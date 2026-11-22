@@ -305,7 +305,7 @@ impl WorkerRuntime {
                     let _gate = gate;
                     if let Err(error) = service.resume(&record).await {
                         tracing::warn!(index=%selector.index_id, build=%selector.build_id, attempt=selector.attempt,
-                            code=?error.code, "index build stopped before completion");
+                            code=?error.code, message=%error.message, "index build stopped before completion");
                     }
                     Ok(())
                 })?;

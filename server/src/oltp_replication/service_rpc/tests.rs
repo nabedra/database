@@ -194,7 +194,7 @@ impl Endpoint for ConvergingTimestamp {
                 3 => Err(unavailable()),
                 5 => Err(ProtocolError::new(
                     ErrorCode::Overloaded,
-                    "worker outgoing lane full",
+                    "worker outgoing lane full (ServiceMutation)",
                     Outcome::NotApplied,
                 )),
                 _ => {

@@ -546,7 +546,7 @@ mod tests {
     };
     use crate::{
         executor::Executor,
-        oltp_replication::multiplex::{EndpointFuture, RequestError},
+        oltp_replication::multiplex::{EndpointFuture, RequestError, TrafficClass},
         request_queue::{RequestRecord, RequestState},
         scheduling::{MemoryCharge, ResourceScheduler},
     };
@@ -680,14 +680,17 @@ mod tests {
     /// NS11 queued-path 429 whose update had committed) is an unknown outcome.
     #[tokio::test]
     async fn g1_lane_full_after_acceptance_reports_outcome_unknown() {
-        let lane_full = ProtocolError::from(RequestError::OutgoingLaneFull);
+        let lane_full = ProtocolError::from(RequestError::OutgoingLaneFull {
+            class: TrafficClass::ApiObservation,
+            direct: false,
+        });
         assert_eq!(lane_full.outcome, Outcome::NotApplied);
         let (status, error) = post(Ok(()), lane_full.clone()).await;
         assert_eq!(status, 503, "{error:?}");
         assert_eq!(error.code, ErrorCode::OutcomeUnknown);
         assert_eq!(error.outcome, Outcome::Unknown);
         assert!(
-            error.message.contains("worker outgoing lane full"),
+            error.message.contains(lane_full.message.as_str()),
             "{error:?}"
         );
 

@@ -34,7 +34,10 @@ struct Registry {
 pub(crate) enum Checkpoint {
     Backfill,
     Refresh,
+    RefreshAdmissionRefused,
+    RefreshPrepare,
     Validation,
+    ReadyCommit,
     ReadPin,
     Reclaim,
 }
@@ -81,6 +84,10 @@ pub(crate) async fn checkpoint(
         return false;
     }
     decision.await.unwrap_or(false)
+}
+
+pub(crate) fn unregister_checkpoint(id: Uuid, stage: Checkpoint) {
+    registry().lock().unwrap().checkpoints.remove(&(id, stage));
 }
 
 fn registry() -> &'static Mutex<Registry> {

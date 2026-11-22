@@ -290,8 +290,176 @@ async fn o12_failed_ready_validation_preserves_direct_schema() {
 
 const INDEX: &str = "secondary by_category";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o12_hot_key_cannot_starve_backfill() {
+    tokio::time::timeout(WAIT, async {
+        let fixture = Fixture::new().await;
+        fixture.insert_rows(vec![row(0, 0, "seed")]).await;
+        let record = fixture.declare().await;
+        fixture.assert_point(0, row(0, 0, "seed")).await;
+        let owner = MaintenanceOwnerRef {
+            catalog_group_id: fixture.runtime.services.catalog.participant().identity().group_id,
+            table_id: fixture.definition.table_id,
+            index_id: fixture.definition.index_id,
+            build_id: fixture.build_id,
+            attempt: 1,
+        };
+        let job = crate::oltp::mvcc::index::build::refresh_job(owner, &protocol::Key::Int64(0))
+            .unwrap();
+        let switch = fixture.runtime.direct_switch().unwrap();
+        let before = switch.direct_stats().unwrap().entries_applied;
+        let mut next = index_holds::register_checkpoint(job, Checkpoint::RefreshPrepare);
+        let mut actor = fixture.spawn_resume(record);
+        let mut revision = 0;
+        loop {
+            tokio::select! {
+                result = &mut actor => {
+                    result.unwrap().expect("backfill must finish while every refresh attempt races a committed write");
+                    break;
+                }
+                hold = &mut next => {
+                    let hold = hold.unwrap();
+                    revision += 1;
+                    assert!(revision <= MAX_QUEUED_MUTATION_ATTEMPTS as i64);
+                    let (status, reply) = post(
+                        &fixture.app,
+                        "/v1/operations",
+                        TOKEN,
+                        Uuid::new_v4(),
+                        "table.update",
+                        json!({
+                            "table_id":owner.table_id, "key":0,
+                            "values":{"category":revision,"label":format!("write {revision}")},
+                        }),
+                    ).await;
+                    assert_eq!(status, StatusCode::OK, "{reply}");
+                    assert_eq!(reply["data"], true);
+                    next = index_holds::register_checkpoint(job, Checkpoint::RefreshPrepare);
+                    hold.release.send(false).unwrap();
+                }
+            }
+        }
+        index_holds::unregister_checkpoint(job, Checkpoint::RefreshPrepare);
+        assert!(revision > 0, "the writer never raced backfill");
+        assert_eq!(
+            switch.direct_stats().unwrap().entries_applied - before,
+            if switch.routes_direct() { revision as u64 } else { 0 },
+        );
+        let expected = row(0, revision, &format!("write {revision}"));
+        fixture.assert_status(1, "ready", false).await;
+        fixture.assert_point(0, expected.clone()).await;
+        fixture.assert_query(revision, &json!([expected]), true).await;
+        let latest = ReadTs::new(u64::MAX).unwrap();
+        for category in 0..revision {
+            assert!(fixture.stored_index_rows(latest, category).await.is_empty());
+        }
+        assert_eq!(fixture.stored_index_rows(latest, revision).await, vec![expected]);
+        fixture.close().await;
+    }).await.expect("hot-key backfill watchdog");
+}
+
 fn row(id: i64, category: i64, label: &str) -> Value {
     json!({"id":id,"category":category,"label":label})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o12_refresh_survives_temporary_ingress_saturation() {
+    let fixture = Fixture::new().await;
+    let seed = row(0, 0, "seed");
+    fixture.insert_rows(vec![seed.clone()]).await;
+    let record = fixture.declare().await;
+    let owner = MaintenanceOwnerRef {
+        catalog_group_id: fixture
+            .runtime
+            .services
+            .catalog
+            .participant()
+            .identity()
+            .group_id,
+        table_id: fixture.definition.table_id,
+        index_id: fixture.definition.index_id,
+        build_id: fixture.build_id,
+        attempt: 1,
+    };
+    let job =
+        crate::oltp::mvcc::index::build::refresh_job(owner, &protocol::Key::Int64(0)).unwrap();
+    let permits: Vec<_> = std::iter::from_fn(|| fixture.runtime.ingress.try_admit().ok()).collect();
+    assert!(!permits.is_empty());
+    let refused = index_holds::register_checkpoint(job, Checkpoint::RefreshAdmissionRefused);
+    let mut actor = fixture.spawn_resume(record);
+    let hold = tokio::select! {
+        hold = reached(refused) => hold,
+        result = &mut actor => panic!("an ingress refusal stopped the build: {result:?}"),
+    };
+    drop(permits);
+    hold.release.send(false).unwrap();
+    tokio::time::timeout(WAIT, actor)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    fixture.assert_status(1, "ready", false).await;
+    fixture.assert_query(0, &json!([seed]), true).await;
+    fixture.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o12_ready_retries_after_settled_prepare_overload() {
+    use crate::oltp_replication::multiplex::TrafficClass;
+    use index_holds::Stage;
+
+    let fixture = Fixture::new().await;
+    let seed = row(0, 0, "seed");
+    fixture.insert_rows(vec![seed.clone()]).await;
+    let record = fixture.declare().await;
+    let stage =
+        index_holds::register_checkpoint(fixture.definition.index_id, Checkpoint::ReadyCommit);
+    let actor = fixture.spawn_resume(record);
+    let before_commit = reached(stage).await;
+    let catalog_id = fixture
+        .runtime
+        .services
+        .catalog
+        .participant()
+        .identity()
+        .group_id;
+    let mut decisions = index_holds::register(catalog_id);
+    let client = fixture.runtime.services.manager.client();
+    let storage = client.hold_outgoing_for_test(TrafficClass::Storage);
+    before_commit.release.send(false).unwrap();
+    let aborted = tokio::time::timeout(WAIT, decisions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(aborted.stage, Stage::Decided);
+    let decision = fixture
+        .runtime
+        .services
+        .status
+        .inspect_transaction(aborted.txn)
+        .await
+        .unwrap()
+        .unwrap()
+        .decision
+        .unwrap();
+    assert_eq!(
+        decision.decision,
+        TxnDecision::Abort {
+            reason: AbortReason::ResourceLimit
+        }
+    );
+    drop(storage);
+    index_holds::unregister(catalog_id);
+    aborted.release.send(()).unwrap();
+
+    tokio::time::timeout(WAIT, actor)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a settled overload must allow a fresh publication transaction");
+    fixture.assert_status(1, "ready", false).await;
+    fixture.assert_query(0, &json!([seed]), true).await;
+    fixture.close().await;
 }
 
 fn original(category: i64) -> Value {
@@ -871,6 +1039,24 @@ fn marker(assertion: &str, status: &str, detail: Value) {
         "NABEDRA_OLTP_ASSERT {}",
         json!({"scenario":"O12","assertion":assertion,"status":status,"detail":detail})
     );
+}
+
+#[test]
+#[ignore = "real RF1 processes, run through the CI tests input with modes=on"]
+fn d11_hot_key_index_process() {
+    let binary = std::env::var_os("NABEDRA_BIN").expect("CI server binary");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/oltp_direct_acceptance.py");
+    let output = Directory::new();
+    let status = std::process::Command::new("python3")
+        .arg(script)
+        .arg("--binary")
+        .arg(binary)
+        .args(["--suite", "d11", "--output"])
+        .arg(&output.0)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .status()
+        .expect("launch D11 index fixture");
+    assert!(status.success(), "D11 index fixture failed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

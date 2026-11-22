@@ -348,7 +348,8 @@ async fn c07_f03_o23_read_grant_copy_keeps_transport_outcomes_distinct() {
         .client
         .hold_outgoing_for_test(TrafficClass::QueueControl);
     let refused = copy().await.unwrap_err();
-    assert_eq!(refused, ProtocolError::from(RequestError::OutgoingLaneFull));
+    assert_eq!(refused.code, ErrorCode::Overloaded);
+    assert_eq!(refused.message, "worker outgoing lane full (QueueControl)");
     assert_eq!(refused.outcome, Outcome::NotApplied);
     assert_eq!(fixture.authority.0.load(Ordering::Relaxed), 0);
     drop(full);

@@ -4,9 +4,10 @@ use super::*;
 use crate::oltp::{
     mvcc::{
         MvccKey,
-        catalog::{CatalogRead, IntentRef},
+        catalog::{CatalogRead, IntentRef, decode_record},
         planner::{MutationPlan, NativePlanner, PlanError, ResolveFuture},
         store::{
+            ParticipantHandle,
             index::VerifiedIndexAttemptClosed,
             lifecycle::{GuardMode, LifecycleBinding, VerifiedLifecycleGuard},
             scan::{ScanDomain, ScanPage, ScanRequest},
@@ -14,11 +15,15 @@ use crate::oltp::{
     },
     pool::ScratchLease,
 };
-use crate::oltp_replication::{
-    owned::serialized_digest,
-    types::{Authority, Digest, MaintenanceOwnerRef, RequestBinding, TxnId},
+use crate::{
+    oltp_replication::{
+        owned::serialized_digest,
+        types::{Authority, Digest, MaintenanceOwnerRef, ReadTs, RequestBinding, TxnId},
+    },
+    protocol::Outcome,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 pub(crate) struct IndexAttempt {
     pub pin: PinnedCatalog,
@@ -27,6 +32,26 @@ pub(crate) struct IndexAttempt {
     pub owner: Arc<ScratchLease>,
     pub identity: crate::oltp_replication::types::PinIdentity,
     pub storage_pin: StoragePin,
+}
+
+pub(crate) enum IndexCommitOutcome {
+    Committed,
+    /// The durable ABORT and its cleanup have both settled.
+    Aborted(ProtocolError),
+}
+
+impl IndexCommitOutcome {
+    fn into_result(self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Committed => Ok(()),
+            Self::Aborted(error) => Err(error),
+        }
+    }
+}
+
+enum BackfillPublication {
+    Progress(IndexProgress),
+    Ready,
 }
 /// One physical worker's existing queue/Status coordinator implements this.
 /// Metadata jobs have distinct durable identities and exact snapshot bindings;
@@ -43,7 +68,11 @@ pub(crate) trait IndexBackend: Send + Sync {
     fn checkpoint(&self) -> ResolveFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
-    fn commit(&self, attempt: IndexAttempt, plan: MutationPlan) -> ResolveFuture<'_, ()>;
+    fn commit(
+        &self,
+        attempt: IndexAttempt,
+        plan: MutationPlan,
+    ) -> ResolveFuture<'_, IndexCommitOutcome>;
     fn source_pin(
         &self,
         authority: Authority,
@@ -196,7 +225,7 @@ impl IndexService {
             Ok(plan) => plan,
             Err(error) => return self.failed(metadata, error).await,
         };
-        self.backend.commit(metadata, plan).await?;
+        self.backend.commit(metadata, plan).await?.into_result()?;
         Ok((maintenance, source))
     }
     /// Resume an existing Building attempt under its original pinned source.
@@ -337,7 +366,7 @@ impl IndexService {
             Ok(plan) => plan,
             Err(error) => return self.failed(metadata, error).await,
         };
-        self.backend.commit(metadata, plan).await?;
+        self.backend.commit(metadata, plan).await?.into_result()?;
         self.backend
             .close_source(
                 authority,
@@ -391,7 +420,7 @@ impl IndexService {
             Ok(plan) => plan,
             Err(error) => return self.failed(metadata, error).await,
         };
-        self.backend.commit(metadata, plan).await?;
+        self.backend.commit(metadata, plan).await?.into_result()?;
         self.backend
             .close_source(
                 authority,
@@ -404,6 +433,30 @@ impl IndexService {
             )
             .await
     }
+    async fn row_written_since_source(
+        &self,
+        participant: &ParticipantHandle,
+        key: &MvccKey,
+        source_ts: ReadTs,
+    ) -> Result<bool, ProtocolError> {
+        // The declaration's lifecycle guard and Data fence order every writer
+        // that could omit this index before the source cut. A committed newer
+        // row version (including a tombstone) has already maintained the index
+        // in its own atomic Data write. An intent alone proves nothing.
+        let latest = ReadTs::new(u64::MAX).map_err(|_| blocked_index())?;
+        let resources = self.backend.planner().catalog().resources();
+        for _ in 0..8 {
+            let raw = participant.read_at(latest, key.clone()).await?;
+            match decode_record::<serde::de::IgnoredAny>(resources, raw).await? {
+                CatalogRead::Value { version, .. } => {
+                    return Ok(version.is_some_and(|stamp| stamp > source_ts));
+                }
+                CatalogRead::Blocked(intent) => self.backend.help(intent).await?,
+            }
+        }
+        Err(blocked_index())
+    }
+
     async fn backfill(
         &self,
         maintenance: MaintenanceOwnerRef,
@@ -523,14 +576,24 @@ impl IndexService {
                                     let MvccKey::Row { primary_key, .. } = &record.key else {
                                         return Err(invalid("index source row key"));
                                     };
-                                    let job = job_id(
-                                        maintenance,
-                                        b"refresh",
-                                        Some(serialized_digest(primary_key)?),
-                                    )?;
-                                    self.backend
+                                    let job = refresh_job(maintenance, primary_key)?;
+                                    let refreshed = self
+                                        .backend
                                         .refresh(maintenance.table_id, primary_key.clone(), job)
-                                        .await?;
+                                        .await;
+                                    if let Err(error) = refreshed
+                                        && (error.code != ErrorCode::Conflict
+                                            || error.outcome != Outcome::NotApplied
+                                            || !self
+                                                .row_written_since_source(
+                                                    &participant,
+                                                    &record.key,
+                                                    source.read_ts,
+                                                )
+                                                .await?)
+                                    {
+                                        return Err(error);
+                                    }
                                     #[cfg(test)]
                                     if crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
                                         maintenance.index_id,
@@ -555,73 +618,23 @@ impl IndexService {
                         }
                     }
                 }
-                let job = job_id(
+                self.publish_backfill(
                     maintenance,
-                    b"progress",
-                    Some(serialized_digest(&route.group.group_id)?),
-                )?;
-                let metadata = self
-                    .backend
-                    .begin(
-                        job,
-                        serialized_digest(&(
-                            b"index-progress/v1",
-                            maintenance,
-                            route.group.group_id,
-                        ))?,
-                        maintenance,
-                        None,
-                    )
-                    .await?;
-                let plan = self
-                    .backend
-                    .planner()
-                    .plan_index_progress(
-                        &metadata.pin,
-                        metadata.txn,
-                        metadata.request,
-                        maintenance,
-                        IndexProgress {
-                            build_id: maintenance.build_id,
-                            attempt: maintenance.attempt,
-                            group_id: route.group.group_id,
-                            span: route.span.clone(),
-                            done: true,
-                        },
-                        metadata.owner.clone(),
-                    )
-                    .await;
-                let plan = match plan {
-                    Ok(plan) => plan,
-                    Err(error) => return self.failed(metadata, error).await,
-                };
-                self.backend.commit(metadata, plan).await?;
+                    BackfillPublication::Progress(IndexProgress {
+                        build_id: maintenance.build_id,
+                        attempt: maintenance.attempt,
+                        group_id: route.group.group_id,
+                        span: route.span.clone(),
+                        done: true,
+                    }),
+                )
+                .await?;
             }
             next = page.next_page;
         }
-        let (job, digest) = ready_job(maintenance)?;
-        let metadata = self
-            .backend
-            .begin(job, digest, maintenance, None)
+        let authority = self
+            .publish_backfill(maintenance, BackfillPublication::Ready)
             .await?;
-        let authority = metadata.pin.authority;
-        let plan = self
-            .backend
-            .planner()
-            .plan_finish_index(
-                &metadata.pin,
-                metadata.txn,
-                metadata.request,
-                maintenance,
-                IndexClosedKind::Ready,
-                metadata.owner.clone(),
-            )
-            .await;
-        let plan = match plan {
-            Ok(plan) => plan,
-            Err(error) => return self.failed(metadata, error).await,
-        };
-        self.backend.commit(metadata, plan).await?;
         let proof = self
             .backend
             .planner()
@@ -630,6 +643,84 @@ impl IndexService {
             .strong_index_attempt_closed(maintenance)
             .await?;
         self.backend.close_source(authority, proof).await
+    }
+
+    async fn publish_backfill(
+        &self,
+        maintenance: MaintenanceOwnerRef,
+        publication: BackfillPublication,
+    ) -> Result<Authority, ProtocolError> {
+        let (job, digest) = match &publication {
+            BackfillPublication::Progress(progress) => (
+                job_id(
+                    maintenance,
+                    b"progress",
+                    Some(serialized_digest(&progress.group_id)?),
+                )?,
+                serialized_digest(&(b"index-progress/v1", maintenance, progress.group_id))?,
+            ),
+            BackfillPublication::Ready => ready_job(maintenance)?,
+        };
+        let mut retries = 0;
+        let mut backoff = Duration::from_millis(50);
+        loop {
+            let metadata = self.backend.begin(job, digest, maintenance, None).await?;
+            let authority = metadata.pin.authority;
+            let planner = self.backend.planner();
+            let plan = match &publication {
+                BackfillPublication::Progress(progress) => {
+                    planner
+                        .plan_index_progress(
+                            &metadata.pin,
+                            metadata.txn,
+                            metadata.request,
+                            maintenance,
+                            progress.clone(),
+                            metadata.owner.clone(),
+                        )
+                        .await
+                }
+                BackfillPublication::Ready => {
+                    planner
+                        .plan_finish_index(
+                            &metadata.pin,
+                            metadata.txn,
+                            metadata.request,
+                            maintenance,
+                            IndexClosedKind::Ready,
+                            metadata.owner.clone(),
+                        )
+                        .await
+                }
+            };
+            let plan = match plan {
+                Ok(plan) => plan,
+                Err(error) => return self.failed(metadata, error).await.map(|()| authority),
+            };
+            #[cfg(test)]
+            if matches!(publication, BackfillPublication::Ready) {
+                crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
+                    maintenance.index_id,
+                    crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::ReadyCommit,
+                    || None,
+                )
+                .await;
+            }
+            match self.backend.commit(metadata, plan).await? {
+                IndexCommitOutcome::Aborted(error)
+                    if retries < 7
+                        && error.code == ErrorCode::Overloaded
+                        && error.outcome == Outcome::NotApplied =>
+                {
+                    // The backend returns this outcome only after releasing
+                    // the aborted transaction's guards and metadata pin.
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_millis(250));
+                    retries += 1;
+                }
+                outcome => return outcome.into_result().map(|()| authority),
+            }
+        }
     }
     async fn routing_root(
         &self,
@@ -695,6 +786,13 @@ pub(crate) fn ready_job(owner: MaintenanceOwnerRef) -> Result<(Uuid, Digest), Pr
 pub(crate) fn declaration_job(owner: MaintenanceOwnerRef, definition: &IndexDefinition) -> Result<(Uuid, Digest), ProtocolError> {
     Ok((job_id(owner, b"declare", None)?, serialized_digest(&(b"index-declare/v1", definition, owner))?))
 }
+pub(crate) fn refresh_job(
+    owner: MaintenanceOwnerRef,
+    key: &crate::protocol::Key,
+) -> Result<Uuid, ProtocolError> {
+    job_id(owner, b"refresh", Some(serialized_digest(key)?))
+}
+
 fn job_id(
     owner: MaintenanceOwnerRef,
     stage: &[u8],

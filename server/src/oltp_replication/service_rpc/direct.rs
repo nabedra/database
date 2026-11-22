@@ -492,7 +492,7 @@ impl DirectLink {
         let left = request.deadline.saturating_sub(start.elapsed());
         if left.is_zero() {
             return Err(DirectSendError::NotApplied(
-                RequestError::OutgoingLaneFull.into(),
+                reservation.deadline_refusal().into(),
             ));
         }
         header.deadline_ms = u32::try_from(left.as_millis()).unwrap_or(u32::MAX).max(1);
@@ -525,9 +525,9 @@ impl DirectLink {
             // Local failures before sending keep `not_applied`; those after
             // the leader answered carry an unknown outcome.
             Err(CallError::Local(error)) => Err(by_outcome(error)),
-            Err(CallError::Transport(RequestError::OutgoingLaneFull)) => Err(
-                DirectSendError::NotApplied(RequestError::OutgoingLaneFull.into()),
-            ),
+            Err(CallError::Transport(error @ RequestError::OutgoingLaneFull { .. })) => {
+                Err(DirectSendError::NotApplied(error.into()))
+            }
             Err(CallError::Transport(
                 RequestError::Protocol(error) | RequestError::PeerRejected { error, .. },
             )) => Err(by_outcome(error)),
