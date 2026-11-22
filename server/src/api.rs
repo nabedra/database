@@ -157,7 +157,7 @@ async fn operations<B: ObjectStore + 'static>(
     State(state): State<Arc<ApiState<B>>>,
     request: Request,
 ) -> Response {
-    let started = Instant::now();
+    let started = nabedra_rt::time::now_std();
     if request.headers().contains_key("x-nabedra-storage")
         || !authenticated(request.headers(), &state.token)
     {
@@ -279,7 +279,7 @@ async fn submit_request<B: ObjectStore + 'static>(
     State(state): State<Arc<ApiState<B>>>,
     request: Request,
 ) -> Response {
-    let started = Instant::now();
+    let started = nabedra_rt::time::now_std();
     if request.headers().contains_key("x-nabedra-storage")
         || !authenticated(request.headers(), &state.token)
     {
@@ -327,7 +327,7 @@ async fn receipt_request<B: ObjectStore + 'static>(
     Path((run_id, id)): Path<(String, String)>,
     request: Request,
 ) -> Response {
-    let started = Instant::now();
+    let started = nabedra_rt::time::now_std();
     if request.headers().contains_key("x-nabedra-storage")
         || !authenticated(request.headers(), &state.token)
     {
@@ -380,8 +380,8 @@ async fn receipt_request<B: ObjectStore + 'static>(
 
 async fn read_body(mut body: Body) -> Result<Vec<u8>, ProtocolError> {
     let mut bytes = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    while let Some(frame) = tokio::time::timeout_at(deadline, body.frame())
+    let deadline = nabedra_rt::time::now() + std::time::Duration::from_secs(30);
+    while let Some(frame) = nabedra_rt::time::timeout_at(deadline, body.frame())
         .await
         .map_err(|_| {
             not_applied(

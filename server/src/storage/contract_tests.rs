@@ -23,7 +23,6 @@ use std::{
     },
 };
 use tokio::io::AsyncReadExt;
-use uuid::Uuid;
 
 /// What a contract case needs beyond `ObjectStore`. Optional operations return
 /// `None` when the store has no such operation, and the case reports not-run.
@@ -152,10 +151,10 @@ async fn read<T: ObjectStore>(s: &T, key: &str) -> Result<(Vec<u8>, String), Sto
     Ok((bytes, d.etag))
 }
 fn heartbeat(ns: &str) -> String {
-    format!("{ns}cluster/heartbeats/{}.json", Uuid::new_v4())
+    format!("{ns}cluster/heartbeats/{}.json", nabedra_rt::ids::uuid_v4())
 }
 fn decision(ns: &str) -> String {
-    format!("{ns}decisions/{}.json", Uuid::new_v4())
+    format!("{ns}decisions/{}.json", nabedra_rt::ids::uuid_v4())
 }
 fn ensure(ok: bool, msg: impl FnOnce() -> String) -> Result<(), String> {
     if ok { Ok(()) } else { Err(msg()) }
@@ -177,7 +176,7 @@ async fn create_race<T: Target>(s: T, ns: String) -> CaseResult {
     let mut tasks = Vec::new();
     for i in 0..N {
         let (s, key, barrier) = (s.clone(), key.clone(), barrier.clone());
-        tasks.push(tokio::spawn(async move {
+        tasks.push(nabedra_rt::task::spawn(async move {
             barrier.wait().await;
             (
                 i,
@@ -306,7 +305,7 @@ async fn delete_race<T: Target>(s: T, ns: String) -> CaseResult {
     let mut tasks = Vec::new();
     for i in 0..N {
         let (s, key, etag, barrier) = (s.clone(), key.clone(), etag.clone(), barrier.clone());
-        tasks.push(tokio::spawn(async move {
+        tasks.push(nabedra_rt::task::spawn(async move {
             barrier.wait().await;
             let r = s
                 .put(
@@ -320,7 +319,7 @@ async fn delete_race<T: Target>(s: T, ns: String) -> CaseResult {
     }
     let deleter = {
         let (s, key, barrier) = (s.clone(), key.clone(), barrier.clone());
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             barrier.wait().await;
             s.delete(&key).await.unwrap()
         })
@@ -458,7 +457,7 @@ async fn injected_faults<T: Target>(s: T, ns: String) -> CaseResult {
             applied = true;
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        nabedra_rt::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     ensure(applied, || "late PUT never applied".into())?;
     Ok(Verdict::Pass)
@@ -543,7 +542,7 @@ async fn sim_conflict_on_concurrent_delete() {
     s.inject(Rule::put(key, Fault::Hold(gate.clone())));
     let held = {
         let (s, etag) = (s.clone(), etag.clone());
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             s.put(key, b"b".to_vec(), WriteCondition::Match(&etag))
                 .await
         })
@@ -657,7 +656,8 @@ pub(crate) struct LocalStore {
 impl LocalStore {
     pub fn start() -> Option<Self> {
         let python = python()?;
-        let dir = std::env::temp_dir().join(format!("nabedra-contract-{}", Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("nabedra-contract-{}", nabedra_rt::ids::uuid_v4()));
         std::fs::create_dir(&dir).unwrap();
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/local_store.py");
         let mut child = std::process::Command::new(python)
@@ -691,7 +691,7 @@ struct HttpFactory(String);
 impl Factory for HttpFactory {
     type Store = super::HttpStore;
     async fn store(&self, case: &str) -> (super::HttpStore, String) {
-        let ns = format!("contract/{case}-{}", Uuid::new_v4());
+        let ns = format!("contract/{case}-{}", nabedra_rt::ids::uuid_v4());
         let store = super::HttpStore::new(
             &self.0,
             Namespace::new(&ns).unwrap(),
@@ -723,7 +723,7 @@ pub(crate) fn s3_run_prefix() -> String {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
         })
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+        .unwrap_or_else(|| nabedra_rt::ids::uuid_v4().to_string());
     format!("runs/{id}")
 }
 
@@ -738,7 +738,11 @@ struct S3Factory {
 impl Factory for S3Factory {
     type Store = Counted<super::S3Store>;
     async fn store(&self, case: &str) -> (Self::Store, String) {
-        let ns = format!("{}/contract/{case}-{}", self.prefix, Uuid::new_v4());
+        let ns = format!(
+            "{}/contract/{case}-{}",
+            self.prefix,
+            nabedra_rt::ids::uuid_v4()
+        );
         let inner = super::S3Store::connect_region(
             &self.bucket,
             Namespace::new(&ns).unwrap(),

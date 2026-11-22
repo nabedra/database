@@ -88,7 +88,8 @@ struct World {
 }
 
 async fn operation(engine: &Engine<Counted>, name: &str, payload: Value) -> Result<Value, String> {
-    let request = json!({"request_id": Uuid::new_v4(), "operation": name, "payload": payload});
+    let request =
+        json!({"request_id": nabedra_rt::ids::uuid_v4(), "operation": name, "payload": payload});
     let bytes = serde_json::to_vec(&request).unwrap();
     let operation = parse_request(&bytes).unwrap().operation;
     let catalog = engine
@@ -123,7 +124,7 @@ impl World {
             )
         };
         let writer_storage = storage(None);
-        let run = Uuid::new_v4();
+        let run = nabedra_rt::ids::uuid_v4();
         writer_storage
             .initialize_fenced_cluster_catalog(
                 CatalogFence {
@@ -252,7 +253,7 @@ impl World {
 
     /// Every worker stopped. A new run starts on the same committed data.
     async fn cold_start(&mut self) {
-        self.run = Uuid::new_v4();
+        self.run = nabedra_rt::ids::uuid_v4();
         self.term = 1;
         self.engine
             .storage()
@@ -939,7 +940,7 @@ async fn open_session<'w>(
     bug: Bug,
 ) -> Result<Session<'w>, String> {
     let spec = Spec::generate(g);
-    let request_id = Uuid::new_v4();
+    let request_id = nabedra_rt::ids::uuid_v4();
     let files = world.files().await;
     let local = Local::new();
     let body = spec.open(request_id, world.run, world.table);
@@ -1036,7 +1037,7 @@ async fn case(g: &mut Gen, bug: Bug) -> Result<(), String> {
 /// new open pins the latest committed data.
 async fn cold_start(mut session: Session<'_>, g: &mut Gen) -> Result<(), String> {
     // Leave a fresh open outstanding when every holder stops.
-    let request_id = Uuid::new_v4();
+    let request_id = nabedra_rt::ids::uuid_v4();
     let body = session
         .spec
         .open(request_id, session.world.run, session.world.table);

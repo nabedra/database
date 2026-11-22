@@ -20,7 +20,7 @@ impl PayloadOwners {
         deadline: Instant,
     ) -> Result<PayloadLease> {
         let permit =
-            tokio::time::timeout_at(deadline, self.shared.outgoing.clone().acquire_owned())
+            nabedra_rt::time::timeout_at(deadline, self.shared.outgoing.clone().acquire_owned())
                 .await
                 .map_err(|_| OwnerError::Refused)?
                 .map_err(|_| OwnerError::Refused)?;

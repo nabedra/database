@@ -149,7 +149,7 @@ impl Admission {
                 Outcome::NotApplied,
             )
         })?;
-        let task = runtime.spawn(async move {
+        let task = nabedra_rt::task::spawn_on(&runtime, async move {
             let execution = self.inner.workers.acquire().await.map_err(|_| {
                 ProtocolError::new(
                     ErrorCode::InternalError,

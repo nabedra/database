@@ -37,7 +37,7 @@ use std::{
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
-use tokio::{sync::OwnedSemaphorePermit, time::Instant};
+use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
 pub(crate) const PATH: &str = "/internal/v1/streams";
@@ -200,8 +200,9 @@ pub(crate) async fn remote(
     })
     .await;
     if let (Err(_), Some(token)) = (&reply, delivery) {
-        let _ = tokio::time::timeout(Duration::from_secs(2), release(client, signer, root, token))
-            .await;
+        let _ =
+            nabedra_rt::time::timeout(Duration::from_secs(2), release(client, signer, root, token))
+                .await;
     }
     let (reply, ()) = reply?;
     match reply {
@@ -389,9 +390,10 @@ impl Driver for WorkerDriver {
         previous: Option<Version>,
         dependency: Option<Dependency>,
     ) -> Result<Arc<Stored>, Error> {
-        let _change = tokio::time::timeout(TRANSACTION_TIMEOUT, self.0.queue.lock_stream_changes())
-            .await
-            .map_err(|_| wire::unavailable())?;
+        let _change =
+            nabedra_rt::time::timeout(TRANSACTION_TIMEOUT, self.0.queue.lock_stream_changes())
+                .await
+                .map_err(|_| wire::unavailable())?;
         let (observed, root) = self.0.stream_authority().await?;
         if observed.run != authority.run {
             return Err(Error::abandoned());
@@ -432,7 +434,7 @@ impl Driver for WorkerDriver {
             }
             Ok::<(), ProtocolError>(())
         };
-        tokio::time::timeout(TRANSACTION_TIMEOUT, install)
+        nabedra_rt::time::timeout(TRANSACTION_TIMEOUT, install)
             .await
             .map_err(|_| wire::unavailable())??;
         let (current, fresh) = self.0.stream_authority().await?;
@@ -489,7 +491,7 @@ impl Worker {
         if let Some(status) = registry.recovery_status(expected) {
             return Ok(status);
         }
-        tokio::time::timeout(TRANSACTION_TIMEOUT, async {
+        nabedra_rt::time::timeout(TRANSACTION_TIMEOUT, async {
             let _change = self.queue.lock_stream_changes().await;
             let mut progress = registry.recovery.lock().await;
             if let Some(status) = registry.recovery_status(expected) {
@@ -927,7 +929,7 @@ async fn handle(
     let bytes = http::read_small(
         request.into_body(),
         length,
-        Instant::now() + Duration::from_secs(30),
+        nabedra_rt::time::now() + Duration::from_secs(30),
     )
     .await?;
     if http::digest(&bytes) != digest {

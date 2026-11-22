@@ -77,7 +77,7 @@ impl S3Store {
     pub async fn from_context(
         context: &super::context::RequestContext,
     ) -> Result<Self, StorageError> {
-        let now = std::time::SystemTime::now()
+        let now = nabedra_rt::time::wall_now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| StorageError::Configuration)?
             .as_secs();
@@ -161,7 +161,7 @@ impl S3Store {
         Ok(Download::new(
             DeadlineReader {
                 reader: response.body.into_async_read(),
-                deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(30))),
+                deadline: Box::pin(nabedra_rt::time::sleep(std::time::Duration::from_secs(30))),
             },
             etag,
         ))
@@ -346,9 +346,9 @@ mod live_context_probe {
         eprintln!("live-context-probe absent-get-kind={kind}");
         assert_eq!(kind, "NoSuchKey");
         let storage = Storage::new(client, context.namespace().unwrap());
-        let owner = uuid::Uuid::new_v4();
+        let owner = nabedra_rt::ids::uuid_v4();
         let fence = super::super::CatalogFence {
-            run_id: uuid::Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
             scheduler_term: 1,
         };
         eprintln!("live-context-probe phase=owned-init");

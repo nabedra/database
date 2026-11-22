@@ -5,7 +5,7 @@ pub(super) async fn unsupported<B: ObjectStore + 'static>(
     State(state): State<Arc<ApiState<B>>>,
     request: Request,
 ) -> Response {
-    let started = Instant::now();
+    let started = nabedra_rt::time::now_std();
     if !authenticated(request.headers(), &state.token) {
         return failure(
             None,

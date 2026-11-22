@@ -19,6 +19,7 @@ use crate::{
     worker_pool::WorkerPool,
 };
 use bytes::Bytes;
+use nabedra_rt::time::timeout_at;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::{
@@ -28,7 +29,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 use encoding::BatchEncoder;
@@ -254,7 +254,7 @@ impl PinnedScan {
             return Err(corrupt());
         }
         let _charge = pool.scheduler().charge_memory(0, GET_AUTH_BYTES)?;
-        let deadline = Instant::now() + GET_AUTH_TIMEOUT;
+        let deadline = nabedra_rt::time::now() + GET_AUTH_TIMEOUT;
         for file in files {
             let key = self.file_key(file)?;
             timeout_at(deadline, storage.authorize_object(&key))

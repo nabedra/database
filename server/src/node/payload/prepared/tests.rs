@@ -26,7 +26,7 @@ struct Scratch {
 impl Scratch {
     fn new() -> Self {
         let parent =
-            std::env::temp_dir().join(format!("nabedra-prepared-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("nabedra-prepared-{}", nabedra_rt::ids::uuid_v4()));
         std::fs::create_dir(&parent).unwrap();
         Self {
             spool: Some(

@@ -22,12 +22,12 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
+use nabedra_rt::time::{Instant, timeout_at};
 use sha2::{Digest, Sha256};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 pub(crate) type Result<T> = std::result::Result<T, ProtocolError>;
@@ -166,7 +166,7 @@ pub(crate) async fn load_root(
     let storage = storage.clone();
     cpu(pool, move |runtime| {
         runtime
-            .block_on(storage.load_control(Instant::now() + Duration::from_secs(10)))
+            .block_on(storage.load_control(nabedra_rt::time::now() + Duration::from_secs(10)))
             .map(|loaded| loaded.root().clone())
             .map_err(|_| unavailable())
     })
@@ -399,7 +399,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = nabedra_rt::time::now() + Duration::from_secs(30);
     let mut delay = Duration::from_millis(10);
     for attempt in 0..32 {
         let result = timeout_at(deadline, exchange()).await.map_err(|_| {
@@ -416,11 +416,11 @@ where
                     ErrorCode::Overloaded | ErrorCode::StorageUnavailable
                 ) && attempt < 31 =>
             {
-                let wake = Instant::now() + delay;
+                let wake = nabedra_rt::time::now() + delay;
                 if wake >= deadline {
                     return Err(error);
                 }
-                tokio::time::sleep_until(wake).await;
+                nabedra_rt::time::sleep_until(wake).await;
                 delay = delay.saturating_mul(2).min(Duration::from_millis(250));
             }
             result => return result,
@@ -461,7 +461,7 @@ pub(crate) async fn small_exchange(
     storage: &Arc<Storage<RuntimeStore>>,
     pool: &WorkerPool,
 ) -> Result<auth::ReplyHandoff> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = nabedra_rt::time::now() + Duration::from_secs(30);
     let request = signer.request(
         endpoint,
         &context,

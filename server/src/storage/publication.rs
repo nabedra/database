@@ -5,8 +5,8 @@ use super::{
     LoadedClusterCatalog, MAX_DECISION_BYTES, ObjectKey, ObjectStore, Storage, StorageError,
     TableData, WriteCondition,
 };
+use nabedra_rt::time::timeout_at;
 use std::{collections::BTreeMap, future::Future};
-use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 /// A result for this attempt, not an HTTP outcome for the logical request.
@@ -219,7 +219,7 @@ impl PreparedPublication {
     }
 }
 fn check_deadline(budget: HistoryBudget) -> Result<(), StorageError> {
-    if Instant::now() >= budget.deadline() {
+    if nabedra_rt::time::now() >= budget.deadline() {
         Err(StorageError::Unavailable)
     } else {
         Ok(())

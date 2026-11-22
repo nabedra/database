@@ -843,7 +843,7 @@ mod tests {
     #[test]
     fn r05_q03_stream_page_fences_delayed_replica_writes() {
         let former = Authority {
-            run: Uuid::new_v4(),
+            run: nabedra_rt::ids::uuid_v4(),
             term: 7,
         };
         let current = Authority { term: 8, ..former };
@@ -852,7 +852,7 @@ mod tests {
         let now = super::super::now_ms();
         let key = Key {
             scope: Scope::from_context(None).unwrap(),
-            id: Uuid::new_v4(),
+            id: nabedra_rt::ids::uuid_v4(),
         };
         let late = Entry {
             key: key.clone(),
@@ -870,7 +870,7 @@ mod tests {
                     run_id: former.run,
                     expires_at: now + IDLE_MS,
                 },
-                handle_id: Uuid::new_v4(),
+                handle_id: nabedra_rt::ids::uuid_v4(),
                 shards: 1,
             }),
         };
@@ -889,7 +889,7 @@ mod tests {
         let Kind::Snapshot(snapshot) = &mut reopened.kind else {
             unreachable!()
         };
-        snapshot.handle_id = Uuid::new_v4();
+        snapshot.handle_id = nabedra_rt::ids::uuid_v4();
         assert_eq!(
             install(current, reopened.clone())
                 .unwrap()
@@ -909,15 +909,15 @@ mod tests {
 
         // A current repair can restore an older record from another holder.
         let mut surviving = late;
-        surviving.key.id = Uuid::new_v4();
+        surviving.key.id = nabedra_rt::ids::uuid_v4();
         let restored = install(current, surviving.clone()).unwrap().unwrap();
         assert!(restored.entry == surviving);
     }
 
     #[test]
     fn st04_recovery_restores_a_complete_record_missing_from_the_new_owner() {
-        let run = Uuid::new_v4();
-        let table = Uuid::new_v4();
+        let run = nabedra_rt::ids::uuid_v4();
+        let table = nabedra_rt::ids::uuid_v4();
         let mut catalog = Catalog::empty();
         catalog.tables.insert(
             "examples".into(),
@@ -948,10 +948,10 @@ mod tests {
         let first = scan.cursor(0, 1).unwrap();
         let key = Key {
             scope: Scope::from_context(None).unwrap(),
-            id: Uuid::new_v4(),
+            id: nabedra_rt::ids::uuid_v4(),
         };
         let opened = Opened {
-            stream_id: Uuid::new_v4(),
+            stream_id: nabedra_rt::ids::uuid_v4(),
             run_id: run,
             prefetch_batches: 0,
             expires_at: 1_000,

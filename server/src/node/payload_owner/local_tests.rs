@@ -303,7 +303,7 @@ async fn local_candidate_cancel_panic_and_buffered_drop_reap_on_workers() {
         }
         let watchdog = std::time::Duration::from_secs(10);
         let observed: std::result::Result<(), &'static str> = async {
-            tokio::time::timeout(watchdog, started)
+            nabedra_rt::time::timeout(watchdog, started)
                 .await
                 .map_err(|_| "producer did not reach its gate")?
                 .map_err(|_| "producer gate closed")?;
@@ -313,13 +313,13 @@ async fn local_candidate_cancel_panic_and_buffered_drop_reap_on_workers() {
             {
                 return Err("production released admission or permits early");
             }
-            if !tokio::time::timeout(watchdog, quota_charged(&f))
+            if !nabedra_rt::time::timeout(watchdog, quota_charged(&f))
                 .await
                 .map_err(|_| "production quota probe stalled")??
             {
                 return Err("production released scratch early");
             }
-            let rejected = tokio::time::timeout(
+            let rejected = nabedra_rt::time::timeout(
                 watchdog,
                 run_command(&f.owners.shared.pool, &slot, Command::TakeRows),
             )
@@ -337,12 +337,12 @@ async fn local_candidate_cancel_panic_and_buffered_drop_reap_on_workers() {
                 .send(())
                 .map_err(|_| "producer gate receiver closed")?;
             if mode == "buffered" {
-                tokio::time::timeout(watchdog, ready_rx)
+                nabedra_rt::time::timeout(watchdog, ready_rx)
                     .await
                     .map_err(|_| "completion was not buffered")?
                     .map_err(|_| "completion gate closed")?;
                 // The causal partition barrier proves the completion reply was buffered.
-                tokio::time::timeout(watchdog, async {
+                nabedra_rt::time::timeout(watchdog, async {
                     f.partition.submit(0, |_, _| Ok(())).await?.receive().await
                 })
                 .await
@@ -351,7 +351,7 @@ async fn local_candidate_cancel_panic_and_buffered_drop_reap_on_workers() {
             }
             // Drop the original receiver before observing disposal, including buffered results.
             drop(lease.take());
-            tokio::time::timeout(watchdog, returning)
+            nabedra_rt::time::timeout(watchdog, returning)
                 .await
                 .map_err(|_| "supervisor did not reach its return gate")?
                 .map_err(|_| "supervisor return gate closed")?;
@@ -370,7 +370,7 @@ async fn local_candidate_cancel_panic_and_buffered_drop_reap_on_workers() {
             {
                 return Err("cleanup ownership or worker placement changed before reaping");
             }
-            if tokio::time::timeout(watchdog, quota_charged(&f))
+            if nabedra_rt::time::timeout(watchdog, quota_charged(&f))
                 .await
                 .map_err(|_| "disposed quota probe stalled")??
             {
@@ -387,7 +387,7 @@ async fn local_candidate_cancel_panic_and_buffered_drop_reap_on_workers() {
         let _ = reap_release.send(());
         let reaped = wait_reap(&f.owners.shared, Some(slot.id)).await;
         let lifetime_after_reap = lifetime_capacity.available_permits();
-        let recovered = match tokio::time::timeout(watchdog, f.run(f.job.clone())).await {
+        let recovered = match nabedra_rt::time::timeout(watchdog, f.run(f.job.clone())).await {
             Ok(Ok((r, lease))) => {
                 let found = matches!(r.result, JobResult::Get { found: true, .. });
                 let disposed = lease.dispose().await;

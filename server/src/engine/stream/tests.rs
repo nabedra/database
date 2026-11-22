@@ -46,7 +46,7 @@ impl ObjectStore for Store {
 
 fn table() -> TableDescriptor {
     TableDescriptor {
-        id: Uuid::new_v4(),
+        id: nabedra_rt::ids::uuid_v4(),
         name: "stream_rows".into(),
         key: "id".into(),
         format: TableFormat::Parquet,
@@ -124,7 +124,7 @@ fn grouped_parquet(rows: &[Row]) -> Vec<u8> {
 
 fn catalog(table: &TableDescriptor, row_count: usize, data: TableData) -> Catalog {
     let mut catalog = Catalog::empty();
-    catalog.commit_id = Uuid::new_v4();
+    catalog.commit_id = nabedra_rt::ids::uuid_v4();
     catalog.tables.insert(
         table.name.clone(),
         CatalogEntry {
@@ -180,7 +180,7 @@ impl ScanFixture {
     }
 
     async fn legacy(&self, table: &TableDescriptor, rows: &[Row]) -> Catalog {
-        let key = ObjectKey::snapshot(table.id, Uuid::new_v4());
+        let key = ObjectKey::snapshot(table.id, nabedra_rt::ids::uuid_v4());
         self.storage
             .put(
                 &key,
@@ -201,7 +201,7 @@ impl ScanFixture {
     async fn partitioned(&self, table: &TableDescriptor, rows: &[Row], split: i64) -> Catalog {
         let files = [(None, Some(split)), (Some(split), None)];
         let mut manifest = Vec::new();
-        let commit = Uuid::new_v4();
+        let commit = nabedra_rt::ids::uuid_v4();
         let (left, right) = rows.split_at(split as usize);
         for (index, ((lower, upper), partition)) in files.into_iter().zip([left, right]).enumerate()
         {
@@ -613,10 +613,10 @@ async fn st01_st02_u01_local_serve_streams_over_one_connection() {
     use http_body_util::{BodyExt, Full};
     use hyper::client::conn::http1;
     use hyper_util::rt::TokioIo;
+    use nabedra_rt::time::{Duration, timeout};
     use tokio::{
         net::{TcpListener, TcpStream},
         sync::oneshot,
-        time::{Duration, timeout},
     };
 
     async fn call(
@@ -664,7 +664,7 @@ async fn st01_st02_u01_local_serve_streams_over_one_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel();
-        let serving = tokio::spawn(runtime::serve_configured(
+        let serving = nabedra_rt::task::spawn(runtime::serve_configured(
             listener,
             engine,
             Executor::new(4, 4).unwrap(),
@@ -680,7 +680,7 @@ async fn st01_st02_u01_local_serve_streams_over_one_connection() {
         ));
         let socket = TcpStream::connect(address).await.unwrap();
         let (mut conn, driver) = http1::handshake(TokioIo::new(socket)).await.unwrap();
-        let driver = tokio::spawn(driver);
+        let driver = nabedra_rt::task::spawn(driver);
 
         let (status, headers, caps) =
             call(&mut conn, Method::GET, "/v1/streams/capabilities", None).await;
@@ -688,7 +688,7 @@ async fn st01_st02_u01_local_serve_streams_over_one_connection() {
         assert_eq!(headers["cache-control"], "no-store");
         let caps: serde_json::Value = serde_json::from_slice(&caps).unwrap();
         let (status, _, opened) = call(&mut conn, Method::POST, "/v1/streams", Some(json!({
-            "request_id": Uuid::new_v4(), "expected_run_id": caps["run_id"], "table_id": table.id,
+            "request_id": nabedra_rt::ids::uuid_v4(), "expected_run_id": caps["run_id"], "table_id": table.id,
             "query": {"select":["id"],"filter":null,"order_by":null,"limit":null},
             "batch_rows": 2, "prefetch_batches": 0, "format": "rows", "drop_last": false,
             "snapshot_id": null, "shard": 0

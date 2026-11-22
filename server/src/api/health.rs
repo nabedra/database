@@ -17,7 +17,7 @@ pub fn router<B: ObjectStore + 'static>(engine: Engine<B>) -> Router {
 }
 
 async fn ready<B: ObjectStore + 'static>(State(engine): State<Engine<B>>) -> StatusCode {
-    match tokio::time::timeout(Duration::from_secs(5), async {
+    match nabedra_rt::time::timeout(Duration::from_secs(5), async {
         let object = engine
             .storage()
             .read(

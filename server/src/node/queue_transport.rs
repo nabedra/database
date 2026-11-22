@@ -15,7 +15,6 @@ use bytes::Bytes;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, time::Duration};
-use tokio::time::Instant;
 use uuid::Uuid;
 
 pub(super) const PATH: &str = "/internal/v1/queue";
@@ -306,7 +305,7 @@ pub(super) async fn exchange_accounted<T>(
     if body.len() > MAX_BYTES {
         return Err(http::failure(ErrorCode::LimitExceeded));
     }
-    let nonce = Uuid::new_v4();
+    let nonce = nabedra_rt::ids::uuid_v4();
     let mut c = claims(signer, root, node, nonce, false, &body)?;
     if let Some(class) = class {
         c.class = class.into();
@@ -339,7 +338,7 @@ pub(super) async fn exchange_accounted<T>(
         .header("x-nabedra-queue-signature", s)
         .body(Body::from(body))
         .map_err(|_| invalid())?;
-    let end = Instant::now() + Duration::from_secs(30);
+    let end = nabedra_rt::time::now() + Duration::from_secs(30);
     let response = client.request(request, end).await?;
     if response.status() != 200 {
         // Do not turn a denial or malformed peer request into a retryable
@@ -656,7 +655,8 @@ mod observation_http_tests {
                     .body(Body::from("{}"))
                     .unwrap()
             });
-            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let server =
+                nabedra_rt::task::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let client = HttpClient::new(None).unwrap();
             let signer = Signer::api(id(1), id(2), &"A".repeat(43)).unwrap();
             let error = exchange(

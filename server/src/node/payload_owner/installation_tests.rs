@@ -12,8 +12,10 @@ async fn accepted_storage_is_reserved_before_registration() {
         .entries
         .capacity();
     let drained =
-        tokio::time::timeout(std::time::Duration::from_secs(10), owners.close_and_drain()).await;
-    let joined = tokio::time::timeout(std::time::Duration::from_secs(10), threads.shutdown()).await;
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(10), owners.close_and_drain())
+            .await;
+    let joined =
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(10), threads.shutdown()).await;
     std::fs::remove_dir(path).unwrap();
     assert!(matches!(drained, Ok(Ok(()))));
     assert!(matches!(joined, Ok(Ok(()))));
@@ -27,7 +29,8 @@ async fn accepted_storage_is_reserved_before_registration() {
 async fn reservation_rolls_back_parent_and_installs_original_task() {
     let (owners, threads, path, guard) = tests::fixture();
     let mut process = owners.try_process(path.clone(), tests::limits()).unwrap();
-    let ready = tokio::time::timeout(std::time::Duration::from_secs(10), process.ready()).await;
+    let ready =
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(10), process.ready()).await;
     let prepared = owners
         .prepare_entry(
             Kind::Operation,
@@ -96,8 +99,10 @@ async fn reservation_rolls_back_parent_and_installs_original_task() {
     drop(installed);
     drop(process);
     let drained =
-        tokio::time::timeout(std::time::Duration::from_secs(10), owners.close_and_drain()).await;
-    let joined = tokio::time::timeout(std::time::Duration::from_secs(10), threads.shutdown()).await;
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(10), owners.close_and_drain())
+            .await;
+    let joined =
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(10), threads.shutdown()).await;
     std::fs::remove_dir(path).unwrap();
     assert!(matches!(ready, Ok(Ok(Reply::Ready))));
     assert!(matches!(drained, Ok(Ok(()))));
@@ -114,7 +119,7 @@ async fn pending_guard_release_remains_visible_after_handle_reaping() {
         .unwrap();
     let slot = prepared.slot.clone();
     drop(prepared);
-    let finished = tokio::time::timeout(
+    let finished = nabedra_rt::time::timeout(
         std::time::Duration::from_secs(10),
         poll_fn(|cx| {
             let mut state = owners.shared.state.lock().unwrap();
@@ -143,7 +148,7 @@ async fn pending_guard_release_remains_visible_after_handle_reaping() {
     *owners.shared.releasing.lock().unwrap() = Some((at_release, gate));
     let shared = owners.shared.clone();
     let reaper = std::thread::spawn(move || reap_shared(&shared, None));
-    let observed = tokio::time::timeout(std::time::Duration::from_secs(10), observed).await;
+    let observed = nabedra_rt::time::timeout(std::time::Duration::from_secs(10), observed).await;
     let snapshot = owners
         .shared
         .state
@@ -162,8 +167,10 @@ async fn pending_guard_release_remains_visible_after_handle_reaping() {
         .payload
         .retention_locked();
     let drained =
-        tokio::time::timeout(std::time::Duration::from_secs(10), owners.close_and_drain()).await;
-    let joined = tokio::time::timeout(std::time::Duration::from_secs(10), threads.shutdown()).await;
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(10), owners.close_and_drain())
+            .await;
+    let joined =
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(10), threads.shutdown()).await;
     std::fs::remove_dir(path).unwrap();
     assert!(matches!(finished, Ok(Ok(()))));
     assert!(matches!(observed, Ok(Ok(()))));
@@ -236,7 +243,8 @@ async fn exact_boot_receipt_needs_no_transport_and_never_initializes() {
         )
         .is_err();
     let receipt =
-        tokio::time::timeout(std::time::Duration::from_secs(10), process.process_ready()).await;
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(10), process.process_ready())
+            .await;
     let valid = receipt.as_ref().is_ok_and(|r| {
         r.as_ref()
             .is_ok_and(|r| r.check_locked(&owners.shared.state.lock().unwrap()))
@@ -271,8 +279,10 @@ async fn exact_boot_receipt_needs_no_transport_and_never_initializes() {
             .is_err();
     drop(process);
     let drained =
-        tokio::time::timeout(std::time::Duration::from_secs(10), owners.close_and_drain()).await;
-    let joined = tokio::time::timeout(std::time::Duration::from_secs(10), threads.shutdown()).await;
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(10), owners.close_and_drain())
+            .await;
+    let joined =
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(10), threads.shutdown()).await;
     std::fs::remove_dir(path).unwrap();
     assert!(matches!(drained, Ok(Ok(()))) && matches!(joined, Ok(Ok(()))));
     assert!(wrong_boot && wrong && duplicate && valid && legacy && !initialized);
@@ -299,7 +309,7 @@ async fn booted(
             tests::limits(),
         )
         .unwrap();
-    let receipt = tokio::time::timeout(WATCHDOG, process.process_ready()).await;
+    let receipt = nabedra_rt::time::timeout(WATCHDOG, process.process_ready()).await;
     let initialized = if let Ok(Ok(receipt)) = receipt {
         owners
             .shared
@@ -332,7 +342,7 @@ async fn finish_distributed_with_watchdog(
 ) {
     let drain = owners.close_and_drain();
     tokio::pin!(drain);
-    let drained = tokio::time::timeout(watchdog, &mut drain).await;
+    let drained = nabedra_rt::time::timeout(watchdog, &mut drain).await;
     if drained.is_err() {
         // A watchdog reports failure; it does not end registered ownership.
         // Keep the pool available until the original drain has settled/reaped.
@@ -353,7 +363,7 @@ async fn finish_distributed_with_watchdog(
     };
     let shutdown = threads.shutdown();
     tokio::pin!(shutdown);
-    let joined = tokio::time::timeout(watchdog, &mut shutdown).await;
+    let joined = nabedra_rt::time::timeout(watchdog, &mut shutdown).await;
     if joined.is_err() {
         // This future owns the actual worker joins. Never detach it on timeout.
         let _ = shutdown.await;
@@ -420,7 +430,7 @@ async fn data_saturation_preserves_eight_original_memory_controls_through_delive
     let mut ready = true;
     for lease in &mut leases {
         ready &= matches!(
-            tokio::time::timeout(WATCHDOG, lease.ready()).await,
+            nabedra_rt::time::timeout(WATCHDOG, lease.ready()).await,
             Ok(Ok(()))
         );
     }
@@ -431,7 +441,7 @@ async fn data_saturation_preserves_eight_original_memory_controls_through_delive
     drop(drain);
     let held = control.available_permits() == 0;
     drop(hold);
-    let returned = tokio::time::timeout(WATCHDOG, async {
+    let returned = nabedra_rt::time::timeout(WATCHDOG, async {
         for returned in returns {
             returned.await.map_err(|_| ())?;
         }
@@ -564,10 +574,10 @@ async fn observe_operation_publication(
     let mut account = installed.account.unwrap();
     let mut stream = installed.stream;
     let ready = matches!(
-        tokio::time::timeout(WATCHDOG, account.ready()).await,
+        nabedra_rt::time::timeout(WATCHDOG, account.ready()).await,
         Ok(Ok(_))
     ) && matches!(
-        tokio::time::timeout(WATCHDOG, stream.ready()).await,
+        nabedra_rt::time::timeout(WATCHDOG, stream.ready()).await,
         Ok(Ok(_))
     );
     let publication = account.retain_delivery();
@@ -673,7 +683,7 @@ async fn dependency_attempts_share_exact_account_and_closing_waits_for_child_and
         };
         drop(prepared);
         let mut stream = installed.stream;
-        let ready = tokio::time::timeout(WATCHDOG, stream.ready()).await;
+        let ready = nabedra_rt::time::timeout(WATCHDOG, stream.ready()).await;
         reused &= matches!(ready, Ok(Ok(_))) && installed.account.is_none();
         let id = {
             let state = owners.shared.state.lock().unwrap();
@@ -734,7 +744,7 @@ async fn dependency_attempts_share_exact_account_and_closing_waits_for_child_and
     let (job, result) = tests::controls();
     let mut command = Box::pin(first.command(Command::BeginRows { job, result }));
     let command_pending = poll_fn(|cx| Poll::Ready(command.as_mut().poll(cx).is_pending())).await;
-    let command_entered = tokio::time::timeout(WATCHDOG, at_command).await;
+    let command_entered = nabedra_rt::time::timeout(WATCHDOG, at_command).await;
     drop(command);
     drop(first);
     let close = {
@@ -770,7 +780,7 @@ async fn dependency_attempts_share_exact_account_and_closing_waits_for_child_and
     let blocked = transport.available_permits() == 0;
     drop(wrong);
     let _ = command_release.send(());
-    let discard_entered = tokio::time::timeout(WATCHDOG, at_discard).await;
+    let discard_entered = nabedra_rt::time::timeout(WATCHDOG, at_discard).await;
     let during = owners
         .shared
         .state
@@ -780,7 +790,7 @@ async fn dependency_attempts_share_exact_account_and_closing_waits_for_child_and
         .unwrap()
         .counts();
     let _ = discard_release.send(());
-    let at_return = tokio::time::timeout(WATCHDOG, returned).await;
+    let at_return = nabedra_rt::time::timeout(WATCHDOG, returned).await;
     let retained = {
         let state = owners.shared.state.lock().unwrap();
         state.local().unwrap().counts() == during
@@ -848,7 +858,7 @@ async fn configured_stream_role_bound_and_operation_cleanup_leave_job_and_contro
         };
         drop(pair);
         ready &= matches!(
-            tokio::time::timeout(WATCHDOG, installed.stream.ready()).await,
+            nabedra_rt::time::timeout(WATCHDOG, installed.stream.ready()).await,
             Ok(Ok(_))
         );
         accepted.push(installed);
@@ -889,7 +899,7 @@ async fn configured_stream_role_bound_and_operation_cleanup_leave_job_and_contro
     account_slot.hooks.lock().unwrap().returning = Some((at_return, return_gate));
     drop(first.stream);
     drop(account);
-    let discard_entered = tokio::time::timeout(WATCHDOG, at_discard).await;
+    let discard_entered = nabedra_rt::time::timeout(WATCHDOG, at_discard).await;
     let binding = owners
         .shared
         .state
@@ -945,7 +955,7 @@ async fn configured_stream_role_bound_and_operation_cleanup_leave_job_and_contro
             .unwrap()
             .install_control_locked()
     };
-    let control_ready = tokio::time::timeout(WATCHDOG, control.ready()).await;
+    let control_ready = nabedra_rt::time::timeout(WATCHDOG, control.ready()).await;
     let counts = owners
         .shared
         .state
@@ -961,7 +971,7 @@ async fn configured_stream_role_bound_and_operation_cleanup_leave_job_and_contro
     drop(accepted);
     drop(process);
     let mut drain = Box::pin(owners.close_and_drain());
-    let at_return = tokio::time::timeout(WATCHDOG, async {
+    let at_return = nabedra_rt::time::timeout(WATCHDOG, async {
         tokio::select! { r=returned=>r.map_err(|_|()), _=&mut drain=>Err(()) }
     })
     .await;
@@ -985,7 +995,7 @@ async fn configured_stream_role_bound_and_operation_cleanup_leave_job_and_contro
     .await;
     drop(cancelled);
     let _ = return_release.send(());
-    let survived = tokio::time::timeout(WATCHDOG, &mut survivor).await;
+    let survived = nabedra_rt::time::timeout(WATCHDOG, &mut survivor).await;
     drop(survivor);
     finish_distributed(owners, threads, path).await;
     assert!(ready && full && unchanged && retained && both_pending);
@@ -1031,8 +1041,8 @@ async fn failed_pool_quarantines_original_distributed_keys_and_handles() {
         .install_entry_locked()
     };
     drop(prepared);
-    let ready = tokio::time::timeout(WATCHDOG, installed.stream.ready()).await;
-    let joined = tokio::time::timeout(WATCHDOG, threads.shutdown()).await;
+    let ready = nabedra_rt::time::timeout(WATCHDOG, installed.stream.ready()).await;
+    let joined = nabedra_rt::time::timeout(WATCHDOG, threads.shutdown()).await;
     let mut original = Vec::with_capacity(32);
     {
         let state = owners.shared.state.lock().unwrap();
@@ -1046,7 +1056,7 @@ async fn failed_pool_quarantines_original_distributed_keys_and_handles() {
     }
     drop(installed);
     drop(process);
-    let failed = tokio::time::timeout(WATCHDOG, owners.close_and_drain()).await;
+    let failed = nabedra_rt::time::timeout(WATCHDOG, owners.close_and_drain()).await;
     let retained = {
         let state = owners.shared.state.lock().unwrap();
         state.local().unwrap().counts().0 == 1
@@ -1061,7 +1071,7 @@ async fn failed_pool_quarantines_original_distributed_keys_and_handles() {
     };
     let charged = transport.available_permits();
     // Existing intentional-failure recovery joins originals and disposes cells on its joined thread.
-    tokio::time::timeout(WATCHDOG, tests::quarantine_teardown(&owners))
+    nabedra_rt::time::timeout(WATCHDOG, tests::quarantine_teardown(&owners))
         .await
         .unwrap();
     let empty = std::fs::read_dir(&path).unwrap().count() == 0;
@@ -1130,8 +1140,8 @@ async fn incomplete_preparation_and_checked_ids_refuse_without_extra_task_or_cha
     let charged = transport.available_permits();
     let scratch = std::fs::read_dir(&path).unwrap().count();
     drop(tickets);
-    let reaped = tokio::time::timeout(WATCHDOG, wait_reap(&owners.shared, None)).await;
-    let deadline = Instant::now() + std::time::Duration::from_secs(3600);
+    let reaped = nabedra_rt::time::timeout(WATCHDOG, wait_reap(&owners.shared, None)).await;
+    let deadline = nabedra_rt::time::now() + std::time::Duration::from_secs(3600);
     let pair = owners
         .prepare_pair(
             Role::Dependency,
@@ -1142,7 +1152,8 @@ async fn incomplete_preparation_and_checked_ids_refuse_without_extra_task_or_cha
     let account_lifetime =
         pair.account.slot.deadline.is_none() && pair.stream.slot.deadline == Some(deadline);
     drop(pair);
-    let deadline_reaped = tokio::time::timeout(WATCHDOG, wait_reap(&owners.shared, None)).await;
+    let deadline_reaped =
+        nabedra_rt::time::timeout(WATCHDOG, wait_reap(&owners.shared, None)).await;
     owners.shared.state.lock().unwrap().payload.next = u64::MAX - 1;
     let exhausted = owners
         .prepare_pair(
@@ -1536,7 +1547,7 @@ async fn signed_booted_with_queue(
     let mut process = owners
         .start_boot(&boot, id(30), path.clone(), tests::limits())
         .unwrap();
-    let ready = tokio::time::timeout(WATCHDOG, process.process_ready()).await;
+    let ready = nabedra_rt::time::timeout(WATCHDOG, process.process_ready()).await;
     let initialized = ready
         .ok()
         .and_then(|r| r.ok())
@@ -1633,8 +1644,9 @@ async fn receiver_operation_capacity_payload_and_retained_start() {
             .check(&f.root, &f.pin())
             .and_then(|check| owners.shared.state.lock().unwrap().start_locked(check));
         let mut account = accepted.owners.account.take().unwrap();
-        let ready = tokio::time::timeout(WATCHDOG, account.ready()).await;
-        let stream_ready = tokio::time::timeout(WATCHDOG, accepted.owners.stream.ready()).await;
+        let ready = nabedra_rt::time::timeout(WATCHDOG, account.ready()).await;
+        let stream_ready =
+            nabedra_rt::time::timeout(WATCHDOG, accepted.owners.stream.ready()).await;
         let payload = account.take_request();
         let second_take = account.take_request().is_err();
         let same_box = payload.as_ref().is_ok_and(|p| p.bytes.as_ptr() as usize == original_bytes && matches!(&p.body, RequestBody::Operation(r) if r.as_ref() as *const crate::protocol::Request as usize == original_parsed));
@@ -1648,7 +1660,7 @@ async fn receiver_operation_capacity_payload_and_retained_start() {
         );
         drop(payload);
         drop(accepted.owners.stream);
-        let disposed = tokio::time::timeout(WATCHDOG, account.dispose()).await;
+        let disposed = nabedra_rt::time::timeout(WATCHDOG, account.dispose()).await;
         facts.1 &= matches!(disposed, Ok(Ok(())));
         // The surviving subject retains immutable authority, not the body or owner.
         facts.4 &= accepted.start.check(&f.root, &f.pin()).is_ok();
@@ -1769,7 +1781,7 @@ async fn receiver_first_draining_job_and_closing_retained_start() {
         // registered worker and its charge before promotion.
         let blocker_settled = if let Ok(AcceptedRoute::Job(blocking)) = blocker_accepted {
             matches!(
-                tokio::time::timeout(WATCHDOG, blocking.owners.stream.dispose()).await,
+                nabedra_rt::time::timeout(WATCHDOG, blocking.owners.stream.dispose()).await,
                 Ok(Ok(()))
             )
         } else {
@@ -1793,7 +1805,7 @@ async fn receiver_first_draining_job_and_closing_retained_start() {
         facts.2 = owners
             .accept(proof.0, proof.1, &mut later, &process)
             .is_err();
-        let ready = tokio::time::timeout(WATCHDOG, accepted.owners.stream.ready()).await;
+        let ready = nabedra_rt::time::timeout(WATCHDOG, accepted.owners.stream.ready()).await;
         let payload = accepted.owners.stream.take_request();
         facts.3 = matches!(ready, Ok(Ok(Reply::Ready))) && payload.as_ref().is_ok_and(|p| matches!(&p.body, RequestBody::Job(j) if j.as_ref() as *const JobEnvelope as usize == original));
         facts.4 = accepted.start.check(&f.root, &f.pin()).is_ok();
@@ -1820,7 +1832,7 @@ async fn receiver_first_draining_job_and_closing_retained_start() {
                     .stream
                     .command(Command::StartSend { job, request: true });
                 tokio::pin!(command);
-                tokio::time::timeout(WATCHDOG, async {
+                nabedra_rt::time::timeout(WATCHDOG, async {
                     tokio::select! { _ = &mut command => false, result = seen => result.is_ok() }
                 })
                 .await
@@ -1835,7 +1847,7 @@ async fn receiver_first_draining_job_and_closing_retained_start() {
                 .accepted
                 > 1;
             let _ = release.send(());
-            let command_settled = tokio::time::timeout(WATCHDOG, async {
+            let command_settled = nabedra_rt::time::timeout(WATCHDOG, async {
                 owners
                     .shared
                     .pool
@@ -1848,7 +1860,8 @@ async fn receiver_first_draining_job_and_closing_retained_start() {
             drop(bytes);
             drop(delivery);
             facts.3 &= matches!(command_settled, Ok(Ok(())));
-            let settled = tokio::time::timeout(WATCHDOG, accepted.owners.stream.dispose()).await;
+            let settled =
+                nabedra_rt::time::timeout(WATCHDOG, accepted.owners.stream.dispose()).await;
             facts.3 &= matches!(observed, Ok(true)) && retained && matches!(settled, Ok(Ok(())));
         }
         drop(closed);
@@ -2248,10 +2261,10 @@ async fn receiver_original_request_survives_publication_discard_and_unreaped_ret
     if let Ok(AcceptedRoute::Operation(mut accepted)) = result {
         if let Some(mut account) = accepted.owners.account.take() {
             ready = matches!(
-                tokio::time::timeout(WATCHDOG, account.ready()).await,
+                nabedra_rt::time::timeout(WATCHDOG, account.ready()).await,
                 Ok(Ok(Reply::Ready))
             ) && matches!(
-                tokio::time::timeout(WATCHDOG, accepted.owners.stream.ready()).await,
+                nabedra_rt::time::timeout(WATCHDOG, accepted.owners.stream.ready()).await,
                 Ok(Ok(Reply::Ready))
             );
             publication = account.retain_delivery();
@@ -2278,7 +2291,7 @@ async fn receiver_original_request_survives_publication_discard_and_unreaped_ret
     let during_publication = retained();
     drop(publication);
     let mut drain = Box::pin(owners.close_and_drain());
-    let discarded = tokio::time::timeout(WATCHDOG, async {
+    let discarded = nabedra_rt::time::timeout(WATCHDOG, async {
         tokio::select! { r = at_discard => r.is_ok(), _ = &mut drain => false }
     })
     .await;
@@ -2286,7 +2299,7 @@ async fn receiver_original_request_survives_publication_discard_and_unreaped_ret
     let during_discard = retained();
     let _ = release_discard.send(());
     let mut drain = Box::pin(owners.close_and_drain());
-    let returning = tokio::time::timeout(WATCHDOG, async {
+    let returning = nabedra_rt::time::timeout(WATCHDOG, async {
         tokio::select! { r = at_return => r.is_ok(), _ = &mut drain => false }
     })
     .await;
@@ -2400,8 +2413,8 @@ async fn receiver_association_foreign_start_preserves_local_replay_and_start() {
     drop(process_b);
     // Join both teardowns even if one reports a failed observation after cleanup.
     let (clean_a, clean_b) = tokio::join!(
-        tokio::spawn(finish_distributed(owners_a, threads_a, path_a)),
-        tokio::spawn(finish_distributed(owners_b, threads_b, path_b)),
+        nabedra_rt::task::spawn(finish_distributed(owners_a, threads_a, path_a)),
+        nabedra_rt::task::spawn(finish_distributed(owners_b, threads_b, path_b)),
     );
     assert!(clean_a.is_ok() && clean_b.is_ok());
     assert!(independent && admitted && foreign_refused && other_started);
@@ -2499,8 +2512,8 @@ async fn receiver_association_control_keys_resolve_only_the_original_owner() {
     drop(process_a);
     drop(process_b);
     let (clean_a, clean_b) = tokio::join!(
-        tokio::spawn(finish_distributed(owners_a, threads_a, path_a)),
-        tokio::spawn(finish_distributed(owners_b, threads_b, path_b)),
+        nabedra_rt::task::spawn(finish_distributed(owners_a, threads_a, path_a)),
+        nabedra_rt::task::spawn(finish_distributed(owners_b, threads_b, path_b)),
     );
     // Keep the keys alive through cleanup: they must not keep registered owners alive.
     drop(keys);
@@ -2538,7 +2551,7 @@ async fn drain_classifier_signed_baseline_and_extra_delivery() {
     let mut outcomes = None;
     if let Some(Ok(AcceptedRoute::Drain(a))) = accepted.as_mut() {
         let incomplete = classify(&owners, &a.owner.key());
-        let ready = tokio::time::timeout(WATCHDOG, a.owner.ready()).await;
+        let ready = nabedra_rt::time::timeout(WATCHDOG, a.owner.ready()).await;
         let key = a.owner.key();
         let classify = || {
             let state = owners.shared.state.lock().unwrap();
@@ -2605,7 +2618,7 @@ async fn classifier_observer(
     };
     let ready = if let Some(a) = observer.as_mut() {
         matches!(
-            tokio::time::timeout(WATCHDOG, a.owner.ready()).await,
+            nabedra_rt::time::timeout(WATCHDOG, a.owner.ready()).await,
             Ok(Ok(()))
         )
     } else {
@@ -2649,8 +2662,8 @@ async fn drain_classifier_foreign_collisions_and_wrong_identity() {
     drop(process_a);
     drop(process_b);
     let (done_a, done_b) = tokio::join!(
-        tokio::spawn(finish_distributed(a, ta, pa)),
-        tokio::spawn(finish_distributed(b, tb, pb)),
+        nabedra_rt::task::spawn(finish_distributed(a, ta, pa)),
+        nabedra_rt::task::spawn(finish_distributed(b, tb, pb)),
     );
     assert!(done_a.is_ok() && done_b.is_ok() && ready_a && ready_b);
     assert_eq!(
@@ -2682,7 +2695,7 @@ async fn drain_classifier_dormant_preparation_and_unrelated_control() {
         .map(|r| owners.accept(proof.0, proof.1, r, &process));
     let control_ready = if let Some(Ok(AcceptedRoute::Readiness(a))) = unrelated.as_mut() {
         matches!(
-            tokio::time::timeout(WATCHDOG, a.owner.ready()).await,
+            nabedra_rt::time::timeout(WATCHDOG, a.owner.ready()).await,
             Ok(Ok(()))
         )
     } else {
@@ -2696,7 +2709,7 @@ async fn drain_classifier_dormant_preparation_and_unrelated_control() {
     });
     drop(unrelated);
     drop(route);
-    let reaped = tokio::time::timeout(WATCHDOG, async {
+    let reaped = nabedra_rt::time::timeout(WATCHDOG, async {
         loop {
             owners.release_pending();
             if owners.shared.state.lock().unwrap().payload.controls.len() == 1 {
@@ -2750,12 +2763,15 @@ async fn drain_classifier_account_publication_discard_return_and_release() {
     let mut work_ready = false;
     if let Ok(AcceptedRoute::Operation(mut a)) = accepted {
         work_ready = matches!(
-            tokio::time::timeout(WATCHDOG, a.owners.stream.ready()).await,
+            nabedra_rt::time::timeout(WATCHDOG, a.owners.stream.ready()).await,
             Ok(Ok(_))
         );
         account = a.owners.account.take();
         if let Some(a) = account.as_mut() {
-            work_ready &= matches!(tokio::time::timeout(WATCHDOG, a.ready()).await, Ok(Ok(_)));
+            work_ready &= matches!(
+                nabedra_rt::time::timeout(WATCHDOG, a.ready()).await,
+                Ok(Ok(_))
+            );
         }
     }
     drop(route);
@@ -2767,7 +2783,7 @@ async fn drain_classifier_account_publication_discard_return_and_release() {
     drop(account);
     let held = observe();
     drop(publication);
-    let discarded = tokio::time::timeout(WATCHDOG, async {
+    let discarded = nabedra_rt::time::timeout(WATCHDOG, async {
         tokio::pin!(at_discard);
         loop {
             owners.release_pending();
@@ -2777,13 +2793,13 @@ async fn drain_classifier_account_publication_discard_return_and_release() {
     .await;
     let during_discard = observe();
     let _ = release_discard.send(());
-    let returned = tokio::time::timeout(WATCHDOG, at_return).await;
+    let returned = nabedra_rt::time::timeout(WATCHDOG, at_return).await;
     let before_return = observe();
     let cleanup = slot.cleanup.load(Ordering::Acquire);
     owners.release_pending();
     let still_retained = observe();
     let _ = release_return.send(());
-    let finished = tokio::time::timeout(WATCHDOG, async {
+    let finished = nabedra_rt::time::timeout(WATCHDOG, async {
         loop {
             let finished = owners
                 .shared
@@ -2808,7 +2824,7 @@ async fn drain_classifier_account_publication_discard_return_and_release() {
     *owners.shared.releasing.lock().unwrap() = Some((at_release, gate));
     let shared = owners.shared.clone();
     let reaper = std::thread::spawn(move || reap_shared(&shared, None));
-    let releasing = tokio::time::timeout(WATCHDOG, releasing).await;
+    let releasing = nabedra_rt::time::timeout(WATCHDOG, releasing).await;
     let pending_release = observe();
     let _ = release.send(());
     let joined_reaper = reaper.join();
@@ -2859,7 +2875,7 @@ async fn drain_classifier_dependency_without_payload_account() {
         .map(|r| owners.accept(proof.0, proof.1, r, &process));
     let open_ready = if let Some(Ok(AcceptedRoute::Open(a))) = opened.as_mut() {
         matches!(
-            tokio::time::timeout(WATCHDOG, a.owner.ready()).await,
+            nabedra_rt::time::timeout(WATCHDOG, a.owner.ready()).await,
             Ok(Ok(()))
         )
     } else {
@@ -2867,7 +2883,7 @@ async fn drain_classifier_dependency_without_payload_account() {
     };
     drop(opened);
     drop(route);
-    let reaped = tokio::time::timeout(WATCHDOG, async {
+    let reaped = nabedra_rt::time::timeout(WATCHDOG, async {
         loop {
             owners.release_pending();
             if owners
@@ -2928,13 +2944,13 @@ async fn drain_classifier_cancelled_and_cleanup_unreaped_exemptions_refused() {
         }
         let cancelled = key.as_ref().map(|key| classify(&owners, key));
         drop(observer);
-        let returned = tokio::time::timeout(WATCHDOG, returned).await;
+        let returned = nabedra_rt::time::timeout(WATCHDOG, returned).await;
         let cleanup = slot
             .as_ref()
             .is_some_and(|s| s.cleanup.load(Ordering::Acquire));
         let unreaped = key.as_ref().map(|key| classify(&owners, key));
         let _ = release.send(());
-        let finished = tokio::time::timeout(WATCHDOG, async {
+        let finished = nabedra_rt::time::timeout(WATCHDOG, async {
             loop {
                 let done = {
                     let state = owners.shared.state.lock().unwrap();
@@ -3024,7 +3040,7 @@ async fn drain_classifier_failed_original_process_stays_failed() {
     let (release, gate) = oneshot::channel();
     process.slot.hooks.lock().unwrap().returning = Some((returning, gate));
     process.slot.cancel();
-    let returned = tokio::time::timeout(WATCHDOG, at_return).await;
+    let returned = nabedra_rt::time::timeout(WATCHDOG, at_return).await;
     {
         let state = owners.shared.state.lock().unwrap();
         if let Some(e) = state
@@ -3037,7 +3053,7 @@ async fn drain_classifier_failed_original_process_stays_failed() {
         }
     }
     let _ = release.send(());
-    let finished = tokio::time::timeout(WATCHDOG, async {
+    let finished = nabedra_rt::time::timeout(WATCHDOG, async {
         loop {
             let done = owners
                 .shared
@@ -3060,8 +3076,8 @@ async fn drain_classifier_failed_original_process_stays_failed() {
     let refusal = observer.as_ref().map(|a| classify(&owners, &a.owner.key()));
     drop(observer);
     drop(process);
-    let observer_returned = tokio::time::timeout(WATCHDOG, observer_at_return).await;
-    let drained = tokio::time::timeout(WATCHDOG, owners.close_and_drain()).await;
+    let observer_returned = nabedra_rt::time::timeout(WATCHDOG, observer_at_return).await;
+    let drained = nabedra_rt::time::timeout(WATCHDOG, owners.close_and_drain()).await;
     let retained_failed = owners.shared.state.lock().unwrap().payload.failed;
     let retained_observer = {
         let state = owners.shared.state.lock().unwrap();
@@ -3076,7 +3092,7 @@ async fn drain_classifier_failed_original_process_stays_failed() {
     let _ = observer_release.send(());
     // Global failure makes close_and_drain return early. Continue polling the
     // registered survivor until its original handle and guards are reaped.
-    let observer_reaped = tokio::time::timeout(WATCHDOG, async {
+    let observer_reaped = nabedra_rt::time::timeout(WATCHDOG, async {
         let waker = Waker::from(owners.shared.reap_wake.clone());
         loop {
             let notified = owners.shared.reap_wake.0.notified();
@@ -3114,7 +3130,7 @@ async fn drain_classifier_failed_original_process_stays_failed() {
     for mut entry in remaining {
         entry.slot.cancel();
         if !entry.terminated
-            && tokio::time::timeout(WATCHDOG, &mut entry.handle)
+            && nabedra_rt::time::timeout(WATCHDOG, &mut entry.handle)
                 .await
                 .is_err()
         {
@@ -3128,13 +3144,13 @@ async fn drain_classifier_failed_original_process_stays_failed() {
     }
     let quarantine = tests::quarantine_teardown(&owners);
     tokio::pin!(quarantine);
-    let quarantined = tokio::time::timeout(WATCHDOG, &mut quarantine).await;
+    let quarantined = nabedra_rt::time::timeout(WATCHDOG, &mut quarantine).await;
     if quarantined.is_err() {
         quarantine.await;
     }
     let shutdown = threads.shutdown();
     tokio::pin!(shutdown);
-    let joined = tokio::time::timeout(WATCHDOG, &mut shutdown).await;
+    let joined = nabedra_rt::time::timeout(WATCHDOG, &mut shutdown).await;
     if joined.is_err() {
         let _ = shutdown.await;
     }
@@ -3170,7 +3186,7 @@ async fn drain_classifier_failed_observer_is_retained_without_exemption() {
             e.handle.abort();
         }
     }
-    let finished = tokio::time::timeout(WATCHDOG, async {
+    let finished = nabedra_rt::time::timeout(WATCHDOG, async {
         loop {
             let done = {
                 let state = owners.shared.state.lock().unwrap();
@@ -3202,7 +3218,7 @@ async fn drain_classifier_failed_observer_is_retained_without_exemption() {
     };
     drop(observer);
     drop(process);
-    let drained = tokio::time::timeout(WATCHDOG, owners.close_and_drain()).await;
+    let drained = nabedra_rt::time::timeout(WATCHDOG, owners.close_and_drain()).await;
     // Intentional abort quarantine: the original memory-only handle was polled
     // above. Move its guards out only for test recovery, after recording failure.
     let controls = std::mem::take(&mut owners.shared.state.lock().unwrap().payload.controls);
@@ -3214,13 +3230,13 @@ async fn drain_classifier_failed_observer_is_retained_without_exemption() {
     .join();
     let quarantine = tests::quarantine_teardown(&owners);
     tokio::pin!(quarantine);
-    let quarantined = tokio::time::timeout(WATCHDOG, &mut quarantine).await;
+    let quarantined = nabedra_rt::time::timeout(WATCHDOG, &mut quarantine).await;
     if quarantined.is_err() {
         quarantine.await;
     }
     let shutdown = threads.shutdown();
     tokio::pin!(shutdown);
-    let joined = tokio::time::timeout(WATCHDOG, &mut shutdown).await;
+    let joined = nabedra_rt::time::timeout(WATCHDOG, &mut shutdown).await;
     if joined.is_err() {
         let _ = shutdown.await;
     }
@@ -3252,7 +3268,7 @@ async fn drain_classifier_unchecked_memory_control_cannot_be_observer() {
     };
     let raw_ready = if let Ok(raw) = raw.as_mut() {
         matches!(
-            tokio::time::timeout(WATCHDOG, raw.ready()).await,
+            nabedra_rt::time::timeout(WATCHDOG, raw.ready()).await,
             Ok(Ok(()))
         )
     } else {
@@ -3340,12 +3356,15 @@ async fn barrier_sample_worker_cleanup_and_release_handoff() {
     let mut work_ready = false;
     if let Ok(AcceptedRoute::Operation(mut a)) = accepted {
         work_ready = matches!(
-            tokio::time::timeout(WATCHDOG, a.owners.stream.ready()).await,
+            nabedra_rt::time::timeout(WATCHDOG, a.owners.stream.ready()).await,
             Ok(Ok(_))
         );
         account = a.owners.account.take();
         if let Some(a) = account.as_mut() {
-            work_ready &= matches!(tokio::time::timeout(WATCHDOG, a.ready()).await, Ok(Ok(_)));
+            work_ready &= matches!(
+                nabedra_rt::time::timeout(WATCHDOG, a.ready()).await,
+                Ok(Ok(_))
+            );
         }
     }
     drop(route);
@@ -3372,7 +3391,7 @@ async fn barrier_sample_worker_cleanup_and_release_handoff() {
     drop(account);
     let held = observe();
     drop(publication);
-    let discarded = tokio::time::timeout(WATCHDOG, async {
+    let discarded = nabedra_rt::time::timeout(WATCHDOG, async {
         tokio::pin!(at_discard);
         loop {
             owners.release_pending();
@@ -3383,13 +3402,13 @@ async fn barrier_sample_worker_cleanup_and_release_handoff() {
     let during_discard = observe();
     let discard_sample_refused = sample_now().is_none();
     let _ = release_discard.send(());
-    let returned = tokio::time::timeout(WATCHDOG, at_return).await;
+    let returned = nabedra_rt::time::timeout(WATCHDOG, at_return).await;
     let before_return = observe();
     let cleanup = slot.cleanup.load(Ordering::Acquire);
     owners.release_pending();
     let still_retained = observe();
     let _ = release_return.send(());
-    let finished = tokio::time::timeout(WATCHDOG, async {
+    let finished = nabedra_rt::time::timeout(WATCHDOG, async {
         loop {
             let finished = owners
                 .shared
@@ -3414,7 +3433,7 @@ async fn barrier_sample_worker_cleanup_and_release_handoff() {
     *owners.shared.releasing.lock().unwrap() = Some((at_release, gate));
     let shared = owners.shared.clone();
     let reaper = std::thread::spawn(move || reap_shared(&shared, None));
-    let releasing = tokio::time::timeout(WATCHDOG, releasing).await;
+    let releasing = nabedra_rt::time::timeout(WATCHDOG, releasing).await;
     let pending_release = observe();
     let release_sample_refused = sample_now().is_none();
     let _ = release.send(());
@@ -3501,7 +3520,8 @@ async fn barrier_sample_unchanged_root_and_fully_reaped_preparation() {
                 drop(preparation);
                 let settled = if let Some(id) = pending_id {
                     matches!(
-                        tokio::time::timeout(WATCHDOG, wait_reap(&owners.shared, Some(id))).await,
+                        nabedra_rt::time::timeout(WATCHDOG, wait_reap(&owners.shared, Some(id)))
+                            .await,
                         Ok(Ok(()))
                     )
                 } else {
@@ -3630,8 +3650,8 @@ async fn barrier_sample_foreign_key_and_initialization_refuse() {
     drop(process_a);
     drop(process_b);
     let (cleanup_a, cleanup_b) = tokio::join!(
-        tokio::spawn(finish_distributed(a, ta, pa)),
-        tokio::spawn(finish_distributed(b, tb, pb))
+        nabedra_rt::task::spawn(finish_distributed(a, ta, pa)),
+        nabedra_rt::task::spawn(finish_distributed(b, tb, pb))
     );
     assert!(cleanup_a.is_ok() && cleanup_b.is_ok());
     assert!(ra && rb);
@@ -3726,7 +3746,7 @@ async fn work_evidence_regression_pair_reservation_invalidates_before_publicatio
         let _entered = runtime.enter();
         PayloadOwners { shared }.prepare_pair(Role::Operation, permit, None)
     });
-    let reached = tokio::time::timeout(WATCHDOG, at_reservation).await;
+    let reached = nabedra_rt::time::timeout(WATCHDOG, at_reservation).await;
     let during = sample.as_ref().map(|sample| {
         let state = owners.shared.state.lock().unwrap();
         (
@@ -3879,7 +3899,7 @@ async fn proof_cycle_registered_ack_reaps_once() {
                 owners.shared.dependency_transport.available_permits(),
             );
             let published =
-                owners.publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG);
+                owners.publish_proof(sample, storage.clone(), nabedra_rt::time::now() + WATCHDOG);
             if let Ok(ticket) = published {
                 let unchanged = charges
                     == (
@@ -3896,11 +3916,15 @@ async fn proof_cycle_registered_ack_reaps_once() {
                 );
                 let busy = second.is_ok_and(|sample| {
                     matches!(
-                        owners.publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG),
+                        owners.publish_proof(
+                            sample,
+                            storage.clone(),
+                            nabedra_rt::time::now() + WATCHDOG
+                        ),
                         Err(ProofError::Busy)
                     )
                 });
-                let terminated = tokio::time::timeout(WATCHDOG, async {
+                let terminated = nabedra_rt::time::timeout(WATCHDOG, async {
                     while !owners.shared.state.lock().unwrap().payload.proof.finished() {
                         tokio::task::yield_now().await;
                     }
@@ -3908,7 +3932,7 @@ async fn proof_cycle_registered_ack_reaps_once() {
                 .await
                 .is_ok();
                 let unreaped = owners.take_proof(&ticket, &a.owner.key()).is_none();
-                let waited = tokio::time::timeout(WATCHDOG, owners.wait_proof(&ticket)).await;
+                let waited = nabedra_rt::time::timeout(WATCHDOG, owners.wait_proof(&ticket)).await;
                 let completion = owners.take_proof(&ticket, &a.owner.key());
                 let exact = completion.as_ref().is_some_and(|c| {
                     c.acknowledgement().is_some_and(|ack| ack.sequence() == 1)
@@ -3976,10 +4000,10 @@ async fn proof_cycle_gates_cancelled_waiter_and_retained_ack() {
                 .sample_barrier(prepared, id(30), a.owner.key());
         if let Ok(sample) = sample
             && let Ok(ticket) =
-                owners.publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG)
+                owners.publish_proof(sample, storage.clone(), nabedra_rt::time::now() + WATCHDOG)
         {
             let ticket = Arc::new(ticket);
-            let entered = tokio::time::timeout(WATCHDOG, io.entered.acquire())
+            let entered = nabedra_rt::time::timeout(WATCHDOG, io.entered.acquire())
                 .await
                 .is_ok();
             let snapshot = owners
@@ -3993,17 +4017,17 @@ async fn proof_cycle_gates_cancelled_waiter_and_retained_ack() {
             let waiter_a = {
                 let o = owners.clone();
                 let t = ticket.clone();
-                tokio::spawn(async move { o.wait_proof(&t).await })
+                nabedra_rt::task::spawn(async move { o.wait_proof(&t).await })
             };
             let mut waiter_b = {
                 let o = owners.clone();
                 let t = ticket.clone();
-                tokio::spawn(async move { o.wait_proof(&t).await })
+                nabedra_rt::task::spawn(async move { o.wait_proof(&t).await })
             };
             waiter_a.abort();
             let cancelled = waiter_a.await.is_err();
             io.release.add_permits(1);
-            let buffered = tokio::time::timeout(WATCHDOG, ack.entered.acquire())
+            let buffered = nabedra_rt::time::timeout(WATCHDOG, ack.entered.acquire())
                 .await
                 .is_ok();
             let retained = owners
@@ -4015,12 +4039,12 @@ async fn proof_cycle_gates_cancelled_waiter_and_retained_ack() {
                 .retention_locked();
             let early = owners.take_proof(&ticket, &a.owner.key()).is_none();
             ack.release.add_permits(1);
-            let cleanup = tokio::time::timeout(WATCHDOG, returning.entered.acquire())
+            let cleanup = nabedra_rt::time::timeout(WATCHDOG, returning.entered.acquire())
                 .await
                 .is_ok();
             let still_early = owners.take_proof(&ticket, &a.owner.key()).is_none();
             returning.release.add_permits(1);
-            let survivor = tokio::time::timeout(WATCHDOG, &mut waiter_b).await;
+            let survivor = nabedra_rt::time::timeout(WATCHDOG, &mut waiter_b).await;
             if survivor.is_err() {
                 waiter_b.abort();
                 let _ = waiter_b.await;
@@ -4125,10 +4149,13 @@ async fn proof_cycle_no_ack_and_panic_remain_owned() {
                         (StorageError::InvalidCatalog, false),
                     );
                 }
-                if let Ok(ticket) =
-                    owners.publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG)
-                {
-                    let waited = tokio::time::timeout(WATCHDOG, owners.wait_proof(&ticket)).await;
+                if let Ok(ticket) = owners.publish_proof(
+                    sample,
+                    storage.clone(),
+                    nabedra_rt::time::now() + WATCHDOG,
+                ) {
+                    let waited =
+                        nabedra_rt::time::timeout(WATCHDOG, owners.wait_proof(&ticket)).await;
                     let completion = owners.take_proof(&ticket, &a.owner.key());
                     let no_ack = completion
                         .as_ref()
@@ -4219,12 +4246,12 @@ async fn proof_cycle_placeholder_shutdown_is_resumable() {
         if let Ok(sample) = sample {
             let o = owners.clone();
             let s = storage.clone();
-            task = Some(tokio::task::spawn_blocking(move || {
-                o.publish_proof(sample, s, Instant::now() + WATCHDOG)
+            task = Some(nabedra_rt::task::spawn_blocking(move || {
+                o.publish_proof(sample, s, nabedra_rt::time::now() + WATCHDOG)
             }));
         }
     }
-    let reached = tokio::time::timeout(WATCHDOG, at).await;
+    let reached = nabedra_rt::time::timeout(WATCHDOG, at).await;
     let snapshot = owners
         .shared
         .state
@@ -4233,7 +4260,7 @@ async fn proof_cycle_placeholder_shutdown_is_resumable() {
         .payload
         .retention_locked();
     let before = storage.backend().state.lock().unwrap().puts;
-    let cancelled = tokio::time::timeout(
+    let cancelled = nabedra_rt::time::timeout(
         std::time::Duration::from_millis(20),
         owners.close_and_drain(),
     )
@@ -4283,9 +4310,10 @@ async fn proof_cycle_exact_key_exhaustion_and_independent_work() {
                 .unwrap()
                 .sample_barrier(prepared, id(30), oa.owner.key());
         if let Ok(sample) = sample
-            && let Ok(ticket) = a.publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG)
+            && let Ok(ticket) =
+                a.publish_proof(sample, storage.clone(), nabedra_rt::time::now() + WATCHDOG)
         {
-            let waited = tokio::time::timeout(WATCHDOG, a.wait_proof(&ticket)).await;
+            let waited = nabedra_rt::time::timeout(WATCHDOG, a.wait_proof(&ticket)).await;
             let foreign = a.take_proof(&ticket, &ob.owner.key()).is_none();
             let hold = oa.owner.retain_response();
             drop(hold);
@@ -4313,9 +4341,9 @@ async fn proof_cycle_exact_key_exhaustion_and_independent_work() {
             let mut reused = false;
             if let Ok(sample) = last
                 && let Ok(ticket) =
-                    a.publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG)
+                    a.publish_proof(sample, storage.clone(), nabedra_rt::time::now() + WATCHDOG)
             {
-                let waited = tokio::time::timeout(WATCHDOG, a.wait_proof(&ticket)).await;
+                let waited = nabedra_rt::time::timeout(WATCHDOG, a.wait_proof(&ticket)).await;
                 let completion = a.take_proof(&ticket, &oa.owner.key());
                 reused = matches!(waited, Ok(Ok(())))
                     && completion.as_ref().is_some_and(|c| {
@@ -4334,7 +4362,7 @@ async fn proof_cycle_exact_key_exhaustion_and_independent_work() {
                     .sample_barrier(prepared, id(30), oa.owner.key());
             let exhausted = sample.is_ok_and(|s| {
                 matches!(
-                    a.publish_proof(s, storage.clone(), Instant::now() + WATCHDOG),
+                    a.publish_proof(s, storage.clone(), nabedra_rt::time::now() + WATCHDOG),
                     Err(ProofError::Exhausted)
                 )
             });
@@ -4345,8 +4373,8 @@ async fn proof_cycle_exact_key_exhaustion_and_independent_work() {
     drop(ob);
     drop(process_a);
     drop(process_b);
-    let ca = tokio::spawn(finish_distributed(a, ta, pa));
-    let cb = tokio::spawn(finish_distributed(b, tb, pb));
+    let ca = nabedra_rt::task::spawn(finish_distributed(a, ta, pa));
+    let cb = nabedra_rt::task::spawn(finish_distributed(b, tb, pb));
     let (ca, cb) = tokio::join!(ca, cb);
     assert!(ca.is_ok() && cb.is_ok() && ra && rb);
     assert_eq!(result, Some(true));
@@ -4378,9 +4406,11 @@ impl crate::storage::ObjectStore for PendingProofFake {
         let gate = self.gate.clone();
         let key = key.to_owned();
         let (send, receive) = oneshot::channel();
-        let task = tokio::spawn(async move {
+        let task = nabedra_rt::task::spawn(async move {
             gate.entered.add_permits(1);
-            if let Ok(Ok(permit)) = tokio::time::timeout(WATCHDOG, gate.release.acquire()).await {
+            if let Ok(Ok(permit)) =
+                nabedra_rt::time::timeout(WATCHDOG, gate.release.acquire()).await
+            {
                 permit.forget();
             }
             let result = crate::storage::ObjectStore::put(
@@ -4433,12 +4463,12 @@ async fn proof_cycle_cancelled_ticket_ambiguous_provider_is_not_recovered_by_rea
                 .publish_proof(
                     sample,
                     storage.clone(),
-                    Instant::now() + std::time::Duration::from_millis(50),
+                    nabedra_rt::time::now() + std::time::Duration::from_millis(50),
                 )
                 .ok();
         }
     }
-    let entered = tokio::time::timeout(WATCHDOG, gate.entered.acquire())
+    let entered = nabedra_rt::time::timeout(WATCHDOG, gate.entered.acquire())
         .await
         .is_ok();
     let active = owners
@@ -4449,7 +4479,7 @@ async fn proof_cycle_cancelled_ticket_ambiguous_provider_is_not_recovered_by_rea
         .payload
         .retention_locked();
     drop(ticket);
-    let drain = tokio::time::timeout(WATCHDOG, owners.close_and_drain()).await;
+    let drain = nabedra_rt::time::timeout(WATCHDOG, owners.close_and_drain()).await;
     let retained = owners
         .shared
         .state
@@ -4526,14 +4556,14 @@ async fn proof_cycle_buffered_ack_cancel_and_resume_shutdown() {
                 .sample_barrier(prepared, id(30), a.owner.key());
         if let Ok(sample) = sample {
             ticket = owners
-                .publish_proof(sample, storage, Instant::now() + WATCHDOG)
+                .publish_proof(sample, storage, nabedra_rt::time::now() + WATCHDOG)
                 .ok();
         }
     }
-    let entered = tokio::time::timeout(WATCHDOG, gate.entered.acquire())
+    let entered = nabedra_rt::time::timeout(WATCHDOG, gate.entered.acquire())
         .await
         .is_ok();
-    let drain_cancelled = tokio::time::timeout(
+    let drain_cancelled = nabedra_rt::time::timeout(
         std::time::Duration::from_millis(20),
         owners.close_and_drain(),
     )
@@ -4551,7 +4581,7 @@ async fn proof_cycle_buffered_ack_cancel_and_resume_shutdown() {
     drop(process);
     // Keep the cancelled ticket alive through resumed full drain. Its shared
     // identity must not keep a buffered outcome/provider after actual reap.
-    let drained = tokio::time::timeout(WATCHDOG, owners.close_and_drain()).await;
+    let drained = nabedra_rt::time::timeout(WATCHDOG, owners.close_and_drain()).await;
     let final_snapshot = owners
         .shared
         .state
@@ -4609,11 +4639,11 @@ async fn proof_cycle_regression_drops_preserve_work_generation() {
             });
             if let (Some(sample), Some(baseline)) = (sample, baseline) {
                 let mut ticket = owners
-                    .publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG)
+                    .publish_proof(sample, storage.clone(), nabedra_rt::time::now() + WATCHDOG)
                     .ok();
                 let waited = if let Some(t) = &ticket {
                     matches!(
-                        tokio::time::timeout(WATCHDOG, owners.wait_proof(t)).await,
+                        nabedra_rt::time::timeout(WATCHDOG, owners.wait_proof(t)).await,
                         Ok(Ok(()))
                     )
                 } else {
@@ -4656,8 +4686,10 @@ async fn proof_cycle_regression_drops_preserve_work_generation() {
                 drop(completion);
                 let shared = owners.shared.clone();
                 let reaper = std::thread::spawn(move || reap_shared(&shared, None));
-                let reached =
-                    matches!(tokio::time::timeout(WATCHDOG, at_release).await, Ok(Ok(())));
+                let reached = matches!(
+                    nabedra_rt::time::timeout(WATCHDOG, at_release).await,
+                    Ok(Ok(()))
+                );
                 let pending = {
                     let state = owners.shared.state.lock().unwrap();
                     let snapshot = state.payload.retention_locked();
@@ -4753,11 +4785,12 @@ async fn proof_cycle_regression_spawn_allows_receiver_inspection() {
         if let Some(sample) = sample {
             let (probe, observed) = oneshot::channel();
             owners.shared.state.lock().unwrap().payload.proof.spawning = Some(probe);
-            let ticket = owners.publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG);
-            let inspection = tokio::time::timeout(WATCHDOG, observed).await;
+            let ticket =
+                owners.publish_proof(sample, storage.clone(), nabedra_rt::time::now() + WATCHDOG);
+            let inspection = nabedra_rt::time::timeout(WATCHDOG, observed).await;
             let waited = if let Ok(t) = &ticket {
                 matches!(
-                    tokio::time::timeout(WATCHDOG, owners.wait_proof(t)).await,
+                    nabedra_rt::time::timeout(WATCHDOG, owners.wait_proof(t)).await,
                     Ok(Ok(()))
                 )
             } else {
@@ -4816,24 +4849,25 @@ async fn proof_cycle_waiting_drain_survives_handle_publication() {
         if let Some(sample) = sample {
             let retained_owners = owners.clone();
             let retained_storage = storage.clone();
-            publishing = Some(tokio::task::spawn_blocking(move || {
+            publishing = Some(nabedra_rt::task::spawn_blocking(move || {
                 retained_owners.publish_proof(
                     sample,
                     retained_storage,
-                    Instant::now() + WATCHDOG * 3,
+                    nabedra_rt::time::now() + WATCHDOG * 3,
                 )
             }));
         }
     }
     let reached = matches!(
-        tokio::time::timeout(WATCHDOG, at_preparation).await,
+        nabedra_rt::time::timeout(WATCHDOG, at_preparation).await,
         Ok(Ok(()))
     );
     drop(observer);
     drop(process);
     let draining_owners = owners.clone();
-    let mut draining = tokio::spawn(async move { draining_owners.close_and_drain().await });
-    let ordinary_reaped = tokio::time::timeout(WATCHDOG, async {
+    let mut draining =
+        nabedra_rt::task::spawn(async move { draining_owners.close_and_drain().await });
+    let ordinary_reaped = nabedra_rt::time::timeout(WATCHDOG, async {
         loop {
             let ordinary_empty = {
                 let state = owners.shared.state.lock().unwrap();
@@ -4865,13 +4899,13 @@ async fn proof_cycle_waiting_drain_survives_handle_publication() {
         None
     };
     // Keep the original ticket alive: shutdown already cancelled this cycle.
-    let original_result = tokio::time::timeout(WATCHDOG, &mut draining).await;
+    let original_result = nabedra_rt::time::timeout(WATCHDOG, &mut draining).await;
     let completed_without_rescue = matches!(original_result, Ok(Ok(Ok(()))));
     let mut settled = completed_without_rescue;
     if original_result.is_err() {
         // Recovery is only teardown after the failed observation was captured.
         owners.shared.reap_wake.0.notify_waiters();
-        let recovered = tokio::time::timeout(WATCHDOG, &mut draining).await;
+        let recovered = nabedra_rt::time::timeout(WATCHDOG, &mut draining).await;
         settled = matches!(recovered, Ok(Ok(Ok(()))));
         if recovered.is_err() {
             draining.abort();
@@ -4942,14 +4976,14 @@ async fn final_drain_receipt_reaped_original_and_ticket_drop() {
             .sample_barrier(prepared, id(30), a.owner.key())
             .unwrap();
         let ticket = owners
-            .publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG)
+            .publish_proof(sample, storage.clone(), nabedra_rt::time::now() + WATCHDOG)
             .unwrap();
-        let reached = tokio::time::timeout(WATCHDOG, gate.entered.acquire())
+        let reached = nabedra_rt::time::timeout(WATCHDOG, gate.entered.acquire())
             .await
             .is_ok();
         let early = owners.take_proof(&ticket, &a.owner.key()).is_none();
         gate.release.add_permits(1);
-        let waited = tokio::time::timeout(WATCHDOG, owners.wait_proof(&ticket)).await;
+        let waited = nabedra_rt::time::timeout(WATCHDOG, owners.wait_proof(&ticket)).await;
         let completion = owners.take_proof(&ticket, &a.owner.key());
         drop(ticket);
         let ordinary = classify(&owners, &a.owner.key());
@@ -5029,9 +5063,9 @@ async fn final_proof(
         .sample_barrier(prepared, id(30), observer.key())
         .ok()?;
     let ticket = owners
-        .publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG)
+        .publish_proof(sample, storage.clone(), nabedra_rt::time::now() + WATCHDOG)
         .ok()?;
-    let waited = tokio::time::timeout(WATCHDOG, owners.wait_proof(&ticket)).await;
+    let waited = nabedra_rt::time::timeout(WATCHDOG, owners.wait_proof(&ticket)).await;
     let result = if matches!(waited, Ok(Ok(()))) {
         owners.take_proof(&ticket, &observer.key())
     } else {
@@ -5041,7 +5075,7 @@ async fn final_proof(
     result
 }
 async fn final_cycle_released(owners: &PayloadOwners) -> bool {
-    tokio::time::timeout(WATCHDOG, async {
+    nabedra_rt::time::timeout(WATCHDOG, async {
         loop {
             owners.release_pending();
             if owners.shared.state.lock().unwrap().payload.proof.retained() == 0 {
@@ -5094,12 +5128,15 @@ async fn final_drain_receipt_account_publication_cleanup_and_release() {
         let mut work_ready = false;
         if let Ok(AcceptedRoute::Operation(mut a)) = accepted {
             work_ready = matches!(
-                tokio::time::timeout(WATCHDOG, a.owners.stream.ready()).await,
+                nabedra_rt::time::timeout(WATCHDOG, a.owners.stream.ready()).await,
                 Ok(Ok(_))
             );
             account = a.owners.account.take();
             if let Some(a) = account.as_mut() {
-                work_ready &= matches!(tokio::time::timeout(WATCHDOG, a.ready()).await, Ok(Ok(_)));
+                work_ready &= matches!(
+                    nabedra_rt::time::timeout(WATCHDOG, a.ready()).await,
+                    Ok(Ok(_))
+                );
             }
         }
         drop(route);
@@ -5128,7 +5165,7 @@ async fn final_drain_receipt_account_publication_cleanup_and_release() {
             final_checked = final_nonpositive(&owners, &mut proof);
         }
         drop(publication);
-        let discarded = tokio::time::timeout(WATCHDOG, async {
+        let discarded = nabedra_rt::time::timeout(WATCHDOG, async {
         tokio::pin!(at_discard);
         loop {
             owners.release_pending();
@@ -5141,7 +5178,7 @@ async fn final_drain_receipt_account_publication_cleanup_and_release() {
             final_checked = final_nonpositive(&owners, &mut proof);
         }
         let _ = release_discard.send(());
-        let returned = tokio::time::timeout(WATCHDOG, at_return).await;
+        let returned = nabedra_rt::time::timeout(WATCHDOG, at_return).await;
         let before_return = observe();
         if phase == 3 {
             final_checked = final_nonpositive(&owners, &mut proof);
@@ -5153,7 +5190,7 @@ async fn final_drain_receipt_account_publication_cleanup_and_release() {
             final_checked = final_nonpositive(&owners, &mut proof);
         }
         let _ = release_return.send(());
-        let finished = tokio::time::timeout(WATCHDOG, async {
+        let finished = nabedra_rt::time::timeout(WATCHDOG, async {
             loop {
                 let finished = owners
                     .shared
@@ -5181,7 +5218,7 @@ async fn final_drain_receipt_account_publication_cleanup_and_release() {
         *owners.shared.releasing.lock().unwrap() = Some((at_release, gate));
         let shared = owners.shared.clone();
         let reaper = std::thread::spawn(move || reap_shared(&shared, None));
-        let releasing = tokio::time::timeout(WATCHDOG, releasing).await;
+        let releasing = nabedra_rt::time::timeout(WATCHDOG, releasing).await;
         let pending_release = observe();
         if phase == 6 {
             final_checked = final_nonpositive(&owners, &mut proof);
@@ -5262,7 +5299,7 @@ async fn final_drain_receipt_history_preparation_and_extra_response() {
                     drop(preparation.take());
                     settled = if let Some(owner_id) = owner_id {
                         matches!(
-                            tokio::time::timeout(
+                            nabedra_rt::time::timeout(
                                 WATCHDOG,
                                 wait_reap(&owners.shared, Some(owner_id))
                             )
@@ -5290,7 +5327,7 @@ async fn final_drain_receipt_history_preparation_and_extra_response() {
             drop(preparation);
             drop(delivery);
             let released = final_cycle_released(&owners).await;
-            let settled_all = tokio::time::timeout(WATCHDOG, async {
+            let settled_all = nabedra_rt::time::timeout(WATCHDOG, async {
                 loop {
                     owners.release_pending();
                     if classify(&owners, &a.owner.key()) == DrainWork::ExemptOnly {
@@ -5363,8 +5400,8 @@ async fn final_drain_receipt_foreign_cycle_preserves_both_receivers() {
     drop(ob);
     drop(process_a);
     drop(process_b);
-    let cleanup_a = tokio::spawn(finish_distributed(a, ta, pa));
-    let cleanup_b = tokio::spawn(finish_distributed(b, tb, pb));
+    let cleanup_a = nabedra_rt::task::spawn(finish_distributed(a, ta, pa));
+    let cleanup_b = nabedra_rt::task::spawn(finish_distributed(b, tb, pb));
     let (a, b) = tokio::join!(cleanup_a, cleanup_b);
     assert!(a.is_ok() && b.is_ok() && ra && rb);
     assert_eq!(result, Some((true, true, true, true)));
@@ -5401,7 +5438,7 @@ async fn final_drain_receipt_cancelled_observer_and_stale_root_refuse() {
             let replacement_ready = if let Some(Ok(AcceptedRoute::Drain(a))) = replacement.as_mut()
             {
                 matches!(
-                    tokio::time::timeout(WATCHDOG, a.owner.ready()).await,
+                    nabedra_rt::time::timeout(WATCHDOG, a.owner.ready()).await,
                     Ok(Ok(()))
                 )
             } else {
@@ -5411,7 +5448,7 @@ async fn final_drain_receipt_cancelled_observer_and_stale_root_refuse() {
             drop(observer.take());
             let released = final_cycle_released(&owners).await;
             let fresh = if let Some(Ok(AcceptedRoute::Drain(a))) = &replacement {
-                let settled = tokio::time::timeout(WATCHDOG, async {
+                let settled = nabedra_rt::time::timeout(WATCHDOG, async {
                     loop {
                         owners.release_pending();
                         if owners.shared.state.lock().unwrap().payload.controls.len() == 1 {
@@ -5458,7 +5495,7 @@ async fn final_drain_receipt_unrelated_control_and_preparation() {
         .map(|r| owners.accept(proof.0, proof.1, r, &process));
     let control_ready = if let Some(Ok(AcceptedRoute::Readiness(a))) = unrelated.as_mut() {
         matches!(
-            tokio::time::timeout(WATCHDOG, a.owner.ready()).await,
+            nabedra_rt::time::timeout(WATCHDOG, a.owner.ready()).await,
             Ok(Ok(()))
         )
     } else {
@@ -5484,7 +5521,7 @@ async fn final_drain_receipt_unrelated_control_and_preparation() {
     let control_released = final_cycle_released(&owners).await;
     drop(unrelated);
     drop(route);
-    let reaped = tokio::time::timeout(WATCHDOG, async {
+    let reaped = nabedra_rt::time::timeout(WATCHDOG, async {
         loop {
             owners.release_pending();
             if owners.shared.state.lock().unwrap().payload.controls.len() == 1 {
@@ -5532,7 +5569,7 @@ async fn final_drain_receipt_dependency_without_payload() {
         .map(|r| owners.accept(proof.0, proof.1, r, &process));
     let open_ready = if let Some(Ok(AcceptedRoute::Open(a))) = opened.as_mut() {
         matches!(
-            tokio::time::timeout(WATCHDOG, a.owner.ready()).await,
+            nabedra_rt::time::timeout(WATCHDOG, a.owner.ready()).await,
             Ok(Ok(()))
         )
     } else {
@@ -5540,7 +5577,7 @@ async fn final_drain_receipt_dependency_without_payload() {
     };
     drop(opened);
     drop(route);
-    let reaped = tokio::time::timeout(WATCHDOG, async {
+    let reaped = nabedra_rt::time::timeout(WATCHDOG, async {
         loop {
             owners.release_pending();
             if owners
@@ -5641,7 +5678,7 @@ async fn final_drain_receipt_failed_process() {
     let (release, gate) = oneshot::channel();
     process.slot.hooks.lock().unwrap().returning = Some((returning, gate));
     process.slot.cancel();
-    let returned = tokio::time::timeout(WATCHDOG, at_return).await;
+    let returned = nabedra_rt::time::timeout(WATCHDOG, at_return).await;
     {
         let state = owners.shared.state.lock().unwrap();
         if let Some(e) = state
@@ -5654,7 +5691,7 @@ async fn final_drain_receipt_failed_process() {
         }
     }
     let _ = release.send(());
-    let finished = tokio::time::timeout(WATCHDOG, async {
+    let finished = nabedra_rt::time::timeout(WATCHDOG, async {
         loop {
             let done = owners
                 .shared
@@ -5679,8 +5716,8 @@ async fn final_drain_receipt_failed_process() {
     let refusal = observer.as_ref().map(|a| classify(&owners, &a.owner.key()));
     drop(observer);
     drop(process);
-    let observer_returned = tokio::time::timeout(WATCHDOG, observer_at_return).await;
-    let drained = tokio::time::timeout(WATCHDOG, owners.close_and_drain()).await;
+    let observer_returned = nabedra_rt::time::timeout(WATCHDOG, observer_at_return).await;
+    let drained = nabedra_rt::time::timeout(WATCHDOG, owners.close_and_drain()).await;
     let retained_failed = owners.shared.state.lock().unwrap().payload.failed;
     let retained_observer = {
         let state = owners.shared.state.lock().unwrap();
@@ -5695,7 +5732,7 @@ async fn final_drain_receipt_failed_process() {
     let _ = observer_release.send(());
     // Global failure makes close_and_drain return early. Continue polling the
     // registered survivor until its original handle and guards are reaped.
-    let observer_reaped = tokio::time::timeout(WATCHDOG, async {
+    let observer_reaped = nabedra_rt::time::timeout(WATCHDOG, async {
         let waker = Waker::from(owners.shared.reap_wake.clone());
         loop {
             let notified = owners.shared.reap_wake.0.notified();
@@ -5733,7 +5770,7 @@ async fn final_drain_receipt_failed_process() {
     for mut entry in remaining {
         entry.slot.cancel();
         if !entry.terminated
-            && tokio::time::timeout(WATCHDOG, &mut entry.handle)
+            && nabedra_rt::time::timeout(WATCHDOG, &mut entry.handle)
                 .await
                 .is_err()
         {
@@ -5747,13 +5784,13 @@ async fn final_drain_receipt_failed_process() {
     }
     let quarantine = tests::quarantine_teardown(&owners);
     tokio::pin!(quarantine);
-    let quarantined = tokio::time::timeout(WATCHDOG, &mut quarantine).await;
+    let quarantined = nabedra_rt::time::timeout(WATCHDOG, &mut quarantine).await;
     if quarantined.is_err() {
         quarantine.await;
     }
     let shutdown = threads.shutdown();
     tokio::pin!(shutdown);
-    let joined = tokio::time::timeout(WATCHDOG, &mut shutdown).await;
+    let joined = nabedra_rt::time::timeout(WATCHDOG, &mut shutdown).await;
     if joined.is_err() {
         let _ = shutdown.await;
     }
@@ -5839,10 +5876,13 @@ async fn final_drain_receipt_no_ack_and_failed_outcomes() {
                         (StorageError::InvalidCatalog, false),
                     );
                 }
-                if let Ok(ticket) =
-                    owners.publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG)
-                {
-                    let waited = tokio::time::timeout(WATCHDOG, owners.wait_proof(&ticket)).await;
+                if let Ok(ticket) = owners.publish_proof(
+                    sample,
+                    storage.clone(),
+                    nabedra_rt::time::now() + WATCHDOG,
+                ) {
+                    let waited =
+                        nabedra_rt::time::timeout(WATCHDOG, owners.wait_proof(&ticket)).await;
                     let completion = owners.take_proof(&ticket, &a.owner.key());
                     let no_ack = completion
                         .as_ref()
@@ -5930,7 +5970,7 @@ async fn final_drain_receipt_shutdown_retains_observation() {
         .retention_locked();
     drop(observer);
     drop(process);
-    let blocked = tokio::time::timeout(
+    let blocked = nabedra_rt::time::timeout(
         std::time::Duration::from_millis(20),
         owners.close_and_drain(),
     )
@@ -6002,11 +6042,11 @@ async fn final_drain_receipt_replacement_cannot_take_original_cycle() {
             .sample_barrier(preparation, id(30), original.owner.key())
             .unwrap();
         let ticket = owners
-            .publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG)
+            .publish_proof(sample, storage.clone(), nabedra_rt::time::now() + WATCHDOG)
             .unwrap();
-        let waited = tokio::time::timeout(WATCHDOG, owners.wait_proof(&ticket)).await;
+        let waited = nabedra_rt::time::timeout(WATCHDOG, owners.wait_proof(&ticket)).await;
         drop(observer.take());
-        let gone = tokio::time::timeout(WATCHDOG, async {
+        let gone = nabedra_rt::time::timeout(WATCHDOG, async {
             loop {
                 owners.release_pending();
                 if owners
@@ -6036,7 +6076,7 @@ async fn final_drain_receipt_replacement_cannot_take_original_cycle() {
             .map(|r| owners.accept(checked.0, checked.1, r, &process));
         if let Some(Ok(AcceptedRoute::Drain(a))) = replacement.as_mut() {
             let new_ready = matches!(
-                tokio::time::timeout(WATCHDOG, a.owner.ready()).await,
+                nabedra_rt::time::timeout(WATCHDOG, a.owner.ready()).await,
                 Ok(Ok(()))
             );
             let cannot_take = owners.take_proof(&ticket, &a.owner.key()).is_none();
@@ -6083,14 +6123,15 @@ async fn final_drain_cleanup_watchdog_keeps_owner_drain_before_pool_shutdown() {
     let (release, gate) = oneshot::channel();
     process.slot.hooks.lock().unwrap().returning = Some((returning, gate));
     drop(process);
-    let reached_return = tokio::time::timeout(WATCHDOG, at_return).await;
-    let mut cleanup = tokio::spawn(finish_distributed_with_watchdog(
+    let reached_return = nabedra_rt::time::timeout(WATCHDOG, at_return).await;
+    let mut cleanup = nabedra_rt::task::spawn(finish_distributed_with_watchdog(
         owners,
         threads,
         path,
         std::time::Duration::from_millis(20),
     ));
-    let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut cleanup).await;
+    let early =
+        nabedra_rt::time::timeout(std::time::Duration::from_millis(200), &mut cleanup).await;
     let still_owned = early.is_err();
     let scratch_retained = scratch.exists();
     let pool_available = match pool.submit(0, |_, _| Ok(())).await {
@@ -6118,7 +6159,7 @@ async fn final_drain_cleanup_watchdog_keeps_owner_drain_before_pool_shutdown() {
         }
     };
     tokio::pin!(survivor);
-    let reaped = tokio::time::timeout(WATCHDOG, &mut survivor).await;
+    let reaped = nabedra_rt::time::timeout(WATCHDOG, &mut survivor).await;
     if reaped.is_err() {
         survivor.await;
     }
@@ -6152,7 +6193,7 @@ async fn final_drain_cleanup_watchdog_keeps_original_worker_join() {
         .submit(0, move |_, runtime| {
             // Runtime teardown drops this witness before the thread is joined.
             let witness = WorkerExit(Some(exited));
-            let exit_task = runtime.spawn(async move {
+            let exit_task = nabedra_rt::task::spawn_on(runtime.handle(), async move {
                 let _witness = witness;
                 std::future::pending::<()>().await;
             });
@@ -6160,14 +6201,15 @@ async fn final_drain_cleanup_watchdog_keeps_original_worker_join() {
             Ok((gate.recv_timeout(WATCHDOG).is_ok(), exit_task))
         })
         .await;
-    let reached_work = tokio::time::timeout(WATCHDOG, at_work).await;
-    let mut cleanup = tokio::spawn(finish_distributed_with_watchdog(
+    let reached_work = nabedra_rt::time::timeout(WATCHDOG, at_work).await;
+    let mut cleanup = nabedra_rt::task::spawn(finish_distributed_with_watchdog(
         owners,
         threads,
         path,
         std::time::Duration::from_millis(20),
     ));
-    let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut cleanup).await;
+    let early =
+        nabedra_rt::time::timeout(std::time::Duration::from_millis(200), &mut cleanup).await;
     let still_owned = early.is_err();
     let scratch_retained = scratch.exists();
     let _ = release.send(());
@@ -6189,7 +6231,7 @@ async fn final_drain_cleanup_watchdog_keeps_original_worker_join() {
     // The pre-correction path loses its join future; still wait for the actual
     // worker runtime to exit before reporting the regression's observations.
     tokio::pin!(at_exit);
-    let exited = tokio::time::timeout(WATCHDOG, &mut at_exit).await;
+    let exited = nabedra_rt::time::timeout(WATCHDOG, &mut at_exit).await;
     if exited.is_err() {
         let _ = at_exit.await;
     }
@@ -6228,7 +6270,7 @@ async fn checked_control_continues_original_tcp_reader_through_eof() {
         let bytes = encode_job(content.job().unwrap()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let sending = tokio::spawn(async move {
+        let sending = nabedra_rt::task::spawn(async move {
             let mut tcp = TcpStream::connect(address).await.unwrap();
             {
                 let mut writer = FrameWriter::new(&mut tcp);
@@ -6389,7 +6431,7 @@ async fn self_dependency_account_reaps_while_original_operation_response_is_reta
     drop(job_stream);
     // Drive the real handles through job cleanup and account reaping while the
     // original operation and its response hold are deliberately still alive.
-    let released = tokio::time::timeout(
+    let released = nabedra_rt::time::timeout(
         WATCHDOG,
         poll_fn(|cx| {
             reap_shared(&owners.shared, Some(cx));
@@ -6434,15 +6476,15 @@ async fn self_dependency_account_reaps_while_original_operation_response_is_reta
     drop(stream);
     drop(account);
     drop(process);
-    let drained = tokio::time::timeout(WATCHDOG, owners.close_and_drain()).await;
+    let drained = nabedra_rt::time::timeout(WATCHDOG, owners.close_and_drain()).await;
     if !matches!(drained, Ok(Ok(()))) {
         // The pre-fix failure quarantines original handles. Dispose them before
         // reporting the regression so the failing test leaves no worker/scratch.
-        tokio::time::timeout(WATCHDOG, tests::quarantine_teardown(&owners))
+        nabedra_rt::time::timeout(WATCHDOG, tests::quarantine_teardown(&owners))
             .await
             .unwrap();
     }
-    let joined = tokio::time::timeout(WATCHDOG, threads.shutdown()).await;
+    let joined = nabedra_rt::time::timeout(WATCHDOG, threads.shutdown()).await;
     let empty = std::fs::read_dir(&path).unwrap().count() == 0;
     std::fs::remove_dir(path).unwrap();
     assert!(matches!(
@@ -6498,11 +6540,11 @@ async fn c06_f03_parallel_outbound_streams_retain_one_operation_and_transfer_sta
     main.ready().await.unwrap();
     let source = owners.fork_source(&main).unwrap();
     let mut first = owners
-        .fork_stream(&source, Instant::now() + WATCHDOG)
+        .fork_stream(&source, nabedra_rt::time::now() + WATCHDOG)
         .await
         .unwrap();
     let mut second = owners
-        .fork_stream(&source, Instant::now() + WATCHDOG)
+        .fork_stream(&source, nabedra_rt::time::now() + WATCHDOG)
         .await
         .unwrap();
     first.ready().await.unwrap();
@@ -6616,7 +6658,11 @@ async fn a02_ordinary_heartbeat_and_drain_proof_share_one_sequence_writer() {
                 .await
                 .as_mut()
                 .unwrap()
-                .publish(&storage, ordinary.clone(), Instant::now() + WATCHDOG)
+                .publish(
+                    &storage,
+                    ordinary.clone(),
+                    nabedra_rt::time::now() + WATCHDOG,
+                )
                 .await
                 .unwrap();
             assert!(
@@ -6624,7 +6670,7 @@ async fn a02_ordinary_heartbeat_and_drain_proof_share_one_sequence_writer() {
             );
         }
         let ticket = owners
-            .publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG)
+            .publish_proof(sample, storage.clone(), nabedra_rt::time::now() + WATCHDOG)
             .unwrap();
         owners.wait_proof(&ticket).await.unwrap();
         let proof = owners.take_proof(&ticket, &observer.owner.key()).unwrap();
@@ -6637,7 +6683,7 @@ async fn a02_ordinary_heartbeat_and_drain_proof_share_one_sequence_writer() {
             .await
             .as_mut()
             .unwrap()
-            .publish(&storage, ordinary, Instant::now() + WATCHDOG)
+            .publish(&storage, ordinary, nabedra_rt::time::now() + WATCHDOG)
             .await
             .unwrap();
         assert!(matches!(result,HeartbeatWriteResult::Acknowledged(ack) if ack.sequence()==4));

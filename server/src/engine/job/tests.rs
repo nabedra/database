@@ -5,16 +5,16 @@ async fn captured_reads_complete_input_and_validate_before_io() {
     for field in ["cluster", "operation", "table", "object", "schema", "range"] {
         let mut j = f.job.clone();
         match field {
-            "cluster" => j.cluster_id = uuid::Uuid::new_v4(),
-            "operation" => j.operation_id = uuid::Uuid::new_v4(),
-            "table" => j.table.id = uuid::Uuid::new_v4(),
+            "cluster" => j.cluster_id = nabedra_rt::ids::uuid_v4(),
+            "operation" => j.operation_id = nabedra_rt::ids::uuid_v4(),
+            "table" => j.table.id = nabedra_rt::ids::uuid_v4(),
             "schema" => j.table.schema.clear(),
             "range" => {
                 j.task = Task::Get {
                     file: crate::node::job::FileInput::Partition {
                         object: crate::storage::ObjectKey::partition(
                             j.table.id,
-                            uuid::Uuid::new_v4(),
+                            nabedra_rt::ids::uuid_v4(),
                             0,
                         )
                         .as_str()
@@ -198,7 +198,8 @@ async fn captured_partition_accounting_and_deposit_identity() {
         })
         .collect::<Vec<Row>>();
     let bytes = crate::snapshot::encode(&f.job.table, &rows).unwrap();
-    let object = crate::storage::ObjectKey::partition(f.job.table.id, uuid::Uuid::new_v4(), 0);
+    let object =
+        crate::storage::ObjectKey::partition(f.job.table.id, nabedra_rt::ids::uuid_v4(), 0);
     let byte_size = bytes.len() as u64;
     let payload_bytes = crate::snapshot::validate_rows(&f.job.table, &rows).unwrap() as u64;
     // Direct Fake seeding, with write counters fixed before handler execution.
@@ -242,9 +243,10 @@ async fn captured_partition_accounting_and_deposit_identity() {
                     .insert("missing".into(), crate::protocol::ColumnType::Bool);
             }
             "missing" => {
-                *object = crate::storage::ObjectKey::partition(j.table.id, uuid::Uuid::new_v4(), 0)
-                    .as_str()
-                    .into()
+                *object =
+                    crate::storage::ObjectKey::partition(j.table.id, nabedra_rt::ids::uuid_v4(), 0)
+                        .as_str()
+                        .into()
             }
             _ => (),
         }
@@ -279,8 +281,8 @@ async fn captured_partition_accounting_and_deposit_identity() {
         let expected = f.job.clone();
         let mut different = expected.clone();
         match mode {
-            "job" => different.job_id = uuid::Uuid::new_v4(),
-            "attempt" => different.attempt_id = uuid::Uuid::new_v4(),
+            "job" => different.job_id = nabedra_rt::ids::uuid_v4(),
+            "attempt" => different.attempt_id = nabedra_rt::ids::uuid_v4(),
             _ => different.snapshot.catalog_revision += 1,
         }
         f.owners
