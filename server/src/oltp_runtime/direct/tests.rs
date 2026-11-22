@@ -63,6 +63,7 @@ use uuid::Uuid;
 #[path = "../../../tests/support/tls.rs"]
 mod tls;
 
+mod fixa;
 mod gc1;
 mod gc2;
 #[cfg(target_os = "linux")]

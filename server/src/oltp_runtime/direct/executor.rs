@@ -1107,15 +1107,46 @@ impl DirectExecutor {
                     DirectData::from_json(result.as_str()).map_err(failed)?,
                 )));
             }
-            Committed::Replayed(Some(result)) => {
+            Committed::Replayed(result) => {
+                let result = match result {
+                    Some(result) => result,
+                    None => {
+                        // Apply already found the committed record. Read it
+                        // locally under the same key latches, without another
+                        // leadership check or mutation attempt.
+                        let MvccKey::Row { primary_key, .. } = &keys[0] else {
+                            unreachable!("row keys only");
+                        };
+                        match by(
+                            deadline,
+                            handle.direct_dedup_after_barrier(
+                                request.table_id,
+                                primary_key.clone(),
+                                request.request_id,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Some(DedupLookup::Committed { digest, result, .. }))
+                                if digest == request.digest =>
+                            {
+                                result
+                            }
+                            _ => {
+                                return Err(failed(ProtocolError::new(
+                                    ErrorCode::OutcomeUnknown,
+                                    "could not recover the committed batch member's result",
+                                    Outcome::Unknown,
+                                )));
+                            }
+                        }
+                    }
+                };
                 self.stats.replayed();
                 return Ok(Attempt::Done(DirectResponse::Done(
-                    DirectData::from_json(result.get()).map_err(failed)?,
+                    DirectData::from_json(result.get()).map_err(|_| failed(corrupt()))?,
                 )));
             }
-            // GC2: a batch member's record existed. The next attempt reads
-            // it (step 3) and replays its result.
-            Committed::Replayed(None) => return Ok(Attempt::Retry(RetryCause::Conflict)),
             Committed::Forwarded => {
                 return Err(DirectResponse::Fallback {
                     reason: FallbackReason::Forwarded,

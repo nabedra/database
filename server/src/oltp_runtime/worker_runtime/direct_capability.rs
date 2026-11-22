@@ -37,7 +37,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{sync::watch, task::JoinHandle, time::Instant};
 
 /// Poll period while the capability is inactive.
 const POLL: Duration = Duration::from_secs(5);
@@ -46,6 +46,37 @@ const POLL: Duration = Duration::from_secs(5);
 const REEVALUATE_EVERY: u32 = 12;
 
 type OnActive = Box<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct SnapshotRetry {
+    enabled: AtomicBool,
+    next_probe: Mutex<Option<Instant>>,
+}
+
+impl SnapshotRetry {
+    async fn check<F>(&self, read: impl FnOnce() -> F) -> bool
+    where
+        F: std::future::Future<Output = Result<bool, ProtocolError>>,
+    {
+        if self.enabled.load(Ordering::Acquire) {
+            return true;
+        }
+        {
+            let mut next_probe = self.next_probe.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            // Share one refresh interval with the watcher. Reserve it before
+            // the read so concurrent stale prepares don't each call Control.
+            if next_probe.is_some_and(|next| now < next) {
+                return self.enabled.load(Ordering::Acquire);
+            }
+            *next_probe = Some(now + POLL);
+        }
+        if read().await == Ok(true) {
+            self.enabled.store(true, Ordering::Release);
+        }
+        self.enabled.load(Ordering::Acquire)
+    }
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -60,7 +91,7 @@ pub(crate) struct DirectSwitch {
     active: AtomicBool,
     /// GC2: Control enabled `data.direct.batch` (as last observed; sticky).
     batch: AtomicBool,
-    snapshot_retry: AtomicBool,
+    snapshot_retry: SnapshotRetry,
     /// End (Unix ms) of the queued-history window, 0 without one (T7c).
     history_until: AtomicU64,
     /// Control recorded this owner's pre-activation queued history (T7c).
@@ -97,7 +128,7 @@ impl DirectSwitch {
             direct_oltp,
             active: AtomicBool::new(false),
             batch: AtomicBool::new(false),
-            snapshot_retry: AtomicBool::new(false),
+            snapshot_retry: SnapshotRetry::default(),
             history_until: AtomicU64::new(0),
             history_noted: AtomicBool::new(false),
             #[cfg(test)]
@@ -120,14 +151,9 @@ impl DirectSwitch {
         self.batch.load(Ordering::Acquire)
     }
     pub(crate) async fn queued_snapshot_retry_enabled(&self) -> bool {
-        if self.snapshot_retry.load(Ordering::Acquire) {
-            return true;
-        }
-        let enabled = self.control.queued_snapshot_retry_enabled().await == Ok(true);
-        if enabled {
-            self.snapshot_retry.store(true, Ordering::Release);
-        }
-        enabled
+        self.snapshot_retry
+            .check(|| self.control.queued_snapshot_retry_enabled())
+            .await
     }
 
     /// The `direct_oltp` configuration of this process.
@@ -562,5 +588,45 @@ impl DirectSwitch {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|(executor, _)| executor.stats())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{ErrorCode, Outcome};
+    use std::cell::Cell;
+
+    #[tokio::test(start_paused = true)]
+    async fn o02_o08_fixa_negative_snapshot_retry_probes_are_bounded() {
+        let retry = SnapshotRetry::default();
+        let reads = Cell::new(0);
+        let read = |reply| {
+            || {
+                reads.set(reads.get() + 1);
+                std::future::ready(reply)
+            }
+        };
+        let old_control = Err(ProtocolError::new(
+            ErrorCode::ValidationError,
+            "invalid Control authority request",
+            Outcome::NotApplied,
+        ));
+        assert!(!retry.check(read(old_control.clone())).await);
+        for _ in 0..20 {
+            assert!(!retry.check(read(old_control.clone())).await);
+        }
+        assert_eq!(reads.get(), 1, "old Control reads in one poll interval");
+
+        tokio::time::advance(POLL).await;
+        assert!(!retry.check(read(Ok(false))).await);
+        assert!(!retry.check(read(Ok(true))).await);
+        assert_eq!(reads.get(), 2, "disabled responses also expire");
+
+        tokio::time::advance(POLL).await;
+        assert!(retry.check(read(Ok(true))).await);
+        tokio::time::advance(POLL).await;
+        assert!(retry.check(read(old_control)).await);
+        assert_eq!(reads.get(), 3, "enabled responses are sticky");
     }
 }
