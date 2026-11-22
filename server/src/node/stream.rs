@@ -1,5 +1,7 @@
 //! OLAP stream leases and deterministic batch replay. Only workers own lookahead.
 mod distributed;
+#[cfg(test)]
+mod sim_tests;
 mod state;
 #[cfg(test)]
 mod tests;
