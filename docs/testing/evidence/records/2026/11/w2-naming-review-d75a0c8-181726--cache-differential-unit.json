@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "w2-naming-review-d75a0c8-181726--cache-differential-unit.log",
+      "sha256": "5f328d8d2f19f9a00e442f1087c6c2fd51dd07e7927466d103237c7097aa67b6"
+    }
+  ],
+  "assertions": {
+    "executed": 14,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-differential-unit",
+  "duration_s": 3.223,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T18:17:54.161412+00:00",
+    "request_id": "w2-naming-review-d75a0c8-181726",
+    "runner": "GitHub Actions 1000003910",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45054225591"
+  },
+  "scenarios": [
+    "K01"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "d75a0c84f1c26d5bd93e1c0ce529c95ce153f3b5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

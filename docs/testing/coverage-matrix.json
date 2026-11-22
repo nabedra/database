@@ -1,7 +1,32 @@
 {
   "allow_unattested": false,
-  "head": "cb15c48d3168ad3070d4e5d88946d8e0b7ff54ed",
-  "ignored_records": [],
+  "head": "589dcf98f5b9501e07b32da123a091381750c6cb",
+  "ignored_records": [
+    {
+      "path": "w2-naming-review-d75a0c8-181726--cache-differential-unit.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "w2-naming-review-d75a0c8-181726--cache-store-model.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "w2-naming-review-d75a0c8-181726--models.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "w2-naming-review-d75a0c8-181726--testing-bugs.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "w2-naming-review-d75a0c8-181726--testing-matrix.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "w2-naming-review-d75a0c8-181726--testing-tools.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -276,6 +301,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2120,6 +2146,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2180,6 +2207,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2240,6 +2268,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2299,6 +2328,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2876,6 +2906,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2941,6 +2972,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -3203,6 +3235,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -3683,9 +3716,10 @@
     {
       "cells": {
         "D": {
-          "reason": "The version comparison is part of U",
-          "required": false,
-          "state": "n/a"
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
         },
         "F": {
           "reason": "Version fields are read from package metadata",
@@ -3986,5 +4020,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }

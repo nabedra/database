@@ -1,0 +1,44 @@
+{
+  "artifacts": [
+    {
+      "name": "w2-naming-review-d75a0c8-181726--cache-store-model.log",
+      "sha256": "c9445c9cb62062b28c6f097bd52fece6703725643c0e5d0e0f67a02233b2590d"
+    }
+  ],
+  "assertions": {
+    "executed": 6,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-store-model",
+  "duration_s": 42.975,
+  "guarantees": [
+    "CACHE-G02",
+    "CACHE-G03"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T18:17:52.643462+00:00",
+    "request_id": "w2-naming-review-d75a0c8-181726",
+    "runner": "GitHub Actions 1000003908",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45054225591"
+  },
+  "scenarios": [
+    "K01",
+    "K02"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "d75a0c84f1c26d5bd93e1c0ce529c95ce153f3b5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
