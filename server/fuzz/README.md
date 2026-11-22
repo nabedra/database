@@ -27,7 +27,9 @@ the commands with `NABEDRA_FUZZ_BLESS=1`, then review the diff of the `.expected
 ## Run a target on nightly
 
 The `fuzz-nightly` check runs `sh nightly.sh` from this directory. The script runs each target
-for 300 seconds by default. The Actions fuzz job can set `RUST_NIGHTLY` and `FUZZ_SECONDS`.
+for 300 seconds by default. It writes new inputs to the ignored `fuzz/target/nightly-corpus/<target>/`
+and reads `corpus/<target>/` as seeds, so the tracked tree stays clean for the evidence record. The
+Actions fuzz job can set `RUST_NIGHTLY` and `FUZZ_SECONDS`.
 The script needs the nightly toolchain, `nightly-2026-11-20` unless `RUST_NIGHTLY` is set. It
 installs cargo-fuzz 0.13.2 when that version is absent. To run one target, use the following
 command from `server`, with a target and features from the table.

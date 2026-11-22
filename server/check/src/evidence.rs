@@ -119,6 +119,10 @@ pub struct Record {
     #[serde(deserialize_with = "Deserialize::deserialize")]
     pub virtual_hours: Option<f64>,
     pub artifacts: Vec<Artifact>,
+    /// Optional in the schema: S3 requests the check made, summed for the monthly budget.
+    /// Omitted when `None`, so records without S3 keep the schema's required field set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_requests: Option<u64>,
 }
 
 impl Record {
@@ -150,6 +154,7 @@ impl Record {
             sim_core_hours: None,
             virtual_hours: None,
             artifacts: Vec::new(),
+            s3_requests: None,
         }
     }
 

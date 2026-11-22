@@ -380,8 +380,19 @@ jobs:
           role-to-assume: ${{ vars.NABEDRA_TEST_S3_ROLE_ARN }}
           aws-region: ${{ env.NABEDRA_TEST_S3_REGION }}
           role-session-name: nabedra-${{ github.run_id }}-${{ github.run_attempt }}
+      # --strict fails the job on not-run (exit 2), so a green job always means an executed pass.
       - name: Run the check
-        run: python3 scripts/testing/run_check.py "$ID" --evidence-dir evidence/
+        run: |
+          status=0
+          python3 scripts/testing/run_check.py "$ID" --evidence-dir evidence/ --strict || status=$?
+          for record in evidence/*/*/*.json; do
+            [ -f "$record" ] || continue
+            jq -r '"Check `\(.check)`: **\(.result)** (executed \(.assertions.executed), failed \(.assertions.failed))" +
+              (if (.assertions.not_run | length) > 0 then ", not run: " + ([.assertions.not_run[] | "\(.id): \(.reason)"] | join("; ")) else "" end)' \
+              "$record" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [ "$status" -eq 2 ]; then echo "::error::check $ID did not run (not-run never counts as a pass)"; fi
+          exit "$status"
       - name: Upload check evidence
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

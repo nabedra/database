@@ -88,7 +88,8 @@ python3 --version        # 3.11 or later
 
 The testing scripts use only the Python standard library, so there is nothing to `pip install`.
 They need Python 3.11 or later for `tomllib`. On macOS, `brew install python@3.11` and use
-`python3.11` if the default `python3` is older. `rustup` installs the pinned Rust toolchain from
+`python3.11` if the default `python3` is older: the commands below say `python3`, so substitute
+`python3.11` in each one. `rustup` installs the pinned Rust toolchain from
 `rust-toolchain.toml` on the first `cargo` command. For GitHub Actions, install the GitHub CLI and
 run `gh auth login`.
 
@@ -101,7 +102,8 @@ python3 scripts/testing/run_check.py --list --tier T0
 python3 scripts/testing/run_check.py cache-store-model
 ```
 
-Each run writes an evidence record. Use `CARGO_BUILD_JOBS=2` on a small
+Each run writes an evidence record, under `docs/testing/evidence/records/` unless you pass
+`--evidence-dir` (the directory appears with the first record). Use `CARGO_BUILD_JOBS=2` on a small
 machine and keep local property and simulation runs to one test thread.
 Use local records to investigate failures. Verification requires records
 attested by the workflow.

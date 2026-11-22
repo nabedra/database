@@ -20,6 +20,10 @@ for target in $targets; do
         events_*|olap_*) features=events,olap,libfuzzer ;;
         *) echo "Unknown fuzz target: $target" >&2; exit 1 ;;
     esac
-    cargo "+$toolchain" fuzz run "$target" --no-default-features --features "$features" -- "-max_total_time=$seconds" || result=1
+    # New inputs go to an ignored directory: an untracked file in fuzz/corpus would mark the tree dirty,
+    # and the matrix ignores evidence from a dirty tree. The tracked corpus is read as a seed.
+    work="fuzz/target/nightly-corpus/$target"
+    mkdir -p "$work"
+    cargo "+$toolchain" fuzz run "$target" --no-default-features --features "$features" "$work" "fuzz/corpus/$target" -- "-max_total_time=$seconds" || result=1
 done
 exit "$result"

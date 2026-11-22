@@ -81,7 +81,7 @@ the record stores their sum as `s3_requests`, including for failed checks.
 ## Running
 
 ```sh
-python3.11 scripts/testing/run_check.py --list --tier T1 --module kv
+python3.11 scripts/testing/run_check.py --list --tier T1 --module cache
 python3.11 scripts/testing/run_check.py cache-store-model --dry-run
 python3.11 scripts/testing/run_check.py cache-store-model --evidence-dir /tmp/evidence
 ```
