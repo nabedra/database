@@ -2,6 +2,7 @@
 *
 !kv/Cargo.toml
 !kv/src/
+!check/Cargo.toml
 !events/Cargo.toml
 !events/Cargo.lock
 !events/src/

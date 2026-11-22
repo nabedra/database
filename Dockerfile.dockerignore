@@ -6,6 +6,7 @@
 !server/Cargo.lock
 !server/kv/Cargo.toml
 !server/kv/src/
+!server/check/Cargo.toml
 !server/src/
 !orm/python/pyproject.toml
 !orm/python/README.md

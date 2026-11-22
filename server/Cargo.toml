@@ -100,6 +100,10 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Shrinking reruns properties thousands of times; a little optimisation keeps it fast.
+[profile.dev.package.nabedra-check]
+opt-level = 1
+
 [[test]]
 name = "api"
 required-features = ["olap"]

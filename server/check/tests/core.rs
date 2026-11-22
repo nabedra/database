@@ -4,7 +4,7 @@
 use std::panic::{self, AssertUnwindSafe};
 
 use nabedra_check::config::{self, Knob};
-use nabedra_check::evidence::{Artifact, Outcome, Record};
+use nabedra_check::evidence::{self, Artifact, Outcome, Record, Seeds};
 use nabedra_check::prop::{self, Config};
 use nabedra_check::rng::SplitMix64;
 use nabedra_check::Gen;
@@ -218,53 +218,109 @@ fn config_rejects_duplicate_knobs() {
 
 #[test]
 fn evidence_record_round_trips_and_writes_its_file() {
-    let mut r = Record::new("kv-store-model", "U");
+    let mut r = Record::new("kv-store-model", "U S");
     assert_eq!(r.result, Outcome::Error);
-    r.guarantees = vec!["KV-G02".into()];
+    assert_eq!(r.run.request_id, "local");
+    assert!(r.validate().unwrap_err().contains("sha"), "a record without a SHA is invalid");
+    r.guarantees = vec!["KV-G02".into(), "OLAP-STR-G01".into()];
     r.scenarios = vec!["K01".into()];
     r.sha = "a".repeat(40);
     r.tree_clean = true;
-    r.build.profile = "dev".into();
+    r.build.profile = Some("dev".into());
     r.build.features = vec!["cache".into()];
     r.build.binary_sha256 = Some("b".repeat(64));
-    r.mode = config::sample(&mut Gen::from_seed(1), KNOBS);
-    r.run.request_id = Some("req-1".into());
+    r.mode = Some(config::sample(&mut Gen::from_seed(1), KNOBS));
+    r.run.request_id = "th-check-core-abc1234-170500".into();
     r.run.attempt = Some(2);
+    r.run.url = Some("https://github.com/o/r/actions/runs/1".into());
+    r.run.date = "2026-11-22T17:05:09Z".into();
     r.duration_s = 1.5;
-    r.assertion(true).assertion(true).not_run("s3", "s3-unconfigured");
+    r.assertion(true).assertion(true).not_run("s3-roundtrip", "s3-unconfigured");
     assert_eq!(r.conclude(), Outcome::Pass);
-    r.seeds.range = Some([0, 99]);
-    r.seeds.count = 100;
-    r.seeds.failing = vec![u64::MAX];
-    r.sim_core_hours = 0.25;
-    r.virtual_hours = 12.0;
-    r.artifacts.push(Artifact { path: "history.jsonl".into(), sha256: "c".repeat(64) });
+    r.seeds = Some(Seeds { range: Some([0, 99]), count: 100, failing: vec![u64::MAX] });
+    r.sim_core_hours = Some(0.25);
+    r.artifacts.push(Artifact { name: "history.jsonl".into(), sha256: "c".repeat(64) });
+    r.validate().unwrap();
 
     let json = r.to_json();
     assert_eq!(Record::from_json(&json).unwrap(), r);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["schema"], "nabedra.evidence/1");
     assert_eq!(v["result"], "pass");
-    assert_eq!(v["assertions"]["not_run"][0]["reason"], "s3-unconfigured");
+    assert_eq!(v["kind"], "U S");
+    assert_eq!(v["assertions"]["not_run"][0]["id"], "s3-roundtrip");
     assert_eq!(v["seeds"]["failing"][0].as_u64(), Some(u64::MAX));
-    let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-    for k in [
+    assert_eq!(v["virtual_hours"], serde_json::Value::Null);
+    assert_eq!(v["artifacts"][0]["name"], "history.jsonl");
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    keys.sort();
+    let mut want = vec![
         "schema", "check", "kind", "guarantees", "scenarios", "sha", "tree_clean", "build", "mode", "run",
         "duration_s", "result", "assertions", "seeds", "sim_core_hours", "virtual_hours", "artifacts",
-    ] {
-        assert!(keys.contains(&k), "missing field {k}");
-    }
-    assert_eq!(keys.len(), 17, "{keys:?}");
+    ];
+    want.sort();
+    assert_eq!(keys, want);
+    let sub = |o: &str| {
+        let mut k: Vec<String> = v[o].as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k.join(",")
+    };
+    assert_eq!(sub("build"), "binary_sha256,features,profile");
+    assert_eq!(sub("run"), "attempt,date,request_id,runner,url");
+    assert_eq!(sub("assertions"), "executed,failed,not_run");
+    assert_eq!(sub("seeds"), "count,failing,range");
+    assert!(Record::from_json(&json.replace("\"tree_clean\"", "\"extra\": 1, \"tree_clean\"")).is_err());
 
     let dir = std::env::temp_dir().join(format!("nabedra-check-evidence-{}", std::process::id()));
     let path = r.write_to(&dir).unwrap();
-    assert_eq!(path.file_name().unwrap(), "req-1--kv-store-model.json");
+    assert_eq!(path, dir.join("2026/11/th-check-core-abc1234-170500--kv-store-model.json"));
     assert_eq!(Record::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap(), r);
-    r.run.request_id = None;
-    assert_eq!(r.file_name(), "local--kv-store-model.json");
-    r.artifacts = (0..300).map(|i| Artifact { path: format!("a{i}"), sha256: "d".repeat(64) }).collect();
-    assert_eq!(r.write_to(&dir).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    for i in 0..100 {
+        r.not_run(&format!("assertion-{i}"), &"r".repeat(250));
+    }
+    assert!(r.validate().is_ok());
+    assert_eq!(r.write_to(&dir).unwrap_err().kind(), std::io::ErrorKind::InvalidData, "over 20 KiB");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn evidence_validate_rejects_schema_violations() {
+    let mut ok = Record::new("check-core", "U");
+    ok.sha = "0123456789abcdef0123456789abcdef01234567".into();
+    ok.validate().unwrap();
+    assert!(ok.run.date.len() == 20 && ok.run.date.ends_with('Z'), "{}", ok.run.date);
+    type Mutation = Box<dyn Fn(&mut Record)>;
+    let bad: Vec<(&str, Mutation)> = vec![
+        ("check", Box::new(|r| r.check = "Check_Core".into())),
+        ("kind", Box::new(|r| r.kind = "U,S".into())),
+        ("kind", Box::new(|r| r.kind = "X".into())),
+        ("guarantee", Box::new(|r| r.guarantees = vec!["KV-G2".into()])),
+        ("sha", Box::new(|r| r.sha = "A".repeat(40))),
+        ("binary_sha256", Box::new(|r| r.build.binary_sha256 = Some("z".repeat(64)))),
+        ("mode", Box::new(|r| r.mode = Some([("k".to_string(), serde_json::json!([1]))].into()))),
+        ("run.url", Box::new(|r| r.run.url = Some("http://x".into()))),
+        ("run.attempt", Box::new(|r| r.run.attempt = Some(0))),
+        ("run.request_id", Box::new(|r| r.run.request_id = "a/b".into())),
+        ("run.date", Box::new(|r| r.run.date = "yesterday".into())),
+        ("duration_s", Box::new(|r| r.duration_s = -1.0)),
+        ("artifact", Box::new(|r| r.artifacts = vec![Artifact { name: "a".into(), sha256: "0".into() }])),
+    ];
+    for (what, f) in bad {
+        let mut r = ok.clone();
+        f(&mut r);
+        let e = r.validate().expect_err(what);
+        assert!(e.contains(what), "{what}: {e}");
+        assert_eq!(r.write_to(&std::env::temp_dir()).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+}
+
+#[test]
+fn rfc3339_dates_are_correct() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let at = |s: u64| evidence::rfc3339_utc(UNIX_EPOCH + Duration::from_secs(s));
+    assert_eq!(at(0), "1970-01-01T00:00:00Z");
+    assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z");
+    assert_eq!(at(1_795_367_109), "2026-11-22T17:05:09Z");
 }
 
 #[test]
@@ -275,4 +331,19 @@ fn evidence_conclude_reports_fail_and_not_run() {
     assert_eq!(r.conclude(), Outcome::Fail);
     assert_eq!(serde_json::to_value(Outcome::NotRun).unwrap(), "not-run");
     assert_eq!(serde_json::to_value(Outcome::Quarantined).unwrap(), "quarantined");
+}
+
+#[test]
+fn pair_sum_collects_into_one_choice() {
+    // Both values stay below 100, so no single zeroing step can keep the sum at 100: zeroing,
+    // halving and decrementing alone stop at a balanced pair such as `50 + 50`. The
+    // redistribution pass moves the total into the second choice, reaching the shortlex minimum.
+    for seed in 0..10 {
+        let msg = failure(cfg(256, seed), "pair-sum", |g| {
+            let (a, b) = (g.below(100), g.below(100));
+            if a + b >= 100 { Err(format!("{a} + {b}")) } else { Ok(()) }
+        })
+        .unwrap();
+        assert_eq!(line(&msg, "failure: "), "1 + 99", "seed {seed}:\n{msg}");
+    }
 }

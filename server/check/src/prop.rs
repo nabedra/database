@@ -279,17 +279,27 @@ impl<F: Fn(&mut Gen) -> Result<(), String>> Shrinker<'_, F> {
         }
     }
 
-    /// Moves the whole value of a choice into one of the next 8 choices, so a total spread over
-    /// several elements can collect in one and the emptied ones can then be deleted.
+    /// Lowers a choice and raises one of the next 8 by the same amount, so a total spread over
+    /// several choices collects in a later one and the emptied ones can be deleted. The amount
+    /// starts at the whole value and halves after each move that stops failing.
     fn redistribute(&mut self) {
         let mut i = 0;
         while i < self.best.len() && !self.exhausted() {
             let mut j = i + 1;
-            while j < self.best.len().min(i + 9) && self.best[i] > 0 && !self.exhausted() {
-                let mut cand = self.best.clone();
-                cand[j] = cand[j].saturating_add(cand[i]);
-                cand[i] = 0;
-                self.attempt(cand);
+            while j < self.best.len().min(i + 9) && !self.exhausted() {
+                let mut d = self.best[i];
+                while d > 0 && i < self.best.len() && j < self.best.len() && !self.exhausted() {
+                    let step = d.min(self.best[i]);
+                    if step == 0 {
+                        break;
+                    }
+                    let mut cand = self.best.clone();
+                    cand[i] -= step;
+                    cand[j] = cand[j].saturating_add(step);
+                    if !self.attempt(cand) {
+                        d /= 2;
+                    }
+                }
                 j += 1;
             }
             i += 1;
