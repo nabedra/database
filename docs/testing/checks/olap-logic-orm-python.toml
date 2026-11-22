@@ -1,0 +1,12 @@
+id = "olap-logic-orm-python"
+module = "orm-python"
+kinds = ["D"]
+guarantees = ["ORM-G02", "OLAP-G06"]
+scenarios = ["U01", "U02"]
+tiers = ["T1"]
+command = ["python3", "-m", "unittest", "discover", "-v", "-s", "tests", "-p", "test_logic_replay.py"]
+cwd = "orm/python"
+timeout_s = 300
+needs = ["python-orm"]
+result_parser = "unittest"
+env = { PYTHONPATH = "src" }
