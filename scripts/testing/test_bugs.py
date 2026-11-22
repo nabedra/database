@@ -37,11 +37,16 @@ fix_commits = ["{self.sha}"]
 revert_patch_ok = true
 '''
 
-    def run_fixture(self, command, fixture):
+    def run_fixture(self, command, fixture, repo=bugs.REPO, registers=None):
         (self.directory / "fixture.toml").write_text(fixture, encoding="utf-8")
         output, errors = StringIO(), StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
-            status = bugs.main([command], directory=self.directory)
+            status = bugs.main(
+                [command],
+                directory=self.directory,
+                repo=repo,
+                registers=registers or bugs.REGISTER_DIR,
+            )
         return status, output.getvalue(), errors.getvalue()
 
     def test_valid_record_and_markdown_counts(self):
@@ -71,6 +76,34 @@ revert_patch_ok = true
         self.assert_invalid(
             self.fixture.replace("OLTP-G04", "OLTP-04"), "invalid guarantee ID 'OLTP-04'"
         )
+
+    def test_rejects_guarantee_missing_from_registers(self):
+        self.assert_invalid(
+            self.fixture.replace("OLTP-G04", "OLTP-G99"),
+            "guarantee ID 'OLTP-G99' is not in the guarantee registers",
+        )
+
+    def test_accepts_lsm_register_ids(self):
+        status, _, errors = self.run_fixture(
+            "validate", self.fixture.replace('"OLTP-G04"', '"LSM-G01"')
+        )
+        self.assertEqual((status, errors), (0, ""))
+
+    def test_shallow_clone_warns_instead_of_failing(self):
+        clone = TemporaryDirectory()
+        self.addCleanup(clone.cleanup)
+        subprocess.run(
+            ["git", "clone", "-q", "--no-checkout", "--depth", "1",
+             f"file://{bugs.REPO}", clone.name],
+            check=True,
+        )
+        old = "0" * 40
+        status, output, errors = self.run_fixture(
+            "validate", self.fixture.replace(self.sha, old), repo=Path(clone.name)
+        )
+        self.assertEqual((status, output), (0, "Validated 1 bug records.\n"))
+        self.assertIn("1 fix commit SHAs are absent from this shallow clone", errors)
+        self.assertIn("fetch-depth: 0", errors)
 
     def assert_invalid(self, fixture, diagnostic):
         status, output, errors = self.run_fixture("validate", fixture)

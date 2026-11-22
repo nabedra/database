@@ -11,6 +11,7 @@ import tomllib
 
 REPO = Path(__file__).resolve().parents[2]
 BUG_DIR = REPO / "docs/testing/bugs"
+REGISTER_DIR = REPO / "docs/testing/guarantees"
 CLASSES = (
     "uncertain-outcome",
     "stale-route-topology-schema",
@@ -32,11 +33,20 @@ STRING_FIELDS = (
     "invariant_added",
 )
 LIST_FIELDS = ("guarantees", "scenarios", "fix_commits")
-GUARANTEE_ID = re.compile(r"(?:OLTP|OLAP|OLAP-STR|EVT|KV|ORM|SCHED)-G[0-9]{2}")
+GUARANTEE_ID = re.compile(r"(?:OLTP|OLAP|OLAP-STR|EVT|KV|LSM|ORM|SCHED)-G[0-9]{2}")
+REGISTER_ROW = re.compile(r"^\|\s*([A-Z][A-Z-]*-G[0-9]{2})\s*\|", re.MULTILINE)
+
+
+def register_ids(directory):
+    """Return the guarantee IDs the registers define, or None without registers."""
+    ids = set()
+    for path in sorted(directory.glob("*.md")):
+        ids.update(REGISTER_ROW.findall(path.read_text(encoding="utf-8")))
+    return ids or None
 SHA = re.compile(r"[0-9a-f]{40}")
 
 
-def check_fields(record):
+def check_fields(record, known_ids=None):
     errors = []
     for field in (*STRING_FIELDS, *LIST_FIELDS, "seed", "revert_patch_ok"):
         if field not in record:
@@ -62,8 +72,12 @@ def check_fields(record):
     if record["found_by"] not in FINDERS:
         errors.append(f"unknown finder {record['found_by']!r}")
     for guarantee in record["guarantees"]:
-        if guarantee != "unknown" and not GUARANTEE_ID.fullmatch(guarantee):
+        if guarantee == "unknown":
+            continue
+        if not GUARANTEE_ID.fullmatch(guarantee):
             errors.append(f"invalid guarantee ID {guarantee!r}")
+        elif known_ids is not None and guarantee not in known_ids:
+            errors.append(f"guarantee ID {guarantee!r} is not in the guarantee registers")
     if not record["fix_commits"]:
         errors.append("fix_commits must contain at least one Git commit SHA")
     for sha in record["fix_commits"]:
@@ -72,9 +86,23 @@ def check_fields(record):
     return errors
 
 
-def load_records(directory, repo):
+def is_shallow(repo):
+    result = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def load_records(directory, repo, registers=REGISTER_DIR, warnings=None):
+    """Return (records, errors). Shallow-clone notes go to `warnings`."""
     records = {}
     errors = []
+    if warnings is None:
+        warnings = []
+    known_ids = register_ids(registers)
     paths = sorted(directory.glob("*.toml"))
     if not paths:
         return records, [f"{directory}: no bug records"]
@@ -86,7 +114,7 @@ def load_records(directory, repo):
         except (OSError, ValueError) as error:
             errors.append(f"{path.name}: {error}")
             continue
-        field_errors = check_fields(record)
+        field_errors = check_fields(record, known_ids)
         if field_errors:
             errors.extend(f"{path.name}: {error}" for error in field_errors)
             continue
@@ -113,10 +141,20 @@ def load_records(directory, repo):
             commits = {
                 line.split()[0] for line in result.stdout.splitlines() if line.endswith(" commit")
             }
-            for name, record in records.items():
-                for sha in record["fix_commits"]:
-                    if sha not in commits:
-                        errors.append(f"{name}: unknown Git commit SHA {sha}")
+            missing = [
+                (name, sha)
+                for name, record in records.items()
+                for sha in record["fix_commits"]
+                if sha not in commits
+            ]
+            if missing and is_shallow(repo):
+                warnings.append(
+                    f"warning: {len(missing)} fix commit SHAs are absent from this shallow clone "
+                    "and were not verified; fetch full history (git fetch --unshallow, or "
+                    "actions/checkout with fetch-depth: 0) to verify them"
+                )
+            else:
+                errors.extend(f"{name}: unknown Git commit SHA {sha}" for name, sha in missing)
     return records, errors
 
 
@@ -132,11 +170,14 @@ def markdown_summary(records):
     return "\n".join(lines)
 
 
-def main(argv=None, *, directory=BUG_DIR, repo=REPO):
+def main(argv=None, *, directory=BUG_DIR, repo=REPO, registers=REGISTER_DIR):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("validate", "summary"))
     args = parser.parse_args(argv)
-    records, errors = load_records(directory, repo)
+    warnings = []
+    records, errors = load_records(directory, repo, registers, warnings)
+    if warnings:
+        print("\n".join(warnings), file=sys.stderr)
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1

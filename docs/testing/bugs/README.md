@@ -23,7 +23,7 @@ when the discovery date is unknown. Keep the record ID stable across edits.
 | `title` | String | Observable failure. |
 | `class` | String | One of the classes below. |
 | `module` | String | Module where the failure occurred. Use `testing` for fixture failures. |
-| `guarantees` | Array of strings | IDs from the guarantee registers, such as `OLTP-G04`. |
+| `guarantees` | Array of strings | IDs defined in the [guarantee registers](../guarantees/), such as `OLTP-G04`. |
 | `scenarios` | Array of strings | Relevant contract scenario IDs, such as `D04` or `R04`. |
 | `found_by` | String | `acceptance`, `review`, `campaign`, `ci-flake`, `user`, or `unknown`. |
 | `found_date` | String | ISO calendar date of the earliest documented finding, or `unknown`. |
@@ -68,7 +68,10 @@ the historical product bugs. Use the fixture records to improve the test
 harness.
 
 Run these commands from the repository root with Python 3.11 or later and
-Git history containing the cited commits.
+Git history containing the cited commits. Validation rejects a guarantee ID
+that no register defines. In a shallow clone it cannot see older commits, so
+it warns about unverified SHAs instead of failing. Use `fetch-depth: 0` in CI
+to verify them.
 
 ```sh
 python3 scripts/testing/bugs.py validate

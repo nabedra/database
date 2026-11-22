@@ -1,9 +1,9 @@
 # Evidence: GitHub PR #23
 id = "NS01-dir-sync"
 title = "A power loss after journal roll lost newly synced records"
-class = "fence-lifecycle-order"
+class = "other"
 module = "lsm"
-guarantees = ["OLTP-G01"]
+guarantees = ["LSM-G01", "LSM-G02", "OLTP-G01"]
 scenarios = ["NS01"]
 found_by = "campaign"
 found_date = "unknown"
