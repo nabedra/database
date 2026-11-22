@@ -11,9 +11,15 @@
 //! simulated crash aborts the node's tasks, and inline blocking work. The simulation
 //! feature never reaches a product build; `server/src/main.rs` refuses to compile with it.
 
+// This crate is the one place that makes the direct calls `server/clippy.toml` bans.
+#![allow(clippy::disallowed_methods)]
+
 pub mod ids;
 pub mod task;
 pub mod time;
 
 #[cfg(feature = "sim")]
 pub mod sim;
+
+#[cfg(test)]
+mod tests;

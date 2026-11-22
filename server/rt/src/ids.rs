@@ -32,13 +32,18 @@ pub fn random_u64() -> u64 {
     }
     #[cfg(not(feature = "sim"))]
     {
-        random_bits(uuid::Uuid::new_v4())
+        product_random_u64()
     }
+}
+
+/// The product [`random_u64`]; the simulation uses it outside a simulated world.
+#[inline]
+pub(crate) fn product_random_u64() -> u64 {
+    random_bits(uuid::Uuid::new_v4())
 }
 
 /// The low 62 bits of a version 4 UUID are random (the 2 above them are the variant),
 /// and so are the 2 lowest bits of its high half (the version sits at bits 12 to 15).
-#[cfg_attr(feature = "sim", allow(dead_code))]
 #[inline]
 fn random_bits(id: uuid::Uuid) -> u64 {
     let (high, low) = id.as_u64_pair();
