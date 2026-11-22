@@ -24,6 +24,23 @@ pub enum CommandKind {
 }
 
 impl CommandKind {
+    /// Valkey's lowercase command name, as its errors print it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Set => "set",
+            Self::Del => "del",
+            Self::Exists => "exists",
+            Self::Mget => "mget",
+            Self::Ttl => "ttl",
+            Self::Pttl => "pttl",
+            Self::Expire => "expire",
+            Self::Pexpire => "pexpire",
+            Self::Persist => "persist",
+            Self::Incrby => "incrby",
+        }
+    }
+
     fn parse(name: &[u8]) -> Option<Self> {
         DATA_METADATA
             .iter()
@@ -91,7 +108,13 @@ impl DataCommand {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandError {
-    Arity,
+    /// Wrong argument count for the command with this Valkey full name, such
+    /// as `get` or `client|setname`.
+    Arity(&'static str),
+    /// An empty command frame.
+    Empty,
+    /// `COMMAND GETKEYS` embedding a command with the wrong argument count.
+    GetKeysArity,
     Syntax,
     Unsupported,
     InvalidInteger,
@@ -107,7 +130,13 @@ pub enum CommandError {
 impl CommandError {
     pub fn response(self) -> Response {
         Response::error(match self {
-            Self::Arity => b"ERR wrong number of arguments",
+            Self::Arity(name) => {
+                return Response::Error(Bytes::from(format!(
+                    "ERR wrong number of arguments for '{name}' command"
+                )));
+            }
+            Self::Empty => b"ERR wrong number of arguments",
+            Self::GetKeysArity => b"ERR Invalid number of arguments specified for command",
             Self::Syntax => b"ERR syntax error",
             Self::Unsupported => b"ERR unknown or unsupported command",
             Self::InvalidInteger => b"ERR value is not an integer or out of range",
@@ -126,7 +155,7 @@ impl Command {
     pub fn parse(frame: Vec<Bytes>) -> Result<Self, CommandError> {
         let mut arguments = frame.into_iter();
         let Some(name) = arguments.next() else {
-            return Err(CommandError::Arity);
+            return Err(CommandError::Empty);
         };
         if let Some(kind) = CommandKind::parse(&name) {
             return parse_data(kind, arguments).map(Self::Data);
@@ -136,14 +165,14 @@ impl Command {
             name if word(name, b"HELLO") => parse_hello(arguments),
             name if word(name, b"PING") => match arguments.len() {
                 0 | 1 => Ok(Self::Ping(arguments.next())),
-                _ => Err(CommandError::Arity),
+                _ => Err(CommandError::Arity("ping")),
             },
-            name if word(name, b"ECHO") => Ok(Self::Echo(exactly_one(arguments)?)),
+            name if word(name, b"ECHO") => Ok(Self::Echo(exactly_one(arguments, "echo")?)),
             name if word(name, b"CLIENT") => parse_client(arguments),
             name if word(name, b"COMMAND") => parse_metadata(arguments),
             name if word(name, b"CLUSTER") => parse_cluster(arguments),
-            name if word(name, b"QUIT") && arguments.len() == 0 => Ok(Self::Quit),
-            name if word(name, b"QUIT") => Err(CommandError::Arity),
+            // Valkey's QUIT takes any arguments and ignores them.
+            name if word(name, b"QUIT") => Ok(Self::Quit),
             #[cfg(feature = "test-hooks")]
             name if word(name, b"DEBUG") => super::test_hooks::parse(arguments).map(Self::Debug),
             _ => Err(CommandError::Unsupported),
@@ -194,9 +223,12 @@ impl Command {
     }
 }
 
-fn exactly_one(mut arguments: std::vec::IntoIter<Bytes>) -> Result<Bytes, CommandError> {
+fn exactly_one(
+    mut arguments: std::vec::IntoIter<Bytes>,
+    name: &'static str,
+) -> Result<Bytes, CommandError> {
     if arguments.len() != 1 {
-        return Err(CommandError::Arity);
+        return Err(CommandError::Arity(name));
     }
     Ok(arguments.next().unwrap())
 }
@@ -234,7 +266,7 @@ fn parse_data(
             key: positional.next().unwrap(),
             delta: parse_integer(&positional.next().unwrap())?,
         },
-        _ => return Err(CommandError::Arity),
+        _ => return Err(CommandError::Arity(kind.name())),
     };
     let command = DataCommand { kind, operation };
     if command.keys().any(|key| key.len() > MAX_KEY_BYTES) {
@@ -299,7 +331,8 @@ fn parse_auth(mut arguments: std::vec::IntoIter<Bytes>) -> Result<Credentials, C
     let (username, password) = match arguments.len() {
         1 => (None, arguments.next().unwrap()),
         2 => (arguments.next(), arguments.next().unwrap()),
-        _ => return Err(CommandError::Arity),
+        0 => return Err(CommandError::Arity("auth")),
+        _ => return Err(CommandError::Syntax),
     };
     Ok(Credentials { username, password })
 }
@@ -330,10 +363,10 @@ fn parse_hello(mut arguments: std::vec::IntoIter<Bytes>) -> Result<Command, Comm
 }
 
 fn parse_client(mut arguments: std::vec::IntoIter<Bytes>) -> Result<Command, CommandError> {
-    let subcommand = arguments.next().ok_or(CommandError::Arity)?;
+    let subcommand = arguments.next().ok_or(CommandError::Arity("client"))?;
     if word(&subcommand, b"SETINFO") {
         if arguments.len() != 2 {
-            return Err(CommandError::Arity);
+            return Err(CommandError::Arity("client|setinfo"));
         }
         let field = arguments.next().unwrap();
         if !(word(&field, b"LIB-NAME") || word(&field, b"LIB-VER")) {
@@ -342,7 +375,7 @@ fn parse_client(mut arguments: std::vec::IntoIter<Bytes>) -> Result<Command, Com
         validate_client_name(&arguments.next().unwrap())?;
         Ok(Command::ClientSetInfo)
     } else if word(&subcommand, b"SETNAME") {
-        let name = exactly_one(arguments)?;
+        let name = exactly_one(arguments, "client|setname")?;
         validate_client_name(&name)?;
         Ok(Command::ClientSetName(name))
     } else {
@@ -364,11 +397,16 @@ fn parse_metadata(mut arguments: std::vec::IntoIter<Bytes>) -> Result<Command, C
     match name.as_ref() {
         name if word(name, b"INFO") => Ok(Command::CommandInfo(arguments.collect())),
         name if word(name, b"COUNT") && arguments.len() == 0 => Ok(Command::CommandCount),
-        name if word(name, b"COUNT") => Err(CommandError::Arity),
+        name if word(name, b"COUNT") => Err(CommandError::Arity("command|count")),
         name if word(name, b"GETKEYS") => {
-            let embedded = arguments.next().ok_or(CommandError::Arity)?;
+            let embedded = arguments
+                .next()
+                .ok_or(CommandError::Arity("command|getkeys"))?;
             let kind = CommandKind::parse(&embedded).ok_or(CommandError::NoKeys)?;
-            let command = parse_data(kind, arguments)?;
+            let command = parse_data(kind, arguments).map_err(|error| match error {
+                CommandError::Arity(_) => CommandError::GetKeysArity,
+                error => error,
+            })?;
             Ok(Command::CommandGetKeys(command.keys().cloned().collect()))
         }
         _ => Err(CommandError::Unsupported),
@@ -376,7 +414,7 @@ fn parse_metadata(mut arguments: std::vec::IntoIter<Bytes>) -> Result<Command, C
 }
 
 fn parse_cluster(mut arguments: std::vec::IntoIter<Bytes>) -> Result<Command, CommandError> {
-    let subcommand = arguments.next().ok_or(CommandError::Arity)?;
+    let subcommand = arguments.next().ok_or(CommandError::Arity("cluster"))?;
     match subcommand.as_ref() {
         subcommand if word(subcommand, b"SLOTS") && arguments.len() == 0 => {
             Ok(Command::ClusterSlots)
@@ -384,11 +422,10 @@ fn parse_cluster(mut arguments: std::vec::IntoIter<Bytes>) -> Result<Command, Co
         subcommand if word(subcommand, b"SHARDS") && arguments.len() == 0 => {
             Ok(Command::ClusterShards)
         }
-        subcommand if word(subcommand, b"SLOTS") || word(subcommand, b"SHARDS") => {
-            Err(CommandError::Arity)
-        }
+        subcommand if word(subcommand, b"SLOTS") => Err(CommandError::Arity("cluster|slots")),
+        subcommand if word(subcommand, b"SHARDS") => Err(CommandError::Arity("cluster|shards")),
         subcommand if word(subcommand, b"KEYSLOT") => {
-            let key = exactly_one(arguments)?;
+            let key = exactly_one(arguments, "cluster|keyslot")?;
             if key.len() > MAX_KEY_BYTES {
                 return Err(CommandError::InvalidKeySize);
             }
@@ -492,7 +529,7 @@ const CONTROL_METADATA: &[Metadata] = &[
     Metadata::control(b"client", -2),
     Metadata::control(b"command", -1),
     Metadata::control(b"cluster", -2),
-    Metadata::control(b"quit", 1),
+    Metadata::control(b"quit", -1),
 ];
 
 fn metadata() -> impl Iterator<Item = &'static Metadata> {

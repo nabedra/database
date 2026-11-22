@@ -193,3 +193,144 @@ fn test_hooks_debug_is_unknown_without_the_feature() {
         );
     }
 }
+
+/// Wrong-arity replies, byte for byte as Valkey 8.1.11 answers them
+/// (captured from `valkey/valkey:8.1.11`; the differential found the
+/// data-command cases in Actions run 45047452991). Valkey prints the
+/// lowercase full command name, whatever case the client sent.
+#[test]
+fn k01_wrong_arity_errors_match_valkey() {
+    let cases: &[(&[&[u8]], &[u8])] = &[
+        (
+            &[b"GET"],
+            b"ERR wrong number of arguments for 'get' command",
+        ),
+        (
+            &[b"get", b"a", b"b"],
+            b"ERR wrong number of arguments for 'get' command",
+        ),
+        (
+            &[b"SET", b"k"],
+            b"ERR wrong number of arguments for 'set' command",
+        ),
+        (
+            &[b"DEL"],
+            b"ERR wrong number of arguments for 'del' command",
+        ),
+        (
+            &[b"EXISTS"],
+            b"ERR wrong number of arguments for 'exists' command",
+        ),
+        (
+            &[b"MGET"],
+            b"ERR wrong number of arguments for 'mget' command",
+        ),
+        (
+            &[b"TTL"],
+            b"ERR wrong number of arguments for 'ttl' command",
+        ),
+        (
+            &[b"pttl", b"a", b"b"],
+            b"ERR wrong number of arguments for 'pttl' command",
+        ),
+        (
+            &[b"EXPIRE", b"k"],
+            b"ERR wrong number of arguments for 'expire' command",
+        ),
+        (
+            &[b"PEXPIRE", b"k"],
+            b"ERR wrong number of arguments for 'pexpire' command",
+        ),
+        (
+            &[b"PERSIST"],
+            b"ERR wrong number of arguments for 'persist' command",
+        ),
+        (
+            &[b"InCrBy", b"k"],
+            b"ERR wrong number of arguments for 'incrby' command",
+        ),
+        (
+            &[b"PING", b"a", b"b"],
+            b"ERR wrong number of arguments for 'ping' command",
+        ),
+        (
+            &[b"ECHO"],
+            b"ERR wrong number of arguments for 'echo' command",
+        ),
+        (
+            &[b"ECHO", b"a", b"b"],
+            b"ERR wrong number of arguments for 'echo' command",
+        ),
+        (
+            &[b"AUTH"],
+            b"ERR wrong number of arguments for 'auth' command",
+        ),
+        (&[b"AUTH", b"a", b"b", b"c"], b"ERR syntax error"),
+        (
+            &[b"CLIENT"],
+            b"ERR wrong number of arguments for 'client' command",
+        ),
+        (
+            &[b"CLIENT", b"SETNAME"],
+            b"ERR wrong number of arguments for 'client|setname' command",
+        ),
+        (
+            &[b"client", b"setname", b"a", b"b"],
+            b"ERR wrong number of arguments for 'client|setname' command",
+        ),
+        (
+            &[b"CLIENT", b"SETINFO", b"LIB-NAME"],
+            b"ERR wrong number of arguments for 'client|setinfo' command",
+        ),
+        (
+            &[b"COMMAND", b"COUNT", b"x"],
+            b"ERR wrong number of arguments for 'command|count' command",
+        ),
+        (
+            &[b"COMMAND", b"GETKEYS"],
+            b"ERR wrong number of arguments for 'command|getkeys' command",
+        ),
+        (
+            &[b"COMMAND", b"GETKEYS", b"GET"],
+            b"ERR Invalid number of arguments specified for command",
+        ),
+        (
+            &[b"COMMAND", b"GETKEYS", b"GET", b"a", b"b"],
+            b"ERR Invalid number of arguments specified for command",
+        ),
+        (
+            &[b"CLUSTER"],
+            b"ERR wrong number of arguments for 'cluster' command",
+        ),
+        (
+            &[b"CLUSTER", b"SLOTS", b"x"],
+            b"ERR wrong number of arguments for 'cluster|slots' command",
+        ),
+        (
+            &[b"CLUSTER", b"SHARDS", b"x"],
+            b"ERR wrong number of arguments for 'cluster|shards' command",
+        ),
+        (
+            &[b"CLUSTER", b"KEYSLOT"],
+            b"ERR wrong number of arguments for 'cluster|keyslot' command",
+        ),
+        (
+            &[b"CLUSTER", b"KEYSLOT", b"a", b"b"],
+            b"ERR wrong number of arguments for 'cluster|keyslot' command",
+        ),
+    ];
+    for (words, expected) in cases {
+        let error = parse(words).err().expect("wrong arity must not parse");
+        assert_eq!(
+            error.response(),
+            Response::Error(Bytes::from_static(expected)),
+            "{:?}",
+            words
+                .iter()
+                .map(|w| String::from_utf8_lossy(w))
+                .collect::<Vec<_>>()
+        );
+    }
+    // Valkey's QUIT ignores its arguments and answers OK.
+    assert!(matches!(parse(&[b"QUIT", b"x"]), Ok(Command::Quit)));
+}

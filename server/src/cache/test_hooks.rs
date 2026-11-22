@@ -28,10 +28,10 @@ pub enum DebugCommand {
 pub(super) fn parse(
     mut arguments: std::vec::IntoIter<Bytes>,
 ) -> Result<DebugCommand, CommandError> {
-    let subcommand = arguments.next().ok_or(CommandError::Arity)?;
+    let subcommand = arguments.next().ok_or(CommandError::Arity("debug"))?;
     let argument = arguments.next();
     if arguments.next().is_some() {
-        return Err(CommandError::Arity);
+        return Err(CommandError::Arity("debug"));
     }
     let word = |name: &[u8]| subcommand.eq_ignore_ascii_case(name);
     match argument {
@@ -49,7 +49,7 @@ pub(super) fn parse(
             .map(|seconds| DebugCommand::Sleep(Duration::from_secs_f64(seconds)))
             .ok_or(CommandError::InvalidInteger),
         _ if word(b"DIGEST") || word(b"SET-ACTIVE-EXPIRE") || word(b"SLEEP") => {
-            Err(CommandError::Arity)
+            Err(CommandError::Arity("debug"))
         }
         _ => Err(CommandError::Unsupported),
     }
@@ -128,9 +128,9 @@ mod tests {
             debug(&["SLEEP", "0"]),
             Ok(DebugCommand::Sleep(Duration::ZERO))
         );
-        assert_eq!(debug(&[]), Err(CommandError::Arity));
-        assert_eq!(debug(&["DIGEST", "x"]), Err(CommandError::Arity));
-        assert_eq!(debug(&["SLEEP"]), Err(CommandError::Arity));
+        assert_eq!(debug(&[]), Err(CommandError::Arity("debug")));
+        assert_eq!(debug(&["DIGEST", "x"]), Err(CommandError::Arity("debug")));
+        assert_eq!(debug(&["SLEEP"]), Err(CommandError::Arity("debug")));
         assert_eq!(
             debug(&["SET-ACTIVE-EXPIRE", "2"]),
             Err(CommandError::Syntax)
