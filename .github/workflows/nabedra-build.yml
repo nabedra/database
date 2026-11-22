@@ -1679,6 +1679,17 @@ jobs:
           python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf-bin/nabedra-db-fp" --direct-oltp on \
             --output "$GITHUB_WORKSPACE/perf-out/serial-nowarm" --rates 0.2 --seconds 5 --warmup-seconds 5 --repetitions 10 \
             --clients 1 --rows 2000 --seed 20261118 --timeout 10 --worker-env NABEDRA_BENCH_NO_GRANT_WARM=1
+      # RD3: 400 updates/s with and without leader direct admission (same binary and runner).
+      - name: RD3 A/B (400/s, direct admission on/off)
+        run: |
+          cd scripts
+          bench() { python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf-bin/nabedra-db-fp" \
+            --direct-oltp on --seed 20261118 --timeout 10 "$@"; }
+          bench --output "$GITHUB_WORKSPACE/perf-out/rate400" --rates 400 --seconds 20 --warmup-seconds 5 \
+            --repetitions 1 --clients 64 --rows 10000
+          bench --output "$GITHUB_WORKSPACE/perf-out/rate400-noadmission" --rates 400 --seconds 20 --warmup-seconds 5 \
+            --repetitions 1 --clients 64 --rows 10000 --worker-env NABEDRA_BENCH_NO_DIRECT_ADMISSION=1
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/perf-out" || true
       - name: 50 updates/s with perf
         run: |
           cd scripts
