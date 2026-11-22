@@ -1,0 +1,1 @@
+{"op":"or","args":[{"op":"ne","column":"name","value":"test"},{"op":"eq","column":"enabled","value":true}]}

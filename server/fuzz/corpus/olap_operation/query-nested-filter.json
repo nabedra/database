@@ -1,0 +1,1 @@
+{"request_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","operation":"query.collect","payload":{"table_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","query":{"select":null,"filter":{"op":"and","args":[{"op":"eq","column":"id","value":1},{"op":"not","arg":{"op":"lt","column":"score","value":0.125}}]},"order_by":null,"limit":null}}}

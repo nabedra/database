@@ -7,7 +7,7 @@ use nabedra_check::config::{self, Knob};
 use nabedra_check::evidence::{self, Artifact, Outcome, Record, Seeds};
 use nabedra_check::prop::{self, Config};
 use nabedra_check::rng::SplitMix64;
-use nabedra_check::Gen;
+use nabedra_check::{Gen, generator, r#gen};
 
 fn cfg(cases: u64, seed: u64) -> Config {
     Config { cases, seed: Some(seed), max_shrink_steps: prop::DEFAULT_MAX_SHRINK_STEPS }
@@ -51,11 +51,11 @@ fn splitmix_matches_reference_values() {
 fn same_seed_gives_same_draws_and_tape_replays_them() {
     for seed in [0, 1, 42, u64::MAX] {
         let mut a = Gen::from_seed(seed);
-        let mut b = Gen::from_seed(seed);
+        let mut b = generator::Gen::from_seed(seed);
         let da = draws(&mut a);
         assert_eq!(da, draws(&mut b), "seed {seed}");
         assert_eq!(a.seed(), seed);
-        let mut r = Gen::from_tape(a.tape().to_vec());
+        let mut r = r#gen::Gen::from_tape(a.tape().to_vec());
         assert_eq!(da, draws(&mut r), "replay of seed {seed}");
         assert_eq!(r.tape(), a.tape());
     }
@@ -68,6 +68,13 @@ fn exhausted_tape_gives_minimal_values() {
     assert_eq!(draws(&mut g), (0, 0, -5, false, false, 1, vec![], String::new(), vec![]));
     assert!(!Gen::from_tape(vec![]).chance(0, 5));
     assert!(Gen::from_tape(vec![]).chance(5, 5), "chance(den, den) is always true");
+}
+
+#[test]
+fn vector_accepts_the_largest_length_bound() {
+    let mut g = Gen::from_tape(vec![2]);
+    assert_eq!(g.vec(usize::MAX, Gen::bool), vec![false, false]);
+    assert!(Gen::from_tape(vec![]).bytes(usize::MAX).is_empty());
 }
 
 #[test]
@@ -124,6 +131,26 @@ fn shrinking_is_bounded_by_max_shrink_steps() {
     assert!(line(&none, "shrunk tape length: ").contains("0 shrink runs"), "{none}");
     let some = failure(Config { max_shrink_steps: 5, ..cfg(256, 3) }, "five", prop).unwrap();
     assert!(line(&some, "shrunk tape length: ").contains("5 shrink runs"), "{some}");
+    assert!(prop::simpler(&[u64::MAX], &[0, 0]));
+    assert!(prop::simpler(&[1, u64::MAX], &[2, 0]));
+    assert!(!prop::simpler(&[0, 0], &[u64::MAX]));
+    assert!(!prop::simpler(&[2, 0], &[1, u64::MAX]));
+    assert!(!prop::simpler(&[0], &[0]));
+}
+
+#[test]
+fn shrinking_preserves_the_seed_of_the_failing_case() {
+    let seed = 42;
+    let msg = failure(cfg(1, seed), "seeded-property", |g| {
+        let value = g.u64();
+        if g.seed() == seed {
+            Err(format!("seed {seed} with value {value}"))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    assert_eq!(line(&msg, "failure: "), "seed 42 with value 0");
 }
 
 #[test]
@@ -252,23 +279,25 @@ fn evidence_record_round_trips_and_writes_its_file() {
     assert_eq!(v["seeds"]["failing"][0].as_u64(), Some(u64::MAX));
     assert_eq!(v["virtual_hours"], serde_json::Value::Null);
     assert_eq!(v["artifacts"][0]["name"], "history.jsonl");
-    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-    keys.sort();
-    let mut want = vec![
-        "schema", "check", "kind", "guarantees", "scenarios", "sha", "tree_clean", "build", "mode", "run",
-        "duration_s", "result", "assertions", "seeds", "sim_core_hours", "virtual_hours", "artifacts",
-    ];
-    want.sort();
-    assert_eq!(keys, want);
-    let sub = |o: &str| {
-        let mut k: Vec<String> = v[o].as_object().unwrap().keys().cloned().collect();
-        k.sort();
-        k.join(",")
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/testing/evidence/schema.json"
+    )).unwrap();
+    let assert_keys = |value: &serde_json::Value, schema: &serde_json::Value| {
+        let mut actual: Vec<_> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut required: Vec<_> = schema["required"].as_array().unwrap().iter()
+            .map(|key| key.as_str().unwrap())
+            .collect();
+        actual.sort_unstable();
+        required.sort_unstable();
+        assert_eq!(actual, required);
     };
-    assert_eq!(sub("build"), "binary_sha256,features,profile");
-    assert_eq!(sub("run"), "attempt,date,request_id,runner,url");
-    assert_eq!(sub("assertions"), "executed,failed,not_run");
-    assert_eq!(sub("seeds"), "count,failing,range");
+    assert_keys(&v, &schema);
+    let fields = &schema["properties"];
+    for field in ["build", "run", "assertions", "seeds"] {
+        assert_keys(&v[field], &fields[field]);
+    }
+    assert_keys(&v["assertions"]["not_run"][0], &fields["assertions"]["properties"]["not_run"]["items"]);
+    assert_keys(&v["artifacts"][0], &fields["artifacts"]["items"]);
     assert!(Record::from_json(&json.replace("\"tree_clean\"", "\"extra\": 1, \"tree_clean\"")).is_err());
 
     let dir = std::env::temp_dir().join(format!("nabedra-check-evidence-{}", std::process::id()));
@@ -311,6 +340,85 @@ fn evidence_validate_rejects_schema_violations() {
         let e = r.validate().expect_err(what);
         assert!(e.contains(what), "{what}: {e}");
         assert_eq!(r.write_to(&std::env::temp_dir()).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+}
+
+#[test]
+fn evidence_dates_match_the_schema_format() {
+    let mut record = Record::new("check-core", "U");
+    record.sha = "a".repeat(40);
+    for date in [
+        "2026-13-01T00:00:00Z",
+        "2026-02-29T00:00:00Z",
+        "2026-11-22T24:00:00Z",
+        "2026-11-22T00:00:00",
+        "2026-11-22T00:00:00+02:60",
+        "2026-11-22T00:00:00+01:00",
+        "2026-11-22T00:00:00-00:00",
+        "2026-11-22T00:00:00.Z",
+    ] {
+        record.run.date = date.into();
+        assert!(record.validate().unwrap_err().contains("run.date"), "{date}");
+    }
+    for date in ["2024-02-29T00:00:00Z", "2026-11-22t17:05:09.123+00:00"] {
+        record.run.date = date.into();
+        record.validate().unwrap();
+    }
+}
+
+#[test]
+fn evidence_rejects_duplicate_kind_letters() {
+    let mut record = Record::new("check-core", "U S U");
+    record.sha = "a".repeat(40);
+    assert!(record.validate().unwrap_err().contains("kind"));
+    record.kind = "U S".into();
+    record.validate().unwrap();
+}
+
+#[test]
+fn evidence_rejects_invalid_assertion_totals() {
+    let mut record = Record::new("check-core", "U");
+    record.sha = "a".repeat(40);
+    record.result = Outcome::Pass;
+    assert!(record.validate().unwrap_err().contains("zero executed assertions"));
+    record.assertion(true);
+    record.validate().unwrap();
+    record.assertion(false);
+    assert!(record.validate().unwrap_err().contains("pass with failed assertions"));
+    record.assertions.failed = 3;
+    assert!(record.validate().unwrap_err().contains("failed exceeds executed"));
+
+    record.assertions = Default::default();
+    record.result = Outcome::Quarantined;
+    assert!(record.validate().unwrap_err().contains("zero executed"));
+    record.conclude();
+    assert!(record.validate().unwrap_err().contains("at least one reason"));
+    record.not_run("setup", "unavailable");
+    record.validate().unwrap();
+}
+
+#[test]
+fn evidence_requires_explicit_null_fields() {
+    let mut record = Record::new("check-core", "U");
+    record.seeds = Some(Seeds::default());
+    let json = serde_json::to_value(record).unwrap();
+    for (parent, key) in [
+        ("", "mode"),
+        ("", "seeds"),
+        ("", "sim_core_hours"),
+        ("", "virtual_hours"),
+        ("build", "profile"),
+        ("build", "binary_sha256"),
+        ("run", "url"),
+        ("run", "runner"),
+        ("run", "attempt"),
+        ("run", "date"),
+        ("seeds", "range"),
+    ] {
+        let mut broken = json.clone();
+        let object = if parent.is_empty() { &mut broken } else { &mut broken[parent] };
+        object.as_object_mut().unwrap().remove(key).unwrap();
+        assert!(Record::from_json(&broken.to_string()).is_err(), "missing {parent}.{key}");
     }
 }
 
