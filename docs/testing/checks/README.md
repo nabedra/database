@@ -9,10 +9,10 @@ writes one `nabedra.evidence/1` record. CI runs the same command on Actions, and
 One TOML file per check, named `<id>.toml`.
 
 ```toml
-id = "kv-store-model"            # unique kebab-case, equal to the file name
-module = "kv"                    # a module name from docs/testing/modules.toml
+id = "cache-store-model"            # unique kebab-case, equal to the file name
+module = "cache"                    # a module name from docs/testing/modules.toml
 kinds = ["U"]                    # check kinds this run provides: M U S H F D R P K
-guarantees = ["KV-G02", "KV-G03"]
+guarantees = ["CACHE-G02", "CACHE-G03"]
 scenarios = ["K01", "K02"]
 tiers = ["T0", "T1"]             # any of T0 T1 T2 T3 weekly
 command = ["cargo", "test", "--no-default-features", "--features", "cache", "--lib", "cache::store::model_tests"]
@@ -82,8 +82,8 @@ the record stores their sum as `s3_requests`, including for failed checks.
 
 ```sh
 python3.11 scripts/testing/run_check.py --list --tier T1 --module kv
-python3.11 scripts/testing/run_check.py kv-store-model --dry-run
-python3.11 scripts/testing/run_check.py kv-store-model --evidence-dir /tmp/evidence
+python3.11 scripts/testing/run_check.py cache-store-model --dry-run
+python3.11 scripts/testing/run_check.py cache-store-model --evidence-dir /tmp/evidence
 ```
 
 Records go to `docs/testing/evidence/records/<yyyy>/<mm>/<request_id>--<id>.json` unless

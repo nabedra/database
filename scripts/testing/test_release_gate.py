@@ -25,10 +25,10 @@ class ReleaseGateTests(MatrixFixtureTests):
         code, out = run(self.fx, "--dry-run", "--allow-unattested")
         self.assertEqual(code, 1)
         self.assertIn("Release gate: FAILED", out)
-        self.assertIn("- KV-G02 U: fail", out)
+        self.assertIn("- CACHE-G02 U: fail", out)
         self.assertIn("### Deferred checks", out)
-        self.assertIn("- KV-G01 R: cloud-deferred (EKS soak)", out)
-        self.assertIn("- KV-G01 P: hardware-deferred (absolute latency)", out)
+        self.assertIn("- CACHE-G01 R: cloud-deferred (EKS soak)", out)
+        self.assertIn("- CACHE-G01 P: hardware-deferred (absolute latency)", out)
 
     def test_passing_scope_writes_notes(self):
         notes = Path(self.fx.tmp.name) / "notes.md"

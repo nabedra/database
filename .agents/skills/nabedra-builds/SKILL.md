@@ -20,6 +20,10 @@ Keep these local:
 - a single acceptance scenario on an already built binary
   (`scripts/acceptance_oltp.py --scenario <ID> --test-binary <exe>`).
 
+When worktrees share `CARGO_TARGET_DIR`, Cargo can link a stale path-dependency
+rlib from another worktree, so touch the dependency's sources or use a private
+target directory for small dev-only crates.
+
 Send these to Actions:
 - the full OLTP library suite, the integration tests and acceptance categories;
 - crash campaigns, Docker and anything that rebuilds the server.

@@ -119,7 +119,7 @@ at `docs/testing/evidence/records`.
 | `schema` | string | Always `"nabedra.evidence/1"` |
 | `check` | string | Kebab-case check ID, at most 80 characters, equal to its `docs/testing/checks/<id>.toml` name |
 | `kind` | string | One or more distinct letters from `M U S H F D R P K`, separated by single spaces, such as `"U S"` |
-| `guarantees` | array of string | Guarantee IDs, such as `"KV-G02"` or `"OLAP-STR-G01"` |
+| `guarantees` | array of string | Guarantee IDs, such as `"CACHE-G02"` or `"OLAP-STR-G01"` |
 | `scenarios` | array of string | Scenario IDs, such as `"O08"` |
 | `sha` | string | 40-character lowercase commit SHA |
 | `tree_clean` | boolean | Whether the working tree had no uncommitted changes |

@@ -112,7 +112,7 @@ def main(argv=None):
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
     parser.add_argument("--nabedra-bin", type=Path)
-    parser.add_argument("--log", type=Path, default=Path("artifacts/kv-valkey-tcl.log"))
+    parser.add_argument("--log", type=Path, default=Path("artifacts/cache-valkey-tcl.log"))
     args = parser.parse_args(argv)
     endpoint_given = args.host and args.port is not None and 1 <= args.port <= 65535
     if args.nabedra_bin:

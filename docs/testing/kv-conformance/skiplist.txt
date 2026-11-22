@@ -1,5 +1,5 @@
 # Valkey 8.1.11 test name or /regexp, a tab, then the K01 scope reason.
-# References: KV-G01 / K01 and the command table in server/src/cache/command.rs.
+# References: CACHE-G01 / K01 and the command table in server/src/cache/command.rs.
 INCR fails against a key holding a list	K01 stores strings only. RPUSH, RPOP and INCR are outside the command table.
 Coverage: SWAPDB and FLUSHDB	K01 uses one database and does not expose SWAPDB or FLUSHDB.
 /^RESP3 attributes	K01 supports RESP2. These tests require a RESP3 session.

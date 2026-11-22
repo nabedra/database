@@ -83,11 +83,14 @@ revert_patch_ok = true
             "guarantee ID 'OLTP-G99' is not in the guarantee registers",
         )
 
-    def test_accepts_lsm_register_ids(self):
-        status, _, errors = self.run_fixture(
-            "validate", self.fixture.replace('"OLTP-G04"', '"LSM-G01"')
-        )
-        self.assertEqual((status, errors), (0, ""))
+    def test_accepts_cache_and_lsm_register_ids(self):
+        for module, guarantee in (("cache", "CACHE-G01"), ("lsm", "LSM-G01")):
+            with self.subTest(module=module):
+                fixture = self.fixture.replace('module = "oltp"', f'module = "{module}"')
+                status, _, errors = self.run_fixture(
+                    "validate", fixture.replace('"OLTP-G04"', f'"{guarantee}"')
+                )
+                self.assertEqual((status, errors), (0, ""))
 
     def test_shallow_clone_warns_instead_of_failing(self):
         clone = TemporaryDirectory()

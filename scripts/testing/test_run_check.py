@@ -104,8 +104,8 @@ class ParserTests(unittest.TestCase):
 
 class CheckFileTests(unittest.TestCase):
     def test_fixture_checks_load(self):
-        checks = run_check.load_all(FIXTURE_CHECKS, {"kv", "events", "testing", "misc"})
-        self.assertEqual([c.id for c in checks], ["events-unit", "kv-sim", "kv-unit"])
+        checks = run_check.load_all(FIXTURE_CHECKS, {"cache", "events", "testing", "misc"})
+        self.assertEqual([c.id for c in checks], ["cache-sim", "cache-unit", "events-unit"])
 
     def test_repository_checks_load(self):
         checks = run_check.load_all(run_check.CHECKS_DIR, run_check.module_names())
@@ -121,7 +121,7 @@ class CheckFileTests(unittest.TestCase):
             "bad parser": check_data(result_parser="junit"),
             "absolute cwd": check_data(cwd="/tmp"),
             "escaping cwd": check_data(cwd="../x"),
-            "bad guarantee": check_data(guarantees=["KV-2"]),
+            "bad guarantee": check_data(guarantees=["CACHE-2"]),
             "unknown module": check_data(module="nope"),
             "bool timeout": check_data(timeout_s=True),
         }

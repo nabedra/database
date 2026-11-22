@@ -11,7 +11,7 @@ python3.11 scripts/testing/ab.py docs/testing/perf/oltp/point-update.toml \
 
 | Spec | Input and runner setup | Metric |
 | --- | --- | --- |
-| KV GET hit | Cache binaries on Linux. Set `NABEDRA_PERF_VALKEY` and `NABEDRA_PERF_VALKEY_CLI` to the reference tool paths and `NABEDRA_PERF_CLIENT_CPU` to a client CPU ID. Follow the prerequisites in [the Cache benchmark](../cache-benchmark.md). | GET-hit p99 at 24 offered requests/s with the stock client. |
+| Cache GET hit | Cache binaries on Linux. Set `NABEDRA_PERF_VALKEY` and `NABEDRA_PERF_VALKEY_CLI` to the reference tool paths and `NABEDRA_PERF_CLIENT_CPU` to a client CPU ID. Follow the prerequisites in [the Cache benchmark](../cache-benchmark.md). | GET-hit p99 at 24 offered requests/s with the stock client. |
 | Events publish | Two locally built Events images and Docker. | Median of the publish p99 values from the measured load stages. |
 | OLAP streaming | Matching OLAP binaries and the Docker streaming fixture. Set `NABEDRA_PERF_BASE_SHA`, `NABEDRA_PERF_HEAD_SHA` and `NABEDRA_PERF_FIXTURE_SHA` to the source revisions. | Median steady-state next-batch p99 across prefetch depths and worker configurations. |
 | OLTP point update | Linux OLTP binaries and Docker. Set `NABEDRA_PERF_OLTP_IMAGE` to a locally available image with the benchmark's runtime dependencies. | Median of phase p99 latencies for direct updates at 20 offered requests/s. |

@@ -1,4 +1,4 @@
-//! Model of the KV cluster slot lease under clock error (KV-G06).
+//! Model of the Cache cluster slot lease under clock error (CACHE-G06).
 //!
 //! What the product does (server/src/cache/cluster/):
 //! - Leases last `LEASE_MS = 3_000` (protocol.rs:12). A clock sample is an interval
@@ -196,7 +196,7 @@ fn lease_with_error_bound_passes() {
     for actual_error in 0..=BOUND {
         let e = common::expect_passed(
             &format!(
-                "kv-lease with bound, midpoint error {} ms",
+                "cache-lease with bound, midpoint error {} ms",
                 actual_error * TICK_MS
             ),
             &KvLease {
@@ -213,7 +213,7 @@ fn lease_with_error_bound_passes() {
 #[test]
 fn lease_without_error_bound_has_two_primaries() {
     common::expect_violated(
-        "kv-lease without bound, midpoint error 5 ms",
+        "cache-lease without bound, midpoint error 5 ms",
         &KvLease {
             use_bound: false,
             actual_error: BOUND,
@@ -265,7 +265,7 @@ fn promotion_does_not_revoke_the_old_workers_local_grant() {
 #[test]
 fn drift_beyond_the_bound_breaks_the_lease() {
     common::expect_violated(
-        "kv-lease with bound, midpoint error 20 ms (outside the interval)",
+        "cache-lease with bound, midpoint error 20 ms (outside the interval)",
         &KvLease {
             use_bound: true,
             actual_error: 20 / TICK_MS,

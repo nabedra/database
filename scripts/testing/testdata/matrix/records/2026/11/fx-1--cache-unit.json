@@ -1,8 +1,8 @@
 {
   "artifacts": [],
   "assertions": {
-    "executed": 5,
-    "failed": 2,
+    "executed": 10,
+    "failed": 0,
     "not_run": []
   },
   "build": {
@@ -10,20 +10,21 @@
     "features": [],
     "profile": null
   },
-  "check": "kv-flaky",
+  "check": "cache-unit",
   "duration_s": 1.5,
   "guarantees": [
-    "KV-G03"
+    "CACHE-G01",
+    "EVT-G01"
   ],
   "kind": "U",
   "mode": null,
-  "result": "quarantined",
+  "result": "pass",
   "run": {
     "date": "2026-11-22T12:00:00+00:00",
-    "attempt": null,
-    "request_id": "fx-5",
+    "attempt": 1,
+    "request_id": "fx-1",
     "runner": "fixture",
-    "url": null
+    "url": "https://github.com/example/repo/actions/runs/1"
   },
   "scenarios": [],
   "schema": "nabedra.evidence/1",

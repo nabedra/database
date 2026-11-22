@@ -98,7 +98,7 @@ List the T0 checks and run the ones for the module you are changing:
 
 ```sh
 python3 scripts/testing/run_check.py --list --tier T0
-python3 scripts/testing/run_check.py kv-store-model
+python3 scripts/testing/run_check.py cache-store-model
 ```
 
 Each run writes an evidence record. Use `CARGO_BUILD_JOBS=2` on a small
@@ -131,7 +131,7 @@ BRANCH=$(git branch --show-current)
 git push origin "$BRANCH"
 RID="testing-$(git rev-parse --short=7 HEAD)-$(date +%H%M%S)"
 gh workflow run nabedra-build.yml --ref "$BRANCH" -f sha="$SHA" -f request_id="$RID" \
-  -f base=false -f checks=kv-store-model
+  -f base=false -f checks=cache-store-model
 ```
 
 [GitHub Actions for checks](../../.agents/skills/code-review/references/gh-actions.md) explains how

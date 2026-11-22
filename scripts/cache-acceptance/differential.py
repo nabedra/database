@@ -391,7 +391,7 @@ def main(argv=None):
     parser.add_argument("--ops-per-program", type=int, default=48)
     parser.add_argument("--ttl-tolerance-ms", type=int, default=50)
     parser.add_argument("--shrink", action="store_true")
-    parser.add_argument("--history", type=Path, default=Path("artifacts/kv-valkey-diff.jsonl"))
+    parser.add_argument("--history", type=Path, default=Path("artifacts/cache-valkey-diff.jsonl"))
     args = parser.parse_args(argv)
     if args.programs <= 0 or args.ops_per_program <= 0 or args.ttl_tolerance_ms < 0:
         parser.error("program and operation counts must be positive and TTL tolerance nonnegative")
