@@ -890,6 +890,8 @@ async fn replacement_peer_probe(config: PathBuf) {
         // D01-style budget evidence: this process's Control reads, by kind.
         let stats = config.directory.join("stats.json");
         let voters_path = config.directory.join("control-voters.json");
+        let revoked_path = config.directory.join("revoked-workers.json");
+        let directory_view = directory.clone();
         tokio::spawn(async move {
             loop {
                 if let Some(routes) = &published {
@@ -897,6 +899,15 @@ async fn replacement_peer_probe(config: PathBuf) {
                     let temporary = voters_path.with_extension("tmp");
                     std::fs::write(&temporary, serde_json::to_vec(&voters).unwrap()).unwrap();
                     std::fs::rename(&temporary, &voters_path).unwrap();
+                    let revoked: Vec<_> = config
+                        .targets
+                        .iter()
+                        .filter(|peer| directory_view.revoked(WorkerIdentity::from(*peer)))
+                        .map(|peer| peer.worker_id)
+                        .collect();
+                    let temporary = revoked_path.with_extension("tmp");
+                    std::fs::write(&temporary, serde_json::to_vec(&revoked).unwrap()).unwrap();
+                    std::fs::rename(&temporary, &revoked_path).unwrap();
                 }
                 let temporary = stats.with_extension("tmp");
                 let snapshot = crate::oltp_runtime::stage_timing::snapshot();
@@ -986,6 +997,25 @@ async fn replacement_peer_probe(config: PathBuf) {
         std::fs::write(&temporary, serde_json::to_vec(&observed).unwrap()).unwrap();
         std::fs::rename(temporary, output).unwrap();
     }
+}
+
+#[test]
+#[ignore = "Linux process test with passwordless sudo, run through the CI tests input"]
+fn o17_control_voter_refresh_process() {
+    let binary = std::env::var_os("NABEDRA_BIN").expect("CI server binary");
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/oltp_recovery_operations.py");
+    let status = std::process::Command::new("python3")
+        .arg(script)
+        .arg("--binary")
+        .arg(binary)
+        .arg("--test-executable")
+        .arg(std::env::current_exe().unwrap())
+        .args(["--suite", "replacement-voter-refresh"])
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .status()
+        .expect("launch O17 Control voter refresh fixture");
+    assert!(status.success(), "O17 Control voter refresh fixture failed");
 }
 
 #[test]

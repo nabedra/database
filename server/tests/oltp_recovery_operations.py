@@ -855,9 +855,21 @@ def o17_check_second_control_replacement(
         )
         cluster.config[name] = replacement
         cluster.launch_worker(name)
-        cluster.wait_workers(names=[*remaining, name])
-        wait_for_voters({cluster.enrollments[actor]['worker_id'], first['worker_id'], fresh['worker_id']})
-        assert observe('after') == [False]
+        revoked_file = data_peer_dir / 'revoked-workers.json'
+        try:
+            wait_for(lambda: revoked_file.is_file() and previous['worker_id'] in json.loads(revoked_file.read_text()),
+                     'Data-only worker learned the second revocation', PROBE_WINDOW)
+            assert observe('after') == [False]
+            cluster.wait_workers(names=[*remaining, name])
+            wait_for_voters({cluster.enrollments[actor]['worker_id'], first['worker_id'], fresh['worker_id']})
+        except AssertionError as error:
+            tails = '\n'.join(f'{worker}:\n{cluster.tail(worker, size=8000)}'
+                              for worker in [*remaining, name])
+            status_body = operation('worker.system_replacement.status',
+                                    dict(run_id=cluster.run_id, previous=previous))
+            status = send(cluster.urls[actor], cluster.auth['admin_token'], status_body,
+                          path='/v1/cluster/operations', timeout=5)
+            raise AssertionError(f'{error}\nSecond replacement status {status}\n{tails}') from error
         report('O17 Data-only revocation after two Control voter replacements',
                revoked_workers=[first_revoked, previous['worker_id']], refused_second_revoked_session=True)
     finally:

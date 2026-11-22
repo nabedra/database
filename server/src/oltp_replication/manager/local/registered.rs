@@ -262,6 +262,15 @@ impl RegisteredWorker {
         Ok(())
     }
 
+    fn replacement_catch_up_before(&self, group: &GroupIdentity) -> Option<u64> {
+        let record = self.system_replacement.as_ref()?;
+        record
+            .groups
+            .iter()
+            .find(|plan| plan.expected.identity == *group)
+            .map(|plan| plan.expected.membership_position.index)
+    }
+
     /// Start the listener before calling this method. All groups start before
     /// waiting for a leader so another process can complete their quorum.
     pub(crate) async fn start_system_groups(
@@ -281,6 +290,7 @@ impl RegisteredWorker {
                     self.open_system_store(group.identity.clone()).await?,
                     local.clone(),
                     group.members(),
+                    self.replacement_catch_up_before(&group.identity),
                     config.clone(),
                     self.directory.clone(),
                 )
@@ -294,7 +304,7 @@ impl RegisteredWorker {
             let group = &self.placements.timestamps;
             let running = self
                 .manager
-                .start_timestamps(
+                .start(
                     self.open_system_store(group.identity.clone()).await?,
                     local.clone(),
                     group.members(),
@@ -309,12 +319,15 @@ impl RegisteredWorker {
         let mut status = Vec::new();
         for group in self.placements.status_groups() {
             if let Some(local) = group.local(worker) {
-                let running = self.manager.start_status(
-                    self.open_system_store(group.identity.clone()).await?,
-                    local.clone(),
-                    group.members(),
-                    config.clone(),
-                ).await?;
+                let running = self
+                    .manager
+                    .start(
+                        self.open_system_store(group.identity.clone()).await?,
+                        local.clone(),
+                        group.members(),
+                        config.clone(),
+                    )
+                    .await?;
                 self.check_system_group(&running, group, &local).await?;
                 status.push(running);
             }
@@ -323,7 +336,7 @@ impl RegisteredWorker {
             let group = &self.placements.catalog;
             let running = self
                 .manager
-                .start_catalog(
+                .start(
                     self.open_system_store(group.identity.clone()).await?,
                     local.clone(),
                     group.members(),
