@@ -1,0 +1,16 @@
+id = "olap-stream-sim"
+module = "olap-stream"
+kinds = ["S", "H"]
+guarantees = ["OLAP-STR-G01", "OLAP-STR-G02", "OLAP-STR-G03", "OLAP-STR-G04", "OLAP-STR-G05", "OLAP-STR-G06"]
+scenarios = ["ST01", "ST02", "ST03", "ST04", "ST05", "ST06"]
+tiers = ["T1"]
+# Drives the real Local coordinator and scan reader over SimObjectStore with a
+# seeded nemesis (lost replies, coordinator kills before and after checkpoint
+# replication, concurrent commits, GET faults, cold start). Includes the three
+# planted-bug sensitivity tests. Seams: docs/testing/olap-stream-sim.md.
+command = ["cargo", "test", "-j", "2", "--locked", "--lib", "node::stream::sim_tests::", "--", "--nocapture", "--test-threads=1"]
+cwd = "server"
+timeout_s = 1800
+needs = []
+result_parser = "cargo-test"
+env = { NABEDRA_CASES = "200" }
