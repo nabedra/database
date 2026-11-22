@@ -1,0 +1,6 @@
+{"type":"invoke","process":0,"f":"txn","value":[["append","x",1],["append","y",1]]}
+{"type":"invoke","process":1,"f":"txn","value":[["r","x",null],["r","y",null]]}
+{"type":"ok","process":1,"f":"txn","value":[["r","x",[]],["r","y",[1]]]}
+{"type":"ok","process":0,"f":"txn","value":[["append","x",1],["append","y",1]]}
+{"type":"invoke","process":2,"f":"txn","value":[["r","x",null]]}
+{"type":"ok","process":2,"f":"txn","value":[["r","x",[1]]]}

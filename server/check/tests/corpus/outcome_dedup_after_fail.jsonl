@@ -1,0 +1,4 @@
+{"type":"invoke","process":0,"f":"write","key":"k","value":7,"request_id":"r-3"}
+{"type":"fail","process":0,"f":"write","key":"k","value":{"outcome":"not_applied"},"request_id":"r-3"}
+{"type":"invoke","process":0,"f":"write","key":"k","value":7,"request_id":"r-3"}
+{"type":"ok","process":0,"f":"write","key":"k","value":{"dedup":true},"request_id":"r-3"}

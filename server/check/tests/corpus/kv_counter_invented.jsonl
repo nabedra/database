@@ -1,0 +1,6 @@
+{"type":"invoke","process":0,"f":"incr","key":"c","value":2}
+{"type":"ok","process":0,"f":"incr","key":"c","value":2}
+{"type":"invoke","process":1,"f":"incr","key":"c","value":3}
+{"type":"info","process":1,"f":"incr","key":"c","value":3}
+{"type":"invoke","process":2,"f":"get","key":"c","value":null}
+{"type":"ok","process":2,"f":"get","key":"c","value":"6"}

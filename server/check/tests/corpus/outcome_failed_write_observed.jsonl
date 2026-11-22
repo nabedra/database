@@ -1,0 +1,4 @@
+{"type":"invoke","process":0,"f":"write","key":"k","value":5,"request_id":"r-1"}
+{"type":"fail","process":0,"f":"write","key":"k","value":5,"request_id":"r-1"}
+{"type":"invoke","process":1,"f":"read","key":"k","value":null}
+{"type":"ok","process":1,"f":"read","key":"k","value":5}

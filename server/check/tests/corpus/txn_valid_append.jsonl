@@ -1,0 +1,14 @@
+{"type":"invoke","process":0,"f":"txn","value":[["append","x",1],["r","x",null]]}
+{"type":"invoke","process":1,"f":"txn","value":[["r","x",null],["append","y",1]]}
+{"type":"ok","process":0,"f":"txn","value":[["append","x",1],["r","x",[1]]]}
+{"type":"ok","process":1,"f":"txn","value":[["r","x",[]],["append","y",1]]}
+{"type":"invoke","process":2,"f":"txn","value":[["append","x",2],["append","y",2]]}
+{"type":"info","process":2,"f":"txn","value":[["append","x",2],["append","y",2]]}
+{"type":"invoke","process":3,"f":"txn","value":[["append","x",3]]}
+{"type":"info","process":3,"f":"txn","value":[["append","x",3]]}
+{"type":"invoke","process":4,"f":"txn","value":[["append","y",4]]}
+{"type":"fail","process":4,"f":"txn","value":[["append","y",4]]}
+{"type":"invoke","process":0,"f":"txn","value":[["r","x",null],["r","y",null]]}
+{"type":"ok","process":0,"f":"txn","value":[["r","x",[1,2]],["r","y",[1,2]]]}
+{"type":"invoke","process":1,"f":"txn","value":[["r","x",null]]}
+{"type":"ok","process":1,"f":"txn","value":[["r","x",[1,2]]]}
