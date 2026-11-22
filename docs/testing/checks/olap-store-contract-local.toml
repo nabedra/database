@@ -1,0 +1,14 @@
+id = "olap-store-contract-local"
+module = "olap"
+kinds = ["H"]
+# Tests adapter behavior used by the commit protocol.
+guarantees = []
+tiers = ["T1"]
+# Spawns scripts/local_store.py --test-faults; needs only Python 3.11 or later.
+# Without it the test prints "not-run: python-unavailable" and asserts nothing.
+command = ["cargo", "test", "--locked", "--lib", "storage::contract_tests::contract_local_store", "--", "--exact", "--nocapture"]
+cwd = "server"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"
+not_run_marker = "not-run: python-unavailable"

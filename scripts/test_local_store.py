@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 
@@ -18,13 +19,15 @@ TOKEN = 'local-test-token'
 
 
 class StoreProcess:
-    def __init__(self, database):
+    def __init__(self, database, extra_args=()):
         self.database = database
+        self.extra_args = list(extra_args)
         self.process = None
 
     def start(self):
         self.process = subprocess.Popen(
-            [sys.executable, str(SCRIPT), '--database', str(self.database), '--port', '0'],
+            [sys.executable, str(SCRIPT), '--database', str(self.database), '--port', '0',
+             *self.extra_args],
             env={**os.environ, 'NABEDRA_STORE_TOKEN': TOKEN},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -201,6 +204,88 @@ class LocalStoreTests(unittest.TestCase):
         status, headers, body = self.store.request('GET')
         self.assertEqual((status, headers['ETag'], body), (200, acknowledged_to_proxy, b''))
         self.assertEqual(self.store.request('PUT', headers={'If-None-Match': '*'})[0], 412)
+
+
+FAULT = 'X-Nabedra-Test-Fault'
+
+
+class TestFaultTests(unittest.TestCase):
+    """--test-faults: X-Nabedra-Test-Fault reaches HttpStore over real HTTP."""
+
+    def start(self, *args):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        store = StoreProcess(Path(temp.name) / 'store.sqlite', args)
+        self.addCleanup(store.stop)
+        return store.start()
+
+    def disconnected(self, store, method, key, body=b'', headers=None):
+        try:
+            store.request(method, key, body=body, headers=headers)
+        except (http.client.RemoteDisconnected, ConnectionResetError):
+            return True
+        return False
+
+    def test_header_is_ignored_without_the_flag(self):
+        store = self.start()
+        status, _, _ = store.request('PUT', body=b'x', headers={'If-None-Match': '*', FAULT: 'status=503'})
+        self.assertEqual(status, 204)
+        self.assertEqual(store.request('GET', headers={FAULT: 'status=503'})[0], 200)
+
+    def test_put_faults(self):
+        store = self.start('--test-faults')
+        create = {'If-None-Match': '*'}
+        key = '/v1/objects/test/lost'
+        self.assertTrue(self.disconnected(store, 'PUT', key, b'lost', {**create, FAULT: 'lost-response'}))
+        status, _, body = store.request('GET', key)
+        self.assertEqual((status, body), (200, b'lost'))
+        for code in (412, 409, 503, 404):
+            with self.subTest(code=code):
+                key = f'/v1/objects/test/status{code}'
+                status, _, _ = store.request('PUT', key, b'x', {**create, FAULT: f'status={code}'})
+                self.assertEqual(status, code)
+                self.assertEqual(store.request('GET', key)[0], 404)
+        key = '/v1/objects/test/embedded'
+        status, headers, body = store.request('PUT', key, b'x', {**create, FAULT: 'status=200'})
+        self.assertEqual(status, 200)
+        self.assertIn(b'<Error>', body)
+        self.assertNotIn('ETag', headers)
+        self.assertEqual(store.request('GET', key)[0], 404)
+        for bad in ('nonsense', 'status=9999', 'delay-apply=', 'status=200,lost-response'):
+            with self.subTest(bad=bad):
+                key = '/v1/objects/test/bad'
+                self.assertEqual(store.request('PUT', key, b'x', {**create, FAULT: bad})[0], 400)
+                self.assertEqual(store.request('GET', key)[0], 404)
+
+    def test_delayed_apply_checks_its_condition_late(self):
+        store = self.start('--test-faults')
+        key = '/v1/objects/test/late'
+        self.assertTrue(self.disconnected(store, 'PUT', key, b'late',
+                                          {'If-None-Match': '*', FAULT: 'delay-apply=300'}))
+        self.assertEqual(store.request('GET', key)[0], 404)
+        deadline = time.monotonic() + 5
+        while store.request('GET', key)[0] == 404 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        status, headers, body = store.request('GET', key)
+        self.assertEqual((status, body), (200, b'late'))
+        # A late If-Match whose version was replaced meanwhile must not apply.
+        stale = headers['ETag']
+        self.assertTrue(self.disconnected(store, 'PUT', key, b'stale',
+                                          {'If-Match': stale, FAULT: 'delay-apply=300'}))
+        status, headers, _ = store.request('PUT', key, b'fresh', {'If-Match': stale})
+        self.assertEqual(status, 204)
+        time.sleep(0.8)
+        self.assertEqual(store.request('GET', key)[2], b'fresh')
+
+    def test_get_faults(self):
+        store = self.start('--test-faults')
+        key = '/v1/objects/test/item'
+        self.assertEqual(store.request('PUT', key, b'x', {'If-None-Match': '*'})[0], 204)
+        self.assertEqual(store.request('GET', key, headers={FAULT: 'status=503'})[0], 503)
+        self.assertEqual(store.request('GET', key, headers={FAULT: 'status=404'})[0], 404)
+        self.assertTrue(self.disconnected(store, 'GET', key, headers={FAULT: 'lost-response'}))
+        self.assertEqual(store.request('GET', key, headers={FAULT: 'delay-apply=5'})[0], 400)
+        self.assertEqual(store.request('GET', key)[2], b'x')
 
 
 if __name__ == '__main__':

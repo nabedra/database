@@ -32,23 +32,14 @@ jobs:
         shell: bash
         run: |
           sha=$(git rev-parse HEAD)
-          if [ -f scripts/testing/run_check.py ] && python3 scripts/testing/run_check.py --help | grep -F -- --tier > /dev/null; then
-            checks=$(python3 scripts/testing/run_check.py --list --tier T2 | cut -f1 | paste -sd, -)
-          else
-            checks=$(python3 - <<'PY'
-          from pathlib import Path
-          import tomllib
-
-          ids = []
-          for path in sorted(Path("docs/testing/checks").glob("*.toml")):
-              with path.open("rb") as source:
-                  check = tomllib.load(source)
-              if "T2" in check.get("tiers", []):
-                  ids.append(check["id"])
-          print(",".join(ids))
-          PY
-            )
+          include_s3=true
+          if ! python3 scripts/testing/s3/budget.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"; then
+            include_s3=false
+            echo "S3 checks omitted because the budget check failed." >> "$GITHUB_STEP_SUMMARY"
           fi
+          checks=$(python3 scripts/testing/run_check.py --list --tier T2 --json |
+            jq -r --argjson include_s3 "$include_s3" \
+              '[.[] | select($include_s3 or (.needs | index("s3") == null)) | .id] | join(",")')
           # The run ID keeps a manual rerun on the same day from sharing evidence and S3 prefixes.
           request_id="nightly-${sha:0:7}-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}"
           {

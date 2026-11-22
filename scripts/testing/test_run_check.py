@@ -94,6 +94,13 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(result, "error")
         self.assertEqual(p.not_run[-1]["id"], "timeout")
 
+    def test_not_run_marker_preserves_failures(self):
+        marker = "not-run: missing fixture"
+        output = marker + "\n" + CARGO_FAIL
+        self.assertEqual(run_check.classify("cargo-test", output, 0, not_run_marker=marker)[0], "fail")
+        self.assertEqual(run_check.classify("exit-code", marker, 1, not_run_marker=marker)[0], "fail")
+        self.assertEqual(run_check.classify("exit-code", marker, 0, True, marker)[0], "error")
+
 
 class CheckFileTests(unittest.TestCase):
     def test_fixture_checks_load(self):
@@ -161,6 +168,15 @@ class ExecuteTests(unittest.TestCase):
                 print("Ran 0 tests in 0.000s"); print(); print("NO TESTS RAN")
             elif mode == "fail":
                 print("Ran 3 tests in 0.001s"); print(); print("FAILED (failures=1)"); sys.exit(1)
+            elif mode == "skip":
+                print("not-run: missing fixture")
+                print("Ran 1 test in 0.001s"); print(); print("OK")
+            elif mode == "s3":
+                print("nabedra-s3-requests: 12 prefix=runs/req-s3/")
+                print("nabedra-s3-requests: 3")
+                print("some log: nabedra-s3-requests: 100")
+                print("nabedra-s3-requests: 42bad")
+                sys.exit(1)
             elif mode == "env":
                 print("rid=" + os.environ["NABEDRA_REQUEST_ID"] + " knob=" + os.environ["KNOB"])
             elif mode == "sleep":
@@ -196,6 +212,24 @@ class ExecuteTests(unittest.TestCase):
     def test_zero_assertions_record_is_not_run(self):
         record, _ = self.run_mode("zero")
         self.assertEqual(record["result"], "not-run")
+
+    def test_not_run_marker_overrides_a_success_summary(self):
+        marker = "not-run: missing fixture"
+        record, path = self.run_mode("skip", not_run_marker=marker)
+        self.assertEqual(record["result"], "not-run")
+        self.assertEqual(record["assertions"], {
+            "executed": 0, "failed": 0,
+            "not_run": [{"id": "output-marker", "reason": marker}],
+        })
+        self.assertEqual(json.loads(path.read_text()), record)
+        output = (self.logs / "req-skip--demo.log").read_text()
+        self.assertEqual(run_check.classify("unittest", output, 0)[0], "pass")
+
+    def test_s3_requests_are_recorded_even_when_check_fails(self):
+        record, path = self.run_mode("s3", parser="exit-code")
+        self.assertEqual(record["result"], "fail")
+        self.assertEqual(json.loads(path.read_text())["s3_requests"], 15)
+        self.assertNotIn("s3_requests", self.run_mode("ok")[0])
 
     def test_failure(self):
         record, _ = self.run_mode("fail")

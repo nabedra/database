@@ -226,6 +226,39 @@ impl Storage<S3Store> {
 
 #[cfg(test)]
 impl S3Store {
+    /// Contract-suite helper: an unconditional DELETE of a namespaced key.
+    pub(crate) async fn test_delete(&self, key: &str) -> Result<(), StorageError> {
+        self.check_key(key)?;
+        self.writes
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map(drop)
+            .map_err(|_| StorageError::Unavailable)
+    }
+    /// Contract-suite helper: one LIST page (at most 1,000 keys) under `prefix`.
+    pub(crate) async fn test_list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        if !prefix.starts_with(self.namespace.as_str()) {
+            return Err(StorageError::InvalidPath);
+        }
+        let response = self
+            .reads
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .send()
+            .await
+            .map_err(|_| StorageError::Unavailable)?;
+        let mut keys: Vec<String> = response
+            .contents()
+            .iter()
+            .filter_map(|o| o.key().map(str::to_owned))
+            .collect();
+        keys.sort();
+        Ok(keys)
+    }
     pub(crate) async fn test_credentials(&self) -> aws_sdk_s3::config::Credentials {
         self.snapshot
             .as_ref()

@@ -37,6 +37,7 @@ env = { NABEDRA_CASES = "1000" } # optional
 | `needs` | no | Environment the check requires. See below. |
 | `result_parser` | yes | How assertion counts are read from the output. See below. |
 | `env` | no | String values added to the environment. `NABEDRA_REQUEST_ID` is always set. |
+| `not_run_marker` | no | A nonblank literal string, up to 300 characters. If the command exits successfully and prints this string without any parsed test failures, the record is `not-run` with zero executed assertions. Use it only when the entire check was skipped. |
 
 Unknown fields are errors.
 
@@ -66,13 +67,16 @@ A missing need makes the result `not-run` with the reason below, and the command
 The result follows these rules, in order:
 
 1. Timeout: `error`.
-2. No summary line for the parser (for example a compile error): `fail`.
-3. Any failed assertion: `fail`.
-4. Nonzero exit with no failed assertion parsed: `error`.
-5. Zero executed assertions: `not-run` with reason `zero-assertions`. Never `pass`.
-6. Otherwise `pass`.
+2. A matching `not_run_marker` with exit status zero and no parsed failures: `not-run`.
+3. No summary line for the parser (for example a compile error): `fail`.
+4. Any failed assertion: `fail`.
+5. Nonzero exit with no failed assertion parsed: `error`.
+6. Zero executed assertions: `not-run` with reason `zero-assertions`. Never `pass`.
+7. Otherwise `pass`.
 
 Ignored, skipped and todo tests are listed in the record's `assertions.not_run`.
+If a check prints one or more lines starting with `nabedra-s3-requests: <n>`,
+the record stores their sum as `s3_requests`, including for failed checks.
 
 ## Running
 

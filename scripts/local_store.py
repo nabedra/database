@@ -4,6 +4,15 @@
 PUT requires Content-Length. Bodyless GET accepts an absent length or zero.
 Keys use two or more slash-separated, nonempty ASCII unreserved components.
 Run on trusted local networks only: bearer authentication does not provide TLS.
+
+With --test-faults only, the store honours the request header
+X-Nabedra-Test-Fault, so adapter tests meet faults over real HTTP:
+  lost-response     apply the PUT, then close the connection without a reply
+  delay-apply=<ms>  close without a reply now, apply the PUT <ms> later (the
+                    condition is checked when it applies)
+  status=<code>     reply <code> and apply nothing; status=200 on PUT replies an
+                    S3-style embedded error body
+Never pass --test-faults outside tests.
 """
 import argparse
 from contextlib import closing
@@ -28,6 +37,9 @@ QUEUE_SIZE = 8
 REQUEST_SECONDS = 15
 ETAG = re.compile(r'"[\x21\x23-\x7e\x80-\xff]*"')
 COMPONENT = re.compile(r'[A-Za-z0-9_.~-]+')
+FAULT = re.compile(r'lost-response|delay-apply=[0-9]{1,6}|status=[1-5][0-9][0-9]')
+EMBEDDED_ERROR = (b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                  b'<Error><Code>InternalError</Code><Message>embedded</Message></Error>')
 
 
 def connect(database):
@@ -75,8 +87,9 @@ class StoreServer(socketserver.TCPServer):
     allow_reuse_address = True
     request_queue_size = QUEUE_SIZE
 
-    def __init__(self, address, database, token):
+    def __init__(self, address, database, token, test_faults=False):
         self.database = database
+        self.test_faults = test_faults
         self.token = token.encode('ascii')
         self.stopping = threading.Event()
         self.pending = queue.Queue(maxsize=QUEUE_SIZE)
@@ -209,11 +222,30 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return key, length
 
+    def fault(self):
+        """Return the requested test fault, '' for a malformed one, or None."""
+        values = self.headers.get_all('X-Nabedra-Test-Fault', [])
+        if not values or not self.server.test_faults:
+            return None
+        if len(values) != 1 or FAULT.fullmatch(values[0]) is None:
+            return ''
+        return values[0]
+
     def do_GET(self):
         validated = self.validate()
         if validated is None:
             return
         key, _ = validated
+        fault = self.fault()
+        if fault == '' or (fault is not None and fault.startswith('delay-apply=')):
+            self.reply(400)
+            return
+        if fault == 'lost-response':
+            self.close_connection = True
+            return
+        if fault is not None:
+            self.reply(int(fault.split('=', 1)[1]))
+            return
         with closing(connect(self.server.database)) as connection:
             # One SELECT reads both bytes and generation from one snapshot.
             row = connection.execute('SELECT body, generation FROM objects WHERE key=?', (key,)).fetchone()
@@ -227,6 +259,10 @@ class Handler(BaseHTTPRequestHandler):
         if validated is None:
             return
         key, length = validated
+        fault = self.fault()
+        if fault == '':
+            self.reply(400)
+            return
         create = self.headers.get_all('If-None-Match', [])
         match = self.headers.get_all('If-Match', [])
         if not ((create == ['*'] and not match) or
@@ -244,31 +280,61 @@ class Handler(BaseHTTPRequestHandler):
         if len(body) != length:
             self.reply(400)
             return
-        with closing(connect(self.server.database)) as connection:
-            connection.execute('BEGIN IMMEDIATE')
-            try:
-                current = connection.execute('SELECT generation FROM objects WHERE key=?', (key,)).fetchone()
-                if (create and current is not None) or (match and (current is None or tag(current[0]) != match[0])):
-                    connection.rollback()
-                    self.reply(412)
-                    return
-                generation = connection.execute('SELECT value FROM generation WHERE singleton=1').fetchone()[0] + 1
-                connection.execute('UPDATE generation SET value=? WHERE singleton=1', (generation,))
-                # The condition and this write share BEGIN IMMEDIATE. Avoid
-                # UPSERT syntax so the helper also runs with SQLite < 3.24.
-                if current is None:
-                    connection.execute('INSERT INTO objects VALUES (?, ?, ?)',
-                                       (key, body, generation))
-                else:
-                    connection.execute('UPDATE objects SET body=?, generation=? WHERE key=?',
-                                       (body, generation, key))
-                connection.commit()
-            except BaseException:
-                # In particular, a COMMIT error may mean the write applied.
-                # Close without an HTTP result; the client must reconcile by GET.
-                connection.rollback()
-                raise
+        if fault == 'lost-response':
+            apply_put(self.server.database, key, body, create, match)
+            self.close_connection = True
+            return
+        if fault is not None and fault.startswith('delay-apply='):
+            delay = int(fault.split('=', 1)[1]) / 1000
+            timer = threading.Timer(delay, late_put, args=(self.server.database, key, body, create, match))
+            timer.daemon = True
+            timer.start()
+            self.close_connection = True
+            return
+        if fault is not None:
+            code = int(fault.split('=', 1)[1])
+            self.reply(code, EMBEDDED_ERROR if code == 200 else b'')
+            return
+        generation = apply_put(self.server.database, key, body, create, match)
+        if generation is None:
+            self.reply(412)
+            return
         self.reply(204, etag=tag(generation))
+
+
+def apply_put(database, key, body, create, match):
+    """Apply one conditional PUT. Return the new generation, or None on a failed condition."""
+    with closing(connect(database)) as connection:
+        connection.execute('BEGIN IMMEDIATE')
+        try:
+            current = connection.execute('SELECT generation FROM objects WHERE key=?', (key,)).fetchone()
+            if (create and current is not None) or (match and (current is None or tag(current[0]) != match[0])):
+                connection.rollback()
+                return None
+            generation = connection.execute('SELECT value FROM generation WHERE singleton=1').fetchone()[0] + 1
+            connection.execute('UPDATE generation SET value=? WHERE singleton=1', (generation,))
+            # The condition and this write share BEGIN IMMEDIATE. Avoid
+            # UPSERT syntax so the helper also runs with SQLite < 3.24.
+            if current is None:
+                connection.execute('INSERT INTO objects VALUES (?, ?, ?)',
+                                   (key, body, generation))
+            else:
+                connection.execute('UPDATE objects SET body=?, generation=? WHERE key=?',
+                                   (body, generation, key))
+            connection.commit()
+            return generation
+        except BaseException:
+            # In particular, a COMMIT error may mean the write applied.
+            # Close without an HTTP result; the client must reconcile by GET.
+            connection.rollback()
+            raise
+
+
+def late_put(database, key, body, create, match):
+    try:
+        apply_put(database, key, body, create, match)
+    except (OSError, sqlite3.Error):
+        pass
 
 
 def main():
@@ -276,6 +342,8 @@ def main():
     parser.add_argument('--database', required=True, help='SQLite file on local disk')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=9000)
+    parser.add_argument('--test-faults', action='store_true',
+                        help='honour X-Nabedra-Test-Fault request headers (tests only)')
     args = parser.parse_args()
     token = os.environ.get('NABEDRA_STORE_TOKEN', '')
     if not token or any(ord(c) < 33 or ord(c) > 126 for c in token):
@@ -286,7 +354,7 @@ def main():
         return 2
     try:
         initialize(args.database)
-        with StoreServer((args.host, args.port), args.database, token) as server:
+        with StoreServer((args.host, args.port), args.database, token, args.test_faults) as server:
             def stop(signum, frame):
                 server.stopping.set()
             signal.signal(signal.SIGTERM, stop)
