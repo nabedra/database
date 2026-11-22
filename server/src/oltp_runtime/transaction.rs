@@ -15,7 +15,7 @@ use crate::{
     },
     oltp_replication::{
         authority::{
-            control::ScopedCatalogRead,
+            control::{ControlHandle, ScopedCatalogRead},
             status::{
                 IdentityLookup, IdentityReservation, PointManifest, StatusService,
                 TerminalIdentity, VerifiedSettlement, VerifiedStatusDecision,
@@ -679,7 +679,7 @@ impl TransactionCoordinator {
         &self,
         authority: Authority,
         txn: TxnId,
-        retry_switch: Option<&DirectSwitch>,
+        retry_control: Option<&ControlHandle>,
     ) -> Result<Option<VerifiedStatusDecision>, ProtocolError> {
         if let Some(scope) = self.scope {
             match self.recover_timestamp_point(authority, scope, txn).await? {
@@ -725,10 +725,12 @@ impl TransactionCoordinator {
                 .await?
                 .ok_or_else(unknown)?
         } else if authority.owner_term > state.created_authority.owner_term {
+            // An unavailable capability read leaves the attempt undecided.
+            // Only a definite answer can select the terminal fallback.
             if state.created_authority.run_id == authority.run_id
                 && state.manifest.is_some()
-                && let Some(switch) = retry_switch
-                && switch.queued_snapshot_retry_enabled().await
+                && let Some(control) = retry_control
+                && control.queued_snapshot_retry_enabled().await?
             {
                 let (reason, message) = if txn.attempt < MAX_QUEUED_MUTATION_ATTEMPTS {
                     (

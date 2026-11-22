@@ -43,9 +43,9 @@ impl WorkerRuntime {
                     && !record.body.is_empty()
                     && record.pinned_catalog.is_some()
             });
-        let retry_switch = self.direct_switch().map(Arc::as_ref).filter(|_| retained);
+        let retry_control = retained.then_some(self.services.control.as_ref());
         self.transactions
-            .recover_queued(authority, txn, retry_switch)
+            .recover_queued(authority, txn, retry_control)
             .await
     }
 
