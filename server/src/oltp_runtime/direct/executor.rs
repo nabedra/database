@@ -632,7 +632,9 @@ impl DirectExecutor {
         error: ProtocolError,
     ) -> Result<(), DirectResponse> {
         // RV-FINAL M1: a full device refuses new work before proposing it.
-        if error.outcome == Outcome::NotApplied && crate::oltp::pool::is_no_space(&error) {
+        if (error.outcome == Outcome::NotApplied && crate::oltp::pool::is_no_space(&error))
+            || crate::oltp::pool::is_disk_reservation_refusal(&error)
+        {
             return Err(failed(error));
         }
         let expired = Instant::now() >= deadline;

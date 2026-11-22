@@ -990,8 +990,10 @@ def disk_pressure_settlement(test_executable):
                     wait_reached([server.root], request, 'prepared')
 
                 filler = server.directory / 'acc3-disk-pressure'
+                [headroom] = server.stats()['storage_reservations']
                 remaining = os.statvfs(server.directory)
                 keep = 1 << 20
+                assert keep < headroom['protected_bytes'], headroom
                 size = remaining.f_bavail * remaining.f_frsize - keep
                 assert size > 0
                 with filler.open('xb') as allocation:
@@ -999,6 +1001,14 @@ def disk_pressure_settlement(test_executable):
                 free = os.statvfs(server.directory)
                 assert free.f_bavail * free.f_frsize <= keep, free
                 try:
+                    blocked = operation('table.insert', dict(
+                        table_id=table.id, row=dict(id='blocked', value=1)))
+                    assert client.exchange('/v1/operations', blocked) == (503, dict(
+                        request_id=blocked['request_id'], error=dict(
+                            code='storage_unavailable', outcome='not_applied',
+                            message='OLTP filesystem has insufficient unreserved storage',
+                        ),
+                    ))
                     for request in (commit, abort):
                         release(server.root, request)
                     exact_receipt(client.exchange, server.run_id, commit, None)
@@ -1016,14 +1026,18 @@ def disk_pressure_settlement(test_executable):
                     wait_until(abort_receipt, 'prepared transaction did not settle ABORT under disk pressure', timeout=20)
                     assert table.get('commit') == dict(id='commit', value=1)
                     assert table.get('abort') is None
+                    assert table.get('blocked') is None
                     assert table.query().count() == 1
                     table.drop()
                     assert db.tables() == []
                     queue = server.stats()['queue']
                     assert queue['queued_records'] == queue['running_records'] == queue['reconciling_records'] == 0, queue
+                    [settled] = server.stats()['storage_reservations']
+                    assert settled['reserved_bytes'] == settled['reservations'] == 0, settled
                 finally:
                     filler.unlink()
-                return dict(free_bytes=free.f_bavail * free.f_frsize, committed=1, aborted=1, pending=0)
+                return dict(free_bytes=free.f_bavail * free.f_frsize, protected_bytes=headroom['protected_bytes'],
+                            committed=1, aborted=1, pending=0, reserved_bytes=settled['reserved_bytes'])
         finally:
             subprocess.run(['sudo', '-n', 'umount', mount], capture_output=True, check=True, timeout=30)
 

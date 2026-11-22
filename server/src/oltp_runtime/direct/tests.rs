@@ -65,6 +65,8 @@ mod tls;
 
 mod gc1;
 mod gc2;
+#[cfg(target_os = "linux")]
+mod reservations;
 
 struct Dir(PathBuf);
 impl Dir {

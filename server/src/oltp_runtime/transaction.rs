@@ -516,7 +516,9 @@ impl TransactionCoordinator {
         };
         let decision = match preparation {
             Err(error) => {
+                let disk_refusal = crate::oltp::pool::is_disk_reservation_refusal(&error);
                 if recoverable
+                    && !disk_refusal
                     && (error.outcome == Outcome::Unknown
                         || matches!(
                             error.code,
@@ -532,6 +534,7 @@ impl TransactionCoordinator {
                     txn.request_id, error.code, error.message
                 );
                 let mut reason = match error.code {
+                    _ if disk_refusal => AbortReason::ResourceLimit,
                     ErrorCode::Overloaded | ErrorCode::LimitExceeded => AbortReason::ResourceLimit,
                     _ => AbortReason::Conflict,
                 };
