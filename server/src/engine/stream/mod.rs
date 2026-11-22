@@ -51,6 +51,9 @@ pub(crate) struct PinnedScan {
     data: TableData,
     /// One prefix per file, followed by the full raw row count.
     file_starts: Vec<u64>,
+    #[cfg(test)]
+    #[serde(skip)]
+    force_full_scan: bool,
 }
 
 fn decode_pinned_query<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<Query, D::Error> {
@@ -154,6 +157,8 @@ impl PinnedScan {
             query,
             data: entry.data.clone(),
             file_starts,
+            #[cfg(test)]
+            force_full_scan: false,
         })
     }
 
