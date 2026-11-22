@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "FLAKE2-sync-fixture"
+title = "A delayed commit marker could occupy the typed-log fault gate"
+class = "other"
+module = "testing"
+guarantees = ["OLTP-G01"]
+scenarios = ["O06", "O11", "O29"]
+found_by = "ci-flake"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_replication/typed_log/tests.rs::o06_o11_journal_sync_precedes_typed_append_ack"
+seed = "unknown"
+why_not_caught = "The fixture closed the sync gate before earlier marker work settled."
+invariant_added = "Settle earlier markers before holding the intended append and release the hold on scope exit."
+fix_commits = ["765c2f56bd0854af2d382ed221c9b41f5cb47c18", "4fd461c232947df3f5d9994d4b6157fef139ab82"]
+revert_patch_ok = false

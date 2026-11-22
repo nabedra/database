@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "IDXHOT"
+title = "A continually updated key prevented an online index from finishing"
+class = "stale-route-topology-schema"
+module = "oltp"
+guarantees = ["OLTP-G06"]
+scenarios = ["O12", "D11"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "D11"
+seed = "unknown"
+why_not_caught = "The writer must repeatedly hit a key that the backfill is refreshing."
+invariant_added = "Skip a conflicted refresh only when a newer committed version proves foreground maintenance."
+fix_commits = ["4fda542014c4d3aa129124503122b75c405a6084"]
+revert_patch_ok = true

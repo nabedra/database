@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "BUG1-auth"
+title = "A retry's authorization refusal hid a committed write"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G03", "OLTP-G04"]
+scenarios = ["D02", "O10"]
+found_by = "unknown"
+found_date = "2026-11-21"
+lowest_regression = "server/src/oltp_runtime/application/direct/tests.rs::d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome"
+seed = "unknown"
+why_not_caught = "The first reply must be lost after apply and the retry must lose authorization."
+invariant_added = "A retry refusal cannot erase uncertainty from a prior attempt."
+fix_commits = ["259da02c2369527ebce3d292dac83dd5ffad2d71", "d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+revert_patch_ok = false

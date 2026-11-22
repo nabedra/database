@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "CAP1"
+title = "Per-connection index reclamation could split durable apply across versions"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G06", "OLTP-G08"]
+scenarios = ["O02", "O12"]
+found_by = "unknown"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_runtime/direct/tests/cap1.rs::cap1_o02_o12_reclaim_index_is_proposed_only_once_the_feature_is_enabled"
+seed = "unknown"
+why_not_caught = "The connection handshake described one peer while reclamation changes replicated state."
+invariant_added = "Propose ReclaimIndex only after cluster feature activation and require the advert on join."
+fix_commits = ["9be40820c5d2385d24e8bc4d5b3b441820567f04", "414dcf79c8f29eb01a4b1a5961b078eacb477232", "2920a442d269135de2a7471001d6af9ea4c45853"]
+revert_patch_ok = false

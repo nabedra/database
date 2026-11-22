@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "RD1"
+title = "A DDL fence between epoch read and snapshot allowed an old descriptor"
+class = "stale-route-topology-schema"
+module = "oltp"
+guarantees = ["OLTP-G06"]
+scenarios = ["O12", "D11"]
+found_by = "unknown"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_runtime/direct/tests.rs::o12_d11_rd1_a_fence_after_the_descriptor_lookup_restarts_the_mutation"
+seed = "unknown"
+why_not_caught = "The DDL fence must apply between the descriptor lookup and the barrier-checked snapshot."
+invariant_added = "Retry when the descriptor epoch differs from the attempt's snapshot epoch."
+fix_commits = ["f2e21999dfb5801dcaee413b4c4c524254fa4511"]
+revert_patch_ok = false

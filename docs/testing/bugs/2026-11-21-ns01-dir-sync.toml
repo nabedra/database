@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #23
+id = "NS01-dir-sync"
+title = "A power loss after journal roll lost newly synced records"
+class = "fence-lifecycle-order"
+module = "lsm"
+guarantees = ["OLTP-G01"]
+scenarios = ["NS01"]
+found_by = "campaign"
+found_date = "unknown"
+lowest_regression = "server/kv/src/journal/crash_tests.rs::ns04_kvfix4_kill_before_a_rolls_dir_sync_then_crash_after_reopen_keeps_synced_records"
+seed = 4242
+why_not_caught = "The cut needed a reopen after a segment rename and a later power loss after new writes synced."
+invariant_added = "Sync the journal directory on open before appending to the recovered segment."
+fix_commits = ["1fac75462b088c47e8cecd6aefcd5612bdadbb42"]
+revert_patch_ok = false

@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "RV-REP-2"
+title = "The 1,025th worker revocation could stop Control"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G08", "OLTP-G09"]
+scenarios = ["O17"]
+found_by = "review"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_replication/authority/control/tests/system_recovery.rs::o17_revocation_limit_and_failed_refresh_preserve_the_committed_mount"
+seed = "unknown"
+why_not_caught = "The overflow only appears after filling the 1,024-entry revocation set."
+invariant_added = "Refuse a new mount before mutation at capacity and load the historical overflow on restart."
+fix_commits = ["8b3c44b2c55b51c4aae414567924ace705fdf048", "2def358f9c98bb14910726ac5888ba3be2a80441"]
+revert_patch_ok = false

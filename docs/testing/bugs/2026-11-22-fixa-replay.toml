@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "FIXA-replay"
+title = "A DirectBatch replay near its deadline denied an applied member"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G03", "OLTP-G04"]
+scenarios = ["D02"]
+found_by = "unknown"
+found_date = "2026-11-22"
+lowest_regression = "server/src/oltp_runtime/direct/tests/fixa.rs::d02_fixa_batch_replay_near_deadline_preserves_the_committed_outcome"
+seed = "unknown"
+why_not_caught = "The batch must return Replayed(None) within one retry pause of the deadline."
+invariant_added = "Replay returns the stored result or preserves uncertainty."
+fix_commits = ["443322361d89d5f3de5dd06632f09e4a14dd8fec"]
+revert_patch_ok = true

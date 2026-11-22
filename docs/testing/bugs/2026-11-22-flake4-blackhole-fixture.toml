@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "FLAKE4-blackhole-fixture"
+title = "The packet-drop client expired before its stated failover bound"
+class = "other"
+module = "testing"
+guarantees = ["OLTP-G10"]
+scenarios = ["D05"]
+found_by = "ci-flake"
+found_date = "unknown"
+lowest_regression = "server/tests/test_oltp_blackhole.py"
+seed = "unknown"
+why_not_caught = "The fixture used the ordinary client timeout before the allowed fault window elapsed."
+invariant_added = "Give each probe the remaining failover window."
+fix_commits = ["ca31990477dd6536b84ca327ed1f65f41e9b98a6"]
+revert_patch_ok = true

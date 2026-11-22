@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "O21CAP"
+title = "Table creation failed while the queue's published view was still installing"
+class = "stale-route-topology-schema"
+module = "oltp"
+guarantees = ["OLTP-G06", "OLTP-G07"]
+scenarios = ["O21"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "O21"
+seed = "unknown"
+why_not_caught = "The request must arrive between Control publishing the view and the owner or follower installing it."
+invariant_added = "Wait for the exact published view before accepting or installing the queue copy."
+fix_commits = ["c4fad97e65892eddf3f96cfe26287a8b04175300", "c7761409efaad8613c3fa0991730a14862d46879"]
+revert_patch_ok = false

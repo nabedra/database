@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "FLAKE5"
+title = "D11 treated a definite lane-full refusal as an index failure"
+class = "other"
+module = "testing"
+guarantees = ["OLTP-G06"]
+scenarios = ["D11"]
+found_by = "ci-flake"
+found_date = "unknown"
+lowest_regression = "D11"
+seed = "unknown"
+why_not_caught = "The fixture passed through pre-admission overload and raced writers against the first backfill keys."
+invariant_added = "Bound retries to the typed pre-admission refusal and start writers beyond the first backfill keys."
+fix_commits = ["8d2f271d9fd211e2f9b90db2eac387851945340e", "3e32b23f4aa66169468ddefbec321badfd1b386f"]
+revert_patch_ok = false

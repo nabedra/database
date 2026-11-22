@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "BUG1-pre-append"
+title = "A follower reported uncertainty for a proposal it refused before append"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G04"]
+scenarios = ["D04", "O13"]
+found_by = "unknown"
+found_date = "2026-11-21"
+lowest_regression = "server/src/oltp_runtime/application/direct/tests.rs::d04_o13_bug1_raft_follower_refuses_the_proposal_before_append"
+seed = "unknown"
+why_not_caught = "unknown"
+invariant_added = "Treat a pre-append redirect as definitive only if no earlier attempt may have applied."
+fix_commits = ["d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+revert_patch_ok = false

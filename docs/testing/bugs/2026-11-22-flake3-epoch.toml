@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "FLAKE3-epoch"
+title = "A coalesced Raft append could take jobs from the next writer epoch"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G01"]
+scenarios = ["O06", "O11"]
+found_by = "ci-flake"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_replication/typed_log/tests.rs::o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote"
+seed = "unknown"
+why_not_caught = "The second append must be queued after an intervening vote while the first append still owns the writer."
+invariant_added = "Coalesce jobs only within an append's writer epoch."
+fix_commits = ["38fc414df670cdfae981184e4721c0bbd79ff0e9"]
+revert_patch_ok = true

@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "RD2"
+title = "Background grant refresh starved Control during startup recovery"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G07", "OLTP-G09"]
+scenarios = ["C07", "O15"]
+found_by = "ci-flake"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_replication/service_rpc/grant_cache.rs::c07_rd2_warm_refreshes_hold_at_most_one_read_while_control_hangs"
+seed = "unknown"
+why_not_caught = "Contention appeared when multiple grant refreshes coincided with slow cold fencing."
+invariant_added = "At most one background role refresh holds a Control lane slot."
+fix_commits = ["116f03f811997edbff331d619f9baee328856948"]
+revert_patch_ok = true

@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "TOPO1-range-cap"
+title = "Whole-table route fills blocked point requests on large tables"
+class = "stale-route-topology-schema"
+module = "oltp"
+guarantees = ["OLTP-G06"]
+scenarios = ["O21", "O28"]
+found_by = "acceptance"
+found_date = "2026-11-21"
+lowest_regression = "server/src/oltp_runtime/application/direct/tests.rs::o28_gateway_routes_a_key_past_the_former_table_fill_cap"
+seed = "unknown"
+why_not_caught = "Smaller tables fit within the route-count limit and metadata lane."
+invariant_added = "Route one key with bounded Catalog pages and a bounded cache."
+fix_commits = ["44df28a40aaaadb4b7ad0ad837e0b2f29e7a060d"]
+revert_patch_ok = false

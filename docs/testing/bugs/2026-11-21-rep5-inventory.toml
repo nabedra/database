@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "REP5-inventory"
+title = "Replacement inventories above 64 Data groups could not finish inline repair"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G08", "OLTP-G09"]
+scenarios = ["O17", "NS14"]
+found_by = "review"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_replication/authority/control/tests/system_recovery.rs::o17_ns14_system_mount_hands_more_than_64_data_groups_to_the_damage_path"
+seed = "unknown"
+why_not_caught = "Small inventories fit in the inline work bound."
+invariant_added = "Page the inventory and pass remaining Data groups to bounded damage repair."
+fix_commits = ["ec8d06c5b80a012b42faf0ea891e459cc934a4f4", "15f9a8617d24291fb27ac4782576af9620b6fb0f"]
+revert_patch_ok = false

@@ -1,0 +1,15 @@
+# Evidence: docs/testing/evidence/oltp/direct-latency/rd3/README.md
+id = "RD3-journal"
+title = "An unsynced journal write waited for a later write's fsync"
+class = "resource-release-order"
+module = "lsm"
+guarantees = ["OLTP-G13"]
+scenarios = ["unknown"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "server/kv/src/journal/tests.rs::rd3_unsynced_head_of_a_group_is_visible_before_its_sync"
+seed = "unknown"
+why_not_caught = "The unsynced write and its later synced neighbor must enter the same batch."
+invariant_added = "Publish the leading unsynced writes in order before the later sync."
+fix_commits = ["fba2ccb012a2f0a81e659a5c5fcbabb658c60b31"]
+revert_patch_ok = true

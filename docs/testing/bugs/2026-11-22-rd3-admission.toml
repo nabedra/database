@@ -1,0 +1,15 @@
+# Evidence: docs/testing/evidence/oltp/direct-latency/rd3/README.md
+id = "RD3-admission"
+title = "Long direct commits occupied the queued ingress handler slots"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G09", "OLTP-G13"]
+scenarios = ["D12", "O03"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_replication/multiplex/transport/tests/sessions.rs::rd3_d12_o03_direct_requests_beyond_the_ingress_slots_reach_the_leader"
+seed = "unknown"
+why_not_caught = "Short serial workloads do not exceed the ingress slot count."
+invariant_added = "A direct leader admits requests on its own bounded, negotiated lane."
+fix_commits = ["906a0badbd9385dd3040b5743d2f3d650112e24f"]
+revert_patch_ok = false
