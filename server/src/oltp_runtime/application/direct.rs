@@ -52,6 +52,7 @@ use crate::{
     protocol::{ColumnType, ErrorCode, Key, Outcome, ProtocolError},
     response::{self, EncodedResponse},
 };
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::{
@@ -80,6 +81,9 @@ pub(super) const ROUTE_REPLY_BYTES: usize = 60 << 10;
 /// The leader gets this much less time than the gateway, so its own
 /// deadline answer arrives before the gateway gives up.
 const LEADER_MARGIN: Duration = Duration::from_millis(100);
+// Leave time for another voter to answer within the gateway deadline, even
+// when TCP accepts frames but the peer never acknowledges or replies.
+const PEER_ATTEMPT: Duration = Duration::from_millis(1500);
 const FIRST_PAUSE: Duration = Duration::from_millis(10);
 const MAX_PAUSE: Duration = Duration::from_millis(200);
 
@@ -247,6 +251,11 @@ impl RangeRoute {
     pub(crate) fn leader_hint(&self) -> Option<u64> {
         Some(self.leader_hint.load(Ordering::Relaxed)).filter(|node| *node != 0)
     }
+    fn forget_leader(&self, node: u64) {
+        let _ = self
+            .leader_hint
+            .compare_exchange(node, 0, Ordering::Relaxed, Ordering::Relaxed);
+    }
     fn cached_voters(&self) -> Option<Arc<[Voter]>> {
         self.voters
             .lock()
@@ -265,6 +274,7 @@ pub(crate) struct TableRoute {
     // Keep key-column metadata on an unavailable range so retrying an
     // insert can look up its anchor without filling another range first.
     unavailable: AtomicBool,
+    refresh_before_settle: AtomicBool,
     _charge: ScratchLease,
 }
 impl TableRoute {
@@ -441,6 +451,7 @@ pub(crate) struct GatewayStats {
     pub stale_routes: AtomicU64,
     pub not_leader: AtomicU64,
     pub resends: AtomicU64,
+    pub peer_timeouts: AtomicU64,
     pub unknown: AtomicU64,
     pub overloaded: AtomicU64,
 }
@@ -457,6 +468,7 @@ pub(crate) struct GatewayStatsSnapshot {
     pub stale_routes: u64,
     pub not_leader: u64,
     pub resends: u64,
+    pub peer_timeouts: u64,
     pub unknown: u64,
     pub overloaded: u64,
     pub cached_ranges: usize,
@@ -483,6 +495,7 @@ impl GatewayStats {
             stale_routes: get(&self.stale_routes),
             not_leader: get(&self.not_leader),
             resends: get(&self.resends),
+            peer_timeouts: get(&self.peer_timeouts),
             unknown: get(&self.unknown),
             overloaded: get(&self.overloaded),
             cached_ranges,
@@ -777,10 +790,15 @@ impl DirectGateway {
         GatewayStats::bump(&self.stats.forwards);
         let mut delay = Duration::ZERO;
         loop {
-            let current = self
+            let mut current = self
                 .cache
                 .get(route.table_id, Some(anchor))
                 .unwrap_or_else(|| route.clone());
+            if current.refresh_before_settle.swap(false, Ordering::Relaxed)
+                && let Ok(Some(fresh)) = self.refresh(&current, anchor, deadline).await
+            {
+                current = fresh;
+            }
             match self
                 .call(
                     anchor,
@@ -834,9 +852,10 @@ impl DirectGateway {
                 // The anchor cannot be reached: the request may have run
                 // directly before, so it must not go queued.
                 Err(_) => {
-                    // A retired parent cannot answer StaleRoute. Disable only
-                    // this attempt's range so an exact retry can read Catalog.
-                    current.unavailable.store(true, Ordering::Relaxed);
+                    // A retired parent cannot answer StaleRoute. Refresh
+                    // for the next settlement while keeping warm routes
+                    // usable by direct requests during a queue outage.
+                    current.refresh_before_settle.store(true, Ordering::Relaxed);
                     return Err(self.final_error(unknown()));
                 }
             }
@@ -863,46 +882,132 @@ impl DirectGateway {
         } = attempt;
         let mut delay = Duration::ZERO;
         let mut rotation = 0usize;
+        let mut attempts = FuturesUnordered::new();
+        let mut pending = [None; 7];
+        let mut attempted_route: Option<(_, Arc<[Voter]>)> = None;
+        let mut next_probe = Instant::now();
         let mut refreshed_unknown_table = false;
         loop {
             if Instant::now() >= deadline {
-                return Err(deadline_error(&table, *uncertain));
+                return Err(deadline_error(&table, forward, *uncertain));
             }
             if last.is_some_and(|last| !table.range.shard.contains_key(last)) {
                 return Ok(Terminal::Fallback(FallbackReason::Ineligible));
             }
             let range = &table.range;
-            let voters = match self.voters(range, false).await {
+            let voters = match self.voters(range, false, deadline).await {
                 Ok(voters) if !voters.is_empty() => voters,
                 _ => {
                     if !pause(deadline, &mut delay).await {
-                        return Err(deadline_error(&table, *uncertain));
+                        return Err(deadline_error(&table, forward, *uncertain));
                     }
                     continue;
                 }
             };
-            let voter = range
-                .leader_hint()
-                .and_then(|node| voters.iter().find(|voter| voter.node_id == node))
-                .copied()
-                .unwrap_or_else(|| voters[rotation % voters.len()]);
+            let route = (
+                range.group().group_id,
+                range.shard.routing_epoch,
+                table.schema_epoch,
+            );
+            if attempted_route
+                .as_ref()
+                .is_none_or(|(prior, prior_voters)| {
+                    *prior != route || !Arc::ptr_eq(prior_voters, &voters)
+                })
+            {
+                attempts.clear();
+                pending.fill(None);
+                attempted_route = Some((route, voters.clone()));
+            }
+            let now = Instant::now();
+            let waiting_for_probe = now < next_probe && !attempts.is_empty();
+            let available = |voter: &Voter| !pending.contains(&Some(voter.node_id));
+            let next = if waiting_for_probe {
+                None
+            } else {
+                range
+                    .leader_hint()
+                    .and_then(|node| {
+                        voters
+                            .iter()
+                            .enumerate()
+                            .find(|(_, voter)| voter.node_id == node && available(voter))
+                    })
+                    .or_else(|| {
+                        let first = rotation % voters.len();
+                        voters
+                            .iter()
+                            .enumerate()
+                            .cycle()
+                            .skip(first)
+                            .take(voters.len())
+                            .find(|(_, voter)| available(voter))
+                    })
+            };
             request.schema_epoch = table.schema_epoch;
             request.routing_epoch = range.shard.routing_epoch;
             request.group = range.group().group_id;
-            let left = deadline.saturating_duration_since(Instant::now());
-            request.deadline = left
-                .saturating_sub(LEADER_MARGIN)
-                .max(left / 2)
-                .max(Duration::from_millis(1));
-            let sent = tokio::time::timeout_at(
-                deadline,
-                self.transport.send(range.group(), voter, request, forward),
-            )
-            .await;
+            let attempt = if let Some((index, voter)) = next {
+                let voter = *voter;
+                rotation = index + 1;
+                // A connected leader may still be waiting for Timestamp or
+                // Raft. Keep its waiter while trying other voters, and allow
+                // only one in-flight execution per voter for this request.
+                let left = deadline.saturating_duration_since(now);
+                request.deadline = left
+                    .saturating_sub(LEADER_MARGIN)
+                    .max(left / 2)
+                    .max(Duration::from_millis(1));
+                let sent_request = request.clone();
+                let slot = pending
+                    .iter()
+                    .position(Option::is_none)
+                    .expect("bounded voters");
+                pending[slot] = Some(voter.node_id);
+                let group = range.clone();
+                attempts.push(async move {
+                    let reply = self
+                        .transport
+                        .send(group.group(), voter, &sent_request, forward)
+                        .await;
+                    (slot, voter, reply)
+                });
+                if voters
+                    .iter()
+                    .any(|voter| !pending.contains(&Some(voter.node_id)))
+                {
+                    deadline.min(now + PEER_ATTEMPT)
+                } else {
+                    deadline
+                }
+            } else if waiting_for_probe {
+                deadline.min(next_probe)
+            } else {
+                deadline
+            };
+            let (slot, voter, reply) = match tokio::time::timeout_at(attempt, attempts.next()).await
+            {
+                Ok(Some(settled)) => settled,
+                Ok(None) => return Err(deadline_error(&table, forward, *uncertain)),
+                Err(_) if waiting_for_probe && attempt < deadline => continue,
+                Err(_) => {
+                    *uncertain = true;
+                    GatewayStats::bump(&self.stats.peer_timeouts);
+                    if attempt == deadline {
+                        return Err(deadline_error(&table, forward, true));
+                    }
+                    GatewayStats::bump(&self.stats.resends);
+                    if let Some((_, voter)) = next {
+                        range.forget_leader(voter.node_id);
+                    }
+                    continue;
+                }
+            };
+            pending[slot] = None;
             #[cfg(test)]
             if std::env::var_os("T6_TRACE").is_some() {
                 eprintln!(
-                    "t6 {} forward={forward} node={} group={} epochs={}/{}: {sent:?}",
+                    "t6 {} forward={forward} node={} group={} epochs={}/{}: {reply:?}",
                     request.request_id,
                     voter.node_id,
                     range.group().group_id,
@@ -910,14 +1015,6 @@ impl DirectGateway {
                     request.routing_epoch
                 );
             }
-            let reply = match sent {
-                // The gateway's deadline cut the call: it may have executed.
-                Err(_) => {
-                    *uncertain = true;
-                    return Err(deadline_error(&table, true));
-                }
-                Ok(reply) => reply,
-            };
             match reply {
                 Ok(DirectResponse::Done(data)) => {
                     range.leader_hint.store(voter.node_id, Ordering::Relaxed);
@@ -937,23 +1034,19 @@ impl DirectGateway {
                     return Ok(Terminal::Fallback(reason));
                 }
                 Ok(DirectResponse::Failed(error)) => {
-                    if error.code == ErrorCode::OutcomeUnknown {
-                        // The leader could not settle an attempt within the
-                        // deadline: pass it through as unknown.
-                        *uncertain = true;
-                        table.unavailable.store(true, Ordering::Relaxed);
-                        return Err(error);
-                    }
                     if error.outcome == Outcome::Unknown {
                         // Not settled yet (a proposal failed in an election):
                         // resend the same id and body; the dedup record
                         // decides.
                         *uncertain = true;
                         GatewayStats::bump(&self.stats.resends);
-                        range.leader_hint.store(0, Ordering::Relaxed);
-                        rotation += 1;
-                        if !pause(deadline, &mut delay).await {
-                            return Err(deadline_error(&table, true));
+                        range.forget_leader(voter.node_id);
+                        if error.code == ErrorCode::OutcomeUnknown {
+                            // The old leader spent its execution budget.
+                            // Check the dedup result while time remains.
+                            delay = Duration::ZERO;
+                        } else if !pause(deadline, &mut delay).await {
+                            return Err(deadline_error(&table, forward, true));
                         }
                         continue;
                     }
@@ -981,7 +1074,7 @@ impl DirectGateway {
                     }
                     // Not applied and transient: retry within the deadline.
                     if !pause(deadline, &mut delay).await {
-                        return Err(deadline_error(&table, *uncertain));
+                        return Err(deadline_error(&table, forward, *uncertain));
                     }
                 }
                 Ok(DirectResponse::StaleRoute { .. }) => {
@@ -1002,12 +1095,14 @@ impl DirectGateway {
                         Err(_) => false,
                     };
                     if !changed && !pause(deadline, &mut delay).await {
-                        return Err(deadline_error(&table, *uncertain));
+                        return Err(deadline_error(&table, forward, *uncertain));
                     }
                 }
                 Ok(DirectResponse::NotLeader { hint }) => {
                     GatewayStats::bump(&self.stats.not_leader);
-                    match hint.filter(|node| *node != voter.node_id) {
+                    match hint
+                        .filter(|node| *node != voter.node_id && !pending.contains(&Some(*node)))
+                    {
                         Some(node) if voters.iter().any(|voter| voter.node_id == node) => {
                             range.leader_hint.store(node, Ordering::Relaxed);
                         }
@@ -1015,14 +1110,17 @@ impl DirectGateway {
                             // A leader outside the cached placement: the
                             // replicas moved.
                             range.leader_hint.store(0, Ordering::Relaxed);
-                            let _ = self.voters(range, true).await;
+                            let _ = self.voters(range, true, deadline).await;
                         }
                         None => {
-                            range.leader_hint.store(0, Ordering::Relaxed);
-                            rotation += 1;
-                            // No leader known (an election): back off.
-                            if !pause(deadline, &mut delay).await {
-                                return Err(deadline_error(&table, *uncertain));
+                            range.forget_leader(voter.node_id);
+                            // Back off the next probe, while still polling a
+                            // leader that may be finishing the request.
+                            if !attempts.is_empty() {
+                                delay = (delay * 2).clamp(FIRST_PAUSE, MAX_PAUSE);
+                                next_probe = Instant::now() + delay;
+                            } else if !pause(deadline, &mut delay).await {
+                                return Err(deadline_error(&table, forward, *uncertain));
                             }
                         }
                     }
@@ -1034,15 +1132,14 @@ impl DirectGateway {
                     if error.code == ErrorCode::Overloaded && !*uncertain {
                         return Err(error);
                     }
-                    range.leader_hint.store(0, Ordering::Relaxed);
-                    rotation += 1;
+                    range.forget_leader(voter.node_id);
                     if error.code == ErrorCode::ValidationError {
                         // The receiver refused this replica identity: read
                         // the placement again.
-                        let _ = self.voters(range, true).await;
+                        let _ = self.voters(range, true, deadline).await;
                     }
                     if !pause(deadline, &mut delay).await {
-                        return Err(deadline_error(&table, *uncertain));
+                        return Err(deadline_error(&table, forward, *uncertain));
                     }
                 }
                 Err(DirectSendError::Uncertain(_)) => {
@@ -1050,10 +1147,9 @@ impl DirectGateway {
                     // record decides whether the first attempt committed.
                     *uncertain = true;
                     GatewayStats::bump(&self.stats.resends);
-                    range.leader_hint.store(0, Ordering::Relaxed);
-                    rotation += 1;
+                    range.forget_leader(voter.node_id);
                     if !pause(deadline, &mut delay).await {
-                        return Err(deadline_error(&table, true));
+                        return Err(deadline_error(&table, forward, true));
                     }
                 }
             }
@@ -1153,6 +1249,7 @@ impl DirectGateway {
             schema_epoch: fill.schema_epoch,
             range,
             unavailable: AtomicBool::new(false),
+            refresh_before_settle: AtomicBool::new(false),
             _charge: charge,
         })
     }
@@ -1161,12 +1258,16 @@ impl DirectGateway {
         &self,
         range: &RangeRoute,
         refresh: bool,
+        deadline: Instant,
     ) -> Result<Arc<[Voter]>, ProtocolError> {
         if !refresh && let Some(voters) = range.cached_voters() {
             return Ok(voters);
         }
         GatewayStats::bump(&self.stats.placement_reads);
-        let mut voters = self.source.placement(range.group(), refresh).await?;
+        let mut voters =
+            tokio::time::timeout_at(deadline, self.source.placement(range.group(), refresh))
+                .await
+                .map_err(|_| route_unavailable())??;
         voters.sort_unstable_by_key(|voter| voter.node_id);
         voters.dedup_by_key(|voter| voter.node_id);
         if voters.is_empty() || voters.len() > 7 {
@@ -1441,10 +1542,14 @@ fn digest(body: &[u8]) -> Digest {
     Digest::from_bytes(Sha256::digest(body).into())
 }
 
-fn deadline_error(route: &TableRoute, uncertain: bool) -> ProtocolError {
+fn deadline_error(route: &TableRoute, forward: bool, uncertain: bool) -> ProtocolError {
     // A retired range may never answer StaleRoute. Let an exact retry
     // refill the range without discarding its primary key descriptor.
-    route.unavailable.store(true, Ordering::Relaxed);
+    if forward {
+        route.refresh_before_settle.store(true, Ordering::Relaxed);
+    } else {
+        route.unavailable.store(true, Ordering::Relaxed);
+    }
     if uncertain {
         unknown()
     } else {
