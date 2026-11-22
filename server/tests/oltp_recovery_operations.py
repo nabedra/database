@@ -265,7 +265,9 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
             # A separate process with a Data-only directory uses a survivor's
             # enrolled identity for Control reads. Give the listener its own
             # endpoint and reuse the survivor's TLS name.
-            identity = dict(targets[0], worker_id=uid(), incarnation=uid(), endpoint=f'127.0.0.1:{free_port()}')
+            identity = dict(targets[0], endpoint=f'127.0.0.1:{free_port()}')
+            if variant == 'data-trust':
+                identity.update(worker_id=uid(), incarnation=uid())
             pin_node = cluster.config[survivors[0]]['node']
             data_peer_dir = root / 'data-trust'
             data_peer_dir.mkdir()
@@ -278,6 +280,7 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
                 'control_actor': targets[0], 'revoked_bootstrap_peer': previous['worker_id'],
                 'track_control_voters': variant == 'voter-refresh',
             })
+            targets = [peer for peer in targets if peer['worker_id'] != identity['worker_id']]
             targets.append(identity)
         write_json(probe_input, {
             'group': control_group,
@@ -869,7 +872,11 @@ def o17_check_second_control_replacement(
                                     dict(run_id=cluster.run_id, previous=previous))
             status = send(cluster.urls[actor], cluster.auth['admin_token'], status_body,
                           path='/v1/cluster/operations', timeout=5)
-            raise AssertionError(f'{error}\nSecond replacement status {status}\n{tails}') from error
+            view = {path.name: path.read_text() for path in [
+                data_peer_dir / 'control-voters.json', revoked_file, data_peer_dir / 'stats.json',
+            ] if path.is_file()}
+            raise AssertionError(f'{error}\nSecond replacement status {status}\n'
+                                 f'Data-only view {view}\n{tails}') from error
         report('O17 Data-only revocation after two Control voter replacements',
                revoked_workers=[first_revoked, previous['worker_id']], refused_second_revoked_session=True)
     finally:

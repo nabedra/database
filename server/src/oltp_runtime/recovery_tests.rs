@@ -835,22 +835,34 @@ async fn replacement_peer_probe(config: PathBuf) {
             Some(published) => published.clone(),
             None => Arc::new(Routes(voters)),
         };
-        let authority_resources = WorkerSharedResources::new(
-            2,
-            WorkerResources::default(),
-            SharedResourceConfig::default(),
-        )
-        .unwrap();
-        let authority = WorkerTransport::new(
-            &actor,
-            &tls,
-            authority_resources.clone(),
-            directory.clone(),
-            Arc::new(EndpointRegistry::new(authority_resources.clone())),
-            TransportConfig::default(),
-        )
-        .unwrap()
-        .client();
+        let (authority_resources, authority) = if published.is_some() {
+            // The inventory decoder must use the same resource owner as its
+            // Control replies. This listener shares the enrolled actor's
+            // identity and has its own listening address.
+            assert_eq!(
+                WorkerIdentity::from(&actor),
+                WorkerIdentity::from(&config.from)
+            );
+            (shared.clone(), client.clone())
+        } else {
+            let authority_resources = WorkerSharedResources::new(
+                2,
+                WorkerResources::default(),
+                SharedResourceConfig::default(),
+            )
+            .unwrap();
+            let authority = WorkerTransport::new(
+                &actor,
+                &tls,
+                authority_resources.clone(),
+                directory.clone(),
+                Arc::new(EndpointRegistry::new(authority_resources.clone())),
+                TransportConfig::default(),
+            )
+            .unwrap()
+            .client();
+            (authority_resources, authority)
+        };
         let control =
             ControlClient::new(authority, authority_resources, config.group.clone(), routes)
                 .unwrap();

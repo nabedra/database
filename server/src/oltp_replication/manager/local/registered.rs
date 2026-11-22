@@ -305,9 +305,7 @@ impl RegisteredWorker {
             let running = self
                 .manager
                 .start(
-                    TimestampMachine::new(
-                        self.open_system_store(group.identity.clone()).await?,
-                    )?,
+                    TimestampMachine::new(self.open_system_store(group.identity.clone()).await?)?,
                     local.clone(),
                     group.members(),
                     self.replacement_catch_up_before(&group.identity),
@@ -325,9 +323,7 @@ impl RegisteredWorker {
                 let running = self
                     .manager
                     .start(
-                        StatusMachine::new(
-                            self.open_system_store(group.identity.clone()).await?,
-                        )?,
+                        StatusMachine::new(self.open_system_store(group.identity.clone()).await?)?,
                         local.clone(),
                         group.members(),
                         self.replacement_catch_up_before(&group.identity),
@@ -343,9 +339,7 @@ impl RegisteredWorker {
             let running = self
                 .manager
                 .start(
-                    ParticipantMachine::new(
-                        self.open_system_store(group.identity.clone()).await?,
-                    )?,
+                    ParticipantMachine::new(self.open_system_store(group.identity.clone()).await?)?,
                     local.clone(),
                     group.members(),
                     self.replacement_catch_up_before(&group.identity),
