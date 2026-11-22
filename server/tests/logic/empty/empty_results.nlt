@@ -31,6 +31,7 @@ query nosort
 ----
 false
 
+skipif standalone and fixed-cluster OLAP explain disagree on the partition footer
 explain
 {"op":"query.explain","table":"t"}
 ----

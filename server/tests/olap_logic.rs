@@ -875,6 +875,20 @@ async fn sensitivity_correct_answers_pass() {
     )
     .await;
     assert!(ok.is_empty(), "{ok:?}");
+    let explain = failures_of(
+        r#"explain
+{"op":"query.explain","table":"t"}
+----
+scan t (<uuid>)
+filter none
+sort id ASC (primary key)
+limit none
+projection all
+partitions 1; worker execution
+"#,
+    )
+    .await;
+    assert!(explain.is_empty(), "{explain:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
