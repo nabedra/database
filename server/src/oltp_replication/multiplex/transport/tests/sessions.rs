@@ -216,8 +216,8 @@ struct Fixture {
 enum Release {
     Current,
     SessionV2,
-    /// The build before RD3: sessions with index reclamation, no direct
-    /// admission.
+    /// The builds from IDXGC1 to before RD3: they also offer the retired
+    /// `nabedra-otp/3` (index reclamation frames), no direct admission.
     SessionV3,
     OneShotOnly,
 }
@@ -278,7 +278,7 @@ impl Fixture {
             if release == Release::SessionV3 {
                 let common = Arc::get_mut(&mut transport.common).unwrap();
                 (common.connector, common.acceptor) =
-                    tls[index].transports(&[INDEX_RECLAIM_ALPN, SESSION_ALPN, ALPN]);
+                    tls[index].transports(&[LEGACY_INDEX_RECLAIM_ALPN, SESSION_ALPN, ALPN]);
             }
             transport
         };
@@ -620,45 +620,57 @@ async fn d10_old_one_shot_peer_interoperates_in_both_directions() {
     }
 }
 
+/// The ALPN that IDXGC1 builds offered for index reclamation frames. CAP1
+/// retired it: Control's `data.index.reclaim` cluster feature gates them.
+const LEGACY_INDEX_RECLAIM_ALPN: &[u8] = b"nabedra-otp/3";
+
+/// CAP1/D10/O02: with `nabedra-otp/3` retired, this build still forms one
+/// session per lane with every older session build, in both directions:
+/// otp/2 with a pre-IDXGC1 build and with an IDXGC1 build (which also offers
+/// otp/3), and otp/4 with an RD3 build. Raft frames, a reclamation-shaped
+/// frame included, travel on the negotiated session; nothing requires a
+/// per-connection capability any more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn d10_index_reclamation_frames_require_the_negotiated_capability() {
-    for release in [Release::SessionV2, Release::Current] {
+async fn cap1_d10_o02_sessions_form_with_older_builds_after_otp3_is_retired() {
+    for (caller, receiver) in [
+        (Release::Current, Release::SessionV2),
+        (Release::SessionV2, Release::Current),
+        (Release::Current, Release::SessionV3),
+        (Release::SessionV3, Release::Current),
+        (Release::Current, Release::Current),
+    ] {
         let (f, _) = Fixture::start(
-            Release::Current,
-            release,
+            caller,
+            receiver,
             TransportConfig::default(),
             TransportConfig::default(),
             false,
         )
         .await;
-        echoed(
-            f.call(&f.data_group, Purpose::Raft, "old append").await,
-            "old append",
-        );
-        let header = f
-            .client
-            .common
-            .shared
-            .encode_in(ByteClass::Data, &"reclaim", 128)
-            .unwrap();
-        let response = f
-            .client
-            .request_classified(
-                &f.data_group,
-                RequestTarget::Feature(f.target.worker_id, PeerFeature::IndexReclamation),
-                Purpose::Raft,
-                header,
-                [None, None, None],
-                0,
-            )
-            .await;
-        if release == Release::SessionV2 {
-            assert!(matches!(response, Err(RequestError::Unreachable)));
-            assert_eq!(f.endpoint.handled.load(Ordering::Acquire), 1);
-        } else {
-            echoed(response, "reclaim");
-            assert_eq!(f.endpoint.handled.load(Ordering::Acquire), 2);
-        }
+        timeout(WAIT, async {
+            for text in ["append", "reclaim", "append again"] {
+                echoed(f.call(&f.data_group, Purpose::Raft, text).await, text);
+            }
+            assert_eq!(f.endpoint.handled.load(Ordering::Acquire), 3);
+            assert_eq!(f.client.connections_for_test(), 1, "one session");
+            assert_eq!(f.client.live_sessions_for_test(), 1);
+            let session = |feature| {
+                f.client
+                    .peer_supports(f.target.worker_id, TrafficClass::DataConsensus, feature)
+                    .is_some()
+            };
+            assert!(
+                session(PeerFeature::MultiEntryAppend),
+                "a session, not one-shot"
+            );
+            // otp/4 only between two builds that offer it.
+            assert_eq!(
+                session(PeerFeature::DirectAdmission),
+                caller == Release::Current && receiver == Release::Current
+            );
+        })
+        .await
+        .unwrap();
         f.stop().await;
     }
 }

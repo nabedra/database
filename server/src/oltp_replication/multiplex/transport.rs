@@ -29,9 +29,7 @@ mod resolve;
 mod session;
 use resolve::{PeerResolver, ResolveError};
 pub(crate) use session::PeerFeature;
-use session::{
-    DIRECT_ADMISSION_ALPN, INDEX_RECLAIM_ALPN, PeerSessions, RawReply, SESSION_ALPN, session_alpn,
-};
+use session::{DIRECT_ADMISSION_ALPN, PeerSessions, RawReply, SESSION_ALPN, session_alpn};
 #[cfg(test)]
 mod tests;
 
@@ -792,12 +790,11 @@ impl Drop for RaftTransportTrace {
 pub(crate) enum RequestTarget {
     WorkerId(Uuid),
     Exact(WorkerIdentity),
-    Feature(Uuid, PeerFeature),
 }
 impl RequestTarget {
     pub(crate) fn worker_id(self) -> Uuid {
         match self {
-            Self::WorkerId(id) | Self::Feature(id, _) => id,
+            Self::WorkerId(id) => id,
             Self::Exact(worker) => worker.worker_id,
         }
     }
@@ -885,14 +882,9 @@ impl WorkerTransport {
         }
         let direct_admission = !direct_admission_disabled();
         let (connector, acceptor) = if sessions_enabled && !direct_admission {
-            tls.transports(&[INDEX_RECLAIM_ALPN, SESSION_ALPN, ALPN])
+            tls.transports(&[SESSION_ALPN, ALPN])
         } else if sessions_enabled {
-            tls.transports(&[
-                DIRECT_ADMISSION_ALPN,
-                INDEX_RECLAIM_ALPN,
-                SESSION_ALPN,
-                ALPN,
-            ])
+            tls.transports(&[DIRECT_ADMISSION_ALPN, SESSION_ALPN, ALPN])
         } else {
             tls.transports(&[ALPN])
         };
@@ -1530,10 +1522,9 @@ impl WorkerClient {
             purpose,
             phase: RaftTransportPhase::ResolvePeer,
         };
-        let (worker, expected, required) = match target {
-            RequestTarget::WorkerId(worker) => (worker, None, None),
-            RequestTarget::Exact(identity) => (identity.worker_id, Some(identity), None),
-            RequestTarget::Feature(worker, feature) => (worker, None, Some(feature)),
+        let (worker, expected) = match target {
+            RequestTarget::WorkerId(worker) => (worker, None),
+            RequestTarget::Exact(identity) => (identity.worker_id, Some(identity)),
         };
         let peer = self.common.directory.resolve(worker)?;
         peer.validate()
@@ -1575,7 +1566,6 @@ impl WorkerClient {
                 header,
                 sections,
                 deadline,
-                required,
                 probe_resolving.take(),
                 &mut trace.phase,
             )
