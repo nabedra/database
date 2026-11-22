@@ -3,30 +3,25 @@
   "assertions": {
     "executed": 0,
     "failed": 0,
-    "not_run": [
-      {
-        "id": "need:s3",
-        "reason": "s3-unconfigured: NABEDRA_TEST_S3_BUCKET is unset"
-      }
-    ]
+    "not_run": []
   },
   "build": {
     "binary_sha256": null,
     "features": [],
     "profile": null
   },
-  "check": "kv-valkey-diff",
+  "check": "cache-empty",
   "duration_s": 1.5,
   "guarantees": [
-    "KV-G02"
+    "CACHE-G03"
   ],
-  "kind": "D",
+  "kind": "U",
   "mode": null,
-  "result": "not-run",
+  "result": "pass",
   "run": {
     "date": "2026-11-22T12:00:00+00:00",
     "attempt": null,
-    "request_id": "fx-4",
+    "request_id": "fx-7",
     "runner": "fixture",
     "url": null
   },

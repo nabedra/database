@@ -103,7 +103,7 @@ class PairedBenchmarkTests(unittest.TestCase):
         self.assertGreater(ab.measure(spec, None, sleeper(.020), "base"), .020)
 
     def test_metric_file_and_existing_specs(self):
-        for module in ("kv", "events", "olap", "oltp"):
+        for module in ("cache", "events", "olap", "oltp"):
             with self.subTest(module=module):
                 paths = list((ab.ROOT / "docs/testing/perf" / module).glob("*.toml"))
                 self.assertTrue(paths)

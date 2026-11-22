@@ -1,7 +1,7 @@
-id = "kv-test-hooks"
-module = "kv"
+id = "cache-test-hooks"
+module = "cache"
 kinds = ["U"]
-guarantees = ["KV-G02"]
+guarantees = ["CACHE-G02"]
 scenarios = ["K01"]
 tiers = ["T1"]
 command = ["cargo", "test", "--no-default-features", "--features", "cache,test-hooks", "--lib", "test_hooks"]

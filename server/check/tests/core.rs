@@ -245,11 +245,11 @@ fn config_rejects_duplicate_knobs() {
 
 #[test]
 fn evidence_record_round_trips_and_writes_its_file() {
-    let mut r = Record::new("kv-store-model", "U S");
+    let mut r = Record::new("cache-store-model", "U S");
     assert_eq!(r.result, Outcome::Error);
     assert_eq!(r.run.request_id, "local");
     assert!(r.validate().unwrap_err().contains("sha"), "a record without a SHA is invalid");
-    r.guarantees = vec!["KV-G02".into(), "OLAP-STR-G01".into()];
+    r.guarantees = vec!["CACHE-G02".into(), "OLAP-STR-G01".into()];
     r.scenarios = vec!["K01".into()];
     r.sha = "a".repeat(40);
     r.tree_clean = true;
@@ -302,7 +302,7 @@ fn evidence_record_round_trips_and_writes_its_file() {
 
     let dir = std::env::temp_dir().join(format!("nabedra-check-evidence-{}", std::process::id()));
     let path = r.write_to(&dir).unwrap();
-    assert_eq!(path, dir.join("2026/11/th-check-core-abc1234-170500--kv-store-model.json"));
+    assert_eq!(path, dir.join("2026/11/th-check-core-abc1234-170500--cache-store-model.json"));
     assert_eq!(Record::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap(), r);
     for i in 0..100 {
         r.not_run(&format!("assertion-{i}"), &"r".repeat(250));
@@ -323,7 +323,7 @@ fn evidence_validate_rejects_schema_violations() {
         ("check", Box::new(|r| r.check = "Check_Core".into())),
         ("kind", Box::new(|r| r.kind = "U,S".into())),
         ("kind", Box::new(|r| r.kind = "X".into())),
-        ("guarantee", Box::new(|r| r.guarantees = vec!["KV-G2".into()])),
+        ("guarantee", Box::new(|r| r.guarantees = vec!["CACHE-G2".into()])),
         ("sha", Box::new(|r| r.sha = "A".repeat(40))),
         ("binary_sha256", Box::new(|r| r.build.binary_sha256 = Some("z".repeat(64)))),
         ("mode", Box::new(|r| r.mode = Some([("k".to_string(), serde_json::json!([1]))].into()))),

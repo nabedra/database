@@ -1,7 +1,7 @@
 id = "fuzz-nightly"
 module = "fuzz"
 kinds = ["F"]
-guarantees = ["KV-G01", "EVT-G07", "OLAP-G08"]
+guarantees = ["CACHE-G01", "EVT-G07", "OLAP-G08"]
 scenarios = []
 tiers = ["T2"]
 command = ["sh", "nightly.sh"]

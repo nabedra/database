@@ -16,8 +16,8 @@ SHA = "a" * 40
 
 def good(**over):
     rec = evidence.new_record(
-        "kv-store-model", ["U", "S"], result="pass", executed=12, failed=0,
-        guarantees=["KV-G02"], scenarios=["K01"], sha=SHA, tree_clean=True,
+        "cache-store-model", ["U", "S"], result="pass", executed=12, failed=0,
+        guarantees=["CACHE-G02"], scenarios=["K01"], sha=SHA, tree_clean=True,
         run={"url": None, "attempt": None, "request_id": "req-1", "runner": None,
              "date": "2026-11-22T12:00:00+00:00"},
     )
@@ -36,7 +36,7 @@ class ValidatorTests(unittest.TestCase):
             "short sha": lambda r: r.update(sha="abc"),
             "bad kind": lambda r: r.update(kind="X"),
             "bad result": lambda r: r.update(result="green"),
-            "bad guarantee": lambda r: r.update(guarantees=["kv-1"]),
+            "bad guarantee": lambda r: r.update(guarantees=["cache-1"]),
             "negative duration": lambda r: r.update(duration_s=-1),
             "nonfinite duration": lambda r: r.update(duration_s=float("nan")),
             "bool as integer": lambda r: r["assertions"].update(executed=True),
@@ -122,7 +122,7 @@ class WriteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             now = dt.datetime(2026, 3, 9, tzinfo=dt.timezone.utc)
             path = evidence.write(good(), Path(tmp), now)
-            self.assertEqual(path, Path(tmp) / "2026" / "03" / "req-1--kv-store-model.json")
+            self.assertEqual(path, Path(tmp) / "2026" / "03" / "req-1--cache-store-model.json")
             self.assertEqual(json.loads(path.read_text())["result"], "pass")
             with self.assertRaises(FileExistsError):
                 evidence.write(good(), Path(tmp), now)

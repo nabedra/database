@@ -1,7 +1,7 @@
-id = "kv-unit"
-module = "kv"
+id = "cache-unit"
+module = "cache"
 kinds = ["U"]
-guarantees = ["KV-G01", "KV-G02", "KV-G03"]
+guarantees = ["CACHE-G01", "CACHE-G02", "CACHE-G03"]
 scenarios = ["K01"]
 tiers = ["T0", "T1"]
 command = ["cargo", "test", "--lib", "cache::"]

@@ -32,9 +32,9 @@ share = 15
 modules = ["events"]
 
 [[nightly.pool]]
-name = "kv"
+name = "cache"
 share = 15
-modules = ["kv"]
+modules = ["cache"]
 
 [[nightly.pool]]
 name = "olap"
@@ -267,9 +267,9 @@ hot_paths = [
 ]
 
 [[module]]
-name = "kv"
+name = "cache"
 level = "L2"
-register = "docs/testing/guarantees/kv.md"
+register = "docs/testing/guarantees/cache.md"
 paths = [
   "server/src/cache.rs",
   "server/src/cache/**",

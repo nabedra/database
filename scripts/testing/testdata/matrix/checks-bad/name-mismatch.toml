@@ -1,7 +1,7 @@
 id = "some-other-name"
-module = "kv"
+module = "cache"
 kinds = ["U"]
-guarantees = ["KV-G01"]
+guarantees = ["CACHE-G01"]
 scenarios = []
 tiers = ["T1"]
 command = ["true"]

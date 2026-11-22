@@ -1,8 +1,8 @@
-id = "kv-differential-unit"
-module = "kv"
+id = "cache-differential-unit"
+module = "cache"
 kinds = ["U"]
 # These tests run the comparator against in-process fakes, not Nabedra, so
-# they show the harness is sensitive and qualify no KV guarantee.
+# they show the harness is sensitive and qualify no Cache guarantee.
 guarantees = []
 scenarios = ["K01"]
 tiers = ["T0", "T1"]

@@ -1,4 +1,4 @@
-//! A relaxed checker for KV keys served by an asynchronous replica (KV-G05). It checks only
+//! A relaxed checker for Cache keys served by an asynchronous replica (CACHE-G05). It checks only
 //! what the replica promises, not linearizability.
 //!
 //! | f | invoke value | ok completion value |

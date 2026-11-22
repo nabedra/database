@@ -637,6 +637,10 @@ def lint(paths: Paths, files: list[str] | None = None) -> tuple[list[str], list[
             registers.append(parse_register(p.read_text(encoding="utf-8"), p))
         except MatrixError as exc:
             errors.append(str(exc))
+    for m in modules.modules:
+        if m.register and not any(r.path.as_posix().endswith(m.register) for r in registers):
+            errors.append(f"modules.toml: module {m.name} names register {m.register}, "
+                          "which matches no register file")
     known: dict[str, Guarantee] = {}
     for reg in registers:
         for g in reg.guarantees:

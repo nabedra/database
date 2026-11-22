@@ -1,7 +1,7 @@
-id = "kv-store-model"
-module = "kv"
+id = "cache-store-model"
+module = "cache"
 kinds = ["U"]
-guarantees = ["KV-G02", "KV-G03"]
+guarantees = ["CACHE-G02", "CACHE-G03"]
 scenarios = ["K01", "K02"]
 tiers = ["T0", "T1"]
 command = ["cargo", "test", "--no-default-features", "--features", "cache", "--lib", "cache::store::model_tests"]

@@ -8,10 +8,10 @@ Each runnable check is one file, `docs/testing/checks/<id>.toml`. The `id`
 equals the filename stem.
 
 ```toml
-id = "kv-store-model"
-module = "kv"
+id = "cache-store-model"
+module = "cache"
 kinds = ["U"]                    # M U S H F D R P K
-guarantees = ["KV-G02", "KV-G03"]
+guarantees = ["CACHE-G02", "CACHE-G03"]
 scenarios = ["K01", "K02"]
 tiers = ["T0", "T1"]             # T0 T1 T2 T3 weekly
 command = ["cargo", "test", "--no-default-features", "--features", "cache", "--lib", "cache::store::model_tests"]

@@ -1,0 +1,15 @@
+id = "cache-valkey-tcl"
+module = "cache"
+kinds = ["R"]
+# An informational exit code does not qualify any guarantee.
+guarantees = []
+scenarios = ["K01"]
+tiers = ["T2"]
+command = [
+    "sh", "-ec",
+    'cargo build --no-default-features --features cache && exec python3 ../scripts/cache-acceptance/valkey_tcl.py --nabedra-bin "${CARGO_TARGET_DIR:-target}/debug/nabedra-db" --log ../target/testing-logs/cache-valkey-tcl.log',
+]
+cwd = "server"
+timeout_s = 2400
+needs = ["docker"]
+result_parser = "exit-code"

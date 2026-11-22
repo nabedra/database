@@ -1,7 +1,7 @@
-id = "kv-sim"
-module = "kv"
+id = "cache-sim"
+module = "cache"
 kinds = ["S", "H"]
-guarantees = ["KV-G01", "KV-G03"]
+guarantees = ["CACHE-G01", "CACHE-G03"]
 scenarios = []
 tiers = ["T2"]
 command = ["cargo", "test", "--test", "kv_sim"]

@@ -6,7 +6,7 @@
 //! | [`txn::check`] | transactions are (strictly) serializable | `G0` `G1a` `G1b` `G1c` `G-single` `G2`, the `-realtime` variants, `incompatible-order`, `garbage-read`, `duplicate-elements` |
 //! | [`outcome::check`] | a failed or `not_applied` write never takes effect | `failed-write-observed` |
 //! | [`queue::check`] | log offsets, ordering, durability and redelivery | `duplicate-offset` `duplicate-event` `offset-gap` `out-of-order` `lost-publish` `redelivery-missing` |
-//! | [`relaxed_kv::check`] | asynchronous-replica KV promise (KV-G05) | `invented-value` `resurrection` `stale-read` `lost-write` |
+//! | [`relaxed_kv::check`] | asynchronous Cache replica promise (CACHE-G05) | `invented-value` `resurrection` `stale-read` `lost-write` |
 //!
 //! A malformed history (for example a completion without an invoke) yields the kind
 //! `malformed-history`, so it can never pass silently.

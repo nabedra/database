@@ -1,4 +1,4 @@
-# KV conformance against Valkey
+# Cache conformance against Valkey
 
 K01 compares Nabedra's standalone cache replies with Valkey 8.1.11. The
 reference uses the official `valkey/valkey:8.1.11` image index digest
@@ -24,7 +24,7 @@ python3 scripts/cache-acceptance/differential.py \
 The same seed and program dimensions reproduce the logical command sequences.
 Each execution uses a fresh key prefix on both instances, including during
 shrinking. The servers retain the test keys until expiry, deletion or shutdown.
-The default JSONL log in `artifacts/kv-valkey-diff.jsonl` records invocations
+The default JSONL log in `artifacts/cache-valkey-diff.jsonl` records invocations
 and replies from both engines. The `value` field holds the exact hex-encoded
 RESP2 frame. The `attempt` field distinguishes the initial programs from
 shrink replays. The log retains the original TTL values.
@@ -35,7 +35,7 @@ duplicate keys, empty strings, and binary payloads. It exercises string values
 that `INCRBY` rejects as non-integers. Nabedra stores strings, so the data
 command set cannot create a list or another value that triggers `WRONGTYPE`.
 The direct RESP2 comparison sends raw frames and runs no client library, so it
-is not evidence for KV-G12. The existing K01 client checks exercise those
+is not evidence for CACHE-G12. The existing K01 client checks exercise those
 clients.
 
 The comparator accepts live PTTL values within 50 ms by default. TTL replies
@@ -68,7 +68,7 @@ External setup requires `FLUSHALL` and `FUNCTION FLUSH` even with
 Some test bodies also require `CONFIG`, `SELECT` or `FLUSHDB`. The canary
 reports failures in its log and declares itself non-authoritative below 100
 executed assertions. Tcl assertion failures are informational.
-The registered canary does not qualify a KV guarantee.
+The registered canary does not qualify a Cache guarantee.
 [Valkey external mode setup](https://github.com/valkey-io/valkey/blob/5fb5bc4b13b22084b54c7db2a88d14ce2f6fa867/tests/support/server.tcl#L373-L396)
 
 ## Benchmark fuzz capability

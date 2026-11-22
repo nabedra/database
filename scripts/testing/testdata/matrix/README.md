@@ -7,11 +7,11 @@ temporary git repository and substitute real shas before loading the records.
 | Cell | Expected state |
 | --- | --- |
 | EVT-G01 U | pass |
-| KV-G01 U | pass |
-| KV-G01 S | stale 2 (pass) |
-| KV-G01 R | n/a, cloud-deferred |
-| KV-G02 U | fail |
-| KV-G02 D | not-run: s3-unconfigured |
-| KV-G03 U | quarantined 3/5 |
-| KV-G03 H | missing (its only record is on a commit that is not an ancestor) |
-| KV-G03 M | n/a (not required) |
+| CACHE-G01 U | pass |
+| CACHE-G01 S | stale 2 (pass) |
+| CACHE-G01 R | n/a, cloud-deferred |
+| CACHE-G02 U | fail |
+| CACHE-G02 D | not-run: s3-unconfigured |
+| CACHE-G03 U | quarantined 3/5 |
+| CACHE-G03 H | missing (its only record is on a commit that is not an ancestor) |
+| CACHE-G03 M | n/a (not required) |

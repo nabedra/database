@@ -41,7 +41,7 @@ Each register has:
 
 In that table:
 
-- **ID** uses the module prefix and a number, such as `OLTP-G04` or `KV-G02`. IDs are never reused.
+- **ID** uses the module prefix and a number, such as `OLTP-G04` or `CACHE-G02`. IDs are never reused.
 - **Checks** is a space-separated list of the kind letters below, such as `M S H R`.
 - **n/a** holds `<kind>: <reason>` entries separated by `;`, or is empty.
 - For a check that needs cloud compute, put `R: cloud-deferred (<what>)` in

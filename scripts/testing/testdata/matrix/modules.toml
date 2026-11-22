@@ -5,9 +5,9 @@ fallback = "misc"
 core_hours = 10
 
 [[nightly.pool]]
-name = "kv"
+name = "cache"
 share = 60
-modules = ["kv"]
+modules = ["cache"]
 
 [[nightly.pool]]
 name = "events"
@@ -15,9 +15,9 @@ share = 40
 modules = ["events"]
 
 [[module]]
-name = "kv"
+name = "cache"
 level = "L2"
-register = "registers/kv.md"
+register = "registers/cache.md"
 paths = ["server/src/cache/**", "server/src/cache.rs"]
 hot_paths = ["server/src/cache/store/**"]
 

@@ -1,7 +1,7 @@
-id = "kv-cluster-real"
-module = "kv"
+id = "cache-cluster-real"
+module = "cache"
 kinds = ["R", "H"]
-guarantees = ["KV-G05", "KV-G06"]
+guarantees = ["CACHE-G05", "CACHE-G06"]
 scenarios = ["K03"]
 tiers = ["T2"]
 command = ["bash", "scripts/cache-acceptance/cluster.sh"]

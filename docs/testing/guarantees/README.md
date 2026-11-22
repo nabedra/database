@@ -27,12 +27,12 @@ a deferred portion. Record that portion as `R: cloud-deferred (<what>)` or
 
 | Level | Applies to | Required checks | T1 budget | Release budget |
 | --- | --- | --- | --- | --- |
-| L1 | KV standalone, OLAP query semantics, scheduler internals, ORM clients, and streaming outside recovery | Generated unit or property checks, differential checks against a reference, fuzzing on every decoder, golden logic tests, Docker smoke checks, and paired A/B performance checks | 1,000 generated cases per property | 100,000 cases per property |
-| L2 | KV cluster, Events, OLAP commit protocol, and OLAP streaming recovery | L1 plus a model of the core protocol, simulation with fault injection, history checking, Docker and kind fault checks, and an upgrade and downgrade matrix | 500 seeds per touched workload | 200,000 clean seeds on the release SHA |
+| L1 | Standalone Cache, OLAP query semantics, scheduler internals, ORM clients, and streaming outside recovery | Generated unit or property checks, differential checks against a reference, fuzzing on every decoder, golden logic tests, Docker smoke checks, and paired A/B performance checks | 1,000 generated cases per property | 100,000 cases per property |
+| L2 | Cache cluster, Events, OLAP commit protocol, and OLAP streaming recovery | L1 plus a model of the core protocol, simulation with fault injection, history checking, Docker and kind fault checks, and an upgrade and downgrade matrix | 500 seeds per touched workload | 200,000 clean seeds on the release SHA |
 | L3 | OLTP and its LSM storage engine | L2 plus strict-serializability checking, 80% coverage in the bug-replay corpus, and mutation runs on all touched code | 2,000 seeds | 1,000,000 seeds |
 
 The nightly budget is 160 core-hours. OLTP gets 60%, Events gets 15%,
-KV gets 15%, and OLAP and streaming share 10%. Release soaks pair 72 hours
+Cache gets 15%, and OLAP and streaming share 10%. Release soaks pair 72 hours
 of virtual time with parallel 5.5-hour real soaks on Actions runners.
 
 ## Check kinds

@@ -1,7 +1,7 @@
 id = "fuzz-replay"
 module = "fuzz"
 kinds = ["F"]
-guarantees = ["KV-G01", "EVT-G07", "OLAP-G08"]
+guarantees = ["CACHE-G01", "EVT-G07", "OLAP-G08"]
 scenarios = []
 tiers = ["T0", "T1"]
 command = ["sh", "-ec", "cargo test --locked -j 2 && cargo test --locked -j 2 --no-default-features --features cache"]

@@ -33,7 +33,7 @@ STRING_FIELDS = (
     "invariant_added",
 )
 LIST_FIELDS = ("guarantees", "scenarios", "fix_commits")
-GUARANTEE_ID = re.compile(r"(?:OLTP|OLAP|OLAP-STR|EVT|KV|LSM|ORM|SCHED)-G[0-9]{2}")
+GUARANTEE_ID = re.compile(r"(?:OLTP|OLAP|OLAP-STR|EVT|CACHE|LSM|ORM|SCHED)-G[0-9]{2}")
 REGISTER_ROW = re.compile(r"^\|\s*([A-Z][A-Z-]*-G[0-9]{2})\s*\|", re.MULTILINE)
 
 

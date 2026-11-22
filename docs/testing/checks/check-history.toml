@@ -1,7 +1,7 @@
 id = "check-history"
 module = "check"
 kinds = ["H"]
-guarantees = ["OLTP-G02", "OLTP-G04", "EVT-G01", "EVT-G02", "EVT-G03", "KV-G05"]
+guarantees = ["OLTP-G02", "OLTP-G04", "EVT-G01", "EVT-G02", "EVT-G03", "CACHE-G05"]
 scenarios = []
 tiers = ["T0", "T1"]
 command = ["cargo", "test", "--locked", "-j", "2", "-p", "nabedra-check", "--test", "history_corpus", "--test", "history_sim"]

@@ -1,4 +1,4 @@
-//! Model-based tests of the slot store (KV-G02, KV-G03; scenarios K01, K02).
+//! Model-based tests of the slot store (CACHE-G02, CACHE-G03; scenarios K01, K02).
 //!
 //! A reference model, a `BTreeMap` from key to value and optional absolute
 //! deadline, runs the same generated command sequences as the store. The
