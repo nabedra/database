@@ -30,7 +30,7 @@ def sleeper(delay, samples=1):
 
 
 class PairedBenchmarkTests(unittest.TestCase):
-    def test_sleeping_ten_percent_longer_flags_and_writes_reports(self):
+    def test_sleeping_twenty_percent_longer_flags_and_writes_reports(self):
         with TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
             output = Path(directory)
             spec = output / "sleep.toml"
@@ -40,8 +40,9 @@ class PairedBenchmarkTests(unittest.TestCase):
                 r"metric = 'elapsed=(\d+\.\d+)'" + "\n"
             )
             result = ab.main([
-                # Use the fastest of three 50 ms sleeps so scheduler overshoot stays small.
-                str(spec), join(sleeper(.050, 3)), join(sleeper(.055, 3)),
+                # Real processes, fastest of three sleeps. The 10% power is checked on the
+                # decision rule below; 20% here keeps a loaded shared host from inverting pairs.
+                str(spec), join(sleeper(.050, 3)), join(sleeper(.060, 3)),
                 "--commands", "--output", str(output),
             ])
             data = json.loads((output / "results.json").read_text())
@@ -55,7 +56,7 @@ class PairedBenchmarkTests(unittest.TestCase):
         self.assertEqual(data["bootstrap_seed"], ab.BOOTSTRAP_SEED)
         self.assertTrue(data["cpu_model"])
         self.assertIn("Regression on ", summary)
-        print(f"Planted 10% sleep slowdown flagged (head/base {data['median_ratio']:.4f}).")
+        print(f"Planted 20% sleep slowdown flagged (head/base {data['median_ratio']:.4f}).")
 
     def test_null_false_positive_rate_and_power_on_paired_noise(self):
         # Monte Carlo over the real decision rule. Each pair shares a host
