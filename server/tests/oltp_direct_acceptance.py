@@ -295,7 +295,8 @@ def d11_rf1_cli(args, output):
     from oltp_runtime_acceptance import RuntimeServer
     root = output / 'rf1-cli'
     root.mkdir(parents=True, exist_ok=True)
-    binary = stderr_wrapper(args.binary, root / 'nabedra-db', root / 'server-stderr.log')
+    server_stderr = root / 'server-stderr.log'
+    binary = stderr_wrapper(args.binary, root / 'nabedra-db', server_stderr)
     server = RuntimeServer(binary, root, cli=True)
     trace = (root / 'admin-trace.log').open('a')
     try:
@@ -315,6 +316,13 @@ def d11_rf1_cli(args, output):
             trace.flush()
             return status, reply
         d11_index(server.url, server.token, None, admin, lambda: {'rf1': server.stats()})
+    except Exception:
+        if server_stderr.exists():
+            with server_stderr.open(errors='replace') as log:
+                diagnostics = [line.rstrip() for line in log if 'index build stopped' in line
+                               or 'preparation failed' in line or 'worker outgoing lane full' in line]
+            print('\n'.join(diagnostics[-30:]), file=sys.stderr, flush=True)
+        raise
     finally:
         trace.close()
         server.stop()

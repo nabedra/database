@@ -954,6 +954,7 @@ fn d11_hot_key_index_process() {
         .args(["--suite", "d11", "--output"])
         .arg(&output.0)
         .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("NABEDRA_OLTP_RPC_TRACE", "1")
         .status()
         .expect("launch D11 index fixture");
     assert!(status.success(), "D11 index fixture failed");
