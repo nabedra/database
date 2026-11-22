@@ -548,10 +548,10 @@ def d11_index(url, token, ca, admin, stats):
                     row = {'id': next_key, 'category': next_key % 8, 'label': f'w{index}-{next_key}'}
                     next_key += writers
                     if write('table.insert', {'table_id': table.id, 'row': row}):
+                        acknowledged[row['id']] = row
                         # Keep the first source key hot across publication.
                         if index != 0:
                             target = row['id']
-                        acknowledged[target] = row
                         inserted.set()
 
                 # Each writer owns its keys. Keep moving rows between categories and
