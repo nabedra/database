@@ -116,21 +116,24 @@ fn acceptance_o09() {
 #[test]
 #[ignore = "requires an OLTP server and Linux network namespaces with passwordless sudo"]
 fn o06_o18_packet_drop_failover() {
-    let output = tempfile::tempdir().expect("packet-drop fixture directory");
+    let output = std::env::temp_dir().join(format!("nabedra-blackhole-{}", uuid::Uuid::new_v4()));
     let status = process_driver("oltp_blackhole.py")
         .arg("--binary")
         .arg(process_binary().expect("shared-build OLTP binary"))
         .arg("--test-executable")
         .arg(std::env::current_exe().unwrap())
         .arg("--output")
-        .arg(output.path())
+        .arg(&output)
         .env(
             "PYTHONPATH",
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../orm/python/src"),
         )
-        .status()
-        .expect("launch packet-drop fixture");
-    assert!(status.success(), "O06/O18 packet-drop assertions failed");
+        .status();
+    let _ = std::fs::remove_dir_all(output);
+    assert!(
+        status.expect("launch packet-drop fixture").success(),
+        "O06/O18 packet-drop assertions failed"
+    );
 }
 
 #[test]
