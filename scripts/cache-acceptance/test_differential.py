@@ -63,7 +63,8 @@ class FakeCache(socketserver.ThreadingTCPServer):
                 self.data[key] = (value, now + ttl, ttl)
             return bulk(value)
         if command == b"PTTL":
-            remaining = -2 if value is None else -1 if deadline is None else deadline - now
+            missing = -1 if self.mutation == "missing-as-persistent" else -2
+            remaining = missing if value is None else -1 if deadline is None else deadline - now
             return b":%d\r\n" % remaining
         if command == b"EXPIRE" and int(rest[0]) < 0:
             if value is None:
@@ -164,6 +165,23 @@ class DifferentialTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("wire replies differ", stderr)
         self.assertIn("shrunk to 3 commands", stderr)
+
+    def test_expired_key_reported_as_persistent_is_not_normalized(self):
+        # Regression for review of K01: -2 (missing) and -1 (no expiry) are
+        # distinct sentinels, so the PTTL tolerance must not merge them.
+        program = [
+            diff.op("SET", "noise", "x"),
+            diff.op("SET", "ttl", "v", "PX", 20),
+            diff.op("GET", "noise", delay_ms=100),
+            diff.op("PTTL", "ttl"),
+            diff.op("GET", "noise"),
+        ]
+        status, _, stderr, _ = self.run_case(program, "missing-as-persistent")
+        self.assertEqual(status, 1)
+        self.assertIn("wire replies differ", stderr)
+        self.assertIn("A b':-1\\r\\n'", stderr)
+        self.assertIn("B b':-2\\r\\n'", stderr)
+        self.assertIn("(b'PTTL', b'ttl')", stderr)
 
     def test_identical_schema_violations_still_fail(self):
         status, _, stderr, rows = self.run_case([diff.op("GET", "key")], "bad-get", "bad-get")
