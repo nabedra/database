@@ -27,8 +27,9 @@ use crate::{
         TlsMaterial,
         authority::{
             control::{
-                ControlClient, ControlReply, ControlRoutes, DataWorkerClient, DataWorkerIntent, EksReplacementPermit,
-                Fault, GroupRecord, InventoryPage, ServiceAction, WorkerDrainPhase,
+                ControlClient, ControlReply, DataWorkerClient, DataWorkerIntent,
+                EksReplacementPermit, Fault, GroupRecord, InventoryPage, PublishedControlRoutes,
+                ServiceAction, WorkerDrainPhase,
             },
             status::{PartitionedStatus, StatusService, StatusTopology},
         },
@@ -106,14 +107,6 @@ struct Auth {
 
 fn valid_token(token: &str) -> bool {
     (43..=4096).contains(&token.len()) && token.bytes().all(|byte| (33..=126).contains(&byte))
-}
-
-struct Routes(Vec<Uuid>);
-impl ControlRoutes for Routes {
-    fn next(&self, after: Option<Uuid>) -> Result<Option<Uuid>, ProtocolError> {
-        let index = after.map_or(0, |old| self.0.partition_point(|worker| *worker <= old));
-        Ok(self.0.get(index).copied())
-    }
 }
 
 struct Joined {
@@ -237,13 +230,13 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         TransportConfig::default(),
     )?);
     let client = transport.client();
-    let mut voters: Vec<_> = pinned.iter().map(|(_, peer)| peer.worker_id).collect();
-    voters.sort_unstable();
+    let control_routes =
+        PublishedControlRoutes::new(pinned.iter().map(|(_, peer)| peer.worker_id).collect())?;
     let control = ControlClient::new(
         client.clone(),
         shared.clone(),
         group.clone(),
-        Arc::new(Routes(voters)),
+        control_routes.clone(),
     )?;
     let bootstrap_peers: Vec<_> = pinned.iter().map(|(_, peer)| *peer).collect();
     let joining = DataWorkerClient::new(client.clone(), shared.clone(), group.clone(), pinned);
@@ -671,6 +664,8 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
 
     let result = match result {
         Ok(joined) => {
+            let voter_refresh =
+                tokio::spawn(control_routes.run_refresh(control.clone(), stop.subscribe()));
             let refresh = tokio::spawn(directory.run_refresh(control, stop.subscribe()));
             let membership = tokio::spawn(follow_membership(joined.clone(), stop.subscribe()));
             let retirement = tokio::spawn(prune_retired(joined.clone(), stop.subscribe()));
@@ -693,6 +688,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
             let settled = settlement.await.map_err(|_| unavailable("data placement settlement task failed"));
             let _ = stop.send(true);
             let _ = refresh.await;
+            let _ = voter_refresh.await;
             let _ = membership.await;
             let _ = retirement.await;
             result.and(settled.and_then(|result| result))

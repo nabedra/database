@@ -478,6 +478,8 @@ impl ControlHandle {
         } else {
             self.local_operator(permit, operation_id, evidence)?
         };
+        #[cfg(test)]
+        crate::oltp_runtime::recovery_tests::pause("replacement_before_publication", group).await;
         match self
             .propose_system_recovery(
                 running,

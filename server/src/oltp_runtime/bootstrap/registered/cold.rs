@@ -132,20 +132,45 @@ async fn prior_holder(
 
 pub(super) async fn verify_system_groups(
     worker: &RegisteredWorker,
+    control: &ControlHandle,
     rpc: &ControlClient,
     deadline: Instant,
     errors: &Mutex<Option<ProtocolError>>,
 ) -> Result<(), ProtocolError> {
+    let mut replacement = None;
     for placement in worker.placements.all() {
         let routes = startup_read(deadline, errors, "retained system group placement", || {
             rpc.replica_routes(&placement.identity)
         })
         .await?;
-        if routes.record.identity != placement.identity
-            || routes.members.as_slice() != placement.voters.as_ref()
-        {
+        if routes.members.as_slice() == placement.voters.as_ref() {
+            continue;
+        }
+        // A mounted replacement can have changed Raft before publishing
+        // the resulting group record. The retained topology can name only
+        // the exact next voters in that committed plan.
+        if worker.cold.is_none() {
             return Err(failure("retained system group placement differs from configuration"));
         }
+        if replacement.is_none() {
+            replacement = startup_read(deadline, errors, "mounted system replacement", || {
+                control.active_system_replacement()
+            })
+            .await?;
+        }
+        if let Some((record, remaining)) = &replacement
+            && remaining.contains(&placement.identity.group_id)
+            && let Some(plan) = record
+                .groups
+                .iter()
+                .find(|plan| plan.expected == routes.record)
+            && plan.next(record.intent.previous.worker_id)?.as_slice() == placement.voters.as_ref()
+        {
+            continue;
+        }
+        return Err(failure(
+            "retained system group placement differs from configuration",
+        ));
     }
     Ok(())
 }

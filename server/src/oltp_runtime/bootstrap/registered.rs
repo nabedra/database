@@ -342,9 +342,9 @@ impl LocalServices {
                     cold::verify_workers(&worker, &control)
                 })
                 .await?;
-                cold::verify_system_groups(&worker, &rpc, deadline, &error_trace).await?;
+                cold::verify_system_groups(&worker, &control, &rpc, deadline, &error_trace).await?;
             } else if rolling {
-                cold::verify_system_groups(&worker, &rpc, deadline, &error_trace).await?;
+                cold::verify_system_groups(&worker, &control, &rpc, deadline, &error_trace).await?;
             } else {
                 let state = startup_read(deadline, &error_trace, "Control inspect", || control.inspect()).await?.ok_or_else(unavailable)?;
                 let authority = state.ready.view.authority();

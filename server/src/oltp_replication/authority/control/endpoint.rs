@@ -736,7 +736,126 @@ pub(crate) trait ControlRoutes: Send + Sync + 'static {
         None
     }
     fn next(&self, after: Option<Uuid>) -> Result<Option<Uuid>, ProtocolError>;
+
+    fn quorum_voters(&self) -> Result<Vec<Uuid>, ProtocolError> {
+        let mut voters = Vec::new();
+        while let Some(worker) = self.next(voters.last().copied())? {
+            if worker.is_nil()
+                || voters.last().is_some_and(|after| worker <= *after)
+                || voters.len() == 5
+            {
+                return Err(invalid("invalid Control voters"));
+            }
+            voters.push(worker);
+        }
+        Ok(voters)
+    }
 }
+/// Bootstrap pins are the initial trust set. A quorum of that set can
+/// confirm the next published Control placement.
+pub(crate) struct PublishedControlRoutes {
+    current: Mutex<(Vec<Uuid>, Option<GroupRecord>)>,
+}
+
+impl PublishedControlRoutes {
+    pub(crate) fn new(mut voters: Vec<Uuid>) -> Result<Arc<Self>, ProtocolError> {
+        voters.sort_unstable();
+        if !matches!(voters.len(), 1 | 3 | 5)
+            || voters[0].is_nil()
+            || voters.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(invalid("invalid Control bootstrap voters"));
+        }
+        Ok(Arc::new(Self {
+            current: Mutex::new((voters, None)),
+        }))
+    }
+
+    async fn refresh(&self, control: &ControlClient) -> Result<(), ProtocolError> {
+        let (voters, published) = self.current.lock().map_err(|_| unavailable())?.clone();
+        let record =
+            control
+                .quorum_read(
+                    &ReadRequest::Group {
+                        group_id: control.group.group_id,
+                    },
+                    HEADER_LIMIT,
+                    |reply| async move {
+                        Ok((*reply.decode_section::<Option<GroupRecord>>(0)?).clone())
+                    },
+                )
+                .await?
+                .filter(|record| record.identity == control.group)
+                .ok_or_else(unavailable)?;
+        if published.as_ref() == Some(&record) {
+            return Ok(());
+        }
+        if published.as_ref().is_some_and(|previous| {
+            record.membership_position.index <= previous.membership_position.index
+        }) || record.replica_count != voters.len() as u64
+        {
+            return Err(invalid("unexpected published Control placement"));
+        }
+
+        // The quorum agreed to the member root. Fetch and verify the member
+        // page against that exact publication.
+        let (members, _) = control.load_replica_members(&record, voters.len()).await?;
+        validate_voters(&members).map_err(|_| invalid("invalid Control voters"))?;
+        let mut next: Vec<_> = members.iter().map(|member| member.worker_id).collect();
+        next.sort_unstable();
+        if next
+            .iter()
+            .filter(|id| voters.binary_search(id).is_ok())
+            .count()
+            <= voters.len() / 2
+        {
+            return Err(invalid(
+                "published Control voters do not retain a previous majority",
+            ));
+        }
+        let mut current = self.current.lock().map_err(|_| unavailable())?;
+        if current.1 == published {
+            *current = (next, Some(record));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn run_refresh(
+        self: Arc<Self>,
+        control: Arc<ControlClient>,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut tick = time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        while !*stop.borrow() {
+            tokio::select! {
+                _ = stop.changed() => return,
+                _ = tick.tick() => {}
+            }
+            tokio::select! {
+                _ = stop.changed() => return,
+                result = self.refresh(&control) => {
+                    if let Err(error) = result {
+                        tracing::debug!(code = ?error.code, "published Control voter refresh incomplete");
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl ControlRoutes for PublishedControlRoutes {
+    fn next(&self, after: Option<Uuid>) -> Result<Option<Uuid>, ProtocolError> {
+        let current = self.current.lock().map_err(|_| unavailable())?;
+        let index = after.map_or(0, |old| current.0.partition_point(|worker| *worker <= old));
+        Ok(current.0.get(index).copied())
+    }
+
+    fn quorum_voters(&self) -> Result<Vec<Uuid>, ProtocolError> {
+        Ok(self.current.lock().map_err(|_| unavailable())?.0.clone())
+    }
+}
+
 pub(crate) struct ControlClient {
     client: WorkerClient,
     shared: Arc<WorkerSharedResources>,
@@ -1580,7 +1699,7 @@ impl ControlClient {
     }
 
     /// REP6: every committed system revocation (the set Control hosts
-    /// enforce), each page agreed by a majority of the Control pins. A
+    /// enforce), each page agreed by a majority of the current Control voters. A
     /// Data-only worker seeds its revocation view with this at startup and
     /// refreshes it once per second (`REVOCATION_REFRESH`), never per
     /// exchange.
@@ -1623,8 +1742,9 @@ impl ControlClient {
         }
     }
 
-    /// `request` sent to every Control pin; the first value a majority of
-    /// them return (each a linearizable read on its replica) wins.
+    /// `request` sent to every current Control voter; the first value a majority of
+    /// them return (each a linearizable read on its replica) wins. Snapshot
+    /// the voter set so a concurrent publication cannot mix two quorums.
     async fn quorum_read<T, F, D>(
         &self,
         request: &ReadRequest,
@@ -1639,16 +1759,7 @@ impl ControlClient {
         let header = self
             .shared
             .encode_in(ByteClass::Progress, request, HEADER_LIMIT)?;
-        let mut voters = Vec::new();
-        while let Some(worker) = self.routes.next(voters.last().copied())? {
-            if worker.is_nil()
-                || voters.last().is_some_and(|after| worker <= *after)
-                || voters.len() == 5
-            {
-                return Err(invalid("invalid Control revocation voters"));
-            }
-            voters.push(worker);
-        }
+        let voters = self.routes.quorum_voters()?;
         if !matches!(voters.len(), 1 | 3 | 5) {
             return Err(unavailable());
         }

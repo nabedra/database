@@ -165,6 +165,18 @@ a new run and recovers data through the archived cut.
    survivor pauses. A mounted intent can resume with the original mount,
    identity file, and pool contents. Startup checks Control before opening
    the pool, and a wiped mount is refused even if the signing key survived.
+   After a complete shutdown with a mounted replacement, restart the retained
+   workers under one cold-fence profile with new incarnations, incremented
+   enrollment revisions and mount generations, and the retained certificates.
+   Use the stable voter sets from the committed plan for any system groups
+   still awaiting publication. Keep the original policy placements, omit
+   `system_replacement`, and include the retained workers in the configured
+   Control enrollment and operator pins. Use binaries that support mounted
+   replacement across a cold start on every retained Control voter. Control
+   can finish publishing the mounted intent in the new run. For status, keep
+   using the intent's original `run_id`. The cold fence abandons the old
+   RAM queue and preserves committed mutations and request IDs.
+
    Once the procedure completes, a later permanent loss uses a fresh intent
    naming the replacement worker. If the replacement mount is lost while
    promotion is still in progress, preserve the survivors and their quorum.
@@ -188,10 +200,13 @@ call:
 - A Data-only worker checks a local revocation view: the revoked worker IDs
   and certificate digests. At startup it reads the full list from its
   configured Control peers. A majority must return the same pages, otherwise
-  startup fails. It then repeats that majority read once per second.
+  startup fails. It then repeats the revocation read once per second and
+  follows changes to Control's published stable voter set. A majority of the
+  last known voters must confirm the new placement, and the new set must
+  retain a majority of those voters.
 - When the view learns a revocation, the worker closes that identity's
   sessions at once and refuses its new ones. A revocation committed while a
-  Control majority is reachable takes effect on every Data-only worker
+  majority of the worker's current Control voter set is reachable takes effect
   within about 1 second, plus up to 2 seconds for a slow read.
 - A refresh can fail, for example when the worker cannot reach a Control
   majority. The view then keeps every revocation it already learned, since
@@ -215,9 +230,10 @@ restore a Data-only worker's Control connectivity, stop the revoked worker's
 host or isolate it from the network.
 
 Update Data workers' Control placements and enrollments before their next
-restart. A confirmed revocation removes the stale bootstrap trust. A
-Data-only worker's view needs a majority of its configured Control peers. A
-peer that was replaced and revoked no longer counts toward that majority.
+restart. While running, the Data worker counts the new voter after it
+confirms the published placement. If a Data-only worker misses enough
+replacements to lose contact with a majority of its last known voter set,
+restart it with current Control placements and enrollments.
 
 Control accepts up to 1,024 committed worker revocations. It refuses the
 next mount before enrolling the candidate or changing any placement. The

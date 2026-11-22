@@ -673,9 +673,13 @@ fn publish(
     else {
         return fault(Fault::Invalid);
     };
+    // Mount revoked the old worker and claimed these groups. Publishing a
+    // stable Raft membership can finish after a cold fence changes the run.
     let claim = placement::claim_key(group);
     if load::<Uuid>(tx, ACTIVE)? != Some(id)
-        || state.ready.view.run_id != record.intent.run_id
+        || tx
+            .get(&revoked_id(record.intent.previous.worker_id))?
+            .is_none()
         || load::<Uuid>(tx, &claim)? != Some(id)
         || load::<GroupRecord>(tx, &key(GROUPS, group))?.as_ref() != Some(&plan.expected)
         || !position_valid(applied)

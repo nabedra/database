@@ -261,7 +261,7 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
         victim_node = cluster.config[victim]['node']
         control_group = victim_node['placements']['control']['identity']
         targets = [cluster.enrollments[name] for name in survivors]
-        if variant == 'data-trust':
+        if variant in ('data-trust', 'voter-refresh'):
             # A separate process with a Data-only directory and no inventory
             # refresh uses a survivor's enrolled identity for Control reads.
             # Give its listener a distinct endpoint and reuse its TLS name.
@@ -276,6 +276,7 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
                 'certificate': pin_node['certificate'], 'private_key': pin_node['private_key'],
                 'authority_ca': pin_node['authority_ca'], 'directory': str(data_peer_dir),
                 'control_actor': targets[0], 'revoked_bootstrap_peer': previous['worker_id'],
+                'track_control_voters': variant == 'voter-refresh',
             })
             targets.append(identity)
         write_json(probe_input, {
@@ -288,7 +289,7 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
         probe_env['NABEDRA_OLTP_TEST_REPLACEMENT_PEER'] = str(probe_input)
         peer_probe = Process('old-peer', [str(test_executable), '--exact', CHILD, '--ignored', '--nocapture'],
                              probe_env, old_probe_dir / 'peer.log')
-        if variant == 'data-trust':
+        if variant in ('data-trust', 'voter-refresh'):
             def launch_data_trust(restarted=False):
                 ready = data_peer_dir / 'listening'
                 ready.unlink(missing_ok=True)
@@ -472,13 +473,15 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
         candidate_barrier.mkdir(parents=True)
         (candidate_barrier / 'rolling-test-id').write_text(intent['id'])
         write_json(candidate_barrier / 'inspect.json', [queued_id])
+        publication_gate = ({control_group['group_id']: 'replacement_before_publication'}
+                            if variant == 'cold' else {})
         write_json(candidate_barrier / 'gates.json', {
             intent['id']: 'rolling_copy_complete', queued_id: 'queued',
-            fresh['worker_id']: 'system_replacement_rf3_applied',
+            fresh['worker_id']: 'system_replacement_rf3_applied', **publication_gate,
         })
         for name in survivors:
             write_json(cluster.barrier_dir(name) / 'gates.json', {
-                queued_id: 'queued', data_group: 'replacement_learner_appended',
+                queued_id: 'queued', data_group: 'replacement_learner_appended', **publication_gate,
             })
 
         def learner_leader():
@@ -535,6 +538,11 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
             cluster.workers[paused].resume()
             for name in survivors:
                 (cluster.barrier_dir(name) / f'release-{data_group}').touch()
+
+        if variant == 'cold':
+            r04_o17_finish_replacement_after_cold_restart(
+                cluster, survivors, prepared, original_placements, table, queued_id, acknowledged_writes)
+            return
 
         stable_checkpoint = candidate_barrier / f'reached-{fresh["worker_id"]}'
         wait_for(stable_checkpoint.exists, 'replacement applied stable RF3 in every group', RECOVERY_DEADLINE)
@@ -640,6 +648,10 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
         new_route = cluster.admin('storage.replica.placement', {'group': initial_range(cluster, new_table)},
                                   worker='replacement')
         assert new_route['members'] == current_voters, new_route
+        if variant == 'voter-refresh':
+            o17_check_second_control_replacement(
+                cluster, survivors, fresh, original_placements, progress, previous['worker_id'], identity,
+                data_peer_dir, probe_env, test_executable, control_leader)
         report('O06/O16/O17/NS23/R01/R03/R06/Q03 system replacement', lost_control_leader=victim,
                groups=len(expected), refused_live_worker=True, refused_without_quorum=True,
                refused_missing_advert=True, refused_candidate_missing_advert=True,
@@ -656,6 +668,166 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
         if data_peer is not None:
             data_peer.stop()
         cluster.close()
+
+
+
+def replacement_placements(original, groups):
+    placements = deepcopy(original)
+    system = [placements[key] for key in ('control', 'timestamps', 'status', 'catalog')]
+    system.extend(placements['status_partitions'])
+    for placement in system:
+        placement['voters'] = groups[placement['identity']['group_id']]
+    return placements
+
+
+def r04_o17_finish_replacement_after_cold_restart(
+        cluster, survivors, prepared, original_placements, table, queued_id, acknowledged_writes):
+    intent = prepared['intent']
+    check = dict(run_id=intent['run_id'], previous=intent['previous'])
+    control_group = original_placements['control']['identity']['group_id']
+    names = [*survivors, 'replacement']
+    wait_for(lambda: any((cluster.barrier_dir(name) / f'reached-{control_group}').is_file()
+                         for name in names),
+             'Control Raft promotion applied before publication', PROBE_WINDOW)
+    status = cluster.admin('worker.system_replacement.status', check, worker=survivors[0])
+    assert status['id'] == intent['id'] and status['mounted'] and not status['complete'], status
+    planned = {plan['expected']['identity']['group_id']: sorted(
+        [member for member in plan['old'] if member['worker_id'] != intent['previous']['worker_id']]
+        + [plan['learner']], key=lambda member: member['node_id']) for plan in prepared['groups']}
+    for plan, route in zip(prepared['groups'], status['groups'], strict=True):
+        group = plan['expected']['identity']['group_id']
+        assert route['members'] == (plan['old'] if group == control_group else planned[group]), route
+    cluster.kill_workers()
+    assert all(not process.alive() for process in cluster.workers.values())
+
+    profile = dict(previous_run=cluster.run_id, next_run=uid(), transition_id=uid())
+    placements = replacement_placements(original_placements, planned)
+    nexts = {}
+    for name in names:
+        previous = cluster.config[name]['node']['enrollment']
+        nexts[name] = dict(previous, incarnation=uid(),
+                           enrollment_revision=previous['enrollment_revision'] + 1)
+    peers = sorted(nexts.values(), key=lambda enrollment: enrollment['worker_id'])
+    pins = sorted(peer['certificate_sha256'] for peer in peers)
+    for name in names:
+        node = cluster.config[name]['node']
+        node.pop('system_replacement', None)
+        node.update(cold=profile, enrollment=nexts[name], control_enrollments=peers,
+                    operator_pins=pins, placements=placements, bootstrap_placements=original_placements)
+        node['mount']['worker'] = {field: nexts[name][field] for field in IDENTITY_FIELDS}
+        node['mount']['generation'] += 1
+        write_json(cluster.barrier_dir(name) / 'gates.json', {})
+        cluster.launch_worker(name)
+    cluster.wait_workers(names=names)
+    ready = cluster.admin('cluster.connection', {}, worker=survivors[0])
+    assert ready['run_id'] == profile['next_run'], ready
+    status = cluster.admin('worker.system_replacement.status', check, worker=survivors[0])
+    assert status['complete'] and status['id'] == intent['id'], status
+    for route in status['groups']:
+        assert route['members'] == planned[route['record']['identity']['group_id']], route
+
+    url = cluster.urls[survivors[0]]
+    for body, original in acknowledged_writes:
+        row = body['payload']['row']
+        assert success(*send(url, cluster.auth['data_token'], get(table, row['id']))) == row
+        assert send(url, cluster.auth['data_token'], body) == original
+    receipt_path = f'/v1/requests/{profile["previous_run"]}/{queued_id}'
+    code, receipt = send(url, cluster.auth['data_token'], None, path=receipt_path)
+    assert code == 200 and receipt['state'] == 'abandoned', (code, receipt)
+    assert success(*send(url, cluster.auth['data_token'], get(table, 2))) is None
+    report('R04/O17 cold fence between group publications',
+           previous_run=profile['previous_run'], next_run=profile['next_run'],
+           completed_groups=len(planned), acknowledged_writes=len(acknowledged_writes),
+           pending_receipt_abandoned=True)
+
+
+def o17_check_second_control_replacement(
+        cluster, survivors, first, original_placements, progress, first_revoked, data_identity,
+        data_peer_dir, probe_env, test_executable, control_leader):
+    actor, victim = survivors
+    old = cluster.enrollments[victim]
+    previous = {field: old[field] for field in IDENTITY_FIELDS}
+    control = original_placements['control']['identity']
+
+    def wait_for_voters(expected):
+        path = data_peer_dir / 'control-voters.json'
+        wait_for(lambda: path.is_file() and set(json.loads(path.read_text())) == expected,
+                 'Data-only worker adopted the published Control voters', PROBE_WINDOW)
+
+    wait_for_voters({cluster.enrollments[actor]['worker_id'], old['worker_id'], first['worker_id']})
+    probe_dir = cluster.root / 'second-old-peer'
+    probe_dir.mkdir()
+    node = cluster.config[victim]['node']
+    write_json(probe_dir / 'config.json', {
+        'group': control, 'from': old, 'targets': [data_identity],
+        'certificate': node['certificate'], 'private_key': node['private_key'],
+        'authority_ca': node['authority_ca'], 'directory': str(probe_dir),
+    })
+    env = dict(probe_env, NABEDRA_OLTP_TEST_REPLACEMENT_PEER=str(probe_dir / 'config.json'))
+    probe = Process('second-old-peer', [str(test_executable), '--exact', CHILD, '--ignored', '--nocapture'],
+                    env, probe_dir / 'peer.log')
+
+    def observe(phase):
+        (probe_dir / f'probe-{phase}').touch()
+        result = probe_dir / f'probe-{phase}.json'
+
+        def read():
+            if not probe.alive() and not result.exists():
+                raise AssertionError((probe_dir / 'peer.log').read_text())
+            return json.loads(result.read_text()) if result.exists() else None
+
+        return wait_for(read, f'second revoked peer {phase} replacement', PROBE_WINDOW)
+
+    try:
+        assert observe('before') == [True]
+        cluster.workers[victim].kill()
+        remaining = [actor, 'replacement']
+        wait_for(lambda: two_ready(cluster, remaining), 'two ready after the second loss', PROBE_WINDOW)
+        leader = wait_for(lambda: control_leader(remaining), 'Control leader after the second loss', PROBE_WINDOW)
+        name = 'replacement2'
+        fresh = cluster.certificate(name)
+        mount = cluster.mount_pool(name, uid(), fresh)
+        key = cluster.root / 'replacement2-mount.pem'
+        cluster.openssl('genpkey', '-algorithm', 'Ed25519', '-out', key)
+        key.chmod(0o600)
+        seed = Path(mount['mount_path']) / 'NABEDRA_RESTART_KEY'
+        seed.write_bytes(subprocess.check_output(
+            ['openssl', 'pkey', '-in', str(key), '-outform', 'DER'], timeout=30)[-32:])
+        seed.chmod(0o600)
+        public_key = subprocess.check_output(
+            ['openssl', 'pkey', '-in', str(key), '-pubout', '-outform', 'DER'], timeout=30)[-32:].hex()
+        intent = dict(id=uid(), run_id=cluster.run_id, previous=previous, next=fresh,
+                      mount=mount, mount_public_key=public_key)
+        prepare = operation('worker.system_replacement.prepare', intent, intent['id'])
+
+        def prepared():
+            code, response = send(cluster.urls[leader], cluster.auth['admin_token'], prepare,
+                                  path='/v1/cluster/operations', timeout=15)
+            if code in (429, 503, 504):
+                return None
+            return success(code, response)
+
+        record = wait_for(prepared, 'second system replacement prepared', PROBE_WINDOW)
+        current = replacement_placements(original_placements, {
+            route['record']['identity']['group_id']: route['members'] for route in progress['groups']})
+        replacement = deepcopy(cluster.config[victim])
+        replacement['bind'] = f'127.0.0.1:{free_port()}'
+        replacement['node'].update(
+            directory=mount['mount_path'], pool_id=mount['identity']['pool_id'], scheduler_node_id=5,
+            enrollment=fresh, bind=fresh['endpoint'], mount=mount, placements=current,
+            control_enrollments=[cluster.enrollments[actor], old, first],
+            certificate=str(cluster.root / f'{name}.pem'), private_key=str(cluster.root / f'{name}.key'),
+            system_replacement=record, bootstrap_placements=original_placements,
+        )
+        cluster.config[name] = replacement
+        cluster.launch_worker(name)
+        cluster.wait_workers(names=[*remaining, name])
+        wait_for_voters({cluster.enrollments[actor]['worker_id'], first['worker_id'], fresh['worker_id']})
+        assert observe('after') == [False]
+        report('O17 Data-only revocation after two Control voter replacements',
+               revoked_workers=[first_revoked, previous['worker_id']], refused_second_revoked_session=True)
+    finally:
+        probe.stop()
 
 
 def o17_mixed_binary_retained_enrollment_refused(binary, test_executable, legacy_binary, root):
@@ -1162,7 +1334,8 @@ def main():
     parser.add_argument('--binary', required=True)
     parser.add_argument('--test-executable', required=True)
     parser.add_argument('--suite', choices=('all', 'rollback', 'restart', 'replacement-check', 'replacement-mixed',
-                                             'replacement-abandon', 'replacement-wipe', 'replacement-data-trust', 'scale'),
+                                             'replacement-abandon', 'replacement-wipe', 'replacement-data-trust',
+                                             'replacement-cold', 'replacement-voter-refresh', 'scale'),
                         default='all')
     parser.add_argument('--legacy-binary', type=Path)
     args = parser.parse_args()
@@ -1176,6 +1349,15 @@ def main():
         if args.suite in ('all', 'replacement-check'):
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
             o06_o17_system_replacement_check(args.binary, args.test_executable, root / 'replacement-check')
+        # The existing rep1 dispatch runs these entry points.
+        if args.suite in ('all', 'replacement-check', 'replacement-cold'):
+            assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
+            o06_o17_system_replacement_check(args.binary, args.test_executable, root / 'replacement-cold',
+                                             variant='cold')
+        if args.suite in ('all', 'replacement-data-trust', 'replacement-voter-refresh'):
+            assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
+            o06_o17_system_replacement_check(args.binary, args.test_executable, root / 'replacement-voter-refresh',
+                                             variant='voter-refresh')
         if args.suite in ('all', 'scale'):
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
             o17_a02_scale(args.binary, args.test_executable, root / 'scale')
