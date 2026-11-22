@@ -93,6 +93,7 @@
     },
     "sim_core_hours": {"type": ["number", "null"], "minimum": 0},
     "virtual_hours": {"type": ["number", "null"], "minimum": 0},
+    "s3_requests": {"type": "integer", "minimum": 0},
     "artifacts": {
       "type": "array",
       "maxItems": 50,

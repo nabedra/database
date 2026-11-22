@@ -214,6 +214,11 @@ def sha256_file(path: Path) -> str:
 # --------------------------------------------------------------------------------------------
 # Building and writing.
 
+def parse_s3_requests(output: str) -> int | None:
+    counts = re.findall(r"^nabedra-s3-requests:[ \t]+([0-9]+)(?=[ \t]|$)", output, re.M)
+    return sum(map(int, counts)) if counts else None
+
+
 def new_record(
     check: str,
     kinds: Iterable[str],
@@ -233,6 +238,7 @@ def new_record(
     seeds: dict | None = None,
     sim_core_hours: float | None = None,
     virtual_hours: float | None = None,
+    s3_requests: int | None = None,
     artifacts: list[dict] | None = None,
     env: dict[str, str] | None = None,
     repo: Path = REPO_ROOT,
@@ -243,7 +249,7 @@ def new_record(
         sha = head if sha is None else sha
         tree_clean = clean if tree_clean is None else tree_clean
     kind_list = list(kinds)
-    return {
+    record = {
         "schema": SCHEMA_ID,
         "check": check,
         "kind": " ".join(kind_list),
@@ -262,6 +268,9 @@ def new_record(
         "virtual_hours": virtual_hours,
         "artifacts": artifacts or [],
     }
+    if s3_requests is not None:
+        record["s3_requests"] = s3_requests
+    return record
 
 
 def record_stem(rid: str, check: str) -> str:
