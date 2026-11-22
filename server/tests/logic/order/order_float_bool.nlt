@@ -4,7 +4,7 @@ statement ok
 {"op":"table.create","name":"n","schema":{"id":"int64","x":"int64","s":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
 
 statement ok
-{"op":"table.insert_many","table":"n","rows":[{"id":1,"x":-5,"s":"apple","f":-0.0,"b":true},{"id":2,"x":0,"s":"Banana","f":0.0,"b":false},{"id":3,"x":5,"s":"cherry","f":2.5,"b":true},{"id":4,"x":5,"s":"apple pie","f":-3.75,"b":false},{"id":5,"x":9223372036854775807,"s":"","f":1e-7,"b":true},{"id":6,"x":-9223372036854775808,"s":"Ünïcode","f":1e300,"b":false}]}
+{"op":"table.insert_many","table":"n","rows":[{"id":1,"x":-5,"s":"apple","f":-0.0,"b":true},{"id":2,"x":0,"s":"Banana","f":0.0,"b":false},{"id":3,"x":5,"s":"cherry","f":2.5,"b":true},{"id":4,"x":5,"s":"apple pie","f":-3.75,"b":false},{"id":5,"x":9223372036854775807,"s":"","f":0.50000762939453125,"b":true},{"id":6,"x":-9223372036854775808,"s":"Ünïcode","f":1e300,"b":false}]}
 
 # -0.0 and 0.0 tie, so the key decides.
 
@@ -14,7 +14,7 @@ query nosort
 4	-3.75
 1	0.0
 2	0.0
-5	1e-7
+5	0.5000076293945312
 3	2.5
 6	1e300
 
@@ -23,7 +23,7 @@ query nosort
 ----
 6	1e300
 3	2.5
-5	1e-7
+5	0.5000076293945312
 1	0.0
 2	0.0
 4	-3.75

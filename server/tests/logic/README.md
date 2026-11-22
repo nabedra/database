@@ -117,8 +117,9 @@ Values render as follows:
 | String | `(empty)` for the empty string. Otherwise the string, with `\` as `\\`, tab as `\t`, newline as `\n`, carriage return as `\r`, and any other character below U+0020 or U+007F as `\xHH` (lowercase hex) |
 
 A canonical float uses the shortest digits that round-trip, `d1 d2 ... dn`,
-and the decimal exponent `x` of `d1`. Zero of either sign is `0.0`. A negative
-value gets a leading `-`. When `-7 < x < 21` the float is plain decimal with at
+and the decimal exponent `x` of `d1`. For equally close representations of
+the same length, the decimal with an even last digit wins. Zero of either sign
+is `0.0`. A negative value gets a leading `-`. When `-7 < x < 21` the float is plain decimal with at
 least one fractional digit (`2.0`, `0.001`, `1.5`). Otherwise it is
 `d1[.d2...dn]e<x>`, such as `1e21` or `1.5e-7`.
 

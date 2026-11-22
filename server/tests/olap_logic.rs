@@ -399,11 +399,17 @@ fn canonical_float(v: f64) -> String {
         return "0.0".into();
     }
     let sign = if v < 0.0 { "-" } else { "" };
-    let sci = format!("{:e}", v.abs());
-    let (mantissa, exp) = sci.split_once('e').expect("LowerExp has an exponent");
-    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
-    let exp: i32 = exp.parse().expect("integer exponent");
-    format_float(sign, &digits, exp)
+    // Use the wire serializer's shortest digits. Rust's LowerExp chooses
+    // different digits for some ties, for example 0.50000762939453125.
+    let wire = serde_json::to_string(&v.abs()).expect("finite float");
+    let (mantissa, exp) = wire
+        .split_once('e')
+        .map_or((wire.as_str(), 0), |(m, e)| (m, e.parse::<i32>().unwrap()));
+    let integer_len = mantissa.find('.').unwrap_or(mantissa.len()) as i32;
+    let digits = mantissa.replace('.', "");
+    let significant = digits.trim_start_matches('0');
+    let first_exp = exp + integer_len - (digits.len() - significant.len()) as i32 - 1;
+    format_float(sign, significant, first_exp)
 }
 
 fn format_float(sign: &str, digits: &str, exp: i32) -> String {
@@ -938,6 +944,7 @@ fn canonical_floats() {
         (1e21, "1e21"),
         (123456.789, "123456.789"),
         (0.1 + 0.2, "0.30000000000000004"),
+        (0.50000762939453125, "0.5000076293945312"),
         (f64::MAX, "1.7976931348623157e308"),
         (f64::MIN_POSITIVE, "2.2250738585072014e-308"),
     ] {
