@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/zPy52/nabedra-database/docs/testing/evidence/schema.json",
+  "title": "nabedra.evidence/1",
+  "description": "One record per run and check, stored at docs/testing/evidence/records/<yyyy>/<mm>/<request_id>--<check>.json and kept under 20 KB. `kind` holds one or more check-kind letters separated by single spaces (a check that provides U and S writes \"U S\"). Logs and histories stay in Actions artifacts; `artifacts` lists their SHA-256 digests.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "check", "kind", "guarantees", "scenarios", "sha", "tree_clean", "build", "mode",
+    "run", "duration_s", "result", "assertions", "seeds", "sim_core_hours", "virtual_hours",
+    "artifacts"
+  ],
+  "properties": {
+    "schema": {"type": "string", "const": "nabedra.evidence/1"},
+    "check": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 80},
+    "kind": {"type": "string", "pattern": "^[MUSHFDRPK]( [MUSHFDRPK])*$"},
+    "guarantees": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^[A-Z]+(-[A-Z]+)*-G[0-9]{2}$"}
+    },
+    "scenarios": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$", "maxLength": 40}
+    },
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "tree_clean": {"type": "boolean"},
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "features", "binary_sha256"],
+      "properties": {
+        "profile": {"type": ["string", "null"], "maxLength": 40},
+        "features": {"type": "array", "items": {"type": "string", "maxLength": 80}},
+        "binary_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "mode": {
+      "description": "Run mode and sampled configuration knobs, such as {\"direct_oltp\": true}. Null when the check has no mode.",
+      "type": ["object", "null"],
+      "additionalProperties": {"type": ["string", "boolean", "integer", "number"]}
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "attempt", "request_id", "runner"],
+      "properties": {
+        "url": {"type": ["string", "null"], "pattern": "^https://", "maxLength": 300},
+        "attempt": {"type": ["integer", "null"], "minimum": 1},
+        "request_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "maxLength": 100},
+        "runner": {"type": ["string", "null"], "maxLength": 100}
+      }
+    },
+    "duration_s": {"type": "number", "minimum": 0},
+    "result": {"type": "string", "enum": ["pass", "fail", "not-run", "quarantined", "error"]},
+    "assertions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executed", "failed", "not_run"],
+      "properties": {
+        "executed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "not_run": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "reason"],
+            "properties": {
+              "id": {"type": "string", "maxLength": 200},
+              "reason": {"type": "string", "maxLength": 300}
+            }
+          }
+        }
+      }
+    },
+    "seeds": {
+      "description": "Null for checks that use no seeds.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["range", "count", "failing"],
+      "properties": {
+        "range": {
+          "type": ["array", "null"],
+          "items": {"type": "integer", "minimum": 0},
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "count": {"type": "integer", "minimum": 0},
+        "failing": {"type": "array", "maxItems": 100, "items": {"type": "integer", "minimum": 0}}
+      }
+    },
+    "sim_core_hours": {"type": ["number", "null"], "minimum": 0},
+    "virtual_hours": {"type": ["number", "null"], "minimum": 0},
+    "artifacts": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "sha256"],
+        "properties": {
+          "name": {"type": "string", "maxLength": 200},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}
