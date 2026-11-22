@@ -646,6 +646,7 @@ def check_allocator(fixture, table, commit_ts):
     assert latest['first'] > new['last'], (latest, new)
     for worker in WORKERS:
         (cluster.barrier_dir(worker) / 'clock-offset-seconds').unlink()
+    evidence('O09', 'allocator-failover', previous=previous, replacement=replacement)
 
     if clock_jumps:
         passed('O09', 'timestamp-order',
@@ -683,10 +684,27 @@ def verify_direct_scan(fixture, table, prior_rows, completed_ts):
     with ThreadPoolExecutor(max_workers=1) as pool:
         write = pool.submit(fixture.data, body)
         try:
-            wait_for(reached, lambda path: path.read_text() == 'direct-proposing', timeout=15)
+            def proposing():
+                if write.done():
+                    result = write.result()
+                    raise AssertionError(f'{request_id} completed before the direct proposal: {result!r}')
+                for path in reached:
+                    try:
+                        if path.read_text() == 'direct-proposing':
+                            return path
+                    except FileNotFoundError:
+                        pass
+                return None
+
+            wait_until(proposing, f'{request_id} did not reach direct-proposing', timeout=15)
             assert not write.done()
             admit_after_election(fixture, scan)
             _, scan_ts = fixture.reached(scan_id, 'snapshot')
+        except Exception:
+            status, stats = fixture.api('api1', '/v1/runtime/stats', timeout=2)
+            evidence('O09', 'direct-scan-failure', request_id=request_id, status=status,
+                     gateway=stats.get('direct_gateway'), timings=stats.get('api_stage_timing'))
+            raise
         finally:
             release_direct_proposal(fixture, request_id)
         assert write.result(timeout=35) is None
