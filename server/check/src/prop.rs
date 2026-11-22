@@ -86,7 +86,7 @@ pub fn check_with(cfg: Config, name: &str, f: impl Fn(&mut Gen) -> Result<(), St
         let Err(message) = run(&f, &mut g) else { continue };
         let original = g.into_tape();
         let original_len = original.len();
-        let s = shrink(original, message, cfg.max_shrink_steps, &f);
+        let s = shrink_with_seed(seed, original, message, cfg.max_shrink_steps, &f);
         panic!("{}", report(name, seed, case, cfg.cases, original_len, &s));
     }
 }
@@ -179,6 +179,7 @@ pub fn simpler(a: &[u64], b: &[u64]) -> bool {
 
 struct Shrinker<'a, F> {
     f: &'a F,
+    seed: u64,
     best: Vec<u64>,
     message: String,
     steps: u64,
@@ -197,7 +198,7 @@ impl<F: Fn(&mut Gen) -> Result<(), String>> Shrinker<'_, F> {
             return false;
         }
         self.steps += 1;
-        let mut g = Gen::from_tape(cand);
+        let mut g = Gen::from_seeded_tape(self.seed, cand);
         match run(self.f, &mut g) {
             Ok(()) => false,
             Err(message) => {
@@ -307,15 +308,24 @@ impl<F: Fn(&mut Gen) -> Result<(), String>> Shrinker<'_, F> {
     }
 }
 
-/// Shrinks a failing tape. `tape` and `message` are a failure of `f` (the tape as consumed by
-/// [`Gen::tape`]). Runs the passes to a fixed point or until `max_steps` property runs are spent.
+/// Shrinks a failing tape using seed 0, like [`Gen::from_tape`].
 pub fn shrink(
     tape: Vec<u64>,
     message: String,
     max_steps: u64,
     f: &impl Fn(&mut Gen) -> Result<(), String>,
 ) -> Shrunk {
-    let mut s = Shrinker { f, best: tape, message, steps: 0, max_steps };
+    shrink_with_seed(0, tape, message, max_steps, f)
+}
+
+fn shrink_with_seed(
+    seed: u64,
+    tape: Vec<u64>,
+    message: String,
+    max_steps: u64,
+    f: &impl Fn(&mut Gen) -> Result<(), String>,
+) -> Shrunk {
+    let mut s = Shrinker { f, seed, best: tape, message, steps: 0, max_steps };
     loop {
         let before = s.best.clone();
         s.delete_chunks();

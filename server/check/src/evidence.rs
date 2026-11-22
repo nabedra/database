@@ -33,9 +33,11 @@ pub enum Outcome {
 #[serde(deny_unknown_fields)]
 pub struct Build {
     /// Cargo profile, such as `dev`, `release` or `ci`.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub profile: Option<String>,
     pub features: Vec<String>,
     /// SHA-256 of the binary under test, lowercase hex, when one exists.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub binary_sha256: Option<String>,
 }
 
@@ -43,11 +45,14 @@ pub struct Build {
 #[serde(deny_unknown_fields)]
 pub struct Run {
     /// Actions run URL (`https://...`); `None` for a local run.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub url: Option<String>,
     /// Actions run attempt, from 1.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub attempt: Option<u64>,
     /// The dispatch request ID, or `local`.
     pub request_id: String,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub runner: Option<String>,
     /// When the run started, RFC 3339 UTC, such as `2026-11-22T17:05:09Z`.
     pub date: String,
@@ -72,6 +77,7 @@ pub struct Assertions {
 #[serde(deny_unknown_fields)]
 pub struct Seeds {
     /// Inclusive `[lo, hi]` of a contiguous seed range, when the run used one.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub range: Option<[u64; 2]>,
     pub count: u64,
     pub failing: Vec<u64>,
@@ -99,14 +105,18 @@ pub struct Record {
     pub build: Build,
     /// Run mode and sampled configuration, such as `{"direct_oltp": true}` from `config::sample`.
     /// Values are scalars. `None` when the check has no mode.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub mode: Option<BTreeMap<String, Value>>,
     pub run: Run,
     pub duration_s: f64,
     pub result: Outcome,
     pub assertions: Assertions,
     /// `None` for checks that use no seeds.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub seeds: Option<Seeds>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub sim_core_hours: Option<f64>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub virtual_hours: Option<f64>,
     pub artifacts: Vec<Artifact>,
 }
@@ -238,7 +248,7 @@ impl Record {
         if let Some((k, v)) = self.mode.iter().flatten().find(|(_, v)| v.is_null() || v.is_array() || v.is_object()) {
             return err("mode value", &format!("{k}={v}"));
         }
-        if let Some(u) = self.run.url.as_deref().filter(|u| !u.starts_with("https://") || u.len() > 300) {
+        if let Some(u) = self.run.url.as_deref().filter(|u| !u.starts_with("https://") || u.chars().count() > 300) {
             return err("run.url", u);
         }
         if self.run.attempt == Some(0) {
@@ -250,7 +260,7 @@ impl Record {
         if self.run.runner.as_deref().is_some_and(|r| r.chars().count() > 100) {
             return err("run.runner", self.run.runner.as_deref().unwrap_or(""));
         }
-        if year_month(&self.run.date).is_none() || !self.run.date.contains('T') {
+        if year_month(&self.run.date).is_none() {
             return err("run.date", &self.run.date);
         }
         let nonneg = |x: f64| x.is_finite() && x >= 0.0;
@@ -346,11 +356,48 @@ fn is_guarantee(s: &str) -> bool {
         && prefix.split('-').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_uppercase()))
 }
 
-/// `("2026", "11")` from an RFC 3339 date such as `2026-11-22T17:05:09Z`.
+/// Validates the timestamp using the same date and time bounds as the matrix's evidence reader.
 fn year_month(date: &str) -> Option<(&str, &str)> {
-    let (y, m) = (date.get(0..4)?, date.get(5..7)?);
-    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
-    (digits(y) && digits(m) && date.as_bytes().get(4) == Some(&b'-')).then_some((y, m))
+    let [y1, y2, y3, y4, b'-', m1, m2, b'-', d1, d2, b'T' | b't',
+        h1, h2, b':', min1, min2, b':', s1, s2, suffix @ ..] = date.as_bytes()
+    else {
+        return None;
+    };
+    let year = u16::from(two_digits(*y1, *y2)?) * 100 + u16::from(two_digits(*y3, *y4)?);
+    let month = two_digits(*m1, *m2)?;
+    let leap_year = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = match month {
+        2 => 28 + u8::from(leap_year),
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => return None,
+    };
+    if year == 0 || !(1..=days).contains(&two_digits(*d1, *d2)?)
+        || two_digits(*h1, *h2)? > 23 || two_digits(*min1, *min2)? > 59
+        || two_digits(*s1, *s2)? > 59
+    {
+        return None;
+    }
+    let zone = if let [b'.', fraction @ ..] = suffix {
+        let digits = fraction.iter().take_while(|b| b.is_ascii_digit()).count();
+        if digits == 0 {
+            return None;
+        }
+        &fraction[digits..]
+    } else {
+        suffix
+    };
+    match zone {
+        [b'Z' | b'z'] => {}
+        [b'+' | b'-', h1, h2, b':', m1, m2]
+            if two_digits(*h1, *h2)? <= 23 && two_digits(*m1, *m2)? <= 59 => {}
+        _ => return None,
+    }
+    Some((&date[..4], &date[5..7]))
+}
+
+fn two_digits(a: u8, b: u8) -> Option<u8> {
+    (a.is_ascii_digit() && b.is_ascii_digit()).then(|| (a - b'0') * 10 + (b - b'0'))
 }
 
 /// RFC 3339 UTC with second precision. Civil-date conversion after Howard Hinnant's

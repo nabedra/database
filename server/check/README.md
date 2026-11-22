@@ -15,8 +15,8 @@ Test it alone with `cargo test -p nabedra-check` from `server/`.
 | `config` | `Knob` and `sample`, the configuration randomizer, plus `describe` for log lines |
 | `evidence` | `Record`, one `nabedra.evidence/1` JSON record |
 
-In edition 2024 `gen` is a reserved word, so the module path is `nabedra_check::r#gen`. Most callers
-use the root re-export `nabedra_check::Gen` instead.
+In edition 2024 `gen` is a reserved word. Import `nabedra_check::Gen` directly or use
+`nabedra_check::generator::Gen`. The raw module path `nabedra_check::r#gen` works in every edition.
 
 ## Generators and the choice tape
 
@@ -83,6 +83,7 @@ repeated until none makes progress or `max_steps` property runs are spent:
    collects in one and the emptied ones can be deleted.
 
 Simulation harnesses can call `prop::shrink` and `prop::run` directly with their own tapes.
+`prop::check` and `check_with` retain the original case seed while shrinking.
 
 ## Configuration randomizer
 
@@ -102,7 +103,8 @@ Sampling draws from the same `Gen`, so a configuration replays with its seed and
 ## Evidence record fields
 
 `evidence::Record` matches `docs/testing/evidence/schema.json` (`nabedra.evidence/1`). Every field is
-always present, `Option` fields serialize as `null`, and unknown fields fail to deserialize.
+required. An absent value for an `Option` field is represented by an explicit `null`. Unknown
+fields fail to deserialize.
 `Record::new(check, kind)` dates the record now, sets `run.request_id` to `local`, and starts with
 `result` set to `"error"`, so a record whose runner never set a result cannot read as a pass.
 

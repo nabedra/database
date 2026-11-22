@@ -27,12 +27,16 @@ impl Gen {
         Self { seed, source: Source::Fresh(SplitMix64::new(seed)), tape: Vec::new() }
     }
 
-    /// A generator that replays `tape`, then returns minimal values once it is exhausted.
+    /// A generator with seed 0 that replays `tape`, then returns minimal values once exhausted.
     pub fn from_tape(tape: Vec<u64>) -> Self {
-        Self { seed: 0, source: Source::Replay(tape), tape: Vec::new() }
+        Self::from_seeded_tape(0, tape)
     }
 
-    /// The seed of a fresh generator (0 for a replayed tape).
+    pub(crate) fn from_seeded_tape(seed: u64, tape: Vec<u64>) -> Self {
+        Self { seed, source: Source::Replay(tape), tape: Vec::new() }
+    }
+
+    /// The case seed, or 0 for a generator constructed with `from_tape`.
     pub fn seed(&self) -> u64 {
         self.seed
     }
@@ -117,7 +121,10 @@ impl Gen {
     /// Up to `max_len` items. The length is drawn first, so the shrinker shortens a vector by
     /// lowering that one choice and deleting element choices after it.
     pub fn vec<T>(&mut self, max_len: usize, mut f: impl FnMut(&mut Gen) -> T) -> Vec<T> {
-        let len = self.below(max_len as u64 + 1) as usize;
+        let len = match (max_len as u64).checked_add(1) {
+            Some(span) => self.below(span),
+            None => self.u64(),
+        } as usize;
         (0..len).map(|_| f(self)).collect()
     }
 }
