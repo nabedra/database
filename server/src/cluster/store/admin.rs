@@ -8,8 +8,9 @@ use crate::storage::{
     ControlDecision, MAX_CONTROL_DECISION_BYTES, ObjectKey, ObjectStore, Storage, StorageError,
     WriteCondition,
 };
+use nabedra_rt::time;
+use nabedra_rt::time::timeout_at;
 use std::future::Future;
-use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -96,7 +97,7 @@ impl PreparedAdmin {
         )
         .await;
         let conflict = match result {
-            Ok(Ok(token)) if !token.is_empty() && Instant::now() < budget.deadline() => {
+            Ok(Ok(token)) if !token.is_empty() && time::now() < budget.deadline() => {
                 return Ok(AdminPublicationOutcome::Terminal(self.decision));
             }
             Ok(Err(StorageError::Conflict)) => true,

@@ -4,6 +4,7 @@ use super::super::{
     startup_config::{self, ApiConfig, Bootstrap, MAX_INPUT_BYTES},
 };
 use crate::protocol::deserialize_object;
+use nabedra_rt::time;
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
     sign::CertifiedKey,
@@ -114,7 +115,7 @@ impl Reader {
         })
     }
     fn check(&self) -> Result<(), ConfigurationError> {
-        if Instant::now() >= self.deadline {
+        if time::now_std() >= self.deadline {
             Err(LIMIT)
         } else {
             Ok(())

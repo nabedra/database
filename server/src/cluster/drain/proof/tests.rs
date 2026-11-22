@@ -5,6 +5,7 @@ use crate::{
     storage::{Namespace, ObjectKey, Storage, WriteCondition},
     test_storage::Fake,
 };
+use nabedra_rt::{task, time};
 use serde_json::json;
 use tokio::time::{Duration, Instant};
 fn id(n: u128) -> Uuid {
@@ -39,7 +40,7 @@ async fn whole_root_confirmation_accepts_actual_loaded_ack() {
         .await
         .unwrap();
     let loaded = storage
-        .load_control(Instant::now() + Duration::from_secs(2))
+        .load_control(time::now() + Duration::from_secs(2))
         .await
         .unwrap();
     assert!(exact_outcome(
@@ -106,7 +107,7 @@ async fn setup() -> (
         confirmed_idle: false,
     });
     let s = store(&root);
-    let t = Instant::now();
+    let t = time::now();
     let p = OwnershipProposal::new(
         &root,
         OwnershipChange::Acquire { process_id: id(90) },
@@ -849,12 +850,12 @@ async fn real_lost_reply_gate_distinguishes_exact_from_superseding_root() {
         }
         let s = std::sync::Arc::new(s);
         let submitted = s.clone();
-        let mut task = tokio::spawn(async move {
+        let mut task = task::spawn(async move {
             prepared
-                .submit(&submitted, Instant::now() + Duration::from_secs(5))
+                .submit(&submitted, time::now() + Duration::from_secs(5))
                 .await
         });
-        let entered = tokio::time::timeout(Duration::from_secs(2), gate.entered.acquire())
+        let entered = time::timeout(Duration::from_secs(2), gate.entered.acquire())
             .await
             .is_ok();
         if supersede {
@@ -871,7 +872,7 @@ async fn real_lost_reply_gate_distinguishes_exact_from_superseding_root() {
         }
         gate.release.add_permits(1);
         // Timeout never detaches the original submission or abandons a Fake effect.
-        let completion = match tokio::time::timeout(Duration::from_secs(6), &mut task).await {
+        let completion = match time::timeout(Duration::from_secs(6), &mut task).await {
             Ok(v) => v,
             Err(_) => task.await,
         };
@@ -1035,7 +1036,7 @@ async fn claim_confirmation_requires_entire_expected_root_and_outcome_kind() {
         }
         let s = store(&c);
         let l = s
-            .load_control(Instant::now() + Duration::from_secs(5))
+            .load_control(time::now() + Duration::from_secs(5))
             .await
             .unwrap();
         let outcome = match case {

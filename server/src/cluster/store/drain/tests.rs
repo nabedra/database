@@ -12,6 +12,7 @@ use crate::{
     storage::{Download, Namespace},
     test_storage::{Fake, ReadGate},
 };
+use nabedra_rt::{task, time};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -145,7 +146,7 @@ fn registered() -> Control {
 
 const KEY: &str = "test/cluster/control.json";
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(5)
+    time::now() + Duration::from_secs(5)
 }
 fn candidate(c: &Control, drain: u128, proposal: u128) -> DrainCandidate {
     let DrainPlan::Change(v) =
@@ -164,7 +165,7 @@ struct Backend {
 }
 async fn hold(g: Arc<ReadGate>) -> Result<(), StorageError> {
     g.entered.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(5), g.release.acquire())
+    time::timeout(Duration::from_secs(5), g.release.acquire())
         .await
         .map_err(|_| StorageError::Unavailable)?
         .map_err(|_| StorageError::Unavailable)?
@@ -212,7 +213,7 @@ fn counts(s: &Storage<Backend>) -> (usize, usize) {
     (f.puts, f.gets)
 }
 async fn entered(g: &ReadGate) -> bool {
-    match tokio::time::timeout(Duration::from_secs(5), g.entered.acquire()).await {
+    match time::timeout(Duration::from_secs(5), g.entered.acquire()).await {
         Ok(Ok(p)) => {
             p.forget();
             true
@@ -221,7 +222,7 @@ async fn entered(g: &ReadGate) -> bool {
     }
 }
 async fn settle<T>(mut task: tokio::task::JoinHandle<T>) -> Result<T, &'static str> {
-    match tokio::time::timeout(Duration::from_secs(6), &mut task).await {
+    match time::timeout(Duration::from_secs(6), &mut task).await {
         Ok(v) => v.map_err(|_| "join failed"),
         Err(_) => {
             task.abort();
@@ -256,7 +257,7 @@ async fn consumed_prepare_checks_complete_observation_and_owner() {
         ));
     }
     assert_eq!(
-        p.submit(&s, Instant::now()).await.unwrap_err(),
+        p.submit(&s, time::now()).await.unwrap_err(),
         StorageError::Unavailable
     );
     assert_eq!(counts(&s), (0, 1));
@@ -281,7 +282,7 @@ async fn gated_competing_drain_and_takeover_reload_winner() {
         let original_deadline = deadline();
         let task = {
             let s = s.clone();
-            tokio::spawn(async move { stale.submit(&s, original_deadline).await })
+            task::spawn(async move { stale.submit(&s, original_deadline).await })
         };
         let reached = entered(&g).await;
         let winner = if reached {
@@ -340,7 +341,7 @@ async fn late_verified_enrollment_recomputes_after_drain_wins() {
     let end = deadline();
     let task = {
         let s = s.clone();
-        tokio::spawn(async move { stale.submit(&s, end).await })
+        task::spawn(async move { stale.submit(&s, end).await })
     };
     let reached = entered(&g).await;
     let winner = if reached {
@@ -400,7 +401,7 @@ async fn applied_lost_reply_exact_or_superseded_uses_one_read_and_no_resend() {
         let end = deadline();
         let task = {
             let s = s.clone();
-            tokio::spawn(async move { p.submit(&s, end).await })
+            task::spawn(async move { p.submit(&s, end).await })
         };
         let reached = entered(&g).await;
         let superseding = if reached && later {

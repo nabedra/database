@@ -5,6 +5,7 @@ use crate::cluster::{
 };
 use crate::storage::{Download, Namespace};
 use crate::test_storage as support;
+use nabedra_rt::time;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use support::Fake;
@@ -25,7 +26,7 @@ fn initial() -> Control {
     Control::decode(&serde_json::to_vec(&root()).unwrap()).unwrap()
 }
 fn budget() -> AdminHistoryBudget {
-    AdminHistoryBudget::new(Instant::now() + Duration::from_secs(5)).unwrap()
+    AdminHistoryBudget::new(time::now() + Duration::from_secs(5)).unwrap()
 }
 fn body(request: u128, nodes: u64) -> Vec<u8> {
     format!(
@@ -65,7 +66,7 @@ impl Gate {
         self.release.acquire().await.unwrap().forget();
     }
     async fn entered(&self) -> bool {
-        tokio::time::timeout(Duration::from_secs(2), self.entered.acquire())
+        time::timeout(Duration::from_secs(2), self.entered.acquire())
             .await
             .map(|v| v.unwrap().forget())
             .is_ok()
@@ -538,7 +539,7 @@ async fn empty_ack_caps_and_deadlines_do_not_resubmit() {
     assert!(s.backend().matches.lock().unwrap().is_empty());
     for after in [false, true] {
         let s = store(&initial());
-        let b = AdminHistoryBudget::new(Instant::now() + Duration::from_millis(100)).unwrap();
+        let b = AdminHistoryBudget::new(time::now() + Duration::from_millis(100)).unwrap();
         let p = prepare(&s, 10, 2, 20, b).await;
         let gate = Gate::new();
         if after {

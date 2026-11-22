@@ -5,6 +5,7 @@ use crate::cluster::{
 };
 use crate::storage::{Download, Namespace};
 use crate::test_storage as support;
+use nabedra_rt::{task, time};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use support::{Fake, ReadGate};
@@ -26,7 +27,7 @@ fn initial() -> Control {
     Control::decode(&serde_json::to_vec(&root()).unwrap()).unwrap()
 }
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(5)
+    time::now() + Duration::from_secs(5)
 }
 
 struct Gate {
@@ -47,7 +48,7 @@ impl Gate {
         self.release.acquire().await.unwrap().forget();
     }
     async fn entered(&self) {
-        tokio::time::timeout(Duration::from_secs(5), self.entered.acquire())
+        time::timeout(Duration::from_secs(5), self.entered.acquire())
             .await
             .unwrap()
             .unwrap()
@@ -133,12 +134,12 @@ impl<T> Drop for Task<T> {
 fn spawn<T: Send + 'static>(
     future: impl std::future::Future<Output = T> + Send + 'static,
 ) -> Task<T> {
-    Task(tokio::spawn(future))
+    Task(task::spawn(future))
 }
 async fn finish<T>(task: Task<T>) -> T {
     // Abort and join on watchdog expiry; no detached fixture tasks.
     let mut task = task;
-    match tokio::time::timeout(Duration::from_secs(5), &mut task.0).await {
+    match time::timeout(Duration::from_secs(5), &mut task.0).await {
         Ok(result) => result.unwrap(),
         Err(_) => {
             task.0.abort();
@@ -371,7 +372,7 @@ async fn reconcile_failures_and_integrity_keep_application_uncertain() {
             let s = s.clone();
             spawn(async move { p.submit(&s, deadline()).await })
         };
-        tokio::time::timeout(Duration::from_secs(5), gate.entered.acquire())
+        time::timeout(Duration::from_secs(5), gate.entered.acquire())
             .await
             .unwrap()
             .unwrap()
@@ -485,7 +486,7 @@ async fn deadlines_cover_original_write_and_reconcile_without_reset() {
         } else {
             *s.backend().before.lock().unwrap() = Some(gate.clone());
         }
-        let end = Instant::now() + Duration::from_millis(150);
+        let end = time::now() + Duration::from_millis(150);
         let task = {
             let s = s.clone();
             spawn(async move { prepare(base, acquire(), 100, 4).submit(&s, end).await })
@@ -502,7 +503,7 @@ async fn deadlines_cover_original_write_and_reconcile_without_reset() {
     let base = s.load_control(deadline()).await.unwrap();
     assert_eq!(
         prepare(base, acquire(), 100, 4)
-            .submit(&s, Instant::now())
+            .submit(&s, time::now())
             .await
             .unwrap_err(),
         StorageError::Unavailable
@@ -517,12 +518,12 @@ async fn deadlines_cover_original_write_and_reconcile_without_reset() {
         f.lose_put_response = true;
         f.read_gate = Some(gate.clone());
     }
-    let end = Instant::now() + Duration::from_millis(150);
+    let end = time::now() + Duration::from_millis(150);
     let task = {
         let s = s.clone();
         spawn(async move { prepare(base, acquire(), 100, 4).submit(&s, end).await })
     };
-    tokio::time::timeout(Duration::from_secs(5), gate.entered.acquire())
+    time::timeout(Duration::from_secs(5), gate.entered.acquire())
         .await
         .unwrap()
         .unwrap()
@@ -531,7 +532,7 @@ async fn deadlines_cover_original_write_and_reconcile_without_reset() {
         finish(task).await.unwrap(),
         OwnershipOutcome::Unknown { current: None }
     ));
-    assert!(Instant::now() >= end);
+    assert!(time::now() >= end);
     assert_eq!(counts(&s), (1, 1)); // Fake counts GET only after its gate.
 }
 #[tokio::test]
@@ -563,7 +564,7 @@ async fn cancellation_after_observed_application_never_resubmits() {
 use crate::cluster::controller::{
     OwnershipEvidence, OwnershipGuard, OwnershipObservation, OwnershipProposal, OwnershipSample,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 fn guard_sample(t: Instant, elapsed: u64, wall: u64) -> Result<OwnershipSample, StorageError> {
     OwnershipSample::from_system_time(
         t + Duration::from_millis(elapsed),
@@ -574,7 +575,7 @@ fn guard_sample(t: Instant, elapsed: u64, wall: u64) -> Result<OwnershipSample, 
 async fn guard_late_ack_error_cancel_cannot_disturb_fresh_recovery() {
     for late in 0..3 {
         let s = Arc::new(store(&initial()));
-        let t = Instant::now();
+        let t = time::now();
         let base = s.load_control(deadline()).await.unwrap();
         let p =
             OwnershipProposal::new(base.root(), acquire(), id(4), guard_sample(t, 0, 100)).unwrap();
@@ -640,7 +641,7 @@ async fn guard_late_ack_error_cancel_cannot_disturb_fresh_recovery() {
 async fn guard_lost_acquire_renew_release_ack_requires_distinct_fresh_renewal() {
     for change_kind in 0..3 {
         let s = store(&initial());
-        let t = Instant::now();
+        let t = time::now();
         let mut guard = OwnershipGuard::new(id(10));
         if change_kind != 0 {
             let p = OwnershipProposal::new(&initial(), acquire(), id(3), guard_sample(t, 0, 100))
@@ -720,12 +721,12 @@ async fn guard_lost_acquire_renew_release_ack_requires_distinct_fresh_renewal() 
         }
     }
     // The paired real sampling boundary is usable without a clock service.
-    assert!(OwnershipSample::from_system_time(Instant::now(), SystemTime::now()).is_ok());
+    assert!(OwnershipSample::from_system_time(time::now(), time::wall_now()).is_ok());
 }
 #[tokio::test]
 async fn guard_gated_ack_after_observed_takeover_cannot_restore_owner() {
     let s = Arc::new(store(&initial()));
-    let t = Instant::now();
+    let t = time::now();
     let base = s.load_control(deadline()).await.unwrap();
     let p = OwnershipProposal::new(base.root(), acquire(), id(4), guard_sample(t, 0, 100)).unwrap();
     let mut guard = OwnershipGuard::new(id(10));
@@ -773,7 +774,7 @@ async fn guard_gated_ack_after_observed_takeover_cannot_restore_owner() {
 #[tokio::test]
 async fn guard_actual_preparation_failure_completes_only_its_stamp() {
     let s = store(&initial());
-    let t = Instant::now();
+    let t = time::now();
     let base = s.load_control(deadline()).await.unwrap();
     let p = OwnershipProposal::new(base.root(), acquire(), id(4), guard_sample(t, 0, 100)).unwrap();
     let mut guard = OwnershipGuard::new(id(10));

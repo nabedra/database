@@ -1,5 +1,6 @@
 use super::*;
 use crate::{storage::Namespace, test_storage::Fake};
+use nabedra_rt::time;
 use std::time::Duration;
 fn binding() -> HeartbeatBinding {
     HeartbeatBinding {
@@ -54,7 +55,7 @@ fn c01_c02_availability_is_bound_to_advertised_resource_limits() {
     }
 }
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(5)
+    time::now() + Duration::from_secs(5)
 }
 #[tokio::test]
 async fn create_then_match_preserves_independent_capacities() {
@@ -121,7 +122,7 @@ async fn invalid_inputs_are_independent_and_pre_io() {
         ));
     }
     assert!(matches!(
-        writer.publish(&storage, sample(), Instant::now()).await,
+        writer.publish(&storage, sample(), time::now()).await,
         Err(StorageError::Unavailable)
     ));
     let state = storage.backend().state.lock().unwrap();
@@ -314,7 +315,7 @@ impl Default for Provider {
 }
 impl Provider {
     async fn settle(&self) -> Result<String, StorageError> {
-        tokio::time::timeout(Duration::from_secs(5), self.release.acquire())
+        time::timeout(Duration::from_secs(5), self.release.acquire())
             .await
             .unwrap()
             .unwrap()
@@ -438,7 +439,7 @@ async fn dropped_borrowed_publish_preserves_high_water_and_pending_provider_effe
     {
         let future = writer.publish(&storage, sample(), deadline());
         tokio::pin!(future);
-        tokio::time::timeout(Duration::from_secs(5), async {
+        time::timeout(Duration::from_secs(5), async {
             tokio::select! { result = &mut future => panic!("unexpected {result:?}"), () = storage.backend().entered.notified() => {} }
         }).await.unwrap();
     }
@@ -615,11 +616,7 @@ async fn old_write_wins_after_fresh_condition_capture_and_late_ack_has_no_receip
     // Provider applies the bytes but withholds its response beyond the invocation
     // deadline. This timeout makes no claim that provider application stopped.
     let late = writer
-        .publish(
-            &storage,
-            sample(),
-            Instant::now() + Duration::from_millis(10),
-        )
+        .publish(&storage, sample(), time::now() + Duration::from_millis(10))
         .await
         .unwrap();
     assert!(matches!(late, HeartbeatWriteResult::Unknown));

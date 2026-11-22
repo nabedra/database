@@ -9,6 +9,7 @@ use crate::{
     storage::{Namespace, Storage},
     test_storage::Fake,
 };
+use nabedra_rt::{task, time};
 use serde_json::json;
 use tokio::time::{Duration, Instant};
 fn id(n: u128) -> Uuid {
@@ -92,7 +93,7 @@ async fn setup_with(
     edit(&mut root);
     let mut root = Control::decode(&root.encode().unwrap()).unwrap();
     let s = store(&root);
-    let t = Instant::now();
+    let t = time::now();
     let p = OwnershipProposal::new(
         &root,
         OwnershipChange::Acquire { process_id: id(90) },
@@ -206,7 +207,7 @@ async fn receipt(
     o: &mut Observations,
     t: Instant,
 ) -> crate::cluster::heartbeat::DrainHeartbeat {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = time::now() + Duration::from_secs(10);
     let b = hb_binding(root);
     let mut w = HeartbeatWriter::new(b.clone()).unwrap();
     let h = HeartbeatSample {
@@ -742,8 +743,8 @@ async fn lost_claim_reply_exact_read_jointly_confirms_but_gated_takeover_release
         }
         let s = std::sync::Arc::new(s);
         let submitted = s.clone();
-        let mut task = tokio::spawn(async move { prepared.submit(&submitted, d).await });
-        let entered = tokio::time::timeout(Duration::from_secs(2), gate.entered.acquire())
+        let mut task = task::spawn(async move { prepared.submit(&submitted, d).await });
+        let entered = time::timeout(Duration::from_secs(2), gate.entered.acquire())
             .await
             .is_ok();
         // Capture failures as results until the original submission is released,
@@ -766,7 +767,7 @@ async fn lost_claim_reply_exact_read_jointly_confirms_but_gated_takeover_release
             Ok(None)
         };
         gate.release.add_permits(1);
-        let settled = match tokio::time::timeout(Duration::from_secs(6), &mut task).await {
+        let settled = match time::timeout(Duration::from_secs(6), &mut task).await {
             Ok(result) => Some(result),
             Err(_) => {
                 task.abort();
@@ -775,9 +776,7 @@ async fn lost_claim_reply_exact_read_jointly_confirms_but_gated_takeover_release
             }
         };
         s.backend().state.lock().unwrap().read_gate = None;
-        let current = s
-            .load_control(Instant::now() + Duration::from_secs(2))
-            .await;
+        let current = s.load_control(time::now() + Duration::from_secs(2)).await;
         assert!(entered);
         let changed = changed.unwrap();
         if takeover {
@@ -895,7 +894,7 @@ async fn expired_original_round_at_joint_confirmation_releases_nothing() {
             .unwrap();
     // An actual clock deadline expires the original heartbeat round. No field
     // or receipt is modified, and no authority deadline is extended.
-    let expired = tokio::time::timeout_at(
+    let expired = time::timeout_at(
         t + Duration::from_millis(1010),
         std::future::pending::<()>(),
     )
@@ -976,7 +975,7 @@ async fn stop_null_acceptance_preserves_everything_except_state_and_root_version
     expected.change_id = id(73);
     expected.intents[1].state = IntentState::Reconciling;
     assert_eq!(c.result, expected);
-    let d = Instant::now() + Duration::from_secs(5);
+    let d = time::now() + Duration::from_secs(5);
     let out =
         crate::cluster::store::PreparedProvision::prepare(s.load_control(d).await.unwrap(), c)
             .unwrap()
@@ -1012,7 +1011,7 @@ fn inventory_record(root: &Control, resource: &str, state: &str) -> serde_json::
     json!({"cluster_id":root.cluster_id,"node_id":id(3),"request_id":id(6),"resource_id":resource,"state":state})
 }
 async fn persist(s: &Storage<Fake>, c: ProvisionCandidate) -> Control {
-    let d = Instant::now() + Duration::from_secs(5);
+    let d = time::now() + Duration::from_secs(5);
     let out =
         crate::cluster::store::PreparedProvision::prepare(s.load_control(d).await.unwrap(), c)
             .unwrap()
@@ -1112,7 +1111,7 @@ async fn uncertain_delivery_fresh_round_inventory_retry_joint_confirmation_and_a
     let (c, p) = claim_stop(&root, owner(), id(40), proof, id(80), 100, id(72))
         .unwrap()
         .into_parts();
-    let d = Instant::now() + Duration::from_secs(5);
+    let d = time::now() + Duration::from_secs(5);
     let out =
         crate::cluster::store::PreparedProvision::prepare(s.load_control(d).await.unwrap(), c)
             .unwrap()
@@ -1259,7 +1258,7 @@ async fn takeover_adopts_then_requires_new_inventory_and_authenticated_round() {
     let (c, p) = claim_stop(&root, owner(), id(40), proof, id(80), 100, id(72))
         .unwrap()
         .into_parts();
-    let d = Instant::now() + Duration::from_secs(5);
+    let d = time::now() + Duration::from_secs(5);
     let out =
         crate::cluster::store::PreparedProvision::prepare(s.load_control(d).await.unwrap(), c)
             .unwrap()
@@ -1448,7 +1447,7 @@ async fn stop_checked_failure_arithmetic_and_retry_backoffs_limits_preserve_base
 #[tokio::test]
 async fn gated_prepared_completion_loses_cas_to_real_takeover() {
     let (root, ctx, s) = delivered().await;
-    let d = Instant::now() + Duration::from_secs(5);
+    let d = time::now() + Duration::from_secs(5);
     let c = uncertain_stop(&root, owner(), &ctx, 100, id(73)).unwrap();
     let prepared =
         crate::cluster::store::PreparedProvision::prepare(s.load_control(d).await.unwrap(), c)
@@ -1457,24 +1456,24 @@ async fn gated_prepared_completion_loses_cas_to_real_takeover() {
     let submitted = s.clone();
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let mut task = tokio::spawn(async move {
+    let mut task = task::spawn(async move {
         let _ = entered_tx.send(());
         let _ = release_rx.await;
         prepared.submit(&submitted, d).await
     });
-    let entered = tokio::time::timeout(Duration::from_secs(2), entered_rx).await;
+    let entered = time::timeout(Duration::from_secs(2), entered_rx).await;
     let changed = async {
         let p = OwnershipProposal::new(
             &root,
             OwnershipChange::Acquire { process_id: id(92) },
             id(99),
-            Ok(sample(Instant::now(), 20000)),
+            Ok(sample(time::now(), 20000)),
         )?;
         p.prepare(s.load_control(d).await?)?.submit(&s, d).await
     }
     .await;
     let _ = release_tx.send(());
-    let result = match tokio::time::timeout(Duration::from_secs(6), &mut task).await {
+    let result = match time::timeout(Duration::from_secs(6), &mut task).await {
         Ok(v) => Some(v),
         Err(_) => {
             task.abort();
@@ -1482,9 +1481,7 @@ async fn gated_prepared_completion_loses_cas_to_real_takeover() {
             None
         }
     };
-    let current = s
-        .load_control(Instant::now() + Duration::from_secs(2))
-        .await;
+    let current = s.load_control(time::now() + Duration::from_secs(2)).await;
     assert!(entered.unwrap().is_ok());
     assert!(matches!(changed, Ok(OwnershipOutcome::Acknowledged(_))));
     assert!(matches!(

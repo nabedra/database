@@ -1,4 +1,5 @@
 use super::*;
+use nabedra_rt::{ids, time};
 #[test]
 fn secret_fixed_vector() {
     assert_eq!(
@@ -230,7 +231,7 @@ impl Drop for Temp {
 fn reader(dir: &std::path::Path) -> super::super::files::Reader {
     super::super::files::Reader::new(
         &dir.join("input"),
-        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        time::now_std() + std::time::Duration::from_secs(30),
     )
     .unwrap()
 }
@@ -245,7 +246,7 @@ fn private_write(path: &std::path::Path, bytes: &[u8]) {
 #[test]
 fn loaded_material_equivalence_and_differences() {
     use std::fs;
-    let dir = Temp(std::env::temp_dir().join(format!("nabedra-identity-{}", uuid::Uuid::new_v4())));
+    let dir = Temp(std::env::temp_dir().join(format!("nabedra-identity-{}", ids::uuid_v4())));
     fs::create_dir(&dir.0).unwrap();
     super::super::files::tests::create_tls_fixture(&dir.0);
     let hints = super::super::super::configuration::Tls {
@@ -442,8 +443,7 @@ fn concrete_function_vectors() {
 
 #[test]
 fn local_api_fields_are_excluded_from_worker_identity() {
-    let dir =
-        Temp(std::env::temp_dir().join(format!("nabedra-identity-api-{}", uuid::Uuid::new_v4())));
+    let dir = Temp(std::env::temp_dir().join(format!("nabedra-identity-api-{}", ids::uuid_v4())));
     std::fs::create_dir(&dir.0).unwrap();
     let original = r#"{"version":1,"cluster_id":"00000000-0000-0000-0000-000000000001","bind":"127.0.0.1:0","advertise_url":"http://api:80","api_urls":["http://a","http://b"],"storage":{"driver":"http","options":{"base_url":"http://store","namespace":"n","token_file":"token","ca_file":null}},"auth_file":"auth","tls":null,"worker":{"listen":"127.0.0.1:0","operation_slots":2,"partition_slots":3,"queue_size":4,"partition_size":"1 MiB"}}"#;
     std::fs::write(dir.0.join("input"), original).unwrap();

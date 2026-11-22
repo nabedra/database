@@ -30,6 +30,7 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
+use nabedra_rt::{ids, task, time};
 use serde::Deserialize;
 use serde_json::json;
 use std::{
@@ -39,7 +40,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 use tokio::{
     net::{TcpListener, UnixStream},
@@ -80,10 +81,10 @@ struct Message {
     kind: String,
 }
 fn sample() -> std::result::Result<OwnershipSample, StorageError> {
-    OwnershipSample::from_system_time(Instant::now(), SystemTime::now())
+    OwnershipSample::from_system_time(time::now(), time::wall_now())
 }
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(10)
+    time::now() + Duration::from_secs(10)
 }
 
 struct Api {
@@ -156,7 +157,7 @@ impl Api {
             }
         };
         let proposal = cpu(&self.pool, move |_| {
-            OwnershipProposal::new(&root, change, Uuid::new_v4(), Ok(now))
+            OwnershipProposal::new(&root, change, ids::uuid_v4(), Ok(now))
                 .map_err(|_| unavailable())
         })
         .await?;
@@ -258,7 +259,7 @@ impl Api {
         };
         let new_run = cold || old.is_none();
         let run_id = if new_run {
-            Uuid::new_v4()
+            ids::uuid_v4()
         } else {
             old.unwrap().run_id
         };
@@ -359,7 +360,7 @@ impl Api {
             None,
         )?;
         let plan = cpu(&self.pool, move |_| {
-            registration_plan(&root, owner, &proof, Uuid::new_v4())
+            registration_plan(&root, owner, &proof, ids::uuid_v4())
                 .map_err(|_| failure(ErrorCode::Conflict))
         })
         .await?;
@@ -381,7 +382,7 @@ impl Api {
         Ok(bytes)
     }
     async fn probe(&self, root: Control, node: Node) -> Result<()> {
-        let challenge = Uuid::new_v4();
+        let challenge = ids::uuid_v4();
         let initial = serde_json::to_vec(&json!({"version":1,"challenge":challenge}))
             .map_err(|_| invalid())?;
         let signer = self.signer.clone();
@@ -456,7 +457,7 @@ impl Api {
                 verified_challenge: challenge,
                 initialized: true,
             };
-            ready_candidate(&root, owner, &input, Uuid::new_v4()).map_err(|_| unavailable())
+            ready_candidate(&root, owner, &input, ids::uuid_v4()).map_err(|_| unavailable())
         })
         .await?;
         let publication = self.publish(loaded, candidate).await;
@@ -503,7 +504,7 @@ impl Api {
         self.observations
             .lock()
             .unwrap()
-            .reconcile_members(&root, Instant::now())
+            .reconcile_members(&root, time::now())
             .map_err(|_| unavailable())?;
         for node in root.nodes.iter().filter(|n| {
             matches!(n.state, NodeState::Ready | NodeState::Starting)
@@ -516,19 +517,19 @@ impl Api {
                 match heartbeat {
                     Ok(Some(h)) => {
                         observed
-                            .observe(&binding, h.heartbeat(), Instant::now())
+                            .observe(&binding, h.heartbeat(), time::now())
                             .map_err(|_| unavailable())?;
                     }
                     _ => {
                         observed
-                            .read_failed(&binding, Instant::now())
+                            .read_failed(&binding, time::now())
                             .map_err(|_| unavailable())?;
                     }
                 }
                 observed
                     .expiry_input(
                         &binding,
-                        Instant::now(),
+                        time::now(),
                         Duration::from_millis(root.timing.expiry_ms),
                     )
                     .map_err(|_| unavailable())?
@@ -541,7 +542,7 @@ impl Api {
                     .matches_expiry(
                         &binding,
                         &input,
-                        Instant::now(),
+                        time::now(),
                         Duration::from_millis(root.timing.expiry_ms),
                     )
                     .map_err(|_| unavailable())?
@@ -549,7 +550,7 @@ impl Api {
                     continue;
                 }
                 let candidate =
-                    super::membership::loss_candidate(&root, owner, &input, Uuid::new_v4())
+                    super::membership::loss_candidate(&root, owner, &input, ids::uuid_v4())
                         .map_err(|_| unavailable())?;
                 self.publish(loaded, candidate).await?;
                 self.ensure_catalog_fence(owner).await?;
@@ -581,7 +582,7 @@ impl Api {
         &self,
         headers: &axum::http::HeaderMap,
     ) -> Result<Option<crate::storage::context::RequestContext>> {
-        let now = SystemTime::now()
+        let now = time::wall_now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| unavailable())?
             .as_secs();
@@ -761,7 +762,7 @@ async fn enroll(State(api): State<Arc<Api>>, request: Request) -> Response {
             let bytes = http::read_small(
                 request.into_body(),
                 length,
-                Instant::now() + Duration::from_secs(30),
+                time::now() + Duration::from_secs(30),
             )
             .await?;
             api.enroll(bytes).await
@@ -845,7 +846,7 @@ async fn operations(State(api): State<Arc<Api>>, request: Request) -> Response {
             let bytes = http::read_small(
                 request.into_body(),
                 length,
-                Instant::now() + Duration::from_secs(30),
+                time::now() + Duration::from_secs(30),
             )
             .await?;
             api.route(bytes, context, _staging).await
@@ -899,7 +900,7 @@ async fn submit_request(State(api): State<Arc<Api>>, request: Request) -> Respon
         if !api.accepting.load(Ordering::Acquire){return Err(unavailable());}
         let _staging=api.pool.scheduler().charge_memory(0,(3*protocol::MAX_BODY_BYTES+protocol::MAX_DECODED_PAYLOAD_BYTES) as u64)?;
         let length=http::framing(request.headers(),protocol::MAX_BODY_BYTES,false)?.ok_or_else(invalid)?;
-        let bytes=http::read_small(request.into_body(),length,Instant::now()+Duration::from_secs(30)).await?;
+        let bytes=http::read_small(request.into_body(),length,time::now()+Duration::from_secs(30)).await?;
         let parsed=protocol::parse_request(&bytes)?;let id=parsed.request_id;drop(parsed);
         Ok(match api.submit(bytes, context).await{
             Ok(record)=>EncodedResponse{status:202,body:serde_json::to_vec(&json!({"request_id":record.request_id,"run_id":record.run_id,"state":"queued"})).map_err(|_|invalid())?},
@@ -991,7 +992,7 @@ pub async fn run_api_configured(
         let _ = send(
             &mut channel,
             json!({"version":1,"type":"fatal","code":"startup_failed"}),
-            Instant::now() + Duration::from_secs(2),
+            time::now() + Duration::from_secs(2),
         )
         .await;
     }
@@ -1005,7 +1006,7 @@ async fn api_process(
     cold_start: bool,
     migrate_catalog: bool,
 ) -> Result<()> {
-    let startup_end = Instant::now() + Duration::from_secs(30);
+    let startup_end = time::now() + Duration::from_secs(30);
     let init: Init =
         serde_json::from_slice(&frame(channel, Some(startup_end)).await?).map_err(|_| invalid())?;
     let provisioning = match (init.provisioning.as_str(), init.bridge.as_ref()) {
@@ -1055,7 +1056,7 @@ async fn api_process(
         }
     };
     let client = HttpClient::new(local.prepared.tls.as_ref())?;
-    let process = Uuid::new_v4();
+    let process = ids::uuid_v4();
     let signer = Arc::new(Signer::api(
         local.prepared.input.value.cluster_id,
         process,
@@ -1093,7 +1094,7 @@ async fn api_process(
         template: template.clone(),
         timing: local.prepared.input.value.lifecycle.clone(),
         revision: 1,
-        change_id: Uuid::new_v4(),
+        change_id: ids::uuid_v4(),
         policy: Policy {
             revision: 1,
             mode: policy_mode,
@@ -1121,7 +1122,7 @@ async fn api_process(
         intents: vec![],
     };
     let proposed_fence = crate::storage::CatalogFence {
-        run_id: Uuid::new_v4(),
+        run_id: ids::uuid_v4(),
         scheduler_term: 1,
     };
     let (attached, initialization_new) = cpu(&pool, {
@@ -1165,8 +1166,8 @@ async fn api_process(
         process,
         guard: Mutex::new(OwnershipGuard::new(process)),
         changes: tokio::sync::Mutex::new(()),
-        observations: Arc::new(Mutex::new(Observations::new(process, Instant::now()))),
-        status_observations: Mutex::new(Observations::new(process, Instant::now())),
+        observations: Arc::new(Mutex::new(Observations::new(process, time::now()))),
+        status_observations: Mutex::new(Observations::new(process, time::now())),
         data: Executor::new(data_coordination, 0)?,
         controls: Executor::new(8, 0)?,
         submissions: Executor::new(16, 0)?,
@@ -1217,14 +1218,14 @@ async fn api_process(
                 }
             }
         }
-        if Instant::now() >= startup_end {
+        if time::now() >= startup_end {
             return Err(unavailable());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        time::sleep(Duration::from_millis(100)).await;
     }
     let (stop, mut renew_stop) = watch::channel(false);
     let authorizer = authorizer.map(|listener| {
-        tokio::spawn(provider_runtime::authorizer(
+        task::spawn(provider_runtime::authorizer(
             api.clone(),
             listener,
             stop.subscribe(),
@@ -1232,15 +1233,15 @@ async fn api_process(
     });
     let renewal_interval = Duration::from_millis(api.attached.root().timing.renew_ms);
     let owner = api.clone();
-    let renewal = tokio::spawn(async move {
+    let renewal = task::spawn(async move {
         loop {
             let _ = owner.ownership().await;
-            tokio::select! { _ = renew_stop.changed() => break, _ = tokio::time::sleep(renewal_interval) => {} }
+            tokio::select! { _ = renew_stop.changed() => break, _ = time::sleep(renewal_interval) => {} }
         }
     });
     let owner = api.clone();
     let mut probe_stop = stop.subscribe();
-    let probes = tokio::spawn(async move {
+    let probes = task::spawn(async move {
         loop {
             if let Ok(loaded) = owner.load().await {
                 let root = loaded.root();
@@ -1255,7 +1256,7 @@ async fn api_process(
             }
             let _ = owner.observe_losses().await;
             let _ = owner.provider_tick().await;
-            tokio::select! { _ = probe_stop.changed() => break, _ = tokio::time::sleep(Duration::from_millis(250)) => {} }
+            tokio::select! { _ = probe_stop.changed() => break, _ = time::sleep(Duration::from_millis(250)) => {} }
         }
     });
     api.accepting.store(true, Ordering::Release);
@@ -1321,16 +1322,17 @@ fn follower_ready(
 #[cfg(test)]
 mod queue_response_tests {
     use super::*;
+    use nabedra_rt::ids;
     #[test]
     fn u02_q05_follower_api_attaches_only_to_live_matching_authority() {
         let mut controller = Controller {
-            owner_id: Some(Uuid::new_v4()),
+            owner_id: Some(ids::uuid_v4()),
             epoch: 3,
             lease_state: LeaseState::Held,
             lease_until_ms: Some(2000),
         };
         let fence = crate::storage::CatalogFence {
-            run_id: Uuid::new_v4(),
+            run_id: ids::uuid_v4(),
             scheduler_term: 7,
         };
         assert!(follower_ready(&controller, 7, Some(fence), 1000, false));
@@ -1347,7 +1349,7 @@ mod queue_response_tests {
     }
     #[test]
     fn q04_t04_post_accept_lookup_failure_preserves_identity_and_unknown_outcome() {
-        let id = Uuid::new_v4();
+        let id = ids::uuid_v4();
         for mutation in [false, true] {
             let encoded =
                 route_failure(id, mutation, true, http::failure(ErrorCode::LimitExceeded));

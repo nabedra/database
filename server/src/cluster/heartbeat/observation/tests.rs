@@ -4,6 +4,7 @@ use crate::cluster::{
     member::*,
     state::*,
 };
+use nabedra_rt::time;
 use serde_json::{Value, json};
 fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
@@ -76,7 +77,7 @@ fn beat(b: &HeartbeatBinding, seq: u64) -> Heartbeat {
 #[test]
 fn repeats_expire_at_original_advance() {
     let (r, b) = setup();
-    let t = Instant::now();
+    let t = time::now();
     let e = Duration::from_millis(r.timing.expiry_ms);
     let mut o = Observations::new(id(90), t);
     o.reconcile_members(&r, t).unwrap();
@@ -91,7 +92,7 @@ fn repeats_expire_at_original_advance() {
 #[test]
 fn failures_keep_original_loss_anchors_and_require_advance() {
     let (r, b) = setup();
-    let t = Instant::now();
+    let t = time::now();
     let e = Duration::from_millis(r.timing.expiry_ms);
     let mut o = Observations::new(id(90), t);
     o.reconcile_members(&r, t).unwrap();
@@ -113,7 +114,7 @@ fn failures_keep_original_loss_anchors_and_require_advance() {
 fn both_query_time_regressions_persist_and_keep_high_water() {
     for via_fresh in [false, true] {
         let (r, b) = setup();
-        let t = Instant::now();
+        let t = time::now();
         let e = Duration::from_millis(r.timing.expiry_ms);
         let mut o = Observations::new(id(90), t);
         o.reconcile_members(&r, t).unwrap();
@@ -137,7 +138,7 @@ fn both_query_time_regressions_persist_and_keep_high_water() {
 #[test]
 fn root_order_and_integrity_preserve_accepted_binding() {
     let (r, b) = setup();
-    let t = Instant::now();
+    let t = time::now();
     let e = Duration::from_millis(r.timing.expiry_ms);
     let mut o = Observations::new(id(90), t);
     o.reconcile_members(&r, t).unwrap();
@@ -164,7 +165,7 @@ fn root_order_and_integrity_preserve_accepted_binding() {
 #[test]
 fn binding_and_capacity_controls_do_not_restore_freshness() {
     let (r, b) = setup();
-    let t = Instant::now();
+    let t = time::now();
     let e = Duration::from_secs(15);
     let mut o = Observations::new(id(90), t);
     o.reconcile_members(&r, t).unwrap();
@@ -206,7 +207,7 @@ fn draining(root: &mut Control) {
 #[test]
 fn takeover_restart_baseline_and_full_grace() {
     let (mut r, b) = setup();
-    let t = Instant::now();
+    let t = time::now();
     let e = Duration::from_millis(r.timing.expiry_ms);
     let mut o = Observations::new(id(90), t);
     o.reconcile_members(&r, t).unwrap();
@@ -233,7 +234,7 @@ fn takeover_restart_baseline_and_full_grace() {
 #[test]
 fn overflow_and_generation_exhaustion_close_evidence() {
     let (r, b) = setup();
-    let t = Instant::now();
+    let t = time::now();
     let e = Duration::from_secs(15);
     for via_fresh in [false, true] {
         let mut o = Observations::new(id(90), t);
@@ -262,7 +263,7 @@ fn overflow_and_generation_exhaustion_close_evidence() {
 #[test]
 fn replacement_pruning_bounds_and_delayed_old_root() {
     let (mut r, b) = setup();
-    let t = Instant::now();
+    let t = time::now();
     let e = Duration::from_secs(15);
     let mut o = Observations::new(id(90), t);
     o.reconcile_members(&r, t).unwrap();
@@ -312,7 +313,7 @@ fn loss_candidate_preserves_root_and_draining_never_expires() {
     r.nodes[0].resource_id = Some("synthetic-resource".into());
     r.intents.push(serde_json::from_value(json!({"request_id":id(6),"node_id":b.node_id,"launch_id":id(6),"incarnation_id":null,"resource_id":"synthetic-resource","action":"start","state":"completed","attempts":1,"created_at_ms":0,"deadline_ms":1,"retry_at_ms":0,"error_code":null,"template_fingerprint":r.config.template_fingerprint,"delivery":null,"outcome":"resource_known"})).unwrap());
     r.validate().unwrap();
-    let t = Instant::now();
+    let t = time::now();
     let e = Duration::from_millis(r.timing.expiry_ms);
     let mut o = Observations::new(id(90), t);
     o.reconcile_members(&r, t).unwrap();
@@ -374,7 +375,7 @@ async fn loaded(
         )
         .await
         .unwrap();
-    super::super::load_heartbeat(&storage, b, Instant::now() + Duration::from_secs(5))
+    super::super::load_heartbeat(&storage, b, time::now() + Duration::from_secs(5))
         .await
         .unwrap()
         .unwrap()
@@ -383,7 +384,7 @@ async fn loaded(
 async fn drain_receipt_requires_progress_and_current_configured_evidence() {
     let (mut r, b) = setup();
     draining(&mut r);
-    let t = Instant::now();
+    let t = time::now();
     let e = Duration::from_millis(r.timing.expiry_ms);
     let mut o = Observations::new(id(90), t);
     let baseline = loaded(100, &b, Some(id(77)), false).await;
@@ -455,7 +456,7 @@ fn receipt_traits_are_closed() {
 async fn drain_receipt_requires_present_durable_drain_identity() {
     let (mut root, binding) = setup();
     draining(&mut root);
-    let now = Instant::now();
+    let now = time::now();
     let expiry = Duration::from_millis(root.timing.expiry_ms);
     for drain_id in [Some(id(77)), None] {
         let mut candidate = root.clone();
@@ -488,7 +489,7 @@ async fn drain_receipt_requires_present_durable_drain_identity() {
 #[test]
 fn takeover_grace_does_not_manufacture_sequence_advancement_time() {
     let (mut r, b) = setup();
-    let t = Instant::now();
+    let t = time::now();
     let e = Duration::from_millis(r.timing.expiry_ms);
     let mut o = Observations::new(id(90), t);
     o.reconcile_members(&r, t).unwrap();
@@ -531,7 +532,7 @@ fn auto_root() -> (Control, HeartbeatBinding) {
 #[tokio::test]
 async fn autoscale_loaded_progress_yields_snapshot() {
     let (r, b) = auto_root();
-    let t = Instant::now();
+    let t = time::now();
     let mut o = Observations::new(id(90), t);
     o.autoscale_observe(&r, loaded(1, &b, None, true).await, auto_sample(t, 1000))
         .unwrap();
@@ -559,7 +560,7 @@ async fn auto_ingest(
         )
         .await
         .unwrap();
-    let h = load_heartbeat(&storage, b, Instant::now() + Duration::from_secs(5))
+    let h = load_heartbeat(&storage, b, time::now() + Duration::from_secs(5))
         .await
         .unwrap()
         .unwrap();
@@ -593,7 +594,7 @@ async fn auto_healthy(t: Instant) -> (Observations, Control, HeartbeatBinding) {
 #[tokio::test]
 async fn autoscale_busy_between_polls_resets_each_load_dimension() {
     for dimension in 0..5 {
-        let t = Instant::now();
+        let t = time::now();
         let (mut o, r, b) = auto_healthy(t).await;
         let old = o
             .autoscale_snapshot(&r, auto_owner(), auto_sample(t, 1000))
@@ -638,7 +639,7 @@ async fn autoscale_busy_between_polls_resets_each_load_dimension() {
 }
 #[tokio::test]
 async fn autoscale_duplicates_preserve_but_cannot_refresh_or_restore() {
-    let t = Instant::now();
+    let t = time::now();
     let (mut o, r, b) = auto_healthy(t).await;
     let expiry = Duration::from_millis(r.timing.expiry_ms);
     for ms in [1000, 2000, 5000, 14000] {
@@ -700,7 +701,7 @@ async fn autoscale_duplicates_preserve_but_cannot_refresh_or_restore() {
 #[tokio::test]
 async fn autoscale_missed_deadline_checked_before_advancing_load() {
     for nanos in [0, 1] {
-        let t = Instant::now();
+        let t = time::now();
         let (mut o, r, b) = auto_healthy(t).await;
         let d = Duration::from_millis(r.timing.expiry_ms);
         let now = t + d - Duration::from_nanos(nanos);
@@ -723,7 +724,7 @@ async fn autoscale_missed_deadline_checked_before_advancing_load() {
 #[tokio::test]
 async fn autoscale_rejections_close_old_snapshots_and_require_new_progress() {
     for case in 0..7 {
-        let t = Instant::now();
+        let t = time::now();
         let (mut o, mut r, b) = auto_healthy(t).await;
         let old = o
             .autoscale_snapshot(&r, auto_owner(), auto_sample(t, 1000))
@@ -789,7 +790,7 @@ async fn autoscale_rejections_close_old_snapshots_and_require_new_progress() {
 #[tokio::test]
 async fn autoscale_identity_and_housekeeping_are_distinct() {
     for case in 0..7 {
-        let t = Instant::now();
+        let t = time::now();
         let (mut o, mut r, b) = auto_healthy(t).await;
         let old = o
             .autoscale_snapshot(&r, auto_owner(), auto_sample(t, 1000))
@@ -832,7 +833,7 @@ async fn autoscale_identity_and_housekeeping_are_distinct() {
 #[tokio::test]
 async fn autoscale_time_drift_and_exhaustion_fail_closed() {
     for offset in [1999, 2000, 2001, -1999, -2000, -2001] {
-        let t = Instant::now();
+        let t = time::now();
         let (mut o, r, _) = auto_healthy(t).await;
         let result = o.autoscale_snapshot(
             &r,
@@ -841,7 +842,7 @@ async fn autoscale_time_drift_and_exhaustion_fail_closed() {
         );
         assert_eq!(result.is_ok(), offset.abs() <= 2000);
     }
-    let t = Instant::now();
+    let t = time::now();
     let (mut o, r, _) = auto_healthy(t).await;
     assert!(
         o.autoscale_snapshot(&r, auto_owner(), auto_sample(t, 999))
@@ -867,7 +868,7 @@ async fn autoscale_time_drift_and_exhaustion_fail_closed() {
 async fn autoscale_restart_never_inherits_persisted_diagnostic() {
     let (mut r, b) = auto_root();
     r.scheduler.low_since_ms = Some(1);
-    let t = Instant::now();
+    let t = time::now();
     let mut o = Observations::new(id(90), t);
     assert!(
         o.autoscale_snapshot(&r, auto_owner(), auto_sample(t, 1000))
@@ -893,7 +894,7 @@ async fn autoscale_real_guard_renewals_preserve_original_sixty_second_anchor() {
         OwnershipChange, OwnershipEvidence, OwnershipGuard, OwnershipProposal,
     };
     use crate::{storage::Namespace, test_storage::Fake};
-    let t = Instant::now();
+    let t = time::now();
     let (mut r, b) = auto_root();
     r.controller = Controller {
         owner_id: None,
@@ -919,7 +920,7 @@ async fn autoscale_real_guard_renewals_preserve_original_sixty_second_anchor() {
             assert_eq!(guard.check(auto_sample(now, ms)).unwrap(), auto_owner());
         }
         let base = storage
-            .load_control(Instant::now() + Duration::from_secs(5))
+            .load_control(time::now() + Duration::from_secs(5))
             .await
             .unwrap();
         let change = if k == 0 {
@@ -952,7 +953,7 @@ async fn autoscale_real_guard_renewals_preserve_original_sixty_second_anchor() {
         let result = proposal
             .prepare(base)
             .unwrap()
-            .submit(&storage, Instant::now() + Duration::from_secs(5))
+            .submit(&storage, time::now() + Duration::from_secs(5))
             .await
             .unwrap();
         assert!(
@@ -962,7 +963,7 @@ async fn autoscale_real_guard_renewals_preserve_original_sixty_second_anchor() {
         );
         assert_eq!(guard.check(auto_sample(now, ms)).unwrap(), auto_owner());
         r = storage
-            .load_control(Instant::now() + Duration::from_secs(5))
+            .load_control(time::now() + Duration::from_secs(5))
             .await
             .unwrap()
             .root()
@@ -999,7 +1000,7 @@ async fn autoscale_real_guard_renewals_preserve_original_sixty_second_anchor() {
 async fn autoscale_missing_corrupt_and_failed_load_notifications() {
     use crate::{storage::Namespace, test_storage::Fake};
     for case in 0..4 {
-        let t = Instant::now();
+        let t = time::now();
         let (mut o, r, b) = auto_healthy(t).await;
         let old = o
             .autoscale_snapshot(&r, auto_owner(), auto_sample(t, 1000))
@@ -1019,9 +1020,9 @@ async fn autoscale_missing_corrupt_and_failed_load_notifications() {
             storage.backend().state.lock().unwrap().read_failure = true;
         }
         let deadline = if case == 2 {
-            Instant::now()
+            time::now()
         } else {
-            Instant::now() + Duration::from_secs(5)
+            time::now() + Duration::from_secs(5)
         };
         let result = load_heartbeat(&storage, &b, deadline).await;
         if case == 0 {
@@ -1050,7 +1051,7 @@ async fn autoscale_real_guard_failed_ambiguous_expired_and_obsolete_renewals_res
     };
     use crate::{storage::Namespace, test_storage::Fake};
     for case in 0..4 {
-        let t = Instant::now();
+        let t = time::now();
         let (mut r, b) = auto_root();
         r.controller = Controller {
             owner_id: None,
@@ -1069,7 +1070,7 @@ async fn autoscale_real_guard_failed_ambiguous_expired_and_obsolete_renewals_res
             .unwrap();
         let mut guard = OwnershipGuard::new(id(90));
         let base = storage
-            .load_control(Instant::now() + Duration::from_secs(5))
+            .load_control(time::now() + Duration::from_secs(5))
             .await
             .unwrap();
         let p = OwnershipProposal::new(
@@ -1083,7 +1084,7 @@ async fn autoscale_real_guard_failed_ambiguous_expired_and_obsolete_renewals_res
         let result = p
             .prepare(base)
             .unwrap()
-            .submit(&storage, Instant::now() + Duration::from_secs(5))
+            .submit(&storage, time::now() + Duration::from_secs(5))
             .await
             .unwrap();
         assert!(
@@ -1092,7 +1093,7 @@ async fn autoscale_real_guard_failed_ambiguous_expired_and_obsolete_renewals_res
                 .unwrap()
         );
         r = storage
-            .load_control(Instant::now() + Duration::from_secs(5))
+            .load_control(time::now() + Duration::from_secs(5))
             .await
             .unwrap()
             .root()
@@ -1109,7 +1110,7 @@ async fn autoscale_real_guard_failed_ambiguous_expired_and_obsolete_renewals_res
         let now = t + Duration::from_secs(5);
         assert_eq!(guard.check(auto_sample(now, 6000)).unwrap(), auto_owner());
         let base = storage
-            .load_control(Instant::now() + Duration::from_secs(5))
+            .load_control(time::now() + Duration::from_secs(5))
             .await
             .unwrap();
         let p = OwnershipProposal::new(
@@ -1129,7 +1130,7 @@ async fn autoscale_real_guard_failed_ambiguous_expired_and_obsolete_renewals_res
         } else {
             p.prepare(base)
                 .unwrap()
-                .submit(&storage, Instant::now() + Duration::from_secs(5))
+                .submit(&storage, time::now() + Duration::from_secs(5))
                 .await
                 .and_then(OwnershipEvidence::new)
         };
@@ -1152,7 +1153,7 @@ async fn autoscale_real_guard_failed_ambiguous_expired_and_obsolete_renewals_res
         // Immediate caller handoff, before any decision/recovery read.
         o.autoscale_failed(auto_sample(now, 6000)).unwrap();
         r = storage
-            .load_control(Instant::now() + Duration::from_secs(5))
+            .load_control(time::now() + Duration::from_secs(5))
             .await
             .unwrap()
             .root()
@@ -1200,7 +1201,7 @@ fn autoscale_snapshot_traits_are_closed() {
 
 #[tokio::test]
 async fn autoscale_all_required_members_recover_after_any_freshness_gap() {
-    let t = Instant::now();
+    let t = time::now();
     let (mut o, mut r, b) = auto_healthy(t).await;
     let mut n = r.nodes[0].clone();
     n.node_id = id(60);
@@ -1271,7 +1272,7 @@ async fn autoscale_all_required_members_recover_after_any_freshness_gap() {
 #[tokio::test]
 async fn autoscale_unavailable_members_and_terminal_witnesses_are_not_empty_idle() {
     for state in [NodeState::Starting, NodeState::Lost, NodeState::Stopped] {
-        let t = Instant::now();
+        let t = time::now();
         let (mut o, mut r, _) = auto_healthy(t).await;
         r.nodes[0].state = state;
         next(&mut r);
@@ -1283,7 +1284,7 @@ async fn autoscale_unavailable_members_and_terminal_witnesses_are_not_empty_idle
         );
         assert_eq!(o.autoscale.members.len(), 1);
     }
-    let t = Instant::now();
+    let t = time::now();
     let (mut o, mut r, _) = auto_healthy(t).await;
     let mut stop = r.intents[0].clone();
     stop.request_id = id(80);
@@ -1329,7 +1330,7 @@ async fn autoscale_unavailable_members_and_terminal_witnesses_are_not_empty_idle
 #[tokio::test]
 async fn autoscale_foreign_replaced_capacity_and_backward_time_close_receipts() {
     for case in 0..4 {
-        let t = Instant::now();
+        let t = time::now();
         let (mut o, mut r, b) = auto_healthy(t).await;
         let old = o
             .autoscale_snapshot(&r, auto_owner(), auto_sample(t, 1000))
@@ -1365,7 +1366,7 @@ async fn autoscale_foreign_replaced_capacity_and_backward_time_close_receipts() 
         assert!(!o.matches_autoscale(&old, auto_sample(t, 1000)).unwrap());
     }
     for extra_nano in [false, true] {
-        let t = Instant::now();
+        let t = time::now();
         let (mut o, r, _) = auto_healthy(t).await;
         let now = t + Duration::from_secs(5) + Duration::from_nanos(u64::from(extra_nano));
         assert_eq!(
@@ -1378,7 +1379,7 @@ async fn autoscale_foreign_replaced_capacity_and_backward_time_close_receipts() 
 
 #[tokio::test]
 async fn autoscale_loaded_duplicate_retains_contradiction_check_after_raw_failure() {
-    let t = Instant::now();
+    let t = time::now();
     let (mut o, r, b) = auto_healthy(t).await;
     o.observe(&b, &beat(&b, 3), t).unwrap();
     o.read_failed(&b, t).unwrap();
@@ -1402,7 +1403,7 @@ async fn autoscale_loaded_duplicate_retains_contradiction_check_after_raw_failur
 #[test]
 fn r01_r05_lease_renewal_does_not_postpone_worker_loss() {
     let (mut root, binding) = setup();
-    let now = Instant::now();
+    let now = time::now();
     let expiry = Duration::from_millis(root.timing.expiry_ms);
     let mut observed = Observations::new(id(90), now);
     observed.reconcile_members(&root, now).unwrap();

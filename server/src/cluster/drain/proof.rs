@@ -7,8 +7,8 @@ use crate::cluster::{
     store::OwnershipOutcome,
 };
 use crate::node::auth::{self, PendingReplyChecks, ReplyHandoff, RequestContext, Role, Route};
+use nabedra_rt::time;
 use std::time::Duration;
-use tokio::time::Instant;
 
 // Each entry point is pending C06c/runtime integration, not a public facade.
 #[allow(dead_code)]
@@ -297,7 +297,7 @@ impl ConfirmedDrain {
             .sampled_at()
             .checked_add(Duration::from_millis(root.timing.expiry_ms))
             .ok_or(StorageError::LimitExceeded)?;
-        require(Instant::now() < deadline)?;
+        require(time::now() < deadline)?;
         let observation = OwnershipObservation::new(&root)?;
         Ok(Self {
             proof,
@@ -329,7 +329,7 @@ impl ConfirmedDrain {
             .sampled_at()
             .checked_add(Duration::from_millis(root.timing.expiry_ms))
             .ok_or(StorageError::LimitExceeded)?;
-        require(Instant::now() < end)
+        require(time::now() < end)
     }
     /// Call at every local use boundary. Failure consumes the proof so a later
     /// zero cannot restore it. Observations retains its own failure high-water.

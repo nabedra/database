@@ -4,18 +4,15 @@ use crate::cluster::{
 };
 use crate::storage::{Namespace, Storage};
 use crate::test_storage as support;
+use nabedra_rt::{ids, time};
 use serde_json::{Value, json};
-use std::{
-    fs,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::{fs, path::PathBuf, time::Duration};
 use support::Fake;
 const KEY: &str = "test/cluster/control.json";
 pub(in crate::cluster) struct Fixture(pub(in crate::cluster) PathBuf);
 impl Fixture {
     pub(in crate::cluster) fn new() -> Self {
-        let f = Self(std::env::temp_dir().join(format!("nabedra-attach-{}", uuid::Uuid::new_v4())));
+        let f = Self(std::env::temp_dir().join(format!("nabedra-attach-{}", ids::uuid_v4())));
         fs::create_dir(&f.0).unwrap();
         f.write("auth", serde_json::to_vec(&json!({"admin_token":"A".repeat(43),"data_token":"D".repeat(43),"enrollment_token":"E".repeat(43)})).unwrap());
         f.write("token", b"owned-token\n");
@@ -37,7 +34,7 @@ impl Fixture {
         self.write("api.json", serde_json::to_vec(value).unwrap());
         prepare_api(
             &self.0.join("api.json"),
-            Instant::now() + Duration::from_secs(30),
+            time::now_std() + Duration::from_secs(30),
         )
         .unwrap()
         .connect()
@@ -50,11 +47,11 @@ impl Drop for Fixture {
     }
 }
 pub(in crate::cluster) fn deadline() -> tokio::time::Instant {
-    tokio::time::Instant::now() + Duration::from_secs(5)
+    time::now() + Duration::from_secs(5)
 }
 pub(in crate::cluster) fn candidate(local: &ApiReady, managed: bool) -> Control {
     let template = &local.prepared.input.value.template;
-    Control::decode(&serde_json::to_vec(&json!({"version":1,"cluster_id":local.prepared.input.value.cluster_id,"name":"Fleet_1","config":{"generation":2,"storage_fingerprint":local.backend.storage.as_str(),"auth_fingerprint":local.authentication.as_str(),"template_fingerprint":template.fingerprint().unwrap(),"lifecycle_fingerprint":local.lifecycle.as_str(),"worker_semantic_fingerprint":local.backend.worker.as_str(),"adapter_contract":if managed {Some("meshdb.callbacks.v1")} else {None}},"provisioning":if managed {"managed"} else {"external"},"template":template,"timing":Timing::default(),"revision":1,"change_id":uuid::Uuid::new_v4(),"policy":{"revision":1,"mode":"fixed","desired":0,"min_nodes":0,"max_nodes":0},"controller":{"owner_id":null,"epoch":0,"lease_state":"released","lease_until_ms":null},"scheduler":{"cooldown_until_ms":0,"backoff_until_ms":0,"failures":0,"low_since_ms":null},"admin_seq":0,"admin_head":null,"nodes":[],"intents":[]})).unwrap()).unwrap()
+    Control::decode(&serde_json::to_vec(&json!({"version":1,"cluster_id":local.prepared.input.value.cluster_id,"name":"Fleet_1","config":{"generation":2,"storage_fingerprint":local.backend.storage.as_str(),"auth_fingerprint":local.authentication.as_str(),"template_fingerprint":template.fingerprint().unwrap(),"lifecycle_fingerprint":local.lifecycle.as_str(),"worker_semantic_fingerprint":local.backend.worker.as_str(),"adapter_contract":if managed {Some("meshdb.callbacks.v1")} else {None}},"provisioning":if managed {"managed"} else {"external"},"template":template,"timing":Timing::default(),"revision":1,"change_id":ids::uuid_v4(),"policy":{"revision":1,"mode":"fixed","desired":0,"min_nodes":0,"max_nodes":0},"controller":{"owner_id":null,"epoch":0,"lease_state":"released","lease_until_ms":null},"scheduler":{"cooldown_until_ms":0,"backoff_until_ms":0,"failures":0,"low_since_ms":null},"admin_seq":0,"admin_head":null,"nodes":[],"intents":[]})).unwrap()).unwrap()
 }
 pub(in crate::cluster) fn store(root: Option<&Control>) -> Storage<Fake> {
     let f = Fake::default();
@@ -79,10 +76,10 @@ async fn preserves_loaded_noninitial_root_with_relocated_material() {
     root.policy.min_nodes = 2;
     root.policy.max_nodes = 2;
     root.admin_seq = 2;
-    root.admin_head = Some(uuid::Uuid::new_v4());
+    root.admin_head = Some(ids::uuid_v4());
     root.scheduler.failures = 7;
     root.scheduler.backoff_until_ms = 800;
-    root.controller.owner_id = Some(uuid::Uuid::new_v4());
+    root.controller.owner_id = Some(ids::uuid_v4());
     root.controller.epoch = 3;
     root.controller.lease_state = crate::cluster::state::LeaseState::Held;
     root.controller.lease_until_ms = Some(900);
@@ -119,7 +116,7 @@ async fn incompatible_create_winner_is_never_reset_or_recreated() {
     let initial = candidate(&local, true);
     let mut winner = initial.clone();
     winner.name = "Other".into();
-    winner.change_id = uuid::Uuid::new_v4();
+    winner.change_id = ids::uuid_v4();
     let bytes = winner.encode().unwrap();
     let s = store(None);
     s.backend().state.lock().unwrap().race = Some(bytes.clone());
@@ -144,7 +141,7 @@ async fn real_initialization_existing_and_race_use_one_comparison() {
         let initial = candidate(&local, true);
         let s = store(None);
         let mut winner = initial.clone();
-        winner.change_id = uuid::Uuid::new_v4();
+        winner.change_id = ids::uuid_v4();
         winner.policy.desired = 3;
         winner.policy.min_nodes = 3;
         winner.policy.max_nodes = 3;
@@ -235,12 +232,9 @@ async fn real_decode_failures_and_storage_failures_have_fixed_categories() {
         "storage_unavailable"
     );
     assert_eq!(
-        control_result(
-            s.initialize_control(&initial, tokio::time::Instant::now())
-                .await
-        )
-        .unwrap_err()
-        .to_string(),
+        control_result(s.initialize_control(&initial, time::now()).await)
+            .unwrap_err()
+            .to_string(),
         "storage_unavailable"
     );
 }
@@ -251,7 +245,7 @@ async fn independently_rejects_local_and_stored_semantic_changes() {
     let s = store(Some(&root));
     let loaded = s.load_control(deadline()).await.unwrap();
     for (pointer, value) in [
-        ("/cluster_id", json!(uuid::Uuid::new_v4())),
+        ("/cluster_id", json!(ids::uuid_v4())),
         ("/api_urls", json!(["http://different.invalid:8000"])),
         ("/worker/listen", json!("worker:8002")),
         ("/worker/operation_slots", json!(5)),
@@ -466,7 +460,7 @@ async fn foreign_hints_never_read_and_tls_uses_retained_material() {
     let (_, attempts) = observe_reads(|| {
         prepare_api(
             &foreign.join("api.json"),
-            Instant::now() + Duration::from_secs(5),
+            time::now_std() + Duration::from_secs(5),
         )
     });
     assert_eq!(attempts, vec![foreign.join("api.json")]);
@@ -503,7 +497,7 @@ async fn callback_enrollment_retains_material_and_checks_immutable_root() {
     for kind in 0..7 {
         let mut changed = root.clone();
         match kind {
-            0 => changed.cluster_id = uuid::Uuid::new_v4(),
+            0 => changed.cluster_id = ids::uuid_v4(),
             1 => changed.name = "Other".into(),
             2 => changed.config.auth_fingerprint = "0".repeat(64),
             3 => changed.template.listen = "other:1".into(),

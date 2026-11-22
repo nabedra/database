@@ -4,7 +4,9 @@ use crate::storage::{
     ControlDecision, MAX_CONTROL_BODY_BYTES, MAX_CONTROL_DECISION_BYTES, ObjectKey, ObjectStore,
     Storage, StorageError,
 };
-use tokio::time::{Duration, Instant, timeout_at};
+use nabedra_rt::time;
+use nabedra_rt::time::timeout_at;
+use tokio::time::{Duration, Instant};
 use uuid::Uuid;
 
 const MAX_RECORDS: usize = 4096;
@@ -21,7 +23,7 @@ pub(crate) struct AdminHistoryBudget {
 #[allow(dead_code)]
 impl AdminHistoryBudget {
     pub(crate) fn new(caller_deadline: Instant) -> Result<Self, StorageError> {
-        let now = Instant::now();
+        let now = time::now();
         let cap = now
             .checked_add(Duration::from_secs(5))
             .ok_or(StorageError::Unavailable)?;
@@ -35,7 +37,7 @@ impl AdminHistoryBudget {
         self.deadline
     }
     fn check_deadline(&self) -> Result<(), StorageError> {
-        if Instant::now() >= self.deadline {
+        if time::now() >= self.deadline {
             Err(StorageError::Unavailable)
         } else {
             Ok(())

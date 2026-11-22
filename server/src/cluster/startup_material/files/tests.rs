@@ -1,9 +1,10 @@
 use super::*;
+use nabedra_rt::{ids, time};
 use std::{fs, time::Duration};
 struct TempDir(std::path::PathBuf);
 impl TempDir {
     fn new() -> std::io::Result<Self> {
-        let path = std::env::temp_dir().join(format!("nabedra-material-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("nabedra-material-{}", ids::uuid_v4()));
         fs::create_dir(&path)?;
         Ok(Self(path))
     }
@@ -19,7 +20,7 @@ impl Drop for TempDir {
 fn reader(dir: &Path) -> Reader {
     Reader::new(
         &dir.join("input.json"),
-        Instant::now() + Duration::from_secs(30),
+        time::now_std() + Duration::from_secs(30),
     )
     .unwrap()
 }
@@ -34,7 +35,7 @@ fn literal_paths_bounded_reads_and_deadlines() {
             .read("$literal ~ space", 3, false)
             .is_err()
     );
-    let mut expired = Reader::new(&dir.path().join("input"), Instant::now()).unwrap();
+    let mut expired = Reader::new(&dir.path().join("input"), time::now_std()).unwrap();
     assert!(expired.read("$literal ~ space", 4, false).is_err());
 }
 #[cfg(unix)]
@@ -75,7 +76,7 @@ fn protected_targets_and_preopen_swap() {
     symlink(other.path().join("config"), dir.path().join("input")).unwrap();
     let r = Reader::new(
         &dir.path().join("input"),
-        Instant::now() + Duration::from_secs(5),
+        time::now_std() + Duration::from_secs(5),
     )
     .unwrap();
     assert_eq!(r.base, dir.path());
@@ -91,11 +92,11 @@ fn protected_targets_and_preopen_swap() {
     );
     let mut r = Reader::new(
         &dir.path().join("input"),
-        Instant::now() + Duration::from_millis(5),
+        time::now_std() + Duration::from_millis(5),
     )
     .unwrap();
     assert_eq!(
-        r.read_with("grow", 10, false, || std::thread::sleep(
+        r.read_with("grow", 10, false, || time::thread_sleep(
             Duration::from_millis(15)
         ))
         .unwrap_err(),
@@ -219,7 +220,7 @@ fn run_child(mut command: std::process::Command) {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let status = wait_child(&mut child, Instant::now() + Duration::from_secs(90))
+    let status = wait_child(&mut child, time::now_std() + Duration::from_secs(90))
         .expect("synthetic fixture preparation failed or timed out");
     assert!(status.success(), "synthetic fixture preparation failed");
 }
@@ -233,10 +234,10 @@ fn wait_child(
             Err(error) => break Err(error),
             Ok(None) => (),
         }
-        if Instant::now() >= deadline {
+        if time::now_std() >= deadline {
             break Err(std::io::ErrorKind::TimedOut.into());
         }
-        std::thread::sleep(Duration::from_millis(20));
+        time::thread_sleep(Duration::from_millis(20));
     };
     if result.is_err() {
         // The handle is still owned and has not been reaped on this path.
@@ -275,7 +276,7 @@ fn fixture_timeout_reaps_its_direct_child() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let result = wait_child(&mut child, Instant::now());
+    let result = wait_child(&mut child, time::now_std());
     let reaped = child.try_wait().unwrap().is_some();
     assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     assert!(reaped);

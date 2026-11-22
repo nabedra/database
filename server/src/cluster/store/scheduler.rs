@@ -4,6 +4,7 @@ use crate::cluster::{
     controller::Owner,
     member::{NodeState, Registration},
 };
+use nabedra_rt::ids;
 pub(crate) struct PreparedScheduler {
     base: LoadedControl,
     candidate: Control,
@@ -52,7 +53,7 @@ impl PreparedScheduler {
             .revision
             .checked_add(1)
             .ok_or(StorageError::LimitExceeded)?;
-        candidate.change_id = Uuid::new_v4();
+        candidate.change_id = ids::uuid_v4();
         let bytes = candidate.encode().map_err(control_error)?;
         Ok(Self {
             base,

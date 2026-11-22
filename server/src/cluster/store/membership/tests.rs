@@ -9,6 +9,7 @@ use crate::{
     storage::{Download, Namespace},
     test_storage::{Fake, ReadGate},
 };
+use nabedra_rt::{task, time};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -24,7 +25,7 @@ fn owner() -> Owner {
     }
 }
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(5)
+    time::now() + Duration::from_secs(5)
 }
 fn root() -> Control {
     let mut v = super::super::tests::root();
@@ -103,7 +104,7 @@ impl ObjectStore for Backend {
             let fake = self.fake.clone();
             let key = key.to_owned();
             let token = token.to_owned();
-            *self.pending_task.lock().unwrap() = Some(tokio::spawn(async move {
+            *self.pending_task.lock().unwrap() = Some(task::spawn(async move {
                 hold(g).await;
                 fake.put(&key, bytes, WriteCondition::Match(&token)).await
             }));
@@ -132,7 +133,7 @@ fn counts(s: &Storage<Backend>) -> (usize, usize) {
     (f.puts, f.gets)
 }
 async fn entered(g: &ReadGate) -> bool {
-    match tokio::time::timeout(Duration::from_secs(5), g.entered.acquire()).await {
+    match time::timeout(Duration::from_secs(5), g.entered.acquire()).await {
         Ok(Ok(p)) => {
             p.forget();
             true
@@ -141,7 +142,7 @@ async fn entered(g: &ReadGate) -> bool {
     }
 }
 async fn finish<T>(mut t: tokio::task::JoinHandle<T>) -> T {
-    match tokio::time::timeout(Duration::from_secs(5), &mut t).await {
+    match time::timeout(Duration::from_secs(5), &mut t).await {
         Ok(r) => r.unwrap(),
         Err(_) => {
             t.abort();
@@ -236,7 +237,7 @@ async fn committed_reply_loss_exact_or_later_root_and_binding_retry() {
         *s.backend().after.lock().unwrap() = Some(g.clone());
         let t = {
             let s = s.clone();
-            tokio::spawn(async move { p.submit(&s, deadline()).await })
+            task::spawn(async move { p.submit(&s, deadline()).await })
         };
         let reached = entered(&g).await;
         if reached && later {
@@ -336,7 +337,7 @@ async fn gated_registration_and_readiness_lose_to_takeover_drain_or_replacement(
         *s.backend().before.lock().unwrap() = Some(g.clone());
         let t = {
             let s = s.clone();
-            tokio::spawn(async move { p.submit(&s, deadline()).await })
+            task::spawn(async move { p.submit(&s, deadline()).await })
         };
         let reached = entered(&g).await;
         let competing = if reached {
@@ -380,7 +381,7 @@ async fn reconciliation_failures_and_equal_uuid_unequal_contents_remain_unknown(
         s.backend().fake.state.lock().unwrap().read_gate = Some(g.clone());
         let t = {
             let s = s.clone();
-            tokio::spawn(async move { p.submit(&s, deadline()).await })
+            task::spawn(async move { p.submit(&s, deadline()).await })
         };
         let reached = entered(&g).await;
         if reached {
@@ -465,7 +466,7 @@ async fn expired_before_submission_is_definite_and_performs_no_write() {
     let base = s.load_control(deadline()).await.unwrap();
     let p = PreparedMembership::prepare(base, candidate(&c, 10)).unwrap();
     assert_eq!(
-        p.submit(&s, Instant::now()).await.unwrap_err(),
+        p.submit(&s, time::now()).await.unwrap_err(),
         StorageError::Unavailable
     );
     assert_eq!(counts(&s), (0, 1));
