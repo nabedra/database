@@ -1,0 +1,92 @@
+import contextlib
+import io
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import insn_count
+
+
+class InstructionCountTests(unittest.TestCase):
+    def test_parse_single_ir_summary(self):
+        profile = "version: 1\nevents: Ir\nsummary: 10342\nfn=(1) main\ntotals: 10342\n"
+        self.assertEqual(insn_count.instruction_count(profile), 10342)
+
+    def test_reject_missing_ambiguous_or_nonpositive_counts(self):
+        for profile in (
+            "events: Ir\ntotals: 2",
+            "events: Ir Dr\nsummary: 2 3",
+            "events: Ir\nsummary: 2\nsummary: 3",
+            "events: Ir\nsummary: -1",
+            "events: Ir\nsummary: invalid",
+        ):
+            with self.subTest(profile=profile), self.assertRaises(ValueError):
+                insn_count.instruction_count(profile)
+
+    def test_uses_medians_and_fails_strictly_above_half_percent(self):
+        base = [10000, 10001, 9999]
+        row = insn_count.compare(base, [10050, 10051, 10049], 100)
+        self.assertEqual(row["base_per_op"], 100)
+        self.assertEqual(row["head_per_op"], 100.5)
+        self.assertFalse(row["regression"])
+        self.assertTrue(insn_count.compare(base, [10051] * 3, 100)["regression"])
+        self.assertFalse(insn_count.compare(base, [9900] * 3, 100)["regression"])
+
+    def test_uses_three_times_base_spread_when_larger(self):
+        base = [990, 1000, 1010]
+        row = insn_count.compare(base, [1050, 1051, 1049], 10)
+        self.assertEqual(row["noise_pct"], 2)
+        self.assertEqual(row["threshold_pct"], 6)
+        self.assertFalse(row["regression"])
+        self.assertTrue(insn_count.compare(base, [1061] * 3, 10)["regression"])
+
+    def test_measure_rejects_wrong_completed_operation_count_and_cleans_up(self):
+        workload = insn_count.WORKLOADS[0]
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch) / "run"
+            with patch.object(insn_count, "run", return_value="nabedra-insn-count: oltp-storage 0"):
+                with self.assertRaisesRegex(ValueError, "expected .*oltp-storage 512"):
+                    insn_count.measure("valgrind", Path("/binary"), workload, directory)
+            self.assertFalse(directory.exists())
+
+    def test_cleanup_after_profiler_timeout(self):
+        workload = insn_count.WORKLOADS[0]
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch) / "run"
+            with patch.object(insn_count, "run", side_effect=subprocess.TimeoutExpired("valgrind", 180)):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    insn_count.measure("valgrind", Path("/binary"), workload, directory)
+            self.assertFalse(directory.exists())
+
+    def test_one_regression_fails_even_if_another_workload_passes(self):
+        counts = (
+            ("cache-set", {"base": [10000] * 3, "head": [10051] * 3}),
+            ("olap-queue", {"base": [10000] * 3, "head": [10000] * 3}),
+        )
+        output = io.StringIO()
+        with (
+            patch.object(insn_count.shutil, "which", return_value="/tool"),
+            patch.object(insn_count, "revision", side_effect=["base-sha", "head-sha"]),
+            patch.object(insn_count, "run", return_value="valgrind-3.26.0"),
+            patch.object(insn_count, "benchmark", return_value=counts),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(insn_count.main(["--base", "main", "--head", "topic"]), 1)
+        self.assertIn("FAIL cache-set:", output.getvalue())
+        self.assertIn("PASS olap-queue:", output.getvalue())
+
+    def test_missing_valgrind_requires_explicit_skip(self):
+        with (
+            patch.object(insn_count.shutil, "which", return_value=None),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            args = ["--base", "main", "--head", "topic"]
+            self.assertEqual(insn_count.main(args), 2)
+            self.assertEqual(insn_count.main([*args, "--skip-missing-valgrind"]), 0)
+        self.assertIn(insn_count.MISSING_COUNTER, output.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()
