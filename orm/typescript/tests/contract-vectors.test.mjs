@@ -17,6 +17,11 @@ async function runOlap(url, action, input) {
       assert.equal(await table.insert({ id: input.insert_id, age: BigInt(input.insert_age), active: true }), undefined)
       return null
     }
+    if (action === "collect_defaults") {
+      // Omitted optional arguments pin each ORM's runtime defaults on the wire.
+      const rows = await table.where().select("id", "age").orderBy("age").collect()
+      return rows.map(row => ({ ...row, age: bigintText(row.age) }))
+    }
     const query = table.where(col("age").ge(BigInt(input.minimum_age)), { active: true })
       .select("id", "age").orderBy("age", true).limit(input.limit)
     if (action === "collect") return (await query.collect()).map(row => ({ ...row, age: bigintText(row.age) }))
@@ -53,8 +58,8 @@ async function runEvents(url, action, input) {
   }
   const lease = await client.subscription(input.topic, input.subscription, { partition: input.partition })
     .claim({ claimId: input.claim_id })
-  const page = await lease.poll({ limit: input.limit })
-  if (action === "poll") {
+  const page = action === "poll_defaults" ? await lease.poll() : await lease.poll({ limit: input.limit })
+  if (action === "poll" || action === "poll_defaults") {
     return { after: bigintText(page.after), events: page.events.map(eventResult), delivery: page.delivery }
   }
   if (action === "ack") return bigintText(await lease.ack(page, { through: BigInt(input.through) }))

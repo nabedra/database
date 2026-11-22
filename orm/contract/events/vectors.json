@@ -111,6 +111,41 @@
         "body": "{\"offset\":\"9007199254740993\"}"
       },
       "result": "9007199254740993"
+    },
+    "poll_defaults": {
+      "setup": [
+        "claim"
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/v1/topics/orders/partitions/4/subscriptions/audit/events?limit=100",
+        "body": "",
+        "headers": {
+          "authorization": "Bearer fixture",
+          "x-events-lease": "fixture.lease"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": "{\"after\":\"9007199254740992\",\"events\":[{\"topic_id\":\"00000000-0000-0000-0000-000000000001\",\"partition\":4,\"offset\":\"9007199254740993\",\"event_id\":\"00000000-0000-0000-0000-000000000002\",\"published_at\":\"2026-11-17T12:00:00Z\",\"data\":{\"active\":true,\"item\":\"雪\"}}],\"delivery\":\"fixture.delivery\"}"
+      },
+      "result": {
+        "after": "9007199254740992",
+        "events": [
+          {
+            "topic_id": "00000000-0000-0000-0000-000000000001",
+            "partition": 4,
+            "offset": "9007199254740993",
+            "event_id": "00000000-0000-0000-0000-000000000002",
+            "published_at": "2026-11-17T12:00:00Z",
+            "data": {
+              "active": true,
+              "item": "雪"
+            }
+          }
+        ],
+        "delivery": "fixture.delivery"
+      }
     }
   },
   "cases": [
@@ -121,6 +156,10 @@
     {
       "name": "poll decodes a contiguous page",
       "operation": "poll"
+    },
+    {
+      "name": "poll without a limit requests the shared default page",
+      "operation": "poll_defaults"
     },
     {
       "name": "empty poll retains its checkpoint",

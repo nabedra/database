@@ -109,12 +109,41 @@
         "body": "{\"request_id\":\"@request_id\",\"data\":null}"
       },
       "result": null
+    },
+    "collect_defaults": {
+      "setup": [
+        "describe"
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/v1/operations",
+        "body": "{\"request_id\":\"@request_id\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000010\",\"query\":{\"select\":[\"id\",\"age\"],\"filter\":null,\"order_by\":{\"column\":\"age\",\"desc\":false},\"limit\":null}}}",
+        "headers": {
+          "authorization": "Bearer fixture",
+          "x-nabedra-database": "analytics-v1",
+          "content-type": "application/json"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"@request_id\",\"data\":[{\"id\":\"雪\",\"age\":9223372036854775807}]}"
+      },
+      "result": [
+        {
+          "id": "雪",
+          "age": "9223372036854775807"
+        }
+      ]
     }
   },
   "cases": [
     {
       "name": "projected rows preserve int64 and Unicode",
       "operation": "collect"
+    },
+    {
+      "name": "omitted query options use the shared defaults",
+      "operation": "collect_defaults"
     },
     {
       "name": "count respects the query limit",

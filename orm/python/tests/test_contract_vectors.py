@@ -52,6 +52,10 @@ def run_olap(url, action, inputs):
         table = db.table(inputs["table"])
         if action == "insert":
             return table.insert({"id": inputs["insert_id"], "age": int(inputs["insert_age"]), "active": True})
+        if action == "collect_defaults":
+            # Omitted optional arguments pin each ORM's runtime defaults on the wire.
+            rows = table.where().select("id", "age").order_by("age").collect()
+            return [{**row, "age": integer_text(row["age"])} for row in rows]
         query = (table.where(col("age") >= int(inputs["minimum_age"]), active=True)
                  .select("id", "age").order_by("age", True).limit(inputs["limit"]))
         if action == "collect":
@@ -83,8 +87,8 @@ def run_events(url, action, inputs):
                                            event_id=inputs["event_id"], data=inputs["data"]))
     lease = client.subscription(inputs["topic"], inputs["subscription"],
                                 partition=inputs["partition"]).claim(claim_id=inputs["claim_id"])
-    page = lease.poll(limit=inputs["limit"])
-    if action == "poll":
+    page = lease.poll() if action == "poll_defaults" else lease.poll(limit=inputs["limit"])
+    if action in ("poll", "poll_defaults"):
         return {"after": integer_text(page.after), "events": list(map(event_result, page.events)),
                 "delivery": page.delivery}
     if action == "ack":
