@@ -550,6 +550,17 @@ async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
         assert_eq!(final_members.len(), 3);
         assert!(final_members.iter().any(|member| member.node_id == 4));
         assert!(!final_members.iter().any(|member| member.node_id == removed));
+        // O16/O26 (REP6 merge regression): a same-ID move's source replica
+        // retires only after applying this membership, so the final
+        // membership keeps the removed voter as a learner the leader still
+        // replicates to. System replacement and NS14 repair drop theirs.
+        {
+            let metrics = hosts[leader].raft.metrics();
+            let metrics = metrics.borrow_watched();
+            let membership = metrics.membership_config.membership();
+            assert!(membership.nodes().any(|(node, _)| *node == removed));
+            assert!(!membership.voter_ids().any(|node| node == removed));
+        }
         let target_metrics = hosts[3]
             .raft
             .wait(Some(Duration::from_secs(10)))
@@ -611,7 +622,7 @@ async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
         let saved: serde_json::Value = serde_json::from_slice(saved.as_slice()).unwrap();
         assert_eq!(saved["authority"], serde_json::to_value(authority).unwrap());
         let replay = hosts[leader]
-            .reconcile_voter_replacement(&expected, &final_members, &peers[&4], removed, None)
+            .reconcile_voter_replacement(&expected, &final_members, &peers[&4], removed, None, true)
             .await
             .unwrap();
         assert_eq!(replay.replicas(), final_members.as_ref());
@@ -622,7 +633,8 @@ async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
                     &final_members,
                     &peers[&4],
                     leader as u64 + 1,
-                    None
+                    None,
+                    true,
                 )
                 .await
                 .is_err(),

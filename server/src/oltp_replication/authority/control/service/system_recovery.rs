@@ -4,7 +4,8 @@ use crate::oltp_replication::{
         ReplacementGroup, ReplacementIntent, ReplacementMountProof, ReplacementRecord,
         SystemRecoveryCommand,
         machine::system_recovery::{
-            ACTIVATION, ACTIVE, EXECUTION, by_id, by_worker, published, revoked_id,
+            ACTIVATION, ACTIVE, DEFERRED_DATA, EXECUTION, HARDENING, abandoned, by_id, by_worker,
+            published, revoked_id,
         },
     },
     manager::{HostedGroupManager, ManagedControl},
@@ -35,8 +36,11 @@ impl ControlHandle {
             operation_id,
             machine::hash(b"enable-system-replacement"),
         )?;
-        if let Some(position) = self.system_replacement_execution().await? {
-            return Ok(position);
+        if let Some(position) = self.replacement_capability(HARDENING).await? {
+            return Ok(self
+                .system_replacement_execution()
+                .await?
+                .unwrap_or(position));
         }
         let running = manager.local_control(self.identity())?;
         let stable = running.observe_stable_membership().await?;
@@ -66,7 +70,7 @@ impl ControlHandle {
             let identity = WorkerIdentity::from(&identity);
             if identity.worker_id != permit.local.worker_id {
                 manager
-                    .verify_recovery_execution(self.identity(), identity)
+                    .verify_recovery_hardening(self.identity(), identity)
                     .await?;
             } else if identity != permit.local {
                 return Err(stale());
@@ -74,7 +78,7 @@ impl ControlHandle {
             voters.push(identity);
         }
         let voters: [WorkerIdentity; 3] = voters.try_into().map_err(|_| stale())?;
-        let evidence = serialized_digest(&(&group, voters, state.enrollment_revision, true))?;
+        let evidence = serialized_digest(&(&group, voters, state.enrollment_revision, true, true))?;
         let authorization = self.local_operator(permit, operation_id, evidence)?;
         // The same local leader writes the activation entry. Recheck the
         // committed configuration after gathering the authenticated adverts.
@@ -89,6 +93,7 @@ impl ControlHandle {
                 SystemRecoveryCommand::Enable {
                     group: Box::new(group),
                     execution: true,
+                    hardening: true,
                     voters,
                     enrollment_revision: state.enrollment_revision,
                     authorization,
@@ -96,7 +101,53 @@ impl ControlHandle {
             )
             .await?;
         match reply {
-            ControlReply::SystemReplacementEnabled(position) => Ok(position),
+            ControlReply::SystemReplacementEnabled(position) => Ok(self
+                .system_replacement_execution()
+                .await?
+                .unwrap_or(position)),
+            _ => Err(stale()),
+        }
+    }
+
+    pub(crate) async fn abandon_system_replacement(
+        &self,
+        manager: &HostedGroupManager,
+        permit: &LocalOperatorPermit,
+        operation_id: Uuid,
+        id: Uuid,
+    ) -> Result<(), ProtocolError> {
+        let authorization = self.local_operator(
+            permit,
+            operation_id,
+            serialized_digest(&(b"abandon-system-replacement".as_slice(), id))?,
+        )?;
+        if self.replacement_capability(HARDENING).await?.is_none() {
+            return Err(ProtocolError::new(
+                ErrorCode::UnsupportedOperation,
+                "enable control.system-replacement.hardening.v1 first",
+                Outcome::NotApplied,
+            ));
+        }
+        let running = manager.local_control(self.identity())?;
+        match self
+            .propose_system_recovery(
+                &running,
+                operation_id,
+                SystemRecoveryCommand::Abandon { id, authorization },
+            )
+            .await?
+        {
+            ControlReply::SystemReplacementAbandoned => Ok(()),
+            ControlReply::Rejected(Fault::Conflict) => Err(ProtocolError::new(
+                ErrorCode::Conflict,
+                "replacement mount already committed",
+                Outcome::NotApplied,
+            )),
+            ControlReply::Rejected(Fault::NotFound) => Err(ProtocolError::new(
+                ErrorCode::NotFound,
+                "replacement intent was not found",
+                Outcome::NotApplied,
+            )),
             _ => Err(stale()),
         }
     }
@@ -108,7 +159,10 @@ impl ControlHandle {
         let raw = self
             .read(move |view| {
                 let record = if let Some(id) = load::<Uuid>(view, &by_worker(worker))? {
-                    Some(load::<ReplacementRecord>(view, &by_id(id))?.ok_or_else(stale)?)
+                    let record = load::<ReplacementRecord>(view, &by_id(id))?.ok_or_else(stale)?;
+                    (record.intent.run_id == state(view)?.ready.view.run_id
+                        || view.get(&revoked_id(worker))?.is_some())
+                    .then_some(record)
                 } else {
                     None
                 };
@@ -187,29 +241,85 @@ impl ControlHandle {
         manager: &HostedGroupManager,
         next: WorkerIdentity,
     ) -> Result<(), ProtocolError> {
-        if !self
-            .registered_directory
-            .get()
-            .is_some_and(|directory| directory.replacement_capability_active())
-        {
+        if self.registered_directory.get().is_none() {
             return Ok(());
         }
-        if self.system_replacement_execution().await?.is_some() {
+        let raw = self
+            .read(|view| {
+                let hardening = view.get(HARDENING)?.is_some();
+                let execution = view.get(EXECUTION)?.is_some();
+                let preparation = view.get(ACTIVATION)?.is_some();
+                view.encode(&(hardening, execution, preparation))
+            })
+            .await?;
+        let (hardening, execution, preparation): (bool, bool, bool) =
+            machine::decode(raw.as_ref())?;
+        if hardening {
+            manager
+                .verify_recovery_hardening(self.identity(), next)
+                .await
+        } else if execution {
             manager
                 .verify_recovery_execution(self.identity(), next)
                 .await
-        } else {
+        } else if preparation {
             manager
                 .verify_recovery_capability(self.identity(), next)
                 .await
+        } else {
+            Ok(())
         }
     }
 
     async fn system_replacement_execution(&self) -> Result<Option<AppliedPosition>, ProtocolError> {
+        self.replacement_capability(EXECUTION).await
+    }
+
+    pub(crate) async fn replacement_hardening_active(&self) -> Result<bool, ProtocolError> {
+        Ok(self.replacement_capability(HARDENING).await?.is_some())
+    }
+
+    async fn replacement_capability(
+        &self,
+        key: &'static [u8],
+    ) -> Result<Option<AppliedPosition>, ProtocolError> {
         let raw = self
-            .read(|view| {
-                let activation = load::<AppliedPosition>(view, EXECUTION)?;
+            .read(move |view| {
+                let activation = load::<AppliedPosition>(view, key)?;
                 view.encode(&activation)
+            })
+            .await?;
+        machine::decode(raw.as_ref())
+    }
+
+    pub(crate) async fn check_replacement_mount(
+        &self,
+        proof: &ReplacementMountProof,
+    ) -> Result<bool, ProtocolError> {
+        let proof = proof.clone();
+        let scope = self.identity().clone();
+        let raw = self
+            .read(move |view| {
+                let record =
+                    load::<ReplacementRecord>(view, &by_id(proof.id))?.ok_or_else(unauthorized)?;
+                if view.get(&abandoned(proof.id))?.is_some()
+                    || record.intent.run_id != state(view)?.ready.view.run_id
+                    || proof.verify(&scope, &record).is_err()
+                {
+                    return Err(unauthorized());
+                }
+                let mounted = view
+                    .get(&revoked_id(record.intent.previous.worker_id))?
+                    .is_some();
+                if mounted
+                    && load::<WorkerRecord>(view, &machine::key(WORKERS, proof.worker.worker_id))?
+                        .is_none_or(|worker| {
+                            WorkerIdentity::from(&worker.enrollment) != proof.worker
+                        })
+                {
+                    return Err(unauthorized());
+                }
+                view.encode(&mounted)
             })
             .await?;
         machine::decode(raw.as_ref())
@@ -223,7 +333,9 @@ impl ControlHandle {
             .machine
             .store()
             .read_metadata(BUDGET, move |view| {
-                let record = if let Some(record) = load::<ReplacementRecord>(view, &by_id(id))? {
+                let record = if view.get(&abandoned(id))?.is_none()
+                    && let Some(record) = load::<ReplacementRecord>(view, &by_id(id))?
+                {
                     let mounted = view
                         .get(&revoked_id(record.intent.previous.worker_id))?
                         .is_some();
@@ -262,6 +374,43 @@ impl ControlHandle {
         machine::decode(raw.as_ref())
     }
 
+    pub(crate) async fn queue_lost_data_repairs(
+        &self,
+        running: &ManagedControl,
+        permit: &LocalOperatorPermit,
+    ) -> Result<(), ProtocolError> {
+        let raw = self
+            .read(|view| {
+                let cursor = load::<Option<Uuid>>(view, DEFERRED_DATA)?;
+                view.encode(&(cursor.is_some(), cursor.flatten()))
+            })
+            .await?;
+        let (pending, after): (bool, Option<Uuid>) = machine::decode(raw.as_ref())?;
+        if !pending {
+            return Ok(());
+        }
+        let operation_id = Uuid::new_v4();
+        let authorization = self.local_operator(
+            permit,
+            operation_id,
+            serialized_digest(&(b"queue-lost-data".as_slice(), after))?,
+        )?;
+        match self
+            .propose_system_recovery(
+                running,
+                operation_id,
+                SystemRecoveryCommand::QueueLostData {
+                    after,
+                    authorization,
+                },
+            )
+            .await?
+        {
+            ControlReply::SystemReplacementDataQueued => Ok(()),
+            _ => Err(stale()),
+        }
+    }
+
     pub(crate) async fn mount_system_replacement(
         &self,
         running: &ManagedControl,
@@ -283,6 +432,16 @@ impl ControlHandle {
         {
             ControlReply::SystemReplacementMounted => Ok(()),
             ControlReply::Rejected(Fault::Unauthorized) => Err(unauthorized()),
+            ControlReply::Rejected(Fault::Conflict) => Err(ProtocolError::new(
+                ErrorCode::Conflict,
+                "replacement mount already committed",
+                Outcome::NotApplied,
+            )),
+            ControlReply::Rejected(Fault::Busy) => Err(ProtocolError::new(
+                ErrorCode::UnsupportedOperation,
+                "replacement revocation capacity exhausted",
+                Outcome::NotApplied,
+            )),
             _ => Err(unavailable("system replacement mount or inventory changed")),
         }
     }

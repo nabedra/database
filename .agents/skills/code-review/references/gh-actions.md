@@ -48,7 +48,7 @@ The workflow is `.github/workflows/nabedra-build.yml`. Its dispatch inputs:
 | `sha` (required) | Full 40-character commit to test. It must be pushed. |
 | `request_id` (required) | Your request ID, shown in the run name. |
 | `base` (default true) | kv (clippy, tests), features (O02, NS26, `cargo check` per engine), OLTP library and integration tests, Events tests, and the quarantine job. |
-| `jobs` | Comma-separated opt-in jobs: `direct` (D01-D12, ORM suites, library suite off, acceptance, one leg per mode), `acceptance` (Linux OLTP acceptance, default mode), `campaign`, `docker`, `memory`, `bench`, `perf`, `g7`. Unknown names fail the run. |
+| `jobs` | Comma-separated opt-in jobs: `direct` (D01-D12, ORM suites, library suite off, acceptance, one leg per mode; implies `rep1`, `growth`, `o02`), `acceptance` (Linux OLTP acceptance, default mode; implies `growth`, `o02`), `o02` (O01 and O02 with an OLAP server and the engine matrix, plus T02), `growth` (O16, O26 on the shared build; O21, O28 on one opt-level-1 build), `rep1` (REP1-REP5 process suites), `rep4-mixed` (mixed-version enrollment), `o22` (adds O22 to `scenarios`), `blackhole` (AZ1/AZ2 packet-drop failover), `migrate` (MIG1/MIG2 upgrade), `live3`, `live3-fixture`, `campaign`, `docker`, `memory`, `bench`, `perf`, `g7`, `gc1`, `perf1`, `snap1`. Unknown names fail the run; the run summary lists the resolved set. |
 | `scenarios` | Comma-separated OLTP acceptance scenarios (O01-O29) run on the shared build, one job per scenario and mode. |
 | `tests` | Space-separated full library test paths (`module::tests::name`) run on the shared build. |
 | `repeat` (default 1) | Runs of each `tests` entry. Use 20 or more for flake evidence. |
