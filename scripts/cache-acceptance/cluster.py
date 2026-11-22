@@ -8,9 +8,9 @@ import json
 import os
 from pathlib import Path
 import shutil
-import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -22,6 +22,11 @@ from redis.exceptions import (
     TimeoutError, TryAgainError,
 )
 
+# This script is invoked by path from cluster.sh.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from testing.realenv.history import HistoryWriter
+from testing.realenv.nemesis import Nemesis, Process
+
 SLOTS = 16_384
 PASSWORD = "local-cache-history"
 SERVER = "127.0.0.1"
@@ -30,12 +35,17 @@ TRANSPORT = (ConnectionError, TimeoutError, ClusterDownError, TryAgainError, Mov
 
 def wait(description, assertion, seconds=25):
     end = time.monotonic() + seconds
-    while time.monotonic() < end:
+    delay = .05
+    while True:
         value = assertion()
         if value:
             return value
-        time.sleep(.025)
-    raise AssertionError(f"timeout awaiting {description}")
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"timeout awaiting {description}")
+        # Cache status and metrics expose the state, without a blocking watch API.
+        time.sleep(min(delay, remaining))
+        delay = min(.25, delay * 2)
 
 
 def port():
@@ -70,11 +80,13 @@ def ssl_table(name):
 
 
 class Fleet:
-    def __init__(self, binary, root, evidence, scope):
+    def __init__(self, binary, root, evidence, scope, recorder):
         self.binary = str(binary)
         self.root = root
         self.evidence = evidence
         self.scope = scope
+        self.recorder = recorder
+        self.nemesis = Nemesis(recorder)
         self.metrics = root / "metrics"
         self.metrics.mkdir()
         scope.callback(self.save_metrics)
@@ -197,11 +209,43 @@ class Fleet:
         for metrics in self.metrics.glob("w*-metrics.json"):
             shutil.copyfile(metrics, self.evidence / metrics.name)
 
+    def run_fault(self, action, name):
+        process = self.processes[name]
+        action(Process(name, process))
+
     def stop(self, name):
-        self.processes[name].send_signal(signal.SIGSTOP)
+        self.run_fault(self.nemesis.stop, name)
 
     def resume(self, name):
-        self.processes[name].send_signal(signal.SIGCONT)
+        self.run_fault(self.nemesis.cont, name)
+
+    def kill(self, name):
+        self.run_fault(self.nemesis.kill, name)
+        self.processes[name].wait(timeout=5)
+
+    def op(self, node, client, f, key, *args, **kwargs):
+        fields = dict(process=1, f=f, key=key.decode(), node=f"w{node}")
+        value = None
+        if f == "set":
+            value = args[0].decode()
+        elif args:
+            value = [key.decode(), *(arg.decode() for arg in args)]
+        self.recorder.record("invoke", value=value, **fields)
+        try:
+            result = client.mget([key, *args]) if f == "mget" else getattr(client, f)(key, *args, **kwargs)
+        except BaseException as error:
+            outcome = "fail" if isinstance(error, (
+                ClusterDownError, TryAgainError, MovedError, ClusterCrossSlotError,
+            )) else "info"
+            self.recorder.record(outcome, value={"error": type(error).__name__}, **fields)
+            raise
+        observed = value if f == "set" else result
+        if isinstance(observed, bytes):
+            observed = observed.decode()
+        elif isinstance(observed, list):
+            observed = [item.decode() if isinstance(item, bytes) else item for item in observed]
+        self.recorder.record("ok", value=observed, **fields)
+        return result
 
     def wait_placement(self, verify, seconds=30):
         def predicate():
@@ -240,7 +284,8 @@ def assert_reply_error(expected, callback):
 def routed_value(fleet, node, key, expected):
     try:
         with fleet.client(node) as client:
-            return (True, client.get(key)) if expected is None else client.get(key) == expected
+            value = fleet.op(node, client, "get", key)
+            return (True, value) if expected is None else value == expected
     except TRANSPORT:
         return None
 
@@ -262,13 +307,13 @@ def history(fleet, evidence):
     key, independent = keys[primary], keys[unaffected]
     slot = key_slot(key)
     with fleet.client(primary) as client:
-        assert client.set(key, b"prior", px=120_000)
-        assert client.mget([key, key + b":missing", key]) == [b"prior", None, b"prior"]
-        assert_reply_error(ClusterCrossSlotError, lambda: client.delete(key, independent))
-        assert client.get(key) == b"prior"
+        assert fleet.op(primary, client, "set", key, b"prior", px=120_000)
+        assert fleet.op(primary, client, "mget", key, key + b":missing", key) == [b"prior", None, b"prior"]
+        assert_reply_error(ClusterCrossSlotError, lambda: fleet.op(primary, client, "delete", key, independent))
+        assert fleet.op(primary, client, "get", key) == b"prior"
     with fleet.client(unaffected) as client:
-        assert_reply_error(MovedError, lambda: client.get(key))
-        assert client.set(independent, b"independent", px=120_000)
+        assert_reply_error(MovedError, lambda: fleet.op(unaffected, client, "get", key))
+        assert fleet.op(unaffected, client, "set", independent, b"independent", px=120_000)
     evidence.append("K01 direct MOVED, same-slot order and cross-slot mutation rejection")
 
     prior = view["slots"][slot]["epoch"]
@@ -293,11 +338,12 @@ def history(fleet, evidence):
     read = wait("successor authorizes cache slot", lambda: routed_value(fleet, successor, key, None))
     assert read[1] == b"prior", read
     with fleet.client(successor) as client:
-        assert 0 < client.pttl(key) < 120_000
-        assert client.set(key, b"successor", px=120_000)
+        assert 0 < fleet.op(successor, client, "pttl", key) < 120_000
+        assert fleet.op(successor, client, "set", key, b"successor", px=120_000)
     fleet.resume(f"w{primary}")
     with fleet.client(primary) as client:
-        assert_reply_error((MovedError, ClusterDownError, TryAgainError), lambda: client.set(key, b"retired"))
+        assert_reply_error((MovedError, ClusterDownError, TryAgainError),
+                           lambda: fleet.op(primary, client, "set", key, b"retired"))
     assert wait("post-promotion independent value", lambda: routed_value(fleet, unaffected, independent, b"independent"))
     assert wait("successor value", lambda: routed_value(fleet, successor, key, b"successor"))
     evidence.append("K03 acknowledged replica prefix, paused primary, advanced epoch, fenced old write and unaffected slot")
@@ -307,7 +353,7 @@ def history(fleet, evidence):
     def expired_authority():
         with fleet.client(successor) as client:
             try:
-                client.get(key)
+                fleet.op(successor, client, "get", key)
             except ClusterDownError:
                 return True
             except (ConnectionError, TimeoutError, TryAgainError):
@@ -318,7 +364,7 @@ def history(fleet, evidence):
     wait("quorum restores leased authority", lambda: routed_value(fleet, successor, key, b"successor"))
     evidence.append("K03 minority controller cannot authorize after lease expiry")
 
-    fleet.reap(fleet.processes["c1"])
+    fleet.kill("c1")
     with (fleet.root / "c1-metadata" / "topology.wal").open("ab") as wal:
         wal.write(b"\x00\x00\x00")
         wal.flush()
@@ -336,12 +382,12 @@ def history(fleet, evidence):
     fleet.wait_placement(lambda view: owner(view, slot) == primary and view["slots"][slot]["epoch"] > moving_epoch)
     assert wait("online move restored value", lambda: routed_value(fleet, primary, key, b"successor"))
     with fleet.client(primary) as client:
-        assert 0 < client.pttl(key) < 120_000
+        assert 0 < fleet.op(primary, client, "pttl", key) < 120_000
     evidence.append("K03 verified online move preserved value and absolute expiry")
 
     prior_view = fleet.wait_placement(ready)
     for node in fleet.workers:
-        fleet.reap(fleet.processes[f"w{node}"])
+        fleet.kill(f"w{node}")
     fleet.wait_placement(lambda view: view["ready_primaries"] == view["ready_replicas"] == 0)
     for node, (_, config) in fleet.workers.items():
         fleet.launch(f"w{node}", "worker", config)
@@ -365,8 +411,13 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     completed = []
     try:
-        with tempfile.TemporaryDirectory() as path, ExitStack() as scope:
-            history(Fleet(args.binary, Path(path), args.output, scope), completed)
+        with (tempfile.TemporaryDirectory() as path,
+              HistoryWriter(args.output / "K03.jsonl") as recorder, ExitStack() as scope):
+            fleet = Fleet(args.binary, Path(path), args.output, scope, recorder)
+            try:
+                history(fleet, completed)
+            finally:
+                fleet.nemesis.heal_all()
     finally:
         (args.output / "cluster.json").write_text(json.dumps({
             "environment": "Docker, one kernel clock",
