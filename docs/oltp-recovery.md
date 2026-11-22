@@ -167,10 +167,11 @@ a new run and recovers data through the archived cut.
    the pool, and a wiped mount is refused even if the signing key survived.
    After a complete shutdown during a mounted replacement, start the two
    survivors with one cold-fence profile. Keep their certificates and advance
-   their incarnations, enrollment revisions and mount generations. Set their
-   expected system placements to the intent's target voter sets and keep the
-   original policy placements. Include the candidate's original enrollment
-   with the survivors' new Control enrollments and operator pins.
+   their incarnations, enrollment revisions and mount generations. Use the
+   intent's target voters for planned system groups and the current voters
+   for other groups. Keep the original policy placements. Include the
+   candidate's original enrollment with the survivors' new Control
+   enrollments and operator pins.
 
    Wait for `registered cold run <UUID> published` in a survivor's log. Then
    start the candidate on its original mount with its original enrollment and

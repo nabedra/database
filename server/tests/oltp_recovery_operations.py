@@ -803,8 +803,8 @@ def o17_check_second_control_replacement(
         assert observe('before') == [True]
         cluster.workers[victim].kill()
         remaining = [actor, 'replacement']
+        (cluster.barrier_dir('replacement') / 'inspect-control-leader').touch()
         wait_for(lambda: two_ready(cluster, remaining), 'two ready after the second loss', PROBE_WINDOW)
-        leader = wait_for(lambda: control_leader(remaining), 'Control leader after the second loss', PROBE_WINDOW)
         name = 'replacement2'
         fresh = cluster.certificate(name)
         mount = cluster.mount_pool(name, uid(), fresh)
@@ -822,9 +822,12 @@ def o17_check_second_control_replacement(
         prepare = operation('worker.system_replacement.prepare', intent, intent['id'])
 
         def prepared():
+            leader = control_leader(remaining)
+            if leader is None:
+                return None
             code, response = send(cluster.urls[leader], cluster.auth['admin_token'], prepare,
                                   path='/v1/cluster/operations', timeout=15)
-            if code in (429, 503, 504):
+            if code in (429, 503, 504) or (code == 409 and 'reachable' in json.dumps(response)):
                 return None
             return success(code, response)
 
