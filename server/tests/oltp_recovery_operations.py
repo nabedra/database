@@ -7,6 +7,7 @@ import hashlib
 import http.client
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -178,10 +179,11 @@ def two_ready(cluster, survivors):
                .get('ready_workers') == 2 for name in survivors)
 
 
-def o06_o17_system_replacement_check(binary, test_executable, root):
+def o06_o17_system_replacement_check(binary, test_executable, root, variant=None):
     cluster = Rf3Cluster(binary, root, mounts=True, test_executable=test_executable,
                          status_partitions=2)
     peer_probe = None
+    data_peer = None
     try:
         cluster.start()
         connection = cluster.admin('cluster.connection', {})
@@ -257,9 +259,28 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         old_probe_dir.mkdir()
         probe_input = old_probe_dir / 'config.json'
         victim_node = cluster.config[victim]['node']
+        control_group = victim_node['placements']['control']['identity']
+        targets = [cluster.enrollments[name] for name in survivors]
+        if variant == 'data-trust':
+            # A separate process with a Data-only directory and no inventory
+            # refresh uses a survivor's enrolled identity for Control reads.
+            # Give its listener a distinct endpoint and reuse its TLS name.
+            identity = dict(targets[0], worker_id=uid(), incarnation=uid(), endpoint=f'127.0.0.1:{free_port()}')
+            pin_node = cluster.config[survivors[0]]['node']
+            data_peer_dir = root / 'data-trust'
+            data_peer_dir.mkdir()
+            data_peer_input = data_peer_dir / 'config.json'
+            write_json(data_peer_input, {
+                'group': control_group, 'from': identity,
+                'targets': list(cluster.enrollments.values()),
+                'certificate': pin_node['certificate'], 'private_key': pin_node['private_key'],
+                'authority_ca': pin_node['authority_ca'], 'directory': str(data_peer_dir),
+                'control_actor': targets[0], 'revoked_bootstrap_peer': previous['worker_id'],
+            })
+            targets.append(identity)
         write_json(probe_input, {
-            'group': victim_node['placements']['control']['identity'],
-            'from': enrollment, 'targets': [cluster.enrollments[name] for name in survivors],
+            'group': control_group,
+            'from': enrollment, 'targets': targets,
             'certificate': victim_node['certificate'], 'private_key': victim_node['private_key'],
             'authority_ca': victim_node['authority_ca'], 'directory': str(old_probe_dir),
         })
@@ -267,6 +288,29 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         probe_env['NABEDRA_OLTP_TEST_REPLACEMENT_PEER'] = str(probe_input)
         peer_probe = Process('old-peer', [str(test_executable), '--exact', CHILD, '--ignored', '--nocapture'],
                              probe_env, old_probe_dir / 'peer.log')
+        if variant == 'data-trust':
+            def launch_data_trust(restarted=False):
+                ready = data_peer_dir / 'listening'
+                ready.unlink(missing_ok=True)
+                env = dict(probe_env, NABEDRA_OLTP_TEST_REPLACEMENT_PEER=str(data_peer_input))
+                if restarted:
+                    env['NABEDRA_REP5_REFRESH_BOOTSTRAP'] = '1'
+                proc = Process('data-trust', [str(test_executable), '--exact', CHILD, '--ignored', '--nocapture'],
+                               env, data_peer_dir / 'peer.log')
+                def listening():
+                    if not proc.alive():
+                        raise AssertionError((data_peer_dir / 'peer.log').read_text())
+                    return ready.exists()
+
+                try:
+                    wait_for(listening, 'Data-only trust listener started', PROBE_WINDOW)
+                except Exception:
+                    proc.stop()
+                    raise
+                return proc
+
+            data_peer = launch_data_trust()
+
 
         def old_certificate_observation(phase):
             (old_probe_dir / f'probe-{phase}').touch()
@@ -277,7 +321,41 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
                 return json.loads(result.read_text()) if result.exists() else None
             return wait_for(observed, f'old certificate {phase} replacement', PROBE_WINDOW)
 
-        assert old_certificate_observation('before') == [True, True]
+        if variant == 'data-trust':
+            def quorum_rpcs():
+                stats = json.loads((data_peer_dir / 'stats.json').read_text())
+                return sum(stage['count'] for name, stage in stats.items()
+                           if name.startswith('control.quorum_rpc.'))
+            rpcs_before = quorum_rpcs()
+            window_started = time.monotonic()
+        assert old_certificate_observation('before') == [True] * len(targets)
+        if variant == 'data-trust':
+            time.sleep(0.5)  # the listener rewrites stats.json every 100 ms
+            rpcs = quorum_rpcs() - rpcs_before
+            window = time.monotonic() - window_started
+            latency = json.loads((old_probe_dir / 'probe-before-latency.json').read_text())
+
+            def percentiles(samples):
+                ordered = sorted(samples)
+                return (round(ordered[len(ordered) // 2] / 1000, 3),
+                        round(ordered[min(len(ordered) - 1, len(ordered) * 99 // 100)] / 1000, 3))
+            data_only = latency[identity['worker_id']]
+            control_host = latency[targets[0]['worker_id']]
+            exchanges = sum(len(samples) + 2 for samples in latency.values())
+            # D01/O17 (REP6): the Data-only listener's Control reads follow its
+            # refresh interval (1 s, one read per Control voter), never the
+            # number of inbound exchanges.
+            budget = 3 * (int(window) + 3)
+            observations = dict(
+                exchanges=exchanges, data_only_exchanges=len(data_only) + 2,
+                control_quorum_rpcs=rpcs, budget=budget, window_seconds=round(window, 3),
+                data_only_p50_ms=percentiles(data_only)[0], data_only_p99_ms=percentiles(data_only)[1],
+                control_host_p50_ms=percentiles(control_host)[0],
+                control_host_p99_ms=percentiles(control_host)[1])
+            print(json.dumps(dict(measurement='REP6 Data-only exchange gate', **observations),
+                             sort_keys=True), flush=True)
+            assert rpcs <= budget, observations
+            report('D01/O17 Data-only listener per-exchange Control budget', **observations)
         stopped_at = time.monotonic()
         cluster.workers[victim].kill()
         mount = Path(cluster.config[victim]['node']['directory'])
@@ -347,6 +425,18 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         mount_seed.chmod(0o600)
         intent = dict(id=uid(), run_id=cluster.run_id, previous=previous,
                       next=fresh, mount=fresh_mount, mount_public_key=mount_der('-pubout').hex())
+        if variant == 'abandon':
+            abandoned = cluster.certificate('abandoned')
+            abandoned_mount = cluster.mount_pool('abandoned', uid(), abandoned)
+            decoy = dict(intent, id=uid(), next=abandoned, mount=abandoned_mount)
+            assert success(*operator(leader, operation(
+                'worker.system_replacement.prepare', decoy, decoy['id'])))['intent'] == decoy
+            abandon = operation('worker.system_replacement.abandon', {'id': decoy['id']})
+            status, reply = send(cluster.urls[leader], cluster.auth['data_token'], abandon,
+                                 path='/v1/cluster/operations')
+            assert status in (401, 403), (status, reply)
+            for _ in range(2):
+                assert success(*operator(leader, abandon)) == {'id': decoy['id'], 'abandoned': True}
         prepare = operation('worker.system_replacement.prepare', intent, intent['id'])
         borrowed_cert = cluster.enrollments[survivors[0]]['certificate_sha256']
         bad_mount = dict(fresh_mount, worker=dict(fresh_mount['worker'], certificate_sha256=borrowed_cert))
@@ -417,6 +507,12 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         replacement_started = time.monotonic()
         cluster.launch_worker('replacement')
         data_leader = wait_for(learner_leader, 'learner append committed', PROBE_WINDOW)
+        if variant == 'abandon':
+            active_leader = wait_for(lambda: control_leader(survivors), 'surviving Control leader', PROBE_WINDOW)
+            status, reply = operator(active_leader, operation(
+                'worker.system_replacement.abandon', {'id': intent['id']}))
+            assert status == 409, (status, reply)
+            report('O17/R01 abandons only unmounted intents', intent=intent['id'])
         paused = next(name for name in survivors if name != data_leader)
         data_plan = next(plan for plan in prepared['groups']
                          if plan['expected']['identity']['group_id'] == data_group)
@@ -442,6 +538,19 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
 
         stable_checkpoint = candidate_barrier / f'reached-{fresh["worker_id"]}'
         wait_for(stable_checkpoint.exists, 'replacement applied stable RF3 in every group', RECOVERY_DEADLINE)
+        if variant == 'wipe':
+            cluster.workers['replacement'].kill()
+            mount_root = Path(fresh_mount['mount_path'])
+            shutil.rmtree(mount_root / 'pool')
+            (mount_root / 'NABEDRA_REGISTERED_WORKER.json').unlink()
+            assert mount_seed.exists()
+            cluster.launch_worker('replacement')
+            attempt = cluster.workers['replacement']
+            assert attempt.popen.wait(timeout=30) != 0
+            assert 'replacement mount already committed' in cluster.tail('replacement'), cluster.tail('replacement')
+            assert not (mount_root / 'pool').exists(), 'startup opened a blank pool'
+            report('O17/NS23 refuses a wiped mounted replacement', intent=intent['id'])
+            return
         rf3_restored = time.monotonic()
         (candidate_barrier / f'release-{fresh["worker_id"]}').touch()
         copy_checkpoint = candidate_barrier / f'reached-{intent["id"]}'
@@ -458,7 +567,13 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         assert two_ready(cluster, survivors), 'the queue-copy proof is still held before publication'
         (candidate_barrier / f'release-{intent["id"]}').touch()
         cluster.wait_workers(names=('replacement',))
-        assert old_certificate_observation('after') == [False, False]
+        assert old_certificate_observation('after') == [False] * len(targets)
+        if variant == 'data-trust':
+            data_peer.stop()
+            data_peer = launch_data_trust(restarted=True)
+            assert old_certificate_observation('restarted') == [False] * len(targets)
+            report('O17 checks Data-only sessions and stale bootstrap pins',
+                   cached_inventory_refresh=False, revoked_session=True, revoked_bootstrap_pin=True)
         progress = cluster.admin('worker.system_replacement.status',
                                  dict(run_id=cluster.run_id, previous=previous), worker='replacement')
         assert progress['mounted'] and progress['complete'], progress
@@ -538,6 +653,8 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
     finally:
         if peer_probe is not None:
             peer_probe.stop()
+        if data_peer is not None:
+            data_peer.stop()
         cluster.close()
 
 
@@ -1044,7 +1161,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True)
     parser.add_argument('--test-executable', required=True)
-    parser.add_argument('--suite', choices=('all', 'rollback', 'restart', 'replacement-check', 'replacement-mixed', 'scale'),
+    parser.add_argument('--suite', choices=('all', 'rollback', 'restart', 'replacement-check', 'replacement-mixed',
+                                             'replacement-abandon', 'replacement-wipe', 'replacement-data-trust', 'scale'),
                         default='all')
     parser.add_argument('--legacy-binary', type=Path)
     args = parser.parse_args()
@@ -1061,6 +1179,11 @@ def main():
         if args.suite in ('all', 'scale'):
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
             o17_a02_scale(args.binary, args.test_executable, root / 'scale')
+
+        if args.suite in ('replacement-abandon', 'replacement-wipe', 'replacement-data-trust'):
+            assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
+            o06_o17_system_replacement_check(args.binary, args.test_executable, root / args.suite,
+                                              variant=args.suite[len('replacement-'):])
 
         if args.suite == 'replacement-mixed':
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'

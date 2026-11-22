@@ -245,6 +245,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         group.clone(),
         Arc::new(Routes(voters)),
     )?;
+    let bootstrap_peers: Vec<_> = pinned.iter().map(|(_, peer)| *peer).collect();
     let joining = DataWorkerClient::new(client.clone(), shared.clone(), group.clone(), pinned);
     let last_error = Mutex::new(None);
     let replacement = if let Some(drain) = node.eks_replacement_drain {
@@ -315,6 +316,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
             .await
     });
 
+    let revocation_refresh = Mutex::new(None);
     let result = tokio::time::timeout_at(deadline, async {
         let enroll = if let (Some(permit), Some(added)) = (&replacement, &added_mount) {
             transition_id("eks-replacement-enroll", &(permit.drain_id, local, mounted.total_bytes, added.total_bytes))?
@@ -344,6 +346,28 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         )
         .await?;
         startup_read(
+            deadline, &last_error, "exclude replaced Control bootstrap peers", || async {
+                directory.exclude_replaced_bootstrap_peers(&control, &bootstrap_peers).await
+                    .map_err(limited_enrollment_retry)
+            },
+        ).await?;
+        // REP6: Control-majority revocation view, refreshed once per second
+        // by its own task. Inbound exchanges check it in memory only.
+        startup_read(deadline, &last_error, "seed Data-only revocation view", || async {
+            directory
+                .seed_remote_revocations(&*control)
+                .await
+                .map_err(limited_enrollment_retry)
+        })
+        .await?;
+        let refresh = directory
+            .clone()
+            .run_revocation_refresh(control.clone(), stop.subscribe());
+        *revocation_refresh
+            .lock()
+            .map_err(|_| unavailable("data worker revocation refresh state"))? =
+            Some(tokio::spawn(refresh));
+        startup_read(
             deadline,
             &last_error,
             "apply data worker peer directory",
@@ -351,7 +375,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 directory
                     .refresh(&control)
                     .await
-                    .map_err(|error| limited_enrollment_retry(error))
+                    .map_err(limited_enrollment_retry)
             },
         )
         .await?;
@@ -676,6 +700,9 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         Err(error) => Err(error),
     };
     let _ = stop.send(true);
+    if let Some(refresh) = revocation_refresh.lock().ok().and_then(|mut task| task.take()) {
+        let _ = refresh.await;
+    }
     let transport = transport_task
         .await
         .map_err(|_| unavailable("data worker transport task failed"))?;

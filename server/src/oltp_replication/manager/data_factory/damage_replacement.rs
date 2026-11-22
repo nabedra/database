@@ -333,6 +333,7 @@ pub(crate) struct DamageScheduler {
     local: Arc<DamageReplacementEndpoint>,
     interval: Duration,
     running: Mutex<BTreeSet<(Uuid, u64)>>,
+    after: Mutex<Option<(Uuid, u64)>>,
     pub(crate) stats: DamageSchedulerStats,
     /// Test only: after hosting the fresh replica, signal the first `Notify`
     /// and wait for the second (a Control leader that stops mid-replacement).
@@ -355,6 +356,7 @@ impl DamageScheduler {
             local,
             interval,
             running: Mutex::new(BTreeSet::new()),
+            after: Mutex::new(None),
             stats: DamageSchedulerStats::default(),
             #[cfg(test)]
             hold_after_host: Mutex::new(None),
@@ -386,24 +388,22 @@ impl DamageScheduler {
         self.raw_control.raft.current_leader().await == Some(local)
     }
 
-    /// One pass: starts a task for every pending record that has none.
+    /// Visit one page per tick so a lost worker with many ranges cannot
+    /// create an unbounded number of competing repair tasks.
     pub(crate) async fn tick(self: &Arc<Self>) -> Result<(), ProtocolError> {
         if !self.control.group_damage_enabled() || !self.leads().await {
             return Ok(());
         }
-        let mut after = None;
-        loop {
-            let (records, done) = self.control.group_damage_page(after, 64).await?;
-            for record in &records {
-                after = Some((record.report.group.group_id, record.report.replica.node_id));
-                if record.pending() && matches!(record.report.group.kind, GroupKind::Data { .. }) {
-                    self.start(record.clone());
-                }
-            }
-            if done || records.is_empty() {
-                return Ok(());
+        let after = *self.after.lock().map_err(|_| unavailable())?;
+        let (records, done) = self.control.group_damage_page(after, 64).await?;
+        let next = records.last().map(|record| (record.report.group.group_id, record.report.replica.node_id));
+        for record in records {
+            if record.pending() && matches!(record.report.group.kind, GroupKind::Data { .. }) {
+                self.start(record);
             }
         }
+        *self.after.lock().map_err(|_| unavailable())? = if done { None } else { next };
+        Ok(())
     }
 
     fn start(self: &Arc<Self>, record: GroupDamageRecord) {
@@ -411,7 +411,10 @@ impl DamageScheduler {
         if !self
             .running
             .lock()
-            .is_ok_and(|mut running| running.insert(key))
+            .is_ok_and(|mut running| {
+                running.len() < crate::oltp_replication::authority::control::MAX_ACTIVE_DAMAGE_REPLACEMENTS
+                    && running.insert(key)
+            })
         {
             return;
         }
