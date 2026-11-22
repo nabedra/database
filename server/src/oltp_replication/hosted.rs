@@ -515,6 +515,26 @@ where
 /// on a loaded host. Larger ones keep their native jobs.
 const INLINE_BYTES: usize = 4 << 10;
 
+/// RD3: PERF2b's rule for the Raft log and transport codecs. Runs `work` on
+/// the calling task when it handles at most [`INLINE_BYTES`] (`bytes`, an
+/// estimate from the entries' heap size or the frame length), otherwise in a
+/// native job. The serial Data commit made five such handoffs for a few
+/// microseconds of work each: the leader's log sizing pass, an encode and a
+/// reply decode per follower, and each follower's decode and sizing pass.
+pub(crate) async fn execute_small<T: Send + 'static>(
+    shared: &Arc<crate::oltp::pool::WorkerSharedResources>,
+    class: ExecutionClass,
+    request: u64,
+    bytes: usize,
+    work: impl FnOnce() -> Result<T, ProtocolError> + Send + 'static,
+) -> Result<T, ProtocolError> {
+    if bytes <= INLINE_BYTES {
+        work()
+    } else {
+        shared.execute(class, request, 0, work).await
+    }
+}
+
 fn blank_digest() -> Digest {
     Digest::from_bytes(Sha256::digest(b"nabedra/typed-raft-blank/v1").into())
 }
@@ -871,6 +891,8 @@ pub(crate) mod proposal_clock {
         time::{Duration, Instant},
     };
     static LAST: AtomicU64 = AtomicU64::new(0);
+    /// The proposal whose first acknowledgement was recorded (RD3).
+    static FIRST: AtomicU64 = AtomicU64::new(0);
     fn now_us() -> u64 {
         static BASE: OnceLock<Instant> = OnceLock::new();
         BASE.get_or_init(Instant::now).elapsed().as_micros() as u64 + 1
@@ -882,6 +904,14 @@ pub(crate) mod proposal_clock {
         mark(crate::oltp_runtime::stage_timing::perf_stage!(
             "raft.data.propose_to_apply"
         ));
+    }
+    /// Records the time since the latest Data proposal in `stage`, once per
+    /// proposal: the first follower's acknowledgement (RD3).
+    pub(crate) fn mark_first(stage: &'static crate::oltp_runtime::stage_timing::Stage) {
+        let last = LAST.load(Ordering::Relaxed);
+        if last != 0 && FIRST.swap(last, Ordering::Relaxed) != last {
+            stage.record(Duration::from_micros(now_us().saturating_sub(last)));
+        }
     }
     /// Records the time since the latest Data proposal in `stage`.
     pub(crate) fn mark(stage: &'static crate::oltp_runtime::stage_timing::Stage) {

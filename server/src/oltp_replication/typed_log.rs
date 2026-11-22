@@ -835,6 +835,14 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             ],
         )
         .timer();
+        // RD3: the core saves the commit just before it hands the entries to
+        // the apply worker; with `propose_to_first_ack` and
+        // `propose_to_apply` this splits quorum -> commit -> apply.
+        if id.is_some() && matches!(self.store.identity().kind, GroupKind::Data { .. }) {
+            super::hosted::proposal_clock::mark(crate::oltp_runtime::stage_timing::perf_stage!(
+                "raft.data.propose_to_commit"
+            ));
+        }
         // A quorum of other replicas can commit an entry before this replica's
         // own sync. Its writer records the marker after that sync (PERF2d).
         if id.is_some_and(|id| self.overlay.defer_commit(id)) {
@@ -1051,9 +1059,20 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                     _ => ExecutionClass::Query,
                 };
                 let request = batch[0].index();
-                let (batch, sizes) = store
-                    .resources()
-                    .execute(class, request, 0, move || {
+                // RD3: an unknown size keeps the native job.
+                let estimate = batch
+                    .iter()
+                    .map(|entry| {
+                        use crate::oltp_replication::owned::OwnedPayload;
+                        entry.heap_bytes().unwrap_or(usize::MAX)
+                    })
+                    .fold(0usize, usize::saturating_add);
+                let (batch, sizes) = super::hosted::execute_small(
+                    store.resources(),
+                    class,
+                    request,
+                    estimate,
+                    move || {
                         struct Counter(usize);
                         impl io::Write for Counter {
                             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -1076,9 +1095,10 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                             sizes.push(counter.0);
                         }
                         Ok((batch, sizes))
-                    })
-                    .await
-                    .map_err(disk)?;
+                    },
+                )
+                .await
+                .map_err(disk)?;
                 let written = std::time::Instant::now();
                 by_kind(
                     &kind,

@@ -216,6 +216,9 @@ struct Fixture {
 enum Release {
     Current,
     SessionV2,
+    /// The build before RD3: sessions with index reclamation, no direct
+    /// admission.
+    SessionV3,
     OneShotOnly,
 }
 
@@ -263,7 +266,7 @@ impl Fixture {
             .unwrap();
             let registry = Arc::new(EndpointRegistry::new(shared.clone()));
             let build = match release {
-                Release::Current | Release::SessionV2 => WorkerTransport::new,
+                Release::Current | Release::SessionV2 | Release::SessionV3 => WorkerTransport::new,
                 Release::OneShotOnly => WorkerTransport::one_shot_for_test,
             };
             let mut transport =
@@ -271,6 +274,11 @@ impl Fixture {
             if release == Release::SessionV2 {
                 let common = Arc::get_mut(&mut transport.common).unwrap();
                 (common.connector, common.acceptor) = tls[index].transports(&[SESSION_ALPN, ALPN]);
+            }
+            if release == Release::SessionV3 {
+                let common = Arc::get_mut(&mut transport.common).unwrap();
+                (common.connector, common.acceptor) =
+                    tls[index].transports(&[INDEX_RECLAIM_ALPN, SESSION_ALPN, ALPN]);
             }
             transport
         };
@@ -1488,5 +1496,133 @@ async fn g1_local_failure_after_send_has_unknown_outcome() {
         assert_eq!(fixture.endpoint.handled.load(Ordering::Acquire), 1);
         drop(_held);
         fixture.stop().await;
+    }
+}
+
+/// RD3 (D12, O03, PERF1, C07): a range leader handles direct requests (ingress
+/// on a Data group) in their own pool, not in the ingress class's 4 handler
+/// slots, so a caller keeps many in flight to it and the leader can batch
+/// them. Before RD3 at most 3 waiting direct requests reached the leader at
+/// once. Queued ingress (a Control submission that refuses at once) keeps its
+/// own slots next to them. To a leader of the previous build (no direct
+/// admission negotiated) the caller keeps PERF1's bound: at most 3 waiting
+/// direct requests in flight, the rest wait in arrival order, none refused,
+/// and the queued caller still finds its slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rd3_d12_o03_direct_requests_beyond_the_ingress_slots_reach_the_leader() {
+    let ingress = TransportConfig::default().handler_slots[TrafficClass::ApiIngress as usize];
+    let direct = 3 * ingress;
+    for receiver_release in [Release::Current, Release::SessionV3] {
+        let (f, _) = Fixture::start(
+            Release::Current,
+            receiver_release,
+            TransportConfig::default(),
+            TransportConfig::default(),
+            false,
+        )
+        .await;
+        let control = GroupIdentity {
+            group_id: Uuid::new_v4(),
+            kind: GroupKind::Control,
+            ..f.group.clone()
+        };
+        f.receiver
+            .registry
+            .reserve(control.clone())
+            .unwrap()
+            .bind(Purpose::ApiIngress, f.endpoint.clone())
+            .unwrap();
+        f.receiver
+            .registry
+            .reserve(f.data_group.clone())
+            .unwrap()
+            .bind(Purpose::ApiIngress, f.endpoint.clone())
+            .unwrap();
+        // The first call opens the ingress session and negotiates its ALPN.
+        echoed(
+            f.call(&f.data_group, Purpose::ApiIngress, "open").await,
+            "open",
+        );
+        let wide = receiver_release == Release::Current;
+        assert_eq!(
+            f.client
+                .peer_supports(
+                    f.target.worker_id,
+                    TrafficClass::ApiIngress,
+                    PeerFeature::DirectAdmission
+                )
+                .is_some(),
+            wide
+        );
+        f.endpoint.hold.store(true, Ordering::Release);
+        let refused = f.client.lane_refusals();
+        let calls: Vec<_> = (0..direct)
+            .map(|index| {
+                let client = f.client.clone();
+                let group = f.data_group.clone();
+                let target = f.target.clone();
+                let shared = f.caller_transport.common.shared.clone();
+                tokio::spawn(async move {
+                    let text = format!("direct-{index}");
+                    let reservation = client
+                        .reserve_outgoing(
+                            &group,
+                            target.worker_id,
+                            Purpose::ApiIngress,
+                            Instant::now() + WAIT,
+                        )
+                        .await?;
+                    let header = shared.encode_in(ByteClass::Data, &text, 1024).unwrap();
+                    let reply = client
+                        .request_reserved(
+                            reservation,
+                            &group,
+                            WorkerIdentity::from(&target),
+                            Purpose::ApiIngress,
+                            header,
+                            [None, None, None],
+                            0,
+                        )
+                        .await;
+                    echoed(reply, &text);
+                    Ok::<_, RequestError>(())
+                })
+            })
+            .collect();
+        let at_leader = if wide { direct } else { ingress - 1 };
+        let entered = |n: usize| {
+            let endpoint = f.endpoint.clone();
+            async move {
+                timeout(WAIT, endpoint.entered.acquire_many(n as u32))
+                    .await
+                    .unwrap_or_else(|_| panic!("{n} requests reach the leader's handler"))
+                    .unwrap()
+                    .forget();
+            }
+        };
+        entered(at_leader).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            f.endpoint.entered.available_permits(),
+            0,
+            "no more than {at_leader} direct requests at the leader at once"
+        );
+        // A queued submission refuses at once on a full lane; it still gets in.
+        let queued = f.call(&control, Purpose::ApiIngress, "queued");
+        let queued = tokio::spawn(queued);
+        entered(1).await;
+        assert_eq!(f.client.lane_refusals(), refused, "nothing refused");
+        f.endpoint.hold.store(false, Ordering::Release);
+        f.endpoint.release.add_permits(direct + 1);
+        echoed(queued.await.unwrap(), "queued");
+        for call in calls {
+            timeout(WAIT, call)
+                .await
+                .expect("every direct request completes")
+                .unwrap()
+                .expect("no direct request is refused");
+        }
+        assert_eq!(f.client.lane_refusals(), refused, "nothing refused");
+        f.stop().await;
     }
 }

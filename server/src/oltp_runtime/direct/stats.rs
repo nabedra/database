@@ -9,6 +9,8 @@ use std::{
 
 /// Upper bounds of the rows-per-entry buckets; the last bucket is open.
 pub(crate) const BATCH_BUCKETS: [u64; 5] = [1, 8, 64, 512, 4096];
+/// RD3: members per `DirectBatch` entry (upper bounds; at most 64 members).
+const MEMBER_BUCKETS: [u64; 7] = [2, 3, 4, 8, 16, 32, 64];
 
 /// Why an attempt went back to step 3 within the deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +68,7 @@ pub(crate) struct DirectStats {
     /// GC2: `DirectBatch` entries proposed, and the commits they carried.
     batch_entries: AtomicU64,
     batched_commits: AtomicU64,
+    member_buckets: [AtomicU64; MEMBER_BUCKETS.len()],
     applied: AtomicU64,
     replayed: AtomicU64,
     rows_proposed: AtomicU64,
@@ -130,6 +133,11 @@ impl DirectStats {
         bump(&self.batch_entries);
         self.batched_commits
             .fetch_add(members as u64, Ordering::Relaxed);
+        let bucket = MEMBER_BUCKETS
+            .iter()
+            .position(|bound| members as u64 <= *bound)
+            .unwrap_or(MEMBER_BUCKETS.len() - 1);
+        bump(&self.member_buckets[bucket]);
     }
     pub(crate) fn applied(&self) {
         bump(&self.applied);
@@ -204,6 +212,11 @@ impl DirectStats {
             };
             batch_sizes.insert(label, load(counter));
         }
+        let batch_members = MEMBER_BUCKETS
+            .iter()
+            .zip(&self.member_buckets)
+            .map(|(bound, counter)| (format!("le_{bound}"), load(counter)))
+            .collect();
         let fallbacks = FallbackReason::ALL
             .iter()
             .zip(&self.fallbacks)
@@ -234,6 +247,7 @@ impl DirectStats {
             entries_applied: load(&self.applied),
             batch_entries: load(&self.batch_entries),
             batched_commits: load(&self.batched_commits),
+            batch_members,
             replayed: load(&self.replayed),
             read_only: load(&self.read_only),
             pre_latch_epoch_reads: load(&self.epoch_reads),
@@ -276,6 +290,8 @@ pub(crate) struct DirectStatsSnapshot {
     /// `entries_proposed` commits rode in them.
     pub batch_entries: u64,
     pub batched_commits: u64,
+    /// RD3: `DirectBatch` entries by members (`le_<n>`).
+    pub batch_members: BTreeMap<String, u64>,
     pub replayed: u64,
     pub read_only: u64,
     /// RD1: mutations that read the group's epochs before latching.

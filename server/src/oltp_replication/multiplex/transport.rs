@@ -29,7 +29,9 @@ mod resolve;
 mod session;
 use resolve::{PeerResolver, ResolveError};
 pub(crate) use session::PeerFeature;
-use session::{INDEX_RECLAIM_ALPN, PeerSessions, RawReply, SESSION_ALPN, session_alpn};
+use session::{
+    DIRECT_ADMISSION_ALPN, INDEX_RECLAIM_ALPN, PeerSessions, RawReply, SESSION_ALPN, session_alpn,
+};
 #[cfg(test)]
 mod tests;
 
@@ -183,6 +185,42 @@ pub struct TransportConfig {
     pub ping_timeout: Duration,
     /// Bound on one TCP connect plus TLS handshake for a lane.
     pub connect_timeout: Duration,
+    /// RD3: `Method::Direct` and `DirectForward` (ingress on a Data group)
+    /// have their own preflight and handler pools at the range leader, apart
+    /// from the ingress class's queued submissions. A direct request holds
+    /// its handler slot for its whole commit (fsync and quorum), so the slot
+    /// count is the leader's in-flight bound, as the direct executor's
+    /// `max_in_flight`; their bytes are charged against the worker's budget.
+    pub direct_preflight_slots: usize,
+    pub direct_handler_slots: usize,
+}
+/// RD3: the default `direct_handler_slots`, equal to the direct executor's
+/// default `max_in_flight` (plan section 6 step 1).
+pub(crate) const DIRECT_HANDLER_SLOTS: usize = 256;
+/// RD3: the default `direct_preflight_slots`. Preflight is the warm role
+/// check; the slot is held only until the handler slot is taken.
+pub(crate) const DIRECT_PREFLIGHT_SLOTS: usize = 64;
+/// RD3: whether a request of `class` on `group` is a direct request
+/// (`Method::Direct` or `DirectForward`, the only ingress on a Data group).
+fn direct_lane(class: TrafficClass, group: &GroupIdentity) -> bool {
+    class == TrafficClass::ApiIngress && matches!(group.kind, GroupKind::Data { .. })
+}
+/// Benchmark only (RD3): `NABEDRA_BENCH_NO_DIRECT_ADMISSION=1` makes this
+/// worker behave as the build before RD3 (no `nabedra-otp/4`, direct requests
+/// in the ingress class's pools), so one binary measures both sides.
+const NO_DIRECT_ADMISSION_ENV: &str = "NABEDRA_BENCH_NO_DIRECT_ADMISSION";
+fn direct_admission_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        let disabled =
+            std::env::var_os(NO_DIRECT_ADMISSION_ENV).is_some_and(|value| value == "1");
+        if disabled {
+            tracing::warn!(
+                "{NO_DIRECT_ADMISSION_ENV}=1: direct requests use the ingress handler slots (benchmark only)"
+            );
+        }
+        disabled
+    })
 }
 impl Default for TransportConfig {
     fn default() -> Self {
@@ -230,6 +268,8 @@ impl Default for TransportConfig {
             ping_idle: Duration::from_secs(15),
             ping_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(10),
+            direct_preflight_slots: DIRECT_PREFLIGHT_SLOTS,
+            direct_handler_slots: DIRECT_HANDLER_SLOTS,
         }
     }
 }
@@ -242,7 +282,11 @@ impl TransportConfig {
                 .iter()
                 .chain(&self.handler_slots)
                 .chain(&self.session_slots)
-                .chain([&self.pending_sessions])
+                .chain([
+                    &self.pending_sessions,
+                    &self.direct_preflight_slots,
+                    &self.direct_handler_slots,
+                ])
                 .any(|&n| n == 0 || n > Semaphore::MAX_PERMITS)
             || self
                 .payload_bytes
@@ -610,6 +654,18 @@ struct Common {
     /// waiting direct requests) always finds headroom (PERF1).
     waiting: OutgoingLanes,
     waiting_class: [Arc<Semaphore>; CLASSES],
+    /// RD3: receiver pools for direct requests (`direct_lane`), apart from
+    /// `preflight` and `handlers` of the ingress class.
+    direct_preflight: Arc<Semaphore>,
+    direct_handlers: Arc<Semaphore>,
+    /// False only under `NABEDRA_BENCH_NO_DIRECT_ADMISSION=1`.
+    direct_admission: bool,
+    /// RD3: caller slots for direct requests to a peer whose session
+    /// negotiated `PeerFeature::DirectAdmission`: `direct_handler_slots` per
+    /// peer lane and `OUTGOING_CLASS_LANES` lanes' worth in total. To an
+    /// older peer, direct requests keep the ingress lanes above (PERF1).
+    direct_outgoing: DirectLanes,
+    direct_class: Arc<Semaphore>,
     authority_roles: Semaphore,
     authority_waiters: Semaphore,
     resolver: PeerResolver,
@@ -634,6 +690,27 @@ struct Common {
     /// Replies a receiver skipped because the caller cancelled the stream.
     #[cfg(test)]
     cancelled_replies: std::sync::atomic::AtomicU64,
+}
+impl Common {
+    /// The receiver's preflight pool for a request of `class` on `group`.
+    fn preflight_pool(&self, class: TrafficClass, group: &GroupIdentity) -> &Arc<Semaphore> {
+        if self.direct_admission && direct_lane(class, group) {
+            &self.direct_preflight
+        } else {
+            &self.preflight[class as usize]
+        }
+    }
+    /// The receiver's handler pool for a request of `class` on `group`. A
+    /// direct request holds its slot until its reply is written, through
+    /// its commit, so the ingress class's few slots would bound the leader's
+    /// in-flight direct requests and their batches (RD3).
+    fn handler_pool(&self, class: TrafficClass, group: &GroupIdentity) -> &Arc<Semaphore> {
+        if self.direct_admission && direct_lane(class, group) {
+            &self.direct_handlers
+        } else {
+            &self.handlers[class as usize]
+        }
+    }
 }
 /// Requests this worker refused locally because a lane was full: `outgoing`
 /// before sending (caller slots), `handler` on receipt (handler slots).
@@ -806,8 +883,16 @@ impl WorkerTransport {
         if local.certificate_sha256.to_string() != tls.certificate_sha256() {
             return Err(malformed("local certificate differs from enrollment"));
         }
-        let (connector, acceptor) = if sessions_enabled {
+        let direct_admission = !direct_admission_disabled();
+        let (connector, acceptor) = if sessions_enabled && !direct_admission {
             tls.transports(&[INDEX_RECLAIM_ALPN, SESSION_ALPN, ALPN])
+        } else if sessions_enabled {
+            tls.transports(&[
+                DIRECT_ADMISSION_ALPN,
+                INDEX_RECLAIM_ALPN,
+                SESSION_ALPN,
+                ALPN,
+            ])
         } else {
             tls.transports(&[ALPN])
         };
@@ -843,6 +928,13 @@ impl WorkerTransport {
                         class.saturating_sub(config.handler_slots[i]).max(1),
                     ))
                 }),
+                direct_preflight: Arc::new(Semaphore::new(config.direct_preflight_slots)),
+                direct_handlers: Arc::new(Semaphore::new(config.direct_handler_slots)),
+                direct_admission,
+                direct_outgoing: DirectLanes::default(),
+                direct_class: Arc::new(Semaphore::new(outgoing_class_slots(
+                    config.direct_handler_slots,
+                ))),
                 authority_roles: Semaphore::new(
                     config.handler_slots[TrafficClass::Authority as usize] - 1,
                 ),
@@ -987,7 +1079,9 @@ impl WorkerTransport {
         admit_trust(trust, group, hello.purpose)?;
         let class = traffic(group, hello.purpose)?;
         trace.phase = RaftTransportPhase::Preflight;
-        let preflight = self.common.preflight[class as usize]
+        let preflight = self
+            .common
+            .preflight_pool(class, group)
             .clone()
             .try_acquire_owned()
             .map_err(|_| overloaded("worker preflight lane full"))?;
@@ -1019,7 +1113,9 @@ impl WorkerTransport {
             let plan = endpoint.preflight(&session, header.as_slice()).await?;
             drop(header_scratch);
             validate_plan(&self.common.config, class, plan)?;
-            let handler = self.common.handlers[class as usize]
+            let handler = self
+                .common
+                .handler_pool(class, group)
                 .clone()
                 .try_acquire_owned()
                 .map_err(|_| {
@@ -1131,6 +1227,50 @@ impl WorkerClient {
             .map_err(|_| malformed("invalid target group"))?;
         let class = traffic(group, purpose)?;
         let index = class as usize;
+        #[cfg(test)]
+        let hold = self.common.outgoing_hold[index].clone();
+        // RD3: a leader whose session negotiated direct admission handles
+        // `direct_handler_slots` direct requests at once, apart from queued
+        // ingress. Its lane has that capacity and no waiting share: every
+        // caller on it waits (`DirectLink`), and the ingress lane's callers
+        // that refuse at once never compete with it.
+        if direct_lane(class, group)
+            && self
+                .peer_supports(target, class, PeerFeature::DirectAdmission)
+                .is_some()
+        {
+            let lane = self
+                .common
+                .direct_outgoing
+                .lane(target, &self.common.config);
+            let class_slots = self.common.direct_class.clone();
+            let acquire = timeout_at(until, async {
+                #[cfg(test)]
+                let held = hold.acquire_owned().await?;
+                Ok::<_, tokio::sync::AcquireError>(OutgoingSlot {
+                    _slot: lane.acquire_owned().await?,
+                    _class: class_slots.acquire_owned().await?,
+                    #[cfg(test)]
+                    _held: held,
+                })
+            });
+            let _memory = self
+                .common
+                .shared
+                .reserve_scratch(ByteClass::Progress, std::mem::size_of_val(&acquire))?;
+            return match acquire.await {
+                Ok(Ok(slot)) => Ok(OutgoingReservation {
+                    target,
+                    class,
+                    slot,
+                    _waiting: None,
+                }),
+                _ => {
+                    self.common.refusals.outgoing(class);
+                    Err(RequestError::OutgoingLaneFull)
+                }
+            };
+        }
         let waiting_lane = self.common.waiting.lane(target, class, &self.common.config);
         let waiting_class = self.common.waiting_class[index].clone();
         let lane = self
@@ -1144,10 +1284,7 @@ impl WorkerClient {
                 waiting_class.acquire_owned().await?,
             );
             #[cfg(test)]
-            let held = self.common.outgoing_hold[index]
-                .clone()
-                .acquire_owned()
-                .await?;
+            let held = hold.acquire_owned().await?;
             let slot = lane.acquire_owned().await?;
             let class_slot = class_slots.acquire_owned().await?;
             Ok::<_, tokio::sync::AcquireError>((
@@ -1170,7 +1307,7 @@ impl WorkerClient {
                 target,
                 class,
                 slot,
-                _waiting: waiting,
+                _waiting: Some(waiting),
             }),
             _ => {
                 self.common.refusals.outgoing(class);
@@ -1665,7 +1802,8 @@ pub(crate) struct OutgoingReservation {
     slot: OutgoingSlot,
     /// The waiting callers' share of the lane and the class, held with the
     /// slot. A request moves `slot` out; dropping the rest frees the share.
-    _waiting: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    /// `None` on a direct lane (RD3), which has no share to keep.
+    _waiting: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
 }
 
 /// A caller slot on one peer lane and in its class. Dropping it frees both.
@@ -1709,6 +1847,30 @@ impl OutgoingLanes {
                 Arc::new(Semaphore::new(capacity(config.handler_slots[i])))
             }))
         })[class as usize]
+            .clone()
+    }
+}
+
+/// RD3: caller slots per peer for direct requests to peers that negotiated
+/// `PeerFeature::DirectAdmission`, `direct_handler_slots` each, created on
+/// first use and pruned like [`OutgoingLanes`].
+#[derive(Default)]
+struct DirectLanes {
+    lanes: Mutex<std::collections::HashMap<Uuid, Arc<Semaphore>>>,
+}
+impl DirectLanes {
+    fn lane(&self, worker: Uuid, config: &TransportConfig) -> Arc<Semaphore> {
+        let mut lanes = self
+            .lanes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capacity = config.direct_handler_slots;
+        if !lanes.contains_key(&worker) && lanes.len() >= OutgoingLanes::PRUNE_AT {
+            lanes.retain(|_, lane| lane.available_permits() != capacity);
+        }
+        lanes
+            .entry(worker)
+            .or_insert_with(|| Arc::new(Semaphore::new(capacity)))
             .clone()
     }
 }
