@@ -14,10 +14,41 @@ use serde::de::DeserializeOwned;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        RwLock,
+        Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
+
+/// REP6: a Data-only worker refreshes its revocation view this often.
+pub(crate) const REVOCATION_REFRESH: Duration = Duration::from_secs(1);
+/// One refresh waits at most this long for a Control majority.
+const REVOCATION_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// A view without a successful majority refresh for longer than this is
+/// stale. It keeps enforcing what it learned and keeps serving (Data
+/// availability does not depend on Control's); see `docs/oltp-recovery.md`.
+pub(crate) const REVOCATION_STALE_AFTER: Duration = Duration::from_secs(5);
+/// Control retains at most 1,024 revocations plus the one REP4 could commit
+/// past its limit (`system_trust::MAX_RETAINED_REVOCATIONS`).
+pub(crate) const MAX_VIEW_REVOCATIONS: usize = 1025;
+
+/// Committed system revocations as a majority of Control voters report
+/// them. A Data-only worker has no Control replica of its own.
+pub(crate) trait RevocationSource: Send + Sync + 'static {
+    fn revocations(&self) -> EndpointFuture<'_, Vec<WorkerIdentity>>;
+}
+
+impl RevocationSource for ControlClient {
+    fn revocations(&self) -> EndpointFuture<'_, Vec<WorkerIdentity>> {
+        Box::pin(self.revocations_quorum())
+    }
+}
+
+/// The freshness of a Data-only worker's revocation view.
+struct RemoteRevocations {
+    refreshed: Mutex<Instant>,
+    stale: AtomicBool,
+}
 
 enum Role {
     Worker,
@@ -33,11 +64,28 @@ struct Entry {
 }
 struct SystemTrust {
     revision: u64,
+    hardened: bool,
+    deferred_data: bool,
     operators: BTreeMap<Uuid, WorkerEnrollment>,
-    revoked_workers: BTreeSet<Uuid>,
-    revoked_certificates: BTreeSet<Digest>,
     candidate: Option<(ReplacementRecord, bool)>,
     _charge: ScratchLease,
+}
+
+#[derive(Default)]
+struct Revocations {
+    workers: BTreeSet<Uuid>,
+    certificates: BTreeSet<Digest>,
+}
+
+pub(crate) struct RevocationReload<'a>(&'a AppliedPeerDirectory);
+
+impl Drop for RevocationReload<'_> {
+    fn drop(&mut self) {
+        self.0.reloading_revocations.store(false, Ordering::Release);
+        // A revocation recorded during the reload wakes sessions only now:
+        // while reloading, `resolve` refuses every peer.
+        self.0.wake_sessions();
+    }
 }
 
 pub(crate) struct AppliedPeerDirectory {
@@ -52,7 +100,14 @@ pub(crate) struct AppliedPeerDirectory {
     epoch: AtomicU64,
     cold_bootstrap: AtomicBool,
     reloading_revocations: AtomicBool,
+    revocations_ready: AtomicBool,
+    revocations: RwLock<Revocations>,
+    revocation_memory: std::sync::OnceLock<ScratchLease>,
+    remote: std::sync::OnceLock<RemoteRevocations>,
+    trust_changes: tokio::sync::watch::Sender<u64>,
     refresh: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    pub(crate) fail_replacement_trust_install: AtomicBool,
 }
 impl AppliedPeerDirectory {
     /// Bootstrap pins are an explicit operator-supplied Control peer set. They
@@ -79,7 +134,14 @@ impl AppliedPeerDirectory {
             epoch: AtomicU64::new(1),
             cold_bootstrap: AtomicBool::new(false),
             reloading_revocations: AtomicBool::new(false),
+            revocations_ready: AtomicBool::new(true),
+            revocations: RwLock::new(Revocations::default()),
+            revocation_memory: std::sync::OnceLock::new(),
+            remote: std::sync::OnceLock::new(),
+            trust_changes: tokio::sync::watch::Sender::new(0),
             refresh: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            fail_replacement_trust_install: AtomicBool::new(false),
         });
         for peer in peers {
             if directory
@@ -94,6 +156,149 @@ impl AppliedPeerDirectory {
         }
         Ok(directory)
     }
+    /// REP6: seeds a Data-only worker's revocation view from a Control
+    /// majority. Each exchange then checks the view in memory only
+    /// ([`PeerDirectory::revoked`], [`PeerDirectory::verify`]); the view is
+    /// kept current by [`Self::run_revocation_refresh`].
+    pub(crate) async fn seed_remote_revocations(
+        &self,
+        source: &dyn RevocationSource,
+    ) -> Result<(), ProtocolError> {
+        self.reserve_revocations(MAX_VIEW_REVOCATIONS)?;
+        let revoked = source.revocations().await?;
+        self.learn_revocations(revoked)?;
+        let now = Instant::now();
+        if let Err(view) = self.remote.set(RemoteRevocations {
+            refreshed: Mutex::new(now),
+            stale: AtomicBool::new(false),
+        }) {
+            drop(view);
+            self.mark_refreshed(now);
+        }
+        Ok(())
+    }
+
+    /// Refreshes the view every [`REVOCATION_REFRESH`] with one majority
+    /// read. A failed refresh keeps every revocation already learned (Control
+    /// never deletes one) and keeps the worker serving; past
+    /// [`REVOCATION_STALE_AFTER`] it logs that the view is stale.
+    pub(crate) async fn run_revocation_refresh(
+        self: Arc<Self>,
+        source: Arc<dyn RevocationSource>,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut interval = tokio::time::interval(REVOCATION_REFRESH);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            if *stop.borrow() {
+                return;
+            }
+            tokio::select! {
+                changed = stop.changed() => if changed.is_err() || *stop.borrow() { return },
+                _ = interval.tick() => {}
+            }
+            let read = tokio::time::timeout(REVOCATION_READ_TIMEOUT, source.revocations());
+            let result = tokio::select! {
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() { return }
+                    continue
+                }
+                result = read => result.unwrap_or_else(|_| Err(unavailable())),
+            };
+            self.refreshed(result.and_then(|revoked| self.learn_revocations(revoked)));
+        }
+    }
+
+    fn refreshed(&self, result: Result<usize, ProtocolError>) {
+        use crate::oltp_runtime::stage_timing::perf_stage;
+        let Some(remote) = self.remote.get() else {
+            return;
+        };
+        match result {
+            Ok(learned) => {
+                perf_stage!("peer.revocations.refresh").record(Duration::ZERO);
+                self.mark_refreshed(Instant::now());
+                if learned > 0 {
+                    tracing::info!(learned, "Data-only revocation view learned revocations");
+                }
+            }
+            Err(error) => {
+                perf_stage!("peer.revocations.refresh_failed").record(Duration::ZERO);
+                let age = self.revocation_view_age().unwrap_or_default();
+                if age > REVOCATION_STALE_AFTER && !remote.stale.swap(true, Ordering::AcqRel) {
+                    tracing::warn!(code=?error.code, age_ms=age.as_millis() as u64,
+                        "Data-only revocation view is stale: no Control majority refresh; \
+                         enforcing the revocations already learned");
+                }
+            }
+        }
+    }
+
+    fn mark_refreshed(&self, now: Instant) {
+        if let Some(remote) = self.remote.get() {
+            *remote
+                .refreshed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
+            if remote.stale.swap(false, Ordering::AcqRel) {
+                tracing::info!("Data-only revocation view refreshed from a Control majority again");
+            }
+        }
+    }
+
+    /// Time since the last successful majority refresh of a Data-only
+    /// worker's revocation view; `None` where Control is local.
+    pub(crate) fn revocation_view_age(&self) -> Option<Duration> {
+        let remote = self.remote.get()?;
+        Some(
+            remote
+                .refreshed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .elapsed(),
+        )
+    }
+
+    /// Records each revocation not yet known and drops its directory entry.
+    fn learn_revocations(&self, revoked: Vec<WorkerIdentity>) -> Result<usize, ProtocolError> {
+        if revoked.len() > MAX_VIEW_REVOCATIONS {
+            return Err(invalid());
+        }
+        let mut learned = 0;
+        for worker in revoked {
+            if self.record_revocation(worker) {
+                self.remove_replaced(worker)?;
+                learned += 1;
+            }
+        }
+        Ok(learned)
+    }
+
+    pub(crate) async fn exclude_replaced_bootstrap_peers(
+        &self,
+        control: &ControlClient,
+        peers: &[WorkerIdentity],
+    ) -> Result<(), ProtocolError> {
+        for &peer in peers {
+            if control.worker_exclusion_quorum(peer).await? {
+                self.remove_replaced(peer)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_replaced(&self, peer: WorkerIdentity) -> Result<(), ProtocolError> {
+        let mut entries = self.entries.write().map_err(|_| unavailable())?;
+        if entries
+            .get(&peer.worker_id)
+            .is_some_and(|entry| WorkerIdentity::from(&entry.enrollment) == peer)
+        {
+            entries.remove(&peer.worker_id);
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_cold_bootstrap(&self, cold: bool) {
         self.cold_bootstrap.store(cold, Ordering::Release);
     }
@@ -134,26 +339,27 @@ impl AppliedPeerDirectory {
         &self,
         revision: u64,
         operators: Vec<WorkerEnrollment>,
-        revoked: Vec<WorkerIdentity>,
         candidate: Option<(ReplacementRecord, bool)>,
+        hardened: bool,
+        deferred_data: bool,
     ) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        if self.fail_replacement_trust_install.load(Ordering::Acquire) {
+            return Err(unavailable());
+        }
         let charge = self.shared.reserve_scratch(
             crate::oltp::pool::ByteClass::Progress,
-            4096 + revoked.len() * 128
-                + candidate
-                    .as_ref()
-                    .map_or(0, |(record, _)| record.groups.len() * 2048),
+            4096 + candidate
+                .as_ref()
+                .map_or(0, |(record, _)| record.groups.len() * 2048),
         )?;
         *self.system.write().map_err(|_| unavailable())? = Some(SystemTrust {
             revision,
+            hardened,
+            deferred_data,
             operators: operators
                 .into_iter()
                 .map(|entry| (entry.worker_id, entry))
-                .collect(),
-            revoked_workers: revoked.iter().map(|worker| worker.worker_id).collect(),
-            revoked_certificates: revoked
-                .iter()
-                .map(|worker| worker.certificate_sha256)
                 .collect(),
             candidate,
             _charge: charge,
@@ -161,9 +367,78 @@ impl AppliedPeerDirectory {
         Ok(())
     }
 
-    pub(crate) fn replace_revocation_view(&self, updating: bool) {
-        self.reloading_revocations
-            .store(updating, Ordering::Release);
+    pub(crate) fn reserve_revocations(&self, limit: usize) -> Result<(), ProtocolError> {
+        if self.revocation_memory.get().is_none() {
+            let lease = self
+                .shared
+                .reserve_scratch(crate::oltp::pool::ByteClass::Progress, limit * 128)?;
+            let _ = self.revocation_memory.set(lease);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reloading_revocations(&self) -> RevocationReload<'_> {
+        self.reloading_revocations.store(true, Ordering::Release);
+        RevocationReload(self)
+    }
+
+    pub(crate) fn require_revocation_snapshot(&self) {
+        self.revocations_ready.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn install_revocations(&self, revoked: Vec<WorkerIdentity>) {
+        let mut learned = false;
+        for worker in revoked {
+            learned |= self.record_revocation(worker);
+        }
+        self.revocations_ready.store(true, Ordering::Release);
+        if learned {
+            self.wake_sessions();
+        }
+    }
+
+    /// Records `worker` as revoked. A new revocation wakes every session
+    /// ([`PeerDirectory::trust_changes`]) so a revoked peer's sessions close
+    /// now rather than at their next directory check.
+    pub(crate) fn record_revocation(&self, worker: WorkerIdentity) -> bool {
+        let learned = {
+            let mut revoked = self
+                .revocations
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let id = revoked.workers.insert(worker.worker_id);
+            revoked.certificates.insert(worker.certificate_sha256) || id
+        };
+        if learned {
+            self.wake_sessions();
+        }
+        learned
+    }
+
+    /// Wakes every session to recheck its peer ([`PeerDirectory::trust_changes`]).
+    /// Not while trust is unavailable: sessions would see every peer refused.
+    fn wake_sessions(&self) {
+        if self.trust_available() {
+            self.trust_changes
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+    }
+
+    fn trust_available(&self) -> bool {
+        self.revocations_ready.load(Ordering::Acquire)
+            && !self.reloading_revocations.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn replacement_hardening_active(&self) -> bool {
+        self.system
+            .read()
+            .is_ok_and(|system| system.as_ref().is_some_and(|state| state.hardened))
+    }
+
+    pub(crate) fn has_deferred_data_repairs(&self) -> bool {
+        self.system
+            .read()
+            .is_ok_and(|system| system.as_ref().is_some_and(|state| state.deferred_data))
     }
 
     pub(crate) fn has_mounted_replacement(&self) -> bool {
@@ -178,40 +453,37 @@ impl AppliedPeerDirectory {
     }
 
     pub(crate) fn system_placement_changed(&self) -> bool {
-        self.system.read().is_ok_and(|system| {
-            system
-                .as_ref()
-                .is_some_and(|state| !state.revoked_workers.is_empty())
-        })
-    }
-
-    pub(crate) fn replacement_capability_active(&self) -> bool {
-        self.system.read().is_ok_and(|system| system.is_some())
+        self.revocations
+            .read()
+            .is_ok_and(|revoked| !revoked.workers.is_empty())
     }
 
     pub(crate) fn current_operator(&self, identity: WorkerIdentity) -> Option<bool> {
-        if self.reloading_revocations.load(Ordering::Acquire) {
+        if !self.trust_available()
+            || self.denied(identity.worker_id, Some(identity.certificate_sha256))
+        {
             return Some(false);
         }
         match self.system.read() {
             Ok(state) => state.as_ref().map(|state| {
-                !Self::denied(state, identity.worker_id, Some(identity.certificate_sha256))
-                    && state
-                        .operators
-                        .get(&identity.worker_id)
-                        .is_some_and(|entry| {
-                            WorkerIdentity::from(entry) == identity
-                                || self.cold_peer(entry).as_ref().map(WorkerIdentity::from)
-                                    == Some(identity)
-                        })
+                state
+                    .operators
+                    .get(&identity.worker_id)
+                    .is_some_and(|entry| {
+                        WorkerIdentity::from(entry) == identity
+                            || self.cold_peer(entry).as_ref().map(WorkerIdentity::from)
+                                == Some(identity)
+                    })
             }),
             Err(_) => Some(false),
         }
     }
 
-    fn denied(state: &SystemTrust, worker: Uuid, certificate: Option<Digest>) -> bool {
-        state.revoked_workers.contains(&worker)
-            || certificate.is_some_and(|digest| state.revoked_certificates.contains(&digest))
+    fn denied(&self, worker: Uuid, certificate: Option<Digest>) -> bool {
+        self.revocations.read().map_or(true, |revoked| {
+            revoked.workers.contains(&worker)
+                || certificate.is_some_and(|digest| revoked.certificates.contains(&digest))
+        })
     }
 
     fn install(
@@ -270,6 +542,13 @@ impl AppliedPeerDirectory {
             },
         );
         Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn install_worker_for_test(
+        &self,
+        enrollment: WorkerEnrollment,
+    ) -> Result<(), ProtocolError> {
+        self.install(enrollment, Role::Worker, self.epoch.load(Ordering::Relaxed))
     }
     pub(crate) fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
@@ -424,12 +703,10 @@ impl PeerDirectory for AppliedPeerDirectory {
         Some(self.revision().max(revision))
     }
     fn revoked(&self, peer: WorkerIdentity) -> bool {
-        self.reloading_revocations.load(Ordering::Acquire)
-            || self.system.read().map_or(true, |state| {
-                state.as_ref().is_some_and(|state| {
-                    Self::denied(state, peer.worker_id, Some(peer.certificate_sha256))
-                })
-            })
+        !self.trust_available() || self.denied(peer.worker_id, Some(peer.certificate_sha256))
+    }
+    fn trust_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.trust_changes.subscribe())
     }
     fn is_api(&self, peer: WorkerIdentity) -> bool {
         self.entries.read().is_ok_and(|entries| {
@@ -440,21 +717,24 @@ impl PeerDirectory for AppliedPeerDirectory {
         })
     }
     fn resolve(&self, worker: Uuid) -> Result<WorkerEnrollment, ProtocolError> {
-        if self.reloading_revocations.load(Ordering::Acquire) {
+        if !self.trust_available() {
             return Err(unavailable());
         }
-        if let Some(state) = self.system.read().map_err(|_| unavailable())?.as_ref() {
-            if Self::denied(state, worker, None) {
-                return Err(unavailable());
-            }
-            if let Some((record, _)) = &state.candidate
-                && record.intent.next.worker_id == worker
-            {
-                return Ok(record.intent.next.clone());
-            }
-            // During a retained restart the prepared entry must override the
-            // previous operator, so applied operators are a later fallback.
+        if self.denied(worker, None) {
+            return Err(unavailable());
         }
+        if let Some((record, _)) = self
+            .system
+            .read()
+            .map_err(|_| unavailable())?
+            .as_ref()
+            .and_then(|state| state.candidate.as_ref())
+            && record.intent.next.worker_id == worker
+        {
+            return Ok(record.intent.next.clone());
+        }
+        // During a retained restart the prepared entry must override the
+        // previous operator, so applied operators are a later fallback.
         if let Some(candidate) = self
             .prepared
             .read()
@@ -491,42 +771,41 @@ impl PeerDirectory for AppliedPeerDirectory {
         if group.cluster_id != self.cluster {
             return Err(invalid());
         }
-        if self.reloading_revocations.load(Ordering::Acquire) {
+        if !self.trust_available() {
             return Err(unavailable());
         }
-        if let Some(state) = self.system.read().map_err(|_| unavailable())?.as_ref() {
-            if Self::denied(state, peer.worker_id, Some(peer.certificate_sha256)) {
+        if self.denied(peer.worker_id, Some(peer.certificate_sha256)) {
+            return Err(invalid());
+        }
+        if let Some(state) = self.system.read().map_err(|_| unavailable())?.as_ref()
+            && let Some((record, mounted)) = &state.candidate
+            && record.intent.next.worker_id == peer.worker_id
+        {
+            if WorkerIdentity::from(&record.intent.next) != peer {
                 return Err(invalid());
             }
-            if let Some((record, mounted)) = &state.candidate
-                && record.intent.next.worker_id == peer.worker_id
-            {
-                if WorkerIdentity::from(&record.intent.next) != peer {
-                    return Err(invalid());
-                }
-                let admitted = (group == &self.control && purpose == Purpose::SystemRecovery)
-                    || (*mounted
-                        && matches!(
-                            purpose,
-                            Purpose::Raft | Purpose::Snapshot | Purpose::RaftProgress
-                        )
-                        && record
-                            .groups
-                            .iter()
-                            .any(|plan| plan.expected.identity == *group))
-                    || (*mounted
-                        && state
-                            .operators
-                            .get(&peer.worker_id)
-                            .is_some_and(|entry| WorkerIdentity::from(entry) == peer)
-                        && group == &self.control
-                        && matches!(purpose, Purpose::Authority | Purpose::ControlDelegation));
-                return if admitted {
-                    Ok(TransportTrust::AppliedEnrollment)
-                } else {
-                    Err(unavailable())
-                };
-            }
+            let admitted = (group == &self.control && purpose == Purpose::SystemRecovery)
+                || (*mounted
+                    && matches!(
+                        purpose,
+                        Purpose::Raft | Purpose::Snapshot | Purpose::RaftProgress
+                    )
+                    && record
+                        .groups
+                        .iter()
+                        .any(|plan| plan.expected.identity == *group))
+                || (*mounted
+                    && state
+                        .operators
+                        .get(&peer.worker_id)
+                        .is_some_and(|entry| WorkerIdentity::from(entry) == peer)
+                    && group == &self.control
+                    && matches!(purpose, Purpose::Authority | Purpose::ControlDelegation));
+            return if admitted {
+                Ok(TransportTrust::AppliedEnrollment)
+            } else {
+                Err(unavailable())
+            };
         }
         if let Some(candidate) = self
             .prepared

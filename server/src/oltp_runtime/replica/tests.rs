@@ -473,20 +473,21 @@ fn o22_c04_r01_r03_r04_f03_live_read_grants_survive_copy_and_owner_loss() {
 fn o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement() {
     use crate::oltp_replication::service_rpc::ReadScope;
 
-    let fixture = Fixture::new(1);
+    let fixture = Fixture::new(2);
     let current = fixture.authority;
     let mut owner = fixture.replica(0);
+    let mut replicas = [fixture.replica(1)];
     let id = Uuid::new_v4();
     let body = fixture.body(id);
     let context = fixture.context(id, &body);
-    let read_ts = context.read.as_ref().unwrap().storage_pin.read_ts;
+    let read = context.read.clone().unwrap();
     let pending = owner.propose(current, body.clone(), context, 0).unwrap();
-    let accepted = copy(&mut owner, &mut [], &pending).unwrap();
-    copy(&mut owner, &mut [], &accepted);
+    let accepted = copy(&mut owner, &mut replicas, &pending).unwrap();
+    copy(&mut owner, &mut replicas, &accepted);
     let running = owner.start(current, id).unwrap();
-    copy(&mut owner, &mut [], &running);
+    copy(&mut owner, &mut replicas, &running);
     let pin = owner.record(id).unwrap().pinned_catalog.as_deref().unwrap();
-    let grant = ReadGrant {
+    let template = ReadGrant {
         scope: ReadScope {
             request: RequestBinding {
                 run_id: current.ready.view.run_id,
@@ -495,31 +496,106 @@ fn o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement() {
                 accepted_context: hash(pin),
             },
             authority: current.ready.view.authority(),
-            read_ts,
+            read_ts: read.storage_pin.read_ts,
         },
         owner: current.owner,
-        worker: current.owner,
+        worker: fixture.members[1],
         group: Uuid::new_v4(),
         node: 1,
-        ticket: Uuid::new_v4(),
+        ticket: Uuid::nil(),
         input: hash(b"scan page"),
     };
-    let pending = owner.update_read_grant(current, grant, true).unwrap().unwrap();
-    owner.complete_read_grant_copy(current, id, &pending).unwrap();
+    let target = replicas[0].shared_resources();
+    let scheduler = target.scheduler();
+    let baseline = scheduler.usage();
+    let grant = target.read_attempts.open(&target, template).unwrap();
+    let grant_bytes = scheduler.usage()[0].2 - baseline[0].2;
+    assert!(grant_bytes > 0);
+    let pending = owner
+        .update_read_grant(current, grant, true)
+        .unwrap()
+        .unwrap();
+    replicas[0]
+        .install_read_grants(current, current.owner, id, pending.clone())
+        .unwrap();
+    owner
+        .complete_read_grant_copy(current, id, &pending)
+        .unwrap();
+    let (claimed, attempt) = target
+        .read_attempts
+        .claim(grant.ticket, grant.owner, grant.group, grant.node)
+        .unwrap();
+    assert_eq!(claimed, grant);
     let reply = crate::response::encode_error(Some(id), QueueError::Unavailable.protocol());
     let digest = hash(&reply.body);
-    let terminal = owner.finish(current, id, reply.status, reply.body, 1).unwrap();
-    copy(&mut owner, &mut [], &terminal);
+    let terminal = owner
+        .finish(current, id, reply.status, reply.body, 1)
+        .unwrap();
+    let version = terminal.record_version().unwrap();
+    copy(&mut owner, &mut replicas, &terminal);
 
-    assert_eq!(owner.retained_record(id, 2).unwrap().state, RequestState::Failed);
+    assert_eq!(
+        owner.retained_record(id, 2).unwrap().state,
+        RequestState::Failed
+    );
     assert_eq!(owner.terminal_response_hash(id), Ok(digest));
+    assert!(owner.copies_complete(id));
     assert_eq!(owner.terminal_statement(id), Err(QueueError::Unavailable));
-    assert!(owner.knows_read_grant(grant));
+    assert_eq!(
+        owner.terminal_copy_statement(id),
+        Err(QueueError::Unavailable)
+    );
+    assert_eq!(
+        replicas[0].terminal_copy_statement(id),
+        Err(QueueError::Unavailable)
+    );
+    let before_settlement = scheduler.usage();
+    assert!(target.read_attempts.settle(grant).is_err());
+    assert_eq!(scheduler.usage(), before_settlement);
 
-    let cleared = owner.update_read_grant(current, grant, false).unwrap().unwrap();
+    drop(attempt);
+    target.read_attempts.settle(grant).unwrap();
+    assert_eq!(scheduler.usage()[0].2 + grant_bytes, before_settlement[0].2);
+    let cleared = owner
+        .update_read_grant(current, grant, false)
+        .unwrap()
+        .unwrap();
+    replicas[0]
+        .install_read_grants(current, current.owner, id, cleared.clone())
+        .unwrap();
+    assert_eq!(
+        owner.terminal_copy_statement(id),
+        Err(QueueError::Unavailable)
+    );
     assert_eq!(owner.terminal_statement(id), Err(QueueError::Unavailable));
-    owner.complete_read_grant_copy(current, id, &cleared).unwrap();
-    assert_eq!(owner.terminal_statement(id).unwrap().response_hash, digest);
+    owner
+        .complete_read_grant_copy(current, id, &cleared)
+        .unwrap();
+
+    // The new grant revision invalidates the old terminal frame's ACKs.
+    assert_eq!(owner.terminal_statement(id), Err(QueueError::Unavailable));
+    let settled = owner.resume(current, id).unwrap();
+    let settled_version = settled.record_version().unwrap();
+    assert_eq!(settled_version.version, version.version);
+    assert_ne!(settled_version.digest, version.digest);
+    let old_ack = CopyAcknowledgement::authenticated(current.owner, version);
+    assert!(matches!(
+        owner.acknowledge(current, old_ack),
+        Err(QueueError::Stale)
+    ));
+    let local_ack = owner.install(current, current.owner, &settled).unwrap();
+    owner.acknowledge(current, local_ack).unwrap();
+    assert_eq!(owner.terminal_statement(id), Err(QueueError::Unavailable));
+    let peer_ack = replicas[0]
+        .install(current, current.owner, &settled)
+        .unwrap();
+    owner.acknowledge(current, peer_ack).unwrap();
+
+    let statement = owner.terminal_statement(id).unwrap();
+    assert_eq!(statement.response_hash, digest);
+    assert_eq!(statement.pin_identity, read.identity);
+    assert_eq!(statement.storage_pin, read.storage_pin);
+    assert_eq!(replicas[0].terminal_copy_statement(id).unwrap(), statement);
 }
 
 #[test]

@@ -27,6 +27,7 @@ pub(crate) use forwarding::{DataWorkerClient, ForwardedControl, HostedControlEnd
 pub(crate) use group_damage::{
     GroupDamageReason, GroupDamageRecord, GroupDamageReplacement, GroupDamageReplacementPlan,
     GroupDamageReport, PoolRefusal, DirectCapabilityDamageGate,
+    MAX_ACTIVE_REPLACEMENTS as MAX_ACTIVE_DAMAGE_REPLACEMENTS,
 };
 #[allow(unused_imports)]
 pub(crate) use group_damage::{GroupDamageGate, GroupDamagePhase};
@@ -55,8 +56,11 @@ pub(crate) use service::{
 };
 pub(crate) use service::IdlePasses;
 pub(crate) use system_recovery::{
-    CAPABILITY as SYSTEM_REPLACEMENT_CAPABILITY, EXECUTION_CAPABILITY as SYSTEM_REPLACEMENT_EXECUTION, MAX_GROUPS as MAX_SYSTEM_REPLACEMENT_GROUPS,
-    ReplacementGroup, ReplacementIntent, ReplacementMountProof, ReplacementRecord, SystemRecoveryCommand,
+    CAPABILITY as SYSTEM_REPLACEMENT_CAPABILITY,
+    EXECUTION_CAPABILITY as SYSTEM_REPLACEMENT_EXECUTION,
+    HARDENING_CAPABILITY as SYSTEM_REPLACEMENT_HARDENING,
+    MAX_GROUPS as MAX_SYSTEM_REPLACEMENT_GROUPS, ReplacementGroup, ReplacementIntent,
+    ReplacementMountProof, ReplacementRecord, SystemRecoveryCommand,
 };
 #[cfg(test)]
 mod tests;
