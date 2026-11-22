@@ -838,6 +838,8 @@ def o06_r01_r03_r06_retained_restart(binary, test_executable, root):
             write_json(cluster.barrier_dir(name) / 'gates.json',
                        {queued_id: 'queued', preparation_write_id: 'queued', fenced_id: 'prepared'})
             write_json(cluster.barrier_dir(name) / 'inspect.json', ids)
+            write_json(cluster.barrier_dir(name) / 'transaction-gates.json',
+                       {fenced_id: {'retry-aborted-1': False, 'decision': False}})
         for request in requests:
             accepted = send_op(request, '/v1/requests')
             assert accepted == (202, dict(request_id=request['request_id'], run_id=cluster.run_id, state='queued')), accepted
@@ -901,6 +903,8 @@ def o06_r01_r03_r06_retained_restart(binary, test_executable, root):
                 killed_at = time.monotonic()
                 cluster.workers[victim].kill()
                 cluster.workers[victim].stop()
+                for name in WORKERS:
+                    (cluster.barrier_dir(name) / f'release-{fenced_id}').touch()
                 assert_start_refused(cluster, victim)
                 wait_for(lambda: two_ready(cluster, survivors), 'survivors removed the killed incarnation')
                 after_kill = wait_for(lambda: next((sample for sample in probes if sample > killed_at), None),
@@ -957,26 +961,29 @@ def o06_r01_r03_r06_retained_restart(binary, test_executable, root):
             assert success(*send_op(get(table, row['id']))) == row, body
         await_receipt(queued_id)
         assert success(*send_op(get(table, 1))) == {'id': 1, 'value': 1234}
-        fenced_error = dict(code='conflict', message='original execution authority was fenced',
-                            outcome='not_applied')
-        fenced_path = f'/v1/requests/{cluster.run_id}/{fenced_id}'
+        await_receipt(fenced_id)
 
-        def fenced_receipt():
-            status, response = send_op(None, fenced_path, timeout=5)
-            if status == 200 and response['state'] in ('succeeded', 'failed', 'abandoned'):
-                return response
+        def checkpoints(stage):
+            return [json.loads(path.read_text()) for name in WORKERS if
+                    (path := cluster.barrier_dir(name) / f'transaction-{fenced_id}-{stage}.json').is_file()]
 
-        assert wait_for(fenced_receipt, 'prepared mutation reconciles in the original run', PROBE_WINDOW) == dict(
-            request_id=fenced_id, run_id=cluster.run_id, state='failed', result=None, error=fenced_error)
-        decision = next(json.loads(path.read_text()) for name in survivors
-                        if (path := cluster.barrier_dir(name) / f'resolved-{fenced_id}.json').is_file())
-        assert decision['txn'] == {'request_id': fenced_id, 'attempt': 1}, decision
-        assert decision['request']['run_id'] == cluster.run_id, decision
-        assert decision['decision'] == {'abort': {'reason': 'abandoned_by_fence'}}, decision
-        assert send_op(fenced) == (409, {'request_id': fenced_id, 'error': fenced_error})
-        assert success(*send_op(get(table, -3))) is None
-        report('O14/R01/Q06 prepared mutation reconciled after owner fence', decision=decision,
-               receipt=fenced_error, row_present=False)
+        aborts = checkpoints('retry-aborted-1')
+        assert aborts and all(abort == aborts[0] for abort in aborts), aborts
+        abort = aborts[0]
+        assert abort['txn'] == {'request_id': fenced_id, 'attempt': 1}, abort
+        assert abort['request']['run_id'] == cluster.run_id, abort
+        assert abort['decision'] == {'abort': {'reason': 'retry_snapshot'}}, abort
+        commits = checkpoints('decision')
+        assert len(commits) == 1, commits
+        commit = commits[0]
+        assert commit['txn'] == {'request_id': fenced_id, 'attempt': 2}, commit
+        assert commit['request'] == abort['request'], (abort, commit)
+        assert 'commit' in commit['decision'], commit
+        assert send_op(fenced) == (200, {'request_id': fenced_id, 'data': None})
+        assert success(*send_op(get(table, -3))) == {'id': -3, 'value': 600}
+        assert checkpoints('decision') == commits
+        report('O10/O14/R01/Q06 prepared mutation committed once after owner fence',
+               aborted=abort, committed=commit, row={'id': -3, 'value': 600})
         recovered_nodes = []
         expected_voters = []
         for group, before in zip(groups, placements):
