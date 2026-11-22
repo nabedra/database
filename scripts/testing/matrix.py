@@ -348,8 +348,8 @@ class Cell:
     failed: int = 0
 
     def text(self) -> str:
-        if not self.required and self.state == "":
-            return ""
+        if not self.required:
+            return self.state  # "" or "n/a"; the register reason is in the JSON
         label = self.state
         if self.state == "stale":
             label = f"stale {self.behind} ({self.last})"
@@ -506,7 +506,7 @@ def render_markdown(m: Matrix) -> str:
     deferred = [c for c in m.cells.values() if c.deferred]
     if deferred:
         out += ["## Deferred cells", "", "These are never counted as green.", ""]
-        out += [f"- {c.guarantee} {c.kind}: {c.deferred}" for c in deferred]
+        out += [f"- {c.guarantee} {c.kind}: {c.reason or c.deferred}" for c in deferred]
         out.append("")
     if m.ignored:
         out += ["## Records not counted", ""]
@@ -522,9 +522,14 @@ def render_json(m: Matrix) -> dict:
             cells = {}
             for k in m.kinds:
                 c = m.cells[(g.id, k)]
+                if not c.required:
+                    if c.state:
+                        cells[k] = {"required": False, "state": c.state, "reason": c.reason}
+                    continue
                 cells[k] = {key: getattr(c, key) for key in (
                     "required", "state", "reason", "deferred", "behind", "last", "sha", "date",
-                    "checks", "run_url", "executed", "failed")}
+                    "checks", "run_url", "executed", "failed") if getattr(c, key) not in (None, "", [])}
+                cells[k].setdefault("required", True)
             rows.append({"id": g.id, "module": g.module, "level": g.level, "guarantee": g.statement,
                          "scenarios": g.scenarios, "cells": cells})
     return {"schema": "nabedra.coverage-matrix/1", "head": m.head, "allow_unattested": m.allow_unattested,
