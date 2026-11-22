@@ -450,7 +450,7 @@ impl DirectLink {
         request: &DirectRequest,
         forward: bool,
     ) -> Result<DirectResponse, DirectSendError> {
-        use super::{CallError, Method, RequestError, RequestTarget};
+        use super::{CallError, Method, Outgoing, RequestError, RequestTarget};
         if request.group != self.client.group.group_id
             || request.database != self.client.group.database
         {
@@ -504,14 +504,14 @@ impl DirectLink {
         let payload = Some(request.body.clone());
         match self
             .client
-            .call_member_reserved(
+            .call_member_with_outgoing(
                 self.client.action,
                 method,
                 &payload,
                 node,
                 RequestTarget::WorkerId(worker),
                 None,
-                Some(reservation),
+                Outgoing::Reserved(reservation),
             )
             .await
         {

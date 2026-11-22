@@ -416,6 +416,11 @@ impl TransactionCoordinator {
                 .collect::<Vec<_>>(),
         )
         .await;
+        #[cfg(test)]
+        if matches!(mode, CommitMode::Queued(_)) {
+            use super::recovery_tests::index_holds::{Checkpoint, checkpoint};
+            checkpoint(txn.request_id, Checkpoint::QueuedPrepare, || None).await;
+        }
         let mut stale_prepare = false;
         let preparation = async {
             let mut point_permit = None;

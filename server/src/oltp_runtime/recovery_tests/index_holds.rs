@@ -40,6 +40,7 @@ pub(crate) enum Checkpoint {
     ReadyCommit,
     ReadPin,
     Reclaim,
+    QueuedPrepare,
 }
 
 #[derive(Debug)]
