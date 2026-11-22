@@ -1049,6 +1049,15 @@ async fn o13_o14_q06_retirement_certificate_survives_retry_reopen_and_ready_chan
 
 #[tokio::test]
 async fn o08_q05_o10_retry_abort_fences_commit_and_requires_exact_settlement() {
+    retry_abort_fences_commit_and_requires_exact_settlement(false).await;
+}
+
+#[tokio::test]
+async fn o10_o14_r01_q06_fenced_retry_abort_requires_exact_settlement() {
+    retry_abort_fences_commit_and_requires_exact_settlement(true).await;
+}
+
+async fn retry_abort_fences_commit_and_requires_exact_settlement(fence_owner: bool) {
     use crate::oltp::mvcc::{CanonicalJson, store::ResolutionEvidence};
     use crate::oltp_replication::authority::timestamp::cold::ColdApplicationPin;
 
@@ -1083,7 +1092,7 @@ async fn o08_q05_o10_retry_abort_fences_commit_and_requires_exact_settlement() {
     let result = CanonicalJson::from_serializable(f.pool.resources(), &true, 1024).unwrap();
     let outcome = MutationOutcome::from_success(&result).unwrap();
     let result_digest = outcome.digest().unwrap();
-    let begin = |attempt, request, read_ts| StatusCommand::BeginManifest {
+    let begin = |authority, attempt, request, read_ts| StatusCommand::BeginManifest {
         authority,
         txn: TxnId { attempt, ..txn },
         request,
@@ -1094,10 +1103,10 @@ async fn o08_q05_o10_retry_abort_fences_commit_and_requires_exact_settlement() {
     };
     let fresh = Timestamp::new(3).unwrap();
     assert_eq!(
-        f.apply(begin(2, request, fresh)).await,
+        f.apply(begin(authority, 2, request, fresh)).await,
         StatusReply::Rejected(StatusFault::Incomplete)
     );
-    let StatusReply::Manifest(draft) = f.apply(begin(1, request, read_ts)).await else {
+    let StatusReply::Manifest(draft) = f.apply(begin(authority, 1, request, read_ts)).await else {
         panic!("expected manifest draft");
     };
     let participant = ParticipantPlan {
@@ -1145,6 +1154,35 @@ async fn o08_q05_o10_retry_abort_fences_commit_and_requires_exact_settlement() {
     })
     .await;
     let permit = f.read_handle().commit_permit(authority, txn).await.unwrap();
+    let stamp = super::super::CommitStamp {
+        permit_digest: permit.allocation_digest().unwrap(),
+        commit_ts: Timestamp::new(2).unwrap(),
+        allocated_at: applied_at,
+    };
+    let authority = if fence_owner {
+        let next = Authority {
+            owner_term: 2,
+            ..authority
+        };
+        f.apply(StatusCommand::Fence {
+            transition_id: Uuid::new_v4(),
+            expected: Some(authority),
+            next,
+        })
+        .await;
+        assert_eq!(
+            f.apply(StatusCommand::DecideCommit {
+                authority,
+                permit: permit.clone(),
+                stamp,
+            })
+            .await,
+            StatusReply::Rejected(StatusFault::StaleAuthority)
+        );
+        next
+    } else {
+        authority
+    };
     let failure = MutationOutcome::failure(ProtocolError::new(
         ErrorCode::Conflict,
         "stale prepare",
@@ -1157,19 +1195,16 @@ async fn o08_q05_o10_retry_abort_fences_commit_and_requires_exact_settlement() {
         reason: AbortReason::RetrySnapshot,
         outcome: failure.clone(),
     };
-    let StatusReply::Decided(aborted) = f.apply(abort.clone()).await else {
-        panic!("expected retry abort");
+    let reply = f.apply(abort.clone()).await;
+    let StatusReply::Decided(aborted) = reply else {
+        panic!("expected retry abort, got {reply:?}");
     };
     assert!(aborted.decision.retries_snapshot());
     assert_eq!(f.apply(abort).await, StatusReply::Decided(aborted.clone()));
     assert_eq!(
         f.apply(StatusCommand::DecideCommit {
             authority,
-            stamp: super::super::CommitStamp {
-                permit_digest: permit.allocation_digest().unwrap(),
-                commit_ts: Timestamp::new(2).unwrap(),
-                allocated_at: applied_at,
-            },
+            stamp,
             permit,
         })
         .await,
@@ -1185,7 +1220,7 @@ async fn o08_q05_o10_retry_abort_fences_commit_and_requires_exact_settlement() {
         StatusReply::Rejected(StatusFault::AlreadyDecided)
     );
     assert_eq!(
-        f.apply(begin(2, request, fresh)).await,
+        f.apply(begin(authority, 2, request, fresh)).await,
         StatusReply::Rejected(StatusFault::InvalidBinding)
     );
     assert_eq!(
@@ -1213,7 +1248,7 @@ async fn o08_q05_o10_retry_abort_fences_commit_and_requires_exact_settlement() {
 
     let mut f = f.reopen().await;
     assert_eq!(
-        f.apply(begin(2, request, read_ts)).await,
+        f.apply(begin(authority, 2, request, read_ts)).await,
         StatusReply::Rejected(StatusFault::InvalidBinding)
     );
     let changed = RequestBinding {
@@ -1221,11 +1256,11 @@ async fn o08_q05_o10_retry_abort_fences_commit_and_requires_exact_settlement() {
         ..request
     };
     assert_eq!(
-        f.apply(begin(2, changed, fresh)).await,
+        f.apply(begin(authority, 2, changed, fresh)).await,
         StatusReply::Rejected(StatusFault::InvalidBinding)
     );
     assert_eq!(
-        f.apply(begin(3, request, fresh)).await,
+        f.apply(begin(authority, 3, request, fresh)).await,
         StatusReply::Rejected(StatusFault::Incomplete)
     );
     // Replanning can discover a deterministic error before opening attempt 2.
@@ -1237,13 +1272,13 @@ async fn o08_q05_o10_retry_abort_fences_commit_and_requires_exact_settlement() {
     );
     assert_eq!(f.apply(terminal_failure).await, first);
     assert_eq!(
-        f.apply(begin(2, request, fresh)).await,
+        f.apply(begin(authority, 2, request, fresh)).await,
         StatusReply::Rejected(StatusFault::AlreadyDecided)
     );
 
     let cold = Authority {
         run_id: Uuid::new_v4(),
-        owner_term: 2,
+        owner_term: authority.owner_term + 1,
     };
     f.apply(StatusCommand::Fence {
         transition_id: Uuid::new_v4(),

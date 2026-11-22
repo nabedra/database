@@ -1,7 +1,7 @@
 """RF3 process assertions for O06, O08, O09 and O11."""
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import suppress
 from functools import lru_cache
 import http.client
@@ -304,11 +304,132 @@ def o08(fixture):
         verify_queued_snapshot_retry(fixture, table)
         passed('O08', 'fresh-snapshot-retry',
                'A queued update lost its first Prepare and committed from a fresh snapshot under the original request ID.')
+    verify_storage_reservations(fixture, table)
     verify_queued_retry_exhaustion(fixture, table)
     verify_queued_batch_retry_after_owner_loss(fixture)
-    not_run('O08', 'storage-reservations',
-            'The pool can report filesystem headroom and ENOSPC, but it has no owned disk-byte '
-            'reservations for competing writes. A measured race requires that admission mechanism.')
+
+
+def verify_storage_reservations(fixture, table):
+    cluster = fixture.cluster
+    if not cluster.mounts:
+        not_run('O08', 'storage-reservations', 'The disk budget fixture needs a Linux tmpfs mount and passwordless sudo.')
+        return
+    # Direct batching serializes proposals within one range. Choose two
+    # different ranges led on one filesystem. Four ranges suffice at RF3.
+    ranges = {}
+    for index in range(len(WORKERS) + 1):
+        candidate = table if index == 0 else create(fixture, f'disk_race_{index}')
+        seed = batch(candidate, rows(100, category=1))
+        fixture.select(seed['request_id'], {'participants': False})
+        fixture.admit(seed)
+        _, plans = fixture.reached(seed['request_id'], 'participants')
+        assert len(plans) == 1, plans
+        fixture.terminal(seed['request_id'], 1)
+        group = plans[0]['group']['group_id']
+        owner = data_leader(fixture, group)
+        if owner in ranges:
+            contenders = [ranges[owner], (candidate, group)]
+            break
+        ranges[owner] = candidate, group
+    else:
+        raise AssertionError(f'no two Data ranges share a leader: {ranges}')
+    directory = Path(cluster.config[owner]['node']['directory'])
+
+    def disk_stats():
+        [stats] = cluster.stats(owner)['storage_reservations']
+        return stats
+
+    before = disk_stats()
+    assert before['reserved_bytes'] == before['reservations'] == 0, before
+    # Measure a same-sized insert through this mode's real proposal path.
+    # Prepare and Direct have different encoded sizes and apply costs.
+    target, group = contenders[0]
+    probe = point(target, 'insert', row=rows(103, category=1)[0])
+    fixture.select(probe['request_id'], {'storage-reserved': True})
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        call = pool.submit(exchange, fixture, probe)
+        try:
+            assert fixture.reached(probe['request_id'], 'storage-reserved') == (owner, group)
+            measured = disk_stats()
+            charge = measured['reserved_bytes']
+            assert measured['reservations'] == 1 and charge >= 8192, measured
+        finally:
+            fixture.release(probe['request_id'], 'storage-reserved')
+        assert call.result(timeout=35) == (200, dict(request_id=probe['request_id'], data=None))
+    keep = before['protected_bytes'] + charge + charge // 2
+    requests = [point(target, 'insert', row=row)
+                for (target, _), row in zip(contenders, rows(101, 102, category=1), strict=True)]
+    by_table = {body['payload']['table_id']: target for body, target in zip(requests, contenders, strict=True)}
+    for body in requests:
+        fixture.select(body['request_id'], {'storage-admission': True, 'storage-reserved': True})
+    filler = directory / 'o08-reservation-pressure'
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            calls = {pool.submit(exchange, fixture, body): body for body in requests}
+            try:
+                for body in requests:
+                    _, expected_group = by_table[body['payload']['table_id']]
+                    assert fixture.reached(body['request_id'], 'storage-admission') == (owner, expected_group)
+                free = os.statvfs(directory)
+                size = free.f_bavail * free.f_frsize - keep
+                assert size > 0
+                with filler.open('xb') as handle:
+                    os.posix_fallocate(handle.fileno(), 0, size)
+                ready = disk_stats()
+                budget = ready['available_bytes'] - ready['protected_bytes']
+                assert charge <= budget < 2 * charge and ready['reserved_bytes'] == 0, ready
+                for body in requests:
+                    fixture.release(body['request_id'], 'storage-admission')
+                done, held = wait(calls, timeout=12, return_when=FIRST_COMPLETED)
+                assert len(done) == len(held) == 1, (done, held)
+                loser = calls[next(iter(done))]
+                winner = calls[next(iter(held))]
+                _, expected_group = by_table[winner['payload']['table_id']]
+                assert fixture.reached(winner['request_id'], 'storage-reserved') == (owner, expected_group)
+                refusal = next(iter(done)).result()
+                assert refusal == (503, dict(request_id=loser['request_id'], error=dict(
+                    code='storage_unavailable',
+                    message='OLTP filesystem has insufficient unreserved storage',
+                    outcome='not_applied',
+                ))), refusal
+                charged = disk_stats()
+                actual = charged['reserved_bytes']
+                assert charged['reservations'] == 1 and abs(actual - charge) <= 4096, charged
+                assert actual <= budget < actual + charge - 4096, charged
+                losing_table, _ = by_table[loser['payload']['table_id']]
+                assert fixture.data(point(losing_table, 'get', key=loser['payload']['row']['id'])) is None
+            finally:
+                for body in requests:
+                    fixture.release(body['request_id'], 'storage-admission')
+                    fixture.release(body['request_id'], 'storage-reserved')
+            success = next(iter(held)).result(timeout=35)
+            assert success == (200, dict(request_id=winner['request_id'], data=None)), success
+        settled = disk_stats()
+        assert settled['reserved_bytes'] == settled['reservations'] == 0, settled
+        assert exchange(fixture, winner) == success
+        if not fixture.direct:
+            assert exchange(fixture, loser) == refusal
+        replacement = {**loser, 'request_id': uid()}
+        assert fixture.data(replacement) is None
+        for body in (winner, replacement):
+            row = body['payload']['row']
+            target, _ = by_table[body['payload']['table_id']]
+            assert fixture.data(point(target, 'get', key=row['id'])) == row
+        assert disk_stats()['reservations'] == 0
+        print('O08 filesystem accounting', json.dumps(dict(ready=ready, charged=charged, settled=settled)), flush=True)
+    finally:
+        filler.unlink(missing_ok=True)
+
+    result = subprocess.run([
+        cluster.test_executable, '--exact',
+        'oltp_runtime::direct::tests::reservations::o08_o13_small_data_proposals_share_two_gib',
+        '--ignored', '--nocapture',
+    ], env={**os.environ, 'TMPDIR': str(directory)}, capture_output=True, text=True, timeout=90)
+    print(result.stdout, end='', flush=True)
+    print(result.stderr, end='', file=sys.stderr, flush=True)
+    assert result.returncode == 0 and 'test result: ok. 1 passed; 0 failed;' in result.stdout
+    passed('O08', 'storage-reservations',
+           'Two RF3 inserts raced for one filesystem budget. On a 2 GiB filesystem, 256 concurrent small Data proposals applied and an oversized proposal was refused before Raft. Both fixtures released every reservation.')
 
 
 def direct_proposal_paths(fixture, request_id):
@@ -827,8 +948,8 @@ def main():
     parser.add_argument('--test-executable', type=Path, required=True)
     args = parser.parse_args()
     direct = os.environ.get('NABEDRA_TEST_DIRECT_OLTP') != 'off'
-    mounts = args.scenario == 'O11'
-    if mounts and not Rf3Cluster.mounts_available():
+    mounts = args.scenario in ('O08', 'O11') and Rf3Cluster.mounts_available()
+    if args.scenario == 'O11' and not mounts:
         not_run('O11', 'committed-state-replay', 'RF3 cold start requires separate Linux pool mounts and passwordless sudo.')
         return
     with tempfile.TemporaryDirectory(prefix=f'nabedra-{args.scenario.lower()}-') as root:

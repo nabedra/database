@@ -21,6 +21,7 @@ use futures_util::{Stream, StreamExt};
 use openraft::{
     OptionalSend, Raft, RaftSnapshotBuilder, ReadPolicy,
     errors::{ClientWriteError, RaftError},
+    raft::ClientWriteResponse,
     storage::{EntryResponder, RaftStateMachine},
     type_config::alias::{SnapshotMetaOf, SnapshotOf, StoredMembershipOf},
     vote::RaftLeaderId,
@@ -37,6 +38,8 @@ use std::{
     time::Duration,
 };
 use transient::{HostRetry, RaftHealthStats, RaftWrite, transient};
+
+mod disk_admission;
 
 const META: TransactionBudget = TransactionBudget {
     scratch_bytes: 256 << 10,
@@ -55,6 +58,17 @@ pub(crate) trait TypedMachine<C: TypedConfig>: Clone + Send + Sync + 'static {
         meta: ApplyMeta,
         command: OwnedCommand<C::Command>,
     ) -> impl Future<Output = Result<ChargedBytes, ProtocolError>> + Send;
+
+    fn client_write(
+        &self,
+        raft: &HostRaft<C, Self>,
+        command: OwnedCommand<C::Command>,
+    ) -> impl Future<Output = Result<ClientWriteResponse<C>, ProtocolError>> + Send
+    where
+        C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
+    {
+        async move { raft.client_write(command).await.map_err(client_write_error) }
+    }
 }
 impl TypedMachine<super::authority::config::DataConfig>
     for crate::oltp::mvcc::store::ParticipantMachine
@@ -68,6 +82,13 @@ impl TypedMachine<super::authority::config::DataConfig>
         command: OwnedCommand<crate::oltp::mvcc::store::ParticipantCommand>,
     ) -> Result<ChargedBytes, ProtocolError> {
         self.apply(meta, command).await
+    }
+    async fn client_write(
+        &self,
+        raft: &HostRaft<super::authority::config::DataConfig, Self>,
+        command: OwnedCommand<crate::oltp::mvcc::store::ParticipantCommand>,
+    ) -> Result<ClientWriteResponse<super::authority::config::DataConfig>, ProtocolError> {
+        disk_admission::client_write(raft, self.store(), command).await
     }
 }
 impl TypedMachine<super::authority::config::CatalogConfig>
@@ -962,21 +983,7 @@ where
                 ],
             )
             .timer();
-            let response = self
-                .raft
-                .client_write(command)
-                .await
-                .map_err(|error| {
-                    tracing::error!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,"typed client_write failed");
-                    match error {
-                        // OpenRaft sends this response before it appends the entry.
-                        // LogEntryDiscarded and Fatal can also follow an append.
-                        RaftError::APIError(ClientWriteError::ForwardToLeader(_)) => {
-                            proposal_forwarded()
-                        }
-                        _ => unavailable(),
-                    }
-                })?;
+            let response = self.state.machine.client_write(&self.raft, command).await?;
             let (position, reply, owner) = response.data.into_parts()?;
             Ok(Applied::owned(
                 position,
@@ -1239,6 +1246,18 @@ fn unavailable() -> ProtocolError {
         "typed Raft quorum, application or leader authority unavailable",
         Outcome::Unknown,
     )
+}
+
+fn client_write_error<C: TypedConfig>(error: RaftError<C, ClientWriteError<C>>) -> ProtocolError {
+    // OpenRaft forwards before appending. LogEntryDiscarded and Fatal
+    // can also follow an append, so they retain the unknown outcome.
+    match error {
+        RaftError::APIError(ClientWriteError::ForwardToLeader(_)) => proposal_forwarded(),
+        other => {
+            tracing::error!(error = %other, "typed client_write failed");
+            unavailable()
+        }
+    }
 }
 
 pub(super) fn proposal_forwarded() -> ProtocolError {

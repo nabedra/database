@@ -50,7 +50,7 @@ use uuid::Uuid;
 pub(super) enum Committed {
     Applied,
     /// The request's dedup record already existed. A batch member carries
-    /// no result: the caller reads the record on its next attempt.
+    /// no result: the caller reads the record while still holding its latches.
     Replayed(Option<DirectResult>),
     Forwarded,
     Rejected(Fault),
@@ -263,11 +263,12 @@ impl Drop for Handoff {
             resources: self.resources.clone(),
             stats: self.stats.clone(),
             max_bytes: self.max_bytes,
+            unproposed: batch,
             armed: true,
         };
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                runtime.spawn(driver.run(batch));
+                runtime.spawn(driver.run());
             }
             // No runtime (shutdown): nothing was proposed.
             Err(_) => drop(driver),
@@ -280,17 +281,19 @@ struct Driver {
     resources: Arc<WorkerSharedResources>,
     stats: Arc<DirectStats>,
     max_bytes: usize,
+    /// Members taken from the queue before the driver starts proposing them.
+    unproposed: Vec<Member>,
     /// Until the queue is empty: on an unexpected stop (a panic or runtime
-    /// shutdown) `Drop` refuses the queued, unproposed members and idles the
-    /// range, so it never stays busy.
+    /// shutdown) `Drop` refuses unproposed members and idles the range.
     armed: bool,
 }
 impl Driver {
-    async fn run(mut self, mut batch: Vec<Member>) {
+    async fn run(mut self) {
         loop {
+            let batch = std::mem::take(&mut self.unproposed);
             self.propose(batch).await;
             match self.range.take(self.max_bytes) {
-                Some(next) => batch = next,
+                Some(next) => self.unproposed = next,
                 None => {
                     self.armed = false;
                     return;
@@ -366,7 +369,7 @@ impl Drop for Driver {
             state.busy = false;
             std::mem::take(&mut state.queue)
         };
-        for member in queued {
+        for member in self.unproposed.drain(..).chain(queued) {
             if let Ok(clock) = member.handle.direct_clock() {
                 clock.settle(member.commit.commit_ts);
             }
