@@ -1,0 +1,18 @@
+id = "rt-zero-cost"
+module = "oltp"
+kinds = ["P"]
+guarantees = ["OLTP-G13"]
+scenarios = ["O09"]
+tiers = ["T1"]
+command = ["bash", "-ec", '''
+if [[ ${GITHUB_ACTIONS:-} == true ]] && ! command -v valgrind >/dev/null; then
+    sudo -n apt-get update -qq
+    sudo -n apt-get install -y --no-install-recommends valgrind
+fi
+exec python3 scripts/testing/insn_count.py --base e3d51a6ab87facd85eb493115228771f1fc193a2 --head HEAD --skip-missing-valgrind
+''']
+cwd = "."
+timeout_s = 3600
+needs = []
+not_run_marker = "not-run: valgrind-missing"
+result_parser = "exit-code"

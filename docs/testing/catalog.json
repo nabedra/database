@@ -1,4 +1,4 @@
-{"schema":"nabedra.catalog/1","count":2307,"tests":[
+{"schema":"nabedra.catalog/1","count":2317,"tests":[
 {"file":"orm/python/tests/events/test_client.py","hash":"202d453fc9458842","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_ack_uses_exact_offset_and_rejects_foreign_delivery_before_request","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"1c426c67dd348a60","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_claim_reuses_uuid_after_missing_response","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"b8d2b5c0d984c70e","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_error_metadata_and_duplicate_fields","lang":"python"},
@@ -452,6 +452,16 @@
 {"file":"scripts/testing/test_ingest_evidence.py","hash":"d33b9ef7e0fe4fd9","id":"scripts/testing/test_ingest_evidence.py::IngestTests::test_rejects_valid_signature_from_another_run","lang":"python"},
 {"file":"scripts/testing/test_ingest_evidence.py","hash":"67ee83597ac4d650","id":"scripts/testing/test_ingest_evidence.py::IngestTests::test_unverified_records_are_excluded_from_consumers","lang":"python"},
 {"file":"scripts/testing/test_ingest_evidence.py","hash":"c123a77ad257353b","id":"scripts/testing/test_ingest_evidence.py::IngestTests::test_validates_schema_before_attestation","lang":"python"},
+{"file":"scripts/testing/test_insn_count.py","hash":"2f4105166bb6830c","id":"scripts/testing/test_insn_count.py::InstructionCountTests::test_build_work_uses_the_selected_directory","lang":"python"},
+{"file":"scripts/testing/test_insn_count.py","hash":"a0971f5af70c586d","id":"scripts/testing/test_insn_count.py::InstructionCountTests::test_cleanup_after_profiler_timeout","lang":"python"},
+{"file":"scripts/testing/test_insn_count.py","hash":"02ba9291ed2bd60d","id":"scripts/testing/test_insn_count.py::InstructionCountTests::test_measure_rejects_wrong_completed_operation_count_and_cleans_up","lang":"python"},
+{"file":"scripts/testing/test_insn_count.py","hash":"1fe62cf7e54721fe","id":"scripts/testing/test_insn_count.py::InstructionCountTests::test_missing_valgrind_requires_explicit_skip","lang":"python"},
+{"file":"scripts/testing/test_insn_count.py","hash":"3b53d8a22f5e481c","id":"scripts/testing/test_insn_count.py::InstructionCountTests::test_noisy_base_is_inconclusive_instead_of_passing","lang":"python"},
+{"file":"scripts/testing/test_insn_count.py","hash":"0304f64c88e0ce8f","id":"scripts/testing/test_insn_count.py::InstructionCountTests::test_one_regression_fails_even_if_another_workload_passes","lang":"python"},
+{"file":"scripts/testing/test_insn_count.py","hash":"862e7475cdc03375","id":"scripts/testing/test_insn_count.py::InstructionCountTests::test_parse_single_ir_summary","lang":"python"},
+{"file":"scripts/testing/test_insn_count.py","hash":"7fcb54da94a6c0a1","id":"scripts/testing/test_insn_count.py::InstructionCountTests::test_reject_missing_ambiguous_or_nonpositive_counts","lang":"python"},
+{"file":"scripts/testing/test_insn_count.py","hash":"9766211d554721ba","id":"scripts/testing/test_insn_count.py::InstructionCountTests::test_uses_medians_and_fails_strictly_above_half_percent","lang":"python"},
+{"file":"scripts/testing/test_insn_count.py","hash":"b32fe830d97c7851","id":"scripts/testing/test_insn_count.py::InstructionCountTests::test_uses_three_times_base_spread_when_larger","lang":"python"},
 {"file":"scripts/testing/test_ledger_sync.py","hash":"82507affb5d750c8","id":"scripts/testing/test_ledger_sync.py::LedgerSyncTests::test_publishes_only_bounded_text_to_the_orphan_branch","lang":"python"},
 {"file":"scripts/testing/test_ledger_sync.py","hash":"ecbb37ca84417a6a","id":"scripts/testing/test_ledger_sync.py::LedgerSyncTests::test_retries_are_noops_and_missing_local_files_survive","lang":"python"},
 {"file":"scripts/testing/test_ledger_sync.py","hash":"74d9b72e54a0725c","id":"scripts/testing/test_ledger_sync.py::LedgerSyncTests::test_total_cap_rejects_sync_before_publishing","lang":"python"},

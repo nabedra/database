@@ -41,3 +41,58 @@ at or above the configured threshold and an interval with a lower bound above
 `summary.md` contains the decision. The runner exits 0 for a pass, 1 for a
 regression and 2 for a command or input error. Use a distinct output directory
 for each comparison.
+
+## Phase 7 instruction counts
+
+Use Callgrind on Linux or WSL to compare the phase 7 runtime wrappers in a
+release build. Run from a checkout containing the harness and pass two refs
+available in that clone. The registered `rt-zero-cost` check compares the
+tested revision with the phase 7 base at `e3d51a6`. The check installs
+Valgrind when needed on GitHub Actions. Install it before running locally.
+
+```sh
+python3 scripts/testing/insn_count.py --base e3d51a6 --head HEAD --output counts.json
+```
+
+Pass `--workload cache-set` to focus on a single workload during diagnosis.
+
+The runner builds both commits in detached worktrees with private target
+directories. These live under a sibling `<checkout>-work` directory by default.
+Use `--work-dir` to put them on another disk. The runner uses `cargo-slot`
+when available, or Cargo, with six build jobs. It inserts the same driver
+into both checkouts, including visibility
+hooks to the standalone Cache command handler and OLAP queue clock. Builds
+use one engine feature at a time and the normal release profile.
+
+| Workload | Operation count | Product path |
+| --- | ---: | --- |
+| OLTP storage | 512 | Apply a batch with one row overwrite in the Data group store and verify the reply and final row. |
+| KV write and flush | 1,024 | Submit and await synced point writes on the native journal, flush to a run, and read back the last key. The flush cost is amortized over the writes. |
+| Cache SET | 8,192 | Parse and execute one standalone SET PX command per operation, including the wall-clock expiry validation. |
+| OLAP queue | 512 | Propose, acknowledge, start, finish and look up a request on a fresh in-process queue, using the production wall-clock helper. A fresh queue per operation keeps retained receipts from growing the cost of later operations. |
+
+Each workload runs three times per binary in alternating order with
+Callgrind fair scheduling to reduce variation in threaded paths. The result
+uses the median process-wide instruction count divided by the completed
+operation count. The counter includes setup, teardown and background threads.
+The noise floor is the full spread of the three base counts divided by their
+median. The threshold is the larger of 0.5% and three times that spread.
+The fixed allowance leaves room for small code generation differences and
+the spread multiplier accommodates repeat variation in threaded paths. An
+increase strictly above the threshold fails the comparison. If three times
+a base spread exceeds 2%, that workload is reported as `NOISY` and the run
+cannot pass, because a wider threshold could hide a regression. JSON output
+contains all six counts per workload. The exit statuses are 0 for a pass, 1
+for a regression and 2 for a noisy base or a tool or input error.
+
+The threshold is relative, so the smallest detectable increase depends on
+the cost of one operation. At 0.5% it is about 20 instructions per
+operation for Cache SET, 66 for KV, 170 for OLTP storage and 670 for the
+OLAP queue, whose cost is mostly request digests and record validation.
+Cache SET reads the wall clock once per operation, so it is the most
+sensitive check of a wrapper's own cost.
+
+These counts cover the measured code paths and exclude kernel instructions.
+Absolute latency and throughput targets still use their dedicated benchmarks.
+O09 tracks the associated clock-seam change. Clock jumps and real-time
+ordering (OLTP-G02) require their own functional assertions.
