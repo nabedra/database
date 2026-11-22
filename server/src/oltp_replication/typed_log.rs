@@ -1059,9 +1059,20 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                     _ => ExecutionClass::Query,
                 };
                 let request = batch[0].index();
-                let (batch, sizes) = store
-                    .resources()
-                    .execute(class, request, 0, move || {
+                // RD3: an unknown size keeps the native job.
+                let estimate = batch
+                    .iter()
+                    .map(|entry| {
+                        use crate::oltp_replication::owned::OwnedPayload;
+                        entry.heap_bytes().unwrap_or(usize::MAX)
+                    })
+                    .fold(0usize, usize::saturating_add);
+                let (batch, sizes) = super::hosted::execute_small(
+                    store.resources(),
+                    class,
+                    request,
+                    estimate,
+                    move || {
                         struct Counter(usize);
                         impl io::Write for Counter {
                             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -1084,9 +1095,10 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                             sizes.push(counter.0);
                         }
                         Ok((batch, sizes))
-                    })
-                    .await
-                    .map_err(disk)?;
+                    },
+                )
+                .await
+                .map_err(disk)?;
                 let written = std::time::Instant::now();
                 by_kind(
                     &kind,

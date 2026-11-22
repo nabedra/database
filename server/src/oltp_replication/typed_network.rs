@@ -255,16 +255,23 @@ impl<C: TypedConfig> TypedNetwork<C> {
             ProtocolError::from(failure)
         })?;
         // The two private return types contain only fixed vote/log metadata.
-        // Move the entire transport owner into the native codec until it settles.
-        let decoded = shared
-            .execute(execution(traffic), self.target, 0, move || {
+        // Move the entire transport owner into the codec until it settles; a
+        // small reply decodes on this task (RD3, PERF2b's bound).
+        let reply_bytes = reply.header.len();
+        let decoded = super::hosted::execute_small(
+            &shared,
+            execution(traffic),
+            self.target,
+            reply_bytes,
+            move || {
                 crate::protocol::json_input(reply.header.as_slice(), response_header)
                     .map_err(|_| invalid("typed Raft reply bounds"))?;
                 serde_json::from_slice(reply.header.as_slice())
                     .map_err(|_| invalid("invalid typed Raft reply"))
-            })
-            .await
-            .inspect_err(|error| report("decode_reply", "local_protocol", Some(error.code)))?;
+            },
+        )
+        .await
+        .inspect_err(|error| report("decode_reply", "local_protocol", Some(error.code)))?;
         if traffic == TrafficClass::RaftProgress {
             tracing::debug!(group=%group.group_id, from_node=header.from_node, to_node=header.to_node,
                 method=?header.method, ?purpose, prev_index=header.prev_log_id.map(|id| id.index),
@@ -306,36 +313,42 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
             let shared = self.factory.shared.clone();
             let resident = self.factory.resident.clone();
             let entries = rpc.entries.clone();
-            shared
-                .execute(execution(class), self.target, 0, {
-                    let shared = shared.clone();
-                    move || {
-                        let mut encoded = Vec::with_capacity(entries.len());
-                        let mut framed = 0usize;
-                        for entry in entries {
-                            let bytes = entry.charge_resident(&resident).and_then(|entry| {
-                                shared.encode_in(
-                                    class.byte_class(),
-                                    &entry,
-                                    crate::oltp::mvcc::MAX_FIXED_COMMAND_BYTES,
-                                )
-                            });
-                            let bytes = match bytes {
-                                Ok(bytes) => bytes,
-                                Err(error) if encoded.is_empty() => return Err(error),
-                                Err(_) => break,
-                            };
-                            framed += 4 + bytes.len();
-                            if !encoded.is_empty() && framed > budget {
-                                break;
-                            }
-                            encoded.push(bytes);
-                        }
-                        Ok(encoded)
-                    }
+            let estimate = entries
+                .iter()
+                .map(|entry| {
+                    use crate::oltp_replication::owned::OwnedPayload;
+                    entry.heap_bytes().unwrap_or(usize::MAX)
                 })
-                .await
-                .map_err(|_| unreachable())?
+                .fold(0usize, usize::saturating_add);
+            super::hosted::execute_small(&shared, execution(class), self.target, estimate, {
+                let shared = shared.clone();
+                move || {
+                    let mut encoded = Vec::with_capacity(entries.len());
+                    let mut framed = 0usize;
+                    for entry in entries {
+                        let bytes = entry.charge_resident(&resident).and_then(|entry| {
+                            shared.encode_in(
+                                class.byte_class(),
+                                &entry,
+                                crate::oltp::mvcc::MAX_FIXED_COMMAND_BYTES,
+                            )
+                        });
+                        let bytes = match bytes {
+                            Ok(bytes) => bytes,
+                            Err(error) if encoded.is_empty() => return Err(error),
+                            Err(_) => break,
+                        };
+                        framed += 4 + bytes.len();
+                        if !encoded.is_empty() && framed > budget {
+                            break;
+                        }
+                        encoded.push(bytes);
+                    }
+                    Ok(encoded)
+                }
+            })
+            .await
+            .map_err(|_| unreachable())?
         };
         rpc.entries.truncate(encoded.len());
         let previous = rpc.prev_log_id;
@@ -767,8 +780,13 @@ where
                     let entries = if head.payload_bytes == 0 {
                         Vec::new()
                     } else {
-                        shared
-                            .execute(execution(traffic), head.from_node, 0, {
+                        let input_bytes = sections.section(0).map_or(0, |input| input.len());
+                        super::hosted::execute_small(
+                            &shared,
+                            execution(traffic),
+                            head.from_node,
+                            input_bytes,
+                            {
                                 let shared = shared.clone();
                                 move || {
                                     let input = sections
@@ -790,8 +808,9 @@ where
                                         .map(|entry| vec![entry]),
                                     }
                                 }
-                            })
-                            .await?
+                            },
+                        )
+                        .await?
                     };
                     #[cfg(test)]
                     if !entries.is_empty() {
