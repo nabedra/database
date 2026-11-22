@@ -1,7 +1,9 @@
 from contextlib import redirect_stdout
 import io
 import json
+import math
 from pathlib import Path
+import random
 from shlex import join
 import sys
 from tempfile import TemporaryDirectory
@@ -23,21 +25,6 @@ for _ in range(int(sys.argv[2])):
 print(f"elapsed={min(elapsed):.9f}")
 """
 
-SEEDED_SLEEP = """\
-from pathlib import Path
-import random
-import sys
-import time
-
-counter = Path(sys.argv[1])
-index = int(counter.read_text())
-counter.write_text(str(index + 1))
-budget = .020 * random.Random(20261122 + index).uniform(.925, 1.075)
-time.sleep(budget)
-print(f"budget={budget:.9f}")
-"""
-
-
 def sleeper(delay, samples=1):
     return [sys.executable, "-S", "-c", SLEEP, str(delay), str(samples)]
 
@@ -49,12 +36,12 @@ class PairedBenchmarkTests(unittest.TestCase):
             spec = output / "sleep.toml"
             spec.write_text(
                 'name = "Synthetic sleep"\nmodule = "testing"\n'
-                'command = ["{bin}"]\nwarmup = 1\nrounds = 7\n'
+                'command = ["{bin}"]\nwarmup = 1\nrounds = 5\n'
                 r"metric = 'elapsed=(\d+\.\d+)'" + "\n"
             )
             result = ab.main([
-                # Use the fastest of five measured sleeps to reduce scheduler overshoot.
-                str(spec), join(sleeper(.020, 5)), join(sleeper(.022, 5)),
+                # Use the fastest of three 50 ms sleeps so scheduler overshoot stays small.
+                str(spec), join(sleeper(.050, 3)), join(sleeper(.055, 3)),
                 "--commands", "--output", str(output),
             ])
             data = json.loads((output / "results.json").read_text())
@@ -63,24 +50,35 @@ class PairedBenchmarkTests(unittest.TestCase):
         self.assertTrue(data["regression"])
         self.assertGreater(data["ci95"][0], 1)
         self.assertGreaterEqual(data["median_ratio"], 1.05)
-        self.assertEqual(len(data["pairs"]), 7)
+        self.assertEqual(len(data["pairs"]), 5)
         self.assertEqual(data["pairs"][0]["order"], ["head", "base"])
         self.assertEqual(data["bootstrap_seed"], ab.BOOTSTRAP_SEED)
         self.assertTrue(data["cpu_model"])
         self.assertIn("Regression on ", summary)
         print(f"Planted 10% sleep slowdown flagged (head/base {data['median_ratio']:.4f}).")
 
-    def test_no_op_commands_pass_at_least_nineteen_of_twenty_comparisons(self):
-        spec = ab.Spec("No-op sleep", "testing", ["{bin}"], 0, 3, r"budget=(\d+\.\d+)")
-        with TemporaryDirectory() as directory:
-            # Run identical workloads with seeded jitter. The reported budget
-            # isolates the statistical gate from unrelated host scheduling.
-            counter = Path(directory) / "counter"
-            counter.write_text("0")
-            command = [sys.executable, "-S", "-c", SEEDED_SLEEP, str(counter)]
-            passes = sum(not ab.benchmark(spec, command, command)["regression"] for _ in range(20))
-        self.assertGreaterEqual(passes, 19)
-        print(f"Seeded no-op sleep comparisons passed {passes}/20.")
+    def test_null_false_positive_rate_and_power_on_paired_noise(self):
+        # Monte Carlo over the real decision rule. Each pair shares a host
+        # factor (10% drift) and each side adds its own 5% noise, as on a shared
+        # runner. With six rounds, as in the perf specs, identical builds must be
+        # flagged at most 5% of the time, and a 10% slowdown must still be caught
+        # most of the time, so a gate that never flags cannot pass.
+        def flagged(rng, shift, trials=100):
+            hits = 0
+            for _ in range(trials):
+                pairs = []
+                for _ in range(6):
+                    host = math.exp(rng.gauss(0, .10))
+                    pairs.append({"base": host * math.exp(rng.gauss(0, .05)),
+                                  "head": host * shift * math.exp(rng.gauss(0, .05))})
+                hits += ab.compare(pairs, 5, 1000)["regression"]
+            return hits
+
+        false_positives = flagged(random.Random(20261122), 1.0)
+        detected = flagged(random.Random(20261123), 1.10)
+        self.assertLessEqual(false_positives, 5)
+        self.assertGreaterEqual(detected, 60)
+        print(f"Null comparisons flagged {false_positives}/100; 10% slowdowns flagged {detected}/100.")
 
     def test_threshold_and_confidence_both_required_with_seeded_bootstrap(self):
         def assess(ratios):
