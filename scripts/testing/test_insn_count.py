@@ -35,12 +35,47 @@ class InstructionCountTests(unittest.TestCase):
         self.assertFalse(insn_count.compare(base, [9900] * 3, 100)["regression"])
 
     def test_uses_three_times_base_spread_when_larger(self):
-        base = [990, 1000, 1010]
-        row = insn_count.compare(base, [1050, 1051, 1049], 10)
-        self.assertEqual(row["noise_pct"], 2)
-        self.assertEqual(row["threshold_pct"], 6)
+        base = [9970, 10000, 10030]
+        row = insn_count.compare(base, [10170, 10171, 10169], 10)
+        self.assertAlmostEqual(row["noise_pct"], 0.6)
+        self.assertAlmostEqual(row["threshold_pct"], 1.8)
         self.assertFalse(row["regression"])
-        self.assertTrue(insn_count.compare(base, [1061] * 3, 10)["regression"])
+        self.assertFalse(row["inconclusive"])
+        self.assertTrue(insn_count.compare(base, [10190] * 3, 10)["regression"])
+
+    def test_noisy_base_is_inconclusive_instead_of_passing(self):
+        # A 1% spread would allow 3%; the ceiling is 2%.
+        row = insn_count.compare([995, 1000, 1005], [1025] * 3, 10)
+        self.assertEqual(row["threshold_pct"], 3)
+        self.assertFalse(row["regression"])
+        self.assertTrue(row["inconclusive"])
+        self.assertFalse(insn_count.compare([997, 1000, 1003], [1000] * 3, 10)["inconclusive"])
+        counts = (
+            ("cache-set", {"base": [10000] * 3, "head": [10000] * 3}),
+            ("olap-queue", {"base": [995, 1000, 1005], "head": [1000] * 3}),
+        )
+        status, output = self.run_main(counts)
+        self.assertEqual(status, 2)
+        self.assertIn("NOISY olap-queue:", output)
+        self.assertIn("INCONCLUSIVE instruction-count comparison", output)
+        # A regression elsewhere still reports a failure.
+        status, output = self.run_main(
+            (("cache-set", {"base": [10000] * 3, "head": [10100] * 3}), counts[1])
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("FAIL cache-set:", output)
+
+    def run_main(self, counts):
+        output = io.StringIO()
+        with (
+            patch.object(insn_count.shutil, "which", return_value="/tool"),
+            patch.object(insn_count, "revision", side_effect=["base-sha", "head-sha"]),
+            patch.object(insn_count, "run", return_value="valgrind-3.26.0"),
+            patch.object(insn_count, "benchmark", return_value=counts),
+            contextlib.redirect_stdout(output),
+        ):
+            status = insn_count.main(["--base", "main", "--head", "topic"])
+        return status, output.getvalue()
 
     def test_measure_rejects_wrong_completed_operation_count_and_cleans_up(self):
         workload = insn_count.WORKLOADS[0]

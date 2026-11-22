@@ -21,6 +21,9 @@ DRIVERS = Path(__file__).resolve().with_name("insn_workloads")
 EXAMPLE = "phase7_insn_count"
 REPETITIONS = 3
 DEFAULT_THRESHOLD_PCT = 0.5
+# A noise-derived threshold above this cannot certify a pass. The largest
+# measured spread (0.27%, OLTP storage) gives 0.8%.
+MAX_NOISE_THRESHOLD_PCT = 2.0
 MISSING_COUNTER = "not-run: valgrind-missing"
 
 
@@ -145,6 +148,8 @@ def compare(base, head, operations, threshold_pct=DEFAULT_THRESHOLD_PCT):
     base_median, head_median = median(base), median(head)
     # The full base spread also covers worst-case variation between base runs.
     noise_pct = 100 * (max(base) - min(base)) / base_median
+    # A noisy base must not widen the threshold until it hides a regression.
+    inconclusive = 3 * noise_pct > max(threshold_pct, MAX_NOISE_THRESHOLD_PCT)
     threshold_pct = max(threshold_pct, 3 * noise_pct)
     delta_pct = 100 * (head_median - base_median) / base_median
     return {
@@ -157,6 +162,7 @@ def compare(base, head, operations, threshold_pct=DEFAULT_THRESHOLD_PCT):
         "threshold_pct": threshold_pct,
         "delta_pct": delta_pct,
         "regression": delta_pct > threshold_pct,
+        "inconclusive": inconclusive,
     }
 
 
@@ -218,7 +224,7 @@ def main(argv=None):
         for name, counts in benchmark(base, head, args.cargo, counter, workloads, args.work_dir.resolve()):
             row = compare(counts["base"], counts["head"], operations[name], args.threshold_pct)
             results[name] = row
-            status = "FAIL" if row["regression"] else "PASS"
+            status = "FAIL" if row["regression"] else "NOISY" if row["inconclusive"] else "PASS"
             print(
                 f"{status} {name}: ops={row['operations']} base={row['base_per_op']:.2f} "
                 f"head={row['head_per_op']:.2f} Ir/op delta={row['delta_pct']:+.4f}% "
@@ -227,15 +233,20 @@ def main(argv=None):
                 flush=True,
             )
         regression = any(row["regression"] for row in results.values())
+        inconclusive = not regression and any(row["inconclusive"] for row in results.values())
         if args.output:
             args.output.write_text(
                 json.dumps(
                     {"base": base, "head": head, "counter": version, "profile": "release",
-                     "fair_scheduling": True, "regression": regression, "workloads": results},
+                     "fair_scheduling": True, "regression": regression,
+                     "inconclusive": inconclusive, "workloads": results},
                     indent=2,
                 ) + "\n",
                 encoding="utf-8",
             )
+        if inconclusive:
+            print("INCONCLUSIVE instruction-count comparison: a NOISY base spread cannot certify a pass")
+            return 2
         print(f"{'FAIL' if regression else 'PASS'} instruction-count comparison")
         return int(regression)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
