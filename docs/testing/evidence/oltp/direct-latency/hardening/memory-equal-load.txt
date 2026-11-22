@@ -1,0 +1,12 @@
+update-cr-cand peak through 100/s: 101.4 MB (w1)
+update-cr-main peak through 100/s: 105.1 MB (w1)
+get-cand peak through 100/s: 80.3 MB (w1)
+get-main peak through 100/s: 80.3 MB (w1)
+mix-cand peak through 100/s: 75.9 MB (w1)
+mix-main peak through 100/s: 81.1 MB (w1)
+update-cr-cand peak through 200/s: 118.1 MB (w1)
+update-cr-main no phase at 200.0
+get-cand peak through 200/s: 80.3 MB (w1)
+get-main peak through 200/s: 84.7 MB (w1)
+mix-cand peak through 200/s: 77.1 MB (w1)
+mix-main peak through 200/s: 82.6 MB (w1)

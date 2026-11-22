@@ -21,6 +21,8 @@ PERF2c follow-up (HTTP keep-alive on the OLTP API, idle Control reads): [perf2c/
 
 Final comparative benchmark of the follow-up PR (BENCH2: G1–G7 and the direct-path targets): [final/README.md](final/README.md).
 
+Final comparative benchmark of the hardening PR (BENCH3: `c38a4a7` vs main `6141321` vs ScyllaDB, external SSD): [hardening/README.md](hardening/README.md).
+
 RD1 (hardening): lease reads without the RaftCore round trip, no Timestamp store read, no pre-latch epochs read; per-step tables on the controlled host (external SSD) and runner: [rd1/README.md](rd1/README.md).
 
 ## Fixes

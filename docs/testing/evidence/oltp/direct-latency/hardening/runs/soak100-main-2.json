@@ -1,0 +1,483 @@
+{
+ "run": "soak100-main-2",
+ "settings": {
+  "soak_rows": 80000,
+  "soak_payload_bytes": 2048,
+  "soak_seconds": 300.0,
+  "soak_phase_seconds": 60.0,
+  "soak_rate": 100.0,
+  "soak_seed_clients": 4,
+  "soak_verify_keys": 500,
+  "clients": 32,
+  "seed": 20261118,
+  "timeout": 10.0
+ },
+ "workload": "storage soak: updates of rows with incompressible payloads",
+ "started_utc": null,
+ "error": null,
+ "correctness_verified": true,
+ "metadata": {
+  "engine": "nabedra",
+  "binary_sha256": "107127bdc57e8e6c586e0239d43eaacc1cd8bca80cf30799eaaad5bbcd59f8f5",
+  "server_version": "nabedra-db 0.1.1 oltp",
+  "image": "sha256:1547483c44543b51e35b72fce17d9bf49d6b6f56c027dd5b634392006f83f7dc",
+  "direct_oltp": "on",
+  "pool_format_version": 2,
+  "workspace_head": "c38a4a722b02e8b6989c1188e8e6b9156cb596b7",
+  "benchmark_source_sha256": {
+   "benchmark_oltp_nabedra.py": "24b65c6f4c3d32a4033027f4ac9cc1742ae189a977151ca8cd8c37196f1e18cc",
+   "benchmark_oltp_workload.py": "3f43e38951020343f8bf65e8de2f275f189b83aae96f8136573ad15824ebe21e"
+  },
+  "docker_environment": {
+   "ServerVersion": "28.3.3",
+   "OperatingSystem": "Docker Desktop",
+   "Architecture": "x86_64",
+   "KernelVersion": "6.10.14-linuxkit",
+   "NCPU": 8,
+   "MemTotal": 8220102656,
+   "CgroupVersion": "2"
+  },
+  "allocations": {
+   "worker_bytes": 2150000000,
+   "api_cpu": 0.35,
+   "api_bytes": 550000000,
+   "driver_cpu": 0.65,
+   "driver_bytes": 900000000,
+   "total_cpu": 4,
+   "total_bytes": 7900000000,
+   "hold_compaction": false,
+   "worker_env": [],
+   "worker_cpu": 1.0
+  },
+  "consistency": "Nabedra production OLTP",
+  "data_bytes": {
+   "w1": 1101269440,
+   "w2": 1101333483,
+   "w3": 1101341629
+  },
+  "direct_activation_seconds_after_api_ready": 2.674814677971881
+ },
+ "summary": {
+  "run": "soak100-main-2",
+  "error": null,
+  "correctness_verified": true,
+  "stopped_after_rate": null,
+  "stop_reason": null,
+  "rates": {
+   "100.0": {
+    "reps": 5,
+    "offered": 30000,
+    "median_succeeded_rps": 90.455030067263,
+    "median_p50_ms": 23.973342,
+    "median_p95_ms": 147.134149,
+    "median_p99_ms": 511.403496,
+    "statuses": {
+     "client_capacity": 35,
+     "failed": 0,
+     "rejected": 2730,
+     "succeeded": 27235,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   }
+  }
+ },
+ "direct_counters": {
+  "batch_sizes": {
+   "le_1": 27235
+  },
+  "entries_applied": 27235,
+  "entries_proposed": 27235,
+  "expire_entries": 5,
+  "latch_wait_micros": 40619,
+  "latch_waits": 16,
+  "mutation_micros_total": 413233971,
+  "mutations": 27235,
+  "mutations_done": 27235,
+  "requests": 27235,
+  "rows_proposed": 27235
+ },
+ "refusals": {
+  "update | rejected | 429 | executor admission capacity exhausted": 2730
+ },
+ "resources": {
+  "window_s": 301.308468568,
+  "acknowledged_writes": 27235,
+  "io": {
+   "w1": null,
+   "w2": null,
+   "w3": null
+  },
+  "wbytes_total": 0,
+  "wbytes_per_ack": 0.0,
+  "strace": null,
+  "fsync_fdatasync_total": null,
+  "fsyncs_per_ack": null,
+  "finals": {
+   "driver": {
+    "memory_peak": null,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "",
+    "nano_cpus": 650000000,
+    "memory_limit": 900000000,
+    "memory_swap": 900000000,
+    "throttled": "0/0"
+   },
+   "api": {
+    "memory_peak": 36712448,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "35000 100000",
+    "nano_cpus": 350000000,
+    "memory_limit": 550000000,
+    "memory_swap": 550000000,
+    "throttled": "250/3604"
+   },
+   "w3": {
+    "memory_peak": 77778944,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "0/91"
+   },
+   "w2": {
+    "memory_peak": 73310208,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "0/104"
+   },
+   "w1": {
+    "memory_peak": 92020736,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "2/118"
+   }
+  },
+  "budget_verified": true,
+  "errors": [],
+  "memory_stat_max": {
+   "w1": {
+    "max_anon": 101748736,
+    "max_file": 1233932288
+   },
+   "w2": {
+    "max_anon": 91979776,
+    "max_file": 1228599296
+   },
+   "w3": {
+    "max_anon": 90017792,
+    "max_file": 1213911040
+   },
+   "api": {
+    "max_anon": 23392256,
+    "max_file": 4218880
+   }
+  }
+ },
+ "cold-restart": {
+  "mode": "cold restart of all workers after SIGKILL",
+  "previous_run": "8c076bb6-a116-47b3-84b7-bab7201547a2",
+  "certificates": "keep",
+  "profile": {
+   "previous_run": "8c076bb6-a116-47b3-84b7-bab7201547a2",
+   "next_run": "cdf68cdb-15d4-4e77-a023-5e80a5e856d7",
+   "transition_id": "76e475b3-aaae-4d05-9434-f292f9408006"
+  },
+  "start_command_seconds": 1.4067915439954959,
+  "started_at": {
+   "w1": "2026-11-22T11:46:31.552645232Z",
+   "w2": "2026-11-22T11:46:32.055606901Z",
+   "w3": "2026-11-22T11:46:32.520269608Z"
+  },
+  "ready": {
+   "w1": {
+    "seconds": 7.345514720946085,
+    "reply": {
+     "cluster_id": "c3d906c0-c522-4cd8-8177-a90ac863669e",
+     "consensus_timing": {
+      "election_max_ms": 3000,
+      "election_min_ms": 1500,
+      "heartbeat_ms": 500
+     },
+     "engine": "oltp",
+     "native_thread_budget": {
+      "compaction_threads": 1,
+      "control_threads": 1,
+      "flush_threads": 1,
+      "journal_threads": 16,
+      "query_control_stack_bytes_per_thread": 4194304,
+      "query_threads": 1,
+      "storage_stack_bytes_per_thread": 4194304,
+      "total_stack_reservation_bytes": 83886080
+     },
+     "ready_workers": 3,
+     "replication_factor": 3,
+     "run_id": "cdf68cdb-15d4-4e77-a023-5e80a5e856d7",
+     "status": "ready",
+     "topology": "typed-groups-distributed"
+    }
+   },
+   "w2": {
+    "seconds": 7.413291050994303,
+    "reply": {
+     "cluster_id": "c3d906c0-c522-4cd8-8177-a90ac863669e",
+     "consensus_timing": {
+      "election_max_ms": 3000,
+      "election_min_ms": 1500,
+      "heartbeat_ms": 500
+     },
+     "engine": "oltp",
+     "native_thread_budget": {
+      "compaction_threads": 1,
+      "control_threads": 1,
+      "flush_threads": 1,
+      "journal_threads": 16,
+      "query_control_stack_bytes_per_thread": 4194304,
+      "query_threads": 1,
+      "storage_stack_bytes_per_thread": 4194304,
+      "total_stack_reservation_bytes": 83886080
+     },
+     "ready_workers": 3,
+     "replication_factor": 3,
+     "run_id": "cdf68cdb-15d4-4e77-a023-5e80a5e856d7",
+     "status": "ready",
+     "topology": "typed-groups-distributed"
+    }
+   },
+   "w3": {
+    "seconds": 7.474880646972451,
+    "reply": {
+     "cluster_id": "c3d906c0-c522-4cd8-8177-a90ac863669e",
+     "consensus_timing": {
+      "election_max_ms": 3000,
+      "election_min_ms": 1500,
+      "heartbeat_ms": 500
+     },
+     "engine": "oltp",
+     "native_thread_budget": {
+      "compaction_threads": 1,
+      "control_threads": 1,
+      "flush_threads": 1,
+      "journal_threads": 16,
+      "query_control_stack_bytes_per_thread": 4194304,
+      "query_threads": 1,
+      "storage_stack_bytes_per_thread": 4194304,
+      "total_stack_reservation_bytes": 83886080
+     },
+     "ready_workers": 3,
+     "replication_factor": 3,
+     "run_id": "cdf68cdb-15d4-4e77-a023-5e80a5e856d7",
+     "status": "ready",
+     "topology": "typed-groups-distributed"
+    }
+   }
+  },
+  "all_ready_seconds": 7.474880646972451,
+  "direct_capability": {
+   "workers": {
+    "w1": {
+     "active": true,
+     "direct_oltp": true,
+     "history_settling": false
+    },
+    "w2": {
+     "active": true,
+     "direct_oltp": true,
+     "history_settling": false
+    },
+    "w3": {
+     "active": true,
+     "direct_oltp": true,
+     "history_settling": false
+    }
+   },
+   "seconds_after_api_ready": 0.015287390968296677
+  },
+  "direct_active_seconds": 7.645613367960323,
+  "api_probe": {
+   "attempts": 1,
+   "last": {
+    "status": 200,
+    "reply": {
+     "request_id": "6601d1ab-7c6a-4545-b0a9-c3d2198b8fc0",
+     "data": {
+      "id": 0,
+      "payload": "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",
+      "value": 15469
+     }
+    }
+   },
+   "served_seconds": 7.769858557963744
+  }
+ },
+ "soak": {
+  "verification": {
+   "keys_checked": 500,
+   "mismatches": 0,
+   "first_mismatches": [],
+   "later_unresolved_values_seen": 0,
+   "keys_with_unresolved_values": 0
+  },
+  "summary": {
+   "offered": 30000,
+   "succeeded": 27235,
+   "rejected": 2730,
+   "phase_p99_ms": [
+    511.403496,
+    514.539192,
+    209.853577,
+    487.185524,
+    553.785987
+   ]
+  },
+  "seed_details": {
+   "seed": {
+    "batches": 625,
+    "rows_per_batch": 128,
+    "rejected_retries": 0,
+    "errors": [],
+    "seconds": 44.50849412199932,
+    "rows": 80000,
+    "payload_bytes": 2048,
+    "logical_bytes": 165120000
+   }
+  }
+ },
+ "verification": {
+  "keys_checked": 500,
+  "mismatches": 0,
+  "first_mismatches": [],
+  "later_unresolved_values_seen": 0,
+  "keys_with_unresolved_values": 0
+ },
+ "soak_phases": [
+  {
+   "label": "soak-0",
+   "offered": 6000,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 536,
+    "succeeded": 5464,
+    "unresolved": 0
+   },
+   "succeeded_rps": 90.98848248530248,
+   "success_latency_ms": {
+    "count": 5464,
+    "p50": 34.193975,
+    "p90": 139.779385,
+    "p95": 169.250334,
+    "p99": 511.403496,
+    "max": 3260.004424
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-1",
+   "offered": 6000,
+   "statuses": {
+    "client_capacity": 8,
+    "failed": 0,
+    "rejected": 564,
+    "succeeded": 5428,
+    "unresolved": 0
+   },
+   "succeeded_rps": 90.455030067263,
+   "success_latency_ms": {
+    "count": 5428,
+    "p50": 24.575634,
+    "p90": 110.288022,
+    "p95": 156.93912,
+    "p99": 514.539192,
+    "max": 4019.167526
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-2",
+   "offered": 6000,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 490,
+    "succeeded": 5510,
+    "unresolved": 0
+   },
+   "succeeded_rps": 91.83333333333333,
+   "success_latency_ms": {
+    "count": 5510,
+    "p50": 21.424091,
+    "p90": 98.794251,
+    "p95": 125.446524,
+    "p99": 209.853577,
+    "max": 4397.641338
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-3",
+   "offered": 6000,
+   "statuses": {
+    "client_capacity": 24,
+    "failed": 0,
+    "rejected": 572,
+    "succeeded": 5404,
+    "unresolved": 0
+   },
+   "succeeded_rps": 90.05018767142819,
+   "success_latency_ms": {
+    "count": 5404,
+    "p50": 23.637627,
+    "p90": 93.285414,
+    "p95": 124.247525,
+    "p99": 487.185524,
+    "max": 4740.555787
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-4",
+   "offered": 6000,
+   "statuses": {
+    "client_capacity": 3,
+    "failed": 0,
+    "rejected": 568,
+    "succeeded": 5429,
+    "unresolved": 0
+   },
+   "succeeded_rps": 90.23569311098679,
+   "success_latency_ms": {
+    "count": 5429,
+    "p50": 23.973342,
+    "p90": 109.673811,
+    "p95": 147.134149,
+    "p99": 553.785987,
+    "max": 4154.506663
+   },
+   "unresolved_after_reconciliation": 0
+  }
+ ]
+}

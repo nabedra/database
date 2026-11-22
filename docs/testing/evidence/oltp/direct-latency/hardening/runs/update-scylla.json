@@ -1,0 +1,232 @@
+{
+ "run": "update-scylla",
+ "settings": {
+  "rates": [
+   1,
+   5,
+   20,
+   50,
+   100,
+   200,
+   300,
+   400,
+   600
+  ],
+  "seconds": 5.0,
+  "warmup_seconds": 3.0,
+  "repetitions": 3,
+  "clients": 32,
+  "rows": 5000,
+  "seed": 20261118,
+  "timeout": 10.0,
+  "operation": "update",
+  "read_fraction": 0.95,
+  "stop_p99_ms": 100.0,
+  "stop_on_rejection": true,
+  "snapshot_between_phases": false
+ },
+ "workload": "existing bigint primary-key updates to a bigint value",
+ "started_utc": "2026-11-22T10:31:26.191637+00:00",
+ "error": null,
+ "correctness_verified": true,
+ "metadata": {
+  "engine": "ScyllaDB",
+  "engine_version": "6.2.3-0.20250119.bff9ddde1283",
+  "consistency": "QUORUM",
+  "commitlog_sync_by_node": {
+   "172.20.0.2": "batch",
+   "172.20.0.4": "batch",
+   "172.20.0.3": "batch"
+  },
+  "measurement": "persistent native CQL, prepared UPDATE and SELECT at QUORUM, no application retries",
+  "driver_version": "3.29.13"
+ },
+ "summary": {
+  "run": "update-scylla",
+  "error": null,
+  "correctness_verified": true,
+  "stopped_after_rate": 600,
+  "stop_reason": {
+   "median_p99_ms": 160.127611,
+   "rejected": 0
+  },
+  "rates": {
+   "1": {
+    "reps": 3,
+    "offered": 15,
+    "median_succeeded_rps": 1.0,
+    "median_p50_ms": 9.620005,
+    "median_p95_ms": 12.864451,
+    "median_p99_ms": 12.864451,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 15,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "5": {
+    "reps": 3,
+    "offered": 75,
+    "median_succeeded_rps": 5.0,
+    "median_p50_ms": 9.143519,
+    "median_p95_ms": 11.191388,
+    "median_p99_ms": 13.3934,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 75,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "20": {
+    "reps": 3,
+    "offered": 300,
+    "median_succeeded_rps": 20.0,
+    "median_p50_ms": 7.655657,
+    "median_p95_ms": 10.813112,
+    "median_p99_ms": 11.640522,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 300,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "50": {
+    "reps": 3,
+    "offered": 750,
+    "median_succeeded_rps": 50.0,
+    "median_p50_ms": 7.543472,
+    "median_p95_ms": 12.304136,
+    "median_p99_ms": 15.1473,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 750,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "100": {
+    "reps": 3,
+    "offered": 1500,
+    "median_succeeded_rps": 99.93084527685262,
+    "median_p50_ms": 6.59777,
+    "median_p95_ms": 12.086671,
+    "median_p99_ms": 15.98611,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 1500,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "200": {
+    "reps": 3,
+    "offered": 3000,
+    "median_succeeded_rps": 200.0,
+    "median_p50_ms": 5.513177,
+    "median_p95_ms": 10.35698,
+    "median_p99_ms": 20.228138,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 3000,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "300": {
+    "reps": 3,
+    "offered": 4500,
+    "median_succeeded_rps": 299.7803752013004,
+    "median_p50_ms": 5.656445,
+    "median_p95_ms": 17.550049,
+    "median_p99_ms": 33.120764,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 4500,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "400": {
+    "reps": 3,
+    "offered": 6000,
+    "median_succeeded_rps": 395.5543057149916,
+    "median_p50_ms": 6.620235,
+    "median_p95_ms": 57.490894,
+    "median_p99_ms": 76.845949,
+    "statuses": {
+     "client_capacity": 55,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 5945,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "600": {
+    "reps": 3,
+    "offered": 9000,
+    "median_succeeded_rps": 491.26049814019893,
+    "median_p50_ms": 51.288749,
+    "median_p95_ms": 89.00639,
+    "median_p99_ms": 160.127611,
+    "statuses": {
+     "client_capacity": 2102,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 6898,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   }
+  }
+ },
+ "verification": {
+  "mode": "one snapshot read after the last measured phase",
+  "phases": 36,
+  "start_unix_ns": 1795343655037602991,
+  "end_unix_ns": 1795343655540942377,
+  "seconds": 0.503339386,
+  "driver_cpu_seconds": 0.3285029800000032,
+  "final_snapshot": {
+   "rows": 5000,
+   "sha256": "452a3029a18404700bdd55c07eae16c5b0c2d833bb7befa3f104a279c9835b87",
+   "mismatches": 0,
+   "first_mismatches": [],
+   "read_mismatches": 0,
+   "first_read_mismatches": [],
+   "unresolved_keys": 0,
+   "unresolved_keys_with_new_value": 0,
+   "unobserved_unresolved_values_before_phase": 0,
+   "unobserved_unresolved_values_after_snapshot": 0,
+   "prior_unresolved_values_observed": 0,
+   "first_prior_unresolved_values_observed": [],
+   "source": "snapshot read"
+  }
+ }
+}
