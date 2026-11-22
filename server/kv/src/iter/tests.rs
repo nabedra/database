@@ -661,6 +661,7 @@ fn check_consistent(values: &[Option<Bytes>], completed: u64, ctx: &str) {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // short-lived test threads, joined before the test ends
 fn run_ns02(batches_per_writer: u64) {
     const WRITERS: u64 = 8;
     const READERS: usize = 16;

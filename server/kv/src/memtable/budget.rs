@@ -141,6 +141,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // short-lived test threads, joined before the test ends
     fn ns_unit_stalled_writers_wake_on_release() {
         let budget = Arc::new(MemtableBudget::new(100));
         budget.reserve(150);

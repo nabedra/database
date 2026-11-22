@@ -1195,6 +1195,7 @@ fn descriptor_cache_keeps_at_most_max_open_runs_and_reopens_transparently() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)] // short-lived test threads, joined before the test ends
 fn runs_serve_concurrent_readers_through_a_small_shared_cache() {
     let mut rng = Rng(99);
     let model = random_model(&mut rng, 2000);

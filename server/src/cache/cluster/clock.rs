@@ -1,4 +1,13 @@
 //! Clock sources for lease fencing. Endpoints enclose the sampled interval.
+//!
+//! [`Clock::now`] is the only place the cache reads Unix time for leases and
+//! expiry. `LocalDocker` reads `nabedra_rt::time::wall_now()`, so a simulated
+//! node's wall offset and jumps (O09) reach it. `ClockBound` reads the
+//! clock-bound daemon's shared memory through `clock_bound_client`, which
+//! samples the kernel clock itself. That read stays in `clockbound_now`, the
+//! seam phase 12 replaces: under simulation `SimClockBound` returns an interval
+//! around `nabedra_rt::time::unix_nanos()` with the node's error bound and
+//! drift, and `validate` keeps applying the 10 ms and rollback checks.
 use std::io;
 
 use nabedra_rt::time::{self, UNIX_EPOCH};

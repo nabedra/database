@@ -407,6 +407,7 @@ impl Drop for DropProbe {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)] // short-lived test threads, joined before the test ends
 fn ns08_group_commit_shares_syncs_across_concurrent_writers() {
     let dir = TempDir::new("ns08");
     let options = JournalOptions {
@@ -784,6 +785,7 @@ fn ns07_damage_below_replay_after_is_skipped() {
 // NS09: EIO latches
 
 #[test]
+#[allow(clippy::disallowed_methods)] // short-lived test threads, joined before the test ends
 fn ns09_eio_on_sync_latches_and_never_retries() {
     let dir = TempDir::new("ns09-sync");
     let (fs, faults) = fault_fs();
@@ -1208,6 +1210,7 @@ fn ns12_replay_of_64_mib_journal() {
 /// reads the stats right after its commit returns sees it (the pool-level ns08 test
 /// counted a commit acknowledged before its `before` read: 385 vs 384 on CI).
 #[test]
+#[allow(clippy::disallowed_methods)] // short-lived test threads, joined before the test ends
 fn ns08_commit_is_counted_before_its_waiter_wakes() {
     let fs = crate::fs::FaultFs::new();
     fs.create_dir_all_durable(Path::new("/db"));
