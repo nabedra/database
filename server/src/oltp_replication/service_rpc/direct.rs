@@ -459,7 +459,9 @@ impl DirectLink {
         // handler slots); requests over it queue here, in arrival order, for
         // at most the request's own deadline, which the gateway set below its
         // deadline. Nothing is written while waiting, so a timeout stays
-        // `not_applied`, and the leader gets only the time left.
+        // `not_applied`, and the leader gets only the time left. RD3: a
+        // leader whose session negotiated direct admission takes up to
+        // `direct_handler_slots` (its executor's in-flight bound) at once.
         let start = tokio::time::Instant::now();
         let reservation = {
             let _timer =
