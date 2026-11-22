@@ -19,6 +19,8 @@ ALLOWED = {
     "BSD-3-Clause", "ISC", "Unicode-3.0", "Unicode-DFS-2016", "Zlib",
     "CC0-1.0", "Unlicense", "BSL-1.0", "MPL-2.0", "0BSD",
     "CDLA-Permissive-2.0",
+    # University of Illinois/NCSA, permissive and OSI-approved; libfuzzer-sys bundles LLVM libFuzzer.
+    "NCSA",
 }
 SPDX_TOKEN = re.compile(r"[^\s()]+|[()]")
 SPDX_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:-]*\+?")

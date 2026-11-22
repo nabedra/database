@@ -1,0 +1,14 @@
+above-limit.query	reject
+bad-percent.query	reject
+default.query	accept
+duplicate.query	reject
+escaped-name.query	accept
+escaped-value.query	accept
+invalid-utf8.bin	reject
+max-limit.query	accept
+missing-value.query	reject
+negative.query	reject
+one.query	accept
+overflow.query	reject
+unknown-field.query	reject
+zero.query	reject

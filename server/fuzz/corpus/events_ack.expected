@@ -1,0 +1,12 @@
+duplicate-field.json	reject
+empty-offset.json	reject
+leading-zero.json	reject
+max-offset.json	accept
+negative-offset.json	reject
+numeric-offset.json	reject
+offset-escaped-digit.json	accept
+offset-one.json	accept
+offset-zero.json	accept
+overflow.json	reject
+positional.json	reject
+unknown-field.json	reject

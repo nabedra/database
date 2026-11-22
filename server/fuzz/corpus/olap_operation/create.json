@@ -1,0 +1,1 @@
+{"request_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","operation":"table.create","payload":{"name":"accounts","schema":{"id":"int64","active":"bool"},"key":"id","format":"parquet"}}
