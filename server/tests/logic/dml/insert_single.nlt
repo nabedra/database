@@ -1,0 +1,35 @@
+# name: dml/insert_single
+
+statement ok
+{"op":"table.create","name":"t","schema":{"id":"int64","v":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+query nosort
+{"op":"table.insert","table":"t","row":{"id":1,"v":"one","f":1.0,"b":true}}
+----
+
+statement error conflict
+{"op":"table.insert","table":"t","row":{"id":1,"v":"again","f":2.0,"b":false}}
+
+statement error complete row must contain every schema column
+{"op":"table.insert","table":"t","row":{"id":2,"v":"two","f":2.0}}
+
+statement error validation_error
+{"op":"table.insert","table":"t","row":{"id":2,"v":"two","f":2.0,"b":true,"extra":1}}
+
+statement error scalar must match exact column type
+{"op":"table.insert","table":"t","row":{"id":2,"v":"two","f":2,"b":true}}
+
+statement error scalar must match exact column type
+{"op":"table.insert","table":"t","row":{"id":2.0,"v":"two","f":2.0,"b":true}}
+
+statement error scalar must match exact column type
+{"op":"table.insert","table":"t","row":{"id":2,"v":2,"f":2.0,"b":true}}
+
+statement error scalar must match exact column type
+{"op":"table.insert","table":"t","row":{"id":2,"v":"two","f":2.0,"b":"true"}}
+
+# The failed conflict left the first row unchanged.
+query nosort
+{"op":"query.collect","table":"t"}
+----
+true	1.0	1	one

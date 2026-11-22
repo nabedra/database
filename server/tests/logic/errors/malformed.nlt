@@ -1,0 +1,34 @@
+# name: errors/malformed
+
+statement ok
+{"op":"table.create","name":"t","schema":{"id":"int64","v":"utf8"},"key":"id","format":"parquet"}
+
+# The query object needs all four keys.
+statement error validation_error
+{"op":"query.collect","table":"t","query":{"select":null,"filter":null,"order_by":null}}
+
+statement error validation_error
+{"op":"query.collect","table":"t","query":{"select":null,"filter":null,"order_by":null,"limit":null,"offset":1}}
+
+statement error validation_error
+{"op":"query.collect","table":"t","query":[null,null,null,null]}
+
+statement error validation_error
+{"op":"query.count","table":"t","query":null}
+
+statement error validation_error
+{"op":"table.insert","table":"t","row":[1,"a"]}
+
+statement error validation_error
+{"op":"table.insert","table":"t","rows":[{"id":1,"v":"a"}]}
+
+statement error validation_error
+{"op":"table.list","extra":true}
+
+statement error validation_error
+{"op":"table.describe"}
+
+query nosort
+{"op":"query.count","table":"t"}
+----
+0

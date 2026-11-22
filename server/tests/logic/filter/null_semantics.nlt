@@ -1,0 +1,46 @@
+# name: filter/null_semantics
+
+statement ok
+{"op":"table.create","name":"n","schema":{"id":"int64","x":"int64","s":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"n","rows":[{"id":1,"x":-5,"s":"apple","f":-0.0,"b":true},{"id":2,"x":0,"s":"Banana","f":0.0,"b":false},{"id":3,"x":5,"s":"cherry","f":2.5,"b":true},{"id":4,"x":5,"s":"apple pie","f":-3.75,"b":false},{"id":5,"x":9223372036854775807,"s":"","f":1e-7,"b":true},{"id":6,"x":-9223372036854775808,"s":"Ünïcode","f":1e300,"b":false}]}
+
+# The wire format has no NULL: null values are rejected everywhere a scalar is expected.
+statement error validation_error
+{"op":"query.collect","table":"n","filter":{"op":"eq","column":"s","value":null}}
+
+statement error validation_error
+{"op":"query.collect","table":"n","filter":{"is_null":true}}
+
+statement error validation_error
+{"op":"table.insert","table":"n","row":{"id":7,"x":null,"s":"a","f":1.0,"b":true}}
+
+statement error validation_error
+{"op":"table.upsert","table":"n","row":{"id":7,"x":1,"s":null,"f":1.0,"b":true}}
+
+statement error validation_error
+{"op":"table.insert_many","table":"n","rows":[{"id":7,"x":1,"s":"a","f":null,"b":true}]}
+
+# A null select, filter, order_by or limit means "absent".
+query nosort
+{"op":"query.count","table":"n","query":{"select":null,"filter":null,"order_by":null,"limit":null}}
+----
+6
+
+query nosort label-all
+{"op":"query.collect","table":"n","query":{"select":null,"filter":null,"order_by":null,"limit":null}}
+
+query nosort label-all
+{"op":"query.collect","table":"n"}
+
+# Every row has every column, so no rendered value is NULL.
+query nosort hash
+{"op":"query.collect","table":"n"}
+----
+30 values hashing to 3657fafbd39dc64ea78f42819eafdae07c2f1d3877bfb00d9d4160692c41a902
+
+query nosort
+{"op":"query.count","table":"n"}
+----
+6

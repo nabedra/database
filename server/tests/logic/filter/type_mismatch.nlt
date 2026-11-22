@@ -1,0 +1,31 @@
+# name: filter/type_mismatch
+
+statement ok
+{"op":"table.create","name":"n","schema":{"id":"int64","x":"int64","s":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"n","rows":[{"id":1,"x":-5,"s":"apple","f":-0.0,"b":true},{"id":2,"x":0,"s":"Banana","f":0.0,"b":false},{"id":3,"x":5,"s":"cherry","f":2.5,"b":true},{"id":4,"x":5,"s":"apple pie","f":-3.75,"b":false},{"id":5,"x":9223372036854775807,"s":"","f":1e-7,"b":true},{"id":6,"x":-9223372036854775808,"s":"Ünïcode","f":1e300,"b":false}]}
+
+statement error scalar must match exact column type
+{"op":"query.collect","table":"n","filter":{"op":"eq","column":"x","value":5.0}}
+
+statement error scalar must match exact column type
+{"op":"query.collect","table":"n","filter":{"op":"eq","column":"x","value":"5"}}
+
+statement error scalar must match exact column type
+{"op":"query.collect","table":"n","filter":{"op":"eq","column":"s","value":5}}
+
+statement error scalar must match exact column type
+{"op":"query.count","table":"n","filter":{"op":"lt","column":"f","value":"1.0"}}
+
+statement error validation_error
+{"op":"query.collect","table":"n","filter":{"op":"eq","column":"x","value":[5]}}
+
+statement error validation_error
+{"op":"query.collect","table":"n","filter":{"op":"eq","column":"x","value":{"v":5}}}
+
+statement error unknown query column
+{"op":"query.collect","table":"n","filter":{"op":"eq","column":"missing","value":5}}
+
+statement error validation_error
+{"op":"query.collect","table":"n","filter":{"op":"like","column":"s","value":"a"}}

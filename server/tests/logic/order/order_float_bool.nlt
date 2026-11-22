@@ -1,0 +1,51 @@
+# name: order/order_float_bool
+
+statement ok
+{"op":"table.create","name":"n","schema":{"id":"int64","x":"int64","s":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"n","rows":[{"id":1,"x":-5,"s":"apple","f":-0.0,"b":true},{"id":2,"x":0,"s":"Banana","f":0.0,"b":false},{"id":3,"x":5,"s":"cherry","f":2.5,"b":true},{"id":4,"x":5,"s":"apple pie","f":-3.75,"b":false},{"id":5,"x":9223372036854775807,"s":"","f":1e-7,"b":true},{"id":6,"x":-9223372036854775808,"s":"Ünïcode","f":1e300,"b":false}]}
+
+# -0.0 and 0.0 tie, so the key decides.
+
+query nosort
+{"op":"query.collect","table":"n","select":["id","f"],"order_by":{"column":"f","desc":false}}
+----
+4	-3.75
+1	0.0
+2	0.0
+5	1e-7
+3	2.5
+6	1e300
+
+query nosort
+{"op":"query.collect","table":"n","select":["id","f"],"order_by":{"column":"f","desc":true}}
+----
+6	1e300
+3	2.5
+5	1e-7
+1	0.0
+2	0.0
+4	-3.75
+
+# false sorts before true.
+
+query nosort
+{"op":"query.collect","table":"n","select":["id","b"],"order_by":{"column":"b","desc":false}}
+----
+2	false
+4	false
+6	false
+1	true
+3	true
+5	true
+
+query nosort
+{"op":"query.collect","table":"n","select":["id","b"],"order_by":{"column":"b","desc":true}}
+----
+1	true
+3	true
+5	true
+2	false
+4	false
+6	false

@@ -1,0 +1,45 @@
+# name: ddl/create_errors
+
+statement error validation_error
+{"op":"table.create","name":"9bad","schema":{"id":"int64"},"key":"id","format":"parquet"}
+
+statement error identifier must match
+{"op":"table.create","name":"has-dash","schema":{"id":"int64"},"key":"id","format":"parquet"}
+
+statement error identifier must match
+{"op":"table.create","name":"","schema":{"id":"int64"},"key":"id","format":"parquet"}
+
+statement error identifier must match
+{"op":"table.create","name":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","schema":{"id":"int64"},"key":"id","format":"parquet"}
+
+statement error schema requires 1 to 128 columns
+{"op":"table.create","name":"t","schema":{},"key":"id","format":"parquet"}
+
+statement error primary key must name a utf8 or int64 column
+{"op":"table.create","name":"t","schema":{"id":"int64"},"key":"other","format":"parquet"}
+
+statement error primary key must name a utf8 or int64 column
+{"op":"table.create","name":"t","schema":{"id":"float64"},"key":"id","format":"parquet"}
+
+statement error primary key must name a utf8 or int64 column
+{"op":"table.create","name":"t","schema":{"id":"bool"},"key":"id","format":"parquet"}
+
+statement error validation_error
+{"op":"table.create","name":"t","schema":{"id":"int32"},"key":"id","format":"parquet"}
+
+statement error validation_error
+{"op":"table.create","name":"t","schema":{"id":"int64"},"key":"id","format":"csv"}
+
+statement error validation_error
+{"op":"table.create","name":"t","schema":{"id":"int64"},"key":"id"}
+
+statement error validation_error
+{"op":"table.create","name":"t","schema":{"id":"int64"},"key":"id","format":"parquet","extra":1}
+
+statement error identifier must match
+{"op":"table.create","name":"t","schema":{"id":"int64","bad col":"utf8"},"key":"id","format":"parquet"}
+
+# Nothing above was created.
+query nosort
+{"op":"table.list"}
+----

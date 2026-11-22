@@ -1,0 +1,34 @@
+# name: dml/get
+
+statement ok
+{"op":"table.create","name":"t","schema":{"id":"int64","v":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"t","rows":[{"id":-1,"v":"neg","f":-1.25,"b":false},{"id":0,"v":"zero","f":0.0,"b":true}]}
+
+query nosort
+{"op":"table.get","table":"t","key":-1}
+----
+false	-1.25	-1	neg
+
+query nosort
+{"op":"table.get","table":"t","key":0}
+----
+true	0.0	0	zero
+
+# A missing key is a null result, which renders as no rows.
+query nosort
+{"op":"table.get","table":"t","key":42}
+----
+
+statement error key type does not match schema
+{"op":"table.get","table":"t","key":"0"}
+
+statement error validation_error
+{"op":"table.get","table":"t","key":1.5}
+
+statement error validation_error
+{"op":"table.get","table":"t","key":null}
+
+statement error validation_error
+{"op":"table.get","table":"t"}

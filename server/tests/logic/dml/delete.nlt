@@ -1,0 +1,41 @@
+# name: dml/delete
+
+statement ok
+{"op":"table.create","name":"t","schema":{"id":"int64","v":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"t","rows":[{"id":1,"v":"a","f":1.0,"b":true},{"id":2,"v":"b","f":2.0,"b":false},{"id":3,"v":"c","f":3.0,"b":true}]}
+
+query nosort
+{"op":"table.delete","table":"t","key":2}
+----
+true
+
+query nosort
+{"op":"table.delete","table":"t","key":2}
+----
+false
+
+statement error key type does not match schema
+{"op":"table.delete","table":"t","key":"2"}
+
+query nosort
+{"op":"query.collect","table":"t","select":["id"]}
+----
+1
+3
+
+query nosort
+{"op":"table.get","table":"t","key":2}
+----
+
+# A deleted key can be inserted again.
+statement ok
+{"op":"table.insert","table":"t","row":{"id":2,"v":"b2","f":2.5,"b":true}}
+
+query nosort
+{"op":"query.collect","table":"t","select":["id","v"]}
+----
+1	a
+2	b2
+3	c
