@@ -1,0 +1,11 @@
+id = "events-unit"
+module = "events"
+kinds = ["U"]
+guarantees = ["EVT-G01"]
+scenarios = []
+tiers = ["T1"]
+command = ["cargo", "test"]
+cwd = "server/events"
+timeout_s = 600
+needs = []
+result_parser = "cargo-test"
