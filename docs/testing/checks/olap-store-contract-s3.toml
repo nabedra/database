@@ -1,8 +1,8 @@
 id = "olap-store-contract-s3"
 module = "olap"
 kinds = ["R"]
-guarantees = ["OLAP-G01", "OLAP-G03"]
-scenarios = ["T03", "T04"]
+# Tests S3 adapter semantics used by the commit protocol.
+guarantees = []
 tiers = ["T2"]
 # Real S3 under runs/<NABEDRA_REQUEST_ID>/. Without NABEDRA_TEST_S3_BUCKET the test
 # prints "not-run: s3-unconfigured", makes no assertion, and the record is not-run.

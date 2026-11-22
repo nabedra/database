@@ -1,8 +1,8 @@
 id = "olap-commit-protocol"
 module = "olap"
 kinds = ["S"]
-guarantees = ["OLAP-G01", "OLAP-G02", "OLAP-G03", "OLAP-G04", "OLAP-G05"]
-scenarios = ["T01", "T03", "T04", "T05", "T06"]
+guarantees = ["OLAP-G02", "OLAP-G03", "OLAP-G04", "OLAP-G05"]
+scenarios = ["T03", "T04", "T05", "T06"]
 tiers = ["T1", "T2"]
 # Includes the planted-bug sensitivity tests (false not_applied, CAS overwrite).
 command = ["cargo", "test", "--locked", "--lib", "storage::commit_protocol_tests::", "--", "--nocapture"]
@@ -10,4 +10,4 @@ cwd = "server"
 timeout_s = 1800
 needs = []
 result_parser = "cargo-test"
-env = { NABEDRA_CASES = "256" }
+env = { NABEDRA_CASES = "1280" }

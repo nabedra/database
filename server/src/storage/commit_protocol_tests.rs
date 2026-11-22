@@ -1,4 +1,4 @@
-//! OLAP commit protocol (OLAP-G01 to G05, scenarios T01 and T03 to T06) on the real
+//! OLAP commit protocol (OLAP-G02 to G05, scenarios T03 to T06) on the real
 //! publication code (`PreparedPublication`, storage/publication.rs) and the legacy
 //! coordinator (`commit::Coordinator`), over `SimObjectStore` with seeded faults and
 //! seeded interleavings on a current-thread runtime, so each seed replays exactly.
@@ -274,12 +274,16 @@ fn lockstep(plan: &Plan, bug: Bug) -> Result<(), String> {
             ));
         }
         // The catalog equals the serial application of the chain.
-        let expected: BTreeSet<String> = (0..plan.writers)
-            .flat_map(|w| (0..plan.commits).map(move |m| table_name(w, m)))
+        let expected: BTreeMap<_, _> = (0..plan.writers)
+            .flat_map(|w| {
+                (0..plan.commits).map(move |m| (table_name(w, m), entry(request_id(w, m))))
+            })
             .collect();
-        let tables: BTreeSet<String> = root.catalog().tables.keys().cloned().collect();
-        if tables != expected {
-            return Err(format!("catalog tables {tables:?} != serial application"));
+        if root.catalog().tables != expected {
+            return Err(format!(
+                "catalog tables {:?} != serial application {expected:?}",
+                root.catalog().tables
+            ));
         }
         // Every reported result is the reachable decision (T06), and every
         // "not applied" claim is true (T04: no false not_applied).
@@ -330,6 +334,18 @@ fn lockstep(plan: &Plan, bug: Bug) -> Result<(), String> {
             ))
         {
             return Err(format!("replay returned {replay:?}"));
+        }
+        let mut reused = decision(&base, 0, 0, Uuid::from_u128((1 << 64) + 1));
+        reused.request_body = reused.request_body.replace("\"id\":1", "\"id\":2");
+        let conflict =
+            PreparedPublication::prepare(base.clone(), base.catalog().tables.clone(), reused)
+                .map_err(|e| format!("{e:?}"))?
+                .publish(&s, budget())
+                .await;
+        if conflict != Ok(PublicationOutcome::IdentityConflict) {
+            return Err(format!(
+                "request ID reused with a different body: {conflict:?}"
+            ));
         }
         if sim.applied().len() != before {
             return Err("replay wrote to the store".into());
@@ -409,6 +425,47 @@ fn t03_cas_loser_recomputes_and_never_overwrites() {
     });
 }
 
+#[test]
+fn t03_coordinators_cannot_overwrite_a_concurrent_create() {
+    current_thread().block_on(async {
+        let sim = SimObjectStore::new();
+        let first = crate::commit::Coordinator::new(storage(&sim, Bug::None));
+        first.storage().initialize_catalog().await.unwrap();
+        let second = crate::commit::Coordinator::new(storage(&sim, Bug::None));
+        let winner = first.begin().await.unwrap();
+        let loser = second.begin().await.unwrap();
+        assert_eq!(winner.catalog(), loser.catalog());
+
+        let mut created = winner.candidate();
+        created
+            .tables
+            .insert("shared".into(), entry(Uuid::from_u128(1)));
+        let mut stale = loser.candidate();
+        stale
+            .tables
+            .insert("shared".into(), entry(Uuid::from_u128(2)));
+        winner
+            .publish_partitions(created.clone(), vec![])
+            .await
+            .unwrap();
+        let error = loser.publish_partitions(stale, vec![]).await.err().unwrap();
+        assert_eq!(error.code, crate::protocol::ErrorCode::Conflict);
+        assert_eq!(error.outcome, Outcome::NotApplied);
+
+        let recomputed = second.begin().await.unwrap();
+        assert_eq!(recomputed.catalog(), &created);
+        let mut candidate = recomputed.candidate();
+        candidate
+            .tables
+            .insert("distinct".into(), entry(Uuid::from_u128(2)));
+        recomputed
+            .publish_partitions(candidate.clone(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(first.begin().await.unwrap().catalog(), &candidate);
+    });
+}
+
 /// T04 on the publication path: the root PUT applies and its reply is lost. The
 /// writer reads back its decision and reports it committed, with no second root.
 #[test]
@@ -453,7 +510,7 @@ async fn coordinator_t04(bug: Bug, readback_fails: bool) -> Result<(), String> {
     candidate
         .tables
         .insert("t".into(), entry(Uuid::from_u128(5)));
-    let result = session.publish_partitions(candidate, vec![]).await;
+    let result = session.publish_partitions(candidate.clone(), vec![]).await;
     let applied = sim
         .object(&format!("{NS}/catalog.json"))
         .and_then(|(bytes, _)| super::Catalog::decode(&bytes).ok())
@@ -469,7 +526,19 @@ async fn coordinator_t04(bug: Bug, readback_fails: bool) -> Result<(), String> {
         }
         Err(e) if readback_fails && e.outcome == Outcome::Unknown => Ok(()),
         Err(e) => Err(format!("unexpected {e:?}")),
+    }?;
+    drop(coordinator);
+    let restarted = crate::commit::Coordinator::new(storage(&sim, bug));
+    let recovered = restarted.begin().await.map_err(|e| format!("{e:?}"))?;
+    let root_writes = sim
+        .applied()
+        .iter()
+        .filter(|a| a.key.ends_with("catalog.json"))
+        .count();
+    if recovered.catalog() != &candidate || root_writes != 2 {
+        return Err("a restarted coordinator did not recover exactly one committed change".into());
     }
+    Ok(())
 }
 
 #[test]
@@ -538,7 +607,11 @@ fn t05(delay: u64, hold: bool) -> Result<bool, String> {
             }
             Err("fence starved".to_string())
         };
-        let (outcome, fence) = tokio::join!(prepared.publish(&s, budget()), new_run);
+        let (outcome, fence) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(prepared.publish(&s, budget()), new_run)
+        })
+        .await
+        .map_err(|_| "old publication or new-run fence did not finish".to_string())?;
         let fence = fence?;
         sim.apply_delayed();
         let (root, chain) = chain(&s).await?;

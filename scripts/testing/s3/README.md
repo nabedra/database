@@ -1,8 +1,8 @@
 # S3 test bucket
 
 The real-S3 checks (`olap-store-contract-s3` and later S3 checks) run against one
-dedicated test bucket. Until it exists they print `not-run: s3-unconfigured` and
-pass vacuously.
+dedicated test bucket. Until it exists the evidence records show
+`not-run: s3-unconfigured` with zero executed assertions.
 
 ## One-time setup
 
@@ -17,6 +17,10 @@ login that can administer the repository.
 
    Options: `--region` (default `us-east-1`), `--role` (default `nabedra-test-s3`) and
    `--account-id` (only to show the real role ARN in the plan).
+   The plan includes a repository-wide OIDC subject change. Before applying it,
+   update any existing OIDC trust policies that match this repository's token
+   subjects. Every workflow that requests an OIDC token will get the new subject
+   format, including workflows unrelated to S3.
 2. Apply it:
 
    ```
@@ -40,20 +44,18 @@ login that can administer the repository.
 | --- | --- |
 | Bucket | Public access blocked. One lifecycle rule expires every object after 1 day and aborts incomplete multipart uploads after 1 day. |
 | OIDC provider | `token.actions.githubusercontent.com`, audience `sts.amazonaws.com`. Skipped when the account already has it. |
-| IAM role | Trusted only for the subjects below. Its inline policy allows get, put, delete and multipart cleanup on `runs/*` in this bucket, and listing with a `runs/` prefix. Sessions last at most 1 hour. |
-| Repository OIDC subject template | Claim keys `repo`, `context`, `event_name`. |
+| IAM role | Trusted only for the subjects below. Its inline policy allows get, put, delete and multipart cleanup on `runs/*` in this bucket, plus listing the dedicated test bucket. S3 requires bucket-level list access for reads of missing keys to return 404. Sessions last at most 1 hour. |
+| Repository OIDC subject template | Immutable repository subjects with claim keys `repo`, `context`, `event_name`. |
 
-The default GitHub subject (`repo:<owner>/<repo>:ref:refs/heads/main`) does not name
-the event. The script therefore changes the repository's subject template so the
-subject ends in the event name, and the role trusts exactly:
+The template retains the immutable owner and repository IDs and adds the event
+name. The role trusts these two subjects.
 
-- `repo:zPy52/nabedra-database:ref:refs/heads/main:event_name:workflow_dispatch`
-- `repo:zPy52/nabedra-database:ref:refs/heads/main:event_name:schedule`
+- `repo:zPy52@36101760/nabedra-database@1459052341:ref:refs/heads/main:event_name:workflow_dispatch`
+- `repo:zPy52@36101760/nabedra-database@1459052341:ref:refs/heads/main:event_name:schedule`
 
 Pull-request runs have the context `pull_request`, so they never match and the
 pull-request gate never receives the role. Runs dispatched on another branch do not
-match either. The template applies to every OIDC consumer of the repository; there
-are none besides this role today.
+match either.
 
 ## Running the checks
 
@@ -75,7 +77,9 @@ are none besides this role today.
 python3 scripts/testing/s3/budget.py --month 2026-11
 ```
 
-A nightly run of about 20,000 requests costs about $0.10.
+A nightly run of about 20,000 requests costs about $0.10. The nightly workflow
+omits checks that declare `needs = ["s3"]` when the budget command fails. The
+total uses evidence records available in the checked-out revision.
 
 ## Tests
 

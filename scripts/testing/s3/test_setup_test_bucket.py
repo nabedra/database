@@ -35,6 +35,8 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(runner.calls, [])
         self.assertIn('nothing changes without --apply', text)
+        self.assertIn('changes the OIDC token subject for every workflow in the repository', text)
+        self.assertIn('Update existing OIDC trust policies', text)
         self.assertIn('NABEDRA_TEST_S3_ROLE_ARN = arn:aws:iam::<ACCOUNT_ID>:role/nabedra-test-s3', text)
         self.assertIn('NABEDRA_TEST_S3_REGION   = us-east-1', text)
         self.assertNotIn('LocationConstraint', text)
@@ -49,8 +51,8 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(list(condition), ['StringEquals'])  # no wildcard StringLike
         self.assertEqual(condition['StringEquals']['token.actions.githubusercontent.com:aud'], 'sts.amazonaws.com')
         self.assertEqual(condition['StringEquals']['token.actions.githubusercontent.com:sub'], [
-            'repo:zPy52/nabedra-database:ref:refs/heads/main:event_name:workflow_dispatch',
-            'repo:zPy52/nabedra-database:ref:refs/heads/main:event_name:schedule',
+            'repo:zPy52@36101760/nabedra-database@1459052341:ref:refs/heads/main:event_name:workflow_dispatch',
+            'repo:zPy52@36101760/nabedra-database@1459052341:ref:refs/heads/main:event_name:schedule',
         ])
         for subject in condition['StringEquals']['token.actions.githubusercontent.com:sub']:
             self.assertNotIn('*', subject)
@@ -61,7 +63,7 @@ class SetupTests(unittest.TestCase):
         policy = setup.bucket_policy('b-1')
         resources = [s['Resource'] for s in policy['Statement']]
         self.assertEqual(resources, ['arn:aws:s3:::b-1/runs/*', 'arn:aws:s3:::b-1'])
-        self.assertEqual(policy['Statement'][1]['Condition'], {'StringLike': {'s3:prefix': ['runs/*']}})
+        self.assertEqual(policy['Statement'][1]['Action'], ['s3:ListBucket', 's3:ListBucketMultipartUploads'])
         for statement in policy['Statement']:
             self.assertNotIn('s3:*', statement['Action'])
 
@@ -80,7 +82,11 @@ class SetupTests(unittest.TestCase):
         create = next(argv for argv, _ in runner.calls if argv[:3] == ['aws', 's3api', 'create-bucket'])
         self.assertIn('LocationConstraint=eu-west-1', create)
         gh_stdin = next(stdin for argv, stdin in runner.calls if argv[0] == 'gh')
-        self.assertEqual(json.loads(gh_stdin)['include_claim_keys'], ['repo', 'context', 'event_name'])
+        self.assertEqual(json.loads(gh_stdin), {
+            'include_claim_keys': ['repo', 'context', 'event_name'],
+            'use_default': False,
+            'use_immutable_subject': True,
+        })
         code, text, runner = self.plan('--apply', runner=Recorder(fail=['aws', 's3api', 'create-bucket']))
         self.assertEqual(code, 1)
         self.assertFalse(any(argv[0] == 'gh' for argv, _ in runner.calls))

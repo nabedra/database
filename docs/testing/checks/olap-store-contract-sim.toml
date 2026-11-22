@@ -1,12 +1,12 @@
 id = "olap-store-contract-sim"
 module = "olap"
 kinds = ["S"]
-guarantees = ["OLAP-G01", "OLAP-G03"]
-scenarios = ["T03", "T04"]
+# Verifies the object store fixture used by the commit-protocol checks.
+guarantees = []
 tiers = ["T0", "T1"]
 command = ["cargo", "test", "--locked", "--lib", "storage::contract_tests::", "--", "--skip", "contract_local_store", "--skip", "contract_s3", "--nocapture"]
 cwd = "server"
 timeout_s = 900
 needs = []
 result_parser = "cargo-test"
-env = { NABEDRA_CASES = "256" }
+env = { NABEDRA_CASES = "1280" }

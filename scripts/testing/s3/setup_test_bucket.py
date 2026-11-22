@@ -10,7 +10,7 @@ What it sets up:
     abort incomplete multipart uploads after 1 day;
   - the GitHub Actions OIDC identity provider, if the account lacks it;
   - an IAM role that only workflow_dispatch and schedule runs on `main` of the
-    repository can assume, allowed to touch only `runs/*` in that bucket;
+    repository can assume, with object access limited to `runs/*` in that bucket;
   - the repository's OIDC subject template, so the subject carries the event
     name and the trust policy can tell dispatches from pull requests.
 """
@@ -22,6 +22,7 @@ import subprocess
 import sys
 
 REPOSITORY = 'zPy52/nabedra-database'
+REPOSITORY_SUBJECT = 'repo:zPy52@36101760/nabedra-database@1459052341'
 BRANCH = 'main'
 EVENTS = ('workflow_dispatch', 'schedule')
 OIDC_HOST = 'token.actions.githubusercontent.com'
@@ -35,9 +36,9 @@ ROLE = re.compile(r'[A-Za-z0-9+=,.@_-]{1,64}')
 REGION = re.compile(r'[a-z]{2}(-[a-z]+)+-[0-9]')
 
 
-def subjects(repository=REPOSITORY, branch=BRANCH, events=EVENTS):
+def subjects():
     """The exact OIDC `sub` values the role trusts."""
-    return [f'repo:{repository}:ref:refs/heads/{branch}:event_name:{event}' for event in events]
+    return [f'{REPOSITORY_SUBJECT}:ref:refs/heads/{BRANCH}:event_name:{event}' for event in EVENTS]
 
 
 def lifecycle():
@@ -69,7 +70,7 @@ def trust_policy(account):
 
 
 def bucket_policy(bucket):
-    """The role's only permissions: objects under runs/ in this one bucket."""
+    """Object access under runs/ and listing of the dedicated bucket."""
     return {
         'Version': '2012-10-17',
         'Statement': [
@@ -81,11 +82,11 @@ def bucket_policy(bucket):
                 'Resource': f'arn:aws:s3:::{bucket}/{PREFIX}*',
             },
             {
-                'Sid': 'ListRuns',
+                # S3 requires bucket-level ListBucket for missing GETs to return 404.
+                'Sid': 'ListTestBucket',
                 'Effect': 'Allow',
                 'Action': ['s3:ListBucket', 's3:ListBucketMultipartUploads'],
                 'Resource': f'arn:aws:s3:::{bucket}',
-                'Condition': {'StringLike': {'s3:prefix': [f'{PREFIX}*']}},
             },
         ],
     }
@@ -112,16 +113,20 @@ def steps(bucket, region, role, account):
             'aws', 'iam', 'create-role', '--role-name', role,
             '--max-session-duration', '3600',
             '--assume-role-policy-document', json.dumps(trust_policy(account), separators=(',', ':'))]),
-        ('Allow the role only runs/* in the bucket', [
+        ('Allow listing the test bucket and object access under runs/*', [
             'aws', 'iam', 'put-role-policy', '--role-name', role, '--policy-name', 'nabedra-test-s3',
             '--policy-document', json.dumps(bucket_policy(bucket), separators=(',', ':'))]),
-        ('Put the event name into the repository OIDC subject', [
+        ('Replace the repository OIDC subject template', [
             'gh', 'api', '--method', 'PUT', f'repos/{REPOSITORY}/actions/oidc/customization/sub',
             '--input', '-']),
     ]
 
 
-SUBJECT_TEMPLATE = json.dumps({'use_default': False, 'include_claim_keys': SUBJECT_KEYS})
+SUBJECT_TEMPLATE = json.dumps({
+    'use_default': False,
+    'include_claim_keys': SUBJECT_KEYS,
+    'use_immutable_subject': True,
+})
 
 
 def run(argv, stdin=None):
@@ -164,6 +169,10 @@ def main(argv=None, runner=run, out=sys.stdout):
     for number, (description, command) in enumerate(plan, 1):
         print(f'\n{number}. {description}\n   {shlex.join(command)}', file=out)
         if command[0] == 'gh':
+            print('   This changes the OIDC token subject for every workflow in the repository.',
+                  file=out)
+            print('   Update existing OIDC trust policies to accept the new subjects before applying.',
+                  file=out)
             print(f'   stdin: {SUBJECT_TEMPLATE}', file=out)
         if not args.apply:
             continue

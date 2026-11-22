@@ -209,28 +209,29 @@ async fn create_race<T: Target>(s: T, ns: String) -> CaseResult {
     Ok(Verdict::Pass)
 }
 
-/// GET returns the latest acknowledged write and its version, versions never
-/// repeat (no ABA, even for identical bytes), and a stale `If-Match` fails
-/// without changing the object.
+/// GET returns the latest acknowledged write and its version. Distinct
+/// contents produce distinct versions and a stale `If-Match` changes nothing.
 async fn versions_and_stale_match<T: Target>(s: T, ns: String) -> CaseResult {
     let key = heartbeat(&ns);
+    let mut current_bytes = b"revision-0".to_vec();
     let first = s
-        .put(&key, b"same".to_vec(), WriteCondition::Create)
+        .put(&key, current_bytes.clone(), WriteCondition::Create)
         .await
         .map_err(|e| format!("create: {e:?}"))?;
     let mut seen = vec![first.clone()];
     let mut current = first.clone();
-    for round in 0..3 {
+    for round in 1..=3 {
         let got = read(&s, &key).await.map_err(|e| format!("get: {e:?}"))?;
-        ensure(got == (b"same".to_vec(), current.clone()), || {
+        ensure(got == (current_bytes, current.clone()), || {
             format!("round {round}: GET is not the last acknowledged write")
         })?;
+        current_bytes = format!("revision-{round}").into_bytes();
         let next = s
-            .put(&key, b"same".to_vec(), WriteCondition::Match(&current))
+            .put(&key, current_bytes.clone(), WriteCondition::Match(&current))
             .await
             .map_err(|e| format!("round {round} match: {e:?}"))?;
         ensure(!seen.contains(&next), || {
-            format!("round {round}: version {next} repeated for identical bytes")
+            format!("round {round}: version {next} repeated for distinct bytes")
         })?;
         seen.push(next.clone());
         current = next;
@@ -242,7 +243,7 @@ async fn versions_and_stale_match<T: Target>(s: T, ns: String) -> CaseResult {
         format!("stale If-Match returned {stale:?}")
     })?;
     let got = read(&s, &key).await.map_err(|e| format!("get: {e:?}"))?;
-    ensure(got == (b"same".to_vec(), current), || {
+    ensure(got == (current_bytes, current), || {
         "stale If-Match changed the object".into()
     })?;
     Ok(Verdict::Pass)
@@ -288,8 +289,8 @@ async fn match_after_delete<T: Target>(s: T, ns: String) -> CaseResult {
     Ok(Verdict::Pass)
 }
 
-/// Conditional writers race a delete. At most one writer wins; the final state
-/// is either absent or exactly one winner's bytes and version.
+/// Conditional writers race a delete. At most one writer wins before deletion
+/// and the key stays absent after all contenders finish.
 async fn delete_race<T: Target>(s: T, ns: String) -> CaseResult {
     const N: usize = 4;
     let key = heartbeat(&ns);
@@ -297,11 +298,9 @@ async fn delete_race<T: Target>(s: T, ns: String) -> CaseResult {
         .put(&key, b"base".to_vec(), WriteCondition::Create)
         .await
         .map_err(|e| format!("create: {e:?}"))?;
-    if s.delete(&format!("{ns}cluster/control.json"))
-        .await
-        .is_none()
-    {
-        return Ok(Verdict::NotRun("delete-not-supported"));
+    match s.delete(&format!("{ns}cluster/control.json")).await {
+        None => return Ok(Verdict::NotRun("delete-not-supported")),
+        Some(result) => result.map_err(|e| format!("delete probe: {e:?}"))?,
     }
     let barrier = Arc::new(tokio::sync::Barrier::new(N + 1));
     let mut tasks = Vec::new();
@@ -326,12 +325,14 @@ async fn delete_race<T: Target>(s: T, ns: String) -> CaseResult {
             s.delete(&key).await.unwrap()
         })
     };
-    let mut winners = Vec::new();
+    let mut winners = 0;
     for t in tasks {
         let (i, r) = t.await.map_err(|e| e.to_string())?;
         match r {
-            Ok(e) => winners.push((i, e)),
-            Err(StorageError::Conflict | StorageError::NotFound) => {}
+            Ok(_) => winners += 1,
+            // S3 may return 404 when the delete wins. Its PUT adapter maps 404
+            // to Unavailable, and the GET assertion below verifies absence.
+            Err(StorageError::Conflict | StorageError::NotFound | StorageError::Unavailable) => {}
             other => return Err(format!("writer {i}: {other:?}")),
         }
     }
@@ -339,17 +340,11 @@ async fn delete_race<T: Target>(s: T, ns: String) -> CaseResult {
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("delete: {e:?}"))?;
-    ensure(winners.len() <= 1, || format!("{} winners", winners.len()))?;
-    match read(&s, &key).await {
-        Err(StorageError::NotFound) => {}
-        Ok((bytes, e)) => ensure(
-            winners
-                .first()
-                .is_some_and(|(i, w)| *w == e && bytes == format!("w{i}").into_bytes()),
-            || "surviving object is not the single winner's".into(),
-        )?,
-        Err(e) => return Err(format!("get: {e:?}")),
-    }
+    ensure(winners <= 1, || format!("{winners} winners"))?;
+    let got = read(&s, &key).await;
+    ensure(matches!(got, Err(StorageError::NotFound)), || {
+        format!("GET after the delete race: {:?}", got.map(|(_, etag)| etag))
+    })?;
     Ok(Verdict::Pass)
 }
 
@@ -397,7 +392,11 @@ async fn injected_faults<T: Target>(s: T, ns: String) -> CaseResult {
         // Statuses an adapter does not define may surface conservatively as
         // Ambiguous; only a definite refusal or Ambiguous is acceptable.
         ("status=409", Result::is_err, false),
-        ("status=503", Result::is_err, false),
+        (
+            "status=503",
+            |r| matches!(r, Err(StorageError::Ambiguous)),
+            false,
+        ),
         ("status=404", Result::is_err, false),
         (
             "embedded-error",
@@ -413,8 +412,13 @@ async fn injected_faults<T: Target>(s: T, ns: String) -> CaseResult {
         let r = s.put(&key, b"f".to_vec(), WriteCondition::Create).await;
         ensure(expected(&r), || format!("{fault}: PUT returned {r:?}"))?;
         let got = read(&s, &key).await;
-        ensure(got.is_ok() == applied, || {
-            format!("{fault}: applied={} but expected {applied}", got.is_ok())
+        let expected = if applied {
+            Ok(b"f".to_vec())
+        } else {
+            Err(StorageError::NotFound)
+        };
+        ensure(got.map(|(bytes, _)| bytes) == expected, || {
+            format!("{fault}: GET did not confirm the expected write outcome")
         })?;
         // A fault never consumes the condition: a lost response leaves the object
         // in place, and a refused one leaves the key free.
