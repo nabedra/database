@@ -1,7 +1,40 @@
 {
   "allow_unattested": false,
-  "head": "8498d0ee2c61a3df8557091412665b0e73f47bdc",
-  "ignored_records": [],
+  "head": "2fb95cb17220b831ae7a90bdec461c51f9d3576d",
+  "ignored_records": [
+    {
+      "path": "p7-cluster-review-1cb7198-230843--olap-commit-protocol.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p7-cluster-review-1cb7198-230843--olap-logic.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p7-cluster-review-1cb7198-230843--olap-oracles.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p7-cluster-review-1cb7198-230843--olap-store-contract-local.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p7-cluster-review-1cb7198-230843--olap-store-contract-sim.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p7-cluster-review-1cb7198-230843--rt-unit.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p7-cluster-review-1cb7198-230843--rt-zero-cost.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p7-cluster-review-1cb7198-230843--scheduler-properties.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -2202,6 +2235,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2262,6 +2296,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2321,6 +2356,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2380,6 +2416,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2402,6 +2439,7 @@
         "D": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2443,6 +2481,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -2503,6 +2542,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -2544,6 +2584,7 @@
         "D": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2586,6 +2627,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -3786,6 +3828,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -3853,6 +3896,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -3913,6 +3957,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -3975,6 +4020,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -3992,5 +4038,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }

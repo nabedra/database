@@ -1,0 +1,44 @@
+{
+  "artifacts": [
+    {
+      "name": "p7-cluster-review-1cb7198-230843--olap-logic.log",
+      "sha256": "1b1bc157c51b7bfbbe3fba67b3c78053cee8f613845227f46a31b7d8ba797b2d"
+    }
+  ],
+  "assertions": {
+    "executed": 10,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "olap-logic",
+  "duration_s": 97.027,
+  "guarantees": [
+    "OLAP-G06",
+    "OLAP-G08"
+  ],
+  "kind": "U D",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T23:09:14.604998+00:00",
+    "request_id": "p7-cluster-review-1cb7198-230843",
+    "runner": "GitHub Actions 1000004299",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45081625954"
+  },
+  "scenarios": [
+    "U01",
+    "U02"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "1cb71980d509559b151b92889d7623647e3f16cd",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
