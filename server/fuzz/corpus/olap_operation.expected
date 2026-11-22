@@ -1,0 +1,16 @@
+batch-rows.json	accept
+create.json	accept
+duplicate-field.json	reject
+get-int-key.json	accept
+get-string-key.json	accept
+insert-scalars.json	accept
+invalid-scalar.json	reject
+list.json	accept
+malformed-uuid.json	reject
+missing-query-field.json	reject
+non-object-payload.json	reject
+payload-first.json	accept
+query-nested-filter.json	accept
+query-saturating-limit.json	accept
+trailing-value.json	reject
+unknown-operation.json	reject

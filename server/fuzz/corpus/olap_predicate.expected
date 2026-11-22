@@ -1,0 +1,15 @@
+comparison.json	accept
+duplicate-op.json	reject
+float-exponent.json	accept
+float-overflow.json	reject
+int-overflow.json	reject
+max-depth.json	accept
+negative-zero.json	accept
+nested.json	accept
+or.json	accept
+positional.json	reject
+private-scalar-marker.json	reject
+too-deep.json	reject
+trailing-value.json	reject
+unknown-op.json	reject
+wrong-shape.json	reject

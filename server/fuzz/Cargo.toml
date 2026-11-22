@@ -1,0 +1,112 @@
+[package]
+name = "nabedra-fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94.1"
+license = "MIT"
+publish = false
+autobins = false
+
+[workspace]
+resolver = "3"
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+default = ["olap", "events"]
+cache = ["nabedra-database/cache", "dep:bytes"]
+olap = ["nabedra-database/olap", "dep:serde_json"]
+events = ["dep:nabedra-events", "dep:axum", "dep:tokio", "dep:tower"]
+libfuzzer = ["dep:libfuzzer-sys"]
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", optional = true }
+nabedra-database = { path = "..", default-features = false, optional = true }
+nabedra-events = { path = "../events", optional = true }
+
+# These are already in the product graph and provide the types used by the
+# production decoder APIs and by the in-process Events router.
+axum = { version = "=0.8.9", default-features = false, optional = true }
+bytes = { version = "=1.12.1", optional = true }
+serde_json = { version = "=1.0.154", optional = true }
+tokio = { version = "=1.54.1", optional = true }
+tower = { version = "=0.5.3", features = ["util"], optional = true }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[[bin]]
+name = "cache_resp"
+path = "fuzz_targets/cache_resp.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer", "cache"]
+
+[[bin]]
+name = "cache_command"
+path = "fuzz_targets/cache_command.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer", "cache"]
+
+[[bin]]
+name = "events_publish"
+path = "fuzz_targets/events_publish.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer", "events"]
+
+[[bin]]
+name = "events_poll"
+path = "fuzz_targets/events_poll.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer", "events"]
+
+[[bin]]
+name = "events_ack"
+path = "fuzz_targets/events_ack.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer", "events"]
+
+[[bin]]
+name = "events_lease"
+path = "fuzz_targets/events_lease.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer", "events"]
+
+[[bin]]
+name = "olap_operation"
+path = "fuzz_targets/olap_operation.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer", "olap"]
+
+[[bin]]
+name = "olap_predicate"
+path = "fuzz_targets/olap_predicate.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer", "olap"]
+
+[[bin]]
+name = "olap_catalog"
+path = "fuzz_targets/olap_catalog.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer", "olap"]

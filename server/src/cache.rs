@@ -13,3 +13,8 @@ mod wire;
 
 pub use cluster::{AdminCommand, run_admin, run_controller, run_worker};
 pub use standalone::run as run_standalone;
+
+#[doc(hidden)]
+pub use command::{Command, CommandError, SLOT_COUNT, key_slot};
+#[doc(hidden)]
+pub use wire::{Decoder, FrameLimits, ProtocolError, Response};
