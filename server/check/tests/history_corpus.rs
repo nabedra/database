@@ -347,3 +347,240 @@ fn reads_the_python_writer_format() {
     assert_eq!(parsed[0].marker_name(), "heal_all");
     assert_eq!(parsed[0].time_ns, None);
 }
+
+#[test]
+fn linearizability_review_cases() {
+    let stale = history(
+        r#"
+{"type":"invoke","process":0,"f":"write","key":"k","value":1}
+{"type":"invoke","process":1,"f":"write","key":"k","value":2}
+{"type":"ok","process":1,"f":"write","key":"k"}
+{"type":"ok","process":0,"f":"write","key":"k"}
+{"type":"invoke","process":2,"f":"read","key":"k"}
+{"type":"ok","process":2,"f":"read","key":"k","value":2}
+{"type":"invoke","process":3,"f":"read","key":"k"}
+{"type":"ok","process":3,"f":"read","key":"k","value":1}
+"#,
+    );
+    // The first read forces 1 before 2, then the second read illegally returns 1.
+    assert!(linearizable::check_kv(&stale).has("non-linearizable"));
+    let mut reordered = stale[..6].to_vec();
+    reordered.swap(0, 1);
+    assert!(
+        linearizable::check_kv(&reordered).valid,
+        "the cache must distinguish the two terminal values of the same set of writes"
+    );
+
+    let cas = history(
+        r#"
+{"type":"invoke","process":0,"f":"cas","key":"k","value":[null,1]}
+{"type":"info","process":0,"f":"cas","key":"k"}
+{"type":"invoke","process":1,"f":"cas","key":"k","value":[2,3]}
+{"type":"invoke","process":2,"f":"cas","key":"k","value":[1,2]}
+{"type":"ok","process":1,"f":"cas","key":"k"}
+{"type":"ok","process":2,"f":"cas","key":"k"}
+{"type":"invoke","process":3,"f":"read","key":"k"}
+{"type":"ok","process":3,"f":"read","key":"k","value":3}
+"#,
+    );
+    assert!(linearizable::check_kv(&cas).valid);
+    assert!(linearizable::check_kv_with(&cas, 1).has("check-limit"));
+
+    let malformed = history(
+        r#"
+{"type":"invoke","process":0,"f":"cas","key":"k","value":[1]}
+{"type":"ok","process":0,"f":"cas","key":"k"}
+"#,
+    );
+    assert!(linearizable::check_kv(&malformed).has("malformed-history"));
+}
+
+fn history(jsonl: &str) -> Vec<Event> {
+    read_jsonl(jsonl.as_bytes()).unwrap()
+}
+
+#[test]
+fn txn_version_order_review_cases() {
+    let stale = history(
+        r#"
+{"type":"invoke","process":0,"f":"txn","value":[["w","x",1]]}
+{"type":"ok","process":0,"f":"txn","value":[["w","x",1]]}
+{"type":"invoke","process":1,"f":"txn","value":[["w","x",2]]}
+{"type":"ok","process":1,"f":"txn","value":[["w","x",2]]}
+{"type":"invoke","process":2,"f":"txn","value":[["r","z",null]]}
+{"type":"ok","process":2,"f":"txn","value":[["r","z",null]]}
+{"type":"invoke","process":3,"f":"txn","value":[["r","x",null]]}
+{"type":"ok","process":3,"f":"txn","value":[["r","x",1]]}
+"#,
+    );
+    assert_eq!(txn::check(&stale).kinds(), ["G-single-realtime"]);
+
+    let overlap = history(
+        r#"
+{"type":"invoke","process":0,"f":"txn","value":[["w","x",1]]}
+{"type":"invoke","process":1,"f":"txn","value":[["w","x",2]]}
+{"type":"ok","process":0,"f":"txn","value":[["w","x",1]]}
+{"type":"ok","process":1,"f":"txn","value":[["w","x",2]]}
+{"type":"invoke","process":2,"f":"txn","value":[["r","x",null]]}
+{"type":"ok","process":2,"f":"txn","value":[["r","x",1]]}
+"#,
+    );
+    assert!(txn::check(&overlap).valid);
+
+    let fractured = history(
+        r#"
+{"type":"invoke","process":0,"f":"txn","value":[["w","x",1],["w","y",1]]}
+{"type":"invoke","process":1,"f":"txn","value":[["w","x",2],["w","y",2]]}
+{"type":"ok","process":0,"f":"txn","value":[["w","x",1],["w","y",1]]}
+{"type":"ok","process":1,"f":"txn","value":[["w","x",2],["w","y",2]]}
+{"type":"invoke","process":2,"f":"txn","value":[["r","x",null],["r","y",null]]}
+{"type":"ok","process":2,"f":"txn","value":[["r","x",1],["r","y",2]]}
+"#,
+    );
+    assert_eq!(txn::check(&fractured).kinds(), ["G0-realtime"]);
+
+    let hidden_append = history(
+        r#"
+{"type":"invoke","process":0,"f":"txn","value":[["append","x",1]]}
+{"type":"ok","process":0,"f":"txn","value":[["append","x",1]]}
+{"type":"invoke","process":1,"f":"txn","value":[["r","x",null]]}
+{"type":"ok","process":1,"f":"txn","value":[["r","x",[]]]}
+"#,
+    );
+    assert_eq!(txn::check(&hidden_append).kinds(), ["G-single-realtime"]);
+
+    let array_register = history(
+        r#"
+{"type":"invoke","process":0,"f":"txn","value":[["w","x",[1,2]]]}
+{"type":"ok","process":0,"f":"txn","value":[["w","x",[1,2]]]}
+{"type":"invoke","process":1,"f":"txn","value":[["r","x",null]]}
+{"type":"ok","process":1,"f":"txn","value":[["r","x",[1,2]]]}
+"#,
+    );
+    assert!(txn::check(&array_register).valid);
+
+    let inconsistent = history(
+        r#"
+{"type":"invoke","process":0,"f":"txn","value":[["w","x",1],["r","x",null]]}
+{"type":"ok","process":0,"f":"txn","value":[["w","x",1],["r","x",null]]}
+"#,
+    );
+    assert!(txn::check(&inconsistent).has("internal"));
+}
+
+#[test]
+fn events_simulator_receipts_are_checked() {
+    let events = history(
+        r#"
+{"type":"invoke","process":0,"f":"publish","key":"p0","value":[["00000000-0000-0000-0000-000000000001",42]]}
+{"type":"ok","process":0,"f":"publish","key":"p0","value":[["00000000-0000-0000-0000-000000000001",1]]}
+{"type":"invoke","process":1,"f":"poll","key":"p0","value":{"generation":1}}
+{"type":"ok","process":1,"f":"poll","key":"p0","value":{"after":0,"events":[[1,"00000000-0000-0000-0000-000000000001"]]}}
+{"type":"invoke","process":1,"f":"ack","key":"p0","value":{"after":0,"through":1}}
+{"type":"info","process":1,"f":"ack","key":"p0","value":"client timeout"}
+{"type":"invoke","process":1,"f":"poll","key":"p0","value":{"generation":1}}
+{"type":"ok","process":1,"f":"poll","key":"p0","value":{"after":0,"events":[[1,"00000000-0000-0000-0000-000000000001"]]}}
+{"type":"invoke","process":1,"f":"ack","key":"p0","value":{"after":0,"through":1}}
+{"type":"ok","process":1,"f":"ack","key":"p0","value":{"checkpoint":1}}
+{"type":"invoke","process":1,"f":"poll","key":"p0","value":{"generation":1}}
+{"type":"ok","process":1,"f":"poll","key":"p0","value":{"after":1,"events":[]}}
+"#,
+    );
+    assert!(queue::check(&events).valid, "{:?}", queue::check(&events));
+    let mut wrong_offset = events.clone();
+    wrong_offset[1].value[0][1] = serde_json::json!(2);
+    assert!(queue::check(&wrong_offset).has("duplicate-event"));
+    let mut missing = events[..4].to_vec();
+    missing[3].value["events"] = serde_json::json!([]);
+    assert!(queue::check(&missing).has("lost-publish"));
+    let mut wrong_ack = events.clone();
+    wrong_ack[9].value["checkpoint"] = serde_json::json!(2);
+    assert!(queue::check(&wrong_ack).has("malformed-history"));
+
+    let mut timeout_before_gap = history(
+        r#"
+{"type":"invoke","process":0,"f":"publish","key":"p0","value":"a"}
+{"type":"info","process":0,"f":"publish","key":"p0"}
+{"type":"invoke","process":1,"f":"publish","key":"p0","value":"b"}
+{"type":"ok","process":1,"f":"publish","key":"p0","value":2}
+"#,
+    );
+    assert!(queue::check(&timeout_before_gap).valid);
+    timeout_before_gap.rotate_left(2);
+    assert!(queue::check(&timeout_before_gap).has("offset-gap"));
+
+    let mut before_heal = load("queue_redelivery_missing");
+    before_heal.extend(history(
+        r#"
+{"type":"invoke","process":2,"f":"ack","key":"t/0","value":3}
+{"type":"ok","process":2,"f":"ack","key":"t/0"}
+"#,
+    ));
+    assert!(queue::check(&before_heal).has("redelivery-missing"));
+}
+
+#[test]
+fn relaxed_kv_review_cases() {
+    let failed = load("outcome_failed_write_observed");
+    assert!(relaxed_kv::check(&failed).has("failed-write-observed"));
+
+    let future_delete = history(
+        r#"
+{"type":"invoke","process":0,"f":"set","key":"k","value":"first"}
+{"type":"ok","process":0,"f":"set","key":"k","value":{"epoch":1}}
+{"type":"invoke","process":1,"f":"get","key":"k"}
+{"type":"ok","process":1,"f":"get","key":"k","value":{"value":null,"epoch":1}}
+{"type":"invoke","process":0,"f":"del","key":"k"}
+{"type":"ok","process":0,"f":"del","key":"k","value":{"epoch":1}}
+"#,
+    );
+    assert!(relaxed_kv::check(&future_delete).has("stale-read"));
+
+    let stale = history(
+        r#"
+{"type":"invoke","process":0,"f":"set","key":"k","value":"first","time_ns":1}
+{"type":"ok","process":0,"f":"set","key":"k","value":{"epoch":1},"time_ns":2}
+{"type":"info","process":"nemesis","f":"failover","key":"k","time_ns":100}
+{"type":"invoke","process":1,"f":"get","key":"k","time_ns":101}
+{"type":"ok","process":1,"f":"get","key":"k","value":{"value":null,"epoch":2},"time_ns":102}
+"#,
+    );
+    let bound = relaxed_kv::Options {
+        lag_window_ns: Some(10),
+        ..Default::default()
+    };
+    assert!(relaxed_kv::check_with(&stale, &bound).has("lost-write"));
+
+    let mut reset = stale;
+    reset[2].f = "cold-reset".into();
+    assert!(relaxed_kv::check_with(&reset, &bound).valid);
+    reset[4].value["value"] = serde_json::json!("first");
+    assert!(relaxed_kv::check_with(&reset, &bound).has("resurrection"));
+
+    let mut mget = load("kv_resurrection_expiry");
+    mget[6].f = "mget".into();
+    mget[6].value = serde_json::json!(["a", "b"]);
+    mget[7].f = "mget".into();
+    mget[7].value = serde_json::json!([1, null]);
+    assert!(relaxed_kv::check(&mget).has("resurrection"));
+}
+
+#[test]
+fn outcome_requires_a_possible_source_for_a_value_or_dedup_receipt() {
+    let mut events = load("outcome_failed_write_observed");
+    let mut successful_retry = events[..2].to_vec();
+    successful_retry[1].kind = nabedra_check::history::EventType::Ok;
+    events.extend(successful_retry);
+    assert!(outcome::check(&events).has("failed-write-observed"));
+
+    let mut dedup = load("outcome_dedup_after_fail");
+    dedup[2].key = Some("other".into());
+    dedup[3].key = Some("other".into());
+    assert!(outcome::check(&dedup).valid);
+
+    let mut dedup = load("outcome_dedup_after_fail");
+    let mut committed = dedup[2..].to_vec();
+    committed[1].value = serde_json::json!({"dedup": false});
+    dedup.splice(2..2, committed);
+    assert!(outcome::check(&dedup).valid);
+}

@@ -10,13 +10,15 @@
 //! | `["w", k, v]` | rw-register: write the unique `v` |
 //! | `["r", k, v]` | rw-register read: `null` is the initial version |
 //!
-//! A key is a list key when any append or any list-valued read touches it, and a register key
-//! otherwise. Both kinds may appear in one history.
+//! An append identifies a list key. A register write identifies a register key whose values
+//! can themselves be arrays. A list-valued read identifies a list key when there are no
+//! writes to that key. Both kinds may appear in one history.
 //!
 //! Version order comes from the reads. For list keys the longest read gives it, and every read
-//! must be a prefix of it (else `incompatible-order`). For register keys the only sound
-//! inferences are that the initial `null` precedes every write, and that a transaction that
-//! reads `v1` and then writes `v2` to the same key orders `v1` before `v2`.
+//! must be a prefix of it (else `incompatible-order`). For register keys, the initial
+//! `null` precedes every write. A transaction that reads `v1` and then writes `v2` to the
+//! same key orders `v1` before `v2`. For strict serializability, a version observed by a
+//! read must follow any other version of the key that was installed before the read began.
 //!
 //! The dependency graph has write-write (ww), write-read (wr), read-write (rw, anti-dependency)
 //! and real-time (rt) edges between `ok` transactions and the `info` transactions whose writes
@@ -25,7 +27,7 @@
 //! `G2` (two or more rw). A cycle that needs a real-time edge gets the `-realtime` suffix, which
 //! violates strict serializability but not serializability. `G1a` (a read of a failed write),
 //! `G1b` (a read of a non-final write of a transaction) and `garbage-read` (a read of a value
-//! nobody wrote) are checked directly.
+//! nobody wrote) are checked directly, along with inconsistent reads within a transaction.
 
 use super::{Anomaly, Verdict, canon};
 use crate::history::{Event, Op, Outcome, pair};
@@ -36,9 +38,12 @@ const WW: u8 = 1;
 const WR: u8 = 2;
 const RW: u8 = 4;
 const RT: u8 = 8;
-const ALL: u8 = WW | WR | RW | RT;
+const RW_RT: u8 = 16; // Anti-dependency inferred using real-time version order.
+const WW_RT: u8 = 32; // Version order inferred from a read's real-time predecessors.
+const REALTIME: u8 = RT | WW_RT;
+const ALL: u8 = WW | WR | RW | RW_RT | REALTIME;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Mop {
     Append(String, Value),
     Write(String, Value),
@@ -90,26 +95,58 @@ pub fn check(events: &[Event]) -> Verdict {
     let mut txns: Vec<Txn> = Vec::new();
     let mut anomalies = Vec::new();
     for op in paired.ops.iter().filter(|o| o.f == "txn") {
-        match parse_mops(op.value()) {
-            Some(mops) => txns.push(Txn { op, mops }),
-            None => {
+        let Some(invoke) = parse_mops(&op.invoke_value) else {
+            return Verdict::malformed(format!(
+                "event {}: invalid txn invocation",
+                op.invoke_index
+            ));
+        };
+        let mops = if op.outcome == Outcome::Ok {
+            let Some(completion) = parse_mops(&op.complete_value) else {
                 return Verdict::malformed(format!(
-                    "event {}: txn value is not a list of [f, k, v] micro-ops",
+                    "event {}: invalid txn completion",
+                    op.invoke_index
+                ));
+            };
+            if invoke.len() != completion.len()
+                || !invoke.iter().zip(&completion).all(|(a, b)| match (a, b) {
+                    (Mop::Read(ka, _), Mop::Read(kb, _)) => ka == kb,
+                    _ => a == b,
+                })
+            {
+                return Verdict::malformed(format!(
+                    "event {}: txn completion changes its invocation",
                     op.invoke_index
                 ));
             }
-        }
+            completion
+        } else {
+            invoke
+        };
+        txns.push(Txn { op, mops });
     }
 
-    // Classify keys, index writes, collect observed values.
+    let register_keys: HashSet<&str> = txns
+        .iter()
+        .flat_map(|t| &t.mops)
+        .filter_map(|m| match m {
+            Mop::Write(k, _) => Some(k.as_str()),
+            _ => None,
+        })
+        .collect();
     let mut list_keys: HashSet<String> = HashSet::new();
     for t in &txns {
         for m in &t.mops {
             match m {
+                Mop::Append(k, _) if register_keys.contains(k.as_str()) => {
+                    return Verdict::malformed(format!(
+                        "key {k:?} mixes append and register writes"
+                    ));
+                }
                 Mop::Append(k, _) => {
                     list_keys.insert(k.clone());
                 }
-                Mop::Read(k, v) if v.is_array() => {
+                Mop::Read(k, v) if v.is_array() && !register_keys.contains(k.as_str()) => {
                     list_keys.insert(k.clone());
                 }
                 _ => {}
@@ -128,32 +165,20 @@ pub fn check(events: &[Event]) -> Verdict {
             if let Mop::Append(k, v) | Mop::Write(k, v) = m {
                 let c = canon(v);
                 let last = last_write.get(k.as_str()) == Some(&c);
-                writes
-                    .entry((k.clone(), c))
-                    .or_insert(WriteSite { txn: ti, last });
+                if (!list_keys.contains(k) && v.is_null())
+                    || writes
+                        .insert((k.clone(), c), WriteSite { txn: ti, last })
+                        .is_some()
+                {
+                    return Verdict::malformed(format!(
+                        "event {}: key {k:?} has a write indistinguishable from another version: {v}",
+                        t.op.invoke_index
+                    ));
+                }
             }
         }
     }
-    // Reads that count: those of ok transactions, excluding reads of a key the transaction
-    // itself wrote earlier (internal reads).
-    let mut reads: Vec<(usize, String, Value)> = Vec::new(); // (txn, key, value)
-    for (ti, t) in txns.iter().enumerate() {
-        if t.op.outcome != Outcome::Ok {
-            continue;
-        }
-        let mut written: HashSet<&str> = HashSet::new();
-        for m in &t.mops {
-            match m {
-                Mop::Append(k, _) | Mop::Write(k, _) => {
-                    written.insert(k);
-                }
-                Mop::Read(k, v) if !written.contains(k.as_str()) => {
-                    reads.push((ti, k.clone(), v.clone()));
-                }
-                Mop::Read(..) => {}
-            }
-        }
-    }
+    let reads = external_reads(&txns, &list_keys, &mut anomalies);
     let mut observed_info: HashSet<usize> = HashSet::new();
     let mut note_value = |anomalies: &mut Vec<Anomaly>, reader: usize, k: &str, v: &Value| {
         let c = canon(v);
@@ -170,6 +195,14 @@ pub fn check(events: &[Event]) -> Verdict {
             Some(site) => {
                 let w = txns[site.txn].op;
                 if site.txn == reader {
+                    anomalies.push(Anomaly::new(
+                        "internal",
+                        format!(
+                            "txn at event {} read its own future version {v} of {k:?}",
+                            reader_op.invoke_index
+                        ),
+                        reader_op.indices(),
+                    ));
                     return;
                 }
                 match w.outcome {
@@ -287,6 +320,34 @@ pub fn check(events: &[Event]) -> Verdict {
                 g.add(a, b, WW, &in_graph);
             }
         }
+        // A committed append missing from every read follows the observed prefix.
+        // Its exact position among other unseen appends is unknown.
+        let observed: HashSet<_> = longest.iter().map(canon).collect();
+        let unobserved: HashSet<_> = writes
+            .iter()
+            .filter_map(|((key, v), site)| {
+                (key == k && in_graph[site.txn] && !observed.contains(v)).then_some(site.txn)
+            })
+            .collect();
+        // Each transaction's same-key appends form a contiguous block in a read.
+        for (i, item) in longest.iter().enumerate() {
+            if let Some(w) = writer(item) {
+                let mut appends = txns[w].mops.iter().filter_map(|m| match m {
+                    Mop::Append(key, value) if key == k => Some(value),
+                    _ => None,
+                });
+                if i == 0 || writer(&longest[i - 1]) != Some(w) {
+                    let end = longest[i..].iter().take_while(|v| writer(v) == Some(w));
+                    if end.zip(&mut appends).any(|(a, b)| a != b) {
+                        anomalies.push(Anomaly::new(
+                            "incompatible-order",
+                            format!("key {k:?}: observed appends of txn {} do not form its original prefix", txns[w].op.invoke_index),
+                            txns[w].op.indices(),
+                        ));
+                    }
+                }
+            }
+        }
         for (ti, list) in rs {
             if let Some(last) = list.last()
                 && let Some(w) = writer(last)
@@ -297,6 +358,10 @@ pub fn check(events: &[Event]) -> Verdict {
                 && let Some(w) = writer(next)
             {
                 g.add(*ti, w, RW, &in_graph);
+            } else if list.len() == longest.len() {
+                for &w in &unobserved {
+                    g.add(*ti, w, RW, &in_graph);
+                }
             }
         }
     }
@@ -336,6 +401,60 @@ pub fn check(events: &[Event]) -> Verdict {
             }
         }
     }
+    // A transaction installs its final version before any successful read of it returns.
+    let mut installed_by: HashMap<usize, usize> = HashMap::new();
+    for (ti, k, v) in &reads {
+        let last = if list_keys.contains(k) {
+            v.as_array().and_then(|list| list.last())
+        } else {
+            Some(v)
+        };
+        if let Some(site) = last.and_then(|value| writes.get(&(k.clone(), canon(value)))) {
+            let completion = txns[*ti].op.ret_pos();
+            installed_by
+                .entry(site.txn)
+                .and_modify(|first| *first = (*first).min(completion))
+                .or_insert(completion);
+        }
+    }
+    let installed = |i: usize| {
+        txns[i]
+            .op
+            .ret_pos()
+            .min(*installed_by.get(&i).unwrap_or(&usize::MAX))
+    };
+
+    // If a write had to take effect before a read, the version that read observed
+    // must be at least as new. This also orders overlapping blind writes across keys.
+    let mut strict_successors = HashMap::<(&str, usize), HashSet<usize>>::new();
+    for (ti, k, v) in &reads {
+        if list_keys.contains(k) || v.is_null() {
+            continue;
+        }
+        let Some(site) = writes
+            .get(&(k.clone(), canon(v)))
+            .filter(|site| site.last && in_graph[site.txn])
+        else {
+            continue;
+        };
+        for &other in reg_writers.get(k.as_str()).into_iter().flatten() {
+            if other == site.txn || !in_graph[other] {
+                continue;
+            }
+            if installed(site.txn) < txns[other].op.call {
+                strict_successors
+                    .entry((k, site.txn))
+                    .or_default()
+                    .insert(other);
+            } else if installed(other) < txns[*ti].op.call {
+                strict_successors
+                    .entry((k, other))
+                    .or_default()
+                    .insert(site.txn);
+                g.add(other, site.txn, WW_RT, &in_graph);
+            }
+        }
+    }
     for (ti, k, v) in &reads {
         if list_keys.contains(k) {
             continue;
@@ -354,6 +473,15 @@ pub fn check(events: &[Event]) -> Verdict {
         g.add(site.txn, *ti, WR, &in_graph);
         for &next in successors.get(&key).into_iter().flatten() {
             g.add(*ti, next, RW, &in_graph);
+        }
+        if site.last {
+            for &next in strict_successors
+                .get(&(k.as_str(), site.txn))
+                .into_iter()
+                .flatten()
+            {
+                g.add(*ti, next, RW_RT, &in_graph);
+            }
         }
     }
     for ((k, c), nexts) in &successors {
@@ -392,6 +520,86 @@ pub fn check(events: &[Event]) -> Verdict {
 
     anomalies.extend(g.cycles(&txns));
     Verdict::new(txns.len(), anomalies)
+}
+
+/// External reads constrain version order. Reads after a transaction's own write must
+/// agree with its local state. A list read after appends also exposes the external prefix.
+fn external_reads(
+    txns: &[Txn],
+    list_keys: &HashSet<String>,
+    anomalies: &mut Vec<Anomaly>,
+) -> Vec<(usize, String, Value)> {
+    let mut reads = Vec::new();
+    for (ti, t) in txns
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.op.outcome == Outcome::Ok)
+    {
+        let mut register = HashMap::<&str, &Value>::new();
+        let mut prefixes = HashMap::<&str, Value>::new();
+        let mut appended = HashMap::<&str, Vec<Value>>::new();
+        for mop in &t.mops {
+            let (key, consistent) = match mop {
+                Mop::Write(k, v) => {
+                    register.insert(k, v);
+                    continue;
+                }
+                Mop::Append(k, v) => {
+                    appended.entry(k).or_default().push(v.clone());
+                    continue;
+                }
+                Mop::Read(k, v) if list_keys.contains(k) => {
+                    let own = appended.get(k.as_str()).map_or(&[][..], Vec::as_slice);
+                    let list = if v.is_null() {
+                        Some(&[][..])
+                    } else {
+                        v.as_array().map(Vec::as_slice)
+                    };
+                    let Some(prefix) = list.and_then(|l| l.strip_suffix(own)) else {
+                        anomalies.push(Anomaly::new(
+                            "internal",
+                            format!(
+                                "txn at event {} read invalid list {v} at {k:?}",
+                                t.op.invoke_index
+                            ),
+                            t.op.indices(),
+                        ));
+                        continue;
+                    };
+                    let prefix = Value::Array(prefix.to_vec());
+                    let consistent = if let Some(first) = prefixes.get(k.as_str()) {
+                        first == &prefix
+                    } else {
+                        prefixes.insert(k, prefix.clone());
+                        reads.push((ti, k.clone(), prefix));
+                        true
+                    };
+                    (k, consistent)
+                }
+                Mop::Read(k, v) => {
+                    let consistent = if let Some(first) = register.get(k.as_str()) {
+                        *first == v
+                    } else {
+                        register.insert(k, v);
+                        reads.push((ti, k.clone(), v.clone()));
+                        true
+                    };
+                    (k, consistent)
+                }
+            };
+            if !consistent {
+                anomalies.push(Anomaly::new(
+                    "internal",
+                    format!(
+                        "txn at event {} read inconsistent versions of {key:?}",
+                        t.op.invoke_index
+                    ),
+                    t.op.indices(),
+                ));
+            }
+        }
+    }
+    reads
 }
 
 struct Graph {
@@ -533,18 +741,13 @@ impl Graph {
     }
 
     /// A cycle with exactly one rw edge, the rest from `mask` (which excludes rw).
-    fn single_rw(&self, mask: u8, members: &HashSet<usize>) -> Option<Vec<usize>> {
-        let mut tries = 0;
+    fn single_rw(&self, mask: u8, rw: u8, members: &HashSet<usize>) -> Option<Vec<usize>> {
         let mut nodes: Vec<usize> = members.iter().copied().collect();
         nodes.sort_unstable();
         for a in nodes {
             for &b in &self.adj[a] {
-                if !members.contains(&b) || self.bits(a, b) & RW == 0 {
+                if !members.contains(&b) || self.bits(a, b) & rw == 0 {
                     continue;
-                }
-                tries += 1;
-                if tries > 4096 {
-                    return None;
                 }
                 if let Some(p) = self.path(b, a, mask, members) {
                     return Some([vec![a], p].concat());
@@ -563,36 +766,56 @@ impl Graph {
                 ("G1c", WW | WR, false),
                 ("G-single", WW | WR, true),
                 ("G2", WW | WR | RW, false),
-                ("G0-realtime", WW | RT, false),
-                ("G1c-realtime", WW | WR | RT, false),
-                ("G-single-realtime", WW | WR | RT, true),
+                ("G0-realtime", WW | REALTIME, false),
+                ("G1c-realtime", WW | WR | REALTIME, false),
+                ("G-single-realtime", WW | WR | REALTIME, true),
                 ("G2-realtime", ALL, false),
             ]
             .into_iter()
             .find_map(|(kind, mask, one_rw)| {
                 let c = if one_rw {
-                    self.single_rw(mask, &members)
+                    let rw = if mask & RT == 0 { RW } else { RW | RW_RT };
+                    self.single_rw(mask, rw, &members)
                 } else {
                     self.cycle_in(mask, &members)
                 };
-                c.map(|c| (kind, mask | if one_rw { RW } else { 0 }, c))
+                c.map(|c| (kind, mask, one_rw, c))
             });
-            if let Some((kind, mask, cycle)) = found {
-                out.push(self.describe(kind, mask, &cycle, txns));
+            if let Some((kind, mask, one_rw, cycle)) = found {
+                out.push(self.describe(kind, mask, one_rw, &cycle, txns));
             }
         }
         out
     }
 
-    fn describe(&self, kind: &str, mask: u8, cycle: &[usize], txns: &[Txn]) -> Anomaly {
+    fn describe(
+        &self,
+        kind: &str,
+        mask: u8,
+        one_rw: bool,
+        cycle: &[usize],
+        txns: &[Txn],
+    ) -> Anomaly {
         let mut detail = format!("{kind} cycle: ");
         let mut events = Vec::new();
-        for w in cycle.windows(2) {
-            let bits = self.bits(w[0], w[1]) & mask;
-            let label = [(WW, "ww"), (WR, "wr"), (RW, "rw"), (RT, "rt")]
-                .iter()
-                .find(|(b, _)| bits & b != 0)
-                .map_or("?", |x| x.1);
+        for (i, w) in cycle.windows(2).enumerate() {
+            let edge_mask = if one_rw && i == 0 {
+                if mask & RT == 0 { RW } else { RW | RW_RT }
+            } else {
+                mask
+            };
+            let bits = self.bits(w[0], w[1]) & edge_mask;
+            let label = [
+                (WW, "ww"),
+                (WW_RT, "ww (inferred in real time)"),
+                (WR, "wr"),
+                (RW, "rw"),
+                (RW_RT, "rw (inferred in real time)"),
+                (RT, "rt"),
+            ]
+            .iter()
+            .find(|(b, _)| bits & b != 0)
+            .map_or("?", |x| x.1);
             detail.push_str(&format!("T{} -{label}-> ", txns[w[0]].op.invoke_index));
             events.extend(txns[w[0]].op.indices());
         }

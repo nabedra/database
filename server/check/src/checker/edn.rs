@@ -38,7 +38,7 @@ pub fn export_vector(events: &[Event]) -> String {
 
 pub fn event(ev: &Event) -> String {
     let mut s = String::from("{");
-    let ty = match ev.kind {
+    let ty = match ev.effective_kind() {
         EventType::Invoke => "invoke",
         EventType::Ok => "ok",
         EventType::Fail => "fail",

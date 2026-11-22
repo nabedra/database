@@ -67,11 +67,23 @@ pub fn check_kv_with(events: &[Event], max_configs: usize) -> Verdict {
     let ops = &paired.ops;
     let mut per_key: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (i, op) in ops.iter().enumerate() {
-        if let Some(k) = op.key.as_deref()
-            && classify(&op.f).is_some()
-        {
-            per_key.entry(k).or_default().push(i);
+        if classify(&op.f).is_none() || op.outcome == Outcome::Fail {
+            continue;
         }
+        let Some(k) = op.key.as_deref() else {
+            return Verdict::malformed(format!("{} at event {} has no key", op.f, op.invoke_index));
+        };
+        if op.f == "cas"
+            && !payload(&op.invoke_value)
+                .as_array()
+                .is_some_and(|args| args.len() == 2)
+        {
+            return Verdict::malformed(format!(
+                "cas at event {} needs [expected, new]",
+                op.invoke_index
+            ));
+        }
+        per_key.entry(k).or_default().push(i);
     }
     let mut anomalies = Vec::new();
     let mut checked = 0;

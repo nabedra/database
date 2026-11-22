@@ -7,16 +7,16 @@
 //! `append` micro-ops) and `publish` (each event). Observations, from `ok` completions: `read`
 //! and `get` (the value, or each element of a list), `txn` reads, and `poll` deliveries.
 //!
-//! A value that an op which did not fail also writes (for example a retry with the same
-//! request ID after `not_applied`) is ambiguous, so observing it is not reported.
+//! A value that another possible source wrote or could have written by the observation
+//! is ambiguous. A later retry cannot explain an earlier observation.
 //!
 //! A dedup hit is an `ok` completion whose value has `"dedup": true`, for an op whose
-//! `request_id` equals the failed op's.
+//! `request_id` and key match the failed op's, with no other possible source for the record.
 
 use super::{Anomaly, Verdict, canon, queue};
 use crate::history::{Event, Op, Outcome, pair, payload};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 fn written(op: &Op) -> Vec<(String, Value)> {
     let key = op.key.clone().unwrap_or_default();
@@ -55,12 +55,12 @@ fn key_of(v: &Value) -> String {
     }
 }
 
-fn observed(op: &Op) -> Vec<(String, Value)> {
+fn observed(op: &Op, lists: &HashSet<String>) -> Vec<(String, Value)> {
     let key = op.key.clone().unwrap_or_default();
     let spread = |k: String, v: &Value| -> Vec<(String, Value)> {
         match v {
             Value::Null => vec![],
-            Value::Array(items) => {
+            Value::Array(items) if lists.contains(&k) => {
                 let mut out: Vec<(String, Value)> =
                     items.iter().map(|i| (k.clone(), i.clone())).collect();
                 out.push((k, v.clone()));
@@ -96,45 +96,76 @@ pub fn check(events: &[Event]) -> Verdict {
         Err(e) => return Verdict::malformed(e),
     };
     let ops = &paired.ops;
+    let list_keys: HashSet<_> = ops
+        .iter()
+        .flat_map(|op| {
+            if op.f == "append" {
+                return vec![op.key.clone().unwrap_or_default()];
+            }
+            if op.f != "txn" {
+                return Vec::new();
+            }
+            op.invoke_value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|m| {
+                    let mop = m.as_array().filter(|m| m.len() == 3 && m[0] == "append")?;
+                    Some(key_of(&mop[1]))
+                })
+                .collect()
+        })
+        .collect();
     // (key, canonical value) -> observing ops, in history order.
     let mut seen: HashMap<(String, String), Vec<usize>> = HashMap::new();
-    let mut dedup_hits: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut dedup_hits = HashMap::<_, Vec<usize>>::new();
     for (i, op) in ops.iter().enumerate() {
         if op.outcome != Outcome::Ok {
             continue;
         }
-        for (k, v) in observed(op) {
+        for (k, v) in observed(op, &list_keys) {
             seen.entry((k, canon(&v))).or_default().push(i);
         }
         if let (Some(rid), Some(true)) = (
             op.request_id.as_deref(),
             op.complete_value.get("dedup").and_then(Value::as_bool),
         ) {
-            dedup_hits.entry(rid).or_default().push(i);
+            dedup_hits.entry((&op.key, rid)).or_default().push(i);
         }
     }
-    let mut live_writes: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
+    let mut live_writes = HashMap::<_, Vec<&Op>>::new();
     for op in ops.iter().filter(|o| o.outcome != Outcome::Fail) {
         for (k, v) in written(op) {
-            live_writes.insert((k, canon(&v)));
+            live_writes.entry((k, canon(&v))).or_default().push(op);
         }
     }
     let mut anomalies = Vec::new();
     let mut checked = 0;
     for op in ops.iter().filter(|o| o.outcome == Outcome::Fail) {
+        let values = written(op);
+        if values.is_empty() && !matches!(op.f.as_str(), "delete" | "del") {
+            continue;
+        }
         checked += 1;
         let mut reported = false;
-        for (k, v) in written(op) {
-            if v.is_null() || reported || live_writes.contains(&(k.clone(), canon(&v))) {
+        for (k, v) in values {
+            if v.is_null() || reported {
                 continue;
             }
+            let value = (k.clone(), canon(&v));
             let hit = seen
-                .get(&(k.clone(), canon(&v)))
+                .get(&value)
                 .into_iter()
                 .flatten()
                 .map(|&i| &ops[i])
-                .find(|o| o.ret_pos() > op.call && !std::ptr::eq(*o, op));
+                .find(|o| {
+                    o.ret_pos() > op.call
+                        && !live_writes
+                            .get(&value)
+                            .into_iter()
+                            .flatten()
+                            .any(|w| w.call < o.ret_pos())
+                });
             if let Some(reader) = hit {
                 anomalies.push(Anomaly::new(
                     "failed-write-observed",
@@ -158,11 +189,23 @@ pub fn check(events: &[Event]) -> Verdict {
         }
         if let Some(rid) = op.request_id.as_deref()
             && let Some(retry) = dedup_hits
-                .get(rid)
+                .get(&(&op.key, rid))
                 .into_iter()
                 .flatten()
                 .map(|&i| &ops[i])
-                .find(|o| o.call > op.call)
+                .find(|retry| {
+                    retry.call > op.call
+                        && retry.f == op.f
+                        && !ops.iter().any(|w| {
+                            w.request_id.as_deref() == Some(rid)
+                                && w.key == op.key
+                                && w.f == op.f
+                                && w.outcome != Outcome::Fail
+                                && w.call < retry.ret_pos()
+                                && w.complete_value.get("dedup").and_then(Value::as_bool)
+                                    != Some(true)
+                        })
+                })
         {
             anomalies.push(Anomaly::new(
                 "failed-write-observed",

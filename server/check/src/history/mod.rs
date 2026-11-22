@@ -128,6 +128,17 @@ impl Event {
         self
     }
 
+    pub(crate) fn effective_kind(&self) -> EventType {
+        if self.kind == EventType::Invoke || self.is_nemesis() {
+            return self.kind;
+        }
+        match str_field(&self.value, "outcome") {
+            Some("not_applied") => EventType::Fail,
+            Some("outcome_unknown" | "unknown") => EventType::Info,
+            _ => self.kind,
+        }
+    }
+
     /// A nemesis event in either form: process `"nemesis"`, or `f == "nemesis"`.
     pub fn is_nemesis(&self) -> bool {
         self.process == NEMESIS || self.f == "nemesis"
@@ -218,7 +229,7 @@ pub struct Op {
 impl Marker {
     /// False for a fault that definitely did not happen.
     pub fn applied(&self) -> bool {
-        self.kind != EventType::Fail
+        matches!(self.kind, EventType::Ok | EventType::Info)
     }
 }
 
@@ -332,7 +343,7 @@ pub fn pair(events: &[Event]) -> Result<Paired, String> {
                     ret_time: None,
                 });
             }
-            kind => {
+            _ => {
                 let Some(slot) = open.remove(&ev.process) else {
                     return Err(format!(
                         "event {}: completion for process {} without an open invoke",
@@ -346,11 +357,23 @@ pub fn pair(events: &[Event]) -> Result<Paired, String> {
                         ev.index, ev.f, op.f, op.invoke_index
                     ));
                 }
-                op.outcome = match (kind, str_field(&ev.value, "outcome")) {
-                    (_, Some("not_applied")) => Outcome::Fail,
-                    (_, Some("outcome_unknown")) | (_, Some("unknown")) => Outcome::Info,
-                    (EventType::Ok, _) => Outcome::Ok,
-                    (EventType::Fail, _) => Outcome::Fail,
+                if ev
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| op.key.as_ref() != Some(key))
+                    || ev
+                        .request_id
+                        .as_ref()
+                        .is_some_and(|id| op.request_id.as_ref() != Some(id))
+                {
+                    return Err(format!(
+                        "event {}: completion key or request ID differs from invoke at event {}",
+                        ev.index, op.invoke_index
+                    ));
+                }
+                op.outcome = match ev.effective_kind() {
+                    EventType::Ok => Outcome::Ok,
+                    EventType::Fail => Outcome::Fail,
                     _ => Outcome::Info,
                 };
                 op.complete_value = ev.value.clone();
