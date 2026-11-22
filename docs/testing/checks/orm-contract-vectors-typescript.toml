@@ -1,0 +1,17 @@
+id = "orm-contract-vectors-typescript"
+module = "orm-typescript"
+kinds = ["D", "F"]
+guarantees = ["ORM-G02"]
+scenarios = ["U02"]
+tiers = ["T0", "T1"]
+command = ["bash", "-ec", '''
+if [ ! -f node_modules/typescript/bin/tsc ]; then
+  npm ci --no-audit --no-fund
+fi
+npm run build
+node --test tests/contract-vectors.test.mjs
+''']
+cwd = "orm/typescript"
+timeout_s = 90
+needs = ["node"]
+result_parser = "node-test"
