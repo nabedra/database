@@ -1,7 +1,36 @@
 {
   "allow_unattested": false,
-  "head": "33b1734a3a64548ce8b240eb8ce5750085043977",
-  "ignored_records": [],
+  "head": "5a5e4e8f38ea8560ff2f15218f43903faf655e76",
+  "ignored_records": [
+    {
+      "path": "harness-integrated-8498d0e-194119--check-core.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "harness-integrated-8498d0e-194119--fuzz-nightly.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "harness-integrated-8498d0e-194119--kind-events.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "harness-integrated-8498d0e-194119--olap-logic-orm-python.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "harness-integrated-8498d0e-194119--olap-logic-orm-typescript.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "harness-integrated-8498d0e-194119--testing-matrix.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "harness-integrated-8498d0e-194119--testing-tools.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -25,6 +54,7 @@
         "F": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -760,6 +790,7 @@
         "R": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -1090,6 +1121,7 @@
         "F": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2402,6 +2434,7 @@
         "D": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2550,6 +2583,7 @@
         "F": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -3628,6 +3662,7 @@
         "D": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -3992,5 +4027,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }

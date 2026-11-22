@@ -1,0 +1,49 @@
+{
+  "artifacts": [
+    {
+      "name": "harness-integrated-8498d0e-194119--olap-logic-orm-typescript.log",
+      "sha256": "060ebfa659bd0a3a79a30664372d428382b1361c5e6c236431c8c2648b103da2"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "skipped",
+        "reason": "1 tests skipped"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "olap-logic-orm-typescript",
+  "duration_s": 134.782,
+  "guarantees": [
+    "ORM-G02",
+    "OLAP-G06"
+  ],
+  "kind": "D",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T18:41:39.821181+00:00",
+    "request_id": "harness-integrated-8498d0e-194119",
+    "runner": "GitHub Actions 1000004003",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45056495242"
+  },
+  "scenarios": [
+    "U01",
+    "U02"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "8498d0ee2c61a3df8557091412665b0e73f47bdc",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
