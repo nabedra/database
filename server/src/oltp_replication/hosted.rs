@@ -12,14 +12,16 @@ use super::{
 };
 use crate::{
     oltp::pool::{
-        ApplyMeta, ChargedBytes, ExecutionClass, GroupSnapshot, GroupStore, TransactionBudget,
-        Transition,
+        ApplyMeta, ChargedBytes, ExecutionClass, GroupSnapshot, GroupSnapshotHeader, GroupStore,
+        SnapshotCut, TransactionBudget, Transition,
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
 use futures_util::{Stream, StreamExt};
 use openraft::{
     OptionalSend, Raft, RaftSnapshotBuilder, ReadPolicy,
+    errors::{ClientWriteError, RaftError},
+    raft::ClientWriteResponse,
     storage::{EntryResponder, RaftStateMachine},
     type_config::alias::{SnapshotMetaOf, SnapshotOf, StoredMembershipOf},
     vote::RaftLeaderId,
@@ -37,6 +39,8 @@ use std::{
 };
 use transient::{HostRetry, RaftHealthStats, RaftWrite, transient};
 
+mod disk_admission;
+
 const META: TransactionBudget = TransactionBudget {
     scratch_bytes: 256 << 10,
     batch_bytes: 128 << 10,
@@ -45,11 +49,26 @@ const META: TransactionBudget = TransactionBudget {
 
 pub(crate) trait TypedMachine<C: TypedConfig>: Clone + Send + Sync + 'static {
     fn store(&self) -> &GroupStore;
+    fn installing_snapshot(&self) -> impl Send {}
+    fn snapshot_installed(&self) -> impl Future<Output = Result<(), ProtocolError>> + Send {
+        std::future::ready(Ok(()))
+    }
     fn apply(
         &self,
         meta: ApplyMeta,
         command: OwnedCommand<C::Command>,
     ) -> impl Future<Output = Result<ChargedBytes, ProtocolError>> + Send;
+
+    fn client_write(
+        &self,
+        raft: &HostRaft<C, Self>,
+        command: OwnedCommand<C::Command>,
+    ) -> impl Future<Output = Result<ClientWriteResponse<C>, ProtocolError>> + Send
+    where
+        C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
+    {
+        async move { raft.client_write(command).await.map_err(client_write_error) }
+    }
 }
 impl TypedMachine<super::authority::config::DataConfig>
     for crate::oltp::mvcc::store::ParticipantMachine
@@ -63,6 +82,13 @@ impl TypedMachine<super::authority::config::DataConfig>
         command: OwnedCommand<crate::oltp::mvcc::store::ParticipantCommand>,
     ) -> Result<ChargedBytes, ProtocolError> {
         self.apply(meta, command).await
+    }
+    async fn client_write(
+        &self,
+        raft: &HostRaft<super::authority::config::DataConfig, Self>,
+        command: OwnedCommand<crate::oltp::mvcc::store::ParticipantCommand>,
+    ) -> Result<ClientWriteResponse<super::authority::config::DataConfig>, ProtocolError> {
+        disk_admission::client_write(raft, self.store(), command).await
     }
 }
 impl TypedMachine<super::authority::config::CatalogConfig>
@@ -109,6 +135,7 @@ impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
     pub(crate) fn resident(&self) -> ReplicaLease {
         self._resident.clone()
     }
+    /// A received or installed snapshot file, checked against its header.
     pub(crate) async fn snapshot(
         &self,
         file: GroupSnapshot,
@@ -118,6 +145,32 @@ impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
             .snapshot_membership(file.clone(), META)
             .await
             .map_err(disk)?;
+        let header = file.header.clone();
+        self.typed(
+            &header,
+            raw.as_ref().map(ChargedBytes::as_slice),
+            SnapshotSource::File(Box::new(file)),
+        )
+        .await
+    }
+    /// SNAP1: the Raft snapshot of a cut; its metadata comes from the cut's
+    /// header and membership, which one `nabedra-kv` view produced.
+    async fn of_cut(&self, cut: SnapshotCut) -> io::Result<SnapshotOf<C, TypedSnapshot>> {
+        let cut = Arc::new(cut);
+        let header = cut.header.clone();
+        self.typed(
+            &header,
+            cut.membership.as_ref().map(ChargedBytes::as_slice),
+            SnapshotSource::Cut(cut.clone()),
+        )
+        .await
+    }
+    async fn typed(
+        &self,
+        header: &GroupSnapshotHeader,
+        raw: Option<&[u8]>,
+        source: SnapshotSource,
+    ) -> io::Result<SnapshotOf<C, TypedSnapshot>> {
         // Waits for room: a refusal here would stop the core (RV-APPLY F3).
         // Every other holder releases on drop.
         let owner = Arc::new(
@@ -127,17 +180,17 @@ impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
                 .map_err(disk)?,
         );
         let membership = match raw {
-            Some(raw) => stored_membership(raw.as_slice()).map_err(disk)?,
+            Some(raw) => stored_membership(raw).map_err(disk)?,
             None => StoredMembershipOf::<C>::default(),
         };
         let meta = SnapshotMetaOf::<C> {
-            last_log_id: file.header.applied.map(log_id),
+            last_log_id: header.applied.map(log_id),
             last_membership: membership,
         };
         Ok(openraft::Snapshot {
             meta,
             snapshot: TypedSnapshot {
-                file,
+                source,
                 _owner: owner,
             },
         })
@@ -145,42 +198,72 @@ impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
     async fn builder(&self) -> TypedSnapshotBuilder<C, M> {
         // Capture the cut when OpenRaft asks for a builder, not when a later
         // background build polls it after application has advanced.
-        let cut = self.export().await.map_err(disk);
+        let cut = self.cut().await.map_err(disk);
         TypedSnapshotBuilder {
             owner: self.clone(),
             cut: Some(cut),
         }
     }
-    async fn export(&self) -> Result<GroupSnapshot, ProtocolError> {
+    /// SNAP1: a policy build is a header-only cut. OpenRaft keeps only the
+    /// metadata of a built snapshot (to purge the log up to it), so nothing
+    /// is written and no view stays pinned; a follower that needs the state
+    /// gets a fresh cut from [`RaftStateMachine::get_current_snapshot`].
+    async fn cut(&self) -> Result<SnapshotCut, ProtocolError> {
         #[cfg(test)]
         if self.retry.take_export_fault() {
             return Err(crate::oltp::pool::no_space());
         }
-        self.store().export_snapshot(META).await
+        self.store().cut_snapshot(META, false).await
     }
 }
+/// Scratch for writing a cut's file: one 64 KiB write buffer per job.
+const MATERIALIZE: TransactionBudget = TransactionBudget {
+    scratch_bytes: 256 << 10,
+    batch_bytes: 0,
+    output_bytes: 0,
+};
 #[derive(Clone)]
 pub(crate) struct TypedSnapshot {
-    pub(crate) file: GroupSnapshot,
+    source: SnapshotSource,
     _owner: Arc<ReplicaMetadata>,
+}
+#[derive(Clone)]
+enum SnapshotSource {
+    /// A received file, or one written from a cut elsewhere.
+    File(Box<GroupSnapshot>),
+    /// SNAP1: a cut; its file is written on first use.
+    Cut(Arc<SnapshotCut>),
+}
+impl TypedSnapshot {
+    /// The transferable file. A cut writes it here, on the caller's task: the
+    /// replication task streaming it to a follower, never the state machine's
+    /// task, so applies do not wait for it.
+    pub(crate) async fn file(&self) -> Result<GroupSnapshot, ProtocolError> {
+        match &self.source {
+            SnapshotSource::File(file) => Ok((**file).clone()),
+            SnapshotSource::Cut(cut) => cut.file(MATERIALIZE).await,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn cut(&self) -> Option<&Arc<SnapshotCut>> {
+        match &self.source {
+            SnapshotSource::Cut(cut) => Some(cut),
+            SnapshotSource::File(_) => None,
+        }
+    }
 }
 pub(crate) struct TypedSnapshotBuilder<C: TypedConfig, M: TypedMachine<C>> {
     owner: HostedState<C, M>,
-    cut: Option<io::Result<GroupSnapshot>>,
+    cut: Option<io::Result<SnapshotCut>>,
 }
 impl<C: TypedConfig, M: TypedMachine<C>> RaftSnapshotBuilder<C> for TypedSnapshotBuilder<C, M> {
     type SnapshotData = TypedSnapshot;
     async fn build_snapshot(&mut self) -> io::Result<SnapshotOf<C, TypedSnapshot>> {
-        let file = match self.cut.take() {
+        let cut = match self.cut.take() {
             Some(cut) => cut?,
-            None => self
-                .owner
-                .store()
-                .export_snapshot(META)
-                .await
-                .map_err(disk)?,
+            None => self.owner.cut().await.map_err(disk)?,
         };
-        self.owner.snapshot(file).await
+        self.owner.of_cut(cut).await
     }
 }
 impl<C, M> RaftStateMachine<C> for HostedState<C, M>
@@ -206,6 +289,10 @@ where
     {
         while let Some(item) = entries.next().await {
             let (entry, responder) = item?;
+            if responder.is_some() && matches!(self.store().identity().kind, GroupKind::Data { .. })
+            {
+                proposal_clock::applying();
+            }
             let _timer = crate::oltp_runtime::stage_timing::by_kind(
                 &self.store().identity().kind,
                 [
@@ -382,10 +469,10 @@ where
         }
         let cut = if force {
             self.retry
-                .retry(RaftWrite::BuildSnapshot, || self.export())
+                .retry(RaftWrite::BuildSnapshot, || self.cut())
                 .await
         } else {
-            self.export().await
+            self.cut().await
         };
         match cut {
             Err(error) if !force && transient(&error).is_some() && !self.retry.is_stopping() => {
@@ -409,25 +496,37 @@ where
         meta: &SnapshotMetaOf<C>,
         snapshot: TypedSnapshot,
     ) -> io::Result<()> {
-        let checked = self.snapshot(snapshot.file.clone()).await?;
+        let file = snapshot.file().await.map_err(disk)?;
+        let checked = self.snapshot(file.clone()).await?;
         if checked.meta != *meta {
             return Err(io::Error::other(
                 "snapshot bytes differ from typed Raft metadata",
             ));
         }
         let store = self.store();
+        let _trust = self.machine.installing_snapshot();
         self.retry
             .retry(RaftWrite::InstallSnapshot, || {
-                store.install_snapshot(snapshot.file.clone(), META)
+                store.install_snapshot(file.clone(), META)
             })
             .await
-            .map_err(disk)
+            .map_err(disk)?;
+        self.machine.snapshot_installed().await.map_err(disk)
     }
+    /// SNAP1: a fresh cut of the current state, which covers every purged
+    /// index (a purge never passes the applied one). It pins its view until
+    /// the replication task that asked for it writes the file, or drops it.
     async fn get_current_snapshot(&mut self) -> io::Result<Option<SnapshotOf<C, TypedSnapshot>>> {
-        match self.store().current_snapshot(META).await.map_err(disk)? {
-            Some(file) => self.snapshot(file).await.map(Some),
-            None => Ok(None),
+        let store = self.store();
+        let cut = self
+            .retry
+            .retry(RaftWrite::BuildSnapshot, || store.cut_snapshot(META, true))
+            .await
+            .map_err(disk)?;
+        if cut.header.applied.is_none() {
+            return Ok(None);
         }
+        self.of_cut(cut).await.map(Some)
     }
 }
 
@@ -436,6 +535,26 @@ where
 /// microseconds of bounded CPU, against a cross-thread handoff of 0.3-0.5 ms
 /// on a loaded host. Larger ones keep their native jobs.
 const INLINE_BYTES: usize = 4 << 10;
+
+/// RD3: PERF2b's rule for the Raft log and transport codecs. Runs `work` on
+/// the calling task when it handles at most [`INLINE_BYTES`] (`bytes`, an
+/// estimate from the entries' heap size or the frame length), otherwise in a
+/// native job. The serial Data commit made five such handoffs for a few
+/// microseconds of work each: the leader's log sizing pass, an encode and a
+/// reply decode per follower, and each follower's decode and sizing pass.
+pub(crate) async fn execute_small<T: Send + 'static>(
+    shared: &Arc<crate::oltp::pool::WorkerSharedResources>,
+    class: ExecutionClass,
+    request: u64,
+    bytes: usize,
+    work: impl FnOnce() -> Result<T, ProtocolError> + Send + 'static,
+) -> Result<T, ProtocolError> {
+    if bytes <= INLINE_BYTES {
+        work()
+    } else {
+        shared.execute(class, request, 0, work).await
+    }
+}
 
 fn blank_digest() -> Digest {
     Digest::from_bytes(Sha256::digest(b"nabedra/typed-raft-blank/v1").into())
@@ -479,6 +598,15 @@ fn bounded_digest(
     }
 }
 
+/// SNAP1: the snapshot policy of the production Raft profiles, set
+/// explicitly. A policy build is now a header-only cut (a sync and three point
+/// reads under the application order), so the interval no longer trades apply
+/// stalls for log length; it only sets how often the log is purged. The values
+/// stay OpenRaft's defaults: a group retains 1,000-6,000 entries, as every
+/// existing recovery, move and catch-up scenario was validated against, and a
+/// cut every 5,000 entries costs one sync and one purge write.
+pub(crate) const SNAPSHOT_LOGS_SINCE_LAST: u64 = 5000;
+pub(crate) const SNAPSHOT_LOGS_TO_KEEP: u64 = 1000;
 /// How long policy snapshot builds pause after a transient failure (F2).
 const SNAPSHOT_DEFERRAL: Duration = Duration::from_secs(1);
 /// Cores one host can run over its lifetime: the first and the supervisor's
@@ -583,6 +711,9 @@ where
     pub(crate) log: TypedLogStore<C>,
     pub(crate) state: HostedState<C, M>,
     pub(in crate::oltp_replication) membership_changes: tokio::sync::Mutex<()>,
+    /// CAP1: the cluster features the hosting worker observed enabled. Set
+    /// by the hosted-group manager; unset, no gated entry is proposed.
+    pub(crate) cluster_features: OnceLock<Arc<super::authority::control::EnabledFeatures>>,
     /// Guards the single direct-leadership watcher of a Data replica. The
     /// watcher follows every core of the host (RV-FINAL H1).
     pub(in crate::oltp_replication) direct_watch: std::sync::Once,
@@ -611,6 +742,10 @@ pub(crate) fn batched_config(
     config.api_batch_capacity = Some(MAX_APPEND_ENTRIES as u64);
     config.api_channel_size = Some(64);
     config.api_batch_linger_ms = Some(0);
+    // RD1: lease reads (Timestamp `AllocateDirect`, direct gets and the
+    // direct leader's reads) check the lease on the caller's task. Only
+    // `ReadPolicy::LeaseRead` uses it; ReadIndex keeps the quorum round.
+    config.enable_local_lease_read = Some(true);
     config
         .validate()
         .map(Arc::new)
@@ -693,6 +828,7 @@ where
             log,
             state,
             membership_changes: tokio::sync::Mutex::new(()),
+            cluster_features: OnceLock::new(),
             direct_watch: std::sync::Once::new(),
             deferred_applies: std::sync::Mutex::new(deferred_applies),
             retry,
@@ -762,6 +898,53 @@ where
         stopped.map_err(|_| unavailable())
     }
 }
+/// RD2 breakdown of a Data `client_write` on its leader: the time from the
+/// latest Data proposal on this process to the leader's log append start and
+/// flush (`raft.data.propose_to_append`, `propose_to_flush`), to sending and
+/// acknowledging the AppendEntries that carries it (`propose_to_send`,
+/// `propose_to_ack`), and to the apply of an entry this replica proposed
+/// (`propose_to_apply`). Exact only while one proposal is in flight (the
+/// serial benchmark); a diagnostic, not a per-entry measurement.
+pub(crate) mod proposal_clock {
+    use std::{
+        sync::{
+            OnceLock,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    /// The proposal whose first acknowledgement was recorded (RD3).
+    static FIRST: AtomicU64 = AtomicU64::new(0);
+    fn now_us() -> u64 {
+        static BASE: OnceLock<Instant> = OnceLock::new();
+        BASE.get_or_init(Instant::now).elapsed().as_micros() as u64 + 1
+    }
+    pub(super) fn proposed() {
+        LAST.store(now_us(), Ordering::Relaxed);
+    }
+    pub(super) fn applying() {
+        mark(crate::oltp_runtime::stage_timing::perf_stage!(
+            "raft.data.propose_to_apply"
+        ));
+    }
+    /// Records the time since the latest Data proposal in `stage`, once per
+    /// proposal: the first follower's acknowledgement (RD3).
+    pub(crate) fn mark_first(stage: &'static crate::oltp_runtime::stage_timing::Stage) {
+        let last = LAST.load(Ordering::Relaxed);
+        if last != 0 && FIRST.swap(last, Ordering::Relaxed) != last {
+            stage.record(Duration::from_micros(now_us().saturating_sub(last)));
+        }
+    }
+    /// Records the time since the latest Data proposal in `stage`.
+    pub(crate) fn mark(stage: &'static crate::oltp_runtime::stage_timing::Stage) {
+        let last = LAST.load(Ordering::Relaxed);
+        if last != 0 {
+            stage.record(Duration::from_micros(now_us().saturating_sub(last)));
+        }
+    }
+}
+
 impl<C, M> Consensus<C::Command, C::Reply> for RaftConsensus<C, M>
 where
     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
@@ -770,6 +953,20 @@ where
     fn propose(&self, command: OwnedCommand<C::Command>) -> ConsensusFuture<'_, Applied<C::Reply>> {
         Box::pin(async move {
             command.ensure_charged()?;
+            // CAP1: `ReclaimIndex` only once Control enabled
+            // `data.index.reclaim`: then every replica host decodes it, and
+            // Control refuses joiners whose build does not.
+            if C::requires_index_reclamation(command.payload()?)
+                && !self.cluster_features.get().is_some_and(|features| {
+                    features.enabled(super::authority::control::INDEX_RECLAIM_FEATURE)
+                })
+            {
+                return Err(ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    "cluster feature data.index.reclaim is not enabled",
+                    Outcome::NotApplied,
+                ));
+            }
             // A full device: nothing would commit until space frees up, so
             // the leader says so before proposing (RV-APPLY F1).
             if self.retry.out_of_space() {
@@ -783,6 +980,9 @@ where
                 super::entry::OwnedRaftEntry::<C::Command>::normal_metadata_bytes(),
             )?;
             let kind = self.state.store().identity().kind.clone();
+            if matches!(kind, GroupKind::Data { .. }) {
+                proposal_clock::proposed();
+            }
             let _timer = crate::oltp_runtime::stage_timing::by_kind(
                 &kind,
                 [
@@ -792,14 +992,7 @@ where
                 ],
             )
             .timer();
-            let response = self
-                .raft
-                .client_write(command)
-                .await
-                .map_err(|error| {
-                    tracing::error!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,"typed client_write failed");
-                    unavailable()
-                })?;
+            let response = self.state.machine.client_write(&self.raft, command).await?;
             let (position, reply, owner) = response.data.into_parts()?;
             Ok(Applied::owned(
                 position,
@@ -829,6 +1022,14 @@ where
             }
         })
     }
+    fn lease_read_position(&self) -> ConsensusFuture<'_, AppliedPosition> {
+        Box::pin(async move {
+            match self.read_position(ReadPolicy::LeaseRead).await {
+                Ok(position) => Ok(position),
+                Err(_) => self.read_position(ReadPolicy::ReadIndex).await,
+            }
+        })
+    }
     fn current_leader(&self) -> Option<u64> {
         use openraft::type_config::async_runtime::watch::WatchReceiver;
         // A stopped core's metrics may still name a leader (RV-APPLY F4).
@@ -853,18 +1054,54 @@ where
         metrics.last_applied.as_ref().map(|id| id.index)
     }
 }
+
 impl<C, M> RaftConsensus<C, M>
 where
     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
     M: TypedMachine<C>,
 {
-    /// `read_barrier`'s Raft half: the index a read must have applied. The
-    /// caller checks it against its own snapshot (`lease_read_index`).
-    async fn read_index(&self, policy: ReadPolicy) -> Result<u64, ProtocolError> {
+    /// RD1: `policy`'s linearizer once this replica applied its read index.
+    ///
+    /// A lease read checks the leader lease on the calling task, against the
+    /// leader state openraft publishes (`enable_local_lease_read`, set in
+    /// [`batched_config`]), with no round trip through the RaftCore task. The
+    /// lease and its length are the core path's: openraft publishes the
+    /// committed index before it dispatches the apply, and clears the state
+    /// before the node gives up leadership. A missing or expired lease takes
+    /// the core path, which refuses a stale lease; ReadIndex always confirms
+    /// through the core with a quorum round. Both then wait until this
+    /// replica's state machine applied the read index.
+    async fn linearized(
+        &self,
+        policy: ReadPolicy,
+    ) -> Result<openraft::raft::linearizable_read::LinearizeState<C>, ProtocolError> {
         let lease = matches!(policy, ReadPolicy::LeaseRead);
+        let failed = |error: &dyn std::fmt::Display| {
+            tracing::warn!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,lease,"typed linearizable read failed");
+            unavailable()
+        };
+        let raft: &HostRaft<C, M> = &self.raft;
+        let linearizer = raft
+            .get_local_read_linearizer(policy)
+            .await
+            .map_err(|error| failed(&error))?;
+        linearizer
+            .await_ready(raft)
+            .await
+            .map_err(|error| failed(&error))
+    }
+    /// Counts one linearizable read of `policy` and times it under `lease`
+    /// or `index` (data, timestamp, metadata).
+    fn read_timer(
+        &self,
+        policy: &ReadPolicy,
+        lease: [&'static str; 3],
+        index: [&'static str; 3],
+    ) -> crate::oltp_runtime::stage_timing::Timer {
+        let leased = matches!(policy, ReadPolicy::LeaseRead);
         let kind = self.state.store().identity().kind.clone();
         crate::oltp_runtime::stage_timing::variant(
-            if lease {
+            if leased {
                 "raft.lease_read_by_kind."
             } else {
                 "raft.read_index_by_kind."
@@ -872,71 +1109,72 @@ where
             &kind,
         )
         .record(std::time::Duration::ZERO);
-        let _timer = crate::oltp_runtime::stage_timing::by_kind(
-            &kind,
-            if lease {
-                [
-                    "raft.data.lease_index",
-                    "raft.ts.lease_index",
-                    "raft.meta.lease_index",
-                ]
-            } else {
-                [
-                    "raft.data.read_index_only",
-                    "raft.ts.read_index_only",
-                    "raft.meta.read_index_only",
-                ]
-            },
-        )
-        .timer();
-        let barrier = self
-            .raft
-            .ensure_linearizable(policy)
-            .await
-            .map_err(|error| {
-                tracing::warn!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,lease,"typed linearizable read failed");
-                unavailable()
-            })?;
-        Ok(barrier.index())
+        crate::oltp_runtime::stage_timing::by_kind(&kind, if leased { lease } else { index })
+            .timer()
+    }
+    /// `read_barrier`'s Raft half: the index a read must have applied. The
+    /// caller checks it against its own snapshot (`lease_read_index`).
+    async fn read_index(&self, policy: ReadPolicy) -> Result<u64, ProtocolError> {
+        let _timer = self.read_timer(
+            &policy,
+            [
+                "raft.data.lease_index",
+                "raft.ts.lease_index",
+                "raft.meta.lease_index",
+            ],
+            [
+                "raft.data.read_index_only",
+                "raft.ts.read_index_only",
+                "raft.meta.read_index_only",
+            ],
+        );
+        Ok(self.linearized(policy).await?.read_log_id().index())
+    }
+    /// RD1: the barrier's applied position from openraft's applied log id
+    /// instead of a store read. `await_ready` returned only once the state
+    /// machine applied the read index, and the machine applies an entry's
+    /// effects before openraft records it as applied, so every effect up to
+    /// the returned position is visible to the caller's in-memory reads.
+    async fn read_position(&self, policy: ReadPolicy) -> Result<AppliedPosition, ProtocolError> {
+        let _timer = self.read_timer(
+            &policy,
+            [
+                "raft.data.lease_position",
+                "raft.ts.lease_position",
+                "raft.meta.lease_position",
+            ],
+            [
+                "raft.data.read_position",
+                "raft.ts.read_position",
+                "raft.meta.read_position",
+            ],
+        );
+        let state = self.linearized(policy).await?;
+        let required = state.read_log_id().index();
+        match state.applied() {
+            Some(applied) if applied.index >= required => Ok(position(*applied)),
+            applied => {
+                tracing::error!(group=%self.state.store().identity().group_id,node=self.state._resident.node_id(),?applied,required,"typed lease read applied below its read index");
+                Err(unavailable())
+            }
+        }
     }
     async fn read_barrier(&self, policy: ReadPolicy) -> Result<ReadBarrier, ProtocolError> {
         {
-            let lease = matches!(policy, ReadPolicy::LeaseRead);
-            let kind = self.state.store().identity().kind.clone();
-            crate::oltp_runtime::stage_timing::variant(
-                if lease {
-                    "raft.lease_read_by_kind."
-                } else {
-                    "raft.read_index_by_kind."
-                },
-                &kind,
-            )
-            .record(std::time::Duration::ZERO);
-            let _timer = crate::oltp_runtime::stage_timing::by_kind(
-                &kind,
-                if lease {
-                    [
-                        "raft.data.lease_read",
-                        "raft.ts.lease_read",
-                        "raft.meta.lease_read",
-                    ]
-                } else {
-                    [
-                        "raft.data.read_index",
-                        "raft.ts.read_index",
-                        "raft.meta.read_index",
-                    ]
-                },
-            )
-            .timer();
-            let barrier = self
-                .raft
-                .ensure_linearizable(policy)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,lease,"typed linearizable read failed");
-                    unavailable()
-                })?;
+            let _timer = self.read_timer(
+                &policy,
+                [
+                    "raft.data.lease_read",
+                    "raft.ts.lease_read",
+                    "raft.meta.lease_read",
+                ],
+                [
+                    "raft.data.read_index",
+                    "raft.ts.read_index",
+                    "raft.meta.read_index",
+                ],
+            );
+            let barrier = *self.linearized(policy).await?.read_log_id();
             let applied = self
                 .state
                 .store()
@@ -980,6 +1218,26 @@ fn unavailable() -> ProtocolError {
     )
 }
 
+fn client_write_error<C: TypedConfig>(error: RaftError<C, ClientWriteError<C>>) -> ProtocolError {
+    // OpenRaft forwards before appending. LogEntryDiscarded and Fatal
+    // can also follow an append, so they retain the unknown outcome.
+    match error {
+        RaftError::APIError(ClientWriteError::ForwardToLeader(_)) => proposal_forwarded(),
+        other => {
+            tracing::error!(error = %other, "typed client_write failed");
+            unavailable()
+        }
+    }
+}
+
+pub(super) fn proposal_forwarded() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        "typed Raft leader refused the proposal before append",
+        Outcome::NotApplied,
+    )
+}
+
 fn execution_class(store: &GroupStore) -> ExecutionClass {
     match store.identity().kind {
         GroupKind::Control | GroupKind::Timestamps | GroupKind::Status { .. } => {
@@ -992,4 +1250,6 @@ fn execution_class(store: &GroupStore) -> ExecutionClass {
 pub(crate) mod direct_leadership;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::acceptance_o11_storage;
 pub(crate) mod transient;

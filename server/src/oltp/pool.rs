@@ -3,10 +3,12 @@
 mod activation;
 mod closed;
 mod damage;
+mod disk;
 pub(crate) use activation::{ReplicaActivationStatement, VerifiedReplicaActivation};
 pub use damage::ACCEPT_DAMAGE_FILE;
 use damage::group_of_scope;
 pub(crate) use damage::{DamageCause, DamagedReplicaRemoved, ReleaseOutcome, quarantined_group};
+pub(crate) use disk::{DiskReservation, is_disk_reservation_refusal};
 pub(crate) mod mount;
 pub(crate) use closed::{PoolCloseOutcome, PoolClosedStatement, VerifiedPoolClosed};
 mod placement;
@@ -14,7 +16,9 @@ mod resources;
 pub(crate) mod restore;
 mod snapshot;
 mod storage;
-pub use snapshot::{GroupSnapshot, GroupSnapshotHeader, IncomingSnapshot, PoolSnapshotFile};
+pub use snapshot::{
+    GroupSnapshot, GroupSnapshotHeader, IncomingSnapshot, PoolSnapshotFile, SnapshotCut,
+};
 #[cfg(test)]
 mod tests;
 pub use resources::{
@@ -22,7 +26,9 @@ pub use resources::{
     QueueLease, ScratchLease, SharedResourceConfig, WorkerSharedResources,
 };
 use resources::{ByteReservation, capacity};
-pub(crate) use resources::{GroupCapacityLease, RAFT_REPLICA_BYTES};
+pub(crate) use resources::{DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease, RAFT_REPLICA_BYTES};
+#[cfg(test)]
+pub(crate) use tests::{acceptance_damaged_checkpoints, o29_pool_recovery};
 
 use super::{failure, recovery_unknown};
 use crate::{
@@ -98,6 +104,7 @@ struct PoolInner {
     synced_requests: AtomicU64,
     /// Quarantine bookkeeping (NS14): run-time damage events, refusals, R6.
     damage: Arc<damage::DamageState>,
+    disk: disk::PoolDisk,
     _pool_slot: OwnedSemaphorePermit,
     _overhead: MemoryCharge,
     _mount: Option<VerifiedPoolMount>,
@@ -269,14 +276,10 @@ impl OltpPool {
         shared: Arc<WorkerSharedResources>,
         mount: Option<VerifiedPoolMount>,
     ) -> Result<Self, ProtocolError> {
-        Self::open_path_on(
-            path,
-            identity,
-            shared,
-            mount,
-            nabedra_kv::fs::real(),
-            &|_| {},
-        )
+        let fs = nabedra_kv::fs::real();
+        #[cfg(test)]
+        let fs = crate::oltp_runtime::recovery_tests::pool_sync::wrap(fs);
+        Self::open_path_on(path, identity, shared, mount, fs, &|_| {})
     }
     fn open_path_on(
         path: &Path,
@@ -299,11 +302,24 @@ impl OltpPool {
         let mut options =
             storage::store_options(&shared.storage, fs, shared.config.write_buffer_bytes);
         tune(&mut options);
-        let opened = Store::open(&path.join(storage::STORE_DIR), options).map_err(|error| {
+        let store_path = path.join(storage::STORE_DIR);
+        let journal_path = store_path.join(nabedra_kv::manifest::JOURNAL_DIR);
+        let journal_path = journal_path.as_path();
+        let segment_bytes = options.journal.segment_bytes;
+        let opened = Store::open(&store_path, options).map_err(|error| {
             tracing::error!(path = %path.display(), %error, "OLTP pool refused at open");
             damage::open_refused(error)
         })?;
         let store = OwnedStore(Some(opened.store));
+        // FaultFs keeps the journal in memory, with only the pool manifest on
+        // disk. Real stores measure the device of the journal itself.
+        #[cfg(test)]
+        let journal_path = if journal_path.exists() {
+            journal_path
+        } else {
+            path
+        };
+        let disk = disk::PoolDisk::open(journal_path, segment_bytes)?;
         // R6 at pool level, sticky (NS14, `damage.rs`): new damage of more than 8
         // groups, or more than 10% of the pool's groups (always allowing one), is
         // more likely systemic than local, so the pool is refused instead (plan
@@ -382,6 +398,7 @@ impl OltpPool {
             groups: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             synced_requests: AtomicU64::new(0),
             damage: damage_state,
+            disk,
             _pool_slot: pool_slot,
             _overhead: overhead,
             _mount: mount,
@@ -401,6 +418,13 @@ impl OltpPool {
     }
     pub fn identity(&self) -> &PoolIdentity {
         &self.inner.identity
+    }
+    pub(crate) fn reserve_proposal_disk(
+        &self,
+        encoded_bytes: usize,
+        apply_items: usize,
+    ) -> Result<DiskReservation, ProtocolError> {
+        self.inner.disk.reserve(encoded_bytes, apply_items)
     }
     pub fn resources(&self) -> &Arc<WorkerSharedResources> {
         &self.inner.shared
@@ -1044,7 +1068,17 @@ impl GroupStore {
         } else {
             None
         };
+        // RD2: a Data apply's legs on its host (order lock, budgets, native
+        // execute incl. its admission, journal completion).
+        use crate::{oltp_replication::types::GroupKind, oltp_runtime::stage_timing::perf_stage};
+        let data_apply = matches!(lane, MutationLane::State)
+            && matches!(self.identity().kind, GroupKind::Data { .. });
+        let stage_started = std::time::Instant::now();
         let owner = order.clone().lock_owned().await;
+        if data_apply {
+            perf_stage!("pool.data_apply.order").since(stage_started);
+        }
+        let stage_started = std::time::Instant::now();
         let group = self.clone();
         let output = match execution_class {
             ExecutionClass::Query => {
@@ -1060,6 +1094,10 @@ impl GroupStore {
         };
         let prepared = self.resources().prepare(execution_class).await?;
         let reservations = prepared.buffers(budget, output).await?;
+        if data_apply {
+            perf_stage!("pool.data_apply.prepare").since(stage_started);
+        }
+        let stage_started = std::time::Instant::now();
         let runtime = tokio::runtime::Handle::try_current().ok();
         // The executor builds the batch and submits it, or hands it to a paced
         // task; it never waits for storage. Either way the write is dispatched
@@ -1207,6 +1245,10 @@ impl GroupStore {
                 }
             })
             .await?;
+        if data_apply {
+            perf_stage!("pool.data_apply.execute").since(stage_started);
+        }
+        let stage_started = std::time::Instant::now();
         let submitted = match submitted {
             Submitted::Paced {
                 response,
@@ -1249,6 +1291,9 @@ impl GroupStore {
                     .done()
                     .await
                     .map_err(|error| self.pool().failed(error))?;
+                if data_apply {
+                    perf_stage!("pool.data_apply.commit").since(stage_started);
+                }
                 if deferred {
                     self.inner.deferred_writes.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -1916,6 +1961,14 @@ impl<'a> GroupTransaction<'a> {
         visit: impl FnMut(&[u8], &[u8]) -> Result<(), ProtocolError>,
     ) -> Result<ScanProgress, ProtocolError> {
         self.read.scan_page(prefix, after, max_items, visit)
+    }
+    pub(crate) fn scan_page_until(
+        &mut self,
+        prefix: &[u8],
+        max_items: usize,
+        visit: impl FnMut(&[u8], &[u8]) -> Result<bool, ProtocolError>,
+    ) -> Result<ScanProgress, ProtocolError> {
+        self.read.scan_page_until(prefix, None, max_items, visit)
     }
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), ProtocolError> {
         if key.len() > MAX_KEY_BYTES {

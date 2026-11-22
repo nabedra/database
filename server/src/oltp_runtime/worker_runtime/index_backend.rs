@@ -5,7 +5,10 @@ use crate::oltp::mvcc::{
     catalog::PinnedCatalog,
     index::{
         IndexClosedKind, IndexDefinition, IndexRecord,
-        build::{IndexAttempt, IndexBackend, IndexService, declaration_job, ready_job},
+        build::{
+            IndexAttempt, IndexBackend, IndexCommitOutcome, IndexService, declaration_job,
+            ready_job,
+        },
     },
     planner::{MutationPlan, ResolveFuture},
     store::{
@@ -431,7 +434,11 @@ impl IndexBackend for RuntimeIndexes {
             })
         })
     }
-    fn commit(&self, attempt: IndexAttempt, plan: MutationPlan) -> ResolveFuture<'_, ()> {
+    fn commit(
+        &self,
+        attempt: IndexAttempt,
+        plan: MutationPlan,
+    ) -> ResolveFuture<'_, IndexCommitOutcome> {
         Box::pin(async move {
             let current = self
                 .runtime
@@ -495,7 +502,12 @@ impl IndexBackend for RuntimeIndexes {
                 .release_index_metadata(authority, attempt.identity, attempt.storage_pin, settled)
                 .await?;
             match decision.outcome().ok_or_else(unknown)?.result() {
-                Ok(_) => Ok(()),
+                Ok(_) => Ok(IndexCommitOutcome::Committed),
+                Err(error)
+                    if matches!(decision.statement().decision, TxnDecision::Abort { .. }) =>
+                {
+                    Ok(IndexCommitOutcome::Aborted(error))
+                }
                 Err(error) => Err(error),
             }
         })
@@ -523,22 +535,53 @@ impl IndexBackend for RuntimeIndexes {
     }
     fn refresh(&self, table: Uuid, key: protocol::Key, job: Uuid) -> ResolveFuture<'_, ()> {
         Box::pin(async move {
-            let request = protocol::Request {
+            use std::time::Duration;
+
+            let request = Arc::new(protocol::Request {
                 request_id: job,
                 operation: protocol::Operation::Update(protocol::UpdatePayload {
                     table_id: table,
                     key,
                     values: protocol::Row::new(),
                 }),
-            };
+            });
             let resources = self.runtime.services.shared.clone();
-            let body = resources
-                .execute(ExecutionClass::Query, 0, 0, move || {
-                    serde_json::to_vec(&request).map_err(|_| unknown())
-                })
-                .await?;
-            let accepted = self.runtime.admit_with_authority(body, self.authority).await?;
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut retries = 0;
+            let mut backoff = Duration::from_millis(50);
+            let accepted = loop {
+                let request = request.clone();
+                let body = resources
+                    .execute(ExecutionClass::Query, 0, 0, move || {
+                        serde_json::to_vec(&*request).map_err(|_| unknown())
+                    })
+                    .await?;
+                match self
+                    .runtime
+                    .admit_with_authority(body, self.authority)
+                    .await
+                {
+                    Err(error)
+                        if retries < 7
+                            && error.code == ErrorCode::Overloaded
+                            && error.outcome == Outcome::NotApplied =>
+                    {
+                        // A definitive admission refusal can be retried with
+                        // the same job identity. Receipts and uncertain
+                        // outcomes take their normal path below.
+                        #[cfg(test)]
+                        crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
+                            job,
+                            crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::RefreshAdmissionRefused,
+                            || None,
+                        ).await;
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_millis(250));
+                        retries += 1;
+                    }
+                    result => break result?,
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     if !self.runtime.accepting.load(Ordering::Acquire) {
                         return Err(unavailable());
@@ -550,7 +593,7 @@ impl IndexBackend for RuntimeIndexes {
                             return Err(receipt.error.clone().unwrap_or_else(unknown));
                         }
                         RequestState::Abandoned => return Err(unavailable()),
-                        _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                        _ => tokio::time::sleep(Duration::from_millis(10)).await,
                     }
                 }
             }).await.map_err(|_| unknown())?
@@ -789,6 +832,8 @@ impl WorkerRuntime {
     }
 }
 
+#[cfg(test)]
+mod acceptance_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

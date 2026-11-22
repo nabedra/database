@@ -1,0 +1,16 @@
+=== serial-base start 2026-11-21T13:03:24Z load: { 5.61 10.75 31.83 }
+=== serial-base end 2026-11-21T13:05:38Z rc=0 seconds=135 load: { 20.13 14.40 30.19 }
+=== serial-cand start 2026-11-21T13:15:40Z load: { 5.47 7.98 19.28 }
+=== serial-cand end 2026-11-21T13:17:42Z rc=0 seconds=122 load: { 14.43 10.22 18.66 }
+=== get-cand start 2026-11-21T13:27:45Z load: { 17.66 15.31 16.66 }
+=== get-cand end 2026-11-21T13:27:59Z rc=1 seconds=14 load: { 17.46 15.40 16.67 }
+=== get-base start 2026-11-21T13:38:02Z load: { 31.45 36.11 27.55 }
+=== get-base end 2026-11-21T13:39:03Z rc=1 seconds=61 load: { 52.00 41.13 30.00 }
+=== serial-cand2 start 2026-11-21T13:49:05Z load: { 3.45 10.60 18.35 }
+=== serial-cand2 end 2026-11-21T13:50:46Z rc=0 seconds=101 load: { 7.54 10.06 17.29 }
+=== serial-base2 start 2026-11-21T13:54:46Z load: { 2.67 6.46 13.95 }
+=== serial-base2 end 2026-11-21T13:56:16Z rc=0 seconds=90 load: { 4.67 6.05 13.03 }
+=== get-base start 2026-11-21T13:57:29Z load: { 2.58 5.14 12.13 }
+=== get-base end 2026-11-21T14:00:37Z rc=0 seconds=188 load: { 4.55 4.90 10.64 }
+=== get-cand start 2026-11-21T14:01:07Z load: { 2.88 4.46 10.28 }
+=== get-cand end 2026-11-21T14:04:39Z rc=0 seconds=212 load: { 3.71 4.07 8.84 }

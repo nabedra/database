@@ -29,6 +29,7 @@ mod pool_drain;
 mod replacement;
 mod restart;
 mod scoped_queue;
+mod system_recovery;
 mod worker_drain;
 
 /// Authentication configuration, supplied by the operator rather than a worker
@@ -262,6 +263,8 @@ pub(crate) struct ControlHandle {
     machine: ControlMachine,
     consensus: Arc<dyn Consensus<ControlCommand, ControlReply>>,
     policy: OperatorPolicy,
+    registered_directory:
+        std::sync::OnceLock<Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
     /// NS14 mixed-version gate for the group damage commands.
     group_damage_gate: std::sync::RwLock<Option<Arc<dyn super::group_damage::GroupDamageGate>>>,
 }
@@ -275,8 +278,22 @@ impl ControlHandle {
             machine,
             consensus,
             policy,
+            registered_directory: Default::default(),
             group_damage_gate: std::sync::RwLock::new(None),
         })
+    }
+    pub(crate) fn use_registered_directory(
+        &self,
+        directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+    ) -> Result<(), ProtocolError> {
+        self.registered_directory
+            .set(directory)
+            .map_err(|_| unauthorized())
+    }
+    pub(crate) fn system_placement_changed(&self) -> bool {
+        self.registered_directory
+            .get()
+            .is_some_and(|directory| directory.system_placement_changed())
     }
     pub(crate) fn resources(&self) -> &Arc<crate::oltp::pool::WorkerSharedResources> {
         self.machine.store().resources()
@@ -309,10 +326,7 @@ impl ControlHandle {
         if session.group() != self.identity()
             || session.purpose() != Purpose::Authority
             || session.recovery_only()
-            || !self
-                .policy
-                .certificate_pins
-                .contains(&session.remote().certificate_sha256)
+            || !self.is_operator(&session.remote())
         {
             return Err(unauthorized());
         }
@@ -329,12 +343,7 @@ impl ControlHandle {
         operation_id: Uuid,
         evidence: Digest,
     ) -> Result<AuthorizationStamp, ProtocolError> {
-        if !Arc::ptr_eq(&permit.shared, self.resources())
-            || !self
-                .policy
-                .certificate_pins
-                .contains(&permit.local.certificate_sha256)
-        {
+        if !Arc::ptr_eq(&permit.shared, self.resources()) || !self.is_operator(&permit.local) {
             return Err(unauthorized());
         }
         Ok(AuthorizationStamp {
@@ -544,6 +553,18 @@ impl ControlHandle {
                 unix_ms: super::direct::wall_ms(),
             })
             .await?;
+            for feature in super::CLUSTER_FEATURES.map(|feature| feature.name) {
+                let _ = self
+                    .submit(ControlCommand::DirectCapability {
+                        operation_id: super::feature_operation_id(feature, target),
+                        actor: target,
+                        action: super::DirectCapabilityOperation::Advertise {
+                            version: super::DIRECT_VERSION,
+                        },
+                        unix_ms: super::direct::wall_ms(),
+                    })
+                    .await;
+            }
         }
         self.submit(ControlCommand::BeginJoin {
             operation_id,
@@ -924,8 +945,16 @@ impl ControlHandle {
     ) -> Result<bool, ProtocolError> {
         let raw = self
             .read(move |view| {
-                if load::<WorkerIdentity>(view, &machine::process_exclusion_key(worker))?
-                    == Some(worker)
+                if view
+                    .get(&machine::system_recovery::revoked_id(worker.worker_id))?
+                    .is_some()
+                    || view
+                        .get(&machine::system_recovery::revoked_certificate(
+                            worker.certificate_sha256,
+                        ))?
+                        .is_some()
+                    || load::<WorkerIdentity>(view, &machine::process_exclusion_key(worker))?
+                        == Some(worker)
                 {
                     return view.encode(&true);
                 }
@@ -940,6 +969,41 @@ impl ControlHandle {
             })
             .await?;
         machine::decode(raw.as_ref())
+    }
+    /// REP6: one page of committed system revocations, the set Control
+    /// hosts enforce (`system_trust`). `revision` is the enrollment revision
+    /// the page was read at; callers agree on the items only.
+    pub(crate) async fn revocations(
+        &self,
+        after: Option<Uuid>,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.read(move |view| {
+            let state = state(view)?;
+            let prefix = machine::system_recovery::REVOKED_WORKERS;
+            let mut items = Vec::new();
+            let mut cursor = after;
+            let progress = view.scan_page(
+                prefix,
+                after.map(|id| machine::key(prefix, id)).as_deref(),
+                crate::oltp_replication::types::MAX_PAGE_ITEMS,
+                |key, bytes| {
+                    let worker: WorkerIdentity = machine::decode(bytes)?;
+                    if key[prefix.len()..] != *worker.worker_id.as_bytes() {
+                        return Err(stale());
+                    }
+                    cursor = Some(worker.worker_id);
+                    items.push(worker);
+                    Ok(())
+                },
+            )?;
+            view.encode(&InventoryPage {
+                revision: state.enrollment_revision,
+                items: Page::new(items).map_err(|_| stale())?,
+                after: cursor,
+                done: progress.exhausted,
+            })
+        })
+        .await
     }
     pub(crate) async fn worker(
         &self,
@@ -1343,10 +1407,7 @@ impl ControlHandle {
         }
         let control = self.identity().clone();
         let database = scope.database.clone();
-        let operator = self
-            .policy
-            .certificate_pins
-            .contains(&remote.certificate_sha256);
+        let operator = self.is_operator(&remote);
         let raw = self
             .read(move |view| {
                 let state = state(view)?;
@@ -1356,9 +1417,15 @@ impl ControlHandle {
                 ) {
                     let api: ApiEnrollment = load(view, &machine::key(APIS, remote.worker_id))?
                         .ok_or_else(unauthorized)?;
+                    // The Data endpoint binds the exact hosted group. For
+                    // direct ingress, Control only proves the API's current
+                    // enrollment in the database and direct activation.
+                    let direct = action == ServiceAction::ApiIngress
+                        && matches!(target.kind, GroupKind::Data { .. })
+                        && view.get(machine::direct::activation_key())?.is_some();
                     if WorkerIdentity::from(api.transport()) != remote
                         || api.database != database
-                        || target != control
+                        || (target != control && !direct)
                     {
                         return Err(unauthorized());
                     }
@@ -1394,10 +1461,11 @@ impl ControlHandle {
                             Some(ScopedIngressGrant::from_placement(&queue)?),
                         )
                     } else {
-                        if state.owner.is_none()
-                            || state.ready.ready_count == 0
-                            || state.invalid_ready != 0
-                            || state.pending.is_some()
+                        if !direct
+                            && (state.owner.is_none()
+                                || state.ready.ready_count == 0
+                                || state.invalid_ready != 0
+                                || state.pending.is_some())
                         {
                             return Err(stale());
                         }
@@ -1438,10 +1506,8 @@ impl ControlHandle {
                         return Err(unauthorized());
                     }
                     ServiceAction::DirectLeader => {
-                        let advertised = load::<WorkerIdentity>(
-                            view,
-                            &machine::direct::reader_key(remote),
-                        )?;
+                        let advertised =
+                            load::<WorkerIdentity>(view, &machine::direct::reader_key(remote))?;
                         if view.get(machine::direct::activation_key())?.is_none()
                             || advertised != Some(remote)
                             || !matches!(
@@ -1854,7 +1920,7 @@ impl AuthorityReader for ControlHandle {
         Box::pin(self.authority(scope, Some((remote, timestamps_group_id)), false))
     }
 }
-fn load<T: serde::de::DeserializeOwned>(
+pub(super) fn load<T: serde::de::DeserializeOwned>(
     view: &mut GroupRead<'_>,
     key: &[u8],
 ) -> Result<Option<T>, ProtocolError> {

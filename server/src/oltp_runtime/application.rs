@@ -11,7 +11,7 @@ use super::{
 use crate::{
     oltp::pool::{ByteClass, ChargedBytes, ExecutionClass, WorkerSharedResources},
     oltp_replication::{authority::control::ControlClient, multiplex::*, types::*},
-    protocol::{ErrorCode, Outcome, ProtocolError},
+    protocol::{ErrorCode, Key, Outcome, ProtocolError},
     request_queue::RequestRecord,
 };
 use scoped::ScopedRoutes;
@@ -70,6 +70,12 @@ enum Method {
     DirectRoute {
         table_id: Uuid,
     },
+    /// Read one owning range. Older workers reject this variant in preflight.
+    DirectPoint {
+        table_id: Uuid,
+        key_bytes: u64,
+        wide: bool,
+    },
     ScopedSubmit {
         bytes: u64,
         target: ScopedTarget,
@@ -92,7 +98,8 @@ impl Method {
             Self::Submit { .. }
             | Self::Result { .. }
             | Self::ScopedSubmit { .. }
-            | Self::ScopedResult { .. } => Purpose::ApiIngress,
+            | Self::ScopedResult { .. }
+            | Self::DirectPoint { wide: true, .. } => Purpose::ApiIngress,
             _ => Purpose::ApiObservation,
         }
     }
@@ -156,6 +163,15 @@ impl ApplicationEndpoint {
         }
         crate::protocol::json_input(bytes, MAX_HEADER_BYTES).map_err(|_| invalid())?;
         let header: Header = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        #[cfg(test)]
+        if matches!(header.method, Method::DirectPoint { .. })
+            && let Some(dir) =
+                std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").map(std::path::PathBuf::from)
+            && dir.join("reject-direct-point").is_file()
+        {
+            std::fs::write(dir.join("rejected-direct-point"), []).map_err(|_| unavailable())?;
+            return Err(invalid());
+        }
         if session.purpose() != header.method.purpose() {
             return Err(invalid());
         }
@@ -181,11 +197,27 @@ impl ApplicationEndpoint {
             .ok_or_else(stale_route)
     }
 
+    fn encode_submission(
+        shared: &WorkerSharedResources,
+        record: &RequestRecord,
+    ) -> Result<(ChargedBytes, Option<ChargedBytes>), ProtocolError> {
+        let bytes = shared
+            .encode_in(ByteClass::Data, record, 16 << 10)
+            .map_err(submission_reply_unavailable)?;
+        Ok((bytes, None))
+    }
+
     fn finish_reply(
         shared: &WorkerSharedResources,
         session: &AuthenticatedSession,
+        submits: bool,
         result: Result<(ChargedBytes, Option<ChargedBytes>), ProtocolError>,
     ) -> Result<ChargedReply, ProtocolError> {
+        let possibly_accepted = submits
+            && result
+                .as_ref()
+                .err()
+                .is_none_or(|error| error.outcome == Outcome::Unknown);
         let (body, inline, error) = match result {
             Ok((body, inline)) => (Some(body), inline, None),
             Err(error) => (None, None, Some(error)),
@@ -197,15 +229,23 @@ impl ApplicationEndpoint {
             error,
         };
         Ok(ChargedReply {
-            header: shared.encode_in(
-                if session.purpose() == Purpose::ApiIngress {
-                    ByteClass::Data
-                } else {
-                    ByteClass::Progress
-                },
-                &reply,
-                MAX_HEADER_BYTES,
-            )?,
+            header: shared
+                .encode_in(
+                    if session.purpose() == Purpose::ApiIngress {
+                        ByteClass::Data
+                    } else {
+                        ByteClass::Progress
+                    },
+                    &reply,
+                    MAX_HEADER_BYTES,
+                )
+                .map_err(|error| {
+                    if possibly_accepted {
+                        submission_reply_unavailable(error)
+                    } else {
+                        error
+                    }
+                })?,
             sections: [body, inline, None],
         })
     }
@@ -232,6 +272,18 @@ impl Endpoint for ApplicationEndpoint {
                         .await?;
                     bytes
                 }
+                Method::DirectPoint {
+                    key_bytes, wide, ..
+                } if key_bytes > 0 => {
+                    validate_body_length(key_bytes)?;
+                    if wide {
+                        let runtime = self.runtime.upgrade().ok_or_else(unavailable)?;
+                        runtime.authorize_api(session.remote()).await?;
+                    } else if key_bytes > direct::ROUTE_REPLY_BYTES as u64 {
+                        return Err(invalid());
+                    }
+                    key_bytes
+                }
                 _ => 0,
             };
             Ok(ReceivePlan {
@@ -253,6 +305,10 @@ impl Endpoint for ApplicationEndpoint {
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
             let request = self.parse(&session, header.as_ref())?;
+            let submits = matches!(
+                request.method,
+                Method::Submit { .. } | Method::ScopedSubmit { .. }
+            );
             if let Some((target, request_id)) = request.method.scoped_request() {
                 let worker = self.scoped_worker()?;
                 let shared = worker.resources();
@@ -271,7 +327,7 @@ impl Endpoint for ApplicationEndpoint {
                                 .settle_before_reserve(body.as_ref())
                                 .await?;
                             let record = worker.submit(placement, body, session.remote()).await?;
-                            Ok((shared.encode_in(ByteClass::Data, &record, 16 << 10)?, None))
+                            Self::encode_submission(shared, &record)
                         }
                         Method::ScopedObserve {
                             run_id,
@@ -301,7 +357,7 @@ impl Endpoint for ApplicationEndpoint {
                     }
                 }
                 .await;
-                return Self::finish_reply(shared, &session, result);
+                return Self::finish_reply(shared, &session, submits, result);
             }
             let runtime = self.runtime.upgrade().ok_or_else(unavailable)?;
             // Bind the terminal version before the Control role check. A
@@ -328,7 +384,7 @@ impl Endpoint for ApplicationEndpoint {
                     Method::Submit { bytes } => {
                         let body = request_body(bytes, &sections)?;
                         let record = runtime.submit_charged(body, session.remote()).await?;
-                        Ok((shared.encode_in(ByteClass::Data, &record, 16 << 10)?, None))
+                        Self::encode_submission(&shared, &record)
                     }
                     Method::Observe {
                         run_id,
@@ -388,7 +444,54 @@ impl Endpoint for ApplicationEndpoint {
                         let fill = runtime
                             .direct_table_fill(view.authority.ready.view.authority(), table_id)
                             .await?;
-                        Ok((shared.encode_in(ByteClass::Progress, &fill, 1 << 20)?, None))
+                        Ok((
+                            shared.encode_in(
+                                ByteClass::Progress,
+                                &fill,
+                                direct::ROUTE_REPLY_BYTES,
+                            )?,
+                            None,
+                        ))
+                    }
+                    Method::DirectPoint {
+                        table_id,
+                        key_bytes,
+                        wide,
+                    } => {
+                        let key = if key_bytes == 0 {
+                            ensure_empty(&sections)?;
+                            None
+                        } else {
+                            let body = request_body(key_bytes, &sections)?;
+                            let scratch = crate::oltp::mvcc::json_decode_budget(body.as_ref())?;
+                            Some(
+                                sections
+                                    .reserve_decode(&shared, scratch)?
+                                    .decode::<Key>(0)?,
+                            )
+                        };
+                        let fill = runtime
+                            .direct_point_fill(
+                                view.authority.ready.view.authority(),
+                                table_id,
+                                key.as_deref(),
+                            )
+                            .await?;
+                        let class = if wide {
+                            ByteClass::Data
+                        } else {
+                            ByteClass::Progress
+                        };
+                        let limit = if wide {
+                            WIDE_ROUTE_BYTES
+                        } else {
+                            direct::ROUTE_REPLY_BYTES
+                        };
+                        if !wide && crate::oltp::mvcc::store::encoded_length(&fill, limit).is_err()
+                        {
+                            return Err(wide_route_required());
+                        }
+                        Ok((shared.encode_in(class, &fill, limit)?, None))
                     }
                     Method::ScopedSubmit { .. }
                     | Method::ScopedObserve { .. }
@@ -396,7 +499,7 @@ impl Endpoint for ApplicationEndpoint {
                 }
             }
             .await;
-            Self::finish_reply(&shared, &session, result)
+            Self::finish_reply(&shared, &session, submits, result)
         })
     }
 }
@@ -437,14 +540,63 @@ impl ApplicationClient {
             _metadata: metadata,
         }))
     }
-    /// One Catalog read for the direct-path gateway, served by the owner.
-    pub(crate) async fn direct_table(
+    /// One Catalog point lookup through the ready owner. On a mixed-version
+    /// cluster only the old parser's rejection permits the legacy read.
+    pub(crate) async fn direct_point(
         &self,
         table_id: Uuid,
-    ) -> Result<Option<direct::TableFill>, ProtocolError> {
-        let reply = self.call(Method::DirectRoute { table_id }, None).await?;
-        Ok((*reply.decode_section::<Option<direct::TableFill>>(0)?).clone())
+        key: Option<&Key>,
+    ) -> Result<Option<direct::PointFill>, ProtocolError> {
+        let key_body = key
+            .map(|key| self.shared.encode(key, crate::protocol::MAX_BODY_BYTES))
+            .transpose()?;
+        let key_bytes = key_body.as_ref().map_or(0, |body| body.len() as u64);
+        let wide = key_bytes > direct::ROUTE_REPLY_BYTES as u64;
+        let reply = self
+            .call(
+                Method::DirectPoint {
+                    table_id,
+                    key_bytes,
+                    wide,
+                },
+                key_body.clone(),
+            )
+            .await;
+        let reply = match reply {
+            Err(error) if error == invalid() => {
+                let reply = self.call(Method::DirectRoute { table_id }, None).await?;
+                let fill = self.decode_route::<direct::TableFill>(reply)?;
+                return match fill {
+                    Some(fill) => fill.select(key).map(Some).ok_or_else(unavailable),
+                    None => Ok(None),
+                };
+            }
+            Err(error) if !wide && error == wide_route_required() => {
+                self.call(
+                    Method::DirectPoint {
+                        table_id,
+                        key_bytes,
+                        wide: true,
+                    },
+                    key_body,
+                )
+                .await?
+            }
+            other => other?,
+        };
+        self.decode_route(reply)
     }
+
+    fn decode_route<T: serde::de::DeserializeOwned + Clone>(
+        &self,
+        reply: ReceivedReply,
+    ) -> Result<Option<T>, ProtocolError> {
+        let body = reply.sections[0].as_ref().ok_or_else(invalid)?;
+        let scratch = crate::oltp::mvcc::json_decode_budget(body.as_ref())?;
+        let reply = reply.reserve_decode(&self.shared, scratch)?;
+        Ok((*reply.decode_section::<Option<T>>(0)?).clone())
+    }
+
     async fn call(
         &self,
         method: Method,
@@ -669,6 +821,18 @@ fn verify_response_hash(body: &ChargedBytes, expected: Digest) -> Result<(), Pro
     }
     Ok(())
 }
+// The ingress lane accepts two HTTP bodies plus transport overhead. Two
+// bounds of a range can each be as long as a key accepted at HTTP ingress.
+const WIDE_ROUTE_BYTES: usize = 2 * crate::protocol::MAX_BODY_BYTES + (8 << 10);
+
+fn wide_route_required() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::LimitExceeded,
+        "direct route needs the wide application lane",
+        Outcome::NotApplied,
+    )
+}
+
 fn invalid() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::ValidationError,
@@ -688,6 +852,110 @@ fn unavailable() -> ProtocolError {
 pub(super) fn submission_unknown(mut error: ProtocolError) -> ProtocolError {
     error.outcome = Outcome::Unknown;
     error
+}
+
+fn submission_reply_unavailable(error: ProtocolError) -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::OutcomeUnknown,
+        format!(
+            "request receipt unavailable after submission: {}",
+            error.message
+        ),
+        Outcome::Unknown,
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity() {
+    use crate::oltp::pool::SharedResourceConfig;
+    use crate::request_queue::{QueueLimits, RequestQueue};
+
+    let member = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "request_id": id, "operation": "table.create",
+        "payload": {"name": "items", "schema": {"id": "int64"}, "key": "id", "format": "parquet"},
+    }))
+    .unwrap();
+    let mut queue = RequestQueue::new(
+        Uuid::new_v4(),
+        1,
+        1,
+        QueueLimits {
+            max_pending_requests: 4,
+            max_queue_bytes_per_replica: 1 << 20,
+            max_retained_result_bytes_per_worker: 1 << 20,
+            result_retention_ms: 1_000,
+        },
+        [member].into(),
+    )
+    .unwrap();
+    let staged = queue.propose(body.clone(), 0).unwrap();
+    let accepted = queue.acknowledge(staged.identity(), member).unwrap();
+    assert!(accepted.accepted);
+    let shared = WorkerSharedResources::new(
+        1,
+        crate::config::WorkerResources::default(),
+        SharedResourceConfig {
+            control_bytes: (4 << 20) + 4096,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let held = shared.allocate_bytes(ByteClass::Data, 4096).unwrap();
+    let error = ApplicationEndpoint::encode_submission(&shared, &accepted)
+        .err()
+        .unwrap();
+    let identity = WorkerIdentity {
+        worker_id: member,
+        incarnation: Uuid::new_v4(),
+        certificate_sha256: Digest::from_bytes([1; 32]),
+        enrollment_revision: 1,
+    };
+    let session = AuthenticatedSession::for_test(
+        identity,
+        identity,
+        GroupIdentity {
+            database: Text::try_from("bug1").unwrap(),
+            cluster_id: Uuid::new_v4(),
+            group_id: Uuid::new_v4(),
+            group_format_version: 1,
+            kind: GroupKind::Control,
+        },
+        Purpose::ApiIngress,
+        Uuid::new_v4(),
+    );
+    let retained = shared
+        .encode_in(ByteClass::Progress, &accepted, 16 << 10)
+        .unwrap();
+    let header_error =
+        ApplicationEndpoint::finish_reply(&shared, &session, true, Ok((retained, None)))
+            .err()
+            .unwrap();
+    drop(held);
+    let retry = queue.propose(body, 0).unwrap();
+    assert_eq!(retry, accepted);
+    assert_eq!(queue.pending(), 1);
+    let (reply, _) = ApplicationEndpoint::encode_submission(&shared, &retry).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<RequestRecord>(reply.as_ref()).unwrap(),
+        accepted
+    );
+    let mut changed: serde_json::Value = serde_json::from_slice(&accepted.body).unwrap();
+    changed["payload"]["name"] = serde_json::json!("other");
+    let conflict = queue
+        .propose(serde_json::to_vec(&changed).unwrap(), 0)
+        .unwrap_err()
+        .protocol();
+    assert_eq!(
+        (conflict.code, conflict.outcome),
+        (ErrorCode::Conflict, Outcome::NotApplied)
+    );
+    for error in [error, header_error] {
+        assert_eq!(error.outcome, Outcome::Unknown);
+        assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    }
 }
 
 #[cfg(test)]

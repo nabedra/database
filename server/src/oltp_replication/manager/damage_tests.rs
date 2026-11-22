@@ -207,6 +207,25 @@ impl Cluster {
         self.members[&(index as u64 + 1)].clone()
     }
 
+    async fn replace_damaged(
+        &self,
+        leader: usize,
+        damaged: usize,
+        fresh: ReplicaMember,
+    ) -> Result<super::DamagedReplacement, ProtocolError> {
+        let old = [self.member(0), self.member(1), self.member(2)];
+        let next = old
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != damaged)
+            .map(|(_, member)| member.clone())
+            .chain(std::iter::once(fresh.clone()))
+            .collect::<Vec<_>>();
+        self.host(leader)
+            .replace_damaged_voter(&old, &next, &old[damaged], fresh)
+            .await
+    }
+
     /// Starts (or restarts) worker `index`: opens its pool, its transport on
     /// its enrolled address, and the group's replica. The replica start is the
     /// worker's own: it opens the retained group, which a quarantine refuses.
@@ -539,9 +558,7 @@ async fn ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released()
         let fresh = cluster.member(3);
         let blocked = timeout(
             Duration::from_secs(60),
-            cluster
-                .host(leader)
-                .replace_damaged_voter(&cluster.member(damaged), fresh.clone()),
+            cluster.replace_damaged(leader, damaged, fresh.clone()),
         )
         .await;
         assert!(
@@ -556,9 +573,7 @@ async fn ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released()
         let leader = cluster.leader(&[leader, other]).await;
         let replaced = timeout(
             Duration::from_secs(60),
-            cluster
-                .host(leader)
-                .replace_damaged_voter(&cluster.member(damaged), fresh.clone()),
+            cluster.replace_damaged(leader, damaged, fresh.clone()),
         )
         .await
         .expect("replacement finished")
@@ -572,6 +587,14 @@ async fn ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released()
         assert!(voters.contains(&fresh.node_id));
         assert!(!voters.contains(&damaged_node));
         assert_eq!(voters.len(), 3);
+        assert!(
+            !cluster
+                .host(leader)
+                .raft
+                .learner_ids()
+                .any(|id| id == damaged_node),
+            "the removed voter still receives learner replication"
+        );
         assert_eq!(replaced.proof.removed, cluster.member(damaged));
         assert_eq!(replaced.proof.replacement, fresh);
 
@@ -596,8 +619,7 @@ async fn ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released()
         assert_eq!(cluster.applied_term(3).await, term);
         // Idempotent once committed.
         let again = cluster
-            .host(leader)
-            .replace_damaged_voter(&cluster.member(damaged), fresh.clone())
+            .replace_damaged(leader, damaged, fresh.clone())
             .await
             .unwrap();
         assert_eq!(again.proof.removed, cluster.member(damaged));
@@ -873,9 +895,7 @@ async fn o06_o17_rv_final_m4_given_up_replica_bytes_are_released_after_replaceme
         let fresh = cluster.member(3);
         let replaced = timeout(
             Duration::from_secs(60),
-            cluster
-                .host(leader)
-                .replace_damaged_voter(&cluster.member(follower), fresh.clone()),
+            cluster.replace_damaged(leader, follower, fresh.clone()),
         )
         .await
         .expect("replacement finished")
@@ -990,7 +1010,7 @@ async fn o29_ns10_perf2d_leader_power_cut_before_its_sync_keeps_the_quorum_commi
         let followers: Vec<usize> = (0..3).filter(|index| *index != leader).collect();
         let first = cluster.fence(leader, 1).await;
         let gate = cluster.workers[leader].gate.clone().unwrap();
-        gate.hold();
+        let held = gate.hold();
         let fence = cluster.fence_task(leader, 2);
         let next = first.index + 1;
         timeout(Duration::from_secs(20), async {
@@ -1021,7 +1041,7 @@ async fn o29_ns10_perf2d_leader_power_cut_before_its_sync_keeps_the_quorum_commi
 
         let disk = cluster.workers[leader].fault.crash();
         cluster.workers[leader].fault.halt();
-        gate.release();
+        drop(held);
         let outcome = timeout(Duration::from_secs(20), fence).await;
         assert!(
             !matches!(outcome, Ok(Ok(Ok(_)))),
@@ -1058,9 +1078,7 @@ async fn o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry() {
         let gates: Vec<_> = (0..3)
             .map(|index| cluster.workers[index].gate.clone().unwrap())
             .collect();
-        for gate in &gates {
-            gate.hold();
-        }
+        let held: Vec<_> = gates.iter().map(|gate| gate.hold()).collect();
         let fence = cluster.fence_task(leader, 2);
         timeout(Duration::from_secs(20), async {
             while gates.iter().any(|gate| gate.entered() == 0) {
@@ -1086,9 +1104,7 @@ async fn o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry() {
         for index in 0..3 {
             cluster.workers[index].fault.halt();
         }
-        for gate in &gates {
-            gate.release();
-        }
+        drop(held);
         let outcome = timeout(Duration::from_secs(20), fence).await;
         assert!(!matches!(outcome, Ok(Ok(Ok(_)))));
         for (index, disk) in disks.into_iter().enumerate() {
@@ -1110,4 +1126,118 @@ async fn o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o06_follower_sync_error_cannot_complete_a_quorum_with_a_delayed_follower() {
+    use nabedra_kv::fs::{Fault, FaultError, FsOp};
+
+    let cluster = Cluster::new_with(3, 3, true).await;
+    let leader = cluster.leader(&[0, 1, 2]).await;
+    let followers: Vec<_> = (0..3).filter(|node| *node != leader).collect();
+    let (delayed, failing) = (followers[0], followers[1]);
+    let first = cluster.fence(leader, 1).await;
+    for follower in &followers {
+        applied_term_reaches(&cluster, *follower, 1).await;
+    }
+    let gate = cluster.workers[delayed].gate.clone().unwrap();
+    let sync_hold = gate.hold();
+    let failing_pool = cluster.workers[failing].pool.clone().unwrap();
+    cluster.workers[failing].fault.inject(
+        Fault::on(FsOp::SyncData)
+            .path_prefix(cluster.pool_path(failing).join("kv/journal"))
+            .error(FaultError::Eio),
+    );
+    let proposal = cluster.fence_task(leader, 2);
+    let held = timeout(Duration::from_secs(15), async {
+        while gate.entered() == 0 || !failing_pool.requires_recovery() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let metrics = cluster.host(leader).raft.metrics().borrow_watched().clone();
+        (
+            !proposal.is_finished(),
+            metrics
+                .cluster_committed
+                .is_some_and(|id| id.index == first.index),
+            metrics
+                .last_applied
+                .is_some_and(|id| id.index == first.index),
+            followers.iter().all(|node| {
+                cluster
+                    .matched(leader, *node as u64 + 1)
+                    .is_none_or(|index| index <= first.index)
+            }),
+        )
+    })
+    .await;
+    // Always unblock the journal thread before assertions can unwind.
+    drop(sync_hold);
+    assert_eq!(
+        held.expect("both follower syncs reached their fault"),
+        (true, true, true, true)
+    );
+    let applied = timeout(Duration::from_secs(15), proposal)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(applied.index, first.index + 1);
+    applied_term_reaches(&cluster, delayed, 2).await;
+    assert_eq!(
+        cluster
+            .host(leader)
+            .ensure_linearizable()
+            .await
+            .unwrap()
+            .applied,
+        applied
+    );
+    assert!(failing_pool.requires_recovery());
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o06_foreign_pool_and_group_identity_are_refused() {
+    let cluster = Cluster::new(3, 3).await;
+    let index = 0;
+    let pool = cluster.workers[index].pool.as_ref().unwrap();
+    let mut foreign = cluster.group.clone();
+    foreign.cluster_id = Uuid::new_v4();
+    assert!(pool.retained_group(foreign).await.is_err());
+    let path = cluster.pool_path(index);
+    let identity = cluster.pool_identity(index);
+    let shared = cluster.workers[index].shared.clone();
+    let mut cluster = cluster;
+    cluster.stop(index).await;
+    let mut foreign = identity.clone();
+    foreign.pool_id = cluster.pool_identity(1).pool_id;
+    let fs: Arc<dyn Fs> = Arc::new(cluster.workers[index].fault.clone());
+    assert!(OltpPool::open_development_on(&path, foreign, shared.clone(), fs.clone()).is_err());
+    let exact = OltpPool::open_development_on(path, identity, shared, fs).unwrap();
+    assert!(exact.retained_group(cluster.group.clone()).await.is_ok());
+    cluster.shutdown().await;
+}
+
+pub(crate) fn acceptance_o06_storage() {
+    o06_follower_sync_error_cannot_complete_a_quorum_with_a_delayed_follower();
+    crate::oltp_acceptance::clause(
+        "O06",
+        "stable-storage-before-ack",
+        "passed",
+        "An RF3 mTLS FaultFs fixture held one follower at journal sync and failed the other with EIO. The leader could neither commit, apply nor reply until the held follower synced.",
+    );
+    ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released();
+    o06_foreign_pool_and_group_identity_are_refused();
+    crate::oltp::pool::acceptance_damaged_checkpoints();
+    crate::oltp_acceptance::clause(
+        "O06",
+        "corrupt-and-foreign-rejection",
+        "passed",
+        "The RF3 storage fixture quarantined a corrupted voter log and refused foreign pool and group identities. The pool also rejected corrupt checkpoint membership and an inconsistent header.",
+    );
+}
+
+pub(crate) fn acceptance_overlapped_append() {
+    o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry();
+    o29_ns10_perf2d_leader_power_cut_before_its_sync_keeps_the_quorum_commit();
 }

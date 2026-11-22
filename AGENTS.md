@@ -24,8 +24,8 @@ suggestion to persist the request queue across a complete cluster shutdown.
 For OLTP request-path work, read
 [the direct path plan](plans/oltp-direct-path.md) first. The user decided on
 2026-11-19 that synchronous single-key OLTP operations skip the replicated
-queue. The owning range's leader commits each one with a single Data log
-entry, and a retry with the same request ID and body returns the original
+queue. The owning range's leader commits each one in a single Data log
+entry, which may carry other requests' commits to the same range, and a retry with the same request ID and body returns the original
 result. Request ID reuse is detected per table and key on this path. The path
 is on by default, and `direct_oltp: false` restores the queued path.
 

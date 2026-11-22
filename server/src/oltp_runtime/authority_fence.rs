@@ -105,11 +105,14 @@ pub(super) async fn fence_groups(
                         .await?
                 }
             };
+            #[cfg(test)]
+            let observed_fence = receipt.clone();
             let op = transition_id("record-fence", &(fence.transition_id, identity))?;
             accepted(control.record_group_fence(op, receipt).await?.reply)?;
             tracing::debug!(transition = %fence.transition_id, group = %identity.group_id, "recorded registered group fence");
             #[cfg(test)]
             if fence.cold {
+                super::recovery_tests::cold_fence_checkpoint(&observed_fence).await;
                 super::recovery_tests::pause("cold_group_fenced", fence.transition_id).await;
             }
         }

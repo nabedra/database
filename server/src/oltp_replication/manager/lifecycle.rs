@@ -166,6 +166,10 @@ where
                 .await
                 .map_err(|_| unavailable())?;
             let minimum = *reply.log_id();
+            #[cfg(test)]
+            crate::oltp_runtime::recovery_tests::pause(
+                "replacement_learner_appended", self.state.store().identity().group_id,
+            ).await;
             self.raft
                 .wait(Some(Duration::from_secs(25)))
                 .replication(target.node_id, Some(minimum.index), u64::MAX)
@@ -176,12 +180,14 @@ where
         .await
         .map_err(|_| unavailable())?
     }
+    #[cfg(test)]
     pub(crate) async fn replace_voter(
         &self,
         learner: ReplicatedLearner,
         removed: u64,
     ) -> Result<GroupMembershipObservation, ProtocolError> {
-        self.replace_voter_applied(learner, removed, None).await
+        self.replace_voter_applied(learner, removed, None, true)
+            .await
     }
 
     async fn replace_voter_applied(
@@ -189,6 +195,7 @@ where
         learner: ReplicatedLearner,
         removed: u64,
         target_applied: Option<&PlacementCatchUp<'_>>,
+        retain_removed: bool,
     ) -> Result<GroupMembershipObservation, ProtocolError> {
         let _change = self.membership_changes.lock().await;
         let current = self.observe_membership().await?;
@@ -211,53 +218,24 @@ where
         next.sort_by_key(|member| member.node_id);
         validate_voters(&next).map_err(|_| invalid())?;
         let next = Page::new(next).map_err(|_| invalid())?;
-        self.finish_replacement(&current.replicas, &next, &learner.target, target_applied)
-            .await
+        self.finish_replacement(
+            &current.replicas,
+            &next,
+            &learner.target,
+            target_applied,
+            retain_removed,
+        )
+        .await
     }
-    /// Recover an interrupted joint membership using the SAME durable planned
-    /// old/new voter identities. No route is published while it is joint.
-    pub(crate) async fn resume_voter_replacement(
-        &self,
-        expected: Page<ReplicaMember>,
-        next: Page<ReplicaMember>,
-        target: ReplicaMember,
-    ) -> Result<GroupMembershipObservation, ProtocolError> {
-        self.resume_voter_replacement_applied(expected, next, target, None)
-            .await
-    }
-
-    async fn resume_voter_replacement_applied(
-        &self,
-        expected: Page<ReplicaMember>,
-        next: Page<ReplicaMember>,
-        target: ReplicaMember,
-        target_applied: Option<&PlacementCatchUp<'_>>,
-    ) -> Result<GroupMembershipObservation, ProtocolError> {
-        let _change = self.membership_changes.lock().await;
-        validate_voters(&expected).map_err(|_| invalid())?;
-        validate_voters(&next).map_err(|_| invalid())?;
-        if expected.len() != next.len()
-            || !next.iter().any(|member| member == &target)
-            || expected
-                .iter()
-                .any(|member| member.node_id == target.node_id)
-            || expected
-                .iter()
-                .filter(|member| !next.contains(member))
-                .count()
-                != 1
-            || next
-                .iter()
-                .filter(|member| !expected.contains(member))
-                .count()
-                != 1
-        {
-            return Err(invalid());
-        }
-        self.finish_replacement(&expected, &next, &target, target_applied)
-            .await
-    }
-
+    /// Drive or resume the exact durable replacement plan. A stable voter set
+    /// is evidence for this plan only if it replaces the specified voter.
+    ///
+    /// `retain_removed` keeps the removed voter as a learner in the final
+    /// membership. A live removed replica needs that: it must apply the final
+    /// membership to retire (`verify_removed`), and the leader stops
+    /// replicating to a node the final membership no longer names. A voter
+    /// that never applies again (lost in system replacement, or quarantined
+    /// by NS14) is dropped.
     pub(crate) async fn reconcile_voter_replacement(
         &self,
         old: &[ReplicaMember],
@@ -265,23 +243,34 @@ where
         target: &ReplicaMember,
         removed: u64,
         target_applied: Option<&PlacementCatchUp<'_>>,
+        retain_removed: bool,
     ) -> Result<GroupMembershipObservation, ProtocolError> {
+        validate_voters(old).map_err(|_| invalid())?;
+        validate_voters(next).map_err(|_| invalid())?;
+        if old.len() != next.len()
+            || !next.contains(target)
+            || !old.iter().any(|member| member.node_id == removed)
+            || old.iter().any(|member| member.node_id == target.node_id)
+            || old
+                .iter()
+                .filter(|member| member.node_id != removed)
+                .ne(next.iter().filter(|member| *member != target))
+        {
+            return Err(invalid());
+        }
+
         if let Ok(observed) = self.observe_membership().await {
             if observed.replicas() == old {
                 let learner = self.replicate_learner(observed, target.clone()).await?;
-                self.replace_voter_applied(learner, removed, target_applied)
+                self.replace_voter_applied(learner, removed, target_applied, retain_removed)
                     .await?;
             } else if observed.replicas() != next {
                 return Err(invalid());
             }
         } else {
-            self.resume_voter_replacement_applied(
-                Page::new(old.to_vec()).map_err(|_| invalid())?,
-                Page::new(next.to_vec()).map_err(|_| invalid())?,
-                target.clone(),
-                target_applied,
-            )
-            .await?;
+            let _change = self.membership_changes.lock().await;
+            self.finish_replacement(old, next, target, target_applied, retain_removed)
+                .await?;
         }
         let observed = self.observe_stable_membership().await?;
         if observed.replicas() != next {
@@ -296,6 +285,7 @@ where
         next: &[ReplicaMember],
         target: &ReplicaMember,
         target_applied: Option<&PlacementCatchUp<'_>>,
+        retain_removed: bool,
     ) -> Result<GroupMembershipObservation, ProtocolError> {
         self.ensure_linearizable().await?;
         let old_ids = expected
@@ -377,7 +367,7 @@ where
                 Duration::from_secs(30),
                 self.raft.change_membership_if(
                     new_ids,
-                    true,
+                    retain_removed,
                     [Precondition::LastMembershipLogId {
                         last_membership_log_id: guarded_id,
                     }],
@@ -715,38 +705,24 @@ where
     M: TypedMachine<C>,
 {
     /// Section 3 rule 3 on the group's leader: replaces the damaged voter with
-    /// a fresh identity through the joint-membership `replace_voter`. The new
-    /// replica starts as a learner, catches up (a snapshot when the log no
-    /// longer covers it, O16) and is promoted; the damaged identity leaves the
-    /// voters. Rule 5: without a quorum that excludes the damaged replica the
-    /// quorum read or the change fails, and nothing is recorded or deleted.
-    /// Idempotent after the change committed.
+    /// a fresh identity through joint consensus. A retry uses the same planned
+    /// members whether the group is still on the old configuration, already
+    /// in joint consensus, or on the final configuration.
     pub(crate) async fn replace_damaged_voter(
         &self,
+        old: &[ReplicaMember],
+        next: &[ReplicaMember],
         damaged: &ReplicaMember,
         fresh: ReplicaMember,
     ) -> Result<DamagedReplacement, ProtocolError> {
-        damaged.validate().map_err(|_| invalid())?;
-        fresh.validate().map_err(|_| invalid())?;
-        if fresh.node_id == damaged.node_id {
+        if !old.contains(damaged) {
             return Err(invalid());
         }
-        let current = self.observe_membership().await?;
-        let membership = if current.replicas.iter().any(|member| member == damaged) {
-            if current
-                .replicas
-                .iter()
-                .any(|member| member.node_id == fresh.node_id)
-            {
-                return Err(invalid());
-            }
-            let learner = self.replicate_learner(current, fresh.clone()).await?;
-            self.replace_voter(learner, damaged.node_id).await?
-        } else if current.replicas.iter().any(|member| member == &fresh) {
-            current
-        } else {
-            return Err(invalid());
-        };
+        let membership = self
+            // A quarantined voter never applies again; its removal is proven
+            // by `DamagedReplicaRemoved`, so it is dropped (REP5, ns23).
+            .reconcile_voter_replacement(old, next, &fresh, damaged.node_id, None, false)
+            .await?;
         let proof = GroupDamageReplacement {
             group: membership.group.clone(),
             removed: damaged.clone(),

@@ -750,6 +750,9 @@ impl ScopedWorker {
         let context: AcceptedContext =
             serde_json::from_slice(context_bytes.as_ref()).map_err(|_| unavailable())?;
         let read = context.read.as_ref().ok_or_else(unavailable)?;
+        #[cfg(test)]
+        super::recovery_tests::transaction_checkpoint("snapshot", id, &read.storage_pin.read_ts)
+            .await;
         let request = record.stamp.binding();
         let GroupKind::Data { table_id, .. } = placement.group.kind else {
             return Err(unavailable());
@@ -955,9 +958,20 @@ impl ScopedWorker {
                 error = *cause;
             }
             match error {
-                PlanError::Blocked(_) | PlanError::LifecyclePending(_)
+                blocked @ (PlanError::Blocked(_) | PlanError::LifecyclePending(_))
                     if Instant::now() < deadline =>
                 {
+                    #[cfg(test)]
+                    if let PlanError::Blocked(intent) = blocked {
+                        super::recovery_tests::transaction_checkpoint(
+                            "blocked",
+                            txn.request_id,
+                            &intent,
+                        )
+                        .await;
+                    }
+                    #[cfg(not(test))]
+                    let _ = blocked;
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 PlanError::Protocol(error) => return Err((error, guards.into_values().collect())),

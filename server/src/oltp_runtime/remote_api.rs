@@ -75,6 +75,7 @@ pub(crate) struct RemoteRuntime {
     gateway: Arc<super::application::direct::DirectGateway>,
     scope: QueueScope,
     ingress: Executor,
+    direct_ingress: Executor,
     accepting: AtomicBool,
     stop: watch::Sender<bool>,
     tasks: Mutex<Option<(JoinHandle<Result<(), ProtocolError>>, JoinHandle<()>)>>,
@@ -256,6 +257,7 @@ impl RemoteRuntime {
             gateway,
             scope,
             ingress: Executor::new(2, 16)?,
+            direct_ingress: Executor::new(super::http_runtime::DIRECT_INGRESS_SLOTS, 0)?,
             accepting: AtomicBool::new(true),
             stop,
             tasks: Mutex::new(Some((task, refresh))),
@@ -276,9 +278,11 @@ impl RemoteRuntime {
     pub(crate) fn stop_accepting(&self) {
         self.accepting.store(false, Ordering::Release);
         self.ingress.stop_accepting();
+        self.direct_ingress.stop_accepting();
     }
     pub(crate) async fn drain(&self) -> Result<(), ProtocolError> {
         self.stop_accepting();
+        self.direct_ingress.drain().await;
         self.ingress.drain().await;
         self.direct.stop().await;
         let _ = self.stop.send(true);
@@ -350,6 +354,9 @@ impl HttpRuntime for RemoteRuntime {
     fn ingress(&self) -> &Executor {
         &self.ingress
     }
+    fn direct_ingress(&self) -> &Executor {
+        &self.direct_ingress
+    }
     fn direct_gateway(&self) -> Option<Arc<super::application::direct::DirectGateway>> {
         Some(self.gateway.clone())
     }
@@ -402,9 +409,11 @@ impl HttpRuntime for RemoteRuntime {
                 .client
                 .has_scoped_receipt(record.run_id, record.request_id);
             let mut copy_deadline = None;
+            let mut observation_deadline = None;
             loop {
                 let observe = self.client.observe(record.run_id, record.request_id);
-                let observed = match copy_deadline {
+                let deadline = copy_deadline.into_iter().chain(observation_deadline).min();
+                let observed = match deadline {
                     Some(deadline) => tokio::time::timeout_at(deadline, observe)
                         .await
                         .map_err(|_| unavailable())?,
@@ -412,6 +421,9 @@ impl HttpRuntime for RemoteRuntime {
                 };
                 let state = match observed {
                     Ok(observed) => {
+                        // A healthy observation ends the transient failure
+                        // streak. The original request may still be queued.
+                        observation_deadline = None;
                         let metadata = &observed.metadata.record;
                         if metadata.digest != record.digest
                             || metadata.state == RequestState::Reconciling && !scoped
@@ -442,10 +454,20 @@ impl HttpRuntime for RemoteRuntime {
                         state
                     }
                     Err(error) if scoped && receipt_retryable(&error) => RequestState::Reconciling,
+                    Err(error) if receipt_retryable(&error) => {
+                        observation_deadline.get_or_insert_with(|| {
+                            tokio::time::Instant::now() + super::RECEIPT_OBSERVATION_TIMEOUT
+                        });
+                        RequestState::Reconciling
+                    }
                     Err(error) => return Err(error),
                 };
                 let now = tokio::time::Instant::now();
-                if copy_deadline.is_some_and(|end| now >= end) {
+                if copy_deadline
+                    .into_iter()
+                    .chain(observation_deadline)
+                    .any(|end| now >= end)
+                {
                     return Err(unavailable());
                 }
                 if (state == RequestState::Committing
@@ -462,8 +484,11 @@ impl HttpRuntime for RemoteRuntime {
                     copy_deadline = Some(now + timeout);
                 }
                 let next_poll = now + interval;
-                tokio::time::sleep_until(copy_deadline.map_or(next_poll, |end| end.min(next_poll)))
-                    .await;
+                let wake = copy_deadline
+                    .into_iter()
+                    .chain(observation_deadline)
+                    .fold(next_poll, std::cmp::min);
+                tokio::time::sleep_until(wake).await;
                 interval = (interval * 2).min(std::time::Duration::from_millis(500));
             }
         })

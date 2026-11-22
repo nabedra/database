@@ -24,6 +24,7 @@ use crate::oltp_replication::{
     },
     owned::{OwnedCommand, OwnedPayload},
 };
+use uuid::Uuid;
 
 #[path = "participant_full_timestamp_point.rs"]
 mod timestamp_point;
@@ -136,6 +137,10 @@ impl ParticipantEndpoint {
                     head.action,
                     ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_)
                 ) || matches!(head.action,ServiceAction::ParticipantProof{source_group} if source_group==self.proof.handle.identity().group_id)
+            }
+            Method::ParticipantIndexReclaim | Method::ParticipantStoredIndex { .. } => {
+                head.action == ServiceAction::Owner
+                    && matches!(self.proof.handle.identity().kind, GroupKind::Data { .. })
             }
             Method::Direct(_) | Method::DirectForward(_) => {
                 matches!(self.proof.handle.identity().kind, GroupKind::Data { .. })
@@ -1076,7 +1081,16 @@ impl Endpoint for ParticipantEndpoint {
                         )
                         .await
                     }
-                    Method::ParticipantPropose { progress } => {
+                    Method::ParticipantStoredIndex { after } => {
+                        let index = self.proof.handle.next_stored_index(after).await?;
+                        self.proof
+                            .shared
+                            .encode_in(ByteClass::Progress, &index, 128)
+                    }
+                    Method::ParticipantPropose { .. } | Method::ParticipantIndexReclaim => {
+                        let reclaim = head.method == Method::ParticipantIndexReclaim;
+                        let progress = reclaim
+                            || head.method == (Method::ParticipantPropose { progress: true });
                         let shared = self.proof.shared.clone();
                         let class = if progress {
                             ByteClass::Progress
@@ -1105,6 +1119,11 @@ impl Endpoint for ParticipantEndpoint {
                                 },
                             )
                             .await?;
+                        if reclaim
+                            != matches!(command.payload()?, ParticipantCommand::ReclaimIndex(_))
+                        {
+                            return Err(invalid());
+                        }
                         self.validate(&session, command.payload()?, &head).await?;
                         let value = match head.action {
                             ServiceAction::ScopedQueueExecute(scope) => {
@@ -1304,6 +1323,17 @@ impl ParticipantClient {
     }
 }
 impl RemoteParticipant for ParticipantClient {
+    fn next_stored_index(&self, after: Option<Uuid>) -> ParticipantFuture<'_, Option<Uuid>> {
+        Box::pin(async move {
+            let response = self
+                .proof
+                .client
+                .read(Method::ParticipantStoredIndex { after })
+                .await?;
+            let (index, _) = self.decode_response(response).await?;
+            Ok(index)
+        })
+    }
     fn with_scoped_execution(
         &self,
         scope: ScopedCatalogRead,
@@ -1324,7 +1354,14 @@ impl RemoteParticipant for ParticipantClient {
         Box::pin(async move {
             let client = &self.proof.client;
             let command_body = command.payload()?;
+            let reclaim = matches!(command_body, ParticipantCommand::ReclaimIndex(_));
             let progress = !command_body.uses_prepare_lane();
+            let wait_for_outgoing = matches!(
+                command_body,
+                ParticipantCommand::PreparePage { .. }
+                    | ParticipantCommand::Seal { .. }
+                    | ParticipantCommand::Resolve { .. }
+            );
             // These commands replay the same locator, page, or settled guard.
             let repeat = matches!(client.action, ServiceAction::ScopedQueueExecute(_))
                 && matches!(
@@ -1367,15 +1404,32 @@ impl RemoteParticipant for ParticipantClient {
                     },
                 )
                 .await?;
-            let method = Method::ParticipantPropose { progress };
+            let method = if reclaim {
+                Method::ParticipantIndexReclaim
+            } else {
+                Method::ParticipantPropose { progress }
+            };
             let response = if repeat {
                 client.repeat_as(client.action, method, Some(payload)).await?
+            } else if wait_for_outgoing {
+                client
+                    .call_with_outgoing_deadline(
+                        client.action,
+                        method,
+                        Some(payload),
+                        Some(Instant::now() + SERVICE_CONVERGENCE),
+                    )
+                    .await?
             } else {
                 client.call(method, Some(payload)).await?
             };
             let (value, owner): (Applied<ParticipantReply>, _) =
                 self.decode_response(response).await.map_err(|error| {
-                    if repeat { mutation_uncertain(error) } else { error }
+                    if repeat || wait_for_outgoing {
+                        mutation_uncertain(error)
+                    } else {
+                        error
+                    }
                 })?;
             Ok(Applied::owned(value.position, value.reply, owner))
         })

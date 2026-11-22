@@ -8,6 +8,7 @@ use crate::{
             index::IndexAttemptClosedRecord,
             store::{
                 archive::ArchiveEffects,
+                encoded_length,
                 image_archive::CommittedImage,
                 index::{ArchivedIndexClosure, index_closure_row},
                 restore::validate_archive_image,
@@ -17,7 +18,9 @@ use crate::{
                 },
             },
         },
-        pool::{ByteClass, ScratchLease, WorkerSharedResources},
+        pool::{
+            ByteClass, DEFAULT_REPLY_DECODE_BYTES, GroupRead, ScratchLease, WorkerSharedResources,
+        },
     },
     oltp_replication::{
         authority::{
@@ -39,6 +42,64 @@ use std::{
 use uuid::Uuid;
 const MAGIC: &[u8; 16] = b"NABEDRA-HST-0001";
 const MAX_FRAME: usize = 32 << 20;
+
+pub(crate) const ARCHIVE_PAGE_WIRE_BYTES: usize = 128 << 10;
+
+/// Metadata authority reads share a bounded reply decoder. A backup can
+/// retain its current page while asking for a proof or participant manifest.
+pub(crate) struct ArchivePageBudget {
+    wire: usize,
+    decode: usize,
+}
+impl ArchivePageBudget {
+    const WIRE_HEADROOM: usize = 8 << 10;
+    const DECODE_HEADROOM: usize = 64 << 10;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            wire: Self::WIRE_HEADROOM,
+            decode: Self::DECODE_HEADROOM,
+        }
+    }
+
+    /// Return false at a page boundary, before advancing the caller's cursor.
+    pub(crate) fn include(
+        &mut self,
+        view: &mut GroupRead<'_>,
+        item: &impl Serialize,
+    ) -> Result<bool, ProtocolError> {
+        let fits = || {
+            failure(
+                ErrorCode::LimitExceeded,
+                "one archive record exceeds a page budget",
+            )
+        };
+        let bytes = encoded_length(item, ARCHIVE_PAGE_WIRE_BYTES).map_err(|_| fits())?;
+        let wire = self.wire.checked_add(bytes + 1).ok_or_else(fits)?;
+        if wire <= ARCHIVE_PAGE_WIRE_BYTES {
+            let item_decode = view.with_scratch_buffer(bytes, |_, scratch| {
+                let mut destination = &mut *scratch;
+                serde_json::to_writer(&mut destination, item).map_err(|_| invalid())?;
+                if !destination.is_empty() {
+                    return Err(invalid());
+                }
+                crate::oltp::mvcc::json_decode_budget(scratch)
+            })?;
+            // The item estimator includes 4 KiB of per-message headroom,
+            // more than the extra comma and per-item container accounting.
+            let decode = self.decode.checked_add(item_decode).ok_or_else(fits)?;
+            if decode <= DEFAULT_REPLY_DECODE_BYTES / 2 {
+                self.wire = wire;
+                self.decode = decode;
+                return Ok(true);
+            }
+        }
+        if self.wire == Self::WIRE_HEADROOM {
+            return Err(fits());
+        }
+        Ok(false)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

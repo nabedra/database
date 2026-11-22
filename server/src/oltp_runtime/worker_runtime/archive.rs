@@ -71,6 +71,11 @@ pub(crate) use restore::VerifiedNativeRestore;
 mod publication;
 pub(crate) use publication::NativeBackupPublication;
 
+fn backup_error(stage: &str, mut error: ProtocolError) -> ProtocolError {
+    error.message = format!("native backup {stage}: {}", error.message);
+    error
+}
+
 struct Export {
     writer: HistoryWriter<File>,
     shared: Arc<crate::oltp::pool::WorkerSharedResources>,
@@ -99,14 +104,8 @@ impl WorkerRuntime {
         if owner.backup_id.is_nil() || owner.attempt == 0 {
             return Err(unknown());
         }
-        // Incremental segments export only Status-decided transactions, so
-        // they would lose every direct commit and its dedup record (RV-T4 F2).
-        if previous.is_some() && self.direct_commits_active() {
-            return Err(crate::oltp::failure(
-                ErrorCode::UnsupportedOperation,
-                "incremental backups are unavailable while direct commits (data.direct.v1) \
-                 are active: take a full backup",
-            ));
+        if previous.is_some() {
+            self.check_incremental_backup().await?;
         }
         if let Some(repository) = &self.services.archive_repository {
             repository.require_write()?;
@@ -163,6 +162,21 @@ impl WorkerRuntime {
     /// and `routes_direct()` for the leader executor (T5) and gateway (T6).
     pub(crate) fn direct_switch(&self) -> Option<&Arc<super::direct_capability::DirectSwitch>> {
         self.direct.get()
+    }
+
+    async fn check_incremental_backup(&self) -> Result<(), ProtocolError> {
+        // Incremental segments export only Status-decided transactions. The
+        // local watcher may lag the durable activation in Control.
+        if self.direct_commits_active()
+            || self.direct_switch().ok_or_else(unknown)?.refresh().await?
+        {
+            return Err(crate::oltp::failure(
+                ErrorCode::UnsupportedOperation,
+                "incremental backups are unavailable while direct commits (data.direct.v1) \
+                 are active: take a full backup",
+            ));
+        }
+        Ok(())
     }
     /// Incremental backups exist only while `data.direct.v1` is inactive (a
     /// cluster with an older member). A single test worker activates it on
@@ -282,8 +296,15 @@ impl WorkerRuntime {
             .services
             .timestamps
             .begin_backup(authority, owner)
-            .await?;
+            .await
+            .map_err(|error| backup_error("pin", error))?;
         *active_pin = Some(pin);
+        // Activation may have committed since the first check. A direct
+        // timestamp allocated after this cut is above it, so check Control
+        // after the cut is fixed and before exporting incremental history.
+        if previous.is_some() {
+            self.check_incremental_backup().await?;
+        }
         let catalog = self.services.catalog.snapshot(pin.read_ts, authority)?;
         let archive_id = key.archive_id;
         let scope = HistoryScope {
@@ -367,10 +388,13 @@ impl WorkerRuntime {
                         end: None,
                     },
                 },
-                pin.read_ts,
+                &catalog,
             )
-            .await?;
-            self.export_native_routes(&catalog, &mut export).await?;
+            .await
+            .map_err(|error| backup_error("catalog images", error))?;
+            self.export_native_routes(&catalog, &mut export)
+                .await
+                .map_err(|error| backup_error("data ranges", error))?;
         } else {
             self.export_native_split_baselines(&catalog, &scope, &mut export)
                 .await?;
@@ -385,7 +409,8 @@ impl WorkerRuntime {
                 .services
                 .control
                 .groups(control.group_inventory_revision, after)
-                .await?;
+                .await
+                .map_err(|error| backup_error("control inventory", error))?;
             let page: crate::oltp_replication::authority::control::InventoryPage<
                 crate::oltp_replication::authority::control::GroupRecord,
             > = serde_json::from_slice(raw.as_ref()).map_err(|_| unknown())?;
@@ -419,7 +444,8 @@ impl WorkerRuntime {
                     status,
                     exported.is_empty(),
                 )
-                .await?;
+                .await
+                .map_err(|error| backup_error("status history", error))?;
                 exported.insert(group.identity.group_id);
             }
             if page.done {
@@ -444,7 +470,10 @@ impl WorkerRuntime {
         let split_graph = restore_graph::RestoreGraph::new(shared.clone())?;
         let mut split_transcript = restore_graph::SplitTranscript::default();
         let mut point_transcript = point_history::PointTranscript::default();
-        while let Some(frame) = validator.next(&shared)? {
+        while let Some(frame) = validator
+            .next(&shared)
+            .map_err(|error| backup_error("history frame", error))?
+        {
             split_transcript.observe(&split_graph, &frame, scope.cut)?;
             point_transcript.observe(frame.payload()?, &shared)?;
         }
@@ -495,7 +524,8 @@ impl WorkerRuntime {
         let history = shared.encode_in(ByteClass::Data, &manifest, 64 << 10)?;
         let published = upload
             .publish(history, manifest.scope.previous_segment)
-            .await?;
+            .await
+            .map_err(|error| backup_error("repository publication", error))?;
         *active_pin = None;
         manifest.repository_root = published.root_sha256();
         // Continuous retention is established before the completed base pin is
@@ -549,9 +579,9 @@ impl WorkerRuntime {
         export: &mut Export,
         participant: Arc<ParticipantHandle>,
         scope: GroupImageScope,
-        cut: CommitTs,
+        pin: &PinnedCatalog,
     ) -> Result<(), ProtocolError> {
-        self.export_native_image_stream(export, participant, scope, cut, false)
+        self.export_native_image_stream(export, participant, scope, pin.read_ts, Some(pin))
             .await
     }
 
@@ -561,16 +591,17 @@ impl WorkerRuntime {
         participant: Arc<ParticipantHandle>,
         scope: GroupImageScope,
         cut: CommitTs,
-        split_baseline: bool,
+        catalog_cut: Option<&PinnedCatalog>,
     ) -> Result<(), ProtocolError> {
-        let mut root = if split_baseline {
-            None
-        } else {
+        let mut root = if catalog_cut.is_some() {
             export
                 .frame(HistoryFrame::BeginGroup(scope.clone()))
                 .await?;
             Some(serialized_digest(&(b"nabedra/history-group/v1", &scope))?)
+        } else {
+            None
         };
+        let mut index = None;
         let mut count = 0u64;
         let mut after = None;
         let mut after_owner = None;
@@ -632,6 +663,36 @@ impl WorkerRuntime {
                         return Err(unknown());
                     }
                     for image in images.iter() {
+                        if let (
+                            Some(pin),
+                            MvccKey::IndexEntry {
+                                table_id, index_id, ..
+                            },
+                        ) = (catalog_cut, &image.key)
+                        {
+                            // Index images sort by UUID. At a full backup cut
+                            // after retirement, their presence in Data can
+                            // change while pages are being exported.
+                            if index.is_none_or(|(prior, _)| prior != *index_id) {
+                                use crate::oltp::mvcc::index::{IndexPhase, IndexRecord};
+                                let retired = self
+                                    .native_catalog::<IndexRecord>(
+                                        pin,
+                                        MvccKey::CatalogIndex {
+                                            table_id: *table_id,
+                                            index_id: *index_id,
+                                        },
+                                    )
+                                    .await?
+                                    .is_some_and(|record| {
+                                        matches!(record.phase, IndexPhase::Retired { .. })
+                                    });
+                                index = Some((*index_id, retired));
+                            }
+                            if index.is_some_and(|(_, retired)| retired) {
+                                continue;
+                            }
+                        }
                         if let Some(prior) = root {
                             root = Some(serialized_digest(&(
                                 b"nabedra/history-image/v1",
@@ -793,7 +854,7 @@ impl WorkerRuntime {
                                         routing_epoch: route.routing_epoch,
                                         span: route.span.clone(),
                                     },
-                                    pin.read_ts,
+                                    pin,
                                 )
                                 .await?;
                             }
@@ -825,13 +886,17 @@ impl WorkerRuntime {
             .services
             .timestamps
             .archive_closure(authority, owner, pin, archive_id, base, status.clone())
-            .await?;
+            .await
+            .map_err(|error| backup_error("timestamp closure", error))?;
         export
             .frame(HistoryFrame::StatusClosure(closure.statement().clone()))
             .await?;
         let mut after = None;
         loop {
-            let page = status.identity_history_page(&closure, after).await?;
+            let page = status
+                .identity_history_page(&closure, after)
+                .await
+                .map_err(|error| backup_error("identity page", error))?;
             for identity in page.items.iter() {
                 export
                     .frame(HistoryFrame::Identity {
@@ -869,7 +934,8 @@ impl WorkerRuntime {
                     .services
                     .timestamps
                     .native_archive_page(&closure, cursor.clone())
-                    .await?;
+                    .await
+                    .map_err(|error| backup_error("timestamp metadata page", error))?;
                 for image in page.items.iter() {
                     export.frame(HistoryFrame::Metadata(image.clone())).await?;
                 }
@@ -886,7 +952,8 @@ impl WorkerRuntime {
         loop {
             let page = status
                 .native_archive_page(&closure, metadata_after.clone())
-                .await?;
+                .await
+                .map_err(|error| backup_error("status metadata page", error))?;
             for image in page.items.iter() {
                 export.frame(HistoryFrame::Metadata(image.clone())).await?;
             }
@@ -900,7 +967,10 @@ impl WorkerRuntime {
         }
         let mut after = None;
         loop {
-            let page = status.committed_page(&closure, base, after).await?;
+            let page = status
+                .committed_page(&closure, base, after)
+                .await
+                .map_err(|error| backup_error("committed decisions page", error))?;
             for decision in page.items.iter() {
                 let txn = decision.statement.txn;
                 let manifest = decision.statement.manifest;
@@ -914,7 +984,10 @@ impl WorkerRuntime {
                 let mut cursor = None;
                 let mut participants = 0u64;
                 loop {
-                    let plans = status.manifest_page(txn, manifest, cursor).await?;
+                    let plans = status
+                        .manifest_page(txn, manifest, cursor)
+                        .await
+                        .map_err(|error| backup_error("participant manifest page", error))?;
                     for plan in plans.items.iter() {
                         if base.is_none() {
                             export

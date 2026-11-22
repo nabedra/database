@@ -5,7 +5,7 @@ use super::worker_runtime::WorkerRuntime;
 use crate::{
     oltp::pool::ExecutionClass,
     oltp_replication::{
-        authority::control::{ApiEnrollment, ControlReply, DataWorkerIntent, EksReplacementAction, RestartIntent, ScopedQueueCapability, SignedEksReplacement, WorkerDrainIntent},
+        authority::control::{ApiEnrollment, ControlReply, DataWorkerIntent, EksReplacementAction, ReplacementIntent, RestartIntent, ScopedQueueCapability, SignedEksReplacement, WorkerDrainIntent},
         types::*,
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
@@ -66,6 +66,23 @@ impl WorkerRuntime {
                         return Err(invalid());
                     }
                     intent.validate()?;
+                } else if matches!(request.operation.as_str(), "worker.system_replacement.check" | "worker.system_replacement.status") {
+                    let check: super::worker_runtime::system_recovery::ReplacementCheck =
+                        serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
+                    check.validate()?;
+                } else if request.operation == "worker.system_replacement.abandon" {
+                    let abandon: super::worker_runtime::system_recovery::ReplacementAbandon =
+                        serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
+                    if abandon.id.is_nil() {
+                        return Err(invalid());
+                    }
+                } else if request.operation == "worker.system_replacement.prepare" {
+                    let intent: ReplacementIntent =
+                        serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
+                    if intent.id != request.request_id {
+                        return Err(invalid());
+                    }
+                    intent.validate()?;
                 } else if request.operation == "worker.drain" {
                     let intent: WorkerDrainIntent = serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
                     intent.validate()?;
@@ -88,7 +105,7 @@ impl WorkerRuntime {
                 } else if Self::validate_index_admin(&request.operation, request.payload.get())? {
                 } else if Self::validate_pool_drain_admin(&request.operation, request.payload.get())? {
                 } else if Self::validate_placement_admin(&request.operation, request.payload.get())? {
-                } else if !matches!(request.operation.as_str(), "cluster.connection" | "query.statistics" | "worker.drain.status" | "worker.stop_permit" | "worker.replacement.status" | "queue.scoped.status")
+                } else if !matches!(request.operation.as_str(), "cluster.connection" | "query.statistics" | "worker.drain.status" | "worker.stop_permit" | "worker.replacement.status" | "queue.scoped.status" | "worker.system_replacement.enable")
                     || request.payload.get().trim() != "{}"
                 {
                     return Err(invalid());
@@ -140,6 +157,28 @@ impl WorkerRuntime {
         if request.operation == "worker.restart.prepare" {
             let intent = serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
             return self.prepare_worker_restart(intent).await;
+        }
+        if request.operation == "worker.system_replacement.status" {
+            let check = serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
+            return self.system_replacement_status(request.request_id, check).await;
+        }
+        if request.operation == "worker.system_replacement.check" {
+            let check = serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
+            return self.check_system_replacement(request.request_id, check).await;
+        }
+        if request.operation == "worker.system_replacement.enable" {
+            return self.enable_system_replacement(request.request_id).await;
+        }
+        if request.operation == "worker.system_replacement.abandon" {
+            let abandon: super::worker_runtime::system_recovery::ReplacementAbandon =
+                serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
+            return self
+                .abandon_system_replacement(request.request_id, abandon.id)
+                .await;
+        }
+        if request.operation == "worker.system_replacement.prepare" {
+            let intent = serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
+            return self.prepare_system_replacement(intent).await;
         }
         if request.operation == "worker.drain" {
             let intent = serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;

@@ -76,3 +76,8 @@ standalone and clustered process tests. The arm64 binary passed the standalone
 TLS and RESP smoke under QEMU in Docker. BuildKit accepted the cache Dockerfile.
 The runtime stage, loaded with the compiled amd64 binary, returned RESP2 PONG
 as the unprivileged service user. [Release archive build command](../../../../scripts/cache-release/build-linux.sh)
+
+## LIVE2 AWS preflight
+
+The supplied identity received permission errors during EC2 and CloudFormation
+discovery. K04a, K04b and K05 remain unqualified. [LIVE2 preflight](live-aws/README.md)

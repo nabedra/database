@@ -174,6 +174,305 @@ async fn create(app: &Router) -> Value {
     created["data"]["id"].clone()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane() {
+    use crate::{
+        oltp_replication::{
+            multiplex::TrafficClass,
+            types::{TxnDecision, TxnId},
+        },
+        oltp_runtime::recovery_tests::index_holds::{Checkpoint, register_checkpoint},
+        request_queue::RequestState,
+    };
+
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("nabedra-o07-prepare-lane-{}", Uuid::new_v4())),
+        );
+        let runtime = open(&directory.0, ExecutionConfig::default().direct_oltp).await;
+        activated(&runtime).await;
+        let app = runtime.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
+        let id = Uuid::new_v4();
+        let batch = body(
+            id,
+            "table.insert_many",
+            json!({
+                "table_id": table,
+                "rows": [
+                    {"id": -1, "value": 10, "tag": "left"},
+                    {"id": 1, "value": 20, "tag": "right"},
+                ],
+            }),
+        );
+        let preparing = register_checkpoint(id, Checkpoint::QueuedPrepare);
+        // A streaming body takes the queued path in both direct modes.
+        let mut result = Box::pin(call(&app, batch.clone(), false));
+        let checkpoint = tokio::select! {
+            checkpoint = preparing => checkpoint.unwrap(),
+            reply = &mut result => panic!("batch ended before queued Prepare: {reply:?}"),
+        };
+        let record = runtime
+            .services
+            .replica
+            .lock()
+            .unwrap()
+            .observation(id)
+            .unwrap();
+        assert!(record.accepted);
+        assert_eq!(record.state, RequestState::Running);
+        let client = runtime.services.manager.client();
+        let storage = client.hold_outgoing_for_test(TrafficClass::Storage);
+        checkpoint.release.send(false).unwrap();
+        tokio::select! {
+            () = client.outgoing_lane_full_for_test(TrafficClass::Storage) => {}
+            reply = &mut result => panic!("batch ended with Storage held: {reply:?}"),
+        }
+        drop(storage);
+
+        let original = result.await;
+        assert_eq!(original, (200, json!({"request_id": id, "data": 2})));
+        assert_eq!(call(&app, batch, false).await, original);
+        let txn = TxnId {
+            request_id: id,
+            attempt: 1,
+        };
+        let committed = runtime
+            .services
+            .status
+            .inspect_transaction(txn)
+            .await
+            .unwrap()
+            .unwrap();
+        let participants = committed.manifest.unwrap().participant_count;
+        assert_eq!(committed.prepared_count, participants);
+        assert_eq!(committed.resolved_count, participants);
+        assert!(matches!(
+            committed.decision.unwrap().decision,
+            TxnDecision::Commit { .. }
+        ));
+        assert!(
+            runtime
+                .services
+                .status
+                .inspect_transaction(TxnId { attempt: 2, ..txn })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for (key, value) in [(-1, 10), (1, 20)] {
+            let key_read = body(
+                Uuid::new_v4(),
+                "table.get",
+                json!({"table_id":table,"key":key}),
+            );
+            let (status, read) = call(&app, key_read, true).await;
+            assert_eq!(status, 200, "{read}");
+            assert_eq!(read["data"]["value"], value);
+        }
+        runtime.drain().await.unwrap();
+    })
+    .await
+    .expect("queued Prepare saturation watchdog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d03_q05_bug1_direct_retry_without_content_length_replays_original_result() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("nabedra-bug1-streamed-{}", Uuid::new_v4())),
+        );
+        let runtime = open(&directory.0, true).await;
+        activated(&runtime).await;
+        let app = runtime.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
+        let id = Uuid::new_v4();
+        let insert = |value| {
+            body(
+                id,
+                "table.insert",
+                json!({
+                    "table_id": table, "row": {"id": 7, "value": value, "tag": "a"},
+                }),
+            )
+        };
+        let original = call(&app, insert(1), true).await;
+        assert_eq!(original, (200, json!({"request_id": id, "data": null})));
+        let replay = call(&app, insert(1), false).await;
+        let conflict = call(&app, insert(2), false).await;
+        assert_eq!(conflict.0, 409, "{conflict:?}");
+        assert_eq!(conflict.1["error"]["code"], "conflict");
+        let get = body(
+            Uuid::new_v4(),
+            "table.get",
+            json!({"table_id": table, "key": 7}),
+        );
+        assert_eq!(call(&app, get, true).await.1["data"]["value"], 1);
+        runtime.drain().await.unwrap();
+        assert_eq!(replay, original);
+    })
+    .await
+    .expect("streamed retry watchdog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
+    use crate::oltp::mvcc::store::ParticipantHandle;
+    use crate::oltp::pool::{ByteClass, ChargedBuffer};
+    use crate::oltp_replication::authority::control::ServiceAction;
+    use crate::oltp_replication::multiplex::EndpointFuture;
+    use crate::oltp_replication::service_rpc::direct::{
+        self, DirectLink, DirectRequest, DirectResponse, DirectSendError, DirectService,
+    };
+    use sha2::{Digest as _, Sha256};
+    use std::sync::Mutex;
+
+    struct ReplyPressure {
+        service: Arc<dyn DirectService>,
+        id: Uuid,
+        hold: Mutex<Option<ChargedBuffer>>,
+    }
+    impl DirectService for ReplyPressure {
+        fn execute<'a>(
+            &'a self,
+            handle: &'a Arc<ParticipantHandle>,
+            request: DirectRequest,
+        ) -> EndpointFuture<'a, DirectResponse> {
+            Box::pin(async move {
+                let inject = request.request_id == self.id;
+                let response = self.service.execute(handle, request).await?;
+                if inject {
+                    assert!(matches!(response, DirectResponse::Done(_)), "{response:?}");
+                    let shared = handle.resources();
+                    let config = shared.config();
+                    let free = config.control_bytes
+                        - config.progress_bytes
+                        - shared.buffer_bytes_used(ByteClass::Data);
+                    let hold = shared.allocate_bytes(ByteClass::Data, free)?;
+                    assert_eq!(
+                        shared.buffer_bytes_used(ByteClass::Data),
+                        config.control_bytes - config.progress_bytes
+                    );
+                    *self.hold.lock().unwrap() = Some(hold);
+                }
+                Ok(response)
+            })
+        }
+
+        fn forward<'a>(
+            &'a self,
+            handle: &'a Arc<ParticipantHandle>,
+            request: DirectRequest,
+        ) -> EndpointFuture<'a, DirectResponse> {
+            self.service.forward(handle, request)
+        }
+
+        fn stats(&self) -> Value {
+            self.service.stats()
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("nabedra-bug1-reply-{}", Uuid::new_v4())),
+        );
+        let runtime = open(&directory.0, true).await;
+        activated(&runtime).await;
+        let app = runtime.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
+        let get = || {
+            body(
+                Uuid::new_v4(),
+                "table.get",
+                json!({"table_id": table, "key": 7}),
+            )
+        };
+        assert_eq!(call(&app, get(), true).await.0, 200);
+        let table_id = serde_json::from_value(table.clone()).unwrap();
+        let route = runtime
+            .direct_gateway_handle()
+            .unwrap()
+            .cache()
+            .get(table_id, Some(&crate::protocol::Key::Int64(7)))
+            .unwrap();
+        let range = &route.range;
+        let shared = &runtime.services.shared;
+        let id = Uuid::new_v4();
+        let insert = body(
+            id,
+            "table.insert",
+            json!({
+                "table_id": table, "row": {"id": 7, "value": 1, "tag": "a"},
+            }),
+        );
+        let request = DirectRequest {
+            database: runtime.services.scope.database.clone(),
+            table_id,
+            schema_epoch: route.schema_epoch,
+            routing_epoch: range.shard.routing_epoch,
+            group: range.group().group_id,
+            request_id: id,
+            digest: Digest::from_bytes(Sha256::digest(&insert).into()),
+            body: shared.copy_bytes(&insert).unwrap(),
+            deadline: Duration::from_secs(5),
+        };
+        let link = DirectLink::new(
+            range.group().clone(),
+            shared.clone(),
+            runtime.services.manager.client(),
+            runtime.services.control_client.clone(),
+            ServiceAction::DirectLeader,
+        )
+        .unwrap();
+        let pressure = Arc::new(ReplyPressure {
+            service: direct::installed(shared).unwrap(),
+            id,
+            hold: Mutex::new(None),
+        });
+        direct::install(shared, &(pressure.clone() as Arc<dyn DirectService>));
+        let result = link
+            .send(
+                range.leader_hint().unwrap(),
+                runtime.services.local.worker_id,
+                &request,
+                false,
+            )
+            .await;
+        direct::install(shared, &pressure.service);
+        assert!(
+            pressure.hold.lock().unwrap().take().is_some(),
+            "post-apply hold reached"
+        );
+        drop(request);
+        drop(link);
+        drop(route);
+        assert_eq!(call(&app, get(), true).await.1["data"]["value"], 1);
+        assert_eq!(
+            call(&app, insert, true).await,
+            (200, json!({"request_id": id, "data": null}))
+        );
+        let changed = body(
+            id,
+            "table.insert",
+            json!({
+                "table_id": table, "row": {"id": 7, "value": 2, "tag": "a"},
+            }),
+        );
+        let conflict = call(&app, changed, true).await;
+        assert_eq!(conflict.0, 409, "{conflict:?}");
+        runtime.drain().await.unwrap();
+        let Err(DirectSendError::Uncertain(error)) = result else {
+            panic!("{result:?}");
+        };
+        assert!(
+            error.message.contains("encode class=Data requested="),
+            "{error:?}"
+        );
+    })
+    .await
+    .expect("reply pressure watchdog");
+}
+
 /// D01/O03/O02 on one worker: every eligible operation's results, errors
 /// and types over the direct path equal the queued path's for the same
 /// program; the topology is read once per table. The baseline worker runs
@@ -253,11 +552,9 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
         assert_eq!(stats.forwards, 0, "{stats:?}");
         assert_eq!(leader()["entries_applied"], json!(6));
 
-        // Without a declared length the request takes the queued path and
-        // still answers the same (the full parsing charge applies). The
-        // queue owner settles each eligible mutation at its anchor before it
-        // reserves it (T7c), so none can also run directly; gets are not
-        // settled (RV-FINAL M3).
+        // A body without a declared length still takes the queued path with
+        // the full parsing charge. Both the gateway and queue owner settle
+        // eligible mutations, but only the first writes the marker.
         let markers = leader()["forward_markers_written"].as_u64().unwrap();
         let base = 2_000;
         for (index, (operation, payload)) in program(&table, base).into_iter().enumerate() {
@@ -272,7 +569,7 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
         let after = gateway.stats();
         assert_eq!(after.direct_done, stats.direct_done, "{after:?}");
         assert!(after.forwards >= 8, "{after:?}");
-        assert!(after.forwards - stats.forwards <= mutations, "no get settled: {after:?}");
+        assert!(after.forwards - stats.forwards <= 2 * mutations, "no get settled: {after:?}");
         let written = leader()["forward_markers_written"].as_u64().unwrap() - markers;
         assert!((8..=mutations).contains(&written), "{}", leader());
 
@@ -459,7 +756,7 @@ fn report(line: &str) {
 /// O15/D03, RV-FINAL M3 (user decision 2026-11-21): in rollback mode
 /// (`direct_oltp: false` while `data.direct.v1` is active) a queued get has
 /// no exactly-once identity of its own. Through the gateway (declared
-/// length) and through the queue owner (no declared length) it proposes no
+/// length or streamed body) it proposes no
 /// Data entry and writes no forward marker, so no dedup record or expiry
 /// key. A mutation in the same mode is still settled (one marker). The run
 /// reports per-get Data entries, forwards, journal bytes and wall time; the
@@ -600,8 +897,16 @@ async fn d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs() {
         };
         // Warm the topology cache and the session.
         assert_eq!(call(&app, get(), true).await.0, 200);
+        // These tasks share the native job counters with the mTLS request.
+        // The retirement task also runs the index reclamation sweep. Join
+        // both tasks after stopping them so a slow runner cannot count a
+        // periodic inventory scan or enrollment refresh as reply decoding.
+        let retirement = runtime.retirement.lock().unwrap().take().unwrap();
+        retirement.abort();
+        assert!(retirement.await.unwrap_err().is_cancelled());
+        runtime.services.stop_directory_refresh_for_test().await;
         let gateway = runtime.direct_gateway_handle().unwrap().clone();
-        let done = gateway.stats().direct_done;
+        let before = gateway.stats();
         let shared = runtime.services.shared.clone();
         let jobs = || {
             (
@@ -616,13 +921,16 @@ async fn d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs() {
             assert_eq!(envelope["data"]["value"], json!(10), "{envelope}");
         }
         let (query_after, control_after) = jobs();
-        assert_eq!(gateway.stats().direct_done - done, GETS);
+        let after = gateway.stats();
+        assert_eq!(after.direct_done - before.direct_done, GETS);
+        assert_eq!(after.catalog_reads, before.catalog_reads);
+        assert_eq!(after.placement_reads, before.placement_reads);
         eprintln!(
             "perf2b rf1: {GETS} gets took {} Query and {} Control jobs",
             query_after - query,
             control_after - control
         );
-        // Background Control work on an idle RF1 worker is allowed for.
+        // Each native reply codec job would contribute one job per GET.
         assert!(
             control_after - control < GETS / 2,
             "Control jobs for {GETS} gets: {}",

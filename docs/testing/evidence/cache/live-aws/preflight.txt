@@ -1,0 +1,5 @@
+STS identity: OK
+EC2 availability zones: UnauthorizedOperation
+EKS cluster list: AccessDeniedException
+CloudFormation stack list: AccessDenied
+Teardown infrastructure mutations submitted: 0

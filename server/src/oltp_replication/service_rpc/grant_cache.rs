@@ -17,6 +17,18 @@
 //!
 //! Only roles whose check reflects stable membership are cached. Request-,
 //! transfer- and transition-scoped actions always read Control.
+//!
+//! Warm roles (RD2). The direct path's role checks (a range leader's
+//! `DirectLeader` calls at the Timestamp leader, an API's direct ingress at a
+//! range leader) are refreshed in the background while they are in use, the
+//! way ScyllaDB's permissions cache reloads an entry asynchronously before it
+//! expires. A request then finds a valid entry instead of waiting for a
+//! linearizable Control read whenever its caller was idle for more than
+//! [`GRANT_TTL`]. Every entry keeps its own bound: it is valid until
+//! [`GRANT_TTL`] after the read that produced it started, and the revision and
+//! observed-view rules above still drop it. A refresh that Control refuses
+//! removes the entry at once. A key is refreshed only while a request used it
+//! within [`WARM_IDLE`], and at most [`MAX_WARM`] keys are warm.
 use crate::{
     oltp_replication::{
         authority::control::{ServiceAction, ServiceAuthorization},
@@ -27,7 +39,9 @@ use crate::{
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::HashMap,
-    sync::{Mutex, PoisonError},
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex, PoisonError, Weak},
     time::Duration,
 };
 use tokio::time::Instant;
@@ -35,6 +49,31 @@ use uuid::Uuid;
 
 pub(crate) const GRANT_TTL: Duration = Duration::from_secs(5);
 const MAX_GRANTS: usize = 1024;
+/// A warm key is refreshed only while a request used it this recently.
+pub(crate) const WARM_IDLE: Duration = Duration::from_secs(30);
+/// How often the warm task looks for entries to refresh.
+const WARM_TICK: Duration = Duration::from_secs(1);
+/// An entry with less validity left than this is refreshed. With
+/// [`WARM_TICK`] it is refreshed while it still has at least 0.5 s left, so a
+/// key in use is read about every 3.5 to 4.5 s: close to the one read per
+/// [`GRANT_TTL`] that a continuously used key costs without warming.
+const WARM_AHEAD: Duration = Duration::from_millis(1500);
+/// At most this many keys are kept warm.
+pub(crate) const MAX_WARM: usize = 64;
+/// A background read that takes longer is abandoned. Refreshes run one at a
+/// time, so the warm task holds at most one Control read (one outgoing lane
+/// slot and one native Control job) for at most this long.
+const WARM_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// One background role check: the applied revision read before the Control
+/// read starts, and the read itself.
+pub(crate) type WarmRead = (
+    Option<u64>,
+    Pin<Box<dyn Future<Output = Result<Option<ServiceAuthorization>, ProtocolError>> + Send>>,
+);
+/// Builds a [`WarmRead`] for one key. It holds the Control client weakly
+/// (the cache lives inside it), so `None` means the client is gone.
+pub(crate) type Refresh = Arc<dyn Fn() -> Option<WarmRead> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct GrantKey([u8; 32]);
@@ -91,12 +130,23 @@ fn observed(grant: &ServiceAuthorization) -> Observed {
     (grant.ready, grant.owner)
 }
 
+struct Warm {
+    refresh: Refresh,
+    used: Instant,
+    /// No refresh before this: the last one failed transiently.
+    backoff: Option<Instant>,
+}
+
 #[derive(Default)]
 struct Grants {
     /// Role checks passed, by key, with their expiry.
     entries: HashMap<GrantKey, Instant>,
     revision: Option<u64>,
     observed: Option<Observed>,
+    /// Keys refreshed in the background, with their last use.
+    warm: HashMap<GrantKey, Warm>,
+    /// Whether the warm task runs.
+    warming: bool,
 }
 impl Grants {
     fn align(&mut self, revision: Option<u64>) {
@@ -109,10 +159,13 @@ impl Grants {
 }
 
 #[derive(Default)]
-pub(crate) struct GrantCache(Mutex<Grants>);
+pub(crate) struct GrantCache(Arc<Mutex<Grants>>);
+fn lock(grants: &Mutex<Grants>) -> std::sync::MutexGuard<'_, Grants> {
+    grants.lock().unwrap_or_else(PoisonError::into_inner)
+}
 impl GrantCache {
     fn grants(&self) -> std::sync::MutexGuard<'_, Grants> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.0)
     }
     /// Whether a role check for `key` passed recently at this applied revision.
     pub(crate) fn allowed(&self, key: GrantKey, revision: Option<u64>) -> bool {
@@ -137,33 +190,7 @@ impl GrantCache {
         started: Instant,
         observed: Option<Observed>,
     ) {
-        let mut grants = self.grants();
-        match grants.revision.cmp(&revision) {
-            std::cmp::Ordering::Greater => return,
-            std::cmp::Ordering::Less => grants.align(revision),
-            std::cmp::Ordering::Equal => {}
-        }
-        if let Some(observed) = observed {
-            if grants.observed.is_some_and(|previous| previous != observed) {
-                grants.entries.clear();
-            }
-            grants.observed = Some(observed);
-        }
-        let Some(key) = key else {
-            return;
-        };
-        let expires = started + GRANT_TTL;
-        let now = Instant::now();
-        if expires <= now {
-            return;
-        }
-        if grants.entries.len() >= MAX_GRANTS {
-            grants.entries.retain(|_, expires| *expires > now);
-            if grants.entries.len() >= MAX_GRANTS {
-                grants.entries.clear();
-            }
-        }
-        grants.entries.insert(key, expires);
+        insert(&mut self.grants(), key, revision, started, observed);
     }
     /// A role check: served from the cache while valid, otherwise `read`
     /// (which reports the fresh view it saw, if any) runs and is recorded.
@@ -176,13 +203,73 @@ impl GrantCache {
     where
         F: Future<Output = Result<Option<ServiceAuthorization>, ProtocolError>>,
     {
+        use crate::oltp_runtime::stage_timing::perf_stage;
         if key.is_some_and(|key| self.allowed(key, revision)) {
+            perf_stage!("grant.role.hit").record(Duration::ZERO);
             return Ok(());
         }
+        let _timer = perf_stage!("grant.role.miss").timer();
         let started = Instant::now();
         let grant = read().await?;
         self.insert(key, revision, started, grant.as_ref().map(observed));
         Ok(())
+    }
+    /// As [`Self::role`], and keeps `key` warm while it is in use (RD2):
+    /// `warm` builds its background refresh the first time it is used.
+    pub(crate) async fn role_warm<F>(
+        &self,
+        key: Option<GrantKey>,
+        revision: Option<u64>,
+        read: impl FnOnce() -> F,
+        warm: impl FnOnce() -> Refresh,
+    ) -> Result<(), ProtocolError>
+    where
+        F: Future<Output = Result<Option<ServiceAuthorization>, ProtocolError>>,
+    {
+        if let Some(key) = key {
+            self.touch(key, warm);
+        }
+        self.role(key, revision, read).await
+    }
+    /// Records a use of a warm key, registering it (and starting the warm
+    /// task) on first use. While `warm` is not empty the task runs.
+    fn touch(&self, key: GrantKey, warm: impl FnOnce() -> Refresh) {
+        if warming_disabled() {
+            return;
+        }
+        let now = Instant::now();
+        let mut grants = self.grants();
+        if let Some(entry) = grants.warm.get_mut(&key) {
+            entry.used = now;
+            return;
+        }
+        if grants.warm.len() >= MAX_WARM {
+            grants
+                .warm
+                .retain(|_, entry| now.duration_since(entry.used) < WARM_IDLE);
+            if grants.warm.len() >= MAX_WARM {
+                return;
+            }
+        }
+        if !grants.warming {
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            grants.warming = true;
+            runtime.spawn(warm_loop(Arc::downgrade(&self.0)));
+        }
+        grants.warm.insert(
+            key,
+            Warm {
+                refresh: warm(),
+                used: now,
+                backoff: None,
+            },
+        );
+    }
+    #[cfg(test)]
+    pub(crate) fn warm_len(&self) -> usize {
+        self.grants().warm.len()
     }
     /// A full grant, always read fresh because callers compare its owner and
     /// authority with the request. The passed role check is recorded.
@@ -203,6 +290,131 @@ impl GrantCache {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.grants().entries.len()
+    }
+}
+
+fn insert(
+    grants: &mut Grants,
+    key: Option<GrantKey>,
+    revision: Option<u64>,
+    started: Instant,
+    observed: Option<Observed>,
+) {
+    match grants.revision.cmp(&revision) {
+        std::cmp::Ordering::Greater => return,
+        std::cmp::Ordering::Less => grants.align(revision),
+        std::cmp::Ordering::Equal => {}
+    }
+    if let Some(observed) = observed {
+        if grants.observed.is_some_and(|previous| previous != observed) {
+            grants.entries.clear();
+        }
+        grants.observed = Some(observed);
+    }
+    let Some(key) = key else {
+        return;
+    };
+    let expires = started + GRANT_TTL;
+    let now = Instant::now();
+    if expires <= now {
+        return;
+    }
+    if grants.entries.len() >= MAX_GRANTS {
+        grants.entries.retain(|_, expires| *expires > now);
+        if grants.entries.len() >= MAX_GRANTS {
+            grants.entries.clear();
+        }
+    }
+    grants.entries.insert(key, expires);
+}
+
+/// Benchmark only (RD2): `NABEDRA_BENCH_NO_GRANT_WARM=1` turns warming off,
+/// so one binary measures both sides of the change in one session.
+const NO_WARM_ENV: &str = "NABEDRA_BENCH_NO_GRANT_WARM";
+fn warming_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        let disabled = std::env::var_os(NO_WARM_ENV).is_some_and(|value| value == "1");
+        if disabled {
+            tracing::warn!("{NO_WARM_ENV}=1: role checks are not kept warm (benchmark only)");
+        }
+        disabled
+    })
+}
+
+/// Refreshes the warm keys whose entries are missing or close to expiry,
+/// until no key was used within [`WARM_IDLE`] or the cache is dropped.
+async fn warm_loop(cache: Weak<Mutex<Grants>>) {
+    use crate::oltp_runtime::stage_timing::perf_stage;
+    loop {
+        tokio::time::sleep(WARM_TICK).await;
+        let due: Vec<(GrantKey, Refresh)> = {
+            let Some(shared) = cache.upgrade() else {
+                return;
+            };
+            let mut grants = lock(&shared);
+            let now = Instant::now();
+            grants
+                .warm
+                .retain(|_, entry| now.duration_since(entry.used) < WARM_IDLE);
+            if grants.warm.is_empty() {
+                grants.warming = false;
+                return;
+            }
+            let Grants { entries, warm, .. } = &*grants;
+            warm.iter()
+                .filter(|(_, entry)| entry.backoff.is_none_or(|until| now >= until))
+                .filter(|(key, _)| {
+                    entries
+                        .get(key)
+                        .is_none_or(|expires| expires.saturating_duration_since(now) < WARM_AHEAD)
+                })
+                .map(|(key, entry)| (*key, entry.refresh.clone()))
+                .collect()
+        };
+        // One read at a time: a slow or unavailable Control (recovery, a
+        // partition) costs the foreground at most one lane slot and one
+        // native Control job, for at most WARM_READ_TIMEOUT per tick.
+        for (key, refresh) in due {
+            let Some((revision, read)) = refresh() else {
+                continue;
+            };
+            let started = Instant::now();
+            let result = {
+                let _timer = perf_stage!("grant.warm.refresh").timer();
+                tokio::time::timeout(WARM_READ_TIMEOUT, read).await
+            };
+            let Some(shared) = cache.upgrade() else {
+                return;
+            };
+            let mut grants = lock(&shared);
+            match result {
+                Ok(Ok(grant)) => insert(
+                    &mut grants,
+                    Some(key),
+                    revision,
+                    started,
+                    grant.as_ref().map(observed),
+                ),
+                // Control refused the caller: drop the role now instead of
+                // serving it until it expires.
+                Ok(Err(error)) if error.code == crate::protocol::ErrorCode::Unauthorized => {
+                    perf_stage!("grant.warm.refused").record(Duration::ZERO);
+                    grants.entries.remove(&key);
+                    grants.warm.remove(&key);
+                }
+                // A transient failure or a timeout: the entry expires on its
+                // own bound, this key waits one TTL, and the rest of this
+                // tick is skipped so a struggling Control is not read again.
+                _ => {
+                    perf_stage!("grant.warm.failed").record(Duration::ZERO);
+                    if let Some(entry) = grants.warm.get_mut(&key) {
+                        entry.backoff = Some(Instant::now() + GRANT_TTL);
+                    }
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -501,5 +713,205 @@ mod tests {
         cache.role(key, Some(7), read).await.unwrap();
         assert!(cache.allowed(key.unwrap(), Some(7)));
         assert!(!cache.allowed(key.unwrap(), Some(8)));
+    }
+
+    /// RD2: a warm role (the direct path's `DirectLeader` and direct ingress
+    /// checks) is refreshed in the background, so a caller that was idle for
+    /// longer than `GRANT_TTL` still finds it valid. Each entry keeps its own
+    /// bound: after the refreshes start failing it expires `GRANT_TTL` after
+    /// the last successful read started; a refusal drops it at once; and the
+    /// refreshes stop once the key is unused for `WARM_IDLE`.
+    #[tokio::test(start_paused = true)]
+    async fn d10_o14_rd2_warm_role_survives_idle_gaps_and_keeps_its_bound() {
+        use std::sync::atomic::AtomicU8;
+        const OK: u8 = 0;
+        const UNAVAILABLE: u8 = 1;
+        const REFUSED: u8 = 2;
+        let cache = GrantCache::default();
+        let caller = worker();
+        let target = group();
+        let key = GrantKey::new(caller, ServiceAction::DirectLeader, &target, None);
+        assert!(key.is_some());
+        let mode = Arc::new(AtomicU8::new(OK));
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let last_ok = Arc::new(Mutex::new(None::<Instant>));
+        let refresh: Refresh = {
+            let (mode, refreshes, last_ok) = (mode.clone(), refreshes.clone(), last_ok.clone());
+            Arc::new(move || {
+                let (mode, refreshes, last_ok) = (mode.clone(), refreshes.clone(), last_ok.clone());
+                Some((
+                    Some(4),
+                    Box::pin(async move {
+                        refreshes.fetch_add(1, Ordering::Relaxed);
+                        let started = Instant::now();
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        match mode.load(Ordering::Relaxed) {
+                            OK => {
+                                *last_ok.lock().unwrap() = Some(started);
+                                Ok(Some(grant(caller, 1)))
+                            }
+                            UNAVAILABLE => Err(ProtocolError::new(
+                                crate::protocol::ErrorCode::StorageUnavailable,
+                                "control unavailable",
+                                crate::protocol::Outcome::Unknown,
+                            )),
+                            _ => Err(ProtocolError::new(
+                                crate::protocol::ErrorCode::Unauthorized,
+                                "caller revoked",
+                                crate::protocol::Outcome::NotApplied,
+                            )),
+                        }
+                    }) as Pin<Box<dyn Future<Output = _> + Send>>,
+                ))
+            })
+        };
+        let reads = AtomicUsize::new(0);
+        let read = || async {
+            reads.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(grant(caller, 1)))
+        };
+        cache
+            .role_warm(key, Some(4), read, || refresh.clone())
+            .await
+            .unwrap();
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.warm_len(), 1);
+
+        // A caller idle for 12 s (more than two TTLs) uses the key again:
+        // the entry is still valid and no request waits on Control.
+        for _ in 0..12 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(cache.allowed(key.unwrap(), Some(4)), "warm entry lapsed");
+        }
+        cache
+            .role_warm(
+                key,
+                Some(4),
+                || async { panic!("a warm role check waited for Control") },
+                || refresh.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert!(refreshes.load(Ordering::Relaxed) >= 2);
+        // Background reads stay close to one per TTL: at most one per 3.5 s.
+        assert!(refreshes.load(Ordering::Relaxed) <= 4);
+
+        // Control becomes unreachable: the entry is not extended. It lapses
+        // exactly GRANT_TTL after the last successful read started.
+        mode.store(UNAVAILABLE, Ordering::Relaxed);
+        let ok_at = last_ok.lock().unwrap().unwrap();
+        tokio::time::sleep_until(ok_at + GRANT_TTL - Duration::from_millis(1)).await;
+        let last = last_ok.lock().unwrap().unwrap();
+        assert!(cache.allowed(key.unwrap(), Some(4)));
+        tokio::time::sleep_until(last + GRANT_TTL).await;
+        assert!(!cache.allowed(key.unwrap(), Some(4)), "outlived its bound");
+
+        // Control answers again: after its backoff (one TTL) the key is
+        // re-warmed within a tick.
+        mode.store(OK, Ordering::Relaxed);
+        tokio::time::sleep(GRANT_TTL + Duration::from_millis(1100)).await;
+        assert!(cache.allowed(key.unwrap(), Some(4)));
+
+        // A refusal drops the role at the next refresh, before it expires.
+        mode.store(REFUSED, Ordering::Relaxed);
+        let refused_by = Instant::now() + Duration::from_secs(4);
+        while cache.allowed(key.unwrap(), Some(4)) {
+            assert!(Instant::now() < refused_by, "a refused role stayed cached");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(cache.warm_len(), 0);
+
+        // An idle key stops being refreshed after WARM_IDLE.
+        mode.store(OK, Ordering::Relaxed);
+        cache
+            .role_warm(key, Some(4), read, || refresh.clone())
+            .await
+            .unwrap();
+        tokio::time::sleep(WARM_IDLE + Duration::from_secs(2)).await;
+        let stopped = refreshes.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(refreshes.load(Ordering::Relaxed), stopped);
+        assert_eq!(cache.warm_len(), 0);
+        assert!(!cache.allowed(key.unwrap(), Some(4)));
+        assert!(!cache.grants().warming);
+    }
+
+    /// RD2: at most `MAX_WARM` keys are warm; unused ones make room.
+    #[tokio::test(start_paused = true)]
+    async fn d10_o05_rd2_warm_keys_stay_bounded() {
+        let cache = GrantCache::default();
+        let target = group();
+        let refresh: Refresh = Arc::new(|| None);
+        for _ in 0..MAX_WARM + 10 {
+            let key = GrantKey::new(worker(), ServiceAction::DirectLeader, &target, None);
+            cache
+                .role_warm(key, Some(1), || async { Ok(None) }, || refresh.clone())
+                .await
+                .unwrap();
+            assert!(cache.warm_len() <= MAX_WARM);
+        }
+        tokio::time::sleep(WARM_IDLE).await;
+        let key = GrantKey::new(worker(), ServiceAction::DirectLeader, &target, None);
+        cache
+            .role_warm(key, Some(1), || async { Ok(None) }, || refresh.clone())
+            .await
+            .unwrap();
+        assert_eq!(cache.warm_len(), 1);
+    }
+
+    /// RD2: while Control hangs (recovery, a partition) the warm task holds at
+    /// most one background read, abandons it after `WARM_READ_TIMEOUT`, skips
+    /// the rest of that tick and backs the key off for one TTL, so it never
+    /// piles reads onto the Control lane that foreground calls need.
+    #[tokio::test(start_paused = true)]
+    async fn c07_rd2_warm_refreshes_hold_at_most_one_read_while_control_hangs() {
+        let cache = GrantCache::default();
+        let target = group();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let refresh: Refresh = {
+            let (in_flight, peak, started) = (in_flight.clone(), peak.clone(), started.clone());
+            Arc::new(move || {
+                let (in_flight, peak, started) = (in_flight.clone(), peak.clone(), started.clone());
+                Some((
+                    Some(1),
+                    Box::pin(async move {
+                        started.fetch_add(1, Ordering::Relaxed);
+                        let now = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+                        peak.fetch_max(now, Ordering::Relaxed);
+                        struct Leave(Arc<AtomicUsize>);
+                        impl Drop for Leave {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        let _leave = Leave(in_flight);
+                        std::future::pending::<()>().await;
+                        Ok(None)
+                    }) as Pin<Box<dyn Future<Output = _> + Send>>,
+                ))
+            })
+        };
+        for _ in 0..8 {
+            let key = GrantKey::new(worker(), ServiceAction::DirectLeader, &target, None);
+            cache
+                .role_warm(key, Some(1), || async { Ok(None) }, || refresh.clone())
+                .await
+                .unwrap();
+        }
+        // 8 warm keys, every read hangs. Over 20 s each tick starts at most
+        // one read, and each key is retried at most once per TTL.
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(in_flight.load(Ordering::Relaxed) <= 1);
+        }
+        assert_eq!(peak.load(Ordering::Relaxed), 1);
+        let reads = started.load(Ordering::Relaxed);
+        assert!(
+            (2..=12).contains(&reads),
+            "{reads} background reads in 20 s"
+        );
     }
 }

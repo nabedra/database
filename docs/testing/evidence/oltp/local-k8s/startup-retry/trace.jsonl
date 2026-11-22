@@ -1,0 +1,29 @@
+{"check": "host", "context": "desktop-linux", "csi": "hostpath", "docker": "28.3.3", "docker_disk": "/Volumes/ZX20/Docker/vms/0/data/Docker.raw", "elapsed_seconds": 0.812, "kernel": "Darwin MacBook-Pro-de-Antonio.local 25.6.0 Darwin Kernel Version 25.6.0: Mon Oct 12 00:33:09 PDT 2026; root:xnu-12377.161.15.701.48~2/RELEASE_X86_64 x86_64", "kind": "kind v0.33.0 go1.27.0 darwin/amd64", "scenario": "lifecycle", "server_sha256": "7e0e997ad1a183f42085fb29d56a5317e96eb3bf374f20111d4d79eb1e8bcff5", "server_source": "a5ebd056de0cafba437637f657c90ed724246ba7", "source": "d67c7442e3fda85aac63b2ac8fe133bf99580c20", "test_executable_sha256": "8cbab6cd489e4664d0604863b89f35bc5c206b3b9bd21d6c8780164a78450385"}
+{"check": "docker-lane", "elapsed_seconds": 150.863, "status": "acquired"}
+{"check": "kind-create", "cluster": "nabedra-live3-d2fd2681", "elapsed_seconds": 199.77, "node_image": "mirror.gcr.io/kindest/node:v1.34.11"}
+{"check": "vm-memory", "elapsed_seconds": 215.374, "total_bytes": 8220102656, "used_bytes": 900784128}
+{"check": "vm-memory", "elapsed_seconds": 222.186, "total_bytes": 8220102656, "used_bytes": 1062490112}
+{"check": "vm-memory", "elapsed_seconds": 229.388, "total_bytes": 8220102656, "used_bytes": 1229385728}
+{"check": "vm-memory", "elapsed_seconds": 237.05, "total_bytes": 8220102656, "used_bytes": 1387048960}
+{"check": "vm-memory", "elapsed_seconds": 244.088, "total_bytes": 8220102656, "used_bytes": 1521541120}
+{"check": "vm-memory", "elapsed_seconds": 251.85, "total_bytes": 8220102656, "used_bytes": 1733464064}
+{"check": "vm-memory", "elapsed_seconds": 259.574, "total_bytes": 8220102656, "used_bytes": 1821491200}
+{"check": "vm-memory", "elapsed_seconds": 267.184, "total_bytes": 8220102656, "used_bytes": 1898045440}
+{"check": "vm-memory", "elapsed_seconds": 274.824, "total_bytes": 8220102656, "used_bytes": 2071052288}
+{"check": "vm-memory", "elapsed_seconds": 282.814, "total_bytes": 8220102656, "used_bytes": 2185957376}
+{"check": "vm-memory", "elapsed_seconds": 291.54, "total_bytes": 8220102656, "used_bytes": 2193690624}
+{"check": "vm-memory", "elapsed_seconds": 316.386, "total_bytes": 8220102656, "used_bytes": 2202300416}
+{"check": "vm-memory", "elapsed_seconds": 336.066, "total_bytes": 8220102656, "used_bytes": 2203197440}
+{"check": "vm-memory", "elapsed_seconds": 342.982, "total_bytes": 8220102656, "used_bytes": 2208411648}
+{"check": "vm-memory", "elapsed_seconds": 351.257, "total_bytes": 8220102656, "used_bytes": 2277310464}
+{"check": "vm-memory", "elapsed_seconds": 359.39, "total_bytes": 8220102656, "used_bytes": 2311553024}
+{"check": "vm-memory", "elapsed_seconds": 367.62, "total_bytes": 8220102656, "used_bytes": 2321006592}
+{"check": "vm-memory", "elapsed_seconds": 374.862, "total_bytes": 8220102656, "used_bytes": 2343976960}
+{"check": "vm-memory", "elapsed_seconds": 383.043, "total_bytes": 8220102656, "used_bytes": 2344050688}
+{"check": "vm-memory", "elapsed_seconds": 419.488, "total_bytes": 8220102656, "used_bytes": 2355712000}
+{"check": "vm-memory", "elapsed_seconds": 427.405, "total_bytes": 8220102656, "used_bytes": 2398248960}
+{"check": "vm-memory", "elapsed_seconds": 442.493, "total_bytes": 8220102656, "used_bytes": 2526117888}
+{"check": "vm-memory", "elapsed_seconds": 451.319, "total_bytes": 8220102656, "used_bytes": 2561708032}
+{"check": "session-failed", "elapsed_seconds": 596.583, "message": "separate API readiness: \"ConnectionRefusedError(61, 'Connection refused')\"", "type": "AssertionError"}
+{"check": "kind-delete", "elapsed_seconds": 635.069, "kind_exit": 0, "peak_vm_used_bytes": 2561708032, "remaining_nodes": [], "status": "passed"}
+{"check": "docker-lane", "elapsed_seconds": 636.12, "status": "released"}

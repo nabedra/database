@@ -415,12 +415,19 @@ impl Writer {
         }
         let mut ok = fail != Some(Status::Failed);
         let mut synced = false;
+        // Whether the group's commit counters were already bumped (by the unsynced head).
+        let mut counted = false;
         if ok {
             let written = (|| -> Result<bool, Fail> {
                 let dirty =
                     self.active_dirty || !self.prev_unsynced.is_empty() || !self.buf.is_empty();
                 if wants_sync && dirty {
-                    self.sync_aligned(0)?;
+                    // RD3: write first, then let the unsynced writes at the head of the
+                    // group become visible and complete before the sync. They never
+                    // asked for one; alone they would have been a group of their own.
+                    self.write_aligned(0)?;
+                    counted = self.publish_unsynced_head(items, sink)?;
+                    self.sync_written()?;
                     Ok(true)
                 } else {
                     self.flush_buf()?;
@@ -497,7 +504,7 @@ impl Writer {
         stats
             .synced_commits
             .fetch_add(synced_commits, Ordering::Relaxed);
-        if !self.placements.is_empty() {
+        if !self.placements.is_empty() && !counted {
             stats.group_commits.fetch_add(1, Ordering::Relaxed);
         }
         for (i, item) in items.drain(..).enumerate() {
@@ -666,9 +673,106 @@ impl Writer {
         Ok(())
     }
 
+    /// RD3: after the group's bytes are written and before its sync, applies the records
+    /// of the unsynced writes that lead the group to the sink in sequence order, publishes
+    /// `visible_seq` over them and completes their waiters, so an unsynced write never
+    /// waits for a sync that later items asked for. Every byte of these records is in the
+    /// file (their locators resolve), `durable_seq` is unchanged, and visibility stays a
+    /// prefix of the sequence order: exactly what a group of only these writes followed by
+    /// a group of the rest would publish. Removes the completed items from `items` (and
+    /// their statuses and placements). Returns whether the group was counted. A sink
+    /// failure latches; the records before it stay visible and their waiters succeed.
+    fn publish_unsynced_head(
+        &mut self,
+        items: &mut Vec<Item>,
+        sink: &dyn JournalSink,
+    ) -> Result<bool, Fail> {
+        let head = items
+            .iter()
+            .zip(&self.status)
+            .take_while(|(item, status)| {
+                matches!(item, Item::Write { sync: false, .. }) && **status == Status::Placed
+            })
+            .count();
+        if head == 0 {
+            return Ok(false);
+        }
+        let mut failed = false;
+        let mut visible = None;
+        let mut applied = 0;
+        for p in self.placements.iter().take_while(|p| p.item < head) {
+            let Item::Write {
+                kind,
+                batch,
+                first_seq,
+                ..
+            } = &items[p.item]
+            else {
+                unreachable!("placements index writes")
+            };
+            fill_locators(&mut self.locators, batch, p);
+            let started = Instant::now();
+            let kind = if *kind == RecordType::Relocate {
+                RecordKind::Relocate
+            } else {
+                RecordKind::Batch
+            };
+            let result = sink.apply(kind, *first_seq, batch, &self.locators);
+            let elapsed = started.elapsed();
+            if elapsed >= Duration::from_millis(1) {
+                self.shared
+                    .stats
+                    .stall_ns
+                    .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+            }
+            if result.is_err() {
+                self.latch();
+                failed = true;
+                break;
+            }
+            visible = Some(first_seq + u64::from(batch.count()) - 1);
+            applied += 1;
+        }
+        if let Some(visible) = visible {
+            self.shared.visible.store(visible, Ordering::Release);
+        }
+        // Count before any waiter wakes (ns08).
+        let stats = &self.shared.stats;
+        stats.commits.fetch_add(applied as u64, Ordering::Relaxed);
+        if applied != 0 {
+            stats.group_commits.fetch_add(1, Ordering::Relaxed);
+        }
+        let done: Vec<Item> = items.drain(..applied).collect();
+        self.status.drain(..applied);
+        self.placements.drain(..applied);
+        for p in &mut self.placements {
+            p.item -= applied;
+        }
+        for item in done {
+            let Item::Write {
+                batch, first_seq, ..
+            } = &item
+            else {
+                unreachable!("the head holds writes only")
+            };
+            let seq = first_seq + u64::from(batch.count()) - 1;
+            complete(item, Ok(seq));
+        }
+        if failed {
+            return Err(Fail::Fatal(Error::RecoveryRequired));
+        }
+        Ok(applied != 0)
+    }
+
     /// Pads to the next 4 KiB boundary (or the segment end), writes the buffer and syncs
     /// every segment with unsynced bytes. Afterwards no later write touches a synced byte.
     fn sync_aligned(&mut self, extra_flags: u8) -> Result<(), Fail> {
+        self.write_aligned(extra_flags)?;
+        self.sync_written()
+    }
+
+    /// The write half of [`Self::sync_aligned`]: the pad and the buffer.
+    fn write_aligned(&mut self, extra_flags: u8) -> Result<(), Fail> {
         let at = self.at();
         if let Some(len) = format::align_pad_len(at) {
             let room = self.active.len - at;
@@ -683,7 +787,11 @@ impl Writer {
             }
             // With fewer than MIN_PAD bytes left, the next record rolls to a new segment.
         }
-        self.flush_buf()?;
+        self.flush_buf()
+    }
+
+    /// The sync half of [`Self::sync_aligned`]: every segment with unsynced bytes.
+    fn sync_written(&mut self) -> Result<(), Fail> {
         let stats = &self.shared.stats;
         for file in self.prev_unsynced.drain(..) {
             file.sync_data().map_err(|e| Fail::Fatal(segment::io(e)))?;

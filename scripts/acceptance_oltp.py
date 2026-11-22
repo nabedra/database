@@ -22,6 +22,40 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 MARKER = "NABEDRA_OLTP_ACCEPTANCE "
+ASSERTION_MARKER = "NABEDRA_OLTP_ASSERT "
+# Clause IDs follow the Required assertions column of docs/testing/oltp-contract.md.
+# Each ID covers the complete named observation, including its required variations.
+CLAUSES = {
+    1: "operations-and-descriptors results-types-and-ordering errors-and-table-identity authentication-and-scope advisory-mode-and-parquet large-counts",
+    2: "engine-dependencies invalid-feature-combinations credential-free-startup mixed-engine-and-disk-rejection binary-engine",
+    3: "owning-shard-point-lookup admission-cost typed-key-boundaries tombstones-and-invalid-keys stale-epochs",
+    4: "predicate-oracle residual-filters ordering projection-and-top-k bounded-count-and-empty-results bounded-errors index-duplicates-and-mutations",
+    5: "aggregate-native-budgets maintenance-bounds allocation-failure-isolation",
+    6: "stable-storage-before-ack quorum-and-applied-authority corrupt-and-foreign-rejection acknowledged-write-survival",
+    7: "private-before-commit atomic-snapshots single-decision-and-application duplicate-key-aborts-batch",
+    8: "serial-history uniqueness-and-absence storage-reservations schema-fences bounded-progress stable-results fresh-snapshot-retry",
+    9: "timestamp-order commit-after-prepare ambiguous-intent-reads no-backdated-allocation",
+    10: "same-decision-and-result uncertainty-stays-unknown immutable-terminal-and-context",
+    11: "committed-state-replay data-index-result-position idempotent-apply damaged-state-rejection optimization-durability",
+    12: "never-plan-incomplete-index concurrent-writes-exactly-once recovery-and-retired-snapshots bounded-resources",
+    13: "scheduler-contract accepted-identity-conservation explicit-overload protected-disk-headroom settlement-and-expiry",
+    14: "same-run-request-and-context quorum-loss-retains-queue paged-bootstrap signed-control-progress",
+    15: "cold-run-abandonment pre-fence-decisions post-fence-rejection abort-without-reexecution old-receipt-outcomes interrupted-fences",
+    16: "key-coverage lineage-and-mvcc atomic-activation unrelated-shard-isolation",
+    17: "replacement-and-copy-evidence catch-up-and-drain placement-and-replication missing-adapter-rejection",
+    18: "volume-and-single-writer retained-data native-sync-and-security process-identity quorum-aware-drain actual-provider-proof",
+    19: "consistent-cut include-committed-participants exclude-uncommitted-work empty-queue recovery-measurements fault-drills",
+    20: "matching-schema-identity-and-rows write-freeze partial-import-and-rollback unsafe-input-rejection no-queue-replay",
+    21: "growth-and-exact-queries no-logical-cap bounded-work safe-split-under-same-id capacity-errors",
+    22: "scheduler-contract caps-fairness-and-conservation dependent-waits-release-compute protected-progress",
+    23: "all-ready-and-retention queue-cost-and-throughput required-queue-and-receipts",
+    24: "environment-and-repetitions matched-conditions end-to-end-latency-and-errors accepted-identity-accounting",
+    25: "scaling-metrics replica-versus-shard-impact hot-key-and-az-failure measured-comparisons",
+    26: "identities-and-atomicity storage-only-growth mount-identity-and-exclusion aggregate-budgets drain-before-detach",
+    27: "idempotent-ready-only-growth pvc-replacement-with-quorum host-limits-and-placement failed-and-unauthorized-growth missing-adapter-rejection",
+    28: "exact-paged-coverage bounded-authenticated-pagination no-logical-metadata-cap interruption-and-pins large-counts",
+    29: "unreadable-is-uncertain shared-recovery-state authoritative-decision-replay recovery-without-pending-replay healthy-pool-isolation fault-model-label",
+}
 CATEGORIES = {
     "compatibility": ("Compatibility and packaging", (1, 2)),
     "queries": ("Keys, query semantics and indexes", (3, 4, 12)),
@@ -82,10 +116,21 @@ class Scenario:
     def id(self):
         return f"O{self.number:02d}"
 
-    def result(self, status="not-run", reason="not selected"):
+    @property
+    def clauses(self):
+        return CLAUSES[self.number].split()
+
+    def result(self, status="not-run", reason="not selected", assertions=None):
+        assertions = assertions or {}
+        missing = [clause for clause in self.clauses
+                   if clause not in assertions or assertions[clause]["status"] == "not-run"]
+        if missing and reason != "not selected":
+            reason += "; missing clauses: " + ", ".join(missing)
         return dict(scenario=self.id, category=self.category, title=TITLES[self.number - 1],
                     status=status, reason=reason, scheduler_ids=SCHEDULER[self.number].split(),
-                    regressions=[name for name, ids in REGRESSIONS.items() if self.number in ids])
+                    regressions=[name for name, ids in REGRESSIONS.items() if self.number in ids],
+                    required_clauses=self.clauses, assertions=list(assertions.values()),
+                    executed_clauses=len(self.clauses) - len(missing), missing_clauses=missing)
 
 SCENARIOS = [Scenario(n, key) for key, (_, ids) in CATEGORIES.items() for n in ids]
 assert sorted(s.number for s in SCENARIOS) == list(range(1, 30))
@@ -126,8 +171,13 @@ def source_identity():
     paths += sorted((ROOT / "server/src").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.py"))
+    paths += sorted((ROOT / "server/tests").rglob("*.c"))
+    paths += sorted((ROOT / "server/tests").rglob("*.mjs"))
     paths += sorted((ROOT / "scripts").glob("*.py"))
     paths += sorted((ROOT / "orm/python/src").rglob("*.py"))
+    paths += sorted((ROOT / "orm/typescript/src").rglob("*.ts"))
+    paths += [ROOT / "orm/python/pyproject.toml", ROOT / "orm/typescript/package.json",
+              ROOT / "orm/typescript/package-lock.json", ROOT / "orm/typescript/tsconfig.json"]
     for path in sorted(set(paths)):
         digest.update(str(path.relative_to(ROOT)).encode() + b"\0")
         digest.update(hashlib.sha256(path.read_bytes()).digest())
@@ -174,21 +224,56 @@ def run_scenario(binary, name, scenario, env, output, timeout):
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-            return dict(scenario.result("failed", "scenario watchdog expired"), elapsed_seconds=time.monotonic() - start)
+            code = None
     text = output.read_text(errors="replace")
-    status, reason = ("failed", f"assertion process exited {code}") if code else ("passed", "assertions executed")
-    if not code and not re.search(r"test result: ok\. 1 passed; 0 failed; 0 ignored;", text):
-        status, reason = "not-run", "the exact scenario did not execute one non-ignored test"
+    status, reason = ("not-run", "assertions incomplete")
+    if code is None:
+        status, reason = "failed", "scenario watchdog expired"
+    elif code:
+        status, reason = "failed", f"assertion process exited {code}"
+    elif not re.search(r"(?m)^test result: ok\. 1 passed; 0 failed; 0 ignored;", text):
+        reason = "the exact scenario did not execute one non-ignored test"
+    else:
+        status, reason = "passed", "all required clauses passed"
+
+    assertions = {}
     for line in text.splitlines():
-        if MARKER in line:
+        # libtest may prefix the first line with "test <name> ... ".
+        for prefix in (MARKER, ASSERTION_MARKER):
+            if prefix not in line:
+                continue
             try:
-                marker = json.loads(line.split(MARKER, 1)[1])
-                assert marker["scenario"] == scenario.id and marker["status"] in ("not-run", "failed")
-                if not code or marker["status"] == "failed":
-                    status, reason = marker["status"], marker["reason"]
-            except (ValueError, KeyError, AssertionError):
-                status, reason = "failed", "invalid scenario status marker"
-    return dict(scenario.result(status, reason), elapsed_seconds=round(time.monotonic() - start, 3), log=str(output))
+                marker = json.loads(line.split(prefix, 1)[1])
+                if not isinstance(marker, dict) or marker.get("scenario") != scenario.id:
+                    raise ValueError("wrong scenario")
+                if prefix == ASSERTION_MARKER:
+                    clause = marker.get("assertion")
+                    if (clause not in scenario.clauses or clause in assertions
+                            or marker.get("status") not in ("passed", "failed", "not-run")
+                            or "detail" not in marker):
+                        raise ValueError("invalid or duplicate clause")
+                    assertions[clause] = marker
+                    if marker["status"] == "failed" and status != "failed":
+                        status, reason = "failed", f"clause failed: {clause}"
+                else:
+                    if (marker.get("status") not in ("not-run", "failed")
+                            or not isinstance(marker.get("reason"), str)):
+                        raise ValueError("invalid scenario status")
+                    if status != "failed":
+                        status, reason = marker["status"], marker["reason"]
+            except ValueError:
+                status, reason = "failed", f"invalid {prefix.strip()} marker"
+    if status == "passed" and not all(
+        assertions.get(clause, {}).get("status") == "passed" for clause in scenario.clauses
+    ):
+        status, reason = "not-run", "assertions incomplete"
+    return dict(scenario.result(status, reason, assertions),
+                elapsed_seconds=round(time.monotonic() - start, 3), log=str(output))
+
+
+def print_scenario(result):
+    print(f"{result['scenario']} {result['status']}: executed {result['executed_clauses']}/"
+          f"{len(result['required_clauses'])} clauses; {result['reason']}", flush=True)
 
 
 def main():
@@ -210,7 +295,7 @@ def main():
             print(title)
             for s in SCENARIOS:
                 if s.category == key:
-                    print(f"  {s.id} {TITLES[s.number - 1]}")
+                    print(f"  {s.id} {TITLES[s.number - 1]}: {', '.join(s.clauses)}")
         return 0
     target = target_directory(args.target_dir)
     env = environment(target)
@@ -221,6 +306,7 @@ def main():
             return subprocess.call(["cargo", *args.cargo], cwd=ROOT, env=env)
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    env["NABEDRA_OLTP_ACCEPTANCE_OUTPUT"] = str(args.output.resolve())
     if args.provider_config:
         env["NABEDRA_OLTP_PROVIDER_CONFIG"] = str(args.provider_config.resolve())
     if args.olap_binary:
@@ -252,7 +338,7 @@ def main():
                         result = run_scenario(binary, matches[0], s, env, args.output / f"{s.id}.log", args.timeout)
                     else:
                         result = s.result("failed" if matches else "not-run", "duplicate scenario definitions" if matches else "production scenario assertions not integrated")
-                    print(f"{s.id} {result['status']}: {result['reason']}", flush=True)
+                    print_scenario(result)
                 report["results"].append(result)
     except (OSError, subprocess.SubprocessError, RuntimeError) as error:
         report["error"] = str(error)
@@ -260,7 +346,10 @@ def main():
     recorded = {r["scenario"] for r in report["results"]}
     for s in SCENARIOS:
         if s.id not in recorded:
-            report["results"].append(s.result(reason="build or runner failed before execution" if s in selected else "not selected"))
+            result = s.result(reason="build or runner failed before execution" if s in selected else "not selected")
+            report["results"].append(result)
+            if s in selected:
+                print_scenario(result)
     report["source_after"] = source_identity()
     report["source_changed"] = report["source"]["source_sha256"] != report["source_after"]["source_sha256"]
     chosen = [r for r in report["results"] if r["scenario"] in {s.id for s in selected}]

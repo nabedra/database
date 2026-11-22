@@ -25,11 +25,12 @@
 //! overload and closes the session after the reply.
 use super::*;
 use crate::oltp_replication::types::WorkerEnrollment;
+use crate::oltp_runtime::stage_timing::Stage;
 use std::{
     collections::HashMap,
     io::IoSlice,
     pin::Pin,
-    sync::{MutexGuard, PoisonError, atomic::AtomicU64},
+    sync::{MutexGuard, OnceLock, PoisonError, atomic::AtomicU64},
     task::{Context, Poll},
 };
 use tokio::{
@@ -40,6 +41,22 @@ use tokio::{
 use tokio_rustls::{client, server};
 
 pub(super) const SESSION_ALPN: &[u8] = b"nabedra-otp/2";
+/// RD3: `nabedra-otp/2` plus direct admission: the receiver handles direct
+/// requests (ingress on a Data group) in their own pools of
+/// `direct_handler_slots`, so a caller may keep that many in flight to it.
+/// It changes only the receiver's lanes, never a frame, entry or log
+/// format, so it stays a per-connection capability (CAP1).
+///
+/// CAP1: `nabedra-otp/3` (IDXGC1, index reclamation frames) is retired.
+/// Index reclamation is gated by Control's `data.index.reclaim` cluster
+/// feature, which also covers replicas that join later. Builds that offer
+/// otp/3 also offer otp/2 (and RD3's otp/4), so this build still negotiates
+/// a session with them.
+pub(super) const DIRECT_ADMISSION_ALPN: &[u8] = b"nabedra-otp/4";
+
+pub(super) fn session_alpn(alpn: Option<&[u8]>) -> bool {
+    matches!(alpn, Some(SESSION_ALPN | DIRECT_ADMISSION_ALPN))
+}
 pub(super) const REPLY_PREFIX_BYTES: usize = 53;
 const FRAME_BYTES: usize = 13;
 const REQUEST: u8 = 1;
@@ -55,6 +72,57 @@ const SECTION_PREFIX_BYTES: usize = 8 * MAX_SECTIONS;
 const DRAIN_BYTES: usize = 16 << 10;
 const DIRECTORY_CHECK: Duration = Duration::from_secs(1);
 const WRITE_QUEUE: usize = 64;
+
+/// One stage timer per traffic class, created on first use (RD2 transport
+/// breakdown). `sess.c.*` are the caller's legs, `sess.s.*` the receiver's:
+/// - `queue`: frame queued until its writer takes it; `write`: the vectored
+///   write and flush;
+/// - `sess.c.rtt`: request written until the reply's frame head is read,
+///   which is the receiver's `sess.s.total` plus both network legs and both
+///   socket wakeups;
+/// - `sess.c.wake`: reply read until the caller runs again;
+/// - `sess.s.receive`: request head read until the body is read and
+///   checked; `spawn`: until its stream task runs; `preflight` and `handle`:
+///   the endpoint's two calls; `total`: request head read until the reply
+///   was written.
+struct ClassStage {
+    prefix: &'static str,
+    stages: [OnceLock<&'static Stage>; TrafficClass::ALL.len()],
+}
+impl ClassStage {
+    const fn new(prefix: &'static str) -> Self {
+        Self {
+            prefix,
+            stages: [const { OnceLock::new() }; TrafficClass::ALL.len()],
+        }
+    }
+    fn get(&'static self, class: TrafficClass) -> &'static Stage {
+        self.stages[class as usize].get_or_init(|| {
+            crate::oltp_runtime::stage_timing::stage(Box::leak(
+                format!("{}{class:?}", self.prefix).into_boxed_str(),
+            ))
+        })
+    }
+}
+static C_QUEUE: ClassStage = ClassStage::new("sess.c.queue.");
+static C_WRITE: ClassStage = ClassStage::new("sess.c.write.");
+static C_RTT: ClassStage = ClassStage::new("sess.c.rtt.");
+static C_WAKE: ClassStage = ClassStage::new("sess.c.wake.");
+static C_CALL: ClassStage = ClassStage::new("sess.c.call.");
+static S_RECEIVE: ClassStage = ClassStage::new("sess.s.receive.");
+static S_SPAWN: ClassStage = ClassStage::new("sess.s.spawn.");
+static S_PREFLIGHT: ClassStage = ClassStage::new("sess.s.preflight.");
+static S_HANDLE: ClassStage = ClassStage::new("sess.s.handle.");
+static S_QUEUE: ClassStage = ClassStage::new("sess.s.queue.");
+static S_WRITE: ClassStage = ClassStage::new("sess.s.write.");
+static S_TOTAL: ClassStage = ClassStage::new("sess.s.total.");
+
+/// When a frame was queued, and the stages its writer records.
+struct FrameTiming {
+    queued: Instant,
+    queue: &'static Stage,
+    write: &'static Stage,
+}
 
 /// Fixed header of every frame on a session. `len` counts the body only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +157,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) enum PeerFeature {
     /// AppendEntries frames carrying more than one entry.
     MultiEntryAppend,
+    /// RD3: the receiver admits direct requests by its direct handler pool
+    /// (`TransportConfig::direct_handler_slots`), not the ingress class's.
+    DirectAdmission,
 }
 
 /// Counts bytes read, so liveness checks see progress inside large frames.
@@ -200,6 +271,9 @@ pub(super) struct RawReply {
     pub prefix: ReplyPrefix,
     pub header: ChargedBytes,
     pub sections: [Option<ChargedBytes>; MAX_SECTIONS],
+    /// When its frame head was read, and when the whole reply was read.
+    pub received: Instant,
+    pub read: Instant,
 }
 
 enum Part {
@@ -231,6 +305,7 @@ struct Outbound {
     /// reply and send its next request (a sequential caller is never refused
     /// by its own previous call).
     release: Option<OwnedSemaphorePermit>,
+    timing: Option<FrameTiming>,
 }
 impl Outbound {
     fn control(stream_id: u64, flags: u8) -> Self {
@@ -245,6 +320,7 @@ impl Outbound {
             parts: Vec::new(),
             ack: None,
             release: None,
+            timing: None,
         }
     }
     fn cancel(stream_id: u64) -> Self {
@@ -313,6 +389,10 @@ async fn write_frames(
             }
         }
         drop(frame.release.take());
+        let started = Instant::now();
+        if let Some(timing) = &frame.timing {
+            timing.queue.record(started - timing.queued);
+        }
         let written = tokio::select! {
             biased;
             written = timeout(deadline, write_frame(&mut stream, &frame)) => {
@@ -320,6 +400,9 @@ async fn write_frames(
             }
             _ = stopped(&mut stop) => false,
         };
+        if let Some(timing) = &frame.timing {
+            timing.write.record(started.elapsed());
+        }
         if let Some(ack) = frame.ack {
             let _ = ack.send(if written {
                 WriteOutcome::Written(Instant::now())
@@ -359,6 +442,18 @@ fn enrolled(directory: &dyn PeerDirectory, peer: WorkerIdentity) -> bool {
         .is_ok_and(|enrollment| WorkerIdentity::from(&enrollment) == peer)
 }
 
+/// Resolves when the directory learned a revocation; never without one.
+async fn trust_changed(changes: &mut Option<watch::Receiver<u64>>) {
+    let closed = match changes.as_mut() {
+        Some(receiver) => receiver.changed().await.is_err(),
+        None => true,
+    };
+    if closed {
+        *changes = None;
+        std::future::pending::<()>().await;
+    }
+}
+
 fn framing() -> io::Error {
     io::ErrorKind::InvalidData.into()
 }
@@ -379,6 +474,7 @@ struct Waiters {
 struct ClientSession {
     enrollment: WorkerEnrollment,
     identity: WorkerIdentity,
+    direct_admission: bool,
     outgoing: mpsc::Sender<Outbound>,
     waiters: Mutex<Waiters>,
     closed: watch::Sender<bool>,
@@ -389,20 +485,31 @@ struct ClientSession {
     /// A stream that waited this long for a reply with nothing at all
     /// received meanwhile marks the connection dead (the ping timeout).
     silent_limit: Duration,
+    class: TrafficClass,
 }
 impl ClientSession {
+    fn supports(&self, feature: PeerFeature) -> bool {
+        match feature {
+            PeerFeature::MultiEntryAppend => true,
+            PeerFeature::DirectAdmission => self.direct_admission,
+        }
+    }
+
     fn start(
         stream: client::TlsStream<TcpStream>,
         enrollment: WorkerEnrollment,
         class: TrafficClass,
         common: &Common,
     ) -> Arc<Self> {
+        let alpn = stream.get_ref().1.alpn_protocol();
+        let direct_admission = alpn == Some(DIRECT_ADMISSION_ALPN);
         let (read, write) = tokio::io::split(stream);
         let (outgoing, queue) = mpsc::channel(WRITE_QUEUE);
         let (closed, stop) = watch::channel(false);
         let received = Arc::new(AtomicU64::new(0));
         let session = Arc::new(Self {
             identity: WorkerIdentity::from(&enrollment),
+            direct_admission,
             enrollment,
             outgoing,
             waiters: Mutex::new(Waiters {
@@ -414,6 +521,7 @@ impl ClientSession {
             reader: Mutex::new(None),
             received: received.clone(),
             silent_limit: common.config.ping_timeout,
+            class,
         });
         let deadline = common.config.deadline;
         #[cfg(test)]
@@ -468,10 +576,16 @@ impl ClientSession {
         let mut progress = Progress::new(self.received.clone());
         let mut queued: Option<oneshot::Receiver<WriteOutcome>> = None;
         let mut written: Option<(Instant, u64)> = None;
+        let mut changes = directory.trust_changes();
         loop {
             tokio::select! {
                 _ = &mut reader => break,
                 _ = stop.wait_for(|closed| *closed) => break,
+                _ = trust_changed(&mut changes) => {
+                    if !enrolled(&*directory, self.identity) {
+                        break;
+                    }
+                }
                 outcome = async { queued.as_mut().expect("ping queued").await }, if queued.is_some() => {
                     queued = None;
                     if !matches!(outcome, Ok(WriteOutcome::Written(_))) {
@@ -587,11 +701,17 @@ impl ClientSession {
         }
         let (ack, written) = oneshot::channel();
         *phase = RaftTransportPhase::SendRequest;
+        let called = Instant::now();
         let frame = Outbound {
             head,
             parts,
             ack: Some(ack),
             release: None,
+            timing: Some(FrameTiming {
+                queued: called,
+                queue: C_QUEUE.get(self.class),
+                write: C_WRITE.get(self.class),
+            }),
         };
         // Bytes received before the frame was queued: nothing received
         // since then means nothing received since it was written either.
@@ -610,6 +730,18 @@ impl ClientSession {
             // A reply means the request was written.
             *phase = RaftTransportPhase::ReceiveReply;
             guard.settled = true;
+            if let Ok(reply) = &result {
+                let now = Instant::now();
+                C_WAKE.get(self.class).record(now - reply.read);
+                C_CALL.get(self.class).record(now - called);
+                if let Some((written, _)) = guard.written.as_mut()
+                    && let Ok(WriteOutcome::Written(at)) = written.try_recv()
+                {
+                    C_RTT
+                        .get(self.class)
+                        .record(reply.received.saturating_duration_since(at));
+                }
+            }
             return result.map_err(CallError::Failed);
         }
         let outcome = guard.write_outcome(deadline).await;
@@ -717,6 +849,7 @@ async fn read_replies(
         if stream.read_exact(&mut head).await.is_err() {
             return;
         }
+        let received = Instant::now();
         let frame = StreamFrame::decode(head);
         let waiter = session.waiter(frame.stream_id);
         match frame.flags {
@@ -727,7 +860,10 @@ async fn read_replies(
                 )
                 .await;
                 match read {
-                    Ok(Ok(result)) => {
+                    Ok(Ok(mut result)) => {
+                        if let Ok(reply) = &mut result {
+                            reply.received = received;
+                        }
                         if let Some(waiter) = waiter {
                             let _ = waiter.send(result);
                         }
@@ -810,10 +946,13 @@ async fn read_reply(
         rest -= length;
         *slot = Some(bytes.freeze());
     }
+    let now = Instant::now();
     Ok(Ok(RawReply {
         prefix,
         header: header.freeze(),
         sections,
+        received: now,
+        read: now,
     }))
 }
 
@@ -845,8 +984,7 @@ impl Drop for PeerSessions {
 }
 impl PeerSessions {
     /// Whether the live session to this peer incarnation on `class` offers
-    /// `feature`. Every `nabedra-otp/2` session supports every feature listed
-    /// in [`PeerFeature`]; one-shot peers support none.
+    /// `feature`. One-shot peers support none.
     pub(super) fn supports(
         &self,
         peer: &WorkerEnrollment,
@@ -857,12 +995,9 @@ impl PeerSessions {
         let Some(slot) = lock(&self.slots).get(&key).cloned() else {
             return false;
         };
-        let live = lock(&slot.current)
-            .as_ref()
-            .is_some_and(|session| session.alive() && session.enrollment == *peer);
-        match feature {
-            PeerFeature::MultiEntryAppend => live,
-        }
+        lock(&slot.current).as_ref().is_some_and(|session| {
+            session.alive() && session.enrollment == *peer && session.supports(feature)
+        })
     }
     /// Streams waiting for replies on this caller's sessions.
     #[cfg(test)]
@@ -978,7 +1113,7 @@ impl PeerSessions {
             }
         };
         self.connections.fetch_add(1, Ordering::Relaxed);
-        if stream.get_ref().1.alpn_protocol() == Some(SESSION_ALPN) {
+        if session_alpn(stream.get_ref().1.alpn_protocol()) {
             let session = ClientSession::start(stream, peer.clone(), class, common);
             if let Some(old) = lock(&slot.current).replace(session.clone()) {
                 old.close();
@@ -1089,7 +1224,7 @@ async fn connect(
         .await
         .map_err(|_| RequestError::Unreachable)?;
     let alpn = stream.get_ref().1.alpn_protocol();
-    let supported = alpn == Some(ALPN) || common.sessions_enabled && alpn == Some(SESSION_ALPN);
+    let supported = alpn == Some(ALPN) || common.sessions_enabled && session_alpn(alpn);
     if !supported || peer_digest(stream.get_ref().1.peer_certificates())? != peer.certificate_sha256
     {
         return Err(malformed("target certificate or ALPN differs").into());
@@ -1159,10 +1294,13 @@ async fn one_shot(
             }
         }
     }
+    let now = Instant::now();
     Ok(RawReply {
         prefix,
         header: response_header.freeze(),
         sections: response_sections,
+        received: now,
+        read: now,
     })
 }
 
@@ -1292,11 +1430,21 @@ pub(super) async fn serve(
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let started = Instant::now();
     let mut progress = Progress::new(state.received.clone());
+    let mut changes = transport.common.directory.trust_changes();
     let read_finished = loop {
         tokio::select! {
             _ = &mut reader => break true,
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
+                    break false;
+                }
+            }
+            _ = trust_changed(&mut changes) => {
+                let bound = *lock(&state.bound);
+                if bound.is_some_and(|peer| !enrolled(&*transport.common.directory, peer)) {
+                    tracing::debug!(peer=?bound.map(|peer| peer.worker_id),
+                        "closing a revoked peer's session");
+                    transport.common.revoked_closes.fetch_add(1, Ordering::Relaxed);
                     break false;
                 }
             }
@@ -1348,6 +1496,7 @@ async fn serve_frames(
         if stream.read_exact(&mut head).await.is_err() {
             return;
         }
+        let arrived = Instant::now();
         let frame = StreamFrame::decode(head);
         match frame.flags {
             REQUEST => {
@@ -1358,6 +1507,8 @@ async fn serve_frames(
                 .await;
                 match received {
                     Ok(Ok(Received::Stream(work))) => {
+                        let spawned = Instant::now();
+                        S_RECEIVE.get(work.class).record(spawned - arrived);
                         let cancelled = Arc::new(AtomicBool::new(false));
                         lock(&state.active).insert(work.stream_id, cancelled.clone());
                         tokio::spawn(run_stream(
@@ -1366,6 +1517,7 @@ async fn serve_frames(
                             outgoing.clone(),
                             state.clone(),
                             cancelled,
+                            (arrived, spawned),
                         ));
                     }
                     Ok(Ok(Received::Abort)) => {
@@ -1457,6 +1609,7 @@ fn reply_frame(stream_id: u64, nonce: Uuid, status: u8, reply: ChargedReply) -> 
         parts,
         ack: None,
         release: None,
+        timing: None,
     }
 }
 
@@ -1466,6 +1619,7 @@ async fn run_stream(
     outgoing: mpsc::Sender<Outbound>,
     state: Arc<ServerSession>,
     cancelled: Arc<AtomicBool>,
+    (arrived, spawned): (Instant, Instant),
 ) {
     let common = &transport.common;
     let StreamWork {
@@ -1481,6 +1635,7 @@ async fn run_stream(
         sections,
         preflight,
     } = work;
+    S_SPAWN.get(class).record(spawned.elapsed());
     let mut trace = RaftTransportTrace {
         group: group_id,
         purpose,
@@ -1492,10 +1647,13 @@ async fn run_stream(
         let header_scratch = common
             .shared
             .reserve_scratch(class.byte_class(), header_decode_bytes(class, header.len()))?;
+        let preflight_started = Instant::now();
         let plan = endpoint.preflight(&session, header.as_slice()).await?;
+        S_PREFLIGHT.get(class).record(preflight_started.elapsed());
         drop(header_scratch);
         validate_plan(&common.config, class, plan)?;
-        let handler = common.handlers[class as usize]
+        let handler = common
+            .handler_pool(class, session.group())
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
@@ -1518,7 +1676,12 @@ async fn run_stream(
         };
         drop(preflight);
         trace.phase = RaftTransportPhase::Handle;
+        if common.directory.revoked(session.remote()) {
+            return Err(super::revoked_peer());
+        }
+        let handle_started = Instant::now();
         let reply = endpoint.handle(session, header, sections).await?;
+        S_HANDLE.get(class).record(handle_started.elapsed());
         validate_reply(&common.config, class, &reply)?;
         Ok((reply, handler))
     })
@@ -1552,8 +1715,15 @@ async fn run_stream(
         // can see it: freed after the write, the slot could still be held
         // when the peer's next request arrives (D10/O05, CIfix1).
         frame.release = handler.take();
-        if outgoing.send(frame).await.is_ok() {
-            let _ = written.await;
+        frame.timing = Some(FrameTiming {
+            queued: Instant::now(),
+            queue: S_QUEUE.get(class),
+            write: S_WRITE.get(class),
+        });
+        if outgoing.send(frame).await.is_ok()
+            && let Ok(WriteOutcome::Written(_)) = written.await
+        {
+            S_TOTAL.get(class).record(arrived.elapsed());
         }
     }
     drop(handler);
@@ -1649,7 +1819,11 @@ impl WorkerTransport {
         }
         // Definite rejections before any execution get a typed reply: the
         // caller knows the request was not applied.
-        let Ok(preflight) = common.preflight[class as usize].clone().try_acquire_owned() else {
+        let Ok(preflight) = common
+            .preflight_pool(class, &group)
+            .clone()
+            .try_acquire_owned()
+        else {
             drain(stream, rest).await?;
             return Ok(Received::Reject {
                 nonce: hello.nonce,
@@ -1779,6 +1953,7 @@ mod tests {
             ],
             ack: None,
             release: None,
+            timing: None,
         };
         let mut out = Vec::new();
         write_frame(&mut out, &frame).await.unwrap();

@@ -17,8 +17,8 @@ enum Host {
     System {
         factory: Arc<DataGroupFactory>,
         pools: Arc<WorkerPools>,
-        timestamps: Arc<TimestampHandle>,
-        catalog: CatalogHandle,
+        timestamps: Option<Arc<TimestampHandle>>,
+        catalog: Option<CatalogHandle>,
     },
     Data(Arc<RemotePlacementTarget>),
 }
@@ -35,17 +35,17 @@ impl SplitEndpoint {
         factory: Arc<DataGroupFactory>,
         pools: Arc<WorkerPools>,
         client: SplitClient,
-        timestamps: Arc<TimestampHandle>,
-        catalog: Arc<ParticipantHandle>,
+        timestamps: Option<Arc<TimestampHandle>>,
+        catalog: Option<Arc<ParticipantHandle>>,
         status: StatusTopology,
     ) -> Result<Arc<Self>, ProtocolError> {
         Ok(Arc::new(Self {
-            catalog: catalog.identity().clone(),
+            catalog: client.catalog.clone(),
             host: Host::System {
                 factory,
                 pools,
                 timestamps,
-                catalog: CatalogHandle::new(catalog)?,
+                catalog: catalog.map(CatalogHandle::new).transpose()?,
             },
             client,
             status,
@@ -66,7 +66,7 @@ impl SplitEndpoint {
         let data = DataGroupClient::new(manager, control_group, bootstrap_voters)?;
         Ok(Arc::new(Self {
             host: Host::Data(host),
-            client: SplitClient::new(data, control, timestamps),
+            client: SplitClient::new(data, control, timestamps, catalog.clone()),
             catalog,
             status,
             usage: Default::default(),
@@ -85,6 +85,9 @@ impl SplitEndpoint {
     }
 
     fn fixed_peer(&self, session: &AuthenticatedSession) -> bool {
+        if let Host::System { factory, .. } = &self.host {
+            return factory.control.is_operator(&session.remote());
+        }
         self.client
             .data
             .voters
@@ -331,7 +334,11 @@ impl SplitEndpoint {
         }
         let children = attempt.children()?;
         let table_id = children[0].guard.binding().table_id;
-        let Host::System { catalog, .. } = &self.host else {
+        let Host::System {
+            catalog: Some(catalog),
+            ..
+        } = &self.host
+        else {
             return Err(unauthorized());
         };
         let pin = catalog.snapshot(request.at, self.current().await?)?;
@@ -486,7 +493,11 @@ impl SplitEndpoint {
         if command.authority() != self.current().await? {
             return Err(unauthorized());
         }
-        let Host::System { timestamps, .. } = &self.host else {
+        let Host::System {
+            timestamps: Some(timestamps),
+            ..
+        } = &self.host
+        else {
             return Err(unauthorized());
         };
         let authority = ServiceAction::TimestampProof {
@@ -660,7 +671,11 @@ impl SplitEndpoint {
                 output!(LocalUsageScan::observe(&self.usage, request, machine).await?)
             }
             Operation::Job | Operation::FailureSettlement => {
-                let Host::System { timestamps, .. } = &self.host else {
+                let Host::System {
+                    timestamps: Some(timestamps),
+                    ..
+                } = &self.host
+                else {
                     return Err(unauthorized());
                 };
                 if operation == Operation::Job {
@@ -774,14 +789,16 @@ impl SplitEndpoint {
                     let Host::System { factory, .. } = &self.host else {
                         return Err(unauthorized());
                     };
-                    if node != factory.local.node_id {
-                        return Err(unauthorized());
-                    }
+                    let voters = factory.initial_voters().await?.into_inner();
+                    let local = voters.iter().find(|member| member.node_id == node
+                        && member.worker_id == factory.local.worker_id
+                        && member.pool_id == factory.local.pool_id)
+                        .ok_or_else(unauthorized)?;
                     if operation == Operation::Host {
-                        factory.host_group(&binding.target, true).await?;
-                        return output!((&binding.target, &factory.local));
+                        factory.host_at(&binding.target, local, &voters, true).await?;
+                        return output!((&binding.target, local));
                     }
-                    (factory.local.clone(), factory.voters.to_vec())
+                    (local.clone(), voters)
                 };
                 let spec = DataGroupSpec {
                     group: binding.target.clone(),

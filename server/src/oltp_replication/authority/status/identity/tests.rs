@@ -697,19 +697,84 @@ async fn r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures(
     )
     .unwrap();
     let result_digest = outcome.digest().unwrap();
-    assert!(matches!(
-        f.apply(StatusCommand::BeginManifest {
+    let read_ts = Timestamp::new(1).unwrap();
+    let StatusReply::Manifest(draft) = f
+        .apply(StatusCommand::BeginManifest {
             authority: old,
             txn,
             request,
-            read_ts: Timestamp::new(1).unwrap(),
+            read_ts,
             participant_count: 1,
             outcome,
-            result_digest
+            result_digest,
+        })
+        .await
+    else {
+        panic!("expected durable manifest draft")
+    };
+    let participant = ParticipantPlan {
+        group: GroupIdentity {
+            kind: GroupKind::Catalog,
+            group_id: Uuid::new_v4(),
+            ..f.machine.store().identity().clone()
+        },
+        schema_epoch: 1,
+        routing_epoch: 1,
+        read_ts,
+        write_root: Digest::from_bytes([63; 32]),
+        write_count: 1,
+        page_count: 1,
+    };
+    f.apply(StatusCommand::ManifestPage {
+        authority: old,
+        txn,
+        page_index: 0,
+        previous_root: draft.initial_root,
+        participants: Page::new(vec![participant.clone()]).unwrap(),
+    })
+    .await;
+    let StatusReply::ManifestSealed(manifest) = f
+        .apply(StatusCommand::SealManifest {
+            authority: old,
+            txn,
+        })
+        .await
+    else {
+        panic!("expected sealed manifest")
+    };
+    let position = AppliedPosition {
+        term: 1,
+        node_id: 1,
+        index: 7,
+    };
+    assert_eq!(
+        f.apply(StatusCommand::RecordPrepared {
+            authority: old,
+            evidence: PreparedParticipant {
+                txn,
+                manifest,
+                participant,
+                authority: old,
+                sealed_at: position,
+                result_digest,
+            },
         })
         .await,
-        StatusReply::Manifest(_)
-    ));
+        StatusReply::Prepared {
+            count: 1,
+            complete: true,
+        }
+    );
+    let permit = f.read_handle().commit_permit(old, txn).await.unwrap();
+    let delayed = StatusCommand::DecideCommit {
+        authority: old,
+        stamp: super::super::CommitStamp {
+            permit_digest: permit.allocation_digest().unwrap(),
+            commit_ts: Timestamp::new(2).unwrap(),
+            allocated_at: position,
+        },
+        permit,
+    };
     let cold = Authority {
         run_id: Uuid::new_v4(),
         owner_term: 2,
@@ -720,6 +785,10 @@ async fn r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures(
         next: cold,
     })
     .await;
+    assert_eq!(
+        f.apply(delayed).await,
+        StatusReply::Rejected(StatusFault::StaleAuthority)
+    );
     assert_eq!(
         f.apply(reserve(cold, request_id, digest)).await,
         StatusReply::Identity(IdentityLookup::Abandoned(reservation))
@@ -976,4 +1045,268 @@ async fn o13_o14_q06_retirement_certificate_survives_retry_reopen_and_ready_chan
     }).await;
     assert_eq!(fixture.apply(command).await, StatusReply::Rejected(StatusFault::StaleAuthority));
     assert_eq!(fixture.apply(reserve(cold, request_id, digest)).await, terminal);
+}
+
+#[tokio::test]
+async fn o08_q05_o10_retry_abort_fences_commit_and_requires_exact_settlement() {
+    retry_abort_fences_commit_and_requires_exact_settlement(false).await;
+}
+
+#[tokio::test]
+async fn o10_o14_r01_q06_fenced_retry_abort_requires_exact_settlement() {
+    retry_abort_fences_commit_and_requires_exact_settlement(true).await;
+}
+
+async fn retry_abort_fences_commit_and_requires_exact_settlement(fence_owner: bool) {
+    use crate::oltp::mvcc::{CanonicalJson, store::ResolutionEvidence};
+    use crate::oltp_replication::authority::timestamp::cold::ColdApplicationPin;
+
+    let mut f = Fixture::new().await;
+    let authority = Authority {
+        run_id: Uuid::new_v4(),
+        owner_term: 1,
+    };
+    f.apply(StatusCommand::Fence {
+        transition_id: Uuid::new_v4(),
+        expected: None,
+        next: authority,
+    })
+    .await;
+    let request = RequestBinding {
+        run_id: authority.run_id,
+        request_id: Uuid::new_v4(),
+        digest: Digest::from_bytes([1; 32]),
+        accepted_context: Digest::from_bytes([2; 32]),
+    };
+    let StatusReply::Identity(IdentityLookup::Reserved(reservation)) = f
+        .apply(reserve(authority, request.request_id, request.digest))
+        .await
+    else {
+        panic!("expected reservation");
+    };
+    let txn = TxnId {
+        request_id: request.request_id,
+        attempt: 1,
+    };
+    let read_ts = Timestamp::new(1).unwrap();
+    let result = CanonicalJson::from_serializable(f.pool.resources(), &true, 1024).unwrap();
+    let outcome = MutationOutcome::from_success(&result).unwrap();
+    let result_digest = outcome.digest().unwrap();
+    let begin = |authority, attempt, request, read_ts| StatusCommand::BeginManifest {
+        authority,
+        txn: TxnId { attempt, ..txn },
+        request,
+        read_ts,
+        participant_count: 1,
+        outcome: outcome.clone(),
+        result_digest,
+    };
+    let fresh = Timestamp::new(3).unwrap();
+    assert_eq!(
+        f.apply(begin(authority, 2, request, fresh)).await,
+        StatusReply::Rejected(StatusFault::Incomplete)
+    );
+    let StatusReply::Manifest(draft) = f.apply(begin(authority, 1, request, read_ts)).await else {
+        panic!("expected manifest draft");
+    };
+    let participant = ParticipantPlan {
+        group: GroupIdentity {
+            group_id: Uuid::new_v4(),
+            kind: GroupKind::Catalog,
+            ..f.machine.store().identity().clone()
+        },
+        schema_epoch: 1,
+        routing_epoch: 1,
+        read_ts,
+        write_root: Digest::from_bytes([3; 32]),
+        write_count: 1,
+        page_count: 1,
+    };
+    f.apply(StatusCommand::ManifestPage {
+        authority,
+        txn,
+        page_index: 0,
+        previous_root: draft.initial_root,
+        participants: Page::new(vec![participant.clone()]).unwrap(),
+    })
+    .await;
+    let StatusReply::ManifestSealed(manifest) = f
+        .apply(StatusCommand::SealManifest { authority, txn })
+        .await
+    else {
+        panic!("expected sealed manifest");
+    };
+    let applied_at = AppliedPosition {
+        term: 1,
+        node_id: 1,
+        index: f.index,
+    };
+    f.apply(StatusCommand::RecordPrepared {
+        authority,
+        evidence: PreparedParticipant {
+            txn,
+            manifest,
+            participant: participant.clone(),
+            authority,
+            sealed_at: applied_at,
+            result_digest,
+        },
+    })
+    .await;
+    let permit = f.read_handle().commit_permit(authority, txn).await.unwrap();
+    let stamp = super::super::CommitStamp {
+        permit_digest: permit.allocation_digest().unwrap(),
+        commit_ts: Timestamp::new(2).unwrap(),
+        allocated_at: applied_at,
+    };
+    let authority = if fence_owner {
+        let next = Authority {
+            owner_term: 2,
+            ..authority
+        };
+        f.apply(StatusCommand::Fence {
+            transition_id: Uuid::new_v4(),
+            expected: Some(authority),
+            next,
+        })
+        .await;
+        assert_eq!(
+            f.apply(StatusCommand::DecideCommit {
+                authority,
+                permit: permit.clone(),
+                stamp,
+            })
+            .await,
+            StatusReply::Rejected(StatusFault::StaleAuthority)
+        );
+        next
+    } else {
+        authority
+    };
+    let failure = MutationOutcome::failure(ProtocolError::new(
+        ErrorCode::Conflict,
+        "stale prepare",
+        Outcome::NotApplied,
+    ))
+    .unwrap();
+    let abort = StatusCommand::Abort {
+        authority,
+        txn,
+        reason: AbortReason::RetrySnapshot,
+        outcome: failure.clone(),
+    };
+    let reply = f.apply(abort.clone()).await;
+    let StatusReply::Decided(aborted) = reply else {
+        panic!("expected retry abort, got {reply:?}");
+    };
+    assert!(aborted.decision.retries_snapshot());
+    assert_eq!(f.apply(abort).await, StatusReply::Decided(aborted.clone()));
+    assert_eq!(
+        f.apply(StatusCommand::DecideCommit {
+            authority,
+            stamp,
+            permit,
+        })
+        .await,
+        StatusReply::Decided(aborted.clone())
+    );
+    let terminal_failure = StatusCommand::TerminalFailure {
+        authority,
+        request,
+        outcome: failure,
+    };
+    assert_eq!(
+        f.apply(terminal_failure.clone()).await,
+        StatusReply::Rejected(StatusFault::AlreadyDecided)
+    );
+    assert_eq!(
+        f.apply(begin(authority, 2, request, fresh)).await,
+        StatusReply::Rejected(StatusFault::InvalidBinding)
+    );
+    assert_eq!(
+        f.read_handle()
+            .lookup_identity(request.request_id, Some(request.digest))
+            .await
+            .unwrap(),
+        Some(IdentityLookup::Reserved(reservation))
+    );
+    f.apply(StatusCommand::RecordResolved {
+        authority,
+        evidence: ResolutionEvidence {
+            group: participant.group,
+            txn,
+            request,
+            manifest,
+            decision: aborted.decision,
+            completed_at: AppliedPosition {
+                index: f.index,
+                ..applied_at
+            },
+        },
+    })
+    .await;
+
+    let mut f = f.reopen().await;
+    assert_eq!(
+        f.apply(begin(authority, 2, request, read_ts)).await,
+        StatusReply::Rejected(StatusFault::InvalidBinding)
+    );
+    let changed = RequestBinding {
+        accepted_context: Digest::from_bytes([8; 32]),
+        ..request
+    };
+    assert_eq!(
+        f.apply(begin(authority, 2, changed, fresh)).await,
+        StatusReply::Rejected(StatusFault::InvalidBinding)
+    );
+    assert_eq!(
+        f.apply(begin(authority, 3, request, fresh)).await,
+        StatusReply::Rejected(StatusFault::Incomplete)
+    );
+    // Replanning can discover a deterministic error before opening attempt 2.
+    let first = f.apply(terminal_failure.clone()).await;
+    assert!(
+        matches!(&first, StatusReply::Identity(IdentityLookup::Terminal(TerminalIdentity::Failed {
+        request: binding, ..
+    })) if *binding == request)
+    );
+    assert_eq!(f.apply(terminal_failure).await, first);
+    assert_eq!(
+        f.apply(begin(authority, 2, request, fresh)).await,
+        StatusReply::Rejected(StatusFault::AlreadyDecided)
+    );
+
+    let cold = Authority {
+        run_id: Uuid::new_v4(),
+        owner_term: authority.owner_term + 1,
+    };
+    f.apply(StatusCommand::Fence {
+        transition_id: Uuid::new_v4(),
+        expected: Some(authority),
+        next: cold,
+    })
+    .await;
+    let safe = f
+        .read_handle()
+        .cold_application_pin_settled(
+            cold,
+            ColdApplicationPin {
+                identity: PinIdentity {
+                    run_id: authority.run_id,
+                    request_id: request.request_id,
+                    digest: request.digest,
+                    nonce: reservation.reservation_id,
+                },
+                reservation,
+                request: Some(request),
+                pin: StoragePin {
+                    pin_id: Uuid::new_v4(),
+                    read_ts,
+                    allocator_epoch: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(serde_json::from_slice::<bool>(safe.as_slice()).unwrap());
 }

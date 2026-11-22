@@ -739,14 +739,17 @@ async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
     assert!(used_bytes() > baseline + b"cancelled".len());
     assert!(matches!(
         dependency(b"excess").await,
-        Err(RequestError::OutgoingLaneFull)
+        Err(RequestError::OutgoingLaneFull { .. })
     ));
     drop(pending);
     assert_eq!(used_bytes(), baseline);
     let mut pending = Box::pin(dependency(b"expired"));
     assert_pending(pending.as_mut()).await;
     tokio::time::advance(config.deadline).await;
-    assert!(matches!(pending.await, Err(RequestError::OutgoingLaneFull)));
+    assert!(matches!(
+        pending.await,
+        Err(RequestError::OutgoingLaneFull { .. })
+    ));
     assert_eq!(caller.common.authority_waiters.available_permits(), 1);
     assert_eq!(echo.0.load(Ordering::Relaxed), 0);
     assert_eq!(used_bytes(), baseline);
@@ -844,7 +847,7 @@ async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
     }
     assert!(matches!(
         client.try_outgoing(targets[0], class),
-        Err(RequestError::OutgoingLaneFull)
+        Err(RequestError::OutgoingLaneFull { .. })
     ));
     // The other peers still send, up to the class cap.
     for target in &targets[1..OUTGOING_CLASS_LANES] {
@@ -861,7 +864,7 @@ async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
     let fifth = targets[OUTGOING_CLASS_LANES];
     assert!(matches!(
         client.try_outgoing(fifth, class),
-        Err(RequestError::OutgoingLaneFull)
+        Err(RequestError::OutgoingLaneFull { .. })
     ));
     // Control traffic is never starved by Data consensus.
     let control = client
@@ -875,6 +878,108 @@ async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
         transport.common.outgoing_class[class as usize].available_permits(),
         cap
     );
+}
+
+/// PERF1 (O03, D01): a direct request that finds its leader's lane full
+/// waits for a slot, in arrival order, until its deadline, instead of being
+/// refused at once. Waiting callers hold at most one slot less than the lane,
+/// so a caller that refuses at once (a queued submission next to direct load,
+/// D11-drop in run 44904328496) still finds one. A wait that times out is a
+/// local, not-applied `OutgoingLaneFull`.
+#[tokio::test]
+async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
+    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("lanes-{}", Uuid::new_v4())));
+    std::fs::create_dir(&temp.0).unwrap();
+    let tls = tls::certificates(&temp.0, 1);
+    let local = WorkerEnrollment {
+        worker_id: Uuid::new_v4(),
+        incarnation: Uuid::new_v4(),
+        enrollment_revision: 1,
+        certificate_sha256: Digest::parse(tls[0].certificate_sha256()).unwrap(),
+        endpoint: Text::new("127.0.0.1:1".to_owned()).unwrap(),
+        server_name: Text::try_from("localhost").unwrap(),
+    };
+    let peers = Arc::new(TestDirectory::default());
+    peers.install(local.clone());
+    let config = TransportConfig::default();
+    let shared = WorkerSharedResources::new(
+        1,
+        WorkerResources::default(),
+        SharedResourceConfig::default(),
+    )
+    .unwrap();
+    let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+    let transport =
+        WorkerTransport::new(&local, &tls[0], shared, peers, registry, config.clone()).unwrap();
+    let client = transport.client();
+    let group = GroupIdentity {
+        cluster_id: Uuid::new_v4(),
+        database: Text::try_from("direct").unwrap(),
+        group_id: Uuid::new_v4(),
+        kind: GroupKind::Data {
+            table_id: Uuid::new_v4(),
+            shard_id: Uuid::new_v4(),
+        },
+        group_format_version: 1,
+    };
+    let class = TrafficClass::ApiIngress;
+    let lane = config.handler_slots[class as usize];
+    let leader = Uuid::new_v4();
+    let reserve = |until| client.reserve_outgoing(&group, leader, Purpose::ApiIngress, until);
+    // Waiting callers get `lane - 1` slots at once.
+    let mut held = Vec::new();
+    for _ in 0..lane - 1 {
+        held.push(reserve(Instant::now()).await.unwrap());
+    }
+    // Their share is full: refused at the deadline, counted as a local refusal.
+    let refused = transport.common.refusals.snapshot();
+    let start = Instant::now();
+    assert!(matches!(
+        reserve(start + Duration::from_millis(50)).await,
+        Err(RequestError::OutgoingLaneFull { .. })
+    ));
+    assert!(start.elapsed() >= Duration::from_millis(50));
+    assert_ne!(transport.common.refusals.snapshot(), refused);
+    // The last slot is still there for a caller that refuses at once.
+    let headroom = client.try_outgoing(leader, class).unwrap();
+    assert!(matches!(
+        client.try_outgoing(leader, class),
+        Err(RequestError::OutgoingLaneFull { .. })
+    ));
+    // A waiter gets the slot a finished request frees.
+    let waiter = tokio::spawn({
+        let client = client.clone();
+        let group = group.clone();
+        async move {
+            client
+                .reserve_outgoing(
+                    &group,
+                    leader,
+                    Purpose::ApiIngress,
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !waiter.is_finished(),
+        "the waiter must wait while the lane is full"
+    );
+    held.pop();
+    let admitted = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the freed slot admits the waiter")
+        .unwrap()
+        .unwrap();
+    held.push(admitted);
+    // The bound holds: `lane` slots in all, the waiter's included.
+    assert!(matches!(
+        client.try_outgoing(leader, class),
+        Err(RequestError::OutgoingLaneFull { .. })
+    ));
+    drop((held, headroom));
+    assert!(client.try_outgoing(leader, class).is_ok());
 }
 
 /// NS11 finding 8: local lane-full refusals are counted per class for
@@ -918,7 +1023,7 @@ async fn ns11_f8_lane_full_refusals_are_counted_per_class() {
     for _ in 0..2 {
         assert!(matches!(
             client.try_outgoing(target, class),
-            Err(RequestError::OutgoingLaneFull)
+            Err(RequestError::OutgoingLaneFull { .. })
         ));
     }
     // A probe that waits for its slot is not a refusal.

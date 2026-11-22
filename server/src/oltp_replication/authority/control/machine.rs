@@ -18,6 +18,8 @@ pub(super) mod restart;
 pub(super) mod placement;
 pub(super) mod pool_drain;
 pub(super) mod scoped_queue;
+pub(super) mod system_recovery;
+mod system_trust;
 pub(super) mod worker_drain;
 
 pub(super) const STATE: &[u8] = b"ct/state";
@@ -34,13 +36,35 @@ pub(super) const BUDGET: TransactionBudget = TransactionBudget {
 #[derive(Clone)]
 pub(crate) struct ControlMachine {
     store: GroupStore,
+    replacement_trust: Option<system_trust::ReplacementTrust>,
+    /// GC2/CAP1 mixed-version tests: apply as a build that knows only the
+    /// first this many cluster features.
+    #[cfg(test)]
+    known_features: usize,
 }
 impl ControlMachine {
     pub(crate) fn new(store: GroupStore) -> Result<Self, ProtocolError> {
         if store.identity().kind != GroupKind::Control {
             return Err(unavailable("wrong Control group kind"));
         }
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            replacement_trust: None,
+            #[cfg(test)]
+            known_features: super::direct::CLUSTER_FEATURES.len(),
+        })
+    }
+    /// GC2: this replica applies every entry as a pre-feature build would.
+    #[cfg(test)]
+    pub(crate) fn legacy_v1_for_test(self) -> Self {
+        self.known_features_for_test(0)
+    }
+    /// CAP1: this replica applies every entry as a build that knows only the
+    /// first `count` registered cluster features would.
+    #[cfg(test)]
+    pub(crate) fn known_features_for_test(mut self, count: usize) -> Self {
+        self.known_features = count;
+        self
     }
     pub(crate) fn store(&self) -> &GroupStore {
         &self.store
@@ -54,14 +78,71 @@ impl ControlMachine {
         let scope = self.store.identity().clone();
         let position = meta.position;
         let digest = meta.command_digest;
-        self.store
+        let payload = command.payload()?;
+        let refresh = matches!(
+            payload,
+            ControlCommand::SystemRecovery { .. }
+                | ControlCommand::Enroll { .. }
+                | ControlCommand::CompleteRestart { .. }
+                | ControlCommand::PublishFence { .. }
+        );
+        let mount = match payload {
+            ControlCommand::SystemRecovery { command, .. } => match command.as_ref() {
+                super::SystemRecoveryCommand::Mount { proof, .. } => Some(proof.id),
+                _ => None,
+            },
+            _ => None,
+        };
+        let directory = self
+            .replacement_trust
+            .as_ref()
+            .map(|trust| trust.directory.as_ref());
+        let reload = directory
+            .filter(|_| mount.is_some())
+            .map(|directory| directory.reloading_revocations());
+        let revoked = reload
+            .as_ref()
+            .map(|_| std::sync::Arc::new(std::sync::OnceLock::new()));
+        let revoke = revoked.clone();
+        #[cfg(test)]
+        let known_features = self.known_features;
+        let result = self
+            .store
             .transaction(meta, BUDGET, move |tx| {
                 if crate::oltp_replication::owned::serialized_digest(&command)? != digest {
                     return Err(unavailable("Control command digest differs"));
                 }
-                apply(tx, &scope, position, digest, command.payload()?)
+                #[cfg(test)]
+                direct::KNOWN_FEATURES.with(|known| known.set(known_features));
+                let transition = command
+                    .payload()
+                    .and_then(|payload| apply(tx, &scope, position, digest, payload));
+                #[cfg(test)]
+                direct::KNOWN_FEATURES
+                    .with(|known| known.set(super::direct::CLUSTER_FEATURES.len()));
+                let transition = transition?;
+                if let (Some(id), Some(revoke)) = (mount, revoke)
+                    && let Transition::Commit(reply) = &transition
+                    && decode::<ControlReply>(reply.as_ref())?
+                        == ControlReply::SystemReplacementMounted
+                    && let Some(record) =
+                        load::<super::ReplacementRecord>(tx, &system_recovery::by_id(id))?
+                {
+                    let _ = revoke.set(record.intent.previous);
+                }
+                Ok(transition)
             })
-            .await
+            .await?;
+        if let Some(directory) = directory
+            && let Some(worker) = revoked.as_ref().and_then(|change| change.get())
+        {
+            directory.record_revocation(*worker);
+        }
+        drop(reload);
+        if refresh {
+            self.refresh_or_retry().await;
+        }
+        Ok(result)
     }
 }
 
@@ -236,12 +317,14 @@ fn apply_initialized(
         return fault(Fault::Busy);
     }
     match command {
+        SystemRecovery { operation_id, command } =>
+            system_recovery::apply(tx, scope, state, position, *operation_id, command),
         DirectCapability {
+            operation_id,
             actor,
             action,
             unix_ms,
-            ..
-        } => direct::apply(tx, state, position, *actor, action, *unix_ms),
+        } => direct::apply(tx, state, position, *operation_id, *actor, action, *unix_ms),
         ScopedQueue { operation_id, actor, action, authorization } => {
             scoped_queue::apply(tx, scope, state, *operation_id, *actor, action, authorization.as_ref())
         }
@@ -383,7 +466,8 @@ fn apply_initialized(
             previous_process,
             ..
         } => {
-            if tx.get(&key(data_worker::REGISTERED, next.worker_id))?.is_some()
+            if system_recovery::blocked_enrollment(tx, next)?
+                || tx.get(&key(data_worker::REGISTERED, next.worker_id))?.is_some()
                 || load::<super::DataWorkerIntent>(tx, data_worker::PREPARED)?
                     .is_some_and(|intent| intent.enrollment.worker_id == next.worker_id)
             {
@@ -460,6 +544,9 @@ fn apply_initialized(
                 || next.validate().is_err()
                 || next.database != scope.database
             {
+                return fault(Fault::Unauthorized);
+            }
+            if system_recovery::blocked_enrollment(tx, next.transport())? {
                 return fault(Fault::Unauthorized);
             }
             let next_identity = WorkerIdentity::from(next.transport());
@@ -1031,6 +1118,7 @@ fn apply_initialized(
             state.ready = pending.next;
             state.owner = pending.next_owner;
             if pending.cold {
+                system_recovery::retire_on_cold_fence(tx)?;
                 // A cold fence begun by an earlier binary can still publish.
                 save(tx, &key(RUNS, pending.expected.view.run_id), &true)?;
                 save(tx, &key(RUNS, pending.next.view.run_id), &true)?;
@@ -1076,6 +1164,9 @@ fn begin_ready(
     }
     if state.ready.view != expected || target.validate().is_err() {
         return fault(Fault::Stale);
+    }
+    if change == ReadyChange::Join && system_recovery::waits_for_groups(tx, target.worker_id)? {
+        return fault(Fault::Busy);
     }
     if change == ReadyChange::Join && !direct::admits(tx, target)? {
         return fault(Fault::DirectCapabilityRequired);
@@ -1619,6 +1710,18 @@ fn unknown() -> ProtocolError {
 impl crate::oltp_replication::hosted::TypedMachine<super::super::config::ControlConfig>
     for ControlMachine
 {
+    fn installing_snapshot(&self) -> impl Send {
+        self.replacement_trust
+            .as_ref()
+            .map(|trust| trust.directory.reloading_revocations())
+    }
+    async fn snapshot_installed(&self) -> Result<(), ProtocolError> {
+        if let Some(trust) = &self.replacement_trust {
+            trust.directory.require_revocation_snapshot();
+        }
+        self.refresh_or_retry().await;
+        Ok(())
+    }
     fn store(&self) -> &GroupStore {
         ControlMachine::store(self)
     }

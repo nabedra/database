@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::Instant,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -152,6 +152,34 @@ pub struct QueueAuthority {
     pub owner: WorkerIdentity,
 }
 
+impl QueueAuthority {
+    pub(super) fn view_is_behind(self, expected: AuthorityView) -> bool {
+        let local = self.ready.view;
+        local.run_id == expected.run_id && local.membership_revision < expected.membership_revision
+    }
+}
+
+pub(super) async fn wait_for_local_ready_view(
+    replica: &Mutex<WorkerReplica>,
+    expected: QueueAuthority,
+) -> Result<(), QueueError> {
+    // Registered membership polls every 250 ms and skips quiet passes for up to 2 s.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let local = replica.lock().map_err(|_| QueueError::Unavailable)?.authority();
+            if local == expected {
+                return Ok(());
+            }
+            if !local.view_is_behind(expected.ready.view) {
+                return Err(QueueError::Stale);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or(Err(QueueError::Stale))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordHeader {
@@ -178,8 +206,6 @@ impl RecordHeader {
     pub fn preflight(&self, scope: &QueueScope, current: QueueAuthority) -> Result<(), QueueError> {
         if self.queue_format_version != QUEUE_FORMAT_VERSION
             || self.scope != *scope
-            || self.ready != current.ready
-            || self.owner != current.owner
             || self.request_id.is_nil()
             || self.sequence == 0
             || self.version == 0
@@ -200,7 +226,12 @@ impl RecordHeader {
         self.scope.validate()?;
         self.ready.view.validate().map_err(invalid)?;
         self.owner.validate().map_err(invalid)?;
-        self.read_grants.validate(self.ready.view, self.request_id, self.digest, self.accepted)?;
+        self.read_grants
+            .validate(self.ready.view, self.request_id, self.digest, self.accepted)?;
+        // Control can authorize receipt before this replica applies the new ready set.
+        if self.ready != current.ready || self.owner != current.owner {
+            return Err(QueueError::Stale);
+        }
         Ok(())
     }
 }

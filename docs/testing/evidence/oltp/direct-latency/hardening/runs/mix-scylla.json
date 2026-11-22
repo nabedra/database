@@ -1,0 +1,358 @@
+{
+ "run": "mix-scylla",
+ "settings": {
+  "rates": [
+   1,
+   5,
+   20,
+   50,
+   100,
+   200,
+   300,
+   400,
+   600
+  ],
+  "seconds": 5.0,
+  "warmup_seconds": 3.0,
+  "repetitions": 3,
+  "clients": 32,
+  "rows": 5000,
+  "seed": 20261118,
+  "timeout": 10.0,
+  "operation": "mix",
+  "read_fraction": 0.95,
+  "stop_p99_ms": 100.0,
+  "stop_on_rejection": true,
+  "snapshot_between_phases": false
+ },
+ "workload": "point gets and updates of existing bigint primary keys (--read-fraction gets)",
+ "started_utc": "2026-11-22T10:50:43.049413+00:00",
+ "error": null,
+ "correctness_verified": true,
+ "metadata": {
+  "engine": "ScyllaDB",
+  "engine_version": "6.2.3-0.20250119.bff9ddde1283",
+  "consistency": "QUORUM",
+  "commitlog_sync_by_node": {
+   "172.20.0.2": "batch",
+   "172.20.0.4": "batch",
+   "172.20.0.3": "batch"
+  },
+  "measurement": "persistent native CQL, prepared UPDATE and SELECT at QUORUM, no application retries",
+  "driver_version": "3.29.13"
+ },
+ "summary": {
+  "run": "mix-scylla",
+  "error": null,
+  "correctness_verified": true,
+  "stopped_after_rate": 600,
+  "stop_reason": {
+   "median_p99_ms": 108.154303,
+   "rejected": 0
+  },
+  "rates": {
+   "1": {
+    "reps": 3,
+    "offered": 15,
+    "median_succeeded_rps": 1.0,
+    "median_p50_ms": 4.25117,
+    "median_p95_ms": 7.581506,
+    "median_p99_ms": 7.581506,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 15,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 4.25117,
+      "median_p99_ms": 7.501196,
+      "succeeded": 14,
+      "offered": 14
+     },
+     "update": {
+      "median_p50_ms": 8.397924,
+      "median_p99_ms": 8.397924,
+      "succeeded": 1,
+      "offered": 1
+     }
+    }
+   },
+   "5": {
+    "reps": 3,
+    "offered": 75,
+    "median_succeeded_rps": 5.0,
+    "median_p50_ms": 7.829819,
+    "median_p95_ms": 9.675838,
+    "median_p99_ms": 10.815277,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 75,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 7.829819,
+      "median_p99_ms": 10.070927,
+      "succeeded": 73,
+      "offered": 73
+     },
+     "update": {
+      "median_p50_ms": 12.972553000000001,
+      "median_p99_ms": 12.972553000000001,
+      "succeeded": 2,
+      "offered": 2
+     }
+    }
+   },
+   "20": {
+    "reps": 3,
+    "offered": 300,
+    "median_succeeded_rps": 20.0,
+    "median_p50_ms": 6.158611,
+    "median_p95_ms": 9.355667,
+    "median_p99_ms": 10.583716,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 300,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 6.158611,
+      "median_p99_ms": 10.940478,
+      "succeeded": 285,
+      "offered": 285
+     },
+     "update": {
+      "median_p50_ms": 6.757145,
+      "median_p99_ms": 9.945896,
+      "succeeded": 15,
+      "offered": 15
+     }
+    }
+   },
+   "50": {
+    "reps": 3,
+    "offered": 750,
+    "median_succeeded_rps": 50.0,
+    "median_p50_ms": 6.451275,
+    "median_p95_ms": 9.862838,
+    "median_p99_ms": 13.53811,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 750,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 6.400468,
+      "median_p99_ms": 12.541247,
+      "succeeded": 713,
+      "offered": 713
+     },
+     "update": {
+      "median_p50_ms": 8.108016,
+      "median_p99_ms": 13.53811,
+      "succeeded": 37,
+      "offered": 37
+     }
+    }
+   },
+   "100": {
+    "reps": 3,
+    "offered": 1500,
+    "median_succeeded_rps": 99.93678640486198,
+    "median_p50_ms": 5.768989,
+    "median_p95_ms": 10.716335,
+    "median_p99_ms": 14.891201,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 1500,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 5.698439,
+      "median_p99_ms": 17.727662,
+      "succeeded": 1414,
+      "offered": 1414
+     },
+     "update": {
+      "median_p50_ms": 8.078703,
+      "median_p99_ms": 13.413954,
+      "succeeded": 86,
+      "offered": 86
+     }
+    }
+   },
+   "200": {
+    "reps": 3,
+    "offered": 3000,
+    "median_succeeded_rps": 200.0,
+    "median_p50_ms": 5.213209,
+    "median_p95_ms": 10.297425,
+    "median_p99_ms": 14.227345,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 3000,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 5.175527,
+      "median_p99_ms": 14.227345,
+      "succeeded": 2842,
+      "offered": 2842
+     },
+     "update": {
+      "median_p50_ms": 5.903253,
+      "median_p99_ms": 14.291752,
+      "succeeded": 158,
+      "offered": 158
+     }
+    }
+   },
+   "300": {
+    "reps": 3,
+    "offered": 4500,
+    "median_succeeded_rps": 299.86394255342685,
+    "median_p50_ms": 4.69257,
+    "median_p95_ms": 12.881243,
+    "median_p99_ms": 38.697242,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 4500,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 4.618614,
+      "median_p99_ms": 37.204113,
+      "succeeded": 4257,
+      "offered": 4257
+     },
+     "update": {
+      "median_p50_ms": 5.749626,
+      "median_p99_ms": 62.534084,
+      "succeeded": 243,
+      "offered": 243
+     }
+    }
+   },
+   "400": {
+    "reps": 3,
+    "offered": 6000,
+    "median_succeeded_rps": 397.93532672379126,
+    "median_p50_ms": 5.470276,
+    "median_p95_ms": 42.446473,
+    "median_p99_ms": 51.784827,
+    "statuses": {
+     "client_capacity": 13,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 5987,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 5.417192,
+      "median_p99_ms": 51.784827,
+      "succeeded": 5680,
+      "offered": 5691
+     },
+     "update": {
+      "median_p50_ms": 6.653336,
+      "median_p99_ms": 53.082439,
+      "succeeded": 307,
+      "offered": 309
+     }
+    }
+   },
+   "600": {
+    "reps": 3,
+    "offered": 9000,
+    "median_succeeded_rps": 507.18958248371536,
+    "median_p50_ms": 45.858064,
+    "median_p95_ms": 85.105619,
+    "median_p99_ms": 108.154303,
+    "statuses": {
+     "client_capacity": 1361,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 7639,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 45.40457,
+      "median_p99_ms": 108.154303,
+      "succeeded": 7255,
+      "offered": 8538
+     },
+     "update": {
+      "median_p50_ms": 51.900427,
+      "median_p99_ms": 107.606025,
+      "succeeded": 384,
+      "offered": 462
+     }
+    }
+   }
+  }
+ },
+ "verification": {
+  "mode": "one snapshot read after the last measured phase",
+  "phases": 36,
+  "start_unix_ns": 1795344812037012978,
+  "end_unix_ns": 1795344812583118286,
+  "seconds": 0.546105308,
+  "driver_cpu_seconds": 0.35116492799999577,
+  "final_snapshot": {
+   "rows": 5000,
+   "sha256": "47856cd8e9e55ffde3d6a179c266e02ed5b7e2ece0330879a3e1130d4c3762aa",
+   "mismatches": 0,
+   "first_mismatches": [],
+   "read_mismatches": 0,
+   "first_read_mismatches": [],
+   "unresolved_keys": 0,
+   "unresolved_keys_with_new_value": 0,
+   "unobserved_unresolved_values_before_phase": 0,
+   "unobserved_unresolved_values_after_snapshot": 0,
+   "prior_unresolved_values_observed": 0,
+   "first_prior_unresolved_values_observed": [],
+   "source": "snapshot read"
+  }
+ }
+}

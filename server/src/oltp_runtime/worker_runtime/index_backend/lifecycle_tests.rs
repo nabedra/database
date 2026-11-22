@@ -30,7 +30,11 @@ impl IndexBackend for Paused {
     ) -> ResolveFuture<'_, IndexAttempt> {
         self.inner.begin(job, digest, maintenance, fixed_identity)
     }
-    fn commit(&self, attempt: IndexAttempt, plan: MutationPlan) -> ResolveFuture<'_, ()> {
+    fn commit(
+        &self,
+        attempt: IndexAttempt,
+        plan: MutationPlan,
+    ) -> ResolveFuture<'_, IndexCommitOutcome> {
         self.inner.commit(attempt, plan)
     }
     fn source_pin(
@@ -278,9 +282,13 @@ async fn exercise_case(case: &str) {
                 expected_version: None,
                 change: Change::Put(value),
             }];
+            // IDXHOT: a settled durable ABORT is returned as `Aborted`, not `Err`.
             assert!(
-                backend.commit(attempt, plan).await.is_err(),
-                "metadata cleanup authorized a Data mutation"
+                matches!(
+                    backend.commit(attempt, plan).await,
+                    Ok(IndexCommitOutcome::Aborted(_))
+                ),
+                "metadata cleanup must yield a settled abort"
             );
             let status = runtime
                 .services
@@ -411,8 +419,7 @@ async fn exercise_case(case: &str) {
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "run through scripts/acceptance_oltp.py"]
-async fn acceptance_o12() {
+async fn o12_resume_cold_and_tombstone_cleanup() {
     tokio::time::timeout(std::time::Duration::from_secs(240), async {
         for case in ["resume", "cold", "drop"] {
             exercise_case(case).await;
@@ -420,8 +427,4 @@ async fn acceptance_o12() {
     })
     .await
     .expect("index lifecycle watchdog");
-    eprintln!(
-        "NABEDRA_OLTP_ACCEPTANCE {}",
-        serde_json::json!({"scenario":"O12","status":"not-run","reason":"local backfill/resume/cold/drop executed; failure while validation/epoch publication and distributed leader failure remain required"})
-    );
 }

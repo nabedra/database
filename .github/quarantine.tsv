@@ -4,5 +4,3 @@
 # owner: the task or thread that fixes it, assigned by the orchestrator; `unassigned` until then.
 # added/expires: ISO dates. exit_criteria: what lets the row be deleted.
 id	kind	owner	added	expires	exit_criteria
-oltp::pool::tests::c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory	test	unassigned	2026-11-22	2026-12-06	fix with a regression test that failed before it, then 20/20 passes in the quarantine job
-oltp_runtime::replica::tests::o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement	test	unassigned	2026-11-22	2026-12-06	fix with a regression test that failed before it, then 20/20 passes in the quarantine job

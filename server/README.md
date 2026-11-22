@@ -188,6 +188,9 @@ never reverted.
 - While the capability is active, the server refuses incremental backups. Take
   full backups instead.
 
+See [OLTP worker recovery and direct-mode rollback](../docs/oltp-recovery.md)
+for retained-mount restart, lost-volume replacement, and full archive restore.
+
 ### Docker
 
 The Docker build takes the same engine choice. The OLAP image keeps the Python

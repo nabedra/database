@@ -27,6 +27,68 @@ pub(crate) struct Held {
 struct Registry {
     catalogs: HashMap<Uuid, mpsc::UnboundedSender<Held>>,
     txns: HashMap<Uuid, Uuid>,
+    checkpoints: HashMap<(Uuid, Checkpoint), oneshot::Sender<BuildHold>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum Checkpoint {
+    Backfill,
+    Refresh,
+    RefreshAdmissionRefused,
+    RefreshPrepare,
+    Validation,
+    ReadyCommit,
+    ReadPin,
+    Reclaim,
+    QueuedPrepare,
+}
+
+#[derive(Debug)]
+pub(crate) struct PageBuffers {
+    pub rows: usize,
+    pub source_rows: usize,
+    pub page_bytes: usize,
+    pub cursor_bytes: usize,
+    pub exhausted: bool,
+}
+
+pub(crate) struct BuildHold {
+    pub buffers: Option<PageBuffers>,
+    pub release: oneshot::Sender<bool>,
+}
+
+pub(crate) fn register_checkpoint(id: Uuid, stage: Checkpoint) -> oneshot::Receiver<BuildHold> {
+    let (send, receive) = oneshot::channel();
+    registry()
+        .lock()
+        .unwrap()
+        .checkpoints
+        .insert((id, stage), send);
+    receive
+}
+
+pub(crate) async fn checkpoint(
+    id: Uuid,
+    stage: Checkpoint,
+    buffers: impl FnOnce() -> Option<PageBuffers>,
+) -> bool {
+    let send = registry().lock().unwrap().checkpoints.remove(&(id, stage));
+    let Some(send) = send else { return false };
+    let (release, decision) = oneshot::channel();
+    if send
+        .send(BuildHold {
+            buffers: buffers(),
+            release,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    decision.await.unwrap_or(false)
+}
+
+pub(crate) fn unregister_checkpoint(id: Uuid, stage: Checkpoint) {
+    registry().lock().unwrap().checkpoints.remove(&(id, stage));
 }
 
 fn registry() -> &'static Mutex<Registry> {

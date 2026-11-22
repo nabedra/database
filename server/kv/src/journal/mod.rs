@@ -732,6 +732,11 @@ impl Journal {
         })
     }
 
+    pub(crate) fn queued(&self) -> (usize, usize) {
+        let queue = lock(&self.shared.queue);
+        (queue.items.len(), queue.bytes)
+    }
+
     pub fn stats(&self) -> JournalStats {
         let s = &self.shared.stats;
         let get = |c: &AtomicU64| c.load(Ordering::Relaxed);

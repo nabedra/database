@@ -411,7 +411,7 @@ impl QueuePeerClient {
                     return error.into();
                 }
                 match error {
-                    RequestError::OutgoingLaneFull => RequestError::OutgoingLaneFull.into(),
+                    RequestError::OutgoingLaneFull { .. } => error.into(),
                     RequestError::Unreachable => ProtocolError::new(
                         ErrorCode::OutcomeUnknown,
                         "read grant copy acknowledgement unavailable",
@@ -1663,7 +1663,22 @@ impl Endpoint for QueueEndpoint {
             let current = if let QueueRequest::Install { record } = &request {
                 // Preflight authorizes reception. Check the local view before
                 // decoding, then recheck Control immediately before installation.
-                let current = self.replica.lock().map_err(|_| unavailable())?.authority();
+                let local = self.replica.lock().map_err(|_| unavailable())?.authority();
+                let current = if local.view_is_behind(record.ready.view) {
+                    #[cfg(test)]
+                    super::recovery_tests::observe_o21_stale_copy(record.request_id);
+                    // Control published this view before the local membership
+                    // actor installed it. Keep the charged frame and wait
+                    // only for that exact view. An old owner or old frame
+                    // still fails the authoritative checks.
+                    let current = self.check(&session, &request).await?;
+                    wait_for_local_ready_view(&self.replica, current)
+                        .await
+                        .map_err(QueueError::protocol)?;
+                    current
+                } else {
+                    local
+                };
                 if session.remote() != current.owner {
                     return Err(QueueError::Stale.protocol());
                 }
@@ -1932,8 +1947,16 @@ impl Endpoint for QueueEndpoint {
                         .prepare_payload(&session, current, &record, &sections)
                         .await?;
                     #[cfg(test)]
+                    if !record.accepted {
+                        super::recovery_tests::pause("before-staged-copy", record.request_id).await;
+                    }
+                    #[cfg(test)]
                     if record.state.terminal() {
-                        super::recovery_tests::pause("before-terminal-copy", record.request_id).await;
+                        super::recovery_tests::pause("before-terminal-copy", record.request_id)
+                            .await;
+                        if super::recovery_tests::lose_terminal_copy(record.request_id).await {
+                            return Err(unavailable());
+                        }
                     }
                     #[cfg(test)]
                     if record.ready.view.owner_term > 1 {

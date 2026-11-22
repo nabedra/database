@@ -1,0 +1,10 @@
+Test binary SHA256: 5f52a2be91f04778cfe8f15ffe4b1cb8d9ff769d9e5355b51161ae7f8b7a99dd
+oltp live test started: 2026-11-21T11:05:05+00:00
+running 1 test
+test oltp_backup_repository::tests::o19_live_s3_archive_reopens_and_reconciles_exact_retries ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 469 filtered out; finished in 3.55s
+Live test objects: 3, total bytes: 613
+oltp live test finished: 2026-11-21T11:05:23+00:00
+Teardown infrastructure mutations submitted: 0
+Teardown S3 prefix: complete
+Archive prefix teardown finished at 2026-11-21T11:05:35Z

@@ -103,6 +103,7 @@ pub(super) fn prepare(
     if !stamp(authorization, state.policy)
         || operation_id != intent.id
         || intent.validate().is_err()
+        || system_recovery::blocked_enrollment(tx, &intent.next)?
     {
         return fault(Fault::Unauthorized);
     }
@@ -180,6 +181,9 @@ pub(super) fn complete(
     let Some(prepared) = state.restart.as_ref() else {
         return fault(Fault::NotFound);
     };
+    if system_recovery::blocked_enrollment(tx, &intent.next)? {
+        return fault(Fault::Unauthorized);
+    }
     let worker = WorkerIdentity::from(&intent.next);
     if &prepared.intent != intent
         || prepared.enrolled

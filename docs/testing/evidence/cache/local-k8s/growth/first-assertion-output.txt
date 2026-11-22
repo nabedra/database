@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "/source/scripts/local-kind/cache_lifecycle.py", line 260, in <module>
+    main()
+  File "/source/scripts/local-kind/cache_lifecycle.py", line 256, in main
+    repeated_growth_under_load(fleet, args.output, keys, values)
+  File "/source/scripts/local-kind/cache_lifecycle.py", line 224, in repeated_growth_under_load
+    assert during and all(during), (count, len(during), failures)
+           ^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (6, 101, [])

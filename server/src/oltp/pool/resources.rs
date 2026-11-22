@@ -24,6 +24,8 @@ const GROUP_HANDLE_BYTES: usize = 64 << 10;
 const GROUP_ENDPOINT_BYTES: usize = 64 << 10;
 pub(crate) const RAFT_REPLICA_BYTES: usize = 8 << 20;
 
+pub(crate) const DEFAULT_REPLY_DECODE_BYTES: usize = 1 << 20;
+
 #[derive(Clone, Copy, Debug)]
 pub struct SharedResourceConfig {
     pub query_threads: usize,
@@ -58,7 +60,7 @@ impl Default for SharedResourceConfig {
             apply_bytes_per_slot: 65 << 20,
             query_reply_bytes: 8 << 20,
             control_reply_bytes: 1 << 20,
-            reply_decode_bytes: 1 << 20,
+            reply_decode_bytes: DEFAULT_REPLY_DECODE_BYTES,
             data_apply_reply_bytes: 1 << 20,
             max_open_pools: 8,
             max_group_handles: 128,
@@ -88,6 +90,8 @@ pub struct WorkerSharedResources {
     native_jobs: [AtomicU64; 2],
     task_memory_limit_bytes: usize,
     decode_bytes: Arc<AtomicUsize>,
+    #[cfg(test)]
+    peak_decode_bytes: AtomicUsize,
     thread_budget: super::super::NativeThreadBudget,
     pub(crate) read_attempts: crate::oltp_replication::service_rpc::ReadAttempts,
     read_replica: OnceLock<Weak<Mutex<crate::oltp_runtime::replica::WorkerReplica>>>,
@@ -106,8 +110,7 @@ pub struct WorkerSharedResources {
     reply_apply: Arc<ByteArena>,
     queue_claim: Arc<AtomicBool>,
     _native_charge: MemoryCharge,
-    leases: Mutex<LeaseState>,
-    settled: Notify,
+    leases: Arc<NativeLeases>,
 }
 
 pub(crate) struct GroupCapacityLease {
@@ -236,6 +239,8 @@ impl WorkerSharedResources {
             native_jobs: Default::default(),
             task_memory_limit_bytes: limits.task_memory_limit_bytes as usize,
             decode_bytes: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            peak_decode_bytes: AtomicUsize::new(0),
             thread_budget,
             read_attempts: Default::default(),
             read_replica: OnceLock::new(),
@@ -254,11 +259,7 @@ impl WorkerSharedResources {
             reply_apply,
             queue_claim: Arc::new(AtomicBool::new(false)),
             _native_charge: native_charge,
-            leases: Mutex::new(LeaseState {
-                closed: false,
-                count: 0,
-            }),
-            settled: Notify::new(),
+            leases: Arc::new(NativeLeases::default()),
         });
         let weak = Arc::downgrade(&owner);
         let _ = owner.weak_self.set(weak.clone());
@@ -345,7 +346,7 @@ impl WorkerSharedResources {
     /// The one physical queue owner contains every database scope under shared
     /// count/byte/result ceilings. A scoped wrapper must not create another owner.
     pub fn claim_queue(self: &Arc<Self>) -> Result<QueueLease, ProtocolError> {
-        if self.worker_id().is_none() || self.leases.lock().map_err(|_| capacity())?.closed {
+        if self.worker_id().is_none() || self.leases.state.lock().map_err(|_| capacity())?.closed {
             return Err(capacity());
         }
         self.queue_claim
@@ -513,7 +514,7 @@ impl WorkerSharedResources {
                 let charge = self
                     .scheduler
                     .charge_memory(self.scheduler_node_id, bytes as u64)?;
-                self.decode_bytes.fetch_add(bytes, Ordering::AcqRel);
+                self.account_decode(bytes);
                 ScratchBacking::Working {
                     charge: Mutex::new(charge),
                     counter: self.decode_bytes.clone(),
@@ -545,6 +546,26 @@ impl WorkerSharedResources {
             backing: ScratchBacking::Combined([current, extra]),
         }))
     }
+    fn account_decode(&self, bytes: usize) {
+        let previous = self.decode_bytes.fetch_add(bytes, Ordering::AcqRel);
+        #[cfg(test)]
+        self.peak_decode_bytes
+            .fetch_max(previous + bytes, Ordering::Relaxed);
+        #[cfg(not(test))]
+        let _ = previous;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_working_decode_peak(&self) {
+        self.peak_decode_bytes
+            .swap(self.working_decode_bytes(), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak_working_decode_bytes(&self) -> usize {
+        self.peak_decode_bytes.load(Ordering::Relaxed)
+    }
+
     pub fn working_decode_bytes(&self) -> usize {
         self.decode_bytes.load(Ordering::Acquire)
     }
@@ -658,7 +679,7 @@ impl WorkerSharedResources {
                     .scheduler
                     .reserve_memory(request, self.scheduler_node_id, bytes as u64)
                     .await?;
-                self.decode_bytes.fetch_add(bytes, Ordering::AcqRel);
+                self.account_decode(bytes);
                 Ok(ScratchLease {
                     backing: ScratchBacking::Working {
                         charge: Mutex::new(charge),
@@ -726,6 +747,9 @@ impl WorkerSharedResources {
     pub(crate) fn storage_stats(&self) -> super::StorageStats {
         self.storage.stats()
     }
+    pub(crate) fn storage_reservations(&self) -> Vec<super::disk::DiskReservationStats> {
+        self.storage.disk_stats()
+    }
     pub(crate) fn resident_group_usage(&self) -> (usize, usize) {
         let limit = self.config.max_resident_groups;
         let free = self
@@ -762,15 +786,16 @@ impl WorkerSharedResources {
         class: ExecutionClass,
     ) -> Result<PreparedNative, ProtocolError> {
         {
-            let mut state = self.leases.lock().map_err(|_| capacity())?;
+            let mut state = self.leases.state.lock().map_err(|_| capacity())?;
             if state.closed {
                 return Err(capacity());
             }
             state.count += 1;
         }
         let mut lease = NativeLease {
+            permit: None,
             owner: self.clone(),
-            _permit: None,
+            settlement: NativeSettlement(self.leases.clone()),
         };
         #[cfg(test)]
         self.native_jobs[class as usize].fetch_add(1, Ordering::Relaxed);
@@ -784,7 +809,7 @@ impl WorkerSharedResources {
             .acquire_owned()
             .await
             .map_err(|_| capacity())?;
-        lease._permit = Some(permit);
+        lease.permit = Some(permit);
         Ok(PreparedNative { class, lease })
     }
     /// Native jobs prepared so far in `class`.
@@ -792,11 +817,12 @@ impl WorkerSharedResources {
     pub(crate) fn native_jobs(&self, class: ExecutionClass) -> u64 {
         self.native_jobs[class as usize].load(Ordering::Relaxed)
     }
-    /// Close admission and join every prepared or dispatched native lease.
-    /// Callers must release their own prepared work before awaiting this drain.
+    /// Close admission and wait for prepared and dispatched native work.
+    /// A dispatched job settles after it returns its guards to a live caller
+    /// or drops them after cancellation. Callers must release their own guards.
     pub async fn drain(&self) {
         {
-            let mut state = self.leases.lock().expect("native lease state");
+            let mut state = self.leases.state.lock().expect("native lease state");
             state.closed = true;
             self.query.slots.close();
             self.control.slots.close();
@@ -806,8 +832,8 @@ impl WorkerSharedResources {
             self.reply_apply.close();
         }
         loop {
-            let notified = self.settled.notified();
-            if self.leases.lock().expect("native lease state").count == 0 {
+            let notified = self.leases.settled.notified();
+            if self.leases.state.lock().expect("native lease state").count == 0 {
                 return;
             }
             notified.await;
@@ -927,20 +953,27 @@ impl Drop for ScratchLease {
     }
 }
 
+#[derive(Default)]
+struct NativeLeases {
+    state: Mutex<LeaseState>,
+    settled: Notify,
+}
+#[derive(Default)]
 struct LeaseState {
     closed: bool,
     count: usize,
 }
 struct NativeLease {
+    permit: Option<OwnedSemaphorePermit>,
     owner: Arc<WorkerSharedResources>,
-    _permit: Option<OwnedSemaphorePermit>,
+    settlement: NativeSettlement,
 }
-impl Drop for NativeLease {
+/// Tracks job settlement without keeping the worker or its executor alive.
+struct NativeSettlement(Arc<NativeLeases>);
+impl Drop for NativeSettlement {
     fn drop(&mut self) {
-        // Drop physical capacity before notifying an awaiting drain.
-        self._permit.take();
-        self.owner.leases.lock().expect("native lease state").count -= 1;
-        self.owner.settled.notify_waiters();
+        self.0.state.lock().expect("native lease state").count -= 1;
+        self.0.settled.notify_waiters();
     }
 }
 pub struct NativeComputeGuard {
@@ -1036,17 +1069,28 @@ impl PreparedNative {
             ExecutionClass::Control => &owner.control,
         };
         let (tx, rx) = oneshot::channel();
+        let job = (guard, work, self.lease);
         executor.send(Box::new(move || {
-            let lease = self.lease;
+            let (guard, work, lease) = job;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
                 .unwrap_or_else(|_| Err(super::super::recovery_unknown()));
             // Release the slot and the worker owner before the caller can see
             // the result: a caller that then drops its last owner must find the
             // worker unbound, or a reopen is refused (C02, CIfix1).
-            drop(lease);
-            let _ = tx.send((result, guard));
+            let NativeLease {
+                permit,
+                owner,
+                settlement,
+            } = lease;
+            drop(permit);
+            drop(owner);
+            // Keep the job tracked until receipt or until the undelivered
+            // result and guard have both dropped.
+            let _ = tx.send((result, guard, settlement));
         }))?;
-        rx.await.map_err(|_| super::super::recovery_unknown())
+        let (result, guard, _settlement) =
+            rx.await.map_err(|_| super::super::recovery_unknown())?;
+        Ok((result, guard))
     }
 }
 

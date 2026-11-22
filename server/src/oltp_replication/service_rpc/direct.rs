@@ -317,7 +317,7 @@ pub(super) fn allowed(header: &super::Header) -> bool {
 }
 
 pub(super) async fn authorize(
-    control: &crate::oltp_replication::authority::control::ControlClient,
+    control: &Arc<crate::oltp_replication::authority::control::ControlClient>,
     session: &super::AuthenticatedSession,
     header: &super::Header,
 ) -> Result<(), ProtocolError> {
@@ -329,18 +329,43 @@ pub(super) async fn authorize(
         cluster_id: session.group().cluster_id,
         database: session.group().database.clone(),
     };
-    let target = control.control_group().clone();
+    let control_group = control.control_group();
     // Cached like the stable roles (T6 concern 4): one Control read per
-    // API process per `GRANT_TTL`, not per request.
-    let key = super::GrantKey::direct_ingress(session.remote(), &target);
+    // API process per `GRANT_TTL`, not per request. Kept warm while the API
+    // sends direct requests (RD2), so an idle API's next request does not
+    // wait for a Control read. AZ2: ask for the Data group first; previous
+    // Control builds only accept the Control group as the ApiIngress target.
+    let key = super::GrantKey::direct_ingress(session.remote(), control_group);
+    let target = session.group().clone();
     control
         .service_grants()
-        .role(key, control.applied_revision(), || async {
-            control
-                .service_role(&scope, session.remote(), header.action, target.clone())
-                .await
-                .map(Some)
-        })
+        .role_warm(
+            key,
+            control.applied_revision(),
+            || async {
+                let caller = session.remote();
+                match control
+                    .service_role(&scope, caller, header.action, target.clone())
+                    .await
+                {
+                    Err(error) if error.code == ErrorCode::Unauthorized => control
+                        .service_role(&scope, caller, header.action, control_group.clone())
+                        .await
+                        .map(Some),
+                    grant => grant.map(Some),
+                }
+            },
+            || {
+                super::warm_role_or(
+                    control,
+                    scope.clone(),
+                    session.remote(),
+                    header.action,
+                    target.clone(),
+                    control_group.clone(),
+                )
+            },
+        )
         .await
 }
 
@@ -361,11 +386,21 @@ pub(super) async fn serve(
         Some(service) if forward => service.forward(handle, request).await?,
         Some(service) => service.execute(handle, request).await?,
     };
-    handle.resources().encode_in(
-        crate::oltp::pool::ByteClass::Data,
-        &response,
-        crate::protocol::MAX_BODY_BYTES,
-    )
+    handle
+        .resources()
+        .encode_in(
+            crate::oltp::pool::ByteClass::Data,
+            &response,
+            crate::protocol::MAX_BODY_BYTES,
+        )
+        .map_err(|error| match response {
+            DirectResponse::Done(_)
+            | DirectResponse::Failed(ProtocolError {
+                outcome: Outcome::Unknown,
+                ..
+            }) => super::mutation_uncertain(error),
+            _ => error,
+        })
 }
 
 /// Why a gateway's send produced no `DirectResponse`.
@@ -415,18 +450,12 @@ impl DirectLink {
         request: &DirectRequest,
         forward: bool,
     ) -> Result<DirectResponse, DirectSendError> {
-        use super::{CallError, Method, RequestError, RequestTarget};
+        use super::{CallError, Method, Outgoing, RequestError, RequestTarget};
         if request.group != self.client.group.group_id
             || request.database != self.client.group.database
         {
             return Err(DirectSendError::NotApplied(invalid_request()));
         }
-        let header = request.header();
-        let method = if forward {
-            Method::DirectForward(header)
-        } else {
-            Method::Direct(header)
-        };
         let by_outcome = |error: ProtocolError| {
             if error.outcome == Outcome::NotApplied {
                 DirectSendError::NotApplied(error)
@@ -434,17 +463,55 @@ impl DirectLink {
                 DirectSendError::Uncertain(error)
             }
         };
-        let payload = Some(request.body.clone());
         let _timer = crate::oltp_runtime::stage_timing::perf_stage!("gw.direct.send").timer();
+        // PERF1: wait for a slot on the leader's lane instead of refusing a
+        // request that finds it full. The lane keeps its bound (the leader's
+        // handler slots); requests over it queue here, in arrival order, for
+        // at most the request's own deadline, which the gateway set below its
+        // deadline. Nothing is written while waiting, so a timeout stays
+        // `not_applied`, and the leader gets only the time left. RD3: a
+        // leader whose session negotiated direct admission takes up to
+        // `direct_handler_slots` (its executor's in-flight bound) at once.
+        let start = tokio::time::Instant::now();
+        let reservation = {
+            let _timer =
+                crate::oltp_runtime::stage_timing::perf_stage!("gw.direct.lane_wait").timer();
+            self.client
+                .transport
+                .reserve_outgoing(
+                    &self.client.group,
+                    worker,
+                    super::Purpose::ApiIngress,
+                    start + request.deadline,
+                )
+                .await
+        };
+        // Only local refusals come from here: a full lane, or a charge.
+        let reservation = reservation.map_err(|error| by_outcome(error.into()))?;
+        let mut header = request.header();
+        let left = request.deadline.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            return Err(DirectSendError::NotApplied(
+                reservation.deadline_refusal().into(),
+            ));
+        }
+        header.deadline_ms = u32::try_from(left.as_millis()).unwrap_or(u32::MAX).max(1);
+        let method = if forward {
+            Method::DirectForward(header)
+        } else {
+            Method::Direct(header)
+        };
+        let payload = Some(request.body.clone());
         match self
             .client
-            .call_member_at(
+            .call_member_with_outgoing(
                 self.client.action,
                 method,
                 &payload,
                 node,
                 RequestTarget::WorkerId(worker),
                 None,
+                Outgoing::Reserved(reservation),
             )
             .await
         {
@@ -458,9 +525,9 @@ impl DirectLink {
             // Local failures before sending keep `not_applied`; those after
             // the leader answered carry an unknown outcome.
             Err(CallError::Local(error)) => Err(by_outcome(error)),
-            Err(CallError::Transport(RequestError::OutgoingLaneFull)) => Err(
-                DirectSendError::NotApplied(RequestError::OutgoingLaneFull.into()),
-            ),
+            Err(CallError::Transport(error @ RequestError::OutgoingLaneFull { .. })) => {
+                Err(DirectSendError::NotApplied(error.into()))
+            }
             Err(CallError::Transport(
                 RequestError::Protocol(error) | RequestError::PeerRejected { error, .. },
             )) => Err(by_outcome(error)),

@@ -1,0 +1,85 @@
+{
+ "run": "serial-scylla-1",
+ "settings": {
+  "rates": [
+   0.2
+  ],
+  "seconds": 5.0,
+  "warmup_seconds": 5.0,
+  "repetitions": 10,
+  "clients": 1,
+  "rows": 2000,
+  "seed": 20261118,
+  "timeout": 10.0,
+  "operation": "update",
+  "read_fraction": 0.95,
+  "stop_p99_ms": null,
+  "stop_on_rejection": false,
+  "snapshot_between_phases": false
+ },
+ "workload": "existing bigint primary-key updates to a bigint value",
+ "started_utc": "2026-11-22T09:59:09.663593+00:00",
+ "error": null,
+ "correctness_verified": true,
+ "metadata": {
+  "engine": "ScyllaDB",
+  "engine_version": "6.2.3-0.20250119.bff9ddde1283",
+  "consistency": "QUORUM",
+  "commitlog_sync_by_node": {
+   "172.20.0.2": "batch",
+   "172.20.0.4": "batch",
+   "172.20.0.3": "batch"
+  },
+  "measurement": "persistent native CQL, prepared UPDATE and SELECT at QUORUM, no application retries",
+  "driver_version": "3.29.13"
+ },
+ "summary": {
+  "run": "serial-scylla-1",
+  "error": null,
+  "correctness_verified": true,
+  "stopped_after_rate": null,
+  "stop_reason": null,
+  "rates": {
+   "0.2": {
+    "reps": 10,
+    "offered": 10,
+    "median_succeeded_rps": 0.2,
+    "median_p50_ms": 8.526574499999999,
+    "median_p95_ms": 8.526574499999999,
+    "median_p99_ms": 8.526574499999999,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 10,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   }
+  }
+ },
+ "verification": {
+  "mode": "one snapshot read after the last measured phase",
+  "phases": 11,
+  "start_unix_ns": 1795341607792811407,
+  "end_unix_ns": 1795341607854883829,
+  "seconds": 0.062072422,
+  "driver_cpu_seconds": 0.04779596600000002,
+  "final_snapshot": {
+   "rows": 2000,
+   "sha256": "0c35487fc52072d11bfc3a99b290b9707bc6fa9797ff2e5f8a03de7553fe3e44",
+   "mismatches": 0,
+   "first_mismatches": [],
+   "read_mismatches": 0,
+   "first_read_mismatches": [],
+   "unresolved_keys": 0,
+   "unresolved_keys_with_new_value": 0,
+   "unobserved_unresolved_values_before_phase": 0,
+   "unobserved_unresolved_values_after_snapshot": 0,
+   "prior_unresolved_values_observed": 0,
+   "first_prior_unresolved_values_observed": [],
+   "source": "snapshot read"
+  }
+ }
+}

@@ -1,0 +1,4 @@
+soak100-before rc=0 seconds=335 load=1.83 1.00 0.47
+soak100-after rc=0 seconds=330 load=1.17 1.24 0.75
+soak50-before rc=0 seconds=339 load=0.96 0.83 0.41
+soak50-after rc=0 seconds=334 load=1.49 1.02 0.62

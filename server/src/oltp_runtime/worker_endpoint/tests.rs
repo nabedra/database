@@ -348,7 +348,8 @@ async fn c07_f03_o23_read_grant_copy_keeps_transport_outcomes_distinct() {
         .client
         .hold_outgoing_for_test(TrafficClass::QueueControl);
     let refused = copy().await.unwrap_err();
-    assert_eq!(refused, ProtocolError::from(RequestError::OutgoingLaneFull));
+    assert_eq!(refused.code, ErrorCode::Overloaded);
+    assert_eq!(refused.message, "worker outgoing lane full (QueueControl)");
     assert_eq!(refused.outcome, Outcome::NotApplied);
     assert_eq!(fixture.authority.0.load(Ordering::Relaxed), 0);
     drop(full);
@@ -387,6 +388,216 @@ fn m02_nested_raw_predicate_bytes_are_charged_without_a_wide_row_multiplier() {
     let deep_bound = request_raw_clone_bytes(deep.as_bytes()).unwrap();
     assert!(deep_bound >= text.len() * crate::protocol::MAX_PREDICATE_DEPTH);
     assert!(deep_bound < 40 * deep.len());
+}
+
+#[tokio::test]
+async fn o16_r02_r03_queued_get_copy_waits_for_receiver_membership() {
+    use sha2::{Digest as _, Sha256};
+
+    let resources = |node| {
+        WorkerSharedResources::new(
+            node,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap()
+    };
+    let shared = resources(92);
+    let worker_base = Uuid::new_v4().as_u128() & !0xff;
+    let worker = |id: u128| WorkerIdentity {
+        worker_id: Uuid::from_u128(worker_base + id),
+        incarnation: Uuid::new_v4(),
+        certificate_sha256: Digest::from_bytes([id as u8; 32]),
+        enrollment_revision: 1,
+    };
+    let [owner, follower, removed] = [worker(1), worker(2), worker(3)];
+    let scope = QueueScope {
+        cluster_id: Uuid::new_v4(),
+        database: Text::try_from("default").unwrap(),
+    };
+    let run_id = Uuid::new_v4();
+    let authority = |membership_revision, members: &[WorkerIdentity]| {
+        let mut root = ReadySetHasher::default();
+        for member in members {
+            root.push(*member).unwrap();
+        }
+        QueueAuthority {
+            ready: ReadyMembership {
+                view: AuthorityView {
+                    run_id,
+                    owner_term: 2,
+                    membership_revision,
+                },
+                ready_root: root.finish(),
+                ready_count: root.count(),
+            },
+            owner,
+        }
+    };
+    let previous_members = [owner, follower, removed];
+    let members = [owner, follower];
+    let previous = authority(3, &previous_members);
+    let current = authority(4, &members);
+    let limits = QueueLimits {
+        max_pending_requests: 4,
+        max_queue_bytes_per_replica: 1 << 20,
+        max_retained_result_bytes_per_worker: 1 << 20,
+        result_retention_ms: 300_000,
+    };
+    let mut sender = WorkerReplica::new(
+        resources(91),
+        scope.clone(),
+        owner,
+        current,
+        members,
+        limits,
+    )
+    .unwrap();
+    let receiver = Arc::new(Mutex::new(
+        WorkerReplica::new(
+            shared.clone(),
+            scope.clone(),
+            follower,
+            previous,
+            previous_members,
+            limits,
+        )
+        .unwrap(),
+    ));
+    let endpoint = QueueEndpoint::new(
+        receiver.clone(),
+        shared.clone(),
+        scope.clone(),
+        Arc::new(BlockFirstAuthority {
+            current,
+            first: AtomicBool::new(false),
+            entered: Notify::new(),
+            release: Notify::new(),
+        }),
+        128 << 20,
+    )
+    .unwrap();
+    let group = GroupIdentity {
+        cluster_id: scope.cluster_id,
+        database: scope.database.clone(),
+        group_id: Uuid::new_v4(),
+        kind: GroupKind::Control,
+        group_format_version: GROUP_FORMAT_VERSION,
+    };
+    let id = Uuid::new_v4();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "request_id": id, "operation": "table.get",
+        "payload": {"table_id": Uuid::new_v4(), "key": 9}
+    }))
+    .unwrap();
+    let context = AcceptedContext {
+        authorization: OriginalAuthorization {
+            database: scope.database.clone(),
+            principal: Digest::from_bytes([2; 32]),
+            policy_revision: 1,
+            ingress_id: Uuid::new_v4(),
+            ingress_incarnation: Uuid::new_v4(),
+            credential_expires_at_ms: None,
+        },
+        read: Some(QueueReadToken {
+            identity: PinIdentity {
+                run_id,
+                request_id: id,
+                digest: Digest::from_bytes(Sha256::digest(&body).into()),
+                nonce: Uuid::new_v4(),
+            },
+            storage_pin: StoragePin {
+                pin_id: Uuid::new_v4(),
+                read_ts: Timestamp::new(1).unwrap(),
+                allocator_epoch: 1,
+            },
+            catalog_root: Digest::from_bytes([3; 32]),
+            schema_epoch: 1,
+            routing_epoch: 1,
+        }),
+    };
+    let frame = sender
+        .propose(current, body.clone(), context.clone(), 1)
+        .unwrap();
+    let session = || {
+        AuthenticatedSession::for_test(
+            follower,
+            owner,
+            group.clone(),
+            Purpose::QueueData,
+            Uuid::new_v4(),
+        )
+    };
+    let header = |record| {
+        shared
+            .encode(&QueueRequest::Install { record }, MAX_RECORD_HEADER_BYTES)
+            .unwrap()
+    };
+    let sections =
+        || ChargedSections::for_test(&shared, ByteClass::Data, frame.sections.clone(), 0).unwrap();
+    let record = frame.decode_header().unwrap();
+    let install = header(record.clone());
+
+    let plan = endpoint
+        .preflight(&session(), install.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(plan.section_lengths, record.section_lengths);
+    let Err(error) = endpoint
+        .handle(session(), install.clone(), sections())
+        .await
+    else {
+        panic!("receiver acknowledged a copy before applying the ready set");
+    };
+    assert_eq!(
+        (error.status_code(), error.code, error.outcome),
+        (503, ErrorCode::StorageUnavailable, Outcome::Unknown),
+        "{error}"
+    );
+    {
+        let mut receiver = receiver.lock().unwrap();
+        assert!(receiver.record(id).is_none());
+        receiver
+            .fenced_takeover(previous, current, members)
+            .unwrap();
+    }
+
+    let reply = endpoint
+        .handle(session(), install, sections())
+        .await
+        .unwrap();
+    let QueueReply::Installed {
+        worker,
+        record: version,
+        ..
+    } = serde_json::from_slice(reply.header.as_ref()).unwrap()
+    else {
+        panic!("expected an installation acknowledgement");
+    };
+    assert_eq!(worker, follower);
+    assert_eq!(version, frame.record_version().unwrap());
+    {
+        let receiver = receiver.lock().unwrap();
+        let installed = receiver.record(id).unwrap();
+        assert_eq!(installed.run_id, run_id);
+        assert_eq!(installed.body, body);
+        assert_eq!(
+            installed.pinned_catalog.as_deref(),
+            Some(serde_json::to_vec(&context).unwrap().as_slice())
+        );
+        assert!(!installed.accepted);
+    }
+
+    let mut malformed = record;
+    malformed.sequence = 0;
+    let error = endpoint
+        .preflight(&session(), header(malformed).as_ref())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (error.status_code(), error.code, error.outcome),
+        (400, ErrorCode::ValidationError, Outcome::NotApplied)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

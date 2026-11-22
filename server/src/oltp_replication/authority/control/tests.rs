@@ -37,6 +37,61 @@ mod group_damage;
 mod growth;
 mod pool_drain;
 mod restart;
+mod system_recovery;
+
+async fn apply_to(
+    machine: &ControlMachine,
+    position: AppliedPosition,
+    command: ControlCommand,
+) -> ControlReply {
+    let digest = serialized_digest(&command).unwrap();
+    let command =
+        OwnedCommand::new_owned(command, machine.store().resources(), ByteClass::Progress).unwrap();
+    let bytes = machine
+        .apply(
+            ApplyMeta {
+                position,
+                command_digest: digest,
+                membership: None,
+            },
+            command,
+        )
+        .await
+        .unwrap();
+    decode(bytes.as_ref()).unwrap()
+}
+
+/// Every key and value of a Control replica's applied state, in key order.
+async fn control_dump(machine: &ControlMachine) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    loop {
+        let mut cursor = out.last().map(|(key, _)| key.clone());
+        if let Some(cursor) = cursor.as_mut() {
+            cursor.push(0);
+        }
+        let raw = machine
+            .store()
+            .read(BUDGET, move |view| {
+                let mut page = Vec::new();
+                let mut cursor = cursor.unwrap_or_default();
+                while page.len() < 32
+                    && let Some(record) = view.first_from(&[], &cursor)?
+                {
+                    page.push((record.key().to_vec(), record.value().to_vec()));
+                    cursor = record.key().to_vec();
+                    cursor.push(0);
+                }
+                view.encode(&page)
+            })
+            .await
+            .unwrap();
+        let page: Vec<(Vec<u8>, Vec<u8>)> = serde_json::from_slice(raw.as_ref()).unwrap();
+        if page.is_empty() {
+            return out;
+        }
+        out.extend(page);
+    }
+}
 
 struct Directory(PathBuf);
 impl Directory {
@@ -55,6 +110,9 @@ struct Fixture {
     machine: ControlMachine,
     next: u64,
     base: u128,
+    /// GC2 mixed-version tests: a pre-feature Control replica that applies
+    /// every entry too. Each apply asserts the same reply and state.
+    mirror: Option<ControlMachine>,
 }
 impl Fixture {
     async fn open(directory: &Directory, scope: GroupIdentity, pool: PoolIdentity) -> Self {
@@ -75,7 +133,32 @@ impl Fixture {
             machine: ControlMachine::new(store).unwrap(),
             next,
             base: (Uuid::new_v4().as_u128() >> 64) << 64,
+            mirror: None,
         }
+    }
+    /// GC2: from now on every entry is also applied by a fresh Control
+    /// replica of the pre-feature build in `directory`. It must be opened
+    /// before the first entry.
+    async fn mirror_legacy(
+        &mut self,
+        directory: &Directory,
+        scope: GroupIdentity,
+        pool: PoolIdentity,
+    ) {
+        assert_eq!(self.next, 0, "the mirror replays the whole log");
+        let shared = WorkerSharedResources::new(
+            1,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        // Another worker's replica: its own worker and pool identity.
+        let mut pool = pool;
+        pool.worker_id = Uuid::new_v4();
+        pool.pool_id = Uuid::new_v4();
+        let pool = OltpPool::open_development(&directory.0, pool, shared).unwrap();
+        let store = pool.group(scope).await.unwrap();
+        self.mirror = Some(ControlMachine::new(store).unwrap().legacy_v1_for_test());
     }
     async fn apply(&mut self, command: ControlCommand) -> ControlReply {
         let position = AppliedPosition {
@@ -84,26 +167,20 @@ impl Fixture {
             index: self.next,
         };
         self.next += 1;
-        let digest = serialized_digest(&command).unwrap();
-        let command = OwnedCommand::new_owned(
-            command,
-            self.machine.store().resources(),
-            ByteClass::Progress,
-        )
-        .unwrap();
-        let bytes = self
-            .machine
-            .apply(
-                ApplyMeta {
-                    position,
-                    command_digest: digest,
-                    membership: None,
-                },
-                command,
-            )
-            .await
-            .unwrap();
-        decode(bytes.as_ref()).unwrap()
+        let reply = apply_to(&self.machine, position, command.clone()).await;
+        if let Some(mirror) = &self.mirror {
+            assert_eq!(
+                apply_to(mirror, position, command).await,
+                reply,
+                "a pre-feature Control replica answered differently"
+            );
+            assert!(
+                control_dump(mirror).await == control_dump(&self.machine).await,
+                "a pre-feature Control replica diverged at index {}",
+                position.index
+            );
+        }
+        reply
     }
     async fn state(&self) -> State {
         let bytes = self

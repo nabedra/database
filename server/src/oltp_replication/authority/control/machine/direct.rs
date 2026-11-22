@@ -5,7 +5,8 @@
 //! did not advertise cannot become a voter or learner of any group.
 use super::*;
 use crate::oltp_replication::authority::control::direct::{
-    DIRECT_VERSION, DirectActivation, DirectCapability, DirectCapabilityOperation,
+    CLUSTER_FEATURES, ClusterFeature, DIRECT_VERSION, DirectActivation, DirectCapability,
+    DirectCapabilityOperation, FeatureActivation, feature_operation_id,
 };
 
 const ACTIVATION: &[u8] = b"ct/direct-capability";
@@ -13,6 +14,37 @@ const READERS: &[u8] = b"ct/direct-reader/";
 /// Present once a queue owner reserved an eligible mutation unsettled while
 /// the capability was inactive (T7c). Never deleted.
 const QUEUED_HISTORY: &[u8] = b"ct/direct-queued-history";
+/// GC2: `data.direct.batch` is enabled (a `FeatureActivation`). Written only
+/// by a feature-aware build, never deleted.
+const BATCH_ENABLED: &[u8] = CLUSTER_FEATURES[0].enabled_key;
+pub(in crate::oltp_replication::authority::control) const SNAPSHOT_RETRY_ENABLED: &[u8] =
+    CLUSTER_FEATURES[1].enabled_key;
+
+pub(in crate::oltp_replication::authority::control) fn batch_key() -> &'static [u8] {
+    BATCH_ENABLED
+}
+
+// Mixed-version tests (GC2, CAP1): a Control replica of an older build,
+// simulated by knowing only the first `KNOWN_FEATURES` registry entries (0:
+// the build before cluster features; 2: the build before
+// `data.index.reclaim`). Set by `ControlMachine::apply` around one apply on
+// the native thread that runs it.
+#[cfg(test)]
+thread_local! {
+    pub(super) static KNOWN_FEATURES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(CLUSTER_FEATURES.len()) };
+}
+/// The registered features this build applies.
+#[cfg(test)]
+fn registry() -> &'static [ClusterFeature] {
+    &CLUSTER_FEATURES[..KNOWN_FEATURES
+        .with(std::cell::Cell::get)
+        .min(CLUSTER_FEATURES.len())]
+}
+#[cfg(not(test))]
+fn registry() -> &'static [ClusterFeature] {
+    &CLUSTER_FEATURES
+}
 
 pub(in crate::oltp_replication::authority::control) fn activation_key() -> &'static [u8] {
     ACTIVATION
@@ -27,6 +59,7 @@ pub(super) fn apply(
     tx: &mut GroupTransaction<'_>,
     state: &State,
     position: AppliedPosition,
+    operation_id: Uuid,
     actor: WorkerIdentity,
     action: &DirectCapabilityOperation,
     unix_ms: u64,
@@ -73,6 +106,23 @@ pub(super) fn apply(
             None
         }
     };
+    // GC2: the reply and every write above are what a pre-feature build
+    // produces for this entry. A feature-aware build may add only the
+    // enablement, and only when every enrolled worker advertised it.
+    if activation.is_some() {
+        for &feature in registry() {
+            let advert = matches!(action, DirectCapabilityOperation::Advertise { .. })
+                && operation_id == feature_operation_id(feature.name, actor);
+            maybe_enable(
+                tx,
+                state,
+                position,
+                feature.name,
+                feature.enabled_key,
+                advert.then_some(actor),
+            )?;
+        }
+    }
     Ok(ControlReply::DirectCapability(DirectCapability {
         version: DIRECT_VERSION,
         activation,
@@ -98,14 +148,39 @@ pub(super) fn active(tx: &mut GroupTransaction<'_>) -> Result<bool, ProtocolErro
     Ok(tx.get(ACTIVATION)?.is_some())
 }
 
+/// Whether `worker`'s exact identity advertised `feature`: the receipt of
+/// its derived advert operation holds a `DirectCapability` reply.
+pub(in crate::oltp_replication::authority::control) fn supports_feature(
+    tx: &mut GroupTransaction<'_>,
+    feature: &str,
+    worker: WorkerIdentity,
+) -> Result<bool, ProtocolError> {
+    let receipt = key(b"ct/op/", feature_operation_id(feature, worker));
+    Ok(load::<super::Receipt>(tx, &receipt)?
+        .is_some_and(|receipt| matches!(receipt.reply, ControlReply::DirectCapability(_))))
+}
+
+fn features_admit(
+    tx: &mut GroupTransaction<'_>,
+    worker: WorkerIdentity,
+) -> Result<bool, ProtocolError> {
+    for feature in registry() {
+        if tx.get(feature.enabled_key)?.is_some() && !supports_feature(tx, feature.name, worker)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// After activation, only a worker that advertised its current identity may
 /// join a group or the ready set: an older build cannot decode direct
-/// entries. Before activation everyone may join.
+/// entries. Before activation everyone may join. The same holds for every
+/// enabled cluster feature (GC2).
 pub(super) fn admits(
     tx: &mut GroupTransaction<'_>,
     worker: WorkerIdentity,
 ) -> Result<bool, ProtocolError> {
-    Ok(!active(tx)? || supports(tx, worker)?)
+    Ok((!active(tx)? || supports(tx, worker)?) && features_admit(tx, worker)?)
 }
 
 /// `admits` for a replica named only by its worker id: the enrolled
@@ -120,7 +195,8 @@ pub(super) fn admits_worker_id(
     let Some(record) = load::<WorkerRecord>(tx, &key(WORKERS, worker_id))? else {
         return Ok(false);
     };
-    supports(tx, WorkerIdentity::from(&record.enrollment))
+    let worker = WorkerIdentity::from(&record.enrollment);
+    Ok(supports(tx, worker)? && features_admit(tx, worker)?)
 }
 
 /// Test processes (T7c): while the file named by
@@ -152,19 +228,60 @@ fn can_activate(
     {
         return Ok(false);
     }
-    Ok(
-        all_advertised(tx, WORKERS, advertising, |entry: WorkerRecord| {
-            WorkerIdentity::from(&entry.enrollment)
-        })? && all_advertised(tx, APIS, advertising, |entry: ApiEnrollment| {
-            WorkerIdentity::from(entry.transport())
-        })?,
-    )
+    let advertised =
+        |tx: &mut GroupTransaction<'_>, worker: WorkerIdentity| -> Result<bool, ProtocolError> {
+            Ok(advertising == Some(worker) || supports(tx, worker)?)
+        };
+    Ok(all_members(tx, WORKERS, advertised, |entry: WorkerRecord| {
+        WorkerIdentity::from(&entry.enrollment)
+    })? && all_members(tx, APIS, advertised, |entry: ApiEnrollment| {
+        WorkerIdentity::from(entry.transport())
+    })?)
 }
 
-fn all_advertised<T: serde::de::DeserializeOwned>(
+/// A feature's activation covers every enrolled worker, including voters
+/// and learners. The current advert has yet to be stored as a receipt.
+fn maybe_enable(
+    tx: &mut GroupTransaction<'_>,
+    state: &State,
+    position: AppliedPosition,
+    feature: &str,
+    enabled_key: &[u8],
+    advertising: Option<WorkerIdentity>,
+) -> Result<(), ProtocolError> {
+    if tx.get(enabled_key)?.is_some()
+        || state.pending.is_some()
+        || state.restart.is_some()
+        || state.ready.ready_count == 0
+        || state.invalid_ready != 0
+        || tx.get(placement::ACTIVE)?.is_some()
+    {
+        return Ok(());
+    }
+    let advertised =
+        |tx: &mut GroupTransaction<'_>, worker: WorkerIdentity| -> Result<bool, ProtocolError> {
+            Ok(advertising == Some(worker) || supports_feature(tx, feature, worker)?)
+        };
+    if all_members(tx, WORKERS, advertised, |entry: WorkerRecord| {
+        WorkerIdentity::from(&entry.enrollment)
+    })? {
+        save(
+            tx,
+            enabled_key,
+            &FeatureActivation {
+                activated_at: position,
+                enrollment_revision: state.enrollment_revision,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether `advertised` holds for every member under `prefix`.
+fn all_members<T: serde::de::DeserializeOwned>(
     tx: &mut GroupTransaction<'_>,
     prefix: &[u8],
-    advertising: Option<WorkerIdentity>,
+    advertised: impl Fn(&mut GroupTransaction<'_>, WorkerIdentity) -> Result<bool, ProtocolError>,
     identity: impl Fn(T) -> WorkerIdentity,
 ) -> Result<bool, ProtocolError> {
     let mut cursor = None;
@@ -182,7 +299,7 @@ fn all_advertised<T: serde::de::DeserializeOwned>(
         })?;
         for worker in members {
             cursor = Some(super::key(prefix, worker.worker_id));
-            if advertising != Some(worker) && !supports(tx, worker)? {
+            if !advertised(tx, worker)? {
                 return Ok(false);
             }
         }

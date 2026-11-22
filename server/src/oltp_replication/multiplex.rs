@@ -12,13 +12,15 @@ use std::{future::Future, ops::Deref, pin::Pin, sync::Arc};
 use uuid::Uuid;
 mod directory;
 mod transport;
-pub(crate) use directory::AppliedPeerDirectory;
+pub(crate) use directory::{AppliedPeerDirectory, MAX_VIEW_REVOCATIONS};
+#[cfg(test)]
+pub(crate) use directory::{REVOCATION_REFRESH, REVOCATION_STALE_AFTER, RevocationSource};
 pub use transport::{
     EndpointRegistry, PeerDirectory, ResidentGroup, ResidentLease, TransportConfig, TransportTrust,
     WorkerClient, WorkerTransport,
 };
 pub(crate) use transport::{
-    PeerFeature, ReplicaLease, ReplicaMetadata, RequestError, RequestTarget,
+    OutgoingReservation, PeerFeature, ReplicaLease, ReplicaMetadata, RequestError, RequestTarget,
 };
 
 pub const MAX_SECTIONS: usize = 3;
@@ -48,6 +50,7 @@ pub enum Purpose {
     RaftProgress = 17,
     /// NS14b: Control's damage-replacement scheduler to a worker (Control scope).
     GroupDamage = 18,
+    SystemRecovery = 19,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrafficClass {

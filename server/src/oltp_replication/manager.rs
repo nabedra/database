@@ -4,7 +4,7 @@ use super::{
     authority::{
         config::*,
         consensus::{Applied, Consensus},
-        control::ControlMachine,
+        control::{ControlMachine, ReplicaMove},
         status::StatusMachine,
         timestamp::TimestampMachine,
     },
@@ -31,6 +31,7 @@ use std::{
 
 mod data_factory;
 mod lifecycle;
+pub(crate) mod system_recovery;
 pub(crate) use lifecycle::{
     AppliedPlacementMembership, DamageSink, ReplicatedLearner, ReportingDamageSink,
     SettlingReplicas, spawn_settlement,
@@ -39,6 +40,8 @@ pub(crate) use lifecycle::{
 pub(crate) use lifecycle::{DamageControl, DamagedReplacement, settle_damage};
 #[cfg(test)]
 mod damage_tests;
+#[cfg(test)]
+pub(crate) use damage_tests::{acceptance_o06_storage, acceptance_overlapped_append};
 #[cfg(test)]
 mod damage_scheduler_tests;
 mod retirement;
@@ -67,6 +70,20 @@ pub(crate) type ManagedCatalog = Managed<CatalogConfig, ParticipantMachine>;
 trait Running: Send + Sync {
     fn leader(&self) -> Option<u64>;
     fn members(&self) -> Vec<ReplicaMember>;
+    fn surviving_quorum<'a>(
+        &'a self,
+        request: &'a system_recovery::QuorumRequest,
+    ) -> system_recovery::QuorumFuture<'a>;
+    fn reconcile_system_replacement<'a>(
+        &'a self,
+        plan: &'a crate::oltp_replication::authority::control::ReplacementGroup,
+        lost: uuid::Uuid,
+    ) -> system_recovery::PositionFuture<'a>;
+    fn verify_replacement_applied<'a>(
+        &'a self,
+        plan: &'a crate::oltp_replication::authority::control::ReplacementGroup,
+        lost: uuid::Uuid,
+    ) -> system_recovery::PositionFuture<'a>;
     fn stop(&self) -> Pin<Box<dyn Future<Output = Result<(), ProtocolError>> + Send + '_>>;
     fn removed_applied(
         &self,
@@ -79,6 +96,49 @@ where
     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
     M: TypedMachine<C>,
 {
+    fn surviving_quorum<'a>(
+        &'a self,
+        request: &'a system_recovery::QuorumRequest,
+    ) -> system_recovery::QuorumFuture<'a> {
+        Box::pin(self.check_surviving_quorum(request))
+    }
+    fn reconcile_system_replacement<'a>(
+        &'a self,
+        plan: &'a crate::oltp_replication::authority::control::ReplacementGroup,
+        lost: uuid::Uuid,
+    ) -> system_recovery::PositionFuture<'a> {
+        Box::pin(async move {
+            let removed = plan.old.iter().find(|member| member.worker_id == lost).ok_or_else(invalid)?;
+            let next = plan.next(lost)?;
+            // The lost voter never retires: drop it from the membership.
+            Ok(self.reconcile_voter_replacement(&plan.old, &next, &plan.learner, removed.node_id, None, false)
+                .await?.applied_at())
+        })
+    }
+    fn verify_replacement_applied<'a>(
+        &'a self,
+        plan: &'a crate::oltp_replication::authority::control::ReplacementGroup,
+        lost: uuid::Uuid,
+    ) -> system_recovery::PositionFuture<'a> {
+        Box::pin(async move {
+            let mut local = self.state.clone();
+            let (applied, membership) = openraft::storage::RaftStateMachine::<C>::applied_state(&mut local)
+                .await.map_err(|_| unavailable())?;
+            let membership_position = membership.log_id().ok_or_else(unavailable)?;
+            let next = plan.next(lost)?;
+            let [voters] = membership.membership().get_joint_config().as_slice() else {
+                return Err(unavailable());
+            };
+            if voters.len() != next.len()
+                || next.iter().any(|member| !voters.contains(&member.node_id)
+                    || membership.membership().get_node(&member.node_id) != Some(member))
+                || applied.is_none_or(|applied| applied.index < membership_position.index)
+            {
+                return Err(unavailable());
+            }
+            Ok(super::hosted::position(membership_position))
+        })
+    }
     fn leader(&self) -> Option<u64> {
         // A stopped core never counts as the leader (RV-APPLY F4).
         let metrics = self.raft.metrics();
@@ -135,6 +195,9 @@ pub(crate) struct HostedGroupManager {
     damage_sink: Arc<Mutex<Option<Arc<dyn DamageSink>>>>,
     /// Retry, restart and stop counters of every core (`/v1/runtime/stats`).
     health: Arc<super::hosted::transient::RaftHealthStats>,
+    /// CAP1: the cluster features this worker observed enabled, shared with
+    /// every hosted core (gated proposals).
+    features: Arc<crate::oltp_replication::authority::control::EnabledFeatures>,
 }
 impl HostedGroupManager {
     fn hosted_data(
@@ -157,6 +220,33 @@ impl HostedGroupManager {
         }
         Ok(running)
     }
+
+    #[cfg(test)]
+    pub(crate) fn local_leads(&self, group: uuid::Uuid) -> bool {
+        self.routes.lock().is_ok_and(|routes| {
+            routes.get(&group).is_some_and(|route| {
+                route.replicas.values().any(|replica| {
+                    replica.running.leader() == Some(replica.member.node_id)
+                })
+            })
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn data_voter_state(
+        &self,
+        group: &GroupIdentity,
+        node: u64,
+    ) -> Option<(Vec<u64>, u64)> {
+        let hosted = self.hosted_data(group, node).ok()?;
+        let metrics = hosted.raft.metrics();
+        let metrics = metrics.borrow_watched();
+        let index = metrics.last_applied.as_ref()?.index;
+        metrics.running_state.as_ref().ok()?;
+        let voters = metrics.committed_membership_config.membership().voter_ids().collect();
+        Some((voters, index))
+    }
+
     pub(crate) fn new(
         shared: Arc<WorkerSharedResources>,
         client: WorkerClient,
@@ -171,10 +261,78 @@ impl HostedGroupManager {
             starts: tokio::sync::Mutex::new(()),
             damage_sink: Arc::new(Mutex::new(None)),
             health: Arc::default(),
+            features: Arc::default(),
         })
     }
     pub(crate) fn resources(&self) -> &Arc<WorkerSharedResources> {
         &self.shared
+    }
+    /// CAP1: this worker's view of the enabled cluster features.
+    pub(crate) fn cluster_features(
+        &self,
+    ) -> &Arc<crate::oltp_replication::authority::control::EnabledFeatures> {
+        &self.features
+    }
+    #[cfg(test)]
+    pub(crate) async fn test_transfer_data_snapshot(
+        &self,
+        group: &GroupIdentity,
+        target: uuid::Uuid,
+    ) -> Result<u64, ProtocolError> {
+        use openraft::{
+            network::{RPCOption, RaftNetworkFactory, RaftNetworkV2},
+            storage::RaftStateMachine,
+        };
+
+        let (source, target) = {
+            let routes = self.routes.lock().map_err(|_| unavailable())?;
+            let replica = routes
+                .get(&group.group_id)
+                .and_then(|route| {
+                    route
+                        .replicas
+                        .values()
+                        .find(|replica| replica.running.leader() == Some(replica.member.node_id))
+                })
+                .ok_or_else(unavailable)?;
+            let target = replica
+                .running
+                .members()
+                .into_iter()
+                .find(|member| member.worker_id == target)
+                .ok_or_else(unavailable)?;
+            (replica.member.clone(), target)
+        };
+        let host = self.hosted_data(group, source.node_id)?;
+        host.ensure_linearizable().await?;
+        // SNAP1: what the replication task sends a lagging follower, a fresh
+        // cut whose file is written during the transfer.
+        let mut state = host.state.clone();
+        let snapshot = state
+            .get_current_snapshot()
+            .await
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
+        let cut = snapshot.meta.last_log_id.ok_or_else(unavailable)?.index;
+        let mut factory = TypedNetworkFactory::<DataConfig>::new(
+            self.client(),
+            source,
+            host.state.resident(),
+            self.shared.clone(),
+        )?;
+        let vote = host.raft.metrics().borrow_watched().vote;
+        factory
+            .new_client(target.node_id, &target)
+            .await
+            .full_snapshot(
+                vote,
+                snapshot,
+                std::future::pending(),
+                RPCOption::new(std::time::Duration::from_secs(10)),
+            )
+            .await
+            .map_err(|_| unavailable())?;
+        Ok(cut)
     }
     pub(crate) fn client(&self) -> WorkerClient {
         self.client.clone()
@@ -219,6 +377,24 @@ impl HostedGroupManager {
         dispatcher.retire(node).await?;
         self.bind_service(identity, node, endpoint)
     }
+    #[cfg(test)]
+    pub(crate) fn test_group_leader(&self, group: uuid::Uuid) -> Option<uuid::Uuid> {
+        let routes = self.routes.lock().ok()?;
+        let routes = routes.get(&group)?;
+        let leader = routes
+            .replicas
+            .values()
+            .find_map(|route| route.running.leader())?;
+        routes.replicas.values().find_map(|route| {
+            route
+                .running
+                .members()
+                .into_iter()
+                .find(|member| member.node_id == leader)
+                .map(|member| member.worker_id)
+        })
+    }
+
     pub(crate) fn leader_candidates(
         &self,
         group: uuid::Uuid,
@@ -252,6 +428,7 @@ impl HostedGroupManager {
         machine: M,
         local: ReplicaMember,
         bootstrap: BTreeMap<u64, ReplicaMember>,
+        catch_up_before: Option<u64>,
         config: openraft::Config,
     ) -> Result<Managed<C, M>, ProtocolError>
     where
@@ -356,13 +533,15 @@ impl HostedGroupManager {
         let state = HostedState::new(machine, resident.clone())?;
         let running =
             RaftConsensus::start_with(config, network, log, state, self.health.clone()).await?;
+        let _ = running.cluster_features.set(self.features.clone());
         let endpoint = ReplicaEndpoint::new(
             running.raft.clone(),
             running.state.clone(),
             resident,
             self.shared.clone(),
             bootstrap.clone(),
-        )?;
+        )?
+        .with_learner_catch_up(catch_up_before);
         if let Err(error) = dispatcher.add(local.node_id, Arc::new(endpoint)) {
             running.shutdown().await?;
             return Err(error);
@@ -447,7 +626,20 @@ impl HostedGroupManager {
         peers: BTreeMap<u64, ReplicaMember>,
         config: openraft::Config,
     ) -> Result<ManagedControl, ProtocolError> {
-        self.start(ControlMachine::new(store)?, local, peers, config)
+        self.start(ControlMachine::new(store)?, local, peers, None, config)
+            .await
+    }
+    pub(crate) async fn start_registered_control(
+        &self,
+        store: GroupStore,
+        local: ReplicaMember,
+        peers: BTreeMap<u64, ReplicaMember>,
+        catch_up_before: Option<u64>,
+        config: openraft::Config,
+        directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+    ) -> Result<ManagedControl, ProtocolError> {
+        let machine = ControlMachine::new(store)?.with_replacement_directory(directory).await?;
+        self.start(machine, local, peers, catch_up_before, config)
             .await
     }
     pub(crate) async fn start_timestamps(
@@ -457,7 +649,7 @@ impl HostedGroupManager {
         peers: BTreeMap<u64, ReplicaMember>,
         config: openraft::Config,
     ) -> Result<ManagedTimestamps, ProtocolError> {
-        self.start(TimestampMachine::new(store)?, local, peers, config)
+        self.start(TimestampMachine::new(store)?, local, peers, None, config)
             .await
     }
     pub(crate) async fn start_status(
@@ -467,7 +659,7 @@ impl HostedGroupManager {
         peers: BTreeMap<u64, ReplicaMember>,
         config: openraft::Config,
     ) -> Result<ManagedStatus, ProtocolError> {
-        self.start(StatusMachine::new(store)?, local, peers, config)
+        self.start(StatusMachine::new(store)?, local, peers, None, config)
             .await
     }
     pub(crate) async fn start_data(
@@ -477,8 +669,45 @@ impl HostedGroupManager {
         peers: BTreeMap<u64, ReplicaMember>,
         config: openraft::Config,
     ) -> Result<ManagedData, ProtocolError> {
+        self.start_data_with_bootstrap(store, local, peers, None, config)
+            .await
+    }
+    async fn start_placement_learner(
+        &self,
+        store: GroupStore,
+        plan: &ReplicaMove,
+        config: openraft::Config,
+    ) -> Result<ManagedData, ProtocolError> {
+        self.start_data_with_bootstrap(
+            store,
+            plan.request.target.clone(),
+            plan.old
+                .iter()
+                .map(|member| (member.node_id, member.clone()))
+                .collect(),
+            // The move's committed Control record authorizes these senders
+            // while the learner catches up to that placement.
+            Some(plan.expected.membership_position.index),
+            config,
+        )
+        .await
+    }
+    async fn start_data_with_bootstrap(
+        &self,
+        store: GroupStore,
+        local: ReplicaMember,
+        peers: BTreeMap<u64, ReplicaMember>,
+        catch_up_before: Option<u64>,
+        config: openraft::Config,
+    ) -> Result<ManagedData, ProtocolError> {
         let running = self
-            .start(ParticipantMachine::new(store)?, local, peers, config)
+            .start(
+                ParticipantMachine::new(store)?,
+                local,
+                peers,
+                catch_up_before,
+                config,
+            )
             .await?;
         super::hosted::direct_leadership::watch(&running);
         Ok(running)
@@ -490,7 +719,7 @@ impl HostedGroupManager {
         peers: BTreeMap<u64, ReplicaMember>,
         config: openraft::Config,
     ) -> Result<ManagedCatalog, ProtocolError> {
-        self.start(ParticipantMachine::new(store)?, local, peers, config)
+        self.start(ParticipantMachine::new(store)?, local, peers, None, config)
             .await
     }
     pub(crate) async fn shutdown(&self) -> Result<(), ProtocolError> {

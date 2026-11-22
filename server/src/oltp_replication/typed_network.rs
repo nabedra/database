@@ -3,7 +3,7 @@
 //! Current process enrollment remains a transport concern, not a Raft node ID.
 use super::{
     authority::consensus::Applied,
-    entry::{LogId, OwnedRaftEntry, Vote},
+    entry::{CommittedLeaderId, LogId, Membership, OwnedRaftEntry, Vote},
     hosted::{HostedState, RaftCores, TypedMachine, TypedSnapshot},
     multiplex::{
         AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, PeerFeature,
@@ -205,6 +205,12 @@ impl<C: TypedConfig> TypedNetwork<C> {
             return Err(invalid("target node disagrees with membership"));
         }
         let group = self.factory.resident.identity();
+        #[cfg(test)]
+        if crate::oltp_runtime::recovery_tests::block_raft_for_test(group.group_id)
+            || crate::oltp_growth_acceptance::data_raft_isolated(group.group_id)
+        {
+            return Err(unavailable());
+        }
         let (purpose, traffic) = header.route(&group.kind);
         let shared = self.factory.shared.clone();
         let byte_class = traffic.byte_class();
@@ -240,7 +246,7 @@ impl<C: TypedConfig> TypedNetwork<C> {
         })?
         .map_err(|failure| {
             let (reason, code) = match &failure {
-                RequestError::OutgoingLaneFull => ("outgoing_lane_full", None),
+                RequestError::OutgoingLaneFull { .. } => ("outgoing_lane_full", None),
                 RequestError::Unreachable => ("unreachable", None),
                 RequestError::PeerRejected { error, .. } => ("peer_rejected", Some(error.code)),
                 RequestError::Protocol(error) => ("local_protocol", Some(error.code)),
@@ -249,16 +255,23 @@ impl<C: TypedConfig> TypedNetwork<C> {
             ProtocolError::from(failure)
         })?;
         // The two private return types contain only fixed vote/log metadata.
-        // Move the entire transport owner into the native codec until it settles.
-        let decoded = shared
-            .execute(execution(traffic), self.target, 0, move || {
+        // Move the entire transport owner into the codec until it settles; a
+        // small reply decodes on this task (RD3, PERF2b's bound).
+        let reply_bytes = reply.header.len();
+        let decoded = super::hosted::execute_small(
+            &shared,
+            execution(traffic),
+            self.target,
+            reply_bytes,
+            move || {
                 crate::protocol::json_input(reply.header.as_slice(), response_header)
                     .map_err(|_| invalid("typed Raft reply bounds"))?;
                 serde_json::from_slice(reply.header.as_slice())
                     .map_err(|_| invalid("invalid typed Raft reply"))
-            })
-            .await
-            .inspect_err(|error| report("decode_reply", "local_protocol", Some(error.code)))?;
+            },
+        )
+        .await
+        .inspect_err(|error| report("decode_reply", "local_protocol", Some(error.code)))?;
         if traffic == TrafficClass::RaftProgress {
             tracing::debug!(group=%group.group_id, from_node=header.from_node, to_node=header.to_node,
                 method=?header.method, ?purpose, prev_index=header.prev_log_id.map(|id| id.index),
@@ -300,40 +313,49 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
             let shared = self.factory.shared.clone();
             let resident = self.factory.resident.clone();
             let entries = rpc.entries.clone();
-            shared
-                .execute(execution(class), self.target, 0, {
-                    let shared = shared.clone();
-                    move || {
-                        let mut encoded = Vec::with_capacity(entries.len());
-                        let mut framed = 0usize;
-                        for entry in entries {
-                            let bytes = entry.charge_resident(&resident).and_then(|entry| {
-                                shared.encode_in(
-                                    class.byte_class(),
-                                    &entry,
-                                    crate::oltp::mvcc::MAX_FIXED_COMMAND_BYTES,
-                                )
-                            });
-                            let bytes = match bytes {
-                                Ok(bytes) => bytes,
-                                Err(error) if encoded.is_empty() => return Err(error),
-                                Err(_) => break,
-                            };
-                            framed += 4 + bytes.len();
-                            if !encoded.is_empty() && framed > budget {
-                                break;
-                            }
-                            encoded.push(bytes);
-                        }
-                        Ok(encoded)
-                    }
+            let estimate = entries
+                .iter()
+                .map(|entry| {
+                    use crate::oltp_replication::owned::OwnedPayload;
+                    entry.heap_bytes().unwrap_or(usize::MAX)
                 })
-                .await
-                .map_err(|_| unreachable())?
+                .fold(0usize, usize::saturating_add);
+            super::hosted::execute_small(&shared, execution(class), self.target, estimate, {
+                let shared = shared.clone();
+                move || {
+                    let mut encoded = Vec::with_capacity(entries.len());
+                    let mut framed = 0usize;
+                    for entry in entries {
+                        let bytes = entry.charge_resident(&resident).and_then(|entry| {
+                            shared.encode_in(
+                                class.byte_class(),
+                                &entry,
+                                crate::oltp::mvcc::MAX_FIXED_COMMAND_BYTES,
+                            )
+                        });
+                        let bytes = match bytes {
+                            Ok(bytes) => bytes,
+                            Err(error) if encoded.is_empty() => return Err(error),
+                            Err(_) => break,
+                        };
+                        framed += 4 + bytes.len();
+                        if !encoded.is_empty() && framed > budget {
+                            break;
+                        }
+                        encoded.push(bytes);
+                    }
+                    Ok(encoded)
+                }
+            })
+            .await
+            .map_err(|_| unreachable())?
         };
         rpc.entries.truncate(encoded.len());
         let previous = rpc.prev_log_id;
         let last = rpc.last_log_id();
+        // CAP1: entries Control's cluster features gate (`ReclaimIndex`) need
+        // no per-connection check here: a leader proposes one only once every
+        // replica host's build decodes it.
         let (payload, entries, target) = match encoded.len() {
             0 => (None, None, RequestTarget::from(self.node.worker_id)),
             1 => (
@@ -376,6 +398,16 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
                 "raft.meta.net.append",
             ]
         };
+        let data_append = header.payload_bytes != 0
+            && matches!(
+                self.factory.resident.identity().kind,
+                crate::oltp_replication::types::GroupKind::Data { .. }
+            );
+        if data_append {
+            super::hosted::proposal_clock::mark(crate::oltp_runtime::stage_timing::perf_stage!(
+                "raft.data.propose_to_send"
+            ));
+        }
         let reply: AppendEntriesResponse<C> = crate::oltp_runtime::stage_timing::timed(
             crate::oltp_runtime::stage_timing::by_kind(
                 &self.factory.resident.identity().kind,
@@ -385,6 +417,14 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
         )
         .await
         .map_err(|_| unreachable())?;
+        if data_append {
+            super::hosted::proposal_clock::mark(crate::oltp_runtime::stage_timing::perf_stage!(
+                "raft.data.propose_to_ack"
+            ));
+            super::hosted::proposal_clock::mark_first(
+                crate::oltp_runtime::stage_timing::perf_stage!("raft.data.propose_to_first_ack"),
+            );
+        }
         if (previous.is_none() && matches!(reply, AppendEntriesResponse::Conflict))
             || (header.payload_bytes == 0
                 && matches!(reply, AppendEntriesResponse::PartialSuccess(_)))
@@ -553,6 +593,7 @@ where
     resident: ReplicaLease,
     shared: Arc<WorkerSharedResources>,
     bootstrap: Arc<BTreeMap<u64, ReplicaMember>>,
+    catch_up_before: Option<u64>,
 }
 impl<C, M> ReplicaEndpoint<C, M>
 where
@@ -576,7 +617,12 @@ where
             resident,
             shared,
             bootstrap: Arc::new(bootstrap),
+            catch_up_before: None,
         })
+    }
+    pub(crate) fn with_learner_catch_up(mut self, catch_up_before: Option<u64>) -> Self {
+        self.catch_up_before = catch_up_before;
+        self
     }
     fn verify(
         &self,
@@ -610,7 +656,12 @@ where
             }
             _ => {}
         }
-        self.verify_sender(session, head.from_node, head.to_node)?;
+        self.verify_sender(
+            session,
+            head.from_node,
+            head.to_node,
+            matches!(head.method, Method::Append),
+        )?;
         Ok(traffic)
     }
     fn verify_sender(
@@ -618,30 +669,51 @@ where
         session: &AuthenticatedSession,
         from_node: u64,
         to_node: u64,
+        catch_up: bool,
     ) -> Result<(), ProtocolError> {
         if session.group() != self.resident.identity() || to_node != self.resident.node_id() {
             return Err(invalid("typed RPC target mismatch"));
         }
         let metrics = self.raft.metrics();
         let metrics = metrics.borrow_watched();
-        let membership = metrics.membership_config.membership();
-        let member = membership
-            .nodes()
-            .find(|(node, _)| **node == from_node)
-            .map(|(_, member)| member)
-            .or_else(|| {
-                if membership.nodes().next().is_none() {
-                    self.bootstrap.get(&from_node)
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| invalid("sender is outside enrolled replica membership"))?;
+        let member = raft_sender(
+            &metrics.membership_config,
+            &self.bootstrap,
+            self.catch_up_before.filter(|_| catch_up),
+            from_node,
+        )
+        .ok_or_else(|| invalid("sender is outside enrolled replica membership"))?;
         if member.worker_id != session.remote().worker_id {
             return Err(invalid("sender node is bound to another physical worker"));
         }
         Ok(())
     }
+}
+
+fn raft_sender<'a>(
+    stored: &'a openraft::StoredMembership<CommittedLeaderId, Membership>,
+    bootstrap: &'a BTreeMap<u64, ReplicaMember>,
+    catch_up_before: Option<u64>,
+    sender: u64,
+) -> Option<&'a ReplicaMember> {
+    let membership = stored.membership();
+    membership
+        .nodes()
+        .find(|(node, _)| **node == sender)
+        .map(|(_, member)| member)
+        .or_else(|| {
+            // A newly hosted learner can receive historical membership
+            // entries before it sees the previously published placement.
+            // Until then, its authorized bootstrap voters can send catch-up
+            // traffic even if a historical membership does not list them.
+            let replaying_history = catch_up_before
+                .is_some_and(|index| stored.log_id().is_none_or(|log| log.index < index));
+            if replaying_history || membership.nodes().next().is_none() {
+                bootstrap.get(&sender)
+            } else {
+                None
+            }
+        })
 }
 impl<C, M> Endpoint for ReplicaEndpoint<C, M>
 where
@@ -654,6 +726,11 @@ where
         bytes: &'a [u8],
     ) -> EndpointFuture<'a, ReceivePlan> {
         Box::pin(async move {
+            #[cfg(test)]
+            if crate::oltp_growth_acceptance::data_raft_isolated(self.resident.identity().group_id)
+            {
+                return Err(unavailable());
+            }
             if session.purpose() == Purpose::Snapshot {
                 return self.snapshot_preflight(session, bytes);
             }
@@ -700,8 +777,13 @@ where
                     let entries = if head.payload_bytes == 0 {
                         Vec::new()
                     } else {
-                        shared
-                            .execute(execution(traffic), head.from_node, 0, {
+                        let input_bytes = sections.section(0).map_or(0, |input| input.len());
+                        super::hosted::execute_small(
+                            &shared,
+                            execution(traffic),
+                            head.from_node,
+                            input_bytes,
+                            {
                                 let shared = shared.clone();
                                 move || {
                                     let input = sections
@@ -723,8 +805,9 @@ where
                                         .map(|entry| vec![entry]),
                                     }
                                 }
-                            })
-                            .await?
+                            },
+                        )
+                        .await?
                     };
                     #[cfg(test)]
                     if !entries.is_empty() {

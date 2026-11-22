@@ -215,6 +215,10 @@ struct Fixture {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Release {
     Current,
+    SessionV2,
+    /// The builds from IDXGC1 to before RD3: they also offer the retired
+    /// `nabedra-otp/3` (index reclamation frames), no direct admission.
+    SessionV3,
     OneShotOnly,
 }
 
@@ -262,10 +266,21 @@ impl Fixture {
             .unwrap();
             let registry = Arc::new(EndpointRegistry::new(shared.clone()));
             let build = match release {
-                Release::Current => WorkerTransport::new,
+                Release::Current | Release::SessionV2 | Release::SessionV3 => WorkerTransport::new,
                 Release::OneShotOnly => WorkerTransport::one_shot_for_test,
             };
-            build(local, &tls[index], shared, peers.clone(), registry, config).unwrap()
+            let mut transport =
+                build(local, &tls[index], shared, peers.clone(), registry, config).unwrap();
+            if release == Release::SessionV2 {
+                let common = Arc::get_mut(&mut transport.common).unwrap();
+                (common.connector, common.acceptor) = tls[index].transports(&[SESSION_ALPN, ALPN]);
+            }
+            if release == Release::SessionV3 {
+                let common = Arc::get_mut(&mut transport.common).unwrap();
+                (common.connector, common.acceptor) =
+                    tls[index].transports(&[LEGACY_INDEX_RECLAIM_ALPN, SESSION_ALPN, ALPN]);
+            }
+            transport
         };
         let group = GroupIdentity {
             cluster_id: Uuid::new_v4(),
@@ -517,15 +532,16 @@ async fn d10_c07_o05_exhausted_lane_overloads_while_raft_progress_advances() {
             TrafficClass::DataConsensus,
             caller_config.handler_slots[data] as u32 - 1,
         );
-        assert!(matches!(
-            fixture
-                .call(&fixture.data_group, Purpose::Raft, "caller-full")
-                .await,
-            Err(RequestError::OutgoingLaneFull)
-        ));
-        let error = ProtocolError::from(RequestError::OutgoingLaneFull);
+        let Err(refusal @ RequestError::OutgoingLaneFull { .. }) = fixture
+            .call(&fixture.data_group, Purpose::Raft, "caller-full")
+            .await
+        else {
+            panic!("expected a local caller refusal");
+        };
+        let error = ProtocolError::from(refusal);
         assert_eq!(error.code, ErrorCode::Overloaded);
         assert_eq!(error.outcome, Outcome::NotApplied);
+        assert_eq!(error.message, "worker outgoing lane full (DataConsensus)");
 
         // Raft progress traffic for the same group advances on its own lane.
         fixture.endpoint.hold.store(false, Ordering::Release);
@@ -602,6 +618,61 @@ async fn d10_old_one_shot_peer_interoperates_in_both_directions() {
         .await
         .unwrap();
         fixture.stop().await;
+    }
+}
+
+/// The ALPN that IDXGC1 builds offered for index reclamation frames. CAP1
+/// retired it: Control's `data.index.reclaim` cluster feature gates them.
+const LEGACY_INDEX_RECLAIM_ALPN: &[u8] = b"nabedra-otp/3";
+
+/// CAP1/D10/O02: with `nabedra-otp/3` retired, this build still forms one
+/// session per lane with every older session build, in both directions:
+/// otp/2 with a pre-IDXGC1 build and with an IDXGC1 build (which also offers
+/// otp/3), and otp/4 with an RD3 build. Raft frames, a reclamation-shaped
+/// frame included, travel on the negotiated session; nothing requires a
+/// per-connection capability any more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cap1_d10_o02_sessions_form_with_older_builds_after_otp3_is_retired() {
+    for (caller, receiver) in [
+        (Release::Current, Release::SessionV2),
+        (Release::SessionV2, Release::Current),
+        (Release::Current, Release::SessionV3),
+        (Release::SessionV3, Release::Current),
+        (Release::Current, Release::Current),
+    ] {
+        let (f, _) = Fixture::start(
+            caller,
+            receiver,
+            TransportConfig::default(),
+            TransportConfig::default(),
+            false,
+        )
+        .await;
+        timeout(WAIT, async {
+            for text in ["append", "reclaim", "append again"] {
+                echoed(f.call(&f.data_group, Purpose::Raft, text).await, text);
+            }
+            assert_eq!(f.endpoint.handled.load(Ordering::Acquire), 3);
+            assert_eq!(f.client.connections_for_test(), 1, "one session");
+            assert_eq!(f.client.live_sessions_for_test(), 1);
+            let session = |feature| {
+                f.client
+                    .peer_supports(f.target.worker_id, TrafficClass::DataConsensus, feature)
+                    .is_some()
+            };
+            assert!(
+                session(PeerFeature::MultiEntryAppend),
+                "a session, not one-shot"
+            );
+            // otp/4 only between two builds that offer it.
+            assert_eq!(
+                session(PeerFeature::DirectAdmission),
+                caller == Release::Current && receiver == Release::Current
+            );
+        })
+        .await
+        .unwrap();
+        f.stop().await;
     }
 }
 
@@ -1014,7 +1085,7 @@ async fn d10_o05_large_and_small_frames_share_one_lane() {
                     .await
                 {
                     // Three large calls may hold the lane's four slots briefly.
-                    Err(RequestError::OutgoingLaneFull) => tokio::task::yield_now().await,
+                    Err(RequestError::OutgoingLaneFull { .. }) => tokio::task::yield_now().await,
                     reply => break reply,
                 }
             };
@@ -1120,7 +1191,7 @@ async fn d10_c07_full_session_pools_reject_typed_and_keep_raft_progress() {
             .connect(ServerName::try_from("localhost").unwrap(), socket)
             .await
             .unwrap();
-        assert_eq!(idle.get_ref().1.alpn_protocol(), Some(SESSION_ALPN));
+        assert!(session_alpn(idle.get_ref().1.alpn_protocol()));
         // A new lane now handshakes without sessions and still works.
         let before = other.client.connections_for_test();
         echoed(
@@ -1350,7 +1421,7 @@ async fn d05_live1_black_holed_peer_fills_only_its_own_lane() {
             fixture
                 .call(&fixture.data_group, Purpose::Raft, "excess")
                 .await,
-            Err(RequestError::OutgoingLaneFull)
+            Err(RequestError::OutgoingLaneFull { .. })
         ));
         assert!(stalled.iter().all(|call| !call.is_finished()));
         // The same class to the healthy peer still sends, many times over.
@@ -1433,10 +1504,160 @@ async fn g1_local_failure_after_send_has_unknown_outcome() {
         let Err(full) = full else {
             panic!("a held lane accepted the call");
         };
-        assert!(matches!(full, RequestError::OutgoingLaneFull));
+        assert!(matches!(full, RequestError::OutgoingLaneFull { .. }));
         assert_eq!(ProtocolError::from(full).outcome, Outcome::NotApplied);
         assert_eq!(fixture.endpoint.handled.load(Ordering::Acquire), 1);
         drop(_held);
         fixture.stop().await;
+    }
+}
+
+/// RD3 (D12, O03, PERF1, C07): a range leader handles direct requests (ingress
+/// on a Data group) in their own pool, not in the ingress class's 4 handler
+/// slots, so a caller keeps many in flight to it and the leader can batch
+/// them. Before RD3 at most 3 waiting direct requests reached the leader at
+/// once. Queued ingress (a Control submission that refuses at once) keeps its
+/// own slots next to them. To a leader of the previous build (no direct
+/// admission negotiated) the caller keeps PERF1's bound: at most 3 waiting
+/// direct requests in flight, the rest wait in arrival order, none refused,
+/// and the queued caller still finds its slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rd3_d12_o03_direct_requests_beyond_the_ingress_slots_reach_the_leader() {
+    let ingress = TransportConfig::default().handler_slots[TrafficClass::ApiIngress as usize];
+    let direct = 3 * ingress;
+    for receiver_release in [Release::Current, Release::SessionV3] {
+        let (f, _) = Fixture::start(
+            Release::Current,
+            receiver_release,
+            TransportConfig::default(),
+            TransportConfig::default(),
+            false,
+        )
+        .await;
+        let control = GroupIdentity {
+            group_id: Uuid::new_v4(),
+            kind: GroupKind::Control,
+            ..f.group.clone()
+        };
+        f.receiver
+            .registry
+            .reserve(control.clone())
+            .unwrap()
+            .bind(Purpose::ApiIngress, f.endpoint.clone())
+            .unwrap();
+        f.receiver
+            .registry
+            .reserve(f.data_group.clone())
+            .unwrap()
+            .bind(Purpose::ApiIngress, f.endpoint.clone())
+            .unwrap();
+        // The first call opens the ingress session and negotiates its ALPN.
+        echoed(
+            f.call(&f.data_group, Purpose::ApiIngress, "open").await,
+            "open",
+        );
+        let wide = receiver_release == Release::Current;
+        assert_eq!(
+            f.client
+                .peer_supports(
+                    f.target.worker_id,
+                    TrafficClass::ApiIngress,
+                    PeerFeature::DirectAdmission
+                )
+                .is_some(),
+            wide
+        );
+        f.endpoint.hold.store(true, Ordering::Release);
+        let refused = f.client.lane_refusals();
+        let calls: Vec<_> = (0..direct)
+            .map(|index| {
+                let client = f.client.clone();
+                let group = f.data_group.clone();
+                let target = f.target.clone();
+                let shared = f.caller_transport.common.shared.clone();
+                tokio::spawn(async move {
+                    let text = format!("direct-{index}");
+                    let reservation = client
+                        .reserve_outgoing(
+                            &group,
+                            target.worker_id,
+                            Purpose::ApiIngress,
+                            Instant::now() + WAIT,
+                        )
+                        .await?;
+                    let header = shared.encode_in(ByteClass::Data, &text, 1024).unwrap();
+                    let reply = client
+                        .request_reserved(
+                            reservation,
+                            &group,
+                            WorkerIdentity::from(&target),
+                            Purpose::ApiIngress,
+                            header,
+                            [None, None, None],
+                            0,
+                        )
+                        .await;
+                    echoed(reply, &text);
+                    Ok::<_, RequestError>(())
+                })
+            })
+            .collect();
+        let at_leader = if wide { direct } else { ingress - 1 };
+        let entered = |n: usize| {
+            let endpoint = f.endpoint.clone();
+            async move {
+                timeout(WAIT, endpoint.entered.acquire_many(n as u32))
+                    .await
+                    .unwrap_or_else(|_| panic!("{n} requests reach the leader's handler"))
+                    .unwrap()
+                    .forget();
+            }
+        };
+        entered(at_leader).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            f.endpoint.entered.available_permits(),
+            0,
+            "no more than {at_leader} direct requests at the leader at once"
+        );
+        // A queued submission refuses at once on a full lane; it still gets in.
+        let queued = f.call(&control, Purpose::ApiIngress, "queued");
+        let queued = tokio::spawn(queued);
+        entered(1).await;
+        assert_eq!(f.client.lane_refusals(), refused, "nothing refused");
+        f.endpoint.hold.store(false, Ordering::Release);
+        f.endpoint.release.add_permits(direct + 1);
+        echoed(queued.await.unwrap(), "queued");
+        for call in calls {
+            timeout(WAIT, call)
+                .await
+                .expect("every direct request completes")
+                .unwrap()
+                .expect("no direct request is refused");
+        }
+        assert_eq!(f.client.lane_refusals(), refused, "nothing refused");
+        let hold = f.client.hold_outgoing_for_test(TrafficClass::ApiIngress);
+        let Err(error @ RequestError::OutgoingLaneFull { .. }) = f
+            .client
+            .reserve_outgoing(
+                &f.data_group,
+                f.target.worker_id,
+                Purpose::ApiIngress,
+                Instant::now(),
+            )
+            .await
+        else {
+            panic!("expected a local lane refusal at the deadline");
+        };
+        let error = ProtocolError::from(error);
+        let lane = if wide { "direct" } else { "ingress" };
+        assert_eq!(
+            error.message,
+            format!("worker outgoing lane full (ApiIngress/{lane})")
+        );
+        assert_eq!(error.code, ErrorCode::Overloaded);
+        assert_eq!(error.outcome, Outcome::NotApplied);
+        drop(hold);
+        f.stop().await;
     }
 }

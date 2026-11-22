@@ -1252,6 +1252,13 @@ impl StatusEndpoint {
                             error
                         }
                     })?;
+                #[cfg(test)]
+                crate::oltp_runtime::recovery_tests::transaction_checkpoint(
+                    "commit-reply",
+                    txn.request_id,
+                    decision.statement(),
+                )
+                .await;
                 if inline {
                     let outcome = decision.outcome().ok_or_else(unavailable)?;
                     encode(shared, (decision.statement().clone(), outcome.clone()))
@@ -1300,6 +1307,11 @@ impl StatusEndpoint {
                 .await
             }
             Request::Inspect { txn } => {
+                #[cfg(test)]
+                if crate::oltp_runtime::recovery_tests::lose_status_inspection(txn.request_id).await
+                {
+                    return Err(unavailable());
+                }
                 encode(shared, handle.inspect_transaction(txn).await?).await
             }
             Request::Manifest {
@@ -1920,6 +1932,7 @@ impl StatusClient {
                 member.node_id,
                 target,
                 receiver.map(|_| routes.record.generation),
+                None,
             )
             .await
         {
@@ -1931,7 +1944,7 @@ impl StatusClient {
                 self.client.control.invalidate_replica_routes(&routes);
                 return Ok(None);
             }
-            Err(CallError::Transport(RequestError::OutgoingLaneFull)) => return Ok(None),
+            Err(CallError::Transport(RequestError::OutgoingLaneFull { .. })) => return Ok(None),
             Ok(Err(error)) => Err(error),
             Err(error) => Err(error.into()),
         }

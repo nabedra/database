@@ -20,6 +20,7 @@ pub(super) fn prepare(
     if !stamp(authorization, state.policy)
         || authorization.subject == intent.worker().certificate_sha256
         || intent.validate(scope).is_err()
+        || system_recovery::blocked_enrollment(tx, &intent.enrollment)?
     {
         return fault(Fault::Unauthorized);
     }
@@ -62,7 +63,8 @@ pub(super) fn complete(
     if !ready_for_join(state, intent.run_id) {
         return fault(Fault::NotReady);
     }
-    if load::<DataWorkerIntent>(tx, PREPARED)?.as_ref() != Some(intent)
+    if system_recovery::blocked_enrollment(tx, &intent.enrollment)?
+        || load::<DataWorkerIntent>(tx, PREPARED)?.as_ref() != Some(intent)
         || tx.get(&worker_key)?.is_some()
         || tx.get(&key(APIS, worker.worker_id))?.is_some()
     {

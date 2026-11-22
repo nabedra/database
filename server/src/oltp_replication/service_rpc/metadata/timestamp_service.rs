@@ -68,6 +68,11 @@ enum Request {
         identity: PinIdentity,
         reservation: IdentityReservation,
     },
+    RetrySnapshot {
+        view: AuthorityView,
+        identity: PinIdentity,
+        previous: crate::oltp_replication::authority::status::SealedSettlement,
+    },
     Bind {
         view: AuthorityView,
         identity: PinIdentity,
@@ -209,6 +214,10 @@ enum Request {
     AllocateDirect {
         count: u64,
     },
+    AdvanceFloor {
+        authority: Authority,
+        retired_at: Option<CommitTs>,
+    },
 }
 impl Request {
     fn method(&self) -> Method {
@@ -254,6 +263,8 @@ impl Request {
             Self::Cancel { .. } => 15,
             Self::CloseBackup { .. } => 16,
             Self::AllocateDirect { .. } => 41,
+            Self::AdvanceFloor { .. } => 42,
+            Self::RetrySnapshot { .. } => 43,
         };
         Method::TimestampCall {
             operation,
@@ -752,15 +763,36 @@ impl TimestampEndpoint {
                 )
                 .await
             }
+            Request::RetrySnapshot {
+                view,
+                identity,
+                previous,
+            } => {
+                let statement = previous.statement();
+                let group = self.status.manifest(statement.txn, statement.manifest)?;
+                let actual = self
+                    .status_client(group)
+                    .await?
+                    .settled_proof(statement.txn, statement.manifest)
+                    .await?;
+                if actual.statement() != statement {
+                    return Err(invalid());
+                }
+                encode(
+                    shared,
+                    self.handle.retry_snapshot(view, identity, actual).await?,
+                )
+                .await
+            }
             Request::Bind {
                 view,
                 identity,
                 pin,
                 request,
             } => {
-                // The pin's policy is immutable once allocated.
+                // Application, index and import use this unscoped bind.
                 self.handle
-                    .verify_snapshot_policy(identity.clone(), pin, None)
+                    .verify_unscoped_bind_pin(identity.clone(), pin)
                     .await?;
                 self.handle
                     .bind_snapshot_context(view, identity, pin, request)
@@ -896,6 +928,16 @@ impl TimestampEndpoint {
             }
             Request::AllocateDirect { count } => {
                 encode(shared, self.handle.allocate_direct(count).await?).await
+            }
+            Request::AdvanceFloor {
+                authority,
+                retired_at,
+            } => {
+                encode(
+                    shared,
+                    self.handle.advance_floor(authority, retired_at).await?,
+                )
+                .await
             }
             Request::Allocation { permit } => {
                 let statement = permit.statement();
@@ -1219,7 +1261,7 @@ impl Endpoint for TimestampEndpoint {
                 ).await;
                 return reply(self.handle.resources(), &session, self.node, result).await;
             }
-            if head.method.inline_small_reply()
+            if head.method.is_allocate_direct()
                 && sections
                     .section(0)
                     .is_some_and(|section| section.len() <= INLINE_REPLY_BYTES)
@@ -1405,6 +1447,7 @@ impl TimestampClient {
             request,
             Request::Current
                 | Request::Begin { .. }
+                | Request::RetrySnapshot { .. }
                 | Request::Bind { .. }
                 | Request::Allocate { .. }
                 | Request::Allocation { .. }
@@ -2051,6 +2094,16 @@ impl DirectTimestampSource for TimestampClient {
     }
 }
 impl TimestampService for TimestampClient {
+    fn advance_floor(
+        &self,
+        authority: Authority,
+        retired_at: Option<CommitTs>,
+    ) -> ConsensusFuture<'_, u64> {
+        Box::pin(self.value(Request::AdvanceFloor {
+            authority,
+            retired_at,
+        }))
+    }
     fn native_archive_page<'a>(&'a self,closure:&'a VerifiedArchiveClosure,after:Option<Vec<u8>>)->ConsensusFuture<'a,crate::oltp_replication::authority::status::identity::transaction::archive_images::MetadataArchivePage>{
         Box::pin(async move {
             let(mut page,owner):(crate::oltp_replication::authority::status::identity::transaction::archive_images::MetadataArchivePage,_)=self.response(Request::ArchiveMetadata{closure:closure.statement().clone(),after}).await?.decoded(&self.client.shared).await?;
@@ -2292,6 +2345,21 @@ impl TimestampService for TimestampClient {
         Box::pin(
             async move { TimestampClient::begin_snapshot(self, view, identity, reservation).await },
         )
+    }
+    fn retry_snapshot<'a>(
+        &'a self,
+        view: AuthorityView,
+        identity: PinIdentity,
+        previous: crate::oltp_replication::authority::status::VerifiedSettlement,
+    ) -> ConsensusFuture<'a, StoragePin> {
+        Box::pin(async move {
+            self.value(Request::RetrySnapshot {
+                view,
+                identity,
+                previous: previous.into_sealed(),
+            })
+            .await
+        })
     }
     fn bind_snapshot_context<'a>(
         &'a self,

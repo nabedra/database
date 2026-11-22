@@ -60,7 +60,7 @@ struct Transition {
 }
 
 #[derive(Default)]
-struct Sweep {
+pub(super) struct Sweep {
     revision: Option<u64>,
     after: Option<Uuid>,
     page: VecDeque<GroupRecord>,
@@ -68,7 +68,11 @@ struct Sweep {
     done: bool,
 }
 impl Sweep {
-    async fn next(
+    pub(super) fn is_exhausted(&self) -> bool {
+        self.done && self.page.is_empty()
+    }
+
+    pub(super) async fn next(
         &mut self,
         runtime: &WorkerRuntime,
     ) -> Result<Option<GroupRecord>, ProtocolError> {
@@ -748,22 +752,6 @@ async fn settle(
                 .status
                 .failure_settled_proof(attempt.txn, attempt.request)
                 .await?;
-            if attempt.image.is_none() {
-                let GroupKind::Data { table_id, .. } = intent.source.kind else {
-                    return Err(unknown());
-                };
-                if let Some(binding) = runtime
-                    .services
-                    .catalog
-                    .participant()
-                    .lifecycle_holder(table_id)
-                    .await?
-                    && binding.txn == attempt.txn
-                    && binding.request == attempt.request
-                {
-                    runtime.help_lifecycle(binding).await?;
-                }
-            }
             runtime
                 .settle_split_proof(client, &attempt, authority, proof)
                 .await

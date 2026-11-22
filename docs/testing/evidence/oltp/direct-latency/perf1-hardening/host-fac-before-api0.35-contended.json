@@ -1,0 +1,229 @@
+[
+ {
+  "allocations": {
+   "api_bytes": 550000000,
+   "api_cpu": 0.35,
+   "driver_bytes": 900000000,
+   "driver_cpu": 0.65,
+   "hold_compaction": false,
+   "total_bytes": 7900000000,
+   "total_cpu": 4,
+   "worker_bytes": 2150000000,
+   "worker_cpu": 1.0
+  },
+  "binary_sha256": "f2a27de023e9e0a1d7b981510563f06693ade679a7ae7c001de108353355ea6c",
+  "correctness_verified": true,
+  "rows": [
+   {
+    "ack_rate": 79.81,
+    "acked": 1221,
+    "api": [
+     {
+      "cpu": 0.155,
+      "throttled": "20/139"
+     },
+     {
+      "cpu": 0.173,
+      "throttled": "22/138"
+     },
+     {
+      "cpu": 0.168,
+      "throttled": "9/65"
+     }
+    ],
+    "api_stages_ms": {
+     "gw.direct.lane_wait": null,
+     "gw.direct.send": 23.04,
+     "gw.route": 23.14,
+     "http.dispatch.spawn_wait": 104.79
+    },
+    "cap": 57,
+    "driver": [
+     0.3,
+     0.29,
+     0.25
+    ],
+    "failed": 0,
+    "leader": "w1",
+    "leader_cpu": [
+     {
+      "cpu": 0.786,
+      "throttled": "46/139"
+     },
+     {
+      "cpu": 0.767,
+      "throttled": "48/145"
+     },
+     {
+      "cpu": 0.756,
+      "throttled": "42/155"
+     }
+    ],
+    "leader_stages_ms": {
+     "leader.mutation.total": 19.83,
+     "raft.data.append_write": 3.7,
+     "raft.data.client_write": 15.76
+    },
+    "leader_storage": {
+     "commits": 3661,
+     "compaction_bytes": 0,
+     "flush_bytes": 0,
+     "journal_syncs": 1221,
+     "l0_runs": 0,
+     "stall_ms": 12
+    },
+    "offered": 1500,
+    "p50": 89.0,
+    "p99": 658.7,
+    "phase": 100,
+    "refusals": {
+     "rejected: executor admission capacity exhausted": 222
+    },
+    "rejected": 222,
+    "unresolved": 0
+   },
+   {
+    "ack_rate": 86.71,
+    "acked": 1377,
+    "api": [
+     {
+      "cpu": 0.169,
+      "throttled": "103/607"
+     },
+     {
+      "cpu": 0.169,
+      "throttled": "103/607"
+     },
+     {
+      "cpu": 0.169,
+      "throttled": "103/607"
+     }
+    ],
+    "api_stages_ms": {
+     "gw.direct.lane_wait": null,
+     "gw.direct.send": 22.16,
+     "gw.route": 22.24,
+     "http.dispatch.spawn_wait": 156.8
+    },
+    "cap": 675,
+    "driver": [
+     0.63,
+     0.63,
+     0.62
+    ],
+    "failed": 0,
+    "leader": "w1",
+    "leader_cpu": [
+     {
+      "cpu": 0.755,
+      "throttled": "125/627"
+     },
+     {
+      "cpu": 0.751,
+      "throttled": "102/543"
+     },
+     {
+      "cpu": 0.751,
+      "throttled": "102/543"
+     }
+    ],
+    "leader_stages_ms": {
+     "leader.mutation.total": 19.06,
+     "raft.data.append_write": 3.53,
+     "raft.data.client_write": 14.69
+    },
+    "leader_storage": {
+     "commits": 4131,
+     "compaction_bytes": 0,
+     "flush_bytes": 1825628,
+     "journal_syncs": 1378,
+     "l0_runs": 1,
+     "stall_ms": 14
+    },
+    "offered": 3000,
+    "p50": 237.5,
+    "p99": 607.0,
+    "phase": 200,
+    "refusals": {
+     "rejected: executor admission capacity exhausted": 948
+    },
+    "rejected": 948,
+    "unresolved": 0
+   },
+   {
+    "ack_rate": 96.73,
+    "acked": 1488,
+    "api": [
+     {
+      "cpu": 0.169,
+      "throttled": "103/607"
+     },
+     {
+      "cpu": 0.169,
+      "throttled": "103/607"
+     },
+     {
+      "cpu": 0.169,
+      "throttled": "103/607"
+     }
+    ],
+    "api_stages_ms": {
+     "gw.direct.lane_wait": null,
+     "gw.direct.send": 20.78,
+     "gw.route": 20.85,
+     "http.dispatch.spawn_wait": 139.45
+    },
+    "cap": 3718,
+    "driver": [
+     0.63,
+     0.64,
+     0.63
+    ],
+    "failed": 0,
+    "leader": "w1",
+    "leader_cpu": [
+     {
+      "cpu": 0.751,
+      "throttled": "102/543"
+     },
+     {
+      "cpu": 0.751,
+      "throttled": "102/543"
+     },
+     {
+      "cpu": 0.751,
+      "throttled": "102/543"
+     }
+    ],
+    "leader_stages_ms": {
+     "leader.mutation.total": 18.85,
+     "raft.data.append_write": 3.57,
+     "raft.data.client_write": 14.9
+    },
+    "leader_storage": {
+     "commits": 4468,
+     "compaction_bytes": 0,
+     "flush_bytes": 0,
+     "journal_syncs": 1492,
+     "l0_runs": 1,
+     "stall_ms": 3
+    },
+    "offered": 6000,
+    "p50": 265.1,
+    "p99": 569.2,
+    "phase": 400,
+    "refusals": {
+     "rejected: executor admission capacity exhausted": 794
+    },
+    "rejected": 794,
+    "unresolved": 0
+   }
+  ],
+  "run": "fac-before-api0.35",
+  "verification": {
+   "mismatches": 0,
+   "rows": 5000,
+   "unresolved_keys": 0
+  }
+ }
+]

@@ -9,15 +9,18 @@ mod deployment;
 mod direct_gateway;
 mod index_admin;
 mod index_backend;
+mod index_reclaim;
 mod migration;
 mod placement;
 mod pool_drain;
 mod query_statistics;
+mod queued_attempt;
 mod recovery;
 pub(super) mod retirement;
 #[cfg(test)]
 mod shard_route;
 mod split;
+pub(super) mod system_recovery;
 mod worker_drain;
 use super::{
     admission::{DurableAdmission, ReservationResult},
@@ -27,7 +30,7 @@ use super::{
     bootstrap::LocalServices,
     http_runtime::{HttpRuntime, OwnedReceipt},
     replica::*,
-    transaction::TransactionCoordinator,
+    transaction::{RETRY_PROGRESS_TIMEOUT, TransactionCoordinator},
     worker_endpoint::AuthorityReader,
 };
 use crate::{
@@ -53,6 +56,7 @@ use crate::{
     response::{self, EncodedResponse},
     scheduling::{MemoryCharge, ResourceScheduler},
 };
+use queued_attempt::QueuedAttempt;
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -72,6 +76,8 @@ pub(crate) struct WorkerRuntime {
     transactions: TransactionCoordinator,
     scoped: Option<Arc<super::scoped_worker::ScopedWorker>>,
     ingress: Executor,
+    /// HTTP admission for direct-gateway requests (PERF1).
+    direct_ingress: Executor,
     actors: Executor,
     control_ingress: Executor,
     index_builds: Executor,
@@ -215,6 +221,7 @@ impl WorkerRuntime {
             planner,
             transactions,
             ingress,
+            direct_ingress: Executor::new(super::http_runtime::DIRECT_INGRESS_SLOTS, 0)?,
             control_ingress: Executor::new(2, 0)?,
             index_builds: Executor::new(1, 0)?,
             supervision: Executor::new(1, 0)?,
@@ -245,26 +252,30 @@ impl WorkerRuntime {
             }
         }
         let retirement = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let Some(runtime) = weak.upgrade() else {
-                    break;
-                };
-                if !runtime.accepting.load(Ordering::Acquire) {
-                    break;
+            let reclaim = index_reclaim::reclaim_indexes(weak.clone());
+            let retire = async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let Some(runtime) = weak.upgrade() else {
+                        break;
+                    };
+                    if !runtime.accepting.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let _ = runtime.tick_supervision();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        runtime.dispatch_retained(),
+                    )
+                    .await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        runtime.retire_expired(),
+                    )
+                    .await;
                 }
-                let _ = runtime.tick_supervision();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    runtime.dispatch_retained(),
-                )
-                .await;
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    runtime.retire_expired(),
-                )
-                .await;
-            }
+            };
+            tokio::join!(retire, reclaim);
         });
         *runtime.retirement.lock().map_err(|_| unknown())? = Some(retirement);
         let endpoint = super::application::ApplicationEndpoint::new(&runtime);
@@ -315,6 +326,20 @@ impl WorkerRuntime {
                 catalog: runtime.services.catalog.participant().identity().clone(),
                 timestamps: runtime.services.timestamps.identity().clone(),
                 local_timestamps: runtime.services.direct_timestamps.clone(),
+            });
+            // CAP1: watch the cluster features this worker's own tasks and
+            // hosted leaders gate on, from activation on (no feature is
+            // enabled before it).
+            let features = runtime.services.manager.cluster_features().clone();
+            let control = runtime.services.control_client.clone();
+            let local = runtime.services.local;
+            direct.on_active(move || {
+                crate::oltp_replication::authority::control::watch_cluster_features(
+                    &control,
+                    local,
+                    &[crate::oltp_replication::authority::control::INDEX_RECLAIM_FEATURE],
+                    &features,
+                );
             });
             direct.start();
             runtime.direct.set(direct).map_err(|_| unknown())?;
@@ -740,6 +765,10 @@ impl WorkerRuntime {
         id: Uuid,
         include_result: bool,
     ) -> Result<ObservedApplication, ProtocolError> {
+        #[cfg(test)]
+        if super::recovery_tests::lose_receipt_observation(id).await {
+            return Err(unknown());
+        }
         let limit = if include_result {
             INLINE_RECEIPT_BYTES
         } else {
@@ -936,6 +965,7 @@ impl WorkerRuntime {
         }
         self.admission_cleanup.stop();
         self.ingress.stop_accepting();
+        self.direct_ingress.stop_accepting();
         self.actors.stop_accepting();
         self.control_ingress.stop_accepting();
         self.index_builds.stop_accepting();
@@ -947,6 +977,7 @@ impl WorkerRuntime {
             scoped.drain().await;
         }
         self.admission_cleanup.stop();
+        self.direct_ingress.drain().await;
         self.ingress.drain().await;
         self.actors.drain().await;
         self.control_ingress.drain().await;
@@ -1037,6 +1068,8 @@ impl WorkerRuntime {
         // The HTTP ingress owns this entire future independently of its socket.
         let prepared = self.admission.prepare(body, authorization, now()).await?;
         let id = prepared.request_id;
+        #[cfg(test)]
+        super::recovery_tests::count_submission(id);
         let gate = self
             .admission_cleanup
             .lock(self.gate(id)?, id, prepared.digest)
@@ -1200,13 +1233,15 @@ impl WorkerRuntime {
                     id,
                     armed: true,
                 };
-                runtime.execute(id, captured_point).await.map_err(|error| {
-                    eprintln!(
-                        "nabedra-db: request {id} execution failed: {:?}: {}",
-                        error.code, error.message
-                    );
-                    error
-                })?;
+                runtime
+                    .execute(id, captured_point, None)
+                    .await
+                    .inspect_err(|error| {
+                        eprintln!(
+                            "nabedra-db: request {id} execution failed: {:?}: {}",
+                            error.code, error.message
+                        );
+                    })?;
                 settlement.armed = false;
                 Ok(())
             }) {
@@ -1311,6 +1346,7 @@ impl WorkerRuntime {
         &self,
         id: Uuid,
         captured_point: Option<CatalogCapture>,
+        resumed: Option<QueuedAttempt>,
     ) -> Result<(), ProtocolError> {
         #[cfg(test)]
         super::recovery_tests::pause("queued", id).await;
@@ -1319,29 +1355,136 @@ impl WorkerRuntime {
         let read = input.context.read.as_ref().ok_or_else(unknown)?;
         let current = self.services.control.current(&self.services.scope).await?;
         let authority = current.ready.view.authority();
-        let pin = self
-            .services
-            .catalog
-            .snapshot(read.storage_pin.read_ts, authority)?;
-        let point = captured_point
-            .as_ref()
-            .and_then(|catalog| catalog.point_for(&pin, read.catalog_root));
-        let txn = TxnId {
-            request_id: id,
-            attempt: 1,
-        };
+        let mut attempt = resumed.unwrap_or_else(|| QueuedAttempt::original(id, read.storage_pin));
+        let initial_txn = attempt.txn;
         let mutation = input.request.operation.is_mutation();
-        let mut guards = BTreeMap::new();
+        let mut captured_point = captured_point;
+        let encoded = loop {
+            let txn = attempt.txn;
+            let pin = self
+                .services
+                .catalog
+                .snapshot(attempt.pin.read_ts, authority)?;
+            #[cfg(test)]
+            if txn.attempt == 1 {
+                super::recovery_tests::transaction_checkpoint("snapshot", id, &pin.read_ts).await;
+            }
+            // The pinned Running copy barrier has finished.
+            if txn == initial_txn
+                && let Ok(mut replica) = self.services.replica.lock()
+            {
+                replica.observe_dispatch(current, running);
+            }
+            let point = captured_point
+                .as_ref()
+                .and_then(|catalog| catalog.point_for(&pin, read.catalog_root));
+            let mut guards = BTreeMap::new();
+            let planned = self
+                .plan_queued(&input, &pin, txn, request, point, &mut guards)
+                .await?;
+            drop(captured_point.take());
+            break match planned {
+                Ok(PlannedOperation::Read(bytes)) => {
+                    let shared = self.services.shared.clone();
+                    shared
+                        .execute(ExecutionClass::Query, 0, 0, move || {
+                            let raw: &serde_json::value::RawValue =
+                                serde_json::from_slice(bytes.as_ref()).map_err(|_| unknown())?;
+                            Ok(response::encode_success(id, raw, false))
+                        })
+                        .await?
+                }
+                Ok(PlannedOperation::Mutation(plan)) => {
+                    let decision = Box::pin(self.transactions.commit_queued(
+                        authority,
+                        txn,
+                        request,
+                        pin.read_ts,
+                        plan,
+                        self.direct_switch().map(Arc::as_ref),
+                    ))
+                    .await?;
+                    if decision.statement().decision.retries_snapshot() {
+                        attempt = self
+                            .advance_queued_attempt(current, &read.identity, &decision)
+                            .await?;
+                        continue;
+                    }
+                    match decision.outcome().ok_or_else(unknown)?.result() {
+                        Ok(value) => response::encode_success(id, &value, true),
+                        Err(error) => response::encode_error(Some(id), error),
+                    }
+                }
+                Err(PlanError::Protocol(error)) => {
+                    if mutation {
+                        let terminal = self
+                            .services
+                            .status
+                            .terminal_failure(authority, request, error.clone())
+                            .await?;
+                        #[cfg(test)]
+                        super::recovery_tests::transaction_checkpoint(
+                            "status-failure",
+                            id,
+                            &terminal,
+                        )
+                        .await;
+                        if !guards.is_empty() {
+                            let settled = self
+                                .services
+                                .status
+                                .failure_settled_proof(txn, request)
+                                .await?;
+                            for (_, guard) in guards {
+                                self.services
+                                    .catalog
+                                    .participant()
+                                    .release_lifecycle(authority, guard, settled.clone())
+                                    .await?;
+                            }
+                        }
+                        terminal_response(id, &terminal)?
+                    } else {
+                        response::encode_error(Some(id), error)
+                    }
+                }
+                Err(_) => return Err(unknown()),
+            };
+        };
+        self.services
+            .queue
+            .finish(id, encoded.status, encoded.body, now())
+            .await?;
+        self.changed.notify_waiters();
+        let statement = self
+            .services
+            .replica
+            .lock()
+            .map_err(|_| unknown())?
+            .terminal_statement(id)
+            .map_err(QueueError::protocol)?;
+        // A failed cleanup does not undo an acknowledged decision/result. Keep
+        // the complete record and retry through the bounded retirement loop.
+        let _ = self.services.timestamps.release(statement).await;
+        Ok(())
+    }
+    async fn plan_queued(
+        &self,
+        input: &DecodedInput,
+        pin: &crate::oltp::mvcc::catalog::PinnedCatalog,
+        txn: TxnId,
+        request: RequestBinding,
+        point: Option<&crate::oltp::mvcc::catalog::PointCatalog>,
+        guards: &mut BTreeMap<Uuid, crate::oltp::mvcc::store::lifecycle::VerifiedLifecycleGuard>,
+    ) -> Result<Result<PlannedOperation, PlanError>, ProtocolError> {
+        let mutation = input.request.operation.is_mutation();
+        let mut blocked_since = None;
         let mut split_retry: Option<(tokio::time::Instant, ProtocolError)> = None;
         let mut split_backoff = std::time::Duration::from_millis(50);
-        // The pinned Running copy barrier has finished and the backend is about to start.
-        if let Ok(mut replica) = self.services.replica.lock() {
-            replica.observe_dispatch(current, running);
-        }
         let planned = loop {
             let planning = self.planner.plan(
                 input.request.operation.clone(),
-                &pin,
+                pin,
                 txn,
                 request,
                 input.owner.clone(),
@@ -1380,7 +1523,7 @@ impl WorkerRuntime {
                 {
                     #[cfg(test)]
                     if split_retry.is_none() {
-                        super::recovery_tests::pause("split_read_pending", id).await;
+                        super::recovery_tests::pause("split_read_pending", txn.request_id).await;
                     }
                     // Each plan drops its native and query grants before waiting.
                     // Re-read Catalog at the original accepted timestamp.
@@ -1393,14 +1536,19 @@ impl WorkerRuntime {
                 }
                 PlanError::Blocked(intent) => {
                     #[cfg(test)]
-                    super::recovery_tests::transaction_checkpoint("blocked", id, &intent).await;
+                    super::recovery_tests::transaction_checkpoint(
+                        "blocked",
+                        txn.request_id,
+                        &intent,
+                    )
+                    .await;
                     self.help_intent(intent).await?;
                 }
                 PlanError::LifecyclePending(binding) => {
                     #[cfg(test)]
                     super::recovery_tests::transaction_checkpoint(
                         "lifecycle-blocked",
-                        id,
+                        txn.request_id,
                         &binding,
                     )
                     .await;
@@ -1416,77 +1564,17 @@ impl WorkerRuntime {
                 }
                 other => break Err(other),
             }
+            if txn.attempt > 1
+                && blocked_since
+                    .get_or_insert_with(tokio::time::Instant::now)
+                    .elapsed()
+                    >= RETRY_PROGRESS_TIMEOUT
+            {
+                return Err(unknown());
+            }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         };
-        drop(captured_point);
-        let encoded = match planned {
-            Ok(PlannedOperation::Read(bytes)) => {
-                let shared = self.services.shared.clone();
-                shared
-                    .execute(ExecutionClass::Query, 0, 0, move || {
-                        let raw: &serde_json::value::RawValue =
-                            serde_json::from_slice(bytes.as_ref()).map_err(|_| unknown())?;
-                        Ok(response::encode_success(id, raw, false))
-                    })
-                    .await?
-            }
-            Ok(PlannedOperation::Mutation(plan)) => {
-                let decision = self
-                    .transactions
-                    .commit(authority, txn, request, read.storage_pin.read_ts, plan)
-                    .await?;
-                match decision.outcome().ok_or_else(unknown)?.result() {
-                    Ok(value) => response::encode_success(id, &value, true),
-                    Err(error) => response::encode_error(Some(id), error),
-                }
-            }
-            Err(PlanError::Protocol(error)) => {
-                if mutation {
-                    let terminal = self
-                        .services
-                        .status
-                        .terminal_failure(authority, request, error.clone())
-                        .await?;
-                    #[cfg(test)]
-                    super::recovery_tests::transaction_checkpoint("status-failure", id, &terminal)
-                        .await;
-                    if !guards.is_empty() {
-                        let settled = self
-                            .services
-                            .status
-                            .failure_settled_proof(txn, request)
-                            .await?;
-                        for (_, guard) in guards {
-                            self.services
-                                .catalog
-                                .participant()
-                                .release_lifecycle(authority, guard, settled.clone())
-                                .await?;
-                        }
-                    }
-                    terminal_response(id, &terminal)?
-                } else {
-                    response::encode_error(Some(id), error)
-                }
-            }
-            Err(_) => return Err(unknown()),
-        };
-        self.services
-            .queue
-            .finish(id, encoded.status, encoded.body, now())
-            .await?;
-        self.changed.notify_waiters();
-        let statement = self
-            .services
-            .replica
-            .lock()
-            .map_err(|_| unknown())?
-            .terminal_statement(id)
-            .map_err(QueueError::protocol)?;
-        // A failed cleanup does not undo an acknowledged decision/result. Keep
-        // the complete record and retry through the bounded retirement loop.
-        let _ = self.services.timestamps.release(statement).await;
-        Ok(())
+        Ok(planned)
     }
     async fn help_intent(&self, intent: IntentRef) -> Result<(), ProtocolError> {
         let authority = self
@@ -1497,7 +1585,10 @@ impl WorkerRuntime {
             .ready
             .view
             .authority();
-        if let Some(decision) = self.transactions.recover(authority, intent.txn).await? {
+        if let Some(decision) = self
+            .recover_queued_transaction(authority, intent.txn)
+            .await?
+        {
             if decision.statement().manifest != intent.manifest {
                 return Err(unknown());
             }
@@ -1516,28 +1607,30 @@ impl WorkerRuntime {
             .ready
             .view
             .authority();
-        let settled =
-            if let Some(decision) = self.transactions.recover(authority, binding.txn).await? {
-                let statement = decision.statement();
-                self.services
-                    .status
-                    .settled_proof(statement.txn, statement.manifest)
-                    .await?
-            } else {
-                // A planning actor may own a guard before a manifest exists. Only
-                // its immutable Status failure proves that no Prepare can follow.
-                let identity = self.durable_lookup(binding.request.request_id).await?;
-                if !matches!(
-                    identity,
-                    Some(IdentityLookup::Terminal(TerminalIdentity::Failed { .. }))
-                ) {
-                    return Ok(());
-                }
-                self.services
-                    .status
-                    .failure_settled_proof(binding.txn, binding.request)
-                    .await?
-            };
+        let decision = self
+            .recover_queued_transaction(authority, binding.txn)
+            .await?;
+        let settled = if let Some(decision) = decision {
+            let statement = decision.statement();
+            self.services
+                .status
+                .settled_proof(statement.txn, statement.manifest)
+                .await?
+        } else {
+            // A planning actor may own a guard before a manifest exists. Only
+            // its immutable Status failure proves that no Prepare can follow.
+            let identity = self.durable_lookup(binding.request.request_id).await?;
+            if !matches!(
+                identity,
+                Some(IdentityLookup::Terminal(TerminalIdentity::Failed { .. }))
+            ) {
+                return Ok(());
+            }
+            self.services
+                .status
+                .failure_settled_proof(binding.txn, binding.request)
+                .await?
+        };
         let participant = self.services.catalog.participant();
         if let Some(guard) = participant.lifecycle_guard(&binding).await? {
             participant
@@ -1772,6 +1865,9 @@ impl HttpRuntime for WorkerRuntime {
     fn ingress(&self) -> &Executor {
         &self.ingress
     }
+    fn direct_ingress(&self) -> &Executor {
+        &self.direct_ingress
+    }
     fn direct_gateway(&self) -> Option<Arc<super::application::direct::DirectGateway>> {
         self.direct_gateway_handle().cloned()
     }
@@ -1865,6 +1961,14 @@ impl HttpRuntime for WorkerRuntime {
     }
     fn stats(&self) -> EndpointFuture<'_, EncodedResponse> {
         Box::pin(async move {
+            #[cfg(test)]
+            {
+                super::recovery_tests::observe_data_voters(&self.services.manager);
+                super::recovery_tests::observe_control_leader(
+                    &self.services.manager,
+                    self.services.control.identity().group_id,
+                );
+            }
             let (queue, accept_to_dispatch) = {
                 let replica = self.services.replica.lock().map_err(|_| unknown())?;
                 #[cfg(test)]
@@ -1872,37 +1976,91 @@ impl HttpRuntime for WorkerRuntime {
                 (replica.stats(), replica.queue_latency_stats())
             };
             let scheduler = self.services.shared.scheduler().usage();
+            #[allow(unused_mut)]
+            let mut stats = serde_json::json!({
+                "engine":"oltp", "queue":queue, "scheduler":scheduler,
+                "accept_to_dispatch":accept_to_dispatch,
+                "block_cache":self.services.shared.block_cache_usage(),
+                "storage":self.services.shared.storage_stats(),
+                "storage_reservations":self.services.shared.storage_reservations(),
+                // Rule 6: secondary pools refused at open, with the error class.
+                "refused_pools":self.services.pools.refused_report(),
+                "working_decode_bytes":self.services.shared.working_decode_bytes(),
+                "native_thread_budget":self.services.shared.thread_budget(),
+                // `null` until `data.direct.v1` activates the executor.
+                "direct":match self.direct_switch().and_then(|switch| switch.direct_stats()) {
+                    Some(stats) => serde_json::to_value(stats).map_err(|_| unknown())?,
+                    None => crate::oltp_replication::service_rpc::direct::installed(&self.services.shared)
+                        .map(|service| service.stats())
+                        .unwrap_or(serde_json::Value::Null),
+                },
+                "direct_capability":self.direct_switch().map(|switch| serde_json::json!({
+                    "active":switch.is_direct_active(), "direct_oltp":switch.direct_oltp(),
+                    "history_settling":switch.history_settling(),
+                    // GC2: `data.direct.batch` enabled (DirectBatch entries).
+                    "batch":switch.is_batch_enabled(),
+                })),
+                "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
+                // Local lane refusals (NS11 finding 8).
+                "transport":self.services.manager.client().lane_refusals(),
+                // RV-APPLY: transient retries and stopped cores.
+                "raft":self.services.manager.raft_health(),
+                // PERF1: per-stage latency histograms of this process.
+                "stage_timing":super::stage_timing::snapshot(),
+            });
+            #[cfg(test)]
+            {
+                if let Some(dir) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")
+                    && std::fs::remove_file(std::path::Path::new(&dir).join("reset-growth-decode"))
+                        .is_ok()
+                {
+                    self.services.shared.reset_working_decode_peak();
+                }
+                stats["test_working_memory"] = serde_json::json!({
+                    "decode_peak_bytes": self.services.shared.peak_working_decode_bytes(),
+                    "task_limit_bytes": self.services.shared.task_memory_limit_bytes(),
+                });
+                if let Some(source) = &self.services.direct_timestamps
+                    && let Some(probe) =
+                        super::recovery_tests::timestamp_probe(source.as_ref()).await
+                {
+                    stats["test_timestamp"] = probe;
+                }
+                if let Some(group) = super::recovery_tests::group_leader_probe() {
+                    stats["test_group_leader"] =
+                        serde_json::json!(self.services.manager.test_group_leader(group));
+                }
+                if let Some(request) = super::recovery_tests::pool_sync::status_probe() {
+                    let lookup = match self.durable_lookup(request).await {
+                        Ok(Some(IdentityLookup::Terminal(terminal))) => {
+                            let result = match &terminal {
+                                TerminalIdentity::Committed { outcome, .. } => {
+                                    Some(outcome.result()?)
+                                }
+                                _ => None,
+                            };
+                            serde_json::json!({"terminal": terminal, "result": result})
+                        }
+                        Ok(Some(_)) => serde_json::json!({"pending": true}),
+                        Ok(None) => serde_json::Value::Null,
+                        Err(error) => serde_json::json!({"error": error}),
+                    };
+                    stats["test_pool_sync"] = serde_json::json!({
+                        "pools_requiring_recovery": self.services.pools.pool_ids()?.into_iter()
+                            .filter_map(|id| self.services.pools.get(id).ok().flatten())
+                            .filter(|pool| pool.requires_recovery()).count(),
+                        "status": lookup,
+                    });
+                }
+                if let Some(observed) =
+                    super::recovery_tests::maintenance::observe(&self.services).await?
+                {
+                    stats["test_maintenance"] = observed;
+                }
+            }
             Ok(EncodedResponse {
                 status: 200,
-                body: serde_json::to_vec(&serde_json::json!({
-                    "engine":"oltp", "queue":queue, "scheduler":scheduler,
-                    "accept_to_dispatch":accept_to_dispatch,
-                    "block_cache":self.services.shared.block_cache_usage(),
-                    "storage":self.services.shared.storage_stats(),
-                    // Rule 6: secondary pools refused at open, with the error class.
-                    "refused_pools":self.services.pools.refused_report(),
-                    "working_decode_bytes":self.services.shared.working_decode_bytes(),
-                    "native_thread_budget":self.services.shared.thread_budget(),
-                    // `null` until `data.direct.v1` activates the executor.
-                    "direct":match self.direct_switch().and_then(|switch| switch.direct_stats()) {
-                        Some(stats) => serde_json::to_value(stats).map_err(|_| unknown())?,
-                        None => crate::oltp_replication::service_rpc::direct::installed(&self.services.shared)
-                            .map(|service| service.stats())
-                            .unwrap_or(serde_json::Value::Null),
-                    },
-                    "direct_capability":self.direct_switch().map(|switch| serde_json::json!({
-                        "active":switch.is_direct_active(), "direct_oltp":switch.direct_oltp(),
-                        "history_settling":switch.history_settling(),
-                    })),
-                    "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
-                    // Local lane refusals (NS11 finding 8).
-                    "transport":self.services.manager.client().lane_refusals(),
-                    // RV-APPLY: transient retries and stopped cores.
-                    "raft":self.services.manager.raft_health(),
-                    // PERF1: per-stage latency histograms of this process.
-                    "stage_timing":super::stage_timing::snapshot(),
-                }))
-                .map_err(|_| unknown())?,
+                body: serde_json::to_vec(&stats).map_err(|_| unknown())?,
             })
         })
     }

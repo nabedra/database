@@ -339,6 +339,7 @@ pub(super) fn begin(
             state: PinState::Active,
             purpose: PinPurpose::Application,
             scoped_copy_proof: None,
+            retry_pins: None,
         };
         put(tx, &key, &record)?;
         tx.put(&active_key(pin), identity.nonce.as_bytes())?;

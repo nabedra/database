@@ -1,0 +1,12 @@
+NAME                                              ATTACHREQUIRED   PODINFOONMOUNT   STORAGECAPACITY   TOKENREQUESTS   REQUIRESREPUBLISH   MODES        AGE
+csidriver.storage.k8s.io/rawfile.csi.openebs.io   false            true             true              <unset>         false               Persistent   35s
+
+NAME                                                          DRIVERS   AGE
+csinode.storage.k8s.io/nabedra-live3-6430c078-control-plane   0         3m40s
+csinode.storage.k8s.io/nabedra-live3-6430c078-worker          1         3m19s
+csinode.storage.k8s.io/nabedra-live3-6430c078-worker2         0         3m20s
+csinode.storage.k8s.io/nabedra-live3-6430c078-worker3         0         3m21s
+
+NAME                                             PROVISIONER              RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+storageclass.storage.k8s.io/rawfile-localpv      rawfile.csi.openebs.io   Delete          WaitForFirstConsumer   true                   35s
+storageclass.storage.k8s.io/standard (default)   rancher.io/local-path    Delete          WaitForFirstConsumer   false                  3m30s

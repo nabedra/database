@@ -27,8 +27,9 @@ use crate::{
         TlsMaterial,
         authority::{
             control::{
-                ControlClient, ControlReply, ControlRoutes, DataWorkerClient, DataWorkerIntent, EksReplacementPermit,
-                Fault, GroupRecord, InventoryPage, ServiceAction, WorkerDrainPhase,
+                ControlClient, ControlReply, DataWorkerClient, DataWorkerIntent,
+                EksReplacementPermit, Fault, GroupRecord, InventoryPage, PublishedControlRoutes,
+                ServiceAction, WorkerDrainPhase,
             },
             status::{PartitionedStatus, StatusService, StatusTopology},
         },
@@ -106,14 +107,6 @@ struct Auth {
 
 fn valid_token(token: &str) -> bool {
     (43..=4096).contains(&token.len()) && token.bytes().all(|byte| (33..=126).contains(&byte))
-}
-
-struct Routes(Vec<Uuid>);
-impl ControlRoutes for Routes {
-    fn next(&self, after: Option<Uuid>) -> Result<Option<Uuid>, ProtocolError> {
-        let index = after.map_or(0, |old| self.0.partition_point(|worker| *worker <= old));
-        Ok(self.0.get(index).copied())
-    }
 }
 
 struct Joined {
@@ -221,6 +214,13 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         shared.clone(),
     )?;
     let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+    registry.reserve(group.clone())?.bind(
+        Purpose::SystemRecovery,
+        Arc::new(crate::oltp_replication::manager::system_recovery::ReplacementCapabilityEndpoint {
+            group: group.clone(),
+            shared: shared.clone(),
+        }),
+    )?;
     let transport = Arc::new(WorkerTransport::new(
         &node.intent.enrollment,
         &tls,
@@ -230,14 +230,15 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         TransportConfig::default(),
     )?);
     let client = transport.client();
-    let mut voters: Vec<_> = pinned.iter().map(|(_, peer)| peer.worker_id).collect();
-    voters.sort_unstable();
+    let control_routes =
+        PublishedControlRoutes::new(pinned.iter().map(|(_, peer)| peer.worker_id).collect())?;
     let control = ControlClient::new(
         client.clone(),
         shared.clone(),
         group.clone(),
-        Arc::new(Routes(voters)),
+        control_routes.clone(),
     )?;
+    let bootstrap_peers: Vec<_> = pinned.iter().map(|(_, peer)| *peer).collect();
     let joining = DataWorkerClient::new(client.clone(), shared.clone(), group.clone(), pinned);
     let last_error = Mutex::new(None);
     let replacement = if let Some(drain) = node.eks_replacement_drain {
@@ -308,6 +309,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
             .await
     });
 
+    let revocation_refresh = Mutex::new(None);
     let result = tokio::time::timeout_at(deadline, async {
         let enroll = if let (Some(permit), Some(added)) = (&replacement, &added_mount) {
             transition_id("eks-replacement-enroll", &(permit.drain_id, local, mounted.total_bytes, added.total_bytes))?
@@ -337,6 +339,28 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         )
         .await?;
         startup_read(
+            deadline, &last_error, "exclude replaced Control bootstrap peers", || async {
+                directory.exclude_replaced_bootstrap_peers(&control, &bootstrap_peers).await
+                    .map_err(limited_enrollment_retry)
+            },
+        ).await?;
+        // REP6: Control-majority revocation view, refreshed once per second
+        // by its own task. Inbound exchanges check it in memory only.
+        startup_read(deadline, &last_error, "seed Data-only revocation view", || async {
+            directory
+                .seed_remote_revocations(&*control)
+                .await
+                .map_err(limited_enrollment_retry)
+        })
+        .await?;
+        let refresh = directory
+            .clone()
+            .run_revocation_refresh(control.clone(), stop.subscribe());
+        *revocation_refresh
+            .lock()
+            .map_err(|_| unavailable("data worker revocation refresh state"))? =
+            Some(tokio::spawn(refresh));
+        startup_read(
             deadline,
             &last_error,
             "apply data worker peer directory",
@@ -344,7 +368,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 directory
                     .refresh(&control)
                     .await
-                    .map_err(|error| limited_enrollment_retry(error))
+                    .map_err(limited_enrollment_retry)
             },
         )
         .await?;
@@ -416,6 +440,19 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                     },
                 )
                 .await;
+            // Every registered cluster feature (CAP1's registry).
+            for feature in crate::oltp_replication::authority::control::CLUSTER_FEATURES
+                .map(|feature| feature.name)
+            {
+                #[cfg(test)]
+                if feature == crate::oltp_replication::authority::control::DIRECT_BATCH_FEATURE
+                    && super::recovery_tests::take_fault("lose-batch-advert", local.worker_id)
+                        .is_some()
+                {
+                    continue;
+                }
+                control.advertise_direct_feature(feature, local).await;
+            }
             match startup_read(
                 deadline,
                 &last_error,
@@ -433,6 +470,21 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 } => break (current, members, ticket),
                 ControlReply::Rejected(Fault::Busy | Fault::Stale | Fault::NotReady) => {
                     wait_startup(deadline).await?
+                }
+                ControlReply::Rejected(Fault::DirectCapabilityRequired) => {
+                    // A capability advert can miss the accepting leader
+                    // while voters refresh this worker's enrollment. The
+                    // rejected join has no receipt. Re-advertise this exact
+                    // incarnation and retry against the current ready set.
+                    tracing::debug!(
+                        fault = ?Fault::DirectCapabilityRequired,
+                        "retrying data worker queue join after incomplete capability advertisement"
+                    );
+                    wait_startup(deadline).await?
+                }
+                ControlReply::Rejected(fault) => {
+                    tracing::warn!(?fault, "Control rejected data worker queue join");
+                    return Err(refused("Control refused data worker queue join"));
                 }
                 _ => return Err(refused("Control refused data worker queue join")),
             }
@@ -501,6 +553,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         }
         endpoint.release_join_mount()?;
         let manager = HostedGroupManager::new(shared.clone(), client.clone(), registry.clone());
+        let cluster_features = manager.cluster_features().clone();
         let (direct_catalog, direct_timestamps) = (catalog.identity.clone(), timestamps.clone());
         let scoped = if let Some(limits) = scoped_limits {
             let resolver = ScopedParticipants::new(shared.clone(), client.clone(), control.clone());
@@ -584,6 +637,16 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 local_timestamps: None,
             },
         );
+        // CAP1: this worker's hosted leaders gate `ReclaimIndex` on it.
+        let feature_control = control.clone();
+        direct.on_active(move || {
+            crate::oltp_replication::authority::control::watch_cluster_features(
+                &feature_control,
+                local,
+                &[crate::oltp_replication::authority::control::INDEX_RECLAIM_FEATURE],
+                &cluster_features,
+            );
+        });
         direct.start();
         Ok(Arc::new(Joined {
             scope,
@@ -612,6 +675,8 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
 
     let result = match result {
         Ok(joined) => {
+            let voter_refresh =
+                tokio::spawn(control_routes.run_refresh(control.clone(), stop.subscribe()));
             let refresh = tokio::spawn(directory.run_refresh(control, stop.subscribe()));
             let membership = tokio::spawn(follow_membership(joined.clone(), stop.subscribe()));
             let retirement = tokio::spawn(prune_retired(joined.clone(), stop.subscribe()));
@@ -634,6 +699,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
             let settled = settlement.await.map_err(|_| unavailable("data placement settlement task failed"));
             let _ = stop.send(true);
             let _ = refresh.await;
+            let _ = voter_refresh.await;
             let _ = membership.await;
             let _ = retirement.await;
             result.and(settled.and_then(|result| result))
@@ -641,6 +707,9 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         Err(error) => Err(error),
     };
     let _ = stop.send(true);
+    if let Some(refresh) = revocation_refresh.lock().ok().and_then(|mut task| task.take()) {
+        let _ = refresh.await;
+    }
     let transport = transport_task
         .await
         .map_err(|_| unavailable("data worker transport task failed"))?;

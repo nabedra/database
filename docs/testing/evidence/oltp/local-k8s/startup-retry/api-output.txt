@@ -1,0 +1,11 @@
+nabedra-db: OLTP API process failed
+Traceback (most recent call last):
+  File "/config/supervised_api.py", line 52, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/config/supervised_api.py", line 41, in main
+    receive(stream, 'prepared')
+  File "/config/supervised_api.py", line 21, in receive
+    assert message['type'] == message_type, message
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'code': 'startup_failed', 'type': 'fatal', 'version': 1}

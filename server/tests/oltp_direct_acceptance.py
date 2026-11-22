@@ -26,6 +26,7 @@ import http.client
 import json
 import math
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -294,7 +295,8 @@ def d11_rf1_cli(args, output):
     from oltp_runtime_acceptance import RuntimeServer
     root = output / 'rf1-cli'
     root.mkdir(parents=True, exist_ok=True)
-    binary = stderr_wrapper(args.binary, root / 'nabedra-db', root / 'server-stderr.log')
+    server_stderr = root / 'server-stderr.log'
+    binary = stderr_wrapper(args.binary, root / 'nabedra-db', server_stderr)
     server = RuntimeServer(binary, root, cli=True)
     trace = (root / 'admin-trace.log').open('a')
     try:
@@ -314,6 +316,13 @@ def d11_rf1_cli(args, output):
             trace.flush()
             return status, reply
         d11_index(server.url, server.token, None, admin, lambda: {'rf1': server.stats()})
+    except Exception:
+        if server_stderr.exists():
+            with server_stderr.open(errors='replace') as log:
+                diagnostics = [line.rstrip() for line in log if 'index build stopped' in line
+                               or 'preparation failed' in line or 'worker outgoing lane full' in line]
+            print('\n'.join(diagnostics[-30:]), file=sys.stderr, flush=True)
+        raise
     finally:
         trace.close()
         server.stop()
@@ -456,6 +465,41 @@ def suite_cluster(args, output, rf1_reference):
 def dump(cluster):
     for name in [*cluster.workers, *cluster.apis]:
         print(f'===== {name} log tail =====\n{cluster.tail(name)}', file=sys.stderr, flush=True)
+    # Raft snapshot, membership and placement lines from the whole log (SNAP1): the tail is
+    # usually DEBUG noise from the last second.
+    pattern = re.compile(r'snapshot|learner|membership|placement|replica move|WARN|ERROR')
+    for name in cluster.workers:
+        try:
+            lines = (cluster.root / f'{name}.log').read_text(errors='replace').splitlines()
+        except OSError:
+            continue
+        matched = [line[:400] for line in lines if pattern.search(line)][-300:]
+        print(f'===== {name} snapshot/membership lines ({len(matched)}) =====', file=sys.stderr, flush=True)
+        print('\n'.join(matched), file=sys.stderr, flush=True)
+
+
+def create_d11_index(admin, definition):
+    delay = 0.05
+    for retries in range(8):
+        build_id = uid()
+        code, reply = admin('storage.index.create', definition, build_id)
+        message = reply.get('error', {}).get('message', '')
+        refusal = {
+            'request_id': build_id,
+            'error': {'code': 'overloaded', 'message': message, 'outcome': 'not_applied'},
+        }
+        if code == 429 and reply == refusal and retries < 7 and re.fullmatch(
+                r'worker outgoing lane full \([A-Z][A-Za-z]*(?:/(?:direct|ingress))?\)', message):
+            # A refused declaration can leave a terminal failure for its build
+            # UUID. Keep the index definition and use a fresh build UUID only
+            # after this exact, definitive refusal.
+            time.sleep(delay)
+            delay = min(delay * 2, 0.25)
+            continue
+        assert code == 200, ('storage.index.create', code, reply)
+        created = reply['data']
+        assert created['build_id'] == build_id, created
+        return build_id, created, retries
 
 
 def d11_index(url, token, ca, admin, stats):
@@ -479,85 +523,127 @@ def d11_index(url, token, ca, admin, stats):
         return reply['data']['state']
     db = Database(url=url, token=token, database=DATABASE, ca_file=str(ca) if ca else None, timeout=30)
     table = db.create_table('d11_index', {'id': int, 'category': int, 'label': str}, key='id')
-    table.insert_many([{'id': i, 'category': i % 8, 'label': f'seed-{i}'} for i in range(64)])
-    stop = threading.Event()
-    acknowledged, errors, counter = {}, [], [64]
-    lock = threading.Lock()
+    seed_count = 64
+    expected = {key: {'id': key, 'category': key % 8, 'label': f'seed-{key}'} for key in range(seed_count)}
+    table.insert_many(list(expected.values()))
+    writers = 4
+    key_limit = seed_count + 16 * writers
+    initial_updates = [threading.Event() for _ in range(writers)]
+    declared, inserted, ready, updated_after_ready, stop = (threading.Event() for _ in range(5))
+    hot_key_updated = threading.Event()
 
     def writer(index):
         client = Http(url, token, 30, ca)
+        target, next_key, revision = index, seed_count + index, 0
+        acknowledged, refused = {}, 0
+
+        def write(name, payload):
+            nonlocal refused
+            code, reply = client.exchange('/v1/operations', operation(name, payload))
+            if code != 200:
+                assert reply['error']['outcome'] == 'not_applied', (name, code, reply)
+                refused += 1
+                return False
+            if name == 'table.update':
+                assert reply['data'] is True, (payload, reply)
+            return True
+
         try:
             while not stop.is_set():
-                with lock:
-                    key = counter[0]
-                    counter[0] += 1
-                category = key % 8
-                body = operation('table.insert', {'table_id': table.id, 'row': {'id': key, 'category': category,
-                                                                                  'label': f'w{index}-{key}'}})
-                status, reply = client.exchange('/v1/operations', body)
-                if status == 200:
-                    with lock:
-                        acknowledged[key] = category
-                    # Move an older row to another category through the direct path.
-                    moved = key - 32
-                    if moved >= 64:
-                        new = (moved + 3) % 8
-                        status, reply = client.exchange('/v1/operations', operation('table.update', {
-                            'table_id': table.id, 'key': moved, 'values': {'category': new}}))
-                        if status == 200 and reply['data'] is True:
-                            with lock:
-                                acknowledged[moved] = new
-                        elif status != 200:
-                            errors.append((status, reply))
-                else:
-                    errors.append((status, reply))
+                # Before declaration all writes update seeded keys. A delayed create
+                # request therefore cannot add work below the pinned backfill cut.
+                if declared.is_set() and next_key < key_limit:
+                    row = {'id': next_key, 'category': next_key % 8, 'label': f'w{index}-{next_key}'}
+                    next_key += writers
+                    if write('table.insert', {'table_id': table.id, 'row': row}):
+                        acknowledged[row['id']] = row
+                        # Keep the first source key hot across publication.
+                        if index != 0:
+                            target = row['id']
+                        inserted.set()
+
+                # Each writer owns its keys. Keep moving rows between categories and
+                # changing the covered label through the Ready publication.
+                after_ready = ready.is_set()
+                building = declared.is_set() and not after_ready
+                revision += 1
+                values = {'category': (target + revision) % 8, 'label': f'w{index}-update-{revision}'}
+                if write('table.update', {'table_id': table.id, 'key': target, 'values': values}):
+                    acknowledged[target] = {'id': target, **values}
+                    initial_updates[index].set()
+                    if target == 0 and building:
+                        hot_key_updated.set()
+                    if after_ready:
+                        updated_after_ready.set()
+            return acknowledged, refused
         finally:
             client.close()
 
     before = stats()
-    with ThreadPoolExecutor(4) as pool:
-        futures = [pool.submit(writer, index) for index in range(4)]
+    errors = acknowledged_rows = 0
+    with ThreadPoolExecutor(writers) as pool:
+        futures = [pool.submit(writer, index) for index in range(writers)]
         try:
-            time.sleep(1.0)
+            for updated in initial_updates:
+                assert updated.wait(timeout=15), 'writer did not update a seeded row before index create'
             index_id = uid()
             definition = {'table_id': table.id, 'index_id': index_id, 'name': 'by_category', 'columns': ['category'],
                           'covering': ['label']}
-            build_id = uid()
-            code, created = admin('storage.index.create', definition, build_id)
-            assert code == 200, ('storage.index.create', code, created)
-            created = created['data']
+            started = time.monotonic()
+            build_id, created, create_retries = create_d11_index(admin, definition)
             selector = {'table_id': table.id, 'index_id': index_id, 'build_id': build_id, 'attempt': 1}
             deadline = time.monotonic() + 120
             state = created['state']
+            saw_insert_while_building = False
+            saw_hot_update_while_building = False
+            declared.set()
             while state != 'ready':
                 assert state in (None, 'building', 'pending', 'backfilling', 'validating'), created
                 assert time.monotonic() < deadline, f'index never became ready: {state}'
                 time.sleep(poll)
+                inserted_before_poll = inserted.is_set()
+                hot_updated_before_poll = hot_key_updated.is_set()
                 state = status(selector)
-            time.sleep(1.0)
+                saw_insert_while_building |= inserted_before_poll and state == 'building'
+                saw_hot_update_while_building |= hot_updated_before_poll and state == 'building'
+            ready_seconds = time.monotonic() - started
+            assert saw_insert_while_building, 'no insert was acknowledged while the index was Building'
+            assert saw_hot_update_while_building, 'no update of source key 0 was acknowledged while Building'
+            ready.set()
+            assert updated_after_ready.wait(timeout=15), 'no update started and succeeded after Ready'
         finally:
             stop.set()
         for future in futures:
-            future.result()
+            acknowledged, refused = future.result()
+            expected.update(acknowledged)
+            acknowledged_rows += len(acknowledged)
+            errors += refused
     after = stats()
-    rows = table.query().collect()
-    assert all(error[1]['error']['outcome'] == 'not_applied' for error in errors), errors[:5]
-    expected = {}
-    for item in rows:
-        expected.setdefault(item['category'], set()).add(item['id'])
-    for key, category in acknowledged.items():
-        assert any(item['id'] == key for item in rows), key
+    rows = table.where(col('id') >= 0).collect()
+    assert len(rows) == len(expected) and {row['id']: row for row in rows} == expected, rows
     plans = {}
     for category in range(8):
         selected = table.where(col('category') == category)
-        indexed = {item['id'] for item in selected.collect()}
+        indexed = selected.collect()
         plans[category] = selected.explain()
         assert 'by_category' in plans[category], plans[category]
-        assert indexed == expected.get(category, set()), (category, indexed ^ expected.get(category, set()))
-    report('D11-index', table=table.id, rows=len(rows), acknowledged_direct_writes=len(acknowledged),
-           not_applied_errors=len(errors), index_state=state, status_retried=retried[:8],
-           status_retries=len(retried),
-           direct_entries=direct(after, 'entries_proposed') - direct(before, 'entries_proposed'),
+        expected_category = {key: row for key, row in expected.items() if row['category'] == category}
+        assert len(indexed) == len(expected_category) and {row['id']: row for row in indexed} == expected_category, (
+            category, indexed, expected_category)
+    direct_entries = direct(after, 'entries_proposed') - direct(before, 'entries_proposed')
+    assert direct_entries > 0, 'the writer workload did not use the direct path'
+    report('D11-index', table=table.id, rows=len(rows), acknowledged_rows=acknowledged_rows,
+           not_applied_errors=errors, index_state=state, create_retries=create_retries, status_retried=retried[:8],
+           status_retries=len(retried), ready_seconds=round(ready_seconds, 3),
+           hot_key_updated_while_building=saw_hot_update_while_building,
+           insert_acknowledged_while_building=True, update_acknowledged_after_ready=True,
+           direct_entries=direct_entries,
+           # GC2: DirectBatch entries (`data.direct.batch` enabled by the processes
+           # themselves) and the commits they carried.
+           direct_batch_entries=direct(after, 'batch_entries') - direct(before, 'batch_entries'),
+           direct_batched_commits=direct(after, 'batched_commits') - direct(before, 'batched_commits'),
+           batch_enabled={name: (value.get('direct_capability') or {}).get('batch')
+                          for name, value in after.items()},
            direct_fallbacks=direct_map(after, 'fallbacks') - direct_map(before, 'fallbacks'),
            plan_uses_index=True, plan_sample=plans[0][:300])
 
@@ -573,7 +659,7 @@ def admin_owner(cluster, name, payload, request_id=None):
     raise AssertionError(f'{name}: {errors}')
 
 
-def d11_drop(cluster, url, token, ca):
+def d11_drop(cluster, url, token, ca, *, writer_count=4):
     db = Database(url=url, token=token, database=DATABASE, ca_file=str(ca), timeout=30)
     table = db.create_table('d11_drop', {'id': int, 'value': int}, key='id')
     stop, lock = threading.Event(), threading.Lock()
@@ -598,8 +684,8 @@ def d11_drop(cluster, url, token, ca):
         finally:
             client.close()
 
-    with ThreadPoolExecutor(4) as pool:
-        futures = [pool.submit(writer) for _ in range(4)]
+    with ThreadPoolExecutor(writer_count) as pool:
+        futures = [pool.submit(writer) for _ in range(writer_count)]
         try:
             time.sleep(1.0)
             table.drop()

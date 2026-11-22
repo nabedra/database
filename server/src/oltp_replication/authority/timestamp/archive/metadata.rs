@@ -4,7 +4,7 @@ use super::super::*;
 use super::point;
 use crate::oltp::{
     backup::{
-        history::{HistoryFrame, MetadataImage},
+        history::{ARCHIVE_PAGE_WIRE_BYTES, ArchivePageBudget, HistoryFrame, MetadataImage},
         restore::OfflineRestoreTarget,
     },
     mvcc::{MvccKey, index::IndexRecord},
@@ -148,7 +148,7 @@ impl TimestampHandle {
                 TransactionBudget {
                     scratch_bytes: 2 << 20,
                     batch_bytes: 0,
-                    output_bytes: 128 << 10,
+                    output_bytes: ARCHIVE_PAGE_WIRE_BYTES,
                 },
                 move |view, _| {
                     let mut cursor = after.clone().unwrap_or_else(|| b"ts/".to_vec());
@@ -157,7 +157,7 @@ impl TimestampHandle {
                     }
                     let mut next = after;
                     let mut items = Vec::new();
-                    let mut used = 4096usize;
+                    let mut budget = ArchivePageBudget::new();
                     for _ in 0..64 {
                         let Some(row) = view.first_from(b"ts/", &cursor)? else {
                             break;
@@ -193,30 +193,18 @@ impl TimestampHandle {
                         };
                         if let Some(commit_ts) = visible.filter(|ts| ts.is_none_or(|ts| ts <= cut))
                         {
-                            let cost = row
-                                .value()
-                                .len()
-                                .checked_mul(2)
-                                .and_then(|n| n.checked_add(row.key().len() * 4 + 4096))
-                                .ok_or_else(unknown)?;
-                            if used
-                                .checked_add(cost)
-                                .is_none_or(|n| n > (128 << 10) - 4096)
-                            {
-                                if items.is_empty() {
-                                    return Err(unknown());
-                                }
-                                break;
-                            }
-                            used += cost;
-                            items.push(MetadataImage {
+                            let item = MetadataImage {
                                 group: group.clone(),
                                 key: row.key().to_vec(),
                                 commit_ts,
                                 value: std::str::from_utf8(row.value())
                                     .map_err(|_| unknown())?
                                     .to_owned(),
-                            });
+                            };
+                            if !budget.include(view, &item)? {
+                                break;
+                            }
+                            items.push(item);
                         }
                         next = Some(row.key().to_vec());
                         cursor = row.key().to_vec();

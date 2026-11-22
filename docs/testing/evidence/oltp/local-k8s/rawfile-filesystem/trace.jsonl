@@ -1,0 +1,28 @@
+{"check": "host", "context": "desktop-linux", "csi": "openebs-rawfile", "docker": "28.3.3", "docker_disk": "/Volumes/ZX20/Docker/vms/0/data/Docker.raw", "elapsed_seconds": 0.246, "kernel": "Darwin MacBook-Pro-de-Antonio.local 25.6.0 Darwin Kernel Version 25.6.0: Mon Oct 12 00:33:09 PDT 2026; root:xnu-12377.161.15.701.48~2/RELEASE_X86_64 x86_64", "kind": "kind v0.33.0 go1.27.0 darwin/amd64", "scenario": "preflight", "server_sha256": null, "server_source": null, "source": "e2fb3ba1479daf187fcb7cc6bda632b087b95ad4", "test_executable_sha256": null}
+{"check": "docker-lane", "elapsed_seconds": 360.666, "status": "acquired"}
+{"check": "kind-create", "cluster": "nabedra-live3-6430c078", "elapsed_seconds": 360.745, "node_image": "mirror.gcr.io/kindest/node:v1.34.11"}
+{"check": "vm-memory", "elapsed_seconds": 397.157, "total_bytes": 8220102656, "used_bytes": 989573120}
+{"check": "vm-memory", "elapsed_seconds": 404.009, "total_bytes": 8220102656, "used_bytes": 1139679232}
+{"check": "vm-memory", "elapsed_seconds": 412.339, "total_bytes": 8220102656, "used_bytes": 1234292736}
+{"check": "vm-memory", "elapsed_seconds": 420.411, "total_bytes": 8220102656, "used_bytes": 1348227072}
+{"check": "vm-memory", "elapsed_seconds": 427.49, "total_bytes": 8220102656, "used_bytes": 1512685568}
+{"check": "vm-memory", "elapsed_seconds": 434.901, "total_bytes": 8220102656, "used_bytes": 1561911296}
+{"check": "vm-memory", "elapsed_seconds": 442.95, "total_bytes": 8220102656, "used_bytes": 1675513856}
+{"check": "vm-memory", "elapsed_seconds": 451.913, "total_bytes": 8220102656, "used_bytes": 1819217920}
+{"check": "vm-memory", "elapsed_seconds": 460.567, "total_bytes": 8220102656, "used_bytes": 1864421376}
+{"check": "vm-memory", "elapsed_seconds": 468.964, "total_bytes": 8220102656, "used_bytes": 1955434496}
+{"check": "vm-memory", "elapsed_seconds": 478.939, "total_bytes": 8220102656, "used_bytes": 2028306432}
+{"check": "vm-memory", "elapsed_seconds": 488.747, "total_bytes": 8220102656, "used_bytes": 2059513856}
+{"check": "vm-memory", "elapsed_seconds": 496.909, "total_bytes": 8220102656, "used_bytes": 2103934976}
+{"check": "vm-memory", "elapsed_seconds": 517.715, "total_bytes": 8220102656, "used_bytes": 2107478016}
+{"check": "vm-memory", "elapsed_seconds": 527.542, "total_bytes": 8220102656, "used_bytes": 2111717376}
+{"check": "vm-memory", "elapsed_seconds": 567.313, "total_bytes": 8220102656, "used_bytes": 2119643136}
+{"check": "vm-memory", "elapsed_seconds": 616.477, "total_bytes": 8220102656, "used_bytes": 2176126976}
+{"check": "vm-memory", "elapsed_seconds": 624.642, "total_bytes": 8220102656, "used_bytes": 2224386048}
+{"check": "vm-memory", "elapsed_seconds": 633.267, "total_bytes": 8220102656, "used_bytes": 2323173376}
+{"check": "vm-memory", "elapsed_seconds": 641.534, "total_bytes": 8220102656, "used_bytes": 2411573248}
+{"check": "kind CSI preflight", "elapsed_seconds": 642.255, "status": "passed", "zones": {"a": "nabedra-live3-6430c078-worker", "b": "nabedra-live3-6430c078-worker2", "c": "nabedra-live3-6430c078-worker3"}}
+{"check": "vm-memory", "elapsed_seconds": 683.128, "total_bytes": 8220102656, "used_bytes": 2419474432}
+{"check": "O27 rawfile provider filesystem probe", "elapsed_seconds": 784.481, "filesystem_after_kib": 480868, "filesystem_before_kib": 235431, "overflow": "fallocate: fallocate failed: No space left on device\ncommand terminated with exit code 1", "pod_uid": "73cd2f3d-51e0-4441-9743-4d52452d092d", "pvc_after": "512Mi", "pvc_before": "256Mi", "status": "passed"}
+{"check": "kind-delete", "elapsed_seconds": 831.007, "kind_exit": 0, "peak_vm_used_bytes": 2419474432, "remaining_nodes": [], "status": "passed"}
+{"check": "docker-lane", "elapsed_seconds": 831.019, "status": "released"}

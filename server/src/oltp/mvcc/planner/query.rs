@@ -318,6 +318,10 @@ impl NativePlanner {
             order,
             _container: container,
         };
+        #[cfg(test)]
+        if count && crate::oltp_growth_acceptance::count_overflow_requested(pin.read_ts.get()) {
+            state.matched = u64::MAX - 1;
+        }
         let (bounds, choice) = match access {
             QueryAccess::Empty => return self.finish_query(state, owner).await,
             QueryAccess::Point { key, group } => {
@@ -372,6 +376,12 @@ impl NativePlanner {
                             break;
                         }
                         if let Some(cursor) = cursor {
+                            #[cfg(test)]
+                            crate::oltp_runtime::recovery_tests::transaction_checkpoint(
+                                "scan-page",
+                                binding.request_id,
+                                &state.matched,
+                            ).await;
                             pages.start(self.clone().scan_next(
                                 input.clone(), ScanShard::Continue(participant, cursor),
                             ));

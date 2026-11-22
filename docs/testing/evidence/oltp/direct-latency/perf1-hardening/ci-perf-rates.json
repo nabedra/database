@@ -1,0 +1,144 @@
+[
+ {
+  "allocations": {
+   "api_bytes": 550000000,
+   "api_cpu": 0.35,
+   "driver_bytes": 900000000,
+   "driver_cpu": 0.65,
+   "hold_compaction": false,
+   "total_bytes": 7900000000,
+   "total_cpu": 4,
+   "worker_bytes": 2150000000,
+   "worker_cpu": 1.0
+  },
+  "binary_sha256": "295415bb625ae12a72125eab2f5be94f96537f0c5e313630e63625a1863095db",
+  "correctness_verified": true,
+  "rows": [
+   {
+    "ack_rate": 149.75,
+    "acked": 8985,
+    "api": [
+     {
+      "cpu": 0.063,
+      "throttled": "5/629"
+     }
+    ],
+    "api_stages_ms": {
+     "gw.direct.lane_wait": 0.64,
+     "gw.direct.send": 3.8,
+     "gw.route": 3.82,
+     "http.dispatch.spawn_wait": 0.01
+    },
+    "cap": 15,
+    "driver": [
+     0.09
+    ],
+    "failed": 0,
+    "leader": "w1",
+    "leader_cpu": [
+     {
+      "cpu": 0.4,
+      "throttled": "2/637"
+     }
+    ],
+    "leader_stages_ms": {
+     "leader.mutation.total": 2.83,
+     "raft.data.append_write": 0.51,
+     "raft.data.client_write": 2.06
+    },
+    "leader_storage": {
+     "commits": 26806,
+     "compaction_bytes": 0,
+     "flush_bytes": 5469990,
+     "journal_syncs": 8986,
+     "l0_runs": 3,
+     "l0_runs_peak": 3,
+     "stall_ms": 0,
+     "write_delay_us": 0,
+     "write_delays": 0
+    },
+    "offered": 9000,
+    "p50": 3.5,
+    "p99": 10.1,
+    "phase": 150,
+    "refusals": {},
+    "rejected": 0,
+    "unresolved": 0
+   }
+  ],
+  "run": "rate150",
+  "verification": {
+   "mismatches": 0,
+   "rows": 10000,
+   "unresolved_keys": 0
+  }
+ },
+ {
+  "allocations": {
+   "api_bytes": 550000000,
+   "api_cpu": 0.35,
+   "driver_bytes": 900000000,
+   "driver_cpu": 0.65,
+   "hold_compaction": false,
+   "total_bytes": 7900000000,
+   "total_cpu": 4,
+   "worker_bytes": 2150000000,
+   "worker_cpu": 1.0
+  },
+  "binary_sha256": "295415bb625ae12a72125eab2f5be94f96537f0c5e313630e63625a1863095db",
+  "correctness_verified": true,
+  "rows": [
+   {
+    "ack_rate": 50.0,
+    "acked": 3000,
+    "api": [
+     null
+    ],
+    "api_stages_ms": {
+     "gw.direct.lane_wait": 0.01,
+     "gw.direct.send": 2.89,
+     "gw.route": 2.92,
+     "http.dispatch.spawn_wait": 0.02
+    },
+    "cap": 0,
+    "driver": [
+     0.03
+    ],
+    "failed": 0,
+    "leader": "w1",
+    "leader_cpu": [
+     null
+    ],
+    "leader_stages_ms": {
+     "leader.mutation.total": 2.54,
+     "raft.data.append_write": 0.53,
+     "raft.data.client_write": 1.89
+    },
+    "leader_storage": {
+     "commits": 8987,
+     "compaction_bytes": 0,
+     "flush_bytes": 1826245,
+     "journal_syncs": 3002,
+     "l0_runs": 1,
+     "l0_runs_peak": 1,
+     "stall_ms": 0,
+     "write_delay_us": 0,
+     "write_delays": 0
+    },
+    "offered": 3000,
+    "p50": 3.6,
+    "p99": 7.4,
+    "phase": 50,
+    "refusals": {},
+    "rejected": 0,
+    "unresolved": 0
+   }
+  ],
+  "run": "rate50",
+  "verification": {
+   "mismatches": 0,
+   "rows": 5000,
+   "unresolved_keys": 0
+  }
+ }
+]

@@ -9,6 +9,8 @@ use std::{
 
 /// Upper bounds of the rows-per-entry buckets; the last bucket is open.
 pub(crate) const BATCH_BUCKETS: [u64; 5] = [1, 8, 64, 512, 4096];
+/// RD3: members per `DirectBatch` entry (upper bounds; at most 64 members).
+const MEMBER_BUCKETS: [u64; 7] = [2, 3, 4, 8, 16, 32, 64];
 
 /// Why an attempt went back to step 3 within the deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,8 +27,12 @@ pub(crate) enum RetryCause {
     Unavailable,
     /// The group's fence moved; the next attempt reads the new authority.
     Authority,
+    /// RD1: the group's direct schema in the attempt's snapshot differs from
+    /// the one the table descriptor was looked up with. The mutation drops
+    /// its latches and looks the table up again from the group's epochs.
+    Schema,
 }
-const RETRY_CAUSES: usize = 5;
+const RETRY_CAUSES: usize = 6;
 
 /// Why a proposal (a `DirectCommit`, a forward marker, a group activation or
 /// an expiry page) produced no reply. Tells a slow election from a stuck
@@ -57,14 +63,21 @@ pub(crate) struct DirectStats {
     gets: AtomicU64,
     mutations: AtomicU64,
     forwards: AtomicU64,
-    /// `DirectCommit` entries proposed.
+    /// `DirectCommit`s proposed (alone or as a `DirectBatch` member).
     proposed: AtomicU64,
+    /// GC2: `DirectBatch` entries proposed, and the commits they carried.
+    batch_entries: AtomicU64,
+    batched_commits: AtomicU64,
+    member_buckets: [AtomicU64; MEMBER_BUCKETS.len()],
     applied: AtomicU64,
     replayed: AtomicU64,
     rows_proposed: AtomicU64,
     index_changes_proposed: AtomicU64,
     batch_buckets: [AtomicU64; BATCH_BUCKETS.len() + 1],
     read_only: AtomicU64,
+    /// RD1: mutations that read the group's epochs from the store before
+    /// latching (no epochs from an earlier snapshot of this group).
+    epoch_reads: AtomicU64,
     fallbacks: [AtomicU64; FallbackReason::ALL.len()],
     retries: [AtomicU64; RETRY_CAUSES],
     proposal_failures: [AtomicU64; PROPOSAL_FAILURES.len()],
@@ -115,6 +128,17 @@ impl DirectStats {
             .unwrap_or(BATCH_BUCKETS.len());
         bump(&self.batch_buckets[bucket]);
     }
+    /// GC2: one `DirectBatch` entry of `members` commits was proposed.
+    pub(crate) fn batch_entry(&self, members: usize) {
+        bump(&self.batch_entries);
+        self.batched_commits
+            .fetch_add(members as u64, Ordering::Relaxed);
+        let bucket = MEMBER_BUCKETS
+            .iter()
+            .position(|bound| members as u64 <= *bound)
+            .unwrap_or(MEMBER_BUCKETS.len() - 1);
+        bump(&self.member_buckets[bucket]);
+    }
     pub(crate) fn applied(&self) {
         bump(&self.applied);
     }
@@ -123,6 +147,9 @@ impl DirectStats {
     }
     pub(crate) fn read_only(&self) {
         bump(&self.read_only);
+    }
+    pub(crate) fn epoch_read(&self) {
+        bump(&self.epoch_reads);
     }
     pub(crate) fn fallback(&self, reason: FallbackReason) {
         let index = FallbackReason::ALL
@@ -185,6 +212,11 @@ impl DirectStats {
             };
             batch_sizes.insert(label, load(counter));
         }
+        let batch_members = MEMBER_BUCKETS
+            .iter()
+            .zip(&self.member_buckets)
+            .map(|(bound, counter)| (format!("le_{bound}"), load(counter)))
+            .collect();
         let fallbacks = FallbackReason::ALL
             .iter()
             .zip(&self.fallbacks)
@@ -196,6 +228,7 @@ impl DirectStats {
             ("leadership", RetryCause::Leadership),
             ("unavailable", RetryCause::Unavailable),
             ("authority", RetryCause::Authority),
+            ("schema", RetryCause::Schema),
         ];
         let retries = causes
             .iter()
@@ -212,8 +245,12 @@ impl DirectStats {
             forwards: load(&self.forwards),
             entries_proposed: load(&self.proposed),
             entries_applied: load(&self.applied),
+            batch_entries: load(&self.batch_entries),
+            batched_commits: load(&self.batched_commits),
+            batch_members,
             replayed: load(&self.replayed),
             read_only: load(&self.read_only),
+            pre_latch_epoch_reads: load(&self.epoch_reads),
             rows_proposed: load(&self.rows_proposed),
             index_changes_proposed: load(&self.index_changes_proposed),
             batch_sizes,
@@ -249,8 +286,16 @@ pub(crate) struct DirectStatsSnapshot {
     pub forwards: u64,
     pub entries_proposed: u64,
     pub entries_applied: u64,
+    /// GC2: `DirectBatch` entries proposed; `batched_commits` of the
+    /// `entries_proposed` commits rode in them.
+    pub batch_entries: u64,
+    pub batched_commits: u64,
+    /// RD3: `DirectBatch` entries by members (`le_<n>`).
+    pub batch_members: BTreeMap<String, u64>,
     pub replayed: u64,
     pub read_only: u64,
+    /// RD1: mutations that read the group's epochs before latching.
+    pub pre_latch_epoch_reads: u64,
     pub rows_proposed: u64,
     pub index_changes_proposed: u64,
     /// Rows per proposed entry.

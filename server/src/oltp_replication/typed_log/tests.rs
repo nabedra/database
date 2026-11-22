@@ -140,11 +140,19 @@ pub(crate) struct GatedSync {
     inner: nabedra_kv::fs::FaultFs,
     gate: Arc<(std::sync::Mutex<GateState>, std::sync::Condvar)>,
 }
+#[must_use = "dropping the guard releases journal syncs"]
+pub(crate) struct HeldSync<'a>(&'a GatedSync);
+impl Drop for HeldSync<'_> {
+    fn drop(&mut self) {
+        self.0.state(|gate| gate.closed = false);
+    }
+}
 #[derive(Default)]
 struct GateState {
     closed: bool,
     entered: usize,
     passed: usize,
+    fail_after_sync: bool,
 }
 struct GatedFile {
     inner: Arc<dyn nabedra_kv::fs::FsFile>,
@@ -169,19 +177,31 @@ impl GatedSync {
             gate: self.gate.clone(),
         }
     }
-    /// Holds every later journal sync until [`Self::release`].
-    pub(crate) fn hold(&self) {
+    /// Holds later journal syncs until the returned guard drops.
+    pub(crate) fn hold(&self) -> HeldSync<'_> {
         self.state(|gate| {
+            assert!(!gate.closed, "journal sync gate is already held");
             gate.closed = true;
             gate.entered = 0;
         });
+        HeldSync(self)
     }
-    pub(crate) fn release(&self) {
-        self.state(|gate| gate.closed = false);
+    /// The next successful native sync persists its bytes but reports EIO.
+    pub(crate) fn fail_after_sync(&self) {
+        self.state(|gate| gate.fail_after_sync = true);
     }
     /// Syncs that reached the closed gate since [`Self::hold`].
     pub(crate) fn entered(&self) -> usize {
         self.state(|gate| gate.entered)
+    }
+    async fn wait_for_sync(&self) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.entered() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("pending append did not reach the journal sync gate");
     }
 }
 impl nabedra_kv::fs::Fs for GatedSync {
@@ -230,15 +250,25 @@ impl nabedra_kv::fs::FsFile for GatedFile {
         if state.closed {
             state.entered += 1;
             changed.notify_all();
-            while state.closed {
-                state = changed.wait(state).unwrap();
+            (state, _) = changed
+                .wait_timeout_while(state, Duration::from_secs(60), |state| state.closed)
+                .unwrap();
+            if state.closed {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "test journal sync gate was not released",
+                ));
             }
         }
+        let fail_after_sync = std::mem::take(&mut state.fail_after_sync);
         drop(state);
         let result = self.inner.sync_data();
         if result.is_ok() {
             lock.lock().unwrap().passed += 1;
             changed.notify_all();
+        }
+        if fail_after_sync && result.is_ok() {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
         }
         result
     }
@@ -308,7 +338,7 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
         )
         .unwrap();
         let target = pool.group(group_id.clone()).await.unwrap();
-        let log = TypedLogStore::<TestConfig>::new(target, 1).await.unwrap();
+        let mut log = TypedLogStore::<TestConfig>::new(target, 1).await.unwrap();
         let healthy = OltpPool::open_development(
             dir.0.join("healthy"),
             PoolIdentity {
@@ -330,10 +360,8 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
             .await
             .unwrap();
         let baseline = shared.scheduler().usage();
-        let passed_at_close = gated.state(|gate| {
-            gate.closed = true;
-            gate.passed
-        });
+        let held = gated.hold();
+        let passed_at_close = gated.state(|gate| gate.passed);
 
         let vote = Vote::new_committed(2, 1);
         control.save_vote(&vote).await.unwrap();
@@ -344,26 +372,14 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
         );
 
         let (sender, mut callback) = TestConfig::oneshot();
-        let first = tokio::spawn({
-            let mut log = log.clone();
-            async move { log.append([blank(0)], IOFlushed::signal(sender)).await }
-        });
-        while gated.state(|gate| gate.entered) == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        log.append([blank(0)], IOFlushed::signal(sender))
+            .await
+            .unwrap();
+        gated.wait_for_sync().await;
         assert!(matches!(
             callback.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
-        // PERF2d: the append returned before its sync, and replication reads
-        // the entry while the sync is held. Dropping the awaiter now changes
-        // nothing: the owned write and its callback stay in order.
-        first.abort();
-        first.await.unwrap().unwrap();
-        assert_eq!(
-            log.clone().limited_get_log_entries(0, 1).await.unwrap()[0].log_id,
-            id(0)
-        );
         let callback = Arc::new(Mutex::new(callback));
         let released = Arc::new(AtomicBool::new(false));
         let first_ack_observed = Arc::new(AtomicBool::new(false));
@@ -378,13 +394,16 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
             }
         }));
         let (sender, mut next_callback) = TestConfig::oneshot();
-        let second = tokio::spawn({
-            let mut log = log.clone();
-            async move { log.append([blank(1)], IOFlushed::signal(sender)).await }
-        });
-        while log.pending.count.load(Ordering::Acquire) != 2 {
-            tokio::task::yield_now().await;
-        }
+        // Wait for the append submission itself. The number of pending
+        // guards is an implementation detail and cannot signal submission.
+        log.append([blank(1)], IOFlushed::signal(sender))
+            .await
+            .unwrap();
+        // PERF2d: replication can read both appends before either syncs.
+        assert_eq!(
+            log_ids(log.limited_get_log_entries(0, 2).await.unwrap()),
+            [id(0), id(1)]
+        );
         assert!(log.writes.try_lock().is_err());
         // The batch charge stays held until the journal thread drops it.
         assert!(shared.apply_bytes_used() > 0);
@@ -409,10 +428,9 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
         released.store(true, Ordering::Release);
-        gated.state(|gate| gate.closed = false);
+        drop(held);
 
         next_callback.await.unwrap().unwrap();
-        second.await.unwrap().unwrap();
         drain.await;
         assert!(first_ack_observed.load(Ordering::Acquire));
         assert_eq!(log.pending.count.load(Ordering::Acquire), 0);
@@ -420,7 +438,6 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
         assert_eq!(shared.working_decode_bytes(), 0);
         assert_eq!(shared.control_bytes_used(), 0);
         assert_eq!(shared.scheduler().usage(), baseline);
-        let mut log = log;
         log.save_committed(Some(id(0))).await.unwrap();
         // A synced metadata write makes the unsynced commit hint durable too.
         log.save_vote(&Vote::new_committed(1, 1)).await.unwrap();
@@ -941,6 +958,8 @@ impl GatedLog {
         let log = TypedLogStore::<TestConfig>::new(group, 1).await.unwrap();
         (pool, log)
     }
+    /// Waits until a sync reached the closed gate (GC1; lost in the merge
+    /// of GC1 into `nabedra/hardening`, restored by GC2).
     async fn entered(&self) {
         while self.gated.state(|gate| gate.entered) == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -966,13 +985,16 @@ async fn o29_ns10_perf2d_crash_between_overlay_publish_and_sync_keeps_only_acked
             .unwrap();
         acked.await.unwrap().unwrap();
         log.save_committed(Some(id(0))).await.unwrap();
+        // The previous marker must finish its background write before the
+        // gate can hold a journal batch that would delay that write.
+        assert_eq!(log.read_committed().await.unwrap(), Some(id(0)));
 
-        rig.gated.state(|gate| gate.closed = true);
+        let held = rig.gated.hold();
         let (sent, mut pending) = TestConfig::oneshot();
         log.append([blank(1)], IOFlushed::signal(sent))
             .await
             .unwrap();
-        rig.entered().await;
+        rig.gated.wait_for_sync().await;
         assert_eq!(
             log_ids(log.limited_get_log_entries(0, 2).await.unwrap()),
             [id(0), id(1)]
@@ -1004,7 +1026,7 @@ async fn o29_ns10_perf2d_crash_between_overlay_publish_and_sync_keeps_only_acked
             .map(|seed| rig.gated.inner.power_loss(seed))
             .collect::<Vec<_>>();
         rig.gated.inner.halt();
-        rig.gated.state(|gate| gate.closed = false);
+        drop(held);
         assert!(
             pending.await.unwrap().is_err(),
             "a sync that failed must not report a flush"
@@ -1062,41 +1084,38 @@ async fn o11_perf2d_commit_marker_and_apply_follow_the_local_sync() {
             .unwrap();
         acked.await.unwrap().unwrap();
         log.save_committed(Some(id(0))).await.unwrap();
+        assert_eq!(log.read_committed().await.unwrap(), Some(id(0)));
 
-        rig.gated.state(|gate| gate.closed = true);
+        let held = rig.gated.hold();
         let (sent, mut pending) = TestConfig::oneshot();
         log.append([blank(1), blank(2)], IOFlushed::signal(sent))
             .await
             .unwrap();
-        rig.entered().await;
-        let apply = tokio::spawn({
-            let mut log = log.clone();
-            async move {
-                let mut stream = Box::pin(log.entries_stream(1..3).await);
-                let mut applied = Vec::new();
-                while let Some(entry) = stream.next().await {
-                    applied.push(entry.unwrap().log_id);
-                }
-                applied
-            }
-        });
+        rig.gated.wait_for_sync().await;
+        let mut reader = log.clone();
+        let mut apply = Box::pin(reader.entries_stream(1..3).await);
         log.save_committed(Some(id(2))).await.unwrap();
         assert_eq!(log.read_committed().await.unwrap(), Some(id(0)));
         assert_eq!(
             log_ids(log.limited_get_log_entries(1, 3).await.unwrap()),
             [id(1), id(2)]
         );
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(!apply.is_finished());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), apply.next())
+                .await
+                .is_err(),
+            "applying the batch must wait for its local sync"
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(1), &mut pending)
                 .await
                 .is_err()
         );
 
-        rig.gated.state(|gate| gate.closed = false);
+        drop(held);
         pending.await.unwrap().unwrap();
-        assert_eq!(apply.await.unwrap(), [id(1), id(2)]);
+        let applied = apply.map(|entry| entry.unwrap().log_id).collect::<Vec<_>>();
+        assert_eq!(applied.await, [id(1), id(2)]);
         while log.read_committed().await.unwrap() != Some(id(2)) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -1220,6 +1239,90 @@ async fn o11_c07_perf2d_commit_marker_is_written_off_the_commit_path() {
     })
     .await
     .expect("PERF2d marker watchdog");
+}
+
+/// O06/O11 (fsync before ack), GC1: appends queued behind a held sync share
+/// one synced write, and a vote queued between appends is never merged
+/// across. With the first append's sync held, appends 1 and 2 queue, then a
+/// vote, then appends 3 and 4. After the release the writes are `[0]`,
+/// `[1, 2]`, the vote, `[3, 4]`: four journal syncs. Before GC1 every append
+/// was its own synced write (six); merging across the vote would give three.
+/// No callback fires while the first sync is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let rig = GatedLog::new();
+        let (pool, mut log) = rig.open(Arc::new(rig.gated.clone()), true).await;
+        let syncs = || pool.kv_store().stats().journal_syncs;
+        let before = syncs();
+        let held_sync = rig.gated.hold();
+        let mut acks = Vec::new();
+        let mut ack = |index: u64| {
+            let (sent, acked) = TestConfig::oneshot();
+            acks.push(acked);
+            ([blank(index)], IOFlushed::signal(sent))
+        };
+        let (entries, flushed) = ack(0);
+        log.append(entries, flushed).await.unwrap();
+        rig.gated.wait_for_sync().await;
+        for index in [1, 2] {
+            let (entries, flushed) = ack(index);
+            log.append(entries, flushed).await.unwrap();
+        }
+        // The vote takes its writer place behind appends 0 to 2.
+        let mut voter = log.clone();
+        let new_vote = Vote::new_committed(2, 1);
+        let mut vote = Box::pin(voter.save_vote(&new_vote));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(vote.as_mut().poll(cx).is_pending()))
+                .await,
+            "the vote waits for the held append"
+        );
+        let syncs_at_post_vote_append = Arc::new(AtomicU64::new(0));
+        *log.append_hook.lock().unwrap() = Some(Arc::new({
+            let pool = pool.clone();
+            let observed = syncs_at_post_vote_append.clone();
+            move || observed.store(pool.kv_store().stats().journal_syncs, Ordering::Release)
+        }));
+        for index in [3, 4] {
+            let (entries, flushed) = ack(index);
+            log.append(entries, flushed).await.unwrap();
+        }
+        for acked in &mut acks {
+            assert!(matches!(
+                acked.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        drop(held_sync);
+        vote.await.unwrap();
+        for acked in acks {
+            acked.await.unwrap().unwrap();
+        }
+        log.drain().await;
+        assert_eq!(
+            syncs_at_post_vote_append.load(Ordering::Acquire),
+            before + 3,
+            "the vote must sync before the post-vote batch starts"
+        );
+        assert_eq!(
+            syncs() - before,
+            4,
+            "writes [0], [1, 2], vote, [3, 4]: one sync each"
+        );
+        assert_eq!(
+            log_ids(log.try_get_log_entries(..).await.unwrap()),
+            (0..5).map(id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            voter.read_vote().await.unwrap(),
+            Some(Vote::new_committed(2, 1))
+        );
+    })
+    .await
+    .expect("GC1 append coalescing watchdog");
 }
 
 /// KVfix4, NS13/O05: once `drain` returns, no append task still holds what it

@@ -29,6 +29,31 @@ struct ReleasePause {
     resume: Arc<tokio::sync::Notify>,
 }
 impl TimestampHandle {
+    pub(crate) async fn advance_floor(
+        &self,
+        authority: Authority,
+        retired_at: Option<CommitTs>,
+    ) -> Result<u64, ProtocolError> {
+        let safe_ts = self.advance_floor_once(authority).await?;
+        if retired_at.is_some_and(|retired_at| retired_at.get() == safe_ts) {
+            // An idle cluster's last allocation can be the retirement itself.
+            // Move the watermark through the existing, capability-gated allocator.
+            self.allocate_direct(1).await?;
+            return self.advance_floor_once(authority).await;
+        }
+        Ok(safe_ts)
+    }
+
+    async fn advance_floor_once(&self, authority: Authority) -> Result<u64, ProtocolError> {
+        match self
+            .submit(TimestampCommand::AdvanceFloor { authority })
+            .await?
+            .reply
+        {
+            TimestampReply::Retention { safe_ts, .. } => Ok(safe_ts),
+            reply => Err(rejected(reply)),
+        }
+    }
     pub(crate) async fn begin_import_metadata(
         &self,
         authority: Authority,
@@ -720,11 +745,10 @@ impl TimestampHandle {
             .map(|_| ())
     }
 
-    pub(crate) async fn verify_snapshot_policy(
+    pub(crate) async fn verify_unscoped_bind_pin(
         &self,
         identity: PinIdentity,
         pin: StoragePin,
-        scope: Option<ScopedAdmission>,
     ) -> Result<(), ProtocolError> {
         self.consensus.ensure_linearizable().await?;
         self.machine
@@ -737,8 +761,13 @@ impl TimestampHandle {
                     .ok_or_else(unknown)?;
                 if record.identity != identity
                     || record.pin != pin
-                    || record.reservation.scoped != scope
-                    || record.purpose != PinPurpose::Application
+                    || record.reservation.scoped.is_some()
+                    || !matches!(
+                        record.purpose,
+                        PinPurpose::Application
+                            | PinPurpose::IndexMetadata { .. }
+                            | PinPurpose::ImportMetadata { .. }
+                    )
                 {
                     return Err(invalid());
                 }

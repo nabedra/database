@@ -29,7 +29,7 @@ mod resolve;
 mod session;
 use resolve::{PeerResolver, ResolveError};
 pub(crate) use session::PeerFeature;
-use session::{PeerSessions, RawReply, SESSION_ALPN};
+use session::{DIRECT_ADMISSION_ALPN, PeerSessions, RawReply, SESSION_ALPN, session_alpn};
 #[cfg(test)]
 mod tests;
 
@@ -78,7 +78,10 @@ fn admit_trust(
         && (group.kind != GroupKind::Control
             || !matches!(
                 purpose,
-                Purpose::Raft | Purpose::Authority | Purpose::ControlDelegation
+                Purpose::Raft
+                    | Purpose::Authority
+                    | Purpose::ControlDelegation
+                    | Purpose::SystemRecovery
             ))
     {
         return Err(malformed(
@@ -108,10 +111,31 @@ pub trait PeerDirectory: Send + Sync + 'static {
     fn applied_revision(&self) -> Option<u64> {
         None
     }
+    /// Revocations are checked again after asynchronous endpoint preflight.
+    /// This is an in-memory lookup on every worker: a Data-only worker checks
+    /// its cached Control revocation view and calls no Control voter per
+    /// exchange (REP6, `plans/oltp-direct-path.md` section 3).
+    fn revoked(&self, _peer: WorkerIdentity) -> bool {
+        false
+    }
+    /// Changes whenever the directory learns a revocation. Sessions recheck
+    /// their peer at once, so a revoked peer's sessions close when the view
+    /// learns it rather than at their next periodic directory check.
+    fn trust_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
     /// Whether `peer` is an enrolled API gateway (not a worker).
     fn is_api(&self, _peer: WorkerIdentity) -> bool {
         false
     }
+}
+
+fn revoked_peer() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::Unauthorized,
+        "worker certificate or identity was revoked",
+        Outcome::NotApplied,
+    )
 }
 
 /// Whether this worker is the hello's audience. Every audience names this
@@ -159,6 +183,42 @@ pub struct TransportConfig {
     pub ping_timeout: Duration,
     /// Bound on one TCP connect plus TLS handshake for a lane.
     pub connect_timeout: Duration,
+    /// RD3: `Method::Direct` and `DirectForward` (ingress on a Data group)
+    /// have their own preflight and handler pools at the range leader, apart
+    /// from the ingress class's queued submissions. A direct request holds
+    /// its handler slot for its whole commit (fsync and quorum), so the slot
+    /// count is the leader's in-flight bound, as the direct executor's
+    /// `max_in_flight`; their bytes are charged against the worker's budget.
+    pub direct_preflight_slots: usize,
+    pub direct_handler_slots: usize,
+}
+/// RD3: the default `direct_handler_slots`, equal to the direct executor's
+/// default `max_in_flight` (plan section 6 step 1).
+pub(crate) const DIRECT_HANDLER_SLOTS: usize = 256;
+/// RD3: the default `direct_preflight_slots`. Preflight is the warm role
+/// check; the slot is held only until the handler slot is taken.
+pub(crate) const DIRECT_PREFLIGHT_SLOTS: usize = 64;
+/// RD3: whether a request of `class` on `group` is a direct request
+/// (`Method::Direct` or `DirectForward`, the only ingress on a Data group).
+fn direct_lane(class: TrafficClass, group: &GroupIdentity) -> bool {
+    class == TrafficClass::ApiIngress && matches!(group.kind, GroupKind::Data { .. })
+}
+/// Benchmark only (RD3): `NABEDRA_BENCH_NO_DIRECT_ADMISSION=1` makes this
+/// worker behave as the build before RD3 (no `nabedra-otp/4`, direct requests
+/// in the ingress class's pools), so one binary measures both sides.
+const NO_DIRECT_ADMISSION_ENV: &str = "NABEDRA_BENCH_NO_DIRECT_ADMISSION";
+fn direct_admission_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        let disabled =
+            std::env::var_os(NO_DIRECT_ADMISSION_ENV).is_some_and(|value| value == "1");
+        if disabled {
+            tracing::warn!(
+                "{NO_DIRECT_ADMISSION_ENV}=1: direct requests use the ingress handler slots (benchmark only)"
+            );
+        }
+        disabled
+    })
 }
 impl Default for TransportConfig {
     fn default() -> Self {
@@ -206,6 +266,8 @@ impl Default for TransportConfig {
             ping_idle: Duration::from_secs(15),
             ping_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(10),
+            direct_preflight_slots: DIRECT_PREFLIGHT_SLOTS,
+            direct_handler_slots: DIRECT_HANDLER_SLOTS,
         }
     }
 }
@@ -218,7 +280,11 @@ impl TransportConfig {
                 .iter()
                 .chain(&self.handler_slots)
                 .chain(&self.session_slots)
-                .chain([&self.pending_sessions])
+                .chain([
+                    &self.pending_sessions,
+                    &self.direct_preflight_slots,
+                    &self.direct_handler_slots,
+                ])
                 .any(|&n| n == 0 || n > Semaphore::MAX_PERMITS)
             || self
                 .payload_bytes
@@ -580,6 +646,24 @@ struct Common {
     outgoing: OutgoingLanes,
     /// Caller slots per class across every peer lane (RV-FINAL L1).
     outgoing_class: [Arc<Semaphore>; CLASSES],
+    /// Bounds on the callers that wait for a lane (`reserve_outgoing`): one
+    /// slot short of each peer lane, and one lane's worth short of each
+    /// class, so a caller that refuses at once (a queued submission next to
+    /// waiting direct requests) always finds headroom (PERF1).
+    waiting: OutgoingLanes,
+    waiting_class: [Arc<Semaphore>; CLASSES],
+    /// RD3: receiver pools for direct requests (`direct_lane`), apart from
+    /// `preflight` and `handlers` of the ingress class.
+    direct_preflight: Arc<Semaphore>,
+    direct_handlers: Arc<Semaphore>,
+    /// False only under `NABEDRA_BENCH_NO_DIRECT_ADMISSION=1`.
+    direct_admission: bool,
+    /// RD3: caller slots for direct requests to a peer whose session
+    /// negotiated `PeerFeature::DirectAdmission`: `direct_handler_slots` per
+    /// peer lane and `OUTGOING_CLASS_LANES` lanes' worth in total. To an
+    /// older peer, direct requests keep the ingress lanes above (PERF1).
+    direct_outgoing: DirectLanes,
+    direct_class: Arc<Semaphore>,
     authority_roles: Semaphore,
     authority_waiters: Semaphore,
     resolver: PeerResolver,
@@ -590,6 +674,9 @@ struct Common {
     pending_sessions: Arc<Semaphore>,
     /// Local lane refusals, reported in `/v1/runtime/stats` (NS11 finding 8).
     refusals: LaneRefusals,
+    /// Accepted sessions this worker closed when its directory learned their
+    /// peer's revocation (REP6 push).
+    revoked_closes: AtomicU64,
     #[cfg(test)]
     outgoing_lane_full: [tokio::sync::Notify; CLASSES],
     /// Tests close a whole class with `hold_outgoing_for_test`.
@@ -602,6 +689,27 @@ struct Common {
     #[cfg(test)]
     cancelled_replies: std::sync::atomic::AtomicU64,
 }
+impl Common {
+    /// The receiver's preflight pool for a request of `class` on `group`.
+    fn preflight_pool(&self, class: TrafficClass, group: &GroupIdentity) -> &Arc<Semaphore> {
+        if self.direct_admission && direct_lane(class, group) {
+            &self.direct_preflight
+        } else {
+            &self.preflight[class as usize]
+        }
+    }
+    /// The receiver's handler pool for a request of `class` on `group`. A
+    /// direct request holds its slot until its reply is written, through
+    /// its commit, so the ingress class's few slots would bound the leader's
+    /// in-flight direct requests and their batches (RD3).
+    fn handler_pool(&self, class: TrafficClass, group: &GroupIdentity) -> &Arc<Semaphore> {
+        if self.direct_admission && direct_lane(class, group) {
+            &self.direct_handlers
+        } else {
+            &self.handlers[class as usize]
+        }
+    }
+}
 /// Requests this worker refused locally because a lane was full: `outgoing`
 /// before sending (caller slots), `handler` on receipt (handler slots).
 #[derive(Default)]
@@ -610,8 +718,9 @@ struct LaneRefusals {
     handler: [AtomicU64; CLASSES],
 }
 impl LaneRefusals {
-    fn outgoing(&self, class: TrafficClass) {
+    fn outgoing(&self, class: TrafficClass, direct: bool) {
         self.outgoing[class as usize].fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("{}", outgoing_lane_message(class, direct));
     }
     fn handler(&self, class: TrafficClass) {
         self.handler[class as usize].fetch_add(1, Ordering::Relaxed);
@@ -704,7 +813,10 @@ impl From<WorkerIdentity> for RequestTarget {
 
 #[derive(Debug)]
 pub(crate) enum RequestError {
-    OutgoingLaneFull,
+    OutgoingLaneFull {
+        class: TrafficClass,
+        direct: bool,
+    },
     Unreachable,
     PeerRejected {
         worker: WorkerIdentity,
@@ -712,6 +824,24 @@ pub(crate) enum RequestError {
     },
     Protocol(ProtocolError),
 }
+impl RequestError {
+    fn outgoing_lane_full(class: TrafficClass) -> Self {
+        Self::OutgoingLaneFull {
+            class,
+            direct: false,
+        }
+    }
+}
+
+fn outgoing_lane_message(class: TrafficClass, direct: bool) -> String {
+    let lane = match (class, direct) {
+        (TrafficClass::ApiIngress, true) => "/direct",
+        (TrafficClass::ApiIngress, false) => "/ingress",
+        _ => "",
+    };
+    format!("worker outgoing lane full ({class:?}{lane})")
+}
+
 impl From<ProtocolError> for RequestError {
     fn from(error: ProtocolError) -> Self {
         Self::Protocol(error)
@@ -720,7 +850,11 @@ impl From<ProtocolError> for RequestError {
 impl From<RequestError> for ProtocolError {
     fn from(error: RequestError) -> Self {
         match error {
-            RequestError::OutgoingLaneFull => overloaded("worker outgoing lane full"),
+            RequestError::OutgoingLaneFull { class, direct } => ProtocolError::new(
+                ErrorCode::Overloaded,
+                outgoing_lane_message(class, direct),
+                Outcome::NotApplied,
+            ),
             RequestError::Unreachable => unavailable(),
             RequestError::Protocol(error) | RequestError::PeerRejected { error, .. } => error,
         }
@@ -772,8 +906,11 @@ impl WorkerTransport {
         if local.certificate_sha256.to_string() != tls.certificate_sha256() {
             return Err(malformed("local certificate differs from enrollment"));
         }
-        let (connector, acceptor) = if sessions_enabled {
+        let direct_admission = !direct_admission_disabled();
+        let (connector, acceptor) = if sessions_enabled && !direct_admission {
             tls.transports(&[SESSION_ALPN, ALPN])
+        } else if sessions_enabled {
+            tls.transports(&[DIRECT_ADMISSION_ALPN, SESSION_ALPN, ALPN])
         } else {
             tls.transports(&[ALPN])
         };
@@ -799,6 +936,23 @@ impl WorkerTransport {
                         config.handler_slots[i],
                     )))
                 }),
+                waiting: OutgoingLanes {
+                    headroom: 1,
+                    ..OutgoingLanes::default()
+                },
+                waiting_class: std::array::from_fn(|i| {
+                    let class = outgoing_class_slots(config.handler_slots[i]);
+                    Arc::new(Semaphore::new(
+                        class.saturating_sub(config.handler_slots[i]).max(1),
+                    ))
+                }),
+                direct_preflight: Arc::new(Semaphore::new(config.direct_preflight_slots)),
+                direct_handlers: Arc::new(Semaphore::new(config.direct_handler_slots)),
+                direct_admission,
+                direct_outgoing: DirectLanes::default(),
+                direct_class: Arc::new(Semaphore::new(outgoing_class_slots(
+                    config.direct_handler_slots,
+                ))),
                 authority_roles: Semaphore::new(
                     config.handler_slots[TrafficClass::Authority as usize] - 1,
                 ),
@@ -813,6 +967,7 @@ impl WorkerTransport {
                 }),
                 pending_sessions: Arc::new(Semaphore::new(config.pending_sessions)),
                 refusals: LaneRefusals::default(),
+                revoked_closes: AtomicU64::new(0),
                 #[cfg(test)]
                 outgoing_lane_full: std::array::from_fn(|_| tokio::sync::Notify::new()),
                 #[cfg(test)]
@@ -827,6 +982,11 @@ impl WorkerTransport {
             }),
             registry,
         })
+    }
+    /// Sessions closed when the directory learned their peer's revocation.
+    #[cfg(test)]
+    pub(crate) fn revoked_session_closes(&self) -> u64 {
+        self.common.revoked_closes.load(Ordering::Relaxed)
     }
     pub fn client(&self) -> WorkerClient {
         WorkerClient {
@@ -890,7 +1050,7 @@ impl WorkerTransport {
             return;
         };
         if let Some(pending) = pending
-            && stream.get_ref().1.alpn_protocol() == Some(SESSION_ALPN)
+            && session_alpn(stream.get_ref().1.alpn_protocol())
         {
             let Ok(certificate) = peer_digest(stream.get_ref().1.peer_certificates()) else {
                 return;
@@ -937,7 +1097,9 @@ impl WorkerTransport {
         admit_trust(trust, group, hello.purpose)?;
         let class = traffic(group, hello.purpose)?;
         trace.phase = RaftTransportPhase::Preflight;
-        let preflight = self.common.preflight[class as usize]
+        let preflight = self
+            .common
+            .preflight_pool(class, group)
             .clone()
             .try_acquire_owned()
             .map_err(|_| overloaded("worker preflight lane full"))?;
@@ -969,7 +1131,9 @@ impl WorkerTransport {
             let plan = endpoint.preflight(&session, header.as_slice()).await?;
             drop(header_scratch);
             validate_plan(&self.common.config, class, plan)?;
-            let handler = self.common.handlers[class as usize]
+            let handler = self
+                .common
+                .handler_pool(class, group)
                 .clone()
                 .try_acquire_owned()
                 .map_err(|_| {
@@ -980,6 +1144,9 @@ impl WorkerTransport {
             let sections = read_sections(&mut stream, &self.common, class, plan).await?;
             drop(preflight);
             trace.phase = RaftTransportPhase::Handle;
+            if self.common.directory.revoked(hello.from) {
+                return Err(revoked_peer());
+            }
             let reply = endpoint.handle(session, header, sections).await?;
             validate_reply(&self.common.config, class, &reply)?;
             // Free the lane before the reply can reach the peer, as on a
@@ -1056,6 +1223,146 @@ impl WorkerClient {
             header,
             sections,
             response_decode_bytes,
+            None,
+        )
+        .await
+    }
+    /// Waits until `until` for one caller slot on the lane to `target` for
+    /// the class `group` and `purpose` select, instead of refusing at once
+    /// when the lane is full (PERF1). Nothing is written while waiting, so a
+    /// timeout is still a not-applied `OutgoingLaneFull`. The slot keeps the
+    /// lane's bound: no more streams in flight to `target` than its handler
+    /// admits. Pass it to [`Self::request_reserved`].
+    pub(crate) async fn reserve_outgoing(
+        &self,
+        group: &GroupIdentity,
+        target: Uuid,
+        purpose: Purpose,
+        until: Instant,
+    ) -> Result<OutgoingReservation, RequestError> {
+        group
+            .validate()
+            .map_err(|_| malformed("invalid target group"))?;
+        let class = traffic(group, purpose)?;
+        let index = class as usize;
+        #[cfg(test)]
+        let hold = self.common.outgoing_hold[index].clone();
+        // RD3: a leader whose session negotiated direct admission handles
+        // `direct_handler_slots` direct requests at once, apart from queued
+        // ingress. Its lane has that capacity and no waiting share: every
+        // caller on it waits (`DirectLink`), and the ingress lane's callers
+        // that refuse at once never compete with it.
+        if direct_lane(class, group)
+            && self
+                .peer_supports(target, class, PeerFeature::DirectAdmission)
+                .is_some()
+        {
+            let lane = self
+                .common
+                .direct_outgoing
+                .lane(target, &self.common.config);
+            let class_slots = self.common.direct_class.clone();
+            let acquire = timeout_at(until, async {
+                #[cfg(test)]
+                let held = hold.acquire_owned().await?;
+                Ok::<_, tokio::sync::AcquireError>(OutgoingSlot {
+                    _slot: lane.acquire_owned().await?,
+                    _class: class_slots.acquire_owned().await?,
+                    #[cfg(test)]
+                    _held: held,
+                })
+            });
+            let _memory = self
+                .common
+                .shared
+                .reserve_scratch(ByteClass::Progress, std::mem::size_of_val(&acquire))?;
+            return match acquire.await {
+                Ok(Ok(slot)) => Ok(OutgoingReservation {
+                    target,
+                    class,
+                    slot,
+                    _waiting: None,
+                }),
+                _ => {
+                    self.common.refusals.outgoing(class, true);
+                    Err(RequestError::OutgoingLaneFull {
+                        class,
+                        direct: true,
+                    })
+                }
+            };
+        }
+        let waiting_lane = self.common.waiting.lane(target, class, &self.common.config);
+        let waiting_class = self.common.waiting_class[index].clone();
+        let lane = self
+            .common
+            .outgoing
+            .lane(target, class, &self.common.config);
+        let class_slots = self.common.outgoing_class[index].clone();
+        let acquire = timeout_at(until, async {
+            let waiting = (
+                waiting_lane.acquire_owned().await?,
+                waiting_class.acquire_owned().await?,
+            );
+            #[cfg(test)]
+            let held = hold.acquire_owned().await?;
+            let slot = lane.acquire_owned().await?;
+            let class_slot = class_slots.acquire_owned().await?;
+            Ok::<_, tokio::sync::AcquireError>((
+                waiting,
+                OutgoingSlot {
+                    _slot: slot,
+                    _class: class_slot,
+                    #[cfg(test)]
+                    _held: held,
+                },
+            ))
+        });
+        // Charge the pending acquisition and timer, as `authority_slots` does.
+        let _memory = self
+            .common
+            .shared
+            .reserve_scratch(ByteClass::Progress, std::mem::size_of_val(&acquire))?;
+        match acquire.await {
+            Ok(Ok((waiting, slot))) => Ok(OutgoingReservation {
+                target,
+                class,
+                slot,
+                _waiting: Some(waiting),
+            }),
+            _ => {
+                self.common.refusals.outgoing(class, false);
+                Err(RequestError::outgoing_lane_full(class))
+            }
+        }
+    }
+    /// [`Self::request_classified`] on a slot from [`Self::reserve_outgoing`]
+    /// for the same target and class.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_reserved(
+        &self,
+        reservation: OutgoingReservation,
+        group: &GroupIdentity,
+        target: impl Into<RequestTarget>,
+        purpose: Purpose,
+        header: ChargedBytes,
+        sections: [Option<ChargedBytes>; MAX_SECTIONS],
+        response_decode_bytes: usize,
+    ) -> Result<ReceivedReply, RequestError> {
+        let target = target.into();
+        if reservation.target != target.worker_id()
+            || traffic(group, purpose).ok() != Some(reservation.class)
+        {
+            return Err(malformed("outgoing reservation is for another lane").into());
+        }
+        self.request_with_timeout(
+            group,
+            target,
+            (purpose, None),
+            header,
+            sections,
+            response_decode_bytes,
+            Some(reservation.slot),
         )
         .await
     }
@@ -1074,9 +1381,11 @@ impl WorkerClient {
             header,
             [None, None, None],
             response_decode_bytes,
+            None,
         )
         .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn request_with_timeout(
         &self,
         group: &GroupIdentity,
@@ -1085,12 +1394,16 @@ impl WorkerClient {
         header: ChargedBytes,
         sections: [Option<ChargedBytes>; MAX_SECTIONS],
         response_decode_bytes: usize,
+        reserved: Option<OutgoingSlot>,
     ) -> Result<ReceivedReply, RequestError> {
         group
             .validate()
             .map_err(|_| malformed("invalid target group"))?;
         let class = traffic(group, purpose)?;
-        let _slot = self.try_outgoing(target.worker_id(), class)?;
+        let _slot = match reserved {
+            Some(slot) => slot,
+            None => self.try_outgoing(target.worker_id(), class)?,
+        };
         let deadline = self.common.config.deadline;
         let mut resolving = false;
         timeout(
@@ -1136,8 +1449,8 @@ impl WorkerClient {
             .checked_add(self.common.config.deadline)
             .ok_or_else(|| malformed("worker transport deadline is too large"))?;
         let refused = |error: RequestError| {
-            if matches!(error, RequestError::OutgoingLaneFull) {
-                self.common.refusals.outgoing(class);
+            if matches!(error, RequestError::OutgoingLaneFull { .. }) {
+                self.common.refusals.outgoing(class, false);
             }
             error
         };
@@ -1146,7 +1459,7 @@ impl WorkerClient {
             .await
             .map_err(refused)?;
         if Instant::now() >= deadline {
-            return Err(refused(RequestError::OutgoingLaneFull));
+            return Err(refused(RequestError::outgoing_lane_full(class)));
         }
         timeout_at(
             deadline,
@@ -1192,7 +1505,7 @@ impl WorkerClient {
             .common
             .authority_waiters
             .try_acquire()
-            .map_err(|_| RequestError::OutgoingLaneFull)?;
+            .map_err(|_| RequestError::outgoing_lane_full(class))?;
         let acquire = timeout_at(deadline, async {
             let role = roles.acquire().await?;
             #[cfg(test)]
@@ -1220,8 +1533,8 @@ impl WorkerClient {
             .reserve_scratch(ByteClass::Progress, std::mem::size_of_val(&acquire))?;
         acquire
             .await
-            .map_err(|_| RequestError::OutgoingLaneFull)?
-            .map_err(|_| RequestError::OutgoingLaneFull)
+            .map_err(|_| RequestError::outgoing_lane_full(class))?
+            .map_err(|_| RequestError::outgoing_lane_full(class))
     }
     async fn exchange(
         &self,
@@ -1328,6 +1641,7 @@ impl WorkerClient {
             prefix,
             header,
             sections,
+            ..
         } = raw;
         if prefix.nonce != *nonce.as_bytes() {
             return Err(malformed("invalid worker response context").into());
@@ -1416,7 +1730,7 @@ impl WorkerClient {
         class: TrafficClass,
     ) -> Result<OutgoingSlot, RequestError> {
         self.try_outgoing_slot(target, class).inspect_err(|_| {
-            self.common.refusals.outgoing(class);
+            self.common.refusals.outgoing(class, false);
         })
     }
     /// `try_outgoing` for a caller that waits instead when the lane is full.
@@ -1428,7 +1742,7 @@ impl WorkerClient {
         let full = || {
             #[cfg(test)]
             self.common.outgoing_lane_full[class as usize].notify_one();
-            RequestError::OutgoingLaneFull
+            RequestError::outgoing_lane_full(class)
         };
         #[cfg(test)]
         let held = self.common.outgoing_hold[class as usize]
@@ -1499,6 +1813,26 @@ fn outgoing_class_slots(handler_slots: usize) -> usize {
         .min(Semaphore::MAX_PERMITS)
 }
 
+/// A caller slot taken ahead of its request by
+/// [`WorkerClient::reserve_outgoing`]. Dropping it frees the slot.
+pub(crate) struct OutgoingReservation {
+    target: Uuid,
+    class: TrafficClass,
+    slot: OutgoingSlot,
+    /// The waiting callers' share of the lane and the class, held with the
+    /// slot. A request moves `slot` out; dropping the rest frees the share.
+    /// `None` on a direct lane (RD3), which has no share to keep.
+    _waiting: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
+}
+impl OutgoingReservation {
+    pub(crate) fn deadline_refusal(&self) -> RequestError {
+        RequestError::OutgoingLaneFull {
+            class: self.class,
+            direct: self._waiting.is_none(),
+        }
+    }
+}
+
 /// A caller slot on one peer lane and in its class. Dropping it frees both.
 struct OutgoingSlot {
     _slot: OwnedSemaphorePermit,
@@ -1513,6 +1847,9 @@ struct OutgoingSlot {
 #[derive(Default)]
 struct OutgoingLanes {
     lanes: Mutex<std::collections::HashMap<Uuid, Arc<[Arc<Semaphore>; CLASSES]>>>,
+    /// Slots each lane keeps back from its handler capacity (at least one
+    /// slot stays).
+    headroom: usize,
 }
 impl OutgoingLanes {
     /// Lanes are kept per worker ID, not per incarnation. Idle lanes of
@@ -1524,18 +1861,43 @@ impl OutgoingLanes {
             .lanes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capacity = |slots: usize| slots.saturating_sub(self.headroom).max(1);
         if !lanes.contains_key(&worker) && lanes.len() >= Self::PRUNE_AT {
             lanes.retain(|_, lane| {
                 lane.iter()
                     .zip(&config.handler_slots)
-                    .any(|(slots, &capacity)| slots.available_permits() != capacity)
+                    .any(|(slots, &handlers)| slots.available_permits() != capacity(handlers))
             });
         }
         lanes.entry(worker).or_insert_with(|| {
             Arc::new(std::array::from_fn(|i| {
-                Arc::new(Semaphore::new(config.handler_slots[i]))
+                Arc::new(Semaphore::new(capacity(config.handler_slots[i])))
             }))
         })[class as usize]
+            .clone()
+    }
+}
+
+/// RD3: caller slots per peer for direct requests to peers that negotiated
+/// `PeerFeature::DirectAdmission`, `direct_handler_slots` each, created on
+/// first use and pruned like [`OutgoingLanes`].
+#[derive(Default)]
+struct DirectLanes {
+    lanes: Mutex<std::collections::HashMap<Uuid, Arc<Semaphore>>>,
+}
+impl DirectLanes {
+    fn lane(&self, worker: Uuid, config: &TransportConfig) -> Arc<Semaphore> {
+        let mut lanes = self
+            .lanes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capacity = config.direct_handler_slots;
+        if !lanes.contains_key(&worker) && lanes.len() >= OutgoingLanes::PRUNE_AT {
+            lanes.retain(|_, lane| lane.available_permits() != capacity);
+        }
+        lanes
+            .entry(worker)
+            .or_insert_with(|| Arc::new(Semaphore::new(capacity)))
             .clone()
     }
 }
@@ -1589,7 +1951,9 @@ fn traffic(group: &GroupIdentity, purpose: Purpose) -> Result<TrafficClass, Prot
             Ok(TrafficClass::ServiceMutation)
         }
         Purpose::GroupLifecycle if group.kind == GroupKind::Control => Ok(TrafficClass::Settlement),
-        Purpose::ReplicaPlacement | Purpose::GroupDamage if group.kind == GroupKind::Control => {
+        Purpose::ReplicaPlacement | Purpose::GroupDamage | Purpose::SystemRecovery
+            if group.kind == GroupKind::Control =>
+        {
             Ok(TrafficClass::Settlement)
         }
         Purpose::ShardSplit if group.kind == GroupKind::Control => Ok(TrafficClass::Settlement),
@@ -1789,6 +2153,7 @@ impl Hello {
             16 => Purpose::ReplicaPlacement,
             17 => Purpose::RaftProgress,
             18 => Purpose::GroupDamage,
+            19 => Purpose::SystemRecovery,
             _ => return Err(malformed("unknown worker RPC purpose")),
         };
         let member = |start| WorkerIdentity {

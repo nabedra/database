@@ -15,6 +15,7 @@ use crate::{
         },
         pool::{ByteClass, OltpPool, SharedResourceConfig, WorkerSharedResources},
     },
+    oltp_deployment::inventory::WorkerPools,
     oltp_replication::{
         authority::{
             consensus::{Applied, Consensus},
@@ -36,7 +37,6 @@ use crate::{
         typed_log::TypedConfig,
         types::*,
     },
-    oltp_deployment::inventory::WorkerPools,
     protocol::{ErrorCode, Outcome, ProtocolError, TableDescriptor},
     request_queue::{QueueError, QueueLimits},
 };
@@ -92,6 +92,15 @@ impl Drop for LocalServices {
     }
 }
 impl LocalServices {
+    #[cfg(test)]
+    pub(super) async fn stop_directory_refresh_for_test(&self) {
+        let refresh = self.refresh.lock().unwrap().take();
+        if let Some(refresh) = refresh {
+            refresh.abort();
+            assert!(refresh.await.unwrap_err().is_cancelled());
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn status_endpoint_for_test(
         &self,
@@ -396,6 +405,8 @@ impl LocalServices {
                 let TimestampReply::Fenced { receipt, .. } = timestamp.reply else {
                     return Err(unavailable());
                 };
+                #[cfg(test)]
+                let observed_fence = receipt.clone();
                 if control.group(receipt.group.group_id).await?.is_some() {
                     accepted(
                         control
@@ -404,6 +415,8 @@ impl LocalServices {
                             .reply,
                     )?;
                 }
+                #[cfg(test)]
+                super::recovery_tests::cold_fence_checkpoint(&observed_fence).await;
                 let status_receipt = status_raft
                     .propose(OwnedCommand::new_owned(
                         StatusCommand::Fence {
@@ -418,6 +431,8 @@ impl LocalServices {
                 let StatusReply::Fenced(receipt) = status_receipt.reply else {
                     return Err(unavailable());
                 };
+                #[cfg(test)]
+                let observed_fence = receipt.clone();
                 if control.group(receipt.group.group_id).await?.is_some() {
                     accepted(
                         control
@@ -426,6 +441,8 @@ impl LocalServices {
                             .reply,
                     )?;
                 }
+                #[cfg(test)]
+                super::recovery_tests::cold_fence_checkpoint(&observed_fence).await;
                 let receipt = catalog_participant
                     .fence_current(fence.transition_id, old, next)
                     .await?;
@@ -454,12 +471,16 @@ impl LocalServices {
                         let receipt = participant
                             .fence_current(fence.transition_id, old, next)
                             .await?;
+                        #[cfg(test)]
+                        let observed_fence = receipt.clone();
                         accepted(
                             control
                                 .record_group_fence(Uuid::new_v4(), receipt)
                                 .await?
                                 .reply,
                         )?;
+                        #[cfg(test)]
+                        super::recovery_tests::cold_fence_checkpoint(&observed_fence).await;
                     }
                     if page.done {
                         break;
@@ -1080,15 +1101,23 @@ pub(super) fn registered_raft_config() -> openraft::Config {
         heartbeat_interval: 500,
         election_timeout_min: 1500,
         election_timeout_max: 3000,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
+            crate::oltp_replication::hosted::SNAPSHOT_LOGS_SINCE_LAST,
+        ),
+        max_in_snapshot_log_to_keep: crate::oltp_replication::hosted::SNAPSHOT_LOGS_TO_KEEP,
         ..Default::default()
     }
 }
 
-fn raft_config() -> openraft::Config {
+pub(crate) fn raft_config() -> openraft::Config {
     openraft::Config {
         heartbeat_interval: 100,
         election_timeout_min: 200,
         election_timeout_max: 400,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
+            crate::oltp_replication::hosted::SNAPSHOT_LOGS_SINCE_LAST,
+        ),
+        max_in_snapshot_log_to_keep: crate::oltp_replication::hosted::SNAPSHOT_LOGS_TO_KEEP,
         ..Default::default()
     }
 }

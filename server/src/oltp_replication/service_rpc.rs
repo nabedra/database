@@ -1,7 +1,7 @@
 //! Authenticated application service RPCs. Ordinary worker TLS enrollment is
 //! not permission to submit an arbitrary Raft command or manufacture a proof.
 use super::{
-    multiplex::{Purpose, ReceivedReply},
+    multiplex::{MAX_SECTIONS, Purpose, ReceivedReply},
     owned::serialized_digest,
     types::*,
 };
@@ -80,6 +80,9 @@ pub(super) const INLINE_REPLY_BYTES: usize = 1024;
 const RECEIVER_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const HINTED_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const SCOPED_MUTATION_TIMEOUT: Duration = Duration::from_secs(2);
+const DIRECT_CATALOG_PEER_TIMEOUT: Duration = Duration::from_millis(500);
+const ALLOCATE_DIRECT_PEER_TIMEOUT: Duration = Duration::from_millis(750);
+const ALLOCATE_DIRECT_STALLED_PROBE: Duration = Duration::from_millis(200);
 pub(super) const SERVICE_HEADER_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,6 +189,10 @@ enum Method {
     ParticipantPropose {
         progress: bool,
     },
+    ParticipantIndexReclaim,
+    ParticipantStoredIndex {
+        after: Option<uuid::Uuid>,
+    },
     /// A point operation for the range leader (plan section 6). The body is
     /// the first payload section.
     Direct(direct::DirectHeader),
@@ -215,6 +222,7 @@ impl Method {
             | Self::ParticipantScanOpen { .. }
             | Self::ParticipantFence { .. }
             | Self::ParticipantResolveTimestampPoint
+            | Self::ParticipantIndexReclaim
             | Self::ParticipantPropose { progress: true } => Purpose::Settlement,
             Self::Direct(_) | Self::DirectForward(_) => Purpose::ApiIngress,
             _ => Purpose::Authority,
@@ -236,7 +244,7 @@ impl Method {
                 Self::ParticipantPropose { .. } | Self::ParticipantScanRun { .. }
             )
     }
-    fn can_repeat_scoped_read(self, action: ServiceAction) -> bool {
+    fn uses_bounded_read_failover(self, action: ServiceAction) -> bool {
         self.can_repeat_read()
             && (matches!(
                 action,
@@ -244,11 +252,15 @@ impl Method {
                     | ServiceAction::ScopedQueueExecute(_)
                     | ServiceAction::ScopedQueueRead { .. }
                     | ServiceAction::ScopedQueueFenceReceipt { .. }
-            ) || matches!(self, Self::ScopedStatusParticipant { .. }))
+            ) || matches!(self, Self::ScopedStatusParticipant { .. })
+                || self.is_direct_catalog_read(action))
     }
-    /// Calls whose small replies are decoded inline (PERF2a): only
-    /// `AllocateDirect`, whose reply is a fixed-shape range.
-    fn inline_small_reply(self) -> bool {
+    fn is_direct_catalog_read(self, action: ServiceAction) -> bool {
+        action == ServiceAction::DirectLeader
+            && matches!(self, Self::ParticipantRead { .. } | Self::ParticipantGuard)
+    }
+    /// `AllocateDirect` has a fixed-shape reply decoded inline (PERF2a).
+    fn is_allocate_direct(self) -> bool {
         matches!(
             self,
             Self::TimestampCall {
@@ -256,6 +268,24 @@ impl Method {
                 mutation: true
             }
         )
+    }
+    fn peer_timeout(self, action: ServiceAction, stalled: bool) -> Duration {
+        if self.is_allocate_direct() {
+            // Timestamp replicas can immediately refuse when they are not
+            // the leader. Probe a silent old leader briefly between rounds
+            // so a freshly elected survivor can answer in the same request.
+            if stalled {
+                ALLOCATE_DIRECT_STALLED_PROBE
+            } else {
+                ALLOCATE_DIRECT_PEER_TIMEOUT
+            }
+        } else if self.is_direct_catalog_read(action) {
+            DIRECT_CATALOG_PEER_TIMEOUT
+        } else if self.can_repeat_read() {
+            HINTED_READ_TIMEOUT
+        } else {
+            SCOPED_MUTATION_TIMEOUT
+        }
     }
     fn input_limit(self) -> usize {
         match self {
@@ -270,6 +300,7 @@ impl Method {
                 crate::oltp::mvcc::MAX_FIXED_COMMAND_BYTES
             }
             Self::ParticipantPropose { progress: true } => 128 << 10,
+            Self::ParticipantIndexReclaim => 4096,
             Self::TimestampPointDecisionRead { .. }
             | Self::ParticipantTimestampPointSeal { .. }
             | Self::ParticipantTimestampPointRejection { .. }
@@ -328,6 +359,21 @@ impl From<CallError> for ProtocolError {
         }
     }
 }
+
+#[derive(Clone, Copy, Default)]
+struct CallDeadlines {
+    peer_failover: Option<Instant>,
+    outgoing: Option<Instant>,
+}
+
+enum Outgoing {
+    Immediate,
+    WaitUntil(Instant),
+    Reserved(crate::oltp_replication::multiplex::OutgoingReservation),
+}
+type TransportFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ReceivedReply, RequestError>> + Send + 'a>,
+>;
 
 struct Client {
     group: GroupIdentity,
@@ -428,27 +474,47 @@ impl Client {
     ) -> Result<ServiceResponse, ProtocolError> {
         self.call_as(self.action, method, payload).await
     }
-    async fn call_as(
+    fn call_as(
         &self,
         action: ServiceAction,
         method: Method,
         payload: Option<ChargedBytes>,
+    ) -> impl std::future::Future<Output = Result<ServiceResponse, ProtocolError>> + Send + '_ {
+        self.call_with_outgoing_deadline(action, method, payload, None)
+    }
+
+    async fn call_with_outgoing_deadline(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: Option<ChargedBytes>,
+        outgoing_deadline: Option<Instant>,
     ) -> Result<ServiceResponse, ProtocolError> {
-        if method.can_repeat_scoped_read(action) {
+        if method.uses_bounded_read_failover(action) {
             return self.repeat_as(action, method, payload).await;
         }
         let mut possibly_applied = false;
-        self.call_round(action, method, &payload, &mut possibly_applied, None, false)
-            .await
-            .map_err(|error| {
-                let error = ProtocolError::from(error);
-                // An earlier replica may have executed the call before this
-                // round met a local refusal on the next one (G1).
-                if possibly_applied && !method.can_repeat_read() {
-                    return mutation_uncertain(error);
-                }
-                error
-            })
+        self.call_round(
+            action,
+            method,
+            &payload,
+            &mut possibly_applied,
+            CallDeadlines {
+                outgoing: outgoing_deadline,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .map_err(|error| {
+            let error = ProtocolError::from(error);
+            // An earlier replica may have executed the call before this
+            // round met a local refusal on the next one (G1).
+            if possibly_applied && !method.can_repeat_read() {
+                return mutation_uncertain(error);
+            }
+            error
+        })
     }
     async fn converge(
         &self,
@@ -534,7 +600,7 @@ impl Client {
             .iter()
             .find(|member| member.node_id == node)?;
         let attempt = timeout_at(
-            deadline.min(Instant::now() + SCOPED_MUTATION_TIMEOUT),
+            deadline.min(Instant::now() + method.peer_timeout(action, false)),
             self.call_member(action, method, payload, node, member.worker_id.into()),
         )
         .await;
@@ -552,7 +618,7 @@ impl Client {
                 RequestError::Protocol(error) | RequestError::PeerRejected { error, .. },
             ))) => route_unavailable(&error) || error == invalid(),
             Ok(Err(CallError::Transport(RequestError::Unreachable))) => true,
-            Ok(Err(CallError::Transport(RequestError::OutgoingLaneFull))) => false,
+            Ok(Err(CallError::Transport(RequestError::OutgoingLaneFull { .. }))) => false,
             // The reply failed this side's checks.
             Ok(Err(CallError::Local(_))) => true,
         };
@@ -666,16 +732,19 @@ impl Client {
                     method,
                     &payload,
                     &mut possibly_applied,
-                    peer_deadline,
+                    CallDeadlines {
+                        peer_failover: peer_deadline,
+                        ..Default::default()
+                    },
                     reuse_routes,
                 ),
             )
             .await
             .map_err(|_| unavailable())?;
             let refused_before_send = match attempt {
-                Err(CallError::Transport(RequestError::OutgoingLaneFull)) => {
-                    tracing::debug!(group=%self.group.group_id, method=?method, retry_ms=delay.as_millis(), "local service outgoing lane full");
-                    true
+                Err(CallError::Transport(error @ RequestError::OutgoingLaneFull { .. })) => {
+                    tracing::debug!(group=%self.group.group_id, method=?method, ?error, retry_ms=delay.as_millis(), "local service outgoing lane full");
+                    Some(error)
                 }
                 Err(CallError::Transport(
                     RequestError::Protocol(error) | RequestError::PeerRejected { error, .. },
@@ -684,12 +753,12 @@ impl Client {
                     // Retry the same idempotent operation with fresh TLS context.
                     possibly_applied = true;
                     tracing::debug!(group=%self.group.group_id, method=?method, retry_ms=delay.as_millis(), "service transport temporarily overloaded");
-                    false
+                    None
                 }
                 Err(CallError::Local(error)) if route_unavailable(&error) => {
                     possibly_applied = true;
                     tracing::debug!(group=%self.group.group_id, method=?method, retry_ms=delay.as_millis(), "service routes temporarily unavailable");
-                    false
+                    None
                 }
                 result => {
                     return result.map_err(|error| {
@@ -707,10 +776,9 @@ impl Client {
             // Only the original charged request crosses the wait.
             sleep_until((Instant::now() + delay).min(deadline)).await;
             if Instant::now() >= deadline {
-                return Err(if refused_before_send && !possibly_applied {
-                    RequestError::OutgoingLaneFull.into()
-                } else {
-                    unavailable()
+                return Err(match refused_before_send {
+                    Some(error) if !possibly_applied => error.into(),
+                    _ => unavailable(),
                 });
             }
             delay = (delay * 2).min(Duration::from_millis(250));
@@ -722,13 +790,19 @@ impl Client {
         method: Method,
         payload: &Option<ChargedBytes>,
         possibly_applied: &mut bool,
-        convergence_deadline: Option<Instant>,
+        deadlines: CallDeadlines,
         reuse_routes: bool,
     ) -> Result<ServiceResponse, CallError> {
         let mut failed_read_hint = None;
         if action == ServiceAction::Owner
             && let Some(result) = self
-                .call_hinted(method, payload, possibly_applied, &mut failed_read_hint)
+                .call_hinted(
+                    method,
+                    payload,
+                    possibly_applied,
+                    &mut failed_read_hint,
+                    deadlines.outgoing,
+                )
                 .await
         {
             return result;
@@ -744,7 +818,7 @@ impl Client {
                     possibly_applied,
                     &routes,
                     None,
-                    convergence_deadline,
+                    deadlines,
                 )
                 .await;
             if result.is_ok() {
@@ -769,7 +843,7 @@ impl Client {
             possibly_applied,
             &routes,
             retry_last,
-            convergence_deadline,
+            deadlines,
         )
         .await
     }
@@ -782,13 +856,14 @@ impl Client {
         possibly_applied: &mut bool,
         routes: &ReplicaRoutes,
         retry_last: Option<u64>,
-        convergence_deadline: Option<Instant>,
+        deadlines: CallDeadlines,
     ) -> Result<ServiceResponse, CallError> {
         let stalled = self.stalled.load(Ordering::Relaxed);
         let preferred = match self.leader.load(Ordering::Relaxed) {
-            0 if convergence_deadline.is_some() => routes.last_successful_node().unwrap_or(0),
+            0 if deadlines.peer_failover.is_some() => routes.last_successful_node().unwrap_or(0),
             node => node,
         };
+        let mut forwarded = None;
         // Prefer the observed leader, but let other replicas answer before
         // spending another transport deadline on a failed cached receiver.
         for pass in 0..3 {
@@ -802,20 +877,18 @@ impl Client {
                 };
                 priority == pass
             }) {
-                let call = self.call_member(
+                let call = self.call_member_at(
                     action,
                     method,
                     payload,
                     member.node_id,
                     member.worker_id.into(),
+                    None,
+                    deadlines.outgoing,
                 );
-                let reply = if let Some(deadline) = convergence_deadline {
+                let reply = if let Some(deadline) = deadlines.peer_failover {
                     // Leave time to reach the next leader when one peer stalls.
-                    let attempt = if method.can_repeat_read() {
-                        HINTED_READ_TIMEOUT
-                    } else {
-                        SCOPED_MUTATION_TIMEOUT
-                    };
+                    let attempt = method.peer_timeout(action, member.node_id == stalled);
                     let peer_deadline = deadline.min(Instant::now() + attempt);
                     timeout_at(peer_deadline, call).await.unwrap_or_else(|_| {
                         self.stalled.store(member.node_id, Ordering::Relaxed);
@@ -832,16 +905,29 @@ impl Client {
                             Ordering::Relaxed,
                             Ordering::Relaxed,
                         );
-                        if action == ServiceAction::Owner || convergence_deadline.is_some() {
+                        if action == ServiceAction::Owner || deadlines.peer_failover.is_some() {
                             routes.record_successful_node(member.node_id);
                         }
                         return Ok(response);
+                    }
+                    Ok(Err(error)) if error == super::hosted::proposal_forwarded() => {
+                        forwarded = Some(error);
                     }
                     Ok(Err(error)) if route_unavailable(&error) => {
                         *possibly_applied = true;
                         continue;
                     }
                     Ok(Err(error)) => return Err(error.into()),
+                    Err(CallError::Transport(RequestError::PeerRejected { worker, error }))
+                        if matches!(method, Method::ParticipantFence { .. })
+                            && worker.worker_id == member.worker_id
+                            && placement_rejected_before_execution(&error) =>
+                    {
+                        // Control retains the placement while replicas reopen.
+                        // This peer had no route for the fence, so try the
+                        // other verified voters before refreshing membership.
+                        continue;
+                    }
                     Err(CallError::Transport(error)) => {
                         match &error {
                             RequestError::Protocol(detail)
@@ -856,7 +942,7 @@ impl Client {
                                 *possibly_applied = true;
                                 continue;
                             }
-                            RequestError::OutgoingLaneFull => {}
+                            RequestError::OutgoingLaneFull { .. } => {}
                         }
                         return Err(CallError::Transport(error));
                     }
@@ -867,6 +953,9 @@ impl Client {
         // Local saturation and definitive errors already returned above. On
         // exhaustion the next call must verify the membership pages again.
         self.control.invalidate_replica_routes(routes);
+        if !*possibly_applied && let Some(error) = forwarded {
+            return Err(error.into());
+        }
         Err(unavailable().into())
     }
 
@@ -888,7 +977,10 @@ impl Client {
                 &mut completed,
                 target,
                 None,
-                Some(deadline),
+                CallDeadlines {
+                    peer_failover: Some(deadline),
+                    ..Default::default()
+                },
             ),
         )
         .await
@@ -910,6 +1002,7 @@ impl Client {
         payload: &Option<ChargedBytes>,
         possibly_applied: &mut bool,
         failed_read_hint: &mut Option<(uuid::Uuid, u64)>,
+        outgoing_deadline: Option<Instant>,
     ) -> Option<Result<ServiceResponse, CallError>> {
         if *possibly_applied
             || matches!(
@@ -967,6 +1060,7 @@ impl Client {
                         member.node_id,
                         member.worker_id.into(),
                         generation,
+                        None,
                     ),
                 )
                 .await
@@ -987,6 +1081,7 @@ impl Client {
             member.node_id,
             receiver.into(),
             generation,
+            outgoing_deadline,
         );
         let attempt = if method.can_repeat_read() {
             match tokio::time::timeout(HINTED_READ_TIMEOUT, call).await {
@@ -997,6 +1092,10 @@ impl Client {
             call.await
         };
         let route_failure = match attempt {
+            Ok(Err(error)) if error == super::hosted::proposal_forwarded() => {
+                self.control.invalidate_replica_routes(&routes);
+                return None;
+            }
             Ok(Ok(response)) => {
                 routes.record_successful_node(member.node_id);
                 return Some(Ok(response));
@@ -1057,9 +1156,10 @@ impl Client {
         node: u64,
         worker: RequestTarget,
     ) -> Result<Result<ServiceResponse, ProtocolError>, CallError> {
-        self.call_member_at(action, method, payload, node, worker, None)
+        self.call_member_at(action, method, payload, node, worker, None, None)
             .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn call_member_at(
         &self,
         action: ServiceAction,
@@ -1068,6 +1168,30 @@ impl Client {
         node: u64,
         worker: RequestTarget,
         placement_generation: Option<uuid::Uuid>,
+        outgoing_deadline: Option<Instant>,
+    ) -> Result<Result<ServiceResponse, ProtocolError>, CallError> {
+        self.call_member_with_outgoing(
+            action,
+            method,
+            payload,
+            node,
+            worker,
+            placement_generation,
+            outgoing_deadline.map_or(Outgoing::Immediate, Outgoing::WaitUntil),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn call_member_with_outgoing(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: &Option<ChargedBytes>,
+        node: u64,
+        worker: RequestTarget,
+        placement_generation: Option<uuid::Uuid>,
+        outgoing: Outgoing,
     ) -> Result<Result<ServiceResponse, ProtocolError>, CallError> {
         let header = self.shared.encode_in(
             method.class().byte_class(),
@@ -1086,18 +1210,33 @@ impl Client {
         }
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport start");
         let _timer = crate::oltp_runtime::stage_timing::variant("rpc.call.", &method).timer();
-        let reply = self
-            .transport
-            .request_classified(
+        let sections = [payload.clone(), None, None];
+        // Box the transport future and the lane wait. Keeping either inline
+        // grew nested service futures enough to overflow Tokio worker
+        // stacks during D05 and O11 recovery.
+        let transport: TransportFuture<'_> = match outgoing {
+            Outgoing::Immediate => Box::pin(self.transport.request_classified(
                 &self.group,
                 worker,
                 method.purpose(),
                 header,
-                [payload.clone(), None, None],
+                sections,
                 64 << 10,
-            )
-            .await
-            .map_err(|error| {
+            )),
+            Outgoing::Reserved(reservation) => Box::pin(self.transport.request_reserved(
+                reservation,
+                &self.group,
+                worker,
+                method.purpose(),
+                header,
+                sections,
+                64 << 10,
+            )),
+            Outgoing::WaitUntil(until) => {
+                self.request_with_lane_wait(worker, method.purpose(), header, sections, until)
+            }
+        };
+        let reply = transport.await.map_err(|error| {
                 tracing::debug!(group=%self.group.group_id, method=?method, node, error=?error, "service peer transport refused or lost");
                 CallError::Transport(error)
             })?;
@@ -1113,6 +1252,53 @@ impl Client {
                     mutation_uncertain(error)
                 })
             })
+    }
+
+    fn request_with_lane_wait(
+        &self,
+        worker: RequestTarget,
+        purpose: Purpose,
+        header: ChargedBytes,
+        sections: [Option<ChargedBytes>; MAX_SECTIONS],
+        until: Instant,
+    ) -> TransportFuture<'_> {
+        Box::pin(async move {
+            let refusal = match self
+                .transport
+                .request_classified(
+                    &self.group,
+                    worker,
+                    purpose,
+                    header.clone(),
+                    sections.clone(),
+                    64 << 10,
+                )
+                .await
+            {
+                Err(error @ RequestError::OutgoingLaneFull { .. }) => error,
+                result => return result,
+            };
+            // A local refusal precedes send, so the same header and
+            // charged payload can use a reserved slot.
+            let reservation = self
+                .transport
+                .reserve_outgoing(&self.group, worker.worker_id(), purpose, until)
+                .await?;
+            if Instant::now() >= until {
+                return Err(refusal);
+            }
+            self.transport
+                .request_reserved(
+                    reservation,
+                    &self.group,
+                    worker,
+                    purpose,
+                    header,
+                    sections,
+                    64 << 10,
+                )
+                .await
+        })
     }
 
     async fn member_reply(
@@ -1143,7 +1329,7 @@ impl Client {
             && reply.sections[0]
                 .as_ref()
                 .is_none_or(|section| section.len() <= DIRECT_INLINE_REPLY_BYTES))
-            || (method.inline_small_reply()
+            || (method.is_allocate_direct()
                 && raw.len() <= INLINE_REPLY_BYTES
                 && reply.sections[0]
                     .as_ref()
@@ -1395,7 +1581,7 @@ async fn service_grant(
 /// and role while the locally applied Control revision is unchanged and the
 /// Control read started under 5 s ago.
 async fn authorize(
-    control: &ControlClient,
+    control: &Arc<ControlClient>,
     session: &AuthenticatedSession,
     header: &Header,
 ) -> Result<(), ProtocolError> {
@@ -1428,20 +1614,91 @@ async fn authorize(
             .await;
     }
     let key = GrantKey::new(session.remote(), header.action, session.group(), None);
-    control
-        .service_grants()
-        .role(key, revision, || async {
-            control
-                .service_role(
-                    &scope,
-                    session.remote(),
-                    header.action,
-                    session.group().clone(),
-                )
-                .await
-                .map(Some)
-        })
-        .await
+    let read = || async {
+        control
+            .service_role(
+                &scope,
+                session.remote(),
+                header.action,
+                session.group().clone(),
+            )
+            .await
+            .map(Some)
+    };
+    // RD2: a range leader's calls on the direct path (`AllocateDirect` at the
+    // Timestamp leader, Catalog reads) keep their role warm, so an idle
+    // leader's next commit does not wait for a Control read.
+    if header.action == ServiceAction::DirectLeader {
+        let refresh = || {
+            warm_role(
+                control,
+                scope.clone(),
+                session.remote(),
+                header.action,
+                session.group().clone(),
+            )
+        };
+        return control
+            .service_grants()
+            .role_warm(key, revision, read, refresh)
+            .await;
+    }
+    control.service_grants().role(key, revision, read).await
+}
+
+/// The background refresh of one warm role check (RD2, `grant_cache`).
+pub(super) fn warm_role(
+    control: &Arc<ControlClient>,
+    scope: crate::oltp_runtime::replica::QueueScope,
+    remote: WorkerIdentity,
+    action: ServiceAction,
+    target: GroupIdentity,
+) -> grant_cache::Refresh {
+    let control = Arc::downgrade(control);
+    Arc::new(move || {
+        let control = control.upgrade()?;
+        let revision = control.applied_revision();
+        let (scope, target) = (scope.clone(), target.clone());
+        Some((
+            revision,
+            Box::pin(async move {
+                control
+                    .service_role(&scope, remote, action, target)
+                    .await
+                    .map(Some)
+            }),
+        ))
+    })
+}
+/// `warm_role` for a role whose target moved (AZ2): asks for `target` and, when
+/// a previous Control build refuses it as `Unauthorized`, for `fallback`, as
+/// the request path does.
+pub(super) fn warm_role_or(
+    control: &Arc<ControlClient>,
+    scope: crate::oltp_runtime::replica::QueueScope,
+    remote: WorkerIdentity,
+    action: ServiceAction,
+    target: GroupIdentity,
+    fallback: GroupIdentity,
+) -> grant_cache::Refresh {
+    let control = Arc::downgrade(control);
+    Arc::new(move || {
+        let control = control.upgrade()?;
+        let revision = control.applied_revision();
+        let (scope, target, fallback) = (scope.clone(), target.clone(), fallback.clone());
+        Some((
+            revision,
+            Box::pin(async move {
+                match control.service_role(&scope, remote, action, target).await {
+                    Err(error) if error.code == ErrorCode::Unauthorized => control
+                        .service_role(&scope, remote, action, fallback)
+                        .await
+                        .map(Some),
+                    grant => grant.map(Some),
+                }
+            }),
+        ))
+    })
 }
 async fn reply(
     shared: &Arc<WorkerSharedResources>,

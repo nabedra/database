@@ -450,7 +450,7 @@ async fn assert_progress<C>(
                 0
             )
             .await,
-        Err(RequestError::OutgoingLaneFull)
+        Err(RequestError::OutgoingLaneFull { .. })
     ));
 
     assert!(leader.ensure_linearizable().await.is_err());
