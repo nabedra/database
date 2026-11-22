@@ -4,8 +4,14 @@ kinds = ["R"]
 guarantees = ["EVT-G01", "EVT-G14"]
 scenarios = ["EV06", "EV07"]
 tiers = ["T2"]
-command = ["python3", "-m", "scripts.testing.kind.suite_events"]
+# The checks job builds nothing, so the command builds the Events image the suite deploys.
+# The history goes under the ignored target/ tree: an untracked file at the repository root
+# would mark the record's tree dirty, and the matrix ignores dirty-tree evidence.
+command = ["bash", "-ec", '''
+docker build -f server/events/deploy/Dockerfile --build-arg BUILD_JOBS=4 -t nabedra-events:ci server
+exec python3 -m scripts.testing.kind.suite_events --image nabedra-events:ci --history target/testing-logs/kind-events.jsonl
+''']
 cwd = "."
-timeout_s = 1800
+timeout_s = 3600
 needs = ["docker", "kind"]
 result_parser = "exit-code"

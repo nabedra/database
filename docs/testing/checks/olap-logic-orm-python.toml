@@ -4,9 +4,18 @@ kinds = ["D"]
 guarantees = ["ORM-G02", "OLAP-G06"]
 scenarios = ["U01", "U02"]
 tiers = ["T1"]
-command = ["python3", "-m", "unittest", "discover", "-v", "-s", "tests", "-p", "test_logic_replay.py", "-k", "test_replay_corpus"]
+# The Rust runner records every server exchange of the corpus (NABEDRA_LOGIC_RECORD). The Python
+# replay decodes those responses through its transport and must render the same goldens. The HTTP
+# replay also runs, and stays not-run (skipped) unless NABEDRA_LOGIC_URL names a server.
+# Without the recording step, both tests skip and the check executes zero assertions.
+command = ["bash", "-ec", '''
+transcripts="$PWD/../../target/testing-logs/logic-transcripts-python"
+rm -rf "$transcripts"
+(cd ../../server && NABEDRA_LOGIC_RECORD="$transcripts" cargo test --locked -j 2 --test olap_logic)
+NABEDRA_LOGIC_TRANSCRIPTS="$transcripts" exec python3 -m unittest discover -v -s tests -p test_logic_replay.py -k test_replay
+''']
 cwd = "orm/python"
-timeout_s = 300
+timeout_s = 2400
 needs = ["python-orm"]
 result_parser = "unittest"
 env = { PYTHONPATH = "src" }

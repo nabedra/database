@@ -4,14 +4,21 @@ kinds = ["D"]
 guarantees = ["ORM-G02", "OLAP-G06"]
 scenarios = ["U01", "U02"]
 tiers = ["T1"]
+# The Rust runner records every server exchange of the corpus (NABEDRA_LOGIC_RECORD). The TypeScript
+# replay decodes those responses through its transport and must render the same goldens. The HTTP
+# replay also runs, and stays skipped unless NABEDRA_LOGIC_URL names a server.
+# Without the recording step, both tests skip and the check executes zero assertions.
 command = ["bash", "-ec", '''
+transcripts="$PWD/../../target/testing-logs/logic-transcripts-typescript"
+rm -rf "$transcripts"
+(cd ../../server && NABEDRA_LOGIC_RECORD="$transcripts" cargo test --locked -j 2 --test olap_logic)
 if [ ! -f node_modules/typescript/bin/tsc ]; then
   npm ci --no-audit --no-fund
 fi
 npm run build
-node --test --test-reporter=tap --test-name-pattern='^replay corpus over HTTP$' tests/logic-replay.test.mjs
+NABEDRA_LOGIC_TRANSCRIPTS="$transcripts" node --test --test-reporter=tap --test-name-pattern='^replay' tests/logic-replay.test.mjs
 ''']
 cwd = "orm/typescript"
-timeout_s = 300
+timeout_s = 2400
 needs = ["node"]
 result_parser = "node-test"
