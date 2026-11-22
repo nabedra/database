@@ -2,8 +2,8 @@ auth-one-argument.resp	Auth
 client-invalid-name.resp	Err(InvalidClientName)
 cluster-keyslot.resp	ClusterKeySlot
 command-info.resp	CommandInfo
-expire-overflow.resp	Err(InvalidInteger)
-get-missing-key.resp	Err(Arity)
+expire-overflow.resp	Err(InvalidExpireTime("expire"))
+get-missing-key.resp	Err(Arity("get"))
 get-oversize-key.resp	Err(InvalidKeySize)
 get.resp	Data(Get)
 getkeys.resp	CommandGetKeys
