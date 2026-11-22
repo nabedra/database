@@ -759,7 +759,10 @@ impl Factory for S3Factory {
 #[cfg(feature = "s3")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn contract_s3() {
-    let Ok(bucket) = std::env::var("NABEDRA_TEST_S3_BUCKET") else {
+    let Some(bucket) = std::env::var("NABEDRA_TEST_S3_BUCKET")
+        .ok()
+        .filter(|bucket| !bucket.is_empty())
+    else {
         println!("not-run: s3-unconfigured");
         return;
     };
