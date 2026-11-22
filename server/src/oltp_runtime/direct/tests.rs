@@ -63,6 +63,7 @@ use uuid::Uuid;
 #[path = "../../../tests/support/tls.rs"]
 mod tls;
 
+mod cap1;
 mod gc1;
 mod gc2;
 

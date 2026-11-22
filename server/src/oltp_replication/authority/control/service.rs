@@ -553,10 +553,7 @@ impl ControlHandle {
                 unix_ms: super::direct::wall_ms(),
             })
             .await?;
-            for feature in [
-                super::DIRECT_BATCH_FEATURE,
-                super::QUEUED_SNAPSHOT_RETRY_FEATURE,
-            ] {
+            for feature in super::CLUSTER_FEATURES.map(|feature| feature.name) {
                 let _ = self
                     .submit(ControlCommand::DirectCapability {
                         operation_id: super::feature_operation_id(feature, target),

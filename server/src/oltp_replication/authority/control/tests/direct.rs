@@ -773,3 +773,243 @@ async fn o02_o08_snapshot_retry_waits_for_every_worker_and_refuses_old_joiners()
         ControlReply::JoinBegun { .. }
     ));
 }
+
+// ---------------------------------------------------------------------------
+// CAP1: the `data.index.reclaim` cluster feature
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// `actor`'s advert of the registered cluster feature `name`, exactly as
+    /// a worker of a build that knows it sends it.
+    async fn advertise_feature(&mut self, name: &str, actor: WorkerIdentity) -> ControlReply {
+        self.apply(ControlCommand::DirectCapability {
+            operation_id: crate::oltp_replication::authority::control::feature_operation_id(
+                name, actor,
+            ),
+            actor,
+            action: DirectCapabilityOperation::Advertise {
+                version: DIRECT_VERSION,
+            },
+            unix_ms: crate::oltp_replication::authority::control::direct::wall_ms(),
+        })
+        .await
+    }
+    /// Every feature a GC2 build (the build before `data.index.reclaim`)
+    /// advertises: `data.direct.v1`, `data.direct.batch` and
+    /// `status.queued-snapshot-retry`.
+    async fn advertise_gc2_build(&mut self, actor: WorkerIdentity) {
+        use crate::oltp_replication::authority::control::{
+            DIRECT_BATCH_FEATURE, QUEUED_SNAPSHOT_RETRY_FEATURE,
+        };
+        self.advertise(actor).await;
+        self.advertise_feature(DIRECT_BATCH_FEATURE, actor).await;
+        self.advertise_feature(QUEUED_SNAPSHOT_RETRY_FEATURE, actor)
+            .await;
+    }
+    async fn advertise_index_reclaim(&mut self, actor: WorkerIdentity) -> ControlReply {
+        self.advertise_feature(
+            crate::oltp_replication::authority::control::INDEX_RECLAIM_FEATURE,
+            actor,
+        )
+        .await
+    }
+    async fn feature_enabled(
+        &self,
+        name: &'static str,
+    ) -> Option<crate::oltp_replication::authority::control::FeatureActivation> {
+        let feature = crate::oltp_replication::authority::control::cluster_feature(name)
+            .expect("a registered feature");
+        let raw = self
+            .machine
+            .store()
+            .read(BUDGET, move |view| {
+                let enabled: Option<
+                    crate::oltp_replication::authority::control::FeatureActivation,
+                > = view
+                    .get(feature.enabled_key)?
+                    .map(|raw| decode(raw.as_ref()))
+                    .transpose()?;
+                view.encode(&enabled)
+            })
+            .await
+            .unwrap();
+        decode(raw.as_ref()).unwrap()
+    }
+}
+
+/// CAP1's mixed-version proof: a Control replica of the GC2 build (it knows
+/// `data.direct.batch` and `status.queued-snapshot-retry`, not
+/// `data.index.reclaim`) applies every entry a CAP1 cluster produces until
+/// the enablement with the same reply and byte-identical state: the index
+/// adverts, a repeated advert, re-evaluations, and a GC2-build worker
+/// joining the ready set and a Data group. The other two features enable on
+/// both builds alike. The enablement needs every enrolled worker's advert,
+/// so no GC2-build Control replica is left when it is written.
+#[tokio::test]
+async fn cap1_o02_index_reclaim_adverts_apply_identically_on_a_gc2_control_replica() {
+    use crate::oltp_replication::authority::control::{
+        DIRECT_BATCH_FEATURE, INDEX_RECLAIM_FEATURE, QUEUED_SNAPSHOT_RETRY_FEATURE,
+    };
+    let directory = Directory::new();
+    let legacy = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope.clone(), pool.clone()).await;
+    fixture.mirror_legacy(&legacy, scope, pool).await;
+    fixture.mirror = fixture
+        .mirror
+        .take()
+        .map(|mirror| mirror.known_features_for_test(2));
+    let workers = fixture.ready_cluster(3).await;
+    for worker in &workers {
+        fixture.advertise_gc2_build(*worker).await;
+    }
+    assert!(
+        fixture
+            .feature_enabled(DIRECT_BATCH_FEATURE)
+            .await
+            .is_some()
+    );
+    assert!(
+        fixture
+            .feature_enabled(QUEUED_SNAPSHOT_RETRY_FEATURE)
+            .await
+            .is_some()
+    );
+    // Two members run CAP1: their index adverts are ordinary
+    // `Advertise { version: 1 }` entries to the GC2 replica.
+    for worker in &workers[..2] {
+        assert!(matches!(
+            fixture.advertise_index_reclaim(*worker).await,
+            ControlReply::DirectCapability(DirectCapability {
+                advertised: true,
+                activation: Some(_),
+                ..
+            })
+        ));
+    }
+    assert_eq!(
+        fixture.advertise_index_reclaim(workers[0]).await,
+        ControlReply::Rejected(Fault::Conflict)
+    );
+    fixture
+        .direct(workers[1], DirectCapabilityOperation::Activate)
+        .await;
+    assert_eq!(
+        fixture.feature_enabled(INDEX_RECLAIM_FEATURE).await,
+        None,
+        "workers[2] runs GC2"
+    );
+    // A GC2-build worker enrolls and joins the ready set and a Data group:
+    // admitted on both builds, since nothing new is enabled.
+    let old = fixture.enroll(4).await;
+    fixture.advertise_gc2_build(old).await;
+    let mut members = workers.clone();
+    members.sort_by_key(|worker| worker.worker_id);
+    fixture.add_ready(old, &mut members).await;
+    let generation = fixture.begin_group().await;
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::GroupPage {
+                operation_id: Uuid::new_v4(),
+                generation,
+                replicas: Page::new(vec![replica(1, workers[0]), replica(2, old)]).unwrap(),
+            })
+            .await,
+        ControlReply::GroupBuilding { .. }
+    ));
+    fixture.advertise_index_reclaim(workers[2]).await;
+    fixture
+        .direct(workers[0], DirectCapabilityOperation::Activate)
+        .await;
+    assert_eq!(fixture.feature_enabled(INDEX_RECLAIM_FEATURE).await, None);
+    // The last member upgrades: every enrolled worker, so every Control
+    // voter and learner, now runs CAP1, and no GC2 replica is left.
+    fixture.mirror = None;
+    fixture.advertise_index_reclaim(old).await;
+    let enabled = fixture
+        .feature_enabled(INDEX_RECLAIM_FEATURE)
+        .await
+        .expect("the last advert enables");
+    assert_eq!(enabled.activated_at.index, fixture.next - 1);
+}
+
+/// Once `data.index.reclaim` is enabled (unanimous over enrolled workers,
+/// sticky, durable), a GC2-build joiner, which advertises every older
+/// feature but not this one, is refused as a ready-set member and as a Data
+/// replica; after its advert (an upgrade) it joins. This is the join an
+/// older build could otherwise make into a group whose log already holds
+/// `ReclaimIndex` entries (RV-FINAL-A L1).
+#[tokio::test]
+async fn cap1_o02_o12_enabled_index_reclaim_refuses_a_gc2_build_joiner() {
+    use crate::oltp_replication::authority::control::INDEX_RECLAIM_FEATURE;
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope.clone(), pool.clone()).await;
+    let workers = fixture.ready_cluster(3).await;
+    for worker in &workers {
+        fixture.advertise_gc2_build(*worker).await;
+    }
+    // An advert before `data.direct.v1` activation would wait for a
+    // re-evaluation; here the capability is active, so the last advert
+    // enables.
+    for worker in &workers[..2] {
+        fixture.advertise_index_reclaim(*worker).await;
+        assert_eq!(fixture.feature_enabled(INDEX_RECLAIM_FEATURE).await, None);
+    }
+    fixture.advertise_index_reclaim(workers[2]).await;
+    let enabled = fixture
+        .feature_enabled(INDEX_RECLAIM_FEATURE)
+        .await
+        .expect("unanimous");
+    let old = fixture.enroll(4).await;
+    fixture.advertise_gc2_build(old).await;
+    assert_eq!(
+        fixture.feature_enabled(INDEX_RECLAIM_FEATURE).await,
+        Some(enabled),
+        "sticky"
+    );
+    let state = fixture.state().await;
+    assert_eq!(
+        fixture
+            .apply(ControlCommand::BeginJoin {
+                operation_id: Uuid::new_v4(),
+                expected: state.ready.view,
+                target: old,
+            })
+            .await,
+        ControlReply::Rejected(Fault::DirectCapabilityRequired)
+    );
+    let generation = fixture.begin_group().await;
+    let page = |old| ControlCommand::GroupPage {
+        operation_id: Uuid::new_v4(),
+        generation,
+        replicas: Page::new(vec![replica(1, workers[0]), replica(2, old)]).unwrap(),
+    };
+    assert_eq!(
+        fixture.apply(page(old)).await,
+        ControlReply::Rejected(Fault::DirectCapabilityRequired)
+    );
+    fixture.advertise_index_reclaim(old).await;
+    assert!(matches!(
+        fixture.apply(page(old)).await,
+        ControlReply::GroupBuilding { .. }
+    ));
+    let state = fixture.state().await;
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::BeginJoin {
+                operation_id: Uuid::new_v4(),
+                expected: state.ready.view,
+                target: old,
+            })
+            .await,
+        ControlReply::JoinBegun { .. }
+    ));
+    drop(fixture);
+    let reopened = Fixture::open(&directory, scope, pool).await;
+    assert_eq!(
+        reopened.feature_enabled(INDEX_RECLAIM_FEATURE).await,
+        Some(enabled),
+        "durable"
+    );
+}

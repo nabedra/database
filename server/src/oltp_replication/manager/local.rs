@@ -165,6 +165,7 @@ impl LocalWorker {
             starts: tokio::sync::Mutex::new(()),
             damage_sink: Arc::new(Mutex::new(None)),
             health: Arc::default(),
+            features: Arc::default(),
         });
         let operator = LocalOperatorPermit::from_local_bootstrap(
             WorkerIdentity::from(&enrollment),
