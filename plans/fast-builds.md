@@ -73,13 +73,13 @@ Actions is the source of truth for full suites. It has already caught Linux-only
 | --- | --- | --- | --- |
 | T0 edit loop | Local | under 1 min | Incremental `cargo check --features oltp --lib`, `cargo test -p nabedra-kv <filter>`, one test filter on an already built test binary |
 | T1 focused | Local | under 5 min | Incremental `cargo test --features oltp --lib <module filter>` (build `--lib` only: `--tests` also builds the plain library and 6 integration binaries), Events tests |
-| T2 every push | Actions, parallel jobs | under 8 min wall | `kv` (clippy, tests), `features` (O02, NS26, `cargo check` per engine), `oltp` (lib suite + integration), `events` |
-| T3 on request | Actions, `[ci docker]` / `[ci campaign]` / `[ci acceptance]` | 3 to 240 min | Both images plus Events acceptance (NS27), release crash campaign, Linux OLTP acceptance |
+| T2 base (dispatch or PR gate) | Actions, parallel jobs on one shared build | under 8 min wall | `kv` (clippy, tests), `features` (O02, NS26, `cargo check` per engine), `oltp` (lib suite + integration), `events` |
+| T3 on request | Actions, dispatch with `jobs=docker`, `campaign`, `acceptance`, `direct`, or `scenarios` / `tests` | 3 to 240 min | Both images plus Events acceptance (NS27), release crash campaign, Linux OLTP acceptance |
 | T4 designated | Benchmark infrastructure | | NS11 and the ScyllaDB comparison. Not on shared runners. |
 
 Load-sensitive tests run alone when they fail locally. The full suite runs on Actions. Current list (ledger): `o14_c07_m02`, `o05_o28_typed_mtls_snapshot`, `o06_o16_actual_learner_replacement`, `q03_r05_mtls_probe`, `o03_o04_native_query_plan`, D07, and the `typed_log` cancellation tests (15 s watchdog).
 
-`scripts/acceptance_oltp.py` sets `CARGO_INCREMENTAL=0`, debug info 0 and `CARGO_BUILD_JOBS=2`, and holds an `flock` lane. Its default target is the main checkout's shared `server/target`, so the lane stops worktrees from building into one directory at the same time, and incremental off keeps that shared directory from filling with per-source incremental caches. `RUST_TEST_THREADS=1` and `TOKIO_WORKER_THREADS=2` keep the resource assertions stable. On a dedicated runner the lane is uncontended and costs nothing.
+`scripts/acceptance_oltp.py` sets `CARGO_INCREMENTAL=0`, debug info 0 and `CARGO_BUILD_JOBS=2`, and holds an `flock` lane. Its default target is the main checkout's shared `server/target`, so the lane stops worktrees from building into one directory at the same time, and incremental off keeps that shared directory from filling with per-source incremental caches. `RUST_TEST_THREADS=1` and `TOKIO_WORKER_THREADS=2` keep the resource assertions stable. On a dedicated runner the lane is uncontended and costs nothing. Since 2026-11-22 agents do not build through the lane: CI passes `--test-binary` from its shared build, and local runs use one `--scenario` on an already built binary.
 
 Fixes already made by the lead: `shell: bash` with pipefail and `--no-fail-fast`, so `cargo test | tee` fails the step (`762d0df`), and the Events acceptance output path (`9af7bdb`).
 
@@ -95,7 +95,7 @@ Cache budget, measured from the repository's cache list on 2026-11-20 (compresse
 | Docker `type=gha` dependency layers | none | estimated 300 MiB per image if BLD3 adds them |
 | Total per branch | about 0.8 GB today, 2.3 GB used | |
 
-GitHub lets a run restore caches only from its own branch and the default branch. Each `rr-*` task branch therefore starts cold and saves its own copy of identical keys. About 12 task branches fill the 10 GB, after which GitHub evicts the least recently used entries.
+GitHub lets a run restore caches only from its own branch and the default branch. Each `rr-*` task branch therefore starts cold and saves its own copy of identical keys. About 12 task branches fill the 10 GB, after which GitHub evicts the least recently used entries. Since 2026-11-22 caches are saved only from dispatches on `main`, and runs are started only by dispatch ([GitHub Actions for checks](../.agents/skills/code-review/references/gh-actions.md)).
 
 ---
 
