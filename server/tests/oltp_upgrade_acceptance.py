@@ -272,10 +272,11 @@ def export_with_retry(cluster, repository):
     backup_id = uid()
     destination = archive_path(repository, cluster.cluster_id, backup_id)
     command = [sys.executable, str(ROOT / 'scripts/oltp_upgrade_export.py'), '--database', DATABASE,
-               '--cluster-id', cluster.cluster_id, '--backup-id', backup_id, '--repository', str(repository)]
+               '--cluster-id', cluster.cluster_id, '--backup-id', backup_id, '--repository', str(repository),
+               '--insecure']
     for url in cluster.urls.values():
         command.extend(['--worker', url])
-    env = dict(os.environ, NABEDRA_ADMIN_TOKEN=cluster.auth['admin_token'])
+    env = dict(os.environ, NABEDRA_ADMIN_TOKEN=cluster.auth['admin_token'], XDG_STATE_HOME=str(cluster.root / 'state'))
     # Force a real cancellation after the old worker acquires a pin. Its
     # staging file cannot be renamed over this directory before publication.
     destination.mkdir(mode=0o700)
@@ -311,6 +312,7 @@ def export_with_retry(cluster, repository):
     assert manifest == cluster.operator('archive.status', {'output': str(completed)})
     replay = subprocess.run(command, env=env, capture_output=True, text=True, timeout=300)
     assert replay.returncode == 0, replay.stderr
+    assert replay.stderr.startswith(f'Export attempt 2 on the workers: {completed}\n'), replay.stderr
     assert json.loads(replay.stdout) == manifest
     assert set(repository.iterdir()) == {destination, completed}
     assert sorted(repository.glob('*/manifest.json')) == [completed / 'manifest.json']

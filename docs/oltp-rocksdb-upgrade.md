@@ -11,7 +11,10 @@ available until you finish verification.
 2. Pause application writes and schema changes, and let accepted requests reach
    a terminal outcome. Record the database name, source cluster ID and a newly
    generated backup UUID. With `NABEDRA_ADMIN_TOKEN` set, run the exporter from
-   this checkout. Use the worker admin URLs over a protected network or tunnel.
+   this checkout. Use HTTPS worker admin URLs and pass `--ca-file` if the
+   workers use a private CA. For plain HTTP through a protected tunnel, pass
+   `--insecure` explicitly. Plain HTTP sends the admin token in cleartext and
+   the flag leaves HTTPS certificate verification enabled.
 
    ```sh
    python3 scripts/oltp_upgrade_export.py \
@@ -24,14 +27,20 @@ available until you finish verification.
    command with the same backup UUID. The old release accepts archive requests
    on the current coordinator. Other workers may answer `503 worker runtime
    is not accepting requests` even while healthy. The exporter tries the
-   supplied workers using the same attempt. If none accepts it, check cluster
-   readiness and retry with the original UUID.
+   supplied workers using the same attempt. If the coordinator times out and
+   the other workers return 503, the coordinator may still be exporting. It is
+   safe to rerun with the original UUID. If no worker accepts the request,
+   check cluster readiness before rerunning.
 
    If the coordinator reports `PinExpired`, the exporter advances to the next
    attempt under the same backup UUID. The new attempt takes a new snapshot
-   pin and uses a different archive directory. Keep writes and schema changes
-   paused across retries. If five attempts lose their pins, check the source
-   cluster and repository before starting a new export.
+   pin and uses a different archive directory. The exporter records confirmed
+   pin expiries in its local state directory (`$XDG_STATE_HOME/nabedra/upgrade-export`,
+   default `~/.local/state/nabedra/upgrade-export`). Rerun with the same state
+   directory, database, cluster ID, backup UUID and repository path to resume
+   at the first attempt without a confirmed expiry. Keep writes and schema
+   changes paused across retries. If five attempts lose their pins, check the
+   source cluster and repository before starting a new export.
 
    The exporter prints each attempt's path on stderr and returns the completed
    manifest on stdout. Use the directory named by `key.archive_id` in that
