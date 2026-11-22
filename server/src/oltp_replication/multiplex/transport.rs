@@ -189,6 +189,23 @@ pub(crate) const DIRECT_PREFLIGHT_SLOTS: usize = 64;
 fn direct_lane(class: TrafficClass, group: &GroupIdentity) -> bool {
     class == TrafficClass::ApiIngress && matches!(group.kind, GroupKind::Data { .. })
 }
+/// Benchmark only (RD3): `NABEDRA_BENCH_NO_DIRECT_ADMISSION=1` makes this
+/// worker behave as the build before RD3 (no `nabedra-otp/4`, direct requests
+/// in the ingress class's pools), so one binary measures both sides.
+const NO_DIRECT_ADMISSION_ENV: &str = "NABEDRA_BENCH_NO_DIRECT_ADMISSION";
+fn direct_admission_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        let disabled =
+            std::env::var_os(NO_DIRECT_ADMISSION_ENV).is_some_and(|value| value == "1");
+        if disabled {
+            tracing::warn!(
+                "{NO_DIRECT_ADMISSION_ENV}=1: direct requests use the ingress handler slots (benchmark only)"
+            );
+        }
+        disabled
+    })
+}
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
@@ -625,6 +642,8 @@ struct Common {
     /// `preflight` and `handlers` of the ingress class.
     direct_preflight: Arc<Semaphore>,
     direct_handlers: Arc<Semaphore>,
+    /// False only under `NABEDRA_BENCH_NO_DIRECT_ADMISSION=1`.
+    direct_admission: bool,
     /// RD3: caller slots for direct requests to a peer whose session
     /// negotiated `PeerFeature::DirectAdmission`: `direct_handler_slots` per
     /// peer lane and `OUTGOING_CLASS_LANES` lanes' worth in total. To an
@@ -656,7 +675,7 @@ struct Common {
 impl Common {
     /// The receiver's preflight pool for a request of `class` on `group`.
     fn preflight_pool(&self, class: TrafficClass, group: &GroupIdentity) -> &Arc<Semaphore> {
-        if direct_lane(class, group) {
+        if self.direct_admission && direct_lane(class, group) {
             &self.direct_preflight
         } else {
             &self.preflight[class as usize]
@@ -667,7 +686,7 @@ impl Common {
     /// its commit, so the ingress class's few slots would bound the leader's
     /// in-flight direct requests and their batches (RD3).
     fn handler_pool(&self, class: TrafficClass, group: &GroupIdentity) -> &Arc<Semaphore> {
-        if direct_lane(class, group) {
+        if self.direct_admission && direct_lane(class, group) {
             &self.direct_handlers
         } else {
             &self.handlers[class as usize]
@@ -845,7 +864,10 @@ impl WorkerTransport {
         if local.certificate_sha256.to_string() != tls.certificate_sha256() {
             return Err(malformed("local certificate differs from enrollment"));
         }
-        let (connector, acceptor) = if sessions_enabled {
+        let direct_admission = !direct_admission_disabled();
+        let (connector, acceptor) = if sessions_enabled && !direct_admission {
+            tls.transports(&[INDEX_RECLAIM_ALPN, SESSION_ALPN, ALPN])
+        } else if sessions_enabled {
             tls.transports(&[
                 DIRECT_ADMISSION_ALPN,
                 INDEX_RECLAIM_ALPN,
@@ -889,6 +911,7 @@ impl WorkerTransport {
                 }),
                 direct_preflight: Arc::new(Semaphore::new(config.direct_preflight_slots)),
                 direct_handlers: Arc::new(Semaphore::new(config.direct_handler_slots)),
+                direct_admission,
                 direct_outgoing: DirectLanes::default(),
                 direct_class: Arc::new(Semaphore::new(outgoing_class_slots(
                     config.direct_handler_slots,
