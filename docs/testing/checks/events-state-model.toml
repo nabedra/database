@@ -1,0 +1,11 @@
+id = "events-state-model"
+module = "events"
+kinds = ["U"]
+guarantees = ["EVT-G02", "EVT-G03", "EVT-G04", "EVT-G05", "EVT-G08"]
+scenarios = ["EV01", "EV02", "EV03"]
+tiers = ["T0", "T1"]
+command = ["cargo", "test", "--locked", "-j", "2", "--test", "state_model"]
+cwd = "server/events"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"
