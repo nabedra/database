@@ -206,12 +206,19 @@ async fn o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane() {
             }),
         );
         let preparing = register_checkpoint(id, Checkpoint::QueuedPrepare);
+        // A streaming body takes the queued path in both direct modes.
         let mut result = Box::pin(call(&app, batch.clone(), false));
         let checkpoint = tokio::select! {
             checkpoint = preparing => checkpoint.unwrap(),
             reply = &mut result => panic!("batch ended before queued Prepare: {reply:?}"),
         };
-        let record = runtime.services.replica.lock().unwrap().observation(id).unwrap();
+        let record = runtime
+            .services
+            .replica
+            .lock()
+            .unwrap()
+            .observation(id)
+            .unwrap();
         assert!(record.accepted);
         assert_eq!(record.state, RequestState::Running);
         let client = runtime.services.manager.client();
@@ -230,18 +237,43 @@ async fn o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane() {
             request_id: id,
             attempt: 1,
         };
-        let committed = runtime.services.status.inspect_transaction(txn).await.unwrap().unwrap();
-        assert!(matches!(committed.decision.unwrap().decision, TxnDecision::Commit { .. }));
-        assert!(runtime.services.status.inspect_transaction(TxnId { attempt: 2, ..txn })
-            .await.unwrap().is_none());
+        let committed = runtime
+            .services
+            .status
+            .inspect_transaction(txn)
+            .await
+            .unwrap()
+            .unwrap();
+        let participants = committed.manifest.unwrap().participant_count;
+        assert_eq!(committed.prepared_count, participants);
+        assert_eq!(committed.resolved_count, participants);
+        assert!(matches!(
+            committed.decision.unwrap().decision,
+            TxnDecision::Commit { .. }
+        ));
+        assert!(
+            runtime
+                .services
+                .status
+                .inspect_transaction(TxnId { attempt: 2, ..txn })
+                .await
+                .unwrap()
+                .is_none()
+        );
         for (key, value) in [(-1, 10), (1, 20)] {
-            let key_read = body(Uuid::new_v4(), "table.get", json!({"table_id":table,"key":key}));
+            let key_read = body(
+                Uuid::new_v4(),
+                "table.get",
+                json!({"table_id":table,"key":key}),
+            );
             let (status, read) = call(&app, key_read, true).await;
             assert_eq!(status, 200, "{read}");
             assert_eq!(read["data"]["value"], value);
         }
         runtime.drain().await.unwrap();
-    }).await.expect("queued Prepare saturation watchdog");
+    })
+    .await
+    .expect("queued Prepare saturation watchdog");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

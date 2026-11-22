@@ -360,6 +360,12 @@ impl From<CallError> for ProtocolError {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct CallDeadlines {
+    peer_failover: Option<Instant>,
+    outgoing: Option<Instant>,
+}
+
 struct Client {
     group: GroupIdentity,
     shared: Arc<WorkerSharedResources>,
@@ -468,18 +474,38 @@ impl Client {
         if method.uses_bounded_read_failover(action) {
             return self.repeat_as(action, method, payload).await;
         }
+        self.call_once(action, method, payload, None).await
+    }
+
+    async fn call_once(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: Option<ChargedBytes>,
+        outgoing_deadline: Option<Instant>,
+    ) -> Result<ServiceResponse, ProtocolError> {
         let mut possibly_applied = false;
-        self.call_round(action, method, &payload, &mut possibly_applied, None, false)
-            .await
-            .map_err(|error| {
-                let error = ProtocolError::from(error);
-                // An earlier replica may have executed the call before this
-                // round met a local refusal on the next one (G1).
-                if possibly_applied && !method.can_repeat_read() {
-                    return mutation_uncertain(error);
-                }
-                error
-            })
+        self.call_round(
+            action,
+            method,
+            &payload,
+            &mut possibly_applied,
+            CallDeadlines {
+                outgoing: outgoing_deadline,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .map_err(|error| {
+            let error = ProtocolError::from(error);
+            // An earlier replica may have executed the call before this
+            // round met a local refusal on the next one (G1).
+            if possibly_applied && !method.can_repeat_read() {
+                return mutation_uncertain(error);
+            }
+            error
+        })
     }
     async fn converge(
         &self,
@@ -697,7 +723,10 @@ impl Client {
                     method,
                     &payload,
                     &mut possibly_applied,
-                    peer_deadline,
+                    CallDeadlines {
+                        peer_failover: peer_deadline,
+                        ..Default::default()
+                    },
                     reuse_routes,
                 ),
             )
@@ -752,13 +781,19 @@ impl Client {
         method: Method,
         payload: &Option<ChargedBytes>,
         possibly_applied: &mut bool,
-        convergence_deadline: Option<Instant>,
+        deadlines: CallDeadlines,
         reuse_routes: bool,
     ) -> Result<ServiceResponse, CallError> {
         let mut failed_read_hint = None;
         if action == ServiceAction::Owner
             && let Some(result) = self
-                .call_hinted(method, payload, possibly_applied, &mut failed_read_hint)
+                .call_hinted(
+                    method,
+                    payload,
+                    possibly_applied,
+                    &mut failed_read_hint,
+                    deadlines.outgoing,
+                )
                 .await
         {
             return result;
@@ -774,7 +809,7 @@ impl Client {
                     possibly_applied,
                     &routes,
                     None,
-                    convergence_deadline,
+                    deadlines,
                 )
                 .await;
             if result.is_ok() {
@@ -799,7 +834,7 @@ impl Client {
             possibly_applied,
             &routes,
             retry_last,
-            convergence_deadline,
+            deadlines,
         )
         .await
     }
@@ -812,11 +847,11 @@ impl Client {
         possibly_applied: &mut bool,
         routes: &ReplicaRoutes,
         retry_last: Option<u64>,
-        convergence_deadline: Option<Instant>,
+        deadlines: CallDeadlines,
     ) -> Result<ServiceResponse, CallError> {
         let stalled = self.stalled.load(Ordering::Relaxed);
         let preferred = match self.leader.load(Ordering::Relaxed) {
-            0 if convergence_deadline.is_some() => routes.last_successful_node().unwrap_or(0),
+            0 if deadlines.peer_failover.is_some() => routes.last_successful_node().unwrap_or(0),
             node => node,
         };
         let mut forwarded = None;
@@ -833,14 +868,16 @@ impl Client {
                 };
                 priority == pass
             }) {
-                let call = self.call_member(
+                let call = self.call_member_at(
                     action,
                     method,
                     payload,
                     member.node_id,
                     member.worker_id.into(),
+                    None,
+                    deadlines.outgoing,
                 );
-                let reply = if let Some(deadline) = convergence_deadline {
+                let reply = if let Some(deadline) = deadlines.peer_failover {
                     // Leave time to reach the next leader when one peer stalls.
                     let attempt = method.peer_timeout(action, member.node_id == stalled);
                     let peer_deadline = deadline.min(Instant::now() + attempt);
@@ -859,7 +896,7 @@ impl Client {
                             Ordering::Relaxed,
                             Ordering::Relaxed,
                         );
-                        if action == ServiceAction::Owner || convergence_deadline.is_some() {
+                        if action == ServiceAction::Owner || deadlines.peer_failover.is_some() {
                             routes.record_successful_node(member.node_id);
                         }
                         return Ok(response);
@@ -931,7 +968,10 @@ impl Client {
                 &mut completed,
                 target,
                 None,
-                Some(deadline),
+                CallDeadlines {
+                    peer_failover: Some(deadline),
+                    ..Default::default()
+                },
             ),
         )
         .await
@@ -953,6 +993,7 @@ impl Client {
         payload: &Option<ChargedBytes>,
         possibly_applied: &mut bool,
         failed_read_hint: &mut Option<(uuid::Uuid, u64)>,
+        outgoing_deadline: Option<Instant>,
     ) -> Option<Result<ServiceResponse, CallError>> {
         if *possibly_applied
             || matches!(
@@ -1010,6 +1051,7 @@ impl Client {
                         member.node_id,
                         member.worker_id.into(),
                         generation,
+                        None,
                     ),
                 )
                 .await
@@ -1030,6 +1072,7 @@ impl Client {
             member.node_id,
             receiver.into(),
             generation,
+            outgoing_deadline,
         );
         let attempt = if method.can_repeat_read() {
             match tokio::time::timeout(HINTED_READ_TIMEOUT, call).await {
@@ -1104,9 +1147,10 @@ impl Client {
         node: u64,
         worker: RequestTarget,
     ) -> Result<Result<ServiceResponse, ProtocolError>, CallError> {
-        self.call_member_at(action, method, payload, node, worker, None)
+        self.call_member_at(action, method, payload, node, worker, None, None)
             .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn call_member_at(
         &self,
         action: ServiceAction,
@@ -1115,7 +1159,36 @@ impl Client {
         node: u64,
         worker: RequestTarget,
         placement_generation: Option<uuid::Uuid>,
+        outgoing_deadline: Option<Instant>,
     ) -> Result<Result<ServiceResponse, ProtocolError>, CallError> {
+        let result = self
+            .call_member_reserved(
+                action,
+                method,
+                payload,
+                node,
+                worker,
+                placement_generation,
+                None,
+            )
+            .await;
+        let (until, refusal) = match (outgoing_deadline, result) {
+            (
+                Some(until),
+                Err(error @ CallError::Transport(RequestError::OutgoingLaneFull { .. })),
+            ) => (until, error),
+            (_, result) => return result,
+        };
+        // Only a local pre-send refusal can wait and send the same command.
+        // Keep the original charged payload and the round's G1 tracking.
+        let reservation = self
+            .transport
+            .reserve_outgoing(&self.group, worker.worker_id(), method.purpose(), until)
+            .await
+            .map_err(CallError::Transport)?;
+        if Instant::now() >= until {
+            return Err(refusal);
+        }
         self.call_member_reserved(
             action,
             method,
@@ -1123,7 +1196,7 @@ impl Client {
             node,
             worker,
             placement_generation,
-            None,
+            Some(reservation),
         )
         .await
     }

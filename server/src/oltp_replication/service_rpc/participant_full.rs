@@ -1356,6 +1356,12 @@ impl RemoteParticipant for ParticipantClient {
             let command_body = command.payload()?;
             let reclaim = matches!(command_body, ParticipantCommand::ReclaimIndex(_));
             let progress = !command_body.uses_prepare_lane();
+            let wait_for_outgoing = matches!(
+                command_body,
+                ParticipantCommand::PreparePage { .. }
+                    | ParticipantCommand::Seal { .. }
+                    | ParticipantCommand::Resolve { .. }
+            );
             // These commands replay the same locator, page, or settled guard.
             let repeat = matches!(client.action, ServiceAction::ScopedQueueExecute(_))
                 && matches!(
@@ -1405,12 +1411,25 @@ impl RemoteParticipant for ParticipantClient {
             };
             let response = if repeat {
                 client.repeat_as(client.action, method, Some(payload)).await?
+            } else if wait_for_outgoing {
+                client
+                    .call_once(
+                        client.action,
+                        method,
+                        Some(payload),
+                        Some(Instant::now() + SERVICE_CONVERGENCE),
+                    )
+                    .await?
             } else {
                 client.call(method, Some(payload)).await?
             };
             let (value, owner): (Applied<ParticipantReply>, _) =
                 self.decode_response(response).await.map_err(|error| {
-                    if repeat { mutation_uncertain(error) } else { error }
+                    if repeat || wait_for_outgoing {
+                        mutation_uncertain(error)
+                    } else {
+                        error
+                    }
                 })?;
             Ok(Applied::owned(value.position, value.reply, owner))
         })

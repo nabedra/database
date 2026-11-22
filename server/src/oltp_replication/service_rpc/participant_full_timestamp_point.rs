@@ -171,7 +171,10 @@ impl ParticipantClient {
                         &mut possibly_applied,
                         &route,
                         None,
-                        peer_deadline,
+                        CallDeadlines {
+                            peer_failover: peer_deadline,
+                            ..Default::default()
+                        },
                     )
                     .await
                     .map_err(ProtocolError::from);
