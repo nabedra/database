@@ -39,7 +39,7 @@ const CONTAINER_BOUND: usize = 16 * (size_of::<(Bytes, usize)>() + 1)
     + 16 * size_of::<Record>()
     + 16 * size_of::<usize>();
 const KEYS: [&[u8]; 6] = [b"a", b"b", b"{k}c", b"d\0\r\n", b"e", b"\xfff"];
-const CAPS: [usize; 4] = [3_000, 6_000, 12_000, 1 << 20];
+const CAPS: [usize; 5] = [2_000, 3_000, 6_000, 12_000, 1 << 20];
 const OVERFLOW: &str = "ERR increment or decrement would overflow";
 const NOT_INTEGER: &str = "ERR value is not an integer or out of range";
 const SET_EXPIRY: &str = "ERR invalid expire time in 'set' command";
@@ -189,7 +189,7 @@ fn gen_value(g: &mut Gen) -> Bytes {
         0 => Bytes::new(),
         1..=3 => Bytes::from(g.ascii(8)),
         4 => Bytes::from(g.bytes(8)),
-        5..=7 => Bytes::from_static(
+        5 | 6 => Bytes::from_static(
             *g.pick::<&[u8]>(&[
                 b"0",
                 b"1",
@@ -207,7 +207,7 @@ fn gen_value(g: &mut Gen) -> Bytes {
             ]),
         ),
         _ => {
-            let len = 200 + g.below(1_000) as usize;
+            let len = 300 + g.below(1_300) as usize;
             Bytes::from(vec![b'a' + g.below(26) as u8; len])
         }
     }
@@ -224,9 +224,9 @@ fn gen_delta(g: &mut Gen) -> i64 {
 }
 
 fn gen_cmd(g: &mut Gen, key_count: usize) -> Cmd {
-    match g.below(16) {
+    match g.below(17) {
         0 | 1 => Cmd::Get(gen_key(g, key_count)),
-        2..=4 => {
+        2..=5 => {
             let key = gen_key(g, key_count);
             let value = gen_value(g);
             let when = *g.pick(&[SetWhen::Always, SetWhen::Always, SetWhen::Absent, SetWhen::Present]);
@@ -243,14 +243,14 @@ fn gen_cmd(g: &mut Gen, key_count: usize) -> Cmd {
                 ttl,
             }
         }
-        5 => Cmd::Del(gen_keys(g, key_count)),
-        6 => Cmd::Exists(gen_keys(g, key_count)),
-        7 => Cmd::Mget(gen_keys(g, key_count)),
-        8 => Cmd::Ttl(gen_key(g, key_count)),
-        9 => Cmd::Pttl(gen_key(g, key_count)),
-        10 => Cmd::Expire(gen_key(g, key_count), g.range_i64(-2, 3)),
-        11 => Cmd::Pexpire(gen_key(g, key_count), g.range_i64(-100, 3_000)),
-        12 => Cmd::Persist(gen_key(g, key_count)),
+        6 => Cmd::Del(gen_keys(g, key_count)),
+        7 => Cmd::Exists(gen_keys(g, key_count)),
+        8 => Cmd::Mget(gen_keys(g, key_count)),
+        9 => Cmd::Ttl(gen_key(g, key_count)),
+        10 => Cmd::Pttl(gen_key(g, key_count)),
+        11 => Cmd::Expire(gen_key(g, key_count), g.range_i64(-2, 3)),
+        12 => Cmd::Pexpire(gen_key(g, key_count), g.range_i64(-100, 3_000)),
+        13 => Cmd::Persist(gen_key(g, key_count)),
         _ => Cmd::Incrby(gen_key(g, key_count), gen_delta(g)),
     }
 }
