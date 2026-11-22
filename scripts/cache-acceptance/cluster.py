@@ -3,6 +3,7 @@
 
 import argparse
 from contextlib import ExitStack
+from datetime import timedelta
 import hashlib
 import json
 import os
@@ -88,6 +89,7 @@ class Fleet:
         self.recorder = recorder
         self.nemesis = Nemesis(recorder)
         self.client_process = 1
+        self.placement = None
         self.metrics = root / "metrics"
         self.metrics.mkdir()
         scope.callback(self.save_metrics)
@@ -226,36 +228,65 @@ class Fleet:
 
     def op(self, node, client, f, key, *args, **kwargs):
         fields = dict(process=self.client_process, f=f, key=key.decode(), node=f"w{node}")
-        value = None
+        epoch = None
+        # The workload observes each new placement before issuing commands to its primary.
+        if self.placement is not None:
+            slot = key_slot(key)
+            if owner(self.placement, slot) == node:
+                epoch = self.placement["slots"][slot]["epoch"]
+        started = time.monotonic_ns()
         if f == "set":
-            value = args[0].decode()
-        elif args:
+            observed = value = args[0].decode()
+            if (ttl := kwargs.get("px")) is not None:
+                value = {"value": value, "at_ns": deadline(started, ttl, units_per_second=1000)}
+        elif f == "expire":
+            ttl = args[0] if args else kwargs["time"]
+            value = {"at_ns": deadline(started, ttl, units_per_second=1)}
+        elif f == "mget" or args:
             value = [key.decode(), *(arg.decode() for arg in args)]
-        self.recorder.record("invoke", value=value, **fields)
+        else:
+            value = None
+        self.recorder.record("invoke", value=value, time_ns=started, **fields)
         try:
             result = client.mget([key, *args]) if f == "mget" else getattr(client, f)(key, *args, **kwargs)
         except BaseException as error:
             outcome = "fail" if isinstance(error, (
                 ClusterDownError, TryAgainError, MovedError, ClusterCrossSlotError,
             )) else "info"
-            self.recorder.record(outcome, value={"error": type(error).__name__}, **fields)
+            self.recorder.record(outcome, value={"error": type(error).__name__, "epoch": epoch}, **fields)
             if outcome == "info":
                 # The operation may still apply, so this client process never invokes again.
                 self.client_process += 1
             raise
-        observed = value if f == "set" else result
+        if f != "set":
+            observed = result
         if isinstance(observed, bytes):
             observed = observed.decode()
         elif isinstance(observed, list):
             observed = [item.decode() if isinstance(item, bytes) else item for item in observed]
-        self.recorder.record("ok", value=observed, **fields)
+        self.recorder.record("ok", value={"value": observed, "epoch": epoch}, **fields)
         return result
+
+    def record_marker(self, action, key=None, node=None, **details):
+        if key is not None:
+            details["slot"] = key_slot(key)
+            key = key.decode()
+        self.recorder.record("ok", self.nemesis.process, "nemesis", key=key,
+                             node=f"w{node}" if node is not None else None,
+                             value={"action": action, **details})
 
     def wait_placement(self, verify, seconds=30):
         def predicate():
             state = self.status()
             return state if state is not None and verify(state) else None
-        return wait("committed placement", predicate, seconds=seconds)
+        self.placement = wait("committed placement", predicate, seconds=seconds)
+        return self.placement
+
+
+def deadline(started, ttl, *, units_per_second):
+    if isinstance(ttl, timedelta):
+        ttl = int(ttl.total_seconds() * units_per_second)
+    return max(0, started + int(ttl) * (1_000_000_000 // units_per_second))
 
 
 def owner(view, slot):
@@ -335,10 +366,12 @@ def history(fleet, evidence):
 
     wait("verified replica prefix includes acknowledged write", replica_caught_up)
     fleet.stop(f"w{primary}")
+    fleet.record_marker("failover", key, primary, epoch=prior)
     promoted = fleet.wait_placement(
         lambda view: owner(view, slot) not in (None, primary) and view["slots"][slot]["epoch"] > prior,
     )
     successor = owner(promoted, slot)
+    fleet.record_marker("promote", key, successor, epoch=promoted["slots"][slot]["epoch"])
     read = wait("successor authorizes cache slot", lambda: routed_value(fleet, successor, key, None))
     assert read[1] == b"prior", read
     with fleet.client(successor) as client:
@@ -383,7 +416,8 @@ def history(fleet, evidence):
     before_move = fleet.wait_placement(ready)
     moving_epoch = before_move["slots"][slot]["epoch"]
     fleet.apply("rebalance", "--first", str(slot), "--last", str(slot), "--target", str(primary))
-    fleet.wait_placement(lambda view: owner(view, slot) == primary and view["slots"][slot]["epoch"] > moving_epoch)
+    moved = fleet.wait_placement(lambda view: owner(view, slot) == primary and view["slots"][slot]["epoch"] > moving_epoch)
+    fleet.record_marker("slot-move", key, primary, epoch=moved["slots"][slot]["epoch"])
     assert wait("online move restored value", lambda: routed_value(fleet, primary, key, b"successor"))
     with fleet.client(primary) as client:
         assert 0 < fleet.op(primary, client, "pttl", key) < 120_000
@@ -401,6 +435,7 @@ def history(fleet, evidence):
     ))
     fleet.apply("cold-reset", "--confirm-data-loss")
     fresh = fleet.wait_placement(lambda view: view["generation"] == prior_view["generation"] + 1 and ready(view))
+    fleet.record_marker("cold-reset", generation=fresh["generation"])
     for old_key in (key, independent):
         read = wait("empty slot after cold reset", lambda: routed_value(fleet, owner(fresh, key_slot(old_key)), old_key, None))
         assert read[1] is None
