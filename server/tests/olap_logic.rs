@@ -311,10 +311,12 @@ impl Translator {
                     keys
                 }
             };
-            columns
-                .iter()
-                .map(|c| render_value(object.get(c).unwrap_or(&Value::Null)))
-                .collect()
+            if columns.len() != object.len() || columns.iter().any(|c| !object.contains_key(c)) {
+                return Err(format!(
+                    "wrong result columns: expected {columns:?}, got {object:?}"
+                ));
+            }
+            columns.iter().map(|c| render_value(&object[c])).collect()
         };
         match op {
             "table.create" | "table.describe" => Ok(vec![self.descriptor_row(data)?]),
@@ -570,6 +572,7 @@ struct Outcome {
     assertions: usize,
     skipped: Vec<String>,
     failures: Vec<String>,
+    mismatches: Vec<String>,
     /// Actual expected blocks by record index, for blessing.
     actual: BTreeMap<usize, Vec<String>>,
 }
@@ -584,6 +587,7 @@ async fn run_file(path: &str, file: &File, exec: &mut impl Exec, prefix: &str) -
             out.skipped.push(format!("{at} skipif {reason}"));
             continue;
         }
+        out.assertions += 1;
         let (op, payload) = match tr.translate(&record.command) {
             Ok(v) => v,
             Err(e) => {
@@ -595,7 +599,6 @@ async fn run_file(path: &str, file: &File, exec: &mut impl Exec, prefix: &str) -
         if let Ok(data) = &result {
             tr.observe(&op, data);
         }
-        out.assertions += 1;
         match (&record.kind, result) {
             (Kind::StatementOk, Ok(_)) => {}
             (Kind::StatementError(pattern), Err((code, message)))
@@ -628,11 +631,14 @@ async fn run_file(path: &str, file: &File, exec: &mut impl Exec, prefix: &str) -
                 };
                 if let Some(label) = label {
                     match labels.get(&label) {
-                        Some((line, first)) if *first != actual => out.failures.push(format!(
-                            "{at}: label-{label} disagrees with line {line}\n  expected:\n{}\n  actual:\n{}",
-                            indent(first),
-                            indent(&actual)
-                        )),
+                        Some((line, first)) if *first != actual => {
+                            out.failures.push(format!(
+                                "{at}: label-{label} disagrees with line {line}\n  expected:\n{}\n  actual:\n{}",
+                                indent(first),
+                                indent(&actual)
+                            ));
+                            continue;
+                        }
                         Some(_) => {}
                         None => {
                             labels.insert(label, (record.line, actual.clone()));
@@ -645,7 +651,7 @@ async fn run_file(path: &str, file: &File, exec: &mut impl Exec, prefix: &str) -
                         expected.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
                     }
                     if expected != actual {
-                        out.failures.push(format!(
+                        out.mismatches.push(format!(
                             "{at}: wrong result\n  expected:\n{}\n  actual:\n{}",
                             indent(&expected),
                             indent(&actual)
@@ -720,6 +726,9 @@ async fn run_recorded(
     record: Option<&Path>,
 ) -> Result<(File, Outcome), String> {
     let file = parse(text).map_err(|e| format!("{path}: {e}"))?;
+    if !file.engines.iter().any(|e| e == "olap") {
+        return Ok((file, Outcome::default()));
+    }
     let mut engine = Recording {
         inner: OlapEngine::start().await,
         log: Vec::new(),
@@ -792,36 +801,37 @@ async fn logic_corpus() {
             println!("skipped: {skip}");
         }
         ignored += outcome.skipped.len();
-        failed += outcome.failures.len();
-        passed += outcome.assertions - outcome.failures.len().min(outcome.assertions);
-        failures.extend(outcome.failures.iter().cloned());
-        if bless {
+        let file_failures = outcome.failures.len() + outcome.mismatches.len();
+        failed += file_failures;
+        passed += outcome.assertions - file_failures;
+        if bless && outcome.failures.is_empty() {
             let new = blessed(&file, &outcome.actual);
             if new != text {
                 std::fs::write(path, new).unwrap();
                 println!("blessed: tests/logic/{rel}");
             }
+        } else {
+            failures.extend(outcome.mismatches);
         }
+        failures.extend(outcome.failures);
     }
     for failure in &failures {
         println!("FAILED {failure}");
     }
-    let status = if failures.is_empty() { "ok" } else { "FAILED" };
     println!(
         "olap-logic: {files} files; oltp: not-run: oltp-runner-deferred (the oltp feature is not in the default build)"
     );
     println!(
-        "test result: {status}. {passed} passed; {failed} failed; {ignored} ignored; 0 measured; 0 filtered out; finished in {:.2}s",
+        "logic result: {passed} passed; {failed} mismatched or failed; {ignored} skipped; finished in {:.2}s",
         started.elapsed().as_secs_f64()
     );
-    assert!(files > 0 || !filter.is_empty(), "no .nlt files found");
-    if !bless {
-        assert!(
-            failures.is_empty(),
-            "{} logic assertion(s) failed",
-            failures.len()
-        );
-    }
+    assert!(files > 0, "no .nlt files matched {filter:?}");
+    assert!(
+        failures.is_empty(),
+        "{} logic assertion(s) failed",
+        failures.len()
+    );
+    assert!(passed + failed > 0, "no logic records ran");
 }
 
 // ---------------------------------------------------------------------------
@@ -840,7 +850,11 @@ statement ok
 async fn failures_of(extra: &str) -> Vec<String> {
     let text = format!("{BASE}\n{extra}");
     let (_, outcome) = run_text("planted.nlt", &text).await.unwrap();
-    outcome.failures
+    outcome
+        .failures
+        .into_iter()
+        .chain(outcome.mismatches)
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -958,6 +972,12 @@ fn rendering_and_translation() {
         .translate(r#"{"op":"table.describe","name":"t"}"#)
         .unwrap();
     assert_eq!(payload["name"], "p_t");
+    let projection = json!({"query":{"select":["id"]}});
+    assert!(
+        tr.render("query.collect", &projection, &json!([{"id":1,"extra":2}]))
+            .unwrap_err()
+            .starts_with("wrong result columns")
+    );
 }
 
 #[test]

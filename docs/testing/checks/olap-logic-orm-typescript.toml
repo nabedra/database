@@ -9,7 +9,7 @@ if [ ! -f node_modules/typescript/bin/tsc ]; then
   npm ci --no-audit --no-fund
 fi
 npm run build
-node --test tests/logic-replay.test.mjs
+node --test --test-reporter=tap --test-name-pattern='^replay corpus over HTTP$' tests/logic-replay.test.mjs
 ''']
 cwd = "orm/typescript"
 timeout_s = 300

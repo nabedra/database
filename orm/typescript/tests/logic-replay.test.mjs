@@ -17,6 +17,7 @@ import { Transport, parseJson } from "../dist/transport.js"
 const corpus = fileURLToPath(new URL("../../../server/tests/logic/", import.meta.url))
 const missingTableId = "ffffffff-ffff-4fff-bfff-ffffffffffff"
 const uuidPattern = /[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/g
+const tableNamePattern = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/
 // Operations whose integer results the transport decodes as bigint, so a JS number is a float.
 const strictIntegers = new Set(["table.get", "query.collect", "query.count", "table.insert_many"])
 
@@ -163,6 +164,7 @@ export class Translator {
   constructor(prefix) {
     this.prefix = prefix
     this.tables = new Map()
+    this.longNames = new Map()
   }
 
   translate(command) {
@@ -187,7 +189,7 @@ export class Translator {
       delete payload.table
     }
     if ((op === "table.create" || op === "table.describe") && typeof payload.name === "string") {
-      payload.name = this.prefix + payload.name
+      payload.name = this.physical(payload.name)
     }
     if (op.startsWith("query.") && !Object.hasOwn(payload, "query")) {
       const query = {}
@@ -206,8 +208,18 @@ export class Translator {
     }
   }
 
+  physical(name) {
+    // Preserve invalid identifiers so the request tests server validation.
+    if (!this.prefix || tableNamePattern.exec(name)?.[0] !== name) return name
+    if (this.prefix.length + name.length <= 64) return this.prefix + name
+    const digest = createHash("sha256").update(name, "ascii").digest("hex").slice(0, 16)
+    const physical = this.prefix + name.slice(0, 64 - this.prefix.length - digest.length) + digest
+    this.longNames.set(physical, name)
+    return physical
+  }
+
   logical(name) {
-    return name.startsWith(this.prefix) ? name.slice(this.prefix.length) : name
+    return this.longNames.get(name) ?? (name.startsWith(this.prefix) ? name.slice(this.prefix.length) : name)
   }
 
   descriptorRow(d) {
@@ -223,7 +235,10 @@ export class Translator {
       }
       const select = op === "query.collect" ? payload.query?.select : null
       const columns = Array.isArray(select) ? select : Object.keys(object).sort(utf8Compare)
-      return columns.map(c => renderValue(Object.hasOwn(object, c) ? object[c] : null, strict))
+      if (columns.length !== Object.keys(object).length || columns.some(c => !Object.hasOwn(object, c))) {
+        throw new FormatError(`wrong result columns: expected ${columns.join(", ")}, got ${Object.keys(object).join(", ")}`)
+      }
+      return columns.map(c => renderValue(object[c], strict))
     }
     if (op === "table.create" || op === "table.describe") return [this.descriptorRow(data)]
     if (op === "table.list") {
@@ -233,7 +248,8 @@ export class Translator {
     if (op === "query.collect") return data.map(row)
     if (op === "table.get") return data === null ? [] : [row(data)]
     if (op === "query.explain") {
-      const text = (this.prefix ? data.replaceAll(this.prefix, "") : data).replace(uuidPattern, "<uuid>")
+      const text = data.replace(/^scan (\S+) (?=\()/, (_, name) => `scan ${this.logical(name)} `)
+        .replace(uuidPattern, "<uuid>")
       return text.split("\n").map(line => [renderString(line)])
     }
     if (data === null) return []
@@ -282,7 +298,14 @@ export async function runFile(path, parsed, execute, prefix) {
       failures.push(`${at}: expected success\n  actual error: ${error.code}: ${error.message}`)
       continue
     }
-    const rows = tr.render(op, payload, data)
+    let rows
+    try {
+      rows = tr.render(op, payload, data)
+    } catch (error) {
+      if (!(error instanceof FormatError)) throw error
+      failures.push(`${at}: ${error.message}`)
+      continue
+    }
     const sort = kind.sort ?? "nosort"
     const actual = kind.hash ? [hashLine(rows, sort)] : ordered(rows, sort).map(r => r.join("\t"))
     if (kind.label) {
@@ -291,6 +314,7 @@ export async function runFile(path, parsed, execute, prefix) {
       else if (JSON.stringify(first.actual) !== JSON.stringify(actual)) {
         failures.push(`${at}: label-${kind.label} disagrees with line ${first.line}\n`
           + `  expected: ${JSON.stringify(first.actual)}\n  actual: ${JSON.stringify(actual)}`)
+        continue
       }
     }
     let expected = record.expected
@@ -371,6 +395,17 @@ test("rendering and translation", () => {
   assert.equal(tr.translate('{"op":"table.describe","name":"t"}')[1].name, "p_t")
   assert.deepEqual(tr.render("query.explain", {}, "scan p_t (11111111-1111-4111-8111-111111111111)"),
     [["scan t (<uuid>)"]])
+  for (const name of ["", "9bad", "x".repeat(65)]) {
+    assert.equal(tr.translate(JSON.stringify({ op: "table.create", name }))[1].name, name)
+  }
+  const longName = "x".repeat(64)
+  const physical = tr.translate(JSON.stringify({ op: "table.create", name: longName }))[1].name
+  assert.equal(physical.length, 64)
+  assert.ok(physical.startsWith("p_"))
+  assert.equal(tr.logical(physical), longName)
+  assert.deepEqual(parse("# name: x\nquery nosort\n{}\n----\na\u2028b\n").records[0].expected, ["a\u2028b"])
+  assert.throws(() => tr.render("query.collect", { query: { select: ["id"] } }, [{ id: 1n, extra: 2n }]),
+    /wrong result columns/)
 })
 
 test("canned correct order passes", async () => {
@@ -470,5 +505,6 @@ test("replay corpus over HTTP", async (t) => {
   }
   for (const line of skipped) t.diagnostic(`skipped: ${line}`)
   t.diagnostic(`logic replay (typescript): ${total - failures.length} passed; ${failures.length} failed; ${skipped.length} skipped`)
+  assert.ok(total > 0, `no logic records ran for engine ${JSON.stringify(engine)}`)
   assert.deepEqual(failures, [], failures.join("\n"))
 })

@@ -15,12 +15,15 @@ Three runners read the same `.nlt` files and must render results identically:
 Run the Rust runner with `cargo test --test olap_logic -- --nocapture` from
 `server/`. Set `NABEDRA_LOGIC_FILTER=<substring>` to run only matching files.
 Set `NABEDRA_BLESS=1` to rewrite every expected block in place with the actual
-output. Review a blessed diff by hand before committing it: blessing a wrong
-answer turns a bug into a golden.
+output for each file whose statements and labels pass. Review blessed diffs by
+hand before committing. The runner prints the corpus assertion count as
+`logic result:`. Cargo reports the Rust test count separately.
 
 The ORM replays skip with `not-run: NABEDRA_LOGIC_URL unset` when no server is
 given. `NABEDRA_LOGIC_TOKEN` (default `NABEDRA_TOKEN`) is the bearer token.
 `NABEDRA_LOGIC_ENGINE` (`olap` by default) selects which `require` sets run.
+Use a disposable database. The tests create tables and exercise mutations and
+deletes. The registered ORM checks run the HTTP replay only.
 
 Without a server, the renderers can still be compared on real engine output.
 `NABEDRA_LOGIC_RECORD=<dir>` makes the Rust runner write every exchange of each
@@ -74,10 +77,11 @@ request the same way:
    recorded when that table was created in this file. An unknown name becomes
    `ffffffff-ffff-4fff-bfff-ffffffffffff`, which never exists, so a bad table
    gives `not_found`. A dropped table keeps its old ID.
-3. For `table.create` and `table.describe`, `name` is prefixed with the
-   runner's table prefix. The Rust runner uses an empty prefix. The ORM runners
-   use a random prefix per file, so files can share one server. Keep logical
-   names short, so prefixed names stay within 64 characters.
+3. For `table.create` and `table.describe`, the ORM runners prefix valid table
+   names with a random prefix per file. If the result would exceed 64 characters,
+   they shorten the name and include a hash within the 64-character limit.
+   Invalid names go to the server unchanged so the server validates them.
+   The Rust runner uses one fresh engine per file and sends every name as written.
 4. For `query.collect`, `query.count` and `query.explain` without a `query`
    key, the runner moves `select`, `filter`, `order_by` and `limit` into
    `query`, and sets each missing one to `null`. With a `query` key, the payload
@@ -94,7 +98,7 @@ Each operation result becomes a list of rows of strings:
 | `table.create`, `table.describe` | One row: logical name, key, schema. |
 | `table.list` | One row per table whose name has the runner's prefix, sorted by name. |
 | `table.get` | No rows for `null`, otherwise one row like `query.collect`. |
-| `query.collect` | One row per result row. Columns follow `select` when it is a list, otherwise column names in ascending order. |
+| `query.collect` | One row per result row. The runners check that each row has exactly the selected columns and render them in the order of `select`. Without a selection, they render columns in ascending name order. |
 | `query.count` | One row with the count. |
 | `query.explain` | One row per plan line. |
 | Mutations and `table.drop` | No rows for `null`, otherwise one row with the value (a count or a found flag). |
@@ -120,8 +124,8 @@ least one fractional digit (`2.0`, `0.001`, `1.5`). Otherwise it is
 
 `rowsort` orders rows by their tab-joined text in UTF-8 byte order.
 
-Explain normalization replaces every UUID with `<uuid>` and removes the table
-prefix from the plan text.
+Explain normalization replaces every UUID with `<uuid>` and restores the
+logical table name on the scan line.
 
 ## Notes on the data model
 

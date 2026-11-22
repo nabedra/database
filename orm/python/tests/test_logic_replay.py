@@ -22,6 +22,7 @@ CORPUS = pathlib.Path(__file__).resolve().parents[3] / 'server' / 'tests' / 'log
 MISSING_TABLE_ID = 'ffffffff-ffff-4fff-bfff-ffffffffffff'
 CONTROL_RE = re.compile(r'[\\\x00-\x1f\x7f]')
 UUID_RE = re.compile(r'[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}')
+TABLE_NAME_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,63}')
 
 
 class FormatError(ValueError):
@@ -30,7 +31,7 @@ class FormatError(ValueError):
 
 def parse(text):
     """Return {'name', 'engines', 'records'}; each record has kind, line, skip, command, expected."""
-    lines = text.splitlines()
+    lines = text.replace('\r\n', '\n').removesuffix('\n').split('\n')
     if not lines or not lines[0].startswith('# name:'):
         raise FormatError('line 1: the file must start with `# name: <name>`')
     name = lines[0][len('# name:'):].strip()
@@ -184,6 +185,7 @@ class Translator:
     def __init__(self, prefix):
         self.prefix = prefix
         self.tables = {}
+        self.long_names = {}
 
     def translate(self, command):
         try:
@@ -199,7 +201,7 @@ class Translator:
         if isinstance(table, str):
             payload['table_id'] = self.tables.get(table, MISSING_TABLE_ID)
         if op in ('table.create', 'table.describe') and isinstance(payload.get('name'), str):
-            payload['name'] = self.prefix + payload['name']
+            payload['name'] = self.physical(payload['name'])
         if op.startswith('query.') and 'query' not in payload:
             payload['query'] = {k: payload.pop(k, None) for k in ('select', 'filter', 'order_by', 'limit')}
         return op, payload
@@ -210,8 +212,19 @@ class Translator:
             if isinstance(name, str) and isinstance(table_id, str):
                 self.tables[self.logical(name)] = table_id
 
+    def physical(self, name):
+        # Preserve invalid identifiers so the request tests server validation.
+        if not self.prefix or not TABLE_NAME_RE.fullmatch(name):
+            return name
+        if len(self.prefix) + len(name) <= 64:
+            return self.prefix + name
+        digest = hashlib.sha256(name.encode('ascii')).hexdigest()[:16]
+        physical = self.prefix + name[:64 - len(self.prefix) - len(digest)] + digest
+        self.long_names[physical] = name
+        return physical
+
     def logical(self, name):
-        return name[len(self.prefix):] if name.startswith(self.prefix) else name
+        return self.long_names.get(name, name.removeprefix(self.prefix))
 
     def descriptor_row(self, d):
         schema = ','.join(f'{c}:{t}' for c, t in sorted(d['schema'].items(), key=lambda kv: utf8_key(kv[0])))
@@ -223,7 +236,9 @@ class Translator:
                 raise FormatError('result row is not an object')
             select = payload.get('query', {}).get('select') if op == 'query.collect' else None
             columns = select if isinstance(select, list) else sorted(obj, key=utf8_key)
-            return [render_value(obj.get(c)) for c in columns]
+            if len(columns) != len(obj) or any(c not in obj for c in columns):
+                raise FormatError(f'wrong result columns: expected {columns!r}, got {obj!r}')
+            return [render_value(obj[c]) for c in columns]
 
         if op in ('table.create', 'table.describe'):
             return [self.descriptor_row(data)]
@@ -235,7 +250,8 @@ class Translator:
         if op == 'table.get':
             return [] if data is None else [row(data)]
         if op == 'query.explain':
-            text = UUID_RE.sub('<uuid>', data.replace(self.prefix, '') if self.prefix else data)
+            text = re.sub(r'^scan (\S+) (?=\()', lambda m: f'scan {self.logical(m[1])} ', data)
+            text = UUID_RE.sub('<uuid>', text)
             return [[render_string(line)] for line in text.split('\n')]
         if data is None:
             return []
@@ -279,7 +295,11 @@ def run_file(path, parsed, execute, prefix):
         if error is not None:
             failures.append(f'{at}: expected success\n  actual error: {error.code}: {error}')
             continue
-        rows = tr.render(op, payload, data)
+        try:
+            rows = tr.render(op, payload, data)
+        except FormatError as error:
+            failures.append(f'{at}: {error}')
+            continue
         sort = kind.get('sort', 'nosort')
         actual = [hash_line(rows, sort)] if kind.get('hash') else ['\t'.join(r) for r in ordered(rows, sort)]
         label = kind.get('label')
@@ -289,6 +309,7 @@ def run_file(path, parsed, execute, prefix):
             elif labels[label][1] != actual:
                 failures.append(f'{at}: label-{label} disagrees with line {labels[label][0]}\n'
                                 f'  expected: {labels[label][1]!r}\n  actual: {actual!r}')
+                continue
         expected = record['expected']
         if expected is not None and sort == 'rowsort' and not kind.get('hash'):
             expected = sorted(expected, key=utf8_key)
@@ -363,6 +384,19 @@ class LogicFormatTests(unittest.TestCase):
         self.assertEqual(tr.translate('{"op":"table.describe","name":"t"}')[1]['name'], 'p_t')
         self.assertEqual(tr.render('query.explain', {}, 'scan p_t (11111111-1111-4111-8111-111111111111)'),
                          [['scan t (<uuid>)']])
+        for invalid in ('', '9bad', 'x' * 65):
+            command = json.dumps({'op': 'table.create', 'name': invalid})
+            self.assertEqual(tr.translate(command)[1]['name'], invalid)
+        long_name = 'x' * 64
+        command = json.dumps({'op': 'table.create', 'name': long_name})
+        physical = tr.translate(command)[1]['name']
+        self.assertEqual(len(physical), 64)
+        self.assertTrue(physical.startswith('p_'))
+        self.assertEqual(tr.logical(physical), long_name)
+        self.assertEqual(parse('# name: x\nquery nosort\n{}\n----\na\u2028b\n')['records'][0]['expected'],
+                         ['a\u2028b'])
+        with self.assertRaisesRegex(FormatError, 'wrong result columns'):
+            tr.render('query.collect', {'query': {'select': ['id']}}, [{'id': 1, 'extra': 2}])
 
     def test_canned_correct_order_passes(self):
         execute = FakeExecute([('table.create', DESCRIPTOR),
@@ -450,6 +484,7 @@ class LogicReplayTests(unittest.TestCase):
             print('skipped:', line)
         print(f'logic replay (python): {total - len(failures)} passed; {len(failures)} failed; '
               f'{len(skipped)} skipped')
+        self.assertGreater(total, 0, f'no logic records ran for engine {engine!r}')
         self.assertEqual(failures, [], '\n'.join(failures))
 
 
