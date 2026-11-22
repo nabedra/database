@@ -30,7 +30,11 @@ impl IndexBackend for Paused {
     ) -> ResolveFuture<'_, IndexAttempt> {
         self.inner.begin(job, digest, maintenance, fixed_identity)
     }
-    fn commit(&self, attempt: IndexAttempt, plan: MutationPlan) -> ResolveFuture<'_, ()> {
+    fn commit(
+        &self,
+        attempt: IndexAttempt,
+        plan: MutationPlan,
+    ) -> ResolveFuture<'_, IndexCommitOutcome> {
         self.inner.commit(attempt, plan)
     }
     fn source_pin(

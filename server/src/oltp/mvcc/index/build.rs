@@ -23,6 +23,7 @@ use crate::{
     protocol::Outcome,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 pub(crate) struct IndexAttempt {
     pub pin: PinnedCatalog,
@@ -31,6 +32,26 @@ pub(crate) struct IndexAttempt {
     pub owner: Arc<ScratchLease>,
     pub identity: crate::oltp_replication::types::PinIdentity,
     pub storage_pin: StoragePin,
+}
+
+pub(crate) enum IndexCommitOutcome {
+    Committed,
+    /// The durable ABORT and its cleanup have both settled.
+    Aborted(ProtocolError),
+}
+
+impl IndexCommitOutcome {
+    fn into_result(self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Committed => Ok(()),
+            Self::Aborted(error) => Err(error),
+        }
+    }
+}
+
+enum BackfillPublication {
+    Progress(IndexProgress),
+    Ready,
 }
 /// One physical worker's existing queue/Status coordinator implements this.
 /// Metadata jobs have distinct durable identities and exact snapshot bindings;
@@ -47,7 +68,11 @@ pub(crate) trait IndexBackend: Send + Sync {
     fn checkpoint(&self) -> ResolveFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
-    fn commit(&self, attempt: IndexAttempt, plan: MutationPlan) -> ResolveFuture<'_, ()>;
+    fn commit(
+        &self,
+        attempt: IndexAttempt,
+        plan: MutationPlan,
+    ) -> ResolveFuture<'_, IndexCommitOutcome>;
     fn source_pin(
         &self,
         authority: Authority,
@@ -200,7 +225,7 @@ impl IndexService {
             Ok(plan) => plan,
             Err(error) => return self.failed(metadata, error).await,
         };
-        self.backend.commit(metadata, plan).await?;
+        self.backend.commit(metadata, plan).await?.into_result()?;
         Ok((maintenance, source))
     }
     /// Resume an existing Building attempt under its original pinned source.
@@ -341,7 +366,7 @@ impl IndexService {
             Ok(plan) => plan,
             Err(error) => return self.failed(metadata, error).await,
         };
-        self.backend.commit(metadata, plan).await?;
+        self.backend.commit(metadata, plan).await?.into_result()?;
         self.backend
             .close_source(
                 authority,
@@ -395,7 +420,7 @@ impl IndexService {
             Ok(plan) => plan,
             Err(error) => return self.failed(metadata, error).await,
         };
-        self.backend.commit(metadata, plan).await?;
+        self.backend.commit(metadata, plan).await?.into_result()?;
         self.backend
             .close_source(
                 authority,
@@ -593,80 +618,23 @@ impl IndexService {
                         }
                     }
                 }
-                let job = job_id(
+                self.publish_backfill(
                     maintenance,
-                    b"progress",
-                    Some(serialized_digest(&route.group.group_id)?),
-                )?;
-                let metadata = self
-                    .backend
-                    .begin(
-                        job,
-                        serialized_digest(&(
-                            b"index-progress/v1",
-                            maintenance,
-                            route.group.group_id,
-                        ))?,
-                        maintenance,
-                        None,
-                    )
-                    .await?;
-                let plan = self
-                    .backend
-                    .planner()
-                    .plan_index_progress(
-                        &metadata.pin,
-                        metadata.txn,
-                        metadata.request,
-                        maintenance,
-                        IndexProgress {
-                            build_id: maintenance.build_id,
-                            attempt: maintenance.attempt,
-                            group_id: route.group.group_id,
-                            span: route.span.clone(),
-                            done: true,
-                        },
-                        metadata.owner.clone(),
-                    )
-                    .await;
-                let plan = match plan {
-                    Ok(plan) => plan,
-                    Err(error) => return self.failed(metadata, error).await,
-                };
-                self.backend.commit(metadata, plan).await?;
+                    BackfillPublication::Progress(IndexProgress {
+                        build_id: maintenance.build_id,
+                        attempt: maintenance.attempt,
+                        group_id: route.group.group_id,
+                        span: route.span.clone(),
+                        done: true,
+                    }),
+                )
+                .await?;
             }
             next = page.next_page;
         }
-        let (job, digest) = ready_job(maintenance)?;
-        let metadata = self
-            .backend
-            .begin(job, digest, maintenance, None)
+        let authority = self
+            .publish_backfill(maintenance, BackfillPublication::Ready)
             .await?;
-        let authority = metadata.pin.authority;
-        let plan = self
-            .backend
-            .planner()
-            .plan_finish_index(
-                &metadata.pin,
-                metadata.txn,
-                metadata.request,
-                maintenance,
-                IndexClosedKind::Ready,
-                metadata.owner.clone(),
-            )
-            .await;
-        let plan = match plan {
-            Ok(plan) => plan,
-            Err(error) => return self.failed(metadata, error).await,
-        };
-        #[cfg(test)]
-        crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
-            maintenance.index_id,
-            crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::ReadyCommit,
-            || None,
-        )
-        .await;
-        self.backend.commit(metadata, plan).await?;
         let proof = self
             .backend
             .planner()
@@ -675,6 +643,84 @@ impl IndexService {
             .strong_index_attempt_closed(maintenance)
             .await?;
         self.backend.close_source(authority, proof).await
+    }
+
+    async fn publish_backfill(
+        &self,
+        maintenance: MaintenanceOwnerRef,
+        publication: BackfillPublication,
+    ) -> Result<Authority, ProtocolError> {
+        let (job, digest) = match &publication {
+            BackfillPublication::Progress(progress) => (
+                job_id(
+                    maintenance,
+                    b"progress",
+                    Some(serialized_digest(&progress.group_id)?),
+                )?,
+                serialized_digest(&(b"index-progress/v1", maintenance, progress.group_id))?,
+            ),
+            BackfillPublication::Ready => ready_job(maintenance)?,
+        };
+        let mut retries = 0;
+        let mut backoff = Duration::from_millis(50);
+        loop {
+            let metadata = self.backend.begin(job, digest, maintenance, None).await?;
+            let authority = metadata.pin.authority;
+            let planner = self.backend.planner();
+            let plan = match &publication {
+                BackfillPublication::Progress(progress) => {
+                    planner
+                        .plan_index_progress(
+                            &metadata.pin,
+                            metadata.txn,
+                            metadata.request,
+                            maintenance,
+                            progress.clone(),
+                            metadata.owner.clone(),
+                        )
+                        .await
+                }
+                BackfillPublication::Ready => {
+                    planner
+                        .plan_finish_index(
+                            &metadata.pin,
+                            metadata.txn,
+                            metadata.request,
+                            maintenance,
+                            IndexClosedKind::Ready,
+                            metadata.owner.clone(),
+                        )
+                        .await
+                }
+            };
+            let plan = match plan {
+                Ok(plan) => plan,
+                Err(error) => return self.failed(metadata, error).await.map(|()| authority),
+            };
+            #[cfg(test)]
+            if matches!(publication, BackfillPublication::Ready) {
+                crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
+                    maintenance.index_id,
+                    crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::ReadyCommit,
+                    || None,
+                )
+                .await;
+            }
+            match self.backend.commit(metadata, plan).await? {
+                IndexCommitOutcome::Aborted(error)
+                    if retries < 7
+                        && error.code == ErrorCode::Overloaded
+                        && error.outcome == Outcome::NotApplied =>
+                {
+                    // The backend returns this outcome only after releasing
+                    // the aborted transaction's guards and metadata pin.
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_millis(250));
+                    retries += 1;
+                }
+                outcome => return outcome.into_result().map(|()| authority),
+            }
+        }
     }
     async fn routing_root(
         &self,

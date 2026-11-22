@@ -5,7 +5,10 @@ use crate::oltp::mvcc::{
     catalog::PinnedCatalog,
     index::{
         IndexClosedKind, IndexDefinition, IndexRecord,
-        build::{IndexAttempt, IndexBackend, IndexService, declaration_job, ready_job},
+        build::{
+            IndexAttempt, IndexBackend, IndexCommitOutcome, IndexService, declaration_job,
+            ready_job,
+        },
     },
     planner::{MutationPlan, ResolveFuture},
     store::{
@@ -431,7 +434,11 @@ impl IndexBackend for RuntimeIndexes {
             })
         })
     }
-    fn commit(&self, attempt: IndexAttempt, plan: MutationPlan) -> ResolveFuture<'_, ()> {
+    fn commit(
+        &self,
+        attempt: IndexAttempt,
+        plan: MutationPlan,
+    ) -> ResolveFuture<'_, IndexCommitOutcome> {
         Box::pin(async move {
             let current = self
                 .runtime
@@ -495,7 +502,12 @@ impl IndexBackend for RuntimeIndexes {
                 .release_index_metadata(authority, attempt.identity, attempt.storage_pin, settled)
                 .await?;
             match decision.outcome().ok_or_else(unknown)?.result() {
-                Ok(_) => Ok(()),
+                Ok(_) => Ok(IndexCommitOutcome::Committed),
+                Err(error)
+                    if matches!(decision.statement().decision, TxnDecision::Abort { .. }) =>
+                {
+                    Ok(IndexCommitOutcome::Aborted(error))
+                }
                 Err(error) => Err(error),
             }
         })
