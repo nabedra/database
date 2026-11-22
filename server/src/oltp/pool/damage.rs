@@ -137,11 +137,8 @@ impl DamageState {
         let Some(pool) = self.pool.get().cloned() else {
             return;
         };
-        #[allow(clippy::disallowed_methods)] // explicit kv stack size, which spawn_service cannot set
-        let spawned = std::thread::Builder::new()
-            .name("oltp-damage".into())
-            .stack_size(nabedra_kv::THREAD_STACK_BYTES)
-            .spawn(move || {
+        let spawned =
+            nabedra_rt::task::spawn_service_with_stack("oltp-damage", nabedra_kv::THREAD_STACK_BYTES, move || {
                 let Some(inner) = pool.upgrade() else {
                     return;
                 };

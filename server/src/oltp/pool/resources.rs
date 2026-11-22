@@ -1111,11 +1111,8 @@ impl NativeExecutor {
         };
         for index in 0..count {
             let receiver = receiver.clone();
-            #[allow(clippy::disallowed_methods)] // explicit stack size, which spawn_service cannot set; phase 9 moves this pool
-            let thread = thread::Builder::new()
-                .name(format!("{name}-{index}"))
-                .stack_size(2 << 20)
-                .spawn(move || {
+            let thread =
+                nabedra_rt::task::spawn_service_with_stack(format!("{name}-{index}"), 2 << 20, move || {
                     loop {
                         let job = receiver.lock().unwrap().recv();
                         match job {
