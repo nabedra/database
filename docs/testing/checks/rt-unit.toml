@@ -1,0 +1,16 @@
+id = "rt-unit"
+# The runtime seam (server/rt) maps to the `sim` module in modules.toml.
+module = "sim"
+kinds = ["U"]
+# OLTP-G02 and O09: per-node clock offset, drift and wall jumps that never move now().
+# Product mode runs first (the forwarding wrappers as shipped), then the simulation; the
+# product run includes tests/product_features.rs, which checks that no product build
+# graph enables the sim feature (O02, NS26).
+guarantees = ["OLTP-G02"]
+scenarios = ["O09"]
+tiers = ["T0", "T1"]
+command = ["sh", "-ec", "cargo test --locked -j 2 -p nabedra-rt && cargo test --locked -j 2 -p nabedra-rt --features sim"]
+cwd = "server"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"
