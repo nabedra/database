@@ -92,6 +92,12 @@ async fn o03_d01_d03_gc2_concurrent_commits_share_entries_and_retries_replay_per
         stats.batch_entries + (stats.entries_proposed - stats.batched_commits),
         "every entry is a batch or a lone commit"
     );
+    // RD3: the members histogram counts every batch entry once.
+    assert_eq!(
+        stats.batch_members.values().sum::<u64>(),
+        stats.batch_entries,
+        "{stats:?}"
+    );
     // Follower apply equals the leader's: every row and record.
     cluster.converge(leader).await;
     for voter in 0..3 {
