@@ -5,6 +5,7 @@
 //! | --- | --- | --- |
 //! | `write`, `set`, `put` | the unique value | optional `{"epoch": e}` |
 //! | `read`, `get` | ignored | the value (`null` when absent), or `{"value": v, "epoch": e}` |
+//! | `cas` | `[expected, new]`, a write of `new` when it succeeds | optional epoch |
 //! | `delete`, `del` | ignored | optional epoch |
 //! | `expire` | `{"at_ns": t}`, the absolute deadline in `time_ns` terms | ignored |
 //! | `incr`, `incrby` | the delta (default 1, must be positive) | the new value, optional epoch |
@@ -58,13 +59,22 @@ pub fn check(events: &[Event]) -> Verdict {
 
 fn kind(f: &str) -> Option<&'static str> {
     Some(match f {
-        "write" | "set" | "put" => "write",
+        "write" | "set" | "put" | "cas" => "write",
         "read" | "get" => "read",
         "delete" | "del" => "delete",
         "expire" => "expire",
         "incr" | "incrby" => "incr",
         _ => return None,
     })
+}
+
+/// The value a write op writes (the new value for `cas`).
+fn written(op: &Op) -> &Value {
+    let v = payload(&op.invoke_value);
+    match (op.f.as_str(), v.as_array()) {
+        ("cas", Some(a)) if a.len() == 2 => &a[1],
+        _ => v,
+    }
 }
 
 fn epoch(op: &Op) -> Option<u64> {
@@ -117,7 +127,7 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
         Err(e) => return Verdict::malformed(e),
     };
     let ctx = Ctx {
-        failovers: paired.markers.iter().filter(|m| opts.failover_markers.contains(&m.f)).collect(),
+        failovers: paired.markers.iter().filter(|m| m.applied() && opts.failover_markers.contains(&m.f)).collect(),
         opts,
     };
     let mut keys: BTreeMap<&str, Vec<&Op>> = BTreeMap::new();
@@ -142,7 +152,7 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
 fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly>) {
     let mut writer: HashMap<String, &Op> = HashMap::new();
     for op in ops.iter().copied().filter(|o| kind(&o.f) == Some("write")) {
-        writer.entry(canon(payload(&op.invoke_value))).or_insert(op);
+        writer.entry(canon(written(op))).or_insert(op);
     }
     let acked_writes: Vec<&Op> = ops
         .iter()
@@ -234,7 +244,7 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                 format!(
                     "key {key:?}: read {v} (event {}) after the write of {} was acknowledged (event {}){}",
                     at(r),
-                    payload(&w2.invoke_value),
+                    written(w2),
                     at(w2),
                     epochs(w2, r)
                 ),

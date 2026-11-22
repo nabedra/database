@@ -45,7 +45,8 @@ pub fn event(ev: &Event) -> String {
         EventType::Info => "info",
     };
     let process = if ev.is_nemesis() { ":nemesis".to_string() } else { ev.process.to_string() };
-    let _ = write!(s, ":index {}, :type :{ty}, :process {process}, :f {}", ev.index, keyword(&ev.f));
+    let f = if ev.is_nemesis() { ev.marker_name() } else { ev.f.clone() };
+    let _ = write!(s, ":index {}, :type :{ty}, :process {process}, :f {}", ev.index, keyword(&f));
     let value = if ev.f == "txn" {
         txn_value(&ev.value)
     } else if let Some(k) = &ev.key {

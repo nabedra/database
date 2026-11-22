@@ -3,7 +3,7 @@
 //! take effect) must pass. Files live in `tests/corpus/`.
 
 use nabedra_check::checker::{Verdict, edn, linearizable, outcome, queue, relaxed_kv, txn};
-use nabedra_check::history::{Event, read_jsonl, write_jsonl};
+use nabedra_check::history::{Event, Outcome, pair, read_jsonl, write_jsonl};
 use std::path::PathBuf;
 
 type Checker = fn(&[Event]) -> Verdict;
@@ -53,6 +53,11 @@ const CASES: &[(&str, &str, Checker, &[&str])] = &[
     ("kv_counter_invented", "relaxed_kv", relaxed_kv::check, &["invented-value"]),
     ("kv_counter_lost", "relaxed_kv", relaxed_kv::check, &["lost-write"]),
     ("kv_counter_valid", "relaxed_kv", relaxed_kv::check, &[]),
+    // Written by scripts/testing/realenv/history.py: null fields, f="nemesis" markers, a
+    // fresh process after an info op whose write took effect.
+    ("realenv_python_writer", "linearizable", linearizable::check_kv, &[]),
+    ("realenv_python_writer", "relaxed_kv", relaxed_kv::check, &[]),
+    ("realenv_python_writer", "outcome", outcome::check, &[]),
 ];
 
 fn corpus_dir() -> PathBuf {
@@ -69,6 +74,7 @@ fn load(name: &str) -> Vec<Event> {
 fn corpus_verdicts() {
     let mut failures = Vec::new();
     for (name, checker_name, checker, expected) in CASES {
+        let expected: &[&str] = expected;
         let events = load(name);
         let verdict = checker(&events);
         let kinds = verdict.kinds();
@@ -163,4 +169,29 @@ fn edn_export_is_jepsen_shaped() {
     assert!(edn.contains(":process :nemesis, :f :heal"));
     assert!(edn.contains(r#":f :publish, :value ["t/0" ["a" "b"]]"#), "{edn}");
     assert!(edn.contains(r#":value ["t/0" {:offsets [1 2]}]"#), "{edn}");
+}
+
+/// The real-environment Python writer's style: `null` for unknown fields, nemesis events as
+/// `f: "nemesis"` with `value.action`, on an integer process.
+#[test]
+fn reads_the_python_writer_format() {
+    let events = load("realenv_python_writer");
+    assert_eq!(events.len(), 14);
+    assert!(events.iter().all(|e| e.time_ns.is_some()));
+    assert_eq!(events[2].key, None);
+    assert_eq!(events[2].request_id, None);
+    let paired = pair(&events).unwrap();
+    assert_eq!(paired.ops.len(), 5);
+    let names: Vec<&str> = paired.markers.iter().map(|m| m.f.as_str()).collect();
+    assert_eq!(names, ["kill", "heal_all"]);
+    assert!(paired.markers.iter().all(|m| m.applied()));
+    assert_eq!(paired.ops.iter().filter(|o| o.outcome == Outcome::Info).count(), 1);
+
+    // A literal line in that style, with every optional field null.
+    let line = r#"{"index":null,"type":"info","process":0,"f":"nemesis","key":null,"value":{"action":"heal_all","failed":1},"request_id":null,"node":null,"time_ns":null}"#;
+    let parsed = read_jsonl(std::io::BufReader::new(line.as_bytes())).unwrap();
+    assert_eq!(parsed[0].index, 0);
+    assert!(parsed[0].is_nemesis());
+    assert_eq!(parsed[0].marker_name(), "heal_all");
+    assert_eq!(parsed[0].time_ns, None);
 }

@@ -10,7 +10,8 @@
 //! A delivery `d` is `[offset, payload]` or `{"offset": o, "value": payload, "redelivered":
 //! bool}`. A poll is a redelivery when the poll or any of its deliveries is marked so; the
 //! consumer marks it after a lease loss. Payloads are unique. `info` ops (timeouts, "not
-//! leader") are unknown outcomes. A `heal` nemesis marker starts the redelivery check.
+//! leader") are unknown outcomes. A `heal` (or `heal_all`) nemesis marker starts the
+//! redelivery check.
 //!
 //! Per partition the checker reports:
 //! - `duplicate-offset`: one offset seen with two payloads; `duplicate-event`: one payload at
@@ -32,12 +33,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub struct Options {
     pub start_offset: i64,
     pub redelivery_bound_ns: Option<u64>,
-    pub heal_marker: String,
+    /// Marker names that end a fault (`heal_all` is the real-environment nemesis's name).
+    pub heal_markers: Vec<String>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { start_offset: 1, redelivery_bound_ns: None, heal_marker: "heal".into() }
+        Options { start_offset: 1, redelivery_bound_ns: None, heal_markers: vec!["heal".into(), "heal_all".into()] }
     }
 }
 
@@ -146,7 +148,7 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
         }
         checked += 1;
     }
-    let heal = paired.markers.iter().filter(|m| m.f == opts.heal_marker).max_by_key(|m| m.pos);
+    let heal = paired.markers.iter().filter(|m| m.applied() && opts.heal_markers.contains(&m.f)).max_by_key(|m| m.pos);
     let mut anomalies = Vec::new();
     for (name, p) in &parts {
         check_partition(name, p, opts, heal, &mut anomalies);

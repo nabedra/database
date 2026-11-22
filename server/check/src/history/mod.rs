@@ -8,6 +8,10 @@
 //! `type` is `invoke`, `ok`, `fail` or `info`. `info` is an unknown outcome, as in Jepsen; the
 //! spelling `unknown` is accepted on input and written back as `info`. Nemesis events use the
 //! process `"nemesis"` (stored as [`NEMESIS`]) and serve as markers such as `heal` or `failover`.
+//! The real-environment Python writer (`scripts/testing/realenv/history.py`) instead records
+//! nemesis events with `"f": "nemesis"`, an integer process and the fault in `value.action`;
+//! both forms become [`Marker`]s named by the fault. Fields it does not know are written as
+//! `null`, and every field except `type`, `process` and `f` may be `null` or absent.
 //!
 //! A completion whose value is an object with `"outcome": "not_applied"` counts as a definite
 //! failure, and one with `"outcome": "outcome_unknown"` counts as unknown, whatever its `type`.
@@ -35,7 +39,7 @@ pub enum EventType {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     /// Position in the history. `read_jsonl` fills it with the line position when it is absent.
-    #[serde(default = "missing_index")]
+    #[serde(default = "missing_index", deserialize_with = "de_index")]
     pub index: usize,
     #[serde(rename = "type")]
     pub kind: EventType,
@@ -60,6 +64,13 @@ pub struct Event {
 
 fn missing_index() -> usize {
     usize::MAX
+}
+
+fn de_index<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    match Option::<usize>::deserialize(d)? {
+        Some(i) => Ok(i),
+        None => Ok(missing_index()),
+    }
 }
 
 fn ser_process<S: Serializer>(p: &u64, s: S) -> Result<S::Ok, S::Error> {
@@ -117,8 +128,19 @@ impl Event {
         self
     }
 
+    /// A nemesis event in either form: process `"nemesis"`, or `f == "nemesis"`.
     pub fn is_nemesis(&self) -> bool {
-        self.process == NEMESIS
+        self.process == NEMESIS || self.f == "nemesis"
+    }
+
+    /// The fault a nemesis event names: `value.action` for `f == "nemesis"`, otherwise `f`.
+    pub fn marker_name(&self) -> String {
+        if self.f == "nemesis"
+            && let Some(a) = str_field(&self.value, "action")
+        {
+            return a.to_string();
+        }
+        self.f.clone()
     }
 }
 
@@ -193,6 +215,13 @@ pub struct Op {
     pub ret_time: Option<u64>,
 }
 
+impl Marker {
+    /// False for a fault that definitely did not happen.
+    pub fn applied(&self) -> bool {
+        self.kind != EventType::Fail
+    }
+}
+
 impl Op {
     /// The value that carries the operation's result: the completion value for an `ok` op,
     /// otherwise the invoke value.
@@ -225,7 +254,10 @@ impl Op {
 /// A nemesis marker such as `heal` or `failover`, at the position of its last event.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Marker {
+    /// The fault name, such as `heal`, `heal_all`, `failover` or `kill`.
     pub f: String,
+    /// The type of the marker's last event. A `Fail` fault was definitely not applied.
+    pub kind: EventType,
     pub pos: usize,
     pub index: usize,
     pub time_ns: Option<u64>,
@@ -259,14 +291,15 @@ pub fn pair(events: &[Event]) -> Result<Paired, String> {
     use std::collections::HashMap;
     let mut out = Paired::default();
     let mut open: HashMap<u64, usize> = HashMap::new(); // process -> op slot
-    let mut nemesis_open: HashMap<String, usize> = HashMap::new(); // f -> marker slot
+    let mut nemesis_open: HashMap<(u64, String), usize> = HashMap::new(); // (process, fault) -> slot
     for (pos, ev) in events.iter().enumerate() {
         if ev.is_nemesis() {
             // A nemesis invoke and its completion collapse into one marker at the later event.
+            let slot_key = (ev.process, ev.marker_name());
             if ev.kind == EventType::Invoke {
-                nemesis_open.insert(ev.f.clone(), out.markers.len());
+                nemesis_open.insert(slot_key, out.markers.len());
                 out.markers.push(marker(ev, pos));
-            } else if let Some(slot) = nemesis_open.remove(&ev.f) {
+            } else if let Some(slot) = nemesis_open.remove(&slot_key) {
                 out.markers[slot] = marker(ev, pos);
             } else {
                 out.markers.push(marker(ev, pos));
@@ -336,7 +369,8 @@ pub fn pair(events: &[Event]) -> Result<Paired, String> {
 
 fn marker(ev: &Event, pos: usize) -> Marker {
     Marker {
-        f: ev.f.clone(),
+        f: ev.marker_name(),
+        kind: ev.kind,
         pos,
         index: ev.index,
         time_ns: ev.time_ns,

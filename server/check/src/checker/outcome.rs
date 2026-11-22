@@ -7,6 +7,9 @@
 //! `append` micro-ops) and `publish` (each event). Observations, from `ok` completions: `read`
 //! and `get` (the value, or each element of a list), `txn` reads, and `poll` deliveries.
 //!
+//! A value that an op which did not fail also writes (for example a retry with the same
+//! request ID after `not_applied`) is ambiguous, so observing it is not reported.
+//!
 //! A dedup hit is an `ok` completion whose value has `"dedup": true`, for an op whose
 //! `request_id` equals the failed op's.
 
@@ -103,13 +106,19 @@ pub fn check(events: &[Event]) -> Verdict {
             dedup_hits.entry(rid).or_default().push(i);
         }
     }
+    let mut live_writes: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for op in ops.iter().filter(|o| o.outcome != Outcome::Fail) {
+        for (k, v) in written(op) {
+            live_writes.insert((k, canon(&v)));
+        }
+    }
     let mut anomalies = Vec::new();
     let mut checked = 0;
     for op in ops.iter().filter(|o| o.outcome == Outcome::Fail) {
         checked += 1;
         let mut reported = false;
         for (k, v) in written(op) {
-            if v.is_null() || reported {
+            if v.is_null() || reported || live_writes.contains(&(k.clone(), canon(&v))) {
                 continue;
             }
             let hit = seen
