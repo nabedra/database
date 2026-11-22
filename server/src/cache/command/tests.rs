@@ -63,7 +63,7 @@ fn k01_validates_set_forms_and_integer_boundaries() {
     }
     assert!(matches!(
         operation(&[b"EXPIRE", b"k", b"-1"]),
-        Operation::Expire { ttl_ms: -1, .. }
+        Operation::Expire { ttl_ms: -1_000, .. }
     ));
     assert!(matches!(
         operation(&[b"PEXPIRE", b"k", b"0"]),

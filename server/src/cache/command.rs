@@ -115,6 +115,8 @@ pub enum CommandError {
     Empty,
     /// `COMMAND GETKEYS` embedding a command with the wrong argument count.
     GetKeysArity,
+    /// An expiry that overflows, for the command with this Valkey name.
+    InvalidExpireTime(&'static str),
     Syntax,
     Unsupported,
     InvalidInteger,
@@ -133,6 +135,11 @@ impl CommandError {
             Self::Arity(name) => {
                 return Response::Error(Bytes::from(format!(
                     "ERR wrong number of arguments for '{name}' command"
+                )));
+            }
+            Self::InvalidExpireTime(name) => {
+                return Response::Error(Bytes::from(format!(
+                    "ERR invalid expire time in '{name}' command"
                 )));
             }
             Self::Empty => b"ERR wrong number of arguments",
@@ -252,13 +259,17 @@ fn parse_data(
         (Expire | Pexpire, 2) => {
             let key = positional.next().unwrap();
             let ttl_ms = parse_integer(&positional.next().unwrap())?;
-            let ttl_ms = if ttl_ms > 0 && kind == Expire {
+            // Valkey rejects seconds whose milliseconds overflow, either sign.
+            let ttl_ms = if kind == Expire {
                 ttl_ms
                     .checked_mul(1000)
-                    .ok_or(CommandError::InvalidInteger)?
+                    .ok_or(CommandError::InvalidExpireTime("expire"))?
             } else {
                 ttl_ms
             };
+            if ttl_ms > max_relative_ttl_ms() {
+                return Err(CommandError::InvalidExpireTime(kind.name()));
+            }
             Operation::Expire { key, ttl_ms }
         }
         (Persist, 1) => Operation::Persist(positional.next().unwrap()),
@@ -296,7 +307,7 @@ fn parse_set(mut args: std::vec::IntoIter<Bytes>) -> Result<Operation, CommandEr
             } else {
                 value
             };
-            if ttl <= 0 {
+            if ttl <= 0 || ttl > max_relative_ttl_ms() {
                 return Err(CommandError::InvalidExpiry);
             }
             ttl_ms = Some(ttl as u64);
@@ -310,6 +321,15 @@ fn parse_set(mut args: std::vec::IntoIter<Bytes>) -> Result<Operation, CommandEr
         ttl_ms,
         when,
     })
+}
+
+/// Valkey stores absolute Unix milliseconds and rejects a relative TTL that
+/// would overflow `i64` when added to the current wall-clock time.
+fn max_relative_ttl_ms() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    i64::MAX - i64::try_from(now).unwrap_or(i64::MAX)
 }
 
 fn parse_integer(input: &[u8]) -> Result<i64, CommandError> {
