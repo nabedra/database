@@ -76,6 +76,11 @@ server or a client wheel, builds or installs it in its own command, for example 
 `scripts/testing/` that runs `cargo build` and then the suite. The job's time limit is the check's
 `timeout_s` plus 30 minutes for setup and that build, capped at six hours.
 
+The job runs `run_check.py --strict`, so a check that reports `not-run`, for a missing need or zero
+executed assertions, fails its job, and the job summary prints the record's result and reasons. A
+green `Check <id>` job therefore means an executed pass. While the S3 repository variables are unset,
+the nightly leaves out checks that need `s3` instead of dispatching them to fail.
+
 Each registered check uploads its `evidence/` directory and command logs as `evidence-<id>`. GitHub
 attests the JSON records on deliberate and nightly dispatches. The `checks` matrix takes up to
 eight runners, or six with two reserved for the `fuzz` matrix.

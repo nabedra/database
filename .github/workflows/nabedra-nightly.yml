@@ -29,11 +29,16 @@ jobs:
       - name: Select T2 checks and dispatch the build workflow
         env:
           GH_TOKEN: ${{ github.token }}
+          S3_CONFIGURED: ${{ vars.NABEDRA_TEST_S3_ROLE_ARN != '' && vars.NABEDRA_TEST_S3_BUCKET != '' }}
         shell: bash
         run: |
           sha=$(git rev-parse HEAD)
           include_s3=true
-          if ! python3 scripts/testing/s3/budget.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"; then
+          # A dispatched check fails on not-run, so S3 checks wait until the test bucket exists.
+          if [ "$S3_CONFIGURED" != true ]; then
+            include_s3=false
+            echo "S3 checks omitted: not-run: s3-unconfigured (repository variables unset)." >> "$GITHUB_STEP_SUMMARY"
+          elif ! python3 scripts/testing/s3/budget.py 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"; then
             include_s3=false
             echo "S3 checks omitted because the budget check failed." >> "$GITHUB_STEP_SUMMARY"
           fi
