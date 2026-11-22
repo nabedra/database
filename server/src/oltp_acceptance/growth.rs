@@ -90,7 +90,7 @@ fn o21_capacity_deficit() {
     let binary = std::env::var_os("NABEDRA_BIN").expect("OLTP server executable");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/oltp_growth_acceptance.py");
     let status = Command::new(
-        std::env::var_os("NABEDRA_ACCEPTANCE_PYTHON").unwrap_or_else(|| "python3.11".into()),
+        std::env::var_os("NABEDRA_ACCEPTANCE_PYTHON").unwrap_or_else(|| "python3".into()),
     )
     .arg(script)
     .args(["--scenario", "O21", "--capacity-only", "--binary"])
