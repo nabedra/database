@@ -85,6 +85,8 @@ pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<St
     let mut offset_of: BTreeMap<Uuid, u64> = BTreeMap::new();
     let mut event_at: BTreeMap<u64, Uuid> = BTreeMap::new();
     let mut invoked: BTreeSet<Uuid> = BTreeSet::new();
+    let mut batches = BTreeMap::new();
+    let retained: BTreeSet<_> = log.values().copied().collect();
     let mut delivered: BTreeSet<u64> = BTreeSet::new();
     let mut claim = |id: Uuid, offset: u64, source: &str, index: usize, out: &mut Vec<String>| {
         if let Some(previous) = offset_of
@@ -105,11 +107,24 @@ pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<St
     for event in &history.events {
         match (event.f, event.kind) {
             ("publish", "invoke") => {
-                for item in event.value.as_array().into_iter().flatten() {
-                    if let Some(id) = item.get(0).and_then(uuid_of) {
-                        invoked.insert(id);
-                    }
+                let ids: Vec<_> = event
+                    .value
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.get(0).and_then(uuid_of))
+                    .collect();
+                invoked.extend(ids.iter().copied());
+                // This workload retries whole batches, so even an unknown outcome can
+                // leave only the entire batch or none of it in the final log.
+                let present = ids.iter().filter(|id| retained.contains(id)).count();
+                if present != 0 && present != ids.len() {
+                    anomalies.push(format!(
+                        "EVT-G04 partial-batch: {present} of {} invoked events survived (history index {})",
+                        ids.len(), event.index,
+                    ));
                 }
+                batches.insert((event.process, event.request_id.as_str()), ids);
             }
             ("publish", "ok") => {
                 let pairs: Vec<(Uuid, u64)> = event
@@ -119,6 +134,16 @@ pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<St
                     .flatten()
                     .filter_map(|pair| Some((uuid_of(pair.get(0)?)?, pair.get(1)?.as_u64()?)))
                     .collect();
+                let request = (event.process, event.request_id.as_str());
+                if !batches
+                    .get(&request)
+                    .is_some_and(|ids| ids.iter().copied().eq(pairs.iter().map(|(id, _)| *id)))
+                {
+                    anomalies.push(format!(
+                        "EVT-G04 incomplete-receipt: the receipt does not match the invoked event IDs (history index {})",
+                        event.index,
+                    ));
+                }
                 for (id, offset) in &pairs {
                     claim(*id, *offset, "publish ok", event.index, &mut anomalies);
                     if log.get(offset) != Some(id) {

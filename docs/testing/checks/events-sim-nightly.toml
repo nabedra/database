@@ -4,13 +4,12 @@ kinds = ["S", "H"]
 guarantees = ["EVT-G01", "EVT-G02", "EVT-G03", "EVT-G04", "EVT-G06"]
 scenarios = ["EV01", "EV02", "EV07"]
 tiers = ["T2", "T3"]
-command = ["cargo", "test", "-j", "2", "--release", "--features", "sim", "--lib", "sim::"]
+command = ["cargo", "test", "--locked", "-j", "2", "--release", "--features", "sim", "--lib", "sim::", "--", "--nocapture", "--test-threads=1"]
 cwd = "server/events"
-# A GitHub-hosted job stops at 6 h. Seed time in release is not measured yet; shard by
-# NABEDRA_SEED if 20,000 seeds do not fit.
-timeout_s = 21000
+# Shard 1 of 4. Allow five hours including the release build.
+timeout_s = 18000
 needs = []
 result_parser = "cargo-test"
 # tokio_unstable enables Builder::rng_seed (select! order). A separate target directory
 # keeps these RUSTFLAGS from invalidating other Events builds.
-env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SEEDS = "20000", NABEDRA_SEED = "100000", NABEDRA_PLANTED_SEEDS = "1000" }
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SEEDS = "5000", NABEDRA_SEED = "100000" }

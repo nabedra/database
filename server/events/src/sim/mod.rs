@@ -203,9 +203,9 @@ pub(crate) struct World {
 }
 
 impl World {
-    pub fn new(seed: u64, knobs: Knobs, nodes: u64) -> Self {
+    pub fn new(seed: u64, knobs: Knobs, voters: u64) -> Self {
         let mut root = SplitMix64::new(seed);
-        let nodes = (1..=nodes)
+        let nodes = (1..=voters)
             .map(|id| {
                 (
                     id,
@@ -231,7 +231,7 @@ impl World {
                 trace: Fnv::default(),
                 trace_events: 0,
                 trace_tail: VecDeque::new(),
-                observer: cluster::Observer::default(),
+                observer: cluster::Observer::new(voters),
                 history: history::History::default(),
                 messages: 0,
             }),

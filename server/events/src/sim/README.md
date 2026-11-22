@@ -15,19 +15,23 @@ runs exactly the code it ran before; `src/main.rs` refuses to build with the fea
 ```sh
 cd server/events
 export CARGO_TARGET_DIR=<events target dir>/sim   # RUSTFLAGS differ from other builds
-RUSTFLAGS="--cfg tokio_unstable" cargo test -j 2 --features sim --lib sim::
+RUSTFLAGS="--cfg tokio_unstable" cargo test --locked -j 2 --features sim --lib sim:: -- --nocapture --test-threads=1
 ```
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `NABEDRA_SEED` | first seed of the sweep, and the seed of the determinism test | 1 (sweep), 7 (determinism) |
+| `NABEDRA_SEED` | first seed of the sweep | 1 |
 | `NABEDRA_SEEDS` | number of consecutive seeds in the sweep | 20 |
+| `NABEDRA_SIM_VERIFY_REPLAY` | run every sweep seed twice and compare its trace and history | enabled in the T1 check |
 | `NABEDRA_PLANTED_SEED`, `NABEDRA_PLANTED_SEEDS` | first seed and budget of each planted-bug search | 1000, 200 |
 | `NABEDRA_SIM_HISTORY_DIR` | write every run's history there, not only failing ones | unset |
 
 A failing seed prints its violations, the last trace lines, the path of its history file
 (under the system temp directory, `nabedra-sim/`) and a replay command such as
 `NABEDRA_SEED=42 NABEDRA_SEEDS=1 RUSTFLAGS="--cfg tokio_unstable" cargo test --features sim --lib sim::tests::seed_sweep -- --nocapture`.
+Single-seed sweeps print the trace hash and event count. T1 runs 500 seeds twice
+in debug. Nightly runs release seeds 100000 through 119999 in four jobs of 5,000
+seeds each, with each job capped at five hours including the build.
 
 `--cfg tokio_unstable` enables `Builder::rng_seed`, which makes `tokio::select!` branch
 order part of the seed. Without it a run still works, but two runs of a seed may
@@ -40,7 +44,7 @@ diverge, and the determinism test can fail.
 | Time (`rt::now`, `sleep_until`, `timeout_at`, `wall_now`) | tokio and `SystemTime` | tokio paused time plus a per-node monotonic and wall offset |
 | Ids (`rt::uuid_v4`) | `Uuid::new_v4` | the node's seeded SplitMix64 stream |
 | Tasks (`rt::spawn`) | `tokio::spawn` | registered with the node in the task-local context |
-| Blocking storage work (`rt::blocking`) | `spawn_blocking` | inline on the simulation thread |
+| Blocking storage work (`rt::blocking`) | `spawn_blocking` | a helper thread completes each job while virtual time stands still |
 | Raft runtime (`raft::Runtime`) | `openraft::TokioRuntime` | `sim::runtime::SimRuntime` |
 | Peer network (`RaftNetwork for Network`) | reqwest to the axum peer router | `sim::net::call`, an in-memory router |
 | Disk | the real filesystem | a `nabedra_kv::fs::FaultFs` volume per broker |
@@ -113,14 +117,14 @@ After every 10 ms step (and inside the apply hook), after Kafka's
 | `MonotonicCommit` | the apply hook never sees an index at or below the previous one |
 | `MonotonicEpoch` | a replica's term never decreases, across restarts too (the vote is durable) |
 | `SingleLeader` | each term has at most one leader |
-| `MajorityReachedHighWatermark` | the highest applied entry is in the durable log of a majority, by the append and truncate hooks, rebuilt from the volume at every start |
+| `MajorityReachedHighWatermark` | each entry is in the durable log of a majority at first apply and the highest applied entry is rechecked every step. The append and truncate hooks track the logs, which are rebuilt from the volume at every start. |
 | `AppliedPrefixesAgree` | every replica that applies index i applies the same term and payload |
 
 At the end:
 
 | Name | Check |
 | --- | --- |
-| `ConsistentCommittedData` | every replica holds the same partition (offset to event id) |
+| `ConsistentCommittedData` | every replica holds the same retained events, tail and subscription checkpoint |
 | `Liveness` | replicas converge, and the drain finishes, within 30 s of healing |
 | history checks | below |
 
@@ -139,7 +143,7 @@ The `nabedra-check` queue checker was not on `main` when this was written, so
 | `lost-write`: an acknowledged event is not in the final log at its offset | EVT-G01 |
 | `duplicate-offset`, `gap`, `poll-order`, `phantom-read`, `invented-event` | EVT-G02 |
 | `offset-reassigned`, `duplicate-event`: a retried publish got different offsets | EVT-G03 |
-| `split-batch`: a batch's offsets are not consecutive | EVT-G04 |
+| `split-batch`, `incomplete-receipt`, `partial-batch`: a batch returns consecutive offsets for all invoked IDs and leaves all or none of its events on disk | EVT-G04 |
 | `not-delivered`, `drain-incomplete`: at-least-once delivery up to the final checkpoint | EVT-G05 (partial) |
 | a poll answered by a node that could not reach a quorum for the whole call | EVT-G06 |
 
@@ -161,13 +165,13 @@ fixture per history anomaly, and synthetic observations for each Kafka invariant
 ## Determinism
 
 The trace is an FNV-1a hash over every message plan, reply, apply, nemesis action and
-history event, each prefixed with the virtual time. `same_seed_same_trace` runs a seed
+history event, each prefixed with the virtual time. `same_seed_same_trace` runs seed 7
 twice and compares the hashes, the event counts and the histories.
 
 Sources of nondeterminism that were removed or ruled out:
 
 - tokio's `select!` order: seeded by `rng_seed` (`tokio_unstable`).
-- `spawn_blocking`: storage work runs inline, so no OS thread decides an order.
+- `spawn_blocking`: the runtime waits for each storage job before polling another task.
 - `Uuid::new_v4` on the Raft path: seeded.
 - openraft's election timeout rng: seeded through `SimRuntime`.
 - nabedra-kv's background flush and compaction threads: the default memtable is large

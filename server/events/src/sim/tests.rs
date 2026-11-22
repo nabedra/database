@@ -51,11 +51,22 @@ fn describe(report: &Report, label: &str) -> String {
 fn seed_sweep() {
     let first = env_u64("NABEDRA_SEED", 1);
     let count = env_u64("NABEDRA_SEEDS", 20);
+    assert!(count > 0, "NABEDRA_SEEDS must be positive");
+    let last = first
+        .checked_add(count - 1)
+        .expect("seed range overflows u64");
+    let replay = std::env::var_os("NABEDRA_SIM_VERIFY_REPLAY").is_some();
     let keep = std::env::var_os("NABEDRA_SIM_HISTORY_DIR").map(PathBuf::from);
     let mut failures = Vec::new();
     let mut totals = (0usize, 0usize, 0u64);
-    for seed in first..first + count {
+    for seed in first..=last {
         let report = run(SimConfig::new(seed));
+        if count == 1 {
+            eprintln!(
+                "seed {seed} trace hash {:016x} ({} events)",
+                report.trace_hash, report.trace_events
+            );
+        }
         if let Some(dir) = &keep {
             write_history(&report, "sweep", dir.clone());
         }
@@ -65,6 +76,9 @@ fn seed_sweep() {
         if !report.passed() {
             eprintln!("{}", describe(&report, "sweep"));
             failures.push(seed);
+        } else if replay {
+            let repeated = run(SimConfig::new(seed));
+            assert_same_trace(&report, &repeated);
         }
     }
     eprintln!(
@@ -80,7 +94,7 @@ fn seed_sweep() {
 /// The same seed gives the same trace and history, run after run.
 #[test]
 fn same_seed_same_trace() {
-    let seed = env_u64("NABEDRA_SEED", 7);
+    let seed = 7;
     let a = run(SimConfig::new(seed));
     let b = run(SimConfig::new(seed));
     assert!(
@@ -93,6 +107,13 @@ fn same_seed_same_trace() {
         "the workload made no progress: {:?}",
         a.stats
     );
+    assert_same_trace(&a, &b);
+}
+
+fn assert_same_trace(a: &Report, b: &Report) {
+    let seed = a.seed;
+    assert!(a.passed(), "{}", describe(a, "determinism-first"));
+    assert!(b.passed(), "{}", describe(b, "determinism-replay"));
     assert_eq!(
         (a.trace_hash, a.trace_events),
         (b.trace_hash, b.trace_events),
@@ -295,6 +316,26 @@ mod checkers {
                 3,
             ),
             (
+                "incomplete-receipt",
+                history(&[
+                    ("invoke", "publish", publish(&[(1, 0), (2, 0)])),
+                    ("ok", "publish", publish(&[(1, 1)])),
+                    ("ok", "poll", poll(0, &[(1, 1), (2, 2)])),
+                ]),
+                log(&[(1, 1), (2, 2)]),
+                2,
+            ),
+            (
+                "partial-batch",
+                history(&[
+                    ("invoke", "publish", publish(&[(1, 0), (2, 0)])),
+                    ("info", "publish", serde_json::Value::Null),
+                    ("ok", "poll", poll(0, &[(1, 1)])),
+                ]),
+                log(&[(1, 1)]),
+                1,
+            ),
+            (
                 "drain-incomplete",
                 history(&[("invoke", "publish", publish(&[(1, 0)]))]),
                 log(&[(1, 1)]),
@@ -341,7 +382,9 @@ mod checkers {
             o.violations
         );
 
-        let mut o = Observer::default();
+        let mut o = Observer::new(3);
+        o.appended(1, 1, 1);
+        o.appended(2, 1, 1);
         o.applied(1, 1, 1, 0xaa, 0);
         o.applied(2, 1, 1, 0xbb, 0);
         assert!(
@@ -352,10 +395,13 @@ mod checkers {
             o.violations
         );
 
-        let mut o = Observer::default();
+        let mut o = Observer::new(3);
         o.appended(1, 1, 1);
         o.applied(1, 1, 1, 0xaa, 0);
-        o.check_majority_for_test(3);
+        // The next entry reaches a majority before the next metrics sample.
+        o.appended(1, 2, 1);
+        o.appended(2, 2, 1);
+        o.applied(1, 2, 1, 0xaa, 0);
         assert!(
             o.violations
                 .iter()
@@ -363,11 +409,10 @@ mod checkers {
             "{:?}",
             o.violations
         );
-        let mut o = Observer::default();
+        let mut o = Observer::new(3);
         o.appended(1, 1, 1);
         o.appended(2, 1, 1);
         o.applied(1, 1, 1, 0xaa, 0);
-        o.check_majority_for_test(3);
         assert_eq!(o.violations, Vec::<String>::new());
     }
 }

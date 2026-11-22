@@ -30,6 +30,7 @@ const TICK: Duration = Duration::from_millis(10);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 const PRODUCER: u64 = 0;
 const CONSUMER: u64 = 1;
+const DRAINER: u64 = 2;
 
 /// Test-only planted bugs. Each must make some seed fail.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -104,6 +105,7 @@ impl Report {
 /// `SingleLeader`, `MajorityReachedHighWatermark`, and agreeing applied prefixes.
 #[derive(Default)]
 pub(crate) struct Observer {
+    voters: u64,
     /// index -> (term, payload hash) of every entry any replica applied.
     committed: BTreeMap<u64, (u64, u64)>,
     /// Each replica's durable log, from the append and truncate hooks; rebuilt from its
@@ -121,6 +123,13 @@ pub(crate) struct Observer {
 }
 
 impl Observer {
+    pub fn new(voters: u64) -> Self {
+        Self {
+            voters,
+            ..Self::default()
+        }
+    }
+
     pub fn violate(&mut self, now_ms: u64, message: String) {
         if self.violations.len() < 32 && self.reported.insert(message.clone()) {
             self.violations.push(format!("t={now_ms}ms {message}"));
@@ -138,6 +147,7 @@ impl Observer {
             Some(_) => {}
             None => {
                 self.committed.insert(index, (term, hash));
+                self.check_entry_majority(index, term, now_ms);
             }
         }
         if let Some(previous) = self
@@ -206,20 +216,25 @@ impl Observer {
         }
     }
 
-    fn check_majority(&mut self, nodes: u64, now_ms: u64) {
+    fn check_majority(&mut self, now_ms: u64) {
         let Some((&index, &(term, _))) = self.committed.iter().next_back() else {
             return;
         };
+        self.check_entry_majority(index, term, now_ms);
+    }
+
+    fn check_entry_majority(&mut self, index: u64, term: u64, now_ms: u64) {
         let holders = self
             .logs
             .values()
             .filter(|log| log.get(&index) == Some(&term))
             .count() as u64;
-        if holders < nodes / 2 + 1 {
+        if holders <= self.voters / 2 {
+            let voters = self.voters;
             self.violate(
                 now_ms,
                 format!(
-                    "MajorityReachedHighWatermark: committed entry {term}:{index} is held by {holders} of {nodes} replicas"
+                    "MajorityReachedHighWatermark: committed entry {term}:{index} is held by {holders} of {voters} replicas"
                 ),
             );
         }
@@ -428,12 +443,11 @@ impl Cluster {
                 metrics.last_applied.map(|log| log.index),
             ));
         }
-        let nodes = self.config.nodes;
         let mut state = self.world.lock();
         for (id, term, leader, applied) in seen {
             state.observer.observe(id, term, leader, applied, now);
         }
-        state.observer.check_majority(nodes, now);
+        state.observer.check_majority(now);
     }
 
     async fn run(&mut self) -> Result<()> {
@@ -467,8 +481,12 @@ impl Cluster {
         }
 
         stop.store(true, Ordering::Release);
-        let _ = tokio::time::timeout(Duration::from_secs(20), producer).await;
-        let _ = tokio::time::timeout(Duration::from_secs(20), consumer).await;
+        tokio::time::timeout(Duration::from_secs(20), producer)
+            .await
+            .context("producer did not stop")??;
+        tokio::time::timeout(Duration::from_secs(20), consumer)
+            .await
+            .context("consumer did not stop")??;
         self.heal_all().await?;
         self.converge().await;
         let checkpoint = self.drain().await;
@@ -721,7 +739,7 @@ impl Cluster {
     /// Takes a fresh lease after the old one expires and acknowledges everything.
     async fn drain(&mut self) -> u64 {
         tokio::time::sleep(Duration::from_millis(LEASE_TTL_MS as u64 + 200)).await;
-        let mut client = Client::new(self.world.clone(), CONSUMER, self.config.seed ^ 0xd7a1);
+        let mut client = Client::new(self.world.clone(), DRAINER, self.config.seed ^ 0xd7a1);
         let mut checkpoint = None;
         let deadline = self.now() + 30_000;
         while self.now() < deadline {
@@ -741,41 +759,53 @@ impl Cluster {
     }
 
     async fn final_checks(&mut self, checkpoint: u64) {
-        let mut logs: BTreeMap<u64, FinalLog> = BTreeMap::new();
+        let mut replicas = BTreeMap::new();
         for id in 1..=self.config.nodes {
             let Some(group) = self.group(id) else {
                 self.violate(format!("harness: n{id} is not running at the end"));
                 continue;
             };
-            match in_node(id, group.sim_local_read(partition::sim_events)).await {
-                Ok(Ok(events)) => {
-                    logs.insert(id, events.into_iter().collect());
+            let read = group.sim_local_read(|tx| partition::sim_state(tx, SUBSCRIPTION));
+            match in_node(id, read).await {
+                Ok(Ok(replica)) => {
+                    replicas.insert(id, replica);
                 }
                 Ok(Err(error)) => self.violate(format!("harness: n{id} final read: {error:?}")),
                 Err(error) => self.violate(format!("harness: n{id} final read: {error:#}")),
             }
         }
-        let Some((first, reference)) = logs.iter().next() else {
+        let Some((first, reference)) = replicas.first_key_value() else {
             return;
         };
-        for (id, log) in &logs {
-            if log != reference {
-                let differs = reference
-                    .iter()
-                    .zip(log.iter())
-                    .find(|(a, b)| a != b)
-                    .map(|(a, b)| format!("{a:?} vs {b:?}"))
-                    .unwrap_or_else(|| format!("lengths {} vs {}", reference.len(), log.len()));
+        for (id, replica) in &replicas {
+            if replica != reference {
                 self.violate(format!(
-                    "ConsistentCommittedData: n{first} and n{id} hold different partitions ({differs})"
+                    "ConsistentCommittedData: n{first} and n{id} disagree on retained events, tail or checkpoint"
                 ));
             }
         }
-        self.stats.final_events = reference.len();
-        let reference = reference.clone();
+        self.stats.final_events = reference.events.len();
+        let log: FinalLog = reference
+            .events
+            .iter()
+            .map(|event| (event.offset, event.event_id))
+            .collect();
+        let last = log.last_key_value().map_or(0, |(&offset, _)| offset);
+        if last != reference.tail {
+            self.violate(format!(
+                "EVT-G02 gap: stored tail {} differs from the last retained offset {last}",
+                reference.tail
+            ));
+        }
+        if checkpoint != reference.checkpoint {
+            self.violate(format!(
+                "EVT-G05 checkpoint: poll returned {checkpoint}, storage reports {}",
+                reference.checkpoint
+            ));
+        }
         let anomalies = {
             let state = self.world.lock();
-            history::check(&state.history, &reference, checkpoint)
+            history::check(&state.history, &log, reference.checkpoint)
         };
         for anomaly in anomalies {
             self.violate(anomaly);
@@ -1151,6 +1181,9 @@ async fn producer(world: Arc<World>, stop: Arc<AtomicBool>, seed: u64) {
                 .collect()
         };
         for attempt in 0..4u64 {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
             match client.publish(&batch).await {
                 Outcome::Ok(()) => {
                     acknowledged.push(batch.clone());
@@ -1184,9 +1217,5 @@ async fn consumer(world: Arc<World>, stop: Arc<AtomicBool>, seed: u64) {
 impl Observer {
     pub fn observe_for_test(&mut self, node: u64, term: u64, leader: bool, applied: Option<u64>) {
         self.observe(node, term, leader, applied, 0);
-    }
-
-    pub fn check_majority_for_test(&mut self, nodes: u64) {
-        self.check_majority(nodes, 0);
     }
 }
