@@ -133,7 +133,14 @@ fn drift_change_keeps_the_clock_continuous() {
 #[test]
 fn wall_jumps_move_wall_now_but_never_now() {
     run(4, |world| async move {
-        world.add_node(1, NodeClock::default());
+        // A large monotonic offset: a jump that leaks into now() cannot hide behind saturation.
+        world.add_node(
+            1,
+            NodeClock {
+                mono_offset: Duration::from_secs(600),
+                ..NodeClock::default()
+            },
+        );
         world.add_node(
             2,
             NodeClock {
@@ -152,10 +159,11 @@ fn wall_jumps_move_wall_now_but_never_now() {
                 mono_after >= mono_before,
                 "now() went backward on a wall jump"
             );
+            assert_eq!(mono_after, mono_before, "a wall jump moved now()");
             assert_eq!(wall_after, wall_before - 60_000);
 
             world.jump_wall_forward(1, ms(90_000));
-            assert!(time::now() >= mono_after);
+            assert_eq!(time::now(), mono_after, "a wall jump moved now()");
             assert_eq!(wall_ms(), wall_after + 90_000);
 
             // A backward jump past the epoch reads 0 from the epoch helpers.
@@ -319,7 +327,7 @@ fn spawn_blocking_runs_inline_in_the_node_context() {
             let handle = task::spawn_blocking(move || {
                 ran_in_job.store(true, Ordering::SeqCst);
                 // Blocking sleeps do not stall the simulation or move virtual time.
-                time::thread_sleep(Duration::from_secs(3_600));
+                time::thread_sleep(Duration::from_secs(2));
                 (
                     current_node(),
                     time::now().duration_since(world_for_job.start()),

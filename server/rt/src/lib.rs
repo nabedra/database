@@ -21,5 +21,9 @@ pub mod time;
 #[cfg(feature = "sim")]
 pub mod sim;
 
+/// True when the `sim` feature is enabled. `server/src/main.rs` asserts it is false, so
+/// no simulation build produces a server binary however the feature was enabled.
+pub const SIM: bool = cfg!(feature = "sim");
+
 #[cfg(test)]
 mod tests;
