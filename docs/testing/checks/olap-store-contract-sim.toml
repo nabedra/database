@@ -1,6 +1,6 @@
 id = "olap-store-contract-sim"
 module = "olap"
-kinds = ["U", "S"]
+kinds = ["S"]
 guarantees = ["OLAP-G01", "OLAP-G03"]
 scenarios = ["T03", "T04"]
 tiers = ["T0", "T1"]
