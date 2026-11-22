@@ -72,6 +72,17 @@ Local records help the author iterate. They are not evidence of verification. To
 hand, run `gh attestation verify <record> --repo zPy52/nabedra-database`. Release evidence is also
 attached to the GitHub release.
 
+After a build dispatch or schedule completes, `nabedra-evidence.yml` downloads its evidence
+artifacts, checks each record against the tested revision, and verifies its attestation against
+the build run. It opens a pull request with the verified records and regenerated matrix. The
+workflow checks the diff before requesting auto-merge. Merged records feed the matrix and the
+S3 budget.
+
+To retry a run, dispatch `nabedra-evidence.yml` with `run_id`. For local inspection, use
+`python3 scripts/testing/ingest_evidence.py --run <id> --dest <scratch-directory>`. The command
+writes a scratch matrix in the sibling `<scratch-directory>-matrix`. `--no-verify` saves raw
+records with a `.json.unattested` suffix that the matrix and budget skip.
+
 ## Matrix states
 
 `scripts/testing/matrix.py` reads the registers and the attested records and writes
@@ -104,6 +115,8 @@ simulation results as a fault model. They never stand in for an R check the regi
 
 ## Ledgers
 
-Workflow ledgers, briefs and reports live in `.nabedra/workflows/`, a worktree of the orphan
-`ledgers` branch. Pushing that branch starts no CI, and ledgers survive deleted worktrees. Keep
-them out of product pull requests.
+Workflow ledgers, briefs and reports start in `.nabedra/workflows/<name>/`. Run
+`python3 scripts/testing/ledger_sync.py <name>` from the checkout containing that directory to
+publish its UTF-8 Markdown and text to an isolated worktree of the orphan `ledgers` branch on
+origin. The sync copies eligible files up to 256 KiB each and 2 MiB total and preserves remote
+files absent locally. The branch is public and pushes start no CI.

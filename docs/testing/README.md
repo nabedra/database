@@ -146,7 +146,22 @@ on that SHA. List recent runs with:
 gh run list -e schedule -L 5
 ```
 
-Its records feed the matrix like any other attested run.
+The evidence workflow imports attested records and opens an evidence-only PR. Once on `main`,
+those records feed the coverage matrix and the S3 budget. Use `gh workflow run nabedra-evidence.yml
+--ref main -f run_id=<id>` to retry a completed build run.
+
+The workflow can publish only when two repository settings are on. A repository admin switches
+them on in the GitHub web interface:
+
+| Setting | Where | Without it |
+| --- | --- | --- |
+| Allow GitHub Actions to create and approve pull requests | Settings, Actions, General, Workflow permissions | The job pushes `evidence/<run id>` but cannot open the PR |
+| Allow auto-merge | Settings, General, Pull Requests | The job opens the PR but cannot merge it |
+
+When either setting is off, the job fails with an `Evidence not published` error that names the
+setting, and the run summary says how to retry. The verified records wait on the `evidence/<run id>`
+branch, and a retry reuses it after its paths pass the same check. When the PR has no pending checks,
+GitHub refuses to queue auto-merge, so the job merges it directly at the checked head commit.
 
 ### 6. Read the matrix
 
@@ -195,6 +210,13 @@ If the dedicated bucket is available, export `NABEDRA_TEST_S3_BUCKET` and
 use your usual AWS credentials. On Actions, only dispatched and scheduled
 jobs can request the bucket-scoped role through GitHub OIDC. See
 `scripts/testing/s3/README.md` for setup.
+
+### 10. Publish workflow ledgers
+
+Run `python3 scripts/testing/ledger_sync.py <name>` from the checkout containing
+`.nabedra/workflows/<name>/`. It publishes UTF-8 Markdown and text in that directory to the orphan
+`ledgers` branch on origin. The branch is public. Its history preserves briefs and reports after
+local worktrees are removed.
 
 ## Rules that apply to every change
 

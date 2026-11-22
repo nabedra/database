@@ -1,0 +1,150 @@
+name: nabedra evidence
+
+on:
+  workflow_run:
+    workflows: [nabedra build]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Completed nabedra build run ID
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  ingest:
+    if: >-
+      github.repository == 'zPy52/nabedra-database' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.head_repository.full_name == github.repository &&
+        contains(fromJSON('["workflow_dispatch", "schedule"]'), github.event.workflow_run.event)))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: nabedra-evidence-${{ inputs.run_id || github.event.workflow_run.id }}
+      cancel-in-progress: false
+    permissions:
+      actions: read # Downloading even a public run's artifacts requires this scope.
+      contents: write
+      pull-requests: write
+      attestations: read
+    env:
+      RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify and ingest records
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: python3 scripts/testing/ingest_evidence.py --run "$RUN_ID" --repo "$GITHUB_REPOSITORY"
+      - name: Publish the evidence pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          records=docs/testing/evidence/records
+          if [[ ! -d "$records" ]]; then exit 0; fi
+          git add -- "$records"
+          if git diff --cached --quiet -- "$records"; then
+            echo "No new evidence records"
+            exit 0
+          fi
+          git add -- docs/testing/coverage-matrix.md docs/testing/coverage-matrix.json
+
+          base=$(git rev-parse HEAD)
+          branch="evidence/$RUN_ID"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+          git commit -m "[skip ci] [evidence] run $RUN_ID"
+          head=$(git rev-parse HEAD)
+
+          check_paths() {
+            # Disable rename detection so a rename out of scope still exposes the old path.
+            git diff --exit-code --name-only --no-ext-diff --no-renames "$base...$1" -- . \
+              ':(exclude,glob)docs/testing/evidence/records/**' \
+              ':(exclude,literal)docs/testing/coverage-matrix.md' \
+              ':(exclude,literal)docs/testing/coverage-matrix.json'
+            # Allowed paths may only gain or change regular files: no deletions, symlinks,
+            # submodules or executable bits.
+            if git diff --raw --no-renames --no-abbrev --no-ext-diff "$base...$1" \
+                | grep -v '^:[0-7]\{6\} 100644 '; then
+              echo "::error::evidence diff contains a change that is not a regular file write"
+              return 1
+            fi
+          }
+          check_paths "$head"
+
+          gh auth setup-git --hostname github.com
+          ref="refs/heads/$branch"
+          previous=$(git ls-remote origin "$ref")
+          previous=${previous%%$'\t'*}
+          if [[ -n "$previous" ]]; then
+            git fetch --no-tags origin "$previous"
+            check_paths "$previous"
+          fi
+          git push --force-with-lease="$ref:$previous" origin "HEAD:$ref"
+
+          not_published() {
+            echo "::error title=Evidence not published::$1"
+            if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+              {
+                echo "### Evidence for run $RUN_ID was not published"
+                echo
+                echo "$1"
+                echo
+                echo "Branch \`$branch\` holds the verified records. After fixing the setting, dispatch"
+                echo "\`nabedra-evidence.yml\` on \`main\` with \`run_id=$RUN_ID\` again."
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 1
+          }
+
+          lookup_pr() {
+            gh pr list --repo "$GITHUB_REPOSITORY" --state open --base main --head "$branch" \
+              --json number,isCrossRepository --jq '.[] | select(.isCrossRepository == false) | .number'
+          }
+          pr=$(lookup_pr)
+          if [[ -z "$pr" ]]; then
+            body=$(mktemp)
+            cat > "$body" <<EOF
+          Imports the attested evidence and regenerates the coverage matrix.
+
+          Guarantees: none
+          Evidence: https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID
+          Not run: PR gate skipped for the evidence-only commit
+          Reviewers: automated evidence path check
+          EOF
+            if ! out=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
+                --title "[evidence] run $RUN_ID" --body-file "$body" 2>&1); then
+              echo "$out" >&2
+              if [[ "$out" == *"not permitted to create or approve pull requests"* ]]; then
+                not_published "The repository setting \"Allow GitHub Actions to create and approve pull requests\" (Settings, Actions, General, Workflow permissions) is disabled, so the evidence pull request could not be opened."
+              fi
+              exit 1
+            fi
+            echo "$out"
+            pr=$(lookup_pr)
+          fi
+          [[ "$pr" =~ ^[1-9][0-9]*$ ]]
+          if ! out=$(gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --auto --merge \
+              --match-head-commit "$head" 2>&1); then
+            echo "$out" >&2
+            case "$out" in
+              *"clean status"*)
+                # Nothing is pending on the PR, so GitHub refuses auto-merge. The paths are checked
+                # and the head is pinned, so merge it now.
+                gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --merge --match-head-commit "$head" ;;
+              *"uto merge is not allowed"*|*"uto-merge is not allowed"*|*"not enabled for this repository"*)
+                not_published "The repository setting \"Allow auto-merge\" (Settings, General, Pull Requests) is disabled, so evidence pull request #$pr was opened but not merged." ;;
+              *) exit 1 ;;
+            esac
+          else
+            echo "$out"
+          fi
