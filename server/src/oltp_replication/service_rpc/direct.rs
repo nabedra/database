@@ -329,30 +329,40 @@ pub(super) async fn authorize(
         cluster_id: session.group().cluster_id,
         database: session.group().database.clone(),
     };
-    let target = control.control_group().clone();
+    let control_group = control.control_group();
     // Cached like the stable roles (T6 concern 4): one Control read per
     // API process per `GRANT_TTL`, not per request. Kept warm while the API
     // sends direct requests (RD2), so an idle API's next request does not
-    // wait for a Control read.
-    let key = super::GrantKey::direct_ingress(session.remote(), &target);
+    // wait for a Control read. AZ2: ask for the Data group first; previous
+    // Control builds only accept the Control group as the ApiIngress target.
+    let key = super::GrantKey::direct_ingress(session.remote(), control_group);
+    let target = session.group().clone();
     control
         .service_grants()
         .role_warm(
             key,
             control.applied_revision(),
             || async {
-                control
-                    .service_role(&scope, session.remote(), header.action, target.clone())
+                let caller = session.remote();
+                match control
+                    .service_role(&scope, caller, header.action, target.clone())
                     .await
-                    .map(Some)
+                {
+                    Err(error) if error.code == ErrorCode::Unauthorized => control
+                        .service_role(&scope, caller, header.action, control_group.clone())
+                        .await
+                        .map(Some),
+                    grant => grant.map(Some),
+                }
             },
             || {
-                super::warm_role(
+                super::warm_role_or(
                     control,
                     scope.clone(),
                     session.remote(),
                     header.action,
                     target.clone(),
+                    control_group.clone(),
                 )
             },
         )

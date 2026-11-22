@@ -418,7 +418,7 @@ def add_pool(cluster, worker, label, policy, *, check_identity=False):
     return mount
 
 
-def move(cluster, group, worker, mount):
+def move(cluster, group, worker, mount, *, source_leads=False):
     before = placement(cluster, group)
     identity = worker_identity(cluster, worker)
     source = next(member for member in before['members'] if member['worker_id'] == identity['worker_id'])
@@ -429,14 +429,35 @@ def move(cluster, group, worker, mount):
                    remove_node=source['node_id'], target=target, worker=identity,
                    pool_generation=mount['generation'])
     request = operation('storage.replica.move', payload, move_id)
+    attempts = deque(maxlen=4)
+    if source_leads:
+        election = cluster.barrier_dir(worker) / f'move-elect-source-{move_id}'
+        election.touch()
 
     def advanced():
         status, reply = admin(cluster, worker, request, timeout=75)
         if status in (429, 503, 504):
+            attempts.append((status, reply))
             return None
         return success(status, reply)
 
-    result = wait_for(advanced, 'same-ID replica move', 165)
+    started = time.monotonic()
+    try:
+        result = wait_for(advanced, 'same-ID replica move', 165)
+    except AssertionError as error:
+        try:
+            state = admin(cluster, worker, operation('storage.replica.move.status', {}, move_id),
+                          timeout=5)
+        except TRANSPORT_ERRORS as status_error:
+            state = repr(status_error)
+        raise AssertionError(
+            f'move {move_id} from {source} to {target}: {state}; recent replies: {list(attempts)}'
+        ) from error
+    if source_leads:
+        assert not election.exists(), 'the move did not exercise a source-led catch-up'
+        print(json.dumps(dict(scenario='O26', move_id=move_id, source_node=source['node_id'],
+                              target_node=target['node_id'], seconds=round(time.monotonic() - started, 3))),
+              flush=True)
     assert result['phase']['state'] == 'retired', result
     after = placement(cluster, group)
     phase = result['phase']
@@ -455,6 +476,11 @@ def drain_and_detach(facade, owner, mount, target):
     table = create(facade, 'drain_rows')
     expected = [row(1), row(2)]
     table.insert_many(expected)
+    # Put the original membership and its replacement in different
+    # AppendEntries frames even on a peer that supports 64-entry batches.
+    for value in range(65):
+        expected[0] = row(1, value=value)
+        table.upsert(expected[0])
     group = initial_range(cluster, table.id)
     move(cluster, group, owner, mount)
     drain_id = uid()
@@ -465,7 +491,9 @@ def drain_and_detach(facade, owner, mount, target):
     assert status == 409 and 'replica' in reply['error']['message'], (status, reply)
     assert admin(cluster, owner, permit)[0] != 200
     assert success(*admin(cluster, owner, operation('storage.pool.drain.status', {}, drain_id)))['phase'] == 'draining'
-    move(cluster, group, owner, target)
+    # The second learner must replay a membership that predates the
+    # colocated source's replica ID. Exercise that source as leader.
+    move(cluster, group, owner, target, source_leads=True)
 
     refusals = deque(maxlen=4)
 

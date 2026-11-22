@@ -179,6 +179,11 @@ impl ReadRequest {
         matches!(
             self,
             Self::Current
+                | Self::EnrollmentRevision
+                | Self::Workers { .. }
+                | Self::Apis { .. }
+                | Self::RestartPreparation { .. }
+                | Self::PreparedDataWorker { .. }
                 | Self::ColdPin { .. }
                 | Self::GroupInventoryRevision
                 | Self::Groups { .. }
