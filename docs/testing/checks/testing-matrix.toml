@@ -4,8 +4,11 @@ kinds = ["U"]
 guarantees = []
 scenarios = []
 tiers = ["T0", "T1"]
-command = ["python3", "-m", "unittest", "discover", "-s", "scripts/testing", "-p", "test_*.py"]
-cwd = "."
+command = [
+  "python3", "-m", "unittest",
+  "test_catalog", "test_evidence", "test_matrix", "test_release_gate", "test_run_check",
+]
+cwd = "scripts/testing"
 timeout_s = 600
 needs = []
 result_parser = "unittest"
