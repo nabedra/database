@@ -1,4 +1,4 @@
-{"schema":"nabedra.catalog/1","count":2298,"tests":[
+{"schema":"nabedra.catalog/1","count":2302,"tests":[
 {"file":"orm/python/tests/events/test_client.py","hash":"202d453fc9458842","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_ack_uses_exact_offset_and_rejects_foreign_delivery_before_request","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"1c426c67dd348a60","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_claim_reuses_uuid_after_missing_response","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"b8d2b5c0d984c70e","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_error_metadata_and_duplicate_fields","lang":"python"},
@@ -551,7 +551,7 @@
 {"file":"server/check/tests/core.rs","hash":"e6e55f691df2ad06","id":"server/check/tests/core.rs::draws_stay_in_bounds","lang":"rust"},
 {"file":"server/check/tests/core.rs","hash":"87b695341a7ffcf4","id":"server/check/tests/core.rs::evidence_conclude_reports_fail_and_not_run","lang":"rust"},
 {"file":"server/check/tests/core.rs","hash":"353fdb0165f3ba8f","id":"server/check/tests/core.rs::evidence_dates_match_the_schema_format","lang":"rust"},
-{"file":"server/check/tests/core.rs","hash":"a29e1e1a7de4e501","id":"server/check/tests/core.rs::evidence_record_round_trips_and_writes_its_file","lang":"rust"},
+{"file":"server/check/tests/core.rs","hash":"1c7a86373c86a9bc","id":"server/check/tests/core.rs::evidence_record_round_trips_and_writes_its_file","lang":"rust"},
 {"file":"server/check/tests/core.rs","hash":"517fda52583592a2","id":"server/check/tests/core.rs::evidence_rejects_duplicate_kind_letters","lang":"rust"},
 {"file":"server/check/tests/core.rs","hash":"b129df5afce9fd85","id":"server/check/tests/core.rs::evidence_rejects_invalid_assertion_totals","lang":"rust"},
 {"file":"server/check/tests/core.rs","hash":"4bfc7611a3ef3802","id":"server/check/tests/core.rs::evidence_requires_explicit_null_fields","lang":"rust"},
@@ -1469,6 +1469,10 @@
 {"file":"server/src/node/runtime/shared_tests.rs","hash":"e17c3ce21bc1690f","id":"server/src/node/runtime/shared_tests.rs::sl01_sl02_shared_worker_routes_independent_databases_and_reauthorizes_receipts","lang":"rust"},
 {"file":"server/src/node/spool.rs","hash":"008c5199a93d5df0","id":"server/src/node/spool.rs::write_error_keeps_attempted_bytes_charged_and_poisons_until_drop","lang":"rust"},
 {"file":"server/src/node/stream/distributed.rs","hash":"37ec021f3b7d2eee","id":"server/src/node/stream/distributed.rs::st03_small_control_reserve_charges_fence_reads_to_working_memory","lang":"rust"},
+{"file":"server/src/node/stream/sim_tests.rs","hash":"5ec377e4f057a9a5","id":"server/src/node/stream/sim_tests.rs::st01_st06_olap_stream_simulation","lang":"rust"},
+{"file":"server/src/node/stream/sim_tests.rs","hash":"190943a7d22eb5fb","id":"server/src/node/stream/sim_tests.rs::st04_planted_replay_with_new_handle_is_caught","lang":"rust"},
+{"file":"server/src/node/stream/sim_tests.rs","hash":"854296495e4cc8af","id":"server/src/node/stream/sim_tests.rs::st04_planted_sequence_gap_after_kill_is_caught","lang":"rust"},
+{"file":"server/src/node/stream/sim_tests.rs","hash":"d6ecd2d5572d482b","id":"server/src/node/stream/sim_tests.rs::st04_st06_planted_rescan_after_reconnect_is_caught","lang":"rust"},
 {"file":"server/src/node/stream/state.rs","hash":"559ec8b03dc0c7eb","id":"server/src/node/stream/state.rs::r05_q03_stream_page_fences_delayed_replica_writes","lang":"rust"},
 {"file":"server/src/node/stream/state.rs","hash":"cf03fee3c8fefb58","id":"server/src/node/stream/state.rs::st04_recovery_restores_a_complete_record_missing_from_the_new_owner","lang":"rust"},
 {"file":"server/src/node/stream/tests.rs","hash":"d800d62bc5776a89","id":"server/src/node/stream/tests.rs::st03_close_releases_in_progress_prefetch","lang":"rust"},

@@ -299,6 +299,10 @@ fn evidence_record_round_trips_and_writes_its_file() {
     assert_keys(&v["assertions"]["not_run"][0], &fields["assertions"]["properties"]["not_run"]["items"]);
     assert_keys(&v["artifacts"][0], &fields["artifacts"]["items"]);
     assert!(Record::from_json(&json.replace("\"tree_clean\"", "\"extra\": 1, \"tree_clean\"")).is_err());
+    // The Python writer adds the schema's optional `s3_requests`; the Rust reader must accept it.
+    let with_s3 = Record::from_json(&json.replace("\"tree_clean\"", "\"s3_requests\": 42, \"tree_clean\"")).unwrap();
+    assert_eq!(with_s3.s3_requests, Some(42));
+    assert!(with_s3.to_json().contains("\"s3_requests\": 42"));
 
     let dir = std::env::temp_dir().join(format!("nabedra-check-evidence-{}", std::process::id()));
     let path = r.write_to(&dir).unwrap();

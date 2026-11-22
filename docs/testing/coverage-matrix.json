@@ -1,6 +1,6 @@
 {
   "allow_unattested": false,
-  "head": "19250c1b3048b91b1d53013ffb50245e54710fc6",
+  "head": "e3dea900adf4349aaa9912e2799e545376ed7180",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -2047,9 +2047,10 @@
           "state": "n/a"
         },
         "H": {
-          "reason": "Scanned and delivered row counts detect repeated work directly",
-          "required": false,
-          "state": "n/a"
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
         },
         "K": {
           "reason": "Planned read and reconnect trials cover the scan boundaries",
