@@ -16,7 +16,7 @@
 #   acceptance  Linux OLTP acceptance in the default mode; implies growth, o02
 #   o02         O02 engine identity with the same-commit engine matrix and an OLAP server, per mode (+ T02)
 #   growth      O16 and O26 on the shared build, O21 and O28 on one opt-level-1 build, per mode
-#   rep1        REP1-REP5 process suites: scale, rollback, restart, replacement check
+#   rep1        REP1-REP5 process suites: scale, rollback, restart, replacement check, abandon, wipe, data trust
 #   rep4-mixed  builds the pre-execution worker and tests mixed-version enrollment
 #   o22         adds O22 to `scenarios` (focused O22, per mode)
 #   blackhole   AZ1/AZ2 RF3 packet-drop failover fixture (O06/O18)
@@ -1135,14 +1135,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # REP1-REP5 worker recovery process suites on the shared build: scale, direct-mode rollback,
-  # restart and system replacement.
+  # REP1-REP5 worker recovery process suites on the shared build, one invocation each: SCALE1's scale,
+  # direct-mode rollback, retained restart, system replacement and REP5's abandon, wipe and data-trust
+  # replacement variants. replacement-mixed needs the pre-execution binary and runs in rep4-mixed.
   rep1:
     name: REP1 worker recovery, rollback, restart and replacement
     needs: [revision, build]
     if: contains(needs.revision.outputs.jobs, ',rep1,')
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1161,7 +1162,7 @@ jobs:
         run: |
           set -o pipefail
           status=0
-          for suite in scale rollback restart replacement-check; do
+          for suite in scale rollback restart replacement-check replacement-abandon replacement-wipe replacement-data-trust; do
             echo "::group::$suite"
             python3 server/tests/oltp_recovery_operations.py --binary "$NABEDRA_BIN" \
               --test-executable "$NABEDRA_TEST_EXE" --suite "$suite" 2>&1 | tee "oltp-rep1-$suite.log" || { status=1; echo "::error::REP1 suite $suite failed"; }
