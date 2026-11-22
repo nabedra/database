@@ -288,9 +288,12 @@ async fn pre_spawn_failure_rolls_back_and_identity_exhaustion_never_wraps() {
         shared: owners.shared.clone(),
     };
     let permit = transport.clone().try_acquire_owned().unwrap();
-    let rolled_back = std::thread::spawn(move || outside_runtime.prepare_control(permit).is_err())
-        .join()
-        .unwrap();
+    let rolled_back = nabedra_rt::task::spawn_service("nabedra-test", move || {
+        outside_runtime.prepare_control(permit).is_err()
+    })
+    .expect("spawn test thread")
+    .join()
+    .unwrap();
     let empty = owners
         .shared
         .state

@@ -147,7 +147,9 @@ async fn pending_guard_release_remains_visible_after_handle_reaping() {
     let (release, gate) = std::sync::mpsc::channel();
     *owners.shared.releasing.lock().unwrap() = Some((at_release, gate));
     let shared = owners.shared.clone();
-    let reaper = std::thread::spawn(move || reap_shared(&shared, None));
+    let reaper =
+        nabedra_rt::task::spawn_service("nabedra-test", move || reap_shared(&shared, None))
+            .expect("spawn test thread");
     let observed = nabedra_rt::time::timeout(std::time::Duration::from_secs(10), observed).await;
     let snapshot = owners
         .shared
@@ -2823,7 +2825,9 @@ async fn drain_classifier_account_publication_discard_return_and_release() {
     let (release, gate) = std::sync::mpsc::channel();
     *owners.shared.releasing.lock().unwrap() = Some((at_release, gate));
     let shared = owners.shared.clone();
-    let reaper = std::thread::spawn(move || reap_shared(&shared, None));
+    let reaper =
+        nabedra_rt::task::spawn_service("nabedra-test", move || reap_shared(&shared, None))
+            .expect("spawn test thread");
     let releasing = nabedra_rt::time::timeout(WATCHDOG, releasing).await;
     let pending_release = observe();
     let _ = release.send(());
@@ -3222,11 +3226,12 @@ async fn drain_classifier_failed_observer_is_retained_without_exemption() {
     // Intentional abort quarantine: the original memory-only handle was polled
     // above. Move its guards out only for test recovery, after recording failure.
     let controls = std::mem::take(&mut owners.shared.state.lock().unwrap().payload.controls);
-    let recovered = std::thread::spawn(move || {
+    let recovered = nabedra_rt::task::spawn_service("nabedra-test", move || {
         for e in controls {
             drop(ManuallyDrop::into_inner(e.guards));
         }
     })
+    .expect("spawn test thread")
     .join();
     let quarantine = tests::quarantine_teardown(&owners);
     tokio::pin!(quarantine);
@@ -3432,7 +3437,9 @@ async fn barrier_sample_worker_cleanup_and_release_handoff() {
     let (release, gate) = std::sync::mpsc::channel();
     *owners.shared.releasing.lock().unwrap() = Some((at_release, gate));
     let shared = owners.shared.clone();
-    let reaper = std::thread::spawn(move || reap_shared(&shared, None));
+    let reaper =
+        nabedra_rt::task::spawn_service("nabedra-test", move || reap_shared(&shared, None))
+            .expect("spawn test thread");
     let releasing = nabedra_rt::time::timeout(WATCHDOG, releasing).await;
     let pending_release = observe();
     let release_sample_refused = sample_now().is_none();
@@ -3742,10 +3749,11 @@ async fn work_evidence_regression_pair_reservation_invalidates_before_publicatio
     let shared = owners.shared.clone();
     let transport = Arc::new(Semaphore::new(1));
     let permit = transport.clone().try_acquire_owned().unwrap();
-    let preparing = std::thread::spawn(move || {
+    let preparing = nabedra_rt::task::spawn_service("nabedra-test", move || {
         let _entered = runtime.enter();
         PayloadOwners { shared }.prepare_pair(Role::Operation, permit, None)
-    });
+    })
+    .expect("spawn test thread");
     let reached = nabedra_rt::time::timeout(WATCHDOG, at_reservation).await;
     let during = sample.as_ref().map(|sample| {
         let state = owners.shared.state.lock().unwrap();
@@ -4685,7 +4693,10 @@ async fn proof_cycle_regression_drops_preserve_work_generation() {
                 *owners.shared.releasing.lock().unwrap() = Some((entered, gate));
                 drop(completion);
                 let shared = owners.shared.clone();
-                let reaper = std::thread::spawn(move || reap_shared(&shared, None));
+                let reaper = nabedra_rt::task::spawn_service("nabedra-test", move || {
+                    reap_shared(&shared, None)
+                })
+                .expect("spawn test thread");
                 let reached = matches!(
                     nabedra_rt::time::timeout(WATCHDOG, at_release).await,
                     Ok(Ok(()))
@@ -5217,7 +5228,9 @@ async fn final_drain_receipt_account_publication_cleanup_and_release() {
         let (release, gate) = std::sync::mpsc::channel();
         *owners.shared.releasing.lock().unwrap() = Some((at_release, gate));
         let shared = owners.shared.clone();
-        let reaper = std::thread::spawn(move || reap_shared(&shared, None));
+        let reaper =
+            nabedra_rt::task::spawn_service("nabedra-test", move || reap_shared(&shared, None))
+                .expect("spawn test thread");
         let releasing = nabedra_rt::time::timeout(WATCHDOG, releasing).await;
         let pending_release = observe();
         if phase == 6 {

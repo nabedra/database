@@ -530,11 +530,12 @@ pub(super) async fn quarantine_teardown(owners: &PayloadOwners) {
         slots.push(entry.slot);
         guards.push(entry.guards);
     }
-    std::thread::spawn(move || {
+    nabedra_rt::task::spawn_service("nabedra-test", move || {
         for g in guards {
             drop(ManuallyDrop::into_inner(g));
         }
     })
+    .expect("spawn test thread")
     .join()
     .unwrap();
     for (h, terminated) in handles {
@@ -542,11 +543,12 @@ pub(super) async fn quarantine_teardown(owners: &PayloadOwners) {
             h.await.unwrap();
         }
     }
-    std::thread::spawn(move || {
+    nabedra_rt::task::spawn_service("nabedra-test", move || {
         for slot in slots {
             slot.discard();
         }
     })
+    .expect("spawn test thread")
     .join()
     .unwrap();
 }
