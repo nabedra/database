@@ -269,7 +269,6 @@ impl HostedGroupManager {
         target: uuid::Uuid,
     ) -> Result<u64, ProtocolError> {
         use openraft::{
-            RaftSnapshotBuilder,
             network::{RPCOption, RaftNetworkFactory, RaftNetworkV2},
             storage::RaftStateMachine,
         };
@@ -295,13 +294,14 @@ impl HostedGroupManager {
         };
         let host = self.hosted_data(group, source.node_id)?;
         host.ensure_linearizable().await?;
+        // SNAP1: what the replication task sends a lagging follower, a fresh
+        // cut whose file is written during the transfer.
         let mut state = host.state.clone();
         let snapshot = state
-            .get_snapshot_builder()
+            .get_current_snapshot()
             .await
-            .build_snapshot()
-            .await
-            .map_err(|_| unavailable())?;
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
         let cut = snapshot.meta.last_log_id.ok_or_else(unavailable)?.index;
         let mut factory = TypedNetworkFactory::<DataConfig>::new(
             self.client(),

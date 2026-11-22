@@ -1,0 +1,60 @@
+# SNAP1: Raft snapshot export off the apply path
+
+PERF1 traced the soak stalls of 1.4–3.6 s to Raft snapshot export. Roughly every 5,000 Data entries, each replica ran
+`export_snapshot` on OpenRaft's state-machine task. It held the group's application order, and the worker's only query
+thread, while it iterated, wrote, fsynced and published a full group file of 140–480 MB.
+
+SNAP1 makes a Raft snapshot a **cut**:
+- Under the application order, the cut syncs any unsynced applies, takes one `nabedra-kv` view, and reads the applied
+  position, membership and response from that view. It rewrites nothing.
+- Policy builds are header-only cuts. OpenRaft keeps only their metadata, which it uses to purge the log.
+- A lagging follower gets a fresh cut from `get_current_snapshot`. The replication task writes that cut's file from the
+  pinned view, in 1 MiB native jobs. The file is not fsynced and lives under `snapshots/<group>/outgoing/`. The task then
+  releases the view.
+- The production profiles now set `snapshot_policy = LogsSinceLast(5000)` and keep 1,000 entries explicitly. These are
+  OpenRaft's defaults. A cut is cheap, so the interval only sets how often the log is purged. A trial with 1,024 / 4,096
+  was dropped. With it, O26 failed with `direct_oltp` off; the default values failed the same way once and then passed
+  twice, so the trial values were not shown to cause that failure.
+
+## Soak A/B on runners (relative numbers only)
+
+`[ci snap1]`, run [44959457181](https://github.com/zPy52/nabedra-database/actions/runs/44959457181):
+- **Before:** `nabedra/hardening` bb6dc32 (main 70c4e7d merged). **After:** f04d14d.
+- ubuntu-24.04, 4 vCPU, NS11 caps, API uncapped.
+- NS11 soak: 80,000 rows with 2 KiB payloads, 300 s in five 60 s phases, 32 clients, 500 keys verified.
+- A stall window is a run of updates that took more than 250 ms, scheduled less than 1 s apart (`analyze_snap1.py`).
+
+| Soak | Acked / offered | Refused (client cap) | p50 / p99 / max ms | Stall windows > 250 ms | Written per replica per 5,000 entries |
+| --- | --- | --- | --- | --- | --- |
+| 100/s before | 28,981 / 30,000 | 1,019 (3.40%) | 2.31 / 29.9 / 2,763 | 5, every ~53 s, max 1.9–2.8 s | 908–921 MB |
+| 100/s after | 30,000 / 30,000 | 0 | 2.39 / 10.8 / 56 | 0 | 527–542 MB |
+| 50/s before | 14,651 / 15,000 | 349 (2.33%) | 2.95 / 189 / 3,567 | 3 of 3.0–3.6 s, plus 2 of ~0.3 s | 532–549 MB |
+| 50/s after | 15,000 / 15,000 | 0 | 3.15 / 29.6 / 328 | 2 of ~0.32 s | 318–326 MB |
+
+- Verification found 0 mismatches in all four runs.
+- Per-phase p99, 50/s:
+  - before: 161 / 2,512 / 5.7 / 2,500 / 2,999 ms
+  - after: 98 / 5.9 / 6.0 / 145 / 6.0 ms
+- The ~0.3 s windows at about 34 s and 191 s appear in both binaries. They are not snapshot export.
+- An earlier A/B on the same base, run 44940068585, gave the same picture (it used the trial policy 1,024 / 4,096). The
+  first A/B, run 44915229646, used SNAP1's original base 5b6939a. Both summaries are in the git history of this file.
+- What each replica still writes (about 107 KB per update at 100/s) is LSM flush and compaction of 2 KiB-payload updates
+  with their MVCC history, plus the journal. 5 s write bursts of about 525 MB remain at 100/s. That is the next thing to
+  look at for the sustained-write limit.
+
+## Apply stall during an export (regression, local Mac, debug build)
+
+`snap1_o11_applies_proceed_while_a_snapshot_file_is_written`: a 48 MiB group, one query thread, and one synced apply
+after another while `export_snapshot` runs.
+
+| | Export | Applies during it | Apply p50 / max |
+| --- | --- | --- | --- |
+| Base (5b6939a product code) | 3.95 s | 2 | 3.75 s / 3.75 s: **FAILED** ("only 2 applies completed during a 3.95 s export") |
+| SNAP1 | 3.35 s | 52 | 57 ms / 154 ms: ok |
+
+The apply p50 is dominated by its own `F_FULLFSYNC` on macOS.
+
+## Files
+
+- `analyze_snap1.py`: stall windows, refusals, p50/p99 and cgroup `io.stat` writes from soak run directories.
+- `ci-soak-summary.json`, `ci-soak-runs.txt`: compact outputs of run 44959457181.
