@@ -134,7 +134,16 @@ async fn ns27_f01_f03_rv_ev_m1_full_device_does_not_stop_the_raft_core() -> Resu
     fill_device(&fs, disk.path());
     let (mut acked, (stalled, pending)) = write_until_stalled(&group, &mut next).await;
     acked.extend(0..3);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // The storage worker retries on a real clock. Wait for the observed retry
+    // count so the assertion does not depend on a fixed wall-clock delay.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut readiness = tokio::time::interval(Duration::from_millis(10));
+        while total_retries(&broker.storage_health()) < 3 {
+            readiness.tick().await;
+        }
+    })
+    .await
+    .expect("the storage worker retries the full device");
     let health = broker.storage_health();
     assert!(group.status().running, "the core kept running");
     assert!(health.no_space, "{health:?}");
@@ -290,13 +299,15 @@ async fn ns27_rv_ev_damage_found_while_serving_closes_the_running_group() -> Res
         })
         .await;
     assert!(read.is_err(), "{read:?}");
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while broker.group("serving").is_some() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the broker stops the damaged group");
+    group
+        .raft
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(
+            |metrics| metrics.state == openraft::ServerState::Shutdown,
+            "the broker stops the damaged group",
+        )
+        .await?;
+    assert!(broker.group("serving").is_none());
     // Its Raft node is stopped: it neither acknowledges nor commits.
     assert!(group.write(command(3)).await.is_err());
     let reported = broker.quarantined_groups();

@@ -1064,6 +1064,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nabedra-check"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nabedra-events"
 version = "0.1.0"
 dependencies = [
@@ -1076,6 +1084,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "hmac",
+ "nabedra-check",
  "nabedra-kv",
  "openraft",
  "rand 0.8.8",
