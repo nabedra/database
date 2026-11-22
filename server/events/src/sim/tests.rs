@@ -186,3 +186,188 @@ fn planted_fsynced_data_loss_is_caught() {
         "fsynced-data-loss",
     );
 }
+
+mod checkers {
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::super::cluster::Observer;
+    use super::super::history::{self, FinalLog, History};
+
+    fn id(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    fn history(ops: &[(&'static str, &'static str, serde_json::Value)]) -> History {
+        let mut history = History::default();
+        for (kind, f, value) in ops {
+            history.push(kind, 0, f, value.clone(), "r", 1, 0);
+        }
+        history
+    }
+
+    fn publish(events: &[(u128, u64)]) -> serde_json::Value {
+        history::publish_value(&events.iter().map(|(n, o)| (id(*n), *o)).collect::<Vec<_>>())
+    }
+
+    fn log(events: &[(u64, u128)]) -> FinalLog {
+        events.iter().map(|(o, n)| (*o, id(*n))).collect()
+    }
+
+    fn poll(after: u64, events: &[(u64, u128)]) -> serde_json::Value {
+        let events: Vec<_> = events
+            .iter()
+            .map(|(o, n)| json!([o, id(*n).to_string()]))
+            .collect();
+        json!({ "after": after, "events": events })
+    }
+
+    #[test]
+    fn a_clean_history_passes() {
+        let h = history(&[
+            ("invoke", "publish", publish(&[(1, 1), (2, 2)])),
+            ("ok", "publish", publish(&[(1, 1), (2, 2)])),
+            ("invoke", "publish", publish(&[(1, 1), (2, 2)])),
+            ("ok", "publish", publish(&[(1, 1), (2, 2)])),
+            ("ok", "poll", poll(0, &[(1, 1), (2, 2)])),
+        ]);
+        assert_eq!(
+            history::check(&h, &log(&[(1, 1), (2, 2)]), 2),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn known_bad_histories_are_flagged() {
+        let cases: &[(&str, History, FinalLog, u64)] = &[
+            (
+                "lost-write",
+                history(&[
+                    ("invoke", "publish", publish(&[(1, 0)])),
+                    ("ok", "publish", publish(&[(1, 1)])),
+                ]),
+                log(&[]),
+                0,
+            ),
+            (
+                "duplicate-offset",
+                history(&[
+                    ("invoke", "publish", publish(&[(1, 0), (2, 0)])),
+                    ("ok", "publish", publish(&[(1, 1)])),
+                    ("ok", "publish", publish(&[(2, 1)])),
+                ]),
+                log(&[(1, 1)]),
+                1,
+            ),
+            (
+                "offset-reassigned",
+                history(&[
+                    ("invoke", "publish", publish(&[(1, 0)])),
+                    ("ok", "publish", publish(&[(1, 1)])),
+                    ("ok", "publish", publish(&[(1, 2)])),
+                ]),
+                log(&[(1, 1)]),
+                1,
+            ),
+            (
+                "gap",
+                history(&[("invoke", "publish", publish(&[(1, 0), (2, 0)]))]),
+                log(&[(1, 1), (3, 2)]),
+                3,
+            ),
+            ("invented-event", history(&[]), log(&[(1, 9)]), 1),
+            (
+                "poll-order",
+                history(&[
+                    ("invoke", "publish", publish(&[(1, 0), (2, 0)])),
+                    ("ok", "poll", poll(0, &[(2, 2)])),
+                ]),
+                log(&[(1, 1), (2, 2)]),
+                2,
+            ),
+            (
+                "split-batch",
+                history(&[
+                    ("invoke", "publish", publish(&[(1, 0), (2, 0)])),
+                    ("ok", "publish", publish(&[(1, 1), (2, 3)])),
+                ]),
+                log(&[(1, 1), (2, 2), (3, 2)]),
+                3,
+            ),
+            (
+                "drain-incomplete",
+                history(&[("invoke", "publish", publish(&[(1, 0)]))]),
+                log(&[(1, 1)]),
+                0,
+            ),
+        ];
+        for (expected, h, final_log, checkpoint) in cases {
+            let anomalies = history::check(h, final_log, *checkpoint);
+            assert!(
+                anomalies.iter().any(|a| a.contains(expected)),
+                "{expected} not flagged: {anomalies:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kafka_invariants_flag_known_bad_observations() {
+        let mut o = Observer::default();
+        o.observe_for_test(1, 3, true, Some(1));
+        o.observe_for_test(2, 3, true, Some(1));
+        assert!(
+            o.violations.iter().any(|v| v.contains("SingleLeader")),
+            "{:?}",
+            o.violations
+        );
+
+        let mut o = Observer::default();
+        o.observe_for_test(1, 5, false, None);
+        o.observe_for_test(1, 4, false, None);
+        assert!(
+            o.violations.iter().any(|v| v.contains("MonotonicEpoch")),
+            "{:?}",
+            o.violations
+        );
+
+        let mut o = Observer::default();
+        o.observe_for_test(1, 1, false, Some(9));
+        o.observe_for_test(1, 1, false, Some(8));
+        assert!(
+            o.violations
+                .iter()
+                .any(|v| v.contains("MonotonicHighWatermark")),
+            "{:?}",
+            o.violations
+        );
+
+        let mut o = Observer::default();
+        o.applied(1, 1, 1, 0xaa, 0);
+        o.applied(2, 1, 1, 0xbb, 0);
+        assert!(
+            o.violations
+                .iter()
+                .any(|v| v.contains("AppliedPrefixesAgree")),
+            "{:?}",
+            o.violations
+        );
+
+        let mut o = Observer::default();
+        o.appended(1, 1, 1);
+        o.applied(1, 1, 1, 0xaa, 0);
+        o.check_majority_for_test(3);
+        assert!(
+            o.violations
+                .iter()
+                .any(|v| v.contains("MajorityReachedHighWatermark")),
+            "{:?}",
+            o.violations
+        );
+        let mut o = Observer::default();
+        o.appended(1, 1, 1);
+        o.appended(2, 1, 1);
+        o.applied(1, 1, 1, 0xaa, 0);
+        o.check_majority_for_test(3);
+        assert_eq!(o.violations, Vec::<String>::new());
+    }
+}

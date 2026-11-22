@@ -78,7 +78,10 @@ pub(crate) fn run_blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 
             .send(job)
             .expect("the simulation blocking helper is running")
     });
-    match result.recv().expect("the simulation blocking helper replies") {
+    match result
+        .recv()
+        .expect("the simulation blocking helper replies")
+    {
         Ok(value) => value,
         Err(panic) => std::panic::resume_unwind(panic),
     }

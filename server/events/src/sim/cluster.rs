@@ -116,11 +116,13 @@ pub(crate) struct Observer {
     applied_hook: BTreeMap<u64, u64>,
     applied_metric: BTreeMap<u64, u64>,
     pub violations: Vec<String>,
+    /// Messages already reported, so a violation that persists is reported once.
+    reported: std::collections::BTreeSet<String>,
 }
 
 impl Observer {
     pub fn violate(&mut self, now_ms: u64, message: String) {
-        if self.violations.len() < 32 {
+        if self.violations.len() < 32 && self.reported.insert(message.clone()) {
             self.violations.push(format!("t={now_ms}ms {message}"));
         }
     }
@@ -1175,5 +1177,16 @@ async fn consumer(world: Arc<World>, stop: Arc<AtomicBool>, seed: u64) {
             Step::Drained(_) => client.rng.range(30, 150),
         };
         tokio::time::sleep(Duration::from_millis(pause)).await;
+    }
+}
+
+#[cfg(test)]
+impl Observer {
+    pub fn observe_for_test(&mut self, node: u64, term: u64, leader: bool, applied: Option<u64>) {
+        self.observe(node, term, leader, applied, 0);
+    }
+
+    pub fn check_majority_for_test(&mut self, nodes: u64) {
+        self.check_majority(nodes, 0);
     }
 }

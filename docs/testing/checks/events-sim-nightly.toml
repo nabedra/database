@@ -6,7 +6,9 @@ scenarios = ["EV01", "EV02", "EV07"]
 tiers = ["T2", "T3"]
 command = ["cargo", "test", "-j", "2", "--release", "--features", "sim", "--lib", "sim::"]
 cwd = "server/events"
-timeout_s = 36000
+# A GitHub-hosted job stops at 6 h. Seed time in release is not measured yet; shard by
+# NABEDRA_SEED if 20,000 seeds do not fit.
+timeout_s = 21000
 needs = []
 result_parser = "cargo-test"
 # tokio_unstable enables Builder::rng_seed (select! order). A separate target directory

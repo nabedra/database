@@ -155,6 +155,9 @@ Test-only knobs (`Knobs`), compiled only with the feature. Each test searches se
 | `reuse_offset_after_dedup` | `partition/events.rs`: a dedup hit rewinds the offset counter | `duplicate-offset`, `offset-reassigned` |
 | `lose_fsynced_on_restart` | the harness restarts a broker from its volume as of its previous start | `MonotonicEpoch` and others |
 
+The checkers also have direct tests on known-bad inputs (`sim::tests::checkers`): one
+fixture per history anomaly, and synthetic observations for each Kafka invariant.
+
 ## Determinism
 
 The trace is an FNV-1a hash over every message plan, reply, apply, nemesis action and
