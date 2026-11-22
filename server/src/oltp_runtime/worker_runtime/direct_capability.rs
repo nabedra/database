@@ -37,7 +37,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{sync::watch, task::JoinHandle, time::Instant};
 
 /// Poll period while the capability is inactive.
 const POLL: Duration = Duration::from_secs(5);
@@ -50,6 +50,7 @@ type OnActive = Box<dyn Fn() + Send + Sync>;
 #[derive(Default)]
 struct SnapshotRetry {
     enabled: AtomicBool,
+    next_probe: Mutex<Option<Instant>>,
 }
 
 impl SnapshotRetry {
@@ -60,11 +61,20 @@ impl SnapshotRetry {
         if self.enabled.load(Ordering::Acquire) {
             return true;
         }
-        let enabled = read().await == Ok(true);
-        if enabled {
+        {
+            let mut next_probe = self.next_probe.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            // Share one refresh interval with the watcher. Reserve it before
+            // the read so concurrent stale prepares don't each call Control.
+            if next_probe.is_some_and(|next| now < next) {
+                return self.enabled.load(Ordering::Acquire);
+            }
+            *next_probe = Some(now + POLL);
+        }
+        if read().await == Ok(true) {
             self.enabled.store(true, Ordering::Release);
         }
-        enabled
+        self.enabled.load(Ordering::Acquire)
     }
 }
 
