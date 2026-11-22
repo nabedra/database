@@ -317,6 +317,15 @@ class LintTests(unittest.TestCase):
         self.assertTrue(any("add up to 90" in e for e in errors), errors)
         self.assertTrue(any("level 'L4'" in e for e in errors), errors)
 
+    def test_missing_register_file(self):
+        text = self.paths.modules.read_text().replace("registers/cache.md", "registers/kv.md")
+        with tempfile.TemporaryDirectory() as directory:
+            modules = Path(directory) / "modules.toml"
+            modules.write_text(text)
+            errors, _ = matrix.lint(replace(self.paths, modules=modules), files=[])
+        self.assertIn("modules.toml: module cache names register registers/kv.md, "
+                      "which matches no register file", errors)
+
     def test_repository_tree_has_no_dangling_tests(self):
         paths = matrix.Paths()
         modules = matrix.load_modules(paths.modules)

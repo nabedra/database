@@ -1,4 +1,4 @@
-{"schema":"nabedra.catalog/1","count":2278,"tests":[
+{"schema":"nabedra.catalog/1","count":2279,"tests":[
 {"file":"orm/python/tests/events/test_client.py","hash":"202d453fc9458842","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_ack_uses_exact_offset_and_rejects_foreign_delivery_before_request","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"1c426c67dd348a60","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_claim_reuses_uuid_after_missing_response","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"b8d2b5c0d984c70e","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_error_metadata_and_duplicate_fields","lang":"python"},
@@ -460,6 +460,7 @@
 {"file":"scripts/testing/test_matrix.py","hash":"22d27f68a56c7cb5","id":"scripts/testing/test_matrix.py::LintTests::test_bad_modules_file","lang":"python"},
 {"file":"scripts/testing/test_matrix.py","hash":"c12f7aef7ac76e6d","id":"scripts/testing/test_matrix.py::LintTests::test_each_failure","lang":"python"},
 {"file":"scripts/testing/test_matrix.py","hash":"0d7af028ef54a771","id":"scripts/testing/test_matrix.py::LintTests::test_fixture_is_clean_apart_from_warnings","lang":"python"},
+{"file":"scripts/testing/test_matrix.py","hash":"357eb0370de3373a","id":"scripts/testing/test_matrix.py::LintTests::test_missing_register_file","lang":"python"},
 {"file":"scripts/testing/test_matrix.py","hash":"3e1a5f0b5885dce2","id":"scripts/testing/test_matrix.py::LintTests::test_repository_tree_has_no_dangling_tests","lang":"python"},
 {"file":"scripts/testing/test_matrix.py","hash":"02297d54dd0b6809","id":"scripts/testing/test_matrix.py::RegisterTests::test_malformed_registers","lang":"python"},
 {"file":"scripts/testing/test_matrix.py","hash":"a236b73c723b4047","id":"scripts/testing/test_matrix.py::RegisterTests::test_parse_fixture","lang":"python"},

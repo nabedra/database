@@ -17,7 +17,7 @@ modules = ["events"]
 [[module]]
 name = "cache"
 level = "L2"
-register = "registers/kv.md"
+register = "registers/cache.md"
 paths = ["server/src/cache/**", "server/src/cache.rs"]
 hot_paths = ["server/src/cache/store/**"]
 
