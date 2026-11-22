@@ -474,22 +474,36 @@ impl QueueCoordinator {
         context: AcceptedContext,
         now_ms: u64,
     ) -> Result<RecordVersion, ProtocolError> {
+        #[cfg(test)]
+        if self
+            .replica
+            .lock()
+            .map_err(|_| QueueError::Unavailable.protocol())?
+            .authority()
+            .view_is_behind(current.ready.view)
+        {
+            super::recovery_tests::observe_o21_stale_proposal(&body);
+        }
+        // The captured snapshot names Control's published view. Wait for the
+        // local queue to install it before any copy phase can start.
+        wait_for_local_ready_view(&self.replica, current)
+            .await
+            .map_err(|error| {
+                // submit_original still proves absence under its UUID gate
+                // and seals the rejection in Status before exposing this.
+                let mut error = error.protocol();
+                error.outcome = Outcome::NotApplied;
+                error
+            })?;
         if self.current().await? != current {
             return Err(QueueError::Stale.protocol());
         }
-        let frame = {
-            let mut replica = self
-                .replica
-                .lock()
-                .map_err(|_| QueueError::Unavailable.protocol())?;
-            #[cfg(test)]
-            if replica.authority() != current {
-                super::recovery_tests::observe_o21_stale_proposal(&body);
-            }
-            replica
-                .propose(current, body, context, now_ms)
-                .map_err(QueueError::protocol)?
-        };
+        let frame = self
+            .replica
+            .lock()
+            .map_err(|_| QueueError::Unavailable.protocol())?
+            .propose(current, body, context, now_ms)
+            .map_err(QueueError::protocol)?;
         let id = frame
             .record_version()
             .map_err(QueueError::protocol)?
