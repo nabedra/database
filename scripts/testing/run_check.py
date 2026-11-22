@@ -46,6 +46,7 @@ ID_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 FIELDS = {
     "id": str, "module": str, "kinds": list, "guarantees": list, "scenarios": list, "tiers": list,
     "command": list, "cwd": str, "timeout_s": int, "needs": list, "result_parser": str, "env": dict,
+    "not_run_marker": str,
 }
 REQUIRED = ("id", "module", "kinds", "guarantees", "tiers", "command", "cwd", "timeout_s", "result_parser")
 
@@ -69,6 +70,7 @@ class Check:
     result_parser: str
     env: dict[str, str] = field(default_factory=dict)
     path: Path | None = None
+    not_run_marker: str | None = None
 
 
 # --------------------------------------------------------------------------------------------
@@ -110,7 +112,7 @@ def parse_check(data: dict, path: Path | None = None, modules: set[str] | None =
         guarantees=str_list("guarantees"), scenarios=str_list("scenarios"), tiers=str_list("tiers"),
         command=str_list("command"), cwd=data["cwd"], timeout_s=data["timeout_s"],
         needs=str_list("needs"), result_parser=data["result_parser"],
-        env=dict(data.get("env", {})), path=path,
+        env=dict(data.get("env", {})), path=path, not_run_marker=data.get("not_run_marker"),
     )
     if not ID_RE.fullmatch(check.id):
         problems.append(f"id {check.id!r} is not kebab-case")
@@ -140,6 +142,10 @@ def parse_check(data: dict, path: Path | None = None, modules: set[str] | None =
         problems.append(f"result_parser must be one of {list(PARSERS)}")
     if not all(isinstance(k, str) and isinstance(v, str) for k, v in check.env.items()):
         problems.append("env values must be strings")
+    if check.not_run_marker is not None and (
+        not check.not_run_marker.strip() or len(check.not_run_marker) > 300
+    ):
+        problems.append("not_run_marker must be a nonblank string of at most 300 characters")
     if problems:
         raise CheckError(f"{path or check.id}: " + "; ".join(problems))
     return check
@@ -277,7 +283,8 @@ PARSER_FUNCS = {
 }
 
 
-def classify(parser: str, output: str, returncode: int | None, timed_out: bool = False) -> tuple[str, Parsed]:
+def classify(parser: str, output: str, returncode: int | None, timed_out: bool = False,
+             not_run_marker: str | None = None) -> tuple[str, Parsed]:
     """Maps a command's output and exit status to (result, counts)."""
     if timed_out:
         parsed = Parsed(0, 0, [], False) if parser == "exit-code" else PARSER_FUNCS[parser](output, 1)
@@ -286,6 +293,8 @@ def classify(parser: str, output: str, returncode: int | None, timed_out: bool =
     if returncode is None:
         return "error", Parsed(0, 0, [{"id": "spawn", "reason": "the command did not start"}], False)
     parsed = PARSER_FUNCS[parser](output, returncode)
+    if returncode == 0 and parsed.failed == 0 and not_run_marker and not_run_marker in output:
+        return "not-run", Parsed(0, 0, [{"id": "output-marker", "reason": not_run_marker}], True)
     if not parsed.found:
         parsed.not_run.append({"id": "parser", "reason": f"no {parser} summary line in the output (exit {returncode})"})
         return "fail", parsed
@@ -374,17 +383,20 @@ def execute(check: Check, *, evidence_dir: Path | None, log_dir: Path, request_i
 
     start = time.monotonic()
     artifacts = []
+    s3_requests = None
     if missing:
         result, parsed = "not-run", Parsed(0, 0, missing, True)
     else:
         log_path = Path(log_dir) / f"{stem}.log"
         code, output, timed_out = run_command(cmd, repo / check.cwd, child_env, check.timeout_s, log_path, echo)
-        result, parsed = classify(check.result_parser, output, code, timed_out)
+        result, parsed = classify(check.result_parser, output, code, timed_out, check.not_run_marker)
+        s3_requests = evidence.parse_s3_requests(output)
         artifacts.append({"name": log_path.name, "sha256": evidence.sha256_file(log_path)})
     record = evidence.new_record(
         check.id, check.kinds, result=result, executed=parsed.executed, failed=parsed.failed,
         not_run=parsed.not_run[:200], guarantees=check.guarantees, scenarios=check.scenarios,
         duration_s=time.monotonic() - start, run=run, artifacts=artifacts, repo=repo,
+        s3_requests=s3_requests,
     )
     path = evidence.write(record, evidence_dir)
     return record, path

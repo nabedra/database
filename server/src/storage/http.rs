@@ -46,6 +46,10 @@ pub struct HttpStore {
     authorization: HeaderValue,
     #[cfg(test)]
     startup_ca_argument: Option<Vec<u8>>,
+    /// Test-only: each queued value is sent once, on the next request, as
+    /// `X-Nabedra-Test-Fault`. Only `local_store.py --test-faults` honours it.
+    #[cfg(test)]
+    test_faults: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
 fn component_path(path: &str) -> bool {
@@ -190,6 +194,8 @@ impl HttpStore {
             authorization,
             #[cfg(test)]
             startup_ca_argument: ca_pem.map(<[u8]>::to_vec),
+            #[cfg(test)]
+            test_faults: Default::default(),
         })
     }
     fn key(&self, key: &str) -> Result<ObjectKey, StorageError> {
@@ -201,13 +207,24 @@ impl HttpStore {
                 .ok_or(StorageError::InvalidPath)?,
         )
     }
+    /// Test-only: send `fault` as `X-Nabedra-Test-Fault` on the next request.
+    #[cfg(test)]
+    pub(crate) fn push_test_fault(&self, fault: &str) {
+        self.test_faults.lock().unwrap().push_back(fault.into());
+    }
     fn request(
         &self,
         method: &str,
         key: &str,
         bytes: Vec<u8>,
     ) -> Result<Request<Full<Bytes>>, StorageError> {
-        Request::builder()
+        let builder = Request::builder();
+        #[cfg(test)]
+        let builder = match self.test_faults.lock().unwrap().pop_front() {
+            Some(fault) => builder.header("X-Nabedra-Test-Fault", fault),
+            None => builder,
+        };
+        builder
             .method(method)
             .uri(format!("{}/v1/objects/{key}", self.base))
             .header(header::AUTHORIZATION, self.authorization.clone())

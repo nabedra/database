@@ -279,23 +279,25 @@ fn evidence_record_round_trips_and_writes_its_file() {
     assert_eq!(v["seeds"]["failing"][0].as_u64(), Some(u64::MAX));
     assert_eq!(v["virtual_hours"], serde_json::Value::Null);
     assert_eq!(v["artifacts"][0]["name"], "history.jsonl");
-    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-    keys.sort();
-    let mut want = vec![
-        "schema", "check", "kind", "guarantees", "scenarios", "sha", "tree_clean", "build", "mode", "run",
-        "duration_s", "result", "assertions", "seeds", "sim_core_hours", "virtual_hours", "artifacts",
-    ];
-    want.sort();
-    assert_eq!(keys, want);
-    let sub = |o: &str| {
-        let mut k: Vec<String> = v[o].as_object().unwrap().keys().cloned().collect();
-        k.sort();
-        k.join(",")
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/testing/evidence/schema.json"
+    )).unwrap();
+    let assert_keys = |value: &serde_json::Value, schema: &serde_json::Value| {
+        let mut actual: Vec<_> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut required: Vec<_> = schema["required"].as_array().unwrap().iter()
+            .map(|key| key.as_str().unwrap())
+            .collect();
+        actual.sort_unstable();
+        required.sort_unstable();
+        assert_eq!(actual, required);
     };
-    assert_eq!(sub("build"), "binary_sha256,features,profile");
-    assert_eq!(sub("run"), "attempt,date,request_id,runner,url");
-    assert_eq!(sub("assertions"), "executed,failed,not_run");
-    assert_eq!(sub("seeds"), "count,failing,range");
+    assert_keys(&v, &schema);
+    let fields = &schema["properties"];
+    for field in ["build", "run", "assertions", "seeds"] {
+        assert_keys(&v[field], &fields[field]);
+    }
+    assert_keys(&v["assertions"]["not_run"][0], &fields["assertions"]["properties"]["not_run"]["items"]);
+    assert_keys(&v["artifacts"][0], &fields["artifacts"]["items"]);
     assert!(Record::from_json(&json.replace("\"tree_clean\"", "\"extra\": 1, \"tree_clean\"")).is_err());
 
     let dir = std::env::temp_dir().join(format!("nabedra-check-evidence-{}", std::process::id()));
@@ -351,15 +353,48 @@ fn evidence_dates_match_the_schema_format() {
         "2026-11-22T24:00:00Z",
         "2026-11-22T00:00:00",
         "2026-11-22T00:00:00+02:60",
+        "2026-11-22T00:00:00+01:00",
+        "2026-11-22T00:00:00-00:00",
         "2026-11-22T00:00:00.Z",
     ] {
         record.run.date = date.into();
         assert!(record.validate().unwrap_err().contains("run.date"), "{date}");
     }
-    for date in ["2024-02-29T00:00:00Z", "2026-11-22t17:05:09.123+01:00"] {
+    for date in ["2024-02-29T00:00:00Z", "2026-11-22t17:05:09.123+00:00"] {
         record.run.date = date.into();
         record.validate().unwrap();
     }
+}
+
+#[test]
+fn evidence_rejects_duplicate_kind_letters() {
+    let mut record = Record::new("check-core", "U S U");
+    record.sha = "a".repeat(40);
+    assert!(record.validate().unwrap_err().contains("kind"));
+    record.kind = "U S".into();
+    record.validate().unwrap();
+}
+
+#[test]
+fn evidence_rejects_invalid_assertion_totals() {
+    let mut record = Record::new("check-core", "U");
+    record.sha = "a".repeat(40);
+    record.result = Outcome::Pass;
+    assert!(record.validate().unwrap_err().contains("zero executed assertions"));
+    record.assertion(true);
+    record.validate().unwrap();
+    record.assertion(false);
+    assert!(record.validate().unwrap_err().contains("pass with failed assertions"));
+    record.assertions.failed = 3;
+    assert!(record.validate().unwrap_err().contains("failed exceeds executed"));
+
+    record.assertions = Default::default();
+    record.result = Outcome::Quarantined;
+    assert!(record.validate().unwrap_err().contains("zero executed"));
+    record.conclude();
+    assert!(record.validate().unwrap_err().contains("at least one reason"));
+    record.not_run("setup", "unavailable");
+    record.validate().unwrap();
 }
 
 #[test]

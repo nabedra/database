@@ -21,6 +21,12 @@ pub mod s3;
 pub use manifest::*;
 #[cfg(feature = "s3")]
 pub use s3::S3Store;
+#[cfg(test)]
+mod commit_protocol_tests;
+#[cfg(test)]
+mod contract_tests;
+#[cfg(test)]
+pub(crate) mod sim;
 use std::{future::Future, pin::Pin};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
@@ -182,11 +188,13 @@ impl From<StorageError> for ObjectAccessError {
 /// absence; incomplete reads must fail rather than return a successful prefix.
 ///
 /// Create atomically succeeds only for an absent key; Match atomically succeeds
-/// only for the supplied current version. Success means durable bytes and a new,
-/// nonempty, non-ABA version, even when replacing a key with identical bytes.
-/// A failed condition returns Conflict without applying the write. Any failure
-/// that may have applied a write must conservatively return Ambiguous. Adapters
-/// must never automatically retry PUT; callers reconcile possibly applied writes.
+/// only for the supplied current version. Success means durable bytes and a
+/// nonempty version. Content-based ETags can repeat for identical bytes, so
+/// callers that need to prevent ABA must write unique content at each revision.
+/// A stale version returns Conflict without applying the write. A missing key
+/// can produce a different refusal. A write that may have applied must return
+/// Ambiguous on failure. Adapters must never automatically retry PUT. Callers
+/// reconcile possibly applied writes.
 ///
 /// Keys are already namespace-qualified by Storage; there is no per-call bucket.
 /// Storage additionally enforces immutable snapshots and namespace validation.

@@ -6,7 +6,7 @@
 //! refuses a record the schema would reject. The Python runners write the same format through
 //! their own stdlib helper.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -153,15 +153,15 @@ impl Record {
         }
     }
 
-    /// Fills `sha` and `run` from the GitHub Actions environment (`GITHUB_SHA`,
-    /// `GITHUB_SERVER_URL`, `GITHUB_REPOSITORY`, `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`,
-    /// `RUNNER_NAME`) and `request_id` from `NABEDRA_REQUEST_ID`. Without `GITHUB_SHA` it asks
-    /// `git` for `HEAD` and whether the tree is clean. Unavailable values leave fields as they are.
+    /// Fills `sha` from `TESTED_SHA`, the checkout's `HEAD`, or `GITHUB_SHA`, in that order.
+    /// Reads tree cleanliness from Git, run metadata from GitHub Actions, and the request ID
+    /// from `NABEDRA_REQUEST_ID`. Unavailable values leave fields as they are.
     pub fn fill_from_env(&mut self) -> &mut Self {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        if let Some(sha) = var("GITHUB_SHA") {
-            self.sha = sha;
-        } else if let Some(sha) = git(&["rev-parse", "HEAD"]) {
+        if let Some(sha) = var("TESTED_SHA")
+            .or_else(|| git(&["rev-parse", "HEAD"]))
+            .or_else(|| var("GITHUB_SHA"))
+        {
             self.sha = sha;
         }
         if let Some(status) = git(&["status", "--porcelain"]) {
@@ -213,8 +213,7 @@ impl Record {
         self.result
     }
 
-    /// Checks the constraints of `docs/testing/evidence/schema.json` that the types do not
-    /// already enforce. `Err` names the first violation.
+    /// Checks the evidence schema and the matrix's assertion rules. `Err` names the first violation.
     pub fn validate(&self) -> Result<(), String> {
         let err = |what: &str, v: &str| Err(format!("evidence {what} {v:?} does not match the schema"));
         if self.schema != SCHEMA {
@@ -223,8 +222,8 @@ impl Record {
         if !is_kebab(&self.check) || self.check.len() > 80 {
             return err("check", &self.check);
         }
-        let kinds: Vec<&str> = self.kind.split(' ').collect();
-        if !kinds.iter().all(|k| k.len() == 1 && "MUSHFDRPK".contains(*k)) {
+        let mut kinds = BTreeSet::new();
+        if !self.kind.split(' ').all(|k| k.len() == 1 && "MUSHFDRPK".contains(k) && kinds.insert(k)) {
             return err("kind", &self.kind);
         }
         if let Some(g) = self.guarantees.iter().find(|g| !is_guarantee(g)) {
@@ -261,7 +260,7 @@ impl Record {
             return err("run.runner", self.run.runner.as_deref().unwrap_or(""));
         }
         if year_month(&self.run.date).is_none() {
-            return err("run.date", &self.run.date);
+            return Err(format!("evidence run.date {:?} must be RFC 3339 UTC", self.run.date));
         }
         let nonneg = |x: f64| x.is_finite() && x >= 0.0;
         if !nonneg(self.duration_s) {
@@ -273,6 +272,24 @@ impl Record {
             }
         }
         let a = &self.assertions;
+        if a.failed > a.executed {
+            return Err("evidence assertions: failed exceeds executed".into());
+        }
+        match self.result {
+            Outcome::Pass if a.executed == 0 => {
+                return Err("evidence result: pass with zero executed assertions".into());
+            }
+            Outcome::Pass if a.failed > 0 => {
+                return Err("evidence result: pass with failed assertions".into());
+            }
+            Outcome::NotRun if a.not_run.is_empty() => {
+                return Err("evidence assertions.not_run: a not-run record needs at least one reason".into());
+            }
+            Outcome::Quarantined if a.executed == 0 => {
+                return Err("evidence result: quarantined with zero executed runs".into());
+            }
+            _ => {}
+        }
         if a.not_run.len() > 200 {
             return err("assertions.not_run length", &a.not_run.len().to_string());
         }
@@ -356,7 +373,7 @@ fn is_guarantee(s: &str) -> bool {
         && prefix.split('-').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_uppercase()))
 }
 
-/// Validates the timestamp using the same date and time bounds as the matrix's evidence reader.
+/// Extracts the calendar month from an RFC 3339 UTC timestamp.
 fn year_month(date: &str) -> Option<(&str, &str)> {
     let [y1, y2, y3, y4, b'-', m1, m2, b'-', d1, d2, b'T' | b't',
         h1, h2, b':', min1, min2, b':', s1, s2, suffix @ ..] = date.as_bytes()
@@ -387,11 +404,8 @@ fn year_month(date: &str) -> Option<(&str, &str)> {
     } else {
         suffix
     };
-    match zone {
-        [b'Z' | b'z'] => {}
-        [b'+' | b'-', h1, h2, b':', m1, m2]
-            if two_digits(*h1, *h2)? <= 23 && two_digits(*m1, *m2)? <= 59 => {}
-        _ => return None,
+    if !matches!(zone, [b'Z' | b'z'] | b"+00:00") {
+        return None;
     }
     Some((&date[..4], &date[5..7]))
 }
