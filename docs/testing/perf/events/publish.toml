@@ -1,0 +1,10 @@
+name = "Events publish p99"
+module = "events"
+command = [
+    "python3.11", "server/events/tests/acceptance.py", "--image", "{bin}",
+    "--cases", "load-1", "--load-events", "96", "--output", "{work}/events.json",
+]
+warmup = 1
+rounds = 6
+metric_file = "events.json"
+metric = '"p99_publish_ms"\s*:\s*(\d+(?:\.\d+)?)'

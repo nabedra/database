@@ -1,0 +1,21 @@
+id = "testing-tools"
+module = "testing"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+command = ["python3", "-c", '''
+import sys
+import unittest
+
+loader = unittest.TestLoader()
+suite = unittest.TestSuite(
+    loader.discover("scripts/testing", pattern=f"test_{tool}.py")
+    for tool in ("ab", "licenses", "pr_lint", "repeat_gate", "triage")
+)
+sys.exit(not unittest.TextTestRunner().run(suite).wasSuccessful())
+''']
+cwd = "."
+timeout_s = 120
+needs = []
+result_parser = "unittest"
