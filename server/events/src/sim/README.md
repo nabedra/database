@@ -137,10 +137,15 @@ At the end:
 Client operations are recorded in the `nabedra-check` JSON-lines format
 (`{"index","type","process","f","key","value","request_id","node","time_ns"}`, with `type`
 one of `invoke`, `ok`, `fail`, `info`). Timeouts and Group errors, including "not
-leader", are `info` (unknown outcome).
+leader", are `info` (unknown outcome), and the next operation uses a fresh process number.
+Publish attempts for the same batch share a request ID. The receipt carries the offsets
+and reports `dedup: true` when the broker inserted no events. Poll and ack events name
+their subscription.
 
-The `nabedra-check` queue checker was not on `main` when this was written, so
-`history.rs` implements the assertions locally:
+The simulator tests replay every seed's JSONL through the `nabedra-check` queue checker.
+The final timestamped `heal` starts a 64.2-second virtual redelivery window, which allows
+for convergence, lease expiry and the final drain. `history.rs` also checks the history
+against the replicas' final log:
 
 | Anomaly | Guarantee |
 | --- | --- |
@@ -160,8 +165,9 @@ Test-only knobs (`Knobs`), compiled only with the feature. Each test searches se
 | Knob | Where | Expected detection |
 | --- | --- | --- |
 | `ack_unreachable_appends` | `raft/network.rs`: an unreachable follower's append counts as acknowledged | `MajorityReachedHighWatermark` |
-| `reuse_offset_after_dedup` | `partition/events.rs`: a dedup hit rewinds the offset counter | `duplicate-offset`, `offset-reassigned` |
+| `reuse_offset_after_dedup` | `partition/events.rs`: a dedup hit rewinds the offset counter | Queue checker `duplicate-offset` or `duplicate-event` |
 | `lose_fsynced_on_restart` | the harness restarts a broker from its volume as of its previous start | `MonotonicEpoch` and others |
+| `delay_redelivery_after_heal` | the final consumer starts polling after the redelivery deadline | Queue checker `redelivery-missing` |
 
 The checkers also have direct tests on known-bad inputs (`sim::tests::checkers`): one
 fixture per history anomaly, and synthetic observations for each Kafka invariant.

@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from .history import Event, HistoryWriter, pair_operations, read_jsonl
+from .history import Event, HistoryWriter, NEMESIS, pair_operations, read_jsonl
 
 
 class HistoryTests(unittest.TestCase):
@@ -43,3 +43,18 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(len(pair_operations(nemesis)), 2)
         with self.assertRaisesRegex(ValueError, "without invoke"):
             pair_operations([Event(0, "ok", 2, "read")])
+
+    def test_legacy_index_and_process_are_normalized(self):
+        events = list(read_jsonl([
+            '{"index":8,"type":"invoke","process":"+3","f":"get","key":42}',
+            '\n',
+            '{"type":"ok","process":"nemesis","f":"heal","time_ns":100}',
+            '{"index":null,"type":"unknown","process":3,"f":"get","key":"42"}',
+        ]))
+        self.assertEqual(events, [
+            Event(8, "invoke", 3, "get", key="42"),
+            Event(1, "ok", NEMESIS, "heal", time_ns=100),
+            Event(2, "info", 3, "get", key="42"),
+        ])
+        operation, = pair_operations(events)
+        self.assertEqual(operation.completion, events[2])
