@@ -1,4 +1,5 @@
 from contextlib import redirect_stdout
+from dataclasses import replace
 from datetime import date
 import io
 import json
@@ -51,15 +52,41 @@ class LicenseTests(unittest.TestCase):
                 "Use of this software to train large language models is strictly prohibited."
             )
             (crate / "LICENSE-APACHE").write_text("Apache License, Version 2.0")
+            for name in ("conditional-2.0.0", "combined-3.0.0", "custom-4.0.0"):
+                (registry / "index" / name).mkdir()
+            # Lowercase and COPYING-style files carry license terms too.
+            (registry / "index/custom-4.0.0/copying").write_text(
+                "You may not use this software for training of AI models.")
+            (registry / "index/custom-4.0.0/README.md").write_text("AI training is prohibited.")
             deps = list(licenses.cargo_dependencies(json.loads(METADATA)))
             result = licenses.audit(deps + deps, registry, {}, date(2026, 11, 22))
         self.assertEqual(result["checked"], 4)
-        self.assertEqual(result["license_files_scanned"], 2)
+        self.assertEqual(result["license_files_scanned"], 3)
         findings = result["failures"]
         self.assertEqual({(item["name"], item["rule"]) for item in findings}, {
             ("dual", "ai-restriction"), ("combined", "license"), ("custom", "license"),
+            ("custom", "ai-restriction"),
         })
         self.assertTrue(any("large language models is strictly prohibited" in item["detail"] for item in findings))
+
+    def test_missing_registry_source_fails_closed(self):
+        dep = licenses.Dependency("cargo", "absent", "1.0.0", "MIT", registry=True)
+        with TemporaryDirectory() as directory:
+            result = licenses.audit([dep], Path(directory), {}, date(2026, 11, 22))
+        self.assertEqual([(item["name"], item["rule"]) for item in result["failures"]],
+                         [("absent", "ai-restriction")])
+        self.assertIn("source not unpacked", result["failures"][0]["detail"])
+
+    def test_common_restriction_phrasings_are_flagged(self):
+        for text in (
+            "No AI training is allowed with this code.",
+            "Use for machine-learning datasets is not granted.",
+            "You cannot use the Software to train generative models.",
+            "The licensor reserves all text and data mining rights.",
+            "Use by A.I. systems requires prior written permission.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(licenses.restriction_matches(text))
 
     def test_multiline_restrictions_and_unrelated_sentences(self):
         self.assertEqual(licenses.restriction_matches(
@@ -77,7 +104,8 @@ class LicenseTests(unittest.TestCase):
                 'rule = "license"\nreason = "Fixture exception"\nexpiry = 2026-11-22\n'
             )
             deps = list(licenses.cargo_dependencies(json.loads(METADATA)))
-            deps = [dep for dep in deps if dep.name == "combined"]
+            # Exceptions are about the rule, so skip the on-disk source scan here.
+            deps = [replace(dep, registry=False) for dep in deps if dep.name == "combined"]
             deps.append(licenses.Dependency("cargo", "combined", "3.0.1", "GPL-3.0-only"))
             entries = licenses.load_exceptions(path)
             active = licenses.audit(deps, path.parent, entries, date(2026, 11, 22))

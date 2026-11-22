@@ -23,13 +23,19 @@ ALLOWED = {
 SPDX_TOKEN = re.compile(r"[^\s()]+|[()]")
 SPDX_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:-]*\+?")
 AI_TERMS = re.compile(
-    r"\b(?:artificial intelligence|machine learning|train(?:s|ed|ing)?|"
-    r"AI(?:[- ]assisted)?|large language models?|LLMs?)\b", re.I,
+    r"\b(?:artificial[- ]intelligence|machine[- ]learning|deep[- ]learning|neural networks?|"
+    r"train(?:s|ed|ing)?|generative|A\.I\.|AI(?:[- ]assisted|[- ]generated)?|ML|"
+    r"(?:large )?language models?|LLMs?|text and data mining)(?![A-Za-z])", re.I,
 )
 RESTRICTION_TERMS = re.compile(
-    r"\b(?:prohibit(?:s|ed|ion)?|restrict(?:s|ed|ion|ions)?|"
-    r"not (?:permitted|allowed)|must not|may not|shall not|forbidden)\b", re.I,
+    r"\b(?:prohibit(?:s|ed|ion)?|restrict(?:s|ed|ion|ions)?|forbid(?:s|den)?|ban(?:s|ned)?|"
+    r"not (?:be )?(?:permitted|allowed|granted|licensed|authori[sz]ed)|"
+    r"(?:must|may|shall|will|do|does|can) not|cannot|can't|no (?:right|permission|license|licence)|"
+    r"(?:without|requir(?:e|es|ed|ing)) (?:the )?(?:prior |express |explicit )*(?:written )?(?:permission|consent)|"
+    r"exclud(?:e|es|ed|ing)|except|opt(?:s|ed)?[- ]out|reserv(?:e|es|ed)|no)\b", re.I,
 )
+# File names, compared case-insensitively, that carry a crate's license terms.
+LICENSE_FILES = ("LICENSE", "LICENCE", "COPYING", "UNLICENSE", "NOTICE", "COPYRIGHT")
 RULES = {"license", "ai-restriction"}
 
 
@@ -106,7 +112,8 @@ def license_allowed(expression):
 
 
 def restriction_matches(text):
-    normalized = " ".join(text.split())
+    # Spell A.I. as AI so its periods do not read as sentence ends.
+    normalized = re.sub(r"\bA\.I\.", "AI", " ".join(text.split()), flags=re.I)
     restrictions = list(RESTRICTION_TERMS.finditer(normalized))
     matches = set()
     for ai in AI_TERMS.finditer(normalized):
@@ -189,9 +196,15 @@ def audit(dependencies, registry_src, exceptions, today):
                 dep.ecosystem, dep.name, dep.version, "license",
                 dep.license or "missing license expression",
             ))
-        if dep.registry:
-            for path in sorted(registry_src.glob(f"*/{dep.name}-{dep.version}/LICENSE*")):
-                if not path.is_file():
+        if dep.registry and not any(registry_src.glob(f"*/{dep.name}-{dep.version}")):
+            # Fail closed: a missing source means its license files were never scanned.
+            findings.append(Finding(
+                dep.ecosystem, dep.name, dep.version, "ai-restriction",
+                f"source not unpacked under {registry_src}; run cargo fetch",
+            ))
+        elif dep.registry:
+            for path in sorted(registry_src.glob(f"*/{dep.name}-{dep.version}/*")):
+                if not path.is_file() or not path.name.upper().startswith(LICENSE_FILES):
                     continue
                 report["license_files_scanned"] += 1
                 text = path.read_text(encoding="utf-8", errors="replace")

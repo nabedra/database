@@ -1,5 +1,6 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -69,19 +70,35 @@ class TriageTests(unittest.TestCase):
 
     def test_reads_only_recent_executed_records_for_the_check(self):
         today = date(2026, 11, 22)
+        old = (today - timedelta(days=14)).isoformat()
         cases = [
-            ("probe", "pass", today.isoformat()),
-            ("probe", "fail", {"date": f"{today - timedelta(days=13)}T19:30:00Z"}),
-            ("probe", "fail", (today - timedelta(days=14)).isoformat()),
-            ("probe", "fail", (today + timedelta(days=1)).isoformat()),
-            ("probe", "not-run", today.isoformat()),
-            ("probe", "quarantined", today.isoformat()),
-            ("different", "fail", today.isoformat()),
-            ("probe", "fail", {"request_id": "legacy-123456"}),
+            ("probe", "pass", {"run": today.isoformat()}),
+            ("probe", "fail", {"run": {"date": f"{today - timedelta(days=13)}T19:30:00Z"}}),
+            ("probe", "fail", {"run": old}),
+            ("probe", "fail", {"run": (today + timedelta(days=1)).isoformat()}),
+            ("probe", "not-run", {"run": today.isoformat()}),
+            ("probe", "quarantined", {"run": today.isoformat()}),
+            ("different", "fail", {"run": today.isoformat()}),
+            # Records without run.date fall back to finished_at, then started_at.
+            ("probe", "pass", {"run": {"request_id": "r-1", "finished_at": f"{today}T01:00:00+00:00"}}),
+            ("probe", "pass", {"run": {"request_id": "r-2"}, "finished_at": f"{old}T23:00:00Z"}),
+            ("probe", "fail", {"run": {"request_id": "r-3"}, "started_at": f"{today}T02:00:00Z"}),
         ]
         with TemporaryDirectory() as directory:
             root = Path(directory) / "2026/11"
             root.mkdir(parents=True)
-            for number, (check, result, run) in enumerate(cases):
-                (root / f"{number}.json").write_text(json.dumps(dict(check=check, result=result, run=run)))
-            self.assertEqual(triage.baseline(Path(directory), "probe", today), (1, 2))
+            for number, (check, result, extra) in enumerate(cases):
+                (root / f"{number}.json").write_text(json.dumps(dict(check=check, result=result, **extra)))
+            self.assertEqual(triage.baseline(Path(directory), "probe", today), (2, 4))
+
+    def test_undated_records_fall_back_to_file_mtime_instead_of_blocking(self):
+        today = date(2026, 11, 22)
+        with TemporaryDirectory() as directory:
+            recent, stale = Path(directory) / "recent.json", Path(directory) / "stale.json"
+            for path in (recent, stale):
+                path.write_text(json.dumps({"check": "probe", "result": "pass",
+                                            "run": {"request_id": path.stem}}))
+            for path, day in ((recent, today), (stale, today - timedelta(days=14))):
+                stamp = datetime(day.year, day.month, day.day, 12, tzinfo=timezone.utc).timestamp()
+                os.utime(path, (stamp, stamp))
+            self.assertEqual(triage.baseline(Path(directory), "probe", today), (1, 1))

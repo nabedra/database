@@ -47,16 +47,31 @@ def crash_signature(returncode, log):
     return match.group().strip() if match else None
 
 
-def record_date(run):
-    if isinstance(run, dict):
-        run = run.get("date")
-    if not isinstance(run, str):
-        raise ValueError("expected an ISO date in run or run.date")
+DATE_FIELDS = ("date", "finished_at", "started_at")
+
+
+def parse_date(value):
     try:
-        return date.fromisoformat(run)
+        return date.fromisoformat(value)
     except ValueError:
-        stamp = datetime.fromisoformat(run)
+        stamp = datetime.fromisoformat(value)
         return stamp.astimezone(timezone.utc).date() if stamp.tzinfo else stamp.date()
+
+
+def record_date(record, path):
+    """Date a record from run.date, then run or top-level finished_at or started_at, then mtime.
+
+    The evidence schema may not carry run.date yet. The file's mtime is the last
+    resort: a fresh checkout resets it, so such records count as recent.
+    """
+    run = record.get("run")
+    if isinstance(run, str):
+        return parse_date(run)
+    for source in (run if isinstance(run, dict) else {}, record):
+        for field in DATE_FIELDS:
+            if isinstance(source.get(field), str):
+                return parse_date(source[field])
+    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).date()
 
 
 def baseline(directory, check, today):
@@ -67,10 +82,7 @@ def baseline(directory, check, today):
             record = json.loads(path.read_text(encoding="utf-8"))
             if record.get("check") != check or record.get("result") not in {"pass", "fail"}:
                 continue
-            run = record["run"]
-            if isinstance(run, dict) and "request_id" in run and "date" not in run:
-                continue  # Earlier evidence records have no usable run date.
-            if first_day <= record_date(run) <= today:
+            if first_day <= record_date(record, path) <= today:
                 runs += 1
                 passes += record["result"] == "pass"
         except (ValueError, KeyError, AttributeError, TypeError) as error:
@@ -107,7 +119,8 @@ def triage(kind, returncode, log, get_baseline, rerun):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Use ISO dates in run or run.date. Only dated pass/fail records and fresh retries count.",
+        epilog="Records are dated by run.date, finished_at or started_at, else file mtime. "
+               "Only pass/fail records and fresh retries count.",
     )
     parser.add_argument("--kind", required=True, help="check kind or space-separated kinds (only R retries)")
     parser.add_argument("--check", required=True, help="check ID in the evidence records")
