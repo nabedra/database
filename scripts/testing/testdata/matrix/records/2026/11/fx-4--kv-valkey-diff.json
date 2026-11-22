@@ -1,0 +1,39 @@
+{
+  "artifacts": [],
+  "assertions": {
+    "executed": 0,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "need:s3",
+        "reason": "s3-unconfigured: NABEDRA_TEST_S3_BUCKET is unset"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "kv-valkey-diff",
+  "duration_s": 1.5,
+  "guarantees": [
+    "KV-G02"
+  ],
+  "kind": "D",
+  "mode": null,
+  "result": "not-run",
+  "run": {
+    "attempt": null,
+    "request_id": "fx-4",
+    "runner": "fixture",
+    "url": null
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "@HEAD",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

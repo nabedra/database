@@ -1,0 +1,35 @@
+{
+  "artifacts": [],
+  "assertions": {
+    "executed": 10,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "kv-unit",
+  "duration_s": 1.5,
+  "guarantees": [
+    "KV-G01",
+    "EVT-G01"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "request_id": "fx-1",
+    "runner": "fixture",
+    "url": "https://github.com/example/repo/actions/runs/1"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "@HEAD",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

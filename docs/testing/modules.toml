@@ -1,0 +1,432 @@
+# Path-to-module map for check selection, the coverage matrix and the nightly budget.
+#
+# Rules:
+# - A path belongs to every module whose `paths` glob matches it and whose `exclude` globs do not.
+#   Shared server files map to both `oltp` and `olap`, so a change to them selects both.
+# - A path that matches no module belongs to the `fallback` module (`misc`). `matrix.py select`
+#   treats a `misc` path as "run every T1 check", because nothing narrower is known to be safe.
+# - Globs are relative to the repository root. `**` matches any number of directories (including
+#   none), `*` matches within one path segment, and `?` matches one character.
+# - `register` names the module's guarantee register. Several modules may share one register.
+# - `level` is the assurance level (plan revision 2, "Three assurance levels"): L1, L2 or L3.
+# - `hot_paths` are the globs whose changes require paired A/B performance runs in T1.
+# - `matrix.py lint` checks this file: every test file must match a module, every module named by
+#   a check must exist, and nightly shares must add up to 100.
+
+schema = "nabedra.modules/1"
+fallback = "misc"
+
+[nightly]
+core_hours = 160
+
+# The nightly simulation and fuzzing budget is split by risk. Each pool's share is a percentage of
+# `core_hours`; the modules in a pool share its hours. Change the shares as bug rates change.
+[[nightly.pool]]
+name = "oltp"
+share = 60
+modules = ["oltp", "lsm"]
+
+[[nightly.pool]]
+name = "events"
+share = 15
+modules = ["events"]
+
+[[nightly.pool]]
+name = "kv"
+share = 15
+modules = ["kv"]
+
+[[nightly.pool]]
+name = "olap"
+share = 10
+modules = ["olap", "olap-stream", "scheduler"]
+
+[[module]]
+name = "oltp"
+level = "L3"
+register = "docs/testing/guarantees/oltp.md"
+paths = [
+  "server/src/oltp/**",
+  "server/src/oltp.rs",
+  "server/src/oltp_*/**",
+  "server/src/oltp_*.rs",
+  "server/src/migration_interchange.rs",
+  # Shared server entry points: both engines link them.
+  "server/src/lib.rs",
+  "server/src/main.rs",
+  "server/src/api.rs",
+  "server/src/api/control.rs",
+  "server/src/api/health.rs",
+  "server/src/api/response.rs",
+  "server/src/aws_http.rs",
+  "server/src/cli.rs",
+  "server/src/config.rs",
+  "server/src/executor.rs",
+  "server/src/maintenance.rs",
+  "server/src/network.rs",
+  "server/src/protocol.rs",
+  "server/src/query_semantics.rs",
+  "server/src/response.rs",
+  "server/src/runtime.rs",
+  "server/src/supervisor.rs",
+  "server/tests/oltp_*",
+  "server/tests/oltp_*/**",
+  "server/tests/test_oltp_*.py",
+  "server/tests/api.rs",
+  "server/tests/cli.rs",
+  "server/tests/config.rs",
+  "server/tests/executor.rs",
+  "server/tests/fenced_requests.rs",
+  "server/tests/health.rs",
+  "server/tests/harness_ports.py",
+  "server/tests/kv_crash.rs",
+  "server/tests/protocol.rs",
+  "server/tests/rename_compatibility.rs",
+  "server/tests/response.rs",
+  "server/tests/runtime.rs",
+  "server/tests/startup.rs",
+  "server/tests/support/**",
+  "server/tests/capture_worker_queue_evidence.py",
+  "server/tests/render_*.py",
+  "server/tests/direct_off_server.sh",
+  "server/examples/**",
+  "scripts/*oltp*",
+  "scripts/acceptance_support.py",
+  "scripts/test_acceptance_support.py",
+  "scripts/acceptance_cancellation.py",
+  "scripts/test_acceptance_cancellation.py",
+  "scripts/acceptance_concurrency.py",
+  "scripts/acceptance_http.py",
+  "scripts/acceptance_latency.py",
+  "scripts/acceptance_lifecycle.py",
+  "scripts/test_lifecycle_cleanup.py",
+  "scripts/acceptance_nabedra.py",
+  "scripts/acceptance_nodes.py",
+  "scripts/acceptance_partitions.py",
+  "scripts/acceptance_providers.py",
+  "scripts/acceptance_cli_serverless.py",
+  "scripts/acceptance_serverless_s3.py",
+  "scripts/test_acceptance_serverless_s3.py",
+  "scripts/server_process.py",
+  "scripts/test_server_process.py",
+  "scripts/test_tls_material.py",
+  "scripts/gateway_host_fixture.py",
+  "scripts/install_nabedra.py",
+  "scripts/local-kind/**",
+  "scripts/benchmark_scylla*",
+  "scripts/benchmark_scylla/**",
+  "scripts/check_engine_features.py",
+]
+hot_paths = [
+  "server/src/oltp_runtime/direct/**",
+  "server/src/oltp_runtime/worker_runtime/**",
+  "server/src/oltp_runtime/transaction/**",
+  "server/src/oltp/mvcc/**",
+  "server/src/oltp/pool/**",
+  "server/src/oltp/codec.rs",
+  "server/src/oltp_replication/typed_log/**",
+  "server/src/oltp_replication/multiplex/**",
+  "server/src/protocol.rs",
+]
+
+[[module]]
+name = "olap"
+level = "L2"
+register = "docs/testing/guarantees/olap.md"
+paths = [
+  "server/src/engine.rs",
+  "server/src/engine/**",
+  "server/src/storage.rs",
+  "server/src/storage/**",
+  "server/src/snapshot.rs",
+  "server/src/snapshot/**",
+  "server/src/commit.rs",
+  "server/src/olap_export.rs",
+  "server/src/partition_size.rs",
+  "server/src/node/**",
+  "server/src/cluster/**",
+  # Shared server entry points: both engines link them.
+  "server/src/lib.rs",
+  "server/src/main.rs",
+  "server/src/api.rs",
+  "server/src/api/**",
+  "server/src/aws_http.rs",
+  "server/src/cli.rs",
+  "server/src/config.rs",
+  "server/src/executor.rs",
+  "server/src/maintenance.rs",
+  "server/src/migration_interchange.rs",
+  "server/src/network.rs",
+  "server/src/protocol.rs",
+  "server/src/query_semantics.rs",
+  "server/src/response.rs",
+  "server/src/runtime.rs",
+  "server/src/supervisor.rs",
+  "server/tests/commit.rs",
+  "server/tests/control_*.rs",
+  "server/tests/decision.rs",
+  "server/tests/engine_*.rs",
+  "server/tests/history.rs",
+  "server/tests/http_store.rs",
+  "server/tests/node_*.rs",
+  "server/tests/publication.rs",
+  "server/tests/snapshot.rs",
+  "server/tests/storage.rs",
+  "server/tests/olap_*.rs",
+  "server/tests/logic/**",
+  "server/tests/api.rs",
+  "server/tests/cli.rs",
+  "server/tests/config.rs",
+  "server/tests/protocol.rs",
+  "server/tests/response.rs",
+  "server/tests/runtime.rs",
+  "server/tests/startup.rs",
+  "server/tests/support/**",
+  "scripts/local_store.py",
+  "scripts/test_local_store.py",
+  "scripts/testing/s3/**",
+  "scripts/acceptance_nabedra.py",
+  "scripts/acceptance_nodes.py",
+  "scripts/acceptance_partitions.py",
+  "scripts/acceptance_http.py",
+  "scripts/acceptance_providers.py",
+  "scripts/acceptance_serverless_s3.py",
+  "scripts/test_acceptance_serverless_s3.py",
+  "scripts/check_engine_features.py",
+]
+hot_paths = [
+  "server/src/engine/query.rs",
+  "server/src/engine/read.rs",
+  "server/src/engine/partition.rs",
+  "server/src/snapshot.rs",
+  "server/src/snapshot/**",
+  "server/src/query_semantics.rs",
+  "server/src/node/payload/**",
+]
+
+[[module]]
+name = "olap-stream"
+level = "L2"
+register = "docs/testing/guarantees/olap-stream.md"
+paths = [
+  "server/src/engine/stream/**",
+  "server/src/api/stream.rs",
+  "server/src/node/stream.rs",
+  "server/src/node/stream/**",
+  "server/src/node/payload_stream.rs",
+  "server/src/node/payload_stream/**",
+  "server/src/snapshot/stream.rs",
+  "scripts/acceptance_olap_stream*.py",
+  "scripts/benchmark_olap_streaming.py",
+  "orm/python/src/nabedra/stream.py",
+  "orm/python/src/nabedra/_stream_transport.py",
+  "orm/python/tests/test_streaming.py",
+  "orm/typescript/src/stream.ts",
+  "orm/typescript/src/streamTransport.ts",
+  "orm/typescript/src/public/stream.ts",
+  "orm/typescript/tests/stream.test.mjs",
+  "orm/typescript/tests/liveStream.test.mjs",
+]
+hot_paths = [
+  "server/src/engine/stream/encoding.rs",
+  "server/src/node/stream/wire.rs",
+  "server/src/snapshot/stream.rs",
+]
+
+[[module]]
+name = "scheduler"
+level = "L1"
+register = "docs/testing/guarantees/scheduler.md"
+paths = [
+  "server/src/request_queue.rs",
+  "server/src/request_queue/**",
+  "server/src/scheduling.rs",
+  "server/src/scheduling/**",
+  "server/src/worker_pool.rs",
+  "server/src/node/admission.rs",
+  "server/src/node/admission/**",
+  "server/src/node/coordinator.rs",
+  "server/src/node/coordinator/**",
+  "server/src/node/queue_runtime.rs",
+  "server/src/node/queue_transport.rs",
+  "server/src/cluster/store/scheduler.rs",
+  "server/tests/worker_pool.rs",
+  "server/tests/queued_api.rs",
+  "server/tests/queue_catalog_events.rs",
+  "server/tests/oltp_worker_queue.rs",
+  "server/tests/oltp_worker_memory.py",
+  "server/examples/resource_scheduler_benchmark.rs",
+  "scripts/acceptance_scheduler*.py",
+  "scripts/*scheduler*",
+  "scripts/ci_repeat_tests.py",
+]
+hot_paths = [
+  "server/src/scheduling.rs",
+  "server/src/request_queue.rs",
+  "server/src/worker_pool.rs",
+]
+
+[[module]]
+name = "kv"
+level = "L2"
+register = "docs/testing/guarantees/kv.md"
+paths = [
+  "server/src/cache.rs",
+  "server/src/cache/**",
+  "server/tests/data/valkey-commands/**",
+  "orm/python/src/nabedra/cache.py",
+  "orm/python/src/nabedra/_cache_wire.py",
+  "orm/python/tests/test_cache*.py",
+  "orm/typescript/src/cache.ts",
+  "orm/typescript/src/cacheWire.ts",
+  "orm/typescript/tests/cache*.test.*",
+  "orm/cache-contract/**",
+  "scripts/cache-acceptance/**",
+  "scripts/cache-benchmark/**",
+  "scripts/cache-ec2/**",
+  "scripts/cache-release",
+  "scripts/cache-release/**",
+  "docs/cache/**",
+  "docs/testing/kv-conformance/**",
+]
+hot_paths = [
+  "server/src/cache/store.rs",
+  "server/src/cache/store/**",
+  "server/src/cache/wire.rs",
+  "server/src/cache/wire/**",
+  "server/src/cache/command.rs",
+  "server/src/cache/command/**",
+  "server/src/cache/listener.rs",
+  "server/src/cache/cluster/worker/**",
+]
+
+[[module]]
+name = "events"
+level = "L2"
+register = "docs/testing/guarantees/events.md"
+paths = [
+  "server/events/**",
+  "orm/python/src/nabedra/events/**",
+  "orm/python/tests/events/**",
+  "orm/typescript/src/events/**",
+  "orm/typescript/tests/events.test.mjs",
+]
+hot_paths = [
+  "server/events/src/partition.rs",
+  "server/events/src/partition/**",
+  "server/events/src/raft/**",
+  "server/events/src/http.rs",
+  "server/events/src/http/**",
+]
+
+[[module]]
+name = "orm-python"
+level = "L1"
+register = "docs/testing/guarantees/orm.md"
+paths = [
+  "orm/python/**",
+]
+hot_paths = [
+  "orm/python/src/nabedra/_http_pool.py",
+  "orm/python/src/nabedra/client.py",
+]
+
+[[module]]
+name = "orm-typescript"
+level = "L1"
+register = "docs/testing/guarantees/orm.md"
+paths = [
+  "orm/typescript/**",
+  "orm/api-manifest.json",
+  "scripts/testing/api_manifest.py",
+  "scripts/testing/test_api_manifest.py",
+]
+hot_paths = [
+  "orm/typescript/src/transport.ts",
+  "orm/typescript/src/client.ts",
+]
+
+[[module]]
+name = "lsm"
+level = "L3"
+register = "docs/testing/guarantees/oltp.md"
+paths = [
+  "server/kv/**",
+]
+hot_paths = [
+  "server/kv/src/memtable/**",
+  "server/kv/src/journal/**",
+  "server/kv/src/run/**",
+  "server/kv/src/iter/**",
+  "server/kv/src/coding.rs",
+]
+
+[[module]]
+name = "check"
+level = "L1"
+paths = [
+  "server/check/**",
+]
+hot_paths = []
+
+[[module]]
+name = "sim"
+level = "L1"
+paths = [
+  "server/sim/**",
+  "server/rt/**",
+  "server/check/src/sim/**",
+]
+hot_paths = []
+
+[[module]]
+name = "fuzz"
+level = "L1"
+paths = [
+  "server/fuzz/**",
+]
+hot_paths = []
+
+[[module]]
+name = "testing"
+level = "L1"
+paths = [
+  "scripts/testing/**",
+  "docs/testing/**",
+]
+exclude = [
+  "docs/testing/kv-conformance/**",
+]
+hot_paths = []
+
+[[module]]
+name = "ci"
+level = "L1"
+paths = [
+  ".github/**",
+  "scripts/ci_*.py",
+  "scripts/test_ci_*.py",
+  "scripts/testing/ci/**",
+]
+hot_paths = []
+
+[[module]]
+name = "docs"
+level = "L1"
+paths = [
+  "**/*.md",
+  "docs/**",
+  "plans/**",
+  "server/notes/**",
+  "scripts/notes/**",
+  "orm/python/notes/**",
+  "orm/python/docs/**",
+  "server/docs/**",
+  ".agents/**",
+  "LICENSE",
+  "**/LICENSE",
+]
+exclude = [
+  "docs/testing/**",
+]
+hot_paths = []

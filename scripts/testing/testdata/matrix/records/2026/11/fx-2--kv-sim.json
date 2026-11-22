@@ -1,0 +1,34 @@
+{
+  "artifacts": [],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "kv-sim",
+  "duration_s": 1.5,
+  "guarantees": [
+    "KV-G01"
+  ],
+  "kind": "S H",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": null,
+    "request_id": "fx-2",
+    "runner": "fixture",
+    "url": null
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "@HEAD~2",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

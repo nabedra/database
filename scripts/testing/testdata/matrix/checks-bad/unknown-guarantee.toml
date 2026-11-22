@@ -1,0 +1,11 @@
+id = "unknown-guarantee"
+module = "kv"
+kinds = ["U"]
+guarantees = ["KV-G99"]
+scenarios = []
+tiers = ["T1"]
+command = ["true"]
+cwd = "."
+timeout_s = 10
+needs = []
+result_parser = "exit-code"
