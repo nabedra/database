@@ -1,0 +1,11 @@
+id = "licenses"
+module = "testing"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T1", "T2"]
+command = ["python3", "scripts/testing/licenses.py"]
+cwd = "."
+timeout_s = 300
+needs = []
+result_parser = "exit-code"
