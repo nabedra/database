@@ -130,10 +130,34 @@ impl<M: Model> Outcome<M> {
                     "violated: {invariant}\ntrace ({} steps):\n",
                     trace.len().saturating_sub(1)
                 );
-                for (i, (action, state)) in trace.iter().enumerate() {
-                    match action {
-                        None => s.push_str(&format!("  {i:>3}. init\n       {state:?}\n")),
-                        Some(a) => s.push_str(&format!("  {i:>3}. {a:?}\n       {state:?}\n")),
+                // A run of three or more identical actions (such as clock ticks) is
+                // printed once with its count and the state after the run.
+                let mut i = 0;
+                while i < trace.len() {
+                    let (action, state) = &trace[i];
+                    let Some(a) = action else {
+                        s.push_str(&format!("  {i:>3}. init\n       {state:?}\n"));
+                        i += 1;
+                        continue;
+                    };
+                    let label = format!("{a:?}");
+                    let mut j = i + 1;
+                    while j < trace.len()
+                        && trace[j].0.as_ref().is_some_and(|b| format!("{b:?}") == label)
+                    {
+                        j += 1;
+                    }
+                    if j - i >= 3 {
+                        let last = &trace[j - 1].1;
+                        s.push_str(&format!(
+                            "  {i:>3}-{:<3} {label} x{}\n       {last:?}\n",
+                            j - 1,
+                            j - i
+                        ));
+                        i = j;
+                    } else {
+                        s.push_str(&format!("  {i:>3}. {label}\n       {state:?}\n"));
+                        i += 1;
                     }
                 }
                 s
@@ -346,6 +370,33 @@ mod tests {
             explore(&Counter { limit: 10, bad: None }, 10),
             Outcome::LimitReached(_)
         ));
+    }
+
+    #[test]
+    fn report_collapses_repeated_actions() {
+        let out = explore(&Counter { limit: 20, bad: Some(5) }, 1_000);
+        let report = out.report();
+        // Shortest path to 5 is 1, 1, 3 (BFS tries +1 first): no run of three.
+        assert!(report.contains("trace (3 steps)"), "{report}");
+        struct Ticks;
+        impl Model for Ticks {
+            type State = u8;
+            type Action = &'static str;
+            fn init_states(&self) -> Vec<u8> {
+                vec![0]
+            }
+            fn actions(&self, _: &u8, out: &mut Vec<&'static str>) {
+                out.push("Tick");
+            }
+            fn next_state(&self, s: &u8, _: &&'static str) -> Option<u8> {
+                Some(s + 1)
+            }
+            fn check(&self, s: &u8) -> Result<(), String> {
+                if *s == 10 { Err("ten".into()) } else { Ok(()) }
+            }
+        }
+        let report = explore(&Ticks, 100).report();
+        assert!(report.contains("1-10  \"Tick\" x10"), "{report}");
     }
 
     #[test]
