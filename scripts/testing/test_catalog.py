@@ -82,6 +82,11 @@ class ScanTests(unittest.TestCase):
                                "orm/python/tests/test_a.py::ATests::test_one",
                                "orm/python/tests/test_a.py::ATests::test_two"])
         self.assertEqual(catalog.scan_file("orm/python/tests/helper.py", PY), [])
+        before = catalog.scan_file("test_a.py", PY)
+        after = catalog.scan_file("test_a.py", PY.replace("    def test_one(", '    @unittest.skip("déjà vu")\n    def test_one('))
+        self.assertEqual([row["hash"] for row in (before[0], before[2])],
+                         [row["hash"] for row in (after[0], after[2])])
+        self.assertNotEqual(before[1]["hash"], after[1]["hash"])
 
     def test_node(self):
         ids = [e["id"].split("::", 1)[1] for e in catalog.scan_file("orm/typescript/tests/a.test.mjs", NODE)]

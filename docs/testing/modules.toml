@@ -325,6 +325,10 @@ level = "L1"
 register = "docs/testing/guarantees/orm.md"
 paths = [
   "orm/python/**",
+  "orm/contract/**",
+  "orm/api-manifest.json",
+  "scripts/testing/api_manifest.py",
+  "scripts/testing/test_api_manifest.py",
 ]
 hot_paths = [
   "orm/python/src/nabedra/_http_pool.py",
@@ -337,6 +341,7 @@ level = "L1"
 register = "docs/testing/guarantees/orm.md"
 paths = [
   "orm/typescript/**",
+  "orm/contract/**",
   "orm/api-manifest.json",
   "scripts/testing/api_manifest.py",
   "scripts/testing/test_api_manifest.py",

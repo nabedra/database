@@ -100,13 +100,18 @@ def scan_python(path: str, src: str) -> list[dict]:
     except SyntaxError:
         return []
     out = []
+    lines = src.encode("utf-8").splitlines(keepends=True)
 
     def visit(node: ast.AST, prefix: str) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.ClassDef):
                 visit(child, f"{prefix}::{child.name}")
             elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name.startswith("test"):
-                out.append({"id": f"{prefix}::{child.name}", "body": ast.get_source_segment(src, child) or child.name})
+                first = child.decorator_list[0].lineno if child.decorator_list else child.lineno
+                segment = lines[first - 1:child.end_lineno]
+                segment[-1] = segment[-1][:child.end_col_offset]
+                segment[0] = segment[0][child.col_offset:]
+                out.append({"id": f"{prefix}::{child.name}", "body": b"".join(segment).decode("utf-8")})
 
     visit(tree, path)
     return out

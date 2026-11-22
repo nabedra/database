@@ -145,14 +145,14 @@ class NeedsTests(unittest.TestCase):
 
 
 class ExecuteTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
-        self.repo = root / "repo"
-        self.repo.mkdir()
+    @classmethod
+    def setUpClass(cls):
+        tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmp.cleanup)
+        cls.repo = Path(tmp.name)
         g = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
-        subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
-        (self.repo / "fake_tests.py").write_text(textwrap.dedent("""
+        subprocess.run(["git", "init", "-q"], cwd=cls.repo, check=True)
+        (cls.repo / "fake_tests.py").write_text(textwrap.dedent("""
             import os, sys, time
             mode = sys.argv[1]
             if mode == "ok":
@@ -166,13 +166,15 @@ class ExecuteTests(unittest.TestCase):
             elif mode == "sleep":
                 time.sleep(30)
         """))
-        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
-        subprocess.run([*g, "commit", "-qm", "c"], cwd=self.repo, check=True)
+        subprocess.run(["git", "add", "."], cwd=cls.repo, check=True)
+        subprocess.run([*g, "commit", "-qm", "c"], cwd=cls.repo, check=True)
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
         self.evidence = root / "evidence"
         self.logs = root / "logs"
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def run_mode(self, mode, parser="unittest", **over):
         check = run_check.parse_check(check_data(
@@ -207,6 +209,7 @@ class ExecuteTests(unittest.TestCase):
     def test_timeout_kills_the_command(self):
         record, _ = self.run_mode("sleep", parser="exit-code", timeout_s=1)
         self.assertEqual(record["result"], "error")
+        self.assertEqual(record["assertions"]["executed"], 0)
         self.assertLess(record["duration_s"], 20)
 
     def test_missing_need_skips_the_command(self):
@@ -224,6 +227,21 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(run_check.execute(check, evidence_dir=self.evidence, log_dir=self.logs,
                                            request_id="req-dry", dry_run=True, echo=False, repo=self.repo),
                          (None, None))
+        self.assertFalse(self.evidence.exists())
+
+    def test_python_resolution_preserves_explicit_interpreters_and_arguments(self):
+        args = ["-c", "print('hello; world')", "python3"]
+        self.assertEqual(run_check.resolve_command(["python3", *args]), [sys.executable, *args])
+        for interpreter in ("python3.12", "./bin/python3", "/opt/python/bin/python"):
+            command = [interpreter, *args]
+            self.assertEqual(run_check.resolve_command(command), command)
+
+    def test_unsafe_request_id_creates_no_log(self):
+        check = run_check.parse_check(check_data(command=["python3", "fake_tests.py", "ok"]))
+        with self.assertRaises(run_check.evidence.EvidenceError):
+            run_check.execute(check, evidence_dir=self.evidence, log_dir=self.logs,
+                              request_id="../escape", echo=False, repo=self.repo)
+        self.assertFalse(self.logs.exists())
         self.assertFalse(self.evidence.exists())
 
 

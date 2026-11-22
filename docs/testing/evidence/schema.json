@@ -42,12 +42,13 @@
     "run": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["url", "attempt", "request_id", "runner"],
+      "required": ["url", "attempt", "request_id", "runner", "date"],
       "properties": {
         "url": {"type": ["string", "null"], "pattern": "^https://", "maxLength": 300},
         "attempt": {"type": ["integer", "null"], "minimum": 1},
         "request_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "maxLength": 100},
-        "runner": {"type": ["string", "null"], "maxLength": 100}
+        "runner": {"type": ["string", "null"], "maxLength": 100},
+        "date": {"type": "string", "format": "date-time"}
       }
     },
     "duration_s": {"type": "number", "minimum": 0},

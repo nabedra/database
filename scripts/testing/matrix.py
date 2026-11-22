@@ -13,8 +13,8 @@ docs/testing/checks/*.toml, and docs/testing/modules.toml maps paths to modules.
 
 A record counts toward a cell only if it is valid, its sha is HEAD or an ancestor of HEAD, and it
 is attested (`gh attestation verify` succeeds under --verify-attestations) or --allow-unattested
-is given. Cell states: pass, fail, not-run (reason), quarantined p/n (never green), stale (n
-commits behind HEAD), n/a (reason) and missing. Cells whose n/a reason starts with
+is given. Cell states: pass, fail, not-run: <reason>, quarantined p/n, stale (<n> behind),
+n/a and missing. The gate verifies attestations by default. Cells whose n/a reason starts with
 `cloud-deferred` or `hardware-deferred` are deferred: listed by name and never counted as green.
 """
 
@@ -41,7 +41,9 @@ KINDS = evidence.KINDS
 LEVELS = ("L1", "L2", "L3")
 DEFERRED_PREFIXES = ("cloud-deferred", "hardware-deferred")
 REGISTER_HEADER = ["id", "guarantee", "failure model", "scenarios", "checks", "n/a"]
-TEST_FILE_GLOBS = ("server/**/tests/**", "**/test_*.py", "orm/**/test/**", "orm/**/tests/**")
+TEST_FILE_GLOBS = ("server/**/tests/**", "**/test_*.py", "orm/**/test/**", "orm/**/tests/**",
+                   "orm/contract/**")
+CHECK_FILE = re.compile(r"docs/testing/checks/([a-z0-9-]+)\.toml")
 
 
 class MatrixError(ValueError):
@@ -173,7 +175,7 @@ class Guarantee:
 
     def deferred(self, kind: str) -> str | None:
         reason = self.na.get(kind, "")
-        return next((p for p in DEFERRED_PREFIXES if reason.startswith(p)), None)
+        return next((p for p in DEFERRED_PREFIXES if reason == p or reason.startswith(f"{p} (")), None)
 
 
 @dataclass
@@ -272,7 +274,7 @@ class Git:
         return subprocess.run(["git", *args], cwd=self.repo, capture_output=True, text=True, check=check)
 
     def rev(self, rev: str) -> str:
-        out = self.run("rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}", check=False)
+        out = self.run("rev-parse", "--verify", "--quiet", "--end-of-options", f"{rev}^{{commit}}", check=False)
         if out.returncode != 0:
             raise MatrixError(f"unknown revision {rev!r}")
         return out.stdout.strip()
@@ -284,36 +286,34 @@ class Git:
             value = None
             if sha == head:
                 value = 0
-            elif self.run("merge-base", "--is-ancestor", sha, head, check=False).returncode == 0:
-                value = int(self.run("rev-list", "--count", f"{sha}..{head}").stdout.strip())
+            else:
+                commits = self.run("rev-list", "--left-right", "--count", f"{sha}...{head}", check=False)
+                if commits.returncode == 0:
+                    ahead, behind = map(int, commits.stdout.split())
+                    if ahead == 0:
+                        value = behind
             self._cache[key] = value
         return self._cache[key]  # type: ignore[return-value]
 
-    def date(self, sha: str) -> str:
-        key = ("date", sha)
-        if key not in self._cache:
-            out = self.run("show", "-s", "--format=%cs", sha, check=False)
-            self._cache[key] = out.stdout.strip() if out.returncode == 0 else ""
-        return self._cache[key]  # type: ignore[return-value]
-
     def changed(self, base: str, head: str) -> list[str]:
-        out = self.run("diff", "--name-only", "--no-renames", base, head)
-        return [l for l in out.stdout.splitlines() if l]
+        out = self.run("diff", "--name-only", "--no-renames", "-z", base, head)
+        return out.stdout.rstrip("\0").split("\0") if out.stdout else []
 
     def files(self) -> list[str]:
-        out = self.run("ls-files", "--cached", "--others", "--exclude-standard")
-        return sorted(set(l for l in out.stdout.splitlines() if l))
+        out = self.run("ls-files", "-z", "--cached")
+        return sorted(set(out.stdout.rstrip("\0").split("\0"))) if out.stdout else []
 
     def origin_repo(self) -> str | None:
         out = self.run("remote", "get-url", "origin", check=False)
-        m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", out.stdout.strip())
+        m = re.fullmatch(
+            r"(?:(?:https|ssh)://)?(?:[^@/:]+@)?(?:github\.com|github-[^:/.]+)"
+            r"[:/]([^/]+/[^/]+?)(?:\.git)?", out.stdout.strip()
+        )
         return m.group(1) if m else None
 
 
-def verify_attestation(path: Path, repo_slug: str | None) -> bool:
-    cmd = ["gh", "attestation", "verify", str(path)]
-    if repo_slug:
-        cmd += ["--repo", repo_slug]
+def verify_attestation(path: Path, repo_slug: str) -> bool:
+    cmd = ["gh", "attestation", "verify", str(path), "--repo", repo_slug]
     try:
         return subprocess.run(cmd, capture_output=True, timeout=120).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
@@ -352,13 +352,11 @@ class Cell:
             return self.state  # "" or "n/a"; the register reason is in the JSON
         label = self.state
         if self.state == "stale":
-            label = f"stale {self.behind} ({self.last})"
-        if self.state in ("not-run", "n/a") and self.reason:
+            label = f"stale ({self.behind} behind)"
+        if self.state == "not-run" and self.reason:
             label = f"{label}: {self.reason}"
         if self.state == "missing" and self.reason:
             label = f"missing ({self.reason})"
-        if self.deferred and self.state != "n/a":
-            label = f"{label} [{self.deferred}]"
         parts = [label]
         if self.sha:
             parts.append(f"`{self.sha[:7]}`")
@@ -373,28 +371,27 @@ class Cell:
         return self.state == "pass" and self.deferred is None
 
 
-def _combine(group: list[Counted]) -> tuple[str, str, int, int, list[str], str | None]:
-    """Combines the records of one sha: any fail or error wins, then pass, then quarantined."""
+def _combine(group: list[Counted]) -> tuple[str, str, int, int, list[str]]:
+    """Combines records on one SHA. Failures and quarantine take precedence over a pass."""
     results = [c.record["result"] for c in group]
     checks = sorted({c.record["check"] for c in group})
     executed = sum(c.record["assertions"]["executed"] for c in group)
     failed = sum(c.record["assertions"]["failed"] for c in group)
-    url = next((c.record["run"]["url"] for c in group if c.record["run"]["url"]), None)
     if "fail" in results or "error" in results:
         bad = sorted({c.record["check"] for c in group if c.record["result"] in ("fail", "error")})
-        return "fail", "failed: " + ", ".join(bad), executed, failed, checks, url
-    if "pass" in results:
-        return "pass", "", executed, failed, checks, url
+        return "fail", "failed: " + ", ".join(bad), executed, failed, checks
     if "quarantined" in results:
         q = [c for c in group if c.record["result"] == "quarantined"]
         runs = sum(c.record["assertions"]["executed"] for c in q)
         ok = runs - sum(c.record["assertions"]["failed"] for c in q)
-        return f"quarantined {ok}/{runs}", "", executed, failed, checks, url
+        return f"quarantined {ok}/{runs}", "", runs, runs - ok, checks
+    if "pass" in results:
+        return "pass", "", executed, failed, checks
     reasons = sorted({n["reason"] for c in group for n in c.record["assertions"]["not_run"]})
-    return "not-run", "; ".join(reasons), executed, failed, checks, url
+    return "not-run", "; ".join(reasons), executed, failed, checks
 
 
-def evaluate_cell(g: Guarantee, kind: str, counted: list[Counted], ignored_for: int, git: Git) -> Cell:
+def evaluate_cell(g: Guarantee, kind: str, counted: list[Counted], ignored_for: int) -> Cell:
     required = kind in g.checks
     na = g.na.get(kind)
     deferred = g.deferred(kind)
@@ -405,16 +402,19 @@ def evaluate_cell(g: Guarantee, kind: str, counted: list[Counted], ignored_for: 
     mine = [c for c in counted if g.id in c.record["guarantees"] and kind in c.record["kind"].split(" ")]
     if not mine:
         if deferred:
-            return Cell(g.id, kind, True, "n/a", reason=na or "", deferred=deferred)
+            return Cell(g.id, kind, True, "not-run", reason=na or "", deferred=deferred)
         reason = f"{ignored_for} uncounted record(s)" if ignored_for else ""
         return Cell(g.id, kind, True, "missing", reason=reason)
-    nearest = min(c.behind for c in mine)
-    group = [c for c in mine if c.behind == nearest]
-    sha = group[0].record["sha"]
-    state, reason, executed, failed, checks, url = _combine(group)
-    cell = Cell(g.id, kind, True, state, reason=reason, deferred=deferred, behind=nearest, sha=sha,
-                date=git.date(sha), checks=checks, run_url=url, executed=executed, failed=failed)
-    if nearest > 0:
+    nearest = min(mine, key=lambda c: (c.behind, c.record["sha"]))
+    sha = nearest.record["sha"]
+    group = [c for c in mine if c.record["sha"] == sha]
+    state, reason, executed, failed, checks = _combine(group)
+    run = next((c.record["run"] for c in group if c.record["run"]["url"]), nearest.record["run"])
+    cell = Cell(g.id, kind, True, state, reason=reason, deferred=deferred, behind=nearest.behind, sha=sha,
+                date=run["date"], checks=checks, run_url=run["url"], executed=executed, failed=failed)
+    if deferred:
+        cell.last, cell.state, cell.reason = cell.state, "not-run", na
+    elif nearest.behind > 0:
         cell.last, cell.state = cell.state, "stale"
     return cell
 
@@ -442,12 +442,17 @@ def count_records(records: list[tuple[Path, dict]], head: str, git: Git, *, allo
         if errors:
             ignored.append({"path": str(path), "reason": "invalid: " + errors[0], "record": record})
             continue
+        if not record["tree_clean"]:
+            ignored.append({"path": str(path), "reason": "record was produced on a dirty tree", "record": record})
+            continue
         behind = git.behind(record["sha"], head)
         if behind is None:
             ignored.append({"path": str(path), "reason": "sha is not HEAD or an ancestor of HEAD", "record": record})
             continue
-        if not allow_unattested and not (verify and verify_attestation(path, repo_slug)):
+        if not allow_unattested and not (verify and repo_slug and verify_attestation(path, repo_slug)):
             why = "attestation did not verify" if verify else "unattested (pass --verify-attestations)"
+            if verify and not repo_slug:
+                why = "cannot verify attestation without a GitHub origin"
             ignored.append({"path": str(path), "reason": why, "record": record})
             continue
         counted.append(Counted(path, record, behind))
@@ -466,8 +471,9 @@ def build_matrix(paths: Paths, head_rev: str = "HEAD", *, allow_unattested: bool
                 raise MatrixError(f"guarantee {g.id} is defined in both {seen[g.id]} and {reg.path}")
             seen[g.id] = str(reg.path)
     records = evidence.load_records(paths.records)
+    repo_slug = git.origin_repo() if records and verify and not allow_unattested else None
     counted, ignored = count_records(records, head, git, allow_unattested=allow_unattested,
-                                     verify=verify, repo_slug=git.origin_repo())
+                                     verify=verify, repo_slug=repo_slug)
     kinds = [k for k in KINDS if any(k in g.checks for r in registers for g in r.guarantees)]
     cells = {}
     for reg in registers:
@@ -475,10 +481,11 @@ def build_matrix(paths: Paths, head_rev: str = "HEAD", *, allow_unattested: bool
             for kind in kinds:
                 uncounted = sum(
                     1 for i in ignored
-                    if isinstance(i["record"], dict) and g.id in i["record"].get("guarantees", [])
+                    if isinstance(i["record"], dict) and isinstance(i["record"].get("guarantees"), list)
+                    and g.id in i["record"]["guarantees"]
                     and kind in str(i["record"].get("kind", "")).split(" ")
                 )
-                cells[(g.id, kind)] = evaluate_cell(g, kind, counted, uncounted, git)
+                cells[(g.id, kind)] = evaluate_cell(g, kind, counted, uncounted)
     return Matrix(head, registers, cells, kinds, ignored, allow_unattested, verify)
 
 
@@ -557,10 +564,16 @@ def select(paths: Paths, base: str, head: str, changed: list[str] | None = None)
     modules = load_modules(paths.modules)
     registers = load_registers(paths.registers)
     checks = run_check.load_all(paths.checks, modules.names())
+    check_modules = {c.id: c.module for c in checks}
     touched: dict[str, list[str]] = {}
     hot: dict[str, list[str]] = {}
     for f in files:
-        for name in modules.modules_for(f):
+        owners = modules.modules_for(f)
+        check_file = CHECK_FILE.fullmatch(f)
+        if check_file:
+            owner = check_modules.get(check_file[1], modules.fallback)
+            owners = list(dict.fromkeys([*(n for n in owners if n != modules.fallback), owner]))
+        for name in owners:
             touched.setdefault(name, []).append(f)
             mod = modules.get(name)
             if mod and glob_match(f, mod.hot_paths):
@@ -701,11 +714,11 @@ def gate(paths: Paths, sha: str, scope: str, *, allow_unattested: bool = False, 
                     continue
                 if cell.deferred:
                     deferred.append(cell)
-                elif cell.state == "pass" and cell.behind == 0 and cell.sha == matrix.head:
+                elif cell.green() and cell.behind == 0 and cell.sha == matrix.head:
                     passed.append(cell)
                 else:
                     failing.append(cell)
-    ok = not failing and bool(passed or deferred)
+    ok = bool(passed) and not failing and not deferred
     return GateResult(ok, matrix.head, scope, passed, failing, deferred)
 
 
@@ -746,7 +759,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--sha", required=True)
     g.add_argument("--scope", required=True)
     g.add_argument("--allow-unattested", action="store_true")
-    g.add_argument("--verify-attestations", action="store_true")
+    g.add_argument("--verify-attestations", action="store_true", default=True)
     args = parser.parse_args(argv)
     paths = paths_from(args)
     try:

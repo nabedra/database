@@ -30,8 +30,8 @@ env = { NABEDRA_CASES = "1000" } # optional
 | `kinds` | yes | A non-empty list of distinct kind letters (plan revision 1, "check kinds"). |
 | `guarantees` | yes | Guarantee IDs from `docs/testing/guarantees/*.md`. May be empty for tooling checks. `matrix.py lint` fails on an unknown ID. |
 | `scenarios` | no | Scenario IDs, copied into the record. |
-| `tiers` | yes | Where the check runs. `matrix.py select` picks the T1 checks of the touched modules. |
-| `command` | yes | Argument list, run without a shell. A leading `python3` or `python` runs under the interpreter that runs `run_check.py` (3.11 or later). |
+| `tiers` | yes | Where the check runs. `matrix.py select` picks the T1 checks of the touched modules, including modules declared by changed check files. A removed check file selects all T1 checks. |
+| `command` | yes | Argument list, run without a shell. A bare `python3` or `python` as the first argument uses the runner's interpreter (Python 3.11 or later). To choose a different interpreter, use a versioned name such as `python3.12` or an explicit path. |
 | `cwd` | yes | Relative to the repository root, without `..`. |
 | `timeout_s` | yes | Positive. On timeout the process group is killed and the result is `error`. |
 | `needs` | no | Environment the check requires. See below. |
@@ -88,6 +88,7 @@ Records go to `docs/testing/evidence/records/<yyyy>/<mm>/<request_id>--<id>.json
 `--request-id`, then `NABEDRA_REQUEST_ID`, then `local-<short sha>-<hhmmss>`. The exit status is 1
 for `fail` and `error`, and 0 otherwise. `--strict` also exits 2 for `not-run`.
 
-Locally written records are unattested. The matrix counts a record only when its sha is HEAD or
-an ancestor of HEAD and its attestation verifies (`matrix.py build --verify-attestations`), unless
-`--allow-unattested` is given.
+Each record includes the UTC start time as `run.date`. The matrix counts clean-tree records
+from HEAD or its ancestors after attestation verification. Use `matrix.py build --verify-attestations`
+to verify records when generating the matrix. The gate verifies attestations by default and
+requires a pass on the requested SHA for each required cell. Use `--allow-unattested` for local fixtures.

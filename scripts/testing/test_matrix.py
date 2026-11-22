@@ -7,7 +7,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import matrix  # noqa: E402
@@ -35,12 +37,13 @@ class FixtureRepo:
     """A git repo with HEAD, HEAD~1, HEAD~2 on `main`, an unrelated `other` commit, and the fixture
     registers, checks and records (placeholder shas substituted) copied next to it."""
 
-    def __init__(self, registers="registers"):
+    def __init__(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.repo = root / "repo"
         self.repo.mkdir()
         git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "remote", "add", "origin", "git@github-fixture:example/repo.git")
         c0 = commit(self.repo, {"README.md": "0\n"}, "c0")
         git(self.repo, "checkout", "-q", "-b", "other")
         self.other = commit(self.repo, {"other.txt": "x\n"}, "other")
@@ -57,7 +60,7 @@ class FixtureRepo:
             data["sha"] = self.shas[data["sha"]]
             dst.write_text(json.dumps(data))
         self.registers = root / "registers"
-        shutil.copytree(FIXTURES / registers, self.registers)
+        shutil.copytree(FIXTURES / "registers", self.registers)
         self.checks = root / "checks"
         shutil.copytree(FIXTURES / "checks", self.checks)
         self.modules = root / "modules.toml"
@@ -68,6 +71,13 @@ class FixtureRepo:
 
     def cleanup(self):
         self.tmp.cleanup()
+
+
+class MatrixFixtureTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.fx = FixtureRepo()
+        cls.addClassCleanup(cls.fx.cleanup)
 
 
 class GlobTests(unittest.TestCase):
@@ -87,8 +97,9 @@ class RegisterTests(unittest.TestCase):
         reg = matrix.parse_register((FIXTURES / "registers" / "kv.md").read_text(), Path("kv.md"))
         self.assertEqual((reg.module, reg.level), ("kv", "L2"))
         g1, g2, g3 = reg.guarantees
-        self.assertEqual(g1.checks, ["U", "S", "R"])
+        self.assertEqual(g1.checks, ["U", "S", "R", "P"])
         self.assertEqual(g1.deferred("R"), "cloud-deferred")
+        self.assertEqual(g1.deferred("P"), "hardware-deferred")
         self.assertEqual(g2.na, {})
         self.assertEqual(g3.na["M"], "no protocol state beyond the lease, covered by U")
         self.assertEqual(g1.scenarios, ["K01", "K02"])
@@ -111,25 +122,22 @@ class RegisterTests(unittest.TestCase):
                 matrix.parse_register(text, Path("kv.md"))
 
 
-class BuildTests(unittest.TestCase):
-    def setUp(self):
-        self.fx = FixtureRepo()
-
-    def tearDown(self):
-        self.fx.cleanup()
-
+class BuildTests(MatrixFixtureTests):
     def cells(self, **kw):
         m = matrix.build_matrix(self.fx.paths, allow_unattested=True, **kw)
         return m, {f"{g} {k}": c for (g, k), c in m.cells.items()}
 
     def test_every_cell_state(self):
         m, c = self.cells()
-        self.assertEqual(m.kinds, ["U", "S", "H", "D", "R"])
+        self.assertEqual(m.kinds, ["U", "S", "H", "D", "R", "P"])
         self.assertEqual(c["EVT-G01 U"].state, "pass")
         self.assertEqual(c["KV-G01 U"].state, "pass")
         self.assertEqual(c["KV-G01 U"].run_url, "https://github.com/example/repo/actions/runs/1")
+        self.assertEqual(c["KV-G01 U"].date, "2026-11-22T12:00:00+00:00")
         self.assertEqual((c["KV-G01 S"].state, c["KV-G01 S"].behind, c["KV-G01 S"].last), ("stale", 2, "pass"))
-        self.assertEqual((c["KV-G01 R"].state, c["KV-G01 R"].deferred), ("n/a", "cloud-deferred"))
+        self.assertEqual((c["KV-G01 R"].state, c["KV-G01 R"].deferred), ("not-run", "cloud-deferred"))
+        self.assertEqual((c["KV-G01 P"].state, c["KV-G01 P"].deferred), ("not-run", "hardware-deferred"))
+        self.assertFalse(c["KV-G01 P"].green())
         self.assertEqual(c["KV-G02 U"].state, "fail")
         self.assertEqual(c["KV-G02 D"].state, "not-run")
         self.assertIn("s3-unconfigured", c["KV-G02 D"].reason)
@@ -145,6 +153,20 @@ class BuildTests(unittest.TestCase):
         reasons = {os.path.basename(i["path"]): i["reason"] for i in m.ignored}
         self.assertIn("zero executed", reasons["fx-7--kv-empty.json"])
         self.assertIn("not HEAD or an ancestor", reasons["fx-6--kv-sim.json"])
+
+    def test_quarantine_takes_precedence_on_the_same_sha(self):
+        source = self.fx.records / "2026/11"
+        quarantined = json.loads((source / "fx-5--kv-flaky.json").read_text())
+        passed = json.loads((source / "fx-1--kv-unit.json").read_text())
+        passed["guarantees"] = quarantined["guarantees"]
+        with tempfile.TemporaryDirectory() as directory:
+            records = Path(directory)
+            (records / "quarantined.json").write_text(json.dumps(quarantined))
+            (records / "pass.json").write_text(json.dumps(passed))
+            m = matrix.build_matrix(replace(self.fx.paths, records=records), allow_unattested=True)
+        cell = m.cells[("KV-G03", "U")]
+        self.assertEqual(cell.state, "quarantined 3/5")
+        self.assertFalse(cell.green())
 
     def test_unattested_records_do_not_count_by_default(self):
         m = matrix.build_matrix(self.fx.paths)
@@ -170,7 +192,7 @@ class BuildTests(unittest.TestCase):
                 finally:
                     os.environ["PATH"] = old
                 self.assertEqual(m.cells[("EVT-G01", "U")].state, expect)
-                self.assertIn("attestation verify", (bindir / "calls").read_text())
+                self.assertRegex((bindir / "calls").read_text(), r"attestation verify .* --repo example/repo")
 
     def test_head_option_moves_staleness(self):
         m = matrix.build_matrix(self.fx.paths, self.fx.shas["@HEAD~1"], allow_unattested=True)
@@ -186,7 +208,7 @@ class BuildTests(unittest.TestCase):
         md = (self.fx.out / "coverage-matrix.md").read_text()
         self.assertIn("| KV-G03 | Leases are linearizable", md)
         self.assertIn("quarantined 3/5", md)
-        self.assertIn("stale 2 (pass)", md)
+        self.assertIn("stale (2 behind)", md)
         self.assertIn("KV-G01 R: cloud-deferred", md)
         self.assertIn("Unattested evidence was allowed", md)
         data = json.loads((self.fx.out / "coverage-matrix.json").read_text())
@@ -195,22 +217,24 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(row["cells"]["U"]["state"], "fail")
 
     def test_duplicate_guarantee_is_refused(self):
-        shutil.copy(self.fx.registers / "kv.md", self.fx.registers / "kv-copy.md")
-        with self.assertRaises(matrix.MatrixError):
-            matrix.build_matrix(self.fx.paths, allow_unattested=True)
+        with tempfile.TemporaryDirectory() as directory:
+            registers = Path(directory)
+            shutil.copy(self.fx.registers / "kv.md", registers / "kv.md")
+            shutil.copy(self.fx.registers / "kv.md", registers / "kv-copy.md")
+            with self.assertRaises(matrix.MatrixError):
+                matrix.build_matrix(replace(self.fx.paths, registers=registers), allow_unattested=True)
 
 
-class SelectTests(unittest.TestCase):
-    def setUp(self):
-        self.fx = FixtureRepo()
-
-    def tearDown(self):
-        self.fx.cleanup()
+class SelectTests(MatrixFixtureTests):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.diff_sha = commit(cls.fx.repo, {"server/src/cache/store/map.rs": "x\n",
+                                          "server/events/src/a.rs": "y\n"}, "diff")
+        cls.docker_sha = commit(cls.fx.repo, {"Dockerfile": "FROM x\n"}, "docker")
 
     def test_synthetic_diff(self):
-        base = self.fx.head
-        head = commit(self.fx.repo, {"server/src/cache/store/map.rs": "x\n", "server/events/src/a.rs": "y\n"}, "diff")
-        sel = matrix.select(self.fx.paths, base, head)
+        sel = matrix.select(self.fx.paths, self.fx.head, self.diff_sha)
         self.assertEqual(sorted(sel["modules"]), ["events", "kv"])
         self.assertFalse(sel["full_t1"])
         self.assertEqual([c["id"] for c in sel["t1_checks"]], ["events-unit", "kv-unit"])  # kv-sim is T2
@@ -221,9 +245,7 @@ class SelectTests(unittest.TestCase):
         self.assertIn("Paired A/B required", text)
 
     def test_unmapped_path_selects_every_t1_check(self):
-        base = self.fx.head
-        head = commit(self.fx.repo, {"Dockerfile": "FROM x\n"}, "docker")
-        sel = matrix.select(self.fx.paths, base, head)
+        sel = matrix.select(self.fx.paths, self.diff_sha, self.docker_sha)
         self.assertTrue(sel["full_t1"])
         self.assertEqual(list(sel["modules"]), ["misc"])
         self.assertEqual([c["id"] for c in sel["t1_checks"]], ["events-unit", "kv-unit"])
@@ -233,25 +255,48 @@ class SelectTests(unittest.TestCase):
         self.assertEqual(list(sel["modules"]), ["testing"])
         self.assertEqual(sel["t1_checks"], [])
 
+    def test_changed_check_selects_its_declared_module(self):
+        sel = matrix.select(self.fx.paths, "x", "y", changed=["docs/testing/checks/kv-unit.toml"])
+        self.assertIn("kv", sel["modules"])
+        self.assertIn("kv-unit", [c["id"] for c in sel["t1_checks"]])
+        self.assertIn("KV-G01", sel["guarantees"])
+
+    def test_deleted_check_selects_all_t1_checks(self):
+        sel = matrix.select(self.fx.paths, "x", "y", changed=["docs/testing/checks/removed.toml"])
+        self.assertTrue(sel["full_t1"])
+        self.assertEqual([c["id"] for c in sel["t1_checks"]], ["events-unit", "kv-unit"])
+
+    def test_repository_path_ownership(self):
+        modules = matrix.load_modules(matrix.Paths().modules)
+        examples = {
+            "server/src/oltp_runtime/direct/executor.rs": ["oltp"],
+            "orm/python/src/nabedra/client.py": ["orm-python"],
+            ".github/workflows/nabedra-build.yml": ["ci"],
+            "docs/testing/checks/testing-matrix.toml": ["testing"],
+            "server/check/tests/model_queue.rs": ["check"],
+            "server/fuzz/tests/replay.rs": ["fuzz"],
+            "scripts/cache-acceptance/test_valkey.py": ["kv"],
+            "orm/contract/test_api.py": ["orm-python", "orm-typescript"],
+        }
+        for path, expected in examples.items():
+            with self.subTest(path=path):
+                self.assertEqual(modules.modules_for(path), expected)
+
 
 class LintTests(unittest.TestCase):
     def setUp(self):
-        self.fx = FixtureRepo()
-
-    def tearDown(self):
-        self.fx.cleanup()
+        self.paths = matrix.Paths(registers=FIXTURES / "registers", checks=FIXTURES / "checks",
+                                  modules=FIXTURES / "modules.toml")
 
     def test_fixture_is_clean_apart_from_warnings(self):
-        errors, warnings = matrix.lint(self.fx.paths, files=["server/src/cache/tests/a.rs"])
+        errors, warnings = matrix.lint(self.paths, files=["server/src/cache/tests/a.rs"])
         self.assertEqual(errors, [])
         # KV-G02 needs D and nothing provides it; deferred KV-G01 R is not warned about.
         self.assertIn("KV-G02 requires kind D but no registered check provides it", warnings)
         self.assertFalse(any("KV-G01 requires kind R" in w for w in warnings))
 
     def test_each_failure(self):
-        for name in ("name-mismatch", "unknown-guarantee"):
-            shutil.copy(FIXTURES / "checks-bad" / f"{name}.toml", self.fx.checks)
-        errors, _ = matrix.lint(self.fx.paths, files=[
+        errors, _ = matrix.lint(replace(self.paths, checks=FIXTURES / "checks-bad"), files=[
             "server/src/cache/x.rs", "server/other/tests/dangling.rs", "tools/test_orphan.py",
             "orm/ruby/test/a_test.rb", "server/src/cache/tests/ok.rs"])
         text = "\n".join(errors)
@@ -264,9 +309,11 @@ class LintTests(unittest.TestCase):
         self.assertNotIn("server/src/cache/x.rs", text)
 
     def test_bad_modules_file(self):
-        text = self.fx.modules.read_text().replace("share = 40", "share = 30").replace('level = "L1"', 'level = "L4"')
-        self.fx.modules.write_text(text)
-        errors, _ = matrix.lint(self.fx.paths, files=[])
+        text = self.paths.modules.read_text().replace("share = 40", "share = 30").replace('level = "L1"', 'level = "L4"')
+        with tempfile.TemporaryDirectory() as directory:
+            modules = Path(directory) / "modules.toml"
+            modules.write_text(text)
+            errors, _ = matrix.lint(replace(self.paths, modules=modules), files=[])
         self.assertTrue(any("add up to 90" in e for e in errors), errors)
         self.assertTrue(any("level 'L4'" in e for e in errors), errors)
 
@@ -278,20 +325,41 @@ class LintTests(unittest.TestCase):
         self.assertEqual([e for e in errors if "dangling" in e or "modules.toml" in e], [])
 
 
-class GateTests(unittest.TestCase):
-    def setUp(self):
-        self.fx = FixtureRepo()
-
-    def tearDown(self):
-        self.fx.cleanup()
+class GateTests(MatrixFixtureTests):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.next_sha = commit(cls.fx.repo, {"x": "1"}, "next")
 
     def test_release_gate_fails_on_fixture(self):
         res = matrix.gate(self.fx.paths, self.fx.head, "release", allow_unattested=True)
         self.assertFalse(res.ok)
         failing = sorted(f"{c.guarantee} {c.kind}" for c in res.failing)
         self.assertEqual(failing, ["KV-G01 S", "KV-G02 D", "KV-G02 U", "KV-G03 H", "KV-G03 U"])
-        self.assertEqual([f"{c.guarantee} {c.kind}" for c in res.deferred], ["KV-G01 R"])
+        self.assertEqual([f"{c.guarantee} {c.kind}" for c in res.deferred], ["KV-G01 R", "KV-G01 P"])
         self.assertIn("deferred (not counted as green): KV-G01 R", res.report())
+        self.assertIn("deferred (not counted as green): KV-G01 P", res.report())
+
+    def test_deferred_cells_block_even_with_pass_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registers = Path(directory)
+            (registers / "kv.md").write_text(
+                "Module: kv\nLevel: L2\n"
+                "| ID | Guarantee | Failure model | Scenarios | Checks | n/a |\n"
+                "| --- | --- | --- | --- | --- | --- |\n"
+                "| KV-G01 | Failover | primary crash | K01 | U R P | "
+                "R: cloud-deferred (EKS soak); P: hardware-deferred (absolute latency) |\n"
+            )
+            records = registers / "records"
+            records.mkdir()
+            record = json.loads((self.fx.records / "2026/11/fx-1--kv-unit.json").read_text())
+            record["kind"] = "U R P"
+            (records / "pass.json").write_text(json.dumps(record))
+            paths = matrix.Paths(self.fx.repo, registers, records)
+            res = matrix.gate(paths, self.fx.head, "release", allow_unattested=True)
+        self.assertFalse(res.ok)
+        self.assertEqual([cell.kind for cell in res.passed], ["U"])
+        self.assertEqual([(cell.kind, cell.state) for cell in res.deferred], [("R", "not-run"), ("P", "not-run")])
 
     def test_module_gate_passes_when_every_cell_passed_on_that_sha(self):
         res = matrix.gate(self.fx.paths, self.fx.head, "module:events", allow_unattested=True)
@@ -300,8 +368,7 @@ class GateTests(unittest.TestCase):
 
     def test_gate_requires_exactly_that_sha(self):
         # On the next commit the same evidence is stale, so the gate fails.
-        head = commit(self.fx.repo, {"x": "1"}, "next")
-        res = matrix.gate(self.fx.paths, head, "module:events", allow_unattested=True)
+        res = matrix.gate(self.fx.paths, self.next_sha, "module:events", allow_unattested=True)
         self.assertFalse(res.ok)
         self.assertEqual(res.failing[0].state, "stale")
 
@@ -317,9 +384,11 @@ class GateTests(unittest.TestCase):
     def test_cli_exit_status(self):
         args = ["gate", "--repo", str(self.fx.repo), "--registers-dir", str(self.fx.registers),
                 "--evidence-dir", str(self.fx.records), "--checks-dir", str(self.fx.checks),
-                "--modules", str(self.fx.modules), "--sha", self.fx.head, "--allow-unattested"]
-        self.assertEqual(matrix.main(args + ["--scope", "release"]), 1)
-        self.assertEqual(matrix.main(args + ["--scope", "module:events"]), 0)
+                "--modules", str(self.fx.modules), "--sha", self.fx.head]
+        self.assertEqual(matrix.main(args + ["--scope", "release", "--allow-unattested"]), 1)
+        with patch.object(matrix, "verify_attestation", return_value=True) as verify:
+            self.assertEqual(matrix.main(args + ["--scope", "module:events"]), 0)
+        verify.assert_called()
 
 
 if __name__ == "__main__":

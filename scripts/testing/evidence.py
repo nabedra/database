@@ -19,6 +19,7 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -49,13 +50,28 @@ _TYPE_CHECKS = {
     "string": lambda v: isinstance(v, str),
     "boolean": lambda v: isinstance(v, bool),
     "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
-    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "number": lambda v: (isinstance(v, int) and not isinstance(v, bool))
+                        or (isinstance(v, float) and math.isfinite(v)),
     "null": lambda v: v is None,
 }
 _SUPPORTED = {
     "$schema", "$id", "title", "description", "type", "const", "enum", "pattern", "maxLength",
-    "minimum", "properties", "required", "additionalProperties", "items", "minItems", "maxItems",
+    "minimum", "properties", "required", "additionalProperties", "items", "minItems", "maxItems", "format",
 }
+_DATE_TIME = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]+)?(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
+)
+
+
+def _valid_date_time(value: str) -> bool:
+    if not _DATE_TIME.fullmatch(value):
+        return False
+    try:
+        _dt.datetime.fromisoformat(value.upper())
+    except ValueError:
+        return False
+    return True
 
 
 def schema_errors(value: Any, schema: dict, path: str = "$") -> list[str]:
@@ -78,6 +94,11 @@ def schema_errors(value: Any, schema: dict, path: str = "$") -> list[str]:
             errors.append(f"{path}: {value!r} does not match {schema['pattern']}")
         if "maxLength" in schema and len(value) > schema["maxLength"]:
             errors.append(f"{path}: longer than {schema['maxLength']} characters")
+        if "format" in schema:
+            if schema["format"] != "date-time":
+                raise EvidenceError(f"unsupported string format: {schema['format']!r}")
+            if not _valid_date_time(value):
+                errors.append(f"{path}: expected a date-time with a timezone")
     if _TYPE_CHECKS["number"](value) and "minimum" in schema and value < schema["minimum"]:
         errors.append(f"{path}: {value} is below the minimum {schema['minimum']}")
     if isinstance(value, dict):
@@ -169,6 +190,7 @@ def run_info(env: dict[str, str] | None = None, request_id: str | None = None) -
         "attempt": int(attempt) if attempt and attempt.isdigit() and int(attempt) >= 1 else None,
         "request_id": rid,
         "runner": env.get("RUNNER_NAME") or None,
+        "date": _dt.datetime.now(_dt.timezone.utc).isoformat(),
     }
 
 
@@ -242,15 +264,18 @@ def new_record(
     }
 
 
+def record_stem(rid: str, check: str) -> str:
+    for name in (rid, check):
+        if not _SAFE_NAME.fullmatch(name) or ".." in name:
+            raise EvidenceError(f"unsafe name for an evidence path: {name!r}")
+    return f"{rid}--{check}"
+
+
 def record_path(record: dict, evidence_dir: Path | None = None, now: _dt.datetime | None = None) -> Path:
     """`<dir>/<yyyy>/<mm>/<request_id>--<check>.json`; the month is the UTC write time."""
-    rid, check = record["run"]["request_id"], record["check"]
-    for name in (rid, check):
-        if not _SAFE_NAME.match(name) or ".." in name:
-            raise EvidenceError(f"unsafe name for an evidence path: {name!r}")
     now = now or _dt.datetime.now(_dt.timezone.utc)
     base = Path(evidence_dir) if evidence_dir is not None else DEFAULT_RECORDS_DIR
-    return base / f"{now:%Y}" / f"{now:%m}" / f"{rid}--{check}.json"
+    return base / f"{now:%Y}" / f"{now:%m}" / f"{record_stem(record['run']['request_id'], record['check'])}.json"
 
 
 def write(record: dict, evidence_dir: Path | None = None, now: _dt.datetime | None = None) -> Path:

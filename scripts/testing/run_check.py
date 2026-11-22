@@ -102,6 +102,7 @@ def parse_check(data: dict, path: Path | None = None, modules: set[str] | None =
         values = data.get(key, [])
         if not all(isinstance(v, str) for v in values):
             problems.append(f"{key} must contain only strings")
+            return []
         return list(values)
 
     check = Check(
@@ -111,7 +112,7 @@ def parse_check(data: dict, path: Path | None = None, modules: set[str] | None =
         needs=str_list("needs"), result_parser=data["result_parser"],
         env=dict(data.get("env", {})), path=path,
     )
-    if not ID_RE.match(check.id):
+    if not ID_RE.fullmatch(check.id):
         problems.append(f"id {check.id!r} is not kebab-case")
     if path is not None and path.stem != check.id:
         problems.append(f"id {check.id!r} does not match the file name {path.name!r}")
@@ -279,10 +280,12 @@ PARSER_FUNCS = {
 def classify(parser: str, output: str, returncode: int | None, timed_out: bool = False) -> tuple[str, Parsed]:
     """Maps a command's output and exit status to (result, counts)."""
     if timed_out:
-        parsed = PARSER_FUNCS[parser](output, 1)
+        parsed = Parsed(0, 0, [], False) if parser == "exit-code" else PARSER_FUNCS[parser](output, 1)
         parsed.not_run.append({"id": "timeout", "reason": "the command exceeded timeout_s and was killed"})
         return "error", parsed
-    parsed = PARSER_FUNCS[parser](output, returncode or 0)
+    if returncode is None:
+        return "error", Parsed(0, 0, [{"id": "spawn", "reason": "the command did not start"}], False)
+    parsed = PARSER_FUNCS[parser](output, returncode)
     if not parsed.found:
         parsed.not_run.append({"id": "parser", "reason": f"no {parser} summary line in the output (exit {returncode})"})
         return "fail", parsed
@@ -301,7 +304,7 @@ def classify(parser: str, output: str, returncode: int | None, timed_out: bool =
 # Running.
 
 def resolve_command(command: list[str]) -> list[str]:
-    """`python3` and `python` run under this interpreter, which is known to be 3.11 or later."""
+    """Only a bare `python3` or `python` in argv[0] uses the runner's interpreter."""
     if command and command[0] in ("python3", "python"):
         return [sys.executable, *command[1:]]
     return list(command)
@@ -356,7 +359,8 @@ def execute(check: Check, *, evidence_dir: Path | None, log_dir: Path, request_i
     """Runs a check and writes its record. Returns (record, record path); both None on dry runs."""
     base_env = dict(os.environ if env is None else env)
     run = evidence.run_info(base_env, request_id)
-    child_env = dict(base_env, **check.env, NABEDRA_REQUEST_ID=run["request_id"])
+    stem = evidence.record_stem(run["request_id"], check.id)
+    child_env = {**base_env, **check.env, "NABEDRA_REQUEST_ID": run["request_id"]}
     missing = missing_needs(check, child_env)
     cmd = resolve_command(check.command)
     if dry_run:
@@ -373,7 +377,7 @@ def execute(check: Check, *, evidence_dir: Path | None, log_dir: Path, request_i
     if missing:
         result, parsed = "not-run", Parsed(0, 0, missing, True)
     else:
-        log_path = Path(log_dir) / f"{run['request_id']}--{check.id}.log"
+        log_path = Path(log_dir) / f"{stem}.log"
         code, output, timed_out = run_command(cmd, repo / check.cwd, child_env, check.timeout_s, log_path, echo)
         result, parsed = classify(check.result_parser, output, code, timed_out)
         artifacts.append({"name": log_path.name, "sha256": evidence.sha256_file(log_path)})
@@ -419,16 +423,18 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if not args.id:
             parser.error("give a check id or --list")
+        if not ID_RE.fullmatch(args.id):
+            parser.error("check id must be kebab-case")
         path = args.checks_dir / f"{args.id}.toml"
         if not path.exists():
             print(f"no such check: {path}", file=sys.stderr)
             return 1
         check = load_check(path, modules)
-    except CheckError as exc:
+        record, record_path = execute(check, evidence_dir=args.evidence_dir, log_dir=args.log_dir,
+                                      request_id=args.request_id, dry_run=args.dry_run)
+    except (CheckError, evidence.EvidenceError, FileExistsError) as exc:
         print(exc, file=sys.stderr)
         return 1
-    record, record_path = execute(check, evidence_dir=args.evidence_dir, log_dir=args.log_dir,
-                                  request_id=args.request_id, dry_run=args.dry_run)
     if record is None:
         return 0
     a = record["assertions"]

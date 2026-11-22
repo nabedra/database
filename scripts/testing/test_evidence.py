@@ -18,7 +18,8 @@ def good(**over):
     rec = evidence.new_record(
         "kv-store-model", ["U", "S"], result="pass", executed=12, failed=0,
         guarantees=["KV-G02"], scenarios=["K01"], sha=SHA, tree_clean=True,
-        run={"url": None, "attempt": None, "request_id": "req-1", "runner": None},
+        run={"url": None, "attempt": None, "request_id": "req-1", "runner": None,
+             "date": "2026-11-22T12:00:00+00:00"},
     )
     rec.update(over)
     return rec
@@ -37,8 +38,12 @@ class ValidatorTests(unittest.TestCase):
             "bad result": lambda r: r.update(result="green"),
             "bad guarantee": lambda r: r.update(guarantees=["kv-1"]),
             "negative duration": lambda r: r.update(duration_s=-1),
+            "nonfinite duration": lambda r: r.update(duration_s=float("nan")),
             "bool as integer": lambda r: r["assertions"].update(executed=True),
             "nested unknown": lambda r: r["run"].update(job="x"),
+            "missing date": lambda r: r["run"].pop("date"),
+            "date without offset": lambda r: r["run"].update(date="2026-11-22T12:00:00"),
+            "invalid date": lambda r: r["run"].update(date="2026-02-30T12:00:00Z"),
             "bad artifact digest": lambda r: r.update(artifacts=[{"name": "log", "sha256": "zz"}]),
             "seed range arity": lambda r: r.update(seeds={"range": [1], "count": 1, "failing": []}),
             "wrong schema id": lambda r: r.update(schema="nabedra.evidence/2"),
@@ -79,7 +84,13 @@ class EnvironmentTests(unittest.TestCase):
         env = {"GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": "o/r",
                "GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "2", "NABEDRA_REQUEST_ID": "rid-1",
                "RUNNER_NAME": "GitHub Actions 7"}
-        self.assertEqual(evidence.run_info(env), {
+        earliest = dt.datetime.now(dt.timezone.utc)
+        info = evidence.run_info(env)
+        date = dt.datetime.fromisoformat(info.pop("date"))
+        self.assertEqual(date.utcoffset(), dt.timedelta(0))
+        self.assertLessEqual(earliest, date)
+        self.assertLessEqual(date, dt.datetime.now(dt.timezone.utc))
+        self.assertEqual(info, {
             "url": "https://github.com/o/r/actions/runs/42", "attempt": 2,
             "request_id": "rid-1", "runner": "GitHub Actions 7"})
 
