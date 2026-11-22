@@ -1,0 +1,15 @@
+batch.json	event=reject batch=accept
+data-depth-boundary.json	event=accept batch=reject
+data-too-deep.json	event=reject batch=reject
+duplicate-data-key.json	event=reject batch=reject
+empty-batch.json	event=reject batch=reject
+escaped-duplicate-data-key.json	event=reject batch=reject
+event.json	event=accept batch=reject
+i64-data.json	event=accept batch=reject
+integer-overflow.json	event=reject batch=reject
+invalid-utf8.bin	event=reject batch=reject
+nonfinite-data.json	event=reject batch=reject
+private-number-key.json	event=reject batch=reject
+trailing-json.json	event=reject batch=reject
+u64-data.json	event=accept batch=reject
+unknown-event-field.json	event=reject batch=reject

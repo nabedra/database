@@ -1,0 +1,11 @@
+id = "check-core"
+module = "check"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+command = ["cargo", "test", "--locked", "-p", "nabedra-check"]
+cwd = "server"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"

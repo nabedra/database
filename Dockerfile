@@ -18,11 +18,14 @@ RUN case "$NABEDRA_ENGINE" in olap|oltp|cache) ;; *) exit 2 ;; esac && \
 # manifest whose declared targets are missing, so every declared test and example gets
 # an empty stub. The stubs stay: the image build never compiles them, and keeping them
 # means test-only changes do not rebuild the image. The workspace crates' stub outputs
-# are cleaned so the real sources always rebuild, whatever their timestamps.
+# are cleaned so the real sources always rebuild, whatever their timestamps. The
+# dev-only `nabedra-check` member is never built here; it needs only its manifest and an
+# empty crate root, which stay in place so the workspace keeps loading.
 COPY server/Cargo.toml server/Cargo.lock ./
 COPY server/kv/Cargo.toml ./kv/
-RUN mkdir -p src kv/src tests examples /out/timings && \
-    echo 'fn main() {}' > src/main.rs && : > src/lib.rs && : > kv/src/lib.rs && \
+COPY server/check/Cargo.toml ./check/
+RUN mkdir -p src kv/src check/src tests examples /out/timings && \
+    echo 'fn main() {}' > src/main.rs && : > src/lib.rs && : > kv/src/lib.rs && : > check/src/lib.rs && \
     awk -F'"' '/^\[\[(test|example)\]\]/ { dir = ($0 ~ /test/) ? "tests" : "examples"; next } \
                /^\[/ { dir = "" } \
                dir != "" && /^name *=/ { print dir "/" $2 ".rs" }' Cargo.toml | xargs -r touch && \

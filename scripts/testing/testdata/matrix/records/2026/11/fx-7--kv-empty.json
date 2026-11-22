@@ -1,0 +1,35 @@
+{
+  "artifacts": [],
+  "assertions": {
+    "executed": 0,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "kv-empty",
+  "duration_s": 1.5,
+  "guarantees": [
+    "KV-G03"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "date": "2026-11-22T12:00:00+00:00",
+    "attempt": null,
+    "request_id": "fx-7",
+    "runner": "fixture",
+    "url": null
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "@HEAD",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

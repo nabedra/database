@@ -1,0 +1,11 @@
+id = "kv-sim"
+module = "kv"
+kinds = ["S", "H"]
+guarantees = ["KV-G01", "KV-G03"]
+scenarios = []
+tiers = ["T2"]
+command = ["cargo", "test", "--test", "kv_sim"]
+cwd = "server"
+timeout_s = 600
+needs = []
+result_parser = "cargo-test"
