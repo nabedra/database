@@ -1,0 +1,16 @@
+id = "orm-api-manifest"
+module = "orm-python"
+kinds = ["D"]
+guarantees = ["ORM-G01", "ORM-G03"]
+scenarios = []
+tiers = ["T0", "T1"]
+command = ["bash", "-ec", '''
+if [ ! -f orm/typescript/node_modules/typescript/bin/tsc ]; then
+  npm ci --prefix orm/typescript --no-audit --no-fund
+fi
+python3 -m unittest scripts.testing.test_api_manifest
+''']
+cwd = "."
+timeout_s = 180
+needs = ["node"]
+result_parser = "unittest"
