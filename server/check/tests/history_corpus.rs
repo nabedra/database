@@ -439,6 +439,23 @@ fn txn_version_order_review_cases() {
     );
     assert_eq!(txn::check(&fractured).kinds(), ["G0-realtime"]);
 
+    let cross_key_order = history(
+        r#"
+{"type":"invoke","process":0,"f":"txn","value":[["w","x",1],["w","y",1]]}
+{"type":"invoke","process":1,"f":"txn","value":[["r","x",null],["w","y",2]]}
+{"type":"invoke","process":2,"f":"txn","value":[["r","x",null],["r","y",null]]}
+{"type":"ok","process":0,"f":"txn","value":[["w","x",1],["w","y",1]]}
+{"type":"ok","process":1,"f":"txn","value":[["r","x",null],["w","y",2]]}
+{"type":"ok","process":2,"f":"txn","value":[["r","x",1],["r","y",2]]}
+"#,
+    );
+    // Txn 1 must precede txn 0 because it read x=nil. Txn 2 must follow txn 0
+    // because it read x=1, so it cannot still read y=2.
+    assert!(txn::check(&cross_key_order).has("non-serializable"));
+    let mut serialized = cross_key_order;
+    serialized[5].value[1][2] = serde_json::json!(1);
+    assert!(txn::check(&serialized).valid);
+
     let hidden_append = history(
         r#"
 {"type":"invoke","process":0,"f":"txn","value":[["append","x",1]]}

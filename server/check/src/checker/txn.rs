@@ -28,11 +28,16 @@
 //! violates strict serializability but not serializability. `G1a` (a read of a failed write),
 //! `G1b` (a read of a non-final write of a transaction) and `garbage-read` (a read of a value
 //! nobody wrote) are checked directly, along with inconsistent reads within a transaction.
+//! If the graph alone has no cycle, a bounded search tests the remaining rw-register version
+//! orders. It reports `non-serializable` (or `non-serializable-realtime`) when every candidate
+//! is impossible and `check-limit` when it cannot decide within its budget.
+
+mod order;
 
 use super::{Anomaly, Verdict, canon};
 use crate::history::{Event, Op, Outcome, pair};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 const WW: u8 = 1;
 const WR: u8 = 2;
@@ -373,6 +378,9 @@ pub fn check(events: &[Event]) -> Verdict {
             reg_writers.entry(k).or_default().push(site.txn);
         }
     }
+    for writers in reg_writers.values_mut() {
+        writers.sort_unstable();
+    }
     // v1 < v2 when one transaction reads v1 and then writes v2 (its final write) to the key.
     let mut successors: HashMap<(String, String), Vec<usize>> = HashMap::new();
     for (ti, t) in txns.iter().enumerate() {
@@ -519,7 +527,81 @@ pub fn check(events: &[Event]) -> Verdict {
     }
 
     anomalies.extend(g.cycles(&txns));
+    if anomalies.is_empty() {
+        if let Some(anomaly) =
+            check_register_order(&g, &reads, &writes, &reg_writers, &in_graph, &txns)
+        {
+            anomalies.push(anomaly);
+        }
+    }
     Verdict::new(txns.len(), anomalies)
+}
+
+fn check_register_order(
+    graph: &Graph,
+    reads: &[(usize, String, Value)],
+    writes: &HashMap<(String, String), WriteSite>,
+    register_writers: &HashMap<&str, Vec<usize>>,
+    in_graph: &[bool],
+    txns: &[Txn],
+) -> Option<Anomaly> {
+    let mut constraints = Vec::new();
+    for (reader, key, value) in reads.iter().filter(|(_, _, value)| !value.is_null()) {
+        let Some(others) = register_writers.get(key.as_str()) else {
+            continue;
+        };
+        let source = writes[&(key.clone(), canon(value))].txn;
+        for &other_writer in others {
+            if other_writer == source || other_writer == *reader || !in_graph[other_writer] {
+                continue;
+            }
+            if constraints.len() == order::MAX_CONSTRAINTS {
+                return Some(Anomaly::new(
+                    "check-limit",
+                    "too many register read-order constraints".into(),
+                    vec![],
+                ));
+            }
+            constraints.push(order::ReadOrder {
+                reader: *reader,
+                source,
+                other_writer,
+            });
+        }
+    }
+    if constraints.is_empty() {
+        return None;
+    }
+    let (kind, detail) = match order::check(graph, ALL, &constraints) {
+        order::Search::Witness => return None,
+        order::Search::Limit => (
+            "check-limit",
+            "register version-order search exhausted its budget",
+        ),
+        order::Search::Impossible => {
+            if order::check(graph, WW | WR | RW, &constraints) == order::Search::Witness {
+                (
+                    "non-serializable-realtime",
+                    "register reads admit a serial order only without real-time constraints",
+                )
+            } else {
+                (
+                    "non-serializable",
+                    "no serial order satisfies the register reads and observed dependencies",
+                )
+            }
+        }
+    };
+    let events: BTreeSet<_> = constraints
+        .iter()
+        .flat_map(|c| [c.reader, c.source, c.other_writer])
+        .flat_map(|i| txns[i].op.indices())
+        .collect();
+    Some(Anomaly::new(
+        kind,
+        detail.into(),
+        events.into_iter().take(32).collect(),
+    ))
 }
 
 /// External reads constrain version order. Reads after a transaction's own write must
