@@ -18,6 +18,7 @@ FORBIDDEN_NATIVE = frozenset({'rocksdb', 'librocksdb-sys', 'bindgen', 'clang-sys
 CASES = (
     ('default', 'olap', True, []),
     ('olap', 'olap', False, ['--no-default-features', '--features', 'olap']),
+    ('olap-s3-image', 'olap', True, ['--no-default-features', '--features', 'olap,s3']),
     ('oltp', 'oltp', False, ['--no-default-features', '--features', 'oltp']),
     ('oltp-s3', 'oltp', True, ['--no-default-features', '--features', 'oltp-backup-s3']),
     ('cache', 'cache', False, ['--no-default-features', '--features', 'cache']),
@@ -37,6 +38,14 @@ def cargo(command, selection, *extra, check=True, manifest=MANIFEST):
 
 def package_names(tree):
     return {line.split()[0] for line in tree.splitlines() if line.strip()}
+
+
+def assert_no_test_hooks(name, tree):
+    # Cargo resolves transitive feature aliases before printing {f}.
+    for line in tree.splitlines():
+        package, feature_separator, features = line.partition('|')
+        if feature_separator:
+            assert 'test-hooks' not in features.split(','), (name, package, 'test-hooks enabled')
 
 
 def assert_no_forbidden_native(name, packages):
@@ -96,8 +105,10 @@ def main():
     mode.add_argument('--acceptance-evidence', type=Path,
                         help='build installed binaries and record O02 checks without running full engine suites')
     args = parser.parse_args()
-    tree = ('--edges', 'normal,build', '--prefix', 'none', '--format', '{p}')
-    events = package_names(cargo('tree', [], *tree, manifest=EVENTS_MANIFEST).stdout)
+    tree = ('--edges', 'normal,build', '--prefix', 'none', '--format', '{p}|{f}')
+    events_tree = cargo('tree', [], *tree, manifest=EVENTS_MANIFEST).stdout
+    assert_no_test_hooks('events', events_tree)
+    events = package_names(events_tree)
     assert_no_forbidden_native('events', events)
     assert 'nabedra-kv' in events, ('events', 'native storage engine')
     print('O02 events: dependency graph passed', flush=True)
@@ -105,6 +116,7 @@ def main():
     versions = {}
     for name, engine, s3, selection in CASES:
         result = cargo('tree', selection, *tree)
+        assert_no_test_hooks(name, result.stdout)
         graphs[name] = assert_dependency_packages(name, engine, s3, result.stdout)
         print(f'O02 {name}: dependency graph passed', flush=True)
         if args.acceptance_evidence:

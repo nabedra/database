@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Build a GitHub Actions matrix from the checks requested for a pinned revision."""
+
+import json
+import os
+from pathlib import Path
+import re
+import tomllib
+
+
+NEEDS = {"docker", "kind", "node", "python-orm", "rust-nightly", "s3", "valkey"}
+
+
+def check_matrix(requested, directory):
+    if not requested.strip():
+        return []
+    checks = []
+    for check_id in dict.fromkeys(item.strip() for item in requested.split(",")):
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", check_id):
+            raise ValueError(f"invalid check ID {check_id!r}")
+        manifest = directory / f"{check_id}.toml"
+        if not manifest.is_file():
+            raise ValueError(f"unknown check {check_id!r}: {manifest} does not exist")
+        with manifest.open("rb") as source:
+            check = tomllib.load(source)
+        if check.get("id") != check_id:
+            raise ValueError(f"{manifest}: id must match the filename")
+        needs = check.get("needs", [])
+        if not isinstance(needs, list) or any(
+            not isinstance(need, str) or need not in NEEDS for need in needs
+        ):
+            raise ValueError(f"{manifest}: unsupported needs {needs!r}")
+        checks.append({"id": check_id, "tools": needs})
+    return checks
+
+
+if __name__ == "__main__":
+    try:
+        print(json.dumps(check_matrix(os.environ["CHECKS"], Path("docs/testing/checks"))))
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
