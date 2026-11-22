@@ -14,7 +14,12 @@ impl ControlHandle {
             .unwrap_or_else(|poison| poison.into_inner())
             .as_ref()
             .is_some_and(|gate| gate.group_damage_supported());
-        if open {
+        if open
+            || self
+                .registered_directory
+                .get()
+                .is_some_and(|directory| directory.replacement_hardening_active())
+        {
             Ok(())
         } else {
             Err(ProtocolError::new(

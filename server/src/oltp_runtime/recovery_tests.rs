@@ -17,7 +17,9 @@ static BARRIER: OnceLock<Option<Barrier>> = OnceLock::new();
 
 pub(crate) fn block_raft_for_test(group: Uuid) -> bool {
     std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").is_some_and(|directory| {
-        PathBuf::from(directory).join(format!("hold-raft-{group}")).exists()
+        PathBuf::from(directory)
+            .join(format!("hold-raft-{group}"))
+            .exists()
     })
 }
 
@@ -228,7 +230,11 @@ pub(super) fn observe_rolling_copy(
     };
     observe_record(replica);
     let copied = serde_json::json!({"statement": statement, "queue":replica.stats()});
-    std::fs::write(directory.join("rolling-copy.json"), serde_json::to_vec(&copied).unwrap()).unwrap();
+    std::fs::write(
+        directory.join("rolling-copy.json"),
+        serde_json::to_vec(&copied).unwrap(),
+    )
+    .unwrap();
 }
 pub(super) async fn pause_rolling_copy() {
     if let Some((_, id)) = rolling_test() {
@@ -237,9 +243,11 @@ pub(super) async fn pause_rolling_copy() {
 }
 pub(super) async fn refuse_staged_copy(request: Uuid) -> bool {
     const STAGE: &str = "staged-copy-refused";
-    if BARRIER.get().and_then(Option::as_ref).is_some_and(|barrier| {
-        barrier.request == request && barrier.stage == STAGE
-    }) {
+    if BARRIER
+        .get()
+        .and_then(Option::as_ref)
+        .is_some_and(|barrier| barrier.request == request && barrier.stage == STAGE)
+    {
         pause(STAGE, request).await;
         return true;
     }
@@ -248,7 +256,10 @@ pub(super) async fn refuse_staged_copy(request: Uuid) -> bool {
 fn rolling_test() -> Option<(PathBuf, Uuid)> {
     let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
     let input = std::fs::read_to_string(directory.join("rolling-test-id")).ok()?;
-    Some((directory, input.trim().parse().expect("rolling fixture UUID")))
+    Some((
+        directory,
+        input.trim().parse().expect("rolling fixture UUID"),
+    ))
 }
 pub(crate) async fn pause(stage: &str, request: Uuid) {
     if stage == "queued" {
@@ -668,11 +679,17 @@ fn actual_runtime_child() {
 }
 
 async fn replacement_peer_probe(config: PathBuf) {
+    const PROBE_SAMPLES: usize = 200;
     use crate::{
         config::WorkerResources,
         oltp::pool::{ByteClass, SharedResourceConfig, WorkerSharedResources},
         oltp_replication::{
-            multiplex::{AppliedPeerDirectory, EndpointRegistry, Purpose, TransportConfig, WorkerTransport},
+            authority::control::{ControlClient, ControlRoutes},
+            manager::system_recovery::ReplacementCapabilityEndpoint,
+            multiplex::{
+                AppliedPeerDirectory, EndpointRegistry, PeerDirectory, Purpose, TransportConfig,
+                WorkerTransport,
+            },
             types::{GroupIdentity, WorkerEnrollment, WorkerIdentity},
         },
     };
@@ -687,18 +704,45 @@ async fn replacement_peer_probe(config: PathBuf) {
         private_key: PathBuf,
         authority_ca: PathBuf,
         directory: PathBuf,
+        #[serde(default)]
+        control_actor: Option<WorkerEnrollment>,
+        #[serde(default)]
+        revoked_bootstrap_peer: Option<Uuid>,
+        #[serde(default)]
         queue_view: Option<crate::oltp_replication::types::AuthorityView>,
+    }
+    struct Routes(Vec<Uuid>);
+    impl ControlRoutes for Routes {
+        fn next(
+            &self,
+            after: Option<Uuid>,
+        ) -> Result<Option<Uuid>, crate::protocol::ProtocolError> {
+            Ok(self
+                .0
+                .iter()
+                .find(|id| after.is_none_or(|after| **id > after))
+                .copied())
+        }
     }
     let config: Config = serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
     let tls = crate::oltp_replication::TlsMaterial::from_pem(
         &std::fs::read(config.certificate).unwrap(),
         &std::fs::read(config.private_key).unwrap(),
         &std::fs::read(config.authority_ca).unwrap(),
-    ).unwrap();
-    let shared = WorkerSharedResources::new(1, WorkerResources::default(), SharedResourceConfig::default()).unwrap();
+    )
+    .unwrap();
+    let shared = WorkerSharedResources::new(
+        1,
+        WorkerResources::default(),
+        SharedResourceConfig::default(),
+    )
+    .unwrap();
     let directory = AppliedPeerDirectory::from_bootstrap(
-        config.group.clone(), config.targets.clone(), shared.clone(),
-    ).unwrap();
+        config.group.clone(),
+        config.targets.clone(),
+        shared.clone(),
+    )
+    .unwrap();
     if let Some(view) = config.queue_view {
         use super::{replica::QueueScope, worker_endpoint::QueueRequest};
         use crate::oltp_replication::multiplex::RequestError;
@@ -709,7 +753,7 @@ async fn replacement_peer_probe(config: PathBuf) {
         // The fixture pins the outbound receiver. The real receiver checks
         // the caller against its applied Control enrollment.
         directory
-            .install_system_trust(1, config.targets.clone(), Vec::new(), None)
+            .install_system_trust(1, config.targets.clone(), None, false, false)
             .unwrap();
         for stale in [false, true] {
             let mut enrollment = config.from.clone();
@@ -755,18 +799,120 @@ async fn replacement_peer_probe(config: PathBuf) {
         }
         return;
     }
-    let client = WorkerTransport::new(&config.from, &tls, shared.clone(), directory,
-        Arc::new(EndpointRegistry::new(shared.clone())), TransportConfig::default()).unwrap().client();
+    let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+    let transport = Arc::new(
+        WorkerTransport::new(
+            &config.from,
+            &tls,
+            shared.clone(),
+            directory.clone(),
+            registry.clone(),
+            TransportConfig::default(),
+        )
+        .unwrap(),
+    );
+    let client = transport.client();
+    if let Some(actor) = config.control_actor {
+        registry
+            .reserve(config.group.clone())
+            .unwrap()
+            .bind(
+                Purpose::SystemRecovery,
+                Arc::new(ReplacementCapabilityEndpoint {
+                    group: config.group.clone(),
+                    shared: shared.clone(),
+                }),
+            )
+            .unwrap();
+        let mut voters: Vec<_> = config.targets.iter().map(|peer| peer.worker_id).collect();
+        voters.sort_unstable();
+        let authority_resources = WorkerSharedResources::new(
+            2,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let authority = WorkerTransport::new(
+            &actor,
+            &tls,
+            authority_resources.clone(),
+            directory.clone(),
+            Arc::new(EndpointRegistry::new(authority_resources.clone())),
+            TransportConfig::default(),
+        )
+        .unwrap()
+        .client();
+        let control = ControlClient::new(
+            authority,
+            authority_resources,
+            config.group.clone(),
+            Arc::new(Routes(voters)),
+        )
+        .unwrap();
+        if std::env::var_os("NABEDRA_REP5_REFRESH_BOOTSTRAP").is_some() {
+            let peers: Vec<_> = config.targets.iter().map(WorkerIdentity::from).collect();
+            directory
+                .exclude_replaced_bootstrap_peers(&control, &peers)
+                .await
+                .unwrap();
+            assert!(
+                directory
+                    .resolve(config.revoked_bootstrap_peer.unwrap())
+                    .is_err()
+            );
+        }
+        // REP6: the Data-only worker's view, seeded from a Control majority
+        // and refreshed by its own task, as in `data_worker_process`.
+        directory.seed_remote_revocations(&*control).await.unwrap();
+        let (_refresh_stop, refresh_stopped) = tokio::sync::watch::channel(false);
+        tokio::spawn(
+            directory
+                .clone()
+                .run_revocation_refresh(control.clone(), refresh_stopped),
+        );
+        // D01-style budget evidence: this process's Control reads, by kind.
+        let stats = config.directory.join("stats.json");
+        tokio::spawn(async move {
+            loop {
+                let temporary = stats.with_extension("tmp");
+                let snapshot = crate::oltp_runtime::stage_timing::snapshot();
+                if std::fs::write(&temporary, serde_json::to_vec(&snapshot).unwrap()).is_ok() {
+                    let _ = std::fs::rename(&temporary, &stats);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let listener = tokio::net::TcpListener::bind(config.from.endpoint.as_str())
+            .await
+            .unwrap();
+        std::fs::write(config.directory.join("listening"), b"ready").unwrap();
+        transport
+            .run(listener, std::future::pending())
+            .await
+            .unwrap();
+        return;
+    }
     let probe = |target: WorkerIdentity| {
-        let header = shared.encode_in(ByteClass::Progress, &"advertise", 4096).unwrap();
+        let header = shared
+            .encode_in(ByteClass::Progress, &"advertise", 4096)
+            .unwrap();
         let client = client.clone();
         let group = config.group.clone();
         async move {
-            client.request_classified(&group, target, Purpose::SystemRecovery, header,
-                [None, None, None], 16 << 10).await.is_ok()
+            client
+                .request_classified(
+                    &group,
+                    target,
+                    Purpose::SystemRecovery,
+                    header,
+                    [None, None, None],
+                    16 << 10,
+                )
+                .await
+                .is_ok()
         }
     };
-    for phase in ["before", "after"] {
+    for phase in ["before", "after", "restarted"] {
         let marker = config.directory.join(format!("probe-{phase}"));
         tokio::time::timeout(Duration::from_secs(240), async {
             while !marker.exists() {
@@ -774,14 +920,39 @@ async fn replacement_peer_probe(config: PathBuf) {
                     // Keep the original sessions open until Control revokes
                     // their identity. Both sessions use the same client below.
                     for target in &config.targets {
-                        let _ = tokio::time::timeout(Duration::from_secs(2), probe(WorkerIdentity::from(target))).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            probe(WorkerIdentity::from(target)),
+                        )
+                        .await;
                     }
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 } else {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
+        if phase == "before" {
+            // Exchange latency per target, sequential, on established sessions.
+            let mut latency = serde_json::Map::new();
+            for target in &config.targets {
+                let identity = WorkerIdentity::from(target);
+                assert!(probe(identity).await);
+                let mut samples = Vec::with_capacity(PROBE_SAMPLES);
+                for _ in 0..PROBE_SAMPLES {
+                    let started = std::time::Instant::now();
+                    assert!(probe(identity).await);
+                    samples.push(started.elapsed().as_micros() as u64);
+                }
+                latency.insert(target.worker_id.to_string(), samples.into());
+            }
+            let output = config.directory.join("probe-before-latency.json");
+            let temporary = output.with_extension("tmp");
+            std::fs::write(&temporary, serde_json::to_vec(&latency).unwrap()).unwrap();
+            std::fs::rename(temporary, output).unwrap();
+        }
         let mut observed = Vec::new();
         for target in &config.targets {
             observed.push(probe(WorkerIdentity::from(target)).await);

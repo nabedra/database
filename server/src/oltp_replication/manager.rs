@@ -110,7 +110,8 @@ where
         Box::pin(async move {
             let removed = plan.old.iter().find(|member| member.worker_id == lost).ok_or_else(invalid)?;
             let next = plan.next(lost)?;
-            Ok(self.reconcile_voter_replacement(&plan.old, &next, &plan.learner, removed.node_id, None)
+            // The lost voter never retires: drop it from the membership.
+            Ok(self.reconcile_voter_replacement(&plan.old, &next, &plan.learner, removed.node_id, None, false)
                 .await?.applied_at())
         })
     }

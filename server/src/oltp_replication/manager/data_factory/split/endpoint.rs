@@ -17,8 +17,8 @@ enum Host {
     System {
         factory: Arc<DataGroupFactory>,
         pools: Arc<WorkerPools>,
-        timestamps: Arc<TimestampHandle>,
-        catalog: CatalogHandle,
+        timestamps: Option<Arc<TimestampHandle>>,
+        catalog: Option<CatalogHandle>,
     },
     Data(Arc<RemotePlacementTarget>),
 }
@@ -35,17 +35,17 @@ impl SplitEndpoint {
         factory: Arc<DataGroupFactory>,
         pools: Arc<WorkerPools>,
         client: SplitClient,
-        timestamps: Arc<TimestampHandle>,
-        catalog: Arc<ParticipantHandle>,
+        timestamps: Option<Arc<TimestampHandle>>,
+        catalog: Option<Arc<ParticipantHandle>>,
         status: StatusTopology,
     ) -> Result<Arc<Self>, ProtocolError> {
         Ok(Arc::new(Self {
-            catalog: catalog.identity().clone(),
+            catalog: client.catalog.clone(),
             host: Host::System {
                 factory,
                 pools,
                 timestamps,
-                catalog: CatalogHandle::new(catalog)?,
+                catalog: catalog.map(CatalogHandle::new).transpose()?,
             },
             client,
             status,
@@ -334,7 +334,11 @@ impl SplitEndpoint {
         }
         let children = attempt.children()?;
         let table_id = children[0].guard.binding().table_id;
-        let Host::System { catalog, .. } = &self.host else {
+        let Host::System {
+            catalog: Some(catalog),
+            ..
+        } = &self.host
+        else {
             return Err(unauthorized());
         };
         let pin = catalog.snapshot(request.at, self.current().await?)?;
@@ -489,7 +493,11 @@ impl SplitEndpoint {
         if command.authority() != self.current().await? {
             return Err(unauthorized());
         }
-        let Host::System { timestamps, .. } = &self.host else {
+        let Host::System {
+            timestamps: Some(timestamps),
+            ..
+        } = &self.host
+        else {
             return Err(unauthorized());
         };
         let authority = ServiceAction::TimestampProof {
@@ -663,7 +671,11 @@ impl SplitEndpoint {
                 output!(LocalUsageScan::observe(&self.usage, request, machine).await?)
             }
             Operation::Job | Operation::FailureSettlement => {
-                let Host::System { timestamps, .. } = &self.host else {
+                let Host::System {
+                    timestamps: Some(timestamps),
+                    ..
+                } = &self.host
+                else {
                     return Err(unauthorized());
                 };
                 if operation == Operation::Job {

@@ -46,7 +46,7 @@ const META: TransactionBudget = TransactionBudget {
 
 pub(crate) trait TypedMachine<C: TypedConfig>: Clone + Send + Sync + 'static {
     fn store(&self) -> &GroupStore;
-    fn installing_snapshot(&self) {}
+    fn installing_snapshot(&self) -> impl Send {}
     fn snapshot_installed(&self) -> impl Future<Output = Result<(), ProtocolError>> + Send {
         std::future::ready(Ok(()))
     }
@@ -483,7 +483,7 @@ where
             ));
         }
         let store = self.store();
-        self.machine.installing_snapshot();
+        let _trust = self.machine.installing_snapshot();
         self.retry
             .retry(RaftWrite::InstallSnapshot, || {
                 store.install_snapshot(file.clone(), META)

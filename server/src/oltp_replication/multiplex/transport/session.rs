@@ -429,6 +429,18 @@ fn enrolled(directory: &dyn PeerDirectory, peer: WorkerIdentity) -> bool {
         .is_ok_and(|enrollment| WorkerIdentity::from(&enrollment) == peer)
 }
 
+/// Resolves when the directory learned a revocation; never without one.
+async fn trust_changed(changes: &mut Option<watch::Receiver<u64>>) {
+    let closed = match changes.as_mut() {
+        Some(receiver) => receiver.changed().await.is_err(),
+        None => true,
+    };
+    if closed {
+        *changes = None;
+        std::future::pending::<()>().await;
+    }
+}
+
 fn framing() -> io::Error {
     io::ErrorKind::InvalidData.into()
 }
@@ -550,10 +562,16 @@ impl ClientSession {
         let mut progress = Progress::new(self.received.clone());
         let mut queued: Option<oneshot::Receiver<WriteOutcome>> = None;
         let mut written: Option<(Instant, u64)> = None;
+        let mut changes = directory.trust_changes();
         loop {
             tokio::select! {
                 _ = &mut reader => break,
                 _ = stop.wait_for(|closed| *closed) => break,
+                _ = trust_changed(&mut changes) => {
+                    if !enrolled(&*directory, self.identity) {
+                        break;
+                    }
+                }
                 outcome = async { queued.as_mut().expect("ping queued").await }, if queued.is_some() => {
                     queued = None;
                     if !matches!(outcome, Ok(WriteOutcome::Written(_))) {
@@ -1403,11 +1421,21 @@ pub(super) async fn serve(
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let started = Instant::now();
     let mut progress = Progress::new(state.received.clone());
+    let mut changes = transport.common.directory.trust_changes();
     let read_finished = loop {
         tokio::select! {
             _ = &mut reader => break true,
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
+                    break false;
+                }
+            }
+            _ = trust_changed(&mut changes) => {
+                let bound = *lock(&state.bound);
+                if bound.is_some_and(|peer| !enrolled(&*transport.common.directory, peer)) {
+                    tracing::debug!(peer=?bound.map(|peer| peer.worker_id),
+                        "closing a revoked peer's session");
+                    transport.common.revoked_closes.fetch_add(1, Ordering::Relaxed);
                     break false;
                 }
             }
