@@ -1664,6 +1664,10 @@ impl Endpoint for QueueEndpoint {
                 // Preflight authorizes reception. Check the local view before
                 // decoding, then recheck Control immediately before installation.
                 let current = self.replica.lock().map_err(|_| unavailable())?.authority();
+                #[cfg(test)]
+                if current.ready != record.ready {
+                    super::recovery_tests::observe_o21_stale_copy(record.request_id);
+                }
                 if session.remote() != current.owner {
                     return Err(QueueError::Stale.protocol());
                 }

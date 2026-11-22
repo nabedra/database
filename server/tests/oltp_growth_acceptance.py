@@ -631,15 +631,64 @@ def split_child(source, attempt, side):
     return source | {'group_id': group, 'kind': {'data': dict(table_id=table_id, shard_id=shard)}}
 
 
-def check_capacity_deficit(binary, root, direct):
+def create_with_lagging_queue_replica(constrained, holds):
+    cluster = constrained.cluster
+    def ready_views():
+        views = [cluster.stats(worker)['accept_to_dispatch']['view'] for worker in WORKERS]
+        # One of the two followers joined last and has already installed this view.
+        return views if views[0] in views[1:] and views[1] != views[2] else None
+
+    wait_for(ready_views, 'owner and one follower have the current view', 15)
+    request = operation('table.create', dict(name='capacity_deficit', schema=dict(id='int64', data='utf8'),
+                                             key='id', format='parquet'))
+    reached = [hold.parent / f"o21-stale-copy-{request['request_id']}" for hold in holds]
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        creating = executor.submit(constrained.api, 'api1', OPERATIONS, request)
+
+        def arrived():
+            if any(path.is_file() for path in reached):
+                return True
+            assert not creating.done(), creating.result()
+            return False
+
+        try:
+            wait_for(arrived, 'create copy on the worker with an older queue view', 15)
+        finally:
+            for hold in holds:
+                hold.unlink()
+        status, reply = creating.result(timeout=30)
+    assert status == 200 and reply['request_id'] == request['request_id'], (status, reply)
+    submissions = sum(len(path.read_text().splitlines()) for path in
+                      cluster.root.glob(f"barriers/*/submissions-{request['request_id']}"))
+    assert submissions == 1, submissions
+    assert constrained.api('api1', OPERATIONS, request) == (status, reply)
+    changed = request | {'payload': request['payload'] | {'name': 'different'}}
+    conflict, response = constrained.api('api1', OPERATIONS, changed)
+    assert conflict == 409 and response['error']['code'] == 'conflict', (conflict, response)
+    table = constrained.db.table('capacity_deficit')
+    assert table.id == reply['data']['id'], reply
+    return table
+
+
+def check_capacity_deficit(binary, root, direct, *, test_executable=None):
     cluster = GrowthCluster(binary, root / 'capacity-deficit', mounts=True,
                             automatic=dict(shard_target_bytes=64 << 10, minimum_free_bytes=3 << 30),
+                            test_executable=test_executable,
                             direct=dict.fromkeys(WORKERS, direct), api_direct=(direct,))
     constrained = Transactions(cluster, direct)
+    holds = []
+    if test_executable:
+        # Hold the existing follower when the last worker joins. Either follower can join last.
+        for worker in WORKERS[1:]:
+            hold = cluster.barrier_dir(worker) / 'o21-hold-ready-view'
+            hold.parent.mkdir(parents=True, exist_ok=True)
+            hold.touch()
+            holds.append(hold)
     try:
         constrained.start()
         configure_growth(cluster)
-        table = constrained.db.create_table('capacity_deficit', {'id': int, 'data': str}, key='id')
+        table = (create_with_lagging_queue_replica(constrained, holds) if holds else
+                 constrained.db.create_table('capacity_deficit', {'id': int, 'data': str}, key='id'))
         rows = [dict(id=key, data='x' * (8 << 10)) for key in range(16)]
         assert constrained.data(batch(table, rows)) == len(rows)
         source = initial_range(cluster, table.id)
@@ -666,6 +715,8 @@ def check_capacity_deficit(binary, root, direct):
         dump(cluster)
         raise
     finally:
+        for hold in holds:
+            hold.unlink(missing_ok=True)
         cluster.close()
 
 
@@ -1206,7 +1257,7 @@ def main():
     direct = os.environ.get('NABEDRA_TEST_DIRECT_OLTP') != 'off'
     if args.capacity_only:
         with tempfile.TemporaryDirectory(prefix='nabedra-o21-capacity-') as root:
-            check_capacity_deficit(args.binary, Path(root), direct)
+            check_capacity_deficit(args.binary, Path(root), direct, test_executable=args.test_executable)
         return
     if args.scenario == 'O21':
         with args.binary.open('rb') as binary:
