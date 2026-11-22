@@ -22,7 +22,7 @@ const ADMIN: &str = "ns28-admin";
 struct Directory(PathBuf);
 impl Directory {
     fn new(label: &str) -> Self {
-        Self(std::env::temp_dir().join(format!("nabedra-ns28-{label}-{}", Uuid::new_v4())))
+        Self(std::env::temp_dir().join(format!("nabedra-ns28-{label}-{}", nabedra_rt::ids::uuid_v4())))
     }
 }
 impl Drop for Directory {
@@ -61,13 +61,13 @@ async fn raw(app: &Router, body: String) -> (StatusCode, Value) {
 }
 
 async fn data(app: &Router, operation: &str, payload: Value) -> Value {
-    let (status, reply) = send(app, Uuid::new_v4(), operation, payload).await;
+    let (status, reply) = send(app, nabedra_rt::ids::uuid_v4(), operation, payload).await;
     assert_eq!(status, StatusCode::OK, "{operation}: {reply}");
     reply["data"].clone()
 }
 
 async fn refused(app: &Router, operation: &str, payload: Value) -> Value {
-    let (status, reply) = send(app, Uuid::new_v4(), operation, payload).await;
+    let (status, reply) = send(app, nabedra_rt::ids::uuid_v4(), operation, payload).await;
     assert_ne!(status, StatusCode::OK, "{operation}: {reply}");
     reply["error"]["code"].clone()
 }
@@ -135,7 +135,7 @@ async fn open_with(
 /// and `o07_o08_o10_atomic_conflicts_stable_replays_and_database_binding` on the pool path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o01_o03_o04_o07_o08_o10_pool_path_thirteen_operations_types_order_conflicts_and_replay() {
-    tokio::time::timeout(Duration::from_secs(120), async {
+    nabedra_rt::time::timeout(Duration::from_secs(120), async {
         let dir = Directory::new("operations");
         let (runtime, app) = open(&dir.0).await;
         let id = create(&app, "items").await;
@@ -186,7 +186,7 @@ async fn o01_o03_o04_o07_o08_o10_pool_path_thirteen_operations_types_order_confl
         ] {
             let body = format!(
                 r#"{{"request_id":"{}","operation":"{operation}","payload":{payload}}}"#,
-                Uuid::new_v4()
+                nabedra_rt::ids::uuid_v4()
             );
             let (status, reply) = raw(&app, body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{operation}: {reply}");
@@ -313,7 +313,7 @@ async fn o01_o03_o04_o07_o08_o10_pool_path_thirteen_operations_types_order_confl
 
         // O08/O10: the same identity and body replays one decision; a changed body
         // under that identity never applies.
-        let request_id = Uuid::new_v4();
+        let request_id = nabedra_rt::ids::uuid_v4();
         let insert = json!({"table_id":id,"row":row(7, 1.0, "seven")});
         let first = send(&app, request_id, "table.insert", insert.clone()).await;
         assert_eq!(first.0, StatusCode::OK, "{}", first.1);
@@ -369,7 +369,7 @@ async fn o01_o03_o04_o07_o08_o10_pool_path_thirteen_operations_types_order_confl
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "O21 growth takes 15-30 minutes in a debug build; run with --ignored --exact"]
 async fn o10_o21_pool_path_growth_past_old_row_and_byte_limits_survives_cold_restart() {
-    tokio::time::timeout(Duration::from_secs(3600), async {
+    nabedra_rt::time::timeout(Duration::from_secs(3600), async {
         let dir = Directory::new("growth");
         // Terminal records hold queue bytes until result retention expires, so
         // bulk loading uses the default 256 MiB replica queue and a short retention.
@@ -378,7 +378,7 @@ async fn o10_o21_pool_path_growth_past_old_row_and_byte_limits_survives_cold_res
             ..Default::default()
         };
         let (runtime, app) = open_with(&dir.0, execution.clone(), false).await;
-        let started = std::time::Instant::now();
+        let started = nabedra_rt::time::now_std();
         let id = create(&app, "large").await;
         let text = "x".repeat(640);
         let total = 110_001_i64;
@@ -389,7 +389,7 @@ async fn o10_o21_pool_path_growth_past_old_row_and_byte_limits_survives_cold_res
                 .collect();
             // Admission sheds load with a not-applied 429 while earlier batches
             // still hold replica queue bytes; a client resubmits the same identity.
-            let request_id = Uuid::new_v4();
+            let request_id = nabedra_rt::ids::uuid_v4();
             let payload = json!({"table_id":id,"rows":rows});
             let reply = loop {
                 let (status, reply) =
@@ -400,7 +400,7 @@ async fn o10_o21_pool_path_growth_past_old_row_and_byte_limits_survives_cold_res
                 }
                 assert_eq!(reply["error"]["outcome"], "not_applied", "{reply}");
                 overloaded += 1;
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(20)).await;
             };
             assert_eq!(reply["data"], json!((first + 5000).min(total) - first));
             if first % 20_000 == 0 {
@@ -497,9 +497,9 @@ async fn o02_pool_refuses_foreign_engine_and_identity_and_reopens_its_own() {
     let identity = PoolIdentity {
         engine: "oltp".into(),
         pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-        cluster_id: Uuid::new_v4(),
-        worker_id: Uuid::new_v4(),
-        pool_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
     };
     drop(OltpPool::open_development(&dir.0, identity.clone(), shared.clone()).unwrap());
     for foreign in [
@@ -508,11 +508,11 @@ async fn o02_pool_refuses_foreign_engine_and_identity_and_reopens_its_own() {
             ..identity.clone()
         },
         PoolIdentity {
-            cluster_id: Uuid::new_v4(),
+            cluster_id: nabedra_rt::ids::uuid_v4(),
             ..identity.clone()
         },
         PoolIdentity {
-            pool_id: Uuid::new_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
             ..identity.clone()
         },
     ] {

@@ -132,7 +132,7 @@ impl WorkerRuntime {
                         intent: intent.clone(),
                         catalog_group_id: self.services.catalog.participant().identity().group_id,
                         reservation,
-                        pin_id: Uuid::new_v4(),
+                        pin_id: nabedra_rt::ids::uuid_v4(),
                     })
                     .await?;
                 client.job(split_id).await?.ok_or_else(unknown)?
@@ -249,7 +249,7 @@ impl WorkerRuntime {
                         authority,
                         split_id,
                         guard,
-                        pin_id: Uuid::new_v4(),
+                        pin_id: nabedra_rt::ids::uuid_v4(),
                     })
                     .await?,
             )?
@@ -396,7 +396,7 @@ impl WorkerRuntime {
                     {
                         self.help_lifecycle(holder).await?;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    nabedra_rt::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 Err(error) => return Err(split_plan_error(error)),
             }

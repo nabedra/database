@@ -194,18 +194,18 @@ fn span(start: Option<i64>, end: Option<i64>) -> KeySpan {
 impl Cluster {
     async fn new() -> Self {
         crate::oltp_runtime::direct::trace_for_test();
-        let dir = Dir(std::env::temp_dir().join(format!("t6-gateway-{}", Uuid::new_v4())));
+        let dir = Dir(std::env::temp_dir().join(format!("t6-gateway-{}", nabedra_rt::ids::uuid_v4())));
         std::fs::create_dir_all(&dir.0).unwrap();
         let certificates = tls::certificates(&dir.0, 3);
-        let cluster_id = Uuid::new_v4();
-        let table = Uuid::new_v4();
+        let cluster_id = nabedra_rt::ids::uuid_v4();
+        let table = nabedra_rt::ids::uuid_v4();
         let mut listeners = Vec::new();
         let mut workers = Vec::new();
         for tls in &certificates {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             workers.push(WorkerEnrollment {
-                worker_id: Uuid::new_v4(),
-                incarnation: Uuid::new_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                incarnation: nabedra_rt::ids::uuid_v4(),
                 certificate_sha256: Digest::parse(tls.certificate_sha256()).unwrap(),
                 enrollment_revision: 1,
                 endpoint: Text::new(listener.local_addr().unwrap().to_string()).unwrap(),
@@ -234,7 +234,7 @@ impl Cluster {
         {
             let id = index as u64 + 1;
             let shared = resources();
-            let pool_id = Uuid::new_v4();
+            let pool_id = nabedra_rt::ids::uuid_v4();
             let pool = OltpPool::open_development(
                 dir.0.join(format!("pool{id}")),
                 PoolIdentity {
@@ -260,7 +260,7 @@ impl Cluster {
                 .unwrap(),
             );
             let (stop, stopped) = oneshot::channel();
-            let task = tokio::spawn(transport.clone().run(listener, async {
+            let task = nabedra_rt::task::spawn(transport.clone().run(listener, async {
                 let _ = stopped.await;
             }));
             let executor = DirectExecutor::new(
@@ -289,9 +289,9 @@ impl Cluster {
             cluster_id,
             database: Text::try_from("t6").unwrap(),
             table,
-            catalog: Uuid::new_v4(),
+            catalog: nabedra_rt::ids::uuid_v4(),
             authority: Authority {
-                run_id: Uuid::new_v4(),
+                run_id: nabedra_rt::ids::uuid_v4(),
                 owner_term: 1,
             },
             timestamps,
@@ -306,10 +306,10 @@ impl Cluster {
         let identity = GroupIdentity {
             cluster_id: self.cluster_id,
             database: self.database.clone(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Data {
                 table_id: self.table,
-                shard_id: Uuid::new_v4(),
+                shard_id: nabedra_rt::ids::uuid_v4(),
             },
             group_format_version: 1,
         };
@@ -399,7 +399,7 @@ impl Cluster {
             replicas,
         });
         let group = self.groups.len() - 1;
-        let (transition, authority, catalog) = (Uuid::new_v4(), self.authority, self.catalog);
+        let (transition, authority, catalog) = (nabedra_rt::ids::uuid_v4(), self.authority, self.catalog);
         watchdog(|| async {
             let leader = self.leader(group).await;
             self.groups[group].replicas[leader]
@@ -745,12 +745,12 @@ async fn answer(gateway: &DirectGateway, body: &[u8], request_id: Uuid) -> Answe
 }
 
 async fn watchdog<T, F: Future<Output = Option<T>>>(mut probe: impl FnMut() -> F) -> T {
-    tokio::time::timeout(Duration::from_secs(60), async {
+    nabedra_rt::time::timeout(Duration::from_secs(60), async {
         loop {
             if let Some(value) = probe().await {
                 return value;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -802,17 +802,17 @@ async fn o06_o18_cached_blackholed_data_leader_leaves_time_to_retry() {
         source.clone(),
         transport.clone(),
     );
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let get = cluster.body(id, "table.get", json!({"key": 1}));
     assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
-    *transport.disconnected.lock().unwrap() = Some(Instant::now());
-    let id = Uuid::new_v4();
+    *transport.disconnected.lock().unwrap() = Some(nabedra_rt::time::now());
+    let id = nabedra_rt::ids::uuid_v4();
     let update = cluster.body(
         id,
         "table.update",
         json!({"key": 1, "values": {"value": 2}}),
     );
-    let result = tokio::time::timeout(Duration::from_secs(4), answer(&gateway, &update, id)).await;
+    let result = nabedra_rt::time::timeout(Duration::from_secs(4), answer(&gateway, &update, id)).await;
     cluster.shutdown().await;
     assert_eq!(
         result.expect("blackholed voter used the entire client budget"),
@@ -837,7 +837,7 @@ async fn o06_o18_slow_live_leader_keeps_one_mutation_attempt() {
             Box::pin(async move {
                 if voter.node_id == 1 {
                     self.0.fetch_add(1, Ordering::Relaxed);
-                    tokio::time::sleep(PEER_ATTEMPT + Duration::from_millis(300)).await;
+                    nabedra_rt::time::sleep(PEER_ATTEMPT + Duration::from_millis(300)).await;
                     return Ok(DirectResponse::Done(DirectData::from_json("true").unwrap()));
                 }
                 Ok(DirectResponse::NotLeader { hint: Some(1) })
@@ -855,13 +855,13 @@ async fn o06_o18_slow_live_leader_keeps_one_mutation_attempt() {
         source,
         transport.clone(),
     );
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let update = cluster.body(
         id,
         "table.update",
         json!({"key": 1, "values": {"value": 2}}),
     );
-    let result = tokio::time::timeout(Duration::from_secs(4), answer(&gateway, &update, id)).await;
+    let result = nabedra_rt::time::timeout(Duration::from_secs(4), answer(&gateway, &update, id)).await;
     cluster.shutdown().await;
     assert_eq!(result.unwrap(), Answer::Data(json!(true)));
     assert_eq!(transport.0.load(Ordering::Relaxed), 1);
@@ -924,14 +924,14 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
     ];
     let mut latencies = Vec::new();
     for (operation, payload, expected) in &cases {
-        let id = Uuid::new_v4();
-        let started = std::time::Instant::now();
+        let id = nabedra_rt::ids::uuid_v4();
+        let started = nabedra_rt::time::now_std();
         let got = answer(&gateway, &cluster.body(id, operation, payload.clone()), id).await;
         latencies.push((*operation, started.elapsed()));
         assert_eq!(got, Answer::Data(expected.clone()), "{operation} {payload}");
     }
     // Definite errors pass through with the leader's code and outcome.
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let conflict = answer(
         &gateway,
         &cluster.body(id, "table.insert", json!({"row": {"id": 1, "value": 0}})),
@@ -944,7 +944,7 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
     );
     // A key of the wrong type never reaches a leader: the queued path gives
     // the exact validation error.
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let sent = transport.sent.load(Ordering::Relaxed);
     assert_eq!(
         answer(
@@ -970,7 +970,7 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
         ("query.count", json!({"query": {}})),
         ("table.drop", json!({})),
     ] {
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         assert_eq!(
             answer(&gateway, &cluster.body(id, operation, payload), id).await,
             Answer::Queued
@@ -989,7 +989,7 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
     switch.set_active(false);
     let sent = transport.sent.load(Ordering::Relaxed);
     for (operation, payload, _) in &cases {
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         assert_eq!(
             answer(&gateway, &cluster.body(id, operation, payload.clone()), id).await,
             Answer::Queued
@@ -1002,7 +1002,7 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
     // RV-FINAL M3).
     switch.set_active(true);
     switch.set_direct_oltp(false);
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         answer(
             &gateway,
@@ -1022,7 +1022,7 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
         Some(json!({"id": 1, "value": 11}))
     );
     let sent = transport.sent.load(Ordering::Relaxed);
-    let get = Uuid::new_v4();
+    let get = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         answer(
             &gateway,
@@ -1035,7 +1035,7 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
     assert_eq!(transport.sent.load(Ordering::Relaxed), sent, "no forward");
     assert!(!cluster.settled(group, 1, get).await, "no get marker");
     // `POST /v1/requests` (asynchronous): the same for a get.
-    let get = Uuid::new_v4();
+    let get = nabedra_rt::ids::uuid_v4();
     assert!(matches!(
         gateway
             .route(&cluster.body(get, "table.get", json!({"key": 1})), true)
@@ -1048,7 +1048,7 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
     // gets read directly.
     switch.set_direct_oltp(true);
     switch.set_history(true);
-    let update = Uuid::new_v4();
+    let update = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         answer(
             &gateway,
@@ -1063,7 +1063,7 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
         Answer::Queued
     );
     assert!(cluster.settled(group, 1, update).await, "forward marker");
-    let get = Uuid::new_v4();
+    let get = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         answer(
             &gateway,
@@ -1102,7 +1102,7 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
     let rows: Vec<String> = (0..4000)
         .map(|i| format!("{{\"id\":{}{pad},\"value\":{i}}}", 100_000 + i))
         .collect();
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = format!(
         r#"{{"request_id":"{id}","operation":"table.insert_many","payload":{{"table_id":"{}","rows":[{}]}}}}"#,
         cluster.table,
@@ -1139,7 +1139,7 @@ async fn o03_d04_gateway_follows_the_leader_and_resends_after_a_lost_reply() {
     let source = Source::new(vec![cluster.fill(&[group])], cluster.voters());
     let transport = cluster.transport();
     let gateway = cluster.gateway(direct_on(), source.clone(), transport.clone());
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let insert = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
     assert_eq!(
         answer(&gateway, &insert, id).await,
@@ -1154,7 +1154,7 @@ async fn o03_d04_gateway_follows_the_leader_and_resends_after_a_lost_reply() {
     // A lost reply: the leader committed, the gateway resends the same id
     // and body and gets the original result; one version.
     transport.lose.store(1, Ordering::SeqCst);
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let update = cluster.body(
         id,
         "table.update",
@@ -1188,22 +1188,22 @@ async fn o28_gateway_routes_a_key_past_the_former_table_fill_cap() {
     let template = fill.shards[0].clone();
     for end in (1..=1025).rev() {
         let mut shard = template.clone();
-        shard.group.group_id = Uuid::new_v4();
+        shard.group.group_id = nabedra_rt::ids::uuid_v4();
         let GroupKind::Data { shard_id, .. } = &mut shard.group.kind else {
             unreachable!();
         };
-        *shard_id = Uuid::new_v4();
+        *shard_id = nabedra_rt::ids::uuid_v4();
         shard.span = span((end > 1).then_some(end - 1), Some(end));
         fill.shards.insert(0, shard);
     }
     let source = Source::new(vec![fill], cluster.voters());
     let switch = direct_on();
     let gateway = cluster.gateway(switch.clone(), source.clone(), cluster.transport());
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let get = cluster.body(id, "table.get", json!({"key": 1025}));
     assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
     switch.set_direct_oltp(false);
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let update = cluster.body(
         id,
         "table.update",
@@ -1232,7 +1232,7 @@ async fn o28_d07_same_id_retry_refreshes_a_retired_split_parent() {
         let gateway = cluster
             .gateway(direct_on(), source.clone(), transport.clone())
             .with_deadline(Duration::from_secs(2));
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let get = cluster.body(id, "table.get", json!({"key": 7}));
         assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
         assert_eq!(source.reads(), (1, 1));
@@ -1242,7 +1242,7 @@ async fn o28_d07_same_id_retry_refreshes_a_retired_split_parent() {
             .unwrap()
             .insert(cluster.shard(parent).group.group_id);
 
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let mutation = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
         let error = gateway.route(&mutation, asynchronous).await.err().unwrap();
         // The fixture's retired voters explicitly refuse leadership. A
@@ -1290,7 +1290,7 @@ async fn o06_o18_failed_settlement_keeps_the_independent_range_warm() {
     let gateway = cluster
         .gateway(direct_on(), source.clone(), transport.clone())
         .with_deadline(Duration::from_millis(400));
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let get = cluster.body(id, "table.get", json!({"key": 7}));
     assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
     transport
@@ -1299,7 +1299,7 @@ async fn o06_o18_failed_settlement_keeps_the_independent_range_warm() {
         .unwrap()
         .insert(cluster.shard(left).group.group_id);
     let write = cluster.body(
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
         "table.insert",
         json!({"row": {"id": 1, "value": 1}}),
     );
@@ -1328,7 +1328,7 @@ async fn d02_q05_rv_final_l2_uncertain_resend_never_reports_a_definite_failure()
     let source = Source::new(vec![cluster.fill(&[group])], cluster.voters());
     let transport = cluster.transport();
     let gateway = cluster.gateway(direct_on(), source.clone(), transport.clone());
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let insert = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
     let schema = cluster.schema.clone();
     let table = cluster.table;
@@ -1369,7 +1369,7 @@ async fn d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome() {
     let transport = cluster.transport();
     let switch = direct_on();
     let gateway = cluster.gateway(switch.clone(), source, transport.clone());
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let insert = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
     let deny = Arc::downgrade(&transport);
     *transport.after_lose.lock().unwrap() = Some(Box::new(move || {
@@ -1381,7 +1381,7 @@ async fn d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome() {
     let (version, row) = cluster.latest(group, 0, 7).await;
     assert!(version.is_some());
     assert_eq!(row, Some(json!({"id": 7, "value": 1})));
-    let refused_id = Uuid::new_v4();
+    let refused_id = nabedra_rt::ids::uuid_v4();
     let refused = cluster.body(
         refused_id,
         "table.insert",
@@ -1421,7 +1421,7 @@ async fn d10_o03_bug1_get_without_a_reply_has_no_unknown_mutation_outcome() {
         .gateway(direct_on(), source, transport.clone())
         .with_deadline(Duration::from_millis(250));
     transport.down.lock().unwrap().extend([1, 2, 3]);
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let get = cluster.body(id, "table.get", json!({"key": 7}));
 
     let missing_reply = answer(&gateway, &get, id).await;
@@ -1442,7 +1442,7 @@ async fn d04_o13_bug1_raft_follower_refuses_the_proposal_before_append() {
     let group = cluster.add_group(span(None, None), 1, &[1]).await;
     let follower = &cluster.groups[group].replicas[1];
     let command = ParticipantCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: Some(cluster.authority),
         next: cluster.authority,
         schema_epoch: 1,
@@ -1475,7 +1475,7 @@ async fn d04_d05_gateway_retries_on_the_new_leader_and_answers_at_the_deadline()
     let gateway = cluster
         .gateway(direct_on(), source.clone(), transport.clone())
         .with_deadline(Duration::from_secs(15));
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let insert = cluster.body(id, "table.insert", json!({"row": {"id": 1, "value": 1}}));
     assert_eq!(
         answer(&gateway, &insert, id).await,
@@ -1484,7 +1484,7 @@ async fn d04_d05_gateway_retries_on_the_new_leader_and_answers_at_the_deadline()
     let leader = cluster.groups[group].replicas[cluster.leader(group).await].node;
     transport.down.lock().unwrap().insert(leader);
     cluster.stop_node(leader).await;
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let update = cluster.body(
         id,
         "table.update",
@@ -1507,13 +1507,13 @@ async fn d04_d05_gateway_retries_on_the_new_leader_and_answers_at_the_deadline()
     let short = cluster
         .gateway(direct_on(), source.clone(), transport.clone())
         .with_deadline(Duration::from_secs(3));
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let update = cluster.body(
         id,
         "table.update",
         json!({"key": 1, "values": {"value": 3}}),
     );
-    let started = std::time::Instant::now();
+    let started = nabedra_rt::time::now_std();
     match answer(&short, &update, id).await {
         Answer::Error(ErrorCode::OutcomeUnknown, Outcome::Unknown)
         | Answer::Error(ErrorCode::StorageUnavailable, Outcome::NotApplied) => {}
@@ -1543,7 +1543,7 @@ async fn d07_o07_route_refresh_reclassifies_cross_range_batch() {
     let after = cluster.fill(&[left, right]);
     let source = Source::new(vec![before, after], cluster.voters());
     let gateway = cluster.gateway(direct_on(), source.clone(), cluster.transport());
-    let request_id = Uuid::new_v4();
+    let request_id = nabedra_rt::ids::uuid_v4();
     let body = cluster.body(
         request_id,
         "table.insert_many",
@@ -1588,12 +1588,12 @@ async fn d07_o16_split_and_leader_move_under_load_give_one_outcome_per_request()
     let keys: Vec<i64> = (0..48)
         .map(|i| if i % 2 == 0 { i } else { 500 + i })
         .collect();
-    let ids: Vec<Uuid> = keys.iter().map(|_| Uuid::new_v4()).collect();
+    let ids: Vec<Uuid> = keys.iter().map(|_| nabedra_rt::ids::uuid_v4()).collect();
     let mut tasks = Vec::new();
     for (key, id) in keys.iter().copied().zip(ids.iter().copied()) {
         let gateway = gateway.clone();
         let cluster = cluster.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(nabedra_rt::task::spawn(async move {
             let body = cluster.body(
                 id,
                 "table.insert",
@@ -1602,7 +1602,7 @@ async fn d07_o16_split_and_leader_move_under_load_give_one_outcome_per_request()
             (key, id, body.clone(), answer(&gateway, &body, id).await)
         }));
     }
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(30)).await;
     let moved = {
         let leader = cluster.leader(left).await;
         let follower = (leader + 1) % 3;
@@ -1631,7 +1631,7 @@ async fn d07_o16_split_and_leader_move_under_load_give_one_outcome_per_request()
 
     // Phase 2: the split barrier holds the right range. Its requests fall
     // back, are settled at the anchor and go queued; left requests commit.
-    let split_id = Uuid::new_v4();
+    let split_id = nabedra_rt::ids::uuid_v4();
     let pause = |paused| {
         ParticipantCommand::DirectPause(crate::oltp::mvcc::store::direct::DirectPause {
             authority: cluster.authority,
@@ -1644,13 +1644,13 @@ async fn d07_o16_split_and_leader_move_under_load_give_one_outcome_per_request()
         ParticipantReply::DirectPaused { .. }
     ));
     let phase2: Vec<(i64, Uuid)> = (0..16)
-        .map(|i| (if i % 2 == 0 { 100 + i } else { 600 + i }, Uuid::new_v4()))
+        .map(|i| (if i % 2 == 0 { 100 + i } else { 600 + i }, nabedra_rt::ids::uuid_v4()))
         .collect();
     let mut tasks = Vec::new();
     for (key, id) in phase2.iter().copied() {
         let gateway = gateway.clone();
         let cluster = cluster.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(nabedra_rt::task::spawn(async move {
             let body = cluster.body(
                 id,
                 "table.insert",
@@ -1737,7 +1737,7 @@ async fn d08_direct_requests_fall_back_while_a_queued_intent_is_open() {
     let transport = cluster.transport();
     let gateway = cluster.gateway(direct_on(), source.clone(), transport.clone());
     for (key, value) in [(1, 10), (2, 20)] {
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let body = cluster.body(
             id,
             "table.insert",
@@ -1749,7 +1749,7 @@ async fn d08_direct_requests_fall_back_while_a_queued_intent_is_open() {
     // A queued transaction prepares key 1 (an intent) and stays open.
     let shared = cluster.nodes[0].shared.clone();
     let txn = TxnId {
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         attempt: 0,
     };
     let request = RequestBinding {
@@ -1759,7 +1759,7 @@ async fn d08_direct_requests_fall_back_while_a_queued_intent_is_open() {
         accepted_context: Digest::from_bytes([2; 32]),
     };
     let manifest = ManifestRef {
-        status_group_id: Uuid::new_v4(),
+        status_group_id: nabedra_rt::ids::uuid_v4(),
         digest: Digest::from_bytes([3; 32]),
         participant_count: 1,
     };
@@ -1789,7 +1789,7 @@ async fn d08_direct_requests_fall_back_while_a_queued_intent_is_open() {
     plan.write_root = page_root(root, 0, std::slice::from_ref(&write)).unwrap();
     let guard = lifecycle::VerifiedLifecycleGuard::model_for_test(
         lifecycle::LifecycleBinding {
-            guard_id: Uuid::new_v4(),
+            guard_id: nabedra_rt::ids::uuid_v4(),
             catalog_group_id: cluster.catalog,
             table_id: cluster.table,
             lifecycle_version: None,
@@ -1826,7 +1826,7 @@ async fn d08_direct_requests_fall_back_while_a_queued_intent_is_open() {
     // settled at the anchor and go queued; key 2 keeps committing.
     let blocked: Vec<(Uuid, Vec<u8>)> = (0..8)
         .map(|i| {
-            let id = Uuid::new_v4();
+            let id = nabedra_rt::ids::uuid_v4();
             let body = cluster.body(
                 id,
                 "table.update",
@@ -1839,11 +1839,11 @@ async fn d08_direct_requests_fall_back_while_a_queued_intent_is_open() {
     let mut tasks = Vec::new();
     for (id, body) in blocked.iter().cloned() {
         let gateway = gateway.clone();
-        tasks.push(tokio::spawn(
+        tasks.push(nabedra_rt::task::spawn(
             async move { answer(&gateway, &body, id).await },
         ));
     }
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let other = cluster.body(
         id,
         "table.update",
@@ -1865,7 +1865,7 @@ async fn d08_direct_requests_fall_back_while_a_queued_intent_is_open() {
     // A get on the intent key also takes the queued path, unsettled
     // (RV-FINAL M3): no forward, no marker.
     let sent = transport.sent.load(Ordering::Relaxed);
-    let get = Uuid::new_v4();
+    let get = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         answer(
             &gateway,
@@ -1935,7 +1935,7 @@ async fn d08_direct_requests_fall_back_while_a_queued_intent_is_open() {
     }
     assert_eq!(cluster.latest(group, 0, 1).await.0, Some(queued_ts));
     // A new direct writer serializes after the queued commit.
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let later = cluster.body(
         id,
         "table.update",
@@ -1960,24 +1960,24 @@ async fn d08_direct_requests_fall_back_while_a_queued_intent_is_open() {
 /// does not recognize is left to the queued path.
 #[test]
 fn o03_scan_and_route_keys_follow_the_route_key_column() {
-    let table = Uuid::new_v4();
+    let table = nabedra_rt::ids::uuid_v4();
     let body = |op: &str, payload: Value| {
         let mut payload = payload;
         payload["table_id"] = json!(table);
         serde_json::to_vec(
-            &json!({"request_id": Uuid::new_v4(), "operation": op, "payload": payload}),
+            &json!({"request_id": nabedra_rt::ids::uuid_v4(), "operation": op, "payload": payload}),
         )
         .unwrap()
     };
     let shared = resources();
     let group = |start: Option<i64>, end: Option<i64>| ShardRoute {
         group: GroupIdentity {
-            cluster_id: Uuid::new_v4(),
+            cluster_id: nabedra_rt::ids::uuid_v4(),
             database: Text::try_from("t6").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Data {
                 table_id: table,
-                shard_id: Uuid::new_v4(),
+                shard_id: nabedra_rt::ids::uuid_v4(),
             },
             group_format_version: 1,
         },
@@ -2037,7 +2037,7 @@ fn o03_scan_and_route_keys_follow_the_route_key_column() {
     }
     let duplicate = format!(
         r#"{{"request_id":"{}","operation":"table.insert","payload":{{"table_id":"{table}","row":{{"id":1,"id":2}}}}}}"#,
-        Uuid::new_v4()
+        nabedra_rt::ids::uuid_v4()
     );
     assert!(keys(duplicate.as_bytes()).is_none());
     // Not eligible or not an envelope: no scan.
@@ -2050,7 +2050,7 @@ fn o03_scan_and_route_keys_follow_the_route_key_column() {
     }
     let extra = format!(
         r#"{{"request_id":"{}","operation":"table.get","payload":{{"table_id":"{table}","key":1}},"x":1}}"#,
-        Uuid::new_v4()
+        nabedra_rt::ids::uuid_v4()
     );
     assert!(scan(extra.as_bytes()).is_none(), "unknown envelope field");
 }
@@ -2059,16 +2059,16 @@ fn o03_scan_and_route_keys_follow_the_route_key_column() {
 fn o28_topology_cache_is_a_byte_bounded_range_lru() {
     let shared = resources();
     let cache = TopologyCache::new();
-    let table_id = Uuid::new_v4();
+    let table_id = nabedra_rt::ids::uuid_v4();
     let route = |lo| {
         let shard = ShardRoute {
             group: GroupIdentity {
-                cluster_id: Uuid::new_v4(),
+                cluster_id: nabedra_rt::ids::uuid_v4(),
                 database: Text::try_from("t6").unwrap(),
-                group_id: Uuid::new_v4(),
+                group_id: nabedra_rt::ids::uuid_v4(),
                 kind: GroupKind::Data {
                     table_id,
-                    shard_id: Uuid::new_v4(),
+                    shard_id: nabedra_rt::ids::uuid_v4(),
                 },
                 group_format_version: 1,
             },

@@ -251,11 +251,11 @@ impl WorkerRuntime {
                 client.install_admission_issuer(issuer.clone())?;
             }
         }
-        let retirement = tokio::spawn(async move {
+        let retirement = nabedra_rt::task::spawn(async move {
             let reclaim = index_reclaim::reclaim_indexes(weak.clone());
             let retire = async move {
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    nabedra_rt::time::sleep(std::time::Duration::from_millis(100)).await;
                     let Some(runtime) = weak.upgrade() else {
                         break;
                     };
@@ -263,12 +263,12 @@ impl WorkerRuntime {
                         break;
                     }
                     let _ = runtime.tick_supervision();
-                    let _ = tokio::time::timeout(
+                    let _ = nabedra_rt::time::timeout(
                         std::time::Duration::from_secs(2),
                         runtime.dispatch_retained(),
                     )
                     .await;
-                    let _ = tokio::time::timeout(
+                    let _ = nabedra_rt::time::timeout(
                         std::time::Duration::from_secs(2),
                         runtime.retire_expired(),
                     )
@@ -1133,7 +1133,7 @@ impl WorkerRuntime {
                         CaptureRead::Captured(capture) => break capture,
                         CaptureRead::Blocked(intent) => {
                             self.help_intent(intent).await?;
-                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            nabedra_rt::time::sleep(std::time::Duration::from_millis(2)).await;
                         }
                     }
                 };
@@ -1491,7 +1491,7 @@ impl WorkerRuntime {
                 point,
             );
             let result = match &split_retry {
-                Some((deadline, error)) => match tokio::time::timeout_at(*deadline, planning).await
+                Some((deadline, error)) => match nabedra_rt::time::timeout_at(*deadline, planning).await
                 {
                     Ok(result) => result,
                     Err(_) => break Err(PlanError::Protocol(error.clone())),
@@ -1527,10 +1527,10 @@ impl WorkerRuntime {
                     }
                     // Each plan drops its native and query grants before waiting.
                     // Re-read Catalog at the original accepted timestamp.
-                    let now = tokio::time::Instant::now();
+                    let now = nabedra_rt::time::now();
                     let (deadline, _) = split_retry
                         .get_or_insert_with(|| (now + std::time::Duration::from_secs(10), error));
-                    tokio::time::sleep_until((now + split_backoff).min(*deadline)).await;
+                    nabedra_rt::time::sleep_until((now + split_backoff).min(*deadline)).await;
                     split_backoff = (split_backoff * 2).min(std::time::Duration::from_millis(250));
                     continue;
                 }
@@ -1566,13 +1566,13 @@ impl WorkerRuntime {
             }
             if txn.attempt > 1
                 && blocked_since
-                    .get_or_insert_with(tokio::time::Instant::now)
+                    .get_or_insert_with(nabedra_rt::time::now)
                     .elapsed()
                     >= RETRY_PROGRESS_TIMEOUT
             {
                 return Err(unknown());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            nabedra_rt::time::sleep(std::time::Duration::from_millis(2)).await;
         };
         Ok(planned)
     }
@@ -1902,7 +1902,7 @@ impl HttpRuntime for WorkerRuntime {
                 changed.as_mut().enable();
                 let observe = self.receipt_owned(record.run_id, record.request_id);
                 let receipt = match copy_deadline {
-                    Some(deadline) => tokio::time::timeout_at(deadline, observe)
+                    Some(deadline) => nabedra_rt::time::timeout_at(deadline, observe)
                         .await
                         .map_err(|_| unavailable())?,
                     None => observe.await,
@@ -1922,7 +1922,7 @@ impl HttpRuntime for WorkerRuntime {
                 }
                 if receipt.state == RequestState::Committing || copy_deadline.is_some() {
                     // A remote owner's confirmation does not notify this worker.
-                    let now = tokio::time::Instant::now();
+                    let now = nabedra_rt::time::now();
                     let deadline =
                         *copy_deadline.get_or_insert(now + super::RECEIPT_OBSERVATION_TIMEOUT);
                     if now >= deadline {
@@ -1930,7 +1930,7 @@ impl HttpRuntime for WorkerRuntime {
                     }
                     tokio::select! {
                         () = &mut changed => {},
-                        () = tokio::time::sleep_until(deadline.min(now + interval)) => {},
+                        () = nabedra_rt::time::sleep_until(deadline.min(now + interval)) => {},
                     }
                     interval = (interval * 2).min(std::time::Duration::from_millis(500));
                 } else {
@@ -2243,10 +2243,10 @@ fn receipt_body(
 #[test]
 fn q04_r01_r02_reconciling_observation_requires_exact_reserved_read() {
     let reservation = IdentityReservation {
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         digest: Digest::from_bytes([1; 32]),
-        original_run: Uuid::new_v4(),
-        reservation_id: Uuid::new_v4(),
+        original_run: nabedra_rt::ids::uuid_v4(),
+        reservation_id: nabedra_rt::ids::uuid_v4(),
         kind: RequestKind::Read,
         scoped: None,
     };
@@ -2280,11 +2280,11 @@ fn q04_r01_r02_reconciling_observation_requires_exact_reserved_read() {
             ..reservation
         },
         IdentityReservation {
-            original_run: Uuid::new_v4(),
+            original_run: nabedra_rt::ids::uuid_v4(),
             ..reservation
         },
         IdentityReservation {
-            request_id: Uuid::new_v4(),
+            request_id: nabedra_rt::ids::uuid_v4(),
             ..reservation
         },
         IdentityReservation {
@@ -2341,10 +2341,10 @@ fn q04_r01_r02_reconciling_observation_requires_exact_reserved_read() {
 #[test]
 fn q04_q06_result_snapshot_checks_request_digest_status_and_terminal_hash() {
     let reservation = IdentityReservation {
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         digest: Digest::from_bytes([1; 32]),
-        original_run: Uuid::new_v4(),
-        reservation_id: Uuid::new_v4(),
+        original_run: nabedra_rt::ids::uuid_v4(),
+        reservation_id: nabedra_rt::ids::uuid_v4(),
         kind: RequestKind::Mutation,
         scoped: None,
     };
@@ -2361,9 +2361,9 @@ fn q04_q06_result_snapshot_checks_request_digest_status_and_terminal_hash() {
     let mut wrong_status = original.clone();
     wrong_status.record.response_status = Some(202);
     let mut wrong_run = original.clone();
-    wrong_run.record.run_id = Uuid::new_v4();
+    wrong_run.record.run_id = nabedra_rt::ids::uuid_v4();
     let mut wrong_request = original.clone();
-    wrong_request.record.request_id = Uuid::new_v4();
+    wrong_request.record.request_id = nabedra_rt::ids::uuid_v4();
     for altered in [
         wrong_digest,
         wrong_payload,
@@ -2415,7 +2415,7 @@ fn q04_q06_result_snapshot_checks_request_digest_status_and_terminal_hash() {
 }
 
 fn now() -> u64 {
-    std::time::SystemTime::now()
+    nabedra_rt::time::wall_now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()

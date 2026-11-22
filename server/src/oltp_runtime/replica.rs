@@ -18,7 +18,7 @@ use sha2::{Digest as _, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use uuid::Uuid;
 
@@ -164,7 +164,7 @@ pub(super) async fn wait_for_local_ready_view(
     expected: QueueAuthority,
 ) -> Result<(), QueueError> {
     // Registered membership polls every 250 ms and skips quiet passes for up to 2 s.
-    tokio::time::timeout(Duration::from_secs(3), async {
+    nabedra_rt::time::timeout(Duration::from_secs(3), async {
         loop {
             let local = replica.lock().map_err(|_| QueueError::Unavailable)?.authority();
             if local == expected {
@@ -173,7 +173,7 @@ pub(super) async fn wait_for_local_ready_view(
             if !local.view_is_behind(expected.ready.view) {
                 return Err(QueueError::Stale);
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
@@ -649,7 +649,7 @@ impl WorkerReplica {
         Ok(QueueCopyStatement {
             ticket,
             source: self.local,
-            snapshot_id: Uuid::new_v4(),
+            snapshot_id: nabedra_rt::ids::uuid_v4(),
             snapshot_cut: 0,
             final_cut: 0,
             record_version_hash: hash(b"nabedra/ram-queue-cut/v1\0"),
@@ -1404,7 +1404,7 @@ impl WorkerReplica {
             && matches!(barrier.acceptance_timing, AcceptanceTiming::Copying)
         {
             self.queue_latency
-                .accepted(&mut barrier.acceptance_timing, Instant::now());
+                .accepted(&mut barrier.acceptance_timing, nabedra_rt::time::now_std());
         }
         Ok(None)
     }
@@ -1518,7 +1518,7 @@ impl WorkerReplica {
             })
         {
             self.queue_latency
-                .dispatch(&mut barrier.acceptance_timing, Instant::now());
+                .dispatch(&mut barrier.acceptance_timing, nabedra_rt::time::now_std());
         }
     }
 

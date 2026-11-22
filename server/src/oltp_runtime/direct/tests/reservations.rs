@@ -42,7 +42,7 @@ async fn o08_o13_small_data_proposals_share_two_gib() {
                 table_id: cluster.table,
                 schema_epoch: 1,
                 routing_epoch: 1,
-                request_id: Uuid::new_v4(),
+                request_id: nabedra_rt::ids::uuid_v4(),
                 digest: Digest::from_bytes([0; 32]),
                 commit_ts: CommitTs::new(1_000 + id as u64).unwrap(),
                 writes: vec![DirectWrite {
@@ -107,7 +107,7 @@ async fn o08_o13_small_data_proposals_share_two_gib() {
     let replies = pending
         .into_iter()
         .map(|proposal| async move { proposal.await.unwrap().reply });
-    let replies = tokio::time::timeout(
+    let replies = nabedra_rt::time::timeout(
         Duration::from_secs(45),
         futures_util::future::join_all(replies),
     )

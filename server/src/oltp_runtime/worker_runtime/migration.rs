@@ -111,7 +111,7 @@ impl WorkerRuntime {
             return Err(unavailable());
         }
         let authority = current.ready.view.authority();
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let digest = serialized_digest(&(
             b"offline-import-metadata/v1",
             archive_id,
@@ -376,7 +376,7 @@ impl WorkerRuntime {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let target_id = Uuid::new_v4();
+        let target_id = nabedra_rt::ids::uuid_v4();
         let stage = parent.join(format!(".nabedra-import-{target_id}.partial"));
         import_directory(&stage).map_err(|_| unknown())?;
         let cleanup = ImportDirectory(stage.clone());
@@ -419,7 +419,7 @@ impl WorkerRuntime {
             }
             let verification = stage.join(".import-verification");
             runtime
-                .migration_snapshot(&verification, Uuid::new_v4(), 1)
+                .migration_snapshot(&verification, nabedra_rt::ids::uuid_v4(), 1)
                 .await?;
             runtime
                 .verify_import(&source.archive, &verification.join("snapshot.nab"))
@@ -650,7 +650,7 @@ impl WorkerRuntime {
                             )
                             .map_err(|_| unknown())?,
                         },
-                        Uuid::new_v4(),
+                        nabedra_rt::ids::uuid_v4(),
                         1,
                     )
                     .await?;

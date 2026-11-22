@@ -29,25 +29,25 @@ pub(super) async fn build_archive_split_index(
 ) {
     use crate::oltp::mvcc::index::IndexDefinition;
     let input = directory.join("split-index.json");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let deadline = nabedra_rt::time::now() + Duration::from_secs(90);
     let raw = loop {
         match std::fs::read(&input) {
             Ok(raw) => break raw,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 assert!(
-                    tokio::time::Instant::now() < deadline,
+                    nabedra_rt::time::now() < deadline,
                     "no split index request"
                 );
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(25)).await;
             }
             Err(error) => panic!("read private split index request: {error}"),
         }
     };
     assert!(raw.len() <= 4096);
     let definition: IndexDefinition = serde_json::from_slice(&raw).unwrap();
-    let build = tokio::time::timeout_at(
+    let build = nabedra_rt::time::timeout_at(
         deadline,
-        runtime.create_index(definition, Uuid::new_v4(), 1),
+        runtime.create_index(definition, nabedra_rt::ids::uuid_v4(), 1),
     )
     .await
     .expect("split fixture index build deadline");
@@ -159,7 +159,7 @@ fn write_record(replica: &super::replica::WorkerReplica, directory: &std::path::
         "copies_complete":replica.copies_complete(id),
         "terminal":replica.terminal_copy_statement(id).ok(),
         "state":record.state,"version":record.version,"sequence":record.sequence,
-        "observed_at_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()});
+        "observed_at_ms":nabedra_rt::time::wall_now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()});
     let path = directory.join(format!("record-{id}.json"));
     std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
 }
@@ -206,7 +206,7 @@ pub(super) fn observe_load_copy(
         .unwrap();
     let context = frame.sections[1].as_ref().expect("complete copied context");
     let row = serde_json::json!({
-        "at_unix_ns": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64,
+        "at_unix_ns": nabedra_rt::time::wall_now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64,
         "request_id": id, "digest": header.digest, "owner": header.owner,
         "ready": header.ready, "sequence": header.sequence, "version": record.version,
         "record_digest": record.digest,
@@ -285,13 +285,13 @@ pub(crate) async fn pause(stage: &str, request: Uuid) {
                 writeln!(attempts, "{stage}").unwrap();
                 drop(attempts);
                 std::fs::write(directory.join(format!("reached-{request}")), stage).unwrap();
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+                let deadline = nabedra_rt::time::now() + Duration::from_secs(120);
                 while !directory.join(format!("release-{request}")).exists() {
                     assert!(
-                        tokio::time::Instant::now() < deadline,
+                        nabedra_rt::time::now() < deadline,
                         "registered barrier watchdog expired"
                     );
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    nabedra_rt::time::sleep(Duration::from_millis(10)).await;
                 }
             }
             return;
@@ -313,13 +313,13 @@ pub(crate) async fn pause(stage: &str, request: Uuid) {
     }
     std::fs::write(barrier.directory.join("reached"), stage.as_bytes())
         .expect("write deterministic process barrier");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = nabedra_rt::time::now() + Duration::from_secs(60);
     while !barrier.directory.join("release").exists() {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            nabedra_rt::time::now() < deadline,
             "process barrier watchdog expired"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -347,13 +347,13 @@ pub(super) async fn cold_fence_checkpoint(
     let pending = observation.with_extension("tmp");
     std::fs::write(&pending, serde_json::to_vec(receipt).unwrap()).unwrap();
     std::fs::rename(pending, observation).unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = nabedra_rt::time::now() + Duration::from_secs(60);
     while hold.is_file() {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            nabedra_rt::time::now() < deadline,
             "cold {kind} fence watchdog expired"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -403,13 +403,13 @@ pub(crate) async fn transaction_checkpoint(
         .unwrap();
     drop(file);
     if hold {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let deadline = nabedra_rt::time::now() + Duration::from_secs(120);
         while !directory.join(format!("release-{checkpoint}")).is_file() {
             assert!(
-                tokio::time::Instant::now() < deadline,
+                nabedra_rt::time::now() < deadline,
                 "transaction checkpoint watchdog expired: {checkpoint}"
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }
@@ -423,11 +423,11 @@ pub(super) async fn timestamp_probe(
     if !directory.join("probe-timestamp").is_file() {
         return None;
     }
-    let wall_seconds = std::time::SystemTime::now()
+    let wall_seconds = nabedra_rt::time::wall_now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let result = tokio::time::timeout(Duration::from_secs(2), source.allocate_direct(4)).await;
+    let result = nabedra_rt::time::timeout(Duration::from_secs(2), source.allocate_direct(4)).await;
     Some(match result {
         Ok(Ok(range)) => serde_json::json!({ "window": range, "wall_seconds": wall_seconds }),
         other => serde_json::json!({
@@ -788,7 +788,7 @@ async fn replacement_peer_probe(config: PathBuf) {
         for stale in [false, true] {
             let mut enrollment = config.from.clone();
             if stale {
-                enrollment.incarnation = Uuid::new_v4();
+                enrollment.incarnation = nabedra_rt::ids::uuid_v4();
             }
             let client = WorkerTransport::new(
                 &enrollment,
@@ -808,7 +808,7 @@ async fn replacement_peer_probe(config: PathBuf) {
                 view,
             };
             let header = shared.encode_in(ByteClass::Progress, &ping, 4096).unwrap();
-            let result = tokio::time::timeout(
+            let result = nabedra_rt::time::timeout(
                 Duration::from_secs(8),
                 client.request_classified(
                     &config.group,
@@ -911,18 +911,18 @@ async fn replacement_peer_probe(config: PathBuf) {
         directory.seed_remote_revocations(&*control).await.unwrap();
         let (_refresh_stop, refresh_stopped) = tokio::sync::watch::channel(false);
         if let Some(routes) = &published {
-            tokio::spawn(
+            nabedra_rt::task::spawn(
                 routes
                     .clone()
                     .run_refresh(control.clone(), refresh_stopped.clone()),
             );
-            tokio::spawn(
+            nabedra_rt::task::spawn(
                 directory
                     .clone()
                     .run_refresh(control.clone(), refresh_stopped.clone()),
             );
         }
-        tokio::spawn(
+        nabedra_rt::task::spawn(
             directory
                 .clone()
                 .run_revocation_refresh(control.clone(), refresh_stopped),
@@ -932,7 +932,7 @@ async fn replacement_peer_probe(config: PathBuf) {
         let voters_path = config.directory.join("control-voters.json");
         let revoked_path = config.directory.join("revoked-workers.json");
         let directory_view = directory.clone();
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             loop {
                 if let Some(routes) = &published {
                     let voters = routes.quorum_voters().unwrap();
@@ -954,7 +954,7 @@ async fn replacement_peer_probe(config: PathBuf) {
                 if std::fs::write(&temporary, serde_json::to_vec(&snapshot).unwrap()).is_ok() {
                     let _ = std::fs::rename(&temporary, &stats);
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(100)).await;
             }
         });
         let listener = tokio::net::TcpListener::bind(config.from.endpoint.as_str())
@@ -989,21 +989,21 @@ async fn replacement_peer_probe(config: PathBuf) {
     };
     for phase in ["before", "after", "restarted"] {
         let marker = config.directory.join(format!("probe-{phase}"));
-        tokio::time::timeout(Duration::from_secs(240), async {
+        nabedra_rt::time::timeout(Duration::from_secs(240), async {
             while !marker.exists() {
                 if phase == "after" {
                     // Keep the original sessions open until Control revokes
                     // their identity. Both sessions use the same client below.
                     for target in &config.targets {
-                        let _ = tokio::time::timeout(
+                        let _ = nabedra_rt::time::timeout(
                             Duration::from_secs(2),
                             probe(WorkerIdentity::from(target)),
                         )
                         .await;
                     }
-                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    nabedra_rt::time::sleep(Duration::from_millis(300)).await;
                 } else {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    nabedra_rt::time::sleep(Duration::from_millis(20)).await;
                 }
             }
         })
@@ -1017,7 +1017,7 @@ async fn replacement_peer_probe(config: PathBuf) {
                 assert!(probe(identity).await);
                 let mut samples = Vec::with_capacity(PROBE_SAMPLES);
                 for _ in 0..PROBE_SAMPLES {
-                    let started = std::time::Instant::now();
+                    let started = nabedra_rt::time::now_std();
                     assert!(probe(identity).await);
                     samples.push(started.elapsed().as_micros() as u64);
                 }

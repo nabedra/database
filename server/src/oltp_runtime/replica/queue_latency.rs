@@ -96,7 +96,7 @@ mod tests {
     fn b02_first_dispatch_records_one_bucket_and_does_not_measure_recovery_replays() {
         let mut latency = QueueLatency::default();
         let mut timing = AcceptanceTiming::Copying;
-        let now = Instant::now();
+        let now = nabedra_rt::time::now_std();
         latency.accepted(&mut timing, now);
         latency.accepted(&mut timing, now + Duration::from_micros(50));
         latency.dispatch(&mut timing, now + Duration::from_nanos(50_001));
@@ -112,7 +112,7 @@ mod tests {
         let mut terminal = AcceptanceTiming::Copying;
         let mut fenced = AcceptanceTiming::Copying;
         let mut tentative = AcceptanceTiming::Copying;
-        let now = Instant::now();
+        let now = nabedra_rt::time::now_std();
         latency.accepted(&mut terminal, now);
         latency.accepted(&mut fenced, now);
         latency.discard(&mut tentative);

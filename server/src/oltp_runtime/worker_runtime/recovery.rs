@@ -48,8 +48,8 @@ fn r05_indeterminate_probes_preserve_genuine_misses() {
     use PeerReachability::{Indeterminate, Reachable, Unreachable};
 
     let worker = WorkerIdentity {
-        worker_id: Uuid::new_v4(),
-        incarnation: Uuid::new_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         certificate_sha256: Digest::from_bytes([1; 32]),
         enrollment_revision: 1,
     };
@@ -99,7 +99,7 @@ impl WorkerRuntime {
         }
         {
             let mut probe = self.recovery_probe.lock().map_err(|_| unknown())?;
-            let now = tokio::time::Instant::now();
+            let now = nabedra_rt::time::now();
             if probe.next_turn.is_some_and(|next| now < next) {
                 return Ok(());
             }
@@ -201,7 +201,7 @@ impl WorkerRuntime {
         let current = self.services.control.current(&self.services.scope).await?;
         let target = {
             let mut probe = self.recovery_probe.lock().map_err(|_| unknown())?;
-            let now = tokio::time::Instant::now();
+            let now = nabedra_rt::time::now();
             if probe.next_at.is_some_and(|next| now < next) {
                 return Ok(());
             }
@@ -219,7 +219,7 @@ impl WorkerRuntime {
         let Some(target) = target.filter(|worker| *worker != self.services.local) else {
             return Ok(());
         };
-        let started = tokio::time::Instant::now();
+        let started = nabedra_rt::time::now();
         let live = peer
             .probe(target, self.services.scope.clone(), current.ready)
             .await;

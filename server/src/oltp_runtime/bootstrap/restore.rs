@@ -156,10 +156,10 @@ pub(super) async fn activate_registered(
                     Err(error) if super::registered::bootstrap_transient(&error) => {}
                     Err(error) => return Err(error),
                 }
-                if tokio::time::Instant::now() >= deadline {
+                if nabedra_rt::time::now() >= deadline {
                     return Err(unavailable());
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                nabedra_rt::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
         if page.exhausted {

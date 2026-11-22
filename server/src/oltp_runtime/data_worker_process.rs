@@ -65,7 +65,6 @@ use std::{
 use tokio::{
     net::TcpListener,
     sync::{Semaphore, watch},
-    time::Instant,
 };
 use uuid::Uuid;
 
@@ -150,7 +149,7 @@ pub async fn run(path: PathBuf) -> Result<(), &'static str> {
 }
 
 async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = nabedra_rt::time::now() + Duration::from_secs(60);
     let (stop, mut stopped) = watch::channel(false);
     let mut node = config.node;
     let group = node.control.identity.clone();
@@ -269,7 +268,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
     let expectation = node.intent.mount.clone();
     let mount_resources = shared.clone();
     let mount_permit = replacement.clone();
-    let (pool, key, added_pool) = tokio::time::timeout_at(
+    let (pool, key, added_pool) = nabedra_rt::time::timeout_at(
         deadline,
         shared.execute(ExecutionClass::Control, 0, 0, move || {
             let added = mount_permit.as_ref().map(|permit| {
@@ -297,7 +296,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         cluster_id: group.cluster_id,
         database: group.database.clone(),
     };
-    let transport_task = tokio::spawn(async move {
+    let transport_task = nabedra_rt::task::spawn(async move {
         transport
             .run(listener, async move {
                 while !*stopped.borrow_and_update() {
@@ -310,7 +309,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
     });
 
     let revocation_refresh = Mutex::new(None);
-    let result = tokio::time::timeout_at(deadline, async {
+    let result = nabedra_rt::time::timeout_at(deadline, async {
         let enroll = if let (Some(permit), Some(added)) = (&replacement, &added_mount) {
             transition_id("eks-replacement-enroll", &(permit.drain_id, local, mounted.total_bytes, added.total_bytes))?
         } else {
@@ -359,7 +358,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         *revocation_refresh
             .lock()
             .map_err(|_| unavailable("data worker revocation refresh state"))? =
-            Some(tokio::spawn(refresh));
+            Some(nabedra_rt::task::spawn(refresh));
         startup_read(
             deadline,
             &last_error,
@@ -434,7 +433,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
             // older Control (which rejects the request) has nothing active.
             let _ = control
                 .change_direct_capability(
-                    Uuid::new_v4(),
+                    nabedra_rt::ids::uuid_v4(),
                     crate::oltp_replication::authority::control::DirectCapabilityOperation::Advertise {
                         version: crate::oltp_replication::authority::control::DIRECT_VERSION,
                     },
@@ -676,15 +675,15 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
     let result = match result {
         Ok(joined) => {
             let voter_refresh =
-                tokio::spawn(control_routes.run_refresh(control.clone(), stop.subscribe()));
-            let refresh = tokio::spawn(directory.run_refresh(control, stop.subscribe()));
-            let membership = tokio::spawn(follow_membership(joined.clone(), stop.subscribe()));
-            let retirement = tokio::spawn(prune_retired(joined.clone(), stop.subscribe()));
+                nabedra_rt::task::spawn(control_routes.run_refresh(control.clone(), stop.subscribe()));
+            let refresh = nabedra_rt::task::spawn(directory.run_refresh(control, stop.subscribe()));
+            let membership = nabedra_rt::task::spawn(follow_membership(joined.clone(), stop.subscribe()));
+            let retirement = nabedra_rt::task::spawn(prune_retired(joined.clone(), stop.subscribe()));
             let (drain_stop, draining) = watch::channel(false);
-            let drain = tokio::spawn(follow_drain(joined.clone(), draining));
+            let drain = nabedra_rt::task::spawn(follow_drain(joined.clone(), draining));
             let (settle_stop, settling) = watch::channel(false);
             let placement = joined.placement.clone();
-            let settlement = tokio::spawn(async move {
+            let settlement = nabedra_rt::task::spawn(async move {
                 placement.settle(settling).await;
                 placement.shutdown().await
             });
@@ -791,7 +790,7 @@ async fn retirement_status(
 }
 
 async fn prune_retired(joined: Arc<Joined>, mut stop: watch::Receiver<bool>) {
-    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    let mut interval = nabedra_rt::time::interval(Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let cursor = Mutex::new(None);
     while !*stop.borrow() {
@@ -811,7 +810,7 @@ async fn prune_retired(joined: Arc<Joined>, mut stop: watch::Receiver<bool>) {
         };
         tokio::select! {
             _ = stop.changed() => break,
-            _ = tokio::time::timeout(Duration::from_secs(2), update) => {}
+            _ = nabedra_rt::time::timeout(Duration::from_secs(2), update) => {}
         }
     }
 }
@@ -876,7 +875,7 @@ async fn advance(
 }
 
 async fn follow_membership(joined: Arc<Joined>, mut stop: watch::Receiver<bool>) {
-    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    let mut interval = nabedra_rt::time::interval(Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     while !*stop.borrow() {
         tokio::select! {
@@ -912,7 +911,7 @@ async fn follow_membership(joined: Arc<Joined>, mut stop: watch::Receiver<bool>)
 }
 
 async fn follow_drain(joined: Arc<Joined>, mut stop: watch::Receiver<bool>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut interval = nabedra_rt::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
@@ -999,7 +998,7 @@ async fn readiness(
             body.to_string(),
         ))
     };
-    tokio::time::timeout(Duration::from_secs(3), check)
+    nabedra_rt::time::timeout(Duration::from_secs(3), check)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
@@ -1066,7 +1065,7 @@ async fn growth_admin(State(joined): State<Arc<Joined>>, request: Request) -> Re
         let _request = joined
             .shared
             .reserve_scratch(ByteClass::Progress, 32 << 10)?;
-        tokio::time::timeout(SAMPLE_DEADLINE, async {
+        nabedra_rt::time::timeout(SAMPLE_DEADLINE, async {
             let bytes = to_bytes(request.into_body(), SAMPLE_BODY_LIMIT)
                 .await
                 .map_err(|_| invalid_sample())?;

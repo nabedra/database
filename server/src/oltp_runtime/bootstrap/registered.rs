@@ -101,7 +101,7 @@ impl LocalServices {
         eprintln!(
             "nabedra-db: registered consensus heartbeat_ms=500 election_min_ms=1500 election_max_ms=3000"
         );
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(if replacing { 240 } else if rolling { 120 } else { 60 });
+        let deadline = nabedra_rt::time::now() + std::time::Duration::from_secs(if replacing { 240 } else if rolling { 120 } else { 60 });
         let last_error = Arc::new(Mutex::new(None::<ProtocolError>));
         let error_trace = last_error.clone();
         let scope = QueueScope {
@@ -111,7 +111,7 @@ impl LocalServices {
         let (stop, mut stopped) = watch::channel(false);
         let transport = worker.transport.clone();
         let listener = worker.listener.take().ok_or_else(unavailable)?;
-        let transport_task = tokio::spawn(async move {
+        let transport_task = nabedra_rt::task::spawn(async move {
             transport
                 .run(listener, async move {
                     while !*stopped.borrow_and_update() {
@@ -122,7 +122,7 @@ impl LocalServices {
                 })
                 .await
         });
-        let result = tokio::time::timeout_at(deadline, async {
+        let result = nabedra_rt::time::timeout_at(deadline, async {
             let groups = worker.start_system_groups(registered_raft_config()).await?;
             let raw_control = groups.control.ok_or_else(unavailable)?;
             let raw_timestamps = groups.timestamps;
@@ -570,7 +570,7 @@ impl LocalServices {
             if replacing {
                 use crate::oltp_replication::authority::control::{DIRECT_VERSION, DirectCapabilityOperation};
                 startup_read(deadline, &error_trace, "replacement direct capability", || async {
-                    rpc.change_direct_capability(Uuid::new_v4(), DirectCapabilityOperation::Advertise {
+                    rpc.change_direct_capability(nabedra_rt::ids::uuid_v4(), DirectCapabilityOperation::Advertise {
                         version: DIRECT_VERSION,
                     }).await.map(|_| ())
                 }).await?;
@@ -654,7 +654,7 @@ impl LocalServices {
                     control
                         .ready_page_local(
                             &operator,
-                            Uuid::new_v4(),
+                            nabedra_rt::ids::uuid_v4(),
                             ticket_id,
                             Page::new(page.to_vec()).map_err(|_| unavailable())?,
                         )
@@ -663,7 +663,7 @@ impl LocalServices {
                 )?;
             }
             let ControlReply::ReadySealed { expected, next, .. } = control
-                .seal_ready_local(&operator, Uuid::new_v4(), ticket_id)
+                .seal_ready_local(&operator, nabedra_rt::ids::uuid_v4(), ticket_id)
                 .await?
                 .reply
             else {
@@ -694,7 +694,7 @@ impl LocalServices {
             );
             accepted(
                 control
-                    .timestamp_fenced(Uuid::new_v4(), receipt)
+                    .timestamp_fenced(nabedra_rt::ids::uuid_v4(), receipt)
                     .await?
                     .reply,
             )?;
@@ -703,7 +703,7 @@ impl LocalServices {
                     let replica = replica.lock().map_err(|_| unavailable())?;
                     VerifiedQueueCopy::from_empty_worker(ticket, &replica)?
                 };
-                accepted(control.publish_ready(Uuid::new_v4(), proof).await?.reply)?;
+                accepted(control.publish_ready(nabedra_rt::ids::uuid_v4(), proof).await?.reply)?;
                 let current = startup_read(deadline, &error_trace, "queue authority", || control.current(&scope)).await?;
                 replica
                     .lock()
@@ -795,7 +795,7 @@ impl LocalServices {
                 scoped,
                 native_timestamps,
             )) => {
-                let refresh = tokio::spawn(
+                let refresh = nabedra_rt::task::spawn(
                     directory
                         .clone()
                         .run_refresh(control_client.clone(), stop.subscribe()),
@@ -860,7 +860,7 @@ where
     Fut: std::future::Future<Output = Result<T, ProtocolError>>,
 {
     loop {
-        match tokio::time::timeout_at(deadline, read()).await {
+        match nabedra_rt::time::timeout_at(deadline, read()).await {
             Ok(Ok(value)) => return Ok(value),
             Ok(Err(error)) if bootstrap_transient(&error) => {
                 tracing::debug!(stage, code=?error.code, outcome=?error.outcome, message=error.message,
@@ -874,11 +874,11 @@ where
     }
 }
 pub(in crate::oltp_runtime) async fn wait_startup(deadline: tokio::time::Instant) -> Result<(), ProtocolError> {
-    if tokio::time::Instant::now() >= deadline {
+    if nabedra_rt::time::now() >= deadline {
         return Err(unavailable());
     }
-    tokio::time::sleep_until(
-        (tokio::time::Instant::now() + std::time::Duration::from_millis(100)).min(deadline),
+    nabedra_rt::time::sleep_until(
+        (nabedra_rt::time::now() + std::time::Duration::from_millis(100)).min(deadline),
     )
     .await;
     Ok(())
@@ -987,7 +987,7 @@ fn spawn_membership(
     rejoin: Rejoin,
     mut stop: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    nabedra_rt::task::spawn(async move {
         // The ticket of this worker's own Join while it rejoins the ready set.
         let mut rejoining: Option<Uuid> = None;
         // At idle, every worker repeated two linearizable Control reads
@@ -999,11 +999,11 @@ fn spawn_membership(
             if *stop.borrow_and_update() {
                 break;
             }
-            let started = tokio::time::Instant::now();
+            let started = nabedra_rt::time::now();
             let applied = control.applied_index();
             let held = replica.lock().ok().map(|replica| replica.authority());
             if !idle.due(applied, &held, started) {
-                tokio::select! {_=tokio::time::sleep(std::time::Duration::from_millis(250))=>{},_=stop.changed()=>{}}
+                tokio::select! {_=nabedra_rt::time::sleep(std::time::Duration::from_millis(250))=>{},_=stop.changed()=>{}}
                 continue;
             }
             // Ok(true) when the pass found nothing to do.
@@ -1069,7 +1069,7 @@ fn spawn_membership(
                             source_ready: pending.expected,
                         };
                         let proof = queue.copy_join(ticket, &peer).await?;
-                        accepted(control.publish_ready(Uuid::new_v4(), proof).await?.reply)?;
+                        accepted(control.publish_ready(nabedra_rt::ids::uuid_v4(), proof).await?.reply)?;
                     } else if control.data_worker(pending.target).await?.is_some() {
                         join_owner.advance(&control, &pending).await?;
                     }
@@ -1083,7 +1083,7 @@ fn spawn_membership(
                 };
                 idle.record(quiet, applied, held, started);
             },_=stop.changed()=>{}}
-            tokio::select! {_=tokio::time::sleep(std::time::Duration::from_millis(250))=>{},_=stop.changed()=>{}}
+            tokio::select! {_=nabedra_rt::time::sleep(std::time::Duration::from_millis(250))=>{},_=stop.changed()=>{}}
         }
     })
 }
@@ -1145,7 +1145,7 @@ impl ParticipantResolver for RegisteredParticipants {
                 },
             };
             let voters = self.data.initial_voters(&self.control, &self.rpc).await?;
-            let started = tokio::time::Instant::now();
+            let started = nabedra_rt::time::now();
             let hosted = async {
                 let current = self
                     .control
@@ -1163,12 +1163,12 @@ impl ParticipantResolver for RegisteredParticipants {
             .await;
             tracing::debug!(group_id = %group.group_id, stage = "data_host", ms = started.elapsed().as_millis(), ok = hosted.is_ok(), "initial Data group");
             hosted?;
-            let started = tokio::time::Instant::now();
+            let started = nabedra_rt::time::now();
             let activated = self.data.activate(spec, &voters).await;
             tracing::debug!(group_id = %group.group_id, stage = "data_activate", ms = started.elapsed().as_millis(), ok = activated.is_ok(), "initial Data group");
             let observation = activated?;
             let generation = id(group.group_id, b"control-membership");
-            let started = tokio::time::Instant::now();
+            let started = nabedra_rt::time::now();
             let registered = self
                 .control
                 .register_initial_data_local(&self.operator, generation, pin.authority, observation)

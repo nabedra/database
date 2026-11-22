@@ -9,11 +9,11 @@ struct Fixture {
 }
 impl Fixture {
     fn new(count: u128) -> Self {
-        let base = (Uuid::new_v4().as_u128() >> 64) << 64;
+        let base = (nabedra_rt::ids::uuid_v4().as_u128() >> 64) << 64;
         let members: Vec<_> = (1..=count)
             .map(|id| WorkerIdentity {
                 worker_id: Uuid::from_u128(base + id),
-                incarnation: Uuid::new_v4(),
+                incarnation: nabedra_rt::ids::uuid_v4(),
                 certificate_sha256: Digest::from_bytes([id as u8; 32]),
                 enrollment_revision: 1,
             })
@@ -30,13 +30,13 @@ impl Fixture {
             )
             .unwrap(),
             scope: QueueScope {
-                cluster_id: Uuid::new_v4(),
+                cluster_id: nabedra_rt::ids::uuid_v4(),
                 database: Text::try_from("default").unwrap(),
             },
             authority: QueueAuthority {
                 ready: ReadyMembership {
                     view: AuthorityView {
-                        run_id: Uuid::new_v4(),
+                        run_id: nabedra_rt::ids::uuid_v4(),
                         owner_term: 1,
                         membership_revision: 1,
                     },
@@ -84,8 +84,8 @@ impl Fixture {
                 database: self.scope.database.clone(),
                 principal: Digest::from_bytes([6; 32]),
                 policy_revision: 4,
-                ingress_id: Uuid::new_v4(),
-                ingress_incarnation: Uuid::new_v4(),
+                ingress_id: nabedra_rt::ids::uuid_v4(),
+                ingress_incarnation: nabedra_rt::ids::uuid_v4(),
                 credential_expires_at_ms: Some(50),
             },
             read: Some(QueueReadToken {
@@ -93,10 +93,10 @@ impl Fixture {
                     run_id: self.authority.ready.view.run_id,
                     request_id: id,
                     digest: hash(body),
-                    nonce: Uuid::new_v4(),
+                    nonce: nabedra_rt::ids::uuid_v4(),
                 },
                 storage_pin: StoragePin {
-                    pin_id: Uuid::new_v4(),
+                    pin_id: nabedra_rt::ids::uuid_v4(),
                     read_ts: Timestamp::new(10).unwrap(),
                     allocator_epoch: 1,
                 },
@@ -200,7 +200,7 @@ async fn c07_m02_f03_o22_o23_read_grant_copy_retries_only_the_blocked_replica() 
     let current = fixture.authority;
     let mut owner = fixture.replica(0);
     let mut receivers = [fixture.replica(1), fixture.replica(2)];
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = fixture.body(id);
     let context = fixture.context(id, &body);
     let pending = owner
@@ -226,7 +226,7 @@ async fn c07_m02_f03_o22_o23_read_grant_copy_retries_only_the_blocked_replica() 
         },
         owner: current.owner,
         worker: current.owner,
-        group: Uuid::new_v4(),
+        group: nabedra_rt::ids::uuid_v4(),
         node: 1,
         ticket: Uuid::nil(),
         input: hash(b"scan page"),
@@ -252,7 +252,7 @@ async fn c07_m02_f03_o22_o23_read_grant_copy_retries_only_the_blocked_replica() 
     let queue = QueueCoordinator::new(owner.clone(), authority.clone(), peers.clone());
     let opening = {
         let queue = queue.clone();
-        tokio::spawn(async move { queue.open_read_grant(grant).await })
+        nabedra_rt::task::spawn(async move { queue.open_read_grant(grant).await })
     };
     peers.refused.notified().await;
     assert!(!opening.is_finished());
@@ -302,7 +302,7 @@ async fn c07_m02_f03_o22_o23_read_grant_copy_retries_only_the_blocked_replica() 
     peers.attempts.lock().unwrap().clear();
     let opening = {
         let queue = queue.clone();
-        tokio::spawn(async move { queue.open_read_grant(grant).await })
+        nabedra_rt::task::spawn(async move { queue.open_read_grant(grant).await })
     };
     peers.refused.notified().await;
     authority.0.lock().unwrap().ready.view.membership_revision += 1;
@@ -321,7 +321,7 @@ async fn c07_m02_f03_o22_o23_read_grant_copy_retries_only_the_blocked_replica() 
         faults.push_back(lost);
         faults.extend(std::iter::repeat_n(refused, 130));
     }
-    let start = tokio::time::Instant::now();
+    let start = nabedra_rt::time::now();
     let expired = queue.open_read_grant(grant).await.unwrap_err();
     assert_eq!(expired.code, ErrorCode::Overloaded);
     assert_eq!(expired.outcome, Outcome::Unknown);
@@ -343,7 +343,7 @@ fn o22_c04_r01_r03_r04_f03_live_read_grants_survive_copy_and_owner_loss() {
     let mut owner = fixture.replica(0);
     let mut survivors = [fixture.replica(1), fixture.replica(2)];
     let target = survivors[1].shared_resources();
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = fixture.body(id);
     let context = fixture.context(id, &body);
     let pending = owner.propose(current, body.clone(), context.clone(), 0).unwrap();
@@ -366,7 +366,7 @@ fn o22_c04_r01_r03_r04_f03_live_read_grants_survive_copy_and_owner_loss() {
     };
     let template = ReadGrant {
         scope, owner: current.owner, worker: fixture.members[2],
-        group: Uuid::new_v4(), node: 1, ticket: Uuid::nil(), input: hash(b"scan page"),
+        group: nabedra_rt::ids::uuid_v4(), node: 1, ticket: Uuid::nil(), input: hash(b"scan page"),
     };
     let baseline = target.scheduler().usage();
     let mut running = Vec::new();
@@ -383,11 +383,11 @@ fn o22_c04_r01_r03_r04_f03_live_read_grants_survive_copy_and_owner_loss() {
         assert_eq!(actual, grant);
         running.push((grant, lease));
     }
-    assert_eq!(owner.update_read_grant(current, ReadGrant { ticket: Uuid::new_v4(), ..template }, true),
+    assert_eq!(owner.update_read_grant(current, ReadGrant { ticket: nabedra_rt::ids::uuid_v4(), ..template }, true),
         Err(QueueError::Overloaded));
 
-    let joiner = WorkerIdentity { worker_id: Uuid::new_v4(), incarnation: Uuid::new_v4(), ..fixture.members[2] };
-    let ticket = JoinTicket { ticket_id: Uuid::new_v4(), target: joiner, source_ready: current.ready };
+    let joiner = WorkerIdentity { worker_id: nabedra_rt::ids::uuid_v4(), incarnation: nabedra_rt::ids::uuid_v4(), ..fixture.members[2] };
+    let ticket = JoinTicket { ticket_id: nabedra_rt::ids::uuid_v4(), target: joiner, source_ready: current.ready };
     let snapshot = owner.begin_join(current, ticket).unwrap();
     let page = owner.join_page(current, snapshot, JoinPhase::Snapshot, None).unwrap();
     let frame_header = page.record.as_ref().unwrap().decode_header().unwrap();
@@ -477,7 +477,7 @@ fn o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement() {
     let current = fixture.authority;
     let mut owner = fixture.replica(0);
     let mut replicas = [fixture.replica(1)];
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = fixture.body(id);
     let context = fixture.context(id, &body);
     let read = context.read.clone().unwrap();
@@ -500,7 +500,7 @@ fn o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement() {
         },
         owner: current.owner,
         worker: fixture.members[1],
-        group: Uuid::new_v4(),
+        group: nabedra_rt::ids::uuid_v4(),
         node: 1,
         ticket: Uuid::nil(),
         input: hash(b"scan page"),
@@ -668,9 +668,9 @@ fn o14_o23_q03_r01_r02_r03_removal_merges_lower_uuid_data_survivor() {
                 },
                 owner: previous.owner,
                 worker: *data_id,
-                group: Uuid::new_v4(),
+                group: nabedra_rt::ids::uuid_v4(),
                 node: 1,
-                ticket: Uuid::new_v4(),
+                ticket: nabedra_rt::ids::uuid_v4(),
                 input: hash(b"held scan page"),
             };
             let grants = old_owner
@@ -720,7 +720,7 @@ fn o14_o23_q03_r01_r02_r03_removal_merges_lower_uuid_data_survivor() {
     let terminal_hash = data.terminal_response_hash(terminal).unwrap();
     let grants_before = data.pending_read_grants(terminal);
     let ticket = JoinTicket {
-        ticket_id: Uuid::new_v4(),
+        ticket_id: nabedra_rt::ids::uuid_v4(),
         target: *failed_id,
         source_ready: current.ready,
     };
@@ -909,7 +909,7 @@ fn r01_r02_removal_copy_resumes_exact_ack_cursor_after_cancel_and_lost_reply() {
     drop(old_owner);
     let [mut source, mut target] = survivors;
     let ticket = JoinTicket {
-        ticket_id: Uuid::new_v4(),
+        ticket_id: nabedra_rt::ids::uuid_v4(),
         target: fixture.members[0],
         source_ready: current.ready,
     };
@@ -965,7 +965,7 @@ fn r01_r02_removal_copy_resumes_exact_ack_cursor_after_cancel_and_lost_reply() {
         Some(ids[1])
     );
     let mut wrong = ticket;
-    wrong.ticket_id = Uuid::new_v4();
+    wrong.ticket_id = nabedra_rt::ids::uuid_v4();
     assert_eq!(source.removal_progress(wrong), Err(QueueError::Stale));
     let mut after = Some(ids[0]);
     for id in &ids[1..] {
@@ -1015,7 +1015,7 @@ fn q03_payload_and_acceptance_evidence_are_separate_all_ready_barriers() {
     let fixture = Fixture::new(3);
     let mut owner = fixture.replica(0);
     let mut replicas = [fixture.replica(1), fixture.replica(2)];
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = fixture.body(id);
     let context = fixture.context(id, &body);
     let payload = owner
@@ -1081,7 +1081,7 @@ fn b02_r01_queue_latency_consumes_the_first_dispatch_and_drops_fenced_waits() {
             .sum::<u64>()
     };
     let enqueue = |owner: &mut WorkerReplica, replicas: &mut [WorkerReplica]| {
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let body = fixture.body(id);
         let context = fixture.context(id, &body);
         let payload = owner.propose(fixture.authority, body, context, 1).unwrap();
@@ -1134,7 +1134,7 @@ fn q04_q06_idle_preflight_preserves_recovery_and_expired_result_work() {
         let mut followers: Vec<_> = (1..count)
             .map(|index| fixture.replica(index as usize))
             .collect();
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let mut active = BTreeSet::new();
         assert!(!owner.has_recovery_work(1, &active));
         assert!(!owner.has_retirement_work(0, &active));
@@ -1194,7 +1194,7 @@ fn q06_t04_receipt_race_reuses_terminal_version_and_retains_pin_until_every_copy
     let fixture = Fixture::new(3);
     let mut owner = fixture.replica(0);
     let mut replicas = [fixture.replica(1), fixture.replica(2)];
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = fixture.body(id);
     let context = fixture.context(id, &body);
     let payload = owner
@@ -1283,7 +1283,7 @@ fn q06_o14_o23_terminal_confirmation_requires_the_exact_ready_view_and_version()
     let fixture = Fixture::new(3);
     let mut owner = fixture.replica(0);
     let mut replicas = [fixture.replica(1), fixture.replica(2)];
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = fixture.body(id);
     let context = fixture.context(id, &body);
     let previous = fixture.authority;
@@ -1367,7 +1367,7 @@ fn r01_r05_takeover_keeps_original_context_and_rejects_stale_owner_or_new_run() 
     let fixture = Fixture::new(3);
     let mut owner = fixture.replica(0);
     let mut replicas = [fixture.replica(1), fixture.replica(2)];
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = fixture.body(id);
     let payload = owner
         .propose(
@@ -1406,7 +1406,7 @@ fn r01_r05_takeover_keeps_original_context_and_rejects_stale_owner_or_new_run() 
         Err(QueueError::Stale)
     ));
     let mut cold = next;
-    cold.ready.view.run_id = Uuid::new_v4();
+    cold.ready.view.run_id = nabedra_rt::ids::uuid_v4();
     cold.ready.view.owner_term += 1;
     assert!(matches!(
         replicas[0].fenced_takeover(next, cold, members.iter().copied()),
@@ -1420,7 +1420,7 @@ fn u02_invalid_auth_or_pin_installs_no_identity_and_wire_keeps_exact_raw_bytes()
     let fixture = Fixture::new(2);
     let mut owner = fixture.replica(0);
     let mut peer = fixture.replica(1);
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = fixture.body(id);
     let mut context = fixture.context(id, &body);
     context.read.as_mut().unwrap().identity.digest = Digest::from_bytes([0; 32]);
@@ -1441,7 +1441,7 @@ fn u02_invalid_auth_or_pin_installs_no_identity_and_wire_keeps_exact_raw_bytes()
     assert_eq!(frame.sections[0].as_ref().unwrap().as_ref(), body);
     assert!(frame.header.len() < MAX_HEADER_BYTES);
     let mut stale = fixture.members[0];
-    stale.incarnation = Uuid::new_v4();
+    stale.incarnation = nabedra_rt::ids::uuid_v4();
     assert!(matches!(
         peer.install(fixture.authority, stale, &frame),
         Err(QueueError::Stale)
@@ -1467,12 +1467,12 @@ fn u02_invalid_auth_or_pin_installs_no_identity_and_wire_keeps_exact_raw_bytes()
 fn joiner(fixture: &Fixture) -> (WorkerReplica, JoinTicket) {
     let local = WorkerIdentity {
         worker_id: Uuid::from_u128(fixture.members.last().unwrap().worker_id.as_u128() + 1),
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         certificate_sha256: Digest::from_bytes([3; 32]),
         enrollment_revision: 1,
     };
     let ticket = JoinTicket {
-        ticket_id: Uuid::new_v4(),
+        ticket_id: nabedra_rt::ids::uuid_v4(),
         target: local,
         source_ready: fixture.authority.ready,
     };
@@ -1614,7 +1614,7 @@ async fn r03_q03_join_empty_single_multiple_and_exhausted_pages_have_correct_don
                 &super::super::worker_endpoint::QueueReply::JoinStatement {
                     worker: ticket.target,
                     statement: Box::new(statement),
-                    nonce: Uuid::new_v4(),
+                    nonce: nabedra_rt::ids::uuid_v4(),
                 },
                 MAX_HEADER_BYTES,
             )
@@ -1752,7 +1752,7 @@ fn q02_q06_retained_result_capacity_never_discards_running_body_or_snapshot_pin(
         },
     )
     .unwrap();
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = fixture.body(id);
     let payload = owner
         .propose(
@@ -1784,7 +1784,7 @@ fn q02_q06_retained_result_capacity_never_discards_running_body_or_snapshot_pin(
 #[test]
 fn m02_fixed_terminal_cache_slot_is_reserved_at_initial_admission_and_snapshot_replacement() {
     let fixture = Fixture::new(1);
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = fixture.body(id);
     let context = fixture.context(id, &body);
     let context_len = serde_json::to_vec(&context).unwrap().len();
@@ -1840,7 +1840,7 @@ fn q03_f03_tentative_copies_keep_original_context_until_explicit_acceptance() {
     let mut owner = fixture.replica(0);
     let mut first = fixture.replica(1);
     let mut second = fixture.replica(2);
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = fixture.body(id);
     let context = fixture.context(id, &body);
     let payload = owner
@@ -1935,7 +1935,7 @@ fn o13_q06_delayed_install_cannot_restore_retired_terminal_and_new_sequences_ski
     let mut owner = fixture.replica(0);
     let mut peers = [fixture.replica(1)];
     let propose = |source: &mut WorkerReplica| {
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let body = fixture.body(id);
         let context = fixture.context(id, &body);
         (id, source.propose(current, body, context, 0).unwrap())
@@ -1997,7 +1997,7 @@ fn d05_live1_removed_replica_rejoins_in_place() {
     };
     let mut owner = fixture.replica(0);
     let mut holders = [fixture.replica(1), fixture.replica(2)];
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = fixture.body(id);
     let pending = owner
         .propose(current, body.clone(), fixture.context(id, &body), 0)
@@ -2034,7 +2034,7 @@ fn d05_live1_removed_replica_rejoins_in_place() {
 
     // Its own Join ticket replaces the stale queue in place.
     let local = fixture.members[2];
-    let ticket = JoinTicket { ticket_id: Uuid::new_v4(), target: local, source_ready: next.ready };
+    let ticket = JoinTicket { ticket_id: nabedra_rt::ids::uuid_v4(), target: local, source_ready: next.ready };
     let foreign = JoinTicket { target: fixture.members[1], ..ticket };
     assert_eq!(removed.rejoin(next, remaining.clone(), limits, foreign), Err(QueueError::Invalid));
     assert_eq!(

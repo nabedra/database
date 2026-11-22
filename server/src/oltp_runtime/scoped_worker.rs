@@ -50,7 +50,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{sync::Mutex as AsyncMutex, time::Instant};
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 pub(super) const COPY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -382,7 +382,7 @@ impl ScopedWorker {
         body: ChargedBytes,
         api: WorkerIdentity,
     ) -> Result<RequestRecord, ProtocolError> {
-        let deadline = Instant::now() + COPY_TIMEOUT;
+        let deadline = nabedra_rt::time::now() + COPY_TIMEOUT;
         let placement = ingress.placement;
         let (parsed, digest, decoded) = self.decode(body.clone()).await?;
         let id = parsed.request_id;
@@ -894,7 +894,7 @@ impl ScopedWorker {
                 &placement,
                 frame,
                 decision,
-                Instant::now() + COPY_TIMEOUT,
+                nabedra_rt::time::now() + COPY_TIMEOUT,
             )
             .await?;
         let record = self.services.endpoint.scoped_record(&placement, id).await?;
@@ -936,7 +936,7 @@ impl ScopedWorker {
         owner: Arc<ScratchLease>,
         point: Option<&PointCatalog>,
     ) -> Result<PlannedOperation, (ProtocolError, Vec<VerifiedLifecycleGuard>)> {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = nabedra_rt::time::now() + Duration::from_secs(2);
         let mut guards = BTreeMap::new();
         loop {
             let mut error = match self
@@ -959,7 +959,7 @@ impl ScopedWorker {
             }
             match error {
                 blocked @ (PlanError::Blocked(_) | PlanError::LifecyclePending(_))
-                    if Instant::now() < deadline =>
+                    if nabedra_rt::time::now() < deadline =>
                 {
                     #[cfg(test)]
                     if let PlanError::Blocked(intent) = blocked {
@@ -972,7 +972,7 @@ impl ScopedWorker {
                     }
                     #[cfg(not(test))]
                     let _ = blocked;
-                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    nabedra_rt::time::sleep(Duration::from_millis(5)).await;
                 }
                 PlanError::Protocol(error) => return Err((error, guards.into_values().collect())),
                 _ => return Err((unavailable(), guards.into_values().collect())),
@@ -1248,7 +1248,7 @@ fn unavailable() -> ProtocolError {
 }
 
 fn now() -> u64 {
-    std::time::SystemTime::now()
+    nabedra_rt::time::wall_now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |now| now.as_millis().try_into().unwrap_or(u64::MAX))
 }

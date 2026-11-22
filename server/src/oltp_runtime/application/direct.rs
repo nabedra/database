@@ -637,7 +637,7 @@ impl DirectGateway {
         if get && (asynchronous || mode == DirectMode::ForwardOnly) {
             return Ok(self.queued());
         }
-        let deadline = Instant::now() + self.deadline;
+        let deadline = nabedra_rt::time::now() + self.deadline;
         let point = match scanned.op {
             Op::Get | Op::Delete | Op::Update => match point_key(&scanned) {
                 Some(key) => Some(key),
@@ -885,10 +885,10 @@ impl DirectGateway {
         let mut attempts = FuturesUnordered::new();
         let mut pending = [None; 7];
         let mut attempted_route: Option<(_, Arc<[Voter]>)> = None;
-        let mut next_probe = Instant::now();
+        let mut next_probe = nabedra_rt::time::now();
         let mut refreshed_unknown_table = false;
         loop {
-            if Instant::now() >= deadline {
+            if nabedra_rt::time::now() >= deadline {
                 return Err(deadline_error(&table, forward, *uncertain));
             }
             if last.is_some_and(|last| !table.range.shard.contains_key(last)) {
@@ -919,7 +919,7 @@ impl DirectGateway {
                 pending.fill(None);
                 attempted_route = Some((route, voters.clone()));
             }
-            let now = Instant::now();
+            let now = nabedra_rt::time::now();
             let waiting_for_probe = now < next_probe && !attempts.is_empty();
             let available = |voter: &Voter| !pending.contains(&Some(voter.node_id));
             let next = if waiting_for_probe {
@@ -985,7 +985,7 @@ impl DirectGateway {
             } else {
                 deadline
             };
-            let (slot, voter, reply) = match tokio::time::timeout_at(attempt, attempts.next()).await
+            let (slot, voter, reply) = match nabedra_rt::time::timeout_at(attempt, attempts.next()).await
             {
                 Ok(Some(settled)) => settled,
                 Ok(None) => return Err(deadline_error(&table, forward, *uncertain)),
@@ -1120,7 +1120,7 @@ impl DirectGateway {
                             // leader that may be finishing the request.
                             if !attempts.is_empty() {
                                 delay = (delay * 2).clamp(FIRST_PAUSE, MAX_PAUSE);
-                                next_probe = Instant::now() + delay;
+                                next_probe = nabedra_rt::time::now() + delay;
                             } else if !pause(deadline, &mut delay).await {
                                 return Err(deadline_error(&table, forward, *uncertain));
                             }
@@ -1171,14 +1171,14 @@ impl DirectGateway {
         if let Some(current) = self.cache.get(table_id, key).filter(fresh) {
             return Ok(Some(current));
         }
-        let _fill = tokio::time::timeout_at(deadline, self.fill.lock())
+        let _fill = nabedra_rt::time::timeout_at(deadline, self.fill.lock())
             .await
             .map_err(|_| route_unavailable())?;
         if let Some(current) = self.cache.get(table_id, key).filter(fresh) {
             return Ok(Some(current));
         }
         GatewayStats::bump(&self.stats.catalog_reads);
-        let fill = tokio::time::timeout_at(deadline, self.source.point(table_id, key))
+        let fill = nabedra_rt::time::timeout_at(deadline, self.source.point(table_id, key))
             .await
             .map_err(|_| route_unavailable())??;
         let Some(fill) = fill else {
@@ -1267,7 +1267,7 @@ impl DirectGateway {
         }
         GatewayStats::bump(&self.stats.placement_reads);
         let mut voters =
-            tokio::time::timeout_at(deadline, self.source.placement(range.group(), refresh))
+            nabedra_rt::time::timeout_at(deadline, self.source.placement(range.group(), refresh))
                 .await
                 .map_err(|_| route_unavailable())??;
         voters.sort_unstable_by_key(|voter| voter.node_id);
@@ -1532,10 +1532,10 @@ pub(crate) async fn catalog_fill(
 /// `MAX_PAUSE`. False when the deadline leaves no time for one.
 async fn pause(deadline: Instant, delay: &mut Duration) -> bool {
     *delay = (*delay * 2).clamp(FIRST_PAUSE, MAX_PAUSE);
-    if Instant::now() + *delay >= deadline {
+    if nabedra_rt::time::now() + *delay >= deadline {
         return false;
     }
-    tokio::time::sleep(*delay).await;
+    nabedra_rt::time::sleep(*delay).await;
     true
 }
 

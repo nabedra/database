@@ -10,7 +10,7 @@ use std::{
     cell::Cell,
     fs, io,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use uuid::Uuid;
 
@@ -57,12 +57,12 @@ pub(super) fn hold_run_sync(directory: &Path, bytes: u64) -> io::Result<()> {
     };
     if reached(directory, stage, bytes.to_string().as_bytes()) {
         let release = directory.join(format!("release-{stage}"));
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let deadline = nabedra_rt::time::now_std() + Duration::from_secs(90);
         while !release.is_file() {
-            if Instant::now() >= deadline {
+            if nabedra_rt::time::now_std() >= deadline {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "O05 run sync gate"));
             }
-            std::thread::sleep(Duration::from_millis(5));
+            nabedra_rt::time::thread_sleep(Duration::from_millis(5));
         }
     }
     Ok(())
@@ -84,9 +84,9 @@ async fn hold(stage: String, observed: &[u8]) {
     let Some(directory) = directory() else { return };
     if reached(&directory, &stage, observed) {
         let release = directory.join(format!("release-{stage}"));
-        tokio::time::timeout(Duration::from_secs(90), async {
+        nabedra_rt::time::timeout(Duration::from_secs(90), async {
             while !release.is_file() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
@@ -133,7 +133,7 @@ pub(crate) async fn observe(services: &LocalServices) -> Result<Option<Value>, P
             .first()
             .ok_or_else(|| failed("missing local pool"))?
             .clone();
-        tokio::task::spawn_blocking(move || {
+        nabedra_rt::task::spawn_blocking(move || {
             let _restore = FlushMarker::new();
             pool.kv_store().flush()
         })

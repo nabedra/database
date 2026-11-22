@@ -171,7 +171,7 @@ impl RemoteRuntime {
         )?;
         let (stop, mut stopped) = watch::channel(false);
         let owner = transport.clone();
-        let task = tokio::spawn(async move {
+        let task = nabedra_rt::task::spawn(async move {
             owner
                 .run(listener, async move {
                     while !*stopped.borrow_and_update() {
@@ -226,7 +226,7 @@ impl RemoteRuntime {
                 return Err(error);
             }
         };
-        let refresh = tokio::spawn(directory.run_refresh(control.clone(), stop.subscribe()));
+        let refresh = nabedra_rt::task::spawn(directory.run_refresh(control.clone(), stop.subscribe()));
         // Gateways advertise too: one that cannot settle request ids at the
         // anchor before going queued must keep the capability inactive.
         let direct = super::worker_runtime::direct_capability::DirectSwitch::new(
@@ -414,7 +414,7 @@ impl HttpRuntime for RemoteRuntime {
                 let observe = self.client.observe(record.run_id, record.request_id);
                 let deadline = copy_deadline.into_iter().chain(observation_deadline).min();
                 let observed = match deadline {
-                    Some(deadline) => tokio::time::timeout_at(deadline, observe)
+                    Some(deadline) => nabedra_rt::time::timeout_at(deadline, observe)
                         .await
                         .map_err(|_| unavailable())?,
                     None => observe.await,
@@ -435,7 +435,7 @@ impl HttpRuntime for RemoteRuntime {
                             let status = metadata.response_status.ok_or_else(unavailable)?;
                             let result = self.client.result(observed);
                             let body = match copy_deadline.filter(|_| scoped) {
-                                Some(deadline) => tokio::time::timeout_at(deadline, result)
+                                Some(deadline) => nabedra_rt::time::timeout_at(deadline, result)
                                     .await
                                     .map_err(|_| unavailable())?,
                                 None => result.await,
@@ -456,13 +456,13 @@ impl HttpRuntime for RemoteRuntime {
                     Err(error) if scoped && receipt_retryable(&error) => RequestState::Reconciling,
                     Err(error) if receipt_retryable(&error) => {
                         observation_deadline.get_or_insert_with(|| {
-                            tokio::time::Instant::now() + super::RECEIPT_OBSERVATION_TIMEOUT
+                            nabedra_rt::time::now() + super::RECEIPT_OBSERVATION_TIMEOUT
                         });
                         RequestState::Reconciling
                     }
                     Err(error) => return Err(error),
                 };
-                let now = tokio::time::Instant::now();
+                let now = nabedra_rt::time::now();
                 if copy_deadline
                     .into_iter()
                     .chain(observation_deadline)
@@ -488,7 +488,7 @@ impl HttpRuntime for RemoteRuntime {
                     .into_iter()
                     .chain(observation_deadline)
                     .fold(next_poll, std::cmp::min);
-                tokio::time::sleep_until(wake).await;
+                nabedra_rt::time::sleep_until(wake).await;
                 interval = (interval * 2).min(std::time::Duration::from_millis(500));
             }
         })

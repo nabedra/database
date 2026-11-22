@@ -7,7 +7,7 @@ use crate::{
     protocol::Operation,
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use tokio::time::{Instant as Deadline, timeout_at};
+use nabedra_rt::time::{Instant as Deadline, timeout_at};
 
 pub(in crate::oltp_runtime) const SCOPED_QUEUE_VERSION: u32 = 2;
 const MAJORITY: u32 = 2;

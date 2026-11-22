@@ -346,7 +346,7 @@ impl IndexBackend for RuntimeIndexes {
             // binds the stable logical job and fenced build attempt. A resumed
             // completed progress step may repeat safely without rewriting or
             // evicting the previous transaction's durable UUID decision.
-            let id = fixed_identity.unwrap_or_else(Uuid::new_v4);
+            let id = fixed_identity.unwrap_or_else(nabedra_rt::ids::uuid_v4);
             let digest = metadata_digest(job, digest, maintenance)?;
             let owner = Arc::new(services.shared.reserve_scratch(ByteClass::Data, 4 << 20)?);
             let reservation = match services
@@ -574,14 +574,14 @@ impl IndexBackend for RuntimeIndexes {
                             crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::RefreshAdmissionRefused,
                             || None,
                         ).await;
-                        tokio::time::sleep(backoff).await;
+                        nabedra_rt::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(Duration::from_millis(250));
                         retries += 1;
                     }
                     result => break result?,
                 }
             };
-            tokio::time::timeout(Duration::from_secs(30), async {
+            nabedra_rt::time::timeout(Duration::from_secs(30), async {
                 loop {
                     if !self.runtime.accepting.load(Ordering::Acquire) {
                         return Err(unavailable());
@@ -593,7 +593,7 @@ impl IndexBackend for RuntimeIndexes {
                             return Err(receipt.error.clone().unwrap_or_else(unknown));
                         }
                         RequestState::Abandoned => return Err(unavailable()),
-                        _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                        _ => nabedra_rt::time::sleep(Duration::from_millis(10)).await,
                     }
                 }
             }).await.map_err(|_| unknown())?
@@ -847,7 +847,7 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
     pub(super) async fn call(app: &axum::Router, operation: &str, payload: Value) -> Value {
-        let body = json!({"request_id":Uuid::new_v4(),"operation":operation,"payload":payload});
+        let body = json!({"request_id":nabedra_rt::ids::uuid_v4(),"operation":operation,"payload":payload});
         let response = app
             .clone()
             .oneshot(
@@ -913,7 +913,7 @@ mod tests {
         );
     }
     async fn reject_mixed_predicate(app: &axum::Router, table: Uuid) {
-        let body = serde_json::json!({"request_id":Uuid::new_v4(),"operation":"query.collect","payload":{"table_id":table,"query":{"select":null,"filter":{"column":"price","op":"gt","value":i64::MAX},"order_by":null,"limit":null}}});
+        let body = serde_json::json!({"request_id":nabedra_rt::ids::uuid_v4(),"operation":"query.collect","payload":{"table_id":table,"query":{"select":null,"filter":{"column":"price","op":"gt","value":i64::MAX},"order_by":null,"limit":null}}});
         let response = app
             .clone()
             .oneshot(
@@ -934,8 +934,8 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_online_index_public_query_oracle() {
-        tokio::time::timeout(std::time::Duration::from_secs(120),async {
-            let path=std::env::temp_dir().join(format!("nabedra-index-runtime-{}",Uuid::new_v4()));
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(120),async {
+            let path=std::env::temp_dir().join(format!("nabedra-index-runtime-{}",nabedra_rt::ids::uuid_v4()));
             let runtime=WorkerRuntime::open(&path,"index-test","index-test",ExecutionConfig{max_pending_requests:32,max_queue_bytes_per_replica:8<<20,max_retained_result_bytes_per_worker:8<<20,..Default::default()},WorkerResources{max_threads:2,memory_limit_bytes:2<<30,..Default::default()}).await.unwrap();
             let app=runtime.application("index-test".into()).unwrap();
             let descriptor=call(&app,"table.create",json!({"name":"items","schema":{"id":"int64","category":"int64","price":"float64","name":"utf8"},"key":"id","format":"parquet"})).await;
@@ -958,7 +958,7 @@ mod tests {
             ].into_iter().map(|q|serde_json::from_value(q).unwrap()).collect();
             for query in &queries {check(&app,&table,&rows,query.clone()).await;}
             reject_mixed_predicate(&app,table.id).await;
-            runtime.create_index(IndexDefinition{index_id:Uuid::new_v4(),table_id:table.id,name:Text::try_from("category_price").unwrap(),columns:Page::new(vec![Text::try_from("category").unwrap(),Text::try_from("price").unwrap()]).unwrap(),covering:Page::new(vec![Text::try_from("name").unwrap()]).unwrap()},Uuid::new_v4(),1).await.unwrap();
+            runtime.create_index(IndexDefinition{index_id:nabedra_rt::ids::uuid_v4(),table_id:table.id,name:Text::try_from("category_price").unwrap(),columns:Page::new(vec![Text::try_from("category").unwrap(),Text::try_from("price").unwrap()]).unwrap(),covering:Page::new(vec![Text::try_from("name").unwrap()]).unwrap()},nabedra_rt::ids::uuid_v4(),1).await.unwrap();
             for query in &queries {check(&app,&table,&rows,query.clone()).await;}
             reject_mixed_predicate(&app,table.id).await;
             let explanation=call(&app,"query.explain",json!({"table_id":table.id,"query":queries[1]})).await;

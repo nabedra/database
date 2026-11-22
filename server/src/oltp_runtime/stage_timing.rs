@@ -77,7 +77,7 @@ impl Stage {
     pub(crate) fn timer(&'static self) -> Timer {
         Timer {
             stage: self,
-            started: Instant::now(),
+            started: nabedra_rt::time::now_std(),
         }
     }
 }

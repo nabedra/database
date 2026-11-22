@@ -126,7 +126,7 @@ async fn at_proposal(
     mut request: Pin<&mut impl Future<Output = DirectResponse>>,
     count: u64,
 ) {
-    tokio::time::timeout(
+    nabedra_rt::time::timeout(
         Duration::from_secs(5),
         std::future::poll_fn(|cx| {
             assert!(request.as_mut().poll(cx).is_pending());
@@ -145,14 +145,14 @@ async fn pause_near(deadline: Instant) {
     pause();
     let near = deadline - Duration::from_millis(1);
     assert!(
-        Instant::now() <= near,
+        nabedra_rt::time::now() <= near,
         "test reached the deadline too early"
     );
-    advance(near - Instant::now()).await;
+    advance(near - nabedra_rt::time::now()).await;
 }
 
 fn timed_insert(cluster: &Cluster, leader: usize, key: i64) -> DirectRequest {
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     cluster.request(leader, &insert(cluster, id, key), id)
 }
 
@@ -166,7 +166,7 @@ async fn d02_fixa_batch_replay_near_deadline_preserves_the_committed_outcome() {
     let leader = cluster.leader().await;
     let voter = &cluster.voters[leader];
     let keys = distinct_keys(&cluster, 3);
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = insert(&cluster, id, keys[1]);
     let deadline = Arc::new(OnceLock::new());
     let (handle, consensus) = held_handle(voter, Some((id, deadline.clone())));
@@ -179,7 +179,7 @@ async fn d02_fixa_batch_replay_near_deadline_preserves_the_committed_outcome() {
 
     let request = cluster.request(leader, &body, id);
     pause();
-    deadline.set(Instant::now() + request.deadline).unwrap();
+    deadline.set(nabedra_rt::time::now() + request.deadline).unwrap();
     let mut retry = Box::pin(voter.executor.execute(&handle, request));
     assert!(futures_util::poll!(retry.as_mut()).is_pending());
     resume();
@@ -242,7 +242,7 @@ async fn d04_fixa_shutdown_refuses_a_batch_that_never_reached_raft() {
 
     let request = timed_insert(&cluster, leader, keys[1]);
     pause();
-    let deadline = Instant::now() + request.deadline;
+    let deadline = nabedra_rt::time::now() + request.deadline;
     let mut queued = Box::pin(voter.executor.execute(&handle, request));
     assert!(futures_util::poll!(queued.as_mut()).is_pending());
     resume();

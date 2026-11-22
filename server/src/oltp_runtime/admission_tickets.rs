@@ -152,7 +152,7 @@ impl AdmissionTicketIssuer for AdmissionTickets {
             };
             let ticket = OwnerAdmissionTicket {
                 owner: self.local,
-                nonce: Uuid::new_v4(),
+                nonce: nabedra_rt::ids::uuid_v4(),
                 status_group: status.clone(),
                 expected,
             };
