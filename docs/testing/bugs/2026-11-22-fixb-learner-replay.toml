@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "FIXB-learner-replay"
+title = "A second replacement learner could not replay historical membership"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_runtime/recovery_tests.rs::o17_control_voter_refresh_process"
+seed = "unknown"
+why_not_caught = "A fresh learner must replay records that predate the previous replacement."
+invariant_added = "Bound the learner's authorization to the published voters and the replay interval."
+fix_commits = ["08f27344864e5a77f484b79853dde05d50e8f5d1", "9e10a04c05d37a673535d0ac1d9bef698cc229cc"]
+revert_patch_ok = false

@@ -1,0 +1,15 @@
+# Evidence: docs/testing/evidence/oltp/direct-latency/snap1/README.md
+id = "SNAP1"
+title = "Writing a Raft snapshot file stalled the Data apply path"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G09", "OLTP-G13"]
+scenarios = ["O11", "O16"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "server/src/oltp/pool/tests/snap1.rs::snap1_o11_applies_proceed_while_a_snapshot_file_is_written"
+seed = "unknown"
+why_not_caught = "Short runs did not reach the snapshot threshold with enough data to hold apply for seconds."
+invariant_added = "Sync and pin one cut under apply order and write the file away from apply only when needed."
+fix_commits = ["7345610d2331fb9e94c7f40c63caa6f3be039bbc"]
+revert_patch_ok = false

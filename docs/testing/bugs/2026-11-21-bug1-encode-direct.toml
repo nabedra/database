@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "BUG1-encode-direct"
+title = "Direct reply encoding pressure hid an applied write"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G04"]
+scenarios = ["D10", "O10"]
+found_by = "unknown"
+found_date = "2026-11-21"
+lowest_regression = "server/src/oltp_runtime/worker_runtime/direct_gateway/tests.rs::d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied"
+seed = "unknown"
+why_not_caught = "The reply allocation must fail after the mutation has applied."
+invariant_added = "A reply encoding failure after possible apply preserves uncertainty."
+fix_commits = ["d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+revert_patch_ok = false

@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "ACC3-cold-fence"
+title = "Cold fencing gave up while a configured voter reopened"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G07", "OLTP-G08"]
+scenarios = ["O15", "R04"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "O15"
+seed = "unknown"
+why_not_caught = "The refusal occurred during a reopen window in cold startup."
+invariant_added = "Retry a transient voter refusal within the cold fencing deadline."
+fix_commits = ["6cf032792e7ed01c97e01c16a31f0adc8478ee95"]
+revert_patch_ok = true

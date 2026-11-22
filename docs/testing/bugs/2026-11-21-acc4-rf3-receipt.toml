@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "ACC4-rf3-receipt"
+title = "The O11 fixture expected a retained record for abandoned old-run work"
+class = "other"
+module = "testing"
+guarantees = ["OLTP-G07"]
+scenarios = ["O11", "O15"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "O11"
+seed = "unknown"
+why_not_caught = "The fixture expected the old-run request body to survive a full stop."
+invariant_added = "The O11 fixture checks the abandonment error and verifies committed rows separately."
+fix_commits = ["5ac1562343b17fbb7c2c69817f2d7752157afb7e"]
+revert_patch_ok = false

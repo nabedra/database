@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "ACC3-receipt"
+title = "Transient receipt lookup failures ended queued observation early"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G03", "OLTP-G07"]
+scenarios = ["O13", "O14"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "server/tests/oltp_runtime_acceptance.py::transient_receipt_observation"
+seed = "unknown"
+why_not_caught = "The lookup error must interrupt a request that the queue already accepted."
+invariant_added = "Retry receipt observation within its deadline under the original request ID."
+fix_commits = ["d6eb811a9846485713937fb9bedff51f22b2bce1"]
+revert_patch_ok = true

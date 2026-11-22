@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "REP5-cold-intent"
+title = "An unmounted replacement intent survived into a new run"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17", "R04"]
+found_by = "review"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_replication/authority/control/tests/system_recovery.rs::r04_o17_cold_publication_retires_the_unmounted_intent"
+seed = "unknown"
+why_not_caught = "The cold shutdown must follow Prepare and precede Mount."
+invariant_added = "A new run retires old unmounted replacement intents and frees their slot."
+fix_commits = ["ec8d06c5b80a012b42faf0ea891e459cc934a4f4", "2def358f9c98bb14910726ac5888ba3be2a80441"]
+revert_patch_ok = false

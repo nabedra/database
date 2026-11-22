@@ -1,0 +1,15 @@
+# Evidence: docs/testing/evidence/oltp/local-k8s/README.md
+id = "AZ1"
+title = "A blackholed voter exhausted the client's failover window"
+class = "stale-route-topology-schema"
+module = "oltp"
+guarantees = ["OLTP-G10"]
+scenarios = ["D05", "O18"]
+found_by = "acceptance"
+found_date = "2026-11-21"
+lowest_regression = "server/tests/oltp_blackhole.py"
+seed = "unknown"
+why_not_caught = "A clean stop closes connections before a silent packet drop would time out."
+invariant_added = "Probe alternate voters within the client deadline and keep polling submitted attempts."
+fix_commits = ["b423c2d731dd59c8096babe37978ddac2ea2c5d0", "cb9e2ae16e4107856aebbce1db2a5aa961afb724", "7d8e23d94250b608efa06efc644f1d77a1b77ecf", "4491bcc6ee520521e848e8c99cacba311b4b26b6", "ddca31cb13915efd7a5dae57af1ae234eb4b5ab9"]
+revert_patch_ok = false

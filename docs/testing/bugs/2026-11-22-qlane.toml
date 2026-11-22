@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "QLANE"
+title = "Local participant lane saturation aborted accepted queued work"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G05", "OLTP-G07", "OLTP-G09"]
+scenarios = ["O07", "O08"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "O07"
+seed = "unknown"
+why_not_caught = "The outgoing lane must run out of slots after the queue accepts a request."
+invariant_added = "Wait within the deadline with the same charged participant command and attempt."
+fix_commits = ["b179b5840b06d2ec7bf0bf001325101b06629dad", "7ddad3bbf4c3871c2db88a579312e81dc33fbd2a"]
+revert_patch_ok = true

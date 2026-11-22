@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "BUG1-encode-submit"
+title = "A queued receipt encoding failure hid accepted work"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G04", "OLTP-G07"]
+scenarios = ["Q05", "O13"]
+found_by = "unknown"
+found_date = "2026-11-21"
+lowest_regression = "server/src/oltp_runtime/application.rs::q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity"
+seed = "unknown"
+why_not_caught = "The receipt body or header must fail to encode after submission."
+invariant_added = "Receipt encoding failure preserves uncertainty and the queued identity."
+fix_commits = ["d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+revert_patch_ok = false

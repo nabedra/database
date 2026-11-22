@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "FIXA-unproposed"
+title = "Batch shutdown left an unproposed member with an unknown outcome"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G04"]
+scenarios = ["D04"]
+found_by = "unknown"
+found_date = "2026-11-22"
+lowest_regression = "server/src/oltp_runtime/direct/tests/fixa.rs::d04_fixa_shutdown_refuses_a_batch_that_never_reached_raft"
+seed = "unknown"
+why_not_caught = "The batch driver must stop while a member still waits to reach Raft."
+invariant_added = "Members dropped before proposal have a definite refusal."
+fix_commits = ["6ea31de7e9ac775cb8d6e91a61297fdb693e8716"]
+revert_patch_ok = true

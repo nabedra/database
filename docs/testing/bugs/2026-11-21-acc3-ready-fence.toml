@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "ACC3-ready-fence"
+title = "A Timestamp election could interrupt the ready fence permanently"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G07"]
+scenarios = ["O15"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "O15"
+seed = "unknown"
+why_not_caught = "The election must coincide with the ready fence."
+invariant_added = "Resume a ready fence across a leadership change."
+fix_commits = ["afbc048bb192cdb86b86bb279e80d911864a90ce"]
+revert_patch_ok = true

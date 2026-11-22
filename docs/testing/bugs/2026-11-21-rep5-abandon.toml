@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "REP5-abandon"
+title = "An unmounted replacement could leave the execution slot occupied"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17", "R01"]
+found_by = "review"
+found_date = "2026-11-21"
+lowest_regression = "server/tests/oltp_recovery_operations.py --suite replacement-abandon"
+seed = "unknown"
+why_not_caught = "The replacement must be prepared and then abandoned before Mount."
+invariant_added = "An authorized Abandon clears an unmounted intent and leaves a mounted intent intact."
+fix_commits = ["2def358f9c98bb14910726ac5888ba3be2a80441"]
+revert_patch_ok = false

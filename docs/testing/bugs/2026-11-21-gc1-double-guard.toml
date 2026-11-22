@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "GC1-double-guard"
+title = "Each append acquired two pending guards after the GC1 merge"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G09"]
+scenarios = ["C07", "F03"]
+found_by = "ci-flake"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_replication/typed_log/tests.rs::c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_group_vote"
+seed = "unknown"
+why_not_caught = "Both parent branches tracked appends independently and the duplication appeared only after the merge."
+invariant_added = "One task guard tracks each append through the end of its work."
+fix_commits = ["b694f75b3a2198c6a02aff222a2f62dd1161adde"]
+revert_patch_ok = false

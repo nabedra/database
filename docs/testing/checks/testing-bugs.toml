@@ -1,0 +1,11 @@
+id = "testing-bugs"
+module = "testing"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+command = ["python3", "scripts/testing/bugs.py", "validate"]
+cwd = "."
+timeout_s = 30
+needs = []
+result_parser = "exit-code"
