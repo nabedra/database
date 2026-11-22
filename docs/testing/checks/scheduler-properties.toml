@@ -1,0 +1,11 @@
+id = "scheduler-properties"
+module = "scheduler"
+kinds = ["U"]
+guarantees = ["SCHED-G01", "SCHED-G02", "SCHED-G03", "SCHED-G04", "OLAP-G07"]
+scenarios = ["U03"]
+tiers = ["T0", "T1"]
+command = ["cargo", "test", "-j", "2", "--lib", "scheduler_properties"]
+cwd = "server"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"

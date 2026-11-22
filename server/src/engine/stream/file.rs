@@ -27,9 +27,16 @@ enum Reader {
     Unchecked(Bytes),
     Projected(Box<ProjectedReader>),
     Legacy(Vec<Row>),
+    #[cfg(test)]
+    FullScan(Vec<Row>),
 }
 
 impl OpenFile {
+    #[cfg(test)]
+    pub(super) fn is_full_scan(&self) -> bool {
+        matches!(self.reader, Reader::FullScan(_))
+    }
+
     pub(super) async fn load<B: ObjectStore>(
         storage: &Storage<B>,
         pool: &WorkerPool,
@@ -144,6 +151,10 @@ impl OpenFile {
                     &projected
                 }
                 Reader::Legacy(rows) => rows.get(cursor.raw_offset as usize).ok_or_else(corrupt)?,
+                #[cfg(test)]
+                Reader::FullScan(rows) => {
+                    rows.get(cursor.raw_offset as usize).ok_or_else(corrupt)?
+                }
             };
             let matched = matches_filter(&scan.query, row);
             if matched {
@@ -166,6 +177,13 @@ impl OpenFile {
     fn open_reader(&self, scan: &PinnedScan, bytes: Bytes) -> Result<Reader, ProtocolError> {
         match &scan.data {
             TableData::Partitioned { files } => {
+                #[cfg(test)]
+                if scan.force_full_scan {
+                    // Decode every column and row group before applying the stream cursor.
+                    let rows =
+                        snapshot::decode(&scan.table, bytes, Some(scan.file_rows(self.file)?))?;
+                    return Ok(Reader::FullScan(rows));
+                }
                 let reader = ProjectedReader::open(
                     &scan.table,
                     bytes,

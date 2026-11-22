@@ -1,4 +1,7 @@
 use super::*;
+
+mod scheduler_properties;
+
 fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }

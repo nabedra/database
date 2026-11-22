@@ -20,6 +20,8 @@ use serde_json::json;
 use std::{num::NonZeroUsize, sync::Mutex};
 use tokio::runtime::Handle;
 
+mod olap_oracles;
+
 #[derive(Default)]
 struct Store {
     objects: Fake,
