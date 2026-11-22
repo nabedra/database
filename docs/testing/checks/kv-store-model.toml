@@ -1,0 +1,11 @@
+id = "kv-store-model"
+module = "kv"
+kinds = ["U"]
+guarantees = ["KV-G02", "KV-G03"]
+scenarios = ["K01", "K02"]
+tiers = ["T0", "T1"]
+command = ["cargo", "test", "--no-default-features", "--features", "cache", "--lib", "cache::store::model_tests"]
+cwd = "server"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"

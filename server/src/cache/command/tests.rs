@@ -63,7 +63,7 @@ fn k01_validates_set_forms_and_integer_boundaries() {
     }
     assert!(matches!(
         operation(&[b"EXPIRE", b"k", b"-1"]),
-        Operation::Expire { ttl_ms: -1, .. }
+        Operation::Expire { ttl_ms: -1_000, .. }
     ));
     assert!(matches!(
         operation(&[b"PEXPIRE", b"k", b"0"]),
@@ -154,6 +154,24 @@ fn k01_validates_driver_handshake_and_metadata() {
 }
 
 #[test]
+fn k01_getkeys_does_not_apply_wall_clock_expiry_limit() {
+    let command = parse(&[
+        b"COMMAND",
+        b"GETKEYS",
+        b"SET",
+        b"k",
+        b"v",
+        b"PX",
+        b"9223372036854775807",
+    ])
+    .unwrap();
+    assert_eq!(
+        command.metadata_response(1024),
+        Some(Response::Array(vec![Response::bulk(b"k")]))
+    );
+}
+
+#[test]
 fn k02_validates_item_sizes_in_every_operation() {
     let oversized_key = Bytes::from(vec![b'k'; MAX_KEY_BYTES + 1]);
     assert!(matches!(
@@ -172,4 +190,165 @@ fn k02_validates_item_sizes_in_every_operation() {
         ]),
         Err(CommandError::InvalidValueSize)
     ));
+}
+
+/// Release builds have no DEBUG command: every form gets the ordinary
+/// unknown-command error, exactly as an unsupported command does.
+#[cfg(not(feature = "test-hooks"))]
+#[test]
+fn test_hooks_debug_is_unknown_without_the_feature() {
+    for words in [
+        &[b"DEBUG".as_slice(), b"DIGEST"][..],
+        &[b"debug", b"SET-ACTIVE-EXPIRE", b"0"],
+        &[b"DEBUG", b"SLEEP", b"1"],
+        &[b"DEBUG"],
+    ] {
+        let error = parse(words).err().expect("DEBUG must not parse");
+        assert_eq!(error, CommandError::Unsupported);
+        assert_eq!(
+            error.response(),
+            Response::error(b"ERR unknown or unsupported command")
+        );
+    }
+}
+
+/// Wrong-arity replies, byte for byte as Valkey 8.1.11 answers them
+/// (captured from `valkey/valkey:8.1.11`; the differential found the
+/// data-command cases in Actions run 45047452991). Valkey prints the
+/// lowercase full command name, whatever case the client sent.
+#[test]
+fn k01_wrong_arity_errors_match_valkey() {
+    let cases: &[(&[&[u8]], &[u8])] = &[
+        (
+            &[b"GET"],
+            b"ERR wrong number of arguments for 'get' command",
+        ),
+        (
+            &[b"get", b"a", b"b"],
+            b"ERR wrong number of arguments for 'get' command",
+        ),
+        (
+            &[b"SET", b"k"],
+            b"ERR wrong number of arguments for 'set' command",
+        ),
+        (
+            &[b"DEL"],
+            b"ERR wrong number of arguments for 'del' command",
+        ),
+        (
+            &[b"EXISTS"],
+            b"ERR wrong number of arguments for 'exists' command",
+        ),
+        (
+            &[b"MGET"],
+            b"ERR wrong number of arguments for 'mget' command",
+        ),
+        (
+            &[b"TTL"],
+            b"ERR wrong number of arguments for 'ttl' command",
+        ),
+        (
+            &[b"pttl", b"a", b"b"],
+            b"ERR wrong number of arguments for 'pttl' command",
+        ),
+        (
+            &[b"EXPIRE", b"k"],
+            b"ERR wrong number of arguments for 'expire' command",
+        ),
+        (
+            &[b"PEXPIRE", b"k"],
+            b"ERR wrong number of arguments for 'pexpire' command",
+        ),
+        (
+            &[b"PERSIST"],
+            b"ERR wrong number of arguments for 'persist' command",
+        ),
+        (
+            &[b"InCrBy", b"k"],
+            b"ERR wrong number of arguments for 'incrby' command",
+        ),
+        (
+            &[b"PING", b"a", b"b"],
+            b"ERR wrong number of arguments for 'ping' command",
+        ),
+        (
+            &[b"ECHO"],
+            b"ERR wrong number of arguments for 'echo' command",
+        ),
+        (
+            &[b"ECHO", b"a", b"b"],
+            b"ERR wrong number of arguments for 'echo' command",
+        ),
+        (
+            &[b"AUTH"],
+            b"ERR wrong number of arguments for 'auth' command",
+        ),
+        (&[b"AUTH", b"a", b"b", b"c"], b"ERR syntax error"),
+        (
+            &[b"CLIENT"],
+            b"ERR wrong number of arguments for 'client' command",
+        ),
+        (
+            &[b"CLIENT", b"SETNAME"],
+            b"ERR wrong number of arguments for 'client|setname' command",
+        ),
+        (
+            &[b"client", b"setname", b"a", b"b"],
+            b"ERR wrong number of arguments for 'client|setname' command",
+        ),
+        (
+            &[b"CLIENT", b"SETINFO", b"LIB-NAME"],
+            b"ERR wrong number of arguments for 'client|setinfo' command",
+        ),
+        (
+            &[b"COMMAND", b"COUNT", b"x"],
+            b"ERR wrong number of arguments for 'command|count' command",
+        ),
+        (
+            &[b"COMMAND", b"GETKEYS"],
+            b"ERR wrong number of arguments for 'command|getkeys' command",
+        ),
+        (
+            &[b"COMMAND", b"GETKEYS", b"GET"],
+            b"ERR Invalid number of arguments specified for command",
+        ),
+        (
+            &[b"COMMAND", b"GETKEYS", b"GET", b"a", b"b"],
+            b"ERR Invalid number of arguments specified for command",
+        ),
+        (
+            &[b"CLUSTER"],
+            b"ERR wrong number of arguments for 'cluster' command",
+        ),
+        (
+            &[b"CLUSTER", b"SLOTS", b"x"],
+            b"ERR wrong number of arguments for 'cluster|slots' command",
+        ),
+        (
+            &[b"CLUSTER", b"SHARDS", b"x"],
+            b"ERR wrong number of arguments for 'cluster|shards' command",
+        ),
+        (
+            &[b"CLUSTER", b"KEYSLOT"],
+            b"ERR wrong number of arguments for 'cluster|keyslot' command",
+        ),
+        (
+            &[b"CLUSTER", b"KEYSLOT", b"a", b"b"],
+            b"ERR wrong number of arguments for 'cluster|keyslot' command",
+        ),
+    ];
+    for (words, expected) in cases {
+        let error = parse(words).err().expect("wrong arity must not parse");
+        assert_eq!(
+            error.response(),
+            Response::Error(Bytes::from_static(expected)),
+            "{:?}",
+            words
+                .iter()
+                .map(|w| String::from_utf8_lossy(w))
+                .collect::<Vec<_>>()
+        );
+    }
+    // Valkey's QUIT ignores its arguments and answers OK.
+    assert!(matches!(parse(&[b"QUIT", b"x"]), Ok(Command::Quit)));
 }

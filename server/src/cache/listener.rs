@@ -12,8 +12,11 @@ use tokio::time::{sleep, timeout};
 
 use super::admission::Admission;
 use super::auth::{Acl, Identity};
-use super::command::{Command, Credentials, DataCommand, hello_response, key_slot};
+use super::command::{
+    Command, CommandError, CommandKind, Credentials, DataCommand, hello_response, key_slot,
+};
 use super::config::ListenerConfig;
+use super::store::StoreError;
 use super::wire::{Decoder, Response};
 
 pub(super) trait Backend: Send + Sync + 'static {
@@ -29,6 +32,14 @@ pub(super) trait Backend: Send + Sync + 'static {
 
     fn shards(&self) -> Response {
         self.slots()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn debug(
+        &self,
+        _command: super::test_hooks::DebugCommand,
+    ) -> impl Future<Output = Response> + Send {
+        async { Response::error(b"ERR DEBUG is not supported by this backend") }
     }
 }
 
@@ -290,9 +301,23 @@ async fn dispatch<'a, B: Backend>(
             if identity.is_some_and(|identity| !identity.allows(&command)) {
                 return forbidden();
             }
-            backend.execute(command).await
+            let kind = command.kind();
+            data_response(kind, backend.execute(command).await)
         }
+        #[cfg(feature = "test-hooks")]
+        Command::Debug(command) => backend.debug(command).await,
         _ => Response::error(b"ERR unsupported command"),
+    }
+}
+
+/// The store cannot name the command, so its deadline overflow gets Valkey's
+/// per-command text here, for the standalone and cluster backends alike.
+fn data_response(kind: CommandKind, response: Response) -> Response {
+    match &response {
+        Response::Error(text) if text.as_ref() == StoreError::InvalidTtl.resp().as_bytes() => {
+            CommandError::InvalidExpireTime(kind.name()).response()
+        }
+        _ => response,
     }
 }
 
@@ -319,6 +344,65 @@ mod tests {
     use bytes::Buf;
 
     use super::*;
+
+    /// Valkey 8.1.11 replies, captured from `valkey/valkey:8.1.11`.
+    #[tokio::test]
+    async fn k01_expire_time_overflow_matches_valkey() {
+        use crate::cache::standalone::Standalone;
+        use crate::cache::store::{EvictionPolicy, TurnLimits};
+        let backend = Standalone::new(
+            1 << 20,
+            EvictionPolicy::NoEviction,
+            16,
+            TurnLimits::default(),
+        );
+        let run = async |words: &[&'static [u8]]| {
+            let frame = words
+                .iter()
+                .map(|word| bytes::Bytes::from_static(word))
+                .collect();
+            match Command::parse(frame) {
+                Ok(Command::Data(command)) => {
+                    let kind = command.kind();
+                    data_response(kind, backend.execute(command).await)
+                }
+                Ok(_) => panic!("not a data command"),
+                Err(error) => error.response(),
+            }
+        };
+        assert_eq!(run(&[b"SET", b"k", b"v"]).await, Response::ok());
+        let max = b"9223372036854775807";
+        for (words, expected) in [
+            (&[b"EXPIRE".as_slice(), b"k", max][..], "expire"),
+            (&[b"EXPIRE", b"missing", max], "expire"),
+            (&[b"EXPIRE", b"k", b"-9223372036854775807"], "expire"),
+            (&[b"EXPIRE", b"k", b"-9223372036854776"], "expire"),
+            (&[b"PEXPIRE", b"k", max], "pexpire"),
+            (&[b"PEXPIRE", b"k", b"9223372036854000000"], "pexpire"),
+            (&[b"EXPIRE", b"k", b"9223372036854775"], "expire"),
+            (&[b"SET", b"k", b"v", b"PX", max], "set"),
+            (&[b"SET", b"k", b"v", b"EX", b"9223372036854775"], "set"),
+        ] {
+            let text = format!("ERR invalid expire time in '{expected}' command");
+            assert_eq!(
+                run(words).await,
+                Response::Error(bytes::Bytes::from(text)),
+                "{words:?}"
+            );
+        }
+        assert_eq!(
+            run(&[b"GET", b"k"]).await,
+            Response::Bulk(Some(bytes::Bytes::from_static(b"v")))
+        );
+        for words in [
+            [b"EXPIRE".as_slice(), b"k", b"-9223372036854775"],
+            [b"PEXPIRE", b"k", b"-9223372036854775808"],
+        ] {
+            assert_eq!(run(&[b"SET", b"k", b"v"]).await, Response::ok());
+            assert_eq!(run(&words).await, Response::Integer(1));
+            assert_eq!(run(&[b"EXISTS", b"k"]).await, Response::Integer(0));
+        }
+    }
 
     #[test]
     fn k02_pipeline_compacts_within_backing_budget() {
