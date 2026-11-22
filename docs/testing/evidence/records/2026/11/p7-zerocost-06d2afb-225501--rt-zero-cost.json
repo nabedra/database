@@ -1,0 +1,47 @@
+{
+  "artifacts": [
+    {
+      "name": "p7-zerocost-06d2afb-225501--rt-zero-cost.log",
+      "sha256": "9cd900637990dcc6fbe697d087480262c1c4ced8e6bafd099eca77d5f455fa80"
+    }
+  ],
+  "assertions": {
+    "executed": 0,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "output-marker",
+        "reason": "not-run: valgrind-missing"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "rt-zero-cost",
+  "duration_s": 0.165,
+  "guarantees": [
+    "OLTP-G13"
+  ],
+  "kind": "P",
+  "mode": null,
+  "result": "not-run",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T21:55:21.649657+00:00",
+    "request_id": "p7-zerocost-06d2afb-225501",
+    "runner": "GitHub Actions 1000004074",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45074733543"
+  },
+  "scenarios": [
+    "O09"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "06d2afb29842825552cf9ff4c41dd95f197ba548",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
