@@ -21,6 +21,12 @@ pub mod s3;
 pub use manifest::*;
 #[cfg(feature = "s3")]
 pub use s3::S3Store;
+#[cfg(test)]
+mod commit_protocol_tests;
+#[cfg(test)]
+mod contract_tests;
+#[cfg(test)]
+pub(crate) mod sim;
 use std::{future::Future, pin::Pin};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
