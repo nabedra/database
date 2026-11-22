@@ -1,0 +1,14 @@
+# Explicit-state protocol models (server/check/src/model.rs and server/check/tests/model_*.rs).
+# Each model passes with its guards on, and each guard removed gives a counterexample
+# that the test asserts, so the check fails if a model or the checker stops finding it.
+id = "models"
+module = "check"
+kinds = ["M"]
+guarantees = ["OLTP-G03", "OLTP-G04", "OLTP-G08", "OLAP-G01", "OLAP-G02", "OLAP-G03", "OLAP-G04", "EVT-G05", "KV-G06"]
+scenarios = ["O10", "O12", "D02", "D05", "O17", "O26", "T04", "T05", "EV03", "K03"]
+tiers = ["T0", "T1"]
+command = ["cargo", "test", "-j", "2", "-p", "nabedra-check", "--lib", "--test", "model_*"]
+cwd = "server"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"
