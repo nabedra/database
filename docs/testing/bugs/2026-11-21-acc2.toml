@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "ACC2"
+title = "Index validation failure advanced the Data schema fence"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G06"]
+scenarios = ["O12"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "O12"
+seed = "unknown"
+why_not_caught = "The failed validation must occur before Catalog publishes the candidate index lifecycle."
+invariant_added = "Validate publication before taking the Data fence."
+fix_commits = ["c25875663dddcad60275ff34b92cbd62d160ffef"]
+revert_patch_ok = true

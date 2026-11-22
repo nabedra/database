@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "AZ2"
+title = "A Data learner refused the published leader during historical membership replay"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G08"]
+scenarios = ["O26"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_replication/typed_network/tests.rs::o26_learner_accepts_current_leader_while_replaying_historical_membership"
+seed = "unknown"
+why_not_caught = "The learner must catch up through an older membership after the sender becomes a published voter."
+invariant_added = "Authorize published voters during the bounded replay interval."
+fix_commits = ["2df6cd9aefeeeed22d56a2c5cf87cebded9f54df"]
+revert_patch_ok = false

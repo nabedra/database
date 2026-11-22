@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "FIXB-cold-publish"
+title = "A mounted replacement could not publish after a cold restart"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17", "R04"]
+found_by = "unknown"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_replication/authority/control/tests/system_recovery.rs::r04_o17_cold_fence_after_mount_completes_publication"
+seed = "unknown"
+why_not_caught = "The cold restart must fall between Mount and Publish."
+invariant_added = "A retained mounted candidate may publish after the survivors establish the new run."
+fix_commits = ["c7249204deb25eff3c49afc677a2f0a4a7afc2e2", "d509f66bbc1e01b8687eec8429a236a0a1016ef5"]
+revert_patch_ok = false

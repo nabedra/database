@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "RV-REP-3"
+title = "A wiped replacement could reopen under its committed voter identity"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G01", "OLTP-G08"]
+scenarios = ["O17", "NS23"]
+found_by = "review"
+found_date = "2026-11-21"
+lowest_regression = "server/tests/oltp_recovery_operations.py --suite replacement-wipe"
+seed = "unknown"
+why_not_caught = "The mount must be wiped after its identity commits while its signing key survives."
+invariant_added = "A mounted voter may resume only on the verified retained storage."
+fix_commits = ["96d892ea0c3de91af4c7c14a272c66d15ec1e5db", "2def358f9c98bb14910726ac5888ba3be2a80441"]
+revert_patch_ok = false

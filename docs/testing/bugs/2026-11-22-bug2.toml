@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "BUG2"
+title = "A replica rejected a well-formed queue copy as invalid during a view change"
+class = "stale-route-topology-schema"
+module = "oltp"
+guarantees = ["OLTP-G06", "OLTP-G07"]
+scenarios = ["O16"]
+found_by = "ci-flake"
+found_date = "unknown"
+lowest_regression = "O16"
+seed = "unknown"
+why_not_caught = "Routing ahead of the replica's applied membership was intermittent in direct-off runs."
+invariant_added = "A valid copy with a newer authority returns retryable Stale."
+fix_commits = ["fd5aa4a3cef443fc1635ff5667e232b071b6c007"]
+revert_patch_ok = true

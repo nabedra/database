@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "RES1"
+title = "Concurrent Data proposals checked free space without reserving it together"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G09"]
+scenarios = ["O08", "O13", "O21"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "server/src/oltp/pool/disk.rs::o08_o13_o21_same_filesystem_reserves_once_and_releases"
+seed = "unknown"
+why_not_caught = "Independent ranges and pools must contend on one filesystem to expose the check-then-reserve race."
+invariant_added = "Hold one charged filesystem reservation per admitted proposal through settlement."
+fix_commits = ["c5d4a26ef0ec40ac59fa85a957896f7d3b5a9b03", "601008115c261d0f4808fbe315a9bfc1a1bb4596"]
+revert_patch_ok = false

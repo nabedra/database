@@ -1,0 +1,61 @@
+name: nabedra nightly
+
+on:
+  schedule:
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nabedra-nightly-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Dispatch nightly checks on main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Dispatching nabedra-build.yml is the only write this workflow makes.
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Select T2 checks and dispatch the build workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          sha=$(git rev-parse HEAD)
+          if [ -f scripts/testing/run_check.py ] && python3 scripts/testing/run_check.py --help | grep -F -- --tier > /dev/null; then
+            checks=$(python3 scripts/testing/run_check.py --list --tier T2 | cut -f1 | paste -sd, -)
+          else
+            checks=$(python3 - <<'PY'
+          from pathlib import Path
+          import tomllib
+
+          ids = []
+          for path in sorted(Path("docs/testing/checks").glob("*.toml")):
+              with path.open("rb") as source:
+                  check = tomllib.load(source)
+              if "T2" in check.get("tiers", []):
+                  ids.append(check["id"])
+          print(",".join(ids))
+          PY
+            )
+          fi
+          # The run ID keeps a manual rerun on the same day from sharing evidence and S3 prefixes.
+          request_id="nightly-${sha:0:7}-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}"
+          {
+            printf 'Tested revision: `%s`\n\n' "$sha"
+            printf 'Request: `%s`\n\n' "$request_id"
+            printf 'T2 checks: %s\n' "${checks:-none registered}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh workflow run nabedra-build.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f sha="$sha" -f request_id="$request_id" -f base=false \
+            -f checks="$checks" -f jobs=fuzz -f fuzz_seconds=3600 | tee -a "$GITHUB_STEP_SUMMARY"

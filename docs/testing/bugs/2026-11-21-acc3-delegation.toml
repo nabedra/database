@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "ACC3-delegation"
+title = "A retained worker tried to delegate before its promotion applied"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G07", "OLTP-G08"]
+scenarios = ["O14", "R03"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "O14"
+seed = "unknown"
+why_not_caught = "The gateway must see enrollment before the worker can act as a delegate."
+invariant_added = "Wait for retained-worker delegation to be authorized by applied membership."
+fix_commits = ["6ad8a99c2561ba48c0bcb4a2b8252d9c1e2ad30b"]
+revert_patch_ok = true

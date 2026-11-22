@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "FLAKE4-allocator-fixture"
+title = "O09 raced writes before both gateways could read after failover"
+class = "other"
+module = "testing"
+guarantees = ["OLTP-G02"]
+scenarios = ["O09"]
+found_by = "ci-flake"
+found_date = "unknown"
+lowest_regression = "O09"
+seed = "unknown"
+why_not_caught = "Allocator readiness alone did not establish readiness for Catalog and Data reads."
+invariant_added = "Read through both gateways and take the allocator reference window after readiness."
+fix_commits = ["faa21dc347ad6b2cb91f9c5314368c170dfd1681", "221ed56ae160f52c1bfdd7397366804d812f4f6e"]
+revert_patch_ok = false

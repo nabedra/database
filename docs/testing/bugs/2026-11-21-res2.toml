@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "RES2"
+title = "Fixed disk reservations rejected small proposals that could fit"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G09"]
+scenarios = ["O08", "O13"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_runtime/direct/tests/reservations.rs::o08_o13_small_data_proposals_share_two_gib"
+seed = "unknown"
+why_not_caught = "The fixed allowance only failed under concurrent proposals and a tight filesystem budget."
+invariant_added = "Scale reservations with encoded bytes and apply work while protecting journal progress."
+fix_commits = ["ca5edf920c26cdaff5a1234f2536497f545352dd"]
+revert_patch_ok = false

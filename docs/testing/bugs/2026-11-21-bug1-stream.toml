@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "BUG1-stream"
+title = "A streamed retry could miss the original direct result"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G03"]
+scenarios = ["D03", "Q05"]
+found_by = "unknown"
+found_date = "2026-11-21"
+lowest_regression = "server/src/oltp_runtime/worker_runtime/direct_gateway/tests.rs::d03_q05_bug1_direct_retry_without_content_length_replays_original_result"
+seed = "unknown"
+why_not_caught = "The retry must change HTTP body framing while keeping the same logical request."
+invariant_added = "Settle the direct identity before forwarding a streamed retry to the queue."
+fix_commits = ["c9d7c5b86280e174f613ab6ddacc747c7aafda0c", "d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+revert_patch_ok = false

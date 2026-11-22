@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "BUG1-d04"
+title = "The direct leader lost its responder after applying a write"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G01", "OLTP-G03", "OLTP-G04"]
+scenarios = ["D04", "O10"]
+found_by = "unknown"
+found_date = "2026-11-21"
+lowest_regression = "server/src/oltp_runtime/direct/tests.rs::d04_o10_bug1_leader_shutdown_after_apply_preserves_proposal_uncertainty"
+seed = "unknown"
+why_not_caught = "The leader must apply the write and step down before its proposal returns."
+invariant_added = "Preserve uncertainty across the redirect and replay the stored result on the next leader."
+fix_commits = ["259da02c2369527ebce3d292dac83dd5ffad2d71", "d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+revert_patch_ok = false

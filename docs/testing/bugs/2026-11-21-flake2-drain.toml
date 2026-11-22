@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "FLAKE2-drain"
+title = "Native drain returned while a cancelled job still held a permit"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G09"]
+scenarios = ["C07", "F03"]
+found_by = "ci-flake"
+found_date = "2026-11-21"
+lowest_regression = "server/src/oltp/pool/tests.rs::f03_native_drain_waits_for_cancelled_guard_drop"
+seed = "unknown"
+why_not_caught = "The job's guard destructor must be held after the caller cancels."
+invariant_added = "Drain completes only after the cancelled job drops its captured guards."
+fix_commits = ["541b37587b46888095186b458ef070b0906b1fcd"]
+revert_patch_ok = false

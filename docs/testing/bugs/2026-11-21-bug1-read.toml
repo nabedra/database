@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "BUG1-read"
+title = "A lost read reply reported an uncertain mutation outcome"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G04"]
+scenarios = ["D10", "O03"]
+found_by = "unknown"
+found_date = "2026-11-21"
+lowest_regression = "server/src/oltp_runtime/application/direct/tests.rs::d10_o03_bug1_get_without_a_reply_has_no_unknown_mutation_outcome"
+seed = "unknown"
+why_not_caught = "unknown"
+invariant_added = "A read without a reply cannot leave a mutation behind."
+fix_commits = ["d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+revert_patch_ok = false

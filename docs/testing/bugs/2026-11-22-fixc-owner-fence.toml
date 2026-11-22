@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "FIXC-owner-fence"
+title = "Owner fencing returned conflict for recoverable queued work"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G02", "OLTP-G07"]
+scenarios = ["O08", "R01"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "O08"
+seed = "unknown"
+why_not_caught = "The owner must be fenced after preparation while a complete queue copy stays in the current run."
+invariant_added = "Retry the same logical request from a fresh snapshot after exact attempt settlement."
+fix_commits = ["c7b93782a1e9bf4802d3e0dd046ee6725d5616b1", "4287df8234a38854edf7e54e1e42cd460f1c551a"]
+revert_patch_ok = true

@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "REP2"
+title = "Replacement retry certified removal of a different voter"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17", "NS14"]
+found_by = "review"
+found_date = "unknown"
+lowest_regression = "NS14"
+seed = "unknown"
+why_not_caught = "A generic stable voter set cannot distinguish two retries naming different removals."
+invariant_added = "A retry succeeds only for the exact replacement plan and named removed voter."
+fix_commits = ["116fb51dd377611f0a53642fe68e1bb4f742da7d"]
+revert_patch_ok = false

@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "TOPO1-child-schema"
+title = "A split child reused the parent's cached pre-index schema"
+class = "stale-route-topology-schema"
+module = "oltp"
+guarantees = ["OLTP-G06"]
+scenarios = ["O28", "D11"]
+found_by = "acceptance"
+found_date = "unknown"
+lowest_regression = "O28"
+seed = "unknown"
+why_not_caught = "A split child must reuse a parent's epoch after the table lifecycle has changed."
+invariant_added = "Scope cached schema to the group and lifecycle so an acknowledged insert appears in the covering index."
+fix_commits = ["40e0c7f76d27c67d3f1deda91bc585b1781811bf"]
+revert_patch_ok = true

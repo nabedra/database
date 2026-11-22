@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "FIXA-probes"
+title = "Disabled snapshot retry repeatedly probed Control"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G09"]
+scenarios = ["O02", "O08"]
+found_by = "unknown"
+found_date = "2026-11-22"
+lowest_regression = "server/src/oltp_runtime/worker_runtime/direct_capability.rs::o02_o08_fixa_negative_snapshot_retry_probes_are_bounded"
+seed = "unknown"
+why_not_caught = "An active feature never takes the negative-result path."
+invariant_added = "Limit calls for a negative feature result to one per refresh interval."
+fix_commits = ["44fe0693e2915fe4545b5fe3a8dd8fd846ea48c2"]
+revert_patch_ok = true

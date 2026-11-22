@@ -1,0 +1,15 @@
+# Evidence: GitHub PR #27
+id = "FIXB-voter-refresh"
+title = "Data-only revocation checks kept using the old Control voters"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17"]
+found_by = "unknown"
+found_date = "unknown"
+lowest_regression = "server/src/oltp_runtime/recovery_tests.rs::o17_control_voter_refresh_process"
+seed = "unknown"
+why_not_caught = "One replacement leaves enough voters from the original set to mask a stale configuration."
+invariant_added = "Resolve revocations against a majority of the published Control voters."
+fix_commits = ["780db860fffae8e5a0d1cb0838cc6c146eb06850", "d509f66bbc1e01b8687eec8429a236a0a1016ef5"]
+revert_patch_ok = false
