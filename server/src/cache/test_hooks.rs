@@ -228,13 +228,13 @@ mod tests {
             Response::ok()
         );
         assert!(!backend.active_expire.load(Ordering::Relaxed));
-        let sweeper = tokio::spawn(crate::cache::standalone::expire(
+        let sweeper = nabedra_rt::task::spawn(crate::cache::standalone::expire(
             std::sync::Arc::clone(&backend.actor),
             backend.started,
             std::sync::Arc::clone(&backend.active_expire),
         ));
         run(&backend, &["SET", "k", "v", "PX", "1"]).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             backend.actor.lock().await.len(),
             1,
@@ -245,13 +245,13 @@ mod tests {
             run(&backend, &["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).await,
             Response::ok()
         );
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = nabedra_rt::time::now_std() + Duration::from_secs(5);
         while !backend.actor.lock().await.is_empty() {
             assert!(
-                std::time::Instant::now() < deadline,
+                nabedra_rt::time::now_std() < deadline,
                 "the sweep did not resume"
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(10)).await;
         }
         sweeper.abort();
     }
@@ -259,7 +259,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_hooks_sleep_holds_the_store() {
         let backend = backend();
-        let started = tokio::time::Instant::now();
+        let started = nabedra_rt::time::now();
         let (reply, ()) = tokio::join!(run(&backend, &["DEBUG", "SLEEP", "2.5"]), async {
             tokio::task::yield_now().await;
             assert!(
@@ -267,7 +267,7 @@ mod tests {
                 "SLEEP released the store"
             );
             assert!(
-                tokio::time::timeout(
+                nabedra_rt::time::timeout(
                     Duration::from_millis(1),
                     run(&backend, &["DEBUG", "SET-ACTIVE-EXPIRE", "0"]),
                 )
@@ -277,7 +277,7 @@ mod tests {
             );
         });
         assert_eq!(reply, Response::ok());
-        assert!(started.elapsed() >= Duration::from_millis(2_500));
+        assert!(nabedra_rt::time::now().duration_since(started) >= Duration::from_millis(2_500));
         assert!(backend.actor.try_lock().is_ok());
     }
 }

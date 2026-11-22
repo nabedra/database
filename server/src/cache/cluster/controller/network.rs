@@ -3,6 +3,7 @@ use std::future::Future;
 use std::io;
 use std::sync::Arc;
 
+use nabedra_rt::time::timeout;
 use openraft::{
     BasicNode,
     error::{RPCError, ReplicationClosed, StreamingError, Unreachable},
@@ -15,7 +16,6 @@ use openraft::{
     vote::RaftLeaderId,
 };
 use serde::{Deserialize, Serialize};
-use tokio::time::timeout;
 use uuid::Uuid;
 
 use super::super::protocol::{CONTROL_FRAME, VERSION};

@@ -1,7 +1,7 @@
 //! Clock sources for lease fencing. Endpoints enclose the sampled interval.
 use std::io;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use nabedra_rt::time::{self, UNIX_EPOCH};
 use serde::Deserialize;
 
 const NANOS_PER_MILLISECOND: u64 = 1_000_000;
@@ -58,7 +58,7 @@ impl Clock {
             ClockMode::LocalDocker => {
                 // These fixtures share the Docker VM's clock. This mode does
                 // not establish a time bound between separate hosts.
-                let time = SystemTime::now()
+                let time = time::wall_now()
                     .duration_since(UNIX_EPOCH)
                     .map_err(io::Error::other)?;
                 let ns = u64::try_from(time.as_nanos())

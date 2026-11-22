@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use nabedra_rt::time::timeout;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject};
 use rustls::server::WebPkiClientVerifier;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -14,7 +15,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::cache::config::read_bounded;

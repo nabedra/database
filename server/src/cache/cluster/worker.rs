@@ -12,7 +12,6 @@ use std::sync::{Arc, RwLock};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, oneshot};
-use uuid::Uuid;
 
 use crate::cache::command::DataCommand;
 use crate::cache::config::{self, Eviction, ListenerConfig};
@@ -127,7 +126,7 @@ impl Backend for Worker {
             generation: topology.generation,
             epoch: placement.epoch,
             slot,
-            queued: std::time::Instant::now(),
+            queued: nabedra_rt::time::now_std(),
             operation: command.into_operation(),
             reply,
         };
@@ -174,7 +173,7 @@ pub(super) fn run(path: &Path) -> io::Result<()> {
     let member = Member {
         id: WorkerId {
             node: config.node,
-            incarnation: Uuid::new_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
         },
         zone: config.zone,
         client_host: config.client_host,

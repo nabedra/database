@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 use crate::cache::cluster::protocol::{Move, Slot};
 use crate::cache::command::key_slot;
@@ -12,7 +11,7 @@ use super::*;
 fn node(node: u64) -> WorkerId {
     WorkerId {
         node,
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
     }
 }
 
@@ -113,13 +112,13 @@ fn k03_freeze_survives_delayed_grants_and_retired_state_is_fenced() {
     actor.install(Arc::clone(&old), &grants);
     let operation = set(key.clone(), Bytes::from_static(b"before"));
     assert!(matches!(
-        actor.execute(slot, 1, 1, Instant::now(), &operation),
+        actor.execute(slot, 1, 1, nabedra_rt::time::now_std(), &operation),
         Response::Simple(_)
     ));
     topology.revision += 1;
     let target = node(2);
     topology.slots[index].moving = Some(Move {
-        operation: Uuid::new_v4(),
+        operation: nabedra_rt::ids::uuid_v4(),
         target,
         freeze_requested: true,
         frozen: None,
@@ -131,7 +130,7 @@ fn k03_freeze_survives_delayed_grants_and_retired_state_is_fenced() {
     assert_eq!(current.frozen.unwrap().sequence, 1);
     assert_eq!(current.frozen.unwrap().lease_expires_ms, u64::MAX);
     assert!(
-        matches!(actor.execute(slot, 1, 1, Instant::now(), &operation), Response::Error(error) if error.starts_with(b"TRYAGAIN"))
+        matches!(actor.execute(slot, 1, 1, nabedra_rt::time::now_std(), &operation), Response::Error(error) if error.starts_with(b"TRYAGAIN"))
     );
 
     topology.generation += 1;
@@ -140,10 +139,16 @@ fn k03_freeze_survives_delayed_grants_and_retired_state_is_fenced() {
     topology.slots[index].moving = None;
     actor.install(Arc::new(topology), &grants);
     assert!(
-        matches!(actor.execute(slot, 1, 1, Instant::now(), &Operation::Get(key.clone())), Response::Error(error) if error.starts_with(b"CLUSTERDOWN"))
+        matches!(actor.execute(slot, 1, 1, nabedra_rt::time::now_std(), &Operation::Get(key.clone())), Response::Error(error) if error.starts_with(b"CLUSTERDOWN"))
     );
     assert!(matches!(
-        actor.execute(slot, 2, 2, Instant::now(), &Operation::Get(key)),
+        actor.execute(
+            slot,
+            2,
+            2,
+            nabedra_rt::time::now_std(),
+            &Operation::Get(key)
+        ),
         Response::Bulk(None)
     ));
 }
@@ -174,7 +179,7 @@ fn k03_replica_rejects_gap_conflicting_duplicate_and_old_incarnation() {
     actor.apply(owner, packet(2, b"gap", 2));
     let wrong = WorkerId {
         node: owner.node,
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
     };
     actor.apply(wrong, packet(1, b"forged", 1));
     assert_eq!(actor.slots[&slot].sequence, 0);
@@ -205,7 +210,7 @@ fn k03_snapshot_installs_after_verified_final_chunk_only() {
     let one = Bytes::from_static(b"{snapshot}a");
     let two = Bytes::from_static(b"{snapshot}b");
     let slot = key_slot(&one);
-    let stream = Uuid::new_v4();
+    let stream = nabedra_rt::ids::uuid_v4();
     let effect = |key| {
         only(Effect::Upsert {
             key,
@@ -411,7 +416,7 @@ fn k02_promoted_then_refilled_roles_stay_within_total_data_capacity() {
     let value = Bytes::from(vec![4; 900_000]);
     let op = set(original.clone(), value.clone());
     assert!(matches!(
-        actor.execute(slot_a, 1, 1, Instant::now(), &op),
+        actor.execute(slot_a, 1, 1, nabedra_rt::time::now_std(), &op),
         Response::Simple(_)
     ));
     actor.apply(
@@ -452,7 +457,7 @@ fn k02_promoted_then_refilled_roles_stay_within_total_data_capacity() {
     actor.install(Arc::new(topology), &grants);
     assert_eq!(actor.storage.primary, data_before);
     assert!(
-        matches!(actor.execute(slot_b, 1, 2, Instant::now(), &Operation::Get(promoted.clone())), Response::Bulk(Some(v)) if v == value)
+        matches!(actor.execute(slot_b, 1, 2, nabedra_rt::time::now_std(), &Operation::Get(promoted.clone())), Response::Bulk(Some(v)) if v == value)
     );
     let stream = || {
         let effects = only(Effect::Upsert {
@@ -466,7 +471,7 @@ fn k02_promoted_then_refilled_roles_stay_within_total_data_capacity() {
             slot: slot_c,
             epoch: 1,
             data: Data::Snapshot(Chunk {
-                id: Uuid::new_v4(),
+                id: nabedra_rt::ids::uuid_v4(),
                 cut: 1,
                 offset: 0,
                 effects,
@@ -485,7 +490,7 @@ fn k02_promoted_then_refilled_roles_stay_within_total_data_capacity() {
             slot_a,
             1,
             1,
-            Instant::now(),
+            nabedra_rt::time::now_std(),
             &Operation::Delete(vec![original])
         ),
         Response::Integer(1)
@@ -495,7 +500,7 @@ fn k02_promoted_then_refilled_roles_stay_within_total_data_capacity() {
     assert_eq!(actor.progress(false, None, 0).missing_replica_baselines, 0);
     assert!(actor.storage.primary + actor.storage.replica <= 2 * MIB);
     assert!(
-        matches!(actor.execute(slot_b, 1, 2, Instant::now(), &Operation::Get(promoted)), Response::Bulk(Some(v)) if v == value)
+        matches!(actor.execute(slot_b, 1, 2, nabedra_rt::time::now_std(), &Operation::Get(promoted)), Response::Bulk(Some(v)) if v == value)
     );
 }
 
