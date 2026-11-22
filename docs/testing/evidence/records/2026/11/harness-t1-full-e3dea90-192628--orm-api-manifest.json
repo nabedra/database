@@ -1,0 +1,41 @@
+{
+  "artifacts": [
+    {
+      "name": "harness-t1-full-e3dea90-192628--orm-api-manifest.log",
+      "sha256": "adb956972eb161c4ac50072537c337f2509770022f4362c3a69b890730014566"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "orm-api-manifest",
+  "duration_s": 6.345,
+  "guarantees": [
+    "ORM-G01",
+    "ORM-G03"
+  ],
+  "kind": "D",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T18:29:39.009721+00:00",
+    "request_id": "harness-t1-full-e3dea90-192628",
+    "runner": "GitHub Actions 1000003959",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45055093094"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "e3dea900adf4349aaa9912e2799e545376ed7180",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

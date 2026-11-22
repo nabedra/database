@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "harness-t1-full-e3dea90-192628--olap-store-contract-local.log",
+      "sha256": "ff266529dcdbce4261427aacc7eb8b45085e2d8f96c78f19e4f1bf4885b64022"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "olap-store-contract-local",
+  "duration_s": 95.623,
+  "guarantees": [],
+  "kind": "H",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T18:28:45.411857+00:00",
+    "request_id": "harness-t1-full-e3dea90-192628",
+    "runner": "GitHub Actions 1000003956",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45055093094"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "e3dea900adf4349aaa9912e2799e545376ed7180",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

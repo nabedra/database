@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "harness-t1-full-e3dea90-192628--cache-test-hooks.log",
+      "sha256": "2ca52062299ef1f43ab73b4e2ea97d3b982127d4e72cb6f2491a5ee75a8a39c8"
+    }
+  ],
+  "assertions": {
+    "executed": 5,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-test-hooks",
+  "duration_s": 57.78,
+  "guarantees": [
+    "CACHE-G02"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T18:26:51.956304+00:00",
+    "request_id": "harness-t1-full-e3dea90-192628",
+    "runner": "GitHub Actions 1000003938",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45055093094"
+  },
+  "scenarios": [
+    "K01"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "e3dea900adf4349aaa9912e2799e545376ed7180",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

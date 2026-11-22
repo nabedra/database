@@ -1,0 +1,52 @@
+{
+  "artifacts": [
+    {
+      "name": "harness-t1-full-e3dea90-192628--olap-stream-sim.log",
+      "sha256": "d820064ec04ed70e8fdaee3a0d9253095fbebfa876b241ce7b45d01eeb0770de"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "olap-stream-sim",
+  "duration_s": 121.679,
+  "guarantees": [
+    "OLAP-STR-G01",
+    "OLAP-STR-G02",
+    "OLAP-STR-G03",
+    "OLAP-STR-G04",
+    "OLAP-STR-G05",
+    "OLAP-STR-G06"
+  ],
+  "kind": "S H",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T18:28:46.962180+00:00",
+    "request_id": "harness-t1-full-e3dea90-192628",
+    "runner": "GitHub Actions 1000003958",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45055093094"
+  },
+  "scenarios": [
+    "ST01",
+    "ST02",
+    "ST03",
+    "ST04",
+    "ST05",
+    "ST06"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "e3dea900adf4349aaa9912e2799e545376ed7180",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

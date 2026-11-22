@@ -1,0 +1,48 @@
+{
+  "artifacts": [
+    {
+      "name": "harness-t1-full-e3dea90-192628--events-state-model.log",
+      "sha256": "2cb164e8fc4e3c5ec697833ffca47f59756ae3c63820763c334fb3b0065794d7"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "events-state-model",
+  "duration_s": 61.517,
+  "guarantees": [
+    "EVT-G02",
+    "EVT-G03",
+    "EVT-G04",
+    "EVT-G05",
+    "EVT-G08"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T18:27:25.136988+00:00",
+    "request_id": "harness-t1-full-e3dea90-192628",
+    "runner": "GitHub Actions 1000003946",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45055093094"
+  },
+  "scenarios": [
+    "EV01",
+    "EV02",
+    "EV03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "e3dea900adf4349aaa9912e2799e545376ed7180",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
