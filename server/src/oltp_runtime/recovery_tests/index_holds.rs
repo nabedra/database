@@ -37,6 +37,7 @@ pub(crate) enum Checkpoint {
     RefreshAdmissionRefused,
     RefreshPrepare,
     Validation,
+    ReadyCommit,
     ReadPin,
     Reclaim,
 }

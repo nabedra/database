@@ -659,6 +659,13 @@ impl IndexService {
             Ok(plan) => plan,
             Err(error) => return self.failed(metadata, error).await,
         };
+        #[cfg(test)]
+        crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
+            maintenance.index_id,
+            crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::ReadyCommit,
+            || None,
+        )
+        .await;
         self.backend.commit(metadata, plan).await?;
         let proof = self
             .backend

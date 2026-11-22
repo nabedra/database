@@ -403,6 +403,37 @@ async fn o12_refresh_survives_temporary_ingress_saturation() {
     fixture.close().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o12_ready_retries_after_settled_prepare_overload() {
+    use crate::oltp_replication::multiplex::TrafficClass;
+    use index_holds::Stage;
+
+    let fixture = Fixture::new().await;
+    let record = fixture.declare().await;
+    let stage = index_holds::register_checkpoint(fixture.definition.index_id, Checkpoint::ReadyCommit);
+    let actor = fixture.spawn_resume(record);
+    let before_commit = reached(stage).await;
+    let catalog_id = fixture.runtime.services.catalog.participant().identity().group_id;
+    let mut decisions = index_holds::register(catalog_id);
+    let client = fixture.runtime.services.manager.client();
+    let storage = client.hold_outgoing_for_test(TrafficClass::Storage);
+    before_commit.release.send(false).unwrap();
+    let aborted = tokio::time::timeout(WAIT, decisions.recv()).await.unwrap().unwrap();
+    assert_eq!(aborted.stage, Stage::Decided);
+    let decision = fixture.runtime.services.status.inspect_transaction(aborted.txn)
+        .await.unwrap().unwrap().decision.unwrap();
+    assert_eq!(decision.decision, TxnDecision::Abort { reason: AbortReason::ResourceLimit });
+    drop(storage);
+    index_holds::unregister(catalog_id);
+    aborted.release.send(()).unwrap();
+
+    tokio::time::timeout(WAIT, actor).await.unwrap().unwrap()
+        .expect("a settled overload must allow a fresh publication transaction");
+    fixture.assert_status(1, "ready", false).await;
+    fixture.assert_query(0, &json!([]), true).await;
+    fixture.close().await;
+}
+
 fn original(category: i64) -> Value {
     match category {
         7 => json!([
