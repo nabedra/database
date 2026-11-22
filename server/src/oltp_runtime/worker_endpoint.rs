@@ -19,6 +19,9 @@ use uuid::Uuid;
 mod scoped_payload;
 mod scoped_retirement;
 
+// Registered membership polls every 250 ms and skips quiet passes for up to 2 s.
+const LOCAL_READY_VIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Implementations use the separate Authority transport lane. They must not
 /// acquire queue-data/control body permits or recursively authenticate Control
 /// consensus through another strong Control lookup.
@@ -1285,6 +1288,23 @@ impl QueueEndpoint {
         }
         Ok(current)
     }
+    async fn wait_for_local_ready_view(&self, expected: QueueAuthority) -> Result<(), ProtocolError> {
+        tokio::time::timeout(LOCAL_READY_VIEW_TIMEOUT, async {
+            loop {
+                let local = self.replica.lock().map_err(|_| unavailable())?.authority();
+                if local == expected {
+                    return Ok(());
+                }
+                if !queue_view_behind(local.ready.view, expected.ready.view) {
+                    return Err(QueueError::Stale.protocol());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err(QueueError::Stale.protocol()))
+    }
+
     async fn prepare_payload(
         &self,
         session: &AuthenticatedSession,
@@ -1663,11 +1683,20 @@ impl Endpoint for QueueEndpoint {
             let current = if let QueueRequest::Install { record } = &request {
                 // Preflight authorizes reception. Check the local view before
                 // decoding, then recheck Control immediately before installation.
-                let current = self.replica.lock().map_err(|_| unavailable())?.authority();
-                #[cfg(test)]
-                if current.ready != record.ready {
+                let local = self.replica.lock().map_err(|_| unavailable())?.authority();
+                let current = if queue_view_behind(local.ready.view, record.ready.view) {
+                    #[cfg(test)]
                     super::recovery_tests::observe_o21_stale_copy(record.request_id);
-                }
+                    // Control published this view before the local membership
+                    // actor installed it. Keep the charged frame and wait
+                    // only for that exact view. An old owner or old frame
+                    // still fails the authoritative checks.
+                    let current = self.check(&session, &request).await?;
+                    self.wait_for_local_ready_view(current).await?;
+                    current
+                } else {
+                    local
+                };
                 if session.remote() != current.owner {
                     return Err(QueueError::Stale.protocol());
                 }
@@ -2081,6 +2110,10 @@ impl Endpoint for QueueEndpoint {
             }
         })
     }
+}
+
+fn queue_view_behind(local: AuthorityView, expected: AuthorityView) -> bool {
+    local.run_id == expected.run_id && local.membership_revision < expected.membership_revision
 }
 
 fn malformed(message: &'static str) -> ProtocolError {

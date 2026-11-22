@@ -633,10 +633,12 @@ def split_child(source, attempt, side):
 
 def create_with_lagging_queue_replica(constrained, holds):
     cluster = constrained.cluster
+
     def ready_views():
         views = [cluster.stats(worker)['accept_to_dispatch']['view'] for worker in WORKERS]
         # One of the two followers joined last and has already installed this view.
-        return views if views[0] in views[1:] and views[1] != views[2] else None
+        newest = max(views, key=lambda view: view['membership_revision'])
+        return views if views[0] == newest and views[1:].count(newest) == 1 else None
 
     wait_for(ready_views, 'owner and one follower have the current view', 15)
     request = operation('table.create', dict(name='capacity_deficit', schema=dict(id='int64', data='utf8'),
@@ -667,6 +669,8 @@ def create_with_lagging_queue_replica(constrained, holds):
     assert conflict == 409 and response['error']['code'] == 'conflict', (conflict, response)
     table = constrained.db.table('capacity_deficit')
     assert table.id == reply['data']['id'], reply
+    print(f'O21 created and replayed {request["request_id"]} after a follower installed its ready view',
+          flush=True)
     return table
 
 
