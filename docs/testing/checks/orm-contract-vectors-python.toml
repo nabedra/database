@@ -1,0 +1,12 @@
+id = "orm-contract-vectors-python"
+module = "orm-python"
+kinds = ["D", "F"]
+guarantees = ["ORM-G02"]
+scenarios = ["U02"]
+tiers = ["T0", "T1"]
+command = ["python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_contract_vectors.py"]
+cwd = "orm/python"
+timeout_s = 60
+needs = []
+result_parser = "unittest"
+env = { PYTHONPATH = "src" }
