@@ -7,6 +7,7 @@ use crate::{
     storage::{Download, Namespace},
     test_storage::{Fake, ReadGate},
 };
+use nabedra_rt::{task, time};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
@@ -21,7 +22,7 @@ fn owner() -> Owner {
     }
 }
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(5)
+    time::now() + Duration::from_secs(5)
 }
 fn root() -> Control {
     let mut v = super::super::tests::root();
@@ -41,7 +42,7 @@ struct Backend {
 }
 async fn hold(g: Arc<ReadGate>) {
     g.entered.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(5), g.release.acquire())
+    time::timeout(Duration::from_secs(5), g.release.acquire())
         .await
         .unwrap()
         .unwrap()
@@ -88,7 +89,7 @@ fn counts(s: &Storage<Backend>) -> (usize, usize) {
     (f.puts, f.gets)
 }
 async fn entered(g: &ReadGate) -> bool {
-    match tokio::time::timeout(Duration::from_secs(5), g.entered.acquire()).await {
+    match time::timeout(Duration::from_secs(5), g.entered.acquire()).await {
         Ok(Ok(p)) => {
             p.forget();
             true
@@ -97,7 +98,7 @@ async fn entered(g: &ReadGate) -> bool {
     }
 }
 async fn finish<T>(mut t: tokio::task::JoinHandle<T>) -> T {
-    match tokio::time::timeout(Duration::from_secs(5), &mut t).await {
+    match time::timeout(Duration::from_secs(5), &mut t).await {
         Ok(r) => r.unwrap(),
         Err(_) => {
             t.abort();
@@ -146,7 +147,7 @@ async fn same_token_allocations_have_one_winner() {
     *s.backend().before.lock().unwrap() = Some(g.clone());
     let t = {
         let s = s.clone();
-        tokio::spawn(async move { a.submit(&s, deadline()).await })
+        task::spawn(async move { a.submit(&s, deadline()).await })
     };
     let reached = entered(&g).await;
     let winner = if reached {
@@ -192,7 +193,7 @@ async fn applied_lost_reply_confirms_only_exact_whole_candidate() {
         *s.backend().after.lock().unwrap() = Some(g.clone());
         let t = {
             let s = s.clone();
-            tokio::spawn(async move { p.submit(&s, deadline()).await })
+            task::spawn(async move { p.submit(&s, deadline()).await })
         };
         let reached = entered(&g).await;
         if reached && later {
@@ -243,7 +244,7 @@ async fn successful_takeover_fences_old_allocation() {
     *s.backend().before.lock().unwrap() = Some(g.clone());
     let t = {
         let s = s.clone();
-        tokio::spawn(async move { p.submit(&s, deadline()).await })
+        task::spawn(async move { p.submit(&s, deadline()).await })
     };
     let reached = entered(&g).await;
     let winner = if reached {

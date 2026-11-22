@@ -3,6 +3,7 @@ use crate::cluster::attachment::{
     check_attach,
     tests::{Fixture, candidate, deadline, store},
 };
+use nabedra_rt::{task, time};
 fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
@@ -540,7 +541,7 @@ impl ObjectStore for Gated {
         let gate = self.gate.lock().unwrap().take();
         if let Some(g) = gate {
             g.entered.add_permits(1);
-            tokio::time::timeout(Duration::from_secs(5), g.release.acquire())
+            time::timeout(Duration::from_secs(5), g.release.acquire())
                 .await
                 .map_err(|_| StorageError::Unavailable)?
                 .map_err(|_| StorageError::Unavailable)?
@@ -579,9 +580,9 @@ async fn prepared_stale_completion_loses_to_takeover_with_exact_token_and_counts
     *s.backend().gate.lock().unwrap() = Some(g.clone());
     let task = {
         let s = s.clone();
-        tokio::spawn(async move { p.submit(&s, deadline()).await })
+        task::spawn(async move { p.submit(&s, deadline()).await })
     };
-    let reached = match tokio::time::timeout(Duration::from_secs(5), g.entered.acquire()).await {
+    let reached = match time::timeout(Duration::from_secs(5), g.entered.acquire()).await {
         Ok(Ok(p)) => {
             p.forget();
             true
@@ -604,7 +605,7 @@ async fn prepared_stale_completion_loses_to_takeover_with_exact_token_and_counts
     };
     g.release.add_permits(1);
     let mut task = task;
-    let result = match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+    let result = match time::timeout(Duration::from_secs(5), &mut task).await {
         Ok(r) => Some(r),
         Err(_) => {
             task.abort();

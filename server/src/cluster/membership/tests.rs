@@ -5,6 +5,7 @@ use crate::cluster::{
     state::*,
 };
 use crate::node::auth::verify_enrollment;
+use nabedra_rt::time;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{Value, json};
 fn id(n: u128) -> Uuid {
@@ -178,7 +179,7 @@ fn readiness(c: &Control) -> ReadinessInput {
     }
 }
 fn expiry(c: &Control) -> ExpiryInput {
-    let t = Instant::now();
+    let t = time::now();
     ExpiryInput {
         cluster_id: c.cluster_id,
         member: c.nodes[0].clone(),

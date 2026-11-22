@@ -8,6 +8,7 @@ use crate::{
     storage::{Namespace, Storage},
     test_storage::Fake,
 };
+use nabedra_rt::{task, time};
 use serde_json::json;
 use tokio::time::{Duration, Instant};
 fn id(n: u128) -> Uuid {
@@ -91,7 +92,7 @@ async fn setup_with(
     edit(&mut root);
     let mut root = Control::decode(&root.encode().unwrap()).unwrap();
     let s = store(&root);
-    let t = Instant::now();
+    let t = time::now();
     let p = OwnershipProposal::new(
         &root,
         OwnershipChange::Acquire { process_id: id(90) },
@@ -205,7 +206,7 @@ async fn receipt(
     o: &mut Observations,
     t: Instant,
 ) -> crate::cluster::heartbeat::DrainHeartbeat {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = time::now() + Duration::from_secs(10);
     let b = hb_binding(root);
     let mut w = HeartbeatWriter::new(b.clone()).unwrap();
     let h = HeartbeatSample {
@@ -752,8 +753,8 @@ async fn lost_allocation_reply_exact_read_can_confirm_but_gated_takeover_cannot(
         }
         let s = std::sync::Arc::new(s);
         let submitted = s.clone();
-        let mut task = tokio::spawn(async move { prepared.submit(&submitted, d).await });
-        let entered = tokio::time::timeout(Duration::from_secs(2), gate.entered.acquire())
+        let mut task = task::spawn(async move { prepared.submit(&submitted, d).await });
+        let entered = time::timeout(Duration::from_secs(2), gate.entered.acquire())
             .await
             .is_ok();
         // Capture failures as results until the original submission is released,
@@ -776,7 +777,7 @@ async fn lost_allocation_reply_exact_read_can_confirm_but_gated_takeover_cannot(
             Ok(None)
         };
         gate.release.add_permits(1);
-        let settled = match tokio::time::timeout(Duration::from_secs(6), &mut task).await {
+        let settled = match time::timeout(Duration::from_secs(6), &mut task).await {
             Ok(result) => Some(result),
             Err(_) => {
                 task.abort();
@@ -785,9 +786,7 @@ async fn lost_allocation_reply_exact_read_can_confirm_but_gated_takeover_cannot(
             }
         };
         s.backend().state.lock().unwrap().read_gate = None;
-        let current = s
-            .load_control(Instant::now() + Duration::from_secs(2))
-            .await;
+        let current = s.load_control(time::now() + Duration::from_secs(2)).await;
         assert!(entered);
         let changed = changed.unwrap();
         if takeover {

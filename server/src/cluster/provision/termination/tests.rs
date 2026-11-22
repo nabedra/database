@@ -6,6 +6,7 @@ use crate::cluster::{
     member::{Delivery, Drain, Session},
     store::{OwnershipOutcome, PreparedProvision},
 };
+use nabedra_rt::{task, time};
 use serde_json::{Value, json};
 fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
@@ -530,23 +531,23 @@ fn stale_root_owner_external_and_incomplete_evidence_refuse() {
 async fn gated_terminal_cas_loses_to_takeover_or_late_resource_recovery() {
     use crate::cluster::{controller::OwnershipChange, store::PreparedOwnership};
     use std::sync::Arc;
-    use tokio::time::{Duration, Instant};
+    use tokio::time::Duration;
     for takeover in [false, true] {
         let c = ambiguous();
         let s = Arc::new(store(Some(&c)));
-        let d = Instant::now() + Duration::from_secs(5);
+        let d = time::now() + Duration::from_secs(5);
         let stale = evidence(&c, json!([record(&c, "resource/one", "terminated")]));
         let p = terminal_candidate(&c, id(80));
         let prepared = PreparedProvision::prepare(s.load_control(d).await.unwrap(), p).unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let submitted = s.clone();
-        let mut task = tokio::spawn(async move {
+        let mut task = task::spawn(async move {
             let _ = entered_tx.send(());
             let _ = release_rx.await;
             prepared.submit(&submitted, d).await
         });
-        let entered = tokio::time::timeout(Duration::from_secs(2), entered_rx).await;
+        let entered = time::timeout(Duration::from_secs(2), entered_rx).await;
         // Capture every fallible result until release and original-task settlement.
         let competing = async {
             let loaded = s.load_control(d).await?;
@@ -578,7 +579,7 @@ async fn gated_terminal_cas_loses_to_takeover_or_late_resource_recovery() {
         }
         .await;
         let _ = release_tx.send(());
-        let settled = match tokio::time::timeout(Duration::from_secs(6), &mut task).await {
+        let settled = match time::timeout(Duration::from_secs(6), &mut task).await {
             Ok(v) => Some(v),
             Err(_) => {
                 task.abort();
@@ -586,9 +587,7 @@ async fn gated_terminal_cas_loses_to_takeover_or_late_resource_recovery() {
                 None
             }
         };
-        let loaded = s
-            .load_control(Instant::now() + Duration::from_secs(2))
-            .await;
+        let loaded = s.load_control(time::now() + Duration::from_secs(2)).await;
         assert!(entered.unwrap().is_ok());
         assert!(matches!(competing, Ok(OwnershipOutcome::Acknowledged(_))));
         assert!(matches!(

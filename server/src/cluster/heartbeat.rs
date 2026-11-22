@@ -1,7 +1,9 @@
 //! Bounded heartbeat publication. No freshness or drain authority.
 use super::member::{Heartbeat, MAX_HEARTBEAT_BYTES, MemberError};
 use crate::storage::{ObjectKey, ObjectStore, Storage, StorageError, WriteCondition};
-use tokio::time::{Instant, timeout_at};
+use nabedra_rt::time;
+use nabedra_rt::time::timeout_at;
+use tokio::time::Instant;
 use uuid::Uuid;
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct HeartbeatBinding {
@@ -108,7 +110,7 @@ fn member_error(error: MemberError) -> StorageError {
     }
 }
 fn check_deadline(deadline: Instant) -> Result<(), StorageError> {
-    if Instant::now() >= deadline {
+    if time::now() >= deadline {
         Err(StorageError::Unavailable)
     } else {
         Ok(())
@@ -288,7 +290,7 @@ impl HeartbeatWriter {
         )
         .await;
         let conflict = match result {
-            Ok(Ok(token)) if !token.is_empty() && Instant::now() < deadline => {
+            Ok(Ok(token)) if !token.is_empty() && time::now() < deadline => {
                 self.token = Some(token);
                 self.confirmed = Some(sample.clone());
                 self.pending = None;

@@ -7,8 +7,9 @@ use crate::{
     request_queue::{Receipt, RequestRecord, RequestState},
     storage::context::RequestContext,
 };
+use nabedra_rt::time;
+use nabedra_rt::time::timeout_at;
 use std::{future::Future, time::Duration};
-use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 pub(super) trait QueueAccess {
@@ -62,11 +63,11 @@ pub(super) async fn route<Q: QueueAccess, S>(
         // QueueAccess::lookup reloads authority and signs a new exchange each
         // time. This helper has no path back to Submit after acceptance.
         let observation = if let Some(end) = recovery_end {
-            if Instant::now() >= end {
+            if time::now() >= end {
                 return Ok(encode_error(Some(id), unknown()));
             }
             match timeout_at(end, queue.lookup(run_id, request_id, context.clone())).await {
-                Ok(result) if Instant::now() < end => result,
+                Ok(result) if time::now() < end => result,
                 _ => return Ok(encode_error(Some(id), unknown())),
             }
         } else {
@@ -82,12 +83,12 @@ pub(super) async fn route<Q: QueueAccess, S>(
                 if failures >= MAX_TRANSIENT_FAILURES {
                     return Ok(encode_error(Some(id), unknown()));
                 }
-                let end = *recovery_end.get_or_insert_with(|| Instant::now() + RECOVERY_WINDOW);
+                let end = *recovery_end.get_or_insert_with(|| time::now() + RECOVERY_WINDOW);
                 let backoff = Duration::from_millis(50 * (1u64 << (failures - 1)));
-                if Instant::now() + backoff >= end {
+                if time::now() + backoff >= end {
                     return Ok(encode_error(Some(id), unknown()));
                 }
-                tokio::time::sleep(backoff).await;
+                time::sleep(backoff).await;
                 continue;
             }
         };
@@ -109,7 +110,7 @@ pub(super) async fn route<Q: QueueAccess, S>(
                 EncodedResponse { status: 200, body }
             });
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -121,6 +122,7 @@ mod tests {
         protocol::ErrorCode,
         request_queue::{QueueLimits, RequestQueue},
     };
+    use nabedra_rt::{ids, time};
     use std::{
         collections::VecDeque,
         sync::{
@@ -128,6 +130,7 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
+    use tokio::time::Instant;
     struct IngressCharge(Arc<AtomicBool>);
     impl Drop for IngressCharge {
         fn drop(&mut self) {
@@ -170,7 +173,7 @@ mod tests {
             self.observations
                 .lock()
                 .unwrap()
-                .push((run, id, context, Instant::now()));
+                .push((run, id, context, time::now()));
             self.active.fetch_add(1, Ordering::SeqCst);
             let _charge = LookupCharge(self.active.clone());
             let (delay, result) = self
@@ -179,7 +182,7 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("unexpected extra observation");
-            tokio::time::sleep(delay).await;
+            time::sleep(delay).await;
             result
         }
     }
@@ -187,17 +190,17 @@ mod tests {
         fixture_for(true)
     }
     fn fixture_for(mutation: bool) -> (Script, Vec<u8>, RequestContext) {
-        let id = Uuid::new_v4();
-        let member = Uuid::new_v4();
+        let id = ids::uuid_v4();
+        let member = ids::uuid_v4();
         let context:RequestContext=serde_json::from_value(serde_json::json!({"version":1,"bucket":"tenant-data","region":"eu-west-1","prefix":"db/","credentials":{"access_key_id":"accepted","secret_access_key":"fixture-secret","session_token":null,"expires_at":null}})).unwrap();
         let body=serde_json::to_vec(&serde_json::json!({"request_id":id,"operation":"table.create","payload":{"name":"original","schema":{"id":"int64"},"key":"id","format":"parquet"}})).unwrap();
         let body = if mutation {
             body
         } else {
-            serde_json::to_vec(&serde_json::json!({"request_id":id,"operation":"table.get","payload":{"table_id":Uuid::new_v4(),"key":1}})).unwrap()
+            serde_json::to_vec(&serde_json::json!({"request_id":id,"operation":"table.get","payload":{"table_id":ids::uuid_v4(),"key":1}})).unwrap()
         };
         let mut queue = RequestQueue::new(
-            Uuid::new_v4(),
+            ids::uuid_v4(),
             1,
             1,
             QueueLimits {
@@ -263,7 +266,7 @@ mod tests {
             ErrorCode::OutcomeUnknown,
         ] {
             let (script, body, context) = fixture();
-            let began = Instant::now();
+            let began = time::now();
             script
                 .replies
                 .lock()
@@ -291,7 +294,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn q04_observation_deadline_cancels_slow_recovery_without_resubmission() {
         let (script, body, context) = fixture();
-        let began = Instant::now();
+        let began = time::now();
         script.replies.lock().unwrap().extend([
             (Duration::ZERO, Err(failure(ErrorCode::StorageUnavailable))),
             (Duration::from_secs(30), Ok(terminal(&script))),
@@ -305,7 +308,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status, 503);
-        assert_eq!(Instant::now() - began, RECOVERY_WINDOW);
+        assert_eq!(time::now() - began, RECOVERY_WINDOW);
         assert_once(&script, &body, &context, 2);
     }
     #[tokio::test(start_paused = true)]
@@ -338,7 +341,7 @@ mod tests {
         }
         let (script, body, context) = fixture();
         let mut foreign = terminal(&script);
-        foreign.run_id = Uuid::new_v4();
+        foreign.run_id = ids::uuid_v4();
         script
             .replies
             .lock()
@@ -362,7 +365,7 @@ mod tests {
     async fn q04_q06_healthy_pending_resets_streak_without_shortening_queue_wait_or_retrying_terminal_errors()
      {
         let (script, body, context) = fixture();
-        let began = Instant::now();
+        let began = time::now();
         let mut pending = terminal(&script);
         pending.state = RequestState::Running;
         pending.result = None;
@@ -382,7 +385,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status, 200);
-        assert!(Instant::now() - began > RECOVERY_WINDOW);
+        assert!(time::now() - began > RECOVERY_WINDOW);
         assert_once(&script, &body, &context, 5);
         let (script, body, context) = fixture();
         let mut failed = terminal(&script);

@@ -2,7 +2,9 @@
 //! Loaded records establish no attachment compatibility or controller authority.
 use super::state::{Control, ControlError, LeaseState, MAX_CONTROL_BYTES, PolicyMode};
 use crate::storage::{ObjectKey, ObjectStore, Storage, StorageError, WriteCondition};
-use tokio::time::{Instant, timeout_at};
+use nabedra_rt::time;
+use nabedra_rt::time::timeout_at;
+use tokio::time::Instant;
 
 /// One validated root paired with the nonempty version of that representation.
 /// Neither the root nor its opaque backend token can be mutated by callers.
@@ -31,7 +33,7 @@ fn control_error(error: ControlError) -> StorageError {
     }
 }
 fn check_deadline(deadline: Instant) -> Result<(), StorageError> {
-    if Instant::now() >= deadline {
+    if time::now() >= deadline {
         Err(StorageError::Unavailable)
     } else {
         Ok(())
@@ -116,7 +118,7 @@ impl<B: ObjectStore> Storage<B> {
         )
         .await;
         let error = match result {
-            Ok(Ok(token)) if !token.is_empty() && Instant::now() < deadline => {
+            Ok(Ok(token)) if !token.is_empty() && time::now() < deadline => {
                 return Ok(LoadedControl {
                     root: initial.clone(),
                     token,
@@ -211,7 +213,7 @@ async fn submit_control<B: ObjectStore>(
     )
     .await;
     let conflict = match result {
-        Ok(Ok(token)) if !token.is_empty() && Instant::now() < deadline => {
+        Ok(Ok(token)) if !token.is_empty() && time::now() < deadline => {
             return Ok(OwnershipOutcome::Acknowledged(LoadedControl {
                 root: candidate,
                 token,

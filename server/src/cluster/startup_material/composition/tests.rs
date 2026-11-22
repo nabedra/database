@@ -1,11 +1,11 @@
 use super::super::files::tests::create_tls_fixture;
 use super::*;
+use nabedra_rt::{ids, time};
 use std::{fs, time::Duration};
 struct Fixture(std::path::PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("nabedra-composition-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("nabedra-composition-{}", ids::uuid_v4()));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
@@ -70,7 +70,7 @@ impl Drop for Fixture {
     }
 }
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(30)
+    time::now_std() + Duration::from_secs(30)
 }
 fn assert_tls(tls: &TlsMaterial) {
     tls.certified_key.keys_match().unwrap();
@@ -227,7 +227,7 @@ fn local_failures_are_fixed_invalid_config_without_sources() {
     let f = Fixture::new();
     f.input(false, false, false, false);
     assert_eq!(
-        prepare_api(&f.0.join("input.json"), Instant::now()).unwrap_err(),
+        prepare_api(&f.0.join("input.json"), time::now_std()).unwrap_err(),
         StartupError::InvalidConfig
     );
     assert_eq!(

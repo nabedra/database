@@ -10,6 +10,7 @@ use crate::storage::{
 };
 use crate::storage::{Download, Namespace, WriteCondition};
 use crate::test_storage as support;
+use nabedra_rt::time;
 use serde_json::{Value, json};
 use support::Fake;
 use tokio::time::Duration;
@@ -31,7 +32,7 @@ fn initial() -> Control {
     Control::decode(&serde_json::to_vec(&root()).unwrap()).unwrap()
 }
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(5)
+    time::now() + Duration::from_secs(5)
 }
 
 fn decision(seq: u64, base: u64) -> ControlDecision {
@@ -162,11 +163,11 @@ async fn zero_and_admission_deadline_before_io() {
         Err(StorageError::LimitExceeded)
     );
     assert!(matches!(
-        AdminHistoryBudget::new(Instant::now()),
+        AdminHistoryBudget::new(time::now()),
         Err(StorageError::Unavailable)
     ));
     let expired = AdminHistoryBudget {
-        deadline: Instant::now(),
+        deadline: time::now(),
     };
     assert_eq!(
         s.lookup_admin(&l, id(9), b"{}", expired).await,
@@ -176,10 +177,10 @@ async fn zero_and_admission_deadline_before_io() {
     assert_eq!(s.backend().state.lock().unwrap().puts, 0);
     let copy = b;
     assert_eq!(copy.deadline(), b.deadline());
-    let before = Instant::now();
+    let before = time::now();
     let capped = AdminHistoryBudget::new(before + Duration::from_secs(60)).unwrap();
     assert!(capped.deadline() >= before + Duration::from_secs(5));
-    assert!(capped.deadline() <= Instant::now() + Duration::from_secs(5));
+    assert!(capped.deadline() <= time::now() + Duration::from_secs(5));
     assert!(b.deadline() <= deadline());
 }
 #[tokio::test]
@@ -292,7 +293,7 @@ async fn hard_byte_limit_is_not_deadline_exhaustion() {
         s.lookup_admin(&l, id(99999), b"{}", b).await,
         Err(StorageError::LimitExceeded)
     );
-    assert!(Instant::now() < b.deadline());
+    assert!(time::now() < b.deadline());
     assert_eq!(s.backend().state.lock().unwrap().gets, 9);
     assert_eq!(s.backend().state.lock().unwrap().puts, 0);
 }
@@ -359,7 +360,7 @@ async fn stalled_get_and_partial_body_are_errors() {
             FaultBackend { fake, mode },
             Namespace::new("test/").unwrap(),
         );
-        let b = AdminHistoryBudget::new(Instant::now() + Duration::from_millis(100)).unwrap();
+        let b = AdminHistoryBudget::new(time::now() + Duration::from_millis(100)).unwrap();
         let l = s.load_control(b.deadline()).await.unwrap();
         assert_eq!(
             s.lookup_admin(&l, d.request_id, d.request_body.as_bytes(), b)

@@ -1,5 +1,6 @@
 use super::tests::{fleet, id};
 use super::*;
+use nabedra_rt::time;
 
 fn sample(start: Instant, elapsed: u64, wall: u64) -> Result<OwnershipSample, StorageError> {
     OwnershipSample::from_system_time(
@@ -24,7 +25,7 @@ fn ack(p: &OwnershipProposal) -> Result<OwnershipEvidence, StorageError> {
 }
 #[test]
 fn boot_is_closed_and_only_ack_installs_pre_io_deadline() {
-    let t = Instant::now();
+    let t = time::now();
     let base = fleet(0);
     let mut g = OwnershipGuard::new(id(3));
     assert_eq!(g.check(sample(t, 0, 100)), Err(StorageError::Unavailable));
@@ -45,7 +46,7 @@ fn boot_is_closed_and_only_ack_installs_pre_io_deadline() {
 }
 
 fn installed() -> (OwnershipGuard, Control, Instant) {
-    let t = Instant::now();
+    let t = time::now();
     let base = fleet(0);
     let p = proposal(
         &base,
@@ -178,7 +179,7 @@ fn newer_same_tuple_observation_invalidates_pending_and_changed_tuple_revokes() 
 }
 #[test]
 fn mismatched_uuid_and_preparation_failure_release_only_current_slot() {
-    let t = Instant::now();
+    let t = time::now();
     let base = fleet(0);
     let change = OwnershipChange::Acquire { process_id: id(3) };
     let p = proposal(&base, change, t, 100, 4);
@@ -214,7 +215,7 @@ fn exact_expiry_discontinuities_tolerance_and_retained_drift() {
         g.check(sample(t, 3000, 6101)),
         Err(StorageError::Unavailable)
     );
-    let t = Instant::now();
+    let t = time::now();
     let base = fleet(0);
     let p = proposal(
         &base,
@@ -326,7 +327,7 @@ fn precomputed_arithmetic_failures_close_before_io_and_leave_slot_free() {
 }
 #[test]
 fn full_candidate_contents_are_bound_and_owner_must_be_this_boot() {
-    let t = Instant::now();
+    let t = time::now();
     let base = fleet(0);
     let p = proposal(
         &base,
@@ -366,7 +367,7 @@ fn full_candidate_contents_are_bound_and_owner_must_be_this_boot() {
 
 #[test]
 fn unrelated_admin_member_and_claim_content_preserves_original_deadline() {
-    let t = Instant::now();
+    let t = time::now();
     let base = fleet(1);
     let p = proposal(
         &base,
@@ -481,7 +482,7 @@ fn pending_renewal_clock_failure_makes_later_acknowledgment_obsolete() {
 #[test]
 fn actual_forward_and_backward_wall_steps_at_finish_and_check() {
     for wall in [7999, 8000, 12000, 12001] {
-        let t = Instant::now();
+        let t = time::now();
         let base = fleet(0);
         let p = proposal(
             &base,

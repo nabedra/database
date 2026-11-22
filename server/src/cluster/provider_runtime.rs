@@ -9,6 +9,7 @@ use crate::cluster::{
 };
 use crate::node::queue_runtime::{Command, Reply};
 use axum::http::Request as HttpRequest;
+use nabedra_rt::{ids, time};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -118,7 +119,7 @@ impl Api {
             .header("content-length", body.len())
             .body(Body::from(body))
             .map_err(|_| invalid())?;
-        let end = Instant::now() + Duration::from_secs(30);
+        let end = time::now() + Duration::from_secs(30);
         let response = self.client.request(request, end).await?;
         let status = response.status().as_u16();
         let length = http::framing(response.headers(), 1024 * 1024, false)?.ok_or_else(invalid)?;
@@ -130,7 +131,7 @@ impl Api {
         root: &Control,
         owner: Owner,
     ) -> Result<callback::InventoryEvidence> {
-        let command = callback::InventoryCommand::build(root, owner, Uuid::new_v4())
+        let command = callback::InventoryCommand::build(root, owner, ids::uuid_v4())
             .map_err(|_| unavailable())?;
         let (bytes, context) = command.into_parts();
         match self.callback_exchange(bytes, &context).await? {
@@ -157,10 +158,10 @@ impl Api {
                 &context,
                 reply,
                 now_ms(),
-                Uuid::new_v4(),
+                ids::uuid_v4(),
             ),
             Err(_) => {
-                provision::uncertain_start(loaded.root(), owner, &context, now_ms(), Uuid::new_v4())
+                provision::uncertain_start(loaded.root(), owner, &context, now_ms(), ids::uuid_v4())
             }
         }
         .map_err(|_| unavailable())?;
@@ -210,7 +211,7 @@ impl Api {
             Ok(v) => v,
             Err(_) => {
                 let candidate =
-                    provision::inventory_failed_candidate(root, owner, now_ms(), Uuid::new_v4())
+                    provision::inventory_failed_candidate(root, owner, now_ms(), ids::uuid_v4())
                         .map_err(|_| unavailable())?;
                 exact(self.provision_publish(loaded, candidate).await?)?;
                 return Ok(());
@@ -223,7 +224,7 @@ impl Api {
                 && i.outcome.is_none()
         }) {
             let id = intent.request_id;
-            match provision::reconcile_start(root, owner, id, inventory, now_ms(), Uuid::new_v4())
+            match provision::reconcile_start(root, owner, id, inventory, now_ms(), ids::uuid_v4())
                 .map_err(|_| unavailable())?
             {
                 provision::ReconcilePlan::Change { candidate, .. } => {
@@ -237,10 +238,10 @@ impl Api {
                         owner,
                         id,
                         inventory,
-                        Uuid::new_v4(),
+                        ids::uuid_v4(),
                         &self.attached,
                         now_ms(),
-                        Uuid::new_v4(),
+                        ids::uuid_v4(),
                     )
                     .map_err(|_| unavailable())?;
                     self.deliver_start(loaded, claim, owner).await?;
@@ -257,7 +258,7 @@ impl Api {
                             node,
                             inventory,
                             now_ms(),
-                            Uuid::new_v4(),
+                            ids::uuid_v4(),
                         )
                         .map_err(|_| unavailable())?
                     {
@@ -283,7 +284,7 @@ impl Api {
                     delivery.owner_id == owner.process_id && delivery.epoch == owner.epoch
                 })
                 .map(|delivery| delivery.invocation_id);
-            match provision::reconcile_stop(root, owner, id, inventory, now_ms(), Uuid::new_v4())
+            match provision::reconcile_stop(root, owner, id, inventory, now_ms(), ids::uuid_v4())
                 .map_err(|_| unavailable())?
             {
                 provision::StopReconcilePlan::Change { candidate, .. } => {
@@ -301,7 +302,7 @@ impl Api {
                             node,
                             inventory,
                             now_ms(),
-                            Uuid::new_v4(),
+                            ids::uuid_v4(),
                         )
                         .map_err(|_| unavailable())?
                     {
@@ -319,7 +320,7 @@ impl Api {
                     .map_err(|_| unavailable())?;
                 let (_, context) = command.into_parts();
                 let candidate =
-                    provision::uncertain_stop(root, owner, &context, now_ms(), Uuid::new_v4())
+                    provision::uncertain_stop(root, owner, &context, now_ms(), ids::uuid_v4())
                         .map_err(|_| unavailable())?;
                 exact(self.provision_publish(loaded, candidate).await?)?;
                 return Ok(());
@@ -329,7 +330,7 @@ impl Api {
         }
         if !provision::inventory_clean(root, owner, &inventory).map_err(|_| unavailable())? {
             let candidate =
-                provision::inventory_failed_candidate(root, owner, now_ms(), Uuid::new_v4())
+                provision::inventory_failed_candidate(root, owner, now_ms(), ids::uuid_v4())
                     .map_err(|_| unavailable())?;
             exact(self.provision_publish(loaded, candidate).await?)?;
             return Ok(());
@@ -370,7 +371,7 @@ impl Api {
                 node,
                 inventory,
                 now_ms(),
-                Uuid::new_v4(),
+                ids::uuid_v4(),
             )
             .map_err(|_| unavailable())?
             {
@@ -387,7 +388,7 @@ impl Api {
                     && i.resource_id.as_deref() == Some(record.resource_id())
             }) {
                 let candidate =
-                    provision::inventory_failed_candidate(root, owner, now_ms(), Uuid::new_v4())
+                    provision::inventory_failed_candidate(root, owner, now_ms(), ids::uuid_v4())
                         .map_err(|_| unavailable())?;
                 exact(self.provision_publish(loaded, candidate).await?)?;
                 return Ok(());
@@ -402,10 +403,10 @@ impl Api {
                 root,
                 owner,
                 intent.request_id,
-                Uuid::new_v4(),
+                ids::uuid_v4(),
                 &self.attached,
                 now_ms(),
-                Uuid::new_v4(),
+                ids::uuid_v4(),
             )
             .map_err(|_| unavailable())?;
             return self.deliver_start(loaded, claim, owner).await;
@@ -432,7 +433,7 @@ impl Api {
                     running,
                     oldest_wait_ms,
                     now_ms(),
-                    Uuid::new_v4(),
+                    ids::uuid_v4(),
                 )
                 .map_err(|_| unavailable())?
                 {
@@ -456,10 +457,10 @@ impl Api {
             let candidate = provision::allocate_start(
                 root,
                 owner,
-                Uuid::new_v4(),
-                Uuid::new_v4(),
+                ids::uuid_v4(),
+                ids::uuid_v4(),
                 now_ms(),
-                Uuid::new_v4(),
+                ids::uuid_v4(),
             )
             .map_err(|_| unavailable())?;
             exact(self.provision_publish(loaded, candidate).await?)?;
@@ -483,9 +484,9 @@ impl Api {
                         root,
                         owner,
                         node_id,
-                        Uuid::new_v4(),
+                        ids::uuid_v4(),
                         now_ms(),
-                        Uuid::new_v4(),
+                        ids::uuid_v4(),
                     )
                     .map_err(|_| unavailable())?;
                     let changed = match candidate {
@@ -534,9 +535,9 @@ impl Api {
                     root,
                     owner,
                     node_id,
-                    Uuid::new_v4(),
+                    ids::uuid_v4(),
                     now_ms(),
-                    Uuid::new_v4(),
+                    ids::uuid_v4(),
                 )
                 .map_err(|_| unavailable())?;
                 let changed = match plan {
@@ -618,7 +619,7 @@ impl Api {
             .clone();
         let drain_id = node.drain.as_ref().ok_or_else(unavailable)?.id;
         let drain::DrainPlan::Existing(binding) =
-            drain::begin_drain(root, owner, node_id, drain_id, now_ms(), Uuid::new_v4())
+            drain::begin_drain(root, owner, node_id, drain_id, now_ms(), ids::uuid_v4())
                 .map_err(|_| unavailable())?
         else {
             return Err(unavailable());
@@ -688,7 +689,7 @@ impl Api {
                 root,
                 &binding,
                 &heartbeat,
-                Instant::now(),
+                time::now(),
                 Duration::from_millis(root.timing.expiry_ms),
             )
             .map_err(|_| unavailable())?;
@@ -718,7 +719,7 @@ impl Api {
                 root,
                 owner,
                 proof,
-                Uuid::new_v4(),
+                ids::uuid_v4(),
                 &mut observations,
                 &mut guard,
                 sample().map_err(|_| unavailable())?,
@@ -755,9 +756,9 @@ impl Api {
             loaded.root(),
             owner,
             proof,
-            Uuid::new_v4(),
+            ids::uuid_v4(),
             now_ms(),
-            Uuid::new_v4(),
+            ids::uuid_v4(),
         )
         .map_err(|_| unavailable())?
         {
@@ -809,9 +810,9 @@ impl Api {
                 owner,
                 stop,
                 proof,
-                Uuid::new_v4(),
+                ids::uuid_v4(),
                 now_ms(),
-                Uuid::new_v4(),
+                ids::uuid_v4(),
             )
         } else {
             let inventory = self.provider_inventory(loaded.root(), owner).await?;
@@ -821,9 +822,9 @@ impl Api {
                 stop,
                 proof,
                 inventory,
-                Uuid::new_v4(),
+                ids::uuid_v4(),
                 now_ms(),
-                Uuid::new_v4(),
+                ids::uuid_v4(),
             )
         }
         .map_err(|_| unavailable())?;
@@ -882,7 +883,7 @@ impl Api {
             {
                 // A transient bridge refusal supplies no permission to abandon
                 // the stop lifecycle. Retry only with fresh inventory and proof.
-                provision::uncertain_stop(loaded.root(), owner, &context, now_ms(), Uuid::new_v4())
+                provision::uncertain_stop(loaded.root(), owner, &context, now_ms(), ids::uuid_v4())
             }
             Ok(reply) => provision::complete_stop(
                 loaded.root(),
@@ -890,10 +891,10 @@ impl Api {
                 &context,
                 reply,
                 now_ms(),
-                Uuid::new_v4(),
+                ids::uuid_v4(),
             ),
             Err(_) => {
-                provision::uncertain_stop(loaded.root(), owner, &context, now_ms(), Uuid::new_v4())
+                provision::uncertain_stop(loaded.root(), owner, &context, now_ms(), ids::uuid_v4())
             }
         }
         .map_err(|_| unavailable())?;
@@ -1020,7 +1021,7 @@ fn requested_capacity(request: &ControlRequest) -> Result<Option<u64>> {
 }
 impl Api {
     async fn control_status(&self) -> Result<serde_json::Value> {
-        let end = Instant::now() + Duration::from_secs(5);
+        let end = time::now() + Duration::from_secs(5);
         let loaded = self
             .storage
             .load_control(end)
@@ -1033,7 +1034,7 @@ impl Api {
         self.status_observations
             .lock()
             .unwrap()
-            .reconcile_members(root, Instant::now())
+            .reconcile_members(root, time::now())
             .map_err(|_| unavailable())?;
         let mut nodes = Vec::with_capacity(root.nodes.len());
         let mut all_fresh = true;
@@ -1046,12 +1047,12 @@ impl Api {
                         Ok(Some(loaded)) => {
                             let mut observations = self.status_observations.lock().unwrap();
                             observations
-                                .observe(&binding, loaded.heartbeat(), Instant::now())
+                                .observe(&binding, loaded.heartbeat(), time::now())
                                 .map_err(|_| unavailable())?;
                             observations
                                 .status_heartbeat(
                                     &binding,
-                                    Instant::now(),
+                                    time::now(),
                                     Duration::from_millis(root.timing.expiry_ms),
                                 )
                                 .map_err(|_| unavailable())?
@@ -1060,7 +1061,7 @@ impl Api {
                             self.status_observations
                                 .lock()
                                 .unwrap()
-                                .read_failed(&binding, Instant::now())
+                                .read_failed(&binding, time::now())
                                 .map_err(|_| unavailable())?;
                             None
                         }
@@ -1150,7 +1151,7 @@ impl Api {
                 }
             }
             let prepared =
-                PreparedAdmin::prepare(loaded, request.request_id, &bytes, Uuid::new_v4())
+                PreparedAdmin::prepare(loaded, request.request_id, &bytes, ids::uuid_v4())
                     .map_err(|_| invalid())?;
             match prepared
                 .publish(&self.storage, budget)
