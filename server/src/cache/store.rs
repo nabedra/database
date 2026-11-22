@@ -305,7 +305,11 @@ impl SlotStore {
     pub fn digest(&self, now_ms: u64) -> [u8; 20] {
         use sha2::{Digest as _, Sha256};
         let mut digest = [0u8; 20];
-        for record in self.records.iter().filter(|record| !record.is_expired(now_ms)) {
+        for record in self
+            .records
+            .iter()
+            .filter(|record| !record.is_expired(now_ms))
+        {
             let mut hash = Sha256::new();
             hash.update((record.key().len() as u64).to_le_bytes());
             hash.update(record.key());

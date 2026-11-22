@@ -25,7 +25,9 @@ pub enum DebugCommand {
     Sleep(Duration),
 }
 
-pub(super) fn parse(mut arguments: std::vec::IntoIter<Bytes>) -> Result<DebugCommand, CommandError> {
+pub(super) fn parse(
+    mut arguments: std::vec::IntoIter<Bytes>,
+) -> Result<DebugCommand, CommandError> {
     let subcommand = arguments.next().ok_or(CommandError::Arity)?;
     let argument = arguments.next();
     if arguments.next().is_some() {
@@ -74,7 +76,10 @@ mod tests {
     use crate::cache::store::{EvictionPolicy, TurnLimits};
 
     fn frame(parts: &[&str]) -> Vec<Bytes> {
-        parts.iter().map(|part| Bytes::from(part.to_string())).collect()
+        parts
+            .iter()
+            .map(|part| Bytes::from(part.to_string()))
+            .collect()
     }
 
     fn debug(parts: &[&str]) -> Result<DebugCommand, CommandError> {
@@ -87,7 +92,12 @@ mod tests {
     }
 
     fn backend() -> Standalone {
-        Standalone::new(1 << 20, EvictionPolicy::NoEviction, 16, TurnLimits::default())
+        Standalone::new(
+            1 << 20,
+            EvictionPolicy::NoEviction,
+            16,
+            TurnLimits::default(),
+        )
     }
 
     async fn run(backend: &Standalone, parts: &[&str]) -> Response {
@@ -114,13 +124,23 @@ mod tests {
             debug(&["SLEEP", "0.25"]),
             Ok(DebugCommand::Sleep(Duration::from_millis(250)))
         );
-        assert_eq!(debug(&["SLEEP", "0"]), Ok(DebugCommand::Sleep(Duration::ZERO)));
+        assert_eq!(
+            debug(&["SLEEP", "0"]),
+            Ok(DebugCommand::Sleep(Duration::ZERO))
+        );
         assert_eq!(debug(&[]), Err(CommandError::Arity));
         assert_eq!(debug(&["DIGEST", "x"]), Err(CommandError::Arity));
         assert_eq!(debug(&["SLEEP"]), Err(CommandError::Arity));
-        assert_eq!(debug(&["SET-ACTIVE-EXPIRE", "2"]), Err(CommandError::Syntax));
+        assert_eq!(
+            debug(&["SET-ACTIVE-EXPIRE", "2"]),
+            Err(CommandError::Syntax)
+        );
         for bad in ["-1", "61", "nan", "inf", "1e3", " 1", ""] {
-            assert_eq!(debug(&["SLEEP", bad]), Err(CommandError::InvalidInteger), "{bad}");
+            assert_eq!(
+                debug(&["SLEEP", bad]),
+                Err(CommandError::InvalidInteger),
+                "{bad}"
+            );
         }
         assert_eq!(debug(&["RELOAD"]), Err(CommandError::Unsupported));
     }
@@ -137,9 +157,16 @@ mod tests {
             panic!("digest is not a status reply: {digest:?}");
         };
         assert_eq!(text.len(), 40);
-        assert!(text.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)));
+        assert!(
+            text.iter()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+        );
         assert_ne!(digest, empty);
-        assert_eq!(run(&backend, &["DEBUG", "DIGEST"]).await, digest, "not deterministic");
+        assert_eq!(
+            run(&backend, &["DEBUG", "DIGEST"]).await,
+            digest,
+            "not deterministic"
+        );
 
         run(&backend, &["PERSIST", "b"]).await;
         let persisted = run(&backend, &["DEBUG", "DIGEST"]).await;
@@ -159,7 +186,11 @@ mod tests {
             ttl_ms,
             when: SetWhen::Always,
         };
-        let ops = [set(b"a", b"1", None), set(b"b", b"2", Some(50)), set(b"c", b"", None)];
+        let ops = [
+            set(b"a", b"1", None),
+            set(b"b", b"2", Some(50)),
+            set(b"c", b"", None),
+        ];
         let mut forward = SlotStore::new(1 << 20, EvictionPolicy::NoEviction);
         let mut backward = SlotStore::new(1 << 20, EvictionPolicy::NoEviction);
         for op in &ops {
@@ -174,7 +205,11 @@ mod tests {
         assert_ne!(forward.digest(0), [0; 20]);
         // A key past its deadline is not part of the digest.
         assert_ne!(forward.digest(0), forward.digest(50));
-        let swapped = [set(b"a", b"2", None), set(b"b", b"1", Some(50)), set(b"c", b"", None)];
+        let swapped = [
+            set(b"a", b"2", None),
+            set(b"b", b"1", Some(50)),
+            set(b"c", b"", None),
+        ];
         let mut other = SlotStore::new(1 << 20, EvictionPolicy::NoEviction);
         for op in &swapped {
             let prepared = other.prepare(op, 0, TurnLimits::default());
@@ -200,15 +235,22 @@ mod tests {
         ));
         run(&backend, &["SET", "k", "v", "PX", "1"]).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(backend.actor.lock().await.len(), 1, "the sweep ran while paused");
+        assert_eq!(
+            backend.actor.lock().await.len(),
+            1,
+            "the sweep ran while paused"
+        );
 
         assert_eq!(
             run(&backend, &["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).await,
             Response::ok()
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while backend.actor.lock().await.len() != 0 {
-            assert!(std::time::Instant::now() < deadline, "the sweep did not resume");
+        while !backend.actor.lock().await.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sweep did not resume"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         sweeper.abort();
@@ -220,7 +262,10 @@ mod tests {
         let started = tokio::time::Instant::now();
         let (reply, ()) = tokio::join!(run(&backend, &["DEBUG", "SLEEP", "2.5"]), async {
             tokio::task::yield_now().await;
-            assert!(backend.actor.try_lock().is_err(), "SLEEP released the store");
+            assert!(
+                backend.actor.try_lock().is_err(),
+                "SLEEP released the store"
+            );
         });
         assert_eq!(reply, Response::ok());
         assert!(started.elapsed() >= Duration::from_millis(2_500));

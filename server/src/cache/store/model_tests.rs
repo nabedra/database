@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nabedra_check::prop::{self, Config};
 use nabedra_check::r#gen::Gen;
+use nabedra_check::prop::{self, Config};
 
 use super::records::Record;
 use super::*;
@@ -40,6 +40,22 @@ const CONTAINER_BOUND: usize = 16 * (size_of::<(Bytes, usize)>() + 1)
     + 16 * size_of::<usize>();
 const KEYS: [&[u8]; 6] = [b"a", b"b", b"{k}c", b"d\0\r\n", b"e", b"\xfff"];
 const CAPS: [usize; 5] = [2_000, 3_000, 6_000, 12_000, 1 << 20];
+/// Canonical extremes and the non-canonical forms Valkey rejects as integers.
+const INTEGER_TEXTS: [&[u8]; 13] = [
+    b"0",
+    b"1",
+    b"-1",
+    b"42",
+    b"9223372036854775807",
+    b"-9223372036854775808",
+    b"9223372036854775806",
+    b"007",
+    b"-0",
+    b"+1",
+    b" 1",
+    b"1.5",
+    b"99999999999999999999",
+];
 const OVERFLOW: &str = "ERR increment or decrement would overflow";
 const NOT_INTEGER: &str = "ERR value is not an integer or out of range";
 const SET_EXPIRY: &str = "ERR invalid expire time in 'set' command";
@@ -158,7 +174,9 @@ impl Cmd {
             }
             Self::Ttl(key) => args.extend([word("ttl"), key.clone()]),
             Self::Pttl(key) => args.extend([word("pttl"), key.clone()]),
-            Self::Expire(key, seconds) => args.extend([word("expire"), key.clone(), number(*seconds)]),
+            Self::Expire(key, seconds) => {
+                args.extend([word("expire"), key.clone(), number(*seconds)])
+            }
             Self::Pexpire(key, ms) => args.extend([word("pexpire"), key.clone(), number(*ms)]),
             Self::Persist(key) => args.extend([word("persist"), key.clone()]),
             Self::Incrby(key, delta) => args.extend([word("incrby"), key.clone(), number(*delta)]),
@@ -189,23 +207,7 @@ fn gen_value(g: &mut Gen) -> Bytes {
         0 => Bytes::new(),
         1..=3 => Bytes::from(g.ascii(8)),
         4 => Bytes::from(g.bytes(8)),
-        5 | 6 => Bytes::from_static(
-            *g.pick::<&[u8]>(&[
-                b"0",
-                b"1",
-                b"-1",
-                b"42",
-                b"9223372036854775807",
-                b"-9223372036854775808",
-                b"9223372036854775806",
-                b"007",
-                b"-0",
-                b"+1",
-                b" 1",
-                b"1.5",
-                b"99999999999999999999",
-            ]),
-        ),
+        5 | 6 => Bytes::from_static(INTEGER_TEXTS[g.below(INTEGER_TEXTS.len() as u64) as usize]),
         _ => {
             let len = 300 + g.below(1_300) as usize;
             Bytes::from(vec![b'a' + g.below(26) as u8; len])
@@ -229,7 +231,12 @@ fn gen_cmd(g: &mut Gen, key_count: usize) -> Cmd {
         2..=5 => {
             let key = gen_key(g, key_count);
             let value = gen_value(g);
-            let when = *g.pick(&[SetWhen::Always, SetWhen::Always, SetWhen::Absent, SetWhen::Present]);
+            let when = *g.pick(&[
+                SetWhen::Always,
+                SetWhen::Always,
+                SetWhen::Absent,
+                SetWhen::Present,
+            ]);
             let ttl = match g.below(6) {
                 0 | 1 => None,
                 2 => Some(SetTtl::Ex(g.range_i64(1, 3))),
@@ -311,14 +318,18 @@ impl Model {
 
     fn expect(&self, cmd: &Cmd, now: u64) -> Expected {
         match cmd {
-            Cmd::Get(key) => Expected::reply(Out::Bulk(self.live(key, now).map(|e| e.value.clone()))),
+            Cmd::Get(key) => {
+                Expected::reply(Out::Bulk(self.live(key, now).map(|e| e.value.clone())))
+            }
             Cmd::Mget(keys) => Expected::reply(Out::Array(
                 keys.iter()
                     .map(|key| self.live(key, now).map(|e| e.value.clone()))
                     .collect(),
             )),
             Cmd::Exists(keys) => Expected::reply(Out::Int(
-                keys.iter().filter(|key| self.live(key, now).is_some()).count() as i64,
+                keys.iter()
+                    .filter(|key| self.live(key, now).is_some())
+                    .count() as i64,
             )),
             Cmd::Del(keys) => {
                 let mut deletes: Vec<Bytes> = Vec::new();
@@ -499,7 +510,10 @@ struct Executed {
 impl Subject {
     fn probe(&self, op: &Operation, now: u64) -> Reply {
         // Preparation never publishes, so a probe has no side effects.
-        self.store.prepare(op, now, TurnLimits::default()).reply().clone()
+        self.store
+            .prepare(op, now, TurnLimits::default())
+            .reply()
+            .clone()
     }
 
     fn pttl(&self, key: &Bytes, now: u64) -> Reply {
@@ -668,15 +682,21 @@ impl Run {
         let limit = *g.pick(&[1usize, 2, 3, 64]);
         // The time budget is generous so the item limit decides; the budget
         // itself is checked deterministically in `k01_sweep_respects_time_budget`.
-        let prepared =
-            self.subject
-                .store
-                .prepare_expiry(self.now, limit, Duration::from_secs(10));
+        let prepared = self
+            .subject
+            .store
+            .prepare_expiry(self.now, limit, Duration::from_secs(10));
         let effects = prepared.effects().to_vec();
-        self.trace
-            .push(format!("t={} sweep limit {limit} -> {} deletes", self.now, effects.len()));
+        self.trace.push(format!(
+            "t={} sweep limit {limit} -> {} deletes",
+            self.now,
+            effects.len()
+        ));
         if effects.len() > limit {
-            return self.fail(format!("sweep removed {} items, limit {limit}", effects.len()));
+            return self.fail(format!(
+                "sweep removed {} items, limit {limit}",
+                effects.len()
+            ));
         }
         for effect in &effects {
             let Effect::Delete(key) = effect else {
@@ -740,9 +760,11 @@ impl Run {
         // An expired key never returns.
         let returned: Vec<(&Bytes, bool)> = match (&cmd, &executed.out) {
             (Cmd::Get(key), Out::Bulk(value)) => vec![(key, value.is_some())],
-            (Cmd::Mget(keys), Out::Array(values)) => {
-                keys.iter().zip(values).map(|(k, v)| (k, v.is_some())).collect()
-            }
+            (Cmd::Mget(keys), Out::Array(values)) => keys
+                .iter()
+                .zip(values)
+                .map(|(k, v)| (k, v.is_some()))
+                .collect(),
             _ => Vec::new(),
         };
         for (key, present) in returned {
@@ -799,12 +821,20 @@ impl Run {
     }
 
     /// The store refused an admitted write for memory. Check it had to.
-    fn check_oom(&self, expected: &Expected, digest_before: [u8; 20], now: u64) -> Result<(), String> {
+    fn check_oom(
+        &self,
+        expected: &Expected,
+        digest_before: [u8; 20],
+        now: u64,
+    ) -> Result<(), String> {
         if self.subject.store.digest(now) != digest_before {
             return self.fail("an OOM reply changed the keyspace".into());
         }
         let Some((key, entry)) = &expected.upsert else {
-            return self.fail(format!("OOM for a command that writes nothing ({:?})", expected.out));
+            return self.fail(format!(
+                "OOM for a command that writes nothing ({:?})",
+                expected.out
+            ));
         };
         let fits = self.model.body_after(expected, |_| true) + CONTAINER_BOUND <= self.cap;
         match self.policy {
@@ -823,7 +853,12 @@ impl Run {
         }
     }
 
-    fn check_effects(&self, expected: &Expected, executed: &Executed, now: u64) -> Result<(), String> {
+    fn check_effects(
+        &self,
+        expected: &Expected,
+        executed: &Executed,
+        now: u64,
+    ) -> Result<(), String> {
         let upserts: Vec<&Effect> = executed
             .effects
             .iter()
@@ -864,7 +899,9 @@ impl Run {
         let mut evicted = 0;
         for key in deleted {
             let Some(entry) = self.model.map.get(key) else {
-                return self.fail(format!("deleted or evicted a key that never existed: {key:?}"));
+                return self.fail(format!(
+                    "deleted or evicted a key that never existed: {key:?}"
+                ));
             };
             if entry.live(now) && !expected.deletes.contains(key) {
                 evicted += 1;
@@ -885,7 +922,8 @@ impl Run {
         if self.policy == EvictionPolicy::NoEviction
             && self.model.body_after(expected, |entry| entry.live(now)) > self.cap
         {
-            return self.fail("noeviction admitted a write whose live bodies exceed the cap".into());
+            return self
+                .fail("noeviction admitted a write whose live bodies exceed the cap".into());
         }
         Ok(())
     }
@@ -924,7 +962,9 @@ fn run_case(g: &mut Gen, mutant: Mutant) -> Result<(), String> {
 
 #[test]
 fn k01_k02_store_matches_model() {
-    prop::check("kv store matches the reference model", |g| run_case(g, Mutant::None));
+    prop::check("kv store matches the reference model", |g| {
+        run_case(g, Mutant::None)
+    });
     for (counter, name) in COVERAGE.iter().zip(COVERAGE_NAMES) {
         let hits = counter.load(Ordering::Relaxed);
         eprintln!("coverage: {name}: {hits}");
@@ -948,7 +988,10 @@ fn k01_sweep_respects_item_limit_and_time_budget() {
         assert_eq!(store.commit(prepared), Reply::Ok);
     }
     let stalled = store.prepare_expiry(1_000, 64, Duration::ZERO);
-    assert!(stalled.effects().is_empty(), "a zero time budget processed items");
+    assert!(
+        stalled.effects().is_empty(),
+        "a zero time budget processed items"
+    );
     let mut remaining = 200;
     while remaining > 0 {
         let prepared = store.prepare_expiry(1_000, 64, Duration::from_secs(10));
@@ -1013,7 +1056,10 @@ fn k01_planted_read_extends_ttl_is_caught() {
 #[test]
 fn k01_planted_non_positive_expire_keeps_key_is_caught() {
     let message = planted(Mutant::NonPositiveExpireKeeps);
-    assert!(message.contains("non-positive EXPIRE did not delete"), "{message}");
+    assert!(
+        message.contains("non-positive EXPIRE did not delete"),
+        "{message}"
+    );
 }
 
 #[test]
