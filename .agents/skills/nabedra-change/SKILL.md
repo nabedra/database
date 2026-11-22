@@ -28,6 +28,35 @@ When agents work in parallel on one codebase, every hot file has a single owner
 per wave. See the hot-file rule in the
 [subagent-driven development workflow](references/subagent-driven-development.md#prepare-the-work).
 
+# Feedback tiers
+
+Run checks by tier. `python3 scripts/testing/matrix.py select --base <sha> --head <sha>`
+picks the checks for a diff, and `python3 scripts/testing/run_check.py --list --tier <tier>`
+lists a tier's checks.
+
+| Tier | Where and when | Contents |
+| --- | --- | --- |
+| T0 | Locally, before each commit | The T0 checks of the touched modules, such as model, property and logic tests, each in process in under 10 s. Simulation runs one thread and about 20 seeds. |
+| T1 | On Actions, dispatched on the final SHA before review | The set from `matrix.py select`, the repetition gate for new or changed tests, and paired A/B when the diff touches a hot path listed in `docs/testing/modules.toml` |
+| T2 | Nightly, scheduled on the SHA of `main` | Long seed runs, fuzzing, real S3 and kind suites |
+| Weekly | Scheduled on `main` | The upgrade and downgrade matrix |
+| T3 | Release SHA | Every in-scope matrix cell green on that SHA |
+
+Never start a T2 or T3 run from a task branch. Record what each tier ran as
+[evidence](../code-review/references/evidence.md).
+
+# Fixing a bug
+
+Follow the [bug loop](../code-review/references/bug-loop.md):
+
+1. Classify the bug and name the guarantees it breaks.
+2. Write a failing regression at the lowest level that reproduces it, a seed if
+   possible, and confirm that it fails before the fix.
+3. Fix it.
+4. Answer why no check caught it.
+5. Add the missing invariant, and show that it fails on the reverted fix.
+6. Write the bug record in `docs/testing/bugs/<date>-<slug>.toml`.
+
 To file the PR, use the `file-pr` skill in this repo. Include before and after pictures or videos for UI changes and give a concise description of the problem and solution of the PR
 
 Also always include screenshots and videos of the functional implementation of logic, or other methods to visualize the feature (diagrams, charts, etc.) and efficiency and time benchmarks (jitter, lag, time-to-first-token, results from the tests for scaling or load scenarios...)

@@ -48,8 +48,29 @@ The user decided on 2026-11-22 that heavy tests and checks run on GitHub
 Actions (standard runners are free for this public repository). No run starts
 on push or commit. Every run is a deliberate dispatch, pinned to a commit,
 that no later push or other agent can cancel. The pull-request gate to `main`
-remains. Follow [GitHub Actions for checks](.agents/skills/code-review/references/gh-actions.md)
+remains, and so does the scheduled nightly run described under "Testing
+system". Follow [GitHub Actions for checks](.agents/skills/code-review/references/gh-actions.md)
 for dispatching, evidence and the quarantine. When agents work in parallel,
 each hot file has one owner per wave
 ([hot-file rule](.agents/skills/nabedra-change/references/subagent-driven-development.md#prepare-the-work)).
 These rules apply to every task and workflow in this repository.
+
+# Testing system
+
+Each module's guarantees are in a register in `docs/testing/guarantees/`.
+`docs/testing/modules.toml` maps paths to modules and guarantees, each check
+is defined in `docs/testing/checks/`, and `docs/testing/coverage-matrix.md`
+shows the state of every cell. Follow the [evidence rules](.agents/skills/code-review/references/evidence.md)
+and the [verification rules](.agents/skills/code-review/SKILL.md#verification-rules).
+[docs/testing/README.md](docs/testing/README.md) is the overview and quickstart.
+
+A guarantee is verified only by attested evidence on the SHA being shipped.
+Simulation evidence is labelled as a fault model and does not replace the
+real-environment checks the register requires.
+
+Until cloud runs are approved, real-environment checks run on local Docker and
+local Kubernetes (kind), and cloud-only checks show as `not-run: cloud-deferred`.
+A scheduled nightly run, pinned to the SHA of `main` when it starts, is allowed
+alongside deliberate dispatches. S3 checks use only the dedicated test bucket,
+under `runs/<request_id>/`, and report `not-run: s3-unconfigured` when
+`NABEDRA_TEST_S3_BUCKET` is unset.

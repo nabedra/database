@@ -25,7 +25,11 @@ runners, and integration changes as tasks where the plan calls for them.
 4. Assign hot files. Before each wave of parallel tasks, list its hot files:
    files that two or more tasks in the wave will likely edit, plus any file that
    caused a merge conflict or a cross-branch break in the last wave. CI files
-   (`.github/workflows/*`, `.github/quarantine.tsv`) are always hot. Give each
+   (`.github/workflows/*`, `.github/quarantine.tsv`) are always hot. So are the
+   guarantee registers (`docs/testing/guarantees/*`), `docs/testing/modules.toml`,
+   the coverage matrix (`docs/testing/coverage-matrix.*`) and the test catalog
+   (`docs/testing/catalog.json`). The lead regenerates the matrix and the catalog
+   after each merge. Give each
    hot file one owner for the wave in the ledger's ownership column: the task
    with the largest change there, or the lead for CI files. Only the owner
    commits to a hot file. A task that needs a change in a hot file it does not
@@ -68,6 +72,23 @@ actual assertion results. An unexecuted scenario remains unverified.
   Sol on high for Codex or the latest Claude Opus on high for Claude Code,
   subject to harness availability and dispatch rules. The lead dispatches
   implementations and reviews. Children work directly on their assignment.
+- Local simulation and property runs use one thread per agent
+  (`--test-threads=1`, and `-j 2` for builds). Larger seed counts go to Actions.
+
+## Three roles per task
+
+Each task has three roles, filled by separate agents:
+
+| Role | Works from | Delivers |
+| --- | --- | --- |
+| Implementer | The brief and the plan | The change, and T0 results on each commit. It never records its own work as verified. |
+| Adversarial tester | The affected guarantees and the diff, not the implementer's notes | New tests that fail on the bug corpus, a mutant of the touched code or a reverted fix before they count |
+| Reviewer | The brief, the diff, the tester's results and the T1 evidence on the final SHA | Verdicts per guarantee, and blocking findings |
+
+The tester runs on a different model from the implementer. The reviewer did
+not author the change. A task is complete only with the reviewer's approval
+and no open blocking finding. See
+[the verification rules](../../code-review/SKILL.md#verification-rules).
 
 Give each agent a brief with the task ID, relevant requirements, agreed
 interfaces, owned paths, base revision or checkout, and acceptance checks.
