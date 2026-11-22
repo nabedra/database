@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    protocol::{Comparison, ComparisonOp},
-    query_semantics::matches_filter,
-};
+use crate::protocol::{Comparison, ComparisonOp};
 use nabedra_check::{Gen, prop};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -99,6 +96,29 @@ fn lower(p: &Predicate) -> (Predicate, Predicate) {
     }
 }
 
+// Compare a present value with a literal without the engine's
+// `query_semantics`, so a wrong operator or ordering there is visible.
+fn holds(op: ComparisonOp, value: &Scalar, literal: &Scalar) -> bool {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let order = match (value, literal) {
+        (Scalar::Int64(a), Scalar::Int64(b)) => a.cmp(b),
+        (Scalar::Utf8(a), Scalar::Utf8(b)) => a.as_bytes().cmp(b.as_bytes()),
+        (Scalar::Bool(a), Scalar::Bool(b)) => u8::from(*a).cmp(&u8::from(*b)),
+        (Scalar::Float64(a), Scalar::Float64(b)) if a == b => Equal,
+        (Scalar::Float64(a), Scalar::Float64(b)) if a < b => Less,
+        (Scalar::Float64(_), Scalar::Float64(_)) => Greater,
+        other => panic!("generated comparison has mismatched types: {other:?}"),
+    };
+    match op {
+        ComparisonOp::Eq => order == Equal,
+        ComparisonOp::Ne => order != Equal,
+        ComparisonOp::Gt => order == Greater,
+        ComparisonOp::Ge => order != Less,
+        ComparisonOp::Lt => order == Less,
+        ComparisonOp::Le => order != Greater,
+    }
+}
+
 // Interpret SQL three-valued logic over the original logical rows. The pure
 // scalar evaluator handles only comparisons whose operands are present.
 fn evaluate(p: &Predicate, row: &Row) -> Truth {
@@ -106,13 +126,7 @@ fn evaluate(p: &Predicate, row: &Row) -> Truth {
         Predicate::Comparison(c) => {
             if c.column == "score" && row["active"] == Scalar::Bool(false) {
                 Truth::Unknown
-            } else if matches_filter(
-                &Query {
-                    filter: Some(p.clone()),
-                    ..all()
-                },
-                row,
-            ) {
+            } else if holds(c.op, &row[&c.column], &c.value) {
                 Truth::True
             } else {
                 Truth::False
@@ -181,21 +195,33 @@ async fn scan_rows(
     query: Query,
     window: ScanWindow,
     force_full_scan: bool,
-) -> Vec<Row> {
-    let mut scan = PinnedScan::capture(catalog, table.id, query).unwrap();
+) -> Result<Vec<Row>, String> {
+    let mode = if force_full_scan { "full" } else { "pruned" };
+    let failed = |error| format!("{mode} scan of {query:?} failed: {error:?}");
+    let mut scan = PinnedScan::capture(catalog, table.id, query.clone()).map_err(failed)?;
     scan.force_full_scan = force_full_scan;
     let scan = Arc::new(scan);
-    fixture
-        .rows(
-            &scan,
-            scan.cursor(window.shard, window.shards).unwrap(),
-            window.batch_rows,
-            false,
-        )
-        .await
-        .into_iter()
-        .flatten()
-        .collect()
+    let mut cursor = scan.cursor(window.shard, window.shards).map_err(failed)?;
+    let mut reader = ScanReader::default();
+    let mut rows = Vec::new();
+    // An engine error is an oracle failure with a replay seed, not a panic.
+    loop {
+        let batch = reader
+            .next_batch(
+                &fixture.storage,
+                &fixture.pool,
+                scan.clone(),
+                cursor,
+                options(BatchFormat::Rows, window.batch_rows),
+            )
+            .await
+            .map_err(failed)?;
+        let Some(data) = batch.data else {
+            return Ok(rows);
+        };
+        rows.extend(decode_rows(data.bytes()));
+        cursor = batch.cursor;
+    }
 }
 
 async fn check_oracles(
@@ -206,7 +232,7 @@ async fn check_oracles(
     select: &[String],
     window: ScanWindow,
     prune_null_bug: bool,
-) -> [Result<(), String>; 3] {
+) -> Result<[Result<(), String>; 3], String> {
     let table = table();
     let catalog = fixture.partitioned(&table, source, split).await;
     let (yes, no) = lower(predicate);
@@ -228,18 +254,15 @@ async fn check_oracles(
             filter,
             ..all()
         };
-        let full = if truth == Some(Truth::True) {
-            let full = scan_rows(fixture, &catalog, &table, query.clone(), window, true).await;
-            if prune_null_bug {
-                // Omitting the presence guard compares the placeholder float
-                // even when the logical score is NULL.
-                query.filter = Some(predicate.clone());
-            }
-            Some(full)
-        } else {
-            None
-        };
-        let pruned = scan_rows(fixture, &catalog, &table, query, window, false).await;
+        // NoREC: every partition and the unfiltered scan also run without
+        // row-group selection or column projection.
+        let full = scan_rows(fixture, &catalog, &table, query.clone(), window, true).await?;
+        if prune_null_bug && truth == Some(Truth::True) {
+            // Omitting the presence guard compares the placeholder float
+            // even when the logical score is NULL.
+            query.filter = Some(predicate.clone());
+        }
+        let pruned = scan_rows(fixture, &catalog, &table, query, window, false).await?;
         let expected: Vec<Row> = source
             .iter()
             .filter(|row| truth.is_none_or(|want| evaluate(predicate, row) == want))
@@ -250,7 +273,7 @@ async fn check_oracles(
                     .collect()
             })
             .collect();
-        if let Some(full) = full.filter(|full| *full != pruned) {
+        if full != pruned && norec.is_ok() {
             norec = Err(format!(
                 "NoREC {truth:?}, {predicate:?}: pruned {pruned:?}, full {full:?}"
             ));
@@ -279,7 +302,7 @@ async fn check_oracles(
             multiset(unfiltered.iter().cloned()),
         ))
     };
-    [tlp, norec, reference]
+    Ok([tlp, norec, reference])
 }
 
 #[test]
@@ -309,7 +332,7 @@ fn generated_typed_queries_agree_with_all_three_oracles() {
         };
         let [tlp, norec, reference] = runtime.block_on(check_oracles(
             &fixture, &source, split, &predicate, select, window, false,
-        ));
+        ))?;
         tlp.and(norec).and(reference)
     });
     runtime.block_on(workers.shutdown()).unwrap();
@@ -354,10 +377,11 @@ async fn pruned_null_bug_is_caught_by_tlp_and_norec() {
         batch_rows: 5,
     };
     let baseline = check_oracles(&fixture, &source, 10, &predicate, &select, window, false).await;
-    assert_eq!(baseline, [Ok(()), Ok(()), Ok(())]);
+    assert_eq!(baseline, Ok([Ok(()), Ok(()), Ok(())]));
 
-    let [tlp, norec, _] =
-        check_oracles(&fixture, &source, 10, &predicate, &select, window, true).await;
+    let [tlp, norec, _] = check_oracles(&fixture, &source, 10, &predicate, &select, window, true)
+        .await
+        .unwrap();
     let tlp = tlp.unwrap_err();
     let norec = norec.unwrap_err();
     assert!(tlp.starts_with("TLP "), "{tlp}");
