@@ -1,0 +1,93 @@
+# Registered checks
+
+Each file here registers one runnable check. `scripts/testing/run_check.py <id>` runs it and
+writes one `nabedra.evidence/1` record. CI runs the same command on Actions, and
+`scripts/testing/matrix.py` uses the records to fill the coverage matrix.
+
+## File format
+
+One TOML file per check, named `<id>.toml`.
+
+```toml
+id = "kv-store-model"            # unique kebab-case, equal to the file name
+module = "kv"                    # a module name from docs/testing/modules.toml
+kinds = ["U"]                    # check kinds this run provides: M U S H F D R P K
+guarantees = ["KV-G02", "KV-G03"]
+scenarios = ["K01", "K02"]
+tiers = ["T0", "T1"]             # any of T0 T1 T2 T3 weekly
+command = ["cargo", "test", "--no-default-features", "--features", "cache", "--lib", "cache::store::model_tests"]
+cwd = "server"                   # relative to the repository root
+timeout_s = 900
+needs = []                       # any of: docker, kind, s3, rust-nightly, node, python-orm, valkey
+result_parser = "cargo-test"     # cargo-test | unittest | node-test | exit-code
+env = { NABEDRA_CASES = "1000" } # optional
+```
+
+| Field | Required | Rule |
+| --- | --- | --- |
+| `id` | yes | Kebab-case, equal to the file name without `.toml`. |
+| `module` | yes | A module in `docs/testing/modules.toml`, or `misc`. |
+| `kinds` | yes | A non-empty list of distinct kind letters (plan revision 1, "check kinds"). |
+| `guarantees` | yes | Guarantee IDs from `docs/testing/guarantees/*.md`. May be empty for tooling checks. `matrix.py lint` fails on an unknown ID. |
+| `scenarios` | no | Scenario IDs, copied into the record. |
+| `tiers` | yes | Where the check runs. `matrix.py select` picks the T1 checks of the touched modules. |
+| `command` | yes | Argument list, run without a shell. A leading `python3` or `python` runs under the interpreter that runs `run_check.py` (3.11 or later). |
+| `cwd` | yes | Relative to the repository root, without `..`. |
+| `timeout_s` | yes | Positive. On timeout the process group is killed and the result is `error`. |
+| `needs` | no | Environment the check requires. See below. |
+| `result_parser` | yes | How assertion counts are read from the output. See below. |
+| `env` | no | String values added to the environment. `NABEDRA_REQUEST_ID` is always set. |
+
+Unknown fields are errors.
+
+## Needs
+
+A missing need makes the result `not-run` with the reason below, and the command does not run.
+
+| Need | Present when | Reason |
+| --- | --- | --- |
+| `s3` | `NABEDRA_TEST_S3_BUCKET` is set | `s3-unconfigured` |
+| `kind` | a `kind` binary is on `PATH` | `kind-missing` |
+| `docker` | `docker info` succeeds | `docker-unavailable` |
+| `rust-nightly` | `cargo +nightly --version` succeeds | `rust-nightly-missing` |
+| `node` | a `node` binary is on `PATH` | `node-missing` |
+| `python-orm` | `import nabedra` succeeds with `orm/python/src` on `PYTHONPATH` | `python-orm-unavailable` |
+| `valkey` | `valkey-server` is on `PATH`, or `NABEDRA_TEST_VALKEY_URL` is set | `valkey-unavailable` |
+
+## Result parsers
+
+| Parser | Reads | Executed | Failed |
+| --- | --- | --- | --- |
+| `cargo-test` | every `test result:` line, summed | passed + failed | failed |
+| `unittest` | `Ran N tests` and `OK` or `FAILED (failures=.., errors=..)` | N minus skipped | failures + errors |
+| `node-test` | TAP `# pass`, `# fail`, `# cancelled`, `# skipped` | pass + fail + cancelled | fail + cancelled |
+| `exit-code` | the exit status | 1 | 1 if the status is nonzero |
+
+The result follows these rules, in order:
+
+1. Timeout: `error`.
+2. No summary line for the parser (for example a compile error): `fail`.
+3. Any failed assertion: `fail`.
+4. Nonzero exit with no failed assertion parsed: `error`.
+5. Zero executed assertions: `not-run` with reason `zero-assertions`. Never `pass`.
+6. Otherwise `pass`.
+
+Ignored, skipped and todo tests are listed in the record's `assertions.not_run`.
+
+## Running
+
+```sh
+python3.11 scripts/testing/run_check.py --list --tier T1 --module kv
+python3.11 scripts/testing/run_check.py kv-store-model --dry-run
+python3.11 scripts/testing/run_check.py kv-store-model --evidence-dir /tmp/evidence
+```
+
+Records go to `docs/testing/evidence/records/<yyyy>/<mm>/<request_id>--<id>.json` unless
+`--evidence-dir` is given. The log goes to `target/testing-logs/<request_id>--<id>.log` (or
+`--log-dir`), and its SHA-256 is listed in the record's `artifacts`. The request ID comes from
+`--request-id`, then `NABEDRA_REQUEST_ID`, then `local-<short sha>-<hhmmss>`. The exit status is 1
+for `fail` and `error`, and 0 otherwise. `--strict` also exits 2 for `not-run`.
+
+Locally written records are unattested. The matrix counts a record only when its sha is HEAD or
+an ancestor of HEAD and its attestation verifies (`matrix.py build --verify-attestations`), unless
+`--allow-unattested` is given.
