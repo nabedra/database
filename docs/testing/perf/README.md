@@ -69,7 +69,7 @@ use one engine feature at a time and the normal release profile.
 | OLTP storage | 512 | Apply a batch with one row overwrite in the Data group store and verify the reply and final row. |
 | KV write and flush | 1,024 | Submit and await synced point writes on the native journal, flush to a run, and read back the last key. The flush cost is amortized over the writes. |
 | Cache SET | 8,192 | Parse and execute one standalone SET PX command per operation, including the wall-clock expiry validation. |
-| OLAP queue | 512 | Propose, acknowledge, start, finish and look up a queued request in process, using the production wall-clock helper. |
+| OLAP queue | 512 | Propose, acknowledge, start, finish and look up a request on a fresh in-process queue, using the production wall-clock helper. A fresh queue per operation keeps retained receipts from growing the cost of later operations. |
 
 Each workload runs three times per binary in alternating order with
 Callgrind fair scheduling to reduce variation in threaded paths. The result
@@ -79,9 +79,18 @@ The noise floor is the full spread of the three base counts divided by their
 median. The threshold is the larger of 0.5% and three times that spread.
 The fixed allowance leaves room for small code generation differences and
 the spread multiplier accommodates repeat variation in threaded paths. An
-increase strictly above the threshold fails the comparison. JSON output
+increase strictly above the threshold fails the comparison. If three times
+a base spread exceeds 2%, that workload is reported as `NOISY` and the run
+cannot pass, because a wider threshold could hide a regression. JSON output
 contains all six counts per workload. The exit statuses are 0 for a pass, 1
-for a regression and 2 for a tool or input error.
+for a regression and 2 for a noisy base or a tool or input error.
+
+The threshold is relative, so the smallest detectable increase depends on
+the cost of one operation. At 0.5% it is about 20 instructions per
+operation for Cache SET, 66 for KV, 170 for OLTP storage and 670 for the
+OLAP queue, whose cost is mostly request digests and record validation.
+Cache SET reads the wall clock once per operation, so it is the most
+sensitive check of a wrapper's own cost.
 
 These counts cover the measured code paths and exclude kernel instructions.
 Absolute latency and throughput targets still use their dedicated benchmarks.

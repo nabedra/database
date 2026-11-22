@@ -156,20 +156,23 @@ fn olap_queue() -> u64 {
     const OPERATIONS: u64 = 512;
     let run = Uuid::from_u128(1);
     let member = Uuid::from_u128(2);
-    let mut queue = RequestQueue::new(
-        run,
-        1,
-        1,
-        QueueLimits {
-            max_pending_requests: OPERATIONS as usize,
-            max_queue_bytes_per_replica: 8 << 20,
-            max_retained_result_bytes_per_worker: 1 << 20,
-            result_retention_ms: 3600_000,
-        },
-        [member].into(),
-    )
-    .unwrap();
     for n in 0..OPERATIONS {
+        // A fresh queue per operation keeps the count per operation flat.
+        // Retained receipts would otherwise make every later operation scan
+        // a longer record list, and that compute would hide the clock reads.
+        let mut queue = RequestQueue::new(
+            run,
+            1,
+            1,
+            QueueLimits {
+                max_pending_requests: 1,
+                max_queue_bytes_per_replica: 1 << 20,
+                max_retained_result_bytes_per_worker: 1 << 20,
+                result_retention_ms: 3600_000,
+            },
+            [member].into(),
+        )
+        .unwrap();
         let request = Uuid::from_u128(u128::from(n) + 3);
         let body =
             format!(r#"{{"request_id":"{request}","operation":"table.list","payload":{{}}}}"#);
@@ -191,7 +194,7 @@ fn olap_queue() -> u64 {
                 .state,
             RequestState::Succeeded
         );
+        assert_eq!(queue.pending(), 0);
     }
-    assert_eq!(queue.pending(), 0);
     OPERATIONS
 }
