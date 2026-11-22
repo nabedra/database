@@ -108,15 +108,17 @@ fields fail to deserialize.
 `Record::new(check, kind)` dates the record now, sets `run.request_id` to `local`, and starts with
 `result` set to `"error"`, so a record whose runner never set a result cannot read as a pass.
 
-`validate()` checks the schema's patterns and limits. `write_to(dir)` validates, refuses a record
-over 20 KiB (20,480 bytes), and writes `<dir>/<yyyy>/<mm>/<request_id>--<check>.json`, with the year
-and month taken from `run.date`. Point `dir` at `docs/testing/evidence/records`.
+`validate()` checks the schema and the matrix's assertion rules. A pass requires at least one
+executed assertion and zero failures. A not-run record requires a reason. `write_to(dir)` validates
+the record, enforces a 20 KiB (20,480 byte) cap, and writes
+`<dir>/<yyyy>/<mm>/<request_id>--<check>.json`, using the year and month from `run.date`. Point `dir`
+at `docs/testing/evidence/records`.
 
 | Field | JSON type | Meaning |
 | --- | --- | --- |
 | `schema` | string | Always `"nabedra.evidence/1"` |
 | `check` | string | Kebab-case check ID, at most 80 characters, equal to its `docs/testing/checks/<id>.toml` name |
-| `kind` | string | One or more kind letters from `M U S H F D R P K`, separated by single spaces, such as `"U S"` |
+| `kind` | string | One or more distinct letters from `M U S H F D R P K`, separated by single spaces, such as `"U S"` |
 | `guarantees` | array of string | Guarantee IDs, such as `"KV-G02"` or `"OLAP-STR-G01"` |
 | `scenarios` | array of string | Scenario IDs, such as `"O08"` |
 | `sha` | string | 40-character lowercase commit SHA |
@@ -134,7 +136,7 @@ and month taken from `run.date`. Point `dir` at `docs/testing/evidence/records`.
 
 Seeds are full 64-bit unsigned integers. Readers must not round them through a float.
 
-Helpers: `fill_from_env()` sets `sha` and `run` from the GitHub Actions variables (falling back to
-`git rev-parse HEAD`), `tree_clean` from `git status`, and `request_id` from `NABEDRA_REQUEST_ID`;
-`assertion(passed)` and `not_run(id, reason)` count assertions; and `conclude()` sets `result` to
-`fail`, `pass` or `not-run` from the counts.
+`fill_from_env()` uses `TESTED_SHA`, `git rev-parse HEAD`, then `GITHUB_SHA` for `sha`. It reads
+run metadata from GitHub Actions, `tree_clean` from `git status`, and `request_id` from
+`NABEDRA_REQUEST_ID`. Use `assertion(passed)` and `not_run(id, reason)` to account for assertions.
+`conclude()` sets `result` to `fail`, `pass` or `not-run` from the counts.

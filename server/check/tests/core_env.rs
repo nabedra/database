@@ -3,6 +3,7 @@
 use std::process::Command;
 
 use nabedra_check::Gen;
+use nabedra_check::evidence::Record;
 use nabedra_check::prop;
 
 fn property(g: &mut Gen) -> Result<(), String> {
@@ -53,4 +54,39 @@ fn env_seed_replays_the_reported_failure() {
     let hex = format!("{:#x}", seed.parse::<u64>().unwrap());
     assert_eq!(field(&failure(Some(&hex), "1"), "seed: "), field(&first, "seed: "));
     assert!(failure(Some("not-a-seed"), "1").contains("NABEDRA_SEED=\"not-a-seed\" is not a u64"));
+}
+
+#[test]
+fn evidence_uses_the_tested_revision() {
+    if let Some(expected) = std::env::var_os("NABEDRA_CHECK_EXPECTED_SHA") {
+        assert_eq!(Record::new("check-core", "U").fill_from_env().sha, expected.to_str().unwrap());
+        return;
+    }
+
+    let head = Command::new("git").args(["rev-parse", "HEAD"]).output().unwrap();
+    assert!(head.status.success());
+    let head = String::from_utf8(head.stdout).unwrap();
+    let checkout = std::env::current_dir().unwrap();
+    let outside_checkout = std::env::temp_dir();
+    let caller_sha = "a".repeat(40);
+    let tested_sha = "b".repeat(40);
+    for (cwd, pinned, expected) in [
+        (&checkout, Some(tested_sha.as_str()), tested_sha.as_str()),
+        (&checkout, None, head.trim()),
+        (&outside_checkout, None, caller_sha.as_str()),
+    ] {
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "evidence_uses_the_tested_revision"])
+            .current_dir(cwd)
+            .env("GITHUB_SHA", &caller_sha)
+            .env("NABEDRA_CHECK_EXPECTED_SHA", expected)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE");
+        match pinned {
+            Some(sha) => child.env("TESTED_SHA", sha),
+            None => child.env_remove("TESTED_SHA"),
+        };
+        let out = child.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    }
 }
