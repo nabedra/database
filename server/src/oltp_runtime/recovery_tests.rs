@@ -364,6 +364,9 @@ pub(crate) async fn transaction_checkpoint(
     request: Uuid,
     observed: &impl serde::Serialize,
 ) {
+    if stage == "participants" || stage.starts_with("retry-participants-") {
+        index_holds::checkpoint(request, index_holds::Checkpoint::RefreshPrepare, || None).await;
+    }
     let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {
         return;
     };

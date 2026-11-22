@@ -290,6 +290,65 @@ async fn o12_failed_ready_validation_preserves_direct_schema() {
 
 const INDEX: &str = "secondary by_category";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o12_hot_key_cannot_starve_backfill() {
+    tokio::time::timeout(WAIT, async {
+        let fixture = Fixture::new().await;
+        fixture.insert_rows(vec![row(0, 0, "seed")]).await;
+        let record = fixture.declare().await;
+        let owner = MaintenanceOwnerRef {
+            catalog_group_id: fixture.runtime.services.catalog.participant().identity().group_id,
+            table_id: fixture.definition.table_id,
+            index_id: fixture.definition.index_id,
+            build_id: fixture.build_id,
+            attempt: 1,
+        };
+        let job = crate::oltp::mvcc::index::build::refresh_job(owner, &protocol::Key::Int64(0))
+            .unwrap();
+        let switch = fixture.runtime.direct_switch().unwrap();
+        let before = switch.direct_stats().unwrap().entries_applied;
+        let mut next = index_holds::register_checkpoint(job, Checkpoint::RefreshPrepare);
+        let mut actor = fixture.spawn_resume(record);
+        let mut revision = 0;
+        loop {
+            tokio::select! {
+                result = &mut actor => {
+                    result.unwrap().expect("backfill must finish while every refresh attempt races a committed write");
+                    break;
+                }
+                hold = &mut next => {
+                    let hold = hold.unwrap();
+                    revision += 1;
+                    assert!(revision <= MAX_QUEUED_MUTATION_ATTEMPTS as i64);
+                    let reply = tests::call(&fixture.app, "table.update", json!({
+                        "table_id":owner.table_id, "key":0,
+                        "values":{"category":revision,"label":format!("write {revision}")},
+                    })).await;
+                    assert_eq!(reply, true);
+                    next = index_holds::register_checkpoint(job, Checkpoint::RefreshPrepare);
+                    hold.release.send(false).unwrap();
+                }
+            }
+        }
+        index_holds::unregister_checkpoint(job, Checkpoint::RefreshPrepare);
+        assert!(revision > 0, "the writer never raced backfill");
+        assert_eq!(
+            switch.direct_stats().unwrap().entries_applied - before,
+            if switch.routes_direct() { revision as u64 } else { 0 },
+        );
+        let expected = row(0, revision, &format!("write {revision}"));
+        fixture.assert_status(1, "ready", false).await;
+        fixture.assert_point(0, expected.clone()).await;
+        fixture.assert_query(revision, &json!([expected]), true).await;
+        let latest = ReadTs::new(u64::MAX).unwrap();
+        for category in 0..revision {
+            assert!(fixture.stored_index_rows(latest, category).await.is_empty());
+        }
+        assert_eq!(fixture.stored_index_rows(latest, revision).await, vec![expected]);
+        fixture.close().await;
+    }).await.expect("hot-key backfill watchdog");
+}
+
 fn row(id: i64, category: i64, label: &str) -> Value {
     json!({"id":id,"category":category,"label":label})
 }

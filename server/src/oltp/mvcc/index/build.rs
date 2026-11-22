@@ -523,11 +523,7 @@ impl IndexService {
                                     let MvccKey::Row { primary_key, .. } = &record.key else {
                                         return Err(invalid("index source row key"));
                                     };
-                                    let job = job_id(
-                                        maintenance,
-                                        b"refresh",
-                                        Some(serialized_digest(primary_key)?),
-                                    )?;
+                                    let job = refresh_job(maintenance, primary_key)?;
                                     self.backend
                                         .refresh(maintenance.table_id, primary_key.clone(), job)
                                         .await?;
@@ -695,6 +691,13 @@ pub(crate) fn ready_job(owner: MaintenanceOwnerRef) -> Result<(Uuid, Digest), Pr
 pub(crate) fn declaration_job(owner: MaintenanceOwnerRef, definition: &IndexDefinition) -> Result<(Uuid, Digest), ProtocolError> {
     Ok((job_id(owner, b"declare", None)?, serialized_digest(&(b"index-declare/v1", definition, owner))?))
 }
+pub(crate) fn refresh_job(
+    owner: MaintenanceOwnerRef,
+    key: &crate::protocol::Key,
+) -> Result<Uuid, ProtocolError> {
+    job_id(owner, b"refresh", Some(serialized_digest(key)?))
+}
+
 fn job_id(
     owner: MaintenanceOwnerRef,
     stage: &[u8],
