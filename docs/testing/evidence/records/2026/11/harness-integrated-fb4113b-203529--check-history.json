@@ -1,0 +1,45 @@
+{
+  "artifacts": [
+    {
+      "name": "harness-integrated-fb4113b-203529--check-history.log",
+      "sha256": "42a46d4ff500c563760082b486db5be7a4baf8062f9b6c1d9e38b53be9094a83"
+    }
+  ],
+  "assertions": {
+    "executed": 18,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "check-history",
+  "duration_s": 16.835,
+  "guarantees": [
+    "OLTP-G02",
+    "OLTP-G04",
+    "EVT-G01",
+    "EVT-G02",
+    "EVT-G03",
+    "CACHE-G05"
+  ],
+  "kind": "H",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T19:35:57.048215+00:00",
+    "request_id": "harness-integrated-fb4113b-203529",
+    "runner": "GitHub Actions 1000004059",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45061628258"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "fb4113bdececcda0f4f4814122ae3d7828143e70",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

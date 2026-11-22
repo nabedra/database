@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "harness-integrated-fb4113b-203529--check-core.log",
+      "sha256": "cb1513edfea5cb647675830625eb1093a236cb70b9eee65e5ddfa10914f84d6d"
+    }
+  ],
+  "assertions": {
+    "executed": 76,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "ignored",
+        "reason": "1 tests marked #[ignore]"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "check-core",
+  "duration_s": 19.485,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T19:35:58.289988+00:00",
+    "request_id": "harness-integrated-fb4113b-203529",
+    "runner": "GitHub Actions 1000004060",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45061628258"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "fb4113bdececcda0f4f4814122ae3d7828143e70",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

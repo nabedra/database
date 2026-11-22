@@ -1,7 +1,20 @@
 {
   "allow_unattested": false,
-  "head": "33b1734a3a64548ce8b240eb8ce5750085043977",
-  "ignored_records": [],
+  "head": "5a5e4e8f38ea8560ff2f15218f43903faf655e76",
+  "ignored_records": [
+    {
+      "path": "harness-integrated-fb4113b-203529--check-core.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "harness-integrated-fb4113b-203529--check-history.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "harness-integrated-fb4113b-203529--testing-matrix.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -267,6 +280,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -738,6 +752,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -799,6 +814,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -858,6 +874,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2806,6 +2823,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2935,6 +2953,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -3992,5 +4011,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
