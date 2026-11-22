@@ -1,9 +1,8 @@
 //! The task seam.
 //!
 //! Product builds forward to tokio and `std::thread::Builder`. Under `sim`, spawned
-//! tasks join the current node's registry (so [`crate::sim::crash`] can abort them),
-//! blocking work runs inline, and services run as tasks on the simulation runtime (see
-//! [`spawn_service`]).
+//! tasks join the current node's registry so a simulated crash can abort them.
+//! Blocking work completes before the caller resumes, and services use helper threads.
 
 pub use tokio::task::{JoinError, JoinHandle, JoinSet};
 
@@ -12,6 +11,7 @@ use std::future::Future;
 /// [`tokio::spawn`]. Under `sim` the task inherits the current node context and joins
 /// that node's task registry.
 #[inline]
+#[track_caller]
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
@@ -28,8 +28,10 @@ where
 }
 
 /// [`tokio::runtime::Handle::spawn`]. Under `sim` the task inherits the current node
-/// context and joins that node's task registry.
+/// context and joins that node's task registry. The handle must belong to the world's
+/// runtime while a simulated world is installed.
 #[inline]
+#[track_caller]
 pub fn spawn_on<F>(handle: &tokio::runtime::Handle, future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
@@ -49,6 +51,7 @@ where
 /// in the current node context, before this returns; the handle then resolves at once.
 /// No OS scheduling decision reaches the simulated schedule.
 #[inline]
+#[track_caller]
 pub fn spawn_blocking<F, R>(f: F) -> JoinHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -70,7 +73,7 @@ where
 ///
 /// Under `sim` the service runs on its own helper OS thread, with the spawning node's
 /// context installed on that thread and registered so a crash marks it. See
-/// [`crate::sim`] for why this phase uses a helper thread and what phase 9 changes.
+/// the `sim` module for why this phase uses a helper thread and what phase 9 changes.
 #[inline]
 pub fn spawn_service<F, T>(
     name: impl Into<String>,

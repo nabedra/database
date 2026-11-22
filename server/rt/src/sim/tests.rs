@@ -189,6 +189,24 @@ fn wall_jumps_move_wall_now_but_never_now() {
     });
 }
 
+#[test]
+fn wall_clock_preserves_time_before_the_epoch() {
+    run(4, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.jump_wall_backward(1, ms(super::EPOCH_MS + 2_000));
+        in_node(1, async {
+            let wall = time::wall_now();
+            assert_eq!(wall, SystemTime::UNIX_EPOCH - ms(2_000));
+            assert_eq!(time::unix_ms(), 0);
+            assert_eq!(time::unix_micros(), 0);
+            assert_eq!(time::unix_nanos(), 0);
+            world.jump_wall_forward(1, ms(2_500));
+            assert_eq!(time::wall_now(), SystemTime::UNIX_EPOCH + ms(500));
+        })
+        .await;
+    });
+}
+
 fn draws(seed: u64, node: u64) -> (Vec<uuid::Uuid>, Vec<u64>) {
     run(seed, move |world| async move {
         world.add_node(1, NodeClock::default());
@@ -307,6 +325,32 @@ fn spawn_on_registers_with_the_node() {
         tokio::task::yield_now().await;
         world.crash(1);
         assert!(task.await.unwrap_err().is_cancelled());
+    });
+}
+
+#[test]
+#[should_panic(expected = "a simulated world cannot spawn onto another runtime")]
+fn spawn_on_rejects_a_foreign_runtime_in_simulation() {
+    let foreign = super::runtime().unwrap();
+    let target = foreign.handle();
+    run(6, |world| async move {
+        world.add_node(1, NodeClock::default());
+        in_node(1, async {
+            drop(task::spawn_on(target, async {}));
+        })
+        .await;
+    });
+}
+
+#[test]
+fn run_enters_its_runtime_before_constructing_the_future() {
+    run(6, |world| {
+        assert_eq!(super::world().unwrap().seed(), world.seed());
+        let sleep = time::sleep(ms(25));
+        async move {
+            sleep.await;
+            assert_eq!(local_elapsed(&world), ms(25));
+        }
     });
 }
 

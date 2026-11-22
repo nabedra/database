@@ -78,6 +78,7 @@ fn since_epoch() -> Option<Duration> {
 
 /// [`tokio::time::sleep`].
 #[inline]
+#[track_caller]
 pub fn sleep(duration: Duration) -> Sleep {
     #[cfg(feature = "sim")]
     {
@@ -91,12 +92,14 @@ pub fn sleep(duration: Duration) -> Sleep {
 
 /// [`tokio::time::sleep_until`] for a deadline on the node clock ([`now`]).
 #[inline]
+#[track_caller]
 pub fn sleep_until(deadline: Instant) -> Sleep {
     tokio::time::sleep_until(to_runtime(deadline))
 }
 
 /// [`tokio::time::timeout`].
 #[inline]
+#[track_caller]
 pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
     #[cfg(feature = "sim")]
     {
@@ -110,12 +113,14 @@ pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
 
 /// [`tokio::time::timeout_at`] for a deadline on the node clock ([`now`]).
 #[inline]
+#[track_caller]
 pub fn timeout_at<F: Future>(deadline: Instant, future: F) -> Timeout<F> {
     tokio::time::timeout_at(to_runtime(deadline), future)
 }
 
 /// [`tokio::time::interval`].
 #[inline]
+#[track_caller]
 pub fn interval(period: Duration) -> Interval {
     #[cfg(feature = "sim")]
     {
@@ -129,6 +134,7 @@ pub fn interval(period: Duration) -> Interval {
 
 /// [`tokio::time::interval_at`] for a start on the node clock ([`now`]).
 #[inline]
+#[track_caller]
 pub fn interval_at(start: Instant, period: Duration) -> Interval {
     #[cfg(feature = "sim")]
     {
@@ -142,9 +148,8 @@ pub fn interval_at(start: Instant, period: Duration) -> Interval {
 
 /// [`std::thread::sleep`], for blocking threads only.
 ///
-/// Under `sim` the calling thread does not sleep: blocking work runs inline on the
-/// simulation thread, and a real sleep there would stall the whole simulated cluster
-/// without advancing virtual time.
+/// Under `sim` only service threads sleep in real time. A sleep on the simulation
+/// thread or its blocking helper would stall the cluster without advancing virtual time.
 #[inline]
 pub fn thread_sleep(duration: Duration) {
     #[cfg(feature = "sim")]

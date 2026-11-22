@@ -108,6 +108,20 @@ async fn spawned_work_runs_on_the_runtime() {
 }
 
 #[test]
+fn spawn_on_uses_the_given_runtime_and_preserves_abort() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    // The calling thread has no runtime entered when the tasks are submitted.
+    let target = runtime.handle();
+    let ran = task::spawn_on(target, async { tokio::runtime::Handle::current().id() });
+    let cancelled = task::spawn_on(target, async { panic!("aborted task was polled") });
+    cancelled.abort();
+    assert_eq!(runtime.block_on(ran).unwrap(), target.id());
+    assert!(runtime.block_on(cancelled).unwrap_err().is_cancelled());
+}
+
+#[test]
 fn services_are_named_threads() {
     let started = Arc::new(AtomicBool::new(false));
     let flag = started.clone();

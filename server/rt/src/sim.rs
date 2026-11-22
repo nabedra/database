@@ -67,6 +67,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
+use tokio::runtime::{Handle, Id, RuntimeFlavor};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -232,6 +233,7 @@ struct State {
 #[derive(Debug)]
 pub struct World {
     seed: u64,
+    runtime_id: Id,
     start: Instant,
     std_start: std::time::Instant,
     state: Mutex<State>,
@@ -242,14 +244,18 @@ impl World {
     ///
     /// # Panics
     ///
-    /// Outside a tokio runtime: the world's clock is the runtime's paused clock.
+    /// Outside a current-thread tokio runtime. Use [`runtime`] for its paused clock.
     pub fn new(seed: u64) -> Arc<Self> {
-        assert!(
-            tokio::runtime::Handle::try_current().is_ok(),
-            "create the simulation world inside its runtime (sim::run)"
+        let runtime = Handle::try_current()
+            .expect("create the simulation world inside its runtime (sim::run)");
+        assert_eq!(
+            runtime.runtime_flavor(),
+            RuntimeFlavor::CurrentThread,
+            "a simulated world requires a current-thread runtime"
         );
         Arc::new(Self {
             seed,
+            runtime_id: runtime.id(),
             start: Instant::now(),
             std_start: std::time::Instant::now(),
             state: Mutex::new(State {
@@ -341,7 +347,24 @@ impl World {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let handle = tokio::spawn(NODE.scope(node, future));
+        self.spawn_node_on(&Handle::current(), node, future)
+    }
+
+    fn assert_runtime(&self, target: &Handle) {
+        assert_eq!(
+            target.id(),
+            self.runtime_id,
+            "a simulated world cannot spawn onto another runtime"
+        );
+    }
+
+    fn spawn_node_on<F>(&self, target: &Handle, node: u64, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.assert_runtime(target);
+        let handle = target.spawn(NODE.scope(node, future));
         self.register(node, &handle);
         handle
     }
@@ -399,12 +422,17 @@ impl World {
 #[must_use = "the world is uninstalled when the guard drops"]
 pub struct Installed {
     previous: Option<Arc<World>>,
+    // Restoring a thread-local must happen on the thread that installed it.
+    thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl Installed {
     pub fn new(world: Arc<World>) -> Self {
         let previous = WORLD.with(|slot| slot.borrow_mut().replace(world));
-        Self { previous }
+        Self {
+            previous,
+            thread: std::marker::PhantomData,
+        }
     }
 }
 
@@ -441,7 +469,7 @@ where
     let runtime = runtime().expect("build the simulation runtime");
     let world = runtime.block_on(async { World::new(seed) });
     let _installed = Installed::new(world.clone());
-    runtime.block_on(body(world))
+    runtime.block_on(async { body(world).await })
 }
 
 /// The node the current task or thread belongs to, if any.
@@ -502,8 +530,13 @@ pub(crate) fn wall_now() -> SystemTime {
     node_clock(|world, clock| {
         let local = local_elapsed(world, clock).as_nanos() as i128;
         let offset = clock.map_or(0, |clock| clock.wall_offset_nanos);
-        let since_epoch = i128::from(EPOCH_MS) * 1_000_000 + local + offset;
-        SystemTime::UNIX_EPOCH + nanos(since_epoch)
+        let since_epoch = (i128::from(EPOCH_MS) * 1_000_000 + local).saturating_add(offset);
+        if since_epoch < 0 {
+            SystemTime::UNIX_EPOCH.checked_sub(nanos(since_epoch.saturating_neg()))
+        } else {
+            SystemTime::UNIX_EPOCH.checked_add(nanos(since_epoch))
+        }
+        .expect("the simulated wall clock must fit in SystemTime")
     })
     .unwrap_or_else(SystemTime::now)
 }
@@ -584,16 +617,16 @@ where
     }
 }
 
-pub(crate) fn spawn_on<F>(handle: &tokio::runtime::Handle, future: F) -> JoinHandle<F::Output>
+pub(crate) fn spawn_on<F>(handle: &Handle, future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     match (current_node(), world()) {
-        (Some(node), Some(world)) => {
-            let task = handle.spawn(NODE.scope(node, future));
-            world.register(node, &task);
-            task
+        (Some(node), Some(world)) => world.spawn_node_on(handle, node, future),
+        (None, Some(world)) => {
+            world.assert_runtime(handle);
+            handle.spawn(future)
         }
         _ => handle.spawn(future),
     }

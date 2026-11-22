@@ -6,7 +6,7 @@
 //! line, so behaviour and generated code stay the same.
 //!
 //! With the `sim` feature the same functions read the simulated node context in
-//! [`sim`]: a per-node monotonic offset and drift, a per-node wall clock with explicit
+//! the `sim` module: a per-node monotonic offset and drift, a per-node wall clock with explicit
 //! jumps (scenario O09), seeded per-node id streams, a per-node task registry so a
 //! simulated crash aborts the node's tasks, and inline blocking work. The simulation
 //! feature never reaches a product build; `server/src/main.rs` refuses to compile with it.
