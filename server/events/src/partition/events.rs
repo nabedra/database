@@ -98,6 +98,14 @@ pub(super) fn publish(
             {
                 return Err(Error::new(ErrorCode::Conflict, "event ID has different data").into());
             }
+            // Planted bug (simulation only): a dedup hit rewinds the offset counter to the
+            // duplicate's offset, so the next new event reuses an assigned offset.
+            #[cfg(feature = "sim")]
+            if crate::sim::hooks::reuse_offset_after_dedup() {
+                next_offset = offset;
+                head.next_offset = offset;
+                store(tx, HEAD_KEY, head)?;
+            }
             committed
         } else {
             let offset = next_offset;

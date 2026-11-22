@@ -39,6 +39,10 @@ enum Command {
     },
 }
 
+// Simulation swaps the Raft runtime, network and storage threading; it never ships.
+#[cfg(feature = "sim")]
+compile_error!("the `sim` feature is for simulation tests and must not build the broker binary");
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let command = Cli::parse().command;

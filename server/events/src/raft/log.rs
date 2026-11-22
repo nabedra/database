@@ -238,12 +238,18 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     {
         let store = self.clone();
         let entries: Vec<_> = entries.into_iter().collect();
+        #[cfg(feature = "sim")]
+        let appended: Vec<_> = entries.iter().map(|entry| entry.log_id).collect();
         // A full device is retried per sub-batch inside the job, so the callback reports
         // success only after the last one is durable (RV-EV M1).
         let result = self
             .0
             .run_as("append", move |_| store.append_entries(entries))
             .await;
+        #[cfg(feature = "sim")]
+        if result.is_ok() {
+            crate::sim::hooks::appended(&self.0.id, &appended);
+        }
         callback.log_io_completed(
             result
                 .as_ref()
@@ -258,7 +264,10 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         self.0
             .run_as("truncate", move |_| store.truncate_from(log_id.index))
             .await
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Delete, error))
+            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Delete, error))?;
+        #[cfg(feature = "sim")]
+        crate::sim::hooks::truncated(&self.0.id, log_id.index);
+        Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {

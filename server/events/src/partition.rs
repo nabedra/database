@@ -253,6 +253,46 @@ pub fn query(tx: &Transaction<'_>, query: Query) -> StorageResult<Result<QueryRe
     as_outcome(read(tx, query))
 }
 
+#[cfg(feature = "sim")]
+#[derive(PartialEq)]
+pub(crate) struct SimState {
+    pub tail: u64,
+    pub checkpoint: u64,
+    pub events: Vec<Event>,
+}
+
+/// Read the retained events and subscription checkpoint in one local transaction.
+#[cfg(feature = "sim")]
+pub(crate) fn sim_state(
+    tx: &Transaction<'_>,
+    subscription: &str,
+) -> StorageResult<Result<SimState, Error>> {
+    as_outcome((|| {
+        let head = load_head(tx)?;
+        let query = Query::SubscriptionStatus {
+            name: subscription.into(),
+        };
+        let QueryReply::SubscriptionStatus(status) = subscriptions::read(tx, &head, query)? else {
+            unreachable!("subscription status query returns subscription status");
+        };
+        let mut out = Vec::new();
+        let mut after = head.first_checkpoint();
+        while after < head.tail() {
+            let page = events::page(tx, &head, after, MAX_PAGE_EVENTS)?;
+            let Some(last) = page.events.last() else {
+                break;
+            };
+            after = last.offset;
+            out.extend(page.events);
+        }
+        Ok(SimState {
+            tail: head.tail(),
+            checkpoint: status.checkpoint,
+            events: out,
+        })
+    })())
+}
+
 #[derive(Serialize, Deserialize)]
 struct Head {
     topic_id: Uuid,

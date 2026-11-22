@@ -1087,6 +1087,7 @@ dependencies = [
  "nabedra-check",
  "nabedra-kv",
  "openraft",
+ "rand 0.8.8",
  "reqwest",
  "rustls",
  "serde",
