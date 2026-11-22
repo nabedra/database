@@ -1943,7 +1943,7 @@ impl StatusClient {
                 self.client.control.invalidate_replica_routes(&routes);
                 return Ok(None);
             }
-            Err(CallError::Transport(RequestError::OutgoingLaneFull)) => return Ok(None),
+            Err(CallError::Transport(RequestError::OutgoingLaneFull { .. })) => return Ok(None),
             Ok(Err(error)) => Err(error),
             Err(error) => Err(error.into()),
         }

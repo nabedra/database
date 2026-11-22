@@ -246,7 +246,7 @@ impl<C: TypedConfig> TypedNetwork<C> {
         })?
         .map_err(|failure| {
             let (reason, code) = match &failure {
-                RequestError::OutgoingLaneFull => ("outgoing_lane_full", None),
+                RequestError::OutgoingLaneFull { .. } => ("outgoing_lane_full", None),
                 RequestError::Unreachable => ("unreachable", None),
                 RequestError::PeerRejected { error, .. } => ("peer_rejected", Some(error.code)),
                 RequestError::Protocol(error) => ("local_protocol", Some(error.code)),

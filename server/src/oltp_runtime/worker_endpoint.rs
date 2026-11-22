@@ -411,7 +411,7 @@ impl QueuePeerClient {
                     return error.into();
                 }
                 match error {
-                    RequestError::OutgoingLaneFull => RequestError::OutgoingLaneFull.into(),
+                    RequestError::OutgoingLaneFull { .. } => error.into(),
                     RequestError::Unreachable => ProtocolError::new(
                         ErrorCode::OutcomeUnknown,
                         "read grant copy acknowledgement unavailable",

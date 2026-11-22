@@ -583,7 +583,7 @@ impl Client {
                 RequestError::Protocol(error) | RequestError::PeerRejected { error, .. },
             ))) => route_unavailable(&error) || error == invalid(),
             Ok(Err(CallError::Transport(RequestError::Unreachable))) => true,
-            Ok(Err(CallError::Transport(RequestError::OutgoingLaneFull))) => false,
+            Ok(Err(CallError::Transport(RequestError::OutgoingLaneFull { .. }))) => false,
             // The reply failed this side's checks.
             Ok(Err(CallError::Local(_))) => true,
         };
@@ -704,9 +704,9 @@ impl Client {
             .await
             .map_err(|_| unavailable())?;
             let refused_before_send = match attempt {
-                Err(CallError::Transport(RequestError::OutgoingLaneFull)) => {
-                    tracing::debug!(group=%self.group.group_id, method=?method, retry_ms=delay.as_millis(), "local service outgoing lane full");
-                    true
+                Err(CallError::Transport(error @ RequestError::OutgoingLaneFull { .. })) => {
+                    tracing::debug!(group=%self.group.group_id, method=?method, ?error, retry_ms=delay.as_millis(), "local service outgoing lane full");
+                    Some(error)
                 }
                 Err(CallError::Transport(
                     RequestError::Protocol(error) | RequestError::PeerRejected { error, .. },
@@ -715,12 +715,12 @@ impl Client {
                     // Retry the same idempotent operation with fresh TLS context.
                     possibly_applied = true;
                     tracing::debug!(group=%self.group.group_id, method=?method, retry_ms=delay.as_millis(), "service transport temporarily overloaded");
-                    false
+                    None
                 }
                 Err(CallError::Local(error)) if route_unavailable(&error) => {
                     possibly_applied = true;
                     tracing::debug!(group=%self.group.group_id, method=?method, retry_ms=delay.as_millis(), "service routes temporarily unavailable");
-                    false
+                    None
                 }
                 result => {
                     return result.map_err(|error| {
@@ -738,10 +738,9 @@ impl Client {
             // Only the original charged request crosses the wait.
             sleep_until((Instant::now() + delay).min(deadline)).await;
             if Instant::now() >= deadline {
-                return Err(if refused_before_send && !possibly_applied {
-                    RequestError::OutgoingLaneFull.into()
-                } else {
-                    unavailable()
+                return Err(match refused_before_send {
+                    Some(error) if !possibly_applied => error.into(),
+                    _ => unavailable(),
                 });
             }
             delay = (delay * 2).min(Duration::from_millis(250));
@@ -897,7 +896,7 @@ impl Client {
                                 *possibly_applied = true;
                                 continue;
                             }
-                            RequestError::OutgoingLaneFull => {}
+                            RequestError::OutgoingLaneFull { .. } => {}
                         }
                         return Err(CallError::Transport(error));
                     }

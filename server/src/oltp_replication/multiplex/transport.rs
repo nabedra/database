@@ -718,8 +718,9 @@ struct LaneRefusals {
     handler: [AtomicU64; CLASSES],
 }
 impl LaneRefusals {
-    fn outgoing(&self, class: TrafficClass) {
+    fn outgoing(&self, class: TrafficClass, direct: bool) {
         self.outgoing[class as usize].fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("{}", outgoing_lane_message(class, direct));
     }
     fn handler(&self, class: TrafficClass) {
         self.handler[class as usize].fetch_add(1, Ordering::Relaxed);
@@ -812,7 +813,10 @@ impl From<WorkerIdentity> for RequestTarget {
 
 #[derive(Debug)]
 pub(crate) enum RequestError {
-    OutgoingLaneFull,
+    OutgoingLaneFull {
+        class: TrafficClass,
+        direct: bool,
+    },
     Unreachable,
     PeerRejected {
         worker: WorkerIdentity,
@@ -820,6 +824,24 @@ pub(crate) enum RequestError {
     },
     Protocol(ProtocolError),
 }
+impl RequestError {
+    fn outgoing_lane_full(class: TrafficClass) -> Self {
+        Self::OutgoingLaneFull {
+            class,
+            direct: false,
+        }
+    }
+}
+
+fn outgoing_lane_message(class: TrafficClass, direct: bool) -> String {
+    let lane = match (class, direct) {
+        (TrafficClass::ApiIngress, true) => "/direct",
+        (TrafficClass::ApiIngress, false) => "/ingress",
+        _ => "",
+    };
+    format!("worker outgoing lane full ({class:?}{lane})")
+}
+
 impl From<ProtocolError> for RequestError {
     fn from(error: ProtocolError) -> Self {
         Self::Protocol(error)
@@ -828,7 +850,11 @@ impl From<ProtocolError> for RequestError {
 impl From<RequestError> for ProtocolError {
     fn from(error: RequestError) -> Self {
         match error {
-            RequestError::OutgoingLaneFull => overloaded("worker outgoing lane full"),
+            RequestError::OutgoingLaneFull { class, direct } => ProtocolError::new(
+                ErrorCode::Overloaded,
+                outgoing_lane_message(class, direct),
+                Outcome::NotApplied,
+            ),
             RequestError::Unreachable => unavailable(),
             RequestError::Protocol(error) | RequestError::PeerRejected { error, .. } => error,
         }
@@ -1258,8 +1284,11 @@ impl WorkerClient {
                     _waiting: None,
                 }),
                 _ => {
-                    self.common.refusals.outgoing(class);
-                    Err(RequestError::OutgoingLaneFull)
+                    self.common.refusals.outgoing(class, true);
+                    Err(RequestError::OutgoingLaneFull {
+                        class,
+                        direct: true,
+                    })
                 }
             };
         }
@@ -1302,8 +1331,8 @@ impl WorkerClient {
                 _waiting: Some(waiting),
             }),
             _ => {
-                self.common.refusals.outgoing(class);
-                Err(RequestError::OutgoingLaneFull)
+                self.common.refusals.outgoing(class, false);
+                Err(RequestError::outgoing_lane_full(class))
             }
         }
     }
@@ -1420,8 +1449,8 @@ impl WorkerClient {
             .checked_add(self.common.config.deadline)
             .ok_or_else(|| malformed("worker transport deadline is too large"))?;
         let refused = |error: RequestError| {
-            if matches!(error, RequestError::OutgoingLaneFull) {
-                self.common.refusals.outgoing(class);
+            if matches!(error, RequestError::OutgoingLaneFull { .. }) {
+                self.common.refusals.outgoing(class, false);
             }
             error
         };
@@ -1430,7 +1459,7 @@ impl WorkerClient {
             .await
             .map_err(refused)?;
         if Instant::now() >= deadline {
-            return Err(refused(RequestError::OutgoingLaneFull));
+            return Err(refused(RequestError::outgoing_lane_full(class)));
         }
         timeout_at(
             deadline,
@@ -1476,7 +1505,7 @@ impl WorkerClient {
             .common
             .authority_waiters
             .try_acquire()
-            .map_err(|_| RequestError::OutgoingLaneFull)?;
+            .map_err(|_| RequestError::outgoing_lane_full(class))?;
         let acquire = timeout_at(deadline, async {
             let role = roles.acquire().await?;
             #[cfg(test)]
@@ -1504,8 +1533,8 @@ impl WorkerClient {
             .reserve_scratch(ByteClass::Progress, std::mem::size_of_val(&acquire))?;
         acquire
             .await
-            .map_err(|_| RequestError::OutgoingLaneFull)?
-            .map_err(|_| RequestError::OutgoingLaneFull)
+            .map_err(|_| RequestError::outgoing_lane_full(class))?
+            .map_err(|_| RequestError::outgoing_lane_full(class))
     }
     async fn exchange(
         &self,
@@ -1701,7 +1730,7 @@ impl WorkerClient {
         class: TrafficClass,
     ) -> Result<OutgoingSlot, RequestError> {
         self.try_outgoing_slot(target, class).inspect_err(|_| {
-            self.common.refusals.outgoing(class);
+            self.common.refusals.outgoing(class, false);
         })
     }
     /// `try_outgoing` for a caller that waits instead when the lane is full.
@@ -1713,7 +1742,7 @@ impl WorkerClient {
         let full = || {
             #[cfg(test)]
             self.common.outgoing_lane_full[class as usize].notify_one();
-            RequestError::OutgoingLaneFull
+            RequestError::outgoing_lane_full(class)
         };
         #[cfg(test)]
         let held = self.common.outgoing_hold[class as usize]
@@ -1794,6 +1823,14 @@ pub(crate) struct OutgoingReservation {
     /// slot. A request moves `slot` out; dropping the rest frees the share.
     /// `None` on a direct lane (RD3), which has no share to keep.
     _waiting: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
+}
+impl OutgoingReservation {
+    pub(crate) fn deadline_refusal(&self) -> RequestError {
+        RequestError::OutgoingLaneFull {
+            class: self.class,
+            direct: self._waiting.is_none(),
+        }
+    }
 }
 
 /// A caller slot on one peer lane and in its class. Dropping it frees both.

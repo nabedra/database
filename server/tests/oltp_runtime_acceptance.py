@@ -13,6 +13,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import signal
 import socket
@@ -94,7 +95,10 @@ def exact_receipt(exchange, run, request, result, timeout=60, *, allow_lane_over
         if status == 200:
             if body['state'] in ('succeeded', 'failed'):
                 if allow_lane_overload and body['state'] == 'failed':
-                    error = dict(code='overloaded', message='worker outgoing lane full', outcome='not_applied')
+                    message = body['error']['message']
+                    assert re.fullmatch(
+                        r'worker outgoing lane full \([A-Z][A-Za-z]*(?:/(?:direct|ingress))?\)', message), body
+                    error = dict(code='overloaded', message=message, outcome='not_applied')
                     assert body == dict(expected, state='failed', result=None, error=error), body
                 else:
                     assert body == expected, body

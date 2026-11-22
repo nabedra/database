@@ -532,15 +532,16 @@ async fn d10_c07_o05_exhausted_lane_overloads_while_raft_progress_advances() {
             TrafficClass::DataConsensus,
             caller_config.handler_slots[data] as u32 - 1,
         );
-        assert!(matches!(
-            fixture
-                .call(&fixture.data_group, Purpose::Raft, "caller-full")
-                .await,
-            Err(RequestError::OutgoingLaneFull)
-        ));
-        let error = ProtocolError::from(RequestError::OutgoingLaneFull);
+        let Err(refusal @ RequestError::OutgoingLaneFull { .. }) = fixture
+            .call(&fixture.data_group, Purpose::Raft, "caller-full")
+            .await
+        else {
+            panic!("expected a local caller refusal");
+        };
+        let error = ProtocolError::from(refusal);
         assert_eq!(error.code, ErrorCode::Overloaded);
         assert_eq!(error.outcome, Outcome::NotApplied);
+        assert_eq!(error.message, "worker outgoing lane full (DataConsensus)");
 
         // Raft progress traffic for the same group advances on its own lane.
         fixture.endpoint.hold.store(false, Ordering::Release);
@@ -1084,7 +1085,7 @@ async fn d10_o05_large_and_small_frames_share_one_lane() {
                     .await
                 {
                     // Three large calls may hold the lane's four slots briefly.
-                    Err(RequestError::OutgoingLaneFull) => tokio::task::yield_now().await,
+                    Err(RequestError::OutgoingLaneFull { .. }) => tokio::task::yield_now().await,
                     reply => break reply,
                 }
             };
@@ -1420,7 +1421,7 @@ async fn d05_live1_black_holed_peer_fills_only_its_own_lane() {
             fixture
                 .call(&fixture.data_group, Purpose::Raft, "excess")
                 .await,
-            Err(RequestError::OutgoingLaneFull)
+            Err(RequestError::OutgoingLaneFull { .. })
         ));
         assert!(stalled.iter().all(|call| !call.is_finished()));
         // The same class to the healthy peer still sends, many times over.
@@ -1503,7 +1504,7 @@ async fn g1_local_failure_after_send_has_unknown_outcome() {
         let Err(full) = full else {
             panic!("a held lane accepted the call");
         };
-        assert!(matches!(full, RequestError::OutgoingLaneFull));
+        assert!(matches!(full, RequestError::OutgoingLaneFull { .. }));
         assert_eq!(ProtocolError::from(full).outcome, Outcome::NotApplied);
         assert_eq!(fixture.endpoint.handled.load(Ordering::Acquire), 1);
         drop(_held);
@@ -1635,6 +1636,28 @@ async fn rd3_d12_o03_direct_requests_beyond_the_ingress_slots_reach_the_leader()
                 .expect("no direct request is refused");
         }
         assert_eq!(f.client.lane_refusals(), refused, "nothing refused");
+        let hold = f.client.hold_outgoing_for_test(TrafficClass::ApiIngress);
+        let Err(error @ RequestError::OutgoingLaneFull { .. }) = f
+            .client
+            .reserve_outgoing(
+                &f.data_group,
+                f.target.worker_id,
+                Purpose::ApiIngress,
+                Instant::now(),
+            )
+            .await
+        else {
+            panic!("expected a local lane refusal at the deadline");
+        };
+        let error = ProtocolError::from(error);
+        let lane = if wide { "direct" } else { "ingress" };
+        assert_eq!(
+            error.message,
+            format!("worker outgoing lane full (ApiIngress/{lane})")
+        );
+        assert_eq!(error.code, ErrorCode::Overloaded);
+        assert_eq!(error.outcome, Outcome::NotApplied);
+        drop(hold);
         f.stop().await;
     }
 }
