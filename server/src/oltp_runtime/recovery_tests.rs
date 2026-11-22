@@ -684,7 +684,7 @@ async fn replacement_peer_probe(config: PathBuf) {
         config::WorkerResources,
         oltp::pool::{ByteClass, SharedResourceConfig, WorkerSharedResources},
         oltp_replication::{
-            authority::control::{ControlClient, ControlRoutes},
+            authority::control::{ControlClient, ControlRoutes, PublishedControlRoutes},
             manager::system_recovery::ReplacementCapabilityEndpoint,
             multiplex::{
                 AppliedPeerDirectory, EndpointRegistry, PeerDirectory, Purpose, TransportConfig,
@@ -708,6 +708,8 @@ async fn replacement_peer_probe(config: PathBuf) {
         control_actor: Option<WorkerEnrollment>,
         #[serde(default)]
         revoked_bootstrap_peer: Option<Uuid>,
+        #[serde(default)]
+        track_control_voters: bool,
         #[serde(default)]
         queue_view: Option<crate::oltp_replication::types::AuthorityView>,
     }
@@ -826,29 +828,44 @@ async fn replacement_peer_probe(config: PathBuf) {
             .unwrap();
         let mut voters: Vec<_> = config.targets.iter().map(|peer| peer.worker_id).collect();
         voters.sort_unstable();
-        let authority_resources = WorkerSharedResources::new(
-            2,
-            WorkerResources::default(),
-            SharedResourceConfig::default(),
-        )
-        .unwrap();
-        let authority = WorkerTransport::new(
-            &actor,
-            &tls,
-            authority_resources.clone(),
-            directory.clone(),
-            Arc::new(EndpointRegistry::new(authority_resources.clone())),
-            TransportConfig::default(),
-        )
-        .unwrap()
-        .client();
-        let control = ControlClient::new(
-            authority,
-            authority_resources,
-            config.group.clone(),
-            Arc::new(Routes(voters)),
-        )
-        .unwrap();
+        let published = config
+            .track_control_voters
+            .then(|| PublishedControlRoutes::new(voters.clone()).unwrap());
+        let routes: Arc<dyn ControlRoutes> = match &published {
+            Some(published) => published.clone(),
+            None => Arc::new(Routes(voters)),
+        };
+        let (authority_resources, authority) = if published.is_some() {
+            // The inventory decoder must use the same resource owner as its
+            // Control replies. This listener shares the enrolled actor's
+            // identity and has its own listening address.
+            assert_eq!(
+                WorkerIdentity::from(&actor),
+                WorkerIdentity::from(&config.from)
+            );
+            (shared.clone(), client.clone())
+        } else {
+            let authority_resources = WorkerSharedResources::new(
+                2,
+                WorkerResources::default(),
+                SharedResourceConfig::default(),
+            )
+            .unwrap();
+            let authority = WorkerTransport::new(
+                &actor,
+                &tls,
+                authority_resources.clone(),
+                directory.clone(),
+                Arc::new(EndpointRegistry::new(authority_resources.clone())),
+                TransportConfig::default(),
+            )
+            .unwrap()
+            .client();
+            (authority_resources, authority)
+        };
+        let control =
+            ControlClient::new(authority, authority_resources, config.group.clone(), routes)
+                .unwrap();
         if std::env::var_os("NABEDRA_REP5_REFRESH_BOOTSTRAP").is_some() {
             let peers: Vec<_> = config.targets.iter().map(WorkerIdentity::from).collect();
             directory
@@ -865,6 +882,18 @@ async fn replacement_peer_probe(config: PathBuf) {
         // and refreshed by its own task, as in `data_worker_process`.
         directory.seed_remote_revocations(&*control).await.unwrap();
         let (_refresh_stop, refresh_stopped) = tokio::sync::watch::channel(false);
+        if let Some(routes) = &published {
+            tokio::spawn(
+                routes
+                    .clone()
+                    .run_refresh(control.clone(), refresh_stopped.clone()),
+            );
+            tokio::spawn(
+                directory
+                    .clone()
+                    .run_refresh(control.clone(), refresh_stopped.clone()),
+            );
+        }
         tokio::spawn(
             directory
                 .clone()
@@ -872,8 +901,26 @@ async fn replacement_peer_probe(config: PathBuf) {
         );
         // D01-style budget evidence: this process's Control reads, by kind.
         let stats = config.directory.join("stats.json");
+        let voters_path = config.directory.join("control-voters.json");
+        let revoked_path = config.directory.join("revoked-workers.json");
+        let directory_view = directory.clone();
         tokio::spawn(async move {
             loop {
+                if let Some(routes) = &published {
+                    let voters = routes.quorum_voters().unwrap();
+                    let temporary = voters_path.with_extension("tmp");
+                    std::fs::write(&temporary, serde_json::to_vec(&voters).unwrap()).unwrap();
+                    std::fs::rename(&temporary, &voters_path).unwrap();
+                    let revoked: Vec<_> = config
+                        .targets
+                        .iter()
+                        .filter(|peer| directory_view.revoked(WorkerIdentity::from(*peer)))
+                        .map(|peer| peer.worker_id)
+                        .collect();
+                    let temporary = revoked_path.with_extension("tmp");
+                    std::fs::write(&temporary, serde_json::to_vec(&revoked).unwrap()).unwrap();
+                    std::fs::rename(&temporary, &revoked_path).unwrap();
+                }
                 let temporary = stats.with_extension("tmp");
                 let snapshot = crate::oltp_runtime::stage_timing::snapshot();
                 if std::fs::write(&temporary, serde_json::to_vec(&snapshot).unwrap()).is_ok() {
@@ -962,6 +1009,25 @@ async fn replacement_peer_probe(config: PathBuf) {
         std::fs::write(&temporary, serde_json::to_vec(&observed).unwrap()).unwrap();
         std::fs::rename(temporary, output).unwrap();
     }
+}
+
+#[test]
+#[ignore = "Linux process test with passwordless sudo, run through the CI tests input"]
+fn o17_control_voter_refresh_process() {
+    let binary = std::env::var_os("NABEDRA_BIN").expect("CI server binary");
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/oltp_recovery_operations.py");
+    let status = std::process::Command::new("python3")
+        .arg(script)
+        .arg("--binary")
+        .arg(binary)
+        .arg("--test-executable")
+        .arg(std::env::current_exe().unwrap())
+        .args(["--suite", "replacement-voter-refresh"])
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .status()
+        .expect("launch O17 Control voter refresh fixture");
+    assert!(status.success(), "O17 Control voter refresh fixture failed");
 }
 
 #[test]

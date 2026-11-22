@@ -233,7 +233,7 @@ impl RegisteredWorker {
         &self,
         identity: GroupIdentity,
     ) -> Result<GroupStore, ProtocolError> {
-        if self.cold.is_some() || self.rolling.is_some() {
+        if self.system_replacement.is_none() && (self.cold.is_some() || self.rolling.is_some()) {
             self.pool.retained_group(identity).await
         } else {
             self.pool.group(identity).await
@@ -262,6 +262,15 @@ impl RegisteredWorker {
         Ok(())
     }
 
+    fn replacement_catch_up_before(&self, group: &GroupIdentity) -> Option<u64> {
+        let record = self.system_replacement.as_ref()?;
+        record
+            .groups
+            .iter()
+            .find(|plan| plan.expected.identity == *group)
+            .map(|plan| plan.expected.membership_position.index)
+    }
+
     /// Start the listener before calling this method. All groups start before
     /// waiting for a leader so another process can complete their quorum.
     pub(crate) async fn start_system_groups(
@@ -281,6 +290,7 @@ impl RegisteredWorker {
                     self.open_system_store(group.identity.clone()).await?,
                     local.clone(),
                     group.members(),
+                    self.replacement_catch_up_before(&group.identity),
                     config.clone(),
                     self.directory.clone(),
                 )
@@ -294,10 +304,11 @@ impl RegisteredWorker {
             let group = &self.placements.timestamps;
             let running = self
                 .manager
-                .start_timestamps(
-                    self.open_system_store(group.identity.clone()).await?,
+                .start(
+                    TimestampMachine::new(self.open_system_store(group.identity.clone()).await?)?,
                     local.clone(),
                     group.members(),
+                    self.replacement_catch_up_before(&group.identity),
                     config.clone(),
                 )
                 .await?;
@@ -309,12 +320,16 @@ impl RegisteredWorker {
         let mut status = Vec::new();
         for group in self.placements.status_groups() {
             if let Some(local) = group.local(worker) {
-                let running = self.manager.start_status(
-                    self.open_system_store(group.identity.clone()).await?,
-                    local.clone(),
-                    group.members(),
-                    config.clone(),
-                ).await?;
+                let running = self
+                    .manager
+                    .start(
+                        StatusMachine::new(self.open_system_store(group.identity.clone()).await?)?,
+                        local.clone(),
+                        group.members(),
+                        self.replacement_catch_up_before(&group.identity),
+                        config.clone(),
+                    )
+                    .await?;
                 self.check_system_group(&running, group, &local).await?;
                 status.push(running);
             }
@@ -323,10 +338,11 @@ impl RegisteredWorker {
             let group = &self.placements.catalog;
             let running = self
                 .manager
-                .start_catalog(
-                    self.open_system_store(group.identity.clone()).await?,
+                .start(
+                    ParticipantMachine::new(self.open_system_store(group.identity.clone()).await?)?,
                     local.clone(),
                     group.members(),
+                    self.replacement_catch_up_before(&group.identity),
                     config,
                 )
                 .await?;
@@ -608,6 +624,9 @@ impl RegisteredWorker {
             })
             .await
             .map_err(|_| unavailable())??;
+            if cold.is_some() && !replacement_mount_committed {
+                return Err(invalid());
+            }
             restart_mount = Some(mount);
         }
         let mut restored = None;
@@ -1008,7 +1027,11 @@ fn install_replacement_placements(
     let intent = &record.intent;
     intent.validate()?;
     if config.required_voters != 3
-        || config.cold.is_some() || config.rolling.is_some() || config.restore.is_some()
+        || config
+            .cold
+            .is_some_and(|cold| cold.previous_run != intent.run_id)
+        || config.rolling.is_some()
+        || config.restore.is_some()
         || !config.secondary_pools.is_empty()
         || config.enrollment != intent.next
         || config.mount.as_ref() != Some(&intent.mount)

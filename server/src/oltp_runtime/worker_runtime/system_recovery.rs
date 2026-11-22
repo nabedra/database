@@ -171,7 +171,7 @@ impl WorkerRuntime {
                 record.intent.previous == check.previous && record.intent.run_id == check.run_id
             })
             .ok_or_else(|| conflict("system replacement intent or run differs from Control"))?;
-        let (_, mounted, complete) = control
+        let (_, mounted, complete, _) = control
             .replacement_record_local(record.intent.id)
             .await?
             .ok_or_else(quorum_unavailable)?;

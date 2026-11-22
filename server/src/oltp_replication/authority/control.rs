@@ -23,8 +23,10 @@ pub(crate) use direct::{
     DirectCapability, DirectCapabilityOperation, DirectFeatures, FeatureActivation,
     INDEX_RECLAIM_FEATURE, QUEUED_SNAPSHOT_RETRY_FEATURE, cluster_feature, feature_operation_id,
 };
+pub(crate) use endpoint::{
+    ControlClient, ControlEndpoint, ControlRoutes, PublishedControlRoutes, ReplicaRoutes,
+};
 pub(crate) use features::{EnabledFeatures, spawn_watch as watch_cluster_features};
-pub(crate) use endpoint::{ControlClient, ControlEndpoint, ControlRoutes, ReplicaRoutes};
 pub(crate) use forwarding::{DataWorkerClient, ForwardedControl, HostedControlEndpoint};
 pub(crate) use group_damage::{
     GroupDamageReason, GroupDamageRecord, GroupDamageReplacement, GroupDamageReplacementPlan,

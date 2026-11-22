@@ -71,6 +71,16 @@ impl Recovery {
         previous: WorkerIdentity,
         suffix: u128,
     ) -> (ReplacementRecord, RestartMountKey) {
+        self.prepare_groups(previous, suffix, vec![self.group.clone()])
+            .await
+    }
+
+    async fn prepare_groups(
+        &mut self,
+        previous: WorkerIdentity,
+        suffix: u128,
+        mut records: Vec<GroupRecord>,
+    ) -> (ReplacementRecord, RestartMountKey) {
         let key = RestartMountKey::from_seed(&[7; 32]).unwrap();
         let next = worker(self.fixture.base + suffix);
         let state = self.fixture.state().await;
@@ -96,8 +106,11 @@ impl Recovery {
             next,
             mount_public_key: Some(key.public_key()),
         };
-        let groups =
-            vec![ReplacementGroup::new(self.group.clone(), self.members.clone(), &intent).unwrap()];
+        records.sort_unstable_by_key(|record| record.identity.group_id);
+        let groups = records
+            .into_iter()
+            .map(|record| ReplacementGroup::new(record, self.members.clone(), &intent).unwrap())
+            .collect::<Vec<_>>();
         let evidence = serialized_digest(&(
             &intent,
             state.ready,
@@ -144,11 +157,26 @@ impl Recovery {
     }
 
     async fn publish(&mut self, record: &ReplacementRecord) {
+        self.group = self.publish_group(record, &self.group.clone()).await;
+        self.members = record
+            .groups
+            .iter()
+            .find(|plan| plan.expected.identity == self.group.identity)
+            .unwrap()
+            .next(record.intent.previous.worker_id)
+            .unwrap();
+    }
+
+    async fn publish_group(
+        &mut self,
+        record: &ReplacementRecord,
+        expected: &GroupRecord,
+    ) -> GroupRecord {
         let id = record.intent.id;
-        let group = self.group.identity.group_id;
+        let group = expected.identity.group_id;
         let applied = AppliedPosition {
-            index: self.group.membership_position.index + 10,
-            ..self.group.membership_position
+            index: expected.membership_position.index + 10,
+            ..expected.membership_position
         };
         let evidence = serialized_digest(&(id, group, applied)).unwrap();
         let reply = self
@@ -165,10 +193,9 @@ impl Recovery {
         let ControlReply::SystemReplacementPublished(next) = reply else {
             panic!("{reply:?}")
         };
-        self.group = next;
-        self.members = record.groups[0]
-            .next(record.intent.previous.worker_id)
-            .unwrap();
+        assert_eq!(next.identity, expected.identity);
+        assert_eq!(next.membership_position, applied);
+        next
     }
 
     async fn seed(
@@ -232,16 +259,12 @@ fn authorized(
     }
 }
 
-#[tokio::test]
-async fn r04_o17_cold_publication_retires_the_unmounted_intent() {
-    let directory = Directory::new();
-    let mut recovery = Recovery::open(&directory).await;
-    let (record, key) = recovery.prepare(recovery.voters[2], 4).await;
+async fn cold_fence(recovery: &mut Recovery, groups: &[GroupRecord]) -> ReadyMembership {
     let expected = recovery.fixture.state().await.ready;
     let transition = Uuid::new_v4();
     let ControlReply::FenceBegun {
         next,
-        required_groups: 1,
+        required_groups,
         ..
     } = recovery
         .fixture
@@ -255,6 +278,26 @@ async fn r04_o17_cold_publication_retires_the_unmounted_intent() {
     else {
         panic!("cold fence did not begin")
     };
+    assert_eq!(required_groups, 1 + groups.len() as u64);
+    for group in groups {
+        assert!(matches!(
+            recovery
+                .fixture
+                .apply(ControlCommand::GroupFenced {
+                    operation_id: Uuid::new_v4(),
+                    receipt: GroupFenceReceipt {
+                        group: group.identity.clone(),
+                        transition_id: transition,
+                        expected: Some(expected.view.authority()),
+                        next: next.view.authority(),
+                        applied_at: group.membership_position,
+                        command_digest: hash(b"cold group fence"),
+                    },
+                })
+                .await,
+            ControlReply::FenceProgress { .. }
+        ));
+    }
     assert!(matches!(
         recovery
             .fixture
@@ -287,6 +330,15 @@ async fn r04_o17_cold_publication_retires_the_unmounted_intent() {
             owner: None
         }
     );
+    next
+}
+
+#[tokio::test]
+async fn r04_o17_cold_publication_retires_the_unmounted_intent() {
+    let directory = Directory::new();
+    let mut recovery = Recovery::open(&directory).await;
+    let (record, key) = recovery.prepare(recovery.voters[2], 4).await;
+    let next = cold_fence(&mut recovery, &[]).await;
     assert_eq!(
         recovery.get::<bool>(abandoned(record.intent.id)).await,
         Some(true)
@@ -306,6 +358,54 @@ async fn r04_o17_cold_publication_retires_the_unmounted_intent() {
         .add_ready(recovery.voters[0], &mut Vec::new())
         .await;
     let (next_record, _) = recovery.prepare(recovery.voters[2], 5).await;
+    assert_eq!(next_record.intent.run_id, next.view.run_id);
+}
+
+#[tokio::test]
+async fn r04_o17_cold_fence_after_mount_completes_publication() {
+    let directory = Directory::new();
+    let mut recovery = Recovery::open(&directory).await;
+    let timestamps = recovery
+        .fixture
+        .register_group(GroupKind::Timestamps, recovery.members.to_vec())
+        .await;
+    let (record, key) = recovery
+        .prepare_groups(
+            recovery.voters[2],
+            4,
+            vec![recovery.group.clone(), timestamps.clone()],
+        )
+        .await;
+    assert_eq!(
+        recovery.mount(&record, &key).await,
+        ControlReply::SystemReplacementMounted
+    );
+    let published = recovery.publish_group(&record, &timestamps).await;
+    let next = cold_fence(&mut recovery, &[published.clone()]).await;
+    assert_ne!(next.view.run_id, record.intent.run_id);
+    assert_eq!(
+        recovery.get::<Uuid>(ACTIVE.to_vec()).await,
+        Some(record.intent.id)
+    );
+    assert_eq!(
+        recovery.publish_group(&record, &timestamps).await,
+        published
+    );
+
+    recovery.publish(&record).await;
+    assert_eq!(recovery.get::<Uuid>(ACTIVE.to_vec()).await, None);
+    assert!(
+        recovery
+            .members
+            .iter()
+            .any(|member| member.worker_id == record.intent.next.worker_id)
+    );
+    assert_eq!(recovery.fixture.state().await.ready, next);
+    recovery
+        .fixture
+        .add_ready(recovery.voters[0], &mut Vec::new())
+        .await;
+    let (next_record, _) = recovery.prepare(recovery.voters[1], 5).await;
     assert_eq!(next_record.intent.run_id, next.view.run_id);
 }
 

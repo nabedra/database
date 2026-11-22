@@ -634,11 +634,13 @@ impl HostedGroupManager {
         store: GroupStore,
         local: ReplicaMember,
         peers: BTreeMap<u64, ReplicaMember>,
+        catch_up_before: Option<u64>,
         config: openraft::Config,
         directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
     ) -> Result<ManagedControl, ProtocolError> {
         let machine = ControlMachine::new(store)?.with_replacement_directory(directory).await?;
-        self.start(machine, local, peers, None, config).await
+        self.start(machine, local, peers, catch_up_before, config)
+            .await
     }
     pub(crate) async fn start_timestamps(
         &self,

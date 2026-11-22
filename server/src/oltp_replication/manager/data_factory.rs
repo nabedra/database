@@ -287,13 +287,20 @@ impl DataGroupFactory {
             if !matches!(group.kind, GroupKind::Data { .. }) {
                 continue;
             }
-            let running = self.manager.start_data(
-                self.pool.group(group.clone()).await?,
-                plan.learner.clone(),
-                plan.old.iter().chain(std::iter::once(&plan.learner))
-                    .map(|member| (member.node_id, member.clone())).collect(),
-                self.config.clone(),
-            ).await?;
+            let running = self
+                .manager
+                .start_data_with_bootstrap(
+                    self.pool.group(group.clone()).await?,
+                    plan.learner.clone(),
+                    plan.old
+                        .iter()
+                        .chain(std::iter::once(&plan.learner))
+                        .map(|member| (member.node_id, member.clone()))
+                        .collect(),
+                    Some(plan.expected.membership_position.index),
+                    self.config.clone(),
+                )
+                .await?;
             self.wire_participant(group, plan.learner.node_id, running)?;
         }
         Ok(())

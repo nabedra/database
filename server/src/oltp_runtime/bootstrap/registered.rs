@@ -342,9 +342,9 @@ impl LocalServices {
                     cold::verify_workers(&worker, &control)
                 })
                 .await?;
-                cold::verify_system_groups(&worker, &rpc, deadline, &error_trace).await?;
+                cold::verify_system_groups(&worker, &control, &rpc, deadline, &error_trace).await?;
             } else if rolling {
-                cold::verify_system_groups(&worker, &rpc, deadline, &error_trace).await?;
+                cold::verify_system_groups(&worker, &control, &rpc, deadline, &error_trace).await?;
             } else {
                 let state = startup_read(deadline, &error_trace, "Control inspect", || control.inspect()).await?.ok_or_else(unavailable)?;
                 let authority = state.ready.view.authority();
@@ -496,6 +496,7 @@ impl LocalServices {
                     directory.refresh(&rpc).await.map_err(|error|
                         if error.code == ErrorCode::Unauthorized { unavailable() } else { error })
                 }).await?;
+                directory.set_cold_bootstrap(false);
             } else if rolling {
                 startup_read(deadline, &error_trace, "rolling retained Data groups", || factory.rehost_retained(&pools)).await?;
             } else if worker.restored.is_none() {
