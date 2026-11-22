@@ -37,7 +37,8 @@ use crate::{
 use nabedra_kv::fs::{FaultFs, Fs};
 use openraft::RaftLogReader;
 use std::{collections::BTreeSet, path::PathBuf, time::Duration};
-use tokio::{net::TcpListener, sync::watch, time::timeout};
+use nabedra_rt::time::timeout;
+use tokio::{net::TcpListener, sync::watch};
 use uuid::Uuid;
 
 const WORKERS: usize = 5;
@@ -183,25 +184,25 @@ impl Cluster {
     /// Starts every worker, Control and g, registers g in Control and makes
     /// `writes` acknowledged writes to g. Workers in `silent` offer no pool.
     async fn new(writes: u64, silent: &[usize]) -> Self {
-        let dir = Temporary(std::env::temp_dir().join(format!("ns14b-{}", Uuid::new_v4())));
+        let dir = Temporary(std::env::temp_dir().join(format!("ns14b-{}", nabedra_rt::ids::uuid_v4())));
         std::fs::create_dir(&dir.0).unwrap();
         let tls = tls::certificates(&dir.0, WORKERS as u64);
-        let cluster = Uuid::new_v4();
+        let cluster = nabedra_rt::ids::uuid_v4();
         let database = Text::try_from("ns14b").unwrap();
         let control = GroupIdentity {
             cluster_id: cluster,
             database: database.clone(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Control,
             group_format_version: 1,
         };
         let group = GroupIdentity {
             cluster_id: cluster,
             database,
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Data {
-                table_id: Uuid::new_v4(),
-                shard_id: Uuid::new_v4(),
+                table_id: nabedra_rt::ids::uuid_v4(),
+                shard_id: nabedra_rt::ids::uuid_v4(),
             },
             group_format_version: 1,
         };
@@ -210,8 +211,8 @@ impl Cluster {
         for material in &tls {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             enrollments.push(WorkerEnrollment {
-                worker_id: Uuid::new_v4(),
-                incarnation: Uuid::new_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                incarnation: nabedra_rt::ids::uuid_v4(),
                 certificate_sha256: Digest::parse(material.certificate_sha256()).unwrap(),
                 enrollment_revision: 1,
                 endpoint: Text::new(listener.local_addr().unwrap().to_string()).unwrap(),
@@ -234,14 +235,14 @@ impl Cluster {
         let mut cluster = Self {
             dir,
             tls,
-            pools: (0..WORKERS).map(|_| Uuid::new_v4()).collect(),
+            pools: (0..WORKERS).map(|_| nabedra_rt::ids::uuid_v4()).collect(),
             enrollments,
             directory,
             control,
             group,
             pins,
             workers: Vec::new(),
-            run_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
             term: 0,
         };
         for (index, listener) in listeners.into_iter().enumerate() {
@@ -377,12 +378,12 @@ impl Cluster {
         );
         let manager = HostedGroupManager::new(shared.clone(), transport.client(), registry);
         let (stop, mut stopped) = watch::channel(false);
-        let transport = tokio::spawn(transport.run(listener, async move {
+        let transport = nabedra_rt::task::spawn(transport.run(listener, async move {
             let _ = stopped.wait_for(|stop| *stop).await;
         }));
         if create {
             let flushing = pool.clone();
-            tokio::task::spawn_blocking(move || flushing.kv_store().flush().unwrap())
+            nabedra_rt::task::spawn_blocking(move || flushing.kv_store().flush().unwrap())
                 .await
                 .unwrap();
         }
@@ -564,7 +565,7 @@ impl Cluster {
                     Ok(value) => return value,
                     Err(error) => {
                         tracing::debug!(what, %error, "retrying");
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        nabedra_rt::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
             }
@@ -576,14 +577,14 @@ impl Cluster {
     /// Initializes Control, enrolls every worker and registers g.
     async fn bootstrap_control(&self) {
         let (handle, permit) = self.handle();
-        let run = Uuid::new_v4();
+        let run = nabedra_rt::ids::uuid_v4();
         Self::retry("initialize Control", || {
             handle.initialize_local(&permit, run, run)
         })
         .await;
         let operator = self.identity(CONTROL[0]);
         for index in 0..WORKERS {
-            let operation = Uuid::new_v4();
+            let operation = nabedra_rt::ids::uuid_v4();
             let next = self.enrollments[index].clone();
             let group = self.control.clone();
             Self::retry("enroll", || {
@@ -594,7 +595,7 @@ impl Cluster {
                     operator,
                     group.clone(),
                     Purpose::Authority,
-                    Uuid::new_v4(),
+                    nabedra_rt::ids::uuid_v4(),
                 );
                 async move { handle.enroll(&session, operation, None, next, None).await }
             })
@@ -617,21 +618,21 @@ impl Cluster {
             .ready
             .view
             .authority();
-        let generation = Uuid::new_v4();
-        let operation = Uuid::new_v4();
+        let generation = nabedra_rt::ids::uuid_v4();
+        let operation = nabedra_rt::ids::uuid_v4();
         Self::retry("begin g", || {
             handle.begin_group_local(&permit, operation, generation, self.group.clone())
         })
         .await;
         let page = Page::new(self.data_members().into_values().collect()).unwrap();
-        let operation = Uuid::new_v4();
+        let operation = nabedra_rt::ids::uuid_v4();
         Self::retry("page g", || {
             handle.group_page_local(&permit, operation, generation, page.clone())
         })
         .await;
         let proof = VerifiedMembership::from_consensus(observation, generation, authority).unwrap();
         handle
-            .seal_group_local(&permit, Uuid::new_v4(), proof)
+            .seal_group_local(&permit, nabedra_rt::ids::uuid_v4(), proof)
             .await
             .unwrap();
         assert_eq!(
@@ -681,7 +682,7 @@ impl Cluster {
                         return index;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
@@ -705,9 +706,9 @@ impl Cluster {
         self.term = 1;
         self.participant(leader)
             .fence_initial(
-                Uuid::new_v4(),
+                nabedra_rt::ids::uuid_v4(),
                 self.authority(1),
-                Uuid::new_v4(),
+                nabedra_rt::ids::uuid_v4(),
                 1,
                 1,
                 KeySpan {
@@ -723,7 +724,7 @@ impl Cluster {
         let receipt = self
             .participant(leader)
             .fence_current(
-                Uuid::new_v4(),
+                nabedra_rt::ids::uuid_v4(),
                 self.authority(self.term),
                 self.authority(self.term + 1),
             )
@@ -761,7 +762,7 @@ impl Cluster {
                 {
                     return record;
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(100)).await;
             }
         })
         .await
@@ -840,7 +841,7 @@ impl Cluster {
         // The reporter polls Control with a backoff of up to 30 s.
         timeout(Duration::from_secs(90), async {
             while pool.is_group_quarantined(self.group.group_id) {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
@@ -942,7 +943,7 @@ async fn ns23_o06_o17_ns14b_g1_damage_is_replaced_by_control_and_rule5_holds_wit
                 {
                     return plan.clone();
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(100)).await;
             }
         })
         .await
@@ -957,7 +958,7 @@ async fn ns23_o06_o17_ns14b_g1_damage_is_replaced_by_control_and_rule5_holds_wit
             .contains(&plan.replacement.worker_id),
             "the fresh replica is on a worker that hosts no member of g"
         );
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        nabedra_rt::time::sleep(Duration::from_secs(5)).await;
         let held = cluster.record().await.unwrap();
         assert!(
             matches!(held.phase, GroupDamagePhase::Replacing { .. }),
@@ -1004,14 +1005,14 @@ async fn damage_at_run_time(cluster: &mut Cluster, kind: RunTime) {
     let term = cluster.term;
     timeout(Duration::from_secs(60), async {
         while Cluster::applied_term(&host).await != term {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("worker 2 applied every acknowledged write");
     drop(host);
     let flushing = cluster.running(DAMAGED).pool.clone();
-    tokio::task::spawn_blocking(move || flushing.kv_store().flush().unwrap())
+    nabedra_rt::task::spawn_blocking(move || flushing.kv_store().flush().unwrap())
         .await
         .unwrap();
     let path = cluster.pool_path(DAMAGED);
@@ -1083,7 +1084,7 @@ async fn run_time_damage_is_replaced_by_control(kind: RunTime, reason: GroupDama
     let manager = cluster.running(DAMAGED).manager.clone();
     timeout(Duration::from_secs(10), async {
         while !manager.hosted_replicas(cluster.group.group_id).is_empty() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -1136,7 +1137,7 @@ async fn ns23_o17_ns14b_control_leader_change_mid_replacement_resumes_the_same_p
                 || raw.ensure_linearizable().await.is_err()
             {
                 let _ = raw.raft.trigger().elect(false).await;
-                tokio::time::sleep(Duration::from_millis(700)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(700)).await;
             }
         })
         .await

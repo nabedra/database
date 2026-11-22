@@ -36,10 +36,10 @@ impl PlacementCatalog<'_> {
         }
         let mut cursor = root.first_page;
         let mut route_digest = None;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = nabedra_rt::time::now() + Duration::from_secs(30);
         while let Some(page_id) = cursor {
             let (_, page) = record(
-                tokio::time::timeout_at(
+                nabedra_rt::time::timeout_at(
                     deadline,
                     self.catalog.routing_page(&pin, table_id, page_id),
                 )

@@ -57,7 +57,7 @@ impl RestartMount {
                 SystemRandom::new().fill(&mut seed).map_err(|_| invalid())?;
                 let temporary = owner
                     .path
-                    .join(format!("restart-key-{}.next", Uuid::new_v4()));
+                    .join(format!("restart-key-{}.next", nabedra_rt::ids::uuid_v4()));
                 let mut output = private_file(&temporary, true).map_err(storage)?;
                 output.write_all(&seed).map_err(storage)?;
                 output.sync_all().map_err(storage)?;

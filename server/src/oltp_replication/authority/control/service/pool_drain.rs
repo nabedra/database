@@ -283,7 +283,7 @@ impl ControlHandle {
     ) -> Result<PoolDrainRecord, ProtocolError> {
         self.pool_drain_submit(
             permit,
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             PoolDrainCommand::Prepare { id, revision },
         )
         .await
@@ -302,7 +302,7 @@ impl ControlHandle {
         }
         self.pool_drain_submit(
             permit,
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             PoolDrainCommand::Closed {
                 id: closed.close_id,
                 mount: Box::new(observed.clone().into()),

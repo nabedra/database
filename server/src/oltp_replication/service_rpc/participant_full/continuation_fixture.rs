@@ -27,7 +27,7 @@ fn write(base: &PathBuf, suffix: &str, value: Value) {
             .unwrap()
             .trim_end_matches("-enabled")
     ));
-    let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    let temporary = path.with_extension(format!("{}.tmp", nabedra_rt::ids::uuid_v4()));
     std::fs::write(&temporary, serde_json::to_vec(&value).unwrap()).unwrap();
     std::fs::rename(temporary, path).unwrap();
 }
@@ -95,13 +95,13 @@ pub(super) async fn checkpoint(
         "waiting",
         json!({"scope": scope, "input": input(payload), "digest": hash}),
     );
-    let deadline = Instant::now() + Duration::from_secs(240);
+    let deadline = nabedra_rt::time::now() + Duration::from_secs(240);
     while !release.is_file() {
         assert!(
-            Instant::now() < deadline,
+            nabedra_rt::time::now() < deadline,
             "scan continuation fixture timed out"
         );
-        sleep_until(Instant::now() + Duration::from_millis(25)).await;
+        sleep_until(nabedra_rt::time::now() + Duration::from_millis(25)).await;
     }
     Some(HeldContinuation(base))
 }

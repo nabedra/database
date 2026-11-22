@@ -1224,7 +1224,7 @@ impl Endpoint for TimestampEndpoint {
         Box::pin(async move {
             let head = self.parse(session, bytes)?;
             if let Method::TimestampPointDecisionRead { route, source_digest, .. } = head.method {
-                tokio::time::timeout(
+                nabedra_rt::time::timeout(
                     SERVICE_CONVERGENCE,
                     self.control.verify_timestamp_point_decision_route(
                         session, self.node, route, head.action, source_digest,

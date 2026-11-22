@@ -683,7 +683,7 @@ impl Endpoint for ParticipantEndpoint {
                 let scope = grant.scope;
                 // The transport deadline and requester disconnect cannot
                 // cancel a native job or release its ticket.
-                return tokio::spawn(async move {
+                return nabedra_rt::task::spawn(async move {
                     let result = async {
                         let queue_scope = crate::oltp_runtime::replica::QueueScope {
                             cluster_id: session.group().cluster_id,
@@ -1417,7 +1417,7 @@ impl RemoteParticipant for ParticipantClient {
                         client.action,
                         method,
                         Some(payload),
-                        Some(Instant::now() + SERVICE_CONVERGENCE),
+                        Some(nabedra_rt::time::now() + SERVICE_CONVERGENCE),
                     )
                     .await?
             } else {

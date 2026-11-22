@@ -69,8 +69,8 @@ async fn assert_pending<T>(waiter: Pin<&mut impl Future<Output = T>>) {
 
 fn identity() -> WorkerIdentity {
     WorkerIdentity {
-        worker_id: Uuid::new_v4(),
-        incarnation: Uuid::new_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         certificate_sha256: Digest::from_bytes([1; 32]),
         enrollment_revision: 1,
     }
@@ -90,14 +90,14 @@ fn o05_m02_failed_replica_reservation_releases_unused_group_capacity() {
     .unwrap();
     let registry = EndpointRegistry::new(shared.clone());
     let first = GroupIdentity {
-        cluster_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
         database: Text::try_from("capacity").unwrap(),
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Catalog,
         group_format_version: 1,
     };
     let second = GroupIdentity {
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         ..first.clone()
     };
     let (group, replica) = registry.reserve_replica(first.clone(), 1).unwrap();
@@ -158,7 +158,7 @@ async fn o14_o22_c07_f03_hostname_lookup_owns_slots_across_cancellations() {
         Err(ResolveError::LocallyUnavailable)
     ));
     let replacement = WorkerIdentity {
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         enrollment_revision: 2,
         ..first
     };
@@ -368,13 +368,13 @@ async fn r05_f03_queue_probe_resolver_contention_is_indeterminate() {
     };
 
     let temp =
-        TestDirectoryPath(std::env::temp_dir().join(format!("probe-dns-{}", Uuid::new_v4())));
+        TestDirectoryPath(std::env::temp_dir().join(format!("probe-dns-{}", nabedra_rt::ids::uuid_v4())));
     std::fs::create_dir(&temp.0).unwrap();
     let tls = tls::certificates(&temp.0, 2);
     let group = GroupIdentity {
-        cluster_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
         database: Text::try_from("probe").unwrap(),
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Control,
         group_format_version: 1,
     };
@@ -384,7 +384,7 @@ async fn r05_f03_queue_probe_resolver_contention_is_indeterminate() {
     };
     let ready = ReadyMembership {
         view: AuthorityView {
-            run_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
             owner_term: 1,
             membership_revision: 1,
         },
@@ -395,8 +395,8 @@ async fn r05_f03_queue_probe_resolver_contention_is_indeterminate() {
     let (resolver, mut lookup) =
         GatedLookup::resolver(&[GONE, OTHER], listener.local_addr().unwrap());
     let enrollment = |index: usize, endpoint: &str| WorkerEnrollment {
-        worker_id: Uuid::new_v4(),
-        incarnation: Uuid::new_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         enrollment_revision: 1,
         certificate_sha256: Digest::parse(tls[index].certificate_sha256()).unwrap(),
         endpoint: Text::try_from(endpoint).unwrap(),
@@ -444,7 +444,7 @@ async fn r05_f03_queue_probe_resolver_contention_is_indeterminate() {
     let probe =
         |peer: &WorkerEnrollment| queue.probe(WorkerIdentity::from(peer), scope.clone(), ready);
     let (stop, shutdown) = oneshot::channel();
-    let worker = tokio::spawn(receiver.run(listener, async {
+    let worker = nabedra_rt::task::spawn(receiver.run(listener, async {
         let _ = shutdown.await;
     }));
 
@@ -514,21 +514,21 @@ async fn r05_f03_queue_probe_resolver_contention_is_indeterminate() {
 /// transport while both ordinary DNS slots remain occupied.
 #[tokio::test]
 async fn o14_o22_c07_f03_mtls_progress_survives_held_hostname_lookups() {
-    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("peer-dns-{}", Uuid::new_v4())));
+    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("peer-dns-{}", nabedra_rt::ids::uuid_v4())));
     std::fs::create_dir(&temp.0).unwrap();
     let tls = tls::certificates(&temp.0, 2);
     let group = GroupIdentity {
-        cluster_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
         database: Text::try_from("progress").unwrap(),
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Catalog,
         group_format_version: 1,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let enrollment = |index: usize, endpoint: Text<255>| WorkerEnrollment {
-        worker_id: Uuid::new_v4(),
-        incarnation: Uuid::new_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         enrollment_revision: 1,
         certificate_sha256: Digest::parse(tls[index].certificate_sha256()).unwrap(),
         endpoint,
@@ -574,7 +574,7 @@ async fn o14_o22_c07_f03_mtls_progress_survives_held_hostname_lookups() {
     Arc::get_mut(&mut caller.common).unwrap().resolver = resolver;
     let client = caller.client();
     let (stop, shutdown) = oneshot::channel();
-    let worker = tokio::spawn(receiver.run(listener, async {
+    let worker = nabedra_rt::task::spawn(receiver.run(listener, async {
         let _ = shutdown.await;
     }));
 
@@ -659,13 +659,13 @@ async fn o14_o22_c07_f03_mtls_progress_survives_held_hostname_lookups() {
 #[tokio::test]
 async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
     let temp =
-        TestDirectoryPath(std::env::temp_dir().join(format!("authority-{}", Uuid::new_v4())));
+        TestDirectoryPath(std::env::temp_dir().join(format!("authority-{}", nabedra_rt::ids::uuid_v4())));
     std::fs::create_dir(&temp.0).unwrap();
     let tls = tls::certificates(&temp.0, 2);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let enrollment = |index: usize, endpoint: String| WorkerEnrollment {
-        worker_id: Uuid::new_v4(),
-        incarnation: Uuid::new_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         enrollment_revision: 1,
         certificate_sha256: Digest::parse(tls[index].certificate_sha256()).unwrap(),
         endpoint: Text::new(endpoint).unwrap(),
@@ -699,9 +699,9 @@ async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
         .unwrap()
     };
     let group = GroupIdentity {
-        cluster_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
         database: Text::try_from("authority").unwrap(),
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Control,
         group_format_version: 1,
     };
@@ -716,7 +716,7 @@ async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
     let caller = transport(&caller, 1, 0);
     let client = caller.client();
     let (stop, shutdown) = oneshot::channel();
-    let worker = tokio::spawn(receiver.run(listener, async {
+    let worker = nabedra_rt::task::spawn(receiver.run(listener, async {
         let _ = shutdown.await;
     }));
     let used_bytes = || caller.common.shared.buffer_bytes_used(ByteClass::Progress);
@@ -758,7 +758,7 @@ async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
 
     timeout(Duration::from_secs(5), async {
         let held = client
-            .authority_slots(target.worker_id, Instant::now() + config.deadline)
+            .authority_slots(target.worker_id, nabedra_rt::time::now() + config.deadline)
             .await
             .unwrap();
         let mut pending = Box::pin(dependency(b"role"));
@@ -812,12 +812,12 @@ async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
 /// classes (Control consensus) are not affected.
 #[tokio::test]
 async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
-    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("lanes-{}", Uuid::new_v4())));
+    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("lanes-{}", nabedra_rt::ids::uuid_v4())));
     std::fs::create_dir(&temp.0).unwrap();
     let tls = tls::certificates(&temp.0, 1);
     let local = WorkerEnrollment {
-        worker_id: Uuid::new_v4(),
-        incarnation: Uuid::new_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         enrollment_revision: 1,
         certificate_sha256: Digest::parse(tls[0].certificate_sha256()).unwrap(),
         endpoint: Text::new("127.0.0.1:1".to_owned()).unwrap(),
@@ -839,7 +839,7 @@ async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
     let class = TrafficClass::DataConsensus;
     let lane = config.handler_slots[class as usize];
     let cap = lane * OUTGOING_CLASS_LANES;
-    let targets: Vec<Uuid> = (0..=OUTGOING_CLASS_LANES).map(|_| Uuid::new_v4()).collect();
+    let targets: Vec<Uuid> = (0..=OUTGOING_CLASS_LANES).map(|_| nabedra_rt::ids::uuid_v4()).collect();
     let mut held = Vec::new();
     // A paused peer holds only its own lane.
     for _ in 0..lane {
@@ -888,12 +888,12 @@ async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
 /// local, not-applied `OutgoingLaneFull`.
 #[tokio::test]
 async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
-    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("lanes-{}", Uuid::new_v4())));
+    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("lanes-{}", nabedra_rt::ids::uuid_v4())));
     std::fs::create_dir(&temp.0).unwrap();
     let tls = tls::certificates(&temp.0, 1);
     let local = WorkerEnrollment {
-        worker_id: Uuid::new_v4(),
-        incarnation: Uuid::new_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         enrollment_revision: 1,
         certificate_sha256: Digest::parse(tls[0].certificate_sha256()).unwrap(),
         endpoint: Text::new("127.0.0.1:1".to_owned()).unwrap(),
@@ -913,27 +913,27 @@ async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
         WorkerTransport::new(&local, &tls[0], shared, peers, registry, config.clone()).unwrap();
     let client = transport.client();
     let group = GroupIdentity {
-        cluster_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
         database: Text::try_from("direct").unwrap(),
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Data {
-            table_id: Uuid::new_v4(),
-            shard_id: Uuid::new_v4(),
+            table_id: nabedra_rt::ids::uuid_v4(),
+            shard_id: nabedra_rt::ids::uuid_v4(),
         },
         group_format_version: 1,
     };
     let class = TrafficClass::ApiIngress;
     let lane = config.handler_slots[class as usize];
-    let leader = Uuid::new_v4();
+    let leader = nabedra_rt::ids::uuid_v4();
     let reserve = |until| client.reserve_outgoing(&group, leader, Purpose::ApiIngress, until);
     // Waiting callers get `lane - 1` slots at once.
     let mut held = Vec::new();
     for _ in 0..lane - 1 {
-        held.push(reserve(Instant::now()).await.unwrap());
+        held.push(reserve(nabedra_rt::time::now()).await.unwrap());
     }
     // Their share is full: refused at the deadline, counted as a local refusal.
     let refused = transport.common.refusals.snapshot();
-    let start = Instant::now();
+    let start = nabedra_rt::time::now();
     assert!(matches!(
         reserve(start + Duration::from_millis(50)).await,
         Err(RequestError::OutgoingLaneFull { .. })
@@ -947,7 +947,7 @@ async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
         Err(RequestError::OutgoingLaneFull { .. })
     ));
     // A waiter gets the slot a finished request frees.
-    let waiter = tokio::spawn({
+    let waiter = nabedra_rt::task::spawn({
         let client = client.clone();
         let group = group.clone();
         async move {
@@ -956,18 +956,18 @@ async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
                     &group,
                     leader,
                     Purpose::ApiIngress,
-                    Instant::now() + Duration::from_secs(10),
+                    nabedra_rt::time::now() + Duration::from_secs(10),
                 )
                 .await
         }
     });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(20)).await;
     assert!(
         !waiter.is_finished(),
         "the waiter must wait while the lane is full"
     );
     held.pop();
-    let admitted = tokio::time::timeout(Duration::from_secs(5), waiter)
+    let admitted = nabedra_rt::time::timeout(Duration::from_secs(5), waiter)
         .await
         .expect("the freed slot admits the waiter")
         .unwrap()
@@ -986,12 +986,12 @@ async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
 /// `/v1/runtime/stats`; a waiting Authority probe that later succeeds is not.
 #[tokio::test]
 async fn ns11_f8_lane_full_refusals_are_counted_per_class() {
-    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("refusals-{}", Uuid::new_v4())));
+    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("refusals-{}", nabedra_rt::ids::uuid_v4())));
     std::fs::create_dir(&temp.0).unwrap();
     let tls = tls::certificates(&temp.0, 1);
     let local = WorkerEnrollment {
-        worker_id: Uuid::new_v4(),
-        incarnation: Uuid::new_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         enrollment_revision: 1,
         certificate_sha256: Digest::parse(tls[0].certificate_sha256()).unwrap(),
         endpoint: Text::new("127.0.0.1:1".to_owned()).unwrap(),
@@ -1016,7 +1016,7 @@ async fn ns11_f8_lane_full_refusals_are_counted_per_class() {
     });
     assert_eq!(client.lane_refusals(), empty);
     let class = TrafficClass::ApiObservation;
-    let target = Uuid::new_v4();
+    let target = nabedra_rt::ids::uuid_v4();
     let held: Vec<_> = (0..config.handler_slots[class as usize])
         .map(|_| client.try_outgoing(target, class).unwrap())
         .collect();
@@ -1048,7 +1048,7 @@ async fn ns11_f8_lane_full_refusals_are_counted_per_class() {
 fn g6_api_reaches_control_authority_at_a_newer_incarnation_only() {
     let enrollment = |revision| WorkerEnrollment {
         worker_id: Uuid::from_u128(7),
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         enrollment_revision: revision,
         certificate_sha256: Digest::from_bytes([3; 32]),
         endpoint: Text::new("127.0.0.1:1".to_owned()).unwrap(),
@@ -1068,9 +1068,9 @@ fn g6_api_reaches_control_authority_at_a_newer_incarnation_only() {
     directory.install_api(api.clone());
     directory.install(worker.clone());
     let control = GroupIdentity {
-        cluster_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
         database: Text::try_from("g6").unwrap(),
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Control,
         group_format_version: 1,
     };
@@ -1085,7 +1085,7 @@ fn g6_api_reaches_control_authority_at_a_newer_incarnation_only() {
         purpose,
         from: WorkerIdentity::from(from),
         to,
-        nonce: Uuid::new_v4(),
+        nonce: nabedra_rt::ids::uuid_v4(),
         header_len: 0,
     };
     let reached = |hello: &Hello, group: &GroupIdentity| audience(&directory, hello, group, &local);
@@ -1122,7 +1122,7 @@ fn g6_api_reaches_control_authority_at_a_newer_incarnation_only() {
     ));
     // An API whose own incarnation differs from its enrollment is not one.
     let impostor = WorkerEnrollment {
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         ..api
     };
     assert!(!reached(

@@ -472,7 +472,7 @@ impl DirectLink {
         // `not_applied`, and the leader gets only the time left. RD3: a
         // leader whose session negotiated direct admission takes up to
         // `direct_handler_slots` (its executor's in-flight bound) at once.
-        let start = tokio::time::Instant::now();
+        let start = nabedra_rt::time::now();
         let reservation = {
             let _timer =
                 crate::oltp_runtime::stage_timing::perf_stage!("gw.direct.lane_wait").timer();
@@ -595,10 +595,10 @@ mod tests {
     #[test]
     fn o02_direct_header_is_fixed_size_and_rejects_unknown_fields() {
         let header = DirectHeader {
-            table_id: Uuid::new_v4(),
+            table_id: nabedra_rt::ids::uuid_v4(),
             schema_epoch: u64::MAX,
             routing_epoch: u64::MAX,
-            request_id: Uuid::new_v4(),
+            request_id: nabedra_rt::ids::uuid_v4(),
             digest: Digest::from_bytes([0xab; 32]),
             deadline_ms: u32::MAX,
         };

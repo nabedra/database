@@ -121,16 +121,16 @@ async fn o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions() {
     let old_authority = prior.view.authority();
     let timestamps_group = fixture.machine.store().identity().clone();
     let status_group = GroupIdentity {
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Status { bucket: 0 },
         ..timestamps_group.clone()
     };
-    let table_id = Uuid::new_v4();
+    let table_id = nabedra_rt::ids::uuid_v4();
     let data_group = GroupIdentity {
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Data {
             table_id,
-            shard_id: Uuid::new_v4(),
+            shard_id: nabedra_rt::ids::uuid_v4(),
         },
         ..timestamps_group.clone()
     };
@@ -142,8 +142,8 @@ async fn o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions() {
     members.sort_by_key(|member| member.worker_id);
     let placement = ScopedQueuePlacement {
         group: data_group.clone(),
-        data_generation: Uuid::new_v4(),
-        queue_generation: Uuid::new_v4(),
+        data_generation: nabedra_rt::ids::uuid_v4(),
+        queue_generation: nabedra_rt::ids::uuid_v4(),
         view: prior.view,
         owner: members[0],
         members,
@@ -155,7 +155,7 @@ async fn o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions() {
         epoch: status_epoch,
         command: Box::new(command),
     };
-    let initial_fence = Uuid::new_v4();
+    let initial_fence = nabedra_rt::ids::uuid_v4();
     assert!(matches!(
         apply_status(
             &fixture.pool,
@@ -170,7 +170,7 @@ async fn o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions() {
         .await,
         StatusReply::Fenced(_)
     ));
-    let catalog_group_id = Uuid::new_v4();
+    let catalog_group_id = nabedra_rt::ids::uuid_v4();
     let data_fence = |transition_id, expected, next| ParticipantCommand::Fence {
         transition_id,
         expected,
@@ -196,7 +196,7 @@ async fn o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions() {
 
     let request = RequestBinding {
         run_id: old_authority.run_id,
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         digest: Digest::from_bytes([1; 32]),
         accepted_context: Digest::from_bytes([2; 32]),
     };
@@ -204,7 +204,7 @@ async fn o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions() {
         run_id: request.run_id,
         request_id: request.request_id,
         digest: request.digest,
-        nonce: Uuid::new_v4(),
+        nonce: nabedra_rt::ids::uuid_v4(),
     };
     let StatusReply::Identity(IdentityLookup::Reserved(reservation)) = apply_status(
         &fixture.pool,
@@ -232,8 +232,8 @@ async fn o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions() {
         database: timestamps_group.database.clone(),
         principal: Digest::from_bytes([3; 32]),
         policy_revision: 1,
-        ingress_id: Uuid::new_v4(),
-        ingress_incarnation: Uuid::new_v4(),
+        ingress_id: nabedra_rt::ids::uuid_v4(),
+        ingress_incarnation: nabedra_rt::ids::uuid_v4(),
         credential_expires_at_ms: None,
     };
     let TimestampReply::ScopedSnapshot {
@@ -246,7 +246,7 @@ async fn o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions() {
                 view: prior.view,
                 identity: identity.clone(),
                 reservation,
-                pin_id: Uuid::new_v4(),
+                pin_id: nabedra_rt::ids::uuid_v4(),
                 origin: origin.clone(),
             },
         ))
@@ -346,23 +346,23 @@ async fn o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions() {
             owner_term: prior.view.owner_term + 1,
             ..prior.view
         },
-        data_generation: Uuid::new_v4(),
+        data_generation: nabedra_rt::ids::uuid_v4(),
         owner: members[1],
         ..placement
     };
     let next_epoch = ScopedTimestampEpoch::from_placement(&next_placement).unwrap();
     assert!(matches!(fixture.apply(TimestampCommand::FenceScopedQueue {
-        transition_id: Uuid::new_v4(), previous: epoch, next: next_epoch,
+        transition_id: nabedra_rt::ids::uuid_v4(), previous: epoch, next: next_epoch,
     }).await, TimestampReply::ScopedQueueFenced { epoch, .. } if epoch == next_epoch));
     assert_eq!(
         fixture.apply(delayed_commit.clone()).await,
         TimestampReply::Rejected(Fault::StaleReadyView)
     );
 
-    let transition_id = Uuid::new_v4();
+    let transition_id = nabedra_rt::ids::uuid_v4();
     let ready = ReadyMembership {
         view: AuthorityView {
-            run_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
             owner_term: prior.view.owner_term + 1,
             ..prior.view
         },
@@ -439,7 +439,7 @@ async fn o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions() {
         }))
     };
     assert_eq!(
-        fixture.apply(decide(Uuid::new_v4())).await,
+        fixture.apply(decide(nabedra_rt::ids::uuid_v4())).await,
         TimestampReply::Rejected(Fault::InvalidBinding)
     );
     let timestamp_position = position(1, fixture.next);

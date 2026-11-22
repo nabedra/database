@@ -23,7 +23,7 @@ pub(crate) fn record(
         "ticket": ticket, "worker": worker, "scope": scope,
     }))
     .unwrap();
-    let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    let temporary = path.with_extension(format!("{}.tmp", nabedra_rt::ids::uuid_v4()));
     std::fs::write(&temporary, bytes).unwrap();
     std::fs::rename(temporary, path).unwrap();
 }
@@ -60,13 +60,13 @@ async fn wait_for_release(scope: ReadScope, group: Uuid, hold: &str, release: &s
         return;
     };
     let release = marker(scope, group, release).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = nabedra_rt::time::now() + Duration::from_secs(90);
     while hold.is_file() && !release.is_file() {
         assert!(
-            Instant::now() < deadline,
+            nabedra_rt::time::now() < deadline,
             "scheduled page reply fixture timed out"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -85,7 +85,7 @@ pub(crate) async fn disconnect<T>(
         reply = response => reply,
         _ = async {
             while !path.is_file() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(10)).await;
             }
         } => Err(CallError::Transport(RequestError::Unreachable)),
     }

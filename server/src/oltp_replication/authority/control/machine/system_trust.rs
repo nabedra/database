@@ -156,11 +156,11 @@ impl ControlMachine {
         let weak = Arc::downgrade(&directory);
         let reader = self.clone();
         let retry_order = order.clone();
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             while pending.recv().await.is_some() {
                 let mut delay = Duration::from_millis(100);
                 loop {
-                    tokio::time::sleep(delay).await;
+                    nabedra_rt::time::sleep(delay).await;
                     if pending.is_closed() {
                         return;
                     }

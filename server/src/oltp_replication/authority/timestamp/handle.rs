@@ -69,7 +69,7 @@ impl TimestampHandle {
                 target_id,
                 txn,
                 reservation,
-                pin_id: uuid::Uuid::new_v4(),
+                pin_id: nabedra_rt::ids::uuid_v4(),
             })
             .await?
             .reply
@@ -108,7 +108,7 @@ impl TimestampHandle {
             .submit(TimestampCommand::BeginBackup {
                 authority,
                 owner,
-                pin_id: uuid::Uuid::new_v4(),
+                pin_id: nabedra_rt::ids::uuid_v4(),
             })
             .await?
             .reply
@@ -147,7 +147,7 @@ impl TimestampHandle {
                 owner,
                 txn,
                 reservation,
-                pin_id: uuid::Uuid::new_v4(),
+                pin_id: nabedra_rt::ids::uuid_v4(),
             })
             .await?
             .reply
@@ -186,7 +186,7 @@ impl TimestampHandle {
             .submit(TimestampCommand::BeginMaintenance {
                 authority,
                 owner,
-                pin_id: uuid::Uuid::new_v4(),
+                pin_id: nabedra_rt::ids::uuid_v4(),
             })
             .await?
             .reply
@@ -562,7 +562,7 @@ impl TimestampHandle {
                 view,
                 identity,
                 reservation,
-                pin_id: uuid::Uuid::new_v4(),
+                pin_id: nabedra_rt::ids::uuid_v4(),
             })
             .await?
             .reply
@@ -585,7 +585,7 @@ impl TimestampHandle {
                 view,
                 identity,
                 reservation,
-                pin_id: uuid::Uuid::new_v4(),
+                pin_id: nabedra_rt::ids::uuid_v4(),
                 origin,
             }))
             .await?

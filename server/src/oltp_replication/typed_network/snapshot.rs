@@ -123,7 +123,7 @@ impl<C: TypedConfig> TypedNetwork<C> {
         let shared = self.factory.shared.clone();
         let class = traffic(&self.factory.resident.identity().kind);
         let header = shared.encode_in(class.byte_class(), &head, 1024)?;
-        let reply = tokio::time::timeout(
+        let reply = nabedra_rt::time::timeout(
             ttl,
             self.factory.client.request(
                 self.factory.resident.identity(),
@@ -152,7 +152,7 @@ impl<C: TypedConfig> TypedNetwork<C> {
         cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<C>, StreamingError<C>> {
-        let transfer = Uuid::new_v4();
+        let transfer = nabedra_rt::ids::uuid_v4();
         let base = Header {
             from_node: self.factory.local.node_id,
             to_node: self.target,
@@ -168,7 +168,7 @@ impl<C: TypedConfig> TypedNetwork<C> {
             let shared = self.factory.shared.clone();
             let class = traffic(&self.factory.resident.identity().kind);
             // SNAP1: a cut writes its file here, on this replication task.
-            let started = std::time::Instant::now();
+            let started = nabedra_rt::time::now_std();
             let file = snapshot.snapshot.file().await.inspect_err(|error| {
                 tracing::warn!(group=%self.factory.resident.identity().group_id, target=self.target,
                     code=?error.code, %error, "typed snapshot file could not be written");
@@ -385,7 +385,7 @@ where
                     file,
                     received: 0,
                     digest: Sha256::new(),
-                    touched: Instant::now(),
+                    touched: nabedra_rt::time::now_std(),
                     _owner: owner,
                 });
                 Reply {
@@ -430,7 +430,7 @@ where
                             .map_err(|_| unavailable())?;
                         incoming.digest.update(input.as_slice());
                         incoming.received = end;
-                        incoming.touched = Instant::now();
+                        incoming.touched = nabedra_rt::time::now_std();
                         Ok((guard, end))
                     })
                     .await?;

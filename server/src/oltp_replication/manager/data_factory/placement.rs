@@ -99,12 +99,12 @@ impl ReplicaPlacement {
                     let group = &plan.request.group;
                     let node = plan.request.remove_node;
                     let source = self.factory.manager.hosted_data(group, node)?;
-                    tokio::time::timeout(Duration::from_secs(30), async {
+                    nabedra_rt::time::timeout(Duration::from_secs(30), async {
                         while source.raft.current_leader().await != Some(node)
                             || source.ensure_linearizable().await.is_err()
                         {
                             source.raft.trigger().elect(false).await.unwrap();
-                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            nabedra_rt::time::sleep(Duration::from_millis(250)).await;
                         }
                     })
                     .await
@@ -361,7 +361,7 @@ impl ReplicaPlacement {
         let membership = VerifiedMembership::from_consensus(observation, plan.id, plan.authority)?;
         #[cfg(test)]
         crate::oltp_runtime::recovery_tests::pause("replica_move_activated", plan.id).await;
-        let operation = Uuid::new_v4();
+        let operation = nabedra_rt::ids::uuid_v4();
         loop {
             // The admin executor owns this future independently of the socket.
             // On an uncertain result keep the exact native lease and retry the
@@ -387,7 +387,7 @@ impl ReplicaPlacement {
                     return Ok(published);
                 }
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(250)).await;
         }
     }
 
@@ -398,7 +398,7 @@ impl ReplicaPlacement {
         plan: ReplicaMove,
         observation: Option<GroupMembershipObservation>,
     ) -> Result<ReplicaMove, ProtocolError> {
-        let operation = Uuid::new_v4();
+        let operation = nabedra_rt::ids::uuid_v4();
         let applied = if plan.remote_source.is_some() {
             let retired = if plan.source_worker() == plan.request.worker {
                 wait_activation(|| self.remote_retirement(&plan)).await?
@@ -495,13 +495,13 @@ impl ReplicaPlacement {
         &self,
         plan: &ReplicaMove,
     ) -> Result<GroupMembershipObservation, ProtocolError> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        let deadline = nabedra_rt::time::now() + Duration::from_secs(45);
         let mut candidates = plan.next.to_vec();
         candidates.push(plan.removed().ok_or_else(invalid)?.clone());
         loop {
             for member in &candidates {
                 if let Ok(Ok(observation)) =
-                    tokio::time::timeout_at(deadline, self.observe(plan, member)).await
+                    nabedra_rt::time::timeout_at(deadline, self.observe(plan, member)).await
                 {
                     if observation.group() == &plan.request.group
                         && observation.replicas() == plan.next
@@ -511,10 +511,10 @@ impl ReplicaPlacement {
                     }
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
+            if nabedra_rt::time::now() >= deadline {
                 return Err(unavailable());
             }
-            tokio::time::sleep(Duration::from_millis(75)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(75)).await;
         }
     }
 
@@ -733,12 +733,12 @@ where
     F: FnMut() -> R,
     R: Future<Output = Result<T, ProtocolError>>,
 {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    nabedra_rt::time::timeout(Duration::from_secs(15), async {
         loop {
             match acquire().await {
                 Ok(native) => return Ok(native),
                 Err(error) if retryable(&error) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await
+                    nabedra_rt::time::sleep(Duration::from_millis(50)).await
                 }
                 Err(error) => return Err(error),
             }

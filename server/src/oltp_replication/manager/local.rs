@@ -24,7 +24,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -115,7 +115,7 @@ impl LocalWorker {
         let tls_dir = ownership.path.join("internal-tls");
         fs::create_dir_all(&tls_dir).map_err(storage)?;
         private_directory(&tls_dir)?;
-        let incarnation = Uuid::new_v4();
+        let incarnation = nabedra_rt::ids::uuid_v4();
         let process_tls = tls_dir.join(incarnation.to_string());
         fs::create_dir(&process_tls).map_err(storage)?;
         private_directory(&process_tls)?;
@@ -238,14 +238,14 @@ fn topology(owner: &DirectoryOwner, database: &Text<128>) -> Result<LocalTopolog
             }
             let t = LocalTopology {
                 format: 1,
-                cluster_id: Uuid::new_v4(),
-                worker_id: Uuid::new_v4(),
-                pool_id: Uuid::new_v4(),
+                cluster_id: nabedra_rt::ids::uuid_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                pool_id: nabedra_rt::ids::uuid_v4(),
                 database: database.clone(),
-                control: Uuid::new_v4(),
-                timestamps: Uuid::new_v4(),
-                status: Uuid::new_v4(),
-                catalog: Uuid::new_v4(),
+                control: nabedra_rt::ids::uuid_v4(),
+                timestamps: nabedra_rt::ids::uuid_v4(),
+                status: nabedra_rt::ids::uuid_v4(),
+                catalog: nabedra_rt::ids::uuid_v4(),
                 node_id: 1,
                 enrollment_revision: 1,
                 directory_dev,
@@ -420,7 +420,7 @@ fn openssl(path: &Path, args: &[&str]) -> Result<(), ProtocolError> {
         .stderr(Stdio::from(log))
         .spawn()
         .map_err(storage)?;
-    let until = Instant::now() + Duration::from_secs(15);
+    let until = nabedra_rt::time::now_std() + Duration::from_secs(15);
     loop {
         if let Some(status) = child.try_wait().map_err(storage)? {
             return if status.success() {
@@ -433,7 +433,7 @@ fn openssl(path: &Path, args: &[&str]) -> Result<(), ProtocolError> {
                 ))
             };
         }
-        if Instant::now() >= until {
+        if nabedra_rt::time::now_std() >= until {
             let _ = child.kill();
             let _ = child.wait();
             return Err(ProtocolError::new(
@@ -442,7 +442,7 @@ fn openssl(path: &Path, args: &[&str]) -> Result<(), ProtocolError> {
                 Outcome::NotApplied,
             ));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        nabedra_rt::time::thread_sleep(Duration::from_millis(10));
     }
 }
 fn storage(error: std::io::Error) -> ProtocolError {
@@ -465,7 +465,7 @@ fn directory_identity(_: &DirectoryOwner) -> Result<(u64, u64, u64, u64), Protoc
     Err(invalid())
 }
 fn replace_topology(path: &Path, topology: &LocalTopology) -> Result<(), ProtocolError> {
-    let next = path.join(format!("typed-worker-{}.next", Uuid::new_v4()));
+    let next = path.join(format!("typed-worker-{}.next", nabedra_rt::ids::uuid_v4()));
     let mut file = private_file(&next, true).map_err(storage)?;
     let bytes = serde_json::to_vec(topology).map_err(|_| invalid())?;
     file.write_all(&bytes).map_err(storage)?;

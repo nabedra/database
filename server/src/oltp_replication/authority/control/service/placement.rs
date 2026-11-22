@@ -355,7 +355,7 @@ impl ControlHandle {
         transition_id: Uuid,
         guard: VerifiedLifecycleGuard,
     ) -> Result<Applied<ControlReply>, ProtocolError> {
-        let operation_id = Uuid::new_v4();
+        let operation_id = nabedra_rt::ids::uuid_v4();
         let guard = guard.into_sealed();
         let authorization = self.local_operator(
             permit,
@@ -377,7 +377,7 @@ impl ControlHandle {
         permit: &LocalOperatorPermit,
         transition_id: Uuid,
     ) -> Result<Applied<ControlReply>, ProtocolError> {
-        let operation_id = Uuid::new_v4();
+        let operation_id = nabedra_rt::ids::uuid_v4();
         let authorization = self.local_operator(
             permit,
             operation_id,

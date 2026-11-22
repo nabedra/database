@@ -27,7 +27,7 @@ impl ParticipantEndpoint {
         header: &Header,
         sections: ChargedSections,
     ) -> Result<ChargedBytes, ProtocolError> {
-        tokio::time::timeout(SERVICE_CONVERGENCE, async {
+        nabedra_rt::time::timeout(SERVICE_CONVERGENCE, async {
             let input: Decoded<ResolveRequest> =
                 decode_point_input(&self.proof.shared, self.proof.node, sections).await?;
             let locator = &input.locator;
@@ -145,7 +145,7 @@ impl ParticipantClient {
         {
             return Err(invalid());
         }
-        let deadline = Instant::now() + SERVICE_CONVERGENCE;
+        let deadline = nabedra_rt::time::now() + SERVICE_CONVERGENCE;
         let peer_deadline = matches!(client.action, ServiceAction::ScopedQueueExecute(_))
             .then_some(deadline);
         timeout_at(deadline, async {

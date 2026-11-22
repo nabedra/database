@@ -365,7 +365,7 @@ impl DamageScheduler {
 
     /// Runs until `stop` turns true or its sender drops.
     pub(crate) fn spawn(self: Arc<Self>, mut stop: watch::Receiver<bool>) -> JoinHandle<()> {
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             loop {
                 tokio::select! {
                     changed = stop.changed() => {
@@ -373,7 +373,7 @@ impl DamageScheduler {
                             return;
                         }
                     }
-                    _ = tokio::time::sleep(self.interval) => {}
+                    _ = nabedra_rt::time::sleep(self.interval) => {}
                 }
                 if let Err(error) = self.tick().await {
                     tracing::debug!(%error, "damage replacement scheduler pass failed");
@@ -419,7 +419,7 @@ impl DamageScheduler {
             return;
         }
         let scheduler = self.clone();
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             let outcome = scheduler.settle(record).await;
             match &outcome {
                 Ok(true) => {
@@ -668,14 +668,14 @@ impl DamageScheduler {
         &self,
         plan: &GroupDamageReplacementPlan,
     ) -> Result<GroupDamageReplacement, ProtocolError> {
-        let deadline = tokio::time::Instant::now() + REPLACE_DEADLINE;
+        let deadline = nabedra_rt::time::now() + REPLACE_DEADLINE;
         let survivors = plan
             .members
             .iter()
             .filter(|member| **member != plan.damaged)
             .collect::<Vec<_>>();
         let mut last = unavailable();
-        while tokio::time::Instant::now() < deadline {
+        while nabedra_rt::time::now() < deadline {
             if !self.leads().await {
                 return Err(unavailable());
             }
@@ -700,7 +700,7 @@ impl DamageScheduler {
                     Err(error) => last = error,
                 }
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(200)).await;
         }
         Err(last)
     }

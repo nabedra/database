@@ -14,7 +14,7 @@ async fn r03_prepared_restart_requires_retained_mount_and_preserves_control_vote
     let permanent = ReplicaMember {
         node_id: 7,
         worker_id: previous.worker_id,
-        pool_id: Uuid::new_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
     };
     let group = fixture
         .register_group(GroupKind::Control, vec![permanent.clone()])
@@ -26,7 +26,7 @@ async fn r03_prepared_restart_requires_retained_mount_and_preserves_control_vote
     };
     let next = WorkerIdentity::from(&new_enrollment);
     let intent = RestartIntent {
-        id: Uuid::new_v4(),
+        id: nabedra_rt::ids::uuid_v4(),
         run_id: initial.view.run_id,
         previous,
         next: new_enrollment,
@@ -44,7 +44,7 @@ async fn r03_prepared_restart_requires_retained_mount_and_preserves_control_vote
     );
     let key = RestartMountKey::from_seed(&[4; 32]).unwrap();
     let register = ControlCommand::RegisterRestartMount {
-        operation_id: Uuid::new_v4(),
+        operation_id: nabedra_rt::ids::uuid_v4(),
         worker: previous,
         pool_id: permanent.pool_id,
         generation: 1,
@@ -67,7 +67,7 @@ async fn r03_prepared_restart_requires_retained_mount_and_preserves_control_vote
         ControlReply::RestartPrepared(next)
     );
     assert!(!fixture.state().await.restart.unwrap().enrolled);
-    let operation = Uuid::new_v4();
+    let operation = nabedra_rt::ids::uuid_v4();
     let exclude = ExclusionStamp {
         worker: previous,
         authorization: AuthorizationStamp {

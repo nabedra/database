@@ -159,13 +159,13 @@ mod tests {
     };
 
     fn fixture(count: u128) -> (TerminalCopyStatement, Vec<WorkerIdentity>) {
-        let run_id = Uuid::new_v4();
-        let request_id = Uuid::new_v4();
+        let run_id = nabedra_rt::ids::uuid_v4();
+        let request_id = nabedra_rt::ids::uuid_v4();
         let digest = Digest::from_bytes([1; 32]);
         let members: Vec<_> = (1..=count)
             .map(|id| WorkerIdentity {
                 worker_id: Uuid::from_u128(id),
-                incarnation: Uuid::new_v4(),
+                incarnation: nabedra_rt::ids::uuid_v4(),
                 certificate_sha256: Digest::from_bytes([id as u8; 32]),
                 enrollment_revision: 1,
             })
@@ -197,10 +197,10 @@ mod tests {
                 run_id,
                 request_id,
                 digest,
-                nonce: Uuid::new_v4(),
+                nonce: nabedra_rt::ids::uuid_v4(),
             },
             storage_pin: StoragePin {
-                pin_id: Uuid::new_v4(),
+                pin_id: nabedra_rt::ids::uuid_v4(),
                 read_ts: Timestamp::new(10).unwrap(),
                 allocator_epoch: 1,
             },
@@ -212,7 +212,7 @@ mod tests {
         AuthenticatedAck::from_transport(
             member,
             statement_digest(statement).unwrap(),
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
         )
     }
 
@@ -252,7 +252,7 @@ mod tests {
         for field in 0..4 {
             let mut supplied = ack(members[0], &statement);
             match field {
-                0 => supplied.member.incarnation = Uuid::new_v4(),
+                0 => supplied.member.incarnation = nabedra_rt::ids::uuid_v4(),
                 1 => supplied.member.enrollment_revision += 1,
                 2 => supplied.member.certificate_sha256 = Digest::from_bytes([0; 32]),
                 _ => supplied.nonce = Uuid::nil(),
@@ -266,7 +266,7 @@ mod tests {
                 0 => altered.request.accepted_context = Digest::from_bytes([9; 32]),
                 1 => altered.terminal_version += 1,
                 2 => altered.response_hash = Digest::from_bytes([9; 32]),
-                _ => altered.storage_pin.pin_id = Uuid::new_v4(),
+                _ => altered.storage_pin.pin_id = nabedra_rt::ids::uuid_v4(),
             }
             let mut verifier = TerminalVerifier::begin(altered.clone(), altered.ready).unwrap();
             assert!(

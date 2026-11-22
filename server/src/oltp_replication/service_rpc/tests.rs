@@ -212,9 +212,9 @@ impl Endpoint for ConvergingTimestamp {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o06_o14_timestamp_service_retries_same_snapshot_after_leader_convergence() {
-    tokio::time::timeout(Duration::from_secs(40), async {
+    nabedra_rt::time::timeout(Duration::from_secs(40), async {
         let directory =
-            Directory(std::env::temp_dir().join(format!("timestamp-service-{}", Uuid::new_v4())));
+            Directory(std::env::temp_dir().join(format!("timestamp-service-{}", nabedra_rt::ids::uuid_v4())));
         let services = LocalServices::open(
             &directory.0,
             "convergence",
@@ -242,7 +242,7 @@ async fn o06_o14_timestamp_service_retries_same_snapshot_after_leader_convergenc
                 RequestKind::Read,
             )
         };
-        let initial = reserve(Uuid::new_v4()).await.unwrap();
+        let initial = reserve(nabedra_rt::ids::uuid_v4()).await.unwrap();
         let StatusReply::Identity(IdentityLookup::Reserved(reservation)) = initial.reply else {
             panic!("expected a durable read reservation");
         };
@@ -309,7 +309,7 @@ async fn o06_o14_timestamp_service_retries_same_snapshot_after_leader_convergenc
                 attempts.iter().map(|(_, nonce, _)| *nonce).collect();
             assert_eq!(nonces.len(), attempts.len());
         }
-        let next = reserve(Uuid::new_v4()).await.unwrap();
+        let next = reserve(nabedra_rt::ids::uuid_v4()).await.unwrap();
         let StatusReply::Identity(IdentityLookup::Reserved(next)) = next.reply else {
             panic!("expected another durable read reservation");
         };
@@ -363,9 +363,9 @@ async fn o06_o14_timestamp_service_retries_same_snapshot_after_leader_convergenc
 /// after ReadIndex. A matching wire shape with altered outcome is not a proof.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o10_o15_status_service_uses_actual_control_routes_and_rejects_forged_outcome() {
-    tokio::time::timeout(std::time::Duration::from_secs(40), async {
+    nabedra_rt::time::timeout(std::time::Duration::from_secs(40), async {
         let directory =
-            Directory(std::env::temp_dir().join(format!("status-service-{}", Uuid::new_v4())));
+            Directory(std::env::temp_dir().join(format!("status-service-{}", nabedra_rt::ids::uuid_v4())));
         let services = LocalServices::open(
             &directory.0,
             "service",
@@ -385,7 +385,7 @@ async fn o10_o15_status_service_uses_actual_control_routes_and_rejects_forged_ou
         .unwrap();
         let current = services.control.current(&services.scope).await.unwrap();
         let authority = current.ready.view.authority();
-        let request_id = Uuid::new_v4();
+        let request_id = nabedra_rt::ids::uuid_v4();
         let digest = Digest::from_bytes([45; 32]);
         let applied = services
             .status
@@ -523,7 +523,7 @@ async fn o10_o15_status_service_uses_actual_control_routes_and_rejects_forged_ou
         // settlement from the missing transaction and not mask it as Unknown.
         let failed_request = RequestBinding {
             run_id: authority.run_id,
-            request_id: Uuid::new_v4(),
+            request_id: nabedra_rt::ids::uuid_v4(),
             digest: Digest::from_bytes([71; 32]),
             accepted_context: Digest::from_bytes([72; 32]),
         };

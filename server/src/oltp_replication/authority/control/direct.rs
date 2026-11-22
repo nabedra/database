@@ -134,7 +134,7 @@ pub(crate) struct DirectFeatures {
 
 /// The proposer's wall clock for `ControlCommand::DirectCapability`.
 pub(crate) fn wall_ms() -> u64 {
-    std::time::SystemTime::now()
+    nabedra_rt::time::wall_now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }

@@ -463,7 +463,7 @@ impl ControlHandle {
     ) -> Result<Applied<ControlReply>, ProtocolError> {
         let replicas = Page::new(observation.replicas().to_vec()).map_err(|_| unauthorized())?;
         let proof = VerifiedMembership::from_consensus(observation, generation, authority)?.stamp;
-        let operation_id = Uuid::new_v4();
+        let operation_id = nabedra_rt::ids::uuid_v4();
         let authorization = self.local_operator(
             permit,
             operation_id,
@@ -545,7 +545,7 @@ impl ControlHandle {
         // (and records nothing) when the identity is not enrolled yet.
         if target == permit.local {
             self.submit(ControlCommand::DirectCapability {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 actor: target,
                 action: super::DirectCapabilityOperation::Advertise {
                     version: super::DIRECT_VERSION,
@@ -1946,7 +1946,6 @@ fn unauthorized() -> ProtocolError {
 mod idle_passes_tests {
     use super::IdlePasses;
     use std::time::Duration;
-    use tokio::time::Instant;
 
     /// PERF2c: a quiet pass lets later passes be skipped only while the local
     /// Control replica applied nothing new, the key is unchanged and less than
@@ -1954,7 +1953,7 @@ mod idle_passes_tests {
     /// every pass due.
     #[test]
     fn perf2c_idle_passes_skip_only_quiet_unchanged_passes() {
-        let start = Instant::now();
+        let start = nabedra_rt::time::now();
         let mut idle = IdlePasses::new(Duration::from_secs(2));
         // the first pass is due
         assert!(idle.due(Some(7), &1, start));

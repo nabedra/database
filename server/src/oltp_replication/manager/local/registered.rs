@@ -597,8 +597,8 @@ impl RegisteredWorker {
                 &record.intent.mount,
                 &mount.key,
             )?;
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-            replacement_mount_committed = tokio::time::timeout_at(deadline, async {
+            let deadline = nabedra_rt::time::now() + std::time::Duration::from_secs(20);
+            replacement_mount_committed = nabedra_rt::time::timeout_at(deadline, async {
                 loop {
                     for peer in config
                         .control_enrollments
@@ -619,7 +619,7 @@ impl RegisteredWorker {
                             Err(_) => {}
                         }
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    nabedra_rt::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             })
             .await
@@ -642,7 +642,7 @@ impl RegisteredWorker {
                             policy: retained.restore_policy.unwrap_or(policy),
                             certificate_pins: operator_pins,
                         },
-                        Uuid::new_v4(),
+                        nabedra_rt::ids::uuid_v4(),
                         previous,
                     )?)
                 }
@@ -850,7 +850,7 @@ fn retain_identity(owner: &DirectoryOwner, next: &RetainedIdentity) -> Result<()
     let path = owner.path.join("NABEDRA_REGISTERED_WORKER.json");
     let temporary = owner
         .path
-        .join(format!("registered-{}.next", Uuid::new_v4()));
+        .join(format!("registered-{}.next", nabedra_rt::ids::uuid_v4()));
     let mut output = private_file(&temporary, true).map_err(storage)?;
     let encoded = serde_json::to_vec(next).map_err(|_| invalid())?;
     if encoded.len() > 128 << 10 {
@@ -904,22 +904,22 @@ mod status_tests {
     #[test]
     fn o17_replacement_leaves_system_groups_without_the_lost_worker_unchanged() {
         use crate::oltp_replication::authority::control::ReplacementIntent;
-        let lost = Uuid::new_v4();
-        let cluster_id = Uuid::new_v4();
+        let lost = nabedra_rt::ids::uuid_v4();
+        let cluster_id = nabedra_rt::ids::uuid_v4();
         let enrolled = |worker_id| WorkerEnrollment {
             worker_id,
-            incarnation: Uuid::new_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
             enrollment_revision: 1,
             certificate_sha256: Digest::from_bytes([1; 32]),
             endpoint: Text::try_from("127.0.0.1:1").unwrap(),
             server_name: Text::try_from("localhost").unwrap(),
         };
-        let next = enrolled(Uuid::new_v4());
+        let next = enrolled(nabedra_rt::ids::uuid_v4());
         let mut group = GroupPlacement {
             identity: GroupIdentity {
                 cluster_id,
                 database: Text::try_from("routing").unwrap(),
-                group_id: Uuid::new_v4(),
+                group_id: nabedra_rt::ids::uuid_v4(),
                 kind: GroupKind::Catalog,
                 group_format_version: GROUP_FORMAT_VERSION,
             },
@@ -927,8 +927,8 @@ mod status_tests {
                 (1..=3)
                     .map(|node_id| ReplicaMember {
                         node_id,
-                        worker_id: Uuid::new_v4(),
-                        pool_id: Uuid::new_v4(),
+                        worker_id: nabedra_rt::ids::uuid_v4(),
+                        pool_id: nabedra_rt::ids::uuid_v4(),
                     })
                     .collect(),
             )
@@ -941,20 +941,20 @@ mod status_tests {
                 index: 3,
             },
             intent: ReplacementIntent {
-                id: Uuid::new_v4(),
-                run_id: Uuid::new_v4(),
+                id: nabedra_rt::ids::uuid_v4(),
+                run_id: nabedra_rt::ids::uuid_v4(),
                 previous: WorkerIdentity::from(&enrolled(lost)),
                 mount_public_key: None,
                 mount: PoolMountExpectation {
                     profile: PoolMountProfile::Docker {
-                        volume_marker: Uuid::new_v4(),
+                        volume_marker: nabedra_rt::ids::uuid_v4(),
                     },
                     identity: PoolIdentity {
                         engine: "oltp".into(),
                         pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                         cluster_id,
                         worker_id: next.worker_id,
-                        pool_id: Uuid::new_v4(),
+                        pool_id: nabedra_rt::ids::uuid_v4(),
                     },
                     worker: WorkerIdentity::from(&next),
                     generation: 1,

@@ -183,7 +183,7 @@ impl ControlHandle {
         let running = manager.local_control(self.identity())?;
         // The intent owns its durable operator ID. A separate log operation
         // ID lets concurrent identical callers reach the same intent record.
-        let operation_id = Uuid::new_v4();
+        let operation_id = nabedra_rt::ids::uuid_v4();
         let authorization = self.local_operator(
             permit,
             operation_id,
@@ -391,7 +391,7 @@ impl ControlHandle {
         if !pending {
             return Ok(());
         }
-        let operation_id = Uuid::new_v4();
+        let operation_id = nabedra_rt::ids::uuid_v4();
         let authorization = self.local_operator(
             permit,
             operation_id,
@@ -422,7 +422,7 @@ impl ControlHandle {
         match self
             .propose_system_recovery(
                 running,
-                Uuid::new_v4(),
+                nabedra_rt::ids::uuid_v4(),
                 SystemRecoveryCommand::Mount {
                     proof,
                     ready: state.ready,
@@ -457,7 +457,7 @@ impl ControlHandle {
         applied: AppliedPosition,
     ) -> Result<(), ProtocolError> {
         let id = record.intent.id;
-        let operation_id = Uuid::new_v4();
+        let operation_id = nabedra_rt::ids::uuid_v4();
         let evidence = serialized_digest(&(id, group, applied))?;
         let authorization = if group == self.identity().group_id
             && permit.local == WorkerIdentity::from(&record.intent.next)

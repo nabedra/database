@@ -15,7 +15,6 @@ use crate::{
 use openraft::type_config::TypeConfigExt;
 use openraft::vote::RaftLeaderId;
 use std::time::Duration;
-use uuid::Uuid;
 
 #[derive(Serialize, Deserialize)]
 struct Command(PreparedWrite);
@@ -85,7 +84,7 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
-        let dir = Dir(std::env::temp_dir().join(format!("typed-log-{}", Uuid::new_v4())));
+        let dir = Dir(std::env::temp_dir().join(format!("typed-log-{}", nabedra_rt::ids::uuid_v4())));
         let shared = WorkerSharedResources::new(
             2,
             WorkerResources {
@@ -100,9 +99,9 @@ impl Fixture {
             PoolIdentity {
                 engine: "oltp".into(),
                 pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-                cluster_id: Uuid::new_v4(),
-                worker_id: Uuid::new_v4(),
-                pool_id: Uuid::new_v4(),
+                cluster_id: nabedra_rt::ids::uuid_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                pool_id: nabedra_rt::ids::uuid_v4(),
             },
             shared,
         )
@@ -111,7 +110,7 @@ impl Fixture {
             .group(GroupIdentity {
                 cluster_id: pool.identity().cluster_id,
                 database: Text::try_from("default").unwrap(),
-                group_id: Uuid::new_v4(),
+                group_id: nabedra_rt::ids::uuid_v4(),
                 kind: GroupKind::Catalog,
                 group_format_version: 1,
             })
@@ -195,9 +194,9 @@ impl GatedSync {
         self.state(|gate| gate.entered)
     }
     async fn wait_for_sync(&self) {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        nabedra_rt::time::timeout(Duration::from_secs(10), async {
             while self.entered() == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
@@ -296,13 +295,13 @@ impl nabedra_kv::fs::FsFile for GatedFile {
 /// order, and only the bytes a completed sync covered survive a crash.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o06_o11_journal_sync_precedes_typed_append_ack() {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    nabedra_rt::time::timeout(Duration::from_secs(30), async {
         use std::sync::{
             Mutex,
             atomic::{AtomicBool, Ordering},
         };
 
-        let dir = Dir(std::env::temp_dir().join(format!("typed-log-gate-{}", Uuid::new_v4())));
+        let dir = Dir(std::env::temp_dir().join(format!("typed-log-gate-{}", nabedra_rt::ids::uuid_v4())));
         let path = dir.0.join("pool");
         std::fs::create_dir_all(&path).unwrap();
         let gated = GatedSync::new();
@@ -319,14 +318,14 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
         let identity = PoolIdentity {
             engine: "oltp".into(),
             pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-            cluster_id: Uuid::new_v4(),
-            worker_id: Uuid::new_v4(),
-            pool_id: Uuid::new_v4(),
+            cluster_id: nabedra_rt::ids::uuid_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
         };
         let group_id = GroupIdentity {
             cluster_id: identity.cluster_id,
             database: Text::try_from("default").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Catalog,
             group_format_version: 1,
         };
@@ -342,7 +341,7 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
         let healthy = OltpPool::open_development(
             dir.0.join("healthy"),
             PoolIdentity {
-                pool_id: Uuid::new_v4(),
+                pool_id: nabedra_rt::ids::uuid_v4(),
                 ..identity.clone()
             },
             shared.clone(),
@@ -350,7 +349,7 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
         .unwrap();
         let control = healthy
             .group(GroupIdentity {
-                group_id: Uuid::new_v4(),
+                group_id: nabedra_rt::ids::uuid_v4(),
                 kind: GroupKind::Control,
                 ..group_id.clone()
             })
@@ -471,7 +470,7 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
 /// the C07 progress test hung on Linux CI).
 #[tokio::test]
 async fn c07_o05_bounded_entry_stream_ends_without_reading_past_its_end() {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    nabedra_rt::time::timeout(Duration::from_secs(15), async {
         let mut f = Fixture::new().await;
         for index in 0..3 {
             f.log
@@ -485,7 +484,7 @@ async fn c07_o05_bounded_entry_stream_ends_without_reading_past_its_end() {
             assert_eq!(stream.next().await.unwrap().unwrap().index(), index);
         }
         let query = shared.prepare(ExecutionClass::Query).await.unwrap();
-        let end = tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
+        let end = nabedra_rt::time::timeout(Duration::from_secs(2), stream.next()).await;
         drop(query);
         assert!(
             matches!(end, Ok(None)),
@@ -591,7 +590,7 @@ async fn o05_m01_wide_entry_retains_extracted_payload_without_reply_or_apply_esc
     let command = OwnedCommand::new_owned(
         Command(PreparedWrite {
             key: MvccKey::Row {
-                table_id: Uuid::new_v4(),
+                table_id: nabedra_rt::ids::uuid_v4(),
                 primary_key: Key::Utf8("k".repeat(7 << 20)),
             },
             expected_version: None,
@@ -635,7 +634,7 @@ async fn o05_m01_wide_entry_retains_extracted_payload_without_reply_or_apply_esc
 /// first actual sync. Both appends return before their writes (PERF2d).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn f03_cancelled_append_keeps_callback_order_and_drain_until_native_settles() {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    nabedra_rt::time::timeout(Duration::from_secs(15), async {
         let f = Fixture::new().await;
         let (entered, observed) = std::sync::mpsc::channel();
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -657,14 +656,14 @@ async fn f03_cancelled_append_keeps_callback_order_and_drain_until_native_settle
         let (sent, mut done) = TestConfig::oneshot();
         let mut writer = f.log.clone();
         let first =
-            tokio::spawn(async move { writer.append([blank(0)], IOFlushed::signal(sent)).await });
+            nabedra_rt::task::spawn(async move { writer.append([blank(0)], IOFlushed::signal(sent)).await });
         while observed.try_recv().is_err() {
             tokio::task::yield_now().await;
         }
         first.abort();
         first.await.unwrap().unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut done)
+            nabedra_rt::time::timeout(Duration::from_millis(20), &mut done)
                 .await
                 .is_err()
         );
@@ -676,10 +675,10 @@ async fn f03_cancelled_append_keeps_callback_order_and_drain_until_native_settle
             .await
             .unwrap();
         let log = f.log.clone();
-        let drain = tokio::spawn(async move { log.drain().await });
+        let drain = nabedra_rt::task::spawn(async move { log.drain().await });
         tokio::task::yield_now().await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut second_done)
+            nabedra_rt::time::timeout(Duration::from_millis(20), &mut second_done)
                 .await
                 .is_err()
         );
@@ -709,7 +708,7 @@ async fn f03_cancelled_append_keeps_callback_order_and_drain_until_native_settle
 /// log IO, PERF2d) and completes after that append's sync and callback.
 #[tokio::test]
 async fn c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_group_vote() {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    nabedra_rt::time::timeout(Duration::from_secs(15), async {
         let f = Fixture::new().await;
         let shared = f.log.group().resources();
         let query = shared.prepare(ExecutionClass::Query).await.unwrap();
@@ -727,7 +726,7 @@ async fn c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_gro
             1
         );
         let mut identity = f.log.group().identity().clone();
-        identity.group_id = Uuid::new_v4();
+        identity.group_id = nabedra_rt::ids::uuid_v4();
         identity.kind = GroupKind::Control;
         let mut other =
             TypedLogStore::<ControlTestConfig>::new(f._pool.group(identity).await.unwrap(), 1)
@@ -739,17 +738,17 @@ async fn c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_gro
             Some(Vote::new_committed(3, 1))
         );
         let mut vote = f.log.clone();
-        let vote = tokio::spawn(async move {
+        let vote = nabedra_rt::task::spawn(async move {
             vote.save_vote(&Vote::new_committed(3, 1)).await.unwrap();
             vote
         });
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut callback)
+            nabedra_rt::time::timeout(Duration::from_millis(20), &mut callback)
                 .await
                 .is_err()
         );
         let log = f.log.clone();
-        let drain = tokio::spawn(async move { log.drain().await });
+        let drain = nabedra_rt::task::spawn(async move { log.drain().await });
         tokio::task::yield_now().await;
         assert!(!drain.is_finished());
         assert!(!vote.is_finished());
@@ -776,7 +775,7 @@ async fn c07_m02_control_append_and_read_progress_with_all_data_memory_and_query
     let f = Fixture::new().await;
     let shared = f.log.group().resources().clone();
     let mut identity = f.log.group().identity().clone();
-    identity.group_id = Uuid::new_v4();
+    identity.group_id = nabedra_rt::ids::uuid_v4();
     identity.kind = GroupKind::Control;
     let mut control =
         TypedLogStore::<ControlTestConfig>::new(f._pool.group(identity).await.unwrap(), 1)
@@ -802,7 +801,7 @@ async fn c07_m02_control_append_and_read_progress_with_all_data_memory_and_query
     let command =
         OwnedCommand::new_owned(MetadataCommand { value: 42 }, &shared, ByteClass::Progress)
             .unwrap();
-    tokio::time::timeout(
+    nabedra_rt::time::timeout(
         Duration::from_secs(5),
         control.append(
             [OwnedRaftEntry::new(id(0), Payload::Normal(command))],
@@ -813,10 +812,10 @@ async fn c07_m02_control_append_and_read_progress_with_all_data_memory_and_query
     .unwrap()
     .unwrap();
     // Read the decoded store copy, not the pending entry (PERF2d).
-    tokio::time::timeout(Duration::from_secs(5), control.drain())
+    nabedra_rt::time::timeout(Duration::from_secs(5), control.drain())
         .await
         .unwrap();
-    let read = tokio::time::timeout(Duration::from_secs(5), control.try_get_log_entries(0..1))
+    let read = nabedra_rt::time::timeout(Duration::from_secs(5), control.try_get_log_entries(0..1))
         .await
         .unwrap()
         .unwrap();
@@ -840,7 +839,7 @@ async fn o01_live_append_uses_residency_with_progress_wire_completely_full() {
     let f = Fixture::new().await;
     let shared = f.log.group().resources().clone();
     let mut identity = f.log.group().identity().clone();
-    identity.group_id = Uuid::new_v4();
+    identity.group_id = nabedra_rt::ids::uuid_v4();
     identity.kind = GroupKind::Control;
     let registry = crate::oltp_replication::multiplex::EndpointRegistry::new(shared.clone());
     let group = registry.reserve(identity.clone()).unwrap();
@@ -860,7 +859,7 @@ async fn o01_live_append_uses_residency_with_progress_wire_completely_full() {
         .unwrap();
     assert!(shared.reserve_scratch(ByteClass::Progress, 1).is_err());
     let (send, done) = ControlTestConfig::oneshot();
-    tokio::time::timeout(
+    nabedra_rt::time::timeout(
         Duration::from_secs(5),
         log.append(
             [OwnedRaftEntry::new(id(0), Payload::Normal(command))],
@@ -870,7 +869,7 @@ async fn o01_live_append_uses_residency_with_progress_wire_completely_full() {
     .await
     .unwrap()
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), done)
+    nabedra_rt::time::timeout(Duration::from_secs(5), done)
         .await
         .unwrap()
         .unwrap()
@@ -900,7 +899,7 @@ struct GatedLog {
 }
 impl GatedLog {
     fn new() -> Self {
-        let dir = Dir(std::env::temp_dir().join(format!("typed-log-perf2d-{}", Uuid::new_v4())));
+        let dir = Dir(std::env::temp_dir().join(format!("typed-log-perf2d-{}", nabedra_rt::ids::uuid_v4())));
         let path = dir.0.join("pool");
         std::fs::create_dir_all(&path).unwrap();
         let gated = GatedSync::new();
@@ -917,14 +916,14 @@ impl GatedLog {
         let identity = PoolIdentity {
             engine: "oltp".into(),
             pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-            cluster_id: Uuid::new_v4(),
-            worker_id: Uuid::new_v4(),
-            pool_id: Uuid::new_v4(),
+            cluster_id: nabedra_rt::ids::uuid_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
         };
         let group = GroupIdentity {
             cluster_id: identity.cluster_id,
             database: Text::try_from("default").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Catalog,
             group_format_version: 1,
         };
@@ -962,7 +961,7 @@ impl GatedLog {
     /// of GC1 into `nabedra/hardening`, restored by GC2).
     async fn entered(&self) {
         while self.gated.state(|gate| gate.entered) == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(5)).await;
         }
     }
 }
@@ -976,7 +975,7 @@ impl GatedLog {
 /// reports an error, never a flush.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o29_ns10_perf2d_crash_between_overlay_publish_and_sync_keeps_only_acked_entries() {
-    tokio::time::timeout(Duration::from_secs(60), async {
+    nabedra_rt::time::timeout(Duration::from_secs(60), async {
         let rig = GatedLog::new();
         let (pool, mut log) = rig.open(Arc::new(rig.gated.clone()), true).await;
         let (sent, acked) = TestConfig::oneshot();
@@ -1005,7 +1004,7 @@ async fn o29_ns10_perf2d_crash_between_overlay_publish_and_sync_keeps_only_acked
         );
         let mut apply = Box::pin(log.entries_stream(1..2).await);
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), apply.next())
+            nabedra_rt::time::timeout(Duration::from_millis(50), apply.next())
                 .await
                 .is_err(),
             "applying an entry must wait for its local sync"
@@ -1015,7 +1014,7 @@ async fn o29_ns10_perf2d_crash_between_overlay_publish_and_sync_keeps_only_acked
         log.save_committed(Some(id(1))).await.unwrap();
         assert_eq!(log.read_committed().await.unwrap(), Some(id(0)));
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut pending)
+            nabedra_rt::time::timeout(Duration::from_millis(20), &mut pending)
                 .await
                 .is_err()
         );
@@ -1075,7 +1074,7 @@ async fn o29_ns10_perf2d_crash_between_overlay_publish_and_sync_keeps_only_acked
 /// meanwhile. A later marker still advances directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o11_perf2d_commit_marker_and_apply_follow_the_local_sync() {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    nabedra_rt::time::timeout(Duration::from_secs(30), async {
         let rig = GatedLog::new();
         let (_pool, mut log) = rig.open(Arc::new(rig.gated.clone()), true).await;
         let (sent, acked) = TestConfig::oneshot();
@@ -1101,13 +1100,13 @@ async fn o11_perf2d_commit_marker_and_apply_follow_the_local_sync() {
             [id(1), id(2)]
         );
         assert!(
-            tokio::time::timeout(Duration::from_millis(30), apply.next())
+            nabedra_rt::time::timeout(Duration::from_millis(30), apply.next())
                 .await
                 .is_err(),
             "applying the batch must wait for its local sync"
         );
         assert!(
-            tokio::time::timeout(Duration::from_millis(1), &mut pending)
+            nabedra_rt::time::timeout(Duration::from_millis(1), &mut pending)
                 .await
                 .is_err()
         );
@@ -1117,7 +1116,7 @@ async fn o11_perf2d_commit_marker_and_apply_follow_the_local_sync() {
         let applied = apply.map(|entry| entry.unwrap().log_id).collect::<Vec<_>>();
         assert_eq!(applied.await, [id(1), id(2)]);
         while log.read_committed().await.unwrap() != Some(id(2)) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(5)).await;
         }
         let (sent, acked) = TestConfig::oneshot();
         log.append([blank(3)], IOFlushed::signal(sent))
@@ -1137,7 +1136,7 @@ async fn o11_perf2d_commit_marker_and_apply_follow_the_local_sync() {
 /// and a core that reads the log state again starts on the durable log.
 #[tokio::test]
 async fn o29_perf2d_failed_append_fails_queued_appends_until_the_log_state_is_read_again() {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    nabedra_rt::time::timeout(Duration::from_secs(15), async {
         let f = Fixture::new().await;
         let mut log = f.log.clone();
         let (sent, acked) = TestConfig::oneshot();
@@ -1205,7 +1204,7 @@ async fn o29_perf2d_failed_append_fails_queued_appends_until_the_log_state_is_re
 /// once; reading the marker and draining the replica wait for the writer.
 #[tokio::test]
 async fn o11_c07_perf2d_commit_marker_is_written_off_the_commit_path() {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    nabedra_rt::time::timeout(Duration::from_secs(15), async {
         let f = Fixture::new().await;
         let mut log = f.log.clone();
         let (sent, acked) = TestConfig::oneshot();
@@ -1218,19 +1217,19 @@ async fn o11_c07_perf2d_commit_marker_is_written_off_the_commit_path() {
             .prepare(ExecutionClass::Control)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), log.save_committed(Some(id(0))))
+        nabedra_rt::time::timeout(Duration::from_secs(1), log.save_committed(Some(id(0))))
             .await
             .expect("save_committed waited for a native write")
             .unwrap();
-        let read = tokio::spawn({
+        let read = nabedra_rt::task::spawn({
             let mut log = log.clone();
             async move { log.read_committed().await.unwrap() }
         });
-        let drain = tokio::spawn({
+        let drain = nabedra_rt::task::spawn({
             let log = log.clone();
             async move { log.drain().await }
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(20)).await;
         assert!(!read.is_finished());
         assert!(!drain.is_finished());
         drop(control);
@@ -1252,7 +1251,7 @@ async fn o11_c07_perf2d_commit_marker_is_written_off_the_commit_path() {
 async fn o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote() {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    tokio::time::timeout(Duration::from_secs(30), async {
+    nabedra_rt::time::timeout(Duration::from_secs(30), async {
         let rig = GatedLog::new();
         let (pool, mut log) = rig.open(Arc::new(rig.gated.clone()), true).await;
         let syncs = || pool.kv_store().stats().journal_syncs;
@@ -1338,7 +1337,7 @@ async fn ns13_o05_drain_waits_until_the_append_task_dropped_its_state() {
     struct SlowDrop(Arc<AtomicBool>);
     impl Drop for SlowDrop {
         fn drop(&mut self) {
-            std::thread::sleep(Duration::from_millis(200));
+            nabedra_rt::time::thread_sleep(Duration::from_millis(200));
             self.0.store(true, Ordering::Release);
         }
     }
@@ -1354,7 +1353,7 @@ async fn ns13_o05_drain_waits_until_the_append_task_dropped_its_state() {
         .await
         .unwrap();
     callback.await.unwrap().unwrap();
-    tokio::time::timeout(Duration::from_secs(10), f.log.drain())
+    nabedra_rt::time::timeout(Duration::from_secs(10), f.log.drain())
         .await
         .expect("drain");
     assert!(

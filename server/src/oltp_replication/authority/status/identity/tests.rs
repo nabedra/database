@@ -19,7 +19,7 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
-        let dir = Dir(std::env::temp_dir().join(format!("status-identity-{}", Uuid::new_v4())));
+        let dir = Dir(std::env::temp_dir().join(format!("status-identity-{}", nabedra_rt::ids::uuid_v4())));
         let shared = WorkerSharedResources::new(
             3,
             WorkerResources {
@@ -34,9 +34,9 @@ impl Fixture {
             PoolIdentity {
                 engine: "oltp".into(),
                 pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-                cluster_id: Uuid::new_v4(),
-                worker_id: Uuid::new_v4(),
-                pool_id: Uuid::new_v4(),
+                cluster_id: nabedra_rt::ids::uuid_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                pool_id: nabedra_rt::ids::uuid_v4(),
             },
             shared,
         )
@@ -45,7 +45,7 @@ impl Fixture {
             .group(GroupIdentity {
                 cluster_id: pool.identity().cluster_id,
                 database: Text::try_from("default").unwrap(),
-                group_id: Uuid::new_v4(),
+                group_id: nabedra_rt::ids::uuid_v4(),
                 kind: GroupKind::Status { bucket: 0 },
                 group_format_version: 1,
             })
@@ -130,7 +130,7 @@ fn reserve(authority: Authority, id: Uuid, digest: Digest) -> StatusCommand {
         digest,
         kind: RequestKind::Mutation,
         scoped: None,
-        reservation_id: Uuid::new_v4(),
+        reservation_id: nabedra_rt::ids::uuid_v4(),
     }
 }
 
@@ -138,18 +138,18 @@ fn reserve(authority: Authority, id: Uuid, digest: Digest) -> StatusCommand {
 async fn q05_q06_o10_terminal_failure_replay_keeps_the_accepted_context_and_result() {
     let mut f = Fixture::new().await;
     let authority = Authority {
-        run_id: Uuid::new_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
         owner_term: 1,
     };
     f.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: None,
         next: authority,
     })
     .await;
     let request = RequestBinding {
         run_id: authority.run_id,
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         digest: Digest::from_bytes([1; 32]),
         accepted_context: Digest::from_bytes([2; 32]),
     };
@@ -194,18 +194,18 @@ async fn q05_q06_o10_o29_terminal_receipt_disagrees_with_the_durable_decision() 
     use super::super::CommitStamp;
     let mut f = Fixture::new().await;
     let authority = Authority {
-        run_id: Uuid::new_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
         owner_term: 1,
     };
     f.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: None,
         next: authority,
     })
     .await;
     let request = RequestBinding {
         run_id: authority.run_id,
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         digest: Digest::from_bytes([1; 32]),
         accepted_context: Digest::from_bytes([2; 32]),
     };
@@ -247,7 +247,7 @@ async fn q05_q06_o10_o29_terminal_receipt_disagrees_with_the_durable_decision() 
     let participant = ParticipantPlan {
         group: GroupIdentity {
             kind: GroupKind::Catalog,
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             ..f.machine.store().identity().clone()
         },
         schema_epoch: 1,
@@ -384,16 +384,16 @@ async fn q05_q06_o10_o29_terminal_receipt_disagrees_with_the_durable_decision() 
 async fn r04_r05_o10_reserved_uuid_survives_reopen_and_never_relabels_into_a_new_run() {
     let mut f = Fixture::new().await;
     let authority = Authority {
-        run_id: Uuid::new_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
         owner_term: 1,
     };
     f.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: None,
         next: authority,
     })
     .await;
-    let request = Uuid::new_v4();
+    let request = nabedra_rt::ids::uuid_v4();
     let digest = Digest::from_bytes([3; 32]);
     let first = f.apply(reserve(authority, request, digest)).await;
     let StatusReply::Identity(IdentityLookup::Reserved(reservation)) = first else {
@@ -410,7 +410,7 @@ async fn r04_r05_o10_reserved_uuid_survives_reopen_and_never_relabels_into_a_new
         ..authority
     };
     f.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: Some(authority),
         next: owner,
     })
@@ -420,11 +420,11 @@ async fn r04_r05_o10_reserved_uuid_survives_reopen_and_never_relabels_into_a_new
         StatusReply::Identity(IdentityLookup::Reserved(reservation))
     );
     let cold = Authority {
-        run_id: Uuid::new_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
         owner_term: 3,
     };
     f.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: Some(owner),
         next: cold,
     })
@@ -434,7 +434,7 @@ async fn r04_r05_o10_reserved_uuid_survives_reopen_and_never_relabels_into_a_new
         StatusReply::Identity(IdentityLookup::Abandoned(reservation))
     );
     assert_eq!(
-        f.apply(reserve(owner, Uuid::new_v4(), digest)).await,
+        f.apply(reserve(owner, nabedra_rt::ids::uuid_v4(), digest)).await,
         StatusReply::Rejected(StatusFault::StaleAuthority)
     );
     assert_eq!(
@@ -460,16 +460,16 @@ async fn r04_r05_o10_reserved_uuid_survives_reopen_and_never_relabels_into_a_new
 async fn o10_o29_corrupt_identity_cannot_be_recomputed_as_absent() {
     let mut f = Fixture::new().await;
     let authority = Authority {
-        run_id: Uuid::new_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
         owner_term: 1,
     };
     f.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: None,
         next: authority,
     })
     .await;
-    let request = Uuid::new_v4();
+    let request = nabedra_rt::ids::uuid_v4();
     let digest = Digest::from_bytes([5; 32]);
     f.apply(reserve(authority, request, digest)).await;
     let index = f.index;
@@ -525,16 +525,16 @@ async fn o10_o29_corrupt_identity_cannot_be_recomputed_as_absent() {
 async fn q02_f03_rejection_cas_is_durable_and_cannot_become_a_transaction() {
     let mut f = Fixture::new().await;
     let authority = Authority {
-        run_id: Uuid::new_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
         owner_term: 1,
     };
     f.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: None,
         next: authority,
     })
     .await;
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let digest = Digest::from_bytes([17; 32]);
     let StatusReply::Identity(IdentityLookup::Reserved(reservation)) =
         f.apply(reserve(authority, id, digest)).await
@@ -661,16 +661,16 @@ async fn o22_extracted_terminal_outcome_retains_reply_decode_owner() {
 async fn r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures() {
     let mut f = Fixture::new().await;
     let old = Authority {
-        run_id: Uuid::new_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
         owner_term: 1,
     };
     f.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: None,
         next: old,
     })
     .await;
-    let request_id = Uuid::new_v4();
+    let request_id = nabedra_rt::ids::uuid_v4();
     let digest = Digest::from_bytes([61; 32]);
     let StatusReply::Identity(IdentityLookup::Reserved(reservation)) =
         f.apply(reserve(old, request_id, digest)).await
@@ -715,7 +715,7 @@ async fn r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures(
     let participant = ParticipantPlan {
         group: GroupIdentity {
             kind: GroupKind::Catalog,
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             ..f.machine.store().identity().clone()
         },
         schema_epoch: 1,
@@ -776,11 +776,11 @@ async fn r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures(
         permit,
     };
     let cold = Authority {
-        run_id: Uuid::new_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
         owner_term: 2,
     };
     f.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: Some(old),
         next: cold,
     })
@@ -822,7 +822,7 @@ async fn r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures(
 
     let prior_request = RequestBinding {
         run_id: old.run_id,
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         digest,
         accepted_context: Digest::from_bytes([63; 32]),
     };
@@ -830,7 +830,7 @@ async fn r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures(
         request_id: prior_request.request_id,
         digest,
         original_run: old.run_id,
-        reservation_id: Uuid::new_v4(),
+        reservation_id: nabedra_rt::ids::uuid_v4(),
         kind: RequestKind::Mutation,
         scoped: None,
     };
@@ -923,12 +923,12 @@ async fn r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures(
 
 #[test]
 fn o19_restored_reserved_identity_never_reenters_reused_run() {
-    let run_id = Uuid::new_v4();
+    let run_id = nabedra_rt::ids::uuid_v4();
     let reservation = IdentityReservation {
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         digest: Digest::from_bytes([23; 32]),
         original_run: run_id,
-        reservation_id: Uuid::new_v4(),
+        reservation_id: nabedra_rt::ids::uuid_v4(),
         kind: RequestKind::Mutation,
         scoped: None,
     };
@@ -939,9 +939,9 @@ fn o19_restored_reserved_identity_never_reenters_reused_run() {
         rejection: None,
         retirement: None,
         restore_origin: Some(RestoredHistoryOrigin {
-            restore_id: Uuid::new_v4(),
-            source_cluster: Uuid::new_v4(),
-            source_archive: Uuid::new_v4(),
+            restore_id: nabedra_rt::ids::uuid_v4(),
+            source_cluster: nabedra_rt::ids::uuid_v4(),
+            source_archive: nabedra_rt::ids::uuid_v4(),
             source_root: Digest::from_bytes([41; 32]),
             through_cut: CommitTs::new(7).unwrap(),
         }),
@@ -958,13 +958,13 @@ async fn o13_o14_q06_retirement_certificate_survives_retry_reopen_and_ready_chan
         proof::ReadySetHasher,
     };
     let mut fixture = Fixture::new().await;
-    let authority = Authority { run_id: Uuid::new_v4(), owner_term: 1 };
+    let authority = Authority { run_id: nabedra_rt::ids::uuid_v4(), owner_term: 1 };
     fixture.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(), expected: None, next: authority,
+        transition_id: nabedra_rt::ids::uuid_v4(), expected: None, next: authority,
     }).await;
     let workers: Vec<_> = (1..=3u128).map(|id| WorkerIdentity {
         worker_id: Uuid::from_u128(id),
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         certificate_sha256: Digest::from_bytes([7; 32]),
         enrollment_revision: 1,
     }).collect();
@@ -978,8 +978,8 @@ async fn o13_o14_q06_retirement_certificate_survives_retry_reopen_and_ready_chan
         ready_count: 3,
     };
     let digest = Digest::from_bytes([13; 32]);
-    let request_id = Uuid::new_v4();
-    let reservation_id = Uuid::new_v4();
+    let request_id = nabedra_rt::ids::uuid_v4();
+    let reservation_id = nabedra_rt::ids::uuid_v4();
     let request = RequestBinding {
         run_id: authority.run_id, request_id, digest, accepted_context: Digest::from_bytes([19; 32]),
     };
@@ -991,17 +991,17 @@ async fn o13_o14_q06_retirement_certificate_survives_retry_reopen_and_ready_chan
         response_hash: outcome.response_hash(request_id).unwrap(),
         terminal_digest: Some(Digest::from_bytes([17; 32])),
         pin_identity: PinIdentity { run_id: authority.run_id, request_id, digest, nonce: reservation_id },
-        storage_pin: StoragePin { pin_id: Uuid::new_v4(), read_ts: Timestamp::new(11).unwrap(), allocator_epoch: 1 },
+        storage_pin: StoragePin { pin_id: nabedra_rt::ids::uuid_v4(), read_ts: Timestamp::new(11).unwrap(), allocator_epoch: 1 },
     };
     let mut verifier = TerminalVerifier::begin(original.clone(), ready).unwrap();
     let digest_for_ack = statement_digest(&original).unwrap();
     for worker in workers.iter().take(2) {
-        verifier.accept(*worker, &AuthenticatedAck::from_transport(*worker, digest_for_ack, Uuid::new_v4())).unwrap();
+        verifier.accept(*worker, &AuthenticatedAck::from_transport(*worker, digest_for_ack, nabedra_rt::ids::uuid_v4())).unwrap();
     }
     assert!(verifier.finish(ready).is_err(), "quorum alone cannot certify retirement");
     let mut verifier = TerminalVerifier::begin(original.clone(), ready).unwrap();
     for worker in workers {
-        verifier.accept(worker, &AuthenticatedAck::from_transport(worker, digest_for_ack, Uuid::new_v4())).unwrap();
+        verifier.accept(worker, &AuthenticatedAck::from_transport(worker, digest_for_ack, nabedra_rt::ids::uuid_v4())).unwrap();
     }
     let command = StatusCommand::RetireTerminal {
         authority, proof: verifier.finish(ready).unwrap().into_sealed(),
@@ -1039,9 +1039,9 @@ async fn o13_o14_q06_retirement_certificate_survives_retry_reopen_and_ready_chan
     for forbidden in ["operation", "payload", "authorization", "token", "queue_order", "sequence"] {
         assert!(!encoded.contains(&format!("\"{forbidden}\"")), "{encoded}");
     }
-    let cold = Authority { run_id: Uuid::new_v4(), owner_term: 2 };
+    let cold = Authority { run_id: nabedra_rt::ids::uuid_v4(), owner_term: 2 };
     fixture.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(), expected: Some(authority), next: cold,
+        transition_id: nabedra_rt::ids::uuid_v4(), expected: Some(authority), next: cold,
     }).await;
     assert_eq!(fixture.apply(command).await, StatusReply::Rejected(StatusFault::StaleAuthority));
     assert_eq!(fixture.apply(reserve(cold, request_id, digest)).await, terminal);
@@ -1063,18 +1063,18 @@ async fn retry_abort_fences_commit_and_requires_exact_settlement(fence_owner: bo
 
     let mut f = Fixture::new().await;
     let authority = Authority {
-        run_id: Uuid::new_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
         owner_term: 1,
     };
     f.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: None,
         next: authority,
     })
     .await;
     let request = RequestBinding {
         run_id: authority.run_id,
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         digest: Digest::from_bytes([1; 32]),
         accepted_context: Digest::from_bytes([2; 32]),
     };
@@ -1111,7 +1111,7 @@ async fn retry_abort_fences_commit_and_requires_exact_settlement(fence_owner: bo
     };
     let participant = ParticipantPlan {
         group: GroupIdentity {
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Catalog,
             ..f.machine.store().identity().clone()
         },
@@ -1165,7 +1165,7 @@ async fn retry_abort_fences_commit_and_requires_exact_settlement(fence_owner: bo
             ..authority
         };
         f.apply(StatusCommand::Fence {
-            transition_id: Uuid::new_v4(),
+            transition_id: nabedra_rt::ids::uuid_v4(),
             expected: Some(authority),
             next,
         })
@@ -1277,11 +1277,11 @@ async fn retry_abort_fences_commit_and_requires_exact_settlement(fence_owner: bo
     );
 
     let cold = Authority {
-        run_id: Uuid::new_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
         owner_term: authority.owner_term + 1,
     };
     f.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: Some(authority),
         next: cold,
     })
@@ -1300,7 +1300,7 @@ async fn retry_abort_fences_commit_and_requires_exact_settlement(fence_owner: bo
                 reservation,
                 request: Some(request),
                 pin: StoragePin {
-                    pin_id: Uuid::new_v4(),
+                    pin_id: nabedra_rt::ids::uuid_v4(),
                     read_ts,
                     allocator_epoch: 1,
                 },

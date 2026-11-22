@@ -324,7 +324,7 @@ impl DirectCapabilityDamageGate {
             open: std::sync::atomic::AtomicBool::new(false),
         });
         let weak = std::sync::Arc::downgrade(&gate);
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             loop {
                 let active = control
                     .direct_capability()
@@ -339,7 +339,7 @@ impl DirectCapabilityDamageGate {
                     return;
                 }
                 drop(gate);
-                tokio::time::sleep(every).await;
+                nabedra_rt::time::sleep(every).await;
             }
         });
         gate

@@ -5,7 +5,6 @@ use crate::{
     oltp_replication::authority::control::{ControlHandle, LocalOperatorPermit},
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
-use uuid::Uuid;
 
 pub(super) fn empty() -> crate::oltp_replication::types::Page<SecondaryPoolConfig> {
     crate::oltp_replication::types::Page::new(Vec::new()).expect("an empty pool page is bounded")
@@ -35,7 +34,7 @@ pub(super) async fn open_configured(
         let previous = anchor.retained_worker_if_initialized()?;
         let exclusion = match (previous, entry.mount.profile) {
             (Some(old), PoolMountProfile::Docker { .. }) if old != worker => {
-                Some(operator.exclude_previous_before_open(&policy, Uuid::new_v4(), old)?)
+                Some(operator.exclude_previous_before_open(&policy, nabedra_rt::ids::uuid_v4(), old)?)
             }
             (Some(old), PoolMountProfile::Ebs) if old != worker => {
                 return Err(ProtocolError::new(

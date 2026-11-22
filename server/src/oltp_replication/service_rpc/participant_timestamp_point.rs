@@ -43,7 +43,7 @@ impl ParticipantProofEndpoint {
         header: &Header,
         sections: ChargedSections,
     ) -> Result<ChargedBytes, ProtocolError> {
-        tokio::time::timeout(SERVICE_CONVERGENCE, async {
+        nabedra_rt::time::timeout(SERVICE_CONVERGENCE, async {
             let input: Decoded<ProofRequest> =
                 decode_point_input(&self.shared, self.node, sections).await?;
             let locator = &input.locator;
@@ -304,7 +304,7 @@ impl ParticipantProofClient {
         if client.action != action || client.group != binding.participant.group {
             return Err(invalid());
         }
-        tokio::time::timeout(SERVICE_CONVERGENCE, async {
+        nabedra_rt::time::timeout(SERVICE_CONVERGENCE, async {
             let request = ProofRequest {
                 locator: locator.clone(),
                 scope,
