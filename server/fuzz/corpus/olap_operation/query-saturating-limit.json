@@ -1,0 +1,1 @@
+{"request_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","operation":"query.count","payload":{"table_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","query":{"select":null,"filter":null,"order_by":null,"limit":18446744073709551616}}}
