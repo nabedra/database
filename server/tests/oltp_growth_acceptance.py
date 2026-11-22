@@ -631,19 +631,20 @@ def split_child(source, attempt, side):
     return source | {'group_id': group, 'kind': {'data': dict(table_id=table_id, shard_id=shard)}}
 
 
-def create_with_lagging_queue_replica(constrained, holds):
+def create_with_lagging_queue_replicas(constrained, holds):
     cluster = constrained.cluster
 
     def ready_views():
         views = [cluster.stats(worker)['accept_to_dispatch']['view'] for worker in WORKERS]
         # One of the two followers joined last and has already installed this view.
         newest = max(views, key=lambda view: view['membership_revision'])
-        return views if views[0] == newest and views[1:].count(newest) == 1 else None
+        return views if views[0] != newest and views[1:].count(newest) == 1 else None
 
-    wait_for(ready_views, 'owner and one follower have the current view', 15)
+    wait_for(ready_views, 'owner and existing follower still hold the old view', 15)
     request = operation('table.create', dict(name='capacity_deficit', schema=dict(id='int64', data='utf8'),
                                              key='id', format='parquet'))
-    reached = [hold.parent / f"o21-stale-copy-{request['request_id']}" for hold in holds]
+    proposal = holds[0].parent / f"o21-stale-proposal-{request['request_id']}"
+    copies = [hold.parent / f"o21-stale-copy-{request['request_id']}" for hold in holds[1:]]
     submissions = [cluster.barrier_dir(worker) / f"submissions-{request['request_id']}"
                    for worker in WORKERS]
     for path in submissions:
@@ -651,17 +652,19 @@ def create_with_lagging_queue_replica(constrained, holds):
     with ThreadPoolExecutor(max_workers=1) as executor:
         creating = executor.submit(constrained.api, 'api1', OPERATIONS, request)
 
-        def arrived():
-            if any(path.is_file() for path in reached):
+        def arrived(paths):
+            if any(path.is_file() for path in paths):
                 return True
             assert not creating.done(), creating.result()
             return False
 
         try:
-            wait_for(arrived, 'create copy on the worker with an older queue view', 15)
+            wait_for(lambda: arrived([proposal]), 'create proposal on the owner with an older queue view', 15)
+            holds[0].unlink()
+            wait_for(lambda: arrived(copies), 'create copy on the follower with an older queue view', 15)
         finally:
             for hold in holds:
-                hold.unlink()
+                hold.unlink(missing_ok=True)
         status, reply = creating.result(timeout=30)
     assert status == 200 and reply['request_id'] == request['request_id'], (status, reply)
     attempts = [line for path in submissions for line in path.read_text().splitlines()]
@@ -672,7 +675,7 @@ def create_with_lagging_queue_replica(constrained, holds):
     assert conflict == 409 and response['error']['code'] == 'conflict', (conflict, response)
     table = constrained.db.table('capacity_deficit')
     assert table.id == reply['data']['id'], reply
-    print(f'O21 created and replayed {request["request_id"]} after a follower installed its ready view',
+    print(f'O21 created and replayed {request["request_id"]} after the owner and follower installed the ready view',
           flush=True)
     return table
 
@@ -685,8 +688,8 @@ def check_capacity_deficit(binary, root, direct, *, test_executable=None):
     constrained = Transactions(cluster, direct)
     holds = []
     if test_executable:
-        # Hold the existing follower when the last worker joins. Either follower can join last.
-        for worker in WORKERS[1:]:
+        # Hold existing workers when the last worker joins. Either follower can join last.
+        for worker in WORKERS:
             hold = cluster.barrier_dir(worker) / 'o21-hold-ready-view'
             hold.parent.mkdir(parents=True, exist_ok=True)
             hold.touch()
@@ -694,7 +697,7 @@ def check_capacity_deficit(binary, root, direct, *, test_executable=None):
     try:
         constrained.start()
         configure_growth(cluster)
-        table = (create_with_lagging_queue_replica(constrained, holds) if holds else
+        table = (create_with_lagging_queue_replicas(constrained, holds) if holds else
                  constrained.db.create_table('capacity_deficit', {'id': int, 'data': str}, key='id'))
         rows = [dict(id=key, data='x' * (8 << 10)) for key in range(16)]
         assert constrained.data(batch(table, rows)) == len(rows)

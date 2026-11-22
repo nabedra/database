@@ -477,12 +477,19 @@ impl QueueCoordinator {
         if self.current().await? != current {
             return Err(QueueError::Stale.protocol());
         }
-        let frame = self
-            .replica
-            .lock()
-            .map_err(|_| QueueError::Unavailable.protocol())?
-            .propose(current, body, context, now_ms)
-            .map_err(QueueError::protocol)?;
+        let frame = {
+            let mut replica = self
+                .replica
+                .lock()
+                .map_err(|_| QueueError::Unavailable.protocol())?;
+            #[cfg(test)]
+            if replica.authority() != current {
+                super::recovery_tests::observe_o21_stale_proposal(&body);
+            }
+            replica
+                .propose(current, body, context, now_ms)
+                .map_err(QueueError::protocol)?
+        };
         let id = frame
             .record_version()
             .map_err(QueueError::protocol)?

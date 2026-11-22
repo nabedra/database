@@ -549,6 +549,13 @@ pub(super) fn observe_o21_stale_copy(request: Uuid) {
     }
 }
 
+pub(super) fn observe_o21_stale_proposal(body: &[u8]) {
+    if let Some(directory) = o21_ready_hold() {
+        let request = crate::protocol::parse_request(body).unwrap().request_id;
+        std::fs::write(directory.join(format!("o21-stale-proposal-{request}")), b"").unwrap();
+    }
+}
+
 pub(super) fn count_submission(request: Uuid) {
     use std::io::Write as _;
     let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {
