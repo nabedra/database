@@ -89,3 +89,31 @@ where
         std::thread::Builder::new().name(name.into()).spawn(f)
     }
 }
+
+/// [`spawn_service`] with an explicit stack size, for services that budget their thread
+/// stacks (nabedra-kv's threads, scenario O05).
+///
+/// Product: `std::thread::Builder::new().name(name).stack_size(stack_bytes).spawn(f)`.
+/// Under `sim` it is the same helper thread as [`spawn_service`], with this stack size.
+#[inline]
+pub fn spawn_service_with_stack<F, T>(
+    name: impl Into<String>,
+    stack_bytes: usize,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    #[cfg(feature = "sim")]
+    {
+        crate::sim::spawn_service_with_stack(name.into(), Some(stack_bytes), f)
+    }
+    #[cfg(not(feature = "sim"))]
+    {
+        std::thread::Builder::new()
+            .name(name.into())
+            .stack_size(stack_bytes)
+            .spawn(f)
+    }
+}
