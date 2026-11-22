@@ -116,3 +116,19 @@ class RepeatGateTests(unittest.TestCase):
         with patch("sys.stdin", io.StringIO(body)), redirect_stdout(io.StringIO()) as output:
             self.assertEqual(repeat_gate.main(["--dry-run"]), 0)
         self.assertIn("unittest test_thing.Thing.test_case", output.getvalue())
+
+    def test_partial_rust_module_path_resolves_to_the_full_name(self):
+        # Regression: a selector containing :: skipped resolution, so --exact
+        # matched zero tests and a good test failed the gate.
+        file = "server/src/cache/store.rs"
+        test = {"id": f"{file}::model_tests::get_set", "kind": "rust", "file": file}
+        listing = subprocess.CompletedProcess([], 0, (
+            "cache::store::model_tests::get_set: test\n"
+            "cache::store::model_tests::get_set_twice: test\n"
+        ))
+        passed = subprocess.CompletedProcess([], 0, "test result: ok. 1 passed; 0 failed; 0 ignored;")
+        run = Mock(side_effect=[listing] + [passed] * 5)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(repeat_gate.repeat([test], real_env=True, run=run), 0)
+        command = run.call_args_list[1].args[0]
+        self.assertEqual(command[command.index("--") - 1], "cache::store::model_tests::get_set")

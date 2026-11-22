@@ -90,7 +90,8 @@ def resolve_rust_test(file, selector, names):
     leaf, _, ordinal = selector.partition("#")
     if selector in names:
         return selector
-    matches = [name for name in names if name.rsplit("::", 1)[-1] == leaf]
+    # A catalog may give a path relative to the file's module, such as tests::name.
+    matches = [name for name in names if name == leaf or name.endswith("::" + leaf)]
     if len(matches) > 1:
         parts = file.with_suffix("").parts
         if "src" in parts:
@@ -129,22 +130,23 @@ def repeat(tests, *, root=ROOT, real_env=False, dry_run=False, features=None, ru
         if kind == "rust":
             name_index = command.index("--") - 1
             selector = command[name_index]
-            if "::" not in selector:
-                listing = (*command[:name_index], "--", "--list", "--format", "terse")
-                if listing not in listed:
-                    if dry_run:
-                        print(f"Resolve Rust test names with {shlex.join(listing)}")
-                    else:
-                        process = run(listing, cwd=cwd, text=True,
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                        if process.returncode:
-                            raise ValueError(f"could not list Rust tests for {test['file']}:\n{process.stdout.rstrip()}")
-                        listed[listing] = RUST_TEST_NAME.findall(process.stdout)
+            # Resolve every selector against the listing: --exact needs the full
+            # path, and a partial path would silently match zero tests.
+            listing = (*command[:name_index], "--", "--list", "--format", "terse")
+            if listing not in listed:
                 if dry_run:
-                    command[name_index] = f"<resolved {selector}>"
-                    listed[listing] = []
+                    print(f"Resolve Rust test names with {shlex.join(listing)}")
                 else:
-                    command[name_index] = resolve_rust_test(Path(test["file"]), selector, listed[listing])
+                    process = run(listing, cwd=cwd, text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    if process.returncode:
+                        raise ValueError(f"could not list Rust tests for {test['file']}:\n{process.stdout.rstrip()}")
+                    listed[listing] = RUST_TEST_NAME.findall(process.stdout)
+            if dry_run:
+                command[name_index] = f"<resolved {selector}>"
+                listed[listing] = []
+            else:
+                command[name_index] = resolve_rust_test(Path(test["file"]), selector, listed[listing])
         if dry_run:
             print(f"{test['id']}: {count} × (cd {shlex.quote(str(cwd))} && {shlex.join(command)})")
             continue
