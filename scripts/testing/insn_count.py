@@ -16,6 +16,7 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_WORK_DIR = ROOT.with_name(f"{ROOT.name}-work")
 DRIVERS = Path(__file__).resolve().with_name("insn_workloads")
 EXAMPLE = "phase7_insn_count"
 REPETITIONS = 3
@@ -125,7 +126,8 @@ def measure(counter, binary, workload, directory):
         profile = directory / "callgrind.out"
         output = run(
             [
-                counter, "--tool=callgrind", "--quiet", "--cache-sim=no", "--branch-sim=no",
+                counter, "--tool=callgrind", "--quiet", "--fair-sched=yes",
+                "--cache-sim=no", "--branch-sim=no",
                 f"--callgrind-out-file={profile}", str(binary), workload.name,
             ],
             directory, capture=True, timeout=180,
@@ -158,8 +160,9 @@ def compare(base, head, operations, threshold_pct=DEFAULT_THRESHOLD_PCT):
     }
 
 
-def benchmark(base_sha, head_sha, cargo, counter, workloads):
-    with tempfile.TemporaryDirectory(prefix="nabedra-insn-") as scratch:
+def benchmark(base_sha, head_sha, cargo, counter, workloads, work_dir):
+    work_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="nabedra-insn-", dir=work_dir) as scratch:
         work = Path(scratch)
         with checkout(work / "base", base_sha) as base, checkout(work / "head", head_sha) as head:
             trees = {"base": base, "head": head}
@@ -192,7 +195,9 @@ def main(argv=None):
     parser.add_argument("--cargo", default=shutil.which("cargo-slot") or "cargo",
                         help="Cargo executable or wrapper (default: cargo-slot if installed)")
     parser.add_argument("--threshold-pct", type=float, default=DEFAULT_THRESHOLD_PCT,
-                        help="minimum allowed increase as a percent (default: 0.5)")
+                        help="minimum regression threshold as a percent (default: 0.5)")
+    parser.add_argument("--work-dir", type=Path, default=DEFAULT_WORK_DIR,
+                        help="parent for worktrees and targets (default: sibling <checkout>-work)")
     parser.add_argument("--output", type=Path, help="write raw instruction counts and result as JSON")
     parser.add_argument("--skip-missing-valgrind", action="store_true",
                         help="emit the registered check's not-run marker if Callgrind is missing")
@@ -206,11 +211,11 @@ def main(argv=None):
     try:
         base, head = revision(args.base), revision(args.head)
         version = run([counter, "--version"], ROOT, capture=True).strip()
-        print(f"Callgrind ({version}) base={base} head={head}", flush=True)
+        print(f"Callgrind ({version}, fair scheduler) base={base} head={head}", flush=True)
         results = {}
         workloads = [row for row in WORKLOADS if not args.workload or row.name in args.workload]
         operations = {workload.name: workload.operations for workload in workloads}
-        for name, counts in benchmark(base, head, args.cargo, counter, workloads):
+        for name, counts in benchmark(base, head, args.cargo, counter, workloads, args.work_dir.resolve()):
             row = compare(counts["base"], counts["head"], operations[name], args.threshold_pct)
             results[name] = row
             status = "FAIL" if row["regression"] else "PASS"
@@ -226,7 +231,7 @@ def main(argv=None):
             args.output.write_text(
                 json.dumps(
                     {"base": base, "head": head, "counter": version, "profile": "release",
-                     "regression": regression, "workloads": results},
+                     "fair_scheduling": True, "regression": regression, "workloads": results},
                     indent=2,
                 ) + "\n",
                 encoding="utf-8",

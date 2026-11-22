@@ -57,8 +57,10 @@ python3 scripts/testing/insn_count.py --base e3d51a6 --head HEAD --output counts
 Pass `--workload cache-set` to focus on a single workload during diagnosis.
 
 The runner builds both commits in detached worktrees with private target
-directories. It uses `cargo-slot` when available, or Cargo, with six build
-jobs. It inserts the same driver into both checkouts, including visibility
+directories. These live under a sibling `<checkout>-work` directory by default.
+Use `--work-dir` to put them on another disk. The runner uses `cargo-slot`
+when available, or Cargo, with six build jobs. It inserts the same driver
+into both checkouts, including visibility
 hooks to the standalone Cache command handler and OLAP queue clock. Builds
 use one engine feature at a time and the normal release profile.
 
@@ -69,7 +71,8 @@ use one engine feature at a time and the normal release profile.
 | Cache SET | 8,192 | Parse and execute one standalone SET PX command per operation, including the wall-clock expiry validation. |
 | OLAP queue | 512 | Propose, acknowledge, start, finish and look up a queued request in process, using the production wall-clock helper. |
 
-Each workload runs three times per binary in alternating order. The result
+Each workload runs three times per binary in alternating order with
+Callgrind fair scheduling to reduce variation in threaded paths. The result
 uses the median process-wide instruction count divided by the completed
 operation count. The counter includes setup, teardown and background threads.
 The noise floor is the full spread of the three base counts divided by their

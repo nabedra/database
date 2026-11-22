@@ -51,6 +51,15 @@ class InstructionCountTests(unittest.TestCase):
                     insn_count.measure("valgrind", Path("/binary"), workload, directory)
             self.assertFalse(directory.exists())
 
+    def test_build_work_uses_the_selected_directory(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            work_dir = Path(scratch) / "on-disk"
+            with patch.object(insn_count, "checkout", side_effect=ValueError("checkout failed")) as checkout:
+                with self.assertRaisesRegex(ValueError, "checkout failed"):
+                    list(insn_count.benchmark("base", "head", "cargo", "valgrind", [], work_dir))
+            self.assertEqual(checkout.call_args.args[0].parent.parent, work_dir)
+            self.assertEqual(list(work_dir.iterdir()), [])
+
     def test_cleanup_after_profiler_timeout(self):
         workload = insn_count.WORKLOADS[0]
         with tempfile.TemporaryDirectory() as scratch:
