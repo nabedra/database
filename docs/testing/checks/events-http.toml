@@ -1,0 +1,11 @@
+id = "events-http"
+module = "events"
+kinds = ["U"]
+guarantees = ["EVT-G07", "EVT-G03", "EVT-G05"]
+scenarios = ["EV03", "EV08"]
+tiers = ["T0", "T1"]
+command = ["cargo", "test", "--locked", "-j", "2", "--lib", "http::tests"]
+cwd = "server/events"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"
