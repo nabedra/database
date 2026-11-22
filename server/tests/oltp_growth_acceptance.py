@@ -631,12 +631,11 @@ def split_child(source, attempt, side):
     return source | {'group_id': group, 'kind': {'data': dict(table_id=table_id, shard_id=shard)}}
 
 
-def check_capacity_deficit(facade):
-    parent = facade.cluster
-    cluster = GrowthCluster(parent.binary, parent.root / 'capacity-deficit', mounts=True,
+def check_capacity_deficit(binary, root, direct):
+    cluster = GrowthCluster(binary, root / 'capacity-deficit', mounts=True,
                             automatic=dict(shard_target_bytes=64 << 10, minimum_free_bytes=3 << 30),
-                            direct=dict.fromkeys(WORKERS, facade.direct), api_direct=(facade.direct,))
-    constrained = Transactions(cluster, facade.direct)
+                            direct=dict.fromkeys(WORKERS, direct), api_direct=(direct,))
+    constrained = Transactions(cluster, direct)
     try:
         constrained.start()
         configure_growth(cluster)
@@ -663,6 +662,9 @@ def check_capacity_deficit(facade):
         assert all(pool['available_bytes'] < pool['required_bytes'] for pool in deficit['pools']), deficit
         assert query(constrained, table) == rows
         assert 'shards 1;' in table.query().explain()
+    except BaseException:
+        dump(cluster)
+        raise
     finally:
         cluster.close()
 
@@ -830,7 +832,7 @@ def o21(facade):
            'Simultaneous disjoint mutation manifests each contained one Data write. During an isolated full count, the worker-wide charged decode high-water stayed below the raw size of the table.')
     passed('O21', 'bounded-work',
            'The charged decode high-water stayed below the configured task ceiling. Checked count overflow returned limit_exceeded and left later counts exact.')
-    check_capacity_deficit(facade)
+    check_capacity_deficit(cluster.binary, cluster.root, facade.direct)
     passed('O21', 'capacity-errors', 'A separate RF3 table crossed its target on 2 GiB mounts with a 3 GiB free-space floor. The split reported a measured disk deficit and the existing rows stayed readable.')
 
 
@@ -1192,13 +1194,20 @@ def main():
     parser.add_argument('--scenario', choices=('O16', 'O21', 'O26', 'O28'), required=True)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--test-executable', type=Path, required=True)
+    parser.add_argument('--capacity-only', action='store_true')
     args = parser.parse_args()
     if not Rf3Cluster.mounts_available():
+        if args.capacity_only:
+            raise AssertionError('O21 capacity regression requires Linux and passwordless sudo')
         print('NABEDRA_OLTP_ACCEPTANCE ' + json.dumps(dict(
             scenario=args.scenario, status='not-run', reason='registered RF3 tmpfs mounts require Linux and passwordless sudo'
         )), flush=True)
         return
     direct = os.environ.get('NABEDRA_TEST_DIRECT_OLTP') != 'off'
+    if args.capacity_only:
+        with tempfile.TemporaryDirectory(prefix='nabedra-o21-capacity-') as root:
+            check_capacity_deficit(args.binary, Path(root), direct)
+        return
     if args.scenario == 'O21':
         with args.binary.open('rb') as binary:
             print(f'O21 server SHA-256 {hashlib.file_digest(binary, "sha256").hexdigest()}', flush=True)

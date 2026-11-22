@@ -85,6 +85,25 @@ fn run(scenario: &str) {
 }
 
 #[test]
+#[ignore = "requires the Linux OLTP binary and tmpfs mounts"]
+fn o21_capacity_deficit() {
+    let binary = std::env::var_os("NABEDRA_BIN").expect("OLTP server executable");
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/oltp_growth_acceptance.py");
+    let status = Command::new(
+        std::env::var_os("NABEDRA_ACCEPTANCE_PYTHON").unwrap_or_else(|| "python3.11".into()),
+    )
+    .arg(script)
+    .args(["--scenario", "O21", "--capacity-only", "--binary"])
+    .arg(binary)
+    .arg("--test-executable")
+    .arg(std::env::current_exe().unwrap())
+    .env("PYTHONDONTWRITEBYTECODE", "1")
+    .status()
+    .expect("launch O21 capacity regression");
+    assert!(status.success(), "O21 capacity assertions failed");
+}
+
+#[test]
 #[ignore = "run through scripts/acceptance_oltp.py"]
 fn acceptance_o16() {
     run("O16");
