@@ -187,7 +187,7 @@ fn terminal(fixture: &Fixture, frame: &RecordFrame, result: bool) -> RecordFrame
 }
 
 fn deadline() -> Deadline {
-    Deadline::now() + Duration::from_secs(1)
+    nabedra_rt::time::now() + Duration::from_secs(1)
 }
 
 #[tokio::test(start_paused = true)]
@@ -212,7 +212,7 @@ async fn scoped_q03_q06_delayed_replica_does_not_block_exact_acceptance_or_termi
     );
     assert!(wire.calls.lock().unwrap().is_empty());
     let accepted = accept(&placement, owner, &wire, &frame, due).await.unwrap();
-    assert!(Deadline::now() < due);
+    assert!(nabedra_rt::time::now() < due);
     assert_eq!(wire.marked(), 2);
     for replica in &wire.replicas[0..2] {
         let replica = replica.lock().unwrap();
@@ -311,7 +311,7 @@ async fn scoped_q03_r01_minorities_cannot_accept_and_same_request_retry_keeps_th
     let owner = fixture.authority.owner;
 
     assert_eq!(
-        accept(&placement, owner, &wire, &frame, Deadline::now()).await,
+        accept(&placement, owner, &wire, &frame, nabedra_rt::time::now()).await,
         Err(QueueError::Unavailable)
     );
     assert!(wire.calls.lock().unwrap().is_empty());
