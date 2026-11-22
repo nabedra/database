@@ -1,0 +1,321 @@
+{
+  "input": {
+    "topic": "orders",
+    "subscription": "audit",
+    "partition": 4,
+    "claim_id": "00000000-0000-0000-0000-000000000003",
+    "event_id": "00000000-0000-0000-0000-000000000002",
+    "data": {
+      "item": "雪",
+      "active": true
+    },
+    "limit": 2,
+    "through": "9007199254740993"
+  },
+  "operations": {
+    "claim": {
+      "setup": [],
+      "request": {
+        "method": "POST",
+        "path": "/v1/topics/orders/partitions/4/subscriptions/audit/claim",
+        "body": "{\"claim_id\":\"00000000-0000-0000-0000-000000000003\"}",
+        "headers": {
+          "authorization": "Bearer fixture",
+          "content-type": "application/json"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": "{\"lease\":\"fixture.lease\",\"expires_at\":\"2026-11-17T12:00:00Z\"}"
+      }
+    },
+    "publish": {
+      "setup": [],
+      "request": {
+        "method": "POST",
+        "path": "/v1/topics/orders/partitions/4/events",
+        "body": "{\"data\":{\"active\":true,\"item\":\"雪\"},\"event_id\":\"00000000-0000-0000-0000-000000000002\"}",
+        "headers": {
+          "authorization": "Bearer fixture",
+          "content-type": "application/json"
+        }
+      },
+      "response": {
+        "status": 201,
+        "body": "{\"topic_id\":\"00000000-0000-0000-0000-000000000001\",\"partition\":4,\"offset\":\"9007199254740993\",\"event_id\":\"00000000-0000-0000-0000-000000000002\",\"published_at\":\"2026-11-17T12:00:00Z\",\"data\":{\"active\":true,\"item\":\"雪\"}}"
+      },
+      "result": {
+        "topic_id": "00000000-0000-0000-0000-000000000001",
+        "partition": 4,
+        "offset": "9007199254740993",
+        "event_id": "00000000-0000-0000-0000-000000000002",
+        "published_at": "2026-11-17T12:00:00Z",
+        "data": {
+          "active": true,
+          "item": "雪"
+        }
+      }
+    },
+    "poll": {
+      "setup": [
+        "claim"
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/v1/topics/orders/partitions/4/subscriptions/audit/events?limit=2",
+        "body": "",
+        "headers": {
+          "authorization": "Bearer fixture",
+          "x-events-lease": "fixture.lease"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": "{\"after\":\"9007199254740992\",\"events\":[{\"topic_id\":\"00000000-0000-0000-0000-000000000001\",\"partition\":4,\"offset\":\"9007199254740993\",\"event_id\":\"00000000-0000-0000-0000-000000000002\",\"published_at\":\"2026-11-17T12:00:00Z\",\"data\":{\"active\":true,\"item\":\"雪\"}}],\"delivery\":\"fixture.delivery\"}"
+      },
+      "result": {
+        "after": "9007199254740992",
+        "events": [
+          {
+            "topic_id": "00000000-0000-0000-0000-000000000001",
+            "partition": 4,
+            "offset": "9007199254740993",
+            "event_id": "00000000-0000-0000-0000-000000000002",
+            "published_at": "2026-11-17T12:00:00Z",
+            "data": {
+              "active": true,
+              "item": "雪"
+            }
+          }
+        ],
+        "delivery": "fixture.delivery"
+      }
+    },
+    "ack": {
+      "setup": [
+        "claim",
+        "poll"
+      ],
+      "request": {
+        "method": "PUT",
+        "path": "/v1/topics/orders/partitions/4/subscriptions/audit/checkpoint",
+        "body": "{\"delivery\":\"fixture.delivery\",\"through\":\"9007199254740993\"}",
+        "headers": {
+          "authorization": "Bearer fixture",
+          "x-events-lease": "fixture.lease",
+          "content-type": "application/json"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": "{\"offset\":\"9007199254740993\"}"
+      },
+      "result": "9007199254740993"
+    }
+  },
+  "cases": [
+    {
+      "name": "publish decodes its exact receipt",
+      "operation": "publish"
+    },
+    {
+      "name": "poll decodes a contiguous page",
+      "operation": "poll"
+    },
+    {
+      "name": "empty poll retains its checkpoint",
+      "operation": "poll",
+      "response": {
+        "status": 200,
+        "body": "{\"after\":\"9007199254740993\",\"events\":[],\"delivery\":null}"
+      },
+      "result": {
+        "after": "9007199254740993",
+        "events": [],
+        "delivery": null
+      }
+    },
+    {
+      "name": "ack encodes the exact prefix offset",
+      "operation": "ack"
+    },
+    {
+      "name": "confirmed publish rejection",
+      "operation": "publish",
+      "response": {
+        "status": 409,
+        "body": "{\"code\":\"conflict\",\"message\":\"ID reused\",\"outcome\":\"not_applied\"}"
+      },
+      "error": {
+        "type": "EventsError",
+        "status_code": 409,
+        "code": "conflict",
+        "outcome": "not_applied",
+        "message": "ID reused"
+      }
+    },
+    {
+      "name": "publish gateway error has unknown outcome",
+      "operation": "publish",
+      "response": {
+        "status": 504,
+        "body": "{\"code\":\"unavailable\",\"message\":\"gateway timed out\"}"
+      },
+      "error": {
+        "type": "EventsUnknownOutcomeError",
+        "status_code": 504,
+        "code": "unavailable",
+        "outcome": "unknown",
+        "message": "gateway timed out"
+      }
+    },
+    {
+      "name": "expired checkpoint keeps earliest offset and retry delay",
+      "operation": "poll",
+      "response": {
+        "status": 409,
+        "body": "{\"code\":\"checkpoint_expired\",\"message\":\"page was trimmed\",\"partition\":4,\"earliest_offset\":\"9007199254740993\"}",
+        "headers": {
+          "Retry-After": "2"
+        }
+      },
+      "error": {
+        "type": "EventsError",
+        "status_code": 409,
+        "code": "checkpoint_expired",
+        "outcome": null,
+        "message": "page was trimmed",
+        "partition": 4,
+        "earliest_offset": "9007199254740993",
+        "retry_after": 2
+      }
+    },
+    {
+      "name": "ack rejects a lost lease",
+      "operation": "ack",
+      "response": {
+        "status": 409,
+        "body": "{\"code\":\"lease_lost\",\"message\":\"claim ended\",\"outcome\":\"not_applied\"}"
+      },
+      "error": {
+        "type": "EventsError",
+        "status_code": 409,
+        "code": "lease_lost",
+        "outcome": "not_applied",
+        "message": "claim ended"
+      }
+    },
+    {
+      "name": "publish receipt has another event ID",
+      "operation": "publish",
+      "response": {
+        "status": 201,
+        "body": "{\"topic_id\":\"00000000-0000-0000-0000-000000000001\",\"partition\":4,\"offset\":\"9007199254740993\",\"event_id\":\"00000000-0000-0000-0000-000000000003\",\"published_at\":\"2026-11-17T12:00:00Z\",\"data\":{\"active\":true,\"item\":\"雪\"}}"
+      },
+      "error": {
+        "type": "EventsUnknownOutcomeError",
+        "status_code": 201,
+        "code": "outcome_unknown",
+        "outcome": "unknown"
+      }
+    },
+    {
+      "name": "publish offset is a number",
+      "operation": "publish",
+      "response": {
+        "status": 201,
+        "body": "{\"topic_id\":\"00000000-0000-0000-0000-000000000001\",\"partition\":4,\"offset\":9007199254740993,\"event_id\":\"00000000-0000-0000-0000-000000000002\",\"published_at\":\"2026-11-17T12:00:00Z\",\"data\":{\"active\":true,\"item\":\"雪\"}}"
+      },
+      "error": {
+        "type": "EventsUnknownOutcomeError",
+        "status_code": 201,
+        "code": "outcome_unknown",
+        "outcome": "unknown"
+      }
+    },
+    {
+      "name": "duplicate delivery field",
+      "operation": "poll",
+      "response": {
+        "status": 200,
+        "body": "{\"after\":\"9007199254740992\",\"events\":[{\"topic_id\":\"00000000-0000-0000-0000-000000000001\",\"partition\":4,\"offset\":\"9007199254740993\",\"event_id\":\"00000000-0000-0000-0000-000000000002\",\"published_at\":\"2026-11-17T12:00:00Z\",\"data\":{\"active\":true,\"item\":\"雪\"}}],\"delivery\":\"fixture.delivery\",\"delivery\":\"different\"}"
+      },
+      "error": {
+        "type": "EventsProtocolError",
+        "status_code": 200,
+        "code": "protocol_error",
+        "outcome": null
+      }
+    },
+    {
+      "name": "page skips an offset",
+      "operation": "poll",
+      "response": {
+        "status": 200,
+        "body": "{\"after\":\"9007199254740991\",\"events\":[{\"topic_id\":\"00000000-0000-0000-0000-000000000001\",\"partition\":4,\"offset\":\"9007199254740993\",\"event_id\":\"00000000-0000-0000-0000-000000000002\",\"published_at\":\"2026-11-17T12:00:00Z\",\"data\":{\"active\":true,\"item\":\"雪\"}}],\"delivery\":\"fixture.delivery\"}"
+      },
+      "error": {
+        "type": "EventsProtocolError",
+        "status_code": 200,
+        "code": "protocol_error",
+        "outcome": null
+      }
+    },
+    {
+      "name": "error checkpoint is outside uint64",
+      "operation": "poll",
+      "response": {
+        "status": 409,
+        "body": "{\"code\":\"checkpoint_expired\",\"message\":\"trimmed\",\"earliest_offset\":\"18446744073709551616\"}"
+      },
+      "error": {
+        "type": "EventsProtocolError",
+        "status_code": 409,
+        "code": "protocol_error",
+        "outcome": null
+      }
+    },
+    {
+      "name": "truncated JSON",
+      "operation": "poll",
+      "response": {
+        "status": 200,
+        "body": "{\"after\":"
+      },
+      "error": {
+        "type": "EventsProtocolError",
+        "status_code": 200,
+        "code": "protocol_error",
+        "outcome": null
+      }
+    },
+    {
+      "name": "ack receipt is behind the acknowledged event",
+      "operation": "ack",
+      "response": {
+        "status": 200,
+        "body": "{\"offset\":\"9007199254740992\"}"
+      },
+      "error": {
+        "type": "EventsUnknownOutcomeError",
+        "status_code": 200,
+        "code": "outcome_unknown",
+        "outcome": "unknown"
+      }
+    },
+    {
+      "name": "ack offset has a leading zero",
+      "operation": "ack",
+      "response": {
+        "status": 200,
+        "body": "{\"offset\":\"09007199254740993\"}"
+      },
+      "error": {
+        "type": "EventsUnknownOutcomeError",
+        "status_code": 200,
+        "code": "outcome_unknown",
+        "outcome": "unknown"
+      }
+    }
+  ]
+}

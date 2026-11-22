@@ -1,0 +1,303 @@
+{
+  "input": {
+    "table": "users",
+    "minimum_age": "9007199254740993",
+    "insert_age": "9223372036854775807",
+    "insert_id": "雪",
+    "limit": 2
+  },
+  "operations": {
+    "describe": {
+      "setup": [],
+      "request": {
+        "method": "POST",
+        "path": "/v1/operations",
+        "body": "{\"request_id\":\"@request_id\",\"operation\":\"table.describe\",\"payload\":{\"name\":\"users\"}}",
+        "headers": {
+          "authorization": "Bearer fixture",
+          "x-nabedra-database": "analytics-v1",
+          "content-type": "application/json"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"@request_id\",\"data\":{\"id\":\"00000000-0000-0000-0000-000000000010\",\"name\":\"users\",\"schema\":{\"id\":\"utf8\",\"age\":\"int64\",\"active\":\"bool\"},\"key\":\"id\",\"format\":\"parquet\"}}"
+      },
+      "result": null
+    },
+    "collect": {
+      "setup": [
+        "describe"
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/v1/operations",
+        "body": "{\"request_id\":\"@request_id\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000010\",\"query\":{\"select\":[\"id\",\"age\"],\"filter\":{\"op\":\"and\",\"args\":[{\"op\":\"ge\",\"column\":\"age\",\"value\":9007199254740993},{\"op\":\"eq\",\"column\":\"active\",\"value\":true}]},\"order_by\":{\"column\":\"age\",\"desc\":true},\"limit\":2}}}",
+        "headers": {
+          "authorization": "Bearer fixture",
+          "x-nabedra-database": "analytics-v1",
+          "content-type": "application/json"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"@request_id\",\"data\":[{\"id\":\"雪\",\"age\":9223372036854775807}]}"
+      },
+      "result": [
+        {
+          "id": "雪",
+          "age": "9223372036854775807"
+        }
+      ]
+    },
+    "count": {
+      "setup": [
+        "describe"
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/v1/operations",
+        "body": "{\"request_id\":\"@request_id\",\"operation\":\"query.count\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000010\",\"query\":{\"select\":[\"id\",\"age\"],\"filter\":{\"op\":\"and\",\"args\":[{\"op\":\"ge\",\"column\":\"age\",\"value\":9007199254740993},{\"op\":\"eq\",\"column\":\"active\",\"value\":true}]},\"order_by\":{\"column\":\"age\",\"desc\":true},\"limit\":2}}}",
+        "headers": {
+          "authorization": "Bearer fixture",
+          "x-nabedra-database": "analytics-v1",
+          "content-type": "application/json"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"@request_id\",\"data\":2}"
+      },
+      "result": "2"
+    },
+    "explain": {
+      "setup": [
+        "describe"
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/v1/operations",
+        "body": "{\"request_id\":\"@request_id\",\"operation\":\"query.explain\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000010\",\"query\":{\"select\":[\"id\",\"age\"],\"filter\":{\"op\":\"and\",\"args\":[{\"op\":\"ge\",\"column\":\"age\",\"value\":9007199254740993},{\"op\":\"eq\",\"column\":\"active\",\"value\":true}]},\"order_by\":{\"column\":\"age\",\"desc\":true},\"limit\":2}}}",
+        "headers": {
+          "authorization": "Bearer fixture",
+          "x-nabedra-database": "analytics-v1",
+          "content-type": "application/json"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"@request_id\",\"data\":\"project id, age\"}"
+      },
+      "result": "project id, age"
+    },
+    "insert": {
+      "setup": [
+        "describe"
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/v1/operations",
+        "body": "{\"request_id\":\"@request_id\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000010\",\"row\":{\"id\":\"雪\",\"age\":9223372036854775807,\"active\":true}}}",
+        "headers": {
+          "authorization": "Bearer fixture",
+          "x-nabedra-database": "analytics-v1",
+          "content-type": "application/json"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"@request_id\",\"data\":null}"
+      },
+      "result": null
+    }
+  },
+  "cases": [
+    {
+      "name": "projected rows preserve int64 and Unicode",
+      "operation": "collect"
+    },
+    {
+      "name": "count respects the query limit",
+      "operation": "count"
+    },
+    {
+      "name": "explain decodes text",
+      "operation": "explain"
+    },
+    {
+      "name": "insert encodes an int64 and accepts null",
+      "operation": "insert"
+    },
+    {
+      "name": "typed read rejection",
+      "operation": "collect",
+      "response": {
+        "status": 429,
+        "body": "{\"request_id\":\"@request_id\",\"error\":{\"code\":\"overloaded\",\"message\":\"query queue full\",\"outcome\":\"not_applied\"}}"
+      },
+      "error": {
+        "type": "OverloadedError",
+        "status_code": 429,
+        "code": "overloaded",
+        "outcome": "not_applied",
+        "message": "query queue full"
+      }
+    },
+    {
+      "name": "confirmed write rejection",
+      "operation": "insert",
+      "response": {
+        "status": 409,
+        "body": "{\"request_id\":\"@request_id\",\"error\":{\"code\":\"conflict\",\"message\":\"duplicate key\",\"outcome\":\"not_applied\"}}"
+      },
+      "error": {
+        "type": "ConflictError",
+        "status_code": 409,
+        "code": "conflict",
+        "outcome": "not_applied",
+        "message": "duplicate key"
+      }
+    },
+    {
+      "name": "server reports an unknown write",
+      "operation": "insert",
+      "response": {
+        "status": 503,
+        "body": "{\"request_id\":\"@request_id\",\"error\":{\"code\":\"outcome_unknown\",\"message\":\"commit uncertain\",\"outcome\":\"unknown\"}}"
+      },
+      "error": {
+        "type": "UnknownOutcomeError",
+        "status_code": 503,
+        "code": "outcome_unknown",
+        "outcome": "unknown",
+        "message": "commit uncertain"
+      }
+    },
+    {
+      "name": "duplicate JSON fields",
+      "operation": "count",
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"@request_id\",\"data\":1,\"data\":2}"
+      },
+      "error": {
+        "type": "ProtocolError",
+        "status_code": 200,
+        "code": "protocol_error",
+        "outcome": null
+      }
+    },
+    {
+      "name": "float token for count",
+      "operation": "count",
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"@request_id\",\"data\":1.0}"
+      },
+      "error": {
+        "type": "ProtocolError",
+        "status_code": 200,
+        "code": "protocol_error",
+        "outcome": null
+      }
+    },
+    {
+      "name": "count exceeds limit",
+      "operation": "count",
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"@request_id\",\"data\":3}"
+      },
+      "error": {
+        "type": "ProtocolError",
+        "status_code": 200,
+        "code": "protocol_error",
+        "outcome": null
+      }
+    },
+    {
+      "name": "projected int64 exceeds range",
+      "operation": "collect",
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"@request_id\",\"data\":[{\"id\":\"雪\",\"age\":9223372036854775808}]}"
+      },
+      "error": {
+        "type": "ProtocolError",
+        "status_code": 200,
+        "code": "protocol_error",
+        "outcome": null
+      }
+    },
+    {
+      "name": "row has an unexpected column",
+      "operation": "collect",
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"@request_id\",\"data\":[{\"id\":\"雪\",\"age\":1,\"active\":true}]}"
+      },
+      "error": {
+        "type": "ProtocolError",
+        "status_code": 200,
+        "code": "protocol_error",
+        "outcome": null
+      }
+    },
+    {
+      "name": "reply echoes another request ID",
+      "operation": "explain",
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"00000000-0000-0000-0000-000000000001\",\"data\":\"plan\"}"
+      },
+      "error": {
+        "type": "ProtocolError",
+        "status_code": 200,
+        "code": "protocol_error",
+        "outcome": null
+      }
+    },
+    {
+      "name": "error code disagrees with status",
+      "operation": "explain",
+      "response": {
+        "status": 404,
+        "body": "{\"request_id\":\"@request_id\",\"error\":{\"code\":\"overloaded\",\"message\":\"bad\",\"outcome\":\"not_applied\"}}"
+      },
+      "error": {
+        "type": "ProtocolError",
+        "status_code": 404,
+        "code": "protocol_error",
+        "outcome": null
+      }
+    },
+    {
+      "name": "truncated JSON",
+      "operation": "explain",
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"@request_id\",\"data\":"
+      },
+      "error": {
+        "type": "ProtocolError",
+        "status_code": 200,
+        "code": "protocol_error",
+        "outcome": null
+      }
+    },
+    {
+      "name": "invalid success body leaves the write uncertain",
+      "operation": "insert",
+      "response": {
+        "status": 200,
+        "body": "{\"request_id\":\"@request_id\",\"data\":true}"
+      },
+      "error": {
+        "type": "UnknownOutcomeError",
+        "status_code": 200,
+        "code": "outcome_unknown",
+        "outcome": "unknown"
+      }
+    }
+  ]
+}
