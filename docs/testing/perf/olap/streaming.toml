@@ -1,0 +1,19 @@
+name = "OLAP streaming batch p99"
+module = "olap"
+command = [
+    "sh", "-eu", "-c",
+    '''
+if [ "$3" = base ]; then
+    commit="$NABEDRA_PERF_BASE_SHA"
+else
+    commit="$NABEDRA_PERF_HEAD_SHA"
+fi
+export PYTHONPATH=orm/python/src
+exec python3.11 scripts/benchmark_olap_streaming.py --binary "$1" --commit "$commit" --fixture-commit "$NABEDRA_PERF_FIXTURE_SHA" --profile dense_fast --evidence "$2"
+''',
+    "olap-benchmark", "{bin}", "{work}/streaming.json", "{side}",
+]
+warmup = 1
+rounds = 6
+metric_file = "streaming.json"
+metric = '"steady_next_ms"\s*:\s*\{[^}]*"p99"\s*:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'

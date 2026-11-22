@@ -1,0 +1,11 @@
+name = "KV GET hit p99"
+module = "kv"
+command = [
+    "sh", "-eu", "-c",
+    'exec python3.11 scripts/cache-benchmark/local_cluster.py --nabedra "$1" --valkey "$NABEDRA_PERF_VALKEY" --valkey-cli "$NABEDRA_PERF_VALKEY_CLI" --client-cpu "$NABEDRA_PERF_CLIENT_CPU" --drivers stock --output "$2"',
+    "kv-benchmark", "{bin}", "{work}",
+]
+warmup = 1
+rounds = 6
+metric_file = "benchmark/3-stock-get-hit-64-24-r0-nabedra.json"
+metric = '"p99"\s*:\s*(\d+(?:\.\d+)?)'
