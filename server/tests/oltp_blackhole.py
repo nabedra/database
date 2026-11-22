@@ -143,9 +143,13 @@ def wait_leaders(cluster, groups, workers, *, down=None, started=None, limit=12)
     return leaders
 
 
-def traffic(cluster, table, write, started, window, first_key):
+def traffic(cluster, table, write, started, bound, first_key):
     label, table_id = table
-    client = Http(cluster.api_urls['api1'], cluster.auth['data_token'], 7, cluster.ca)
+    # Let the first attempt observe the full failover bound. A shorter HTTP
+    # timeout can discard an in-budget reply and leave the retry probing a
+    # silent voter. The assertion still measures from when the drop began.
+    client = Http(cluster.api_urls['api1'], cluster.auth['data_token'], bound, cluster.ca)
+    window = max(11, bound + 2)
     successes = []
     trace = []
     value = first_key
@@ -186,10 +190,9 @@ def scenario(cluster, tables, groups, leaders, victim, bound, round_no):
                     token=token, ca=cluster.ca)[0] == 200
     record('before drop', victim=victim, workers=leaders)
     results = {}
-    window = max(11, bound + 2)
     with cluster.blackhole(victim) as started, ThreadPoolExecutor(max_workers=len(tables) * 2 + 1) as pool:
         elections = pool.submit(wait_leaders, cluster, groups, survivors, down=victim, started=started)
-        running = {(table[0], write): pool.submit(traffic, cluster, table, write, started, window, round_no * 10000)
+        running = {(table[0], write): pool.submit(traffic, cluster, table, write, started, bound, round_no * 10000)
                    for table in tables for write in (False, True)}
         for key, future in running.items():
             results[key] = future.result()

@@ -4,4 +4,3 @@
 # owner: the task or thread that fixes it, assigned by the orchestrator; `unassigned` until then.
 # added/expires: ISO dates. exit_criteria: what lets the row be deleted.
 id	kind	owner	added	expires	exit_criteria
-O09	scenario	FLAKE4	2026-11-22	2026-12-06	no-backdated-allocation barrier watchdog in the acceptance job (run 44971219736, passed in both direct legs of the same run): fix with a regression test that failed before it, then 20/20 O09 passes

@@ -2,6 +2,7 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from functools import lru_cache
 import http.client
 import json
@@ -646,6 +647,7 @@ def check_allocator(fixture, table, commit_ts):
     assert latest['first'] > new['last'], (latest, new)
     for worker in WORKERS:
         (cluster.barrier_dir(worker) / 'clock-offset-seconds').unlink()
+    evidence('O09', 'allocator-failover', previous=previous, replacement=replacement)
 
     if clock_jumps:
         passed('O09', 'timestamp-order',
@@ -654,7 +656,7 @@ def check_allocator(fixture, table, commit_ts):
         not_run('O09', 'timestamp-order', 'Timestamp failover and old-leader resume passed. Wall-clock jumps require Linux and a C compiler.')
 
     if fixture.direct:
-        verify_direct_scan(fixture, table, expected, latest['last'])
+        verify_direct_scan(fixture, table, expected, latest['last'], survivors)
     passed('O09', 'no-backdated-allocation',
            'Four-value AllocateDirect replies advanced past completed allocations and a queued scan pin. The new leader advanced past the old window.')
 
@@ -671,8 +673,51 @@ def admit_after_election(fixture, body):
     raise AssertionError(f'request admission did not resume after Timestamp election: {status}, {reply}')
 
 
-def verify_direct_scan(fixture, table, prior_rows, completed_ts):
+def wait_for_recovered_read(fixture, api, new_request, expected):
+    last = None
+    attempts = 0
+
+    def observe():
+        nonlocal last, attempts
+        # A failed queued query can have a terminal receipt. Each readiness
+        # probe is read-only and needs a fresh ID to check current progress.
+        body = new_request()
+        attempts += 1
+        try:
+            status, reply = fixture.api(api, OPERATIONS, body, timeout=3)
+        except (OSError, http.client.HTTPException) as error:
+            last = repr(error)
+            return False
+        last = status, reply
+        assert reply['request_id'] == body['request_id'], (api, last)
+        if status == 200:
+            assert reply['data'] == expected, (api, reply)
+            return True
+        assert (status, reply['error']['code']) in {
+            (429, 'overloaded'), (503, 'storage_unavailable'), (503, 'outcome_unknown'),
+        }, (api, last)
+        return False
+
+    try:
+        wait_until(observe, f'{api} read service did not recover after allocator failover', timeout=15)
+    except TimeoutError as error:
+        raise AssertionError(f'{error}: {last}') from error
+    evidence('O09', 'post-failover-read', api=api, attempts=attempts)
+
+
+def verify_direct_scan(fixture, table, prior_rows, clock_jump_ts, survivors):
     row = rows(12, category=7)[0]
+    # SIGSTOP pauses every group on the old allocator's worker. The new
+    # Timestamp leader can issue before Catalog and Data can serve requests.
+    # Check a scan over both ranges and a point at the write's route before
+    # starting the race. The racing write must still hit direct-proposing.
+    wait_for_recovered_read(fixture, 'api2', lambda: fixture.query(table), prior_rows)
+    wait_for_recovered_read(fixture, 'api1', lambda: point(table, 'get', key=row['id']), None)
+    # Take the timestamp under test after the probes. A queued read moves the
+    # allocator watermark and can invalidate the rest of a direct window.
+    _, completed, _ = allocator(fixture, survivors)
+    assert completed['first'] > clock_jump_ts, (completed, clock_jump_ts)
+    completed_ts = completed['last']
     body = point(table, 'insert', row=row)
     request_id = body['request_id']
     reached = direct_proposal_paths(fixture, request_id)
@@ -683,16 +728,36 @@ def verify_direct_scan(fixture, table, prior_rows, completed_ts):
     with ThreadPoolExecutor(max_workers=1) as pool:
         write = pool.submit(fixture.data, body)
         try:
-            wait_for(reached, lambda path: path.read_text() == 'direct-proposing', timeout=15)
+            def proposing():
+                if write.done():
+                    result = write.result()
+                    raise AssertionError(f'{request_id} completed before the direct proposal: {result!r}')
+                for path in reached:
+                    try:
+                        if path.read_text() == 'direct-proposing':
+                            return path
+                    except FileNotFoundError:
+                        pass
+                return None
+
+            wait_until(proposing, f'{request_id} did not reach direct-proposing', timeout=15)
             assert not write.done()
             admit_after_election(fixture, scan)
             _, scan_ts = fixture.reached(scan_id, 'snapshot')
+        except Exception:
+            with suppress(OSError, http.client.HTTPException, ValueError):
+                status, stats = fixture.api('api1', '/v1/runtime/stats', timeout=2)
+                if status == 200:
+                    evidence('O09', 'direct-scan-failure', request_id=request_id,
+                             gateway=stats['direct_gateway'], timings=stats['api_stage_timing'])
+            raise
         finally:
             release_direct_proposal(fixture, request_id)
         assert write.result(timeout=35) is None
     _, used = fixture.reached(request_id, 'direct-timestamp')
     assert completed_ts < used < scan_ts, (completed_ts, used, scan_ts)
     fixture.terminal(scan_id, prior_rows + [row])
+    evidence('O09', 'direct-scan-order', allocator_ts=completed_ts, commit_ts=used, scan_ts=scan_ts)
 
 
 def o11(fixture):
