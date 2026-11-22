@@ -175,6 +175,76 @@ async fn create(app: &Router) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane() {
+    use crate::{
+        oltp_replication::{
+            multiplex::TrafficClass,
+            types::{TxnDecision, TxnId},
+        },
+        oltp_runtime::recovery_tests::index_holds::{Checkpoint, register_checkpoint},
+        request_queue::RequestState,
+    };
+
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("nabedra-o07-prepare-lane-{}", Uuid::new_v4())),
+        );
+        let runtime = open(&directory.0, ExecutionConfig::default().direct_oltp).await;
+        activated(&runtime).await;
+        let app = runtime.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
+        let id = Uuid::new_v4();
+        let batch = body(
+            id,
+            "table.insert_many",
+            json!({
+                "table_id": table,
+                "rows": [
+                    {"id": -1, "value": 10, "tag": "left"},
+                    {"id": 1, "value": 20, "tag": "right"},
+                ],
+            }),
+        );
+        let preparing = register_checkpoint(id, Checkpoint::QueuedPrepare);
+        let mut result = Box::pin(call(&app, batch.clone(), false));
+        let checkpoint = tokio::select! {
+            checkpoint = preparing => checkpoint.unwrap(),
+            reply = &mut result => panic!("batch ended before queued Prepare: {reply:?}"),
+        };
+        let record = runtime.services.replica.lock().unwrap().observation(id).unwrap();
+        assert!(record.accepted);
+        assert_eq!(record.state, RequestState::Running);
+        let client = runtime.services.manager.client();
+        let storage = client.hold_outgoing_for_test(TrafficClass::Storage);
+        checkpoint.release.send(false).unwrap();
+        tokio::select! {
+            () = client.outgoing_lane_full_for_test(TrafficClass::Storage) => {}
+            reply = &mut result => panic!("batch ended with Storage held: {reply:?}"),
+        }
+        drop(storage);
+
+        let original = result.await;
+        assert_eq!(original, (200, json!({"request_id": id, "data": 2})));
+        assert_eq!(call(&app, batch, false).await, original);
+        let txn = TxnId {
+            request_id: id,
+            attempt: 1,
+        };
+        let committed = runtime.services.status.inspect_transaction(txn).await.unwrap().unwrap();
+        assert!(matches!(committed.decision.unwrap().decision, TxnDecision::Commit { .. }));
+        assert!(runtime.services.status.inspect_transaction(TxnId { attempt: 2, ..txn })
+            .await.unwrap().is_none());
+        for (key, value) in [(-1, 10), (1, 20)] {
+            let key_read = body(Uuid::new_v4(), "table.get", json!({"table_id":table,"key":key}));
+            let (status, read) = call(&app, key_read, true).await;
+            assert_eq!(status, 200, "{read}");
+            assert_eq!(read["data"]["value"], value);
+        }
+        runtime.drain().await.unwrap();
+    }).await.expect("queued Prepare saturation watchdog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d03_q05_bug1_direct_retry_without_content_length_replays_original_result() {
     tokio::time::timeout(Duration::from_secs(90), async {
         let directory = TestDirectory(
