@@ -294,6 +294,7 @@ fn crash_aborts_the_nodes_tasks_and_their_descendants() {
 }
 
 #[test]
+#[allow(clippy::async_yields_async)] // in_node returns a handle spawned inside the node.
 fn spawn_on_registers_with_the_node() {
     run(6, |world| async move {
         world.add_node(1, NodeClock::default());
@@ -365,6 +366,7 @@ fn spawn_blocking_runs_inline_in_the_node_context() {
 }
 
 #[test]
+#[allow(clippy::async_yields_async)] // in_node returns a handle spawned inside the node.
 fn spawn_blocking_order_is_the_call_order() {
     let order = run(8, |world| async move {
         world.add_node(1, NodeClock::default());
@@ -415,7 +417,7 @@ fn services_get_their_name_stack_and_node_context() {
         assert!(offset_applied, "the service reads its node's clock");
         assert_eq!(world.services(3), vec!["journal".to_owned()]);
 
-        let plain = in_node(3, async { task::spawn_service("flush", || current_node()) })
+        let plain = in_node(3, async { task::spawn_service("flush", current_node) })
             .await
             .unwrap();
         assert_eq!(plain.join().unwrap(), Some(3));

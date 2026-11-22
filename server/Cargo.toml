@@ -32,6 +32,9 @@ cache = ["dep:clock-bound-client", "dep:hashbrown", "dep:smallvec", "dep:toml", 
 test-hooks = ["cache"]
 oltp-backup-s3 = ["oltp", "s3"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-http-client"]
+# Simulation builds of the library only (nabedra-rt deterministic runtime). src/main.rs
+# refuses to compile with it, so no simulation build produces a server binary.
+sim = ["nabedra-rt/sim"]
 
 [dependencies]
 ring = "=0.17.14"

@@ -1,3 +1,14 @@
+// The deterministic simulation (`nabedra-rt/sim`) replaces the clock, ids and task
+// spawning, so no simulation build may produce a server binary. The feature guard covers
+// `--features sim`; the assertion also covers `nabedra-rt/sim` enabled any other way,
+// such as `--features nabedra-rt/sim` or feature unification.
+#[cfg(feature = "sim")]
+compile_error!("the nabedra-db binary cannot be built with the sim feature");
+const _: () = assert!(
+    !nabedra_rt::SIM,
+    "the nabedra-db binary cannot be built with nabedra-rt's sim feature"
+);
+
 #[cfg(all(feature = "olap", feature = "s3"))]
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;

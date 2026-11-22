@@ -1,0 +1,40 @@
+# Runtime seam bans (testing plan phase 7). Clock, task and id calls go through
+# `nabedra_rt` so the simulator can control them; `server/rt` is the only crate that
+# makes these calls directly (it allows the lint at its crate root).
+#
+# Enforcement: until every module is converted the lint only warns. The one clippy run
+# with `-D warnings` in the PR gate (nabedra-kv, .github/workflows/nabedra-build.yml)
+# allows it explicitly. The P7-BANS step enforces `-D clippy::disallowed_methods` on the
+# server workspace and adds file-level allows to `server/tests/**`, benches and examples.
+# No crate-root allow is used in `server/src/lib.rs`: a source allow would override the
+# command-line `-W clippy::disallowed_methods` that converters use to count their hits.
+#
+# Scoped threads and test thread pools may keep a direct call with an item-level
+# `#[allow(clippy::disallowed_methods)] // <reason>`. `ring` randomness for credentials
+# and encryption is not affected. The server has no direct dependency on `rand` or
+# `fastrand`; non-crypto randomness uses `nabedra_rt::ids::random_u64`.
+#
+# The tokio entries set `allow-invalid`: a crate built without tokio's `rt` and `time`
+# features (nabedra-kv alone) cannot resolve them, and clippy would warn on each. Every
+# entry resolves in the server crate, where each one has hits today.
+disallowed-methods = [
+    # Clock
+    { path = "std::time::Instant::now", reason = "use nabedra_rt::time::now_std() (std type) or nabedra_rt::time::now() (tokio type)" },
+    { path = "tokio::time::Instant::now", reason = "use nabedra_rt::time::now()", allow-invalid = true },
+    { path = "std::time::SystemTime::now", reason = "use nabedra_rt::time::wall_now(), or unix_ms() / unix_micros() / unix_nanos()" },
+    { path = "tokio::time::sleep", reason = "use nabedra_rt::time::sleep()", allow-invalid = true },
+    { path = "tokio::time::sleep_until", reason = "use nabedra_rt::time::sleep_until()", allow-invalid = true },
+    { path = "tokio::time::timeout", reason = "use nabedra_rt::time::timeout()", allow-invalid = true },
+    { path = "tokio::time::timeout_at", reason = "use nabedra_rt::time::timeout_at()", allow-invalid = true },
+    { path = "tokio::time::interval", reason = "use nabedra_rt::time::interval()", allow-invalid = true },
+    { path = "tokio::time::interval_at", reason = "use nabedra_rt::time::interval_at()", allow-invalid = true },
+    { path = "std::thread::sleep", reason = "use nabedra_rt::time::thread_sleep()" },
+    # Tasks
+    { path = "tokio::task::spawn", reason = "use nabedra_rt::task::spawn() (also bans tokio::spawn)", allow-invalid = true },
+    { path = "tokio::runtime::Handle::spawn", reason = "use nabedra_rt::task::spawn_on()", allow-invalid = true },
+    { path = "tokio::task::spawn_blocking", reason = "use nabedra_rt::task::spawn_blocking()", allow-invalid = true },
+    { path = "std::thread::spawn", reason = "use nabedra_rt::task::spawn_service() for a long-lived named thread" },
+    { path = "std::thread::Builder::spawn", reason = "use nabedra_rt::task::spawn_service() or spawn_service_with_stack()" },
+    # Ids
+    { path = "uuid::Uuid::new_v4", reason = "use nabedra_rt::ids::uuid_v4()" },
+]
