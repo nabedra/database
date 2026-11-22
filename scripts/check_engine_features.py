@@ -18,7 +18,6 @@ FORBIDDEN_NATIVE = frozenset({'rocksdb', 'librocksdb-sys', 'bindgen', 'clang-sys
 CASES = (
     ('default', 'olap', True, []),
     ('olap', 'olap', False, ['--no-default-features', '--features', 'olap']),
-    ('olap-s3-image', 'olap', True, ['--no-default-features', '--features', 'olap,s3']),
     ('oltp', 'oltp', False, ['--no-default-features', '--features', 'oltp']),
     ('oltp-s3', 'oltp', True, ['--no-default-features', '--features', 'oltp-backup-s3']),
     ('cache', 'cache', False, ['--no-default-features', '--features', 'cache']),
@@ -112,6 +111,11 @@ def main():
     assert_no_forbidden_native('events', events)
     assert 'nabedra-kv' in events, ('events', 'native storage engine')
     print('O02 events: dependency graph passed', flush=True)
+    # The OLAP image selects these features explicitly, independent of Cargo's defaults.
+    image_tree = cargo('tree', ['--no-default-features', '--features', 'olap,s3'], *tree).stdout
+    assert_no_test_hooks('olap-s3-image', image_tree)
+    assert_dependency_packages('olap-s3-image', 'olap', True, image_tree)
+    print('O02 olap-s3-image: dependency graph passed', flush=True)
     graphs = {'events': sorted(events)}
     versions = {}
     for name, engine, s3, selection in CASES:

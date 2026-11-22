@@ -132,6 +132,7 @@ jobs:
       growth: ${{ steps.plan.outputs.growth }}
       has_growth: ${{ steps.plan.outputs.has_growth }}
       checks: ${{ steps.checks.outputs.matrix }}
+      fuzz: ${{ steps.fuzz.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -240,6 +241,15 @@ jobs:
           matrix=$(python3 scripts/testing/ci/plan_checks.py)
           printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
           printf '\nRegistered checks: %s\n' "$(jq -r 'map(.id) | join(", ")' <<< "$matrix")" >> "$GITHUB_STEP_SUMMARY"
+      - name: Discover fuzz targets
+        id: fuzz
+        if: contains(steps.plan.outputs.jobs, ',fuzz,')
+        run: |
+          matrix=$(python3 scripts/testing/ci/plan_fuzz.py)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          if [ "$matrix" = '[]' ]; then
+            echo "Fuzz not-run: this revision has no server/fuzz targets." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
   pr-lint:
     name: PR body lint (non-blocking)
@@ -295,8 +305,8 @@ jobs:
       attestations: write
     strategy:
       fail-fast: false
-      # Leave one runner for fuzz when the nightly dispatch selects it.
-      max-parallel: ${{ contains(needs.revision.outputs.jobs, ',fuzz,') && 7 || 8 }}
+      # Together the nightly check and fuzz matrices use at most eight runners.
+      max-parallel: ${{ needs.revision.outputs.fuzz != '' && needs.revision.outputs.fuzz != '[]' && 6 || 8 }}
       matrix:
         include: ${{ fromJSON(needs.revision.outputs.checks) }}
     env:
@@ -308,12 +318,27 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ env.TESTED_SHA }}
+          # Replay checks resolve historical commits from the tested revision.
+          fetch-depth: 0
           persist-credentials: false
       - name: Install the Rust nightly
         if: contains(matrix.tools, 'rust-nightly')
         run: |
           rustup toolchain install "$RUST_NIGHTLY" --profile minimal
-          echo "RUSTUP_TOOLCHAIN=$RUST_NIGHTLY" >> "$GITHUB_ENV"
+          # The runner's preflight and check commands can explicitly say `cargo +nightly`.
+          # Route that spelling to the same pinned toolchain as plain `cargo`.
+          mkdir -p "$RUNNER_TEMP/pinned-cargo"
+          cat > "$RUNNER_TEMP/pinned-cargo/cargo" <<'SH'
+          #!/usr/bin/env bash
+          if [ "${1:-}" = +nightly ]; then shift; fi
+          exec "$NABEDRA_REAL_CARGO" "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/pinned-cargo/cargo"
+          {
+            echo "RUSTUP_TOOLCHAIN=$RUST_NIGHTLY"
+            echo "NABEDRA_REAL_CARGO=$(command -v cargo)"
+          } >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/pinned-cargo" >> "$GITHUB_PATH"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         if: contains(matrix.tools, 'node')
         with:
@@ -353,7 +378,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: evidence-${{ matrix.id }}
-          path: evidence/
+          path: |
+            evidence/
+            target/testing-logs/
           retention-days: 14
       - name: Attest the evidence records
         if: ${{ !cancelled() && hashFiles('evidence/**/*.json') != '' }}
@@ -362,49 +389,40 @@ jobs:
           subject-path: evidence/**/*.json
 
   fuzz:
-    name: Fuzz Rust targets
+    name: Fuzz ${{ matrix.target }}
     needs: revision
-    if: contains(needs.revision.outputs.jobs, ',fuzz,')
+    if: needs.revision.outputs.fuzz != '' && needs.revision.outputs.fuzz != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJSON(needs.revision.outputs.fuzz) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ env.TESTED_SHA }}
           persist-credentials: false
-      - name: Discover fuzz targets
-        id: targets
-        run: |
-          shopt -s nullglob
-          targets=(server/fuzz/fuzz_targets/*.rs)
-          if [ -f server/fuzz/Cargo.toml ] && [ "${#targets[@]}" -gt 0 ]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Fuzz not-run: this revision has no server/fuzz targets." | tee -a "$GITHUB_STEP_SUMMARY"
-          fi
       - name: Install the nightly toolchain and cargo-fuzz
-        if: steps.targets.outputs.found == 'true'
         run: |
           rustup toolchain install "$RUST_NIGHTLY" --profile minimal
           cargo +"$RUST_NIGHTLY" install --locked --version 0.13.2 cargo-fuzz
-      - name: Fuzz each target
-        if: steps.targets.outputs.found == 'true'
+      - name: Fuzz the target
         working-directory: server
         env:
           FUZZ_SECONDS: ${{ inputs.fuzz_seconds }}
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_FEATURES: ${{ matrix.features }}
         run: |
-          status=0
-          for file in fuzz/fuzz_targets/*.rs; do
-            target=${file##*/}
-            target=${target%.rs}
-            cargo +"$RUST_NIGHTLY" fuzz run "$target" -- "-max_total_time=$FUZZ_SECONDS" || status=1
-          done
-          exit "$status"
+          features=()
+          if [ -n "$FUZZ_FEATURES" ]; then features=(--no-default-features --features "$FUZZ_FEATURES"); fi
+          cargo +"$RUST_NIGHTLY" fuzz run "$FUZZ_TARGET" "${features[@]}" -- "-max_total_time=$FUZZ_SECONDS"
       - name: Upload fuzz crashes
-        if: ${{ always() && steps.targets.outputs.found == 'true' }}
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: fuzz-crashes
+          name: fuzz-crashes-${{ matrix.target }}
           path: server/fuzz/artifacts/
           if-no-files-found: ignore
           retention-days: 14
@@ -774,6 +792,11 @@ jobs:
           key: ${{ steps.cache.outputs.cache-primary-key }}
       - name: Read the quarantine
         run: python3 scripts/ci_quarantine.py tests > "$RUNNER_TEMP/quarantined-tests"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        if: matrix.engine == 'olap'
+        with:
+          # The OLAP HTTP store and shared-worker fixtures invoke python3.11 by name.
+          python-version: "3.11"
       - name: Cache library tests
         if: matrix.engine == 'cache'
         working-directory: server
