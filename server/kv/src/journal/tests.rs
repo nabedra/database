@@ -210,6 +210,10 @@ struct Faults {
     enospc_preallocate: AtomicBool,
     syncs: AtomicU64,
     writes: AtomicU64,
+    /// While set, the sync with index `syncs_allowed` (0-based, counting every
+    /// `sync_data`) and later ones wait until it clears or the bound rises.
+    hold_syncs: AtomicBool,
+    syncs_allowed: AtomicU64,
 }
 
 struct FaultFs {
@@ -264,7 +268,12 @@ impl FsFile for FaultFile {
         self.inner.read_exact_at(buf, offset)
     }
     fn sync_data(&self) -> io::Result<()> {
-        self.faults.syncs.fetch_add(1, Ordering::SeqCst);
+        let index = self.faults.syncs.fetch_add(1, Ordering::SeqCst);
+        while self.faults.hold_syncs.load(Ordering::SeqCst)
+            && index >= self.faults.syncs_allowed.load(Ordering::SeqCst)
+        {
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
         if self.faults.fail_sync.load(Ordering::SeqCst) {
             return Err(io::Error::from_raw_os_error(libc::EIO));
         }
@@ -1237,4 +1246,117 @@ fn ns08_commit_is_counted_before_its_waiter_wakes() {
     for writer in writers {
         writer.join().unwrap();
     }
+}
+
+/// Polls `commit` until it completes or `limit` passes.
+fn result_within(commit: &mut Commit, limit: std::time::Duration) -> Option<Result<Seq>> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(result) = commit.try_result() {
+            return Some(result);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// RD3 (O06, O11, NS08): an unsynced write queued ahead of a synced write in the same
+/// group becomes visible and completes once the group's bytes are written, before the
+/// sync the later write asked for; the synced write completes only after its sync, and
+/// `durable_seq` never covers it earlier. The sink still sees every record in sequence
+/// order, and the bytes on disk are those of one synced group. Before RD3 the unsynced
+/// write waited for the whole sync (a Data apply behind the next Raft append's fsync).
+#[test]
+fn rd3_unsynced_head_of_a_group_is_visible_before_its_sync() {
+    let dir = TempDir::new("rd3-head");
+    let (fs, faults) = fault_fs();
+    let (journal, _, sink) = open(fs, dir.path(), small(), 0).unwrap();
+    let base = faults.syncs.load(Ordering::SeqCst);
+    faults.syncs_allowed.store(base, Ordering::SeqCst);
+    faults.hold_syncs.store(true, Ordering::SeqCst);
+    // A failed assertion must not leave the journal thread in a held sync.
+    struct ReleaseSyncs(Arc<Faults>);
+    impl Drop for ReleaseSyncs {
+        fn drop(&mut self) {
+            self.0.hold_syncs.store(false, Ordering::SeqCst);
+        }
+    }
+    let _release = ReleaseSyncs(faults.clone());
+    // Group 1: a synced write whose sync is held.
+    let mut s0 = journal
+        .submit(batch(b"g/", b"s0", b"v0"), Durability::Sync, Box::new(()))
+        .unwrap();
+    let wait = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while faults.syncs.load(Ordering::SeqCst) == base {
+        assert!(
+            std::time::Instant::now() < wait,
+            "the journal reaches the held sync"
+        );
+        thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // Group 2, queued meanwhile: an unsynced write, then a synced one.
+    let mut u1 = journal
+        .submit(batch(b"g/", b"u1", b"v1"), Durability::NoSync, Box::new(()))
+        .unwrap();
+    let mut s2 = journal
+        .submit(batch(b"g/", b"s2", b"v2"), Durability::Sync, Box::new(()))
+        .unwrap();
+    let (s0_seq, u1_seq, s2_seq) = (s0.seq(), u1.seq(), s2.seq());
+    assert!(s0_seq < u1_seq && u1_seq < s2_seq);
+    // Release group 1's sync only.
+    faults.syncs_allowed.store(base + 1, Ordering::SeqCst);
+    let limit = std::time::Duration::from_secs(5);
+    assert_eq!(
+        result_within(&mut s0, limit)
+            .expect("s0 completes")
+            .unwrap(),
+        s0_seq
+    );
+    let u1_result = result_within(&mut u1, limit)
+        .expect("the unsynced write completes while the later sync is held");
+    assert_eq!(u1_result.unwrap(), u1_seq);
+    assert!(journal.visible_seq() >= u1_seq);
+    assert!(
+        journal.visible_seq() < s2_seq,
+        "the synced write is not visible before its sync"
+    );
+    assert!(
+        journal.durable_seq() < s2_seq,
+        "durability is not published early"
+    );
+    assert!(
+        s2.try_result().is_none(),
+        "the synced write waits for its sync"
+    );
+    // Release every sync: s2 completes, durable covers it, the sink saw all three in order.
+    faults.hold_syncs.store(false, Ordering::SeqCst);
+    assert_eq!(
+        result_within(&mut s2, limit)
+            .expect("s2 completes")
+            .unwrap(),
+        s2_seq
+    );
+    assert!(journal.durable_seq() >= s2_seq);
+    let applied: Vec<Seq> = sink
+        .applied
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|a| a.first_seq)
+        .collect();
+    assert_eq!(applied, vec![s0_seq, u1_seq, s2_seq]);
+    // The same bytes as before: one record each, readable after a reopen.
+    journal.close().unwrap();
+    drop(journal);
+    let (_journal, _, replayed) = open(real(), dir.path(), small(), 0).unwrap();
+    let replayed: Vec<Seq> = replayed
+        .applied
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|a| a.first_seq)
+        .collect();
+    assert_eq!(replayed, vec![s0_seq, u1_seq, s2_seq]);
 }
