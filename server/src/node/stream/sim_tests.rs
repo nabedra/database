@@ -24,13 +24,7 @@ use crate::{
 };
 use nabedra_check::{Gen, prop};
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    sync::{
-        Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
-    },
-};
+use std::{collections::BTreeMap, sync::Mutex as StdMutex};
 
 const MIB: u64 = 1 << 20;
 const MAX_STEPS: usize = 160;
@@ -51,22 +45,21 @@ enum Bug {
     ReplayNewHandle,
 }
 
-/// The object store under test, plus a log of partition reads made while the
-/// harness has a stream call in flight. The log is the G06 scan counter.
+/// The stream engine logs partition reads, including background prefetch.
+/// The mutation engine shares the store and pool without logging its reads.
 #[derive(Clone)]
 struct Counted {
     sim: SimObjectStore,
-    counting: Arc<AtomicBool>,
-    reads: Arc<StdMutex<Vec<String>>>,
+    reads: Option<Arc<StdMutex<Vec<String>>>>,
 }
 impl ObjectStore for Counted {
     async fn get(&self, key: &str) -> Result<Download, StorageError> {
         let result = self.sim.get(key).await;
         if result.is_ok()
             && key.ends_with(".parquet")
-            && self.counting.load(AtomicOrdering::Acquire)
+            && let Some(reads) = &self.reads
         {
-            self.reads.lock().unwrap().push(key.to_owned());
+            reads.lock().unwrap().push(key.to_owned());
         }
         result
     }
@@ -82,8 +75,10 @@ impl ObjectStore for Counted {
 }
 
 struct World {
-    store: Counted,
+    store: SimObjectStore,
+    reads: Arc<StdMutex<Vec<String>>>,
     engine: Engine<Counted>,
+    writer: Engine<Counted>,
     threads: Option<WorkerThreads>,
     run: Uuid,
     term: u64,
@@ -116,14 +111,20 @@ async fn operation(engine: &Engine<Counted>, name: &str, payload: Value) -> Resu
 
 impl World {
     async fn new(g: &mut Gen) -> Self {
-        let store = Counted {
-            sim: SimObjectStore::new(),
-            counting: Arc::new(AtomicBool::new(false)),
-            reads: Arc::default(),
+        let store = SimObjectStore::new();
+        let reads = Arc::new(StdMutex::new(Vec::new()));
+        let storage = |reads| {
+            Storage::new(
+                Counted {
+                    sim: store.clone(),
+                    reads,
+                },
+                Namespace::new("stream-sim/").unwrap(),
+            )
         };
-        let storage = Storage::new(store.clone(), Namespace::new("stream-sim/").unwrap());
+        let writer_storage = storage(None);
         let run = Uuid::new_v4();
-        storage
+        writer_storage
             .initialize_fenced_cluster_catalog(
                 CatalogFence {
                     run_id: run,
@@ -147,9 +148,10 @@ impl World {
         let partition: PartitionSize = ["200 B", "600 B", "1 KiB", "4 KiB"][g.below(4) as usize]
             .parse()
             .unwrap();
-        let engine = Engine::new(storage, pool, partition);
+        let engine = Engine::new(storage(Some(reads.clone())), pool.clone(), partition);
+        let writer = Engine::new(writer_storage, pool, partition);
         let table = operation(
-            &engine,
+            &writer,
             "table.create",
             json!({
                 "name": "items", "schema": {"id": "int64", "text": "utf8"},
@@ -161,7 +163,9 @@ impl World {
         let table = serde_json::from_value(table["id"].clone()).unwrap();
         let mut world = Self {
             store,
+            reads,
             engine,
+            writer,
             threads: Some(threads),
             run,
             term: 1,
@@ -190,17 +194,22 @@ impl World {
                 .iter()
                 .map(|key| {
                     let text = format!("r{key}-{}", g.ascii(12));
-                    world.model.insert(*key, text.clone());
                     json!({"id": key, "text": text})
                 })
                 .collect();
             operation(
-                &world.engine,
+                &world.writer,
                 "table.insert_many",
                 json!({"table_id": world.table, "rows": rows}),
             )
             .await
             .unwrap();
+            for row in rows {
+                world.model.insert(
+                    row["id"].as_i64().unwrap(),
+                    row["text"].as_str().unwrap().to_owned(),
+                );
+            }
         }
         world
     }
@@ -365,6 +374,53 @@ enum Seen {
     Eof,
 }
 
+/// Stop a demand after the local install, before it can return a reply.
+#[derive(Clone)]
+struct BeforeReplication(LocalDriver<Counted>);
+
+impl Driver for BeforeReplication {
+    type Store = Counted;
+
+    fn registry(&self) -> &Arc<Registry> {
+        self.0.registry()
+    }
+
+    fn pool(&self) -> &WorkerPool {
+        self.0.pool()
+    }
+
+    async fn authority(&self) -> Result<Authority, ProtocolError> {
+        self.0.authority().await
+    }
+
+    async fn source(
+        &self,
+        context: Option<RequestContext>,
+    ) -> Result<Source<Counted>, ProtocolError> {
+        self.0.source(context).await
+    }
+
+    async fn catalog(
+        &self,
+        source: &Source<Counted>,
+    ) -> Result<LoadedClusterCatalog, ProtocolError> {
+        self.0.catalog(source).await
+    }
+
+    async fn commit(
+        &self,
+        authority: Authority,
+        entry: Entry,
+        previous: Option<Version>,
+        dependency: Option<Dependency>,
+    ) -> Result<Arc<Stored>, Error> {
+        self.0
+            .commit(authority, entry, previous, dependency)
+            .await?;
+        Err(wire::unavailable().into())
+    }
+}
+
 /// The coordinator under test, the replica holder, and the client's view.
 struct Session<'w> {
     world: &'w mut World,
@@ -382,7 +438,7 @@ struct Session<'w> {
     delivered: BTreeMap<u64, Seen>,
     /// Frames whose reply was lost. A later delivery must match them.
     lost: BTreeMap<u64, Seen>,
-    /// Index of the checkpoint's first file, at the last frame received.
+    /// Index of the first file in the last checkpoint the holder retained.
     frontier: usize,
     rows_scanned: u64,
     rows_behind_checkpoint: u64,
@@ -398,26 +454,17 @@ impl<'w> Session<'w> {
         }
     }
 
-    /// One stream call, with the scan counter armed.
     async fn call(&mut self, request: Request) -> Result<Reply, Error> {
-        self.world
-            .store
-            .counting
-            .store(true, AtomicOrdering::Release);
         let reply = self
             .local
             .call(&self.world.engine, self.world.run, request)
             .await;
-        self.world
-            .store
-            .counting
-            .store(false, AtomicOrdering::Release);
         self.account_reads();
         reply
     }
 
     fn account_reads(&mut self) {
-        let reads = std::mem::take(&mut *self.world.store.reads.lock().unwrap());
+        let reads = std::mem::take(&mut *self.world.reads.lock().unwrap());
         for key in reads {
             let Some(index) = self
                 .files
@@ -496,10 +543,14 @@ impl<'w> Session<'w> {
                 self.delivered.insert(sequence, seen);
             }
         }
+        self.note_checkpoint();
+        Ok(())
+    }
+
+    fn note_checkpoint(&mut self) {
         if let Some(file) = self.checkpoint_file() {
             self.frontier = self.frontier.max(file);
         }
-        Ok(())
     }
 
     fn eof(&self) -> bool {
@@ -529,7 +580,22 @@ impl<'w> Session<'w> {
     async fn lose_reply(&mut self) -> Result<(), String> {
         let sequence = self.next;
         let seen = self.demand(sequence).await?;
-        self.lost.entry(sequence).or_insert(seen);
+        self.note_lost(sequence, seen)
+    }
+
+    fn note_lost(&mut self, sequence: u64, seen: Seen) -> Result<(), String> {
+        match self.lost.entry(sequence) {
+            std::collections::btree_map::Entry::Occupied(entry) if *entry.get() != seen => {
+                return Err(format!(
+                    "OLAP-STR-G03: sequence {sequence} changed after a lost reply"
+                ));
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(seen);
+            }
+            _ => {}
+        }
+        self.note_checkpoint();
         self.pending = true;
         Ok(())
     }
@@ -539,8 +605,10 @@ impl<'w> Session<'w> {
         let Some(current) = self.checkpoint_sequence() else {
             return Ok(());
         };
-        if !self.pending {
-            let seen = self.demand(current).await?;
+        let seen = self.demand(current).await?;
+        if self.pending {
+            self.note_lost(current, seen)?;
+        } else {
             self.receive(current, seen)?;
         }
         let mut wrong = vec![current + 2];
@@ -551,21 +619,25 @@ impl<'w> Session<'w> {
             wrong.push(current + 1);
         }
         for sequence in wrong {
-            match self.call(self.batch_request(sequence)).await {
-                Err(Error::Protocol(error)) if error.code == ErrorCode::Conflict => {}
-                Err(error) if retryable_error(&error) => self.disruptions += 1,
-                other => {
-                    return Err(format!(
-                        "OLAP-STR-G03: demand {sequence} at checkpoint {current} answered {}",
-                        match other {
-                            Ok(reply) => format!("{reply:?}"),
-                            Err(error) => code_of(&error),
-                        }
-                    ));
-                }
-            }
+            self.expect_conflict(self.batch_request(sequence))
+                .await
+                .map_err(|error| {
+                    format!("OLAP-STR-G03: demand {sequence} at checkpoint {current}: {error}")
+                })?;
         }
         Ok(())
+    }
+
+    async fn expect_conflict(&mut self, request: Request) -> Result<(), String> {
+        for _ in 0..20 {
+            match self.call(request.clone()).await {
+                Err(Error::Protocol(error)) if error.code == ErrorCode::Conflict => return Ok(()),
+                Err(error) if retryable_error(&error) => self.disruptions += 1,
+                Ok(reply) => return Err(format!("answered {reply:?}")),
+                Err(error) => return Err(format!("answered {}", code_of(&error))),
+            }
+        }
+        Err("stayed unavailable".into())
     }
 
     /// OLAP-STR-G02: an open retry with the same UUID and body replays the handle.
@@ -581,19 +653,11 @@ impl<'w> Session<'w> {
             let mut conflicting = self.spec.clone();
             conflicting.batch_rows = conflicting.batch_rows % 7 + 1;
             let body = conflicting.open(self.request_id, self.world.run, self.world.table);
-            match self.call(Request::Open(body)).await {
-                Err(Error::Protocol(error)) if error.code == ErrorCode::Conflict => {}
-                Err(error) if retryable_error(&error) => self.disruptions += 1,
-                other => {
-                    return Err(format!(
-                        "OLAP-STR-G02: a conflicting body for the same UUID answered {}",
-                        match other {
-                            Ok(reply) => format!("{reply:?}"),
-                            Err(error) => code_of(&error),
-                        }
-                    ));
-                }
-            }
+            self.expect_conflict(Request::Open(body))
+                .await
+                .map_err(|error| {
+                    format!("OLAP-STR-G02: conflicting body for the same UUID: {error}")
+                })?;
         }
         let body = self
             .spec
@@ -625,7 +689,11 @@ impl<'w> Session<'w> {
 
     /// Kill the coordinator and recover its record on a new owner (OLAP-STR-G04).
     async fn kill(&mut self, g: &mut Gen) -> Result<(), String> {
-        let cut = if self.eof() { 2 } else { g.below(3) };
+        let mut cut = g.below(3);
+        if cut == 1 && self.pending {
+            // This demand already replicated, so there is no new install to interrupt.
+            cut = 0;
+        }
         let mut holder = self.replicate();
         let lost = match cut {
             // Between demand and ack, after the checkpoint replicated.
@@ -637,11 +705,28 @@ impl<'w> Session<'w> {
             }
             // Between demand and ack, before the checkpoint replicated.
             1 => {
-                let sequence = self.next;
-                let seen = self.demand(sequence).await?;
-                Some((sequence, seen))
+                let driver = BeforeReplication(LocalDriver {
+                    registry: self.local.registry.clone(),
+                    changes: self.local.changes.clone(),
+                    engine: self.world.engine.clone(),
+                    run: self.world.run,
+                });
+                let reply = call(driver, self.batch_request(self.next), None).await;
+                self.account_reads();
+                let installed = self.replicate();
+                let advanced = matches!((&holder, &installed), (Some(old), Some(new))
+                    if old.version != new.version
+                        && matches!(&new.kind, Kind::Stream(stream)
+                            if stream.checkpoint.as_ref().is_some_and(|c| c.sequence == self.next)));
+                if !advanced || !matches!(&reply, Err(error) if retryable_error(error)) {
+                    return Err(format!(
+                        "OLAP-STR-G04: demand {} did not stop after the local install: {reply:?}",
+                        self.next
+                    ));
+                }
+                None
             }
-            // Idle, after the last acknowledged reply.
+            // Idle, with the holder's most recent complete checkpoint.
             _ => None,
         };
         let Some(mut entry) = holder else {
@@ -666,7 +751,7 @@ impl<'w> Session<'w> {
         self.install(entry)?;
         self.disruptions += 1;
         if let Some((sequence, seen)) = lost {
-            self.lost.entry(sequence).or_insert(seen);
+            self.note_lost(sequence, seen)?;
         }
         // After replication the checkpoint holds the unacknowledged frame;
         // before it, the new owner resumes from the previous checkpoint.
@@ -681,7 +766,11 @@ impl<'w> Session<'w> {
             .map_err(|e| e.to_string())?;
         let bytes = record_bytes(&entry).unwrap();
         registry
-            .install(
+            .install_fenced(
+                Authority {
+                    run: self.world.run,
+                    term: self.world.term,
+                },
                 entry,
                 None,
                 bytes,
@@ -720,7 +809,7 @@ impl<'w> Session<'w> {
             0 if !existing.is_empty() => {
                 let key = *g.pick(&existing);
                 operation(
-                    &self.world.engine,
+                    &self.world.writer,
                     "table.delete",
                     json!({"table_id": table, "key": key}),
                 )
@@ -731,7 +820,7 @@ impl<'w> Session<'w> {
                 let key = *g.pick(&existing);
                 let text = format!("u{key}-{}", g.ascii(8));
                 operation(
-                    &self.world.engine,
+                    &self.world.writer,
                     "table.upsert",
                     json!({"table_id": table, "row": {"id": key, "text": text}}),
                 )
@@ -745,7 +834,7 @@ impl<'w> Session<'w> {
                 }
                 let text = format!("n{key}");
                 operation(
-                    &self.world.engine,
+                    &self.world.writer,
                     "table.insert",
                     json!({"table_id": table, "row": {"id": key, "text": text}}),
                 )
@@ -763,11 +852,10 @@ impl<'w> Session<'w> {
         let per_mille = 100 + g.below(500);
         self.world
             .store
-            .sim
             .random_faults(seed, per_mille, vec![Fault::Status(503)]);
         let sequence = self.next;
         let attempt = self.demand_once(sequence).await;
-        self.world.store.sim.clear_faults();
+        self.world.store.clear_faults();
         match attempt? {
             Some(seen) => {
                 self.receive(sequence, seen)?;
@@ -780,7 +868,19 @@ impl<'w> Session<'w> {
     }
 
     /// OLAP-STR-G01 and G06 at the end of the stream.
-    fn verify(&self, oracle: &[Vec<Value>]) -> Result<(), String> {
+    async fn finish(&mut self, oracle: &[Vec<Value>]) -> Result<(), String> {
+        while !self.eof() && self.delivered.len() <= oracle.len() {
+            self.advance().await?;
+        }
+        // EOF itself must replay, and every later sequence must conflict.
+        if self.eof() {
+            self.probe_sequences().await?;
+        }
+        self.verify(oracle)
+    }
+
+    fn verify(&mut self, oracle: &[Vec<Value>]) -> Result<(), String> {
+        self.account_reads();
         let mut batches = Vec::new();
         for (expected, (sequence, seen)) in (0_u64..).zip(&self.delivered) {
             if *sequence != expected {
@@ -906,13 +1006,9 @@ async fn case(g: &mut Gen, bug: Bug) -> Result<(), String> {
                 _ => session.faulted_advance(g).await?,
             }
         }
-        while !session.eof() {
-            session.advance().await?;
-        }
-        // OLAP-STR-G03: EOF replays, and nothing follows it.
-        session.probe_sequences().await?;
         session
-            .verify(&oracle)
+            .finish(&oracle)
+            .await
             .map_err(|error| format!("{error}; spec {:?}; {:?}", session.spec, session.log))?;
         if std::env::var_os("NABEDRA_SIM_TRACE").is_some() {
             eprintln!(
@@ -939,8 +1035,16 @@ async fn case(g: &mut Gen, bug: Bug) -> Result<(), String> {
 /// OLAP-STR-G05: after every worker stops, old handles are abandoned and a
 /// new open pins the latest committed data.
 async fn cold_start(mut session: Session<'_>, g: &mut Gen) -> Result<(), String> {
-    let old = session.opened.clone();
-    let request_id = session.request_id;
+    // Leave a fresh open outstanding when every holder stops.
+    let request_id = Uuid::new_v4();
+    let body = session
+        .spec
+        .open(request_id, session.world.run, session.world.table);
+    let Ok(Reply::Opened(old)) = session.call(Request::Open(body)).await else {
+        return Err("OLAP-STR-G05: could not create an outstanding open".into());
+    };
+    session.opened = old.clone();
+    session.next = 0;
     session.local = Local::new();
     session.world.cold_start().await;
     let new_run = session.world.run;
@@ -993,15 +1097,17 @@ async fn cold_start(mut session: Session<'_>, g: &mut Gen) -> Result<(), String>
     session.delivered.clear();
     session.lost.clear();
     session.frontier = 0;
+    session.rows_scanned = 0;
     session.rows_behind_checkpoint = 0;
     session.files = session.world.files().await;
-    while !session.eof() {
+    let oracle = session.spec.oracle(&latest);
+    while !session.eof() && session.delivered.len() <= oracle.len() {
         if g.chance(1, 4) {
             session.lose_reply().await?;
         }
         session.advance().await?;
     }
-    session.verify(&session.spec.oracle(&latest))
+    session.finish(&oracle).await
 }
 
 fn run_case(g: &mut Gen, bug: Bug) -> Result<(), String> {
@@ -1058,7 +1164,7 @@ fn st04_st06_planted_rescan_after_reconnect_is_caught() {
 
 #[test]
 fn st04_planted_sequence_gap_after_kill_is_caught() {
-    planted(Bug::GapAfterKill, "OLAP-STR-G0");
+    planted(Bug::GapAfterKill, "OLAP-STR-G03");
 }
 
 #[test]

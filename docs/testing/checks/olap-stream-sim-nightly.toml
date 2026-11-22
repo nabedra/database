@@ -3,11 +3,11 @@ module = "olap-stream"
 kinds = ["S", "H"]
 guarantees = ["OLAP-STR-G01", "OLAP-STR-G02", "OLAP-STR-G03", "OLAP-STR-G04", "OLAP-STR-G05", "OLAP-STR-G06"]
 scenarios = ["ST01", "ST02", "ST03", "ST04", "ST05", "ST06"]
-tiers = ["T3"]
+tiers = ["T2", "T3"]
 # The olap-stream-sim property with ten times the cases. The base seed is still
 # derived from the property name, so a failure replays from the printed
 # NABEDRA_SEED with NABEDRA_CASES=1. The planted-bug tests run in olap-stream-sim.
-command = ["cargo", "test", "--locked", "--lib", "node::stream::sim_tests::st01_st06_olap_stream_simulation", "--", "--exact", "--nocapture"]
+command = ["cargo", "test", "-j", "2", "--locked", "--lib", "node::stream::sim_tests::st01_st06_olap_stream_simulation", "--", "--exact", "--nocapture", "--test-threads=1"]
 cwd = "server"
 timeout_s = 7200
 needs = []

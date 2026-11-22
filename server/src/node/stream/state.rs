@@ -576,10 +576,10 @@ impl Registry {
 
     pub(super) fn handle(&self, key: &Key) -> Result<Option<Arc<Stored>>, Error> {
         let state = self.state.lock().unwrap();
-        for stored in state
+        if let Some(stored) = state
             .entries
             .values()
-            .filter(|stored| stored.entry.handle_id() == key.id)
+            .find(|stored| stored.entry.handle_id() == key.id)
         {
             if stored.entry.key.scope == key.scope {
                 return Ok(Some(stored.clone()));
