@@ -127,7 +127,11 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
         Err(e) => return Verdict::malformed(e),
     };
     let ctx = Ctx {
-        failovers: paired.markers.iter().filter(|m| m.applied() && opts.failover_markers.contains(&m.f)).collect(),
+        failovers: paired
+            .markers
+            .iter()
+            .filter(|m| m.applied() && opts.failover_markers.contains(&m.f))
+            .collect(),
         opts,
     };
     let mut keys: BTreeMap<&str, Vec<&Op>> = BTreeMap::new();
@@ -206,9 +210,13 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                     && w.precedes(d)
                     && match kind(&d.f) {
                         Some("delete") => d.precedes(r),
-                        _ => match (d.invoke_value.get("at_ns").and_then(Value::as_u64), r.call_time) {
+                        _ => match (
+                            d.invoke_value.get("at_ns").and_then(Value::as_u64),
+                            r.call_time,
+                        ) {
                             (Some(deadline), Some(t)) => {
-                                t > deadline.saturating_add(ctx.opts.expiry_tolerance_ns) && d.precedes(r)
+                                t > deadline.saturating_add(ctx.opts.expiry_tolerance_ns)
+                                    && d.precedes(r)
                             }
                             _ => false,
                         },
@@ -238,7 +246,10 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                     None => !removals.iter().any(|d| !d.precedes(w2)),
                 }
         });
-        if let Some(w2) = newer.filter(|w2| !ctx.loss_allowed(w2, r)).max_by_key(|w2| w2.ret_pos()) {
+        if let Some(w2) = newer
+            .filter(|w2| !ctx.loss_allowed(w2, r))
+            .max_by_key(|w2| w2.ret_pos())
+        {
             anomalies.push(Anomaly::new(
                 ctx.loss_kind(w2, r),
                 format!(
@@ -256,12 +267,15 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
     // Monotonic reads within one epoch.
     for (i, (r2, w_old)) in seen.iter().enumerate() {
         let Some(w_old) = w_old else { continue };
-        let back = seen[..i].iter().chain(seen[i + 1..].iter()).find(|(r1, w_new)| {
-            r1.precedes(r2)
-                && epoch(r1).is_some()
-                && epoch(r1) == epoch(r2)
-                && w_new.is_some_and(|wn| w_old.precedes(wn))
-        });
+        let back = seen[..i]
+            .iter()
+            .chain(seen[i + 1..].iter())
+            .find(|(r1, w_new)| {
+                r1.precedes(r2)
+                    && epoch(r1).is_some()
+                    && epoch(r1) == epoch(r2)
+                    && w_new.is_some_and(|wn| w_old.precedes(wn))
+            });
         if let Some((r1, _)) = back {
             anomalies.push(Anomaly::new(
                 "stale-read",
@@ -299,16 +313,22 @@ fn check_counter(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly>
         .filter_map(|(o, _)| as_int(&o.complete_value).map(|v| (*o, v)))
         .collect();
     let at = |o: &Op| o.complete_index.unwrap_or(o.invoke_index);
-    for x in ops.iter().copied().filter(|o| {
-        o.outcome == Outcome::Ok && matches!(kind(&o.f), Some("read" | "incr"))
-    }) {
+    for x in ops
+        .iter()
+        .copied()
+        .filter(|o| o.outcome == Outcome::Ok && matches!(kind(&o.f), Some("read" | "incr")))
+    {
         let Some(value) = (match payload(&x.complete_value) {
             Value::Null => Some(0),
             _ => as_int(&x.complete_value),
         }) else {
             continue;
         };
-        let attempted: i64 = incrs.iter().filter(|(o, _)| o.call < x.ret_pos()).map(|(_, d)| d).sum();
+        let attempted: i64 = incrs
+            .iter()
+            .filter(|(o, _)| o.call < x.ret_pos())
+            .map(|(_, d)| d)
+            .sum();
         if value > attempted {
             anomalies.push(Anomaly::new(
                 "invented-value",

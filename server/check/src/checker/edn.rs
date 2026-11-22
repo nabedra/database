@@ -44,9 +44,22 @@ pub fn event(ev: &Event) -> String {
         EventType::Fail => "fail",
         EventType::Info => "info",
     };
-    let process = if ev.is_nemesis() { ":nemesis".to_string() } else { ev.process.to_string() };
-    let f = if ev.is_nemesis() { ev.marker_name() } else { ev.f.clone() };
-    let _ = write!(s, ":index {}, :type :{ty}, :process {process}, :f {}", ev.index, keyword(&f));
+    let process = if ev.is_nemesis() {
+        ":nemesis".to_string()
+    } else {
+        ev.process.to_string()
+    };
+    let f = if ev.is_nemesis() {
+        ev.marker_name()
+    } else {
+        ev.f.clone()
+    };
+    let _ = write!(
+        s,
+        ":index {}, :type :{ty}, :process {process}, :f {}",
+        ev.index,
+        keyword(&f)
+    );
     let value = if ev.f == "txn" {
         txn_value(&ev.value)
     } else if let Some(k) = &ev.key {
@@ -69,7 +82,9 @@ pub fn event(ev: &Event) -> String {
 }
 
 fn txn_value(v: &Value) -> String {
-    let Some(mops) = v.as_array() else { return value(v) };
+    let Some(mops) = v.as_array() else {
+        return value(v);
+    };
     let parts: Vec<String> = mops
         .iter()
         .map(|m| match m.as_array() {
@@ -88,11 +103,16 @@ fn txn_value(v: &Value) -> String {
 fn valid_keyword(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || "*+!-_?<>=".contains(c))
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || "*+!-_?<>=.".contains(c))
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "*+!-_?<>=.".contains(c))
 }
 
 fn keyword(s: &str) -> String {
-    if valid_keyword(s) { format!(":{s}") } else { string(s) }
+    if valid_keyword(s) {
+        format!(":{s}")
+    } else {
+        string(s)
+    }
 }
 
 pub fn string(s: &str) -> String {

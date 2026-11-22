@@ -128,7 +128,9 @@ pub fn check(events: &[Event]) -> Verdict {
             if let Mop::Append(k, v) | Mop::Write(k, v) = m {
                 let c = canon(v);
                 let last = last_write.get(k.as_str()) == Some(&c);
-                writes.entry((k.clone(), c)).or_insert(WriteSite { txn: ti, last });
+                writes
+                    .entry((k.clone(), c))
+                    .or_insert(WriteSite { txn: ti, last });
             }
         }
     }
@@ -242,7 +244,11 @@ pub fn check(events: &[Event]) -> Verdict {
                 let op = txns[*ti].op;
                 anomalies.push(Anomaly::new(
                     "duplicate-elements",
-                    format!("txn at event {} read key {k:?} with a repeated element: {}", op.invoke_index, Value::Array((*list).clone())),
+                    format!(
+                        "txn at event {} read key {k:?} with a repeated element: {}",
+                        op.invoke_index,
+                        Value::Array((*list).clone())
+                    ),
                     op.indices(),
                 ));
             }
@@ -250,7 +256,11 @@ pub fn check(events: &[Event]) -> Verdict {
                 check_intermediate(&mut anomalies, *ti, k, last);
             }
         }
-        let longest = rs.iter().map(|r| r.1).max_by_key(|l| l.len()).unwrap_or(&EMPTY);
+        let longest = rs
+            .iter()
+            .map(|r| r.1)
+            .max_by_key(|l| l.len())
+            .unwrap_or(&EMPTY);
         let mut compatible = true;
         for (ti, list) in rs {
             if longest[..list.len()] != list[..] {
@@ -319,7 +329,10 @@ pub fn check(events: &[Event]) -> Verdict {
         }
         for (k, v) in read_first {
             if wrote.contains(k) && !v.is_null() {
-                successors.entry((k.to_string(), canon(v))).or_default().push(ti);
+                successors
+                    .entry((k.to_string(), canon(v)))
+                    .or_default()
+                    .push(ti);
             }
         }
     }
@@ -335,7 +348,9 @@ pub fn check(events: &[Event]) -> Verdict {
         }
         check_intermediate(&mut anomalies, *ti, k, v);
         let key = (k.clone(), canon(v));
-        let Some(site) = writes.get(&key) else { continue };
+        let Some(site) = writes.get(&key) else {
+            continue;
+        };
         g.add(site.txn, *ti, WR, &in_graph);
         for &next in successors.get(&key).into_iter().flatten() {
             g.add(*ti, next, RW, &in_graph);
@@ -386,7 +401,10 @@ struct Graph {
 
 impl Graph {
     fn new(n: usize) -> Self {
-        Graph { edges: HashMap::new(), adj: vec![Vec::new(); n] }
+        Graph {
+            edges: HashMap::new(),
+            adj: vec![Vec::new(); n],
+        }
     }
 
     fn add(&mut self, a: usize, b: usize, kind: u8, in_graph: &[bool]) {
@@ -468,7 +486,13 @@ impl Graph {
     }
 
     /// Shortest path from `from` to `to` over `mask` edges within `members`, as a node list.
-    fn path(&self, from: usize, to: usize, mask: u8, members: &HashSet<usize>) -> Option<Vec<usize>> {
+    fn path(
+        &self,
+        from: usize,
+        to: usize,
+        mask: u8,
+        members: &HashSet<usize>,
+    ) -> Option<Vec<usize>> {
         let mut parent: HashMap<usize, usize> = HashMap::new();
         let mut queue = VecDeque::from([from]);
         parent.insert(from, from);
@@ -501,7 +525,10 @@ impl Graph {
         self.adj[start]
             .iter()
             .filter(|&&w| comp.contains(&w) && self.bits(start, w) & mask != 0)
-            .filter_map(|&w| self.path(w, start, mask, &comp).map(|p| [vec![start], p].concat()))
+            .filter_map(|&w| {
+                self.path(w, start, mask, &comp)
+                    .map(|p| [vec![start], p].concat())
+            })
             .min_by_key(|c| c.len())
     }
 
@@ -543,7 +570,11 @@ impl Graph {
             ]
             .into_iter()
             .find_map(|(kind, mask, one_rw)| {
-                let c = if one_rw { self.single_rw(mask, &members) } else { self.cycle_in(mask, &members) };
+                let c = if one_rw {
+                    self.single_rw(mask, &members)
+                } else {
+                    self.cycle_in(mask, &members)
+                };
                 c.map(|c| (kind, mask | if one_rw { RW } else { 0 }, c))
             });
             if let Some((kind, mask, cycle)) = found {

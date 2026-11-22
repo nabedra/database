@@ -46,13 +46,26 @@ fn register_history(seed: u64, ops: usize, keys: usize, procs: usize) -> Vec<Eve
                     8 => {
                         next_value += 1;
                         let cur = state.get(&key).cloned().unwrap_or(Value::Null);
-                        let expected = if below(&mut rng, 2) == 0 { cur } else { json!(next_value * 1000) };
+                        let expected = if below(&mut rng, 2) == 0 {
+                            cur
+                        } else {
+                            json!(next_value * 1000)
+                        };
                         ("cas", json!([expected, next_value]))
                     }
                     _ => ("delete", Value::Null),
                 };
-                events.push(Event::new(EventType::Invoke, p as u64, f).with_key(&key).with_value(invoke.clone()));
-                pending[p] = Some(Pending { f, key, invoke, result: None });
+                events.push(
+                    Event::new(EventType::Invoke, p as u64, f)
+                        .with_key(&key)
+                        .with_value(invoke.clone()),
+                );
+                pending[p] = Some(Pending {
+                    f,
+                    key,
+                    invoke,
+                    result: None,
+                });
             }
             None => {}
             Some(op) if op.result.is_none() => {
@@ -80,13 +93,21 @@ fn register_history(seed: u64, ops: usize, keys: usize, procs: usize) -> Vec<Eve
                 if below(&mut rng, 40) == 0 && op.f != "read" {
                     // Undo is not possible, so lose it after the effect instead.
                     let op = pending[p].take().unwrap();
-                    events.push(Event::new(EventType::Info, p as u64, op.f).with_key(&op.key).with_value(op.invoke));
+                    events.push(
+                        Event::new(EventType::Info, p as u64, op.f)
+                            .with_key(&op.key)
+                            .with_value(op.invoke),
+                    );
                 }
             }
             Some(_) => {
                 let op = pending[p].take().unwrap();
                 let (kind, value) = op.result.unwrap();
-                events.push(Event::new(kind, p as u64, op.f).with_key(&op.key).with_value(value));
+                events.push(
+                    Event::new(kind, p as u64, op.f)
+                        .with_key(&op.key)
+                        .with_value(value),
+                );
             }
         }
         // Occasionally an op times out before taking effect and never takes effect.
@@ -97,7 +118,11 @@ fn register_history(seed: u64, ops: usize, keys: usize, procs: usize) -> Vec<Eve
                 && op.f != "read"
             {
                 let op = pending[q].take().unwrap();
-                events.push(Event::new(EventType::Info, q as u64, op.f).with_key(&op.key).with_value(op.invoke));
+                events.push(
+                    Event::new(EventType::Info, q as u64, op.f)
+                        .with_key(&op.key)
+                        .with_value(op.invoke),
+                );
             }
         }
     }
@@ -152,8 +177,14 @@ fn planted_future_read_is_caught() {
         let (i, v) = target.expect("generated history has a read followed by a write");
         events[i].value = v;
         let verdict = linearizable::check_kv(&events);
-        assert!(verdict.has("non-linearizable"), "seed {seed}: future read not caught");
-        assert!(relaxed_kv::check(&events).has("invented-value"), "seed {seed}: relaxed missed it");
+        assert!(
+            verdict.has("non-linearizable"),
+            "seed {seed}: future read not caught"
+        );
+        assert!(
+            relaxed_kv::check(&events).has("invented-value"),
+            "seed {seed}: relaxed missed it"
+        );
         caught += 1;
     }
     assert_eq!(caught, 10);
@@ -228,7 +259,11 @@ fn generated_append_histories_pass_and_a_stale_read_is_caught() {
                 .unwrap();
             events[..invoke_pos].iter().any(|e| {
                 e.kind == EventType::Ok
-                    && e.value.as_array().unwrap().iter().any(|m| m[0] == "append" && &m[2] == val)
+                    && e.value
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|m| m[0] == "append" && &m[2] == val)
             })
         };
         let mut planted = false;
@@ -242,7 +277,10 @@ fn generated_append_histories_pass_and_a_stale_read_is_caught() {
                     continue;
                 }
                 let list = m[2].as_array().unwrap();
-                if let Some(cut) = list.iter().rposition(|val| completed_before(&events, pos, val)) {
+                if let Some(cut) = list
+                    .iter()
+                    .rposition(|val| completed_before(&events, pos, val))
+                {
                     let mut mops = mops.clone();
                     mops[mi] = json!(["r", m[1], list[..cut].to_vec()]);
                     events[pos].value = Value::Array(mops);

@@ -40,7 +40,10 @@ fn written(op: &Op) -> Vec<(String, Value)> {
                 (f == "w" || f == "append").then(|| (key_of(&m[1]), m[2].clone()))
             })
             .collect(),
-        "publish" => queue::published(op).into_iter().map(|v| (key.clone(), v)).collect(),
+        "publish" => queue::published(op)
+            .into_iter()
+            .map(|v| (key.clone(), v))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -58,7 +61,8 @@ fn observed(op: &Op) -> Vec<(String, Value)> {
         match v {
             Value::Null => vec![],
             Value::Array(items) => {
-                let mut out: Vec<(String, Value)> = items.iter().map(|i| (k.clone(), i.clone())).collect();
+                let mut out: Vec<(String, Value)> =
+                    items.iter().map(|i| (k.clone(), i.clone())).collect();
                 out.push((k, v.clone()));
                 out
             }
@@ -78,7 +82,10 @@ fn observed(op: &Op) -> Vec<(String, Value)> {
             })
             .flatten()
             .collect(),
-        "poll" => queue::delivered(op).into_iter().map(|d| (key.clone(), d.value)).collect(),
+        "poll" => queue::delivered(op)
+            .into_iter()
+            .map(|d| (key.clone(), d.value))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -106,7 +113,8 @@ pub fn check(events: &[Event]) -> Verdict {
             dedup_hits.entry(rid).or_default().push(i);
         }
     }
-    let mut live_writes: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut live_writes: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for op in ops.iter().filter(|o| o.outcome != Outcome::Fail) {
         for (k, v) in written(op) {
             live_writes.insert((k, canon(&v)));

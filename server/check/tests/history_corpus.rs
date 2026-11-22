@@ -11,12 +11,42 @@ type Checker = fn(&[Event]) -> Verdict;
 /// (file, checker name, checker, expected kinds; empty means the history must pass).
 const CASES: &[(&str, &str, Checker, &[&str])] = &[
     // Per-key linearizability.
-    ("lin_valid_basic", "linearizable", linearizable::check_kv, &[]),
-    ("lin_valid_info_took_effect", "linearizable", linearizable::check_kv, &[]),
-    ("lin_valid_info_never", "linearizable", linearizable::check_kv, &[]),
-    ("lin_stale_read", "linearizable", linearizable::check_kv, &["non-linearizable"]),
-    ("lin_lost_write", "linearizable", linearizable::check_kv, &["non-linearizable"]),
-    ("lin_cas_double", "linearizable", linearizable::check_kv, &["non-linearizable"]),
+    (
+        "lin_valid_basic",
+        "linearizable",
+        linearizable::check_kv,
+        &[],
+    ),
+    (
+        "lin_valid_info_took_effect",
+        "linearizable",
+        linearizable::check_kv,
+        &[],
+    ),
+    (
+        "lin_valid_info_never",
+        "linearizable",
+        linearizable::check_kv,
+        &[],
+    ),
+    (
+        "lin_stale_read",
+        "linearizable",
+        linearizable::check_kv,
+        &["non-linearizable"],
+    ),
+    (
+        "lin_lost_write",
+        "linearizable",
+        linearizable::check_kv,
+        &["non-linearizable"],
+    ),
+    (
+        "lin_cas_double",
+        "linearizable",
+        linearizable::check_kv,
+        &["non-linearizable"],
+    ),
     // Elle-style transactions.
     ("txn_g0", "txn", txn::check, &["G0"]),
     ("txn_g1a", "txn", txn::check, &["G1a"]),
@@ -24,39 +54,124 @@ const CASES: &[(&str, &str, Checker, &[&str])] = &[
     ("txn_g1c", "txn", txn::check, &["G1c"]),
     ("txn_g_single", "txn", txn::check, &["G-single"]),
     ("txn_g2", "txn", txn::check, &["G2"]),
-    ("txn_g_single_realtime", "txn", txn::check, &["G-single-realtime"]),
+    (
+        "txn_g_single_realtime",
+        "txn",
+        txn::check,
+        &["G-single-realtime"],
+    ),
     ("txn_register_g1a", "txn", txn::check, &["G1a"]),
     ("txn_register_g_single", "txn", txn::check, &["G-single"]),
     ("txn_valid_append", "txn", txn::check, &[]),
     ("txn_register_valid", "txn", txn::check, &[]),
     // Outcome truth.
-    ("outcome_failed_write_observed", "outcome", outcome::check, &["failed-write-observed"]),
-    ("outcome_not_applied_observed", "outcome", outcome::check, &["failed-write-observed"]),
-    ("outcome_dedup_after_fail", "outcome", outcome::check, &["failed-write-observed"]),
+    (
+        "outcome_failed_write_observed",
+        "outcome",
+        outcome::check,
+        &["failed-write-observed"],
+    ),
+    (
+        "outcome_not_applied_observed",
+        "outcome",
+        outcome::check,
+        &["failed-write-observed"],
+    ),
+    (
+        "outcome_dedup_after_fail",
+        "outcome",
+        outcome::check,
+        &["failed-write-observed"],
+    ),
     ("outcome_valid", "outcome", outcome::check, &[]),
     ("txn_valid_append", "outcome", outcome::check, &[]),
     ("queue_valid", "outcome", outcome::check, &[]),
     // Queue.
     ("queue_valid", "queue", queue::check, &[]),
-    ("queue_duplicate_offset", "queue", queue::check, &["duplicate-offset"]),
+    (
+        "queue_duplicate_offset",
+        "queue",
+        queue::check,
+        &["duplicate-offset"],
+    ),
     ("queue_offset_gap", "queue", queue::check, &["offset-gap"]),
-    ("queue_lost_publish", "queue", queue::check, &["lost-publish"]),
-    ("queue_out_of_order", "queue", queue::check, &["out-of-order"]),
-    ("queue_redelivery_missing", "queue", queue::check, &["redelivery-missing"]),
+    (
+        "queue_lost_publish",
+        "queue",
+        queue::check,
+        &["lost-publish"],
+    ),
+    (
+        "queue_out_of_order",
+        "queue",
+        queue::check,
+        &["out-of-order"],
+    ),
+    (
+        "queue_redelivery_missing",
+        "queue",
+        queue::check,
+        &["redelivery-missing"],
+    ),
     // Relaxed KV (asynchronous replica).
-    ("kv_invented_value", "relaxed_kv", relaxed_kv::check, &["invented-value"]),
-    ("kv_resurrection_delete", "relaxed_kv", relaxed_kv::check, &["resurrection"]),
-    ("kv_resurrection_expiry", "relaxed_kv", relaxed_kv::check, &["resurrection"]),
-    ("kv_stale_read", "relaxed_kv", relaxed_kv::check, &["stale-read"]),
-    ("kv_lost_write", "relaxed_kv", relaxed_kv::check, &["lost-write"]),
+    (
+        "kv_invented_value",
+        "relaxed_kv",
+        relaxed_kv::check,
+        &["invented-value"],
+    ),
+    (
+        "kv_resurrection_delete",
+        "relaxed_kv",
+        relaxed_kv::check,
+        &["resurrection"],
+    ),
+    (
+        "kv_resurrection_expiry",
+        "relaxed_kv",
+        relaxed_kv::check,
+        &["resurrection"],
+    ),
+    (
+        "kv_stale_read",
+        "relaxed_kv",
+        relaxed_kv::check,
+        &["stale-read"],
+    ),
+    (
+        "kv_lost_write",
+        "relaxed_kv",
+        relaxed_kv::check,
+        &["lost-write"],
+    ),
     ("kv_valid_failover", "relaxed_kv", relaxed_kv::check, &[]),
-    ("kv_counter_invented", "relaxed_kv", relaxed_kv::check, &["invented-value"]),
-    ("kv_counter_lost", "relaxed_kv", relaxed_kv::check, &["lost-write"]),
+    (
+        "kv_counter_invented",
+        "relaxed_kv",
+        relaxed_kv::check,
+        &["invented-value"],
+    ),
+    (
+        "kv_counter_lost",
+        "relaxed_kv",
+        relaxed_kv::check,
+        &["lost-write"],
+    ),
     ("kv_counter_valid", "relaxed_kv", relaxed_kv::check, &[]),
     // Written by scripts/testing/realenv/history.py: null fields, f="nemesis" markers, a
     // fresh process after an info op whose write took effect.
-    ("realenv_python_writer", "linearizable", linearizable::check_kv, &[]),
-    ("realenv_python_writer", "relaxed_kv", relaxed_kv::check, &[]),
+    (
+        "realenv_python_writer",
+        "linearizable",
+        linearizable::check_kv,
+        &[],
+    ),
+    (
+        "realenv_python_writer",
+        "relaxed_kv",
+        relaxed_kv::check,
+        &[],
+    ),
     ("realenv_python_writer", "outcome", outcome::check, &[]),
 ];
 
@@ -83,7 +198,10 @@ fn corpus_verdicts() {
         } else {
             !verdict.valid && expected.iter().all(|k| verdict.has(k))
         };
-        println!("{name} [{checker_name}]: valid={} kinds={kinds:?}", verdict.valid);
+        println!(
+            "{name} [{checker_name}]: valid={} kinds={kinds:?}",
+            verdict.valid
+        );
         if !ok {
             failures.push(format!(
                 "{name} [{checker_name}]: expected {expected:?}, got valid={} {:#?}",
@@ -91,16 +209,34 @@ fn corpus_verdicts() {
             ));
         }
     }
-    assert!(failures.is_empty(), "corpus mismatches:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "corpus mismatches:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// Every anomaly class the plan names has a corpus history that flags it.
 #[test]
 fn corpus_covers_every_anomaly_class() {
     let required = [
-        "G0", "G1a", "G1b", "G1c", "G-single", "G2", "non-linearizable", "lost-write", "stale-read",
-        "failed-write-observed", "duplicate-offset", "offset-gap", "lost-publish", "invented-value",
-        "resurrection", "out-of-order", "redelivery-missing",
+        "G0",
+        "G1a",
+        "G1b",
+        "G1c",
+        "G-single",
+        "G2",
+        "non-linearizable",
+        "lost-write",
+        "stale-read",
+        "failed-write-observed",
+        "duplicate-offset",
+        "offset-gap",
+        "lost-publish",
+        "invented-value",
+        "resurrection",
+        "out-of-order",
+        "redelivery-missing",
     ];
     for kind in required {
         assert!(
@@ -112,7 +248,10 @@ fn corpus_covers_every_anomaly_class() {
     for entry in std::fs::read_dir(corpus_dir()).unwrap() {
         let name = entry.unwrap().file_name().into_string().unwrap();
         let stem = name.trim_end_matches(".jsonl");
-        assert!(CASES.iter().any(|c| c.0 == stem), "corpus file {name} has no expectation");
+        assert!(
+            CASES.iter().any(|c| c.0 == stem),
+            "corpus file {name} has no expectation"
+        );
     }
 }
 
@@ -148,7 +287,10 @@ fn jsonl_round_trip_preserves_every_corpus_history() {
         let back = read_jsonl(std::io::BufReader::new(&buf[..])).unwrap();
         assert_eq!(events, back, "{name}");
         let text = String::from_utf8(buf).unwrap();
-        assert!(!text.contains("\"unknown\""), "{name}: info must be written as info");
+        assert!(
+            !text.contains("\"unknown\""),
+            "{name}: info must be written as info"
+        );
     }
 }
 
@@ -167,7 +309,10 @@ fn edn_export_is_jepsen_shaped() {
     let edn = edn::export_vector(&events);
     assert!(edn.starts_with('[') && edn.trim_end().ends_with(']'));
     assert!(edn.contains(":process :nemesis, :f :heal"));
-    assert!(edn.contains(r#":f :publish, :value ["t/0" ["a" "b"]]"#), "{edn}");
+    assert!(
+        edn.contains(r#":f :publish, :value ["t/0" ["a" "b"]]"#),
+        "{edn}"
+    );
     assert!(edn.contains(r#":value ["t/0" {:offsets [1 2]}]"#), "{edn}");
 }
 
@@ -185,7 +330,14 @@ fn reads_the_python_writer_format() {
     let names: Vec<&str> = paired.markers.iter().map(|m| m.f.as_str()).collect();
     assert_eq!(names, ["kill", "heal_all"]);
     assert!(paired.markers.iter().all(|m| m.applied()));
-    assert_eq!(paired.ops.iter().filter(|o| o.outcome == Outcome::Info).count(), 1);
+    assert_eq!(
+        paired
+            .ops
+            .iter()
+            .filter(|o| o.outcome == Outcome::Info)
+            .count(),
+        1
+    );
 
     // A literal line in that style, with every optional field null.
     let line = r#"{"index":null,"type":"info","process":0,"f":"nemesis","key":null,"value":{"action":"heal_all","failed":1},"request_id":null,"node":null,"time_ns":null}"#;

@@ -39,7 +39,11 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { start_offset: 1, redelivery_bound_ns: None, heal_markers: vec!["heal".into(), "heal_all".into()] }
+        Options {
+            start_offset: 1,
+            redelivery_bound_ns: None,
+            heal_markers: vec!["heal".into(), "heal_all".into()],
+        }
     }
 }
 
@@ -77,10 +81,16 @@ fn publish_offsets(op: &Op) -> Vec<Option<i64>> {
 /// The deliveries of an ok poll.
 pub(crate) fn delivered(op: &Op) -> Vec<Delivery> {
     let v = &op.complete_value;
-    let poll_flag = v.get("redelivery").and_then(Value::as_bool).unwrap_or(false);
+    let poll_flag = v
+        .get("redelivery")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let items = match v {
         Value::Array(a) => a.as_slice(),
-        Value::Object(m) => m.get("events").and_then(Value::as_array).map_or(&[][..], |a| a.as_slice()),
+        Value::Object(m) => m
+            .get("events")
+            .and_then(Value::as_array)
+            .map_or(&[][..], |a| a.as_slice()),
         _ => &[],
     };
     items
@@ -94,9 +104,16 @@ pub(crate) fn delivered(op: &Op) -> Vec<Delivery> {
             Value::Object(m) => Delivery {
                 offset: m.get("offset").and_then(Value::as_i64),
                 value: m.get("value").cloned().unwrap_or(Value::Null),
-                redelivered: poll_flag || m.get("redelivered").and_then(Value::as_bool).unwrap_or(false),
+                redelivered: poll_flag
+                    || m.get("redelivered")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
             },
-            other => Delivery { offset: None, value: other.clone(), redelivered: poll_flag },
+            other => Delivery {
+                offset: None,
+                value: other.clone(),
+                redelivered: poll_flag,
+            },
         })
         .collect()
 }
@@ -148,7 +165,11 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
         }
         checked += 1;
     }
-    let heal = paired.markers.iter().filter(|m| m.applied() && opts.heal_markers.contains(&m.f)).max_by_key(|m| m.pos);
+    let heal = paired
+        .markers
+        .iter()
+        .filter(|m| m.applied() && opts.heal_markers.contains(&m.f))
+        .max_by_key(|m| m.pos);
     let mut anomalies = Vec::new();
     for (name, p) in &parts {
         check_partition(name, p, opts, heal, &mut anomalies);
@@ -171,7 +192,10 @@ fn check_partition(
         if o < opts.start_offset {
             anomalies.push(Anomaly::new(
                 "offset-gap",
-                format!("partition {name:?}: offset {o} is below the first offset {}", opts.start_offset),
+                format!(
+                    "partition {name:?}: offset {o} is below the first offset {}",
+                    opts.start_offset
+                ),
                 src.indices(),
             ));
         }
@@ -230,7 +254,9 @@ fn check_partition(
 
     // Holes below the highest known offset that no unknown publish can explain.
     if let Some((&max, _)) = at.iter().next_back() {
-        let holes: Vec<i64> = (opts.start_offset..=max).filter(|o| !at.contains_key(o)).collect();
+        let holes: Vec<i64> = (opts.start_offset..=max)
+            .filter(|o| !at.contains_key(o))
+            .collect();
         if holes.len() > unknown_events {
             anomalies.push(Anomaly::new(
                 "offset-gap",
@@ -268,31 +294,48 @@ fn check_partition(
             for d in &ds {
                 let Some(o) = d.offset else { continue };
                 let problem = match prev {
-                    Some(p) if o <= p => Some(("out-of-order", format!("offset {o} after {p} in one poll"))),
-                    Some(p) if o > p + 1 => Some(("offset-gap", format!("offset {o} after {p} in one poll"))),
+                    Some(p) if o <= p => {
+                        Some(("out-of-order", format!("offset {o} after {p} in one poll")))
+                    }
+                    Some(p) if o > p + 1 => {
+                        Some(("offset-gap", format!("offset {o} after {p} in one poll")))
+                    }
                     Some(_) => None,
-                    None if redelivery => (o > expected && !uncertain)
-                        .then(|| ("offset-gap", format!("redelivery starts at {o}, beyond the next offset {expected}"))),
+                    None if redelivery => (o > expected && !uncertain).then(|| {
+                        (
+                            "offset-gap",
+                            format!("redelivery starts at {o}, beyond the next offset {expected}"),
+                        )
+                    }),
                     None if o < expected => Some((
                         "out-of-order",
-                        format!("offset {o} delivered again without a redelivery mark (next was {expected})"),
+                        format!(
+                            "offset {o} delivered again without a redelivery mark (next was {expected})"
+                        ),
                     )),
-                    None if o > expected && !uncertain => {
-                        Some(("offset-gap", format!("delivered offset {o}, expected {expected}")))
-                    }
+                    None if o > expected && !uncertain => Some((
+                        "offset-gap",
+                        format!("delivered offset {o}, expected {expected}"),
+                    )),
                     None => None,
                 };
                 if let Some((kind, what)) = problem {
                     anomalies.push(Anomaly::new(
                         kind,
-                        format!("partition {name:?} subscription {sub:?}: {what} (event {at_event})"),
+                        format!(
+                            "partition {name:?} subscription {sub:?}: {what} (event {at_event})"
+                        ),
                         op.indices(),
                     ));
                 }
                 prev = Some(o);
             }
             if let Some(last) = prev {
-                expected = if redelivery { last + 1 } else { expected.max(last + 1) };
+                expected = if redelivery {
+                    last + 1
+                } else {
+                    expected.max(last + 1)
+                };
                 uncertain = false;
             }
         }
@@ -343,7 +386,10 @@ fn check_partition(
             _ => None,
         };
         let mut after: BTreeSet<i64> = BTreeSet::new();
-        for op in polls.iter().filter(|o| o.outcome == Outcome::Ok && o.call > heal.pos) {
+        for op in polls
+            .iter()
+            .filter(|o| o.outcome == Outcome::Ok && o.call > heal.pos)
+        {
             if let (Some(d), Some(t)) = (deadline, op.ret_time)
                 && t > d
             {
@@ -355,7 +401,11 @@ fn check_partition(
                 }
             }
         }
-        let missing: Vec<i64> = required.keys().copied().filter(|o| !after.contains(o)).collect();
+        let missing: Vec<i64> = required
+            .keys()
+            .copied()
+            .filter(|o| !after.contains(o))
+            .collect();
         if !missing.is_empty() {
             anomalies.push(Anomaly::new(
                 "redelivery-missing",

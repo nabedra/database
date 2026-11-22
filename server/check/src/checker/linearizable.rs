@@ -131,7 +131,11 @@ impl Interner {
     }
 
     fn name(&self, id: u32) -> &str {
-        if id == 0 { "nil" } else { &self.names[id as usize - 1] }
+        if id == 0 {
+            "nil"
+        } else {
+            &self.names[id as usize - 1]
+        }
     }
 }
 
@@ -157,7 +161,11 @@ fn to_key_op(op: &Op, src: usize, interner: &mut Interner) -> Option<KeyOp> {
     Some(KeyOp {
         op: reg,
         call: op.call,
-        ret: if op.outcome == Outcome::Ok { op.ret } else { None },
+        ret: if op.outcome == Outcome::Ok {
+            op.ret
+        } else {
+            None
+        },
         src,
     })
 }
@@ -252,8 +260,16 @@ fn search(ops: &[KeyOp], cutoff: Option<usize>, max_configs: usize) -> Search {
                 None => return Search::NotLinearizable,
                 Some((call, s)) => {
                     entry = undo(
-                        call, s, &mut state, &mut linearized, &matched, &node_op, &mut done_must,
-                        &mut prev, &mut next, &relink,
+                        call,
+                        s,
+                        &mut state,
+                        &mut linearized,
+                        &matched,
+                        &node_op,
+                        &mut done_must,
+                        &mut prev,
+                        &mut next,
+                        &relink,
                     );
                     continue;
                 }
@@ -286,8 +302,16 @@ fn search(ops: &[KeyOp], cutoff: Option<usize>, max_configs: usize) -> Search {
                 None => return Search::NotLinearizable,
                 Some((call, s)) => {
                     entry = undo(
-                        call, s, &mut state, &mut linearized, &matched, &node_op, &mut done_must,
-                        &mut prev, &mut next, &relink,
+                        call,
+                        s,
+                        &mut state,
+                        &mut linearized,
+                        &matched,
+                        &node_op,
+                        &mut done_must,
+                        &mut prev,
+                        &mut next,
+                        &relink,
                     );
                 }
             }
@@ -340,7 +364,10 @@ fn explain(
         }
     }
     let t = rets[lo];
-    let culprit = key_ops.iter().find(|o| o.ret == Some(t)).expect("cutoff is a return");
+    let culprit = key_ops
+        .iter()
+        .find(|o| o.ret == Some(t))
+        .expect("cutoff is a return");
     let mut window: Vec<&KeyOp> = key_ops
         .iter()
         .filter(|o| o.call <= t && o.ret.is_none_or(|r| r >= culprit.call))
@@ -363,12 +390,19 @@ fn explain(
             RegOp::Delete => "delete".to_string(),
         };
         let status = if o.ret.is_some() { "ok" } else { "info" };
-        format!("p{} {what} ({status}, event {})", src.process, src.invoke_index)
+        format!(
+            "p{} {what} ({status}, event {})",
+            src.process, src.invoke_index
+        )
     };
     let detail = format!(
         "key {key:?}: no linearization once {} completes; window: {}",
         describe(culprit),
-        window.iter().map(|o| describe(o)).collect::<Vec<_>>().join("; ")
+        window
+            .iter()
+            .map(|o| describe(o))
+            .collect::<Vec<_>>()
+            .join("; ")
     );
     Anomaly::new(
         "non-linearizable",
