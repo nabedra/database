@@ -1,0 +1,464 @@
+{
+ "run": "mix-cand",
+ "settings": {
+  "rates": [
+   1,
+   5,
+   20,
+   50,
+   100,
+   200,
+   300,
+   400,
+   600
+  ],
+  "seconds": 5.0,
+  "warmup_seconds": 3.0,
+  "repetitions": 3,
+  "clients": 32,
+  "rows": 5000,
+  "seed": 20261118,
+  "timeout": 10.0,
+  "operation": "mix",
+  "read_fraction": 0.95,
+  "stop_p99_ms": 100.0,
+  "stop_on_rejection": true,
+  "snapshot_between_phases": false
+ },
+ "workload": "point gets and updates of existing bigint primary keys (--read-fraction gets)",
+ "started_utc": "2026-11-22T10:54:23.637455+00:00",
+ "error": null,
+ "correctness_verified": true,
+ "metadata": {
+  "engine": "nabedra",
+  "binary_sha256": "426516e83587457aa78051ce7b15ac55455d9b5cd6bcb97fda7caf0a057011d2",
+  "server_version": "nabedra-db 0.1.1 oltp",
+  "image": "sha256:1547483c44543b51e35b72fce17d9bf49d6b6f56c027dd5b634392006f83f7dc",
+  "direct_oltp": "on",
+  "pool_format_version": 2,
+  "workspace_head": "c38a4a722b02e8b6989c1188e8e6b9156cb596b7",
+  "benchmark_source_sha256": {
+   "benchmark_oltp_nabedra.py": "24b65c6f4c3d32a4033027f4ac9cc1742ae189a977151ca8cd8c37196f1e18cc",
+   "benchmark_oltp_workload.py": "3f43e38951020343f8bf65e8de2f275f189b83aae96f8136573ad15824ebe21e"
+  },
+  "docker_environment": {
+   "ServerVersion": "28.3.3",
+   "OperatingSystem": "Docker Desktop",
+   "Architecture": "x86_64",
+   "KernelVersion": "6.10.14-linuxkit",
+   "NCPU": 8,
+   "MemTotal": 8220102656,
+   "CgroupVersion": "2"
+  },
+  "allocations": {
+   "worker_bytes": 2150000000,
+   "api_cpu": 0.35,
+   "api_bytes": 550000000,
+   "driver_cpu": 0.65,
+   "driver_bytes": 900000000,
+   "total_cpu": 4,
+   "total_bytes": 7900000000,
+   "hold_compaction": false,
+   "worker_env": [],
+   "worker_cpu": 1.0
+  },
+  "consistency": "Nabedra production OLTP",
+  "data_bytes": {
+   "w1": 67133110,
+   "w2": 67133110,
+   "w3": 67133110
+  },
+  "direct_activation_seconds_after_api_ready": 2.1624458209844306
+ },
+ "summary": {
+  "run": "mix-cand",
+  "error": null,
+  "correctness_verified": true,
+  "stopped_after_rate": 300,
+  "stop_reason": {
+   "median_p99_ms": 125.842928,
+   "rejected": 0
+  },
+  "rates": {
+   "1": {
+    "reps": 3,
+    "offered": 15,
+    "median_succeeded_rps": 1.0,
+    "median_p50_ms": 5.983753,
+    "median_p95_ms": 8.889471,
+    "median_p99_ms": 8.889471,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 15,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 5.983753,
+      "median_p99_ms": 8.523806,
+      "succeeded": 14,
+      "offered": 14
+     },
+     "update": {
+      "median_p50_ms": 10.754629,
+      "median_p99_ms": 10.754629,
+      "succeeded": 1,
+      "offered": 1
+     }
+    }
+   },
+   "5": {
+    "reps": 3,
+    "offered": 75,
+    "median_succeeded_rps": 5.0,
+    "median_p50_ms": 5.896843,
+    "median_p95_ms": 9.339588,
+    "median_p99_ms": 22.934734,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 75,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 5.896843,
+      "median_p99_ms": 13.241387,
+      "succeeded": 73,
+      "offered": 73
+     },
+     "update": {
+      "median_p50_ms": 20.708705000000002,
+      "median_p99_ms": 20.708705000000002,
+      "succeeded": 2,
+      "offered": 2
+     }
+    }
+   },
+   "20": {
+    "reps": 3,
+    "offered": 300,
+    "median_succeeded_rps": 20.0,
+    "median_p50_ms": 5.890752,
+    "median_p95_ms": 10.853609,
+    "median_p99_ms": 17.796343,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 300,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 5.669932,
+      "median_p99_ms": 19.394599,
+      "succeeded": 285,
+      "offered": 285
+     },
+     "update": {
+      "median_p50_ms": 12.928264,
+      "median_p99_ms": 22.725302,
+      "succeeded": 15,
+      "offered": 15
+     }
+    }
+   },
+   "50": {
+    "reps": 3,
+    "offered": 750,
+    "median_succeeded_rps": 50.0,
+    "median_p50_ms": 5.6715,
+    "median_p95_ms": 12.41606,
+    "median_p99_ms": 26.305005,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 750,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 5.334143,
+      "median_p99_ms": 23.574743,
+      "succeeded": 713,
+      "offered": 713
+     },
+     "update": {
+      "median_p50_ms": 12.41606,
+      "median_p99_ms": 28.765414,
+      "succeeded": 37,
+      "offered": 37
+     }
+    }
+   },
+   "100": {
+    "reps": 3,
+    "offered": 1500,
+    "median_succeeded_rps": 99.98080816397272,
+    "median_p50_ms": 5.218534,
+    "median_p95_ms": 11.310353,
+    "median_p99_ms": 27.742889,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 1500,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 5.028088,
+      "median_p99_ms": 27.742889,
+      "succeeded": 1414,
+      "offered": 1414
+     },
+     "update": {
+      "median_p50_ms": 11.102706,
+      "median_p99_ms": 35.049884,
+      "succeeded": 86,
+      "offered": 86
+     }
+    }
+   },
+   "200": {
+    "reps": 3,
+    "offered": 3000,
+    "median_succeeded_rps": 200.0,
+    "median_p50_ms": 4.627911,
+    "median_p95_ms": 12.715185,
+    "median_p99_ms": 24.491872,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 3000,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 4.523173,
+      "median_p99_ms": 24.491872,
+      "succeeded": 2842,
+      "offered": 2842
+     },
+     "update": {
+      "median_p50_ms": 9.840875,
+      "median_p99_ms": 45.313563,
+      "succeeded": 158,
+      "offered": 158
+     }
+    }
+   },
+   "300": {
+    "reps": 3,
+    "offered": 4500,
+    "median_succeeded_rps": 298.26135154047284,
+    "median_p50_ms": 4.65563,
+    "median_p95_ms": 37.052394,
+    "median_p99_ms": 125.842928,
+    "statuses": {
+     "client_capacity": 25,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 4475,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 4.552693,
+      "median_p99_ms": 119.490449,
+      "succeeded": 4233,
+      "offered": 4257
+     },
+     "update": {
+      "median_p50_ms": 10.227922,
+      "median_p99_ms": 174.843334,
+      "succeeded": 242,
+      "offered": 243
+     }
+    }
+   }
+  }
+ },
+ "direct_counters": {
+  "batch_sizes": {
+   "le_1": 636
+  },
+  "entries_applied": 636,
+  "entries_proposed": 636,
+  "get_micros_total": 11158764,
+  "gets": 11450,
+  "gets_done": 11450,
+  "mutation_micros_total": 5045501,
+  "mutations": 636,
+  "mutations_done": 636,
+  "requests": 12086,
+  "rows_proposed": 636,
+  "expire_entries": 2,
+  "batch_entries": 2,
+  "batch_members": {
+   "le_2": 2
+  },
+  "batched_commits": 4
+ },
+ "refusals": {},
+ "resources": {
+  "window_s": 162.285359447,
+  "acknowledged_writes": 636,
+  "io": {
+   "w1": {
+    "wbytes": 2662400,
+    "wios": 1292,
+    "cpu_usec": 34286505,
+    "throttled_periods": 3,
+    "periods": 1708,
+    "window_s": 170.655305866
+   },
+   "w2": {
+    "wbytes": 2666496,
+    "wios": 1293,
+    "cpu_usec": 14429057,
+    "throttled_periods": 1,
+    "periods": 1708,
+    "window_s": 170.683661629
+   },
+   "w3": {
+    "wbytes": 2658304,
+    "wios": 1291,
+    "cpu_usec": 13804366,
+    "throttled_periods": 1,
+    "periods": 1707,
+    "window_s": 170.663218147
+   }
+  },
+  "wbytes_total": 7987200,
+  "wbytes_per_ack": 12558.490566037735,
+  "strace": null,
+  "fsync_fdatasync_total": null,
+  "fsyncs_per_ack": null,
+  "finals": {
+   "driver": {
+    "memory_peak": null,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "",
+    "nano_cpus": 650000000,
+    "memory_limit": 900000000,
+    "memory_swap": 900000000,
+    "throttled": "0/0"
+   },
+   "api": {
+    "memory_peak": 32808960,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "35000 100000",
+    "nano_cpus": 350000000,
+    "memory_limit": 550000000,
+    "memory_swap": 550000000,
+    "throttled": "81/1710"
+   },
+   "w3": {
+    "memory_peak": 69517312,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "1/2066"
+   },
+   "w2": {
+    "memory_peak": 66818048,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "1/2082"
+   },
+   "w1": {
+    "memory_peak": 85995520,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "14/2101"
+   }
+  },
+  "budget_verified": true,
+  "errors": [],
+  "memory_stat_max": {
+   "w1": {
+    "max_anon": 52232192,
+    "max_file": 30044160
+   },
+   "w2": {
+    "max_anon": 41963520,
+    "max_file": 17416192
+   },
+   "w3": {
+    "max_anon": 41705472,
+    "max_file": 23916544
+   },
+   "api": {
+    "max_anon": 22331392,
+    "max_file": 3653632
+   }
+  }
+ },
+ "verification": {
+  "mode": "one snapshot read after the last measured phase",
+  "phases": 28,
+  "start_unix_ns": 1795345042053828431,
+  "end_unix_ns": 1795345052121784679,
+  "seconds": 10.067956248,
+  "driver_cpu_seconds": 0.12863093400000025,
+  "final_snapshot": {
+   "rows": 5000,
+   "sha256": "00870aaddbe87e4234155e20e820afb9914c5a888431d2c8b323c368b75cdd38",
+   "mismatches": 0,
+   "first_mismatches": [],
+   "read_mismatches": 0,
+   "first_read_mismatches": [],
+   "unresolved_keys": 0,
+   "unresolved_keys_with_new_value": 0,
+   "unobserved_unresolved_values_before_phase": 0,
+   "unobserved_unresolved_values_after_snapshot": 0,
+   "prior_unresolved_values_observed": 0,
+   "first_prior_unresolved_values_observed": [],
+   "source": "snapshot read"
+  }
+ }
+}

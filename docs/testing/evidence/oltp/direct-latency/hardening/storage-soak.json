@@ -1,0 +1,224 @@
+{
+ "soak100-cand-2": {
+  "seed_seconds": 44.12063490999935,
+  "seed_rejected_retries": 0,
+  "w1": {
+   "user_bytes": 530975422,
+   "flush_bytes": 265276946,
+   "compaction_bytes": 1382581257,
+   "journal_bytes": 596031587,
+   "journal_syncs": 25594,
+   "stall_ms": 36,
+   "write_delays": 0,
+   "l0_runs_peak": 4,
+   "write_amplification": 4.23
+  },
+  "w2": {
+   "user_bytes": 530972322,
+   "flush_bytes": 265296598,
+   "compaction_bytes": 1382624156,
+   "journal_bytes": 595867747,
+   "journal_syncs": 25572,
+   "stall_ms": 20,
+   "write_delays": 0,
+   "l0_runs_peak": 4,
+   "write_amplification": 4.23
+  },
+  "w3": {
+   "user_bytes": 530973518,
+   "flush_bytes": 265279651,
+   "compaction_bytes": 1382583728,
+   "journal_bytes": 595876911,
+   "journal_syncs": 25585,
+   "stall_ms": 40,
+   "write_delays": 0,
+   "l0_runs_peak": 4,
+   "write_amplification": 4.23
+  }
+ },
+ "soak100-cand": {
+  "seed_seconds": 47.61386886699984,
+  "seed_rejected_retries": 0,
+  "w1": {
+   "user_bytes": 531121824,
+   "flush_bytes": 265214276,
+   "compaction_bytes": 1382620622,
+   "journal_bytes": 596340737,
+   "journal_syncs": 25687,
+   "stall_ms": 62,
+   "write_delays": 0,
+   "l0_runs_peak": 4,
+   "write_amplification": 4.23
+  },
+  "w2": {
+   "user_bytes": 531121192,
+   "flush_bytes": 265214276,
+   "compaction_bytes": 1382620622,
+   "journal_bytes": 596220002,
+   "journal_syncs": 25685,
+   "stall_ms": 96,
+   "write_delays": 0,
+   "l0_runs_peak": 4,
+   "write_amplification": 4.23
+  },
+  "w3": {
+   "user_bytes": 531116668,
+   "flush_bytes": 265219966,
+   "compaction_bytes": 1382633590,
+   "journal_bytes": 596091853,
+   "journal_syncs": 25644,
+   "stall_ms": 53,
+   "write_delays": 0,
+   "l0_runs_peak": 4,
+   "write_amplification": 4.22
+  }
+ },
+ "soak100-main-2": {
+  "seed_seconds": 44.50849412199932,
+  "seed_rejected_retries": 0,
+  "w1": {
+   "user_bytes": 518290436,
+   "flush_bytes": 261787665,
+   "compaction_bytes": 1376929059,
+   "journal_bytes": 584743939,
+   "journal_syncs": 28022,
+   "stall_ms": 35,
+   "write_delays": null,
+   "l0_runs_peak": null,
+   "write_amplification": 4.29
+  },
+  "w2": {
+   "user_bytes": 518256282,
+   "flush_bytes": 261855644,
+   "compaction_bytes": 1377052627,
+   "journal_bytes": 583590674,
+   "journal_syncs": 27743,
+   "stall_ms": 22,
+   "write_delays": null,
+   "l0_runs_peak": null,
+   "write_amplification": 4.29
+  },
+  "w3": {
+   "user_bytes": 518253820,
+   "flush_bytes": 261754789,
+   "compaction_bytes": 1377076965,
+   "journal_bytes": 583497777,
+   "journal_syncs": 27701,
+   "stall_ms": 22,
+   "write_delays": null,
+   "l0_runs_peak": null,
+   "write_amplification": 4.29
+  }
+ },
+ "soak100-main": {
+  "seed_seconds": 48.81515851799941,
+  "seed_rejected_retries": 0,
+  "w1": {
+   "user_bytes": 475740253,
+   "flush_bytes": 240423181,
+   "compaction_bytes": 1124353149,
+   "journal_bytes": 524649379,
+   "journal_syncs": 20684,
+   "stall_ms": 295,
+   "write_delays": null,
+   "l0_runs_peak": null,
+   "write_amplification": 3.97
+  },
+  "w2": {
+   "user_bytes": 475694715,
+   "flush_bytes": 240403351,
+   "compaction_bytes": 1124476533,
+   "journal_bytes": 523029362,
+   "journal_syncs": 20328,
+   "stall_ms": 135,
+   "write_delays": null,
+   "l0_runs_peak": null,
+   "write_amplification": 3.97
+  },
+  "w3": {
+   "user_bytes": 475692278,
+   "flush_bytes": 240412539,
+   "compaction_bytes": 1124497869,
+   "journal_bytes": 523107325,
+   "journal_syncs": 20303,
+   "stall_ms": 117,
+   "write_delays": null,
+   "l0_runs_peak": null,
+   "write_amplification": 3.97
+  }
+ },
+ "soak50-cand": {
+  "seed_seconds": 45.2480759529999,
+  "seed_rejected_retries": 0,
+  "w1": {
+   "user_bytes": 446678840,
+   "flush_bytes": 224912747,
+   "compaction_bytes": 890808705,
+   "journal_bytes": 482931662,
+   "journal_syncs": 14827,
+   "stall_ms": 9,
+   "write_delays": 0,
+   "l0_runs_peak": 4,
+   "write_amplification": 3.58
+  },
+  "w2": {
+   "user_bytes": 446678054,
+   "flush_bytes": 224912693,
+   "compaction_bytes": 890808705,
+   "journal_bytes": 482902018,
+   "journal_syncs": 14824,
+   "stall_ms": 7,
+   "write_delays": 0,
+   "l0_runs_peak": 4,
+   "write_amplification": 3.58
+  },
+  "w3": {
+   "user_bytes": 446678208,
+   "flush_bytes": 224912693,
+   "compaction_bytes": 890808705,
+   "journal_bytes": 482897915,
+   "journal_syncs": 14823,
+   "stall_ms": 1,
+   "write_delays": 0,
+   "l0_runs_peak": 4,
+   "write_amplification": 3.58
+  }
+ },
+ "soak50-main": {
+  "seed_seconds": 43.6377621190004,
+  "seed_rejected_retries": 0,
+  "w1": {
+   "user_bytes": 443619527,
+   "flush_bytes": 224387021,
+   "compaction_bytes": 891604921,
+   "journal_bytes": 479373030,
+   "journal_syncs": 15142,
+   "stall_ms": 8,
+   "write_delays": null,
+   "l0_runs_peak": null,
+   "write_amplification": 3.6
+  },
+  "w2": {
+   "user_bytes": 443613571,
+   "flush_bytes": 224397943,
+   "compaction_bytes": 891615535,
+   "journal_bytes": 479203136,
+   "journal_syncs": 15082,
+   "stall_ms": 58,
+   "write_delays": null,
+   "l0_runs_peak": null,
+   "write_amplification": 3.6
+  },
+  "w3": {
+   "user_bytes": 443611994,
+   "flush_bytes": 224403737,
+   "compaction_bytes": 891618119,
+   "journal_bytes": 479149054,
+   "journal_syncs": 15062,
+   "stall_ms": 36,
+   "write_delays": null,
+   "l0_runs_peak": null,
+   "write_amplification": 3.6
+  }
+ }
+}
