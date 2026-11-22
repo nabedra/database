@@ -515,6 +515,26 @@ where
 /// on a loaded host. Larger ones keep their native jobs.
 const INLINE_BYTES: usize = 4 << 10;
 
+/// RD3: PERF2b's rule for the Raft log and transport codecs. Runs `work` on
+/// the calling task when it handles at most [`INLINE_BYTES`] (`bytes`, an
+/// estimate from the entries' heap size or the frame length), otherwise in a
+/// native job. The serial Data commit made five such handoffs for a few
+/// microseconds of work each: the leader's log sizing pass, an encode and a
+/// reply decode per follower, and each follower's decode and sizing pass.
+pub(crate) async fn execute_small<T: Send + 'static>(
+    shared: &Arc<crate::oltp::pool::WorkerSharedResources>,
+    class: ExecutionClass,
+    request: u64,
+    bytes: usize,
+    work: impl FnOnce() -> Result<T, ProtocolError> + Send + 'static,
+) -> Result<T, ProtocolError> {
+    if bytes <= INLINE_BYTES {
+        work()
+    } else {
+        shared.execute(class, request, 0, work).await
+    }
+}
+
 fn blank_digest() -> Digest {
     Digest::from_bytes(Sha256::digest(b"nabedra/typed-raft-blank/v1").into())
 }
@@ -691,20 +711,6 @@ pub(crate) const REPLICATION_PAYLOAD_ENTRIES: u64 = MAX_APPEND_ENTRIES as u64;
 /// most `MAX_APPEND_ENTRIES` entries without lingering, and the log writes
 /// each append as synced batches of at most 1 MiB. Bounds transient batches
 /// independently of total retained log/table size.
-/// Benchmark only (RD3): `NABEDRA_BENCH_NO_SUBMIT_BROADCAST=1` keeps
-/// OpenRaft's default (appends reach replication after the core's pass), so
-/// one binary measures both sides.
-fn submit_broadcast_disabled() -> bool {
-    const ENV: &str = "NABEDRA_BENCH_NO_SUBMIT_BROADCAST";
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        let disabled = std::env::var_os(ENV).is_some_and(|value| value == "1");
-        if disabled {
-            tracing::warn!("{ENV}=1: appends are published to replication after the core's pass (benchmark only)");
-        }
-        disabled
-    })
-}
 pub(crate) fn batched_config(
     mut config: openraft::Config,
 ) -> Result<Arc<openraft::Config>, ProtocolError> {
@@ -717,15 +723,6 @@ pub(crate) fn batched_config(
     // direct leader's reads) check the lease on the caller's task. Only
     // `ReadPolicy::LeaseRead` uses it; ReadIndex keeps the quorum round.
     config.enable_local_lease_read = Some(true);
-    // RD3: publish an append to the replication streams as soon as
-    // `RaftLogStorage::append` returns, not after the core's next pass over
-    // its queues (1.7 ms on the controlled host, RD2). `append` returns once
-    // the entries are readable in the pending overlay (PERF2d), so a stream
-    // reads them while the sync runs. Durability is unchanged: a follower
-    // acknowledges after its own sync and the leader counts itself only
-    // after its `IOFlushed`. The option also lets the core handle ready
-    // notifications (replication progress, flushes) between client writes.
-    config.broadcast_submitted_on_append = Some(!submit_broadcast_disabled());
     config
         .validate()
         .map(Arc::new)
