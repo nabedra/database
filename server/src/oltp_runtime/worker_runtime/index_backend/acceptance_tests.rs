@@ -369,13 +369,20 @@ async fn o12_refresh_survives_temporary_ingress_saturation() {
     fixture.insert_rows(vec![seed.clone()]).await;
     let record = fixture.declare().await;
     let owner = MaintenanceOwnerRef {
-        catalog_group_id: fixture.runtime.services.catalog.participant().identity().group_id,
+        catalog_group_id: fixture
+            .runtime
+            .services
+            .catalog
+            .participant()
+            .identity()
+            .group_id,
         table_id: fixture.definition.table_id,
         index_id: fixture.definition.index_id,
         build_id: fixture.build_id,
         attempt: 1,
     };
-    let job = crate::oltp::mvcc::index::build::refresh_job(owner, &protocol::Key::Int64(0)).unwrap();
+    let job =
+        crate::oltp::mvcc::index::build::refresh_job(owner, &protocol::Key::Int64(0)).unwrap();
     let permits: Vec<_> = std::iter::from_fn(|| fixture.runtime.ingress.try_admit().ok()).collect();
     assert!(!permits.is_empty());
     let refused = index_holds::register_checkpoint(job, Checkpoint::RefreshAdmissionRefused);
@@ -386,7 +393,11 @@ async fn o12_refresh_survives_temporary_ingress_saturation() {
     };
     drop(permits);
     hold.release.send(false).unwrap();
-    tokio::time::timeout(WAIT, actor).await.unwrap().unwrap().unwrap();
+    tokio::time::timeout(WAIT, actor)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     fixture.assert_status(1, "ready", false).await;
     fixture.assert_query(0, &json!([seed]), true).await;
     fixture.close().await;
