@@ -10,10 +10,25 @@
 # - The pull-request merge gate (base jobs and the non-blocking quarantine job on the merge commit). Only a newer
 #   head of the same pull request cancels a gate run. `[skip ci]` in the head commit skips it for docs-only PRs.
 #
+# Opt-in jobs (`-f jobs=a,b`; unknown names fail the run). Selecting a job may imply others; the
+# `revision` job resolves the list and writes it to the run summary:
+#   direct      D01-D12, ORM suites, library suite off, acceptance, one leg per mode; implies rep1, growth, o02
+#   acceptance  Linux OLTP acceptance in the default mode; implies growth, o02
+#   o02         O02 engine identity with the same-commit engine matrix and an OLAP server, per mode (+ T02)
+#   growth      O16 and O26 on the shared build, O21 and O28 on one opt-level-1 build, per mode
+#   rep1        REP1-REP5 process suites: scale, rollback, restart, replacement check
+#   rep4-mixed  builds the pre-execution worker and tests mixed-version enrollment
+#   o22         adds O22 to `scenarios` (focused O22, per mode)
+#   blackhole   AZ1/AZ2 RF3 packet-drop failover fixture (O06/O18)
+#   migrate     MIG1/MIG2 RocksDB-era RF3 archive export and restore
+#   live3, live3-fixture  LIVE3 Linux release binaries per engine; the library test executable
+#   campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1  long, image and measurement jobs
+#
 # Builds. The `build` job compiles the debug OLTP server and every OLTP test executable once and shares them as
-# one artifact. Jobs that test that build download it instead of compiling. Release, image and Events jobs keep
-# their own builds. Quarantined tests and scenarios (.github/quarantine.tsv) stay out of the blocking jobs and
-# run in the `quarantine` job, which never fails the run.
+# one artifact. Jobs that test that build download it instead of compiling. `growth-build` makes the one
+# opt-level-1 build O21 and O28 need. Release, image and Events jobs keep their own builds. Quarantined tests
+# and scenarios (.github/quarantine.tsv) stay out of the blocking jobs and run in the `quarantine` job, which
+# never fails the run.
 #
 # Caches (plans/fast-builds.md, BLD1). Each Cargo job restores a dependency cache keyed by toolchain
 # and manifests, and saves it right after its build step, before any test runs, so a failing test
@@ -45,7 +60,7 @@ on:
         type: boolean
         default: true
       jobs:
-        description: "Comma-separated opt-in jobs: direct, acceptance, campaign, docker, memory, bench, perf, g7"
+        description: "Comma-separated opt-in jobs: direct, acceptance, o02, growth, rep1, rep4-mixed, o22, blackhole, migrate, live3, live3-fixture, campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1"
         type: string
         default: ""
       scenarios:
@@ -98,8 +113,13 @@ jobs:
     timeout-minutes: 10
     outputs:
       build: ${{ steps.plan.outputs.build }}
+      # The resolved opt-in jobs, comma-delimited on both sides (",direct,rep1,"), for contains().
+      jobs: ${{ steps.plan.outputs.jobs }}
       modes: ${{ steps.plan.outputs.modes }}
       scenarios: ${{ steps.plan.outputs.scenarios }}
+      has_scenarios: ${{ steps.plan.outputs.has_scenarios }}
+      growth: ${{ steps.plan.outputs.growth }}
+      has_growth: ${{ steps.plan.outputs.has_growth }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -127,26 +147,61 @@ jobs:
             [[ "$REQUEST_ID" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || fail "request_id must be 1-80 of [A-Za-z0-9._-]"
             [[ "$REPEAT" =~ ^[0-9]+$ ]] && [ "$REPEAT" -ge 1 ] && [ "$REPEAT" -le 200 ] || fail "repeat must be 1-200"
           fi
-          known=",direct,acceptance,campaign,docker,memory,bench,perf,g7,"
-          for job in ${JOBS//,/ }; do [[ "$known" == *",$job,"* ]] || fail "unknown job '$job' (known: ${known:1:-1})"; done
+          known=",direct,acceptance,o02,growth,rep1,rep4-mixed,o22,blackhole,migrate,live3,live3-fixture,campaign,docker,memory,bench,perf,g7,gc1,perf1,snap1,"
+          selected=","
+          add() { [[ "$selected" == *",$1,"* ]] || selected+="$1,"; }
+          has() { [[ "$selected" == *",$1,"* ]]; }
+          for job in ${JOBS//,/ }; do [[ "$known" == *",$job,"* ]] || fail "unknown job '$job' (known: ${known:1:-1})"; add "$job"; done
+          # direct carries the checks hardening's [ci direct] ran (REP1 suites, growth scenarios); direct and
+          # acceptance leave O02 and the growth category to their own jobs, which have the inputs they need.
+          if has direct; then add rep1; add growth; add o02; fi
+          if has acceptance; then add growth; add o02; fi
           modes=()
-          for mode in ${MODES//,/ }; do [[ "$mode" == on || "$mode" == off ]] || fail "mode must be on or off"; modes+=("\"$mode\""); done
+          for mode in ${MODES//,/ }; do [[ "$mode" == on || "$mode" == off ]] || fail "mode must be on or off"; modes+=("$mode"); done
           [ "${#modes[@]}" -gt 0 ] || fail "modes is empty"
-          include=()
-          for scenario in ${SCENARIOS//,/ }; do
+          scenario_list=" "
+          for scenario in ${SCENARIOS//,/ } $(has o22 && echo O22); do
             [[ "$scenario" =~ ^O(0[1-9]|1[0-9]|2[0-9])$ ]] || fail "scenario must be O01-O29, got '$scenario'"
-            for mode in "${modes[@]}"; do include+=("{\"scenario\":\"$scenario\",\"mode\":$mode}"); done
+            [[ "$scenario_list" == *" $scenario "* ]] || scenario_list+="$scenario "
           done
+          include=()
+          for scenario in $scenario_list; do
+            for mode in "${modes[@]}"; do include+=("{\"scenario\":\"$scenario\",\"mode\":\"$mode\"}"); done
+          done
+          has_scenarios=false; [ "${#include[@]}" -gt 0 ] && has_scenarios=true
           [ "${#include[@]}" -gt 0 ] || include=('{"scenario":"none","mode":"on"}')
           for name in $TESTS; do [[ "$name" =~ ^[a-z_][a-z0-9_]*(::[a-z_][a-z0-9_]*)+$ ]] || fail "test '$name' must be a full path"; done
-          build=false
-          if [ "$BASE" = true ] || [ -n "$SCENARIOS$TESTS" ] || [[ ",$JOBS," == *,direct,* || ",$JOBS," == *,acceptance,* ]]; then build=true; fi
           python3 scripts/ci_quarantine.py check
+          # Growth scenarios: O16 and O26 run every mode in one job on the shared build; O21 and O28 run one
+          # job per mode on the opt-level-1 build. Quarantined scenarios run in the quarantine job instead.
+          quarantined=" $(python3 scripts/ci_quarantine.py scenarios | tr '\n' ' ') "
+          growth=()
+          if has growth; then
+            for scenario in O16 O26; do
+              [[ "$quarantined" == *" $scenario "* ]] || growth+=("{\"scenario\":\"$scenario\",\"modes\":\"${modes[*]}\",\"label\":\"$(IFS=-; echo "${modes[*]}")\",\"opt1\":false,\"timeout\":600}")
+            done
+            for scenario in O21 O28; do
+              [[ "$quarantined" == *" $scenario "* ]] && continue
+              for mode in "${modes[@]}"; do growth+=("{\"scenario\":\"$scenario\",\"modes\":\"$mode\",\"label\":\"$mode\",\"opt1\":true,\"timeout\":3600}"); done
+            done
+          fi
+          has_growth=false; [ "${#growth[@]}" -gt 0 ] && has_growth=true
+          [ "${#growth[@]}" -gt 0 ] || growth=('{"scenario":"none","modes":"on","label":"on","opt1":false,"timeout":600}')
+          build=false
+          for job in direct acceptance o02 growth rep1 rep4-mixed blackhole live3-fixture; do has "$job" && build=true; done
+          if [ "$BASE" = true ] || [ "$has_scenarios" = true ] || [ -n "$TESTS" ]; then build=true; fi
+          quoted=$(printf '"%s",' "${modes[@]}")
           {
             echo "build=$build"
-            echo "modes=[$(IFS=,; echo "${modes[*]}")]"
+            echo "jobs=$selected"
+            echo "modes=[${quoted%,}]"
             echo "scenarios={\"include\":[$(IFS=,; echo "${include[*]}")]}"
+            echo "has_scenarios=$has_scenarios"
+            echo "growth={\"include\":[$(IFS=,; echo "${growth[*]}")]}"
+            echo "has_growth=$has_growth"
           } >> "$GITHUB_OUTPUT"
+          resolved=$(echo "$selected" | sed 's/^,//; s/,$//')
+          shown=$(echo $scenario_list | tr ' ' ',')
           {
             echo "### Tested revision: \`$head\`"
             echo
@@ -156,8 +211,8 @@ jobs:
             echo "| Request | ${REQUEST_ID:-pull request} |"
             echo "| Workflow | \`$WORKFLOW_REF\` at \`$WORKFLOW_SHA\` |"
             echo "| Base jobs | $BASE |"
-            echo "| Opt-in jobs | ${JOBS:-none} |"
-            echo "| Scenarios | ${SCENARIOS:-none} (modes ${MODES}) |"
+            echo "| Opt-in jobs | ${JOBS:-none} (resolved: ${resolved:-none}) |"
+            echo "| Scenarios | ${shown:-none} (modes ${MODES}) |"
             echo "| Tests | ${TESTS:-none} (x${REPEAT:-1}) |"
             echo
             python3 scripts/ci_quarantine.py report
@@ -238,10 +293,26 @@ jobs:
           path: oltp-bins.tar.zst
           compression-level: 0
           retention-days: 3
+      # LIVE3: the library test executable for the queue inspection fixture, with its checksum and source.
+      - name: Package the LIVE3 queue inspection executable
+        if: contains(needs.revision.outputs.jobs, ',live3-fixture,')
+        run: |
+          mkdir live3-test
+          cp "$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)" live3-test/oltp-test
+          cd live3-test
+          sha256sum oltp-test > SHA256SUMS
+          printf 'source=%s\n' "$TESTED_SHA" > build.txt
+      - if: contains(needs.revision.outputs.jobs, ',live3-fixture,')
+        uses: actions/upload-artifact@v4
+        with:
+          name: live3-oltp-test
+          path: live3-test
+          retention-days: 7
+
   kv:
     name: nabedra-kv
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base || contains(format(',{0},', inputs.jobs), ',g7,')
+    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',g7,')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -290,7 +361,7 @@ jobs:
       # GATEfix G7: memory of a freshly opened store (journal zero fill) at the base commit and
       # at the head, each test binary in its own systemd scope on the runner's disk. Opt-in.
       - name: G7 store memory, base vs head
-        if: contains(format(',{0},', inputs.jobs), ',g7,')
+        if: contains(needs.revision.outputs.jobs, ',g7,')
         env:
           G7_BASE: 1ea46224549b565ee3e559b39319970661ea5bc0
         run: |
@@ -322,9 +393,9 @@ jobs:
   features:
     name: feature builds (O02, NS26)
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base
+    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',o02,')
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -373,6 +444,39 @@ jobs:
             ~/.cargo/registry/cache
             ~/cargo-cache
           key: ${{ steps.cache.outputs.cache-primary-key }}
+      # O02 inputs for the o02 job: the same-commit engine matrix (installed binaries, compile guards) and
+      # an OLAP server for the cross-engine worker check. Built after the cache is saved.
+      - name: Build installed engine variants and check feature guards (O02)
+        if: contains(needs.revision.outputs.jobs, ',o02,')
+        run: python scripts/check_engine_features.py --acceptance-evidence o02-engine-features.json
+      - name: OLAP server for O02
+        if: contains(needs.revision.outputs.jobs, ',o02,')
+        run: |
+          cargo build --locked --manifest-path server/Cargo.toml --no-default-features --features olap --bin nabedra-db
+          mkdir -p o02-inputs && cp server/target/debug/nabedra-db o02-inputs/nabedra-db-olap && cp o02-engine-features.json o02-inputs/
+          o02-inputs/nabedra-db-olap --version
+          printf 'source=%s\n' "$TESTED_SHA" > o02-inputs/source.txt
+          tar -cf o02-inputs.tar o02-inputs
+      - name: OLAP publication fault regressions (T02)
+        if: contains(needs.revision.outputs.jobs, ',o02,')
+        run: |
+          set -o pipefail
+          cargo test --locked --manifest-path server/Cargo.toml --no-default-features --features olap --test commit 2>&1 | tee t02-commit.log
+      - if: contains(needs.revision.outputs.jobs, ',o02,')
+        uses: actions/upload-artifact@v4
+        with:
+          name: o02-inputs
+          path: o02-inputs.tar
+          retention-days: 3
+      - if: always() && contains(needs.revision.outputs.jobs, ',o02,')
+        uses: actions/upload-artifact@v4
+        with:
+          name: o02-engine-features
+          path: |
+            o02-engine-features.json
+            t02-commit.log
+          if-no-files-found: ignore
+          retention-days: 14
 
   oltp:
     name: OLTP library and integration tests
@@ -481,7 +585,7 @@ jobs:
   campaign:
     name: crash campaign (release, long)
     needs: revision
-    if: contains(format(',{0},', inputs.jobs), ',campaign,')
+    if: contains(needs.revision.outputs.jobs, ',campaign,')
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -557,7 +661,7 @@ jobs:
   campaign-ns01:
     name: crash campaign NS01 1e6 (release, long)
     needs: revision
-    if: contains(format(',{0},', inputs.jobs), ',campaign,')
+    if: contains(needs.revision.outputs.jobs, ',campaign,')
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
@@ -595,7 +699,7 @@ jobs:
   docker-oltp:
     name: OLTP image
     needs: revision
-    if: contains(format(',{0},', inputs.jobs), ',docker,')
+    if: contains(needs.revision.outputs.jobs, ',docker,')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -647,7 +751,7 @@ jobs:
   docker-events:
     name: Events image and acceptance
     needs: revision
-    if: contains(format(',{0},', inputs.jobs), ',docker,')
+    if: contains(needs.revision.outputs.jobs, ',docker,')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -710,7 +814,7 @@ jobs:
   acceptance:
     name: Linux OLTP acceptance
     needs: [revision, build]
-    if: contains(format(',{0},', inputs.jobs), ',acceptance,')
+    if: contains(needs.revision.outputs.jobs, ',acceptance,')
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
@@ -733,12 +837,16 @@ jobs:
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "QUARANTINE_SKIPS=$(python3 scripts/ci_quarantine.py skips)" >> "$GITHUB_ENV"
           echo "KEEP_SCENARIOS=$(python3 scripts/ci_quarantine.py scenario-args)" >> "$GITHUB_ENV"
+      - name: Acceptance runner unit tests
+        run: python -m unittest discover -s scripts -p test_acceptance_oltp.py
       - name: Acceptance (no AWS, no comparative benchmarks)
+        if: ${{ !cancelled() }}
         run: |
+          # O02 runs in the o02 job and the growth category (O16, O21, O26, O28) in the growth jobs.
           # Exit 1 = a scenario failed; exit 2 = some scenarios did not run (listed in results.json, never counted as passed).
           rc=0; python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" --server-binary "$NABEDRA_BIN" \
             --category compatibility --category queries --category transactions \
-            --category recovery --category growth $KEEP_SCENARIOS --output artifacts/oltp-acceptance || rc=$?
+            --category recovery ${KEEP_SCENARIOS//--scenario O02/} --output artifacts/oltp-acceptance || rc=$?
           python scripts/ci_acceptance_summary.py artifacts/oltp-acceptance/results.json >> "$GITHUB_STEP_SUMMARY" || true
           [ "$rc" = 0 ] || [ "$rc" = 2 ]
       - if: always()
@@ -754,7 +862,7 @@ jobs:
   direct:
     name: direct point path and suites, direct_oltp ${{ matrix.mode }} (T9)
     needs: [revision, build]
-    if: contains(format(',{0},', inputs.jobs), ',direct,')
+    if: contains(needs.revision.outputs.jobs, ',direct,')
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     strategy:
@@ -792,6 +900,9 @@ jobs:
           (cd orm/typescript && npm ci --no-audit --no-fund && npm run build)
           python -m pip install --quiet "httpx>=0.27,<1"
           mkdir -p artifacts
+      - name: Acceptance runner unit tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.mode == 'on' }}
+        run: python -m unittest discover -s scripts -p test_acceptance_oltp.py
       - name: D01-D12 and U01 on real processes
         if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.mode == 'on' }}
         run: |
@@ -819,14 +930,22 @@ jobs:
       - name: OLTP acceptance, direct_oltp ${{ matrix.mode }} (no AWS, no benchmarks)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
+          # O02 runs in the o02 job and the growth category (O16, O21, O26, O28) in the growth jobs.
           rc=0
           NABEDRA_TEST_DIRECT_OLTP=$MODE python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
             --server-binary "$NABEDRA_BIN" --category compatibility --category queries --category transactions \
-            --category recovery --category growth $KEEP_SCENARIOS --output "artifacts/acceptance-$MODE" > "artifacts/acceptance-$MODE.log" 2>&1 || rc=$?
+            --category recovery ${KEEP_SCENARIOS//--scenario O02/} --output "artifacts/acceptance-$MODE" > "artifacts/acceptance-$MODE.log" 2>&1 || rc=$?
           tail -40 "artifacts/acceptance-$MODE.log"
           python scripts/ci_acceptance_summary.py "artifacts/acceptance-$MODE/results.json" >> "$GITHUB_STEP_SUMMARY" || true
           # Exit 1 = a scenario failed; exit 2 = some scenarios did not run (listed in results.json, not counted as passed).
-          [ "$rc" = 0 ] || [ "$rc" = 2 ]
+          status=0; [ "$rc" = 0 ] || [ "$rc" = 2 ] || status=1
+          # The RF3 transaction cases must execute every clause in each mode (quarantined ones excepted).
+          for required in O07 O10; do
+            [[ " $KEEP_SCENARIOS " == *" $required "* ]] || continue
+            jq -e --arg s "$required" '[.results[] | select(.scenario == $s and .status == "passed")] | length == 1' \
+              "artifacts/acceptance-$MODE/results.json" > /dev/null || { echo "::error::$required must pass with direct_oltp=$MODE"; status=1; }
+          done
+          exit "$status"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -834,11 +953,406 @@ jobs:
           path: artifacts
           retention-days: 14
 
+  # O02 engine identity with the inputs it needs: the same-commit engine matrix and the OLAP server
+  # from `features`, and the shared OLTP build. Every selected mode, in one job.
+  o02:
+    name: O02 engine identity, direct_oltp ${{ inputs.modes || 'on,off' }}
+    needs: [revision, build, features]
+    if: ${{ !cancelled() && needs.build.result == 'success' && contains(needs.revision.outputs.jobs, ',o02,') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: oltp-bins
+      - uses: actions/download-artifact@v4
+        with:
+          name: o02-inputs
+      - name: Unpack the shared build and the O02 inputs
+        run: |
+          tar -I zstd -xf oltp-bins.tar.zst && rm oltp-bins.tar.zst
+          grep -qx "source=$TESTED_SHA" bins-source.txt || { echo "::error::the shared build is not $TESTED_SHA"; exit 1; }
+          tar -xf o02-inputs.tar && rm o02-inputs.tar
+          grep -qx "source=$TESTED_SHA" o02-inputs/source.txt || { echo "::error::the O02 inputs are not $TESTED_SHA"; exit 1; }
+          lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
+          echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
+          echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
+          echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
+          echo "NABEDRA_O02_ENGINE_FEATURES=$GITHUB_WORKSPACE/o02-inputs/o02-engine-features.json" >> "$GITHUB_ENV"
+      - name: O02 in every mode
+        env:
+          MODES: ${{ join(fromJSON(needs.revision.outputs.modes), ' ') }}
+        run: |
+          if python3 scripts/ci_quarantine.py scenarios | grep -qx O02; then
+            echo "O02 is quarantined: it runs in the quarantine job." >> "$GITHUB_STEP_SUMMARY"; exit 0
+          fi
+          status=0
+          for mode in $MODES; do
+            rc=0
+            NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
+              --server-binary "$NABEDRA_BIN" --olap-binary o02-inputs/nabedra-db-olap --scenario O02 \
+              --output "artifacts/O02-$mode" || rc=$?
+            python scripts/ci_acceptance_summary.py "artifacts/O02-$mode/results.json" >> "$GITHUB_STEP_SUMMARY" || true
+            # Exit 2 = not every clause executed: shown as not-run, never as passed.
+            if [ "$rc" = 2 ]; then echo "::warning::O02 direct_oltp=$mode: not-run (see results.json)"; elif [ "$rc" != 0 ]; then status=1; fi
+          done
+          exit "$status"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: o02-evidence
+          path: artifacts
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # The one opt-level-1 build of the OLTP server and library test executable that O21 and O28 need
+  # (debug builds time out). Its own target directory, so its paths never collide with the shared build.
+  growth-build:
+    name: OLTP opt-level-1 build (O21, O28)
+    needs: revision
+    if: contains(needs.revision.outputs.jobs, ',growth,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - name: Restore Cargo cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: oltp-opt1-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: oltp-opt1-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target-opt1; fi
+      - name: Build
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked --no-default-features --features oltp --lib --no-run --target-dir target-opt1 \
+            --message-format=json-render-diagnostics > ../build-opt1.json
+          cargo build --locked --no-default-features --features oltp --bin nabedra-db --target-dir target-opt1
+          cd ..
+          jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib")))
+                 | ["lib", .target.name, .executable] | @tsv' build-opt1.json | sed "s#\t$GITHUB_WORKSPACE/#\t#" > bins.tsv
+          printf 'server\tnabedra-db\tserver/target-opt1/debug/nabedra-db\n' >> bins.tsv
+          test "$(awk -F'\t' '$1 == "lib"' bins.tsv | wc -l)" = 1
+          cat bins.tsv
+      - name: Stage Cargo cache without workspace crates
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf ~/cargo-cache && mkdir -p ~/cargo-cache && cp -al server/target-opt1 ~/cargo-cache/target
+          CARGO_TARGET_DIR=~/cargo-cache/target cargo clean --offline --locked --manifest-path server/Cargo.toml -p nabedra-database -p nabedra-kv
+          du -sh ~/cargo-cache/target
+      - name: Save Cargo cache
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: Pack
+        run: |
+          printf 'source=%s\n' "$TESTED_SHA" > bins-source.txt
+          tar -I 'zstd -T0 -3' -cf oltp-bins-opt1.tar.zst bins.tsv bins-source.txt $(cut -f3 bins.tsv)
+          echo "OLTP opt-level-1 build artifact: $(du -h oltp-bins-opt1.tar.zst | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oltp-bins-opt1
+          path: oltp-bins-opt1.tar.zst
+          compression-level: 0
+          retention-days: 3
+
+  # Growth acceptance (O16, O21, O26, O28): O16 and O26 on the shared build, every mode in one job;
+  # O21 and O28 on the opt-level-1 build, one job per mode. The plan comes from `revision`.
+  growth:
+    name: ${{ matrix.scenario }} growth acceptance, direct_oltp ${{ matrix.modes }}
+    needs: [revision, build, growth-build]
+    if: needs.revision.outputs.has_growth == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.revision.outputs.growth) }}
+    env:
+      SCENARIO: ${{ matrix.scenario }}
+      MODES: ${{ matrix.modes }}
+      LIMIT: ${{ matrix.timeout }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.opt1 && 'oltp-bins-opt1' || 'oltp-bins' }}
+      - name: Unpack the ${{ matrix.opt1 && 'opt-level-1' || 'shared' }} build
+        run: |
+          tar -I zstd -xf oltp-bins*.tar.zst && rm oltp-bins*.tar.zst
+          grep -qx "source=$TESTED_SHA" bins-source.txt || { echo "::error::the build is not $TESTED_SHA"; exit 1; }
+          echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
+          echo "NABEDRA_BIN=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "server" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
+      - name: Run ${{ matrix.scenario }}
+        run: |
+          status=0
+          for mode in $MODES; do
+            echo "direct_oltp=$mode"
+            rc=0
+            NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
+              --server-binary "$NABEDRA_BIN" --scenario "$SCENARIO" --timeout "$LIMIT" \
+              --output "artifacts/$SCENARIO-$mode" || rc=$?
+            python scripts/ci_acceptance_summary.py "artifacts/$SCENARIO-$mode/results.json" >> "$GITHUB_STEP_SUMMARY" || true
+            # Exit 2 = not every clause executed: shown as not-run, never as passed.
+            if [ "$rc" = 2 ]; then echo "::warning::$SCENARIO direct_oltp=$mode: not-run (see results.json)"; elif [ "$rc" != 0 ]; then status=1; fi
+          done
+          exit "$status"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: growth-${{ matrix.scenario }}-${{ matrix.label }}
+          path: artifacts
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # REP1-REP5 worker recovery process suites on the shared build: scale, direct-mode rollback,
+  # restart and system replacement.
+  rep1:
+    name: REP1 worker recovery, rollback, restart and replacement
+    needs: [revision, build]
+    if: contains(needs.revision.outputs.jobs, ',rep1,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: oltp-bins
+      - name: Unpack the shared build
+        run: |
+          tar -I zstd -xf oltp-bins.tar.zst && rm oltp-bins.tar.zst
+          grep -qx "source=$TESTED_SHA" bins-source.txt || { echo "::error::the shared build is not $TESTED_SHA"; exit 1; }
+          lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
+          echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
+          echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
+      - name: Process suites
+        run: |
+          set -o pipefail
+          status=0
+          for suite in scale rollback restart replacement-check; do
+            echo "::group::$suite"
+            python3 server/tests/oltp_recovery_operations.py --binary "$NABEDRA_BIN" \
+              --test-executable "$NABEDRA_TEST_EXE" --suite "$suite" 2>&1 | tee "oltp-rep1-$suite.log" || { status=1; echo "::error::REP1 suite $suite failed"; }
+            echo "::endgroup::"
+          done
+          exit "$status"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oltp-rep1-process-logs
+          path: oltp-rep1-*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # REP4: mixed-version enrollment. Builds the pre-execution worker (3b77bce) in its own target,
+  # enrolls it next to this commit's server from the shared build, and runs clippy on both sides.
+  rep4-mixed:
+    name: REP4 mixed-version enrollment (pre-execution worker)
+    needs: [revision, build]
+    if: contains(needs.revision.outputs.jobs, ',rep4-mixed,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      LEGACY_BASE: 3b77bced7c8d6aa5decb25e58e5f428b7dc18ce2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      # Restore only: the OLTP dependency cache, for this commit's clippy.
+      - name: Restore Cargo cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: oltp-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: oltp-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: oltp-bins
+      - name: Unpack the shared build
+        run: |
+          tar -I zstd -xf oltp-bins.tar.zst && rm oltp-bins.tar.zst
+          grep -qx "source=$TESTED_SHA" bins-source.txt || { echo "::error::the shared build is not $TESTED_SHA"; exit 1; }
+          lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
+          echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
+          echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
+      - name: Build the pre-execution worker
+        run: |
+          git fetch --no-tags --depth=1 origin "$LEGACY_BASE"
+          mkdir -p "$RUNNER_TEMP/rep4/source"
+          git archive "$LEGACY_BASE" | tar -x -C "$RUNNER_TEMP/rep4/source"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/rep4/target" cargo build --manifest-path "$RUNNER_TEMP/rep4/source/server/Cargo.toml" \
+            --locked --no-default-features --features oltp --bin nabedra-db
+      - name: Mixed-version enrollment and clippy on both sides
+        run: |
+          set -o pipefail
+          status=0
+          cp "$NABEDRA_BIN" "$RUNNER_TEMP/rep4/current-nabedra-db"
+          python3 server/tests/oltp_recovery_operations.py --suite replacement-mixed \
+            --binary "$RUNNER_TEMP/rep4/current-nabedra-db" --test-executable "$NABEDRA_TEST_EXE" \
+            --legacy-binary "$RUNNER_TEMP/rep4/target/debug/nabedra-db" 2>&1 | tee oltp-rep1-replacement-mixed.log || status=1
+          CARGO_TARGET_DIR="$RUNNER_TEMP/rep4/target" cargo clippy --manifest-path "$RUNNER_TEMP/rep4/source/server/Cargo.toml" \
+            --locked --no-default-features --features oltp --lib 2>&1 | tee oltp-rep1-replacement-baseline-clippy.log || status=1
+          cargo clippy --manifest-path server/Cargo.toml --locked --no-default-features --features oltp --lib \
+            2>&1 | tee oltp-rep1-replacement-clippy.log || status=1
+          exit "$status"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oltp-rep4-mixed-logs
+          path: oltp-rep1-*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # AZ1/AZ2: RF3 packet-drop (black-hole) failover fixture (O06/O18) on the shared build.
+  blackhole:
+    name: RF3 packet-drop failover (AZ1/AZ2, O06/O18)
+    needs: [revision, build]
+    if: contains(needs.revision.outputs.jobs, ',blackhole,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: oltp-bins
+      - name: Unpack the shared build
+        run: |
+          tar -I zstd -xf oltp-bins.tar.zst && rm oltp-bins.tar.zst
+          grep -qx "source=$TESTED_SHA" bins-source.txt || { echo "::error::the shared build is not $TESTED_SHA"; exit 1; }
+          lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
+          echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
+          echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
+      - name: Packet-drop failover
+        env:
+          PYTHONPATH: orm/python/src
+          PYTHONDONTWRITEBYTECODE: "1"
+          NABEDRA_OLTP_RPC_TRACE: "1"
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/az1-cluster" az1-evidence
+          status=0
+          python3 -u server/tests/oltp_blackhole.py --binary "$NABEDRA_BIN" --test-executable "$NABEDRA_TEST_EXE" \
+            --output "$RUNNER_TEMP/az1-cluster" 2>&1 | tee az1-evidence/az1.log || status=1
+          find "$RUNNER_TEMP/az1-cluster" -maxdepth 1 -name '*.log' -exec cp -t az1-evidence {} +
+          exit "$status"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: az1-failover
+          path: az1-evidence
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # MIG1/MIG2: export a RocksDB-era RF3 cluster (b29a178, built in its own checkout) with the
+  # unmodified ORMs and restore it on this commit's native release server.
+  migrate:
+    name: RocksDB-era OLTP archive upgrade (MIG2)
+    needs: revision
+    if: contains(needs.revision.outputs.jobs, ',migrate,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - uses: actions/checkout@v4
+        with:
+          ref: b29a17847d6861040234d767396e6cceb10187f4
+          path: legacy-release
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Legacy export retry regression
+        run: python server/tests/test_oltp_upgrade_export.py -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build the native OLTP binary
+        run: cargo build --manifest-path server/Cargo.toml --locked --release --no-default-features --features oltp --bin nabedra-db
+      - name: Build the pinned old OLTP binary in its own checkout
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang libclang-dev cmake
+          cd legacy-release
+          git rev-parse HEAD
+          cargo build --manifest-path server/Cargo.toml --locked --release --no-default-features --features oltp --bin nabedra-db
+      - name: Build the unmodified ORMs
+        run: |
+          python -m pip install --quiet 'httpx>=0.27,<1'
+          cd orm/typescript
+          npm ci --no-audit --no-fund
+          npm run build
+      - name: Export and restore the RF3 cluster
+        timeout-minutes: 80
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -o pipefail
+          mkdir -p artifacts/migration
+          python server/tests/oltp_upgrade_acceptance.py \
+            --old-binary legacy-release/server/target/release/nabedra-db \
+            --new-binary server/target/release/nabedra-db --output artifacts/migration \
+            2>&1 | tee artifacts/migration/run.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mig2-evidence
+          path: artifacts/migration
+          retention-days: 14
+
   # Selected OLTP acceptance scenarios on the shared build, one job per scenario and mode.
   scenarios:
     name: acceptance ${{ matrix.scenario }}, direct_oltp ${{ matrix.mode }}
     needs: [revision, build]
-    if: github.event_name == 'workflow_dispatch' && inputs.scenarios != ''
+    if: needs.revision.outputs.has_scenarios == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
@@ -986,7 +1500,7 @@ jobs:
   memory:
     name: worker memory under load, THP and malloc arenas, heaptrack (FLAKE1)
     needs: revision
-    if: contains(format(',{0},', inputs.jobs), ',memory,')
+    if: contains(needs.revision.outputs.jobs, ',memory,')
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
@@ -1061,7 +1575,7 @@ jobs:
   bench:
     name: release benchmark binary and NS18 microbench (NS11)
     needs: revision
-    if: contains(format(',{0},', inputs.jobs), ',bench,')
+    if: contains(needs.revision.outputs.jobs, ',bench,')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     container: rust:1.94.1-bookworm
@@ -1108,11 +1622,12 @@ jobs:
   # PERF1: CPU profile of the RF3 direct path. Opt-in with jobs=perf: builds a release binary with
   # frame pointers (for perf call graphs; the bench job's binary stays the comparison build), runs
   # the benchmark driver on this runner with the NS11 caps, records per-stage timings from
-  # /v1/runtime/stats and samples every worker with perf at idle (serial pair) and at 50 updates/s.
+  # /v1/runtime/stats and samples every worker and the API with perf at idle (serial pair), at 50 and at
+  # 150 updates/s.
   perf:
     name: direct path CPU profile and stage timings (PERF1)
     needs: revision
-    if: contains(format(',{0},', inputs.jobs), ',perf,')
+    if: contains(needs.revision.outputs.jobs, ',perf,')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -1143,6 +1658,13 @@ jobs:
           python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf-bin/nabedra-db-fp" --direct-oltp on \
             --output "$GITHUB_WORKSPACE/perf-out/serial" --rates 0.2 --seconds 5 --warmup-seconds 5 --repetitions 10 \
             --clients 1 --rows 2000 --seed 20261118 --timeout 10 --perf-record 30 --perf-delay 20 --perf-frequency 999 --perf-call-graph fp
+      # RD2: the same serial run with the role checks not kept warm (same binary and runner).
+      - name: Serial pair without grant warming (RD2 A/B)
+        run: |
+          cd scripts
+          python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf-bin/nabedra-db-fp" --direct-oltp on \
+            --output "$GITHUB_WORKSPACE/perf-out/serial-nowarm" --rates 0.2 --seconds 5 --warmup-seconds 5 --repetitions 10 \
+            --clients 1 --rows 2000 --seed 20261118 --timeout 10 --worker-env NABEDRA_BENCH_NO_GRANT_WARM=1
       - name: 50 updates/s with perf
         run: |
           cd scripts
@@ -1150,9 +1672,293 @@ jobs:
             --output "$GITHUB_WORKSPACE/perf-out/rate50" --rates 50 --seconds 60 --warmup-seconds 5 --repetitions 1 \
             --clients 32 --rows 5000 --seed 20261118 --timeout 10 --perf-record 25 --perf-delay 25 --perf-frequency 999 --perf-call-graph fp
           sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/perf-out" || true
+      # PERF1 (hardening): per-update CPU at the API (perf samples it too) and the leader at 150/s,
+      # above the old two-worker API admission ceiling.
+      - name: 150 updates/s with perf
+        run: |
+          cd scripts
+          python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf-bin/nabedra-db-fp" --direct-oltp on \
+            --output "$GITHUB_WORKSPACE/perf-out/rate150" --rates 150 --seconds 60 --warmup-seconds 5 --repetitions 1 \
+            --clients 32 --rows 10000 --seed 20261118 --timeout 10 --perf-record 25 --perf-delay 25 --perf-frequency 999 --perf-call-graph fp
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/perf-out" || true
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: perf-profile
           path: perf-out
+          retention-days: 14
+
+  # LIVE3: Linux release binaries per engine, built in the Dockerfile's bookworm base, with checksums.
+  live3:
+    name: LIVE3 Linux release binary (${{ matrix.engine }})
+    needs: revision
+    if: contains(needs.revision.outputs.jobs, ',live3,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container: rust:1.94.1-bookworm
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [oltp, olap, cache]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - name: Build and identify the release binary
+        env:
+          ENGINE: ${{ matrix.engine }}
+        run: |
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN"
+          cargo build --locked --manifest-path server/Cargo.toml --release --no-default-features --features "$ENGINE" --bin nabedra-db
+          mkdir live3-bin
+          cp server/target/release/nabedra-db live3-bin/
+          cd live3-bin
+          sha256sum nabedra-db > SHA256SUMS
+          {
+            printf 'source=%s\nengine=%s\n' "$TESTED_SHA" "$ENGINE"
+            rustc --version
+            ./nabedra-db --version
+            ldd nabedra-db
+          } | tee build.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: live3-${{ matrix.engine }}
+          path: live3-bin
+          retention-days: 7
+
+  # GC1: CPU, wall time, entries, fsyncs and bytes per committed direct write on an in-process
+  # RF3 cluster (per-voter runtimes, per-thread CPU from /proc), release build, uncapped.
+  # Prints one `GC1 {json}` line per phase into gc1-measure.log.
+  gc1:
+    name: direct write cost per entry, append and fsync (GC1)
+    needs: revision
+    if: contains(needs.revision.outputs.jobs, ',gc1,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - name: Build release library tests
+        working-directory: server
+        run: cargo test --locked --release --no-default-features --features oltp --lib --no-run
+      - name: Measure
+        working-directory: server
+        env:
+          GC1_RATES: "100,400,1000,2000"
+          GC1_RANGES: "1,8"
+          # GC2: Raft log group commit on (GC1), DirectBatch off vs on.
+          GC1_MODES: "on"
+          GC1_BATCH: "off,on"
+          GC1_PACKING: "800,1600"
+          GC1_SECONDS: "10"
+          GC1_SERIAL: "300"
+        run: |
+          set -o pipefail
+          nproc; free -m; df -h .
+          cargo test --locked --release --no-default-features --features oltp --lib gc1_measure -- --ignored --nocapture --test-threads 1 2>&1 | tee ../gc1-measure.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gc1-measure
+          path: gc1-measure.log
+          retention-days: 14
+
+  # PERF1 (hardening): factor A/B on runners, relative numbers only (the controlled host gives the
+  # headline numbers). `perf1-bin` builds this commit's release server; the before binary is BENCH2's
+  # 5eb80fb artifact (run 44878990620), whose product code equals 7e110cb. One variable at a time,
+  # same driver, data, rates and NS11 caps unless stated.
+  perf1-bin:
+    name: PERF1 factor binary
+    needs: revision
+    if: contains(needs.revision.outputs.jobs, ',perf1,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container: rust:1.94.1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - name: Build release nabedra-db (oltp)
+        working-directory: server
+        run: |
+          rustup default "$RUST_TOOLCHAIN"
+          cargo build --locked --release --no-default-features --features oltp --bin nabedra-db
+          mkdir -p ../perf1-bin && cp target/release/nabedra-db ../perf1-bin/nabedra-db-after
+          sha256sum ../perf1-bin/nabedra-db-after
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf1-after-binary
+          path: perf1-bin
+          retention-days: 7
+
+  perf1-factors:
+    name: PERF1 factors (${{ matrix.factor }})
+    needs: [revision, perf1-bin]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 170
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        factor: [api, compaction]
+    env:
+      FACTOR: ${{ matrix.factor }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: perf1-after-binary
+          path: perf1-bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-binary
+          path: perf1-before
+          run-id: 44878990620
+          github-token: ${{ github.token }}
+      - name: Binaries and image
+        run: |
+          mv perf1-before/nabedra-db-5eb80fb perf1-bin/nabedra-db-before
+          chmod +x perf1-bin/*
+          sha256sum perf1-bin/*
+          printf 'FROM python:3.11-slim-bookworm\nENV TOKIO_WORKER_THREADS=2\n' | docker build -t nabedra-perf-ci:1 -
+          nproc; free -m; df -h .
+      - name: Runs
+        run: |
+          cd scripts
+          OUT="$GITHUB_WORKSPACE/perf1-out"; mkdir -p "$OUT"
+          run() {  # run <name> <before|after> <api-cpus> <args...>
+            local name=$1 binary=$2 api=$3; shift 3
+            local rc=0 start=$(date +%s)
+            python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf1-bin/nabedra-db-$binary" \
+              --direct-oltp on --api-cpus "$api" --seed 20261118 --timeout 10 --output "$OUT/$name" "$@" \
+              > "$OUT/$name.console.log" 2>&1 || rc=$?
+            echo "$name rc=$rc seconds=$(( $(date +%s) - start )) load=$(cut -d' ' -f1-3 /proc/loadavg)" | tee -a "$OUT/runs.txt"
+          }
+          FAC="--rates 100,200,400 --seconds 5 --warmup-seconds 3 --repetitions 3 --clients 32 --rows 5000"
+          SOAK="--soak --soak-rows 80000 --soak-payload-bytes 2048 --soak-seconds 300 --soak-phase-seconds 60 --clients 32 --soak-verify-keys 500"
+          if [ "$FACTOR" = api ]; then
+            for api in 0.35 none 0.7 1.0; do
+              for b in before after; do run "fac-$b-api$api" $b $api $FAC; done
+            done
+          else
+            run soak100-before-api0.35 before 0.35 $SOAK --soak-rate 100
+            run soak100-after-api0.35 after 0.35 $SOAK --soak-rate 100
+            run soak100-before-apinone before none $SOAK --soak-rate 100
+            run soak100-after-apinone after none $SOAK --soak-rate 100
+            run soak100-after-apinone-hold after none $SOAK --soak-rate 100 --hold-compaction
+            run soak50-before-api0.35 before 0.35 $SOAK --soak-rate 50
+            run soak50-after-api0.35 after 0.35 $SOAK --soak-rate 50
+            run soak50-after-apinone after none $SOAK --soak-rate 50
+            run soak50-after-apinone-hold after none $SOAK --soak-rate 50 --hold-compaction
+          fi
+      - name: Summary
+        if: always()
+        run: |
+          OUT="$GITHUB_WORKSPACE/perf1-out"
+          cat "$OUT/runs.txt" || true
+          python3.11 docs/testing/evidence/oltp/direct-latency/perf1-hardening/analyze.py "$OUT"/*/ --json "$OUT/summary.json" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf1-factors-${{ matrix.factor }}
+          path: perf1-out
+          retention-days: 14
+
+  # SNAP1 (hardening): NS11 soaks before/after taking Raft snapshot export off the apply path.
+  # Before = nabedra/hardening bb6dc32 (main 70c4e7d merged), after = the tested commit.
+  # Runner numbers are relative; same driver, data, rates and NS11 caps for both binaries.
+  snap1-bin:
+    name: SNAP1 soak binary (${{ matrix.side }})
+    needs: revision
+    if: contains(needs.revision.outputs.jobs, ',snap1,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container: rust:1.94.1-bookworm
+    strategy:
+      matrix:
+        side: [before, after]
+    env:
+      SIDE: ${{ matrix.side }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.side == 'before' && 'bb6dc324e00493ee4ae5d3735184811d29404fb3' || env.TESTED_SHA }}
+      - name: Build release nabedra-db (oltp)
+        working-directory: server
+        run: |
+          rustup default "$RUST_TOOLCHAIN"
+          cargo build --locked --release --no-default-features --features oltp --bin nabedra-db
+          mkdir -p ../snap1-bin && cp target/release/nabedra-db "../snap1-bin/nabedra-db-$SIDE"
+          echo "built $SIDE at $(git rev-parse HEAD 2>/dev/null || echo unknown)"; sha256sum ../snap1-bin/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snap1-binary-${{ matrix.side }}
+          path: snap1-bin
+          retention-days: 7
+
+  snap1-soak:
+    name: SNAP1 soaks (${{ matrix.rate }}/s)
+    needs: [revision, snap1-bin]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        rate: [100, 50]
+    env:
+      RATE: ${{ matrix.rate }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: snap1-binary-*
+          path: snap1-bin
+          merge-multiple: true
+      - name: Binaries and image
+        run: |
+          chmod +x snap1-bin/*
+          sha256sum snap1-bin/*
+          printf 'FROM python:3.11-slim-bookworm\nENV TOKIO_WORKER_THREADS=2\n' | docker build -t nabedra-perf-ci:1 -
+          nproc; free -m; df -h .
+      - name: Soaks
+        run: |
+          cd scripts
+          OUT="$GITHUB_WORKSPACE/snap1-out"; mkdir -p "$OUT"
+          SOAK="--soak --soak-rows 80000 --soak-payload-bytes 2048 --soak-seconds 300 --soak-phase-seconds 60 --clients 32 --soak-verify-keys 500"
+          for side in before after; do
+            name="soak$RATE-$side"; rc=0; start=$(date +%s)
+            python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/snap1-bin/nabedra-db-$side" \
+              --direct-oltp on --api-cpus none --seed 20261118 --timeout 10 --output "$OUT/$name" $SOAK --soak-rate "$RATE" \
+              > "$OUT/$name.console.log" 2>&1 || rc=$?
+            echo "$name rc=$rc seconds=$(( $(date +%s) - start )) load=$(cut -d' ' -f1-3 /proc/loadavg)" | tee -a "$OUT/runs.txt"
+          done
+      - name: Summary
+        if: always()
+        run: |
+          OUT="$GITHUB_WORKSPACE/snap1-out"
+          cat "$OUT/runs.txt" || true
+          python3.11 docs/testing/evidence/oltp/direct-latency/snap1/analyze_snap1.py "$OUT"/*/ --json "$OUT/snap1-summary.json" || true
+          python3.11 docs/testing/evidence/oltp/direct-latency/perf1-hardening/analyze.py "$OUT"/*/ --json "$OUT/perf1-summary.json" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snap1-soak-${{ matrix.rate }}
+          path: snap1-out
           retention-days: 14
