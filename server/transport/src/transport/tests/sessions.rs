@@ -1,5 +1,9 @@
-//! D10/O05/O06/C07: persistent peer sessions over real mTLS and ephemeral ports.
+//! D10/O05/O06/C07: persistent peer sessions and backend parity.
 use super::*;
+use crate::backend;
+use nabedra_rt::net::Target;
+#[cfg(feature = "sim")]
+use nabedra_rt::sim;
 use tokio::{
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
     sync::watch,
@@ -7,6 +11,85 @@ use tokio::{
 };
 
 const WAIT: Duration = Duration::from_secs(20);
+#[cfg(feature = "sim")]
+const CALLER_NODE: u64 = 1;
+#[cfg(feature = "sim")]
+const RECEIVER_NODE: u64 = 2;
+#[cfg(feature = "sim")]
+const OTHER_NODE: u64 = 3;
+
+fn fixture_certificates() -> &'static [TlsMaterial] {
+    static CERTIFICATES: std::sync::OnceLock<Vec<TlsMaterial>> = std::sync::OnceLock::new();
+    CERTIFICATES.get_or_init(|| {
+        let temp =
+            TestDirectoryPath(std::env::temp_dir().join(format!("sessions-{}", Uuid::new_v4())));
+        std::fs::create_dir(&temp.0).unwrap();
+        tls::certificates(&temp.0, 3)
+    })
+}
+
+enum Relay {
+    Tcp(TcpRelay),
+    #[cfg(feature = "sim")]
+    Sim(Arc<sim::World>),
+}
+
+impl Relay {
+    async fn start(target: SocketAddr) -> Self {
+        #[cfg(feature = "sim")]
+        if let Some(world) = sim::world() {
+            return Self::Sim(world);
+        }
+        Self::Tcp(TcpRelay::start(target).await)
+    }
+
+    fn address(&self, target: SocketAddr) -> SocketAddr {
+        match self {
+            Self::Tcp(relay) => {
+                let _ = target;
+                relay.address
+            }
+            #[cfg(feature = "sim")]
+            Self::Sim(_) => target,
+        }
+    }
+
+    fn sever(&self) {
+        match self {
+            Self::Tcp(relay) => relay.sever(),
+            #[cfg(feature = "sim")]
+            Self::Sim(world) => {
+                let connections = world.connections();
+                assert_eq!(connections.len(), 1);
+                world.reset_connection(connections[0].id);
+            }
+        }
+    }
+
+    fn accepted(&self) -> u64 {
+        match self {
+            Self::Tcp(relay) => relay.accepted.load(Ordering::Acquire) as u64,
+            #[cfg(feature = "sim")]
+            Self::Sim(world) => world.connections().last().unwrap().id.0,
+        }
+    }
+
+    fn black_hole(&self) {
+        match self {
+            Self::Tcp(relay) => relay.black_hole(),
+            #[cfg(feature = "sim")]
+            Self::Sim(_) => unreachable!("relay black-hole cases use real loopback TCP"),
+        }
+    }
+
+    fn restore(&self) {
+        match self {
+            Self::Tcp(relay) => relay.restore(),
+            #[cfg(feature = "sim")]
+            Self::Sim(_) => unreachable!("relay black-hole cases use real loopback TCP"),
+        }
+    }
+}
 
 /// Echoes the request header. `held` callers block until released. A header
 /// `"big:<n>"` announces an `n`-byte section.
@@ -68,14 +151,14 @@ impl Endpoint for Gate {
 /// or black-holed (bytes silently dropped, connections left open), to fail a
 /// session without touching either endpoint. A black-holed connection stays
 /// black-holed; connections accepted after `restore` forward again.
-struct Relay {
+struct TcpRelay {
     address: SocketAddr,
     generation: watch::Sender<u64>,
     black_hole: watch::Sender<bool>,
     accepted: Arc<std::sync::atomic::AtomicUsize>,
     task: JoinHandle<()>,
 }
-impl Relay {
+impl TcpRelay {
     async fn start(target: SocketAddr) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -159,7 +242,7 @@ async fn pump(
         }
     }
 }
-impl Drop for Relay {
+impl Drop for TcpRelay {
     fn drop(&mut self) {
         self.task.abort();
     }
@@ -169,6 +252,8 @@ impl Drop for Relay {
 struct Caller {
     transport: WorkerTransport,
     client: WorkerClient,
+    #[cfg(feature = "sim")]
+    node: u64,
 }
 impl Caller {
     fn call(
@@ -186,16 +271,18 @@ impl Caller {
         let client = self.client.clone();
         let group = group.clone();
         let target = WorkerIdentity::from(target);
-        async move {
+        let call = async move {
             client
                 .request_classified(&group, target, purpose, header, [section, None, None], 0)
                 .await
-        }
+        };
+        #[cfg(feature = "sim")]
+        let call = sim::in_node(self.node, call);
+        call
     }
 }
 
 struct Fixture {
-    _temp: TestDirectoryPath,
     peers: Arc<TestDirectory>,
     caller: WorkerEnrollment,
     target: WorkerEnrollment,
@@ -230,18 +317,18 @@ impl Fixture {
         receiver_config: TransportConfig,
         relay: bool,
     ) -> (Self, Option<Relay>) {
-        let temp =
-            TestDirectoryPath(std::env::temp_dir().join(format!("sessions-{}", nabedra_rt::ids::uuid_v4())));
-        std::fs::create_dir(&temp.0).unwrap();
-        let tls = tls::certificates(&temp.0, 3);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls = fixture_certificates();
+        let bind = backend::current().bind("127.0.0.1:0".parse().unwrap());
+        #[cfg(feature = "sim")]
+        let bind = sim::in_node(RECEIVER_NODE, bind);
+        let listener = bind.await.unwrap();
         let listen = listener.local_addr().unwrap();
         let relay = if relay {
             Some(Relay::start(listen).await)
         } else {
             None
         };
-        let reach = relay.as_ref().map_or(listen, |relay| relay.address);
+        let reach = relay.as_ref().map_or(listen, |relay| relay.address(listen));
         let enrollment = |index: usize, endpoint: String| WorkerEnrollment {
             worker_id: nabedra_rt::ids::uuid_v4(),
             incarnation: nabedra_rt::ids::uuid_v4(),
@@ -253,24 +340,36 @@ impl Fixture {
         let caller = enrollment(0, "127.0.0.1:1".to_owned());
         let target = enrollment(1, reach.to_string());
         let second = enrollment(2, "127.0.0.1:2".to_owned());
+        #[cfg(feature = "sim")]
+        if let Some(world) = sim::world() {
+            for (node, peer) in [
+                (CALLER_NODE, &caller),
+                (RECEIVER_NODE, &target),
+                (OTHER_NODE, &second),
+            ] {
+                world.set_certificate(node, *peer.certificate_sha256.as_bytes());
+            }
+        }
         let peers = Arc::new(TestDirectory::default());
         peers.install(caller.clone());
         peers.install(target.clone());
         peers.install(second.clone());
         let transport = |local: &WorkerEnrollment, node, index: usize, release, config| {
-            let shared = WorkerSharedResources::new(
-                node,
-                WorkerResources::default(),
-                SharedResourceConfig::default(),
-            )
-            .unwrap();
+            let shared = test_memory(node, SharedResourceConfig::default());
             let registry = Arc::new(EndpointRegistry::new(shared.clone()));
-            let build = match release {
-                Release::Current | Release::SessionV2 | Release::SessionV3 => WorkerTransport::new,
-                Release::OneShotOnly => WorkerTransport::one_shot_for_test,
-            };
-            let mut transport =
-                build(local, &tls[index], shared, peers.clone(), registry, config).unwrap();
+            let mut transport = if release == Release::OneShotOnly {
+                WorkerTransport::one_shot_for_test(
+                    local,
+                    &tls[index],
+                    shared,
+                    peers.clone(),
+                    registry,
+                    config,
+                )
+            } else {
+                WorkerTransport::new(local, &tls[index], shared, peers.clone(), registry, config)
+            }
+            .unwrap();
             if release == Release::SessionV2 {
                 let common = Arc::get_mut(&mut transport.common).unwrap();
                 (common.connector, common.acceptor) = tls[index].transports(&[SESSION_ALPN, ALPN]);
@@ -311,14 +410,23 @@ impl Fixture {
         let other = Caller {
             client: other_transport.client(),
             transport: other_transport,
+            #[cfg(feature = "sim")]
+            node: OTHER_NODE,
         };
         let (stop, shutdown) = oneshot::channel();
-        let worker = nabedra_rt::task::spawn(receiver.clone().run(listener, async {
+        let serve = receiver.clone().run(listener, async {
             let _ = shutdown.await;
-        }));
+        });
+        #[cfg(not(feature = "sim"))]
+        let worker = nabedra_rt::task::spawn(serve);
+        #[cfg(feature = "sim")]
+        let worker = if let Some(world) = sim::world() {
+            world.spawn_node(RECEIVER_NODE, serve)
+        } else {
+            nabedra_rt::task::spawn(serve)
+        };
         (
             Self {
-                _temp: temp,
                 peers,
                 caller,
                 target,
@@ -343,6 +451,8 @@ impl Fixture {
                 registry: self.caller_transport.registry.clone(),
             },
             client: self.client.clone(),
+            #[cfg(feature = "sim")]
+            node: CALLER_NODE,
         }
     }
     fn call(
@@ -380,7 +490,6 @@ async fn eventually(mut done: impl FnMut() -> bool, what: &str) {
 
 /// D10/O05: many sequential and concurrent calls share one TLS handshake per
 /// lane. Raft append and progress lanes each get their own session.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d10_o05_one_session_per_lane_carries_many_calls() {
     let (fixture, _) = Fixture::start(
         Release::Current,
@@ -438,7 +547,6 @@ async fn d10_o05_one_session_per_lane_carries_many_calls() {
 
 /// D10: severing a session while a request is in flight gives that caller an
 /// unknown outcome (the handler still runs), and the next call reconnects.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d10_dropped_session_mid_stream_is_unknown_and_next_call_reconnects() {
     let (fixture, relay) = Fixture::start(
         Release::Current,
@@ -458,7 +566,8 @@ async fn d10_dropped_session_mid_stream_is_unknown_and_next_call_reconnects() {
         );
         assert_eq!(fixture.client.connections_for_test(), 1);
         fixture.endpoint.hold.store(true, Ordering::Release);
-        let in_flight = nabedra_rt::task::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "lost"));
+        let in_flight =
+            nabedra_rt::task::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "lost"));
         fixture.endpoint.entered.acquire().await.unwrap().forget();
         relay.sever();
         let failure = in_flight
@@ -484,7 +593,7 @@ async fn d10_dropped_session_mid_stream_is_unknown_and_next_call_reconnects() {
             "after",
         );
         assert_eq!(fixture.client.connections_for_test(), 2);
-        assert_eq!(relay.accepted.load(Ordering::Acquire), 2);
+        assert_eq!(relay.accepted(), 2);
         assert_eq!(fixture.client.live_sessions_for_test(), 1);
     })
     .await
@@ -494,7 +603,6 @@ async fn d10_dropped_session_mid_stream_is_unknown_and_next_call_reconnects() {
 
 /// D10/C07/O05: a saturated Data consensus lane returns overload errors on
 /// both sides while the Raft progress lane keeps answering.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d10_c07_o05_exhausted_lane_overloads_while_raft_progress_advances() {
     let data = TrafficClass::DataConsensus as usize;
     let caller_config = TransportConfig::default();
@@ -511,7 +619,8 @@ async fn d10_c07_o05_exhausted_lane_overloads_while_raft_progress_advances() {
     .await;
     timeout(WAIT, async {
         fixture.endpoint.hold.store(true, Ordering::Release);
-        let held = nabedra_rt::task::spawn(fixture.call(&fixture.data_group, Purpose::Raft, "held"));
+        let held =
+            nabedra_rt::task::spawn(fixture.call(&fixture.data_group, Purpose::Raft, "held"));
         fixture.endpoint.entered.acquire().await.unwrap().forget();
         // The receiver's handler lane is full: an explicit overload, not applied.
         let rejected = fixture
@@ -572,7 +681,6 @@ async fn d10_c07_o05_exhausted_lane_overloads_while_raft_progress_advances() {
 
 /// D10: a peer that offers only the one-shot `NABOTP01` protocol still
 /// interoperates in both directions, one connection per call.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d10_old_one_shot_peer_interoperates_in_both_directions() {
     for (caller, receiver) in [
         (Release::Current, Release::OneShotOnly),
@@ -631,7 +739,6 @@ const LEGACY_INDEX_RECLAIM_ALPN: &[u8] = b"nabedra-otp/3";
 /// otp/3), and otp/4 with an RD3 build. Raft frames, a reclamation-shaped
 /// frame included, travel on the negotiated session; nothing requires a
 /// per-connection capability any more.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cap1_d10_o02_sessions_form_with_older_builds_after_otp3_is_retired() {
     for (caller, receiver) in [
         (Release::Current, Release::SessionV2),
@@ -678,7 +785,6 @@ async fn cap1_d10_o02_sessions_form_with_older_builds_after_otp3_is_retired() {
 
 /// D10: a session closes when either side's peer incarnation leaves the local
 /// directory, and a stale incarnation cannot reuse the authenticated session.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d10_session_closes_when_peer_incarnation_leaves_directory() {
     let (fixture, _) = Fixture::start(
         Release::Current,
@@ -919,7 +1025,8 @@ async fn d10_cancelled_stream_skips_its_reply_and_keeps_the_session() {
         );
         // Written, then dropped while the handler runs.
         fixture.endpoint.hold.store(true, Ordering::Release);
-        let written = nabedra_rt::task::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "dropped"));
+        let written =
+            nabedra_rt::task::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "dropped"));
         fixture.endpoint.entered.acquire().await.unwrap().forget();
         written.abort();
         let _ = written.await;
@@ -936,7 +1043,8 @@ async fn d10_cancelled_stream_skips_its_reply_and_keeps_the_session() {
             .common
             .hold_writes
             .send_replace(true);
-        let queued = nabedra_rt::task::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "queued"));
+        let queued =
+            nabedra_rt::task::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "queued"));
         eventually(
             || fixture.client.waiting_streams_for_test() == 1,
             "call queued",
@@ -1024,7 +1132,8 @@ async fn d10_unsent_frames_retry_once_on_a_fresh_session_and_written_frames_neve
 
         // Written, then the session fails: unknown outcome, no retry.
         fixture.endpoint.hold.store(true, Ordering::Release);
-        let written = nabedra_rt::task::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "written"));
+        let written =
+            nabedra_rt::task::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "written"));
         fixture.endpoint.entered.acquire().await.unwrap().forget();
         fixture.client.close_sessions_for_test();
         let failure = written.await.unwrap().err().expect("closed call succeeded");
@@ -1067,7 +1176,9 @@ async fn d10_o05_large_and_small_frames_share_one_lane() {
                 &text,
                 Some(large),
             );
-            tasks.push(nabedra_rt::task::spawn(async move { (call.await, text, index) }));
+            tasks.push(nabedra_rt::task::spawn(
+                async move { (call.await, text, index) },
+            ));
         }
         let mut slowest = Duration::ZERO;
         for index in 0..24 {
@@ -1111,7 +1222,6 @@ async fn d10_o05_large_and_small_frames_share_one_lane() {
 /// while Raft progress keeps its own session pool. A full pending pool makes
 /// the listener offer only the one-shot protocol during the handshake, and a
 /// session that never names a lane is closed after the grace period.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d10_c07_full_session_pools_reject_typed_and_keep_raft_progress() {
     let data = TrafficClass::DataConsensus as usize;
     let mut receiver_config = TransportConfig::default();
@@ -1183,15 +1293,17 @@ async fn d10_c07_full_session_pools_reject_typed_and_keep_raft_progress() {
         assert_eq!(fixture.client.connections_for_test(), 1);
 
         // A connection that never sends a request holds the pending slot.
-        let socket = TcpStream::connect(fixture.listen).await.unwrap();
-        let mut idle = fixture
+        let (mut idle, handshake) = fixture
             .caller_transport
             .common
             .connector
-            .connect(ServerName::try_from("localhost").unwrap(), socket)
+            .connect(
+                Target::Addr(fixture.listen),
+                ServerName::try_from("localhost").unwrap(),
+            )
             .await
             .unwrap();
-        assert!(session_alpn(idle.get_ref().1.alpn_protocol()));
+        assert!(session_alpn(handshake.alpn.as_deref()));
         // A new lane now handshakes without sessions and still works.
         let before = other.client.connections_for_test();
         echoed(
@@ -1324,7 +1436,7 @@ async fn d10_queued_callers_share_a_bounded_failed_connect() {
             "{:?}",
             nabedra_rt::time::elapsed(started)
         );
-        assert!(relay.accepted.load(Ordering::Acquire) <= 2);
+        assert!(relay.accepted() <= 2);
         relay.restore();
         echoed(
             fixture
@@ -1660,4 +1772,343 @@ async fn rd3_d12_o03_direct_requests_beyond_the_ingress_slots_reach_the_leader()
         drop(hold);
         f.stop().await;
     }
+}
+
+/// RV-FINAL L1, C07, M02, LIVE1 (5 peers): caller slots of one class are
+/// capped across peer lanes at `OUTGOING_CLASS_LANES` lanes' worth. A paused
+/// peer fills only its own lane, so the others keep sending (LIVE1); four
+/// full lanes reach the class cap, and a fifth peer's empty lane is refused
+/// locally instead of adding a lane of in-flight calls per peer. Other
+/// classes (Control consensus) are not affected.
+async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
+    let config = TransportConfig::default();
+    let (fixture, _) = Fixture::start(
+        Release::Current,
+        Release::Current,
+        config.clone(),
+        TransportConfig::default(),
+        false,
+    )
+    .await;
+    let transport = &fixture.caller_transport;
+    let client = &fixture.client;
+    let class = TrafficClass::DataConsensus;
+    let lane = config.handler_slots[class as usize];
+    let cap = lane * OUTGOING_CLASS_LANES;
+    let targets: Vec<Uuid> = (0..=OUTGOING_CLASS_LANES)
+        .map(|_| nabedra_rt::ids::uuid_v4())
+        .collect();
+    let mut held = Vec::new();
+    // A paused peer holds only its own lane.
+    for _ in 0..lane {
+        held.push(client.try_outgoing(targets[0], class).unwrap());
+    }
+    assert!(matches!(
+        client.try_outgoing(targets[0], class),
+        Err(RequestError::OutgoingLaneFull { .. })
+    ));
+    // The other peers still send, up to the class cap.
+    for target in &targets[1..OUTGOING_CLASS_LANES] {
+        for _ in 0..lane {
+            held.push(client.try_outgoing(*target, class).unwrap());
+        }
+    }
+    assert_eq!(held.len(), cap);
+    assert_eq!(
+        transport.common.outgoing_class[class as usize].available_permits(),
+        0
+    );
+    // A fifth peer's lane is empty, but the class is at its cap.
+    let fifth = targets[OUTGOING_CLASS_LANES];
+    assert!(matches!(
+        client.try_outgoing(fifth, class),
+        Err(RequestError::OutgoingLaneFull { .. })
+    ));
+    // Control traffic is never starved by Data consensus.
+    let control = client
+        .try_outgoing(fifth, TrafficClass::ControlConsensus)
+        .unwrap();
+    echoed(
+        fixture
+            .call(&fixture.group, Purpose::RaftProgress, "protected progress")
+            .await,
+        "protected progress",
+    );
+    // A finished call on any lane admits the fifth peer.
+    held.pop();
+    let admitted = client.try_outgoing(fifth, class).unwrap();
+    drop((control, admitted, held));
+    assert_eq!(
+        transport.common.outgoing_class[class as usize].available_permits(),
+        cap
+    );
+    fixture.stop().await;
+}
+
+/// D10/O05: before writing a reply, the writer returns its handler slot so
+/// another request can enter the same lane even if the first reply is delayed.
+async fn d10_o05_reply_frees_its_handler_slot_before_its_bytes_are_written() {
+    let class = TrafficClass::DataConsensus as usize;
+    let mut receiver_config = TransportConfig::default();
+    receiver_config.handler_slots[class] = 1;
+    let (fixture, _) = Fixture::start(
+        Release::Current,
+        Release::Current,
+        TransportConfig::default(),
+        receiver_config,
+        false,
+    )
+    .await;
+    let hold = &fixture.receiver.common.hold_replies_after_release;
+    hold.send_replace(true);
+    let first = nabedra_rt::task::spawn(fixture.call(&fixture.data_group, Purpose::Raft, "first"));
+    let second = timeout(WAIT, async {
+        eventually(
+            || {
+                fixture.endpoint.handled.load(Ordering::Acquire) == 1
+                    && fixture.receiver.common.handlers[class].available_permits() == 1
+            },
+            "the first handler releases its slot before the writer proceeds",
+        )
+        .await;
+        assert!(!first.is_finished());
+        let second =
+            nabedra_rt::task::spawn(fixture.call(&fixture.data_group, Purpose::Raft, "second"));
+        eventually(
+            || fixture.endpoint.handled.load(Ordering::Acquire) == 2,
+            "the second request enters the same lane while the first reply waits",
+        )
+        .await;
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        second
+    })
+    .await
+    .unwrap();
+    hold.send_replace(false);
+    timeout(WAIT, async {
+        echoed(first.await.unwrap(), "first");
+        echoed(second.await.unwrap(), "second");
+    })
+    .await
+    .unwrap();
+    fixture.stop().await;
+}
+
+/// REP6/O17 (transport component): a stored revocation closes an established
+/// session through the directory watch, and the revoked identity cannot use a
+/// new session.
+async fn revoked_session_closes() {
+    let (fixture, _) = Fixture::start(
+        Release::Current,
+        Release::Current,
+        TransportConfig::default(),
+        TransportConfig::default(),
+        false,
+    )
+    .await;
+    timeout(WAIT, async {
+        echoed(
+            fixture
+                .call(&fixture.group, Purpose::RaftProgress, "before revoke")
+                .await,
+            "before revoke",
+        );
+        assert_eq!(fixture.client.live_sessions_for_test(), 1);
+        let revoked = WorkerIdentity::from(&fixture.caller);
+        fixture.peers.revoke(revoked);
+        eventually(
+            || fixture.client.live_sessions_for_test() == 0,
+            "receiver closes its authenticated session with the revoked worker",
+        )
+        .await;
+        assert_eq!(fixture.receiver.revoked_session_closes(), 1);
+        assert!(matches!(
+            fixture
+                .call(&fixture.group, Purpose::RaftProgress, "after revoke")
+                .await,
+            Err(RequestError::Unreachable)
+        ));
+        assert_eq!(fixture.endpoint.handled.load(Ordering::Acquire), 1);
+    })
+    .await
+    .unwrap();
+    fixture.stop().await;
+}
+
+/// A CA-signed peer with a different fingerprint must fail at the transport
+/// pin check before a request can reach the endpoint.
+async fn peer_certificate_pin_rejects_other_ca_signed_certificate() {
+    let (fixture, _) = Fixture::start(
+        Release::Current,
+        Release::Current,
+        TransportConfig::default(),
+        TransportConfig::default(),
+        false,
+    )
+    .await;
+    let wrong = fixture.other.transport.common.local.certificate_sha256;
+    let mut pinned = fixture.target.clone();
+    // The real listener presents its own valid TLS certificate. Change its
+    // cached pin so it differs. SimNet can change the certificate it presents.
+    #[cfg(feature = "sim")]
+    let simulated = sim::world();
+    #[cfg(not(feature = "sim"))]
+    let presenting_different_certificate = false;
+    #[cfg(feature = "sim")]
+    let presenting_different_certificate = if let Some(world) = &simulated {
+        world.override_certificate(RECEIVER_NODE, Some(*wrong.as_bytes()));
+        true
+    } else {
+        false
+    };
+    if !presenting_different_certificate {
+        pinned.certificate_sha256 = wrong;
+        fixture.peers.install(pinned.clone());
+    }
+    let result = fixture
+        .caller()
+        .call(
+            &pinned,
+            &fixture.group,
+            Purpose::RaftProgress,
+            "bad pin",
+            None,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(RequestError::Protocol(error))
+            if error.code == ErrorCode::ValidationError && error.outcome == Outcome::NotApplied
+                && error.message == "target certificate or ALPN differs"
+    ));
+    assert_eq!(fixture.client.live_sessions_for_test(), 0);
+    assert_eq!(fixture.endpoint.handled.load(Ordering::Acquire), 0);
+
+    #[cfg(feature = "sim")]
+    if let Some(world) = simulated {
+        world.override_certificate(RECEIVER_NODE, None);
+    }
+    fixture.peers.install(fixture.target.clone());
+    echoed(
+        fixture
+            .call(&fixture.group, Purpose::RaftProgress, "good pin")
+            .await,
+        "good pin",
+    );
+    assert_eq!(fixture.endpoint.handled.load(Ordering::Acquire), 1);
+    fixture.stop().await;
+}
+
+macro_rules! parity_cases {
+    ($($case:ident),+ $(,)?) => {
+        mod real {
+            $(
+                #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+                async fn $case() {
+                    super::$case().await;
+                }
+            )+
+        }
+
+        #[cfg(feature = "sim")]
+        mod sim_parity {
+            $(
+                #[test]
+                fn $case() {
+                    super::replay(super::$case);
+                }
+            )+
+        }
+    };
+}
+
+parity_cases!(
+    d10_o05_one_session_per_lane_carries_many_calls,
+    d10_dropped_session_mid_stream_is_unknown_and_next_call_reconnects,
+    d10_c07_o05_exhausted_lane_overloads_while_raft_progress_advances,
+    d10_old_one_shot_peer_interoperates_in_both_directions,
+    cap1_d10_o02_sessions_form_with_older_builds_after_otp3_is_retired,
+    d10_session_closes_when_peer_incarnation_leaves_directory,
+    d10_c07_full_session_pools_reject_typed_and_keep_raft_progress,
+    d10_o05_reply_frees_its_handler_slot_before_its_bytes_are_written,
+    c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes,
+    revoked_session_closes,
+    peer_certificate_pin_rejects_other_ca_signed_certificate,
+);
+
+#[cfg(feature = "sim")]
+fn replay<F, Fut>(case: F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    use crate::{FrameKind, StreamFrame};
+    use sha2::{Digest as _, Sha256};
+    use sim::net::{Direction, Envelope, Fate, Kind, Planner};
+
+    #[derive(Default)]
+    struct Trace {
+        messages: u64,
+        hash: Sha256,
+    }
+
+    struct Recorder(Arc<Mutex<Trace>>);
+    impl Planner for Recorder {
+        fn message(&mut self, envelope: &Envelope<'_>) -> Fate {
+            let mut trace = self.0.lock().unwrap();
+            trace.messages += 1;
+            trace.hash.update(envelope.conn.0.to_le_bytes());
+            trace.hash.update(envelope.seq.to_le_bytes());
+            trace.hash.update(envelope.from.unwrap_or(0).to_le_bytes());
+            trace.hash.update(envelope.to.unwrap_or(0).to_le_bytes());
+            trace
+                .hash
+                .update([envelope.kind as u8, envelope.direction as u8]);
+            trace
+                .hash
+                .update((envelope.bytes.len() as u64).to_le_bytes());
+            trace.hash.update(envelope.bytes);
+            if envelope.kind == Kind::Data
+                && let Some(frame) = StreamFrame::from_message(envelope.bytes)
+            {
+                let direction = match frame.kind() {
+                    FrameKind::Request | FrameKind::Ping => Some(Direction::ToServer),
+                    FrameKind::Reply | FrameKind::Pong => Some(Direction::ToClient),
+                    FrameKind::Cancel => None,
+                };
+                if let Some(direction) = direction {
+                    assert_eq!(envelope.direction, direction);
+                }
+                trace.hash.update(frame.stream_id().to_le_bytes());
+            }
+            Fate::NOW
+        }
+    }
+
+    assert!(
+        sim::TOKIO_RNG_SEEDED,
+        "transport parity requires RUSTFLAGS='--cfg tokio_unstable'"
+    );
+    const SEED: u64 = 0x4e41_4245_4452_4108;
+    let run = || {
+        sim::run(SEED, |world| {
+            let case = &case;
+            async move {
+                for node in [CALLER_NODE, RECEIVER_NODE, OTHER_NODE] {
+                    world.add_node(node, sim::NodeClock::default());
+                }
+                let trace = Arc::new(Mutex::new(Trace::default()));
+                world.set_net_planner(Recorder(trace.clone()));
+                sim::in_node(CALLER_NODE, case()).await;
+                let trace = trace.lock().unwrap();
+                assert!(
+                    trace.messages > 0,
+                    "the case must exercise the simulated backend"
+                );
+                <[u8; 32]>::from(trace.hash.clone().finalize())
+            }
+        })
+    };
+    assert_eq!(run(), run(), "network trace diverged for seed {SEED}");
 }
