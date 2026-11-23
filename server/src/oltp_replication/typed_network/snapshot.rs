@@ -7,7 +7,7 @@ use crate::oltp_replication::{
     entry::BoundedStoredMembership, multiplex::ReplicaMetadata, types::Digest,
 };
 use sha2::{Digest as _, Sha256};
-use std::{os::unix::fs::FileExt, time::Instant};
+use std::time::Instant;
 use uuid::Uuid;
 
 const CHUNK: usize = 64 << 10;

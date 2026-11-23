@@ -785,8 +785,8 @@ fn inspect_identity(
                 // `pool/CURRENT` passes here so the pool open refuses it with
                 // `UnsupportedFormat` (as `local.rs` does). T9 finding: requiring only
                 // `pool/CURRENT` refused every registered worker restart on `nabedra-kv`.
-                || !(owner.path.join("pool/kv/CURRENT").is_file()
-                    || owner.path.join("pool/CURRENT").is_file())
+                || !(fs::metadata(owner.path.join("pool/kv/CURRENT")).is_ok_and(|metadata| metadata.is_file())
+                    || fs::metadata(owner.path.join("pool/CURRENT")).is_ok_and(|metadata| metadata.is_file()))
                 || (!resume && (config.enrollment.enrollment_revision <= old.previous.enrollment_revision
                     || config.enrollment.incarnation == old.previous.incarnation))
             {
@@ -799,10 +799,7 @@ fn inspect_identity(
                 if !config.placements.status_groups().map(|group| group.identity.group_id).eq(status_ids) {
                     return Err(invalid());
                 }
-            } else if owner
-                .path
-                .join("RESTORE_IN_PROGRESS.json")
-                .symlink_metadata()
+            } else if fs::symlink_metadata(owner.path.join("RESTORE_IN_PROGRESS.json"))
                 .is_ok()
             {
                 return Err(invalid());
@@ -810,14 +807,11 @@ fn inspect_identity(
             (Some(old.previous), old.restore_policy, old.cold)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if owner.path.join("NABEDRA_TYPED_WORKER.json").exists()
-                || owner.path.join("NABEDRA_OLTP.json").exists()
-                || owner.path.join("pool").exists()
-                || owner.path.join("CURRENT").exists()
-                || owner
-                    .path
-                    .join("RESTORE_IN_PROGRESS.json")
-                    .symlink_metadata()
+            if fs::try_exists(owner.path.join("NABEDRA_TYPED_WORKER.json")).unwrap_or(false)
+                || fs::try_exists(owner.path.join("NABEDRA_OLTP.json")).unwrap_or(false)
+                || fs::try_exists(owner.path.join("pool")).unwrap_or(false)
+                || fs::try_exists(owner.path.join("CURRENT")).unwrap_or(false)
+                || fs::symlink_metadata(owner.path.join("RESTORE_IN_PROGRESS.json"))
                     .is_ok()
             {
                 return Err(invalid());
@@ -860,9 +854,7 @@ fn retain_identity(owner: &DirectoryOwner, next: &RetainedIdentity) -> Result<()
     output.sync_all().map_err(storage)?;
     drop(output);
     fs::rename(temporary, path).map_err(storage)?;
-    File::open(&owner.path)
-        .and_then(|file| file.sync_all())
-        .map_err(storage)?;
+    fs::sync_dir(&owner.path).map_err(storage)?;
     Ok(())
 }
 
@@ -871,7 +863,6 @@ fn verify_directory_anchor(
     owner: &DirectoryOwner,
     observation: &crate::oltp::pool::mount::MountedPoolObservation,
 ) -> Result<(), ProtocolError> {
-    use std::os::unix::fs::MetadataExt;
     let metadata = fs::metadata(&owner.path).map_err(storage)?;
     if libc::major(metadata.dev()) != observation.device_major
         || libc::minor(metadata.dev()) != observation.device_minor
