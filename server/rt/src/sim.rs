@@ -39,8 +39,10 @@
 //! # Tasks, blocking work and services
 //!
 //! - Every task spawned in a node joins the node's registry. [`World::crash`] marks the
-//!   node down and aborts every registered task; a task spawned into a down node is
-//!   aborted at once. [`World::restart`] marks it up again with an empty registry.
+//!   node down, marks its stepped services dead, then aborts every registered task; a
+//!   task spawned into a down node is aborted at once. [`World::restart`] marks it up
+//!   again with an empty registry. [`World::freeze`] stops polling a node's tasks
+//!   without aborting them, until [`World::thaw`].
 //! - [`crate::task::spawn_blocking`] runs the closure to completion before it returns,
 //!   while the simulation thread waits, so no OS scheduling decision reaches the
 //!   schedule and virtual time stands still meanwhile. The closure runs on one helper
@@ -54,17 +56,44 @@
 //!   records it in the node's registry. A crash cannot abort an OS thread: it marks the
 //!   node down, which ends the service only when its channels close. Service threads run
 //!   concurrently with the simulation thread in real time, so a run whose services do
-//!   work is not deterministic. Phase 9 reworks services into cooperative tasks on the
-//!   simulation runtime; until then a simulation should keep services idle, as the
-//!   Events simulator keeps nabedra-kv's flush and compaction threads idle.
-//! - [`crate::time::thread_sleep`] does not sleep on the simulation thread or in blocking
-//!   work (a real sleep would stall the cluster without advancing virtual time). On a
-//!   service thread it sleeps in real time.
+//!   work is not deterministic. Loops that must be deterministic use
+//!   [`crate::task::spawn_stepped`] instead (next section).
+//! - [`crate::time::thread_sleep`] on the simulation thread or in blocking work lets the
+//!   node's stepped services settle, then pauses the whole world for the duration
+//!   ([`World::pause_all`]). On a service thread it sleeps in real time.
+//!
+//! # Stepped services
+//!
+//! [`crate::task::spawn_stepped`] inside a world registers the service in the world's
+//! registry (`services.rs`), in registration order, and spawns a node task, its driver.
+//! The driver runs one [`crate::task::Stepped::step`] at a time on the blocking helper,
+//! while the simulation thread waits, so a step is atomic: nothing else runs during it.
+//! After `Worked` the driver yields; after `Idle(None)` it waits for the service's
+//! doorbell (a notification on its `sync::Condvar`); after `Idle(Some(at))` it also wakes
+//! at `at` or on any doorbell of its node. Code that waits for a service calls
+//! [`crate::task::drive_until`], which steps the node's services inline, skipping any
+//! that is mid-step, and pauses the world to the earliest timed idle when nothing else
+//! can progress. When nothing can progress at all it panics with every service's state,
+//! so a wait cycle fails deterministically instead of hanging. [`World::set_jitter`]
+//! makes drivers sleep a seeded virtual time before some steps, which varies the
+//! interleaving with the seed (the NS17 analog).
+//!
+//! A crash marks the node's services dead before it aborts any task, so destructors that
+//! run during the abort never wait for a live service.
+//!
+//! # Observing a run
+//!
+//! [`World::observe`] reports every service step, crash, restart and pause, in order, so
+//! a harness can hash the run's trace and compare two runs of one seed.
 
+use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, SystemTime};
 
 use tokio::runtime::{Handle, Id, RuntimeFlavor};
@@ -221,6 +250,9 @@ struct Node {
     up: bool,
     tasks: Vec<AbortHandle>,
     services: Vec<String>,
+    frozen: bool,
+    /// Tasks that found the node frozen, woken by [`World::thaw`].
+    parked: Vec<Waker>,
 }
 
 #[derive(Debug)]
@@ -229,14 +261,35 @@ struct State {
     nodes: BTreeMap<u64, Node>,
 }
 
+type Observer = Arc<dyn Fn(&SimEvent<'_>) + Send + Sync>;
+
+/// The run's observers and type-keyed extension slots.
+#[derive(Default)]
+struct Hooks {
+    observers: Mutex<Vec<Observer>>,
+    ext: Mutex<BTreeMap<TypeId, Box<dyn Any + Send>>>,
+}
+
+impl std::fmt::Debug for Hooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hooks").finish_non_exhaustive()
+    }
+}
+
 /// The shared state of one simulation run.
 #[derive(Debug)]
 pub struct World {
+    me: Weak<World>,
     seed: u64,
     runtime_id: Id,
     start: Instant,
     std_start: std::time::Instant,
     state: Mutex<State>,
+    /// Stop-the-world pauses so far, in nanoseconds: virtual time the runtime clock never
+    /// ran ([`World::pause_all`]).
+    paused_nanos: AtomicU64,
+    services: services::Registry,
+    hooks: Hooks,
 }
 
 impl World {
@@ -253,7 +306,8 @@ impl World {
             RuntimeFlavor::CurrentThread,
             "a simulated world requires a current-thread runtime"
         );
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             seed,
             runtime_id: runtime.id(),
             start: Instant::now(),
@@ -262,6 +316,9 @@ impl World {
                 rng: SplitMix64::new(seed),
                 nodes: BTreeMap::new(),
             }),
+            paused_nanos: AtomicU64::new(0),
+            services: services::Registry::new(seed),
+            hooks: Hooks::default(),
         })
     }
 
@@ -278,8 +335,15 @@ impl World {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn elapsed(&self) -> Duration {
-        virtual_now().saturating_duration_since(self.start)
+    /// Virtual time since the world started, the same on every node. It includes
+    /// stop-the-world pauses ([`World::pause_all`]), which the runtime clock never ran.
+    pub fn elapsed(&self) -> Duration {
+        virtual_now().saturating_duration_since(self.start) + self.paused()
+    }
+
+    /// Stop-the-world pauses so far.
+    pub fn paused(&self) -> Duration {
+        Duration::from_nanos(self.paused_nanos.load(Ordering::SeqCst))
     }
 
     fn with_node<T>(&self, node: u64, f: impl FnOnce(&mut Node) -> T) -> T {
@@ -303,6 +367,8 @@ impl World {
             up: true,
             tasks: Vec::new(),
             services: Vec::new(),
+            frozen: false,
+            parked: Vec::new(),
         };
         let previous = self.lock().nodes.insert(node, entry);
         assert!(previous.is_none(), "node {node} added twice");
@@ -364,7 +430,12 @@ impl World {
         F::Output: Send + 'static,
     {
         self.assert_runtime(target);
-        let handle = target.spawn(NODE.scope(node, future));
+        let gated = Gate {
+            world: self.me.clone(),
+            node,
+            future: Box::pin(future),
+        };
+        let handle = target.spawn(NODE.scope(node, gated));
         self.register(node, handle.abort_handle());
         handle
     }
@@ -383,22 +454,38 @@ impl World {
         }
     }
 
-    /// Crashes `node`: marks it down and aborts every registered task. Service threads
-    /// cannot be aborted; see the module documentation.
+    /// Crashes `node`, in this order: marks it down, marks its stepped services dead (a
+    /// dead service is never stepped again and joins at once), then aborts every
+    /// registered task. Destructors that run during the abort therefore find no live
+    /// service to wait for. Helper-thread services (`spawn_service`) cannot be stopped;
+    /// see the module documentation.
     pub fn crash(&self, node: u64) {
         net::crash(self, node);
         let tasks = self.with_node(node, |entry| {
             entry.up = false;
+            entry.frozen = false;
             std::mem::take(&mut entry.tasks)
         });
+        let parked = self.with_node(node, |entry| std::mem::take(&mut entry.parked));
+        let dead = self.services.kill_node(node);
+        self.emit(&SimEvent::Crash { node });
+        // Service destructors run here, after the services are dead and before any task
+        // is aborted.
+        drop(dead);
         for task in tasks {
             task.abort();
         }
+        for waker in parked {
+            waker.wake();
+        }
     }
 
-    /// Marks a crashed `node` up again. Its clock and id stream continue.
+    /// Marks a crashed `node` up again. Its clock and id stream continue, and its finished
+    /// stepped services leave the registry.
     pub fn restart(&self, node: u64) {
         self.with_node(node, |entry| entry.up = true);
+        self.services.forget_finished(node);
+        self.emit(&SimEvent::Restart { node });
     }
 
     pub fn is_up(&self, node: u64) -> bool {
@@ -416,6 +503,178 @@ impl World {
     /// Names of the service threads started for `node`.
     pub fn services(&self, node: u64) -> Vec<String> {
         self.with_node(node, |entry| entry.services.clone())
+    }
+
+    /// The stepped services registered for `node`, in registration order, with their
+    /// state. Finished services leave the list at [`World::restart`].
+    pub fn stepped_services(&self, node: u64) -> Vec<ServiceInfo> {
+        self.services.infos(Some(node))
+    }
+
+    /// Stops polling `node`'s tasks, and tasks it spawns meanwhile, until [`World::thaw`],
+    /// without aborting them, as SIGSTOP would. The node's clocks keep running, and its
+    /// stepped services stop with their driver tasks. Code outside the node that drives
+    /// its services inline ([`crate::task::drive_until`]) is not stopped.
+    pub fn freeze(&self, node: u64) {
+        self.with_node(node, |entry| entry.frozen = true);
+    }
+
+    /// Resumes a frozen `node`'s tasks.
+    pub fn thaw(&self, node: u64) {
+        let parked = self.with_node(node, |entry| {
+            entry.frozen = false;
+            std::mem::take(&mut entry.parked)
+        });
+        for waker in parked {
+            waker.wake();
+        }
+    }
+
+    pub fn is_frozen(&self, node: u64) -> bool {
+        self.lock()
+            .nodes
+            .get(&node)
+            .is_some_and(|entry| entry.frozen)
+    }
+
+    /// Parks the current task's waker if `node` is frozen.
+    fn park_if_frozen(&self, node: u64, waker: &Waker) -> bool {
+        let mut state = self.lock();
+        match state.nodes.get_mut(&node) {
+            Some(entry) if entry.frozen => {
+                if !entry.parked.iter().any(|parked| parked.will_wake(waker)) {
+                    entry.parked.push(waker.clone());
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Stores `value` in the run's type-keyed slot for `T`, replacing any earlier one.
+    /// Product probe hooks reach it through [`world`].
+    pub fn insert_ext<T: Any + Send>(&self, value: T) {
+        lock(&self.hooks.ext).insert(TypeId::of::<T>(), Box::new(value));
+    }
+
+    /// Runs `f` on the run's `T` slot and returns its result, or `None` when no `T` was
+    /// inserted. The slot is taken out while `f` runs, without holding a lock, so `f` may
+    /// use other slots and the rest of the world; a nested `with_ext::<T>` from inside
+    /// `f` sees `None`.
+    pub fn with_ext<T: Any, R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let mut slot = lock(&self.hooks.ext).remove(&TypeId::of::<T>())?;
+        let result = slot.downcast_mut::<T>().map(f);
+        lock(&self.hooks.ext)
+            .entry(TypeId::of::<T>())
+            .or_insert(slot);
+        result
+    }
+
+    /// A stop-the-world pause: every node's clocks move forward by `by` at once, and
+    /// nothing runs meanwhile. The runtime clock does not move, so timers armed before
+    /// the pause fire late by `by`; deadlines set after it are mapped through it.
+    pub fn pause_all(&self, by: Duration) {
+        if by.is_zero() {
+            return;
+        }
+        let nanos = u64::try_from(by.as_nanos()).unwrap_or(u64::MAX);
+        self.paused_nanos.fetch_add(nanos, Ordering::SeqCst);
+        self.emit(&SimEvent::Pause { by });
+    }
+
+    /// Calls `observer` for every later simulation event, in order, so a harness can hash
+    /// the run's trace. Observers run outside the world's locks, on the simulation thread
+    /// or its blocking helper, and must not block.
+    pub fn observe(&self, observer: Arc<dyn Fn(&SimEvent<'_>) + Send + Sync>) {
+        lock(&self.hooks.observers).push(observer);
+    }
+
+    fn emit(&self, event: &SimEvent<'_>) {
+        let observers = lock(&self.hooks.observers).clone();
+        for observer in observers {
+            observer(event);
+        }
+    }
+}
+
+/// A stepped service as [`World::stepped_services`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceInfo {
+    pub name: String,
+    pub state: ServiceState,
+}
+
+/// Where a stepped service stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceState {
+    /// Started, or did work in its last step.
+    Ready,
+    /// Idle until its doorbell rings, or until a time on its node's `now_std` clock.
+    Idle(Option<std::time::Instant>),
+    /// Mid-step.
+    Stepping,
+    /// Its step returned `Exit`.
+    Exited,
+    /// A step panicked; joining it returns the panic.
+    Panicked,
+    /// Its node crashed.
+    Dead,
+}
+
+/// A step's outcome as [`SimEvent::Step`] reports it. A deadline is node-clock time since
+/// the world started, so two runs of one seed report the same values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepOutcome {
+    Worked,
+    Idle(Option<Duration>),
+    Exit,
+    Panicked,
+}
+
+/// One simulation event, as [`World::observe`] reports it.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SimEvent<'a> {
+    /// A stepped service ran one step.
+    Step {
+        node: Option<u64>,
+        service: &'a str,
+        outcome: StepOutcome,
+    },
+    Crash {
+        node: u64,
+    },
+    Restart {
+        node: u64,
+    },
+    /// A stop-the-world pause ([`World::pause_all`], a timed idle that
+    /// [`crate::task::drive_until`] skipped, or a `thread_sleep` in simulation).
+    Pause {
+        by: Duration,
+    },
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A node task's future: not polled while its node is frozen.
+struct Gate<F> {
+    world: Weak<World>,
+    node: u64,
+    future: Pin<Box<F>>,
+}
+
+impl<F: Future> Future for Gate<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        if let Some(world) = self.world.upgrade()
+            && world.park_if_frozen(self.node, cx.waker())
+        {
+            return Poll::Pending;
+        }
+        self.future.as_mut().poll(cx)
     }
 }
 
@@ -576,8 +835,13 @@ pub(crate) fn wall_now() -> SystemTime {
 /// A deadline on the current node's clock as a deadline on the runtime's virtual clock.
 pub(crate) fn to_runtime_instant(deadline: Instant) -> Instant {
     node_clock(|world, clock| {
+        let paused = world.paused();
         let Some(clock) = clock else {
-            return deadline;
+            // The world clock is the runtime clock plus the pauses.
+            return deadline
+                .checked_sub(paused)
+                .unwrap_or(world.start)
+                .max(world.start.min(deadline));
         };
         let local = if deadline >= world.start {
             deadline.duration_since(world.start).as_nanos() as i128
@@ -586,7 +850,7 @@ pub(crate) fn to_runtime_instant(deadline: Instant) -> Instant {
         };
         world
             .start
-            .checked_add(clock.virtual_at(local))
+            .checked_add(clock.virtual_at(local).saturating_sub(paused))
             .unwrap_or(deadline)
     })
     .unwrap_or(deadline)
@@ -603,11 +867,18 @@ pub(crate) fn to_runtime_duration(duration: Duration) -> Duration {
     .unwrap_or(duration)
 }
 
+/// Under a world, on the simulation thread or its blocking helper, a sleep first lets
+/// the node's stepped services run what they can, then pauses the whole world for the
+/// duration ([`World::pause_all`]): a stop-the-world pause, so a deadline loop in
+/// synchronous code (nabedra-kv's journal GC wait) sees time pass. Service threads
+/// sleep in real time.
 pub(crate) fn thread_sleep(duration: Duration) {
-    let simulated = world().is_some() && !matches!(ROLE.get(), Role::Service(_));
-    if !simulated {
-        std::thread::sleep(duration);
-    }
+    let world = match world() {
+        Some(world) if !matches!(ROLE.get(), Role::Service(_)) => world,
+        _ => return std::thread::sleep(duration),
+    };
+    services::settle(&world, current_node());
+    world.pause_all(to_runtime_duration(duration));
 }
 
 /// Draws from the current node's stream, or the world's stream outside a node.
@@ -797,6 +1068,7 @@ where
 pub mod net;
 #[cfg(feature = "sim-openraft")]
 pub mod openraft10;
+pub(crate) mod services;
 
 #[cfg(test)]
 mod tests;
