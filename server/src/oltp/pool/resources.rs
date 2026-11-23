@@ -687,7 +687,11 @@ impl PreparedNative {
                 owner,
                 settlement,
             } = lease;
-            drop(permit);
+            if tx.is_closed() {
+                std::mem::forget(permit);
+            } else {
+                drop(permit);
+            }
             drop(owner);
             // Keep the job tracked until receipt or until the undelivered
             // result and guard have both dropped.
