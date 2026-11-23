@@ -25,8 +25,8 @@
 //!   controller's 500 to 950 ms, are seeded per node.
 //! - The channels and the mutex are tokio's, exactly as in `TokioRuntime`.
 //!
-//! Outside an installed [`super::World`] every call behaves as in `TokioRuntime`, except
-//! that `spawn_blocking` uses tokio's blocking pool instead of a new OS thread.
+//! Outside an installed [`super::World`], the clock, task and RNG seams use their
+//! ambient implementations. [`AsyncRuntime::new`] still builds a paused runtime.
 
 use std::convert::Infallible;
 use std::fmt;
@@ -320,7 +320,8 @@ mod tests {
             assert_eq!(now(2).await - two, ms(10_000));
 
             // O09: wall jumps in either direction move the wall clock, not C::now().
-            let wall = in_node(1, async { time::unix_ms() }).await;
+            let wall_one = in_node(1, async { time::unix_ms() }).await;
+            let wall_two = in_node(2, async { time::unix_ms() }).await;
             let before = now(1).await;
             world.jump_wall_forward(1, Duration::from_secs(3_600));
             world.jump_wall_backward(2, Duration::from_secs(3_600));
@@ -328,7 +329,11 @@ mod tests {
             assert_eq!(now(2).await - two, ms(10_000));
             assert_eq!(
                 in_node(1, async { time::unix_ms() }).await,
-                wall + 3_600_000
+                wall_one + 3_600_000
+            );
+            assert_eq!(
+                in_node(2, async { time::unix_ms() }).await,
+                wall_two - 3_600_000
             );
 
             // A stall moves the node's monotonic clock forward at once.
@@ -342,12 +347,19 @@ mod tests {
                 let start = SimInstant::now();
                 Rt::sleep(ms(1_100)).await;
                 assert_eq!(start.elapsed(), ms(1_100));
+                assert_eq!(virtual_start.elapsed(), ms(1_000), "relative sleep");
                 Rt::sleep_until(SimInstant::now() + ms(1_100)).await;
-                let late = Rt::timeout(ms(1_100), Rt::sleep(ms(5_000))).await;
+                assert_eq!(virtual_start.elapsed(), ms(2_000), "absolute sleep");
+                let late = Rt::timeout(ms(1_100), std::future::pending::<()>()).await;
                 assert!(late.is_err());
+                assert_eq!(virtual_start.elapsed(), ms(3_000), "relative timeout");
+                let late =
+                    Rt::timeout_at(SimInstant::now() + ms(1_100), std::future::pending::<()>())
+                        .await;
+                assert!(late.is_err());
+                assert_eq!(virtual_start.elapsed(), ms(4_000), "absolute timeout");
             })
             .await;
-            assert_eq!(virtual_start.elapsed(), ms(3_000));
         });
     }
 
@@ -515,16 +527,14 @@ mod tests {
     #[test]
     fn runtime_seeded_is_paused_and_current_thread() {
         let runtime = crate::sim::runtime_seeded(5).unwrap();
-        let wall = std::time::Instant::now();
         let flavor = runtime.block_on(async {
-            tokio::time::sleep(Duration::from_secs(3_600)).await;
+            let start = tokio::time::Instant::now();
+            let step = Duration::from_secs(3_600);
+            tokio::time::advance(step).await;
+            assert_eq!(start.elapsed(), step);
             tokio::runtime::Handle::current().runtime_flavor()
         });
         assert_eq!(flavor, tokio::runtime::RuntimeFlavor::CurrentThread);
-        assert!(
-            wall.elapsed() < Duration::from_secs(60),
-            "time is not paused"
-        );
         assert_eq!(crate::sim::TOKIO_RNG_SEEDED, cfg!(tokio_unstable));
         // `World::new` accepts it.
         let world = runtime.block_on(async { World::new(5) });
@@ -537,8 +547,7 @@ mod tests {
     #[test]
     fn select_order_follows_the_seed() {
         fn choices(seed: u64) -> Vec<u8> {
-            let runtime = crate::sim::runtime_seeded(seed).unwrap();
-            runtime.block_on(async {
+            run(seed, |_| async {
                 let mut picked = Vec::new();
                 for _ in 0..64 {
                     picked.push(tokio::select! {
