@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p9-fs-b3e71c0-185720--crate-graph.log",
+      "sha256": "c8c4c4c63c2cbb62a007d2d8e331c5382eafb3bbca3eaf260516c85237d60286"
+    }
+  ],
+  "assertions": {
+    "executed": 19,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "skipped",
+        "reason": "2 tests skipped"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "crate-graph",
+  "duration_s": 12.54,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T17:57:50.364355+00:00",
+    "request_id": "land-p9-fs-b3e71c0-185720",
+    "runner": "GitHub Actions 1000007300",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45233165197"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "b3e71c074070ee310e6053ec91b96de1769bb332",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
