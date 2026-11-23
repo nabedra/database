@@ -1,6 +1,6 @@
 //! Clock sources for lease fencing. Endpoints enclose the sampled interval.
 //!
-//! [`Clock::now`] is the only place the cache reads Unix time for leases and
+//! [`Clock::now`] is where the cache cluster reads Unix time for leases and
 //! expiry. `LocalDocker` reads `nabedra_rt::time::wall_now()`, so a simulated
 //! node's wall offset and jumps (O09) reach it. `ClockBound` reads the
 //! clock-bound daemon's shared memory through `clock_bound_client`, which
@@ -151,6 +151,38 @@ fn unavailable(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sim")]
+    #[test]
+    fn local_docker_lease_clock_uses_simulated_wall_jumps() {
+        use nabedra_rt::sim::{self, EPOCH_MS, NodeClock};
+        use std::time::Duration;
+
+        sim::run(1, |world| async move {
+            let node = 1;
+            world.add_node(
+                node,
+                NodeClock {
+                    wall_offset_nanos: 1_000_000_000,
+                    ..NodeClock::default()
+                },
+            );
+            sim::in_node(node, async {
+                let mut clock = Clock::new(ClockMode::LocalDocker).unwrap();
+                let deadline_ms = EPOCH_MS + 3_000;
+                let initial = clock.now().unwrap();
+                assert_eq!(initial.lower_ms, EPOCH_MS + 1_000);
+                assert!(initial.allows(deadline_ms));
+
+                world.jump_wall_forward(node, Duration::from_secs(2));
+                assert!(clock.now().unwrap().fenced(deadline_ms));
+
+                world.jump_wall_backward(node, Duration::from_secs(3));
+                assert_eq!(clock.now().unwrap_err().kind(), io::ErrorKind::NotConnected);
+            })
+            .await;
+        });
+    }
 
     #[test]
     fn bounds_round_outward_and_switch_only_at_deadline() {
