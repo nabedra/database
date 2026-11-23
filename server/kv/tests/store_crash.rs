@@ -241,6 +241,37 @@ fn power_loss_campaign(model: PowerLoss, seeds_var: &str, default_seeds: u64) {
     }
 }
 
+#[cfg(feature = "sim")]
+#[test]
+fn phase9_sim_flushed_journal_value_survives_power_loss() {
+    use nabedra_rt::sim::{self, NodeClock};
+    sim::run(55, |world| async move {
+        world.add_node(1, NodeClock::default());
+        sim::in_node(1, async {
+            let (fs, dir) = fault_fs();
+            let bg = Background::new(2).unwrap();
+            let store = Store::open(&dir, options(&fs, &bg)).unwrap().store;
+            let batch = ModelBatch {
+                scope: vec![],
+                ops: vec![Op::PutJournal(b"key".to_vec(), b"value".to_vec())],
+            };
+            let mut model = Model::new();
+            batch.apply(&mut model);
+            write(&store, &batch, Durability::NoSync).unwrap();
+            store.flush().unwrap();
+
+            // Model a power loss where none of the unsynced bytes survive.
+            fs.halt();
+            let durable = fs.crash();
+            drop(store);
+            let opened = Store::open(&dir, options(&durable, &bg)).unwrap();
+            assert!(opened.quarantined.is_empty());
+            assert_eq!(dump(&opened.store.snapshot()), model);
+        })
+        .await;
+    });
+}
+
 #[test]
 fn ns05_power_loss_keeps_synced_writes_and_an_exact_prefix() {
     power_loss_campaign(PowerLoss::default(), "NS05_SEEDS", 150);
