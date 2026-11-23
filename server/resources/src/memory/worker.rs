@@ -173,6 +173,7 @@ impl WorkerMemory {
         self.reply_apply.close();
     }
 
+    #[inline]
     pub async fn reserve_apply(
         &self,
         class: ExecutionClass,
@@ -181,7 +182,6 @@ impl WorkerMemory {
         if bytes > self.config.apply_bytes_per_slot {
             return Err(capacity());
         }
-        let _owner = self.owner()?;
         let arena = match class {
             ExecutionClass::Query => &self.apply_query,
             ExecutionClass::Control => &self.apply_control,
@@ -189,6 +189,7 @@ impl WorkerMemory {
         arena.reserve_wait(bytes).await
     }
 
+    #[inline]
     pub async fn reserve_compute(
         &self,
         request: u64,
@@ -314,12 +315,14 @@ impl WorkerMemory {
     pub fn buffer_bytes_used(&self, class: ByteClass) -> usize {
         self.arena_for(class).used()
     }
+    #[inline]
     fn arena_for(&self, class: ByteClass) -> &Arc<ByteArena> {
         match class {
             ByteClass::Progress => &self.progress,
             ByteClass::Data => &self.arena,
         }
     }
+    #[inline]
     pub fn allocate_bytes(
         &self,
         class: ByteClass,
@@ -332,13 +335,10 @@ impl WorkerMemory {
         class: ByteClass,
         bytes: usize,
     ) -> Result<ScratchLease, ProtocolError> {
-        let owner = self.owner()?;
         match class {
-            ByteClass::Progress => Ok(ScratchLease::arena(
-                owner,
-                self.reserve_bytes_in(class, bytes)?,
-            )),
+            ByteClass::Progress => Ok(ScratchLease::arena(self.reserve_bytes_in(class, bytes)?)),
             ByteClass::Data => {
+                let owner = self.owner()?;
                 if bytes > self.task_memory_limit_bytes {
                     return Err(capacity());
                 }
@@ -444,6 +444,7 @@ impl WorkerMemory {
             error
         })
     }
+    #[inline]
     pub fn reserve_bytes_in(
         &self,
         class: ByteClass,
@@ -452,12 +453,12 @@ impl WorkerMemory {
         self.arena_for(class).reserve(bytes)
     }
 
+    #[inline]
     pub async fn reply_budget(
         &self,
         class: ExecutionClass,
         bytes: usize,
     ) -> Result<ByteReservation, ProtocolError> {
-        let _owner = self.owner()?;
         match class {
             ExecutionClass::Query => self.reply_query.reserve_wait(bytes).await,
             ExecutionClass::Control => self.reply_control.reserve_wait(bytes).await,
@@ -468,20 +469,19 @@ impl WorkerMemory {
     /// reserved ceiling retains decoded DTOs through responders and clones.
     /// Acquire it before native codec execution, and bound the lexical/DTO
     /// allocation estimate before deserializing.
+    #[inline]
     pub async fn data_apply_reply_budget(
         &self,
         bytes: usize,
     ) -> Result<ByteReservation, ProtocolError> {
-        let _owner = self.owner()?;
         self.reply_apply.reserve_wait(bytes).await
     }
     pub fn data_apply_reply_bytes_used(&self) -> usize {
         self.reply_apply.used()
     }
+    #[inline]
     pub async fn reserve_reply_decode(&self, bytes: usize) -> Result<ScratchLease, ProtocolError> {
-        let owner = self.owner()?;
         Ok(ScratchLease::arena(
-            owner,
             self.reply_decode.reserve_wait(bytes).await?,
         ))
     }
@@ -494,13 +494,12 @@ impl WorkerMemory {
         bytes: usize,
         request: u64,
     ) -> Result<ScratchLease, ProtocolError> {
-        let owner = self.owner()?;
         match class {
             ByteClass::Progress => Ok(ScratchLease::arena(
-                owner,
                 self.progress.reserve_wait(bytes).await?,
             )),
             ByteClass::Data => {
+                let owner = self.owner()?;
                 if bytes > self.task_memory_limit_bytes {
                     return Err(capacity());
                 }

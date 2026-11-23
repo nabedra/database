@@ -92,9 +92,9 @@ enum ScratchBacking {
     },
 }
 impl ScratchLease {
-    fn arena(owner: Arc<dyn Any + Send + Sync>, charge: ByteReservation) -> Self {
+    fn arena(charge: ByteReservation) -> Self {
         Self {
-            _owner: owner,
+            _owner: charge._owner.clone(),
             backing: ScratchBacking::Arena(charge),
         }
     }
@@ -257,6 +257,7 @@ impl ByteArena {
         if bytes == 0 {
             return self.reserve(0);
         }
+        let owner = self.owner(bytes)?;
         let ticket = {
             let mut allocation = self.allocation.lock().map_err(|_| capacity())?;
             if self.closed.load(Ordering::Acquire) {
@@ -283,16 +284,40 @@ impl ByteArena {
             if self.closed.load(Ordering::Acquire) {
                 return Err(capacity());
             }
-            if let Ok(reservation) = self.reserve_ticket(bytes, Some(ticket)) {
+            if self.reserve_ticket(bytes, Some(ticket)).is_ok() {
                 waiting.active = false;
-                return Ok(reservation);
+                return Ok(self.reservation(bytes, owner));
             }
             notified.await;
         }
     }
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<ByteReservation, ProtocolError> {
-        self.reserve_ticket(bytes, None)
+        let owner = self.owner(bytes)?;
+        self.reserve_ticket(bytes, None)?;
+        Ok(self.reservation(bytes, owner))
     }
+
+    #[inline]
+    fn owner(&self, bytes: usize) -> Result<Arc<dyn Any + Send + Sync>, ProtocolError> {
+        self.worker
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| self.reservation_error(bytes, "owner unavailable"))
+    }
+
+    #[inline]
+    fn reservation(
+        self: &Arc<Self>,
+        bytes: usize,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> ByteReservation {
+        ByteReservation {
+            arena: self.clone(),
+            _owner: owner,
+            remaining: bytes,
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn oldest_waiter_bypasses(&self) -> Option<u32> {
         self.allocation
@@ -303,29 +328,23 @@ impl ByteArena {
             .map(|waiter| waiter.bypassed)
     }
 
-    fn reserve_ticket(
-        self: &Arc<Self>,
-        bytes: usize,
-        ticket: Option<u64>,
-    ) -> Result<ByteReservation, ProtocolError> {
-        let unavailable = |reason: &str| {
-            capacity_context(format!(
-                "byte arena {reason} requested={bytes} used={} capacity={} waiting={}",
-                self.used.load(Ordering::Acquire),
-                self.capacity,
-                self.waiting.load(Ordering::Acquire)
-            ))
-        };
-        let waiting = |reason: &str| {
+    #[cold]
+    fn reservation_error(&self, bytes: usize, reason: &str) -> ProtocolError {
+        capacity_context(format!(
+            "byte arena {reason} requested={bytes} used={} capacity={} waiting={}",
+            self.used.load(Ordering::Acquire),
+            self.capacity,
+            self.waiting.load(Ordering::Acquire)
+        ))
+    }
+
+    fn reserve_ticket(&self, bytes: usize, ticket: Option<u64>) -> Result<(), ProtocolError> {
+        let unavailable = |reason| self.reservation_error(bytes, reason);
+        let waiting = |reason| {
             let mut error = unavailable(reason);
             error.code = ErrorCode::Overloaded;
             error
         };
-        let owner = self
-            .worker
-            .get()
-            .and_then(Weak::upgrade)
-            .ok_or_else(|| unavailable("owner unavailable"))?;
         let mut allocation = self
             .allocation
             .lock()
@@ -389,11 +408,7 @@ impl ByteArena {
         self.used.fetch_add(bytes, Ordering::AcqRel);
         drop(allocation);
         self.settled.notify_waiters();
-        Ok(ByteReservation {
-            arena: self.clone(),
-            _owner: owner,
-            remaining: bytes,
-        })
+        Ok(())
     }
 }
 struct ByteWaiter {
