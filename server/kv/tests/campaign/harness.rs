@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Waker};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "sim")]
+use nabedra_kv::fs::FsObserver;
 use nabedra_kv::fs::{Fault, FaultError, FaultFs, Fs, FsOp};
 use nabedra_kv::{Background, Durability, Error, MemtableBudget, Opened, Options, Snapshot, Store};
 
@@ -89,7 +91,7 @@ impl Config {
 }
 
 /// What a run did. Summed over runs for the report.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Report {
     pub runs: u64,
     pub steps: u64,
@@ -105,6 +107,9 @@ pub struct Report {
     pub reopens: u64,
     pub faults: u64,
     pub cuts: u64,
+    /// The original filesystem counter at the first cut of one stepped run.
+    #[cfg(feature = "sim")]
+    pub first_cut_at: Option<u64>,
     pub crash_cuts: u64,
     pub power_loss_cuts: u64,
     pub kill_cuts: u64,
@@ -211,7 +216,7 @@ impl Drop for OrderGuard {
         if let Some(&seq) = self.seq.get()
             && !self.store.requires_recovery()
         {
-            let thread = std::thread::current().name().map(str::to_owned);
+            let thread = nabedra_rt::task::current_service();
             let visible = self.store.visible_seq();
             if thread.as_deref() != Some("kv-journal") || visible < seq {
                 let mut bad = self.guards.bad.lock().unwrap_or_else(|p| p.into_inner());
@@ -237,6 +242,8 @@ pub struct Exec<'a> {
     bg: Arc<Background>,
     budget: Arc<MemtableBudget>,
     pub fs: FaultFs,
+    #[cfg(feature = "sim")]
+    pub fs_observer: Option<FsObserver>,
     sleepy: Option<Arc<Sleepy>>,
     store: Option<Arc<Store>>,
     pub hist: History,
@@ -302,6 +309,8 @@ impl<'a> Exec<'a> {
             bg: Background::new(2).unwrap(),
             budget: Arc::new(MemtableBudget::new(8 << 20)),
             fs,
+            #[cfg(feature = "sim")]
+            fs_observer: None,
             sleepy: None,
             store: None,
             hist: History::default(),
@@ -337,6 +346,12 @@ impl<'a> Exec<'a> {
     }
 
     fn open(&mut self, fs: &FaultFs) -> nabedra_kv::Result<Opened> {
+        #[cfg(feature = "sim")]
+        if let Some(observer) = &self.fs_observer {
+            // Recovered images start without observers. Attach before the reopen so
+            // the campaign observes every generation in addition to the original.
+            fs.observe(Arc::clone(observer));
+        }
         let o = self.options(fs);
         Store::open(&dir(), o)
     }
@@ -754,10 +769,13 @@ impl<'a> Exec<'a> {
 
     /// Waits for every order guard to drop, then hands out the only store handle.
     fn take_store(&mut self) -> Result<Store, String> {
+        let drained = || {
+            self.guards.dropped.load(Ordering::Acquire)
+                >= self.guards.created.load(Ordering::Acquire)
+        };
+        nabedra_rt::task::drive_until("campaign order guards", || drained().then_some(()));
         let deadline = Instant::now() + Duration::from_secs(60);
-        while self.guards.dropped.load(Ordering::Acquire)
-            < self.guards.created.load(Ordering::Acquire)
-        {
+        while !drained() {
             if Instant::now() > deadline {
                 return Err(format!(
                     "{}: {} of {} order guards never dropped",
@@ -797,6 +815,10 @@ impl<'a> Exec<'a> {
     /// Takes the image `kind` describes, stops the old machine, recovers and continues.
     fn cut(&mut self, kind: CutKind, why: &'static str) -> Result<(), String> {
         self.report.cuts += 1;
+        #[cfg(feature = "sim")]
+        if self.report.first_cut_at.is_none() {
+            self.report.first_cut_at = Some(self.fs.mutating_ops());
+        }
         match kind {
             CutKind::Crash => self.report.crash_cuts += 1,
             CutKind::Kill => self.report.kill_cuts += 1,

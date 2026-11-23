@@ -1,0 +1,14 @@
+id = "KV-SIM-JOURNAL-CUT"
+title = "A simulated journal cut retained queued write guards"
+class = "resource-release-order"
+module = "lsm"
+guarantees = []
+scenarios = ["NS04", "NS05", "NS17"]
+found_by = "review"
+found_date = "2026-11-23"
+lowest_regression = "server/kv/src/journal/sim_tests.rs::ns17_node_cut_releases_the_last_store_guard_in_an_unstarted_journal"
+seed = 17
+why_not_caught = "Threaded shutdown drained the queue. The stepped journal tests had exercised publishing and clean shutdown without cutting a live service."
+invariant_added = "A dead stepped journal releases guards and settles queued or parked commits with RecoveryRequired without changing the published prefix or touching the filesystem."
+fix_commits = ["0f5ba4cb848c0124122f59470409afec4baa81b4"]
+revert_patch_ok = false
