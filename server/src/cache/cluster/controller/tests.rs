@@ -458,6 +458,65 @@ fn k03_repairs_a_replica_after_its_incarnation_retires() {
 }
 
 #[test]
+fn k03_retired_source_does_not_hold_replica_move_capacity() {
+    use super::placement::MAX_MOVES_PER_WORKER;
+
+    let mut state = fixture();
+    let retired = make_member(1, 1).id;
+    let healthy = make_member(3, 1).id;
+    let target = make_member(2, 1).id;
+    for slot in &mut state.topology.slots[..MAX_MOVES_PER_WORKER] {
+        assert_eq!(slot.primary, Some(retired));
+        slot.moving = Some(Move {
+            operation: Uuid::from_u128(3),
+            target: healthy,
+            freeze_requested: false,
+            frozen: None,
+            replica_only: true,
+        });
+    }
+    let index = state
+        .topology
+        .slots
+        .iter()
+        .position(|slot| slot.primary == Some(healthy) && slot.replica == Some(retired))
+        .expect("a healthy source with the retired replica");
+    let restarted = make_member(retired.node, 2);
+    assert!(matches!(
+        state.apply(
+            Command::Enroll {
+                member: restarted,
+                certificate: [1; 32]
+            },
+            true,
+        ),
+        Some(Reply::Applied { .. })
+    ));
+    assert!(state.topology.member(retired).is_none());
+
+    let mut observed = Observations::default();
+    report(
+        &mut observed,
+        &state,
+        healthy,
+        1_000,
+        Some(Progress {
+            slot: index as u16,
+            epoch: state.topology.slots[index].epoch,
+            sequence: 0,
+            baseline: true,
+            serving_primary: true,
+            frozen: None,
+        }),
+    );
+    report(&mut observed, &state, target, 1_000, None);
+    assert!(state.reconcile(1_000, observed.plan(&state, bounds(1_000))));
+    let repair = state.topology.slots[index].moving.unwrap();
+    assert!(repair.replica_only);
+    assert_eq!(repair.target, target);
+}
+
+#[test]
 fn k03_replaces_a_retired_replica_before_resuming_same_zone_rebalance() {
     let mut state = fixture();
     let original = state.topology.slots[0];

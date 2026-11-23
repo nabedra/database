@@ -390,7 +390,12 @@ impl<'a> Placement<'a> {
         for slot in &topo.slots {
             if let Some(worker) = slot.primary {
                 *placement.primary_load.entry(worker.node).or_default() += 1;
-                if let Some(moving) = slot.moving {
+                // A retired incarnation can no longer participate in copying.
+                // Its stale intent cannot reserve capacity on a live worker.
+                if let Some(moving) = slot.moving
+                    && topo.member(worker).is_some()
+                    && topo.member(moving.target).is_some()
+                {
                     placement.add_move(worker.node, moving.target.node);
                 }
             }
