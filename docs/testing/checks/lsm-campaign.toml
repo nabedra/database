@@ -1,0 +1,13 @@
+id = "lsm-campaign"
+module = "lsm"
+kinds = ["U", "D"]
+guarantees = ["LSM-G01", "LSM-G02", "LSM-G03"]
+scenarios = ["LSM01", "NS04", "NS05", "NS07", "NS09", "NS11", "NS17"]
+tiers = ["T1"]
+# Fault model: production service threads run against FaultFs and the serial oracle.
+# The simulated-service campaign and the real-environment checks have separate records.
+command = ["cargo", "test", "--locked", "-j", "2", "-p", "nabedra-kv", "--test", "campaign", "--", "--nocapture", "--test-threads=1"]
+cwd = "server"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"
