@@ -37,7 +37,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -65,6 +65,7 @@ use crate::run::{
     DEFAULT_MAX_OPEN_RUNS, RunMeta, RunReadContext, RunStats, RunWriterOptions, TableCache,
     run_file_name,
 };
+use crate::service::Condvar;
 use crate::source::{InternalIterator, RangeTombstone};
 use crate::types::{Locator, Seq};
 use crate::version::{FileTracker, LevelOptions, MemEntry, RunFile, SuperVersion, Version};
@@ -381,6 +382,29 @@ impl JournalSink for Sink {
             None => Err(Error::Closed),
         }
     }
+
+    #[cfg(feature = "sim")]
+    fn stall_deadline(
+        &self,
+        _kind: RecordKind,
+        first_seq: Seq,
+        batch: &WriteBatch,
+    ) -> Option<Instant> {
+        self.0
+            .upgrade()
+            .and_then(|inner| inner.stall_deadline(first_seq, batch))
+    }
+}
+
+/// Why a write stalls before the journal thread applies it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stall {
+    /// It does not.
+    Pass,
+    /// The memtable budget is exhausted.
+    Budget,
+    /// L0 is at its stop trigger.
+    L0,
 }
 
 impl Store {
@@ -918,6 +942,20 @@ impl Job for Inner {
             Ok(false) => None,
         }
     }
+
+    /// A flush takes `flush_lock` for the whole flush; a compaction takes
+    /// `compaction_lock`, then `gc_pass` for journal GC. Callers hold the flush lock
+    /// (`Store::flush`, `release_scope`) or `gc_pass` (`Store::gc_journal`) across a
+    /// journal sync, which under `sim` drives these services.
+    #[cfg(feature = "sim")]
+    fn would_block(&self, compaction: bool) -> bool {
+        let held = |m: &Mutex<()>| matches!(m.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+        if compaction {
+            held(&self.compaction_lock) || held(&self.gc_pass)
+        } else {
+            held(&self.flush_lock)
+        }
+    }
 }
 
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1062,6 +1100,17 @@ impl Inner {
             }
             jobs.closing = true;
             self.closing_flag.store(true, Ordering::Release);
+            // Under `sim`, inside a world, a job runs within one service step, so none is
+            // running here unless one is further down this stack; drive the node's
+            // services rather than wait, which would never end.
+            #[cfg(feature = "sim")]
+            if jobs.active > 0 {
+                drop(jobs);
+                let _ = nabedra_rt::task::drive_until("kv store shutdown", || {
+                    (lock(&self.jobs).active == 0).then_some(())
+                });
+                jobs = lock(&self.jobs);
+            }
             while jobs.active > 0 {
                 jobs = self
                     .jobs_done
@@ -1219,19 +1268,59 @@ impl Inner {
     /// scope behind the journal thread. Writers pace themselves ([`Store::write_delay`]).
     fn stall(&self, last_seq: Seq, bytes: usize) {
         loop {
-            if self.latched.load(Ordering::Acquire) || self.closing() {
+            let stall = self.stall_needed(last_seq, bytes, true);
+            if stall == Stall::Pass {
                 return;
             }
-            // A flush waits on a journal sync, which needs this thread: let through the
-            // records queued before the sync and at most one journal group after it.
-            if self.syncs_waiting.load(Ordering::Acquire) > 0
-                && (last_seq <= self.bypass_seq.load(Ordering::Acquire)
-                    || self.bypass_bytes.fetch_sub(bytes as i64, Ordering::AcqRel) > 0)
-            {
-                return;
+            self.stall_kick(stall);
+            if stall == Stall::Budget {
+                self.budget
+                    .wait_below_limit(Some(time::now_std() + STALL_POLL));
+            } else {
+                let guard = lock(&self.l0_lock);
+                let _ = self.l0_changed.wait_timeout(guard, STALL_POLL);
             }
-            let l0 = self.l0_runs.load(Ordering::Relaxed);
-            if self.group.exhausted(&self.budget) {
+        }
+    }
+
+    /// Whether the record ending at `last_seq` must stall now: the one predicate of
+    /// [`Inner::stall`] and of the simulated journal park ([`Inner::stall_deadline`]).
+    /// With `take_bypass`, a record let through on the bypass byte allowance takes its
+    /// bytes from it, as [`Inner::stall`] does; the park only looks (the `apply` that
+    /// follows a pass takes them, in the same simulation step).
+    #[inline(always)]
+    fn stall_needed(&self, last_seq: Seq, bytes: usize, take_bypass: bool) -> Stall {
+        if self.latched.load(Ordering::Acquire) || self.closing() {
+            return Stall::Pass;
+        }
+        // A flush waits on a journal sync, which needs this thread: let through the
+        // records queued before the sync and at most one journal group after it.
+        if self.syncs_waiting.load(Ordering::Acquire) > 0
+            && (last_seq <= self.bypass_seq.load(Ordering::Acquire)
+                || if take_bypass {
+                    self.bypass_bytes.fetch_sub(bytes as i64, Ordering::AcqRel)
+                } else {
+                    self.bypass_bytes.load(Ordering::Acquire)
+                } > 0)
+        {
+            return Stall::Pass;
+        }
+        let l0 = self.l0_runs.load(Ordering::Relaxed);
+        if self.group.exhausted(&self.budget) {
+            return Stall::Budget;
+        }
+        if l0 >= self.levels.l0_stop_writes {
+            return Stall::L0;
+        }
+        Stall::Pass
+    }
+
+    /// What one round of a stall does before it waits: schedule the work that ends it.
+    #[inline]
+    fn stall_kick(&self, stall: Stall) {
+        match stall {
+            Stall::Pass => {}
+            Stall::Budget => {
                 let sv = self.current_sv();
                 let mine = sv.memtables().any(|m| !m.mem.is_empty());
                 if sv.imm.is_empty() && !sv.mem.mem.is_empty() {
@@ -1245,18 +1334,27 @@ impl Inner {
                     // budget holds the most (RV-KV2 finding 6).
                     self.group.flush_largest();
                 }
-                self.budget
-                    .wait_below_limit(Some(time::now_std() + STALL_POLL));
-                continue;
             }
-            if l0 >= self.levels.l0_stop_writes {
-                self.schedule_compaction();
-                let guard = lock(&self.l0_lock);
-                let _ = self.l0_changed.wait_timeout(guard, STALL_POLL);
-                continue;
-            }
-            return;
+            Stall::L0 => self.schedule_compaction(),
         }
+    }
+
+    /// Simulation only: the journal park's view of [`Inner::stall`]. When the record
+    /// would stall, does what one round of the stall does before it waits and returns
+    /// when to look again (the stall's poll interval); `None` when it would pass, in
+    /// which case the `apply` that follows passes too.
+    #[cfg(feature = "sim")]
+    fn stall_deadline(&self, first_seq: Seq, batch: &WriteBatch) -> Option<Instant> {
+        if self.replaying.load(Ordering::Acquire) {
+            return None;
+        }
+        let last = first_seq + u64::from(batch.count()).max(1) - 1;
+        let stall = self.stall_needed(last, batch.encoded_bytes(), false);
+        if stall == Stall::Pass {
+            return None;
+        }
+        self.stall_kick(stall);
+        Some(time::now_std() + STALL_POLL)
     }
 
     /// See [`Store::write_delay`]. A token bucket at `delayed_write_rate`: each caller

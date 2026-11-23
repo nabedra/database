@@ -28,7 +28,7 @@ use crate::harness::{Config, dir, options_for, release_batch};
 use crate::oracle::{Model, scan, show};
 use crate::workload::store_key;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DamageCounts {
     pub trials: u64,
     /// The flip changed nothing a reader could see (a flushed record, a free segment,
