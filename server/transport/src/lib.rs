@@ -345,13 +345,19 @@ impl ReceivedReply {
         self.session.group()
     }
     pub fn decode_header<T: DeserializeOwned>(&self) -> Result<Decoded<T>, ProtocolError> {
-        json_input(self.reply.header.as_slice(), MAX_HEADER_BYTES)
+        let header = self.reply.header.as_slice();
+        if header.len() > MAX_HEADER_BYTES {
+            return Err(malformed("RPC reply header exceeds JSON bounds"));
+        }
+        // The budget scan already checks JSON depth. The header cap also
+        // bounds the allocation estimate, so computing it cannot overflow.
+        let budget = json_decode_budget(header)
             .map_err(|_| malformed("RPC reply header exceeds JSON bounds"))?;
-        if json_decode_budget(self.reply.header.as_slice())? > self.scratch.bytes() {
+        if budget > self.scratch.bytes() {
             return Err(malformed("RPC reply decode reservation is too small"));
         }
-        let value = serde_json::from_slice(self.reply.header.as_slice())
-            .map_err(|_| malformed("invalid RPC reply header"))?;
+        let value =
+            serde_json::from_slice(header).map_err(|_| malformed("invalid RPC reply header"))?;
         Ok(Decoded::new(value, self.reply.sections.clone(), self.scratch.clone()))
     }
     pub fn decode_section<T: DeserializeOwned>(

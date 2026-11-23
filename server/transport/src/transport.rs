@@ -1188,6 +1188,7 @@ impl WorkerClient {
     pub fn local_identity(&self) -> WorkerIdentity {
         self.common.local
     }
+    #[inline]
     pub async fn request(
         &self,
         group: &GroupIdentity,
@@ -1197,17 +1198,19 @@ impl WorkerClient {
         sections: [Option<ChargedBytes>; MAX_SECTIONS],
         response_decode_bytes: usize,
     ) -> Result<ReceivedReply, ProtocolError> {
-        self.request_classified(
+        self.request_with_timeout(
             group,
-            target,
-            purpose,
+            RequestTarget::WorkerId(target),
+            (purpose, None),
             header,
             sections,
             response_decode_bytes,
+            None,
         )
         .await
         .map_err(Into::into)
     }
+    #[inline]
     pub async fn request_classified(
         &self,
         group: &GroupIdentity,

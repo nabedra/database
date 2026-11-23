@@ -115,6 +115,58 @@ fn identity() -> WorkerIdentity {
 }
 
 #[test]
+fn reply_header_checks_bounds_before_deserializing() {
+    let worker = test_memory(1, SharedResourceConfig::default());
+    let resources = MemoryHandle::new(worker);
+    let local = identity();
+    let group = GroupIdentity {
+        cluster_id: nabedra_rt::ids::uuid_v4(),
+        database: "reply-bounds".try_into().unwrap(),
+        group_id: nabedra_rt::ids::uuid_v4(),
+        kind: GroupKind::Control,
+        group_format_version: 1,
+    };
+    let reply = |bytes: &[u8], budget| ReceivedReply {
+        reply: ChargedReply {
+            header: resources.copy_bytes_in(ByteClass::Data, bytes).unwrap(),
+            sections: [None, None, None],
+        },
+        scratch: Arc::new(resources.reserve_scratch(ByteClass::Data, budget).unwrap()),
+        session: AuthenticatedSession::for_test(
+            local,
+            local,
+            group.clone(),
+            Purpose::Authority,
+            nabedra_rt::ids::uuid_v4(),
+        ),
+        resources: resources.clone(),
+    };
+    for (bytes, budget, message) in [
+        (
+            vec![b'1'; MAX_HEADER_BYTES + 1],
+            8192,
+            "RPC reply header exceeds JSON bounds",
+        ),
+        (vec![b'['; 33], 8192, "RPC reply header exceeds JSON bounds"),
+        (
+            b"1".to_vec(),
+            4096,
+            "RPC reply decode reservation is too small",
+        ),
+        (b"invalid".to_vec(), 8192, "invalid RPC reply header"),
+    ] {
+        let error = reply(&bytes, budget)
+            .decode_header::<u64>()
+            .err()
+            .expect("invalid reply header");
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        assert_eq!(error.outcome, Outcome::NotApplied);
+        assert_eq!(error.message, message);
+    }
+    assert_eq!(*reply(b"1", 4098).decode_header::<u64>().unwrap(), 1);
+}
+
+#[test]
 fn o05_m02_failed_replica_reservation_releases_unused_group_capacity() {
     let shared = test_memory(
         1,
