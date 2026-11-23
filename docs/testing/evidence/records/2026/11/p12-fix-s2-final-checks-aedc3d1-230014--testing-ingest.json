@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "p12-fix-s2-final-checks-aedc3d1-230014--testing-ingest.log",
+      "sha256": "06e19ed40328779fe2a33e2eb198223fba6b79d44662119f92aea0205616a89b"
+    }
+  ],
+  "assertions": {
+    "executed": 19,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "testing-ingest",
+  "duration_s": 3.021,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T22:29:56.421035+00:00",
+    "request_id": "p12-fix-s2-final-checks-aedc3d1-230014",
+    "runner": "GitHub Actions 1000008275",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45275323729"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "aedc3d1148fecd5a708750924b287ff09a2a5dc6",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
