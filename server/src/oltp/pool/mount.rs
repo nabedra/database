@@ -815,8 +815,20 @@ mod linux {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    pub(in crate::oltp::pool) fn worker_identity(
+        worker_id: uuid::Uuid,
+        incarnation: uuid::Uuid,
+    ) -> WorkerIdentity {
+        WorkerIdentity {
+            worker_id,
+            incarnation,
+            certificate_sha256: super::super::Digest::from_bytes([1; 32]),
+            enrollment_revision: 1,
+        }
+    }
     #[test]
     fn o26_mount_expectations_require_physical_volume_and_non_root_path() {
         assert!(valid_volume_id("vol-0123456789abcdef0"));
@@ -826,7 +838,6 @@ mod tests {
     }
     #[test]
     fn o26_unmounted_directory_is_rejected_without_creating_pool_files() {
-        use crate::oltp_replication::types::Digest;
         let path =
             std::env::temp_dir().join(format!("nabedra-unmounted-pool-{}", nabedra_rt::ids::uuid_v4()));
         std::fs::create_dir(&path).unwrap();
@@ -840,12 +851,7 @@ mod tests {
                 worker_id,
                 pool_id: nabedra_rt::ids::uuid_v4(),
             },
-            worker: WorkerIdentity {
-                worker_id,
-                incarnation: nabedra_rt::ids::uuid_v4(),
-                certificate_sha256: Digest::from_bytes([1; 32]),
-                enrollment_revision: 1,
-            },
+            worker: worker_identity(worker_id, nabedra_rt::ids::uuid_v4()),
             generation: 1,
             mount_path: path.clone(),
             provider_volume_id: "vol-0123456789abcdef0".into(),
