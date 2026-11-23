@@ -346,7 +346,7 @@ async fn propose_all(voter: &Voter, ids: std::ops::Range<u64>) {
                     Ok(_) => return,
                     Err(error)
                         if error.forward_to_leader().is_some()
-                            && started.elapsed() < Duration::from_secs(60) =>
+                            && nabedra_rt::time::elapsed(started) < Duration::from_secs(60) =>
                     {
                         nabedra_rt::time::sleep(Duration::from_millis(100)).await;
                     }
@@ -640,10 +640,10 @@ async fn o06_d01_rep6_data_only_follower_appends_make_no_control_call_and_surviv
     for id in 0..200 {
         let at = nabedra_rt::time::now_std();
         propose_all(&voters[leader], id..id + 1).await;
-        commits.push(at.elapsed().as_micros() as u64);
+        commits.push(nabedra_rt::time::elapsed(at).as_micros() as u64);
     }
     applied_everywhere(&voters, 200).await;
-    let elapsed = started.elapsed();
+    let elapsed = nabedra_rt::time::elapsed(started);
     let appends = received(&group, 3).0 - appends_before;
     let reads = source.calls.load(Ordering::Acquire) - 1;
     let budget = elapsed.as_secs() / REVOCATION_REFRESH.as_secs() + 2;
@@ -675,7 +675,7 @@ async fn o06_d01_rep6_data_only_follower_appends_make_no_control_call_and_surviv
     for id in 200..240 {
         let at = nabedra_rt::time::now_std();
         propose_all(&voters[leader], id..id + 1).await;
-        outage.push(at.elapsed().as_micros() as u64);
+        outage.push(nabedra_rt::time::elapsed(at).as_micros() as u64);
     }
     timeout_loop(|| async { (read_count(&voters[2].store).await == 240).then_some(()) }).await;
     assert!(!directory.revoked(voters[0].identity));
@@ -727,10 +727,10 @@ async fn o17_rep6_a_learned_revocation_closes_the_data_only_follower_sessions() 
     *source.revoked.lock().unwrap() = vec![revoked];
     let committed = nabedra_rt::time::now_std();
     timeout_loop(|| async { directory.revoked(revoked).then_some(()) }).await;
-    let learned = committed.elapsed();
+    let learned = nabedra_rt::time::elapsed(committed);
     timeout_loop(|| async { (voters[2].transport.revoked_session_closes() > 0).then_some(()) })
         .await;
-    let closed = committed.elapsed();
+    let closed = nabedra_rt::time::elapsed(committed);
     eprintln!("REP6 revocation learned after {learned:?}; session closed after {closed:?}");
     assert!(
         learned <= REVOCATION_REFRESH + Duration::from_secs(1),

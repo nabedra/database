@@ -7,6 +7,7 @@
 //! restricts the run to files whose relative path contains the value.
 //! `NABEDRA_LOGIC_RECORD=<dir>` writes every server exchange per file, for the
 //! ORM replays' offline transcript check (`NABEDRA_LOGIC_TRANSCRIPTS`).
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 #![cfg(feature = "olap")]
 
 use axum::{

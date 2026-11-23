@@ -1,4 +1,5 @@
 //! U01/U02 and Q04-Q06 exercise the public queue routes with real compute gates.
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 use axum::{
     Router,
     body::Body,

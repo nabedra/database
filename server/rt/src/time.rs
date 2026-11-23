@@ -40,6 +40,58 @@ pub fn now_std() -> std::time::Instant {
     }
 }
 
+/// Time elapsed on the current node's monotonic clock since `start`, zero if `start` is
+/// later. It replaces `Instant::elapsed`, which reads the real clock: `start` is a std
+/// [`std::time::Instant`] from [`now_std`] or a tokio [`Instant`] from [`now`].
+///
+/// Product: `start.elapsed()`. Under `sim`, `now_std()` or `now()` minus `start`, so a
+/// duration measured in a simulated node follows that node's clock.
+#[inline]
+pub fn elapsed<I: MonotonicInstant>(start: I) -> Duration {
+    start.elapsed_on_node()
+}
+
+/// An instant of the node's monotonic clock: a std [`std::time::Instant`] or a tokio
+/// [`Instant`]. Sealed; it exists so [`elapsed`] takes either type.
+pub trait MonotonicInstant: sealed::Sealed + Copy {
+    #[doc(hidden)]
+    fn elapsed_on_node(self) -> Duration;
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for std::time::Instant {}
+    impl Sealed for tokio::time::Instant {}
+}
+
+impl MonotonicInstant for std::time::Instant {
+    #[inline]
+    fn elapsed_on_node(self) -> Duration {
+        #[cfg(feature = "sim")]
+        {
+            now_std().saturating_duration_since(self)
+        }
+        #[cfg(not(feature = "sim"))]
+        {
+            self.elapsed()
+        }
+    }
+}
+
+impl MonotonicInstant for Instant {
+    #[inline]
+    fn elapsed_on_node(self) -> Duration {
+        #[cfg(feature = "sim")]
+        {
+            now().saturating_duration_since(self)
+        }
+        #[cfg(not(feature = "sim"))]
+        {
+            self.elapsed()
+        }
+    }
+}
+
 /// The wall clock of the current node.
 #[inline]
 pub fn wall_now() -> SystemTime {

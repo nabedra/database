@@ -1,4 +1,5 @@
 //! Test-only CA and enrolled worker certificates with bounded child cleanup.
+#![allow(clippy::disallowed_methods)] // test support, also #[path]-included by unit tests; the phase 7 seam covers product code
 use nabedra_database_server::oltp_replication::TlsMaterial;
 use std::{
     fs,

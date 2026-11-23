@@ -768,7 +768,7 @@ async fn o03_d01_point_operations_commit_one_entry_each_and_match_queued_results
         let before = cluster.last_index(leader);
         let started = nabedra_rt::time::now_std();
         let response = cluster.op(leader, operation, payload).await;
-        timings.push((operation, nabedra_rt::time::now_std().saturating_duration_since(started)));
+        timings.push((operation, nabedra_rt::time::elapsed(started)));
         assert_eq!(response, done(expected), "{operation}");
         entry(before, cluster.last_index(leader), wrote);
         writes += u64::from(wrote);
@@ -1615,7 +1615,7 @@ async fn d05_one_stopped_follower_keeps_writes_and_two_stop_every_success() {
         .execute(&cluster.voters[leader].handle, request)
         .await;
     assert!(
-        nabedra_rt::time::now_std().saturating_duration_since(started) < Duration::from_secs(5),
+        nabedra_rt::time::elapsed(started) < Duration::from_secs(5),
         "bounded by the deadline"
     );
     assert!(
@@ -1943,7 +1943,7 @@ async fn f01_u01_rv_final_m1_full_leader_answers_not_applied_at_once() {
             serde_json::json!({"key": 1, "values": {"value": 2}}),
         )
         .await;
-    let elapsed = nabedra_rt::time::now_std().saturating_duration_since(started);
+    let elapsed = nabedra_rt::time::elapsed(started);
     let DirectResponse::Failed(error) = &response else {
         panic!("{response:?}");
     };
@@ -2010,7 +2010,7 @@ async fn c07_f03_rv_final_l3_catalog_reads_end_at_the_request_deadline() {
             Some((ErrorCode::StorageUnavailable, Outcome::NotApplied)),
             "forward={forward}: {response:?}"
         );
-        assert!(nabedra_rt::time::now_std().saturating_duration_since(started) < Duration::from_secs(2));
+        assert!(nabedra_rt::time::elapsed(started) < Duration::from_secs(2));
     }
     cluster.schema.stall_table_reads(false);
     assert_eq!(
@@ -2339,7 +2339,7 @@ async fn d04_t7b_activation_failures_are_retried_inside_the_executor() {
         .execute(&cluster.voters[leader].handle, request)
         .await;
     assert!(
-        nabedra_rt::time::now_std().saturating_duration_since(started) < Duration::from_secs(5),
+        nabedra_rt::time::elapsed(started) < Duration::from_secs(5),
         "bounded by the deadline"
     );
     assert_eq!(
@@ -2704,7 +2704,7 @@ async fn o06_d05_rd1_a_leader_without_a_quorum_serves_no_read() {
             .execute(&cluster.voters[leader].handle, request)
             .await;
         assert!(
-            nabedra_rt::time::now_std().saturating_duration_since(started) < Duration::from_secs(5),
+            nabedra_rt::time::elapsed(started) < Duration::from_secs(5),
             "{operation}: bounded by the deadline"
         );
         assert!(

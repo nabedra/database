@@ -330,7 +330,7 @@ impl DataGroupFactory {
         // Only the leader can produce this observation after real ReadIndex.
         let started = nabedra_rt::time::now();
         let observed = running.observe_membership().await;
-        tracing::debug!(group_id = %spec.group.group_id, node = self.local.node_id, stage = "membership_read", ms = started.elapsed().as_millis(), ok = observed.is_ok(), "initial Data activation");
+        tracing::debug!(group_id = %spec.group.group_id, node = self.local.node_id, stage = "membership_read", ms = nabedra_rt::time::elapsed(started).as_millis(), ok = observed.is_ok(), "initial Data activation");
         let observation = observed?;
         if observation.replicas() != voters {
             return Err(invalid());
@@ -341,7 +341,7 @@ impl DataGroupFactory {
         );
         let started = nabedra_rt::time::now();
         let activation = participant.activation().await;
-        tracing::debug!(group_id = %spec.group.group_id, node = self.local.node_id, stage = "fence_read", ms = started.elapsed().as_millis(), ok = activation.is_ok(), "initial Data activation");
+        tracing::debug!(group_id = %spec.group.group_id, node = self.local.node_id, stage = "fence_read", ms = nabedra_rt::time::elapsed(started).as_millis(), ok = activation.is_ok(), "initial Data activation");
         if let Some(existing) = activation? {
             if existing.authority != spec.authority
                 || existing.catalog_group_id != spec.catalog_group_id
@@ -362,7 +362,7 @@ impl DataGroupFactory {
                     spec.span.clone(),
                 )
                 .await;
-            tracing::debug!(group_id = %spec.group.group_id, node = self.local.node_id, stage = "fence_write", ms = started.elapsed().as_millis(), ok = fenced.is_ok(), "initial Data activation");
+            tracing::debug!(group_id = %spec.group.group_id, node = self.local.node_id, stage = "fence_write", ms = nabedra_rt::time::elapsed(started).as_millis(), ok = fenced.is_ok(), "initial Data activation");
             fenced?;
         }
         Ok(Membership {
@@ -662,7 +662,7 @@ impl DataGroupClient {
                             Err(invalid())
                         }
                     });
-                tracing::debug!(group_id = %spec.group.group_id, node = member.node_id, ms = started.elapsed().as_millis(), ok = verified.is_ok(), error = ?verified.as_ref().err(), "initial Data host RPC");
+                tracing::debug!(group_id = %spec.group.group_id, node = member.node_id, ms = nabedra_rt::time::elapsed(started).as_millis(), ok = verified.is_ok(), error = ?verified.as_ref().err(), "initial Data host RPC");
                 verified.map_err(|error| {
                     // Host can leave a private replica after a lost reply. This
                     // stage has no authority to publish a Catalog route.
@@ -702,7 +702,7 @@ impl DataGroupClient {
                     self.call(member, Method::Activate, spec.clone(), voters),
                 )
                 .await;
-                tracing::debug!(group_id = %spec.group.group_id, node = member.node_id, ms = started.elapsed().as_millis(), ok = completed.as_ref().is_ok_and(Result::is_ok), "initial Data activation RPC");
+                tracing::debug!(group_id = %spec.group.group_id, node = member.node_id, ms = nabedra_rt::time::elapsed(started).as_millis(), ok = completed.as_ref().is_ok_and(Result::is_ok), "initial Data activation RPC");
                 let observed: Result<(Membership, _), _> = match completed {
                     Ok(result) => result,
                     Err(_) => return Err(last),

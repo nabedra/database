@@ -405,7 +405,7 @@ impl Measure {
         let runtime = self.voters[0].runtime.as_ref().unwrap().handle();
         nabedra_rt::task::spawn_on(runtime, async move {
             let response = executor.execute(&handle, request).await;
-            (response, nabedra_rt::time::now_std().saturating_duration_since(due))
+            (response, nabedra_rt::time::elapsed(due))
         })
     }
 
@@ -604,7 +604,7 @@ async fn phase(
             count(&response, latency, &mut latencies);
         }
     }
-    let wall = nabedra_rt::time::now_std().saturating_duration_since(started).as_secs_f64();
+    let wall = nabedra_rt::time::elapsed(started).as_secs_f64();
     let cpu_after = measure.cpu();
     let storage_after = measure.storage();
     let stages_after = crate::oltp_runtime::stage_timing::snapshot();

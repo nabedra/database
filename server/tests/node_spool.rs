@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 use nabedra_database_server::node::spool::{Spool, SpoolError, SpoolLimits};
 use std::os::unix::fs::PermissionsExt;
 use std::{

@@ -238,7 +238,7 @@ impl WorkerRuntime {
                 return Ok((None, None));
             }
             observation.deficit.clone().filter(|sample| {
-                sample.ready == ready && nabedra_rt::time::now_std().saturating_duration_since(sample.recorded_at) < DEFICIT_TTL
+                sample.ready == ready && nabedra_rt::time::elapsed(sample.recorded_at) < DEFICIT_TTL
             })
         };
         let current = self.services.control.current(&self.services.scope).await?;
@@ -267,7 +267,7 @@ impl WorkerRuntime {
             .as_ref()
             .filter(|sample| {
                 sample.recorded_at == deficit.recorded_at
-                    && nabedra_rt::time::now_std().saturating_duration_since(sample.recorded_at) < DEFICIT_TTL
+                    && nabedra_rt::time::elapsed(sample.recorded_at) < DEFICIT_TTL
             })
             .map(|_| deficit);
         Ok((current, None))

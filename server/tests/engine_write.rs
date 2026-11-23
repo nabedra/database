@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 use nabedra_database_server::worker_pool::{WorkerPool, WorkerThreads};
 use nabedra_database_server::{engine::Engine, protocol, storage};
 use std::num::NonZeroUsize;

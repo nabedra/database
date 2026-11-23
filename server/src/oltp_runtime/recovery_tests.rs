@@ -1019,7 +1019,7 @@ async fn replacement_peer_probe(config: PathBuf) {
                 for _ in 0..PROBE_SAMPLES {
                     let started = nabedra_rt::time::now_std();
                     assert!(probe(identity).await);
-                    samples.push(nabedra_rt::time::now_std().saturating_duration_since(started).as_micros() as u64);
+                    samples.push(nabedra_rt::time::elapsed(started).as_micros() as u64);
                 }
                 latency.insert(target.worker_id.to_string(), samples.into());
             }

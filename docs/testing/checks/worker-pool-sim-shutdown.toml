@@ -1,0 +1,11 @@
+id = "worker-pool-sim-shutdown"
+module = "scheduler"
+kinds = ["U"]
+guarantees = ["SCHED-G01", "OLAP-G07"]
+scenarios = ["F03"]
+tiers = ["T1"]
+command = ["cargo", "test", "--locked", "-j", "2", "--no-default-features", "--features", "oltp,sim", "--lib", "worker_pool::scheduling_tests::f03_shutdown_allows_the_coordinator_to_finish_accepted_work", "--", "--exact", "--test-threads=1"]
+cwd = "server"
+timeout_s = 1800
+needs = []
+result_parser = "cargo-test"

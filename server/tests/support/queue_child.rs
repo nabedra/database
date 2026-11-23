@@ -1,5 +1,6 @@
 //! Fixture-only worker process. Authority/fences and deterministic reads here
 //! are supplied by the test, not production Control Raft or a data engine.
+#![allow(clippy::disallowed_methods)] // test support, also #[path]-included by unit tests; the phase 7 seam covers product code
 use nabedra_database_server::{
     config::WorkerResources,
     oltp::pool::{SharedResourceConfig, WorkerSharedResources},

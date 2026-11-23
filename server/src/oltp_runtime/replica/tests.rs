@@ -325,7 +325,7 @@ async fn c07_m02_f03_o22_o23_read_grant_copy_retries_only_the_blocked_replica() 
     let expired = queue.open_read_grant(grant).await.unwrap_err();
     assert_eq!(expired.code, ErrorCode::Overloaded);
     assert_eq!(expired.outcome, Outcome::Unknown);
-    assert!((29..=30).contains(&nabedra_rt::time::now().saturating_duration_since(start).as_secs()));
+    assert!((29..=30).contains(&nabedra_rt::time::elapsed(start).as_secs()));
     assert!(owner.lock().unwrap().pending_read_grant_copy(id).is_some());
     assert!(peers.receivers[1].lock().unwrap().knows_read_grant(grant));
     peers.faults.lock().unwrap().clear();

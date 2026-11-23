@@ -317,7 +317,7 @@ impl HostRetry {
                 self.no_space.store(true, Ordering::Release);
             }
             if self.stopped_since(epoch)
-                || (kind == Transient::Capacity && started.elapsed() >= CAPACITY_RETRY_LIMIT)
+                || (kind == Transient::Capacity && nabedra_rt::time::elapsed(started) >= CAPACITY_RETRY_LIMIT)
             {
                 return Err(error);
             }

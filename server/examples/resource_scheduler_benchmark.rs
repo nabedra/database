@@ -1,5 +1,6 @@
 //! B01/B02 resource/pool microbenchmark. Does not stand in for API, storage or provider tests.
 //! Run with --output <file>; JSON includes one warmup and three measured repetitions.
+#![allow(clippy::disallowed_methods)] // examples measure real time on the host; the phase 7 seam covers server/src
 #![recursion_limit = "256"]
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use nabedra_database_server::{

@@ -174,7 +174,7 @@ impl<C: TypedConfig> TypedNetwork<C> {
                     code=?error.code, %error, "typed snapshot file could not be written");
             })?;
             tracing::info!(group=%self.factory.resident.identity().group_id, target=self.target,
-                bytes=file.bytes, applied=?file.header.applied, elapsed_ms=started.elapsed().as_millis() as u64,
+                bytes=file.bytes, applied=?file.header.applied, elapsed_ms=nabedra_rt::time::elapsed(started).as_millis() as u64,
                 "typed snapshot file ready to stream");
             let description_owner = self.factory.resident.metadata(METADATA)?;
             let description = Description {
@@ -344,7 +344,7 @@ where
         let mut guard = self.incoming.clone().lock_owned().await;
         if guard
             .as_ref()
-            .is_some_and(|incoming| incoming.touched.elapsed() > Duration::from_secs(60))
+            .is_some_and(|incoming| nabedra_rt::time::elapsed(incoming.touched) > Duration::from_secs(60))
         {
             *guard = None;
         }

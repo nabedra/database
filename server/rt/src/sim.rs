@@ -98,7 +98,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, SystemTime};
 
 use tokio::runtime::{Handle, Id, RuntimeFlavor};
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -465,7 +465,7 @@ impl World {
         };
         let context = self.node_context(node);
         let handle = target.spawn(NODE.scope(Some(context), gated));
-        self.register(context, &handle);
+        self.register(context, handle.abort_handle());
         handle
     }
 
@@ -478,12 +478,12 @@ impl World {
         })
     }
 
-    fn register<T>(&self, context: NodeContext, handle: &JoinHandle<T>) {
+    fn register(&self, context: NodeContext, handle: AbortHandle) {
         let mut state = self.lock();
         match state.nodes.get_mut(&context.id) {
             Some(entry) if context.is_current(entry) => {
                 entry.tasks.retain(|task| !task.is_finished());
-                entry.tasks.push(handle.abort_handle());
+                entry.tasks.push(handle);
             }
             _ => handle.abort(),
         }
@@ -1044,6 +1044,45 @@ where
             Err(panic) => std::panic::resume_unwind(panic),
         }
     })
+}
+
+pub(crate) fn spawn_blocking_on<F, R>(handle: &Handle, f: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let Some(world) = world() else {
+        return handle.spawn_blocking(f);
+    };
+    world.assert_runtime(handle);
+    let outcome = run_blocking(world, f);
+    spawn_on(handle, async move {
+        match outcome {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+pub(crate) fn spawn_in<T, F>(set: &mut JoinSet<T>, future: F) -> AbortHandle
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    match (current_node_context(), world()) {
+        (Some(context), Some(world)) => {
+            world.assert_runtime(&Handle::current());
+            let gated = Gate {
+                world: world.me.clone(),
+                node: context.id,
+                future: Box::pin(future),
+            };
+            let task = set.spawn(NODE.scope(Some(context), gated));
+            world.register(context, task.clone());
+            task
+        }
+        _ => set.spawn(future),
+    }
 }
 
 /// Runs `work` on this thread's blocking helper and waits for it. Only one job runs at a

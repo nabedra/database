@@ -1289,7 +1289,7 @@ fn bench_one_run(fs: &Arc<dyn Fs>, dir: &Path, id: u64, n: u64) {
             .unwrap();
     }
     let meta = writer.finish().unwrap();
-    let write_secs = start.elapsed().as_secs_f64();
+    let write_secs = nabedra_rt::time::elapsed(start).as_secs_f64();
     println!(
         "write: {n} entries x 100 B, {} MiB in {:.3} s ({:.0} ns/entry), {} data blocks",
         meta.file_size >> 20,
@@ -1323,7 +1323,7 @@ fn bench_one_run(fs: &Arc<dyn Fs>, dir: &Path, id: u64, n: u64) {
             let found = run.get(key, MAX_SEQ, true).unwrap();
             assert!(matches!(found, Lookup::Found { .. }));
         }
-        let hit_ns = t.elapsed().as_nanos() as f64 / f64::from(gets);
+        let hit_ns = nabedra_rt::time::elapsed(t).as_nanos() as f64 / f64::from(gets);
         let hit_bytes = (read_bytes(&ctx) - before) / u64::from(gets);
         let before = read_bytes(&ctx);
         let t = nabedra_rt::time::now_std();
@@ -1332,7 +1332,7 @@ fn bench_one_run(fs: &Arc<dyn Fs>, dir: &Path, id: u64, n: u64) {
             key.push(1);
             assert_eq!(run.get(&key, MAX_SEQ, true).unwrap(), Lookup::NotFound);
         }
-        let miss_ns = t.elapsed().as_nanos() as f64 / f64::from(gets);
+        let miss_ns = nabedra_rt::time::elapsed(t).as_nanos() as f64 / f64::from(gets);
         let miss_bytes = (read_bytes(&ctx) - before) / u64::from(gets);
         println!(
             "{label}: point get present {hit_ns:.0} ns ({hit_bytes} B read), \
@@ -1351,7 +1351,7 @@ fn bench_one_run(fs: &Arc<dyn Fs>, dir: &Path, id: u64, n: u64) {
                     iter.next();
                 }
             }
-            let ns = t.elapsed().as_nanos() as f64 / f64::from(rounds);
+            let ns = nabedra_rt::time::elapsed(t).as_nanos() as f64 / f64::from(rounds);
             let bytes = (read_bytes(&ctx) - before) / u64::from(rounds);
             println!(
                 "{label}: seek + scan {scan}: {ns:.0} ns ({:.0} ns/entry, {bytes} B read)",
@@ -1434,7 +1434,7 @@ fn bench_partitioned_index_get_bytes_under_small_caches() {
                 Lookup::Found { .. }
             ));
         }
-        let hit_ns = t.elapsed().as_nanos() as f64 / gets as f64;
+        let hit_ns = nabedra_rt::time::elapsed(t).as_nanos() as f64 / gets as f64;
         let hit_bytes = (bytes(&ctx) - before) / gets;
         let before = bytes(&ctx);
         let t = nabedra_rt::time::now_std();
@@ -1443,7 +1443,7 @@ fn bench_partitioned_index_get_bytes_under_small_caches() {
             key.push(1);
             assert_eq!(run.get(&key, MAX_SEQ, true).unwrap(), Lookup::NotFound);
         }
-        let miss_ns = t.elapsed().as_nanos() as f64 / gets as f64;
+        let miss_ns = nabedra_rt::time::elapsed(t).as_nanos() as f64 / gets as f64;
         let miss_bytes = (bytes(&ctx) - before) / gets;
         let stats = cache.stats();
         println!(

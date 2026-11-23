@@ -617,7 +617,7 @@ impl QueueCoordinator {
                             })?
                     };
                     #[cfg(test)]
-                    let timing = (target, nabedra_rt::time::now_std().saturating_duration_since(started));
+                    let timing = (target, nabedra_rt::time::elapsed(started));
                     #[cfg(not(test))]
                     let timing = ();
                     Ok::<_, ProtocolError>((ack, timing))
