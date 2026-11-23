@@ -172,11 +172,30 @@ impl SimFile {
     }
 
     pub(super) fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if !self.readable {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
         self.file()?.read_exact_at(buf, offset)
     }
 
     pub(super) fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        self.file()?.write_all_at(buf, offset)
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let file = self.file()?;
+        if !file.is_writable() {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        // Linux pwrite appends on a descriptor opened with O_APPEND, without moving its cursor.
+        let offset = if cfg!(target_os = "linux") && self.append {
+            file.len()?
+        } else {
+            offset
+        };
+        file.write_all_at(buf, offset)
     }
 
     pub(super) fn try_lock_exclusive(&self) -> io::Result<bool> {

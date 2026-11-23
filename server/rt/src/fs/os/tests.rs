@@ -79,6 +79,20 @@ pub(crate) fn scenario(root: &Path) -> Vec<String> {
     log("append", show((&appender).write_all(b"de")));
     log("after append", show(read(&b)));
     log(
+        "positional read on appender",
+        show(appender.read_exact_at(&mut two, 0)),
+    );
+    #[cfg(target_os = "linux")]
+    {
+        log("positional append", show(appender.write_all_at(b"f", 0)));
+        log("after positional append", show(read(&b)));
+    }
+    let reader = File::open(&b).unwrap();
+    log(
+        "positional write on reader",
+        show(reader.write_all_at(b"x", 0)),
+    );
+    log(
         "truncate",
         show(
             OpenOptions::new()
