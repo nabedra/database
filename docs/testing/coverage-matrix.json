@@ -1,6 +1,6 @@
 {
   "allow_unattested": false,
-  "head": "8498d0ee2c61a3df8557091412665b0e73f47bdc",
+  "head": "27cef92872ff2eda65030d422f78e8b4e7072402",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -287,10 +287,18 @@
           "state": "n/a"
         },
         "R": {
-          "executed": 0,
-          "failed": 0,
+          "behind": 0,
+          "checks": [
+            "cache-cluster-real"
+          ],
+          "date": "2026-11-23T17:57:33.212624+00:00",
+          "executed": 1,
+          "failed": 1,
+          "reason": "failed: cache-cluster-real",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45233126481",
+          "sha": "27cef92872ff2eda65030d422f78e8b4e7072402",
+          "state": "fail"
         },
         "S": {
           "executed": 0,
@@ -347,10 +355,18 @@
           "state": "n/a"
         },
         "R": {
-          "executed": 0,
-          "failed": 0,
+          "behind": 0,
+          "checks": [
+            "cache-cluster-real"
+          ],
+          "date": "2026-11-23T17:57:33.212624+00:00",
+          "executed": 1,
+          "failed": 1,
+          "reason": "failed: cache-cluster-real",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45233126481",
+          "sha": "27cef92872ff2eda65030d422f78e8b4e7072402",
+          "state": "fail"
         },
         "S": {
           "executed": 0,
@@ -3992,5 +4008,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
