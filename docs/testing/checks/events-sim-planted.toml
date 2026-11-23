@@ -1,0 +1,19 @@
+id = "events-sim-planted"
+module = "events"
+# The four Events planted-bug searches (testing plan phase 6) with the acceptance budget:
+# each bug must be caught within 10,000 seeds from seed 1000, and the catching seed must
+# replay with the same trace hash, history and violations. They measure the simulator's
+# sensitivity, so they prove no product guarantee by themselves; events-sim covers the
+# guarantees. server/events/src/sim/README.md records the catching seeds and trace hashes.
+kinds = ["S", "H"]
+guarantees = []
+scenarios = []
+tiers = ["T1", "T2"]
+command = ["cargo", "test", "--locked", "-j", "2", "--features", "sim", "--lib", "sim::tests::planted_", "--", "--nocapture", "--test-threads=1"]
+cwd = "server/events"
+timeout_s = 3600
+needs = []
+result_parser = "cargo-test"
+# tokio_unstable enables Builder::rng_seed (select! order). A separate target directory
+# keeps these RUSTFLAGS from invalidating other Events builds.
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_PLANTED_SEED = "1000", NABEDRA_PLANTED_SEEDS = "10000" }

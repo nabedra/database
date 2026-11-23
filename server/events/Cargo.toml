@@ -13,7 +13,7 @@ license = "MIT"
 # Deterministic simulation (src/sim). It swaps openraft's runtime, the peer network and
 # blocking storage work for seeded, single-threaded versions. Never enable it in a
 # product build.
-sim = ["dep:rand", "tokio/test-util"]
+sim = ["dep:nabedra-sim", "dep:rand", "nabedra-rt/sim", "tokio/test-util"]
 
 [dependencies]
 anyhow = "1"
@@ -26,6 +26,9 @@ fs2 = "0.4.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hmac = "0.12.1"
 nabedra-kv = { path = "../kv", version = "=0.1.0" }
+nabedra-rt = { path = "../rt", version = "=0.1.0" }
+# Dev-only simulation core: trace hash, network plan and Raft observer (feature `sim`).
+nabedra-sim = { path = "../sim", optional = true }
 openraft = { version = "=0.9.25", default-features = false, features = ["generic-snapshot-data", "serde", "storage-v2"] }
 # Already in the graph through openraft; the simulator implements its `RngCore`.
 rand = { version = "=0.8.8", default-features = false, optional = true }
