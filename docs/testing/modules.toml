@@ -47,10 +47,16 @@ level = "L3"
 register = "docs/testing/guarantees/oltp.md"
 paths = [
   "server/src/oltp/**",
+  "server/oltp-types/**",
+  "server/resources/src/stage_timing.rs",
+  "server/resources/src/memory.rs",
   "server/src/oltp.rs",
   "server/src/oltp_*/**",
   "server/src/oltp_*.rs",
-  "server/src/migration_interchange.rs",
+  "server/protocol/Cargo.toml",
+  "server/protocol/src/lib.rs",
+  "server/protocol/src/queue_error.rs",
+  "server/protocol/src/migration_interchange.rs",
   # Shared server entry points: both engines link them.
   "server/src/lib.rs",
   "server/src/main.rs",
@@ -64,8 +70,8 @@ paths = [
   "server/src/executor.rs",
   "server/src/maintenance.rs",
   "server/src/network.rs",
-  "server/src/protocol.rs",
-  "server/src/query_semantics.rs",
+  "server/protocol/src/protocol.rs",
+  "server/protocol/src/query_semantics.rs",
   "server/src/response.rs",
   "server/src/runtime.rs",
   "server/src/supervisor.rs",
@@ -126,7 +132,7 @@ hot_paths = [
   "server/src/oltp/codec.rs",
   "server/src/oltp_replication/typed_log/**",
   "server/src/oltp_replication/multiplex/**",
-  "server/src/protocol.rs",
+  "server/protocol/src/protocol.rs",
 ]
 
 [[module]]
@@ -142,7 +148,7 @@ paths = [
   "server/src/snapshot/**",
   "server/src/commit.rs",
   "server/src/olap_export.rs",
-  "server/src/partition_size.rs",
+  "server/resources/src/partition_size.rs",
   "server/src/node/**",
   "server/src/cluster/**",
   # Shared server entry points: both engines link them.
@@ -155,10 +161,13 @@ paths = [
   "server/src/config.rs",
   "server/src/executor.rs",
   "server/src/maintenance.rs",
-  "server/src/migration_interchange.rs",
+  "server/protocol/Cargo.toml",
+  "server/protocol/src/lib.rs",
+  "server/protocol/src/queue_error.rs",
+  "server/protocol/src/migration_interchange.rs",
   "server/src/network.rs",
-  "server/src/protocol.rs",
-  "server/src/query_semantics.rs",
+  "server/protocol/src/protocol.rs",
+  "server/protocol/src/query_semantics.rs",
   "server/src/response.rs",
   "server/src/runtime.rs",
   "server/src/supervisor.rs",
@@ -200,7 +209,7 @@ hot_paths = [
   "server/src/engine/partition.rs",
   "server/src/snapshot.rs",
   "server/src/snapshot/**",
-  "server/src/query_semantics.rs",
+  "server/protocol/src/query_semantics.rs",
   "server/src/node/payload/**",
 ]
 
@@ -240,8 +249,12 @@ register = "docs/testing/guarantees/scheduler.md"
 paths = [
   "server/src/request_queue.rs",
   "server/src/request_queue/**",
-  "server/src/scheduling.rs",
-  "server/src/scheduling/**",
+  "server/protocol/src/queue_error.rs",
+  "server/resources/Cargo.toml",
+  "server/resources/src/config.rs",
+  "server/resources/src/lib.rs",
+  "server/resources/src/scheduling.rs",
+  "server/resources/src/scheduling/**",
   "server/src/worker_pool.rs",
   "server/src/node/admission.rs",
   "server/src/node/admission/**",
@@ -261,7 +274,7 @@ paths = [
   "scripts/ci_repeat_tests.py",
 ]
 hot_paths = [
-  "server/src/scheduling.rs",
+  "server/resources/src/scheduling.rs",
   "server/src/request_queue.rs",
   "server/src/worker_pool.rs",
 ]

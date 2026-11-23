@@ -1,0 +1,17 @@
+[package]
+name = "nabedra-oltp-types"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+description = "Shared OLTP metadata, identities and wire records"
+license = "MIT"
+repository = "https://github.com/zPy52/nabedra-database"
+publish = ["crates-io"]
+
+[dependencies]
+nabedra-protocol = { path = "../protocol", version = "0.1.0" }
+nabedra-resources = { path = "../resources", version = "0.1.0" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+sha2 = "=0.11.1"
+uuid = { version = "=1.29.2", features = ["serde"] }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::{ErrorCode, Outcome};
 use nabedra_check::{Gen, prop};
 use serde_json::json;
 

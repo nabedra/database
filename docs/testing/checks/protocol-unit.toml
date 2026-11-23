@@ -1,0 +1,13 @@
+id = "protocol-unit"
+module = "oltp"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+# Runs the archive format test in the extracted crate. Server integration tests
+# still exercise the compatibility re-exports used by callers.
+command = ["cargo", "test", "--locked", "-j", "2", "-p", "nabedra-protocol"]
+cwd = "server"
+timeout_s = 300
+needs = []
+result_parser = "cargo-test"

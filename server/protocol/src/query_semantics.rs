@@ -5,7 +5,7 @@ use crate::protocol::{
 };
 use std::cmp::Ordering;
 
-pub(crate) fn compare_rows(table: &TableDescriptor, query: &Query, a: &Row, b: &Row) -> Ordering {
+pub fn compare_rows(table: &TableDescriptor, query: &Query, a: &Row, b: &Row) -> Ordering {
     let key_order = || compare(&a[&table.key], &b[&table.key]);
     match &query.order_by {
         Some(order) => {
@@ -16,7 +16,7 @@ pub(crate) fn compare_rows(table: &TableDescriptor, query: &Query, a: &Row, b: &
     }
 }
 
-pub(crate) fn matches_filter(query: &Query, row: &Row) -> bool {
+pub fn matches_filter(query: &Query, row: &Row) -> bool {
     query
         .filter
         .as_ref()
@@ -46,7 +46,7 @@ fn matches_predicate(predicate: &Predicate, row: &Row) -> bool {
     }
 }
 
-pub(crate) fn compare(a: &Scalar, b: &Scalar) -> Ordering {
+pub fn compare(a: &Scalar, b: &Scalar) -> Ordering {
     match (a, b) {
         (Scalar::Utf8(a), Scalar::Utf8(b)) => a.cmp(b),
         (Scalar::Int64(a), Scalar::Int64(b)) => a.cmp(b),

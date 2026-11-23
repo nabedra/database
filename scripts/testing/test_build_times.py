@@ -124,6 +124,16 @@ class RuleTests(unittest.TestCase):
         self.assertEqual([r["result"] for r in rules], ["n/a", "n/a", "n/a"])
         self.assertIn("not on the head yet", rules[0]["reason"])
 
+    def test_skeleton_rebuild_rules_wait_for_the_source_moves(self):
+        rebuilds = {
+            "runtime": {"owner": "nabedra-database", "rebuilt": ["nabedra-database"]},
+            "storage": {"owner": "nabedra-database", "rebuilt": ["nabedra-database"]},
+        }
+        pending = frozenset(("nabedra-transport", "nabedra-oltp-storage"))
+        rules = build_times.evaluate_rules(rebuilds, self.SPLIT, pending)
+        self.assertEqual([rule["result"] for rule in rules], ["pass", "n/a", "n/a"])
+        self.assertEqual(rules[2]["reason"], "probe sources have yet to move into nabedra-oltp-storage")
+
     def test_rules_pass_and_fail_on_the_split_head(self):
         good = {
             "runtime": {"owner": "nabedra-database", "rebuilt": ["nabedra-database"]},

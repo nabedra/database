@@ -4,10 +4,14 @@ use crate::{
     protocol::{ErrorCode, Outcome, ProtocolError},
     scheduling::{MemoryCharge, ResourceScheduler},
 };
+use nabedra_resources::memory::{ByteArena, CountingWriter, capacity_context};
+pub(super) use nabedra_resources::memory::{ByteReservation, ScratchBuffer, capacity};
+pub use nabedra_resources::memory::{ChargedBuffer, ChargedBytes, SharedResourceConfig};
+pub(crate) use nabedra_resources::memory::{DEFAULT_REPLY_DECODE_BYTES, RAFT_REPLICA_BYTES};
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, VecDeque},
-    fmt, io,
+    any::Any,
+    collections::BTreeMap,
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -22,54 +26,6 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 const POOL_OVERHEAD_BYTES: u64 = 64 << 20;
 const GROUP_HANDLE_BYTES: usize = 64 << 10;
 const GROUP_ENDPOINT_BYTES: usize = 64 << 10;
-pub(crate) const RAFT_REPLICA_BYTES: usize = 8 << 20;
-
-pub(crate) const DEFAULT_REPLY_DECODE_BYTES: usize = 1 << 20;
-
-#[derive(Clone, Copy, Debug)]
-pub struct SharedResourceConfig {
-    pub query_threads: usize,
-    pub control_threads: usize,
-    pub background_threads: i32,
-    pub cache_bytes: usize,
-    pub write_buffer_bytes: usize,
-    pub control_bytes: usize,
-    pub progress_bytes: usize,
-    pub apply_bytes_per_slot: usize,
-    pub query_reply_bytes: usize,
-    pub control_reply_bytes: usize,
-    pub reply_decode_bytes: usize,
-    pub data_apply_reply_bytes: usize,
-    pub max_open_pools: usize,
-    pub max_group_handles: usize,
-    pub max_resident_groups: usize,
-    pub precharge_group_capacity: bool,
-}
-impl Default for SharedResourceConfig {
-    fn default() -> Self {
-        Self {
-            query_threads: 1,
-            control_threads: 1,
-            background_threads: 2,
-            cache_bytes: 16 << 20,
-            write_buffer_bytes: 16 << 20,
-            // One32MiB fixed payload may coexist with its encoded frame.
-            control_bytes: 69 << 20,
-            progress_bytes: 4 << 20,
-            //32MiB encoding +32MiB native copy, plus bounded key/marker framing.
-            apply_bytes_per_slot: 65 << 20,
-            query_reply_bytes: 8 << 20,
-            control_reply_bytes: 1 << 20,
-            reply_decode_bytes: DEFAULT_REPLY_DECODE_BYTES,
-            data_apply_reply_bytes: 1 << 20,
-            max_open_pools: 8,
-            max_group_handles: 128,
-            max_resident_groups: 64,
-            precharge_group_capacity: false,
-        }
-    }
-}
-
 /// One owner per worker, shared by all volumes, groups and RAM queue accounting.
 /// The scheduler ID is not a permanent Raft node ID or worker enrollment UUID.
 pub struct WorkerSharedResources {
@@ -263,6 +219,7 @@ impl WorkerSharedResources {
         });
         let weak = Arc::downgrade(&owner);
         let _ = owner.weak_self.set(weak.clone());
+        let arena_owner: Weak<dyn Any + Send + Sync> = weak;
         for arena in [
             &owner.arena,
             &owner.progress,
@@ -273,10 +230,10 @@ impl WorkerSharedResources {
             &owner.reply_decode,
             &owner.reply_apply,
         ] {
-            let _ = arena.worker.set(weak.clone());
+            arena.bind_owner(arena_owner.clone());
         }
         if let Some(arena) = &owner.group_capacity {
-            let _ = arena.worker.set(weak);
+            arena.bind_owner(arena_owner);
         }
         Ok(owner)
     }
@@ -330,13 +287,18 @@ impl WorkerSharedResources {
         &self,
         queue: &Arc<crate::oltp_runtime::coordinator::QueueCoordinator>,
     ) -> Result<(), ProtocolError> {
-        self.read_queue.set(Arc::downgrade(queue)).map_err(|_| capacity())
+        self.read_queue
+            .set(Arc::downgrade(queue))
+            .map_err(|_| capacity())
     }
 
     pub(crate) fn read_queue(
         &self,
     ) -> Result<Arc<crate::oltp_runtime::coordinator::QueueCoordinator>, ProtocolError> {
-        self.read_queue.get().and_then(Weak::upgrade).ok_or_else(capacity)
+        self.read_queue
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(capacity)
     }
 
     pub fn worker_id(&self) -> Option<Uuid> {
@@ -358,13 +320,12 @@ impl WorkerSharedResources {
     }
     pub fn reply_waiters(&self, class: ExecutionClass) -> usize {
         match class {
-            ExecutionClass::Query => self.reply_query.waiting.load(Ordering::Acquire),
-            ExecutionClass::Control => self.reply_control.waiting.load(Ordering::Acquire),
+            ExecutionClass::Query => self.reply_query.waiters(),
+            ExecutionClass::Control => self.reply_control.waiters(),
         }
     }
     pub fn apply_bytes_used(&self) -> usize {
-        self.apply_query.used.load(Ordering::Acquire)
-            + self.apply_control.used.load(Ordering::Acquire)
+        self.apply_query.used() + self.apply_control.used()
     }
 
     pub fn scheduler(&self) -> ResourceScheduler {
@@ -408,7 +369,7 @@ impl WorkerSharedResources {
             &self.reply_apply,
         ]
         .iter()
-        .map(|arena| arena.used.load(Ordering::Acquire))
+        .map(|arena| arena.used())
         .sum()
     }
 
@@ -481,7 +442,7 @@ impl WorkerSharedResources {
         })
     }
     pub fn buffer_bytes_used(&self, class: ByteClass) -> usize {
-        self.arena_for(class).used.load(Ordering::Acquire)
+        self.arena_for(class).used()
     }
     fn arena_for(&self, class: ByteClass) -> &Arc<ByteArena> {
         match class {
@@ -494,11 +455,7 @@ impl WorkerSharedResources {
         class: ByteClass,
         len: usize,
     ) -> Result<ChargedBuffer, ProtocolError> {
-        let charge = self.reserve_bytes_in(class, len)?;
-        let mut data = Vec::new();
-        data.try_reserve_exact(len).map_err(|_| capacity())?;
-        data.resize(len, 0);
-        Ok(ChargedBuffer { data, charge })
+        self.reserve_bytes_in(class, len)?.into_buffer()
     }
     pub fn reserve_scratch(
         &self,
@@ -649,7 +606,7 @@ impl WorkerSharedResources {
         self.reply_apply.reserve_wait(bytes).await
     }
     pub fn data_apply_reply_bytes_used(&self) -> usize {
-        self.reply_apply.used.load(Ordering::Acquire)
+        self.reply_apply.used()
     }
     pub async fn reserve_reply_decode(&self, bytes: usize) -> Result<ScratchLease, ProtocolError> {
         Ok(ScratchLease {
@@ -658,7 +615,7 @@ impl WorkerSharedResources {
         })
     }
     pub fn reply_decode_bytes_used(&self) -> usize {
-        self.reply_decode.used.load(Ordering::Acquire)
+        self.reply_decode.used()
     }
     pub async fn reserve_scratch_wait(
         &self,
@@ -774,12 +731,12 @@ impl WorkerSharedResources {
                 &self.reply_apply,
             ]
             .iter()
-            .map(|arena| arena._charge.bytes())
+            .map(|arena| arena.charged_bytes())
             .sum::<u64>()
             + self
                 .group_capacity
                 .as_ref()
-                .map_or(0, |arena| arena._charge.bytes())
+                .map_or(0, |arena| arena.charged_bytes())
     }
     pub async fn prepare(
         self: &Arc<Self>,
@@ -881,22 +838,6 @@ pub enum ByteClass {
     Progress,
     Data,
 }
-/// A mutable received frame owns its budget before its first byte is allocated.
-pub struct ChargedBuffer {
-    data: Vec<u8>,
-    charge: ByteReservation,
-}
-impl ChargedBuffer {
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data
-    }
-    pub fn freeze(self) -> ChargedBytes {
-        ChargedBytes(Arc::new(ChargedData {
-            data: self.data,
-            _charge: self.charge,
-        }))
-    }
-}
 pub struct QueueLease {
     owner: Arc<WorkerSharedResources>,
 }
@@ -934,7 +875,7 @@ impl ScratchLease {
 
     pub fn bytes(&self) -> usize {
         match &self.backing {
-            ScratchBacking::Arena(charge) => charge.remaining,
+            ScratchBacking::Arena(charge) => charge.remaining(),
             ScratchBacking::Combined(owners) => owners.iter().map(|o| o.bytes()).sum(),
             ScratchBacking::Working { charge, .. } => {
                 charge.lock().expect("scratch charge").bytes() as usize
@@ -1111,8 +1052,10 @@ impl NativeExecutor {
         };
         for index in 0..count {
             let receiver = receiver.clone();
-            let thread =
-                nabedra_rt::task::spawn_service_with_stack(format!("{name}-{index}"), 2 << 20, move || {
+            let thread = nabedra_rt::task::spawn_service_with_stack(
+                format!("{name}-{index}"),
+                2 << 20,
+                move || {
                     loop {
                         let job = receiver.lock().unwrap().recv();
                         match job {
@@ -1122,8 +1065,9 @@ impl NativeExecutor {
                             Err(_) => break,
                         }
                     }
-                })
-                .map_err(|_| capacity())?;
+                },
+            )
+            .map_err(|_| capacity())?;
             executor.threads.push(thread);
         }
         Ok(executor)
@@ -1148,405 +1092,6 @@ impl Drop for NativeExecutor {
     }
 }
 
-struct ByteArena {
-    settled: Notify,
-    waiting: AtomicUsize,
-    closed: AtomicBool,
-    capacity: usize,
-    used: AtomicUsize,
-    _charge: MemoryCharge,
-    worker: OnceLock<Weak<WorkerSharedResources>>,
-    allocation: Mutex<ArenaAllocation>,
-}
-struct ArenaAllocation {
-    next: u64,
-    pending: VecDeque<ArenaWaiter>,
-}
-struct ArenaWaiter {
-    ticket: u64,
-    bytes: usize,
-    bypassed: u32,
-}
-const BYTE_BYPASS_LIMIT: u32 = 32;
-impl ByteArena {
-    fn new(capacity: usize, charge: MemoryCharge) -> Result<Arc<Self>, ProtocolError> {
-        Ok(Arc::new(Self {
-            capacity,
-            used: AtomicUsize::new(0),
-            _charge: charge,
-            worker: OnceLock::new(),
-            allocation: Mutex::new(ArenaAllocation {
-                next: 0,
-                pending: VecDeque::new(),
-            }),
-            settled: Notify::new(),
-            waiting: AtomicUsize::new(0),
-            closed: AtomicBool::new(false),
-        }))
-    }
-    fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.settled.notify_waiters();
-    }
-    async fn reserve_wait(
-        self: &Arc<Self>,
-        bytes: usize,
-    ) -> Result<ByteReservation, ProtocolError> {
-        if bytes > self.capacity {
-            return Err(capacity());
-        }
-        if bytes == 0 {
-            return self.reserve(0);
-        }
-        let ticket = {
-            let mut allocation = self.allocation.lock().map_err(|_| capacity())?;
-            if self.closed.load(Ordering::Acquire) {
-                return Err(capacity());
-            }
-            let next = allocation.next.checked_add(1).ok_or_else(capacity)?;
-            allocation.pending.try_reserve(1).map_err(|_| capacity())?;
-            allocation.next = next;
-            allocation.pending.push_back(ArenaWaiter {
-                ticket: next,
-                bytes,
-                bypassed: 0,
-            });
-            self.waiting.fetch_add(1, Ordering::AcqRel);
-            next
-        };
-        let mut waiting = ByteWaiter {
-            arena: self.clone(),
-            ticket,
-            active: true,
-        };
-        loop {
-            let notified = self.settled.notified();
-            if self.closed.load(Ordering::Acquire) {
-                return Err(capacity());
-            }
-            if let Ok(reservation) = self.reserve_ticket(bytes, Some(ticket)) {
-                waiting.active = false;
-                return Ok(reservation);
-            }
-            notified.await;
-        }
-    }
-    fn reserve(self: &Arc<Self>, bytes: usize) -> Result<ByteReservation, ProtocolError> {
-        self.reserve_ticket(bytes, None)
-    }
-    fn reserve_ticket(
-        self: &Arc<Self>,
-        bytes: usize,
-        ticket: Option<u64>,
-    ) -> Result<ByteReservation, ProtocolError> {
-        let unavailable = |reason: &str| {
-            capacity_context(format!(
-                "byte arena {reason} requested={bytes} used={} capacity={} waiting={}",
-                self.used.load(Ordering::Acquire),
-                self.capacity,
-                self.waiting.load(Ordering::Acquire)
-            ))
-        };
-        let waiting = |reason: &str| {
-            let mut error = unavailable(reason);
-            error.code = ErrorCode::Overloaded;
-            error
-        };
-        let owner = self
-            .worker
-            .get()
-            .and_then(Weak::upgrade)
-            .ok_or_else(|| unavailable("owner unavailable"))?;
-        let mut allocation = self
-            .allocation
-            .lock()
-            .map_err(|_| unavailable("allocation poisoned"))?;
-        if self.closed.load(Ordering::Acquire) {
-            return Err(unavailable("closed"));
-        }
-        let free = self.capacity - self.used.load(Ordering::Acquire);
-        if bytes > free {
-            return Err(unavailable("insufficient bytes"));
-        }
-        let index = match ticket {
-            Some(ticket) => Some(
-                allocation
-                    .pending
-                    .iter()
-                    .position(|waiter| waiter.ticket == ticket && waiter.bytes == bytes)
-                    .ok_or_else(|| unavailable("waiter unavailable"))?,
-            ),
-            None => None,
-        };
-        if bytes != 0 {
-            let free_after = free - bytes;
-            // Queued grants follow first fit. Immediate grants can use the
-            // bytes left over after the first fitting waiter.
-            if let Some((first_fit, waiter)) = allocation
-                .pending
-                .iter()
-                .enumerate()
-                .find(|(_, waiter)| waiter.bytes <= free)
-                && index.map_or(free_after < waiter.bytes, |index| index > first_fit)
-            {
-                return Err(waiting("older fitting waiter"));
-            }
-            // After 32 bypasses, freed bytes accumulate for the oldest aged waiter.
-            if let Some(protected) = allocation
-                .pending
-                .iter()
-                .position(|waiter| waiter.bypassed >= BYTE_BYPASS_LIMIT)
-                && index.is_none_or(|index| index > protected)
-                && free_after < allocation.pending[protected].bytes.min(free)
-            {
-                return Err(waiting("older protected waiter"));
-            }
-            let older = index.unwrap_or(allocation.pending.len());
-            for waiter in allocation
-                .pending
-                .iter_mut()
-                .take(older)
-                .filter(|waiter| waiter.bytes > free)
-            {
-                waiter.bypassed = waiter.bypassed.saturating_add(1).min(BYTE_BYPASS_LIMIT);
-            }
-        }
-        if let Some(index) = index {
-            allocation.pending.remove(index);
-            self.waiting.fetch_sub(1, Ordering::AcqRel);
-        }
-        // Grants serialize under allocation; concurrent drops can only free
-        // more bytes after the availability observation above.
-        self.used.fetch_add(bytes, Ordering::AcqRel);
-        drop(allocation);
-        self.settled.notify_waiters();
-        Ok(ByteReservation {
-            arena: self.clone(),
-            _owner: owner,
-            remaining: bytes,
-        })
-    }
-}
-struct ByteWaiter {
-    arena: Arc<ByteArena>,
-    ticket: u64,
-    active: bool,
-}
-impl Drop for ByteWaiter {
-    fn drop(&mut self) {
-        if self.active {
-            let mut allocation = self.arena.allocation.lock().expect("byte allocation state");
-            if let Some(index) = allocation
-                .pending
-                .iter()
-                .position(|waiter| waiter.ticket == self.ticket)
-            {
-                allocation.pending.remove(index);
-                self.arena.waiting.fetch_sub(1, Ordering::AcqRel);
-            }
-            drop(allocation);
-            self.arena.settled.notify_waiters();
-        }
-    }
-}
-pub(super) struct ByteReservation {
-    _owner: Arc<WorkerSharedResources>,
-    arena: Arc<ByteArena>,
-    remaining: usize,
-}
-impl ByteReservation {
-    pub(super) fn allocate(&mut self, len: usize) -> Result<ChargedBuffer, ProtocolError> {
-        let charge = self.split(len)?;
-        let mut data = Vec::new();
-        data.try_reserve_exact(len).map_err(|_| capacity())?;
-        data.resize(len, 0);
-        Ok(ChargedBuffer { data, charge })
-    }
-    pub(super) fn reclaim_buffer(&mut self, buffer: ChargedBuffer) -> Result<(), ProtocolError> {
-        let ChargedBuffer { data, mut charge } = buffer;
-        if !Arc::ptr_eq(&self.arena, &charge.arena) {
-            return Err(capacity());
-        }
-        drop(data);
-        self.remaining = self
-            .remaining
-            .checked_add(charge.remaining)
-            .ok_or_else(capacity)?;
-        charge.remaining = 0;
-        Ok(())
-    }
-    pub(super) fn reclaim_value(&mut self, value: ChargedBytes) -> Result<(), ProtocolError> {
-        let owned = Arc::try_unwrap(value.0).map_err(|_| capacity())?;
-        self.reclaim_buffer(ChargedBuffer {
-            data: owned.data,
-            charge: owned._charge,
-        })
-    }
-    pub(super) fn rehome(&mut self, value: ChargedBytes) -> Result<ChargedBytes, ProtocolError> {
-        if Arc::ptr_eq(&self.arena, &value.0._charge.arena) {
-            Ok(value)
-        } else {
-            self.copy(value.as_slice())
-        }
-    }
-    pub(super) fn encode_value<T: Serialize>(
-        &mut self,
-        value: &T,
-    ) -> Result<ChargedBytes, ProtocolError> {
-        let mut count = CountingWriter {
-            bytes: 0,
-            limit: self.remaining,
-        };
-        serde_json::to_writer(&mut count, value).map_err(|_| capacity())?;
-        self.split(count.bytes)?.encode(value)
-    }
-    pub(super) fn buffer(&mut self, len: usize) -> Result<ScratchBuffer<'_>, ProtocolError> {
-        if len > self.remaining {
-            return Err(capacity());
-        }
-        let mut data = Vec::new();
-        data.try_reserve_exact(len).map_err(|_| capacity())?;
-        data.resize(len, 0);
-        Ok(ScratchBuffer {
-            data,
-            _reservation: self,
-        })
-    }
-    pub(super) fn remaining(&self) -> usize {
-        self.remaining
-    }
-    pub(super) fn split(&mut self, bytes: usize) -> Result<Self, ProtocolError> {
-        self.remaining = self.remaining.checked_sub(bytes).ok_or_else(capacity)?;
-        Ok(Self {
-            arena: self.arena.clone(),
-            _owner: self._owner.clone(),
-            remaining: bytes,
-        })
-    }
-    pub(super) fn join(&mut self, parts: &[&[u8]]) -> Result<ChargedBytes, ProtocolError> {
-        let length = parts
-            .iter()
-            .try_fold(0usize, |n, p| n.checked_add(p.len()))
-            .ok_or_else(capacity)?;
-        let charge = self.split(length)?;
-        let mut data = Vec::new();
-        data.try_reserve_exact(length).map_err(|_| capacity())?;
-        for part in parts {
-            data.extend_from_slice(part);
-        }
-        Ok(ChargedBytes(Arc::new(ChargedData {
-            data,
-            _charge: charge,
-        })))
-    }
-    pub(super) fn copy(&mut self, bytes: &[u8]) -> Result<ChargedBytes, ProtocolError> {
-        let charge = self.split(bytes.len())?;
-        let mut data = Vec::new();
-        data.try_reserve_exact(bytes.len())
-            .map_err(|_| capacity())?;
-        data.extend_from_slice(bytes);
-        Ok(ChargedBytes(Arc::new(ChargedData {
-            data,
-            _charge: charge,
-        })))
-    }
-    pub(super) fn encode<T: Serialize>(mut self, value: &T) -> Result<ChargedBytes, ProtocolError> {
-        let mut writer = BoundedWriter {
-            data: Vec::new(),
-            limit: self.remaining,
-        };
-        serde_json::to_writer(&mut writer, value).map_err(|_| capacity())?;
-        let charge = self.split(writer.data.capacity())?;
-        Ok(ChargedBytes(Arc::new(ChargedData {
-            data: writer.data,
-            _charge: charge,
-        })))
-    }
-}
-impl Drop for ByteReservation {
-    fn drop(&mut self) {
-        self.arena.used.fetch_sub(self.remaining, Ordering::AcqRel);
-        self.arena.settled.notify_waiters();
-    }
-}
-pub(super) struct ScratchBuffer<'a> {
-    data: Vec<u8>,
-    _reservation: &'a mut ByteReservation,
-}
-impl ScratchBuffer<'_> {
-    pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data
-    }
-    pub(super) fn as_slice(&self) -> &[u8] {
-        &self.data
-    }
-}
-struct ChargedData {
-    data: Vec<u8>,
-    _charge: ByteReservation,
-}
-/// Immutable bytes and their capacity charge share the same lifetime across
-/// log readers, application results, transport frames and cancellation.
-#[derive(Clone)]
-pub struct ChargedBytes(Arc<ChargedData>);
-impl ChargedBytes {
-    pub fn as_slice(&self) -> &[u8] {
-        &self.0.data
-    }
-    pub fn len(&self) -> usize {
-        self.0.data.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.0.data.is_empty()
-    }
-}
-impl AsRef<[u8]> for ChargedBytes {
-    fn as_ref(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-impl fmt::Debug for ChargedBytes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ChargedBytes")
-            .field("len", &self.len())
-            .finish()
-    }
-}
-
-struct BoundedWriter {
-    data: Vec<u8>,
-    limit: usize,
-}
-impl io::Write for BoundedWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let end = self
-            .data
-            .len()
-            .checked_add(bytes.len())
-            .filter(|&n| n <= self.limit)
-            .ok_or_else(|| io::Error::other("encoded value exceeds reserved bytes"))?;
-        if end > self.data.capacity() {
-            let grow = end
-                .max(self.data.capacity().saturating_mul(2))
-                .min(self.limit);
-            self.data
-                .try_reserve_exact(grow - self.data.len())
-                .map_err(io::Error::other)?;
-        }
-        self.data.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-pub(super) fn capacity() -> ProtocolError {
-    super::super::failure(
-        ErrorCode::LimitExceeded,
-        "worker storage capacity unavailable",
-    )
-}
-
 fn group_profile_error() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::ValidationError,
@@ -1557,13 +1102,6 @@ fn group_profile_error() -> ProtocolError {
 
 fn group_slots_exhausted(message: &'static str) -> ProtocolError {
     ProtocolError::new(ErrorCode::Overloaded, message, Outcome::NotApplied)
-}
-
-fn capacity_context(context: String) -> ProtocolError {
-    let mut error = capacity();
-    error.message.push_str("; ");
-    error.message.push_str(&context);
-    error
 }
 
 #[cfg(test)]
@@ -1635,13 +1173,13 @@ mod tests {
         let budget = 2 * (GROUP_ENDPOINT_BYTES + RAFT_REPLICA_BYTES) + 3 * GROUP_HANDLE_BYTES;
         let scheduler = resources.scheduler();
         let baseline = scheduler.usage()[0].2;
-        assert_eq!(arena.capacity, budget);
+        assert_eq!(arena.capacity(), budget);
         assert_eq!(baseline, resources.native_baseline_bytes());
         let groups = [(); 2].map(|()| resources.lease_group_residency().unwrap());
         let [replica, other_replica] =
             [(); 2].map(|()| resources.lease_replica_residency().unwrap());
         let handles = [(); 3].map(|()| resources.reserve_group_handle().unwrap());
-        assert_eq!(arena.used.load(Ordering::Acquire), budget);
+        assert_eq!(arena.used(), budget);
         assert_eq!(scheduler.usage()[0].2, baseline);
         for (error, message) in [
             (
@@ -1662,14 +1200,11 @@ mod tests {
             assert_eq!(error.message, message);
         }
         drop(replica);
-        assert_eq!(
-            arena.used.load(Ordering::Acquire),
-            budget - RAFT_REPLICA_BYTES
-        );
+        assert_eq!(arena.used(), budget - RAFT_REPLICA_BYTES);
         let replica = resources.lease_replica_residency().unwrap();
-        assert_eq!(arena.used.load(Ordering::Acquire), budget);
+        assert_eq!(arena.used(), budget);
         drop((groups, replica, other_replica, handles));
-        assert_eq!(arena.used.load(Ordering::Acquire), 0);
+        assert_eq!(arena.used(), 0);
         assert_eq!(scheduler.usage()[0].2, baseline);
         let execution = ExecutionConfig::default();
         resources
@@ -1734,13 +1269,13 @@ mod tests {
         .unwrap();
         let arena = &resources.progress;
         let used = || resources.buffer_bytes_used(ByteClass::Progress);
-        let waiters = || arena.waiting.load(Ordering::Acquire);
+        let waiters = || arena.waiters();
         let scheduler = resources.scheduler();
         let baseline = scheduler.usage();
         let retained = resources
             .reserve_scratch(ByteClass::Progress, 176_925)
             .unwrap();
-        let blocker = arena.reserve(arena.capacity - retained.bytes()).unwrap();
+        let blocker = arena.reserve(arena.capacity() - retained.bytes()).unwrap();
         let mut older = Box::pin(resources.reserve_scratch_wait(ByteClass::Progress, 16 << 10, 0));
         std::future::poll_fn(|cx| {
             assert!(older.as_mut().poll(cx).is_pending());
@@ -1754,7 +1289,7 @@ mod tests {
         let progress = resources.reserve_scratch(ByteClass::Progress, 383).unwrap();
         assert_eq!(progress.bytes(), 383);
         assert_eq!(used(), retained.bytes() + 383);
-        assert_eq!(arena.allocation.lock().unwrap().pending[0].bypassed, 0);
+        assert_eq!(arena.oldest_waiter_bypasses(), Some(0));
 
         let mut younger = Box::pin(resources.reserve_scratch_wait(ByteClass::Progress, 1, 0));
         let granted = std::future::poll_fn(|cx| {
@@ -1788,8 +1323,8 @@ mod tests {
         )
         .unwrap();
         let arena = &resources.progress;
-        let held = arena.reserve(arena.capacity).unwrap();
-        let mut earlier = std::pin::pin!(arena.reserve_wait(arena.capacity - 382));
+        let held = arena.reserve(arena.capacity()).unwrap();
+        let mut earlier = std::pin::pin!(arena.reserve_wait(arena.capacity() - 382));
         std::future::poll_fn(|cx| {
             assert!(earlier.as_mut().poll(cx).is_pending());
             Poll::Ready(())
@@ -1806,12 +1341,12 @@ mod tests {
             blocked.message,
             format!(
                 "worker storage capacity unavailable; byte arena older fitting waiter requested=383 used=0 capacity={} waiting=1",
-                arena.capacity
+                arena.capacity()
             )
         );
         assert_eq!(resources.buffer_bytes_used(ByteClass::Progress), 0);
         let impossible = arena
-            .reserve_wait(arena.capacity + 1)
+            .reserve_wait(arena.capacity() + 1)
             .await
             .err()
             .expect("request exceeds arena capacity");
@@ -1827,28 +1362,10 @@ mod tests {
         .await;
         assert_eq!(
             resources.buffer_bytes_used(ByteClass::Progress),
-            arena.capacity
+            arena.capacity()
         );
         drop((remaining, earlier));
         assert_eq!(resources.buffer_bytes_used(ByteClass::Progress), 0);
-        assert_eq!(arena.waiting.load(Ordering::Acquire), 0);
-    }
-}
-
-struct CountingWriter {
-    bytes: usize,
-    limit: usize,
-}
-impl io::Write for CountingWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.bytes = self
-            .bytes
-            .checked_add(bytes.len())
-            .filter(|&n| n <= self.limit)
-            .ok_or_else(|| io::Error::other("encoded value exceeds limit"))?;
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        assert_eq!(arena.waiters(), 0);
     }
 }
