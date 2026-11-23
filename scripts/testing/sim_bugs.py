@@ -11,7 +11,8 @@ Commands:
   check [ids]    Cheap (T0, T1): validate every manifest against its bug record, resolve the fix
                  SHAs, confirm the patch touches only product files and applies to HEAD
                  (`git apply --check` against HEAD's tree through a private index), confirm that a
-                 clean port changes the same lines as the reversed fix, and that a hand port has
+                 clean port changes the same lines as the reversed fix in every product file the
+                 fix changed, and that a hand port has
                  regression evidence recorded for its current changed lines.
   verify [ids]   Heavy: build HEAD in a scratch worktree, run each bug's original regression test,
                  then apply each patch and run it again. A bug is verified when the test passes
@@ -296,19 +297,22 @@ def validate_regression(bug):
     return problems
 
 
+def path_problem(name):
+    """Why a patch may not touch `name`, or None for a product source."""
+    if not name.startswith("server/") or name.startswith(BUGS_DIR.parent.as_posix() + "/"):
+        return f"revert.patch touches {name}, outside the product sources"
+    if TEST_FILE.search(name):
+        return f"revert.patch touches the test file {name}"
+    if name.endswith(("Cargo.toml", "Cargo.lock")):
+        return f"revert.patch touches the manifest {name}"
+    return None
+
+
 def validate_patch_paths(patch):
     files = patch_files(patch)
     if not files:
         return ["revert.patch is empty"]
-    problems = []
-    for name in files:
-        if not name.startswith("server/") or name.startswith(BUGS_DIR.parent.as_posix() + "/"):
-            problems.append(f"revert.patch touches {name}, outside the product sources")
-        elif TEST_FILE.search(name):
-            problems.append(f"revert.patch touches the test file {name}")
-        elif name.endswith(("Cargo.toml", "Cargo.lock")):
-            problems.append(f"revert.patch touches the manifest {name}")
-    return problems
+    return [problem for problem in map(path_problem, files) if problem]
 
 
 def validate_git(bug, repo, warnings):
@@ -333,6 +337,12 @@ def validate_git(bug, repo, warnings):
         if changed_lines(reverse) != changed_lines(bug.patch):
             problems.append(f"port = clean, but the patch does not change exactly the lines of "
                             f"`git diff {m['reverts'][:8]} {m['reverts'][:8]}^` on its files")
+        # A clean revert also covers every product file the fix changed, or it is a hand port.
+        fixed = git(repo, "diff", "--name-only", f"{m['reverts']}^", m["reverts"]).stdout.split()
+        omitted = sorted(name for name in fixed if path_problem(name) is None and name not in files)
+        if omitted:
+            problems.append(f"port = clean, but the patch leaves out product files the fix changed: "
+                            f"{', '.join(omitted)}")
     evidence = bug.regression.get("evidence")
     if evidence and evidence.get("digest") != digest(bug.patch):
         problems.append("the patch's changed lines differ from those its regression evidence "

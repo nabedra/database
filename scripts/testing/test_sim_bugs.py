@@ -159,6 +159,22 @@ class SimBugsTest(unittest.TestCase):
         self.f.write_bug(patch=extra_line(self.f.patch))
         self.assert_check(1, "port = clean, but the patch does not change exactly the lines")
 
+    def test_clean_claim_must_cover_every_product_file_of_the_fix(self):
+        f = self.f
+        f.write("server/src/other.rs", "pub fn other() {}\n")
+        f.write("server/src/tests.rs", TESTS + "// a test hunk stays\n")
+        f.write("server/src/lib.rs", FIXED.replace("// fixed", "// fixed again"))
+        fix = f.commit("a fix over two product files and a test")
+        record = f.repo / "docs/testing/bugs/2026-11-23-fix-one.toml"
+        record.write_text(record.read_text().replace(f'["{f.fix}"]', f'["{f.fix}", "{fix}"]'))
+        manifest = f.manifest().replace(f'reverts = "{f.fix}"', f'reverts = "{fix}"').replace(
+            f'fix_commits = ["{f.fix}"]', f'fix_commits = ["{f.fix}", "{fix}"]')
+        f.write_bug(manifest, sh(f.repo, "diff", fix, f"{fix}^", "--", "server/src/lib.rs"))
+        self.assert_check(1, "leaves out product files the fix changed: server/src/other.rs")
+        f.write_bug(manifest, sh(f.repo, "diff", fix, f"{fix}^", "--", "server/src/lib.rs",
+                                 "server/src/other.rs"))
+        self.assert_check(0, "fix-one: ok (clean port")
+
     def test_hand_port_needs_matching_evidence(self):
         self.f.write_bug(self.f.manifest(port="hand"))
         self.assert_check(1, "a hand port counts only with regression evidence")
