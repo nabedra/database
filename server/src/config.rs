@@ -6,9 +6,7 @@ pub use nabedra_resources::config::{
     ConfigError, ExecutionConfig, MAX_RESULT_RETENTION_MS, QueueLifetime, QueueReplication,
     WorkerResources,
 };
-pub(crate) use nabedra_resources::config::direct_oltp_default;
-#[cfg(all(feature = "oltp", test))]
-use nabedra_resources::config::DIRECT_MARKER_RETENTION_MS;
+pub(crate) use nabedra_resources::config::{DIRECT_MARKER_RETENTION_MS, direct_oltp_default};
 use std::{
     env::{self, VarError},
     fmt,
