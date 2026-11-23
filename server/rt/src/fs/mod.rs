@@ -96,8 +96,8 @@ pub trait FsFile: Send + Sync {
 /// The default production filesystem.
 ///
 /// Under `sim`, inside a simulated node that has volumes (`sim::World::mount`), it is
-/// that node's filesystem: every call resolves the node's current volume for its path.
-/// Elsewhere it is [`RealFs`].
+/// the filesystem of that node incarnation. Calls resolve the current volume for each
+/// path. After a restart, obtain a new handle. Elsewhere it is [`RealFs`].
 pub fn real() -> Arc<dyn Fs> {
     #[cfg(feature = "sim")]
     if let Some(fs) = crate::sim::volumes::node_fs() {

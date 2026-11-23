@@ -11,7 +11,8 @@
 //! [`World::crash`] halts every volume of the node first, so nothing written after the
 //! cut reaches a disk image. [`World::restart_with`] replaces each volume by its `kill`,
 //! `crash` or power-loss image; files opened before the cut keep pointing at the halted
-//! old image and fail. [`World::wipe`] replaces one volume by an empty one: the RV-REP #3
+//! old image and fail. Old node contexts and `NodeFs` handles cannot reopen paths on
+//! the replacement image. [`World::wipe`] replaces one volume by an empty one: the RV-REP #3
 //! condition, a wiped data volume next to a surviving key volume, is one call.
 
 use std::collections::BTreeMap;
@@ -21,7 +22,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use uuid::Uuid;
 
-use super::{SimEvent, World, current_node, lock, world};
+use super::{NodeContext, SimEvent, World, current_node_context, lock, world};
 use crate::fs::{FaultFs, Fs, FsFile, FsLock, OpenMode, PowerLoss};
 
 /// The identity of a simulated volume, as the mount code reads it from the host.
@@ -98,11 +99,16 @@ pub(crate) struct Table {
 impl Table {
     /// The volume with the longest mount prefix of `path` on `node`. `Ok(None)` when the
     /// node has no mount at all (it keeps the host filesystem).
-    fn resolve(&self, node: u64, path: &Path) -> io::Result<Option<FaultFs>> {
+    fn resolve(&self, node: u64, active: bool, path: &Path) -> io::Result<Option<FaultFs>> {
         let mut state = lock(&self.state);
         let Some(volumes) = state.volumes.get(&node).filter(|v| !v.is_empty()) else {
             return Ok(None);
         };
+        if !active {
+            return Err(io::Error::other(format!(
+                "simulated node {node} incarnation is no longer active"
+            )));
+        }
         let best = volumes
             .iter()
             .filter(|volume| path.is_absolute() && path.starts_with(&volume.info.mount_path))
@@ -150,10 +156,10 @@ pub(crate) enum Route {
 
 /// Routes `path` for the current world and node.
 pub(crate) fn route(path: &Path) -> io::Result<Route> {
-    let (Some(world), Some(node)) = (world(), current_node()) else {
+    let (Some(world), Some(context)) = (world(), current_node_context()) else {
         return Ok(Route::Host);
     };
-    Ok(match world.volumes.resolve(node, path)? {
+    Ok(match world.resolve_node_path(context, path)? {
         Some(fs) => Route::Volume(fs),
         None => Route::Host,
     })
@@ -162,23 +168,27 @@ pub(crate) fn route(path: &Path) -> io::Result<Route> {
 /// Whether a simulated node with mounts is calling (`fs::os::euid` reports
 /// [`FaultFs::UID`] then).
 pub(crate) fn in_mounted_node() -> bool {
-    let (Some(world), Some(node)) = (world(), current_node()) else {
+    let (Some(world), Some(context)) = (world(), current_node_context()) else {
         return false;
     };
     lock(&world.volumes.state)
         .volumes
-        .get(&node)
+        .get(&context.id)
         .is_some_and(|volumes| !volumes.is_empty())
 }
 
 /// The volume identity for `path` in the current node, for code that reads mount
 /// identity from the host (`/proc/self/mountinfo`, `/dev/disk/by-uuid`, `statvfs`).
 pub fn volume_for(path: &Path) -> Option<VolumeInfo> {
-    let (world, node) = (world()?, current_node()?);
+    let (world, context) = (world()?, current_node_context()?);
+    let nodes = world.lock();
+    if !context.is_current(nodes.nodes.get(&context.id)?) {
+        return None;
+    }
     let state = lock(&world.volumes.state);
     state
         .volumes
-        .get(&node)?
+        .get(&context.id)?
         .iter()
         .filter(|volume| path.is_absolute() && path.starts_with(&volume.info.mount_path))
         .max_by_key(|volume| volume.info.mount_path.components().count())
@@ -193,15 +203,15 @@ pub(crate) fn node_fs() -> Option<Arc<dyn Fs>> {
     let world = world()?;
     Some(Arc::new(NodeFs {
         world: world.me.clone(),
-        node: current_node()?,
+        context: current_node_context()?,
     }))
 }
 
-/// The `Fs` of a simulated node: every call resolves the node's current volume for its
-/// path, so a store reopened after [`World::restart_with`] sees the new image.
+/// The `Fs` of one incarnation of a simulated node. Paths resolve on each call as long
+/// as that incarnation is active.
 struct NodeFs {
     world: Weak<World>,
-    node: u64,
+    context: NodeContext,
 }
 
 impl NodeFs {
@@ -210,10 +220,10 @@ impl NodeFs {
             .world
             .upgrade()
             .ok_or_else(|| io::Error::other("the simulated world has ended"))?;
-        world.volumes.resolve(self.node, path)?.ok_or_else(|| {
+        world.resolve_node_path(self.context, path)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!("simulated node {} has no volumes", self.node),
+                format!("simulated node {} has no volumes", self.context.id),
             )
         })
     }
@@ -265,6 +275,17 @@ pub(crate) fn same_device(from: &FaultFs, to: &FaultFs) -> io::Result<()> {
 }
 
 impl World {
+    fn resolve_node_path(&self, context: NodeContext, path: &Path) -> io::Result<Option<FaultFs>> {
+        // Keep the node state locked through mount lookup. A restart installs its images
+        // while the node is down, so an active old context can only clone a pre-cut image.
+        let nodes = self.lock();
+        let active = nodes
+            .nodes
+            .get(&context.id)
+            .is_some_and(|node| context.is_current(node));
+        self.volumes.resolve(context.id, active, path)
+    }
+
     fn attach(&self, node: u64, mount: &Path, fs: &FaultFs) {
         let world = self.me.clone();
         let mount = mount.to_path_buf();
