@@ -1,0 +1,21 @@
+id = "cache-sim"
+module = "cache"
+kinds = ["S", "H"]
+guarantees = ["CACHE-G02", "CACHE-G03", "CACHE-G05", "CACHE-G06", "CACHE-G07", "CACHE-G08", "CACHE-G09"]
+scenarios = ["K01", "K02", "K03"]
+tiers = ["T1"]
+# Fault model. The cluster uses the simulated runtime, network and ClockBound.
+# Only the Cache library is compiled with sim.
+command = ["bash", "-euc", '''
+cargo test --locked -j 4 --release -p nabedra-check --test history_cache_sim
+sim=(cargo test --locked -j 4 --release --no-default-features --features cache,sim --lib)
+tests=$("${sim[@]}" cache::cluster::sim::tests:: -- --list --format terse)
+grep -Fxq 'cache::cluster::sim::tests::seed_sweep: test' <<< "$tests"
+"${sim[@]}" cache::cluster::sim::tests:: -- --nocapture --test-threads=1
+''']
+cwd = "server"
+timeout_s = 3600
+needs = []
+result_parser = "cargo-test"
+# Five percent of 500 seeds replay with byte-identical histories and trace hashes.
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim-cache", CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true", CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS = "true", NABEDRA_SEEDS = "500", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "0.05", NABEDRA_PLANTED_SEEDS = "500", NABEDRA_SIM_SHRINK = "1", NABEDRA_SIM_ARTIFACTS = "../target/testing-logs/cache-sim" }

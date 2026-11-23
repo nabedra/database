@@ -1,0 +1,34 @@
+id = "cache-sim-nightly"
+module = "cache"
+kinds = ["S", "H"]
+guarantees = ["CACHE-G02", "CACHE-G03", "CACHE-G05", "CACHE-G06", "CACHE-G07", "CACHE-G08", "CACHE-G09"]
+scenarios = ["K01", "K02", "K03"]
+tiers = ["T2", "T3"]
+# Fault-model sweep. Check the elapsed time between batches so a running seed finishes.
+command = ["bash", "-euc", '''
+build=(cargo test --locked -j 4 --release --no-default-features --features cache,sim --lib)
+test_name=cache::cluster::sim::tests::seed_sweep
+tests=$("${build[@]}" "$test_name" -- --list --format terse)
+grep -Fxq "$test_name: test" <<< "$tests"
+
+first=${NABEDRA_SEED:-auto}
+if [[ $first == auto ]]; then
+    run_number=${GITHUB_RUN_NUMBER:-0}
+    first=$((1000000 + 100000 * (10#$run_number % 10000)))
+fi
+seed=$first
+SECONDS=0
+while :; do
+    NABEDRA_SEED="$seed" "${build[@]}" "$test_name" -- \
+        --exact --nocapture --test-threads=1
+    seed=$((seed + NABEDRA_SEEDS))
+    if (( SECONDS >= NABEDRA_SIM_BUDGET_S )); then break; fi
+done
+printf 'Cache nightly fault model: %d seeds, range %d..%d\n' "$((seed - first))" "$first" "$((seed - 1))"
+''']
+cwd = "server"
+# Four hours and twenty minutes of seeds, within five hours including compilation.
+timeout_s = 18000
+needs = []
+result_parser = "cargo-test"
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim-cache", CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true", CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS = "true", NABEDRA_SEEDS = "32", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_BUDGET_S = "15600", NABEDRA_SIM_SHRINK = "1", NABEDRA_SIM_ARTIFACTS = "../target/testing-logs/cache-sim-nightly" }
