@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nabedra_rt::task;
+use nabedra_rt::time::{self, MissedTickBehavior, interval};
 use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
-use tokio::time::{MissedTickBehavior, interval};
 
 use crate::cache::standalone::response;
 use crate::cache::store::{
@@ -253,26 +254,24 @@ pub(super) fn spawn(
     let (control, control_rx) = mpsc::channel(CONTROL_PENDING);
     let (transfer, transfer_rx) = mpsc::channel(TRANSFER_PENDING);
     let (startup, started) = std::sync::mpsc::sync_channel(1);
-    let thread = thread::Builder::new()
-        .name(format!("cache-actor-{index}"))
-        .spawn(move || {
-            let state = State::new(index, config).and_then(|state| {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build()?;
-                Ok((state, runtime))
-            });
-            match state {
-                Ok((state, runtime)) => {
-                    if startup.send(Ok(())).is_ok() {
-                        runtime.block_on(state.run(client_rx, control_rx, transfer_rx));
-                    }
-                }
-                Err(error) => {
-                    let _ = startup.send(Err(error));
+    let thread = task::spawn_service(format!("cache-actor-{index}"), move || {
+        let state = State::new(index, config).and_then(|state| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()?;
+            Ok((state, runtime))
+        });
+        match state {
+            Ok((state, runtime)) => {
+                if startup.send(Ok(())).is_ok() {
+                    runtime.block_on(state.run(client_rx, control_rx, transfer_rx));
                 }
             }
-        })?;
+            Err(error) => {
+                let _ = startup.send(Err(error));
+            }
+        }
+    })?;
     match started.recv() {
         Ok(Ok(())) => Ok((
             ActorHandle {
@@ -635,7 +634,7 @@ impl State {
 
     fn maintenance(&mut self) {
         self.copies.expire();
-        let expires = std::time::Instant::now() + Duration::from_micros(400);
+        let expires = time::now_std() + Duration::from_micros(400);
         for _ in 0..EXPIRY_PER_TICK {
             let Some(slot) = self
                 .expiry_keys
@@ -671,7 +670,7 @@ impl State {
             if state.store.is_empty() || state.role != Role::Primary {
                 self.expiry_keys.remove(&slot);
             }
-            if std::time::Instant::now() >= expires {
+            if time::now_std() >= expires {
                 break;
             }
         }
@@ -847,7 +846,10 @@ fn publish(
 }
 
 fn elapsed_us(queued: Instant) -> u64 {
-    queued.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+    time::now_std()
+        .duration_since(queued)
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]

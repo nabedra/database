@@ -8,6 +8,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use nabedra_rt::{task, time};
+
 use crate::error::Result;
 
 /// Stack size of every thread `nabedra-kv` starts (`kv-flush`, `kv-compact`,
@@ -96,10 +98,9 @@ impl Background {
             };
             // On failure `background` drops here, which stops and joins the threads
             // started so far.
-            let handle = std::thread::Builder::new()
-                .name(name.into())
-                .stack_size(stack_bytes)
-                .spawn(move || run(&shared, flush_thread))?;
+            let handle = task::spawn_service_with_stack(name, stack_bytes, move || {
+                run(&shared, flush_thread)
+            })?;
             lock(&background.threads).push(handle);
         }
         Ok(Arc::new(background))
@@ -125,7 +126,7 @@ impl Background {
 
     fn schedule(&self, kind: Kind, job: Weak<dyn Job>, delay: Duration) {
         let entry = Entry {
-            ready_at: Instant::now() + delay,
+            ready_at: time::now_std() + delay,
             job,
         };
         let mut queues = lock(&self.shared.queues);
@@ -183,7 +184,7 @@ fn run(shared: &Shared, flush_thread: bool) {
         if queues.shutdown {
             return;
         }
-        let now = Instant::now();
+        let now = time::now_std();
         let mut next_wake: Option<Instant> = None;
         let mut picked = None;
         if flush_thread {
@@ -224,7 +225,7 @@ fn run(shared: &Shared, flush_thread: bool) {
             && !queues.shutdown
         {
             let entry = Entry {
-                ready_at: Instant::now() + delay,
+                ready_at: time::now_std() + delay,
                 job: entry.job,
             };
             match kind {

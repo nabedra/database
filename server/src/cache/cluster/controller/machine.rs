@@ -97,7 +97,7 @@ fn validate(saved: &Saved) -> io::Result<()> {
 
 async fn persist(snapshots: Arc<Mutex<Snapshots>>, saved: Saved) -> io::Result<Saved> {
     let mut snapshots = snapshots.lock_owned().await;
-    tokio::task::spawn_blocking(move || {
+    nabedra_rt::task::spawn_blocking(move || {
         if let Some(prior) = &snapshots.saved
             && index(prior.meta.last_log_id) >= index(saved.meta.last_log_id)
         {

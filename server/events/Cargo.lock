@@ -1111,7 +1111,16 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "libc",
+ "nabedra-rt",
  "tokio",
+]
+
+[[package]]
+name = "nabedra-rt"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

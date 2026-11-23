@@ -13,12 +13,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nabedra_rt::time::{MissedTickBehavior, interval, timeout};
 use openraft::{
     BasicNode, ReadPolicy, SnapshotPolicy, type_config::async_runtime::watch::WatchReceiver,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::time::{MissedTickBehavior, interval, timeout};
 use uuid::Uuid;
 
 use super::clock::{Clock, ClockBounds, ClockMode};

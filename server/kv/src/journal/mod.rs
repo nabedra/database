@@ -419,7 +419,7 @@ impl Journal {
                 "journal segment_bytes must be a multiple of 4096 and at least 12288",
             ));
         }
-        let started = std::time::Instant::now();
+        let started = nabedra_rt::time::now_std();
         ensure_durable_dir(&*fs, dir)?;
         let recovered = recovery::recover(&*fs, dir, &options, replay_after, &*sink)?;
         let mut report = recovered.report.clone();
@@ -464,7 +464,9 @@ impl Journal {
             .store(report.tail_truncations, Ordering::Relaxed);
         stats.tail_bytes.store(report.tail_bytes, Ordering::Relaxed);
         report.last_seq = next_seq - 1;
-        report.recovery_ms = started.elapsed().as_millis() as u64;
+        report.recovery_ms = nabedra_rt::time::now_std()
+            .duration_since(started)
+            .as_millis() as u64;
         let preparer = writer::spawn_preparer(shared.clone())?;
         let journal = Journal {
             shared: shared.clone(),

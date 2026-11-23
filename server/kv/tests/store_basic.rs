@@ -1,5 +1,6 @@
 //! Store-level basics: reopen, range tombstones across sources, the clean break (NS22),
 //! snapshots across flush and compaction (NS03), and ENOSPC (NS11).
+#![allow(clippy::disallowed_methods)] // integration tests are outside the phase 7 conversion, which covers kv/src
 
 mod common;
 

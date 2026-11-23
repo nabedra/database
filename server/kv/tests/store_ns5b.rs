@@ -1,6 +1,7 @@
 //! Store-level tests for the NS5b follow-ups: NS09 (EIO latches), write pacing under L0
 //! slowdown, immediate persistence of run-time quarantine, memory accounting, a journal
 //! behind the manifest, and damage found by `Run::open`.
+#![allow(clippy::disallowed_methods)] // integration tests are outside the phase 7 conversion, which covers kv/src
 
 mod common;
 

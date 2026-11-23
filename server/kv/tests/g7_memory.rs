@@ -5,6 +5,7 @@
 //!
 //! `cargo test -p nabedra-kv --test g7_memory -- --ignored --nocapture`, with `G7_DIR`
 //! naming a directory on a disk-backed filesystem.
+#![allow(clippy::disallowed_methods)] // integration tests are outside the phase 7 conversion, which covers kv/src
 
 use std::path::PathBuf;
 use std::sync::Arc;

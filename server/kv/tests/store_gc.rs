@@ -5,6 +5,7 @@
 //! sometimes truncate their tail (`delete_range`), as the pool's `typed_log` does. Group
 //! `g00` lags: it appends a few entries early and never purges, so it pins the oldest
 //! segments until journal GC relocates its values. A `BTreeMap` oracle checks every read.
+#![allow(clippy::disallowed_methods)] // integration tests are outside the phase 7 conversion, which covers kv/src
 
 mod common;
 

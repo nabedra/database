@@ -103,7 +103,7 @@ struct Config {
 }
 
 pub fn run(path: &Path, operation: Option<Uuid>, command: Command) -> io::Result<()> {
-    let id = operation.unwrap_or_else(Uuid::new_v4);
+    let id = operation.unwrap_or_else(nabedra_rt::ids::uuid_v4);
     let command = command.into_request()?;
     let config: Config = read_toml(path)?;
     if config.controllers.len() != 3 {

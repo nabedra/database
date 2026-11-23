@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
 
 use bytes::Bytes;
 
@@ -662,6 +661,7 @@ fn check_consistent(values: &[Option<Bytes>], completed: u64, ctx: &str) {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // short-lived test threads, joined before the test ends
 fn run_ns02(batches_per_writer: u64) {
     const WRITERS: u64 = 8;
     const READERS: usize = 16;
@@ -1384,7 +1384,7 @@ fn ns18_memtable_lookup_and_scan_bench() {
     const ROWS: u64 = 4096; // 262,144 keys
     let mem = Arc::new(Memtable::new(MemtableOptions::default(), None));
     let mut seq = 1;
-    let start = Instant::now();
+    let start = nabedra_rt::time::now_std();
     for g in 0..GROUPS {
         for chunk in (0..ROWS).collect::<Vec<_>>().chunks(16) {
             let mut batch = WriteBatch::new();
@@ -1404,7 +1404,7 @@ fn ns18_memtable_lookup_and_scan_bench() {
     let probe_keys: Vec<Vec<u8>> = (0..1024)
         .map(|_| group_key(rng.below(GROUPS), &rng.below(ROWS).to_be_bytes()))
         .collect();
-    let start = Instant::now();
+    let start = nabedra_rt::time::now_std();
     let mut hits = 0;
     for i in 0..lookups {
         if matches!(mem.get(&probe_keys[i % 1024], snapshot), Lookup::Found(..)) {
@@ -1425,7 +1425,7 @@ fn ns18_memtable_lookup_and_scan_bench() {
         }
     }
     let plain_probes: Vec<Vec<u8>> = probe_keys.iter().map(|k| seek_key(k, snapshot)).collect();
-    let start = Instant::now();
+    let start = nabedra_rt::time::now_std();
     let mut plain_hits = 0;
     for i in 0..lookups {
         let probe = &plain_probes[i % 1024];
@@ -1440,7 +1440,7 @@ fn ns18_memtable_lookup_and_scan_bench() {
     let resolver = Arc::new(FakeResolver::default());
     let mut scanned = 0u64;
     let scans = 20_000;
-    let start = Instant::now();
+    let start = nabedra_rt::time::now_std();
     for i in 0..scans {
         let g = i % GROUPS;
         let (lo, hi) = (group_key(g, b""), group_key(g + 1, b""));
@@ -1462,7 +1462,7 @@ fn ns18_memtable_lookup_and_scan_bench() {
     let scan_ns = scan_elapsed / (scans * 128) as f64;
     let seek_ns = scan_elapsed / scans as f64;
 
-    let start = Instant::now();
+    let start = nabedra_rt::time::now_std();
     let mut it = iter_over(
         &sources,
         snapshot,

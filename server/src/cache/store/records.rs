@@ -417,14 +417,14 @@ impl Records {
         time: Duration,
         mut visit: impl FnMut(&Bytes),
     ) {
-        let start = Instant::now();
+        let start = nabedra_rt::time::now_std();
         let mut stack = SmallVec::<[usize; 32]>::new();
         if !self.expiry.is_empty() {
             stack.push(0);
         }
         let mut found = 0;
         while let Some(index) = stack.pop() {
-            if found >= max_items || start.elapsed() >= time {
+            if found >= max_items || nabedra_rt::time::now_std().duration_since(start) >= time {
                 break;
             }
             if self.deadline(index) > now_ms {
@@ -479,7 +479,7 @@ impl Records {
         item_limit: usize,
         time: Duration,
     ) -> Result<PinnedSnapshot, StoreError> {
-        let start = Instant::now();
+        let start = nabedra_rt::time::now_std();
         let len = self.entries.len();
         let charge = self
             .body_bytes
@@ -494,7 +494,7 @@ impl Records {
             .try_reserve_exact(len)
             .map_err(|_| StoreError::OutOfMemory)?;
         for entry in &self.entries {
-            if start.elapsed() >= time {
+            if nabedra_rt::time::now_std().duration_since(start) >= time {
                 return Err(StoreError::SnapshotLimit);
             }
             effects.push(Effect::Upsert {

@@ -22,7 +22,9 @@ struct Directory(PathBuf);
 
 impl Directory {
     fn new() -> Self {
-        Self(std::env::temp_dir().join(format!("nabedra-cache-test-{}", Uuid::new_v4())))
+        Self(
+            std::env::temp_dir().join(format!("nabedra-cache-test-{}", nabedra_rt::ids::uuid_v4())),
+        )
     }
 }
 

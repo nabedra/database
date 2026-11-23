@@ -86,7 +86,7 @@ impl Log {
         work: impl FnOnce(&mut Wal) -> io::Result<()> + Send + 'static,
     ) -> io::Result<()> {
         let mut guard = Arc::clone(&self.0).lock_owned().await;
-        tokio::task::spawn_blocking(move || {
+        nabedra_rt::task::spawn_blocking(move || {
             guard.require_healthy()?;
             let result = work(&mut guard);
             guard.healthy = result.is_ok();
