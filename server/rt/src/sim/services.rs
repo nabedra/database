@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use super::{
     ROLE, Role, ServiceInfo, ServiceState, SimEvent, SplitMix64, StepOutcome, World, current_node,
-    lock, run_blocking, world,
+    lock, run_blocking, with_node_context, world,
 };
 use crate::task::{ServiceHandle, Step, Stepped};
 
@@ -316,11 +316,22 @@ async fn driver(world: Weak<World>, cell: Arc<Cell>) {
         let Some(strong) = world.upgrade() else {
             return;
         };
-        if let Some(pause) = jitter(&strong) {
+        if cell.finished() {
+            return;
+        }
+        let strong = if let Some(pause) = jitter(&strong) {
             drop(strong);
             crate::time::sleep(pause).await;
-            continue;
-        }
+            let Some(strong) = world.upgrade() else {
+                return;
+            };
+            if cell.finished() {
+                return;
+            }
+            strong
+        } else {
+            strong
+        };
         let seen = (cell.bell.generation(), node_bell.generation());
         let job_cell = Arc::clone(&cell);
         let job_world = Arc::clone(&strong);
@@ -405,8 +416,14 @@ impl Handle {
                 "reentrancy: joining service {} from inside its own step",
                 cell.name
             );
-            drive(&world, cell.node, "ServiceHandle::join", || {
-                cell.finished().then_some(())
+            assert!(
+                stepping_world().is_some_and(|current| Arc::ptr_eq(&current, &world)),
+                "a live stepped service must join on its simulation thread or blocking helper"
+            );
+            with_node_context(cell.node, || {
+                drive(&world, cell.node, "ServiceHandle::join", || {
+                    cell.finished().then_some(())
+                });
             });
         }
         match &mut *lock(&cell.status) {
@@ -427,7 +444,7 @@ impl Handle {
     pub(crate) fn is_current(&self) -> bool {
         match self {
             Handle::Thread(thread) => thread.thread().id() == std::thread::current().id(),
-            Handle::Stepped { cell, world } => world.upgrade().is_some_and(|world| {
+            Handle::Stepped { cell, .. } => stepping_world().is_some_and(|world| {
                 lock(&world.services.stack)
                     .last()
                     .is_some_and(|top| Arc::ptr_eq(top, cell))
@@ -487,7 +504,7 @@ thread_local! {
 }
 
 pub(crate) fn current_service() -> Option<String> {
-    if let Some(world) = world() {
+    if let Some(world) = stepping_world() {
         if let Some(top) = lock(&world.services.stack).last() {
             return Some(top.name.clone());
         }
@@ -530,22 +547,25 @@ where
     Ok(())
 }
 
-/// One pass over the node's live services in registration order. Returns whether any
-/// step did work or finished a service.
-fn pass(world: &World, node: Option<u64>, mut after_step: impl FnMut() -> bool) -> (bool, bool) {
+/// One pass over live services in registration order. A bell rung during the pass
+/// may have made an earlier service ready again, even if every step reported idle.
+fn pass(world: &World, node: Option<u64>, mut after_step: impl FnMut() -> bool) -> bool {
+    let bell = world.services.node_bell(node);
+    let seen = bell.generation();
     let mut progress = false;
     for cell in world.services.live(node) {
         match step_cell(world, &cell) {
-            Outcome::Stepped(Step::Worked | Step::Exit) | Outcome::Panicked => {
-                progress = true;
-                if after_step() {
-                    return (progress, true);
-                }
-            }
-            Outcome::Stepped(Step::Idle(_)) | Outcome::Busy | Outcome::Finished => {}
+            Outcome::Stepped(Step::Worked | Step::Exit) | Outcome::Panicked => progress = true,
+            Outcome::Stepped(Step::Idle(_)) => {}
+            Outcome::Busy | Outcome::Finished => continue,
+        }
+        // The async driver may be parked on the wake condition from its last step.
+        cell.bell.ring();
+        if after_step() {
+            break;
         }
     }
-    (progress, false)
+    progress || bell.generation() != seen
 }
 
 /// The earliest timed idle among the node's live services that are not mid-step.
@@ -574,7 +594,7 @@ fn drive<T>(
             return value;
         }
         let mut found = None;
-        let (progress, _) = pass(world, node, || {
+        let progress = pass(world, node, || {
             found = ready();
             found.is_some()
         });
@@ -613,7 +633,7 @@ pub(crate) fn drive_until<T>(site: &'static str, ready: impl FnMut() -> Option<T
 /// Steps the node's services until a full pass does no work, without moving time.
 pub(crate) fn settle(world: &World, node: Option<u64>) {
     for _ in 0..MAX_PASSES {
-        if !pass(world, node, || false).0 {
+        if !pass(world, node, || false) {
             return;
         }
     }
@@ -660,14 +680,14 @@ pub(crate) fn block_on_inline<F: Future>(
     let waker = Waker::from(Arc::clone(&flag));
     let mut cx = Context::from_waker(&waker);
     loop {
-        if flag.0.swap(false, Ordering::SeqCst) {
-            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
-                return value;
-            }
-            continue;
+        if flag.0.swap(false, Ordering::SeqCst)
+            && let Poll::Ready(value) = future.as_mut().poll(&mut cx)
+        {
+            return value;
         }
-        // Pending and not woken: only the node's services can wake it now.
-        let (progress, _) = pass(&world, node, || flag.0.load(Ordering::SeqCst));
+        // Give services a turn even if the future woke itself during the poll.
+        let was_woken = flag.0.load(Ordering::SeqCst);
+        let progress = pass(&world, node, || !was_woken && flag.0.load(Ordering::SeqCst));
         if !progress && !flag.0.load(Ordering::SeqCst) {
             panic!(
                 "block_on_inline at {caller}: the future needs virtual time or another task \
