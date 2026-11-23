@@ -1,5 +1,7 @@
 //! Worker roles, direct RESP routing and background synchronization.
 mod actor;
+#[cfg(all(test, feature = "sim"))]
+pub(in crate::cache::cluster) use actor::LeaseActorFixture;
 mod peer;
 mod sync;
 
