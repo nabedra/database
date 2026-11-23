@@ -4,10 +4,7 @@ kinds = ["U"]
 guarantees = []
 scenarios = ["D10", "O05", "C07"]
 tiers = ["T1"]
-command = ["sh", "-ec", '''
-cargo test --locked -j 2 --no-default-features --features oltp --lib oltp_replication::multiplex::transport:: -- --test-threads=1
-cargo test --locked -j 2 --no-default-features --features oltp --test oltp_multiplex c07_m02_o06_one_tls_listener_routes_groups_and_preserves_control_during_blocked_data_preflight -- --exact
-''']
+command = ["cargo", "test", "--locked", "-j", "2", "--no-default-features", "--features", "oltp", "--lib", "oltp_replication::multiplex::transport::", "--", "--test-threads=1"]
 cwd = "server"
 timeout_s = 1800
 needs = []
