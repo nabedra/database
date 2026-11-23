@@ -554,3 +554,68 @@ fn k03_stalled_move_resumes_source_under_a_new_epoch_only_after_fence() {
     assert_eq!(resumed.lease.unwrap().not_before_ms, 4_000);
     assert!(resumed.moving.is_none());
 }
+
+/// The existing controller fixture and placement decisions, without the Raft transport.
+#[cfg(feature = "sim")]
+pub(in crate::cache::cluster) struct LeaseControllerFixture {
+    state: State,
+    observed: Observations,
+}
+
+#[cfg(feature = "sim")]
+impl LeaseControllerFixture {
+    pub fn new() -> Self {
+        Self {
+            state: fixture(),
+            observed: Observations::default(),
+        }
+    }
+
+    pub fn topology(&self) -> &super::super::protocol::Topology {
+        &self.state.topology
+    }
+
+    pub fn renew(&mut self, worker: WorkerId, now: ClockBounds) -> super::super::protocol::Update {
+        use super::super::protocol::LEASE_MS;
+
+        let Some(Reply::Update(update)) = self.state.apply(
+            Command::Renew {
+                generation: self.state.topology.generation,
+                // The fixture asks for the complete topology as well as its grants.
+                revision: 0,
+                worker,
+                expires_ms: now.lower_ms.checked_add(LEASE_MS).unwrap(),
+            },
+            true,
+        ) else {
+            panic!("the controller refused the lease renewal for {worker:?}");
+        };
+        update
+    }
+
+    pub fn record(&mut self, worker: WorkerId, now: ClockBounds, progress: Progress) {
+        report(
+            &mut self.observed,
+            &self.state,
+            worker,
+            now.lower_ms,
+            Some(progress),
+        );
+    }
+
+    pub fn reconcile(&mut self, now: ClockBounds) {
+        let changes = self.observed.plan(&self.state, now);
+        if !changes.is_empty() {
+            let reply = self.state.apply(
+                Command::Reconcile {
+                    generation: self.state.topology.generation,
+                    revision: self.state.topology.revision,
+                    lower_ms: now.lower_ms,
+                    changes,
+                },
+                true,
+            );
+            assert!(matches!(reply, Some(Reply::Applied { .. })));
+        }
+    }
+}
