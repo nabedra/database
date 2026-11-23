@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod fault;
+#[cfg(unix)]
+pub mod os;
 mod real;
 
 pub use fault::*;
@@ -92,6 +94,14 @@ pub trait FsFile: Send + Sync {
 }
 
 /// The default production filesystem.
+///
+/// Under `sim`, inside a simulated node that has volumes (`sim::World::mount`), it is
+/// that node's filesystem: every call resolves the node's current volume for its path.
+/// Elsewhere it is [`RealFs`].
 pub fn real() -> Arc<dyn Fs> {
+    #[cfg(feature = "sim")]
+    if let Some(fs) = crate::sim::volumes::node_fs() {
+        return fs;
+    }
     Arc::new(RealFs)
 }

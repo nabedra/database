@@ -651,6 +651,8 @@ struct State {
     /// is one atomic operation (a rename unlinks and links together).
     pending: Vec<Vec<PendingEffect>>,
     locks: BTreeSet<Ino>,
+    #[cfg(all(unix, feature = "sim"))]
+    directory_locks: BTreeSet<Ino>,
     faults: Vec<Fault>,
     mutating_ops: u64,
     crash_after: Option<u64>,
@@ -1411,8 +1413,16 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-impl Fs for FaultFs {
-    fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Arc<dyn FsFile>> {
+impl FaultFs {
+    /// [`Fs::open`] returning the concrete handle, which can also [`FaultFile::stat`].
+    /// With [`OpenMode::CreateNew`], `create_mode` sets the new file's permission bits in
+    /// the same operation, as `open(O_CREAT, mode)` does (the default is `0o600`).
+    pub fn open_file(
+        &self,
+        path: &Path,
+        mode: OpenMode,
+        create_mode: Option<u32>,
+    ) -> io::Result<FaultFile> {
         let mut state = self.state();
         let mode_index = match mode {
             OpenMode::Read => 0,
@@ -1423,6 +1433,9 @@ impl Fs for FaultFs {
             state.admit(FsOp::Open, path, mode == OpenMode::CreateNew)?;
             let ino = match mode {
                 OpenMode::Read | OpenMode::ReadWrite => {
+                    if state.os.dirs.contains_key(path) {
+                        return Err(io::ErrorKind::IsADirectory.into());
+                    }
                     *state.os.files.get(path).ok_or_else(not_found)?
                 }
                 OpenMode::CreateNew => {
@@ -1431,6 +1444,9 @@ impl Fs for FaultFs {
                         return Err(io::ErrorKind::AlreadyExists.into());
                     }
                     let ino = state.new_inode();
+                    if let Some(bits) = create_mode {
+                        state.inodes.get_mut(&ino).expect("new inode").mode = bits & 0o7777;
+                    }
                     state.record(vec![Effect::File(path.to_path_buf(), Some(ino))]);
                     ino
                 }
@@ -1444,35 +1460,104 @@ impl Fs for FaultFs {
         })();
         state.log(FsOp::Open, path, None, 0, mode_index, result.is_ok());
         let ino = result?;
-        Ok(Arc::new(FaultFile {
+        Ok(FaultFile {
             state: Arc::clone(&self.state),
             ino,
             path: path.to_path_buf(),
             writable: mode != OpenMode::Read,
-        }))
+        })
+    }
+
+    /// `rename` that fails with `AlreadyExists` instead of replacing `to`
+    /// (`renameat2(RENAME_NOREPLACE)`).
+    pub fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let mut state = self.state();
+        let result = state.admit(FsOp::Rename, from, true).and_then(|()| {
+            if state.os.files.contains_key(to) || state.os.dirs.contains_key(to) {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            state.rename(from, to)
+        });
+        state.log(FsOp::Rename, from, Some(to), 0, 0, result.is_ok());
+        result
+    }
+
+    /// An exclusive lock on an existing file or directory, as `flock(LOCK_EX | LOCK_NB)`
+    /// on a descriptor of it: `WouldBlock` while another holder has it, `NotFound` if the
+    /// path does not exist. Unlike [`Fs::lock`] it never creates a file, and it is not a
+    /// mutating operation.
+    #[cfg(all(unix, feature = "sim"))]
+    pub(crate) fn lock_existing(&self, path: &Path) -> io::Result<FsLock> {
+        let mut state = self.state();
+        let result = (|| {
+            state.admit(FsOp::Lock, path, false)?;
+            if let Some(ino) = state.os.files.get(path).copied() {
+                if !state.locks.insert(ino) {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                Ok(FsLock::new(Box::new(FaultLockGuard {
+                    state: Arc::clone(&self.state),
+                    ino,
+                })))
+            } else if let Some(meta) = state.os.dirs.get(path).copied() {
+                if !state.directory_locks.insert(meta.ino) {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                Ok(FsLock::new(Box::new(DirectoryLockGuard {
+                    state: Arc::clone(&self.state),
+                    ino: meta.ino,
+                })))
+            } else {
+                Err(not_found())
+            }
+        })();
+        state.log(FsOp::Lock, path, None, 0, 0, result.is_ok());
+        result
+    }
+
+    /// Bytes held by every inode's OS layer (for a simulated `statvfs`).
+    pub fn used_bytes(&self) -> u64 {
+        let state = self.state();
+        state
+            .inodes
+            .values()
+            .map(|inode| inode.os.len() as u64)
+            .sum()
+    }
+}
+
+impl State {
+    /// `rename` of a file or directory (admitted already).
+    fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
+        if self.os.dirs.contains_key(from) && !is_root(from) {
+            return self.rename_dir(from, to);
+        }
+        let ino = *self.os.files.get(from).ok_or_else(not_found)?;
+        self.require_dir(&parent(to))?;
+        if self.os.dirs.contains_key(to) {
+            return Err(io::ErrorKind::IsADirectory.into());
+        }
+        if from != to {
+            self.record(vec![
+                Effect::File(from.to_path_buf(), None),
+                Effect::File(to.to_path_buf(), Some(ino)),
+            ]);
+            self.collect_garbage();
+        }
+        Ok(())
+    }
+}
+
+impl Fs for FaultFs {
+    fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Arc<dyn FsFile>> {
+        Ok(Arc::new(self.open_file(path, mode, None)?))
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let mut state = self.state();
-        let result = (|| {
-            state.admit(FsOp::Rename, from, true)?;
-            if state.os.dirs.contains_key(from) && !is_root(from) {
-                return state.rename_dir(from, to);
-            }
-            let ino = *state.os.files.get(from).ok_or_else(not_found)?;
-            state.require_dir(&parent(to))?;
-            if state.os.dirs.contains_key(to) {
-                return Err(io::ErrorKind::IsADirectory.into());
-            }
-            if from != to {
-                state.record(vec![
-                    Effect::File(from.to_path_buf(), None),
-                    Effect::File(to.to_path_buf(), Some(ino)),
-                ]);
-                state.collect_garbage();
-            }
-            Ok(())
-        })();
+        let result = state
+            .admit(FsOp::Rename, from, true)
+            .and_then(|()| state.rename(from, to));
         state.log(FsOp::Rename, from, Some(to), 0, 0, result.is_ok());
         result
     }
@@ -1599,8 +1684,21 @@ impl Drop for FaultLockGuard {
     }
 }
 
+#[cfg(all(unix, feature = "sim"))]
+struct DirectoryLockGuard {
+    state: Arc<Mutex<State>>,
+    ino: Ino,
+}
+
+#[cfg(all(unix, feature = "sim"))]
+impl Drop for DirectoryLockGuard {
+    fn drop(&mut self) {
+        lock(&self.state).directory_locks.remove(&self.ino);
+    }
+}
+
 /// An open file. It keeps its inode across renames and removals, as a descriptor does.
-struct FaultFile {
+pub struct FaultFile {
     state: Arc<Mutex<State>>,
     ino: Ino,
     /// The path it was opened as (used in the call log and for fault path filters).
@@ -1608,7 +1706,41 @@ struct FaultFile {
     writable: bool,
 }
 
+impl std::fmt::Debug for FaultFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FaultFile")
+            .field("path", &self.path)
+            .field("writable", &self.writable)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FaultFile {
+    /// The metadata of the open inode (`fstat`): it follows the file across renames and
+    /// after it is unlinked (`nlink` 0).
+    pub fn stat(&self) -> io::Result<FsStat> {
+        let mut state = lock(&self.state);
+        let result = state.admit(FsOp::Stat, &self.path, false).map(|()| {
+            let inode = &state.inodes[&self.ino];
+            let nlink = state.os.files.values().filter(|&&i| i == self.ino).count() as u64;
+            FsStat {
+                kind: FsKind::File,
+                len: inode.os.len() as u64,
+                dev: state.dev,
+                ino: state.ino_base + inode.number,
+                nlink,
+                mode: inode.mode,
+                uid: inode.uid,
+            }
+        });
+        state.log(FsOp::Stat, &self.path, None, 0, 0, result.is_ok());
+        result
+    }
+
+    /// Whether this handle may write.
+    pub fn is_writable(&self) -> bool {
+        self.writable
+    }
     /// Runs one call: crash and fault checks, then `body`, then the log entry.
     fn call<T>(
         &self,
