@@ -1,0 +1,44 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p8c-hooks-b58a313-230604--cache-store-model.log",
+      "sha256": "49afa0738f7b97d8605c153d6bdca9e9b99d23ee2fcfce9238e7222294c33347"
+    }
+  ],
+  "assertions": {
+    "executed": 6,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-store-model",
+  "duration_s": 41.427,
+  "guarantees": [
+    "CACHE-G02",
+    "CACHE-G03"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T23:33:26.976748+00:00",
+    "request_id": "land-p8c-hooks-b58a313-230604",
+    "runner": "GitHub Actions 1000008661",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45285784002"
+  },
+  "scenarios": [
+    "K01",
+    "K02"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "b58a3130fac9a39e62ad9003514c6f816c5f7abc",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
