@@ -279,6 +279,17 @@ impl ByteArena {
             let next = allocation.next.checked_add(1).ok_or_else(capacity)?;
             allocation.pending.try_reserve(1).map_err(|_| capacity())?;
             allocation.next = next;
+            // With no queued waiter to age or bypass, this request can take
+            // the same first-fit grant while it already holds the lock.
+            if allocation.pending.is_empty()
+                && bytes <= self.capacity - self.used.load(Ordering::Acquire)
+                && !self.closed.load(Ordering::Acquire)
+            {
+                self.used.fetch_add(bytes, Ordering::AcqRel);
+                drop(allocation);
+                self.settled.notify_waiters();
+                return Ok(self.reservation(bytes, owner));
+            }
             allocation.pending.push_back(ArenaWaiter {
                 ticket: next,
                 bytes,
