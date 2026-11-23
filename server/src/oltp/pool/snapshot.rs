@@ -1113,17 +1113,17 @@ fn read_generation(pool: &OltpPool, id: Uuid, tag: u8) -> Result<u64, ProtocolEr
     ))
 }
 fn new_snapshot_path(group: &GroupStore) -> Result<PathBuf, ProtocolError> {
-    let directory = group
-        .pool()
-        .inner
-        .path
-        .join("snapshots")
-        .join(group.identity().group_id.to_string());
+    let root = &group.pool().inner.path;
+    let snapshots = root.join("snapshots");
+    let directory = snapshots.join(group.identity().group_id.to_string());
     fs::create_dir_all(&directory).map_err(|_| storage_error_message())?;
     let metadata = fs::symlink_metadata(&directory).map_err(|_| storage_error_message())?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(storage_error_message());
     }
+    // Activation can only name the file once the path to its directory is durable.
+    sync_directory(&snapshots)?;
+    sync_directory(root)?;
     Ok(directory.join(format!("snap-{}.bin", nabedra_rt::ids::uuid_v4())))
 }
 /// SNAP1: a create_new name under `snapshots/<group>/outgoing/`, each level a
