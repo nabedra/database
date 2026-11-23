@@ -314,6 +314,12 @@ impl ReceivedReply {
         self.scratch.clone()
     }
 
+    /// Bytes covered by the reply's current decode reservation.
+    #[inline]
+    pub fn decode_reserved_bytes(&self) -> usize {
+        self.scratch.bytes()
+    }
+
     /// Metadata readers use the worker's independent bounded reply decoder,
     /// never the query working budget or an arena holding their raw frames.
     pub async fn reserve_reply_decode(
