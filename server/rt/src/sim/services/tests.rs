@@ -702,6 +702,93 @@ impl Stepped for Named {
     fn run(self) {}
 }
 
+/// Exercises both service entry points from the task-local context of an aborted future.
+struct RetiredTask {
+    attempted: Arc<Mutex<Option<(bool, bool)>>>,
+    steps: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Drop for RetiredTask {
+    fn drop(&mut self) {
+        let service = Named {
+            name: "retired",
+            left: 1,
+            log: Arc::clone(&self.steps),
+            bell: Condvar::new(),
+        };
+        let registered = task::spawn_stepped("retired", 64 * 1024, service)
+            .is_ok_and(|handle| !handle.is_finished());
+        let drove = std::panic::catch_unwind(|| {
+            task::drive_until("retired task", || {
+                self.steps.lock().unwrap().contains(&"fresh").then_some(())
+            });
+        })
+        .is_ok();
+        *self.attempted.lock().unwrap() = Some((registered, drove));
+    }
+}
+
+#[test]
+fn a_cancelled_incarnation_cannot_register_or_drive_restarted_services() {
+    run(23, |world| async move {
+        world.add_node(1, NodeClock::default());
+        let attempted = Arc::new(Mutex::new(None));
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let guard = RetiredTask {
+            attempted: Arc::clone(&attempted),
+            steps: Arc::clone(&steps),
+        };
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let dying = world.spawn_node(1, async move {
+            let _guard = guard;
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(ms(1_000), ready)
+            .await
+            .unwrap()
+            .unwrap();
+
+        world.restart_with(1, crate::sim::volumes::Cut::Kill);
+        // Keep the fresh async driver parked while Tokio drops the aborted task.
+        world.freeze(1);
+        let fresh = spawn_in(
+            1,
+            "fresh",
+            Named {
+                name: "fresh",
+                left: 1,
+                log: Arc::clone(&steps),
+                bell: Condvar::new(),
+            },
+        );
+        assert!(
+            tokio::time::timeout(ms(1_000), dying)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert_eq!(
+            *attempted.lock().unwrap(),
+            Some((false, false)),
+            "retired task registered or drove a live service"
+        );
+        assert!(steps.lock().unwrap().is_empty());
+        assert_eq!(
+            world.stepped_services(1),
+            vec![ServiceInfo {
+                name: "fresh".to_owned(),
+                state: ServiceState::Ready,
+            }]
+        );
+
+        world.thaw(1);
+        in_node(1, async { fresh.join().unwrap() }).await;
+        assert_eq!(*steps.lock().unwrap(), ["fresh"]);
+    });
+}
+
 /// P3: an inline drive steps services in registration order, never in hash order.
 #[test]
 fn drive_steps_services_in_registration_order() {
