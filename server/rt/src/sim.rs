@@ -68,7 +68,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use tokio::runtime::{Handle, Id, RuntimeFlavor};
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -365,19 +365,19 @@ impl World {
     {
         self.assert_runtime(target);
         let handle = target.spawn(NODE.scope(node, future));
-        self.register(node, &handle);
+        self.register(node, handle.abort_handle());
         handle
     }
 
-    fn register<T>(&self, node: u64, handle: &JoinHandle<T>) {
+    fn register(&self, node: u64, handle: AbortHandle) {
         let mut state = self.lock();
         match state.nodes.get_mut(&node) {
             Some(entry) => {
                 entry.tasks.retain(|task| !task.is_finished());
-                entry.tasks.push(handle.abort_handle());
                 if !entry.up {
                     handle.abort();
                 }
+                entry.tasks.push(handle);
             }
             None => handle.abort(),
         }
@@ -678,6 +678,40 @@ where
             Err(panic) => std::panic::resume_unwind(panic),
         }
     })
+}
+
+pub(crate) fn spawn_blocking_on<F, R>(handle: &Handle, f: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let Some(world) = world() else {
+        return handle.spawn_blocking(f);
+    };
+    world.assert_runtime(handle);
+    let outcome = run_blocking(world, f);
+    spawn_on(handle, async move {
+        match outcome {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+pub(crate) fn spawn_in<T, F>(set: &mut JoinSet<T>, future: F) -> AbortHandle
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    match (current_node(), world()) {
+        (Some(node), Some(world)) => {
+            world.assert_runtime(&Handle::current());
+            let task = set.spawn(NODE.scope(node, future));
+            world.register(node, task.clone());
+            task
+        }
+        _ => set.spawn(future),
+    }
 }
 
 /// Runs `work` on this thread's blocking helper and waits for it. Only one job runs at a

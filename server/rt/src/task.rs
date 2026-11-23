@@ -67,6 +67,48 @@ where
     }
 }
 
+/// [`tokio::runtime::Handle::spawn_blocking`]: blocking work on the given runtime's
+/// blocking pool, for code that holds a handle rather than running inside the runtime.
+/// Under `sim` it runs inline like [`spawn_blocking`]; the handle must belong to the
+/// world's runtime while a simulated world is installed.
+#[inline]
+#[track_caller]
+pub fn spawn_blocking_on<F, R>(handle: &tokio::runtime::Handle, f: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    #[cfg(feature = "sim")]
+    {
+        crate::sim::spawn_blocking_on(handle, f)
+    }
+    #[cfg(not(feature = "sim"))]
+    {
+        handle.spawn_blocking(f)
+    }
+}
+
+/// [`JoinSet::spawn`]: spawns `future` into `set` on the current runtime. Under `sim` the
+/// task inherits the current node context and joins that node's task registry, as with
+/// [`spawn`], so a task such as a Cache session handler reads its node's clock and a
+/// simulated crash aborts it.
+#[inline]
+#[track_caller]
+pub fn spawn_in<T, F>(set: &mut JoinSet<T>, future: F) -> tokio::task::AbortHandle
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    #[cfg(feature = "sim")]
+    {
+        crate::sim::spawn_in(set, future)
+    }
+    #[cfg(not(feature = "sim"))]
+    {
+        set.spawn(future)
+    }
+}
+
 /// A long-lived named OS thread (journal, flush, compaction, worker loops).
 ///
 /// Product: `std::thread::Builder::new().name(name).spawn(f)`.
