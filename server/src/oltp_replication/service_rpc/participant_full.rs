@@ -1483,7 +1483,7 @@ impl RemoteParticipant for ParticipantClient {
                     OwnedCommand::decode_with_owner(
                         response.reply.sections[0].as_ref().ok_or_else(invalid)?,
                         response.reply.scratch_lease(),
-                        response.reply.scratch.bytes(),
+                        response.reply.decode_reserved_bytes(),
                     )
                 })
                 .await
@@ -1623,7 +1623,7 @@ impl RemoteParticipant for ParticipantClient {
                             OwnedCommand::decode_with_owner(
                                 response.reply.sections[0].as_ref().ok_or_else(invalid)?,
                                 response.reply.scratch_lease(),
-                                response.reply.scratch.bytes(),
+                                response.reply.decode_reserved_bytes(),
                             )
                         })
                         .await?;
@@ -1664,7 +1664,7 @@ impl RemoteParticipant for ParticipantClient {
                     OwnedCommand::decode_with_owner(
                         response.reply.sections[0].as_ref().ok_or_else(invalid)?,
                         response.reply.scratch_lease(),
-                        response.reply.scratch.bytes(),
+                        response.reply.decode_reserved_bytes(),
                     )
                 })
                 .await
@@ -1696,7 +1696,7 @@ impl RemoteParticipant for ParticipantClient {
                     OwnedCommand::decode_with_owner(
                         response.reply.sections[0].as_ref().ok_or_else(invalid)?,
                         response.reply.scratch_lease(),
-                        response.reply.scratch.bytes(),
+                        response.reply.decode_reserved_bytes(),
                     )
                 })
                 .await
@@ -1733,7 +1733,7 @@ impl RemoteParticipant for ParticipantClient {
                     let page: OwnedCommand<ArchiveEffects> = OwnedCommand::decode_with_owner(
                         response.reply.sections[0].as_ref().ok_or_else(invalid)?,
                         response.reply.scratch_lease(),
-                        response.reply.scratch.bytes(),
+                        response.reply.decode_reserved_bytes(),
                     )?;
                     let value = page.payload()?;
                     if value.group != group
