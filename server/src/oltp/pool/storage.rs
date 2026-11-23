@@ -8,6 +8,7 @@ use bytes::Bytes;
 use nabedra_kv::{
     Background, BlockCache, Commit, MemtableBudget, Options, Seq, StoreStats, fs::Fs,
 };
+use nabedra_rt::fs::os as fs;
 use serde::Serialize;
 use std::{
     future::Future,
@@ -302,6 +303,18 @@ pub(super) fn commit_error(error: nabedra_kv::Error) -> (bool, ProtocolError) {
 /// loop never yields, so that waker would never fire and the thread would park
 /// forever.
 pub(super) fn wait_commit(commit: Commit) -> nabedra_kv::Result<Seq> {
+    // A stepped journal must be driven inline. Until KV's sim feature is
+    // enabled, the journal still runs on its own thread.
+    #[cfg(feature = "sim")]
+    if let (Some(world), Some(node)) = (nabedra_rt::sim::world(), nabedra_rt::sim::current_node())
+        && world
+            .stepped_services(node)
+            .iter()
+            .any(|service| service.name == "kv-journal")
+    {
+        return commit.wait();
+    }
+
     struct Unpark(Thread);
     impl Wake for Unpark {
         fn wake(self: Arc<Self>) {
@@ -371,7 +384,7 @@ impl RawIter {
 /// directory. A pool directory without a format-2 manifest that holds any of them
 /// is refused as an unsupported store format, before anything is touched.
 pub(super) fn legacy_store_marker(path: &Path) -> Option<String> {
-    let entries = std::fs::read_dir(path).ok()?;
+    let entries = fs::read_dir(path).ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();

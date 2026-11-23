@@ -10,7 +10,7 @@ use crate::{
 use crate::oltp_replication::authority::control::EksReplacementPermit;
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
-use std::fs::File;
+use nabedra_rt::fs::os::{File, OpenOptions, self as fs};
 use std::path::{Path, PathBuf};
 mod closed;
 #[cfg(target_os = "linux")]
@@ -256,14 +256,7 @@ fn docker_volume_name(value: &str) -> Option<&str> {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use std::{
-        fs::{self, OpenOptions},
-        io::{BufRead, BufReader, Read, Write},
-        os::{
-            fd::AsRawFd,
-            unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
-        },
-    };
+    use std::io::{BufRead, BufReader, Read, Write};
     const MANIFEST: &str = ".nabedra-volume-v1.json";
     const LIMIT: usize = 16 << 10;
     pub(super) fn data_worker_key(
@@ -275,7 +268,7 @@ mod linux {
     fn read_data_worker_key(
         mount: &VerifiedPoolMount,
     ) -> Result<crate::oltp_replication::authority::control::RestartMountKey, ProtocolError> {
-        let path = PathBuf::from(format!("/proc/self/fd/{}", mount.directory.as_raw_fd()))
+        let path = mount.directory.fd_path()
             .join(".nabedra-data-worker-key");
         let mut file = OpenOptions::new()
             .read(true)
@@ -286,9 +279,9 @@ mod linux {
         if !metadata.is_file()
             || metadata.nlink() != 1
             || metadata.len() != 32
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != fs::euid()
             || metadata.mode() & 0o077 != 0
-            || mount_id(&file)? != mount.observation.mount_id
+            || mount_id(&file, &mount.observation.expected.mount_path)? != mount.observation.mount_id
         {
             return Err(invalid());
         }
@@ -316,7 +309,7 @@ mod linux {
     ) -> Result<Option<WorkerIdentity>, ProtocolError> {
         revalidate(&anchor.directory, &anchor.observation)?;
         let path =
-            PathBuf::from(format!("/proc/self/fd/{}", anchor.directory.as_raw_fd())).join(MANIFEST);
+            anchor.directory.fd_path().join(MANIFEST);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -340,11 +333,16 @@ mod linux {
             .open(path)
             .map_err(|_| invalid())
     }
-    fn mount_id(file: &File) -> Result<u64, ProtocolError> {
-        let bytes = bounded(
-            Path::new(&format!("/proc/self/fdinfo/{}", file.as_raw_fd())),
-            4096,
-        )?;
+    fn mount_id(file: &File, _mount_path: &Path) -> Result<u64, ProtocolError> {
+        let descriptor = file.fd_path();
+        #[cfg(feature = "sim")]
+        if nabedra_rt::sim::volume_for(_mount_path).is_some() {
+            let resolved = fs::canonicalize(&descriptor).map_err(|_| invalid())?;
+            let volume = nabedra_rt::sim::volume_for(&resolved).ok_or_else(invalid)?;
+            return Ok(volume.mount_id);
+        }
+        let fd = descriptor.file_name().ok_or_else(invalid)?;
+        let bytes = bounded(&Path::new("/proc/self/fdinfo").join(fd), 4096)?;
         std::str::from_utf8(&bytes)
             .map_err(|_| invalid())?
             .lines()
@@ -355,12 +353,10 @@ mod linux {
             .ok_or_else(invalid)
     }
     pub(super) fn pool_path(mount: &VerifiedPoolMount) -> Result<PathBuf, ProtocolError> {
-        let path = PathBuf::from(format!(
-            "/proc/self/fd/{}/pool",
-            mount.directory.as_raw_fd()
-        ));
+        let path = mount.directory.fd_path().join("pool");
         match fs::symlink_metadata(&path) {
-            Ok(_) if mount_id(&directory(&path)?)? == mount.observation.mount_id => {}
+            Ok(_) if mount_id(&directory(&path)?, &mount.observation.expected.mount_path)?
+                == mount.observation.mount_id => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             _ => return Err(invalid()),
         }
@@ -370,7 +366,17 @@ mod linux {
         file: &File,
         expected: &PoolMountExpectation,
     ) -> Result<(u64, u32, u32), ProtocolError> {
-        let id = mount_id(file)?;
+        #[cfg(feature = "sim")]
+        if let Some(volume) = nabedra_rt::sim::volume_for(&expected.mount_path) {
+            if volume.mount_path != expected.mount_path
+                || file.metadata().map_err(|_| invalid())?.dev() != volume.dev
+                || mount_id(file, &expected.mount_path)? != volume.mount_id
+            {
+                return Err(invalid());
+            }
+            return Ok((volume.mount_id, volume.major, volume.minor));
+        }
+        let id = mount_id(file, &expected.mount_path)?;
         let line = mount_line(id)?;
         let mut fields = line.split_ascii_whitespace();
         let _id = fields.next().ok_or_else(invalid)?;
@@ -463,6 +469,15 @@ mod linux {
             }
             return Ok(());
         }
+        #[cfg(feature = "sim")]
+        if let Some(volume) = nabedra_rt::sim::volume_for(&expected.mount_path) {
+            if uuid::Uuid::parse_str(&expected.filesystem_uuid).ok() != Some(volume.filesystem_uuid)
+                || (major, minor) != (volume.major, volume.minor)
+            {
+                return Err(invalid());
+            }
+            return Ok(());
+        }
         let block = fs::metadata(Path::new("/dev/disk/by-uuid").join(&expected.filesystem_uuid))
             .map_err(|_| invalid())?;
         if !block.file_type().is_block_device()
@@ -474,7 +489,7 @@ mod linux {
         let mut sys =
             fs::canonicalize(format!("/sys/dev/block/{major}:{minor}")).map_err(|_| invalid())?;
         // A filesystem may occupy a partition of its EBS namespace.
-        if sys.join("partition").exists() {
+        if fs::try_exists(sys.join("partition")).unwrap_or(false) {
             sys = sys.parent().ok_or_else(invalid)?.to_owned();
         }
         let controller = fs::canonicalize(sys.join("device")).map_err(|_| invalid())?;
@@ -504,11 +519,7 @@ mod linux {
         let directory = directory(&expected.mount_path)?;
         let (mount_id, device_major, device_minor) = observed_mount(&directory, &expected)?;
         device(&expected, device_major, device_minor)?;
-        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        if unsafe { libc::fstatvfs(directory.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
-            return Err(invalid());
-        }
-        let stats = unsafe { stats.assume_init() };
+        let stats = directory.statvfs().map_err(|_| invalid())?;
         let observation = MountedPoolObservation {
             expected,
             mount_id,
@@ -516,12 +527,12 @@ mod linux {
             device_minor,
             root_inode: directory.metadata().map_err(|_| invalid())?.ino(),
             total_bytes: stats
-                .f_blocks
-                .checked_mul(stats.f_frsize)
+                .blocks
+                .checked_mul(stats.block_size)
                 .ok_or_else(invalid)?,
             available_bytes: stats
-                .f_bavail
-                .checked_mul(stats.f_frsize)
+                .available
+                .checked_mul(stats.block_size)
                 .ok_or_else(invalid)?,
         };
         revalidate(&directory, &observation)?;
@@ -540,7 +551,7 @@ mod linux {
         } = anchor;
         revalidate(&directory, &observation)?;
         let expected = &observation.expected;
-        let base = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        let base = directory.fd_path();
         let lock = lock_mount(&base, true)?;
         super::closed::reject_closed(&directory)?;
         let path = base.join(MANIFEST);
@@ -571,9 +582,7 @@ mod linux {
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if !base
-                    .join("pool")
-                    .symlink_metadata()
+                if !fs::symlink_metadata(base.join("pool"))
                     .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
                 {
                     return Err(invalid());
@@ -597,8 +606,7 @@ mod linux {
     pub(super) struct VolumeLock(File);
     impl Drop for VolumeLock {
         fn drop(&mut self) {
-            // SAFETY: flock on a valid, owned descriptor.
-            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+            self.0.unlock();
         }
     }
     impl std::ops::Deref for VolumeLock {
@@ -621,9 +629,9 @@ mod linux {
         let metadata = lock.metadata().map_err(|_| invalid())?;
         if !metadata.is_file()
             || metadata.nlink() != 1
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != fs::euid()
             || metadata.mode() & 0o077 != 0
-            || unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
+            || !lock.try_lock_exclusive().map_err(|_| invalid())?
         {
             return Err(invalid());
         }
@@ -650,7 +658,7 @@ mod linux {
         if observation.root_inode != permit.previous_root_inode {
             return Err(invalid());
         }
-        let base = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        let base = directory.fd_path();
         let lock = lock_mount(&base, false)?;
         let mount = VerifiedPoolMount { observation, directory, _lock: VolumeLock(lock) };
         revalidate(&mount.directory, &mount.observation)?;
@@ -750,7 +758,7 @@ mod linux {
             )?,
             None => super::closed::reject_closed(&mount.directory)?,
         }
-        let root = PathBuf::from(format!("/proc/self/fd/{}", mount.directory.as_raw_fd()));
+        let root = mount.directory.fd_path();
         let manifest_path = root.join(MANIFEST);
         let metadata = fs::symlink_metadata(&manifest_path).map_err(|_| invalid())?;
         if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.nlink() != 1 {
@@ -772,19 +780,15 @@ mod linux {
         {
             return Err(invalid());
         }
-        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        if unsafe { libc::fstatvfs(mount.directory.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
-            return Err(invalid());
-        }
-        let stats = unsafe { stats.assume_init() };
+        let stats = mount.directory.statvfs().map_err(|_| invalid())?;
         let mut observation = mount.observation.clone();
         observation.total_bytes = stats
-            .f_blocks
-            .checked_mul(stats.f_frsize)
+            .blocks
+            .checked_mul(stats.block_size)
             .ok_or_else(invalid)?;
         observation.available_bytes = stats
-            .f_bavail
-            .checked_mul(stats.f_frsize)
+            .available
+            .checked_mul(stats.block_size)
             .ok_or_else(invalid)?;
         Ok(observation)
     }

@@ -978,6 +978,7 @@ async fn ns10_o21_two_pools_beyond_memory_budget_stay_inside_their_charges() {
 /// O05: `nabedra-kv` threads. Run in a child process so other tests' threads
 /// do not count: each worker starts `kv-flush` x1 and `kv-compact` x(n-1), and
 /// each open pool `kv-journal` and `kv-journal-prep`, which stop when the pool closes.
+#[cfg(not(feature = "sim"))]
 #[test]
 fn o05_kv_threads_are_per_worker_plus_two_journal_threads_per_open_pool() {
     const FLAG: &str = "NABEDRA_NS6_THREAD_PROBE";

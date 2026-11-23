@@ -775,13 +775,6 @@ impl GroupStore {
         if !metadata.is_file() || metadata.len() != source.bytes {
             return Err(storage_error_message());
         }
-        let mut source_file = source
-            .file
-            .try_clone()
-            .map_err(|_| storage_error_message())?;
-        source_file
-            .seek(SeekFrom::Start(0))
-            .map_err(|_| storage_error_message())?;
         let path = new_snapshot_path(self)?;
         let mut retained = false;
         let mut stage = None;
@@ -797,15 +790,12 @@ impl GroupStore {
                 return Err(capacity());
             }
             let mut copy = scratch.buffer(copy_len)?;
-            let mut remaining = source.bytes;
-            while remaining > 0 {
-                let chunk = (remaining.min(copy_len as u64)) as usize;
-                source_file
-                    .read_exact(&mut copy.as_mut_slice()[..chunk])
-                    .map_err(|_| storage_error_message())?;
-                file.write_all(&copy.as_mut_slice()[..chunk])
-                    .map_err(file_error)?;
-                remaining -= chunk as u64;
+            let mut offset = 0;
+            while offset < source.bytes {
+                let chunk = ((source.bytes - offset).min(copy_len as u64)) as usize;
+                let buffer = &mut copy.as_mut_slice()[..chunk];
+                read_exact_at(&source.file, source.bytes, &mut offset, buffer)?;
+                file.write_all(buffer).map_err(file_error)?;
             }
             drop(copy);
             if file.metadata().map_err(|_| storage_error_message())?.len() != source.bytes {
@@ -1071,7 +1061,7 @@ impl GroupStore {
         fs::rename(temporary, path).unwrap();
         if phase == "staged" && mode == "pause" {
             let deadline = nabedra_rt::time::now_std() + std::time::Duration::from_secs(120);
-            while control.is_file() {
+            while fs::metadata(&control).is_ok_and(|meta| meta.is_file()) {
                 assert!(
                     nabedra_rt::time::now_std() < deadline,
                     "snapshot install watchdog expired"
@@ -1171,9 +1161,7 @@ fn read_hashed(file: &mut File, hash: &mut Sha256, bytes: &mut [u8]) -> Result<(
     Ok(())
 }
 fn sync_directory(path: &Path) -> Result<(), ProtocolError> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|_| storage_error_message())
+    fs::sync_dir(path).map_err(|_| storage_error_message())
 }
 fn clear_stage(pool: &OltpPool, id: Uuid, generation: u64) -> Result<(), ProtocolError> {
     if read_generation(pool, id, b'a')? == generation {
@@ -1210,7 +1198,7 @@ pub(super) fn recover_group(
         .join("snapshots")
         .join(identity.group_id.to_string())
         .join("incoming");
-    if incoming.exists() {
+    if fs::try_exists(&incoming).unwrap_or(false) {
         let metadata = fs::symlink_metadata(&incoming).map_err(|_| storage_error_message())?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(storage_error_message());
@@ -1290,7 +1278,7 @@ pub(super) fn retire_group_files(root: &Path, id: Uuid) -> Result<(), ProtocolEr
 fn cleanup_files(root: &Path, id: Uuid, keep: Option<&str>) -> Result<(), ProtocolError> {
     let directory = root.join("snapshots").join(id.to_string());
     if let Some(name) = keep
-        && (!valid_snapshot_name(name) || !directory.join(name).is_file())
+        && (!valid_snapshot_name(name) || !fs::metadata(directory.join(name)).is_ok_and(|meta| meta.is_file()))
     {
         return Err(recovery_unknown());
     }
@@ -1323,7 +1311,7 @@ fn read_exact_at(
     file: &File,
     total: u64,
     offset: &mut u64,
-    mut target: &mut [u8],
+    target: &mut [u8],
 ) -> Result<(), ProtocolError> {
     if offset
         .checked_add(target.len() as u64)
@@ -1331,27 +1319,8 @@ fn read_exact_at(
     {
         return Err(storage_error_message());
     }
-    while !target.is_empty() {
-        #[cfg(unix)]
-        let count = {
-            use std::os::unix::fs::FileExt;
-            file.read_at(target, *offset)
-        };
-        #[cfg(windows)]
-        let count = {
-            use std::os::windows::fs::FileExt;
-            file.seek_read(target, *offset)
-        };
-        #[cfg(not(any(unix, windows)))]
-        let count: std::io::Result<usize> = Err(std::io::Error::other(
-            "positional snapshot reads unsupported",
-        ));
-        let count = count.map_err(|_| storage_error_message())?;
-        if count == 0 {
-            return Err(storage_error_message());
-        }
-        *offset += count as u64;
-        target = &mut target[count..];
-    }
+    file.read_exact_at(target, *offset)
+        .map_err(|_| storage_error_message())?;
+    *offset += target.len() as u64;
     Ok(())
 }

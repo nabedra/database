@@ -11,9 +11,8 @@ struct ClosedGeneration {
 }
 #[cfg(target_os = "linux")]
 pub(super) fn reject_closed(directory: &File) -> Result<(), ProtocolError> {
-    use std::os::fd::AsRawFd;
-    let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(CLOSED);
-    match std::fs::symlink_metadata(path) {
+    let path = directory.fd_path().join(CLOSED);
+    match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         _ => Err(invalid()),
     }
@@ -32,8 +31,7 @@ fn load_marker(
     expected: &PoolMountExpectation,
     close_id: uuid::Uuid,
 ) -> Result<bool, ProtocolError> {
-    use std::os::fd::AsRawFd;
-    let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(CLOSED);
+    let path = directory.fd_path().join(CLOSED);
     read_marker(&path, expected, close_id)
 }
 #[cfg(target_os = "linux")]
@@ -42,8 +40,8 @@ pub(super) fn read_marker(
     expected: &PoolMountExpectation,
     close_id: uuid::Uuid,
 ) -> Result<bool, ProtocolError> {
-    use std::{io::Read, os::unix::fs::{MetadataExt, OpenOptionsExt}};
-    match std::fs::symlink_metadata(&path) {
+    use std::io::Read;
+    match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Ok(metadata)
             if metadata.is_file()
@@ -51,7 +49,7 @@ pub(super) fn read_marker(
                 && metadata.nlink() == 1 =>
         {
             let mut bytes = Vec::new();
-            std::fs::OpenOptions::new().read(true)
+            fs::OpenOptions::new().read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(path)
                 .map_err(|_| invalid())?
@@ -83,15 +81,8 @@ impl VerifiedPoolMount {
         }
         #[cfg(target_os = "linux")]
         {
-            use std::{
-                fs::{self, OpenOptions},
-                os::{
-                    fd::AsRawFd,
-                    unix::{ffi::OsStrExt, fs::OpenOptionsExt},
-                },
-            };
             super::linux::revalidate(&self.directory, &self.observation)?;
-            let root = PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()));
+            let root = self.directory.fd_path();
             let final_path = root.join(CLOSED);
             let marker = ClosedGeneration {
                 format_version: 1,
@@ -112,22 +103,7 @@ impl VerifiedPoolMount {
                     .map_err(|_| invalid())?;
                 serde_json::to_writer(&file, &marker).map_err(|_| invalid())?;
                 file.sync_all().map_err(|_| invalid())?;
-                let from = std::ffi::CString::new(temporary.as_os_str().as_bytes())
-                    .map_err(|_| invalid())?;
-                let to = std::ffi::CString::new(final_path.as_os_str().as_bytes())
-                    .map_err(|_| invalid())?;
-                if unsafe {
-                    libc::renameat2(
-                        libc::AT_FDCWD,
-                        from.as_ptr(),
-                        libc::AT_FDCWD,
-                        to.as_ptr(),
-                        libc::RENAME_NOREPLACE,
-                    )
-                } != 0
-                {
-                    return Err(invalid());
-                }
+                fs::rename_noreplace(&temporary, &final_path).map_err(|_| invalid())?;
                 self.directory.sync_all().map_err(|_| invalid())
             })();
             let _ = fs::remove_file(&temporary);
@@ -145,20 +121,13 @@ pub(in crate::oltp::pool) fn prove_closed(
     expected: &crate::oltp_replication::authority::control::DrainMount,
     id: uuid::Uuid,
 ) -> Result<MountedPoolObservation, ProtocolError> {
-    use std::{
-        fs::OpenOptions,
-        os::{
-            fd::AsRawFd,
-            unix::fs::{MetadataExt, OpenOptionsExt},
-        },
-    };
     expected.expected.validate()?;
     let anchor = super::linux::inspect_for_close(expected.expected.clone())?;
     let mount = &anchor.observation;
     if crate::oltp_replication::authority::control::DrainMount::from(mount.clone()) != *expected {
         return Err(invalid());
     }
-    let path = PathBuf::from(format!("/proc/self/fd/{}", anchor.directory.as_raw_fd()));
+    let path = anchor.directory.fd_path();
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -168,9 +137,9 @@ pub(in crate::oltp::pool) fn prove_closed(
     let metadata = lock.metadata().map_err(|_| invalid())?;
     if !metadata.is_file()
         || metadata.nlink() != 1
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != fs::euid()
         || metadata.mode() & 0o077 != 0
-        || unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
+        || !lock.try_lock_exclusive().map_err(|_| invalid())?
     {
         return Err(invalid());
     }
