@@ -21,8 +21,9 @@ const OTHER_NODE: u64 = 3;
 fn fixture_certificates() -> &'static [TlsMaterial] {
     static CERTIFICATES: std::sync::OnceLock<Vec<TlsMaterial>> = std::sync::OnceLock::new();
     CERTIFICATES.get_or_init(|| {
-        let temp =
-            TestDirectoryPath(std::env::temp_dir().join(format!("sessions-{}", Uuid::new_v4())));
+        let temp = TestDirectoryPath(
+            std::env::temp_dir().join(format!("sessions-{}", nabedra_rt::ids::uuid_v4())),
+        );
         std::fs::create_dir(&temp.0).unwrap();
         tls::certificates(&temp.0, 3)
     })
@@ -2020,7 +2021,7 @@ macro_rules! parity_cases {
             $(
                 #[test]
                 fn $case() {
-                    super::replay(super::$case, $session);
+                    super::run_parity(super::$case, $session);
                 }
             )+
         }
@@ -2042,7 +2043,7 @@ parity_cases!(
 );
 
 #[cfg(feature = "sim")]
-fn replay<F, Fut>(case: F, expects_session: bool)
+fn run_parity<F, Fut>(case: F, expects_session: bool)
 where
     F: Fn() -> Fut,
     Fut: Future<Output = ()>,
@@ -2100,10 +2101,21 @@ where
         }
     }
 
+    let seeded = sim::TOKIO_RNG_SEEDED;
     assert!(
-        sim::TOKIO_RNG_SEEDED,
+        seeded,
         "transport parity requires RUSTFLAGS='--cfg tokio_unstable'"
     );
+
+    // This same case also runs in a real Tokio runtime, with no World installed.
+    // Initialize the shared TLS material before generating any simulated IDs.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(case());
+
     const SEED: u64 = 0x4e41_4245_4452_4108;
     let run = || {
         sim::run(SEED, |world| {
