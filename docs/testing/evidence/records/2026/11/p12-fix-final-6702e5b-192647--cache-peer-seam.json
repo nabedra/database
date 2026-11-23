@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "p12-fix-final-6702e5b-192647--cache-peer-seam.log",
+      "sha256": "f72e139be3bdd429e09ca803a22affc5f20ec64d662f3731572c1eec191eac9c"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-peer-seam",
+  "duration_s": 56.822,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T18:27:27.670239+00:00",
+    "request_id": "p12-fix-final-6702e5b-192647",
+    "runner": "GitHub Actions 1000007498",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45238460162"
+  },
+  "scenarios": [
+    "K03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "6702e5b9c19ca3462f6ea3807fe4c2395f1ebf07",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

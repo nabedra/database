@@ -1,7 +1,76 @@
 {
   "allow_unattested": false,
-  "head": "8498d0ee2c61a3df8557091412665b0e73f47bdc",
-  "ignored_records": [],
+  "head": "bc96d218b16f700051df6eb3b69ff6010dcbb802",
+  "ignored_records": [
+    {
+      "path": "p12-fix-final-6702e5b-192647--cache-cluster-real.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--cache-differential-unit.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--cache-lease-fault-model.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--cache-peer-seam.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--cache-sim-product.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--cache-sim-seams.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--cache-sim.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--cache-store-model.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--cache-test-hooks.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--cache-valkey-diff.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--cache-valkey-tcl.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--check-core.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--check-history.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--licenses.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--models.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--rt-zero-cost.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p12-fix-final-6702e5b-192647--testing-bugs.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -19,6 +88,7 @@
         "D": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -79,6 +149,7 @@
         "D": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -115,12 +186,14 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -175,12 +248,14 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -267,6 +342,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -289,12 +365,14 @@
         "R": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -327,6 +405,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -338,6 +417,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -349,12 +429,14 @@
         "R": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -413,6 +495,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -471,6 +554,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -529,6 +613,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -738,6 +823,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -799,6 +885,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -858,6 +945,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -988,6 +1076,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2125,6 +2214,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2185,6 +2275,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2245,6 +2336,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2304,6 +2396,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2806,6 +2899,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2870,6 +2964,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2881,6 +2976,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2935,6 +3031,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2946,6 +3043,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -3208,6 +3306,7 @@
         "M": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -3992,5 +4091,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
