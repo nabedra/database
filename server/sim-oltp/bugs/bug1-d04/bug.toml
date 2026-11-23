@@ -11,13 +11,18 @@ fix_commits = ["259da02c2369527ebce3d292dac83dd5ffad2d71", "d7b9d63c3d548e7f694d
 reverts = "259da02c2369527ebce3d292dac83dd5ffad2d71"
 port = "hand"
 port_notes = """
-The 259da02c executor hunks conflict with HEAD. This ports their effect in
-DirectExecutor::proposal_failed (server/src/oltp_runtime/direct/executor.rs): every error other than
-a full-device or disk-reservation refusal returns Ok(()), so a proposal of unknown outcome retries
-locally as it did before the fix. A leader that steps down after applying then answers a redirect
-or, at the deadline, unavailable_not_applied, instead of the outcome_unknown the fix returns at once.
-The pre-fix code kept a local `uncertain` flag for the deadline answer; the redirect that loses the
-uncertainty is the same, so the original regression test fails the same way.
+The 259da02c executor hunks conflict with HEAD. This ports the pre-fix design into
+server/src/oltp_runtime/direct/executor.rs: only the leader holds the uncertainty. A proposal of
+unknown outcome sets a request-local `uncertain` flag (in mutate across its RD1 schema retries, and
+in forward_admitted) and retries locally with RetryCause::Leadership, instead of returning
+outcome_unknown at once. While the flag is set, deadline exits answer outcome_unknown through the
+restored deadline_expired(uncertain), not_leader_or(handle, uncertain) answers outcome_unknown when
+no other node leads, and full-device or reservation refusals retry instead of answering. The bug is
+the one the fix removed: a leader that steps down after applying redirects (NotLeader), and the
+gateway follows it without the uncertainty. A review replaced the first port, which returned Ok(())
+for every error and so also answered unavailable_not_applied at the deadline after an uncertain
+proposal, a stronger bug than the original that a deadline-edge seed could find without the D04
+redirect.
 """
 workload = "direct"
 # drain-leader between Applied and the reply, and crash-leader.
@@ -32,11 +37,11 @@ mode = "on"
 failure_contains = ["NotLeader { hint:"]
 
 [regression.evidence]
-digest = "87a9ba998588f3bfa02ea06e321856bd7e7780b3db74d10c05c9f633d0b0f550"
-clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148935717", sha = "53a5716f844aa9690739daed32fd335c68bc0f8a", result = "passed", note = "request p10-bugs-clean-53a5716-103844, direct_oltp on" }
-patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148923458", sha = "bff93b5a042b056691fb1bfafb555e2ba72f0213", result = "failed", note = "scratch/sim-bug-bug1-d04, request p10-bugs-bug1-d04-bff93b5-103844, direct_oltp on. The final assertion (outcome Unknown) fails: the stepped-down leader answered a redirect.", output = """
+digest = "ffe26b84b86b1261ad54234551a9559dd8b0a41280f95913960cc9cff24479b6"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45158573590", sha = "d7f11683500b678e9c9262e4af189dc8f79abf05", result = "passed", note = "request p10-bugs-opus-clean-d7f1168-114238, direct_oltp on" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45158568925", sha = "c5dcdd0fd5baa8a5d6233af2ec1eaa35e5d143bd", result = "failed", note = "scratch/sim-bug-bug1-d04-r2, request p10-bugs-opus-d04-c5dcdd0-114238, direct_oltp on. The final assertion (outcome Unknown) fails: the stepped-down leader answered a redirect.", output = """
 test oltp_runtime::direct::tests::d04_o10_bug1_leader_shutdown_after_apply_preserves_proposal_uncertainty ... FAILED
 panicked at src/oltp_runtime/direct/tests.rs:1900:5:
 NotLeader { hint: None }
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 585 filtered out; finished in 6.26s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 585 filtered out; finished in 5.86s
 """ }
