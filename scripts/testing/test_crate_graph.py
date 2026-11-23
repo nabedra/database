@@ -350,7 +350,7 @@ class ProofTests(unittest.TestCase):
         base = Path(tempfile.mkdtemp(prefix="crate-graph-proofs-"))
         self.addCleanup(shutil.rmtree, base, ignore_errors=True)
         write_tree(base, {
-            "server/oltp-replication/Cargo.toml": "",
+            CONFIG.proofs["requires"]: "",
             "server/oltp-replication/src/status.rs": "impl StatusDecisionProof for VerifiedStatusDecision {}\n",
             "server/oltp-storage/src/tests.rs": "struct Fake;\nimpl StatusDecisionProof for Fake {}\n",
             "server/oltp-storage/target/debug/build/out.rs": "impl StatusDecisionProof for Built {}\n",
@@ -367,7 +367,7 @@ class ProofTests(unittest.TestCase):
     def test_no_impls_once_the_crate_exists_fails_instead_of_passing(self):
         base = Path(tempfile.mkdtemp(prefix="crate-graph-noproofs-"))
         self.addCleanup(shutil.rmtree, base, ignore_errors=True)
-        write_tree(base, {"server/oltp-replication/Cargo.toml": "", "server/oltp-replication/src/lib.rs": ""})
+        write_tree(base, {CONFIG.proofs["requires"]: "", "server/oltp-replication/src/lib.rs": ""})
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             status = crate_graph.main(["--repo", str(base), "proofs"])

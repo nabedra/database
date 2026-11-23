@@ -8,6 +8,9 @@ repository = "https://github.com/zPy52/nabedra-database"
 publish = ["crates-io"]
 description = "Nabedra OLTP peer transport"
 
+[package.metadata.nabedra]
+extraction-pending = true
+
 [features]
 sim = ["nabedra-rt/sim"]
 

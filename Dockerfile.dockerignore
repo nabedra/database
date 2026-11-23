@@ -15,6 +15,9 @@
 !server/resources/src/
 !server/oltp-types/Cargo.toml
 !server/oltp-types/src/
+!server/transport/Cargo.toml
+!server/oltp-storage/Cargo.toml
+!server/oltp-replication/Cargo.toml
 !server/sim/Cargo.toml
 !server/src/
 !orm/python/pyproject.toml
