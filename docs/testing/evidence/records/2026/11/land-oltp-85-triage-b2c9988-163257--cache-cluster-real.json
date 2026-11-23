@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "land-oltp-85-triage-b2c9988-163257--cache-cluster-real.log",
+      "sha256": "074772788ab5f7dcb7c8d42c38fdcafa73b09fc9958808c182d8ac6f7b30935e"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-cluster-real",
+  "duration_s": 277.55,
+  "guarantees": [
+    "CACHE-G05",
+    "CACHE-G06"
+  ],
+  "kind": "R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T16:34:52.523445+00:00",
+    "request_id": "land-oltp-85-triage-b2c9988-163257",
+    "runner": "GitHub Actions 1000006785",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45217743445"
+  },
+  "scenarios": [
+    "K03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "b2c9988fbcba7ba93cab53271270f9d8e64ceafb",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
