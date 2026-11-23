@@ -189,11 +189,7 @@ fn handshake_negotiates_alpn_and_exchanges_certificate_digests() {
 fn alpn_follows_the_server_preference_like_rustls() {
     run(2, |world| async move {
         nodes(&world, &[1, 2]);
-        let cases: [(
-            &'static [&'static [u8]],
-            &'static [&'static [u8]],
-            Option<&[u8]>,
-        ); 7] = [
+        let cases = [
             (FULL, FULL, Some(OTP4)),
             // The server picks from its own list, whatever order the client offers.
             (&[WORKER1, OTP2], FULL, Some(OTP2)),
@@ -557,6 +553,8 @@ fn dropping_a_listener_refuses_a_waiting_dial() {
         assert!(time::timeout(ms(1), &mut dialing).await.is_err());
 
         drop(listener);
+        // A bind at the same address belongs to a new listener generation.
+        let _replacement = world.listen(1, addr).unwrap();
         let error = time::timeout(ms(10), dialing)
             .await
             .expect("dial should wake when the listener closes")

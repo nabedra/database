@@ -348,6 +348,7 @@ struct Slot {
     node: Option<u64>,
     backlog: VecDeque<u64>,
     acceptors: Waiters,
+    dialers: Waiters,
 }
 
 #[derive(Default)]
@@ -360,8 +361,6 @@ struct State {
     /// Held links `(from, to)` and when each hole opened.
     holes: BTreeMap<(Option<u64>, Option<u64>), Instant>,
     planner: Option<Box<dyn Planner>>,
-    /// Dials waiting for a network change.
-    dialers: Waiters,
     next_conn: u64,
     next_listener: u64,
     next_port: u16,
@@ -400,10 +399,6 @@ impl State {
         ))
     }
 
-    fn linked(&self, a: Option<u64>, b: Option<u64>) -> bool {
-        !self.holes.contains_key(&(a, b)) && !self.holes.contains_key(&(b, a))
-    }
-
     /// Wakes every reader, acceptor and dialer, after a change they may be waiting for.
     fn wake_all(&mut self) {
         for conn in self.conns.values_mut() {
@@ -415,8 +410,8 @@ impl State {
         }
         for slot in self.listeners.values_mut() {
             slot.acceptors.wake_all();
+            slot.dialers.wake_all();
         }
-        self.dialers.wake_all();
     }
 
     fn reset(&mut self, conn: u64) {
@@ -440,7 +435,7 @@ impl State {
             }
         }
         slot.acceptors.wake_all();
-        self.dialers.wake_all();
+        slot.dialers.wake_all();
         self.collect();
     }
 
@@ -696,31 +691,43 @@ pub async fn dial(target: Target<'_>) -> io::Result<Pending> {
 
 async fn dial_one(net: &Arc<Net>, from: Option<u64>, addr: SocketAddr) -> io::Result<Pending> {
     let mut waiter = None;
+    let mut waiting_listener = None;
     poll_fn(|cx| {
         let mut state = net.lock();
         let state = &mut *state;
-        let Some(slot) = state.listeners.get(&addr) else {
+        let Some(slot) = state
+            .listeners
+            .get(&addr)
+            .filter(|slot| waiting_listener.is_none_or(|id| id == slot.id))
+        else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("nothing listens on simulated {addr}"),
             )));
         };
         let to = slot.node;
-        let verdict = if state.linked(from, to) {
-            state
-                .planner
-                .as_mut()
-                .map_or(Dial::Connect, |planner| planner.dial(from, to))
-        } else {
-            Dial::Hang
-        };
+        let verdict =
+            if !state.holes.contains_key(&(from, to)) && !state.holes.contains_key(&(to, from)) {
+                state
+                    .planner
+                    .as_mut()
+                    .map_or(Dial::Connect, |planner| planner.dial(from, to))
+            } else {
+                Dial::Hang
+            };
         match verdict {
             Dial::Refuse => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("simulated dial to {addr} refused"),
             ))),
             Dial::Hang => {
-                state.dialers.register(&mut waiter, cx.waker());
+                waiting_listener = Some(slot.id);
+                state
+                    .listeners
+                    .get_mut(&addr)
+                    .unwrap()
+                    .dialers
+                    .register(&mut waiter, cx.waker());
                 Poll::Pending
             }
             Dial::Connect => {
@@ -746,10 +753,7 @@ async fn dial_one(net: &Arc<Net>, from: Option<u64>, addr: SocketAddr) -> io::Re
                         reset: false,
                     },
                 );
-                let slot = state
-                    .listeners
-                    .get_mut(&addr)
-                    .expect("the listener was found above");
+                let slot = state.listeners.get_mut(&addr).unwrap();
                 slot.backlog.push_back(id);
                 slot.acceptors.wake_all();
                 Poll::Ready(Ok(Pending {
@@ -794,6 +798,7 @@ fn bind(net: Arc<Net>, node: Option<u64>, addr: SocketAddr) -> io::Result<SimLis
             node,
             backlog: VecDeque::new(),
             acceptors: Waiters::default(),
+            dialers: Waiters::default(),
         },
     );
     drop(state);
