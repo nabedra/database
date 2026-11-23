@@ -48,15 +48,27 @@
 //! - **Background work.** Besides the `kv-journal` thread, a `kv-journal-prep` thread
 //!   prepares (creates, zero-fills, syncs) the next free segment once the active one is
 //!   half used, so commits never wait for a zero fill unless no spare exists (F8).
+//!
+//! # Services
+//!
+//! Both threads are [`nabedra_rt::task::Stepped`] services started with
+//! [`nabedra_rt::task::spawn_stepped`]. A product build runs each one's existing loop on
+//! its named thread. Under the `sim` feature, inside a simulated world, the runtime steps
+//! them one atomic step at a time, and [`Commit::wait`] and [`Journal::close`] drive them
+//! inline instead of blocking. The journal then never waits inside its sink: before a
+//! sink call that would stall it parks the group and resumes it later (see `writer.rs`).
+//! On a simulated node cut, the dead service releases pending completion guards and
+//! returns `RecoveryRequired` for their commits. Recovery determines the persisted prefix.
 
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use bytes::Bytes;
+#[cfg(feature = "sim")]
+use nabedra_rt::task;
 use tokio::sync::oneshot;
 
 use crate::batch::{MAX_SCOPE_LEN, WriteBatch};
@@ -64,6 +76,7 @@ use crate::cache::{BlockCache, CacheKey};
 use crate::crc;
 use crate::error::{Damage, Error, FileId, Result};
 use crate::fs::{Fs, FsFile};
+use crate::service::{Condvar, ServiceHandle};
 use crate::types::{Locator, MAX_SEQ, Seq};
 
 pub mod format;
@@ -73,6 +86,8 @@ mod writer;
 
 #[cfg(test)]
 mod crash_tests;
+#[cfg(all(test, feature = "sim"))]
+mod sim_tests;
 #[cfg(test)]
 mod tests;
 
@@ -131,6 +146,24 @@ pub trait JournalSink: Send + Sync {
         batch: &WriteBatch,
         locators: &[Locator],
     ) -> Result<()>;
+
+    /// Simulation only: if [`JournalSink::apply`] of this record would stall now, the time
+    /// to ask again; `None` when it would not wait. The journal asks before every sink
+    /// call while a simulated world steps it, and parks the group instead of blocking
+    /// (risk R1 of the phase 9 design). It must use the predicate `apply` waits on and
+    /// do what one round of that wait does before it blocks (for example scheduling the
+    /// flush that will end the stall), and it must not change what the following
+    /// `apply` decides. The default never stalls.
+    #[cfg(feature = "sim")]
+    fn stall_deadline(
+        &self,
+        kind: RecordKind,
+        first_seq: Seq,
+        batch: &WriteBatch,
+    ) -> Option<std::time::Instant> {
+        let _ = (kind, first_seq, batch);
+        None
+    }
 }
 
 /// A queued write. [`Commit::wait`] or [`Commit::done`] returns the batch's last sequence
@@ -150,8 +183,22 @@ impl Commit {
 
     /// Blocks until the commit completes. Must not be called from a thread that drives
     /// an async runtime; use [`Commit::done`] there.
+    ///
+    /// Under `sim`, inside a simulated world, it drives the node's stepped services (the
+    /// journal among them) until the commit completes. Outside a world and in builds
+    /// without KV's `sim` feature it blocks on the journal thread.
     pub fn wait(self) -> Result<Seq> {
-        self.rx
+        #[cfg(feature = "sim")]
+        let receiver = {
+            let mut commit = self;
+            if let Some(result) = task::drive_until("kv commit", || commit.try_result()) {
+                return result;
+            }
+            commit.rx
+        };
+        #[cfg(not(feature = "sim"))]
+        let receiver = self.rx;
+        receiver
             .blocking_recv()
             .unwrap_or(Err(Error::RecoveryRequired))
     }
@@ -365,8 +412,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 pub struct Journal {
     shared: Arc<Shared>,
-    thread: Mutex<Option<JoinHandle<()>>>,
-    preparer: Mutex<Option<JoinHandle<()>>>,
+    thread: Mutex<Option<ServiceHandle>>,
+    preparer: Mutex<Option<ServiceHandle>>,
 }
 
 /// Creates `dir` if needed and makes its entry durable: syncs the parent of every
@@ -580,7 +627,7 @@ impl Journal {
         self.shared.durable.load(Ordering::Acquire)
     }
 
-    /// True once a write, sync or sink call failed. Only reopening clears it.
+    /// True after a write, sync or sink failure, or a simulated journal abort. Only reopening clears it.
     pub fn requires_recovery(&self) -> bool {
         self.shared.latched.load(Ordering::Acquire)
     }
@@ -762,6 +809,9 @@ impl Journal {
         self.stop(false)
     }
 
+    /// Stops both services and joins them. Under `sim`, inside a world, a join drives the
+    /// node's services until the joined one exits, and a service of a crashed node is
+    /// dead and joins at once.
     fn stop(&self, crash: bool) -> Result<()> {
         {
             let mut queue = lock(&self.shared.queue);
