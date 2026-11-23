@@ -2005,7 +2005,7 @@ async fn peer_certificate_pin_rejects_other_ca_signed_certificate() {
 }
 
 macro_rules! parity_cases {
-    ($($case:ident),+ $(,)?) => {
+    ($($case:ident => $session:literal),+ $(,)?) => {
         mod real {
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2020,7 +2020,7 @@ macro_rules! parity_cases {
             $(
                 #[test]
                 fn $case() {
-                    super::replay(super::$case);
+                    super::replay(super::$case, $session);
                 }
             )+
         }
@@ -2028,21 +2028,21 @@ macro_rules! parity_cases {
 }
 
 parity_cases!(
-    d10_o05_one_session_per_lane_carries_many_calls,
-    d10_dropped_session_mid_stream_is_unknown_and_next_call_reconnects,
-    d10_c07_o05_exhausted_lane_overloads_while_raft_progress_advances,
-    d10_old_one_shot_peer_interoperates_in_both_directions,
-    cap1_d10_o02_sessions_form_with_older_builds_after_otp3_is_retired,
-    d10_session_closes_when_peer_incarnation_leaves_directory,
-    d10_c07_full_session_pools_reject_typed_and_keep_raft_progress,
-    d10_o05_reply_frees_its_handler_slot_before_its_bytes_are_written,
-    c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes,
-    revoked_session_closes,
-    peer_certificate_pin_rejects_other_ca_signed_certificate,
+    d10_o05_one_session_per_lane_carries_many_calls => true,
+    d10_dropped_session_mid_stream_is_unknown_and_next_call_reconnects => true,
+    d10_c07_o05_exhausted_lane_overloads_while_raft_progress_advances => true,
+    d10_old_one_shot_peer_interoperates_in_both_directions => false,
+    cap1_d10_o02_sessions_form_with_older_builds_after_otp3_is_retired => true,
+    d10_session_closes_when_peer_incarnation_leaves_directory => true,
+    d10_c07_full_session_pools_reject_typed_and_keep_raft_progress => true,
+    d10_o05_reply_frees_its_handler_slot_before_its_bytes_are_written => true,
+    c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes => true,
+    revoked_session_closes => true,
+    peer_certificate_pin_rejects_other_ca_signed_certificate => true,
 );
 
 #[cfg(feature = "sim")]
-fn replay<F, Fut>(case: F)
+fn replay<F, Fut>(case: F, expects_session: bool)
 where
     F: Fn() -> Fut,
     Fut: Future<Output = ()>,
@@ -2054,6 +2054,8 @@ where
     #[derive(Default)]
     struct Trace {
         messages: u64,
+        requests: u64,
+        replies: u64,
         hash: Sha256,
     }
 
@@ -2077,8 +2079,16 @@ where
                 && let Some(frame) = StreamFrame::from_message(envelope.bytes)
             {
                 let direction = match frame.kind() {
-                    FrameKind::Request | FrameKind::Ping => Some(Direction::ToServer),
-                    FrameKind::Reply | FrameKind::Pong => Some(Direction::ToClient),
+                    FrameKind::Request => {
+                        trace.requests += 1;
+                        Some(Direction::ToServer)
+                    }
+                    FrameKind::Reply => {
+                        trace.replies += 1;
+                        Some(Direction::ToClient)
+                    }
+                    FrameKind::Ping => Some(Direction::ToServer),
+                    FrameKind::Pong => Some(Direction::ToClient),
                     FrameKind::Cancel => None,
                 };
                 if let Some(direction) = direction {
@@ -2110,6 +2120,18 @@ where
                     trace.messages > 0,
                     "the case must exercise the simulated backend"
                 );
+                if expects_session {
+                    assert!(
+                        trace.requests > 0 && trace.replies > 0,
+                        "whole request and reply frames"
+                    );
+                } else {
+                    assert_eq!(
+                        (trace.requests, trace.replies),
+                        (0, 0),
+                        "only one-shot messages"
+                    );
+                }
                 <[u8; 32]>::from(trace.hash.clone().finalize())
             }
         })

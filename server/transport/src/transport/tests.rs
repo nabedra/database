@@ -323,6 +323,15 @@ impl PeerDirectory for TestDirectory {
         self.apis.lock().unwrap().contains(&peer)
     }
     fn resolve(&self, worker: Uuid) -> Result<WorkerEnrollment, ProtocolError> {
+        if self
+            .revoked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|peer| peer.worker_id == worker)
+        {
+            return Err(unavailable());
+        }
         self.workers
             .lock()
             .unwrap()
