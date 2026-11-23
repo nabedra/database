@@ -1,0 +1,14 @@
+id = "SIM-WORKER-DRAIN"
+title = "The simulated blocking helper suspended coordinator progress during worker drain"
+class = "resource-release-order"
+module = "scheduler"
+guarantees = ["SCHED-G01", "OLAP-G07", "OLTP-G09"]
+scenarios = ["F03"]
+found_by = "review"
+found_date = "2026-11-23"
+lowest_regression = "worker_pool::scheduling_tests::f03_shutdown_allows_the_coordinator_to_finish_accepted_work"
+seed = 50
+why_not_caught = "The simulated blocking helper tests used self-contained closures. They did not cover an accepted job awaiting coordinator progress during shutdown."
+invariant_added = "Close admission synchronously, let the simulated coordinator drive the drain, then release the exit gates and join drained workers. F03 checks the accepted job result and that resources settle to baseline."
+fix_commits = ["460e261e0ff91e8db3f2cfe4927386cd51f73398"]
+revert_patch_ok = true
