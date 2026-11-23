@@ -1,4 +1,5 @@
 //! Shared synchronous file validation and bounded indexed worker dispatch.
+use crate::worker_pool::WorkerRuntime;
 use crate::{
     partition_size::MAX_PARTITION_BYTES,
     protocol::{ErrorCode, Key, Outcome, ProtocolError, Row, Scalar, TableDescriptor},
@@ -11,7 +12,6 @@ use crate::{
 };
 use bytes::Bytes;
 use std::{cmp::Ordering, sync::Arc};
-use tokio::runtime::Runtime;
 
 #[derive(Clone)]
 pub(super) enum ReadFile {
@@ -45,7 +45,7 @@ pub(super) struct LoadedRows {
 /// Call on a worker, outside block_on. Only the bounded storage download uses IO.
 /// Metadata must belong to the operation's captured, validated catalog.
 pub(super) fn load_file<B: ObjectStore>(
-    runtime: &Runtime,
+    runtime: &WorkerRuntime,
     storage: &Storage<B>,
     table: &TableDescriptor,
     file: &ReadFile,
