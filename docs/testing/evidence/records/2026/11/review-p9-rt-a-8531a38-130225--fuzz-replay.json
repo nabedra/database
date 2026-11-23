@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "review-p9-rt-a-8531a38-130225--fuzz-replay.log",
+      "sha256": "3b81899875c5c9cffde344a1302cc0d07cb24155ae9e446f736d3da60a043bcd"
+    }
+  ],
+  "assertions": {
+    "executed": 5,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "fuzz-replay",
+  "duration_s": 112.022,
+  "guarantees": [
+    "CACHE-G01",
+    "EVT-G07",
+    "OLAP-G08"
+  ],
+  "kind": "F",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T12:09:45.627020+00:00",
+    "request_id": "review-p9-rt-a-8531a38-130225",
+    "runner": "GitHub Actions 1000005796",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45170539448"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "8531a38f4bc166e89b5d18586e01018754749c49",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

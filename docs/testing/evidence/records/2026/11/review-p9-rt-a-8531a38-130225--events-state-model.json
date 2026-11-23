@@ -1,0 +1,48 @@
+{
+  "artifacts": [
+    {
+      "name": "review-p9-rt-a-8531a38-130225--events-state-model.log",
+      "sha256": "ca0c27e6316cd4beba7be572661e103e425cc3427ef2bb049af0304eeb713568"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "events-state-model",
+  "duration_s": 52.843,
+  "guarantees": [
+    "EVT-G02",
+    "EVT-G03",
+    "EVT-G04",
+    "EVT-G05",
+    "EVT-G08"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T12:06:22.579364+00:00",
+    "request_id": "review-p9-rt-a-8531a38-130225",
+    "runner": "GitHub Actions 1000005774",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45170539448"
+  },
+  "scenarios": [
+    "EV01",
+    "EV02",
+    "EV03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "8531a38f4bc166e89b5d18586e01018754749c49",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
