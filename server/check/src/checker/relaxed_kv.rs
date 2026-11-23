@@ -110,13 +110,18 @@ impl Ctx<'_> {
     }
 
     fn first_failover(&self, w: &Op, read: &Op) -> Option<&Marker> {
-        self.failovers.iter().copied().find(|m| {
-            self.between(m, w, read)
-                && m.value["epoch"].as_u64().is_none_or(|next| {
-                    epoch(w).is_none_or(|old| next > old)
-                        && epoch(read).is_none_or(|current| next <= current)
-                })
-        })
+        self.failovers
+            .iter()
+            .copied()
+            .filter(|m| {
+                self.between(m, w, read)
+                    && m.value["epoch"].as_u64().is_none_or(|next| {
+                        epoch(w).is_none_or(|old| next > old)
+                            && epoch(read).is_none_or(|current| next <= current)
+                    })
+            })
+            // Paired markers occupy their invocation's entry in the vector.
+            .min_by_key(|m| m.pos)
     }
 
     fn between(&self, marker: &Marker, w: &Op, read: &Op) -> bool {

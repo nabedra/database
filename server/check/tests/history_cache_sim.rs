@@ -79,6 +79,26 @@ fn cache_sim_rejects_resurrection_after_delete() {
     promotion.value["prefix_epoch"] = 1.into();
     promotion.value["prefix_sequence"] = 3.into();
     assert_rejects(&events, completion, "resurrection");
+
+    // A second promotion can invoke before the first one completes.
+    // Evidence from the first completed promotion still protects the deletion.
+    let promotion = events
+        .iter()
+        .position(|event| event.f == "failover")
+        .unwrap();
+    let mut later = events[promotion].clone();
+    later.f = "promote".into();
+    later.value = serde_json::json!({"epoch": 3, "prefix_epoch": 2, "prefix_sequence": 0});
+    later.time_ns = Some(later.time_ns.unwrap() + 1);
+    let mut invocation = later.clone();
+    invocation.kind = EventType::Invoke;
+    invocation.time_ns = events[promotion].time_ns;
+    events.insert(promotion, invocation);
+    events.insert(promotion + 2, later);
+    let completion = completion + 2;
+    events[completion].value["epoch"] = 3.into();
+    nabedra_check::history::reindex(&mut events);
+    assert_rejects(&events, completion, "resurrection");
 }
 
 #[test]
