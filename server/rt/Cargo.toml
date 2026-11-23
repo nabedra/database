@@ -15,7 +15,7 @@ name = "nabedra_rt"
 # Deterministic simulation: per-node clocks, seeded ids, a per-node task registry and
 # inline blocking work. Never enable it in a product build; `server/src/main.rs` refuses
 # to compile with it.
-sim = ["tokio/test-util", "net"]
+sim = ["tokio/test-util", "tokio/sync", "tokio/macros", "net"]
 # The network seam: listener, connector and stream traits over tokio TCP. Off by default
 # so crates that never touch the network (nabedra-kv, Events) keep their graph.
 net = ["tokio/net"]
