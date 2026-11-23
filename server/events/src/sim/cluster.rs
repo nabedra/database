@@ -145,7 +145,7 @@ pub fn run(config: SimConfig) -> Report {
     let seed = config.seed;
     // A paused current-thread runtime whose `select!` branch order follows the seed under
     // `--cfg tokio_unstable`, with a `nabedra_rt::sim` world installed on this thread.
-    let (sim, mut violations, stats) = nabedra_sim::runtime::run(seed, |world| async move {
+    let (sim, mut violations, stats) = nabedra_rt::sim::run(seed, |world| async move {
         let sim = Harness::new(world.clone(), config.knobs, config.nodes);
         let _installed = Installed::new(sim.clone());
         // Every broker joins the world down; `Cluster::start` brings it up.
