@@ -524,6 +524,10 @@ impl WorkerSharedResources {
             self.control.slots.close();
             self.memory.close_reply_arenas();
         }
+        #[cfg(feature = "sim")]
+        if nabedra_rt::sim::world().is_some() {
+            return;
+        }
         loop {
             let notified = self.leases.settled.notified();
             if self.leases.state.lock().expect("native lease state").count == 0 {
