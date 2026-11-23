@@ -420,7 +420,7 @@ impl Handle {
                 stepping_world().is_some_and(|current| Arc::ptr_eq(&current, &world)),
                 "a live stepped service must join on its simulation thread or blocking helper"
             );
-            with_node_context(cell.node, || {
+            with_node_context(cell.node.map(|node| world.node_context(node)), || {
                 drive(&world, cell.node, "ServiceHandle::join", || {
                     cell.finished().then_some(())
                 });
