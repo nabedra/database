@@ -330,7 +330,7 @@ impl StatusProofClient {
             return Err(invalid());
         }
         let source = self.point_source(locator)?;
-        timeout_at(Instant::now() + SERVICE_CONVERGENCE, async {
+        timeout_at(nabedra_rt::time::now() + SERVICE_CONVERGENCE, async {
             for attempt in 0..2 {
                 let routes = self.client.control.timestamp_point_routes(source).await?;
                 let result = self

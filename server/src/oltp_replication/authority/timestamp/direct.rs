@@ -205,7 +205,7 @@ impl DirectWindows {
             refill: tokio::sync::Mutex::new(()),
             prefill: Arc::default(),
             served_ms: AtomicU64::new(0),
-            served_epoch: std::time::Instant::now(),
+            served_epoch: nabedra_rt::time::now_std(),
             gate: RwLock::new(None),
             window_size: AtomicU64::new(DEFAULT_DIRECT_WINDOW),
             reservations: AtomicU64::new(0),
@@ -546,9 +546,9 @@ impl TimestampHandle {
     pub(crate) fn spawn_direct_prefill(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let handle = Arc::downgrade(self);
         let wake = self.machine.direct.prefill.clone();
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             loop {
-                if tokio::time::timeout(PREFILL_POLL, wake.notified())
+                if nabedra_rt::time::timeout(PREFILL_POLL, wake.notified())
                     .await
                     .is_err()
                 {
@@ -560,8 +560,8 @@ impl TimestampHandle {
                 let Some(handle) = handle.upgrade() else {
                     return;
                 };
-                let started = std::time::Instant::now();
-                match tokio::time::timeout(PREFILL_DEADLINE, handle.prefill_direct_window()).await {
+                let started = nabedra_rt::time::now_std();
+                match nabedra_rt::time::timeout(PREFILL_DEADLINE, handle.prefill_direct_window()).await {
                     Ok(Ok(true)) => {
                         crate::oltp_runtime::stage_timing::perf_stage!("ts.window.prefilled")
                             .since(started);

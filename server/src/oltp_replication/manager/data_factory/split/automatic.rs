@@ -142,7 +142,7 @@ impl LocalUsageScan {
             (token, Some(scan.scan))
         } else {
             *slot = None;
-            (Uuid::new_v4(), None)
+            (nabedra_rt::ids::uuid_v4(), None)
         };
         Ok(
             match machine

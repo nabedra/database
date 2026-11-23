@@ -82,7 +82,7 @@ impl Relay {
         let (generation, watcher) = watch::channel(0u64);
         let (black_hole, holes) = watch::channel(false);
         let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let task = tokio::spawn({
+        let task = nabedra_rt::task::spawn({
             let accepted = accepted.clone();
             async move {
                 loop {
@@ -93,7 +93,7 @@ impl Relay {
                     let mut watcher = watcher.clone();
                     let started = *watcher.borrow_and_update();
                     let holes = holes.clone();
-                    tokio::spawn(async move {
+                    nabedra_rt::task::spawn(async move {
                         let Ok(outbound) = TcpStream::connect(target).await else {
                             return;
                         };
@@ -231,7 +231,7 @@ impl Fixture {
         relay: bool,
     ) -> (Self, Option<Relay>) {
         let temp =
-            TestDirectoryPath(std::env::temp_dir().join(format!("sessions-{}", Uuid::new_v4())));
+            TestDirectoryPath(std::env::temp_dir().join(format!("sessions-{}", nabedra_rt::ids::uuid_v4())));
         std::fs::create_dir(&temp.0).unwrap();
         let tls = tls::certificates(&temp.0, 3);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -243,8 +243,8 @@ impl Fixture {
         };
         let reach = relay.as_ref().map_or(listen, |relay| relay.address);
         let enrollment = |index: usize, endpoint: String| WorkerEnrollment {
-            worker_id: Uuid::new_v4(),
-            incarnation: Uuid::new_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
             enrollment_revision: 1,
             certificate_sha256: Digest::parse(tls[index].certificate_sha256()).unwrap(),
             endpoint: Text::new(endpoint).unwrap(),
@@ -283,17 +283,17 @@ impl Fixture {
             transport
         };
         let group = GroupIdentity {
-            cluster_id: Uuid::new_v4(),
+            cluster_id: nabedra_rt::ids::uuid_v4(),
             database: Text::try_from("sessions").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Catalog,
             group_format_version: 1,
         };
         let data_group = GroupIdentity {
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Data {
-                table_id: Uuid::new_v4(),
-                shard_id: Uuid::new_v4(),
+                table_id: nabedra_rt::ids::uuid_v4(),
+                shard_id: nabedra_rt::ids::uuid_v4(),
             },
             ..group.clone()
         };
@@ -313,7 +313,7 @@ impl Fixture {
             transport: other_transport,
         };
         let (stop, shutdown) = oneshot::channel();
-        let worker = tokio::spawn(receiver.clone().run(listener, async {
+        let worker = nabedra_rt::task::spawn(receiver.clone().run(listener, async {
             let _ = shutdown.await;
         }));
         (
@@ -371,7 +371,7 @@ fn echoed(reply: Result<ReceivedReply, RequestError>, text: &str) {
 async fn eventually(mut done: impl FnMut() -> bool, what: &str) {
     timeout(WAIT, async {
         while !done() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -407,7 +407,7 @@ async fn d10_o05_one_session_per_lane_carries_many_calls() {
         for index in 0..progress {
             let text = format!("concurrent-{index}");
             let call = fixture.call(&fixture.group, Purpose::RaftProgress, &text);
-            concurrent.push(tokio::spawn(async move { (call.await, text) }));
+            concurrent.push(nabedra_rt::task::spawn(async move { (call.await, text) }));
         }
         for call in concurrent {
             let (reply, text) = call.await.unwrap();
@@ -458,7 +458,7 @@ async fn d10_dropped_session_mid_stream_is_unknown_and_next_call_reconnects() {
         );
         assert_eq!(fixture.client.connections_for_test(), 1);
         fixture.endpoint.hold.store(true, Ordering::Release);
-        let in_flight = tokio::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "lost"));
+        let in_flight = nabedra_rt::task::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "lost"));
         fixture.endpoint.entered.acquire().await.unwrap().forget();
         relay.sever();
         let failure = in_flight
@@ -511,7 +511,7 @@ async fn d10_c07_o05_exhausted_lane_overloads_while_raft_progress_advances() {
     .await;
     timeout(WAIT, async {
         fixture.endpoint.hold.store(true, Ordering::Release);
-        let held = tokio::spawn(fixture.call(&fixture.data_group, Purpose::Raft, "held"));
+        let held = nabedra_rt::task::spawn(fixture.call(&fixture.data_group, Purpose::Raft, "held"));
         fixture.endpoint.entered.acquire().await.unwrap().forget();
         // The receiver's handler lane is full: an explicit overload, not applied.
         let rejected = fixture
@@ -606,7 +606,7 @@ async fn d10_old_one_shot_peer_interoperates_in_both_directions() {
             for index in 0..4 {
                 let text = format!("legacy-concurrent-{index}");
                 let call = fixture.call(&fixture.group, Purpose::RaftProgress, &text);
-                concurrent.push(tokio::spawn(async move { (call.await, text) }));
+                concurrent.push(nabedra_rt::task::spawn(async move { (call.await, text) }));
             }
             for call in concurrent {
                 let (reply, text) = call.await.unwrap();
@@ -700,7 +700,7 @@ async fn d10_session_closes_when_peer_incarnation_leaves_directory() {
         // The receiver no longer recognizes the caller's incarnation and
         // closes the session; the caller observes the closed connection.
         let mut replaced = fixture.caller.clone();
-        replaced.incarnation = Uuid::new_v4();
+        replaced.incarnation = nabedra_rt::ids::uuid_v4();
         replaced.enrollment_revision = 2;
         fixture.peers.install(replaced);
         eventually(
@@ -725,7 +725,7 @@ async fn d10_session_closes_when_peer_incarnation_leaves_directory() {
 
         // The caller closes its own session once the target leaves.
         let mut moved = fixture.target.clone();
-        moved.incarnation = Uuid::new_v4();
+        moved.incarnation = nabedra_rt::ids::uuid_v4();
         moved.enrollment_revision = 2;
         moved.endpoint = Text::new(fixture.listen.to_string()).unwrap();
         fixture.peers.install(moved);
@@ -825,7 +825,7 @@ async fn d10_o06_black_holed_session_is_closed_by_an_unanswered_ping() {
             "warm",
         );
         // Idle: healthy sessions answer pings and stay open.
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        nabedra_rt::time::sleep(Duration::from_secs(4)).await;
         assert_eq!(fixture.client.live_sessions_for_test(), 1);
         echoed(
             fixture
@@ -842,7 +842,7 @@ async fn d10_o06_black_holed_session_is_closed_by_an_unanswered_ping() {
         )
         .await;
         // A connect into the black hole fails at the connect timeout.
-        let started = Instant::now();
+        let started = nabedra_rt::time::now();
         assert!(matches!(
             fixture
                 .call(&fixture.group, Purpose::RaftProgress, "connect")
@@ -863,7 +863,7 @@ async fn d10_o06_black_holed_session_is_closed_by_an_unanswered_ping() {
         // A call waiting on a session that goes black fails at the busy ping
         // timeout, far below the 30 s transport deadline.
         relay.black_hole();
-        let started = Instant::now();
+        let started = nabedra_rt::time::now();
         let failure = fixture
             .call(&fixture.group, Purpose::RaftProgress, "waiting")
             .await
@@ -919,13 +919,13 @@ async fn d10_cancelled_stream_skips_its_reply_and_keeps_the_session() {
         );
         // Written, then dropped while the handler runs.
         fixture.endpoint.hold.store(true, Ordering::Release);
-        let written = tokio::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "dropped"));
+        let written = nabedra_rt::task::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "dropped"));
         fixture.endpoint.entered.acquire().await.unwrap().forget();
         written.abort();
         let _ = written.await;
         assert_eq!(fixture.client.waiting_streams_for_test(), 0);
         // Let the CANCEL arrive before the handler finishes.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(200)).await;
         fixture.endpoint.release.add_permits(1);
         eventually(|| skipped() == 1, "receiver skips the cancelled reply").await;
         assert_eq!(fixture.endpoint.handled.load(Ordering::Acquire), 2);
@@ -936,13 +936,13 @@ async fn d10_cancelled_stream_skips_its_reply_and_keeps_the_session() {
             .common
             .hold_writes
             .send_replace(true);
-        let queued = tokio::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "queued"));
+        let queued = nabedra_rt::task::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "queued"));
         eventually(
             || fixture.client.waiting_streams_for_test() == 1,
             "call queued",
         )
         .await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(50)).await;
         queued.abort();
         let _ = queued.await;
         fixture
@@ -951,7 +951,7 @@ async fn d10_cancelled_stream_skips_its_reply_and_keeps_the_session() {
             .hold_writes
             .send_replace(false);
         fixture.endpoint.entered.acquire().await.unwrap().forget();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(200)).await;
         fixture.endpoint.release.add_permits(1);
         eventually(|| skipped() == 2, "receiver skips the queued cancel").await;
         assert_eq!(fixture.endpoint.handled.load(Ordering::Acquire), 3);
@@ -1002,7 +1002,7 @@ async fn d10_unsent_frames_retry_once_on_a_fresh_session_and_written_frames_neve
         for index in 0..3 {
             let text = format!("queued-{index}");
             let call = fixture.call(&fixture.group, Purpose::RaftProgress, &text);
-            calls.push(tokio::spawn(async move { (call.await, text) }));
+            calls.push(nabedra_rt::task::spawn(async move { (call.await, text) }));
         }
         eventually(
             || fixture.client.waiting_streams_for_test() == 3,
@@ -1024,7 +1024,7 @@ async fn d10_unsent_frames_retry_once_on_a_fresh_session_and_written_frames_neve
 
         // Written, then the session fails: unknown outcome, no retry.
         fixture.endpoint.hold.store(true, Ordering::Release);
-        let written = tokio::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "written"));
+        let written = nabedra_rt::task::spawn(fixture.call(&fixture.group, Purpose::RaftProgress, "written"));
         fixture.endpoint.entered.acquire().await.unwrap().forget();
         fixture.client.close_sessions_for_test();
         let failure = written.await.unwrap().err().expect("closed call succeeded");
@@ -1032,7 +1032,7 @@ async fn d10_unsent_frames_retry_once_on_a_fresh_session_and_written_frames_neve
         fixture.endpoint.hold.store(false, Ordering::Release);
         fixture.endpoint.release.add_permits(1);
         eventually(|| handled() == 5, "written frame ran once").await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(handled(), 5, "a written frame was retried");
         assert_eq!(fixture.client.connections_for_test(), 2);
     })
@@ -1067,12 +1067,12 @@ async fn d10_o05_large_and_small_frames_share_one_lane() {
                 &text,
                 Some(large),
             );
-            tasks.push(tokio::spawn(async move { (call.await, text, index) }));
+            tasks.push(nabedra_rt::task::spawn(async move { (call.await, text, index) }));
         }
         let mut slowest = Duration::ZERO;
         for index in 0..24 {
             let text = format!("small-{index}");
-            let started = Instant::now();
+            let started = nabedra_rt::time::now();
             let reply = loop {
                 match caller
                     .call(
@@ -1303,10 +1303,10 @@ async fn d10_queued_callers_share_a_bounded_failed_connect() {
     let relay = relay.unwrap();
     timeout(WAIT, async {
         relay.black_hole();
-        let started = Instant::now();
+        let started = nabedra_rt::time::now();
         let mut calls = Vec::new();
         for index in 0..4 {
-            calls.push(tokio::spawn(fixture.call(
+            calls.push(nabedra_rt::task::spawn(fixture.call(
                 &fixture.group,
                 Purpose::RaftProgress,
                 &format!("queued-{index}"),
@@ -1381,7 +1381,7 @@ async fn d05_live1_black_holed_peer_fills_only_its_own_lane() {
         registry: fixture.other.transport.registry.clone(),
     });
     let (stop_healthy, shutdown) = oneshot::channel::<()>();
-    let healthy_worker = tokio::spawn(server.run(listener, async {
+    let healthy_worker = nabedra_rt::task::spawn(server.run(listener, async {
         let _ = shutdown.await;
     }));
     let caller = fixture.caller();
@@ -1403,7 +1403,7 @@ async fn d05_live1_black_holed_peer_fills_only_its_own_lane() {
                     Purpose::Raft,
                     &format!("stalled-{index}"),
                 );
-                tokio::spawn(call)
+                nabedra_rt::task::spawn(call)
             })
             .collect::<Vec<_>>();
         // The black-holed peer's lane is full: refused locally, before any write.
@@ -1535,7 +1535,7 @@ async fn rd3_d12_o03_direct_requests_beyond_the_ingress_slots_reach_the_leader()
         )
         .await;
         let control = GroupIdentity {
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Control,
             ..f.group.clone()
         };
@@ -1575,14 +1575,14 @@ async fn rd3_d12_o03_direct_requests_beyond_the_ingress_slots_reach_the_leader()
                 let group = f.data_group.clone();
                 let target = f.target.clone();
                 let shared = f.caller_transport.common.shared.clone();
-                tokio::spawn(async move {
+                nabedra_rt::task::spawn(async move {
                     let text = format!("direct-{index}");
                     let reservation = client
                         .reserve_outgoing(
                             &group,
                             target.worker_id,
                             Purpose::ApiIngress,
-                            Instant::now() + WAIT,
+                            nabedra_rt::time::now() + WAIT,
                         )
                         .await?;
                     let header = shared.encode_in(ByteClass::Data, &text, 1024).unwrap();
@@ -1614,7 +1614,7 @@ async fn rd3_d12_o03_direct_requests_beyond_the_ingress_slots_reach_the_leader()
             }
         };
         entered(at_leader).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             f.endpoint.entered.available_permits(),
             0,
@@ -1622,7 +1622,7 @@ async fn rd3_d12_o03_direct_requests_beyond_the_ingress_slots_reach_the_leader()
         );
         // A queued submission refuses at once on a full lane; it still gets in.
         let queued = f.call(&control, Purpose::ApiIngress, "queued");
-        let queued = tokio::spawn(queued);
+        let queued = nabedra_rt::task::spawn(queued);
         entered(1).await;
         assert_eq!(f.client.lane_refusals(), refused, "nothing refused");
         f.endpoint.hold.store(false, Ordering::Release);
@@ -1643,7 +1643,7 @@ async fn rd3_d12_o03_direct_requests_beyond_the_ingress_slots_reach_the_leader()
                 &f.data_group,
                 f.target.worker_id,
                 Purpose::ApiIngress,
-                Instant::now(),
+                nabedra_rt::time::now(),
             )
             .await
         else {

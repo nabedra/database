@@ -23,7 +23,7 @@ use crate::{
 };
 use tokio::{
     sync::{Mutex, watch},
-    time::{Instant, MissedTickBehavior},
+    time::MissedTickBehavior,
 };
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -298,7 +298,7 @@ impl RemotePlacementTarget {
     // This task belongs to the process. Requests can disappear while it holds
     // the generation lease, including after proof bytes reach the proposer.
     pub(crate) async fn settle(&self, mut stop: watch::Receiver<bool>) {
-        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        let mut interval = nabedra_rt::time::interval(Duration::from_millis(250));
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             let activation = {
@@ -313,7 +313,7 @@ impl RemotePlacementTarget {
                     .map(|held| (held.id, held.binding))
             };
             if let Some((id, binding)) = activation {
-                if let Ok(Ok(view)) = tokio::time::timeout(
+                if let Ok(Ok(view)) = nabedra_rt::time::timeout(
                     Duration::from_secs(3),
                     self.control.remote_replica_move(id),
                 )
@@ -630,7 +630,7 @@ impl RemotePlacementTarget {
         let running = self
             .manager
             .hosted_data(&plan.request.group, plan.request.target.node_id)?;
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = nabedra_rt::time::now() + Duration::from_secs(5);
         loop {
             match running
                 .applied_placement(
@@ -647,8 +647,8 @@ impl RemotePlacementTarget {
                     test_record("learner", plan.id, &minimum);
                     return Ok(());
                 }
-                Err(error) if retryable(&error) && Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                Err(error) if retryable(&error) && nabedra_rt::time::now() < deadline => {
+                    nabedra_rt::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(error) => return Err(error),
             }

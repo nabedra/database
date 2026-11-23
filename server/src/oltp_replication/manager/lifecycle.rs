@@ -159,7 +159,7 @@ where
         &self,
         target: &ReplicaMember,
     ) -> Result<AppliedPosition, ProtocolError> {
-        tokio::time::timeout(Duration::from_secs(25), async {
+        nabedra_rt::time::timeout(Duration::from_secs(25), async {
             let reply = self
                 .raft
                 .add_learner(target.node_id, target.clone(), false)
@@ -363,7 +363,7 @@ where
                     return Err(unavailable());
                 }
             }
-            let result = tokio::time::timeout(
+            let result = nabedra_rt::time::timeout(
                 Duration::from_secs(30),
                 self.raft.change_membership_if(
                     new_ids,
@@ -474,7 +474,7 @@ pub(crate) async fn settle_damage(
                 "group damage report not settled yet; retrying"
             ),
         }
-        tokio::time::sleep(delay).await;
+        nabedra_rt::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_secs(30));
     }
 }
@@ -497,7 +497,7 @@ pub(crate) fn spawn_settlement(
     {
         return;
     }
-    tokio::spawn(async move {
+    nabedra_rt::task::spawn(async move {
         let outcome = settle_damage(control, report, pool, Duration::from_secs(1)).await;
         tracing::warn!(group = %key.0, node = key.1, ?outcome, "group damage settled");
         if let Ok(mut settling) = settling.lock() {
@@ -632,7 +632,7 @@ impl HostedGroupManager {
         let routes = Arc::downgrade(&self.routes);
         let sink = Arc::downgrade(&self.damage_sink);
         let host = Arc::downgrade(running);
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             let damaged = damage
                 .wait_for(|groups| groups.contains(&group))
                 .await

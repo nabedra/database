@@ -13,7 +13,6 @@ use crate::oltp_replication::{
     owned::{OwnedCommand, serialized_digest},
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use uuid::Uuid;
 
 struct Node {
     fx: Fixture,
@@ -275,7 +274,7 @@ async fn initialize(handle: &TimestampHandle) -> Authority {
     let ready = ready(worker());
     let authority = ready.view.authority();
     let applied = handle
-        .fence(Uuid::new_v4(), None, authority, ready)
+        .fence(nabedra_rt::ids::uuid_v4(), None, authority, ready)
         .await
         .unwrap();
     assert!(matches!(applied.reply, TimestampReply::Fenced { .. }));
@@ -287,7 +286,7 @@ async fn queued(handle: &TimestampHandle, authority: Authority) -> u64 {
         .begin_backup(
             authority,
             crate::oltp::backup::BackupOwnerRef {
-                backup_id: Uuid::new_v4(),
+                backup_id: nabedra_rt::ids::uuid_v4(),
                 attempt: 1,
             },
         )
@@ -391,10 +390,10 @@ async fn o09_d06_raced_reservation_serves_its_head_and_installs_nothing() {
     f.apply(TimestampCommand::BeginBackup {
         authority,
         owner: crate::oltp::backup::BackupOwnerRef {
-            backup_id: Uuid::new_v4(),
+            backup_id: nabedra_rt::ids::uuid_v4(),
             attempt: 1,
         },
-        pin_id: Uuid::new_v4(),
+        pin_id: nabedra_rt::ids::uuid_v4(),
     })
     .await;
     let windows = f.machine.direct.clone();
@@ -444,7 +443,7 @@ async fn o09_reserve_window_validates_authority_count_and_initialization() {
     );
     f.initialize(ready).await;
     let stale = Authority {
-        run_id: Uuid::new_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
         owner_term: authority.owner_term,
     };
     assert_eq!(
@@ -477,10 +476,10 @@ async fn o09_reserve_window_validates_authority_count_and_initialization() {
         .apply(TimestampCommand::BeginBackup {
             authority,
             owner: crate::oltp::backup::BackupOwnerRef {
-                backup_id: Uuid::new_v4(),
+                backup_id: nabedra_rt::ids::uuid_v4(),
                 attempt: 1,
             },
-            pin_id: Uuid::new_v4(),
+            pin_id: nabedra_rt::ids::uuid_v4(),
         })
         .await
     else {
@@ -692,9 +691,9 @@ async fn o09_d06_perf2a_handle_leader_hint_follows_elections() {
     assert!(handles[0].may_answer());
     cluster.elect(1).await;
     let watch = || async {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(10), async {
             while handles[0].may_answer() || !handles[1].may_answer() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                nabedra_rt::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
@@ -703,7 +702,7 @@ async fn o09_d06_perf2a_handle_leader_hint_follows_elections() {
     watch().await;
 }
 async fn until(mut condition: impl FnMut() -> bool) {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    nabedra_rt::time::timeout(std::time::Duration::from_secs(10), async {
         while !condition() {
             tokio::task::yield_now().await;
         }
@@ -716,7 +715,7 @@ async fn until(mut condition: impl FnMut() -> bool) {
 async fn o09_coalescing_client_shares_one_call_among_concurrent_callers() {
     let remote = Source::new(true);
     let client = DirectTimestampClient::new(None, remote.clone());
-    let first = tokio::spawn({
+    let first = nabedra_rt::task::spawn({
         let client = client.clone();
         async move { client.allocate(1).await }
     });
@@ -724,7 +723,7 @@ async fn o09_coalescing_client_shares_one_call_among_concurrent_callers() {
     let callers: Vec<_> = (0..16u64)
         .map(|index| {
             let client = client.clone();
-            tokio::spawn(async move { client.allocate(index % 3 + 1).await })
+            nabedra_rt::task::spawn(async move { client.allocate(index % 3 + 1).await })
         })
         .collect();
     until(|| client.waiting() == 16).await;
@@ -821,7 +820,7 @@ async fn o09_coalescing_client_falls_back_when_the_local_leader_never_answers() 
         remote.clone(),
         std::time::Duration::from_millis(50),
     );
-    let value = tokio::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
+    let value = nabedra_rt::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
         .await
         .expect("the driver must not wedge on the local route")
         .unwrap();
@@ -852,14 +851,14 @@ async fn o09_d06_local_deadline_releases_a_refill_stuck_in_reserve_window() {
         remote.clone(),
         std::time::Duration::from_millis(50),
     );
-    tokio::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
+    nabedra_rt::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
         .await
         .expect("the driver must not wedge on a stalled ReserveWindow")
         .unwrap();
     assert_eq!(remote.calls(), vec![1]);
     // The abandoned local attempt released the store's refill lock.
     cluster.stalled.store(false, Ordering::SeqCst);
-    tokio::time::timeout(std::time::Duration::from_secs(5), handle.allocate_direct(1))
+    nabedra_rt::time::timeout(std::time::Duration::from_secs(5), handle.allocate_direct(1))
         .await
         .expect("the refill lock must be free")
         .unwrap();
@@ -878,10 +877,10 @@ async fn o09_d06_hosted_apply_discards_the_window_of_an_independent_handle_machi
         .commit_external(TimestampCommand::BeginBackup {
             authority,
             owner: crate::oltp::backup::BackupOwnerRef {
-                backup_id: Uuid::new_v4(),
+                backup_id: nabedra_rt::ids::uuid_v4(),
                 attempt: 1,
             },
-            pin_id: Uuid::new_v4(),
+            pin_id: nabedra_rt::ids::uuid_v4(),
         })
         .await
     else {
@@ -910,7 +909,7 @@ async fn o09_d06_concurrent_queued_and_direct_allocations_keep_real_time_order()
         .map(|task| {
             let handle = handle.clone();
             let clock = clock.clone();
-            tokio::spawn(async move {
+            nabedra_rt::task::spawn(async move {
                 let mut events = Vec::new();
                 let mut seed = 0x2026_1119 ^ (task + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
                 for _ in 0..40 {
@@ -961,7 +960,7 @@ async fn o09_coalescing_client_survives_callers_dropped_mid_batch() {
     let client = DirectTimestampClient::new(None, remote.clone());
     let spawn = |client: &DirectTimestampClient| {
         let client = client.clone();
-        tokio::spawn(async move { client.allocate(1).await })
+        nabedra_rt::task::spawn(async move { client.allocate(1).await })
     };
     let in_flight = spawn(&client);
     until(|| remote.entered.load(Ordering::SeqCst) == 1).await;
@@ -979,7 +978,7 @@ async fn o09_coalescing_client_survives_callers_dropped_mid_batch() {
     remote.hold.add_permits(3);
     let kept = kept.await.unwrap().unwrap();
     let kept_too = kept_too.await.unwrap().unwrap();
-    let later = tokio::time::timeout(std::time::Duration::from_secs(5), client.allocate(1))
+    let later = nabedra_rt::time::timeout(std::time::Duration::from_secs(5), client.allocate(1))
         .await
         .expect("no hang after dropped callers")
         .unwrap();
@@ -1000,7 +999,7 @@ async fn o09_perf2a_idle_caller_calls_on_its_own_task() {
     let client = DirectTimestampClient::new(None, remote.clone());
     let mut last = 0;
     for _ in 0..3 {
-        let caller = tokio::spawn({
+        let caller = nabedra_rt::task::spawn({
             let client = client.clone();
             async move {
                 let value = client.commit_ts().await.unwrap().get();
@@ -1014,12 +1013,12 @@ async fn o09_perf2a_idle_caller_calls_on_its_own_task() {
     }
     // A caller that queues behind a call in flight is served by a driver.
     remote.held.store(true, Ordering::SeqCst);
-    let first = tokio::spawn({
+    let first = nabedra_rt::task::spawn({
         let client = client.clone();
         async move { (client.allocate(1).await.unwrap(), tokio::task::id()) }
     });
     until(|| remote.entered.load(Ordering::SeqCst) == 4).await;
-    let queued = tokio::spawn({
+    let queued = nabedra_rt::task::spawn({
         let client = client.clone();
         async move { (client.allocate(2).await.unwrap(), tokio::task::id()) }
     });
@@ -1035,7 +1034,7 @@ async fn o09_perf2a_idle_caller_calls_on_its_own_task() {
     // The driver stops: the next idle caller calls on its own task again.
     until(|| client.idle()).await;
     remote.held.store(false, Ordering::SeqCst);
-    let (_, task) = tokio::spawn({
+    let (_, task) = nabedra_rt::task::spawn({
         let client = client.clone();
         async move { (client.commit_ts().await.unwrap(), tokio::task::id()) }
     })
@@ -1050,13 +1049,13 @@ async fn o09_coalescing_client_recovers_after_the_driver_panics() {
     let client = DirectTimestampClient::new(None, remote.clone());
     let before = client.commit_ts().await.unwrap();
     remote.panic.store(true, Ordering::SeqCst);
-    let error = tokio::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
+    let error = nabedra_rt::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
         .await
         .expect("waiters of a panicked driver must not hang")
         .unwrap_err();
     assert_eq!(error.outcome, Outcome::Unknown);
     remote.panic.store(false, Ordering::SeqCst);
-    let after = tokio::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
+    let after = nabedra_rt::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
         .await
         .expect("a new driver must start")
         .unwrap();
@@ -1073,7 +1072,7 @@ fn o09_coalescing_client_recovers_after_its_runtime_cancels_the_driver() {
         .unwrap();
     first.block_on(async {
         let client = client.clone();
-        tokio::spawn(async move { client.allocate(1).await });
+        nabedra_rt::task::spawn(async move { client.allocate(1).await });
         until(|| remote.entered.load(Ordering::SeqCst) == 1).await;
     });
     // Dropping the runtime cancels the driver mid-call.
@@ -1084,7 +1083,7 @@ fn o09_coalescing_client_recovers_after_its_runtime_cancels_the_driver() {
         .build()
         .unwrap();
     let value = second.block_on(async {
-        tokio::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
             .await
             .expect("a cancelled driver must not leave the client stuck")
             .unwrap()
@@ -1145,7 +1144,7 @@ async fn o09_d06_perf1_discarded_window_is_reserved_again_in_the_background() {
     assert!(e > q2, "direct value {e} after queued {q2} must be higher");
     assert_eq!(cluster.reserve_window_proposals().await, 3);
     drop(handle);
-    tokio::time::timeout(std::time::Duration::from_secs(5), prefill)
+    nabedra_rt::time::timeout(std::time::Duration::from_secs(5), prefill)
         .await
         .expect("the prefill task ends with its handle")
         .unwrap();

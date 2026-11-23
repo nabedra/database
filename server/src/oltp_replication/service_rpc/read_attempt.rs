@@ -55,7 +55,7 @@ impl ReadAttempts {
         shared: &WorkerSharedResources,
         mut grant: ReadGrant,
     ) -> Result<ReadGrant, ProtocolError> {
-        let now = Instant::now();
+        let now = nabedra_rt::time::now();
         let mut entries = self.entries.lock().map_err(|_| unavailable())?;
         entries
             .retain(|_, entry| !matches!(entry.state, State::Unused(deadline) if deadline <= now));
@@ -66,7 +66,7 @@ impl ReadAttempts {
                 Outcome::NotApplied,
             ));
         }
-        let ticket = Uuid::new_v4();
+        let ticket = nabedra_rt::ids::uuid_v4();
         grant.ticket = ticket;
         if entries.contains_key(&ticket) {
             return Err(unavailable());
@@ -97,7 +97,7 @@ impl ReadAttempts {
         if entry.grant.owner != peer
             || entry.grant.group != group
             || entry.grant.node != node
-            || !matches!(entry.state, State::Unused(deadline) if deadline > Instant::now())
+            || !matches!(entry.state, State::Unused(deadline) if deadline > nabedra_rt::time::now())
         {
             return Err(invalid());
         }
@@ -200,16 +200,16 @@ mod tests {
         let base = shared.scheduler().usage();
         let hash = Digest::from_bytes([7; 32]);
         let worker = WorkerIdentity {
-            worker_id: Uuid::new_v4(),
-            incarnation: Uuid::new_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
             certificate_sha256: hash,
             enrollment_revision: 1,
         };
-        let run_id = Uuid::new_v4();
+        let run_id = nabedra_rt::ids::uuid_v4();
         let scope = ReadScope {
             request: RequestBinding {
                 run_id,
-                request_id: Uuid::new_v4(),
+                request_id: nabedra_rt::ids::uuid_v4(),
                 digest: hash,
                 accepted_context: hash,
             },
@@ -219,7 +219,7 @@ mod tests {
             },
             read_ts: ReadTs::new(13).unwrap(),
         };
-        let group = Uuid::new_v4();
+        let group = nabedra_rt::ids::uuid_v4();
         let grant = ReadGrant {
             scope,
             owner: worker,
@@ -237,7 +237,7 @@ mod tests {
         );
         let live = book.open(&shared, grant).unwrap();
         let stale = WorkerIdentity {
-            incarnation: Uuid::new_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
             ..worker
         };
         assert!(book.claim(live.ticket, stale, group, grant.node).is_err());

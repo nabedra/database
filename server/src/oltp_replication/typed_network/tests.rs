@@ -17,7 +17,8 @@ use crate::{
 };
 use openraft::storage::RaftStateMachine;
 use std::{collections::BTreeMap, path::PathBuf};
-use tokio::{net::TcpListener, sync::oneshot, time::timeout};
+use nabedra_rt::time::timeout;
+use tokio::{net::TcpListener, sync::oneshot};
 use uuid::Uuid;
 
 #[path = "tests/progress.rs"]
@@ -31,8 +32,8 @@ mod replicated_durability;
 fn o26_learner_accepts_current_leader_while_replaying_historical_membership() {
     let member = |node_id| ReplicaMember {
         node_id,
-        worker_id: Uuid::new_v4(),
-        pool_id: Uuid::new_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
     };
     let first = member(1);
     let second = member(2);
@@ -121,14 +122,14 @@ impl PeerDirectory for Directory {
 async fn o05_o28_typed_mtls_snapshot_installs_exact_group_cut_with_data_wire_full() {
     timeout(Duration::from_secs(40), async {
         let dir =
-            Temporary(std::env::temp_dir().join(format!("typed-snapshot-{}", Uuid::new_v4())));
+            Temporary(std::env::temp_dir().join(format!("typed-snapshot-{}", nabedra_rt::ids::uuid_v4())));
         std::fs::create_dir(&dir.0).unwrap();
         let certificates = tls::certificates(&dir.0, 3);
-        let cluster = Uuid::new_v4();
+        let cluster = nabedra_rt::ids::uuid_v4();
         let group = GroupIdentity {
             cluster_id: cluster,
             database: Text::try_from("snapshot").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Timestamps,
             group_format_version: 1,
         };
@@ -137,8 +138,8 @@ async fn o05_o28_typed_mtls_snapshot_installs_exact_group_cut_with_data_wire_ful
         for tls in &certificates {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             workers.push(WorkerEnrollment {
-                worker_id: Uuid::new_v4(),
-                incarnation: Uuid::new_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                incarnation: nabedra_rt::ids::uuid_v4(),
                 certificate_sha256: Digest::parse(tls.certificate_sha256()).unwrap(),
                 enrollment_revision: 1,
                 endpoint: Text::new(listener.local_addr().unwrap().to_string()).unwrap(),
@@ -156,7 +157,7 @@ async fn o05_o28_typed_mtls_snapshot_installs_exact_group_cut_with_data_wire_ful
                     ReplicaMember {
                         node_id: node,
                         worker_id: worker.worker_id,
-                        pool_id: Uuid::new_v4(),
+                        pool_id: nabedra_rt::ids::uuid_v4(),
                     },
                 )
             })
@@ -231,7 +232,7 @@ async fn o05_o28_typed_mtls_snapshot_installs_exact_group_cut_with_data_wire_ful
                 .unwrap();
             let (stop, stopped) = oneshot::channel();
             stops.push(stop);
-            transports.push(tokio::spawn(transport.run(listener, async {
+            transports.push(nabedra_rt::task::spawn(transport.run(listener, async {
                 let _ = stopped.await;
             })));
             hosts.push(host);
@@ -246,12 +247,12 @@ async fn o05_o28_typed_mtls_snapshot_installs_exact_group_cut_with_data_wire_ful
             if hosts[1].ensure_linearizable().await.is_ok() {
                 break 1;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(10)).await;
         };
         let follower = 2;
         let ready = ReadyMembership {
             view: AuthorityView {
-                run_id: Uuid::new_v4(),
+                run_id: nabedra_rt::ids::uuid_v4(),
                 owner_term: 1,
                 membership_revision: 1,
             },
@@ -263,7 +264,7 @@ async fn o05_o28_typed_mtls_snapshot_installs_exact_group_cut_with_data_wire_ful
             hosts[leader].clone(),
         );
         handle
-            .fence(Uuid::new_v4(), None, ready.view.authority(), ready)
+            .fence(nabedra_rt::ids::uuid_v4(), None, ready.view.authority(), ready)
             .await
             .unwrap();
         // SNAP1: what the replication task sends a lagging follower: a fresh
@@ -341,14 +342,14 @@ async fn o05_o28_typed_mtls_snapshot_installs_exact_group_cut_with_data_wire_ful
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
     timeout(Duration::from_secs(60), async {
-        let dir = Temporary(std::env::temp_dir().join(format!("typed-move-{}", Uuid::new_v4())));
+        let dir = Temporary(std::env::temp_dir().join(format!("typed-move-{}", nabedra_rt::ids::uuid_v4())));
         std::fs::create_dir(&dir.0).unwrap();
         let certificates = tls::certificates(&dir.0, 4);
-        let cluster = Uuid::new_v4();
+        let cluster = nabedra_rt::ids::uuid_v4();
         let group = GroupIdentity {
             cluster_id: cluster,
             database: Text::try_from("replica-move").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Timestamps,
             group_format_version: 1,
         };
@@ -357,8 +358,8 @@ async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
         for tls in &certificates {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             workers.push(WorkerEnrollment {
-                worker_id: Uuid::new_v4(),
-                incarnation: Uuid::new_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                incarnation: nabedra_rt::ids::uuid_v4(),
                 certificate_sha256: Digest::parse(tls.certificate_sha256()).unwrap(),
                 enrollment_revision: 1,
                 endpoint: Text::new(listener.local_addr().unwrap().to_string()).unwrap(),
@@ -376,7 +377,7 @@ async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
                     ReplicaMember {
                         node_id: node,
                         worker_id: worker.worker_id,
-                        pool_id: Uuid::new_v4(),
+                        pool_id: nabedra_rt::ids::uuid_v4(),
                     },
                 )
             })
@@ -448,7 +449,7 @@ async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
                 .unwrap();
             let (stop, stopped) = oneshot::channel();
             stops.push(Some(stop));
-            transports.push(tokio::spawn(transport.run(listener, async {
+            transports.push(nabedra_rt::task::spawn(transport.run(listener, async {
                 let _ = stopped.await;
             })));
             hosts.push(host);
@@ -469,14 +470,14 @@ async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
                             return index;
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    nabedra_rt::time::sleep(Duration::from_millis(10)).await;
                 }
             }
         };
         let lost = elected(None).await;
         let ready = ReadyMembership {
             view: AuthorityView {
-                run_id: Uuid::new_v4(),
+                run_id: nabedra_rt::ids::uuid_v4(),
                 owner_term: 1,
                 membership_revision: 1,
             },
@@ -489,7 +490,7 @@ async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
             hosts[lost].clone(),
         );
         let before = handle
-            .fence(Uuid::new_v4(), None, authority, ready)
+            .fence(nabedra_rt::ids::uuid_v4(), None, authority, ready)
             .await
             .unwrap();
         drop(handle);
@@ -656,7 +657,7 @@ async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
             hosts[leader].clone(),
         );
         handle
-            .fence(Uuid::new_v4(), Some(authority), next_authority, next_ready)
+            .fence(nabedra_rt::ids::uuid_v4(), Some(authority), next_authority, next_ready)
             .await
             .unwrap();
         assert_eq!(

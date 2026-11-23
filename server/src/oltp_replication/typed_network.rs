@@ -228,7 +228,7 @@ impl<C: TypedConfig> TypedNetwork<C> {
         } else {
             (128 << 10, 16 << 10)
         };
-        let reply = tokio::time::timeout(
+        let reply = nabedra_rt::time::timeout(
             ttl,
             self.factory.client.request_classified(
                 group,

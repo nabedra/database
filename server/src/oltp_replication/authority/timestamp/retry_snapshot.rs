@@ -132,7 +132,7 @@ impl TimestampHandle {
                 view,
                 identity,
                 previous: previous.into_sealed(),
-                pin_id: Uuid::new_v4(),
+                pin_id: nabedra_rt::ids::uuid_v4(),
             })
             .await?
             .reply

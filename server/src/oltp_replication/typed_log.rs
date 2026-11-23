@@ -272,7 +272,7 @@ struct PendingGuard(Arc<Pending>);
 /// worker's pools at once (KVfix4: a local binding of the guard dropped before
 /// the task's captured store, so `bind_worker` met the old owner).
 fn spawn_pending(pending: PendingGuard, task: impl Future<Output = ()> + Send + 'static) {
-    tokio::spawn(async move {
+    nabedra_rt::task::spawn(async move {
         task.await;
         drop(pending);
     });
@@ -444,7 +444,7 @@ impl<C: TypedConfig> TypedLogStore<C> {
                 if !self.overlay.contains(start) {
                     break;
                 }
-                waited.get_or_insert_with(std::time::Instant::now);
+                waited.get_or_insert_with(nabedra_rt::time::now_std);
                 settled.await;
             }
             let Some(waited) = waited else {
@@ -892,7 +892,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         I: IntoIterator<Item = OwnedRaftEntry<C::Command>> + Send,
         I::IntoIter: Send,
     {
-        let submit = std::time::Instant::now();
+        let submit = nabedra_rt::time::now_std();
         // Own a bounded append before the first write. The typed host config
         // admits at most `MAX_APPEND_ENTRIES` entries per append; the writer
         // splits them into synced batches of at most `MAX_APPEND_BYTES`.
@@ -998,7 +998,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         spawn_pending(pending, async move {
             use crate::oltp_runtime::stage_timing::{by_kind, perf_stage};
             let kind = store.identity().kind.clone();
-            let started = std::time::Instant::now();
+            let started = nabedra_rt::time::now_std();
             let data = matches!(kind, crate::oltp_replication::types::GroupKind::Data { .. });
             if data {
                 super::hosted::proposal_clock::mark(perf_stage!("raft.data.propose_to_append"));
@@ -1047,7 +1047,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             };
             #[cfg(test)]
             let append_hook = jobs.iter().find_map(|job| job.hook.clone());
-            let ordered = std::time::Instant::now();
+            let ordered = nabedra_rt::time::now_std();
             let result: io::Result<()> = async {
                 if overlay.failed() {
                     return Err(invalid("an earlier Raft append failed before its sync"));
@@ -1099,7 +1099,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                 )
                 .await
                 .map_err(disk)?;
-                let written = std::time::Instant::now();
+                let written = nabedra_rt::time::now_std();
                 by_kind(
                     &kind,
                     [

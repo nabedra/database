@@ -132,8 +132,8 @@ async fn propose_until_full(
         *next += 1;
         let consensus = node.consensus.clone();
         let command = command(node, id, &"y".repeat(512));
-        let mut task = tokio::spawn(async move { consensus.propose(command).await });
-        match tokio::time::timeout(Duration::from_secs(3), &mut task).await {
+        let mut task = nabedra_rt::task::spawn(async move { consensus.propose(command).await });
+        match nabedra_rt::time::timeout(Duration::from_secs(3), &mut task).await {
             Ok(result) => match result.unwrap() {
                 Ok(_) => acked.push(id),
                 Err(error) if crate::oltp::pool::is_no_space(&error) => return (acked, None),
@@ -168,9 +168,9 @@ async fn ns11_o06_o17_rv_apply_enospc_keeps_raft_cores_alive() {
     acked.extend(0..8);
     // The pending proposal (or a Raft metadata write) keeps meeting a full
     // device and retries.
-    tokio::time::timeout(Duration::from_secs(10), async {
+    nabedra_rt::time::timeout(Duration::from_secs(10), async {
         while health(&node).no_space_retries < 3 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -188,7 +188,7 @@ async fn ns11_o06_o17_rv_apply_enospc_keeps_raft_cores_alive() {
     for _ in 0..5 {
         let id = next;
         next += 1;
-        match tokio::time::timeout(
+        match nabedra_rt::time::timeout(
             Duration::from_secs(5),
             node.consensus.propose(command(&node, id, "refused")),
         )
@@ -208,7 +208,7 @@ async fn ns11_o06_o17_rv_apply_enospc_keeps_raft_cores_alive() {
 
     fault.clear_faults();
     if let Some((id, pending)) = pending {
-        tokio::time::timeout(Duration::from_secs(20), pending)
+        nabedra_rt::time::timeout(Duration::from_secs(20), pending)
             .await
             .expect("the pending proposal completes once space is back")
             .unwrap()
@@ -258,19 +258,19 @@ async fn ns11_rv_apply_shutdown_ends_a_no_space_retry() {
     node.lead(&layout, true).await;
     fill_device(&fault, &path);
     let (_, pending) = propose_until_full(&node, &mut 0).await;
-    tokio::time::timeout(Duration::from_secs(10), async {
+    nabedra_rt::time::timeout(Duration::from_secs(10), async {
         while health(&node).no_space_retries == 0 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), node.consensus.shutdown())
+    nabedra_rt::time::timeout(Duration::from_secs(10), node.consensus.shutdown())
         .await
         .expect("shutdown waits for a NoSpace retry")
         .ok();
     if let Some((_, pending)) = pending {
-        let _ = tokio::time::timeout(Duration::from_secs(5), pending).await;
+        let _ = nabedra_rt::time::timeout(Duration::from_secs(5), pending).await;
     }
 }
 
@@ -308,7 +308,7 @@ async fn ns11_o16_rv_apply_failed_snapshot_build_is_deferred() {
         .fail_exports
         .store(0, std::sync::atomic::Ordering::Release);
     // Past the deferral window, the next policy build succeeds.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(1100)).await;
     for id in 60..90 {
         node.consensus
             .propose(command(&node, id, "x"))
@@ -346,7 +346,7 @@ async fn o16_rv_apply_snapshot_metadata_pressure_waits() {
     let budget = crate::oltp::pool::RAFT_REPLICA_BYTES / 2;
     let hold = resident.metadata(budget - (128 << 10)).unwrap();
     node.consensus.raft.trigger().snapshot().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(500)).await;
     assert!(
         running(&node),
         "snapshot metadata pressure stopped the core"
@@ -383,8 +383,8 @@ async fn o06_rv_apply_leader_membership_append_waits_for_log_metadata() {
     let raft = node.consensus.raft.clone();
     let member = layout.member();
     let initialize =
-        tokio::spawn(async move { raft.initialize(BTreeMap::from([(1, member)])).await });
-    tokio::time::sleep(Duration::from_millis(800)).await;
+        nabedra_rt::task::spawn(async move { raft.initialize(BTreeMap::from([(1, member)])).await });
+    nabedra_rt::time::sleep(Duration::from_millis(800)).await;
     assert!(running(&node), "a log metadata refusal stopped the core");
     assert_eq!(
         node.consensus
@@ -414,7 +414,7 @@ async fn o06_rv_apply_oversized_reply_drops_the_responder() {
     let layout = Layout::new();
     let node = open_node(&path, &layout, &fault, None).await;
     node.lead(&layout, true).await;
-    let oversized = tokio::time::timeout(
+    let oversized = nabedra_rt::time::timeout(
         Duration::from_secs(10),
         node.consensus.propose(command(&node, 1, BIG_REPLY)),
     )

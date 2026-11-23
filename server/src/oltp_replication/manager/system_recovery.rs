@@ -134,7 +134,7 @@ where
                 && request.matches(state.membership_config.membership())
                 && state.membership_config == state.committed_membership_config
         };
-        tokio::time::timeout(QUORUM_TIMEOUT, async {
+        nabedra_rt::time::timeout(QUORUM_TIMEOUT, async {
             let term = {
                 let state = metrics.borrow_watched();
                 if !matches_leader(&state) {

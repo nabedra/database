@@ -97,18 +97,18 @@ struct Worker {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn c07_m02_o05_o06_o11_o22_mtls_data_and_catalog_raft_progress_during_bulk_pressure() {
     timeout(Duration::from_secs(75), async {
-        let dir = Temporary(std::env::temp_dir().join(format!("raft-progress-{}", Uuid::new_v4())));
+        let dir = Temporary(std::env::temp_dir().join(format!("raft-progress-{}", nabedra_rt::ids::uuid_v4())));
         std::fs::create_dir(&dir.0).unwrap();
         let tls = tls::certificates(&dir.0, 2);
-        let cluster = Uuid::new_v4();
+        let cluster = nabedra_rt::ids::uuid_v4();
         let data_kind = GroupKind::Data {
-            table_id: Uuid::new_v4(),
-            shard_id: Uuid::new_v4(),
+            table_id: nabedra_rt::ids::uuid_v4(),
+            shard_id: nabedra_rt::ids::uuid_v4(),
         };
         let group = |kind| GroupIdentity {
             cluster_id: cluster,
             database: Text::try_from("progress").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind,
             group_format_version: 1,
         };
@@ -126,8 +126,8 @@ async fn c07_m02_o05_o06_o11_o22_mtls_data_and_catalog_raft_progress_during_bulk
         for (index, tls) in tls.iter().enumerate() {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let worker = WorkerEnrollment {
-                worker_id: Uuid::new_v4(),
-                incarnation: Uuid::new_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                incarnation: nabedra_rt::ids::uuid_v4(),
                 certificate_sha256: Digest::parse(tls.certificate_sha256()).unwrap(),
                 enrollment_revision: 2,
                 endpoint: Text::new(listener.local_addr().unwrap().to_string()).unwrap(),
@@ -139,7 +139,7 @@ async fn c07_m02_o05_o06_o11_o22_mtls_data_and_catalog_raft_progress_during_bulk
                 ReplicaMember {
                     node_id,
                     worker_id: worker.worker_id,
-                    pool_id: Uuid::new_v4(),
+                    pool_id: nabedra_rt::ids::uuid_v4(),
                 },
             );
             workers.insert(worker.worker_id, worker);
@@ -204,7 +204,7 @@ async fn c07_m02_o05_o06_o11_o22_mtls_data_and_catalog_raft_progress_during_bulk
                 .unwrap(),
             );
             let mut stale = worker.clone();
-            stale.incarnation = Uuid::new_v4();
+            stale.incarnation = nabedra_rt::ids::uuid_v4();
             stale.enrollment_revision = 1;
             let stale_client = WorkerTransport::new(
                 &stale,
@@ -218,7 +218,7 @@ async fn c07_m02_o05_o06_o11_o22_mtls_data_and_catalog_raft_progress_during_bulk
             .client();
             let manager = HostedGroupManager::new(shared.clone(), transport.client(), registry);
             let (stop, stopped) = oneshot::channel();
-            let transport = tokio::spawn(transport.run(listener, async {
+            let transport = nabedra_rt::task::spawn(transport.run(listener, async {
                 let _ = stopped.await;
             }));
             sides.push(Worker {
@@ -343,10 +343,10 @@ async fn assert_progress<C>(
         .propose(
             OwnedCommand::new_owned(
                 ParticipantCommand::Fence {
-                    transition_id: Uuid::new_v4(),
+                    transition_id: nabedra_rt::ids::uuid_v4(),
                     expected: None,
                     next: Authority {
-                        run_id: Uuid::new_v4(),
+                        run_id: nabedra_rt::ids::uuid_v4(),
                         owner_term: 1,
                     },
                     schema_epoch: 1,
@@ -417,7 +417,7 @@ async fn assert_progress<C>(
             .allocate_bytes(ByteClass::Data, BODY_BYTES)
             .unwrap()
             .freeze();
-        background.push(tokio::spawn(async move {
+        background.push(nabedra_rt::task::spawn(async move {
             client
                 .request(
                     &source,
@@ -459,7 +459,7 @@ async fn assert_progress<C>(
     assert_eq!(barrier.applied, proposed.position);
     timeout(WAIT, async {
         while follower_log.read_committed().await.unwrap() != Some(cut) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await

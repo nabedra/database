@@ -194,14 +194,14 @@ impl Layout {
         let pool = PoolIdentity {
             engine: "oltp".into(),
             pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-            cluster_id: Uuid::new_v4(),
-            worker_id: Uuid::new_v4(),
-            pool_id: Uuid::new_v4(),
+            cluster_id: nabedra_rt::ids::uuid_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
         };
         let group = GroupIdentity {
             cluster_id: pool.cluster_id,
             database: Text::try_from("default").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Catalog,
             group_format_version: 1,
         };
@@ -304,7 +304,7 @@ impl Node {
                 ByteClass::Data,
             )
             .unwrap();
-            tasks.push(tokio::spawn(async move {
+            tasks.push(nabedra_rt::task::spawn(async move {
                 consensus.propose(command).await.unwrap().position.index
             }));
         }
@@ -345,7 +345,7 @@ async fn read_markers(store: &GroupStore, ids: std::ops::Range<u64>) -> u64 {
 struct Dir(PathBuf);
 impl Dir {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("t2-hosted-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("t2-hosted-{}", nabedra_rt::ids::uuid_v4()));
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }
@@ -692,7 +692,7 @@ impl LogLayout {
     fn new() -> Self {
         let layout = Layout::new();
         let busy = GroupIdentity {
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             ..layout.group.clone()
         };
         Self {
@@ -749,7 +749,7 @@ impl LogRig {
     /// synced entries.
     async fn close(self) {
         for log in &self.logs {
-            tokio::time::timeout(Duration::from_secs(30), log.drain())
+            nabedra_rt::time::timeout(Duration::from_secs(30), log.drain())
                 .await
                 .expect("pending log operations finish");
         }
@@ -811,7 +811,7 @@ impl LogRig {
     /// Blocking store maintenance, off the async runtime.
     async fn maintain(&self, step: Maintenance) -> Result<(), nabedra_kv::Error> {
         let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || {
+        nabedra_rt::task::spawn_blocking(move || {
             let store = pool.kv_store();
             match step {
                 Maintenance::Flush => store.flush(),
@@ -1142,7 +1142,7 @@ async fn ns13_raft_log_write_amplification_from_store_stats() {
         }
         log.drain().await;
         let flushed = pool.clone();
-        tokio::task::spawn_blocking(move || {
+        nabedra_rt::task::spawn_blocking(move || {
             flushed.kv_store().flush().unwrap();
             flushed.kv_store().compact().unwrap();
         })

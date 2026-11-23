@@ -22,7 +22,7 @@ pub(crate) fn watch(consensus: &RaftConsensus<DataConfig, ParticipantMachine>) {
         let node = consensus.state._resident.node_id();
         let clock = RangeClock::for_store(consensus.state.store());
         let restarts = consensus.raft.subscribe_restarts();
-        tokio::spawn(follow_cores(
+        nabedra_rt::task::spawn(follow_cores(
             Arc::downgrade(&consensus.raft),
             restarts,
             node,

@@ -232,7 +232,7 @@ impl HostRetry {
     /// instead of exporting again at every applied entry.
     pub(crate) fn defer_snapshots(&self, delay: Duration) {
         if let Ok(mut until) = self.defer_snapshots_until.lock() {
-            *until = Some(tokio::time::Instant::now() + delay);
+            *until = Some(nabedra_rt::time::now() + delay);
         }
     }
     pub(crate) fn snapshots_deferred(&self) -> bool {
@@ -240,7 +240,7 @@ impl HostRetry {
             .lock()
             .ok()
             .and_then(|until| *until)
-            .is_some_and(|until| tokio::time::Instant::now() < until)
+            .is_some_and(|until| nabedra_rt::time::now() < until)
     }
     #[cfg(test)]
     pub(crate) fn take_vote_fault(&self) -> bool {
@@ -290,7 +290,7 @@ impl HostRetry {
         Fut: Future<Output = Result<T, ProtocolError>>,
     {
         let epoch = self.epoch.load(Ordering::Acquire);
-        let started = tokio::time::Instant::now();
+        let started = nabedra_rt::time::now();
         let mut delay = FIRST_DELAY;
         let mut attempts = 0u64;
         loop {
@@ -332,7 +332,7 @@ impl HostRetry {
                 return Err(error);
             }
             tokio::select! {
-                () = tokio::time::sleep(delay) => {}
+                () = nabedra_rt::time::sleep(delay) => {}
                 () = stopped => return Err(error),
             }
             delay = (delay * 2).min(MAX_DELAY);

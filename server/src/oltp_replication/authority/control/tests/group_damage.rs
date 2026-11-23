@@ -17,10 +17,10 @@ impl GroupDamageGate for Open {
 
 fn data_group(scope: &GroupIdentity) -> GroupIdentity {
     GroupIdentity {
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Data {
-            table_id: Uuid::new_v4(),
-            shard_id: Uuid::new_v4(),
+            table_id: nabedra_rt::ids::uuid_v4(),
+            shard_id: nabedra_rt::ids::uuid_v4(),
         },
         ..scope.clone()
     }
@@ -32,7 +32,7 @@ fn report(group: &GroupIdentity, worker: WorkerIdentity, node: u64) -> GroupDama
         replica: ReplicaMember {
             node_id: node,
             worker_id: worker.worker_id,
-            pool_id: Uuid::new_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
         },
         reason: GroupDamageReason::JournalRecord,
         first_bad_seq: Some(17),
@@ -57,14 +57,14 @@ async fn data_placement(
                 .get(index)
                 .copied()
                 .flatten()
-                .unwrap_or_else(Uuid::new_v4),
+                .unwrap_or_else(nabedra_rt::ids::uuid_v4),
         })
         .collect();
     let record = f
         .register_group(
             GroupKind::Data {
-                table_id: Uuid::new_v4(),
-                shard_id: Uuid::new_v4(),
+                table_id: nabedra_rt::ids::uuid_v4(),
+                shard_id: nabedra_rt::ids::uuid_v4(),
             },
             members.clone(),
         )
@@ -111,7 +111,7 @@ fn plan(
 
 async fn begin(f: &mut Fixture, plan: &GroupDamageReplacementPlan) -> ControlReply {
     f.apply(ControlCommand::GroupDamageReplacementBegin {
-        operation_id: Uuid::new_v4(),
+        operation_id: nabedra_rt::ids::uuid_v4(),
         authorization: AuthorizationStamp {
             evidence: serialized_digest(plan).unwrap(),
             ..authorization()
@@ -165,7 +165,7 @@ fn replaced_by(
 
 async fn replaced(f: &mut Fixture, proof: GroupDamageReplacement) -> ControlReply {
     f.apply(ControlCommand::GroupDamageReplaced {
-        operation_id: Uuid::new_v4(),
+        operation_id: nabedra_rt::ids::uuid_v4(),
         authorization: AuthorizationStamp {
             evidence: serialized_digest(&proof).unwrap(),
             ..authorization()
@@ -253,13 +253,13 @@ async fn o17_ns14_group_damaged_is_recorded_once_and_replaced_only_by_proof() {
     let fresh = ReplicaMember {
         node_id: 9,
         worker_id: spare.worker_id,
-        pool_id: Uuid::new_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
     };
     let proof = replaced_by(&damage, fresh.clone(), 40);
     // Unauthorized: the stamp does not bind this proof.
     assert_eq!(
         f.apply(ControlCommand::GroupDamageReplaced {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             authorization: authorization(),
             proof: Box::new(proof.clone()),
         })
@@ -349,7 +349,7 @@ async fn o17_ns14_group_damaged_is_recorded_once_and_replaced_only_by_proof() {
     // worker that restarts reads its release evidence.
     let after = record(
         f.apply(ControlCommand::GroupDamaged {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             worker,
             report: Box::new(damage),
         })
@@ -376,9 +376,9 @@ async fn o17_ns14b_begin_claims_once_rate_limits_and_frees_on_publication() {
     let fresh = |node: u64, worker: &WorkerIdentity| ReplicaMember {
         node_id: node,
         worker_id: worker.worker_id,
-        pool_id: Uuid::new_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
     };
-    let shared_pool = Uuid::new_v4();
+    let shared_pool = nabedra_rt::ids::uuid_v4();
     let (a, a_members) = data_placement(&mut f, &workers[0..3], &[]).await;
     let (b, b_members) = data_placement(&mut f, &workers[3..6], &[]).await;
     let (c, c_members) = data_placement(
@@ -423,7 +423,7 @@ async fn o17_ns14b_begin_claims_once_rate_limits_and_frees_on_publication() {
     );
     // A placement that is no longer published is stale.
     let mut stale = plan(&a, &a_members, 2, fresh(4, &workers[7]));
-    stale.expected.generation = Uuid::new_v4();
+    stale.expected.generation = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         begin(&mut f, &stale).await,
         ControlReply::Rejected(Fault::Stale)
@@ -515,7 +515,7 @@ async fn o17_o26_ns14_control_handle_gates_reports_and_serves_the_release_record
     let local = WorkerIdentity::from(&enrollment);
     assert_eq!(
         f.apply(ControlCommand::Enroll {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             expected: None,
             next: enrollment,
             authorization: authorization(),
@@ -587,12 +587,12 @@ async fn o17_o26_ns14_control_handle_gates_reports_and_serves_the_release_record
     let fresh = ReplicaMember {
         node_id: 8,
         worker_id: spare.worker_id,
-        pool_id: Uuid::new_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
     };
     let premature = handle
         .group_damage_replaced_local(
             &permit,
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             replaced_by(&refused, fresh.clone(), 12),
         )
         .await
@@ -600,7 +600,7 @@ async fn o17_o26_ns14_control_handle_gates_reports_and_serves_the_release_record
     assert_eq!(premature.code, ErrorCode::Conflict);
     let chosen = plan(&placement, &members, 1, fresh.clone());
     let claimed = handle
-        .begin_group_damage_replacement_local(&permit, Uuid::new_v4(), chosen.clone())
+        .begin_group_damage_replacement_local(&permit, nabedra_rt::ids::uuid_v4(), chosen.clone())
         .await
         .unwrap();
     assert_eq!(claimed.plan(), Some(&chosen));
@@ -614,7 +614,7 @@ async fn o17_o26_ns14_control_handle_gates_reports_and_serves_the_release_record
     let done = handle
         .group_damage_replaced_local(
             &permit,
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             replaced_by(&refused, fresh.clone(), 12),
         )
         .await

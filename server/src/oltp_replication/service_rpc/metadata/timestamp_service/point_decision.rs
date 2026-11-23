@@ -83,7 +83,7 @@ impl TimestampEndpoint {
         source_digest: Digest,
         locator_digest: Digest,
     ) -> Result<ChargedBytes, ProtocolError> {
-        tokio::time::timeout(SERVICE_CONVERGENCE, async {
+        nabedra_rt::time::timeout(SERVICE_CONVERGENCE, async {
             let locator: Decoded<TimestampDecisionLocator> = self
                 .handle
                 .resources()
@@ -226,7 +226,7 @@ impl TimestampEndpoint {
             return Err(invalid());
         };
         self.validate_point_home(locator)?;
-        tokio::time::timeout(SERVICE_CONVERGENCE, async {
+        nabedra_rt::time::timeout(SERVICE_CONVERGENCE, async {
             let (authority, epoch) = self.scoped_point_authority(session, head, locator).await?;
             let mut reconcile = reconcile;
             let binding = &locator.binding;
@@ -327,7 +327,7 @@ impl TimestampEndpoint {
         {
             return Err(invalid());
         }
-        tokio::time::timeout(SERVICE_CONVERGENCE, async {
+        nabedra_rt::time::timeout(SERVICE_CONVERGENCE, async {
             let (grant, placement, _) = tokio::try_join!(
                 service_grant(&self.control, session, head),
                 self.control.scoped_queue(&binding.participant.group),
@@ -354,7 +354,7 @@ impl TimestampEndpoint {
         locator: TimestampDecisionLocator,
     ) -> Result<ChargedBytes, ProtocolError> {
         self.validate_point_home(&locator)?;
-        tokio::time::timeout(SERVICE_CONVERGENCE, async {
+        nabedra_rt::time::timeout(SERVICE_CONVERGENCE, async {
             let authorize = async {
                 match head.action {
                     ServiceAction::ScopedQueueExecute(_) => {
@@ -385,7 +385,7 @@ impl TimestampEndpoint {
         if head.action != ServiceAction::Owner || transition_id.is_nil() {
             return Err(invalid());
         }
-        tokio::time::timeout(SERVICE_CONVERGENCE, async {
+        nabedra_rt::time::timeout(SERVICE_CONVERGENCE, async {
             let grant = service_grant(&self.control, session, head).await?;
             let authority = grant.effective_authority;
             if grant.owner != Some(session.remote())
@@ -500,7 +500,7 @@ impl TimestampClient {
         {
             return Err(invalid());
         }
-        tokio::time::timeout(
+        nabedra_rt::time::timeout(
             SERVICE_CONVERGENCE,
             self.value(Request::VerifyTimestampPointPin(Box::new(binding.clone()))),
         )
@@ -522,7 +522,7 @@ impl TimestampClient {
             return Err(invalid());
         }
         let client = &self.client;
-        tokio::time::timeout(SERVICE_CONVERGENCE, async {
+        nabedra_rt::time::timeout(SERVICE_CONVERGENCE, async {
             let target = client.control.timestamp_point_routes(&client.group).await?;
             let method = Method::TimestampPointDecisionRead {
                 route: TimestampPointRoute {
@@ -587,7 +587,7 @@ impl TimestampClient {
             return Err(invalid());
         };
         validate_queue_scope(scope, locator)?;
-        tokio::time::timeout(SERVICE_CONVERGENCE, async {
+        nabedra_rt::time::timeout(SERVICE_CONVERGENCE, async {
             if !reconcile {
                 let request = operation.request(locator, false);
                 let routes = self
@@ -606,7 +606,7 @@ impl TimestampClient {
                     .ok_or_else(unavailable)?;
                 let method = request.method();
                 let payload = Some(encode(&self.client.shared, request).await?);
-                let response = tokio::time::timeout(
+                let response = nabedra_rt::time::timeout(
                     HINTED_READ_TIMEOUT,
                     self.client.call_member(
                         self.client.action,
@@ -651,7 +651,7 @@ impl TimestampClient {
         } else if self.client.action != ServiceAction::Owner {
             return Err(invalid());
         }
-        tokio::time::timeout(SERVICE_CONVERGENCE, async {
+        nabedra_rt::time::timeout(SERVICE_CONVERGENCE, async {
             let response = self
                 .response(Request::ObserveTimestampPoint {
                     locator: locator.clone(),
@@ -679,7 +679,7 @@ impl TimestampClient {
         if self.client.action != ServiceAction::Owner || transition_id.is_nil() {
             return Err(invalid());
         }
-        tokio::time::timeout(SERVICE_CONVERGENCE, async {
+        nabedra_rt::time::timeout(SERVICE_CONVERGENCE, async {
             let response = self
                 .response(Request::AbandonTimestampPoint {
                     locator: locator.clone(),

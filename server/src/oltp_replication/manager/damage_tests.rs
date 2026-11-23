@@ -17,7 +17,8 @@ use crate::{
 };
 use nabedra_kv::fs::{FaultFs, Fs};
 use std::{path::PathBuf, time::Duration};
-use tokio::{net::TcpListener, sync::oneshot, time::timeout};
+use nabedra_rt::time::timeout;
+use tokio::{net::TcpListener, sync::oneshot};
 use uuid::Uuid;
 
 struct Temporary(PathBuf);
@@ -90,14 +91,14 @@ impl Cluster {
     }
     /// [`Self::new`], with every worker's journal syncs behind a gate.
     async fn new_with(count: usize, voters: usize, gated: bool) -> Self {
-        let dir = Temporary(std::env::temp_dir().join(format!("ns23-{}", Uuid::new_v4())));
+        let dir = Temporary(std::env::temp_dir().join(format!("ns23-{}", nabedra_rt::ids::uuid_v4())));
         std::fs::create_dir(&dir.0).unwrap();
         let tls = tls::certificates(&dir.0, count as u64);
-        let cluster = Uuid::new_v4();
+        let cluster = nabedra_rt::ids::uuid_v4();
         let group = GroupIdentity {
             cluster_id: cluster,
             database: Text::try_from("ns23").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Timestamps,
             group_format_version: 1,
         };
@@ -106,8 +107,8 @@ impl Cluster {
         for material in &tls {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             enrollments.push(WorkerEnrollment {
-                worker_id: Uuid::new_v4(),
-                incarnation: Uuid::new_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                incarnation: nabedra_rt::ids::uuid_v4(),
                 certificate_sha256: Digest::parse(material.certificate_sha256()).unwrap(),
                 enrollment_revision: 1,
                 endpoint: Text::new(listener.local_addr().unwrap().to_string()).unwrap(),
@@ -125,7 +126,7 @@ impl Cluster {
                     ReplicaMember {
                         node_id: node,
                         worker_id: worker.worker_id,
-                        pool_id: Uuid::new_v4(),
+                        pool_id: nabedra_rt::ids::uuid_v4(),
                     },
                 )
             })
@@ -146,7 +147,7 @@ impl Cluster {
             members,
             group,
             workers: Vec::new(),
-            run_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
         };
         for (index, listener) in listeners.into_iter().enumerate() {
             let shared = WorkerSharedResources::new(
@@ -264,14 +265,14 @@ impl Cluster {
         let manager = HostedGroupManager::new(worker.shared.clone(), transport.client(), registry);
         let (stop, stopped) = oneshot::channel();
         worker.stop = Some(stop);
-        worker.transport = Some(tokio::spawn(transport.run(listener, async {
+        worker.transport = Some(nabedra_rt::task::spawn(transport.run(listener, async {
             let _ = stopped.await;
         })));
         if create {
             // The pool-wide records get a run of their own, so a damaged run
             // block of the group never covers store-wide keys.
             let flushing = pool.clone();
-            tokio::task::spawn_blocking(move || flushing.kv_store().flush().unwrap())
+            nabedra_rt::task::spawn_blocking(move || flushing.kv_store().flush().unwrap())
                 .await
                 .unwrap();
         }
@@ -339,7 +340,7 @@ impl Cluster {
                         return index;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
@@ -365,7 +366,7 @@ impl Cluster {
         let expected = (term > 1).then(|| ready(term - 1).view.authority());
         let applied = handle
             .fence(
-                Uuid::new_v4(),
+                nabedra_rt::ids::uuid_v4(),
                 expected,
                 ready(term).view.authority(),
                 ready(term),
@@ -392,7 +393,7 @@ impl Cluster {
             ready_count: 0,
         };
         let host = self.host(leader).clone();
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             let handle = TimestampHandle::new(
                 TimestampMachine::new(host.state.store().clone()).unwrap(),
                 host.clone(),
@@ -400,7 +401,7 @@ impl Cluster {
             let expected = (term > 1).then(|| ready(term - 1).view.authority());
             handle
                 .fence(
-                    Uuid::new_v4(),
+                    nabedra_rt::ids::uuid_v4(),
                     expected,
                     ready(term).view.authority(),
                     ready(term),
@@ -514,7 +515,7 @@ async fn ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released()
             .matched(leader, damaged_node)
             .is_none_or(|index| index < last)
         {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(20)).await;
         }
 
         // The damaged follower goes down; its journal is damaged (G1).
@@ -544,7 +545,7 @@ async fn ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released()
         // acknowledges again (its matched index stays below the new writes).
         term += 1;
         let after_restart = cluster.fence(leader, term).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(500)).await;
         assert!(
             cluster
                 .matched(leader, damaged_node)
@@ -706,7 +707,7 @@ async fn ns23_o06_run_time_damage_stops_the_running_host_and_reports_it() {
         manager.install_damage_sink(sink.clone());
         let pool = cluster.workers[0].pool.clone().unwrap();
         let flushing = pool.clone();
-        tokio::task::spawn_blocking(move || flushing.kv_store().flush().unwrap())
+        nabedra_rt::task::spawn_blocking(move || flushing.kv_store().flush().unwrap())
             .await
             .unwrap();
         let fault = cluster.workers[0].fault.clone();
@@ -753,7 +754,7 @@ async fn ns23_o06_run_time_damage_stops_the_running_host_and_reports_it() {
             while !manager.hosted_replicas(cluster.group.group_id).is_empty()
                 || sink.0.lock().unwrap().is_empty()
             {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
@@ -800,7 +801,7 @@ async fn o06_d07_rv_apply_fatal_core_is_detected_and_recovered() {
         cluster.fence(leader, 2).await;
         timeout(Duration::from_secs(10), async {
             while host.raft.restarts() != 1 || !host.raft.is_running() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
@@ -872,7 +873,7 @@ async fn o06_o17_rv_final_m4_given_up_replica_bytes_are_released_after_replaceme
         // Restart backoffs of 1 + 2 + 4 s, then the give-up.
         timeout(Duration::from_secs(60), async {
             while sink.0.lock().unwrap().is_empty() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
@@ -908,7 +909,7 @@ async fn o06_o17_rv_final_m4_given_up_replica_bytes_are_released_after_replaceme
                 match pool.release_damaged_group(replaced.removed.clone()).await {
                     // The retired host's last handles are still dropping.
                     Err(error) if error.code == crate::protocol::ErrorCode::Conflict => {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        nabedra_rt::time::sleep(Duration::from_millis(50)).await;
                     }
                     other => break other.unwrap(),
                 }
@@ -957,14 +958,14 @@ async fn o29_rv_apply_latched_pool_stops_routing_without_a_restart_loop() {
         cluster.fence(leader, 2).await;
         timeout(Duration::from_secs(10), async {
             while !manager.hosted_replicas(cluster.group.group_id).is_empty() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
         .expect("the latched replica stops routing");
         assert!(pool.requires_recovery());
         // Longer than every restart backoff: nothing restarts it.
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        nabedra_rt::time::sleep(Duration::from_secs(3)).await;
         let health = manager.raft_health();
         assert_eq!(
             (
@@ -988,7 +989,7 @@ async fn o29_rv_apply_latched_pool_stops_routing_without_a_restart_loop() {
 async fn applied_term_reaches(cluster: &Cluster, index: usize, term: u64) {
     timeout(Duration::from_secs(30), async {
         while cluster.applied_term(index).await != term {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -1022,7 +1023,7 @@ async fn o29_ns10_perf2d_leader_power_cut_before_its_sync_keeps_the_quorum_commi
                 if replicated && metrics.cluster_committed.is_some_and(|id| id.index >= next) {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -1032,7 +1033,7 @@ async fn o29_ns10_perf2d_leader_power_cut_before_its_sync_keeps_the_quorum_commi
             cluster.matched(leader, leader as u64 + 1) < Some(next),
             "the leader counted itself before its sync"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(50)).await;
         assert!(
             !fence.is_finished(),
             "the leader acknowledged before its own sync"
@@ -1082,12 +1083,12 @@ async fn o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry() {
         let fence = cluster.fence_task(leader, 2);
         timeout(Duration::from_secs(20), async {
             while gates.iter().any(|gate| gate.entered() == 0) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("every replica reaches its held sync");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(50)).await;
         let metrics = cluster.host(leader).raft.metrics().borrow_watched().clone();
         assert!(
             metrics
@@ -1151,7 +1152,7 @@ async fn o06_follower_sync_error_cannot_complete_a_quorum_with_a_delayed_followe
     let proposal = cluster.fence_task(leader, 2);
     let held = timeout(Duration::from_secs(15), async {
         while gate.entered() == 0 || !failing_pool.requires_recovery() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(5)).await;
         }
         let metrics = cluster.host(leader).raft.metrics().borrow_watched().clone();
         (
@@ -1202,7 +1203,7 @@ async fn o06_foreign_pool_and_group_identity_are_refused() {
     let index = 0;
     let pool = cluster.workers[index].pool.as_ref().unwrap();
     let mut foreign = cluster.group.clone();
-    foreign.cluster_id = Uuid::new_v4();
+    foreign.cluster_id = nabedra_rt::ids::uuid_v4();
     assert!(pool.retained_group(foreign).await.is_err());
     let path = cluster.pool_path(index);
     let identity = cluster.pool_identity(index);

@@ -57,7 +57,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
-use tokio::time::{Instant, sleep_until, timeout_at};
+use nabedra_rt::time::{Instant, sleep_until, timeout_at};
 
 // Registered election timeouts reach three seconds. Leave time to refresh
 // routes and reach the new leader without using the full public wait budget.
@@ -417,7 +417,7 @@ impl DirectRouting {
             converged: AtomicU64::new(0),
             refreshes: AtomicU64::new(0),
             used_ms: AtomicU64::new(0),
-            epoch: std::time::Instant::now(),
+            epoch: nabedra_rt::time::now_std(),
             warming: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -553,7 +553,7 @@ impl Client {
         payload: ChargedBytes,
     ) -> Result<ServiceResponse, ProtocolError> {
         use crate::oltp_runtime::stage_timing::{perf_stage, timed};
-        let deadline = Instant::now() + SERVICE_CONVERGENCE;
+        let deadline = nabedra_rt::time::now() + SERVICE_CONVERGENCE;
         self.direct
             .used_ms
             .store(self.direct.now_ms(), Ordering::Relaxed);
@@ -600,7 +600,7 @@ impl Client {
             .iter()
             .find(|member| member.node_id == node)?;
         let attempt = timeout_at(
-            deadline.min(Instant::now() + method.peer_timeout(action, false)),
+            deadline.min(nabedra_rt::time::now() + method.peer_timeout(action, false)),
             self.call_member(action, method, payload, node, member.worker_id.into()),
         )
         .await;
@@ -643,9 +643,9 @@ impl Client {
             return;
         };
         let client = Arc::downgrade(self);
-        runtime.spawn(async move {
+        nabedra_rt::task::spawn_on(&runtime, async move {
             loop {
-                tokio::time::sleep(ROUTE_REFRESH).await;
+                nabedra_rt::time::sleep(ROUTE_REFRESH).await;
                 let Some(client) = client.upgrade() else {
                     return;
                 };
@@ -668,7 +668,7 @@ impl Client {
                 }
                 let refreshed = crate::oltp_runtime::stage_timing::timed(
                     crate::oltp_runtime::stage_timing::perf_stage!("ts.routes.refresh"),
-                    tokio::time::timeout(
+                    nabedra_rt::time::timeout(
                         SERVICE_CONVERGENCE,
                         client.control.replica_routes(&client.group),
                     ),
@@ -699,7 +699,7 @@ impl Client {
         payload: Option<ChargedBytes>,
         bound_mutation_attempt: bool,
     ) -> Result<ServiceResponse, ProtocolError> {
-        let deadline = Instant::now() + SERVICE_CONVERGENCE;
+        let deadline = nabedra_rt::time::now() + SERVICE_CONVERGENCE;
         self.converge_with(
             action,
             method,
@@ -774,8 +774,8 @@ impl Client {
                 }
             };
             // Only the original charged request crosses the wait.
-            sleep_until((Instant::now() + delay).min(deadline)).await;
-            if Instant::now() >= deadline {
+            sleep_until((nabedra_rt::time::now() + delay).min(deadline)).await;
+            if nabedra_rt::time::now() >= deadline {
                 return Err(match refused_before_send {
                     Some(error) if !possibly_applied => error.into(),
                     _ => unavailable(),
@@ -889,7 +889,7 @@ impl Client {
                 let reply = if let Some(deadline) = deadlines.peer_failover {
                     // Leave time to reach the next leader when one peer stalls.
                     let attempt = method.peer_timeout(action, member.node_id == stalled);
-                    let peer_deadline = deadline.min(Instant::now() + attempt);
+                    let peer_deadline = deadline.min(nabedra_rt::time::now() + attempt);
                     timeout_at(peer_deadline, call).await.unwrap_or_else(|_| {
                         self.stalled.store(member.node_id, Ordering::Relaxed);
                         Err(CallError::Transport(RequestError::Unreachable))
@@ -967,7 +967,7 @@ impl Client {
         target: &ReplicaRoutes,
     ) -> Result<ServiceResponse, ProtocolError> {
         let mut completed = false;
-        let deadline = Instant::now() + SERVICE_CONVERGENCE;
+        let deadline = nabedra_rt::time::now() + SERVICE_CONVERGENCE;
         timeout_at(
             deadline,
             self.call_routed(
@@ -1051,7 +1051,7 @@ impl Client {
                     .map(|input| self.shared.encode_in(ByteClass::Progress, &input, 4096))
                     .transpose()
                     .ok()?;
-                let response = tokio::time::timeout(
+                let response = nabedra_rt::time::timeout(
                     RECEIVER_PROBE_TIMEOUT,
                     self.call_member_at(
                         ServiceAction::Owner,
@@ -1084,7 +1084,7 @@ impl Client {
             outgoing_deadline,
         );
         let attempt = if method.can_repeat_read() {
-            match tokio::time::timeout(HINTED_READ_TIMEOUT, call).await {
+            match nabedra_rt::time::timeout(HINTED_READ_TIMEOUT, call).await {
                 Ok(result) => result,
                 Err(_) => Err(CallError::Transport(RequestError::Unreachable)),
             }
@@ -1284,7 +1284,7 @@ impl Client {
                 .transport
                 .reserve_outgoing(&self.group, worker.worker_id(), purpose, until)
                 .await?;
-            if Instant::now() >= until {
+            if nabedra_rt::time::now() >= until {
                 return Err(refusal);
             }
             self.transport

@@ -21,8 +21,9 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit},
     task::JoinSet,
-    time::{Instant, timeout, timeout_at},
+    time::Instant,
 };
+use nabedra_rt::time::{timeout, timeout_at};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 mod resolve;
@@ -1030,7 +1031,7 @@ impl WorkerTransport {
         handshake: OwnedSemaphorePermit,
         stopped: tokio::sync::watch::Receiver<bool>,
     ) {
-        let deadline = Instant::now() + self.common.config.deadline;
+        let deadline = nabedra_rt::time::now() + self.common.config.deadline;
         tune_socket(&socket);
         let pending = if self.common.sessions_enabled {
             self.common
@@ -1445,7 +1446,7 @@ impl WorkerClient {
         if class != TrafficClass::Authority {
             return Err(malformed("Control authority dependency requires a Control group").into());
         }
-        let deadline = Instant::now()
+        let deadline = nabedra_rt::time::now()
             .checked_add(self.common.config.deadline)
             .ok_or_else(|| malformed("worker transport deadline is too large"))?;
         let refused = |error: RequestError| {
@@ -1458,7 +1459,7 @@ impl WorkerClient {
             .authority_slots(target, deadline)
             .await
             .map_err(refused)?;
-        if Instant::now() >= deadline {
+        if nabedra_rt::time::now() >= deadline {
             return Err(refused(RequestError::outgoing_lane_full(class)));
         }
         timeout_at(
@@ -1572,7 +1573,7 @@ impl WorkerClient {
                 sections: sections.clone(),
             },
         )?;
-        let nonce = Uuid::new_v4();
+        let nonce = nabedra_rt::ids::uuid_v4();
         let hello = Hello {
             cluster_id: group.cluster_id,
             group_id: group.group_id,
@@ -1583,7 +1584,7 @@ impl WorkerClient {
             nonce,
             header_len: header.len(),
         };
-        let deadline = Instant::now() + self.common.config.deadline;
+        let deadline = nabedra_rt::time::now() + self.common.config.deadline;
         let raw = self
             .common
             .sessions

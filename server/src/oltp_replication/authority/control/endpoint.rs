@@ -32,7 +32,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
-use tokio::time::{self, Instant as TokioInstant};
+use nabedra_rt::time;
 use uuid::Uuid;
 
 const HEADER_LIMIT: usize = 4096;
@@ -1506,7 +1506,7 @@ impl ControlClient {
         let exact_sample = matches!(request, ReadRequest::OwnGrowthSample { .. });
         let deadline = request
             .supports_bounded_failover()
-            .then(|| TokioInstant::now() + READ_FAILOVER_TIMEOUT);
+            .then(|| nabedra_rt::time::now() + READ_FAILOVER_TIMEOUT);
         let use_route_hint = deadline.is_some()
             || matches!(
                 request,
@@ -1570,7 +1570,7 @@ impl ControlClient {
                     }
                 };
                 let result = if let Some(deadline) = deadline {
-                    let now = TokioInstant::now();
+                    let now = nabedra_rt::time::now();
                     if now >= deadline {
                         return Err(last);
                     }
@@ -1640,11 +1640,11 @@ impl ControlClient {
             let Some(deadline) = deadline else {
                 return Err(last);
             };
-            if !attempted || TokioInstant::now() >= deadline {
+            if !attempted || nabedra_rt::time::now() >= deadline {
                 return Err(last);
             }
             // A new election may make a peer usable after the first round.
-            time::sleep_until(deadline.min(TokioInstant::now() + READ_RETRY_DELAY)).await;
+            time::sleep_until(deadline.min(nabedra_rt::time::now() + READ_RETRY_DELAY)).await;
         }
     }
 
@@ -2046,7 +2046,7 @@ struct ReplicaRouteHint {
 impl VerifiedReplicaRoutes {
     fn confirmed(&self) {
         if let Ok(mut hint) = self.hint.lock() {
-            hint.confirmed_at = Some(Instant::now());
+            hint.confirmed_at = Some(nabedra_rt::time::now_std());
         }
     }
 
@@ -2077,7 +2077,7 @@ impl VerifiedReplicaRoutes {
         let Ok(mut hint) = self.hint.lock() else {
             return false;
         };
-        let now = Instant::now();
+        let now = nabedra_rt::time::now_std();
         if hint.probe_after.is_some_and(|after| after > now) {
             return false;
         }
@@ -2215,7 +2215,7 @@ impl ControlClient {
         {
             return Err(invalid("foreign replica routing scope"));
         }
-        let start = Instant::now();
+        let start = nabedra_rt::time::now_std();
         let reply = self.group(expected.group_id).await?;
         let reply = self.reserve_section_decode(reply).await?;
         let decoded = reply.decode_section::<Option<GroupRecord>>(0)?;
@@ -2307,7 +2307,7 @@ impl ControlClient {
             record,
             members,
             hint: Mutex::new(ReplicaRouteHint {
-                confirmed_at: Some(Instant::now()),
+                confirmed_at: Some(nabedra_rt::time::now_std()),
                 ..ReplicaRouteHint::default()
             }),
             _owner: owner,

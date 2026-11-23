@@ -442,10 +442,10 @@ impl SplitClient {
             }
         }
         let mut observation = None;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        let deadline = nabedra_rt::time::now() + Duration::from_secs(12);
         while observation.is_none() {
             for (index, member) in voters.iter().enumerate() {
-                match tokio::time::timeout_at(
+                match nabedra_rt::time::timeout_at(
                     deadline,
                     self.request(member, Operation::Activate, &payload),
                 )
@@ -476,10 +476,10 @@ impl SplitClient {
                 }
             }
             if observation.is_none() {
-                if tokio::time::Instant::now() >= deadline {
+                if nabedra_rt::time::now() >= deadline {
                     return Err(unavailable());
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(50)).await;
             }
         }
         if registered.is_some() {

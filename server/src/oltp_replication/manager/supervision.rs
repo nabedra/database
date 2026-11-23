@@ -75,7 +75,7 @@ impl HostedGroupManager {
         let routes = Arc::downgrade(&self.routes);
         let sink = Arc::downgrade(&self.damage_sink);
         let stats = self.health.clone();
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             let mut restarts: VecDeque<tokio::time::Instant> = VecDeque::new();
             loop {
                 let Some(running) = host.upgrade() else {
@@ -136,7 +136,7 @@ impl HostedGroupManager {
                     }
                     FatalClass::Transient => {}
                 }
-                let now = tokio::time::Instant::now();
+                let now = nabedra_rt::time::now();
                 restarts.retain(|at| now.duration_since(*at) < RESTART_WINDOW);
                 if restarts.len() >= MAX_RESTARTS {
                     give_up(&routes, &sink, &stats, &identity, node, &running).await;
@@ -144,7 +144,7 @@ impl HostedGroupManager {
                 }
                 let delay = FIRST_BACKOFF * (1u32 << restarts.len());
                 drop(running);
-                tokio::time::sleep(delay).await;
+                nabedra_rt::time::sleep(delay).await;
                 let Some(running) = host.upgrade() else {
                     return;
                 };

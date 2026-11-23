@@ -172,7 +172,7 @@ impl Drop for Leading {
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 drop(queue);
-                runtime.spawn(inner.clone().drive());
+                nabedra_rt::task::spawn_on(&runtime, inner.clone().drive());
             }
             // No runtime to drive them: fail the waiters, as a cancelled
             // driver does.
@@ -263,9 +263,9 @@ impl Inner {
                 .local_skip_until
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_some_and(|until| Instant::now() < until);
+                .is_some_and(|until| nabedra_rt::time::now_std() < until);
             if !skip {
-                match tokio::time::timeout(self.local_deadline, local.allocate_direct(count)).await
+                match nabedra_rt::time::timeout(self.local_deadline, local.allocate_direct(count)).await
                 {
                     Ok(Ok(range)) => {
                         crate::oltp_runtime::stage_timing::perf_stage!("ts.client.local_answered")
@@ -278,7 +278,7 @@ impl Inner {
                             .local_skip_until
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                            Some(Instant::now() + LOCAL_BACKOFF);
+                            Some(nabedra_rt::time::now_std() + LOCAL_BACKOFF);
                     }
                 }
             }

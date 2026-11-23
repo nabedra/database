@@ -123,7 +123,7 @@ impl Drop for Pending {
         if let Some((reply, reservation)) = self.0.take() {
             // A cancelled caller can leave an entry in Raft. Keep its charge
             // until the responder completes, is discarded, or the core stops.
-            tokio::spawn(async move {
+            nabedra_rt::task::spawn(async move {
                 let _ = reply.await;
                 drop(reservation);
             });

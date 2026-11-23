@@ -296,11 +296,11 @@ impl ForwardedControl {
                 64 << 10,
             );
             let result = if let Some(deadline) = deadline {
-                let now = Instant::now();
+                let now = nabedra_rt::time::now();
                 if now >= deadline {
                     return Err(last);
                 }
-                tokio::time::timeout_at(deadline.min(now + READ_PEER_TIMEOUT), exchange)
+                nabedra_rt::time::timeout_at(deadline.min(now + READ_PEER_TIMEOUT), exchange)
                     .await
                     .unwrap_or_else(|_| Err(unavailable()))
             } else {
@@ -399,16 +399,16 @@ impl Consensus<ControlCommand, ControlReply> for ForwardedControl {
     }
     fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {
         Box::pin(async move {
-            let deadline = Instant::now() + READ_TIMEOUT;
+            let deadline = nabedra_rt::time::now() + READ_TIMEOUT;
             perf_stage!("control.barrier.request").record(Duration::ZERO);
             if let Some(batch) = self.read_batch.join(self.manager.resources(), || {
                 let forwarding = self.clone();
-                async move { forwarding.read_barrier(Instant::now() + READ_TIMEOUT).await }
+                async move { forwarding.read_barrier(nabedra_rt::time::now() + READ_TIMEOUT).await }
             }) {
-                let (result, _owner) = tokio::time::timeout_at(deadline, batch)
+                let (result, _owner) = nabedra_rt::time::timeout_at(deadline, batch)
                     .await
                     .map_err(|_| unavailable())?;
-                if Instant::now() >= deadline {
+                if nabedra_rt::time::now() >= deadline {
                     return Err(unavailable());
                 }
                 return result;
@@ -424,7 +424,7 @@ impl ForwardedControl {
     async fn read_barrier(&self, deadline: Instant) -> Result<ReadBarrier, ProtocolError> {
         let local_id = self.local.state.resident().node_id();
         loop {
-            if Instant::now() >= deadline {
+            if nabedra_rt::time::now() >= deadline {
                 return Err(unavailable());
             }
             let read = async {
@@ -437,17 +437,17 @@ impl ForwardedControl {
                     self.forwarded(Operation::Barrier, None, Some(deadline)).await?;
                 self.local
                     .raft
-                    .wait(Some(deadline.saturating_duration_since(Instant::now())))
+                    .wait(Some(deadline.saturating_duration_since(nabedra_rt::time::now())))
                     .applied_index_at_least(Some(applied.index), "forwarded Control ReadIndex")
                     .await
                     .map_err(|_| unavailable())?;
                 Ok(ReadBarrier { applied })
             };
-            match tokio::time::timeout_at(deadline, read).await {
-                _ if Instant::now() >= deadline => return Err(unavailable()),
+            match nabedra_rt::time::timeout_at(deadline, read).await {
+                _ if nabedra_rt::time::now() >= deadline => return Err(unavailable()),
                 Ok(Ok(barrier)) => return Ok(barrier),
                 Ok(Err(error)) if transient(&error) => {
-                    tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(25)))
+                    nabedra_rt::time::sleep_until(deadline.min(nabedra_rt::time::now() + Duration::from_millis(25)))
                         .await;
                 }
                 Ok(Err(error)) => return Err(error),

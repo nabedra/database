@@ -91,9 +91,9 @@ impl Endpoint for ObservedControl {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o14_c07_m02_replica_routes_require_fresh_control_record_after_replacement() {
-    tokio::time::timeout(Duration::from_secs(20), async {
+    nabedra_rt::time::timeout(Duration::from_secs(20), async {
         let directory = Directory(
-            std::env::temp_dir().join(format!("nabedra-control-routes-{}", Uuid::new_v4())),
+            std::env::temp_dir().join(format!("nabedra-control-routes-{}", nabedra_rt::ids::uuid_v4())),
         );
         let limits = WorkerResources::default();
         let LocalWorker {
@@ -137,7 +137,7 @@ async fn o14_c07_m02_replica_routes_require_fresh_control_record_after_replaceme
             .unwrap();
         raft.raft.initialize(voters.clone()).await.unwrap();
         let (stop, stopped) = oneshot::channel();
-        let listener = tokio::spawn(transport.run(listener, async move {
+        let listener = nabedra_rt::task::spawn(transport.run(listener, async move {
             let _ = stopped.await;
         }));
         let deadline = Some(Duration::from_secs(5));
@@ -155,7 +155,7 @@ async fn o14_c07_m02_replica_routes_require_fresh_control_record_after_replaceme
             },
         );
         let ControlReply::Initialized { ready } = control
-            .initialize_local(&operator, Uuid::new_v4(), Uuid::new_v4())
+            .initialize_local(&operator, nabedra_rt::ids::uuid_v4(), nabedra_rt::ids::uuid_v4())
             .await
             .unwrap()
             .reply
@@ -165,7 +165,7 @@ async fn o14_c07_m02_replica_routes_require_fresh_control_record_after_replaceme
         let authority = ready.view.authority();
         assert!(matches!(
             control
-                .enroll_local(&operator, Uuid::new_v4(), None, enrollment.clone(), None)
+                .enroll_local(&operator, nabedra_rt::ids::uuid_v4(), None, enrollment.clone(), None)
                 .await
                 .unwrap()
                 .reply,
@@ -202,7 +202,7 @@ async fn o14_c07_m02_replica_routes_require_fresh_control_record_after_replaceme
                 control
                     .group_page_local(
                         &operator,
-                        Uuid::new_v4(),
+                        nabedra_rt::ids::uuid_v4(),
                         generation,
                         Page::new(observation.replicas().to_vec()).unwrap(),
                     )
@@ -216,7 +216,7 @@ async fn o14_c07_m02_replica_routes_require_fresh_control_record_after_replaceme
         let seal = async |proof| {
             assert!(matches!(
                 control
-                    .seal_group_local(&operator, Uuid::new_v4(), proof)
+                    .seal_group_local(&operator, nabedra_rt::ids::uuid_v4(), proof)
                     .await
                     .unwrap()
                     .reply,
@@ -239,10 +239,10 @@ async fn o14_c07_m02_replica_routes_require_fresh_control_record_after_replaceme
             .current_leader(member.node_id, "original timestamp leader")
             .await
             .unwrap();
-        let initial = Uuid::new_v4();
+        let initial = nabedra_rt::ids::uuid_v4();
         assert!(matches!(
             control
-                .begin_group_local(&operator, Uuid::new_v4(), initial, group.clone())
+                .begin_group_local(&operator, nabedra_rt::ids::uuid_v4(), initial, group.clone())
                 .await
                 .unwrap()
                 .reply,
@@ -253,7 +253,7 @@ async fn o14_c07_m02_replica_routes_require_fresh_control_record_after_replaceme
 
         let target = ReplicaMember {
             node_id: member.node_id + 1,
-            pool_id: Uuid::new_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
             ..member.clone()
         };
         let target_pool = OltpPool::open_development(
@@ -304,12 +304,12 @@ async fn o14_c07_m02_replica_routes_require_fresh_control_record_after_replaceme
         let successor_members = successor.observe_stable_membership().await.unwrap();
         assert_eq!(successor_members.replicas(), std::slice::from_ref(&target));
         let original_record = control.group(group.group_id).await.unwrap().unwrap();
-        let replacement = Uuid::new_v4();
+        let replacement = nabedra_rt::ids::uuid_v4();
         assert!(matches!(
             control
                 .begin_group_replacement_local(
                     &operator,
-                    Uuid::new_v4(),
+                    nabedra_rt::ids::uuid_v4(),
                     replacement,
                     original_record.clone()
                 )

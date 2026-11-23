@@ -36,7 +36,7 @@ impl Recovery {
         let members = std::array::from_fn(|i| ReplicaMember {
             node_id: i as u64 + 1,
             worker_id: voters[i].worker_id,
-            pool_id: Uuid::new_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
         });
         let group = fixture
             .register_group(GroupKind::Control, members.to_vec())
@@ -85,16 +85,16 @@ impl Recovery {
         let next = worker(self.fixture.base + suffix);
         let state = self.fixture.state().await;
         let intent = ReplacementIntent {
-            id: Uuid::new_v4(),
+            id: nabedra_rt::ids::uuid_v4(),
             run_id: state.ready.view.run_id,
             previous,
             mount: PoolMountExpectation {
                 profile: PoolMountProfile::Docker {
-                    volume_marker: Uuid::new_v4(),
+                    volume_marker: nabedra_rt::ids::uuid_v4(),
                 },
                 identity: PoolIdentity {
                     worker_id: next.worker_id,
-                    pool_id: Uuid::new_v4(),
+                    pool_id: nabedra_rt::ids::uuid_v4(),
                     ..self.fixture.machine.store().pool().identity().clone()
                 },
                 worker: WorkerIdentity::from(&next),
@@ -145,7 +145,7 @@ impl Recovery {
         let state = self.fixture.state().await;
         self.fixture
             .apply(ControlCommand::SystemRecovery {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 command: Box::new(SystemRecoveryCommand::Mount {
                     proof,
                     ready: state.ready,
@@ -248,7 +248,7 @@ fn authorized(
     evidence: Digest,
     command: impl FnOnce(AuthorizationStamp) -> SystemRecoveryCommand,
 ) -> ControlCommand {
-    let operation_id = Uuid::new_v4();
+    let operation_id = nabedra_rt::ids::uuid_v4();
     ControlCommand::SystemRecovery {
         operation_id,
         command: Box::new(command(AuthorizationStamp {
@@ -261,7 +261,7 @@ fn authorized(
 
 async fn cold_fence(recovery: &mut Recovery, groups: &[GroupRecord]) -> ReadyMembership {
     let expected = recovery.fixture.state().await.ready;
-    let transition = Uuid::new_v4();
+    let transition = nabedra_rt::ids::uuid_v4();
     let ControlReply::FenceBegun {
         next,
         required_groups,
@@ -271,7 +271,7 @@ async fn cold_fence(recovery: &mut Recovery, groups: &[GroupRecord]) -> ReadyMem
         .apply(ControlCommand::BeginColdFence {
             operation_id: transition,
             expected,
-            next_run: Uuid::new_v4(),
+            next_run: nabedra_rt::ids::uuid_v4(),
             authorization: authorization(),
         })
         .await
@@ -284,7 +284,7 @@ async fn cold_fence(recovery: &mut Recovery, groups: &[GroupRecord]) -> ReadyMem
             recovery
                 .fixture
                 .apply(ControlCommand::GroupFenced {
-                    operation_id: Uuid::new_v4(),
+                    operation_id: nabedra_rt::ids::uuid_v4(),
                     receipt: GroupFenceReceipt {
                         group: group.identity.clone(),
                         transition_id: transition,
@@ -302,7 +302,7 @@ async fn cold_fence(recovery: &mut Recovery, groups: &[GroupRecord]) -> ReadyMem
         recovery
             .fixture
             .apply(ControlCommand::ExcludedPage {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 transition_id: transition,
                 workers: Page::new(vec![ExclusionStamp {
                     worker: recovery.voters[0],
@@ -321,7 +321,7 @@ async fn cold_fence(recovery: &mut Recovery, groups: &[GroupRecord]) -> ReadyMem
         recovery
             .fixture
             .apply(ControlCommand::PublishFence {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 transition_id: transition,
             })
             .await,
@@ -459,9 +459,9 @@ async fn o17_revocation_limit_and_failed_refresh_preserve_the_committed_mount() 
     directory_view
         .fail_replacement_trust_install
         .store(false, Ordering::Release);
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    nabedra_rt::time::timeout(std::time::Duration::from_secs(5), async {
         while !directory_view.has_mounted_replacement() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            nabedra_rt::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
@@ -530,8 +530,8 @@ async fn o17_ns14_system_mount_hands_more_than_64_data_groups_to_the_damage_path
                 .fixture
                 .register_group(
                     GroupKind::Data {
-                        table_id: Uuid::new_v4(),
-                        shard_id: Uuid::new_v4(),
+                        table_id: nabedra_rt::ids::uuid_v4(),
+                        shard_id: nabedra_rt::ids::uuid_v4(),
                     },
                     recovery.members.to_vec(),
                 )
