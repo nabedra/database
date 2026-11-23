@@ -259,7 +259,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
     } else {
         None
     };
-    let listener = TcpListener::bind(node.bind)
+    let listener = nabedra_transport::backend::current().bind(node.bind)
         .await
         .map_err(|_| unavailable("data worker transport bind failed"))?;
     let http = TcpListener::bind(config.bind)

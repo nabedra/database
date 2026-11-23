@@ -10,7 +10,7 @@ pub use nabedra_resources::memory::{
 };
 pub(super) use nabedra_resources::memory::{ByteReservation, ScratchBuffer, capacity};
 pub(crate) use nabedra_resources::memory::{
-    DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease, RAFT_REPLICA_BYTES,
+    DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease,
 };
 use serde::Serialize;
 use std::{
@@ -46,6 +46,17 @@ pub struct WorkerSharedResources {
     queue_claim: Arc<AtomicBool>,
     memory: Arc<WorkerMemory>,
     leases: Arc<NativeLeases>,
+}
+
+impl nabedra_transport::ResourceOwner for WorkerSharedResources {
+    #[inline]
+    fn worker_memory(&self) -> &Arc<WorkerMemory> {
+        &self.memory
+    }
+
+    fn bind_worker(self: &Arc<Self>, worker_id: Uuid) -> Result<(), ProtocolError> {
+        WorkerSharedResources::bind_worker(self, worker_id)
+    }
 }
 
 #[derive(Serialize)]

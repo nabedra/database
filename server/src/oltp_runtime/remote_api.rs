@@ -33,7 +33,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
+use tokio::{sync::watch, task::JoinHandle};
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -160,7 +160,8 @@ impl RemoteRuntime {
             registry,
             TransportConfig::default(),
         )?);
-        let listener = TcpListener::bind(config.enrollment.enrollment.endpoint.as_str())
+        let listener = nabedra_transport::backend::current()
+            .bind_endpoint(config.enrollment.enrollment.endpoint.as_str())
             .await
             .map_err(|_| unavailable())?;
         let control = ControlClient::new(

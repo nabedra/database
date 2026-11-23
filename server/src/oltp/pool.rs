@@ -28,7 +28,7 @@ pub use resources::{
     QueueLease, ScratchLease, SharedResourceConfig, WorkerSharedResources,
 };
 use resources::{ByteReservation, capacity};
-pub(crate) use resources::{DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease, RAFT_REPLICA_BYTES};
+pub(crate) use resources::{DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease};
 #[cfg(test)]
 pub(crate) use tests::{acceptance_damaged_checkpoints, o29_pool_recovery};
 

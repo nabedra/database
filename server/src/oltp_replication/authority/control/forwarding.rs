@@ -356,7 +356,7 @@ impl ForwardedControl {
             return shared
                 .execute(ExecutionClass::Control, member.node_id, 0, move || {
                     let value = serde_json::from_slice(input.as_slice()).map_err(|_| invalid())?;
-                    Ok((value, received.scratch.clone()))
+                    Ok((value, received.scratch_lease()))
                 })
                 .await;
         }

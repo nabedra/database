@@ -5,6 +5,8 @@ fn main() {
         #[cfg(feature = "oltp")]
         "oltp-storage" => oltp_storage(),
         #[cfg(feature = "oltp")]
+        "oltp-transport" => oltp_transport(),
+        #[cfg(feature = "oltp")]
         "kv-write-flush" => kv_write_flush(),
         #[cfg(feature = "cache")]
         "cache-set" => current_thread().block_on(nabedra_database_server::cache::run_insn_cache()),
@@ -196,5 +198,187 @@ fn olap_queue() -> u64 {
         );
         assert_eq!(queue.pending(), 0);
     }
+    OPERATIONS
+}
+
+#[cfg(feature = "oltp")]
+fn oltp_transport() -> u64 {
+    use nabedra_database_server::{
+        config::WorkerResources,
+        oltp::pool::{ByteClass, ChargedBytes, SharedResourceConfig, WorkerSharedResources},
+        oltp_replication::{
+            TlsMaterial,
+            multiplex::{
+                AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture,
+                EndpointRegistry, PeerDirectory, Purpose, ReceivePlan, TrafficClass,
+                TransportConfig, TransportTrust, WorkerTransport,
+            },
+            types::{
+                Digest, GROUP_FORMAT_VERSION, GroupIdentity, GroupKind, WorkerEnrollment,
+                WorkerIdentity,
+            },
+        },
+        protocol::{ErrorCode, Outcome, ProtocolError},
+    };
+    use std::{fs, net::Ipv4Addr, sync::Arc, time::Duration};
+    use tokio::{net::TcpListener, sync::oneshot};
+    use uuid::Uuid;
+
+    const OPERATIONS: u64 = 512;
+
+    struct Directory([WorkerEnrollment; 2]);
+    impl PeerDirectory for Directory {
+        fn resolve(&self, worker: Uuid) -> Result<WorkerEnrollment, ProtocolError> {
+            self.0
+                .iter()
+                .find(|entry| entry.worker_id == worker)
+                .cloned()
+                .ok_or_else(untrusted)
+        }
+
+        fn verify(
+            &self,
+            peer: WorkerIdentity,
+            _: &GroupIdentity,
+            _: Purpose,
+        ) -> Result<TransportTrust, ProtocolError> {
+            if WorkerIdentity::from(&self.resolve(peer.worker_id)?) != peer {
+                return Err(untrusted());
+            }
+            Ok(TransportTrust::AppliedEnrollment)
+        }
+    }
+
+    fn untrusted() -> ProtocolError {
+        ProtocolError::new(
+            ErrorCode::Unauthorized,
+            "unknown benchmark peer",
+            Outcome::NotApplied,
+        )
+    }
+
+    struct Echo;
+    impl Endpoint for Echo {
+        fn preflight<'a>(
+            &'a self,
+            _: &'a AuthenticatedSession,
+            _: &'a [u8],
+        ) -> EndpointFuture<'a, ReceivePlan> {
+            Box::pin(async {
+                Ok(ReceivePlan {
+                    class: TrafficClass::ApiIngress,
+                    section_lengths: [0; 3],
+                    decode_budget_bytes: 0,
+                })
+            })
+        }
+
+        fn handle<'a>(
+            &'a self,
+            _: AuthenticatedSession,
+            header: ChargedBytes,
+            _: ChargedSections,
+        ) -> EndpointFuture<'a, ChargedReply> {
+            Box::pin(async move {
+                Ok(ChargedReply {
+                    header,
+                    sections: std::array::from_fn(|_| None),
+                })
+            })
+        }
+    }
+
+    let ca = fs::read("tls/ca.pem").unwrap();
+    let material = [1, 2].map(|index| {
+        let certificate = fs::read(format!("tls/peer-{index}.pem")).unwrap();
+        let private_key = fs::read(format!("tls/peer-{index}.key")).unwrap();
+        TlsMaterial::from_pem(&certificate, &private_key, &ca).unwrap()
+    });
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let id = Uuid::from_u128;
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let endpoint = listener.local_addr().unwrap().to_string();
+            let enrollments = [0, 1].map(|index| WorkerEnrollment {
+                worker_id: id(index as u128 + 1),
+                incarnation: id(index as u128 + 3),
+                certificate_sha256: Digest::parse(material[index].certificate_sha256()).unwrap(),
+                endpoint: endpoint.as_str().try_into().unwrap(),
+                server_name: "localhost".try_into().unwrap(),
+                enrollment_revision: 1,
+            });
+            let directory = Arc::new(Directory(enrollments.clone()));
+            let group = GroupIdentity {
+                cluster_id: id(5),
+                group_id: id(6),
+                database: "benchmark".try_into().unwrap(),
+                kind: GroupKind::Data {
+                    table_id: id(7),
+                    shard_id: id(8),
+                },
+                group_format_version: GROUP_FORMAT_VERSION,
+            };
+            let resources = [1, 2].map(|node| {
+                WorkerSharedResources::new(
+                    node,
+                    WorkerResources {
+                        max_threads: 8,
+                        memory_limit_bytes: 512 << 20,
+                        task_memory_limit_bytes: 128 << 20,
+                        control_memory_reserve_bytes: 64 << 20,
+                    },
+                    SharedResourceConfig::default(),
+                )
+                .unwrap()
+            });
+            let [source, target] = [0, 1].map(|index| {
+                let registry = Arc::new(EndpointRegistry::new(resources[index].clone()));
+                if index == 1 {
+                    registry
+                        .reserve(group.clone())
+                        .unwrap()
+                        .bind(Purpose::ApiIngress, Arc::new(Echo))
+                        .unwrap();
+                }
+                Arc::new(
+                    WorkerTransport::new(
+                        &enrollments[index],
+                        &material[index],
+                        resources[index].clone(),
+                        directory.clone(),
+                        registry,
+                        TransportConfig {
+                            ping_idle: Duration::from_secs(120),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                )
+            });
+            let (stop, shutdown) = oneshot::channel();
+            let listener_task = tokio::spawn(target.run(listener, async {
+                let _ = shutdown.await;
+            }));
+            let caller = source.client();
+            for value in 0..OPERATIONS {
+                let reply = caller
+                    .request(
+                        &group,
+                        enrollments[1].worker_id,
+                        Purpose::ApiIngress,
+                        resources[0].encode_in(ByteClass::Data, &value, 64).unwrap(),
+                        std::array::from_fn(|_| None),
+                        4096,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(*reply.decode_header::<u64>().unwrap(), value);
+            }
+            stop.send(()).unwrap();
+            listener_task.await.unwrap().unwrap();
+        });
     OPERATIONS
 }

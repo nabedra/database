@@ -1909,6 +1909,7 @@ dependencies = [
  "nabedra-resources",
  "nabedra-rt",
  "nabedra-sim",
+ "nabedra-transport",
  "openraft",
  "parquet",
  "ring",

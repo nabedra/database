@@ -89,7 +89,7 @@ impl ReplicaPlacement {
             plan.request.worker,
             request,
         )?;
-        Ok((value, reply.scratch.clone()))
+        Ok((value, reply.scratch_lease()))
     }
 
     pub(super) async fn remote_activation(
