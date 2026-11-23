@@ -1,0 +1,11 @@
+id = "oltp-peer-transport-preflight"
+module = "oltp"
+kinds = ["U"]
+guarantees = []
+scenarios = ["C07", "M02", "O06"]
+tiers = ["T1"]
+command = ["cargo", "test", "--locked", "-j", "2", "--no-default-features", "--features", "oltp", "--test", "oltp_multiplex", "c07_m02_o06_one_tls_listener_routes_groups_and_preserves_control_during_blocked_data_preflight", "--", "--exact"]
+cwd = "server"
+timeout_s = 1800
+needs = []
+result_parser = "cargo-test"
