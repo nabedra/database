@@ -7,27 +7,27 @@ use crate::{
 #[test]
 fn o23_r03_retained_secondary_requires_its_completed_claim_and_fresh_mount() {
     let previous = WorkerIdentity {
-        worker_id: Uuid::new_v4(),
-        incarnation: Uuid::new_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         enrollment_revision: 1,
         certificate_sha256: Digest::from_bytes([1; 32]),
     };
     let worker = WorkerIdentity {
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         enrollment_revision: 2,
         certificate_sha256: Digest::from_bytes([2; 32]),
         ..previous
     };
-    let pool_id = Uuid::new_v4();
+    let pool_id = nabedra_rt::ids::uuid_v4();
     let mount = MountedPoolObservation {
         expected: PoolMountExpectation {
             profile: PoolMountProfile::Docker {
-                volume_marker: Uuid::new_v4(),
+                volume_marker: nabedra_rt::ids::uuid_v4(),
             },
             identity: PoolIdentity {
                 engine: "oltp".into(),
                 pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-                cluster_id: Uuid::new_v4(),
+                cluster_id: nabedra_rt::ids::uuid_v4(),
                 worker_id: worker.worker_id,
                 pool_id,
             },
@@ -46,8 +46,8 @@ fn o23_r03_retained_secondary_requires_its_completed_claim_and_fresh_mount() {
     };
     let mut claim = GrowthRecord {
         intent: GrowthIntent {
-            policy_id: Uuid::new_v4(),
-            claim_id: Uuid::new_v4(),
+            policy_id: nabedra_rt::ids::uuid_v4(),
+            claim_id: nabedra_rt::ids::uuid_v4(),
             action: Action::AddPool {
                 worker: previous.worker_id,
                 zone: "zone".into(),

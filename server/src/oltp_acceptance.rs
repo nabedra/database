@@ -116,7 +116,7 @@ fn acceptance_o09() {
 #[test]
 #[ignore = "requires an OLTP server and Linux network namespaces with passwordless sudo"]
 fn o06_o18_packet_drop_failover() {
-    let output = std::env::temp_dir().join(format!("nabedra-blackhole-{}", uuid::Uuid::new_v4()));
+    let output = std::env::temp_dir().join(format!("nabedra-blackhole-{}", nabedra_rt::ids::uuid_v4()));
     let status = process_driver("oltp_blackhole.py")
         .arg("--binary")
         .arg(process_binary().expect("shared-build OLTP binary"))
@@ -146,7 +146,7 @@ fn acceptance_o11() {
 #[tokio::test]
 #[ignore = "run through scripts/acceptance_oltp.py"]
 async fn acceptance_o29() {
-    tokio::time::timeout(
+    nabedra_rt::time::timeout(
         std::time::Duration::from_secs(30),
         crate::oltp::pool::o29_pool_recovery(),
     )

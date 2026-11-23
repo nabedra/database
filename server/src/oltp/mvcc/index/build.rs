@@ -168,7 +168,7 @@ impl IndexService {
                 }
                 Err(error) => return self.failed(metadata, error).await,
             }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            nabedra_rt::time::sleep(std::time::Duration::from_millis(2)).await;
         };
         if let Err(cause) = self.backend.planner().validate_index_declaration(&metadata.pin, &definition).await {
             return self.failed(metadata, PlanError::Guarded {
@@ -320,7 +320,7 @@ impl IndexService {
                 }
                 Err(error) => return self.failed(metadata, error).await,
             }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            nabedra_rt::time::sleep(std::time::Duration::from_millis(2)).await;
         };
         // Plan section 7, as in `declare`: fence before the new source pin.
         if let Err(cause) = self
@@ -714,7 +714,7 @@ impl IndexService {
                 {
                     // The backend returns this outcome only after releasing
                     // the aborted transaction's guards and metadata pin.
-                    tokio::time::sleep(backoff).await;
+                    nabedra_rt::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_millis(250));
                     retries += 1;
                 }

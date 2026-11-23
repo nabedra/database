@@ -101,7 +101,7 @@ impl VerifiedPoolMount {
             if load_marker(&self.directory, &marker.expected, close_id)? {
                 return self.directory.sync_all().map_err(|_| invalid());
             }
-            let temporary = root.join(format!(".nabedra-closing-{}.tmp", uuid::Uuid::new_v4()));
+            let temporary = root.join(format!(".nabedra-closing-{}.tmp", nabedra_rt::ids::uuid_v4()));
             let result = (|| {
                 let file = OpenOptions::new()
                     .write(true)

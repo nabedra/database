@@ -131,7 +131,7 @@ impl BackupService {
             return Err(invalid());
         }
         let (pin, catalog) = self.backend.begin(owner).await?;
-        let archive_id = Uuid::new_v4();
+        let archive_id = nabedra_rt::ids::uuid_v4();
         let root =
             serialized_digest(&(b"nabedra/backup-catalog/v1", &catalog.catalog, pin.read_ts))?;
         let parent = destination

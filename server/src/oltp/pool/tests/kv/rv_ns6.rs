@@ -15,7 +15,7 @@ fn o05_f03_pool_creation_on_a_worker_without_coop_budget_returns() {
     let dir = Dir::new();
     let path = dir.0.clone();
     let result = runtime.block_on(async move {
-        let task = tokio::spawn(async move {
+        let task = nabedra_rt::task::spawn(async move {
             while tokio::task::coop::has_budget_remaining() {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 tx.send(()).unwrap();
@@ -30,7 +30,7 @@ fn o05_f03_pool_creation_on_a_worker_without_coop_budget_returns() {
         });
         // Generous: about 2 s alone, much longer under a loaded full suite. A
         // parked worker never returns at all.
-        tokio::time::timeout(Duration::from_secs(60), task).await
+        nabedra_rt::time::timeout(Duration::from_secs(60), task).await
     });
     // A parked worker would keep a normal shutdown waiting forever.
     runtime.shutdown_background();
@@ -106,7 +106,7 @@ async fn ns07_o06_run_time_damage_refuses_the_next_append_and_other_groups_serve
     let pool = open(&fault);
     // The pool identity gets a run of its own, so A's run holds only A's scope.
     let flushing = pool.clone();
-    tokio::task::spawn_blocking(move || flush(&flushing))
+    nabedra_rt::task::spawn_blocking(move || flush(&flushing))
         .await
         .unwrap();
     let a = pool.group(group_identity(&pool)).await.unwrap();
@@ -116,7 +116,7 @@ async fn ns07_o06_run_time_damage_refuses_the_next_append_and_other_groups_serve
             .unwrap();
     }
     let flushing = pool.clone();
-    tokio::task::spawn_blocking(move || flush(&flushing))
+    nabedra_rt::task::spawn_blocking(move || flush(&flushing))
         .await
         .unwrap();
     let b = pool.group(group_identity(&pool)).await.unwrap();
@@ -284,6 +284,7 @@ async fn o06_o11_group_stats_name_synced_requests_not_fsyncs() {
 /// close waits here for a journal fsync held by the test, while another stats
 /// call (and so `register`, which takes the same lock) still completes.
 #[test]
+#[allow(clippy::disallowed_methods)] // short-lived helper threads that race two stats calls; not services
 fn o05_stats_never_close_a_store_under_the_registry_lock() {
     let dir = Dir::new();
     let fault = FaultFs::new();

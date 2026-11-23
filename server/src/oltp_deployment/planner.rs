@@ -691,7 +691,7 @@ mod tests {
         ["a", "b", "c"]
             .iter()
             .map(|zone| Worker {
-                worker_id: Uuid::new_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
                 zone: (*zone).into(),
                 observed_at: 100,
                 ready: true,
@@ -705,7 +705,7 @@ mod tests {
                 resident_shards: 1,
                 resident_shard_limit: 10,
                 pools: vec![Pool {
-                    pool_id: Uuid::new_v4(),
+                    pool_id: nabedra_rt::ids::uuid_v4(),
                     total_bytes: 1 << 30,
                     free_bytes: 250,
                     reserved_bytes: 50,
@@ -763,8 +763,8 @@ mod tests {
     fn o16_o17_o21_o26_o27_o28_exact_split_never_uses_unrelated_zone_headroom() {
         let mut ws = workers();
         let mut unrelated = ws[0].clone();
-        unrelated.worker_id = Uuid::new_v4();
-        unrelated.pools[0].pool_id = Uuid::new_v4();
+        unrelated.worker_id = nabedra_rt::ids::uuid_v4();
+        unrelated.pools[0].pool_id = nabedra_rt::ids::uuid_v4();
         unrelated.pools[0].free_bytes = 1 << 30;
         ws.push(unrelated);
         let requirement = 2 << 30;

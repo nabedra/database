@@ -1070,13 +1070,13 @@ impl GroupStore {
         fs::write(&temporary, serde_json::to_vec(&observation).unwrap()).unwrap();
         fs::rename(temporary, path).unwrap();
         if phase == "staged" && mode == "pause" {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let deadline = nabedra_rt::time::now_std() + std::time::Duration::from_secs(120);
             while control.is_file() {
                 assert!(
-                    std::time::Instant::now() < deadline,
+                    nabedra_rt::time::now_std() < deadline,
                     "snapshot install watchdog expired"
                 );
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                nabedra_rt::time::thread_sleep(std::time::Duration::from_millis(10));
             }
         }
         Ok(())
@@ -1134,7 +1134,7 @@ fn new_snapshot_path(group: &GroupStore) -> Result<PathBuf, ProtocolError> {
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(storage_error_message());
     }
-    Ok(directory.join(format!("snap-{}.bin", Uuid::new_v4())))
+    Ok(directory.join(format!("snap-{}.bin", nabedra_rt::ids::uuid_v4())))
 }
 /// SNAP1: a create_new name under `snapshots/<group>/outgoing/`, each level a
 /// real directory (no symlink), like the incoming side.
@@ -1156,7 +1156,7 @@ fn new_outgoing_path(group: &GroupStore) -> Result<PathBuf, ProtocolError> {
             return Err(storage_error_message());
         }
     }
-    Ok(directory.join(format!("send-{}.bin", Uuid::new_v4())))
+    Ok(directory.join(format!("send-{}.bin", nabedra_rt::ids::uuid_v4())))
 }
 const OUTGOING: &str = "outgoing";
 fn valid_outgoing_name(name: &str) -> bool {

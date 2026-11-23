@@ -137,10 +137,8 @@ impl DamageState {
         let Some(pool) = self.pool.get().cloned() else {
             return;
         };
-        let spawned = std::thread::Builder::new()
-            .name("oltp-damage".into())
-            .stack_size(nabedra_kv::THREAD_STACK_BYTES)
-            .spawn(move || {
+        let spawned =
+            nabedra_rt::task::spawn_service_with_stack("oltp-damage", nabedra_kv::THREAD_STACK_BYTES, move || {
                 let Some(inner) = pool.upgrade() else {
                     return;
                 };
@@ -342,7 +340,7 @@ impl OltpPool {
         // Holding the handle registry excludes a concurrent open of the group.
         let groups = self.inner.groups.clone().lock_owned().await;
         let pool = self.clone();
-        tokio::task::spawn_blocking(move || {
+        nabedra_rt::task::spawn_blocking(move || {
             if groups
                 .get(&id)
                 .is_some_and(|group| group.strong_count() > 0)

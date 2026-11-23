@@ -197,7 +197,7 @@ fn put_native(
 ) -> Result<Digest, ProtocolError> {
     let directory = archive_directory(root, key, true)?;
     let expected = hash(body.as_ref());
-    let temporary = format!(".upload-{}", Uuid::new_v4());
+    let temporary = format!(".upload-{}", nabedra_rt::ids::uuid_v4());
     let mut file = file_at(
         &directory,
         &temporary,

@@ -990,7 +990,7 @@ mod index_recovery_tests {
 
     #[tokio::test]
     async fn o08_o12_t06_recover_exact_settled_ready_guard() {
-        let path = std::env::temp_dir().join(format!("nabedra-ready-guard-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("nabedra-ready-guard-{}", nabedra_rt::ids::uuid_v4()));
         struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {
@@ -998,7 +998,7 @@ mod index_recovery_tests {
             }
         }
         let _cleanup = Cleanup(path.clone());
-        let cluster_id = Uuid::new_v4();
+        let cluster_id = nabedra_rt::ids::uuid_v4();
         let shared = WorkerSharedResources::new(
             1,
             WorkerResources::default(),
@@ -1011,8 +1011,8 @@ mod index_recovery_tests {
                 engine: "oltp".into(),
                 pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                 cluster_id,
-                worker_id: Uuid::new_v4(),
-                pool_id: Uuid::new_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                pool_id: nabedra_rt::ids::uuid_v4(),
             },
             shared,
         )
@@ -1020,13 +1020,13 @@ mod index_recovery_tests {
         let catalog = GroupIdentity {
             cluster_id,
             database: Text::try_from("test").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Catalog,
             group_format_version: 1,
         };
         let store = pool.group(catalog.clone()).await.unwrap();
         let original = Authority {
-            run_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
             owner_term: 1,
         };
         let successor = Authority {
@@ -1035,17 +1035,17 @@ mod index_recovery_tests {
         };
         let owner = MaintenanceOwnerRef {
             catalog_group_id: catalog.group_id,
-            table_id: Uuid::new_v4(),
-            index_id: Uuid::new_v4(),
-            build_id: Uuid::new_v4(),
+            table_id: nabedra_rt::ids::uuid_v4(),
+            index_id: nabedra_rt::ids::uuid_v4(),
+            build_id: nabedra_rt::ids::uuid_v4(),
             attempt: 1,
         };
         let txn = TxnId {
-            request_id: Uuid::new_v4(),
+            request_id: nabedra_rt::ids::uuid_v4(),
             attempt: 1,
         };
         let binding = LifecycleBinding {
-            guard_id: Uuid::new_v4(),
+            guard_id: nabedra_rt::ids::uuid_v4(),
             catalog_group_id: catalog.group_id,
             table_id: owner.table_id,
             lifecycle_version: Some(CommitTs::new(10).unwrap()),
@@ -1066,7 +1066,7 @@ mod index_recovery_tests {
             index: 20,
         };
         let manifest = ManifestRef {
-            status_group_id: Uuid::new_v4(),
+            status_group_id: nabedra_rt::ids::uuid_v4(),
             digest: Digest::from_bytes([3; 32]),
             participant_count: 1,
         };
@@ -1091,7 +1091,7 @@ mod index_recovery_tests {
         let closure = IndexAttemptClosedRecord {
             owner,
             pin: StoragePin {
-                pin_id: Uuid::new_v4(),
+                pin_id: nabedra_rt::ids::uuid_v4(),
                 read_ts: ReadTs::new(9).unwrap(),
                 allocator_epoch: 1,
             },
@@ -1212,7 +1212,7 @@ mod index_recovery_tests {
         })
         .await;
         let mut wrong = binding.clone();
-        wrong.guard_id = Uuid::new_v4();
+        wrong.guard_id = nabedra_rt::ids::uuid_v4();
         assert!(matches!(
             apply(&store, &mut index, recover(binding.clone(), successor)).await,
             ParticipantReply::Rejected(Fault::InvalidBinding)
@@ -1228,9 +1228,9 @@ mod index_recovery_tests {
             ParticipantReply::Rejected(Fault::InvalidBinding)
         ));
         let mut wrong_table = binding.clone();
-        wrong_table.table_id = Uuid::new_v4();
+        wrong_table.table_id = nabedra_rt::ids::uuid_v4();
         let mut wrong_txn = binding.clone();
-        wrong_txn.txn.request_id = Uuid::new_v4();
+        wrong_txn.txn.request_id = nabedra_rt::ids::uuid_v4();
         for mismatch in [wrong_table, wrong_txn] {
             assert!(matches!(
                 apply(&store, &mut index, recover(mismatch, successor)).await,
@@ -1240,7 +1240,7 @@ mod index_recovery_tests {
         let mut live = binding.clone();
         live.authority = successor;
         let mut old_run = binding.clone();
-        old_run.authority.run_id = Uuid::new_v4();
+        old_run.authority.run_id = nabedra_rt::ids::uuid_v4();
         for mismatch in [live, old_run] {
             assert!(matches!(
                 apply(&store, &mut index, recover(mismatch, successor)).await,
@@ -1259,8 +1259,8 @@ mod index_recovery_tests {
         ));
         let mut writer = binding.clone();
         writer.authority = successor;
-        writer.guard_id = Uuid::new_v4();
-        writer.txn.request_id = Uuid::new_v4();
+        writer.guard_id = nabedra_rt::ids::uuid_v4();
+        writer.txn.request_id = nabedra_rt::ids::uuid_v4();
         writer.request.request_id = writer.txn.request_id;
         let acquire = |binding: LifecycleBinding| {
             let catalog = catalog.clone();

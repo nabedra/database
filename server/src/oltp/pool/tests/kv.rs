@@ -127,7 +127,7 @@ async fn o29_ns09_journal_sync_eio_latches_every_alias_and_reopen_recovers_from_
     let healthy = OltpPool::open_development(
         &healthy_dir.0,
         PoolIdentity {
-            pool_id: Uuid::new_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
             ..identity.clone()
         },
         resources.clone(),
@@ -359,7 +359,7 @@ async fn ns08_o05_o06_group_commit_shares_fsyncs_across_64_groups_and_4_lanes() 
     for (n, group) in groups.iter().enumerate() {
         for lane in 0..4u8 {
             let group = group.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.push(nabedra_rt::task::spawn(async move {
                 for round in 0..ROUNDS {
                     let value = format!("{n}/{lane}/{round}").into_bytes();
                     let key: &'static [u8] = match lane {
@@ -408,19 +408,19 @@ async fn ns08_o05_o06_group_commit_shares_fsyncs_across_64_groups_and_4_lanes() 
     let mut waiting = Vec::new();
     for group in groups.iter().take(8) {
         let group = group.clone();
-        waiting.push(tokio::spawn(async move {
+        waiting.push(nabedra_rt::task::spawn(async move {
             group
                 .log_transaction(budget(), put_entry(9, b"log", b"held".to_vec()))
                 .await
                 .unwrap();
         }));
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(100)).await;
     assert!(waiting.iter().all(|task| !task.is_finished()));
-    let read = tokio::time::timeout(Duration::from_secs(5), get(&groups[20], b"state")).await;
+    let read = nabedra_rt::time::timeout(Duration::from_secs(5), get(&groups[20], b"state")).await;
     assert_eq!(read.expect("query read waited behind storage"), b"20/0/2");
     let control =
-        tokio::time::timeout(Duration::from_secs(5), groups[21].applied_state(budget())).await;
+        nabedra_rt::time::timeout(Duration::from_secs(5), groups[21].applied_state(budget())).await;
     assert_eq!(
         control
             .expect("control read waited behind storage")
@@ -513,7 +513,7 @@ async fn o11_separate_pool_log_keeps_application_synced() {
     let second = OltpPool::open_development(
         &second_dir.0,
         PoolIdentity {
-            pool_id: Uuid::new_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
             ..identity
         },
         resources.clone(),
@@ -574,7 +574,7 @@ async fn o11_concurrent_groups_track_unsynced_applies_against_an_oracle() {
         for &n in &chosen {
             let group = groups[n].clone();
             let index = applied[n];
-            tasks.push(tokio::spawn(async move {
+            tasks.push(nabedra_rt::task::spawn(async move {
                 group
                     .transaction(
                         meta(index),
@@ -859,6 +859,7 @@ async fn o06_ns07_damaged_group_is_quarantined_reported_and_never_started() {
 /// `cache_bytes`, scheduler charges do not grow, and every value reads back.
 /// The plan's 2.15 GB cgroup run (`memory.peak`) is not this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::disallowed_methods)] // a short-lived memory sampler thread for this test; not a service
 async fn ns10_o21_two_pools_beyond_memory_budget_stay_inside_their_charges() {
     let config = SharedResourceConfig {
         cache_bytes: 1 << 20,
@@ -874,7 +875,7 @@ async fn ns10_o21_two_pools_beyond_memory_budget_stay_inside_their_charges() {
             OltpPool::open_development(
                 &dir.0,
                 PoolIdentity {
-                    pool_id: Uuid::new_v4(),
+                    pool_id: nabedra_rt::ids::uuid_v4(),
                     ..identity.clone()
                 },
                 resources.clone(),
@@ -896,7 +897,7 @@ async fn ns10_o21_two_pools_beyond_memory_budget_stay_inside_their_charges() {
             while sampling.load(Ordering::Relaxed) {
                 peak.fetch_max(resources.storage.memtables.used(), Ordering::Relaxed);
                 assert!(resources.storage.cache.usage_bytes() <= config.cache_bytes + (64 << 10));
-                std::thread::sleep(Duration::from_millis(1));
+                nabedra_rt::time::thread_sleep(Duration::from_millis(1));
             }
         })
     };
@@ -906,7 +907,7 @@ async fn ns10_o21_two_pools_beyond_memory_budget_stay_inside_their_charges() {
     }
     let mut tasks = Vec::new();
     for group in groups.clone() {
-        tasks.push(tokio::spawn(async move {
+        tasks.push(nabedra_rt::task::spawn(async move {
             for row in 0..rows_per_pool as u64 {
                 group
                     .log_transaction(
@@ -1052,7 +1053,7 @@ fn o05_kv_threads_are_per_worker_plus_two_journal_threads_per_open_pool() {
     let second = OltpPool::open_development(
         &second_dir.0,
         PoolIdentity {
-            pool_id: Uuid::new_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
             ..identity
         },
         resources.clone(),
@@ -1072,9 +1073,9 @@ fn o05_kv_threads_are_per_worker_plus_two_journal_threads_per_open_pool() {
     drop(second);
     // Closing joins the pool's threads, but Linux can list an exited thread in
     // /proc/self/task for a moment afterwards; wait for it to go.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while count() != after_first && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    let deadline = nabedra_rt::time::now_std() + std::time::Duration::from_secs(5);
+    while count() != after_first && nabedra_rt::time::now_std() < deadline {
+        nabedra_rt::time::thread_sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(count(), after_first);
     eprintln!(
@@ -1117,24 +1118,24 @@ async fn ns08_ns17_l0_slowdown_paces_writes_off_the_executor() {
         .unwrap();
     // One flushed L0 run reaches the slowdown trigger.
     let flushing = pool.clone();
-    tokio::task::spawn_blocking(move || flushing.inner.store.flush().unwrap())
+    nabedra_rt::task::spawn_blocking(move || flushing.inner.store.flush().unwrap())
         .await
         .unwrap();
     assert!(pool.inner.store.stats().l0_runs >= 1);
 
-    let started = std::time::Instant::now();
+    let started = nabedra_rt::time::now_std();
     let writer = group.clone();
-    let paced = tokio::spawn(async move {
+    let paced = nabedra_rt::task::spawn(async move {
         writer
             .transaction(meta(1), budget(), put_entry(1, b"row", vec![7u8; 16 << 10]))
             .await
             .unwrap();
         started.elapsed()
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(50)).await;
     assert!(!paced.is_finished(), "the write was not paced");
     // The paced write holds no executor slot: the one query thread serves a read.
-    let read = tokio::time::timeout(Duration::from_millis(150), get(&group, b"row"))
+    let read = nabedra_rt::time::timeout(Duration::from_millis(150), get(&group, b"row"))
         .await
         .expect("read waited behind a paced write");
     assert_eq!(read, b"before");
@@ -1145,17 +1146,17 @@ async fn ns08_ns17_l0_slowdown_paces_writes_off_the_executor() {
     // A caller cancelled while its write waits on the pacing timer: the write
     // still lands, exactly once, in order.
     let writer = group.clone();
-    let cancelled = tokio::spawn(async move {
+    let cancelled = nabedra_rt::task::spawn(async move {
         writer
             .transaction(meta(2), budget(), put_entry(2, b"row", vec![9u8; 16 << 10]))
             .await
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(50)).await;
     cancelled.abort();
     let _ = cancelled.await;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    nabedra_rt::time::timeout(Duration::from_secs(5), async {
         while get(&group, b"row").await != vec![9u8; 16 << 10] {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -1167,24 +1168,24 @@ async fn ns08_ns17_l0_slowdown_paces_writes_off_the_executor() {
     // write. The executor finishes the batch after the caller is gone; the
     // write must land all the same, exactly once.
     assert!(pool.inner.store.stats().l0_runs >= 1);
-    let started = std::time::Instant::now();
+    let started = nabedra_rt::time::now_std();
     let writer = group.clone();
-    let cancelled = tokio::spawn(async move {
+    let cancelled = nabedra_rt::task::spawn(async move {
         writer
             .transaction(meta(3), budget(), move |tx| {
                 // Still inside the executor when the caller is cancelled.
-                std::thread::sleep(Duration::from_millis(200));
+                nabedra_rt::time::thread_sleep(Duration::from_millis(200));
                 tx.put(b"row", &[5u8; 16 << 10])?;
                 Ok(Transition::Commit(tx.copy_output(&3u64.to_be_bytes())?))
             })
             .await
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(50)).await;
     cancelled.abort();
     let _ = cancelled.await;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    nabedra_rt::time::timeout(Duration::from_secs(5), async {
         while get(&group, b"row").await != vec![5u8; 16 << 10] {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -1268,20 +1269,20 @@ pub(crate) async fn o29_pool_recovery() {
     let healthy = OltpPool::open_development(
         &healthy_dir.0,
         PoolIdentity {
-            pool_id: Uuid::new_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
             ..identity.clone()
         },
         resources.clone(),
     )
     .unwrap();
     let proof = healthy.group(group_identity(&healthy)).await.unwrap();
-    let decided = Uuid::new_v4().to_string().into_bytes();
+    let decided = nabedra_rt::ids::uuid_v4().to_string().into_bytes();
     proof
         .transaction(meta(0), budget(), put_entry(0, b"prior", decided.clone()))
         .await
         .unwrap();
 
-    let table_id = Uuid::new_v4().to_string().into_bytes();
+    let table_id = nabedra_rt::ids::uuid_v4().to_string().into_bytes();
     let original = table_id.clone();
     let live = pool.kv_store().visible_seq();
     disk.clear_calls();
@@ -1313,7 +1314,7 @@ pub(crate) async fn o29_pool_recovery() {
         let observed = attempted.clone();
         let same_request = handle.transaction(meta(0), budget(), move |tx| {
             observed.fetch_add(1, Ordering::Relaxed);
-            let regenerated = Uuid::new_v4().to_string();
+            let regenerated = nabedra_rt::ids::uuid_v4().to_string();
             tx.put(b"table", regenerated.as_bytes())?;
             Ok(Transition::Commit(tx.copy_output(regenerated.as_bytes())?))
         });

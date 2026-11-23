@@ -180,10 +180,10 @@ impl Fixture {
     }
     /// Another worker's replica with only the first fence applied.
     async fn replica_of_inactive(&self) -> OtherReplica {
-        let dir = Dir(std::env::temp_dir().join(format!("mvcc-direct-{}", Uuid::new_v4())));
+        let dir = Dir(std::env::temp_dir().join(format!("mvcc-direct-{}", nabedra_rt::ids::uuid_v4())));
         let mut identity = self.pool_identity.clone();
-        identity.worker_id = Uuid::new_v4();
-        identity.pool_id = Uuid::new_v4();
+        identity.worker_id = nabedra_rt::ids::uuid_v4();
+        identity.pool_id = nabedra_rt::ids::uuid_v4();
         // Another worker: its own storage and memory budgets.
         let shared = shared();
         let pool = OltpPool::open_development(&dir.0, identity, shared.clone()).unwrap();
@@ -204,7 +204,7 @@ impl Fixture {
         }
     }
     async fn new() -> Self {
-        Self::with(Uuid::new_v4(), full_span()).await
+        Self::with(nabedra_rt::ids::uuid_v4(), full_span()).await
     }
     async fn with(table: Uuid, span: KeySpan) -> Self {
         let mut f = Self::inactive(table, span).await;
@@ -218,34 +218,34 @@ impl Fixture {
     /// A fenced group that `data.direct.v1` has not reached yet.
     async fn inactive(table: Uuid, span: KeySpan) -> Self {
         let shared = shared();
-        let dir = Dir(std::env::temp_dir().join(format!("mvcc-direct-{}", Uuid::new_v4())));
+        let dir = Dir(std::env::temp_dir().join(format!("mvcc-direct-{}", nabedra_rt::ids::uuid_v4())));
         let pool_identity = PoolIdentity {
             engine: "oltp".into(),
             pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-            cluster_id: Uuid::new_v4(),
-            worker_id: Uuid::new_v4(),
-            pool_id: Uuid::new_v4(),
+            cluster_id: nabedra_rt::ids::uuid_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
         };
         let pool =
             OltpPool::open_development(&dir.0, pool_identity.clone(), shared.clone()).unwrap();
         let group = GroupIdentity {
             cluster_id: pool_identity.cluster_id,
             database: Text::try_from("default").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Data {
                 table_id: table,
-                shard_id: Uuid::new_v4(),
+                shard_id: nabedra_rt::ids::uuid_v4(),
             },
             group_format_version: 1,
         };
         let store = pool.group(group.clone()).await.unwrap();
         let authority = Authority {
-            run_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
             owner_term: 1,
         };
-        let catalog_group_id = Uuid::new_v4();
+        let catalog_group_id = nabedra_rt::ids::uuid_v4();
         let first_fence = ParticipantCommand::Fence {
-            transition_id: Uuid::new_v4(),
+            transition_id: nabedra_rt::ids::uuid_v4(),
             expected: None,
             next: authority,
             schema_epoch: 1,
@@ -286,7 +286,7 @@ impl Fixture {
     }
     fn fence(&self, schema_epoch: u64, routing_epoch: u64, span: KeySpan) -> ParticipantCommand {
         ParticipantCommand::Fence {
-            transition_id: Uuid::new_v4(),
+            transition_id: nabedra_rt::ids::uuid_v4(),
             expected: None,
             next: self.authority,
             schema_epoch,
@@ -377,7 +377,7 @@ impl Fixture {
     /// A one-row upsert of `key` committed at `commit_ts`.
     fn put(&self, key: i64, expected: Option<u64>, commit_ts: u64) -> DirectCommit {
         self.commit(
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             1,
             commit_ts,
             vec![self.write(
@@ -403,7 +403,7 @@ impl Fixture {
     // Queued-path helpers, as in the participant store tests.
     fn queued_plan(&self, read: u64, writes: &[PreparedWrite]) -> QueuedPlan {
         let txn = TxnId {
-            request_id: Uuid::new_v4(),
+            request_id: nabedra_rt::ids::uuid_v4(),
             attempt: 0,
         };
         let request = RequestBinding {
@@ -413,7 +413,7 @@ impl Fixture {
             accepted_context: digest(2),
         };
         let manifest = ManifestRef {
-            status_group_id: Uuid::new_v4(),
+            status_group_id: nabedra_rt::ids::uuid_v4(),
             digest: digest(3),
             participant_count: 1,
         };
@@ -439,7 +439,7 @@ impl Fixture {
     async fn prepare(&mut self, p: &QueuedPlan, writes: Vec<PreparedWrite>) -> ParticipantReply {
         let guard = lifecycle::VerifiedLifecycleGuard::model_for_test(
             lifecycle::LifecycleBinding {
-                guard_id: Uuid::new_v4(),
+                guard_id: nabedra_rt::ids::uuid_v4(),
                 catalog_group_id: self.catalog_group_id,
                 table_id: self.table,
                 lifecycle_version: None,
@@ -566,7 +566,7 @@ async fn o11_d03_direct_commit_writes_versions_heads_index_and_one_dedup_record(
     let mut f = Fixture::new().await;
     let index_key = MvccKey::IndexEntry {
         table_id: f.table,
-        index_id: Uuid::new_v4(),
+        index_id: nabedra_rt::ids::uuid_v4(),
         values: Page::new(vec![IndexValue::Int64(7)]).unwrap(),
         primary_key: Key::Int64(1),
     };
@@ -576,7 +576,7 @@ async fn o11_d03_direct_commit_writes_versions_heads_index_and_one_dedup_record(
         expected_version: None,
         value: Some(f.json(serde_json::json!({"id": 1}))),
     });
-    let commit = f.commit(Uuid::new_v4(), 1, 10, vec![write]);
+    let commit = f.commit(nabedra_rt::ids::uuid_v4(), 1, 10, vec![write]);
     assert_eq!(f.direct(&commit).await, applied(10));
 
     assert_eq!(f.version(10, 1).await, Some(10));
@@ -616,7 +616,7 @@ async fn d03_exact_retry_replays_the_original_result_without_a_second_version() 
 #[tokio::test]
 async fn d03_same_id_different_body_conflicts_on_the_same_key_and_executes_on_another_key() {
     let mut f = Fixture::new().await;
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let first = f.commit(
         id,
         1,
@@ -651,7 +651,7 @@ async fn d03_same_id_different_body_conflicts_on_the_same_key_and_executes_on_an
 async fn d03_multi_row_commit_anchors_its_dedup_record_on_the_smallest_key() {
     let mut f = Fixture::new().await;
     let commit = f.commit(
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
         1,
         10,
         vec![
@@ -673,7 +673,7 @@ async fn d03_multi_row_commit_anchors_its_dedup_record_on_the_smallest_key() {
 async fn o07_direct_rejects_an_uninitialized_group() {
     let f = Fixture::new().await;
     let mut group = f.group.clone();
-    group.group_id = Uuid::new_v4();
+    group.group_id = nabedra_rt::ids::uuid_v4();
     let store = f.pool.group(group).await.unwrap();
     let mut empty = Replica {
         machine: ParticipantMachine::new(store).unwrap(),
@@ -693,29 +693,29 @@ async fn o07_direct_rejects_malformed_commands() {
     let mut nil = f.put(1, None, 10);
     nil.request_id = Uuid::nil();
     let unsorted = f.commit(
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
         1,
         10,
         vec![f.write(2, None, None), f.write(1, None, None)],
     );
-    let empty = f.commit(Uuid::new_v4(), 1, 10, Vec::new());
+    let empty = f.commit(nabedra_rt::ids::uuid_v4(), 1, 10, Vec::new());
     let mut other_table = f.put(1, None, 10);
-    other_table.table_id = Uuid::new_v4();
+    other_table.table_id = nabedra_rt::ids::uuid_v4();
     let mut stray_index = f.write(1, None, None);
     stray_index.index.push(IndexChange {
         key: MvccKey::IndexEntry {
             table_id: f.table,
-            index_id: Uuid::new_v4(),
+            index_id: nabedra_rt::ids::uuid_v4(),
             values: Page::new(vec![IndexValue::Int64(1)]).unwrap(),
             primary_key: Key::Int64(2),
         },
         expected_version: None,
         value: None,
     });
-    let stray_index = f.commit(Uuid::new_v4(), 1, 10, vec![stray_index]);
+    let stray_index = f.commit(nabedra_rt::ids::uuid_v4(), 1, 10, vec![stray_index]);
     let mut not_a_row = f.write(1, None, None);
     not_a_row.key = MvccKey::CatalogTable { table_id: f.table };
-    let not_a_row = f.commit(Uuid::new_v4(), 1, 10, vec![not_a_row]);
+    let not_a_row = f.commit(nabedra_rt::ids::uuid_v4(), 1, 10, vec![not_a_row]);
     for command in [nil, unsorted, empty, other_table, stray_index, not_a_row] {
         assert_rejected_without_writes(&mut f, &command, Fault::InvalidBinding).await;
     }
@@ -748,7 +748,7 @@ async fn o07_direct_rejects_a_stale_routing_epoch() {
 #[tokio::test]
 async fn o07_direct_rejects_keys_outside_the_group_span() {
     let mut f = Fixture::with(
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
         KeySpan {
             start: Some(Key::Int64(0)),
             end: Some(Key::Int64(100)),
@@ -759,7 +759,7 @@ async fn o07_direct_rejects_keys_outside_the_group_span() {
     assert_rejected_without_writes(&mut f, &outside, Fault::InvalidBinding).await;
     // One key inside, one outside.
     let straddling = f.commit(
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
         1,
         10,
         vec![f.write(5, None, None), f.write(-1, None, None)],
@@ -798,7 +798,7 @@ async fn o07_direct_rejects_a_stale_expected_version() {
     let older = f.put(1, Some(9), 11);
     assert_rejected_without_writes(&mut f, &older, Fault::Conflict).await;
     // A deleted row keeps its tombstone's timestamp as its head version.
-    let delete = f.commit(Uuid::new_v4(), 1, 11, vec![f.write(1, Some(10), None)]);
+    let delete = f.commit(nabedra_rt::ids::uuid_v4(), 1, 11, vec![f.write(1, Some(10), None)]);
     assert_eq!(f.direct(&delete).await, applied(11));
     assert_eq!(
         f.read(12, 1).await["value"]["value"],
@@ -829,7 +829,7 @@ async fn o07_direct_validation_follows_the_plan_order() {
     f.prepare(&plan, vec![write]).await;
     // Key 1 has an intent; key 2 has head 10. Each command breaks several
     // rules and must report the earliest one.
-    let mut all = f.commit(Uuid::new_v4(), 1, 5, vec![f.write(1, Some(3), None)]);
+    let mut all = f.commit(nabedra_rt::ids::uuid_v4(), 1, 5, vec![f.write(1, Some(3), None)]);
     all.authority.owner_term += 1;
     all.schema_epoch = 9;
     assert_rejected_without_writes(&mut f, &all, Fault::StaleAuthority).await;
@@ -877,7 +877,7 @@ pub(super) async fn o11_crash_replay_of_a_direct_commit_entry_is_idempotent() {
     let f = Fixture::new().await;
     let index = MvccKey::IndexEntry {
         table_id: f.table,
-        index_id: Uuid::new_v4(),
+        index_id: nabedra_rt::ids::uuid_v4(),
         values: Page::new(vec![IndexValue::Int64(7)]).unwrap(),
         primary_key: Key::Int64(1),
     };
@@ -887,7 +887,7 @@ pub(super) async fn o11_crash_replay_of_a_direct_commit_entry_is_idempotent() {
         expected_version: None,
         value: Some(f.json(serde_json::json!({"id": 1}))),
     });
-    let commit = f.commit(Uuid::new_v4(), 1, 10, vec![write]);
+    let commit = f.commit(nabedra_rt::ids::uuid_v4(), 1, 10, vec![write]);
     let key = f.key(1);
     let command = ParticipantCommand::Direct(commit.clone());
     let entry = || OwnedCommand::new_owned(command.clone(), f.shared(), ByteClass::Data).unwrap();
@@ -987,9 +987,9 @@ async fn d03_dedup_records_survive_raft_snapshot_install() {
     assert_eq!(f.direct(&commit).await, applied(10));
     let snapshot = f.machine().store().export_snapshot(BUDGET).await.unwrap();
 
-    let dir = Dir(std::env::temp_dir().join(format!("mvcc-direct-{}", Uuid::new_v4())));
+    let dir = Dir(std::env::temp_dir().join(format!("mvcc-direct-{}", nabedra_rt::ids::uuid_v4())));
     let mut identity = f.pool_identity.clone();
-    identity.pool_id = Uuid::new_v4();
+    identity.pool_id = nabedra_rt::ids::uuid_v4();
     let pool = OltpPool::open_development(&dir.0, identity, f.shared().clone()).unwrap();
     let store = pool.group(f.group.clone()).await.unwrap();
     store.install_snapshot(snapshot, BUDGET).await.unwrap();
@@ -1021,7 +1021,7 @@ async fn d03_o16_dedup_records_follow_their_anchor_row_through_a_split() {
     }
 
     let split_txn = TxnId {
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         attempt: 1,
     };
     let split_request = RequestBinding {
@@ -1032,7 +1032,7 @@ async fn d03_o16_dedup_records_follow_their_anchor_row_through_a_split() {
     };
     let guard = lifecycle::VerifiedLifecycleGuard::model_for_test(
         lifecycle::LifecycleBinding {
-            guard_id: Uuid::new_v4(),
+            guard_id: nabedra_rt::ids::uuid_v4(),
             catalog_group_id: f.catalog_group_id,
             table_id: f.table,
             lifecycle_version: Some(ts(1)),
@@ -1059,10 +1059,10 @@ async fn d03_o16_dedup_records_follow_their_anchor_row_through_a_split() {
     let mut targets = Vec::new();
     for span in &spans {
         let mut target = f.group.clone();
-        target.group_id = Uuid::new_v4();
+        target.group_id = nabedra_rt::ids::uuid_v4();
         target.kind = GroupKind::Data {
             table_id: f.table,
-            shard_id: Uuid::new_v4(),
+            shard_id: nabedra_rt::ids::uuid_v4(),
         };
         let mut child = Replica {
             machine: ParticipantMachine::new(f.pool.group(target.clone()).await.unwrap()).unwrap(),
@@ -1106,7 +1106,7 @@ async fn d03_o16_dedup_records_follow_their_anchor_row_through_a_split() {
     );
     // A forward marker written before the freeze travels with its anchor
     // (key 2, left child) like a dedup record.
-    let forwarded = f.forward_of(2, Uuid::new_v4(), 7);
+    let forwarded = f.forward_of(2, nabedra_rt::ids::uuid_v4(), 7);
     assert_eq!(f.forward(&forwarded).await, forwarded_reply());
     let bindings = bindings(14);
     assert!(matches!(
@@ -1135,7 +1135,7 @@ async fn d03_o16_dedup_records_follow_their_anchor_row_through_a_split() {
         replayed(&left)
     );
     assert_eq!(
-        f.forward(&f.forward_of(6, Uuid::new_v4(), 1)).await,
+        f.forward(&f.forward_of(6, nabedra_rt::ids::uuid_v4(), 1)).await,
         rejected(Fault::SplitInProgress)
     );
     assert_eq!(f.dump().await, before);
@@ -1413,10 +1413,10 @@ async fn d03_o19_dedup_records_survive_backup_images_and_restore() {
     // Install them into a new group, as an offline restore does, with the
     // restore genesis that sets the group's floor to the cut.
     let mut target = f.group.clone();
-    target.group_id = Uuid::new_v4();
+    target.group_id = nabedra_rt::ids::uuid_v4();
     let store = f.pool.group(target.clone()).await.unwrap();
     let genesis = restore::ParticipantGenesis {
-        restore_id: Uuid::new_v4(),
+        restore_id: nabedra_rt::ids::uuid_v4(),
         source_cluster: f.group.cluster_id,
         target_group: target.clone(),
         catalog_group_id: f.catalog_group_id,
@@ -1604,12 +1604,12 @@ async fn d06_registration_requires_leadership_and_an_applied_entry_of_the_term()
         register(&clock, 10, vec![f.key(1)]),
         Err(ClockRejection::NotServing)
     );
-    let read = tokio::spawn({
+    let read = nabedra_rt::task::spawn({
         let machine = f.machine().clone();
         let key = f.key(1);
         async move { machine.read_at(ts(5), key).await.map(drop) }
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(50)).await;
     assert!(!read.is_finished(), "a held leader serves no snapshot read");
     clock.observe_applied(AppliedPosition {
         term: 2,
@@ -1697,17 +1697,17 @@ async fn d06_o07_reads_and_scans_wait_for_pending_commits_at_or_below_their_snap
     let clock = f.machine().range_clock().clone();
     register(&clock, 15, vec![f.key(1)]).unwrap();
     register(&clock, 25, vec![f.key(2)]).unwrap();
-    let scan = tokio::spawn({
+    let scan = nabedra_rt::task::spawn({
         let machine = f.machine().clone();
         let table = f.table;
         async move { scan_versions(&machine, table, 20).await }
     });
-    let above = tokio::spawn({
+    let above = nabedra_rt::task::spawn({
         let machine = f.machine().clone();
         let key = f.key(2);
         async move { machine.read_at(ts(10), key).await.map(drop) }
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(50)).await;
     above.await.unwrap().unwrap();
     assert!(
         !scan.is_finished(),
@@ -1717,13 +1717,13 @@ async fn d06_o07_reads_and_scans_wait_for_pending_commits_at_or_below_their_snap
     let seen = scan.await.unwrap();
     assert_eq!(seen, BTreeMap::from([(1, 15)]));
     // A latest-version read waits only for pending commits on its own key.
-    let latest = tokio::spawn({
+    let latest = nabedra_rt::task::spawn({
         let clock = clock.clone();
         let key = f.key(2);
         async move { clock.wait_latest(&key).await }
     });
     clock.wait_latest(&f.key(1)).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(20)).await;
     assert!(!latest.is_finished());
     // A rejected entry settles its pending timestamp too.
     assert_eq!(
@@ -1800,7 +1800,7 @@ async fn d06_o09_concurrent_scans_see_exactly_the_commits_at_or_below_their_snap
         let next_index = next_index.clone();
         let template = f.put(0, None, 1);
         let key_of = f.key(0);
-        writers.push(tokio::spawn(async move {
+        writers.push(nabedra_rt::task::spawn(async move {
             let mut rng = 0x9e37_79b9_u64.wrapping_mul(writer as u64 + 1);
             let mut committed = Vec::new();
             let mut stale = 0;
@@ -1818,7 +1818,7 @@ async fn d06_o09_concurrent_scans_see_exactly_the_commits_at_or_below_their_snap
                     rng ^= rng << 13;
                     rng ^= rng >> 7;
                     rng ^= rng << 17;
-                    tokio::time::sleep(Duration::from_micros(rng % 2000)).await;
+                    nabedra_rt::time::sleep(Duration::from_micros(rng % 2000)).await;
                     match register(&clock, commit_ts, vec![row.clone()]) {
                         Ok(()) => break commit_ts,
                         Err(ClockRejection::StaleTimestamp { .. }) => stale += 1,
@@ -1826,7 +1826,7 @@ async fn d06_o09_concurrent_scans_see_exactly_the_commits_at_or_below_their_snap
                     }
                 };
                 let mut commit = template.clone();
-                commit.request_id = Uuid::new_v4();
+                commit.request_id = nabedra_rt::ids::uuid_v4();
                 commit.commit_ts = ts(commit_ts);
                 commit.writes[0].key = row;
                 let mut index = next_index.lock().await;
@@ -1850,7 +1850,7 @@ async fn d06_o09_concurrent_scans_see_exactly_the_commits_at_or_below_their_snap
         let machine = f.machine().clone();
         let source = source.clone();
         let table = f.table;
-        readers.push(tokio::spawn(async move {
+        readers.push(nabedra_rt::task::spawn(async move {
             let mut rng = 0x2545_f491_u64.wrapping_mul(reader + 7);
             let mut scans = Vec::new();
             for _ in 0..30 {
@@ -1858,7 +1858,7 @@ async fn d06_o09_concurrent_scans_see_exactly_the_commits_at_or_below_their_snap
                 rng ^= rng << 13;
                 rng ^= rng >> 7;
                 rng ^= rng << 17;
-                tokio::time::sleep(Duration::from_micros(rng % 1500)).await;
+                nabedra_rt::time::sleep(Duration::from_micros(rng % 1500)).await;
                 scans.push((s, scan_versions(&machine, table, s).await));
             }
             scans
@@ -1907,13 +1907,13 @@ async fn o02_direct_variants_use_new_tags_that_an_older_decoder_rejects() {
     assert!(expire.get("direct_expire").is_some());
     for (command, tag) in [
         (
-            ParticipantCommand::DirectForward(f.forward_of(1, Uuid::new_v4(), 1)),
+            ParticipantCommand::DirectForward(f.forward_of(1, nabedra_rt::ids::uuid_v4(), 1)),
             "direct_forward",
         ),
         (
             ParticipantCommand::DirectPause(DirectPause {
                 authority: f.authority,
-                split_id: Uuid::new_v4(),
+                split_id: nabedra_rt::ids::uuid_v4(),
                 paused: true,
             }),
             "direct_pause",
@@ -1938,9 +1938,9 @@ async fn o02_direct_variants_use_new_tags_that_an_older_decoder_rejects() {
     let before = f.dump().await;
     let scoped = ParticipantCommand::Scoped {
         scope: crate::oltp_replication::authority::control::ScopedCatalogRead {
-            queue_group_id: Uuid::new_v4(),
-            data_generation: Uuid::new_v4(),
-            queue_generation: Uuid::new_v4(),
+            queue_group_id: nabedra_rt::ids::uuid_v4(),
+            data_generation: nabedra_rt::ids::uuid_v4(),
+            queue_generation: nabedra_rt::ids::uuid_v4(),
             queue_view: crate::oltp_replication::types::AuthorityView {
                 run_id: f.authority.run_id,
                 owner_term: f.authority.owner_term,
@@ -1948,7 +1948,7 @@ async fn o02_direct_variants_use_new_tags_that_an_older_decoder_rejects() {
             },
             request: RequestBinding {
                 run_id: f.authority.run_id,
-                request_id: Uuid::new_v4(),
+                request_id: nabedra_rt::ids::uuid_v4(),
                 digest: digest(1),
                 accepted_context: digest(2),
             },
@@ -1983,12 +1983,12 @@ async fn d06_o09_a_leadership_change_fails_reads_waiting_on_pending_commits() {
         f.lead();
         let clock = f.machine().range_clock().clone();
         register(&clock, pending, vec![f.key(1)]).unwrap();
-        let read = tokio::spawn({
+        let read = nabedra_rt::task::spawn({
             let machine = f.machine().clone();
             let key = f.key(1);
             async move { machine.read_at(ts(s), key).await.map(drop) }
         });
-        let scan = tokio::spawn({
+        let scan = nabedra_rt::task::spawn({
             let machine = f.machine().clone();
             let table = f.table;
             async move {
@@ -2007,12 +2007,12 @@ async fn d06_o09_a_leadership_change_fails_reads_waiting_on_pending_commits() {
                     .map(drop)
             }
         });
-        let latest = tokio::spawn({
+        let latest = nabedra_rt::task::spawn({
             let clock = clock.clone();
             let key = f.key(1);
             async move { clock.wait_latest(&key).await }
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(50)).await;
         assert!(!read.is_finished() && !scan.is_finished() && !latest.is_finished());
         match change {
             // The commit at 15 may still commit under the next leader.
@@ -2093,7 +2093,7 @@ async fn d06_a_timestamp_fetched_before_a_leadership_change_cannot_register() {
 #[tokio::test]
 async fn d03_a_forward_marker_makes_a_later_direct_attempt_fall_back() {
     let mut f = Fixture::new().await;
-    let request = Uuid::new_v4();
+    let request = nabedra_rt::ids::uuid_v4();
     assert_eq!(f.lookup(1, request).await, None);
     let forward = f.forward_of(1, request, 3);
     assert_eq!(f.forward(&forward).await, forwarded_reply());
@@ -2129,12 +2129,12 @@ async fn d03_a_forward_marker_makes_a_later_direct_attempt_fall_back() {
     assert_eq!(f.direct(&elsewhere).await, applied(10));
     // A bad forward writes nothing.
     let before = f.dump().await;
-    let mut stale = f.forward_of(3, Uuid::new_v4(), 1);
+    let mut stale = f.forward_of(3, nabedra_rt::ids::uuid_v4(), 1);
     stale.authority.owner_term += 1;
-    let mut zero_clock = f.forward_of(3, Uuid::new_v4(), 1);
+    let mut zero_clock = f.forward_of(3, nabedra_rt::ids::uuid_v4(), 1);
     zero_clock.applied_unix_ms = 0;
-    let mut other_table = f.forward_of(3, Uuid::new_v4(), 1);
-    other_table.table_id = Uuid::new_v4();
+    let mut other_table = f.forward_of(3, nabedra_rt::ids::uuid_v4(), 1);
+    other_table.table_id = nabedra_rt::ids::uuid_v4();
     for (forward, fault) in [
         (stale, Fault::StaleAuthority),
         (zero_clock, Fault::InvalidBinding),
@@ -2150,7 +2150,7 @@ async fn d03_a_forward_marker_makes_a_later_direct_attempt_fall_back() {
 #[tokio::test]
 async fn d03_a_forward_after_a_direct_commit_returns_the_committed_result() {
     let mut f = Fixture::with(
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
         KeySpan {
             start: Some(Key::Int64(0)),
             end: Some(Key::Int64(100)),
@@ -2188,12 +2188,12 @@ async fn d03_a_forward_after_a_direct_commit_returns_the_committed_result() {
     );
     assert!(
         f.machine()
-            .direct_dedup(Uuid::new_v4(), Key::Int64(1), commit.request_id)
+            .direct_dedup(nabedra_rt::ids::uuid_v4(), Key::Int64(1), commit.request_id)
             .await
             .is_err()
     );
     assert_eq!(
-        f.forward(&f.forward_of(100, Uuid::new_v4(), 1)).await,
+        f.forward(&f.forward_of(100, nabedra_rt::ids::uuid_v4(), 1)).await,
         rejected(Fault::InvalidBinding)
     );
 }
@@ -2291,7 +2291,7 @@ async fn o16_d06_a_split_barrier_lets_the_freeze_succeed_under_steady_direct_loa
         let stop = stop.clone();
         let template = f.put(0, None, 1);
         let row_of = f.key(0);
-        writers.push(tokio::spawn(async move {
+        writers.push(nabedra_rt::task::spawn(async move {
             let (mut applied_count, mut refused) = (0u64, 0u64);
             let mut n = 0i64;
             while !stop.load(AtomicOrdering::SeqCst) {
@@ -2300,14 +2300,14 @@ async fn o16_d06_a_split_barrier_lets_the_freeze_succeed_under_steady_direct_loa
                     unreachable!()
                 };
                 let mut commit = template.clone();
-                commit.request_id = Uuid::new_v4();
+                commit.request_id = nabedra_rt::ids::uuid_v4();
                 // The timestamp is fetched before the entry is appended.
                 commit.commit_ts = ts(source.fetch_add(1, AtomicOrdering::SeqCst) + 1);
                 commit.writes[0].key = MvccKey::Row {
                     table_id: *table_id,
                     primary_key: Key::Int64(writer * 100_000 + n),
                 };
-                tokio::time::sleep(Duration::from_micros(200)).await;
+                nabedra_rt::time::sleep(Duration::from_micros(200)).await;
                 let mut log = log.lock().await;
                 let command = ParticipantCommand::Direct(commit);
                 let reply = apply_at(&machine, &shared, log.0, command.clone()).await;
@@ -2338,15 +2338,15 @@ async fn o16_d06_a_split_barrier_lets_the_freeze_succeed_under_steady_direct_loa
             reply
         }
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(100)).await;
     // Without the barrier, a cut allocated before more commits apply fails.
-    let early = split_bindings(&f, Uuid::new_v4(), source.load(AtomicOrdering::SeqCst));
+    let early = split_bindings(&f, nabedra_rt::ids::uuid_v4(), source.load(AtomicOrdering::SeqCst));
     // At most one commit per writer took its timestamp before the cut was read,
     // so once four more entries apply at least one of them is above the cut.
     // Wait for that instead of sleeping, which fails on a loaded host.
     let start = log.lock().await.0;
     while log.lock().await.0 < start + 4 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(
         submit(ParticipantCommand::SplitFreeze {
@@ -2357,7 +2357,7 @@ async fn o16_d06_a_split_barrier_lets_the_freeze_succeed_under_steady_direct_loa
         ParticipantReply::Rejected(Fault::DirectCommitAboveCut)
     );
     // The coordinator: barrier, then the cut, then the freeze.
-    let split_id = Uuid::new_v4();
+    let split_id = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         submit(pause(&f, split_id, true)).await,
         ParticipantReply::DirectPaused {
@@ -2366,9 +2366,9 @@ async fn o16_d06_a_split_barrier_lets_the_freeze_succeed_under_steady_direct_loa
         }
     );
     // Writers keep going (and are refused) while the cut is fetched.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(50)).await;
     let cut = source.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(50)).await;
     assert!(matches!(
         submit(ParticipantCommand::SplitFreeze {
             authority: f.authority,
@@ -2377,7 +2377,7 @@ async fn o16_d06_a_split_barrier_lets_the_freeze_succeed_under_steady_direct_loa
         .await,
         ParticipantReply::SplitSourceFrozen(_)
     ));
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(20)).await;
     stop.store(true, AtomicOrdering::SeqCst);
     let (mut applied_total, mut refused_total) = (0, 0);
     for writer in writers {
@@ -2407,7 +2407,7 @@ async fn o16_d06_a_split_barrier_lets_the_freeze_succeed_under_steady_direct_loa
 #[tokio::test]
 async fn o16_the_split_barrier_belongs_to_one_split() {
     let mut f = Fixture::new().await;
-    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let (a, b) = (nabedra_rt::ids::uuid_v4(), nabedra_rt::ids::uuid_v4());
     let paused = |split_id, paused| ParticipantReply::DirectPaused { split_id, paused };
     // Releasing a barrier nobody holds is a no-op.
     assert_eq!(f.submit(pause(&f, a, false)).await, paused(a, false));
@@ -2444,7 +2444,7 @@ async fn o16_the_split_barrier_belongs_to_one_split() {
     let blocked = f.put(1, None, 10);
     assert_rejected_without_writes(&mut f, &blocked, Fault::SplitInProgress).await;
     assert_eq!(
-        f.forward(&f.forward_of(1, Uuid::new_v4(), 1)).await,
+        f.forward(&f.forward_of(1, nabedra_rt::ids::uuid_v4(), 1)).await,
         forwarded_reply()
     );
     // A fence (new run) keeps the barrier.
@@ -2454,7 +2454,7 @@ async fn o16_the_split_barrier_belongs_to_one_split() {
     };
     assert!(matches!(
         f.submit(ParticipantCommand::Fence {
-            transition_id: Uuid::new_v4(),
+            transition_id: nabedra_rt::ids::uuid_v4(),
             expected: Some(f.authority),
             next,
             schema_epoch: 1,
@@ -2573,13 +2573,13 @@ async fn o07_oversized_direct_commands_answer_resource_limit() {
     let rows: Vec<DirectWrite> = (0..=MAX_DIRECT_WRITES as i64)
         .map(|key| f.write(key, None, None))
         .collect();
-    let too_many_rows = f.commit(Uuid::new_v4(), 1, 10, rows);
+    let too_many_rows = f.commit(nabedra_rt::ids::uuid_v4(), 1, 10, rows);
     let mut wide = f.write(1, None, None);
     wide.index = (0..=MAX_DIRECT_INDEX_CHANGES as i64)
         .map(|value| IndexChange {
             key: MvccKey::IndexEntry {
                 table_id: f.table,
-                index_id: Uuid::new_v4(),
+                index_id: nabedra_rt::ids::uuid_v4(),
                 values: Page::new(vec![IndexValue::Int64(value)]).unwrap(),
                 primary_key: Key::Int64(1),
             },
@@ -2587,7 +2587,7 @@ async fn o07_oversized_direct_commands_answer_resource_limit() {
             value: None,
         })
         .collect();
-    let too_many_index_changes = f.commit(Uuid::new_v4(), 1, 10, vec![wide]);
+    let too_many_index_changes = f.commit(nabedra_rt::ids::uuid_v4(), 1, 10, vec![wide]);
     let mut large_result = f.put(1, None, 10);
     large_result.result = f.json(serde_json::json!("x".repeat(MAX_DIRECT_RESULT_BYTES)));
     for command in [too_many_rows, too_many_index_changes, large_result] {
@@ -2595,7 +2595,7 @@ async fn o07_oversized_direct_commands_answer_resource_limit() {
     }
     // A malformed command is still `InvalidBinding`, even when also large.
     let mut both = f.commit(
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
         1,
         10,
         (0..=MAX_DIRECT_WRITES as i64)
@@ -2612,7 +2612,7 @@ async fn o07_oversized_direct_commands_answer_resource_limit() {
 #[tokio::test]
 async fn o16_a_split_child_with_a_stray_dedup_record_refuses_staging() {
     let f = Fixture::new().await;
-    let [left, _] = split_bindings(&f, Uuid::new_v4(), 30);
+    let [left, _] = split_bindings(&f, nabedra_rt::ids::uuid_v4(), 30);
     let mut child = Replica {
         machine: ParticipantMachine::new(f.pool.group(left.target.clone()).await.unwrap()).unwrap(),
         shared: f.shared().clone(),
@@ -2627,7 +2627,7 @@ async fn o16_a_split_child_with_a_stray_dedup_record_refuses_staging() {
         ParticipantReply::DirectSchema(_)
     ));
     // The stray record: a forward marker for a key in the child's span.
-    let mut stray = f.forward_of(1, Uuid::new_v4(), 1);
+    let mut stray = f.forward_of(1, nabedra_rt::ids::uuid_v4(), 1);
     stray.anchor = Key::Int64(1);
     assert_eq!(
         child.submit(ParticipantCommand::DirectForward(stray)).await,
@@ -2658,7 +2658,7 @@ async fn d06_latest_reads_track_pending_writers_per_key() {
     register(&clock, 16, vec![f.key(1)]).unwrap();
     register(&clock, 17, vec![f.key(3)]).unwrap();
     assert_eq!(clock.pending_key_count(), 3);
-    let latest = tokio::spawn({
+    let latest = nabedra_rt::task::spawn({
         let clock = clock.clone();
         let key = f.key(1);
         async move { clock.wait_latest(&key).await }
@@ -2670,7 +2670,7 @@ async fn d06_latest_reads_track_pending_writers_per_key() {
     // One of key 1's two writers settles: the read keeps waiting.
     clock.settle(ts(15));
     clock.wait_latest(&f.key(2)).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(20)).await;
     assert!(!latest.is_finished(), "key 1 still has the writer at 16");
     clock.settle(ts(16));
     latest.await.unwrap().unwrap();

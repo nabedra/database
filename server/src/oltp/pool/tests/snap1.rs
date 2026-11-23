@@ -2,7 +2,6 @@
 //! plus point reads under the application order); its file is written from the
 //! cut's pinned view in bounded native jobs, only when a follower needs it.
 use super::*;
-use std::time::Instant;
 
 fn large() -> TransactionBudget {
     TransactionBudget {
@@ -57,8 +56,8 @@ async fn snap1_o11_applies_proceed_while_a_snapshot_file_is_written() {
     const BATCHES: u64 = 12; // 48 MiB of rows
     fill(&group, BATCHES).await;
 
-    let started = Instant::now();
-    let export = tokio::spawn({
+    let started = nabedra_rt::time::now_std();
+    let export = nabedra_rt::task::spawn({
         let group = group.clone();
         async move {
             let snapshot = group.export_snapshot(budget()).await;
@@ -68,7 +67,7 @@ async fn snap1_o11_applies_proceed_while_a_snapshot_file_is_written() {
     let mut latencies = Vec::new();
     let mut next = BATCHES;
     while !export.is_finished() {
-        let begun = Instant::now();
+        let begun = nabedra_rt::time::now_std();
         probe(&group, next).await;
         latencies.push(begun.elapsed());
         next += 1;
@@ -205,7 +204,7 @@ async fn snap1_o11_ns10_crash_between_cut_and_transfer_leaves_nothing_on_reopen(
     // The name a crash would leave behind (the process dies with the handle).
     let orphan = snapshot
         .path
-        .with_file_name(format!("send-{}.bin", Uuid::new_v4()));
+        .with_file_name(format!("send-{}.bin", nabedra_rt::ids::uuid_v4()));
     fs::copy(&snapshot.path, &orphan).unwrap();
     drop(snapshot);
     drop(group);

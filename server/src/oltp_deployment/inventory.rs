@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 use uuid::Uuid;
 
@@ -679,7 +679,7 @@ impl WorkerPoolInventory {
         Ok(Self {
             worker,
             ready,
-            observed_at: SystemTime::now()
+            observed_at: nabedra_rt::time::wall_now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| unavailable("worker inventory clock unavailable"))?
                 .as_secs(),

@@ -4,11 +4,11 @@ use aws_sdk_s3::{
     config::{Credentials, Region, retry::RetryConfig, timeout::TimeoutConfig},
     primitives::ByteStream,
 };
+use nabedra_rt::time::{Instant, timeout_at};
 use std::time::Duration;
 use tokio::{
     io::AsyncReadExt,
     sync::{OwnedSemaphorePermit, Semaphore},
-    time::{Instant, timeout_at},
 };
 
 pub(crate) struct S3RepositoryConfig {
@@ -76,7 +76,7 @@ impl S3Repository {
         if let Some(credentials) = config.credentials {
             loader = loader.credentials_provider(credentials);
         }
-        let loaded = tokio::time::timeout(Duration::from_secs(15), loader.load())
+        let loaded = nabedra_rt::time::timeout(Duration::from_secs(15), loader.load())
             .await
             .map_err(|_| unavailable())?;
         let mut builder = aws_sdk_s3::config::Builder::from(&loaded)
@@ -191,9 +191,9 @@ impl Repository for S3Repository {
             let length = body.len();
             // A detached owner survives cancellation of the caller. Its body
             // retains both the byte charge and IO slot in HTTP transport clones.
-            tokio::spawn(async move {
+            nabedra_rt::task::spawn(async move {
                 let _slot = slot.clone();
-                let deadline = Instant::now() + Duration::from_secs(30);
+                let deadline = nabedra_rt::time::now() + Duration::from_secs(30);
                 let bytes = bytes::Bytes::from_owner(BodyOwner {
                     bytes: body,
                     _slot: slot,
@@ -222,7 +222,7 @@ impl Repository for S3Repository {
                         // the exact GET its own bounded deadline. Missing or
                         // unreadable objects leave this attempt uncertain.
                         let existing = repository
-                            .get_inner(name, limit, Instant::now() + Duration::from_secs(30))
+                            .get_inner(name, limit, nabedra_rt::time::now() + Duration::from_secs(30))
                             .await?;
                         if existing.len() != length || hash(existing.as_ref()) != expected {
                             return Err(conflict());
@@ -254,10 +254,10 @@ impl Repository for S3Repository {
             })?;
             let repository = self.clone();
             let name = self.object_key(key, &name);
-            tokio::spawn(async move {
+            nabedra_rt::task::spawn(async move {
                 let _slot = slot;
                 repository
-                    .get_inner(name, limit, Instant::now() + Duration::from_secs(30))
+                    .get_inner(name, limit, nabedra_rt::time::now() + Duration::from_secs(30))
                     .await
             })
             .await

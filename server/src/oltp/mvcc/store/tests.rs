@@ -38,13 +38,13 @@ impl Fixture {
             SharedResourceConfig::default(),
         )
         .unwrap();
-        let dir = Dir(std::env::temp_dir().join(format!("mvcc-participant-{}", Uuid::new_v4())));
+        let dir = Dir(std::env::temp_dir().join(format!("mvcc-participant-{}", nabedra_rt::ids::uuid_v4())));
         let identity = PoolIdentity {
             engine: "oltp".into(),
             pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-            cluster_id: Uuid::new_v4(),
-            worker_id: Uuid::new_v4(),
-            pool_id: Uuid::new_v4(),
+            cluster_id: nabedra_rt::ids::uuid_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
         };
         let pool = match fs {
             Some(fs) => {
@@ -59,26 +59,26 @@ impl Fixture {
             None => OltpPool::open_development(&dir.0, identity.clone(), shared.clone()),
         }
         .unwrap();
-        let table = Uuid::new_v4();
+        let table = nabedra_rt::ids::uuid_v4();
         let group = pool
             .group(GroupIdentity {
                 cluster_id: identity.cluster_id,
                 database: Text::try_from("default").unwrap(),
-                group_id: Uuid::new_v4(),
+                group_id: nabedra_rt::ids::uuid_v4(),
                 kind: GroupKind::Data {
                     table_id: table,
-                    shard_id: Uuid::new_v4(),
+                    shard_id: nabedra_rt::ids::uuid_v4(),
                 },
                 group_format_version: 1,
             })
             .await
             .unwrap();
         let authority = Authority {
-            run_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
             owner_term: 1,
         };
         let mut f = Self {
-            catalog_group_id: Uuid::new_v4(),
+            catalog_group_id: nabedra_rt::ids::uuid_v4(),
             machine: ParticipantMachine::new(group).unwrap(),
             shared,
             authority,
@@ -88,7 +88,7 @@ impl Fixture {
         };
         assert!(matches!(
             f.submit(ParticipantCommand::Fence {
-                transition_id: Uuid::new_v4(),
+                transition_id: nabedra_rt::ids::uuid_v4(),
                 expected: None,
                 next: authority,
                 schema_epoch: 1,
@@ -144,7 +144,7 @@ impl Fixture {
     }
     fn plan(&self, read: u64, pages: &[Vec<PreparedWrite>]) -> Plan {
         let txn = TxnId {
-            request_id: Uuid::new_v4(),
+            request_id: nabedra_rt::ids::uuid_v4(),
             attempt: 0,
         };
         let request = RequestBinding {
@@ -154,7 +154,7 @@ impl Fixture {
             accepted_context: Digest::from_bytes([2; 32]),
         };
         let manifest = ManifestRef {
-            status_group_id: Uuid::new_v4(),
+            status_group_id: nabedra_rt::ids::uuid_v4(),
             digest: Digest::from_bytes([3; 32]),
             participant_count: 1,
         };
@@ -199,7 +199,7 @@ impl Fixture {
             guards: Page::new(vec![
                 lifecycle::VerifiedLifecycleGuard::model_for_test(
                     lifecycle::LifecycleBinding {
-                        guard_id: Uuid::new_v4(),
+                        guard_id: nabedra_rt::ids::uuid_v4(),
                         catalog_group_id: self.catalog_group_id,
                         table_id: self.table,
                         lifecycle_version: None,
@@ -284,11 +284,11 @@ fn ts(value: u64) -> Timestamp {
 async fn o01_o22_m02_incremental_prepare_page_budget_retains_exact_limits() {
     let fixture = Fixture::new().await;
     let txn = TxnId {
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         attempt: 1,
     };
     let manifest = ManifestRef {
-        status_group_id: Uuid::new_v4(),
+        status_group_id: nabedra_rt::ids::uuid_v4(),
         digest: Digest::from_bytes([255; 32]),
         participant_count: u64::MAX,
     };
@@ -526,7 +526,7 @@ pub(crate) async fn index_reclamation_storage_evidence() -> (u64, u64) {
     };
     async fn flush_and_compact(f: &Fixture) {
         let pool = f.machine.store.pool().clone();
-        tokio::task::spawn_blocking(move || {
+        nabedra_rt::task::spawn_blocking(move || {
             pool.kv_store().flush().unwrap();
             pool.kv_store().compact().unwrap();
         })
@@ -684,7 +684,7 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
         }
     }
     let mut f = Fixture::new().await;
-    let index_id = Uuid::new_v4();
+    let index_id = nabedra_rt::ids::uuid_v4();
     let index_key = MvccKey::IndexEntry {
         table_id: f.table,
         index_id,
@@ -727,7 +727,7 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
     f.resolve(&plan, committed(11), 128).await;
     eprintln!("split storage stage=source_settled");
     let split_txn = TxnId {
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         attempt: 1,
     };
     let split_request = RequestBinding {
@@ -736,7 +736,7 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
     };
     let guard = lifecycle::VerifiedLifecycleGuard::model_for_test(
         lifecycle::LifecycleBinding {
-            guard_id: Uuid::new_v4(),
+            guard_id: nabedra_rt::ids::uuid_v4(),
             catalog_group_id: f.catalog_group_id,
             table_id: f.table,
             lifecycle_version: Some(ts(1)),
@@ -762,10 +762,10 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
         },
     ] {
         let mut target = f.machine.store.identity().clone();
-        target.group_id = Uuid::new_v4();
+        target.group_id = nabedra_rt::ids::uuid_v4();
         target.kind = GroupKind::Data {
             table_id: f.table,
-            shard_id: Uuid::new_v4(),
+            shard_id: nabedra_rt::ids::uuid_v4(),
         };
         let mut child = Child {
             machine: ParticipantMachine::new(
@@ -779,7 +779,7 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
                 .apply(
                     &f.shared,
                     ParticipantCommand::Fence {
-                        transition_id: Uuid::new_v4(),
+                        transition_id: nabedra_rt::ids::uuid_v4(),
                         expected: None,
                         next: f.authority,
                         schema_epoch: 1,
@@ -857,9 +857,9 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
         .into_sealed()
     };
     let mut cancelled_bindings = bindings.clone();
-    let cancelled_id = Uuid::new_v4();
+    let cancelled_id = nabedra_rt::ids::uuid_v4();
     let cancelled_txn = TxnId {
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         attempt: 1,
     };
     let cancelled_request = RequestBinding {
@@ -1685,7 +1685,7 @@ async fn o06_o07_o10_partial_resolution_witness_requires_exact_decision_and_curr
     };
     assert!(matches!(
         f.submit(ParticipantCommand::Fence {
-            transition_id: Uuid::new_v4(),
+            transition_id: nabedra_rt::ids::uuid_v4(),
             expected: Some(owner),
             next,
             schema_epoch: 1,
@@ -1813,12 +1813,12 @@ async fn o07_o15_r05_abort_before_late_prepare_and_partial_prepare_retains_rollb
     assert!(f.read(20, Key::Int64(1)).await.get("value").is_some());
     let old = f.authority;
     f.authority = Authority {
-        run_id: Uuid::new_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
         owner_term: 2,
     };
     assert!(matches!(
         f.submit(ParticipantCommand::Fence {
-            transition_id: Uuid::new_v4(),
+            transition_id: nabedra_rt::ids::uuid_v4(),
             expected: Some(old),
             next: f.authority,
             catalog_group_id: f.catalog_group_id,

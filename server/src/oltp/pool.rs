@@ -524,7 +524,7 @@ impl OltpPool {
     fn pace_blocking(&self, bytes: usize) {
         let delay = self.inner.store.write_delay(bytes);
         if !delay.is_zero() && tokio::runtime::Handle::try_current().is_err() {
-            std::thread::sleep(delay);
+            nabedra_rt::time::thread_sleep(delay);
         }
     }
     /// The protocol error for a failed write; ambiguous failures latch the pool.
@@ -1073,12 +1073,12 @@ impl GroupStore {
         use crate::{oltp_replication::types::GroupKind, oltp_runtime::stage_timing::perf_stage};
         let data_apply = matches!(lane, MutationLane::State)
             && matches!(self.identity().kind, GroupKind::Data { .. });
-        let stage_started = std::time::Instant::now();
+        let stage_started = nabedra_rt::time::now_std();
         let owner = order.clone().lock_owned().await;
         if data_apply {
             perf_stage!("pool.data_apply.order").since(stage_started);
         }
-        let stage_started = std::time::Instant::now();
+        let stage_started = nabedra_rt::time::now_std();
         let group = self.clone();
         let output = match execution_class {
             ExecutionClass::Query => {
@@ -1097,7 +1097,7 @@ impl GroupStore {
         if data_apply {
             perf_stage!("pool.data_apply.prepare").since(stage_started);
         }
-        let stage_started = std::time::Instant::now();
+        let stage_started = nabedra_rt::time::now_std();
         let runtime = tokio::runtime::Handle::try_current().ok();
         // The executor builds the batch and submits it, or hands it to a paced
         // task; it never waits for storage. Either way the write is dispatched
@@ -1213,8 +1213,8 @@ impl GroupStore {
                     let delay = group.pool().inner.store.write_delay(batch.encoded_bytes());
                     if let Some(runtime) = runtime.as_ref().filter(|_| !delay.is_zero()) {
                         let paced = group.clone();
-                        let task = runtime.spawn(async move {
-                            tokio::time::sleep(delay).await;
+                        let task = nabedra_rt::task::spawn_on(runtime, async move {
+                            nabedra_rt::time::sleep(delay).await;
                             paced.submit_group(batch, durability, on_done, deferred_index)
                         });
                         return Ok(Submitted::Paced {
@@ -1225,7 +1225,7 @@ impl GroupStore {
                     }
                     if !delay.is_zero() {
                         // No runtime to put a timer on: pace here, on the executor.
-                        std::thread::sleep(delay);
+                        nabedra_rt::time::thread_sleep(delay);
                     }
                     let commit = group.submit_group(batch, durability, on_done, deferred_index)?;
                     Ok(Submitted::Pending {
@@ -1248,7 +1248,7 @@ impl GroupStore {
         if data_apply {
             perf_stage!("pool.data_apply.execute").since(stage_started);
         }
-        let stage_started = std::time::Instant::now();
+        let stage_started = nabedra_rt::time::now_std();
         let submitted = match submitted {
             Submitted::Paced {
                 response,
