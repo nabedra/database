@@ -1,0 +1,13 @@
+diff --git a/server/src/oltp_replication/typed_network.rs b/server/src/oltp_replication/typed_network.rs
+index f502b81..3409dad 100644
+--- a/server/src/oltp_replication/typed_network.rs
++++ b/server/src/oltp_replication/typed_network.rs
+@@ -708,7 +708,7 @@ fn raft_sender<'a>(
+             // traffic even if a historical membership does not list them.
+             let replaying_history = catch_up_before
+                 .is_some_and(|index| stored.log_id().is_none_or(|log| log.index < index));
+-            if replaying_history || membership.nodes().next().is_none() {
++            if membership.nodes().next().is_none() {
+                 bootstrap.get(&sender)
+             } else {
+                 None

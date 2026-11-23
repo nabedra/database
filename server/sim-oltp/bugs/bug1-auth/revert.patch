@@ -1,0 +1,13 @@
+diff --git a/server/src/oltp_runtime/application/direct.rs b/server/src/oltp_runtime/application/direct.rs
+index c346a65..063459d 100644
+--- a/server/src/oltp_runtime/application/direct.rs
++++ b/server/src/oltp_runtime/application/direct.rs
+@@ -1129,7 +1129,7 @@ impl DirectGateway {
+                 }
+                 Err(DirectSendError::NotApplied(error)) => {
+                     if error.code == ErrorCode::Unauthorized {
+-                        return Err(if *uncertain { unknown() } else { error });
++                        return Err(error);
+                     }
+                     if error.code == ErrorCode::Overloaded && !*uncertain {
+                         return Err(error);

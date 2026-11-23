@@ -1,0 +1,42 @@
+# Reverted fix BUG1-d04, the D04 lost responder (phase 10, design section 4.1).
+schema = "nabedra.sim-bug/1"
+id = "bug1-d04"
+bug = "BUG1-d04"
+set = "direct"
+phase = 10
+class = "uncertain-outcome"
+guarantees = ["OLTP-G01", "OLTP-G03", "OLTP-G04"]
+scenarios = ["D04", "O10"]
+fix_commits = ["259da02c2369527ebce3d292dac83dd5ffad2d71", "d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+reverts = "259da02c2369527ebce3d292dac83dd5ffad2d71"
+port = "hand"
+port_notes = """
+The 259da02c executor hunks conflict with HEAD. This ports their effect in
+DirectExecutor::proposal_failed (server/src/oltp_runtime/direct/executor.rs): every error other than
+a full-device or disk-reservation refusal returns Ok(()), so a proposal of unknown outcome retries
+locally as it did before the fix. A leader that steps down after applying then answers a redirect
+or, at the deadline, unavailable_not_applied, instead of the outcome_unknown the fix returns at once.
+The pre-fix code kept a local `uncertain` flag for the deadline answer; the redirect that loses the
+uncertainty is the same, so the original regression test fails the same way.
+"""
+workload = "direct"
+# drain-leader between Applied and the reply, and crash-leader.
+profile = ["drain-leader", "crash-leader"]
+expect = ["NotAppliedNeverCommitted"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_runtime::direct::tests::d04_o10_bug1_leader_shutdown_after_apply_preserves_proposal_uncertainty"
+mode = "on"
+failure_contains = ["NotLeader { hint:"]
+
+[regression.evidence]
+digest = "87a9ba998588f3bfa02ea06e321856bd7e7780b3db74d10c05c9f633d0b0f550"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148935717", sha = "53a5716f844aa9690739daed32fd335c68bc0f8a", result = "passed", note = "request p10-bugs-clean-53a5716-103844, direct_oltp on" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148923458", sha = "bff93b5a042b056691fb1bfafb555e2ba72f0213", result = "failed", note = "scratch/sim-bug-bug1-d04, request p10-bugs-bug1-d04-bff93b5-103844, direct_oltp on. The final assertion (outcome Unknown) fails: the stepped-down leader answered a redirect.", output = """
+test oltp_runtime::direct::tests::d04_o10_bug1_leader_shutdown_after_apply_preserves_proposal_uncertainty ... FAILED
+panicked at src/oltp_runtime/direct/tests.rs:1900:5:
+NotLeader { hint: None }
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 585 filtered out; finished in 6.26s
+""" }
