@@ -325,15 +325,12 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                 }))
             .then_some(cutoff)
         };
-        let expired_overwrites = |old| {
+        let overwrites = |old| {
             let seen = &seen;
-            acked_writes.iter().copied().filter_map(move |next| {
-                if next.precedes(r) && observed_before(old, next, seen) {
-                    expired(next).map(|cutoff| (next, cutoff))
-                } else {
-                    None
-                }
-            })
+            acked_writes
+                .iter()
+                .copied()
+                .filter(move |next| next.precedes(r) && observed_before(old, next, seen))
         };
 
         // Resurrection after an acknowledged delete or an expiry.
@@ -398,8 +395,8 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                 ));
                 continue;
             }
-            if let Some((next, _)) = expired_overwrites(w).find(|(next, cutoff)| {
-                !ctx.loss_allowed_before(next, r, Some(*cutoff))
+            if let Some(next) = overwrites(w).find(|next| {
+                expired(next).is_some_and(|cutoff| !ctx.loss_allowed_before(next, r, Some(cutoff)))
                     && !version_can_be_rewritten(next.call)
             }) {
                 anomalies.push(Anomaly::new(
@@ -424,7 +421,7 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                     None => {
                         !removals.iter().any(|d| can_remove_between(d, w2, r))
                             && !deadline_passed(w2, r)
-                            && expired_overwrites(w2).next().is_none()
+                            && !overwrites(w2).any(|next| deadline_passed(next, r))
                     }
                 }
         });

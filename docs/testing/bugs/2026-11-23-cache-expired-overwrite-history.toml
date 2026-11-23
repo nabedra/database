@@ -10,5 +10,5 @@ lowest_regression = "server/check/tests/history_cache_sim.rs::cache_sim_seed_46_
 seed = 46
 why_not_caught = "The existing expiry and stale-read cases did not follow a later SET with an earlier expiry than the value it replaced."
 invariant_added = "The expiry of a surviving overwrite leaves the key absent. Versions it replaced cannot reappear without another write."
-fix_commits = ["476dfa7e83478bc349e3a8424f5d4a6fe3037346"]
+fix_commits = ["c150f004bfeaee37c9160c22576298d757cb5c19"]
 revert_patch_ok = true

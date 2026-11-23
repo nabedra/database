@@ -114,6 +114,13 @@ fn cache_sim_seed_46_expired_overwrite() {
 
     let ops = pair(&events).unwrap().ops;
     let read = ops.iter().find(|op| is_ok(op, "get")).unwrap();
+    let replacement = &ops[1];
+    let expiry = replacement.invoke_value["at_ns"].as_u64().unwrap();
+    let mut at_deadline = events.clone();
+    at_deadline[read.call].time_ns = Some(expiry);
+    at_deadline[read.ret_pos()].time_ns = Some(expiry + 1);
+    assert!(relaxed_kv::check(&at_deadline).valid);
+
     let writes: Vec<_> = preceding_sets(&ops, read).collect();
     for write in writes {
         // The earlier value still has time left on its own TTL. The overwrite
@@ -123,7 +130,6 @@ fn cache_sim_seed_46_expired_overwrite() {
     }
 
     let first = &ops[0];
-    let replacement = &ops[1];
     let mut failover =
         Event::new(EventType::Info, NEMESIS, "failover").with_key(read.key.as_deref().unwrap());
     failover.time_ns = Some(read.call_time.unwrap() - 1);

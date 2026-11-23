@@ -10,5 +10,5 @@ lowest_regression = "server/src/cache/cluster/controller/tests.rs::k03_repairs_a
 seed = 21
 why_not_caught = "Existing transition tests kept the old replica enrolled while staging its replacement."
 invariant_added = "A verified primary can stage a replacement after the old copy retires. The committed replica only changes after the target proves a baseline."
-fix_commits = ["33b3e807532c84119abd6af9bafb46df2b0871b6"]
+fix_commits = ["c0abb4bd82ddc2b6411759341888e1629cec7221"]
 revert_patch_ok = true
