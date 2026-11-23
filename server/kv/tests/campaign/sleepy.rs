@@ -32,9 +32,8 @@ impl Sleepy {
     }
 
     fn nap(&self) {
-        let background = std::thread::current()
-            .name()
-            .is_some_and(|n| n.starts_with("kv-"));
+        let background =
+            nabedra_rt::task::current_service().is_some_and(|name| name.starts_with("kv-"));
         if !background {
             return;
         }
@@ -48,7 +47,7 @@ impl Sleepy {
         };
         if us > 0 {
             self.naps.fetch_add(1, Ordering::Relaxed);
-            std::thread::sleep(Duration::from_micros(us));
+            nabedra_rt::time::thread_sleep(Duration::from_micros(us));
         }
     }
 }

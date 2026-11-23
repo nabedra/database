@@ -1,0 +1,14 @@
+id = "KV-SIM-RESTART-FIXTURE"
+title = "The journal cut fixture reopened in the retired node incarnation"
+class = "fence-lifecycle-order"
+module = "lsm"
+guarantees = ["LSM-G01", "LSM-G02"]
+scenarios = ["NS04", "NS05", "NS17"]
+found_by = "review"
+found_date = "2026-11-23"
+lowest_regression = "journal::sim_tests::ns04_ns05_ns17_node_cut_resolves_parked_and_queued_journal_items"
+seed = 23
+why_not_caught = "The fixture passed before the runtime fenced I/O and services by node incarnation. It reopened after restart without leaving the old node scope."
+invariant_added = "Assert cut outcomes in the retired incarnation, then reopen from a fresh node scope and compare the durable prefix across both opens."
+fix_commits = ["acc47ab39a5818f32c2096961b2400a8e9fcc0e6"]
+revert_patch_ok = true
