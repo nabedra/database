@@ -1,0 +1,46 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p9-83-9fdd217-184358--lsm-stepped-journal.log",
+      "sha256": "a919542109aaf961c6a44d9a4fb79fd8e7bb0c5fd8e42215ec95692b66fbba3e"
+    }
+  ],
+  "assertions": {
+    "executed": 3,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "lsm-stepped-journal",
+  "duration_s": 17.508,
+  "guarantees": [
+    "LSM-G01",
+    "LSM-G02"
+  ],
+  "kind": "S U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T17:44:24.012468+00:00",
+    "request_id": "land-p9-83-9fdd217-184358",
+    "runner": "GitHub Actions 1000007153",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45230813573"
+  },
+  "scenarios": [
+    "LSM01",
+    "NS04",
+    "NS05",
+    "NS17"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "9fdd2179e20b29b144edcca192765e5c9d3ad2be",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
