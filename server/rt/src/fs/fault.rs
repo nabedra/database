@@ -650,7 +650,7 @@ struct State {
     /// Directory operations not yet covered by `sync_dir`, oldest first. Each inner list
     /// is one atomic operation (a rename unlinks and links together).
     pending: Vec<Vec<PendingEffect>>,
-    locks: BTreeSet<PathBuf>,
+    locks: BTreeSet<Ino>,
     faults: Vec<Fault>,
     mutating_ops: u64,
     crash_after: Option<u64>,
@@ -981,6 +981,7 @@ impl State {
                 live.insert(ino);
             }
         }
+        live.extend(&self.locks);
         self.inodes
             .retain(|ino, inode| inode.open_handles > 0 || live.contains(ino));
     }
@@ -1555,37 +1556,46 @@ impl Fs for FaultFs {
 
     fn lock(&self, path: &Path) -> io::Result<FsLock> {
         let mut state = self.state();
-        let result: io::Result<()> = (|| {
-            let creates = !state.os.files.contains_key(path);
-            state.admit(FsOp::Lock, path, creates)?;
-            if state.locks.contains(path) {
-                return Err(io::ErrorKind::WouldBlock.into());
-            }
-            if creates {
+        let result = (|| {
+            let existing = state.os.files.get(path).copied();
+            state.admit(FsOp::Lock, path, existing.is_none())?;
+            let ino = if let Some(ino) = existing {
+                ino
+            } else {
+                if path.as_os_str().is_empty() {
+                    return Err(not_found());
+                }
+                if state.os.dirs.contains_key(path) {
+                    return Err(io::ErrorKind::IsADirectory.into());
+                }
                 state.require_dir(&parent(path))?;
                 let ino = state.new_inode();
                 state.record(vec![Effect::File(path.to_path_buf(), Some(ino))]);
+                ino
+            };
+            if !state.locks.insert(ino) {
+                return Err(io::ErrorKind::WouldBlock.into());
             }
-            state.locks.insert(path.to_path_buf());
-            Ok(())
+            Ok(ino)
         })();
         state.log(FsOp::Lock, path, None, 0, 0, result.is_ok());
-        result?;
         Ok(FsLock::new(Box::new(FaultLockGuard {
             state: Arc::clone(&self.state),
-            path: path.to_path_buf(),
+            ino: result?,
         })))
     }
 }
 
 struct FaultLockGuard {
     state: Arc<Mutex<State>>,
-    path: PathBuf,
+    ino: Ino,
 }
 
 impl Drop for FaultLockGuard {
     fn drop(&mut self) {
-        lock(&self.state).locks.remove(&self.path);
+        let mut state = lock(&self.state);
+        state.locks.remove(&self.ino);
+        state.collect_garbage();
     }
 }
 
