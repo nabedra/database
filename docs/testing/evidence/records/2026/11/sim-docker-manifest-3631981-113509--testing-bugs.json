@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "sim-docker-manifest-3631981-113509--testing-bugs.log",
+      "sha256": "166737a2073608059ee752e421bcc6219f130ec0a3192ae0949d52206afe96dc"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "testing-bugs",
+  "duration_s": 0.065,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T11:36:46.565988+00:00",
+    "request_id": "sim-docker-manifest-3631981-113509",
+    "runner": "GitHub Actions 1000005533",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45166516652"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "36319814f022e622029447f0d4a57ffcd7e4d1bc",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
