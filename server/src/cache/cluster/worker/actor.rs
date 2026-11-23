@@ -639,6 +639,15 @@ impl State {
                     self.config,
                 );
                 if retain {
+                    #[cfg(feature = "sim")]
+                    if role == Role::Primary && hooks::watched(slot_number) {
+                        hooks::observe(Observed::Promoted {
+                            slot: slot_number,
+                            epoch: placement.epoch,
+                            prefix_epoch: state.epoch,
+                            prefix_sequence: state.sequence,
+                        });
+                    }
                     std::mem::swap(&mut replacement.store, &mut state.store);
                     replacement.baseline = true;
                 }
@@ -724,6 +733,7 @@ impl State {
                             worker: self.config.id,
                             slot,
                             epoch: state.epoch,
+                            sequence: state.sequence,
                         });
                     }
                     state.operations = state.operations.saturating_add(1);

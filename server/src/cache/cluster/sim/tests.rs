@@ -27,10 +27,12 @@ const HEAL_MS: u64 = 15_000;
 const REGRESSION_SEEDS: &[u64] = &[
     7, 12, 14, 16, 20, 21, 37, 38, 46, 55, 65, 115, 198, 211, 219,
 ];
-const NIGHTLY_RECOVERY_SEEDS: &[u64] = &[
+const NIGHTLY_REGRESSION_SEEDS: &[u64] = &[
+    4_524_674_007_700_389,
     4_524_674_007_700_564,
     4_524_674_007_700_871,
     4_524_674_007_700_908,
+    4_524_674_007_700_909,
 ];
 const FIRST_WORKER: u64 = 11;
 const MIB: usize = 1 << 20;
@@ -589,9 +591,9 @@ fn seed_sweep() {
 }
 
 #[test]
-fn nightly_recovery_regressions() {
+fn nightly_regressions() {
     let config = SweepConfig::from_env("cache", REPLAY);
-    let reports = sweep::parallel_map(NIGHTLY_RECOVERY_SEEDS, config.jobs, |&seed| {
+    let reports = sweep::parallel_map(NIGHTLY_REGRESSION_SEEDS, config.jobs, |&seed| {
         let single = SweepConfig {
             first: seed,
             count: 1,

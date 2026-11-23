@@ -51,10 +51,17 @@ pub(in crate::cache::cluster) enum Observed {
         sequence: u64,
         digest: [u8; 20],
     },
+    Promoted {
+        slot: u16,
+        epoch: u64,
+        prefix_epoch: u64,
+        prefix_sequence: u64,
+    },
     Served {
         worker: WorkerId,
         slot: u16,
         epoch: u64,
+        sequence: u64,
     },
     Charged {
         worker: WorkerId,

@@ -25,7 +25,8 @@ pub(super) struct Observations {
     commits: BTreeMap<u64, (u64, u64, u64)>,
     pub revisions: BTreeSet<(u64, u64)>,
     applied: BTreeMap<u64, u64>,
-    served: BTreeMap<u16, (u64, WorkerId)>,
+    served: BTreeMap<u16, (u64, WorkerId, u64)>,
+    failover_markers: BTreeMap<(u16, u64), Vec<usize>>,
     primary: BTreeMap<(Version, WorkerId), Digest>,
     replicas: BTreeMap<(Version, WorkerId), (WorkerId, Digest)>,
     pub check_replica_prefix: bool,
@@ -47,6 +48,11 @@ impl Observations {
     pub fn crash(&mut self, node: u64) {
         self.leases.retain(|(_, worker), _| worker.node != node);
         self.applied.remove(&node);
+    }
+
+    pub fn served_sequence(&self, slot: u16, worker: WorkerId, epoch: u64) -> Option<u64> {
+        let &(served_epoch, owner, sequence) = self.served.get(&slot)?;
+        (served_epoch == epoch && owner == worker).then_some(sequence)
     }
 
     pub fn committed(
@@ -136,6 +142,12 @@ impl Observations {
                 } else {
                     continue;
                 };
+                if marker == "failover" {
+                    self.failover_markers
+                        .entry((slot, new.epoch))
+                        .or_default()
+                        .push(self.history.len());
+                }
                 self.history.push(event(
                     EventType::Info,
                     NEMESIS,
@@ -199,12 +211,29 @@ impl Observations {
                 }
                 self.trace.record(now, format_args!("replica node={node} source={} slot={slot} epoch={epoch} seq={sequence} digest={digest:x?}", source.node));
             }
+            Observed::Promoted {
+                slot,
+                epoch,
+                prefix_epoch,
+                prefix_sequence,
+            } => {
+                // Use the copy actually retained at install. Replication can
+                // keep advancing after the controller commits the promotion.
+                if let Some(markers) = self.failover_markers.remove(&(slot, epoch)) {
+                    for index in markers {
+                        let value = &mut self.history[index].value;
+                        value["prefix_epoch"] = prefix_epoch.into();
+                        value["prefix_sequence"] = prefix_sequence.into();
+                    }
+                }
+            }
             Observed::Served {
                 worker,
                 slot,
                 epoch,
+                sequence,
             } => {
-                if let Some((last, owner)) = self.served.get(&slot).copied()
+                if let Some((last, owner, _)) = self.served.get(&slot).copied()
                     && (epoch < last || (epoch == last && worker != owner))
                 {
                     self.violate(
@@ -215,7 +244,7 @@ impl Observations {
                         ),
                     );
                 }
-                self.served.insert(slot, (epoch, worker));
+                self.served.insert(slot, (epoch, worker, sequence));
             }
             Observed::Charged {
                 worker,

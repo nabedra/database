@@ -14,12 +14,16 @@
 //! `epoch` is the primary epoch that served the op. Nemesis markers named in
 //! `Options::failover_markers` (default `failover`, `promote`) mark failovers. A marker
 //! can carry a top-level key to scope it to that key. A `cold-reset` marker records explicit
-//! data loss and starts an empty store.
+//! data loss and starts an empty store. Simulated mutations can carry a `sequence` in the
+//! completion. A failover marker can carry the retained `prefix_epoch` and `prefix_sequence`
+//! of the promoted copy. In that case only the unreplicated suffix may be lost.
 //!
 //! Register keys (no `incr`):
 //! - `invented-value`: a value read that no op wrote, or read before its write was invoked;
-//! - `resurrection`: a value read after an acknowledged delete, or after an expiry deadline
-//!   (plus `expiry_tolerance_ns`). An expired overwrite also removes the versions it replaced;
+//! - `resurrection`: a value read after an acknowledged delete that survived failover, or
+//!   after an expiry deadline (plus `expiry_tolerance_ns`). A delete can be lost under the
+//!   same rule as a write, unless a later primary has already shown the key absent.
+//!   An expired overwrite also removes the versions it replaced;
 //! - `stale-read`: within one epoch (both epochs known and the read's not newer), a read that
 //!   returns a value older than a write acknowledged before the read began, or that goes back
 //!   in time after another read in the same epoch;
@@ -105,18 +109,33 @@ impl Ctx<'_> {
         self.loss_allowed_before(w, read, None)
     }
 
+    fn first_failover(&self, w: &Op, read: &Op) -> Option<&Marker> {
+        self.failovers.iter().copied().find(|m| {
+            self.between(m, w, read)
+                && m.value["epoch"].as_u64().is_none_or(|next| {
+                    epoch(w).is_none_or(|old| next > old)
+                        && epoch(read).is_none_or(|current| next <= current)
+                })
+        })
+    }
+
+    fn between(&self, marker: &Marker, w: &Op, read: &Op) -> bool {
+        marker.pos > w.ret_pos()
+            && marker.pos < read.call
+            && self.events[marker.pos]
+                .key
+                .as_deref()
+                .is_none_or(|key| Some(key) == read.key.as_deref())
+    }
+
     fn loss_allowed_before(&self, w: &Op, read: &Op, cutoff_ns: Option<u64>) -> bool {
-        let applies = |m: &Marker| {
-            m.pos > w.ret_pos()
-                && m.pos < read.call
-                && self.events[m.pos]
-                    .key
-                    .as_deref()
-                    .is_none_or(|key| Some(key) == read.key.as_deref())
-        };
         let before_cutoff =
             |m: &Marker| cutoff_ns.is_none_or(|cutoff| m.time_ns.is_none_or(|t| t < cutoff));
-        if self.resets.iter().any(|m| applies(m) && before_cutoff(m)) {
+        if self
+            .resets
+            .iter()
+            .any(|m| self.between(m, w, read) && before_cutoff(m))
+        {
             return true;
         }
         let epoch_advanced = match (epoch(w), epoch(read)) {
@@ -124,18 +143,27 @@ impl Ctx<'_> {
             (Some(_), Some(_)) => true,
             _ => false,
         };
-        let marker_dates_failover =
-            cutoff_ns.is_some() && self.failovers.iter().any(|m| applies(m));
-        (epoch_advanced && self.opts.lag_window_ns.is_none() && !marker_dates_failover)
-            || self.failovers.iter().any(|m| {
-                applies(m)
-                    && before_cutoff(m)
-                    && match (self.opts.lag_window_ns, w.ret_time, m.time_ns) {
-                        (Some(lag), Some(wt), Some(mt)) => wt <= mt && mt - wt <= lag,
-                        (Some(_), _, _) => false,
-                        (None, _, _) => true,
-                    }
-            })
+        let Some(marker) = self.first_failover(w, read) else {
+            return epoch_advanced && self.opts.lag_window_ns.is_none();
+        };
+        if !before_cutoff(marker) {
+            return false;
+        }
+        // Once included in the successor's prefix, a mutation cannot be lost
+        // by subsequent failovers. An explicit time bound still applies.
+        if let Some((mutation, retained)) = w.complete_value["sequence"]
+            .as_u64()
+            .zip(marker.value["prefix_sequence"].as_u64())
+            && epoch(w).is_some_and(|e| marker.value["prefix_epoch"].as_u64() == Some(e))
+            && mutation <= retained
+        {
+            return false;
+        }
+        match (self.opts.lag_window_ns, w.ret_time, marker.time_ns) {
+            (Some(lag), Some(wt), Some(mt)) => wt <= mt && mt - wt <= lag,
+            (Some(_), _, _) => false,
+            (None, _, _) => true,
+        }
     }
 
     fn loss_kind(&self, w: &Op, read: &Op) -> &'static str {
@@ -354,7 +382,21 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                     && d.precedes(r)
                     && version_was_visible(d)
                     && !version_can_be_rewritten(d.call)
-                    && (kind(&d.f) == Some("delete") || expired(d).is_some())
+                    && match kind(&d.f) {
+                        Some("delete") => {
+                            !ctx.loss_allowed(d, r)
+                                || reads.iter().any(|absent| {
+                                    d.precedes(absent)
+                                        && absent.precedes(r)
+                                        && payload(&absent.complete_value).is_null()
+                                        && match (epoch(d), epoch(absent)) {
+                                            (Some(old), Some(current)) => current > old,
+                                            _ => ctx.first_failover(d, absent).is_some(),
+                                        }
+                                })
+                        }
+                        _ => expired(d).is_some(),
+                    }
             });
             let reset = ctx.resets.iter().find(|m| {
                 m.pos < r.call

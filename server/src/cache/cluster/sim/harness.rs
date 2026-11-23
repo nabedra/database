@@ -646,7 +646,7 @@ impl Cluster {
             .ok()
             .and_then(Result::ok);
         let now = self.now();
-        let completion = op.complete(CLIENT, worker.id(), key, now, reply.as_ref());
+        let mut completion = op.complete(CLIENT, worker.id(), key, now, reply.as_ref());
         self.trace(format_args!(
             "client {} {key} node={node} {:?} {:?}",
             op.name(),
@@ -663,6 +663,12 @@ impl Cluster {
                     .unwrap();
                 observed.history[invocation].value["at_ns"] =
                     (deadline + (now - start) * 1_000_000).into();
+            }
+            if matches!(op, Op::Set(..) | Op::Del | Op::Incr(_))
+                && let Some((_, Some(epoch))) = reply.as_ref()
+                && let Some(sequence) = observed.served_sequence(slot, worker.id(), *epoch)
+            {
+                completion.value["sequence"] = sequence.into();
             }
             observed.history.push(completion);
         }

@@ -17,7 +17,16 @@ fn preceding_sets<'a>(ops: &'a [Op], later: &'a Op) -> impl Iterator<Item = &'a 
 }
 
 fn assert_rejects(events: &[Event], completion: usize, expected: &str) {
-    let verdict = relaxed_kv::check(events);
+    assert_rejects_with(events, completion, expected, &Default::default());
+}
+
+fn assert_rejects_with(
+    events: &[Event],
+    completion: usize,
+    expected: &str,
+    options: &relaxed_kv::Options,
+) {
+    let verdict = relaxed_kv::check_with(events, options);
     assert!(!verdict.valid);
     assert!(
         verdict.anomalies.iter().any(|anomaly| {
@@ -60,6 +69,15 @@ fn cache_sim_rejects_resurrection_after_delete() {
         .expect("recorded acknowledged SET and DEL followed by an absent GET");
     let completion = read.ret_pos();
     events[completion].value["value"] = deleted_value;
+    // The promoted replica already covered the acknowledged delete.
+    let delete = ops.iter().find(|op| is_ok(op, "del")).unwrap();
+    events[delete.ret_pos()].value["sequence"] = 3.into();
+    let promotion = events
+        .iter_mut()
+        .find(|event| event.f == "failover")
+        .unwrap();
+    promotion.value["prefix_epoch"] = 1.into();
+    promotion.value["prefix_sequence"] = 3.into();
     assert_rejects(&events, completion, "resurrection");
 }
 
@@ -145,13 +163,45 @@ fn cache_sim_seed_46_expired_overwrite() {
     assert!(verdict.valid, "{:#?}", verdict.anomalies);
 }
 
-#[test]
-fn cache_sim_reports_lost_delete_after_promotion() {
-    for history in [
+fn lost_del_histories() -> [Vec<Event>; 2] {
+    [
         include_bytes!("fixtures/cache_sim_seed_4524674007700389_lost_delete.jsonl").as_slice(),
         include_bytes!("fixtures/cache_sim_seed_4524674007700909_lost_delete.jsonl").as_slice(),
-    ] {
-        let events = read_jsonl(history).unwrap();
+    ]
+    .map(|history| read_jsonl(history).unwrap())
+}
+
+#[test]
+fn cache_sim_allows_lost_delete_inside_lag_window() {
+    for events in lost_del_histories() {
+        let ops = pair(&events).unwrap().ops;
+        let delete = ops.iter().find(|op| is_ok(op, "del")).unwrap();
+        let promoted = events.iter().rfind(|event| event.f == "failover").unwrap();
+        let lag = promoted.time_ns.unwrap() - delete.ret_time.unwrap();
+        // Check on the inclusive boundary and just outside it.
+        let mut options = relaxed_kv::Options {
+            lag_window_ns: Some(lag),
+            ..Default::default()
+        };
+        let verdict = relaxed_kv::check_with(&events, &options);
+        assert!(verdict.valid, "{:#?}", verdict.anomalies);
+        options.lag_window_ns = Some(lag - 1);
+        assert_rejects_with(&events, events.len() - 1, "resurrection", &options);
+    }
+}
+
+#[test]
+fn cache_sim_rejects_resurrection_after_promoted_replica_showed_absence() {
+    for mut events in lost_del_histories() {
+        let mut absent = events[events.len() - 2..].to_vec();
+        absent[1].value["value"] = serde_json::Value::Null;
+        let promotion_time = events[events.len() - 3].time_ns;
+        for event in &mut absent {
+            event.time_ns = promotion_time;
+        }
+        let read = events.len() - 2;
+        events.splice(read..read, absent);
+        nabedra_check::history::reindex(&mut events);
         assert_rejects(&events, events.len() - 1, "resurrection");
     }
 }
