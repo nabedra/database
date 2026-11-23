@@ -774,7 +774,7 @@ impl DirectTransport for BlackholedLeader {
             let reply = match (voter.node_id, disconnected) {
                 (1, Some(_)) => std::future::pending().await,
                 (1, None) => DirectResponse::Done(DirectData::from_json("null").unwrap()),
-                (2, Some(since)) if since.elapsed() >= Duration::from_millis(1_800) => {
+                (2, Some(since)) if nabedra_rt::time::now().saturating_duration_since(since) >= Duration::from_millis(1_800) => {
                     assert_eq!(request.digest, digest(request.body.as_ref()));
                     DirectResponse::Done(DirectData::from_json("true").unwrap())
                 }
@@ -927,7 +927,7 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
         let id = nabedra_rt::ids::uuid_v4();
         let started = nabedra_rt::time::now_std();
         let got = answer(&gateway, &cluster.body(id, operation, payload.clone()), id).await;
-        latencies.push((*operation, started.elapsed()));
+        latencies.push((*operation, nabedra_rt::time::now_std().saturating_duration_since(started)));
         assert_eq!(got, Answer::Data(expected.clone()), "{operation} {payload}");
     }
     // Definite errors pass through with the leader's code and outcome.
@@ -1519,7 +1519,7 @@ async fn d04_d05_gateway_retries_on_the_new_leader_and_answers_at_the_deadline()
         | Answer::Error(ErrorCode::StorageUnavailable, Outcome::NotApplied) => {}
         other => panic!("two voters down must not succeed: {other:?}"),
     }
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(nabedra_rt::time::now_std().saturating_duration_since(started) < Duration::from_secs(5));
     let last = cluster.groups[group]
         .replicas
         .iter()

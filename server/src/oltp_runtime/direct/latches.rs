@@ -86,7 +86,7 @@ impl KeyLatches {
         }
         Ok(LatchGuard {
             _held: held,
-            waited: waited_since.map(|since| since.elapsed()),
+            waited: waited_since.map(|since| nabedra_rt::time::now().saturating_duration_since(since)),
         })
     }
 }

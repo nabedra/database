@@ -201,7 +201,7 @@ async fn o12_mounted_index_create_watchdog_covers_held_backfill() {
     })
     .await
     .expect("the command must be able to continue after the backfill release");
-    assert!(start.elapsed() > WATCHDOG);
+    assert!(nabedra_rt::time::now().saturating_duration_since(start) > WATCHDOG);
     assert_eq!(Command::Authority { data: Vec::new() }.watchdog(), WATCHDOG);
     assert!(
         nabedra_rt::time::timeout(watchdog, std::future::pending::<()>())

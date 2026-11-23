@@ -61,7 +61,7 @@ async fn execute(runtime: Arc<WorkerRuntime>, request: Arrival, due: Instant) ->
             );
             return json!({
                 "request_id": id, "state": "definitively_rejected", "error": error,
-                "completion_ms": due.elapsed().as_secs_f64() * 1000.0
+                "completion_ms": nabedra_rt::time::now().saturating_duration_since(due).as_secs_f64() * 1000.0
             });
         }
     };
@@ -160,7 +160,7 @@ fn o24_direct_production_rf1() {
             while let Some(result) = tasks.join_next().await {
                 samples.push(result.expect("join admitted direct operation"));
             }
-            let elapsed = origin.elapsed().as_secs_f64();
+            let elapsed = nabedra_rt::time::now().saturating_duration_since(origin).as_secs_f64();
             samples.sort_unstable_by_key(|(index, _)| *index);
             assert!(samples.iter().enumerate().all(|(i, (index, _))| *index == i));
             let after = observations(&runtime).await;

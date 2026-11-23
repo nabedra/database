@@ -261,7 +261,7 @@ async fn d11_o12_index_status_during_ready_publication_is_never_outcome_unknown(
             let started = nabedra_rt::time::now();
             let (code, reply) = admin(&app, nabedra_rt::ids::uuid_v4(), "storage.index.status", selector.clone()).await;
             let observed = format!("{:?} {:?}: {code} {reply}", held.stage, held.txn);
-            assert!(started.elapsed() < Duration::from_secs(5), "status waited for the held actor: {observed}");
+            assert!(nabedra_rt::time::now().saturating_duration_since(started) < Duration::from_secs(5), "status waited for the held actor: {observed}");
             assert_ne!(reply["error"]["code"], "outcome_unknown", "{observed}");
             assert_ne!(reply["error"]["outcome"], "unknown", "{observed}");
             match code {

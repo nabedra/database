@@ -233,7 +233,7 @@ impl WorkerRuntime {
         };
         tracing::debug!(worker=%target.worker_id, incarnation=%target.incarnation,
             owner_term=current.ready.view.owner_term, membership_revision=current.ready.view.membership_revision,
-            failures, elapsed_ms=started.elapsed().as_millis(), "worker reachability probe missed");
+            failures, elapsed_ms=nabedra_rt::time::now().saturating_duration_since(started).as_millis(), "worker reachability probe missed");
         if failures < 3 {
             return Ok(());
         }

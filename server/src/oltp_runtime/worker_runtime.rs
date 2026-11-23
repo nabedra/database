@@ -1565,10 +1565,10 @@ impl WorkerRuntime {
                 other => break Err(other),
             }
             if txn.attempt > 1
-                && blocked_since
-                    .get_or_insert_with(nabedra_rt::time::now)
-                    .elapsed()
-                    >= RETRY_PROGRESS_TIMEOUT
+                && {
+                    let since = *blocked_since.get_or_insert_with(nabedra_rt::time::now);
+                    nabedra_rt::time::now().saturating_duration_since(since) >= RETRY_PROGRESS_TIMEOUT
+                }
             {
                 return Err(unknown());
             }

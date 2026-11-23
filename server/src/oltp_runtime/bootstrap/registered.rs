@@ -1161,11 +1161,11 @@ impl ParticipantResolver for RegisteredParticipants {
                 self.data.host_all(spec.clone(), &self.control, &ready, &voters).await
             }
             .await;
-            tracing::debug!(group_id = %group.group_id, stage = "data_host", ms = started.elapsed().as_millis(), ok = hosted.is_ok(), "initial Data group");
+            tracing::debug!(group_id = %group.group_id, stage = "data_host", ms = nabedra_rt::time::now().saturating_duration_since(started).as_millis(), ok = hosted.is_ok(), "initial Data group");
             hosted?;
             let started = nabedra_rt::time::now();
             let activated = self.data.activate(spec, &voters).await;
-            tracing::debug!(group_id = %group.group_id, stage = "data_activate", ms = started.elapsed().as_millis(), ok = activated.is_ok(), "initial Data group");
+            tracing::debug!(group_id = %group.group_id, stage = "data_activate", ms = nabedra_rt::time::now().saturating_duration_since(started).as_millis(), ok = activated.is_ok(), "initial Data group");
             let observation = activated?;
             let generation = id(group.group_id, b"control-membership");
             let started = nabedra_rt::time::now();
@@ -1174,7 +1174,7 @@ impl ParticipantResolver for RegisteredParticipants {
                 .register_initial_data_local(&self.operator, generation, pin.authority, observation)
                 .await
                 .and_then(|applied| accepted(applied.reply));
-            tracing::debug!(group_id = %group.group_id, stage = "data_register", ms = started.elapsed().as_millis(), ok = registered.is_ok(), "initial Data group");
+            tracing::debug!(group_id = %group.group_id, stage = "data_register", ms = nabedra_rt::time::now().saturating_duration_since(started).as_millis(), ok = registered.is_ok(), "initial Data group");
             registered?;
             Ok(ShardRoute {
                 group,

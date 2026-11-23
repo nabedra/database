@@ -664,7 +664,7 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
     )
     .await
     .unwrap();
-    let restore_elapsed = restore_started.elapsed();
+    let restore_elapsed = nabedra_rt::time::now_std().saturating_duration_since(restore_started);
     println!(
         "{}",
         serde_json::json!({"scope":"local-native-O19-checkpoint","restore_seconds":restore_elapsed.as_secs_f64(),"target_cut":summary.target_cut,"segments":summary.segments,"images":summary.images,"identities":summary.identities})
@@ -1078,7 +1078,7 @@ async fn o12_o19_native_index_closure_pitr_and_repeat_restore() {
         )
         .await
         .unwrap();
-        let restore_seconds = started.elapsed().as_secs_f64();
+        let restore_seconds = nabedra_rt::time::now_std().saturating_duration_since(started).as_secs_f64();
         assert_eq!(
             restored.target_cut,
             cut.unwrap_or_else(|| {
