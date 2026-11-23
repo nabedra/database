@@ -1,0 +1,23 @@
+[package]
+name = "nabedra-resources"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+description = "Nabedra resource limits and admission scheduling"
+license = "MIT"
+repository = "https://github.com/zPy52/nabedra-database"
+publish = ["crates-io"]
+
+[features]
+# Enabled by the server's dev-dependency for T9. Product defaults ignore the
+# test override, including when the resource crate is shared with an engine.
+test-defaults = []
+
+[dependencies]
+nabedra-protocol = { path = "../protocol", version = "0.1.0" }
+serde = { version = "=1.0.229", features = ["derive"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+nabedra-check = { path = "../check" }
+tokio = { version = "=1.54.1", default-features = false, features = ["macros", "rt"] }

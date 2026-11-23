@@ -11,6 +11,8 @@
 !server/rt/src/
 !server/protocol/Cargo.toml
 !server/protocol/src/
+!server/resources/Cargo.toml
+!server/resources/src/
 !server/sim/Cargo.toml
 !server/src/
 !orm/python/pyproject.toml

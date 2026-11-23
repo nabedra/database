@@ -1490,6 +1490,7 @@ dependencies = [
  "libc",
  "mime",
  "nabedra-protocol",
+ "nabedra-resources",
  "nabedra-rt",
  "openraft 0.10.0",
  "parquet",
@@ -1572,6 +1573,15 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "uuid",
+]
+
+[[package]]
+name = "nabedra-resources"
+version = "0.1.0"
+dependencies = [
+ "nabedra-protocol",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

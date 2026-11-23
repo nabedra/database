@@ -1905,6 +1905,7 @@ dependencies = [
  "nabedra-check",
  "nabedra-kv",
  "nabedra-protocol",
+ "nabedra-resources",
  "nabedra-rt",
  "openraft",
  "parquet",
@@ -1943,6 +1944,16 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "uuid",
+]
+
+[[package]]
+name = "nabedra-resources"
+version = "0.1.0"
+dependencies = [
+ "nabedra-check",
+ "nabedra-protocol",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

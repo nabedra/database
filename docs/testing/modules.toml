@@ -145,7 +145,7 @@ paths = [
   "server/src/snapshot/**",
   "server/src/commit.rs",
   "server/src/olap_export.rs",
-  "server/src/partition_size.rs",
+  "server/resources/src/partition_size.rs",
   "server/src/node/**",
   "server/src/cluster/**",
   # Shared server entry points: both engines link them.
@@ -247,8 +247,11 @@ paths = [
   "server/src/request_queue.rs",
   "server/src/request_queue/**",
   "server/protocol/src/queue_error.rs",
-  "server/src/scheduling.rs",
-  "server/src/scheduling/**",
+  "server/resources/Cargo.toml",
+  "server/resources/src/config.rs",
+  "server/resources/src/lib.rs",
+  "server/resources/src/scheduling.rs",
+  "server/resources/src/scheduling/**",
   "server/src/worker_pool.rs",
   "server/src/node/admission.rs",
   "server/src/node/admission/**",
@@ -268,7 +271,7 @@ paths = [
   "scripts/ci_repeat_tests.py",
 ]
 hot_paths = [
-  "server/src/scheduling.rs",
+  "server/resources/src/scheduling.rs",
   "server/src/request_queue.rs",
   "server/src/worker_pool.rs",
 ]

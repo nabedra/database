@@ -56,11 +56,11 @@ pub mod oltp_replication;
 #[cfg(feature = "oltp")]
 pub mod oltp_runtime;
 #[cfg(any(feature = "olap", feature = "oltp"))]
-pub mod partition_size;
-#[cfg(any(feature = "olap", feature = "oltp"))]
 pub use nabedra_protocol::protocol;
 #[cfg(any(feature = "olap", feature = "oltp"))]
 pub(crate) use nabedra_protocol::query_semantics;
+#[cfg(any(feature = "olap", feature = "oltp"))]
+pub use nabedra_resources::partition_size;
 #[cfg(any(feature = "olap", feature = "oltp"))]
 pub mod request_queue;
 #[cfg(feature = "oltp")]
@@ -69,7 +69,7 @@ pub mod response;
 #[cfg(feature = "olap")]
 pub mod runtime;
 #[cfg(any(feature = "olap", feature = "oltp"))]
-pub mod scheduling;
+pub use nabedra_resources::scheduling;
 #[cfg(feature = "olap")]
 pub mod snapshot;
 #[cfg(feature = "olap")]

@@ -26,23 +26,25 @@ COPY server/kv/Cargo.toml ./kv/
 COPY server/check/Cargo.toml ./check/
 COPY server/rt/Cargo.toml ./rt/
 COPY server/protocol/Cargo.toml ./protocol/
+COPY server/resources/Cargo.toml ./resources/
 COPY server/sim/Cargo.toml ./sim/
-RUN mkdir -p src kv/src check/src rt/src protocol/src sim/src tests examples /out/timings && \
-    echo 'fn main() {}' > src/main.rs && : > src/lib.rs && : > kv/src/lib.rs && : > check/src/lib.rs && : > rt/src/lib.rs && : > protocol/src/lib.rs && : > sim/src/lib.rs && \
+RUN mkdir -p src kv/src check/src rt/src protocol/src resources/src sim/src tests examples /out/timings && \
+    echo 'fn main() {}' > src/main.rs && : > src/lib.rs && : > kv/src/lib.rs && : > check/src/lib.rs && : > rt/src/lib.rs && : > protocol/src/lib.rs && : > resources/src/lib.rs && : > sim/src/lib.rs && \
     awk -F'"' '/^\[\[(test|example)\]\]/ { dir = ($0 ~ /test/) ? "tests" : "examples"; next } \
                /^\[/ { dir = "" } \
                dir != "" && /^name *=/ { print dir "/" $2 ".rs" }' Cargo.toml | xargs -r touch && \
     cargo build --locked --release ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} --timings \
         --bin nabedra-db --no-default-features --features "$(cat /src/features)" && \
-    cargo clean --offline --locked --release -p nabedra-database -p nabedra-kv -p nabedra-rt -p nabedra-protocol && \
+    cargo clean --offline --locked --release -p nabedra-database -p nabedra-kv -p nabedra-rt -p nabedra-protocol -p nabedra-resources && \
     mv target/cargo-timings/cargo-timing.html /out/timings/dependencies.html && \
-    rm -rf target/cargo-timings src kv/src rt/src protocol/src
+    rm -rf target/cargo-timings src kv/src rt/src protocol/src resources/src
 
 # The real sources. The layer below keeps only the binary and the timing report, so a
 # `mode=max` cache export does not carry the server crate's build outputs.
 COPY server/kv/src ./kv/src
 COPY server/rt/src ./rt/src
 COPY server/protocol/src ./protocol/src
+COPY server/resources/src ./resources/src
 COPY server/src ./src
 RUN cargo build --locked --release ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} --timings \
         --bin nabedra-db --no-default-features --features "$(cat /src/features)" && \
