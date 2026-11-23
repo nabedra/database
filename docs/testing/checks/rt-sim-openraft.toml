@@ -1,0 +1,18 @@
+id = "rt-sim-openraft"
+# openraft 0.10's runtime on the simulated node context (server/rt/src/sim/openraft10.rs).
+module = "sim"
+kinds = ["U"]
+# OLTP-G02 and O09: openraft's C::now() and timers follow the node clock (offset, drift,
+# stalls) and do not move on a wall-clock jump. The same run checks that election timeouts
+# and a three-node election trace are reproducible per seed, and openraft's own runtime
+# conformance suite. The second command repeats the library tests with
+# `--cfg tokio_unstable` in a separate target directory, which seeds tokio's select! order
+# (sim::runtime_seeded) and adds the test for it.
+guarantees = ["OLTP-G02"]
+scenarios = ["O09"]
+tiers = ["T0", "T1"]
+command = ["sh", "-ec", "cargo test --locked -j 2 -p nabedra-rt --features sim,sim-openraft && RUSTFLAGS='--cfg tokio_unstable' CARGO_TARGET_DIR=target/sim cargo test --locked -j 2 -p nabedra-rt --features sim,sim-openraft --lib"]
+cwd = "server"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"
