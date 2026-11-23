@@ -1,0 +1,55 @@
+{
+  "artifacts": [
+    {
+      "name": "review-p9rtb-eb999eb-130418--lsm-campaign.log",
+      "sha256": "7692b69ca34782548887563bbcb780522b203fb099f8642e844030f8194ff3c2"
+    }
+  ],
+  "assertions": {
+    "executed": 6,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "ignored",
+        "reason": "3 tests marked #[ignore]"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "lsm-campaign",
+  "duration_s": 46.966,
+  "guarantees": [
+    "LSM-G01",
+    "LSM-G02",
+    "LSM-G03"
+  ],
+  "kind": "U D",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T13:04:44.067034+00:00",
+    "request_id": "review-p9rtb-eb999eb-130418",
+    "runner": "GitHub Actions 1000006109",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45180266933"
+  },
+  "scenarios": [
+    "LSM01",
+    "NS04",
+    "NS05",
+    "NS07",
+    "NS09",
+    "NS11",
+    "NS17"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "eb999eb8d3ea673bd661835ee105cfe8239e3a3d",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
