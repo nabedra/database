@@ -38,6 +38,7 @@ impl ClockBounds {
     }
 }
 
+#[cfg_attr(feature = "sim", derive(Clone))]
 pub(super) struct Clock {
     mode: ClockMode,
     last_lower_ns: u64,

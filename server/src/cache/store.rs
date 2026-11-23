@@ -1,9 +1,5 @@
 //! A single-owner cache slot. Preparation never publishes data or evicts a key.
-use std::{
-    collections::{HashSet, hash_map::RandomState},
-    mem::size_of,
-    time::Duration,
-};
+use std::{collections::HashSet, mem::size_of, time::Duration};
 
 use bytes::Bytes;
 use hashbrown::HashMap;
@@ -301,7 +297,7 @@ impl SlotStore {
     /// to 20 bytes. An empty keyspace digests to zero. Keys that are logically
     /// expired but not yet removed are left out, so two copies compare equal
     /// whatever their sweep progress.
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(any(test, feature = "test-hooks", feature = "sim"))]
     pub fn digest(&self, now_ms: u64) -> [u8; 20] {
         use sha2::{Digest as _, Sha256};
         let mut digest = [0u8; 20];
