@@ -1,7 +1,28 @@
 {
   "allow_unattested": false,
-  "head": "8498d0ee2c61a3df8557091412665b0e73f47bdc",
-  "ignored_records": [],
+  "head": "ed2b074504c8cc7318c638d15720895017fe92e5",
+  "ignored_records": [
+    {
+      "path": "review-p10-core-f3113c3-100918--licenses.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "review-p10-core-f3113c3-100918--rt-unit.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "review-p10-core-f3113c3-100918--sim-core-unit.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "review-p10-core-f3113c3-100918--testing-matrix.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "review-p10-core-f3113c3-100918--testing-tools.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -3992,5 +4013,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
