@@ -50,6 +50,7 @@ paths = [
   "server/oltp-types/**",
   "server/resources/src/stage_timing.rs",
   "server/resources/src/memory.rs",
+  "server/resources/src/memory/**",
   "server/src/oltp.rs",
   "server/src/oltp_*/**",
   "server/src/oltp_*.rs",
