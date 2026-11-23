@@ -203,4 +203,3 @@ async fn c07_q06_control_authorized_terminal_metadata_progresses_with_query_slot
     assert_eq!(*statement, expected);
     drop((reply, full_data, occupied_query, endpoint));
 }
-

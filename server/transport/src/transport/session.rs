@@ -1502,6 +1502,13 @@ pub(super) async fn serve(
     let started = nabedra_rt::time::now();
     let mut progress = Progress::new(state.received.clone());
     let mut changes = transport.common.directory.trust_changes();
+    #[cfg(test)]
+    let poll_directory = !transport
+        .common
+        .suspend_directory_poll_for_test
+        .load(Ordering::Relaxed);
+    #[cfg(not(test))]
+    let poll_directory = true;
     let read_finished = loop {
         tokio::select! {
             _ = &mut reader => break true,
@@ -1519,7 +1526,7 @@ pub(super) async fn serve(
                     break false;
                 }
             }
-            _ = check.tick() => {
+            _ = check.tick(), if poll_directory => {
                 let bound = *lock(&state.bound);
                 if bound.is_some_and(|peer| !enrolled(&*transport.common.directory, peer)) {
                     break false;
