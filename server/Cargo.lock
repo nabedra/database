@@ -1908,6 +1908,7 @@ dependencies = [
  "nabedra-protocol",
  "nabedra-resources",
  "nabedra-rt",
+ "nabedra-sim",
  "openraft",
  "parquet",
  "ring",
@@ -1938,12 +1939,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "nabedra-oltp-replication"
+version = "0.1.0"
+dependencies = [
+ "aws-config",
+ "aws-sdk-s3",
+ "aws-smithy-http-client",
+ "bytes",
+ "libc",
+ "nabedra-kv",
+ "nabedra-oltp-storage",
+ "nabedra-oltp-types",
+ "nabedra-protocol",
+ "nabedra-resources",
+ "nabedra-rt",
+ "nabedra-transport",
+ "openraft",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "nabedra-oltp-storage"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "libc",
+ "nabedra-kv",
+ "nabedra-oltp-types",
+ "nabedra-protocol",
+ "nabedra-resources",
+ "nabedra-rt",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "nabedra-oltp-types"
 version = "0.1.0"
 dependencies = [
  "nabedra-protocol",
+ "nabedra-resources",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "uuid",
 ]
 
@@ -1967,6 +2017,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1989,6 +2041,25 @@ dependencies = [
  "nabedra-rt",
  "serde_json",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "nabedra-transport"
+version = "0.1.0"
+dependencies = [
+ "nabedra-oltp-types",
+ "nabedra-protocol",
+ "nabedra-resources",
+ "nabedra-rt",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
  "uuid",
 ]
 

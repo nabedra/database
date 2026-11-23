@@ -13,6 +13,11 @@ use crate::{
     oltp_replication::types::{CommitTs, Text},
     protocol::{ErrorCode, Key, ProtocolError},
 };
+/// Fixed commands may duplicate bounded frontend keys/rows. This is an
+/// internal message ceiling, independent of the unchanged8MiB application body.
+pub use nabedra_resources::decode_budget::{
+    MAX_FIXED_COMMAND_BYTES, json_decode_budget, request_decode_budget,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 use std::{
@@ -20,9 +25,6 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use uuid::Uuid;
-/// Fixed commands may duplicate bounded frontend keys/rows. This is an
-/// internal message ceiling, independent of the unchanged8MiB application body.
-pub const MAX_FIXED_COMMAND_BYTES: usize = 4 * crate::protocol::MAX_BODY_BYTES;
 
 /// Compact JSON with sorted object keys. The number token spelling is retained,
 /// so int64 and float64 values keep their existing protocol distinction.
@@ -176,43 +178,6 @@ impl<'de> Deserialize<'de> for CanonicalJson {
     }
 }
 
-/// A conservative pre-decode upper bound for JSON values and container/Arc
-/// metadata. It scans without constructing strings, maps, arrays or numbers.
-/// Two raw-byte copies cover RawValue ownership plus temporary canonical checks.
-pub fn json_decode_budget(bytes: &[u8]) -> Result<usize, ProtocolError> {
-    crate::protocol::json_input(bytes, MAX_FIXED_COMMAND_BYTES).map_err(|_| invalid_json())?;
-    allocation_budget(bytes)
-}
-pub fn request_decode_budget(bytes: &[u8]) -> Result<usize, ProtocolError> {
-    crate::protocol::request_json_input(bytes).map_err(|_| invalid_json())?;
-    allocation_budget(bytes)
-}
-fn allocation_budget(bytes: &[u8]) -> Result<usize, ProtocolError> {
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut structural = 0usize;
-    for byte in bytes {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if *byte == b'\\' {
-                escaped = true;
-            } else if *byte == b'"' {
-                in_string = false;
-            }
-        } else if *byte == b'"' {
-            in_string = true;
-        } else if matches!(*byte, b'{' | b'}' | b'[' | b']' | b',' | b':') {
-            structural = structural.checked_add(1).ok_or_else(invalid_json)?;
-        }
-    }
-    bytes
-        .len()
-        .checked_mul(2)
-        .and_then(|n| n.checked_add(structural.checked_mul(256)?))
-        .and_then(|n| n.checked_add(4096))
-        .ok_or_else(invalid_json)
-}
 fn validate_canonical(bytes: &[u8]) -> Result<(), ProtocolError> {
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| invalid_json())?;
     let mut comparison = ComparisonWriter {

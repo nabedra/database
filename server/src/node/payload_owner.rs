@@ -9,7 +9,10 @@ use super::{
     payload::{PreparedReceiver, PreparedResult, ValidatedPart, decode_rows, encode_rows},
     spool::{Spool, SpoolLimits, SpoolOperation, SpoolReader, SpoolWriter},
 };
-use crate::{protocol::Row, worker_pool::WorkerPool};
+use crate::{
+    protocol::Row,
+    worker_pool::{WorkerPool, WorkerRuntime},
+};
 use std::{
     fmt,
     future::{Future, poll_fn},
@@ -1664,7 +1667,7 @@ enum Work {
     Command(Command),
     Discard,
 }
-fn execute(slot: &Slot, work: Work, runtime: &tokio::runtime::Runtime) -> Result<Reply> {
+fn execute(slot: &Slot, work: Work, runtime: &WorkerRuntime) -> Result<Reply> {
     let _change = slot
         .evidence
         .begin(false)

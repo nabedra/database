@@ -4,25 +4,6 @@ use nabedra_rt::sim::{self, NodeClock};
 
 use super::*;
 
-fn test_tls() -> PeerTls {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
-    let client = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(rustls::RootCertStore::empty())
-        .with_no_client_auth();
-    PeerTls {
-        server: TlsAcceptor::from(Arc::new(server)),
-        client: TlsConnector::from(Arc::new(client)),
-        fingerprint: [0; 32],
-    }
-}
-
 #[test]
 fn k03_peer_session_checks_fingerprints_and_crash_cuts_connection() {
     sim::run(7, |world| async move {
@@ -39,7 +20,7 @@ fn k03_peer_session_checks_fingerprints_and_crash_cuts_connection() {
             2,
             serve(
                 listener,
-                test_tls(),
+                PeerTls::sim([2; 32]),
                 4,
                 128,
                 |peer, payload| async move {
@@ -56,7 +37,7 @@ fn k03_peer_session_checks_fingerprints_and_crash_cuts_connection() {
                 port,
                 fingerprints: vec![[3; 32]],
             };
-            let tls = test_tls();
+            let tls = PeerTls::sim([1; 32]);
             let error = tls.connect(&endpoint).await.err().unwrap();
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
 

@@ -1,0 +1,14 @@
+id = "lsm-stepped-regressions"
+module = "lsm"
+kinds = ["S"]
+guarantees = ["LSM-G01", "LSM-G02", "LSM-G03"]
+scenarios = ["LSM01", "NS03", "NS04", "NS05", "NS13"]
+tiers = ["T1"]
+# Fault model. Reuse focused disk, flush and relocation regressions with stepped
+# services. The 1000-seed replay check includes the refused relocation at seed 510.
+command = ["cargo", "test", "--locked", "-j", "2", "-p", "nabedra-kv", "--features", "sim", "--lib", "--test", "store_gc", "--test", "store_crash", "phase9_sim_", "--", "--test-threads=1"]
+cwd = "server"
+timeout_s = 300
+needs = []
+result_parser = "cargo-test"
+env = { CARGO_TARGET_DIR = "target/sim", RUSTFLAGS = "--cfg tokio_unstable" }

@@ -1,0 +1,14 @@
+id = "OLTP-MOUNTED-POOL-PARENT-SYNC"
+title = "A freshly created registered pool could disappear after a crash"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G01", "OLTP-G08"]
+scenarios = ["NS04", "O11", "O17"]
+found_by = "campaign"
+found_date = "2026-11-23"
+lowest_regression = "oltp::pool::sim_tests::o17_mount_identity_and_disk_budget_follow_volume"
+seed = 41
+why_not_caught = "The simulated mount test synced the mount root in its fixture after a write."
+invariant_added = "A registered pool's first acknowledged write survives a crash without a fixture sync."
+fix_commits = ["00f8f2a5f4c3c02ded5260c8f5ae11a7f117accd"]
+revert_patch_ok = true

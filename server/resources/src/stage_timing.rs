@@ -62,6 +62,7 @@ macro_rules! perf_stage {
 }
 
 impl Stage {
+    #[inline]
     pub fn record(&self, elapsed: Duration) {
         let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         self.count.fetch_add(1, Ordering::Relaxed);
@@ -70,6 +71,7 @@ impl Stage {
         let bucket = (u64::BITS - us.leading_zeros()) as usize;
         self.buckets[bucket.min(BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
     }
+    #[inline]
     pub fn since(&self, started: Instant) {
         self.record(nabedra_rt::time::elapsed(started));
     }

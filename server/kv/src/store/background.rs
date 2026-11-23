@@ -2,26 +2,49 @@
 //! previous engine's background thread pools). One `kv-flush` thread and `threads - 1` `kv-compact` threads
 //! serve every store opened with the same `Background`. With one thread, the flush
 //! thread also compacts.
+//!
+//! The threaded mode runs [`run`] on each named thread. With KV's `sim` feature,
+//! the runtime drives each [`nabedra_rt::task::Stepped`] service one job per step
+//! inside a simulated world, with timed idles in virtual time for retry delays.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use nabedra_rt::{task, time};
+#[cfg(feature = "sim")]
+use nabedra_rt::task::{self, Step, Stepped};
+use nabedra_rt::time;
 
 use crate::error::Result;
+use crate::journal::service::{Condvar, ServiceHandle};
 
 /// Stack size of every thread `nabedra-kv` starts (`kv-flush`, `kv-compact`,
 /// `kv-journal`, `kv-journal-prep`). Set explicitly so `RUST_MIN_STACK` cannot change
 /// it: the server's native thread budget reserves this much per thread (O05).
 pub const THREAD_STACK_BYTES: usize = 2 << 20;
 
+/// Under `sim`: how soon a service whose next job waits for a lock held further down
+/// the simulation's stack looks again (see [`Job::would_block`]).
+#[cfg(feature = "sim")]
+const BLOCKED_POLL: Duration = Duration::from_millis(1);
+
 /// Work a store hands to the pool. Each call returns a delay after which to run it again
 /// (for example after `NoSpace`), or `None` when there is nothing left to do.
 pub(crate) trait Job: Send + Sync {
     fn run_flush(&self) -> Option<Duration>;
     fn run_compaction(&self) -> Option<Duration>;
+
+    /// Simulation only: whether the flush (or compaction) job would now wait for a lock
+    /// that code further down the simulation's single stack holds, for example a caller's
+    /// `Store::flush` that drives this service from `Commit::wait` while it holds the
+    /// store's flush lock. A product thread would block on that lock until the caller
+    /// releases it; a step must never wait, so the service idles briefly instead and the
+    /// job stays queued where it was.
+    #[cfg(feature = "sim")]
+    fn would_block(&self, compaction: bool) -> bool {
+        let _ = compaction;
+        false
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -55,7 +78,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 pub struct Background {
     shared: Arc<Shared>,
-    threads: Mutex<Vec<JoinHandle<()>>>,
+    threads: Mutex<Vec<ServiceHandle>>,
 }
 
 impl std::fmt::Debug for Background {
@@ -98,7 +121,17 @@ impl Background {
             };
             // On failure `background` drops here, which stops and joins the threads
             // started so far.
-            let handle = task::spawn_service_with_stack(name, stack_bytes, move || {
+            #[cfg(feature = "sim")]
+            let handle = task::spawn_stepped(
+                name,
+                stack_bytes,
+                Service {
+                    shared,
+                    flush_thread,
+                },
+            )?;
+            #[cfg(not(feature = "sim"))]
+            let handle = crate::journal::service::spawn_thread(name, stack_bytes, move || {
                 run(&shared, flush_thread)
             })?;
             lock(&background.threads).push(handle);
@@ -153,11 +186,11 @@ impl Drop for Background {
         lock(&self.shared.queues).shutdown = true;
         self.shared.flush_ready.notify_all();
         self.shared.compaction_ready.notify_all();
-        let me = std::thread::current().id();
         for handle in lock(&self.threads).drain(..) {
             // The last reference can drop on one of the pool's own threads (a store
             // closing there); that thread exits on its own once it sees `shutdown`.
-            if handle.thread().id() != me {
+            // Under `sim` a join drives the service until it exits.
+            if !handle.is_current() {
                 let _ = handle.join();
             }
         }
@@ -172,6 +205,7 @@ fn take_ready(queue: &mut VecDeque<Entry>, now: Instant) -> Result<Entry, Option
     }
 }
 
+/// The thread body of one `kv-flush` or `kv-compact` thread.
 fn run(shared: &Shared, flush_thread: bool) {
     let also_compact = flush_thread && shared.compaction_threads == 0;
     let cv = if flush_thread {
@@ -185,53 +219,142 @@ fn run(shared: &Shared, flush_thread: bool) {
             return;
         }
         let now = time::now_std();
-        let mut next_wake: Option<Instant> = None;
-        let mut picked = None;
-        if flush_thread {
-            match take_ready(&mut queues.flush, now) {
-                Ok(e) => picked = Some((Kind::Flush, e)),
-                Err(at) => next_wake = at,
-            }
-        }
-        if picked.is_none() && (!flush_thread || also_compact) {
-            match take_ready(&mut queues.compaction, now) {
-                Ok(e) => picked = Some((Kind::Compaction, e)),
-                Err(at) => {
-                    next_wake = match (next_wake, at) {
-                        (Some(a), Some(b)) => Some(a.min(b)),
-                        (a, b) => a.or(b),
+        let (kind, entry) = match pick(&mut queues, now, flush_thread, also_compact) {
+            Ok(picked) => picked,
+            Err(next_wake) => {
+                queues = match next_wake {
+                    None => cv.wait(queues).unwrap_or_else(PoisonError::into_inner),
+                    Some(at) => {
+                        cv.wait_timeout(queues, at.saturating_duration_since(now))
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0
                     }
-                }
+                };
+                continue;
             }
-        }
-        let Some((kind, entry)) = picked else {
-            queues = match next_wake {
-                None => cv.wait(queues).unwrap_or_else(PoisonError::into_inner),
-                Some(at) => {
-                    cv.wait_timeout(queues, at.saturating_duration_since(now))
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0
-                }
-            };
-            continue;
         };
         drop(queues);
-        let retry = entry.job.upgrade().and_then(|job| match kind {
-            Kind::Flush => job.run_flush(),
-            Kind::Compaction => job.run_compaction(),
-        });
-        queues = lock(&shared.queues);
-        if let Some(delay) = retry
-            && !queues.shutdown
-        {
-            let entry = Entry {
-                ready_at: time::now_std() + delay,
-                job: entry.job,
-            };
-            match kind {
-                Kind::Flush => queues.flush.push_back(entry),
-                Kind::Compaction => queues.compaction.push_back(entry),
+        queues = run_job(shared, kind, entry);
+    }
+}
+
+/// Takes the job this thread runs next: a ready flush (on the flush thread), else a
+/// ready compaction (on the compaction threads, or on the flush thread when it is the
+/// only one). Otherwise returns when the next queued job becomes ready, if any is.
+#[inline]
+fn pick(
+    queues: &mut Queues,
+    now: Instant,
+    flush_thread: bool,
+    also_compact: bool,
+) -> Result<(Kind, Entry), Option<Instant>> {
+    let mut next_wake: Option<Instant> = None;
+    let mut picked = None;
+    if flush_thread {
+        match take_ready(&mut queues.flush, now) {
+            Ok(e) => picked = Some((Kind::Flush, e)),
+            Err(at) => next_wake = at,
+        }
+    }
+    if picked.is_none() && (!flush_thread || also_compact) {
+        match take_ready(&mut queues.compaction, now) {
+            Ok(e) => picked = Some((Kind::Compaction, e)),
+            Err(at) => {
+                next_wake = match (next_wake, at) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
             }
         }
+    }
+    picked.ok_or(next_wake)
+}
+
+/// Runs one job without the queue lock, then queues its retry, if it asked for one, and
+/// returns the queue lock.
+#[inline]
+fn run_job(shared: &Shared, kind: Kind, entry: Entry) -> MutexGuard<'_, Queues> {
+    let retry = entry.job.upgrade().and_then(|job| match kind {
+        Kind::Flush => job.run_flush(),
+        Kind::Compaction => job.run_compaction(),
+    });
+    let mut queues = lock(&shared.queues);
+    if let Some(delay) = retry
+        && !queues.shutdown
+    {
+        let entry = Entry {
+            ready_at: time::now_std() + delay,
+            job: entry.job,
+        };
+        match kind {
+            Kind::Flush => queues.flush.push_back(entry),
+            Kind::Compaction => queues.compaction.push_back(entry),
+        }
+    }
+    queues
+}
+
+/// Under `sim`: whether the job [`pick`] would take next waits for a lock held further
+/// down the stack ([`Job::would_block`]). It looks without taking the job.
+#[cfg(feature = "sim")]
+fn next_would_block(queues: &Queues, now: Instant, flush_thread: bool, also_compact: bool) -> bool {
+    fn first(queue: &VecDeque<Entry>, now: Instant) -> Option<&Entry> {
+        queue.iter().find(|e| e.ready_at <= now)
+    }
+    let mut next = None;
+    if flush_thread {
+        next = first(&queues.flush, now).map(|e| (false, e));
+    }
+    if next.is_none() && (!flush_thread || also_compact) {
+        next = first(&queues.compaction, now).map(|e| (true, e));
+    }
+    // The upgrade cannot drop the last reference to the store: the simulation runs one
+    // step at a time, so the reference it found stays alive meanwhile.
+    next.and_then(|(compaction, e)| e.job.upgrade().map(|job| (compaction, job)))
+        .is_some_and(|(compaction, job)| job.would_block(compaction))
+}
+
+/// One `kv-flush` or `kv-compact` service.
+#[cfg(feature = "sim")]
+struct Service {
+    shared: Arc<Shared>,
+    flush_thread: bool,
+}
+
+#[cfg(feature = "sim")]
+impl Stepped for Service {
+    /// One job of [`run`], or `Idle` until the next queued job is ready (a retry delay
+    /// becomes a timed idle in virtual time), or `Exit` at shutdown.
+    fn step(&mut self) -> Step {
+        let shared = &*self.shared;
+        let also_compact = self.flush_thread && shared.compaction_threads == 0;
+        let mut queues = lock(&shared.queues);
+        if queues.shutdown {
+            return Step::Exit;
+        }
+        let now = time::now_std();
+        if next_would_block(&queues, now, self.flush_thread, also_compact) {
+            return Step::Idle(Some(now + BLOCKED_POLL));
+        }
+        match pick(&mut queues, now, self.flush_thread, also_compact) {
+            Ok((kind, entry)) => {
+                drop(queues);
+                drop(run_job(shared, kind, entry));
+                Step::Worked
+            }
+            Err(next_wake) => Step::Idle(next_wake),
+        }
+    }
+
+    fn doorbell(&self) -> &Condvar {
+        if self.flush_thread {
+            &self.shared.flush_ready
+        } else {
+            &self.shared.compaction_ready
+        }
+    }
+
+    fn run(self) {
+        run(&self.shared, self.flush_thread)
     }
 }

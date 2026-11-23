@@ -1,0 +1,14 @@
+id = "SIM-POOL-LIFECYCLE"
+title = "Simulated worker cancellation could leave admission waiters and task cleanup active"
+class = "resource-release-order"
+module = "scheduler"
+guarantees = ["SCHED-G01", "OLAP-G07", "OLTP-G09"]
+scenarios = ["F03"]
+found_by = "review"
+found_date = "2026-11-23"
+lowest_regression = "worker_pool::sim_tests::f03_sim_crash_wakes_admission_waiters_even_before_workers_poll"
+seed = 14
+why_not_caught = "The crash fixture waited for a running job and then tried a new admission. It did not hold a memory charge across the crash or cancel workers before their first poll."
+invariant_added = "A simulated pool belongs to a live node, closes admission when its last worker exits, and waits for its owned tasks to drop during orderly shutdown."
+fix_commits = ["c107add3fd9a84f5aaa686e27760abe651433982"]
+revert_patch_ok = true

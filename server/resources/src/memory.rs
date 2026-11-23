@@ -604,6 +604,7 @@ struct ChargedData {
 #[derive(Clone)]
 pub struct ChargedBytes(Arc<ChargedData>);
 impl ChargedBytes {
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
         &self.0.data
     }

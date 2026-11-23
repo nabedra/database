@@ -4,10 +4,9 @@
 //! expiry. `LocalDocker` reads `nabedra_rt::time::wall_now()`, so a simulated
 //! node's wall offset and jumps (O09) reach it. `ClockBound` reads the
 //! clock-bound daemon's shared memory through `clock_bound_client`, which
-//! samples the kernel clock itself. That read stays in `clockbound_now`, the
-//! seam phase 12 replaces: under simulation `SimClockBound` returns an interval
-//! around `nabedra_rt::time::unix_nanos()` with the node's error bound and
-//! drift, and `validate` keeps applying the 10 ms and rollback checks.
+//! samples the kernel clock itself. An installed simulation clock model provides
+//! the same interval interface from virtual time. Both go through the same
+//! width, rollback and fencing checks.
 use std::io;
 
 use nabedra_rt::time::{self, UNIX_EPOCH};
@@ -39,6 +38,7 @@ impl ClockBounds {
     }
 }
 
+#[cfg_attr(feature = "sim", derive(Clone))]
 pub(super) struct Clock {
     mode: ClockMode,
     last_lower_ns: u64,
@@ -49,7 +49,13 @@ impl Clock {
     pub fn new(mode: ClockMode) -> io::Result<Self> {
         #[cfg(not(target_os = "linux"))]
         if matches!(mode, ClockMode::ClockBound) {
-            return Err(unavailable("ClockBound requires Linux"));
+            #[cfg(feature = "sim")]
+            let simulated = super::sim::hooks::has_clock_bound();
+            #[cfg(not(feature = "sim"))]
+            let simulated = false;
+            if !simulated {
+                return Err(unavailable("ClockBound requires Linux"));
+            }
         }
         Ok(Self {
             mode,
@@ -60,10 +66,7 @@ impl Clock {
 
     pub fn now(&mut self) -> io::Result<ClockBounds> {
         let (lower, upper) = match self.mode {
-            #[cfg(target_os = "linux")]
-            ClockMode::ClockBound => clockbound_now()?,
-            #[cfg(not(target_os = "linux"))]
-            ClockMode::ClockBound => return Err(unavailable("ClockBound requires Linux")),
+            ClockMode::ClockBound => bound_now()?,
             ClockMode::LocalDocker => {
                 // These fixtures share the Docker VM's clock. This mode does
                 // not establish a time bound between separate hosts.
@@ -98,6 +101,22 @@ impl Clock {
             lower_ms: self.last_lower_ns / NANOS_PER_MILLISECOND,
             upper_ms: self.last_upper_ns.div_ceil(NANOS_PER_MILLISECOND),
         })
+    }
+}
+
+#[inline]
+fn bound_now() -> io::Result<(u64, u64)> {
+    #[cfg(feature = "sim")]
+    if let Some(sample) = super::sim::hooks::clock_bound() {
+        return sample;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        clockbound_now()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(unavailable("ClockBound requires Linux"))
     }
 }
 

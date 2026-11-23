@@ -7,6 +7,20 @@
 //! shutting down the pool. Per-operation admission windows and joining through
 //! operation errors are the caller's responsibility. Keep the coordinator runtime
 //! alive through teardown; explicit shutdown is the normal lifecycle path.
+//!
+//! # Simulation
+//!
+//! With the `sim` feature, a pool inside a `nabedra_rt::sim` world must start in a live
+//! node. It starts no thread and builds no runtime. It spawns one node task per worker, so the slot count is the
+//! task count and every job still sees its `WorkerId` in `0..count`. Each task runs the
+//! same receive loop (the biased stop `select!`), holds its slot for an optional
+//! virtual cost ([`sim::JobCost`], zero by default), then runs the job on the
+//! simulation's blocking helper as a one-shot named `nabedra-worker-{id}`, under the
+//! same `catch_unwind`. [`WorkerRuntime::block_on`] then polls the future inline: it
+//! must complete without virtual time or another task (until phase 13, OLAP job IO
+//! stays synchronous), or the job panics with the caller's location and the outer
+//! boundary contains it. Shutdown awaits the drained workers and their tasks in a
+//! coordinator task. Outside a world, a `sim` build behaves as a product build.
 
 use crate::protocol::{ErrorCode, Outcome, ProtocolError};
 use crate::{config::WorkerResources, scheduling::ResourceScheduler};
@@ -24,7 +38,94 @@ use tokio::{
 };
 
 pub type WorkerId = usize;
-type Work = Box<dyn FnOnce(WorkerId, &Runtime) + Send + 'static>;
+type Work = Box<dyn FnOnce(WorkerId, &WorkerRuntime) + Send + 'static>;
+
+/// The runtime a job uses for IO. Do synchronous data work outside `block_on`.
+///
+/// Product: the worker thread's own current-thread runtime, with inline forwarders.
+/// Under `sim`, inside a world, the world's runtime (see the module documentation).
+#[cfg_attr(not(feature = "sim"), repr(transparent))]
+pub struct WorkerRuntime {
+    #[cfg(not(feature = "sim"))]
+    runtime: Runtime,
+    #[cfg(feature = "sim")]
+    backend: sim::Backend,
+}
+
+impl WorkerRuntime {
+    #[inline]
+    fn thread(runtime: Runtime) -> Self {
+        #[cfg(not(feature = "sim"))]
+        {
+            Self { runtime }
+        }
+        #[cfg(feature = "sim")]
+        {
+            Self {
+                backend: sim::Backend::Thread(runtime),
+            }
+        }
+    }
+
+    /// [`Runtime::block_on`]. Under `sim`, inside a world, the future is polled inline
+    /// and must not need virtual time or another task to complete.
+    #[inline]
+    #[track_caller]
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        #[cfg(not(feature = "sim"))]
+        {
+            self.runtime.block_on(future)
+        }
+        #[cfg(feature = "sim")]
+        {
+            match &self.backend {
+                sim::Backend::Thread(runtime) => runtime.block_on(future),
+                sim::Backend::Sim(_) => nabedra_rt::task::block_on_inline(future),
+            }
+        }
+    }
+
+    /// The runtime's handle. Under `sim` it is the world runtime's handle, and tasks
+    /// spawned through it outlive the worker until their node crashes.
+    #[inline]
+    pub fn handle(&self) -> &Handle {
+        #[cfg(not(feature = "sim"))]
+        {
+            self.runtime.handle()
+        }
+        #[cfg(feature = "sim")]
+        {
+            match &self.backend {
+                sim::Backend::Thread(runtime) => runtime.handle(),
+                sim::Backend::Sim(worker) => &worker.handle,
+            }
+        }
+    }
+
+    /// Spawns `future` on this runtime. Like dropping the product worker's runtime,
+    /// a simulated worker aborts these tasks when it exits.
+    #[inline]
+    #[track_caller]
+    pub fn spawn<F>(&self, future: F) -> nabedra_rt::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        #[cfg(not(feature = "sim"))]
+        {
+            nabedra_rt::task::spawn_on(self.runtime.handle(), future)
+        }
+        #[cfg(feature = "sim")]
+        {
+            match &self.backend {
+                sim::Backend::Thread(runtime) => {
+                    nabedra_rt::task::spawn_on(runtime.handle(), future)
+                }
+                sim::Backend::Sim(worker) => worker.spawn(future),
+            }
+        }
+    }
+}
 
 struct Shared {
     // Taking this option is the stop boundary. Sending a reserved job uses the
@@ -78,10 +179,15 @@ impl fmt::Display for PoolStartError {
 impl std::error::Error for PoolStartError {}
 
 struct Worker {
-    thread: JoinHandle<()>,
+    thread: WorkerJoin,
     drained: oneshot::Receiver<()>,
     exit: oneshot::Sender<()>,
 }
+
+#[cfg(not(feature = "sim"))]
+type WorkerJoin = JoinHandle<()>;
+#[cfg(feature = "sim")]
+use sim::WorkerJoin;
 
 /// Noncloneable lifecycle owner. Never capture this owner in a worker job.
 /// Drop closes admission and schedules detached cleanup without blocking.
@@ -119,9 +225,30 @@ impl WorkerPool {
         let (stopped, _) = watch::channel(false);
         let (sender, receiver) = mpsc::channel::<Work>(count.get());
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+        let shared = Arc::new(Shared {
+            senders: Mutex::new(Some(sender)),
+            scheduler,
+            resources,
+            next_request: std::sync::atomic::AtomicU64::new(1),
+            stopped,
+            count: count.get(),
+        });
         let mut workers: Vec<Worker> = Vec::new();
-        for id in 0..count.get() {
-            let mut worker_stop = stopped.subscribe();
+        #[cfg(not(feature = "sim"))]
+        let threads = 0..count.get();
+        // Inside a simulated world every worker is a task and no thread starts.
+        #[cfg(feature = "sim")]
+        let threads = if let Some(world) = nabedra_rt::sim::world() {
+            if !nabedra_rt::sim::current_node().is_some_and(|node| world.is_up(node)) {
+                return Err(PoolStartError { worker_index: 0 });
+            }
+            workers = sim::start(count, &coordinator_runtime, &shared, &receiver);
+            count.get()..count.get()
+        } else {
+            0..count.get()
+        };
+        for id in threads {
+            let mut worker_stop = shared.stopped.subscribe();
             let receiver = receiver.clone();
             let (drained_tx, drained) = oneshot::channel();
             let (exit, exit_rx) = oneshot::channel();
@@ -132,7 +259,7 @@ impl WorkerPool {
                         .enable_all()
                         .build()
                     {
-                        Ok(runtime) => runtime,
+                        Ok(runtime) => WorkerRuntime::thread(runtime),
                         Err(_) => {
                             let _ = ready_tx.send(false);
                             return;
@@ -159,7 +286,7 @@ impl WorkerPool {
                 });
             if let Ok(thread) = spawned {
                 workers.push(Worker {
-                    thread,
+                    thread: thread.into(),
                     drained,
                     exit,
                 });
@@ -167,8 +294,7 @@ impl WorkerPool {
                     continue;
                 }
             }
-            stopped.send_replace(true);
-            drop(sender);
+            shared.stop();
             // Dropped exit gates allow partially started workers to leave after
             // draining. Join every thread even if one unexpectedly panicked.
             for worker in workers {
@@ -177,14 +303,6 @@ impl WorkerPool {
             }
             return Err(PoolStartError { worker_index: id });
         }
-        let shared = Arc::new(Shared {
-            senders: Mutex::new(Some(sender)),
-            scheduler,
-            resources,
-            next_request: std::sync::atomic::AtomicU64::new(1),
-            stopped,
-            count: count.get(),
-        });
         Ok((
             Self {
                 shared: shared.clone(),
@@ -221,7 +339,7 @@ impl WorkerPool {
     ) -> Result<Job<T>, ProtocolError>
     where
         T: Send + 'static,
-        F: FnOnce(WorkerId, &Runtime) -> Result<T, ProtocolError> + Send + 'static,
+        F: FnOnce(WorkerId, &WorkerRuntime) -> Result<T, ProtocolError> + Send + 'static,
     {
         self.submit_request(
             self.request_id(),
@@ -241,7 +359,7 @@ impl WorkerPool {
     ) -> Result<Job<T>, ProtocolError>
     where
         T: Send + 'static,
-        F: FnOnce(WorkerId, &Runtime) -> Result<T, ProtocolError> + Send + 'static,
+        F: FnOnce(WorkerId, &WorkerRuntime) -> Result<T, ProtocolError> + Send + 'static,
     {
         let (sender, mut stopped) = {
             let senders = self.shared.senders.lock().unwrap();
@@ -267,7 +385,7 @@ impl WorkerPool {
     ) -> Result<Job<T>, ProtocolError>
     where
         T: Send + 'static,
-        F: FnOnce(WorkerId, &Runtime) -> Result<T, ProtocolError> + Send + 'static,
+        F: FnOnce(WorkerId, &WorkerRuntime) -> Result<T, ProtocolError> + Send + 'static,
     {
         let (sender, mut stopped) = {
             let senders = self.shared.senders.lock().unwrap();
@@ -294,7 +412,7 @@ impl WorkerPool {
     ) -> Result<Job<(T, crate::scheduling::MemoryCharge)>, ProtocolError>
     where
         T: Send + 'static,
-        F: FnOnce(WorkerId, &Runtime) -> Result<T, ProtocolError> + Send + 'static,
+        F: FnOnce(WorkerId, &WorkerRuntime) -> Result<T, ProtocolError> + Send + 'static,
     {
         let (sender, mut stopped) = {
             let senders = self.shared.senders.lock().unwrap();
@@ -343,7 +461,7 @@ impl WorkerPool {
     ) -> Result<Job<T>, ProtocolError>
     where
         T: Send + 'static,
-        F: FnOnce(WorkerId, &Runtime) -> Result<T, ProtocolError> + Send + 'static,
+        F: FnOnce(WorkerId, &WorkerRuntime) -> Result<T, ProtocolError> + Send + 'static,
     {
         let bytes = reservation.bytes();
         let permit = tokio::select! {
@@ -383,6 +501,10 @@ impl WorkerThreads {
     fn begin_shutdown(&mut self) -> tokio::task::JoinHandle<Result<(), ProtocolError>> {
         self.shared.stop();
         let mut workers = self.workers.take().unwrap();
+        #[cfg(feature = "sim")]
+        if workers.iter().any(|worker| worker.thread.is_task()) {
+            return sim::shutdown(&self.coordinator, workers);
+        }
         let coordinator = self.coordinator.clone();
         #[cfg(feature = "sim")]
         if nabedra_rt::sim::world().is_some() {
@@ -442,6 +564,251 @@ fn internal(message: &'static str) -> ProtocolError {
 fn stopping() -> ProtocolError {
     internal("Worker pool is stopping")
 }
+
+/// The simulated pool (feature `sim`, inside a `nabedra_rt::sim` world). See the module
+/// documentation.
+#[cfg(feature = "sim")]
+pub mod sim {
+    use super::{
+        JoinHandle, Shared, Work, Worker, WorkerId, WorkerRuntime, internal, wait_for_drain,
+    };
+    use crate::protocol::ProtocolError;
+    use std::{
+        num::NonZeroUsize,
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{Arc, Mutex, PoisonError},
+        time::Duration,
+    };
+    use tokio::{
+        runtime::{Handle, Runtime},
+        sync::{mpsc, oneshot},
+        task::AbortHandle,
+    };
+
+    /// A product worker thread's default stack. A simulated job runs on the simulation's
+    /// blocking helper, which ignores it.
+    const WORKER_STACK_BYTES: usize = 2 << 20;
+
+    /// The virtual time a simulated worker holds its slot before it runs each job, so
+    /// overlap and refill are observable (C04, C06). Install one for a run with
+    /// `World::insert_ext`; without one, jobs cost no virtual time.
+    pub struct JobCost(Box<dyn FnMut(WorkerId) -> Duration + Send>);
+
+    impl JobCost {
+        /// Every job costs `cost`.
+        pub fn fixed(cost: Duration) -> Self {
+            Self(Box::new(move |_| cost))
+        }
+
+        /// Each job costs a time drawn uniformly from `[0, max]` by a SplitMix64 stream
+        /// seeded with `seed`, separate from the node's id stream.
+        pub fn seeded(seed: u64, max: Duration) -> Self {
+            let mut rng = nabedra_rt::sim::SplitMix64::new(seed);
+            let bound = u64::try_from(max.as_nanos())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            Self(Box::new(move |_| Duration::from_nanos(rng.below(bound))))
+        }
+
+        /// The cost of each job, in the order workers take them, from the taking worker.
+        pub fn from_fn(cost: impl FnMut(WorkerId) -> Duration + Send + 'static) -> Self {
+            Self(Box::new(cost))
+        }
+    }
+
+    fn job_cost(id: WorkerId) -> Duration {
+        nabedra_rt::sim::world()
+            .and_then(|world| world.with_ext::<JobCost, _>(|cost| (cost.0)(id)))
+            .unwrap_or_default()
+    }
+
+    fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(super) enum Backend {
+        Thread(Runtime),
+        Sim(SimWorker),
+    }
+
+    /// One simulated worker: the world runtime's handle and the tasks its jobs spawned.
+    #[derive(Clone)]
+    pub(super) struct SimWorker {
+        pub(super) handle: Handle,
+        spawned: Arc<Mutex<Vec<OwnedTask>>>,
+    }
+
+    struct OwnedTask {
+        abort: AbortHandle,
+        finished: oneshot::Receiver<()>,
+    }
+
+    impl SimWorker {
+        #[track_caller]
+        pub(super) fn spawn<F>(&self, future: F) -> nabedra_rt::task::JoinHandle<F::Output>
+        where
+            F: std::future::Future + Send + 'static,
+            F::Output: Send + 'static,
+        {
+            let (completion, finished) = oneshot::channel();
+            let task = nabedra_rt::task::spawn_on(&self.handle, async move {
+                let _completion = completion;
+                future.await
+            });
+            let mut spawned = lock(&self.spawned);
+            spawned.retain(|task| !task.abort.is_finished());
+            spawned.push(OwnedTask {
+                abort: task.abort_handle(),
+                finished,
+            });
+            task
+        }
+
+        async fn stop_tasks(&self) {
+            let spawned = std::mem::take(&mut *lock(&self.spawned));
+            for task in &spawned {
+                task.abort.abort();
+            }
+            for task in spawned {
+                // Dropping the future on either completion or cancellation releases
+                // its slot in this set before the owning worker is joined.
+                let _ = task.finished.await;
+            }
+        }
+    }
+
+    pub(super) enum WorkerJoin {
+        Thread(JoinHandle<()>),
+        Task(nabedra_rt::task::JoinHandle<()>),
+    }
+
+    impl From<JoinHandle<()>> for WorkerJoin {
+        fn from(thread: JoinHandle<()>) -> Self {
+            Self::Thread(thread)
+        }
+    }
+
+    impl WorkerJoin {
+        pub(super) fn is_task(&self) -> bool {
+            matches!(self, Self::Task(_))
+        }
+
+        pub(super) fn join(self) -> std::thread::Result<()> {
+            match self {
+                Self::Thread(thread) => thread.join(),
+                Self::Task(_) => unreachable!("a simulated worker joins in its async shutdown"),
+            }
+        }
+    }
+
+    /// When the last simulated worker is dropped, close admissions and wake every
+    /// waiter even if a node crash cancelled the tasks before their first poll.
+    struct StopOnWorkerExit(Arc<Shared>);
+
+    impl Drop for StopOnWorkerExit {
+        fn drop(&mut self) {
+            self.0.stop();
+        }
+    }
+
+    /// Spawns one node task per worker on the coordinator runtime, which must be the
+    /// world's runtime.
+    pub(super) fn start(
+        count: NonZeroUsize,
+        coordinator: &Handle,
+        shared: &Arc<Shared>,
+        receiver: &Arc<tokio::sync::Mutex<mpsc::Receiver<Work>>>,
+    ) -> Vec<Worker> {
+        let lifetime = Arc::new(StopOnWorkerExit(shared.clone()));
+        (0..count.get())
+            .map(|id| {
+                let lifetime = lifetime.clone();
+                let mut worker_stop = shared.stopped.subscribe();
+                let receiver = receiver.clone();
+                let (drained_tx, drained) = oneshot::channel();
+                let (exit, exit_rx) = oneshot::channel::<()>();
+                let worker = SimWorker {
+                    handle: coordinator.clone(),
+                    spawned: Arc::default(),
+                };
+                let task = nabedra_rt::task::spawn_on(coordinator, async move {
+                    let _lifetime = lifetime;
+                    loop {
+                        let work = {
+                            let mut receiver = receiver.lock().await;
+                            tokio::select! {
+                                biased;
+                                _ = worker_stop.changed() => {receiver.close(); receiver.recv().await}
+                                work = receiver.recv() => work,
+                            }
+                        };
+                        let Some(work) = work else { break };
+                        let cost = job_cost(id);
+                        if !cost.is_zero() {
+                            nabedra_rt::time::sleep(cost).await;
+                        }
+                        let runtime = WorkerRuntime {
+                            backend: Backend::Sim(worker.clone()),
+                        };
+                        let (done, ran) = oneshot::channel::<()>();
+                        // The job runs on the blocking helper after this task yields,
+                        // named as the product thread is, under the same outer guard.
+                        let started = nabedra_rt::task::spawn_oneshot(
+                            format!("nabedra-worker-{id}"),
+                            WORKER_STACK_BYTES,
+                            move || {
+                                let _ = catch_unwind(AssertUnwindSafe(|| work(id, &runtime)));
+                                let _ = done.send(());
+                            },
+                        );
+                        if started.is_ok() {
+                            let _ = ran.await;
+                        }
+                    }
+                    let _ = drained_tx.send(());
+                    let _ = exit_rx.await;
+                    // The product worker's runtime drops here, with its spawned tasks.
+                    worker.stop_tasks().await;
+                });
+                Worker {
+                    thread: WorkerJoin::Task(task),
+                    drained,
+                    exit,
+                }
+            })
+            .collect()
+    }
+
+    /// The product shutdown, as a coordinator task: await every drained worker, open
+    /// the exit gates, then await every worker task.
+    pub(super) fn shutdown(
+        coordinator: &Handle,
+        mut workers: Vec<Worker>,
+    ) -> tokio::task::JoinHandle<Result<(), ProtocolError>> {
+        nabedra_rt::task::spawn_on(coordinator, async move {
+            let mut failed = wait_for_drain(&mut workers).await;
+            let mut tasks = Vec::new();
+            for worker in workers {
+                let _ = worker.exit.send(());
+                tasks.push(worker.thread);
+            }
+            for task in tasks {
+                match task {
+                    WorkerJoin::Task(task) => failed |= task.await.is_err(),
+                    WorkerJoin::Thread(_) => unreachable!("a simulated pool starts no thread"),
+                }
+            }
+            if failed {
+                Err(internal("Worker teardown failed"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+#[cfg(all(test, feature = "sim"))]
+mod sim_tests;
 
 #[cfg(test)]
 mod scheduling_tests {
@@ -520,27 +887,32 @@ mod scheduling_tests {
     #[cfg(feature = "sim")]
     #[test]
     fn f03_shutdown_allows_the_coordinator_to_finish_accepted_work() {
-        nabedra_rt::sim::run(50, |_| async {
-            let (pool, threads) = WorkerPool::start(NonZeroUsize::MIN, Handle::current()).unwrap();
-            let (release, wait) = mpsc::channel();
-            let job = pool
-                .submit(0, move |_, _| {
-                    wait.recv_timeout(Duration::from_secs(2))
-                        .map_err(|_| internal("Shutdown stalled coordinator progress"))?;
-                    Ok(42)
-                })
-                .await
-                .unwrap();
+        nabedra_rt::sim::run(50, |world| async move {
+            world.add_node(1, nabedra_rt::sim::NodeClock::default());
+            nabedra_rt::sim::in_node(1, async {
+                let (pool, threads) =
+                    WorkerPool::start(NonZeroUsize::MIN, Handle::current()).unwrap();
+                let (release, wait) = mpsc::channel();
+                let job = pool
+                    .submit(0, move |_, _| {
+                        wait.recv_timeout(Duration::from_secs(2))
+                            .map_err(|_| internal("Shutdown stalled coordinator progress"))?;
+                        Ok(42)
+                    })
+                    .await
+                    .unwrap();
 
-            // Shutdown closes admission immediately. This coordinator must be able to
-            // release the admitted job before the returned future is polled.
-            let shutdown = threads.shutdown();
-            assert!(pool.submit(0, |_, _| Ok(())).await.is_err());
-            let _ = release.send(());
+                // Shutdown closes admission immediately. This coordinator must be able to
+                // release the admitted job before the returned future is polled.
+                let shutdown = threads.shutdown();
+                assert!(pool.submit(0, |_, _| Ok(())).await.is_err());
+                let _ = release.send(());
 
-            shutdown.await.unwrap();
-            assert_eq!(job.receive().await.unwrap(), 42);
-            assert_eq!(pool.scheduler().usage(), vec![(0, 0, 0)]);
+                shutdown.await.unwrap();
+                assert_eq!(job.receive().await.unwrap(), 42);
+                assert_eq!(pool.scheduler().usage(), vec![(0, 0, 0)]);
+            })
+            .await;
         });
     }
 

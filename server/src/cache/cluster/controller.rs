@@ -4,7 +4,12 @@ mod log;
 mod machine;
 mod network;
 mod placement;
+#[cfg(all(test, feature = "sim"))]
+mod simulation;
 mod state;
+
+#[cfg(all(test, feature = "sim"))]
+pub(super) use simulation::{SimConfig, SimRaftMetrics, sim_start};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -13,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nabedra_rt::net::AnyListener;
 use nabedra_rt::time::{MissedTickBehavior, interval, timeout};
 use openraft::{
     BasicNode, ReadPolicy, SnapshotPolicy, type_config::async_runtime::watch::WatchReceiver,
@@ -31,12 +37,22 @@ use network::Network;
 use placement::Observations;
 use state::Command;
 
+// This is the runtime openraft selects by default. Naming it keeps the
+// product build on the same type while sim scopes Raft tasks and timers to
+// the node and seeds elections.
+#[cfg(not(feature = "sim"))]
+#[allow(deprecated)]
+type Runtime = openraft::impls::TokioRuntime;
+#[cfg(feature = "sim")]
+type Runtime = nabedra_rt::sim::openraft10::SimRuntime;
+
 openraft::declare_raft_types!(
     RaftConfig:
         D = Command,
         R = Option<Reply>,
         NodeId = u64,
         Node = BasicNode,
+        AsyncRuntime = Runtime,
 );
 type Raft = openraft::Raft<RaftConfig, Machine>;
 const RAFT_SESSIONS: usize = 8;
@@ -77,119 +93,191 @@ pub fn run(path: &Path) -> io::Result<()> {
 async fn serve(config: Config, root: &Path) -> io::Result<()> {
     let tls = PeerTls::load(&config.tls, root)?;
     let voters = Arc::new(validate(&config, &tls)?);
-    let dir = root.join(&config.data_dir);
-    let log = log::Log::open(&dir)?;
-    bind_disk(
-        &dir,
-        DiskIdentity {
-            cluster: config.cluster_id,
-            node: config.node,
-            voters: voters.keys().copied().collect(),
-        },
-    )?;
-    let machine = Machine::open(&dir)?;
-    let clock = Clock::new(config.clock)?;
-    let stop = shutdown()?;
-    let app_listener = TcpListener::bind(config.listen).await?;
-    let raft_listener = TcpListener::bind(config.raft_listen).await?;
     let network = Network {
         cluster: config.cluster_id,
         node: config.node,
-        voters: Arc::clone(&voters),
-        tls: tls.clone(),
+        voters,
+        tls,
     };
-    let raft_config = openraft::Config {
-        cluster_name: format!("nabedra-cache-{}", config.cluster_id),
-        heartbeat_interval: 125,
-        election_timeout_min: 500,
-        election_timeout_max: 950,
-        max_payload_entries: 16,
-        snapshot_policy: SnapshotPolicy::LogsSinceLast(128),
-        max_in_snapshot_log_to_keep: 32,
-        purge_batch_size: 32,
-        ..openraft::Config::default()
-    }
-    .validate()
-    .map_err(io::Error::other)?;
-    let raft = Raft::new(
-        config.node,
-        Arc::new(raft_config),
-        network.clone(),
-        log,
-        machine.clone(),
-    )
-    .await
-    .map_err(io::Error::other)?;
-
-    // A single designated bootstrap voter proposes the initial three-voter
-    // configuration. It does not remove or reinitialize recovered members.
-    if voters.keys().next() == Some(&config.node)
-        && !raft.is_initialized().await.map_err(io::Error::other)?
-    {
-        let initial = voters
-            .iter()
-            .map(|(id, peer)| (*id, BasicNode::new(format!("{}:{}", peer.host, peer.port))))
-            .collect::<BTreeMap<_, _>>();
-        raft.initialize(initial).await.map_err(io::Error::other)?;
-    }
-
-    let privileged = voters
-        .values()
-        .flat_map(|voter| voter.fingerprints.iter())
-        .chain(config.operators.iter())
-        .copied()
-        .collect();
-    let controller = Arc::new(Controller {
-        raft: raft.clone(),
-        machine,
-        node: config.node,
-        clock: Mutex::new(clock),
-        observed: Mutex::new(Observations::default()),
-        operators: config.operators,
-        privileged,
-    });
-    let raft_rpc = {
-        let raft = raft.clone();
-        transport::serve(
-            raft_listener,
-            tls.clone(),
-            RAFT_SESSIONS,
-            CONTROL_FRAME,
-            move |fingerprint, bytes| {
-                let network = network.clone();
-                let raft = raft.clone();
-                async move { network.handle(raft, fingerprint, bytes).await }
-            },
-            std::future::pending(),
-        )
-    };
-    let api = {
-        let controller = Arc::clone(&controller);
-        transport::serve(
-            app_listener,
-            tls,
-            CONTROL_SESSIONS,
-            CONTROL_FRAME,
-            move |fingerprint, bytes| {
-                let controller = Arc::clone(&controller);
-                async move { controller.handle(fingerprint, &bytes).await }
-            },
-            std::future::pending(),
-        )
-    };
+    let loaded = Loaded::open(
+        &root.join(&config.data_dir),
+        network,
+        config.clock,
+        config.operators,
+    )?;
+    let stop = shutdown()?;
+    let app_listener = TcpListener::bind(config.listen).await?;
+    let raft_listener = TcpListener::bind(config.raft_listen).await?;
+    let started = loaded.start().await?;
 
     eprintln!(
         "nabedra-db: cache controller {} listening on {}",
         config.node, config.listen
     );
-    let result = tokio::select! {
-        _ = stop => Ok(()),
-        result = raft_rpc => result,
-        result = api => result,
-        () = controller.reconcile() => Err(invalid("cache placement loop stopped")),
-    };
-    raft.shutdown().await.map_err(io::Error::other)?;
-    result
+    started
+        .serve(app_listener.into(), raft_listener.into(), stop)
+        .await
+}
+
+struct Loaded {
+    network: Network,
+    log: log::Log,
+    machine: Machine,
+    clock: Clock,
+    operators: Vec<Fingerprint>,
+}
+
+impl Loaded {
+    fn open(
+        dir: &Path,
+        network: Network,
+        mode: ClockMode,
+        operators: Vec<Fingerprint>,
+    ) -> io::Result<Self> {
+        let log = log::Log::open(dir)?;
+        bind_disk(
+            dir,
+            DiskIdentity {
+                cluster: network.cluster,
+                node: network.node,
+                voters: network.voters.keys().copied().collect(),
+            },
+        )?;
+        let machine = Machine::open(dir)?;
+        let clock = Clock::new(mode)?;
+        Ok(Self {
+            network,
+            log,
+            machine,
+            clock,
+            operators,
+        })
+    }
+
+    async fn start(self) -> io::Result<Started> {
+        let Self {
+            network,
+            log,
+            machine,
+            clock,
+            operators,
+        } = self;
+        let raft_config = openraft::Config {
+            cluster_name: format!("nabedra-cache-{}", network.cluster),
+            heartbeat_interval: 125,
+            election_timeout_min: 500,
+            election_timeout_max: 950,
+            max_payload_entries: 16,
+            snapshot_policy: SnapshotPolicy::LogsSinceLast(128),
+            max_in_snapshot_log_to_keep: 32,
+            purge_batch_size: 32,
+            ..openraft::Config::default()
+        }
+        .validate()
+        .map_err(io::Error::other)?;
+        let raft = Raft::new(
+            network.node,
+            Arc::new(raft_config),
+            network.clone(),
+            log,
+            machine.clone(),
+        )
+        .await
+        .map_err(io::Error::other)?;
+
+        // A single designated bootstrap voter proposes the initial three-voter
+        // configuration. It does not remove or reinitialize recovered members.
+        if network.voters.keys().next() == Some(&network.node)
+            && !raft.is_initialized().await.map_err(io::Error::other)?
+        {
+            let initial = network
+                .voters
+                .iter()
+                .map(|(id, peer)| (*id, BasicNode::new(format!("{}:{}", peer.host, peer.port))))
+                .collect::<BTreeMap<_, _>>();
+            raft.initialize(initial).await.map_err(io::Error::other)?;
+        }
+
+        let privileged = network
+            .voters
+            .values()
+            .flat_map(|voter| voter.fingerprints.iter())
+            .chain(&operators)
+            .copied()
+            .collect();
+        let controller = Arc::new(Controller {
+            raft,
+            machine,
+            node: network.node,
+            clock: Mutex::new(clock),
+            observed: Mutex::new(Observations::default()),
+            operators,
+            privileged,
+        });
+        Ok(Started {
+            controller,
+            network,
+        })
+    }
+}
+
+struct Started {
+    controller: Arc<Controller>,
+    network: Network,
+}
+
+impl Started {
+    async fn serve(
+        self,
+        app_listener: AnyListener,
+        raft_listener: AnyListener,
+        stop: impl Future<Output = ()>,
+    ) -> io::Result<()> {
+        let Self {
+            controller,
+            network,
+        } = self;
+        let raft = controller.raft.clone();
+        let tls = network.tls.clone();
+        let raft_rpc = {
+            let raft = raft.clone();
+            transport::serve(
+                raft_listener,
+                network.tls.clone(),
+                RAFT_SESSIONS,
+                CONTROL_FRAME,
+                move |fingerprint, bytes| {
+                    let network = network.clone();
+                    let raft = raft.clone();
+                    async move { network.handle(raft, fingerprint, bytes).await }
+                },
+                std::future::pending(),
+            )
+        };
+        let api = {
+            let controller = Arc::clone(&controller);
+            transport::serve(
+                app_listener,
+                tls,
+                CONTROL_SESSIONS,
+                CONTROL_FRAME,
+                move |fingerprint, bytes| {
+                    let controller = Arc::clone(&controller);
+                    async move { controller.handle(fingerprint, &bytes).await }
+                },
+                std::future::pending(),
+            )
+        };
+
+        let result = tokio::select! {
+            _ = stop => Ok(()),
+            result = raft_rpc => result,
+            result = api => result,
+            () = controller.reconcile() => Err(invalid("cache placement loop stopped")),
+        };
+        raft.shutdown().await.map_err(io::Error::other)?;
+        result
+    }
 }
 
 fn validate(config: &Config, tls: &PeerTls) -> io::Result<BTreeMap<u64, Endpoint>> {
@@ -437,4 +525,4 @@ impl Controller {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

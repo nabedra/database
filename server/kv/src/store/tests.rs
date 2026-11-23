@@ -290,11 +290,29 @@ impl super::background::Job for Blocker {
 /// made `ns03_snapshot_survives_flush_and_compaction_and_pins_runs` flaky on CI.
 #[test]
 fn ns03_compaction_deletes_its_unpinned_inputs_before_it_returns() {
-    let fs = FaultFs::new();
-    fs.create_dir_all_durable(Path::new("/db"));
     let bg = Background::new(1).unwrap();
     let _release = Release(Blocker::occupy(&bg));
-    let store = Store::open(Path::new("/db/kv"), small(Arc::new(fs.clone()), &bg, 64))
+    check_compaction_deletes_unpinned_inputs(&bg);
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn phase9_sim_compaction_deletes_unpinned_inputs() {
+    use nabedra_rt::sim::{self, NodeClock};
+    sim::run(3, |world| async move {
+        world.add_node(1, NodeClock::default());
+        sim::in_node(1, async {
+            let bg = Background::new(1).unwrap();
+            check_compaction_deletes_unpinned_inputs(&bg);
+        })
+        .await;
+    });
+}
+
+fn check_compaction_deletes_unpinned_inputs(bg: &Arc<Background>) {
+    let fs = FaultFs::new();
+    fs.create_dir_all_durable(Path::new("/db"));
+    let store = Store::open(Path::new("/db/kv"), small(Arc::new(fs.clone()), bg, 64))
         .unwrap()
         .store;
     // Two L0 runs reach the L0 trigger (2).

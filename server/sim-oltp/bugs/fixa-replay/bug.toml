@@ -1,0 +1,38 @@
+# Reverted fix FIXA-replay (phase 10, design section 4.1).
+schema = "nabedra.sim-bug/1"
+id = "fixa-replay"
+bug = "FIXA-replay"
+set = "direct"
+phase = 10
+class = "uncertain-outcome"
+guarantees = ["OLTP-G03", "OLTP-G04"]
+scenarios = ["D02"]
+fix_commits = ["443322361d89d5f3de5dd06632f09e4a14dd8fec"]
+reverts = "443322361d89d5f3de5dd06632f09e4a14dd8fec"
+port = "clean"
+port_notes = """
+`git diff 44332236 44332236^` on server/src/oltp_runtime/direct/executor.rs: back to
+`Committed::Replayed(Some(result))` plus `Committed::Replayed(None) => Retry(Conflict)`, so a batch
+replay within one RETRY_PAUSE of the deadline answers unavailable_not_applied.
+"""
+workload = "direct"
+# data.direct.batch on, concurrent writers on one range, lost-reply plus deadline-edge.
+profile = ["batch", "same-range-writers", "lost-reply", "deadline-edge"]
+expect = ["NotAppliedNeverCommitted", "failed-write-observed"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_runtime::direct::tests::fixa::d02_fixa_batch_replay_near_deadline_preserves_the_committed_outcome"
+mode = "on"
+failure_contains = ["an applied batch replay must return its result or an unknown outcome"]
+
+[regression.evidence]
+digest = "8ce2dcc915f0141bf4efdd27cf8a769596641a0b3de5643ef557b801532c3960"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148935717", sha = "53a5716f844aa9690739daed32fd335c68bc0f8a", result = "passed", note = "request p10-bugs-clean-53a5716-103844, direct_oltp on" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148918852", sha = "a70f5c2265091e47f0c65db922939e20aab416b5", result = "failed", note = "scratch/sim-bug-fixa-replay, request p10-bugs-fixa-replay-a70f5c2-103844, direct_oltp on", output = """
+test oltp_runtime::direct::tests::fixa::d02_fixa_batch_replay_near_deadline_preserves_the_committed_outcome ... FAILED
+panicked at src/oltp_runtime/direct/tests/fixa.rs:217:5:
+an applied batch replay must return its result or an unknown outcome: Failed(ProtocolError { code: StorageUnavailable, message: "direct request deadline expired before it applied", outcome: NotApplied })
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 585 filtered out; finished in 1.91s
+""" }

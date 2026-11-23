@@ -1,13 +1,37 @@
 //! The journal thread: group commit, segment rolls, sync alignment and the open-time
 //! repair writes that recovery decided on.
+//!
+//! # Services and the journal park
+//!
+//! `kv-journal` ([`JournalService`]) and `kv-journal-prep` ([`PrepService`]) are stepped
+//! services. In a product build each runs its loop ([`Writer::run`], [`prepare_loop`])
+//! on its own thread, unchanged. Under `sim`, inside a simulated world, the runtime calls
+//! `step` instead: one group (or one spare) per step, and `Idle` where the loop would
+//! wait for work.
+//!
+//! The journal's sink may stall (the store's memtable budget or L0 stop trigger), and
+//! what ends the stall is a flush or compaction, which itself waits for a journal sync.
+//! Product breaks that cycle in the store: a stalled sink lets the journal through once
+//! a sync is waiting. A step must not wait at all, so under `sim` the journal asks the
+//! sink before each sink call whether that call would stall
+//! ([`JournalSink::stall_deadline`], the same predicate). If so, it saves where the group
+//! stands ([`Stage`]) and returns `Idle` until the poll deadline. The flush step that
+//! runs meanwhile registers its sync and drives the journal from `Commit::wait`; the
+//! journal resumes at the saved record and the predicate now lets it through. This is
+//! the one place where simulated control flow differs from product (risk R1 of the
+//! phase 9 design), and it is compiled only with `sim`.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::thread::JoinHandle;
+use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
 
-use nabedra_rt::{task, time};
+#[cfg(feature = "sim")]
+use nabedra_rt::task::{self, Step, Stepped};
+use nabedra_rt::time;
 
+#[cfg(feature = "sim")]
+use super::service::Condvar;
+use super::service::ServiceHandle;
 use crate::batch::WriteBatch;
 use crate::crc;
 use crate::error::{Error, Result};
@@ -20,7 +44,7 @@ use super::format::{
 };
 use super::recovery::{End, Recovered};
 use super::segment::{self, FreeSeg, LiveSeg};
-use super::{Item, JournalSink, RecordKind, Shared, Table, TableSeg, lock};
+use super::{Item, JournalSink, Queue, RecordKind, Shared, Table, TableSeg, lock};
 
 /// Free segments the preparer keeps ready for the next roll (bounded: it never creates a
 /// file while this many are free).
@@ -87,6 +111,62 @@ pub(super) struct Writer {
     placements: Vec<Placement>,
     status: Vec<Status>,
     locators: Vec<Locator>,
+    /// Under `sim`: set once the runtime steps this writer, so a group parks before a
+    /// sink call that would stall instead of waiting in it.
+    #[cfg(feature = "sim")]
+    parks: bool,
+}
+
+/// Where a written group stands. A product group runs through both stages in one call;
+/// under `sim` a group may stop before a sink call and resume here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    /// RD3: the group is written but not synced, and the first `applied` records of its
+    /// unsynced head are applied (`visible` is the last of them).
+    Head {
+        applied: usize,
+        visible: Option<Seq>,
+    },
+    /// The group is written (and synced when `synced`); placements before `next` are
+    /// applied.
+    Publish {
+        next: usize,
+        synced: bool,
+        counted: bool,
+    },
+}
+
+/// A group parked before a sink call that would stall: where it resumes and when to
+/// look again.
+#[cfg(feature = "sim")]
+#[derive(Debug)]
+struct Park {
+    stage: Stage,
+    until: Instant,
+}
+
+/// A product build never parks: the journal thread waits inside the sink.
+#[cfg(not(feature = "sim"))]
+#[derive(Debug)]
+enum Park {}
+
+/// What [`Writer::publish_unsynced_head`] reached.
+enum Head {
+    /// The head is published; whether the group was counted.
+    Done(bool),
+    /// A sink call failed; the journal is latched.
+    Failed,
+    #[cfg_attr(not(feature = "sim"), allow(dead_code))]
+    Parked(Park),
+}
+
+/// What [`take_group`] found.
+enum Take {
+    Group,
+    /// The journal stops without its close pad (test hook).
+    Crash,
+    /// The journal is closing and its queue is empty.
+    Close,
 }
 
 impl Writer {
@@ -238,6 +318,8 @@ impl Writer {
             placements: Vec::new(),
             status: Vec::new(),
             locators: Vec::new(),
+            #[cfg(feature = "sim")]
+            parks: false,
         };
         if open_pad {
             // Appending after a clean close: first a synced pad without FLAG_CLOSE, so a
@@ -261,13 +343,27 @@ impl Writer {
         self.next_write_seq
     }
 
-    pub(super) fn spawn(self, sink: Arc<dyn JournalSink>) -> Result<JoinHandle<()>> {
-        task::spawn_service_with_stack("kv-journal", crate::store::THREAD_STACK_BYTES, move || {
-            self.run(&*sink)
-        })
-        .map_err(segment::io)
+    /// Starts the `kv-journal` service (its thread, in a product build).
+    pub(super) fn spawn(self, sink: Arc<dyn JournalSink>) -> Result<ServiceHandle> {
+        let stack_bytes = crate::store::THREAD_STACK_BYTES;
+        #[cfg(feature = "sim")]
+        let handle = task::spawn_stepped(
+            "kv-journal",
+            stack_bytes,
+            JournalService {
+                writer: Some(self),
+                sink,
+                items: Vec::new(),
+                parked: None,
+            },
+        );
+        #[cfg(not(feature = "sim"))]
+        let handle =
+            super::service::spawn_thread("kv-journal", stack_bytes, move || self.run(&*sink));
+        handle.map_err(segment::io)
     }
 
+    /// The `kv-journal` thread body.
     fn run(mut self, sink: &dyn JournalSink) {
         let mut items: Vec<Item> = Vec::new();
         loop {
@@ -282,29 +378,17 @@ impl Writer {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     queue.writer_waiting = false;
                 }
-                if queue.crash {
-                    let dropped: Vec<Item> = queue.items.drain(..).collect();
-                    drop(queue);
-                    drop(dropped);
-                    return;
-                }
-                if queue.items.is_empty() {
-                    drop(queue);
-                    self.close_cleanly();
-                    return;
-                }
-                let mut bytes = 0;
-                while let Some(item) = queue.items.front() {
-                    let b = item_bytes(item);
-                    if !items.is_empty() && bytes + b > shared.options.max_group_bytes {
-                        break;
+                match take_group(queue, &mut items, shared.options.max_group_bytes) {
+                    Take::Group => {}
+                    Take::Crash => return,
+                    Take::Close => {
+                        self.close_cleanly();
+                        return;
                     }
-                    bytes += b;
-                    items.push(queue.items.pop_front().expect("front exists"));
                 }
-                queue.bytes -= bytes;
             }
-            self.process(&mut items, sink);
+            let processed = self.process(&mut items, sink);
+            debug_assert!(processed.is_ok(), "the journal thread never parks");
             self.maybe_prepare_spare();
         }
     }
@@ -326,12 +410,14 @@ impl Writer {
         self.pos + self.buf.len() as u64
     }
 
-    fn process(&mut self, items: &mut Vec<Item>, sink: &dyn JournalSink) {
+    /// Writes one group and publishes it. Under `sim` it may park before a sink call
+    /// that would stall; [`Writer::advance`] resumes the group from the returned stage.
+    fn process(&mut self, items: &mut Vec<Item>, sink: &dyn JournalSink) -> Result<(), Park> {
         if self.latched() {
             for item in items.drain(..) {
                 complete(item, Err(Error::RecoveryRequired));
             }
-            return;
+            return Ok(());
         }
         self.placements.clear();
         self.status.clear();
@@ -415,44 +501,87 @@ impl Writer {
             }
         }
         let mut ok = fail != Some(Status::Failed);
-        let mut synced = false;
-        // Whether the group's commit counters were already bumped (by the unsynced head).
-        let mut counted = false;
+        // RD3: when the group syncs, its bytes are written first, then the unsynced writes
+        // at its head become visible and complete before the sync (the `Head` stage).
+        // They never asked for one; alone they would have been a group of their own.
+        let mut head = false;
         if ok {
-            let written = (|| -> Result<bool, Fail> {
-                let dirty =
-                    self.active_dirty || !self.prev_unsynced.is_empty() || !self.buf.is_empty();
-                if wants_sync && dirty {
-                    // RD3: write first, then let the unsynced writes at the head of the
-                    // group become visible and complete before the sync. They never
-                    // asked for one; alone they would have been a group of their own.
-                    self.write_aligned(0)?;
-                    counted = self.publish_unsynced_head(items, sink)?;
-                    self.sync_written()?;
-                    Ok(true)
-                } else {
-                    self.flush_buf()?;
-                    Ok(false)
-                }
-            })();
-            match written {
-                Ok(s) => synced = s,
-                Err(_) => ok = false,
-            }
+            let dirty = self.active_dirty || !self.prev_unsynced.is_empty() || !self.buf.is_empty();
+            let written = if wants_sync && dirty {
+                head = true;
+                self.write_aligned(0)
+            } else {
+                self.flush_buf()
+            };
+            ok = written.is_ok();
         }
         if !ok {
-            self.latch();
-            for item in items.drain(..) {
-                complete(item, Err(Error::RecoveryRequired));
-            }
-            self.drain_queue_after_latch();
-            return;
+            self.fail_group(items);
+            return Ok(());
         }
+        let stage = if head {
+            Stage::Head {
+                applied: 0,
+                visible: None,
+            }
+        } else {
+            Stage::Publish {
+                next: 0,
+                synced: false,
+                // Whether the group's commit counters were already bumped (by the
+                // unsynced head).
+                counted: false,
+            }
+        };
+        self.advance(items, sink, stage)
+    }
+
+    /// Latches and fails the group and everything queued after it.
+    fn fail_group(&mut self, items: &mut Vec<Item>) {
+        self.latch();
+        for item in items.drain(..) {
+            complete(item, Err(Error::RecoveryRequired));
+        }
+        self.drain_queue_after_latch();
+    }
+
+    /// Runs a written group from `stage` to its end: the unsynced head and the sync (for
+    /// a `Head` stage), then visibility, counters and completions. Under `sim` it returns
+    /// `Err` with the stage to resume from when a sink call would stall.
+    fn advance(
+        &mut self,
+        items: &mut Vec<Item>,
+        sink: &dyn JournalSink,
+        stage: Stage,
+    ) -> Result<(), Park> {
+        let (next, synced, counted) = match stage {
+            Stage::Head { applied, visible } => {
+                match self.publish_unsynced_head(items, sink, applied, visible) {
+                    Head::Done(counted) => {
+                        if self.sync_written().is_err() {
+                            self.fail_group(items);
+                            return Ok(());
+                        }
+                        (0, true, counted)
+                    }
+                    Head::Failed => {
+                        self.fail_group(items);
+                        return Ok(());
+                    }
+                    Head::Parked(park) => return Err(park),
+                }
+            }
+            Stage::Publish {
+                next,
+                synced,
+                counted,
+            } => (next, synced, counted),
+        };
 
         // Visibility: the sink sees each record in sequence order.
         let stats = &self.shared.stats;
         let mut visible = self.next_write_seq - 1;
-        for p in &self.placements {
+        for (index, p) in self.placements.iter().enumerate().skip(next) {
             let Item::Write {
                 kind,
                 batch,
@@ -465,6 +594,17 @@ impl Writer {
             if self.latched() {
                 break;
             }
+            #[cfg(feature = "sim")]
+            if let Some(until) = self.park_deadline(sink, *kind, *first_seq, batch) {
+                let stage = Stage::Publish {
+                    next: index,
+                    synced,
+                    counted,
+                };
+                return Err(Park { stage, until });
+            }
+            #[cfg(not(feature = "sim"))]
+            let _ = index;
             fill_locators(&mut self.locators, batch, p);
             let started = time::now_std();
             let kind = if *kind == RecordType::Relocate {
@@ -534,6 +674,28 @@ impl Writer {
         if self.latched() {
             self.drain_queue_after_latch();
         }
+        Ok(())
+    }
+
+    /// Under `sim`, while the runtime steps this writer: when the sink call for this
+    /// record would stall, the time to look again (the journal park).
+    #[cfg(feature = "sim")]
+    fn park_deadline(
+        &self,
+        sink: &dyn JournalSink,
+        kind: RecordType,
+        first_seq: Seq,
+        batch: &WriteBatch,
+    ) -> Option<Instant> {
+        if !self.parks {
+            return None;
+        }
+        let kind = if kind == RecordType::Relocate {
+            RecordKind::Relocate
+        } else {
+            RecordKind::Batch
+        };
+        sink.stall_deadline(kind, first_seq, batch)
     }
 
     fn drain_queue_after_latch(&self) {
@@ -612,6 +774,9 @@ impl Writer {
         if let Some(free) = lock(&self.shared.table).free.pop() {
             return Ok(free);
         }
+        // Under `sim`, inside a world, a preparer step makes a whole spare atomically and
+        // never runs during a journal step, so `busy` is false here and the loop below
+        // never waits (a wait there would panic in `rt::sync::Condvar`).
         {
             let mut prep = lock(&self.shared.prep);
             while prep.busy {
@@ -688,11 +853,18 @@ impl Writer {
     /// a group of the rest would publish. Removes the completed items from `items` (and
     /// their statuses and placements). Returns whether the group was counted. A sink
     /// failure latches; the records before it stay visible and their waiters succeed.
+    ///
+    /// It starts after the first `applied` head records (`visible` is the last of them):
+    /// zero and `None` for a new group, the parked position when a simulated group
+    /// resumes. Head placements index the head items in order, so placement `applied`
+    /// is the next head record.
     fn publish_unsynced_head(
         &mut self,
         items: &mut Vec<Item>,
         sink: &dyn JournalSink,
-    ) -> Result<bool, Fail> {
+        mut applied: usize,
+        mut visible: Option<Seq>,
+    ) -> Head {
         let head = items
             .iter()
             .zip(&self.status)
@@ -701,12 +873,15 @@ impl Writer {
             })
             .count();
         if head == 0 {
-            return Ok(false);
+            return Head::Done(false);
         }
         let mut failed = false;
-        let mut visible = None;
-        let mut applied = 0;
-        for p in self.placements.iter().take_while(|p| p.item < head) {
+        for p in self
+            .placements
+            .iter()
+            .skip(applied)
+            .take_while(|p| p.item < head)
+        {
             let Item::Write {
                 kind,
                 batch,
@@ -716,6 +891,11 @@ impl Writer {
             else {
                 unreachable!("placements index writes")
             };
+            #[cfg(feature = "sim")]
+            if let Some(until) = self.park_deadline(sink, *kind, *first_seq, batch) {
+                let stage = Stage::Head { applied, visible };
+                return Head::Parked(Park { stage, until });
+            }
             fill_locators(&mut self.locators, batch, p);
             let started = time::now_std();
             let kind = if *kind == RecordType::Relocate {
@@ -765,9 +945,9 @@ impl Writer {
             complete(item, Ok(seq));
         }
         if failed {
-            return Err(Fail::Fatal(Error::RecoveryRequired));
+            return Head::Failed;
         }
-        Ok(applied != 0)
+        Head::Done(applied != 0)
     }
 
     /// Pads to the next 4 KiB boundary (or the segment end), writes the buffer and syncs
@@ -857,15 +1037,18 @@ pub(super) struct Prep {
 /// the writer asks and fewer than [`SPARES`] are free. It never touches a live segment and
 /// never latches: a failure (`NoSpace` included) leaves the writer to create the file
 /// inline at the roll, where `NoSpace` is reported as usual.
-pub(super) fn spawn_preparer(shared: Arc<Shared>) -> Result<JoinHandle<()>> {
-    task::spawn_service_with_stack(
-        "kv-journal-prep",
-        crate::store::THREAD_STACK_BYTES,
-        move || prepare_loop(&shared),
-    )
-    .map_err(segment::io)
+pub(super) fn spawn_preparer(shared: Arc<Shared>) -> Result<ServiceHandle> {
+    let stack_bytes = crate::store::THREAD_STACK_BYTES;
+    #[cfg(feature = "sim")]
+    let handle = task::spawn_stepped("kv-journal-prep", stack_bytes, PrepService { shared });
+    #[cfg(not(feature = "sim"))]
+    let handle = super::service::spawn_thread("kv-journal-prep", stack_bytes, move || {
+        prepare_loop(&shared)
+    });
+    handle.map_err(segment::io)
 }
 
+/// The `kv-journal-prep` thread body.
 fn prepare_loop(shared: &Shared) {
     loop {
         {
@@ -879,31 +1062,215 @@ fn prepare_loop(shared: &Shared) {
             if prep.stop {
                 return;
             }
-            prep.wanted = false;
-            if lock(&shared.table).free.len() >= SPARES {
+            if !claim_spare(&mut prep, shared) {
                 continue;
             }
-            prep.busy = true;
         }
-        let number = shared.next_number.fetch_add(1, Ordering::Relaxed);
-        let options = &shared.options;
-        let made = segment::create_free(
-            &*shared.fs,
-            &shared.dir,
-            number,
-            options.segment_bytes,
-            options.zero_fill,
-            Some(&shared.prep_cancel),
-        );
-        let failed = made.is_err();
-        if let Ok(free) = made {
-            lock(&shared.table).free.push(free);
+        prepare_spare(shared);
+    }
+}
+
+/// Takes the writer's request for a spare. True when one must be made (the preparer is
+/// then busy); false when enough are free already.
+#[inline]
+fn claim_spare(prep: &mut Prep, shared: &Shared) -> bool {
+    prep.wanted = false;
+    if lock(&shared.table).free.len() >= SPARES {
+        return false;
+    }
+    prep.busy = true;
+    true
+}
+
+/// Makes one spare segment and ends the busy state [`claim_spare`] began.
+#[inline]
+fn prepare_spare(shared: &Shared) {
+    let number = shared.next_number.fetch_add(1, Ordering::Relaxed);
+    let options = &shared.options;
+    let made = segment::create_free(
+        &*shared.fs,
+        &shared.dir,
+        number,
+        options.segment_bytes,
+        options.zero_fill,
+        Some(&shared.prep_cancel),
+    );
+    let failed = made.is_err();
+    if let Ok(free) = made {
+        lock(&shared.table).free.push(free);
+    }
+    let mut prep = lock(&shared.prep);
+    prep.busy = false;
+    prep.failed_at = failed.then(time::now_std);
+    drop(prep);
+    shared.prep_done.notify_all();
+}
+
+/// Moves the next group (at most `max_group_bytes`, and at least one item) from the
+/// queue into `items`, or reports why the journal stops. The caller has seen the queue
+/// non-empty or closing.
+#[inline]
+fn take_group(
+    mut queue: MutexGuard<'_, Queue>,
+    items: &mut Vec<Item>,
+    max_group_bytes: usize,
+) -> Take {
+    if queue.crash {
+        let dropped: Vec<Item> = queue.items.drain(..).collect();
+        drop(queue);
+        drop(dropped);
+        return Take::Crash;
+    }
+    if queue.items.is_empty() {
+        drop(queue);
+        return Take::Close;
+    }
+    let mut bytes = 0;
+    while let Some(item) = queue.items.front() {
+        let b = item_bytes(item);
+        if !items.is_empty() && bytes + b > max_group_bytes {
+            break;
         }
-        let mut prep = lock(&shared.prep);
-        prep.busy = false;
-        prep.failed_at = failed.then(time::now_std);
-        drop(prep);
-        shared.prep_done.notify_all();
+        bytes += b;
+        items.push(queue.items.pop_front().expect("front exists"));
+    }
+    queue.bytes -= bytes;
+    Take::Group
+}
+
+/// The `kv-journal` service: the writer, its sink and the group in hand.
+#[cfg(feature = "sim")]
+struct JournalService {
+    /// Taken on a clean stop or when the runtime starts the threaded loop.
+    writer: Option<Writer>,
+    sink: Arc<dyn JournalSink>,
+    /// The group being processed; empty between groups.
+    items: Vec<Item>,
+    /// Where the parked group in `items` resumes.
+    parked: Option<Stage>,
+}
+
+#[cfg(feature = "sim")]
+impl Drop for JournalService {
+    fn drop(&mut self) {
+        let Some(writer) = &self.writer else {
+            return;
+        };
+
+        // The runtime discards the service on a node cut, even before its first step.
+        // Anything still in our group or the queue has no completed outcome. The
+        // bytes may be in the recovered prefix, so these commits require recovery.
+        writer.latch();
+        let queued = {
+            let mut queue = lock(&writer.shared.queue);
+            queue.closing = true;
+            queue.bytes = 0;
+            queue.writer_waiting = false;
+            std::mem::take(&mut queue.items)
+        };
+        // Guards can hold the store itself. Set the latch and drop the queue lock
+        // before completing them, so store teardown can reenter Journal::stop.
+        for item in self.items.drain(..).chain(queued) {
+            complete(item, Err(Error::RecoveryRequired));
+        }
+    }
+}
+
+#[cfg(feature = "sim")]
+impl Stepped for JournalService {
+    /// One group of [`Writer::run`]. A parked group resumes first, and a group
+    /// parks (returns a timed `Idle`) before a sink call that would stall.
+    fn step(&mut self) -> Step {
+        let writer = self.writer.as_mut().expect("live journal service");
+        writer.parks = true;
+        let shared = writer.shared.clone();
+        let mut queue = lock(&shared.queue);
+        // Leave pending items for the abort path when the test hook requests a cut.
+        if queue.crash {
+            return Step::Exit;
+        }
+        let outcome = if let Some(stage) = self.parked.take() {
+            drop(queue);
+            writer.advance(&mut self.items, &*self.sink, stage)
+        } else {
+            if queue.items.is_empty() && !queue.closing {
+                queue.writer_waiting = true;
+                return Step::Idle(None);
+            }
+            queue.writer_waiting = false;
+            match take_group(queue, &mut self.items, shared.options.max_group_bytes) {
+                Take::Group => {}
+                Take::Crash => unreachable!("crash checked under the queue lock"),
+                Take::Close => {
+                    writer.close_cleanly();
+                    self.writer = None;
+                    return Step::Exit;
+                }
+            }
+            writer.process(&mut self.items, &*self.sink)
+        };
+        match outcome {
+            Ok(()) => {
+                writer.maybe_prepare_spare();
+                Step::Worked
+            }
+            Err(park) => {
+                self.parked = Some(park.stage);
+                Step::Idle(Some(park.until))
+            }
+        }
+    }
+
+    fn doorbell(&self) -> &Condvar {
+        &self
+            .writer
+            .as_ref()
+            .expect("live journal service")
+            .shared
+            .work
+    }
+
+    fn run(mut self) {
+        self.writer
+            .take()
+            .expect("live journal service")
+            .run(&*self.sink);
+    }
+}
+
+/// The `kv-journal-prep` service.
+#[cfg(feature = "sim")]
+pub(super) struct PrepService {
+    shared: Arc<Shared>,
+}
+
+#[cfg(feature = "sim")]
+impl Stepped for PrepService {
+    /// One request of [`prepare_loop`]. Each step makes a whole spare, so the journal
+    /// never finds the preparer busy while it steps (`take_spare` never waits there).
+    fn step(&mut self) -> Step {
+        {
+            let mut prep = lock(&self.shared.prep);
+            if prep.stop {
+                return Step::Exit;
+            }
+            if !prep.wanted {
+                return Step::Idle(None);
+            }
+            if !claim_spare(&mut prep, &self.shared) {
+                return Step::Worked;
+            }
+        }
+        prepare_spare(&self.shared);
+        Step::Worked
+    }
+
+    fn doorbell(&self) -> &Condvar {
+        &self.shared.prep_work
+    }
+
+    fn run(self) {
+        prepare_loop(&self.shared)
     }
 }
 

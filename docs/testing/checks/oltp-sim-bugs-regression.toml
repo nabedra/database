@@ -1,0 +1,18 @@
+id = "oltp-sim-bugs-regression"
+module = "oltp"
+kinds = ["U"]
+# Tooling: each listed phase 10 patch, applied in a scratch worktree, makes its original regression
+# test fail with the expected text, and the test passes without it. The command builds the OLTP
+# library tests once clean and once per patch in server/target/sim-bugs.
+# acc3-cold-fence is left out: its only regression, the O15 acceptance scenario, caught the patch
+# in 1 of 5 patched runs (runs 45148928008 and 45150522656), so it cannot gate. Finding that timing
+# window is the seed search's job (oltp-sim-bugs-direct). `sim_bugs.py verify acc3-cold-fence`
+# still runs it by hand.
+guarantees = []
+scenarios = []
+tiers = ["T3"]
+command = ["python3", "scripts/testing/sim_bugs.py", "verify", "bug1-auth", "fixa-replay", "bug1-d04", "az2", "--jobs", "4"]
+cwd = "."
+timeout_s = 18000
+needs = []
+result_parser = "exit-code"
