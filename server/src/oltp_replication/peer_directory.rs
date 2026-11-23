@@ -1,16 +1,18 @@
 //! Transport authentication uses locally installed Control enrollment. Refresh
 //! happens outside Raft handlers, so authenticating Control cannot recursively
 //! require a Control quorum call through the same saturated listener.
-use super::*;
 use crate::oltp::{
     mvcc::json_decode_budget,
-    pool::{ExecutionClass, WorkerSharedResources},
+    pool::{ExecutionClass, ScratchLease, WorkerSharedResources},
 };
 use crate::oltp_replication::{
     authority::control::{ApiEnrollment, ControlClient, InventoryPage, ReplacementRecord},
-    types::{Digest, GroupKind, WorkerEnrollment},
+    types::{Digest, GroupIdentity, GroupKind, Text, WorkerEnrollment, WorkerIdentity},
 };
+use crate::protocol::{ErrorCode, Outcome, ProtocolError};
+use nabedra_transport::{EndpointFuture, PeerDirectory, Purpose, ReceivedReply, TransportTrust};
 use serde::de::DeserializeOwned;
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -19,6 +21,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 /// REP6: a Data-only worker refreshes its revocation view this often.
 pub(crate) const REVOCATION_REFRESH: Duration = Duration::from_secs(1);
@@ -52,7 +55,7 @@ struct RemoteRevocations {
 
 enum Role {
     Worker,
-    Api(super::super::types::Text<128>),
+    Api(Text<128>),
     BootstrapControl(GroupIdentity),
     PreparedControl,
 }
@@ -211,7 +214,7 @@ impl AppliedPeerDirectory {
     }
 
     fn refreshed(&self, result: Result<usize, ProtocolError>) {
-        use crate::oltp_runtime::stage_timing::perf_stage;
+        use nabedra_resources::perf_stage;
         let Some(remote) = self.remote.get() else {
             return;
         };
@@ -686,7 +689,7 @@ impl AppliedPeerDirectory {
             .execute(ExecutionClass::Control, 0, 0, move || {
                 let raw = reply.sections[0].as_ref().ok_or_else(invalid)?;
                 let page = serde_json::from_slice(raw.as_slice()).map_err(|_| invalid())?;
-                Ok((page, reply.scratch.clone()))
+                Ok((page, reply.scratch_lease()))
             })
             .await
     }
