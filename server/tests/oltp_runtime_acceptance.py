@@ -870,7 +870,11 @@ def queue_survival(binary, test_executable):
         join = {'request_id': str(uuid.uuid4())}
         (join_dir / 'rolling-test-id').write_text(join['request_id'])
         write_json(join_dir / 'gates.json', {
-            restart['request_id']: 'rolling_before_join', join['request_id']: 'rolling_copy_complete'})
+            restart['request_id']: 'rolling_before_join',
+            join['request_id']: 'rolling_copy_complete',
+            read['request_id']: 'queued',
+            mutation['request_id']: 'committed',
+        })
         launch_retained(cluster, removed)
         try:
             wait_reached([join_dir], restart, 'rolling_before_join')
@@ -916,13 +920,25 @@ def queue_survival(binary, test_executable):
                 assert assert_record(record, run, request) == originals[request['request_id']], record
         evidence('O14', 'join-with-outstanding-work', worker=removed, recovered_records=len(originals))
 
-        for directory in directories:
-            for request in (read, mutation):
-                release(directory, request)
         cluster.connection = cluster.admin('cluster.connection', {})
         cluster.apis['api2'].stop()
         cluster.start_api('api2', DIRECT)
+        same_id = dict(read, payload=dict(read['payload'], key='changed'))
         with closing(gateway(cluster, 'api2')) as restored:
+            assert_accepted(restored.exchange('/v1/requests', read), run, read)
+            status, conflict = restored.exchange('/v1/requests', same_id)
+            assert status == 409 and conflict['request_id'] == read['request_id'], conflict
+            assert conflict['error']['code'] == 'conflict', conflict
+            assert conflict['error']['outcome'] == 'not_applied', conflict
+            for name in (survivor, removed):
+                record = read_record(cluster, name, read)
+                assert assert_record(record, run, read) == originals[read['request_id']], record
+            assertion('O14', 'same-run-rejoin-idempotency',
+                      'Q04/Q05: the restarted gateway reused the surviving pending read and rejected a changed body. Both workers kept the original request and snapshot.')
+
+            for directory in directories:
+                for request in (read, mutation):
+                    release(directory, request)
             exact_receipt(restored.exchange, run, read, original_row)
             exact_receipt(restored.exchange, run, mutation, None)
         recovered = Database(cluster.api_urls['api2'], cluster.auth['data_token'], database='test',
