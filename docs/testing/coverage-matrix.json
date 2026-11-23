@@ -1,6 +1,6 @@
 {
   "allow_unattested": false,
-  "head": "8498d0ee2c61a3df8557091412665b0e73f47bdc",
+  "head": "8c639abdf01cc45407bd961feab20e32180bf7a4",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -3531,11 +3531,19 @@
           "state": "n/a"
         },
         "P": {
+          "behind": 0,
+          "checks": [
+            "rt-zero-cost"
+          ],
+          "date": "2026-11-23T13:08:29.669273+00:00",
           "deferred": "hardware-deferred",
-          "executed": 0,
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "reason": "hardware-deferred (absolute OLTP latency targets, including the direct-path benchmark)",
           "required": true,
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45180355879",
+          "sha": "8c639abdf01cc45407bd961feab20e32180bf7a4",
           "state": "not-run"
         },
         "R": {
@@ -3992,5 +4000,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
