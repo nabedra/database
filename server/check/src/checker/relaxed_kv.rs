@@ -19,7 +19,7 @@
 //! Register keys (no `incr`):
 //! - `invented-value`: a value read that no op wrote, or read before its write was invoked;
 //! - `resurrection`: a value read after an acknowledged delete, or after an expiry deadline
-//!   (plus `expiry_tolerance_ns`), when its write was acknowledged before the delete or expire;
+//!   (plus `expiry_tolerance_ns`). An expired overwrite also removes the versions it replaced;
 //! - `stale-read`: within one epoch (both epochs known and the read's not newer), a read that
 //!   returns a value older than a write acknowledged before the read began, or that goes back
 //!   in time after another read in the same epoch;
@@ -102,6 +102,10 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     /// Whether losing the effect of `w` is allowed for an op invoked at `read`.
     fn loss_allowed(&self, w: &Op, read: &Op) -> bool {
+        self.loss_allowed_before(w, read, None)
+    }
+
+    fn loss_allowed_before(&self, w: &Op, read: &Op, cutoff_ns: Option<u64>) -> bool {
         let applies = |m: &Marker| {
             m.pos > w.ret_pos()
                 && m.pos < read.call
@@ -110,7 +114,9 @@ impl Ctx<'_> {
                     .as_deref()
                     .is_none_or(|key| Some(key) == read.key.as_deref())
         };
-        if self.resets.iter().any(|m| applies(m)) {
+        let before_cutoff =
+            |m: &Marker| cutoff_ns.is_none_or(|cutoff| m.time_ns.is_none_or(|t| t < cutoff));
+        if self.resets.iter().any(|m| applies(m) && before_cutoff(m)) {
             return true;
         }
         let epoch_advanced = match (epoch(w), epoch(read)) {
@@ -118,9 +124,12 @@ impl Ctx<'_> {
             (Some(_), Some(_)) => true,
             _ => false,
         };
-        (epoch_advanced && self.opts.lag_window_ns.is_none())
+        let marker_dates_failover =
+            cutoff_ns.is_some() && self.failovers.iter().any(|m| applies(m));
+        (epoch_advanced && self.opts.lag_window_ns.is_none() && !marker_dates_failover)
             || self.failovers.iter().any(|m| {
                 applies(m)
+                    && before_cutoff(m)
                     && match (self.opts.lag_window_ns, w.ret_time, m.time_ns) {
                         (Some(lag), Some(wt), Some(mt)) => wt <= mt && mt - wt <= lag,
                         (Some(_), _, _) => false,
@@ -304,6 +313,29 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
         };
         seen.push((r, w));
 
+        let expired = |d: &Op| {
+            let deadline = d.invoke_value.get("at_ns").and_then(Value::as_u64)?;
+            let cutoff = deadline.saturating_add(ctx.opts.expiry_tolerance_ns);
+            (r.call_time? >= cutoff
+                && !removals.iter().any(|later| {
+                    later.f == "expire"
+                        && d.precedes(later)
+                        && later.call < r.ret_pos()
+                        && later.call_time.is_none_or(|time| time < deadline)
+                }))
+            .then_some(cutoff)
+        };
+        let expired_overwrites = |old| {
+            let seen = &seen;
+            acked_writes.iter().copied().filter_map(move |next| {
+                if next.precedes(r) && observed_before(old, next, seen) {
+                    expired(next).map(|cutoff| (next, cutoff))
+                } else {
+                    None
+                }
+            })
+        };
+
         // Resurrection after an acknowledged delete or an expiry.
         if let Some(w) = w {
             let version_was_visible = |d: &Op| {
@@ -320,25 +352,12 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                             || (!std::ptr::eq(*candidate, w) && candidate.ret_pos() > after))
                 })
             };
-            let expired = |d: &Op| {
-                let Some(deadline) = d.invoke_value.get("at_ns").and_then(Value::as_u64) else {
-                    return false;
-                };
-                let Some(t) = r.call_time else { return false };
-                t >= deadline.saturating_add(ctx.opts.expiry_tolerance_ns)
-                    && !removals.iter().any(|later| {
-                        later.f == "expire"
-                            && d.precedes(later)
-                            && later.call < r.ret_pos()
-                            && later.call_time.is_none_or(|time| time < deadline)
-                    })
-            };
             let resurrected = removals.iter().find(|d| {
                 d.outcome == Outcome::Ok
                     && d.precedes(r)
                     && version_was_visible(d)
                     && !version_can_be_rewritten(d.call)
-                    && (kind(&d.f) == Some("delete") || expired(d))
+                    && (kind(&d.f) == Some("delete") || expired(d).is_some())
             });
             let reset = ctx.resets.iter().find(|m| {
                 m.pos < r.call
@@ -359,7 +378,7 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                     [w.indices(), vec![m.index], r.indices()].concat(),
                 ));
             }
-            if w.precedes(r) && expired(w) && !version_can_be_rewritten(w.ret_pos()) {
+            if w.precedes(r) && expired(w).is_some() && !version_can_be_rewritten(w.ret_pos()) {
                 anomalies.push(Anomaly::new(
                     "resurrection",
                     format!("key {key:?}: read {v} after its SET expiry deadline"),
@@ -379,6 +398,17 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                 ));
                 continue;
             }
+            if let Some((next, _)) = expired_overwrites(w).find(|(next, cutoff)| {
+                !ctx.loss_allowed_before(next, r, Some(*cutoff))
+                    && !version_can_be_rewritten(next.call)
+            }) {
+                anomalies.push(Anomaly::new(
+                    "resurrection",
+                    format!("key {key:?}: read {v} after its replacement's SET expiry deadline"),
+                    [w.indices(), next.indices(), r.indices()].concat(),
+                ));
+                continue;
+            }
         }
 
         // A newer acknowledged write finished before this read began.
@@ -394,6 +424,7 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                     None => {
                         !removals.iter().any(|d| can_remove_between(d, w2, r))
                             && !deadline_passed(w2, r)
+                            && expired_overwrites(w2).next().is_none()
                     }
                 }
         });
@@ -433,6 +464,11 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                         None => {
                             !removals.iter().any(|d| can_remove_between(d, r1, r2))
                                 && !deadline_passed(wn, r2)
+                                && !acked_writes.iter().any(|next| {
+                                    observed_before(wn, next, &seen)
+                                        && next.precedes(r2)
+                                        && deadline_passed(next, r2)
+                                })
                         }
                     })
             });

@@ -1,7 +1,7 @@
 //! K03 fault-model history sensitivity for CACHE-G05.
 
 use nabedra_check::checker::relaxed_kv;
-use nabedra_check::history::{Event, Op, Outcome, pair, payload, read_jsonl};
+use nabedra_check::history::{Event, EventType, NEMESIS, Op, Outcome, pair, payload, read_jsonl};
 
 fn recorded_cache_sim() -> Vec<Event> {
     read_jsonl(include_bytes!("fixtures/cache_sim_clean.jsonl").as_slice()).unwrap()
@@ -101,4 +101,40 @@ fn cache_sim_rejects_stale_read_within_epoch() {
     let completion = read.ret_pos();
     events[completion].value["value"] = overwritten_value;
     assert_rejects(&events, completion, "stale-read");
+}
+
+#[test]
+fn cache_sim_seed_46_expired_overwrite() {
+    let mut events =
+        read_jsonl(include_bytes!("fixtures/cache_sim_seed_46_expired_overwrite.jsonl").as_slice())
+            .unwrap();
+    let verdict = relaxed_kv::check(&events);
+    assert!(verdict.valid, "{:#?}", verdict.anomalies);
+    assert_eq!(verdict.checked_ops, 3);
+
+    let ops = pair(&events).unwrap().ops;
+    let read = ops.iter().find(|op| is_ok(op, "get")).unwrap();
+    let writes: Vec<_> = preceding_sets(&ops, read).collect();
+    for write in writes {
+        // The earlier value still has time left on its own TTL. The overwrite
+        // consumed that version, even when the replacement itself expired.
+        events[read.ret_pos()].value["value"] = payload(&write.invoke_value).clone();
+        assert_rejects(&events, read.ret_pos(), "resurrection");
+    }
+
+    let first = &ops[0];
+    let replacement = &ops[1];
+    let mut failover =
+        Event::new(EventType::Info, NEMESIS, "failover").with_key(read.key.as_deref().unwrap());
+    failover.time_ns = Some(read.call_time.unwrap() - 1);
+    events[read.ret_pos()].value["epoch"] = 2.into();
+    events[read.ret_pos()].value["value"] = payload(&first.invoke_value).clone();
+    events.insert(read.call, failover);
+    assert_rejects(&events, read.ret_pos() + 1, "resurrection");
+
+    // A failover before the replacement's deadline can lose that write.
+    // The older version may survive if its own deadline has not passed.
+    events[read.call].time_ns = Some(replacement.ret_time.unwrap() + 1);
+    let verdict = relaxed_kv::check(&events);
+    assert!(verdict.valid, "{:#?}", verdict.anomalies);
 }
