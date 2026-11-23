@@ -1435,7 +1435,7 @@ impl ServiceResponse {
             self.node,
             kind,
             self.digest,
-            self.reply.scratch.clone(),
+            self.reply.scratch_lease(),
         )
     }
     pub(crate) fn status_context(&self) -> AuthenticatedStatusReplyContext {
@@ -1446,7 +1446,7 @@ impl ServiceResponse {
             nonce: self.reply.nonce(),
             digest: self.digest,
             method: self.method,
-            owner: self.reply.scratch.clone(),
+            owner: self.reply.scratch_lease(),
         }
     }
 }

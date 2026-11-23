@@ -1292,7 +1292,7 @@ impl ParticipantClient {
                 move || {
                     let raw = response.reply.sections[0].as_ref().ok_or_else(invalid)?;
                     let value = serde_json::from_slice(raw.as_slice()).map_err(|_| invalid())?;
-                    Ok((value, response.reply.scratch.clone()))
+                    Ok((value, response.reply.scratch_lease()))
                 },
             )
             .await
@@ -1478,8 +1478,8 @@ impl RemoteParticipant for ParticipantClient {
                 .execute(ExecutionClass::Query, 0, 0, move || {
                     OwnedCommand::decode_with_owner(
                         response.reply.sections[0].as_ref().ok_or_else(invalid)?,
-                        response.reply.scratch.clone(),
-                        response.reply.scratch.bytes(),
+                        response.reply.scratch_lease(),
+                        response.reply.decode_reserved_bytes(),
                     )
                 })
                 .await
@@ -1615,8 +1615,8 @@ impl RemoteParticipant for ParticipantClient {
                         .execute(ExecutionClass::Query, 0, 0, move || {
                             OwnedCommand::decode_with_owner(
                                 response.reply.sections[0].as_ref().ok_or_else(invalid)?,
-                                response.reply.scratch.clone(),
-                                response.reply.scratch.bytes(),
+                                response.reply.scratch_lease(),
+                                response.reply.decode_reserved_bytes(),
                             )
                         })
                         .await?;
@@ -1656,8 +1656,8 @@ impl RemoteParticipant for ParticipantClient {
                 .execute(ExecutionClass::Query, 0, 0, move || {
                     OwnedCommand::decode_with_owner(
                         response.reply.sections[0].as_ref().ok_or_else(invalid)?,
-                        response.reply.scratch.clone(),
-                        response.reply.scratch.bytes(),
+                        response.reply.scratch_lease(),
+                        response.reply.decode_reserved_bytes(),
                     )
                 })
                 .await
@@ -1688,8 +1688,8 @@ impl RemoteParticipant for ParticipantClient {
                 .execute(ExecutionClass::Query, 0, 0, move || {
                     OwnedCommand::decode_with_owner(
                         response.reply.sections[0].as_ref().ok_or_else(invalid)?,
-                        response.reply.scratch.clone(),
-                        response.reply.scratch.bytes(),
+                        response.reply.scratch_lease(),
+                        response.reply.decode_reserved_bytes(),
                     )
                 })
                 .await
@@ -1725,8 +1725,8 @@ impl RemoteParticipant for ParticipantClient {
                 .execute(ExecutionClass::Query, 0, 0, move || {
                     let page: OwnedCommand<ArchiveEffects> = OwnedCommand::decode_with_owner(
                         response.reply.sections[0].as_ref().ok_or_else(invalid)?,
-                        response.reply.scratch.clone(),
-                        response.reply.scratch.bytes(),
+                        response.reply.scratch_lease(),
+                        response.reply.decode_reserved_bytes(),
                     )?;
                     let value = page.payload()?;
                     if value.group != group

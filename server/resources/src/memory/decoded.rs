@@ -11,6 +11,7 @@ pub struct Decoded<T> {
     _scratch: Arc<ScratchLease>,
 }
 impl<T> Decoded<T> {
+    #[inline]
     pub fn new(
         value: T,
         sections: [Option<ChargedBytes>; MAX_SECTIONS],
@@ -26,6 +27,7 @@ impl<T> Decoded<T> {
 
 impl<T> Deref for Decoded<T> {
     type Target = T;
+    #[inline]
     fn deref(&self) -> &T {
         &self.value
     }

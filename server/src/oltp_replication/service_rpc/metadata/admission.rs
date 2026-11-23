@@ -60,7 +60,7 @@ impl OwnerAdmissionObservation {
         }
         Ok(Self {
             ticket: ticket.clone(),
-            _owner: reply.scratch.clone(),
+            _owner: reply.scratch_lease(),
         })
     }
     pub(crate) fn status_group(&self) -> &GroupIdentity {

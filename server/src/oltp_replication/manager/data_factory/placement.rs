@@ -584,7 +584,7 @@ impl ReplicaPlacement {
             group: observed.group.clone(),
             replicas: observed.replicas.clone(),
             applied_at: observed.applied_at,
-            _owner: reply.scratch.clone(),
+            _owner: reply.scratch_lease(),
         })
     }
 

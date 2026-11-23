@@ -267,7 +267,7 @@ pub(crate) struct ControlHandle {
     consensus: Arc<dyn Consensus<ControlCommand, ControlReply>>,
     policy: OperatorPolicy,
     registered_directory:
-        std::sync::OnceLock<Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
+        std::sync::OnceLock<Arc<crate::oltp_replication::peer_directory::AppliedPeerDirectory>>,
     /// NS14 mixed-version gate for the group damage commands.
     group_damage_gate: std::sync::RwLock<Option<Arc<dyn super::group_damage::GroupDamageGate>>>,
 }
@@ -287,7 +287,7 @@ impl ControlHandle {
     }
     pub(crate) fn use_registered_directory(
         &self,
-        directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+        directory: Arc<crate::oltp_replication::peer_directory::AppliedPeerDirectory>,
     ) -> Result<(), ProtocolError> {
         self.registered_directory
             .set(directory)

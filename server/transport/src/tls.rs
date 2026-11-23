@@ -1,5 +1,6 @@
 //! Mutual TLS material for worker peer transports. Only a CA-authenticated
 //! certificate and key pair can construct it; callers choose the ALPN list.
+use crate::backend::{Acceptor, Connector};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use sha2::{Digest, Sha256};
 use std::{io, sync::Arc};
@@ -60,17 +61,17 @@ impl TlsMaterial {
     pub fn certificate_sha256(&self) -> &str {
         &self.certificate_sha256
     }
-    /// Offer the protocols in preference order. The server selects the first
-    /// of its own list that the client offers, so an old peer that offers only
-    /// the one-shot protocol still negotiates it.
-    pub(super) fn transports(&self, alpn: &[&[u8]]) -> (TlsConnector, TlsAcceptor) {
+
+    /// Offer the protocols in preference order on both backends. The server
+    /// chooses the first protocol it also finds in the client's offer.
+    pub fn transports(&self, alpn: &[&[u8]]) -> (Connector, Acceptor) {
         let mut client = (*self.client).clone();
         let mut server = (*self.server).clone();
         client.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
         server.alpn_protocols = client.alpn_protocols.clone();
         (
-            TlsConnector::from(Arc::new(client)),
-            TlsAcceptor::from(Arc::new(server)),
+            Connector(TlsConnector::from(Arc::new(client))),
+            Acceptor(TlsAcceptor::from(Arc::new(server))),
         )
     }
 }

@@ -537,10 +537,11 @@ async fn replacement_peer_probe(config: PathBuf) {
         config::WorkerResources,
         oltp::pool::{ByteClass, SharedResourceConfig, WorkerSharedResources},
         oltp_replication::{
+            AppliedPeerDirectory,
             authority::control::{ControlClient, ControlRoutes, PublishedControlRoutes},
             manager::system_recovery::ReplacementCapabilityEndpoint,
             multiplex::{
-                AppliedPeerDirectory, EndpointRegistry, PeerDirectory, Purpose, TransportConfig,
+                EndpointRegistry, PeerDirectory, Purpose, TransportConfig,
                 WorkerTransport,
             },
             types::{GroupIdentity, WorkerEnrollment, WorkerIdentity},

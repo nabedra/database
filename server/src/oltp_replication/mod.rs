@@ -4,17 +4,18 @@ pub(crate) mod authority;
 pub mod entry;
 pub(crate) mod hosted;
 pub(crate) mod manager;
-pub mod multiplex;
+pub use nabedra_transport as multiplex;
 pub mod owned;
 mod proof;
 pub(crate) mod queue_access;
 pub(crate) mod service_rpc;
-mod tls;
+mod peer_directory;
 pub mod typed_log;
 pub(crate) mod typed_network;
 pub mod types;
+pub(crate) use peer_directory::AppliedPeerDirectory;
 pub use proof::ReadySetHasher;
-pub use tls::TlsMaterial;
+pub use nabedra_transport::tls::TlsMaterial;
 
 pub(crate) fn raft_config() -> openraft::Config {
     openraft::Config {

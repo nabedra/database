@@ -1,10 +1,13 @@
 use super::*;
-use crate::oltp::pool::{GroupCapacityLease, RAFT_REPLICA_BYTES, WorkerSharedResources};
-use crate::oltp_replication::{
-    TlsMaterial,
-    types::{Digest, GroupKind},
+use crate::{
+    backend::{self, Acceptor, Conn, Connector, Handshake, Listener, ServerStream},
+    tls::TlsMaterial,
 };
-use nabedra_resources::memory::{ReplicaMetadata, ReplicaMetadataOwner};
+use nabedra_oltp_types::types::{Digest, GroupKind, WorkerEnrollment};
+use nabedra_protocol::protocol::MAX_BODY_BYTES;
+use nabedra_resources::memory::{GroupCapacityLease, RAFT_REPLICA_BYTES, ReplicaMetadataOwner};
+use nabedra_rt::time::{timeout, timeout_at};
+pub use nabedra_resources::memory::ReplicaMetadata;
 use rustls::pki_types::ServerName;
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -19,25 +22,26 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
     sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit},
     task::JoinSet,
     time::Instant,
 };
-use nabedra_rt::time::{timeout, timeout_at};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 mod resolve;
 mod session;
 use resolve::{PeerResolver, ResolveError};
-pub(crate) use session::PeerFeature;
-use session::{DIRECT_ADMISSION_ALPN, PeerSessions, RawReply, SESSION_ALPN, session_alpn};
+pub use session::PeerFeature;
+#[cfg(not(feature = "sim"))]
+use session::session_alpn;
+use session::{DIRECT_ADMISSION_ALPN, PeerSessions, RawReply, SESSION_ALPN};
+#[cfg(feature = "sim")]
+pub use session::{FrameKind, StreamFrame, session_alpn};
 #[cfg(test)]
 mod tests;
 
 // Engine capability is fixed in the authenticated protocol, before variable
 // metadata. An OLAP worker does not implement this listener or enrollment.
-const ALPN: &[u8] = b"nabedra-oltp-worker/1";
+pub const ONE_SHOT_ALPN: &[u8] = b"nabedra-oltp-worker/1";
 const MAGIC: &[u8; 8] = b"NABOTP01";
 const PROLOGUE_BYTES: usize = 173;
 const CLASSES: usize = 15;
@@ -106,8 +110,7 @@ pub trait PeerDirectory: Send + Sync + 'static {
         group: &GroupIdentity,
         purpose: Purpose,
     ) -> Result<TransportTrust, ProtocolError>;
-    fn resolve(&self, worker: Uuid)
-    -> Result<super::super::types::WorkerEnrollment, ProtocolError>;
+    fn resolve(&self, worker: Uuid) -> Result<WorkerEnrollment, ProtocolError>;
     /// The locally applied Control enrollment revision, when this directory
     /// follows Control. Receivers drop cached service grants when it changes.
     fn applied_revision(&self) -> Option<u64> {
@@ -196,10 +199,10 @@ pub struct TransportConfig {
 }
 /// RD3: the default `direct_handler_slots`, equal to the direct executor's
 /// default `max_in_flight` (plan section 6 step 1).
-pub(crate) const DIRECT_HANDLER_SLOTS: usize = 256;
+pub const DIRECT_HANDLER_SLOTS: usize = 256;
 /// RD3: the default `direct_preflight_slots`. Preflight is the warm role
 /// check; the slot is held only until the handler slot is taken.
-pub(crate) const DIRECT_PREFLIGHT_SLOTS: usize = 64;
+pub const DIRECT_PREFLIGHT_SLOTS: usize = 64;
 /// RD3: whether a request of `class` on `group` is a direct request
 /// (`Method::Direct` or `DirectForward`, the only ingress on a Data group).
 fn direct_lane(class: TrafficClass, group: &GroupIdentity) -> bool {
@@ -233,12 +236,12 @@ impl Default for TransportConfig {
                 32 << 20,
                 64 << 10,
                 16 << 10,
-                2 * crate::protocol::MAX_BODY_BYTES + 4096,
+                2 * MAX_BODY_BYTES + 4096,
                 64 << 10,
                 32 << 20,
                 64 << 10,
                 128 << 10,
-                2 * crate::protocol::MAX_BODY_BYTES + (16 << 10),
+                2 * MAX_BODY_BYTES + (16 << 10),
                 64 << 10,
                 128 << 10,
                 128 << 10,
@@ -308,7 +311,7 @@ impl TransportConfig {
 struct Residency {
     identity: GroupIdentity,
     _slot: GroupCapacityLease,
-    shared: Arc<WorkerSharedResources>,
+    shared: Arc<MemoryHandle>,
 }
 /// Clone this into the Raft network factory and state machine BEFORE spawning
 /// their tasks. The last task owner retains the resident permit on cancellation.
@@ -338,55 +341,49 @@ struct ReplicaResidency {
 /// One live Raft instance, keyed by permanent node ID inside its group. A
 /// colocated replacement learner consumes a second real slot and byte budget.
 #[derive(Clone)]
-pub(crate) struct ReplicaLease(Arc<ReplicaResidency>);
+pub struct ReplicaLease(Arc<ReplicaResidency>);
 impl ReplicaLease {
-    pub(crate) fn owns_metadata(&self, metadata: &ReplicaMetadata) -> bool {
+    pub fn owns_metadata(&self, metadata: &ReplicaMetadata) -> bool {
         metadata.belongs_to(&self.0)
     }
 
-    pub(crate) fn retain_owner(&self, owner: Arc<dyn Send + Sync>) -> Result<(), ProtocolError> {
+    pub fn retain_owner(&self, owner: Arc<dyn Send + Sync>) -> Result<(), ProtocolError> {
         self.0
             .ownership
             .set(owner)
             .map_err(|_| malformed("replica ownership already bound"))
     }
-    pub(crate) fn identity(&self) -> &GroupIdentity {
+    pub fn identity(&self) -> &GroupIdentity {
         self.0.group.identity()
     }
-    pub(crate) fn node_id(&self) -> u64 {
+    pub fn node_id(&self) -> u64 {
         self.0.node_id
     }
-    pub(crate) fn same_resources(&self, shared: &Arc<WorkerSharedResources>) -> bool {
-        Arc::ptr_eq(shared, &self.0.group.0.shared)
+    pub fn same_resources(&self, shared: &Arc<impl ResourceOwner>) -> bool {
+        self.0.group.0.shared.belongs_to(shared.as_ref())
     }
-    pub(crate) fn metadata(&self, bytes: usize) -> Result<ReplicaMetadata, ProtocolError> {
+    pub fn metadata(&self, bytes: usize) -> Result<ReplicaMetadata, ProtocolError> {
         self.reserve_metadata(bytes, false)
     }
     /// Two MiB of the existing eight MiB resident charge belongs solely to
     /// live entry/container metadata. Wire and snapshot pressure cannot use it.
-    pub(crate) fn log_metadata(&self, bytes: usize) -> Result<ReplicaMetadata, ProtocolError> {
+    pub fn log_metadata(&self, bytes: usize) -> Result<ReplicaMetadata, ProtocolError> {
         self.reserve_metadata(bytes, true)
     }
-    pub(crate) fn proposal_metadata(&self, bytes: usize) -> Result<ReplicaMetadata, ProtocolError> {
+    pub fn proposal_metadata(&self, bytes: usize) -> Result<ReplicaMetadata, ProtocolError> {
         self.reserve_metadata_limit(bytes, true, (2 << 20) - (128 << 10))
     }
     /// [`Self::metadata`] that waits for room instead of failing. Every
     /// holder releases on drop (snapshot objects, transfer descriptions), so
     /// the wait ends. Used where a refusal would stop the Raft core (RV-APPLY
     /// F3). A request larger than the whole budget fails at once.
-    pub(crate) async fn metadata_wait(
-        &self,
-        bytes: usize,
-    ) -> Result<ReplicaMetadata, ProtocolError> {
+    pub async fn metadata_wait(&self, bytes: usize) -> Result<ReplicaMetadata, ProtocolError> {
         self.wait_metadata(bytes, false, RAFT_REPLICA_BYTES / 2)
             .await
     }
     /// [`Self::log_metadata`] that waits for room (RV-APPLY F5: the leader's
     /// own Blank and Membership entries in `append`).
-    pub(crate) async fn log_metadata_wait(
-        &self,
-        bytes: usize,
-    ) -> Result<ReplicaMetadata, ProtocolError> {
+    pub async fn log_metadata_wait(&self, bytes: usize) -> Result<ReplicaMetadata, ProtocolError> {
         self.wait_metadata(bytes, true, 2 << 20).await
     }
     async fn wait_metadata(
@@ -406,7 +403,7 @@ impl ReplicaLease {
             released.await;
         }
     }
-    pub(crate) fn log_metadata_used(&self) -> usize {
+    pub fn log_metadata_used(&self) -> usize {
         self.0
             .log_metadata_used
             .load(std::sync::atomic::Ordering::Acquire)
@@ -462,12 +459,21 @@ impl ResidentGroup {
     pub fn lease(&self) -> ResidentLease {
         self.0.lease.clone()
     }
-    pub(crate) fn activate_replica(
+    pub fn activate_replica(
         &self,
         node_id: u64,
-        shared: &Arc<WorkerSharedResources>,
+        shared: &Arc<impl ResourceOwner>,
     ) -> Result<ReplicaLease, ProtocolError> {
-        if node_id == 0 || !Arc::ptr_eq(shared, &self.0.lease.0.shared) {
+        if !self.0.lease.0.shared.belongs_to(shared.as_ref()) {
+            return Err(malformed(
+                "invalid hosted replica node or physical worker resources",
+            ));
+        }
+        self.activate(node_id)
+    }
+
+    fn activate(&self, node_id: u64) -> Result<ReplicaLease, ProtocolError> {
+        if node_id == 0 {
             return Err(malformed(
                 "invalid hosted replica node or physical worker resources",
             ));
@@ -484,7 +490,7 @@ impl ResidentGroup {
         {
             return Err(malformed("replica node is already live"));
         }
-        let slot = shared.lease_replica_residency()?;
+        let slot = self.0.lease.0.shared.lease_replica_residency()?;
         let replica = Arc::new(ReplicaResidency {
             group: self.lease(),
             node_id,
@@ -514,14 +520,14 @@ impl ResidentGroup {
 /// require committed placement proof and joined Raft tasks; it has no raw remove
 /// operation. Closing the whole worker is a separate lifecycle operation.
 pub struct EndpointRegistry {
-    shared: Arc<WorkerSharedResources>,
+    shared: Arc<MemoryHandle>,
     groups: Mutex<BTreeMap<Uuid, Arc<Binding>>>,
     closed: AtomicBool,
 }
 impl EndpointRegistry {
-    pub fn new(shared: Arc<WorkerSharedResources>) -> Self {
+    pub fn new(shared: Arc<impl ResourceOwner>) -> Self {
         Self {
-            shared,
+            shared: MemoryHandle::new(shared),
             groups: Mutex::new(BTreeMap::new()),
             closed: AtomicBool::new(false),
         }
@@ -529,13 +535,13 @@ impl EndpointRegistry {
     pub fn reserve(&self, identity: GroupIdentity) -> Result<ResidentGroup, ProtocolError> {
         self.reserve_with(identity, |group| Ok(group.clone()))
     }
-    pub(crate) fn reserve_replica(
+    pub fn reserve_replica(
         &self,
         identity: GroupIdentity,
         node_id: u64,
     ) -> Result<(ResidentGroup, ReplicaLease), ProtocolError> {
         self.reserve_with(identity, |group| {
-            let replica = group.activate_replica(node_id, &self.shared)?;
+            let replica = group.activate(node_id)?;
             Ok((group.clone(), replica))
         })
     }
@@ -597,7 +603,7 @@ impl EndpointRegistry {
     /// Close the entire worker's registrations, never an individual replica.
     /// Existing RPC/native/Raft owners retain their leases until joined; this
     /// only prevents new work and breaks service-routing ownership cycles.
-    pub(crate) fn close_worker(&self) -> Result<(), ProtocolError> {
+    pub fn close_worker(&self) -> Result<(), ProtocolError> {
         self.closed.store(true, Ordering::Release);
         let groups = {
             let mut groups = self.groups.lock().map_err(|_| unavailable())?;
@@ -616,13 +622,13 @@ impl EndpointRegistry {
 
 struct Common {
     local: WorkerIdentity,
-    shared: Arc<WorkerSharedResources>,
+    shared: Arc<MemoryHandle>,
     directory: Arc<dyn PeerDirectory>,
-    connector: TlsConnector,
-    acceptor: TlsAcceptor,
+    connector: Connector,
+    acceptor: Acceptor,
     /// Offers only the one-shot ALPN, for handshakes without a pending
     /// session slot: the caller falls back instead of losing an agreed session.
-    one_shot_acceptor: TlsAcceptor,
+    one_shot_acceptor: Acceptor,
     config: TransportConfig,
     handshakes: Arc<Semaphore>,
     preflight: [Arc<Semaphore>; CLASSES],
@@ -666,17 +672,19 @@ struct Common {
     /// Accepted sessions this worker closed when its directory learned their
     /// peer's revocation (REP6 push).
     revoked_closes: AtomicU64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     outgoing_lane_full: [tokio::sync::Notify; CLASSES],
     /// Tests close a whole class with `hold_outgoing_for_test`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     outgoing_hold: [Arc<Semaphore>; CLASSES],
     /// Tests hold caller session writers before they dequeue a frame.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     hold_writes: tokio::sync::watch::Sender<bool>,
     /// Replies a receiver skipped because the caller cancelled the stream.
     #[cfg(test)]
     cancelled_replies: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    hold_replies_after_release: tokio::sync::watch::Sender<bool>,
 }
 impl Common {
     /// The receiver's preflight pool for a request of `class` on `group`.
@@ -777,12 +785,12 @@ impl Drop for RaftTransportTrace {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum RequestTarget {
+pub enum RequestTarget {
     WorkerId(Uuid),
     Exact(WorkerIdentity),
 }
 impl RequestTarget {
-    pub(crate) fn worker_id(self) -> Uuid {
+    pub fn worker_id(self) -> Uuid {
         match self {
             Self::WorkerId(id) => id,
             Self::Exact(worker) => worker.worker_id,
@@ -801,7 +809,7 @@ impl From<WorkerIdentity> for RequestTarget {
 }
 
 #[derive(Debug)]
-pub(crate) enum RequestError {
+pub enum RequestError {
     OutgoingLaneFull {
         class: TrafficClass,
         direct: bool,
@@ -851,9 +859,9 @@ impl From<RequestError> for ProtocolError {
 }
 impl WorkerTransport {
     pub fn new(
-        local: &super::super::types::WorkerEnrollment,
+        local: &WorkerEnrollment,
         tls: &TlsMaterial,
-        shared: Arc<WorkerSharedResources>,
+        shared: Arc<impl ResourceOwner>,
         directory: Arc<dyn PeerDirectory>,
         registry: Arc<EndpointRegistry>,
         config: TransportConfig,
@@ -862,11 +870,11 @@ impl WorkerTransport {
     }
     /// A peer as released before persistent sessions: it offers and accepts
     /// only the one-shot `NABOTP01` exchange.
-    #[cfg(test)]
-    pub(crate) fn one_shot_for_test(
-        local: &super::super::types::WorkerEnrollment,
+    #[cfg(any(test, feature = "sim", feature = "test-hooks"))]
+    pub fn one_shot_for_test(
+        local: &WorkerEnrollment,
         tls: &TlsMaterial,
-        shared: Arc<WorkerSharedResources>,
+        shared: Arc<impl ResourceOwner>,
         directory: Arc<dyn PeerDirectory>,
         registry: Arc<EndpointRegistry>,
         config: TransportConfig,
@@ -874,9 +882,9 @@ impl WorkerTransport {
         Self::build(local, tls, shared, directory, registry, config, false)
     }
     fn build(
-        local: &super::super::types::WorkerEnrollment,
+        local: &WorkerEnrollment,
         tls: &TlsMaterial,
-        shared: Arc<WorkerSharedResources>,
+        shared: Arc<impl ResourceOwner>,
         directory: Arc<dyn PeerDirectory>,
         registry: Arc<EndpointRegistry>,
         config: TransportConfig,
@@ -886,7 +894,7 @@ impl WorkerTransport {
             .validate()
             .map_err(|_| malformed("invalid local worker enrollment"))?;
         shared.bind_worker(local.worker_id)?;
-        if !Arc::ptr_eq(&shared, &registry.shared) {
+        if !registry.shared.belongs_to(shared.as_ref()) {
             return Err(malformed(
                 "listener and registry have different worker resources",
             ));
@@ -897,17 +905,17 @@ impl WorkerTransport {
         }
         let direct_admission = !direct_admission_disabled();
         let (connector, acceptor) = if sessions_enabled && !direct_admission {
-            tls.transports(&[SESSION_ALPN, ALPN])
+            tls.transports(&[SESSION_ALPN, ONE_SHOT_ALPN])
         } else if sessions_enabled {
-            tls.transports(&[DIRECT_ADMISSION_ALPN, SESSION_ALPN, ALPN])
+            tls.transports(&[DIRECT_ADMISSION_ALPN, SESSION_ALPN, ONE_SHOT_ALPN])
         } else {
-            tls.transports(&[ALPN])
+            tls.transports(&[ONE_SHOT_ALPN])
         };
-        let (_, one_shot_acceptor) = tls.transports(&[ALPN]);
+        let (_, one_shot_acceptor) = tls.transports(&[ONE_SHOT_ALPN]);
         Ok(Self {
             common: Arc::new(Common {
                 local: WorkerIdentity::from(local),
-                shared,
+                shared: registry.shared.clone(),
                 directory,
                 connector,
                 acceptor,
@@ -957,24 +965,26 @@ impl WorkerTransport {
                 pending_sessions: Arc::new(Semaphore::new(config.pending_sessions)),
                 refusals: LaneRefusals::default(),
                 revoked_closes: AtomicU64::new(0),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 outgoing_lane_full: std::array::from_fn(|_| tokio::sync::Notify::new()),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 outgoing_hold: std::array::from_fn(|_| {
                     Arc::new(Semaphore::new(TEST_HOLD_PERMITS as usize))
                 }),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 hold_writes: tokio::sync::watch::channel(false).0,
                 #[cfg(test)]
                 cancelled_replies: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
+                hold_replies_after_release: tokio::sync::watch::channel(false).0,
                 config,
             }),
             registry,
         })
     }
     /// Sessions closed when the directory learned their peer's revocation.
-    #[cfg(test)]
-    pub(crate) fn revoked_session_closes(&self) -> u64 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn revoked_session_closes(&self) -> u64 {
         self.common.revoked_closes.load(Ordering::Relaxed)
     }
     pub fn client(&self) -> WorkerClient {
@@ -984,9 +994,10 @@ impl WorkerTransport {
     }
     pub async fn run(
         self: Arc<Self>,
-        listener: TcpListener,
+        listener: impl Into<Listener> + Send,
         shutdown: impl Future<Output = ()> + Send,
     ) -> Result<(), ProtocolError> {
+        let listener = listener.into();
         tokio::pin!(shutdown);
         let (stop, stopped) = tokio::sync::watch::channel(false);
         let mut tasks = JoinSet::new();
@@ -1015,12 +1026,11 @@ impl WorkerTransport {
     /// drops a session it agreed to.
     async fn accept(
         self: Arc<Self>,
-        socket: TcpStream,
+        socket: Conn,
         handshake: OwnedSemaphorePermit,
         stopped: tokio::sync::watch::Receiver<bool>,
     ) {
         let deadline = nabedra_rt::time::now() + self.common.config.deadline;
-        tune_socket(&socket);
         let pending = if self.common.sessions_enabled {
             self.common
                 .pending_sessions
@@ -1035,30 +1045,28 @@ impl WorkerTransport {
         } else {
             &self.common.one_shot_acceptor
         };
-        let Ok(Ok(stream)) = timeout_at(deadline, acceptor.accept(socket)).await else {
+        let Ok(Ok((stream, proof))) = timeout_at(deadline, acceptor.handshake(socket)).await else {
             return;
         };
         if let Some(pending) = pending
-            && session_alpn(stream.get_ref().1.alpn_protocol())
+            && session_alpn(proof.alpn.as_deref())
         {
-            let Ok(certificate) = peer_digest(stream.get_ref().1.peer_certificates()) else {
-                return;
-            };
             drop(handshake);
-            session::serve(self, stream, certificate, stopped, pending).await;
+            session::serve(self, stream, proof, stopped, pending).await;
             return;
         }
-        let _ = timeout_at(deadline, self.serve(stream, handshake)).await;
+        let _ = timeout_at(deadline, self.serve(stream, proof, handshake)).await;
     }
     async fn serve(
         &self,
-        mut stream: tokio_rustls::server::TlsStream<TcpStream>,
+        mut stream: ServerStream,
+        proof: Handshake,
         classification: OwnedSemaphorePermit,
     ) -> Result<(), ProtocolError> {
-        if stream.get_ref().1.alpn_protocol() != Some(ALPN) {
+        if proof.alpn.as_deref() != Some(ONE_SHOT_ALPN) {
             return Err(malformed("wrong worker ALPN"));
         }
-        let certificate = peer_digest(stream.get_ref().1.peer_certificates())?;
+        let certificate = Digest::from_bytes(proof.peer_certificate_sha256);
         let mut bytes = [0; PROLOGUE_BYTES];
         stream
             .read_exact(&mut bytes)
@@ -1173,7 +1181,7 @@ impl WorkerTransport {
 }
 
 impl WorkerClient {
-    pub(crate) fn local_identity(&self) -> WorkerIdentity {
+    pub fn local_identity(&self) -> WorkerIdentity {
         self.common.local
     }
     pub async fn request(
@@ -1196,7 +1204,7 @@ impl WorkerClient {
         .await
         .map_err(Into::into)
     }
-    pub(crate) async fn request_classified(
+    pub async fn request_classified(
         &self,
         group: &GroupIdentity,
         target: impl Into<RequestTarget>,
@@ -1222,7 +1230,7 @@ impl WorkerClient {
     /// timeout is still a not-applied `OutgoingLaneFull`. The slot keeps the
     /// lane's bound: no more streams in flight to `target` than its handler
     /// admits. Pass it to [`Self::request_reserved`].
-    pub(crate) async fn reserve_outgoing(
+    pub async fn reserve_outgoing(
         &self,
         group: &GroupIdentity,
         target: Uuid,
@@ -1234,7 +1242,7 @@ impl WorkerClient {
             .map_err(|_| malformed("invalid target group"))?;
         let class = traffic(group, purpose)?;
         let index = class as usize;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let hold = self.common.outgoing_hold[index].clone();
         // RD3: a leader whose session negotiated direct admission handles
         // `direct_handler_slots` direct requests at once, apart from queued
@@ -1252,12 +1260,12 @@ impl WorkerClient {
                 .lane(target, &self.common.config);
             let class_slots = self.common.direct_class.clone();
             let acquire = timeout_at(until, async {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 let held = hold.acquire_owned().await?;
                 Ok::<_, tokio::sync::AcquireError>(OutgoingSlot {
                     _slot: lane.acquire_owned().await?,
                     _class: class_slots.acquire_owned().await?,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-hooks"))]
                     _held: held,
                 })
             });
@@ -1293,7 +1301,7 @@ impl WorkerClient {
                 waiting_lane.acquire_owned().await?,
                 waiting_class.acquire_owned().await?,
             );
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             let held = hold.acquire_owned().await?;
             let slot = lane.acquire_owned().await?;
             let class_slot = class_slots.acquire_owned().await?;
@@ -1302,7 +1310,7 @@ impl WorkerClient {
                 OutgoingSlot {
                     _slot: slot,
                     _class: class_slot,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-hooks"))]
                     _held: held,
                 },
             ))
@@ -1328,7 +1336,7 @@ impl WorkerClient {
     /// [`Self::request_classified`] on a slot from [`Self::reserve_outgoing`]
     /// for the same target and class.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn request_reserved(
+    pub async fn request_reserved(
         &self,
         reservation: OutgoingReservation,
         group: &GroupIdentity,
@@ -1356,7 +1364,7 @@ impl WorkerClient {
         .await
     }
     /// A pending local DNS lookup is indeterminate for a liveness probe.
-    pub(crate) async fn request_queue_probe(
+    pub async fn request_queue_probe(
         &self,
         group: &GroupIdentity,
         target: WorkerIdentity,
@@ -1419,7 +1427,7 @@ impl WorkerClient {
     /// A service preflight depends on a fresh Control role read. It can wait
     /// for the existing outgoing slot, then send one exchange in the same
     /// transport deadline.
-    pub(crate) async fn request_authority_dependency(
+    pub async fn request_authority_dependency(
         &self,
         group: &GroupIdentity,
         target: Uuid,
@@ -1497,7 +1505,7 @@ impl WorkerClient {
             .map_err(|_| RequestError::outgoing_lane_full(class))?;
         let acquire = timeout_at(deadline, async {
             let role = roles.acquire().await?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             let held = self.common.outgoing_hold[index]
                 .clone()
                 .acquire_owned()
@@ -1509,7 +1517,7 @@ impl WorkerClient {
                 OutgoingSlot {
                     _slot: slot,
                     _class: class_slot,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-hooks"))]
                     _held: held,
                 },
             ))
@@ -1525,6 +1533,7 @@ impl WorkerClient {
             .map_err(|_| RequestError::outgoing_lane_full(class))?
             .map_err(|_| RequestError::outgoing_lane_full(class))
     }
+    #[allow(clippy::too_many_arguments)]
     async fn exchange(
         &self,
         group: &GroupIdentity,
@@ -1665,24 +1674,24 @@ impl WorkerClient {
     }
     /// TLS connections this caller has opened, sessions and one-shot exchanges.
     #[cfg(test)]
-    pub(crate) fn connections_for_test(&self) -> u64 {
+    fn connections_for_test(&self) -> u64 {
         self.common.sessions.connections()
     }
     #[cfg(test)]
-    pub(crate) fn live_sessions_for_test(&self) -> usize {
+    fn live_sessions_for_test(&self) -> usize {
         self.common.sessions.live_for_test()
     }
     #[cfg(test)]
-    pub(crate) fn waiting_streams_for_test(&self) -> usize {
+    fn waiting_streams_for_test(&self) -> usize {
         self.common.sessions.waiting_for_test()
     }
     /// Close every caller session, as if each connection failed at once.
     #[cfg(test)]
-    pub(crate) fn close_sessions_for_test(&self) {
+    fn close_sessions_for_test(&self) {
         self.common.sessions.close_all();
     }
     /// The locally applied Control enrollment revision, if the directory has one.
-    pub(crate) fn applied_revision(&self) -> Option<u64> {
+    pub fn applied_revision(&self) -> Option<u64> {
         self.common.directory.applied_revision()
     }
     /// The peer's current incarnation when this caller's live session to it on
@@ -1690,7 +1699,7 @@ impl WorkerClient {
     /// such session yet, or the peer speaks only the one-shot protocol.
     /// Send the feature's frames to the returned identity only, so a restarted
     /// (possibly older) incarnation never receives them.
-    pub(crate) fn peer_supports(
+    pub fn peer_supports(
         &self,
         worker: Uuid,
         class: TrafficClass,
@@ -1703,11 +1712,11 @@ impl WorkerClient {
             .then(|| WorkerIdentity::from(&peer))
     }
     /// Local lane refusals since start, for `/v1/runtime/stats`.
-    pub(crate) fn lane_refusals(&self) -> serde_json::Value {
+    pub fn lane_refusals(&self) -> serde_json::Value {
         self.common.refusals.snapshot()
     }
     /// The largest request payload this caller sends on `class`.
-    pub(crate) fn payload_limit(&self, class: TrafficClass) -> usize {
+    pub fn payload_limit(&self, class: TrafficClass) -> usize {
         self.common.config.payload_bytes[class as usize]
     }
 
@@ -1729,11 +1738,11 @@ impl WorkerClient {
         class: TrafficClass,
     ) -> Result<OutgoingSlot, RequestError> {
         let full = || {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             self.common.outgoing_lane_full[class as usize].notify_one();
             RequestError::outgoing_lane_full(class)
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let held = self.common.outgoing_hold[class as usize]
             .clone()
             .try_acquire_owned()
@@ -1751,14 +1760,14 @@ impl WorkerClient {
         Ok(OutgoingSlot {
             _slot: slot,
             _class: class_slot,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             _held: held,
         })
     }
 
     /// Closes `class` to every peer until the permit drops. The class must be idle.
-    #[cfg(test)]
-    pub(crate) fn hold_outgoing_for_test(&self, class: TrafficClass) -> OwnedSemaphorePermit {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn hold_outgoing_for_test(&self, class: TrafficClass) -> OwnedSemaphorePermit {
         self.common.outgoing_hold[class as usize]
             .clone()
             .try_acquire_many_owned(TEST_HOLD_PERMITS)
@@ -1767,7 +1776,7 @@ impl WorkerClient {
 
     /// Takes `slots` caller slots of the lane to `target` for `class`.
     #[cfg(test)]
-    pub(crate) fn take_outgoing_for_test(
+    fn take_outgoing_for_test(
         &self,
         target: Uuid,
         class: TrafficClass,
@@ -1780,22 +1789,22 @@ impl WorkerClient {
             .expect("outgoing lane has the slots")
     }
 
-    #[cfg(test)]
-    pub(crate) async fn outgoing_lane_full_for_test(&self, class: TrafficClass) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn outgoing_lane_full_for_test(&self, class: TrafficClass) {
         self.common.outgoing_lane_full[class as usize]
             .notified()
             .await;
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 const TEST_HOLD_PERMITS: u32 = 1 << 20;
 
 /// Peer lanes' worth of caller slots one class may use in total. A paused
 /// peer holds at most its own lane (one handler capacity), so the others keep
 /// the rest (LIVE1), while the total in flight per class stays bounded by a
 /// constant instead of growing with the number of peers (RV-FINAL L1, M02).
-pub(crate) const OUTGOING_CLASS_LANES: usize = 4;
+pub const OUTGOING_CLASS_LANES: usize = 4;
 fn outgoing_class_slots(handler_slots: usize) -> usize {
     handler_slots
         .saturating_mul(OUTGOING_CLASS_LANES)
@@ -1804,7 +1813,7 @@ fn outgoing_class_slots(handler_slots: usize) -> usize {
 
 /// A caller slot taken ahead of its request by
 /// [`WorkerClient::reserve_outgoing`]. Dropping it frees the slot.
-pub(crate) struct OutgoingReservation {
+pub struct OutgoingReservation {
     target: Uuid,
     class: TrafficClass,
     slot: OutgoingSlot,
@@ -1814,7 +1823,7 @@ pub(crate) struct OutgoingReservation {
     _waiting: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
 }
 impl OutgoingReservation {
-    pub(crate) fn deadline_refusal(&self) -> RequestError {
+    pub fn deadline_refusal(&self) -> RequestError {
         RequestError::OutgoingLaneFull {
             class: self.class,
             direct: self._waiting.is_none(),
@@ -1826,7 +1835,7 @@ impl OutgoingReservation {
 struct OutgoingSlot {
     _slot: OwnedSemaphorePermit,
     _class: OwnedSemaphorePermit,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     _held: OwnedSemaphorePermit,
 }
 
@@ -2204,23 +2213,6 @@ fn identity_digest(group: &GroupIdentity) -> Result<Digest, ProtocolError> {
     serde_json::to_writer(&mut writer, group)
         .map_err(|_| malformed("invalid group fingerprint"))?;
     Ok(Digest::from_bytes(writer.0.finalize().into()))
-}
-fn peer_digest(
-    certificates: Option<&[rustls::pki_types::CertificateDer<'_>]>,
-) -> Result<Digest, ProtocolError> {
-    certificates
-        .and_then(|certs| certs.first())
-        .map(|certificate| Digest::from_bytes(Sha256::digest(certificate.as_ref()).into()))
-        .ok_or_else(|| malformed("missing worker certificate"))
-}
-/// `TCP_NODELAY`, and TCP keepalive so the kernel also notices a dead peer
-/// on a connection that carries no traffic.
-fn tune_socket(socket: &TcpStream) {
-    let _ = socket.set_nodelay(true);
-    let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(10));
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let keepalive = keepalive.with_interval(Duration::from_secs(5));
-    let _ = socket2::SockRef::from(socket).set_tcp_keepalive(&keepalive);
 }
 fn overloaded(message: &'static str) -> ProtocolError {
     ProtocolError::new(ErrorCode::Overloaded, message, Outcome::NotApplied)

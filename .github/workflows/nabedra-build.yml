@@ -523,14 +523,19 @@ jobs:
           set -o pipefail
           cargo test --locked --no-default-features --features oltp --lib --tests --no-run --timings \
             --message-format=json-render-diagnostics > ../build.json
+          cargo test --locked -p nabedra-transport --lib --no-run \
+            --message-format=json-render-diagnostics >> ../build.json
           cargo build --locked --no-default-features --features oltp --bin nabedra-db
           cd ..
           # kind, name, workspace-relative path of every test executable, then the server.
           jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null)
-                 | [(if (.target.kind | index("lib")) then "lib" else .target.kind[0] end), .target.name, .executable] | @tsv' build.json \
+                 | [(if .target.name == "nabedra_transport" then "transport"
+                     elif (.target.kind | index("lib")) then "lib"
+                     else .target.kind[0] end), .target.name, .executable] | @tsv' build.json \
             | sed "s#\t$GITHUB_WORKSPACE/#\t#" > bins.tsv
           printf 'server\tnabedra-db\tserver/target/debug/nabedra-db\n' >> bins.tsv
           test "$(awk -F'\t' '$1 == "lib"' bins.tsv | wc -l)" = 1
+          test "$(awk -F'\t' '$1 == "transport"' bins.tsv | wc -l)" = 1
           cat bins.tsv
       - uses: actions/upload-artifact@v4
         with:
@@ -707,7 +712,7 @@ jobs:
           lint -p nabedra-database --all-targets --no-default-features --features cache
           lint -p nabedra-database --all-targets --no-default-features --features cache,test-hooks
           lint -p nabedra-rt --all-targets
-          for crate in protocol resources oltp-types; do
+          for crate in protocol resources oltp-types transport; do
             if [ -f "$crate/Cargo.toml" ]; then
               lint -p "nabedra-$crate" --all-targets
             fi
@@ -966,6 +971,9 @@ jobs:
           tar -I zstd -xf oltp-bins.tar.zst && rm oltp-bins.tar.zst
           grep -qx "source=$TESTED_SHA" bins-source.txt || { echo "::error::the shared build is not $TESTED_SHA"; exit 1; }
           lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
+          transport=$(awk -F'\t' '$1 == "transport" {print $3}' bins.tsv)
+          test -n "$transport" && test -x "$GITHUB_WORKSPACE/$transport"
+          echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -977,10 +985,17 @@ jobs:
         run: |
           set -o pipefail
           "$NABEDRA_TEST_EXE" --test-threads 4 $QUARANTINE_SKIPS 2>&1 | tee ../oltp-lib.log
+      - name: Transport library suite
+        if: ${{ !cancelled() }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          "$NABEDRA_TRANSPORT_TEST_EXE" --test-threads=1 2>&1 | tee ../oltp-transport.log
       - name: Integration tests
         if: ${{ !cancelled() }}
         working-directory: server
         run: |
+          set -o pipefail
           status=0
           for name in oltp_multiplex oltp_worker_queue worker_pool executor protocol; do
             exe=$(awk -F'\t' -v n="$name" '$1 == "test" && $2 == n {print $3}' ../bins.tsv)
@@ -1311,6 +1326,9 @@ jobs:
           tar -I zstd -xf oltp-bins.tar.zst && rm oltp-bins.tar.zst
           grep -qx "source=$TESTED_SHA" bins-source.txt || { echo "::error::the shared build is not $TESTED_SHA"; exit 1; }
           lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
+          transport=$(awk -F'\t' '$1 == "transport" {print $3}' bins.tsv)
+          test -n "$transport" && test -x "$GITHUB_WORKSPACE/$transport"
+          echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -1369,6 +1387,9 @@ jobs:
           tar -I zstd -xf oltp-bins.tar.zst && rm oltp-bins.tar.zst
           grep -qx "source=$TESTED_SHA" bins-source.txt || { echo "::error::the shared build is not $TESTED_SHA"; exit 1; }
           lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
+          transport=$(awk -F'\t' '$1 == "transport" {print $3}' bins.tsv)
+          test -n "$transport" && test -x "$GITHUB_WORKSPACE/$transport"
+          echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -1407,6 +1428,21 @@ jobs:
         run: |
           set -o pipefail
           NABEDRA_TEST_DIRECT_OLTP=off "$NABEDRA_TEST_EXE" --test-threads 4 $QUARANTINE_SKIPS 2>&1 | tee ../artifacts/oltp-lib-direct-off.log
+      - name: OLTP integration tests, direct_oltp off
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.mode == 'off' }}
+        working-directory: server
+        env:
+          NABEDRA_TEST_DIRECT_OLTP: "off"
+        run: |
+          set -o pipefail
+          status=0
+          for name in oltp_multiplex oltp_worker_queue worker_pool executor protocol; do
+            exe=$(awk -F'\t' -v n="$name" '$1 == "test" && $2 == n {print $3}' ../bins.tsv)
+            [ -n "$exe" ] || { echo "::error::integration test $name was not built"; status=1; continue; }
+            echo "     Running $name ($exe)" | tee -a ../artifacts/oltp-integration-direct-off.log
+            "$GITHUB_WORKSPACE/$exe" 2>&1 | tee -a ../artifacts/oltp-integration-direct-off.log || status=1
+          done
+          exit "$status"
       - name: OLTP acceptance, direct_oltp ${{ matrix.mode }} (no AWS, no benchmarks)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
@@ -1866,6 +1902,9 @@ jobs:
           tar -I zstd -xf oltp-bins.tar.zst && rm oltp-bins.tar.zst
           grep -qx "source=$TESTED_SHA" bins-source.txt || { echo "::error::the shared build is not $TESTED_SHA"; exit 1; }
           lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
+          transport=$(awk -F'\t' '$1 == "transport" {print $3}' bins.tsv)
+          test -n "$transport" && test -x "$GITHUB_WORKSPACE/$transport"
+          echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -1913,6 +1952,9 @@ jobs:
           tar -I zstd -xf oltp-bins.tar.zst && rm oltp-bins.tar.zst
           grep -qx "source=$TESTED_SHA" bins-source.txt || { echo "::error::the shared build is not $TESTED_SHA"; exit 1; }
           lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
+          transport=$(awk -F'\t' '$1 == "transport" {print $3}' bins.tsv)
+          test -n "$transport" && test -x "$GITHUB_WORKSPACE/$transport"
+          echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -1924,7 +1966,28 @@ jobs:
           TESTS: ${{ inputs.tests }}
           REPEAT: ${{ inputs.repeat }}
           MODE: ${{ matrix.mode }}
-        run: python3 ../scripts/ci_repeat_tests.py --mode "$MODE" --repeat "$REPEAT" --log ../tests.log $TESTS >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          read -r -a names <<< "$TESTS"
+          server_cases=()
+          transport_cases=()
+          for name in "${names[@]}"; do
+            case "$name" in
+              transport::*) transport_cases+=("$name") ;;
+              *) server_cases+=("$name") ;;
+            esac
+          done
+          repeat() {
+            python3 ../scripts/ci_repeat_tests.py --mode "$MODE" --repeat "$REPEAT" \
+              --log ../tests.log "$@" >> "$GITHUB_STEP_SUMMARY"
+          }
+          status=0
+          if [ "${#server_cases[@]}" -gt 0 ]; then
+            repeat --executable "$NABEDRA_TEST_EXE" "${server_cases[@]}" || status=1
+          fi
+          if [ "${#transport_cases[@]}" -gt 0 ]; then
+            repeat --executable "$NABEDRA_TRANSPORT_TEST_EXE" "${transport_cases[@]}" || status=1
+          fi
+          exit "$status"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -1956,6 +2019,9 @@ jobs:
           tar -I zstd -xf oltp-bins.tar.zst && rm oltp-bins.tar.zst
           grep -qx "source=$TESTED_SHA" bins-source.txt || { echo "::error::the shared build is not $TESTED_SHA"; exit 1; }
           lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
+          transport=$(awk -F'\t' '$1 == "transport" {print $3}' bins.tsv)
+          test -n "$transport" && test -x "$GITHUB_WORKSPACE/$transport"
+          echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"

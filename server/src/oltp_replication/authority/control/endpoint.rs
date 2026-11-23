@@ -16,6 +16,7 @@ use crate::{
             timestamp::{ScopedTimestampEpoch, TimestampReply},
         },
         multiplex::*,
+        peer_directory::MAX_VIEW_REVOCATIONS,
         service_rpc::{ParticipantClient, StatusClient, TimestampClient},
         queue_access::AuthorityReader,
         types::*,
