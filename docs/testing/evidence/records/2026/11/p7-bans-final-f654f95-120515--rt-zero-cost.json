@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "p7-bans-final-f654f95-120515--rt-zero-cost.log",
+      "sha256": "a53d5cf949611f5eae5b053ab31665689e9b1a3d57eb8892bb5bce5955d3553e"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "rt-zero-cost",
+  "duration_s": 1232.928,
+  "guarantees": [
+    "OLTP-G13"
+  ],
+  "kind": "P",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T12:08:37.078105+00:00",
+    "request_id": "p7-bans-final-f654f95-120515",
+    "runner": "GitHub Actions 1000005789",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45170967427"
+  },
+  "scenarios": [
+    "O09"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "f654f95e63dbd0047fd072673d27c23287da1ab8",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
