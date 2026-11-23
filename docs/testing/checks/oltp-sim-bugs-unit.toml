@@ -1,0 +1,11 @@
+id = "oltp-sim-bugs-unit"
+module = "testing"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+command = ["python3", "-m", "unittest", "test_sim_bugs"]
+cwd = "scripts/testing"
+timeout_s = 300
+needs = []
+result_parser = "unittest"

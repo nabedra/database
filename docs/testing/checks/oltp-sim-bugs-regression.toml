@@ -1,0 +1,14 @@
+id = "oltp-sim-bugs-regression"
+module = "oltp"
+kinds = ["U"]
+# Tooling: each phase 10 patch, applied in a scratch worktree, makes its original regression test
+# fail, and the test passes without it (ACC3's is the O15 acceptance scenario). The command builds
+# the OLTP library tests once clean and once per patch in server/target/sim-bugs.
+guarantees = []
+scenarios = []
+tiers = ["T3"]
+command = ["python3", "scripts/testing/sim_bugs.py", "verify", "--set", "direct", "--jobs", "4"]
+cwd = "."
+timeout_s = 18000
+needs = []
+result_parser = "exit-code"
