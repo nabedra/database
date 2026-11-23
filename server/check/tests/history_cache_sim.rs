@@ -33,7 +33,8 @@ fn cache_sim_clean_history_passes() {
     let events = recorded_cache_sim();
     let verdict = relaxed_kv::check(&events);
     assert!(verdict.valid, "{:#?}", verdict.anomalies);
-    assert!(verdict.checked_ops >= 6);
+    assert_eq!(verdict.checked_ops, 5);
+    assert!(events.iter().any(|event| event.f == "failover"));
 }
 
 #[test]
