@@ -24,7 +24,9 @@ mod mutants;
 
 const FAULT_MS: u64 = 20_000;
 const HEAL_MS: u64 = 15_000;
-const REGRESSION_SEEDS: &[u64] = &[12, 14, 16, 20, 21, 37, 38, 46, 55, 65];
+const REGRESSION_SEEDS: &[u64] = &[
+    7, 12, 14, 16, 20, 21, 37, 38, 46, 55, 65, 115, 198, 211, 219,
+];
 const FIRST_WORKER: u64 = 11;
 const MIB: usize = 1 << 20;
 const REPLAY: &str = concat!(
