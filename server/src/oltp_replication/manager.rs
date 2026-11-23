@@ -57,7 +57,7 @@ pub(crate) use data_factory::damage_replacement::{
 };
 pub(crate) use data_factory::{DataGroupClient, DataGroupFactory, DataGroupSpec};
 pub(crate) use local::{
-    GroupPlacement, LocalOperatorPermit, LocalWorker, RegisteredConfig, RegisteredSystemGroups,
+    GroupPlacement, LocalOperatorPermit, LocalWorker, RegisteredConfig, RegisteredRestore, RegisteredSystemGroups,
     RegisteredWorker, SystemPlacement,
 };
 pub(crate) type Managed<C, M> = Arc<RaftConsensus<C, M>>;
