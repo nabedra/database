@@ -19,14 +19,15 @@ RUN case "$NABEDRA_ENGINE" in olap|oltp|cache) ;; *) exit 2 ;; esac && \
 # an empty stub. The stubs stay: the image build never compiles them, and keeping them
 # means test-only changes do not rebuild the image. The workspace crates' stub outputs
 # are cleaned so the real sources always rebuild, whatever their timestamps. The
-# dev-only `nabedra-check` member is never built here; it needs only its manifest and an
-# empty crate root, which stay in place so the workspace keeps loading.
+# dev-only `nabedra-check` and `nabedra-sim` members need only their manifests and
+# empty crate roots so Cargo can load the workspace.
 COPY server/Cargo.toml server/Cargo.lock ./
 COPY server/kv/Cargo.toml ./kv/
 COPY server/check/Cargo.toml ./check/
 COPY server/rt/Cargo.toml ./rt/
-RUN mkdir -p src kv/src check/src rt/src tests examples /out/timings && \
-    echo 'fn main() {}' > src/main.rs && : > src/lib.rs && : > kv/src/lib.rs && : > check/src/lib.rs && : > rt/src/lib.rs && \
+COPY server/sim/Cargo.toml ./sim/
+RUN mkdir -p src kv/src check/src rt/src sim/src tests examples /out/timings && \
+    echo 'fn main() {}' > src/main.rs && : > src/lib.rs && : > kv/src/lib.rs && : > check/src/lib.rs && : > rt/src/lib.rs && : > sim/src/lib.rs && \
     awk -F'"' '/^\[\[(test|example)\]\]/ { dir = ($0 ~ /test/) ? "tests" : "examples"; next } \
                /^\[/ { dir = "" } \
                dir != "" && /^name *=/ { print dir "/" $2 ".rs" }' Cargo.toml | xargs -r touch && \

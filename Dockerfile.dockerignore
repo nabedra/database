@@ -9,6 +9,7 @@
 !server/check/Cargo.toml
 !server/rt/Cargo.toml
 !server/rt/src/
+!server/sim/Cargo.toml
 !server/src/
 !orm/python/pyproject.toml
 !orm/python/README.md
