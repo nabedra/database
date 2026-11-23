@@ -1,0 +1,46 @@
+{
+  "artifacts": [
+    {
+      "name": "p9-lsm-stepped-ab04598-122426--lsm-campaign-sim-smoke.log",
+      "sha256": "a66234aba278637992dcff73d5d8aebb3793ce0e3379f0868829357f1008ddb3"
+    }
+  ],
+  "assertions": {
+    "executed": 2,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "lsm-campaign-sim-smoke",
+  "duration_s": 15.584,
+  "guarantees": [
+    "LSM-G01",
+    "LSM-G02",
+    "LSM-G03"
+  ],
+  "kind": "S",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T12:24:58.477171+00:00",
+    "request_id": "p9-lsm-stepped-ab04598-122426",
+    "runner": "GitHub Actions 1000005868",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45173990803"
+  },
+  "scenarios": [
+    "LSM01",
+    "NS04",
+    "NS05"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "ab04598937c8df29ece20a514a9d4959438d7552",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
