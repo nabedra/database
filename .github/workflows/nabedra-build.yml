@@ -847,7 +847,7 @@ jobs:
           retention-days: 14
 
   check-tests:
-    name: nabedra-check tests
+    name: Shared Rust crate tests
     needs: revision
     if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',check-tests,')
     runs-on: ubuntu-24.04
@@ -863,7 +863,14 @@ jobs:
             echo "nabedra-check tests not-run: this revision predates the crate." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          RUST_TEST_THREADS=4 cargo test --locked -p nabedra-check --no-fail-fast 2>&1 | tee ../check-test.log
+          packages=(-p nabedra-check)
+          if [ -f protocol/Cargo.toml ]; then
+            packages+=(-p nabedra-protocol)
+          fi
+          if [ -f resources/Cargo.toml ]; then
+            packages+=(-p nabedra-resources)
+          fi
+          RUST_TEST_THREADS=4 cargo test --locked "${packages[@]}" --no-fail-fast 2>&1 | tee ../check-test.log
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
