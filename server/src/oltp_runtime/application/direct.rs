@@ -1129,7 +1129,7 @@ impl DirectGateway {
                 }
                 Err(DirectSendError::NotApplied(error)) => {
                     if error.code == ErrorCode::Unauthorized {
-                        return Err(if *uncertain { unknown() } else { error });
+                        return Err(error);
                     }
                     if error.code == ErrorCode::Overloaded && !*uncertain {
                         return Err(error);
