@@ -34,6 +34,30 @@ impl Backend {
         Listener::bind(address).await
     }
 
+    /// Bind a configured worker endpoint, including a hostname and port.
+    pub async fn bind_endpoint(self, endpoint: &str) -> io::Result<Listener> {
+        #[cfg(feature = "sim")]
+        if nabedra_rt::sim::world().is_some() {
+            if let Ok(addr) = endpoint.parse() {
+                return self.bind(addr).await;
+            }
+            let (host, port) = endpoint
+                .rsplit_once(':')
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            let port = port.parse().map_err(|_| io::ErrorKind::InvalidInput)?;
+            let addresses = self.resolve(host, port)?;
+            let mut error = io::ErrorKind::AddrNotAvailable.into();
+            for address in addresses {
+                match self.bind(address).await {
+                    Ok(listener) => return Ok(listener),
+                    Err(failed) => error = failed,
+                }
+            }
+            return Err(error);
+        }
+        net::TcpListener::bind(endpoint).await.map(Listener::from)
+    }
+
     #[inline]
     pub async fn dial(self, target: Target<'_>) -> io::Result<Conn> {
         self.connector.connect(target).await
