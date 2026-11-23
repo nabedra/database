@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "review-p10-det-2f2cfdd-113258--realenv-unit.log",
+      "sha256": "601f1fcecbca88551d58b16030a48e981c86355e97c174e2cb10e91c7809e03e"
+    }
+  ],
+  "assertions": {
+    "executed": 30,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "realenv-unit",
+  "duration_s": 1.117,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T11:33:55.633056+00:00",
+    "request_id": "review-p10-det-2f2cfdd-113258",
+    "runner": "GitHub Actions 1000005502",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45166195100"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "2f2cfdd0ca50f889cce41bf85cbe4705accd0b3d",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
