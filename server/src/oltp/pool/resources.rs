@@ -12,6 +12,8 @@ pub(super) use nabedra_resources::memory::{ByteReservation, ScratchBuffer, capac
 pub(crate) use nabedra_resources::memory::{
     DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease,
 };
+#[cfg(test)]
+pub(crate) use nabedra_resources::memory::RAFT_REPLICA_BYTES;
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
