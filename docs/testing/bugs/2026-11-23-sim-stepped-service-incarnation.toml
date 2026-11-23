@@ -1,0 +1,14 @@
+id = "SIM-STEPPED-SERVICE-INCARNATION"
+title = "An aborted task could register or drive services on a replacement node"
+class = "stale-route-topology-schema"
+module = "sim"
+guarantees = ["OLTP-G01"]
+scenarios = ["NS04", "O11"]
+found_by = "review"
+found_date = "2026-11-23"
+lowest_regression = "server/rt/src/sim/services/tests.rs::a_cancelled_incarnation_cannot_register_or_drive_restarted_services"
+seed = 23
+why_not_caught = "The restart test covered pathname access from a cancelled task. Stepped service registration and driving still selected cells by node ID."
+invariant_added = "Registration and driving require the caller's active incarnation, and service steps and destructors keep the context from registration."
+fix_commits = ["481743bbc757d482c167a00f31d8f6eafc3360e6"]
+revert_patch_ok = false
