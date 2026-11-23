@@ -246,7 +246,7 @@ fn ns04_ns05_ns17_node_cut_resolves_parked_and_queued_journal_items() {
     for power_loss in [false, true] {
         sim::run(23, |world| async move {
             world.add_node(1, NodeClock::default());
-            sim::in_node(1, async {
+            let image = sim::in_node(1, async {
                 let fs = FaultFs::new();
                 fs.create_dir_all_durable(Path::new("/j"));
                 let sink = Arc::new(StallSink::default());
@@ -311,7 +311,12 @@ fn ns04_ns05_ns17_node_cut_resolves_parked_and_queued_journal_items() {
                 drop(journal);
                 assert!(fs.calls().is_empty(), "journal attempted I/O after the cut");
 
-                world.restart(1);
+                image
+            })
+            .await;
+
+            world.restart(1);
+            sim::in_node(1, async {
                 let mut recovered = None;
                 for _ in 0..2 {
                     let sink = Arc::new(StallSink::default());
