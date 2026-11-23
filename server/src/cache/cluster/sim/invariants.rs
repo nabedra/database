@@ -1,0 +1,329 @@
+//! Invariants over controller commits and the actual records installed by workers.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
+
+use nabedra_check::history::{Event, EventType, NEMESIS};
+use nabedra_sim::Trace;
+use serde_json::json;
+
+use super::super::protocol::{Lease, Slot, Topology, WorkerId};
+use super::hooks::Observed;
+use crate::cache::command::{SLOT_COUNT, key_slot};
+
+pub(super) type Version = (u64, u16, u64, u64);
+type Digest = [u8; 20];
+
+#[derive(Default)]
+pub(super) struct Observations {
+    pub trace: Trace,
+    pub history: Vec<Event>,
+    pub violations: BTreeMap<&'static str, String>,
+    pub latest: Option<Topology>,
+    pub leases: BTreeMap<(u16, WorkerId), Lease>,
+    pub reset_slots: BTreeSet<u16>,
+    commits: BTreeMap<u64, (u64, u64, u64)>,
+    pub revisions: BTreeSet<(u64, u64)>,
+    applied: BTreeMap<u64, u64>,
+    served: BTreeMap<u16, (u64, WorkerId)>,
+    primary: BTreeMap<(Version, WorkerId), Digest>,
+    replicas: BTreeMap<(Version, WorkerId), (WorkerId, Digest)>,
+    pub check_replica_prefix: bool,
+}
+
+impl Observations {
+    pub fn new(check_replica_prefix: bool) -> Self {
+        Self {
+            trace: Trace::new().keep_full(nabedra_sim::trace::full_trace_requested()),
+            check_replica_prefix,
+            ..Self::default()
+        }
+    }
+
+    pub fn violate(&mut self, kind: &'static str, detail: String) {
+        self.violations.entry(kind).or_insert(detail);
+    }
+
+    pub fn crash(&mut self, node: u64) {
+        self.leases.retain(|(_, worker), _| worker.node != node);
+        self.applied.remove(&node);
+    }
+
+    pub fn committed(
+        &mut self,
+        node: u64,
+        index: u64,
+        term: u64,
+        leader: u64,
+        now: u64,
+        state: &Topology,
+        keys: &[String],
+    ) {
+        let mut hash = DefaultHasher::new();
+        state.hash(&mut hash);
+        let signature = (term, leader, hash.finish());
+        if let Some(prior) = self.applied.insert(node, index)
+            && prior > index
+        {
+            self.violate(
+                "MonotonicCommit",
+                format!("controller {node} applied {index} after {prior}"),
+            );
+        }
+        self.trace.record(
+            now,
+            format_args!(
+                "apply node={node} term={term} leader={leader} index={index} hash={:x}",
+                signature.2
+            ),
+        );
+        if let Some(prior) = self.commits.insert(index, signature) {
+            if prior != signature {
+                self.violate(
+                    "AppliedPrefixesAgree",
+                    format!("state differs at controller log index {index}"),
+                );
+            }
+            return;
+        }
+        self.revisions.insert((state.generation, state.revision));
+        if let Some(err) = invalid_placement(state) {
+            self.violate("SlotOwnership", err);
+        }
+        if self
+            .commits
+            .last_key_value()
+            .is_some_and(|(&last, _)| last > index)
+        {
+            return;
+        }
+        if let Some(prior) = self.latest.take() {
+            if prior.generation > state.generation || prior.revision > state.revision {
+                self.violate(
+                    "SlotOwnership",
+                    format!("controller topology went back at {index}"),
+                );
+            }
+            for (i, (old, new)) in prior.slots.iter().zip(&state.slots).enumerate() {
+                if new.epoch < old.epoch || (new.primary != old.primary && new.epoch == old.epoch) {
+                    self.violate("SlotOwnership", format!("slot {i} changed primary at the same epoch or went backwards at {index}"));
+                    break;
+                }
+            }
+            let cold = |old: Slot, new: Slot| old.epoch > 0 && new.cold && new.epoch > old.epoch;
+            for key in keys {
+                let slot = key_slot(key.as_bytes());
+                let Some((&old, &new)) = prior
+                    .slots
+                    .get(usize::from(slot))
+                    .zip(state.slots.get(usize::from(slot)))
+                else {
+                    continue;
+                };
+                let marker = if cold(old, new) {
+                    self.reset_slots.insert(slot);
+                    let true_ms = now + nabedra_rt::sim::EPOCH_MS;
+                    if old.lease.is_some_and(|lease| true_ms < lease.expires_ms) {
+                        self.violate(
+                            "LiveLeaseReset",
+                            format!(
+                                "slot {slot} reset at {true_ms} with a live grant {:?}",
+                                old.lease
+                            ),
+                        );
+                    }
+                    "cold-reset"
+                } else if old.primary.is_some() && old.primary != new.primary {
+                    "failover"
+                } else {
+                    continue;
+                };
+                self.history.push(event(
+                    EventType::Info,
+                    NEMESIS,
+                    marker,
+                    key,
+                    json!({"epoch": new.epoch}),
+                    now,
+                ));
+            }
+        }
+        self.latest = Some(state.clone());
+    }
+
+    pub fn observe(&mut self, node: u64, event: Observed, now: u64) {
+        match event {
+            Observed::Lease {
+                worker,
+                slot,
+                writable,
+                epoch,
+                lease,
+            } => {
+                let key = (slot, worker);
+                let next = lease.filter(|_| writable);
+                let old = self.leases.remove(&key);
+                if let Some(lease) = next {
+                    self.leases.insert(key, lease);
+                }
+                if old != next {
+                    self.trace.record(
+                        now,
+                        format_args!("lease node={node} slot={slot} epoch={epoch} {next:?}"),
+                    );
+                }
+            }
+            Observed::Published {
+                worker,
+                generation,
+                slot,
+                epoch,
+                sequence,
+                digest,
+            } => {
+                self.primary
+                    .insert(((generation, slot, epoch, sequence), worker), digest);
+                self.trace.record(now, format_args!("publish node={node} slot={slot} epoch={epoch} seq={sequence} digest={digest:x?}"));
+            }
+            Observed::ReplicaApplied {
+                worker,
+                source,
+                generation,
+                slot,
+                epoch,
+                sequence,
+                digest,
+            } => {
+                let version = (generation, slot, epoch, sequence);
+                self.replicas.insert((version, worker), (source, digest));
+                if self.check_replica_prefix {
+                    self.replica_prefix(version, worker, source, digest);
+                }
+                self.trace.record(now, format_args!("replica node={node} source={} slot={slot} epoch={epoch} seq={sequence} digest={digest:x?}", source.node));
+            }
+            Observed::Served {
+                worker,
+                slot,
+                epoch,
+            } => {
+                if let Some((last, owner)) = self.served.get(&slot).copied()
+                    && (epoch < last || (epoch == last && worker != owner))
+                {
+                    self.violate(
+                        "ServedEpochOrder",
+                        format!(
+                            "slot {slot} served epoch {epoch} on {node} after {last} on {}",
+                            owner.node
+                        ),
+                    );
+                }
+                self.served.insert(slot, (epoch, worker));
+            }
+            Observed::Charged {
+                worker,
+                slot,
+                slot_bytes,
+                slot_limit,
+                actor_bytes,
+                actor_limit,
+            } => {
+                if slot_bytes > slot_limit || actor_bytes > actor_limit {
+                    self.violate("MemoryCap", format!("worker {} slot {slot}: slot {slot_bytes}/{slot_limit}, actor {actor_bytes}/{actor_limit}", worker.node));
+                }
+            }
+            Observed::Installed {
+                worker,
+                generation,
+                revision,
+            } => {
+                if (generation, revision) != (1, 0)
+                    && !self.revisions.contains(&(generation, revision))
+                {
+                    self.violate(
+                        "RedirectAgrees",
+                        format!(
+                            "worker {} installed uncommitted topology {generation}/{revision}",
+                            worker.node
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    fn replica_prefix(
+        &mut self,
+        version: Version,
+        worker: WorkerId,
+        source: WorkerId,
+        digest: Digest,
+    ) {
+        match self.primary.get(&(version, source)) {
+            Some(expected) if *expected == digest => {}
+            Some(_) => self.violate(
+                "ReplicaPrefix",
+                format!(
+                    "worker {} differs from primary {} at {version:?}",
+                    worker.node, source.node
+                ),
+            ),
+            None => {
+                let (generation, slot, epoch, sequence) = version;
+                let any_prior = self
+                    .primary
+                    .range(
+                        ((generation, slot, epoch, 0), source)
+                            ..=((generation, slot, epoch, sequence), source),
+                    )
+                    .any(|(&(_, owner), _)| owner == source);
+                if any_prior {
+                    self.violate(
+                        "ReplicaNotAhead",
+                        format!(
+                            "worker {} reports unobserved source sequence {version:?} from {}",
+                            worker.node, source.node
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn invalid_placement(topology: &Topology) -> Option<String> {
+    if topology.slots.len() != SLOT_COUNT {
+        return Some(format!(
+            "committed topology has {} slots",
+            topology.slots.len()
+        ));
+    }
+    let initialized = topology.slots.iter().any(|slot| slot.primary.is_some());
+    for (index, slot) in topology.slots.iter().enumerate() {
+        let primary = slot.primary.and_then(|id| topology.workers.get(&id.node));
+        let replica = slot.replica.and_then(|id| topology.workers.get(&id.node));
+        if initialized && (primary.is_none() || slot.epoch == 0)
+            || slot.replica.is_some() && replica.is_none()
+            || primary
+                .zip(replica)
+                .is_some_and(|(p, r)| p.id.node == r.id.node || p.zone == r.zone)
+        {
+            return Some(format!(
+                "committed slot {index} has invalid placement {slot:?}"
+            ));
+        }
+    }
+    None
+}
+
+pub(super) fn event(
+    kind: EventType,
+    process: u64,
+    f: &str,
+    key: &str,
+    value: serde_json::Value,
+    now: u64,
+) -> Event {
+    let mut event = Event::new(kind, process, f).with_key(key).with_value(value);
+    event.time_ns = Some((nabedra_rt::sim::EPOCH_MS + now) * 1_000_000);
+    event
+}
