@@ -529,13 +529,13 @@ struct DurableNamespace {
 impl DurableNamespace {
     fn apply(&mut self, effect: &PendingEffect) {
         let key = &effect.key;
-        if let Some(number) = effect.linked_dir() {
-            if let Some(old) = self.dir_links.insert(number, key.clone()) {
-                self.entries
-                    .get_mut(&old.parent)
-                    .expect("linked parent exists")
-                    .remove(&old.name);
-            }
+        if let Some(number) = effect.linked_dir()
+            && let Some(old) = self.dir_links.insert(number, key.clone())
+        {
+            self.entries
+                .get_mut(&old.parent)
+                .expect("linked parent exists")
+                .remove(&old.name);
         }
 
         let entries = self.entries.entry(key.parent).or_default();
@@ -864,10 +864,10 @@ impl State {
                     durable.apply(effect);
                     false
                 } else {
-                    !effect
+                    effect
                         .linked_dir()
                         .and_then(|number| synced_links.get(&number))
-                        .is_some_and(|&synced_at| synced_at > index)
+                        .is_none_or(|&synced_at| synced_at <= index)
                 }
             });
         }
