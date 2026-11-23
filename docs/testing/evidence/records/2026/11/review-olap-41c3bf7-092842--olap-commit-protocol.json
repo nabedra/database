@@ -1,0 +1,48 @@
+{
+  "artifacts": [
+    {
+      "name": "review-olap-41c3bf7-092842--olap-commit-protocol.log",
+      "sha256": "a8fe66bd7e5efe459e7aac6d09ae4e2255e1892df71a2bc159aa4cde7f9bd960"
+    }
+  ],
+  "assertions": {
+    "executed": 10,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "olap-commit-protocol",
+  "duration_s": 103.918,
+  "guarantees": [
+    "OLAP-G02",
+    "OLAP-G03",
+    "OLAP-G04",
+    "OLAP-G05"
+  ],
+  "kind": "S",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T09:30:15.851468+00:00",
+    "request_id": "review-olap-41c3bf7-092842",
+    "runner": "GitHub Actions 1000004629",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45147372560"
+  },
+  "scenarios": [
+    "T03",
+    "T04",
+    "T05",
+    "T06"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "41c3bf71e344e847a0a3ea15e2515b974385aa74",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
