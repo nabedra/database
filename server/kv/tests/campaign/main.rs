@@ -36,6 +36,8 @@ mod harness;
 mod oracle;
 mod regressions;
 mod shrink;
+#[cfg(feature = "sim")]
+mod sim;
 mod sleepy;
 mod workload;
 
@@ -155,6 +157,15 @@ fn sampled(
     total
 }
 
+fn enumerated_cut(n: u64) -> CutKind {
+    match n % 4 {
+        0 => CutKind::Crash,
+        1 => CutKind::Kill,
+        2 => CutKind::PowerLoss(n),
+        _ => CutKind::PowerLoss4k(n),
+    }
+}
+
 /// NS04: a crash at every mutating filesystem operation of a small run, each turned into a
 /// crash, kill, power-loss or 4 KiB power-loss image in turn.
 #[test]
@@ -183,13 +194,10 @@ fn ns04_ns10_crash_at_every_mutating_operation() {
             if only.is_some_and(|o| o != n) {
                 continue;
             }
-            let kind = match n % 4 {
-                0 => CutKind::Crash,
-                1 => CutKind::Kill,
-                2 => CutKind::PowerLoss(n),
-                _ => CutKind::PowerLoss4k(n),
-            };
-            let arm = [Step::ArmCrash { after: n, kind }];
+            let arm = [Step::ArmCrash {
+                after: n,
+                kind: enumerated_cut(n),
+            }];
             total.add(&run_or_shrink(&cfg, &steps, len, &arm, &wd));
         }
     }
