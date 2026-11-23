@@ -469,6 +469,15 @@ impl World {
         handle
     }
 
+    fn context_active(&self, context: Option<NodeContext>) -> bool {
+        context.is_none_or(|context| {
+            self.lock()
+                .nodes
+                .get(&context.id)
+                .is_some_and(|node| context.is_current(node))
+        })
+    }
+
     fn register<T>(&self, context: NodeContext, handle: &JoinHandle<T>) {
         let mut state = self.lock();
         match state.nodes.get_mut(&context.id) {
@@ -489,16 +498,24 @@ impl World {
     pub fn crash(&self, node: u64) {
         self.volumes.halt_node(node);
         net::crash(self, node);
-        let tasks = self.with_node(node, |entry| {
+        let (context, tasks, parked) = self.with_node(node, |entry| {
             entry.up = false;
             entry.frozen = false;
-            std::mem::take(&mut entry.tasks)
+            let context = NodeContext {
+                id: node,
+                incarnation: Some(entry.incarnation),
+            };
+            (
+                context,
+                std::mem::take(&mut entry.tasks),
+                std::mem::take(&mut entry.parked),
+            )
         });
-        let parked = self.with_node(node, |entry| std::mem::take(&mut entry.parked));
-        let dead = self.services.kill_node(node);
+        let dead = self.services.kill_node(context);
         self.emit(&SimEvent::Crash { node });
-        // Service destructors resolve node-local resources against the crashed node.
-        with_node_context(Some(self.node_context(node)), || drop(dead));
+        // Service destructors run here, after the services are dead and before any task
+        // is aborted. They keep the retired context even when the harness initiated the cut.
+        with_node_context(Some(context), || drop(dead));
         for task in tasks {
             task.abort();
         }
@@ -951,8 +968,11 @@ pub(crate) fn thread_sleep(duration: Duration) {
         Some(world) if !matches!(ROLE.get(), Role::Service(_)) => world,
         _ => return std::thread::sleep(duration),
     };
-    services::settle(&world, current_node());
-    world.pause_all(to_runtime_duration(duration));
+    let context = current_node_context();
+    if world.context_active(context) {
+        services::settle(&world, context);
+        world.pause_all(to_runtime_duration(duration));
+    }
 }
 
 /// Draws from the current node's stream, or the world's stream outside a node.
