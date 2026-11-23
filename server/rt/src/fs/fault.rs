@@ -258,6 +258,13 @@ impl Fault {
 
 type Ino = u64;
 
+#[cfg(all(unix, feature = "sim"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DescriptorInode {
+    File(Ino),
+    Directory(Ino),
+}
+
 #[derive(Clone, Debug, Default)]
 struct Inode {
     os: Vec<u8>,
@@ -1482,36 +1489,81 @@ impl FaultFs {
         result
     }
 
-    /// An exclusive lock on an existing file or directory, as `flock(LOCK_EX | LOCK_NB)`
-    /// on a descriptor of it: `WouldBlock` while another holder has it, `NotFound` if the
-    /// path does not exist. Unlike [`Fs::lock`] it never creates a file, and it is not a
-    /// mutating operation.
+    /// Resolves a descriptor's current name. Unlinked inodes have no usable name.
     #[cfg(all(unix, feature = "sim"))]
-    pub(crate) fn lock_existing(&self, path: &Path) -> io::Result<FsLock> {
+    pub(crate) fn descriptor_path(
+        &self,
+        inode: DescriptorInode,
+        opened_as: &Path,
+    ) -> io::Result<PathBuf> {
+        let state = self.state();
+        if state.crashed {
+            return Err(crashed());
+        }
+        state
+            .descriptor_path(inode, opened_as)
+            .map(Path::to_path_buf)
+    }
+
+    #[cfg(all(unix, feature = "sim"))]
+    pub(crate) fn stat_directory_descriptor(
+        &self,
+        ino: Ino,
+        opened_as: &Path,
+    ) -> io::Result<FsStat> {
+        let mut state = self.state();
+        let result = state.admit(FsOp::Stat, opened_as, false).and_then(|()| {
+            let path = state.descriptor_path(DescriptorInode::Directory(ino), opened_as)?;
+            state.stat(path)
+        });
+        state.log(FsOp::Stat, opened_as, None, 0, 0, result.is_ok());
+        result
+    }
+
+    #[cfg(all(unix, feature = "sim"))]
+    pub(crate) fn sync_directory_descriptor(&self, ino: Ino, opened_as: &Path) -> io::Result<()> {
+        let mut state = self.state();
+        let path = state
+            .descriptor_path(DescriptorInode::Directory(ino), opened_as)?
+            .to_path_buf();
+        state.sync_dir(&path)
+    }
+
+    /// Takes an advisory lock on an open inode without creating a pathname.
+    #[cfg(all(unix, feature = "sim"))]
+    pub(crate) fn lock_descriptor(
+        &self,
+        inode: DescriptorInode,
+        opened_as: &Path,
+        already_locked: bool,
+    ) -> io::Result<Option<FsLock>> {
         let mut state = self.state();
         let result = (|| {
-            state.admit(FsOp::Lock, path, false)?;
-            if let Some(ino) = state.os.files.get(path).copied() {
-                if !state.locks.insert(ino) {
-                    return Err(io::ErrorKind::WouldBlock.into());
-                }
-                Ok(FsLock::new(Box::new(FaultLockGuard {
-                    state: Arc::clone(&self.state),
-                    ino,
-                })))
-            } else if let Some(meta) = state.os.dirs.get(path).copied() {
-                if !state.directory_locks.insert(meta.ino) {
-                    return Err(io::ErrorKind::WouldBlock.into());
-                }
-                Ok(FsLock::new(Box::new(DirectoryLockGuard {
-                    state: Arc::clone(&self.state),
-                    ino: meta.ino,
-                })))
-            } else {
-                Err(not_found())
+            state.admit(FsOp::Lock, opened_as, false)?;
+            if let DescriptorInode::Directory(_) = inode {
+                state.descriptor_path(inode, opened_as)?;
             }
+            if already_locked {
+                return Ok(None);
+            }
+            let guard = match inode {
+                DescriptorInode::File(ino) if state.locks.insert(ino) => {
+                    FsLock::new(Box::new(FaultLockGuard {
+                        state: Arc::clone(&self.state),
+                        ino,
+                    }))
+                }
+                DescriptorInode::Directory(ino) if state.directory_locks.insert(ino) => {
+                    FsLock::new(Box::new(DirectoryLockGuard {
+                        state: Arc::clone(&self.state),
+                        ino,
+                    }))
+                }
+                _ => return Err(io::ErrorKind::WouldBlock.into()),
+            };
+            Ok(Some(guard))
         })();
-        state.log(FsOp::Lock, path, None, 0, 0, result.is_ok());
+        state.log(FsOp::Lock, opened_as, None, 0, 0, result.is_ok());
         result
     }
 
@@ -1527,6 +1579,50 @@ impl FaultFs {
 }
 
 impl State {
+    #[cfg(all(unix, feature = "sim"))]
+    fn descriptor_path(&self, inode: DescriptorInode, opened_as: &Path) -> io::Result<&Path> {
+        let moved = match inode {
+            DescriptorInode::File(ino) => self
+                .os
+                .files
+                .get_key_value(opened_as)
+                .filter(|(_, number)| **number == ino)
+                .map(|(path, _)| path)
+                .or_else(|| {
+                    self.os
+                        .files
+                        .iter()
+                        .find_map(|(path, &number)| (number == ino).then_some(path))
+                }),
+            DescriptorInode::Directory(ino) => self
+                .os
+                .dirs
+                .get_key_value(opened_as)
+                .filter(|(_, meta)| meta.ino == ino)
+                .map(|(path, _)| path)
+                .or_else(|| {
+                    self.os
+                        .dirs
+                        .iter()
+                        .find_map(|(path, meta)| (meta.ino == ino).then_some(path))
+                }),
+        };
+        moved.map(PathBuf::as_path).ok_or_else(not_found)
+    }
+
+    fn sync_dir(&mut self, dir: &Path) -> io::Result<()> {
+        let result = (|| {
+            self.admit(FsOp::SyncDir, dir, true)?;
+            self.require_dir(dir)?;
+            let number = self.os.dirs[dir].ino;
+            self.sync_entries(number);
+            self.collect_garbage();
+            Ok(())
+        })();
+        self.log(FsOp::SyncDir, dir, None, 0, 0, result.is_ok());
+        result
+    }
+
     /// `rename` of a file or directory (admitted already).
     fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
         if self.os.dirs.contains_key(from) && !is_root(from) {
@@ -1626,17 +1722,7 @@ impl Fs for FaultFs {
     }
 
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
-        let mut state = self.state();
-        let result = (|| {
-            state.admit(FsOp::SyncDir, dir, true)?;
-            state.require_dir(dir)?;
-            let number = state.os.dirs[dir].ino;
-            state.sync_entries(number);
-            state.collect_garbage();
-            Ok(())
-        })();
-        state.log(FsOp::SyncDir, dir, None, 0, 0, result.is_ok());
-        result
+        self.state().sync_dir(dir)
     }
 
     fn lock(&self, path: &Path) -> io::Result<FsLock> {
@@ -1716,6 +1802,11 @@ impl std::fmt::Debug for FaultFile {
 }
 
 impl FaultFile {
+    #[cfg(all(unix, feature = "sim"))]
+    pub(crate) fn descriptor_inode(&self) -> DescriptorInode {
+        DescriptorInode::File(self.ino)
+    }
+
     /// The metadata of the open inode (`fstat`): it follows the file across renames and
     /// after it is unlinked (`nlink` 0).
     pub fn stat(&self) -> io::Result<FsStat> {
