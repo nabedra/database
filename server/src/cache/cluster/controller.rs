@@ -5,6 +5,8 @@ mod machine;
 mod network;
 mod placement;
 #[cfg(all(test, feature = "sim"))]
+pub(super) use placement::MAX_MOVES_PER_WORKER;
+#[cfg(all(test, feature = "sim"))]
 mod simulation;
 mod state;
 
@@ -57,6 +59,7 @@ openraft::declare_raft_types!(
 type Raft = openraft::Raft<RaftConfig, Machine>;
 const RAFT_SESSIONS: usize = 8;
 const CONTROL_SESSIONS: usize = 56;
+pub(super) const RECONCILE_MS: u64 = 250;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -493,7 +496,7 @@ impl Controller {
     }
 
     async fn reconcile(&self) {
-        let mut ticks = interval(Duration::from_millis(250));
+        let mut ticks = interval(Duration::from_millis(RECONCILE_MS));
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticks.tick().await;

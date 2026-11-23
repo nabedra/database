@@ -6,7 +6,10 @@ use nabedra_check::{Gen, checker::relaxed_kv, history::write_jsonl};
 use nabedra_sim::{Filters, Nemesis, Profile, SeedRun, SweepConfig, sweep};
 use serde_json::json;
 
-use super::super::{clock::ClockMode, protocol::Admin};
+use super::super::{
+    clock::{ClockMode, MAX_UNCERTAINTY_NS},
+    protocol::Admin,
+};
 use super::harness::{Cluster, Config};
 use super::history::Op;
 use super::hooks::Knobs;
@@ -21,6 +24,7 @@ mod mutants;
 
 const FAULT_MS: u64 = 20_000;
 const HEAL_MS: u64 = 15_000;
+const REGRESSION_SEEDS: &[u64] = &[12, 14, 16, 20, 21, 37, 38, 46, 55, 65];
 const FIRST_WORKER: u64 = 11;
 const MIB: usize = 1 << 20;
 const REPLAY: &str = concat!(
@@ -259,7 +263,7 @@ async fn apply_action(
         Action::CrashWorker => {
             *worker_crashed = true;
             let node = if g.bool() { owner } else { replica };
-            cluster.crash(node);
+            cluster.lose_worker_ram(node);
             Some((700 + g.below(2_000), Action::RestartWorker(node)))
         }
     };
@@ -361,7 +365,7 @@ async fn assert_memory(cluster: &mut Cluster, keys: &[String]) {
     }
 }
 
-async fn cold_reset(cluster: &mut Cluster) {
+async fn cold_reset(cluster: &mut Cluster, lost_key: Option<&str>) {
     let nodes: Vec<_> = cluster.workers.keys().copied().collect();
     for &node in &nodes {
         cluster.crash(node);
@@ -381,7 +385,18 @@ async fn cold_reset(cluster: &mut Cluster) {
         );
     }
     cluster.step(HEAL_MS).await;
-    cluster.verify_quiescence(true).await;
+    let _ = cluster.verify_quiescence(true).await;
+    if let Some(key) = lost_key
+        && !matches!(
+            cluster.send(key, Op::Get, None).await,
+            Some(Response::Bulk(None))
+        )
+    {
+        cluster.violate(
+            "ColdStartEmpty",
+            format!("lost slot did not restart empty: {key}"),
+        );
+    }
 }
 
 fn result(cluster: &Cluster, seed: u64, workload: Workload) -> SeedRun {
@@ -396,11 +411,9 @@ fn result(cluster: &Cluster, seed: u64, workload: Workload) -> SeedRun {
         .map(|(kind, detail)| format!("{kind}: {detail}"))
         .collect();
     let options = relaxed_kv::Options {
-        expiry_tolerance_ns: 2
-            * (cluster.config.base_error_ns
-                + u64::from(cluster.config.declared_ppm) * cluster.now()
-                + 1000)
-            + 1_000_000,
+        // A serving clock bounds its interval to 10 ms. Include the
+        // millisecond round-up used by actors, regardless of repair duration.
+        expiry_tolerance_ns: MAX_UNCERTAINTY_NS + 1_000_000,
         ..relaxed_kv::Options::default()
     };
     let verdict =
@@ -513,9 +526,9 @@ fn run_seed(seed: u64, g: &mut Gen) -> SeedRun {
         }
         cluster.heal();
         cluster.step(HEAL_MS).await;
-        cluster.verify_quiescence(false).await;
-        if seed.is_multiple_of(16) {
-            cold_reset(&mut cluster).await;
+        let lost_key = cluster.verify_quiescence(false).await;
+        if lost_key.is_some() || seed.is_multiple_of(16) {
+            cold_reset(&mut cluster, lost_key.as_deref()).await;
         }
         result(&cluster, seed, workload)
     })
@@ -528,6 +541,7 @@ fn keep_history(dir: &Path, run: &SeedRun) {
 
 #[test]
 fn seed_sweep() {
+    let started = nabedra_rt::time::now_std();
     let config = SweepConfig::from_env("cache", REPLAY);
     let histories = std::env::var_os("NABEDRA_SIM_HISTORY_DIR").map(PathBuf::from);
     if let Some(dir) = &histories {
@@ -540,6 +554,21 @@ fn seed_sweep() {
         }
         run
     });
+    let elapsed = nabedra_rt::time::elapsed(started).as_secs_f64();
+    println!(
+        "Cache fault model ran {} seeds in {elapsed:.2}s ({:.2}s wall/seed, {} workers)",
+        report.count,
+        elapsed / report.count as f64,
+        config.jobs,
+    );
+    for seed in &report.seeds {
+        if REGRESSION_SEEDS.contains(&seed.seed) {
+            println!(
+                "Cache regression seed {}: passed={} trace={:016x} events={} virtual_ms={}",
+                seed.seed, seed.passed, seed.trace_hash, seed.trace_events, seed.virtual_ms,
+            );
+        }
+    }
     println!(
         "NABEDRA_SIM_SUMMARY {}",
         json!({

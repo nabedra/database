@@ -59,9 +59,7 @@ impl Observations {
         state: &Topology,
         keys: &[String],
     ) {
-        let mut hash = DefaultHasher::new();
-        state.hash(&mut hash);
-        let signature = (term, leader, hash.finish());
+        let signature = (term, leader, topology_hash(state));
         if let Some(prior) = self.applied.insert(node, index)
             && prior > index
         {
@@ -288,6 +286,38 @@ impl Observations {
             }
         }
     }
+}
+
+fn topology_hash(topology: &Topology) -> u64 {
+    let Topology {
+        generation,
+        revision,
+        workers,
+        slots,
+        draining,
+        drained,
+        ready_primaries,
+        ready_replicas,
+    } = topology;
+    let mut hash = DefaultHasher::new();
+    (
+        generation,
+        revision,
+        workers,
+        draining,
+        drained,
+        ready_primaries,
+        ready_replicas,
+        slots.len(),
+    )
+        .hash(&mut hash);
+    // Renewals usually leave long runs of identical placement and grants.
+    // Hash the complete map as (length, slot) runs to avoid hashing the same
+    // identifiers and grant for every member of a run on every Raft apply.
+    for run in slots.chunk_by(|left, right| left == right) {
+        (run.len(), run[0]).hash(&mut hash);
+    }
+    hash.finish()
 }
 
 fn invalid_placement(topology: &Topology) -> Option<String> {

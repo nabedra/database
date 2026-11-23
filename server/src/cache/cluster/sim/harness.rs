@@ -16,8 +16,11 @@ use uuid::Uuid;
 
 use super::super::{
     clock::{Clock, ClockMode},
-    controller::{self, SimConfig, SimRaftMetrics},
-    protocol::{Admin, CONTROL_FRAME, Member, Reply, Request, Slot, Topology, VERSION, WorkerId},
+    controller::{self, MAX_MOVES_PER_WORKER, RECONCILE_MS, SimConfig, SimRaftMetrics},
+    protocol::{
+        Admin, CONTROL_FRAME, Member, Progress, RENEW_MS, Reply, Request, Slot, Topology, VERSION,
+        WorkerId,
+    },
     transport::{Endpoint, PeerTls},
     worker::{self, SlotSample, Worker},
 };
@@ -41,6 +44,22 @@ const PEER: u16 = 9202;
 const RESP: u16 = 9203;
 const MIB: usize = 1 << 20;
 const START_BUDGET: u64 = 15_000;
+
+fn replica_repair_budget_ms(pending: usize) -> u64 {
+    // K03 Convergence is separate from the 15 s client/primary deadline.
+    // With links healed and three distinct zones, a full worker can delay the
+    // next slot by one 64-move wave. Budget the whole backlog as serial waves.
+    // Each wave has two placement ticks (start and commit), three worker
+    // heartbeats (install intent, report baseline, install the assignment),
+    // and a full round of 256-slot polls on the longest possible peer lane.
+    // Reserve another renewal interval per wave for bounded transport,
+    // snapshot continuation and tick alignment. Try the assertions as soon as
+    // all copies are ready. A stuck transfer still exhausts this deadline.
+    let sweep_ms =
+        SLOT_COUNT.div_ceil(worker::PROBES) as u64 * worker::REPLICATION_POLL.as_millis() as u64;
+    let wave_ms = 4 * RENEW_MS + 2 * RECONCILE_MS + sweep_ms;
+    pending.div_ceil(MAX_MOVES_PER_WORKER) as u64 * wave_ms
+}
 
 pub(super) type Observed = Arc<Mutex<Observations>>;
 type Controller = (SimRaftMetrics, tokio::task::JoinHandle<io::Result<()>>);
@@ -127,6 +146,7 @@ pub(super) struct Cluster {
     next_admin: u64,
     next_clock_sync_ms: u64,
     ttl_left: BTreeMap<String, u64>,
+    crashed_worker: Option<WorkerId>,
 }
 
 impl Cluster {
@@ -224,6 +244,7 @@ impl Cluster {
             next_admin: 0,
             next_clock_sync_ms: 10_000,
             ttl_left: BTreeMap::new(),
+            crashed_worker: None,
         };
         for node in CONTROLLERS {
             cluster.start_controller(node).await;
@@ -326,6 +347,11 @@ impl Cluster {
         self.workers.remove(&node);
         self.controllers.remove(&node);
         self.observed.lock().unwrap().crash(node);
+    }
+
+    pub fn lose_worker_ram(&mut self, node: u64) {
+        self.crashed_worker = Some(self.workers[&node].id());
+        self.crash(node);
     }
 
     pub fn link(&self, from: u64, to: u64, blocked: bool) {
@@ -669,13 +695,104 @@ impl Cluster {
         reply.map(|(response, _)| response)
     }
 
-    pub async fn verify_quiescence(&mut self, cold: bool) {
+    /// Returns a witness key if the fault schedule destroyed every copy of a slot.
+    pub async fn verify_quiescence(&mut self, cold: bool) -> Option<String> {
+        let (latest, reports) = self.recovery_reports().await;
+        let mut lost = BTreeSet::new();
+        for (index, &slot) in latest.slots.iter().enumerate() {
+            let index = index as u16;
+            let primary = baseline(&reports, index, slot.epoch, slot.primary);
+            if primary.is_some_and(|p| p.serving_primary) {
+                continue;
+            }
+            let lost_primary = !cold
+                && slot.primary.is_some_and(|owner| {
+                    self.crashed_worker == Some(owner) && latest.member(owner).is_none()
+                });
+            if lost_primary
+                && [slot.replica, slot.moving.map(|m| m.target)]
+                    .into_iter()
+                    .all(|copy| {
+                        copy.is_none_or(|id| {
+                            latest.member(id).is_none()
+                                || progress_at(&reports, index, slot.epoch, id)
+                                    .is_some_and(|report| !report.baseline)
+                        })
+                    })
+            {
+                // The old incarnation held the current epoch and can never
+                // return. A newly assigned copy may still lack its baseline
+                // when that primary crashes. Require an explicit fenced reset.
+                lost.insert(index);
+            } else {
+                self.violate(
+                    "Liveness",
+                    format!("slot {index} has no authorized primary after healing"),
+                );
+            }
+        }
+        if !lost.is_empty() {
+            self.trace(format_args!(
+                "RAM loss removed all baselines on {} slots, first {}",
+                lost.len(),
+                lost.first().unwrap()
+            ));
+        }
+        self.verify_final_reads(cold, &lost).await;
+        self.verify_replica_convergence(cold, &lost, &latest, reports)
+            .await;
+        let slot = *lost.first()?;
+        let witness = (0..)
+            .map(|number| format!("cache-sim:lost:{number}"))
+            .find(|key| key_slot(key.as_bytes()) == slot)
+            .expect("generate a key for the lost slot");
+        let reply = self.send(&witness, Op::Get, None).await;
+        self.check_lost_reply(&witness, reply);
+        Some(witness)
+    }
+
+    async fn recovery_reports(&self) -> (Topology, BTreeMap<WorkerId, Vec<Progress>>) {
+        let latest = self.observed.lock().unwrap().latest.clone().unwrap();
+        let mut reports = BTreeMap::new();
+        for (&node, worker) in &self.workers {
+            let mut progress = sim::in_node(node, worker.sim_progress()).await;
+            progress.sort_unstable_by_key(|report| report.slot);
+            reports.insert(worker.id(), progress);
+        }
+        (latest, reports)
+    }
+
+    async fn verify_replica_convergence(
+        &mut self,
+        cold: bool,
+        lost: &BTreeSet<u16>,
+        latest: &Topology,
+        reports: BTreeMap<WorkerId, Vec<Progress>>,
+    ) {
+        let mut pending = pending_copies(latest, &reports, lost);
+        let budget = replica_repair_budget_ms(pending.0);
+        let start = self.now();
+        while pending.0 > 0 && self.now() - start < budget {
+            self.step(RENEW_MS.min(budget - (self.now() - start))).await;
+            let (latest, reports) = self.recovery_reports().await;
+            pending = pending_copies(&latest, &reports, lost);
+        }
+        if pending.0 > 0 {
+            self.violate(
+                "Convergence",
+                format!(
+                    "{} unconverged slots (first {}) after {budget}ms replica repair budget",
+                    pending.0, pending.1
+                ),
+            );
+        }
+
         let slots: BTreeSet<_> = self
             .keys
             .iter()
             .map(|key| key_slot(key.as_bytes()))
             .collect();
-        for slot in slots {
+        for slot in slots.difference(lost).copied() {
             let placement = self.slot(slot);
             let primary = self.sample(placement.primary, slot).await;
             let replica = self.sample(placement.replica, slot).await;
@@ -701,36 +818,20 @@ impl Cluster {
             }
         }
 
-        let latest = self
-            .observed
-            .lock()
-            .unwrap()
-            .latest
-            .clone()
-            .expect("initialized topology");
-        let mut available = vec![false; SLOT_COUNT];
-        for (&node, worker) in &self.workers {
-            let reports = sim::in_node(node, worker.sim_progress()).await;
-            for report in reports {
-                let index = usize::from(report.slot);
-                let slot = latest.slots[index];
-                if report.serving_primary
-                    && slot.primary == Some(worker.id())
-                    && slot.epoch == report.epoch
-                {
-                    available[index] = true;
-                }
-            }
+        for violation in self.raft.take_violations() {
+            self.violate("Raft", violation);
         }
-        if let Some(slot) = available.iter().position(|ready| !ready) {
-            self.violate(
-                "Liveness",
-                format!("slot {slot} has no authorized primary after healing"),
-            );
-        }
+    }
+
+    async fn verify_final_reads(&mut self, cold: bool, lost: &BTreeSet<u16>) {
         let keys = Arc::clone(&self.keys);
         for key in keys.iter() {
-            match self.send(key, Op::Get, None).await {
+            let reply = self.send(key, Op::Get, None).await;
+            if lost.contains(&key_slot(key.as_bytes())) {
+                self.check_lost_reply(key, reply);
+                continue;
+            }
+            match reply {
                 Some(Response::Bulk(value)) => {
                     if cold && value.is_some() {
                         self.violate("ColdStartEmpty", format!("old key {key} still readable"));
@@ -752,8 +853,14 @@ impl Cluster {
                 );
             }
         }
-        for violation in self.raft.take_violations() {
-            self.violate("Raft", violation);
+    }
+
+    fn check_lost_reply(&self, key: &str, reply: Option<Response>) {
+        if !matches!(&reply, Some(Response::Error(error)) if error.starts_with(b"CLUSTERDOWN")) {
+            self.violate(
+                "Liveness",
+                format!("slot without a baseline must fail closed for {key}, got {reply:?}"),
+            );
         }
     }
 
@@ -765,6 +872,53 @@ impl Cluster {
         }
         sim::in_node(id.node, worker.sim_slot(slot)).await
     }
+}
+
+fn baseline(
+    reports: &BTreeMap<WorkerId, Vec<Progress>>,
+    slot: u16,
+    epoch: u64,
+    worker: Option<WorkerId>,
+) -> Option<&Progress> {
+    progress_at(reports, slot, epoch, worker?).filter(|report| report.baseline)
+}
+
+fn progress_at(
+    reports: &BTreeMap<WorkerId, Vec<Progress>>,
+    slot: u16,
+    epoch: u64,
+    worker: WorkerId,
+) -> Option<&Progress> {
+    let reports = reports.get(&worker)?;
+    let report = &reports[reports.binary_search_by_key(&slot, |r| r.slot).ok()?];
+    (report.epoch == epoch).then_some(report)
+}
+
+fn pending_copies(
+    topology: &Topology,
+    reports: &BTreeMap<WorkerId, Vec<Progress>>,
+    lost: &BTreeSet<u16>,
+) -> (usize, u16) {
+    let mut pending = 0;
+    let mut first = 0;
+    for (index, slot) in topology.slots.iter().enumerate() {
+        let index = index as u16;
+        if lost.contains(&index) {
+            continue;
+        }
+        let primary = baseline(reports, index, slot.epoch, slot.primary);
+        let replica = baseline(reports, index, slot.epoch, slot.replica);
+        if !primary
+            .zip(replica)
+            .is_some_and(|(p, r)| p.sequence == r.sequence)
+        {
+            if pending == 0 {
+                first = index;
+            }
+            pending += 1;
+        }
+    }
+    (pending, first)
 }
 
 fn slots_agree(response: Response, topology: &Topology) -> bool {

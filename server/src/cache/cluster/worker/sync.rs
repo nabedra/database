@@ -21,7 +21,7 @@ use super::peer::{self, Data, Identity, PROBES, Probe};
 use super::{OUTBOUND_SESSIONS, PEER_FRAME, Worker, invalid};
 
 const LOCAL_DEADLINE: Duration = Duration::from_millis(250);
-const REPLICATION_POLL: Duration = Duration::from_millis(25);
+pub(in crate::cache::cluster) const REPLICATION_POLL: Duration = Duration::from_millis(25);
 
 pub(super) async fn control(
     worker: Worker,

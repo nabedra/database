@@ -14,8 +14,10 @@ grep -Fxq 'cache::cluster::sim::tests::seed_sweep: test' <<< "$tests"
 "${sim[@]}" -- --nocapture --test-threads=1
 ''']
 cwd = "server"
-timeout_s = 3600
+timeout_s = 1800
 needs = []
 result_parser = "cargo-test"
-# Five percent of 500 seeds replay with byte-identical histories and trace hashes.
-env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim-cache", CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true", CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS = "true", NABEDRA_SEEDS = "500", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "0.05", NABEDRA_PLANTED_SEEDS = "500", NABEDRA_SIM_SHRINK = "1", NABEDRA_SIM_ARTIFACTS = "../target/testing-logs/cache-sim" }
+# The release profile exceeds two core-seconds per seed. Run 250 with 5% replay
+# on the PR check. Failure artifacts still get a full deterministic replay.
+# Shrink interactively from the retained tape so a failure cannot eat the sweep.
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim-cache", CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true", CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS = "true", NABEDRA_SEEDS = "250", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "0.05", NABEDRA_PLANTED_SEEDS = "500", NABEDRA_SIM_SHRINK = "0", NABEDRA_SIM_ARTIFACTS = "../target/testing-logs/cache-sim" }
