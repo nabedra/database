@@ -5,6 +5,17 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work=${NABEDRA_CACHE_WORK:-"$repo/.nabedra/workflows/native-cache"}
 binary=${NABEDRA_CACHE_BINARY:-"$work/native-target/release/nabedra-db"}
 packages=${NABEDRA_CACHE_ORM_ARTIFACTS:-"$work/orm-artifacts-final"}
+if [[ ${1:-} == --from-checkout ]]; then
+  shift
+  artifacts=$(mktemp -d)
+  trap 'rm -rf -- "$artifacts"' EXIT
+  docker buildx build --build-arg NABEDRA_ENGINE=cache --build-arg BUILD_JOBS=2 \
+    --target cache-release --output "type=local,dest=$artifacts/release" "$repo"
+  python3 -m pip download --disable-pip-version-check --only-binary=:all: --no-deps \
+    --dest "$artifacts/wheels" redis==6.4.0
+  binary="$artifacts/release/nabedra-db"
+  packages="$artifacts/wheels"
+fi
 result=${1:-"$work/cluster-acceptance"}
 mkdir -p "$result"
 result=$(cd "$result" && pwd)
@@ -23,3 +34,9 @@ docker run --rm --network none --memory 3g --memory-swap 3g ${cpu[@]+"${cpu[@]}"
     cp /native /tmp/nabedra-db
     exec python /source/scripts/cache-acceptance/cluster.py --binary /tmp/nabedra-db --output /result
   '
+# Include these artifact identities in the check's attested stdout digest.
+(
+  cd "$result"
+  cat cluster.json
+  sha256sum K03.jsonl
+)
