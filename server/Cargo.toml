@@ -14,7 +14,11 @@ include = ["/src/", "/tests/", "/examples/", "/Cargo.lock", "/README.md", "/LICE
 
 [workspace]
 # `nabedra-kv` builds and tests alone: `cargo test -p nabedra-kv`.
-members = [".", "kv", "check", "rt"]
+members = [".", "kv", "check", "rt", "sim"]
+# Plain `cargo build` and `cargo test` here build only the server, as before `sim` joined.
+# The simulation crates are members but never default members: they enable
+# `nabedra-rt/sim`, which `src/main.rs` refuses to compile. Name them with `-p`.
+default-members = ["."]
 exclude = ["events", "fuzz"]
 
 [lib]
