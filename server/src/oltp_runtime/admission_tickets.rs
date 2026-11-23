@@ -150,9 +150,12 @@ impl AdmissionTicketIssuer for AdmissionTickets {
                     index: 0,
                 },
             };
+            // The nonce binds the remote proof to this live guard. Keep OS randomness in simulation.
+            #[allow(clippy::disallowed_methods)]
+            let nonce = Uuid::new_v4();
             let ticket = OwnerAdmissionTicket {
                 owner: self.local,
-                nonce: nabedra_rt::ids::uuid_v4(),
+                nonce,
                 status_group: status.clone(),
                 expected,
             };
