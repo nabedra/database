@@ -10,3 +10,4 @@ cwd = "server"
 timeout_s = 1800
 needs = []
 result_parser = "cargo-test"
+env = { CARGO_TARGET_DIR = "target/sim", RUSTFLAGS = "--cfg tokio_unstable" }
