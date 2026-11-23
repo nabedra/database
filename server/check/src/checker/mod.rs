@@ -13,6 +13,7 @@
 
 use serde::Serialize;
 
+pub mod direct;
 pub mod edn;
 pub mod linearizable;
 pub mod outcome;
