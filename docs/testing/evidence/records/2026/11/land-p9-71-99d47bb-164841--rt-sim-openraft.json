@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p9-71-99d47bb-164841--rt-sim-openraft.log",
+      "sha256": "512a4c6ef24b575c053ef0307cbf33783ea9d540ea1f9a08d347f342278552ce"
+    }
+  ],
+  "assertions": {
+    "executed": 310,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "rt-sim-openraft",
+  "duration_s": 35.098,
+  "guarantees": [
+    "OLTP-G02"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T15:49:06.699448+00:00",
+    "request_id": "land-p9-71-99d47bb-164841",
+    "runner": "GitHub Actions 1000006440",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45209385853"
+  },
+  "scenarios": [
+    "O09"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "99d47bbf82c3827011b09836586e3137bb4212af",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
