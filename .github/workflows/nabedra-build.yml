@@ -707,7 +707,7 @@ jobs:
           lint -p nabedra-database --all-targets --no-default-features --features cache
           lint -p nabedra-database --all-targets --no-default-features --features cache,test-hooks
           lint -p nabedra-rt --all-targets
-          for crate in protocol resources oltp-types; do
+          for crate in protocol resources oltp-types transport; do
             if [ -f "$crate/Cargo.toml" ]; then
               lint -p "nabedra-$crate" --all-targets
             fi

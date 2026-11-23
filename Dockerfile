@@ -39,9 +39,9 @@ RUN mkdir -p src kv/src check/src rt/src protocol/src resources/src oltp-types/s
                dir != "" && /^name *=/ { print dir "/" $2 ".rs" }' Cargo.toml | xargs -r touch && \
     cargo build --locked --release ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} --timings \
         --bin nabedra-db --no-default-features --features "$(cat /src/features)" && \
-    cargo clean --offline --locked --release -p nabedra-database -p nabedra-kv -p nabedra-rt -p nabedra-protocol -p nabedra-resources -p nabedra-oltp-types && \
+    cargo clean --offline --locked --release -p nabedra-database -p nabedra-kv -p nabedra-rt -p nabedra-protocol -p nabedra-resources -p nabedra-oltp-types -p nabedra-transport && \
     mv target/cargo-timings/cargo-timing.html /out/timings/dependencies.html && \
-    rm -rf target/cargo-timings src kv/src rt/src protocol/src resources/src oltp-types/src
+    rm -rf target/cargo-timings src kv/src rt/src protocol/src resources/src oltp-types/src transport/src
 
 # The real sources. The layer below keeps only the binary and the timing report, so a
 # `mode=max` cache export does not carry the server crate's build outputs.
@@ -50,6 +50,7 @@ COPY server/rt/src ./rt/src
 COPY server/protocol/src ./protocol/src
 COPY server/resources/src ./resources/src
 COPY server/oltp-types/src ./oltp-types/src
+COPY server/transport/src ./transport/src
 COPY server/src ./src
 RUN cargo build --locked --release ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} --timings \
         --bin nabedra-db --no-default-features --features "$(cat /src/features)" && \

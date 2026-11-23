@@ -1,0 +1,11 @@
+id = "oltp-peer-transport-component"
+module = "oltp"
+kinds = ["U"]
+guarantees = []
+scenarios = ["D10", "O05", "C07"]
+tiers = ["T1"]
+command = ["cargo", "test", "--locked", "-j", "2", "--no-default-features", "--features", "oltp", "--lib", "oltp_replication::multiplex::transport::", "--", "--test-threads=1"]
+cwd = "server"
+timeout_s = 1800
+needs = []
+result_parser = "cargo-test"
