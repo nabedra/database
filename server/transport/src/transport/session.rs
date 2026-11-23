@@ -656,7 +656,7 @@ impl ClientSession {
                     }
                     written = Some((nabedra_rt::time::now(), self.received.load(Ordering::Relaxed)));
                 }
-                _ = check.tick(), if poll_directory => {
+                _ = check.tick() => {
                     if !enrolled(&*directory, self.identity) {
                         break;
                     }
@@ -1526,7 +1526,7 @@ pub(super) async fn serve(
                     break false;
                 }
             }
-            _ = check.tick() => {
+            _ = check.tick(), if poll_directory => {
                 let bound = *lock(&state.bound);
                 if bound.is_some_and(|peer| !enrolled(&*transport.common.directory, peer)) {
                     break false;
