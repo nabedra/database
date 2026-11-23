@@ -49,13 +49,19 @@ type Ran = (WorkerId, Duration, Option<String>);
 
 /// Submits `jobs` jobs at once, each from its own task, and returns what each recorded,
 /// in submission order.
-async fn run_jobs(world: &Arc<World>, pool: &WorkerPool, jobs: usize) -> Vec<Ran> {
+async fn run_jobs(
+    world: &Arc<World>,
+    pool: &WorkerPool,
+    jobs: usize,
+    max_workers: usize,
+) -> Vec<Ran> {
+    let request = pool.request_id();
     let mut handles = Vec::new();
     for _ in 0..jobs {
         let pool = pool.clone();
         let world = world.clone();
         handles.push(nabedra_rt::task::spawn(async move {
-            pool.submit(0, move |id, _| {
+            pool.submit_request(request, max_workers, 1, move |id, _| {
                 Ok((id, world.elapsed(), nabedra_rt::task::current_service()))
             })
             .await
@@ -82,29 +88,33 @@ fn c04_sim_pool_runs_count_worker_tasks_and_overlaps_count_jobs() {
         // One node task per worker, and no thread (P6 plants count + 1).
         assert_eq!(world.live_tasks(NODE) - before, 3);
         assert!(world.services(NODE).is_empty());
-        let ran = run_jobs(&world, &pool, 12).await;
-        let ids: BTreeSet<WorkerId> = ran.iter().map(|(id, _, _)| *id).collect();
-        assert_eq!(
-            ids,
-            BTreeSet::from([0, 1, 2]),
-            "worker ids stay in 0..count"
-        );
-        for (id, _, service) in &ran {
+        for cap in 1..=3 {
+            let start = world.elapsed();
+            let ran = run_jobs(&world, &pool, 100, cap).await;
+            let ids: BTreeSet<_> = ran.iter().map(|(id, _, _)| *id).collect();
             assert_eq!(
-                service.as_deref(),
-                Some(format!("nabedra-worker-{id}").as_str())
+                ids,
+                BTreeSet::from([0, 1, 2]),
+                "worker ids stay in 0..count"
             );
+            for (id, _, service) in &ran {
+                assert_eq!(
+                    service.as_deref(),
+                    Some(format!("nabedra-worker-{id}").as_str())
+                );
+            }
+            // The cap counts distinct compute nodes. All 100 jobs share one request
+            // and use three concurrent slots on this one node, even under cap 1.
+            let mut waves = std::collections::BTreeMap::<Duration, usize>::new();
+            for (_, at, _) in &ran {
+                *waves.entry(*at - start).or_default() += 1;
+            }
+            let expected: Vec<_> = (1..=34)
+                .map(|wave| (cost * wave, if wave == 34 { 1 } else { 3 }))
+                .collect();
+            assert_eq!(waves.into_iter().collect::<Vec<_>>(), expected);
+            assert_eq!(pool.scheduler().usage(), vec![(0, 0, 0)]);
         }
-        // Three slots hold a job each at once: 12 jobs of 10 ms finish in four waves.
-        let mut waves = std::collections::BTreeMap::<Duration, usize>::new();
-        for (_, at, _) in &ran {
-            *waves.entry(*at).or_default() += 1;
-        }
-        assert_eq!(
-            waves.into_iter().collect::<Vec<_>>(),
-            vec![(cost, 3), (cost * 2, 3), (cost * 3, 3), (cost * 4, 3)]
-        );
-        assert_eq!(pool.scheduler().usage(), vec![(0, 0, 0)]);
         threads.shutdown().await.unwrap();
         assert_eq!(world.live_tasks(NODE), before, "every worker task ended");
     });
@@ -292,12 +302,16 @@ fn q4_sim_block_on_completes_ready_futures_and_contains_one_that_needs_time() {
     });
 }
 
-/// Sets a flag when dropped.
-struct Witness(Arc<AtomicBool>);
+/// Records whether the worker still owns this job's task when the task drops.
+struct Witness {
+    owner: tokio::task::AbortHandle,
+    dropped_before_owner_exit: Arc<AtomicBool>,
+}
 
 impl Drop for Witness {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.dropped_before_owner_exit
+            .store(!self.owner.is_finished(), Ordering::SeqCst);
     }
 }
 
@@ -307,12 +321,25 @@ fn sim_shutdown_drains_accepted_jobs_and_aborts_tasks_jobs_spawned() {
         world.insert_ext(JobCost::fixed(ms(5)));
         let before = world.live_tasks(NODE);
         let (pool, threads) = pool(2);
-        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_before_owner_exit = Arc::new(AtomicBool::new(false));
+        let owners: Vec<_> = threads
+            .workers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|worker| match &worker.thread {
+                WorkerJoin::Task(task) => task.abort_handle(),
+                WorkerJoin::Thread(_) => panic!("the worker was not simulated"),
+            })
+            .collect();
         let spawned = pool
             .submit(0, {
-                let dropped = dropped.clone();
-                move |_, runtime| {
-                    let witness = Witness(dropped);
+                let dropped_before_owner_exit = dropped_before_owner_exit.clone();
+                move |id, runtime| {
+                    let witness = Witness {
+                        owner: owners[id].clone(),
+                        dropped_before_owner_exit,
+                    };
                     drop(runtime.spawn(async move {
                         let _witness = witness;
                         std::future::pending::<()>().await;
@@ -339,15 +366,8 @@ fn sim_shutdown_drains_accepted_jobs_and_aborts_tasks_jobs_spawned() {
             vec![0, 1, 2, 3],
             "shutdown drained every accepted job"
         );
-        // Aborted tasks are dropped when the runtime next runs them.
-        for _ in 0..10 {
-            if dropped.load(Ordering::SeqCst) && world.live_tasks(NODE) == before {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
         assert!(
-            dropped.load(Ordering::SeqCst),
+            dropped_before_owner_exit.load(Ordering::SeqCst),
             "the job's task outlived its worker"
         );
         assert_eq!(world.live_tasks(NODE), before);
@@ -384,12 +404,51 @@ fn sim_crash_fails_accepted_jobs_instead_of_hanging() {
     });
 }
 
+#[test]
+fn sim_pool_requires_a_live_node_scope() {
+    run(10, |world| async move {
+        let coordinator = Handle::current();
+        assert!(WorkerPool::start(NonZeroUsize::MIN, coordinator.clone()).is_err());
+        world.add_node(NODE, NodeClock::default());
+        world.crash(NODE);
+        in_node(NODE, async move {
+            assert!(WorkerPool::start(NonZeroUsize::MIN, coordinator).is_err());
+        })
+        .await;
+    });
+}
+
+#[test]
+fn f03_sim_crash_wakes_admission_waiters_even_before_workers_poll() {
+    simulate(14, |_world| async move {
+        let resources = WorkerResources {
+            max_threads: 1,
+            memory_limit_bytes: 1000,
+            task_memory_limit_bytes: 900,
+            control_memory_reserve_bytes: 100,
+        };
+        let (pool, threads) =
+            WorkerPool::start_with_resources(resources, Handle::current()).unwrap();
+        let held = pool.scheduler().reserve_memory(1, 0, 900).await.unwrap();
+        let mut job = Box::pin(pool.submit_request(2, 1, 100, |_, _| Ok(())));
+        let mut memory = Box::pin(pool.scheduler().reserve_memory(3, 0, 100));
+        assert!(poll_once(job.as_mut()).is_pending());
+        assert!(poll_once(memory.as_mut()).is_pending());
+        nabedra_rt::sim::world().unwrap().crash(NODE);
+        assert!(tokio::time::timeout(ms(20), job).await.unwrap().is_err());
+        assert!(tokio::time::timeout(ms(20), memory).await.unwrap().is_err());
+        drop(held);
+        assert_eq!(pool.scheduler().usage(), vec![(0, 0, 0)]);
+        assert!(threads.shutdown().await.is_err());
+    });
+}
+
 /// The schedule of one seeded run: each job's worker and the virtual time it ran.
 fn schedule(seed: u64) -> Vec<(WorkerId, Duration)> {
     simulate(seed, |world| async move {
         world.insert_ext(JobCost::seeded(seed, ms(20)));
         let (pool, threads) = pool(3);
-        let ran = run_jobs(&world, &pool, 24).await;
+        let ran = run_jobs(&world, &pool, 24, 3).await;
         threads.shutdown().await.unwrap();
         ran.into_iter().map(|(id, at, _)| (id, at)).collect()
     })
