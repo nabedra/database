@@ -45,6 +45,139 @@ fn counter(left: u32) -> Counter {
     }
 }
 
+struct TestService<F> {
+    step: F,
+    bell: Condvar,
+}
+
+impl<F: FnMut() -> Step + Send + 'static> Stepped for TestService<F> {
+    fn step(&mut self) -> Step {
+        (self.step)()
+    }
+
+    fn doorbell(&self) -> &Condvar {
+        &self.bell
+    }
+
+    fn run(self) {
+        unreachable!("simulation only")
+    }
+}
+
+#[test]
+fn maximum_jitter_delays_each_step_once() {
+    run(74, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.set_jitter(1_000, ms(1));
+        let handle = spawn_in(1, "counter", counter(1));
+        assert_eq!(world.service_steps(), 0);
+        tokio::time::sleep(ms(10)).await;
+        assert!(handle.is_finished());
+        assert_eq!(world.service_steps(), 2);
+    });
+}
+
+#[test]
+fn inline_drive_rechecks_a_service_rung_late_in_an_idle_pass() {
+    run(75, |world| async move {
+        world.add_node(1, NodeClock::default());
+        let queue = Arc::new(Queue::default());
+        spawn_in(
+            1,
+            "consumer",
+            Consumer {
+                queue: queue.clone(),
+            },
+        );
+        let mut notify = Some(queue.clone());
+        spawn_in(
+            1,
+            "notifier",
+            TestService {
+                step: move || {
+                    if let Some(queue) = notify.take() {
+                        queue.push(99);
+                    }
+                    Step::Idle(None)
+                },
+                bell: Condvar::new(),
+            },
+        );
+        let result = in_node(1, async {
+            task::drive_until("late doorbell", || queue.done().pop())
+        })
+        .await;
+        assert_eq!(result, Some(("consumer".to_owned(), 99)));
+    });
+}
+
+#[test]
+fn inline_exit_wakes_a_parked_driver() {
+    run(78, |world| async move {
+        world.add_node(1, NodeClock::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let should_stop = stop.clone();
+        let handle = spawn_in(
+            1,
+            "idle",
+            TestService {
+                step: move || {
+                    if should_stop.load(Ordering::SeqCst) {
+                        Step::Exit
+                    } else {
+                        Step::Idle(None)
+                    }
+                },
+                bell: Condvar::new(),
+            },
+        );
+        tokio::time::sleep(ms(1)).await;
+        assert_eq!(world.live_tasks(1), 1);
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        tokio::time::sleep(ms(1)).await;
+        assert_eq!(world.live_tasks(1), 0);
+    });
+}
+
+#[test]
+fn cross_node_join_runs_on_the_service_nodes_clock() {
+    run(76, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.add_node(
+            2,
+            NodeClock {
+                drift_ppm: 500_000,
+                ..NodeClock::default()
+            },
+        );
+        let mut deadline = None;
+        let handle = spawn_in(
+            2,
+            "timer",
+            TestService {
+                step: move || {
+                    assert_eq!(crate::sim::current_node(), Some(2));
+                    let now = time::now_std();
+                    let at = *deadline.get_or_insert(now + ms(300));
+                    if now >= at {
+                        Step::Exit
+                    } else {
+                        Step::Idle(Some(at))
+                    }
+                },
+                bell: Condvar::new(),
+            },
+        );
+        in_node(1, async {
+            handle.join().unwrap();
+            assert_eq!(crate::sim::current_node(), Some(1));
+        })
+        .await;
+        assert_eq!(world.paused(), ms(200));
+    });
+}
+
 /// A queue consumer: idle on its doorbell until an item or the close flag arrives.
 #[derive(Default)]
 struct Queue {
@@ -434,7 +567,7 @@ fn a_panicking_step_finishes_the_service_and_join_returns_the_panic() {
 }
 
 /// The states of node 1's stepped services, as seen from a destructor.
-type Seen = Arc<Mutex<Vec<(&'static str, Vec<ServiceState>)>>>;
+type Seen = Arc<Mutex<Vec<(&'static str, Option<u64>, Vec<ServiceState>)>>>;
 
 fn record(seen: &Seen, who: &'static str) {
     let states = crate::sim::world()
@@ -443,7 +576,9 @@ fn record(seen: &Seen, who: &'static str) {
         .into_iter()
         .map(|info| info.state)
         .collect();
-    seen.lock().unwrap().push((who, states));
+    seen.lock()
+        .unwrap()
+        .push((who, crate::sim::current_node(), states));
 }
 
 /// Records, when its state drops, what the crash had done by then.
@@ -503,12 +638,20 @@ fn a_crash_kills_services_before_any_destructor_runs() {
         // the runtime next runs. Both see every service dead.
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![("service", vec![ServiceState::Dead, ServiceState::Dead])]
+            vec![(
+                "service",
+                Some(1),
+                vec![ServiceState::Dead, ServiceState::Dead]
+            )]
         );
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(
             seen.lock().unwrap()[1],
-            ("task", vec![ServiceState::Dead, ServiceState::Dead])
+            (
+                "task",
+                Some(1),
+                vec![ServiceState::Dead, ServiceState::Dead]
+            )
         );
         // Dead services are never stepped again and join at once.
         tokio::time::sleep(ms(100)).await;
@@ -637,10 +780,30 @@ fn traced_run(seed: u64) -> Vec<String> {
 
 #[test]
 fn same_seed_same_trace() {
-    let first = traced_run(42);
-    assert!(first.len() > 80, "{} events", first.len());
-    assert_eq!(first, traced_run(42), "a replay of one seed differs");
-    assert_ne!(first, traced_run(43), "jitter does not follow the seed");
+    fn trace_hash(events: &[String]) -> u64 {
+        events
+            .iter()
+            .flat_map(|event| event.bytes().chain([0]))
+            .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+            })
+    }
+
+    let mut hashes = std::collections::BTreeSet::new();
+    for seed in 42..47 {
+        let first = traced_run(seed);
+        let replay = traced_run(seed);
+        assert!(first.len() > 80, "seed {seed}: {} events", first.len());
+        let hash = trace_hash(&first);
+        assert_eq!(hash, trace_hash(&replay), "replay hash for seed {seed}");
+        assert_eq!(first, replay, "replay events for seed {seed}");
+        eprintln!(
+            "seed {seed}: {} events, trace hash {hash:016x}",
+            first.len()
+        );
+        hashes.insert(hash);
+    }
+    assert!(hashes.len() > 1, "jitter does not follow the seed");
 }
 
 #[test]
@@ -726,6 +889,39 @@ fn block_on_inline_drives_services_until_the_future_completes() {
         })
         .await;
         assert_eq!(value.unwrap(), 99);
+    });
+}
+
+#[test]
+fn block_on_inline_drives_services_between_self_waking_polls() {
+    run(77, |world| async move {
+        world.add_node(1, NodeClock::default());
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        spawn_in(
+            1,
+            "sender",
+            Sender {
+                bell: Condvar::new(),
+                sender: Some(sender),
+            },
+        );
+        let mut polls = 0;
+        let value = in_node(1, async move {
+            task::block_on_inline(std::future::poll_fn(|cx| {
+                polls += 1;
+                assert!(polls <= 2, "the service must run between polls");
+                match receiver.try_recv() {
+                    Ok(value) => std::task::Poll::Ready(value),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }))
+        })
+        .await;
+        assert_eq!(value, 99);
     });
 }
 
@@ -827,6 +1023,21 @@ fn freeze_stops_a_node_without_aborting_it() {
         tokio::time::sleep(ms(1)).await;
         // The overdue sleep fires at once, and the late task runs.
         assert_eq!(ticks.load(Ordering::SeqCst), 106);
+    });
+}
+
+#[test]
+fn a_panicking_extension_callback_keeps_the_slot() {
+    run(79, |world| async move {
+        world.insert_ext(42_u32);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            world.with_ext(|value: &mut u32| {
+                *value += 1;
+                panic!("extension callback");
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(world.with_ext(|value: &mut u32| *value), Some(43));
     });
 }
 
