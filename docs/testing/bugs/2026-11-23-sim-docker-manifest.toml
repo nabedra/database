@@ -1,0 +1,15 @@
+# Evidence: OLTP image jobs 137656318002 and 137658784090
+id = "SIM-DOCKER-MANIFEST"
+title = "The server image build omitted the simulation workspace manifest"
+class = "other"
+module = "testing"
+guarantees = []
+scenarios = []
+found_by = "review"
+found_date = "2026-11-23"
+lowest_regression = "Load the Dockerfile dependency stage with cargo metadata --no-deps --locked"
+seed = "unknown"
+why_not_caught = "The base PR gate checks the source checkout. The Docker build, which uses a filtered context, is opt-in."
+invariant_added = "Include each workspace member's manifest and crate root in the dependency stage, including development-only members. The existing docker job exercises that stage."
+fix_commits = ["8a9b604a386d9a250a45c46ac2ec7191e823011c"]
+revert_patch_ok = true
