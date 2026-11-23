@@ -936,8 +936,8 @@ def queue_survival(binary, test_executable):
             for name in (survivor, removed):
                 record = read_record(cluster, name, read)
                 assert assert_record(record, run, read) == originals[read['request_id']], record
-            assertion('O14', 'same-run-rejoin-idempotency',
-                      'Q04/Q05: the restarted gateway reused the surviving pending read and rejected a changed body. Both workers kept the original request and snapshot.')
+            evidence('O14', 'same-run-rejoin-idempotency', scenarios=['Q04', 'Q05'],
+                     same_body_status=202, changed_body_status=status, receipt_state=pending[1]['state'])
 
             for directory in directories:
                 for request in (read, mutation):
@@ -953,7 +953,7 @@ def queue_survival(binary, test_executable):
         prepare_rolling_restart(cluster, owner, survivor)
         launch_retained(cluster, owner)
         same_run_ready(cluster, run, WORKERS, 3)
-        assertion('O14', 'same-run-request-and-context', 'Successive API and worker losses preserved exact bytes, identity, read timestamp, schema, authorization and outcomes. The restored gateway returned the historical row and one mutation result, and all three workers became ready on the original run.')
+        assertion('O14', 'same-run-request-and-context', 'Successive API and worker losses preserved exact bytes, identity, read timestamp, schema, authorization and outcomes. The restored gateway attached an identical retry, refused a changed body, and returned the historical row and one mutation result. All three workers became ready on the original run.')
 
 
 def count_pressure(test_executable):
