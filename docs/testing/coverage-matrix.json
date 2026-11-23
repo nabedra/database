@@ -1,7 +1,40 @@
 {
   "allow_unattested": false,
-  "head": "8498d0ee2c61a3df8557091412665b0e73f47bdc",
-  "ignored_records": [],
+  "head": "bc96d218b16f700051df6eb3b69ff6010dcbb802",
+  "ignored_records": [
+    {
+      "path": "land-p8a-77-45b0d77-191450--cache-store-model.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p8a-77-45b0d77-191450--crate-graph.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p8a-77-45b0d77-191450--licenses.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p8a-77-45b0d77-191450--protocol-unit.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p8a-77-45b0d77-191450--queue-scheduler-properties.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p8a-77-45b0d77-191450--rt-unit.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p8a-77-45b0d77-191450--rt-zero-cost.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p8a-77-45b0d77-191450--scheduler-properties.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -121,6 +154,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -181,6 +215,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -2503,6 +2538,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -3786,6 +3822,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -3853,6 +3890,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -3913,6 +3951,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -3975,6 +4014,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -3992,5 +4032,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
