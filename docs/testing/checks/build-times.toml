@@ -1,0 +1,24 @@
+id = "build-times"
+module = "testing"
+kinds = ["P"]
+guarantees = []
+scenarios = []
+# Nightly, and dispatched on each phase 8 extraction PR head. Times are recorded, not gated; the
+# check fails only when a measurement is incomplete or the head breaks a rebuild-set rule.
+tiers = ["T2"]
+# The base is the pre-split baseline (BLD6). The runner's preinstalled SDKs are removed first
+# to make room for the independent debug, test and incremental outputs of the two revisions.
+command = ["bash", "-ec", '''
+if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+    sudo -n rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
+    df -h /
+fi
+exec python3 scripts/testing/build_times.py --base 53a5716f844aa9690739daed32fd335c68bc0f8a --head HEAD \
+    --record target/testing-logs/build-times.json
+''']
+cwd = "."
+# The edit loop dominates: about 5 minutes per probe, round and side on a 4-vCPU runner (estimate
+# from a local run). Lower this once the first Actions runs give real numbers.
+timeout_s = 14400
+needs = []
+result_parser = "exit-code"
