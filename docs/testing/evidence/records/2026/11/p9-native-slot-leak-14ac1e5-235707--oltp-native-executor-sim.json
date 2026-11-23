@@ -1,0 +1,47 @@
+{
+  "artifacts": [
+    {
+      "name": "p9-native-slot-leak-14ac1e5-235707--oltp-native-executor-sim.log",
+      "sha256": "722fb6ee96cd6596f978089861b0f0df7860dffce7bafff4bcbff1939bc6ffb6"
+    }
+  ],
+  "assertions": {
+    "executed": 3,
+    "failed": 1,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-native-executor-sim",
+  "duration_s": 171.809,
+  "guarantees": [
+    "OLTP-G09",
+    "SCHED-G01"
+  ],
+  "kind": "S U",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T23:06:21.263875+00:00",
+    "request_id": "p9-native-slot-leak-14ac1e5-235707",
+    "runner": "GitHub Actions 1000008494",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45284448806"
+  },
+  "scenarios": [
+    "C04",
+    "C06",
+    "F01",
+    "F02",
+    "F03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "14ac1e5ffb5afbf6666f75589f6d29165d056d92",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
