@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-transport-tls-528f859-143924--oltp-peer-transport-preflight.log",
+      "sha256": "48b6443b88ce5e42365e4e149d0431ff05e4d87d10ff0ed3240af9e5a7006aad"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-peer-transport-preflight",
+  "duration_s": 119.155,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T13:42:45.722433+00:00",
+    "request_id": "p8-transport-tls-528f859-143924",
+    "runner": "GitHub Actions 1000006386",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45186069622"
+  },
+  "scenarios": [
+    "C07",
+    "M02",
+    "O06"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "528f859943f6a73de79a715de4440b989ca11560",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
