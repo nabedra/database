@@ -290,6 +290,7 @@ pub struct World {
     /// ran ([`World::pause_all`]).
     paused_nanos: AtomicU64,
     services: services::Registry,
+    volumes: volumes::Table,
     hooks: Hooks,
 }
 
@@ -319,6 +320,7 @@ impl World {
             }),
             paused_nanos: AtomicU64::new(0),
             services: services::Registry::new(seed),
+            volumes: volumes::Table::default(),
             hooks: Hooks::default(),
         })
     }
@@ -455,12 +457,14 @@ impl World {
         }
     }
 
-    /// Crashes `node`, in this order: marks it down, marks its stepped services dead (a
+    /// Crashes `node`, in this order: halts every volume of the node (the disk cut: no
+    /// later call changes an image), marks it down, marks its stepped services dead (a
     /// dead service is never stepped again and joins at once), then aborts every
-    /// registered task. Destructors that run during the abort therefore find no live
-    /// service to wait for. Helper-thread services (`spawn_service`) cannot be stopped;
-    /// see the module documentation.
+    /// registered task. Destructors that run during the crash or the abort therefore find
+    /// halted volumes and no live service to wait for. Helper-thread services
+    /// (`spawn_service`) cannot be stopped; see the module documentation.
     pub fn crash(&self, node: u64) {
+        self.volumes.halt_node(node);
         net::crash(self, node);
         let tasks = self.with_node(node, |entry| {
             entry.up = false;
@@ -660,6 +664,23 @@ pub enum SimEvent<'a> {
     /// [`crate::task::drive_until`] skipped, or a `thread_sleep` in simulation).
     Pause {
         by: Duration,
+    },
+    /// A call on a node's simulated volume, as its `FaultFs` logged it.
+    Fs {
+        node: u64,
+        mount: &'a std::path::Path,
+        call: &'a crate::fs::FsCall,
+    },
+    /// [`World::restart_with`] replaced the node's volumes by their `cut` images.
+    Cut {
+        node: u64,
+        cut: Cut,
+    },
+    /// [`World::wipe`] replaced a volume by an empty one.
+    Wipe {
+        node: u64,
+        mount: &'a std::path::Path,
+        how: Wipe,
     },
 }
 
@@ -1048,6 +1069,9 @@ pub mod net;
 #[cfg(feature = "sim-openraft")]
 pub mod openraft10;
 pub(crate) mod services;
+pub mod volumes;
+
+pub use volumes::{Cut, VolumeInfo, Wipe, volume_for};
 
 #[cfg(test)]
 mod tests;
