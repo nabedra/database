@@ -1,6 +1,6 @@
 {
   "allow_unattested": false,
-  "head": "8498d0ee2c61a3df8557091412665b0e73f47bdc",
+  "head": "2627e24172d1dcb12e379e58aea995a6c03a6e46",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -119,10 +119,18 @@
           "state": "missing"
         },
         "U": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "cache-store-model"
+          ],
+          "date": "2026-11-23T21:48:29.858780+00:00",
+          "executed": 6,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45271135251",
+          "sha": "dae0d202ea06d26a9f0316c6b12dc9e87a19f99a",
+          "state": "stale"
         }
       },
       "guarantee": "Reads never extend a TTL. A non-positive EXPIRE deletes. TTL uses -2 for an absent key and -1 for a key without expiry. Expired keys never return, and each sweep stays within 64 items or 200 \u00b5s.",
@@ -179,10 +187,18 @@
           "state": "missing"
         },
         "U": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "cache-store-model"
+          ],
+          "date": "2026-11-23T21:48:29.858780+00:00",
+          "executed": 6,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45271135251",
+          "sha": "dae0d202ea06d26a9f0316c6b12dc9e87a19f99a",
+          "state": "stale"
         }
       },
       "guarantee": "Memory never exceeds the cap. `noeviction` returns OOM, and `sampled_lru` evicts only existing keys and frees enough space to admit the write.",
@@ -2501,10 +2517,18 @@
           "state": "missing"
         },
         "U": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "scheduler-properties"
+          ],
+          "date": "2026-11-23T21:59:47.358297+00:00",
+          "executed": 5,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45271135251",
+          "sha": "dae0d202ea06d26a9f0316c6b12dc9e87a19f99a",
+          "state": "stale"
         }
       },
       "guarantee": "The scheduler enforces capacity, memory, queue, failure and recovery rules.",
@@ -3531,11 +3555,19 @@
           "state": "n/a"
         },
         "P": {
+          "behind": 1,
+          "checks": [
+            "rt-zero-cost"
+          ],
+          "date": "2026-11-23T21:51:08.187788+00:00",
           "deferred": "hardware-deferred",
-          "executed": 0,
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "reason": "hardware-deferred (absolute OLTP latency targets, including the direct-path benchmark)",
           "required": true,
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45271135251",
+          "sha": "dae0d202ea06d26a9f0316c6b12dc9e87a19f99a",
           "state": "not-run"
         },
         "R": {
@@ -3784,10 +3816,18 @@
           "state": "n/a"
         },
         "U": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "scheduler-properties"
+          ],
+          "date": "2026-11-23T21:59:47.358297+00:00",
+          "executed": 5,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45271135251",
+          "sha": "dae0d202ea06d26a9f0316c6b12dc9e87a19f99a",
+          "state": "stale"
         }
       },
       "guarantee": "Admitted resources never exceed capacity.",
@@ -3851,10 +3891,18 @@
           "state": "n/a"
         },
         "U": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "scheduler-properties"
+          ],
+          "date": "2026-11-23T21:59:47.358297+00:00",
+          "executed": 5,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45271135251",
+          "sha": "dae0d202ea06d26a9f0316c6b12dc9e87a19f99a",
+          "state": "stale"
         }
       },
       "guarantee": "Dominant resource shares stay within the fairness bound.",
@@ -3911,10 +3959,18 @@
           "state": "n/a"
         },
         "U": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "scheduler-properties"
+          ],
+          "date": "2026-11-23T21:59:47.358297+00:00",
+          "executed": 5,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45271135251",
+          "sha": "dae0d202ea06d26a9f0316c6b12dc9e87a19f99a",
+          "state": "stale"
         }
       },
       "guarantee": "An eligible request never starves beyond the allowed number of grant rounds.",
@@ -3992,5 +4048,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
