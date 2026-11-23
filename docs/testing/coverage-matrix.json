@@ -1,7 +1,20 @@
 {
   "allow_unattested": false,
-  "head": "8498d0ee2c61a3df8557091412665b0e73f47bdc",
-  "ignored_records": [],
+  "head": "65d5a74dcb13f3836ea3b568a036b2b18bab71aa",
+  "ignored_records": [
+    {
+      "path": "land-p9-83-preflight-0cf3bc8-171246--lsm-campaign-sim-repeat.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p9-83-preflight-0cf3bc8-171246--lsm-stepped-journal.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p9-83-preflight-0cf3bc8-171246--lsm-stepped-regressions.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -1552,6 +1565,7 @@
         "D": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -1589,12 +1603,14 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "3 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -1616,6 +1632,7 @@
         "D": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -1652,12 +1669,14 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "3 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -1676,6 +1695,7 @@
         "D": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -1712,6 +1732,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -3992,5 +4013,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
