@@ -1,0 +1,65 @@
+{
+  "artifacts": [
+    {
+      "name": "p10-check-review-84d9137-101011--models.log",
+      "sha256": "f4141326792b90653a64ef2b50bfc67d4b117bfceac647143a2e1c160f15e8f3"
+    }
+  ],
+  "assertions": {
+    "executed": 32,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "ignored",
+        "reason": "1 tests marked #[ignore]"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "models",
+  "duration_s": 18.384,
+  "guarantees": [
+    "OLTP-G03",
+    "OLTP-G04",
+    "OLTP-G08",
+    "OLAP-G01",
+    "OLAP-G02",
+    "OLAP-G03",
+    "OLAP-G04",
+    "EVT-G05",
+    "CACHE-G06"
+  ],
+  "kind": "M",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T10:11:02.890618+00:00",
+    "request_id": "p10-check-review-84d9137-101011",
+    "runner": "GitHub Actions 1000004904",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45153593514"
+  },
+  "scenarios": [
+    "O10",
+    "O12",
+    "D02",
+    "D05",
+    "O17",
+    "O26",
+    "T03",
+    "T04",
+    "T05",
+    "EV03",
+    "K03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "84d91371b4bea487065203eee2d103b359e42d8b",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
