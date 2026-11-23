@@ -47,6 +47,8 @@ level = "L3"
 register = "docs/testing/guarantees/oltp.md"
 paths = [
   "server/src/oltp/**",
+  "server/oltp-types/**",
+  "server/resources/src/stage_timing.rs",
   "server/src/oltp.rs",
   "server/src/oltp_*/**",
   "server/src/oltp_*.rs",

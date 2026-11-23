@@ -1904,6 +1904,7 @@ dependencies = [
  "mime",
  "nabedra-check",
  "nabedra-kv",
+ "nabedra-oltp-types",
  "nabedra-protocol",
  "nabedra-resources",
  "nabedra-rt",
@@ -1937,6 +1938,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nabedra-oltp-types"
+version = "0.1.0"
+dependencies = [
+ "nabedra-protocol",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "nabedra-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1952,7 +1963,9 @@ version = "0.1.0"
 dependencies = [
  "nabedra-check",
  "nabedra-protocol",
+ "nabedra-rt",
  "serde",
+ "serde_json",
  "tokio",
 ]
 

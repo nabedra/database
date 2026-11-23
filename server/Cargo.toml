@@ -14,7 +14,7 @@ include = ["/src/", "/tests/", "/examples/", "/Cargo.lock", "/README.md", "/LICE
 
 [workspace]
 # `nabedra-kv` builds and tests alone: `cargo test -p nabedra-kv`.
-members = [".", "kv", "check", "rt", "protocol", "resources", "sim"]
+members = [".", "kv", "check", "rt", "protocol", "resources", "oltp-types", "sim"]
 # Plain `cargo build` and `cargo test` here build only the server, as before `sim` joined.
 # The simulation crates are members but never default members: they enable
 # `nabedra-rt/sim`, which `src/main.rs` refuses to compile. Name them with `-p`.
@@ -31,7 +31,7 @@ path = "src/main.rs"
 [features]
 default = ["olap", "s3"]
 olap = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:parquet"]
-oltp = ["dep:nabedra-kv", "dep:openraft", "dep:tokio-rustls", "dep:socket2"]
+oltp = ["dep:nabedra-oltp-types", "dep:nabedra-kv", "dep:openraft", "dep:tokio-rustls", "dep:socket2"]
 cache = ["dep:clock-bound-client", "dep:hashbrown", "dep:smallvec", "dep:toml", "dep:openraft", "dep:tokio-rustls"]
 test-hooks = ["cache"]
 oltp-backup-s3 = ["oltp", "s3"]
@@ -73,6 +73,7 @@ nabedra-kv = { path = "kv", version = "0.1.0", optional = true }
 nabedra-rt = { path = "rt", version = "0.1.0" }
 nabedra-protocol = { path = "protocol", version = "0.1.0" }
 nabedra-resources = { path = "resources", version = "0.1.0" }
+nabedra-oltp-types = { path = "oltp-types", version = "0.1.0", optional = true }
 hashbrown = { version = "=0.17.1", default-features = false, optional = true }
 smallvec = { version = "=1.16.5", optional = true }
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde"], optional = true }

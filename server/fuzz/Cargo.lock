@@ -1580,7 +1580,9 @@ name = "nabedra-resources"
 version = "0.1.0"
 dependencies = [
  "nabedra-protocol",
+ "nabedra-rt",
  "serde",
+ "serde_json",
  "tokio",
 ]
 

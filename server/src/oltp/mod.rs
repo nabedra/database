@@ -17,14 +17,7 @@ pub(crate) fn failure(code: ErrorCode, message: &str) -> ProtocolError {
     ProtocolError::new(code, message, Outcome::NotApplied)
 }
 
-pub(crate) fn valid_database(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && name.as_bytes()[0].is_ascii_alphanumeric()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
-}
+pub(crate) use nabedra_oltp_types::valid_database;
 
 fn recovery_unknown() -> ProtocolError {
     ProtocolError::new(

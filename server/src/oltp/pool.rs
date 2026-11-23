@@ -63,35 +63,7 @@ const POOL_KEY: &[u8] = b"\0typed-pool-v1";
 const MAX_KEY_BYTES: usize = 2 * crate::protocol::MAX_BODY_BYTES + 256;
 const MAX_IDENTITY_BYTES: u64 = 4096;
 const BATCH_OVERHEAD: usize = 32;
-/// Pool format 2: a `nabedra-kv` store in `kv/`. Format 1 (the previous engine) is
-/// refused (Q1).
-pub const POOL_FORMAT_VERSION: u32 = 2;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PoolIdentity {
-    pub engine: String,
-    pub pool_format_version: u32,
-    pub cluster_id: Uuid,
-    pub worker_id: Uuid,
-    pub pool_id: Uuid,
-}
-impl PoolIdentity {
-    pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.engine != "oltp"
-            || self.pool_format_version != POOL_FORMAT_VERSION
-            || self.cluster_id.is_nil()
-            || self.worker_id.is_nil()
-            || self.pool_id.is_nil()
-        {
-            return Err(failure(
-                ErrorCode::StorageUnavailable,
-                "invalid typed OLTP pool identity",
-            ));
-        }
-        Ok(())
-    }
-}
+pub use nabedra_oltp_types::{POOL_FORMAT_VERSION, PoolIdentity};
 
 struct PoolInner {
     /// Declared first so the store closes before the slot, charges and mount drop.
