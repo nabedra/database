@@ -703,7 +703,7 @@ impl Endpoint for ParticipantEndpoint {
                         read_attempt::fixture::running(grant).await;
                         let page = Self::scan(handle, node, input, Some((scope.read_ts, grant.input)));
                         #[cfg(test)]
-                        let page = continuation_fixture::GRANT.scope(grant, page);
+                        let page = continuation_fixture::observe_read(grant, page);
                         page.await
                     }
                     .await;

@@ -22,7 +22,7 @@ pub use snapshot::{
 #[cfg(all(test, feature = "sim", target_os = "linux"))]
 mod sim_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 pub use resources::{
     ByteClass, ChargedBuffer, ChargedBytes, ExecutionClass, NativeComputeGuard, PreparedNative,
     QueueLease, ScratchLease, SharedResourceConfig, WorkerSharedResources,
@@ -30,7 +30,7 @@ pub use resources::{
 use resources::{ByteReservation, capacity};
 pub(crate) use resources::{DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease, RAFT_REPLICA_BYTES};
 #[cfg(test)]
-pub(crate) use tests::{acceptance_damaged_checkpoints, o29_pool_recovery};
+pub(crate) use tests::acceptance_damaged_checkpoints;
 
 use super::{failure, recovery_unknown};
 use crate::{
@@ -251,8 +251,8 @@ impl OltpPool {
         mount: Option<VerifiedPoolMount>,
     ) -> Result<Self, ProtocolError> {
         let fs = nabedra_kv::fs::real();
-        #[cfg(test)]
-        let fs = crate::oltp_runtime::recovery_tests::pool_sync::wrap(fs);
+        #[cfg(any(test, feature = "test-hooks"))]
+        let fs = crate::oltp::test_hooks::pool_sync::wrap(fs);
         Self::open_path_on(path, identity, shared, mount, fs, &|_| {})
     }
     fn open_path_on(

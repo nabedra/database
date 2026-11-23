@@ -3,7 +3,7 @@
 //! that Catalog twice: after Prepare (intents written, no decision) and after
 //! the decision, before the coordinator resolves its intents. The transaction waits until
 //! the test releases it. Other Catalogs, and so other tests, are never held.
-use crate::oltp_replication::types::TxnId;
+use nabedra_oltp_types::types::TxnId;
 use std::{
     collections::HashMap,
     sync::{Mutex, OnceLock},

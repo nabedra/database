@@ -621,8 +621,8 @@ impl NativePlanner {
             self.catalog.participant().identity().group_id,
             txn.request_id,
         );
-        #[cfg(test)]
-        crate::oltp_runtime::recovery_tests::pool_sync::observe_create_plan(txn.request_id, id);
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::oltp::test_hooks::pool_sync::observe_create_plan(txn.request_id, id);
         let descriptor = TableDescriptor {
             id,
             name: payload.name,
@@ -821,8 +821,8 @@ impl NativePlanner {
         authority: crate::oltp_replication::types::Authority,
     ) -> Result<VerifiedLifecycleGuard, PlanError> {
         let binding = self.lifecycle_binding(pin, txn, request, table_id, lifecycle_version, schema_epoch, authority);
-        #[cfg(test)]
-        crate::oltp_runtime::recovery_tests::index_faults::observe_lifecycle(&binding);
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::oltp::test_hooks::index_faults::observe_lifecycle(&binding);
         self.catalog
             .participant()
             .acquire_lifecycle(binding.clone(), mode)

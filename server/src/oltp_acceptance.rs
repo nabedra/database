@@ -148,7 +148,7 @@ fn acceptance_o11() {
 async fn acceptance_o29() {
     nabedra_rt::time::timeout(
         std::time::Duration::from_secs(30),
-        crate::oltp::pool::o29_pool_recovery(),
+        crate::oltp_runtime::recovery_tests::pool_recovery::o29_pool_recovery(),
     )
     .await
     .expect("O29 pool recovery watchdog");
