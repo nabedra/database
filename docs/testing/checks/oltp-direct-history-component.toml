@@ -1,0 +1,18 @@
+id = "oltp-direct-history-component"
+module = "oltp"
+kinds = ["H"]
+# Component coverage of OLTP-G03 and OLTP-G04. The full history and real cluster checks remain required.
+guarantees = []
+scenarios = ["D02", "D03", "O10"]
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+python3 scripts/testing/repeat_gate.py --features oltp <<'JSON'
+[
+  {"id": "d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome", "file": "server/src/oltp_runtime/application/direct/tests.rs", "lang": "rust"}
+]
+JSON
+''']
+cwd = "."
+timeout_s = 1500
+needs = []
+result_parser = "exit-code"

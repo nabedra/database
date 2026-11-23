@@ -298,6 +298,33 @@ mod in_a_world {
     }
 
     #[test]
+    fn spawn_in_aborts_before_polling_a_retired_incarnation() {
+        run(15, |world| async move {
+            world.add_node(1, NodeClock::default());
+            let mut set = task::JoinSet::new();
+            let ran = Arc::new(AtomicBool::new(false));
+            let ran_in_task = ran.clone();
+            in_node(1, async {
+                world.restart_with(1, crate::sim::volumes::Cut::Kill);
+                task::spawn_in(&mut set, async move {
+                    ran_in_task.store(true, Ordering::SeqCst);
+                });
+            })
+            .await;
+            let result = tokio::time::timeout(ms(1_000), set.join_next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                result.is_err_and(|error| error.is_cancelled()),
+                "the retired task joined the replacement node"
+            );
+            assert!(!ran.load(Ordering::SeqCst));
+            assert_eq!(world.live_tasks(1), 0);
+        });
+    }
+
+    #[test]
     fn spawn_blocking_on_runs_inline_in_the_node_context() {
         run(12, |world| async move {
             world.add_node(3, NodeClock::default());

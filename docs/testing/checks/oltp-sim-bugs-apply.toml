@@ -1,0 +1,13 @@
+id = "oltp-sim-bugs-apply"
+module = "oltp"
+kinds = ["U"]
+# Tooling: every reverted-fix patch in server/sim-oltp/bugs/ still applies to HEAD and its manifest
+# matches its bug record. A product change that breaks a patch fails here; refresh the patch.
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+command = ["python3", "scripts/testing/sim_bugs.py", "check"]
+cwd = "."
+timeout_s = 120
+needs = []
+result_parser = "exit-code"
