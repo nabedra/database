@@ -1,0 +1,28 @@
+id = "oltp-queue-rejoin-component"
+module = "oltp"
+kinds = ["R"]
+# O14 contributes to OLTP-G03 and OLTP-G07. Other real-environment scenarios remain required.
+guarantees = []
+scenarios = ["O14", "Q03", "Q04", "Q05", "R03"]
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+out=$(mktemp -d)
+trap 'rm -rf "$out"' EXIT
+for mode in on off; do
+    for attempt in 1 2 3 4 5; do
+        dir="$out/$mode-$attempt"
+        echo "O14 direct_oltp=$mode attempt $attempt/5"
+        rc=0
+        NABEDRA_TEST_DIRECT_OLTP="$mode" python3 scripts/acceptance_oltp.py --scenario O14 --output "$dir" || rc=$?
+        if [ -f "$dir/O14.log" ]; then cat "$dir/O14.log"; fi
+        if [ "$rc" -ne 0 ]; then
+            if [ ! -f "$dir/O14.log" ] && [ -f "$dir/build.log" ]; then cat "$dir/build.log"; fi
+            exit "$rc"
+        fi
+    done
+done
+''']
+cwd = "."
+timeout_s = 2200
+needs = []
+result_parser = "cargo-test"
