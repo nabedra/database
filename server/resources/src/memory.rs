@@ -18,6 +18,12 @@ use crate::{
     scheduling::MemoryCharge,
 };
 
+mod worker;
+
+pub use worker::{ExecutionClass, GroupCapacityLease, WorkerMemory};
+#[cfg(feature = "test-hooks")]
+pub use worker::{GROUP_ENDPOINT_BYTES, GROUP_HANDLE_BYTES};
+
 pub const RAFT_REPLICA_BYTES: usize = 8 << 20;
 
 pub const DEFAULT_REPLY_DECODE_BYTES: usize = 1 << 20;
@@ -62,6 +68,92 @@ impl Default for SharedResourceConfig {
             max_group_handles: 128,
             max_resident_groups: 64,
             precharge_group_capacity: false,
+        }
+    }
+}
+
+/// Choose this from the authenticated endpoint role. Queue/data payloads must
+/// never consume Progress, which keeps small authority/settlement exchanges live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ByteClass {
+    Progress,
+    Data,
+}
+pub struct ScratchLease {
+    _owner: Arc<dyn Any + Send + Sync>,
+    backing: ScratchBacking,
+}
+enum ScratchBacking {
+    Arena(ByteReservation),
+    Combined([Arc<ScratchLease>; 2]),
+    Working {
+        charge: Mutex<MemoryCharge>,
+        counter: Arc<AtomicUsize>,
+    },
+}
+impl ScratchLease {
+    fn arena(owner: Arc<dyn Any + Send + Sync>, charge: ByteReservation) -> Self {
+        Self {
+            _owner: owner,
+            backing: ScratchBacking::Arena(charge),
+        }
+    }
+
+    fn working(
+        owner: Arc<dyn Any + Send + Sync>,
+        charge: MemoryCharge,
+        counter: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            _owner: owner,
+            backing: ScratchBacking::Working {
+                charge: Mutex::new(charge),
+                counter,
+            },
+        }
+    }
+
+    fn combined(owner: Arc<dyn Any + Send + Sync>, parts: [Arc<Self>; 2]) -> Self {
+        Self {
+            _owner: owner,
+            backing: ScratchBacking::Combined(parts),
+        }
+    }
+
+    fn belongs_to(&self, owner: &Arc<dyn Any + Send + Sync>) -> bool {
+        Arc::ptr_eq(&self._owner, owner)
+    }
+
+    /// Only a codec with a checked aggregate retained-heap bound may release
+    /// unused decode scratch. Every clone observes the same smaller charge.
+    pub fn shrink_unused(&self, bytes: usize) -> Result<(), ProtocolError> {
+        let ScratchBacking::Working { charge, counter } = &self.backing else {
+            return Err(capacity());
+        };
+        let mut charge = charge.lock().map_err(|_| capacity())?;
+        let old = charge.bytes() as usize;
+        charge.shrink_to(bytes as u64)?;
+        counter.fetch_sub(old - bytes, Ordering::AcqRel);
+        Ok(())
+    }
+
+    pub fn bytes(&self) -> usize {
+        match &self.backing {
+            ScratchBacking::Arena(charge) => charge.remaining(),
+            ScratchBacking::Combined(owners) => owners.iter().map(|o| o.bytes()).sum(),
+            ScratchBacking::Working { charge, .. } => {
+                charge.lock().expect("scratch charge").bytes() as usize
+            }
+        }
+    }
+}
+impl Drop for ScratchLease {
+    fn drop(&mut self) {
+        if let ScratchBacking::Working { charge, counter } = &mut self.backing {
+            counter.fetch_sub(
+                charge.get_mut().expect("scratch charge").bytes() as usize,
+                Ordering::AcqRel,
+            );
         }
     }
 }
