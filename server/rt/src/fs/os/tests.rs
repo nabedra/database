@@ -335,6 +335,39 @@ fn directory_descriptor_follows_rename_on_the_host() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) const BEFORE_RENAME_BYTES: &[u8] = b"manifest written under the old directory name";
+
+/// Leave the child's directory entry pending until the renamed directory is synced
+/// through the descriptor opened under its old name.
+#[cfg(target_os = "linux")]
+pub(crate) fn sync_pre_rename_child(root: &Path) -> PathBuf {
+    let staging = root.join("staging");
+    let active = root.join("active");
+    create_dir(&staging).unwrap();
+    sync_dir(root).unwrap();
+    let directory = File::open(&staging).unwrap();
+    let mut child = File::create(staging.join("manifest")).unwrap();
+    child.write_all(BEFORE_RENAME_BYTES).unwrap();
+    child.sync_all().unwrap();
+    drop(child);
+
+    rename(&staging, &active).unwrap();
+    directory.sync_all().unwrap();
+    sync_dir(root).unwrap();
+    active.join("manifest")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn directory_descriptor_syncs_pre_rename_child_on_the_host() {
+    let root = host_dir("descriptor-sync-before-rename");
+    let manifest = sync_pre_rename_child(&root);
+    assert_eq!(read(manifest).unwrap(), BEFORE_RENAME_BYTES);
+    assert!(!try_exists(root.join("staging")).unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(not(feature = "sim"))]
 #[test]
 fn product_wrappers_are_the_std_types() {

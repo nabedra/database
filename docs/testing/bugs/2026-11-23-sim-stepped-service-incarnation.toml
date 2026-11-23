@@ -10,5 +10,5 @@ lowest_regression = "server/rt/src/sim/services/tests.rs::a_cancelled_incarnatio
 seed = 23
 why_not_caught = "The restart test covered pathname access from a cancelled task. Stepped service registration and driving still selected cells by node ID."
 invariant_added = "Registration and driving require the caller's active incarnation, and service steps and destructors keep the context from registration."
-fix_commits = ["481743bbc757d482c167a00f31d8f6eafc3360e6"]
+fix_commits = ["df756edeb928e7b3cd458ca44ad1c5185a6ee21c"]
 revert_patch_ok = false
