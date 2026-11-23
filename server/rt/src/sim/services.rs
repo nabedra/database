@@ -16,8 +16,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use super::{
-    ROLE, Role, ServiceInfo, ServiceState, SimEvent, SplitMix64, StepOutcome, World, current_node,
-    lock, run_blocking, with_node_context, world,
+    NodeContext, ROLE, Role, ServiceInfo, ServiceState, SimEvent, SplitMix64, StepOutcome, World,
+    current_node, current_node_context, lock, run_blocking, with_node_context, world,
 };
 use crate::task::{ServiceHandle, Step, Stepped};
 
@@ -62,7 +62,7 @@ pub(crate) type StepFn = Box<dyn FnMut() -> Step + Send>;
 /// One stepped service.
 pub(crate) struct Cell {
     name: String,
-    node: Option<u64>,
+    context: Option<NodeContext>,
     /// The service's doorbell (its `Stepped::doorbell`).
     bell: Arc<Bell>,
     /// The step function; `None` while it is mid-step and after the service finished.
@@ -97,6 +97,10 @@ impl Status {
 }
 
 impl Cell {
+    fn node(&self) -> Option<u64> {
+        self.context.map(|context| context.id)
+    }
+
     fn state(&self) -> ServiceState {
         lock(&self.status).state()
     }
@@ -110,7 +114,7 @@ impl std::fmt::Debug for Cell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Cell")
             .field("name", &self.name)
-            .field("node", &self.node)
+            .field("context", &self.context)
             .field("state", &self.state())
             .finish_non_exhaustive()
     }
@@ -157,10 +161,10 @@ impl Registry {
     }
 
     /// The node's unfinished services, in registration order.
-    fn live(&self, node: Option<u64>) -> Vec<Arc<Cell>> {
+    fn live(&self, context: Option<NodeContext>) -> Vec<Arc<Cell>> {
         lock(&self.cells)
             .iter()
-            .filter(|cell| cell.node == node && !cell.finished())
+            .filter(|cell| cell.context == context && !cell.finished())
             .cloned()
             .collect()
     }
@@ -168,7 +172,7 @@ impl Registry {
     pub(crate) fn infos(&self, node: Option<u64>) -> Vec<ServiceInfo> {
         lock(&self.cells)
             .iter()
-            .filter(|cell| cell.node == node)
+            .filter(|cell| cell.node() == node)
             .map(|cell| ServiceInfo {
                 name: cell.name.clone(),
                 state: cell.state(),
@@ -178,10 +182,10 @@ impl Registry {
 
     /// Marks every unfinished service of `node` dead and returns their step functions,
     /// for the caller to drop once no lock is held.
-    pub(crate) fn kill_node(&self, node: u64) -> Vec<StepFn> {
+    pub(super) fn kill_node(&self, context: NodeContext) -> Vec<StepFn> {
         let cells: Vec<Arc<Cell>> = lock(&self.cells)
             .iter()
-            .filter(|cell| cell.node == Some(node))
+            .filter(|cell| cell.context == Some(context))
             .cloned()
             .collect();
         let mut dead = Vec::new();
@@ -197,18 +201,18 @@ impl Registry {
             dead.extend(lock(&cell.step).take());
             cell.bell.ring();
         }
-        self.node_bell(Some(node)).ring();
+        self.node_bell(Some(context.id)).ring();
         dead
     }
 
     /// Drops finished services of `node` from the registry.
     pub(crate) fn forget_finished(&self, node: u64) {
-        lock(&self.cells).retain(|cell| cell.node != Some(node) || !cell.finished());
+        lock(&self.cells).retain(|cell| cell.node() != Some(node) || !cell.finished());
     }
 
     fn describe(&self, node: Option<u64>) -> String {
         let mut text = String::new();
-        for cell in lock(&self.cells).iter().filter(|cell| cell.node == node) {
+        for cell in lock(&self.cells).iter().filter(|cell| cell.node() == node) {
             let _ = write!(text, "\n  {}: {:?}", cell.name, cell.state());
         }
         if text.is_empty() {
@@ -232,7 +236,7 @@ enum Outcome {
 
 /// Runs one step of `cell` on this thread.
 fn step_cell(world: &World, cell: &Arc<Cell>) -> Outcome {
-    if lock(&cell.status).finished() {
+    if !world.context_active(cell.context) || cell.finished() {
         return Outcome::Finished;
     }
     let Some(mut step) = lock(&cell.step).take() else {
@@ -240,7 +244,9 @@ fn step_cell(world: &World, cell: &Arc<Cell>) -> Outcome {
     };
     *lock(&cell.status) = Status::Stepping;
     lock(&world.services.stack).push(Arc::clone(cell));
-    let result = std::panic::catch_unwind(AssertUnwindSafe(&mut step));
+    let result = with_node_context(cell.context, || {
+        std::panic::catch_unwind(AssertUnwindSafe(&mut step))
+    });
     lock(&world.services.stack).pop();
     world.services.steps.fetch_add(1, Ordering::SeqCst);
     let (outcome, keep) = {
@@ -272,7 +278,7 @@ fn step_cell(world: &World, cell: &Arc<Cell>) -> Outcome {
         *lock(&cell.step) = Some(step);
     } else {
         // The service is finished: its state drops here, outside every lock.
-        drop(step);
+        with_node_context(cell.context, || drop(step));
     }
     report(world, cell, outcome)
 }
@@ -295,13 +301,13 @@ fn report(world: &World, cell: &Cell, outcome: Outcome) -> Outcome {
         Outcome::Busy | Outcome::Finished => return outcome,
     };
     world.emit(&SimEvent::Step {
-        node: cell.node,
+        node: cell.node(),
         service: &cell.name,
         outcome: reported,
     });
     // An exit or a panic may be what a joiner or an idle peer waits for.
     if matches!(reported, StepOutcome::Exit | StepOutcome::Panicked) {
-        world.services.node_bell(cell.node).ring();
+        world.services.node_bell(cell.node()).ring();
     }
     outcome
 }
@@ -309,7 +315,7 @@ fn report(world: &World, cell: &Cell, outcome: Outcome) -> Outcome {
 /// The driver task of one service.
 async fn driver(world: Weak<World>, cell: Arc<Cell>) {
     let node_bell = match world.upgrade() {
-        Some(world) => world.services.node_bell(cell.node),
+        Some(world) => world.services.node_bell(cell.node()),
         None => return,
     };
     loop {
@@ -420,8 +426,12 @@ impl Handle {
                 stepping_world().is_some_and(|current| Arc::ptr_eq(&current, &world)),
                 "a live stepped service must join on its simulation thread or blocking helper"
             );
-            with_node_context(cell.node, || {
-                drive(&world, cell.node, "ServiceHandle::join", || {
+            assert!(
+                world.context_active(current_node_context()),
+                "a retired node incarnation cannot join live services"
+            );
+            with_node_context(cell.context, || {
+                drive(&world, cell.context, "ServiceHandle::join", || {
                     cell.finished().then_some(())
                 });
             });
@@ -467,28 +477,51 @@ pub(crate) fn spawn_stepped<S: Stepped>(
                 inner: Handle::Thread(thread),
             });
     };
-    let node = current_node();
+    let context = current_node_context();
     let bell = Arc::clone(service.doorbell().bell());
     let mut service = service;
     let cell = Arc::new(Cell {
         name,
-        node,
+        context,
         bell,
         step: Mutex::new(Some(Box::new(move || service.step()))),
         status: Mutex::new(Status::Ready),
     });
-    lock(&world.services.cells).push(Arc::clone(&cell));
-    let task = driver(Arc::downgrade(&world), Arc::clone(&cell));
-    match node {
-        Some(node) => {
-            if !world.is_up(node) {
-                // Started on a crashed node: dead before its first step.
-                let dead = world.services.kill_node(node);
-                drop(dead);
-            }
-            drop(world.spawn_node(node, task));
+    let active = {
+        // Register while holding the node state lock. A crash that makes the context
+        // inactive will then see the cell when it kills the incarnation's services.
+        let state = world.lock();
+        let active = if let Some(context) = context {
+            let entry = state
+                .nodes
+                .get(&context.id)
+                .filter(|node| context.incarnation == Some(node.incarnation))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "cannot register a service for a retired node incarnation",
+                    )
+                })?;
+            entry.up
+        } else {
+            true
+        };
+        if active {
+            lock(&world.services.cells).push(Arc::clone(&cell));
         }
-        None => drop(tokio::runtime::Handle::current().spawn(task)),
+        active
+    };
+    if active {
+        let task = driver(Arc::downgrade(&world), Arc::clone(&cell));
+        match context {
+            Some(context) => drop(world.spawn_node(context.id, task)),
+            None => drop(tokio::runtime::Handle::current().spawn(task)),
+        }
+    } else {
+        // A service started on the still-down incarnation is dead before its first step.
+        *lock(&cell.status) = Status::Dead;
+        let step = lock(&cell.step).take();
+        drop(step);
     }
     Ok(ServiceHandle {
         inner: Handle::Stepped {
@@ -549,11 +582,11 @@ where
 
 /// One pass over live services in registration order. A bell rung during the pass
 /// may have made an earlier service ready again, even if every step reported idle.
-fn pass(world: &World, node: Option<u64>, mut after_step: impl FnMut() -> bool) -> bool {
-    let bell = world.services.node_bell(node);
+fn pass(world: &World, context: Option<NodeContext>, mut after_step: impl FnMut() -> bool) -> bool {
+    let bell = world.services.node_bell(context.map(|context| context.id));
     let seen = bell.generation();
     let mut progress = false;
-    for cell in world.services.live(node) {
+    for cell in world.services.live(context) {
         match step_cell(world, &cell) {
             Outcome::Stepped(Step::Worked | Step::Exit) | Outcome::Panicked => progress = true,
             Outcome::Stepped(Step::Idle(_)) => {}
@@ -569,10 +602,10 @@ fn pass(world: &World, node: Option<u64>, mut after_step: impl FnMut() -> bool) 
 }
 
 /// The earliest timed idle among the node's live services that are not mid-step.
-fn earliest_deadline(world: &World, node: Option<u64>) -> Option<std::time::Instant> {
+fn earliest_deadline(world: &World, context: Option<NodeContext>) -> Option<std::time::Instant> {
     world
         .services
-        .live(node)
+        .live(context)
         .iter()
         .filter_map(|cell| match *lock(&cell.status) {
             Status::Idle(Some(at)) => Some(at),
@@ -584,17 +617,22 @@ fn earliest_deadline(world: &World, node: Option<u64>) -> Option<std::time::Inst
 /// Steps `node`'s services until `ready` returns `Some`; see [`crate::task::drive_until`].
 fn drive<T>(
     world: &World,
-    node: Option<u64>,
+    context: Option<NodeContext>,
     site: &'static str,
     mut ready: impl FnMut() -> Option<T>,
 ) -> T {
+    let node = context.map(|context| context.id);
     let mut passes = 0u64;
     loop {
         if let Some(value) = ready() {
             return value;
         }
+        assert!(
+            world.context_active(context),
+            "drive_until({site}): a retired node incarnation cannot drive services"
+        );
         let mut found = None;
-        let progress = pass(world, node, || {
+        let progress = pass(world, context, || {
             found = ready();
             found.is_some()
         });
@@ -610,7 +648,7 @@ fn drive<T>(
         if progress {
             continue;
         }
-        match earliest_deadline(world, node) {
+        match earliest_deadline(world, context) {
             Some(at) => {
                 let wait = at.saturating_duration_since(crate::time::now_std());
                 // A deadline already due would loop forever without moving time.
@@ -627,13 +665,14 @@ fn drive<T>(
 
 pub(crate) fn drive_until<T>(site: &'static str, ready: impl FnMut() -> Option<T>) -> Option<T> {
     let world = stepping_world()?;
-    Some(drive(&world, current_node(), site, ready))
+    Some(drive(&world, current_node_context(), site, ready))
 }
 
 /// Steps the node's services until a full pass does no work, without moving time.
-pub(crate) fn settle(world: &World, node: Option<u64>) {
+pub(super) fn settle(world: &World, context: Option<NodeContext>) {
+    let node = context.map(|context| context.id);
     for _ in 0..MAX_PASSES {
-        if !pass(world, node, || false) {
+        if !pass(world, context, || false) {
             return;
         }
     }
@@ -675,11 +714,16 @@ pub(crate) fn block_on_inline<F: Future>(
             std::thread::park();
         }
     };
-    let node = current_node();
+    let context = current_node_context();
+    let node = context.map(|context| context.id);
     let flag = Arc::new(Flag(AtomicBool::new(true)));
     let waker = Waker::from(Arc::clone(&flag));
     let mut cx = Context::from_waker(&waker);
     loop {
+        assert!(
+            world.context_active(context),
+            "block_on_inline at {caller}: a retired node incarnation cannot drive services"
+        );
         if flag.0.swap(false, Ordering::SeqCst)
             && let Poll::Ready(value) = future.as_mut().poll(&mut cx)
         {
@@ -687,7 +731,9 @@ pub(crate) fn block_on_inline<F: Future>(
         }
         // Give services a turn even if the future woke itself during the poll.
         let was_woken = flag.0.load(Ordering::SeqCst);
-        let progress = pass(&world, node, || !was_woken && flag.0.load(Ordering::SeqCst));
+        let progress = pass(&world, context, || {
+            !was_woken && flag.0.load(Ordering::SeqCst)
+        });
         if !progress && !flag.0.load(Ordering::SeqCst) {
             panic!(
                 "block_on_inline at {caller}: the future needs virtual time or another task \
@@ -713,7 +759,9 @@ pub(crate) fn before_wait(site: &'static str) {
 /// A `sync::Condvar` notification: rings the condvar's doorbell and its node's bell.
 pub(crate) fn ring(bell: &Arc<Bell>) {
     bell.ring();
-    if let Some(world) = world() {
+    if let Some(world) = world()
+        && world.context_active(current_node_context())
+    {
         world.services.node_bell(current_node()).ring();
     }
 }

@@ -437,4 +437,4 @@ impl Controller {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

@@ -3,6 +3,8 @@ mod clock;
 mod controller;
 mod discovery;
 mod protocol;
+#[cfg(feature = "sim")]
+mod sim;
 mod transport;
 mod worker;
 
