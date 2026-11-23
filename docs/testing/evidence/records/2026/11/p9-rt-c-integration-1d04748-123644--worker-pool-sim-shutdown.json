@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "p9-rt-c-integration-1d04748-123644--worker-pool-sim-shutdown.log",
+      "sha256": "b44756e81d1bf8ba82cdbfdfa5c314abb0bba2d479db7503416a7c2b6ad45e8c"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "worker-pool-sim-shutdown",
+  "duration_s": 171.676,
+  "guarantees": [
+    "SCHED-G01",
+    "OLAP-G07"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T12:37:53.145940+00:00",
+    "request_id": "p9-rt-c-integration-1d04748-123644",
+    "runner": "GitHub Actions 1000005975",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45175946604"
+  },
+  "scenarios": [
+    "F03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "1d047488270c2d0a09da454e5b825b6b7afb6464",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
