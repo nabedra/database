@@ -390,6 +390,7 @@ impl ByteReservation {
     pub fn remaining(&self) -> usize {
         self.remaining
     }
+    #[inline]
     pub fn split(&mut self, bytes: usize) -> Result<Self, ProtocolError> {
         self.remaining = self.remaining.checked_sub(bytes).ok_or_else(capacity)?;
         Ok(Self {
@@ -414,6 +415,7 @@ impl ByteReservation {
             _charge: charge,
         })))
     }
+    #[inline]
     pub fn copy(&mut self, bytes: &[u8]) -> Result<ChargedBytes, ProtocolError> {
         let charge = self.split(bytes.len())?;
         let mut data = Vec::new();
@@ -465,6 +467,7 @@ struct ChargedData {
 #[derive(Clone)]
 pub struct ChargedBytes(Arc<ChargedData>);
 impl ChargedBytes {
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
         &self.0.data
     }
