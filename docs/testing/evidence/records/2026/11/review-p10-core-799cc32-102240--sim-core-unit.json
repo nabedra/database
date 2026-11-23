@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "review-p10-core-799cc32-102240--sim-core-unit.log",
+      "sha256": "ff578eacd84e30d03dd88a678bf1d91677f0224b4dea4e7798bbbdef40a9743c"
+    }
+  ],
+  "assertions": {
+    "executed": 94,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "sim-core-unit",
+  "duration_s": 32.233,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T10:23:49.148989+00:00",
+    "request_id": "review-p10-core-799cc32-102240",
+    "runner": "GitHub Actions 1000005015",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45155531617"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "799cc329d648b8dfaa8579c7ef9e03ec9dbc1918",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
