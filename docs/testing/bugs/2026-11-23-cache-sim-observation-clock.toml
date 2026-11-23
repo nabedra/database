@@ -1,0 +1,14 @@
+id = "CACHE-SIM-OBSERVATION-CLOCK"
+title = "Sampling a simulated Cache slot advanced its lease clock"
+class = "fence-lifecycle-order"
+module = "cache"
+guarantees = ["CACHE-G06"]
+scenarios = ["K03"]
+found_by = "review"
+found_date = "2026-11-23"
+lowest_regression = "cache::cluster::worker::actor::tests::k03_slot_observation_does_not_advance_the_lease_clock"
+seed = 11
+why_not_caught = "The lease fixtures did not query actor state during a transient forward wall step."
+invariant_added = "A slot observation leaves the actor's clock endpoints unchanged for later lease decisions."
+fix_commits = ["5aef2b69af34c18294adb8d2a2004a39dfad8735"]
+revert_patch_ok = false

@@ -1,0 +1,23 @@
+id = "cache-sim-seams"
+module = "cache"
+kinds = ["U"]
+# Component checks and build isolation. K03 cluster acceptance is separate.
+guarantees = []
+scenarios = ["K01", "K02", "K03"]
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+features=(--locked --no-default-features --features cache,sim)
+cargo clippy -j 2 "${features[@]}" --no-deps --lib -- -D clippy::disallowed_methods
+bin_log=$(mktemp)
+trap 'rm -f "$bin_log"' EXIT
+if cargo check -j 2 "${features[@]}" --bin nabedra-db >"$bin_log" 2>&1; then
+    echo 'Unexpectedly built the Cache server with sim'
+    exit 1
+fi
+grep -F 'error: the nabedra-db binary cannot be built with the sim feature' "$bin_log"
+cargo test -j 2 "${features[@]}" --lib cache:: -- --test-threads=1
+''']
+cwd = "server"
+timeout_s = 1200
+needs = []
+result_parser = "cargo-test"
