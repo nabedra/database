@@ -1,12 +1,32 @@
 //! Exact physical topology for a sealed offline genesis. Source group UUIDs
 //! survive; the target cluster, worker and pool are newly authorized identities.
 use super::*;
+use std::future::Future;
 use crate::{
-    oltp::backup::restore::{OfflineRestoreTarget, RestoredGenesis},
-    oltp_backup_repository::{ArchiveKeys, S3ArchiveConfig},
+    oltp::backup::restore::{OfflineRestoreTarget, RestoredGenesis, VerifiedRestorePlan},
+    oltp_backup_repository::{ArchiveKeys, Repository, S3ArchiveConfig},
     oltp_replication::{owned::serialized_digest, types::CommitTs},
-    oltp_runtime::worker_runtime::archive::VerifiedNativeRestore,
 };
+
+pub(crate) trait RegisteredRestore: Sized {
+    fn verify(
+        backups: &[PathBuf],
+        target_cut: Option<CommitTs>,
+        database: &str,
+        target_run: Option<Uuid>,
+        shared: Arc<WorkerSharedResources>,
+        remote: Option<Arc<dyn Repository>>,
+        keys: Arc<ArchiveKeys>,
+    ) -> impl Future<Output = Result<Self, ProtocolError>> + Send;
+
+    fn plan(&self) -> &VerifiedRestorePlan;
+
+    fn install(
+        self,
+        target: OfflineRestoreTarget,
+        pool: &OltpPool,
+    ) -> impl Future<Output = Result<RestoredGenesis, ProtocolError>> + Send;
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,12 +38,12 @@ pub(crate) struct RegisteredRestoreConfig {
 }
 
 impl RegisteredRestoreConfig {
-    pub(super) async fn verify(
+    pub(super) async fn verify<R: RegisteredRestore>(
         &self,
         config: &RegisteredConfig,
         shared: Arc<WorkerSharedResources>,
         keys: Arc<ArchiveKeys>,
-    ) -> Result<VerifiedNativeRestore, ProtocolError> {
+    ) -> Result<R, ProtocolError> {
         let control = &config.placements.control;
         let mount = config.mount.as_ref().ok_or_else(invalid)?;
         if mount.generation != 1 || self.archives.iter().any(|path| !path.is_absolute()) {
@@ -44,7 +64,7 @@ impl RegisteredRestoreConfig {
             Some(source) => Some(source.clone().connect(shared.clone()).await?),
             None => None,
         };
-        let verified = VerifiedNativeRestore::verify(
+        let verified = R::verify(
             &self.archives,
             self.target_cut,
             control.identity.database.as_str(),
@@ -54,7 +74,7 @@ impl RegisteredRestoreConfig {
             keys,
         )
         .await?;
-        if !verified.plan.matches_registered(
+        if !verified.plan().matches_registered(
             control.identity.cluster_id,
             &control.identity.database,
             config

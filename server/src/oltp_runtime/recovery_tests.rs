@@ -8,7 +8,7 @@ pub(crate) mod maintenance;
 pub(crate) mod pool_recovery;
 
 pub(crate) use crate::oltp::test_hooks::{
-    block_raft_for_test, index_holds, mark, pause, pool_sync, refuse_staged_copy,
+    index_holds, mark, pause, pool_sync, refuse_staged_copy, take_fault,
     transaction_checkpoint,
 };
 
@@ -327,20 +327,6 @@ pub(super) async fn lose_terminal_copy(request: Uuid) -> bool {
     true
 }
 
-pub(crate) async fn lose_status_inspection(request: Uuid) -> bool {
-    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {
-        return false;
-    };
-    if !PathBuf::from(directory)
-        .join(format!("lose-status-inspection-{request}"))
-        .is_file()
-    {
-        return false;
-    }
-    transaction_checkpoint("status-inspect-unavailable", request, &request).await;
-    true
-}
-
 pub(super) async fn lose_reservation_reply(
     request: Uuid,
     reply: &crate::oltp_replication::authority::status::StatusReply,
@@ -368,16 +354,6 @@ pub(super) async fn lose_receipt_observation(request: Uuid) -> bool {
 
 pub(super) fn refuse_prepared_commit(request: Uuid) -> bool {
     take_fault("refuse-prepared-commit", request).is_some()
-}
-
-pub(crate) fn elect_move_source(request: Uuid) -> bool {
-    take_fault("move-elect-source", request).is_some()
-}
-
-pub(super) fn take_fault(name: &str, request: Uuid) -> Option<PathBuf> {
-    let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
-    std::fs::remove_file(directory.join(format!("{name}-{request}"))).ok()?;
-    Some(directory)
 }
 
 pub(super) fn hold_o21_ready_view() -> bool {

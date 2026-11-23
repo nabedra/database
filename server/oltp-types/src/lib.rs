@@ -3,6 +3,7 @@
 pub mod authority;
 mod identity;
 pub mod owned;
+pub mod queue;
 pub mod types;
 
 pub use identity::{POOL_FORMAT_VERSION, PoolIdentity};

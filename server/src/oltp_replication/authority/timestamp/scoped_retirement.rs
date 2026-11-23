@@ -8,78 +8,11 @@ use crate::{
         owned::serialized_digest,
         proof::hash,
     },
-    oltp_runtime::replica::RecordVersion,
 };
+use nabedra_oltp_types::queue::RecordVersion;
 use uuid::Uuid;
 
-pub(crate) use nabedra_oltp_types::authority::ScopedTimestampEpoch;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ScopedTerminalStatement {
-    pub epoch: ScopedTimestampEpoch,
-    pub request: RequestBinding,
-    pub pin_identity: PinIdentity,
-    pub storage_pin: StoragePin,
-    pub payload: RecordVersion,
-    pub terminal: RecordVersion,
-    pub response_status: u16,
-    pub response_hash: Digest,
-    pub completed_at_ms: u64,
-}
-
-impl ScopedTerminalStatement {
-    pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
-        if !self.epoch.valid()
-            || self.request.run_id != self.epoch.view.run_id
-            || self.request.request_id.is_nil()
-            || self.payload.request_id != self.request.request_id
-            || self.payload.version == 0
-            || self.terminal.version <= self.payload.version
-            || self.terminal.request_id != self.request.request_id
-            || self.terminal.version == u64::MAX
-            || self.pin_identity.run_id != self.request.run_id
-            || self.pin_identity.request_id != self.request.request_id
-            || self.pin_identity.digest != self.request.digest
-            || self.pin_identity.nonce.is_nil()
-            || self.storage_pin.pin_id.is_nil()
-            || self.storage_pin.allocator_epoch == 0
-            || !(self.response_status == 200 || (400..600).contains(&self.response_status))
-        {
-            return Err(invalid());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn for_placement(
-        &self,
-        placement: &ScopedQueuePlacement,
-    ) -> Result<(), ProtocolError> {
-        self.validate()?;
-        if self.epoch != ScopedTimestampEpoch::from_placement(placement)? {
-            return Err(unknown());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn rebases(&self, old: &Self) -> bool {
-        self.epoch.advances(old.epoch)
-            && self.request == old.request
-            && self.pin_identity == old.pin_identity
-            && self.storage_pin == old.storage_pin
-            && self.payload.version == old.payload.version
-            && self.terminal.version == old.terminal.version
-            && self.completed_at_ms == old.completed_at_ms
-            && self.response_hash == old.response_hash
-            && self.response_status == old.response_status
-    }
-
-    pub(crate) fn matches_reservation(&self, reservation: IdentityReservation) -> bool {
-        reservation.binds(self.request)
-            && reservation.reservation_id == self.pin_identity.nonce
-            && self.epoch.admits(reservation.scoped)
-    }
-}
+pub(crate) use nabedra_oltp_types::queue::{ScopedTerminalStatement, ScopedTimestampEpoch};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

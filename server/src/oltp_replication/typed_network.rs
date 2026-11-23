@@ -205,9 +205,9 @@ impl<C: TypedConfig> TypedNetwork<C> {
             return Err(invalid("target node disagrees with membership"));
         }
         let group = self.factory.resident.identity();
-        #[cfg(test)]
-        if crate::oltp_runtime::recovery_tests::block_raft_for_test(group.group_id)
-            || crate::oltp_growth_acceptance::data_raft_isolated(group.group_id)
+        #[cfg(any(test, feature = "test-hooks"))]
+        if crate::oltp::test_hooks::block_raft_for_test(group.group_id)
+            || crate::oltp::test_hooks::growth::data_raft_isolated(group.group_id)
         {
             return Err(unavailable());
         }
@@ -404,12 +404,12 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
                 crate::oltp_replication::types::GroupKind::Data { .. }
             );
         if data_append {
-            super::hosted::proposal_clock::mark(crate::oltp_runtime::stage_timing::perf_stage!(
+            super::hosted::proposal_clock::mark(nabedra_resources::perf_stage!(
                 "raft.data.propose_to_send"
             ));
         }
-        let reply: AppendEntriesResponse<C> = crate::oltp_runtime::stage_timing::timed(
-            crate::oltp_runtime::stage_timing::by_kind(
+        let reply: AppendEntriesResponse<C> = nabedra_resources::stage_timing::timed(
+            crate::oltp_replication::by_kind(
                 &self.factory.resident.identity().kind,
                 names,
             ),
@@ -418,11 +418,11 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
         .await
         .map_err(|_| unreachable())?;
         if data_append {
-            super::hosted::proposal_clock::mark(crate::oltp_runtime::stage_timing::perf_stage!(
+            super::hosted::proposal_clock::mark(nabedra_resources::perf_stage!(
                 "raft.data.propose_to_ack"
             ));
             super::hosted::proposal_clock::mark_first(
-                crate::oltp_runtime::stage_timing::perf_stage!("raft.data.propose_to_first_ack"),
+                nabedra_resources::perf_stage!("raft.data.propose_to_first_ack"),
             );
         }
         if (previous.is_none() && matches!(reply, AppendEntriesResponse::Conflict))
@@ -726,8 +726,8 @@ where
         bytes: &'a [u8],
     ) -> EndpointFuture<'a, ReceivePlan> {
         Box::pin(async move {
-            #[cfg(test)]
-            if crate::oltp_growth_acceptance::data_raft_isolated(self.resident.identity().group_id)
+            #[cfg(any(test, feature = "test-hooks"))]
+            if crate::oltp::test_hooks::growth::data_raft_isolated(self.resident.identity().group_id)
             {
                 return Err(unavailable());
             }
@@ -838,8 +838,8 @@ where
                             "raft.meta.net.append_handle",
                         ]
                     };
-                    let reply = crate::oltp_runtime::stage_timing::timed(
-                        crate::oltp_runtime::stage_timing::by_kind(
+                    let reply = nabedra_resources::stage_timing::timed(
+                        crate::oltp_replication::by_kind(
                             &self.resident.identity().kind,
                             names,
                         ),

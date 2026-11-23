@@ -1,4 +1,5 @@
 use super::*;
+use nabedra_protocol::RequestState;
 use crate::{
     config::WorkerResources, oltp::pool::SharedResourceConfig, oltp_replication::ReadySetHasher,
     request_queue::QueueLimits,

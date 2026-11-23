@@ -1,7 +1,5 @@
 use std::{path::PathBuf, process::Command};
 
-pub(crate) use crate::oltp::test_hooks::growth::data_raft_isolated;
-
 pub(crate) fn snapshot_test_config(mut config: openraft::Config) -> openraft::Config {
     if std::env::var_os("NABEDRA_OLTP_TEST_SHORT_DATA_SNAPSHOTS").is_some() {
         config.snapshot_policy = openraft::SnapshotPolicy::LogsSinceLast(16);

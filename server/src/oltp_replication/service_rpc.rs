@@ -15,7 +15,7 @@ pub(crate) mod direct;
 mod grant_cache;
 pub(crate) use grant_cache::GrantCache;
 use grant_cache::GrantKey;
-mod metadata;
+pub(crate) mod metadata;
 mod participant;
 mod participant_full;
 mod read_attempt;
@@ -87,7 +87,7 @@ pub(super) const SERVICE_HEADER_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-enum Method {
+pub(crate) enum Method {
     StatusCall {
         operation: u8,
         mutation: bool,
@@ -228,7 +228,7 @@ impl Method {
             _ => Purpose::Authority,
         }
     }
-    fn class(self) -> TrafficClass {
+    pub(crate) fn class(self) -> TrafficClass {
         match self.purpose() {
             Purpose::Storage => TrafficClass::Storage,
             Purpose::Settlement => TrafficClass::Settlement,
@@ -237,7 +237,7 @@ impl Method {
             _ => TrafficClass::ServiceAuthority,
         }
     }
-    fn can_repeat_read(self) -> bool {
+    pub(crate) fn can_repeat_read(self) -> bool {
         matches!(self.purpose(), Purpose::Authority | Purpose::Storage)
             && !matches!(
                 self,
@@ -324,25 +324,25 @@ async fn registered_target(
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Header {
+pub(crate) struct Header {
     to_node: u64,
-    action: ServiceAction,
-    method: Method,
-    payload_bytes: u64,
+    pub(crate) action: ServiceAction,
+    pub(crate) method: Method,
+    pub(crate) payload_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    placement_generation: Option<uuid::Uuid>,
+    pub(crate) placement_generation: Option<uuid::Uuid>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReplyHeader {
+pub(crate) struct ReplyHeader {
     node: u64,
     nonce: uuid::Uuid,
     bytes: u64,
     digest: Digest,
-    error: Option<ProtocolError>,
+    pub(crate) error: Option<ProtocolError>,
 }
 
-enum CallError {
+pub(crate) enum CallError {
     Transport(RequestError),
     Local(ProtocolError),
 }
@@ -375,7 +375,7 @@ type TransportFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ReceivedReply, RequestError>> + Send + 'a>,
 >;
 
-struct Client {
+pub(crate) struct Client {
     group: GroupIdentity,
     shared: Arc<WorkerSharedResources>,
     transport: WorkerClient,
@@ -440,7 +440,7 @@ pub(crate) struct DirectRoutingStats {
     pub refreshes: u64,
 }
 impl Client {
-    fn new(
+    pub(crate) fn new(
         group: GroupIdentity,
         shared: Arc<WorkerSharedResources>,
         transport: WorkerClient,
@@ -464,7 +464,7 @@ impl Client {
             _metadata: metadata,
         })
     }
-    async fn read(&self, method: Method) -> Result<ServiceResponse, ProtocolError> {
+    pub(crate) async fn read(&self, method: Method) -> Result<ServiceResponse, ProtocolError> {
         self.call(method, None).await
     }
     async fn call(
@@ -552,7 +552,7 @@ impl Client {
         method: Method,
         payload: ChargedBytes,
     ) -> Result<ServiceResponse, ProtocolError> {
-        use crate::oltp_runtime::stage_timing::{perf_stage, timed};
+        use nabedra_resources::{perf_stage, stage_timing::timed};
         let deadline = nabedra_rt::time::now() + SERVICE_CONVERGENCE;
         self.direct
             .used_ms
@@ -622,7 +622,7 @@ impl Client {
             // The reply failed this side's checks.
             Ok(Err(CallError::Local(_))) => true,
         };
-        crate::oltp_runtime::stage_timing::perf_stage!("ts.rpc.thin_failed").record(Duration::ZERO);
+        nabedra_resources::perf_stage!("ts.rpc.thin_failed").record(Duration::ZERO);
         if route_failed {
             let _ = self
                 .leader
@@ -666,8 +666,8 @@ impl Client {
                 {
                     continue;
                 }
-                let refreshed = crate::oltp_runtime::stage_timing::timed(
-                    crate::oltp_runtime::stage_timing::perf_stage!("ts.routes.refresh"),
+                let refreshed = nabedra_resources::stage_timing::timed(
+                    nabedra_resources::perf_stage!("ts.routes.refresh"),
                     nabedra_rt::time::timeout(
                         SERVICE_CONVERGENCE,
                         client.control.replica_routes(&client.group),
@@ -1148,7 +1148,7 @@ impl Client {
         *possibly_applied = true;
         Some(Err(route_failure.into()))
     }
-    async fn call_member(
+    pub(crate) async fn call_member(
         &self,
         action: ServiceAction,
         method: Method,
@@ -1209,7 +1209,7 @@ impl Client {
             return Err(unsupported_service_route().into());
         }
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport start");
-        let _timer = crate::oltp_runtime::stage_timing::variant("rpc.call.", &method).timer();
+        let _timer = nabedra_resources::stage_timing::variant("rpc.call.", &method).timer();
         let sections = [payload.clone(), None, None];
         // Box the transport future and the lane wait. Keeping either inline
         // grew nested service futures enough to overflow Tokio worker
@@ -1399,8 +1399,8 @@ fn reply_digest_and_budget(input: &[u8]) -> Result<(Digest, usize), ProtocolErro
             .ok_or_else(invalid)?,
     ))
 }
-struct ServiceResponse {
-    reply: ReceivedReply,
+pub(crate) struct ServiceResponse {
+    pub(crate) reply: ReceivedReply,
     node: u64,
     digest: Digest,
     method: Method,
@@ -1438,7 +1438,7 @@ impl ServiceResponse {
             self.reply.scratch.clone(),
         )
     }
-    fn status_context(&self) -> AuthenticatedStatusReplyContext {
+    pub(crate) fn status_context(&self) -> AuthenticatedStatusReplyContext {
         AuthenticatedStatusReplyContext {
             group: self.reply.group().clone(),
             node: self.node,
@@ -1504,7 +1504,7 @@ impl AuthenticatedStatusReplyContext {
         self.owner.clone()
     }
 }
-fn parse(
+pub(crate) fn parse(
     session: &AuthenticatedSession,
     group: &GroupIdentity,
     node: u64,
@@ -1526,7 +1526,7 @@ fn parse(
     crate::protocol::json_input(bytes, SERVICE_HEADER_BYTES).map_err(|_| invalid())?;
     let header: Header = serde_json::from_slice(bytes).map_err(|_| invalid())?;
     // PERF1: service calls this process serves, by method.
-    crate::oltp_runtime::stage_timing::variant("rpc.serve.", &header.method)
+    nabedra_resources::stage_timing::variant("rpc.serve.", &header.method)
         .record(std::time::Duration::ZERO);
     if header.to_node != node
         || session.purpose() != header.method.purpose()
@@ -1560,7 +1560,7 @@ async fn service_grant(
     header: &Header,
 ) -> Result<ServiceAuthorization, ProtocolError> {
     let key = GrantKey::new(session.remote(), header.action, session.group(), None);
-    let scope = crate::oltp_runtime::replica::QueueScope {
+    let scope = nabedra_oltp_types::queue::QueueScope {
         cluster_id: session.group().cluster_id,
         database: session.group().database.clone(),
     };
@@ -1580,12 +1580,12 @@ async fn service_grant(
 /// The caller's role only. A passed check is cached per caller incarnation
 /// and role while the locally applied Control revision is unchanged and the
 /// Control read started under 5 s ago.
-async fn authorize(
+pub(crate) async fn authorize(
     control: &Arc<ControlClient>,
     session: &AuthenticatedSession,
     header: &Header,
 ) -> Result<(), ProtocolError> {
-    let scope = crate::oltp_runtime::replica::QueueScope {
+    let scope = nabedra_oltp_types::queue::QueueScope {
         cluster_id: session.group().cluster_id,
         database: session.group().database.clone(),
     };
@@ -1649,7 +1649,7 @@ async fn authorize(
 /// The background refresh of one warm role check (RD2, `grant_cache`).
 pub(super) fn warm_role(
     control: &Arc<ControlClient>,
-    scope: crate::oltp_runtime::replica::QueueScope,
+    scope: nabedra_oltp_types::queue::QueueScope,
     remote: WorkerIdentity,
     action: ServiceAction,
     target: GroupIdentity,
@@ -1675,7 +1675,7 @@ pub(super) fn warm_role(
 /// the request path does.
 pub(super) fn warm_role_or(
     control: &Arc<ControlClient>,
-    scope: crate::oltp_runtime::replica::QueueScope,
+    scope: nabedra_oltp_types::queue::QueueScope,
     remote: WorkerIdentity,
     action: ServiceAction,
     target: GroupIdentity,
@@ -1700,7 +1700,7 @@ pub(super) fn warm_role_or(
         ))
     })
 }
-async fn reply(
+pub(crate) async fn reply(
     shared: &Arc<WorkerSharedResources>,
     session: &AuthenticatedSession,
     node: u64,
@@ -1777,7 +1777,7 @@ fn build_reply(
         sections: [payload, None, None],
     })
 }
-fn unavailable() -> ProtocolError {
+pub(crate) fn unavailable() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::StorageUnavailable,
         "no registered group leader completed the strong service call",
@@ -1870,7 +1870,7 @@ impl AuthenticatedParticipantReplyContext {
         })
     }
 }
-fn invalid() -> ProtocolError {
+pub(crate) fn invalid() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::ValidationError,
         "authenticated participant proof context differs",

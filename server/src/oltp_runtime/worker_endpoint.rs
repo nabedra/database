@@ -2,14 +2,12 @@
 //! listener. Application operations are admitted and executed by WorkerRuntime
 //! under the durable Control/TSO/Status authority.
 use super::replica::*;
-use crate::oltp_replication::authority::timestamp::ScopedTerminalStatement;
 use crate::{
     oltp::pool::{ByteClass, ExecutionClass, ScratchLease, WorkerSharedResources},
     oltp_replication::{multiplex::*, owned::serialized_digest, service_rpc::ReadGrant, types::*},
     protocol::{ErrorCode, Outcome, ProtocolError},
-    request_queue::{QueueError, RequestState},
+    request_queue::QueueError,
 };
-use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -19,316 +17,10 @@ use uuid::Uuid;
 mod scoped_payload;
 mod scoped_retirement;
 
-/// Implementations use the separate Authority transport lane. They must not
-/// acquire queue-data/control body permits or recursively authenticate Control
-/// consensus through another strong Control lookup.
-pub trait AuthorityReader: Send + Sync + 'static {
-    fn current<'a>(&'a self, scope: &'a QueueScope) -> EndpointFuture<'a, QueueAuthority>;
-    fn removal_view<'a>(
-        &'a self,
-        _scope: &'a QueueScope,
-        _owner: WorkerIdentity,
-        _ticket: JoinTicket,
-    ) -> EndpointFuture<'a, QueueAuthority> {
-        Box::pin(async { Err(QueueError::Stale.protocol()) })
-    }
-    fn excludes_process(&self, _worker: WorkerIdentity) -> EndpointFuture<'_, bool> {
-        Box::pin(async { Ok(false) })
-    }
-    /// One Control snapshot checks the exact current enrollment and TSO group
-    /// membership. Ordinary worker authorities cannot read proof metadata.
-    fn terminal_reader_view<'a>(
-        &'a self,
-        _scope: &'a QueueScope,
-        _remote: WorkerIdentity,
-        _timestamps_group_id: Uuid,
-    ) -> EndpointFuture<'a, QueueAuthority> {
-        Box::pin(async {
-            Err(ProtocolError::new(
-                ErrorCode::Unauthorized,
-                "terminal proof reader is not authorized",
-                Outcome::NotApplied,
-            ))
-        })
-    }
-}
+pub use crate::oltp_replication::queue_access::AuthorityReader;
+use crate::oltp_replication::queue_access::{JoinObservation, RemovalObservation, TerminalObservation};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum QueueRequest {
-    Ping {
-        scope: QueueScope,
-        view: AuthorityView,
-    },
-    RemovalStatement {
-        scope: QueueScope,
-        view: AuthorityView,
-        ticket: JoinTicket,
-    },
-    RemovalRecord {
-        scope: QueueScope,
-        ticket: JoinTicket,
-        after: Option<Uuid>,
-    },
-    Install {
-        record: RecordHeader,
-    },
-    ScopedPayloadV2 {
-        queue_group_id: Uuid,
-        data_generation: Uuid,
-        queue_generation: Uuid,
-        record: Box<RecordHeader>,
-    },
-    ScopedPayloadWitnessV2 {
-        scope: QueueScope,
-        view: AuthorityView,
-        queue_group_id: Uuid,
-        data_generation: Uuid,
-        queue_generation: Uuid,
-        request: RequestBinding,
-        version: RecordVersion,
-    },
-    ScopedMarkerV2 {
-        scope: QueueScope,
-        view: AuthorityView,
-        queue_group_id: Uuid,
-        data_generation: Uuid,
-        queue_generation: Uuid,
-        request: RequestBinding,
-        version: RecordVersion,
-        witness: bool,
-    },
-    ScopedTerminalV2 {
-        queue_group_id: Uuid,
-        data_generation: Uuid,
-        queue_generation: Uuid,
-        record: Box<RecordHeader>,
-        version: RecordVersion,
-    },
-    ScopedTerminalRepairV2 {
-        queue_group_id: Uuid,
-        data_generation: Uuid,
-        queue_generation: Uuid,
-        record: Box<scoped_store::ScopedTransferRecord>,
-    },
-    ScopedTerminalWitnessV2 {
-        scope: QueueScope,
-        view: AuthorityView,
-        queue_group_id: Uuid,
-        data_generation: Uuid,
-        queue_generation: Uuid,
-        request: RequestBinding,
-        payload: RecordVersion,
-        terminal: RecordVersion,
-    },
-    #[allow(private_interfaces)]
-    ScopedTerminalStateV2 {
-        scope: QueueScope,
-        source_group: Uuid,
-        statement: Box<ScopedTerminalStatement>,
-    },
-    ScopedSurvivorV2 {
-        scope: QueueScope,
-        view: AuthorityView,
-        queue_group_id: Uuid,
-        transfer_id: Uuid,
-        after: Option<Uuid>,
-    },
-    JoinPage {
-        scope: QueueScope,
-        view: AuthorityView,
-        page: Box<JoinPageHeader>,
-        record: Option<RecordHeader>,
-    },
-    State {
-        scope: QueueScope,
-        view: AuthorityView,
-        request_id: Uuid,
-    },
-    TerminalState {
-        scope: QueueScope,
-        view: AuthorityView,
-        request_id: Uuid,
-        timestamps_group_id: Uuid,
-    },
-    JoinStatement {
-        scope: QueueScope,
-        view: AuthorityView,
-        ticket_id: Uuid,
-    },
-    AdmissionState {
-        scope: QueueScope,
-        view: AuthorityView,
-        ticket: Box<crate::oltp_replication::service_rpc::OwnerAdmissionTicket>,
-    },
-    ReadGrantCopy {
-        scope: QueueScope,
-        view: AuthorityView,
-        request_id: Uuid,
-        set: ReadGrantSet,
-    },
-    ReadGrantSettle {
-        scope: QueueScope,
-        view: AuthorityView,
-        grant: Box<ReadGrant>,
-    },
-    Result {
-        scope: QueueScope,
-        view: AuthorityView,
-        request_id: Uuid,
-        version: u64,
-    },
-}
-impl QueueRequest {
-    fn scope(&self) -> &QueueScope {
-        match self {
-            Self::Install { record } => &record.scope,
-            Self::ScopedPayloadV2 { record, .. } | Self::ScopedTerminalV2 { record, .. } => {
-                &record.scope
-            }
-            Self::ScopedTerminalRepairV2 { record, .. } => &record.payload_header().scope,
-            Self::State { scope, .. }
-            | Self::Ping { scope, .. }
-            | Self::RemovalRecord { scope, .. }
-            | Self::RemovalStatement { scope, .. }
-            | Self::TerminalState { scope, .. }
-            | Self::JoinStatement { scope, .. }
-            | Self::AdmissionState { scope, .. }
-            | Self::ReadGrantCopy { scope, .. }
-            | Self::ReadGrantSettle { scope, .. }
-            | Self::ScopedPayloadWitnessV2 { scope, .. }
-            | Self::ScopedMarkerV2 { scope, .. }
-            | Self::ScopedTerminalWitnessV2 { scope, .. }
-            | Self::ScopedTerminalStateV2 { scope, .. }
-            | Self::ScopedSurvivorV2 { scope, .. }
-            | Self::Result { scope, .. }
-            | Self::JoinPage { scope, .. } => scope,
-        }
-    }
-    fn view(&self) -> AuthorityView {
-        match self {
-            Self::Install { record } => record.ready.view,
-            Self::ScopedPayloadV2 { record, .. } | Self::ScopedTerminalV2 { record, .. } => {
-                record.ready.view
-            }
-            Self::ScopedTerminalRepairV2 { record, .. } => record.payload_header().ready.view,
-            Self::RemovalRecord { ticket, .. } => ticket.source_ready.view,
-            Self::ScopedTerminalStateV2 { statement, .. } => statement.epoch.view,
-            Self::State { view, .. }
-            | Self::Ping { view, .. }
-            | Self::RemovalStatement { view, .. }
-            | Self::TerminalState { view, .. }
-            | Self::JoinStatement { view, .. }
-            | Self::AdmissionState { view, .. }
-            | Self::ReadGrantCopy { view, .. }
-            | Self::ReadGrantSettle { view, .. }
-            | Self::ScopedPayloadWitnessV2 { view, .. }
-            | Self::ScopedMarkerV2 { view, .. }
-            | Self::ScopedTerminalWitnessV2 { view, .. }
-            | Self::ScopedSurvivorV2 { view, .. }
-            | Self::Result { view, .. }
-            | Self::JoinPage { view, .. } => *view,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QueueState {
-    pub request_id: Uuid,
-    pub run_id: Uuid,
-    pub version: u64,
-    pub state: RequestState,
-    pub copies_complete: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum QueueReply {
-    Ping {
-        worker: WorkerIdentity,
-        ready: ReadyMembership,
-        nonce: Uuid,
-    },
-    RemovalStatement {
-        worker: WorkerIdentity,
-        statement: Box<QueueCopyStatement>,
-        nonce: Uuid,
-    },
-    RemovalRecord {
-        worker: WorkerIdentity,
-        ticket: JoinTicket,
-        after: Option<Uuid>,
-        record: Option<Box<RecordHeader>>,
-        nonce: Uuid,
-    },
-    Installed {
-        worker: WorkerIdentity,
-        record: RecordVersion,
-        nonce: Uuid,
-    },
-    ReadGrantConfirmed {
-        digest: Digest,
-        nonce: Uuid,
-    },
-    Joined {
-        worker: WorkerIdentity,
-        page: Box<JoinPageHeader>,
-        nonce: Uuid,
-    },
-    State(QueueState),
-    TerminalState {
-        worker: WorkerIdentity,
-        statement: Box<TerminalCopyStatement>,
-        nonce: Uuid,
-    },
-    JoinStatement {
-        worker: WorkerIdentity,
-        statement: Box<QueueCopyStatement>,
-        nonce: Uuid,
-    },
-    Result {
-        request_id: Uuid,
-        version: u64,
-        status: u16,
-        response_bytes: u64,
-    },
-}
-
-/// Constructed only by the authenticated client response path. Callers cannot
-/// deserialize an observation or supply a worker's unverified ACK payload.
-pub(crate) struct TerminalObservation {
-    worker: WorkerIdentity,
-    statement: TerminalCopyStatement,
-    nonce: Uuid,
-}
-/// Only the authenticated transport client creates this completion proof.
-/// A page ACK alone never certifies that the complete snapshot and delta exist.
-pub(crate) struct JoinObservation {
-    worker: WorkerIdentity,
-    statement: QueueCopyStatement,
-    nonce: Uuid,
-}
-pub(crate) struct RemovalObservation {
-    worker: WorkerIdentity,
-    statement: QueueCopyStatement,
-    nonce: Uuid,
-}
-impl RemovalObservation {
-    pub(crate) fn into_parts(self) -> (WorkerIdentity, QueueCopyStatement, Uuid) {
-        (self.worker, self.statement, self.nonce)
-    }
-}
-impl JoinObservation {
-    pub(crate) fn into_parts(self) -> (WorkerIdentity, QueueCopyStatement, Uuid) {
-        (self.worker, self.statement, self.nonce)
-    }
-}
-impl TerminalObservation {
-    pub(crate) fn into_parts(self) -> (WorkerIdentity, TerminalCopyStatement, Uuid) {
-        (self.worker, self.statement, self.nonce)
-    }
-}
+pub use nabedra_oltp_types::queue::{QueueReply, QueueRequest, QueueState};
 
 pub struct QueueEndpoint {
     replica: Arc<Mutex<WorkerReplica>>,
@@ -352,12 +44,7 @@ pub struct QueuePeerClient {
     group: GroupIdentity,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PeerReachability {
-    Reachable,
-    Unreachable,
-    Indeterminate,
-}
+pub(crate) use nabedra_oltp_types::queue::PeerReachability;
 
 impl QueuePeerClient {
     pub(crate) async fn copy_read_grants(
@@ -535,30 +222,7 @@ impl QueuePeerClient {
                 4 * super::replica::MAX_HEADER_BYTES,
             )
             .await?;
-        if reply.remote_identity() != target
-            || reply.group() != &self.group
-            || reply.purpose() != Purpose::QueueControl
-            || reply.sections.iter().any(Option::is_some)
-        {
-            return Err(malformed("queue removal transport context differs"));
-        }
-        let decode = crate::oltp::mvcc::json_decode_budget(reply.header.as_ref())?;
-        let reply = reply.reserve_reply_decode(&self.shared, decode).await?;
-        let decoded = reply.decode_header::<QueueReply>()?;
-        match &*decoded {
-            QueueReply::RemovalStatement {
-                worker,
-                statement,
-                nonce,
-            } if *worker == target && statement.ticket == ticket && *nonce == reply.nonce() => {
-                Ok(RemovalObservation {
-                    worker: *worker,
-                    statement: **statement,
-                    nonce: *nonce,
-                })
-            }
-            _ => Err(malformed("queue removal statement differs")),
-        }
+        RemovalObservation::from_reply(reply, &self.group, target, ticket, &self.shared).await
     }
     pub(crate) async fn removal_record(
         &self,
@@ -807,35 +471,7 @@ impl QueuePeerClient {
                 0,
             )
             .await?;
-        if reply.remote_identity() != target
-            || reply.group() != &self.group
-            || reply.purpose() != Purpose::QueueControl
-            || reply.sections.iter().any(Option::is_some)
-        {
-            return Err(malformed("terminal metadata transport context differs"));
-        }
-        if reply.header.len() > super::replica::MAX_HEADER_BYTES {
-            return Err(malformed("terminal metadata header exceeds bounds"));
-        }
-        let decode = crate::oltp::mvcc::json_decode_budget(reply.header.as_ref())?;
-        let reply = reply.reserve_reply_decode(&self.shared, decode).await?;
-        let decoded = reply.decode_header::<QueueReply>()?;
-        let QueueReply::TerminalState {
-            worker,
-            statement,
-            nonce,
-        } = &*decoded
-        else {
-            return Err(malformed("expected terminal metadata reply"));
-        };
-        if *worker != target || statement.as_ref() != expected || *nonce != reply.nonce() {
-            return Err(malformed("terminal metadata statement differs"));
-        }
-        Ok(TerminalObservation {
-            worker: *worker,
-            statement: statement.as_ref().clone(),
-            nonce: *nonce,
-        })
+        TerminalObservation::from_reply(reply, &self.group, target, expected, &self.shared).await
     }
     pub async fn install_join_page(
         &self,
@@ -927,35 +563,7 @@ impl QueuePeerClient {
                 4 * super::replica::MAX_HEADER_BYTES,
             )
             .await?;
-        if reply.remote_identity() != target
-            || reply.group() != &self.group
-            || reply.purpose() != Purpose::QueueControl
-            || reply.sections.iter().any(Option::is_some)
-        {
-            return Err(malformed("join completion transport context differs"));
-        }
-        if reply.header.len() > super::replica::MAX_HEADER_BYTES {
-            return Err(malformed("join completion header exceeds bounds"));
-        }
-        let decode = crate::oltp::mvcc::json_decode_budget(reply.header.as_ref())?;
-        let reply = reply.reserve_reply_decode(&self.shared, decode).await?;
-        let decoded = reply.decode_header::<QueueReply>()?;
-        let QueueReply::JoinStatement {
-            worker,
-            statement,
-            nonce,
-        } = &*decoded
-        else {
-            return Err(malformed("expected join completion statement"));
-        };
-        if *worker != target || statement.as_ref() != expected || *nonce != reply.nonce() {
-            return Err(malformed("join completion statement differs"));
-        }
-        Ok(JoinObservation {
-            worker: *worker,
-            statement: statement.as_ref().clone(),
-            nonce: *nonce,
-        })
+        JoinObservation::from_reply(reply, &self.group, target, expected, &self.shared).await
     }
     /// Exact immutable response bytes remain charged through the caller's send.
     pub async fn result(
@@ -1019,6 +627,39 @@ impl QueuePeerClient {
         Ok(reply)
     }
 }
+pub(crate) fn probe_queue_peer(
+    manager: &crate::oltp_replication::manager::HostedGroupManager,
+    group: &GroupIdentity,
+    worker: WorkerIdentity,
+    scope: QueueScope,
+    ready: ReadyMembership,
+) -> EndpointFuture<'static, PeerReachability> {
+    let peer = QueuePeerClient::new(manager.client(), manager.resources().clone(), group.clone());
+    Box::pin(async move { Ok(peer?.probe(worker, scope, ready).await) })
+}
+
+impl crate::oltp_replication::queue_access::TerminalQueueReader for QueuePeerClient {
+    fn terminal_observation<'a>(
+        &'a self,
+        worker: WorkerIdentity,
+        scope: QueueScope,
+        expected: &'a TerminalCopyStatement,
+        timestamps_group_id: Uuid,
+    ) -> EndpointFuture<'a, TerminalObservation> {
+        Box::pin(self.terminal_state(worker, scope, expected, timestamps_group_id))
+    }
+
+    fn scoped_terminal_state<'a>(
+        &'a self,
+        worker: WorkerIdentity,
+        placement: &'a crate::oltp_replication::authority::control::ScopedQueuePlacement,
+        statement: &'a nabedra_oltp_types::queue::ScopedTerminalStatement,
+        source_group: Uuid,
+    ) -> EndpointFuture<'a, crate::oltp_replication::authority::timestamp::ScopedTerminalWitness> {
+        Box::pin(self.scoped_terminal_state(worker, placement, statement, source_group))
+    }
+}
+
 impl crate::oltp_replication::service_rpc::OwnerAdmissionReader for QueuePeerClient {
     fn verify<'a>(
         &'a self,

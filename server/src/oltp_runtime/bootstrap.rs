@@ -1109,18 +1109,8 @@ pub(super) fn registered_raft_config() -> openraft::Config {
     }
 }
 
-pub(crate) fn raft_config() -> openraft::Config {
-    openraft::Config {
-        heartbeat_interval: 100,
-        election_timeout_min: 200,
-        election_timeout_max: 400,
-        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
-            crate::oltp_replication::hosted::SNAPSHOT_LOGS_SINCE_LAST,
-        ),
-        max_in_snapshot_log_to_keep: crate::oltp_replication::hosted::SNAPSHOT_LOGS_TO_KEEP,
-        ..Default::default()
-    }
-}
+pub(crate) use crate::oltp_replication::raft_config;
+
 pub(super) fn queue_limits(execution: &ExecutionConfig) -> QueueLimits {
     QueueLimits {
         max_pending_requests: execution.max_pending_requests as usize,

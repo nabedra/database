@@ -28,22 +28,8 @@ impl QueueLimits {
         Ok(())
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequestState {
-    Queued,
-    Running,
-    Committing,
-    Reconciling,
-    Succeeded,
-    Failed,
-    Abandoned,
-}
-impl RequestState {
-    pub fn terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Abandoned)
-    }
-}
+pub use nabedra_protocol::RequestState;
+
 /// Internal identity leaves the public operation UUID and exact bytes intact.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

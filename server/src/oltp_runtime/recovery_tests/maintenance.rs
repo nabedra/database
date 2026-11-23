@@ -12,7 +12,6 @@ use serde_json::{Value, json};
 use std::fs;
 use uuid::Uuid;
 
-pub(crate) use crate::oltp::test_hooks::maintenance::hold_snapshot;
 
 fn failed(error: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::new(

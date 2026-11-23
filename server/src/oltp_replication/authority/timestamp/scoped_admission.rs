@@ -1,5 +1,5 @@
 use super::*;
-use crate::oltp_runtime::replica::OriginalAuthorization;
+use nabedra_oltp_types::queue::OriginalAuthorization;
 use uuid::Uuid;
 
 const ORIGIN_PREFIX: &[u8] = b"ts/scoped-origin/";

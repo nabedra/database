@@ -1,4 +1,5 @@
 use super::*;
+use nabedra_oltp_types::queue::QueueReadSource;
 use crate::oltp::test_hooks::continuation;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -118,7 +119,7 @@ impl HeldContinuation {
     pub(super) async fn probe(
         self,
         client: &Client,
-        queue: &Arc<QueueCoordinator>,
+        queue: &Arc<dyn QueueReadSource>,
         scope: ReadScope,
         payload: &ChargedBytes,
         hash: Digest,
@@ -132,16 +133,9 @@ impl HeldContinuation {
             .find(|member| member.worker_id == target)
             .ok_or_else(unavailable)?
             .node_id;
-        let replica = client.shared.read_replica::<Mutex<WorkerReplica>>()?;
-        let (owner, worker) = {
-            let replica = replica.lock().map_err(|_| unavailable())?;
-            (
-                replica.local_identity(),
-                replica
-                    .read_member(scope.authority, target)
-                    .ok_or_else(unavailable)?,
-            )
-        };
+        let replica = client.shared.read_replica()?;
+        let owner = replica.local_identity()?;
+        let worker = replica.read_member(scope.authority, target)?.ok_or_else(unavailable)?;
         let wrong_scope = ReadScope {
             read_ts: ReadTs::new(scope.read_ts.get().checked_add(1).unwrap()).unwrap(),
             ..scope

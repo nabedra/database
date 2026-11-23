@@ -62,7 +62,9 @@ impl LocalServices {
                 Outcome::NotApplied,
             ));
         }
-        let mut worker = RegisteredWorker::open_development(
+        let mut worker = RegisteredWorker::open_development::<
+            crate::oltp_runtime::worker_runtime::archive::VerifiedNativeRestore,
+        >(
             config,
             resources,
             SharedResourceConfig {
@@ -151,6 +153,7 @@ impl LocalServices {
                 Arc::new(crate::oltp_replication::manager::system_recovery::QuorumEndpoint {
                     manager: manager.clone(),
                     control: control.clone(),
+                    probe_queue_peer: super::super::worker_endpoint::probe_queue_peer,
                 }),
             )?;
             let control_endpoint = ControlEndpoint::new(control.clone(), shared.clone())?;
@@ -701,7 +704,7 @@ impl LocalServices {
             if bootstrap {
                 let proof = {
                     let replica = replica.lock().map_err(|_| unavailable())?;
-                    VerifiedQueueCopy::from_empty_worker(ticket, &replica)?
+                    VerifiedQueueCopy::from_empty_worker(ticket, &*replica)?
                 };
                 accepted(control.publish_ready(nabedra_rt::ids::uuid_v4(), proof).await?.reply)?;
                 let current = startup_read(deadline, &error_trace, "queue authority", || control.current(&scope)).await?;

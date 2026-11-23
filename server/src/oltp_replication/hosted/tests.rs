@@ -2,9 +2,9 @@
 //! and commit hints, and the purge/snapshot durability boundary. NS7: the Raft
 //! log on journal values at pool level (NS13, NS04 relocation crashes, write
 //! amplification).
+use nabedra_resources::config::WorkerResources;
 use super::*;
 use crate::{
-    config::WorkerResources,
     oltp::pool::{
         ByteClass, OltpPool, PoolIdentity, ScratchLease, SharedResourceConfig, TransactionBudget,
         WorkerSharedResources,
@@ -1204,7 +1204,7 @@ fn d01_perf2b_inline_digest_equals_the_native_digest() {
 }
 
 pub(crate) fn acceptance_o11_storage() {
-    use crate::oltp_acceptance::clause;
+    use crate::oltp_replication::acceptance_clause as clause;
 
     d09_o11_o29_lost_unsynced_applies_replay_once_from_the_synced_log();
     o11_purge_and_snapshot_never_pass_the_durable_applied_index();

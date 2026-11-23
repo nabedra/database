@@ -11,7 +11,7 @@ use crate::oltp_replication::authority::{
     control::{ScopedCatalogRead, ScopedQueuePlacement, ScopedQueueTransition},
     status::StatusTopology,
 };
-use crate::oltp_runtime::replica::OriginalAuthorization;
+use nabedra_oltp_types::queue::OriginalAuthorization;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
@@ -20,11 +20,11 @@ pub(crate) use point_decision::VerifiedTimestampPointDecision;
 
 // The owner shares the four outgoing service mutation slots with foreground
 // timestamp and Status operations. Cleanup can occupy at most two of them.
-const RELEASE_CALLS: usize = 2;
+pub(crate) const RELEASE_CALLS: usize = 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-enum Request {
+pub(crate) enum Request {
     ArchiveMetadata {
         closure: ArchiveClosureStatement,
         after: Option<Vec<u8>>,
@@ -297,6 +297,16 @@ pub(crate) struct TimestampEndpoint {
     backup: std::sync::OnceLock<Arc<dyn BackupPublicationReader>>,
 }
 impl TimestampEndpoint {
+    #[cfg(test)]
+    pub(crate) fn resources_for_test(&self) -> &Arc<WorkerSharedResources> {
+        self.handle.resources()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn node_for_test(&self) -> u64 {
+        self.node
+    }
+
     pub(crate) fn new(
         handle: Arc<TimestampHandle>,
         node: u64,
@@ -325,7 +335,7 @@ impl TimestampEndpoint {
     ) -> Result<(), ProtocolError> {
         self.backup.set(reader).map_err(|_| invalid())
     }
-    fn parse(&self, session: &AuthenticatedSession, bytes: &[u8]) -> Result<Header, ProtocolError> {
+    pub(crate) fn parse(&self, session: &AuthenticatedSession, bytes: &[u8]) -> Result<Header, ProtocolError> {
         let head = parse(session, self.handle.identity(), self.node, bytes)?;
         let permitted = match head.method {
             Method::TimestampCall {
@@ -1014,8 +1024,8 @@ impl TimestampEndpoint {
             }
             Request::Release { statement } => {
                 let release = self.handle.release(statement).await?;
-                #[cfg(test)]
-                crate::oltp_runtime::recovery_tests::transaction_checkpoint(
+                #[cfg(any(test, feature = "test-hooks"))]
+                crate::oltp::test_hooks::transaction_checkpoint(
                     "terminal-pin-release",
                     release.statement().request.request_id,
                     &release.wire_parts(),
@@ -1036,7 +1046,7 @@ impl TimestampEndpoint {
                 next,
                 ready,
             } => {
-                let scope = crate::oltp_runtime::replica::QueueScope {
+                let scope = nabedra_oltp_types::queue::QueueScope {
                     cluster_id: self.handle.identity().cluster_id,
                     database: self.handle.identity().database.clone(),
                 };
@@ -1073,7 +1083,7 @@ impl TimestampEndpoint {
                 next,
             } => {
                 tracing::debug!(group = %self.handle.identity().group_id, %transition_id, stage = "ready-control-start", "timestamp ready transition");
-                let scope = crate::oltp_runtime::replica::QueueScope {
+                let scope = nabedra_oltp_types::queue::QueueScope {
                     cluster_id: self.handle.identity().cluster_id,
                     database: self.handle.identity().database.clone(),
                 };
@@ -1253,7 +1263,7 @@ impl Endpoint for TimestampEndpoint {
         sections: ChargedSections,
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
-            let _timer = crate::oltp_runtime::stage_timing::perf_stage!("ts.serve.total").timer();
+            let _timer = nabedra_resources::perf_stage!("ts.serve.total").timer();
             let head = self.parse(&session, bytes.as_slice())?;
             if let Method::TimestampPointDecisionRead { route, source_digest, locator_digest } = head.method {
                 let result = self.read_point_decision(
@@ -1357,6 +1367,11 @@ pub(crate) struct TimestampClient {
     releases: Arc<Semaphore>,
 }
 impl TimestampClient {
+    #[cfg(test)]
+    pub(crate) fn release_slots_for_test(&self) -> &Semaphore {
+        &self.releases
+    }
+
     pub(crate) async fn cold_pin_step(
         &self,
         authority: Authority,
@@ -1459,7 +1474,7 @@ impl TimestampClient {
         &self,
         request: Request,
     ) -> Result<ServiceResponse, ProtocolError> {
-        use crate::oltp_runtime::stage_timing::{perf_stage, timed};
+        use nabedra_resources::{perf_stage, stage_timing::timed};
         let method = request.method();
         // PERF2a: the request is a few bytes of fixed-shape JSON (the same
         // bytes as before, so every peer decodes it): encode it on this task.
@@ -1739,7 +1754,7 @@ impl TimestampClient {
             return Err(invalid());
         }
         let response = self.response(Request::AllocateDirect { count }).await?;
-        let _timer = crate::oltp_runtime::stage_timing::perf_stage!("ts.rpc.decode").timer();
+        let _timer = nabedra_resources::perf_stage!("ts.rpc.decode").timer();
         // PERF2a: a range is about 60 bytes; decode it on this task. Its
         // decode charge was reserved with the reply (`member_reply`).
         let section = response.reply.sections[0].as_ref().ok_or_else(invalid)?;

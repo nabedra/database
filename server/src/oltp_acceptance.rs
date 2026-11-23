@@ -155,9 +155,4 @@ async fn acceptance_o29() {
     process_scenario("O29", "oltp_o29_acceptance.py");
 }
 
-pub(crate) fn clause(scenario: &str, assertion: &str, status: &str, detail: &str) {
-    let marker = serde_json::json!({
-        "scenario": scenario, "assertion": assertion, "status": status, "detail": detail,
-    });
-    println!("NABEDRA_OLTP_ASSERT {marker}");
-}
+pub(crate) use crate::oltp_replication::acceptance_clause as clause;

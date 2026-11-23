@@ -1137,7 +1137,7 @@ impl StatusHandle {
     /// error never grants permission to release its pin or admit the UUID again.
     pub(crate) async fn reject_unaccepted(
         &self,
-        cap: &crate::oltp_runtime::worker_runtime::VerifiedNeverAccepted,
+        cap: &dyn crate::oltp_replication::queue_access::NeverAcceptedAdmission,
     ) -> Result<VerifiedAdmissionRejection, ProtocolError> {
         if cap.scope().cluster_id != self.identity().cluster_id
             || cap.scope().database != self.identity().database
@@ -1438,7 +1438,7 @@ impl StatusHandle {
                     }
                     if digest.is_some_and(|digest| record.reservation.digest != digest) {
                         return Err(if record.reservation.scoped.is_some() {
-                            crate::request_queue::QueueError::Conflict.protocol()
+                            nabedra_protocol::QueueError::Conflict.protocol()
                         } else {
                             invalid()
                         });

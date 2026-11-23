@@ -14,7 +14,6 @@ pub(crate) use nabedra_resources::memory::{
 };
 use serde::Serialize;
 use std::{
-    any::Any,
     collections::BTreeMap,
     sync::{
         Arc, Mutex, OnceLock, Weak,
@@ -39,8 +38,8 @@ pub struct WorkerSharedResources {
     native_jobs: [AtomicU64; 2],
     thread_budget: super::super::NativeThreadBudget,
     pub(crate) read_attempts: ReadAttempts,
-    read_replica: OnceLock<Box<dyn Any + Send + Sync>>,
-    read_queue: OnceLock<Box<dyn Any + Send + Sync>>,
+    read_replica: OnceLock<Weak<dyn nabedra_oltp_types::queue::ReplicaReadSource>>,
+    read_queue: OnceLock<Weak<dyn nabedra_oltp_types::queue::QueueReadSource>>,
     worker_id: Mutex<Option<Uuid>>,
     query: NativeExecutor,
     control: NativeExecutor,
@@ -385,40 +384,40 @@ impl WorkerSharedResources {
         workers.insert(worker_id, Arc::downgrade(self));
         Ok(())
     }
-    pub(crate) fn bind_read_replica<T: Send + Sync + 'static>(
+    pub(crate) fn bind_read_replica<T: nabedra_oltp_types::queue::ReplicaReadSource>(
         &self,
         replica: &Arc<T>,
     ) -> Result<(), ProtocolError> {
+        let source = Arc::downgrade(replica);
         self.read_replica
-            .set(Box::new(Arc::downgrade(replica)))
+            .set(source)
             .map_err(|_| capacity())
     }
 
-    pub(crate) fn read_replica<T: Send + Sync + 'static>(
+    pub(crate) fn read_replica(
         &self,
-    ) -> Result<Arc<T>, ProtocolError> {
+    ) -> Result<Arc<dyn nabedra_oltp_types::queue::ReplicaReadSource>, ProtocolError> {
         self.read_replica
             .get()
-            .and_then(|slot| slot.downcast_ref::<Weak<T>>())
             .and_then(Weak::upgrade)
             .ok_or_else(capacity)
     }
 
-    pub(crate) fn bind_read_queue<T: Send + Sync + 'static>(
+    pub(crate) fn bind_read_queue<T: nabedra_oltp_types::queue::QueueReadSource>(
         &self,
         queue: &Arc<T>,
     ) -> Result<(), ProtocolError> {
+        let source = Arc::downgrade(queue);
         self.read_queue
-            .set(Box::new(Arc::downgrade(queue)))
+            .set(source)
             .map_err(|_| capacity())
     }
 
-    pub(crate) fn read_queue<T: Send + Sync + 'static>(
+    pub(crate) fn read_queue(
         &self,
-    ) -> Result<Arc<T>, ProtocolError> {
+    ) -> Result<Arc<dyn nabedra_oltp_types::queue::QueueReadSource>, ProtocolError> {
         self.read_queue
             .get()
-            .and_then(|slot| slot.downcast_ref::<Weak<T>>())
             .and_then(Weak::upgrade)
             .ok_or_else(capacity)
     }

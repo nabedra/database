@@ -450,7 +450,7 @@ impl<C: TypedConfig> TypedLogStore<C> {
             let Some(waited) = waited else {
                 return self.next_stored(start, end).await;
             };
-            crate::oltp_runtime::stage_timing::by_kind(
+            crate::oltp_replication::by_kind(
                 &self.store.identity().kind,
                 [
                     "raft.data.read_durable_wait",
@@ -826,7 +826,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
     /// raises it to the applied index on startup. The next synced write of
     /// this pool's WAL persists it.
     async fn save_committed(&mut self, id: Option<LogId>) -> io::Result<()> {
-        let _timer = crate::oltp_runtime::stage_timing::by_kind(
+        let _timer = crate::oltp_replication::by_kind(
             &self.store.identity().kind,
             [
                 "raft.data.save_committed",
@@ -839,7 +839,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         // the apply worker; with `propose_to_first_ack` and
         // `propose_to_apply` this splits quorum -> commit -> apply.
         if id.is_some() && matches!(self.store.identity().kind, GroupKind::Data { .. }) {
-            super::hosted::proposal_clock::mark(crate::oltp_runtime::stage_timing::perf_stage!(
+            super::hosted::proposal_clock::mark(nabedra_resources::perf_stage!(
                 "raft.data.propose_to_commit"
             ));
         }
@@ -980,7 +980,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             #[cfg(test)]
             hook: append_hook,
         });
-        crate::oltp_runtime::stage_timing::by_kind(
+        crate::oltp_replication::by_kind(
             &self.store.identity().kind,
             [
                 "raft.data.append_submit",
@@ -996,7 +996,8 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         // synchronous step, and only a running task (which still holds its
         // own guard) takes it, so `drain` waits for every job's write.
         spawn_pending(pending, async move {
-            use crate::oltp_runtime::stage_timing::{by_kind, perf_stage};
+            use crate::oltp_replication::by_kind;
+            use nabedra_resources::perf_stage;
             let kind = store.identity().kind.clone();
             let started = nabedra_rt::time::now_std();
             let data = matches!(kind, crate::oltp_replication::types::GroupKind::Data { .. });

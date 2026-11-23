@@ -1,17 +1,6 @@
 use super::*;
 use crate::oltp_replication::service_rpc::ReadScope;
 
-// A query can have at most this many scan pages in flight. Keep the copy
-// header, snapshot page, and per-record memory charge bounded at that width.
-pub(crate) use nabedra_oltp_types::authority::MAX_READ_GRANTS;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReadGrantSet {
-    pub(crate) revision: u64,
-    pub(crate) grants: Vec<ReadGrant>,
-}
-
 pub(super) struct GrantEntry {
     pub(super) set: ReadGrantSet,
     pub(super) copying: bool,
@@ -24,73 +13,6 @@ const _: () = assert!(
         + 256
         <= PROOF_METADATA_BYTES
 );
-
-impl ReadGrantSet {
-    pub(in crate::oltp_runtime) fn initial() -> Self {
-        Self {
-            revision: 1,
-            grants: Vec::new(),
-        }
-    }
-
-    pub(super) fn is_initial(&self) -> bool {
-        self.revision == 1 && self.grants.is_empty()
-    }
-
-    pub(super) fn validate(
-        &self,
-        view: AuthorityView,
-        id: Uuid,
-        digest: Digest,
-        accepted: bool,
-    ) -> Result<(), QueueError> {
-        if self.revision == 0
-            || self.grants.len() > MAX_READ_GRANTS
-            || !accepted && !self.grants.is_empty()
-            || self
-                .grants
-                .windows(2)
-                .any(|pair| pair[0].ticket >= pair[1].ticket)
-        {
-            return Err(QueueError::Invalid);
-        }
-        for grant in &self.grants {
-            if grant.ticket.is_nil()
-                || grant.group.is_nil()
-                || grant.node == 0
-                || grant.owner.validate().is_err()
-                || grant.worker.validate().is_err()
-                || grant.scope.request.run_id != view.run_id
-                || grant.scope.request.request_id != id
-                || grant.scope.request.digest != digest
-                || grant.scope.authority.run_id != view.run_id
-                || grant.scope.authority.owner_term == 0
-                || grant.scope.authority.owner_term > view.owner_term
-            {
-                return Err(QueueError::Invalid);
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn validate_context(
-        &self,
-        context: &AcceptedContext,
-        bytes: &[u8],
-    ) -> Result<(), QueueError> {
-        if !self.grants.is_empty() {
-            let pin = context.read.as_ref().ok_or(QueueError::Invalid)?;
-            let digest = hash(bytes);
-            if self.grants.iter().any(|grant| {
-                grant.scope.request.accepted_context != digest
-                    || grant.scope.read_ts != pin.storage_pin.read_ts
-            }) {
-                return Err(QueueError::Conflict);
-            }
-        }
-        Ok(())
-    }
-}
 
 impl WorkerReplica {
     pub(crate) fn read_continuation_copied(&self, scope: ReadScope) -> bool {

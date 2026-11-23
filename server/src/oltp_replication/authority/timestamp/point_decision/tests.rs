@@ -1,4 +1,5 @@
 use super::super::tests::{Fixture, ready, worker};
+use nabedra_oltp_types::queue::OriginalAuthorization;
 use super::*;
 use crate::{
     oltp::{
@@ -24,7 +25,6 @@ use crate::{
         multiplex::{ChargedSections, MAX_SECTIONS},
         owned::serialized_digest,
     },
-    oltp_runtime::replica::OriginalAuthorization,
 };
 
 // Apply real log entries locally and model only the Raft read barrier.
@@ -589,6 +589,6 @@ async fn o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions() {
         .unwrap_err();
     assert_eq!(
         conflict,
-        crate::request_queue::QueueError::Conflict.protocol()
+        nabedra_protocol::QueueError::Conflict.protocol()
     );
 }

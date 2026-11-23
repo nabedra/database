@@ -94,8 +94,8 @@ impl ReplicaPlacement {
                     .await?;
                 None
             } else {
-                #[cfg(test)]
-                if crate::oltp_runtime::recovery_tests::elect_move_source(plan.id) {
+                #[cfg(any(test, feature = "test-hooks"))]
+                if crate::oltp::test_hooks::elect_move_source(plan.id) {
                     let group = &plan.request.group;
                     let node = plan.request.remove_node;
                     let source = self.factory.manager.hosted_data(group, node)?;
@@ -359,8 +359,8 @@ impl ReplicaPlacement {
             _owner: observation._owner.clone(),
         };
         let membership = VerifiedMembership::from_consensus(observation, plan.id, plan.authority)?;
-        #[cfg(test)]
-        crate::oltp_runtime::recovery_tests::pause("replica_move_activated", plan.id).await;
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::oltp::test_hooks::pause("replica_move_activated", plan.id).await;
         let operation = nabedra_rt::ids::uuid_v4();
         loop {
             // The admin executor owns this future independently of the socket.

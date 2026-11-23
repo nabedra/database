@@ -1,23 +1,13 @@
 pub(crate) use crate::oltp::read_attempt::{ScheduledReadError, UnsettledRead};
-use crate::{
-    oltp::{mvcc::store::consensus::ConsensusFuture, read_attempt::ReadGrantSettlement},
-    oltp_runtime::coordinator::QueueCoordinator,
-};
 pub use nabedra_oltp_types::authority::{ReadGrant, ReadScope};
 
 #[cfg(test)]
 pub(crate) mod fixture;
 
-impl ReadGrantSettlement for QueueCoordinator {
-    fn settle_read_grant(&self, grant: ReadGrant) -> ConsensusFuture<'_, ()> {
-        Box::pin(QueueCoordinator::settle_read_grant(self, grant))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WorkerResources;
+    use nabedra_resources::config::WorkerResources;
     use crate::oltp::{
         pool::WorkerSharedResources,
         read_attempt::{ATTEMPT_BYTES, UNUSED_LIFETIME},

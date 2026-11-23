@@ -10,14 +10,12 @@ use super::super::{
     types::{WorkerEnrollment, WorkerIdentity},
 };
 use super::*;
-use crate::{
-    config::WorkerResources,
-    oltp::pool::{OltpPool, PoolIdentity, SharedResourceConfig},
-};
+use crate::oltp::pool::{OltpPool, PoolIdentity, SharedResourceConfig};
 pub(crate) use registered::{
     GroupPlacement, RegisteredConfig, RegisteredSystemGroups, RegisteredWorker, SystemPlacement,
 };
-pub(crate) use restore::RegisteredRestoreConfig;
+pub(crate) use restore::{RegisteredRestore, RegisteredRestoreConfig};
+use nabedra_resources::config::WorkerResources;
 use nabedra_rt::fs::os::{File, OpenOptions, self as fs};
 use serde::{Deserialize, Serialize};
 use std::{

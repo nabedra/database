@@ -143,7 +143,7 @@ impl QueueCoordinator {
                 .begin_removal(current, ticket)
                 .map_err(QueueError::protocol)?;
             crate::oltp_replication::authority::control::VerifiedQueueCopy::begin_removal(
-                &source, ticket,
+                &*source, ticket,
             )?
         };
         loop {
@@ -214,7 +214,7 @@ impl QueueCoordinator {
                     .replica
                     .lock()
                     .map_err(|_| QueueError::Unavailable.protocol())?;
-                verifier.observe_local(&source)?;
+                verifier.observe_local(&*source)?;
             } else {
                 verifier.observe(
                     peer.removal_statement(target, scope.clone(), ticket)
@@ -230,7 +230,7 @@ impl QueueCoordinator {
             .replica
             .lock()
             .map_err(|_| QueueError::Unavailable.protocol())?;
-        verifier.finish(&source)
+        verifier.finish(&*source)
     }
 
     async fn merge_removal_inventory(
@@ -431,7 +431,7 @@ impl QueueCoordinator {
             .lock()
             .map_err(|_| QueueError::Unavailable.protocol())?;
         crate::oltp_replication::authority::control::VerifiedQueueCopy::from_join(
-            &source, current, observed,
+            &*source, current, observed,
         )
     }
 
@@ -918,5 +918,26 @@ impl QueueCoordinator {
             .map_err(QueueError::protocol)?;
         drop(grant);
         self.ensure_copies(current, id).await
+    }
+}
+
+impl nabedra_oltp_types::queue::QueueReadSource for QueueCoordinator {
+    fn resume_read_continuation(
+        &self,
+        scope: ReadScope,
+    ) -> nabedra_oltp_types::queue::QueueReadFuture<'_> {
+        Box::pin(self.resume_read_continuation(scope))
+    }
+
+    fn open_read_grant(&self, grant: ReadGrant) -> nabedra_oltp_types::queue::QueueReadFuture<'_> {
+        Box::pin(self.open_read_grant(grant))
+    }
+
+    fn finish_read_grant(&self, grant: ReadGrant) -> nabedra_oltp_types::queue::QueueReadFuture<'_> {
+        Box::pin(self.finish_read_grant(grant))
+    }
+
+    fn settle_read_grant(&self, grant: ReadGrant) -> nabedra_oltp_types::queue::QueueReadFuture<'_> {
+        Box::pin(self.settle_read_grant(grant))
     }
 }

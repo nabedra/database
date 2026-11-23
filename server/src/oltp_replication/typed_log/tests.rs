@@ -1,6 +1,6 @@
+use nabedra_resources::config::WorkerResources;
 use super::*;
 use crate::{
-    config::WorkerResources,
     oltp::{
         mvcc::{CanonicalJson, Change, MvccKey, PreparedWrite},
         pool::{OltpPool, PoolIdentity, ScratchLease, SharedResourceConfig, WorkerSharedResources},

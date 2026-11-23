@@ -5,9 +5,9 @@
 //! evidence is that fault model, not a physical power cut.
 #[path = "../../../tests/support/tls.rs"]
 mod tls;
+use nabedra_resources::config::WorkerResources;
 use super::*;
 use crate::{
-    config::WorkerResources,
     oltp::pool::{OltpPool, PoolIdentity, ReleaseOutcome, SharedResourceConfig, TransactionBudget},
     oltp_replication::{
         ReadySetHasher,
@@ -1221,7 +1221,7 @@ async fn o06_foreign_pool_and_group_identity_are_refused() {
 
 pub(crate) fn acceptance_o06_storage() {
     o06_follower_sync_error_cannot_complete_a_quorum_with_a_delayed_follower();
-    crate::oltp_acceptance::clause(
+    crate::oltp_replication::acceptance_clause(
         "O06",
         "stable-storage-before-ack",
         "passed",
@@ -1230,7 +1230,7 @@ pub(crate) fn acceptance_o06_storage() {
     ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released();
     o06_foreign_pool_and_group_identity_are_refused();
     crate::oltp::pool::acceptance_damaged_checkpoints();
-    crate::oltp_acceptance::clause(
+    crate::oltp_replication::acceptance_clause(
         "O06",
         "corrupt-and-foreign-rejection",
         "passed",

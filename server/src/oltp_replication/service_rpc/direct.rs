@@ -325,7 +325,7 @@ pub(super) async fn authorize(
     if header.action != ServiceAction::ApiIngress {
         return super::authorize(control, session, header).await;
     }
-    let scope = crate::oltp_runtime::replica::QueueScope {
+    let scope = nabedra_oltp_types::queue::QueueScope {
         cluster_id: session.group().cluster_id,
         database: session.group().database.clone(),
     };
@@ -463,7 +463,7 @@ impl DirectLink {
                 DirectSendError::Uncertain(error)
             }
         };
-        let _timer = crate::oltp_runtime::stage_timing::perf_stage!("gw.direct.send").timer();
+        let _timer = nabedra_resources::perf_stage!("gw.direct.send").timer();
         // PERF1: wait for a slot on the leader's lane instead of refusing a
         // request that finds it full. The lane keeps its bound (the leader's
         // handler slots); requests over it queue here, in arrival order, for
@@ -475,7 +475,7 @@ impl DirectLink {
         let start = nabedra_rt::time::now();
         let reservation = {
             let _timer =
-                crate::oltp_runtime::stage_timing::perf_stage!("gw.direct.lane_wait").timer();
+                nabedra_resources::perf_stage!("gw.direct.lane_wait").timer();
             self.client
                 .transport
                 .reserve_outgoing(

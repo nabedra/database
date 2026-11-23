@@ -22,11 +22,6 @@ use std::{
 };
 use uuid::Uuid;
 
-pub const QUEUE_FORMAT_VERSION: u32 = 1;
-pub const MAX_HEADER_BYTES: usize = 4096;
-pub(crate) const MAX_RECORD_HEADER_BYTES: usize = 8192;
-pub const MAX_CONTEXT_BYTES: usize = 4096;
-
 fn hash(bytes: &[u8]) -> Digest {
     Digest::from_bytes(Sha256::digest(bytes).into())
 }
@@ -38,116 +33,32 @@ pub(super) mod scoped;
 pub(super) mod scoped_store;
 mod removal;
 mod read_grants;
-pub use read_grants::ReadGrantSet;
-#[cfg(test)]
-use read_grants::MAX_READ_GRANTS;
 #[cfg(test)]
 mod tests;
 mod transfer;
-pub use transfer::{JoinPage, JoinPageHeader, JoinPhase, JoinSnapshot};
+pub use transfer::JoinPage;
 fn invalid<T>(_: T) -> QueueError {
     QueueError::Invalid
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QueueScope {
-    pub cluster_id: Uuid,
-    pub database: Text<128>,
-}
-impl QueueScope {
-    fn validate(&self) -> Result<(), QueueError> {
-        if self.cluster_id.is_nil() || !crate::oltp::valid_database(&self.database) {
-            return Err(QueueError::Invalid);
-        }
-        Ok(())
-    }
-}
+pub(crate) use nabedra_oltp_types::queue::{MAX_READ_GRANTS, MAX_RECORD_HEADER_BYTES};
+pub use nabedra_oltp_types::queue::{
+    AcceptedContext, OriginalAuthorization, QueueAuthority, QueueReadToken, QueueScope,
+    JoinPageHeader, JoinPhase, JoinSnapshot, RecordHeader, RecordVersion, ReadGrantSet,
+    MAX_CONTEXT_BYTES, MAX_HEADER_BYTES, QUEUE_FORMAT_VERSION,
+};
 
-/// Immutable authorization evidence, never a bearer credential. Expiry is
-/// checked at first admission, not while recovering already accepted work.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OriginalAuthorization {
-    pub database: Text<128>,
-    pub principal: Digest,
-    pub policy_revision: u64,
-    pub ingress_id: Uuid,
-    pub ingress_incarnation: Uuid,
-    pub credential_expires_at_ms: Option<u64>,
-}
-
-pub use nabedra_oltp_types::authority::{QueueReadToken};
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AcceptedContext {
-    pub authorization: OriginalAuthorization,
-    pub read: Option<QueueReadToken>,
-}
-impl AcceptedContext {
-    fn validate(&self, scope: &QueueScope, record: &RequestRecord) -> Result<(), QueueError> {
-        self.validate_binding(
-            scope,
-            record.run_id,
-            record.request_id,
-            Digest::parse(&record.digest).map_err(invalid)?,
-            protocol::parse_request(&record.body)
-                .map_err(invalid)?
-                .operation
-                .is_mutation(),
-        )
-    }
-    fn validate_binding(
-        &self,
-        scope: &QueueScope,
-        run_id: Uuid,
-        request_id: Uuid,
-        digest: Digest,
-        mutation: bool,
-    ) -> Result<(), QueueError> {
-        let auth = &self.authorization;
-        if auth.database != scope.database
-            || auth.policy_revision == 0
-            || auth.ingress_id.is_nil()
-            || auth.ingress_incarnation.is_nil()
-        {
-            return Err(QueueError::Invalid);
-        }
-        if let Some(read) = &self.read
-            && (read.identity.run_id != run_id
-                || read.identity.request_id != request_id
-                || read.identity.digest != digest
-                || read.identity.nonce.is_nil()
-                || read.storage_pin.pin_id.is_nil()
-                || read.storage_pin.allocator_epoch == 0
-                || read.schema_epoch == 0
-                || read.routing_epoch == 0)
-        {
-            return Err(QueueError::Invalid);
-        }
-        // Pure reads cannot be accepted with an owner-private or absent pin.
-        if !mutation && self.read.is_none() {
-            return Err(QueueError::Invalid);
-        }
-        Ok(())
-    }
-}
-
-/// The caller obtained this view through the Control authority lane. The owner
-/// identity is current enrollment, independent of permanent Raft replica IDs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QueueAuthority {
-    pub ready: ReadyMembership,
-    pub owner: WorkerIdentity,
-}
-
-impl QueueAuthority {
-    pub(super) fn view_is_behind(self, expected: AuthorityView) -> bool {
-        let local = self.ready.view;
-        local.run_id == expected.run_id && local.membership_revision < expected.membership_revision
-    }
+fn validate_context(context: &AcceptedContext, scope: &QueueScope, record: &RequestRecord) -> Result<(), QueueError> {
+    context.validate_binding(
+        scope,
+        record.run_id,
+        record.request_id,
+        Digest::parse(&record.digest).map_err(invalid)?,
+        protocol::parse_request(&record.body)
+            .map_err(invalid)?
+            .operation
+            .is_mutation(),
+    )
 }
 
 pub(super) async fn wait_for_local_ready_view(
@@ -169,62 +80,6 @@ pub(super) async fn wait_for_local_ready_view(
     })
     .await
     .unwrap_or(Err(QueueError::Stale))
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecordHeader {
-    pub queue_format_version: u32,
-    pub scope: QueueScope,
-    pub ready: ReadyMembership,
-    pub owner: WorkerIdentity,
-    pub request_id: Uuid,
-    pub digest: Digest,
-    pub sequence: u64,
-    pub version: u64,
-    pub accepted: bool,
-    pub state: RequestState,
-    pub response_status: Option<u16>,
-    pub completed_at_ms: Option<u64>,
-    /// Fixed lengths refer to exact raw body/context/response sections. There
-    /// is no serde byte-array expansion or worker list in this header.
-    pub section_lengths: [u64; 3],
-    pub all_copy_evidence: bool,
-    #[serde(default = "ReadGrantSet::initial", skip_serializing_if = "ReadGrantSet::is_initial")]
-    pub(crate) read_grants: ReadGrantSet,
-}
-impl RecordHeader {
-    pub fn preflight(&self, scope: &QueueScope, current: QueueAuthority) -> Result<(), QueueError> {
-        if self.queue_format_version != QUEUE_FORMAT_VERSION
-            || self.scope != *scope
-            || self.request_id.is_nil()
-            || self.sequence == 0
-            || self.version == 0
-            || self.version == u64::MAX
-            || self.section_lengths[0] == 0
-            || self.section_lengths[0] > protocol::MAX_BODY_BYTES as u64
-            || self.section_lengths[1] == 0
-            || self.section_lengths[1] > MAX_CONTEXT_BYTES as u64
-            || self.section_lengths[2] > protocol::MAX_BODY_BYTES as u64
-            || self.state.terminal() != self.completed_at_ms.is_some()
-            || self.state.terminal() != self.response_status.is_some()
-            || self.state.terminal() != (self.section_lengths[2] != 0)
-            || !self.accepted && self.state != RequestState::Queued
-            || !self.accepted && self.all_copy_evidence
-        {
-            return Err(QueueError::Invalid);
-        }
-        self.scope.validate()?;
-        self.ready.view.validate().map_err(invalid)?;
-        self.owner.validate().map_err(invalid)?;
-        self.read_grants
-            .validate(self.ready.view, self.request_id, self.digest, self.accepted)?;
-        // Control can authorize receipt before this replica applies the new ready set.
-        if self.ready != current.ready || self.owner != current.owner {
-            return Err(QueueError::Stale);
-        }
-        Ok(())
-    }
 }
 
 /// The transport retains each section's charge through sending/cancellation.
@@ -284,14 +139,6 @@ impl RecordFrame {
             digest: Digest::from_bytes(writer.0.finalize().into()),
         })
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecordVersion {
-    pub request_id: Uuid,
-    pub version: u64,
-    pub digest: Digest,
 }
 
 /// Constructed by an authenticated transport callback, not deserializable as a
@@ -441,7 +288,7 @@ impl PreparedInstall {
                 Default::default()
             },
         };
-        context.validate(&environment.scope, &record)?;
+        validate_context(&context, &environment.scope, &record)?;
         let terminal = record
             .state
             .terminal()
@@ -1775,5 +1622,62 @@ impl WorkerReplica {
             all_copy_evidence: record.accepted && record.replicas == *self.queue.members(),
             read_grants: self.read_grant_set(record.request_id),
         })
+    }
+}
+
+impl crate::oltp_replication::queue_access::QueueCopySource for WorkerReplica {
+    fn local_identity(&self) -> WorkerIdentity {
+        self.local_identity()
+    }
+
+    fn authority(&self) -> QueueAuthority {
+        self.authority()
+    }
+
+    fn removal_frozen(&self, ticket: JoinTicket) -> bool {
+        self.removal_frozen(ticket)
+    }
+
+    fn removal_ready_root(&self, ticket: JoinTicket) -> Result<(Digest, u64), QueueError> {
+        self.removal_ready_root(ticket)
+    }
+
+    fn removal_statement(&self, ticket: JoinTicket) -> Result<QueueCopyStatement, QueueError> {
+        self.removal_statement(ticket)
+    }
+
+    fn join_statement(&self, current: QueueAuthority) -> Result<QueueCopyStatement, QueueError> {
+        self.join_statement(current)
+    }
+
+    fn empty_bootstrap_statement(&self, ticket: JoinTicket) -> Result<QueueCopyStatement, QueueError> {
+        self.empty_bootstrap_statement(ticket)
+    }
+}
+
+impl nabedra_oltp_types::queue::ReplicaReadSource for WorkerReplica {
+    fn scan_context(
+        &self,
+        scope: nabedra_oltp_types::authority::ReadScope,
+        owner: WorkerIdentity,
+        target: WorkerIdentity,
+    ) -> Result<ChargedBytes, protocol::ProtocolError> {
+        self.scan_context(scope, owner, target).map_err(QueueError::protocol)
+    }
+
+    fn knows_read_grant(&self, grant: ReadGrant) -> Result<bool, protocol::ProtocolError> {
+        Ok(self.knows_read_grant(grant))
+    }
+
+    fn read_member(
+        &self,
+        authority: Authority,
+        worker: Uuid,
+    ) -> Result<Option<WorkerIdentity>, protocol::ProtocolError> {
+        Ok(self.read_member(authority, worker))
+    }
+
+    fn local_identity(&self) -> Result<WorkerIdentity, protocol::ProtocolError> {
+        Ok(self.local_identity())
     }
 }

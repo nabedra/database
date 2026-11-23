@@ -164,3 +164,27 @@ pub(crate) fn mark(name: &str, request: Uuid) {
         }
     }
 }
+
+pub(crate) async fn lose_status_inspection(request: Uuid) -> bool {
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {
+        return false;
+    };
+    if !PathBuf::from(directory)
+        .join(format!("lose-status-inspection-{request}"))
+        .is_file()
+    {
+        return false;
+    }
+    transaction_checkpoint("status-inspect-unavailable", request, &request).await;
+    true
+}
+
+pub(crate) fn elect_move_source(request: Uuid) -> bool {
+    take_fault("move-elect-source", request).is_some()
+}
+
+pub(crate) fn take_fault(name: &str, request: Uuid) -> Option<PathBuf> {
+    let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
+    std::fs::remove_file(directory.join(format!("{name}-{request}"))).ok()?;
+    Some(directory)
+}

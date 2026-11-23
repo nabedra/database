@@ -1,21 +1,5 @@
 use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JoinPhase {
-    Snapshot,
-    Delta,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct JoinSnapshot {
-    pub ticket: JoinTicket,
-    pub source: WorkerIdentity,
-    pub snapshot_id: Uuid,
-    pub snapshot_cut: u64,
-}
-
 /// One raw record per bounded message. `done` is true on empty, final and
 /// exhausted pages, false only while another eligible record remains.
 pub struct JoinPage {
@@ -26,16 +10,6 @@ pub struct JoinPage {
     pub next_sequence: Option<u64>,
     pub done: bool,
     pub record: Option<RecordFrame>,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct JoinPageHeader {
-    pub snapshot: JoinSnapshot,
-    pub phase: JoinPhase,
-    pub final_cut: Option<u64>,
-    pub after_sequence: Option<u64>,
-    pub next_sequence: Option<u64>,
-    pub done: bool,
 }
 impl JoinPage {
     pub fn header(&self) -> JoinPageHeader {

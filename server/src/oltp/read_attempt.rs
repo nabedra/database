@@ -154,15 +154,11 @@ impl From<ProtocolError> for ScheduledReadError {
 }
 
 pub(crate) struct UnsettledRead {
-    settlement: Arc<dyn ReadGrantSettlement>,
+    settlement: Arc<dyn nabedra_oltp_types::queue::QueueReadSource>,
     pub(crate) grant: Box<ReadGrant>,
 }
-pub(crate) trait ReadGrantSettlement: Send + Sync {
-    fn settle_read_grant(&self, grant: ReadGrant) -> ConsensusFuture<'_, ()>;
-}
-
 impl UnsettledRead {
-    pub(crate) fn new(settlement: Arc<dyn ReadGrantSettlement>, grant: ReadGrant) -> Self {
+    pub(crate) fn new(settlement: Arc<dyn nabedra_oltp_types::queue::QueueReadSource>, grant: ReadGrant) -> Self {
         Self {
             settlement,
             grant: Box::new(grant),
