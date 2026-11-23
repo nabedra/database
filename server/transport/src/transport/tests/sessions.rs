@@ -1907,6 +1907,12 @@ async fn revoked_session_closes() {
         false,
     )
     .await;
+    // Exercise the watch path without the periodic check also closing the session.
+    fixture
+        .receiver
+        .common
+        .suspend_directory_poll_for_test
+        .store(true, Ordering::Relaxed);
     timeout(WAIT, async {
         echoed(
             fixture
