@@ -144,3 +144,14 @@ fn cache_sim_seed_46_expired_overwrite() {
     let verdict = relaxed_kv::check(&events);
     assert!(verdict.valid, "{:#?}", verdict.anomalies);
 }
+
+#[test]
+fn cache_sim_reports_lost_delete_after_promotion() {
+    for history in [
+        include_bytes!("fixtures/cache_sim_seed_4524674007700389_lost_delete.jsonl").as_slice(),
+        include_bytes!("fixtures/cache_sim_seed_4524674007700909_lost_delete.jsonl").as_slice(),
+    ] {
+        let events = read_jsonl(history).unwrap();
+        assert_rejects(&events, events.len() - 1, "resurrection");
+    }
+}
