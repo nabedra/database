@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "review-olap-c49b8dd-090735--olap-store-contract-sim.log",
+      "sha256": "1060de3664f20b8e09a68cf417fc2e151650af840b504041c691838e101a024e"
+    }
+  ],
+  "assertions": {
+    "executed": 3,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "olap-store-contract-sim",
+  "duration_s": 95.674,
+  "guarantees": [],
+  "kind": "S",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T09:09:10.599962+00:00",
+    "request_id": "review-olap-c49b8dd-090735",
+    "runner": "GitHub Actions 1000004502",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45144229435"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "c49b8dd9f0b31756468d666e98bb2f79267a23bd",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
