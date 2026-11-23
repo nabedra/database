@@ -1,11 +1,12 @@
 use super::{ByteClass, TrafficClass, WorkerIdentity};
-use crate::oltp_replication::types::Text;
+use crate::backend;
+use nabedra_oltp_types::types::Text;
+use nabedra_rt::time::timeout;
 use std::{
-    net::{SocketAddr, ToSocketAddrs},
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
 };
-use nabedra_rt::time::timeout;
 use tokio::{
     sync::{Semaphore, watch},
     time::Instant,
@@ -189,8 +190,15 @@ fn hostname(endpoint: &str) -> &str {
 }
 
 fn resolve_host(endpoint: &str) -> Vec<SocketAddr> {
-    endpoint
-        .to_socket_addrs()
-        .map(|addresses| addresses.take(MAX_ADDRESSES).collect())
-        .unwrap_or_default()
+    let Some((host, port)) = endpoint.rsplit_once(':') else {
+        return Vec::new();
+    };
+    let Ok(port) = port.parse() else {
+        return Vec::new();
+    };
+    let mut addresses = backend::current()
+        .resolve(host.trim_matches(['[', ']']), port)
+        .unwrap_or_default();
+    addresses.truncate(MAX_ADDRESSES);
+    addresses
 }

@@ -2,31 +2,68 @@
 //!
 //! Endpoint preflight receives a bounded header before any payload/native/data
 //! permits. Control consensus and authority traffic have independent capacity.
-use super::types::{GroupIdentity, WorkerIdentity};
-use crate::{
-    oltp::pool::{ByteClass, ChargedBytes, ScratchLease},
-    protocol::{ErrorCode, Outcome, ProtocolError},
+use nabedra_oltp_types::types::{GroupIdentity, WorkerIdentity};
+use nabedra_protocol::protocol::{ErrorCode, Outcome, ProtocolError, json_input};
+use nabedra_resources::{
+    decode_budget::json_decode_budget,
+    memory::{ByteClass, ChargedBytes, ScratchLease, WorkerMemory},
 };
 use serde::de::DeserializeOwned;
 use std::{future::Future, ops::Deref, pin::Pin, sync::Arc};
 use uuid::Uuid;
-mod directory;
+
+pub mod backend;
+pub mod tls;
 mod transport;
-pub(crate) use directory::{AppliedPeerDirectory, MAX_VIEW_REVOCATIONS};
-#[cfg(test)]
-pub(crate) use directory::{REVOCATION_REFRESH, REVOCATION_STALE_AFTER, RevocationSource};
+
 pub use transport::{
-    EndpointRegistry, PeerDirectory, ResidentGroup, ResidentLease, TransportConfig, TransportTrust,
-    WorkerClient, WorkerTransport,
+    EndpointRegistry, ONE_SHOT_ALPN, OutgoingReservation, PeerDirectory, PeerFeature, ReplicaLease,
+    ReplicaMetadata, RequestError, RequestTarget, ResidentGroup, ResidentLease, TransportConfig,
+    TransportTrust, WorkerClient, WorkerTransport,
 };
-pub(crate) use transport::{
-    OutgoingReservation, PeerFeature, ReplicaLease, ReplicaMetadata, RequestError, RequestTarget,
-};
+#[cfg(feature = "sim")]
+pub use transport::{FrameKind, StreamFrame, session_alpn};
+
+/// The worker that owns the physical accounting used by this transport.
+/// The owner retains native resources until the last transport handle is dropped.
+pub trait ResourceOwner: Send + Sync + 'static {
+    fn worker_memory(&self) -> &Arc<WorkerMemory>;
+
+    fn bind_worker(self: &Arc<Self>, worker_id: Uuid) -> Result<(), ProtocolError>;
+}
+
+struct MemoryHandle {
+    memory: Arc<WorkerMemory>,
+    _owner: Arc<dyn Send + Sync>,
+}
+
+impl MemoryHandle {
+    fn new(owner: Arc<impl ResourceOwner>) -> Arc<Self> {
+        Arc::new(Self {
+            memory: owner.worker_memory().clone(),
+            _owner: owner,
+        })
+    }
+
+    #[inline]
+    fn belongs_to(&self, owner: &impl ResourceOwner) -> bool {
+        Arc::ptr_eq(&self.memory, owner.worker_memory())
+    }
+}
+
+impl Deref for MemoryHandle {
+    type Target = WorkerMemory;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.memory
+    }
+}
 
 pub const MAX_SECTIONS: usize = 3;
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
-pub(super) const RAFT_PROGRESS_HEADER_BYTES: usize = 1024;
-pub(super) const RAFT_PROGRESS_DECODE_BYTES: usize = 4096;
+pub const RAFT_PROGRESS_HEADER_BYTES: usize = 1024;
+pub const RAFT_PROGRESS_DECODE_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -88,6 +125,7 @@ impl TrafficClass {
         Self::ControlDelegation,
         Self::RaftProgress,
     ];
+    #[inline]
     pub fn byte_class(self) -> ByteClass {
         match self {
             Self::ControlConsensus
@@ -112,16 +150,17 @@ impl TrafficClass {
 /// Only the TLS/prologue verifier constructs this context. Recovery-only
 /// Control Raft authentication never grants queue or application authority.
 pub struct AuthenticatedSession {
-    pub(super) local: WorkerIdentity,
-    pub(super) remote: WorkerIdentity,
-    pub(super) group: GroupIdentity,
-    pub(super) purpose: Purpose,
-    pub(super) nonce: Uuid,
-    pub(super) recovery_only: bool,
+    pub(crate) local: WorkerIdentity,
+    pub(crate) remote: WorkerIdentity,
+    pub(crate) group: GroupIdentity,
+    pub(crate) purpose: Purpose,
+    pub(crate) nonce: Uuid,
+    pub(crate) recovery_only: bool,
 }
 impl AuthenticatedSession {
-    #[cfg(test)]
-    pub(crate) fn for_test(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn for_test(
         local: WorkerIdentity,
         remote: WorkerIdentity,
         group: GroupIdentity,
@@ -137,21 +176,27 @@ impl AuthenticatedSession {
             recovery_only: false,
         }
     }
+    #[inline]
     pub fn local(&self) -> WorkerIdentity {
         self.local
     }
+    #[inline]
     pub fn remote(&self) -> WorkerIdentity {
         self.remote
     }
+    #[inline]
     pub fn group(&self) -> &GroupIdentity {
         &self.group
     }
+    #[inline]
     pub fn purpose(&self) -> Purpose {
         self.purpose
     }
+    #[inline]
     pub fn nonce(&self) -> Uuid {
         self.nonce
     }
+    #[inline]
     pub fn recovery_only(&self) -> bool {
         self.recovery_only
     }
@@ -167,37 +212,43 @@ pub struct ReceivePlan {
 /// Input bytes remain charged until the endpoint and any native continuation
 /// release them. Decode scratch has the same ownership rule.
 pub struct ChargedSections {
-    pub(super) sections: [Option<ChargedBytes>; MAX_SECTIONS],
-    pub(super) scratch: Arc<ScratchLease>,
-    pub(super) resources: Arc<crate::oltp::pool::WorkerSharedResources>,
+    pub(crate) sections: [Option<ChargedBytes>; MAX_SECTIONS],
+    pub(crate) scratch: Arc<ScratchLease>,
+    pub(crate) resources: Arc<MemoryHandle>,
 }
 impl ChargedSections {
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        shared: &Arc<crate::oltp::pool::WorkerSharedResources>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn for_test(
+        shared: &Arc<impl ResourceOwner>,
         class: ByteClass,
         sections: [Option<ChargedBytes>; MAX_SECTIONS],
         decode_bytes: usize,
     ) -> Result<Self, ProtocolError> {
         Ok(Self {
             sections,
-            scratch: Arc::new(shared.reserve_scratch(class, decode_bytes)?),
-            resources: shared.clone(),
+            scratch: Arc::new(
+                shared
+                    .worker_memory()
+                    .reserve_scratch(class, decode_bytes)?,
+            ),
+            resources: MemoryHandle::new(shared.clone()),
         })
     }
     /// Lexically inspect raw sections first, then acquire a working decode
     /// lease. Wire buffering and protected Progress capacity stay independent.
     pub fn reserve_decode(
         mut self,
-        shared: &Arc<crate::oltp::pool::WorkerSharedResources>,
+        shared: &Arc<impl ResourceOwner>,
         bytes: usize,
     ) -> Result<Self, ProtocolError> {
-        if !Arc::ptr_eq(shared, &self.resources) {
+        if !self.resources.belongs_to(shared.as_ref()) {
             return Err(malformed("decode reservation belongs to another worker"));
         }
-        self.scratch = Arc::new(shared.reserve_scratch(ByteClass::Data, bytes)?);
+        self.scratch = Arc::new(self.resources.reserve_scratch(ByteClass::Data, bytes)?);
         Ok(self)
     }
+    #[inline]
     pub fn section(&self, index: usize) -> Option<&ChargedBytes> {
         self.sections.get(index).and_then(Option::as_ref)
     }
@@ -212,9 +263,9 @@ impl ChargedSections {
         let bytes = self
             .section(index)
             .ok_or_else(|| malformed("missing RPC section"))?;
-        crate::protocol::json_input(bytes.as_slice(), bytes.len())
+        json_input(bytes.as_slice(), bytes.len())
             .map_err(|_| malformed("RPC section exceeds JSON bounds"))?;
-        if crate::oltp::mvcc::json_decode_budget(bytes.as_slice())? > self.scratch.bytes() {
+        if json_decode_budget(bytes.as_slice())? > self.scratch.bytes() {
             return Err(malformed("RPC decode reservation is too small"));
         }
         let value = serde_json::from_slice(bytes.as_slice())
@@ -232,6 +283,7 @@ pub struct Decoded<T> {
 }
 impl<T> Deref for Decoded<T> {
     type Target = T;
+    #[inline]
     fn deref(&self) -> &T {
         &self.value
     }
@@ -243,13 +295,14 @@ pub struct ChargedReply {
 }
 /// A received reply retains decode overlap capacity through the caller's use.
 pub struct ReceivedReply {
-    pub(super) reply: ChargedReply,
-    pub(super) scratch: Arc<ScratchLease>,
-    pub(super) session: AuthenticatedSession,
-    pub(super) resources: Arc<crate::oltp::pool::WorkerSharedResources>,
+    pub(crate) reply: ChargedReply,
+    pub(crate) scratch: Arc<ScratchLease>,
+    pub(crate) session: AuthenticatedSession,
+    pub(crate) resources: Arc<MemoryHandle>,
 }
 impl Deref for ReceivedReply {
     type Target = ChargedReply;
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.reply
     }
@@ -257,48 +310,50 @@ impl Deref for ReceivedReply {
 impl ReceivedReply {
     /// Metadata readers use the worker's independent bounded reply decoder,
     /// never the query working budget or an arena holding their raw frames.
-    pub(crate) async fn reserve_reply_decode(
+    pub async fn reserve_reply_decode(
         mut self,
-        shared: &Arc<crate::oltp::pool::WorkerSharedResources>,
+        shared: &Arc<impl ResourceOwner>,
         bytes: usize,
     ) -> Result<Self, ProtocolError> {
-        if !Arc::ptr_eq(shared, &self.resources) {
+        if !self.resources.belongs_to(shared.as_ref()) {
             return Err(malformed("reply decoder belongs to another worker"));
         }
-        self.scratch = Arc::new(shared.reserve_reply_decode(bytes).await?);
+        self.scratch = Arc::new(self.resources.reserve_reply_decode(bytes).await?);
         Ok(self)
     }
     pub fn reserve_decode(
         mut self,
-        shared: &Arc<crate::oltp::pool::WorkerSharedResources>,
+        shared: &Arc<impl ResourceOwner>,
         bytes: usize,
     ) -> Result<Self, ProtocolError> {
-        if !Arc::ptr_eq(shared, &self.resources) {
+        if !self.resources.belongs_to(shared.as_ref()) {
             return Err(malformed(
                 "reply decode reservation belongs to another worker",
             ));
         }
-        self.scratch = Arc::new(shared.reserve_scratch(ByteClass::Data, bytes)?);
+        self.scratch = Arc::new(self.resources.reserve_scratch(ByteClass::Data, bytes)?);
         Ok(self)
     }
+    #[inline]
     pub fn remote_identity(&self) -> WorkerIdentity {
         self.session.remote()
     }
+    #[inline]
     pub fn nonce(&self) -> Uuid {
         self.session.nonce()
     }
+    #[inline]
     pub fn purpose(&self) -> Purpose {
         self.session.purpose()
     }
+    #[inline]
     pub fn group(&self) -> &GroupIdentity {
         self.session.group()
     }
     pub fn decode_header<T: DeserializeOwned>(&self) -> Result<Decoded<T>, ProtocolError> {
-        crate::protocol::json_input(self.reply.header.as_slice(), MAX_HEADER_BYTES)
+        json_input(self.reply.header.as_slice(), MAX_HEADER_BYTES)
             .map_err(|_| malformed("RPC reply header exceeds JSON bounds"))?;
-        if crate::oltp::mvcc::json_decode_budget(self.reply.header.as_slice())?
-            > self.scratch.bytes()
-        {
+        if json_decode_budget(self.reply.header.as_slice())? > self.scratch.bytes() {
             return Err(malformed("RPC reply decode reservation is too small"));
         }
         let value = serde_json::from_slice(self.reply.header.as_slice())
