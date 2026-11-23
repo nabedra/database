@@ -1448,6 +1448,7 @@ async fn d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome() {
         Answer::Data(json!({"id": 7, "value": 1})),
         "the second gateway sees the commit before the retry"
     );
+    let before_retry_len = history.len();
     assert_eq!(
         record_gateway_answer(&mut history, 2, &fresh, &insert).await,
         Answer::Data(Value::Null)
@@ -1472,13 +1473,18 @@ async fn d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome() {
         record_gateway_answer(&mut history, 2, &fresh, &elsewhere).await,
         Answer::Data(Value::Null)
     );
+    let read_elsewhere = cluster.body(nabedra_rt::ids::uuid_v4(), "table.get", json!({"key": 9}));
+    assert_eq!(
+        record_gateway_answer(&mut history, 2, &fresh, &read_elsewhere).await,
+        Answer::Data(json!({"id": 9, "value": 2}))
+    );
+    assert_eq!(cluster.latest(group, 0, 7).await.0, version);
     assert!(cluster.settled(group, 7, id).await);
     assert!(cluster.settled(group, 9, id).await);
     assert!(!cluster.settled(group, 8, refused_id).await);
     let verdict = direct::check(&history);
     assert!(verdict.valid, "{verdict:?}");
-    assert_eq!(history.len(), 12);
-    let before_retry = &mut history[..6];
+    let before_retry = &mut history[..before_retry_len];
     before_retry[1].kind = EventType::Fail;
     before_retry[1].value =
         json!({"code": ErrorCode::Unauthorized, "outcome": Outcome::NotApplied});
