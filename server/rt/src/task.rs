@@ -66,10 +66,7 @@ pub fn spawn_stepped<S: Stepped>(
     }
     #[cfg(not(feature = "sim"))]
     {
-        std::thread::Builder::new()
-            .name(name.into())
-            .stack_size(stack_bytes)
-            .spawn(move || service.run())
+        spawn_service_with_stack(name, stack_bytes, move || service.run())
             .map(|thread| ServiceHandle { thread })
     }
 }
@@ -93,7 +90,8 @@ pub struct ServiceHandle {
 impl ServiceHandle {
     /// Waits for the service to finish. Under `sim` it drives the service (and the rest
     /// of its node's services) until it exits; a service of a crashed node is dead and
-    /// joins at once.
+    /// joins at once. A live simulation service can only be joined from its own
+    /// world, on the simulation thread or its blocking helper.
     #[inline]
     pub fn join(self) -> std::thread::Result<()> {
         #[cfg(feature = "sim")]
@@ -165,11 +163,7 @@ where
     }
     #[cfg(not(feature = "sim"))]
     {
-        std::thread::Builder::new()
-            .name(name.into())
-            .stack_size(stack_bytes)
-            .spawn(f)
-            .map(drop)
+        spawn_service_with_stack(name, stack_bytes, f).map(drop)
     }
 }
 

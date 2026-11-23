@@ -90,6 +90,7 @@ use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -107,7 +108,7 @@ pub const EPOCH_MS: u64 = 1_767_225_600_000;
 const PPM: i128 = 1_000_000;
 
 tokio::task_local! {
-    static NODE: u64;
+    static NODE: Option<u64>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -435,7 +436,7 @@ impl World {
             node,
             future: Box::pin(future),
         };
-        let handle = target.spawn(NODE.scope(node, gated));
+        let handle = target.spawn(NODE.scope(Some(node), gated));
         self.register(node, handle.abort_handle());
         handle
     }
@@ -469,9 +470,8 @@ impl World {
         let parked = self.with_node(node, |entry| std::mem::take(&mut entry.parked));
         let dead = self.services.kill_node(node);
         self.emit(&SimEvent::Crash { node });
-        // Service destructors run here, after the services are dead and before any task
-        // is aborted.
-        drop(dead);
+        // Service destructors resolve node-local resources against the crashed node.
+        with_node_context(Some(node), || drop(dead));
         for task in tasks {
             task.abort();
         }
@@ -554,7 +554,8 @@ impl World {
     /// Stores `value` in the run's type-keyed slot for `T`, replacing any earlier one.
     /// Product probe hooks reach it through [`world`].
     pub fn insert_ext<T: Any + Send>(&self, value: T) {
-        lock(&self.hooks.ext).insert(TypeId::of::<T>(), Box::new(value));
+        let previous = lock(&self.hooks.ext).insert(TypeId::of::<T>(), Box::new(value));
+        drop(previous);
     }
 
     /// Runs `f` on the run's `T` slot and returns its result, or `None` when no `T` was
@@ -562,12 +563,20 @@ impl World {
     /// use other slots and the rest of the world; a nested `with_ext::<T>` from inside
     /// `f` sees `None`.
     pub fn with_ext<T: Any, R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
-        let mut slot = lock(&self.hooks.ext).remove(&TypeId::of::<T>())?;
-        let result = slot.downcast_mut::<T>().map(f);
-        lock(&self.hooks.ext)
-            .entry(TypeId::of::<T>())
-            .or_insert(slot);
-        result
+        let key = TypeId::of::<T>();
+        let mut slot = lock(&self.hooks.ext).remove(&key)?;
+        let value = slot
+            .downcast_mut::<T>()
+            .expect("extension slots are keyed by their stored type");
+        let result = catch_unwind(AssertUnwindSafe(|| f(value)));
+        if let std::collections::btree_map::Entry::Vacant(entry) = lock(&self.hooks.ext).entry(key)
+        {
+            entry.insert(slot);
+        }
+        match result {
+            Ok(value) => Some(value),
+            Err(panic) => resume_unwind(panic),
+        }
     }
 
     /// A stop-the-world pause: every node's clocks move forward by `by` at once, and
@@ -766,8 +775,7 @@ where
 /// The node the current task or thread belongs to, if any.
 pub fn current_node() -> Option<u64> {
     NODE.try_with(|node| *node)
-        .ok()
-        .or_else(|| match ROLE.get() {
+        .unwrap_or_else(|_| match ROLE.get() {
             Role::Blocking(node) | Role::Service(node) => node,
             Role::Main => None,
         })
@@ -775,7 +783,12 @@ pub fn current_node() -> Option<u64> {
 
 /// Runs `future` as part of `node`, without spawning.
 pub async fn in_node<F: Future>(node: u64, future: F) -> F::Output {
-    NODE.scope(node, future).await
+    NODE.scope(Some(node), future).await
+}
+
+/// Runs synchronous code in a service's node context, including on the helper.
+fn with_node_context<T>(node: Option<u64>, f: impl FnOnce() -> T) -> T {
+    NODE.sync_scope(node, f)
 }
 
 /// The paused runtime clock. On the blocking helper it is frozen, because the
