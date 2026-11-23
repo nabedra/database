@@ -47,6 +47,7 @@ pub struct Options {
     /// When set, a loss is allowed only for writes acknowledged within this long before the
     /// failover marker (needs `time_ns`).
     pub lag_window_ns: Option<u64>,
+    /// Clock tolerance on either side of the nominal expiry deadline.
     pub expiry_tolerance_ns: u64,
 }
 
@@ -302,6 +303,7 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
         .filter(|o| kind(&o.f) == Some("read") && o.outcome == Outcome::Ok)
         .collect();
     let at = |o: &Op| o.complete_index.unwrap_or(o.invoke_index);
+    let expiry_tolerance = ctx.opts.expiry_tolerance_ns;
     // (read, writer of the value it saw), for the monotonic-read check.
     let mut seen: Vec<(&Op, Option<&Op>)> = Vec::new();
     for r in &reads {
@@ -348,7 +350,7 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
 
         let expired = |d: &Op| {
             let deadline = d.invoke_value.get("at_ns").and_then(Value::as_u64)?;
-            let cutoff = deadline.saturating_add(ctx.opts.expiry_tolerance_ns);
+            let cutoff = deadline.saturating_add(expiry_tolerance);
             (r.call_time? >= cutoff
                 && !removals.iter().any(|later| {
                     later.f == "expire"
@@ -466,9 +468,12 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                     // A later operation can explain absence only if it could take effect
                     // between the write and this read.
                     None => {
-                        !removals.iter().any(|d| can_remove_between(d, w2, r))
-                            && !deadline_passed(w2, r)
-                            && !overwrites(w2).any(|next| deadline_passed(next, r))
+                        !removals
+                            .iter()
+                            .any(|d| can_remove_between(d, w2, r, expiry_tolerance))
+                            && !expiry_possible(w2, r, expiry_tolerance)
+                            && !overwrites(w2)
+                                .any(|next| expiry_possible(next, r, expiry_tolerance))
                     }
                 }
         });
@@ -506,12 +511,14 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                                 && !possible_rewrite(&writer[&canon(written(w_old))], wn, r2)
                         }
                         None => {
-                            !removals.iter().any(|d| can_remove_between(d, r1, r2))
-                                && !deadline_passed(wn, r2)
+                            !removals
+                                .iter()
+                                .any(|d| can_remove_between(d, r1, r2, expiry_tolerance))
+                                && !expiry_possible(wn, r2, expiry_tolerance)
                                 && !acked_writes.iter().any(|next| {
                                     observed_before(wn, next, &seen)
                                         && next.precedes(r2)
-                                        && deadline_passed(next, r2)
+                                        && expiry_possible(next, r2, expiry_tolerance)
                                 })
                         }
                     })
@@ -546,19 +553,19 @@ fn possible_rewrite(writers: &[&Op], newer: &Op, read: &Op) -> bool {
     })
 }
 
-fn deadline_passed(expiring: &Op, read: &Op) -> bool {
+fn expiry_possible(expiring: &Op, read: &Op, tolerance_ns: u64) -> bool {
     expiring
         .invoke_value
         .get("at_ns")
         .and_then(Value::as_u64)
         .zip(read.ret_time)
-        .is_some_and(|(deadline, time)| time >= deadline)
+        .is_some_and(|(deadline, time)| time.saturating_add(tolerance_ns) >= deadline)
 }
 
-fn can_remove_between(removal: &Op, prior: &Op, read: &Op) -> bool {
+fn can_remove_between(removal: &Op, prior: &Op, read: &Op, tolerance_ns: u64) -> bool {
     !removal.precedes(prior)
         && removal.call < read.ret_pos()
-        && (kind(&removal.f) == Some("delete") || deadline_passed(removal, read))
+        && (kind(&removal.f) == Some("delete") || expiry_possible(removal, read, tolerance_ns))
 }
 
 fn epochs(w: &Op, r: &Op) -> String {
@@ -594,6 +601,7 @@ fn check_counter(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly>
         .filter_map(|(o, _)| as_int(&o.complete_value).map(|v| (*o, v)))
         .collect();
     let at = |o: &Op| o.complete_index.unwrap_or(o.invoke_index);
+    let expiry_tolerance = ctx.opts.expiry_tolerance_ns;
     for x in ops
         .iter()
         .copied()

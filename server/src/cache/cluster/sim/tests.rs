@@ -33,6 +33,7 @@ const NIGHTLY_REGRESSION_SEEDS: &[u64] = &[
     4_524_674_007_700_871,
     4_524_674_007_700_908,
     4_524_674_007_700_909,
+    4_527_531_587_501_106,
 ];
 const FIRST_WORKER: u64 = 11;
 const MIB: usize = 1 << 20;

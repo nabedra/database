@@ -225,3 +225,29 @@ fn cache_sim_rejects_resurrection_after_promoted_replica_showed_absence() {
         assert_rejects(&events, events.len() - 1, "resurrection");
     }
 }
+
+#[test]
+fn cache_sim_expiry_clock_allows_early_absence_within_tolerance() {
+    let mut events = read_jsonl(
+        include_bytes!("fixtures/cache_sim_seed_4527531587501106_expiry_clock.jsonl").as_slice(),
+    )
+    .unwrap();
+    let options = relaxed_kv::Options {
+        expiry_tolerance_ns: 11_000_000,
+        ..Default::default()
+    };
+    let verdict = relaxed_kv::check_with(&events, &options);
+    assert!(verdict.valid, "{:#?}", verdict.anomalies);
+
+    let deadline = events[0].value["at_ns"].as_u64().unwrap();
+    let earliest_expiry = deadline - options.expiry_tolerance_ns;
+    for read in &mut events[2..] {
+        read.time_ns = Some(earliest_expiry);
+    }
+    assert!(relaxed_kv::check_with(&events, &options).valid);
+
+    for read in &mut events[2..] {
+        read.time_ns = Some(earliest_expiry - 1);
+    }
+    assert_rejects_with(&events, 3, "stale-read", &options);
+}
