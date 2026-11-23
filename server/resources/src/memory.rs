@@ -126,7 +126,7 @@ impl ScratchLease {
 
     /// Only a codec with a checked aggregate retained-heap bound may release
     /// unused decode scratch. Every clone observes the same smaller charge.
-    pub fn shrink_unused(&self, bytes: usize) -> Result<(), ProtocolError> {
+    fn shrink_unused(&self, bytes: usize) -> Result<(), ProtocolError> {
         let ScratchBacking::Working { charge, counter } = &self.backing else {
             return Err(capacity());
         };
@@ -156,6 +156,11 @@ impl Drop for ScratchLease {
             );
         }
     }
+}
+
+/// Releases scratch above the caller's checked bound for the retained heap.
+pub fn shrink_scratch(lease: &ScratchLease, bytes: usize) -> Result<(), ProtocolError> {
+    lease.shrink_unused(bytes)
 }
 
 /// A mutable frame owns its budget before its first byte is allocated.

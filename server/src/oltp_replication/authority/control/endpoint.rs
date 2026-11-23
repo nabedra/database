@@ -26,13 +26,13 @@ use crate::{
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
+use nabedra_rt::time;
 use serde::{Deserialize, Serialize};
 use std::{
     mem::size_of,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
-use nabedra_rt::time;
 use uuid::Uuid;
 
 const HEADER_LIMIT: usize = 4096;
@@ -2302,7 +2302,7 @@ impl ControlClient {
                 )
             })
             .ok_or_else(unavailable)?;
-        owner.shrink_unused(retained)?;
+        nabedra_resources::memory::shrink_scratch(&owner, retained)?;
         let route = Arc::new(VerifiedReplicaRoutes {
             record,
             members,

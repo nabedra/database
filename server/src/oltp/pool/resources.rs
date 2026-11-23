@@ -2,7 +2,7 @@
 use crate::{
     config::{ExecutionConfig, WorkerResources},
     protocol::ProtocolError,
-    scheduling::ResourceScheduler,
+    scheduling::{MemoryCharge, ResourceScheduler},
 };
 use nabedra_resources::memory::WorkerMemory;
 pub use nabedra_resources::memory::{
@@ -15,7 +15,6 @@ pub(crate) use nabedra_resources::memory::{
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
-    ops::Deref,
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -47,14 +46,6 @@ pub struct WorkerSharedResources {
     queue_claim: Arc<AtomicBool>,
     memory: Arc<WorkerMemory>,
     leases: Arc<NativeLeases>,
-}
-
-impl Deref for WorkerSharedResources {
-    type Target = WorkerMemory;
-
-    fn deref(&self) -> &Self::Target {
-        &self.memory
-    }
 }
 
 #[derive(Serialize)]
@@ -152,6 +143,209 @@ impl WorkerSharedResources {
         owner.memory.bind_owner(weak);
         Ok(owner)
     }
+    pub fn reply_waiters(&self, class: ExecutionClass) -> usize {
+        self.memory.reply_waiters(class)
+    }
+
+    pub fn apply_bytes_used(&self) -> usize {
+        self.memory.apply_bytes_used()
+    }
+
+    pub fn scheduler(&self) -> ResourceScheduler {
+        self.memory.scheduler()
+    }
+
+    pub fn task_memory_limit_bytes(&self) -> usize {
+        self.memory.task_memory_limit_bytes()
+    }
+
+    pub fn scheduler_node_id(&self) -> u64 {
+        self.memory.scheduler_node_id()
+    }
+
+    pub fn control_bytes_used(&self) -> usize {
+        self.memory.control_bytes_used()
+    }
+
+    /// The multi-Raft owner must hold this through task termination. A storage
+    /// handle going inactive never releases an advertised voter's residency.
+    pub fn reserve_group_residency(&self) -> Result<OwnedSemaphorePermit, ProtocolError> {
+        self.memory.reserve_group_residency()
+    }
+
+    /// Actual live Raft task owners are bounded separately from registered
+    /// endpoint groups. A relocation learner may share the logical group ID,
+    /// but it still consumes its own task capacity until joined shutdown.
+    pub fn reserve_replica_residency(&self) -> Result<OwnedSemaphorePermit, ProtocolError> {
+        self.memory.reserve_replica_residency()
+    }
+
+    pub(crate) fn lease_group_residency(&self) -> Result<GroupCapacityLease, ProtocolError> {
+        self.memory.lease_group_residency()
+    }
+
+    pub(crate) fn lease_replica_residency(&self) -> Result<GroupCapacityLease, ProtocolError> {
+        self.memory.lease_replica_residency()
+    }
+
+    pub(super) fn reserve_group_handle(&self) -> Result<GroupCapacityLease, ProtocolError> {
+        self.memory.reserve_group_handle()
+    }
+
+    pub fn buffer_bytes_used(&self, class: ByteClass) -> usize {
+        self.memory.buffer_bytes_used(class)
+    }
+
+    pub fn allocate_bytes(
+        &self,
+        class: ByteClass,
+        len: usize,
+    ) -> Result<ChargedBuffer, ProtocolError> {
+        self.memory.allocate_bytes(class, len)
+    }
+
+    pub fn reserve_scratch(
+        &self,
+        class: ByteClass,
+        bytes: usize,
+    ) -> Result<ScratchLease, ProtocolError> {
+        self.memory.reserve_scratch(class, bytes)
+    }
+
+    /// Planning may retain bounded derived keys/maps beyond the decoded body.
+    /// Add only the missing working charge before those copies are allocated.
+    pub(crate) fn ensure_scratch_budget(
+        &self,
+        current: Arc<ScratchLease>,
+        required: usize,
+    ) -> Result<Arc<ScratchLease>, ProtocolError> {
+        self.memory.ensure_scratch_budget(current, required)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_working_decode_peak(&self) {
+        self.memory.reset_working_decode_peak()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak_working_decode_bytes(&self) -> usize {
+        self.memory.peak_working_decode_bytes()
+    }
+
+    pub fn working_decode_bytes(&self) -> usize {
+        self.memory.working_decode_bytes()
+    }
+
+    pub fn copy_bytes(&self, bytes: &[u8]) -> Result<ChargedBytes, ProtocolError> {
+        self.memory.copy_bytes(bytes)
+    }
+
+    pub fn copy_bytes_in(
+        &self,
+        class: ByteClass,
+        bytes: &[u8],
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.memory.copy_bytes_in(class, bytes)
+    }
+
+    pub fn encode<T: Serialize>(
+        &self,
+        value: &T,
+        max_bytes: usize,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.memory.encode(value, max_bytes)
+    }
+
+    pub fn encode_in<T: Serialize>(
+        &self,
+        class: ByteClass,
+        value: &T,
+        max_bytes: usize,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.memory.encode_in(class, value, max_bytes)
+    }
+
+    pub(super) fn reserve_bytes_in(
+        &self,
+        class: ByteClass,
+        bytes: usize,
+    ) -> Result<ByteReservation, ProtocolError> {
+        self.memory.reserve_bytes_in(class, bytes)
+    }
+
+    pub(super) async fn reply_budget(
+        &self,
+        class: ExecutionClass,
+        bytes: usize,
+    ) -> Result<ByteReservation, ProtocolError> {
+        self.memory.reply_budget(class, bytes).await
+    }
+
+    /// Reply decoding cannot borrow the raw-reply arena: fully occupied raw
+    /// replies would otherwise wait on their own release. This separately
+    /// reserved ceiling retains decoded DTOs through responders and clones.
+    /// Acquire it before native codec execution, and bound the lexical/DTO
+    /// allocation estimate before deserializing.
+    pub(super) async fn data_apply_reply_budget(
+        &self,
+        bytes: usize,
+    ) -> Result<ByteReservation, ProtocolError> {
+        self.memory.data_apply_reply_budget(bytes).await
+    }
+
+    pub fn data_apply_reply_bytes_used(&self) -> usize {
+        self.memory.data_apply_reply_bytes_used()
+    }
+
+    pub async fn reserve_reply_decode(&self, bytes: usize) -> Result<ScratchLease, ProtocolError> {
+        self.memory.reserve_reply_decode(bytes).await
+    }
+
+    pub fn reply_decode_bytes_used(&self) -> usize {
+        self.memory.reply_decode_bytes_used()
+    }
+
+    pub async fn reserve_scratch_wait(
+        &self,
+        class: ByteClass,
+        bytes: usize,
+        request: u64,
+    ) -> Result<ScratchLease, ProtocolError> {
+        self.memory
+            .reserve_scratch_wait(class, bytes, request)
+            .await
+    }
+
+    pub(super) fn pool_overhead(&self) -> Result<MemoryCharge, ProtocolError> {
+        self.memory.pool_overhead()
+    }
+
+    pub(crate) fn validate_registered_group_capacity(
+        &self,
+        execution: &ExecutionConfig,
+        configured_pools: usize,
+        system_groups: usize,
+    ) -> Result<(), ProtocolError> {
+        self.memory
+            .validate_registered_group_capacity(execution, configured_pools, system_groups)
+    }
+
+    pub fn config(&self) -> SharedResourceConfig {
+        self.memory.config()
+    }
+
+    pub(crate) fn resident_group_usage(&self) -> (usize, usize) {
+        self.memory.resident_group_usage()
+    }
+
+    pub fn native_baseline_bytes(&self) -> u64 {
+        self.memory.native_baseline_bytes()
+    }
+
+    pub(super) fn reserve_pool_slot(&self) -> Result<OwnedSemaphorePermit, ProtocolError> {
+        self.memory.reserve_pool_slot()
+    }
+
     pub(crate) fn request_actor_bytes(execution: &ExecutionConfig) -> Option<u64> {
         WorkerMemory::request_actor_bytes(execution)
     }
@@ -407,7 +601,7 @@ impl PreparedNative {
         // the write is visible, after this slot was released. Wait for it: a
         // failed reservation here would fail a committed Raft apply, which is
         // fatal to the replica (T7b, D07).
-        let mut all = owner.reserve_apply(self.class, working).await?;
+        let mut all = owner.memory.reserve_apply(self.class, working).await?;
         let scratch = all.split(budget.scratch_bytes)?;
         let batch = all.split(budget.batch_bytes)?;
         Ok((scratch, batch, output))
@@ -573,18 +767,17 @@ mod tests {
         assert_eq!(memory.working_decode_bytes(), 0);
         let baseline = memory.scheduler().usage();
         assert!(memory.reserve_scratch(ByteClass::Data, 1024).is_err());
-        assert!(
-            memory
-                .reserve_scratch_wait(ByteClass::Data, 1024, 1)
-                .await
-                .is_err()
-        );
-        assert!(
-            memory
-                .reserve_scratch_wait(ByteClass::Progress, 1024, 1)
-                .await
-                .is_err()
-        );
+        for class in [ByteClass::Data, ByteClass::Progress] {
+            let mut reservation = std::pin::pin!(memory.reserve_scratch_wait(class, 1024, 1));
+            std::future::poll_fn(|context| {
+                assert!(matches!(
+                    reservation.as_mut().poll(context),
+                    Poll::Ready(Err(_))
+                ));
+                Poll::Ready(())
+            })
+            .await;
+        }
         assert_eq!(memory.working_decode_bytes(), 0);
         assert_eq!(memory.scheduler().usage(), baseline);
     }
@@ -649,7 +842,7 @@ mod tests {
             ..Default::default()
         };
         let resources = WorkerSharedResources::new(1, WorkerResources::default(), config).unwrap();
-        let arena = resources.group_capacity_arena().unwrap();
+        let arena = resources.memory.group_capacity_arena().unwrap();
         let budget = 2 * (GROUP_ENDPOINT_BYTES + RAFT_REPLICA_BYTES) + 3 * GROUP_HANDLE_BYTES;
         let scheduler = resources.scheduler();
         let baseline = scheduler.usage()[0].2;
@@ -747,7 +940,7 @@ mod tests {
             SharedResourceConfig::default(),
         )
         .unwrap();
-        let arena = resources.progress_arena();
+        let arena = resources.memory.progress_arena();
         let used = || resources.buffer_bytes_used(ByteClass::Progress);
         let waiters = || arena.waiters();
         let scheduler = resources.scheduler();
@@ -802,7 +995,7 @@ mod tests {
             SharedResourceConfig::default(),
         )
         .unwrap();
-        let arena = resources.progress_arena();
+        let arena = resources.memory.progress_arena();
         let held = arena.reserve(arena.capacity()).unwrap();
         let mut earlier = std::pin::pin!(arena.reserve_wait(arena.capacity() - 382));
         std::future::poll_fn(|cx| {

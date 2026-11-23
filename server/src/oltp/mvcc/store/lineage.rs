@@ -254,7 +254,8 @@ impl ParticipantMachine {
                         return Err(recovery_unknown());
                     }
                     let after = cursor.as_deref().map(super::scan::decode_key).transpose()?;
-                    owner.shrink_unused(
+                    nabedra_resources::memory::shrink_scratch(
+                        &owner,
                         after
                             .as_ref()
                             .map_or(0, MvccKey::heap_bytes)
