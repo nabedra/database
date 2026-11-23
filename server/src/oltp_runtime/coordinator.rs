@@ -552,6 +552,9 @@ impl QueueCoordinator {
                     .lock()
                     .map_err(|_| QueueError::Unavailable.protocol())?;
                 if replica.authority() != current {
+                    #[cfg(test)]
+                    tracing::debug!(%id, local = ?replica.authority(), control = ?current,
+                        "O14 probe: local replica view differs from admission view");
                     return Err(QueueError::Stale.protocol());
                 }
                 if if promote {
@@ -574,6 +577,8 @@ impl QueueCoordinator {
             };
             let Some(targets) = targets else {
                 if self.current().await? != current {
+                    #[cfg(test)]
+                    tracing::debug!(%id, "O14 probe: authority changed after copy completion");
                     return Err(QueueError::Stale.protocol());
                 }
                 let version = frame.record_version().map_err(QueueError::protocol)?;
@@ -610,6 +615,9 @@ impl QueueCoordinator {
                             .install_version(target, frame, version)
                             .await
                             .map_err(|mut error| {
+                                #[cfg(test)]
+                                tracing::debug!(%id, worker = %target.worker_id, ?error,
+                                    "O14 probe: peer rejected copy");
                                 // This send cannot establish that no peer
                                 // accepted or applied the logical request.
                                 error.outcome = Outcome::Unknown;
