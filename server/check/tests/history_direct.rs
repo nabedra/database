@@ -486,3 +486,127 @@ fn performance_2000_direct_ops_under_2s() {
     assert!(v.checked_ops >= 1500, "only {} ops checked", v.checked_ops);
     assert!(elapsed.as_secs_f64() < 2.0, "took {elapsed:?}");
 }
+
+#[test]
+fn direct_result_and_identity_review_cases() {
+    fn check(name: &str, jsonl: &str, expected: Option<&str>) {
+        let events = read_jsonl(jsonl.as_bytes()).unwrap();
+        let verdict = direct::check(&events);
+        assert!(
+            expected.map_or(verdict.valid, |kind| verdict.has(kind)),
+            "{name}: {verdict:#?}"
+        );
+    }
+
+    check(
+        "two lost replies under one identity",
+        r#"
+{"type":"invoke","process":0,"f":"upsert","key":"k","value":1,"request_id":"r"}
+{"type":"info","process":0,"f":"upsert"}
+{"type":"invoke","process":1,"f":"get","key":"k"}
+{"type":"ok","process":1,"f":"get","value":1}
+{"type":"invoke","process":2,"f":"upsert","key":"k","value":2,"request_id":"r"}
+{"type":"info","process":2,"f":"upsert"}
+{"type":"invoke","process":1,"f":"get","key":"k"}
+{"type":"ok","process":1,"f":"get","value":2}
+"#,
+        Some("non-linearizable"),
+    );
+
+    check(
+        "lost batch reply with a fractured read",
+        r#"
+{"type":"invoke","process":0,"f":"insert_many","key":"a","value":[{"id":"a","value":1},{"id":"b","value":2}],"request_id":"r"}
+{"type":"info","process":0,"f":"insert_many"}
+{"type":"invoke","process":1,"f":"get","key":"a"}
+{"type":"ok","process":1,"f":"get","value":1}
+{"type":"invoke","process":1,"f":"get","key":"b"}
+{"type":"ok","process":1,"f":"get","value":null}
+"#,
+        Some("non-linearizable"),
+    );
+
+    check(
+        "batch conflict when all rows are absent",
+        r#"
+{"type":"invoke","process":0,"f":"insert_many","key":"a","value":[{"id":"a","value":1},{"id":"b","value":2}],"request_id":"r"}
+{"type":"fail","process":0,"f":"insert_many","value":{"code":"conflict"}}
+"#,
+        Some("non-linearizable"),
+    );
+
+    check(
+        "batch conflict when a non-anchor row exists",
+        r#"
+{"type":"invoke","process":0,"f":"upsert","key":"b","value":3,"request_id":"seed"}
+{"type":"ok","process":0,"f":"upsert"}
+{"type":"invoke","process":0,"f":"insert_many","key":"a","value":[{"id":"a","value":1},{"id":"b","value":2}],"request_id":"r"}
+{"type":"fail","process":0,"f":"insert_many","value":{"code":"conflict"}}
+"#,
+        None,
+    );
+
+    check(
+        "duplicate batch keys are refused before lookup",
+        r#"
+{"type":"invoke","process":0,"f":"insert_many","key":"a","value":[{"id":"a","value":1},{"id":"a","value":2}],"request_id":"r"}
+{"type":"fail","process":0,"f":"insert_many","value":{"code":"conflict"}}
+"#,
+        None,
+    );
+
+    check(
+        "read-only update cannot explain a reuse refusal",
+        r#"
+{"type":"invoke","process":0,"f":"update","key":"k","value":1,"request_id":"r"}
+{"type":"ok","process":0,"f":"update","value":false}
+{"type":"invoke","process":0,"f":"upsert","key":"k","value":2,"request_id":"r"}
+{"type":"fail","process":0,"f":"upsert","value":{"code":"conflict"}}
+"#,
+        Some("request-id-reuse-misdetected"),
+    );
+
+    check(
+        "read-only update cannot account for an observed failed write",
+        r#"
+{"type":"invoke","process":0,"f":"update","key":"k","value":1,"request_id":"r"}
+{"type":"fail","process":0,"f":"update","value":{"code":"overloaded","not_applied":true}}
+{"type":"invoke","process":1,"f":"update","key":"k","value":1,"request_id":"r"}
+{"type":"ok","process":1,"f":"update","value":false}
+{"type":"invoke","process":1,"f":"get","key":"k"}
+{"type":"ok","process":1,"f":"get","value":1}
+"#,
+        Some("failed-write-observed"),
+    );
+
+    check(
+        "batch replay with an incorrect count",
+        r#"
+{"type":"invoke","process":0,"f":"insert_many","key":"a","value":[{"id":"a","value":1},{"id":"b","value":2}],"request_id":"r"}
+{"type":"info","process":0,"f":"insert_many"}
+{"type":"invoke","process":0,"f":"insert_many","key":"a","value":[{"id":"a","value":1},{"id":"b","value":2}],"request_id":"r"}
+{"type":"ok","process":0,"f":"insert_many","value":{"data":1}}
+"#,
+        Some("non-linearizable"),
+    );
+}
+
+#[test]
+fn generic_kv_does_not_deduplicate_repeated_request_ids() {
+    let events = read_jsonl(
+        br#"
+{"type":"invoke","process":0,"f":"upsert","key":"k","value":1,"request_id":"r"}
+{"type":"ok","process":0,"f":"upsert"}
+{"type":"invoke","process":0,"f":"upsert","key":"k","value":2,"request_id":"other"}
+{"type":"ok","process":0,"f":"upsert"}
+{"type":"invoke","process":0,"f":"upsert","key":"k","value":1,"request_id":"r"}
+{"type":"ok","process":0,"f":"upsert"}
+{"type":"invoke","process":1,"f":"get","key":"k"}
+{"type":"ok","process":1,"f":"get","value":1}
+"#
+        .as_slice(),
+    )
+    .unwrap();
+    assert!(linearizable::check_kv(&events).valid);
+    assert!(direct::check(&events).has("non-linearizable"));
+}

@@ -1,9 +1,8 @@
 //! Per-key register linearizability (OLTP-G02 for single-key operations).
 //!
-//! Each key is an independent register, so by P-compositionality the history is linearizable
-//! iff every per-key subhistory is. Each subhistory is searched with the Wing and Gong algorithm
-//! with Lowe's memoization: a set of `(linearized ops bitset, register state)` pairs already
-//! explored, which prunes the exponential search to the reachable configurations.
+//! Individual keys are independent registers. In direct-path histories, a batch joins the
+//! registers it touches because the rows and the request record change atomically. Each
+//! independent group is searched with the Wing and Gong algorithm with Lowe's memoization.
 //!
 //! Operations, by `f`:
 //!
@@ -13,7 +12,7 @@
 //! | `write`, `set`, `put`, `upsert` | the value written | ignored | writes |
 //! | `cas` | `[expected, new]` | ignored | compare and set |
 //! | `insert` | the value | ignored | sets from absent only |
-//! | `insert_many` | an array of rows | ignored | an `insert` of each row's key |
+//! | `insert_many` | an array of rows | ignored | inserts every row |
 //! | `update` | the value | the existence flag | sets only when present |
 //! | `delete`, `del` | ignored | the existence flag | removes |
 //!
@@ -28,11 +27,9 @@
 //! completion value itself or its `data` field. Without it, an `update` writes only when the
 //! key is present and a `delete` constrains nothing about the state before it.
 //!
-//! `fail` ops are dropped, with one exception: an `insert`, or an `insert_many` of one row,
-//! refused with the error code `conflict` reads "present" at a point inside its interval,
-//! unless another request body under the same request ID and anchor key could have caused the
-//! conflict (the direct path's request ID reuse refusal, D03). The error code is the
-//! completion value's `code` or `error` string, or `error.code`.
+//! An insert conflict requires an existing row, or a record for a different body under the
+//! same identity in direct-path histories. A direct-path batch conflict requires at least one
+//! existing row, unless its body repeats a key or deduplication explains the refusal.
 //!
 //! An `info` write, cas, insert, update or delete may take effect at any point after its
 //! invoke, or never; an `info` read constrains nothing and is dropped. Ops with other `f`
@@ -41,19 +38,17 @@
 //! [`Options::request_dedup`] adds the direct path's request identity (OLTP-G03): the dedup
 //! record is keyed by table, anchor key and request ID, and a retry with the same body returns
 //! the original result. Attempts that share request ID, anchor key, `f` and invoke value are
-//! one logical operation. It takes effect at most once, between the first attempt's invoke and
-//! the first `ok` answer that proves it committed. An attempt answered without a commit (an
-//! `update` or `delete` of a missing row, or an insert `conflict`) ran before the commit, since
-//! later attempts replay the stored result. A history in which a retry applied again, or
-//! answered from fresh state after the commit, is then not linearizable.
+//! one logical mutation. It can commit between the first eligible invoke and the first success
+//! that proves a commit. An answer computed from fresh state requires an empty dedup slot.
+//! All bodies under an identity share the slot, including those with unknown outcomes.
 
 use super::{Anomaly, Verdict, canon};
 use crate::history::{Event, Op, Outcome, pair, payload};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// Upper bound on memoized configurations per key before the checker gives up and reports a
-/// `check-limit` anomaly instead of passing.
+/// Upper bound on memoized configurations per independent key group. Large states can have
+/// a lower limit so a search reports `check-limit` before it exhausts memory.
 pub const DEFAULT_MAX_CONFIGS: usize = 2_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,8 +70,6 @@ impl Default for Options {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RegOp {
     Read(u32),
-    /// Reads any present value.
-    Present,
     Write(u32),
     Cas(u32, u32),
     /// Writes when present; fails when absent.
@@ -92,7 +85,6 @@ impl RegOp {
     fn step(self, state: u32) -> Option<u32> {
         match self {
             RegOp::Read(v) => (v == state).then_some(state),
-            RegOp::Present => (state != 0).then_some(state),
             RegOp::Write(v) => Some(v),
             RegOp::Cas(old, new) => (old == state).then_some(new),
             RegOp::Update(v) => (state != 0).then_some(v),
@@ -103,13 +95,30 @@ impl RegOp {
     }
 
     fn is_read(self) -> bool {
-        matches!(self, RegOp::Read(_) | RegOp::Present)
+        matches!(self, RegOp::Read(_))
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    Effect,
+    Fresh,
+    Conflict,
+    Invalid,
+    Plain,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Record {
+    slot: usize,
+    body: u32,
 }
 
 #[derive(Clone, Debug)]
 struct KeyOp {
-    op: RegOp,
+    rows: Vec<(usize, RegOp)>,
+    record: Option<Record>,
+    role: Role,
     call: usize,
     /// `None` for an op that may take effect at any later point, or never.
     ret: Option<usize>,
@@ -117,8 +126,48 @@ struct KeyOp {
     src: usize,
     /// Other attempts merged into this logical op.
     more: Vec<usize>,
-    /// Index of the key op this one must be linearized before, if that one takes effect.
-    before: Option<usize>,
+}
+
+impl KeyOp {
+    fn is_read(&self) -> bool {
+        matches!(self.role, Role::Conflict | Role::Fresh)
+            || self.role == Role::Plain && self.rows.iter().all(|(_, op)| op.is_read())
+    }
+
+    fn slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.rows
+            .iter()
+            .map(|&(key, _)| key)
+            .chain(self.record.map(|r| r.slot))
+    }
+
+    fn step(&self, state: &[u32]) -> Option<Vec<u32>> {
+        let held = self.record.map_or(0, |r| state[r.slot]);
+        match self.role {
+            Role::Invalid => return None,
+            Role::Conflict => {
+                let allowed = if let Some(r) = self.record.filter(|_| held != 0) {
+                    held != r.body
+                } else {
+                    self.rows.iter().any(|(key, _)| state[*key] != 0)
+                };
+                return allowed.then(|| state.to_vec());
+            }
+            Role::Effect | Role::Fresh if held != 0 => return None,
+            _ => {}
+        }
+
+        let mut next = state.to_vec();
+        for &(key, op) in &self.rows {
+            next[key] = op.step(state[key])?;
+        }
+        if self.role == Role::Effect
+            && let Some(r) = self.record
+        {
+            next[r.slot] = r.body;
+        }
+        Some(next)
+    }
 }
 
 pub fn check_kv(events: &[Event]) -> Verdict {
@@ -142,39 +191,100 @@ pub fn check_kv_opts(events: &[Event], opts: &Options) -> Verdict {
     };
     let ops = &paired.ops;
     let ids = Identities::new(ops);
-    let mut per_key: BTreeMap<String, Vec<Pre>> = BTreeMap::new();
+    let mut keys = BTreeMap::new();
+    let mut parents = Vec::new();
+    let mut projected = Vec::new();
     for (i, op) in ops.iter().enumerate() {
-        match project(op, i, &ids) {
-            Ok(pres) => {
-                for (key, pre) in pres {
-                    per_key.entry(key).or_default().push(pre);
-                }
-            }
+        let mut pre = match project(op, i, &ids, opts.request_dedup) {
+            Ok(Some(pre)) => pre,
+            Ok(None) => continue,
             Err(e) => return Verdict::malformed(e),
+        };
+        let key_id = |k: &str, keys: &mut BTreeMap<String, usize>, parents: &mut Vec<usize>| {
+            *keys.entry(k.to_owned()).or_insert_with(|| {
+                let id = parents.len();
+                parents.push(id);
+                id
+            })
+        };
+        if opts.request_dedup {
+            let home = key_id(&pre.anchor, &mut keys, &mut parents);
+            for (key, _) in &pre.rows {
+                let id = key_id(key, &mut keys, &mut parents);
+                let root = component(&mut parents, id);
+                parents[root] = component(&mut parents, home);
+            }
+            projected.push(pre);
+        } else if pre.rows.len() <= 1 {
+            key_id(&pre.anchor, &mut keys, &mut parents);
+            projected.push(pre);
+        } else {
+            // The generic KV check projects batches into independent registers.
+            for (key, shape) in std::mem::take(&mut pre.rows) {
+                key_id(&key, &mut keys, &mut parents);
+                projected.push(Pre {
+                    rows: vec![(key.clone(), shape)],
+                    anchor: key,
+                    ..pre
+                });
+            }
         }
+    }
+    let mut partitions = BTreeMap::<usize, Vec<Pre>>::new();
+    for pre in projected {
+        let root = component(&mut parents, keys[&pre.anchor]);
+        partitions.entry(root).or_default().push(pre);
     }
     let mut anomalies = Vec::new();
     let mut checked = 0;
-    for (key, pres) in per_key {
+    for (_, pres) in partitions {
         let mut interner = Interner::default();
-        let key_ops = build(&pres, ops, &ids, opts.request_dedup, &mut interner);
+        let (key_ops, width) = build(&pres, ops, &ids, opts.request_dedup, &mut interner);
+        let label = if pres.iter().all(|p| p.anchor == pres[0].anchor)
+            && pres
+                .iter()
+                .flat_map(|p| &p.rows)
+                .all(|(k, _)| k == &pres[0].anchor)
+        {
+            format!("key {:?}", pres[0].anchor)
+        } else {
+            "keys linked by a direct batch".to_string()
+        };
         checked += key_ops.len();
-        match search(&key_ops, None, opts.max_configs) {
+        // A memo entry stores a bitset and the register state. Bound the memory as well as
+        // the number of configurations when many keys or identities share a partition.
+        let state_bytes = 8 * key_ops.len().div_ceil(64) + 4 * width + 64;
+        let max_configs = opts.max_configs.min(128 * 1024 * 1024 / state_bytes);
+        match search(&key_ops, width, None, max_configs) {
             Search::Linearizable => {}
             Search::Limit => anomalies.push(Anomaly::new(
                 "check-limit",
                 format!(
-                    "key {key:?}: gave up after {} configurations; not proven linearizable",
-                    opts.max_configs
+                    "{label}: gave up after {max_configs} configurations; not proven linearizable"
                 ),
                 key_ops.iter().flat_map(|o| indices(o, ops)).collect(),
             )),
             Search::NotLinearizable => {
-                anomalies.push(explain(&key, &key_ops, ops, &interner, opts.max_configs));
+                anomalies.push(explain(
+                    &label,
+                    &key_ops,
+                    width,
+                    ops,
+                    &interner,
+                    max_configs,
+                ));
             }
         }
     }
     Verdict::new(checked, anomalies)
+}
+
+fn component(parents: &mut [usize], mut key: usize) -> usize {
+    while parents[key] != key {
+        parents[key] = parents[parents[key]];
+        key = parents[key];
+    }
+    key
 }
 
 pub(crate) fn classify(f: &str) -> Option<&'static str> {
@@ -226,7 +336,7 @@ pub(crate) fn committed_answer(op: &Op) -> Option<bool> {
     }
 }
 
-/// The rows of an `insert_many` invoke value, as `(key, row)`, first occurrence of each key.
+/// The rows of an `insert_many` invoke value, as `(key, row)`.
 /// `None` unless it is a non-empty array of rows that all have a key.
 pub(crate) fn rows_of(v: &Value) -> Option<Vec<(String, &Value)>> {
     let items = v.as_array()?;
@@ -237,9 +347,7 @@ pub(crate) fn rows_of(v: &Value) -> Option<Vec<(String, &Value)>> {
             Value::Number(n) => n.to_string(),
             _ => return None,
         };
-        if !out.iter().any(|(k, _)| *k == key) {
-            out.push((key, row));
-        }
+        out.push((key, row));
     }
     (!out.is_empty()).then_some(out)
 }
@@ -312,25 +420,17 @@ impl<'a> Identities<'a> {
             .into_iter()
             .flatten()
             .map(|&j| &self.ops[j])
-            .any(|w| w.outcome != Outcome::Fail && w.call < op.ret_pos() && body(w) != mine)
+            .any(|w| {
+                (w.outcome == Outcome::Info || committed_answer(w) == Some(true))
+                    && w.call < op.ret_pos()
+                    && body(w) != mine
+            })
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Role {
-    /// A mutation that took effect (`ok`) or may have (`info`).
-    Effect,
-    /// An answer that wrote nothing and was decided from fresh state, so in dedup mode it
-    /// precedes its identity's commit.
-    Precedes,
-    /// Neither: reads and answers that do not say whether they wrote.
-    Plain,
 }
 
 #[derive(Clone, Debug)]
 enum Shape {
     Read(Value),
-    Present,
     Write(Value),
     Cas(Value, Value),
     Update(Value),
@@ -342,107 +442,149 @@ enum Shape {
 #[derive(Clone, Debug)]
 struct Pre {
     src: usize,
-    shape: Shape,
-    /// The op completed with a definite answer, so it must be linearized.
-    must: bool,
+    anchor: String,
+    rows: Vec<(String, Shape)>,
     role: Role,
 }
 
-/// The per-key projections of one op.
-fn project(op: &Op, src: usize, ids: &Identities) -> Result<Vec<(String, Pre)>, String> {
+fn project(op: &Op, src: usize, ids: &Identities, direct: bool) -> Result<Option<Pre>, String> {
     let Some(class) = classify(&op.f) else {
-        return Ok(vec![]);
+        return Ok(None);
     };
-    let must = op.outcome == Outcome::Ok;
-    let pre = |shape: Shape, must: bool, role: Role| Pre {
-        src,
-        shape,
-        must,
-        role,
-    };
-    let conflict = || {
-        op.outcome == Outcome::Fail
-            && error_code(op) == Some("conflict")
-            && !ids.reuse_explains(src)
-    };
-    if class == "insert_many" {
-        if op.outcome == Outcome::Fail {
-            // A refusal of several rows says only that some key was present.
-            return Ok(match rows(op) {
-                Ok(rows) if rows.len() == 1 && conflict() => {
-                    vec![(rows[0].0.clone(), pre(Shape::Present, true, Role::Precedes))]
-                }
-                _ => vec![],
-            });
+    let conflict = op.outcome == Outcome::Fail && error_code(op) == Some("conflict");
+    let row_conflict = matches!(class, "insert" | "insert_many");
+    if op.outcome == Outcome::Fail && !(conflict && (row_conflict || direct && class != "read")) {
+        return Ok(None);
+    }
+    let batch = if class == "insert_many" {
+        match rows(op) {
+            Ok(rows) => rows,
+            Err(_) if op.outcome == Outcome::Fail => return Ok(None),
+            Err(e) => return Err(e),
         }
-        return Ok(rows(op)?
-            .into_iter()
-            .map(|(k, row)| {
-                let shape = Shape::Cas(Value::Null, payload(row).clone());
-                (k, pre(shape, must, Role::Effect))
-            })
-            .collect());
-    }
-    let present = class == "insert" && conflict();
-    if op.outcome == Outcome::Fail && !present {
-        return Ok(vec![]);
-    }
-    let Some(key) = op.key.clone() else {
-        return Err(format!("{} at event {} has no key", op.f, op.invoke_index));
+    } else {
+        Vec::new()
     };
+    let anchor =
+        anchor(op).ok_or_else(|| format!("{} at event {} has no key", op.f, op.invoke_index))?;
+    if class == "read" && op.outcome != Outcome::Ok {
+        return Ok(None);
+    }
     let value = || payload(&op.invoke_value).clone();
-    let p = match (class, op.outcome) {
-        (_, Outcome::Fail) => pre(Shape::Present, true, Role::Precedes),
-        ("read", Outcome::Ok) => pre(
-            Shape::Read(payload(&op.complete_value).clone()),
-            true,
-            Role::Plain,
-        ),
-        ("read", _) => return Ok(vec![]),
-        ("write", _) => pre(Shape::Write(value()), must, Role::Effect),
-        ("cas", _) => {
+    let mut pre = Pre {
+        src,
+        anchor,
+        rows: Vec::new(),
+        role: Role::Effect,
+    };
+    let single = |shape| vec![(op.key.clone().expect("single-key op"), shape)];
+    let batch_has_duplicate = {
+        let mut seen = HashSet::new();
+        batch.iter().any(|(key, _)| !seen.insert(key))
+    };
+    if op.outcome == Outcome::Fail {
+        if batch_has_duplicate || !direct && (batch.len() > 1 || ids.reuse_explains(src)) {
+            return Ok(None);
+        }
+        pre.role = Role::Conflict;
+        // The shape is unused for a conflict. These rows are the keys it can inspect.
+        pre.rows = match class {
+            "insert_many" => batch
+                .into_iter()
+                .map(|(key, _)| (key, Shape::Delete))
+                .collect(),
+            "insert" => single(Shape::Delete),
+            _ => Vec::new(),
+        };
+        return Ok(Some(pre));
+    }
+
+    pre.rows = match class {
+        "read" => {
+            pre.role = Role::Plain;
+            single(Shape::Read(payload(&op.complete_value).clone()))
+        }
+        "write" => single(Shape::Write(value())),
+        "cas" => {
             let args = payload(&op.invoke_value)
                 .as_array()
                 .filter(|a| a.len() == 2)
                 .ok_or_else(|| format!("cas at event {} needs [expected, new]", op.invoke_index))?;
-            pre(
-                Shape::Cas(args[0].clone(), args[1].clone()),
-                must,
-                Role::Effect,
-            )
+            single(Shape::Cas(args[0].clone(), args[1].clone()))
         }
-        ("insert", _) => pre(Shape::Cas(Value::Null, value()), must, Role::Effect),
-        ("update", Outcome::Info) => pre(Shape::Update(value()), false, Role::Effect),
-        ("update", _) => match existed(op) {
-            Some(true) => pre(Shape::Update(value()), true, Role::Effect),
-            Some(false) => pre(Shape::Read(Value::Null), true, Role::Precedes),
-            None => pre(Shape::UpdateAny(value()), true, Role::Plain),
-        },
-        ("delete", Outcome::Info) => pre(Shape::Delete, false, Role::Effect),
-        ("delete", _) => match existed(op) {
-            Some(true) => pre(Shape::DeleteExisting, true, Role::Effect),
-            Some(false) => pre(Shape::Read(Value::Null), true, Role::Precedes),
-            None => pre(Shape::Delete, true, Role::Plain),
-        },
-        _ => return Ok(vec![]),
+        "insert" => single(Shape::Cas(Value::Null, value())),
+        "insert_many" => {
+            if batch_has_duplicate && op.outcome == Outcome::Info {
+                return Ok(None);
+            }
+            let count = op.complete_value.get("data").unwrap_or(&op.complete_value);
+            if batch_has_duplicate
+                || op.outcome == Outcome::Ok
+                    && !count.is_null()
+                    && count.as_u64() != Some(batch.len() as u64)
+            {
+                pre.role = Role::Invalid;
+            }
+            batch
+                .into_iter()
+                .map(|(key, row)| (key, Shape::Cas(Value::Null, payload(row).clone())))
+                .collect()
+        }
+        "update" | "delete" => {
+            let update = class == "update";
+            single(match (op.outcome, existed(op)) {
+                (Outcome::Ok, Some(false)) => {
+                    pre.role = Role::Fresh;
+                    Shape::Read(Value::Null)
+                }
+                (Outcome::Ok, None) if direct => {
+                    pre.role = Role::Invalid;
+                    Shape::Read(Value::Null)
+                }
+                (Outcome::Ok, None) => {
+                    pre.role = Role::Plain;
+                    if update {
+                        Shape::UpdateAny(value())
+                    } else {
+                        Shape::Delete
+                    }
+                }
+                _ => {
+                    if update {
+                        Shape::Update(value())
+                    } else if direct || op.outcome == Outcome::Ok {
+                        Shape::DeleteExisting
+                    } else {
+                        Shape::Delete
+                    }
+                }
+            })
+        }
+        _ => unreachable!("unknown register operation {class}"),
     };
-    Ok(vec![(key, p)])
+    Ok(Some(pre))
 }
 
-/// Turns one key's projections into key ops, merging the attempts of one request identity
-/// when `dedup` is set.
+/// Assign registers and dedup slots within an independent key group. Merge the committing
+/// attempts for each body, while leaving fresh answers as separate operations.
 fn build(
     pres: &[Pre],
     ops: &[Op],
     ids: &Identities,
     dedup: bool,
     interner: &mut Interner,
-) -> Vec<KeyOp> {
+) -> (Vec<KeyOp>, usize) {
+    let mut keys = HashMap::new();
+    for (key, _) in pres.iter().flat_map(|p| &p.rows) {
+        let next = keys.len();
+        keys.entry(key).or_insert(next);
+    }
     let mut out: Vec<KeyOp> = Vec::with_capacity(pres.len());
-    let mut groups: HashMap<(String, &str, String), usize> = HashMap::new();
+    let mut groups = HashMap::new();
+    let mut slots = HashMap::new();
+    let mut bodies = HashMap::new();
     let mut to_reg = |shape: &Shape| match shape {
         Shape::Read(v) => RegOp::Read(interner.id(v)),
-        Shape::Present => RegOp::Present,
         Shape::Write(v) => RegOp::Write(interner.id(v)),
         Shape::Cas(a, b) => RegOp::Cas(interner.id(a), interner.id(b)),
         Shape::Update(v) => RegOp::Update(interner.id(v)),
@@ -450,52 +592,55 @@ fn build(
         Shape::Delete => RegOp::Delete,
         Shape::DeleteExisting => RegOp::DeleteExisting,
     };
-    for pre in pres.iter().filter(|p| p.role == Role::Effect) {
+    for pre in pres {
         let src = &ops[pre.src];
-        let op = to_reg(&pre.shape);
-        let ret = if pre.must { src.ret } else { None };
-        let id = if dedup { ids.identity(pre.src) } else { None };
-        if let Some(id) = id {
-            if let Some(&g) = groups.get(&id) {
-                let merged = &mut out[g];
+        let ret = src.ret;
+        let record = if dedup && pre.role != Role::Plain {
+            ids.identity(pre.src).and_then(|(anchor, rid, body)| {
+                let scope = (anchor, rid);
+                if ids.by_id[&scope].len() < 2 {
+                    return None;
+                }
+                let next_slot = keys.len() + slots.len();
+                let slot = *slots.entry(scope).or_insert(next_slot);
+                let next_body = bodies.len() as u32 + 1;
+                let body = *bodies.entry(body).or_insert(next_body);
+                Some(Record { slot, body })
+            })
+        } else {
+            None
+        };
+        if pre.role == Role::Effect
+            && let Some(record) = record
+        {
+            let identity = (record.slot, record.body);
+            if let Some(&g) = groups.get(&identity) {
+                let merged: &mut KeyOp = &mut out[g];
                 merged.call = merged.call.min(src.call);
                 merged.more.push(pre.src);
                 if let Some(r) = ret {
-                    // The committing answer fixes the op (a committed delete removed a row).
-                    merged.op = op;
                     merged.ret = Some(merged.ret.map_or(r, |m| m.min(r)));
                 }
                 continue;
             }
-            groups.insert(id, out.len());
+            groups.insert(identity, out.len());
         }
+
         out.push(KeyOp {
-            op,
+            rows: pre
+                .rows
+                .iter()
+                .map(|(key, shape)| (keys[key], to_reg(shape)))
+                .collect(),
+            record,
+            role: pre.role,
             call: src.call,
             ret,
             src: pre.src,
             more: vec![],
-            before: None,
         });
     }
-    for pre in pres.iter().filter(|p| p.role != Role::Effect) {
-        let src = &ops[pre.src];
-        let before = if dedup && pre.role == Role::Precedes {
-            ids.identity(pre.src)
-                .and_then(|id| groups.get(&id).copied())
-        } else {
-            None
-        };
-        out.push(KeyOp {
-            op: to_reg(&pre.shape),
-            call: src.call,
-            ret: if pre.must { src.ret } else { None },
-            src: pre.src,
-            more: vec![],
-            before,
-        });
-    }
-    out
+    (out, keys.len() + slots.len())
 }
 
 fn indices(o: &KeyOp, ops: &[Op]) -> Vec<usize> {
@@ -543,14 +688,70 @@ enum Search {
 
 const NONE: usize = usize::MAX;
 
-fn bit(set: &[u64], i: usize) -> bool {
-    set[i / 64] & (1 << (i % 64)) != 0
-}
-
 /// Wing and Gong search with memoization. With `cutoff = Some(t)`, only ops invoked at or
 /// before `t` are considered and ok ops returning after `t` are treated as unknown, which is the
 /// history prefix up to `t`.
-fn search(ops: &[KeyOp], cutoff: Option<usize>, max_configs: usize) -> Search {
+fn search(ops: &[KeyOp], width: usize, cutoff: Option<usize>, max_configs: usize) -> Search {
+    // If exactly one mutation can produce an observed value, it must take effect before
+    // that read returns. Tighten its deadline to avoid exploring later impossible schedules.
+    let in_prefix = |pos| cutoff.is_none_or(|t| pos <= t);
+    let mut writers = HashMap::new();
+    // Definite operations that would hide a particular value if they followed its source.
+    let mut on_key = HashMap::<usize, Vec<(usize, u32, usize)>>::new();
+    for (i, op) in ops.iter().enumerate() {
+        if op.role == Role::Invalid || !in_prefix(op.call) {
+            continue;
+        }
+        let ret = op.ret.filter(|&r| in_prefix(r));
+        for &(key, row) in &op.rows {
+            let definite_value = match (op.role, row) {
+                (Role::Conflict, _) => None,
+                (_, RegOp::UpdateAny(_)) => None,
+                (_, RegOp::Read(v) | RegOp::Write(v) | RegOp::Cas(_, v) | RegOp::Update(v)) => {
+                    Some(v)
+                }
+                (_, RegOp::Delete | RegOp::DeleteExisting) => Some(0),
+            };
+            if let (Some(r), Some(v)) = (ret, definite_value) {
+                on_key.entry(key).or_default().push((i, v, r));
+            }
+            let written = match row {
+                RegOp::Write(v) | RegOp::Cas(_, v) | RegOp::Update(v) | RegOp::UpdateAny(v) => v,
+                _ => continue,
+            };
+            if written != 0 {
+                writers
+                    .entry((key, written))
+                    .and_modify(|source| *source = None)
+                    .or_insert(Some(i));
+            }
+        }
+    }
+    let mut deadlines: Vec<_> = ops
+        .iter()
+        .map(|o| o.ret.filter(|&r| in_prefix(r)))
+        .collect();
+    let mut prerequisites = vec![Vec::new(); ops.len()];
+    for op in ops.iter().filter(|o| o.role == Role::Plain) {
+        if let (Some(ret), [(key, RegOp::Read(value))]) =
+            (op.ret.filter(|&r| in_prefix(r)), op.rows.as_slice())
+            && let Some(Some(writer)) = writers.get(&(*key, *value))
+            && ops[*writer].call < ret
+        {
+            let deadline = &mut deadlines[*writer];
+            *deadline = Some(deadline.map_or(ret, |d| d.min(ret)));
+            // If an earlier completed read saw another value, or a write left another
+            // value, the unique source of this read must follow it. Real time already
+            // orders predecessors that returned before the source was invoked.
+            prerequisites[*writer].extend(on_key[key].iter().filter_map(
+                |&(other, other_value, done)| {
+                    (other_value != *value && done < op.call && done >= ops[*writer].call)
+                        .then_some(other)
+                },
+            ));
+        }
+    }
+
     // Entries: (position, op index, is_call). Node 0 is the head sentinel.
     let mut entries: Vec<(usize, usize, bool)> = Vec::new();
     let mut must = 0usize;
@@ -558,8 +759,8 @@ fn search(ops: &[KeyOp], cutoff: Option<usize>, max_configs: usize) -> Search {
         if cutoff.is_some_and(|t| op.call > t) {
             continue;
         }
-        let ret = op.ret.filter(|&r| cutoff.is_none_or(|t| r <= t));
-        if ret.is_none() && op.op.is_read() {
+        let ret = deadlines[i];
+        if ret.is_none() && op.is_read() {
             continue; // an unknown read constrains nothing
         }
         entries.push((op.call, i, true));
@@ -611,114 +812,117 @@ fn search(ops: &[KeyOp], cutoff: Option<usize>, max_configs: usize) -> Search {
         }
     };
 
-    let words = ops.len().div_ceil(64);
-    let mut linearized = vec![0u64; words];
-    let mut state = 0u32;
-    let mut cache: HashSet<(Vec<u64>, u32)> = HashSet::new();
-    let mut stack: Vec<(usize, u32)> = Vec::new(); // (call node, state before)
-    let mut done_must = 0usize;
-    let mut entry = next[0];
-    loop {
-        if done_must == must {
-            return Search::Linearizable;
+    // Before the first pending return, only operations linked to it can matter. A disjoint
+    // operation can commute past that return, even if a later operation links their keys.
+    let candidates = |next: &[usize], state: &[u32]| {
+        let mut calls = Vec::new();
+        let mut node = next[0];
+        while is_call[node] {
+            calls.push(node);
+            node = next[node];
         }
-        if entry == NONE {
-            // Cannot happen for a well-formed list (a pending must-op return lies ahead), but
-            // treat it as a dead end.
-            match stack.pop() {
-                None => return Search::NotLinearizable,
-                Some((call, s)) => {
-                    entry = undo(
-                        call,
-                        s,
-                        &mut state,
-                        &mut linearized,
-                        &matched,
-                        &node_op,
-                        &mut done_must,
-                        &mut prev,
-                        &mut next,
-                        &relink,
-                    );
-                    continue;
+        if let Some(&read) = calls.iter().find(|&&call| {
+            let op = &ops[node_op[call]];
+            op.is_read() && op.step(state).is_some()
+        }) {
+            // A read that already agrees with the state can take its result now.
+            return vec![read].into_iter();
+        }
+        let mut related = HashSet::new();
+        let mut ordered = Vec::new();
+        let add = |node: usize, related: &mut HashSet<_>| {
+            related.extend(ops[node_op[node]].slots());
+        };
+        add(node, &mut related);
+        loop {
+            let len = ordered.len();
+            calls.retain(|&call| {
+                if ops[node_op[call]]
+                    .slots()
+                    .any(|slot| related.contains(&slot))
+                    || node_op[call] == node_op[node]
+                {
+                    add(call, &mut related);
+                    ordered.push(call);
+                    false
+                } else {
+                    true
                 }
+            });
+            if ordered.len() == len {
+                break;
             }
         }
-        if is_call[entry] {
+        let first = &ops[node_op[node]];
+        ordered.sort_by_cached_key(|&call| {
+            let op = &ops[node_op[call]];
+            let helps = op
+                .step(state)
+                .is_some_and(|next| first.step(&next).is_some());
+            (node_op[call] != node_op[node], !helps, matched[call])
+        });
+        ordered.into_iter()
+    };
+
+    let words = ops.len().div_ceil(64);
+    let mut linearized = vec![0u64; words];
+    let mut state = vec![0; width];
+    let mut cache: HashSet<(Vec<u64>, Vec<u32>)> = HashSet::new();
+    let mut stack = Vec::new();
+    let mut done_must = 0;
+    let mut choices = candidates(&next, &state);
+    loop {
+        if let Some(entry) = choices.next() {
             let op = node_op[entry];
-            // An answer decided from fresh state cannot follow its identity's commit.
-            let ordered = ops[op].before.is_none_or(|b| !bit(&linearized, b));
-            if ordered && let Some(new_state) = ops[op].op.step(state) {
-                let mut lin = linearized.clone();
-                lin[op / 64] |= 1 << (op % 64);
-                if cache.insert((lin.clone(), new_state)) {
+            if prerequisites[op]
+                .iter()
+                .all(|&p| linearized[p / 64] & (1 << (p % 64)) != 0)
+                && let Some(new_state) = ops[op].step(&state)
+            {
+                linearized[op / 64] |= 1 << (op % 64);
+                if cache.insert((linearized.clone(), new_state.clone())) {
                     if cache.len() > max_configs {
                         return Search::Limit;
                     }
-                    stack.push((entry, state));
-                    state = new_state;
-                    linearized = lin;
                     unlink(&mut prev, &mut next, entry);
                     if matched[entry] != NONE {
                         unlink(&mut prev, &mut next, matched[entry]);
                         done_must += 1;
+                        if done_must == must {
+                            return Search::Linearizable;
+                        }
                     }
-                    entry = next[0];
+                    stack.push((entry, state, choices));
+                    state = new_state;
+                    choices = candidates(&next, &state);
                     continue;
                 }
+                linearized[op / 64] &= !(1 << (op % 64));
             }
-            entry = next[entry];
-        } else {
-            match stack.pop() {
-                None => return Search::NotLinearizable,
-                Some((call, s)) => {
-                    entry = undo(
-                        call,
-                        s,
-                        &mut state,
-                        &mut linearized,
-                        &matched,
-                        &node_op,
-                        &mut done_must,
-                        &mut prev,
-                        &mut next,
-                        &relink,
-                    );
-                }
-            }
+            continue;
         }
-    }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn undo(
-    call: usize,
-    s: u32,
-    state: &mut u32,
-    linearized: &mut [u64],
-    matched: &[usize],
-    node_op: &[usize],
-    done_must: &mut usize,
-    prev: &mut Vec<usize>,
-    next: &mut Vec<usize>,
-    relink: &impl Fn(&mut Vec<usize>, &mut Vec<usize>, usize),
-) -> usize {
-    *state = s;
-    let op = node_op[call];
-    linearized[op / 64] &= !(1 << (op % 64));
-    if matched[call] != NONE {
-        relink(prev, next, matched[call]);
-        *done_must -= 1;
+        let Some((call, old_state, old_choices)) = stack.pop() else {
+            return Search::NotLinearizable;
+        };
+        state = old_state;
+        choices = old_choices;
+        let op = node_op[call];
+        linearized[op / 64] &= !(1 << (op % 64));
+        if matched[call] != NONE {
+            relink(&mut prev, &mut next, matched[call]);
+            done_must -= 1;
+        }
+        relink(&mut prev, &mut next, call);
     }
-    relink(prev, next, call);
-    next[call]
 }
 
 /// Finds the shortest failing history prefix and reports the op whose completion makes it
 /// fail, the ops concurrent with it, and the last write that completed before it was invoked.
 fn explain(
-    key: &str,
+    label: &str,
     key_ops: &[KeyOp],
+    width: usize,
     ops: &[Op],
     interner: &Interner,
     max_configs: usize,
@@ -729,7 +933,7 @@ fn explain(
     let (mut lo, mut hi) = (0usize, rets.len() - 1);
     while lo < hi {
         let mid = (lo + hi) / 2;
-        match search(key_ops, Some(rets[mid]), max_configs) {
+        match search(key_ops, width, Some(rets[mid]), max_configs) {
             Search::NotLinearizable => hi = mid,
             _ => lo = mid + 1,
         }
@@ -745,7 +949,7 @@ fn explain(
         .collect();
     if let Some(last_write) = key_ops
         .iter()
-        .filter(|o| !o.op.is_read() && o.ret.is_some_and(|r| r < culprit.call))
+        .filter(|o| !o.is_read() && o.ret.is_some_and(|r| r < culprit.call))
         .max_by_key(|o| o.ret)
     {
         window.push(last_write);
@@ -755,23 +959,21 @@ fn explain(
     let describe = |o: &KeyOp| -> String {
         let src = &ops[o.src];
         let v = |id: u32| interner.name(id).to_string();
-        let what = match o.op {
-            RegOp::Read(x) => format!("read {}", v(x)),
-            RegOp::Present => "conflict (present)".to_string(),
-            RegOp::Write(x) => format!("write {}", v(x)),
-            RegOp::Cas(a, b) if a == 0 && src.f.starts_with("insert") => {
-                format!("insert {}", v(b))
-            }
-            RegOp::Cas(a, b) => format!("cas {}->{}", v(a), v(b)),
-            RegOp::Update(x) => format!("update {}", v(x)),
-            RegOp::UpdateAny(x) => format!("update {} (existence unknown)", v(x)),
-            RegOp::Delete => "delete".to_string(),
-            RegOp::DeleteExisting => "delete (existed)".to_string(),
-        };
-        let what = if o.op == RegOp::Read(0) && matches!(src.f.as_str(), "update" | "delete") {
-            format!("{} of a missing row", src.f)
-        } else {
-            what
+        let what = match (o.role, o.rows.as_slice()) {
+            (Role::Conflict, _) => "conflict".to_string(),
+            (Role::Invalid, _) => format!("{} with an invalid success result", src.f),
+            (Role::Fresh, _) => format!("{} of a missing row", src.f),
+            (_, [(_, op)]) => match *op {
+                RegOp::Read(x) => format!("read {}", v(x)),
+                RegOp::Write(x) => format!("write {}", v(x)),
+                RegOp::Cas(0, b) if src.f.starts_with("insert") => format!("insert {}", v(b)),
+                RegOp::Cas(a, b) => format!("cas {}->{}", v(a), v(b)),
+                RegOp::Update(x) => format!("update {}", v(x)),
+                RegOp::UpdateAny(x) => format!("update {} (existence unknown)", v(x)),
+                RegOp::Delete => "delete".to_string(),
+                RegOp::DeleteExisting => "delete (existed)".to_string(),
+            },
+            _ => format!("{} ({} keys)", src.f, o.rows.len()),
         };
         let status = if o.ret.is_some() { "ok" } else { "info" };
         let status = if src.outcome == Outcome::Fail {
@@ -794,7 +996,7 @@ fn explain(
         )
     };
     let detail = format!(
-        "key {key:?}: no linearization once {} completes; window: {}",
+        "{label}: no linearization once {} completes; window: {}",
         describe(culprit),
         window
             .iter()

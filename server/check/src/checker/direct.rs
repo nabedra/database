@@ -3,11 +3,10 @@
 //!
 //! [`check`] runs three checks over one history and merges their verdicts:
 //!
-//! 1. [`linearizable::check_kv_opts`] with [`Options::request_dedup`]: per-key
-//!    linearizability, with the attempts of one request identity as one logical operation.
-//! 2. [`outcome::check`] (`failed-write-observed`), after `update` is read as a write of its
-//!    value and each `insert_many` is split into one `insert` per row.
-//! 3. [`check_identity`]: the request ID rules that a register cannot express.
+//! 1. [`linearizable::check_kv_opts`] with [`Options::request_dedup`]: linearizability
+//!    across the rows in each single-range batch, including request-ID replay and reuse.
+//! 2. [`outcome::check`] (`failed-write-observed`) over possible writes and row observations.
+//! 3. [`check_identity`]: specific diagnostics for replay and reuse violations.
 //!
 //! The request identity on the direct path is the table, the anchor key (the smallest key of
 //! the request) and the request ID. Its dedup record stores the body's digest and the result.
@@ -29,14 +28,15 @@
 //!
 //! The completion values come from the simulator's history recorder: a `fail` carries the
 //! error code (`code`, `error`, or `error.code`), and an `ok` `update` or `delete` carries the
-//! existence flag (`true`, `false`, or `{"data": b}`).
+//! existence flag (`true`, `false`, or `{"data": b}`). An `insert_many` success count,
+//! when recorded, must equal the number of input rows. These histories use primary-key
+//! conflicts. A workload with other uniqueness constraints needs to identify those refusals.
 
 use super::linearizable::{
-    self, Identities, Options, body, classify, committed_answer, error_code, rows_of,
+    self, Identities, Options, anchor, body, classify, committed_answer, error_code, rows_of,
 };
 use super::{Anomaly, Verdict, outcome};
-use crate::history::{Event, EventType, Op, Outcome, pair};
-use std::collections::HashMap;
+use crate::history::{Event, Op, Outcome, pair};
 
 /// Every direct-path check over one history.
 pub fn check(events: &[Event]) -> Verdict {
@@ -47,10 +47,14 @@ pub fn check(events: &[Event]) -> Verdict {
             ..Options::default()
         },
     );
+    let paired = match pair(events) {
+        Ok(paired) => paired,
+        Err(e) => return Verdict::malformed(e),
+    };
     Verdict::merge([
         lin,
-        outcome::check(&for_outcome(events)),
-        check_identity(events),
+        outcome::check(&for_outcome(events, &paired.ops)),
+        identity_verdict(&paired.ops),
     ])
 }
 
@@ -60,7 +64,10 @@ pub fn check_identity(events: &[Event]) -> Verdict {
         Ok(p) => p,
         Err(e) => return Verdict::malformed(e),
     };
-    let ops = &paired.ops;
+    identity_verdict(&paired.ops)
+}
+
+fn identity_verdict(ops: &[Op]) -> Verdict {
     let ids = Identities::new(ops);
     let mut anomalies = Vec::new();
     let mut checked = 0;
@@ -167,55 +174,51 @@ fn describe(op: &Op) -> String {
     )
 }
 
-/// The history as [`outcome::check`] reads it: `update` becomes `put`, and each `insert_many`
-/// becomes one `insert` per row on its own process, at the same positions. Event `index`
-/// fields are kept, so reports name the original lines.
-pub fn for_outcome(events: &[Event]) -> Vec<Event> {
-    let mut out = Vec::with_capacity(events.len());
-    // process -> the (process, key) of each row it was split into
-    let mut split: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
-    let mut next = crate::history::NEMESIS - 1;
-    for ev in events {
-        if ev.is_nemesis() {
-            out.push(ev.clone());
+/// Give each projected write its own process, retaining the original event order and indices.
+/// A successful update of a missing row is neither a write nor a possible source for a value.
+///
+/// The generic outcome checker matches dedup receipts by key and request ID. Include the original
+/// anchor and body so that projecting a batch row cannot alias a different request's receipt.
+fn for_outcome(events: &[Event], ops: &[Op]) -> Vec<Event> {
+    let mut at_event = vec![Vec::new(); events.len()];
+    let mut process = 0;
+    for op in ops {
+        if committed_answer(op) == Some(false) {
             continue;
         }
-        if ev.f == "insert_many" {
-            if ev.kind == EventType::Invoke
-                && let Some(rows) = rows_of(&ev.value)
-            {
-                let mut parts = Vec::with_capacity(rows.len());
-                for (key, row) in rows {
-                    next -= 1;
-                    let mut e = ev.clone();
-                    e.process = next;
-                    e.f = "insert".into();
-                    e.key = Some(key.clone());
-                    e.value = row.clone();
-                    out.push(e);
-                    parts.push((next, key));
-                }
-                split.insert(ev.process, parts);
+        let request_id = op
+            .request_id
+            .as_ref()
+            .map(|rid| serde_json::json!([anchor(op), rid, body(op)]).to_string());
+        let parts = if op.f == "insert_many" {
+            let Some(rows) = rows_of(&op.invoke_value) else {
                 continue;
-            }
-            if ev.kind != EventType::Invoke
-                && let Some(parts) = split.remove(&ev.process)
-            {
-                for (process, key) in parts {
-                    let mut e = ev.clone();
-                    e.process = process;
-                    e.f = "insert".into();
-                    e.key = Some(key);
-                    out.push(e);
+            };
+            rows.into_iter()
+                .map(|(key, row)| (Some(key), "insert", row))
+                .collect()
+        } else {
+            let f = if op.f == "update" {
+                "put"
+            } else {
+                op.f.as_str()
+            };
+            vec![(op.key.clone(), f, &op.invoke_value)]
+        };
+        for (key, f, value) in parts {
+            for pos in std::iter::once(op.call).chain(op.done) {
+                let mut event = events[pos].clone();
+                event.process = process;
+                event.key = key.clone();
+                event.request_id = request_id.clone();
+                event.f = f.to_string();
+                if pos == op.call {
+                    event.value = value.clone();
                 }
-                continue;
+                at_event[pos].push(event);
             }
+            process += 1;
         }
-        let mut e = ev.clone();
-        if e.f == "update" {
-            e.f = "put".into();
-        }
-        out.push(e);
     }
-    out
+    at_event.into_iter().flatten().collect()
 }
