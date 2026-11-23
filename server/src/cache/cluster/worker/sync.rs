@@ -119,7 +119,7 @@ impl Controller {
     }
 }
 
-async fn progress(worker: &Worker, telemetry: bool) -> Vec<ActorReport> {
+pub(super) async fn progress(worker: &Worker, telemetry: bool) -> Vec<ActorReport> {
     let mut receivers = Vec::with_capacity(worker.shared.actors.len());
     for actor in &worker.shared.actors {
         let (send, recv) = oneshot::channel();
