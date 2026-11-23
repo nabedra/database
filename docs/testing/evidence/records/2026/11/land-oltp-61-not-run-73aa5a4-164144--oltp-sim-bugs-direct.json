@@ -1,0 +1,56 @@
+{
+  "artifacts": [
+    {
+      "name": "land-oltp-61-not-run-73aa5a4-164144--oltp-sim-bugs-direct.log",
+      "sha256": "0397d1a87987b97e4258c5c45cbc2f818230f57c35407b847d74ee47c1b79d4e"
+    }
+  ],
+  "assertions": {
+    "executed": 0,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "output-marker",
+        "reason": "not-run: sim-harness-missing"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim-bugs-direct",
+  "duration_s": 0.115,
+  "guarantees": [
+    "OLTP-G01",
+    "OLTP-G03",
+    "OLTP-G04",
+    "OLTP-G07",
+    "OLTP-G08"
+  ],
+  "kind": "S H",
+  "mode": null,
+  "result": "not-run",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T16:44:03.754955+00:00",
+    "request_id": "land-oltp-61-not-run-73aa5a4-164144",
+    "runner": "GitHub Actions 1000006869",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45219382025"
+  },
+  "scenarios": [
+    "D02",
+    "D04",
+    "O10",
+    "O15",
+    "R04",
+    "O26"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "73aa5a4e2b2a50307aee22d6ebfc35f67eeb2fb5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
