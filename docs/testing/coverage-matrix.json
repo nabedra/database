@@ -1,7 +1,56 @@
 {
   "allow_unattested": false,
-  "head": "8498d0ee2c61a3df8557091412665b0e73f47bdc",
-  "ignored_records": [],
+  "head": "0c95a2704e675909cbf7cd63db746f0b39779cd4",
+  "ignored_records": [
+    {
+      "path": "land-p9-71-443a1d3-171128--events-sim.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p9-71-443a1d3-171128--licenses.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p9-71-443a1d3-171128--lsm-campaign.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p9-71-443a1d3-171128--realenv-unit.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p9-71-443a1d3-171128--rt-fs-contract.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p9-71-443a1d3-171128--rt-sim-openraft.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p9-71-443a1d3-171128--rt-unit.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p9-71-443a1d3-171128--sim-core-unit.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p9-71-443a1d3-171128--testing-bugs.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p9-71-443a1d3-171128--testing-ingest.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p9-71-443a1d3-171128--testing-matrix.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "land-p9-71-443a1d3-171128--testing-tools.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -738,6 +787,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -766,6 +816,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -799,6 +850,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -825,6 +877,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -858,6 +911,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -885,6 +939,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -918,6 +973,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -944,6 +1000,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -1063,6 +1120,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -1552,6 +1610,7 @@
         "D": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -1595,6 +1654,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -1616,6 +1676,7 @@
         "D": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -1658,6 +1719,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -1676,6 +1738,7 @@
         "D": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -1718,6 +1781,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -3992,5 +4056,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
