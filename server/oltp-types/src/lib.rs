@@ -1,6 +1,7 @@
 //! Protocol records and identities shared between OLTP components.
 
 mod identity;
+pub mod owned;
 pub mod types;
 
 pub use identity::{POOL_FORMAT_VERSION, PoolIdentity};
