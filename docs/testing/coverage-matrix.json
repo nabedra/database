@@ -1,7 +1,12 @@
 {
   "allow_unattested": false,
-  "head": "8498d0ee2c61a3df8557091412665b0e73f47bdc",
-  "ignored_records": [],
+  "head": "03decde1968218868bbdeaf8e0efaed734d380f6",
+  "ignored_records": [
+    {
+      "path": "p7-runtime-review-10b1cbe-102703--rt-zero-cost.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -3992,5 +3997,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
