@@ -12,6 +12,7 @@ publish = ["crates-io"]
 # Enabled by the server's dev-dependency for T9. Product defaults ignore the
 # test override, including when the resource crate is shared with an engine.
 test-defaults = []
+test-hooks = []
 
 [dependencies]
 nabedra-protocol = { path = "../protocol", version = "0.1.0" }

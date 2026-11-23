@@ -842,7 +842,6 @@ pub enum ByteClass {
     Progress,
     Data,
 }
-/// A mutable received frame owns its budget before its first byte is allocated.
 pub struct QueueLease {
     owner: Arc<WorkerSharedResources>,
 }
@@ -1294,7 +1293,7 @@ mod tests {
         let progress = resources.reserve_scratch(ByteClass::Progress, 383).unwrap();
         assert_eq!(progress.bytes(), 383);
         assert_eq!(used(), retained.bytes() + 383);
-        assert_eq!(arena.allocation.lock().unwrap().pending[0].bypassed, 0);
+        assert_eq!(arena.oldest_waiter_bypasses(), Some(0));
 
         let mut younger = Box::pin(resources.reserve_scratch_wait(ByteClass::Progress, 1, 0));
         let granted = std::future::poll_fn(|cx| {

@@ -66,6 +66,7 @@ impl Default for SharedResourceConfig {
     }
 }
 
+/// A mutable frame owns its budget before its first byte is allocated.
 pub struct ChargedBuffer {
     data: Vec<u8>,
     charge: ByteReservation,
@@ -196,6 +197,16 @@ impl ByteArena {
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<ByteReservation, ProtocolError> {
         self.reserve_ticket(bytes, None)
     }
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn oldest_waiter_bypasses(&self) -> Option<u32> {
+        self.allocation
+            .lock()
+            .expect("byte allocation state")
+            .pending
+            .front()
+            .map(|waiter| waiter.bypassed)
+    }
+
     fn reserve_ticket(
         self: &Arc<Self>,
         bytes: usize,

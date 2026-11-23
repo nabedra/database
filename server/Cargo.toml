@@ -98,7 +98,7 @@ libc = "=0.2.191"
 
 [dev-dependencies]
 nabedra-check = { path = "check" }
-nabedra-resources = { path = "resources", version = "0.1.0", features = ["test-defaults"] }
+nabedra-resources = { path = "resources", version = "0.1.0", features = ["test-defaults", "test-hooks"] }
 tokio = { version = "=1.54.1", features = ["test-util"] }
 tower = { version = "=0.5.3", features = ["util"] }
 http-body = "=1.1.0"
