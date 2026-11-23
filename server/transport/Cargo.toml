@@ -1,0 +1,15 @@
+[package]
+name = "nabedra-transport"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+description = "Authenticated peer transport for Nabedra"
+license = "MIT"
+repository = "https://github.com/zPy52/nabedra-database"
+publish = ["crates-io"]
+
+[dependencies]
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "=0.11.1"
+tokio = { version = "=1.54.1", default-features = false, features = ["net"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["tls12", "ring"] }

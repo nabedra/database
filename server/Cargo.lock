@@ -1908,6 +1908,7 @@ dependencies = [
  "nabedra-protocol",
  "nabedra-resources",
  "nabedra-rt",
+ "nabedra-transport",
  "openraft",
  "parquet",
  "ring",
@@ -1990,6 +1991,16 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "nabedra-transport"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "sha2 0.11.1",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
