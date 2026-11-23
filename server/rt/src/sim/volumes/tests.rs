@@ -79,6 +79,26 @@ fn directory_descriptor_follows_rename_on_a_volume() {
     });
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn ns04_o11_directory_descriptor_sync_preserves_pre_rename_child_after_crash() {
+    use crate::fs::os::tests::{BEFORE_RENAME_BYTES, sync_pre_rename_child};
+
+    run(21, |world| async move {
+        let root = Path::new("/sim/n1/data");
+        node_with(&world, 1, &["/sim/n1/data"]);
+        let manifest = on(1, || sync_pre_rename_child(root)).await;
+
+        world.restart_with(1, Cut::Crash);
+        on(1, || {
+            assert_eq!(os::read(&manifest).unwrap(), BEFORE_RENAME_BYTES);
+            assert!(!os::try_exists(root.join("staging")).unwrap());
+        })
+        .await;
+        assert_eq!(world.unmounted_path_errors(), 0);
+    });
+}
+
 #[test]
 fn a_mount_has_a_seeded_identity() {
     let infos = |seed| {

@@ -10,5 +10,5 @@ lowest_regression = "sim::volumes::tests::immediate_restart_fences_a_cancelled_t
 seed = 18
 why_not_caught = "The crash test awaited task cancellation before reopening disks, so the destructor only encountered the old halted image."
 invariant_added = "While a node is down or the caller belongs to an earlier incarnation, reject path operations on its mounted volumes. Require a fresh NodeFs after restart."
-fix_commits = ["329459ba23b6aabd3623fa15bfdc80598db04c9e"]
+fix_commits = ["bb85d030577bddbace2543333e518146070d51aa"]
 revert_patch_ok = true
