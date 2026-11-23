@@ -107,8 +107,20 @@ pub const EPOCH_MS: u64 = 1_767_225_600_000;
 
 const PPM: i128 = 1_000_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NodeContext {
+    id: u64,
+    incarnation: Option<u64>,
+}
+
+impl NodeContext {
+    fn is_current(self, node: &Node) -> bool {
+        node.up && self.incarnation == Some(node.incarnation)
+    }
+}
+
 tokio::task_local! {
-    static NODE: Option<u64>;
+    static NODE: Option<NodeContext>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,9 +128,9 @@ enum Role {
     /// The simulation thread, or a thread outside any simulation.
     Main,
     /// The blocking helper while it runs a job for this node.
-    Blocking(Option<u64>),
+    Blocking(Option<NodeContext>),
     /// A service thread started for this node.
-    Service(Option<u64>),
+    Service(Option<NodeContext>),
 }
 
 thread_local! {
@@ -249,6 +261,7 @@ struct Node {
     clock: Clock,
     rng: SplitMix64,
     up: bool,
+    incarnation: u64,
     tasks: Vec<AbortHandle>,
     services: Vec<String>,
     frozen: bool,
@@ -290,6 +303,7 @@ pub struct World {
     /// ran ([`World::pause_all`]).
     paused_nanos: AtomicU64,
     services: services::Registry,
+    volumes: volumes::Table,
     hooks: Hooks,
 }
 
@@ -319,6 +333,7 @@ impl World {
             }),
             paused_nanos: AtomicU64::new(0),
             services: services::Registry::new(seed),
+            volumes: volumes::Table::default(),
             hooks: Hooks::default(),
         })
     }
@@ -366,6 +381,7 @@ impl World {
             clock: Clock::new(clock),
             rng: SplitMix64::new(node_seed(self.seed, node)),
             up: true,
+            incarnation: 0,
             tasks: Vec::new(),
             services: Vec::new(),
             frozen: false,
@@ -408,6 +424,17 @@ impl World {
         });
     }
 
+    fn node_context(&self, id: u64) -> NodeContext {
+        // A task from a previous incarnation must not adopt the replacement's context
+        // when it spawns descendants or reenters the same node.
+        current_node_context()
+            .filter(|context| context.id == id)
+            .unwrap_or_else(|| NodeContext {
+                id,
+                incarnation: self.lock().nodes.get(&id).map(|entry| entry.incarnation),
+            })
+    }
+
     /// Spawns `future` as a task of `node`, registered so a crash aborts it.
     pub fn spawn_node<F>(&self, node: u64, future: F) -> JoinHandle<F::Output>
     where
@@ -431,9 +458,9 @@ impl World {
         F::Output: Send + 'static,
     {
         self.assert_runtime(target);
-        let task = NODE.scope(Some(node), self.gate(node, future));
-        let handle = target.spawn(task);
-        self.register(node, handle.abort_handle());
+        let context = self.node_context(node);
+        let handle = target.spawn(NODE.scope(Some(context), self.gate(node, future)));
+        self.register(context, handle.abort_handle());
         handle
     }
 
@@ -445,37 +472,53 @@ impl World {
         }
     }
 
-    fn register(&self, node: u64, handle: AbortHandle) {
+    fn context_active(&self, context: Option<NodeContext>) -> bool {
+        context.is_none_or(|context| {
+            self.lock()
+                .nodes
+                .get(&context.id)
+                .is_some_and(|node| context.is_current(node))
+        })
+    }
+
+    fn register(&self, context: NodeContext, handle: AbortHandle) {
         let mut state = self.lock();
-        match state.nodes.get_mut(&node) {
-            Some(entry) => {
+        match state.nodes.get_mut(&context.id) {
+            Some(entry) if context.is_current(entry) => {
                 entry.tasks.retain(|task| !task.is_finished());
-                if !entry.up {
-                    handle.abort();
-                }
                 entry.tasks.push(handle);
             }
-            None => handle.abort(),
+            _ => handle.abort(),
         }
     }
 
-    /// Crashes `node`, in this order: marks it down, marks its stepped services dead (a
+    /// Crashes `node`, in this order: halts every volume of the node (the disk cut: no
+    /// later call changes an image), marks it down, marks its stepped services dead (a
     /// dead service is never stepped again and joins at once), then aborts every
-    /// registered task. Destructors that run during the abort therefore find no live
-    /// service to wait for. Helper-thread services (`spawn_service`) cannot be stopped;
-    /// see the module documentation.
+    /// registered task. Destructors that run during the crash or the abort therefore find
+    /// halted volumes and no live service to wait for. Helper-thread services
+    /// (`spawn_service`) cannot be stopped; see the module documentation.
     pub fn crash(&self, node: u64) {
+        self.volumes.halt_node(node);
         net::crash(self, node);
-        let tasks = self.with_node(node, |entry| {
+        let (context, tasks, parked) = self.with_node(node, |entry| {
             entry.up = false;
             entry.frozen = false;
-            std::mem::take(&mut entry.tasks)
+            let context = NodeContext {
+                id: node,
+                incarnation: Some(entry.incarnation),
+            };
+            (
+                context,
+                std::mem::take(&mut entry.tasks),
+                std::mem::take(&mut entry.parked),
+            )
         });
-        let parked = self.with_node(node, |entry| std::mem::take(&mut entry.parked));
-        let dead = self.services.kill_node(node);
+        let dead = self.services.kill_node(context);
         self.emit(&SimEvent::Crash { node });
-        // Service destructors resolve node-local resources against the crashed node.
-        with_node_context(Some(node), || drop(dead));
+        // Service destructors run here, after the services are dead and before any task
+        // is aborted. They keep the retired context even when the harness initiated the cut.
+        with_node_context(Some(context), || drop(dead));
         for task in tasks {
             task.abort();
         }
@@ -484,10 +527,15 @@ impl World {
         }
     }
 
-    /// Marks a crashed `node` up again. Its clock and id stream continue, and its finished
-    /// stepped services leave the registry.
+    /// Marks a crashed `node` up under a new incarnation. Its clock and id stream
+    /// continue, and its finished stepped services leave the registry.
     pub fn restart(&self, node: u64) {
-        self.with_node(node, |entry| entry.up = true);
+        self.with_node(node, |entry| {
+            if !entry.up {
+                entry.incarnation = entry.incarnation.checked_add(1).expect("node incarnation");
+                entry.up = true;
+            }
+        });
         self.services.forget_finished(node);
         self.emit(&SimEvent::Restart { node });
     }
@@ -665,6 +713,23 @@ pub enum SimEvent<'a> {
     Pause {
         by: Duration,
     },
+    /// A call on a node's simulated volume, as its `FaultFs` logged it.
+    Fs {
+        node: u64,
+        mount: &'a std::path::Path,
+        call: &'a crate::fs::FsCall,
+    },
+    /// [`World::restart_with`] replaced the node's volumes by their `cut` images.
+    Cut {
+        node: u64,
+        cut: Cut,
+    },
+    /// [`World::wipe`] replaced a volume by an empty one.
+    Wipe {
+        node: u64,
+        mount: &'a std::path::Path,
+        how: Wipe,
+    },
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -778,7 +843,11 @@ where
 
 /// The node the current task or thread belongs to, if any.
 pub fn current_node() -> Option<u64> {
-    NODE.try_with(|node| *node)
+    current_node_context().map(|context| context.id)
+}
+
+fn current_node_context() -> Option<NodeContext> {
+    NODE.try_with(|context| *context)
         .unwrap_or_else(|_| match ROLE.get() {
             Role::Blocking(node) | Role::Service(node) => node,
             Role::Main => None,
@@ -787,12 +856,20 @@ pub fn current_node() -> Option<u64> {
 
 /// Runs `future` as part of `node`, without spawning.
 pub async fn in_node<F: Future>(node: u64, future: F) -> F::Output {
-    NODE.scope(Some(node), future).await
+    let context = world().map_or(
+        NodeContext {
+            id: node,
+            incarnation: None,
+        },
+        |world| world.node_context(node),
+    );
+    NODE.scope(Some(context), future).await
 }
 
-/// Runs synchronous code in a service's node context, including on the helper.
-fn with_node_context<T>(node: Option<u64>, f: impl FnOnce() -> T) -> T {
-    NODE.sync_scope(node, f)
+/// Runs synchronous service work in its captured context. An explicit `None`
+/// masks the caller's scope and the blocking helper's inherited context.
+fn with_node_context<T>(context: Option<NodeContext>, f: impl FnOnce() -> T) -> T {
+    NODE.sync_scope(context, f)
 }
 
 /// The paused runtime clock. On the blocking helper it is frozen, because the
@@ -894,8 +971,11 @@ pub(crate) fn thread_sleep(duration: Duration) {
         Some(world) if !matches!(ROLE.get(), Role::Service(_)) => world,
         _ => return std::thread::sleep(duration),
     };
-    services::settle(&world, current_node());
-    world.pause_all(to_runtime_duration(duration));
+    let context = current_node_context();
+    if world.context_active(context) {
+        services::settle(&world, context);
+        world.pause_all(to_runtime_duration(duration));
+    }
 }
 
 /// Draws from the current node's stream, or the world's stream outside a node.
@@ -992,11 +1072,11 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    match (current_node(), world()) {
-        (Some(node), Some(world)) => {
+    match (current_node_context(), world()) {
+        (Some(context), Some(world)) => {
             world.assert_runtime(&Handle::current());
-            let task = set.spawn(NODE.scope(Some(node), world.gate(node, future)));
-            world.register(node, task.clone());
+            let task = set.spawn(NODE.scope(Some(context), world.gate(context.id, future)));
+            world.register(context, task.clone());
             task
         }
         _ => set.spawn(future),
@@ -1009,13 +1089,13 @@ fn run_blocking<R: Send + 'static>(
     world: Arc<World>,
     work: impl FnOnce() -> R + Send + 'static,
 ) -> std::thread::Result<R> {
-    let node = current_node();
+    let context = current_node_context();
     let handle = tokio::runtime::Handle::try_current().ok();
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     let job: Job = Box::new(move || {
         let _entered = handle.as_ref().map(tokio::runtime::Handle::enter);
         let _installed = Installed::new(world);
-        ROLE.set(Role::Blocking(node));
+        ROLE.set(Role::Blocking(context));
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
         ROLE.set(Role::Main);
         let _ = reply.send(outcome);
@@ -1069,15 +1149,15 @@ where
     let Some(world) = world() else {
         return builder.spawn(f);
     };
-    let node = current_node();
-    if let Some(node) = node {
-        world.with_node(node, |entry| entry.services.push(name));
+    let context = current_node_context();
+    if let Some(context) = context {
+        world.with_node(context.id, |entry| entry.services.push(name));
     }
     let handle = tokio::runtime::Handle::try_current().ok();
     builder.spawn(move || {
         let _entered = handle.as_ref().map(tokio::runtime::Handle::enter);
         let _installed = Installed::new(world);
-        ROLE.set(Role::Service(node));
+        ROLE.set(Role::Service(context));
         f()
     })
 }
@@ -1086,6 +1166,9 @@ pub mod net;
 #[cfg(feature = "sim-openraft")]
 pub mod openraft10;
 pub(crate) mod services;
+pub mod volumes;
+
+pub use volumes::{Cut, VolumeInfo, Wipe, volume_for};
 
 #[cfg(test)]
 mod tests;
