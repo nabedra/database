@@ -1,20 +1,23 @@
 //! Worker-owned physical execution and native-memory resources.
 use crate::{
     config::{ExecutionConfig, WorkerResources},
-    protocol::{ErrorCode, Outcome, ProtocolError},
+    protocol::ProtocolError,
     scheduling::{MemoryCharge, ResourceScheduler},
 };
-use nabedra_resources::memory::{ByteArena, CountingWriter, capacity_context};
+use nabedra_resources::memory::WorkerMemory;
+pub use nabedra_resources::memory::{
+    ByteClass, ChargedBuffer, ChargedBytes, ExecutionClass, ScratchLease, SharedResourceConfig,
+};
 pub(super) use nabedra_resources::memory::{ByteReservation, ScratchBuffer, capacity};
-pub use nabedra_resources::memory::{ChargedBuffer, ChargedBytes, SharedResourceConfig};
-pub(crate) use nabedra_resources::memory::{DEFAULT_REPLY_DECODE_BYTES, RAFT_REPLICA_BYTES};
+pub(crate) use nabedra_resources::memory::{
+    DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease, RAFT_REPLICA_BYTES,
+};
 use serde::Serialize;
 use std::{
-    any::Any,
     collections::BTreeMap,
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -23,56 +26,26 @@ use uuid::Uuid;
 static WORKERS: Mutex<BTreeMap<Uuid, Weak<WorkerSharedResources>>> = Mutex::new(BTreeMap::new());
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 
-const POOL_OVERHEAD_BYTES: u64 = 64 << 20;
-const GROUP_HANDLE_BYTES: usize = 64 << 10;
-const GROUP_ENDPOINT_BYTES: usize = 64 << 10;
 /// One owner per worker, shared by all volumes, groups and RAM queue accounting.
 /// The scheduler ID is not a permanent Raft node ID or worker enrollment UUID.
 pub struct WorkerSharedResources {
     /// Block cache, memtable budget and flush/compaction threads of every pool.
     pub(super) storage: super::storage::NativeStorage,
-    pub(super) config: SharedResourceConfig,
-    pub(super) pool_slots: Arc<Semaphore>,
-    handle_slots: Arc<Semaphore>,
-    resident_slots: Arc<Semaphore>,
-    replica_slots: Arc<Semaphore>,
-    group_capacity: Option<Arc<ByteArena>>,
-    scheduler: ResourceScheduler,
-    scheduler_node_id: u64,
     next_native_job: AtomicU64,
     /// Native jobs prepared per class (Query, Control), for tests that
     /// count a request's handoffs (PERF2b).
     #[cfg(test)]
     native_jobs: [AtomicU64; 2],
-    task_memory_limit_bytes: usize,
-    decode_bytes: Arc<AtomicUsize>,
-    #[cfg(test)]
-    peak_decode_bytes: AtomicUsize,
     thread_budget: super::super::NativeThreadBudget,
     pub(crate) read_attempts: crate::oltp_replication::service_rpc::ReadAttempts,
     read_replica: OnceLock<Weak<Mutex<crate::oltp_runtime::replica::WorkerReplica>>>,
     read_queue: OnceLock<Weak<crate::oltp_runtime::coordinator::QueueCoordinator>>,
     worker_id: Mutex<Option<Uuid>>,
-    weak_self: OnceLock<Weak<Self>>,
     query: NativeExecutor,
     control: NativeExecutor,
-    arena: Arc<ByteArena>,
-    progress: Arc<ByteArena>,
-    apply_query: Arc<ByteArena>,
-    apply_control: Arc<ByteArena>,
-    reply_query: Arc<ByteArena>,
-    reply_control: Arc<ByteArena>,
-    reply_decode: Arc<ByteArena>,
-    reply_apply: Arc<ByteArena>,
     queue_claim: Arc<AtomicBool>,
-    _native_charge: MemoryCharge,
+    memory: Arc<WorkerMemory>,
     leases: Arc<NativeLeases>,
-}
-
-pub(crate) struct GroupCapacityLease {
-    _reserved: Option<ByteReservation>,
-    _charged: Option<MemoryCharge>,
-    _permit: OwnedSemaphorePermit,
 }
 
 #[derive(Serialize)]
@@ -139,109 +112,246 @@ impl WorkerSharedResources {
             .and_then(|n| n.checked_add(thread_budget.total_stack_reservation_bytes))
             .and_then(|n| n.checked_add(16 << 20))
             .ok_or_else(capacity)?;
-        let native_charge = scheduler.charge_memory(scheduler_node_id, native_bytes as u64)?;
-        let make_arena = |bytes: usize| {
-            ByteArena::new(
-                bytes,
-                scheduler.charge_memory(scheduler_node_id, bytes as u64)?,
-            )
-        };
-        let arena = make_arena(config.control_bytes - config.progress_bytes)?;
-        let progress = make_arena(config.progress_bytes)?;
-        let apply_query = make_arena(
-            config
-                .apply_bytes_per_slot
-                .checked_mul(config.query_threads)
-                .ok_or_else(capacity)?,
-        )?;
-        let apply_control = make_arena(
-            config
-                .apply_bytes_per_slot
-                .checked_mul(config.control_threads)
-                .ok_or_else(capacity)?,
-        )?;
-        let reply_query = make_arena(config.query_reply_bytes)?;
-        let reply_control = make_arena(config.control_reply_bytes)?;
-        let reply_decode = make_arena(config.reply_decode_bytes)?;
-        let reply_apply = make_arena(config.data_apply_reply_bytes)?;
-        let group_capacity = if config.precharge_group_capacity {
-            let bytes = config
-                .max_resident_groups
-                .checked_mul(GROUP_ENDPOINT_BYTES + RAFT_REPLICA_BYTES)
-                .and_then(|n| {
-                    n.checked_add(config.max_group_handles.checked_mul(GROUP_HANDLE_BYTES)?)
-                })
-                .ok_or_else(group_profile_error)?;
-            Some(make_arena(bytes).map_err(|_| group_profile_error())?)
-        } else {
-            None
-        };
+        let memory = Arc::new(WorkerMemory::new(
+            config,
+            scheduler,
+            scheduler_node_id,
+            limits.task_memory_limit_bytes as usize,
+            native_bytes,
+        )?);
         let owner = Arc::new(Self {
             storage: super::storage::NativeStorage::new(
                 config.cache_bytes,
                 config.write_buffer_bytes,
                 config.background_threads as usize,
             )?,
-            config,
-            pool_slots: Arc::new(Semaphore::new(config.max_open_pools)),
-            handle_slots: Arc::new(Semaphore::new(config.max_group_handles)),
-            resident_slots: Arc::new(Semaphore::new(config.max_resident_groups)),
-            replica_slots: Arc::new(Semaphore::new(config.max_resident_groups)),
-            group_capacity,
-            scheduler,
-            scheduler_node_id,
             next_native_job: AtomicU64::new(1),
             #[cfg(test)]
             native_jobs: Default::default(),
-            task_memory_limit_bytes: limits.task_memory_limit_bytes as usize,
-            decode_bytes: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            peak_decode_bytes: AtomicUsize::new(0),
             thread_budget,
             read_attempts: Default::default(),
             read_replica: OnceLock::new(),
             read_queue: OnceLock::new(),
             worker_id: Mutex::new(None),
-            weak_self: OnceLock::new(),
             query: NativeExecutor::new(config.query_threads, "oltp-query")?,
             control: NativeExecutor::new(config.control_threads, "oltp-control")?,
-            arena,
-            progress,
-            apply_query,
-            apply_control,
-            reply_query,
-            reply_control,
-            reply_decode,
-            reply_apply,
             queue_claim: Arc::new(AtomicBool::new(false)),
-            _native_charge: native_charge,
+            memory,
             leases: Arc::new(NativeLeases::default()),
         });
-        let weak = Arc::downgrade(&owner);
-        let _ = owner.weak_self.set(weak.clone());
-        let arena_owner: Weak<dyn Any + Send + Sync> = weak;
-        for arena in [
-            &owner.arena,
-            &owner.progress,
-            &owner.apply_query,
-            &owner.apply_control,
-            &owner.reply_query,
-            &owner.reply_control,
-            &owner.reply_decode,
-            &owner.reply_apply,
-        ] {
-            arena.bind_owner(arena_owner.clone());
-        }
-        if let Some(arena) = &owner.group_capacity {
-            arena.bind_owner(arena_owner);
-        }
+        let weak: Weak<Self> = Arc::downgrade(&owner);
+        owner.memory.bind_owner(weak);
         Ok(owner)
     }
-    fn owner(&self) -> Result<Arc<Self>, ProtocolError> {
-        self.weak_self
-            .get()
-            .and_then(Weak::upgrade)
-            .ok_or_else(capacity)
+    pub fn reply_waiters(&self, class: ExecutionClass) -> usize {
+        self.memory.reply_waiters(class)
+    }
+
+    pub fn apply_bytes_used(&self) -> usize {
+        self.memory.apply_bytes_used()
+    }
+
+    pub fn scheduler(&self) -> ResourceScheduler {
+        self.memory.scheduler()
+    }
+
+    pub fn task_memory_limit_bytes(&self) -> usize {
+        self.memory.task_memory_limit_bytes()
+    }
+
+    pub fn scheduler_node_id(&self) -> u64 {
+        self.memory.scheduler_node_id()
+    }
+
+    pub fn control_bytes_used(&self) -> usize {
+        self.memory.control_bytes_used()
+    }
+
+    /// The multi-Raft owner must hold this through task termination. A storage
+    /// handle going inactive never releases an advertised voter's residency.
+    pub fn reserve_group_residency(&self) -> Result<OwnedSemaphorePermit, ProtocolError> {
+        self.memory.reserve_group_residency()
+    }
+
+    /// Actual live Raft task owners are bounded separately from registered
+    /// endpoint groups. A relocation learner may share the logical group ID,
+    /// but it still consumes its own task capacity until joined shutdown.
+    pub fn reserve_replica_residency(&self) -> Result<OwnedSemaphorePermit, ProtocolError> {
+        self.memory.reserve_replica_residency()
+    }
+
+    pub(crate) fn lease_group_residency(&self) -> Result<GroupCapacityLease, ProtocolError> {
+        self.memory.lease_group_residency()
+    }
+
+    pub(crate) fn lease_replica_residency(&self) -> Result<GroupCapacityLease, ProtocolError> {
+        self.memory.lease_replica_residency()
+    }
+
+    pub(super) fn reserve_group_handle(&self) -> Result<GroupCapacityLease, ProtocolError> {
+        self.memory.reserve_group_handle()
+    }
+
+    pub fn buffer_bytes_used(&self, class: ByteClass) -> usize {
+        self.memory.buffer_bytes_used(class)
+    }
+
+    pub fn allocate_bytes(
+        &self,
+        class: ByteClass,
+        len: usize,
+    ) -> Result<ChargedBuffer, ProtocolError> {
+        self.memory.allocate_bytes(class, len)
+    }
+
+    #[inline]
+    pub fn reserve_scratch(
+        &self,
+        class: ByteClass,
+        bytes: usize,
+    ) -> Result<ScratchLease, ProtocolError> {
+        self.memory.reserve_scratch(class, bytes)
+    }
+
+    /// Planning may retain bounded derived keys/maps beyond the decoded body.
+    /// Add only the missing working charge before those copies are allocated.
+    pub(crate) fn ensure_scratch_budget(
+        &self,
+        current: Arc<ScratchLease>,
+        required: usize,
+    ) -> Result<Arc<ScratchLease>, ProtocolError> {
+        self.memory.ensure_scratch_budget(current, required)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_working_decode_peak(&self) {
+        self.memory.reset_working_decode_peak()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak_working_decode_bytes(&self) -> usize {
+        self.memory.peak_working_decode_bytes()
+    }
+
+    pub fn working_decode_bytes(&self) -> usize {
+        self.memory.working_decode_bytes()
+    }
+
+    pub fn copy_bytes(&self, bytes: &[u8]) -> Result<ChargedBytes, ProtocolError> {
+        self.memory.copy_bytes(bytes)
+    }
+
+    #[inline]
+    pub fn copy_bytes_in(
+        &self,
+        class: ByteClass,
+        bytes: &[u8],
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.memory.copy_bytes_in(class, bytes)
+    }
+
+    pub fn encode<T: Serialize>(
+        &self,
+        value: &T,
+        max_bytes: usize,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.memory.encode(value, max_bytes)
+    }
+
+    pub fn encode_in<T: Serialize>(
+        &self,
+        class: ByteClass,
+        value: &T,
+        max_bytes: usize,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.memory.encode_in(class, value, max_bytes)
+    }
+
+    pub(super) fn reserve_bytes_in(
+        &self,
+        class: ByteClass,
+        bytes: usize,
+    ) -> Result<ByteReservation, ProtocolError> {
+        self.memory.reserve_bytes_in(class, bytes)
+    }
+
+    #[inline]
+    pub(super) async fn reply_budget(
+        &self,
+        class: ExecutionClass,
+        bytes: usize,
+    ) -> Result<ByteReservation, ProtocolError> {
+        self.memory.reply_budget(class, bytes).await
+    }
+
+    /// Reply decoding cannot borrow the raw-reply arena: fully occupied raw
+    /// replies would otherwise wait on their own release. This separately
+    /// reserved ceiling retains decoded DTOs through responders and clones.
+    /// Acquire it before native codec execution, and bound the lexical/DTO
+    /// allocation estimate before deserializing.
+    #[inline]
+    pub(super) async fn data_apply_reply_budget(
+        &self,
+        bytes: usize,
+    ) -> Result<ByteReservation, ProtocolError> {
+        self.memory.data_apply_reply_budget(bytes).await
+    }
+
+    pub fn data_apply_reply_bytes_used(&self) -> usize {
+        self.memory.data_apply_reply_bytes_used()
+    }
+
+    pub async fn reserve_reply_decode(&self, bytes: usize) -> Result<ScratchLease, ProtocolError> {
+        self.memory.reserve_reply_decode(bytes).await
+    }
+
+    pub fn reply_decode_bytes_used(&self) -> usize {
+        self.memory.reply_decode_bytes_used()
+    }
+
+    pub async fn reserve_scratch_wait(
+        &self,
+        class: ByteClass,
+        bytes: usize,
+        request: u64,
+    ) -> Result<ScratchLease, ProtocolError> {
+        self.memory
+            .reserve_scratch_wait(class, bytes, request)
+            .await
+    }
+
+    pub(super) fn pool_overhead(&self) -> Result<MemoryCharge, ProtocolError> {
+        self.memory.pool_overhead()
+    }
+
+    pub(crate) fn validate_registered_group_capacity(
+        &self,
+        execution: &ExecutionConfig,
+        configured_pools: usize,
+        system_groups: usize,
+    ) -> Result<(), ProtocolError> {
+        self.memory
+            .validate_registered_group_capacity(execution, configured_pools, system_groups)
+    }
+
+    pub fn config(&self) -> SharedResourceConfig {
+        self.memory.config()
+    }
+
+    pub(crate) fn resident_group_usage(&self) -> (usize, usize) {
+        self.memory.resident_group_usage()
+    }
+
+    pub fn native_baseline_bytes(&self) -> u64 {
+        self.memory.native_baseline_bytes()
+    }
+
+    pub(super) fn reserve_pool_slot(&self) -> Result<OwnedSemaphorePermit, ProtocolError> {
+        self.memory.reserve_pool_slot()
+    }
+
+    pub(crate) fn request_actor_bytes(execution: &ExecutionConfig) -> Option<u64> {
+        WorkerMemory::request_actor_bytes(execution)
     }
 
     /// Bind the one physical worker accounting owner before pools or queue
@@ -318,19 +428,6 @@ impl WorkerSharedResources {
             owner: self.clone(),
         })
     }
-    pub fn reply_waiters(&self, class: ExecutionClass) -> usize {
-        match class {
-            ExecutionClass::Query => self.reply_query.waiters(),
-            ExecutionClass::Control => self.reply_control.waiters(),
-        }
-    }
-    pub fn apply_bytes_used(&self) -> usize {
-        self.apply_query.used() + self.apply_control.used()
-    }
-
-    pub fn scheduler(&self) -> ResourceScheduler {
-        self.scheduler.clone()
-    }
     /// Zero denotes an independent internal phase, not one shared logical
     /// request. Give those phases distinct caps so free native lanes can run.
     pub(crate) fn next_native_request_id(&self) -> Result<u64, ProtocolError> {
@@ -351,351 +448,9 @@ impl WorkerSharedResources {
             }
         }
     }
-    pub fn task_memory_limit_bytes(&self) -> usize {
-        self.task_memory_limit_bytes
-    }
-    pub fn scheduler_node_id(&self) -> u64 {
-        self.scheduler_node_id
-    }
-    pub fn control_bytes_used(&self) -> usize {
-        [
-            &self.arena,
-            &self.progress,
-            &self.apply_query,
-            &self.apply_control,
-            &self.reply_query,
-            &self.reply_control,
-            &self.reply_decode,
-            &self.reply_apply,
-        ]
-        .iter()
-        .map(|arena| arena.used())
-        .sum()
-    }
-
-    /// The multi-Raft owner must hold this through task termination. A storage
-    /// handle going inactive never releases an advertised voter's residency.
-    pub fn reserve_group_residency(&self) -> Result<OwnedSemaphorePermit, ProtocolError> {
-        self.resident_slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| capacity())
-    }
-
-    /// Actual live Raft task owners are bounded separately from registered
-    /// endpoint groups. A relocation learner may share the logical group ID,
-    /// but it still consumes its own task capacity until joined shutdown.
-    pub fn reserve_replica_residency(&self) -> Result<OwnedSemaphorePermit, ProtocolError> {
-        self.replica_slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| capacity())
-    }
-
-    pub(crate) fn lease_group_residency(&self) -> Result<GroupCapacityLease, ProtocolError> {
-        let permit = self.reserve_group_residency().map_err(|_| {
-            group_slots_exhausted("worker resident-group placement capacity exhausted")
-        })?;
-        self.charge_group_capacity(permit, GROUP_ENDPOINT_BYTES, true)
-    }
-
-    pub(crate) fn lease_replica_residency(&self) -> Result<GroupCapacityLease, ProtocolError> {
-        let permit = self
-            .reserve_replica_residency()
-            .map_err(|_| group_slots_exhausted("worker active Raft replica capacity exhausted"))?;
-        self.charge_group_capacity(permit, RAFT_REPLICA_BYTES, true)
-    }
-
-    pub(super) fn reserve_group_handle(&self) -> Result<GroupCapacityLease, ProtocolError> {
-        let permit = self.handle_slots.clone().try_acquire_owned().map_err(|_| {
-            if self.group_capacity.is_some() {
-                group_slots_exhausted("worker storage group-handle capacity exhausted")
-            } else {
-                capacity()
-            }
-        })?;
-        // The stock handle allowance is covered by the fixed native overhead.
-        self.charge_group_capacity(permit, GROUP_HANDLE_BYTES, false)
-    }
-
-    fn charge_group_capacity(
-        &self,
-        permit: OwnedSemaphorePermit,
-        bytes: usize,
-        charge_default: bool,
-    ) -> Result<GroupCapacityLease, ProtocolError> {
-        let (reserved, charged) = match &self.group_capacity {
-            Some(arena) => (Some(arena.reserve(bytes)?), None),
-            None if charge_default => (
-                None,
-                Some(
-                    self.scheduler
-                        .charge_memory(self.scheduler_node_id, bytes as u64)?,
-                ),
-            ),
-            None => (None, None),
-        };
-        Ok(GroupCapacityLease {
-            _reserved: reserved,
-            _charged: charged,
-            _permit: permit,
-        })
-    }
-    pub fn buffer_bytes_used(&self, class: ByteClass) -> usize {
-        self.arena_for(class).used()
-    }
-    fn arena_for(&self, class: ByteClass) -> &Arc<ByteArena> {
-        match class {
-            ByteClass::Progress => &self.progress,
-            ByteClass::Data => &self.arena,
-        }
-    }
-    pub fn allocate_bytes(
-        &self,
-        class: ByteClass,
-        len: usize,
-    ) -> Result<ChargedBuffer, ProtocolError> {
-        self.reserve_bytes_in(class, len)?.into_buffer()
-    }
-    pub fn reserve_scratch(
-        &self,
-        class: ByteClass,
-        bytes: usize,
-    ) -> Result<ScratchLease, ProtocolError> {
-        let backing = match class {
-            ByteClass::Progress => ScratchBacking::Arena(self.reserve_bytes_in(class, bytes)?),
-            ByteClass::Data => {
-                if bytes > self.task_memory_limit_bytes {
-                    return Err(capacity());
-                }
-                let charge = self
-                    .scheduler
-                    .charge_memory(self.scheduler_node_id, bytes as u64)?;
-                self.account_decode(bytes);
-                ScratchBacking::Working {
-                    charge: Mutex::new(charge),
-                    counter: self.decode_bytes.clone(),
-                }
-            }
-        };
-        Ok(ScratchLease {
-            backing,
-            _owner: self.owner()?,
-        })
-    }
-    /// Planning may retain bounded derived keys/maps beyond the decoded body.
-    /// Add only the missing working charge before those copies are allocated.
-    pub(crate) fn ensure_scratch_budget(
-        &self,
-        current: Arc<ScratchLease>,
-        required: usize,
-    ) -> Result<Arc<ScratchLease>, ProtocolError> {
-        if !Arc::ptr_eq(&current._owner, &self.owner()?) || required > self.task_memory_limit_bytes
-        {
-            return Err(capacity());
-        }
-        if current.bytes() >= required {
-            return Ok(current);
-        }
-        let extra = Arc::new(self.reserve_scratch(ByteClass::Data, required - current.bytes())?);
-        Ok(Arc::new(ScratchLease {
-            _owner: self.owner()?,
-            backing: ScratchBacking::Combined([current, extra]),
-        }))
-    }
-    fn account_decode(&self, bytes: usize) {
-        let previous = self.decode_bytes.fetch_add(bytes, Ordering::AcqRel);
-        #[cfg(test)]
-        self.peak_decode_bytes
-            .fetch_max(previous + bytes, Ordering::Relaxed);
-        #[cfg(not(test))]
-        let _ = previous;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reset_working_decode_peak(&self) {
-        self.peak_decode_bytes
-            .swap(self.working_decode_bytes(), Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn peak_working_decode_bytes(&self) -> usize {
-        self.peak_decode_bytes.load(Ordering::Relaxed)
-    }
-
-    pub fn working_decode_bytes(&self) -> usize {
-        self.decode_bytes.load(Ordering::Acquire)
-    }
-    pub fn copy_bytes(&self, bytes: &[u8]) -> Result<ChargedBytes, ProtocolError> {
-        self.copy_bytes_in(ByteClass::Data, bytes)
-    }
-    pub fn copy_bytes_in(
-        &self,
-        class: ByteClass,
-        bytes: &[u8],
-    ) -> Result<ChargedBytes, ProtocolError> {
-        self.reserve_bytes_in(class, bytes.len())?.copy(bytes)
-    }
-    pub fn encode<T: Serialize>(
-        &self,
-        value: &T,
-        max_bytes: usize,
-    ) -> Result<ChargedBytes, ProtocolError> {
-        self.encode_in(ByteClass::Data, value, max_bytes)
-    }
-    pub fn encode_in<T: Serialize>(
-        &self,
-        class: ByteClass,
-        value: &T,
-        max_bytes: usize,
-    ) -> Result<ChargedBytes, ProtocolError> {
-        let mut count = CountingWriter {
-            bytes: 0,
-            limit: max_bytes,
-        };
-        serde_json::to_writer(&mut count, value).map_err(|_| {
-            capacity_context(format!(
-                "encode count class={class:?} counted={} limit={max_bytes}",
-                count.bytes
-            ))
-        })?;
-        let context = || {
-            format!(
-                "encode class={class:?} requested={} limit={max_bytes}",
-                count.bytes
-            )
-        };
-        let reservation = self
-            .reserve_bytes_in(class, count.bytes)
-            .map_err(|mut error| {
-                error.message = format!("{}; {} stage=reserve", error.message, context());
-                error
-            })?;
-        reservation.encode(value).map_err(|mut error| {
-            error.message = format!("{}; {} stage=write", error.message, context());
-            error
-        })
-    }
-    pub(super) fn reserve_bytes_in(
-        &self,
-        class: ByteClass,
-        bytes: usize,
-    ) -> Result<ByteReservation, ProtocolError> {
-        self.arena_for(class).reserve(bytes)
-    }
-
-    pub(super) async fn reply_budget(
-        &self,
-        class: ExecutionClass,
-        bytes: usize,
-    ) -> Result<ByteReservation, ProtocolError> {
-        match class {
-            ExecutionClass::Query => self.reply_query.reserve_wait(bytes).await,
-            ExecutionClass::Control => self.reply_control.reserve_wait(bytes).await,
-        }
-    }
-    /// Reply decoding cannot borrow the raw-reply arena: fully occupied raw
-    /// replies would otherwise wait on their own release. This separately
-    /// reserved ceiling retains decoded DTOs through responders and clones.
-    /// Acquire it before native codec execution, and bound the lexical/DTO
-    /// allocation estimate before deserializing.
-    pub(super) async fn data_apply_reply_budget(
-        &self,
-        bytes: usize,
-    ) -> Result<ByteReservation, ProtocolError> {
-        self.reply_apply.reserve_wait(bytes).await
-    }
-    pub fn data_apply_reply_bytes_used(&self) -> usize {
-        self.reply_apply.used()
-    }
-    pub async fn reserve_reply_decode(&self, bytes: usize) -> Result<ScratchLease, ProtocolError> {
-        Ok(ScratchLease {
-            backing: ScratchBacking::Arena(self.reply_decode.reserve_wait(bytes).await?),
-            _owner: self.owner()?,
-        })
-    }
-    pub fn reply_decode_bytes_used(&self) -> usize {
-        self.reply_decode.used()
-    }
-    pub async fn reserve_scratch_wait(
-        &self,
-        class: ByteClass,
-        bytes: usize,
-        request: u64,
-    ) -> Result<ScratchLease, ProtocolError> {
-        match class {
-            ByteClass::Progress => Ok(ScratchLease {
-                backing: ScratchBacking::Arena(self.progress.reserve_wait(bytes).await?),
-                _owner: self.owner()?,
-            }),
-            ByteClass::Data => {
-                if bytes > self.task_memory_limit_bytes {
-                    return Err(capacity());
-                }
-                let charge = self
-                    .scheduler
-                    .reserve_memory(request, self.scheduler_node_id, bytes as u64)
-                    .await?;
-                self.account_decode(bytes);
-                Ok(ScratchLease {
-                    backing: ScratchBacking::Working {
-                        charge: Mutex::new(charge),
-                        counter: self.decode_bytes.clone(),
-                    },
-                    _owner: self.owner()?,
-                })
-            }
-        }
-    }
-
-    pub(super) fn pool_overhead(&self) -> Result<MemoryCharge, ProtocolError> {
-        self.scheduler
-            .charge_memory(self.scheduler_node_id, POOL_OVERHEAD_BYTES)
-    }
-
-    pub(crate) fn request_actor_bytes(execution: &ExecutionConfig) -> Option<u64> {
-        execution
-            .max_pending_requests
-            .checked_add(1)?
-            .checked_mul(64 << 10)
-    }
-
-    pub(crate) fn validate_registered_group_capacity(
-        &self,
-        execution: &ExecutionConfig,
-        configured_pools: usize,
-        system_groups: usize,
-    ) -> Result<(), ProtocolError> {
-        if self.group_capacity.is_none() {
-            return Ok(());
-        }
-        if system_groups > self.config.max_resident_groups
-            || system_groups > self.config.max_group_handles
-            || configured_pools > self.config.max_open_pools
-        {
-            return Err(group_profile_error());
-        }
-        let headroom = (configured_pools as u64)
-            .checked_mul(POOL_OVERHEAD_BYTES)
-            .and_then(|n| n.checked_add(self.task_memory_limit_bytes as u64))
-            .and_then(|n| n.checked_add(execution.max_queue_bytes_per_replica))
-            .and_then(|n| n.checked_add(execution.max_retained_result_bytes_per_worker))
-            .and_then(|n| n.checked_add(Self::request_actor_bytes(execution)?))
-            // Queue replica bookkeeping and enrolled-member metadata.
-            .and_then(|n| n.checked_add(1 << 20))
-            .ok_or_else(group_profile_error)?;
-        self.scheduler
-            .charge_memory(self.scheduler_node_id, headroom)
-            .map(drop)
-            .map_err(|_| group_profile_error())
-    }
-
-    pub fn config(&self) -> SharedResourceConfig {
-        self.config
-    }
     pub(crate) fn block_cache_usage(&self) -> BlockCacheUsage {
         BlockCacheUsage {
-            configured_bytes: self.config.cache_bytes,
+            configured_bytes: self.config().cache_bytes,
             usage_bytes: self.storage.cache.usage_bytes(),
             pinned_bytes: self.storage.cache.pinned_bytes(),
         }
@@ -707,36 +462,8 @@ impl WorkerSharedResources {
     pub(crate) fn storage_reservations(&self) -> Vec<super::disk::DiskReservationStats> {
         self.storage.disk_stats()
     }
-    pub(crate) fn resident_group_usage(&self) -> (usize, usize) {
-        let limit = self.config.max_resident_groups;
-        let free = self
-            .resident_slots
-            .available_permits()
-            .min(self.replica_slots.available_permits());
-        (limit.saturating_sub(free), limit)
-    }
     pub fn thread_budget(&self) -> super::super::NativeThreadBudget {
         self.thread_budget
-    }
-    pub fn native_baseline_bytes(&self) -> u64 {
-        self._native_charge.bytes()
-            + [
-                &self.arena,
-                &self.progress,
-                &self.apply_query,
-                &self.apply_control,
-                &self.reply_query,
-                &self.reply_control,
-                &self.reply_decode,
-                &self.reply_apply,
-            ]
-            .iter()
-            .map(|arena| arena.charged_bytes())
-            .sum::<u64>()
-            + self
-                .group_capacity
-                .as_ref()
-                .map_or(0, |arena| arena.charged_bytes())
     }
     pub async fn prepare(
         self: &Arc<Self>,
@@ -783,10 +510,7 @@ impl WorkerSharedResources {
             state.closed = true;
             self.query.slots.close();
             self.control.slots.close();
-            self.reply_query.close();
-            self.reply_control.close();
-            self.reply_decode.close();
-            self.reply_apply.close();
+            self.memory.close_reply_arenas();
         }
         loop {
             let notified = self.leases.settled.notified();
@@ -825,72 +549,12 @@ impl WorkerSharedResources {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum ExecutionClass {
-    Query,
-    Control,
-}
-
-/// Choose this from the authenticated endpoint role. Queue/data payloads must
-/// never consume Progress, which keeps small authority/settlement exchanges live.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ByteClass {
-    Progress,
-    Data,
-}
 pub struct QueueLease {
     owner: Arc<WorkerSharedResources>,
 }
 impl Drop for QueueLease {
     fn drop(&mut self) {
         self.owner.queue_claim.store(false, Ordering::Release);
-    }
-}
-
-pub struct ScratchLease {
-    _owner: Arc<WorkerSharedResources>,
-    backing: ScratchBacking,
-}
-enum ScratchBacking {
-    Arena(ByteReservation),
-    Combined([Arc<ScratchLease>; 2]),
-    Working {
-        charge: Mutex<MemoryCharge>,
-        counter: Arc<AtomicUsize>,
-    },
-}
-impl ScratchLease {
-    /// Only a codec with a checked aggregate retained-heap bound may release
-    /// unused decode scratch. Every clone observes the same smaller charge.
-    pub(crate) fn shrink_unused(&self, bytes: usize) -> Result<(), ProtocolError> {
-        let ScratchBacking::Working { charge, counter } = &self.backing else {
-            return Err(capacity());
-        };
-        let mut charge = charge.lock().map_err(|_| capacity())?;
-        let old = charge.bytes() as usize;
-        charge.shrink_to(bytes as u64)?;
-        counter.fetch_sub(old - bytes, Ordering::AcqRel);
-        Ok(())
-    }
-
-    pub fn bytes(&self) -> usize {
-        match &self.backing {
-            ScratchBacking::Arena(charge) => charge.remaining(),
-            ScratchBacking::Combined(owners) => owners.iter().map(|o| o.bytes()).sum(),
-            ScratchBacking::Working { charge, .. } => {
-                charge.lock().expect("scratch charge").bytes() as usize
-            }
-        }
-    }
-}
-impl Drop for ScratchLease {
-    fn drop(&mut self) {
-        if let ScratchBacking::Working { charge, counter } = &mut self.backing {
-            counter.fetch_sub(
-                charge.get_mut().expect("scratch charge").bytes() as usize,
-                Ordering::AcqRel,
-            );
-        }
     }
 }
 
@@ -935,20 +599,13 @@ impl PreparedNative {
             .scratch_bytes
             .checked_add(budget.batch_bytes)
             .ok_or_else(capacity)?;
-        if working > owner.config.apply_bytes_per_slot {
-            return Err(capacity());
-        }
-        let apply = match self.class {
-            ExecutionClass::Query => &owner.apply_query,
-            ExecutionClass::Control => &owner.apply_control,
-        };
         // Reply capacity was acquired without a physical or CPU permit. Every
         // active native slot owns this bounded working maximum, but a finished
         // write hands its batch charge to the journal, which drops it only once
         // the write is visible, after this slot was released. Wait for it: a
         // failed reservation here would fail a committed Raft apply, which is
         // fatal to the replica (T7b, D07).
-        let mut all = apply.reserve_wait(working).await?;
+        let mut all = owner.memory.reserve_apply(self.class, working).await?;
         let scratch = all.split(budget.scratch_bytes)?;
         let batch = all.split(budget.batch_bytes)?;
         Ok((scratch, batch, output))
@@ -985,12 +642,7 @@ impl PreparedNative {
                 } else {
                     request
                 };
-                Some(
-                    owner
-                        .scheduler
-                        .reserve_on(request, 1, owner.scheduler_node_id, task_bytes)
-                        .await?,
-                )
+                Some(owner.memory.reserve_compute(request, task_bytes).await?)
             }
         };
         Ok(NativeComputeGuard {
@@ -1092,22 +744,47 @@ impl Drop for NativeExecutor {
     }
 }
 
-fn group_profile_error() -> ProtocolError {
-    ProtocolError::new(
-        ErrorCode::ValidationError,
-        "registered native group capacity does not fit worker resources",
-        Outcome::NotApplied,
-    )
-}
-
-fn group_slots_exhausted(message: &'static str) -> ProtocolError {
-    ProtocolError::new(ErrorCode::Overloaded, message, Outcome::NotApplied)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{ErrorCode, Outcome};
+    use nabedra_resources::memory::{GROUP_ENDPOINT_BYTES, GROUP_HANDLE_BYTES};
     use std::{future::Future, task::Poll};
+
+    #[tokio::test]
+    async fn f03_detached_worker_memory_does_not_grant_scratch_after_worker_drop() {
+        let resources = WorkerSharedResources::new(
+            1,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let memory = resources.memory.clone();
+        let worker = Arc::downgrade(&resources);
+        let scratch = resources.reserve_scratch(ByteClass::Data, 1024).unwrap();
+        drop(resources);
+        assert!(worker.upgrade().is_some());
+        assert_eq!(memory.working_decode_bytes(), 1024);
+
+        drop(scratch);
+        assert!(worker.upgrade().is_none());
+        assert_eq!(memory.working_decode_bytes(), 0);
+        let baseline = memory.scheduler().usage();
+        assert!(memory.reserve_scratch(ByteClass::Data, 1024).is_err());
+        for class in [ByteClass::Data, ByteClass::Progress] {
+            let mut reservation = std::pin::pin!(memory.reserve_scratch_wait(class, 1024, 1));
+            std::future::poll_fn(|context| {
+                assert!(matches!(
+                    reservation.as_mut().poll(context),
+                    Poll::Ready(Err(_))
+                ));
+                Poll::Ready(())
+            })
+            .await;
+        }
+        assert_eq!(memory.working_decode_bytes(), 0);
+        assert_eq!(memory.scheduler().usage(), baseline);
+    }
 
     /// T7b (D07, T5 concern 4, T6 concern 1): a write's batch charge
     /// outlives its native slot (the journal drops it once the write is
@@ -1169,7 +846,7 @@ mod tests {
             ..Default::default()
         };
         let resources = WorkerSharedResources::new(1, WorkerResources::default(), config).unwrap();
-        let arena = resources.group_capacity.as_ref().unwrap();
+        let arena = resources.memory.group_capacity_arena().unwrap();
         let budget = 2 * (GROUP_ENDPOINT_BYTES + RAFT_REPLICA_BYTES) + 3 * GROUP_HANDLE_BYTES;
         let scheduler = resources.scheduler();
         let baseline = scheduler.usage()[0].2;
@@ -1267,7 +944,7 @@ mod tests {
             SharedResourceConfig::default(),
         )
         .unwrap();
-        let arena = &resources.progress;
+        let arena = resources.memory.progress_arena();
         let used = || resources.buffer_bytes_used(ByteClass::Progress);
         let waiters = || arena.waiters();
         let scheduler = resources.scheduler();
@@ -1322,7 +999,7 @@ mod tests {
             SharedResourceConfig::default(),
         )
         .unwrap();
-        let arena = &resources.progress;
+        let arena = resources.memory.progress_arena();
         let held = arena.reserve(arena.capacity()).unwrap();
         let mut earlier = std::pin::pin!(arena.reserve_wait(arena.capacity() - 382));
         std::future::poll_fn(|cx| {
