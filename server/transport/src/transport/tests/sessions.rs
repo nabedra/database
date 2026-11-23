@@ -1867,7 +1867,7 @@ async fn d10_o05_reply_frees_its_handler_slot_before_its_bytes_are_written() {
     let hold = &fixture.receiver.common.hold_replies_after_release;
     hold.send_replace(true);
     let first = nabedra_rt::task::spawn(fixture.call(&fixture.data_group, Purpose::Raft, "first"));
-    let second = timeout(WAIT, async {
+    timeout(WAIT, async {
         eventually(
             || {
                 fixture.endpoint.handled.load(Ordering::Acquire) == 1
@@ -1886,12 +1886,7 @@ async fn d10_o05_reply_frees_its_handler_slot_before_its_bytes_are_written() {
         .await;
         assert!(!first.is_finished());
         assert!(!second.is_finished());
-        second
-    })
-    .await
-    .unwrap();
-    hold.send_replace(false);
-    timeout(WAIT, async {
+        hold.send_replace(false);
         echoed(first.await.unwrap(), "first");
         echoed(second.await.unwrap(), "second");
     })
