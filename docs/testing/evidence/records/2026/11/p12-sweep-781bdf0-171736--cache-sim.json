@@ -1,0 +1,55 @@
+{
+  "artifacts": [
+    {
+      "name": "p12-sweep-781bdf0-171736--cache-sim.log",
+      "sha256": "542ce8e67300b6514290ddf880fac439cafae51230663a48c088fb07dd6c917d"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "timeout",
+        "reason": "the command exceeded timeout_s and was killed"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-sim",
+  "duration_s": 3600.035,
+  "guarantees": [
+    "CACHE-G02",
+    "CACHE-G03",
+    "CACHE-G05",
+    "CACHE-G06",
+    "CACHE-G07",
+    "CACHE-G08",
+    "CACHE-G09"
+  ],
+  "kind": "S H",
+  "mode": null,
+  "result": "error",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T16:18:39.863168+00:00",
+    "request_id": "p12-sweep-781bdf0-171736",
+    "runner": "GitHub Actions 1000006675",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45214840930"
+  },
+  "scenarios": [
+    "K01",
+    "K02",
+    "K03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "781bdf00d20b91f5a50b01a5980f74fc8b957aa8",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
