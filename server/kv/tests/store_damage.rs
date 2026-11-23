@@ -2,6 +2,7 @@
 //!
 //! Bytes are found by searching for unique values, never by format offsets, except the
 //! plan's invariant that a group commit following a sync starts on a 4 KiB boundary.
+#![allow(clippy::disallowed_methods)] // integration tests are outside the phase 7 conversion, which covers kv/src
 
 mod common;
 

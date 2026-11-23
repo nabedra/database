@@ -172,7 +172,7 @@ impl GrantCache {
         let mut grants = self.grants();
         grants.align(revision);
         match grants.entries.get(&key) {
-            Some(&expires) if expires > Instant::now() => true,
+            Some(&expires) if expires > nabedra_rt::time::now() => true,
             Some(_) => {
                 grants.entries.remove(&key);
                 false
@@ -209,7 +209,7 @@ impl GrantCache {
             return Ok(());
         }
         let _timer = perf_stage!("grant.role.miss").timer();
-        let started = Instant::now();
+        let started = nabedra_rt::time::now();
         let grant = read().await?;
         self.insert(key, revision, started, grant.as_ref().map(observed));
         Ok(())
@@ -237,7 +237,7 @@ impl GrantCache {
         if warming_disabled() {
             return;
         }
-        let now = Instant::now();
+        let now = nabedra_rt::time::now();
         let mut grants = self.grants();
         if let Some(entry) = grants.warm.get_mut(&key) {
             entry.used = now;
@@ -256,7 +256,7 @@ impl GrantCache {
                 return;
             };
             grants.warming = true;
-            runtime.spawn(warm_loop(Arc::downgrade(&self.0)));
+            nabedra_rt::task::spawn_on(&runtime, warm_loop(Arc::downgrade(&self.0)));
         }
         grants.warm.insert(
             key,
@@ -282,7 +282,7 @@ impl GrantCache {
     where
         F: Future<Output = Result<ServiceAuthorization, ProtocolError>>,
     {
-        let started = Instant::now();
+        let started = nabedra_rt::time::now();
         let grant = read().await?;
         self.insert(key, revision, started, Some(observed(&grant)));
         Ok(grant)
@@ -315,7 +315,7 @@ fn insert(
         return;
     };
     let expires = started + GRANT_TTL;
-    let now = Instant::now();
+    let now = nabedra_rt::time::now();
     if expires <= now {
         return;
     }
@@ -347,13 +347,13 @@ fn warming_disabled() -> bool {
 async fn warm_loop(cache: Weak<Mutex<Grants>>) {
     use crate::oltp_runtime::stage_timing::perf_stage;
     loop {
-        tokio::time::sleep(WARM_TICK).await;
+        nabedra_rt::time::sleep(WARM_TICK).await;
         let due: Vec<(GrantKey, Refresh)> = {
             let Some(shared) = cache.upgrade() else {
                 return;
             };
             let mut grants = lock(&shared);
-            let now = Instant::now();
+            let now = nabedra_rt::time::now();
             grants
                 .warm
                 .retain(|_, entry| now.duration_since(entry.used) < WARM_IDLE);
@@ -379,10 +379,10 @@ async fn warm_loop(cache: Weak<Mutex<Grants>>) {
             let Some((revision, read)) = refresh() else {
                 continue;
             };
-            let started = Instant::now();
+            let started = nabedra_rt::time::now();
             let result = {
                 let _timer = perf_stage!("grant.warm.refresh").timer();
-                tokio::time::timeout(WARM_READ_TIMEOUT, read).await
+                nabedra_rt::time::timeout(WARM_READ_TIMEOUT, read).await
             };
             let Some(shared) = cache.upgrade() else {
                 return;
@@ -409,7 +409,7 @@ async fn warm_loop(cache: Weak<Mutex<Grants>>) {
                 _ => {
                     perf_stage!("grant.warm.failed").record(Duration::ZERO);
                     if let Some(entry) = grants.warm.get_mut(&key) {
-                        entry.backoff = Some(Instant::now() + GRANT_TTL);
+                        entry.backoff = Some(nabedra_rt::time::now() + GRANT_TTL);
                     }
                     break;
                 }
@@ -426,17 +426,17 @@ mod tests {
 
     fn worker() -> WorkerIdentity {
         WorkerIdentity {
-            worker_id: Uuid::new_v4(),
-            incarnation: Uuid::new_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
             certificate_sha256: Digest::from_bytes([7; 32]),
             enrollment_revision: 1,
         }
     }
     fn group() -> GroupIdentity {
         GroupIdentity {
-            cluster_id: Uuid::new_v4(),
+            cluster_id: nabedra_rt::ids::uuid_v4(),
             database: Text::try_from("grants").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Timestamps,
             group_format_version: 1,
         }
@@ -491,7 +491,7 @@ mod tests {
 
         // A slow Control read: the window starts when the read started.
         let slow = || async {
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            nabedra_rt::time::sleep(Duration::from_secs(3)).await;
             Ok(Some(grant(caller, 1)))
         };
         cache.role(key, Some(4), slow).await.unwrap();
@@ -500,16 +500,16 @@ mod tests {
         assert!(!cache.allowed(key.unwrap(), Some(4)));
         // A read slower than the whole window is not recorded at all.
         let slower = || async {
-            tokio::time::sleep(GRANT_TTL).await;
+            nabedra_rt::time::sleep(GRANT_TTL).await;
             Ok(None)
         };
         cache.role(key, Some(4), slower).await.unwrap();
         assert_eq!(cache.len(), 0);
 
         // A replaced incarnation has its own key and never sees the old grant.
-        cache.insert(key, Some(4), Instant::now(), None);
+        cache.insert(key, Some(4), nabedra_rt::time::now(), None);
         let replacement = WorkerIdentity {
-            incarnation: Uuid::new_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
             enrollment_revision: 2,
             ..caller
         };
@@ -518,7 +518,7 @@ mod tests {
         assert!(!cache.allowed(replaced, Some(4)));
         // The role is part of the key, as is the target group.
         let proof = ServiceAction::StatusProof {
-            source_group: Uuid::new_v4(),
+            source_group: nabedra_rt::ids::uuid_v4(),
         };
         assert_ne!(GrantKey::new(caller, proof, &target, None), key);
         assert_ne!(
@@ -530,7 +530,7 @@ mod tests {
                 caller,
                 ServiceAction::Owner,
                 &target,
-                Some((2, Uuid::new_v4()))
+                Some((2, nabedra_rt::ids::uuid_v4()))
             ),
             key
         );
@@ -549,12 +549,12 @@ mod tests {
         let other_key = GrantKey::new(
             other,
             ServiceAction::TimestampProof {
-                source_group: Uuid::new_v4(),
+                source_group: nabedra_rt::ids::uuid_v4(),
             },
             &target,
             None,
         );
-        let now = Instant::now();
+        let now = nabedra_rt::time::now();
         cache.insert(key, Some(4), now, Some(observed(&grant(caller, 1))));
         cache.insert(other_key, Some(4), now, Some(observed(&grant(caller, 1))));
         assert_eq!(cache.len(), 2);
@@ -628,11 +628,11 @@ mod tests {
             ServiceAction::ApiIngress,
             ServiceAction::Operator,
             ServiceAction::ControlFence {
-                transition_id: Uuid::new_v4(),
+                transition_id: nabedra_rt::ids::uuid_v4(),
             },
             ServiceAction::ScopedQueueFenceReceipt {
-                queue_group_id: Uuid::new_v4(),
-                transfer_id: Uuid::new_v4(),
+                queue_group_id: nabedra_rt::ids::uuid_v4(),
+                transfer_id: nabedra_rt::ids::uuid_v4(),
             },
         ] {
             assert_eq!(GrantKey::new(caller, action, &target, None), None);
@@ -641,10 +641,10 @@ mod tests {
             GrantKey::new(
                 caller,
                 ServiceAction::StatusProof {
-                    source_group: Uuid::new_v4()
+                    source_group: nabedra_rt::ids::uuid_v4()
                 },
                 &target,
-                Some((1, Uuid::new_v4()))
+                Some((1, nabedra_rt::ids::uuid_v4()))
             ),
             None
         );
@@ -656,7 +656,7 @@ mod tests {
         let target = group();
         for _ in 0..MAX_GRANTS + 10 {
             let caller = worker();
-            cache.insert(key(caller, &target), Some(1), Instant::now(), None);
+            cache.insert(key(caller, &target), Some(1), nabedra_rt::time::now(), None);
             assert!(cache.len() <= MAX_GRANTS);
         }
     }
@@ -743,8 +743,8 @@ mod tests {
                     Some(4),
                     Box::pin(async move {
                         refreshes.fetch_add(1, Ordering::Relaxed);
-                        let started = Instant::now();
-                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        let started = nabedra_rt::time::now();
+                        nabedra_rt::time::sleep(Duration::from_millis(5)).await;
                         match mode.load(Ordering::Relaxed) {
                             OK => {
                                 *last_ok.lock().unwrap() = Some(started);
@@ -780,7 +780,7 @@ mod tests {
         // A caller idle for 12 s (more than two TTLs) uses the key again:
         // the entry is still valid and no request waits on Control.
         for _ in 0..12 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            nabedra_rt::time::sleep(Duration::from_secs(1)).await;
             assert!(cache.allowed(key.unwrap(), Some(4)), "warm entry lapsed");
         }
         cache
@@ -801,24 +801,24 @@ mod tests {
         // exactly GRANT_TTL after the last successful read started.
         mode.store(UNAVAILABLE, Ordering::Relaxed);
         let ok_at = last_ok.lock().unwrap().unwrap();
-        tokio::time::sleep_until(ok_at + GRANT_TTL - Duration::from_millis(1)).await;
+        nabedra_rt::time::sleep_until(ok_at + GRANT_TTL - Duration::from_millis(1)).await;
         let last = last_ok.lock().unwrap().unwrap();
         assert!(cache.allowed(key.unwrap(), Some(4)));
-        tokio::time::sleep_until(last + GRANT_TTL).await;
+        nabedra_rt::time::sleep_until(last + GRANT_TTL).await;
         assert!(!cache.allowed(key.unwrap(), Some(4)), "outlived its bound");
 
         // Control answers again: after its backoff (one TTL) the key is
         // re-warmed within a tick.
         mode.store(OK, Ordering::Relaxed);
-        tokio::time::sleep(GRANT_TTL + Duration::from_millis(1100)).await;
+        nabedra_rt::time::sleep(GRANT_TTL + Duration::from_millis(1100)).await;
         assert!(cache.allowed(key.unwrap(), Some(4)));
 
         // A refusal drops the role at the next refresh, before it expires.
         mode.store(REFUSED, Ordering::Relaxed);
-        let refused_by = Instant::now() + Duration::from_secs(4);
+        let refused_by = nabedra_rt::time::now() + Duration::from_secs(4);
         while cache.allowed(key.unwrap(), Some(4)) {
-            assert!(Instant::now() < refused_by, "a refused role stayed cached");
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(nabedra_rt::time::now() < refused_by, "a refused role stayed cached");
+            nabedra_rt::time::sleep(Duration::from_millis(100)).await;
         }
         assert_eq!(cache.warm_len(), 0);
 
@@ -828,9 +828,9 @@ mod tests {
             .role_warm(key, Some(4), read, || refresh.clone())
             .await
             .unwrap();
-        tokio::time::sleep(WARM_IDLE + Duration::from_secs(2)).await;
+        nabedra_rt::time::sleep(WARM_IDLE + Duration::from_secs(2)).await;
         let stopped = refreshes.load(Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        nabedra_rt::time::sleep(Duration::from_secs(10)).await;
         assert_eq!(refreshes.load(Ordering::Relaxed), stopped);
         assert_eq!(cache.warm_len(), 0);
         assert!(!cache.allowed(key.unwrap(), Some(4)));
@@ -851,7 +851,7 @@ mod tests {
                 .unwrap();
             assert!(cache.warm_len() <= MAX_WARM);
         }
-        tokio::time::sleep(WARM_IDLE).await;
+        nabedra_rt::time::sleep(WARM_IDLE).await;
         let key = GrantKey::new(worker(), ServiceAction::DirectLeader, &target, None);
         cache
             .role_warm(key, Some(1), || async { Ok(None) }, || refresh.clone())
@@ -904,7 +904,7 @@ mod tests {
         // 8 warm keys, every read hangs. Over 20 s each tick starts at most
         // one read, and each key is retried at most once per TTL.
         for _ in 0..200 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(100)).await;
             assert!(in_flight.load(Ordering::Relaxed) <= 1);
         }
         assert_eq!(peak.load(Ordering::Relaxed), 1);

@@ -71,13 +71,13 @@ impl Stage {
         self.buckets[bucket.min(BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
     }
     pub(crate) fn since(&self, started: Instant) {
-        self.record(started.elapsed());
+        self.record(nabedra_rt::time::now_std().saturating_duration_since(started));
     }
     /// Records the time until the guard drops (every return path).
     pub(crate) fn timer(&'static self) -> Timer {
         Timer {
             stage: self,
-            started: Instant::now(),
+            started: nabedra_rt::time::now_std(),
         }
     }
 }

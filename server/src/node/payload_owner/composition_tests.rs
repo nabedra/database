@@ -91,7 +91,7 @@ async fn captured_split_prepare_roundtrips_original_registered_output() {
         // Move the ORIGINAL handler lease into the actual sender future.
         let lease = local.take().ok_or(OwnerError::Invalid)?;
         let send_job = job.clone();
-        send_task = Some(tokio::spawn(async move {
+        send_task = Some(nabedra_rt::task::spawn(async move {
             let mut writer = payload_stream::send_result(
                 FrameWriter::new(Box::new(tx) as Box<dyn AsyncWrite + Unpin + Send>),
                 lease,
@@ -100,7 +100,7 @@ async fn captured_split_prepare_roundtrips_original_registered_output() {
             .await?;
             writer.shutdown().await.map_err(|_| OwnerError::Invalid)
         }));
-        receive_task = Some(tokio::spawn(payload_stream::receive_result(
+        receive_task = Some(nabedra_rt::task::spawn(payload_stream::receive_result(
             FrameReader::new(Box::new(rx) as Box<dyn AsyncRead + Unpin + Send>),
             incoming,
             expected_job,
@@ -236,7 +236,7 @@ async fn captured_split_prepare_roundtrips_original_registered_output() {
                 ),
         ));
         let received = accepted.take().ok_or(OwnerError::Invalid)?;
-        dispose_task = Some(tokio::spawn(received.lease.dispose()));
+        dispose_task = Some(nabedra_rt::task::spawn(received.lease.dispose()));
         disposed.await.map_err(|_| OwnerError::Invalid)?;
         checks.push((
             "receiver scratch released by disposal",
@@ -285,7 +285,7 @@ async fn captured_split_prepare_roundtrips_original_registered_output() {
         ));
         Ok::<_, OwnerError>(())
     };
-    let observed = tokio::time::timeout(watchdog, observation).await;
+    let observed = nabedra_rt::time::timeout(watchdog, observation).await;
     // Timeout drops observation futures, but never detaches original task handles.
     if let Some(release) = send_release {
         let _ = release.send(());
@@ -310,8 +310,8 @@ async fn captured_split_prepare_roundtrips_original_registered_output() {
     // finish attempts anchor disposal, actual supervisor reaping, both pool joins,
     // scratch removal and the existing no-PUT observations before asserting.
     let (sender_finished, receiver_finished) = tokio::join!(
-        tokio::spawn(sender.finish()),
-        tokio::spawn(receiver.finish()),
+        nabedra_rt::task::spawn(sender.finish()),
+        nabedra_rt::task::spawn(receiver.finish()),
     );
     assert!(
         sender_finished.is_ok(),

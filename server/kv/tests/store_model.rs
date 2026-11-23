@@ -1,6 +1,7 @@
 //! NS01 at store level: a differential test against a `BTreeMap` oracle with flushes,
 //! compactions and reopens forced, snapshots held across them, point reads, and iterator
 //! walks (forward, reverse, bounds, `seek_for_prev`, direction switches).
+#![allow(clippy::disallowed_methods)] // integration tests are outside the phase 7 conversion, which covers kv/src
 
 mod common;
 

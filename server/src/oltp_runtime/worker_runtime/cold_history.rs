@@ -29,7 +29,7 @@ pub(crate) enum Sources {
 
 pub(super) fn spawn(runtime: &Arc<WorkerRuntime>) -> tokio::task::JoinHandle<()> {
     let runtime = Arc::downgrade(runtime);
-    tokio::spawn(async move {
+    nabedra_rt::task::spawn(async move {
         let Some(initial) = runtime.upgrade() else {
             return;
         };
@@ -39,7 +39,7 @@ pub(super) fn spawn(runtime: &Arc<WorkerRuntime>) -> tokio::task::JoinHandle<()>
         let mut pins = Some((None, false));
         let mut bucket = 0;
         while pins.is_some() || cursors.iter().any(Option::is_some) {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(500)).await;
             let Some(runtime) = runtime.upgrade() else {
                 break;
             };

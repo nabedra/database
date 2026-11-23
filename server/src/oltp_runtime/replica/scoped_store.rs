@@ -2192,12 +2192,12 @@ mod tests {
         let mut store = ScopedQueueStore::new(
             shared.clone(),
             QueueScope {
-                cluster_id: Uuid::new_v4(),
+                cluster_id: nabedra_rt::ids::uuid_v4(),
                 database: Text::try_from("default").unwrap(),
             },
             WorkerIdentity {
-                worker_id: Uuid::new_v4(),
-                incarnation: Uuid::new_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                incarnation: nabedra_rt::ids::uuid_v4(),
                 certificate_sha256: Digest::from_bytes([1; 32]),
                 enrollment_revision: 1,
             },
@@ -2209,10 +2209,10 @@ mod tests {
             },
         )
         .unwrap();
-        let group = Uuid::new_v4();
-        let run = Uuid::new_v4();
-        let expired = Uuid::new_v4();
-        let unrelated = Uuid::new_v4();
+        let group = nabedra_rt::ids::uuid_v4();
+        let run = nabedra_rt::ids::uuid_v4();
+        let expired = nabedra_rt::ids::uuid_v4();
+        let unrelated = nabedra_rt::ids::uuid_v4();
         let old_payload = store.begin_insert(group, run, expired).unwrap();
         let old_repair = store.begin_insert(group, run, expired).unwrap();
         let new_payload = store.begin_insert(group, run, unrelated).unwrap();

@@ -122,8 +122,8 @@ pub(super) fn spawn(
     operator: Arc<LocalOperatorPermit>,
     mut stop: watch::Receiver<bool>,
 ) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+    nabedra_rt::task::spawn(async move {
+        let mut tick = nabedra_rt::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {

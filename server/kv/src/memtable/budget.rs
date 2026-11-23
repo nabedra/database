@@ -98,7 +98,7 @@ impl MemtableBudget {
                         .unwrap_or_else(PoisonError::into_inner);
                 }
                 Some(deadline) => {
-                    let now = Instant::now();
+                    let now = nabedra_rt::time::now_std();
                     if now >= deadline {
                         break false;
                     }
@@ -132,15 +132,16 @@ mod tests {
         assert!(!budget.is_exhausted());
         budget.reserve(100);
         assert!(budget.is_exhausted());
-        let start = Instant::now();
+        let start = nabedra_rt::time::now_std();
         assert!(!budget.wait_below_limit(Some(start + Duration::from_millis(20))));
         assert!(start.elapsed() >= Duration::from_millis(20));
         budget.release(800);
         assert_eq!(budget.used(), 0);
-        assert!(budget.wait_below_limit(Some(Instant::now())));
+        assert!(budget.wait_below_limit(Some(nabedra_rt::time::now_std())));
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // short-lived test threads, joined before the test ends
     fn ns_unit_stalled_writers_wake_on_release() {
         let budget = Arc::new(MemtableBudget::new(100));
         budget.reserve(150);
@@ -150,7 +151,7 @@ mod tests {
                 std::thread::spawn(move || budget.wait_below_limit(None))
             })
             .collect();
-        std::thread::sleep(Duration::from_millis(20));
+        nabedra_rt::time::thread_sleep(Duration::from_millis(20));
         budget.release(100);
         for waiter in waiters {
             assert!(waiter.join().unwrap());

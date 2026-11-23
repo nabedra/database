@@ -1514,7 +1514,7 @@ impl StatusHandle {
             request_id,
             digest,
             kind,
-            reservation_id: Uuid::new_v4(),
+            reservation_id: nabedra_rt::ids::uuid_v4(),
             scoped,
         })
         .await
@@ -1740,7 +1740,7 @@ impl VerifiedTerminalRetirement {
         let digest = statement_digest(&statement).unwrap();
         let mut verifier = TerminalVerifier::begin(statement, ready).unwrap();
         for worker in workers {
-            verifier.accept(*worker, &AuthenticatedAck::from_transport(*worker, digest, Uuid::new_v4())).unwrap();
+            verifier.accept(*worker, &AuthenticatedAck::from_transport(*worker, digest, nabedra_rt::ids::uuid_v4())).unwrap();
         }
         let position = AppliedPosition { term: 1, node_id: 1, index: 2 };
         let certificate = RetirementCertificate {

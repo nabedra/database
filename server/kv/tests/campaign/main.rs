@@ -27,6 +27,7 @@
 //! `NS10_SEED_BASE`, `NS10_SEEDS`, `NS10_STEPS`, `NS10_ENUM_SEEDS`, `NS10_ENUM_STEPS`,
 //! `NS10_DAMAGE_SEEDS`, `NS10_DAMAGE_TRIALS`, `NS10_SLEEPY_SEEDS`, `NS10_LONG_SEEDS`,
 //! `NS10_LONG_OPS`, `NS10_SHRINK` (0 disables shrinking), `NS10_SHRINK_SECS`.
+#![allow(clippy::disallowed_methods)] // integration tests are outside the phase 7 conversion, which covers kv/src
 
 #[path = "../common/mod.rs"]
 mod common;

@@ -81,7 +81,7 @@ async fn observe(
         control.advertise_direct_feature(name, local).await;
     } else if reevaluate {
         let _ = control
-            .change_direct_capability(uuid::Uuid::new_v4(), DirectCapabilityOperation::Activate)
+            .change_direct_capability(nabedra_rt::ids::uuid_v4(), DirectCapabilityOperation::Activate)
             .await;
     } else {
         return false;
@@ -124,7 +124,7 @@ pub(crate) async fn watch(
             }
         }
         polls = polls.wrapping_add(1);
-        tokio::time::sleep(POLL).await;
+        nabedra_rt::time::sleep(POLL).await;
     }
 }
 
@@ -136,7 +136,7 @@ pub(crate) fn spawn_watch(
     flags: &Arc<EnabledFeatures>,
 ) {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        runtime.spawn(watch(
+        nabedra_rt::task::spawn_on(&runtime, watch(
             Arc::downgrade(control),
             local,
             names,

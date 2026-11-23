@@ -1,0 +1,6 @@
+{"type":"invoke","process":0,"f":"insert","key":"k","value":{"id":"k","value":1},"request_id":"a"}
+{"type":"ok","process":0,"f":"insert","key":"k","value":null,"request_id":"a"}
+{"type":"invoke","process":0,"f":"delete","key":"k","request_id":"b"}
+{"type":"ok","process":0,"f":"delete","key":"k","value":true,"request_id":"b"}
+{"type":"invoke","process":1,"f":"update","key":"k","value":{"value":2},"request_id":"c"}
+{"type":"ok","process":1,"f":"update","key":"k","value":true,"request_id":"c"}

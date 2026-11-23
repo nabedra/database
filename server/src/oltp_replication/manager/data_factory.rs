@@ -328,7 +328,7 @@ impl DataGroupFactory {
     async fn activate(&self, spec: &DataGroupSpec, local: &ReplicaMember, voters: &[ReplicaMember]) -> Result<Membership, ProtocolError> {
         let running = self.manager.hosted_data(&spec.group, local.node_id)?;
         // Only the leader can produce this observation after real ReadIndex.
-        let started = tokio::time::Instant::now();
+        let started = nabedra_rt::time::now();
         let observed = running.observe_membership().await;
         tracing::debug!(group_id = %spec.group.group_id, node = self.local.node_id, stage = "membership_read", ms = started.elapsed().as_millis(), ok = observed.is_ok(), "initial Data activation");
         let observation = observed?;
@@ -339,7 +339,7 @@ impl DataGroupFactory {
             ParticipantMachine::new(running.state.store().clone())?,
             running,
         );
-        let started = tokio::time::Instant::now();
+        let started = nabedra_rt::time::now();
         let activation = participant.activation().await;
         tracing::debug!(group_id = %spec.group.group_id, node = self.local.node_id, stage = "fence_read", ms = started.elapsed().as_millis(), ok = activation.is_ok(), "initial Data activation");
         if let Some(existing) = activation? {
@@ -351,7 +351,7 @@ impl DataGroupFactory {
                 return Err(invalid());
             }
         } else {
-            let started = tokio::time::Instant::now();
+            let started = nabedra_rt::time::now();
             let fenced = participant
                 .fence_initial(
                     spec.transition_id,
@@ -651,7 +651,7 @@ impl DataGroupClient {
             let spec = spec.clone();
             let member = member.clone();
             async move {
-                let started = tokio::time::Instant::now();
+                let started = nabedra_rt::time::now();
                 let verified = self
                     .call::<(DataGroupSpec, ReplicaMember)>(&member, Method::Host, spec.clone(), voters)
                     .await
@@ -692,12 +692,12 @@ impl DataGroupClient {
         spec: DataGroupSpec,
         voters: &Page<ReplicaMember>,
     ) -> Result<GroupMembershipObservation, ProtocolError> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = nabedra_rt::time::now() + std::time::Duration::from_secs(10);
         let mut last = unavailable();
         loop {
             for member in voters.iter() {
-                let started = tokio::time::Instant::now();
-                let completed = tokio::time::timeout_at(
+                let started = nabedra_rt::time::now();
+                let completed = nabedra_rt::time::timeout_at(
                     deadline,
                     self.call(member, Method::Activate, spec.clone(), voters),
                 )
@@ -738,10 +738,10 @@ impl DataGroupClient {
                     _owner: owner,
                 });
             }
-            if tokio::time::Instant::now() >= deadline {
+            if nabedra_rt::time::now() >= deadline {
                 return Err(last);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            nabedra_rt::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     }
 }

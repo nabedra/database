@@ -31,7 +31,7 @@ pub(super) fn fixture_workers(
         tokio::runtime::Handle::current(),
     )
     .unwrap();
-    let parent = std::env::temp_dir().join(format!("nabedra-owner-{}", uuid::Uuid::new_v4()));
+    let parent = std::env::temp_dir().join(format!("nabedra-owner-{}", nabedra_rt::ids::uuid_v4()));
     std::fs::create_dir(&parent).unwrap();
     let guard = Arc::new(Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap());
     (
@@ -352,14 +352,14 @@ async fn eof_pending_and_accepted_append_cancellation_retain_owner() {
             bytes: consumed.clone(),
             pending: Some(pending_tx),
         };
-        let task = tokio::spawn(receive_result(reader(observed), lease, job));
-        tokio::time::timeout(std::time::Duration::from_secs(5), started)
+        let task = nabedra_rt::task::spawn(receive_result(reader(observed), lease, job));
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(5), started)
             .await
             .unwrap()
             .unwrap();
         if !append {
             release.send(()).unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            nabedra_rt::time::timeout(std::time::Duration::from_secs(5), pending)
                 .await
                 .unwrap()
                 .unwrap();
@@ -376,7 +376,7 @@ async fn eof_pending_and_accepted_append_cancellation_retain_owner() {
         if append {
             release.send(()).unwrap();
         }
-        tokio::time::timeout(std::time::Duration::from_secs(5), disposed)
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(5), disposed)
             .await
             .unwrap()
             .unwrap();

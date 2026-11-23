@@ -2092,8 +2092,8 @@ impl OperationCandidates {
     #[allow(dead_code)] // Future HTTP prelude.
     pub(super) fn new() -> Self {
         Self {
-            admission: Uuid::new_v4(),
-            permit: Uuid::new_v4(),
+            admission: nabedra_rt::ids::uuid_v4(),
+            permit: nabedra_rt::ids::uuid_v4(),
         }
     }
 }

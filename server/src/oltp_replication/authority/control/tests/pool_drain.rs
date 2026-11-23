@@ -9,7 +9,7 @@ use crate::{
 
 async fn grow(f: &mut Fixture, command: GrowthCommand) -> ControlReply {
     f.apply(ControlCommand::Growth {
-        operation_id: Uuid::new_v4(),
+        operation_id: nabedra_rt::ids::uuid_v4(),
         authorization: authorization(),
         command,
     })
@@ -65,7 +65,7 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
     let local = WorkerIdentity::from(&enrollment);
     assert_eq!(
         f.apply(ControlCommand::Enroll {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             expected: None,
             next: enrollment,
             authorization: authorization(),
@@ -80,7 +80,7 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
     f.add_ready(other, &mut members).await;
     let policy = GrowthPolicy {
         automatic: None,
-        policy_id: Uuid::new_v4(),
+        policy_id: nabedra_rt::ids::uuid_v4(),
         volume_cost_per_gib: 1,
         worker_cost: 1,
         initial_monthly_spend: 0,
@@ -102,8 +102,8 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
         ControlReply::GrowthConfigured(_)
     ));
     let volume = "docker-volume:retained-test".to_owned();
-    let pool_id = Uuid::new_v4();
-    let claim_id = Uuid::new_v4();
+    let pool_id = nabedra_rt::ids::uuid_v4();
+    let claim_id = nabedra_rt::ids::uuid_v4();
     let intent = GrowthIntent {
         policy_id: policy.policy_id,
         claim_id,
@@ -150,7 +150,7 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
     let exact = DrainMount {
         expected: PoolMountExpectation {
             profile: PoolMountProfile::Docker {
-                volume_marker: Uuid::new_v4(),
+                volume_marker: nabedra_rt::ids::uuid_v4(),
             },
             identity: PoolIdentity {
                 pool_id,
@@ -169,17 +169,17 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
         root_inode: 10,
     };
     let other_group = GroupIdentity {
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Data {
-            table_id: Uuid::new_v4(),
-            shard_id: Uuid::new_v4(),
+            table_id: nabedra_rt::ids::uuid_v4(),
+            shard_id: nabedra_rt::ids::uuid_v4(),
         },
         ..scope.clone()
     };
-    let staged = Uuid::new_v4();
+    let staged = nabedra_rt::ids::uuid_v4();
     assert!(matches!(
         f.apply(ControlCommand::BeginGroup {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             generation: staged,
             identity: other_group.clone(),
             authorization: authorization(),
@@ -187,7 +187,7 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
         .await,
         ControlReply::GroupBuilding { .. }
     ));
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let began = drain(
         &mut f,
         local,
@@ -207,7 +207,7 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
         mount: Box::new(exact.clone()),
     };
     assert_eq!(
-        drain(&mut f, local, Uuid::new_v4(), stamp.clone()).await,
+        drain(&mut f, local, nabedra_rt::ids::uuid_v4(), stamp.clone()).await,
         ControlReply::Rejected(Fault::Conflict)
     );
     // A new staged member targeting the pool is blocked at Control apply.
@@ -218,7 +218,7 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
     };
     assert_eq!(
         f.apply(ControlCommand::GroupPage {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             generation: staged,
             replicas: Page::new(vec![target.clone()]).unwrap(),
         })
@@ -236,11 +236,11 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
     let other_replica = ReplicaMember {
         node_id: 6,
         worker_id: other.worker_id,
-        pool_id: Uuid::new_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
     };
     assert!(matches!(
         f.apply(ControlCommand::GroupPage {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             generation: staged,
             replicas: Page::new(vec![other_replica.clone()]).unwrap(),
         })
@@ -251,20 +251,20 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
         drain(
             &mut f,
             local,
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             PoolDrainCommand::Prepare { id, revision }
         )
         .await,
         ControlReply::Rejected(Fault::Stale)
     );
     assert!(
-        matches!(drain(&mut f, local, Uuid::new_v4(), PoolDrainCommand::Cancel { id }).await,
+        matches!(drain(&mut f, local, nabedra_rt::ids::uuid_v4(), PoolDrainCommand::Cancel { id }).await,
         ControlReply::PoolDrain(cancelled) if cancelled.phase == PoolDrainPhase::Cancelled)
     );
-    let staged_other = Uuid::new_v4();
+    let staged_other = nabedra_rt::ids::uuid_v4();
     assert!(matches!(
         f.apply(ControlCommand::BeginGroup {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             generation: staged_other,
             identity: other_group.clone(),
             authorization: authorization(),
@@ -274,14 +274,14 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
     ));
     assert!(matches!(
         f.apply(ControlCommand::GroupPage {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             generation: staged_other,
             replicas: Page::new(vec![target]).unwrap(),
         })
         .await,
         ControlReply::GroupBuilding { .. }
     ));
-    let second = Uuid::new_v4();
+    let second = nabedra_rt::ids::uuid_v4();
     let result = drain(
         &mut f,
         local,
@@ -308,7 +308,7 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
     let authority = f.state().await.ready.view.authority();
     assert!(matches!(
         f.apply(ControlCommand::SealGroup {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             generation: staged,
             proof: GroupMembershipStamp {
                 group: other_group,
@@ -332,7 +332,7 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
         .await
         .unwrap();
     assert!(
-        matches!(drain(&mut f, local, Uuid::new_v4(), PoolDrainCommand::Prepare {
+        matches!(drain(&mut f, local, nabedra_rt::ids::uuid_v4(), PoolDrainCommand::Prepare {
         id: second, revision,
     }).await, ControlReply::PoolDrain(closing) if closing.phase == PoolDrainPhase::Closing)
     );
@@ -340,7 +340,7 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
         drain(
             &mut f,
             local,
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             PoolDrainCommand::Cancel { id: second }
         )
         .await,
@@ -352,7 +352,7 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
         drain(
             &mut f,
             local,
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             PoolDrainCommand::Closed {
                 id: second,
                 mount: Box::new(alias),
@@ -364,7 +364,7 @@ async fn o17_o26_a02_control_pool_drain_pins_staged_inventory_and_recovers_exact
     let completed = drain(
         &mut f,
         local,
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
         PoolDrainCommand::Closed {
             id: second,
             mount: Box::new(exact),

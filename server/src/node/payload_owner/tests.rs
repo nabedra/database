@@ -34,7 +34,7 @@ pub(super) fn fixture() -> (
         tokio::runtime::Handle::current(),
     )
     .unwrap();
-    let parent = std::env::temp_dir().join(format!("nabedra-owner-{}", uuid::Uuid::new_v4()));
+    let parent = std::env::temp_dir().join(format!("nabedra-owner-{}", nabedra_rt::ids::uuid_v4()));
     std::fs::create_dir(&parent).unwrap();
     let guard = Arc::new(Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap());
     (
@@ -189,7 +189,9 @@ async fn cancelled_append_and_panic_dispose_on_worker() {
         let (started, release) = gate(&slot);
         slot.hooks.lock().unwrap().panic = panic;
         let task =
-            tokio::spawn(async move { lease.command(Command::Append(b"[]".to_vec())).await });
+            nabedra_rt::task::spawn(
+                async move { lease.command(Command::Append(b"[]".to_vec())).await },
+            );
         started.await.unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
@@ -336,7 +338,7 @@ async fn concurrent_disposal_waiters_survive_reaping_and_waiter_cancellation() {
         }
         first_release.send(()).unwrap();
         let first_result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), &mut first_task).await;
+            nabedra_rt::time::timeout(std::time::Duration::from_secs(2), &mut first_task).await;
         let first_completed = matches!(first_result, Ok(Ok(Ok(()))));
         if first_result.is_err() {
             first_task.abort();
@@ -346,7 +348,8 @@ async fn concurrent_disposal_waiters_survive_reaping_and_waiter_cancellation() {
         // gated; completing every task at once would mask a missed wakeup.
         second_release.send(()).unwrap();
         let second_completed = if let Some(mut task) = second_task {
-            let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut task).await;
+            let result =
+                nabedra_rt::time::timeout(std::time::Duration::from_secs(2), &mut task).await;
             if result.is_err() {
                 task.abort();
                 let _ = task.await;
@@ -365,7 +368,7 @@ async fn concurrent_disposal_waiters_survive_reaping_and_waiter_cancellation() {
 
 fn disposal_waiter(lease: PayloadLease) -> (JoinHandle<Result<()>>, oneshot::Receiver<()>) {
     let (polled, observed) = oneshot::channel();
-    let task = tokio::spawn(async move {
+    let task = nabedra_rt::task::spawn(async move {
         let mut dispose = Box::pin(lease.dispose());
         let mut polled = Some(polled);
         poll_fn(|cx| {
@@ -389,7 +392,12 @@ async fn early_receive_errors_reap_before_returning() {
         let (owners, threads, parent, guard) = fixture();
         let (process, op) = anchors(&owners, parent.clone(), guard.clone(), limits()).await;
         let lease = owners
-            .try_admit_until(&op, Role::Operation, guard.clone(), Some(Instant::now()))
+            .try_admit_until(
+                &op,
+                Role::Operation,
+                guard.clone(),
+                Some(nabedra_rt::time::now()),
+            )
             .unwrap();
         let slot = lease.slot.clone();
         slot.hooks.lock().unwrap().panic = initialization_fails;
@@ -522,11 +530,12 @@ pub(super) async fn quarantine_teardown(owners: &PayloadOwners) {
         slots.push(entry.slot);
         guards.push(entry.guards);
     }
-    std::thread::spawn(move || {
+    nabedra_rt::task::spawn_service("nabedra-test", move || {
         for g in guards {
             drop(ManuallyDrop::into_inner(g));
         }
     })
+    .expect("spawn test thread")
     .join()
     .unwrap();
     for (h, terminated) in handles {
@@ -534,11 +543,12 @@ pub(super) async fn quarantine_teardown(owners: &PayloadOwners) {
             h.await.unwrap();
         }
     }
-    std::thread::spawn(move || {
+    nabedra_rt::task::spawn_service("nabedra-test", move || {
         for slot in slots {
             slot.discard();
         }
     })
+    .expect("spawn test thread")
     .join()
     .unwrap();
 }
@@ -570,8 +580,11 @@ async fn pending_submit_rejected_by_real_stop_retains_disk_and_guards() {
     // leaves the command itself pending, before any executor-queue insertion.
     let (pending, observed) = oneshot::channel();
     slot.hooks.lock().unwrap().submit_pending = Some(pending);
-    let task = tokio::spawn(async move { lease.command(Command::Append(b"[]".to_vec())).await });
-    tokio::time::timeout(std::time::Duration::from_secs(10), observed)
+    let task =
+        nabedra_rt::task::spawn(
+            async move { lease.command(Command::Append(b"[]".to_vec())).await },
+        );
+    nabedra_rt::time::timeout(std::time::Duration::from_secs(10), observed)
         .await
         .unwrap()
         .unwrap();
@@ -612,7 +625,7 @@ async fn abandonment_is_sticky_before_eof_and_deadlines_do_not_release_capacity(
     );
     lease.dispose().await.unwrap();
     let mut expired = owners
-        .try_admit_until(&op, Role::Operation, guard, Some(Instant::now()))
+        .try_admit_until(&op, Role::Operation, guard, Some(nabedra_rt::time::now()))
         .unwrap();
     expired.ready().await.unwrap();
     assert_eq!(

@@ -2778,7 +2778,7 @@ impl StatusService for StatusClient {
             let outcome = point.outcome.clone();
             let request_id = point.binding.txn.request_id;
             let digest = point.binding.request.digest;
-            let result = tokio::time::timeout(SERVICE_CONVERGENCE, self.value::<ManifestRef>(
+            let result = nabedra_rt::time::timeout(SERVICE_CONVERGENCE, self.value::<ManifestRef>(
                 Request::InstallTimestampPoint { authority, point: Box::new(point) },
             )).await;
             if matches!(result, Ok(Ok((manifest, _))) if manifest == expected) {
@@ -2804,7 +2804,7 @@ impl StatusService for StatusClient {
         digest: Digest,
     ) -> ConsensusFuture<'a, TimestampPointHome> {
         Box::pin(async move {
-            let (mut home, owner): (TimestampPointHome, _) = tokio::time::timeout(
+            let (mut home, owner): (TimestampPointHome, _) = nabedra_rt::time::timeout(
                 SERVICE_CONVERGENCE,
                 self.value(Request::TimestampPointHome { authority, request_id, digest }),
             ).await.map_err(|_| unavailable())??;
@@ -2832,7 +2832,7 @@ impl StatusService for StatusClient {
         locator: &'a TimestampDecisionLocator,
     ) -> ConsensusFuture<'a, Option<(TimestampPointProjection, Arc<ScratchLease>)>> {
         Box::pin(async move {
-            let (record, owner): (Option<TimestampPointProjection>, _) = tokio::time::timeout(
+            let (record, owner): (Option<TimestampPointProjection>, _) = nabedra_rt::time::timeout(
                 SERVICE_CONVERGENCE,
                 self.value(Request::ReadTimestampPointProjection { authority, locator: Box::new(locator.clone()) }),
             ).await.map_err(|_| unavailable())??;
@@ -2849,7 +2849,7 @@ impl StatusService for StatusClient {
         locator: &'a TimestampDecisionLocator,
     ) -> ConsensusFuture<'a, (TimestampPointProjection, Arc<ScratchLease>)> {
         Box::pin(async move {
-            let result = tokio::time::timeout(
+            let result = nabedra_rt::time::timeout(
                 SERVICE_CONVERGENCE,
                 self.value::<TimestampPointProjection>(Request::ProjectTimestampPoint {
                     authority, locator: Box::new(locator.clone()),
@@ -3112,9 +3112,9 @@ mod point_manifest_tests {
     /// prefix and validates the original page before returning a sealed ref.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn o07_o10_o11_point_manifest_replays_legacy_prefixes_and_rejects_changed_plan() {
-        tokio::time::timeout(Duration::from_secs(40), async {
+        nabedra_rt::time::timeout(Duration::from_secs(40), async {
             let directory =
-                Directory(std::env::temp_dir().join(format!("point-status-{}", Uuid::new_v4())));
+                Directory(std::env::temp_dir().join(format!("point-status-{}", nabedra_rt::ids::uuid_v4())));
             let services = LocalServices::open(
                 &directory.0,
                 "point_manifest",
@@ -3182,7 +3182,7 @@ mod point_manifest_tests {
             assert!(
                 client
                     .inspect_transaction(TxnId {
-                        request_id: Uuid::new_v4(),
+                        request_id: nabedra_rt::ids::uuid_v4(),
                         attempt: 1,
                     })
                     .await
@@ -3195,10 +3195,10 @@ mod point_manifest_tests {
                 group: GroupIdentity {
                     cluster_id: client.identity().cluster_id,
                     database: client.identity().database.clone(),
-                    group_id: Uuid::new_v4(),
+                    group_id: nabedra_rt::ids::uuid_v4(),
                     kind: GroupKind::Data {
-                        table_id: Uuid::new_v4(),
-                        shard_id: Uuid::new_v4(),
+                        table_id: nabedra_rt::ids::uuid_v4(),
+                        shard_id: nabedra_rt::ids::uuid_v4(),
                     },
                     group_format_version: client.identity().group_format_version,
                 },
@@ -3211,7 +3211,7 @@ mod point_manifest_tests {
             };
             let result = CanonicalJson::from_serializable(&services.shared, &1_u64, 1024).unwrap();
             for prefix in 0..=3 {
-                let request_id = Uuid::new_v4();
+                let request_id = nabedra_rt::ids::uuid_v4();
                 let digest = Digest::from_bytes([45; 32]);
                 client
                     .reserve_identity(authority, request_id, digest, RequestKind::Mutation)

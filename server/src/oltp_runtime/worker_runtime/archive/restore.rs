@@ -68,7 +68,7 @@ impl VerifiedNativeRestore {
                 return Err(unknown());
             }
             let path =
-                std::env::temp_dir().join(format!(".nabedra-restore-{}.nab", Uuid::new_v4()));
+                std::env::temp_dir().join(format!(".nabedra-restore-{}.nab", nabedra_rt::ids::uuid_v4()));
             let mut file = OpenOptions::new()
                 .create_new(true)
                 .mode(0o600)

@@ -17,7 +17,8 @@ struct StoreProcess {
 }
 impl StoreProcess {
     fn start() -> Self {
-        let path = std::env::temp_dir().join(format!("nabedra-shared-{}", Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("nabedra-shared-{}", nabedra_rt::ids::uuid_v4()));
         std::fs::create_dir(&path).unwrap();
         let mut child = std::process::Command::new("python3.11")
             .args([
@@ -82,13 +83,13 @@ async fn sl01_first_use_absent_catalog_two_workers_metadata_create_and_list() {
     shared_worker_case(true).await;
 }
 async fn shared_worker_case(two_workers: bool) {
-    tokio::time::timeout(Duration::from_secs(60),async {
+    nabedra_rt::time::timeout(Duration::from_secs(60),async {
  let service=StoreProcess::start(); let data_a=StoreProcess::start(); let data_b=StoreProcess::start(); let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint=format!("http://{}",listener.local_addr().unwrap());
  let resources=crate::config::WorkerResources::default();
  let template=json!({"mode":"serverless","api_urls":["http://127.0.0.1:1"],"listen":"127.0.0.1:0","storage":{"driver":"http","options":{"base_url":service.url,"namespace":"control/","token_file":"token","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"4 KiB","resources":resources});
  let mut bootstrap=template.clone();bootstrap["version"]=json!(2);bootstrap["cluster_id"]=json!(id(1));bootstrap["node_id"]=json!(id(3));bootstrap["request_id"]=Value::Null;bootstrap["advertise_url"]=json!(endpoint);bootstrap["enrollment_token"]=json!("E".repeat(43));
  service.write("bootstrap.json",serde_json::to_vec(&bootstrap).unwrap());service.write("token",b"test-secret");
- let ready=Arc::new(Box::pin(prepare_bootstrap(&service.path.join("bootstrap.json"),(Instant::now()+Duration::from_secs(10)).into_std()).unwrap().connect_async()).await.unwrap());
+ let ready=Arc::new(Box::pin(prepare_bootstrap(&service.path.join("bootstrap.json"),(nabedra_rt::time::now()+Duration::from_secs(10)).into_std()).unwrap().connect_async()).await.unwrap());
  let key=Arc::new(auth::WorkerSigningKey::new().unwrap());let sender=Arc::new(auth::Sender::worker(id(3),id(4),id(5),http::hex(&key.public_key())).unwrap());
  let slots=super::super::queue_runtime::coordination_capacity(&ready.prepared.input.value.template).unwrap();let job_slots=super::super::queue_runtime::job_coordination_capacity(&ready.prepared.input.value.template).unwrap();
  let typed:crate::cluster::configuration::Template=serde_json::from_value(template.clone()).unwrap();
@@ -110,20 +111,20 @@ async fn shared_worker_case(two_workers: bool) {
    let key2=Arc::new(auth::WorkerSigningKey::new().unwrap());let sender2=Arc::new(auth::Sender::worker(id(6),id(7),id(8),http::hex(&key2.public_key())).unwrap());
    let mut node=root.nodes[0].clone();node.node_id=id(6);node.resource_id=Some(format!("external:{}",id(6)));node.incarnation=Some(id(7));node.endpoint=Some(endpoint2.clone());node.session.as_mut().unwrap().id=id(8);node.session.as_mut().unwrap().verifier=http::hex(&auth::worker_verifier(id(1),id(6),id(7),id(8),&key2.public_key()));root.nodes.push(node);root.policy.desired=2;root.policy.min_nodes=2;root.policy.max_nodes=2;root.revision+=1;
    let loaded=storage.read(&ObjectKey::control(),crate::cluster::state::MAX_CONTROL_BYTES).await.unwrap();storage.put(&ObjectKey::control(),root.encode().unwrap(),WriteCondition::Match(&loaded.etag)).await.unwrap();
-   let mut boot2=bootstrap.clone();boot2["node_id"]=json!(id(6));boot2["advertise_url"]=json!(endpoint2);service.write("bootstrap2.json",serde_json::to_vec(&boot2).unwrap());let ready2=Arc::new(Box::pin(prepare_bootstrap(&service.path.join("bootstrap2.json"),(Instant::now()+Duration::from_secs(10)).into_std()).unwrap().connect_async()).await.unwrap());
+   let mut boot2=bootstrap.clone();boot2["node_id"]=json!(id(6));boot2["advertise_url"]=json!(endpoint2);service.write("bootstrap2.json",serde_json::to_vec(&boot2).unwrap());let ready2=Arc::new(Box::pin(prepare_bootstrap(&service.path.join("bootstrap2.json"),(nabedra_rt::time::now()+Duration::from_secs(10)).into_std()).unwrap().connect_async()).await.unwrap());
    let (pool2,threads2)=WorkerPool::start_with_resources(resources,tokio::runtime::Handle::current()).unwrap();let local2=LocalAdmission::new_with_job_slots(id(1),&key2,sender2.clone(),id(30),slots,job_slots,64).unwrap();let boot=local2.boot();let receiver2=Arc::new(Mutex::new(ReceiverState::distributed(local2)));let owners2=Arc::new(PayloadOwners::from_receiver_with_streams(pool2.clone(),receiver2.clone(),32));let scratch=service.path.join("scratch2");std::fs::create_dir(&scratch).unwrap();let mut process2=owners2.start_boot(&boot,id(30),scratch,SpoolLimits::new(2*1024*1024*1024,220000).unwrap()).unwrap();let receipt=process2.process_ready().await.unwrap();assert!(receiver2.lock().unwrap().fixture_initialize(receipt));
    let w2=Arc::new(Worker{test_job_barrier:Mutex::new(None),test_terminal_replication_barrier:Mutex::new(None),initialization:id(30),ready:ready2,storage:storage.clone(),registry:worker.registry.clone(),cpu:pool2.clone(),control_cpu:pool2.clone(),control_budget:worker.control_budget.clone(),progress_budget:worker.progress_budget.clone(),coordination_slots:slots,signer:Arc::new(http::Signer::worker(id(1),(*sender2).clone(),key2).unwrap()),client:http::HttpClient::new(None).unwrap(),owners:owners2.clone(),receiver:receiver2,pin:[7;32],process:Arc::new(process2),operations:Executor::new(slots,0).unwrap(),partitions:Executor::new(job_slots,0).unwrap(),controls:Executor::new(8,0).unwrap(),sending:Executor::new(job_slots,0).unwrap(),operation_transport:Arc::new(Semaphore::new(slots)),queue:super::super::queue_runtime::QueueRuntime::new(),remote_scheduler:super::super::coordinator::RemoteScheduler::new(),partition_transport:Arc::new(Semaphore::new(job_slots)),control_transport:Arc::new(Semaphore::new(8)),accepting:AtomicBool::new(true)});
    w2.queue.install_fixture_queue(RequestQueue::new(fence.run_id,1,root.revision,QueueLimits{max_pending_requests:64,max_queue_bytes_per_replica:16<<20,max_retained_result_bytes_per_worker:16<<20,result_retention_ms:300000},[id(3),id(6)].into_iter().collect()).unwrap());
-   let mut app=Router::new();for path in ["operations","jobs","dependencies/open","dependencies/close"] {app=app.route(&format!("/internal/v1/{path}"),post(internal));}let app=app.route(super::super::queue_transport::PATH,post(super::super::queue_runtime::handler)).with_state(w2.clone());let server=tokio::spawn(async move {axum::serve(listener2,app).await.unwrap()});second=Some((w2,owners2,threads2,pool2,server));
+   let mut app=Router::new();for path in ["operations","jobs","dependencies/open","dependencies/close"] {app=app.route(&format!("/internal/v1/{path}"),post(internal));}let app=app.route(super::super::queue_transport::PATH,post(super::super::queue_runtime::handler)).with_state(w2.clone());let server=nabedra_rt::task::spawn(async move {axum::serve(listener2,app).await.unwrap()});second=Some((w2,owners2,threads2,pool2,server));
  }
  worker.queue.install_fixture_queue(RequestQueue::new(fence.run_id,1,root.revision,QueueLimits{max_pending_requests:64,max_queue_bytes_per_replica:16<<20,max_retained_result_bytes_per_worker:16<<20,result_retention_ms:300000},root.nodes.iter().map(|n|n.node_id).collect()).unwrap());
- let mut app=Router::new();for path in ["operations","jobs","dependencies/open","dependencies/close"] {app=app.route(&format!("/internal/v1/{path}"),post(internal));}let worker_for_server=worker.clone();let server=tokio::spawn(async move { axum::serve(listener,app.with_state(worker_for_server)).await.unwrap() });
+ let mut app=Router::new();for path in ["operations","jobs","dependencies/open","dependencies/close"] {app=app.route(&format!("/internal/v1/{path}"),post(internal));}let worker_for_server=worker.clone();let server=nabedra_rt::task::spawn(async move { axum::serve(listener,app.with_state(worker_for_server)).await.unwrap() });
  let request_id=id(100);let body=serde_json::to_vec(&json!({"request_id":request_id,"operation":"table.create","payload":{"name":"same","schema":{"id":"int64","value":"utf8"},"key":"id","format":"parquet"}})).unwrap();
  for ctx in [&a,&b] {
   let fresh=Box::pin(worker.open_database(ctx.clone())).await.unwrap();assert!(matches!(fresh.storage().load_cluster_catalog().await,Err(crate::storage::StorageError::NotFound)));drop(fresh);
   Box::pin(worker.queue_command(&root,None,QueueCommand::Submit{body:body.clone(),context:Some(ctx.clone())})).await.unwrap();let key=RequestKey::new(request_id,Some(ctx)).unwrap();let record=worker.queue.record(key.clone()).unwrap();
   let arrived=Arc::new(Semaphore::new(0));let release=Arc::new(Semaphore::new(0));*worker.test_terminal_replication_barrier.lock().unwrap()=Some((arrived.clone(),release.clone()));
-  let w=worker.clone();let r=root.clone();let execution=tokio::spawn(async move {Box::pin(w.run_queued(r,record)).await});arrived.acquire().await.unwrap().forget();
+  let w=worker.clone();let r=root.clone();let execution=nabedra_rt::task::spawn(async move {Box::pin(w.run_queued(r,record)).await});arrived.acquire().await.unwrap().forget();
   assert!(worker.queue.record(key.clone()).unwrap().state.terminal());
   let receipt=Box::pin(worker.queue_command(&root,None,QueueCommand::Lookup{run_id:fence.run_id,request_id,context:Some(ctx.clone())})).await;
   release.add_permits(1);execution.await.unwrap().unwrap();
@@ -147,7 +148,7 @@ async fn shared_worker_case(two_workers: bool) {
  for (ctx,value) in [(&a,"one"),(&b,"two")] {
    let bytes=serde_json::to_vec(&json!({"request_id":id(101),"operation":"table.insert","payload":{"table_id":id(200),"row":{"id":1,"value":value}}})).unwrap();
    Box::pin(worker.queue_command(&root,None,QueueCommand::Submit{body:bytes,context:Some(ctx.clone())})).await.unwrap();let key=RequestKey::new(id(101),Some(ctx)).unwrap();let record=worker.queue.record(key.clone()).unwrap();let w=worker.clone();let r=root.clone();
-   tasks.push(tokio::spawn(async move {Box::pin(w.run_queued(r,record)).await}));
+   tasks.push(nabedra_rt::task::spawn(async move {Box::pin(w.run_queued(r,record)).await}));
  }
  arrived.acquire_many(2).await.unwrap().forget();
  for ctx in [&a,&b] {assert_eq!(worker.queue.record(RequestKey::new(id(101),Some(ctx)).unwrap()).unwrap().state,crate::request_queue::RequestState::Running);}

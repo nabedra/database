@@ -5,9 +5,10 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use nabedra_rt::time::timeout;
 use tokio::{
     sync::{Semaphore, watch},
-    time::{Instant, timeout},
+    time::Instant,
 };
 
 const DATA_LOOKUPS: usize = 2;
@@ -96,7 +97,7 @@ impl PeerResolver {
             .entries
             .lock()
             .map_err(|_| ResolveError::LocallyUnavailable)?;
-        let now = Instant::now();
+        let now = nabedra_rt::time::now();
         if let Some(entry) = entries.iter().find(|entry| {
             entry.identity == identity && entry.endpoint == *endpoint && entry.fresh(now)
         }) {
@@ -138,7 +139,7 @@ impl PeerResolver {
         #[cfg(test)]
         let lookup = self.lookup.clone();
         // Dropping any or all waiters leaves the permit with getaddrinfo.
-        drop(tokio::task::spawn_blocking(move || {
+        drop(nabedra_rt::task::spawn_blocking(move || {
             #[cfg(test)]
             let addresses = if let Some(lookup) = lookup {
                 lookup(endpoint.as_str())
@@ -155,7 +156,7 @@ impl PeerResolver {
             drop(permit);
             let _ = send.send_replace(Some(CachedAddresses {
                 addresses: addresses.into(),
-                expires: Instant::now() + ttl,
+                expires: nabedra_rt::time::now() + ttl,
             }));
         }));
         Ok(result)

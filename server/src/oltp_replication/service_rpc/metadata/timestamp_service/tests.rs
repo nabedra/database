@@ -173,14 +173,14 @@ fn raft_config() -> openraft::Config {
 // TSO/read pin and authenticated Ready queue copies in a local RF1 worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timestamp_release_recovers_durable_reply_while_foreground_snapshot_progresses() {
-    tokio::time::timeout(Duration::from_secs(40), exercise_release_and_snapshot())
+    nabedra_rt::time::timeout(Duration::from_secs(40), exercise_release_and_snapshot())
         .await
         .expect("timestamp release watchdog");
 }
 
 async fn exercise_release_and_snapshot() {
     let directory =
-        Directory(std::env::temp_dir().join(format!("timestamp-release-{}", Uuid::new_v4())));
+        Directory(std::env::temp_dir().join(format!("timestamp-release-{}", nabedra_rt::ids::uuid_v4())));
     let services = LocalServices::open(
         &directory.0,
         "release",
@@ -284,7 +284,7 @@ async fn exercise_release_and_snapshot() {
             ),
         )
         .unwrap();
-    let lost_id = Uuid::new_v4();
+    let lost_id = nabedra_rt::ids::uuid_v4();
     let endpoint = Arc::new(DiscardReleaseReply {
         endpoint: TimestampEndpoint::new(
             handle.clone(),
@@ -321,8 +321,8 @@ async fn exercise_release_and_snapshot() {
         .discarded
         .get()
         .expect("durable proof from the lost reply");
-    let slow = terminal_copy(&services, &client, ready.view, Uuid::new_v4()).await;
-    let fresh = terminal_copy(&services, &client, ready.view, Uuid::new_v4()).await;
+    let slow = terminal_copy(&services, &client, ready.view, nabedra_rt::ids::uuid_v4()).await;
+    let fresh = terminal_copy(&services, &client, ready.view, nabedra_rt::ids::uuid_v4()).await;
     let (reached, resume) = handle.hold_release_proof_for_test(slow.request.request_id);
     let slow_release = client.release(slow.clone());
     tokio::pin!(slow_release);
@@ -340,7 +340,7 @@ async fn exercise_release_and_snapshot() {
             assert_eq!(refused.code, ErrorCode::Overloaded);
             assert_eq!(refused.outcome, Outcome::NotApplied);
             assert_eq!(refused.message, "timestamp terminal release calls already in progress");
-            let (_, _, next_pin) = begin_and_bind(&services, &client, ready.view, Uuid::new_v4()).await;
+            let (_, _, next_pin) = begin_and_bind(&services, &client, ready.view, nabedra_rt::ids::uuid_v4()).await;
             assert_eq!(next_pin.read_ts.get(), fresh.storage_pin.read_ts.get() + 1);
             drop(second_call);
             let refused = client.release(fresh.clone()).await.err().expect("one native proof in progress");
@@ -372,7 +372,7 @@ async fn exercise_release_and_snapshot() {
 
     let blocked = transport.hold_outgoing_for_test(TrafficClass::QueueControl);
     let mut unknown = lost.clone();
-    unknown.pin_identity.nonce = Uuid::new_v4();
+    unknown.pin_identity.nonce = nabedra_rt::ids::uuid_v4();
     let absent = client
         .release(unknown)
         .await
@@ -411,7 +411,7 @@ async fn exercise_release_and_snapshot() {
     let mut next = ready;
     next.view.membership_revision += 1;
     handle
-        .fence_ready(Uuid::new_v4(), ready, next)
+        .fence_ready(nabedra_rt::ids::uuid_v4(), ready, next)
         .await
         .unwrap();
     let stale = client
@@ -444,7 +444,7 @@ fn d01_t9_allocate_direct_admits_the_direct_leader_role() {
     assert!(allocate_direct_permitted(&ServiceAction::Owner));
     assert!(allocate_direct_permitted(
         &ServiceAction::ParticipantProof {
-            source_group: Uuid::new_v4(),
+            source_group: nabedra_rt::ids::uuid_v4(),
         }
     ));
     assert!(!allocate_direct_permitted(&ServiceAction::ApiIngress));
@@ -531,9 +531,9 @@ impl Endpoint for CountingTimestamp {
 /// skips the stalled leader's thin attempt (D05/LIVE1). Values only rise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o09_d06_perf2a_allocate_direct_takes_one_round_trip_on_warm_routes() {
-    tokio::time::timeout(Duration::from_secs(90), async {
+    nabedra_rt::time::timeout(Duration::from_secs(90), async {
         let directory = Directory(
-            std::env::temp_dir().join(format!("timestamp-thin-direct-{}", Uuid::new_v4())),
+            std::env::temp_dir().join(format!("timestamp-thin-direct-{}", nabedra_rt::ids::uuid_v4())),
         );
         let services = LocalServices::open(
             &directory.0,
@@ -632,7 +632,7 @@ async fn o09_d06_perf2a_allocate_direct_takes_one_round_trip_on_warm_routes() {
         assert_eq!(attempts(), 6);
 
         // Past the reuse bound, the warm-route task kept the routes confirmed.
-        tokio::time::sleep(Duration::from_millis(6500)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(6500)).await;
         next(client.allocate_direct(1).await.unwrap());
         assert!(stats(6, 1).refreshes >= 1);
         assert_eq!(attempts(), 7);
@@ -660,7 +660,7 @@ async fn o09_d06_perf2a_allocate_direct_takes_one_round_trip_on_warm_routes() {
         // A paused leader: one bounded thin attempt, then the converging
         // path, all within the 5 s convergence deadline.
         endpoint.hang.store(true, Ordering::SeqCst);
-        let started = std::time::Instant::now();
+        let started = nabedra_rt::time::now_std();
         let error = client.allocate_direct(1).await.unwrap_err();
         let elapsed = started.elapsed();
         assert!(

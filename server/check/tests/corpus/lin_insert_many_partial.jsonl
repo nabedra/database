@@ -1,0 +1,6 @@
+{"type":"invoke","process":0,"f":"insert_many","key":"a","value":[{"id":"a","value":1},{"id":"b","value":2}],"request_id":"r1"}
+{"type":"ok","process":0,"f":"insert_many","key":"a","value":2,"request_id":"r1"}
+{"type":"invoke","process":1,"f":"get","key":"a"}
+{"type":"ok","process":1,"f":"get","key":"a","value":{"id":"a","value":1}}
+{"type":"invoke","process":1,"f":"get","key":"b"}
+{"type":"ok","process":1,"f":"get","key":"b","value":null}

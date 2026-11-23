@@ -4,10 +4,8 @@ use crate::{
     request_queue::QueueLimits,
 };
 use std::sync::atomic::AtomicBool;
-use tokio::{
-    sync::Notify,
-    time::{Duration, timeout},
-};
+use nabedra_rt::time::{Duration, timeout};
+use tokio::sync::Notify;
 
 #[path = "../../../tests/support/tls.rs"]
 mod tls;
@@ -102,14 +100,14 @@ impl ProbeFixture {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        let temp = Temporary(std::env::temp_dir().join(format!("queue-probe-{}", Uuid::new_v4())));
+        let temp = Temporary(std::env::temp_dir().join(format!("queue-probe-{}", nabedra_rt::ids::uuid_v4())));
         std::fs::create_dir(&temp.0).unwrap();
         let [caller_tls, target_tls]: [_; 2] =
             tls::certificates(&temp.0, 2).try_into().ok().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let enrollment = |certificate, endpoint| WorkerEnrollment {
-            worker_id: Uuid::new_v4(),
-            incarnation: Uuid::new_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
             certificate_sha256: Digest::parse(certificate).unwrap(),
             endpoint: Text::try_from(endpoint).unwrap(),
             server_name: Text::try_from("localhost").unwrap(),
@@ -131,7 +129,7 @@ impl ProbeFixture {
         }
         let ready = ReadyMembership {
             view: AuthorityView {
-                run_id: Uuid::new_v4(),
+                run_id: nabedra_rt::ids::uuid_v4(),
                 owner_term: 1,
                 membership_revision: 1,
             },
@@ -139,14 +137,14 @@ impl ProbeFixture {
             ready_count: members.len() as u64,
         };
         let group = GroupIdentity {
-            cluster_id: Uuid::new_v4(),
+            cluster_id: nabedra_rt::ids::uuid_v4(),
             database: Text::try_from("probe").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Control,
             group_format_version: GROUP_FORMAT_VERSION,
         };
         let legacy_group = GroupIdentity {
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             ..group.clone()
         };
         let scope = QueueScope {
@@ -224,7 +222,7 @@ impl ProbeFixture {
             .unwrap(),
         );
         let (stop, shutdown) = tokio::sync::oneshot::channel();
-        let listener = tokio::spawn(transport.run(listener, async {
+        let listener = nabedra_rt::task::spawn(transport.run(listener, async {
             let _ = shutdown.await;
         }));
         Self {
@@ -265,7 +263,7 @@ async fn q03_r05_mtls_probe_reaches_live_peer_with_unavailable_control() {
             fixture.target,
             fixture.scope.clone(),
             fresh.view,
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
         )
         .await;
     assert_eq!(state.unwrap_err().code, ErrorCode::StorageUnavailable);
@@ -278,7 +276,7 @@ async fn q03_r05_mtls_probe_reaches_live_peer_with_unavailable_control() {
         PeerReachability::Reachable
     );
     let other = WorkerIdentity {
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         ..fixture.target
     };
     assert_eq!(
@@ -330,7 +328,7 @@ async fn q03_r05_mtls_probe_detects_stopped_worker_listener() {
 #[tokio::test]
 async fn c07_f03_o23_read_grant_copy_keeps_transport_outcomes_distinct() {
     let fixture = ProbeFixture::new().await;
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let copy = || {
         fixture.caller.copy_read_grants(
             fixture.target,
@@ -403,19 +401,19 @@ async fn o16_r02_r03_queued_get_copy_waits_for_receiver_membership() {
         .unwrap()
     };
     let shared = resources(92);
-    let worker_base = Uuid::new_v4().as_u128() & !0xff;
+    let worker_base = nabedra_rt::ids::uuid_v4().as_u128() & !0xff;
     let worker = |id: u128| WorkerIdentity {
         worker_id: Uuid::from_u128(worker_base + id),
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         certificate_sha256: Digest::from_bytes([id as u8; 32]),
         enrollment_revision: 1,
     };
     let [owner, follower, removed] = [worker(1), worker(2), worker(3)];
     let scope = QueueScope {
-        cluster_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
         database: Text::try_from("default").unwrap(),
     };
-    let run_id = Uuid::new_v4();
+    let run_id = nabedra_rt::ids::uuid_v4();
     let authority = |membership_revision, members: &[WorkerIdentity]| {
         let mut root = ReadySetHasher::default();
         for member in members {
@@ -480,14 +478,14 @@ async fn o16_r02_r03_queued_get_copy_waits_for_receiver_membership() {
     let group = GroupIdentity {
         cluster_id: scope.cluster_id,
         database: scope.database.clone(),
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Control,
         group_format_version: GROUP_FORMAT_VERSION,
     };
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = serde_json::to_vec(&serde_json::json!({
         "request_id": id, "operation": "table.get",
-        "payload": {"table_id": Uuid::new_v4(), "key": 9}
+        "payload": {"table_id": nabedra_rt::ids::uuid_v4(), "key": 9}
     }))
     .unwrap();
     let context = AcceptedContext {
@@ -495,8 +493,8 @@ async fn o16_r02_r03_queued_get_copy_waits_for_receiver_membership() {
             database: scope.database.clone(),
             principal: Digest::from_bytes([2; 32]),
             policy_revision: 1,
-            ingress_id: Uuid::new_v4(),
-            ingress_incarnation: Uuid::new_v4(),
+            ingress_id: nabedra_rt::ids::uuid_v4(),
+            ingress_incarnation: nabedra_rt::ids::uuid_v4(),
             credential_expires_at_ms: None,
         },
         read: Some(QueueReadToken {
@@ -504,10 +502,10 @@ async fn o16_r02_r03_queued_get_copy_waits_for_receiver_membership() {
                 run_id,
                 request_id: id,
                 digest: Digest::from_bytes(Sha256::digest(&body).into()),
-                nonce: Uuid::new_v4(),
+                nonce: nabedra_rt::ids::uuid_v4(),
             },
             storage_pin: StoragePin {
-                pin_id: Uuid::new_v4(),
+                pin_id: nabedra_rt::ids::uuid_v4(),
                 read_ts: Timestamp::new(1).unwrap(),
                 allocator_epoch: 1,
             },
@@ -525,7 +523,7 @@ async fn o16_r02_r03_queued_get_copy_waits_for_receiver_membership() {
             owner,
             group.clone(),
             Purpose::QueueData,
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
         )
     };
     let header = |record| {
@@ -609,13 +607,13 @@ async fn c07_m02_blocked_authority_preflight_and_full_data_arena_leave_receipt_p
     )
     .unwrap();
     let local = WorkerIdentity {
-        worker_id: Uuid::new_v4(),
-        incarnation: Uuid::new_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         certificate_sha256: Digest::from_bytes([1; 32]),
         enrollment_revision: 1,
     };
     let scope = QueueScope {
-        cluster_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
         database: Text::try_from("default").unwrap(),
     };
     let mut root = ReadySetHasher::default();
@@ -623,7 +621,7 @@ async fn c07_m02_blocked_authority_preflight_and_full_data_arena_leave_receipt_p
     let authority = QueueAuthority {
         ready: ReadyMembership {
             view: AuthorityView {
-                run_id: Uuid::new_v4(),
+                run_id: nabedra_rt::ids::uuid_v4(),
                 owner_term: 1,
                 membership_revision: 1,
             },
@@ -646,7 +644,7 @@ async fn c07_m02_blocked_authority_preflight_and_full_data_arena_leave_receipt_p
         },
     )
     .unwrap();
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body =
         format!(r#"{{"request_id":"{id}","operation":"table.list","payload":{{}}}}"#).into_bytes();
     use sha2::{Digest as _, Sha256};
@@ -655,8 +653,8 @@ async fn c07_m02_blocked_authority_preflight_and_full_data_arena_leave_receipt_p
             database: scope.database.clone(),
             principal: Digest::from_bytes([2; 32]),
             policy_revision: 1,
-            ingress_id: Uuid::new_v4(),
-            ingress_incarnation: Uuid::new_v4(),
+            ingress_id: nabedra_rt::ids::uuid_v4(),
+            ingress_incarnation: nabedra_rt::ids::uuid_v4(),
             credential_expires_at_ms: None,
         },
         read: Some(QueueReadToken {
@@ -664,10 +662,10 @@ async fn c07_m02_blocked_authority_preflight_and_full_data_arena_leave_receipt_p
                 run_id: authority.ready.view.run_id,
                 request_id: id,
                 digest: Digest::from_bytes(Sha256::digest(&body).into()),
-                nonce: Uuid::new_v4(),
+                nonce: nabedra_rt::ids::uuid_v4(),
             },
             storage_pin: StoragePin {
-                pin_id: Uuid::new_v4(),
+                pin_id: nabedra_rt::ids::uuid_v4(),
                 read_ts: Timestamp::new(1).unwrap(),
                 allocator_epoch: 1,
             },
@@ -705,7 +703,7 @@ async fn c07_m02_blocked_authority_preflight_and_full_data_arena_leave_receipt_p
     let group = GroupIdentity {
         cluster_id: scope.cluster_id,
         database: scope.database.clone(),
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Control,
         group_format_version: GROUP_FORMAT_VERSION,
     };
@@ -714,11 +712,11 @@ async fn c07_m02_blocked_authority_preflight_and_full_data_arena_leave_receipt_p
         local,
         group.clone(),
         Purpose::QueueData,
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
     );
     let waiting = {
         let endpoint = endpoint.clone();
-        tokio::spawn(async move { endpoint.preflight(&session, &install_header).await })
+        nabedra_rt::task::spawn(async move { endpoint.preflight(&session, &install_header).await })
     };
     timeout(Duration::from_secs(2), authority_source.entered.notified())
         .await
@@ -746,7 +744,7 @@ async fn c07_m02_blocked_authority_preflight_and_full_data_arena_leave_receipt_p
         local,
         group.clone(),
         Purpose::QueueControl,
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
     );
     let plan = timeout(
         Duration::from_secs(2),
@@ -777,7 +775,7 @@ async fn c07_m02_blocked_authority_preflight_and_full_data_arena_leave_receipt_p
     // The protected lane cannot be used to smuggle an install payload.
     let forbidden = serde_json::to_vec(&request).unwrap();
     let control =
-        AuthenticatedSession::for_test(local, local, group, Purpose::QueueControl, Uuid::new_v4());
+        AuthenticatedSession::for_test(local, local, group, Purpose::QueueControl, nabedra_rt::ids::uuid_v4());
     assert!(endpoint.preflight(&control, &forbidden).await.is_err());
     authority_source.release.notify_one();
     timeout(Duration::from_secs(2), waiting)

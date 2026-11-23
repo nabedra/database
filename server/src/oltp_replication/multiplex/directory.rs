@@ -167,7 +167,7 @@ impl AppliedPeerDirectory {
         self.reserve_revocations(MAX_VIEW_REVOCATIONS)?;
         let revoked = source.revocations().await?;
         self.learn_revocations(revoked)?;
-        let now = Instant::now();
+        let now = nabedra_rt::time::now_std();
         if let Err(view) = self.remote.set(RemoteRevocations {
             refreshed: Mutex::new(now),
             stale: AtomicBool::new(false),
@@ -187,7 +187,7 @@ impl AppliedPeerDirectory {
         source: Arc<dyn RevocationSource>,
         mut stop: tokio::sync::watch::Receiver<bool>,
     ) {
-        let mut interval = tokio::time::interval(REVOCATION_REFRESH);
+        let mut interval = nabedra_rt::time::interval(REVOCATION_REFRESH);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await;
         loop {
@@ -198,7 +198,7 @@ impl AppliedPeerDirectory {
                 changed = stop.changed() => if changed.is_err() || *stop.borrow() { return },
                 _ = interval.tick() => {}
             }
-            let read = tokio::time::timeout(REVOCATION_READ_TIMEOUT, source.revocations());
+            let read = nabedra_rt::time::timeout(REVOCATION_READ_TIMEOUT, source.revocations());
             let result = tokio::select! {
                 changed = stop.changed() => {
                     if changed.is_err() || *stop.borrow() { return }
@@ -218,7 +218,7 @@ impl AppliedPeerDirectory {
         match result {
             Ok(learned) => {
                 perf_stage!("peer.revocations.refresh").record(Duration::ZERO);
-                self.mark_refreshed(Instant::now());
+                self.mark_refreshed(nabedra_rt::time::now_std());
                 if learned > 0 {
                     tracing::info!(learned, "Data-only revocation view learned revocations");
                 }
@@ -653,7 +653,7 @@ impl AppliedPeerDirectory {
         control: Arc<ControlClient>,
         mut stop: tokio::sync::watch::Receiver<bool>,
     ) {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut interval = nabedra_rt::time::interval(std::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             if *stop.borrow() {
@@ -951,8 +951,8 @@ mod tests {
     };
     fn enrollment() -> WorkerEnrollment {
         WorkerEnrollment {
-            worker_id: Uuid::new_v4(),
-            incarnation: Uuid::new_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
             certificate_sha256: Digest::from_bytes([3; 32]),
             endpoint: Text::try_from("127.0.0.1:1234").unwrap(),
             server_name: Text::try_from("localhost").unwrap(),
@@ -969,9 +969,9 @@ mod tests {
         )
         .unwrap();
         let control = GroupIdentity {
-            cluster_id: Uuid::new_v4(),
+            cluster_id: nabedra_rt::ids::uuid_v4(),
             database: Text::try_from("tenant").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Control,
             group_format_version: 1,
         };
@@ -983,7 +983,7 @@ mod tests {
         )
         .unwrap();
         let next = WorkerEnrollment {
-            incarnation: Uuid::new_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
             enrollment_revision: 2,
             ..old.clone()
         };
@@ -1016,10 +1016,10 @@ mod tests {
             Err(invalid())
         );
         let data = GroupIdentity {
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Data {
-                table_id: Uuid::new_v4(),
-                shard_id: Uuid::new_v4(),
+                table_id: nabedra_rt::ids::uuid_v4(),
+                shard_id: nabedra_rt::ids::uuid_v4(),
             },
             ..control
         };
@@ -1038,9 +1038,9 @@ mod tests {
         .unwrap();
         let baseline = shared.control_bytes_used();
         let control = GroupIdentity {
-            cluster_id: Uuid::new_v4(),
+            cluster_id: nabedra_rt::ids::uuid_v4(),
             database: Text::try_from("tenant").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Control,
             group_format_version: 1,
         };
@@ -1063,10 +1063,10 @@ mod tests {
         );
         let mut data = control.clone();
         data.kind = GroupKind::Data {
-            table_id: Uuid::new_v4(),
-            shard_id: Uuid::new_v4(),
+            table_id: nabedra_rt::ids::uuid_v4(),
+            shard_id: nabedra_rt::ids::uuid_v4(),
         };
-        data.group_id = Uuid::new_v4();
+        data.group_id = nabedra_rt::ids::uuid_v4();
         assert!(directory.verify(identity, &data, Purpose::Raft).is_err());
         // This unit checks the cache's defense in depth. Production upgrades
         // come only from refresh's actual Control ReadIndex inventory pages.
@@ -1136,7 +1136,7 @@ mod tests {
                 .is_err()
         );
         assert!(directory.install(api.clone(), Role::Worker, 2).is_err());
-        api.incarnation = Uuid::new_v4();
+        api.incarnation = nabedra_rt::ids::uuid_v4();
         api.enrollment_revision = 2;
         api.certificate_sha256 = Digest::from_bytes([4; 32]);
         directory

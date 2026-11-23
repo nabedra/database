@@ -1,5 +1,6 @@
 //! Regressions for the RV-KV2 store review (findings 1 to 6). Each test reproduced its
 //! finding on `a0bc004`; the assertions encode the correct behavior.
+#![allow(clippy::disallowed_methods)] // integration tests are outside the phase 7 conversion, which covers kv/src
 
 mod common;
 

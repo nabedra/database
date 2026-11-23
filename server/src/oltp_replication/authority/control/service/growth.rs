@@ -287,7 +287,7 @@ impl ControlHandle {
             {
                 record.last_attempt.ok_or_else(unauthorized)?
             }
-            _ => std::time::SystemTime::now()
+            _ => nabedra_rt::time::wall_now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| unauthorized())?
                 .as_secs(),

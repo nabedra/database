@@ -73,7 +73,7 @@ mod reservations;
 struct Dir(PathBuf);
 impl Dir {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("t5-direct-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("t5-direct-{}", nabedra_rt::ids::uuid_v4()));
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }
@@ -229,15 +229,15 @@ impl Cluster {
         crate::oltp_runtime::direct::trace_for_test();
         let dir = Dir::new();
         let certificates = tls::certificates(&dir.0, 3);
-        let cluster_id = Uuid::new_v4();
-        let table = Uuid::new_v4();
+        let cluster_id = nabedra_rt::ids::uuid_v4();
+        let table = nabedra_rt::ids::uuid_v4();
         let group = GroupIdentity {
             cluster_id,
             database: Text::try_from("t5").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Data {
                 table_id: table,
-                shard_id: Uuid::new_v4(),
+                shard_id: nabedra_rt::ids::uuid_v4(),
             },
             group_format_version: 1,
         };
@@ -246,8 +246,8 @@ impl Cluster {
         for tls in &certificates {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             workers.push(WorkerEnrollment {
-                worker_id: Uuid::new_v4(),
-                incarnation: Uuid::new_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                incarnation: nabedra_rt::ids::uuid_v4(),
                 certificate_sha256: Digest::parse(tls.certificate_sha256()).unwrap(),
                 enrollment_revision: 1,
                 endpoint: Text::new(listener.local_addr().unwrap().to_string()).unwrap(),
@@ -265,7 +265,7 @@ impl Cluster {
                     ReplicaMember {
                         node_id: node,
                         worker_id: worker.worker_id,
-                        pool_id: Uuid::new_v4(),
+                        pool_id: nabedra_rt::ids::uuid_v4(),
                     },
                 )
             })
@@ -282,7 +282,7 @@ impl Cluster {
             AtomicBool::new(options.batch),
         ));
         let schema = Arc::new(StaticSchema::default());
-        let index = Uuid::new_v4();
+        let index = nabedra_rt::ids::uuid_v4();
         schema.insert(DirectTable {
             descriptor: descriptor(table),
             schema_epoch: 1,
@@ -372,7 +372,7 @@ impl Cluster {
                 resident.bind(purpose, endpoint.clone()).unwrap();
             }
             let (stop, stopped) = oneshot::channel();
-            let task = tokio::spawn(transport.run(listener, async {
+            let task = nabedra_rt::task::spawn(transport.run(listener, async {
                 let _ = stopped.await;
             }));
             let dyn_consensus: Arc<dyn Consensus<ParticipantCommand, ParticipantReply>> =
@@ -409,7 +409,7 @@ impl Cluster {
             table,
             index,
             authority: Authority {
-                run_id: Uuid::new_v4(),
+                run_id: nabedra_rt::ids::uuid_v4(),
                 owner_term: 1,
             },
             gate,
@@ -418,7 +418,7 @@ impl Cluster {
         };
         // The first proposals after an election can fail while the new
         // leader settles; the same transition is idempotent, so retry it.
-        let (transition, catalog) = (Uuid::new_v4(), Uuid::new_v4());
+        let (transition, catalog) = (nabedra_rt::ids::uuid_v4(), nabedra_rt::ids::uuid_v4());
         watchdog(|| async {
             let leader = cluster.leader().await;
             cluster.voters[leader]
@@ -538,7 +538,7 @@ impl Cluster {
         operation: &str,
         payload: serde_json::Value,
     ) -> DirectResponse {
-        self.run(voter, Uuid::new_v4(), operation, payload).await
+        self.run(voter, nabedra_rt::ids::uuid_v4(), operation, payload).await
     }
     fn row_key(&self, id: i64) -> MvccKey {
         MvccKey::Row {
@@ -638,12 +638,12 @@ impl Cluster {
 }
 
 async fn watchdog<T, F: Future<Output = Option<T>>>(mut probe: impl FnMut() -> F) -> T {
-    tokio::time::timeout(Duration::from_secs(60), async {
+    nabedra_rt::time::timeout(Duration::from_secs(60), async {
         loop {
             if let Some(value) = probe().await {
                 return value;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -766,9 +766,9 @@ async fn o03_d01_point_operations_commit_one_entry_each_and_match_queued_results
     ];
     for (operation, payload, expected, wrote) in cases {
         let before = cluster.last_index(leader);
-        let started = std::time::Instant::now();
+        let started = nabedra_rt::time::now_std();
         let response = cluster.op(leader, operation, payload).await;
-        timings.push((operation, started.elapsed()));
+        timings.push((operation, nabedra_rt::time::now_std().saturating_duration_since(started)));
         assert_eq!(response, done(expected), "{operation}");
         entry(before, cluster.last_index(leader), wrote);
         writes += u64::from(wrote);
@@ -858,7 +858,7 @@ async fn o03_d01_point_operations_commit_one_entry_each_and_match_queued_results
 async fn d03_retries_replay_and_reused_ids_conflict_on_the_same_key() {
     let cluster = Cluster::new(Options::default()).await;
     let leader = cluster.leader().await;
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let row = serde_json::json!({"row": {"id": 5, "value": 50, "tag": "a", "score": 0.0}});
     assert_eq!(
         cluster.run(leader, id, "table.insert", row.clone()).await,
@@ -907,7 +907,7 @@ async fn d03_retries_replay_and_reused_ids_conflict_on_the_same_key() {
 async fn d02_retry_after_a_lost_caller_returns_the_original_result() {
     let cluster = Arc::new(Cluster::new(Options::default()).await);
     let leader = cluster.leader().await;
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = cluster.body(
         id,
         "table.insert",
@@ -916,7 +916,7 @@ async fn d02_retry_after_a_lost_caller_returns_the_original_result() {
     let request = cluster.request(leader, &body, id);
     let first = {
         let cluster = cluster.clone();
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             cluster.voters[leader]
                 .executor
                 .execute(&cluster.voters[leader].handle, request)
@@ -971,7 +971,7 @@ async fn o08_concurrent_same_key_mutations_admit_a_serial_order() {
     let mut tasks = Vec::new();
     for task in 0..8 {
         let cluster = cluster.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(nabedra_rt::task::spawn(async move {
             cluster
                 .op(
                     leader,
@@ -995,7 +995,7 @@ async fn o08_concurrent_same_key_mutations_admit_a_serial_order() {
     let mut tasks = Vec::new();
     for task in 0..16i64 {
         let cluster = cluster.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(nabedra_rt::task::spawn(async move {
             cluster
                 .op(
                     leader,
@@ -1063,7 +1063,7 @@ async fn d12_o13_load_beyond_the_in_flight_budget_is_refused_typed_before_execut
     let mut tasks = Vec::new();
     for id in 0..64i64 {
         let cluster = cluster.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(nabedra_rt::task::spawn(async move {
             let response = cluster
                 .op(
                     leader,
@@ -1148,7 +1148,7 @@ async fn o03_stale_routes_inactive_gate_and_bad_bindings_write_nothing() {
     .await;
     let leader = cluster.leader().await;
     let before = cluster.last_index(leader);
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = cluster.body(
         id,
         "table.insert",
@@ -1227,7 +1227,7 @@ async fn o03_stale_routes_inactive_gate_and_bad_bindings_write_nothing() {
         Some((ErrorCode::ValidationError, Outcome::NotApplied))
     );
     let mut foreign = cluster.request(leader, &body, id);
-    foreign.group = Uuid::new_v4();
+    foreign.group = nabedra_rt::ids::uuid_v4();
     let foreign = cluster.voters[leader]
         .executor
         .execute(&cluster.voters[leader].handle, foreign)
@@ -1260,7 +1260,7 @@ async fn d03_forward_markers_settle_request_ids_before_the_queued_path() {
     let cluster = Cluster::new(Options::default()).await;
     let leader = cluster.leader().await;
     let v = &cluster.voters[leader];
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = cluster.body(
         id,
         "table.insert",
@@ -1293,7 +1293,7 @@ async fn d03_forward_markers_settle_request_ids_before_the_queued_path() {
         (None, None),
         "never applied directly"
     );
-    let committed = Uuid::new_v4();
+    let committed = nabedra_rt::ids::uuid_v4();
     let update = cluster.body(
         committed,
         "table.upsert",
@@ -1343,7 +1343,7 @@ async fn o15_d03_t7c_history_window_leaves_unknown_ids_to_the_queued_path() {
     let v = &cluster.voters[leader];
     // Committed directly before the window opens on this leader (a leader
     // whose clock passed the window's end, then one whose clock did not).
-    let committed = Uuid::new_v4();
+    let committed = nabedra_rt::ids::uuid_v4();
     let upsert = cluster.body(
         committed,
         "table.upsert",
@@ -1361,7 +1361,7 @@ async fn o15_d03_t7c_history_window_leaves_unknown_ids_to_the_queued_path() {
     let history = DirectResponse::Fallback {
         reason: FallbackReason::History,
     };
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let insert = cluster.body(
         id,
         "table.insert",
@@ -1373,7 +1373,7 @@ async fn o15_d03_t7c_history_window_leaves_unknown_ids_to_the_queued_path() {
             .await,
         history
     );
-    let update = Uuid::new_v4();
+    let update = nabedra_rt::ids::uuid_v4();
     let update_body = cluster.body(
         update,
         "table.update",
@@ -1404,7 +1404,7 @@ async fn o15_d03_t7c_history_window_leaves_unknown_ids_to_the_queued_path() {
     );
     // RV-FINAL M3: a get is a read, also inside the window. A retried
     // pre-boundary get is a new read; nothing is proposed.
-    let get = Uuid::new_v4();
+    let get = nabedra_rt::ids::uuid_v4();
     let get_body = cluster.body(get, "table.get", serde_json::json!({"key": 4}));
     assert_eq!(
         v.executor
@@ -1474,7 +1474,7 @@ async fn o15_d03_t7c_history_window_leaves_unknown_ids_to_the_queued_path() {
     );
     // A queued read leaves nothing at its key: the same id read directly
     // later is a new read (RV-FINAL M3), and no entry is proposed for it.
-    let read = Uuid::new_v4();
+    let read = nabedra_rt::ids::uuid_v4();
     let read_body = cluster.body(read, "table.get", serde_json::json!({"key": 4}));
     let entries = v.executor.stats().entries_proposed;
     assert_eq!(
@@ -1537,7 +1537,7 @@ async fn d03_expiry_deletes_old_dedup_records_on_every_replica() {
             )
             .await;
     }
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(20)).await;
     // A newer commit raises the group's high-water past the old records.
     cluster
         .op(
@@ -1602,20 +1602,20 @@ async fn d05_one_stopped_follower_keeps_writes_and_two_stop_every_success() {
     }
     let before = cluster.latest(leader, cluster.row_key(1)).await;
     cluster.stop(followers[1]).await;
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = cluster.body(
         id,
         "table.update",
         serde_json::json!({"key": 1, "values": {"value": 99}}),
     );
     let request = cluster.request_at(leader, &body, id, 1, Duration::from_millis(1500));
-    let started = std::time::Instant::now();
+    let started = nabedra_rt::time::now_std();
     let response = cluster.voters[leader]
         .executor
         .execute(&cluster.voters[leader].handle, request)
         .await;
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        nabedra_rt::time::now_std().saturating_duration_since(started) < Duration::from_secs(5),
         "bounded by the deadline"
     );
     assert!(
@@ -1656,7 +1656,7 @@ async fn d04_leader_loss_before_and_after_quorum_retries_complete_on_the_new_lea
     .await;
     let old = cluster.leader().await;
     // After quorum: acknowledged, then the leader dies.
-    let acked = Uuid::new_v4();
+    let acked = nabedra_rt::ids::uuid_v4();
     let acked_body = cluster.body(
         acked,
         "table.insert",
@@ -1670,7 +1670,7 @@ async fn d04_leader_loss_before_and_after_quorum_retries_complete_on_the_new_lea
         done("null")
     );
     // In flight: proposed, then the leader dies before its reply.
-    let inflight = Uuid::new_v4();
+    let inflight = nabedra_rt::ids::uuid_v4();
     let inflight_body = cluster.body(
         inflight,
         "table.insert",
@@ -1679,7 +1679,7 @@ async fn d04_leader_loss_before_and_after_quorum_retries_complete_on_the_new_lea
     let request = cluster.request(old, &inflight_body, inflight);
     let executor = cluster.voters[old].executor.clone();
     let handle = cluster.voters[old].handle.clone();
-    let pending = tokio::spawn(async move { executor.execute(&handle, request).await });
+    let pending = nabedra_rt::task::spawn(async move { executor.execute(&handle, request).await });
     watchdog(|| async {
         (cluster.voters[old].executor.stats().entries_proposed >= 2).then_some(())
     })
@@ -1753,14 +1753,14 @@ async fn d07_o16_rv_final_h1_restarted_core_serves_direct_commits_again() {
     // The next applied entry stops the core. Its outcome is not asserted.
     let executor = v.executor.clone();
     let handle = v.handle.clone();
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = cluster.body(
         id,
         "table.update",
         serde_json::json!({"key": 1, "values": {"value": 2}}),
     );
     let request = cluster.request_at(leader, &body, id, 1, Duration::from_secs(3));
-    let pending = tokio::spawn(async move { executor.execute(&handle, request).await });
+    let pending = nabedra_rt::task::spawn(async move { executor.execute(&handle, request).await });
     watchdog(|| async { (!v.consensus.raft.is_running()).then_some(()) }).await;
     watchdog(|| async { (!clock.serving()).then_some(()) }).await;
     // What the supervisor does after its backoff.
@@ -1848,7 +1848,7 @@ async fn d04_o10_bug1_leader_shutdown_after_apply_preserves_proposal_uncertainty
             clock: cluster.clock(leader),
         }),
     ));
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let insert = cluster.body(
         id,
         "table.insert",
@@ -1863,7 +1863,7 @@ async fn d04_o10_bug1_leader_shutdown_after_apply_preserves_proposal_uncertainty
     let (version, row) = cluster.latest(leader, cluster.row_key(7)).await;
     assert!(version.is_some());
     assert!(row.is_some());
-    tokio::time::timeout(Duration::from_secs(20), cluster.stop(leader))
+    nabedra_rt::time::timeout(Duration::from_secs(20), cluster.stop(leader))
         .await
         .expect("old leader shutdown watchdog");
     let next = cluster.leader().await;
@@ -1935,7 +1935,7 @@ async fn f01_u01_rv_final_m1_full_leader_answers_not_applied_at_once() {
         .retry()
         .force_no_space
         .store(true, Ordering::Release);
-    let started = std::time::Instant::now();
+    let started = nabedra_rt::time::now_std();
     let response = cluster
         .op(
             leader,
@@ -1943,7 +1943,7 @@ async fn f01_u01_rv_final_m1_full_leader_answers_not_applied_at_once() {
             serde_json::json!({"key": 1, "values": {"value": 2}}),
         )
         .await;
-    let elapsed = started.elapsed();
+    let elapsed = nabedra_rt::time::now_std().saturating_duration_since(started);
     let DirectResponse::Failed(error) = &response else {
         panic!("{response:?}");
     };
@@ -1988,15 +1988,15 @@ async fn c07_f03_rv_final_l3_catalog_reads_end_at_the_request_deadline() {
     let proposed = v.executor.stats().entries_proposed;
     cluster.schema.stall_table_reads(true);
     for forward in [false, true] {
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let body = cluster.body(
             id,
             "table.upsert",
             serde_json::json!({"row": {"id": 1, "value": 1, "tag": "a", "score": 0.0}}),
         );
         let request = cluster.request_at(leader, &body, id, 1, Duration::from_millis(500));
-        let started = std::time::Instant::now();
-        let response = tokio::time::timeout(Duration::from_secs(5), async {
+        let started = nabedra_rt::time::now_std();
+        let response = nabedra_rt::time::timeout(Duration::from_secs(5), async {
             if forward {
                 v.executor.forward(&v.handle, request).await
             } else {
@@ -2010,7 +2010,7 @@ async fn c07_f03_rv_final_l3_catalog_reads_end_at_the_request_deadline() {
             Some((ErrorCode::StorageUnavailable, Outcome::NotApplied)),
             "forward={forward}: {response:?}"
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(nabedra_rt::time::now_std().saturating_duration_since(started) < Duration::from_secs(2));
     }
     cluster.schema.stall_table_reads(false);
     assert_eq!(
@@ -2040,7 +2040,7 @@ async fn d06_get_waits_for_a_pending_commit_on_its_key_only() {
     clock
         .register_pending(token, pending, vec![cluster.row_key(1)])
         .unwrap();
-    let other = tokio::time::timeout(
+    let other = nabedra_rt::time::timeout(
         Duration::from_secs(2),
         cluster.op(leader, "table.get", serde_json::json!({"key": 2})),
     )
@@ -2049,13 +2049,13 @@ async fn d06_get_waits_for_a_pending_commit_on_its_key_only() {
     assert_eq!(other, done("null"));
     let waiting = {
         let cluster = cluster.clone();
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             cluster
                 .op(leader, "table.get", serde_json::json!({"key": 1}))
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(100)).await;
     assert!(
         !waiting.is_finished(),
         "the get waits for the pending commit on its key"
@@ -2070,14 +2070,14 @@ async fn d06_get_waits_for_a_pending_commit_on_its_key_only() {
 
 #[test]
 fn o02_received_request_takes_its_group_and_database_from_the_session() {
-    let table = Uuid::new_v4();
+    let table = nabedra_rt::ids::uuid_v4();
     let group = GroupIdentity {
-        cluster_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
         database: Text::try_from("db").unwrap(),
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Data {
             table_id: table,
-            shard_id: Uuid::new_v4(),
+            shard_id: nabedra_rt::ids::uuid_v4(),
         },
         group_format_version: 1,
     };
@@ -2087,7 +2087,7 @@ fn o02_received_request_takes_its_group_and_database_from_the_session() {
         table_id: table,
         schema_epoch: 1,
         routing_epoch: 1,
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         digest: Digest::from_bytes([1; 32]),
         deadline_ms: u32::MAX,
     };
@@ -2101,7 +2101,7 @@ fn o02_received_request_takes_its_group_and_database_from_the_session() {
     );
     assert_eq!(request.header().request_id, header.request_id);
     let wrong_table = crate::oltp_replication::service_rpc::direct::DirectHeader {
-        table_id: Uuid::new_v4(),
+        table_id: nabedra_rt::ids::uuid_v4(),
         ..header
     };
     assert!(DirectRequest::received(&group, wrong_table, body.clone()).is_err());
@@ -2147,7 +2147,7 @@ async fn o12_d11_ddl_fences_stop_direct_writers_until_the_descriptor_is_publishe
         "the first request activated the group at the table's lifecycle"
     );
     // The DDL coordinator fences before the Catalog publishes `published`.
-    let published = Uuid::new_v4();
+    let published = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         handle
             .change_direct_schema(DirectSchemaChange::Fence {
@@ -2238,19 +2238,19 @@ async fn o12_d11_t7b_activation_waits_for_a_ddl_that_read_the_capability_inactiv
     );
     assert_eq!(cluster.last_index(leader), before, "nothing proposed");
     // A forward waits for the guard: its marker needs an active group.
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = cluster.body(id, "table.insert", row(2));
     let forward = {
         let executor = v.executor.clone();
         let handle = v.handle.clone();
         let request = cluster.request(leader, &body, id);
-        tokio::spawn(async move { executor.forward(&handle, request).await })
+        nabedra_rt::task::spawn(async move { executor.forward(&handle, request).await })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(300)).await;
     assert!(!forward.is_finished(), "the forward waits for the DDL");
     assert_eq!(v.handle.direct_schema().await.unwrap(), None);
     // The DDL publishes a new lifecycle with an index, then releases.
-    let published = Uuid::new_v4();
+    let published = nabedra_rt::ids::uuid_v4();
     cluster.schema.insert(DirectTable {
         descriptor: descriptor(cluster.table),
         schema_epoch: 1,
@@ -2330,16 +2330,16 @@ async fn d04_t7b_activation_failures_are_retried_inside_the_executor() {
     for follower in (0..3).filter(|v| *v != leader).collect::<Vec<_>>() {
         cluster.stop(follower).await;
     }
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = cluster.body(id, "table.insert", row(2));
     let request = cluster.request_at(leader, &body, id, 1, Duration::from_millis(1500));
-    let started = std::time::Instant::now();
+    let started = nabedra_rt::time::now_std();
     let answer = cluster.voters[leader]
         .executor
         .execute(&cluster.voters[leader].handle, request)
         .await;
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        nabedra_rt::time::now_std().saturating_duration_since(started) < Duration::from_secs(5),
         "bounded by the deadline"
     );
     assert_eq!(
@@ -2380,7 +2380,7 @@ async fn d03_t7b_a_new_leader_expires_records_on_ranges_it_never_served() {
             done("null")
         );
     }
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(
         cluster
             .op(
@@ -2401,7 +2401,7 @@ async fn d03_t7b_a_new_leader_expires_records_on_ranges_it_never_served() {
             .trigger()
             .elect(false)
             .await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(200)).await;
         let leader = cluster.leader().await;
         (leader != old).then_some(leader)
     })
@@ -2452,7 +2452,7 @@ impl DirectTimestampSource for Steered {
         Box::pin(async move {
             let mut guard = Unanswered(&self.abandoned, false);
             while self.hold.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                nabedra_rt::time::sleep(Duration::from_millis(5)).await;
             }
             guard.1 = true;
             let first = if self.stale.swap(false, Ordering::SeqCst) {
@@ -2598,7 +2598,7 @@ async fn o09_perf2b_the_commit_timestamp_is_fetched_during_the_reads() {
     source.hold.store(true, Ordering::SeqCst);
     let calls = source.calls.load(Ordering::SeqCst);
     let before = cluster.last_index(leader);
-    let missing = tokio::time::timeout(
+    let missing = nabedra_rt::time::timeout(
         Duration::from_secs(5),
         cluster.op(
             leader,
@@ -2685,7 +2685,7 @@ async fn o06_d05_rd1_a_leader_without_a_quorum_serves_no_read() {
     cluster.stop(followers[0]).await;
     cluster.stop(followers[1]).await;
     // Past the lease (election_timeout_max, 3 s in this fixture).
-    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(3_500)).await;
     let reads = [
         ("table.get", serde_json::json!({"key": 1})),
         (
@@ -2695,16 +2695,16 @@ async fn o06_d05_rd1_a_leader_without_a_quorum_serves_no_read() {
         ("table.insert", row),
     ];
     for (operation, payload) in reads {
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let body = cluster.body(id, operation, payload);
         let request = cluster.request_at(leader, &body, id, 1, Duration::from_millis(1500));
-        let started = std::time::Instant::now();
+        let started = nabedra_rt::time::now_std();
         let response = cluster.voters[leader]
             .executor
             .execute(&cluster.voters[leader].handle, request)
             .await;
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            nabedra_rt::time::now_std().saturating_duration_since(started) < Duration::from_secs(5),
             "{operation}: bounded by the deadline"
         );
         assert!(
@@ -2719,7 +2719,7 @@ async fn o06_d05_rd1_a_leader_without_a_quorum_serves_no_read() {
     }
     assert!(
         !matches!(
-            tokio::time::timeout(Duration::from_secs(5), consensus.lease_read_position()).await,
+            nabedra_rt::time::timeout(Duration::from_secs(5), consensus.lease_read_position()).await,
             Ok(Ok(_))
         ),
         "no lease position without a quorum"
@@ -2753,7 +2753,7 @@ async fn o12_d11_rd1_a_fence_after_the_descriptor_lookup_restarts_the_mutation()
     );
     assert_eq!(executor.stats().pre_latch_epoch_reads, 1);
     // The DDL coordinator fences before the Catalog publishes `published`.
-    let published = Uuid::new_v4();
+    let published = nabedra_rt::ids::uuid_v4();
     handle
         .change_direct_schema(DirectSchemaChange::Fence {
             lifecycle: Some(published),
@@ -2774,7 +2774,7 @@ async fn o12_d11_rd1_a_fence_after_the_descriptor_lookup_restarts_the_mutation()
     let stats = executor.stats();
     assert_eq!(stats.retries["schema"], 1, "{stats:?}");
     // The Catalog publishes a descriptor with a second index, on `tag`.
-    let by_tag = Uuid::new_v4();
+    let by_tag = nabedra_rt::ids::uuid_v4();
     cluster.schema.insert(DirectTable {
         descriptor: descriptor(cluster.table),
         schema_epoch: 1,

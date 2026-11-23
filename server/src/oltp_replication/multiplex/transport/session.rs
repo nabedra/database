@@ -194,12 +194,12 @@ impl Progress {
         Self {
             seen: bytes.load(Ordering::Relaxed),
             bytes,
-            at: Instant::now(),
+            at: nabedra_rt::time::now(),
         }
     }
     /// Time since the counter last moved, sampled now.
     fn silence(&mut self) -> Duration {
-        let now = Instant::now();
+        let now = nabedra_rt::time::now();
         let bytes = self.bytes.load(Ordering::Relaxed);
         if bytes != self.seen {
             self.seen = bytes;
@@ -389,7 +389,7 @@ async fn write_frames(
             }
         }
         drop(frame.release.take());
-        let started = Instant::now();
+        let started = nabedra_rt::time::now();
         if let Some(timing) = &frame.timing {
             timing.queue.record(started - timing.queued);
         }
@@ -405,7 +405,7 @@ async fn write_frames(
         }
         if let Some(ack) = frame.ack {
             let _ = ack.send(if written {
-                WriteOutcome::Written(Instant::now())
+                WriteOutcome::Written(nabedra_rt::time::now())
             } else {
                 WriteOutcome::Failed
             });
@@ -528,14 +528,14 @@ impl ClientSession {
         let hold = Some(common.hold_writes.subscribe());
         #[cfg(not(test))]
         let hold = None;
-        tokio::spawn({
+        nabedra_rt::task::spawn({
             let session = session.clone();
             async move {
                 write_frames(write, queue, Some(stop), hold, deadline).await;
                 session.close();
             }
         });
-        let reader = tokio::spawn(read_replies(
+        let reader = nabedra_rt::task::spawn(read_replies(
             session.clone(),
             Counted {
                 inner: read,
@@ -546,7 +546,7 @@ impl ClientSession {
             common.shared.clone(),
         ));
         *lock(&session.reader) = Some(reader.abort_handle());
-        tokio::spawn(session.clone().supervise(
+        nabedra_rt::task::spawn(session.clone().supervise(
             reader,
             common.directory.clone(),
             common.config.ping_idle,
@@ -567,7 +567,7 @@ impl ClientSession {
         ping_timeout: Duration,
     ) {
         let mut stop = self.closed.subscribe();
-        let mut check = tokio::time::interval(
+        let mut check = nabedra_rt::time::interval(
             DIRECTORY_CHECK
                 .min(ping_timeout / 2)
                 .max(Duration::from_millis(10)),
@@ -591,7 +591,7 @@ impl ClientSession {
                     if !matches!(outcome, Ok(WriteOutcome::Written(_))) {
                         break;
                     }
-                    written = Some((Instant::now(), self.received.load(Ordering::Relaxed)));
+                    written = Some((nabedra_rt::time::now(), self.received.load(Ordering::Relaxed)));
                 }
                 _ = check.tick() => {
                     if !enrolled(&*directory, self.identity) {
@@ -701,7 +701,7 @@ impl ClientSession {
         }
         let (ack, written) = oneshot::channel();
         *phase = RaftTransportPhase::SendRequest;
-        let called = Instant::now();
+        let called = nabedra_rt::time::now();
         let frame = Outbound {
             head,
             parts,
@@ -731,7 +731,7 @@ impl ClientSession {
             *phase = RaftTransportPhase::ReceiveReply;
             guard.settled = true;
             if let Ok(reply) = &result {
-                let now = Instant::now();
+                let now = nabedra_rt::time::now();
                 C_WAKE.get(self.class).record(now - reply.read);
                 C_CALL.get(self.class).record(now - called);
                 if let Some((written, _)) = guard.written.as_mut()
@@ -849,7 +849,7 @@ async fn read_replies(
         if stream.read_exact(&mut head).await.is_err() {
             return;
         }
-        let received = Instant::now();
+        let received = nabedra_rt::time::now();
         let frame = StreamFrame::decode(head);
         let waiter = session.waiter(frame.stream_id);
         match frame.flags {
@@ -946,7 +946,7 @@ async fn read_reply(
         rest -= length;
         *slot = Some(bytes.freeze());
     }
-    let now = Instant::now();
+    let now = nabedra_rt::time::now();
     Ok(Ok(RawReply {
         prefix,
         header: header.freeze(),
@@ -1067,7 +1067,7 @@ impl PeerSessions {
         let _connecting = if legacy {
             None
         } else {
-            let queued = Instant::now();
+            let queued = nabedra_rt::time::now();
             // Waiting on another caller's local connect is as indeterminate
             // as waiting on the resolver, for a liveness probe.
             if let Some(resolving) = probe_resolving.as_deref_mut() {
@@ -1087,7 +1087,7 @@ impl PeerSessions {
             }
             Some(guard)
         };
-        let attempt = deadline.min(Instant::now() + common.config.connect_timeout);
+        let attempt = deadline.min(nabedra_rt::time::now() + common.config.connect_timeout);
         let connected = timeout_at(
             attempt,
             connect(common, peer, class, probe_resolving.as_deref_mut(), phase),
@@ -1107,7 +1107,7 @@ impl PeerSessions {
             }
             Err(error) => {
                 if !legacy {
-                    *lock(&slot.failed) = Some(Instant::now());
+                    *lock(&slot.failed) = Some(nabedra_rt::time::now());
                 }
                 return Err(error);
             }
@@ -1294,7 +1294,7 @@ async fn one_shot(
             }
         }
     }
-    let now = Instant::now();
+    let now = nabedra_rt::time::now();
     Ok(RawReply {
         prefix,
         header: response_header.freeze(),
@@ -1410,13 +1410,13 @@ pub(super) async fn serve(
     let (outgoing, queue) = mpsc::channel(WRITE_QUEUE);
     let config = &transport.common.config;
     let deadline = config.deadline;
-    let writer = tokio::spawn(write_frames(write, queue, None, None, deadline));
+    let writer = nabedra_rt::task::spawn(write_frames(write, queue, None, None, deadline));
     // The writer closes the socket once every sender is gone. This one keeps it
     // open until the slots below are given back, even after the reader (which
     // owns the other sender) ends or is aborted.
     let hold_open = outgoing.clone();
     let state = Arc::new(ServerSession::new(pending));
-    let mut reader = tokio::spawn(serve_frames(
+    let mut reader = nabedra_rt::task::spawn(serve_frames(
         transport.clone(),
         Counted {
             inner: read,
@@ -1426,9 +1426,9 @@ pub(super) async fn serve(
         certificate,
         state.clone(),
     ));
-    let mut check = tokio::time::interval(DIRECTORY_CHECK);
+    let mut check = nabedra_rt::time::interval(DIRECTORY_CHECK);
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let started = Instant::now();
+    let started = nabedra_rt::time::now();
     let mut progress = Progress::new(state.received.clone());
     let mut changes = transport.common.directory.trust_changes();
     let read_finished = loop {
@@ -1496,7 +1496,7 @@ async fn serve_frames(
         if stream.read_exact(&mut head).await.is_err() {
             return;
         }
-        let arrived = Instant::now();
+        let arrived = nabedra_rt::time::now();
         let frame = StreamFrame::decode(head);
         match frame.flags {
             REQUEST => {
@@ -1507,11 +1507,11 @@ async fn serve_frames(
                 .await;
                 match received {
                     Ok(Ok(Received::Stream(work))) => {
-                        let spawned = Instant::now();
+                        let spawned = nabedra_rt::time::now();
                         S_RECEIVE.get(work.class).record(spawned - arrived);
                         let cancelled = Arc::new(AtomicBool::new(false));
                         lock(&state.active).insert(work.stream_id, cancelled.clone());
-                        tokio::spawn(run_stream(
+                        nabedra_rt::task::spawn(run_stream(
                             transport.clone(),
                             *work,
                             outgoing.clone(),
@@ -1647,7 +1647,7 @@ async fn run_stream(
         let header_scratch = common
             .shared
             .reserve_scratch(class.byte_class(), header_decode_bytes(class, header.len()))?;
-        let preflight_started = Instant::now();
+        let preflight_started = nabedra_rt::time::now();
         let plan = endpoint.preflight(&session, header.as_slice()).await?;
         S_PREFLIGHT.get(class).record(preflight_started.elapsed());
         drop(header_scratch);
@@ -1679,7 +1679,7 @@ async fn run_stream(
         if common.directory.revoked(session.remote()) {
             return Err(super::revoked_peer());
         }
-        let handle_started = Instant::now();
+        let handle_started = nabedra_rt::time::now();
         let reply = endpoint.handle(session, header, sections).await?;
         S_HANDLE.get(class).record(handle_started.elapsed());
         validate_reply(&common.config, class, &reply)?;
@@ -1716,7 +1716,7 @@ async fn run_stream(
         // when the peer's next request arrives (D10/O05, CIfix1).
         frame.release = handler.take();
         frame.timing = Some(FrameTiming {
-            queued: Instant::now(),
+            queued: nabedra_rt::time::now(),
             queue: S_QUEUE.get(class),
             write: S_WRITE.get(class),
         });

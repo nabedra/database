@@ -237,7 +237,7 @@ impl ApplicationClient {
         let (Some(routes), Some(point)) = (&self.scoped, point) else {
             return self.submit_legacy(body).await;
         };
-        tokio::time::timeout(ROUTE_DEADLINE, async {
+        nabedra_rt::time::timeout(ROUTE_DEADLINE, async {
             let mut hint = routes.target(&point, &self.group);
             for attempt in 0..2 {
                 let target = match hint.take() {
@@ -360,7 +360,7 @@ impl ApplicationClient {
             let reply = if cached {
                 // Invalidate a silent owner before the HTTP receipt deadline
                 // cancels observation and leaves the same stale hint cached.
-                tokio::time::timeout(RECEIPT_HINT_TIMEOUT, observe)
+                nabedra_rt::time::timeout(RECEIPT_HINT_TIMEOUT, observe)
                     .await
                     .unwrap_or_else(|_| Err(unavailable()))
             } else {

@@ -90,8 +90,8 @@ async fn propose_waves(node: &Node, ids: std::ops::Range<u64>) -> (Vec<(u64, u64
                 ByteClass::Data,
             )
             .unwrap();
-            tasks.push(tokio::spawn(async move {
-                tokio::time::timeout(Duration::from_secs(5), consensus.propose(command)).await
+            tasks.push(nabedra_rt::task::spawn(async move {
+                nabedra_rt::time::timeout(Duration::from_secs(5), consensus.propose(command)).await
             }));
         }
         let mut failed = false;
@@ -112,7 +112,7 @@ async fn propose_waves(node: &Node, ids: std::ops::Range<u64>) -> (Vec<(u64, u64
 }
 
 async fn stop(node: Node) {
-    let _ = tokio::time::timeout(Duration::from_secs(10), node.consensus.shutdown()).await;
+    let _ = nabedra_rt::time::timeout(Duration::from_secs(10), node.consensus.shutdown()).await;
     drop(node);
 }
 

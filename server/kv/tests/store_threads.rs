@@ -1,4 +1,5 @@
 //! The store's own threads and the memory a completed write still holds (RV-NS6 F8, F9).
+#![allow(clippy::disallowed_methods)] // integration tests are outside the phase 7 conversion, which covers kv/src
 
 mod common;
 

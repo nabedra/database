@@ -63,7 +63,7 @@ impl SnapshotRetry {
         }
         {
             let mut next_probe = self.next_probe.lock().unwrap_or_else(|e| e.into_inner());
-            let now = Instant::now();
+            let now = nabedra_rt::time::now();
             // Share one refresh interval with the watcher. Reserve it before
             // the read so concurrent stale prepares don't each call Control.
             if next_probe.is_some_and(|next| now < next) {
@@ -79,9 +79,7 @@ impl SnapshotRetry {
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+    nabedra_rt::time::unix_ms()
 }
 
 pub(crate) struct DirectSwitch {
@@ -269,7 +267,7 @@ impl DirectSwitch {
         // stale activation state.
         let _ = self.local;
         self.control
-            .change_direct_capability(uuid::Uuid::new_v4(), action)
+            .change_direct_capability(nabedra_rt::ids::uuid_v4(), action)
             .await
     }
 
@@ -311,7 +309,7 @@ impl DirectSwitch {
     pub(crate) fn start(self: &Arc<Self>) {
         let switch = Arc::downgrade(self);
         let mut stop = self.stop.subscribe();
-        let task = tokio::spawn(async move {
+        let task = nabedra_rt::task::spawn(async move {
             let mut advertised = false;
             let mut polls = 0u32;
             // T7c process tests hold activation, then release it: ask for
@@ -378,7 +376,7 @@ impl DirectSwitch {
                 polls = polls.wrapping_add(1);
                 drop(switch);
                 tokio::select! {
-                    _ = tokio::time::sleep(POLL) => {}
+                    _ = nabedra_rt::time::sleep(POLL) => {}
                     _ = stop.changed() => return,
                 }
             }

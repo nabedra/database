@@ -12,7 +12,7 @@ async fn registered_request_roundtrip() {
         .try_admit(&op, Role::Operation, guard.clone())
         .unwrap();
     let (tx, rx) = tokio::io::duplex(32);
-    let send = tokio::spawn(async move {
+    let send = nabedra_rt::task::spawn(async move {
         let mut tx = send_request(
             FrameWriter::new(Box::new(tx) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>),
             lease,
@@ -120,7 +120,7 @@ async fn registered_results_roundtrip() {
         lease.command(Command::CommitEof).await.unwrap();
         let (tx, rx) = tokio::io::duplex(31);
         let expected = job.clone();
-        let send = tokio::spawn(async move {
+        let send = nabedra_rt::task::spawn(async move {
             let mut tx = send_result(FrameWriter::new(Box::new(tx) as Transport), lease, job)
                 .await
                 .unwrap();
@@ -191,7 +191,7 @@ async fn prepared_transition_releases_exhausted_reader_before_next_open() {
     let observations = observe_part_open_quota(&lease);
     let (tx, rx) = tokio::io::duplex(31);
     let expected = job.clone();
-    let send = tokio::spawn(async move {
+    let send = nabedra_rt::task::spawn(async move {
         let mut tx = send_result(FrameWriter::new(Box::new(tx) as Transport), lease, job).await?;
         tx.shutdown().await.map_err(|_| OwnerError::Invalid)
     });
@@ -257,7 +257,7 @@ async fn escaped_get_streams_between_distinct_pools() {
     rows_input(&mut lease, job.clone(), result, chunks).await;
     let (tx, rx) = tokio::io::duplex(257);
     let expected = job.clone();
-    let send = tokio::spawn(async move {
+    let send = nabedra_rt::task::spawn(async move {
         let mut tx = send_result(FrameWriter::new(Box::new(tx) as Transport), lease, job)
             .await
             .unwrap();
@@ -326,7 +326,7 @@ impl tokio::io::AsyncWrite for BlockedWriter {
     }
 }
 async fn event<T>(future: impl std::future::Future<Output = T>) -> T {
-    tokio::time::timeout(std::time::Duration::from_secs(10), future)
+    nabedra_rt::time::timeout(std::time::Duration::from_secs(10), future)
         .await
         .expect("event watchdog")
 }
@@ -364,7 +364,8 @@ async fn blocked_writes_and_accepted_reads_retain_ownership() {
             threshold: control_len + if mode == 2 { 7 } else { 1 },
             blocked: Some(blocked_tx),
         };
-        let task = tokio::spawn(send_result(FrameWriter::new(Box::new(output)), lease, job));
+        let task =
+            nabedra_rt::task::spawn(send_result(FrameWriter::new(Box::new(output)), lease, job));
         let mut input = reader(rx);
         assert_eq!(
             event(input.next_frame()).await.unwrap().unwrap().kind,

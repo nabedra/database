@@ -367,11 +367,11 @@ mod tests {
     fn k03_peer_frames_bind_generation_and_incarnations_and_reject_foreign_keys() {
         let sender = WorkerId {
             node: 1,
-            incarnation: Uuid::new_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
         };
         let receiver = WorkerId {
             node: 2,
-            incarnation: Uuid::new_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
         };
         let identity = Identity {
             generation: 3,

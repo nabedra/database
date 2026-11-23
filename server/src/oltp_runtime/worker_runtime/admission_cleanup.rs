@@ -85,7 +85,7 @@ impl AdmissionCleanup {
         let runtime = Arc::downgrade(runtime);
         #[cfg(test)]
         let pause = self.pause.clone();
-        *self.task.lock().map_err(|_| unknown())? = Some(tokio::spawn(async move {
+        *self.task.lock().map_err(|_| unknown())? = Some(nabedra_rt::task::spawn(async move {
             tokio::select! {
                 biased;
                 _ = stopped.wait_for(|stop| *stop) => {},
@@ -197,7 +197,7 @@ async fn retry_never_accepted(runtime: &Weak<WorkerRuntime>, cap: &mut VerifiedN
             return;
         }
         drop(runtime);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

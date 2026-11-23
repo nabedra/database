@@ -3,10 +3,11 @@ use std::path::Path;
 use std::sync::Arc;
 #[cfg(feature = "test-hooks")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use nabedra_rt::task;
+use nabedra_rt::time::{self, MissedTickBehavior, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore};
-use tokio::time::{self, MissedTickBehavior};
 
 use super::command::DataCommand;
 use super::config::{Config, Eviction, ListenerConfig};
@@ -36,7 +37,7 @@ impl Standalone {
         Self {
             actor: Arc::new(Mutex::new(SlotStore::new(data_bytes, eviction))),
             pending: Semaphore::new(max_pending),
-            started: Instant::now(),
+            started: time::now_std(),
             limits,
             #[cfg(feature = "test-hooks")]
             active_expire: Arc::new(AtomicBool::new(true)),
@@ -107,7 +108,7 @@ async fn serve(config: ListenerConfig, eviction: EvictionPolicy) -> io::Result<(
         },
     );
     let actor = Arc::clone(&backend.actor);
-    let maintenance = tokio::spawn(expire(
+    let maintenance = task::spawn(expire(
         Arc::clone(&actor),
         backend.started,
         #[cfg(feature = "test-hooks")]
@@ -153,7 +154,7 @@ fn apply(
     limits: TurnLimits,
 ) -> Reply {
     if let Err(error) = validate_wall_clock_expiry(operation, || {
-        SystemTime::now()
+        time::wall_now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| {
                 u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
@@ -194,7 +195,10 @@ fn validate_wall_clock_expiry(
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
-    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    time::now_std()
+        .duration_since(started)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]

@@ -44,7 +44,7 @@ use sha2::{Digest as _, Sha256};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, Weak},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -196,16 +196,16 @@ impl DirectExecutor {
         handle: &Arc<ParticipantHandle>,
         request: DirectRequest,
     ) -> DirectResponse {
-        let started = std::time::Instant::now();
+        let started = nabedra_rt::time::now_std();
         self.stats.request();
         let mut get = false;
-        let admit = std::time::Instant::now();
+        let admit = nabedra_rt::time::now_std();
         let admission = self.admit(handle, &request);
         perf_stage!("leader.admit").since(admit);
         let response = match admission {
             Err(response) => response,
             Ok((admitted, parsed)) => {
-                let deadline = Instant::now() + request.deadline.min(MAX_DIRECT_DEADLINE);
+                let deadline = nabedra_rt::time::now() + request.deadline.min(MAX_DIRECT_DEADLINE);
                 let response = if matches!(parsed.operation, Operation::Get(_)) {
                     get = true;
                     self.stats.get();
@@ -219,10 +219,10 @@ impl DirectExecutor {
             }
         };
         if get {
-            self.stats.get_time(started.elapsed());
+            self.stats.get_time(nabedra_rt::time::now_std().saturating_duration_since(started));
             perf_stage!("leader.get.total").since(started);
         } else {
-            self.stats.mutation_time(started.elapsed());
+            self.stats.mutation_time(nabedra_rt::time::now_std().saturating_duration_since(started));
             perf_stage!("leader.mutation.total").since(started);
         }
         self.count(&response);
@@ -251,7 +251,7 @@ impl DirectExecutor {
                 }
             }
             Ok((admitted, parsed)) => {
-                let deadline = Instant::now() + request.deadline.min(MAX_DIRECT_DEADLINE);
+                let deadline = nabedra_rt::time::now() + request.deadline.min(MAX_DIRECT_DEADLINE);
                 let response = self
                     .forward_admitted(handle, &request, parsed, deadline)
                     .await;
@@ -385,12 +385,12 @@ impl DirectExecutor {
             }
             let (leader, local) = handle.direct_leadership();
             let leading = leader.is_some() && leader == local;
-            if !leading || Instant::now() + RETRY_PAUSE >= deadline {
+            if !leading || nabedra_rt::time::now() + RETRY_PAUSE >= deadline {
                 return Err(DirectResponse::NotLeader {
                     hint: leader.filter(|leader| Some(*leader) != local),
                 });
             }
-            tokio::time::sleep(RETRY_PAUSE).await;
+            nabedra_rt::time::sleep(RETRY_PAUSE).await;
         }
     }
 
@@ -614,10 +614,10 @@ impl DirectExecutor {
     /// Waits out a transient failure, or reports the deadline.
     async fn pause(&self, deadline: Instant, cause: RetryCause) -> bool {
         self.stats.retry(cause);
-        if Instant::now() + RETRY_PAUSE >= deadline {
+        if nabedra_rt::time::now() + RETRY_PAUSE >= deadline {
             return false;
         }
-        tokio::time::sleep(RETRY_PAUSE).await;
+        nabedra_rt::time::sleep(RETRY_PAUSE).await;
         true
     }
 
@@ -637,7 +637,7 @@ impl DirectExecutor {
         {
             return Err(failed(error));
         }
-        let expired = Instant::now() >= deadline;
+        let expired = nabedra_rt::time::now() >= deadline;
         let reason = if expired {
             ProposalFailure::Deadline
         } else if clock.leader_token() != Some(token) {
@@ -896,7 +896,7 @@ impl DirectExecutor {
                 }
                 self.served(handle);
                 loop {
-                    if Instant::now() >= deadline {
+                    if nabedra_rt::time::now() >= deadline {
                         return Err(failed(unavailable_not_applied()));
                     }
                     match self
@@ -925,7 +925,7 @@ impl DirectExecutor {
                     }
                 }
                 drop(latched);
-                if Instant::now() >= deadline {
+                if nabedra_rt::time::now() >= deadline {
                     return Err(failed(unavailable_not_applied()));
                 }
             }
@@ -989,7 +989,7 @@ impl DirectExecutor {
             } => (epochs, computed, result),
             Prepared::Exit(exit) => return Ok(exit),
         };
-        let waited = std::time::Instant::now();
+        let waited = nabedra_rt::time::now_std();
         let fetched = match fetched {
             Some(fetched) => fetched,
             None => fetch.await,
@@ -1005,7 +1005,7 @@ impl DirectExecutor {
             },
             Err(_) => return Ok(Attempt::Retry(RetryCause::Unavailable)),
         };
-        let build = std::time::Instant::now();
+        let build = nabedra_rt::time::now_std();
         let commit = DirectCommit {
             authority: epochs.authority,
             table_id: request.table_id,
@@ -1185,7 +1185,7 @@ impl DirectExecutor {
             unreachable!("row keys only");
         };
         let leadership = || {
-            if Instant::now() + RETRY_PAUSE >= deadline {
+            if nabedra_rt::time::now() + RETRY_PAUSE >= deadline {
                 return Err(not_leader_or(handle));
             }
             Ok(Prepared::Exit(Attempt::Retry(RetryCause::Leadership)))
@@ -1201,7 +1201,7 @@ impl DirectExecutor {
         // A cancelled earlier attempt of this request may still be pending
         // on these keys (its latch is gone but its entry is not applied):
         // wait for it, so the dedup lookup below sees its record.
-        let waited = std::time::Instant::now();
+        let waited = nabedra_rt::time::now_std();
         for key in keys {
             if by(deadline, clock.wait_latest(key)).await.is_err() {
                 return Ok(Prepared::Exit(Attempt::Retry(RetryCause::Unavailable)));
@@ -1277,7 +1277,7 @@ impl DirectExecutor {
         if epochs.direct_schema != table_schema {
             return Ok(Prepared::Exit(Attempt::Retry(RetryCause::Schema)));
         }
-        let read = std::time::Instant::now();
+        let read = nabedra_rt::time::now_std();
         let mut current = Vec::with_capacity(keys.len());
         let mut first = Some(snapshot.latest);
         for key in keys {
@@ -1556,7 +1556,7 @@ impl DirectExecutor {
                 .map_err(|_| failed(unavailable_not_applied()))?;
             self.served(handle);
             loop {
-                if Instant::now() >= deadline {
+                if nabedra_rt::time::now() >= deadline {
                     return Err(failed(unavailable_not_applied()));
                 }
                 let epochs = handle.direct_epochs().await.map_err(failed)?;
@@ -1677,7 +1677,7 @@ impl DirectExecutor {
                 &self.resources,
                 ByteClass::Progress,
             )?;
-            let bound = Instant::now() + EXPIRE_PROPOSAL_DEADLINE;
+            let bound = nabedra_rt::time::now() + EXPIRE_PROPOSAL_DEADLINE;
             match by(bound, handle.propose(command)).await?.reply {
                 ParticipantReply::DirectExpired {
                     deleted: page,
@@ -1736,9 +1736,9 @@ impl DirectExecutor {
     pub(crate) fn spawn_expiry(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let executor = Arc::downgrade(self);
         let interval = self.config.expire_interval;
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             loop {
-                tokio::time::sleep(interval).await;
+                nabedra_rt::time::sleep(interval).await;
                 let Some(executor) = executor.upgrade() else {
                     return;
                 };
@@ -1851,7 +1851,7 @@ async fn by<T>(
     deadline: Instant,
     future: impl std::future::Future<Output = Result<T, ProtocolError>>,
 ) -> Result<T, ProtocolError> {
-    tokio::time::timeout_at(deadline, future)
+    nabedra_rt::time::timeout_at(deadline, future)
         .await
         .unwrap_or_else(|_| {
             Err(ProtocolError::new(
@@ -1868,7 +1868,7 @@ async fn catalog_read<T>(
     deadline: Instant,
     read: impl std::future::Future<Output = Result<T, ProtocolError>>,
 ) -> Result<T, DirectResponse> {
-    match tokio::time::timeout_at(deadline, read).await {
+    match nabedra_rt::time::timeout_at(deadline, read).await {
         Ok(read) => read.map_err(failed),
         Err(_) => Err(failed(unavailable_not_applied())),
     }
@@ -1908,7 +1908,7 @@ fn already_exists() -> ProtocolError {
     )
 }
 fn unix_ms() -> u64 {
-    SystemTime::now()
+    nabedra_rt::time::wall_now()
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(1)

@@ -110,11 +110,11 @@ async fn voters_inner(
     GroupIdentity,
 ) {
     let certificates = tls::certificates(dir, 3);
-    let cluster = Uuid::new_v4();
+    let cluster = nabedra_rt::ids::uuid_v4();
     let group = GroupIdentity {
         cluster_id: cluster,
         database: Text::try_from("t1b").unwrap(),
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Catalog,
         group_format_version: 1,
     };
@@ -123,8 +123,8 @@ async fn voters_inner(
     for tls in &certificates {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         workers.push(WorkerEnrollment {
-            worker_id: Uuid::new_v4(),
-            incarnation: Uuid::new_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
             certificate_sha256: Digest::parse(tls.certificate_sha256()).unwrap(),
             enrollment_revision: 1,
             endpoint: Text::new(listener.local_addr().unwrap().to_string()).unwrap(),
@@ -142,7 +142,7 @@ async fn voters_inner(
                 ReplicaMember {
                     node_id: node,
                     worker_id: worker.worker_id,
-                    pool_id: Uuid::new_v4(),
+                    pool_id: nabedra_rt::ids::uuid_v4(),
                 },
             )
         })
@@ -194,7 +194,7 @@ async fn voters_inner(
         };
         let directory = (data_only == Some(node)).then(|| {
             let control = GroupIdentity {
-                group_id: Uuid::new_v4(),
+                group_id: nabedra_rt::ids::uuid_v4(),
                 kind: GroupKind::Control,
                 ..group.clone()
             };
@@ -270,7 +270,7 @@ async fn voters_inner(
         }
         let (stop, stopped) = oneshot::channel();
         stops.push(stop);
-        tasks.push(tokio::spawn(transport.clone().run(listener, async {
+        tasks.push(nabedra_rt::task::spawn(transport.clone().run(listener, async {
             let _ = stopped.await;
         })));
         voters.push(Voter {
@@ -303,12 +303,12 @@ async fn leader(voters: &[Voter]) -> usize {
 }
 
 async fn timeout_loop<T, F: Future<Output = Option<T>>>(mut probe: impl FnMut() -> F) -> T {
-    tokio::time::timeout(Duration::from_secs(120), async {
+    nabedra_rt::time::timeout(Duration::from_secs(120), async {
         loop {
             if let Some(value) = probe().await {
                 return value;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -324,8 +324,8 @@ async fn propose_all(voter: &Voter, ids: std::ops::Range<u64>) {
     for id in ids {
         let consensus = voter.consensus.clone();
         let shared = shared.clone();
-        tasks.push(tokio::spawn(async move {
-            let started = std::time::Instant::now();
+        tasks.push(nabedra_rt::task::spawn(async move {
+            let started = nabedra_rt::time::now_std();
             loop {
                 let command = OwnedCommand::new_owned(
                     Bump {
@@ -348,7 +348,7 @@ async fn propose_all(voter: &Voter, ids: std::ops::Range<u64>) {
                         if error.forward_to_leader().is_some()
                             && started.elapsed() < Duration::from_secs(60) =>
                     {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        nabedra_rt::time::sleep(Duration::from_millis(100)).await;
                     }
                     Err(error) => panic!("proposal {id} failed: {error}"),
                 }
@@ -460,7 +460,7 @@ async fn stop_all(
     tasks: Vec<tokio::task::JoinHandle<Result<(), ProtocolError>>>,
 ) {
     for voter in &voters {
-        tokio::time::timeout(Duration::from_secs(20), voter.consensus.shutdown())
+        nabedra_rt::time::timeout(Duration::from_secs(20), voter.consensus.shutdown())
             .await
             .expect("shutdown")
             .unwrap();
@@ -603,7 +603,7 @@ async fn start_view(
     let source = Arc::new(ScriptedRevocations::default());
     directory.seed_remote_revocations(&*source).await.unwrap();
     let (stop, stopped) = tokio::sync::watch::channel(false);
-    let refresh = tokio::spawn(
+    let refresh = nabedra_rt::task::spawn(
         directory
             .clone()
             .run_revocation_refresh(source.clone(), stopped),
@@ -634,11 +634,11 @@ async fn o06_d01_rep6_data_only_follower_appends_make_no_control_call_and_surviv
     let (directory, source, stop, refresh) = start_view(&voters[2]).await;
     assert_eq!(source.calls.load(Ordering::Acquire), 1, "the startup seed");
 
-    let started = std::time::Instant::now();
+    let started = nabedra_rt::time::now_std();
     let appends_before = received(&group, 3).0;
     let mut commits = Vec::new();
     for id in 0..200 {
-        let at = std::time::Instant::now();
+        let at = nabedra_rt::time::now_std();
         propose_all(&voters[leader], id..id + 1).await;
         commits.push(at.elapsed().as_micros() as u64);
     }
@@ -667,13 +667,13 @@ async fn o06_d01_rep6_data_only_follower_appends_make_no_control_call_and_surviv
     .await;
     let failed_reads = source.calls.load(Ordering::Acquire);
     // Stop node 2: each commit now needs node 3, the Data-only follower.
-    tokio::time::timeout(Duration::from_secs(20), voters[1].consensus.shutdown())
+    nabedra_rt::time::timeout(Duration::from_secs(20), voters[1].consensus.shutdown())
         .await
         .expect("shutdown")
         .unwrap();
     let mut outage = Vec::new();
     for id in 200..240 {
-        let at = std::time::Instant::now();
+        let at = nabedra_rt::time::now_std();
         propose_all(&voters[leader], id..id + 1).await;
         outage.push(at.elapsed().as_micros() as u64);
     }
@@ -694,7 +694,7 @@ async fn o06_d01_rep6_data_only_follower_appends_make_no_control_call_and_surviv
     let _ = stop.send(true);
     refresh.await.unwrap();
     for voter in [&voters[0], &voters[2]] {
-        tokio::time::timeout(Duration::from_secs(20), voter.consensus.shutdown())
+        nabedra_rt::time::timeout(Duration::from_secs(20), voter.consensus.shutdown())
             .await
             .expect("shutdown")
             .unwrap();
@@ -725,7 +725,7 @@ async fn o17_rep6_a_learned_revocation_closes_the_data_only_follower_sessions() 
     // Control commits the revocation of node 1's identity.
     let revoked = voters[0].identity;
     *source.revoked.lock().unwrap() = vec![revoked];
-    let committed = std::time::Instant::now();
+    let committed = nabedra_rt::time::now_std();
     timeout_loop(|| async { directory.revoked(revoked).then_some(()) }).await;
     let learned = committed.elapsed();
     timeout_loop(|| async { (voters[2].transport.revoked_session_closes() > 0).then_some(()) })
@@ -742,13 +742,13 @@ async fn o17_rep6_a_learned_revocation_closes_the_data_only_follower_sessions() 
 
     // An append that passed its check before the view learned may still be
     // decoding; none can start after.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(200)).await;
     let appends = received(&group, 3).0;
     propose_all(&voters[leader], 5..25).await;
     for voter in &voters[..2] {
         timeout_loop(|| async { (read_count(&voter.store).await == 25).then_some(()) }).await;
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         read_count(&voters[2].store).await,
         5,

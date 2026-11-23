@@ -386,6 +386,7 @@ impl World {
     /// Crashes `node`: marks it down and aborts every registered task. Service threads
     /// cannot be aborted; see the module documentation.
     pub fn crash(&self, node: u64) {
+        net::crash(self, node);
         let tasks = self.with_node(node, |entry| {
             entry.up = false;
             std::mem::take(&mut entry.tasks)
@@ -450,8 +451,7 @@ pub fn world() -> Option<Arc<World>> {
 
 /// A current-thread tokio runtime with paused time, for one simulation.
 ///
-/// For `tokio::select!` branch order to follow the seed too, build with
-/// `--cfg tokio_unstable` and set `Builder::rng_seed` (see `server/events/src/sim`).
+/// For `tokio::select!` branch order to follow the seed too, use [`runtime_seeded`].
 pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -459,14 +459,46 @@ pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-/// Runs one simulation: a paused current-thread runtime, a [`World`] seeded with `seed`
-/// and installed on this thread, and `body` driven to completion.
+/// True when [`runtime_seeded`] seeds tokio's own random choices, that is when the build
+/// has `--cfg tokio_unstable`. A seed sweep asserts it before it runs.
+pub const TOKIO_RNG_SEEDED: bool = cfg!(tokio_unstable);
+
+/// [`runtime`] with tokio's own random choices, such as the branch `tokio::select!`
+/// polls first, seeded from `seed` through `Builder::rng_seed`.
+///
+/// `Builder::rng_seed` exists only with `--cfg tokio_unstable`. Without the flag this
+/// builds the same runtime as [`runtime`], and [`TOKIO_RNG_SEEDED`] is false.
+///
+/// Simulation builds pass the flag through the environment, with their own target
+/// directory:
+///
+/// ```text
+/// RUSTFLAGS="--cfg tokio_unstable" CARGO_TARGET_DIR=target/sim \
+///     cargo test --locked -p nabedra-rt --features sim,sim-openraft
+/// ```
+///
+/// The flag is never set in a manifest, a `.cargo/config.toml` or a product build step,
+/// so product builds never see it, and the separate target directory keeps the two flag
+/// sets from rebuilding each other's artifacts.
+pub fn runtime_seeded(seed: u64) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_current_thread();
+    builder.enable_time().start_paused(true);
+    #[cfg(tokio_unstable)]
+    builder.rng_seed(tokio::runtime::RngSeed::from_bytes(&seed.to_le_bytes()));
+    #[cfg(not(tokio_unstable))]
+    let _ = seed;
+    builder.build()
+}
+
+/// Runs one simulation: a paused current-thread runtime ([`runtime_seeded`]), a
+/// [`World`] seeded with `seed` and installed on this thread, and `body` driven to
+/// completion.
 pub fn run<F, Fut>(seed: u64, body: F) -> Fut::Output
 where
     F: FnOnce(Arc<World>) -> Fut,
     Fut: Future,
 {
-    let runtime = runtime().expect("build the simulation runtime");
+    let runtime = runtime_seeded(seed).expect("build the simulation runtime");
     let world = runtime.block_on(async { World::new(seed) });
     let _installed = Installed::new(world.clone());
     runtime.block_on(async { body(world).await })
@@ -727,6 +759,10 @@ where
         f()
     })
 }
+
+pub mod net;
+#[cfg(feature = "sim-openraft")]
+pub mod openraft10;
 
 #[cfg(test)]
 mod tests;

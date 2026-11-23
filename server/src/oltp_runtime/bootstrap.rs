@@ -184,7 +184,7 @@ impl LocalServices {
         let pools = WorkerPools::new(pool.clone(), local, None)?;
         let (stop, mut stopped) = watch::channel(false);
         let transport_owner = transport.clone();
-        let task = tokio::spawn(async move {
+        let task = nabedra_rt::task::spawn(async move {
             transport_owner
                 .run(listener, async move {
                     while !*stopped.borrow_and_update() {
@@ -227,7 +227,7 @@ impl LocalServices {
             if initial.is_none() {
                 accepted(
                     control
-                        .initialize_local(&operator, Uuid::new_v4(), Uuid::new_v4())
+                        .initialize_local(&operator, nabedra_rt::ids::uuid_v4(), nabedra_rt::ids::uuid_v4())
                         .await?
                         .reply,
                 )?;
@@ -243,9 +243,9 @@ impl LocalServices {
                             control
                                 .begin_cold_fence_local(
                                     &operator,
-                                    Uuid::new_v4(),
+                                    nabedra_rt::ids::uuid_v4(),
                                     state.ready,
-                                    Uuid::new_v4(),
+                                    nabedra_rt::ids::uuid_v4(),
                                 )
                                 .await?
                                 .reply,
@@ -266,7 +266,7 @@ impl LocalServices {
                 .map(|old| {
                     control.exclude_local_previous(
                         &operator,
-                        Uuid::new_v4(),
+                        nabedra_rt::ids::uuid_v4(),
                         WorkerIdentity::from(old),
                     )
                 })
@@ -275,7 +275,7 @@ impl LocalServices {
                 control
                     .enroll_local(
                         &operator,
-                        Uuid::new_v4(),
+                        nabedra_rt::ids::uuid_v4(),
                         old_worker.as_ref().map(WorkerIdentity::from),
                         enrollment.clone(),
                         exclusion,
@@ -410,7 +410,7 @@ impl LocalServices {
                 if control.group(receipt.group.group_id).await?.is_some() {
                     accepted(
                         control
-                            .record_group_fence(Uuid::new_v4(), receipt)
+                            .record_group_fence(nabedra_rt::ids::uuid_v4(), receipt)
                             .await?
                             .reply,
                     )?;
@@ -436,7 +436,7 @@ impl LocalServices {
                 if control.group(receipt.group.group_id).await?.is_some() {
                     accepted(
                         control
-                            .record_group_fence(Uuid::new_v4(), receipt)
+                            .record_group_fence(nabedra_rt::ids::uuid_v4(), receipt)
                             .await?
                             .reply,
                     )?;
@@ -449,7 +449,7 @@ impl LocalServices {
                 if control.group(receipt.group.group_id).await?.is_some() {
                     accepted(
                         control
-                            .record_group_fence(Uuid::new_v4(), receipt)
+                            .record_group_fence(nabedra_rt::ids::uuid_v4(), receipt)
                             .await?
                             .reply,
                     )?;
@@ -475,7 +475,7 @@ impl LocalServices {
                         let observed_fence = receipt.clone();
                         accepted(
                             control
-                                .record_group_fence(Uuid::new_v4(), receipt)
+                                .record_group_fence(nabedra_rt::ids::uuid_v4(), receipt)
                                 .await?
                                 .reply,
                         )?;
@@ -498,7 +498,7 @@ impl LocalServices {
                         if !control.excluded(fence.transition_id, *worker).await? {
                             excluded.push(control.exclude_local_previous(
                                 &operator,
-                                Uuid::new_v4(),
+                                nabedra_rt::ids::uuid_v4(),
                                 *worker,
                             )?);
                         }
@@ -508,7 +508,7 @@ impl LocalServices {
                             control
                                 .excluded_local_page(
                                     &operator,
-                                    Uuid::new_v4(),
+                                    nabedra_rt::ids::uuid_v4(),
                                     fence.transition_id,
                                     excluded,
                                 )
@@ -524,12 +524,12 @@ impl LocalServices {
                 if let Some(worker) = fence.extra_exclusion {
                     if !control.excluded(fence.transition_id, worker).await? {
                         let proof =
-                            control.exclude_local_previous(&operator, Uuid::new_v4(), worker)?;
+                            control.exclude_local_previous(&operator, nabedra_rt::ids::uuid_v4(), worker)?;
                         accepted(
                             control
                                 .excluded_local_page(
                                     &operator,
-                                    Uuid::new_v4(),
+                                    nabedra_rt::ids::uuid_v4(),
                                     fence.transition_id,
                                     vec![proof],
                                 )
@@ -540,7 +540,7 @@ impl LocalServices {
                 }
                 accepted(
                     control
-                        .publish_fence_local(&operator, Uuid::new_v4(), fence.transition_id)
+                        .publish_fence_local(&operator, nabedra_rt::ids::uuid_v4(), fence.transition_id)
                         .await?
                         .reply,
                 )?;
@@ -553,7 +553,7 @@ impl LocalServices {
                 register(&control, &operator, &status_raft, next).await?;
                 register(&control, &operator, &catalog_raft, next).await?;
             }
-            let ticket_id = Uuid::new_v4();
+            let ticket_id = nabedra_rt::ids::uuid_v4();
             let ControlReply::JoinBegun {
                 ticket,
                 bootstrap: true,
@@ -568,7 +568,7 @@ impl LocalServices {
                 control
                     .ready_page_local(
                         &operator,
-                        Uuid::new_v4(),
+                        nabedra_rt::ids::uuid_v4(),
                         ticket_id,
                         Page::new(vec![local]).map_err(|_| unavailable())?,
                     )
@@ -576,7 +576,7 @@ impl LocalServices {
                     .reply,
             )?;
             let ControlReply::ReadySealed { expected, next, .. } = control
-                .seal_ready_local(&operator, Uuid::new_v4(), ticket_id)
+                .seal_ready_local(&operator, nabedra_rt::ids::uuid_v4(), ticket_id)
                 .await?
                 .reply
             else {
@@ -593,12 +593,12 @@ impl LocalServices {
             let receipt = timestamps.fence_ready(ticket_id, expected, next).await?;
             accepted(
                 control
-                    .timestamp_fenced(Uuid::new_v4(), receipt)
+                    .timestamp_fenced(nabedra_rt::ids::uuid_v4(), receipt)
                     .await?
                     .reply,
             )?;
             let proof = VerifiedQueueCopy::from_empty_worker(ticket, &replica)?;
-            accepted(control.publish_ready(Uuid::new_v4(), proof).await?.reply)?;
+            accepted(control.publish_ready(nabedra_rt::ids::uuid_v4(), proof).await?.reply)?;
             use super::worker_endpoint::AuthorityReader;
             replica
                 .activate_empty_bootstrap(control.current(&scope).await?)
@@ -628,7 +628,7 @@ impl LocalServices {
             let control_client =
                 ControlClient::new(manager.client(), shared.clone(), group.clone(), routes)?;
             directory.refresh(&control_client).await?;
-            directory_refresh = Some(tokio::spawn(
+            directory_refresh = Some(nabedra_rt::task::spawn(
                 directory
                     .clone()
                     .run_refresh(control_client.clone(), stop.subscribe()),
@@ -1026,15 +1026,15 @@ where
             .await
             .map_err(|_| unavailable())?;
     }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = nabedra_rt::time::now() + std::time::Duration::from_secs(10);
     loop {
         if group.ensure_linearizable().await.is_ok() {
             return Ok(());
         }
-        if tokio::time::Instant::now() >= deadline {
+        if nabedra_rt::time::now() >= deadline {
             return Err(unavailable());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        nabedra_rt::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 async fn register<C, M>(
@@ -1059,7 +1059,7 @@ where
     let reply = control
         .begin_group_local(
             operator,
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             generation,
             observation.group().clone(),
         )
@@ -1077,7 +1077,7 @@ where
             control
                 .group_page_local(
                     operator,
-                    Uuid::new_v4(),
+                    nabedra_rt::ids::uuid_v4(),
                     generation,
                     Page::new(page.to_vec()).map_err(|_| unavailable())?,
                 )
@@ -1088,7 +1088,7 @@ where
     let proof = VerifiedMembership::from_consensus(observation, generation, authority)?;
     accepted(
         control
-            .seal_group_local(operator, Uuid::new_v4(), proof)
+            .seal_group_local(operator, nabedra_rt::ids::uuid_v4(), proof)
             .await?
             .reply,
     )

@@ -276,8 +276,12 @@ async fn execute<B: Backend>(
                 )
             })?;
         let write_deadline = request.extensions_mut().remove::<StreamWriteDeadline>();
-        let body =
-            http::read_small(request.into_body(), length, Instant::now() + BODY_TIMEOUT).await?;
+        let body = http::read_small(
+            request.into_body(),
+            length,
+            nabedra_rt::time::now() + BODY_TIMEOUT,
+        )
+        .await?;
         let command = match input {
             Input::Open => {
                 let opened: wire::Open = parse_open(&body)?;
@@ -300,7 +304,7 @@ async fn execute<B: Backend>(
             wire::Reply::Batch(mut batch) => {
                 // Retain the worker delivery even if validating or constructing
                 // the public response fails.
-                let deadline = Instant::now() + DELIVERY_TIMEOUT;
+                let deadline = nabedra_rt::time::now() + DELIVERY_TIMEOUT;
                 let delivery = batch
                     .release
                     .take()
@@ -329,7 +333,7 @@ async fn execute<B: Backend>(
                         if bytes.is_empty() {
                             return None;
                         }
-                        if Instant::now() >= deadline
+                        if nabedra_rt::time::now() >= deadline
                             || live
                                 .as_ref()
                                 .is_some_and(|status| !status.load(Ordering::Acquire))
@@ -384,9 +388,9 @@ impl DeliveryLease {
         let live = Arc::new(AtomicBool::new(true));
         let status = live.clone();
         let (finished, mut ended) = oneshot::channel();
-        tokio::spawn(async move {
-            let mut ticks = tokio::time::interval_at(
-                Instant::now() + DELIVERY_RENEW_INTERVAL,
+        nabedra_rt::task::spawn(async move {
+            let mut ticks = nabedra_rt::time::interval_at(
+                nabedra_rt::time::now() + DELIVERY_RENEW_INTERVAL,
                 DELIVERY_RENEW_INTERVAL,
             );
             ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -394,14 +398,14 @@ impl DeliveryLease {
                 tokio::select! {
                     biased;
                     _ = &mut ended => break,
-                    _ = tokio::time::sleep_until(deadline) => break,
+                    _ = nabedra_rt::time::sleep_until(deadline) => break,
                     _ = ticks.tick() => {}
                 }
                 let renewed = tokio::select! {
                     biased;
                     _ = &mut ended => break,
-                    _ = tokio::time::sleep_until(deadline) => break,
-                    result = tokio::time::timeout(DELIVERY_RENEW_INTERVAL, backend.renew(token)) => {
+                    _ = nabedra_rt::time::sleep_until(deadline) => break,
+                    result = nabedra_rt::time::timeout(DELIVERY_RENEW_INTERVAL, backend.renew(token)) => {
                         result.unwrap_or(false)
                     }
                 };
@@ -413,7 +417,8 @@ impl DeliveryLease {
             if let Ok(admission) = backend.frontend().releases.try_admit() {
                 let _ = admission.spawn(move || async move {
                     let _ =
-                        tokio::time::timeout(Duration::from_secs(2), backend.release(token)).await;
+                        nabedra_rt::time::timeout(Duration::from_secs(2), backend.release(token))
+                            .await;
                     Ok(())
                 });
             }

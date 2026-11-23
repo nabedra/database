@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -270,13 +270,13 @@ impl QueueRuntime {
             changed.as_mut().enable();
             let nearest = {
                 let mut seals = self.seals.lock().unwrap();
-                let now = tokio::time::Instant::now();
+                let now = nabedra_rt::time::now();
                 seals.retain(|_, seal| seal.until > now);
                 seals.values().map(|seal| seal.until).min()
             };
             let expiration = async {
                 match nearest {
-                    Some(until) => tokio::time::sleep_until(until).await,
+                    Some(until) => nabedra_rt::time::sleep_until(until).await,
                     None => std::future::pending::<()>().await,
                 }
             };
@@ -292,11 +292,11 @@ impl QueueRuntime {
         changes: tokio::sync::OwnedMutexGuard<()>,
         stream_changes: tokio::sync::OwnedMutexGuard<()>,
     ) -> Uuid {
-        let token = Uuid::new_v4();
+        let token = nabedra_rt::ids::uuid_v4();
         self.seals.lock().unwrap().insert(
             token,
             QueueSeal {
-                until: tokio::time::Instant::now() + Duration::from_secs(30),
+                until: nabedra_rt::time::now() + Duration::from_secs(30),
                 _changes: changes,
                 _stream_changes: stream_changes,
             },
@@ -465,7 +465,7 @@ fn decode_pin(bytes: &[u8]) -> Result<LoadedClusterCatalog> {
     LoadedClusterCatalog::new(catalog, etag).map_err(|_| invalid())
 }
 pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
+    nabedra_rt::time::wall_now()
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
@@ -795,10 +795,7 @@ impl Worker {
                 .map_err(|_| invalid())?;
             if let Ok(response) = self
                 .client
-                .request(
-                    request,
-                    tokio::time::Instant::now() + Duration::from_secs(5),
-                )
+                .request(request, nabedra_rt::time::now() + Duration::from_secs(5))
                 .await
             {
                 if response.status() != 200 {
@@ -808,7 +805,7 @@ impl Worker {
                 let body = http::read_small(
                     response.into_body(),
                     length,
-                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    nabedra_rt::time::now() + Duration::from_secs(5),
                 )
                 .await?;
                 let value: Authorization = serde_json::from_slice(&body).map_err(|_| invalid())?;
@@ -1410,7 +1407,7 @@ impl Worker {
                     .seals
                     .lock()
                     .unwrap()
-                    .retain(|_, seal| seal.until > tokio::time::Instant::now());
+                    .retain(|_, seal| seal.until > nabedra_rt::time::now());
                 let fresh_grant = if let Some(context) = context.as_ref() {
                     let grant = self.open_database(context.clone()).await?;
                     let loaded = self.owned_catalog(root, &grant).await?;
@@ -1418,7 +1415,7 @@ impl Worker {
                         .storage()
                         .authorize_catalog_objects(
                             &loaded,
-                            tokio::time::Instant::now() + Duration::from_secs(30),
+                            nabedra_rt::time::now() + Duration::from_secs(30),
                         )
                         .await
                         .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
@@ -1496,7 +1493,7 @@ impl Worker {
                     if loaded.catalog().owner_cluster != Some(root.cluster_id) {
                         return Err(http::failure(crate::protocol::ErrorCode::Unauthorized));
                     }
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+                    let deadline = nabedra_rt::time::now() + Duration::from_secs(30);
                     storage
                         .authorize_catalog_objects(&loaded, deadline)
                         .await
@@ -1539,7 +1536,7 @@ impl Worker {
                     let budget = crate::storage::HistoryBudget::new(
                         4096,
                         64 << 20,
-                        tokio::time::Instant::now() + Duration::from_secs(30),
+                        nabedra_rt::time::now() + Duration::from_secs(30),
                     )
                     .map_err(|_| unavailable())?;
                     if let Some(decision) = storage
@@ -1574,7 +1571,7 @@ impl Worker {
                         let budget = crate::storage::HistoryBudget::new(
                             4096,
                             64 << 20,
-                            tokio::time::Instant::now() + Duration::from_secs(30),
+                            nabedra_rt::time::now() + Duration::from_secs(30),
                         )
                         .map_err(|_| unavailable())?;
                         if let Some(d) = storage
@@ -1637,7 +1634,7 @@ impl Worker {
                 .seals
                 .lock()
                 .unwrap()
-                .retain(|_, seal| seal.until > tokio::time::Instant::now());
+                .retain(|_, seal| seal.until > nabedra_rt::time::now());
             if let Ok(root) = self.root().await
                 && scheduler(&root)
                     .ok()
@@ -1688,7 +1685,7 @@ impl Worker {
                         .unwrap()
                         .get(&record.identity())
                         .is_some_and(|(count, until)| {
-                            *count >= 3 || *until > tokio::time::Instant::now()
+                            *count >= 3 || *until > nabedra_rt::time::now()
                         })
                     {
                         continue;
@@ -1723,7 +1720,7 @@ impl Worker {
                                     id.clone(),
                                     (
                                         count,
-                                        tokio::time::Instant::now()
+                                        nabedra_rt::time::now()
                                             + Duration::from_millis(50 * (1u64 << count.min(5))),
                                     ),
                                 );
@@ -1769,7 +1766,7 @@ impl Worker {
             } else {
                 self.queue.streams.scheduler_owner(false);
             }
-            tokio::select! {_=stop.changed()=>{},_=self.queue.changed.notified()=>{},_=tasks.join_next(),if !tasks.is_empty()=>{},_=tokio::time::sleep(Duration::from_millis(100))=>{}}
+            tokio::select! {_=stop.changed()=>{},_=self.queue.changed.notified()=>{},_=tasks.join_next(),if !tasks.is_empty()=>{},_=nabedra_rt::time::sleep(Duration::from_millis(100))=>{}}
         }
         while tasks.join_next().await.is_some() {}
         Ok(())
@@ -1976,7 +1973,7 @@ pub(super) async fn handler(
         let bytes = http::read_small(
             request.into_body(),
             length,
-            tokio::time::Instant::now() + Duration::from_secs(30),
+            nabedra_rt::time::now() + Duration::from_secs(30),
         )
         .await?;
         if http::digest(&bytes) != digest {
@@ -2159,9 +2156,10 @@ mod class_capacity_tests {
         let stream_copying = queue.lock_stream_changes().await;
         let copying = queue.lock_changes().await;
         let waiter_queue = queue.clone();
-        let waiter = tokio::spawn(async move { waiter_queue.lock_changes().await });
+        let waiter = nabedra_rt::task::spawn(async move { waiter_queue.lock_changes().await });
         let waiter_queue = queue.clone();
-        let stream_waiter = tokio::spawn(async move { waiter_queue.lock_stream_changes().await });
+        let stream_waiter =
+            nabedra_rt::task::spawn(async move { waiter_queue.lock_stream_changes().await });
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
         assert!(!stream_waiter.is_finished());
@@ -2178,11 +2176,11 @@ mod class_capacity_tests {
         assert!(!stream_waiter.is_finished());
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
-        let admitted = tokio::time::timeout(Duration::from_secs(1), waiter)
+        let admitted = nabedra_rt::time::timeout(Duration::from_secs(1), waiter)
             .await
             .expect("expired seal must wake the owned actor without a pump")
             .unwrap();
-        let stream_admitted = tokio::time::timeout(Duration::from_secs(1), stream_waiter)
+        let stream_admitted = nabedra_rt::time::timeout(Duration::from_secs(1), stream_waiter)
             .await
             .expect("expired seal must wake the stream actor without a pump")
             .unwrap();
@@ -2233,14 +2231,14 @@ mod expiry_tests {
     use crate::storage::context::RequestContext;
     #[test]
     fn t04_q05_terminal_reconciliation_reuses_original_version_and_rejects_mismatches() {
-        let member = Uuid::new_v4();
-        let id = Uuid::new_v4();
+        let member = nabedra_rt::ids::uuid_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let context:RequestContext=serde_json::from_value(serde_json::json!({"version":1,"bucket":"tenant-data","region":"eu-west-1","prefix":"db/","credentials":{"access_key_id":"original","secret_access_key":"original-secret","session_token":null,"expires_at":null}})).unwrap();
-        let body=serde_json::to_vec(&serde_json::json!({"request_id":id,"operation":"table.drop","payload":{"table_id":Uuid::new_v4()}})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"request_id":id,"operation":"table.drop","payload":{"table_id":nabedra_rt::ids::uuid_v4()}})).unwrap();
         let response =
             serde_json::to_vec(&serde_json::json!({"request_id":id,"data":null})).unwrap();
         let mut queue = RequestQueue::new(
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             1,
             1,
             QueueLimits {
@@ -2259,7 +2257,7 @@ mod expiry_tests {
         let observed = queue.acknowledge(key.clone(), member).unwrap();
         let decision = crate::storage::Decision {
             version: 1,
-            id: Uuid::new_v4(),
+            id: nabedra_rt::ids::uuid_v4(),
             parent: None,
             base_revision: 0,
             revision: 1,
@@ -2278,7 +2276,7 @@ mod expiry_tests {
             let mut changed = observed.clone();
             let mut d = decision.clone();
             match field {
-                0 => d.request_id = Uuid::new_v4(),
+                0 => d.request_id = nabedra_rt::ids::uuid_v4(),
                 1 => d.request_body.push(' '),
                 2 => d.response_status = 409,
                 3 => d.response_body.push(' '),
@@ -2309,11 +2307,11 @@ mod expiry_tests {
 
     #[test]
     fn sl03_t04_expired_reconciling_mutation_keeps_unknown_and_original_snapshot() {
-        let member = Uuid::new_v4();
-        let run = Uuid::new_v4();
-        let request_id = Uuid::new_v4();
+        let member = nabedra_rt::ids::uuid_v4();
+        let run = nabedra_rt::ids::uuid_v4();
+        let request_id = nabedra_rt::ids::uuid_v4();
         let context: RequestContext = serde_json::from_value(serde_json::json!({"version":1,"bucket":"tenant-data","region":"eu-west-1","prefix":"db/","credentials":{"access_key_id":"original-access","secret_access_key":"original-secret","session_token":null,"expires_at":"2026-11-16T20:00:00Z"}})).unwrap();
-        let body = serde_json::to_vec(&serde_json::json!({"request_id":request_id,"operation":"table.drop","payload":{"table_id":Uuid::new_v4()}})).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({"request_id":request_id,"operation":"table.drop","payload":{"table_id":nabedra_rt::ids::uuid_v4()}})).unwrap();
         let mut queue = RequestQueue::new(
             run,
             1,

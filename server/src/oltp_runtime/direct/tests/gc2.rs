@@ -15,8 +15,8 @@ async fn concurrent_inserts(
     let mut tasks = Vec::new();
     for id in first..first + count {
         let cluster = cluster.clone();
-        tasks.push(tokio::spawn(async move {
-            let request_id = Uuid::new_v4();
+        tasks.push(nabedra_rt::task::spawn(async move {
+            let request_id = nabedra_rt::ids::uuid_v4();
             let body = cluster.body(
                 request_id,
                 "table.insert",
@@ -125,7 +125,7 @@ async fn o03_d01_d03_gc2_concurrent_commits_share_entries_and_retries_replay_per
     let mut tasks = Vec::new();
     for (request_id, body, _) in results {
         let cluster = cluster.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(nabedra_rt::task::spawn(async move {
             let request = cluster.request(leader, &body, request_id);
             cluster.voters[leader]
                 .executor
@@ -177,7 +177,7 @@ async fn o08_gc2_same_key_requests_never_share_a_batch() {
     let mut tasks = Vec::new();
     for task in 0..32i64 {
         let cluster = cluster.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(nabedra_rt::task::spawn(async move {
             cluster
                 .op(
                     leader,
@@ -277,8 +277,8 @@ async fn d05_gc2_a_failed_batch_proposal_reaches_every_member() {
     let mut tasks = Vec::new();
     for id in 1..=24i64 {
         let cluster = cluster.clone();
-        tasks.push(tokio::spawn(async move {
-            let request_id = Uuid::new_v4();
+        tasks.push(nabedra_rt::task::spawn(async move {
+            let request_id = nabedra_rt::ids::uuid_v4();
             let body = cluster.body(
                 request_id,
                 "table.insert",

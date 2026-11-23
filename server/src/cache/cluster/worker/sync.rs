@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nabedra_rt::time::{self, MissedTickBehavior, interval, timeout};
 use serde::Serialize;
 use tokio::sync::oneshot;
-use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use crate::cache::command::SLOT_COUNT;
 
@@ -135,9 +135,9 @@ async fn progress(worker: &Worker, telemetry: bool) -> Vec<ActorReport> {
         }
     }
     let mut reports = Vec::with_capacity(receivers.len());
-    let due = tokio::time::Instant::now() + LOCAL_DEADLINE;
+    let due = time::now() + LOCAL_DEADLINE;
     for receiver in receivers {
-        if let Ok(Ok(report)) = tokio::time::timeout_at(due, receiver).await {
+        if let Ok(Ok(report)) = time::timeout_at(due, receiver).await {
             reports.push(report);
         }
     }
@@ -286,7 +286,7 @@ pub(super) async fn replicate(worker: Worker, tls: PeerTls) -> io::Result<()> {
             if lanes
                 .get(&source)
                 .and_then(|lane| lane.next_attempt)
-                .is_some_and(|next| next > Instant::now())
+                .is_some_and(|next| next > time::now_std())
             {
                 continue;
             }
@@ -307,7 +307,7 @@ pub(super) async fn replicate(worker: Worker, tls: PeerTls) -> io::Result<()> {
             };
             match copy(&worker, &tls, &member.peer, identity, &probes, lane).await {
                 Ok(()) => {
-                    lane.last_used = Some(Instant::now());
+                    lane.last_used = Some(time::now_std());
                     lane.failures = 0;
                     lane.next_attempt = None;
                 }
@@ -315,7 +315,7 @@ pub(super) async fn replicate(worker: Worker, tls: PeerTls) -> io::Result<()> {
                     lane.failures = (lane.failures + 1).min(4);
                     lane.session = None;
                     lane.next_attempt =
-                        Some(Instant::now() + Duration::from_millis(100 << lane.failures));
+                        Some(time::now_std() + Duration::from_millis(100 << lane.failures));
                 }
             }
         }
@@ -391,10 +391,10 @@ async fn sample(
             pending.push(result);
         }
     }
-    let until = tokio::time::Instant::now() + LOCAL_DEADLINE;
+    let until = time::now() + LOCAL_DEADLINE;
     let mut probes = Vec::new();
     for result in pending {
-        if let Ok(Ok(group)) = tokio::time::timeout_at(until, result).await {
+        if let Ok(Ok(group)) = time::timeout_at(until, result).await {
             probes.extend(group);
         }
     }

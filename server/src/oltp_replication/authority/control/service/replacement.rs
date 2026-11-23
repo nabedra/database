@@ -151,7 +151,7 @@ impl ControlHandle {
         token_digest: Digest,
     ) -> Result<ChargedBytes, ProtocolError> {
         self.read(move |view| {
-            let now = std::time::SystemTime::now()
+            let now = nabedra_rt::time::wall_now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| unauthorized())?
                 .as_secs();

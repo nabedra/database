@@ -21,10 +21,8 @@ use std::{
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
-use tokio::{
-    sync::{Mutex as AsyncMutex, Semaphore},
-    time::{Instant, sleep_until, timeout_at},
-};
+use nabedra_rt::time::{sleep_until, timeout_at};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use uuid::Uuid;
 
 const READ_GRANT_COPY_DEADLINE: Duration = Duration::from_secs(30);
@@ -599,11 +597,11 @@ impl QueueCoordinator {
                 let frame = &frame;
                 copies.push_back(async move {
                     #[cfg(test)]
-                    let started = std::time::Instant::now();
+                    let started = nabedra_rt::time::now_std();
                     let ack = if target == local {
                         CopyAcknowledgement::authenticated(local, version)
                     } else {
-                        let deadline = Instant::now() + QUEUE_COPY_SLOT_TIMEOUT;
+                        let deadline = nabedra_rt::time::now() + QUEUE_COPY_SLOT_TIMEOUT;
                         let _slot = timeout_at(deadline, self.copy_slots.acquire())
                             .await
                             .map_err(|_| QueueError::Unavailable.protocol())?
@@ -619,7 +617,7 @@ impl QueueCoordinator {
                             })?
                     };
                     #[cfg(test)]
-                    let timing = (target, started.elapsed());
+                    let timing = (target, nabedra_rt::time::now_std().saturating_duration_since(started));
                     #[cfg(not(test))]
                     let timing = ();
                     Ok::<_, ProtocolError>((ack, timing))
@@ -734,7 +732,7 @@ impl QueueCoordinator {
     ) -> Result<(), ProtocolError> {
         // One exchange's normal transport deadline bounds the whole ready-set
         // walk, including retries and fresh Control checks.
-        let deadline = Instant::now() + READ_GRANT_COPY_DEADLINE;
+        let deadline = nabedra_rt::time::now() + READ_GRANT_COPY_DEADLINE;
         let mut after = None;
         let mut delay = READ_GRANT_COPY_BACKOFF;
         let mut possibly_copied = false;
@@ -754,7 +752,7 @@ impl QueueCoordinator {
             };
             let Some(target) = target else { break };
             if target != current.owner {
-                if Instant::now() >= deadline {
+                if nabedra_rt::time::now() >= deadline {
                     return Err(QueueError::Unavailable.protocol());
                 }
                 let reply = timeout_at(
@@ -778,7 +776,7 @@ impl QueueCoordinator {
                     tracing::debug!(%id, worker=%target.worker_id, revision=set.revision,
                         code=?error.code, outcome=?error.outcome, message=%error.message,
                         "read grant copy awaits retry");
-                    let retry_at = Instant::now() + delay;
+                    let retry_at = nabedra_rt::time::now() + delay;
                     if retry_at >= deadline {
                         return Err(error);
                     }
@@ -796,7 +794,7 @@ impl QueueCoordinator {
                     if fresh != current {
                         return Err(QueueError::Stale.protocol());
                     }
-                    if Instant::now() >= deadline {
+                    if nabedra_rt::time::now() >= deadline {
                         return Err(error);
                     }
                     // Leave the cursor at the last acknowledged worker. The
@@ -838,14 +836,14 @@ impl QueueCoordinator {
         let settled = if current.owner == grant.worker {
             shared.read_attempts.settle(grant)
         } else {
-            tokio::time::timeout(std::time::Duration::from_secs(2),
+            nabedra_rt::time::timeout(std::time::Duration::from_secs(2),
                 self.peers.settle_read_grant(scope, current.ready.view, grant),
             ).await.unwrap_or_else(|_| Err(QueueError::Unavailable.protocol()))
         };
         if let Err(error) = settled {
             // Only a committed proof for this exact process can substitute
             // for the receiver's authenticated confirmation.
-            if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2),
+            if !matches!(nabedra_rt::time::timeout(std::time::Duration::from_secs(2),
                 self.authority.excludes_process(grant.worker),
             ).await, Ok(Ok(true))) {
                 return Err(error);

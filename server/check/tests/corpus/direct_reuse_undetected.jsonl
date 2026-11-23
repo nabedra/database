@@ -1,0 +1,6 @@
+{"type":"invoke","process":0,"f":"upsert","key":"k","value":{"id":"k","value":1},"request_id":"r1"}
+{"type":"ok","process":0,"f":"upsert","key":"k","value":null,"request_id":"r1"}
+{"type":"invoke","process":1,"f":"upsert","key":"k","value":{"id":"k","value":2},"request_id":"r1"}
+{"type":"ok","process":1,"f":"upsert","key":"k","value":null,"request_id":"r1"}
+{"type":"invoke","process":1,"f":"get","key":"k"}
+{"type":"ok","process":1,"f":"get","key":"k","value":{"id":"k","value":2}}

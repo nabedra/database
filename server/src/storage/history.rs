@@ -4,8 +4,8 @@ use super::{
     ObjectKey, ObjectStore, Storage, StorageError, WriteCondition,
 };
 use crate::protocol::MAX_CATALOG_BYTES;
+use nabedra_rt::time::{Instant, timeout_at};
 use serde::Deserialize;
-use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 /// A complete validated v3 representation and its nonempty opaque version.
@@ -74,7 +74,7 @@ impl HistoryBudget {
         self.deadline
     }
     fn check_deadline(&self) -> Result<(), StorageError> {
-        if Instant::now() >= self.deadline {
+        if nabedra_rt::time::now() >= self.deadline {
             Err(StorageError::Unavailable)
         } else {
             Ok(())

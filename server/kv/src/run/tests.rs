@@ -1195,6 +1195,7 @@ fn descriptor_cache_keeps_at_most_max_open_runs_and_reopens_transparently() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)] // short-lived test threads, joined before the test ends
 fn runs_serve_concurrent_readers_through_a_small_shared_cache() {
     let mut rng = Rng(99);
     let model = random_model(&mut rng, 2000);
@@ -1263,7 +1264,6 @@ fn bench_run_point_get_and_scan() {
 }
 
 fn bench_one_run(fs: &Arc<dyn Fs>, dir: &Path, id: u64, n: u64) {
-    use std::time::Instant;
     let key_of = |i: u64| {
         // 17-byte group prefix plus a row key, like the pool layout.
         let mut key = vec![0x40];
@@ -1274,7 +1274,7 @@ fn bench_one_run(fs: &Arc<dyn Fs>, dir: &Path, id: u64, n: u64) {
     };
     let mut keys: Vec<Vec<u8>> = (0..n).map(key_of).collect();
     keys.sort();
-    let start = Instant::now();
+    let start = nabedra_rt::time::now_std();
     let mut writer = RunWriter::create(
         &**fs,
         &dir.join(run_file_name(id)),
@@ -1317,7 +1317,7 @@ fn bench_one_run(fs: &Arc<dyn Fs>, dir: &Path, id: u64, n: u64) {
         }
         let read_bytes = |ctx: &RunReadContext| ctx.stats.block_read_bytes();
         let before = read_bytes(&ctx);
-        let t = Instant::now();
+        let t = nabedra_rt::time::now_std();
         for _ in 0..gets {
             let key = &keys[rng.below(n) as usize];
             let found = run.get(key, MAX_SEQ, true).unwrap();
@@ -1326,7 +1326,7 @@ fn bench_one_run(fs: &Arc<dyn Fs>, dir: &Path, id: u64, n: u64) {
         let hit_ns = t.elapsed().as_nanos() as f64 / f64::from(gets);
         let hit_bytes = (read_bytes(&ctx) - before) / u64::from(gets);
         let before = read_bytes(&ctx);
-        let t = Instant::now();
+        let t = nabedra_rt::time::now_std();
         for i in 0..gets {
             let mut key = key_of(n + u64::from(i));
             key.push(1);
@@ -1341,7 +1341,7 @@ fn bench_one_run(fs: &Arc<dyn Fs>, dir: &Path, id: u64, n: u64) {
         for scan in [10usize, 128] {
             let mut iter = run.iter(capacity > 0);
             let before = read_bytes(&ctx);
-            let t = Instant::now();
+            let t = nabedra_rt::time::now_std();
             for _ in 0..rounds {
                 let key = &keys[rng.below(n - scan as u64) as usize];
                 iter.seek(&internal_key(key, MAX_SEQ, Kind::Put));
@@ -1369,7 +1369,6 @@ fn bench_one_run(fs: &Arc<dyn Fs>, dir: &Path, id: u64, n: u64) {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
 fn bench_partitioned_index_get_bytes_under_small_caches() {
-    use std::time::Instant;
     let dir = std::env::temp_dir().join(format!("nabedra-kv-bench-part-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1427,7 +1426,7 @@ fn bench_partitioned_index_get_bytes_under_small_caches() {
         }
         let gets = 20_000u64;
         let before = bytes(&ctx);
-        let t = Instant::now();
+        let t = nabedra_rt::time::now_std();
         for _ in 0..gets {
             let key = &keys[rng.below(n) as usize];
             assert!(matches!(
@@ -1438,7 +1437,7 @@ fn bench_partitioned_index_get_bytes_under_small_caches() {
         let hit_ns = t.elapsed().as_nanos() as f64 / gets as f64;
         let hit_bytes = (bytes(&ctx) - before) / gets;
         let before = bytes(&ctx);
-        let t = Instant::now();
+        let t = nabedra_rt::time::now_std();
         for i in 0..gets {
             let mut key = key_of(n + i);
             key.push(1);

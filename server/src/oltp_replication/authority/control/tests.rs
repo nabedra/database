@@ -96,7 +96,7 @@ async fn control_dump(machine: &ControlMachine) -> Vec<(Vec<u8>, Vec<u8>)> {
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("nabedra-control-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("nabedra-control-{}", nabedra_rt::ids::uuid_v4()));
         std::fs::create_dir(&path).unwrap();
         Self(path)
     }
@@ -132,7 +132,7 @@ impl Fixture {
         Self {
             machine: ControlMachine::new(store).unwrap(),
             next,
-            base: (Uuid::new_v4().as_u128() >> 64) << 64,
+            base: (nabedra_rt::ids::uuid_v4().as_u128() >> 64) << 64,
             mirror: None,
         }
     }
@@ -154,8 +154,8 @@ impl Fixture {
         .unwrap();
         // Another worker's replica: its own worker and pool identity.
         let mut pool = pool;
-        pool.worker_id = Uuid::new_v4();
-        pool.pool_id = Uuid::new_v4();
+        pool.worker_id = nabedra_rt::ids::uuid_v4();
+        pool.pool_id = nabedra_rt::ids::uuid_v4();
         let pool = OltpPool::open_development(&directory.0, pool, shared).unwrap();
         let store = pool.group(scope).await.unwrap();
         self.mirror = Some(ControlMachine::new(store).unwrap().legacy_v1_for_test());
@@ -197,8 +197,8 @@ impl Fixture {
     async fn initialize(&mut self) -> ReadyMembership {
         let result = self
             .apply(ControlCommand::Initialize {
-                operation_id: Uuid::new_v4(),
-                run_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
+                run_id: nabedra_rt::ids::uuid_v4(),
                 authorization: authorization(),
             })
             .await;
@@ -211,7 +211,7 @@ impl Fixture {
         let worker = worker(self.base + number);
         let result = self
             .apply(ControlCommand::Enroll {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: None,
                 next: worker.clone(),
                 authorization: authorization(),
@@ -229,19 +229,19 @@ impl Fixture {
         kind: GroupKind,
         members: Vec<ReplicaMember>,
     ) -> GroupRecord {
-        let generation = Uuid::new_v4();
+        let generation = nabedra_rt::ids::uuid_v4();
         let group = GroupIdentity {
             group_id: if kind == GroupKind::Control {
                 self.machine.store().identity().group_id
             } else {
-                Uuid::new_v4()
+                nabedra_rt::ids::uuid_v4()
             },
             kind,
             ..self.machine.store().identity().clone()
         };
         assert!(matches!(
             self.apply(ControlCommand::BeginGroup {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 identity: group.clone(),
                 authorization: authorization()
@@ -253,7 +253,7 @@ impl Fixture {
         for page in members.chunks(128) {
             assert!(matches!(
                 self.apply(ControlCommand::GroupPage {
-                    operation_id: Uuid::new_v4(),
+                    operation_id: nabedra_rt::ids::uuid_v4(),
                     generation,
                     replicas: Page::new(page.to_vec()).unwrap()
                 })
@@ -273,7 +273,7 @@ impl Fixture {
         let authority = self.state().await.ready.view.authority();
         assert!(matches!(
             self.apply(ControlCommand::SealGroup {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 proof: GroupMembershipStamp {
                     group: group.clone(),
@@ -301,7 +301,7 @@ impl Fixture {
         current_members: &mut Vec<WorkerIdentity>,
     ) -> ReadyMembership {
         let state = self.state().await;
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let result = self
             .apply(ControlCommand::BeginJoin {
                 operation_id: id,
@@ -327,7 +327,7 @@ impl Fixture {
         for page in members.chunks(128) {
             assert!(matches!(
                 self.apply(ControlCommand::ReadyPage {
-                    operation_id: Uuid::new_v4(),
+                    operation_id: nabedra_rt::ids::uuid_v4(),
                     transition_id: id,
                     members: Page::new(page.to_vec()).unwrap()
                 })
@@ -337,7 +337,7 @@ impl Fixture {
         }
         let result = self
             .apply(ControlCommand::SealReady {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 transition_id: id,
             })
             .await;
@@ -355,7 +355,7 @@ impl Fixture {
             },
         };
         self.apply(ControlCommand::TimestampFenced {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             transition_id: id,
             receipt,
         })
@@ -363,14 +363,14 @@ impl Fixture {
         let proof = QueueCopyStatement {
             ticket,
             source: owner,
-            snapshot_id: Uuid::new_v4(),
+            snapshot_id: nabedra_rt::ids::uuid_v4(),
             snapshot_cut: 0,
             final_cut: 0,
             record_version_hash: hash(b"nabedra/ram-queue-cut/v1\0"),
         };
         assert_eq!(
             self.apply(ControlCommand::PublishReady {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 transition_id: id,
                 proof
             })
@@ -388,7 +388,7 @@ impl Fixture {
         actor: WorkerIdentity,
         action: ScopedQueueOperation,
     ) -> ControlReply {
-        let operation_id = Uuid::new_v4();
+        let operation_id = nabedra_rt::ids::uuid_v4();
         let authorization = action.requires_operator().then(|| AuthorizationStamp {
             authorization_id: operation_id,
             subject: actor.certificate_sha256,
@@ -456,12 +456,12 @@ impl Fixture {
     }
 }
 fn identities() -> (GroupIdentity, PoolIdentity) {
-    let cluster = Uuid::new_v4();
+    let cluster = nabedra_rt::ids::uuid_v4();
     (
         GroupIdentity {
             cluster_id: cluster,
             database: Text::try_from("default").unwrap(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Control,
             group_format_version: GROUP_FORMAT_VERSION,
         },
@@ -469,14 +469,14 @@ fn identities() -> (GroupIdentity, PoolIdentity) {
             engine: "oltp".into(),
             pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
             cluster_id: cluster,
-            worker_id: Uuid::new_v4(),
-            pool_id: Uuid::new_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
         },
     )
 }
 fn authorization() -> AuthorizationStamp {
     AuthorizationStamp {
-        authorization_id: Uuid::new_v4(),
+        authorization_id: nabedra_rt::ids::uuid_v4(),
         policy: Digest::from_bytes([1; 32]),
         subject: Digest::from_bytes([2; 32]),
         evidence: Digest::from_bytes([3; 32]),
@@ -485,7 +485,7 @@ fn authorization() -> AuthorizationStamp {
 fn worker(number: u128) -> WorkerEnrollment {
     WorkerEnrollment {
         worker_id: Uuid::from_u128(number),
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         certificate_sha256: hash(&number.to_be_bytes()),
         endpoint: Text::try_from("127.0.0.1:1").unwrap(),
         server_name: Text::try_from("localhost").unwrap(),
@@ -520,8 +520,8 @@ async fn o31_r01_r03_installed_scoped_transfer_rebases_after_ready_removal() {
     let group = fixture
         .register_group(
             GroupKind::Data {
-                table_id: Uuid::new_v4(),
-                shard_id: Uuid::new_v4(),
+                table_id: nabedra_rt::ids::uuid_v4(),
+                shard_id: nabedra_rt::ids::uuid_v4(),
             },
             members
                 .iter()
@@ -529,12 +529,12 @@ async fn o31_r01_r03_installed_scoped_transfer_rebases_after_ready_removal() {
                 .map(|(index, worker)| ReplicaMember {
                     node_id: index as u64 + 1,
                     worker_id: worker.worker_id,
-                    pool_id: Uuid::new_v4(),
+                    pool_id: nabedra_rt::ids::uuid_v4(),
                 })
                 .collect(),
         )
         .await;
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let run_id = initial.view.run_id;
     let ControlReply::ScopedQueue(previous) = fixture
         .apply(ControlCommand::EnsureScopedQueue {
@@ -586,7 +586,7 @@ async fn o31_r01_r03_installed_scoped_transfer_rebases_after_ready_removal() {
     let expected = fixture.state().await.ready.view;
     let ControlReply::JoinBegun { ticket, .. } = fixture
         .apply(ControlCommand::BeginRemoval {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             expected,
             target: removed,
             exclusion: ExclusionStamp {
@@ -677,7 +677,7 @@ async fn r03_control_pending_timestamp_fence_and_publication_survive_each_reopen
     let mut fixture = Fixture::open(&directory, scope.clone(), pool.clone()).await;
     let initial = fixture.initialize().await;
     let target = fixture.enroll(1).await;
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let ControlReply::JoinBegun { ticket, .. } = fixture
         .apply(ControlCommand::BeginJoin {
             operation_id: id,
@@ -690,14 +690,14 @@ async fn r03_control_pending_timestamp_fence_and_publication_survive_each_reopen
     };
     fixture
         .apply(ControlCommand::ReadyPage {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             transition_id: id,
             members: Page::new(vec![target]).unwrap(),
         })
         .await;
     let ControlReply::ReadySealed { expected, next, .. } = fixture
         .apply(ControlCommand::SealReady {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             transition_id: id,
         })
         .await
@@ -707,7 +707,7 @@ async fn r03_control_pending_timestamp_fence_and_publication_survive_each_reopen
     let proof = QueueCopyStatement {
         ticket,
         source: target,
-        snapshot_id: Uuid::new_v4(),
+        snapshot_id: nabedra_rt::ids::uuid_v4(),
         snapshot_cut: 0,
         final_cut: 0,
         record_version_hash: hash(b"nabedra/ram-queue-cut/v1\0"),
@@ -715,7 +715,7 @@ async fn r03_control_pending_timestamp_fence_and_publication_survive_each_reopen
     assert_eq!(
         fixture
             .apply(ControlCommand::PublishReady {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 transition_id: id,
                 proof: proof.clone()
             })
@@ -736,7 +736,7 @@ async fn r03_control_pending_timestamp_fence_and_publication_survive_each_reopen
         },
     };
     let ack = ControlCommand::TimestampFenced {
-        operation_id: Uuid::new_v4(),
+        operation_id: nabedra_rt::ids::uuid_v4(),
         transition_id: id,
         receipt: receipt.clone(),
     };
@@ -752,7 +752,7 @@ async fn r03_control_pending_timestamp_fence_and_publication_survive_each_reopen
     let mut fixture = Fixture::open(&directory, scope, pool).await;
     assert_eq!(fixture.apply(ack).await, first);
     assert_eq!(fixture.state().await.ready, initial);
-    let op = Uuid::new_v4();
+    let op = nabedra_rt::ids::uuid_v4();
     let publish = ControlCommand::PublishReady {
         operation_id: op,
         transition_id: id,
@@ -802,7 +802,7 @@ async fn o06_control_enrollment_cas_requires_exclusion_and_preserves_permanent_g
     let permanent = ReplicaMember {
         node_id: 41,
         worker_id: old.worker_id,
-        pool_id: Uuid::new_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
     };
     let group = fixture
         .register_group(GroupKind::Timestamps, vec![permanent.clone()])
@@ -812,7 +812,7 @@ async fn o06_control_enrollment_cas_requires_exclusion_and_preserves_permanent_g
     assert_eq!(
         fixture
             .apply(ControlCommand::Enroll {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: Some(old),
                 next: next.clone(),
                 authorization: authorization(),
@@ -829,7 +829,7 @@ async fn o06_control_enrollment_cas_requires_exclusion_and_preserves_permanent_g
     assert_eq!(
         fixture
             .apply(ControlCommand::Enroll {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: Some(old),
                 next: next.clone(),
                 authorization: authorization(),
@@ -880,21 +880,21 @@ async fn o14_o16_owner_service_checks_exact_receiver_in_published_membership() {
     let member = ReplicaMember {
         node_id: 41,
         worker_id: receiver.worker_id,
-        pool_id: Uuid::new_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
     };
     let original = fixture
         .register_group(GroupKind::Timestamps, vec![member.clone()])
         .await;
-    let generation = Uuid::new_v4();
+    let generation = nabedra_rt::ids::uuid_v4();
     let successor = ReplicaMember {
         node_id: 42,
-        pool_id: Uuid::new_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
         ..member.clone()
     };
     assert!(matches!(
         fixture
             .apply(ControlCommand::BeginGroupReplacement {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 expected: original.clone(),
                 authorization: authorization(),
@@ -905,7 +905,7 @@ async fn o14_o16_owner_service_checks_exact_receiver_in_published_membership() {
     assert!(matches!(
         fixture
             .apply(ControlCommand::GroupPage {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 replicas: Page::new(vec![successor.clone()]).unwrap(),
             })
@@ -958,7 +958,7 @@ async fn o14_o16_owner_service_checks_exact_receiver_in_published_membership() {
     assert!(matches!(
         fixture
             .apply(ControlCommand::SealGroup {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 proof: GroupMembershipStamp {
                     group: original.identity.clone(),
@@ -995,7 +995,7 @@ async fn o14_o16_owner_service_checks_exact_receiver_in_published_membership() {
         stale_service_route()
     );
     let wrong_incarnation = WorkerIdentity {
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         ..receiver
     };
     assert_eq!(
@@ -1032,18 +1032,18 @@ async fn o01_o14_initial_data_publication_resumes_exact_stage_and_preserves_seal
         members.push(ReplicaMember {
             node_id: index,
             worker_id: worker.worker_id,
-            pool_id: Uuid::new_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
         });
     }
     let group = GroupIdentity {
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Data {
-            table_id: Uuid::new_v4(),
-            shard_id: Uuid::new_v4(),
+            table_id: nabedra_rt::ids::uuid_v4(),
+            shard_id: nabedra_rt::ids::uuid_v4(),
         },
         ..scope
     };
-    let generation = Uuid::new_v4();
+    let generation = nabedra_rt::ids::uuid_v4();
     let initial = |replicas: Vec<ReplicaMember>, generation| {
         let proof = GroupMembershipStamp {
             group: group.clone(),
@@ -1064,7 +1064,7 @@ async fn o01_o14_initial_data_publication_resumes_exact_stage_and_preserves_seal
         authorization.evidence = serialized_digest(&proof).unwrap();
         authorization.subject = owner.certificate_sha256;
         ControlCommand::RegisterInitialData {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             proof,
             replicas: Page::new(replicas).unwrap(),
             authorization,
@@ -1073,7 +1073,7 @@ async fn o01_o14_initial_data_publication_resumes_exact_stage_and_preserves_seal
     assert!(matches!(
         fixture
             .apply(ControlCommand::BeginGroup {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 identity: group.clone(),
                 authorization: authorization(),
@@ -1084,7 +1084,7 @@ async fn o01_o14_initial_data_publication_resumes_exact_stage_and_preserves_seal
     assert!(matches!(
         fixture
             .apply(ControlCommand::GroupPage {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 replicas: Page::new(vec![members[0].clone()]).unwrap(),
             })
@@ -1092,7 +1092,7 @@ async fn o01_o14_initial_data_publication_resumes_exact_stage_and_preserves_seal
         ControlReply::GroupBuilding { count: 1, .. }
     ));
     let mut substituted = members.clone();
-    substituted[0].pool_id = Uuid::new_v4();
+    substituted[0].pool_id = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         fixture.apply(initial(substituted, generation)).await,
         ControlReply::Rejected(Fault::Conflict)
@@ -1112,7 +1112,7 @@ async fn o01_o14_initial_data_publication_resumes_exact_stage_and_preserves_seal
     );
     assert_eq!(
         fixture
-            .apply(initial(members.clone(), Uuid::new_v4()))
+            .apply(initial(members.clone(), nabedra_rt::ids::uuid_v4()))
             .await,
         ControlReply::Rejected(Fault::Conflict)
     );
@@ -1235,7 +1235,7 @@ async fn u02_control_model_inventory_pages_empty_intermediate_final_and_exhauste
     assert_eq!(model.reads.load(Ordering::Acquire), 5);
     assert!(handle.workers(299, None).await.is_err());
     let wrong = QueueScope {
-        cluster_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
         database: Text::try_from("default").unwrap(),
     };
     assert!(handle.current(&wrong).await.is_err());
@@ -1256,7 +1256,7 @@ async fn c07_terminal_reader_requires_current_enrollment_and_same_database_tso_m
             vec![ReplicaMember {
                 node_id: 7,
                 worker_id: reader.worker_id,
-                pool_id: Uuid::new_v4(),
+                pool_id: nabedra_rt::ids::uuid_v4(),
             }],
         )
         .await;
@@ -1293,7 +1293,7 @@ async fn c07_terminal_reader_requires_current_enrollment_and_same_database_tso_m
             .is_err()
     );
     let mut obsolete = reader;
-    obsolete.incarnation = Uuid::new_v4();
+    obsolete.incarnation = nabedra_rt::ids::uuid_v4();
     assert!(
         handle
             .terminal_reader_view(&queue_scope, obsolete, timestamps.identity.group_id)
@@ -1302,7 +1302,7 @@ async fn c07_terminal_reader_requires_current_enrollment_and_same_database_tso_m
     );
     assert!(
         handle
-            .terminal_reader_view(&queue_scope, reader, Uuid::new_v4())
+            .terminal_reader_view(&queue_scope, reader, nabedra_rt::ids::uuid_v4())
             .await
             .is_err()
     );
@@ -1323,15 +1323,15 @@ async fn r04_control_cold_fence_waits_for_every_group_and_old_worker_exclusion()
             vec![ReplicaMember {
                 node_id: 8,
                 worker_id: owner.worker_id,
-                pool_id: Uuid::new_v4(),
+                pool_id: nabedra_rt::ids::uuid_v4(),
             }],
         )
         .await;
-    let transition = Uuid::new_v4();
+    let transition = nabedra_rt::ids::uuid_v4();
     let begin = ControlCommand::BeginColdFence {
         operation_id: transition,
         expected: ready,
-        next_run: Uuid::new_v4(),
+        next_run: nabedra_rt::ids::uuid_v4(),
         authorization: authorization(),
     };
     let ControlReply::FenceBegun {
@@ -1348,14 +1348,14 @@ async fn r04_control_cold_fence_waits_for_every_group_and_old_worker_exclusion()
     assert_eq!(
         fixture
             .apply(ControlCommand::PublishFence {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 transition_id: transition
             })
             .await,
         ControlReply::Rejected(Fault::Incomplete)
     );
     let ack = ControlCommand::GroupFenced {
-        operation_id: Uuid::new_v4(),
+        operation_id: nabedra_rt::ids::uuid_v4(),
         receipt: GroupFenceReceipt {
             transition_id: transition,
             group: group.identity,
@@ -1396,7 +1396,7 @@ async fn r04_control_cold_fence_waits_for_every_group_and_old_worker_exclusion()
     assert_eq!(
         fixture
             .apply(ControlCommand::PublishFence {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 transition_id: transition
             })
             .await,
@@ -1412,7 +1412,7 @@ async fn r04_control_cold_fence_waits_for_every_group_and_old_worker_exclusion()
     assert!(matches!(
         fixture
             .apply(ControlCommand::ExcludedPage {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 transition_id: transition,
                 workers: Page::new(vec![proof]).unwrap()
             })
@@ -1424,7 +1424,7 @@ async fn r04_control_cold_fence_waits_for_every_group_and_old_worker_exclusion()
         }
     ));
     let publish = ControlCommand::PublishFence {
-        operation_id: Uuid::new_v4(),
+        operation_id: nabedra_rt::ids::uuid_v4(),
         transition_id: transition,
     };
     assert_eq!(
@@ -1452,7 +1452,7 @@ async fn r04_control_cold_fence_waits_for_every_group_and_old_worker_exclusion()
     assert_eq!(
         fixture
             .apply(ControlCommand::BeginColdFence {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: next,
                 next_run: ready.view.run_id,
                 authorization: authorization(),
@@ -1489,11 +1489,11 @@ async fn u02_control_administration_rejects_worker_lane_and_unpinned_certificate
         remote,
         scope.clone(),
         Purpose::QueueControl,
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
     );
     assert!(
         handle
-            .initialize(&wrong_lane, Uuid::new_v4(), Uuid::new_v4())
+            .initialize(&wrong_lane, nabedra_rt::ids::uuid_v4(), nabedra_rt::ids::uuid_v4())
             .await
             .is_err()
     );
@@ -1502,19 +1502,19 @@ async fn u02_control_administration_rejects_worker_lane_and_unpinned_certificate
         WorkerIdentity::from(&worker(3)),
         scope.clone(),
         Purpose::Authority,
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
     );
     assert!(
         handle
-            .initialize(&unknown, Uuid::new_v4(), Uuid::new_v4())
+            .initialize(&unknown, nabedra_rt::ids::uuid_v4(), nabedra_rt::ids::uuid_v4())
             .await
             .is_err()
     );
     assert_eq!(model.next.load(Ordering::Acquire), 0);
     let allowed =
-        AuthenticatedSession::for_test(local, remote, scope, Purpose::Authority, Uuid::new_v4());
-    let id = Uuid::new_v4();
-    let run = Uuid::new_v4();
+        AuthenticatedSession::for_test(local, remote, scope, Purpose::Authority, nabedra_rt::ids::uuid_v4());
+    let id = nabedra_rt::ids::uuid_v4();
+    let run = nabedra_rt::ids::uuid_v4();
     let first = handle.initialize(&allowed, id, run).await.unwrap();
     assert!(matches!(first.reply, ControlReply::Initialized { .. }));
     let retry = handle.initialize(&allowed, id, run).await.unwrap();
@@ -1527,8 +1527,8 @@ async fn c07_committed_control_apply_uses_private_budget_when_transport_progress
     let (scope, pool) = identities();
     let fixture = Fixture::open(&directory, scope, pool).await;
     let command = ControlCommand::Initialize {
-        operation_id: Uuid::new_v4(),
-        run_id: Uuid::new_v4(),
+        operation_id: nabedra_rt::ids::uuid_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
         authorization: authorization(),
     };
     let digest = serialized_digest(&command).unwrap();
@@ -1574,7 +1574,7 @@ async fn c07_q06_control_authorized_terminal_metadata_progresses_with_query_slot
         },
         request_queue::QueueLimits,
     };
-    use tokio::time::{Duration, timeout};
+    use nabedra_rt::time::{Duration, timeout};
     let directory = Directory::new();
     let (scope, pool) = identities();
     let worker_id = pool.worker_id;
@@ -1584,7 +1584,7 @@ async fn c07_q06_control_authorized_terminal_metadata_progresses_with_query_slot
     let local = WorkerIdentity::from(&enrollment);
     fixture
         .apply(ControlCommand::Enroll {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             expected: None,
             next: enrollment,
             authorization: authorization(),
@@ -1599,7 +1599,7 @@ async fn c07_q06_control_authorized_terminal_metadata_progresses_with_query_slot
             vec![ReplicaMember {
                 node_id: 2,
                 worker_id: reader.worker_id,
-                pool_id: Uuid::new_v4(),
+                pool_id: nabedra_rt::ids::uuid_v4(),
             }],
         )
         .await;
@@ -1636,7 +1636,7 @@ async fn c07_q06_control_authorized_terminal_metadata_progresses_with_query_slot
         },
     )
     .unwrap();
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body =
         format!(r#"{{"request_id":"{id}","operation":"table.list","payload":{{}}}}"#).into_bytes();
     let digest = hash(&body);
@@ -1654,10 +1654,10 @@ async fn c07_q06_control_authorized_terminal_metadata_progresses_with_query_slot
                 run_id: authority.ready.view.run_id,
                 request_id: id,
                 digest,
-                nonce: Uuid::new_v4(),
+                nonce: nabedra_rt::ids::uuid_v4(),
             },
             storage_pin: StoragePin {
-                pin_id: Uuid::new_v4(),
+                pin_id: nabedra_rt::ids::uuid_v4(),
                 read_ts: Timestamp::new(1).unwrap(),
                 allocator_epoch: 1,
             },
@@ -1729,7 +1729,7 @@ async fn c07_q06_control_authorized_terminal_metadata_progresses_with_query_slot
         )
         .unwrap();
     let session =
-        AuthenticatedSession::for_test(local, reader, scope, Purpose::QueueControl, Uuid::new_v4());
+        AuthenticatedSession::for_test(local, reader, scope, Purpose::QueueControl, nabedra_rt::ids::uuid_v4());
     let plan = timeout(
         Duration::from_secs(2),
         endpoint.preflight(&session, header.as_ref()),
@@ -1771,7 +1771,7 @@ async fn u01_api_ingress_enrollment_never_grants_worker_readiness_or_replica_pro
     assert_eq!(
         fixture
             .apply(ControlCommand::EnrollApi {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: None,
                 next: api.clone(),
                 authorization: authorization(),
@@ -1780,14 +1780,14 @@ async fn u01_api_ingress_enrollment_never_grants_worker_readiness_or_replica_pro
         ControlReply::Enrolled(previous)
     );
     let mut rotated = api.clone();
-    rotated.enrollment.incarnation = Uuid::new_v4();
+    rotated.enrollment.incarnation = nabedra_rt::ids::uuid_v4();
     rotated.enrollment.certificate_sha256 = hash(b"rotated API certificate");
     rotated.enrollment.enrollment_revision += 1;
     let current = WorkerIdentity::from(rotated.transport());
     assert_eq!(
         fixture
             .apply(ControlCommand::EnrollApi {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: Some(previous),
                 next: rotated.clone(),
                 authorization: authorization(),
@@ -1799,7 +1799,7 @@ async fn u01_api_ingress_enrollment_never_grants_worker_readiness_or_replica_pro
     assert!(matches!(
         fixture
             .apply(ControlCommand::BeginJoin {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: ready.view,
                 target: current,
             })
@@ -1809,7 +1809,7 @@ async fn u01_api_ingress_enrollment_never_grants_worker_readiness_or_replica_pro
     assert_eq!(
         fixture
             .apply(ControlCommand::Enroll {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: None,
                 next: rotated.enrollment.clone(),
                 authorization: authorization(),

@@ -268,7 +268,7 @@ impl WorkerRuntime {
                     {
                         return Err(bounds_unavailable());
                     }
-                    let now = std::time::SystemTime::now()
+                    let now = nabedra_rt::time::wall_now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_err(|_| bounds_unavailable())?
                         .as_secs();

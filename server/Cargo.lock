@@ -1930,6 +1930,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "libc",
+ "nabedra-rt",
  "tokio",
 ]
 
@@ -1937,6 +1938,20 @@ dependencies = [
 name = "nabedra-rt"
 version = "0.1.0"
 dependencies = [
+ "openraft-rt",
+ "openraft-rt-tokio",
+ "rand 0.10.4",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "nabedra-sim"
+version = "0.1.0"
+dependencies = [
+ "nabedra-check",
+ "nabedra-rt",
+ "serde_json",
  "tokio",
  "uuid",
 ]

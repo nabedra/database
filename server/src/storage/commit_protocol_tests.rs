@@ -18,7 +18,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::atomic::{AtomicU64, Ordering},
 };
-use tokio::time::{Duration, Instant};
+use tokio::time::Duration;
 use uuid::Uuid;
 
 /// Planted bugs, applied by a wrapper around the sim store.
@@ -77,7 +77,7 @@ fn budget() -> HistoryBudget {
     HistoryBudget::new(
         1000,
         1000 * MAX_DECISION_BYTES,
-        Instant::now() + Duration::from_secs(30),
+        nabedra_rt::time::now() + Duration::from_secs(30),
     )
     .unwrap()
 }
@@ -607,11 +607,12 @@ fn t05(delay: u64, hold: bool) -> Result<bool, String> {
             }
             Err("fence starved".to_string())
         };
-        let (outcome, fence) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(prepared.publish(&s, budget()), new_run)
-        })
-        .await
-        .map_err(|_| "old publication or new-run fence did not finish".to_string())?;
+        let (outcome, fence) =
+            nabedra_rt::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(prepared.publish(&s, budget()), new_run)
+            })
+            .await
+            .map_err(|_| "old publication or new-run fence did not finish".to_string())?;
         let fence = fence?;
         sim.apply_delayed();
         let (root, chain) = chain(&s).await?;

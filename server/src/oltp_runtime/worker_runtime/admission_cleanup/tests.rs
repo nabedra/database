@@ -8,7 +8,8 @@ use crate::{
 };
 use serde_json::json;
 use std::path::PathBuf;
-use tokio::{sync::Semaphore, time::timeout};
+use nabedra_rt::time::timeout;
+use tokio::sync::Semaphore;
 
 pub(super) struct CleanupPause {
     pub(super) id: Uuid,
@@ -105,7 +106,7 @@ async fn assert_pin_cancelled(
 async fn q02_q06_o09_o13_same_term_ready_revision_reconciles_admission_rejection() {
     timeout(Duration::from_secs(45), async {
         let path = TestDirectory(
-            std::env::temp_dir().join(format!("nabedra-admission-{}", Uuid::new_v4())),
+            std::env::temp_dir().join(format!("nabedra-admission-{}", nabedra_rt::ids::uuid_v4())),
         );
         let runtime = WorkerRuntime::open(
             &path.0,
@@ -137,7 +138,7 @@ async fn q02_q06_o09_o13_same_term_ready_revision_reconciles_admission_rejection
         previous.validate().unwrap();
         assert_eq!(previous.authority(), fresh.ready.view.authority());
 
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let body = create_body(id, "never_accepted");
         let (slot, pending_rejection) = pending(&runtime, body.clone(), previous).await;
         let digest = pending_rejection.cap.reservation.digest;
@@ -188,7 +189,7 @@ async fn q02_q06_o09_o13_same_term_ready_revision_reconciles_admission_rejection
             .unwrap_err();
         assert_eq!(conflict.code, ErrorCode::Conflict);
 
-        let unrelated = Uuid::new_v4();
+        let unrelated = nabedra_rt::ids::uuid_v4();
         let record = runtime
             .admit(create_body(unrelated, "ordinary"))
             .await
@@ -230,7 +231,7 @@ async fn q02_q06_o09_o13_same_term_ready_revision_reconciles_admission_rejection
 
         // The other ordering leaves Status Reserved after the lost attempt. The
         // same live gate can establish absence again at the current ready view.
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let (slot, pending_rejection) =
             pending(&runtime, create_body(id, "reproved"), previous).await;
         let digest = pending_rejection.cap.reservation.digest;

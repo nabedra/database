@@ -116,7 +116,7 @@ impl WorkerRuntime {
         }
         let runtime = self.clone();
         let destination = destination.to_path_buf();
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             let gate = runtime.gate(owner.backup_id)?;
             let _gate = gate.lock_owned().await;
             ensure_private_directory(&destination)?;
@@ -347,7 +347,7 @@ impl WorkerRuntime {
             write_locator(&destination, &recorded)?;
             return Ok(recorded);
         }
-        let staging = TemporaryArchiveFile(destination.join(format!(".stage-{}", Uuid::new_v4())));
+        let staging = TemporaryArchiveFile(destination.join(format!(".stage-{}", nabedra_rt::ids::uuid_v4())));
         let file = OpenOptions::new()
             .create_new(true)
             .mode(0o600)
@@ -631,13 +631,13 @@ impl WorkerRuntime {
                 Err(error) if error.code == ErrorCode::SplitPublicationPending => {
                     // A base cut between copy and publication still owns the
                     // old route. Retry the same cut once the source settles.
-                    let now = tokio::time::Instant::now();
+                    let now = nabedra_rt::time::now();
                     let deadline = *pending_deadline
                         .get_or_insert_with(|| now + std::time::Duration::from_secs(30));
                     if now >= deadline {
                         return Err(error);
                     }
-                    tokio::time::sleep_until((now + pending_backoff).min(deadline)).await;
+                    nabedra_rt::time::sleep_until((now + pending_backoff).min(deadline)).await;
                     pending_backoff =
                         (pending_backoff * 2).min(std::time::Duration::from_millis(250));
                     continue;
@@ -1087,7 +1087,7 @@ fn write_local_record(
     limit: usize,
 ) -> Result<(), ProtocolError> {
     let path = directory.join(name);
-    let temporary = TemporaryArchiveFile(directory.join(format!(".record-{}", Uuid::new_v4())));
+    let temporary = TemporaryArchiveFile(directory.join(format!(".record-{}", nabedra_rt::ids::uuid_v4())));
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -1205,7 +1205,7 @@ impl WorkerRuntime {
             return Err(unknown());
         }
         let probe_owner = BackupOwnerRef {
-            backup_id: Uuid::new_v4(),
+            backup_id: nabedra_rt::ids::uuid_v4(),
             attempt: 1,
         };
         let probe = runtime
@@ -1225,7 +1225,7 @@ impl WorkerRuntime {
                     crate::oltp::backup::lifecycle::BackupCancelledStatement {
                         owner: probe_owner,
                         pin: probe,
-                        archive_id: Uuid::new_v4(),
+                        archive_id: nabedra_rt::ids::uuid_v4(),
                     },
                 )?,
             )

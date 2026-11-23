@@ -602,12 +602,12 @@ mod tests {
     fn o06_permanent_membership_excludes_duplicate_physical_voters() {
         let member = ReplicaMember {
             node_id: 1,
-            worker_id: Uuid::new_v4(),
-            pool_id: Uuid::new_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
         };
         let mut duplicate = member.clone();
         duplicate.node_id = 2;
-        duplicate.pool_id = Uuid::new_v4();
+        duplicate.pool_id = nabedra_rt::ids::uuid_v4();
         assert!(validate_voters(&[member.clone(), duplicate]).is_err());
         assert!(validate_voters(&[member]).is_ok());
     }

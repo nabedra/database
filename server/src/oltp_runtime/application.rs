@@ -871,15 +871,15 @@ fn q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity() {
     use crate::oltp::pool::SharedResourceConfig;
     use crate::request_queue::{QueueLimits, RequestQueue};
 
-    let member = Uuid::new_v4();
-    let id = Uuid::new_v4();
+    let member = nabedra_rt::ids::uuid_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let body = serde_json::to_vec(&serde_json::json!({
         "request_id": id, "operation": "table.create",
         "payload": {"name": "items", "schema": {"id": "int64"}, "key": "id", "format": "parquet"},
     }))
     .unwrap();
     let mut queue = RequestQueue::new(
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
         1,
         1,
         QueueLimits {
@@ -909,7 +909,7 @@ fn q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity() {
         .unwrap();
     let identity = WorkerIdentity {
         worker_id: member,
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         certificate_sha256: Digest::from_bytes([1; 32]),
         enrollment_revision: 1,
     };
@@ -918,13 +918,13 @@ fn q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity() {
         identity,
         GroupIdentity {
             database: Text::try_from("bug1").unwrap(),
-            cluster_id: Uuid::new_v4(),
-            group_id: Uuid::new_v4(),
+            cluster_id: nabedra_rt::ids::uuid_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             group_format_version: 1,
             kind: GroupKind::Control,
         },
         Purpose::ApiIngress,
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
     );
     let retained = shared
         .encode_in(ByteClass::Progress, &accepted, 16 << 10)
@@ -963,8 +963,8 @@ fn q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity() {
 fn c07_m02_q04_observation_opt_in_checks_exact_bytes() {
     use sha2::{Digest as _, Sha256};
 
-    let run = Uuid::new_v4();
-    let id = Uuid::new_v4();
+    let run = nabedra_rt::ids::uuid_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let legacy = serde_json::json!({"observe": {"run_id": run, "request_id": id}});
     assert!(matches!(
         serde_json::from_value::<Method>(legacy).unwrap(),

@@ -22,7 +22,6 @@ use std::time::Duration;
 mod resources;
 mod settlement;
 pub(super) use resources::RemoteScheduler;
-use tokio::time::Instant;
 use uuid::Uuid;
 
 fn error(code: ErrorCode) -> ProtocolError {
@@ -201,7 +200,7 @@ impl Peers<'_> {
             grant,
             child,
             || self.settlement_evidence(target, permit),
-            tokio::time::sleep,
+            nabedra_rt::time::sleep,
         )
         .await;
         self.opened.lock().await.remove(&permit);
@@ -262,7 +261,7 @@ impl Peers<'_> {
             Ok((context, framed))
         })
         .await?;
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = nabedra_rt::time::now() + Duration::from_secs(30);
         let request = self.worker.signer.request(
             &endpoint,
             &context,
@@ -280,7 +279,7 @@ impl Peers<'_> {
         let a = http::one(response.headers(), "x-nabedra-auth")?.to_owned();
         let sig = http::one(response.headers(), "x-nabedra-signature")?.to_owned();
         let mut reader = http::framed_reader(response.into_body());
-        let first = tokio::time::timeout_at(deadline, reader.next_frame())
+        let first = nabedra_rt::time::timeout_at(deadline, reader.next_frame())
             .await
             .map_err(|_| unavailable())?
             .map_err(|_| invalid())?
@@ -327,7 +326,7 @@ impl Peers<'_> {
         job: JobEnvelope,
         source: &super::payload_owner::ForkSource,
     ) -> Result<(job::ResultEnvelope, PayloadLease)> {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = nabedra_rt::time::now() + Duration::from_secs(60);
         self.current().await?;
         let root = self.worker.root().await?;
         let view = self.worker.remote_scheduler.view(&root)?;
@@ -346,7 +345,7 @@ impl Peers<'_> {
             .fork_stream(source, deadline)
             .await
             .map_err(|_| unavailable())?;
-        let permit = Uuid::new_v4();
+        let permit = nabedra_rt::ids::uuid_v4();
         let mut may_exist = false;
         let mut verified_settled = false;
         let result = async {
@@ -447,7 +446,7 @@ async fn execute_inner(
     lease: &mut PayloadLease,
 ) -> Result<EncodedResponse> {
     let is_mutation = request.operation.is_mutation();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = nabedra_rt::time::now() + Duration::from_secs(60);
     let budget = HistoryBudget::new(4096, 64 * 1024 * 1024, deadline).map_err(|_| unavailable())?;
     for _ in 0..3 {
         let storage = peers.data.storage();
@@ -499,7 +498,7 @@ async fn execute_inner(
             Some(HistoryLookup::IdentityConflict) => return Err(error(ErrorCode::Conflict)),
             _ => {}
         }
-        let commit = Uuid::new_v4();
+        let commit = nabedra_rt::ids::uuid_v4();
         let tables = loaded.catalog().tables.clone();
         let calculated = calculate(peers, &loaded, request.operation.clone(), commit, lease).await;
         let (tables, encoded) = match calculated {
@@ -657,8 +656,8 @@ fn envelope(
         version: 1,
         cluster_id: peers.worker.ready.prepared.input.value.cluster_id,
         operation_id: peers.binding.operation_id(),
-        job_id: Uuid::new_v4(),
-        attempt_id: Uuid::new_v4(),
+        job_id: nabedra_rt::ids::uuid_v4(),
+        attempt_id: nabedra_rt::ids::uuid_v4(),
         request_digest: peers.digest.clone(),
         snapshot: job::Snapshot {
             catalog_revision: loaded.catalog().revision,
@@ -685,7 +684,7 @@ async fn calculate(
                 return Err(error(ErrorCode::Conflict));
             }
             let table = TableDescriptor {
-                id: Uuid::new_v4(),
+                id: nabedra_rt::ids::uuid_v4(),
                 name: p.name,
                 schema: p.schema,
                 key: p.key,

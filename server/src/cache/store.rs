@@ -2,7 +2,7 @@
 use std::{
     collections::{HashSet, hash_map::RandomState},
     mem::size_of,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bytes::Bytes;

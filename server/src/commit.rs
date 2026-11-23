@@ -57,7 +57,7 @@ impl<B: ObjectStore> Coordinator<B> {
             _guard: guard,
             loaded,
             revision,
-            commit_id: Uuid::new_v4(),
+            commit_id: nabedra_rt::ids::uuid_v4(),
         })
     }
 }

@@ -1,11 +1,11 @@
 //! Engine-neutral framing for the explicitly inherited local supervisor socket.
 //! No application request, credential, provider or storage semantics live here.
+use nabedra_rt::time::{Duration, Instant, timeout_at};
 use serde::Serialize;
 use std::io;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
-    time::{Duration, Instant, timeout_at},
 };
 const MAX_FRAME: usize = 16 << 10;
 fn invalid() -> io::Error {
@@ -26,7 +26,7 @@ pub(crate) async fn frame(stream: &mut UnixStream, end: Option<Instant>) -> io::
             stream.read_exact(&mut first).await?;
         }
     }
-    let end = end.unwrap_or_else(|| Instant::now() + Duration::from_secs(2));
+    let end = end.unwrap_or_else(|| nabedra_rt::time::now() + Duration::from_secs(2));
     let mut prefix = [0; 4];
     prefix[0] = first[0];
     timeout_at(end, stream.read_exact(&mut prefix[1..]))

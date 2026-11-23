@@ -1078,9 +1078,9 @@ fn ns08_spare_segments_are_prepared_off_the_commit_path() {
     let (j, _) = Journal::open(Arc::new(fs.clone()), dir, options, 0, sink).unwrap();
     let free = |j: &Journal| lock(&j.shared.table).free.len();
     let wait_for_spare = |j: &Journal| {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = nabedra_rt::time::now_std() + std::time::Duration::from_secs(10);
         while free(j) == 0 {
-            assert!(std::time::Instant::now() < deadline, "no spare prepared");
+            assert!(nabedra_rt::time::now_std() < deadline, "no spare prepared");
             std::thread::yield_now();
         }
     };
@@ -1268,9 +1268,9 @@ fn ns04_kvfix4_kill_before_a_rolls_dir_sync_then_crash_after_reopen_keeps_synced
         put(&j, format!("a{i:03}")).unwrap();
         synced += 1;
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = nabedra_rt::time::now_std() + std::time::Duration::from_secs(10);
     while free(&j) == 0 {
-        assert!(std::time::Instant::now() < deadline, "no spare prepared");
+        assert!(nabedra_rt::time::now_std() < deadline, "no spare prepared");
         std::thread::yield_now();
     }
     let newest = j.segments().iter().map(|s| s.segment).max().unwrap();

@@ -149,7 +149,7 @@ impl<B: ObjectStore> Engine<B> {
             return Err(failure(ErrorCode::Conflict, "table name already exists"));
         }
         let table = TableDescriptor {
-            id: Uuid::new_v4(),
+            id: nabedra_rt::ids::uuid_v4(),
             name: payload.name,
             schema: payload.schema,
             key: payload.key,

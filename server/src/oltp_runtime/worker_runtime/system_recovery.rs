@@ -70,7 +70,7 @@ impl WorkerRuntime {
         request_id: Uuid,
     ) -> Result<EncodedResponse, ProtocolError> {
         self.require_system_replacement_operator()?;
-        let position = tokio::time::timeout(
+        let position = nabedra_rt::time::timeout(
             CHECK_TIMEOUT,
             self.services.control.enable_system_replacement(
                 &self.services.manager,
@@ -134,7 +134,7 @@ impl WorkerRuntime {
             run_id: intent.run_id,
             previous: intent.previous,
         };
-        let checked = tokio::time::timeout(CHECK_TIMEOUT, self.check_surviving_groups(&check))
+        let checked = nabedra_rt::time::timeout(CHECK_TIMEOUT, self.check_surviving_groups(&check))
             .await
             .map_err(|_| quorum_unavailable())??;
         let groups = checked
@@ -142,7 +142,7 @@ impl WorkerRuntime {
             .into_iter()
             .map(|(record, old)| ReplacementGroup::new(record, old, &intent))
             .collect::<Result<Vec<_>, _>>()?;
-        let record = tokio::time::timeout(
+        let record = nabedra_rt::time::timeout(
             CHECK_TIMEOUT,
             control.prepare_system_replacement(
                 &self.services.manager,
@@ -203,7 +203,7 @@ impl WorkerRuntime {
         check: ReplacementCheck,
     ) -> Result<EncodedResponse, ProtocolError> {
         self.require_system_replacement_operator()?;
-        let checked = tokio::time::timeout(CHECK_TIMEOUT, self.check_surviving_groups(&check))
+        let checked = nabedra_rt::time::timeout(CHECK_TIMEOUT, self.check_surviving_groups(&check))
             .await
             .map_err(|_| quorum_unavailable())??;
         let groups = checked

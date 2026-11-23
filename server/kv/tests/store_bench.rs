@@ -3,6 +3,7 @@
 //! `cargo test --release -p nabedra-kv --test store_bench -- --ignored --nocapture`
 //! on `RealFs` in a temp dir: point gets, short scans, synced and unsynced puts with
 //! 1, 8 and 64 writers, and flush and compaction throughput.
+#![allow(clippy::disallowed_methods)] // integration tests are outside the phase 7 conversion, which covers kv/src
 
 mod common;
 

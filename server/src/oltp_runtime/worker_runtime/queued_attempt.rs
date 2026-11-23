@@ -63,8 +63,8 @@ impl WorkerRuntime {
 
         // The original queue context and authorization identify every pin
         // and every attempt. A stale owner cannot advance the Timestamp view.
-        tokio::time::sleep(Duration::from_millis(5 * txn.attempt)).await;
-        let pin = tokio::time::timeout(RETRY_PROGRESS_TIMEOUT, async {
+        nabedra_rt::time::sleep(Duration::from_millis(5 * txn.attempt)).await;
+        let pin = nabedra_rt::time::timeout(RETRY_PROGRESS_TIMEOUT, async {
             let settled = self
                 .services
                 .status

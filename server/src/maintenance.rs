@@ -5,13 +5,10 @@ use crate::{
     cluster::startup_material::composition::prepare_api,
     storage::{Namespace, ObjectKey, Storage},
 };
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{path::Path, time::Duration};
 
 pub async fn doctor(path: &Path, json: bool) -> Result<(), &'static str> {
-    let prepared = prepare_api(path, Instant::now() + Duration::from_secs(30))
+    let prepared = prepare_api(path, nabedra_rt::time::now_std() + Duration::from_secs(30))
         .map_err(|_| "configuration invalid")?;
     let ready = prepared
         .connect_async()
@@ -81,7 +78,7 @@ pub async fn migrate(
         .initialize_owned_cluster_catalog(
             cluster_id,
             CatalogFence {
-                run_id: uuid::Uuid::new_v4(),
+                run_id: nabedra_rt::ids::uuid_v4(),
                 scheduler_term: 1,
             },
             true,

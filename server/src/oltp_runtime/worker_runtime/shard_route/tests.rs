@@ -16,7 +16,7 @@ impl Drop for TestDirectory {
 
 fn body(operation: &str, payload: Value) -> Vec<u8> {
     serde_json::to_vec(&json!({
-        "request_id": Uuid::new_v4(), "operation": operation, "payload": payload,
+        "request_id": nabedra_rt::ids::uuid_v4(), "operation": operation, "payload": payload,
     }))
     .unwrap()
 }
@@ -68,14 +68,14 @@ fn placement(group: &GroupIdentity, local: WorkerIdentity) -> SplitSourcePlaceme
     let identities = [
         local,
         WorkerIdentity {
-            worker_id: Uuid::new_v4(),
-            incarnation: Uuid::new_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
             certificate_sha256: Digest::from_bytes([2; 32]),
             enrollment_revision: 2,
         },
         WorkerIdentity {
-            worker_id: Uuid::new_v4(),
-            incarnation: Uuid::new_v4(),
+            worker_id: nabedra_rt::ids::uuid_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
             certificate_sha256: Digest::from_bytes([3; 32]),
             enrollment_revision: 3,
         },
@@ -87,7 +87,7 @@ fn placement(group: &GroupIdentity, local: WorkerIdentity) -> SplitSourcePlaceme
             member: ReplicaMember {
                 node_id,
                 worker_id: worker.worker_id,
-                pool_id: Uuid::new_v4(),
+                pool_id: nabedra_rt::ids::uuid_v4(),
             },
             worker,
             registered_pool_generation: None,
@@ -96,7 +96,7 @@ fn placement(group: &GroupIdentity, local: WorkerIdentity) -> SplitSourcePlaceme
     SplitSourcePlacement {
         record: GroupRecord {
             identity: group.clone(),
-            generation: Uuid::new_v4(),
+            generation: nabedra_rt::ids::uuid_v4(),
             replica_count: 3,
             replica_root: group_root(
                 3,
@@ -117,9 +117,9 @@ fn placement(group: &GroupIdentity, local: WorkerIdentity) -> SplitSourcePlaceme
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o03_o16_c02_scoped_point_route_preserves_pinned_table_and_exact_placement() {
-    tokio::time::timeout(std::time::Duration::from_secs(90), async {
+    nabedra_rt::time::timeout(std::time::Duration::from_secs(90), async {
         let directory = TestDirectory(
-            std::env::temp_dir().join(format!("nabedra-scoped-point-{}", Uuid::new_v4())),
+            std::env::temp_dir().join(format!("nabedra-scoped-point-{}", nabedra_rt::ids::uuid_v4())),
         );
         let runtime = WorkerRuntime::open(
             &directory.0,
@@ -284,7 +284,7 @@ async fn o03_o16_c02_scoped_point_route_preserves_pinned_table_and_exact_placeme
         );
         scoped.verify_target(approved.clone(), local).unwrap();
         let prior_incarnation = WorkerIdentity {
-            incarnation: Uuid::new_v4(),
+            incarnation: nabedra_rt::ids::uuid_v4(),
             ..local
         };
         assert_eq!(
@@ -294,10 +294,10 @@ async fn o03_o16_c02_scoped_point_route_preserves_pinned_table_and_exact_placeme
             stale()
         );
         let mut moved = approved.clone();
-        moved.record.generation = Uuid::new_v4();
+        moved.record.generation = nabedra_rt::ids::uuid_v4();
         assert_eq!(scoped.verify_target(moved, local).unwrap_err(), stale());
         let mut voters = approved.voters.clone().into_inner();
-        voters[0].worker.incarnation = Uuid::new_v4();
+        voters[0].worker.incarnation = nabedra_rt::ids::uuid_v4();
         let restarted = SplitSourcePlacement {
             voters: Page::new(voters).unwrap(),
             ..approved

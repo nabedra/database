@@ -28,7 +28,7 @@ pub(super) struct Fixture {
 }
 impl Fixture {
     pub(super) async fn new() -> Self {
-        let dir = Dir(std::env::temp_dir().join(format!("oltp-timestamps-{}", Uuid::new_v4())));
+        let dir = Dir(std::env::temp_dir().join(format!("oltp-timestamps-{}", nabedra_rt::ids::uuid_v4())));
         let shared = WorkerSharedResources::new(
             9,
             WorkerResources {
@@ -43,9 +43,9 @@ impl Fixture {
             PoolIdentity {
                 engine: "oltp".into(),
                 pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-                cluster_id: Uuid::new_v4(),
-                worker_id: Uuid::new_v4(),
-                pool_id: Uuid::new_v4(),
+                cluster_id: nabedra_rt::ids::uuid_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                pool_id: nabedra_rt::ids::uuid_v4(),
             },
             shared,
         )
@@ -54,7 +54,7 @@ impl Fixture {
             .group(GroupIdentity {
                 cluster_id: pool.identity().cluster_id,
                 database: Text::try_from("default").unwrap(),
-                group_id: Uuid::new_v4(),
+                group_id: nabedra_rt::ids::uuid_v4(),
                 kind: GroupKind::Timestamps,
                 group_format_version: GROUP_FORMAT_VERSION,
             })
@@ -91,7 +91,7 @@ impl Fixture {
     pub(super) async fn initialize(&mut self, ready: ReadyMembership) {
         assert!(matches!(
             self.apply(TimestampCommand::Fence {
-                transition_id: Uuid::new_v4(),
+                transition_id: nabedra_rt::ids::uuid_v4(),
                 expected: None,
                 next: ready.view.authority(),
                 ready
@@ -106,8 +106,8 @@ impl Fixture {
 }
 pub(super) fn worker() -> WorkerIdentity {
     WorkerIdentity {
-        worker_id: Uuid::new_v4(),
-        incarnation: Uuid::new_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         certificate_sha256: Digest::from_bytes([3; 32]),
         enrollment_revision: 1,
     }
@@ -117,7 +117,7 @@ pub(super) fn ready(member: WorkerIdentity) -> ReadyMembership {
     hash.push(member).unwrap();
     ReadyMembership {
         view: AuthorityView {
-            run_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
             owner_term: 1,
             membership_revision: 1,
         },
@@ -128,7 +128,7 @@ pub(super) fn ready(member: WorkerIdentity) -> ReadyMembership {
 fn binding(view: AuthorityView) -> (PinIdentity, RequestBinding) {
     let request = RequestBinding {
         run_id: view.run_id,
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         digest: Digest::from_bytes([4; 32]),
         accepted_context: Digest::from_bytes([5; 32]),
     };
@@ -137,7 +137,7 @@ fn binding(view: AuthorityView) -> (PinIdentity, RequestBinding) {
             run_id: view.run_id,
             request_id: request.request_id,
             digest: request.digest,
-            nonce: Uuid::new_v4(),
+            nonce: nabedra_rt::ids::uuid_v4(),
         },
         request,
     )
@@ -158,7 +158,7 @@ fn begin(
             kind: super::super::status::RequestKind::Read,
             scoped: None,
         },
-        pin_id: Uuid::new_v4(),
+        pin_id: nabedra_rt::ids::uuid_v4(),
     }
 }
 fn bind_context(
@@ -195,7 +195,7 @@ fn proof(
     let ack = AuthenticatedAck::from_transport(
         member,
         statement_digest(&statement).unwrap(),
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
     );
     verifier.accept(member, &ack).unwrap();
     verifier.finish(ready).unwrap().into_sealed()
@@ -231,10 +231,10 @@ async fn o09_o15_o19_r04_cold_release_advances_floor_past_abandoned_application_
     };
 
     let owner = MaintenanceOwnerRef {
-        catalog_group_id: Uuid::new_v4(),
-        table_id: Uuid::new_v4(),
-        index_id: Uuid::new_v4(),
-        build_id: Uuid::new_v4(),
+        catalog_group_id: nabedra_rt::ids::uuid_v4(),
+        table_id: nabedra_rt::ids::uuid_v4(),
+        index_id: nabedra_rt::ids::uuid_v4(),
+        build_id: nabedra_rt::ids::uuid_v4(),
         attempt: 1,
     };
     let (index_identity, _) = binding(old.view);
@@ -255,7 +255,7 @@ async fn o09_o15_o19_r04_cold_release_advances_floor_past_abandoned_application_
                 attempt: 1,
             },
             reservation: index_reservation,
-            pin_id: Uuid::new_v4(),
+            pin_id: nabedra_rt::ids::uuid_v4(),
         })
         .await
     else {
@@ -265,7 +265,7 @@ async fn o09_o15_o19_r04_cold_release_advances_floor_past_abandoned_application_
         .apply(TimestampCommand::BeginMaintenance {
             authority,
             owner,
-            pin_id: Uuid::new_v4(),
+            pin_id: nabedra_rt::ids::uuid_v4(),
         })
         .await
     else {
@@ -275,20 +275,20 @@ async fn o09_o15_o19_r04_cold_release_advances_floor_past_abandoned_application_
         .apply(TimestampCommand::BeginBackup {
             authority,
             owner: BackupOwnerRef {
-                backup_id: Uuid::new_v4(),
+                backup_id: nabedra_rt::ids::uuid_v4(),
                 attempt: 1,
             },
-            pin_id: Uuid::new_v4(),
+            pin_id: nabedra_rt::ids::uuid_v4(),
         })
         .await
     else {
         panic!("backup timestamp");
     };
 
-    let transition_id = Uuid::new_v4();
+    let transition_id = nabedra_rt::ids::uuid_v4();
     let fenced = ReadyMembership {
         view: AuthorityView {
-            run_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
             owner_term: 2,
             membership_revision: 2,
         },
@@ -315,7 +315,7 @@ async fn o09_o15_o19_r04_cold_release_advances_floor_past_abandoned_application_
     };
     assert!(matches!(
         f.apply(TimestampCommand::FenceReady {
-            transition_id: Uuid::new_v4(),
+            transition_id: nabedra_rt::ids::uuid_v4(),
             expected: fenced,
             next: live,
         })
@@ -344,7 +344,7 @@ async fn o09_o15_o19_r04_cold_release_advances_floor_past_abandoned_application_
         pin,
     };
     for (fence, pin) in [
-        (Uuid::new_v4(), old_pin.clone()),
+        (nabedra_rt::ids::uuid_v4(), old_pin.clone()),
         (
             transition_id,
             cold::ColdApplicationPin {
@@ -428,13 +428,13 @@ async fn o16_o19_split_retention_tracks_the_published_archive_floor() {
     );
 
     let owner = BackupOwnerRef {
-        backup_id: Uuid::new_v4(),
+        backup_id: nabedra_rt::ids::uuid_v4(),
         attempt: 1,
     };
     let begin_backup = |owner| TimestampCommand::BeginBackup {
         authority,
         owner,
-        pin_id: Uuid::new_v4(),
+        pin_id: nabedra_rt::ids::uuid_v4(),
     };
     let TimestampReply::Snapshot(base) = f.apply(begin_backup(owner)).await else {
         panic!("base timestamp");
@@ -466,7 +466,7 @@ async fn o16_o19_split_retention_tracks_the_published_archive_floor() {
             VerifiedBackupPublished::published(BackupPublishedStatement {
                 owner,
                 pin,
-                archive_id: Uuid::new_v4(),
+                archive_id: nabedra_rt::ids::uuid_v4(),
                 manifest_sha256: root,
                 catalog_root: root,
             })
@@ -688,7 +688,7 @@ async fn q02_q06_o09_o13_r04_unaccepted_rejection_closes_unbound_lost_snapshot()
     );
     let mut relabeled = delayed;
     if let TimestampCommand::BeginSnapshot { identity, .. } = &mut relabeled {
-        identity.nonce = Uuid::new_v4();
+        identity.nonce = nabedra_rt::ids::uuid_v4();
     }
     assert_eq!(
         f.apply(relabeled).await,
@@ -715,7 +715,7 @@ async fn q02_q06_o09_o13_r04_unaccepted_rejection_closes_unbound_lost_snapshot()
 
     let cold = ReadyMembership {
         view: AuthorityView {
-            run_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
             owner_term: original.view.owner_term + 1,
             membership_revision: original.view.membership_revision + 1,
         },
@@ -724,7 +724,7 @@ async fn q02_q06_o09_o13_r04_unaccepted_rejection_closes_unbound_lost_snapshot()
     };
     assert!(matches!(
         f.apply(TimestampCommand::Fence {
-            transition_id: Uuid::new_v4(),
+            transition_id: nabedra_rt::ids::uuid_v4(),
             expected: Some(original.view.authority()),
             next: cold.view.authority(),
             ready: cold,
@@ -756,7 +756,7 @@ async fn q02_q06_o09_o13_r04_unaccepted_rejection_preserves_other_snapshot_state
     };
     let rejection = unaccepted_rejection(&begin_app);
     let mut wrong_nonce = rejection.clone();
-    wrong_nonce.identity.nonce = Uuid::new_v4();
+    wrong_nonce.identity.nonce = nabedra_rt::ids::uuid_v4();
     let wrong_nonce = cancel_command(&f, &wrong_nonce);
     assert_eq!(
         f.apply(wrong_nonce).await,
@@ -805,14 +805,14 @@ async fn q02_q06_o09_o13_r04_unaccepted_rejection_preserves_other_snapshot_state
     metadata.reservation.kind = RequestKind::Mutation;
     let begin_metadata = TimestampCommand::BeginImportMetadata {
         authority: original.view.authority(),
-        archive_id: Uuid::new_v4(),
-        target_id: Uuid::new_v4(),
+        archive_id: nabedra_rt::ids::uuid_v4(),
+        target_id: nabedra_rt::ids::uuid_v4(),
         txn: TxnId {
             request_id: request.request_id,
             attempt: 1,
         },
         reservation: metadata.reservation,
-        pin_id: Uuid::new_v4(),
+        pin_id: nabedra_rt::ids::uuid_v4(),
     };
     let TimestampReply::Snapshot(metadata_pin) = f.apply(begin_metadata.clone()).await else {
         panic!("import metadata pin");
@@ -847,7 +847,7 @@ async fn o15_r05_ready_fence_retries_keep_original_cut_and_reject_old_copy_proof
     let old_proof = proof(member, old, identity.clone(), request, pin);
     let mut next = old;
     next.view.membership_revision += 1;
-    let transition_id = Uuid::new_v4();
+    let transition_id = nabedra_rt::ids::uuid_v4();
     let command = TimestampCommand::FenceReady {
         transition_id,
         expected: old,
@@ -899,7 +899,7 @@ async fn r04_r05_owner_and_run_fences_preserve_old_storage_pins_and_reject_stale
     let mut takeover = old;
     takeover.view.owner_term += 1;
     f.apply(TimestampCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: Some(old.view.authority()),
         next: takeover.view.authority(),
         ready: takeover,
@@ -915,7 +915,7 @@ async fn r04_r05_owner_and_run_fences_preserve_old_storage_pins_and_reject_stale
     );
     let cold = ReadyMembership {
         view: AuthorityView {
-            run_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
             owner_term: 3,
             membership_revision: 2,
         },
@@ -924,7 +924,7 @@ async fn r04_r05_owner_and_run_fences_preserve_old_storage_pins_and_reject_stale
     };
     assert!(matches!(
         f.apply(TimestampCommand::Fence {
-            transition_id: Uuid::new_v4(),
+            transition_id: nabedra_rt::ids::uuid_v4(),
             expected: Some(takeover.view.authority()),
             next: cold.view.authority(),
             ready: cold
@@ -972,7 +972,7 @@ async fn o09_o10_commit_allocation_is_after_read_and_survives_authorized_owner_t
         },
         request,
         manifest: ManifestRef {
-            status_group_id: Uuid::new_v4(),
+            status_group_id: nabedra_rt::ids::uuid_v4(),
             digest: Digest::from_bytes([9; 32]),
             participant_count: 2,
         },
@@ -1006,7 +1006,7 @@ async fn o09_o10_commit_allocation_is_after_read_and_survives_authorized_owner_t
     let mut next = old;
     next.view.owner_term += 1;
     f.apply(TimestampCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: Some(old.view.authority()),
         next: next.view.authority(),
         ready: next,
@@ -1053,7 +1053,7 @@ async fn q06_retirement_rechecks_current_tso_release_and_keeps_original_on_retry
     let mut next = original;
     next.view.membership_revision += 1;
     assert!(matches!(fixture.apply(TimestampCommand::FenceReady {
-        transition_id: Uuid::new_v4(), expected: original, next,
+        transition_id: nabedra_rt::ids::uuid_v4(), expected: original, next,
     }).await, TimestampReply::ReadyFenced(_)));
     assert_eq!(fixture.apply(TimestampCommand::Release { proof: initial.clone() }).await, TimestampReply::Rejected(Fault::StaleReadyView));
 
@@ -1065,7 +1065,7 @@ async fn q06_retirement_rechecks_current_tso_release_and_keeps_original_on_retry
     let seal = |statement: TerminalCopyStatement| {
         let digest = statement_digest(&statement).unwrap();
         let mut verifier = TerminalVerifier::begin(statement, next).unwrap();
-        verifier.accept(member, &AuthenticatedAck::from_transport(member, digest, Uuid::new_v4())).unwrap();
+        verifier.accept(member, &AuthenticatedAck::from_transport(member, digest, nabedra_rt::ids::uuid_v4())).unwrap();
         verifier.finish(next).unwrap().into_sealed()
     };
     assert_eq!(fixture.apply(TimestampCommand::Release { proof: seal(changed) }).await, TimestampReply::Rejected(Fault::InvalidBinding));
@@ -1110,10 +1110,10 @@ async fn o16_o21_o26_o27_o28_automatic_split_keeps_bound_placement_on_exact_retr
     let ready = ready(worker());
     fixture.initialize(ready).await;
     let authority = ready.view.authority();
-    let table_id = Uuid::new_v4();
+    let table_id = nabedra_rt::ids::uuid_v4();
     let source = GroupIdentity {
-        kind: GroupKind::Data { table_id, shard_id: Uuid::new_v4() },
-        group_id: Uuid::new_v4(),
+        kind: GroupKind::Data { table_id, shard_id: nabedra_rt::ids::uuid_v4() },
+        group_id: nabedra_rt::ids::uuid_v4(),
         ..fixture.machine.store().identity().clone()
     };
     let origin = AutomaticSplitOrigin { epoch: ShardEpoch { schema: 1, routing: 2 }, slot: 1 };
@@ -1125,19 +1125,19 @@ async fn o16_o21_o26_o27_o28_automatic_split_keeps_bound_placement_on_exact_retr
         boundary: Key::Int64(11),
         page_bytes: 256 << 10,
     };
-    let catalog_group_id = Uuid::new_v4();
+    let catalog_group_id = nabedra_rt::ids::uuid_v4();
     let reservation = IdentityReservation {
         request_id: split_id,
         kind: RequestKind::Mutation,
         scoped: None,
-        reservation_id: Uuid::new_v4(),
+        reservation_id: nabedra_rt::ids::uuid_v4(),
         original_run: authority.run_id,
         digest: intent.digest().unwrap(),
     };
     assert!(matches!(
         fixture.apply(TimestampCommand::SplitMetadata {
             command: SplitTimestampCommand::Open {
-                authority, intent: intent.clone(), catalog_group_id, reservation, pin_id: Uuid::new_v4(),
+                authority, intent: intent.clone(), catalog_group_id, reservation, pin_id: nabedra_rt::ids::uuid_v4(),
             },
         }).await,
         TimestampReply::Snapshot(_)
@@ -1151,7 +1151,7 @@ async fn o16_o21_o26_o27_o28_automatic_split_keeps_bound_placement_on_exact_retr
     let attempt = read(fixture.machine.store().clone()).await;
     let guard = VerifiedLifecycleGuard::model_for_test(
         LifecycleBinding {
-            guard_id: Uuid::new_v4(),
+            guard_id: nabedra_rt::ids::uuid_v4(),
             catalog_group_id,
             table_id,
             lifecycle_version: None,
@@ -1165,7 +1165,7 @@ async fn o16_o21_o26_o27_o28_automatic_split_keeps_bound_placement_on_exact_retr
     ).into_sealed();
     let TimestampReply::Snapshot(image) = fixture.apply(TimestampCommand::SplitMetadata {
         command: SplitTimestampCommand::Cut {
-            authority, split_id, guard: guard.clone(), pin_id: Uuid::new_v4(),
+            authority, split_id, guard: guard.clone(), pin_id: nabedra_rt::ids::uuid_v4(),
         },
     }).await else {
         panic!("split image cut was refused")
@@ -1190,7 +1190,7 @@ async fn o16_o21_o26_o27_o28_automatic_split_keeps_bound_placement_on_exact_retr
         let worker = worker();
         SplitVoter {
             worker,
-            member: ReplicaMember { node_id, worker_id: worker.worker_id, pool_id: Uuid::new_v4() },
+            member: ReplicaMember { node_id, worker_id: worker.worker_id, pool_id: nabedra_rt::ids::uuid_v4() },
             registered_pool_generation: (node_id == 41).then_some(9),
         }
     }).collect();
@@ -1198,7 +1198,7 @@ async fn o16_o21_o26_o27_o28_automatic_split_keeps_bound_placement_on_exact_retr
         source: SplitSourcePlacement {
             record: GroupRecord {
                 identity: source,
-                generation: Uuid::new_v4(),
+                generation: nabedra_rt::ids::uuid_v4(),
                 replica_count: 3,
                 replica_root: group_root(3, voters.iter().fold(group_seed(), |prior, voter| {
                     group_step(prior, &voter.member)
@@ -1224,7 +1224,7 @@ async fn o16_o21_o26_o27_o28_automatic_split_keeps_bound_placement_on_exact_retr
         ));
     }
     let mut changed_generation = placement.clone();
-    changed_generation.source.record.generation = Uuid::new_v4();
+    changed_generation.source.record.generation = nabedra_rt::ids::uuid_v4();
     let mut changed_mount = placement.clone();
     changed_mount.pool_generations = Page::new(vec![1, 5, 9]).unwrap();
     for substitute in [Some(changed_generation), Some(changed_mount), None] {
@@ -1276,7 +1276,7 @@ async fn o08_q06_retry_pin_keeps_original_context_and_releases_with_receipt() {
         attempt: 1,
     };
     let manifest = ManifestRef {
-        status_group_id: Uuid::new_v4(),
+        status_group_id: nabedra_rt::ids::uuid_v4(),
         digest: Digest::from_bytes([9; 32]),
         participant_count: 1,
     };
@@ -1308,7 +1308,7 @@ async fn o08_q06_retry_pin_keeps_original_context_and_releases_with_receipt() {
         view,
         identity: identity.clone(),
         previous: settlement(request, reason),
-        pin_id: Uuid::new_v4(),
+        pin_id: nabedra_rt::ids::uuid_v4(),
     };
     assert_eq!(
         f.apply(retry(ready.view, request, AbortReason::Conflict))

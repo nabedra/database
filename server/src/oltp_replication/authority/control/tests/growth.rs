@@ -5,7 +5,7 @@ use crate::oltp_deployment::{controller::*, planner::Action};
 
 async fn growth(f: &mut Fixture, command: GrowthCommand) -> ControlReply {
     f.apply(ControlCommand::Growth {
-        operation_id: Uuid::new_v4(),
+        operation_id: nabedra_rt::ids::uuid_v4(),
         authorization: authorization(),
         command,
     })
@@ -21,7 +21,7 @@ async fn o27_growth_attempt_uses_trusted_time_and_replays_original_operation_wit
     let enrollment = worker(pool.worker_id.as_u128());
     let local = WorkerIdentity::from(&enrollment);
     f.apply(ControlCommand::Enroll {
-        operation_id: Uuid::new_v4(),
+        operation_id: nabedra_rt::ids::uuid_v4(),
         expected: None,
         next: enrollment,
         authorization: authorization(),
@@ -30,7 +30,7 @@ async fn o27_growth_attempt_uses_trusted_time_and_replays_original_operation_wit
     .await;
     let policy = GrowthPolicy {
         automatic: None,
-        policy_id: Uuid::new_v4(),
+        policy_id: nabedra_rt::ids::uuid_v4(),
         volume_cost_per_gib: 10,
         worker_cost: 20,
         initial_monthly_spend: 0,
@@ -50,14 +50,14 @@ async fn o27_growth_attempt_uses_trusted_time_and_replays_original_operation_wit
     .await;
     let intent = GrowthIntent {
         policy_id: policy.policy_id,
-        claim_id: Uuid::new_v4(),
+        claim_id: nabedra_rt::ids::uuid_v4(),
         action: Action::AddPool {
             worker: local.worker_id,
             zone: "a".into(),
             bytes: 1,
         },
         worker: local,
-        pool_id: Uuid::new_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
         pool_generation: 1,
         quoted_monthly_cost: 10,
         monthly_spend_ceiling: 20,
@@ -88,11 +88,11 @@ async fn o27_growth_attempt_uses_trusted_time_and_replays_original_operation_wit
             certificate_pins: [local.certificate_sha256].into_iter().collect(),
         },
     );
-    let before = std::time::SystemTime::now()
+    let before = nabedra_rt::time::wall_now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let operation = Uuid::new_v4();
+    let operation = nabedra_rt::ids::uuid_v4();
     let first = handle
         .attempt_growth_local(&permit, operation, intent.claim_id)
         .await
@@ -107,7 +107,7 @@ async fn o27_growth_attempt_uses_trusted_time_and_replays_original_operation_wit
     assert!(record.last_attempt.unwrap() >= before);
     assert_eq!(
         handle
-            .attempt_growth_local(&permit, Uuid::new_v4(), intent.claim_id)
+            .attempt_growth_local(&permit, nabedra_rt::ids::uuid_v4(), intent.claim_id)
             .await
             .unwrap()
             .into_parts()
@@ -127,7 +127,7 @@ async fn o27_growth_attempt_uses_trusted_time_and_replays_original_operation_wit
     );
     assert!(
         handle
-            .attempt_growth_local(&permit, operation, Uuid::new_v4())
+            .attempt_growth_local(&permit, operation, nabedra_rt::ids::uuid_v4())
             .await
             .is_err()
     );
@@ -150,7 +150,7 @@ async fn o27_growth_claim_is_durable_idempotent_bounded_and_never_publishes_prov
     let worker = f.enroll(1).await;
     let policy = GrowthPolicy {
         automatic: None,
-        policy_id: Uuid::new_v4(),
+        policy_id: nabedra_rt::ids::uuid_v4(),
         volume_cost_per_gib: 10,
         worker_cost: 20,
         initial_monthly_spend: 5,
@@ -173,14 +173,14 @@ async fn o27_growth_claim_is_durable_idempotent_bounded_and_never_publishes_prov
     ));
     let intent = GrowthIntent {
         policy_id: policy.policy_id,
-        claim_id: Uuid::new_v4(),
+        claim_id: nabedra_rt::ids::uuid_v4(),
         action: Action::AddPool {
             worker: worker.worker_id,
             zone: "a".into(),
             bytes: 1024,
         },
         worker,
-        pool_id: Uuid::new_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
         pool_generation: 1,
         quoted_monthly_cost: 10,
         monthly_spend_ceiling: 20,
@@ -221,7 +221,7 @@ async fn o27_growth_claim_is_durable_idempotent_bounded_and_never_publishes_prov
         },
     )
     .await;
-    let retry_operation = Uuid::new_v4();
+    let retry_operation = nabedra_rt::ids::uuid_v4();
     let command = GrowthCommand::Claim {
         intent: intent.clone(),
         prior_total_bytes: None,
@@ -353,7 +353,7 @@ async fn o27_growth_claim_is_durable_idempotent_bounded_and_never_publishes_prov
         ControlReply::Rejected(Fault::NotReady)
     );
     let mut another = intent;
-    another.claim_id = Uuid::new_v4();
+    another.claim_id = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         growth(
             &mut f,
@@ -412,26 +412,26 @@ async fn o17_replacement_claim_survives_publication_reopen_until_exact_retiremen
     let old_member = ReplicaMember {
         node_id: 1,
         worker_id: old_worker.worker_id,
-        pool_id: Uuid::new_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
     };
     let new_member = ReplicaMember {
         node_id: 2,
         worker_id: new_worker.worker_id,
-        pool_id: Uuid::new_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
     };
     let old = f
         .register_group(
             GroupKind::Data {
-                table_id: Uuid::new_v4(),
-                shard_id: Uuid::new_v4(),
+                table_id: nabedra_rt::ids::uuid_v4(),
+                shard_id: nabedra_rt::ids::uuid_v4(),
             },
             vec![old_member.clone()],
         )
         .await;
-    let generation = Uuid::new_v4();
+    let generation = nabedra_rt::ids::uuid_v4();
     assert!(matches!(
         f.apply(ControlCommand::BeginGroupReplacement {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             generation,
             expected: old.clone(),
             authorization: authorization()
@@ -440,7 +440,7 @@ async fn o17_replacement_claim_survives_publication_reopen_until_exact_retiremen
         ControlReply::GroupBuilding { .. }
     ));
     f.apply(ControlCommand::GroupPage {
-        operation_id: Uuid::new_v4(),
+        operation_id: nabedra_rt::ids::uuid_v4(),
         generation,
         replicas: Page::new(vec![new_member.clone()]).unwrap(),
     })
@@ -462,7 +462,7 @@ async fn o17_replacement_claim_survives_publication_reopen_until_exact_retiremen
     };
     let seal = f
         .apply(ControlCommand::SealGroup {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             generation,
             proof: proof.clone(),
         })
@@ -471,7 +471,7 @@ async fn o17_replacement_claim_survives_publication_reopen_until_exact_retiremen
     assert_eq!(
         seal,
         f.apply(ControlCommand::SealGroup {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             generation,
             proof
         })
@@ -486,10 +486,10 @@ async fn o17_replacement_claim_survives_publication_reopen_until_exact_retiremen
         replica_root: root,
         membership_position: position,
     };
-    let next = Uuid::new_v4();
+    let next = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         f.apply(ControlCommand::BeginGroupReplacement {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             generation: next,
             expected: published.clone(),
             authorization: authorization()
@@ -506,7 +506,7 @@ async fn o17_replacement_claim_survives_publication_reopen_until_exact_retiremen
     };
     assert_eq!(
         f.apply(ControlCommand::ReplicaRetired {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             authorization: authorization(),
             proof: retired.clone(),
             remote: None,
@@ -519,7 +519,7 @@ async fn o17_replacement_claim_survives_publication_reopen_until_exact_retiremen
     );
     assert_eq!(
         f.apply(ControlCommand::ReplicaRetired {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             authorization: authorization(),
             proof: retired,
             remote: None,
@@ -532,7 +532,7 @@ async fn o17_replacement_claim_survives_publication_reopen_until_exact_retiremen
     );
     assert!(matches!(
         f.apply(ControlCommand::BeginGroupReplacement {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             generation: next,
             expected: published,
             authorization: authorization()

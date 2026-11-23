@@ -12,7 +12,7 @@ impl Fixture {
         action: DirectCapabilityOperation,
     ) -> ControlReply {
         self.apply(ControlCommand::DirectCapability {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             actor,
             action,
             unix_ms: crate::oltp_replication::authority::control::direct::wall_ms(),
@@ -46,18 +46,18 @@ impl Fixture {
         workers
     }
     async fn begin_group(&mut self) -> Uuid {
-        let generation = Uuid::new_v4();
+        let generation = nabedra_rt::ids::uuid_v4();
         let group = GroupIdentity {
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Data {
-                table_id: Uuid::new_v4(),
-                shard_id: Uuid::new_v4(),
+                table_id: nabedra_rt::ids::uuid_v4(),
+                shard_id: nabedra_rt::ids::uuid_v4(),
             },
             ..self.machine.store().identity().clone()
         };
         assert!(matches!(
             self.apply(ControlCommand::BeginGroup {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 identity: group,
                 authorization: authorization(),
@@ -72,7 +72,7 @@ fn replica(node_id: u64, worker: WorkerIdentity) -> ReplicaMember {
     ReplicaMember {
         node_id,
         worker_id: worker.worker_id,
-        pool_id: Uuid::new_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
     }
 }
 
@@ -91,7 +91,7 @@ async fn o06_o18_direct_api_grant_survives_queue_membership_change() {
     assert_eq!(
         fixture
             .apply(ControlCommand::EnrollApi {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: None,
                 next: api,
                 authorization: authorization(),
@@ -106,7 +106,7 @@ async fn o06_o18_direct_api_grant_survives_queue_membership_change() {
     assert!(matches!(
         fixture
             .apply(ControlCommand::BeginJoin {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: ready.view,
                 target: joiner,
             })
@@ -132,10 +132,10 @@ async fn o06_o18_direct_api_grant_survives_queue_membership_change() {
         database: scope.database.clone(),
     };
     let data = GroupIdentity {
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Data {
-            table_id: Uuid::new_v4(),
-            shard_id: Uuid::new_v4(),
+            table_id: nabedra_rt::ids::uuid_v4(),
+            shard_id: nabedra_rt::ids::uuid_v4(),
         },
         ..scope.clone()
     };
@@ -152,7 +152,7 @@ async fn o06_o18_direct_api_grant_survives_queue_membership_change() {
         .unwrap();
     assert_eq!(grant.ready, ready);
     let stale = WorkerIdentity {
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         ..caller
     };
     assert!(
@@ -168,7 +168,7 @@ async fn o06_o18_direct_api_grant_survives_queue_membership_change() {
             .is_err()
     );
     let foreign = GroupIdentity {
-        cluster_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
         ..data
     };
     assert!(
@@ -265,7 +265,7 @@ async fn o02_t7_one_member_that_never_advertised_keeps_the_capability_inactive()
     assert!(matches!(
         fixture
             .apply(ControlCommand::GroupPage {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 replicas: Page::new(vec![replica(1, workers[2])]).unwrap(),
             })
@@ -307,7 +307,7 @@ async fn o02_t7_after_activation_a_member_without_the_advert_cannot_join_as_vote
     assert_eq!(
         fixture
             .apply(ControlCommand::BeginJoin {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: state.ready.view,
                 target: old,
             })
@@ -320,7 +320,7 @@ async fn o02_t7_after_activation_a_member_without_the_advert_cannot_join_as_vote
     assert_eq!(
         fixture
             .apply(ControlCommand::GroupPage {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 replicas: Page::new(vec![replica(1, workers[0]), replica(2, old)]).unwrap(),
             })
@@ -339,13 +339,13 @@ async fn o02_t7_after_activation_a_member_without_the_advert_cannot_join_as_vote
     };
     assert_eq!(WorkerIdentity::from(&previous), workers[2]);
     let restarted = WorkerEnrollment {
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         enrollment_revision: 2,
         ..previous
     };
     let reply = fixture
         .apply(ControlCommand::Enroll {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             expected: Some(workers[2]),
             next: restarted.clone(),
             authorization: authorization(),
@@ -361,7 +361,7 @@ async fn o02_t7_after_activation_a_member_without_the_advert_cannot_join_as_vote
         assert_eq!(
             fixture
                 .apply(ControlCommand::GroupPage {
-                    operation_id: Uuid::new_v4(),
+                    operation_id: nabedra_rt::ids::uuid_v4(),
                     generation,
                     replicas: Page::new(vec![replica(1, restarted)]).unwrap(),
                 })
@@ -376,7 +376,7 @@ async fn o02_t7_after_activation_a_member_without_the_advert_cannot_join_as_vote
     assert!(matches!(
         fixture
             .apply(ControlCommand::GroupPage {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 replicas: Page::new(vec![replica(1, workers[0]), replica(2, old)]).unwrap(),
             })
@@ -387,7 +387,7 @@ async fn o02_t7_after_activation_a_member_without_the_advert_cannot_join_as_vote
     assert!(matches!(
         fixture
             .apply(ControlCommand::BeginJoin {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: state.ready.view,
                 target: old,
             })
@@ -553,7 +553,7 @@ async fn o02_gc2_feature_adverts_apply_identically_on_a_pre_feature_control_repl
     assert!(matches!(
         fixture
             .apply(ControlCommand::GroupPage {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 replicas: Page::new(vec![replica(1, workers[0]), replica(2, old)]).unwrap(),
             })
@@ -619,7 +619,7 @@ async fn o02_gc2_batch_feature_is_sticky_and_refuses_joiners_without_the_advert(
     assert_eq!(
         fixture
             .apply(ControlCommand::BeginJoin {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: state.ready.view,
                 target: old,
             })
@@ -630,7 +630,7 @@ async fn o02_gc2_batch_feature_is_sticky_and_refuses_joiners_without_the_advert(
     assert_eq!(
         fixture
             .apply(ControlCommand::GroupPage {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 replicas: Page::new(vec![replica(1, workers[0]), replica(2, old)]).unwrap(),
             })
@@ -641,7 +641,7 @@ async fn o02_gc2_batch_feature_is_sticky_and_refuses_joiners_without_the_advert(
     // advertise again: the advert's operation id named its old identity.
     let restarted = WorkerEnrollment {
         worker_id: workers[2].worker_id,
-        incarnation: Uuid::new_v4(),
+        incarnation: nabedra_rt::ids::uuid_v4(),
         certificate_sha256: workers[2].certificate_sha256,
         endpoint: Text::try_from("127.0.0.1:1").unwrap(),
         server_name: Text::try_from("localhost").unwrap(),
@@ -649,7 +649,7 @@ async fn o02_gc2_batch_feature_is_sticky_and_refuses_joiners_without_the_advert(
     };
     let reply = fixture
         .apply(ControlCommand::Enroll {
-            operation_id: Uuid::new_v4(),
+            operation_id: nabedra_rt::ids::uuid_v4(),
             expected: Some(workers[2]),
             next: restarted,
             authorization: authorization(),
@@ -666,7 +666,7 @@ async fn o02_gc2_batch_feature_is_sticky_and_refuses_joiners_without_the_advert(
         assert_eq!(
             fixture
                 .apply(ControlCommand::GroupPage {
-                    operation_id: Uuid::new_v4(),
+                    operation_id: nabedra_rt::ids::uuid_v4(),
                     generation,
                     replicas: Page::new(vec![replica(1, restarted)]).unwrap(),
                 })
@@ -677,7 +677,7 @@ async fn o02_gc2_batch_feature_is_sticky_and_refuses_joiners_without_the_advert(
         assert!(matches!(
             fixture
                 .apply(ControlCommand::GroupPage {
-                    operation_id: Uuid::new_v4(),
+                    operation_id: nabedra_rt::ids::uuid_v4(),
                     generation,
                     replicas: Page::new(vec![replica(1, restarted)]).unwrap(),
                 })
@@ -691,7 +691,7 @@ async fn o02_gc2_batch_feature_is_sticky_and_refuses_joiners_without_the_advert(
     assert!(matches!(
         fixture
             .apply(ControlCommand::GroupPage {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 replicas: Page::new(vec![replica(1, workers[0]), replica(2, old)]).unwrap(),
             })
@@ -702,7 +702,7 @@ async fn o02_gc2_batch_feature_is_sticky_and_refuses_joiners_without_the_advert(
     assert!(matches!(
         fixture
             .apply(ControlCommand::BeginJoin {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: state.ready.view,
                 target: old,
             })
@@ -759,7 +759,7 @@ async fn o02_o08_snapshot_retry_waits_for_every_worker_and_refuses_old_joiners()
     fixture.advertise_batch(old).await;
     let ready = fixture.state().await.ready.view;
     let join = || ControlCommand::BeginJoin {
-        operation_id: Uuid::new_v4(),
+        operation_id: nabedra_rt::ids::uuid_v4(),
         expected: ready,
         target: old,
     };
@@ -910,7 +910,7 @@ async fn cap1_o02_index_reclaim_adverts_apply_identically_on_a_gc2_control_repli
     assert!(matches!(
         fixture
             .apply(ControlCommand::GroupPage {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 generation,
                 replicas: Page::new(vec![replica(1, workers[0]), replica(2, old)]).unwrap(),
             })
@@ -972,7 +972,7 @@ async fn cap1_o02_o12_enabled_index_reclaim_refuses_a_gc2_build_joiner() {
     assert_eq!(
         fixture
             .apply(ControlCommand::BeginJoin {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: state.ready.view,
                 target: old,
             })
@@ -981,7 +981,7 @@ async fn cap1_o02_o12_enabled_index_reclaim_refuses_a_gc2_build_joiner() {
     );
     let generation = fixture.begin_group().await;
     let page = |old| ControlCommand::GroupPage {
-        operation_id: Uuid::new_v4(),
+        operation_id: nabedra_rt::ids::uuid_v4(),
         generation,
         replicas: Page::new(vec![replica(1, workers[0]), replica(2, old)]).unwrap(),
     };
@@ -998,7 +998,7 @@ async fn cap1_o02_o12_enabled_index_reclaim_refuses_a_gc2_build_joiner() {
     assert!(matches!(
         fixture
             .apply(ControlCommand::BeginJoin {
-                operation_id: Uuid::new_v4(),
+                operation_id: nabedra_rt::ids::uuid_v4(),
                 expected: state.ready.view,
                 target: old,
             })

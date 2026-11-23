@@ -6,6 +6,8 @@ use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use nabedra_rt::{task, time};
+
 use crate::batch::WriteBatch;
 use crate::crc;
 use crate::error::{Error, Result};
@@ -260,11 +262,10 @@ impl Writer {
     }
 
     pub(super) fn spawn(self, sink: Arc<dyn JournalSink>) -> Result<JoinHandle<()>> {
-        std::thread::Builder::new()
-            .name("kv-journal".into())
-            .stack_size(crate::store::THREAD_STACK_BYTES)
-            .spawn(move || self.run(&*sink))
-            .map_err(segment::io)
+        task::spawn_service_with_stack("kv-journal", crate::store::THREAD_STACK_BYTES, move || {
+            self.run(&*sink)
+        })
+        .map_err(segment::io)
     }
 
     fn run(mut self, sink: &dyn JournalSink) {
@@ -465,14 +466,14 @@ impl Writer {
                 break;
             }
             fill_locators(&mut self.locators, batch, p);
-            let started = Instant::now();
+            let started = time::now_std();
             let kind = if *kind == RecordType::Relocate {
                 RecordKind::Relocate
             } else {
                 RecordKind::Batch
             };
             let applied = sink.apply(kind, *first_seq, batch, &self.locators);
-            let elapsed = started.elapsed();
+            let elapsed = time::now_std().duration_since(started);
             if elapsed >= Duration::from_millis(1) {
                 stats
                     .stall_ns
@@ -646,7 +647,12 @@ impl Writer {
             return;
         }
         let mut prep = lock(&self.shared.prep);
-        if prep.busy || prep.wanted || prep.failed_at.is_some_and(|t| t.elapsed() < PREPARE_RETRY) {
+        if prep.busy
+            || prep.wanted
+            || prep
+                .failed_at
+                .is_some_and(|t| time::now_std().duration_since(t) < PREPARE_RETRY)
+        {
             return;
         }
         prep.wanted = true;
@@ -711,14 +717,14 @@ impl Writer {
                 unreachable!("placements index writes")
             };
             fill_locators(&mut self.locators, batch, p);
-            let started = Instant::now();
+            let started = time::now_std();
             let kind = if *kind == RecordType::Relocate {
                 RecordKind::Relocate
             } else {
                 RecordKind::Batch
             };
             let result = sink.apply(kind, *first_seq, batch, &self.locators);
-            let elapsed = started.elapsed();
+            let elapsed = time::now_std().duration_since(started);
             if elapsed >= Duration::from_millis(1) {
                 self.shared
                     .stats
@@ -852,11 +858,12 @@ pub(super) struct Prep {
 /// never latches: a failure (`NoSpace` included) leaves the writer to create the file
 /// inline at the roll, where `NoSpace` is reported as usual.
 pub(super) fn spawn_preparer(shared: Arc<Shared>) -> Result<JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("kv-journal-prep".into())
-        .stack_size(crate::store::THREAD_STACK_BYTES)
-        .spawn(move || prepare_loop(&shared))
-        .map_err(segment::io)
+    task::spawn_service_with_stack(
+        "kv-journal-prep",
+        crate::store::THREAD_STACK_BYTES,
+        move || prepare_loop(&shared),
+    )
+    .map_err(segment::io)
 }
 
 fn prepare_loop(shared: &Shared) {
@@ -894,7 +901,7 @@ fn prepare_loop(shared: &Shared) {
         }
         let mut prep = lock(&shared.prep);
         prep.busy = false;
-        prep.failed_at = failed.then(Instant::now);
+        prep.failed_at = failed.then(time::now_std);
         drop(prep);
         shared.prep_done.notify_all();
     }

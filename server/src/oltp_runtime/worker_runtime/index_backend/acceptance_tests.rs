@@ -18,7 +18,7 @@ struct Directory(PathBuf);
 
 impl Directory {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("nabedra-o12-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("nabedra-o12-{}", nabedra_rt::ids::uuid_v4()));
         std::fs::create_dir(&path).unwrap();
         Self(path)
     }
@@ -55,7 +55,7 @@ impl Fixture {
         )
         .await;
         let definition = serde_json::from_value(json!({
-            "index_id":Uuid::new_v4(), "table_id":table["id"], "name":"by_category",
+            "index_id":nabedra_rt::ids::uuid_v4(), "table_id":table["id"], "name":"by_category",
             "columns":["category"], "covering":["label"],
         }))
         .unwrap();
@@ -63,7 +63,7 @@ impl Fixture {
             runtime,
             app,
             definition,
-            build_id: Uuid::new_v4(),
+            build_id: nabedra_rt::ids::uuid_v4(),
             dir,
         }
     }
@@ -131,7 +131,7 @@ impl Fixture {
             &self.app,
             "/v1/operations",
             TOKEN,
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             "table.get",
             json!({"table_id":self.definition.table_id,"key":key}),
         )
@@ -155,7 +155,7 @@ impl Fixture {
                 );
                 return (run, receipt);
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -164,7 +164,7 @@ impl Fixture {
         record: IndexRecord,
     ) -> tokio::task::JoinHandle<Result<(), ProtocolError>> {
         let runtime = self.runtime.clone();
-        tokio::spawn(async move { runtime.resume_index(&record).await })
+        nabedra_rt::task::spawn(async move { runtime.resume_index(&record).await })
     }
 
     async fn participant(&self) -> Arc<ParticipantHandle> {
@@ -222,9 +222,9 @@ async fn open(path: &Path, cold: bool) -> Arc<WorkerRuntime> {
     .await
     .unwrap();
     let switch = runtime.direct_switch().unwrap();
-    tokio::time::timeout(WAIT, async {
+    nabedra_rt::time::timeout(WAIT, async {
         while switch.direct_stats().is_none() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -261,7 +261,7 @@ async fn post(
 }
 
 async fn reached(receiver: tokio::sync::oneshot::Receiver<BuildHold>) -> BuildHold {
-    tokio::time::timeout(WAIT, receiver)
+    nabedra_rt::time::timeout(WAIT, receiver)
         .await
         .expect("index actor did not reach checkpoint")
         .expect("index checkpoint closed")
@@ -292,7 +292,7 @@ const INDEX: &str = "secondary by_category";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o12_hot_key_cannot_starve_backfill() {
-    tokio::time::timeout(WAIT, async {
+    nabedra_rt::time::timeout(WAIT, async {
         let fixture = Fixture::new().await;
         fixture.insert_rows(vec![row(0, 0, "seed")]).await;
         let record = fixture.declare().await;
@@ -325,7 +325,7 @@ async fn o12_hot_key_cannot_starve_backfill() {
                         &fixture.app,
                         "/v1/operations",
                         TOKEN,
-                        Uuid::new_v4(),
+                        nabedra_rt::ids::uuid_v4(),
                         "table.update",
                         json!({
                             "table_id":owner.table_id, "key":0,
@@ -393,7 +393,7 @@ async fn o12_refresh_survives_temporary_ingress_saturation() {
     };
     drop(permits);
     hold.release.send(false).unwrap();
-    tokio::time::timeout(WAIT, actor)
+    nabedra_rt::time::timeout(WAIT, actor)
         .await
         .unwrap()
         .unwrap()
@@ -427,7 +427,7 @@ async fn o12_ready_retries_after_settled_prepare_overload() {
     let client = fixture.runtime.services.manager.client();
     let storage = client.hold_outgoing_for_test(TrafficClass::Storage);
     before_commit.release.send(false).unwrap();
-    let aborted = tokio::time::timeout(WAIT, decisions.recv())
+    let aborted = nabedra_rt::time::timeout(WAIT, decisions.recv())
         .await
         .unwrap()
         .unwrap();
@@ -452,7 +452,7 @@ async fn o12_ready_retries_after_settled_prepare_overload() {
     index_holds::unregister(catalog_id);
     aborted.release.send(()).unwrap();
 
-    tokio::time::timeout(WAIT, actor)
+    nabedra_rt::time::timeout(WAIT, actor)
         .await
         .unwrap()
         .unwrap()
@@ -515,10 +515,10 @@ impl Fixture {
     }
 
     async fn assert_status(&self, attempt: u64, state: &str, may_be_undecided: bool) {
-        let (status, body) = tokio::time::timeout(
+        let (status, body) = nabedra_rt::time::timeout(
             Duration::from_secs(5),
             self.admin(
-                Uuid::new_v4(),
+                nabedra_rt::ids::uuid_v4(),
                 "storage.index.status",
                 self.selector(attempt),
             ),
@@ -591,7 +591,7 @@ impl Fixture {
                 json!({"table_id":table,"row":row(7, 7, "direct insert")}),
             ),
         ] {
-            let id = Uuid::new_v4();
+            let id = nabedra_rt::ids::uuid_v4();
             let (status, reply) =
                 post(&self.app, "/v1/operations", TOKEN, id, op, payload.clone()).await;
             assert_eq!(status, StatusCode::OK, "{op}: {reply}");
@@ -618,7 +618,7 @@ impl Fixture {
                 json!({"table_id":table,"row":row(8, 8, "queued insert")}),
             ),
         ] {
-            let id = Uuid::new_v4();
+            let id = nabedra_rt::ids::uuid_v4();
             let (run, receipt) = self.queued(id, op, payload.clone()).await;
             let (status, replayed) = post(&self.app, "/v1/requests", TOKEN, id, op, payload).await;
             assert_eq!(status, StatusCode::ACCEPTED, "{op} retry: {replayed}");
@@ -644,11 +644,11 @@ impl Fixture {
     }
 
     async fn pin_query(&self, operation: &'static str) -> HeldQuery {
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let hold = index_holds::register_checkpoint(id, Checkpoint::ReadPin);
         let (app, query) = (self.app.clone(), self.query(7));
         let task =
-            tokio::spawn(
+            nabedra_rt::task::spawn(
                 async move { post(&app, "/v1/operations", TOKEN, id, operation, query).await },
             );
         let hold = reached(hold).await;
@@ -815,7 +815,7 @@ async fn backfill_and_retirement() -> (usize, usize) {
     let ready_plan = fixture.pin_query("query.explain").await;
     let authority = fixture.runtime.index_authority(None).await.unwrap();
     let backup_owner = crate::oltp::backup::BackupOwnerRef {
-        backup_id: Uuid::new_v4(),
+        backup_id: nabedra_rt::ids::uuid_v4(),
         attempt: 1,
     };
     let timestamps = &fixture.runtime.services.timestamps;
@@ -829,7 +829,7 @@ async fn backfill_and_retirement() -> (usize, usize) {
         assert_eq!(entries, *changed(category).as_array().unwrap());
     }
     let (status, retired) = fixture
-        .admin(Uuid::new_v4(), "storage.index.retire", fixture.selector(1))
+        .admin(nabedra_rt::ids::uuid_v4(), "storage.index.retire", fixture.selector(1))
         .await;
     assert_eq!(status, StatusCode::OK, "{retired}");
     fixture.assert_status(1, "retired", false).await;
@@ -864,7 +864,7 @@ async fn backfill_and_retirement() -> (usize, usize) {
                 crate::oltp::backup::lifecycle::BackupCancelledStatement {
                     owner: backup_owner,
                     pin: backup,
-                    archive_id: Uuid::new_v4(),
+                    archive_id: nabedra_rt::ids::uuid_v4(),
                 },
             )
             .unwrap(),
@@ -879,7 +879,7 @@ async fn backfill_and_retirement() -> (usize, usize) {
             "table_id":fixture.definition.table_id,"key":5,"values":{"label":"during reclamation"}
         }),
     );
-    let queued = fixture.queued(Uuid::new_v4(), "table.update", json!({
+    let queued = fixture.queued(nabedra_rt::ids::uuid_v4(), "table.update", json!({
         "table_id":fixture.definition.table_id,"key":7,"values":{"label":"queued during reclamation"}
     }));
     tokio::join!(synchronous, queued);
@@ -890,12 +890,12 @@ async fn backfill_and_retirement() -> (usize, usize) {
         row(7, 7, "queued during reclamation")
     );
     let participant = fixture.participant().await;
-    let reclaimed = tokio::time::timeout(Duration::from_secs(45), async {
+    let reclaimed = nabedra_rt::time::timeout(Duration::from_secs(45), async {
         loop {
             if participant.next_stored_index(None).await.unwrap().is_none() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(250)).await;
         }
     })
     .await;
@@ -985,7 +985,7 @@ async fn interrupt_publication() {
     let mut holds = index_holds::register(catalog_id);
     held.release.send(false).unwrap();
 
-    let prepared = tokio::time::timeout(WAIT, holds.recv())
+    let prepared = nabedra_rt::time::timeout(WAIT, holds.recv())
         .await
         .unwrap()
         .unwrap();
@@ -995,7 +995,7 @@ async fn interrupt_publication() {
     assert!(!plan.as_str().unwrap().contains(INDEX), "{plan}");
     prepared.release.send(()).unwrap();
 
-    let decided = tokio::time::timeout(WAIT, holds.recv())
+    let decided = nabedra_rt::time::timeout(WAIT, holds.recv())
         .await
         .unwrap()
         .unwrap();
@@ -1007,7 +1007,7 @@ async fn interrupt_publication() {
     drop(decided);
     index_holds::unregister(catalog_id);
     let (status, body) = fixture
-        .admin(Uuid::new_v4(), "storage.index.resume", fixture.selector(1))
+        .admin(nabedra_rt::ids::uuid_v4(), "storage.index.resume", fixture.selector(1))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["data"]["state"], "ready");
@@ -1062,7 +1062,7 @@ fn d11_hot_key_index_process() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "run through scripts/acceptance_oltp.py"]
 async fn acceptance_o12() {
-    tokio::time::timeout(Duration::from_secs(300), async {
+    nabedra_rt::time::timeout(Duration::from_secs(300), async {
         let (page_peak, retained) = backfill_and_retirement().await;
         interrupt_refresh(false).await;
         interrupt_refresh(true).await;

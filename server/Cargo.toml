@@ -14,7 +14,11 @@ include = ["/src/", "/tests/", "/examples/", "/Cargo.lock", "/README.md", "/LICE
 
 [workspace]
 # `nabedra-kv` builds and tests alone: `cargo test -p nabedra-kv`.
-members = [".", "kv", "check", "rt"]
+members = [".", "kv", "check", "rt", "sim"]
+# Plain `cargo build` and `cargo test` here build only the server, as before `sim` joined.
+# The simulation crates are members but never default members: they enable
+# `nabedra-rt/sim`, which `src/main.rs` refuses to compile. Name them with `-p`.
+default-members = ["."]
 exclude = ["events", "fuzz"]
 
 [lib]
@@ -34,7 +38,7 @@ oltp-backup-s3 = ["oltp", "s3"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-http-client"]
 # Simulation builds of the library only (nabedra-rt deterministic runtime). src/main.rs
 # refuses to compile with it, so no simulation build produces a server binary.
-sim = ["nabedra-rt/sim"]
+sim = ["nabedra-rt/sim", "nabedra-rt/sim-openraft"]
 
 [dependencies]
 ring = "=0.17.14"

@@ -4,7 +4,6 @@ use std::path::Path;
 
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 const HEADER_BYTES: usize = 4 + 32;
 const MAX_RECORD: usize = 8 << 20;
@@ -82,7 +81,7 @@ pub(super) fn replace(
     let parent = path
         .parent()
         .ok_or_else(|| invalid("metadata directory missing"))?;
-    let tmp = parent.join(format!(".metadata-{}", Uuid::new_v4()));
+    let tmp = parent.join(format!(".metadata-{}", nabedra_rt::ids::uuid_v4()));
     let file = OpenOptions::new()
         .create_new(true)
         .read(true)

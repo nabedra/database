@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use nabedra_rt::time;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -69,7 +70,7 @@ impl Copies {
     }
 
     pub fn expire(&mut self) {
-        let now = Instant::now();
+        let now = time::now_std();
         self.outgoing.retain(|_, copy| copy.until > now);
         self.incoming.retain(|_, copy| copy.until > now);
     }
@@ -153,7 +154,7 @@ impl Copies {
         }
 
         let resume_valid = self.outgoing.get(&transfer).is_some_and(|pin| {
-            pin.until > Instant::now()
+            pin.until > time::now_std()
                 && probe
                     .resume
                     .is_some_and(|resume| resume.id == pin.id && resume.offset == pin.next)
@@ -175,10 +176,10 @@ impl Copies {
             self.outgoing.insert(
                 transfer,
                 Outgoing {
-                    id: Uuid::new_v4(),
+                    id: nabedra_rt::ids::uuid_v4(),
                     cut: source.sequence,
                     next: 0,
-                    until: Instant::now() + TRANSFER_TTL,
+                    until: time::now_std() + TRANSFER_TTL,
                     image,
                     digest: Sha256::new(),
                 },
@@ -288,7 +289,7 @@ impl Copies {
                     id: chunk.id,
                     cut: chunk.cut,
                     next: 0,
-                    until: Instant::now() + TRANSFER_TTL,
+                    until: time::now_std() + TRANSFER_TTL,
                     store: SlotStore::new(config.slot_bytes, config.eviction),
                     digest: Sha256::new(),
                 },
@@ -302,7 +303,7 @@ impl Copies {
         if transfer.id != chunk.id
             || transfer.cut != chunk.cut
             || transfer.next != chunk.offset
-            || Instant::now() >= transfer.until
+            || time::now_std() >= transfer.until
         {
             return Err(StoreError::InvalidEffects);
         }
