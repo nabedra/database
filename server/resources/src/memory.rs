@@ -72,10 +72,6 @@ pub struct ChargedBuffer {
     charge: ByteReservation,
 }
 impl ChargedBuffer {
-    pub fn from_reserved(data: Vec<u8>, charge: ByteReservation) -> Self {
-        Self { data, charge }
-    }
-
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.data
     }
@@ -132,9 +128,12 @@ impl ByteArena {
         self._charge.bytes()
     }
 
-    pub fn new(capacity: usize, charge: MemoryCharge) -> Result<Arc<Self>, ProtocolError> {
+    pub fn new(bytes: usize, charge: MemoryCharge) -> Result<Arc<Self>, ProtocolError> {
+        if u64::try_from(bytes) != Ok(charge.bytes()) {
+            return Err(capacity());
+        }
         Ok(Arc::new(Self {
-            capacity,
+            capacity: bytes,
             used: AtomicUsize::new(0),
             _charge: charge,
             worker: OnceLock::new(),
@@ -329,12 +328,18 @@ pub struct ByteReservation {
 }
 impl ByteReservation {
     pub fn allocate(&mut self, len: usize) -> Result<ChargedBuffer, ProtocolError> {
-        let charge = self.split(len)?;
+        self.split(len)?.into_buffer()
+    }
+
+    /// Allocates the whole remaining reservation without a second charge.
+    pub fn into_buffer(self) -> Result<ChargedBuffer, ProtocolError> {
+        let len = self.remaining;
         let mut data = Vec::new();
         data.try_reserve_exact(len).map_err(|_| capacity())?;
         data.resize(len, 0);
-        Ok(ChargedBuffer { data, charge })
+        Ok(ChargedBuffer { data, charge: self })
     }
+
     pub fn reclaim_buffer(&mut self, buffer: ChargedBuffer) -> Result<(), ProtocolError> {
         let ChargedBuffer { data, mut charge } = buffer;
         if !Arc::ptr_eq(&self.arena, &charge.arena) {

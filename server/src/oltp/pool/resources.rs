@@ -455,11 +455,7 @@ impl WorkerSharedResources {
         class: ByteClass,
         len: usize,
     ) -> Result<ChargedBuffer, ProtocolError> {
-        let charge = self.reserve_bytes_in(class, len)?;
-        let mut data = Vec::new();
-        data.try_reserve_exact(len).map_err(|_| capacity())?;
-        data.resize(len, 0);
-        Ok(ChargedBuffer::from_reserved(data, charge))
+        self.reserve_bytes_in(class, len)?.into_buffer()
     }
     pub fn reserve_scratch(
         &self,
