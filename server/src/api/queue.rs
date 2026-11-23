@@ -79,7 +79,7 @@ impl LocalQueue {
             initialization: AsyncMutex::new(()),
             submissions: Mutex::new(()),
             changed: Notify::new(),
-            member: Uuid::new_v4(),
+            member: nabedra_rt::ids::uuid_v4(),
             fence: Mutex::new(None),
             active: Mutex::new(std::collections::BTreeSet::new()),
             tasks: Executor::new(config.max_pending_requests as usize, 0)?,
@@ -99,7 +99,7 @@ impl LocalQueue {
             return Ok(fence);
         }
         let proposed = CatalogFence {
-            run_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
             scheduler_term: 1,
         };
         let loaded = engine
@@ -372,7 +372,7 @@ impl LocalQueue {
                 let budget = HistoryBudget::new(
                     4096,
                     64 << 20,
-                    tokio::time::Instant::now() + Duration::from_secs(30),
+                    nabedra_rt::time::now() + Duration::from_secs(30),
                 )
                 .map_err(|_| unavailable())?;
                 if let Some(d) = engine
@@ -512,9 +512,9 @@ mod tests {
     }
     #[test]
     fn q02_rollback_cannot_discard_an_accepted_or_different_version() {
-        let member = Uuid::new_v4();
+        let member = nabedra_rt::ids::uuid_v4();
         let mut queue = RequestQueue::new(
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             1,
             1,
             QueueLimits {
@@ -526,7 +526,7 @@ mod tests {
             [member].into_iter().collect(),
         )
         .unwrap();
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let body = serde_json::to_vec(
             &serde_json::json!({"request_id":id,"operation":"table.list","payload":{}}),
         )
@@ -560,7 +560,7 @@ mod tests {
         );
         let queue = LocalQueue::new(&engine, Default::default(), false, false).unwrap();
         queue.initialize(&engine).await.unwrap();
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let body = serde_json::to_vec(
             &serde_json::json!({"request_id":id,"operation":"table.list","payload":{}}),
         )
@@ -619,7 +619,7 @@ mod tests {
     }
     #[tokio::test]
     async fn q01_f02_f03_actor_unwind_settles_unknown_and_releases_original_memory() {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        nabedra_rt::time::timeout(Duration::from_secs(10), async {
             let (pool, threads) = crate::worker_pool::WorkerPool::start(
                 std::num::NonZeroUsize::new(1).unwrap(),
                 tokio::runtime::Handle::current(),
@@ -641,7 +641,7 @@ mod tests {
                 .backend()
                 .panic
                 .store(true, Ordering::SeqCst);
-            let id = Uuid::new_v4();
+            let id = nabedra_rt::ids::uuid_v4();
             let body = serde_json::to_vec(
                 &serde_json::json!({"request_id":id,"operation":"table.list","payload":{}}),
             )

@@ -56,7 +56,8 @@ async fn gate(gate: Option<Arc<crate::test_storage::ReadGate>>) {
     if let Some(gate) = gate {
         gate.entered.add_permits(1);
         if let Ok(Ok(permit)) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), gate.release.acquire()).await
+            nabedra_rt::time::timeout(std::time::Duration::from_secs(10), gate.release.acquire())
+                .await
         {
             permit.forget();
         }

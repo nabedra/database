@@ -200,7 +200,7 @@ impl Slot {
     }
     pub(super) fn cancelled(&self) -> bool {
         let mut h = self.handoff.lock().unwrap();
-        if !h.cancelled && self.deadline.is_some_and(|d| Instant::now() >= d) {
+        if !h.cancelled && self.deadline.is_some_and(|d| nabedra_rt::time::now() >= d) {
             let _change = self.evidence.begin(false).expect("deadline cancellation");
             h.cancelled = true;
         }
@@ -217,7 +217,7 @@ impl Slot {
         tokio::select! {
             biased;
             _ = wake.changed() => Err(OwnerError::Cancelled),
-            _ = async { if let Some(d) = self.deadline { tokio::time::sleep_until(d).await } else { std::future::pending::<()>().await } } => { self.cancel(); Err(OwnerError::Cancelled) },
+            _ = async { if let Some(d) = self.deadline { nabedra_rt::time::sleep_until(d).await } else { std::future::pending::<()>().await } } => { self.cancel(); Err(OwnerError::Cancelled) },
             frame = reader.next_frame() => frame.map_err(|_| OwnerError::Invalid),
         }
     }
@@ -232,7 +232,7 @@ impl Slot {
         tokio::select! {
             biased;
             _ = wake.changed() => Err(OwnerError::Cancelled),
-            _ = async { if let Some(d) = self.deadline { tokio::time::sleep_until(d).await } else { std::future::pending::<()>().await } } => { self.cancel(); Err(OwnerError::Cancelled) },
+            _ = async { if let Some(d) = self.deadline { nabedra_rt::time::sleep_until(d).await } else { std::future::pending::<()>().await } } => { self.cancel(); Err(OwnerError::Cancelled) },
             result = future => result.map_err(|_| OwnerError::Invalid),
         }
     }
@@ -907,7 +907,7 @@ impl PayloadOwners {
         let supervised = slot.clone();
         let mut wake = slot.wake.subscribe();
         let request = RequestStorage::new();
-        let handle = runtime.spawn(async move {
+        let handle = nabedra_rt::task::spawn_on(&runtime, async move {
             #[cfg(test)]
             if let Some(polled) = supervised.hooks.lock().unwrap().dormant_pending.take() {
                 let _ = polled.send(());
@@ -1638,16 +1638,18 @@ async fn upload_staged(
                 .receive()
                 .await
                 .map_err(|_| OwnerError::Invalid)?;
-            let deadline = Instant::now() + std::time::Duration::from_secs(30);
-            let wrote = tokio::time::timeout_at(
+            let deadline = nabedra_rt::time::now() + std::time::Duration::from_secs(30);
+            let wrote = nabedra_rt::time::timeout_at(
                 deadline,
                 storage.put(&key, bytes.clone(), crate::storage::WriteCondition::Create),
             )
             .await;
             if !matches!(wrote,Ok(Ok(ref token)) if !token.is_empty()) {
-                let confirmed =
-                    tokio::time::timeout_at(deadline, storage.read(&key, meta.byte_size as usize))
-                        .await;
+                let confirmed = nabedra_rt::time::timeout_at(
+                    deadline,
+                    storage.read(&key, meta.byte_size as usize),
+                )
+                .await;
                 if !matches!(confirmed,Ok(Ok(object)) if object.bytes==bytes && !object.etag.is_empty())
                 {
                     return Err(OwnerError::Invalid);
@@ -1841,9 +1843,10 @@ fn execute(slot: &Slot, work: Work, runtime: &tokio::runtime::Runtime) -> Result
                                 reader
                                     .read_to_end(&mut bytes)
                                     .map_err(|_| OwnerError::Invalid)?;
-                                let deadline = Instant::now() + std::time::Duration::from_secs(30);
+                                let deadline =
+                                    nabedra_rt::time::now() + std::time::Duration::from_secs(30);
                                 let wrote = runtime.block_on(async {
-                                    tokio::time::timeout_at(
+                                    nabedra_rt::time::timeout_at(
                                         deadline,
                                         storage.put(
                                             &key,
@@ -1855,7 +1858,7 @@ fn execute(slot: &Slot, work: Work, runtime: &tokio::runtime::Runtime) -> Result
                                 });
                                 if !matches!(wrote, Ok(Ok(ref token)) if !token.is_empty()) {
                                     let confirmed = runtime.block_on(async {
-                                        tokio::time::timeout_at(
+                                        nabedra_rt::time::timeout_at(
                                             deadline,
                                             storage.read(&key, meta.byte_size as usize),
                                         )
@@ -2067,7 +2070,9 @@ fn execute(slot: &Slot, work: Work, runtime: &tokio::runtime::Runtime) -> Result
                     }
                     Command::CommitEof => {
                         let handoff = slot.handoff.lock().unwrap();
-                        if handoff.cancelled || slot.deadline.is_some_and(|d| Instant::now() >= d) {
+                        if handoff.cancelled
+                            || slot.deadline.is_some_and(|d| nabedra_rt::time::now() >= d)
+                        {
                             return Err(OwnerError::Cancelled);
                         }
                         match std::mem::replace(&mut d.processor, Processor::Empty) {
@@ -2196,7 +2201,7 @@ async fn supervise(
     while !slot.cancelled() {
         let request = tokio::select! {
             _ = wake.changed() => None,
-            _ = async { if let Some(d) = deadline { tokio::time::sleep_until(d).await } else { std::future::pending::<()>().await } } => { slot.cancel(); None },
+            _ = async { if let Some(d) = deadline { nabedra_rt::time::sleep_until(d).await } else { std::future::pending::<()>().await } } => { slot.cancel(); None },
             request = rx.recv() => request,
         };
         let Some(request) = request else {
@@ -3871,7 +3876,8 @@ impl PayloadOwners {
         if let Some(probe) = spawning {
             let _ = probe.send(self.shared.state.try_lock().is_ok());
         }
-        let handle = runtime.spawn(invocation.run(storage, deadline, activated));
+        let handle =
+            nabedra_rt::task::spawn_on(&runtime, invocation.run(storage, deadline, activated));
         self.shared
             .state
             .lock()

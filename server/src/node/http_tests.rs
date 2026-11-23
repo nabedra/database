@@ -90,7 +90,7 @@ async fn b02_c07_unsigned_overload_retries_same_permit_with_fresh_sequence_and_o
             let body = read_small(
                 response.into_body(),
                 length,
-                Instant::now() + Duration::from_secs(1),
+                nabedra_rt::time::now() + Duration::from_secs(1),
             )
             .await?;
             checked_small_reply(&a, &signature, status, body, context, &root)

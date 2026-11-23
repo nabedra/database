@@ -120,7 +120,7 @@ impl Worker {
         if self.ready.prepared.input.value.template.mode.is_fixed() {
             return Err(http::failure(ErrorCode::Unauthorized));
         }
-        let now = std::time::SystemTime::now()
+        let now = nabedra_rt::time::wall_now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| unavailable())?
             .as_secs();
@@ -161,8 +161,12 @@ impl Worker {
     }
     async fn start(&self, subject: admission::StartSubject) -> Result<admission::Binding> {
         let binding = subject.binding().map_err(|_| unavailable())?;
-        self.start_until(subject, binding, Instant::now() + Duration::from_secs(30))
-            .await
+        self.start_until(
+            subject,
+            binding,
+            nabedra_rt::time::now() + Duration::from_secs(30),
+        )
+        .await
     }
     async fn start_until(
         &self,
@@ -183,10 +187,10 @@ impl Worker {
             match self.receiver.lock().unwrap().start_locked(checked) {
                 Ok(_ticket) => return Ok(binding),
                 Err(admission::AcceptError::Admission(admission::Refusal::Full))
-                    if Instant::now() < deadline => {}
+                    if nabedra_rt::time::now() < deadline => {}
                 Err(_) => return Err(unavailable()),
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(10)).await;
         }
     }
     pub(super) async fn dispatch(
@@ -197,7 +201,7 @@ impl Worker {
         let request_key = request
             .extensions_mut()
             .remove::<crate::request_queue::RequestKey>();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = nabedra_rt::time::now() + Duration::from_secs(30);
         let path = request.uri().path().to_owned();
         if request.uri().query().is_some() {
             return Err(invalid());
@@ -239,7 +243,7 @@ impl Worker {
         let mut reader = None;
         let bytes = if job {
             let mut framed = http::framed_reader(request.into_body());
-            let first = tokio::time::timeout_at(deadline, framed.next_frame())
+            let first = nabedra_rt::time::timeout_at(deadline, framed.next_frame())
                 .await
                 .map_err(|_| unavailable())?
                 .map_err(|_| invalid())?
@@ -568,7 +572,7 @@ pub async fn run_worker(path: PathBuf) -> std::result::Result<(), &'static str> 
     result.and(joined)
 }
 async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = nabedra_rt::time::now() + Duration::from_secs(30);
     let ready = Arc::new(
         cpu(&cpu_pool, move |runtime| {
             prepare_bootstrap(&path, deadline.into_std())
@@ -623,9 +627,9 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
     .map_err(|_| invalid())?;
     let client = http::HttpClient::new(ready.prepared.tls.as_ref())?;
     let key = Arc::new(auth::WorkerSigningKey::new().map_err(|_| invalid())?);
-    let incarnation = Uuid::new_v4();
-    let session = Uuid::new_v4();
-    let initialization = Uuid::new_v4();
+    let incarnation = nabedra_rt::ids::uuid_v4();
+    let session = nabedra_rt::ids::uuid_v4();
+    let initialization = nabedra_rt::ids::uuid_v4();
     let sender = Arc::new(
         auth::Sender::worker(
             input.node_id,
@@ -656,7 +660,7 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
         .encode()
         .map_err(|_| invalid())?;
     let mut pin = None;
-    while Instant::now() < deadline && pin.is_none() {
+    while nabedra_rt::time::now() < deadline && pin.is_none() {
         for endpoint in &input.template.api_urls {
             let request = Request::builder()
                 .method("POST")
@@ -698,7 +702,7 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
             }
         }
         if pin.is_none() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(100)).await;
         }
     }
     let pin = pin.ok_or_else(unavailable)?;
@@ -785,16 +789,16 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
         let writer=worker.owners.heartbeat_writer();
         *writer.lock().await=Some(HeartbeatWriter::new(crate::cluster::runtime::heartbeat_binding(&root,node)?).map_err(|_|invalid())?);
         let (stop,mut stopped)=tokio::sync::watch::channel(false);
-        let queue_owner=worker.clone();let queue_task=tokio::spawn(queue_owner.queue_pump(stop.subscribe()));
+        let queue_owner=worker.clone();let queue_task=nabedra_rt::task::spawn(queue_owner.queue_pump(stop.subscribe()));
         let heartbeat_interval=Duration::from_millis(root.timing.heartbeat_ms);
         let owner=worker.clone();
-        let heartbeat=tokio::spawn(async move {
+        let heartbeat=nabedra_rt::task::spawn(async move {
             loop {
                 owner.owners.reap();
                 let sample={let (_,used_threads,used_bytes)=owner.cpu.scheduler().usage()[0];let state=owner.receiver.lock().unwrap();let snap=state.snapshot_locked();let local=snap.local.ok_or_else(unavailable)?;let (ro,qo,rp,qp)=local.occupancy();HeartbeatSample{available_threads:Some(owner.cpu.resources().max_threads.saturating_sub(used_threads)),available_memory_bytes:Some(owner.cpu.resources().working_bytes().saturating_sub(used_bytes)),running_operations:ro as u64,queued_operations:qo as u64,running_partitions:rp as u64,queued_partitions:qp as u64,drain_id:local.drain_id(),accepting:owner.accepting.load(Ordering::Acquire)&&local.drain_id().is_none()}};
-                let outcome=writer.lock().await.as_mut().ok_or_else(unavailable)?.publish(&owner.storage,sample,Instant::now()+Duration::from_secs(5)).await;
+                let outcome=writer.lock().await.as_mut().ok_or_else(unavailable)?.publish(&owner.storage,sample,nabedra_rt::time::now()+Duration::from_secs(5)).await;
                 if matches!(outcome,Ok(HeartbeatWriteResult::Exhausted)){owner.accepting.store(false,Ordering::Release);}
-                tokio::select!{_=stopped.changed()=>break,_=tokio::time::sleep(heartbeat_interval)=>{}}
+                tokio::select!{_=stopped.changed()=>break,_=nabedra_rt::time::sleep(heartbeat_interval)=>{}}
             }
             Ok::<(),ProtocolError>(())
         });

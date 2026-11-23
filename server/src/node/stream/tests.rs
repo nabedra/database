@@ -62,7 +62,7 @@ async fn seeded() -> (Engine<Store>, WorkerThreads, Uuid, Uuid) {
         Store::default(),
         Namespace::new("stream-worker-test/").unwrap(),
     );
-    let run = Uuid::new_v4();
+    let run = nabedra_rt::ids::uuid_v4();
     storage
         .initialize_fenced_cluster_catalog(
             CatalogFence {
@@ -106,7 +106,8 @@ async fn seeded() -> (Engine<Store>, WorkerThreads, Uuid, Uuid) {
 }
 
 async fn operation(engine: &Engine<Store>, name: &str, payload: Value) -> Value {
-    let request = json!({"request_id": Uuid::new_v4(), "operation": name, "payload": payload});
+    let request =
+        json!({"request_id": nabedra_rt::ids::uuid_v4(), "operation": name, "payload": payload});
     let bytes = serde_json::to_vec(&request).unwrap();
     let operation = parse_request(&bytes).unwrap().operation;
     let catalog = engine.storage().load_cluster_catalog().await.unwrap();
@@ -123,7 +124,7 @@ async fn operation(engine: &Engine<Store>, name: &str, payload: Value) -> Value 
 
 fn open(run: Uuid, table_id: Uuid, depth: u8) -> Open {
     Open {
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         expected_run_id: run,
         table_id,
         query: serde_json::from_value(json!({
@@ -155,7 +156,7 @@ fn request(opened: &Opened, sequence: u64) -> Request {
 }
 
 async fn settled(activity: &Activity) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    nabedra_rt::time::timeout(Duration::from_secs(5), async {
         while activity.speculative.load(Ordering::Acquire) != 0 {
             tokio::task::yield_now().await;
         }
@@ -328,7 +329,7 @@ async fn st03_close_releases_in_progress_prefetch() {
     };
     let opened = opened(&local, &engine, run, body).await;
     let activity = local.registry.get(&key).unwrap().activity.clone();
-    tokio::time::timeout(Duration::from_secs(5), gate.entered.acquire())
+    nabedra_rt::time::timeout(Duration::from_secs(5), gate.entered.acquire())
         .await
         .expect("open did not start lookahead before demand")
         .unwrap()
@@ -447,7 +448,7 @@ async fn st04_managed_stream_rechecks_revoked_object_access() {
 
     let mut body = open(run, table, 1);
     let Reply::SnapshotOpened(snapshot) = ask(Request::OpenSnapshot(OpenSnapshot {
-        request_id: Uuid::new_v4(),
+        request_id: nabedra_rt::ids::uuid_v4(),
         expected_run_id: run,
         table_id: table,
         query: body.query.clone(),
@@ -601,9 +602,9 @@ async fn st03_replica_byte_ceiling_and_expiry_release() {
     }
     let charged = pool.scheduler().usage()[0].2;
     let mut second = entry.clone();
-    second.key.id = Uuid::new_v4();
+    second.key.id = nabedra_rt::ids::uuid_v4();
     if let Kind::Stream(stream) = &mut second.kind {
-        stream.opened.stream_id = Uuid::new_v4();
+        stream.opened.stream_id = nabedra_rt::ids::uuid_v4();
     }
     assert!(matches!(
         registry.install(second.clone(), Some(None), 8 * MIB, pool.scheduler(), now),

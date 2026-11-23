@@ -30,8 +30,8 @@ async fn settle(
     threads: crate::worker_pool::WorkerThreads,
     parent: PathBuf,
 ) {
-    let drain = tokio::time::timeout(WATCHDOG, owners.close_and_drain()).await;
-    let joined = tokio::time::timeout(WATCHDOG, threads.shutdown()).await;
+    let drain = nabedra_rt::time::timeout(WATCHDOG, owners.close_and_drain()).await;
+    let joined = nabedra_rt::time::timeout(WATCHDOG, threads.shutdown()).await;
     let empty = std::fs::read_dir(&parent).unwrap().count() == 0;
     std::fs::remove_dir(parent).unwrap();
     assert!(matches!(drain, Ok(Ok(()))));
@@ -94,7 +94,7 @@ async fn fixed_shares_retain_original_handles_and_charges_through_return() {
         ticket.slot.hooks.lock().unwrap().dormant_pending = Some(polled);
         pending.push(observed);
     }
-    let dormant_polled = tokio::time::timeout(WATCHDOG, async {
+    let dormant_polled = nabedra_rt::time::timeout(WATCHDOG, async {
         for pending in pending {
             pending.await.map_err(|_| ())?;
         }
@@ -106,7 +106,7 @@ async fn fixed_shares_retain_original_handles_and_charges_through_return() {
         h.executed.is_empty() && h.created.is_empty()
     }) && std::fs::read_dir(&parent).unwrap().count() == 0;
     drop(tickets);
-    let observed = tokio::time::timeout(WATCHDOG, async {
+    let observed = nabedra_rt::time::timeout(WATCHDOG, async {
         for returned in returns {
             returned.await.map_err(|_| ())?;
         }
@@ -175,7 +175,7 @@ async fn close_sees_empty_placeholder_and_later_published_handle() {
     let (release, gate) = oneshot::channel();
     ticket.slot.hooks.lock().unwrap().returning = Some((at_return, gate));
     drop(ticket);
-    let observed = tokio::time::timeout(WATCHDOG, returned).await;
+    let observed = nabedra_rt::time::timeout(WATCHDOG, returned).await;
     let retained = transport.available_permits() == 0
         && owners
             .shared
@@ -196,7 +196,7 @@ async fn close_sees_empty_placeholder_and_later_published_handle() {
 #[tokio::test]
 async fn dormant_abandonment_needs_no_live_worker_and_refusal_stays_bounded() {
     let (owners, threads, parent, _) = tests::fixture();
-    tokio::time::timeout(WATCHDOG, threads.shutdown())
+    nabedra_rt::time::timeout(WATCHDOG, threads.shutdown())
         .await
         .unwrap()
         .unwrap();
@@ -220,7 +220,7 @@ async fn dormant_abandonment_needs_no_live_worker_and_refusal_stays_bounded() {
         .flatten()
         .count();
     drop(tickets);
-    let drain = tokio::time::timeout(WATCHDOG, owners.close_and_drain()).await;
+    let drain = nabedra_rt::time::timeout(WATCHDOG, owners.close_and_drain()).await;
     let empty = std::fs::read_dir(&parent).unwrap().count() == 0;
     std::fs::remove_dir(parent).unwrap();
     assert!(refused && empty && matches!(drain, Ok(Ok(()))));
@@ -260,7 +260,7 @@ async fn boot_activates_original_supervisor_before_any_transport() {
         )
         .unwrap();
     let initialized = matches!(
-        tokio::time::timeout(WATCHDOG, process.ready()).await,
+        nabedra_rt::time::timeout(WATCHDOG, process.ready()).await,
         Ok(Ok(Reply::Ready))
     );
     let same = owners
@@ -288,9 +288,12 @@ async fn pre_spawn_failure_rolls_back_and_identity_exhaustion_never_wraps() {
         shared: owners.shared.clone(),
     };
     let permit = transport.clone().try_acquire_owned().unwrap();
-    let rolled_back = std::thread::spawn(move || outside_runtime.prepare_control(permit).is_err())
-        .join()
-        .unwrap();
+    let rolled_back = nabedra_rt::task::spawn_service("nabedra-test", move || {
+        outside_runtime.prepare_control(permit).is_err()
+    })
+    .expect("spawn test thread")
+    .join()
+    .unwrap();
     let empty = owners
         .shared
         .state

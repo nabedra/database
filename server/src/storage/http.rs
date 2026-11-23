@@ -24,7 +24,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, ReadBuf},
-    time::{Instant, Sleep},
+    time::Sleep,
 };
 use tokio_util::io::StreamReader;
 
@@ -236,8 +236,8 @@ impl HttpStore {
     async fn get_with_access_error(&self, key: &str) -> Result<Download, ObjectAccessError> {
         self.key(key)?;
         let request = self.request("GET", key, vec![])?;
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
-        let response = tokio::time::timeout_at(deadline, self.client.request(request))
+        let deadline = nabedra_rt::time::now() + REQUEST_TIMEOUT;
+        let response = nabedra_rt::time::timeout_at(deadline, self.client.request(request))
             .await
             .map_err(|_| StorageError::Unavailable)?
             .map_err(|_| StorageError::Unavailable)?;
@@ -255,7 +255,7 @@ impl HttpStore {
         Ok(Download::new(
             DeadlineReader {
                 inner: Box::pin(StreamReader::new(stream)),
-                deadline: Box::pin(tokio::time::sleep_until(deadline)),
+                deadline: Box::pin(nabedra_rt::time::sleep_until(deadline)),
             },
             etag,
         ))
@@ -295,7 +295,7 @@ impl ObjectStore for HttpStore {
             name,
             HeaderValue::from_bytes(&value).map_err(|_| StorageError::Configuration)?,
         );
-        let response = tokio::time::timeout(REQUEST_TIMEOUT, self.client.request(request))
+        let response = nabedra_rt::time::timeout(REQUEST_TIMEOUT, self.client.request(request))
             .await
             .map_err(|_| StorageError::Ambiguous)?
             .map_err(|_| StorageError::Ambiguous)?;

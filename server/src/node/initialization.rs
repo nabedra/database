@@ -21,12 +21,12 @@ impl InitializedWorker {
         pool: &crate::worker_pool::WorkerPool,
     ) -> super::http::Result<Self> {
         super::http::cpu(pool, move |runtime| {
-            let control =
-                runtime
-                    .block_on(storage.load_control(
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(10),
-                    ))
-                    .map_err(|_| super::http::unavailable())?;
+            let control = runtime
+                .block_on(
+                    storage
+                        .load_control(nabedra_rt::time::now() + std::time::Duration::from_secs(10)),
+                )
+                .map_err(|_| super::http::unavailable())?;
             let root = control.root();
             let local = &ready.prepared.input.value;
             if root.cluster_id != local.cluster_id
@@ -106,7 +106,8 @@ mod tests {
             )
             .unwrap();
             let owners = PayloadOwners::from_receiver(pool, state.clone());
-            let path = std::env::temp_dir().join(format!("nabedra-c1-{}", Uuid::new_v4()));
+            let path =
+                std::env::temp_dir().join(format!("nabedra-c1-{}", nabedra_rt::ids::uuid_v4()));
             std::fs::create_dir(&path).unwrap();
             let mut process = owners
                 .start_boot(
@@ -116,7 +117,7 @@ mod tests {
                     SpoolLimits::new(4096, 2).unwrap(),
                 )
                 .unwrap();
-            let receipt = tokio::time::timeout(LIMIT, process.process_ready()).await;
+            let receipt = nabedra_rt::time::timeout(LIMIT, process.process_ready()).await;
             let mut outcome = None;
             let mut duplicate = None;
             let mut redacted = None;
@@ -143,7 +144,7 @@ mod tests {
                     );
                 }
                 duplicate = Some(
-                    tokio::time::timeout(LIMIT, process.process_ready())
+                    nabedra_rt::time::timeout(LIMIT, process.process_ready())
                         .await
                         .is_ok_and(|v| v.is_err()),
                 );
@@ -157,8 +158,8 @@ mod tests {
                 .unwrap()
                 .initialized();
             drop(process);
-            let drained = tokio::time::timeout(LIMIT, owners.close_and_drain()).await;
-            let joined = tokio::time::timeout(LIMIT, threads.shutdown()).await;
+            let drained = nabedra_rt::time::timeout(LIMIT, owners.close_and_drain()).await;
+            let joined = nabedra_rt::time::timeout(LIMIT, threads.shutdown()).await;
             let empty = std::fs::read_dir(&path).unwrap().count() == 0;
             std::fs::remove_dir(path).unwrap();
             assert!(matches!(drained, Ok(Ok(()))) && matches!(joined, Ok(Ok(()))) && empty);

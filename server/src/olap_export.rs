@@ -14,7 +14,6 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
-use uuid::Uuid;
 /// Capture one immutable catalog and export each referenced partition in order.
 /// The source must be kept in its offline write-maintenance window and retained
 /// for rollback. A changed catalog invalidates publication; partial output is
@@ -31,7 +30,7 @@ pub async fn export_offline<B: ObjectStore + Clone + Send + Sync + 'static>(
             .map_err(|_| storage_error())?;
         let catalog = decode_catalog(&captured.bytes)?;
         let source_snapshot: [u8; 32] = Sha256::digest(&captured.bytes).into();
-        let archive_id = Uuid::new_v4();
+        let archive_id = nabedra_rt::ids::uuid_v4();
         let parent = destination
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -200,10 +199,10 @@ pub async fn run_configured(
         ));
     }
     let config = std::fs::canonicalize(config).map_err(|_| storage_error())?;
-    let prepared = tokio::task::spawn_blocking(move || {
+    let prepared = nabedra_rt::task::spawn_blocking(move || {
         crate::cluster::startup_material::composition::prepare_api(
             &config,
-            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            nabedra_rt::time::now_std() + std::time::Duration::from_secs(30),
         )
     })
     .await

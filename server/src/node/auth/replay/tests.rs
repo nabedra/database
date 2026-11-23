@@ -19,11 +19,14 @@ fn equal_sequence_one_winner_and_unseen_out_of_order_accepted() {
         gates.push(tx);
         let ready = ready_tx.clone();
         let state = Arc::clone(&state);
-        handles.push(std::thread::spawn(move || {
-            ready.send(()).unwrap();
-            rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            state.lock().unwrap().consume(e, c).map(|_| ())
-        }));
+        handles.push(
+            nabedra_rt::task::spawn_service("nabedra-test", move || {
+                ready.send(()).unwrap();
+                rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                state.lock().unwrap().consume(e, c).map(|_| ())
+            })
+            .expect("spawn test thread"),
+        );
     }
     let observed = (0..2).all(|_| ready_rx.recv_timeout(Duration::from_secs(10)).is_ok());
     for tx in gates {
@@ -42,7 +45,7 @@ fn equal_sequence_one_winner_and_unseen_out_of_order_accepted() {
     let high = pair(&f, 12);
     let low = pair(&f, 11);
     let high_state = Arc::clone(&state);
-    let high_thread = std::thread::spawn(move || {
+    let high_thread = nabedra_rt::task::spawn_service("nabedra-test", move || {
         let result = high_state
             .lock()
             .unwrap()
@@ -50,14 +53,16 @@ fn equal_sequence_one_winner_and_unseen_out_of_order_accepted() {
             .map(|_| ());
         let _ = done_tx.send(());
         result
-    });
-    let low_thread = std::thread::spawn(move || {
+    })
+    .expect("spawn test thread");
+    let low_thread = nabedra_rt::task::spawn_service("nabedra-test", move || {
         let observed = done_rx.recv_timeout(Duration::from_secs(10));
         (
             observed,
             state.lock().unwrap().consume(low.0, low.1).map(|_| ()),
         )
-    });
+    })
+    .expect("spawn test thread");
     let high_result = high_thread.join();
     let low_result = low_thread.join();
     assert_eq!(high_result.unwrap(), Ok(()));

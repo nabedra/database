@@ -16,7 +16,7 @@ use std::{
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex},
-    thread::{self, JoinHandle},
+    thread::JoinHandle,
 };
 use tokio::{
     runtime::{Handle, Runtime},
@@ -126,9 +126,8 @@ impl WorkerPool {
             let (drained_tx, drained) = oneshot::channel();
             let (exit, exit_rx) = oneshot::channel();
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-            let spawned = thread::Builder::new()
-                .name(format!("nabedra-worker-{id}"))
-                .spawn(move || {
+            let spawned =
+                nabedra_rt::task::spawn_service(format!("nabedra-worker-{id}"), move || {
                     let runtime = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()

@@ -83,7 +83,7 @@ impl<I> Connection<I> {
         };
         let timer = self
             .write_timer
-            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+            .get_or_insert_with(|| Box::pin(nabedra_rt::time::sleep_until(deadline)));
         if timer.deadline() != deadline {
             timer.as_mut().reset(deadline);
         }
@@ -317,7 +317,7 @@ impl IdleTracker {
             && buffer.filled().len() > filled
         {
             state.phase = Phase::Head {
-                deadline: tokio::time::Instant::now() + self.phase.header_read,
+                deadline: nabedra_rt::time::now() + self.phase.header_read,
             };
         } else if idle
             && result.is_pending()
@@ -336,7 +336,7 @@ impl IdleTracker {
         if let (Some(deadline), true) = (deadline, result.is_pending()) {
             let timer = self
                 .head_timer
-                .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+                .get_or_insert_with(|| Box::pin(nabedra_rt::time::sleep_until(deadline)));
             if timer.deadline() != deadline {
                 timer.as_mut().reset(deadline);
             }
@@ -356,7 +356,7 @@ impl IdleTracker {
         let mut state = self.phase.state.lock().unwrap();
         if matches!(state.phase, Phase::Flushing) {
             state.phase = Phase::Idle {
-                since: std::time::Instant::now(),
+                since: nabedra_rt::time::now_std(),
             };
         }
     }
@@ -454,7 +454,7 @@ where
                     #[cfg(feature = "oltp")]
                     crate::oltp_runtime::stage_timing::perf_stage!("http.accept.evicted_idle")
                         .record(std::time::Duration::ZERO);
-                    tokio::time::timeout(EVICTION_WAIT, total.acquire_owned())
+                    nabedra_rt::time::timeout(EVICTION_WAIT, total.acquire_owned())
                         .await
                         .ok()
                         .and_then(Result::ok)
@@ -475,8 +475,8 @@ where
             #[cfg(feature = "olap")]
             let service = service.layer(axum::Extension(write_deadline.clone()));
             #[cfg(feature = "oltp")]
-            let started = std::time::Instant::now();
-            let (io, service) = tokio::time::timeout(
+            let started = nabedra_rt::time::now_std();
+            let (io, service) = nabedra_rt::time::timeout(
                 std::time::Duration::from_secs(5),
                 inner.accept(stream, service),
             )
@@ -798,7 +798,7 @@ mod tests {
     async fn st03_blocked_stream_socket_expires_writes_and_final_flush() {
         for writing in [true, false] {
             let deadline = StreamWriteDeadline::default();
-            let response = deadline.arm(Instant::now() + Duration::from_secs(1));
+            let response = deadline.arm(nabedra_rt::time::now() + Duration::from_secs(1));
             let (first_poll, started) = oneshot::channel();
             let mut connection = connection(
                 TestSocket {
@@ -807,7 +807,7 @@ mod tests {
                 },
                 deadline,
             );
-            let writer = tokio::spawn(async move {
+            let writer = nabedra_rt::task::spawn(async move {
                 if writing {
                     let _response = response;
                     connection.write_all(b"batch").await
@@ -818,7 +818,7 @@ mod tests {
             });
             started.await.unwrap();
             // The blocked socket never wakes the task. The write deadline must.
-            let error = tokio::time::timeout(Duration::from_secs(5), writer)
+            let error = nabedra_rt::time::timeout(Duration::from_secs(5), writer)
                 .await
                 .expect("the stream write deadline did not wake the socket task")
                 .unwrap()
@@ -830,7 +830,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn st03_flushed_stream_allows_the_next_keep_alive_response() {
         let deadline = StreamWriteDeadline::default();
-        let response = deadline.arm(Instant::now() + Duration::from_secs(1));
+        let response = deadline.arm(nabedra_rt::time::now() + Duration::from_secs(1));
         let mut connection = connection(
             TestSocket {
                 blocked: false,
@@ -869,7 +869,7 @@ mod keep_alive_tests {
         let mut buffer = [0; 1024];
         // Every test response is "ok" or "no": read until its body arrives.
         while !(response.ends_with(b"ok") || response.ends_with(b"no")) {
-            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
+            let read = nabedra_rt::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
                 .await
                 .unwrap()
                 .unwrap();
@@ -882,7 +882,7 @@ mod keep_alive_tests {
     async fn closed(stream: &mut tokio::net::TcpStream, within: Duration) -> bool {
         let mut buffer = [0; 64];
         matches!(
-            tokio::time::timeout(within, stream.read(&mut buffer)).await,
+            nabedra_rt::time::timeout(within, stream.read(&mut buffer)).await,
             Ok(Ok(0)) | Ok(Err(_))
         )
     }
@@ -891,7 +891,7 @@ mod keep_alive_tests {
     async fn closed_cleanly(stream: &mut tokio::net::TcpStream, within: Duration) -> bool {
         let mut buffer = [0; 64];
         matches!(
-            tokio::time::timeout(within, stream.read(&mut buffer)).await,
+            nabedra_rt::time::timeout(within, stream.read(&mut buffer)).await,
             Ok(Ok(0))
         )
     }
@@ -912,7 +912,7 @@ mod keep_alive_tests {
     ) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             let shutdown = std::future::pending::<()>();
             serve_bounded(listener, app, None, data_connections, keep_alive, shutdown).await
         });
@@ -965,7 +965,7 @@ mod keep_alive_tests {
     async fn o01_perf2e_api_listener_keeps_an_idle_connection_past_5_s() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(serve_router_keep_alive(
+        nabedra_rt::task::spawn(serve_router_keep_alive(
             listener,
             app(),
             None,
@@ -987,14 +987,14 @@ mod keep_alive_tests {
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         exchange(&mut stream, "/ok").await;
         // Idle longer than the header read timeout, then a prompt request.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(1500)).await;
         let response = exchange(&mut stream, "/ok").await;
         assert!(response.starts_with("http/1.1 200"), "{response}");
         // A slow sender: part of a head, then nothing.
         stream.write_all(b"GET /ok HTTP/1.1\r\n").await.unwrap();
-        let started = std::time::Instant::now();
+        let started = nabedra_rt::time::now_std();
         assert!(closed(&mut stream, Duration::from_secs(3)).await);
-        let elapsed = started.elapsed();
+        let elapsed = nabedra_rt::time::now_std().duration_since(started);
         assert!(elapsed >= Duration::from_millis(900), "{elapsed:?}");
         assert!(elapsed < Duration::from_millis(2500), "{elapsed:?}");
     }
@@ -1027,7 +1027,7 @@ mod keep_alive_tests {
         busy.write_all(b"GET /health/slow HTTP/1.1\r\nHost: test\r\n\r\n")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(200)).await;
         // Every other slot holds an idle kept-alive connection.
         let mut idle = Vec::new();
         for _ in 1..slots {
@@ -1036,7 +1036,7 @@ mod keep_alive_tests {
             assert!(response.starts_with("http/1.1 200"), "{response}");
             idle.push(stream);
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(100)).await;
 
         // A new connection is served, and the oldest idle one is closed cleanly.
         let mut new = tokio::net::TcpStream::connect(address).await.unwrap();
@@ -1077,7 +1077,7 @@ mod keep_alive_tests {
             stream.write_all(b"GET /ok HTTP/1.1\r\n").await.unwrap();
             partial.push(stream);
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(200)).await;
         let mut refused = tokio::net::TcpStream::connect(address).await.unwrap();
         let _ = refused
             .write_all(b"GET /ok HTTP/1.1\r\nHost: test\r\n\r\n")

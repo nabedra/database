@@ -119,9 +119,9 @@ impl Local {
         if !self.registry.reaper_started.swap(true, Ordering::AcqRel) {
             let registry = Arc::downgrade(&self.registry);
             let pool = engine.worker_pool().clone();
-            tokio::spawn(async move {
+            nabedra_rt::task::spawn(async move {
                 loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    nabedra_rt::time::sleep(Duration::from_secs(1)).await;
                     let Some(registry) = registry.upgrade() else {
                         break;
                     };
@@ -439,7 +439,7 @@ async fn open_snapshot<D: Driver>(
     )
     .await?;
     scan.cursor(0, open.shards)?;
-    let handle_id = Uuid::new_v4();
+    let handle_id = nabedra_rt::ids::uuid_v4();
     let opened = SnapshotOpened {
         snapshot_id: wire::snapshot_id(authority.run, handle_id),
         run_id: authority.run,
@@ -538,7 +538,7 @@ async fn open_stream<D: Driver>(
             .await?;
             let first = scan.cursor(0, 1)?;
             let opened = Opened {
-                stream_id: Uuid::new_v4(),
+                stream_id: nabedra_rt::ids::uuid_v4(),
                 run_id: authority.run,
                 prefetch_batches: open.prefetch_batches.min(prefetch_ceiling(driver.pool())),
                 expires_at: now.saturating_add(state::LIFETIME_MS),
@@ -552,7 +552,7 @@ async fn open_stream<D: Driver>(
         }
     };
     let opened = Opened {
-        stream_id: Uuid::new_v4(),
+        stream_id: nabedra_rt::ids::uuid_v4(),
         run_id: authority.run,
         prefetch_batches: open.prefetch_batches.min(prefetch_ceiling(driver.pool())),
         expires_at,
@@ -966,7 +966,7 @@ fn start_prefetch<D: Driver>(driver: D, authority: Authority, record: Arc<Stored
         activity: record.activity.clone(),
         released: false,
     };
-    tokio::spawn(async move {
+    nabedra_rt::task::spawn(async move {
         loop {
             let _ = prefetch(&driver, authority, &record).await;
             if running.settled() {
@@ -982,7 +982,7 @@ async fn prefetch<D: Driver>(
     record: &Arc<Stored>,
 ) -> Result<(), Error> {
     let registry = driver.registry();
-    let Ok(Ok(_worker)) = tokio::time::timeout(
+    let Ok(Ok(_worker)) = nabedra_rt::time::timeout(
         Duration::from_millis(250),
         registry.speculation.clone().acquire_owned(),
     )

@@ -10,7 +10,7 @@ use crate::{
     },
 };
 use std::sync::Mutex;
-use tokio::time::{Duration, Instant};
+use tokio::time::Duration;
 
 struct PrivateCatalog {
     catalog: Catalog,
@@ -113,7 +113,7 @@ impl<B: ObjectStore + 'static> Engine<B> {
         let budget = HistoryBudget::new(
             4096,
             64 * 1024 * 1024,
-            Instant::now() + Duration::from_secs(60),
+            nabedra_rt::time::now() + Duration::from_secs(60),
         )
         .map_err(|_| unavailable())?;
         for _ in 0..3 {
@@ -192,7 +192,7 @@ impl<B: ObjectStore + 'static> Engine<B> {
                 id: if changed {
                     candidate.commit_id
                 } else {
-                    Uuid::new_v4()
+                    nabedra_rt::ids::uuid_v4()
                 },
                 parent: base.decision_head,
                 base_revision: base.revision,
