@@ -1521,6 +1521,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "nabedra-kv",
+ "nabedra-rt",
  "openraft 0.9.25",
  "reqwest",
  "rustls",
@@ -1567,6 +1568,7 @@ dependencies = [
 name = "nabedra-rt"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tokio",
  "uuid",
 ]

@@ -10,6 +10,15 @@ the peer network and the disk.
 It is compiled only with the `sim` cargo feature. A product build without the feature
 runs exactly the code it ran before; `src/main.rs` refuses to build with the feature.
 
+Since phase 10 (P10-EVENTS) the simulator is built on the shared core. The per-node
+context (clocks, seeded ids, the task registry, inline blocking work) is the
+`nabedra_rt::sim` world, which the product code reaches through `src/rt.rs`, now thin
+re-exports of `nabedra_rt`. The network plan, the FNV trace hash and the Raft observer come
+from `nabedra-sim` (`server/sim`). This directory keeps the Events harness: the brokers,
+the workload, the nemesis, the history and its checker, the in-memory router and the
+openraft 0.9 `SimRuntime`. The feature enables `nabedra-rt/sim` and the optional
+`nabedra-sim` dependency; neither reaches a product build.
+
 ## Running
 
 ```sh
@@ -23,7 +32,8 @@ RUSTFLAGS="--cfg tokio_unstable" cargo test --locked -j 2 --features sim --lib s
 | `NABEDRA_SEED` | first seed of the sweep | 1 |
 | `NABEDRA_SEEDS` | number of consecutive seeds in the sweep | 20 |
 | `NABEDRA_SIM_VERIFY_REPLAY` | run every sweep seed twice and compare its trace and history | enabled in the T1 check |
-| `NABEDRA_PLANTED_SEED`, `NABEDRA_PLANTED_SEEDS` | first seed and budget of each planted-bug search | 1000, 200 |
+| `NABEDRA_PLANTED_SEED`, `NABEDRA_PLANTED_SEEDS` | first seed and budget of each planted-bug search | 1000, 200 (10,000 in `events-sim-planted`) |
+| `NABEDRA_HANDOFF_SEED` | the seed `same_term_leader_handoff_preserves_safety` runs | 397 |
 | `NABEDRA_SIM_HISTORY_DIR` | write every run's history there, not only failing ones | unset |
 
 A failing seed prints its violations, the last trace lines, the path of its history file
@@ -41,23 +51,26 @@ diverge, and the determinism test can fail.
 
 | Seam | Product | Simulation |
 | --- | --- | --- |
-| Time (`rt::now`, `sleep_until`, `timeout_at`, `wall_now`) | tokio and `SystemTime` | tokio paused time plus a per-node monotonic and wall offset |
-| Ids (`rt::uuid_v4`) | `Uuid::new_v4` | the node's seeded SplitMix64 stream |
-| Tasks (`rt::spawn`) | `tokio::spawn` | registered with the node in the task-local context |
-| Blocking storage work (`rt::blocking`) | `spawn_blocking` | a helper thread completes each job while virtual time stands still |
+| Time (`rt::now`, `sleep`, `sleep_until`, `timeout`, `timeout_at`, `wall_now`, `unix_ms`) | tokio and `SystemTime` | `nabedra_rt::sim`: tokio paused time plus each node's monotonic clock and wall offset |
+| Ids (`rt::uuid_v4`) | `Uuid::new_v4` | the node's seeded SplitMix64 stream in the `nabedra_rt::sim` world |
+| Tasks (`rt::spawn`) | `tokio::spawn` | registered with the node in the world's task registry |
+| Blocking storage work (`rt::blocking`) | `spawn_blocking` | `nabedra_rt`'s blocking helper completes each job while virtual time stands still |
 | Raft runtime (`raft::Runtime`) | `openraft::TokioRuntime` | `sim::runtime::SimRuntime` |
 | Peer network (`RaftNetwork for Network`) | reqwest to the axum peer router | `sim::net::call`, an in-memory router |
 | Disk | the real filesystem | a `nabedra_kv::fs::FaultFs` volume per broker |
 
-The node context is a tokio task-local holding the broker id. `rt::spawn` and
+The node context is `nabedra_rt::sim`'s task-local holding the broker id. `rt::spawn` and
 `SimRuntime::spawn` copy it into every new task and add the task's abort handle to the
-node's registry. The router runs each request as a task of the target node.
+node's registry. The router runs each request as a task of the target node. The product
+hooks (apply, append, truncate and the planted-bug knobs) find the run's harness through
+the world installed on the current thread, which `nabedra_rt` also installs on its
+blocking helper.
 
 ### The openraft runtime
 
 openraft 0.9's `AsyncRuntime` trait is implementable, so the simulator uses it rather
-than seeding election timeouts through the config. `SimRuntime` delegates to tokio, with
-three changes:
+than seeding election timeouts through the config. `SimRuntime` stays in Events, because
+only Events uses openraft 0.9. It delegates to `nabedra_rt`, which gives three changes:
 
 - `Instant` is `SimInstant`, read on the current node's monotonic clock, so a clock jump
   moves that node's election, heartbeat and lease timers.
@@ -68,7 +81,8 @@ three changes:
 
 ### Network
 
-`sim::net::call` plans every message with the world's network rng when it is sent:
+`sim::net::call` plans every message with `nabedra_sim::NetPlan` when it is sent, drawing
+from the run's `net` stream:
 
 - dropped: a black hole until the sender's RPC deadline;
 - delayed by 1 ms plus up to the configured maximum;
@@ -85,8 +99,9 @@ disabled, is refused.
 Each broker has a `FaultFs` volume (the kv store) and a real temporary directory (the
 snapshot directory, which stays empty because runs stay below the snapshot threshold).
 
-- A crash marks the node down (its network is cut), halts its `FaultFs` (its disk is cut),
-  then aborts every registered task. Destructors that run afterwards can neither send nor
+- A crash removes the node's broker (its network is cut), halts its `FaultFs` (its disk is
+  cut), then crashes the node in the `nabedra_rt::sim` world, which aborts every
+  registered task. Destructors that run afterwards can neither send nor
   write. The next start opens `FaultFs::crash()`, which holds only durable data.
 - A restart opens a new broker on that image and reopens the partition group.
 - A wipe replaces the volume with an empty one. It is in the nemesis only when
@@ -109,7 +124,9 @@ snapshot directory, which stays empty because runs stay below the snapshot thres
 ## Invariants
 
 After every 10 ms step (and inside the apply hook), after Kafka's
-`RaftEventSimulationTest`:
+`RaftEventSimulationTest`. They are `nabedra_sim::RaftObserver`'s, fed openraft 0.9 ids
+through `sim::log_id` and `sim::vote`; each message names the group, as in
+`MonotonicEpoch: p0 n2 ...`.
 
 | Name | Check |
 | --- | --- |
@@ -119,10 +136,13 @@ After every 10 ms step (and inside the apply hook), after Kafka's
 | `SingleLeader` | only the broker named by a committed vote can report leadership for that vote |
 | `MajorityReachedHighWatermark` | each entry is in the durable log of a majority at first apply and the highest applied entry is rechecked every step. The append and truncate hooks track the logs, which are rebuilt from the volume at every start. |
 | `AppliedPrefixesAgree` | every replica that applies index i applies the same Raft log ID and payload |
+| `ElectionSafety` | at most one broker reports leadership under one vote |
 
 Events uses [OpenRaft's default leader IDs](https://docs.rs/openraft/0.9.25/openraft/docs/data/leader_id/index.html).
 They order elections by `(term, node ID)`, so a higher vote can replace a leader within
-the same numeric term. Seed 188 exercises this handoff.
+the same numeric term. The harness counts these handoffs (`Stats::same_term_handoffs`), and
+`same_term_leader_handoff_preserves_safety` requires one in seed 397, the first of seeds 1
+to 399 that has one.
 
 At the end:
 
@@ -160,7 +180,10 @@ against the replicas' final log:
 
 Test-only knobs (`Knobs`), compiled only with the feature. Each test searches seeds from
 `NABEDRA_PLANTED_SEED` until a matching violation appears and fails if none does within
-`NABEDRA_PLANTED_SEEDS` seeds.
+`NABEDRA_PLANTED_SEEDS` seeds. It then runs the catching seed again and requires the same
+trace hash, event count, history and violations. The phase 6 acceptance is that every bug
+is caught within 10,000 seeds; the `events-sim-planted` check runs the searches with that
+budget.
 
 | Knob | Where | Expected detection |
 | --- | --- | --- |
@@ -169,19 +192,33 @@ Test-only knobs (`Knobs`), compiled only with the feature. Each test searches se
 | `lose_fsynced_on_restart` | the harness restarts a broker from its volume as of its previous start | `MonotonicEpoch` and others |
 | `delay_redelivery_after_heal` | the final consumer starts polling after the redelivery deadline | Queue checker `redelivery-missing` |
 
+The searches were rerun after the move onto `nabedra_rt` and `nabedra_sim`, which changed
+every trace hash. Debug build, `--cfg tokio_unstable`, window starting at seed 1000:
+
+| Search | Before (phase 6) | After (phase 10) | Caught by, after |
+| --- | --- | --- | --- |
+| `commit-without-majority` | seed 1000 | seed 1000, trace `ce8e7273a245f05e` (3,249 lines) | `lost-write` |
+| `offset-reuse-after-dedup` | seed 1000 | seed 1000, trace `11f9261a9a20929f` (1,589 lines) | queue checker `duplicate-offset` |
+| `missing-redelivery-after-heal` | seed 1001 | seed 1001, trace `045418dc3b853c84` (3,112 lines) | queue checker `redelivery-missing` |
+| `fsynced-data-loss` | seed 1000 | seed 1000, trace `ab723fdd02ef5272` (3,345 lines) | `MonotonicEpoch` |
+
 The checkers also have direct tests on known-bad inputs (`sim::tests::checkers`): one
 fixture per history anomaly, and synthetic observations for each Kafka invariant.
 
 ## Determinism
 
-The trace is an FNV-1a hash over every message plan, reply, apply, nemesis action and
-history event, each prefixed with the virtual time. `same_seed_same_trace` runs seed 7
-twice and compares the hashes, the event counts and the histories.
+The trace is `nabedra_sim::Trace`: an FNV-1a hash over every message plan, reply, apply,
+nemesis action and history event, each prefixed with the virtual time. `same_seed_same_trace`
+runs seed 7 twice and compares the hashes, the event counts and the histories. Seed 7's
+trace was `2a2434cce49a35e1` (2,391 lines) in phase 6 and is `f3563b3d61b41ddc` (1,684
+lines) since phase 10. Every random choice now comes from a named stream of the seed
+(`nemesis`, `net`, `client-<process>`) or from the node's `nabedra_rt` stream.
 
 Sources of nondeterminism that were removed or ruled out:
 
 - tokio's `select!` order: seeded by `rng_seed` (`tokio_unstable`).
-- `spawn_blocking`: the runtime waits for each storage job before polling another task.
+- `spawn_blocking`: `nabedra_rt` runs each storage job to completion on its helper while
+  the simulation thread waits.
 - `Uuid::new_v4` on the Raft path: seeded.
 - openraft's election timeout rng: seeded through `SimRuntime`.
 - nabedra-kv's background flush and compaction threads: the default memtable is large
