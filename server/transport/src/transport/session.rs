@@ -24,8 +24,8 @@
 //! its first verified request. A full lane answers that request with a typed
 //! overload and closes the session after the reply.
 use super::*;
-use crate::oltp_replication::types::WorkerEnrollment;
-use crate::oltp_runtime::stage_timing::Stage;
+use crate::backend::{ClientStream, Target};
+use nabedra_resources::stage_timing::{Stage, stage};
 use std::{
     collections::HashMap,
     io::IoSlice,
@@ -38,7 +38,6 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     task::AbortHandle,
 };
-use tokio_rustls::{client, server};
 
 pub(super) const SESSION_ALPN: &[u8] = b"nabedra-otp/2";
 /// RD3: `nabedra-otp/2` plus direct admission: the receiver handles direct
@@ -54,7 +53,7 @@ pub(super) const SESSION_ALPN: &[u8] = b"nabedra-otp/2";
 /// a session with them.
 pub(super) const DIRECT_ADMISSION_ALPN: &[u8] = b"nabedra-otp/4";
 
-pub(super) fn session_alpn(alpn: Option<&[u8]>) -> bool {
+pub fn session_alpn(alpn: Option<&[u8]>) -> bool {
     matches!(alpn, Some(SESSION_ALPN | DIRECT_ADMISSION_ALPN))
 }
 pub(super) const REPLY_PREFIX_BYTES: usize = 53;
@@ -98,7 +97,7 @@ impl ClassStage {
     }
     fn get(&'static self, class: TrafficClass) -> &'static Stage {
         self.stages[class as usize].get_or_init(|| {
-            crate::oltp_runtime::stage_timing::stage(Box::leak(
+            stage(Box::leak(
                 format!("{}{class:?}", self.prefix).into_boxed_str(),
             ))
         })
@@ -126,10 +125,10 @@ struct FrameTiming {
 
 /// Fixed header of every frame on a session. `len` counts the body only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct StreamFrame {
-    pub stream_id: u64,
-    pub flags: u8,
-    pub len: u32,
+pub struct StreamFrame {
+    stream_id: u64,
+    flags: u8,
+    len: u32,
 }
 impl StreamFrame {
     fn encode(self) -> [u8; FRAME_BYTES] {
@@ -148,13 +147,55 @@ impl StreamFrame {
     }
 }
 
+/// The type of message carried on a multiplexed connection.
+#[cfg(feature = "sim")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum FrameKind {
+    Request = REQUEST,
+    Reply = REPLY,
+    Cancel = CANCEL,
+    Ping = PING,
+    Pong = PONG,
+}
+
+#[cfg(feature = "sim")]
+impl StreamFrame {
+    /// Read only the fixed prefix of a flushed multiplex message.
+    ///
+    /// Each multiplex write flushes exactly one frame. Use this on a connection
+    /// that negotiated a session protocol.
+    pub fn from_message(message: &[u8]) -> Option<Self> {
+        let (prefix, body) = message.split_at_checked(FRAME_BYTES)?;
+        let frame = Self::decode(prefix.try_into().ok()?);
+        (body.len() == frame.len as usize
+            && matches!(frame.flags, REQUEST | REPLY | CANCEL | PING | PONG))
+        .then_some(frame)
+    }
+
+    pub fn stream_id(self) -> u64 {
+        self.stream_id
+    }
+
+    pub fn kind(self) -> FrameKind {
+        match self.flags {
+            REQUEST => FrameKind::Request,
+            REPLY => FrameKind::Reply,
+            CANCEL => FrameKind::Cancel,
+            PING => FrameKind::Ping,
+            PONG => FrameKind::Pong,
+            _ => unreachable!("validated frame"),
+        }
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Optional protocol features a caller may use on a negotiated session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PeerFeature {
+pub enum PeerFeature {
     /// AppendEntries frames carrying more than one entry.
     MultiEntryAppend,
     /// RD3: the receiver admits direct requests by its direct handler pool
@@ -365,6 +406,7 @@ async fn write_frames(
     mut stop: Option<watch::Receiver<bool>>,
     mut hold: Option<watch::Receiver<bool>>,
     deadline: Duration,
+    #[cfg(test)] mut hold_after_release: Option<watch::Receiver<bool>>,
 ) -> bool {
     let healthy = loop {
         let frame = tokio::select! {
@@ -389,6 +431,10 @@ async fn write_frames(
             }
         }
         drop(frame.release.take());
+        #[cfg(test)]
+        if let Some(hold) = &mut hold_after_release {
+            let _ = hold.wait_for(|held| !*held).await;
+        }
         let started = nabedra_rt::time::now();
         if let Some(timing) = &frame.timing {
             timing.queue.record(started - timing.queued);
@@ -503,12 +549,13 @@ impl ClientSession {
     }
 
     fn start(
-        stream: client::TlsStream<TcpStream>,
+        stream: ClientStream,
+        proof: Handshake,
         enrollment: WorkerEnrollment,
         class: TrafficClass,
         common: &Common,
     ) -> Arc<Self> {
-        let alpn = stream.get_ref().1.alpn_protocol();
+        let alpn = proof.alpn.as_deref();
         let direct_admission = alpn == Some(DIRECT_ADMISSION_ALPN);
         let (read, write) = tokio::io::split(stream);
         let (outgoing, queue) = mpsc::channel(WRITE_QUEUE);
@@ -531,14 +578,23 @@ impl ClientSession {
             class,
         });
         let deadline = common.config.deadline;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let hold = Some(common.hold_writes.subscribe());
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-hooks")))]
         let hold = None;
         nabedra_rt::task::spawn({
             let session = session.clone();
             async move {
-                write_frames(write, queue, Some(stop), hold, deadline).await;
+                write_frames(
+                    write,
+                    queue,
+                    Some(stop),
+                    hold,
+                    deadline,
+                    #[cfg(test)]
+                    None,
+                )
+                .await;
                 session.close();
             }
         });
@@ -846,10 +902,10 @@ impl Drop for StreamGuard<'_> {
 
 async fn read_replies(
     session: Arc<ClientSession>,
-    mut stream: Counted<ReadHalf<client::TlsStream<TcpStream>>>,
+    mut stream: Counted<ReadHalf<ClientStream>>,
     class: TrafficClass,
     config: TransportConfig,
-    shared: Arc<WorkerSharedResources>,
+    shared: Arc<MemoryHandle>,
 ) {
     loop {
         let mut head = [0; FRAME_BYTES];
@@ -907,7 +963,7 @@ async fn read_reply(
     len: usize,
     class: TrafficClass,
     config: &TransportConfig,
-    shared: &WorkerSharedResources,
+    shared: &WorkerMemory,
 ) -> io::Result<Result<RawReply, RequestError>> {
     if len < REPLY_PREFIX_BYTES {
         return Err(framing());
@@ -965,7 +1021,7 @@ async fn read_reply(
 
 enum Route {
     Session(Arc<ClientSession>),
-    OneShot(Box<client::TlsStream<TcpStream>>),
+    OneShot(Box<ClientStream>),
 }
 
 #[derive(Default)]
@@ -1107,10 +1163,10 @@ impl PeerSessions {
                 Err(RequestError::Unreachable)
             }
         });
-        let stream = match connected {
-            Ok(stream) => {
+        let (stream, proof) = match connected {
+            Ok(connected) => {
                 *lock(&slot.failed) = None;
-                stream
+                connected
             }
             Err(error) => {
                 if !legacy {
@@ -1120,8 +1176,8 @@ impl PeerSessions {
             }
         };
         self.connections.fetch_add(1, Ordering::Relaxed);
-        if session_alpn(stream.get_ref().1.alpn_protocol()) {
-            let session = ClientSession::start(stream, peer.clone(), class, common);
+        if session_alpn(proof.alpn.as_deref()) {
+            let session = ClientSession::start(stream, proof, peer.clone(), class, common);
             if let Some(old) = lock(&slot.current).replace(session.clone()) {
                 old.close();
             }
@@ -1194,13 +1250,13 @@ async fn connect(
     class: TrafficClass,
     mut probe_resolving: Option<&mut bool>,
     phase: &mut RaftTransportPhase,
-) -> Result<client::TlsStream<TcpStream>, RequestError> {
+) -> Result<(ClientStream, Handshake), RequestError> {
     let identity = WorkerIdentity::from(peer);
     let name = ServerName::try_from(peer.server_name.as_str().to_owned())
         .map_err(|_| malformed("invalid target TLS name"))?;
     let socket = if let Ok(address) = peer.endpoint.parse::<SocketAddr>() {
         *phase = RaftTransportPhase::Connect;
-        TcpStream::connect(address).await
+        backend::current().dial(Target::Addr(address)).await
     } else {
         *phase = RaftTransportPhase::ResolveAddress;
         if let Some(resolving) = probe_resolving.as_deref_mut() {
@@ -1220,26 +1276,28 @@ async fn connect(
             *resolving = false;
         }
         *phase = RaftTransportPhase::Connect;
-        TcpStream::connect(addresses.as_ref()).await
+        backend::current()
+            .dial(Target::Addrs(addresses.as_ref()))
+            .await
     }
     .map_err(|_| RequestError::Unreachable)?;
-    tune_socket(&socket);
     *phase = RaftTransportPhase::Tls;
-    let stream = connect_peer(&common.connector, name, socket)
+    let (stream, proof) = common
+        .connector
+        .handshake(name, socket)
         .await
         .map_err(|_| RequestError::Unreachable)?;
-    let alpn = stream.get_ref().1.alpn_protocol();
-    let supported = alpn == Some(ALPN) || common.sessions_enabled && session_alpn(alpn);
-    if !supported || peer_digest(stream.get_ref().1.peer_certificates())? != peer.certificate_sha256
-    {
+    let alpn = proof.alpn.as_deref();
+    let supported = alpn == Some(ONE_SHOT_ALPN) || common.sessions_enabled && session_alpn(alpn);
+    if !supported || Digest::from_bytes(proof.peer_certificate_sha256) != peer.certificate_sha256 {
         return Err(malformed("target certificate or ALPN differs").into());
     }
-    Ok(stream)
+    Ok((stream, proof))
 }
 
 /// The `NABOTP01` exchange for a peer that negotiated the one-shot protocol.
 async fn one_shot(
-    mut stream: client::TlsStream<TcpStream>,
+    mut stream: ClientStream,
     hello: &[u8; PROLOGUE_BYTES],
     header: ChargedBytes,
     sections: [Option<ChargedBytes>; MAX_SECTIONS],
@@ -1403,8 +1461,8 @@ fn max_request_frame(config: &TransportConfig) -> usize {
 /// within the transport deadline) before the connection closes.
 pub(super) async fn serve(
     transport: Arc<WorkerTransport>,
-    stream: server::TlsStream<TcpStream>,
-    certificate: Digest,
+    stream: ServerStream,
+    proof: Handshake,
     mut stop: watch::Receiver<bool>,
     pending: OwnedSemaphorePermit,
 ) {
@@ -1415,7 +1473,15 @@ pub(super) async fn serve(
     let (outgoing, queue) = mpsc::channel(WRITE_QUEUE);
     let config = &transport.common.config;
     let deadline = config.deadline;
-    let writer = nabedra_rt::task::spawn(write_frames(write, queue, None, None, deadline));
+    let writer = nabedra_rt::task::spawn(write_frames(
+        write,
+        queue,
+        None,
+        None,
+        deadline,
+        #[cfg(test)]
+        Some(transport.common.hold_replies_after_release.subscribe()),
+    ));
     // The writer closes the socket once every sender is gone. This one keeps it
     // open until the slots below are given back, even after the reader (which
     // owns the other sender) ends or is aborted.
@@ -1428,7 +1494,7 @@ pub(super) async fn serve(
             bytes: state.received.clone(),
         },
         outgoing,
-        certificate,
+        Digest::from_bytes(proof.peer_certificate_sha256),
         state.clone(),
     ));
     let mut check = nabedra_rt::time::interval(DIRECTORY_CHECK);
@@ -1490,7 +1556,7 @@ pub(super) async fn serve(
 
 async fn serve_frames(
     transport: Arc<WorkerTransport>,
-    mut stream: Counted<ReadHalf<server::TlsStream<TcpStream>>>,
+    mut stream: Counted<ReadHalf<ServerStream>>,
     outgoing: mpsc::Sender<Outbound>,
     certificate: Digest,
     state: Arc<ServerSession>,
@@ -1640,7 +1706,9 @@ async fn run_stream(
         sections,
         preflight,
     } = work;
-    S_SPAWN.get(class).record(nabedra_rt::time::elapsed(spawned));
+    S_SPAWN
+        .get(class)
+        .record(nabedra_rt::time::elapsed(spawned));
     let mut trace = RaftTransportTrace {
         group: group_id,
         purpose,
@@ -1654,7 +1722,9 @@ async fn run_stream(
             .reserve_scratch(class.byte_class(), header_decode_bytes(class, header.len()))?;
         let preflight_started = nabedra_rt::time::now();
         let plan = endpoint.preflight(&session, header.as_slice()).await?;
-        S_PREFLIGHT.get(class).record(nabedra_rt::time::elapsed(preflight_started));
+        S_PREFLIGHT
+            .get(class)
+            .record(nabedra_rt::time::elapsed(preflight_started));
         drop(header_scratch);
         validate_plan(&common.config, class, plan)?;
         let handler = common
@@ -1686,7 +1756,9 @@ async fn run_stream(
         }
         let handle_started = nabedra_rt::time::now();
         let reply = endpoint.handle(session, header, sections).await?;
-        S_HANDLE.get(class).record(nabedra_rt::time::elapsed(handle_started));
+        S_HANDLE
+            .get(class)
+            .record(nabedra_rt::time::elapsed(handle_started));
         validate_reply(&common.config, class, &reply)?;
         Ok((reply, handler))
     })
@@ -1728,7 +1800,9 @@ async fn run_stream(
         if outgoing.send(frame).await.is_ok()
             && let Ok(WriteOutcome::Written(_)) = written.await
         {
-            S_TOTAL.get(class).record(nabedra_rt::time::elapsed(arrived));
+            S_TOTAL
+                .get(class)
+                .record(nabedra_rt::time::elapsed(arrived));
         }
     }
     drop(handler);
@@ -1742,7 +1816,7 @@ impl WorkerTransport {
     /// allocated, as in the one-shot listener.
     async fn receive(
         &self,
-        stream: &mut Counted<ReadHalf<server::TlsStream<TcpStream>>>,
+        stream: &mut Counted<ReadHalf<ServerStream>>,
         frame: StreamFrame,
         certificate: Digest,
         state: &ServerSession,
@@ -1940,12 +2014,7 @@ mod tests {
 
     #[tokio::test]
     async fn d10_vectored_frame_write_emits_exact_bytes_in_order() {
-        let shared = WorkerSharedResources::new(
-            1,
-            crate::config::WorkerResources::default(),
-            crate::oltp::pool::SharedResourceConfig::default(),
-        )
-        .unwrap();
+        let shared = crate::transport::tests::test_memory(1, Default::default());
         let header = shared
             .copy_bytes_in(ByteClass::Progress, b"header")
             .unwrap();
@@ -2018,7 +2087,7 @@ mod tests {
             lane: lane.clone(),
             free: free.clone(),
         };
-        assert!(write_frames(probe, frames, None, None, Duration::from_secs(5)).await);
+        assert!(write_frames(probe, frames, None, None, Duration::from_secs(5), None).await);
         assert!(matches!(written.await.unwrap(), WriteOutcome::Written(_)));
         let free = free.lock().unwrap().clone();
         assert!(!free.is_empty());

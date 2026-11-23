@@ -8,14 +8,12 @@ repository = "https://github.com/zPy52/nabedra-database"
 publish = ["crates-io"]
 description = "Nabedra OLTP peer transport"
 
-[package.metadata.nabedra]
-extraction-pending = true
-
 [features]
 sim = ["nabedra-rt/sim"]
+test-hooks = []
 
 [dependencies]
-nabedra-rt = { path = "../rt", version = "0.1.0" }
+nabedra-rt = { path = "../rt", version = "0.1.0", features = ["net"] }
 nabedra-protocol = { path = "../protocol", version = "0.1.0" }
 nabedra-resources = { path = "../resources", version = "0.1.0" }
 nabedra-oltp-types = { path = "../oltp-types", version = "0.1.0" }
@@ -28,3 +26,8 @@ uuid = { version = "=1.29.2", features = ["serde", "v4"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 socket2 = "=0.6.5"
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["tls12", "ring"] }
+
+
+[dev-dependencies]
+nabedra-resources = { path = "../resources", version = "0.1.0", features = ["test-defaults", "test-hooks"] }
+tokio = { version = "=1.54.1", features = ["test-util"] }

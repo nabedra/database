@@ -1,0 +1,12 @@
+id = "transport-unit"
+module = "oltp"
+kinds = ["U"]
+guarantees = ["OLTP-G04", "OLTP-G08", "OLTP-G09"]
+scenarios = ["D10", "O05", "C07", "O17", "O02"]
+tiers = ["T0", "T1"]
+# Component coverage over loopback mTLS. Process acceptance and feature builds run separately.
+command = ["cargo", "test", "--locked", "-p", "nabedra-transport", "--lib", "-j", "2", "--", "--test-threads=1"]
+cwd = "server"
+timeout_s = 1800
+needs = []
+result_parser = "cargo-test"
