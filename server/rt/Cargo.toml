@@ -33,7 +33,7 @@ rand = { version = "=0.10.4", default-features = false, optional = true }
 # `RealFs` (flock, fallocate, posix_fadvise) and `FaultFs`'s errno values, at the version
 # nabedra-kv already pins, so no crate enters the graph.
 [target.'cfg(unix)'.dependencies]
-libc = "=0.2.191"
+libc = { version = "=0.2.191", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "=1.54.1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util", "net", "io-util"] }
