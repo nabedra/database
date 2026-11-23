@@ -93,7 +93,7 @@ pub(super) async fn listen<B: Backend>(
                 id = id.wrapping_add(1);
                 let config = Arc::clone(&config);
                 let backend = Arc::clone(&backend);
-                connections.spawn(async move {
+                nabedra_rt::task::spawn_in(&mut connections, async move {
                     let _connection = connection;
                     let _ = connect(stream, &config, &*backend, handshake, id).await;
                 });

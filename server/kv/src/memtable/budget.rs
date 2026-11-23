@@ -134,7 +134,7 @@ mod tests {
         assert!(budget.is_exhausted());
         let start = nabedra_rt::time::now_std();
         assert!(!budget.wait_below_limit(Some(start + Duration::from_millis(20))));
-        assert!(start.elapsed() >= Duration::from_millis(20));
+        assert!(nabedra_rt::time::elapsed(start) >= Duration::from_millis(20));
         budget.release(800);
         assert_eq!(budget.used(), 0);
         assert!(budget.wait_below_limit(Some(nabedra_rt::time::now_std())));

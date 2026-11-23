@@ -47,6 +47,31 @@ def assert_no_test_hooks(name, tree):
             assert 'test-hooks' not in features.split(','), (name, package, 'test-hooks enabled')
 
 
+def package_features(tree):
+    """(package, features) for every line of a `{p}|{f}` tree."""
+    for line in tree.splitlines():
+        package, feature_separator, features = line.partition('|')
+        if feature_separator and package.split():
+            # A repeated package is printed once in full and then marked `(*)`.
+            features = features.strip().removesuffix('(*)').strip()
+            yield package.split()[0], {f for f in features.split(',') if f}
+
+
+def assert_no_sim(name, tree):
+    """No product graph enables the deterministic simulation (phase 7, O02, NS26)."""
+    runtime = False
+    for package, features in package_features(tree):
+        assert not package.startswith('nabedra-sim'), (name, package, 'simulation crate in a product graph')
+        if package == 'nabedra-rt':
+            runtime = True
+            assert 'sim' not in features, (name, package, 'sim enabled')
+        if package == 'nabedra-kv':
+            assert 'sim' not in features, (name, package, 'sim enabled')
+        if package == 'tokio':
+            assert 'test-util' not in features, (name, package, 'test-util enabled')
+    assert runtime, (name, 'nabedra-rt is not in the graph')
+
+
 def assert_no_forbidden_native(name, packages):
     native = FORBIDDEN_NATIVE & packages
     assert not native, (name, 'native dependencies', sorted(native))
@@ -71,20 +96,24 @@ def assert_dependency_packages(name, engine, s3, tree):
 
 def check_compile_guards():
     exclusive_engine = 'select exactly one engine: olap, oltp, or cache'
+    lib = ('--lib',)
     invalid = (
-        ('no-engine', [], exclusive_engine),
-        ('olap-oltp', ['--features', 'olap,oltp'], exclusive_engine),
-        ('olap-cache', ['--features', 'olap,cache'], exclusive_engine),
-        ('oltp-cache', ['--features', 'oltp,cache'], exclusive_engine),
-        ('all-engines', ['--features', 'olap,oltp,cache'], exclusive_engine),
-        ('cache-s3', ['--features', 'cache,s3'], 'the cache engine does not support S3'),
+        ('no-engine', [], lib, exclusive_engine),
+        ('olap-oltp', ['--features', 'olap,oltp'], lib, exclusive_engine),
+        ('olap-cache', ['--features', 'olap,cache'], lib, exclusive_engine),
+        ('oltp-cache', ['--features', 'oltp,cache'], lib, exclusive_engine),
+        ('all-engines', ['--features', 'olap,oltp,cache'], lib, exclusive_engine),
+        ('cache-s3', ['--features', 'cache,s3'], lib, 'the cache engine does not support S3'),
+        # Phase 7: a simulation build of the library is allowed, but never a server binary.
+        ('oltp-sim-bin', ['--features', 'oltp,sim'], ('--bin', 'nabedra-db'),
+         'cannot be built with the sim feature'),
     )
-    for name, features, diagnostic in invalid:
-        result = cargo('check', ['--no-default-features', *features], '--lib', check=False)
+    for name, features, target, diagnostic in invalid:
+        result = cargo('check', ['--no-default-features', *features], *target, check=False)
         assert result.returncode != 0, f'O02 {name} unexpectedly compiled'
         assert diagnostic in result.stderr, result.stderr
         print(f'O02 {name}: explicit compile guard passed', flush=True)
-    return [name for name, _, _ in invalid]
+    return [name for name, *_ in invalid]
 
 
 def installed_version(selection):
@@ -107,6 +136,7 @@ def main():
     tree = ('--edges', 'normal,build', '--prefix', 'none', '--format', '{p}|{f}')
     events_tree = cargo('tree', [], *tree, manifest=EVENTS_MANIFEST).stdout
     assert_no_test_hooks('events', events_tree)
+    assert_no_sim('events', events_tree)
     events = package_names(events_tree)
     assert_no_forbidden_native('events', events)
     assert 'nabedra-kv' in events, ('events', 'native storage engine')
@@ -114,6 +144,7 @@ def main():
     # The OLAP image selects these features explicitly, independent of Cargo's defaults.
     image_tree = cargo('tree', ['--no-default-features', '--features', 'olap,s3'], *tree).stdout
     assert_no_test_hooks('olap-s3-image', image_tree)
+    assert_no_sim('olap-s3-image', image_tree)
     assert_dependency_packages('olap-s3-image', 'olap', True, image_tree)
     print('O02 olap-s3-image: dependency graph passed', flush=True)
     graphs = {'events': sorted(events)}
@@ -121,6 +152,7 @@ def main():
     for name, engine, s3, selection in CASES:
         result = cargo('tree', selection, *tree)
         assert_no_test_hooks(name, result.stdout)
+        assert_no_sim(name, result.stdout)
         graphs[name] = assert_dependency_packages(name, engine, s3, result.stdout)
         print(f'O02 {name}: dependency graph passed', flush=True)
         if args.acceptance_evidence:

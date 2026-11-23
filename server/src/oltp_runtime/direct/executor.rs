@@ -96,6 +96,13 @@ impl Default for DirectConfig {
     }
 }
 
+// A simulation proposes DirectExpire in group order. Each proposal targets
+// its own Data log.
+#[cfg(feature = "sim")]
+type ServedRanges<V> = std::collections::BTreeMap<Uuid, V>;
+#[cfg(not(feature = "sim"))]
+type ServedRanges<V> = HashMap<Uuid, V>;
+
 pub(crate) struct DirectExecutor {
     resources: Arc<WorkerSharedResources>,
     config: DirectConfig,
@@ -108,7 +115,7 @@ pub(crate) struct DirectExecutor {
     /// GC2: per-range `DirectBatch` batching, used while the gate allows.
     batchers: Batchers,
     /// Ranges this worker served as leader, for the expiry task.
-    served: Mutex<HashMap<Uuid, Weak<ParticipantHandle>>>,
+    served: Mutex<ServedRanges<Weak<ParticipantHandle>>>,
     /// RD1: each group's epochs from its newest direct snapshot on this
     /// executor, keyed by group and bound to the handle that read them. The
     /// key for a mutation's table lookup before it latches; never a check.
@@ -219,10 +226,10 @@ impl DirectExecutor {
             }
         };
         if get {
-            self.stats.get_time(nabedra_rt::time::now_std().saturating_duration_since(started));
+            self.stats.get_time(nabedra_rt::time::elapsed(started));
             perf_stage!("leader.get.total").since(started);
         } else {
-            self.stats.mutation_time(nabedra_rt::time::now_std().saturating_duration_since(started));
+            self.stats.mutation_time(nabedra_rt::time::elapsed(started));
             perf_stage!("leader.mutation.total").since(started);
         }
         self.count(&response);
@@ -1707,7 +1714,7 @@ impl DirectExecutor {
         let handles: Vec<Arc<ParticipantHandle>> = {
             let mut served = self.served.lock().unwrap_or_else(|p| p.into_inner());
             served.retain(|_, handle| handle.strong_count() > 0);
-            let mut handles: HashMap<Uuid, Arc<ParticipantHandle>> = served
+            let mut handles: ServedRanges<Arc<ParticipantHandle>> = served
                 .iter()
                 .filter_map(|(group, handle)| Some((*group, handle.upgrade()?)))
                 .collect();

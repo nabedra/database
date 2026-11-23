@@ -2,26 +2,39 @@
 # `nabedra_rt` so the simulator can control them; `server/rt` is the only crate that
 # makes these calls directly (it allows the lint at its crate root).
 #
-# Enforcement: until every module is converted the lint only warns. The one clippy run
-# with `-D warnings` in the PR gate (nabedra-kv, .github/workflows/nabedra-build.yml)
-# allows it explicitly. The P7-BANS step enforces `-D clippy::disallowed_methods` on the
-# server workspace and adds file-level allows to `server/tests/**`, benches and examples.
+# Enforcement: the `clippy` job of .github/workflows/nabedra-build.yml (a base job, so
+# also the PR gate) runs clippy with `-D clippy::disallowed_methods` on the server for
+# every product feature set and on nabedra-rt; the `kv` job runs nabedra-kv with
+# `-D warnings`. The clippy job names packages with `-p` and `--no-deps`, so the dev-only
+# crates are not held to these bans: nabedra-check (its evidence records carry
+# real dates) and the simulation crates (nabedra-sim, later nabedra-sim-oltp), which
+# enable `nabedra-rt/sim` and so never join a product lint run. Integration tests
+# (`server/tests/**`, `server/kv/tests/**`) and examples carry a file-level allow: they
+# drive real processes against real time.
 # No crate-root allow is used in `server/src/lib.rs`: a source allow would override the
-# command-line `-W clippy::disallowed_methods` that converters use to count their hits.
+# command-line level and hide product hits.
 #
 # Scoped threads and test thread pools may keep a direct call with an item-level
 # `#[allow(clippy::disallowed_methods)] // <reason>`. `ring` randomness for credentials
 # and encryption is not affected. The server has no direct dependency on `rand` or
 # `fastrand`; non-crypto randomness uses `nabedra_rt::ids::random_u64`.
 #
+# Events (`server/events`) is a separate workspace below this directory, so clippy would
+# read this file there. Events does not take these bans in phase 7: its own seam
+# (`server/events/src/rt.rs`) re-exports tokio's `sleep` and `Instant`, so these paths
+# would flag the calls that seam sanctions. Events takes its own clippy.toml with an
+# empty list until it moves onto `nabedra_rt`, and then adopts this list.
+#
 # The tokio entries set `allow-invalid`: a crate built without tokio's `rt` and `time`
-# features (nabedra-kv alone) cannot resolve them, and clippy would warn on each. Every
-# entry resolves in the server crate, where each one has hits today.
+# features (nabedra-kv alone) cannot resolve them, and clippy would warn on each.
 disallowed-methods = [
     # Clock
     { path = "std::time::Instant::now", reason = "use nabedra_rt::time::now_std() (std type) or nabedra_rt::time::now() (tokio type)" },
     { path = "tokio::time::Instant::now", reason = "use nabedra_rt::time::now()", allow-invalid = true },
+    { path = "std::time::Instant::elapsed", reason = "use nabedra_rt::time::elapsed(start)" },
+    { path = "tokio::time::Instant::elapsed", reason = "use nabedra_rt::time::elapsed(start)", allow-invalid = true },
     { path = "std::time::SystemTime::now", reason = "use nabedra_rt::time::wall_now(), or unix_ms() / unix_micros() / unix_nanos()" },
+    { path = "std::time::SystemTime::elapsed", reason = "use nabedra_rt::time::wall_now().duration_since(earlier)" },
     { path = "tokio::time::sleep", reason = "use nabedra_rt::time::sleep()", allow-invalid = true },
     { path = "tokio::time::sleep_until", reason = "use nabedra_rt::time::sleep_until()", allow-invalid = true },
     { path = "tokio::time::timeout", reason = "use nabedra_rt::time::timeout()", allow-invalid = true },
@@ -32,7 +45,11 @@ disallowed-methods = [
     # Tasks
     { path = "tokio::task::spawn", reason = "use nabedra_rt::task::spawn() (also bans tokio::spawn)", allow-invalid = true },
     { path = "tokio::runtime::Handle::spawn", reason = "use nabedra_rt::task::spawn_on()", allow-invalid = true },
+    { path = "tokio::runtime::Runtime::spawn", reason = "use nabedra_rt::task::spawn_on(runtime.handle(), future)", allow-invalid = true },
+    { path = "tokio::task::JoinSet::spawn", reason = "use nabedra_rt::task::spawn_in(&mut set, future)", allow-invalid = true },
     { path = "tokio::task::spawn_blocking", reason = "use nabedra_rt::task::spawn_blocking()", allow-invalid = true },
+    { path = "tokio::runtime::Handle::spawn_blocking", reason = "use nabedra_rt::task::spawn_blocking_on()", allow-invalid = true },
+    { path = "tokio::runtime::Runtime::spawn_blocking", reason = "use nabedra_rt::task::spawn_blocking_on(runtime.handle(), f)", allow-invalid = true },
     { path = "std::thread::spawn", reason = "use nabedra_rt::task::spawn_service() for a long-lived named thread" },
     { path = "std::thread::Builder::spawn", reason = "use nabedra_rt::task::spawn_service() or spawn_service_with_stack()" },
     # Ids

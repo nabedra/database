@@ -1,0 +1,15 @@
+id = "crate-graph"
+# The module ratchet must run on OLTP changes, which is what makes a rising back edge fail before
+# the crates exist (phase 8 design, 4.3), so the check belongs to `oltp` rather than `testing`.
+module = "oltp"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+# Cases 5 (planted source edge) and 6 (proof impls) skip with their reason until P8-G and P8-H
+# create the storage and replication crates; the record lists skipped tests as not run.
+command = ["python3", "-m", "unittest", "discover", "-v", "-s", "scripts/testing", "-p", "test_crate_graph.py"]
+cwd = "."
+timeout_s = 600
+needs = []
+result_parser = "unittest"

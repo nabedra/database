@@ -11,6 +11,15 @@ use std::path::PathBuf;
 use super::cluster::{Knobs, Report, SimConfig, run};
 use super::history::History;
 
+/// The default window of every planted-bug search. Each bug must be caught well inside
+/// 10,000 seeds (testing plan phase 6); the README records the catching seeds.
+const PLANTED_FIRST: u64 = 1_000;
+const PLANTED_BUDGET: u64 = 200;
+
+/// A seed in which a second node leads within a term another node already led (the first
+/// of seeds 1 to 399 that does, after the move onto `nabedra_rt` and `nabedra_sim`).
+const HANDOFF_SEED: u64 = 397;
+
 const REPLAY: &str = "RUSTFLAGS=\"--cfg tokio_unstable\" cargo test --features sim --lib sim::tests::seed_sweep -- --nocapture";
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -177,28 +186,55 @@ fn different_seeds_differ() {
 
 #[test]
 fn same_term_leader_handoff_preserves_safety() {
-    // Seed 188 elects n1 and n2 with different leader IDs in term 5.
-    let report = run(SimConfig::new(188));
+    let seed = env_u64("NABEDRA_HANDOFF_SEED", HANDOFF_SEED);
+    let report = run(SimConfig::new(seed));
     assert!(report.passed(), "{}", describe(&report, "leader-handoff"));
+    assert!(
+        report.stats.same_term_handoffs > 0,
+        "seed {seed} no longer hands leadership over within a term: {:?}",
+        report.stats
+    );
 }
 
-/// Runs seeds from a fixed start until one violation mentions `expect`.
+/// Runs seeds from a fixed start until one violation mentions `expect`, then runs the
+/// catching seed again and requires the same trace, history and violations.
 fn find_planted(knobs: Knobs, expect: &[&str], label: &str) {
-    let first = env_u64("NABEDRA_PLANTED_SEED", 1_000);
-    let budget = env_u64("NABEDRA_PLANTED_SEEDS", 200);
-    for seed in first..first + budget {
+    let first = env_u64("NABEDRA_PLANTED_SEED", PLANTED_FIRST);
+    let budget = env_u64("NABEDRA_PLANTED_SEEDS", PLANTED_BUDGET);
+    let planted = |seed| {
         let mut config = SimConfig::new(seed);
         config.knobs = knobs;
-        let report = run(config);
+        run(config)
+    };
+    for seed in first..first + budget {
+        let report = planted(seed);
         if report
             .violations
             .iter()
             .any(|violation| expect.iter().any(|name| violation.contains(name)))
         {
             eprintln!(
-                "planted bug {label} caught at seed {seed} after {} seeds:\n  {}",
+                "planted bug {label} caught at seed {seed} after {} seeds, trace hash {:016x} ({} events):\n  {}",
                 seed - first + 1,
+                report.trace_hash,
+                report.trace_events,
                 report.violations.join("\n  ")
+            );
+            let replay = planted(seed);
+            assert_eq!(
+                (replay.trace_hash, replay.trace_events),
+                (report.trace_hash, report.trace_events),
+                "planted bug {label}: seed {seed} is not deterministic.\nfirst tail:\n{}\nsecond tail:\n{}",
+                report.trace_tail.join("\n"),
+                replay.trace_tail.join("\n"),
+            );
+            assert_eq!(
+                replay.history, report.history,
+                "planted bug {label}: seed {seed}: histories differ"
+            );
+            assert_eq!(
+                replay.violations, report.violations,
+                "planted bug {label}: seed {seed}: violations differ"
             );
             return;
         }
@@ -274,12 +310,15 @@ fn planted_fsynced_data_loss_is_caught() {
 }
 
 mod checkers {
+    use nabedra_sim::RaftObserver;
     use openraft::{CommittedLeaderId, LogId, Vote};
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::super::cluster::Observer;
     use super::super::history::{self, FinalLog, History};
+    use super::super::{log_id, vote};
+
+    const G: &str = "p0";
 
     fn id(n: u128) -> Uuid {
         Uuid::from_u128(n)
@@ -422,78 +461,105 @@ mod checkers {
         }
     }
 
+    /// The Kafka invariants now live in `nabedra_sim::RaftObserver`; these cases feed it
+    /// openraft 0.9 ids through the harness's conversions, as the hooks do.
     #[test]
     fn kafka_invariants_flag_known_bad_observations() {
-        let same_term = Vote::new_committed(3, 1);
-        let mut o = Observer::default();
-        o.observe_for_test(1, same_term, true, Some(1));
-        o.observe_for_test(2, same_term, true, Some(1));
+        let same_term = vote(Vote::new_committed(3, 1));
+        let violations = |o: &RaftObserver| o.violations().to_vec();
+        let mut o = RaftObserver::default();
+        o.observe(G, 1, same_term, true, Some(1), 0);
+        o.observe(G, 2, same_term, true, Some(1), 0);
         assert!(
-            o.violations.iter().any(|v| v.contains("SingleLeader")),
+            violations(&o).iter().any(|v| v.contains("SingleLeader")),
             "{:?}",
-            o.violations
+            violations(&o)
         );
 
-        let mut o = Observer::default();
-        o.observe_for_test(1, same_term, true, Some(1));
-        o.observe_for_test(2, Vote::new_committed(3, 2), true, Some(1));
-        assert!(o.violations.is_empty(), "{:?}", o.violations);
+        let mut o = RaftObserver::default();
+        o.observe(G, 1, same_term, true, Some(1), 0);
+        o.observe(G, 2, vote(Vote::new_committed(3, 2)), true, Some(1), 0);
+        assert!(violations(&o).is_empty(), "{:?}", violations(&o));
 
-        let mut o = Observer::default();
-        o.observe_for_test(1, Vote::new(5, 2), false, None);
-        o.observe_for_test(1, Vote::new(5, 1), false, None);
+        let mut o = RaftObserver::default();
+        o.observe(G, 1, vote(Vote::new(5, 2)), false, None, 0);
+        o.observe(G, 1, vote(Vote::new(5, 1)), false, None, 0);
         assert!(
-            o.violations.iter().any(|v| v.contains("MonotonicEpoch")),
+            violations(&o).iter().any(|v| v.contains("MonotonicEpoch")),
             "{:?}",
-            o.violations
+            violations(&o)
         );
 
-        let mut o = Observer::default();
-        o.observe_for_test(1, same_term, false, Some(9));
-        o.observe_for_test(1, same_term, false, Some(8));
+        let mut o = RaftObserver::default();
+        o.observe(G, 1, same_term, false, Some(9), 0);
+        o.observe(G, 1, same_term, false, Some(8), 0);
         assert!(
-            o.violations
+            violations(&o)
                 .iter()
                 .any(|v| v.contains("MonotonicHighWatermark")),
             "{:?}",
-            o.violations
+            violations(&o)
         );
 
-        let first = LogId::new(CommittedLeaderId::new(1, 1), 1);
-        let next = LogId::new(CommittedLeaderId::new(1, 1), 2);
-        let conflict = LogId::new(CommittedLeaderId::new(1, 2), 1);
-        let mut o = Observer::new(3);
-        o.appended(1, first);
-        o.appended(2, first);
-        o.applied(1, first, 0xaa, 0);
-        o.applied(2, first, 0xbb, 0);
+        let first = log_id(LogId::new(CommittedLeaderId::new(1, 1), 1));
+        let next = log_id(LogId::new(CommittedLeaderId::new(1, 1), 2));
+        let conflict = log_id(LogId::new(CommittedLeaderId::new(1, 2), 1));
+        let mut o = RaftObserver::new(3);
+        o.appended(G, 1, first);
+        o.appended(G, 2, first);
+        o.applied(G, 1, first, 0xaa, 0);
+        o.applied(G, 2, first, 0xbb, 0);
         assert!(
-            o.violations
+            violations(&o)
                 .iter()
                 .any(|v| v.contains("AppliedPrefixesAgree")),
             "{:?}",
-            o.violations
+            violations(&o)
         );
 
-        let mut o = Observer::new(3);
-        o.appended(1, first);
-        o.appended(2, conflict);
-        o.applied(1, first, 0xaa, 0);
+        let mut o = RaftObserver::new(3);
+        o.appended(G, 1, first);
+        o.appended(G, 2, conflict);
+        o.applied(G, 1, first, 0xaa, 0);
         // The next entry reaches a majority before the next metrics sample.
-        o.appended(1, next);
-        o.appended(2, next);
-        o.applied(1, next, 0xaa, 0);
+        o.appended(G, 1, next);
+        o.appended(G, 2, next);
+        o.applied(G, 1, next, 0xaa, 0);
         assert!(
-            o.violations
+            violations(&o)
                 .iter()
                 .any(|v| v.contains("MajorityReachedHighWatermark")),
             "{:?}",
-            o.violations
+            violations(&o)
         );
-        let mut o = Observer::new(3);
-        o.appended(1, first);
-        o.appended(2, first);
-        o.applied(1, first, 0xaa, 0);
-        assert_eq!(o.violations, Vec::<String>::new());
+        let mut o = RaftObserver::new(3);
+        o.appended(G, 1, first);
+        o.appended(G, 2, first);
+        o.applied(G, 1, first, 0xaa, 0);
+        assert_eq!(violations(&o), Vec::<String>::new());
+    }
+
+    /// openraft 0.9's ids map onto the observer's with the same display form and order.
+    #[test]
+    fn openraft_ids_map_onto_the_observer() {
+        let id = LogId::new(CommittedLeaderId::new(4, 2), 17);
+        assert_eq!(log_id(id).to_string(), id.to_string());
+        let votes = [
+            Vote::new(3, 2),
+            Vote::new_committed(3, 2),
+            Vote::new(4, 1),
+            Vote::new_committed(4, 1),
+            Vote::new(4, 3),
+        ];
+        for a in votes {
+            assert_eq!(vote(a).to_string(), a.to_string());
+            for b in votes {
+                assert_eq!(
+                    vote(a).partial_cmp(&vote(b)),
+                    a.partial_cmp(&b),
+                    "{a} vs {b}"
+                );
+            }
+        }
     }
 }

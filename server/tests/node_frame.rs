@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 use nabedra_database_server::node::{
     frame::{FrameError, FrameKind as K, FrameReader, FrameWriter, MAX_DATA_BYTES},
     job::MAX_CONTROL_BYTES,

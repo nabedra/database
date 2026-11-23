@@ -1,0 +1,14 @@
+id = "PHASE8-BUILD-TARGET-ALIAS"
+title = "Build timing comparisons could link workspace code from the other revision"
+class = "other"
+module = "testing"
+guarantees = []
+scenarios = []
+found_by = "review"
+found_date = "2026-11-23"
+lowest_regression = "scripts/testing/test_build_times.py::MainTests::test_revisions_use_distinct_cargo_target_directories"
+seed = "unknown"
+why_not_caught = "The measurement tests mocked the runner and did not check target directory isolation."
+invariant_added = "Warm and measure each revision with its own Cargo target directory."
+fix_commits = ["3fbef0ab0963761b8c055298a8c225db4e631feb"]
+revert_patch_ok = true

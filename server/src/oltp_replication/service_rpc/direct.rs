@@ -489,7 +489,7 @@ impl DirectLink {
         // Only local refusals come from here: a full lane, or a charge.
         let reservation = reservation.map_err(|error| by_outcome(error.into()))?;
         let mut header = request.header();
-        let left = request.deadline.saturating_sub(start.elapsed());
+        let left = request.deadline.saturating_sub(nabedra_rt::time::elapsed(start));
         if left.is_zero() {
             return Err(DirectSendError::NotApplied(
                 reservation.deadline_refusal().into(),

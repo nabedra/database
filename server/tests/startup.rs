@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 use std::process::Command;
 
 fn binary(args: &[&str], configured: bool) -> std::process::Output {

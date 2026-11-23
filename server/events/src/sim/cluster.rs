@@ -1,22 +1,24 @@
 //! The cluster harness: N brokers on one paused runtime, the nemesis, the workload, the
 //! Kafka-style invariants after every step, and the end-of-run consistency checks.
 
-// `tokio_unstable` is set through RUSTFLAGS for simulation builds only.
-#![allow(unexpected_cfgs)]
-
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use nabedra_kv::fs::FaultFs;
-use openraft::{CommittedLeaderId, LogId, ServerState, Vote};
+use nabedra_rt::sim::{NodeClock, World};
+use nabedra_rt::time::sleep;
+use nabedra_sim::net::{DELAY_MAX_MS, DROP_PER_MILLE, DUP_PER_MILLE};
+use nabedra_sim::rng::{stream, uuid_from};
+use nabedra_sim::{Draw, Filters, SplitMix64};
+use openraft::ServerState;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::history::{self, Event, FinalLog};
-use super::{Installed, SplitMix64, World, in_node, wall_ms_of};
+use super::{Harness, Installed, in_node, log_id, vote, wall_ms_of};
 use crate::partition::{
     self, Command, ErrorCode, Machine, Mutation, PublishEvent, Query, QueryReply, Reply, Start,
 };
@@ -87,6 +89,9 @@ pub struct Stats {
     pub partitions: u64,
     pub pauses: u64,
     pub clock_jumps: u64,
+    /// Leaders seen in a term that already had a different leader: openraft's
+    /// `(term, node)` election epoch lets a higher vote take over within one term.
+    pub same_term_handoffs: u64,
     pub final_events: usize,
     pub virtual_ms: u64,
 }
@@ -108,154 +113,6 @@ impl Report {
     }
 }
 
-/// Invariants checked after every simulation step, after Kafka's
-/// `RaftEventSimulationTest`: `MonotonicHighWatermark`, `MonotonicEpoch`,
-/// `SingleLeader`, `MajorityReachedHighWatermark`, and agreeing applied prefixes.
-#[derive(Default)]
-pub(crate) struct Observer {
-    voters: u64,
-    /// index -> (leader ID, payload hash) of every entry any replica applied.
-    committed: BTreeMap<u64, (CommittedLeaderId<u64>, u64)>,
-    /// Each replica's durable log, from the append and truncate hooks; rebuilt from its
-    /// volume on every start.
-    logs: BTreeMap<u64, BTreeMap<u64, CommittedLeaderId<u64>>>,
-    /// The highest vote each replica has reported, across restarts.
-    max_vote: BTreeMap<u64, Vote<u64>>,
-    /// The applied index each replica reported in its current incarnation.
-    applied_hook: BTreeMap<u64, u64>,
-    applied_metric: BTreeMap<u64, u64>,
-    pub violations: Vec<String>,
-    /// Messages already reported, so a violation that persists is reported once.
-    reported: std::collections::BTreeSet<String>,
-}
-
-impl Observer {
-    pub fn new(voters: u64) -> Self {
-        Self {
-            voters,
-            ..Self::default()
-        }
-    }
-
-    pub fn violate(&mut self, now_ms: u64, message: String) {
-        if self.violations.len() < 32 && self.reported.insert(message.clone()) {
-            self.violations.push(format!("t={now_ms}ms {message}"));
-        }
-    }
-
-    pub fn applied(&mut self, node: u64, log_id: LogId<u64>, hash: u64, now_ms: u64) {
-        let LogId { leader_id, index } = log_id;
-        match self.committed.get(&index) {
-            Some(&(prior, prior_hash)) if (prior, prior_hash) != (leader_id, hash) => self.violate(
-                now_ms,
-                format!(
-                    "AppliedPrefixesAgree: n{node} applied {log_id} ({hash:x}), another replica applied {} ({prior_hash:x})",
-                    LogId::new(prior, index),
-                ),
-            ),
-            Some(_) => {}
-            None => {
-                self.committed.insert(index, (leader_id, hash));
-                self.check_entry_majority(log_id, now_ms);
-            }
-        }
-        if let Some(previous) = self
-            .applied_hook
-            .insert(node, index)
-            .filter(|prior| index <= *prior)
-        {
-            self.violate(
-                now_ms,
-                format!("MonotonicCommit: n{node} applied index {index} after {previous} in one incarnation"),
-            );
-        }
-    }
-
-    pub fn appended(&mut self, node: u64, log_id: LogId<u64>) {
-        self.logs
-            .entry(node)
-            .or_default()
-            .insert(log_id.index, log_id.leader_id);
-    }
-
-    pub fn truncated(&mut self, node: u64, from: u64) {
-        self.logs.entry(node).or_default().split_off(&from);
-    }
-
-    pub fn restarted(&mut self, node: u64, log: Vec<LogId<u64>>) {
-        self.logs.insert(
-            node,
-            log.into_iter().map(|id| (id.index, id.leader_id)).collect(),
-        );
-        self.applied_hook.remove(&node);
-        self.applied_metric.remove(&node);
-    }
-
-    fn observe(
-        &mut self,
-        node: u64,
-        vote: Vote<u64>,
-        leader: bool,
-        applied: Option<u64>,
-        now_ms: u64,
-    ) {
-        let max = self.max_vote.entry(node).or_default();
-        if vote < *max {
-            let previous = *max;
-            self.violate(
-                now_ms,
-                format!("MonotonicEpoch: n{node} reports vote {vote} after {previous}"),
-            );
-        } else {
-            *max = vote;
-        }
-        // OpenRaft's default election epoch is (term, node ID). A new leader can
-        // supersede another leader in the same numeric term with a higher vote.
-        if leader && (!vote.committed || vote.leader_id.node_id != node) {
-            self.violate(
-                now_ms,
-                format!("SingleLeader: n{node} reports leadership under vote {vote}"),
-            );
-        }
-        if let Some(applied) = applied {
-            if let Some(previous) = self
-                .applied_metric
-                .insert(node, applied)
-                .filter(|prior| applied < *prior)
-            {
-                self.violate(
-                    now_ms,
-                    format!("MonotonicHighWatermark: n{node} applied index fell from {previous} to {applied}"),
-                );
-            }
-        }
-    }
-
-    fn check_majority(&mut self, now_ms: u64) {
-        let Some((&index, &(leader_id, _))) = self.committed.last_key_value() else {
-            return;
-        };
-        self.check_entry_majority(LogId::new(leader_id, index), now_ms);
-    }
-
-    fn check_entry_majority(&mut self, log_id: LogId<u64>, now_ms: u64) {
-        let holders = self
-            .logs
-            .values()
-            .filter(|log| log.get(&log_id.index) == Some(&log_id.leader_id))
-            .count() as u64;
-        if holders <= self.voters / 2 {
-            let voters = self.voters;
-            self.violate(
-                now_ms,
-                format!(
-                    "MajorityReachedHighWatermark: committed entry {log_id} is held by {holders} of {voters} replicas"
-                ),
-            );
-        }
-    }
-}
-
 struct Volume {
     root: tempfile::TempDir,
     fs: FaultFs,
@@ -270,7 +127,7 @@ fn fresh_volume(root: &tempfile::TempDir) -> FaultFs {
 }
 
 struct Cluster {
-    world: Arc<World>,
+    sim: Arc<Harness>,
     config: SimConfig,
     volumes: BTreeMap<u64, Volume>,
     cluster_id: Uuid,
@@ -279,36 +136,34 @@ struct Cluster {
     stats: Stats,
     resume_at: BTreeMap<u64, u64>,
     restart_at: BTreeMap<u64, u64>,
+    /// The nodes seen leading in each term.
+    term_leaders: BTreeMap<u64, BTreeSet<u64>>,
 }
 
 /// Runs one seed to completion.
 pub fn run(config: SimConfig) -> Report {
-    let mut builder = tokio::runtime::Builder::new_current_thread();
-    builder.enable_all().start_paused(true);
-    // `select!` branch order comes from the runtime's rng; seed it (tokio_unstable).
-    #[cfg(tokio_unstable)]
-    builder.rng_seed(tokio::runtime::RngSeed::from_bytes(
-        &config.seed.to_le_bytes(),
-    ));
-    let runtime = builder.build().expect("build the simulation runtime");
-    let world =
-        runtime.block_on(async { Arc::new(World::new(config.seed, config.knobs, config.nodes)) });
-    let installed = Installed::new(world.clone());
     let seed = config.seed;
-    let (mut violations, stats) = runtime.block_on(async {
-        let mut cluster = Cluster::new(world.clone(), config);
+    // A paused current-thread runtime whose `select!` branch order follows the seed under
+    // `--cfg tokio_unstable`, with a `nabedra_rt::sim` world installed on this thread.
+    let (sim, mut violations, stats) = nabedra_rt::sim::run(seed, |world| async move {
+        let sim = Harness::new(world.clone(), config.knobs, config.nodes);
+        let _installed = Installed::new(sim.clone());
+        // Every broker joins the world down; `Cluster::start` brings it up.
+        for id in 1..=config.nodes {
+            world.add_node(id, NodeClock::default());
+            world.crash(id);
+        }
+        let mut cluster = Cluster::new(sim.clone(), config);
         let result = cluster.run().await;
         let mut violations = Vec::new();
         if let Err(error) = result {
             violations.push(format!("harness: {error:#}"));
         }
         cluster.stop_all();
-        (violations, cluster.stats.clone())
+        (sim, violations, cluster.stats.clone())
     });
-    drop(runtime);
-    drop(installed);
-    let mut state = world.lock();
-    let mut all = std::mem::take(&mut state.observer.violations);
+    let mut state = sim.lock();
+    let mut all = state.observer.take_violations();
     all.append(&mut violations);
     #[cfg(test)]
     match state.history.check_queue(REDELIVERY_BOUND) {
@@ -319,18 +174,18 @@ pub fn run(config: SimConfig) -> Report {
     }
     Report {
         seed,
-        trace_hash: state.trace.finish(),
-        trace_events: state.trace_events,
+        trace_hash: state.trace.hash(),
+        trace_events: state.trace.events(),
         violations: all,
         history: std::mem::take(&mut state.history.events),
-        trace_tail: state.trace_tail.iter().cloned().collect(),
+        trace_tail: state.trace.tail(),
         stats,
     }
 }
 
 impl Cluster {
-    fn new(world: Arc<World>, config: SimConfig) -> Self {
-        let mut rng = SplitMix64::new(config.seed ^ 0x6e65_6d65_7369_7300);
+    fn new(sim: Arc<Harness>, config: SimConfig) -> Self {
+        let mut rng = stream(config.seed, "nemesis");
         let volumes = (1..=config.nodes)
             .map(|id| {
                 let root = tempfile::Builder::new()
@@ -342,36 +197,35 @@ impl Cluster {
                 (id, Volume { root, fs, at_start })
             })
             .collect();
-        let ids = |rng: &mut SplitMix64| {
-            let mut bytes = [0; 16];
-            bytes[..8].copy_from_slice(&rng.next_u64().to_le_bytes());
-            bytes[8..].copy_from_slice(&rng.next_u64().to_le_bytes());
-            uuid::Builder::from_random_bytes(bytes).into_uuid()
-        };
         Self {
-            cluster_id: ids(&mut rng),
-            topic_id: ids(&mut rng),
-            world,
+            cluster_id: uuid_from(&mut rng),
+            topic_id: uuid_from(&mut rng),
+            sim,
             config,
             volumes,
             rng,
             stats: Stats::default(),
             resume_at: BTreeMap::new(),
             restart_at: BTreeMap::new(),
+            term_leaders: BTreeMap::new(),
         }
     }
 
     fn now(&self) -> u64 {
-        self.world.elapsed_ms()
+        self.sim.elapsed_ms()
+    }
+
+    fn world(&self) -> &World {
+        self.sim.world()
     }
 
     fn trace(&self, line: std::fmt::Arguments<'_>) {
-        self.world.trace(line);
+        self.sim.trace(line);
     }
 
     fn violate(&self, message: String) {
         let now = self.now();
-        self.world.lock().observer.violate(now, message);
+        self.sim.lock().observer.violate(now, message);
     }
 
     async fn start(&mut self, id: u64) -> Result<()> {
@@ -379,38 +233,35 @@ impl Cluster {
         volume.at_start = volume.fs.crash();
         let broker = Broker::sim_open(id, self.cluster_id, volume.root.path(), volume.fs.clone())
             .with_context(|| format!("open broker n{id} from its volume"))?;
+        self.sim.world().restart(id);
         {
-            let mut state = self.world.lock();
-            let node = state.nodes.get_mut(&id).expect("node");
-            node.up = true;
-            node.paused = false;
-            node.broker = Some(broker.clone());
-            state.net.epoch += 1;
+            let mut state = self.sim.lock();
+            state.net.resume(id);
+            state.brokers.insert(id, broker.clone());
         }
         let group = in_node(id, broker.open_group(GROUP, Arc::new(Machine)))
             .await
             .map_err(|error| anyhow!("open group on n{id}: {error}"))?;
         let log = in_node(id, group.sim_log_ids()).await?;
-        self.world.lock().observer.restarted(id, log);
+        self.sim
+            .lock()
+            .observer
+            .restarted(GROUP, id, log.into_iter().map(log_id));
         self.trace(format_args!("start n{id}"));
         Ok(())
     }
 
     /// Cuts the node's network and disk, then aborts its tasks.
     fn crash(&mut self, id: u64) {
-        let (broker, tasks) = {
-            let mut state = self.world.lock();
-            state.net.epoch += 1;
-            let node = state.nodes.get_mut(&id).expect("node");
-            node.up = false;
-            node.paused = false;
-            (node.broker.take(), std::mem::take(&mut node.tasks))
+        // Without its broker the network refuses the node; `resume` also bumps the epoch.
+        let broker = {
+            let mut state = self.sim.lock();
+            state.net.resume(id);
+            state.brokers.remove(&id)
         };
         let volume = self.volumes.get_mut(&id).expect("volume");
         volume.fs.halt();
-        for task in tasks {
-            task.abort();
-        }
+        self.sim.world().crash(id);
         drop(broker);
         let image = if self.config.knobs.lose_fsynced_on_restart {
             volume.at_start.crash()
@@ -431,14 +282,14 @@ impl Cluster {
 
     fn stop_all(&mut self) {
         for id in 1..=self.config.nodes {
-            if self.world.is_up(id) {
+            if self.sim.is_up(id) {
                 self.crash(id);
             }
         }
     }
 
     fn group(&self, id: u64) -> Option<Arc<Group>> {
-        self.world.broker(id)?.group(GROUP)
+        self.sim.broker(id)?.group(GROUP)
     }
 
     fn majority(&self) -> u64 {
@@ -456,16 +307,24 @@ impl Cluster {
             let metrics = group.sim_metrics();
             seen.push((
                 id,
-                metrics.vote,
+                vote(metrics.vote),
                 metrics.state == ServerState::Leader,
                 metrics.last_applied.map(|log| log.index),
             ));
         }
-        let mut state = self.world.lock();
+        let mut state = self.sim.lock();
         for (id, vote, leader, applied) in seen {
-            state.observer.observe(id, vote, leader, applied, now);
+            if leader {
+                let leaders = self.term_leaders.entry(vote.leader.term).or_default();
+                if leaders.insert(id) && leaders.len() > 1 {
+                    self.stats.same_term_handoffs += 1;
+                }
+            }
+            state
+                .observer
+                .observe(GROUP, id, vote, leader, applied, now);
         }
-        state.observer.check_majority(now);
+        state.observer.check_majority(GROUP, now);
     }
 
     async fn run(&mut self) -> Result<()> {
@@ -483,13 +342,16 @@ impl Cluster {
 
         let stop = Arc::new(AtomicBool::new(false));
         let seed = self.config.seed;
-        let producer = tokio::spawn(producer(self.world.clone(), stop.clone(), seed));
-        let consumer = tokio::spawn(consumer(self.world.clone(), stop.clone(), seed));
+        let nodes = self.config.nodes;
+        let producer =
+            nabedra_rt::task::spawn(producer(self.sim.clone(), stop.clone(), seed, nodes));
+        let consumer =
+            nabedra_rt::task::spawn(consumer(self.sim.clone(), stop.clone(), seed, nodes));
 
         let chaos_end = self.now() + self.config.chaos_ms;
         let mut next_action = self.now() + self.rng.range(200, 800);
         while self.now() < chaos_end {
-            tokio::time::sleep(TICK).await;
+            sleep(TICK).await;
             self.observe();
             self.scheduled().await?;
             if self.now() >= next_action {
@@ -499,10 +361,10 @@ impl Cluster {
         }
 
         stop.store(true, Ordering::Release);
-        tokio::time::timeout(Duration::from_secs(20), producer)
+        nabedra_rt::time::timeout(Duration::from_secs(20), producer)
             .await
             .context("producer did not stop")??;
-        tokio::time::timeout(Duration::from_secs(20), consumer)
+        nabedra_rt::time::timeout(Duration::from_secs(20), consumer)
             .await
             .context("consumer did not stop")??;
         self.heal_all().await?;
@@ -511,11 +373,11 @@ impl Cluster {
         self.converge().await;
         self.observe();
         self.final_checks(checkpoint).await;
-        let state = self.world.lock();
-        self.stats.messages = state.messages;
-        self.stats.committed_entries = state.observer.committed.len();
+        let state = self.sim.lock();
+        self.stats.messages = state.net.messages();
+        self.stats.committed_entries = state.observer.committed_len(GROUP);
         self.stats.history_events = state.history.events.len();
-        self.stats.virtual_ms = self.world.elapsed_ms();
+        self.stats.virtual_ms = self.sim.elapsed_ms();
         for event in &state.history.events {
             if event.kind == "ok" {
                 match event.f {
@@ -546,9 +408,9 @@ impl Cluster {
             let deadline = self.now() + 30_000;
             loop {
                 anyhow::ensure!(self.now() < deadline, "setup did not commit within 30 s");
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                sleep(Duration::from_millis(50)).await;
                 self.observe();
-                let Some((id, group)) = leader(&self.world, self.config.nodes) else {
+                let Some((id, group)) = leader(&self.sim, self.config.nodes) else {
                     continue;
                 };
                 match in_node(id, group.write(command.clone())).await {
@@ -592,10 +454,11 @@ impl Cluster {
     }
 
     fn set_paused(&mut self, id: u64, paused: bool) {
-        let mut state = self.world.lock();
-        state.net.epoch += 1;
-        if let Some(node) = state.nodes.get_mut(&id) {
-            node.paused = paused;
+        let mut state = self.sim.lock();
+        if paused {
+            state.net.pause(id);
+        } else {
+            state.net.resume(id);
         }
         drop(state);
         self.trace(format_args!(
@@ -606,7 +469,7 @@ impl Cluster {
 
     fn down(&self) -> Vec<u64> {
         (1..=self.config.nodes)
-            .filter(|id| !self.world.is_up(*id))
+            .filter(|id| !self.sim.is_up(*id))
             .collect()
     }
 
@@ -617,7 +480,7 @@ impl Cluster {
         match self.rng.below(100) {
             // Crash a node while at most a minority is down; it restarts later.
             0..=17 => {
-                if self.world.is_up(pick) && (self.down().len() as u64) < nodes - self.majority() {
+                if self.sim.is_up(pick) && (self.down().len() as u64) < nodes - self.majority() {
                     self.crash(pick);
                     if self.config.wipes && self.rng.chance(200) {
                         self.wipe(pick);
@@ -629,17 +492,11 @@ impl Cluster {
             // Isolate one node, or the current leader.
             18..=37 => {
                 let target = if self.rng.chance(500) {
-                    leader(&self.world, nodes).map_or(pick, |(id, _)| id)
+                    leader(&self.sim, nodes).map_or(pick, |(id, _)| id)
                 } else {
                     pick
                 };
-                let mut state = self.world.lock();
-                state.net.epoch += 1;
-                for other in (1..=nodes).filter(|other| *other != target) {
-                    state.net.blocked.insert((target, other));
-                    state.net.blocked.insert((other, target));
-                }
-                drop(state);
+                self.sim.lock().net.isolate(target, 1..=nodes);
                 self.stats.partitions += 1;
                 self.trace(format_args!("isolate n{target}"));
             }
@@ -647,23 +504,17 @@ impl Cluster {
             38..=45 => {
                 let to = self.rng.range(1, nodes);
                 if to != pick {
-                    let mut state = self.world.lock();
-                    state.net.epoch += 1;
-                    state.net.blocked.insert((pick, to));
-                    drop(state);
+                    self.sim.lock().net.block(pick, to);
                     self.stats.partitions += 1;
                     self.trace(format_args!("block n{pick}->n{to}"));
                 }
             }
             46..=65 => {
-                let mut state = self.world.lock();
-                state.net.epoch += 1;
-                state.net.blocked.clear();
-                drop(state);
+                self.sim.lock().net.heal_links();
                 self.record_heal();
             }
             66..=75 => {
-                if self.world.is_up(pick) && !self.world.is_paused(pick) {
+                if self.sim.is_up(pick) && !self.sim.is_paused(pick) {
                     self.set_paused(pick, true);
                     let resume = now + self.rng.range(100, 2_500);
                     self.resume_at.insert(pick, resume);
@@ -673,12 +524,16 @@ impl Cluster {
             76..=85 => {
                 let wall = self.rng.range(0, 4_000) as i64 - 1_000;
                 let mono = Duration::from_millis(self.rng.range(0, 1_500));
-                let mut state = self.world.lock();
-                if let Some(node) = state.nodes.get_mut(&pick) {
-                    node.wall_offset_ms += wall;
-                    node.mono_offset += mono;
+                // Moving the monotonic clock moves the wall clock with it, so the wall
+                // jump makes up the difference: the wall clock moves by `wall` in all.
+                self.world().advance_mono(pick, mono);
+                let wall_jump = wall - mono.as_millis() as i64;
+                let by = Duration::from_millis(wall_jump.unsigned_abs());
+                if wall_jump >= 0 {
+                    self.world().jump_wall_forward(pick, by);
+                } else {
+                    self.world().jump_wall_backward(pick, by);
                 }
-                drop(state);
                 self.stats.clock_jumps += 1;
                 self.trace(format_args!(
                     "clock n{pick} wall{wall:+}ms mono+{}ms",
@@ -686,14 +541,17 @@ impl Cluster {
                 ));
             }
             _ => {
-                let drop_per_mille = [0, 0, 10, 50, 150][self.rng.below(5) as usize];
-                let dup_per_mille = [0, 10, 50][self.rng.below(3) as usize];
-                let delay_max_ms = [0, 5, 30, 120][self.rng.below(4) as usize];
-                let mut state = self.world.lock();
-                state.net.drop_per_mille = drop_per_mille;
-                state.net.dup_per_mille = dup_per_mille;
-                state.net.delay_max_ms = delay_max_ms;
-                drop(state);
+                let filters = Filters {
+                    drop_per_mille: DROP_PER_MILLE[self.rng.below(5) as usize],
+                    dup_per_mille: DUP_PER_MILLE[self.rng.below(3) as usize],
+                    delay_max_ms: DELAY_MAX_MS[self.rng.below(4) as usize],
+                };
+                self.sim.lock().net.set_filters(filters);
+                let Filters {
+                    drop_per_mille,
+                    dup_per_mille,
+                    delay_max_ms,
+                } = filters;
                 self.trace(format_args!(
                     "filters drop={drop_per_mille} dup={dup_per_mille} delay<={delay_max_ms}ms"
                 ));
@@ -703,17 +561,7 @@ impl Cluster {
     }
 
     async fn heal_all(&mut self) -> Result<()> {
-        {
-            let mut state = self.world.lock();
-            state.net.epoch += 1;
-            state.net.blocked.clear();
-            state.net.drop_per_mille = 0;
-            state.net.dup_per_mille = 0;
-            state.net.delay_max_ms = 0;
-            for node in state.nodes.values_mut() {
-                node.paused = false;
-            }
-        }
+        self.sim.lock().net.heal_all();
         self.resume_at.clear();
         self.restart_at.clear();
         for id in self.down() {
@@ -725,7 +573,7 @@ impl Cluster {
 
     fn record_heal(&self) {
         self.trace(format_args!("heal"));
-        self.world.lock().history.heal(self.now());
+        self.sim.lock().history.heal(self.now());
     }
 
     /// Waits until every replica applied the same entries and a leader exists.
@@ -733,7 +581,7 @@ impl Cluster {
         let deadline = self.now() + RECOVERY_TIMEOUT.as_millis() as u64;
         let mut stable = 0;
         while self.now() < deadline {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(100)).await;
             self.observe();
             let views: Vec<_> = (1..=self.config.nodes)
                 .map(|id| {
@@ -766,8 +614,13 @@ impl Cluster {
         } else {
             LEASE_SETTLE
         };
-        tokio::time::sleep(delay).await;
-        let mut client = Client::new(self.world.clone(), DRAINER, self.config.seed ^ 0xd7a1);
+        sleep(delay).await;
+        let mut client = Client::new(
+            self.sim.clone(),
+            DRAINER,
+            self.config.seed,
+            self.config.nodes,
+        );
         let mut checkpoint = None;
         let deadline = self.now() + RECOVERY_TIMEOUT.as_millis() as u64;
         while self.now() < deadline {
@@ -777,7 +630,7 @@ impl Cluster {
                     break;
                 }
                 Step::Progress => {}
-                Step::Retry => tokio::time::sleep(Duration::from_millis(100)).await,
+                Step::Retry => sleep(Duration::from_millis(100)).await,
             }
         }
         if checkpoint.is_none() {
@@ -832,7 +685,7 @@ impl Cluster {
             ));
         }
         let anomalies = {
-            let state = self.world.lock();
+            let state = self.sim.lock();
             history::check(&state.history, &log, reference.checkpoint)
         };
         for anomaly in anomalies {
@@ -842,29 +695,19 @@ impl Cluster {
 }
 
 /// The node that reports itself leader, if any (lowest id first).
-fn leader(world: &World, nodes: u64) -> Option<(u64, Arc<Group>)> {
+fn leader(sim: &Harness, nodes: u64) -> Option<(u64, Arc<Group>)> {
     (1..=nodes).find_map(|id| {
-        let group = world.broker(id)?.group(GROUP)?;
+        let group = sim.broker(id)?.group(GROUP)?;
         (group.leader() == Some(id)).then_some((id, group))
     })
 }
 
 /// Can `node` reach a majority (itself included) over links in both directions?
-fn has_quorum(world: &World, node: u64, nodes: u64) -> bool {
-    let state = world.lock();
-    let usable = |id: u64| state.nodes.get(&id).is_some_and(|n| n.up && !n.paused);
-    if !usable(node) {
-        return false;
-    }
-    let reachable = (1..=nodes)
-        .filter(|other| {
-            *other == node
-                || (usable(*other)
-                    && !state.net.blocked.contains(&(node, *other))
-                    && !state.net.blocked.contains(&(*other, node)))
-        })
-        .count() as u64;
-    reachable > nodes / 2
+fn has_quorum(sim: &Harness, node: u64, nodes: u64) -> bool {
+    let members: Vec<u64> = (1..=nodes).collect();
+    sim.lock()
+        .net
+        .has_quorum(node, &members, |id| sim.world().is_up(id))
 }
 
 enum Step {
@@ -876,7 +719,7 @@ enum Step {
 /// One workload client: it talks to a broker through the in-process Group API, the way
 /// the HTTP layer does, and records each operation in the history.
 struct Client {
-    world: Arc<World>,
+    sim: Arc<Harness>,
     process: u64,
     rng: SplitMix64,
     ops: u64,
@@ -891,12 +734,11 @@ enum Outcome<T> {
 }
 
 impl Client {
-    fn new(world: Arc<World>, process: u64, seed: u64) -> Self {
-        let nodes = world.lock().nodes.len() as u64;
+    fn new(sim: Arc<Harness>, process: u64, seed: u64, nodes: u64) -> Self {
         Self {
-            world,
+            sim,
             process,
-            rng: SplitMix64::new(seed ^ (process + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+            rng: stream(seed, &format!("client-{process}")),
             ops: 0,
             nodes,
             generation: None,
@@ -904,18 +746,15 @@ impl Client {
     }
 
     fn uuid(&mut self) -> Uuid {
-        let mut bytes = [0; 16];
-        bytes[..8].copy_from_slice(&self.rng.next_u64().to_le_bytes());
-        bytes[8..].copy_from_slice(&self.rng.next_u64().to_le_bytes());
-        uuid::Builder::from_random_bytes(bytes).into_uuid()
+        uuid_from(&mut self.rng)
     }
 
     /// The node that claims leadership, or a random running node (which may redirect).
     fn target(&mut self) -> u64 {
-        if !self.rng.chance(100) {
-            if let Some((id, _)) = leader(&self.world, self.nodes) {
-                return id;
-            }
+        if !self.rng.chance(100)
+            && let Some((id, _)) = leader(&self.sim, self.nodes)
+        {
+            return id;
         }
         self.rng.range(1, self.nodes)
     }
@@ -934,12 +773,12 @@ impl Client {
             }
             value["subscription"] = json!(SUBSCRIPTION);
         }
-        let now = self.world.elapsed_ms();
-        self.world.trace(format_args!(
+        let now = self.sim.elapsed_ms();
+        self.sim.trace(format_args!(
             "history {kind} p{} {f} {request} n{node} {value}",
             self.process
         ));
-        self.world
+        self.sim
             .lock()
             .history
             .push(kind, self.process, f, value, request, node, now);
@@ -951,11 +790,7 @@ impl Client {
 
     /// Sends one Raft command to `node` and returns its domain outcome.
     async fn write(&mut self, node: u64, command: Command, coalesced: bool) -> Outcome<Reply> {
-        let Some(group) = self
-            .world
-            .broker(node)
-            .and_then(|broker| broker.group(GROUP))
-        else {
+        let Some(group) = self.sim.broker(node).and_then(|broker| broker.group(GROUP)) else {
             return Outcome::Fail("broker unavailable".into());
         };
         let command = match serde_json::to_value(&command) {
@@ -969,7 +804,7 @@ impl Client {
                 group.write(command).await
             }
         };
-        match tokio::time::timeout(CLIENT_TIMEOUT, in_node(node, call)).await {
+        match nabedra_rt::time::timeout(CLIENT_TIMEOUT, in_node(node, call)).await {
             Err(_) => Outcome::Unknown("client timeout".into()),
             Ok(Err(error)) => group_outcome(error),
             Ok(Ok(value)) => match serde_json::from_value::<Mutation>(value) {
@@ -991,7 +826,7 @@ impl Client {
             &request,
             node,
         );
-        let now_ms = wall_ms_of(&self.world, node);
+        let now_ms = wall_ms_of(node).await;
         let events = batch
             .iter()
             .map(|(id, n)| PublishEvent {
@@ -1049,7 +884,7 @@ impl Client {
                 name: SUBSCRIPTION.into(),
                 owner: OWNER.into(),
                 claim_id: self.uuid(),
-                now_ms: wall_ms_of(&self.world, node),
+                now_ms: wall_ms_of(node).await,
                 ttl_ms: LEASE_TTL_MS,
             };
             return match self.write(node, claim, false).await {
@@ -1082,13 +917,9 @@ impl Client {
             &request,
             node,
         );
-        let quorum_before = has_quorum(&self.world, node, self.nodes);
-        let epoch_before = self.world.lock().net.epoch;
-        let Some(group) = self
-            .world
-            .broker(node)
-            .and_then(|broker| broker.group(GROUP))
-        else {
+        let quorum_before = has_quorum(&self.sim, node, self.nodes);
+        let epoch_before = self.sim.lock().net.epoch();
+        let Some(group) = self.sim.broker(node).and_then(|broker| broker.group(GROUP)) else {
             self.record("fail", "poll", json!("broker unavailable"), &request, node);
             return Step::Retry;
         };
@@ -1096,13 +927,13 @@ impl Client {
             name: SUBSCRIPTION.into(),
             owner: OWNER.into(),
             generation,
-            now_ms: wall_ms_of(&self.world, node),
+            now_ms: wall_ms_of(node).await,
             limit: 10,
         };
         let read = in_node(node, async move {
             group.read(move |tx| partition::query(tx, query)).await
         });
-        let poll = match tokio::time::timeout(CLIENT_TIMEOUT, read).await {
+        let poll = match nabedra_rt::time::timeout(CLIENT_TIMEOUT, read).await {
             Err(_) => {
                 self.record("info", "poll", json!("client timeout"), &request, node);
                 return Step::Retry;
@@ -1143,13 +974,11 @@ impl Client {
             &request,
             node,
         );
-        let epoch_after = self.world.lock().net.epoch;
-        if !quorum_before
-            && epoch_before == epoch_after
-            && !has_quorum(&self.world, node, self.nodes)
+        let epoch_after = self.sim.lock().net.epoch();
+        if !quorum_before && epoch_before == epoch_after && !has_quorum(&self.sim, node, self.nodes)
         {
-            let now = self.world.elapsed_ms();
-            self.world.lock().observer.violate(
+            let now = self.sim.elapsed_ms();
+            self.sim.lock().observer.violate(
                 now,
                 format!("EVT-G06 poll {request} on n{node} answered without a reachable quorum"),
             );
@@ -1174,7 +1003,7 @@ impl Client {
             after: poll.after,
             last,
             through: last,
-            now_ms: wall_ms_of(&self.world, node),
+            now_ms: wall_ms_of(node).await,
         };
         match self.write(node, ack, false).await {
             Outcome::Ok(Reply::Checkpoint { offset }) => {
@@ -1206,8 +1035,8 @@ fn group_outcome<T>(error: GroupError) -> Outcome<T> {
     Outcome::Unknown(error.to_string())
 }
 
-async fn producer(world: Arc<World>, stop: Arc<AtomicBool>, seed: u64) {
-    let mut client = Client::new(world, PRODUCER, seed);
+async fn producer(sim: Arc<Harness>, stop: Arc<AtomicBool>, seed: u64, nodes: u64) {
+    let mut client = Client::new(sim, PRODUCER, seed, nodes);
     let mut acknowledged: Vec<Vec<(Uuid, u64)>> = Vec::new();
     let mut next = 0u64;
     while !stop.load(Ordering::Acquire) {
@@ -1235,36 +1064,23 @@ async fn producer(world: Arc<World>, stop: Arc<AtomicBool>, seed: u64) {
                 Outcome::Fail(_) => break,
                 Outcome::Unknown(_) => {
                     let backoff = client.rng.range(20, 150) * (attempt + 1);
-                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                    sleep(Duration::from_millis(backoff)).await;
                 }
             }
         }
         let pause = client.rng.range(10, 120);
-        tokio::time::sleep(Duration::from_millis(pause)).await;
+        sleep(Duration::from_millis(pause)).await;
     }
 }
 
-async fn consumer(world: Arc<World>, stop: Arc<AtomicBool>, seed: u64) {
-    let mut client = Client::new(world, CONSUMER, seed);
+async fn consumer(sim: Arc<Harness>, stop: Arc<AtomicBool>, seed: u64, nodes: u64) {
+    let mut client = Client::new(sim, CONSUMER, seed, nodes);
     while !stop.load(Ordering::Acquire) {
         let pause = match client.consume_once().await {
             Step::Progress => client.rng.range(5, 40),
             Step::Retry => client.rng.range(50, 300),
             Step::Drained(_) => client.rng.range(30, 150),
         };
-        tokio::time::sleep(Duration::from_millis(pause)).await;
-    }
-}
-
-#[cfg(test)]
-impl Observer {
-    pub fn observe_for_test(
-        &mut self,
-        node: u64,
-        vote: Vote<u64>,
-        leader: bool,
-        applied: Option<u64>,
-    ) {
-        self.observe(node, vote, leader, applied, 0);
+        sleep(Duration::from_millis(pause)).await;
     }
 }

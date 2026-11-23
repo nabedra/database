@@ -6,13 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use nabedra_rt::time::timeout;
+use nabedra_rt::{
+    net::{AnyConnector, AnyListener, Conn, Connector, Established, Target, TcpStream},
+    time::timeout,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject};
 use rustls::server::WebPkiClientVerifier;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -114,23 +116,37 @@ impl PeerTls {
     pub async fn connect(&self, endpoint: &Endpoint) -> io::Result<PeerConnection> {
         let name = endpoint.server_name()?;
         timeout(RPC_TIMEOUT, async {
-            let stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
-            stream.set_nodelay(true)?;
-            let tls = self.client.connect(name, stream).await?;
-            let fingerprint = peer_fingerprint(tls.get_ref().1.peer_certificates())?;
+            let peer = AnyConnector
+                .connect(Target::HostPort(&endpoint.host, endpoint.port))
+                .await?;
+            let (stream, fingerprint) = match peer {
+                Conn::Tcp(stream) => {
+                    stream.set_nodelay(true)?;
+                    let tls = self.client.connect(name, stream).await?;
+                    let fingerprint = peer_fingerprint(tls.get_ref().1.peer_certificates())?;
+                    #[cfg(feature = "sim")]
+                    let tls = Established::Real(tls);
+                    (tls, fingerprint)
+                }
+                #[cfg(feature = "sim")]
+                Conn::Sim(pending) => {
+                    let (stream, proof) = pending.client_handshake(&[]).await?;
+                    (Established::Sim(stream), proof.peer_certificate_sha256)
+                }
+            };
             if !endpoint.fingerprints.contains(&fingerprint) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "peer certificate mismatch",
                 ));
             }
-            Ok(PeerConnection(tls))
+            Ok(PeerConnection(stream))
         })
         .await?
     }
 }
 
-pub(super) struct PeerConnection(tokio_rustls::client::TlsStream<TcpStream>);
+pub(super) struct PeerConnection(Established<tokio_rustls::client::TlsStream<TcpStream>>);
 
 impl PeerConnection {
     pub async fn exchange(&mut self, request: &[u8], limit: usize) -> io::Result<Vec<u8>> {
@@ -153,7 +169,7 @@ impl PeerConnection {
 }
 
 pub(super) async fn serve<H, R>(
-    listener: TcpListener,
+    listener: impl Into<AnyListener>,
     tls: PeerTls,
     max_connections: usize,
     frame_limit: usize,
@@ -167,6 +183,7 @@ where
     if max_connections == 0 || max_connections > 128 || frame_limit > 16 << 20 {
         return Err(invalid("invalid peer server limits"));
     }
+    let listener = listener.into();
     let permits = Arc::new(Semaphore::new(max_connections));
     let handler = Arc::new(handler);
     let mut sessions = JoinSet::new();
@@ -186,7 +203,7 @@ where
                 };
                 let acceptor = tls.server.clone();
                 let handler = Arc::clone(&handler);
-                sessions.spawn(async move {
+                nabedra_rt::task::spawn_in(&mut sessions, async move {
                     let _permit = permit;
                     let _ = serve_session(socket, acceptor, frame_limit, &*handler).await;
                 });
@@ -198,7 +215,7 @@ where
 }
 
 async fn serve_session<H, R>(
-    socket: TcpStream,
+    socket: Conn,
     acceptor: TlsAcceptor,
     limit: usize,
     handler: &H,
@@ -207,9 +224,21 @@ where
     H: Fn(Fingerprint, Vec<u8>) -> R,
     R: Future<Output = io::Result<Vec<u8>>>,
 {
-    socket.set_nodelay(true)?;
-    let mut socket = timeout(RPC_TIMEOUT, acceptor.accept(socket)).await??;
-    let fingerprint = peer_fingerprint(socket.get_ref().1.peer_certificates())?;
+    let (mut socket, fingerprint) = match socket {
+        Conn::Tcp(socket) => {
+            socket.set_nodelay(true)?;
+            let tls = timeout(RPC_TIMEOUT, acceptor.accept(socket)).await??;
+            let fingerprint = peer_fingerprint(tls.get_ref().1.peer_certificates())?;
+            #[cfg(feature = "sim")]
+            let tls = Established::Real(tls);
+            (tls, fingerprint)
+        }
+        #[cfg(feature = "sim")]
+        Conn::Sim(pending) => {
+            let (stream, proof) = timeout(RPC_TIMEOUT, pending.server_handshake(&[])).await??;
+            (Established::Sim(stream), proof.peer_certificate_sha256)
+        }
+    };
     loop {
         let request = timeout(IDLE_TIMEOUT, read_frame(&mut socket, limit)).await??;
         let response = timeout(RPC_TIMEOUT, handler(fingerprint, request)).await??;
@@ -312,3 +341,6 @@ fn digest(cert: &CertificateDer<'_>) -> Fingerprint {
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+
+#[cfg(all(test, feature = "sim"))]
+mod tests;

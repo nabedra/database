@@ -7,7 +7,9 @@
 //! assertions of `jepsen.tests.kafka`, applied to one partition.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::io::Write;
+#[cfg(test)]
 use std::path::Path;
 
 use serde::{Serialize, Serializer};
@@ -71,6 +73,7 @@ impl History {
         });
     }
 
+    #[cfg(test)]
     pub fn write_jsonl(&self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -78,6 +81,7 @@ impl History {
         self.write(std::io::BufWriter::new(std::fs::File::create(path)?))
     }
 
+    #[cfg(test)]
     fn write(&self, mut output: impl Write) -> std::io::Result<()> {
         for event in &self.events {
             serde_json::to_writer(&mut output, event)?;

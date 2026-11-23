@@ -1,10 +1,12 @@
 //! openraft 0.9's `AsyncRuntime` for simulation.
 //!
-//! It delegates to tokio (paused time on the simulation thread), with three changes:
+//! It delegates to `nabedra_rt`, whose `sim` feature reads the `nabedra_rt::sim` world:
 //! `Instant` reads the current node's monotonic clock, so a clock jump moves that node's
 //! election and lease timers; `ThreadLocalRng` draws from the node's seeded stream, which
 //! seeds election timeouts; and `spawn` registers each task with its node, so a crash
-//! aborts the node's Raft core, replication and state machine tasks.
+//! aborts the node's Raft core, replication and state machine tasks. It stays in Events
+//! because Events alone uses openraft 0.9; the OLTP simulator's openraft 0.10 runtime is
+//! separate.
 
 use std::future::Future;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
@@ -19,7 +21,7 @@ pub struct SimInstant(TokioInstant);
 
 impl openraft::Instant for SimInstant {
     fn now() -> Self {
-        Self(super::mono_now())
+        Self(nabedra_rt::time::now())
     }
 }
 
@@ -61,16 +63,16 @@ pub struct SimRng;
 
 impl rand::RngCore for SimRng {
     fn next_u32(&mut self) -> u32 {
-        super::draw_u64() as u32
+        nabedra_rt::ids::random_u64() as u32
     }
 
     fn next_u64(&mut self) -> u64 {
-        super::draw_u64()
+        nabedra_rt::ids::random_u64()
     }
 
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         for chunk in dest.chunks_mut(8) {
-            let bytes = super::draw_u64().to_le_bytes();
+            let bytes = nabedra_rt::ids::random_u64().to_le_bytes();
             chunk.copy_from_slice(&bytes[..chunk.len()]);
         }
     }
@@ -101,29 +103,29 @@ impl AsyncRuntime for SimRuntime {
         T: Future + OptionalSend + 'static,
         T::Output: OptionalSend + 'static,
     {
-        super::spawn(future)
+        nabedra_rt::task::spawn(future)
     }
 
     fn sleep(duration: Duration) -> Self::Sleep {
-        tokio::time::sleep(duration)
+        nabedra_rt::time::sleep(duration)
     }
 
     fn sleep_until(deadline: Self::Instant) -> Self::Sleep {
-        tokio::time::sleep_until(super::to_tokio_instant(deadline.0))
+        nabedra_rt::time::sleep_until(deadline.0)
     }
 
     fn timeout<R, F: Future<Output = R> + OptionalSend>(
         duration: Duration,
         future: F,
     ) -> Self::Timeout<R, F> {
-        tokio::time::timeout(duration, future)
+        nabedra_rt::time::timeout(duration, future)
     }
 
     fn timeout_at<R, F: Future<Output = R> + OptionalSend>(
         deadline: Self::Instant,
         future: F,
     ) -> Self::Timeout<R, F> {
-        tokio::time::timeout_at(super::to_tokio_instant(deadline.0), future)
+        nabedra_rt::time::timeout_at(deadline.0, future)
     }
 
     fn is_panic(join_error: &Self::JoinError) -> bool {
