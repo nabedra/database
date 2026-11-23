@@ -10,7 +10,7 @@ use super::super::protocol::{
 use super::state::State;
 
 // Bound the number of immutable slot transfers started on each worker at once.
-const MAX_MOVES_PER_WORKER: usize = 64;
+pub(in crate::cache::cluster) const MAX_MOVES_PER_WORKER: usize = 64;
 const MAX_CHANGES: usize = 256;
 const REPORT_AGE_MS: u64 = 3_000;
 const MAX_CUTOVER_LAG: u64 = 32;
@@ -276,10 +276,16 @@ fn valid_change(
     let Some(primary) = next.primary.and_then(|id| topo.member(id)) else {
         return false;
     };
+    // Enrollment retires the old incarnation before a replica-only move can
+    // verify its replacement. Preserve that existing assignment while
+    // staging or canceling the move. A new assignment must be enrolled.
+    let replica_unchanged =
+        next.primary == old.primary && next.epoch == old.epoch && next.replica == old.replica;
     if let Some(replica) = next.replica
-        && topo
-            .member(replica)
-            .is_none_or(|member| primary.zone == member.zone)
+        && match topo.member(replica) {
+            Some(member) => primary.zone == member.zone,
+            None => !replica_unchanged,
+        }
     {
         return false;
     }

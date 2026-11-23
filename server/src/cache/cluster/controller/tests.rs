@@ -411,6 +411,53 @@ fn k03_restart_rejects_retired_incarnation_and_scoped_reset_requires_fence() {
 }
 
 #[test]
+fn k03_repairs_a_replica_after_its_incarnation_retires() {
+    let mut state = fixture();
+    let initial = state.topology.slots[0];
+    let primary = initial.primary.unwrap();
+    let retired = initial.replica.unwrap();
+    let restarted = make_member(retired.node, 2);
+    assert!(matches!(
+        state.apply(
+            Command::Enroll {
+                member: restarted.clone(),
+                certificate: [retired.node as u8; 32],
+            },
+            true,
+        ),
+        Some(Reply::Applied { .. })
+    ));
+    assert!(state.topology.member(retired).is_none());
+
+    let mut observed = Observations::default();
+    let baseline = Progress {
+        slot: 0,
+        epoch: initial.epoch,
+        sequence: 31,
+        baseline: true,
+        serving_primary: true,
+        frozen: None,
+    };
+    report(&mut observed, &state, primary, 1_000, Some(baseline));
+    report(&mut observed, &state, restarted.id, 1_000, None);
+    let changes = observed.plan(&state, bounds(1_000));
+    assert!(state.reconcile(1_000, changes));
+    let staged = state.topology.slots[0];
+    assert_eq!(staged.replica, Some(retired));
+    assert_eq!(staged.moving.unwrap().target, restarted.id);
+    assert!(staged.moving.unwrap().replica_only);
+    assert!(observed.plan(&state, bounds(1_010)).is_empty());
+
+    report(&mut observed, &state, restarted.id, 1_020, Some(baseline));
+    let changes = observed.plan(&state, bounds(1_020));
+    assert!(state.reconcile(1_020, changes));
+    assert_eq!(state.topology.slots[0].primary, Some(primary));
+    assert_eq!(state.topology.slots[0].replica, Some(restarted.id));
+    assert_eq!(state.topology.slots[0].epoch, initial.epoch);
+    assert!(state.topology.slots[0].moving.is_none());
+}
+
+#[test]
 fn k03_drain_keeps_current_replica_until_verified_replacement() {
     let mut state = fixture();
     let slot = state.topology.slots[0];
