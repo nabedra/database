@@ -153,6 +153,25 @@ fn run_case(case: Case, seed: u64, generated: bool, history_only: bool) -> Vec<S
                 Reply::Applied { .. }
             ));
         }
+        if matches!(case, Case::BoundIgnored | Case::LocalSkew) {
+            let grant = cluster
+                .sample(Some(old), slot)
+                .await
+                .unwrap()
+                .lease
+                .unwrap();
+            let guard_ms = if case == Case::BoundIgnored { 5 } else { 0 };
+            let deadline = grant.expires_ms - nabedra_rt::sim::EPOCH_MS;
+            cluster
+                .step((deadline + guard_ms).saturating_sub(cluster.now()))
+                .await;
+            cluster.immediate_delivery();
+            cluster.reconcile_once().await;
+            let owner = cluster.slot(slot).primary.unwrap();
+            assert_ne!(old, owner, "no owner change at the lease boundary");
+            cluster.renew_once(owner.node).await.unwrap();
+            cluster.sample_leases().await;
+        }
         let end = cluster.now() + 5_000;
         while cluster.now() < end {
             cluster.step(5).await;

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -62,6 +62,7 @@ pub(super) struct Config {
 }
 
 struct Network {
+    immediate: Arc<AtomicBool>,
     plan: Arc<Mutex<NetPlan>>,
     observed: Observed,
     world: Weak<World>,
@@ -90,7 +91,11 @@ impl Planner for Network {
             // The TCP backend delivers one ordered byte stream. Duplicate
             // segments are invisible to its frame parser.
             Plan::Deliver { delay_ms, .. } => Fate::Deliver {
-                delay: Duration::from_millis(delay_ms),
+                delay: Duration::from_millis(if self.immediate.load(Ordering::Relaxed) {
+                    0
+                } else {
+                    delay_ms
+                }),
             },
         }
     }
@@ -114,11 +119,13 @@ pub(super) struct Cluster {
     pub workers: BTreeMap<u64, Worker>,
     controllers: BTreeMap<u64, Controller>,
     plan: Arc<Mutex<NetPlan>>,
+    immediate: Arc<AtomicBool>,
     paths: Volume,
     clocks: BTreeMap<u64, Clock>,
     raft: RaftObserver,
     next_incarnation: u64,
     next_admin: u64,
+    next_clock_sync_ms: u64,
     ttl_left: BTreeMap<String, u64>,
 }
 
@@ -128,6 +135,7 @@ impl Cluster {
         let watched = keys.iter().map(|key| key_slot(key.as_bytes())).collect();
         let observed = Arc::new(Mutex::new(Observations::new(config.check_replica_prefix)));
         let plan = Arc::new(Mutex::new(NetPlan::new(world.seed())));
+        let immediate = Arc::new(AtomicBool::new(false));
         let observer = Arc::clone(&observed);
         let commits = Arc::clone(&observed);
         let commit_keys = Arc::clone(&keys);
@@ -154,6 +162,7 @@ impl Cluster {
             }),
         });
         world.set_net_planner(Network {
+            immediate: Arc::clone(&immediate),
             plan: Arc::clone(&plan),
             observed: Arc::clone(&observed),
             world: Arc::downgrade(&world),
@@ -207,11 +216,13 @@ impl Cluster {
             workers: BTreeMap::new(),
             controllers: BTreeMap::new(),
             plan,
+            immediate,
             paths: Volume::new().unwrap(),
             clocks,
             raft: RaftObserver::new(3),
             next_incarnation: 0,
             next_admin: 0,
+            next_clock_sync_ms: 10_000,
             ttl_left: BTreeMap::new(),
         };
         for node in CONTROLLERS {
@@ -228,7 +239,7 @@ impl Cluster {
         }
         cluster
             .wait_for(START_BUDGET, |topology| {
-                topology.workers.len() == cluster.config.nodes
+                topology.workers.len() == config.nodes
             })
             .await;
         let reply = cluster
@@ -348,14 +359,6 @@ impl Cluster {
         self.world.black_hole(None, Some(node));
     }
 
-    pub fn resume(&self, node: u64) {
-        self.trace(format_args!("resume {node}"));
-        self.plan.lock().unwrap().resume(node);
-        self.world.thaw(node);
-        self.world.heal(Some(node), None);
-        self.world.heal(None, Some(node));
-    }
-
     pub fn heal(&self) {
         self.trace(format_args!("heal"));
         for node in CONTROLLERS
@@ -374,6 +377,30 @@ impl Cluster {
             .with_ext::<SimClockBound, _>(|bound| bound.set_drift_ppm(&self.world, node, ppm))
             .unwrap()
             .unwrap();
+    }
+
+    pub fn immediate_delivery(&self) {
+        self.trace(format_args!("zero-delay network for lease-boundary turn"));
+        self.immediate.store(true, Ordering::Relaxed);
+    }
+
+    pub async fn reconcile_once(&self) {
+        let leader = self.leader().expect("cache leader for boundary turn");
+        sim::in_node(leader, self.controllers[&leader].0.reconcile_once()).await;
+    }
+
+    pub async fn renew_once(&self, node: u64) -> io::Result<()> {
+        let leader = self.leader().expect("cache leader for boundary renewal");
+        let worker = &self.workers[&node];
+        sim::in_node(
+            node,
+            worker::sim_renew_once(
+                worker,
+                PeerTls::sim(fingerprint(node)),
+                endpoint(leader, CONTROL),
+            ),
+        )
+        .await
     }
 
     pub fn now(&self) -> u64 {
@@ -477,6 +504,9 @@ impl Cluster {
         let end = self.now() + ms;
         while self.now() < end {
             time::sleep(Duration::from_millis((end - self.now()).min(10))).await;
+            if self.config.gradual_drift && self.now() >= self.next_clock_sync_ms {
+                self.refresh_bounds().await;
+            }
             self.sample_leases().await;
             let now = self.now();
             for (metrics, service) in self.controllers.values() {
@@ -486,7 +516,26 @@ impl Cluster {
         }
     }
 
-    async fn sample_leases(&mut self) {
+    async fn refresh_bounds(&mut self) {
+        self.next_clock_sync_ms = self.now() + 10_000;
+        for node in CONTROLLERS
+            .into_iter()
+            .chain(worker_nodes(self.config.nodes))
+        {
+            if self.world.is_up(node) && !self.world.is_frozen(node) {
+                sim::in_node(node, async {
+                    self.world
+                        .with_ext::<SimClockBound, _>(|bound| bound.resync(&self.world, node, 0))
+                        .unwrap()
+                        .unwrap();
+                })
+                .await;
+            }
+        }
+        self.trace(format_args!("refresh clock bounds"));
+    }
+
+    pub async fn sample_leases(&mut self) {
         let views = self.observed.lock().unwrap().leases.clone();
         let mut bounds = BTreeMap::new();
         for node in CONTROLLERS
@@ -586,16 +635,18 @@ impl Cluster {
             }
             observed.history.push(completion);
         }
-        if let Some((Response::Error(error), _)) = &reply
-            && error.starts_with(b"MOVED ")
-        {
-            let expected = owner.map(|member| {
+        if let Some((response, _)) = &reply {
+            let expected = owner.filter(|owner| owner.id != worker.id()).map(|member| {
                 format!("MOVED {slot} {}:{}", member.client_host, member.client_port)
             });
-            if expected.as_deref().map(str::as_bytes) != Some(&error[..]) {
+            let actual = match response {
+                Response::Error(error) if error.starts_with(b"MOVED ") => Some(error.as_ref()),
+                _ => None,
+            };
+            if actual != expected.as_deref().map(str::as_bytes) {
                 self.violate(
                     "RedirectAgrees",
-                    format!("unexpected redirect {error:?}, expected {expected:?}"),
+                    format!("slot {slot} returned {response:?}, expected redirect {expected:?}"),
                 );
             }
         }
@@ -634,12 +685,48 @@ impl Cluster {
                         && p.baseline
                         && r.baseline
                         && (p.generation, p.epoch, p.sequence, p.digest)
-                            == (r.generation, r.epoch, r.sequence, r.digest) => {}
+                            == (r.generation, r.epoch, r.sequence, r.digest) =>
+                {
+                    if cold && (p.digest != [0; 20] || p.sequence != 0) {
+                        self.violate(
+                            "ColdStartEmpty",
+                            format!("slot {slot} retained data after cold reset"),
+                        );
+                    }
+                }
                 (p, r) => self.violate(
                     "Convergence",
                     format!("slot {slot} primary {p:?}, replica {r:?}, placement {placement:?}"),
                 ),
             }
+        }
+
+        let latest = self
+            .observed
+            .lock()
+            .unwrap()
+            .latest
+            .clone()
+            .expect("initialized topology");
+        let mut available = vec![false; SLOT_COUNT];
+        for (&node, worker) in &self.workers {
+            let reports = sim::in_node(node, worker.sim_progress()).await;
+            for report in reports {
+                let index = usize::from(report.slot);
+                let slot = latest.slots[index];
+                if report.serving_primary
+                    && slot.primary == Some(worker.id())
+                    && slot.epoch == report.epoch
+                {
+                    available[index] = true;
+                }
+            }
+        }
+        if let Some(slot) = available.iter().position(|ready| !ready) {
+            self.violate(
+                "Liveness",
+                format!("slot {slot} has no authorized primary after healing"),
+            );
         }
         let keys = Arc::clone(&self.keys);
         for key in keys.iter() {
@@ -654,11 +741,12 @@ impl Cluster {
         }
         if let Some(worker) = self.workers.values().next() {
             let topology = worker.topology();
-            if !slots_agree(worker.slots(), &topology) {
+            if !slots_agree(worker.slots(), &topology) || !shards_agree(worker.shards(), &topology)
+            {
                 self.violate(
                     "RedirectAgrees",
                     format!(
-                        "CLUSTER SLOTS disagrees with worker {} topology",
+                        "CLUSTER SLOTS or SHARDS disagrees with worker {} topology",
                         worker.id().node
                     ),
                 );
@@ -683,7 +771,7 @@ fn slots_agree(response: Response, topology: &Topology) -> bool {
     let Response::Array(rows) = response else {
         return false;
     };
-    let mut next = 0;
+    let mut seen = vec![false; SLOT_COUNT];
     for row in rows {
         let Response::Array(fields) = row else {
             return false;
@@ -691,42 +779,135 @@ fn slots_agree(response: Response, topology: &Topology) -> bool {
         let [
             Response::Integer(first),
             Response::Integer(last),
-            Response::Array(owner),
+            Response::Array(primary),
             rest @ ..,
         ] = fields.as_slice()
         else {
             return false;
         };
-        let (Ok(first), Ok(last)) = (usize::try_from(*first), usize::try_from(*last)) else {
-            return false;
+        let replicas = match rest {
+            [] => None,
+            [Response::Array(replica)] => Some(replica.as_slice()),
+            _ => return false,
         };
-        if first != next || last < first || last >= SLOT_COUNT {
+        if !check_range(*first, *last, topology, &mut seen, |p, r| {
+            address_agrees(primary, p)
+                && match (replicas, r) {
+                    (None, None) => true,
+                    (Some(reply), Some(member)) => address_agrees(reply, member),
+                    _ => false,
+                }
+        }) {
             return false;
         }
-        for slot in &topology.slots[first..=last] {
-            if !address_agrees(owner, slot.primary, topology) {
-                return false;
-            }
-            match (rest, slot.replica) {
-                ([], None) => {}
-                ([Response::Array(replica)], Some(id))
-                    if address_agrees(replica, Some(id), topology) => {}
-                _ => return false,
-            }
-        }
-        next = last + 1;
     }
-    next == SLOT_COUNT
+    projected_coverage(&seen, topology)
 }
 
-fn address_agrees(node: &[Response], id: Option<WorkerId>, topology: &Topology) -> bool {
-    let Some(member) = id.and_then(|id| topology.member(id)) else {
+fn shards_agree(response: Response, topology: &Topology) -> bool {
+    let Response::Array(groups) = response else {
         return false;
     };
-    matches!(node, [Response::Bulk(Some(host)), Response::Integer(port), _] if host.as_ref() == member.client_host.as_bytes() && *port == i64::from(member.client_port))
+    let mut seen = vec![false; SLOT_COUNT];
+    for group in groups {
+        let Response::Array(fields) = group else {
+            return false;
+        };
+        let [
+            slots,
+            Response::Array(ranges),
+            nodes,
+            Response::Array(members),
+        ] = fields.as_slice()
+        else {
+            return false;
+        };
+        if !is_bulk(slots, b"slots") || !is_bulk(nodes, b"nodes") || ranges.len() % 2 != 0 {
+            return false;
+        }
+        let (primary, replica) = match members.as_slice() {
+            [Response::Array(primary)] => (primary, None),
+            [Response::Array(primary), Response::Array(replica)] => (primary, Some(replica)),
+            _ => return false,
+        };
+        for range in ranges.chunks_exact(2) {
+            let [Response::Integer(first), Response::Integer(last)] = range else {
+                return false;
+            };
+            if !check_range(*first, *last, topology, &mut seen, |p, r| {
+                shard_member_agrees(primary, p, b"master")
+                    && match (replica, r) {
+                        (None, None) => true,
+                        (Some(reply), Some(member)) => {
+                            shard_member_agrees(reply, member, b"replica")
+                        }
+                        _ => false,
+                    }
+            }) {
+                return false;
+            }
+        }
+    }
+    projected_coverage(&seen, topology)
 }
 
-pub(super) fn worker_nodes(count: usize) -> impl Iterator<Item = u64> {
+fn check_range(
+    first: i64,
+    last: i64,
+    topology: &Topology,
+    seen: &mut [bool],
+    matches: impl Fn(&Member, Option<&Member>) -> bool,
+) -> bool {
+    let (Ok(first), Ok(last)) = (usize::try_from(first), usize::try_from(last)) else {
+        return false;
+    };
+    if last < first || last >= topology.slots.len() {
+        return false;
+    }
+    for (slot, seen) in topology.slots[first..=last]
+        .iter()
+        .zip(&mut seen[first..=last])
+    {
+        let primary = slot.primary.and_then(|id| topology.member(id));
+        let replica = slot.replica.and_then(|id| topology.member(id));
+        if *seen || !primary.is_some_and(|p| matches(p, replica)) {
+            return false;
+        }
+        *seen = true;
+    }
+    true
+}
+
+fn projected_coverage(seen: &[bool], topology: &Topology) -> bool {
+    topology
+        .slots
+        .iter()
+        .zip(seen)
+        .all(|(slot, seen)| *seen == slot.primary.is_some_and(|id| topology.member(id).is_some()))
+}
+
+fn address_agrees(response: &[Response], member: &Member) -> bool {
+    matches!(response, [host, Response::Integer(port), _]
+        if is_bulk(host, member.client_host.as_bytes()) && *port == i64::from(member.client_port))
+}
+
+fn shard_member_agrees(response: &[Response], member: &Member, role: &[u8]) -> bool {
+    let field = |key| {
+        response
+            .chunks_exact(2)
+            .find(|pair| is_bulk(&pair[0], key))
+            .map(|pair| &pair[1])
+    };
+    field(b"role").is_some_and(|answer| is_bulk(answer, role))
+        && field(b"endpoint").is_some_and(|answer| is_bulk(answer, member.client_host.as_bytes()))
+        && field(b"port") == Some(&Response::Integer(i64::from(member.client_port)))
+}
+
+fn is_bulk(response: &Response, expected: &[u8]) -> bool {
+    matches!(response, Response::Bulk(Some(value)) if value.as_ref() == expected)
+}
+
+pub(super) fn worker_nodes(count: usize) -> std::ops::Range<u64> {
     11..11 + count as u64
 }
 

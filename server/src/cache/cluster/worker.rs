@@ -6,6 +6,8 @@ pub(in crate::cache::cluster) use actor::LeaseActorFixture;
 pub(in crate::cache::cluster) use actor::{SlotSample, lease_authorizes};
 mod peer;
 mod sync;
+#[cfg(all(test, feature = "sim"))]
+pub(super) use sync::sim_renew_once;
 
 use std::collections::BTreeMap;
 use std::io;

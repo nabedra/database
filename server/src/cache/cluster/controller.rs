@@ -497,29 +497,33 @@ impl Controller {
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticks.tick().await;
-            let Some(term) = self.leader_term() else {
-                continue;
-            };
-            let Ok(now) = self.now() else {
-                continue;
-            };
-            let proposal = self
-                .machine
-                .read(|state| {
-                    let mut observed = self.observed.lock().ok()?;
-                    observed.reset_if_changed(term, state.topology.generation);
-                    let changes = observed.plan(state, now);
-                    (!changes.is_empty()).then_some(Command::Reconcile {
-                        generation: state.topology.generation,
-                        revision: state.topology.revision,
-                        lower_ms: now.lower_ms,
-                        changes,
-                    })
+            self.reconcile_once().await;
+        }
+    }
+
+    async fn reconcile_once(&self) {
+        let Some(term) = self.leader_term() else {
+            return;
+        };
+        let Ok(now) = self.now() else {
+            return;
+        };
+        let proposal = self
+            .machine
+            .read(|state| {
+                let mut observed = self.observed.lock().ok()?;
+                observed.reset_if_changed(term, state.topology.generation);
+                let changes = observed.plan(state, now);
+                (!changes.is_empty()).then_some(Command::Reconcile {
+                    generation: state.topology.generation,
+                    revision: state.topology.revision,
+                    lower_ms: now.lower_ms,
+                    changes,
                 })
-                .await;
-            if let Some(proposal) = proposal {
-                let _ = timeout(Duration::from_millis(700), self.commit(proposal)).await;
-            }
+            })
+            .await;
+        if let Some(proposal) = proposal {
+            let _ = timeout(Duration::from_millis(700), self.commit(proposal)).await;
         }
     }
 }

@@ -1,7 +1,12 @@
 //! Test driver for the real controller and its durable topology log.
-use std::{collections::BTreeMap, io, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    io,
+    path::PathBuf,
+    sync::{Arc, Weak},
+};
 
-use nabedra_rt::sim::net::SimListener;
+use nabedra_rt::sim::{self, net::SimListener};
 use nabedra_rt::task;
 use nabedra_sim::{LeaderId, RaftObserver, Vote};
 use openraft::ServerState;
@@ -13,7 +18,7 @@ use uuid::Uuid;
 use super::super::clock::ClockMode;
 use super::super::transport::{Endpoint, Fingerprint, PeerTls};
 use super::network::Network;
-use super::{Loaded, RaftConfig, WatchReceiver};
+use super::{Controller, Loaded, RaftConfig, WatchReceiver};
 
 pub(in crate::cache::cluster) struct SimConfig {
     pub cluster: Uuid,
@@ -25,13 +30,14 @@ pub(in crate::cache::cluster) struct SimConfig {
     pub tls: PeerTls,
 }
 
-pub(in crate::cache::cluster) struct SimRaftMetrics(
-    WatchReceiverOf<RaftConfig, RaftMetrics<RaftConfig>>,
-);
+pub(in crate::cache::cluster) struct SimRaftMetrics {
+    metrics: WatchReceiverOf<RaftConfig, RaftMetrics<RaftConfig>>,
+    controller: Weak<Controller>,
+}
 
 impl SimRaftMetrics {
     pub fn observe(&self, observer: &mut RaftObserver, now_ms: u64) {
-        let current = self.0.borrow_watched();
+        let current = self.metrics.borrow_watched();
         let voted_for = current.vote.leader_id();
         let vote = Vote {
             leader: LeaderId::new(voted_for.term, voted_for.node_id),
@@ -47,9 +53,16 @@ impl SimRaftMetrics {
         );
     }
 
+    /// Drive the real placement turn at a lease boundary in the controller's node.
+    pub async fn reconcile_once(&self) {
+        let controller = self.controller.upgrade().expect("controller is running");
+        assert_eq!(sim::current_node(), Some(controller.node));
+        controller.reconcile_once().await;
+    }
+
     /// The local term, elected leader, and local commit frontier.
     pub fn read(&self) -> (u64, Option<u64>, Option<u64>) {
-        let current = self.0.borrow_watched();
+        let current = self.metrics.borrow_watched();
         (
             current.current_term,
             (current.state == ServerState::Leader).then_some(current.id),
@@ -73,7 +86,10 @@ pub(in crate::cache::cluster) async fn sim_start(
     let started = Loaded::open(&config.dir, network, config.clock, config.operators)?
         .start()
         .await?;
-    let metrics = SimRaftMetrics(started.controller.raft.metrics());
+    let metrics = SimRaftMetrics {
+        metrics: started.controller.raft.metrics(),
+        controller: Arc::downgrade(&started.controller),
+    };
     let service = task::spawn(started.serve(
         app_listener.into(),
         raft_listener.into(),

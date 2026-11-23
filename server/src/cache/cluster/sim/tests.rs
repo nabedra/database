@@ -1,6 +1,5 @@
 //! K01 expiry, K02 capacity and K03 ownership and replica fault-model checks.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use nabedra_check::{Gen, checker::relaxed_kv, history::write_jsonl};
@@ -11,7 +10,11 @@ use super::super::{clock::ClockMode, protocol::Admin};
 use super::harness::{Cluster, Config};
 use super::history::Op;
 use super::hooks::Knobs;
-use crate::cache::{command::key_slot, store::EvictionPolicy, wire::Response};
+use crate::cache::{
+    command::{SLOT_COUNT, key_slot},
+    store::EvictionPolicy,
+    wire::Response,
+};
 
 #[path = "mutants.rs"]
 mod mutants;
@@ -38,17 +41,34 @@ impl Workload {
         [Self::Counter, Self::Register, Self::Ttl, Self::Memory][(seed % 4) as usize]
     }
 
-    fn keys(self) -> Vec<String> {
+    fn keys(self, groups: usize, worker_loss: bool) -> Vec<String> {
         let count = match self {
             Self::Counter => 32,
             Self::Register => 64,
             Self::Ttl => 16,
             Self::Memory => 48,
         };
+        // A crashed worker loses every baseline. Placement repairs in ascending
+        // order with a per-worker move cap. Keep the RAM-loss workload in the
+        // first repair batch while exercising the full map in every run.
+        let mut key_number = 0;
+        let mut tag_in_group = |group: usize| {
+            loop {
+                let tag = format!("{{cache-sim:{self:?}:{key_number}}}");
+                key_number += 1;
+                let slot = usize::from(key_slot(tag.as_bytes()));
+                let first = (group * SLOT_COUNT).div_ceil(groups);
+                if (first..first + 32).contains(&slot) {
+                    break tag;
+                }
+            }
+        };
+        let hot = tag_in_group(0);
         (0..count)
             .map(|i| match self {
-                Self::Memory => format!("{{memory}}:{i}"),
-                Self::Register if i < 16 => format!("{{register-hot}}:{i}"),
+                Self::Memory => format!("{hot}:{i}"),
+                Self::Register if i < 16 => format!("{hot}:{i}"),
+                _ if worker_loss => tag_in_group(0),
                 _ => format!("cache-sim:{self:?}:{i}"),
             })
             .collect()
@@ -127,8 +147,8 @@ enum Action {
     RestartWorker(u64),
 }
 
-fn profile() -> Profile<Action> {
-    Profile::new("cache-cluster", (150, 1200))
+fn profile(worker_loss: bool) -> Profile<Action> {
+    let profile = Profile::new("cache-cluster", (150, 1200))
         .with(Action::Clock, 3)
         .with(Action::Delay, 2)
         .with(Action::PauseWorker, 2)
@@ -136,8 +156,12 @@ fn profile() -> Profile<Action> {
         .with(Action::PartitionZone, 1)
         .with(Action::ReplicaLag, 2)
         .with(Action::Rebalance, 2)
-        .with(Action::CrashController, 2)
-        .with(Action::CrashWorker, 2)
+        .with(Action::CrashController, 2);
+    if worker_loss {
+        profile.with(Action::CrashWorker, 4)
+    } else {
+        profile
+    }
 }
 
 async fn apply_action(
@@ -146,6 +170,7 @@ async fn apply_action(
     slot: u16,
     nemesis: &mut Nemesis<Action>,
     g: &mut Gen,
+    worker_crashed: &mut bool,
 ) {
     let workers: Vec<_> = cluster.workers.keys().copied().collect();
     let worker = workers[g.below(workers.len() as u64) as usize];
@@ -155,8 +180,8 @@ async fn apply_action(
         .map_or(worker, |owner| owner.node);
     let replica = cluster.slot(slot).replica.map_or(worker, |copy| copy.node);
 
-    // Complete an existing recovery before drawing another destructive action. A second
-    // worker loss could remove both RAM copies and would require a separate cold reset.
+    // A restarted worker has empty RAM. A second crash before complete repair
+    // can legitimately destroy both copies. Exercise full loss through cold_reset.
     let recovery = match action {
         Action::RecoverLinks => {
             cluster.heal();
@@ -230,7 +255,9 @@ async fn apply_action(
             cluster.crash(node);
             Some((250 + g.below(1_001), Action::RestartController(node)))
         }
+        Action::CrashWorker if *worker_crashed => return,
         Action::CrashWorker => {
+            *worker_crashed = true;
             let node = if g.bool() { owner } else { replica };
             cluster.crash(node);
             Some((700 + g.below(2_000), Action::RestartWorker(node)))
@@ -422,7 +449,9 @@ fn run_seed(seed: u64, g: &mut Gen) -> SeedRun {
     let workload = Workload::for_seed(seed);
     let config = config(g);
     nabedra_sim::runtime::run(seed, |world| async move {
-        let mut cluster = Cluster::boot(world, workload.keys(), config).await;
+        let worker_loss = (4..8).contains(&(seed % 16));
+        let keys = workload.keys(config.groups, worker_loss);
+        let mut cluster = Cluster::boot(world, keys, config).await;
         let keys = cluster.keys.clone();
         match workload {
             Workload::Ttl => assert_ttl(&mut cluster, &keys[0]).await,
@@ -431,14 +460,23 @@ fn run_seed(seed: u64, g: &mut Gen) -> SeedRun {
         }
         let start = cluster.now();
         let end = start + FAULT_MS;
-        let mut nemesis = Nemesis::new(profile(), start, g);
+        let mut nemesis = Nemesis::new(profile(worker_loss), start, g);
         let mut serial = 10_000;
         let mut completed = 0;
+        let mut worker_crashed = false;
         while cluster.now() < end {
             let key = g.pick(&keys);
             let slot = key_slot(key.as_bytes());
             for action in nemesis.poll(cluster.now(), g) {
-                apply_action(&mut cluster, action, slot, &mut nemesis, g).await;
+                apply_action(
+                    &mut cluster,
+                    action,
+                    slot,
+                    &mut nemesis,
+                    g,
+                    &mut worker_crashed,
+                )
+                .await;
             }
             let op = workload.operation(g.below(10), serial, g);
             let node = (serial % 8 == 0).then(|| FIRST_WORKER + g.below(config.nodes as u64));
@@ -469,6 +507,7 @@ fn run_seed(seed: u64, g: &mut Gen) -> SeedRun {
                 key_slot(keys[0].as_bytes()),
                 &mut nemesis,
                 g,
+                &mut worker_crashed,
             )
             .await;
         }

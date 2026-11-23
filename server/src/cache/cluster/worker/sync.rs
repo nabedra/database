@@ -43,28 +43,7 @@ pub(super) async fn control(
         }
     }
     loop {
-        let topology = worker.topology();
-        let mut reports = progress(&worker, metrics_file.is_some()).await;
-        reports.retain(|report| {
-            report.generation == topology.generation && report.revision == topology.revision
-        });
-        if let Some(path) = &metrics_file {
-            let _ = publish_metrics(path, &worker, &topology, &reports);
-        }
-        let request = Request::Heartbeat(Heartbeat {
-            version: VERSION,
-            generation: topology.generation,
-            revision: topology.revision,
-            worker: member.id,
-            progress: reports
-                .into_iter()
-                .flat_map(|report| report.slots)
-                .collect(),
-        });
-        drop(topology);
-        if let Some(Reply::Update(update)) = client.request(&request).await
-            && let Err(error) = install(&worker, update).await
-        {
+        if let Err(error) = renew(&worker, &mut client, metrics_file.as_deref()).await {
             eprintln!(
                 "nabedra-db: cache worker {} rejected update: {error}",
                 member.id.node
@@ -72,6 +51,46 @@ pub(super) async fn control(
         }
         renewals.tick().await;
     }
+}
+
+async fn renew(
+    worker: &Worker,
+    client: &mut Controller,
+    metrics_file: Option<&Path>,
+) -> io::Result<()> {
+    let topology = worker.topology();
+    let mut reports = progress(worker, metrics_file.is_some()).await;
+    reports.retain(|report| {
+        report.generation == topology.generation && report.revision == topology.revision
+    });
+    if let Some(path) = metrics_file {
+        let _ = publish_metrics(path, worker, &topology, &reports);
+    }
+    let request = Request::Heartbeat(Heartbeat {
+        version: VERSION,
+        generation: topology.generation,
+        revision: topology.revision,
+        worker: worker.shared.id,
+        progress: reports
+            .into_iter()
+            .flat_map(|report| report.slots)
+            .collect(),
+    });
+    drop(topology);
+    if let Some(Reply::Update(update)) = client.request(&request).await {
+        install(worker, update).await?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "sim"))]
+pub(in crate::cache::cluster) async fn sim_renew_once(
+    worker: &Worker,
+    tls: PeerTls,
+    endpoint: Endpoint,
+) -> io::Result<()> {
+    let mut client = Controller::new(tls, BTreeMap::from([(0, endpoint)]));
+    renew(worker, &mut client, None).await
 }
 
 struct Controller {
