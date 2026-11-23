@@ -110,7 +110,7 @@ impl WorkerReplica {
         let snapshot = JoinSnapshot {
             ticket,
             source: self.local,
-            snapshot_id: Uuid::new_v4(),
+            snapshot_id: nabedra_rt::ids::uuid_v4(),
             snapshot_cut: self.change_cut,
         };
         self.export = Some(JoinExport {

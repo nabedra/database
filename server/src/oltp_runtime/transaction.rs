@@ -833,7 +833,7 @@ impl TransactionCoordinator {
             // deadline, while a large valid batch may continue making progress.
             let page = participant.resolve(authority, decision.clone(), 128);
             let result = if retry {
-                tokio::time::timeout(RETRY_PROGRESS_TIMEOUT, page)
+                nabedra_rt::time::timeout(RETRY_PROGRESS_TIMEOUT, page)
                     .await
                     .map_err(|_| unknown())??
             } else {

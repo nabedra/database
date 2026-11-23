@@ -14,7 +14,7 @@ fn reclaim(cluster: &Cluster, voter: usize) -> OwnedCommand<ParticipantCommand> 
     OwnedCommand::new_owned(
         ParticipantCommand::ReclaimIndex(ReclaimIndex {
             authority: cluster.authority,
-            catalog_group_id: Uuid::new_v4(),
+            catalog_group_id: nabedra_rt::ids::uuid_v4(),
             table_id: cluster.table,
             index_id: cluster.index,
             retired_at: CommitTs::new(1).unwrap(),

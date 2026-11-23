@@ -24,7 +24,7 @@ pub(super) async fn reclaim_indexes(runtime: Weak<WorkerRuntime>) {
     let mut range = None;
     let mut idle = IdlePasses::new(Duration::from_secs(2));
     loop {
-        tokio::time::sleep(INTERVAL).await;
+        nabedra_rt::time::sleep(INTERVAL).await;
         let Some(runtime) = runtime.upgrade() else {
             break;
         };
@@ -37,12 +37,12 @@ pub(super) async fn reclaim_indexes(runtime: Weak<WorkerRuntime>) {
         if !runtime.index_reclaim_enabled() {
             continue;
         }
-        let started = tokio::time::Instant::now();
+        let started = nabedra_rt::time::now();
         let applied = runtime.services.control.applied_index();
         if !idle.due(applied, &(), started) {
             continue;
         }
-        let result = tokio::time::timeout(STEP_TIMEOUT, async {
+        let result = nabedra_rt::time::timeout(STEP_TIMEOUT, async {
             let authority = runtime.index_authority(None).await?;
             if range.is_none() {
                 let record = match sweep.next(&runtime).await {

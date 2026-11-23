@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 async fn run(runtime: &Arc<WorkerRuntime>, request: Value) -> (Vec<u8>, Receipt) {
     let body = serde_json::to_vec(&request).unwrap();
     let record = runtime.admit(body.clone()).await.unwrap();
-    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let until = nabedra_rt::time::now() + std::time::Duration::from_secs(30);
     loop {
         let receipt = runtime
             .observe(record.run_id, record.request_id)
@@ -22,14 +22,14 @@ async fn run(runtime: &Arc<WorkerRuntime>, request: Value) -> (Vec<u8>, Receipt)
             return (body, receipt.receipt.clone());
         }
         assert!(
-            tokio::time::Instant::now() < until,
+            nabedra_rt::time::now() < until,
             "actual request never settled"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        nabedra_rt::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 fn request(operation: &str, payload: Value) -> Value {
-    json!({"request_id":Uuid::new_v4(),"operation":operation,"payload":payload})
+    json!({"request_id":nabedra_rt::ids::uuid_v4(),"operation":operation,"payload":payload})
 }
 fn history_path(path: &Path) -> PathBuf {
     std::fs::read_dir(path)
@@ -174,7 +174,7 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
         }
     }
     let directory = TestDirectory(
-        std::env::temp_dir().join(format!("nabedra-native-archive-{}", Uuid::new_v4())),
+        std::env::temp_dir().join(format!("nabedra-native-archive-{}", nabedra_rt::ids::uuid_v4())),
     );
     std::fs::create_dir(directory.path()).unwrap();
     let source_path = directory.path().join("source");
@@ -281,7 +281,7 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
         .await
         .unwrap();
     let race_owner = BackupOwnerRef {
-        backup_id: Uuid::new_v4(),
+        backup_id: nabedra_rt::ids::uuid_v4(),
         attempt: 1,
     };
     let race_pin = source
@@ -290,7 +290,7 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
         .begin_backup(authority, race_owner)
         .await
         .unwrap();
-    let race_archive = Uuid::new_v4();
+    let race_archive = nabedra_rt::ids::uuid_v4();
     let race_cut = source
         .services
         .timestamps
@@ -388,7 +388,7 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
     // A settled failed publication closes its own attempt, rather than
     // accumulating a permanent storage pin on every new failed owner.
     let failed_owner = BackupOwnerRef {
-        backup_id: Uuid::new_v4(),
+        backup_id: nabedra_rt::ids::uuid_v4(),
         attempt: 1,
     };
     let failed_path = directory.path().join("failed-publication");
@@ -465,7 +465,7 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
         "failed attempt pin remained active"
     );
     let owner = BackupOwnerRef {
-        backup_id: Uuid::new_v4(),
+        backup_id: nabedra_rt::ids::uuid_v4(),
         attempt: 1,
     };
     let base_path = directory.path().join("base");
@@ -652,7 +652,7 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
     drop(source);
     let mounted = directory.path().join("mounted-target");
     std::fs::create_dir(&mounted).unwrap();
-    let restore_started = std::time::Instant::now();
+    let restore_started = nabedra_rt::time::now_std();
     let summary = WorkerRuntime::restore_native(
         &[base_path.clone(), first_path, last_path],
         Some(first.pin.read_ts),
@@ -664,7 +664,7 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
     )
     .await
     .unwrap();
-    let restore_elapsed = restore_started.elapsed();
+    let restore_elapsed = nabedra_rt::time::now_std().saturating_duration_since(restore_started);
     println!(
         "{}",
         serde_json::json!({"scope":"local-native-O19-checkpoint","restore_seconds":restore_elapsed.as_secs_f64(),"target_cut":summary.target_cut,"segments":summary.segments,"images":summary.images,"identities":summary.identities})
@@ -831,7 +831,7 @@ async fn o12_o19_native_index_closure_pitr_and_repeat_restore() {
 
     fn owner() -> BackupOwnerRef {
         BackupOwnerRef {
-            backup_id: Uuid::new_v4(),
+            backup_id: nabedra_rt::ids::uuid_v4(),
             attempt: 1,
         }
     }
@@ -854,7 +854,7 @@ async fn o12_o19_native_index_closure_pitr_and_repeat_restore() {
         closure.expect("original Catalog closure missing in archive")
     }
 
-    let path = std::env::temp_dir().join(format!("nabedra-index-archive-{}", Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!("nabedra-index-archive-{}", nabedra_rt::ids::uuid_v4()));
     std::fs::create_dir(&path).unwrap();
     let execution = ExecutionConfig {
         max_pending_requests: 8,
@@ -904,7 +904,7 @@ async fn o12_o19_native_index_closure_pitr_and_repeat_restore() {
 
     let definition = IndexDefinition {
         table_id,
-        index_id: Uuid::new_v4(),
+        index_id: nabedra_rt::ids::uuid_v4(),
         name: Text::try_from("by_value").unwrap(),
         columns: Page::new(vec![Text::try_from("value").unwrap()]).unwrap(),
         covering: Page::new(Vec::new()).unwrap(),
@@ -913,7 +913,7 @@ async fn o12_o19_native_index_closure_pitr_and_repeat_restore() {
         catalog_group_id: base.scope.catalog_group,
         table_id,
         index_id: definition.index_id,
-        build_id: Uuid::new_v4(),
+        build_id: nabedra_rt::ids::uuid_v4(),
         attempt: 1,
     };
     source
@@ -1066,7 +1066,7 @@ async fn o12_o19_native_index_closure_pitr_and_repeat_restore() {
             input
         };
         let destination = path.join(name);
-        let started = std::time::Instant::now();
+        let started = nabedra_rt::time::now_std();
         let restored = WorkerRuntime::restore_native(
             &input,
             cut,
@@ -1078,7 +1078,7 @@ async fn o12_o19_native_index_closure_pitr_and_repeat_restore() {
         )
         .await
         .unwrap();
-        let restore_seconds = started.elapsed().as_secs_f64();
+        let restore_seconds = nabedra_rt::time::now_std().saturating_duration_since(started).as_secs_f64();
         assert_eq!(
             restored.target_cut,
             cut.unwrap_or_else(|| {
@@ -1248,7 +1248,7 @@ async fn o12_o19_native_index_closure_pitr_and_repeat_restore() {
 /// `d03_o19_dedup_records_survive_backup_images_and_restore`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o19_incremental_backups_are_refused_while_direct_commits_are_active() {
-    let path = std::env::temp_dir().join(format!("nabedra-direct-backup-{}", Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!("nabedra-direct-backup-{}", nabedra_rt::ids::uuid_v4()));
     std::fs::create_dir(&path).unwrap();
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {
@@ -1275,7 +1275,7 @@ async fn o19_incremental_backups_are_refused_while_direct_commits_are_active() {
     source.without_direct_for_test().await;
     assert!(!source.direct_commits_active(), "off by default");
     source.set_direct_commits_active(true);
-    let backup_id = Uuid::new_v4();
+    let backup_id = nabedra_rt::ids::uuid_v4();
     let base = source
         .backup_native(
             &path.join("base"),
@@ -1325,7 +1325,7 @@ async fn o19_incremental_backups_are_refused_while_direct_commits_are_active() {
 /// gate, and incremental backups are refused from then on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn o02_o19_t7_a_lone_worker_activates_data_direct_v1_and_refuses_incremental_backups() {
-    let path = std::env::temp_dir().join(format!("nabedra-direct-activation-{}", Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!("nabedra-direct-activation-{}", nabedra_rt::ids::uuid_v4()));
     std::fs::create_dir(&path).unwrap();
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {
@@ -1356,16 +1356,16 @@ async fn o02_o19_t7_a_lone_worker_activates_data_direct_v1_and_refuses_increment
         crate::config::direct_oltp_default(),
         "direct_oltp follows its default"
     );
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = nabedra_rt::time::now() + std::time::Duration::from_secs(60);
     while !switch.is_direct_active() {
-        assert!(tokio::time::Instant::now() < deadline, "data.direct.v1 never activated");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(nabedra_rt::time::now() < deadline, "data.direct.v1 never activated");
+        nabedra_rt::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(switch.requires_forward());
     assert_eq!(switch.routes_direct(), switch.direct_oltp());
     assert!(source.direct_commits_active(), "activation set the backup gate");
     assert!(switch.refresh().await.unwrap(), "Control reports it active");
-    let backup_id = Uuid::new_v4();
+    let backup_id = nabedra_rt::ids::uuid_v4();
     let base = source
         .backup_native(
             &path.join("base"),

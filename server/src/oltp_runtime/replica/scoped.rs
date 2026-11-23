@@ -7,7 +7,7 @@ use crate::{
     protocol::Operation,
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use tokio::time::{Instant as Deadline, timeout_at};
+use nabedra_rt::time::{Instant as Deadline, timeout_at};
 
 pub(in crate::oltp_runtime) const SCOPED_QUEUE_VERSION: u32 = 2;
 const MAJORITY: u32 = 2;
@@ -388,14 +388,14 @@ async fn copy_quorum(
     copy: ScopedCopy<'_>,
     deadline: Deadline,
 ) -> Result<u8, QueueError> {
-    if Deadline::now() >= deadline {
+    if nabedra_rt::time::now() >= deadline {
         return Err(QueueError::Unavailable);
     }
     timeout_at(deadline, async {
         let current = wire.current().await.map_err(|_| QueueError::Unavailable)?;
         placement.ensure_owner(&current, sender)?;
         let statement = copy.statement(placement)?;
-        if Deadline::now() >= deadline {
+        if nabedra_rt::time::now() >= deadline {
             return Err(QueueError::Unavailable);
         }
         let mut replies = FuturesUnordered::new();
@@ -413,7 +413,7 @@ async fn copy_quorum(
                 if holders.count_ones() >= MAJORITY {
                     let current = wire.current().await.map_err(|_| QueueError::Unavailable)?;
                     placement.ensure_owner(&current, sender)?;
-                    if Deadline::now() >= deadline {
+                    if nabedra_rt::time::now() >= deadline {
                         return Err(QueueError::Unavailable);
                     }
                     return Ok(holders);

@@ -178,8 +178,8 @@ async fn body(body: Body) -> Result<Vec<u8>, ProtocolError> {
 }
 async fn bounded_body(mut body: Body, maximum: usize) -> Result<Vec<u8>, ProtocolError> {
     let mut bytes = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    while let Some(frame) = tokio::time::timeout_at(deadline, body.frame())
+    let deadline = nabedra_rt::time::now() + std::time::Duration::from_secs(30);
+    while let Some(frame) = nabedra_rt::time::timeout_at(deadline, body.frame())
         .await
         .map_err(|_| invalid("request body read deadline exceeded"))?
     {
@@ -205,7 +205,7 @@ async fn submit(State(state): State<Arc<ApiState>>, request: Request) -> Respons
 }
 async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) -> Response {
     let _timer = super::stage_timing::perf_stage!("http.dispatch.total").timer();
-    let spawned = std::time::Instant::now();
+    let spawned = nabedra_rt::time::now_std();
     if let Err(error) = authorize(&request, &state) {
         return failure(None, error);
     }
@@ -240,7 +240,7 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
         super::stage_timing::perf_stage!("http.dispatch.spawn_wait").since(spawned);
         let full = (3 * protocol::MAX_BODY_BYTES + super::MAX_DECODED_REQUEST_BYTES) as u64;
         let mut staging = parsing_charge(&state, length.map_or(full, |length| 2 * length as u64))?;
-        let read = std::time::Instant::now();
+        let read = nabedra_rt::time::now_std();
         let bytes = match length {
             Some(length) => bounded_body(request.into_body(), length).await?,
             None => body(request.into_body()).await?,
@@ -383,7 +383,7 @@ async fn receipt(
     };
     // Receipt/control work has independent admission and does not queue behind
     // requests waiting for execution. Each reply is bounded by the wire encoder.
-    let observed = tokio::time::timeout(
+    let observed = nabedra_rt::time::timeout(
         super::RECEIPT_OBSERVATION_TIMEOUT,
         state.runtime.receipt(run, id),
     )
@@ -617,10 +617,10 @@ mod tests {
                 self.submit.clone()?;
                 Ok(RequestRecord {
                     context: None,
-                    run_id: Uuid::new_v4(),
+                    run_id: nabedra_rt::ids::uuid_v4(),
                     scheduler_term: 1,
                     membership_revision: 1,
-                    request_id: Uuid::new_v4(),
+                    request_id: nabedra_rt::ids::uuid_v4(),
                     digest: String::new(),
                     sequence: 1,
                     version: 1,
@@ -656,7 +656,7 @@ mod tests {
         let app = router_for(runtime, TOKEN.into(), DATABASE.into()).unwrap();
         let body = format!(
             r#"{{"request_id":"{}","operation":"table.list","payload":{{}}}}"#,
-            Uuid::new_v4()
+            nabedra_rt::ids::uuid_v4()
         );
         let reply = app
             .oneshot(
@@ -778,12 +778,12 @@ mod tests {
             schema_epoch: 1,
             shard: crate::oltp::mvcc::catalog::ShardRoute {
                 group: GroupIdentity {
-                    cluster_id: Uuid::new_v4(),
+                    cluster_id: nabedra_rt::ids::uuid_v4(),
                     database: Text::try_from(DATABASE).unwrap(),
-                    group_id: Uuid::new_v4(),
+                    group_id: nabedra_rt::ids::uuid_v4(),
                     kind: GroupKind::Data {
                         table_id: table,
-                        shard_id: Uuid::new_v4(),
+                        shard_id: nabedra_rt::ids::uuid_v4(),
                     },
                     group_format_version: 1,
                 },
@@ -839,7 +839,7 @@ mod tests {
     /// capped updates near 170/s and 2 x the commit time at any rate.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn perf1_direct_requests_waiting_on_the_leader_do_not_hold_the_queued_lane() {
-        let table = Uuid::new_v4();
+        let table = nabedra_rt::ids::uuid_v4();
         let leader = Arc::new(SlowLeader {
             in_flight: AtomicUsize::new(0),
             release: tokio::sync::Semaphore::new(0),
@@ -851,22 +851,22 @@ mod tests {
         let requests: Vec<_> = (0..REQUESTS)
             .map(|key| {
                 let body = serde_json::json!({
-                    "request_id": Uuid::new_v4(),
+                    "request_id": nabedra_rt::ids::uuid_v4(),
                     "operation": "table.update",
                     "payload": {"table_id": table, "key": key, "values": {"value": 1}},
                 })
                 .to_string();
-                tokio::spawn(send(app.clone(), body))
+                nabedra_rt::task::spawn(send(app.clone(), body))
             })
             .collect();
         // Every request reaches the leader while none has been answered.
-        let reached = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let reached = nabedra_rt::time::timeout(std::time::Duration::from_secs(10), async {
             while leader.in_flight.load(Ordering::SeqCst) < REQUESTS {
                 if let Some(done) = requests.iter().find(|task| task.is_finished()) {
                     let _ = done;
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                nabedra_rt::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await;
@@ -892,7 +892,7 @@ mod tests {
     /// bound and refuses beyond it with `not_applied`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn perf1_direct_lane_fallback_keeps_the_queued_lane_bound() {
-        let table = Uuid::new_v4();
+        let table = nabedra_rt::ids::uuid_v4();
         let leader = Arc::new(SlowLeader {
             in_flight: AtomicUsize::new(0),
             release: tokio::sync::Semaphore::new(0),
@@ -909,15 +909,15 @@ mod tests {
         let list = || {
             format!(
                 r#"{{"request_id":"{}","operation":"table.list","payload":{{}}}}"#,
-                Uuid::new_v4()
+                nabedra_rt::ids::uuid_v4()
             )
         };
         let held: Vec<_> = (0..2)
-            .map(|_| tokio::spawn(send(app.clone(), list())))
+            .map(|_| nabedra_rt::task::spawn(send(app.clone(), list())))
             .collect();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        nabedra_rt::time::timeout(std::time::Duration::from_secs(10), async {
             while script.submits.load(Ordering::SeqCst) < 2 {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                nabedra_rt::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await

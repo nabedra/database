@@ -106,13 +106,13 @@ pub(crate) async fn checkpoint(stage: &str, index: Uuid, observed: &impl Seriali
     }
     write(&reached, observed);
     let release = directory.join(format!("release-{gate}"));
-    let deadline = tokio::time::Instant::now() + WATCHDOG;
+    let deadline = nabedra_rt::time::now() + WATCHDOG;
     while !release.is_file() {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            nabedra_rt::time::now() < deadline,
             "mounted index checkpoint watchdog expired: {gate}"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(10)).await;
     }
     std::fs::read_to_string(&release)
         .expect("read mounted index checkpoint release")
@@ -151,7 +151,7 @@ pub(in crate::oltp_runtime) async fn serve(runtime: Arc<WorkerRuntime>, director
                 continue;
             };
             let watchdog = command.watchdog();
-            let result = match tokio::time::timeout(
+            let result = match nabedra_rt::time::timeout(
                 watchdog,
                 runtime.run_index_fault_command(command),
             )
@@ -163,7 +163,7 @@ pub(in crate::oltp_runtime) async fn serve(runtime: Arc<WorkerRuntime>, director
             };
             write(&input.with_extension("result"), &result);
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("mounted index fault command directory became unreadable");
 }
@@ -181,30 +181,30 @@ async fn o12_mounted_index_create_watchdog_covers_held_backfill() {
     let create: Command = serde_json::from_value(json!({
         "command": "create",
         "definition": {
-            "index_id": Uuid::new_v4(),
-            "table_id": Uuid::new_v4(),
+            "index_id": nabedra_rt::ids::uuid_v4(),
+            "table_id": nabedra_rt::ids::uuid_v4(),
             "name": "by_category_score",
             "columns": ["category", "score"],
             "covering": ["label"],
         },
-        "build_id": Uuid::new_v4(),
+        "build_id": nabedra_rt::ids::uuid_v4(),
         "attempt": 1,
     }))
     .unwrap();
     let watchdog = create.watchdog();
-    let start = tokio::time::Instant::now();
-    tokio::time::timeout(watchdog, async {
+    let start = nabedra_rt::time::now();
+    nabedra_rt::time::timeout(watchdog, async {
         // The mounted RF3 run reached backfill after 48s and held it for 71s.
-        tokio::time::sleep(Duration::from_secs(48)).await;
-        tokio::time::sleep(Duration::from_secs(71)).await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        nabedra_rt::time::sleep(Duration::from_secs(48)).await;
+        nabedra_rt::time::sleep(Duration::from_secs(71)).await;
+        nabedra_rt::time::sleep(Duration::from_secs(2)).await;
     })
     .await
     .expect("the command must be able to continue after the backfill release");
-    assert!(start.elapsed() > WATCHDOG);
+    assert!(nabedra_rt::time::now().saturating_duration_since(start) > WATCHDOG);
     assert_eq!(Command::Authority { data: Vec::new() }.watchdog(), WATCHDOG);
     assert!(
-        tokio::time::timeout(watchdog, std::future::pending::<()>())
+        nabedra_rt::time::timeout(watchdog, std::future::pending::<()>())
             .await
             .is_err()
     );

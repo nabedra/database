@@ -367,7 +367,7 @@ impl WorkerRuntime {
                     }
                     if attempts > 0 {
                         let backoff = Duration::from_millis(5 << (attempts - 1));
-                        tokio::time::sleep(backoff.min(Duration::from_millis(100))).await;
+                        nabedra_rt::time::sleep(backoff.min(Duration::from_millis(100))).await;
                     }
                     // Help resolves a decided intent and leaves an undecided
                     // one to its actor. A failed observation is not an outcome.

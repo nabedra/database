@@ -84,7 +84,7 @@ impl IndexBackend for Paused {
     }
 }
 async fn exercise_case(case: &str) {
-    let path = std::env::temp_dir().join(format!("nabedra-index-{case}-{}", Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!("nabedra-index-{case}-{}", nabedra_rt::ids::uuid_v4()));
     let execution = ExecutionConfig {
         max_pending_requests: 32,
         max_queue_bytes_per_replica: 8 << 20,
@@ -115,7 +115,7 @@ async fn exercise_case(case: &str) {
     )
     .await;
     let definition = IndexDefinition {
-        index_id: Uuid::new_v4(),
+        index_id: nabedra_rt::ids::uuid_v4(),
         table_id: table.id,
         name: Text::try_from("by_category").unwrap(),
         columns: Page::new(vec![Text::try_from("category").unwrap()]).unwrap(),
@@ -125,7 +125,7 @@ async fn exercise_case(case: &str) {
         ])
         .unwrap(),
     };
-    let build_id = Uuid::new_v4();
+    let build_id = nabedra_rt::ids::uuid_v4();
     let gate = Arc::new(Gate {
         entered: Notify::new(),
         release: Notify::new(),
@@ -141,8 +141,8 @@ async fn exercise_case(case: &str) {
     });
     let service = IndexService::new(paused.clone());
     let input = definition.clone();
-    let building = tokio::spawn(async move { service.create(input, build_id, 1).await });
-    tokio::time::timeout(std::time::Duration::from_secs(30), gate.entered.notified())
+    let building = nabedra_rt::task::spawn(async move { service.create(input, build_id, 1).await });
+    nabedra_rt::time::timeout(std::time::Duration::from_secs(30), gate.entered.notified())
         .await
         .unwrap();
     let query:protocol::Query=serde_json::from_value(serde_json::json!({"select":null,"filter":{"column":"category","op":"eq","value":0},"order_by":{"column":"price","desc":true},"limit":10})).unwrap();
@@ -248,7 +248,7 @@ async fn exercise_case(case: &str) {
             };
             let attempt = backend
                 .begin(
-                    Uuid::new_v4(),
+                    nabedra_rt::ids::uuid_v4(),
                     serialized_digest(&maintenance).unwrap(),
                     maintenance,
                     None,
@@ -357,7 +357,7 @@ async fn exercise_case(case: &str) {
             );
             assert_eq!(retired.terminal_position(), closed.terminal_position());
             let probe = runtime.admit(serde_json::to_vec(&serde_json::json!({
-                "request_id":Uuid::new_v4(),"operation":"table.get","payload":{"table_id":table.id,"key":1}
+                "request_id":nabedra_rt::ids::uuid_v4(),"operation":"table.get","payload":{"table_id":table.id,"key":1}
             })).unwrap()).await.unwrap();
             let (_, context, _) = runtime
                 .services
@@ -420,7 +420,7 @@ async fn exercise_case(case: &str) {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o12_resume_cold_and_tombstone_cleanup() {
-    tokio::time::timeout(std::time::Duration::from_secs(240), async {
+    nabedra_rt::time::timeout(std::time::Duration::from_secs(240), async {
         for case in ["resume", "cold", "drop"] {
             exercise_case(case).await;
         }

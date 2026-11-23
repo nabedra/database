@@ -18,7 +18,7 @@ async fn request(
     operation: &str,
     payload: Value,
 ) -> (StatusCode, Value) {
-    let body = json!({"request_id":Uuid::new_v4(), "operation":operation, "payload":payload});
+    let body = json!({"request_id":nabedra_rt::ids::uuid_v4(), "operation":operation, "payload":payload});
     let reply = app
         .clone()
         .oneshot(
@@ -45,8 +45,8 @@ async fn data(app: &Router, operation: &str, payload: Value) -> Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o03_o04_native_query_plan_residual_order_and_operator_observations() {
-    tokio::time::timeout(std::time::Duration::from_secs(90), async {
-        let path = std::env::temp_dir().join(format!("nabedra-query-plan-{}", Uuid::new_v4()));
+    nabedra_rt::time::timeout(std::time::Duration::from_secs(90), async {
+        let path = std::env::temp_dir().join(format!("nabedra-query-plan-{}", nabedra_rt::ids::uuid_v4()));
         let runtime = WorkerRuntime::open(
             &path, "query_plan", DATA,
             ExecutionConfig {
@@ -151,11 +151,11 @@ async fn o03_o04_native_query_plan_residual_order_and_operator_observations() {
 
         let table_uuid = serde_json::from_value(table_id.clone()).unwrap();
         runtime.create_index(IndexDefinition {
-            index_id: Uuid::new_v4(), table_id: table_uuid,
+            index_id: nabedra_rt::ids::uuid_v4(), table_id: table_uuid,
             name: Text::try_from("by_label").unwrap(),
             columns: Page::new(vec![Text::try_from("label").unwrap()]).unwrap(),
             covering: Page::new(Vec::new()).unwrap(),
-        }, Uuid::new_v4(), 1).await.unwrap();
+        }, nabedra_rt::ids::uuid_v4(), 1).await.unwrap();
         let covering = data(&app, "query.explain", scan.clone()).await;
         assert!(covering.as_str().unwrap().contains("access secondary by_label seek; composite-prefix 1; lower unbounded; upper unbounded; covering true\nscope shards 1"));
         assert_eq!(data(&app, "query.collect", scan.clone()).await, json!([{"id":i64::MIN}]));

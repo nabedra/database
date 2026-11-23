@@ -50,7 +50,7 @@ async fn execute(runtime: Arc<WorkerRuntime>, request: Arrival, due: Instant) ->
     let id: Uuid =
         serde_json::from_value(request.request["request_id"].clone()).expect("request UUID");
     let body = serde_json::to_vec(&request.request).expect("bounded request JSON");
-    let started = Instant::now();
+    let started = nabedra_rt::time::now();
     let record = match runtime.clone().submit_owned(body).await {
         Ok(record) => record,
         Err(error) => {
@@ -61,7 +61,7 @@ async fn execute(runtime: Arc<WorkerRuntime>, request: Arrival, due: Instant) ->
             );
             return json!({
                 "request_id": id, "state": "definitively_rejected", "error": error,
-                "completion_ms": due.elapsed().as_secs_f64() * 1000.0
+                "completion_ms": nabedra_rt::time::now().saturating_duration_since(due).as_secs_f64() * 1000.0
             });
         }
     };
@@ -69,7 +69,7 @@ async fn execute(runtime: Arc<WorkerRuntime>, request: Arrival, due: Instant) ->
         .wait(&record)
         .await
         .expect("observe original result");
-    let finished = Instant::now();
+    let finished = nabedra_rt::time::now();
     let result: Value = serde_json::from_slice(&response.body).expect("decode result envelope");
     let receipt = runtime
         .receipt(record.run_id, id)
@@ -133,20 +133,20 @@ fn o24_direct_production_rf1() {
     let database = std::env::var("NABEDRA_O24_DATABASE").expect("benchmark database");
     let token = std::env::var("NABEDRA_TOKEN").expect("benchmark token");
     standalone_network_runtime().unwrap().block_on(async {
-        tokio::time::timeout(Duration::from_secs(900), async {
+        nabedra_rt::time::timeout(Duration::from_secs(900), async {
             let runtime = WorkerRuntime::open_configured(&data, &database, &token, execution, resources, true)
                 .await.expect("open seeded production RF1 volume");
             for arrival in plan.warmup {
-                let observed = execute(runtime.clone(), arrival, Instant::now()).await;
+                let observed = execute(runtime.clone(), arrival, nabedra_rt::time::now()).await;
                 assert_eq!(observed["state"], "succeeded");
             }
             let before = observations(&runtime).await;
             let mut tasks = JoinSet::new();
             let mut samples = Vec::with_capacity(plan.arrivals.len());
-            let origin = Instant::now();
+            let origin = nabedra_rt::time::now();
             for (index, arrival) in plan.arrivals.into_iter().enumerate() {
                 let due = origin + Duration::from_nanos(arrival.offset_ns);
-                tokio::time::sleep_until(due).await;
+                nabedra_rt::time::sleep_until(due).await;
                 while let Some(result) = tasks.try_join_next() {
                     samples.push(result.expect("join admitted direct operation"));
                 }
@@ -160,7 +160,7 @@ fn o24_direct_production_rf1() {
             while let Some(result) = tasks.join_next().await {
                 samples.push(result.expect("join admitted direct operation"));
             }
-            let elapsed = origin.elapsed().as_secs_f64();
+            let elapsed = nabedra_rt::time::now().saturating_duration_since(origin).as_secs_f64();
             samples.sort_unstable_by_key(|(index, _)| *index);
             assert!(samples.iter().enumerate().all(|(i, (index, _))| *index == i));
             let after = observations(&runtime).await;

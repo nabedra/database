@@ -49,7 +49,7 @@ async fn data(app: &Router, operation: &str, payload: Value) -> Value {
         "/v1/operations",
         DATA,
         DATABASE,
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
         operation,
         payload,
     )
@@ -78,8 +78,8 @@ async fn admin(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o12_u01_protected_index_management_uses_exact_catalog_job() {
-    tokio::time::timeout(Duration::from_secs(90), async {
-        let path = std::env::temp_dir().join(format!("nabedra-index-operator-{}", Uuid::new_v4()));
+    nabedra_rt::time::timeout(Duration::from_secs(90), async {
+        let path = std::env::temp_dir().join(format!("nabedra-index-operator-{}", nabedra_rt::ids::uuid_v4()));
         let runtime = WorkerRuntime::open(
             &path, DATABASE, DATA,
             ExecutionConfig {
@@ -96,8 +96,8 @@ async fn o12_u01_protected_index_management_uses_exact_catalog_job() {
             "key":"id", "format":"parquet",
         })).await;
         let table = table["id"].clone();
-        let build_id = Uuid::new_v4();
-        let index_id = Uuid::new_v4();
+        let build_id = nabedra_rt::ids::uuid_v4();
+        let index_id = nabedra_rt::ids::uuid_v4();
         let create = "storage.index.create";
         let status = "storage.index.status";
         let resume = "storage.index.resume";
@@ -118,8 +118,8 @@ async fn o12_u01_protected_index_management_uses_exact_catalog_job() {
         assert!(runtime.durable_lookup(runtime.index_declaration_identity(build_id).unwrap()).await.unwrap().is_none());
         let mut forged = selector.clone();
         forged["proof"] = json!({"ready":true});
-        assert_eq!(admin(&app, Uuid::new_v4(), resume, forged).await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(admin(&app, Uuid::new_v4(), status, selector.clone()).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(admin(&app, nabedra_rt::ids::uuid_v4(), resume, forged).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(admin(&app, nabedra_rt::ids::uuid_v4(), status, selector.clone()).await.0, StatusCode::NOT_FOUND);
 
         assert_eq!(data(&app, "table.insert_many", json!({"table_id":table,"rows":[
             {"id":1,"category":7,"label":"old"}, {"id":2,"category":7,"label":"keep"},
@@ -130,13 +130,13 @@ async fn o12_u01_protected_index_management_uses_exact_catalog_job() {
         assert_eq!(first["data"], json!({"state":"building","definition":definition,"build_id":build_id,"attempt":1}));
         assert_eq!(admin(&app, build_id, create, definition.clone()).await, (StatusCode::OK, first.clone()));
         let mut different = definition.clone();
-        different["index_id"] = json!(Uuid::new_v4());
+        different["index_id"] = json!(nabedra_rt::ids::uuid_v4());
         different["name"] = json!("same_request_uuid");
         assert_eq!(admin(&app, build_id, create, different).await.0, StatusCode::CONFLICT);
         let mut stale = selector.clone();
         stale["attempt"] = json!(2);
-        assert_eq!(admin(&app, Uuid::new_v4(), resume, stale).await.0, StatusCode::CONFLICT);
-        assert_eq!(admin(&app, Uuid::new_v4(), resume, selector.clone()).await.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(admin(&app, nabedra_rt::ids::uuid_v4(), resume, stale).await.0, StatusCode::CONFLICT);
+        assert_eq!(admin(&app, nabedra_rt::ids::uuid_v4(), resume, selector.clone()).await.0, StatusCode::TOO_MANY_REQUESTS);
 
         let query = json!({"table_id":table,"query":{
             "select":["id","label"],"filter":{"column":"category","op":"eq","value":7},
@@ -146,18 +146,18 @@ async fn o12_u01_protected_index_management_uses_exact_catalog_job() {
         data(&app, "table.update", json!({"table_id":table,"key":1,"values":{"label":"updated"}})).await;
         data(&app, "table.insert", json!({"table_id":table,"row":{"id":3,"category":7,"label":"inserted"}})).await;
         drop(occupied);
-        let (code, started) = admin(&app, Uuid::new_v4(), resume, selector.clone()).await;
+        let (code, started) = admin(&app, nabedra_rt::ids::uuid_v4(), resume, selector.clone()).await;
         assert_eq!(code, StatusCode::OK, "{started}");
         assert_eq!(started["data"]["state"], "building");
         loop {
-            let (code, observed) = admin(&app, Uuid::new_v4(), status, selector.clone()).await;
+            let (code, observed) = admin(&app, nabedra_rt::ids::uuid_v4(), status, selector.clone()).await;
             if code == StatusCode::OK && observed["data"]["state"] == "ready" {
                 break;
             }
             // A status read answers its state or a typed retryable error (IDX1).
             assert!((code == StatusCode::SERVICE_UNAVAILABLE && observed["error"]["outcome"] == "not_applied")
                 || (code == StatusCode::OK && observed["data"]["state"] == "building"), "{code} {observed}");
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(data(&app, "query.explain", query.clone()).await.as_str().unwrap().contains("by_category"));
         let rows = json!([{ "id":1,"label":"updated" },{ "id":2,"label":"keep" },{ "id":3,"label":"inserted" }]);
@@ -170,16 +170,16 @@ async fn o12_u01_protected_index_management_uses_exact_catalog_job() {
         };
         let ready = catalog.strong_index_attempt_closed(owner).await.unwrap();
         assert_eq!(ready.statement().kind, IndexClosedKind::Ready);
-        let retirement_id = Uuid::new_v4();
+        let retirement_id = nabedra_rt::ids::uuid_v4();
         let retired = loop {
             let (code, reply) = admin(&app, retirement_id, retire, selector.clone()).await;
             if code == StatusCode::OK { break reply; }
             assert_eq!(code, StatusCode::TOO_MANY_REQUESTS, "{reply}");
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            nabedra_rt::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(retired["data"]["state"], "retired");
         assert_eq!(admin(&app, retirement_id, retire, selector.clone()).await, (StatusCode::OK, retired));
-        assert_eq!(admin(&app, Uuid::new_v4(), resume, selector).await.0, StatusCode::CONFLICT);
+        assert_eq!(admin(&app, nabedra_rt::ids::uuid_v4(), resume, selector).await.0, StatusCode::CONFLICT);
         let live_closure = catalog.strong_index_attempt_closed(owner).await.unwrap();
         assert_eq!(live_closure.archive_evidence(), ready.archive_evidence());
         let authority = runtime.index_authority(None).await.unwrap();
@@ -193,9 +193,9 @@ async fn o12_u01_protected_index_management_uses_exact_catalog_job() {
         let pin = timestamps.index_metadata_pin(authority, owner, txn, reservation, decision.request)
             .await.unwrap();
         assert!(pin.released);
-        let other = MaintenanceOwnerRef { index_id: Uuid::new_v4(), ..owner };
+        let other = MaintenanceOwnerRef { index_id: nabedra_rt::ids::uuid_v4(), ..owner };
         assert!(timestamps.index_metadata_pin(authority, other, txn, reservation, decision.request).await.is_err());
-        let different_nonce = IdentityReservation { reservation_id: Uuid::new_v4(), ..reservation };
+        let different_nonce = IdentityReservation { reservation_id: nabedra_rt::ids::uuid_v4(), ..reservation };
         assert!(timestamps.index_metadata_pin(authority, owner, txn, different_nonce, decision.request).await.is_err());
         assert!(!data(&app, "query.explain", query.clone()).await.as_str().unwrap().contains("by_category"));
         assert_eq!(data(&app, "query.collect", query).await, rows);
@@ -216,8 +216,8 @@ async fn o12_u01_protected_index_management_uses_exact_catalog_job() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn d11_o12_index_status_during_ready_publication_is_never_outcome_unknown() {
     use crate::oltp_runtime::recovery_tests::index_holds::{self, Stage};
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let path = std::env::temp_dir().join(format!("nabedra-index-status-{}", Uuid::new_v4()));
+    nabedra_rt::time::timeout(Duration::from_secs(120), async {
+        let path = std::env::temp_dir().join(format!("nabedra-index-status-{}", nabedra_rt::ids::uuid_v4()));
         let runtime = WorkerRuntime::open(
             &path, DATABASE, DATA,
             ExecutionConfig {
@@ -236,8 +236,8 @@ async fn d11_o12_index_status_during_ready_publication_is_never_outcome_unknown(
         assert_eq!(data(&app, "table.insert_many", json!({"table_id":table,"rows":[
             {"id":1,"category":7,"label":"one"}, {"id":2,"category":3,"label":"two"},
         ]})).await, json!(2));
-        let build_id = Uuid::new_v4();
-        let index_id = Uuid::new_v4();
+        let build_id = nabedra_rt::ids::uuid_v4();
+        let index_id = nabedra_rt::ids::uuid_v4();
         let definition = json!({"table_id":table,"index_id":index_id,"name":"by_category","columns":["category"],"covering":["label"]});
         let selector = json!({"table_id":table,"index_id":index_id,"build_id":build_id,"attempt":1});
         // Declare without an actor, then hold every later metadata commit of this Catalog.
@@ -248,20 +248,20 @@ async fn d11_o12_index_status_during_ready_publication_is_never_outcome_unknown(
         let catalog = runtime.services.catalog.participant().identity().group_id;
         let mut holds = index_holds::register(catalog);
         drop(occupied);
-        let resume = tokio::spawn({
+        let resume = nabedra_rt::task::spawn({
             let (app, selector) = (app.clone(), selector.clone());
-            async move { admin(&app, Uuid::new_v4(), "storage.index.resume", selector).await }
+            async move { admin(&app, nabedra_rt::ids::uuid_v4(), "storage.index.resume", selector).await }
         });
 
         let (mut retryable, mut held_ready) = (Vec::new(), None);
         while held_ready.is_none() {
-            let held = tokio::time::timeout(Duration::from_secs(60), holds.recv())
+            let held = nabedra_rt::time::timeout(Duration::from_secs(60), holds.recv())
                 .await.expect("the build actor reached no further metadata commit")
                 .expect("hold channel closed");
-            let started = tokio::time::Instant::now();
-            let (code, reply) = admin(&app, Uuid::new_v4(), "storage.index.status", selector.clone()).await;
+            let started = nabedra_rt::time::now();
+            let (code, reply) = admin(&app, nabedra_rt::ids::uuid_v4(), "storage.index.status", selector.clone()).await;
             let observed = format!("{:?} {:?}: {code} {reply}", held.stage, held.txn);
-            assert!(started.elapsed() < Duration::from_secs(5), "status waited for the held actor: {observed}");
+            assert!(nabedra_rt::time::now().saturating_duration_since(started) < Duration::from_secs(5), "status waited for the held actor: {observed}");
             assert_ne!(reply["error"]["code"], "outcome_unknown", "{observed}");
             assert_ne!(reply["error"]["outcome"], "unknown", "{observed}");
             match code {
@@ -295,7 +295,7 @@ async fn d11_o12_index_status_during_ready_publication_is_never_outcome_unknown(
         let closed = runtime.services.catalog.participant().strong_index_attempt_closed(owner).await.unwrap();
         assert_eq!(closed.statement().kind, IndexClosedKind::Ready);
         assert_eq!(Some(closed.archive_evidence().txn), held_ready);
-        let (code, observed) = admin(&app, Uuid::new_v4(), "storage.index.status", selector).await;
+        let (code, observed) = admin(&app, nabedra_rt::ids::uuid_v4(), "storage.index.status", selector).await;
         assert_eq!((code, observed["data"]["state"].clone()), (StatusCode::OK, json!("ready")), "{observed}");
         let query = json!({"table_id":table,"query":{
             "select":["id","label"],"filter":{"column":"category","op":"eq","value":7},

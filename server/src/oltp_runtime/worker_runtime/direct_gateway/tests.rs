@@ -146,13 +146,13 @@ async fn open(path: &std::path::Path, direct_oltp: bool) -> Arc<WorkerRuntime> {
 /// worker activates it on startup) and its executor is installed.
 async fn activated(runtime: &WorkerRuntime) {
     let switch = runtime.direct_switch().unwrap().clone();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = nabedra_rt::time::now() + Duration::from_secs(60);
     while !(switch.refresh().await.unwrap_or(false)
         && crate::oltp_replication::service_rpc::direct::installed(&runtime.services.shared)
             .is_some())
     {
-        assert!(tokio::time::Instant::now() < deadline, "no activation");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(nabedra_rt::time::now() < deadline, "no activation");
+        nabedra_rt::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -160,7 +160,7 @@ async fn create(app: &Router) -> Value {
     let (status, created) = call(
         app,
         body(
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             "table.create",
             json!({
                 "name": "items", "key": "id", "format": "parquet",
@@ -185,15 +185,15 @@ async fn o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane() {
         request_queue::RequestState,
     };
 
-    tokio::time::timeout(Duration::from_secs(90), async {
+    nabedra_rt::time::timeout(Duration::from_secs(90), async {
         let directory = TestDirectory(
-            std::env::temp_dir().join(format!("nabedra-o07-prepare-lane-{}", Uuid::new_v4())),
+            std::env::temp_dir().join(format!("nabedra-o07-prepare-lane-{}", nabedra_rt::ids::uuid_v4())),
         );
         let runtime = open(&directory.0, ExecutionConfig::default().direct_oltp).await;
         activated(&runtime).await;
         let app = runtime.application(TOKEN.into()).unwrap();
         let table = create(&app).await;
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let batch = body(
             id,
             "table.insert_many",
@@ -262,7 +262,7 @@ async fn o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane() {
         );
         for (key, value) in [(-1, 10), (1, 20)] {
             let key_read = body(
-                Uuid::new_v4(),
+                nabedra_rt::ids::uuid_v4(),
                 "table.get",
                 json!({"table_id":table,"key":key}),
             );
@@ -278,15 +278,15 @@ async fn o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d03_q05_bug1_direct_retry_without_content_length_replays_original_result() {
-    tokio::time::timeout(Duration::from_secs(90), async {
+    nabedra_rt::time::timeout(Duration::from_secs(90), async {
         let directory = TestDirectory(
-            std::env::temp_dir().join(format!("nabedra-bug1-streamed-{}", Uuid::new_v4())),
+            std::env::temp_dir().join(format!("nabedra-bug1-streamed-{}", nabedra_rt::ids::uuid_v4())),
         );
         let runtime = open(&directory.0, true).await;
         activated(&runtime).await;
         let app = runtime.application(TOKEN.into()).unwrap();
         let table = create(&app).await;
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let insert = |value| {
             body(
                 id,
@@ -303,7 +303,7 @@ async fn d03_q05_bug1_direct_retry_without_content_length_replays_original_resul
         assert_eq!(conflict.0, 409, "{conflict:?}");
         assert_eq!(conflict.1["error"]["code"], "conflict");
         let get = body(
-            Uuid::new_v4(),
+            nabedra_rt::ids::uuid_v4(),
             "table.get",
             json!({"table_id": table, "key": 7}),
         );
@@ -372,9 +372,9 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
         }
     }
 
-    tokio::time::timeout(Duration::from_secs(90), async {
+    nabedra_rt::time::timeout(Duration::from_secs(90), async {
         let directory = TestDirectory(
-            std::env::temp_dir().join(format!("nabedra-bug1-reply-{}", Uuid::new_v4())),
+            std::env::temp_dir().join(format!("nabedra-bug1-reply-{}", nabedra_rt::ids::uuid_v4())),
         );
         let runtime = open(&directory.0, true).await;
         activated(&runtime).await;
@@ -382,7 +382,7 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
         let table = create(&app).await;
         let get = || {
             body(
-                Uuid::new_v4(),
+                nabedra_rt::ids::uuid_v4(),
                 "table.get",
                 json!({"table_id": table, "key": 7}),
             )
@@ -397,7 +397,7 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
             .unwrap();
         let range = &route.range;
         let shared = &runtime.services.shared;
-        let id = Uuid::new_v4();
+        let id = nabedra_rt::ids::uuid_v4();
         let insert = body(
             id,
             "table.insert",
@@ -481,10 +481,10 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
 /// decision 2026-11-21, RV-FINAL M3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
-    tokio::time::timeout(Duration::from_secs(240), async {
+    nabedra_rt::time::timeout(Duration::from_secs(240), async {
         // The queued path (`direct_oltp: false`), with forward markers.
         let baseline_dir = TestDirectory(
-            std::env::temp_dir().join(format!("nabedra-t6-queued-{}", Uuid::new_v4())),
+            std::env::temp_dir().join(format!("nabedra-t6-queued-{}", nabedra_rt::ids::uuid_v4())),
         );
         let baseline = open(&baseline_dir.0, false).await;
         activated(&baseline).await;
@@ -493,7 +493,7 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
         let mut queued = Vec::new();
         for (operation, payload) in program(&table, 0) {
             let (status, envelope) =
-                call(&app, body(Uuid::new_v4(), operation, payload), true).await;
+                call(&app, body(nabedra_rt::ids::uuid_v4(), operation, payload), true).await;
             queued.push((operation, normalized(status, envelope, 0)));
         }
         let gateway = baseline.direct_gateway_handle().unwrap().stats();
@@ -510,7 +510,7 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
 
         // The direct path (`direct_oltp: true`).
         let directory = TestDirectory(
-            std::env::temp_dir().join(format!("nabedra-t6-direct-{}", Uuid::new_v4())),
+            std::env::temp_dir().join(format!("nabedra-t6-direct-{}", nabedra_rt::ids::uuid_v4())),
         );
         let runtime = open(&directory.0, true).await;
         activated(&runtime).await;
@@ -524,10 +524,10 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
         };
         let mut latencies = Vec::new();
         for (index, (operation, payload)) in program(&table, 0).into_iter().enumerate() {
-            let started = std::time::Instant::now();
+            let started = nabedra_rt::time::now_std();
             let (status, envelope) =
-                call(&app, body(Uuid::new_v4(), operation, payload), true).await;
-            latencies.push(started.elapsed());
+                call(&app, body(nabedra_rt::ids::uuid_v4(), operation, payload), true).await;
+            latencies.push(nabedra_rt::time::now_std().saturating_duration_since(started));
             if normalized(status, envelope.clone(), 0) != queued[index].1 {
                 eprintln!("d01 rf1 mismatch at {index}: leader {}", leader());
             }
@@ -559,7 +559,7 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
         let base = 2_000;
         for (index, (operation, payload)) in program(&table, base).into_iter().enumerate() {
             let (status, envelope) =
-                call(&app, body(Uuid::new_v4(), operation, payload), false).await;
+                call(&app, body(nabedra_rt::ids::uuid_v4(), operation, payload), false).await;
             assert_eq!(
                 normalized(status, envelope, base),
                 queued[index].1,
@@ -607,9 +607,9 @@ async fn o02_d11_t7b_rf1_activation_waits_for_the_exclusive_ddl_guard_over_mtls(
         store::lifecycle::{GuardMode, LifecycleBinding},
     };
     use crate::oltp_replication::types::{Digest, ReadTs, RequestBinding, TxnId};
-    tokio::time::timeout(Duration::from_secs(240), async {
+    nabedra_rt::time::timeout(Duration::from_secs(240), async {
         let directory = TestDirectory(
-            std::env::temp_dir().join(format!("nabedra-t7b-guard-{}", Uuid::new_v4())),
+            std::env::temp_dir().join(format!("nabedra-t7b-guard-{}", nabedra_rt::ids::uuid_v4())),
         );
         let runtime = open(&directory.0, true).await;
         activated(&runtime).await;
@@ -652,7 +652,7 @@ async fn o02_d11_t7b_rf1_activation_waits_for_the_exclusive_ddl_guard_over_mtls(
             _ => panic!("table record"),
         };
         let txn = TxnId {
-            request_id: Uuid::new_v4(),
+            request_id: nabedra_rt::ids::uuid_v4(),
             attempt: 1,
         };
         let request = RequestBinding {
@@ -662,7 +662,7 @@ async fn o02_d11_t7b_rf1_activation_waits_for_the_exclusive_ddl_guard_over_mtls(
             accepted_context: Digest::from_bytes([6; 32]),
         };
         let binding = LifecycleBinding {
-            guard_id: Uuid::new_v4(),
+            guard_id: nabedra_rt::ids::uuid_v4(),
             catalog_group_id: catalog.participant().identity().group_id,
             table_id,
             lifecycle_version: version,
@@ -690,13 +690,13 @@ async fn o02_d11_t7b_rf1_activation_waits_for_the_exclusive_ddl_guard_over_mtls(
         let insert = {
             let app = app.clone();
             let body = body(
-                Uuid::new_v4(),
+                nabedra_rt::ids::uuid_v4(),
                 "table.insert",
                 json!({"table_id": table, "row": {"id": 1, "value": 1, "tag": "a"}}),
             );
-            tokio::spawn(async move { call(&app, body, true).await })
+            nabedra_rt::task::spawn(async move { call(&app, body, true).await })
         };
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(800)).await;
         assert!(!insert.is_finished(), "the request waits for the DDL");
         let leader =
             crate::oltp_replication::service_rpc::direct::installed(&runtime.services.shared)
@@ -764,9 +764,9 @@ fn report(line: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn o15_d03_m3_rollback_queued_gets_propose_no_data_entry() {
     const GETS: usize = 200;
-    tokio::time::timeout(Duration::from_secs(240), async {
+    nabedra_rt::time::timeout(Duration::from_secs(240), async {
         let directory = TestDirectory(
-            std::env::temp_dir().join(format!("nabedra-m3-rollback-{}", Uuid::new_v4())),
+            std::env::temp_dir().join(format!("nabedra-m3-rollback-{}", nabedra_rt::ids::uuid_v4())),
         );
         let runtime = open(&directory.0, false).await;
         activated(&runtime).await;
@@ -775,7 +775,7 @@ async fn o15_d03_m3_rollback_queued_gets_propose_no_data_entry() {
         let (status, inserted) = call(
             &app,
             body(
-                Uuid::new_v4(),
+                nabedra_rt::ids::uuid_v4(),
                 "table.insert",
                 json!({"table_id": table, "row": {"id": 1, "value": 10, "tag": "a"}}),
             ),
@@ -796,12 +796,12 @@ async fn o15_d03_m3_rollback_queued_gets_propose_no_data_entry() {
             )
         };
         let before = snapshot().await;
-        let started = std::time::Instant::now();
+        let started = nabedra_rt::time::now_std();
         for index in 0..GETS {
             let (status, envelope) = call(
                 &app,
                 body(
-                    Uuid::new_v4(),
+                    nabedra_rt::ids::uuid_v4(),
                     "table.get",
                     json!({"table_id": table, "key": 1}),
                 ),
@@ -815,7 +815,7 @@ async fn o15_d03_m3_rollback_queued_gets_propose_no_data_entry() {
                 "{envelope}"
             );
         }
-        let elapsed = started.elapsed();
+        let elapsed = nabedra_rt::time::now_std().saturating_duration_since(started);
         let after = snapshot().await;
         let (entries, markers, forwards, journal, commits) = (
             after.0 - before.0,
@@ -839,7 +839,7 @@ async fn o15_d03_m3_rollback_queued_gets_propose_no_data_entry() {
         let (status, updated) = call(
             &app,
             body(
-                Uuid::new_v4(),
+                nabedra_rt::ids::uuid_v4(),
                 "table.update",
                 json!({"table_id": table, "key": 1, "values": {"value": 11}}),
             ),
@@ -869,9 +869,9 @@ async fn o15_d03_m3_rollback_queued_gets_propose_no_data_entry() {
 async fn d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs() {
     use crate::oltp::pool::ExecutionClass;
     const GETS: u64 = 20;
-    tokio::time::timeout(Duration::from_secs(240), async {
+    nabedra_rt::time::timeout(Duration::from_secs(240), async {
         let directory = TestDirectory(
-            std::env::temp_dir().join(format!("nabedra-perf2b-gw-{}", Uuid::new_v4())),
+            std::env::temp_dir().join(format!("nabedra-perf2b-gw-{}", nabedra_rt::ids::uuid_v4())),
         );
         let runtime = open(&directory.0, true).await;
         activated(&runtime).await;
@@ -880,7 +880,7 @@ async fn d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs() {
         let (status, inserted) = call(
             &app,
             body(
-                Uuid::new_v4(),
+                nabedra_rt::ids::uuid_v4(),
                 "table.insert",
                 json!({"table_id": table, "row": {"id": 1, "value": 10, "tag": "a"}}),
             ),
@@ -890,7 +890,7 @@ async fn d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs() {
         assert_eq!(status, 200, "{inserted}");
         let get = || {
             body(
-                Uuid::new_v4(),
+                nabedra_rt::ids::uuid_v4(),
                 "table.get",
                 json!({"table_id": table, "key": 1}),
             )

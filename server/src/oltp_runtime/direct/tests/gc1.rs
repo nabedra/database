@@ -112,8 +112,8 @@ impl Measure {
     pub(super) async fn new(ranges: usize, rows: i64) -> Self {
         let dir = Dir::new();
         let certificates = tls::certificates(&dir.0, 3);
-        let cluster_id = Uuid::new_v4();
-        let table = Uuid::new_v4();
+        let cluster_id = nabedra_rt::ids::uuid_v4();
+        let table = nabedra_rt::ids::uuid_v4();
         let spans: Vec<(i64, i64)> = (0..ranges as i64)
             .map(|g| (g * rows / ranges as i64, (g + 1) * rows / ranges as i64))
             .collect();
@@ -121,10 +121,10 @@ impl Measure {
             .map(|_| GroupIdentity {
                 cluster_id,
                 database: Text::try_from("gc1").unwrap(),
-                group_id: Uuid::new_v4(),
+                group_id: nabedra_rt::ids::uuid_v4(),
                 kind: GroupKind::Data {
                     table_id: table,
-                    shard_id: Uuid::new_v4(),
+                    shard_id: nabedra_rt::ids::uuid_v4(),
                 },
                 group_format_version: 1,
             })
@@ -135,8 +135,8 @@ impl Measure {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             workers.push(WorkerEnrollment {
-                worker_id: Uuid::new_v4(),
-                incarnation: Uuid::new_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                incarnation: nabedra_rt::ids::uuid_v4(),
                 certificate_sha256: Digest::parse(tls.certificate_sha256()).unwrap(),
                 enrollment_revision: 1,
                 endpoint: Text::new(listener.local_addr().unwrap().to_string()).unwrap(),
@@ -154,7 +154,7 @@ impl Measure {
                     ReplicaMember {
                         node_id: node,
                         worker_id: worker.worker_id,
-                        pool_id: Uuid::new_v4(),
+                        pool_id: nabedra_rt::ids::uuid_v4(),
                     },
                 )
             })
@@ -285,7 +285,7 @@ impl Measure {
                     }
                     let (stop, stopped) = oneshot::channel::<()>();
                     let listener = TcpListener::from_std(listener).unwrap();
-                    tokio::spawn(transport.run(listener, async {
+                    nabedra_rt::task::spawn(transport.run(listener, async {
                         let _ = stopped.await;
                     }));
                     let executor = DirectExecutor::new(
@@ -298,7 +298,7 @@ impl Measure {
                     (shared, pool, replicas, executor, stop)
                 }
             };
-            let (shared, pool, groups, executor, stop) = runtime.spawn(build).await.unwrap();
+            let (shared, pool, groups, executor, stop) = nabedra_rt::task::spawn_on(runtime.handle(), build).await.unwrap();
             let threads = tids().difference(&before).copied().collect();
             voters.push(MVoter {
                 node,
@@ -321,7 +321,7 @@ impl Measure {
             driver_threads,
         };
         let authority = Authority {
-            run_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
             owner_term: 1,
         };
         for (g, (lo, hi)) in measure.spans.clone().into_iter().enumerate() {
@@ -335,7 +335,7 @@ impl Measure {
                 start: (g > 0).then_some(Key::Int64(lo)),
                 end: (g + 1 < measure.spans.len()).then_some(Key::Int64(hi)),
             };
-            let (transition, catalog) = (Uuid::new_v4(), Uuid::new_v4());
+            let (transition, catalog) = (nabedra_rt::ids::uuid_v4(), nabedra_rt::ids::uuid_v4());
             let handle = measure.voters[0].groups[g].handle.clone();
             watchdog(|| async {
                 handle
@@ -370,7 +370,7 @@ impl Measure {
     }
 
     fn request(&self, group: usize, operation: &str, payload: serde_json::Value) -> DirectRequest {
-        let request_id = Uuid::new_v4();
+        let request_id = nabedra_rt::ids::uuid_v4();
         let mut payload = payload;
         payload["table_id"] = serde_json::json!(self.table);
         let body = serde_json::to_vec(&serde_json::json!({
@@ -402,9 +402,10 @@ impl Measure {
     ) -> tokio::task::JoinHandle<(DirectResponse, Duration)> {
         let executor = self.voters[0].executor.clone();
         let handle = self.voters[0].groups[group].handle.clone();
-        self.voters[0].runtime.as_ref().unwrap().spawn(async move {
+        let runtime = self.voters[0].runtime.as_ref().unwrap().handle();
+        nabedra_rt::task::spawn_on(runtime, async move {
             let response = executor.execute(&handle, request).await;
-            (response, due.elapsed())
+            (response, nabedra_rt::time::now_std().saturating_duration_since(due))
         })
     }
 
@@ -421,7 +422,7 @@ impl Measure {
                 let request =
                     self.request(g, "table.insert_many", serde_json::json!({ "rows": rows }));
                 let (response, _) = self
-                    .spawn(g, request, std::time::Instant::now())
+                    .spawn(g, request, nabedra_rt::time::now_std())
                     .await
                     .unwrap();
                 assert!(
@@ -558,7 +559,7 @@ async fn phase(
     let storage_before = measure.storage();
     let direct_before = measure.voters[0].executor.stats();
     let cpu_before = measure.cpu();
-    let started = std::time::Instant::now();
+    let started = nabedra_rt::time::now_std();
     let mut latencies = Vec::new();
     let (mut ok, mut refused, mut failed) = (0u64, 0u64, 0u64);
     let mut count = |response: &DirectResponse,
@@ -578,7 +579,7 @@ async fn phase(
             let key = (next() % rows as u64) as i64;
             let (g, request) = make(key, i);
             let (response, latency) = measure
-                .spawn(g, request, std::time::Instant::now())
+                .spawn(g, request, nabedra_rt::time::now_std())
                 .await
                 .unwrap();
             count(&response, latency, &mut latencies);
@@ -586,12 +587,12 @@ async fn phase(
     } else {
         let total = (rate * seconds) as usize;
         let interval = Duration::from_secs_f64(1.0 / rate);
-        let origin = tokio::time::Instant::now();
-        let origin_std = std::time::Instant::now();
+        let origin = nabedra_rt::time::now();
+        let origin_std = nabedra_rt::time::now_std();
         let mut tasks = Vec::with_capacity(total);
         for i in 0..total {
             let due = origin + interval * i as u32;
-            tokio::time::sleep_until(due).await;
+            nabedra_rt::time::sleep_until(due).await;
             let key = (next() % rows as u64) as i64;
             let (g, request) = make(key, i);
             // Latency from the scheduled arrival (open loop).
@@ -603,7 +604,7 @@ async fn phase(
             count(&response, latency, &mut latencies);
         }
     }
-    let wall = started.elapsed().as_secs_f64();
+    let wall = nabedra_rt::time::now_std().saturating_duration_since(started).as_secs_f64();
     let cpu_after = measure.cpu();
     let storage_after = measure.storage();
     let stages_after = crate::oltp_runtime::stage_timing::snapshot();

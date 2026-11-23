@@ -40,18 +40,18 @@ impl ScopedWorker {
         }
         let memory = self.resources().reserve_scratch(ByteClass::Data, 4096)?;
         let weak = Arc::downgrade(self);
-        *slot = Some(tokio::spawn(async move {
+        *slot = Some(nabedra_rt::task::spawn(async move {
             let _memory = memory;
             let mut progress = Progress::default();
             loop {
-                tokio::time::sleep(PASS_DELAY).await;
+                nabedra_rt::time::sleep(PASS_DELAY).await;
                 let Some(worker) = weak.upgrade() else {
                     break;
                 };
                 if worker.stopping.load(Ordering::Acquire) {
                     break;
                 }
-                match tokio::time::timeout(GROUP_DEADLINE, worker.advance(&mut progress)).await {
+                match nabedra_rt::time::timeout(GROUP_DEADLINE, worker.advance(&mut progress)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => tracing::debug!(
                         group = ?progress.after, code = ?error.code, message = error.message,
@@ -180,7 +180,7 @@ impl ScopedWorker {
                 let Ok(_guard) = gate.try_lock() else {
                     continue;
                 };
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = nabedra_rt::time::now() + Duration::from_secs(5);
                 if record.recovered_marker {
                     self.services
                         .endpoint
@@ -273,7 +273,7 @@ impl ScopedWorker {
                     &self.services.peer,
                     group,
                     transfer.id,
-                    Instant::now() + GROUP_DEADLINE,
+                    nabedra_rt::time::now() + GROUP_DEADLINE,
                 )
                 .await?;
             let report = ScopedQueueTransferReport::Installed { basis, inventory };

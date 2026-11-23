@@ -124,10 +124,10 @@ fn route(fixture: &Fixture, table_id: Uuid) -> ShardRoute {
         group: GroupIdentity {
             cluster_id: fixture.scope.cluster_id,
             database: fixture.scope.database.clone(),
-            group_id: Uuid::new_v4(),
+            group_id: nabedra_rt::ids::uuid_v4(),
             kind: GroupKind::Data {
                 table_id,
-                shard_id: Uuid::new_v4(),
+                shard_id: nabedra_rt::ids::uuid_v4(),
             },
             group_format_version: GROUP_FORMAT_VERSION,
         },
@@ -187,16 +187,16 @@ fn terminal(fixture: &Fixture, frame: &RecordFrame, result: bool) -> RecordFrame
 }
 
 fn deadline() -> Deadline {
-    Deadline::now() + Duration::from_secs(1)
+    nabedra_rt::time::now() + Duration::from_secs(1)
 }
 
 #[tokio::test(start_paused = true)]
 async fn scoped_q03_q06_delayed_replica_does_not_block_exact_acceptance_or_terminal_copy() {
     let fixture = Fixture::new(3);
-    let table = Uuid::new_v4();
-    let placement = placement(&fixture, route(&fixture, table), Uuid::new_v4());
-    let id = Uuid::new_v4();
-    let foreign_id = Uuid::new_v4();
+    let table = nabedra_rt::ids::uuid_v4();
+    let placement = placement(&fixture, route(&fixture, table), nabedra_rt::ids::uuid_v4());
+    let id = nabedra_rt::ids::uuid_v4();
+    let foreign_id = nabedra_rt::ids::uuid_v4();
     let foreign = frame(&fixture, foreign_id, table, 1);
     let wrong_shard = frame(&fixture, id, table, 10);
     let frame = frame(&fixture, id, table, 0);
@@ -212,7 +212,7 @@ async fn scoped_q03_q06_delayed_replica_does_not_block_exact_acceptance_or_termi
     );
     assert!(wire.calls.lock().unwrap().is_empty());
     let accepted = accept(&placement, owner, &wire, &frame, due).await.unwrap();
-    assert!(Deadline::now() < due);
+    assert!(nabedra_rt::time::now() < due);
     assert_eq!(wire.marked(), 2);
     for replica in &wire.replicas[0..2] {
         let replica = replica.lock().unwrap();
@@ -283,7 +283,7 @@ async fn scoped_q03_q06_delayed_replica_does_not_block_exact_acceptance_or_termi
             .is_none()
     );
     let outsider = WorkerIdentity {
-        worker_id: Uuid::new_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
         ..owner
     };
     assert!(
@@ -303,15 +303,15 @@ async fn scoped_q03_q06_delayed_replica_does_not_block_exact_acceptance_or_termi
 #[tokio::test(start_paused = true)]
 async fn scoped_q03_r01_minorities_cannot_accept_and_same_request_retry_keeps_the_record() {
     let fixture = Fixture::new(3);
-    let table = Uuid::new_v4();
-    let placement = placement(&fixture, route(&fixture, table), Uuid::new_v4());
-    let id = Uuid::new_v4();
+    let table = nabedra_rt::ids::uuid_v4();
+    let placement = placement(&fixture, route(&fixture, table), nabedra_rt::ids::uuid_v4());
+    let id = nabedra_rt::ids::uuid_v4();
     let frame = frame(&fixture, id, table, 0);
     let mut wire = Wire::new(&fixture, &placement);
     let owner = fixture.authority.owner;
 
     assert_eq!(
-        accept(&placement, owner, &wire, &frame, Deadline::now()).await,
+        accept(&placement, owner, &wire, &frame, nabedra_rt::time::now()).await,
         Err(QueueError::Unavailable)
     );
     assert!(wire.calls.lock().unwrap().is_empty());
@@ -366,11 +366,11 @@ async fn scoped_q03_r01_minorities_cannot_accept_and_same_request_retry_keeps_th
 #[tokio::test(start_paused = true)]
 async fn scoped_q05_r03_old_owner_cannot_acknowledge_after_marker_copies_cross_the_fence() {
     let fixture = Fixture::new(3);
-    let table = Uuid::new_v4();
+    let table = nabedra_rt::ids::uuid_v4();
     let route = route(&fixture, table);
-    let generation = Uuid::new_v4();
+    let generation = nabedra_rt::ids::uuid_v4();
     let placement = placement(&fixture, route.clone(), generation);
-    let id = Uuid::new_v4();
+    let id = nabedra_rt::ids::uuid_v4();
     let frame = frame(&fixture, id, table, 0);
     let mut wire = Wire::new(&fixture, &placement);
     wire.install_paused = 0b100;
@@ -378,7 +378,7 @@ async fn scoped_q05_r03_old_owner_cannot_acknowledge_after_marker_copies_cross_t
     let owner = fixture.authority.owner;
     let next_owner = fixture.members[1];
     let mut members: [WorkerIdentity; 3] = fixture.members.clone().try_into().unwrap();
-    members[0].incarnation = Uuid::new_v4();
+    members[0].incarnation = nabedra_rt::ids::uuid_v4();
     members[0].enrollment_revision += 1;
     let old_view = fixture.authority.ready.view;
     let next = ScopedPlacement::new(

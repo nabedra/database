@@ -216,7 +216,7 @@ impl Batchers {
                 };
                 lone(&self.resources, handle, commit, deadline).await
             }
-            Err((id, receiver)) => match tokio::time::timeout_at(deadline, receiver).await {
+            Err((id, receiver)) => match nabedra_rt::time::timeout_at(deadline, receiver).await {
                 Ok(Ok(reply)) => reply,
                 Ok(Err(_)) => Err(unknown("the direct batch driver stopped")),
                 Err(_) if range.withdraw(id) => Err(ProtocolError::new(
@@ -268,7 +268,7 @@ impl Drop for Handoff {
         };
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                runtime.spawn(driver.run());
+                nabedra_rt::task::spawn_on(&runtime, driver.run());
             }
             // No runtime (shutdown): nothing was proposed.
             Err(_) => drop(driver),
@@ -391,7 +391,7 @@ async fn by<T>(
     deadline: Instant,
     future: impl std::future::Future<Output = Result<T, ProtocolError>>,
 ) -> Result<T, ProtocolError> {
-    tokio::time::timeout_at(deadline, future)
+    nabedra_rt::time::timeout_at(deadline, future)
         .await
         .unwrap_or_else(|_| Err(unknown("direct request deadline expired")))
 }

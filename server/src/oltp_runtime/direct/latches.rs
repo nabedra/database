@@ -76,8 +76,8 @@ impl KeyLatches {
             match mutex.clone().try_lock_owned() {
                 Ok(guard) => held.push(guard),
                 Err(_) => {
-                    waited_since.get_or_insert_with(Instant::now);
-                    let guard = tokio::time::timeout_at(deadline, mutex.lock_owned())
+                    waited_since.get_or_insert_with(nabedra_rt::time::now);
+                    let guard = nabedra_rt::time::timeout_at(deadline, mutex.lock_owned())
                         .await
                         .map_err(|_| LatchTimeout)?;
                     held.push(guard);
@@ -86,7 +86,7 @@ impl KeyLatches {
         }
         Ok(LatchGuard {
             _held: held,
-            waited: waited_since.map(|since| since.elapsed()),
+            waited: waited_since.map(|since| nabedra_rt::time::now().saturating_duration_since(since)),
         })
     }
 }
@@ -98,10 +98,10 @@ mod tests {
     #[tokio::test]
     async fn o08_latches_serialize_one_key_and_time_out_at_the_deadline() {
         let latches = KeyLatches::new(64);
-        let far = Instant::now() + Duration::from_secs(5);
+        let far = nabedra_rt::time::now() + Duration::from_secs(5);
         let first = latches.lock([&b"k1"[..]], far).await.unwrap();
         assert!(first.waited.is_none());
-        let near = Instant::now() + Duration::from_millis(50);
+        let near = nabedra_rt::time::now() + Duration::from_millis(50);
         assert_eq!(
             latches.lock([&b"k1"[..]], near).await.err(),
             Some(LatchTimeout)
@@ -124,9 +124,9 @@ mod tests {
             if task % 2 == 1 {
                 mine.reverse();
             }
-            tasks.push(tokio::spawn(async move {
+            tasks.push(nabedra_rt::task::spawn(async move {
                 for _ in 0..50 {
-                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let deadline = nabedra_rt::time::now() + Duration::from_secs(10);
                     let guard = latches
                         .lock(mine.iter().map(Vec::as_slice), deadline)
                         .await
@@ -143,7 +143,7 @@ mod tests {
         let all = latches
             .lock(
                 keys.iter().map(Vec::as_slice),
-                Instant::now() + Duration::from_millis(100),
+                nabedra_rt::time::now() + Duration::from_millis(100),
             )
             .await
             .unwrap();

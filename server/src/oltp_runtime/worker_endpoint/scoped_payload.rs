@@ -23,7 +23,7 @@ use scoped_store::{
 };
 use sha2::{Digest as _, Sha256};
 use std::{future::Future, time::Duration};
-use tokio::time::{Instant, sleep, timeout_at};
+use nabedra_rt::time::{Instant, sleep, timeout_at};
 
 pub(super) struct ScopedPayloadReaders {
     pub(super) rpc_group: GroupIdentity,
@@ -504,7 +504,7 @@ impl QueueEndpoint {
             let accepted = ScopedCopyQuorum::confirm(current, stamp.marker(), marker, remote)
                 .map_err(QueueError::protocol)?;
             self.require_scoped_owner(current).await?;
-            if Instant::now() >= deadline {
+            if nabedra_rt::time::now() >= deadline {
                 return Err(unavailable());
             }
             self.with_scoped_store(|store| store.confirm_copies(current, accepted))?;
@@ -613,7 +613,7 @@ impl QueueEndpoint {
                 })
                 .await?;
             self.require_scoped_owner(current).await?;
-            if Instant::now() >= deadline {
+            if nabedra_rt::time::now() >= deadline {
                 return Err(unavailable());
             }
             self.with_scoped_store(|store| store.confirm_copies(current, accepted))?;
@@ -686,7 +686,7 @@ impl QueueEndpoint {
                 backoff = (backoff * 2).min(Duration::from_millis(250));
             };
             self.require_scoped_owner(current).await?;
-            if Instant::now() >= deadline {
+            if nabedra_rt::time::now() >= deadline {
                 return Err(unavailable());
             }
             self.with_scoped_store(|store| store.confirm_copies(current, quorum))?;

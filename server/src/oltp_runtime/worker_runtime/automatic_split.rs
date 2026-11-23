@@ -154,12 +154,12 @@ impl WorkerRuntime {
             .map_err(|_| unknown())?
             .target_bytes = Some(policy.shard_target_bytes);
         let weak = Arc::downgrade(self);
-        Ok(tokio::spawn(async move {
+        Ok(nabedra_rt::task::spawn(async move {
             let _owner = owner;
             let mut authority = None;
             let mut state = OwnerLoop::default();
             loop {
-                tokio::time::sleep(OBSERVATION_INTERVAL).await;
+                nabedra_rt::time::sleep(OBSERVATION_INTERVAL).await;
                 let Some(runtime) = weak.upgrade() else { break };
                 let local_owner = runtime
                     .services
@@ -175,7 +175,7 @@ impl WorkerRuntime {
                     authority = None;
                     continue;
                 }
-                let current = tokio::time::timeout(
+                let current = nabedra_rt::time::timeout(
                     Duration::from_secs(5),
                     runtime.services.control.current(&runtime.services.scope),
                 )
@@ -204,7 +204,7 @@ impl WorkerRuntime {
                 if let Some(work) = state.active.take() {
                     state.drive(&runtime, &client, work, next).await;
                 } else {
-                    let result = tokio::time::timeout(
+                    let result = nabedra_rt::time::timeout(
                         Duration::from_secs(10),
                         state.observe(&runtime, &client, policy, current.ready),
                     )
@@ -238,7 +238,7 @@ impl WorkerRuntime {
                 return Ok((None, None));
             }
             observation.deficit.clone().filter(|sample| {
-                sample.ready == ready && sample.recorded_at.elapsed() < DEFICIT_TTL
+                sample.ready == ready && nabedra_rt::time::now_std().saturating_duration_since(sample.recorded_at) < DEFICIT_TTL
             })
         };
         let current = self.services.control.current(&self.services.scope).await?;
@@ -267,7 +267,7 @@ impl WorkerRuntime {
             .as_ref()
             .filter(|sample| {
                 sample.recorded_at == deficit.recorded_at
-                    && sample.recorded_at.elapsed() < DEFICIT_TTL
+                    && nabedra_rt::time::now_std().saturating_duration_since(sample.recorded_at) < DEFICIT_TTL
             })
             .map(|_| deficit);
         Ok((current, None))
@@ -425,7 +425,7 @@ impl OwnerLoop {
             return;
         }
         runtime.split_observation(source, id, "splitting", None);
-        let error = match tokio::time::timeout(
+        let error = match nabedra_rt::time::timeout(
             STEP_DEADLINE,
             runtime.split_with_placement(work.intent.clone(), work.placement.as_ref()),
         )
@@ -579,7 +579,7 @@ async fn select_work(
                         observed_committed_bytes: bytes,
                         required_bytes,
                         pools,
-                        recorded_at: Instant::now(),
+                        recorded_at: nabedra_rt::time::now_std(),
                     });
                 }
                 runtime.split_observation(
@@ -691,7 +691,7 @@ async fn settle(
     intent: &SplitIntent,
     authority: Authority,
 ) -> Result<Option<SplitResult>, ProtocolError> {
-    tokio::time::timeout(STEP_DEADLINE, async {
+    nabedra_rt::time::timeout(STEP_DEADLINE, async {
         let gate = runtime.gate(intent.split_id)?;
         let _actor = gate.lock().await;
         let current = runtime

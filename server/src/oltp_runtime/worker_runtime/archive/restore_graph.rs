@@ -49,7 +49,7 @@ struct SourceGroup {
 
 impl RestoreGraph {
     pub(super) fn new(shared: Arc<WorkerSharedResources>) -> Result<Self, ProtocolError> {
-        let path = std::env::temp_dir().join(format!("nabedra-restore-graph-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("nabedra-restore-graph-{}", nabedra_rt::ids::uuid_v4()));
         ensure_private_directory(&path)?;
         let graph = Self {
             path,

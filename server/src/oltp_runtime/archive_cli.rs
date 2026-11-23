@@ -135,7 +135,7 @@ pub async fn backup(
             crate::oltp::backup::BackupOwnerRef {
                 backup_id: previous
                     .as_ref()
-                    .map_or_else(uuid::Uuid::new_v4, |old| old.owner.backup_id),
+                    .map_or_else(nabedra_rt::ids::uuid_v4, |old| old.owner.backup_id),
                 attempt: previous
                     .as_ref()
                     .map_or(Some(1), |old| old.owner.attempt.checked_add(1))

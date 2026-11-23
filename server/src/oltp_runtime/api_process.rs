@@ -13,10 +13,8 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::{
-    net::TcpListener,
-    time::{Instant, timeout_at},
-};
+use nabedra_rt::time::timeout_at;
+use tokio::net::TcpListener;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -149,7 +147,7 @@ pub async fn run_api_configured(
         let _ = crate::supervisor::send(
             &mut channel,
             &serde_json::json!({"version":1,"type":"fatal","code":code}),
-            Instant::now() + Duration::from_secs(2),
+            nabedra_rt::time::now() + Duration::from_secs(2),
         )
         .await;
     }
@@ -161,7 +159,7 @@ async fn process(
     cold_start: bool,
     migrate_catalog: bool,
 ) -> Result<(), ProtocolError> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = nabedra_rt::time::now() + Duration::from_secs(30);
     let init: Init = serde_json::from_slice(
         &crate::supervisor::frame(channel, Some(deadline))
             .await

@@ -74,14 +74,14 @@ pub async fn run(path: PathBuf) -> Result<(), &'static str> {
         .map_err(|_| "automatic shard split startup failed")?;
     #[cfg(test)]
     if let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_ARCHIVE_SPLIT_INDEX") {
-        tokio::spawn(super::recovery_tests::build_archive_split_index(
+        nabedra_rt::task::spawn(super::recovery_tests::build_archive_split_index(
             runtime.clone(),
             directory.into(),
         ));
     }
     #[cfg(test)]
     if let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_INDEX_FAULT_DIR") {
-        tokio::spawn(super::recovery_tests::index_faults::serve(
+        nabedra_rt::task::spawn(super::recovery_tests::index_faults::serve(
             runtime.clone(),
             directory.into(),
         ));

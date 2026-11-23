@@ -2143,7 +2143,7 @@ pub(crate) fn request_raw_clone_bytes(bytes: &[u8]) -> Result<usize, ProtocolErr
     Ok(total)
 }
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
+    nabedra_rt::time::wall_now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
