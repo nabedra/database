@@ -10,5 +10,5 @@ lowest_regression = "server/kv/src/journal/sim_tests.rs::ns17_node_cut_releases_
 seed = 17
 why_not_caught = "Threaded shutdown drained the queue. The stepped journal tests had exercised publishing and clean shutdown without cutting a live service."
 invariant_added = "A dead stepped journal releases guards and settles queued or parked commits with RecoveryRequired without changing the published prefix or touching the filesystem."
-fix_commits = ["42f2d73d2f990408d0a8c34eb828cb6d5733e905"]
+fix_commits = ["5be0ee6856efc7d64107af062f200b6c18107fd8"]
 revert_patch_ok = false
