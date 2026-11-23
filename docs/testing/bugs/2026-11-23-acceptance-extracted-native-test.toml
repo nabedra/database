@@ -1,0 +1,14 @@
+id = "ACCEPTANCE-EXTRACTED-NATIVE-TEST"
+title = "OLTP acceptance searched only the server executable for extracted assertions"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G09"]
+scenarios = ["C07", "O05", "O13", "O22"]
+found_by = "acceptance"
+found_date = "2026-11-23"
+lowest_regression = "scripts/test_acceptance_oltp.py::EssentialRunnerTests::test_native_assertions_resolve_tests_moved_into_workspace_crates"
+seed = "unknown"
+why_not_caught = "The source split preserved the native assertions but the standalone acceptance harness searched only the server libtest executable."
+invariant_added = "Each requested native case resolves exactly once across the server, resources and transport test executables and executes before the process workload."
+fix_commits = ["636c8c52f4060ab4b95047943bc41fc0e3e031de"]
+revert_patch_ok = true

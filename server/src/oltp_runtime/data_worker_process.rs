@@ -24,7 +24,7 @@ use crate::{
         live::{InventoryPin, UsageSample, process_counters},
     },
     oltp_replication::{
-        TlsMaterial,
+        AppliedPeerDirectory, TlsMaterial,
         authority::{
             control::{
                 ControlClient, ControlReply, DataWorkerClient, DataWorkerIntent,
@@ -34,10 +34,7 @@ use crate::{
             status::{PartitionedStatus, StatusService, StatusTopology},
         },
         manager::{GroupPlacement, HostedGroupManager, RemotePlacementTarget, shard_split::SplitEndpoint},
-        multiplex::{
-            AppliedPeerDirectory, EndpointRegistry, Purpose, TransportConfig, WorkerClient,
-            WorkerTransport,
-        },
+        multiplex::{EndpointRegistry, Purpose, TransportConfig, WorkerClient, WorkerTransport},
         service_rpc::{StatusClient, TimestampClient},
         types::*,
     },
@@ -259,7 +256,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
     } else {
         None
     };
-    let listener = TcpListener::bind(node.bind)
+    let listener = nabedra_transport::backend::current().bind(node.bind)
         .await
         .map_err(|_| unavailable("data worker transport bind failed"))?;
     let http = TcpListener::bind(config.bind)

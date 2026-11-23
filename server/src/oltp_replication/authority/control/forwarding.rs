@@ -217,7 +217,7 @@ pub(crate) struct ForwardedControl {
     manager: Arc<HostedGroupManager>,
     local: ManagedControl,
     pins: Arc<BTreeSet<Digest>>,
-    directory: Option<Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
+    directory: Option<Arc<crate::oltp_replication::peer_directory::AppliedPeerDirectory>>,
     read_batch: read_batch::ReadBatch,
     _owner: Arc<ScratchLease>,
 }
@@ -254,7 +254,7 @@ impl ForwardedControl {
         manager: Arc<HostedGroupManager>,
         local: ManagedControl,
         pins: BTreeSet<Digest>,
-        directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+        directory: Arc<crate::oltp_replication::peer_directory::AppliedPeerDirectory>,
     ) -> Result<Arc<Self>, ProtocolError> {
         let mut forwarding = Self::new(manager, local, pins)?;
         Arc::get_mut(&mut forwarding).ok_or_else(invalid)?.directory = Some(directory);
@@ -356,7 +356,7 @@ impl ForwardedControl {
             return shared
                 .execute(ExecutionClass::Control, member.node_id, 0, move || {
                     let value = serde_json::from_slice(input.as_slice()).map_err(|_| invalid())?;
-                    Ok((value, received.scratch.clone()))
+                    Ok((value, received.scratch_lease()))
                 })
                 .await;
         }

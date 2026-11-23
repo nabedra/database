@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / 'scripts'), str(ROOT / 'orm/python/src')]
 from acceptance_nodes import announcement
 from acceptance_nabedra import child_pids, reaped
+from acceptance_oltp import run_native_assertions
 from nabedra import Database
 from nabedra._cli_config import protected_write
 from oltp_direct_cluster import Http, IDENTITY_FIELDS, Rf3Cluster, WORKERS, call, operation, write_json
@@ -1795,19 +1796,6 @@ def activation_boundary(test_executable):
             finally:
                 server.stop()
                 server.log.close()
-
-
-def run_native_assertions(test_executable, cases):
-    """Run exact production-library assertions and retain their libtest output."""
-    listed = subprocess.check_output([test_executable, '--list'], text=True, timeout=15)
-    names = [line.removesuffix(': test') for line in listed.splitlines() if line.endswith(': test')]
-    for case in cases:
-        name, = [name for name in names if name.rsplit('::', 1)[-1] == case]
-        result = subprocess.run([test_executable, '--exact', name, '--nocapture'],
-                                capture_output=True, text=True, timeout=90)
-        print(result.stdout, end='', flush=True)
-        print(result.stderr, end='', file=sys.stderr, flush=True)
-        assert result.returncode == 0 and 'test result: ok. 1 passed; 0 failed; 0 ignored;' in result.stdout, name
 
 
 @contextmanager

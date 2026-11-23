@@ -88,7 +88,7 @@ impl ServiceResponse {
                         .as_slice(),
                 )
                 .map_err(|_| invalid())?;
-                Ok((value, self.reply.scratch.clone()))
+                Ok((value, self.reply.scratch_lease()))
             })
             .await
     }
@@ -169,7 +169,7 @@ impl ServiceResponse {
             group: self.reply.group().clone(),
             method: self.method,
             digest: self.digest,
-            owner: self.reply.scratch.clone(),
+            owner: self.reply.scratch_lease(),
         })
     }
 }

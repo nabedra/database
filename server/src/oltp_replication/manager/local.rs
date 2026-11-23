@@ -26,7 +26,7 @@ use std::{
     process::{Command, Stdio},
     time::Duration,
 };
-use tokio::net::TcpListener;
+use nabedra_transport::backend::{self, Listener};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -85,8 +85,8 @@ pub(crate) struct LocalWorker {
     pub enrollment: WorkerEnrollment,
     pub operator: LocalOperatorPermit,
     pub transport: Arc<WorkerTransport>,
-    pub listener: TcpListener,
-    pub directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+    pub listener: Listener,
+    pub directory: Arc<crate::oltp_replication::peer_directory::AppliedPeerDirectory>,
     ownership: Arc<DirectoryOwner>,
 }
 impl LocalWorker {
@@ -125,7 +125,7 @@ impl LocalWorker {
             },
             shared.clone(),
         )?;
-        let listener = TcpListener::bind("127.0.0.1:0").await.map_err(storage)?;
+        let listener = backend::current().bind_endpoint("127.0.0.1:0").await.map_err(storage)?;
         let enrollment = WorkerEnrollment {
             worker_id: topology.worker_id,
             incarnation,
@@ -136,7 +136,7 @@ impl LocalWorker {
             enrollment_revision: topology.enrollment_revision,
         };
         let registry = Arc::new(EndpointRegistry::new(shared.clone()));
-        let directory = crate::oltp_replication::multiplex::AppliedPeerDirectory::from_bootstrap(
+        let directory = crate::oltp_replication::peer_directory::AppliedPeerDirectory::from_bootstrap(
             topology.group(GroupKind::Control)?,
             vec![enrollment.clone()],
             shared.clone(),

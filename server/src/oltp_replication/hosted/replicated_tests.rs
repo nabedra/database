@@ -4,8 +4,10 @@ use super::*;
 mod tls;
 use crate::oltp_replication::{
     multiplex::{
-        AppliedPeerDirectory, EndpointFuture, PeerDirectory, Purpose, REVOCATION_REFRESH,
-        REVOCATION_STALE_AFTER, RevocationSource, TransportConfig, TransportTrust, WorkerTransport,
+        EndpointFuture, PeerDirectory, Purpose, TransportConfig, TransportTrust, WorkerTransport,
+    },
+    peer_directory::{
+        AppliedPeerDirectory, REVOCATION_REFRESH, REVOCATION_STALE_AFTER, RevocationSource,
     },
     typed_network::{RECEIVED_APPENDS, ReplicaEndpoint, TypedNetworkFactory},
     types::{Digest, WorkerEnrollment, WorkerIdentity},
