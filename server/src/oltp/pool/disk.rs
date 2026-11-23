@@ -28,8 +28,13 @@ struct Budget {
     protected_bytes: u64,
 }
 
-#[derive(Default)]
-struct Filesystem(Mutex<Budget>);
+struct Filesystem {
+    accounting: Mutex<Budget>,
+    // Reserve the allocation used as the registry key as long as a pool
+    // or reservation owns this budget, even after the World drops.
+    #[cfg(feature = "sim")]
+    _world: Option<Weak<nabedra_rt::sim::World>>,
+}
 
 impl Filesystem {
     fn reserve(
@@ -37,7 +42,7 @@ impl Filesystem {
         bytes: u64,
         sample: impl FnOnce() -> std::io::Result<u64>,
     ) -> Result<DiskReservation, ProtocolError> {
-        let mut budget = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut budget = self.accounting.lock().unwrap_or_else(|p| p.into_inner());
         // Read free space under the same lock as admission and release. A
         // sample taken before a release could miss the completed write.
         let available = sample().map_err(|_| refused())?;
@@ -56,6 +61,11 @@ impl Filesystem {
         })
     }
 }
+
+#[cfg(not(feature = "sim"))]
+type BudgetKey = u64;
+#[cfg(feature = "sim")]
+type BudgetKey = (usize, Option<u64>, u64);
 
 pub(super) struct PoolDisk {
     device: u64,
@@ -105,20 +115,37 @@ impl PoolDisk {
         let device = directory.metadata().map_err(|_| refused())?.dev();
         #[cfg(not(unix))]
         let device = 0;
-        static BUDGETS: OnceLock<Mutex<HashMap<u64, Weak<Filesystem>>>> = OnceLock::new();
+        static BUDGETS: OnceLock<Mutex<HashMap<BudgetKey, Weak<Filesystem>>>> = OnceLock::new();
         let mut budgets = BUDGETS
             .get_or_init(Mutex::default)
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         budgets.retain(|_, budget| budget.strong_count() != 0);
-        let slot = budgets.entry(device).or_default();
+        // Simulated nodes and parallel worlds may share the host device.
+        #[cfg(feature = "sim")]
+        let world = nabedra_rt::sim::world();
+        #[cfg(feature = "sim")]
+        let key = (
+            world
+                .as_ref()
+                .map_or(0, |world| Arc::as_ptr(world) as usize),
+            nabedra_rt::sim::current_node(),
+            device,
+        );
+        #[cfg(not(feature = "sim"))]
+        let key = device;
+        let slot = budgets.entry(key).or_default();
         let budget = slot.upgrade().unwrap_or_else(|| {
-            let budget = Arc::new(Filesystem::default());
+            let budget = Arc::new(Filesystem {
+                accounting: Mutex::default(),
+                #[cfg(feature = "sim")]
+                _world: world.as_ref().map(Arc::downgrade),
+            });
             *slot = Arc::downgrade(&budget);
             budget
         });
         budget
-            .0
+            .accounting
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .protected_bytes += segment_bytes * PROTECTED_SEGMENTS_PER_POOL;
@@ -142,7 +169,11 @@ impl PoolDisk {
     }
 
     pub(super) fn stats(&self) -> DiskReservationStats {
-        let budget = self.budget.0.lock().unwrap_or_else(|p| p.into_inner());
+        let budget = self
+            .budget
+            .accounting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         DiskReservationStats {
             device: self.device,
             available_bytes: available_bytes(&self.directory).ok(),
@@ -156,7 +187,7 @@ impl PoolDisk {
 impl Drop for PoolDisk {
     fn drop(&mut self) {
         self.budget
-            .0
+            .accounting
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .protected_bytes -= self.segment_bytes * PROTECTED_SEGMENTS_PER_POOL;
@@ -170,7 +201,11 @@ pub(crate) struct DiskReservation {
 
 impl Drop for DiskReservation {
     fn drop(&mut self) {
-        let mut budget = self.budget.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut budget = self
+            .budget
+            .accounting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         budget.reserved_bytes -= self.bytes;
         budget.reservations -= 1;
     }
@@ -216,10 +251,14 @@ mod tests {
         assert!(Arc::ptr_eq(&first.budget, &second.budget));
         let charge = proposal_charge(512, 2);
         let protected = first.stats().protected_bytes;
-        let filesystem = Arc::new(Filesystem(Mutex::new(Budget {
-            protected_bytes: protected,
-            ..Budget::default()
-        })));
+        let filesystem = Arc::new(Filesystem {
+            accounting: Mutex::new(Budget {
+                protected_bytes: protected,
+                ..Budget::default()
+            }),
+            #[cfg(feature = "sim")]
+            _world: None,
+        });
         let gate = Barrier::new(2);
         std::thread::scope(|scope| {
             let reserve = || {
@@ -245,5 +284,64 @@ mod tests {
             filesystem.reserve(charge, || Ok(protected)).err(),
             Some(refused())
         );
+    }
+
+    /// P10-DET: simulated nodes in one process never share a disk budget,
+    /// while pools of one node on one filesystem still do.
+    #[cfg(feature = "sim")]
+    #[test]
+    fn sim_nodes_have_separate_disk_budgets() {
+        let directory = std::env::temp_dir();
+        nabedra_rt::sim::run(7, |world| async move {
+            world.add_node(1, nabedra_rt::sim::NodeClock::default());
+            world.add_node(2, nabedra_rt::sim::NodeClock::default());
+            let open = |node| {
+                let directory = directory.clone();
+                world.spawn_node(
+                    node,
+                    async move { PoolDisk::open(&directory, 4096).unwrap() },
+                )
+            };
+            let (first, second, other) = (
+                open(1).await.unwrap(),
+                open(1).await.unwrap(),
+                open(2).await.unwrap(),
+            );
+            assert!(Arc::ptr_eq(&first.budget, &second.budget));
+            assert!(!Arc::ptr_eq(&first.budget, &other.budget));
+            assert_eq!(
+                first.stats().protected_bytes,
+                2 * 4096 * PROTECTED_SEGMENTS_PER_POOL
+            );
+            assert_eq!(
+                other.stats().protected_bytes,
+                4096 * PROTECTED_SEGMENTS_PER_POOL
+            );
+        });
+    }
+
+    #[cfg(feature = "sim")]
+    #[test]
+    fn sim_disk_budget_keeps_its_world_key_reserved() {
+        let open = || {
+            nabedra_rt::sim::run(7, |world| async move {
+                world.add_node(1, nabedra_rt::sim::NodeClock::default());
+                world
+                    .spawn_node(1, async {
+                        PoolDisk::open(&std::env::temp_dir(), 4096).unwrap()
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+        let first = open();
+        let world = first.budget._world.as_ref().expect("budget owns its key");
+        assert!(world.upgrade().is_none(), "budget must let the world drop");
+        let next = open();
+        assert_ne!(
+            world.as_ptr(),
+            next.budget._world.as_ref().unwrap().as_ptr()
+        );
+        assert!(!Arc::ptr_eq(&first.budget, &next.budget));
     }
 }
