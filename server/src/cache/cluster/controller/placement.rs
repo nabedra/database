@@ -139,8 +139,11 @@ impl Observations {
         for (index, slot) in topo.slots.iter().copied().enumerate() {
             let index = index as u16;
             if let Some(next) = placement.plan_slot(index, slot, &state.orders) {
+                let advances_ownership = next.epoch != slot.epoch;
+                #[cfg(feature = "sim")]
+                let advances_ownership = advances_ownership || next.primary != slot.primary;
                 let evidence = self.baseline(
-                    if next.epoch != slot.epoch {
+                    if advances_ownership {
                         next.primary
                     } else {
                         next.replica
@@ -299,7 +302,13 @@ fn valid_change(
                 .is_some_and(|moving| moving.replica_only && Some(moving.target) == next.replica);
     }
 
-    if old.epoch.checked_add(1) != Some(next.epoch) || next.cold || next.moving.is_some() {
+    let epoch_advances = old.epoch.checked_add(1) == Some(next.epoch);
+    #[cfg(feature = "sim")]
+    let epoch_advances = epoch_advances
+        || (old.primary != next.primary
+            && old.epoch == next.epoch
+            && super::super::sim::hooks::knobs().owner_change_keeps_epoch);
+    if !epoch_advances || next.cold || next.moving.is_some() {
         return false;
     }
     let Some(proof) = evidence else {
@@ -606,8 +615,17 @@ impl<'a> Placement<'a> {
         if let Some(replica) = replica {
             *self.replica_load.entry(replica.node).or_default() += 1;
         }
+        let epoch = slot.epoch.checked_add(1)?;
+        #[cfg(feature = "sim")]
+        let epoch = if slot.primary != Some(primary)
+            && super::super::sim::hooks::knobs().owner_change_keeps_epoch
+        {
+            slot.epoch
+        } else {
+            epoch
+        };
         Some(Slot {
-            epoch: slot.epoch.checked_add(1)?,
+            epoch,
             primary: Some(primary),
             replica,
             lease: Some(Lease {

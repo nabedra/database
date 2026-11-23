@@ -415,10 +415,13 @@ impl State {
             (usize::from(index), usize::from(index))
         });
         let scoped = &self.topology.slots[first..=last];
-        if scoped
+        let authority_is_live = scoped
             .iter()
-            .any(|slot| slot.lease.is_some_and(|lease| lower_ms < lease.expires_ms))
-        {
+            .any(|slot| slot.lease.is_some_and(|lease| lower_ms < lease.expires_ms));
+        #[cfg(feature = "sim")]
+        let authority_is_live =
+            authority_is_live && !super::super::sim::hooks::knobs().cold_reset_ignores_live_lease;
+        if authority_is_live {
             return Err("prior authority is still live");
         }
         if scoped.iter().any(|slot| slot.epoch == u64::MAX) {

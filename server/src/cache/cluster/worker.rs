@@ -2,6 +2,8 @@
 mod actor;
 #[cfg(all(test, feature = "sim"))]
 pub(in crate::cache::cluster) use actor::LeaseActorFixture;
+#[cfg(feature = "sim")]
+pub(in crate::cache::cluster) use actor::{SlotSample, lease_authorizes};
 mod peer;
 mod sync;
 
@@ -79,7 +81,7 @@ fn default_peer_connections() -> usize {
 }
 
 #[derive(Clone)]
-struct Worker {
+pub(super) struct Worker {
     shared: Arc<Shared>,
 }
 
@@ -93,12 +95,20 @@ struct Shared {
 }
 
 impl Worker {
-    fn topology(&self) -> Arc<Topology> {
+    pub(super) fn topology(&self) -> Arc<Topology> {
         Arc::clone(&self.shared.topology.read().expect("topology lock"))
     }
 
     fn set_topology(&self, topology: Arc<Topology>) {
+        #[cfg(feature = "sim")]
+        let (generation, revision) = (topology.generation, topology.revision);
         *self.shared.topology.write().expect("topology lock") = topology;
+        #[cfg(feature = "sim")]
+        super::sim::hooks::observe(super::sim::hooks::Observed::Installed {
+            worker: self.shared.id,
+            generation,
+            revision,
+        });
     }
 
     fn actor(&self, slot: u16) -> &ActorHandle {
@@ -278,6 +288,10 @@ fn spawn_actors(config: ActorConfig) -> io::Result<(Worker, Vec<std::thread::Joi
             }
         }
     }
+    Ok((with_actors(config, actors), threads))
+}
+
+fn with_actors(config: ActorConfig, actors: Vec<ActorHandle>) -> Worker {
     let shared = Shared {
         id: config.id,
         actors,
@@ -286,12 +300,9 @@ fn spawn_actors(config: ActorConfig) -> io::Result<(Worker, Vec<std::thread::Joi
         copy_handoffs: Arc::new(Semaphore::new(COPY_HANDOFFS)),
         output_limit: config.turns.reply_bytes,
     };
-    Ok((
-        Worker {
-            shared: Arc::new(shared),
-        },
-        threads,
-    ))
+    Worker {
+        shared: Arc::new(shared),
+    }
 }
 
 async fn serve(
@@ -326,5 +337,105 @@ async fn serve(
             }, std::future::pending()) => result,
         result = sync::control(background, tls.clone(), member, controllers, metrics_file) => result,
         result = sync::replicate(replicator, tls) => result,
+    }
+}
+
+#[cfg(feature = "sim")]
+pub(super) fn start_sim(
+    member: Member,
+    peer_socket: nabedra_rt::sim::net::SimListener,
+    tls: PeerTls,
+    controllers: BTreeMap<u64, Endpoint>,
+    clock: ClockMode,
+    actors: usize,
+    slot_bytes: usize,
+    eviction: EvictionPolicy,
+) -> io::Result<Worker> {
+    if !(1..=MAX_ACTORS).contains(&actors)
+        || !(MIB..=default_slot_bytes()).contains(&slot_bytes)
+        || !member.valid()
+        || !member.authenticates(tls.fingerprint)
+    {
+        return Err(invalid("invalid simulated cache worker configuration"));
+    }
+    let config = ActorConfig {
+        clock,
+        id: member.id,
+        count: actors,
+        slot_bytes,
+        primary_bytes: 4 * slot_bytes,
+        replica_bytes: 4 * slot_bytes,
+        journal_bytes: 4 * slot_bytes,
+        snapshot_bytes: 4 * slot_bytes,
+        turns: TurnLimits {
+            growth_bytes: 4 * MIB,
+            reply_bytes: 4 * MIB,
+        },
+        max_pending: 32,
+        eviction,
+    };
+    config.validate()?;
+    let handles = (0..config.count)
+        .map(|index| actor::spawn_sim(index, config))
+        .collect::<io::Result<_>>()?;
+    let worker = with_actors(config, handles);
+    let background = worker.clone();
+    let peers = worker.clone();
+    let replicator = worker.clone();
+    drop(nabedra_rt::task::spawn(async move {
+        let result = tokio::select! {
+            result = transport::serve(peer_socket, tls.clone(), default_peer_connections(), PEER_FRAME,
+                move |identity, request| {
+                    let peers = peers.clone();
+                    async move { peer::handle(&peers, identity, &request).await }
+                }, std::future::pending()) => result,
+            result = sync::control(background, tls.clone(), member, controllers, None) => result,
+            result = sync::replicate(replicator, tls) => result,
+        };
+        result.expect("simulated cache worker service");
+    }));
+    Ok(worker)
+}
+
+#[cfg(feature = "sim")]
+impl Worker {
+    pub(super) fn id(&self) -> WorkerId {
+        self.shared.id
+    }
+
+    pub(super) async fn sim_execute(&self, command: DataCommand) -> (Response, Option<u64>) {
+        // The current-thread world cannot change the topology between this sample
+        // and enqueueing the turn. The actor checks that epoch before serving it.
+        let epoch = command
+            .slot()
+            .ok()
+            .map(|slot| self.topology().slots[usize::from(slot)].epoch);
+        let reply = self.execute(command).await;
+        let served = if matches!(reply, Response::Error(_)) {
+            None
+        } else {
+            epoch
+        };
+        (reply, served)
+    }
+
+    pub(super) async fn sim_slot(&self, slot: u16) -> Option<SlotSample> {
+        let (reply, result) = oneshot::channel();
+        self.actor(slot)
+            .control
+            .try_send(actor::Control::Sample { slot, reply })
+            .ok()?;
+        nabedra_rt::time::timeout(std::time::Duration::from_millis(250), result)
+            .await
+            .ok()?
+            .ok()?
+    }
+
+    pub(super) async fn sim_progress(&self) -> Vec<super::protocol::Progress> {
+        sync::progress(self, false)
+            .await
+            .into_iter()
+            .flat_map(|report| report.slots)
+            .collect()
     }
 }
