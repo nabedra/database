@@ -76,12 +76,12 @@ use crate::cache::{BlockCache, CacheKey};
 use crate::crc;
 use crate::error::{Damage, Error, FileId, Result};
 use crate::fs::{Fs, FsFile};
-use crate::service::{Condvar, ServiceHandle};
 use crate::types::{Locator, MAX_SEQ, Seq};
 
 pub mod format;
 mod recovery;
 mod segment;
+pub(crate) mod service;
 mod writer;
 
 #[cfg(test)]
@@ -93,6 +93,7 @@ mod tests;
 
 use format::{BLOCK, RECORD_HEADER_LEN, RECORDS_START, RecordType};
 use segment::{FreeSeg, LiveSeg};
+use service::{Condvar, ServiceHandle};
 
 /// How durable a write must be before its commit completes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

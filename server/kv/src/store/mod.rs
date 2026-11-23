@@ -53,6 +53,7 @@ use crate::error::{Damage, DamageReason, Error, FileId, Result};
 use crate::fs::{Fs, FsLock};
 use crate::gc;
 use crate::iter::MergingIterator;
+use crate::journal::service::Condvar;
 pub use crate::journal::{Commit, Durability, JournalOptions};
 use crate::journal::{Journal, JournalSink, RecordKind};
 use crate::manifest::{
@@ -65,7 +66,6 @@ use crate::run::{
     DEFAULT_MAX_OPEN_RUNS, RunMeta, RunReadContext, RunStats, RunWriterOptions, TableCache,
     run_file_name,
 };
-use crate::service::Condvar;
 use crate::source::{InternalIterator, RangeTombstone};
 use crate::types::{Locator, Seq};
 use crate::version::{FileTracker, LevelOptions, MemEntry, RunFile, SuperVersion, Version};

@@ -21,7 +21,6 @@ pub mod memtable;
 pub mod quarantine;
 mod recovery;
 pub mod run;
-mod service;
 pub mod source;
 pub mod store;
 pub mod types;

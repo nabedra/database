@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
-use crate::service::Condvar;
+use crate::journal::service::Condvar;
 
 #[derive(Debug)]
 pub struct MemtableBudget {

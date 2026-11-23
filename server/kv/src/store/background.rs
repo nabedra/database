@@ -16,7 +16,7 @@ use nabedra_rt::task::{self, Step, Stepped};
 use nabedra_rt::time;
 
 use crate::error::Result;
-use crate::service::{Condvar, ServiceHandle};
+use crate::journal::service::{Condvar, ServiceHandle};
 
 /// Stack size of every thread `nabedra-kv` starts (`kv-flush`, `kv-compact`,
 /// `kv-journal`, `kv-journal-prep`). Set explicitly so `RUST_MIN_STACK` cannot change
@@ -131,7 +131,7 @@ impl Background {
                 },
             )?;
             #[cfg(not(feature = "sim"))]
-            let handle = crate::service::spawn_thread(name, stack_bytes, move || {
+            let handle = crate::journal::service::spawn_thread(name, stack_bytes, move || {
                 run(&shared, flush_thread)
             })?;
             lock(&background.threads).push(handle);

@@ -29,13 +29,13 @@ use std::time::{Duration, Instant};
 use nabedra_rt::task::{self, Step, Stepped};
 use nabedra_rt::time;
 
+#[cfg(feature = "sim")]
+use super::service::Condvar;
+use super::service::ServiceHandle;
 use crate::batch::WriteBatch;
 use crate::crc;
 use crate::error::{Error, Result};
 use crate::fs::FsFile;
-#[cfg(feature = "sim")]
-use crate::service::Condvar;
-use crate::service::ServiceHandle;
 use crate::types::{Locator, Seq};
 
 use super::format::{
@@ -359,7 +359,7 @@ impl Writer {
         );
         #[cfg(not(feature = "sim"))]
         let handle =
-            crate::service::spawn_thread("kv-journal", stack_bytes, move || self.run(&*sink));
+            super::service::spawn_thread("kv-journal", stack_bytes, move || self.run(&*sink));
         handle.map_err(segment::io)
     }
 
@@ -1042,7 +1042,7 @@ pub(super) fn spawn_preparer(shared: Arc<Shared>) -> Result<ServiceHandle> {
     #[cfg(feature = "sim")]
     let handle = task::spawn_stepped("kv-journal-prep", stack_bytes, PrepService { shared });
     #[cfg(not(feature = "sim"))]
-    let handle = crate::service::spawn_thread("kv-journal-prep", stack_bytes, move || {
+    let handle = super::service::spawn_thread("kv-journal-prep", stack_bytes, move || {
         prepare_loop(&shared)
     });
     handle.map_err(segment::io)
