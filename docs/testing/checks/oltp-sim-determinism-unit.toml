@@ -1,0 +1,23 @@
+id = "oltp-sim-determinism-unit"
+module = "oltp"
+kinds = ["U"]
+# Local runtime assertions only. The cluster harness owns scenario-level evidence.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+echo "Fault model: OLTP simulation ordering and disk-budget isolation"
+python3 scripts/testing/repeat_gate.py --features oltp,sim <<'JSON'
+[
+  {"id": "d10_sessions_close_in_lane_and_stream_order", "file": "server/src/oltp_replication/multiplex/transport/session.rs", "lang": "rust"},
+  {"id": "rd2_warm_refreshes_run_in_key_order", "file": "server/src/oltp_replication/service_rpc/grant_cache.rs", "lang": "rust"},
+  {"id": "o08_o13_o21_same_filesystem_reserves_once_and_releases", "file": "server/src/oltp/pool/disk.rs", "lang": "rust"},
+  {"id": "sim_nodes_have_separate_disk_budgets", "file": "server/src/oltp/pool/disk.rs", "lang": "rust"},
+  {"id": "sim_disk_budget_keeps_its_world_key_reserved", "file": "server/src/oltp/pool/disk.rs", "lang": "rust"}
+]
+JSON
+''']
+cwd = "."
+timeout_s = 1200
+needs = []
+result_parser = "exit-code"

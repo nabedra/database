@@ -466,9 +466,16 @@ enum CallError {
     Failed(RequestError),
 }
 
+// Closing sessions wakes tasks. In a simulation, visit waiters and peer
+// lanes in key order so those wakeups follow the same order on replay.
+#[cfg(feature = "sim")]
+type SessionMap<K, V> = std::collections::BTreeMap<K, V>;
+#[cfg(not(feature = "sim"))]
+type SessionMap<K, V> = HashMap<K, V>;
+
 struct Waiters {
     closed: bool,
-    streams: HashMap<u64, oneshot::Sender<Result<RawReply, RequestError>>>,
+    streams: SessionMap<u64, oneshot::Sender<Result<RawReply, RequestError>>>,
 }
 
 struct ClientSession {
@@ -514,7 +521,7 @@ impl ClientSession {
             outgoing,
             waiters: Mutex::new(Waiters {
                 closed: false,
-                streams: HashMap::new(),
+                streams: SessionMap::new(),
             }),
             closed,
             next: AtomicU64::new(1),
@@ -974,7 +981,7 @@ struct Slot {
 /// Caller-side sessions, keyed by peer worker, incarnation and lane.
 #[derive(Default)]
 pub(super) struct PeerSessions {
-    slots: Mutex<HashMap<(Uuid, Uuid, usize), Arc<Slot>>>,
+    slots: Mutex<SessionMap<(Uuid, Uuid, usize), Arc<Slot>>>,
     connections: AtomicU64,
 }
 impl Drop for PeerSessions {
@@ -2019,5 +2026,93 @@ mod tests {
             free.iter().all(|&n| n == 1),
             "the handler slot was held while its reply was written: {free:?}"
         );
+    }
+
+    /// Observe actual waiter wakeups in close_all and incarnation retirement.
+    #[cfg(feature = "sim")]
+    #[test]
+    fn d10_sessions_close_in_lane_and_stream_order() {
+        use std::{
+            future::Future,
+            task::{Wake, Waker},
+        };
+
+        struct RecordWake {
+            order: Arc<Mutex<Vec<(usize, u64)>>>,
+            key: (usize, u64),
+        }
+        impl Wake for RecordWake {
+            fn wake(self: Arc<Self>) {
+                lock(&self.order).push(self.key);
+            }
+        }
+
+        let peer = WorkerEnrollment {
+            worker_id: Uuid::from_u128(1),
+            incarnation: Uuid::from_u128(2),
+            certificate_sha256: Digest::from_bytes([7; 32]),
+            endpoint: "127.0.0.1:1".try_into().unwrap(),
+            server_name: "peer".try_into().unwrap(),
+            enrollment_revision: 1,
+        };
+        for retire in [false, true] {
+            let sessions = PeerSessions::default();
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let mut replies = Vec::new();
+            let mut expected = Vec::new();
+            for class in TrafficClass::ALL.into_iter().rev() {
+                let mut streams = SessionMap::new();
+                for stream in [9, 5, 1] {
+                    let (tx, mut rx) = oneshot::channel();
+                    let key = (class as usize, stream);
+                    let waker = Waker::from(Arc::new(RecordWake {
+                        order: order.clone(),
+                        key,
+                    }));
+                    assert!(
+                        Pin::new(&mut rx)
+                            .poll(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                    streams.insert(stream, tx);
+                    replies.push(rx);
+                    expected.push(key);
+                }
+                *lock(&sessions.slot(&peer, class).current) = Some(Arc::new(ClientSession {
+                    identity: WorkerIdentity::from(&peer),
+                    direct_admission: true,
+                    enrollment: peer.clone(),
+                    outgoing: mpsc::channel(1).0,
+                    waiters: Mutex::new(Waiters {
+                        closed: false,
+                        streams,
+                    }),
+                    closed: watch::channel(false).0,
+                    next: AtomicU64::new(10),
+                    reader: Mutex::new(None),
+                    received: Arc::new(AtomicU64::new(0)),
+                    silent_limit: Duration::from_secs(1),
+                    class,
+                }));
+            }
+            if retire {
+                let replacement = WorkerEnrollment {
+                    incarnation: Uuid::from_u128(3),
+                    enrollment_revision: 2,
+                    ..peer.clone()
+                };
+                sessions.slot(&replacement, TrafficClass::ApiIngress);
+            } else {
+                sessions.close_all();
+            }
+            expected.sort_unstable();
+            assert_eq!(*lock(&order), expected, "retire={retire}");
+            for mut reply in replies {
+                assert!(matches!(
+                    reply.try_recv(),
+                    Ok(Err(RequestError::Unreachable))
+                ));
+            }
+        }
     }
 }
