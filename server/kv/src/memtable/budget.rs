@@ -7,8 +7,10 @@
 //! budget is exhausted (a stall).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
+
+use crate::service::Condvar;
 
 #[derive(Debug)]
 pub struct MemtableBudget {
