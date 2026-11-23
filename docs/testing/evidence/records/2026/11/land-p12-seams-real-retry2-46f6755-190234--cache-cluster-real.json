@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p12-seams-real-retry2-46f6755-190234--cache-cluster-real.log",
+      "sha256": "7d3b173f09a211eb5d122788d9e0c89d4765ee214be3f2b3f8fb580c28f38221"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-cluster-real",
+  "duration_s": 297.326,
+  "guarantees": [
+    "CACHE-G05",
+    "CACHE-G06"
+  ],
+  "kind": "R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T18:04:01.790411+00:00",
+    "request_id": "land-p12-seams-real-retry2-46f6755-190234",
+    "runner": "GitHub Actions 1000007339",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45234097217"
+  },
+  "scenarios": [
+    "K03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "46f6755ebbc43361d0411edeb2fd400809d6ebfd",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
