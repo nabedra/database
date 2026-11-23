@@ -39,16 +39,37 @@
 //! successful sync does not make them durable. This is why the engine never retries a sync.
 //!
 //! Every call is appended to a log ([`FaultFs::calls`]) with its operation, path, offset,
-//! length and outcome, so tests can assert which syncs happened (NS15).
+//! length and outcome, so tests can assert which syncs happened (NS15). An optional
+//! observer ([`FaultFs::observe`]) sees each entry as it is logged.
+//!
+//! # Metadata
+//!
+//! A volume has a device id and an inode base ([`FaultFs::with_device`]). Every file and
+//! directory has an inode number (the base plus a per-volume counter), a permission mode
+//! (`0o600` for new files, `0o700` for new directories) and an owner ([`FaultFs::UID`]),
+//! all reported by [`FaultFs::stat`]. Inode numbers, modes and owners survive `kill`,
+//! `crash` and `power_loss` as last set: a mode or owner change is metadata that the
+//! model treats as durable at once. [`FaultFs::create_dir`] and [`FaultFs::remove_dir`]
+//! are pending directory operations, like renames, so a power loss keeps or drops them.
+//! There are no symlinks.
 //!
 //! The whole filesystem sits behind one `Mutex`; it is a test tool, not a fast path.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::{Fs, FsFile, FsLock, OpenMode};
+use super::{Fs, FsFile, FsKind, FsLock, FsStat, OpenMode};
+
+/// The mode of a file [`FaultFs`] creates.
+pub const DEFAULT_FILE_MODE: u32 = 0o600;
+/// The mode of a directory [`FaultFs`] creates.
+pub const DEFAULT_DIR_MODE: u32 = 0o700;
+
+/// Reports every logged call; see [`FaultFs::observe`].
+pub type FsObserver = Arc<dyn Fn(&FsCall) + Send + Sync>;
 
 /// Size of the unit a power loss keeps, drops or tears (the default [`PowerLoss`] unit).
 pub const POWER_LOSS_SECTOR: u64 = 512;
@@ -106,6 +127,11 @@ pub enum FsOp {
     SetLen,
     Len,
     AdviseDontNeed,
+    CreateDir,
+    RemoveDir,
+    RemoveDirAll,
+    SetMode,
+    Stat,
 }
 
 /// One logged call. `offset` and `len` are zero where they do not apply; for `Open`,
@@ -241,6 +267,19 @@ struct Inode {
     /// The smallest OS length since the last sync: bytes past it were truncated away.
     min_len: u64,
     open_handles: usize,
+    /// The inode number [`FaultFs::stat`] reports, before the volume's base is added.
+    number: u64,
+    /// Permission bits.
+    mode: u32,
+    uid: u32,
+}
+
+/// A directory's reported inode number (before the base), permission bits and owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirMeta {
+    ino: u64,
+    mode: u32,
+    uid: u32,
 }
 
 impl Inode {
@@ -352,30 +391,32 @@ fn sector_range(sector: u64, limit: usize) -> (usize, usize) {
 enum Effect {
     /// `Some(ino)` links `path` to `ino`; `None` unlinks it.
     File(PathBuf, Option<Ino>),
-    /// Creates or removes a directory.
-    Dir(PathBuf, bool),
+    /// `Some(meta)` creates a directory; `None` removes it.
+    Dir(PathBuf, Option<DirMeta>),
+    /// Moves an existing directory and its tree in the OS namespace.
+    MoveDir(PathBuf, PathBuf),
 }
 
 impl Effect {
     fn path(&self) -> &Path {
         match self {
-            Effect::File(path, _) | Effect::Dir(path, _) => path,
+            Effect::File(path, _) | Effect::Dir(path, _) | Effect::MoveDir(_, path) => path,
         }
     }
 }
 
-/// The directory entries of one layer.
+/// Directory entries in the OS layer, indexed by their current paths.
 #[derive(Clone, Debug, Default)]
 struct Namespace {
     files: BTreeMap<PathBuf, Ino>,
-    dirs: BTreeSet<PathBuf>,
+    dirs: BTreeMap<PathBuf, DirMeta>,
 }
 
 impl Namespace {
-    fn with_roots() -> Namespace {
+    fn with_roots(absolute: DirMeta, relative: DirMeta) -> Namespace {
         let mut ns = Namespace::default();
-        ns.dirs.insert(PathBuf::from("/"));
-        ns.dirs.insert(PathBuf::new());
+        ns.dirs.insert(PathBuf::from("/"), absolute);
+        ns.dirs.insert(PathBuf::new(), relative);
         ns
     }
 
@@ -387,28 +428,193 @@ impl Namespace {
             Effect::File(path, None) => {
                 self.files.remove(path);
             }
-            Effect::Dir(path, true) => {
-                self.dirs.insert(path.clone());
+            Effect::Dir(path, Some(meta)) => {
+                self.dirs.insert(path.clone(), *meta);
             }
-            Effect::Dir(path, false) => {
+            Effect::Dir(path, None) => {
                 self.dirs.remove(path);
+            }
+            Effect::MoveDir(from, to) => {
+                let reroot = |path: &Path| to.join(path.strip_prefix(from).expect("under from"));
+                let files: Vec<(PathBuf, Ino)> = self
+                    .files
+                    .extract_if(.., |path, _| path.starts_with(from))
+                    .collect();
+                let dirs: Vec<(PathBuf, DirMeta)> = self
+                    .dirs
+                    .extract_if(.., |path, _| path.starts_with(from))
+                    .collect();
+                for (path, ino) in files {
+                    self.files.insert(reroot(&path), ino);
+                }
+                for (path, meta) in dirs {
+                    self.dirs.insert(reroot(&path), meta);
+                }
             }
         }
     }
 
-    /// Drops entries whose ancestors are not all present.
-    fn prune_unreachable(&mut self) {
-        let mut dirs: Vec<PathBuf> = self.dirs.iter().cloned().collect();
-        // Shorter paths first, so a parent is decided before its children.
-        dirs.sort_by_key(|d| d.components().count());
-        let mut kept = BTreeSet::new();
-        for dir in dirs {
-            if is_root(&dir) || kept.contains(&parent(&dir)) {
-                kept.insert(dir);
+    /// Whether `dir` has any entry.
+    fn has_children(&self, dir: &Path) -> bool {
+        let child = |p: &PathBuf| p.parent() == Some(dir) && !is_root(p);
+        self.files.keys().any(child) || self.dirs.keys().any(child)
+    }
+}
+
+/// An entry belongs to a directory inode. Renaming that directory changes the path
+/// used to reach its contents, while a sync through either name covers the same entries.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct EntryKey {
+    parent: u64,
+    name: OsString,
+}
+
+impl EntryKey {
+    fn new(parent: u64, path: &Path) -> Self {
+        Self {
+            parent,
+            name: path
+                .components()
+                .next_back()
+                .expect("entry has a name")
+                .as_os_str()
+                .into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Entry {
+    File(Ino),
+    Dir(DirMeta),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Change {
+    Link(Entry),
+    UnlinkFile,
+    UnlinkDir(u64),
+}
+
+#[derive(Clone, Debug)]
+struct PendingEffect {
+    key: EntryKey,
+    change: Change,
+    /// A directory rename is one operation. The source participates in power-loss
+    /// dependencies, while syncing the target parent commits the move in this model.
+    source: Option<EntryKey>,
+}
+
+impl PendingEffect {
+    fn touches(&self) -> impl Iterator<Item = &EntryKey> {
+        std::iter::once(&self.key).chain(self.source.as_ref())
+    }
+
+    fn linked_dir(&self) -> Option<u64> {
+        match self.change {
+            Change::Link(Entry::Dir(meta)) => Some(meta.ino),
+            _ => None,
+        }
+    }
+}
+
+/// Synced directory contents, including entries synced before their parent was linked.
+#[derive(Clone, Debug, Default)]
+struct DurableNamespace {
+    entries: BTreeMap<u64, BTreeMap<OsString, Entry>>,
+    /// A directory has at most one durable name, even across independently synced parents.
+    dir_links: BTreeMap<u64, EntryKey>,
+}
+
+impl DurableNamespace {
+    fn apply(&mut self, effect: &PendingEffect) {
+        let key = &effect.key;
+        if let Some(number) = effect.linked_dir()
+            && let Some(old) = self.dir_links.insert(number, key.clone())
+        {
+            self.entries
+                .get_mut(&old.parent)
+                .expect("linked parent exists")
+                .remove(&old.name);
+        }
+
+        let entries = self.entries.entry(key.parent).or_default();
+        let previous = match effect.change {
+            Change::Link(entry) => entries.insert(key.name.clone(), entry),
+            Change::UnlinkFile if matches!(entries.get(&key.name), Some(Entry::File(_))) => {
+                entries.remove(&key.name)
+            }
+            Change::UnlinkDir(number) if matches!(entries.get(&key.name), Some(Entry::Dir(meta)) if meta.ino == number) => {
+                entries.remove(&key.name)
+            }
+            _ => None,
+        };
+        if let Some(Entry::Dir(meta)) = previous {
+            self.dir_links.remove(&meta.ino);
+        }
+    }
+
+    fn file_at(&self, path: &Path) -> Option<Ino> {
+        let mut components = path.components();
+        let mut dir = RELATIVE_ROOT_INO;
+        if path.is_absolute() {
+            components.next();
+            dir = ROOT_INO;
+        }
+        let mut components = components.peekable();
+        while let Some(component) = components.next() {
+            match self.entries.get(&dir)?.get(component.as_os_str())? {
+                Entry::Dir(meta) => dir = meta.ino,
+                Entry::File(ino) => return components.peek().is_none().then_some(*ino),
             }
         }
-        self.files.retain(|path, _| kept.contains(&parent(path)));
-        self.dirs = kept;
+        None
+    }
+
+    /// Rebuild the paths reachable from the two roots. BTreeMap keeps the same path
+    /// order as before, so a subsequent power loss sees the same file inode order.
+    fn image(&self, absolute: DirMeta, relative: DirMeta) -> Namespace {
+        let mut image = Namespace::with_roots(absolute, relative);
+        let mut dirs = vec![
+            (PathBuf::from("/"), absolute.ino),
+            (PathBuf::new(), relative.ino),
+        ];
+        while let Some((path, number)) = dirs.pop() {
+            if let Some(entries) = self.entries.get(&number) {
+                for (name, entry) in entries {
+                    let path = path.join(name);
+                    match entry {
+                        Entry::File(ino) => {
+                            image.files.insert(path, *ino);
+                        }
+                        Entry::Dir(meta) => {
+                            dirs.push((path.clone(), meta.ino));
+                            image.dirs.insert(path, *meta);
+                        }
+                    }
+                }
+            }
+        }
+        image
+    }
+
+    /// Keep contents reachable in the durable or OS layer, or through a pending
+    /// link that power loss could retain. Replaced, unreachable trees can be freed.
+    fn prune(&mut self, mut dirs: Vec<u64>) {
+        let mut reachable = BTreeSet::new();
+        while let Some(dir) = dirs.pop() {
+            if reachable.insert(dir)
+                && let Some(entries) = self.entries.get(&dir)
+            {
+                dirs.extend(entries.values().filter_map(|entry| match entry {
+                    Entry::Dir(meta) => Some(meta.ino),
+                    Entry::File(_) => None,
+                }));
+            }
+        }
+        self.entries.retain(|dir, _| reachable.contains(dir));
+        self.dir_links
+            .retain(|_, key| reachable.contains(&key.parent));
     }
 }
 
@@ -420,30 +626,131 @@ fn parent(path: &Path) -> PathBuf {
     path.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
+#[derive(Default)]
+struct Observer(Option<FsObserver>);
+
+impl std::fmt::Debug for Observer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Some(..)" } else { "None" })
+    }
+}
+
 #[derive(Debug, Default)]
 struct State {
     inodes: BTreeMap<Ino, Inode>,
+    /// The next internal key in `inodes`.
     next_ino: Ino,
+    /// The next reported inode number, shared by files and directories and reported as
+    /// `ino_base + number`.
+    next_number: u64,
+    dev: u64,
+    ino_base: u64,
     os: Namespace,
-    durable: Namespace,
+    durable: DurableNamespace,
     /// Directory operations not yet covered by `sync_dir`, oldest first. Each inner list
     /// is one atomic operation (a rename unlinks and links together).
-    pending: Vec<Vec<Effect>>,
-    locks: BTreeSet<PathBuf>,
+    pending: Vec<Vec<PendingEffect>>,
+    locks: BTreeSet<Ino>,
     faults: Vec<Fault>,
     mutating_ops: u64,
     crash_after: Option<u64>,
     crashed: bool,
     calls: Vec<FsCall>,
+    observer: Observer,
 }
+
+/// The root directory's inode number (as on ext4, before the base is added).
+const ROOT_INO: u64 = 2;
+// FaultFs already has separate namespaces for absolute and relative paths.
+const RELATIVE_ROOT_INO: u64 = 1;
 
 impl State {
     fn fresh() -> State {
+        State::fresh_on(0, 0)
+    }
+
+    /// An empty volume on device `dev` whose inode numbers start after `ino_base`.
+    fn fresh_on(dev: u64, ino_base: u64) -> State {
+        let root = DirMeta {
+            ino: ROOT_INO,
+            mode: 0o755,
+            uid: FaultFs::UID,
+        };
         State {
-            os: Namespace::with_roots(),
-            durable: Namespace::with_roots(),
+            os: Namespace::with_roots(
+                root,
+                DirMeta {
+                    ino: RELATIVE_ROOT_INO,
+                    ..root
+                },
+            ),
+            next_number: ROOT_INO + 1,
+            dev,
+            ino_base,
             ..State::default()
         }
+    }
+
+    fn new_number(&mut self) -> u64 {
+        let number = self.next_number;
+        self.next_number += 1;
+        number
+    }
+
+    fn new_dir_meta(&mut self) -> DirMeta {
+        let ino = self.new_number();
+        DirMeta {
+            ino,
+            mode: DEFAULT_DIR_MODE,
+            uid: FaultFs::UID,
+        }
+    }
+
+    /// Runs `f` on every copy of the directory metadata with inode `ino`: in both
+    /// namespaces and in pending operations.
+    fn update_dir_meta(&mut self, ino: u64, f: impl Fn(&mut DirMeta)) {
+        for meta in self.os.dirs.values_mut().filter(|meta| meta.ino == ino) {
+            f(meta);
+        }
+        if let Some(key) = self.durable.dir_links.get(&ino)
+            && let Some(Entry::Dir(meta)) = self
+                .durable
+                .entries
+                .get_mut(&key.parent)
+                .and_then(|entries| entries.get_mut(&key.name))
+        {
+            f(meta);
+        }
+        for effect in self.pending.iter_mut().flatten() {
+            if let Change::Link(Entry::Dir(meta)) = &mut effect.change
+                && meta.ino == ino
+            {
+                f(meta);
+            }
+        }
+    }
+
+    /// `rename` of the directory `from` (admitted already): onto a missing path or an
+    /// empty directory, never into itself.
+    fn rename_dir(&mut self, from: &Path, to: &Path) -> io::Result<()> {
+        self.require_dir(&parent(to))?;
+        if self.os.files.contains_key(to) {
+            return Err(io::ErrorKind::NotADirectory.into());
+        }
+        if to.starts_with(from) {
+            if from == to {
+                return Ok(());
+            }
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        if self.os.dirs.contains_key(to) && self.os.has_children(to) {
+            return Err(io::ErrorKind::DirectoryNotEmpty.into());
+        }
+        if is_root(to) {
+            return Err(io::ErrorKind::ResourceBusy.into());
+        }
+        self.record(vec![Effect::MoveDir(from.to_path_buf(), to.to_path_buf())]);
+        Ok(())
     }
 
     /// Runs the crash and fault checks for one call. On `Err` the call must have no effect.
@@ -490,26 +797,100 @@ impl State {
         len: u64,
         ok: bool,
     ) {
-        self.calls.push(FsCall {
+        let call = FsCall {
             op,
             path: path.to_path_buf(),
             target: target.map(Path::to_path_buf),
             offset,
             len,
             ok,
-        });
+        };
+        if let Some(observer) = &self.observer.0 {
+            observer(&call);
+        }
+        self.calls.push(call);
+    }
+
+    fn entry_key(&self, path: &Path) -> EntryKey {
+        EntryKey::new(self.os.dirs[&parent(path)].ino, path)
     }
 
     fn record(&mut self, effects: Vec<Effect>) {
-        for effect in &effects {
-            self.os.apply(effect);
+        let mut pending = Vec::with_capacity(effects.len());
+        for effect in effects {
+            let (change, source) = match &effect {
+                Effect::File(_, Some(ino)) => (Change::Link(Entry::File(*ino)), None),
+                Effect::File(_, None) => (Change::UnlinkFile, None),
+                Effect::Dir(_, Some(meta)) => (Change::Link(Entry::Dir(*meta)), None),
+                Effect::Dir(path, None) => (Change::UnlinkDir(self.os.dirs[path].ino), None),
+                Effect::MoveDir(from, _) => (
+                    Change::Link(Entry::Dir(self.os.dirs[from])),
+                    Some(self.entry_key(from)),
+                ),
+            };
+            pending.push(PendingEffect {
+                key: self.entry_key(effect.path()),
+                change,
+                source,
+            });
+            self.os.apply(&effect);
         }
-        self.pending.push(effects);
+        self.pending.push(pending);
+    }
+
+    fn sync_entries(&mut self, dir: u64) {
+        let Self {
+            pending,
+            durable,
+            os,
+            ..
+        } = self;
+        // A later synced name supersedes earlier, unsynced links for the same directory.
+        // They must never replay and move the directory back to an older name.
+        let mut synced_links = BTreeMap::new();
+        for (index, effect) in pending.iter().enumerate().flat_map(|(index, op)| {
+            op.iter()
+                .filter(move |effect| effect.key.parent == dir)
+                .map(move |effect| (index, effect))
+        }) {
+            if let Some(number) = effect.linked_dir() {
+                synced_links.insert(number, index);
+            }
+        }
+
+        for (index, op) in pending.iter_mut().enumerate() {
+            op.retain(|effect| {
+                if effect.key.parent == dir {
+                    durable.apply(effect);
+                    false
+                } else {
+                    effect
+                        .linked_dir()
+                        .and_then(|number| synced_links.get(&number))
+                        .is_none_or(|&synced_at| synced_at <= index)
+                }
+            });
+        }
+        pending.retain(|op| !op.is_empty());
+        let mut dirs: Vec<_> = os.dirs.values().map(|meta| meta.ino).collect();
+        dirs.extend(
+            pending
+                .iter()
+                .flatten()
+                .filter_map(PendingEffect::linked_dir),
+        );
+        durable.prune(dirs);
+    }
+
+    fn durable_image(&self, durable: &DurableNamespace) -> Namespace {
+        durable.image(self.os.dirs[Path::new("/")], self.os.dirs[Path::new("")])
     }
 
     fn require_dir(&self, dir: &Path) -> io::Result<()> {
-        if self.os.dirs.contains(dir) {
+        if self.os.dirs.contains_key(dir) {
             Ok(())
+        } else if self.os.files.contains_key(dir) {
+            Err(io::ErrorKind::NotADirectory.into())
         } else {
             Err(not_found())
         }
@@ -518,36 +899,117 @@ impl State {
     fn new_inode(&mut self) -> Ino {
         let ino = self.next_ino;
         self.next_ino += 1;
-        self.inodes.insert(ino, Inode::default());
+        let number = self.new_number();
+        self.inodes.insert(
+            ino,
+            Inode {
+                number,
+                mode: DEFAULT_FILE_MODE,
+                uid: FaultFs::UID,
+                ..Inode::default()
+            },
+        );
         ino
+    }
+
+    fn stat(&self, path: &Path) -> io::Result<FsStat> {
+        if let Some(&ino) = self.os.files.get(path) {
+            let inode = &self.inodes[&ino];
+            let nlink = self.os.files.values().filter(|&&i| i == ino).count() as u64;
+            return Ok(FsStat {
+                kind: FsKind::File,
+                len: inode.os.len() as u64,
+                dev: self.dev,
+                ino: self.ino_base + inode.number,
+                nlink,
+                mode: inode.mode,
+                uid: inode.uid,
+            });
+        }
+        let meta = self.os.dirs.get(path).ok_or_else(not_found)?;
+        let subdirs = self
+            .os
+            .dirs
+            .keys()
+            .filter(|d| d.parent() == Some(path) && !is_root(d))
+            .count() as u64;
+        Ok(FsStat {
+            kind: FsKind::Dir,
+            len: 4096,
+            dev: self.dev,
+            ino: self.ino_base + meta.ino,
+            nlink: 2 + subdirs,
+            mode: meta.mode,
+            uid: meta.uid,
+        })
+    }
+
+    /// Changes the mode or owner of the file or directory at `path`.
+    fn set_meta(&mut self, path: &Path, mode: Option<u32>, uid: Option<u32>) -> io::Result<()> {
+        if let Some(&ino) = self.os.files.get(path) {
+            let inode = self.inodes.get_mut(&ino).expect("linked inode exists");
+            inode.mode = mode.unwrap_or(inode.mode);
+            inode.uid = uid.unwrap_or(inode.uid);
+            return Ok(());
+        }
+        let ino = self.os.dirs.get(path).ok_or_else(not_found)?.ino;
+        self.update_dir_meta(ino, |meta| {
+            meta.mode = mode.unwrap_or(meta.mode);
+            meta.uid = uid.unwrap_or(meta.uid);
+        });
+        Ok(())
     }
 
     /// Frees inodes that no namespace, pending operation or open handle can reach.
     fn collect_garbage(&mut self) {
         let mut live: BTreeSet<Ino> = self.os.files.values().copied().collect();
-        live.extend(self.durable.files.values().copied());
-        for op in &self.pending {
-            for effect in op {
-                if let Effect::File(_, Some(ino)) = effect {
-                    live.insert(*ino);
-                }
+        live.extend(
+            self.durable
+                .entries
+                .values()
+                .flat_map(|entries| entries.values())
+                .filter_map(|entry| {
+                    if let Entry::File(ino) = entry {
+                        Some(*ino)
+                    } else {
+                        None
+                    }
+                }),
+        );
+        for effect in self.pending.iter().flatten() {
+            if let Change::Link(Entry::File(ino)) = effect.change {
+                live.insert(ino);
             }
         }
+        live.extend(&self.locks);
         self.inodes
             .retain(|ino, inode| inode.open_handles > 0 || live.contains(ino));
     }
 
-    /// A new, independent filesystem from a namespace and per-inode bytes (both layers set
-    /// to the given bytes, so the new state is fully durable).
-    fn rebuilt(mut ns: Namespace, mut bytes_of: impl FnMut(Ino) -> Vec<u8>) -> State {
-        ns.prune_unreachable();
-        let mut state = State::fresh();
-        state.os.dirs = ns.dirs.clone();
-        state.durable.dirs = ns.dirs;
+    /// A new, independent filesystem on the same device from a namespace and per-inode
+    /// bytes (both layers set to the given bytes, so the new state is fully durable).
+    /// Inode numbers, modes and owners are kept.
+    fn rebuilt(&self, ns: Namespace, mut bytes_of: impl FnMut(Ino) -> Vec<u8>) -> State {
+        let mut state = State::fresh_on(self.dev, self.ino_base);
+        state.next_number = self.next_number;
+        state.os.dirs = ns.dirs;
+        for (path, &meta) in &state.os.dirs {
+            if !is_root(path) {
+                state.durable.apply(&PendingEffect {
+                    key: state.entry_key(path),
+                    change: Change::Link(Entry::Dir(meta)),
+                    source: None,
+                });
+            }
+        }
+        // Internal keys are renumbered in path order, as before metadata existed, so the
+        // inode order a later power loss walks (and with it every seeded outcome) is
+        // unchanged. The reported inode numbers are kept.
         let mut renumber = BTreeMap::new();
         for (path, old) in ns.files {
             let ino = *renumber.entry(old).or_insert_with(|| {
                 let bytes = bytes_of(old);
+                let source = &self.inodes[&old];
                 let ino = state.next_ino;
                 state.next_ino += 1;
                 state.inodes.insert(
@@ -556,13 +1018,20 @@ impl State {
                         min_len: bytes.len() as u64,
                         os: bytes.clone(),
                         durable: bytes,
+                        number: source.number,
+                        mode: source.mode,
+                        uid: source.uid,
                         ..Inode::default()
                     },
                 );
                 ino
             });
-            state.os.files.insert(path.clone(), ino);
-            state.durable.files.insert(path, ino);
+            state.durable.apply(&PendingEffect {
+                key: state.entry_key(&path),
+                change: Change::Link(Entry::File(ino)),
+                source: None,
+            });
+            state.os.files.insert(path, ino);
         }
         state
     }
@@ -589,9 +1058,38 @@ impl Default for FaultFs {
 }
 
 impl FaultFs {
-    /// An empty filesystem whose root (`/`) exists and is durable.
+    /// The owner of every file and directory a [`FaultFs`] creates, and the effective uid
+    /// of a simulated process.
+    pub const UID: u32 = 1000;
+
+    /// An empty filesystem whose root (`/`) exists and is durable, on device 0 with
+    /// inode base 0.
     pub fn new() -> FaultFs {
         FaultFs::from_state(State::fresh())
+    }
+
+    /// An empty filesystem on device `dev` whose inode numbers are `ino_base` plus a
+    /// per-volume counter. [`FaultFs::kill`], [`FaultFs::crash`] and the power-loss images
+    /// keep both, as the same disk would.
+    pub fn with_device(dev: u64, ino_base: u64) -> FaultFs {
+        FaultFs::from_state(State::fresh_on(dev, ino_base))
+    }
+
+    /// The device id every [`FaultFs::stat`] reports.
+    pub fn device(&self) -> u64 {
+        self.state().dev
+    }
+
+    /// The inode base given to [`FaultFs::with_device`].
+    pub fn ino_base(&self) -> u64 {
+        self.state().ino_base
+    }
+
+    /// Calls `observer` with every call log entry as it is logged, in order (for a trace
+    /// hash). The observer runs under the filesystem's lock, so it must not call back into
+    /// this filesystem. Images made by `kill`, `crash` and `power_loss` start without one.
+    pub fn observe(&self, observer: FsObserver) {
+        self.state().observer = Observer(Some(observer));
     }
 
     fn from_state(state: State) -> FaultFs {
@@ -608,10 +1106,17 @@ impl FaultFs {
     /// For test setup.
     pub fn create_dir_all_durable(&self, dir: &Path) {
         let mut state = self.state();
-        for ancestor in dir.ancestors() {
-            if !is_root(ancestor) {
-                state.os.dirs.insert(ancestor.to_path_buf());
-                state.durable.dirs.insert(ancestor.to_path_buf());
+        let ancestors: Vec<&Path> = dir.ancestors().filter(|a| !is_root(a)).collect();
+        for ancestor in ancestors.into_iter().rev() {
+            if !state.os.dirs.contains_key(ancestor) {
+                let meta = state.new_dir_meta();
+                let key = state.entry_key(ancestor);
+                state.os.dirs.insert(ancestor.to_path_buf(), meta);
+                state.durable.apply(&PendingEffect {
+                    key,
+                    change: Change::Link(Entry::Dir(meta)),
+                    source: None,
+                });
             }
         }
     }
@@ -621,11 +1126,12 @@ impl FaultFs {
     /// Locks, faults, the counter and the call log start empty.
     pub fn kill(&self) -> FaultFs {
         let state = self.state();
-        let mut next = State::fresh();
+        let mut next = State::fresh_on(state.dev, state.ino_base);
         next.os = state.os.clone();
         next.durable = state.durable.clone();
         next.pending = state.pending.clone();
         next.next_ino = state.next_ino;
+        next.next_number = state.next_number;
         next.inodes = state
             .inodes
             .iter()
@@ -646,8 +1152,8 @@ impl FaultFs {
     /// Crash with no luck at all: a new filesystem holding only durable state.
     pub fn crash(&self) -> FaultFs {
         let state = self.state();
-        let ns = state.durable.clone();
-        FaultFs::from_state(State::rebuilt(ns, |ino| state.inodes[&ino].durable.clone()))
+        let ns = state.durable_image(&state.durable);
+        FaultFs::from_state(state.rebuilt(ns, |ino| state.inodes[&ino].durable.clone()))
     }
 
     /// Power loss: durable state plus, independently for each unsynced sector and each
@@ -666,19 +1172,21 @@ impl FaultFs {
         );
         let state = self.state();
         let mut rng = SplitMix(seed);
-        let mut ns = state.durable.clone();
-        // Paths a lost operation linked or unlinked: a later operation naming one of them
-        // depends on it and is lost too.
-        let mut lost: BTreeSet<&Path> = BTreeSet::new();
+        let mut durable = state.durable.clone();
+        // Entries a lost operation linked or unlinked: a later operation naming one of them
+        // in the same directory inode depends on it and is lost too.
+        let mut lost: BTreeSet<&EntryKey> = BTreeSet::new();
         for op in &state.pending {
             let coin = rng.below(2) == 0;
-            let depends = op.iter().any(|effect| lost.contains(effect.path()));
+            let depends = op
+                .iter()
+                .any(|effect| effect.touches().any(|path| lost.contains(path)));
             if coin && !depends {
                 for effect in op {
-                    ns.apply(effect);
+                    durable.apply(effect);
                 }
             } else {
-                lost.extend(op.iter().map(Effect::path));
+                lost.extend(op.iter().flat_map(PendingEffect::touches));
             }
         }
         // Decide every inode's bytes in inode order, so the result depends only on the seed.
@@ -687,7 +1195,7 @@ impl FaultFs {
             .iter()
             .map(|(&ino, inode)| (ino, inode.after_power_loss(&mut rng, mode)))
             .collect();
-        FaultFs::from_state(State::rebuilt(ns, |ino| bytes[&ino].clone()))
+        FaultFs::from_state(state.rebuilt(state.durable_image(&durable), |ino| bytes[&ino].clone()))
     }
 
     /// Adds a fault rule.
@@ -723,8 +1231,10 @@ impl FaultFs {
 
     /// Mutating operations admitted so far, including ones an injected fault then failed:
     /// writes, syncs (file and directory), renames, removals, `create_dir_all`,
+    /// `create_dir`, `remove_dir`, each entry `remove_dir_all` removes, `set_mode`,
     /// `preallocate`, `set_len`, `open` with [`OpenMode::CreateNew`], and `lock` when it
-    /// creates the lock file. Reads, `len`, `exists`, `list` and other opens do not count.
+    /// creates the lock file. Reads, `len`, `exists`, `list`, `stat` and other opens do
+    /// not count.
     pub fn mutating_ops(&self) -> u64 {
         self.state().mutating_ops
     }
@@ -734,8 +1244,8 @@ impl FaultFs {
         assert!(bit < 8, "bit must be 0..8");
         let mut state = self.state();
         let mut inos: Vec<Ino> = Vec::new();
-        inos.extend(state.os.files.get(path));
-        inos.extend(state.durable.files.get(path));
+        inos.extend(state.os.files.get(path).copied());
+        inos.extend(state.durable.file_at(path));
         inos.dedup();
         if inos.is_empty() {
             return Err(not_found());
@@ -770,8 +1280,8 @@ impl FaultFs {
     /// The durable bytes of the file the durable namespace links at `path`, if any.
     pub fn durable_contents(&self, path: &Path) -> Option<Vec<u8>> {
         let state = self.state();
-        let ino = state.durable.files.get(path)?;
-        Some(state.inodes[ino].durable.clone())
+        let ino = state.durable.file_at(path)?;
+        Some(state.inodes[&ino].durable.clone())
     }
 
     /// Every call so far, oldest first.
@@ -781,6 +1291,116 @@ impl FaultFs {
 
     pub fn clear_calls(&self) {
         self.state().calls.clear();
+    }
+
+    /// Creates the directory `dir` (mode `0o700`), as `mkdir`: `AlreadyExists` if the path
+    /// exists, `NotFound` if its parent does not. A pending directory operation until its
+    /// parent is synced.
+    pub fn create_dir(&self, dir: &Path) -> io::Result<()> {
+        let mut state = self.state();
+        let result = (|| {
+            state.admit(FsOp::CreateDir, dir, true)?;
+            if state.os.files.contains_key(dir) || state.os.dirs.contains_key(dir) {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            state.require_dir(&parent(dir))?;
+            let meta = state.new_dir_meta();
+            state.record(vec![Effect::Dir(dir.to_path_buf(), Some(meta))]);
+            Ok(())
+        })();
+        state.log(FsOp::CreateDir, dir, None, 0, 0, result.is_ok());
+        result
+    }
+
+    /// Removes the empty directory `dir`, as `rmdir`: `DirectoryNotEmpty`, `NotADirectory`
+    /// for a file, `NotFound`. A pending directory operation until its parent is synced.
+    pub fn remove_dir(&self, dir: &Path) -> io::Result<()> {
+        let mut state = self.state();
+        let result = (|| {
+            state.admit(FsOp::RemoveDir, dir, true)?;
+            state.require_dir(dir)?;
+            if is_root(dir) {
+                return Err(io::ErrorKind::ResourceBusy.into());
+            }
+            if state.os.has_children(dir) {
+                return Err(io::ErrorKind::DirectoryNotEmpty.into());
+            }
+            state.record(vec![Effect::Dir(dir.to_path_buf(), None)]);
+            Ok(())
+        })();
+        state.log(FsOp::RemoveDir, dir, None, 0, 0, result.is_ok());
+        result
+    }
+
+    /// Removes `dir` and everything under it, as `std::fs::remove_dir_all`: one unlink or
+    /// `rmdir` per entry, deepest first, each a pending directory operation and each
+    /// counted as a mutating operation, so a crash can stop it part way.
+    pub fn remove_dir_all(&self, dir: &Path) -> io::Result<()> {
+        let mut state = self.state();
+        let result = (|| {
+            state.admit(FsOp::RemoveDirAll, dir, false)?;
+            state.require_dir(dir)?;
+            if is_root(dir) {
+                return Err(io::ErrorKind::ResourceBusy.into());
+            }
+            let mut entries: Vec<Effect> = state
+                .os
+                .files
+                .keys()
+                .filter(|p| p.starts_with(dir))
+                .map(|p| Effect::File(p.clone(), None))
+                .collect();
+            let mut dirs: Vec<PathBuf> = state
+                .os
+                .dirs
+                .keys()
+                .filter(|d| d.starts_with(dir))
+                .cloned()
+                .collect();
+            dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+            entries.extend(dirs.into_iter().map(|d| Effect::Dir(d, None)));
+            for effect in entries {
+                state.admit(FsOp::RemoveDirAll, effect.path(), true)?;
+                state.record(vec![effect]);
+            }
+            state.collect_garbage();
+            Ok(())
+        })();
+        state.log(FsOp::RemoveDirAll, dir, None, 0, 0, result.is_ok());
+        result
+    }
+
+    /// Sets the permission bits of the file or directory at `path` (`chmod`).
+    pub fn set_mode(&self, path: &Path, mode: u32) -> io::Result<()> {
+        let mut state = self.state();
+        let result = state
+            .admit(FsOp::SetMode, path, true)
+            .and_then(|()| state.set_meta(path, Some(mode & 0o7777), None));
+        state.log(
+            FsOp::SetMode,
+            path,
+            None,
+            0,
+            u64::from(mode),
+            result.is_ok(),
+        );
+        result
+    }
+
+    /// Changes the owner of the file or directory at `path`, without logging or counting.
+    /// For test setup (a directory another user owns).
+    pub fn set_owner(&self, path: &Path, uid: u32) -> io::Result<()> {
+        self.state().set_meta(path, None, Some(uid))
+    }
+
+    /// The metadata of the file or directory at `path` (`lstat`; there are no symlinks).
+    pub fn stat(&self, path: &Path) -> io::Result<FsStat> {
+        let mut state = self.state();
+        let result = state
+            .admit(FsOp::Stat, path, false)
+            .and_then(|()| state.stat(path));
+        state.log(FsOp::Stat, path, None, 0, 0, result.is_ok());
+        result
     }
 }
 
@@ -807,7 +1427,7 @@ impl Fs for FaultFs {
                 }
                 OpenMode::CreateNew => {
                     state.require_dir(&parent(path))?;
-                    if state.os.files.contains_key(path) || state.os.dirs.contains(path) {
+                    if state.os.files.contains_key(path) || state.os.dirs.contains_key(path) {
                         return Err(io::ErrorKind::AlreadyExists.into());
                     }
                     let ino = state.new_inode();
@@ -836,9 +1456,12 @@ impl Fs for FaultFs {
         let mut state = self.state();
         let result = (|| {
             state.admit(FsOp::Rename, from, true)?;
+            if state.os.dirs.contains_key(from) && !is_root(from) {
+                return state.rename_dir(from, to);
+            }
             let ino = *state.os.files.get(from).ok_or_else(not_found)?;
             state.require_dir(&parent(to))?;
-            if state.os.dirs.contains(to) {
+            if state.os.dirs.contains_key(to) {
                 return Err(io::ErrorKind::IsADirectory.into());
             }
             if from != to {
@@ -873,7 +1496,7 @@ impl Fs for FaultFs {
         let mut state = self.state();
         let result = state
             .admit(FsOp::Exists, path, false)
-            .map(|()| state.os.files.contains_key(path) || state.os.dirs.contains(path));
+            .map(|()| state.os.files.contains_key(path) || state.os.dirs.contains_key(path));
         state.log(FsOp::Exists, path, None, 0, 0, result.is_ok());
         result
     }
@@ -884,14 +1507,15 @@ impl Fs for FaultFs {
             state.admit(FsOp::CreateDirAll, dir, true)?;
             let mut missing: Vec<&Path> = dir
                 .ancestors()
-                .take_while(|a| !is_root(a) && !state.os.dirs.contains(*a))
+                .take_while(|a| !is_root(a) && !state.os.dirs.contains_key(*a))
                 .collect();
             if missing.iter().any(|a| state.os.files.contains_key(*a)) {
                 return Err(io::ErrorKind::NotADirectory.into());
             }
             missing.reverse();
             for d in missing {
-                state.record(vec![Effect::Dir(d.to_path_buf(), true)]);
+                let meta = state.new_dir_meta();
+                state.record(vec![Effect::Dir(d.to_path_buf(), Some(meta))]);
             }
             Ok(())
         })();
@@ -905,7 +1529,7 @@ impl Fs for FaultFs {
             state.admit(FsOp::List, dir, false)?;
             state.require_dir(dir)?;
             let files = state.os.files.keys();
-            let dirs = state.os.dirs.iter().filter(|d| !is_root(d));
+            let dirs = state.os.dirs.keys().filter(|d| !is_root(d));
             Ok(files
                 .chain(dirs)
                 .filter(|p| p.parent() == Some(dir))
@@ -921,19 +1545,8 @@ impl Fs for FaultFs {
         let result = (|| {
             state.admit(FsOp::SyncDir, dir, true)?;
             state.require_dir(dir)?;
-            let State {
-                pending, durable, ..
-            } = &mut *state;
-            for op in pending.iter_mut() {
-                op.retain(|effect| {
-                    let here = effect.path().parent() == Some(dir);
-                    if here {
-                        durable.apply(effect);
-                    }
-                    !here
-                });
-            }
-            pending.retain(|op| !op.is_empty());
+            let number = state.os.dirs[dir].ino;
+            state.sync_entries(number);
             state.collect_garbage();
             Ok(())
         })();
@@ -943,37 +1556,46 @@ impl Fs for FaultFs {
 
     fn lock(&self, path: &Path) -> io::Result<FsLock> {
         let mut state = self.state();
-        let result: io::Result<()> = (|| {
-            let creates = !state.os.files.contains_key(path);
-            state.admit(FsOp::Lock, path, creates)?;
-            if state.locks.contains(path) {
-                return Err(io::ErrorKind::WouldBlock.into());
-            }
-            if creates {
+        let result = (|| {
+            let existing = state.os.files.get(path).copied();
+            state.admit(FsOp::Lock, path, existing.is_none())?;
+            let ino = if let Some(ino) = existing {
+                ino
+            } else {
+                if path.as_os_str().is_empty() {
+                    return Err(not_found());
+                }
+                if state.os.dirs.contains_key(path) {
+                    return Err(io::ErrorKind::IsADirectory.into());
+                }
                 state.require_dir(&parent(path))?;
                 let ino = state.new_inode();
                 state.record(vec![Effect::File(path.to_path_buf(), Some(ino))]);
+                ino
+            };
+            if !state.locks.insert(ino) {
+                return Err(io::ErrorKind::WouldBlock.into());
             }
-            state.locks.insert(path.to_path_buf());
-            Ok(())
+            Ok(ino)
         })();
         state.log(FsOp::Lock, path, None, 0, 0, result.is_ok());
-        result?;
         Ok(FsLock::new(Box::new(FaultLockGuard {
             state: Arc::clone(&self.state),
-            path: path.to_path_buf(),
+            ino: result?,
         })))
     }
 }
 
 struct FaultLockGuard {
     state: Arc<Mutex<State>>,
-    path: PathBuf,
+    ino: Ino,
 }
 
 impl Drop for FaultLockGuard {
     fn drop(&mut self) {
-        lock(&self.state).locks.remove(&self.path);
+        let mut state = lock(&self.state);
+        state.locks.remove(&self.ino);
+        state.collect_garbage();
     }
 }
 
@@ -1123,12 +1745,20 @@ impl SplitMix {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Error;
 
     const S: usize = POWER_LOSS_SECTOR as usize;
 
     fn p(path: &str) -> PathBuf {
         PathBuf::from(path)
+    }
+
+    /// Whether `error` is the one an injected `kind` returns (EIO or ENOSPC on Unix).
+    fn is_error(error: &io::Error, kind: FaultError) -> bool {
+        let expected = kind.to_io();
+        match expected.raw_os_error() {
+            Some(code) => error.raw_os_error() == Some(code),
+            None => error.kind() == expected.kind(),
+        }
     }
 
     /// A filesystem with a durable `/db`.
@@ -1414,7 +2044,7 @@ mod tests {
         fs.inject(Fault::on(FsOp::Write).nth(2).error(FaultError::Enospc));
         file.write_all_at(b"1", 10).unwrap();
         let error = file.write_all_at(b"2", 11).unwrap_err();
-        assert_eq!(Error::from(error), Error::NoSpace);
+        assert!(is_error(&error, FaultError::Enospc), "{error:?}");
         file.write_all_at(b"3", 12).unwrap();
         assert_eq!(&fs.contents(&p("/db/f")).unwrap()[10..], b"1\x003");
 
@@ -1443,11 +2073,8 @@ mod tests {
                     FsOp::Open => fs.open(&p("/db/f"), OpenMode::Read).map(drop),
                     _ => unreachable!(),
                 };
-                let error = Error::from(result.unwrap_err());
-                match kind {
-                    FaultError::Eio => assert!(matches!(error, Error::Io(_)), "{op:?}"),
-                    FaultError::Enospc => assert_eq!(error, Error::NoSpace, "{op:?}"),
-                }
+                let error = result.unwrap_err();
+                assert!(is_error(&error, kind), "{op:?}: {error:?}");
                 let last = fs.calls().pop().unwrap();
                 assert_eq!((last.op, last.ok), (op, false));
                 // The failed call changed nothing.
@@ -1713,7 +2340,7 @@ mod tests {
         file.read_exact_at(&mut buf, 4608).unwrap();
         for at in [4096 - 511, 4096, 4096 + 511] {
             let err = file.read_exact_at(&mut buf, at).unwrap_err();
-            assert!(matches!(Error::from(err), Error::Io(_)), "{at}");
+            assert!(is_error(&err, FaultError::Eio), "{at}");
         }
         // Writes, syncs and other files never match a read fault.
         file.write_all_at(&[1; 10], 4096).unwrap();
@@ -1771,5 +2398,283 @@ mod tests {
             assert_eq!(&bytes[..4596], &old[..4596]);
             assert_eq!(&bytes[7596..], &old[7596..]);
         }
+    }
+
+    /// Every image of a volume keeps its device id, inode numbers, modes and owners, so a
+    /// restarted node's directory anchor (dev, ino) still matches (O17 precondition).
+    #[test]
+    fn stat_identity_survives_kill_crash_and_power_loss() {
+        let fs = FaultFs::with_device(7, 1_000);
+        assert_eq!((fs.device(), fs.ino_base()), (7, 1_000));
+        fs.create_dir_all_durable(&p("/db"));
+        let file = durable_file(&fs, "/db/f", b"bytes");
+        fs.set_mode(&p("/db/f"), 0o640).unwrap();
+        fs.set_owner(&p("/db"), 42).unwrap();
+        let dir = fs.stat(&p("/db")).unwrap();
+        let before = fs.stat(&p("/db/f")).unwrap();
+        assert_eq!(
+            (dir.kind, dir.dev, dir.mode, dir.uid, dir.nlink),
+            (FsKind::Dir, 7, DEFAULT_DIR_MODE, 42, 2)
+        );
+        assert_eq!(
+            (
+                before.kind,
+                before.len,
+                before.dev,
+                before.mode,
+                before.uid,
+                before.nlink
+            ),
+            (FsKind::File, 5, 7, 0o640, FaultFs::UID, 1)
+        );
+        assert!(dir.ino > 1_000 && before.ino > 1_000 && dir.ino != before.ino);
+        assert_eq!(fs.stat(&p("/")).unwrap().ino, 1_000 + ROOT_INO);
+        drop(file);
+        for image in [fs.kill(), fs.crash(), fs.power_loss(3), fs.kill().crash()] {
+            assert_eq!(image.stat(&p("/db")).unwrap(), dir);
+            assert_eq!(image.stat(&p("/db/f")).unwrap(), before);
+            // New inodes on the image never reuse a number.
+            let created = image.open(&p("/db/g"), OpenMode::CreateNew).unwrap();
+            drop(created);
+            let fresh = image.stat(&p("/db/g")).unwrap();
+            assert!(fresh.ino > dir.ino.max(before.ino));
+            assert_eq!(fresh.mode, DEFAULT_FILE_MODE);
+        }
+        // Another inode base gives other numbers for the same history.
+        let other = FaultFs::with_device(7, 5_000);
+        other.create_dir_all_durable(&p("/db"));
+        assert_ne!(other.stat(&p("/db")).unwrap().ino, dir.ino);
+        assert_eq!(
+            fs.stat(&p("/db/none")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn create_dir_and_remove_dir_follow_mkdir_and_rmdir() {
+        let fs = with_db();
+        fs.create_dir(&p("/db/a")).unwrap();
+        let error = |r: io::Result<()>| r.unwrap_err().kind();
+        assert_eq!(
+            error(fs.create_dir(&p("/db/a"))),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            error(fs.create_dir(&p("/db/missing/a"))),
+            io::ErrorKind::NotFound
+        );
+        durable_file(&fs, "/db/a/f", b"x");
+        assert_eq!(
+            error(fs.remove_dir(&p("/db/a"))),
+            io::ErrorKind::DirectoryNotEmpty
+        );
+        assert_eq!(
+            error(fs.remove_dir(&p("/db/a/f"))),
+            io::ErrorKind::NotADirectory
+        );
+        assert_eq!(
+            error(fs.remove_dir(&p("/db/none"))),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            error(fs.create_dir(&p("/db/a/f"))),
+            io::ErrorKind::AlreadyExists
+        );
+
+        // mkdir is a pending directory operation: durable only after its parent's sync.
+        fs.create_dir(&p("/db/b")).unwrap();
+        assert!(!fs.crash().exists(&p("/db/b")).unwrap());
+        let kept: BTreeSet<bool> = (0..32)
+            .map(|seed| fs.power_loss(seed).exists(&p("/db/b")).unwrap())
+            .collect();
+        assert_eq!(kept, BTreeSet::from([false, true]));
+        fs.sync_dir(&p("/db")).unwrap();
+        assert!(fs.crash().exists(&p("/db/b")).unwrap());
+        fs.remove_dir(&p("/db/b")).unwrap();
+        assert!(!fs.exists(&p("/db/b")).unwrap());
+        assert!(
+            fs.crash().exists(&p("/db/b")).unwrap(),
+            "rmdir not synced yet"
+        );
+        fs.sync_dir(&p("/db")).unwrap();
+        assert!(!fs.crash().exists(&p("/db/b")).unwrap());
+    }
+
+    #[test]
+    fn remove_dir_all_unlinks_deepest_first_and_can_stop_part_way() {
+        let build = || {
+            let fs = with_db();
+            fs.create_dir_all_durable(&p("/db/t/sub"));
+            durable_file(&fs, "/db/t/a", b"a");
+            durable_file(&fs, "/db/t/sub/b", b"b");
+            fs
+        };
+        let fs = build();
+        let before = fs.mutating_ops();
+        fs.remove_dir_all(&p("/db/t")).unwrap();
+        // Two files and two directories.
+        assert_eq!(fs.mutating_ops() - before, 4);
+        assert!(!fs.exists(&p("/db/t")).unwrap());
+        assert_eq!(fs.list(&p("/db")).unwrap(), Vec::<PathBuf>::new());
+        assert_eq!(
+            fs.remove_dir_all(&p("/db/t")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+
+        // A crash after two removals leaves the directories, without the files.
+        let fs = build();
+        fs.crash_after(fs.mutating_ops() + 2);
+        assert!(fs.remove_dir_all(&p("/db/t")).is_err());
+        let after = fs.kill();
+        assert!(after.exists(&p("/db/t/sub")).unwrap());
+        assert!(!after.exists(&p("/db/t/a")).unwrap());
+        assert!(!after.exists(&p("/db/t/sub/b")).unwrap());
+    }
+
+    #[test]
+    fn rename_moves_a_directory_tree_atomically() {
+        let fs = with_db();
+        fs.create_dir_all_durable(&p("/db/staging/inner"));
+        durable_file(&fs, "/db/staging/inner/f", b"payload");
+        let ino = fs.stat(&p("/db/staging")).unwrap().ino;
+        fs.create_dir(&p("/db/full")).unwrap();
+        durable_file(&fs, "/db/full/x", b"x");
+        assert_eq!(
+            fs.rename(&p("/db/staging"), &p("/db/full"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::DirectoryNotEmpty
+        );
+        assert_eq!(
+            fs.rename(&p("/db/staging"), &p("/db/staging/inner/y"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        fs.rename(&p("/db/staging"), &p("/db/active")).unwrap();
+        assert!(!fs.exists(&p("/db/staging")).unwrap());
+        assert_eq!(read_all(&fs, "/db/active/inner/f").unwrap(), b"payload");
+        assert_eq!(fs.stat(&p("/db/active")).unwrap().ino, ino);
+
+        // Not durable until the parent is synced; then the whole tree moves.
+        let crashed = fs.crash();
+        assert!(crashed.exists(&p("/db/staging/inner/f")).unwrap());
+        assert!(!crashed.exists(&p("/db/active")).unwrap());
+        for seed in 0..32 {
+            let after = fs.power_loss(seed);
+            let old = after.exists(&p("/db/staging/inner/f")).unwrap();
+            let new = after.exists(&p("/db/active/inner/f")).unwrap();
+            assert!(old != new, "seed {seed}: one name, never both or none");
+        }
+        fs.sync_dir(&p("/db")).unwrap();
+        let crashed = fs.crash();
+        assert_eq!(
+            read_all(&crashed, "/db/active/inner/f").unwrap(),
+            b"payload"
+        );
+        assert!(!crashed.exists(&p("/db/staging")).unwrap());
+    }
+
+    #[test]
+    fn directory_sync_keeps_entries_across_renames() {
+        for sync_child_first in [false, true] {
+            let fs = with_db();
+            fs.create_dir_all_durable(&p("/db/staging"));
+            let file = fs.open(&p("/db/staging/f"), OpenMode::CreateNew).unwrap();
+            file.write_all_at(b"synced payload", 0).unwrap();
+            file.sync_data().unwrap();
+            fs.rename(&p("/db/staging"), &p("/db/active")).unwrap();
+            if sync_child_first {
+                fs.sync_dir(&p("/db/active")).unwrap();
+                assert_eq!(
+                    read_all(&fs.crash(), "/db/staging/f").as_deref(),
+                    Some(b"synced payload".as_slice())
+                );
+            }
+            fs.sync_dir(&p("/db")).unwrap();
+            if !sync_child_first {
+                fs.sync_dir(&p("/db/active")).unwrap();
+            }
+            let after = fs.crash();
+            assert_eq!(
+                read_all(&after, "/db/active/f").as_deref(),
+                Some(b"synced payload".as_slice())
+            );
+            assert!(!after.exists(&p("/db/staging")).unwrap());
+        }
+    }
+
+    #[test]
+    fn directory_rename_does_not_inherit_replaced_directory_entries() {
+        let fs = with_db();
+        fs.create_dir_all_durable(&p("/db/staging"));
+        fs.create_dir_all_durable(&p("/db/active"));
+        durable_file(&fs, "/db/active/old", b"old");
+        fs.remove(&p("/db/active/old")).unwrap();
+        fs.rename(&p("/db/staging"), &p("/db/active")).unwrap();
+        fs.sync_dir(&p("/db")).unwrap();
+        for image in [fs.crash(), fs.power_loss(0), fs.power_loss(1)] {
+            assert!(image.list(&p("/db/active")).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn directory_rename_keeps_the_latest_synced_name() {
+        let fs = with_db();
+        fs.create_dir_all_durable(&p("/db/first/dir"));
+        fs.create_dir_all_durable(&p("/db/second"));
+        fs.create_dir_all_durable(&p("/db/third"));
+        durable_file(&fs, "/db/first/dir/f", b"data");
+        fs.rename(&p("/db/first/dir"), &p("/db/second/dir"))
+            .unwrap();
+        fs.rename(&p("/db/second/dir"), &p("/db/third/dir"))
+            .unwrap();
+        fs.sync_dir(&p("/db/third")).unwrap();
+
+        for seed in 0..16 {
+            let image = fs.power_loss(seed);
+            assert_eq!(
+                read_all(&image, "/db/third/dir/f").as_deref(),
+                Some(b"data".as_slice())
+            );
+            assert!(!image.exists(&p("/db/first/dir")).unwrap());
+            assert!(!image.exists(&p("/db/second/dir")).unwrap());
+        }
+
+        fs.sync_dir(&p("/db/second")).unwrap();
+        assert_eq!(
+            read_all(&fs.crash(), "/db/third/dir/f").as_deref(),
+            Some(b"data".as_slice())
+        );
+        assert!(!fs.crash().exists(&p("/db/second/dir")).unwrap());
+    }
+
+    #[test]
+    fn the_observer_sees_every_logged_call_in_order() {
+        let fs = with_db();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        fs.observe(Arc::new(move |call: &FsCall| {
+            sink.lock().unwrap().push(call.clone())
+        }));
+        let file = fs.open(&p("/db/f"), OpenMode::CreateNew).unwrap();
+        file.write_all_at(b"x", 0).unwrap();
+        fs.create_dir(&p("/db/d")).unwrap();
+        fs.set_mode(&p("/db/d"), 0o750).unwrap();
+        let _ = fs.stat(&p("/db/missing"));
+        assert_eq!(*seen.lock().unwrap(), fs.calls());
+        let ops: Vec<FsOp> = fs.calls().iter().map(|c| c.op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                FsOp::Open,
+                FsOp::Write,
+                FsOp::CreateDir,
+                FsOp::SetMode,
+                FsOp::Stat
+            ]
+        );
+        assert!(!fs.calls().last().unwrap().ok);
+        assert_eq!(fs.stat(&p("/db/d")).unwrap().mode, 0o750);
     }
 }

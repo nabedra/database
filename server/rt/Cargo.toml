@@ -3,7 +3,7 @@ name = "nabedra-rt"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94.1"
-description = "Nabedra's runtime seam: clock, task spawning and ids, with a deterministic simulation mode"
+description = "Nabedra's runtime seam: clock, task spawning, ids and the filesystem, with a deterministic simulation mode"
 license = "MIT"
 repository = "https://github.com/zPy52/nabedra-database"
 publish = ["crates-io"]
@@ -29,6 +29,11 @@ uuid = { version = "=1.29.2", features = ["v4"] }
 openraft-rt = { version = "=0.10.0", optional = true }
 openraft-rt-tokio = { version = "=0.10.0", optional = true }
 rand = { version = "=0.10.4", default-features = false, optional = true }
+
+# `RealFs` (flock, fallocate, posix_fadvise) and `FaultFs`'s errno values, at the version
+# nabedra-kv already pins, so no crate enters the graph.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "=0.2.191", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "=1.54.1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util", "net", "io-util"] }
