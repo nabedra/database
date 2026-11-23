@@ -926,6 +926,9 @@ def queue_survival(binary, test_executable):
         same_id = dict(read, payload=dict(read['payload'], key='changed'))
         with closing(gateway(cluster, 'api2')) as restored:
             assert_accepted(restored.exchange('/v1/requests', read), run, read)
+            pending = restored.exchange(receipt_path(run, read))
+            assert pending == (200, dict(
+                request_id=read['request_id'], run_id=run, state='queued', result=None, error=None)), pending
             status, conflict = restored.exchange('/v1/requests', same_id)
             assert status == 409 and conflict['request_id'] == read['request_id'], conflict
             assert conflict['error']['code'] == 'conflict', conflict
