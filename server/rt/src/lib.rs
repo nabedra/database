@@ -15,6 +15,8 @@
 #![allow(clippy::disallowed_methods)]
 
 pub mod ids;
+#[cfg(feature = "net")]
+pub mod net;
 pub mod task;
 pub mod time;
 
