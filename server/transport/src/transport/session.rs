@@ -656,7 +656,7 @@ impl ClientSession {
                     }
                     written = Some((nabedra_rt::time::now(), self.received.load(Ordering::Relaxed)));
                 }
-                _ = check.tick() => {
+                _ = check.tick(), if poll_directory => {
                     if !enrolled(&*directory, self.identity) {
                         break;
                     }
@@ -1502,6 +1502,13 @@ pub(super) async fn serve(
     let started = nabedra_rt::time::now();
     let mut progress = Progress::new(state.received.clone());
     let mut changes = transport.common.directory.trust_changes();
+    #[cfg(test)]
+    let poll_directory = !transport
+        .common
+        .suspend_directory_poll_for_test
+        .load(Ordering::Relaxed);
+    #[cfg(not(test))]
+    let poll_directory = true;
     let read_finished = loop {
         tokio::select! {
             _ = &mut reader => break true,
