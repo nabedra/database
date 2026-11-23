@@ -1,16 +1,17 @@
-//! One enumerated NS04 seed and one sampled NS05 seed on stepped LSM services.
+//! Enumerated NS04 and sampled NS05 cuts on stepped LSM services.
 //! The recovery and history oracle are shared with the threaded campaign.
 
 use std::fmt::Debug;
 use std::slice;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use nabedra_rt::sim::{self, NodeClock, SimEvent, in_node};
 
 use crate::common::Rng;
-use crate::enumerated_cut;
 use crate::harness::{Config, Exec, Report};
 use crate::workload::{CutKind, Mix, Step, generate};
+use crate::{enumerated_cut, env_u64, summary};
 
 const NODE: u64 = 1;
 
@@ -191,5 +192,54 @@ fn lsm01_sim_ns05_sampled_seed_replays() {
         run.service_trace.count,
         run.fs_log.hash,
         run.fs_log.count
+    );
+}
+
+/// Run the general NS10 workload twice per seed against the serial oracle, with
+/// stepped services on both runs. The NS04 smoke case separately enumerates all
+/// write boundaries for one seed.
+#[test]
+fn lsm01_sampled_replay_sweep() {
+    let first = env_u64("NS10_SEED_BASE", 0);
+    let seeds = env_u64("NS10_SEEDS", 20);
+    let steps = usize::try_from(env_u64("NS10_STEPS", 400)).expect("NS10_STEPS fits usize");
+    assert!(
+        seeds > 0 && steps > 0,
+        "the replay sweep must execute a workload"
+    );
+    let end = first.checked_add(seeds).expect("seed range overflows u64");
+    let mix = Mix::full();
+    let started = Instant::now();
+    let mut total = Report::default();
+    let mut digest = Digest::default();
+
+    for seed in first..end {
+        let cfg = Config::new(seed, mix);
+        let workload = generate(seed, steps, &mix);
+        let run = replay(&cfg, &workload, None);
+        assert_eq!(run.report.steps, steps as u64, "LSM01-sim seed {seed}");
+        digest.add(&(seed, &run.service_trace, &run.fs_log));
+        eprintln!(
+            "LSM01-sim seed {seed}: {} steps, {} cuts ({} power loss), trace {:016x}/{} events, fs {:016x}/{} calls",
+            run.report.steps,
+            run.report.cuts,
+            run.report.power_loss_cuts,
+            run.service_trace.hash,
+            run.service_trace.count,
+            run.fs_log.hash,
+            run.fs_log.count
+        );
+        total.add(&run.report);
+    }
+
+    assert_eq!(total.runs, seeds);
+    assert_eq!(digest.count, seeds);
+    assert!(total.power_loss_cuts > 0, "NS05 cut no power");
+    assert!(total.crash_cuts > 0, "the workload executed no crash cuts");
+    assert!(total.faults > 0 && total.releases > 0);
+    summary("LSM01-sim sampled fault model", seeds, started, &total);
+    eprintln!(
+        "LSM01-sim seeds {first}..{end}: {seeds} primary runs and {seeds} matching replays, {:016x}/{} paired trace digests",
+        digest.hash, digest.count
     );
 }
