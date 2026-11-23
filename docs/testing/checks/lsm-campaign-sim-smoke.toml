@@ -1,0 +1,14 @@
+id = "lsm-campaign-sim-smoke"
+module = "lsm"
+kinds = ["S"]
+guarantees = ["LSM-G01", "LSM-G02", "LSM-G03"]
+scenarios = ["LSM01", "NS04", "NS05"]
+tiers = ["T1"]
+# Fault model. Enumerate seed 100's workload boundaries and sample seed 6, with a
+# second replay of every case. The 200-seed T1 and nightly campaigns are separate.
+command = ["cargo", "test", "--locked", "-j", "2", "-p", "nabedra-kv", "--features", "sim", "--test", "campaign", "lsm01_sim_", "--", "--nocapture", "--test-threads=1"]
+cwd = "server"
+timeout_s = 300
+needs = []
+result_parser = "cargo-test"
+env = { CARGO_TARGET_DIR = "target/sim", RUSTFLAGS = "--cfg tokio_unstable" }

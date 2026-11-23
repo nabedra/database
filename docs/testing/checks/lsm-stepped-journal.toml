@@ -1,0 +1,14 @@
+id = "lsm-stepped-journal"
+module = "lsm"
+kinds = ["S", "U"]
+guarantees = ["LSM-G01", "LSM-G02"]
+scenarios = ["LSM01", "NS04", "NS05", "NS17"]
+tiers = ["T1"]
+# Fault model. Compare the parked and threaded journal, then check that cuts
+# settle queued and parked commits and release their guards.
+command = ["cargo", "test", "--locked", "-j", "2", "-p", "nabedra-kv", "--features", "sim", "--lib", "journal::sim_tests", "--", "--test-threads=1"]
+cwd = "server"
+timeout_s = 300
+needs = []
+result_parser = "cargo-test"
+env = { CARGO_TARGET_DIR = "target/sim", RUSTFLAGS = "--cfg tokio_unstable" }
