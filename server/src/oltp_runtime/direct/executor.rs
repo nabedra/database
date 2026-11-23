@@ -654,17 +654,7 @@ impl DirectExecutor {
             message = %error.message,
             "direct proposal produced no reply"
         );
-        if error.outcome == Outcome::NotApplied {
-            Ok(())
-        } else if expired {
-            Err(failed(ProtocolError::new(
-                ErrorCode::OutcomeUnknown,
-                "direct request deadline expired after a proposal of unknown outcome",
-                Outcome::Unknown,
-            )))
-        } else {
-            Err(failed(error))
-        }
+        Ok(())
     }
 
     async fn get(
