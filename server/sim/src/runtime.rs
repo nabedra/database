@@ -37,7 +37,7 @@ where
     let runtime = runtime_seeded(seed).expect("build the simulation runtime");
     let world = runtime.block_on(async { World::new(seed) });
     let _installed = Installed::new(world.clone());
-    runtime.block_on(body(world))
+    runtime.block_on(async { body(world).await })
 }
 
 /// Virtual time elapsed since `world` started: the paused runtime clock, the same on every

@@ -104,6 +104,7 @@ impl fmt::Display for Vote {
 #[derive(Debug, Default)]
 struct Group {
     voters: u64,
+    voter_ids: Option<BTreeSet<u64>>,
     /// index -> (leader id, payload hash) of every entry any replica applied.
     committed: BTreeMap<u64, (LeaderId, u64)>,
     /// Each replica's durable log, from the append and truncate observations; rebuilt from
@@ -130,7 +131,8 @@ pub struct RaftObserver {
 
 impl RaftObserver {
     /// An observer in which every group has `default_voters` voters until
-    /// [`RaftObserver::set_voters`] says otherwise.
+    /// [`RaftObserver::set_voters`] or [`RaftObserver::set_voter_ids`] sets membership.
+    /// With only a voter count, all observed replicas count toward the majority.
     pub fn new(default_voters: u64) -> Self {
         Self {
             default_voters,
@@ -152,9 +154,20 @@ impl RaftObserver {
         self.groups.get_mut(group).expect("inserted above")
     }
 
-    /// Sets the voter count a majority of `group` is computed from.
+    /// Sets the voter count for a group whose observed replicas are all voters.
     pub fn set_voters(&mut self, group: &str, voters: u64) {
-        self.group(group).voters = voters;
+        let state = self.group(group);
+        state.voters = voters;
+        state.voter_ids = None;
+    }
+
+    /// Sets the current membership for a group that can contain learners or removed nodes.
+    /// Only these voters' durable logs count toward a majority.
+    pub fn set_voter_ids(&mut self, group: &str, voters: impl IntoIterator<Item = u64>) {
+        let state = self.group(group);
+        let voter_ids: BTreeSet<_> = voters.into_iter().collect();
+        state.voters = voter_ids.len() as u64;
+        state.voter_ids = Some(voter_ids);
     }
 
     /// Records a violation at virtual time `now_ms`. A message already reported is not
@@ -325,8 +338,14 @@ impl RaftObserver {
 fn entry_majority(name: &str, group: &Group, log_id: LogId) -> Option<String> {
     let holders = group
         .logs
-        .values()
-        .filter(|log| log.get(&log_id.index) == Some(&log_id.leader))
+        .iter()
+        .filter(|(node, log)| {
+            group
+                .voter_ids
+                .as_ref()
+                .is_none_or(|ids| ids.contains(node))
+                && log.get(&log_id.index) == Some(&log_id.leader)
+        })
         .count() as u64;
     (holders <= group.voters / 2).then(|| {
         format!(

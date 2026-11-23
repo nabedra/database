@@ -229,7 +229,7 @@ fn the_planted_search_finds_the_lowest_seed_on_any_thread_count() {
         .run(every_seventh)
         .unwrap_err();
     assert!(err.contains("was not caught in 4 seeds from 104"), "{err}");
-    let panics = PlantedSearch::new("panics", 1, 3, &["harness: panic"])
+    let panics = PlantedSearch::new("panics", 1, 3, &["harness"])
         .run(|_| panic!("boom"))
         .unwrap();
     assert_eq!(panics.seed, 1);
@@ -256,4 +256,50 @@ fn the_planted_search_catches_a_planted_bug_in_the_toy_cluster() {
         Knobs::default(),
     );
     assert!(clean.passed(), "{:?}", clean.violations);
+}
+
+#[test]
+fn planted_search_matches_the_invariant_name() {
+    let search = PlantedSearch::new("exact", 1, 3, &["LostWrite"]);
+    let found = search
+        .run(|seed| match seed {
+            1 => vec!["t=1ms Other: mentions LostWrite".into()],
+            2 => vec!["t=1ms PotentialLostWrite: different invariant".into()],
+            _ => vec!["t=2ms LostWrite: confirmed".into()],
+        })
+        .unwrap();
+    assert_eq!((found.seed, found.tried), (3, 3));
+}
+
+#[test]
+fn the_maximum_seed_is_included_in_the_sweep_and_planted_search() {
+    let config = config("max-seed", u64::MAX, 1);
+    let report = sweep(&config, |_, _| SeedRun::default());
+    assert_eq!(report.evidence_seeds().range, Some([u64::MAX, u64::MAX]));
+
+    let mut search = PlantedSearch::new("max", u64::MAX - 1, 5, &["LostWrite"]);
+    search.jobs = 4;
+    let found = search
+        .run(|seed| {
+            if seed == u64::MAX {
+                vec!["LostWrite: last seed".into()]
+            } else {
+                Vec::new()
+            }
+        })
+        .unwrap();
+    assert_eq!((found.seed, found.tried), (u64::MAX, 2));
+}
+
+#[test]
+fn a_replay_with_only_different_history_bytes_fails() {
+    let mut config = config("history-diff", 1, 1);
+    config.verify_replay = 1.0;
+    let calls = std::sync::atomic::AtomicU8::new(0);
+    let report = sweep(&config, |_, _| SeedRun {
+        history: vec![calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed)],
+        ..SeedRun::default()
+    });
+    assert_eq!(report.nondeterministic(), [1]);
+    let _ = std::fs::remove_dir_all(&config.artifacts);
 }

@@ -56,3 +56,27 @@ fn node_streams_follow_the_world_seed() {
     assert_eq!(draw(3), draw(3));
     assert_ne!(draw(3), draw(4));
 }
+
+#[test]
+fn runtime_is_entered_when_the_body_constructs_its_future() {
+    runtime::run(5, |_| nabedra_rt::time::sleep(Duration::from_millis(1)));
+}
+
+#[cfg(tokio_unstable)]
+#[test]
+fn select_branch_order_follows_the_runtime_seed() {
+    let select_order = |seed| {
+        runtime::run(seed, |_| async {
+            let mut branches = Vec::new();
+            for _ in 0..64 {
+                branches.push(tokio::select! {
+                    _ = std::future::ready(()) => 0,
+                    _ = std::future::ready(()) => 1,
+                });
+            }
+            branches
+        })
+    };
+    assert_eq!(select_order(5), select_order(5));
+    assert_ne!(select_order(5), select_order(6));
+}

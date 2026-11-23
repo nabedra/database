@@ -30,7 +30,6 @@ use serde_json::{Value, json};
 
 use crate::rng::stream_seed;
 use crate::shrink::{self, DEFAULT_SHRINK_BUDGET};
-use crate::trace::fnv;
 
 /// What one run of one seed produced.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -57,13 +56,11 @@ impl SeedRun {
     }
 
     /// What two runs of one seed must agree on.
-    fn fingerprint(&self) -> (u64, u64, u64, usize) {
-        (
-            self.trace_hash,
-            self.trace_events,
-            fnv(&self.history),
-            self.history.len(),
-        )
+    fn agrees_with(&self, replay: &Self) -> bool {
+        self.trace_hash == replay.trace_hash
+            && self.trace_events == replay.trace_events
+            && self.history == replay.history
+            && self.violations == replay.violations
     }
 }
 
@@ -257,7 +254,7 @@ impl SweepReport {
     /// The `seeds` block of an evidence record.
     pub fn evidence_seeds(&self) -> Seeds {
         Seeds {
-            range: Some([self.first, self.first + self.count - 1]),
+            range: Some([self.first, self.first + (self.count - 1)]),
             count: self.count,
             failing: self
                 .seeds
@@ -380,9 +377,9 @@ pub fn sweep(config: &SweepConfig, run: impl Fn(u64, &mut Gen) -> SeedRun + Sync
         let first = guarded(&run, seed, &mut config.generator(seed));
         let twice = seed - config.first < replayed || !first.passed();
         let second = twice.then(|| guarded(&run, seed, &mut config.generator(seed)));
-        let deterministic = second.as_ref().is_none_or(|second| {
-            second.fingerprint() == first.fingerprint() && second.violations == first.violations
-        });
+        let deterministic = second
+            .as_ref()
+            .is_none_or(|second| first.agrees_with(second));
         let summary = SeedSummary {
             seed,
             trace_hash: first.trace_hash,
@@ -470,6 +467,7 @@ fn report_failure(
         "trace_events": first.trace_events,
         "replay_trace_hash": second.map(|second| format!("{:016x}", second.trace_hash)),
         "replay_trace_events": second.map(|second| second.trace_events),
+        "replay_violations": second.map(|second| &second.violations),
         "virtual_ms": first.virtual_ms,
         "config": first.config,
         "tape_len": first.tape.len(),
@@ -498,11 +496,12 @@ fn report_failure(
     );
     if let (Some(second), false) = (second, deterministic) {
         text.push_str(&format!(
-            "\n  replay trace: {:016x} ({} events), history {} bytes against {}\n  replay tail:\n    {}",
+            "\n  replay trace: {:016x} ({} events), history {} bytes against {}\n  replay violations:\n    {}\n  replay tail:\n    {}",
             second.trace_hash,
             second.trace_events,
             second.history.len(),
             first.history.len(),
+            second.violations.join("\n    "),
             second.trace_tail.join("\n    "),
         ));
     }
@@ -529,7 +528,7 @@ pub struct PlantedSearch {
     pub first: u64,
     pub budget: u64,
     pub jobs: usize,
-    /// Violation substrings that count as catching the bug.
+    /// Invariant or anomaly names that count as catching the bug.
     pub expect: Vec<String>,
 }
 
@@ -568,36 +567,37 @@ impl PlantedSearch {
 
     fn catches(&self, violations: &[String]) -> bool {
         violations.iter().any(|violation| {
-            self.expect
-                .iter()
-                .any(|name| violation.contains(name.as_str()))
+            let kind = shrink::violation_kind(violation);
+            self.expect.iter().any(|name| kind == name)
         })
     }
 
     /// Runs seeds in batches of `jobs` and returns the lowest seed that caught the bug, or
     /// `Err` with the budget spent. `run` returns a seed's violations.
     pub fn run(&self, run: impl Fn(u64) -> Vec<String> + Sync) -> Result<Found, String> {
-        let end = self.first.saturating_add(self.budget);
-        let mut next = self.first;
-        while next < end {
-            let batch: Vec<u64> = (next..end.min(next + self.jobs.max(1) as u64)).collect();
-            next += batch.len() as u64;
+        let mut seeds = (0..self.budget).map_while(|offset| self.first.checked_add(offset));
+        let mut tried = 0;
+        loop {
+            let batch: Vec<_> = seeds.by_ref().take(self.jobs.max(1)).collect();
+            if batch.is_empty() {
+                break;
+            }
             let results = parallel_map(&batch, self.jobs, |&seed| {
                 panic::catch_unwind(AssertUnwindSafe(|| run(seed))).unwrap_or_else(|payload| {
                     vec![format!("harness: panic: {}", panic_text(&*payload))]
                 })
             });
             for (seed, violations) in batch.into_iter().zip(results) {
+                tried += 1;
                 if self.catches(&violations) {
                     eprintln!(
-                        "planted bug {} caught at seed {seed} after {} seeds:\n  {}",
+                        "planted bug {} caught at seed {seed} after {tried} seeds:\n  {}",
                         self.label,
-                        seed - self.first + 1,
                         violations.join("\n  ")
                     );
                     return Ok(Found {
                         seed,
-                        tried: seed - self.first + 1,
+                        tried,
                         violations,
                     });
                 }
@@ -611,8 +611,8 @@ impl PlantedSearch {
             }
         }
         Err(format!(
-            "planted bug {} was not caught in {} seeds from {}",
-            self.label, self.budget, self.first
+            "planted bug {} was not caught in {tried} seeds from {}",
+            self.label, self.first
         ))
     }
 }

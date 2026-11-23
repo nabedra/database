@@ -166,3 +166,24 @@ fn ids_order_and_print_like_openraft() {
     assert_eq!(LeaderId::new(4, 3).to_string(), "T4-N3");
     assert_eq!(Vote::default(), Vote::new(0, 0));
 }
+
+#[test]
+fn learners_and_removed_voters_cannot_supply_a_durable_majority() {
+    let mut observer = RaftObserver::new(3);
+    observer.set_voter_ids(G, [1, 2, 3]);
+    let entry = LogId::new(1, 1, 1);
+    observer.appended(G, 1, entry);
+    observer.appended(G, 4, entry);
+    observer.applied(G, 1, entry, 1, 0);
+    assert!(has(&observer, "MajorityReachedHighWatermark"));
+
+    let mut observer = RaftObserver::new(3);
+    observer.set_voter_ids(G, [1, 2, 3]);
+    observer.appended(G, 1, entry);
+    observer.appended(G, 2, entry);
+    observer.applied(G, 1, entry, 1, 0);
+    assert!(observer.violations().is_empty());
+    observer.set_voter_ids(G, [1, 3, 4]);
+    observer.check_majority(G, 1);
+    assert!(has(&observer, "MajorityReachedHighWatermark"));
+}
