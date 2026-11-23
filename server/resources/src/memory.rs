@@ -80,54 +80,69 @@ pub enum ByteClass {
     Data,
 }
 pub struct ScratchLease {
-    _owner: Arc<dyn Any + Send + Sync>,
     backing: ScratchBacking,
 }
 enum ScratchBacking {
     Arena(ByteReservation),
-    Combined([Arc<ScratchLease>; 2]),
+    Combined {
+        parts: [Arc<ScratchLease>; 2],
+        owner: Arc<dyn Any + Send + Sync>,
+    },
     Working {
         charge: Mutex<MemoryCharge>,
         counter: Arc<AtomicUsize>,
+        owner: Arc<dyn Any + Send + Sync>,
     },
 }
 impl ScratchLease {
+    #[inline]
     fn arena(charge: ByteReservation) -> Self {
         Self {
-            _owner: charge._owner.clone(),
             backing: ScratchBacking::Arena(charge),
         }
     }
 
+    #[inline]
     fn working(
         owner: Arc<dyn Any + Send + Sync>,
         charge: MemoryCharge,
         counter: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            _owner: owner,
             backing: ScratchBacking::Working {
                 charge: Mutex::new(charge),
                 counter,
+                owner,
             },
         }
     }
 
     fn combined(owner: Arc<dyn Any + Send + Sync>, parts: [Arc<Self>; 2]) -> Self {
         Self {
-            _owner: owner,
-            backing: ScratchBacking::Combined(parts),
+            backing: ScratchBacking::Combined { parts, owner },
         }
     }
 
     fn belongs_to(&self, owner: &Arc<dyn Any + Send + Sync>) -> bool {
-        Arc::ptr_eq(&self._owner, owner)
+        match &self.backing {
+            ScratchBacking::Arena(charge) => Arc::ptr_eq(&charge._owner, owner),
+            ScratchBacking::Combined {
+                owner: retained, ..
+            }
+            | ScratchBacking::Working {
+                owner: retained, ..
+            } => Arc::ptr_eq(retained, owner),
+        }
     }
 
     /// Only a codec with a checked aggregate retained-heap bound may release
     /// unused decode scratch. Every clone observes the same smaller charge.
-    fn shrink_unused(&self, bytes: usize) -> Result<(), ProtocolError> {
-        let ScratchBacking::Working { charge, counter } = &self.backing else {
+    #[doc(hidden)]
+    pub fn shrink_unused(&self, bytes: usize) -> Result<(), ProtocolError> {
+        let ScratchBacking::Working {
+            charge, counter, ..
+        } = &self.backing
+        else {
             return Err(capacity());
         };
         let mut charge = charge.lock().map_err(|_| capacity())?;
@@ -140,7 +155,7 @@ impl ScratchLease {
     pub fn bytes(&self) -> usize {
         match &self.backing {
             ScratchBacking::Arena(charge) => charge.remaining(),
-            ScratchBacking::Combined(owners) => owners.iter().map(|o| o.bytes()).sum(),
+            ScratchBacking::Combined { parts, .. } => parts.iter().map(|part| part.bytes()).sum(),
             ScratchBacking::Working { charge, .. } => {
                 charge.lock().expect("scratch charge").bytes() as usize
             }
@@ -149,18 +164,16 @@ impl ScratchLease {
 }
 impl Drop for ScratchLease {
     fn drop(&mut self) {
-        if let ScratchBacking::Working { charge, counter } = &mut self.backing {
+        if let ScratchBacking::Working {
+            charge, counter, ..
+        } = &mut self.backing
+        {
             counter.fetch_sub(
                 charge.get_mut().expect("scratch charge").bytes() as usize,
                 Ordering::AcqRel,
             );
         }
     }
-}
-
-/// Releases scratch above the caller's checked bound for the retained heap.
-pub fn shrink_scratch(lease: &ScratchLease, bytes: usize) -> Result<(), ProtocolError> {
-    lease.shrink_unused(bytes)
 }
 
 /// A mutable frame owns its budget before its first byte is allocated.
@@ -291,6 +304,7 @@ impl ByteArena {
             notified.await;
         }
     }
+    #[inline]
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<ByteReservation, ProtocolError> {
         let owner = self.owner(bytes)?;
         self.reserve_ticket(bytes, None)?;
@@ -502,6 +516,7 @@ impl ByteReservation {
     pub fn remaining(&self) -> usize {
         self.remaining
     }
+    #[inline]
     pub fn split(&mut self, bytes: usize) -> Result<Self, ProtocolError> {
         self.remaining = self.remaining.checked_sub(bytes).ok_or_else(capacity)?;
         Ok(Self {
@@ -526,6 +541,7 @@ impl ByteReservation {
             _charge: charge,
         })))
     }
+    #[inline]
     pub fn copy(&mut self, bytes: &[u8]) -> Result<ChargedBytes, ProtocolError> {
         let charge = self.split(bytes.len())?;
         let mut data = Vec::new();

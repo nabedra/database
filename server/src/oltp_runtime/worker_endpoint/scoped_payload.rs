@@ -14,7 +14,6 @@ use crate::{
     protocol::{self, Key, Operation},
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use nabedra_rt::time::{Instant, sleep, timeout_at};
 use scoped_store::{
     PreparedScopedPayload, PreparedScopedTerminal, PreparedScopedTransfer, ScopedAdmissionPermit,
     ScopedCopyAck, ScopedCopyQuorum, ScopedCopyStamp, ScopedLocalEpoch, ScopedQueueStore,
@@ -24,6 +23,7 @@ use scoped_store::{
 };
 use sha2::{Digest as _, Sha256};
 use std::{future::Future, time::Duration};
+use nabedra_rt::time::{Instant, sleep, timeout_at};
 
 pub(super) struct ScopedPayloadReaders {
     pub(super) rpc_group: GroupIdentity,
@@ -1639,6 +1639,6 @@ fn decode_route_key(
         Key::Utf8(text) => text.capacity(),
         Key::Int64(_) => 0,
     };
-    nabedra_resources::memory::shrink_scratch(&scratch, key_heap)?;
+    scratch.shrink_unused(key_heap)?;
     Ok((request, table, key, token, scratch))
 }

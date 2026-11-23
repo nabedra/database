@@ -225,7 +225,7 @@ impl ParticipantMachine {
                         }
                         next += 1;
                     }
-                    nabedra_resources::memory::shrink_scratch(&owner, used)?;
+                    owner.shrink_unused(used)?;
                     OwnedCommand::new_with_owner(
                         ArchiveEffects {
                             group,

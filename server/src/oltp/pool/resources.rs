@@ -204,6 +204,7 @@ impl WorkerSharedResources {
         self.memory.allocate_bytes(class, len)
     }
 
+    #[inline]
     pub fn reserve_scratch(
         &self,
         class: ByteClass,
@@ -240,6 +241,7 @@ impl WorkerSharedResources {
         self.memory.copy_bytes(bytes)
     }
 
+    #[inline]
     pub fn copy_bytes_in(
         &self,
         class: ByteClass,
@@ -273,6 +275,7 @@ impl WorkerSharedResources {
         self.memory.reserve_bytes_in(class, bytes)
     }
 
+    #[inline]
     pub(super) async fn reply_budget(
         &self,
         class: ExecutionClass,
@@ -286,6 +289,7 @@ impl WorkerSharedResources {
     /// reserved ceiling retains decoded DTOs through responders and clones.
     /// Acquire it before native codec execution, and bound the lexical/DTO
     /// allocation estimate before deserializing.
+    #[inline]
     pub(super) async fn data_apply_reply_budget(
         &self,
         bytes: usize,

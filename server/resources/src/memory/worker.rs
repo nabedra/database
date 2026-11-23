@@ -152,6 +152,7 @@ impl WorkerMemory {
         }
     }
 
+    #[inline]
     fn owner(&self) -> Result<Arc<dyn Any + Send + Sync>, ProtocolError> {
         self.owner
             .get()
@@ -330,6 +331,7 @@ impl WorkerMemory {
     ) -> Result<ChargedBuffer, ProtocolError> {
         self.reserve_bytes_in(class, len)?.into_buffer()
     }
+    #[inline]
     pub fn reserve_scratch(
         &self,
         class: ByteClass,
@@ -397,6 +399,7 @@ impl WorkerMemory {
     pub fn copy_bytes(&self, bytes: &[u8]) -> Result<ChargedBytes, ProtocolError> {
         self.copy_bytes_in(ByteClass::Data, bytes)
     }
+    #[inline]
     pub fn copy_bytes_in(
         &self,
         class: ByteClass,

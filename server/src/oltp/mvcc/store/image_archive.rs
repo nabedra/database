@@ -343,7 +343,7 @@ impl ParticipantMachine {
                         let emitted = match outcome {
                             Some(Err((txn, manifest))) => {
                                 drop(images);
-                                nabedra_resources::memory::shrink_scratch(&owner, 4096)?;
+                                owner.shrink_unused(4096)?;
                                 return OwnedCommand::new_with_owner(
                                     ImagePage::Blocked { txn, manifest },
                                     owner,
@@ -407,7 +407,7 @@ impl ParticipantMachine {
                     if next.as_ref() == images.last().map(|image| &image.key) {
                         next = None;
                     }
-                    nabedra_resources::memory::shrink_scratch(&owner, used)?;
+                    owner.shrink_unused(used)?;
                     OwnedCommand::new_with_owner(
                         ImagePage::Images {
                             group,

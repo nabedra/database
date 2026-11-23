@@ -374,10 +374,7 @@ impl StatusHandle {
             .await?;
         shared
             .execute(ExecutionClass::Query, 0, 0, move || {
-                nabedra_resources::memory::shrink_scratch(
-                    &owner,
-                    crate::oltp::mvcc::json_decode_budget(raw.as_slice())?,
-                )?;
+                owner.shrink_unused(crate::oltp::mvcc::json_decode_budget(raw.as_slice())?)?;
                 let mut page: CommittedArchivePage =
                     serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())?;
                 let mut items = page.items.into_inner();
@@ -530,10 +527,7 @@ impl StatusHandle {
             .await?;
         shared
             .execute(ExecutionClass::Query, 0, 0, move || {
-                nabedra_resources::memory::shrink_scratch(
-                    &owner,
-                    crate::oltp::mvcc::json_decode_budget(raw.as_slice())?,
-                )?;
+                owner.shrink_unused(crate::oltp::mvcc::json_decode_budget(raw.as_slice())?)?;
                 let mut page: IdentityArchivePage =
                     serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())?;
                 let mut items = page.items.into_inner();
