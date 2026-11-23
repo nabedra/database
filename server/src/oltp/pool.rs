@@ -300,7 +300,7 @@ impl OltpPool {
             .try_acquire_owned()
             .map_err(|_| capacity())?;
         let overhead = shared.pool_overhead()?;
-        open_pool_manifest(path, &identity)?;
+        open_pool_manifest(path, &identity, mount.is_some())?;
         let mut options =
             storage::store_options(&shared.storage, fs, shared.config.write_buffer_bytes);
         tune(&mut options);
@@ -2070,7 +2070,11 @@ fn group_key(id: Uuid, tag: u8, suffix: &[u8]) -> Vec<u8> {
 fn identity_key(id: Uuid) -> Vec<u8> {
     group_key(id, b'i', &[])
 }
-fn open_pool_manifest(path: &Path, identity: &PoolIdentity) -> Result<(), ProtocolError> {
+fn open_pool_manifest(
+    path: &Path,
+    identity: &PoolIdentity,
+    mounted: bool,
+) -> Result<(), ProtocolError> {
     if fs::try_exists(path).unwrap_or(false) {
         let meta = fs::symlink_metadata(path).map_err(|_| storage_error_message())?;
         if !meta.is_dir() || meta.file_type().is_symlink() {
@@ -2121,6 +2125,12 @@ fn open_pool_manifest(path: &Path, identity: &PoolIdentity) -> Result<(), Protoc
             return Err(unsupported_format(&found));
         }
         return Err(storage_error_message());
+    }
+    if mounted {
+        // Make the pool entry durable through the verified mount descriptor before
+        // publishing its first manifest. KV only syncs directories inside the pool.
+        let parent = path.parent().ok_or_else(storage_error_message)?;
+        fs::sync_dir(parent).map_err(|_| storage_error_message())?;
     }
     let mut file = OpenOptions::new()
         .write(true)

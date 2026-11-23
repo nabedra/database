@@ -127,11 +127,21 @@ fn ns04_o11_restart_and_crash_at_each_commit_operation_replay() {
     );
 }
 
+fn observe(world: &World) -> Arc<Mutex<Vec<String>>> {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    world.observe({
+        let trace = trace.clone();
+        Arc::new(move |event| trace.lock().unwrap().push(format!("{event:?}")))
+    });
+    trace
+}
+
 #[test]
 fn ns04_o11_process_kill_preserves_unsynced_pool_writes() {
-    for (cut, retained) in [(Cut::Kill, true), (Cut::Crash, false)] {
+    let replay = |cut, retained| {
         sim::run(SEED, |world| async move {
             mount_data(&world);
+            let trace = observe(&world);
             let pool = sim::in_node(NODE, async {
                 let pool = open();
                 put(&pool, b"base", Durability::Sync).unwrap();
@@ -153,7 +163,13 @@ fn ns04_o11_process_kill_preserves_unsynced_pool_writes() {
             })
             .await;
             assert_eq!(world.unmounted_path_errors(), 0);
-        });
+            let events = trace.lock().unwrap();
+            assert!(!events.is_empty());
+            events.clone()
+        })
+    };
+    for (cut, retained) in [(Cut::Kill, true), (Cut::Crash, false)] {
+        assert_eq!(replay(cut, retained), replay(cut, retained), "{cut:?}");
     }
 }
 
@@ -177,11 +193,7 @@ fn o17_mount_identity_and_disk_budget_follow_volume() {
             let info = mount_data(&world);
             let keys = world.mount(NODE, KEYS);
             let expected = expectation(&info);
-            let trace = Arc::new(Mutex::new(Vec::new()));
-            world.observe({
-                let trace = trace.clone();
-                Arc::new(move |event| trace.lock().unwrap().push(format!("{event:?}")))
-            });
+            let trace = observe(&world);
             let (old_inode, pool) = sim::in_node(NODE, async {
                 let key = Path::new(KEYS).join("worker-key");
                 fs::write(&key, b"identity").unwrap();
@@ -221,8 +233,6 @@ fn o17_mount_identity_and_disk_budget_follow_volume() {
                 )
                 .unwrap();
                 put(&pool, b"mounted", Durability::Sync).unwrap();
-                // The fixture provisions the pool directory durably on the simulated mount.
-                fs::sync_dir(DATA).unwrap();
                 (old_inode, pool)
             })
             .await;
