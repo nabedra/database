@@ -1086,6 +1086,8 @@ dependencies = [
  "hmac",
  "nabedra-check",
  "nabedra-kv",
+ "nabedra-rt",
+ "nabedra-sim",
  "openraft",
  "rand 0.8.8",
  "reqwest",
@@ -1119,6 +1121,17 @@ dependencies = [
 name = "nabedra-rt"
 version = "0.1.0"
 dependencies = [
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "nabedra-sim"
+version = "0.1.0"
+dependencies = [
+ "nabedra-check",
+ "nabedra-rt",
+ "serde_json",
  "tokio",
  "uuid",
 ]

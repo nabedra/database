@@ -1523,6 +1523,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "nabedra-kv",
+ "nabedra-rt",
  "openraft 0.9.25",
  "reqwest",
  "rustls",
