@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod fault;
+#[cfg(unix)]
+pub mod os;
 mod real;
 
 pub use fault::*;

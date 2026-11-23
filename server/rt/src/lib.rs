@@ -16,6 +16,7 @@
 
 pub mod fs;
 pub mod ids;
+pub mod sync;
 pub mod task;
 pub mod time;
 

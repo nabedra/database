@@ -278,7 +278,8 @@ impl World {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn elapsed(&self) -> Duration {
+    /// Virtual time since the world started, the same on every node.
+    pub fn elapsed(&self) -> Duration {
         virtual_now().saturating_duration_since(self.start)
     }
 
@@ -416,6 +417,85 @@ impl World {
     pub fn services(&self, node: u64) -> Vec<String> {
         self.with_node(node, |entry| entry.services.clone())
     }
+
+    /// Stops polling `node`'s tasks, and tasks it spawns meanwhile, until [`World::thaw`],
+    /// without aborting them. The node's clocks keep running, as under SIGSTOP.
+    pub fn freeze(&self, node: u64) {
+        let _ = node;
+        unimplemented!("World::freeze lands in P9-RT (b)")
+    }
+
+    /// Resumes a frozen `node`'s tasks.
+    pub fn thaw(&self, node: u64) {
+        let _ = node;
+        unimplemented!("World::thaw lands in P9-RT (b)")
+    }
+
+    pub fn is_frozen(&self, node: u64) -> bool {
+        let _ = node;
+        false
+    }
+
+    /// Stores `value` in the run's type-keyed slot for `T`, replacing any earlier one.
+    pub fn insert_ext<T: std::any::Any + Send>(&self, value: T) {
+        let _ = value;
+        unimplemented!("World::insert_ext lands in P9-RT (b)")
+    }
+
+    /// Runs `f` on the run's `T` slot. `None` when no `T` was inserted, or when called
+    /// for the same `T` from inside its own closure.
+    pub fn with_ext<T: std::any::Any, R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let _ = f;
+        unimplemented!("World::with_ext lands in P9-RT (b)")
+    }
+
+    /// A stop-the-world pause: every node's clocks move forward by `by` at once, without
+    /// running anything. Timers armed before it fire late by `by`.
+    pub fn pause_all(&self, by: Duration) {
+        let _ = by;
+        unimplemented!("World::pause_all lands in P9-RT (b)")
+    }
+
+    /// Calls `observer` for every simulation event (service steps, volume calls, crashes,
+    /// restarts, cuts, wipes and pauses), in order, so a harness can hash the trace.
+    pub fn observe(&self, observer: Arc<dyn Fn(&SimEvent<'_>) + Send + Sync>) {
+        let _ = observer;
+        unimplemented!("World::observe lands in P9-RT (b)")
+    }
+}
+
+/// One simulation event, as [`World::observe`] reports it.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SimEvent<'a> {
+    /// A stepped service ran one step.
+    Step {
+        node: Option<u64>,
+        service: &'a str,
+        outcome: crate::task::Step,
+    },
+    /// A call on a node's simulated volume.
+    Fs {
+        node: u64,
+        mount: &'a std::path::Path,
+        call: &'a crate::fs::FsCall,
+    },
+    Crash {
+        node: u64,
+    },
+    Restart {
+        node: u64,
+        cut: Option<volumes::Cut>,
+    },
+    Wipe {
+        node: u64,
+        mount: &'a std::path::Path,
+        how: volumes::Wipe,
+    },
+    /// A stop-the-world pause ([`World::pause_all`], or a `thread_sleep` in simulation).
+    Pause {
+        by: Duration,
+    },
 }
 
 /// Installs `world` on this thread until the guard drops.
@@ -727,6 +807,11 @@ where
         f()
     })
 }
+
+pub(crate) mod services;
+pub mod volumes;
+
+pub use volumes::{Cut, VolumeInfo, Wipe};
 
 #[cfg(test)]
 mod tests;
