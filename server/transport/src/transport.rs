@@ -697,6 +697,8 @@ struct Common {
     cancelled_replies: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     hold_replies_after_release: tokio::sync::watch::Sender<bool>,
+    #[cfg(test)]
+    suspend_directory_poll_for_test: AtomicBool,
 }
 impl Common {
     /// The receiver's preflight pool for a request of `class` on `group`.
@@ -989,6 +991,8 @@ impl WorkerTransport {
                 cancelled_replies: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(test)]
                 hold_replies_after_release: tokio::sync::watch::channel(false).0,
+                #[cfg(test)]
+                suspend_directory_poll_for_test: AtomicBool::new(false),
                 config,
             }),
             registry,
