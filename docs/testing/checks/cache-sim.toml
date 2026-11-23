@@ -11,7 +11,7 @@ cargo test --locked -j 4 --release -p nabedra-check --test history_cache_sim
 sim=(cargo test --locked -j 4 --release --no-default-features --features cache,sim --lib)
 tests=$("${sim[@]}" cache::cluster::sim::tests:: -- --list --format terse)
 grep -Fxq 'cache::cluster::sim::tests::seed_sweep: test' <<< "$tests"
-"${sim[@]}" cache::cluster::sim::tests:: -- --nocapture --test-threads=1
+"${sim[@]}" -- --nocapture --test-threads=1
 ''']
 cwd = "server"
 timeout_s = 3600
