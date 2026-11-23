@@ -75,7 +75,8 @@ pub(crate) type WarmRead = (
 /// (the cache lives inside it), so `None` means the client is gone.
 pub(crate) type Refresh = Arc<dyn Fn() -> Option<WarmRead> + Send + Sync>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "sim", derive(PartialOrd, Ord))]
 pub(crate) struct GrantKey([u8; 32]);
 impl GrantKey {
     /// `None` for an action this cache never holds.
@@ -137,6 +138,12 @@ struct Warm {
     backoff: Option<Instant>,
 }
 
+// A seed must replay the same sequence of background Control reads.
+#[cfg(feature = "sim")]
+type WarmGrants = std::collections::BTreeMap<GrantKey, Warm>;
+#[cfg(not(feature = "sim"))]
+type WarmGrants = HashMap<GrantKey, Warm>;
+
 #[derive(Default)]
 struct Grants {
     /// Role checks passed, by key, with their expiry.
@@ -144,7 +151,7 @@ struct Grants {
     revision: Option<u64>,
     observed: Option<Observed>,
     /// Keys refreshed in the background, with their last use.
-    warm: HashMap<GrantKey, Warm>,
+    warm: WarmGrants,
     /// Whether the warm task runs.
     warming: bool,
 }
@@ -348,7 +355,7 @@ async fn warm_loop(cache: Weak<Mutex<Grants>>) {
     use crate::oltp_runtime::stage_timing::perf_stage;
     loop {
         nabedra_rt::time::sleep(WARM_TICK).await;
-        let mut due: Vec<(GrantKey, Refresh)> = {
+        let due: Vec<(GrantKey, Refresh)> = {
             let Some(shared) = cache.upgrade() else {
                 return;
             };
@@ -372,11 +379,6 @@ async fn warm_loop(cache: Weak<Mutex<Grants>>) {
                 .map(|(key, entry)| (*key, entry.refresh.clone()))
                 .collect()
         };
-        // Key order, not hash order, so a simulation refreshes in the same
-        // order for the same seed. Keys are SHA-256 digests, so this is as
-        // arbitrary as the hash order was, and a failed refresh still backs
-        // off its key, so the keys after it come first on the next tick.
-        due.sort_unstable_by_key(|(key, _)| *key);
         // One read at a time: a slow or unavailable Control (recovery, a
         // partition) costs the foreground at most one lane slot and one
         // native Control job, for at most WARM_READ_TIMEOUT per tick.
@@ -923,15 +925,13 @@ mod tests {
     /// P10-DET: the warm task refreshes the keys due in one tick in key
     /// order, not in the map's hash order, so a simulation seed replays the
     /// same sequence of Control reads.
+    #[cfg(feature = "sim")]
     #[tokio::test(start_paused = true)]
     async fn rd2_warm_refreshes_run_in_key_order() {
         let cache = GrantCache::default();
-        let target = group();
         let order = Arc::new(Mutex::new(Vec::<GrantKey>::new()));
-        let mut keys = Vec::new();
-        for _ in 0..16 {
-            let key = GrantKey::new(worker(), ServiceAction::DirectLeader, &target, None).unwrap();
-            keys.push(key);
+        let keys: Vec<_> = (0..16).map(|index| GrantKey([index; 32])).collect();
+        for &key in keys.iter().rev() {
             let refresh: Refresh = {
                 let order = order.clone();
                 Arc::new(move || {
@@ -955,7 +955,6 @@ mod tests {
         nabedra_rt::time::sleep(GRANT_TTL).await;
         let order = order.lock().unwrap().clone();
         assert_eq!(order.len(), keys.len(), "one refresh per key");
-        keys.sort_unstable();
         assert_eq!(order, keys);
     }
 }
