@@ -708,7 +708,7 @@ fn raft_sender<'a>(
             // traffic even if a historical membership does not list them.
             let replaying_history = catch_up_before
                 .is_some_and(|index| stored.log_id().is_none_or(|log| log.index < index));
-            if replaying_history || membership.nodes().next().is_none() {
+            if membership.nodes().next().is_none() {
                 bootstrap.get(&sender)
             } else {
                 None
