@@ -371,8 +371,8 @@ fn spawn_blocking_runs_inline_in_the_node_context() {
         let (node, elapsed, thread) = in_node(1, async move {
             let handle = task::spawn_blocking(move || {
                 ran_in_job.store(true, Ordering::SeqCst);
-                // Blocking sleeps do not stall the simulation or move virtual time.
-                time::thread_sleep(Duration::from_secs(2));
+                // Virtual time stands still during blocking work. (A thread_sleep here
+                // would pause the whole world; see services::tests.)
                 (
                     current_node(),
                     time::now().duration_since(world_for_job.start()),
@@ -391,7 +391,7 @@ fn spawn_blocking_runs_inline_in_the_node_context() {
         assert_eq!(
             elapsed,
             ms(2_030),
-            "virtual time stands still during blocking work"
+            "the node clock reads mono offset plus 30 ms"
         );
         assert_eq!(thread.as_deref(), Some("sim-blocking"));
 

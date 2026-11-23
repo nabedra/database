@@ -854,3 +854,5 @@ fn elapsed_us(queued: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "sim"))]
+pub(in crate::cache::cluster) use tests::LeaseActorFixture;
