@@ -120,7 +120,7 @@ fn paths_route_to_the_longest_mount_and_outside_paths_fail() {
 }
 
 #[test]
-fn fs_real_is_the_node_volume_and_follows_restarts() {
+fn fs_real_requires_a_new_handle_after_restart() {
     run(3, |world| async move {
         node_with(&world, 1, &["/sim/n1/data"]);
         let path = p("/sim/n1/data/store.log");
@@ -143,9 +143,15 @@ fn fs_real_is_the_node_volume_and_follows_restarts() {
         world.restart_with(1, Cut::Crash);
         // The old handle points at the halted image.
         assert!(file.write_all_at(b"late", 0).is_err());
-        // The same NodeFs resolves the new image: only the synced bytes survived.
+        // The old NodeFs cannot reopen or alter any path in the replacement image.
+        assert!(
+            fs.open(&p("/sim/n1/data/late"), OpenMode::CreateNew)
+                .is_err()
+        );
+        // A fresh NodeFs sees the new image and only the synced bytes.
         let bytes = on(1, || {
-            let reopened = fs.open(&path, OpenMode::Read).unwrap();
+            assert!(!os::try_exists("/sim/n1/data/late").unwrap());
+            let reopened = fs::real().open(&path, OpenMode::Read).unwrap();
             let mut bytes = vec![0; reopened.len().unwrap() as usize];
             reopened.read_exact_at(&mut bytes, 0).unwrap();
             bytes
@@ -264,6 +270,37 @@ fn no_mutating_call_reaches_a_volume_after_a_crash() {
             assert!(!os::try_exists("/sim/n1/data/task").unwrap());
         })
         .await;
+    });
+}
+
+#[test]
+fn immediate_restart_fences_a_cancelled_tasks_destructor() {
+    run(18, |world| async move {
+        node_with(&world, 1, &["/sim/n1/data"]);
+        let path = "/sim/n1/data/late";
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let dying = world.spawn_node(1, async move {
+            let _guard = TaskWritesOnDrop(path);
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), ready)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Aborting schedules cancellation. Restart installs the new image before
+        // Tokio gets another poll to drop the aborted task.
+        world.restart_with(1, Cut::Kill);
+        assert!(!dying.is_finished());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), dying)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        on(1, || assert!(!os::try_exists(path).unwrap())).await;
     });
 }
 
