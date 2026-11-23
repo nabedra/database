@@ -384,7 +384,7 @@ impl WorkerThreads {
         self.shared.stop();
         let mut workers = self.workers.take().unwrap();
         let coordinator = self.coordinator.clone();
-        self.coordinator.spawn_blocking(move || {
+        nabedra_rt::task::spawn_blocking_on(&self.coordinator, move || {
             let mut failed = false;
             coordinator.block_on(async {
                 for worker in &mut workers {

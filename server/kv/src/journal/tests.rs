@@ -1179,7 +1179,7 @@ fn ns12_replay_of_64_mib_journal() {
     for c in pending.drain(..) {
         c.wait().unwrap();
     }
-    let write_ms = write_start.elapsed().as_millis();
+    let write_ms = nabedra_rt::time::elapsed(write_start).as_millis();
     drop(journal);
 
     #[derive(Default)]
@@ -1194,7 +1194,7 @@ fn ns12_replay_of_64_mib_journal() {
     let sink = Arc::new(Counting::default());
     let started = nabedra_rt::time::now_std();
     let (_j, report) = Journal::open(real(), dir.path(), options, 0, sink.clone()).unwrap();
-    let open_ms = started.elapsed().as_millis();
+    let open_ms = nabedra_rt::time::elapsed(started).as_millis();
     println!(
         "ns12: wrote {} MiB in {write_ms} ms; replayed {} records ({} MiB) in recovery_ms {} (open {open_ms} ms)",
         bytes >> 20,

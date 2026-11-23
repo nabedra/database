@@ -918,7 +918,7 @@ pub(crate) mod proposal_clock {
     static FIRST: AtomicU64 = AtomicU64::new(0);
     fn now_us() -> u64 {
         static BASE: OnceLock<Instant> = OnceLock::new();
-        BASE.get_or_init(nabedra_rt::time::now_std).elapsed().as_micros() as u64 + 1
+        nabedra_rt::time::elapsed(*BASE.get_or_init(nabedra_rt::time::now_std)).as_micros() as u64 + 1
     }
     pub(super) fn proposed() {
         LAST.store(now_us(), Ordering::Relaxed);

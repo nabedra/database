@@ -406,20 +406,20 @@ async fn o10_o21_pool_path_growth_past_old_row_and_byte_limits_survives_cold_res
             if first % 20_000 == 0 {
                 eprintln!(
                     "O21 pool-path growth: {first} rows after {} ms, overloaded_retries={overloaded}",
-                    nabedra_rt::time::now_std().saturating_duration_since(started).as_millis()
+                    nabedra_rt::time::elapsed(started).as_millis()
                 );
             }
         }
         eprintln!(
             "O21 pool-path growth: rows={total}, raw_text_bytes={}, insertion_ms={}, overloaded_retries={overloaded}",
             total as usize * text.len(),
-            nabedra_rt::time::now_std().saturating_duration_since(started).as_millis()
+            nabedra_rt::time::elapsed(started).as_millis()
         );
         assert!(total as usize * text.len() > 64 << 20);
         runtime.drain().await.unwrap();
         drop(app);
         drop(runtime);
-        eprintln!("O21 drained after {} ms", nabedra_rt::time::now_std().saturating_duration_since(started).as_millis());
+        eprintln!("O21 drained after {} ms", nabedra_rt::time::elapsed(started).as_millis());
 
         // O10: the worker directory stays bound to its database across restarts.
         let rebound = WorkerRuntime::open_configured(
@@ -440,14 +440,14 @@ async fn o10_o21_pool_path_growth_past_old_row_and_byte_limits_survives_cold_res
         assert_eq!(rebound.code, ErrorCode::ValidationError);
 
         let (runtime, app) = open_with(&dir.0, execution, true).await;
-        eprintln!("O21 cold restart after {} ms", nabedra_rt::time::now_std().saturating_duration_since(started).as_millis());
+        eprintln!("O21 cold restart after {} ms", nabedra_rt::time::elapsed(started).as_millis());
         assert_eq!(
             data(&app, "table.get", json!({"table_id":id,"key":100_000})).await,
             row(100_000, 5.0, &text)
         );
         let all = query(&id, Value::Null, Value::Null, Value::Null, Value::Null);
         assert_eq!(data(&app, "query.count", all.clone()).await, json!(total));
-        eprintln!("O21 full count after {} ms", nabedra_rt::time::now_std().saturating_duration_since(started).as_millis());
+        eprintln!("O21 full count after {} ms", nabedra_rt::time::elapsed(started).as_millis());
         assert_eq!(
             refused(&app, "query.collect", all).await,
             json!("limit_exceeded")

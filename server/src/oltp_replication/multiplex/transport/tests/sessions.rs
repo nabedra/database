@@ -849,7 +849,7 @@ async fn d10_o06_black_holed_session_is_closed_by_an_unanswered_ping() {
                 .await,
             Err(RequestError::Unreachable)
         ));
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(nabedra_rt::time::elapsed(started) < Duration::from_secs(10));
 
         relay.restore();
         echoed(
@@ -871,9 +871,9 @@ async fn d10_o06_black_holed_session_is_closed_by_an_unanswered_ping() {
             .expect("black-holed call succeeded");
         assert!(matches!(failure, RequestError::Unreachable), "{failure:?}");
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            nabedra_rt::time::elapsed(started) < Duration::from_secs(10),
             "{:?}",
-            started.elapsed()
+            nabedra_rt::time::elapsed(started)
         );
         relay.restore();
         echoed(
@@ -1089,7 +1089,7 @@ async fn d10_o05_large_and_small_frames_share_one_lane() {
                     reply => break reply,
                 }
             };
-            slowest = slowest.max(started.elapsed());
+            slowest = slowest.max(nabedra_rt::time::elapsed(started));
             echoed(reply, &text);
         }
         for task in tasks {
@@ -1320,9 +1320,9 @@ async fn d10_queued_callers_share_a_bounded_failed_connect() {
         }
         // One bounded connect, shared: well below four in a row.
         assert!(
-            started.elapsed() < Duration::from_millis(3500),
+            nabedra_rt::time::elapsed(started) < Duration::from_millis(3500),
             "{:?}",
-            started.elapsed()
+            nabedra_rt::time::elapsed(started)
         );
         assert!(relay.accepted.load(Ordering::Acquire) <= 2);
         relay.restore();

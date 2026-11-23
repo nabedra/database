@@ -252,12 +252,12 @@ impl DirectWindows {
         }
     }
     fn served(&self) {
-        let ms = u64::try_from(self.served_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let ms = u64::try_from(nabedra_rt::time::elapsed(self.served_epoch).as_millis()).unwrap_or(u64::MAX);
         self.served_ms.store(ms.max(1), Ordering::Relaxed);
     }
     fn recently_served(&self) -> bool {
         let served = self.served_ms.load(Ordering::Relaxed);
-        let now = u64::try_from(self.served_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let now = u64::try_from(nabedra_rt::time::elapsed(self.served_epoch).as_millis()).unwrap_or(u64::MAX);
         served != 0 && now.saturating_sub(served) <= PREFILL_IDLE.as_millis() as u64
     }
     /// A window reserved by `leader` is installed.

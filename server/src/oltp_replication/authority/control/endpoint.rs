@@ -2055,7 +2055,7 @@ impl VerifiedReplicaRoutes {
             .lock()
             .ok()
             .and_then(|hint| hint.confirmed_at)
-            .is_some_and(|at| at.elapsed() <= max_age)
+            .is_some_and(|at| nabedra_rt::time::elapsed(at) <= max_age)
     }
 
     pub(crate) fn last_successful_node(&self) -> Option<u64> {
@@ -2244,7 +2244,7 @@ impl ControlClient {
                 target: "nabedra_database_server::oltp_replication::service_rpc",
                 cache = "hit",
                 pages = 0,
-                ms = start.elapsed().as_millis(),
+                ms = nabedra_rt::time::elapsed(start).as_millis(),
                 "verified replica routes"
             );
             return Ok(route);
@@ -2288,7 +2288,7 @@ impl ControlClient {
         drop(decoded);
         drop(reply);
 
-        let record_ms = start.elapsed().as_millis();
+        let record_ms = nabedra_rt::time::elapsed(start).as_millis();
         let (members, pages) = self.load_replica_members(&record, count).await?;
         let retained = members
             .capacity()
@@ -2319,7 +2319,7 @@ impl ControlClient {
             cacheable,
             pages,
             record_ms,
-            ms = start.elapsed().as_millis(),
+            ms = nabedra_rt::time::elapsed(start).as_millis(),
             "verified replica routes"
         );
         Ok(match self.route_cache() {
