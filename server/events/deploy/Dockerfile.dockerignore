@@ -5,6 +5,7 @@
 !rt/Cargo.toml
 !rt/src/
 !check/Cargo.toml
+!sim/Cargo.toml
 !events/Cargo.toml
 !events/Cargo.lock
 !events/src/

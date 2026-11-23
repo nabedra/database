@@ -2,20 +2,22 @@
 FROM rust:1.94.1-bookworm AS build
 ARG BUILD_JOBS=2
 # Build context: `server`. Events builds alone with `--manifest-path`; it needs only its
-# own sources, the in-tree storage engine and the runtime seam the engine depends on.
+# own sources, the in-tree storage engine and the runtime seam both depend on.
 WORKDIR /server
 
 # Dependency layer: manifests and lock file only, with stub crate roots, so a source
 # change reuses it (and a `type=gha` cache keeps it between CI runs). The workspace
 # crates' stub outputs are cleaned so the real sources always rebuild. The dev-only
-# `nabedra-check` path dev-dependency is never built here; Cargo needs only its manifest
-# and an empty crate root, which stay in place.
+# `nabedra-check` path dev-dependency and the optional `nabedra-sim` dependency (feature
+# `sim`) are never built here; Cargo needs only their manifests and empty crate roots,
+# which stay in place.
 COPY kv/Cargo.toml ./kv/Cargo.toml
 COPY rt/Cargo.toml ./rt/Cargo.toml
 COPY check/Cargo.toml ./check/Cargo.toml
+COPY sim/Cargo.toml ./sim/Cargo.toml
 COPY events/Cargo.toml events/Cargo.lock ./events/
-RUN mkdir -p kv/src rt/src check/src events/src /out/timings && \
-    : > kv/src/lib.rs && : > rt/src/lib.rs && : > check/src/lib.rs && : > events/src/lib.rs && echo 'fn main() {}' > events/src/main.rs && \
+RUN mkdir -p kv/src rt/src check/src sim/src events/src /out/timings && \
+    : > kv/src/lib.rs && : > rt/src/lib.rs && : > check/src/lib.rs && : > sim/src/lib.rs && : > events/src/lib.rs && echo 'fn main() {}' > events/src/main.rs && \
     cargo build --locked --release --jobs "${BUILD_JOBS}" --timings \
         --manifest-path events/Cargo.toml --bin nabedra-events && \
     cargo clean --offline --locked --release --manifest-path events/Cargo.toml -p nabedra-events -p nabedra-kv -p nabedra-rt && \
