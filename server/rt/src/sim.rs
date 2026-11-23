@@ -1011,7 +1011,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    match (current_node_context(), world()) {
+    match (current_node(), world()) {
         (Some(node), Some(world)) => world.spawn_node(node, future),
         _ => tokio::spawn(future),
     }
@@ -1022,7 +1022,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    match (current_node_context(), world()) {
+    match (current_node(), world()) {
         (Some(node), Some(world)) => world.spawn_node_on(handle, node, future),
         (None, Some(world)) => {
             world.assert_runtime(handle);
@@ -1073,10 +1073,10 @@ where
     T: Send + 'static,
 {
     match (current_node_context(), world()) {
-        (Some(node), Some(world)) => {
+        (Some(context), Some(world)) => {
             world.assert_runtime(&Handle::current());
-            let task = set.spawn(NODE.scope(Some(node), world.gate(node.id, future)));
-            world.register(node, task.clone());
+            let task = set.spawn(NODE.scope(Some(context), world.gate(context.id, future)));
+            world.register(context, task.clone());
             task
         }
         _ => set.spawn(future),
