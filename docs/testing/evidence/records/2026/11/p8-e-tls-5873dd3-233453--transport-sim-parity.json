@@ -1,0 +1,47 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-e-tls-5873dd3-233453--transport-sim-parity.log",
+      "sha256": "72fa1b2c1cfa511b79be7786d027ec163478ca11719049cf944124536904cb5c"
+    }
+  ],
+  "assertions": {
+    "executed": 11,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "transport-sim-parity",
+  "duration_s": 36.103,
+  "guarantees": [
+    "OLTP-G04",
+    "OLTP-G08",
+    "OLTP-G09"
+  ],
+  "kind": "S",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T22:40:11.567360+00:00",
+    "request_id": "p8-e-tls-5873dd3-233453",
+    "runner": "GitHub Actions 1000008322",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45281025218"
+  },
+  "scenarios": [
+    "D10",
+    "O05",
+    "C07",
+    "O17"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "5873dd3caa248832090cffa89619b78153dab941",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

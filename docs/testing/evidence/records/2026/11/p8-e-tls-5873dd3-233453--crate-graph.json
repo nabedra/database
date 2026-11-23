@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-e-tls-5873dd3-233453--crate-graph.log",
+      "sha256": "48c84e099e0442090f6e5bc05a02934e851801a35a08dc8d466481613b48bb62"
+    }
+  ],
+  "assertions": {
+    "executed": 20,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "skipped",
+        "reason": "1 tests skipped"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "crate-graph",
+  "duration_s": 21.231,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T22:37:58.080048+00:00",
+    "request_id": "p8-e-tls-5873dd3-233453",
+    "runner": "GitHub Actions 1000008314",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45281025218"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "5873dd3caa248832090cffa89619b78153dab941",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
