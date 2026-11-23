@@ -246,6 +246,7 @@ register = "docs/testing/guarantees/scheduler.md"
 paths = [
   "server/src/request_queue.rs",
   "server/src/request_queue/**",
+  "server/protocol/src/queue_error.rs",
   "server/src/scheduling.rs",
   "server/src/scheduling/**",
   "server/src/worker_pool.rs",
