@@ -384,31 +384,47 @@ impl WorkerThreads {
         self.shared.stop();
         let mut workers = self.workers.take().unwrap();
         let coordinator = self.coordinator.clone();
-        nabedra_rt::task::spawn_blocking_on(&self.coordinator, move || {
-            let mut failed = false;
-            coordinator.block_on(async {
-                for worker in &mut workers {
-                    if (&mut worker.drained).await.is_err() {
-                        failed = true;
-                    }
-                }
+        #[cfg(feature = "sim")]
+        if nabedra_rt::sim::world().is_some() {
+            return nabedra_rt::task::spawn_on(&self.coordinator, async move {
+                // Accepted jobs can depend on the coordinator. Wait for their drain
+                // before using the blocking helper, which pauses the simulated runtime.
+                let failed = wait_for_drain(&mut workers).await;
+                nabedra_rt::task::spawn_blocking_on(&coordinator, move || {
+                    join_drained_workers(workers, failed)
+                })
+                .await
+                .unwrap_or_else(|_| Err(internal("Worker teardown unavailable")))
             });
-            let mut threads = Vec::new();
-            for worker in workers {
-                let _ = worker.exit.send(());
-                threads.push(worker.thread);
-            }
-            for thread in threads {
-                if thread.join().is_err() {
-                    failed = true;
-                }
-            }
-            if failed {
-                Err(internal("Worker teardown failed"))
-            } else {
-                Ok(())
-            }
+        }
+        nabedra_rt::task::spawn_blocking_on(&self.coordinator, move || {
+            let failed = coordinator.block_on(wait_for_drain(&mut workers));
+            join_drained_workers(workers, failed)
         })
+    }
+}
+
+async fn wait_for_drain(workers: &mut [Worker]) -> bool {
+    let mut failed = false;
+    for worker in workers {
+        failed |= (&mut worker.drained).await.is_err();
+    }
+    failed
+}
+
+fn join_drained_workers(workers: Vec<Worker>, mut failed: bool) -> Result<(), ProtocolError> {
+    let mut threads = Vec::new();
+    for worker in workers {
+        let _ = worker.exit.send(());
+        threads.push(worker.thread);
+    }
+    for thread in threads {
+        failed |= thread.join().is_err();
+    }
+    if failed {
+        Err(internal("Worker teardown failed"))
+    } else {
+        Ok(())
     }
 }
 
@@ -501,6 +517,33 @@ mod scheduling_tests {
         threads.shutdown().await.unwrap();
         assert_eq!(pool.scheduler().usage(), vec![(0, 0, 0)]);
     }
+    #[cfg(feature = "sim")]
+    #[test]
+    fn f03_shutdown_allows_the_coordinator_to_finish_accepted_work() {
+        nabedra_rt::sim::run(50, |_| async {
+            let (pool, threads) = WorkerPool::start(NonZeroUsize::MIN, Handle::current()).unwrap();
+            let (release, wait) = mpsc::channel();
+            let job = pool
+                .submit(0, move |_, _| {
+                    wait.recv_timeout(Duration::from_secs(2))
+                        .map_err(|_| internal("Shutdown stalled coordinator progress"))?;
+                    Ok(42)
+                })
+                .await
+                .unwrap();
+
+            // Shutdown closes admission immediately. This coordinator must be able to
+            // release the admitted job before the returned future is polled.
+            let shutdown = threads.shutdown();
+            assert!(pool.submit(0, |_, _| Ok(())).await.is_err());
+            let _ = release.send(());
+
+            shutdown.await.unwrap();
+            assert_eq!(job.receive().await.unwrap(), 42);
+            assert_eq!(pool.scheduler().usage(), vec![(0, 0, 0)]);
+        });
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn f03_pool_stop_wakes_download_memory_waiter() {
         let resources = WorkerResources {

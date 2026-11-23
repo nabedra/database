@@ -701,6 +701,7 @@ jobs:
           set -eux
           lint() { cargo clippy --locked --no-deps "$@" -- -D clippy::disallowed_methods; }
           lint -p nabedra-database --all-targets
+          lint -p nabedra-database --all-targets --no-default-features --features olap
           lint -p nabedra-database --all-targets --no-default-features --features oltp
           lint -p nabedra-database --all-targets --no-default-features --features oltp-backup-s3
           lint -p nabedra-database --all-targets --no-default-features --features cache

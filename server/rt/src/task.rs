@@ -70,7 +70,8 @@ where
 /// [`tokio::runtime::Handle::spawn_blocking`]: blocking work on the given runtime's
 /// blocking pool, for code that holds a handle rather than running inside the runtime.
 /// Under `sim` it runs inline like [`spawn_blocking`]; the handle must belong to the
-/// world's runtime while a simulated world is installed.
+/// world's runtime while a simulated world is installed. The closure must be able
+/// to finish without progress on the simulated runtime.
 #[inline]
 #[track_caller]
 pub fn spawn_blocking_on<F, R>(handle: &tokio::runtime::Handle, f: F) -> JoinHandle<R>
