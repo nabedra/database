@@ -39,7 +39,8 @@ pub(super) mod scoped_store;
 mod removal;
 mod read_grants;
 pub use read_grants::ReadGrantSet;
-pub(crate) use read_grants::MAX_READ_GRANTS;
+#[cfg(test)]
+use read_grants::MAX_READ_GRANTS;
 #[cfg(test)]
 mod tests;
 mod transfer;
@@ -76,17 +77,7 @@ pub struct OriginalAuthorization {
     pub credential_expires_at_ms: Option<u64>,
 }
 
-/// Catalog MVCC resolves this lineage at storage_pin.read_ts. A TSO allocation
-/// alone cannot manufacture schema/routing lineage supplied by a caller.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QueueReadToken {
-    pub identity: PinIdentity,
-    pub storage_pin: StoragePin,
-    pub catalog_root: Digest,
-    pub schema_epoch: u64,
-    pub routing_epoch: u64,
-}
+pub use nabedra_oltp_types::authority::{QueueReadToken};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

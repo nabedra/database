@@ -1,7 +1,7 @@
 //! A close proof certifies one physical DB handle is gone. It is not a shard
 //! quorum, queue handoff, provider detach, or permission to reopen the pool.
 use super::*;
-use crate::oltp_replication::types::WorkerIdentity;
+use nabedra_oltp_types::types::WorkerIdentity;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct PoolClosedStatement {
@@ -129,7 +129,7 @@ impl VerifiedPoolClosed {
     /// under an exclusive lock on the same verified mount instance.
     pub(crate) fn recover_registered(
         close_id: Uuid,
-        mount: &crate::oltp_replication::authority::control::DrainMount,
+        mount: &nabedra_oltp_types::authority::DrainMount,
     ) -> Result<Self, ProtocolError> {
         #[cfg(target_os = "linux")]
         {
@@ -154,7 +154,7 @@ impl OltpPool {
     pub(crate) async fn check_retired_groups<F, Check>(&self, check: Check) -> Result<(), ProtocolError>
     where
         F: std::future::Future<Output = Result<bool, ProtocolError>>,
-        Check: Fn(crate::oltp_replication::authority::control::ReplicaRetiredStamp) -> F,
+        Check: Fn(nabedra_oltp_types::authority::ReplicaRetiredStamp) -> F,
     {
         #[derive(serde::Deserialize)]
         struct LocalGroupPage {
@@ -196,9 +196,9 @@ impl OltpPool {
     pub(crate) async fn drain_group_retirement(
         &self,
         group: GroupIdentity,
-    ) -> Result<crate::oltp_replication::authority::control::ReplicaRetiredStamp, ProtocolError>
+    ) -> Result<nabedra_oltp_types::authority::ReplicaRetiredStamp, ProtocolError>
     {
-        use crate::oltp_replication::{authority::control::ReplicaRetiredStamp, types::GroupKind};
+        use nabedra_oltp_types::{authority::ReplicaRetiredStamp, types::GroupKind};
         let pool = self.clone();
         self.resources()
             .execute(ExecutionClass::Control, 0, 0, move || {

@@ -3,9 +3,9 @@
 use super::history::{HistoryScope, VerifiedHistory};
 use crate::{
     oltp::{failure, pool::PoolIdentity},
-    oltp_replication::types::{CommitTs, Digest},
     protocol::{ErrorCode, ProtocolError},
 };
+use nabedra_oltp_types::types::{CommitTs, Digest};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -38,7 +38,7 @@ impl VerifiedRestorePlan {
     pub(crate) fn matches_registered(
         &self,
         cluster: Uuid,
-        database: &crate::oltp_replication::types::Text<128>,
+        database: &nabedra_oltp_types::types::Text<128>,
         groups: impl IntoIterator<Item = Uuid>,
     ) -> bool {
         cluster != self.base.logical_cluster
@@ -120,7 +120,7 @@ pub(crate) struct RestoreGenesisStatement {
     pub format_version: u32,
     pub restore_id: Uuid,
     pub source_cluster: Uuid,
-    pub database: crate::oltp_replication::types::Text<128>,
+    pub database: nabedra_oltp_types::types::Text<128>,
     pub source_archive: Uuid,
     pub source_root: Digest,
     pub segment_count: u64,
@@ -239,7 +239,7 @@ impl OfflineRestoreTarget {
                 return Err(invalid());
             }
         }
-        let restore_id = crate::oltp_replication::owned::serialized_digest(&(
+        let restore_id = nabedra_oltp_types::owned::serialized_digest(&(
             b"nabedra/mounted-restore-genesis/v1".as_slice(),
             plan.base.archive_id,
             plan.final_root,

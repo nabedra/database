@@ -1,5 +1,4 @@
 use super::*;
-use crate::oltp_runtime::coordinator::QueueCoordinator;
 use crate::oltp::test_hooks::continuation;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -133,7 +132,7 @@ impl HeldContinuation {
             .find(|member| member.worker_id == target)
             .ok_or_else(unavailable)?
             .node_id;
-        let replica = client.shared.read_replica()?;
+        let replica = client.shared.read_replica::<Mutex<WorkerReplica>>()?;
         let (owner, worker) = {
             let replica = replica.lock().map_err(|_| unavailable())?;
             (

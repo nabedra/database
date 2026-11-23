@@ -4,7 +4,9 @@ mod activation;
 mod closed;
 mod damage;
 mod disk;
-pub(crate) use activation::{ReplicaActivationStatement, VerifiedReplicaActivation};
+pub(crate) use activation::{
+    ActivationMembershipProof, ReplicaActivationStatement, VerifiedReplicaActivation,
+};
 pub use damage::ACCEPT_DAMAGE_FILE;
 use damage::group_of_scope;
 pub(crate) use damage::{DamageCause, DamagedReplicaRemoved, ReleaseOutcome, quarantined_group};
@@ -33,13 +35,11 @@ pub(crate) use resources::{DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease, RAFT_
 pub(crate) use tests::acceptance_damaged_checkpoints;
 
 use super::{failure, recovery_unknown};
-use crate::{
-    oltp_replication::types::{Digest, GroupIdentity},
-    protocol::{ErrorCode, ProtocolError},
-    scheduling::MemoryCharge,
-};
+use crate::protocol::{ErrorCode, ProtocolError};
 use bytes::Bytes;
 use nabedra_kv::{Durability, Snapshot, Store, WriteBatch};
+use nabedra_oltp_types::types::{Digest, GroupIdentity};
+use nabedra_resources::scheduling::MemoryCharge;
 use nabedra_rt::fs::os::{File, OpenOptions, self as fs};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -768,7 +768,7 @@ impl OltpPool {
     }
 }
 
-pub use crate::oltp_replication::types::AppliedPosition;
+pub use nabedra_oltp_types::types::AppliedPosition;
 #[derive(Clone, Debug)]
 pub struct ApplyMeta {
     pub position: AppliedPosition,
@@ -1055,7 +1055,8 @@ impl GroupStore {
         };
         // RD2: a Data apply's legs on its host (order lock, budgets, native
         // execute incl. its admission, journal completion).
-        use crate::{oltp_replication::types::GroupKind, oltp_runtime::stage_timing::perf_stage};
+        use nabedra_oltp_types::types::GroupKind;
+        use nabedra_resources::perf_stage;
         let data_apply = matches!(lane, MutationLane::State)
             && matches!(self.identity().kind, GroupKind::Data { .. });
         let stage_started = nabedra_rt::time::now_std();
@@ -1484,7 +1485,7 @@ impl GroupStore {
     /// The caller reserves actual decode ownership before entering native work.
     /// Only a validated attached typed command may leave this callback; native
     /// apply buffers never become a Raft log payload or membership allocation.
-    pub async fn log_read_owned<D: crate::oltp_replication::owned::OwnedPayload>(
+    pub async fn log_read_owned<D: nabedra_oltp_types::owned::OwnedPayload>(
         &self,
         budget: TransactionBudget,
         owner: Arc<ScratchLease>,
@@ -1492,10 +1493,10 @@ impl GroupStore {
             &mut GroupRead<'_>,
             Arc<ScratchLease>,
         )
-            -> Result<crate::oltp_replication::owned::OwnedCommand<D>, ProtocolError>
+            -> Result<nabedra_oltp_types::owned::OwnedCommand<D>, ProtocolError>
         + Send
         + 'static,
-    ) -> Result<crate::oltp_replication::owned::OwnedCommand<D>, ProtocolError> {
+    ) -> Result<nabedra_oltp_types::owned::OwnedCommand<D>, ProtocolError> {
         self.read_namespace(
             true,
             self.execution_class(),
@@ -1512,7 +1513,7 @@ impl GroupStore {
         )
         .await
     }
-    pub(crate) async fn read_owned<D: crate::oltp_replication::owned::OwnedPayload>(
+    pub(crate) async fn read_owned<D: nabedra_oltp_types::owned::OwnedPayload>(
         &self,
         budget: TransactionBudget,
         owner: Arc<ScratchLease>,
@@ -1520,10 +1521,10 @@ impl GroupStore {
             &mut GroupRead<'_>,
             Arc<ScratchLease>,
         )
-            -> Result<crate::oltp_replication::owned::OwnedCommand<D>, ProtocolError>
+            -> Result<nabedra_oltp_types::owned::OwnedCommand<D>, ProtocolError>
         + Send
         + 'static,
-    ) -> Result<crate::oltp_replication::owned::OwnedCommand<D>, ProtocolError> {
+    ) -> Result<nabedra_oltp_types::owned::OwnedCommand<D>, ProtocolError> {
         self.read_namespace(
             false,
             self.execution_class(),
@@ -1638,9 +1639,9 @@ impl GroupStore {
     }
     fn execution_class(&self) -> ExecutionClass {
         match self.identity().kind {
-            crate::oltp_replication::types::GroupKind::Control
-            | crate::oltp_replication::types::GroupKind::Timestamps
-            | crate::oltp_replication::types::GroupKind::Status { .. } => ExecutionClass::Control,
+            nabedra_oltp_types::types::GroupKind::Control
+            | nabedra_oltp_types::types::GroupKind::Timestamps
+            | nabedra_oltp_types::types::GroupKind::Status { .. } => ExecutionClass::Control,
             _ => ExecutionClass::Query,
         }
     }

@@ -3,7 +3,7 @@ use crate::oltp_replication::service_rpc::ReadScope;
 
 // A query can have at most this many scan pages in flight. Keep the copy
 // header, snapshot page, and per-record memory charge bounded at that width.
-pub(crate) const MAX_READ_GRANTS: usize = 4;
+pub(crate) use nabedra_oltp_types::authority::MAX_READ_GRANTS;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -24,11 +24,9 @@ use super::{
     OltpPool, PoolInner, failure,
     storage::{commit_error, group_scope, storage_error, wait_commit},
 };
-use crate::{
-    oltp_replication::types::{AppliedPosition, GroupIdentity, ReplicaMember},
-    protocol::{ErrorCode, Outcome, ProtocolError},
-};
+use crate::protocol::{ErrorCode, Outcome, ProtocolError};
 use nabedra_kv::{Damage, DamageReason, Durability, Store, WriteBatch};
+use nabedra_oltp_types::types::{AppliedPosition, GroupIdentity, ReplicaMember};
 use nabedra_rt::fs::os as fs;
 use serde::{Deserialize, Serialize};
 use std::{

@@ -4,7 +4,7 @@
 //! (rule 1). Damage is injected on `FaultFs`; crash evidence is that fault model.
 use super::*;
 use crate::oltp::pool::{ACCEPT_DAMAGE_FILE, DamagedReplicaRemoved, ReleaseOutcome};
-use crate::oltp_replication::types::ReplicaMember;
+use nabedra_oltp_types::types::ReplicaMember;
 
 /// Creates `count` groups with one synced entry each, holding `needle(n)`,
 /// then a later synced write as evidence. Returns the group identities.

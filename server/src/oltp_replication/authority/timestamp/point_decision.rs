@@ -20,6 +20,9 @@ pub(crate) use crate::oltp_replication::authority::status::identity::transaction
     TimestampDecisionLocator, TimestampPointBinding, TimestampPointManifest,
 };
 
+pub(crate) use nabedra_oltp_types::authority::{PointDecision, matches_epoch};
+use nabedra_oltp_types::authority::{abandon_outcome, conflict_outcome, valid_position};
+
 pub(crate) const STATUS_INDEX: &[u8] = b"ts/point/status/";
 const MARKERS: &[u8] = b"ts/point/marker/";
 const RECORDS: &[u8] = b"ts/point/decision/";
@@ -100,162 +103,24 @@ impl PointCommand {
     }
 }
 
-/// `decided_at` belongs to Timestamp. The later Status projection and Data
-/// completion each retain their own first applied positions.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PointDecision {
-    locator: TimestampDecisionLocator,
-    authority: Authority,
-    decided_at: AppliedPosition,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    queue_epoch: Option<ScopedTimestampEpoch>,
-    seal_at: Option<AppliedPosition>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    rejection_at: Option<AppliedPosition>,
-    decision: TxnDecision,
-    outcome: MutationOutcome,
-}
-
-impl PointDecision {
-    pub(crate) fn locator(&self) -> &TimestampDecisionLocator {
-        &self.locator
+fn valid_in_state(
+    decision: &PointDecision,
+    scope: &GroupIdentity,
+    state: &State,
+    request_id: Uuid,
+) -> Result<bool, ProtocolError> {
+    let binding = &decision.locator.binding;
+    if binding.timestamps_group != *scope
+        || binding.txn.request_id != request_id
+        || decision.authority.owner_term > state.authority.owner_term
+        || (decision.authority.owner_term == state.authority.owner_term
+            && decision.authority != state.authority)
+        || matches!(decision.decision, TxnDecision::Commit { commit_ts }
+            if commit_ts.get() > state.high_watermark)
+    {
+        return Ok(false);
     }
-
-    pub(crate) fn decision(&self) -> TxnDecision {
-        self.decision
-    }
-
-    pub(crate) fn decided_at(&self) -> AppliedPosition {
-        self.decided_at
-    }
-
-    pub(crate) fn rejection_at(&self) -> Option<AppliedPosition> {
-        self.rejection_at
-    }
-
-    pub(crate) fn authority(&self) -> Authority {
-        self.authority
-    }
-
-    pub(crate) fn outcome(&self) -> &MutationOutcome {
-        &self.outcome
-    }
-
-    pub(crate) fn verify_locator(
-        &self,
-        expected: &TimestampDecisionLocator,
-    ) -> Result<(), ProtocolError> {
-        if &self.locator != expected || !self.valid_receipt().map_err(|_| unknown())? {
-            return Err(unknown());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.locator.heap_bytes() + self.outcome.heap_bytes()
-    }
-
-    pub(crate) fn resolution_seal(&self) -> Result<AppliedPosition, ProtocolError> {
-        self.verify_locator(&self.locator)?;
-        self.seal_at.ok_or_else(unknown)
-    }
-
-    fn valid_in_state(
-        &self,
-        scope: &GroupIdentity,
-        state: &State,
-        request_id: Uuid,
-    ) -> Result<bool, ProtocolError> {
-        let binding = &self.locator.binding;
-        if binding.timestamps_group != *scope
-            || binding.txn.request_id != request_id
-            || self.authority.owner_term > state.authority.owner_term
-            || (self.authority.owner_term == state.authority.owner_term
-                && self.authority != state.authority)
-            || matches!(self.decision, TxnDecision::Commit { commit_ts }
-                if commit_ts.get() > state.high_watermark)
-        {
-            return Ok(false);
-        }
-        self.valid_receipt()
-    }
-
-    fn valid_receipt(&self) -> Result<bool, ProtocolError> {
-        if self.locator.validate().is_err()
-            || self.authority.validate().is_err()
-            || !valid_position(self.decided_at)
-        {
-            return Ok(false);
-        }
-        let binding = &self.locator.binding;
-        Ok(
-            match (
-                self.decision,
-                self.seal_at,
-                self.rejection_at,
-                self.queue_epoch,
-            ) {
-                (TxnDecision::Commit { commit_ts }, Some(seal_at), None, Some(epoch)) => {
-                    binding.accepts_authority(self.authority)
-                        && matches_epoch(binding, epoch)
-                        && valid_position(seal_at)
-                        && commit_ts > binding.storage_pin.read_ts
-                        && valid_outcome(&self.outcome, binding.result_digest)?
-                }
-                (
-                    TxnDecision::Abort {
-                        reason: AbortReason::AbandonedByFence,
-                    },
-                    None,
-                    None,
-                    None,
-                ) => {
-                    self.authority.owner_term > binding.created_authority.owner_term
-                        && self.authority.run_id != binding.request.run_id
-                        && self.outcome == abandon_outcome()?
-                }
-                (
-                    TxnDecision::Abort {
-                        reason: AbortReason::Conflict,
-                    },
-                    None,
-                    Some(rejected_at),
-                    Some(epoch),
-                ) => {
-                    binding.accepts_authority(self.authority)
-                        && matches_epoch(binding, epoch)
-                        && valid_position(rejected_at)
-                        && self.outcome == conflict_outcome()?
-                }
-                _ => false,
-            },
-        )
-    }
-}
-
-pub(crate) fn matches_epoch(binding: &TimestampPointBinding, epoch: ScopedTimestampEpoch) -> bool {
-    epoch.valid() && (epoch == binding.original_epoch || epoch.advances(binding.original_epoch))
-}
-
-fn valid_position(position: AppliedPosition) -> bool {
-    position.term != 0 && position.node_id != 0 && position.index != 0
-}
-
-fn abandon_outcome() -> Result<MutationOutcome, ProtocolError> {
-    MutationOutcome::failure(ProtocolError::new(
-        ErrorCode::Conflict,
-        "original execution authority was fenced",
-        Outcome::NotApplied,
-    ))
-}
-
-fn conflict_outcome() -> Result<MutationOutcome, ProtocolError> {
-    MutationOutcome::failure(ProtocolError::new(
-        ErrorCode::Conflict,
-        "row version changed since the pinned snapshot",
-        Outcome::NotApplied,
-    ))
+    decision.valid_receipt()
 }
 
 fn invalid() -> ProtocolError {
@@ -323,7 +188,7 @@ pub(super) fn read_record_by_uuid(
             }
             let decision: PointDecision =
                 serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())?;
-            if !decision.valid_in_state(scope, state, uuid)?
+            if !valid_in_state(&decision, scope, state, uuid)?
                 || !get(&index_key(&decision.locator))?
                     .is_some_and(|index| index.as_slice() == marker.as_slice())
             {

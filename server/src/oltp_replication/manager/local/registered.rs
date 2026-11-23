@@ -6,7 +6,9 @@ use crate::config::ExecutionConfig;
 use crate::oltp::backup::restore::{
     OfflineRestoreTarget, RestoredGenesis, verified_restore_marker,
 };
-use crate::oltp::pool::mount::{PoolMountExpectation, PoolMountProfile, VerifiedPoolMount};
+use crate::oltp::pool::mount::{
+    PoolExclusionProof, PoolMountExpectation, PoolMountProfile, VerifiedMountAnchor, VerifiedPoolMount,
+};
 use crate::oltp_backup_repository::{ArchiveEncryptionConfig, ArchiveKeys};
 use crate::oltp_deployment::inventory::{SecondaryPoolConfig, WorkerPools};
 use crate::oltp_replication::authority::{control::{OperatorPolicy, ReplacementRecord}, status::StatusTopology};
@@ -500,7 +502,7 @@ impl RegisteredWorker {
                 {
                     return Err(invalid());
                 }
-                expected.inspect_mount()
+                VerifiedMountAnchor::inspect(expected)
             })
             .transpose()?;
         let primary_mount = anchor.as_ref().map(|mount| mount.observation().clone());
@@ -655,7 +657,10 @@ impl RegisteredWorker {
                 }
                 _ => None,
             };
-            let mount = VerifiedPoolMount::from_anchor(anchor, exclusion.as_ref())?;
+            let mount = VerifiedPoolMount::from_anchor(
+                anchor,
+                exclusion.as_ref().map(|proof| proof as &dyn PoolExclusionProof),
+            )?;
             let target = restore
                 .as_ref()
                 .map(|verified| OfflineRestoreTarget::claim_mounted(&mount, &verified.plan))

@@ -1,0 +1,17 @@
+id = "oltp-integration-modes"
+module = "oltp"
+kinds = ["U", "R"]
+guarantees = []
+scenarios = ["C07", "M02", "O06", "Q03", "Q04", "Q06", "R01", "R03", "U02"]
+tiers = ["T1"]
+command = ["bash", "-ec", '''
+for mode in on off; do
+    echo "OLTP integration tests with NABEDRA_TEST_DIRECT_OLTP=$mode"
+    NABEDRA_TEST_DIRECT_OLTP="$mode" cargo test --locked -j 4 --no-default-features --features oltp \
+        --test oltp_multiplex --test oltp_worker_queue --test worker_pool --test executor --test protocol
+done
+''']
+cwd = "server"
+timeout_s = 3600
+needs = []
+result_parser = "cargo-test"

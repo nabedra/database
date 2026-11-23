@@ -10,6 +10,7 @@ pub(crate) mod backup;
 pub mod mvcc;
 pub mod pool;
 mod query;
+pub(crate) mod read_attempt;
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) mod test_hooks;
 

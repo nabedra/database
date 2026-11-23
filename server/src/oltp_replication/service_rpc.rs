@@ -22,12 +22,14 @@ mod read_attempt;
 pub(crate) use metadata::{
     AdmissionTicketIssuer, AuthenticatedMetadataReply, BackupPublicationReader,
     OwnerAdmissionObservation, OwnerAdmissionReader, OwnerAdmissionTicket, StatusClient,
-    StatusEndpoint, TimestampClient, TimestampEndpoint, VerifiedTimestampPointDecision,
+    StatusEndpoint, TimestampClient, TimestampEndpoint,
 };
+#[allow(unused_imports)]
+pub(crate) use metadata::VerifiedTimestampPointDecision;
 #[cfg(test)]
 pub(crate) use read_attempt::fixture as read_fixture;
 pub(crate) use read_attempt::{
-    ReadAttempts, ReadGrant, ReadScope, ScheduledReadError, UnsettledRead,
+    ReadGrant, ReadScope, ScheduledReadError, UnsettledRead,
 };
 mod status;
 pub(crate) use participant::{
@@ -1803,14 +1805,8 @@ fn placement_rejected_before_execution(error: &ProtocolError) -> bool {
             && error.message == "worker does not host target replica node")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ParticipantProofKind {
-    Seal,
-    Resolution,
-    Lifecycle,
-    Activation,
-    IndexClosed,
-}
+pub(crate) use nabedra_oltp_types::authority::ParticipantProofKind;
+
 /// Only the verified strong-read RPC decoder can create this object. Its
 /// statement hash prevents reusing an authenticated response with changed DTOs.
 pub(crate) struct AuthenticatedParticipantReplyContext {
@@ -1822,14 +1818,16 @@ pub(crate) struct AuthenticatedParticipantReplyContext {
     payload_digest: Digest,
     owner: Arc<ScratchLease>,
 }
-impl AuthenticatedParticipantReplyContext {
-    pub(crate) fn group(&self) -> &GroupIdentity {
+impl crate::oltp::mvcc::store::ParticipantReplyProof for AuthenticatedParticipantReplyContext {
+    fn group(&self) -> &GroupIdentity {
         &self.group
     }
-    pub(crate) fn owner(&self) -> Arc<ScratchLease> {
+
+    fn owner(&self) -> Arc<ScratchLease> {
         self.owner.clone()
     }
-    pub(crate) fn verify_payload(
+
+    fn verify_payload(
         &self,
         kind: ParticipantProofKind,
         value: &impl Serialize,
@@ -1844,6 +1842,9 @@ impl AuthenticatedParticipantReplyContext {
         }
         Ok(())
     }
+}
+
+impl AuthenticatedParticipantReplyContext {
     fn verified(
         reply: &ReceivedReply,
         node_id: u64,

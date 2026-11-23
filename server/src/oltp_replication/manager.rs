@@ -17,7 +17,7 @@ use super::{
 use crate::{
     oltp::{
         mvcc::store::ParticipantMachine,
-        pool::{GroupStore, WorkerSharedResources},
+        pool::{ActivationMembershipProof, GroupStore, WorkerSharedResources},
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
@@ -764,6 +764,49 @@ impl GroupMembershipObservation {
     }
     pub(crate) fn applied_at(&self) -> AppliedPosition {
         self.applied_at
+    }
+}
+impl ActivationMembershipProof<false> for GroupMembershipObservation {
+    fn group(&self) -> &GroupIdentity {
+        self.group()
+    }
+
+    fn voters(&self) -> &[ReplicaMember] {
+        self.replicas()
+    }
+
+    fn position(&self) -> AppliedPosition {
+        self.applied_at()
+    }
+
+    fn matches_stored_membership(
+        bytes: &[u8],
+        voters: &[ReplicaMember],
+        minimum: AppliedPosition,
+    ) -> Result<bool, ProtocolError> {
+        super::entry::activation_membership_matches(bytes, voters, minimum, false)
+    }
+}
+
+impl ActivationMembershipProof<true> for AppliedPlacementMembership {
+    fn group(&self) -> &GroupIdentity {
+        self.group()
+    }
+
+    fn voters(&self) -> &[ReplicaMember] {
+        self.voters()
+    }
+
+    fn position(&self) -> AppliedPosition {
+        self.position()
+    }
+
+    fn matches_stored_membership(
+        bytes: &[u8],
+        voters: &[ReplicaMember],
+        minimum: AppliedPosition,
+    ) -> Result<bool, ProtocolError> {
+        super::entry::activation_membership_matches(bytes, voters, minimum, true)
     }
 }
 impl<C, M> RaftConsensus<C, M>

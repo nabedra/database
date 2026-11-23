@@ -1,32 +1,11 @@
-use super::*;
-use std::{future::Future, path::PathBuf};
-
-fn marker(scope: ReadScope, group: Uuid, stage: &str) -> Option<PathBuf> {
-    let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
-    Some(directory.join(format!("read-{}-{group}-{stage}", scope.request.request_id)))
-}
-
-pub(crate) fn record(
-    scope: ReadScope,
-    group: Uuid,
-    stage: &str,
-    ticket: Uuid,
-    worker: WorkerIdentity,
-) {
-    let Some(path) = marker(scope, group, stage) else {
-        return;
-    };
-    if !path.with_file_name("read-scheduler-fixture").is_file() {
-        return;
-    }
-    let bytes = serde_json::to_vec(&serde_json::json!({
-        "ticket": ticket, "worker": worker, "scope": scope,
-    }))
-    .unwrap();
-    let temporary = path.with_extension(format!("{}.tmp", nabedra_rt::ids::uuid_v4()));
-    std::fs::write(&temporary, bytes).unwrap();
-    std::fs::rename(temporary, path).unwrap();
-}
+use super::{ReadGrant, ReadScope};
+use crate::oltp_replication::{multiplex::RequestError, service_rpc::CallError};
+use nabedra_oltp_types::types::WorkerIdentity;
+use std::time::Duration;
+use uuid::Uuid;
+use std::future::Future;
+use crate::oltp::read_attempt::fixture::marker;
+pub(crate) use crate::oltp::read_attempt::fixture::record;
 
 pub(crate) async fn reply_ready(
     scope: ReadScope,
@@ -70,7 +49,7 @@ async fn wait_for_release(scope: ReadScope, group: Uuid, hold: &str, release: &s
     }
 }
 
-pub(crate) async fn disconnect<T>(
+pub(in crate::oltp_replication::service_rpc) async fn disconnect<T>(
     scope: ReadScope,
     group: Uuid,
     response: impl Future<Output = Result<T, CallError>>,

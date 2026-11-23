@@ -127,11 +127,11 @@ async fn o02_t7_direct_schema_is_a_new_tag_and_an_active_config_is_unreadable_by
     // Nested in a scoped envelope it is refused at apply.
     let before = f.dump().await;
     let scoped = ParticipantCommand::Scoped {
-        scope: crate::oltp_replication::authority::control::ScopedCatalogRead {
+        scope: nabedra_oltp_types::authority::ScopedCatalogRead {
             queue_group_id: nabedra_rt::ids::uuid_v4(),
             data_generation: nabedra_rt::ids::uuid_v4(),
             queue_generation: nabedra_rt::ids::uuid_v4(),
-            queue_view: crate::oltp_replication::types::AuthorityView {
+            queue_view: nabedra_oltp_types::types::AuthorityView {
                 run_id: f.authority.run_id,
                 owner_term: f.authority.owner_term,
                 membership_revision: 1,

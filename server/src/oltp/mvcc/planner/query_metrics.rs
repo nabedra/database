@@ -3,10 +3,10 @@
 //! recommendation per entry. Scalar literals and row data never enter the hash.
 use crate::{
     oltp::pool::WorkerSharedResources,
-    oltp_replication::types::{Digest, Text},
     protocol::{ComparisonOp, LogicalPredicate, Predicate, ProtocolError, Query, TableDescriptor},
     scheduling::MemoryCharge,
 };
+use nabedra_oltp_types::types::{Digest, Text};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use std::sync::Mutex;

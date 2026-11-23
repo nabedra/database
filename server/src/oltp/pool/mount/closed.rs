@@ -1,6 +1,7 @@
 //! A completed registered-pool drain cannot reopen by racing the released
 //! local lock. Reopening requires a separate authoritative generation change.
 use super::*;
+use serde::{Deserialize, Serialize};
 pub(super) const CLOSED: &str = ".nabedra-closed-pool-v1.json";
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -118,13 +119,13 @@ impl VerifiedPoolMount {
 
 #[cfg(target_os = "linux")]
 pub(in crate::oltp::pool) fn prove_closed(
-    expected: &crate::oltp_replication::authority::control::DrainMount,
+    expected: &nabedra_oltp_types::authority::DrainMount,
     id: uuid::Uuid,
 ) -> Result<MountedPoolObservation, ProtocolError> {
     expected.expected.validate()?;
     let anchor = super::linux::inspect_for_close(expected.expected.clone())?;
     let mount = &anchor.observation;
-    if crate::oltp_replication::authority::control::DrainMount::from(mount.clone()) != *expected {
+    if nabedra_oltp_types::authority::DrainMount::from(mount.clone()) != *expected {
         return Err(invalid());
     }
     let path = anchor.directory.fd_path();

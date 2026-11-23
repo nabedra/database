@@ -1,9 +1,9 @@
 use super::*;
 use crate::{
-    oltp::pool::WorkerSharedResources, oltp_replication::service_rpc::UnsettledRead,
-    oltp_runtime::replica::MAX_READ_GRANTS,
+    oltp::{pool::WorkerSharedResources, read_attempt::UnsettledRead},
     scheduling::Reservation,
 };
+use nabedra_oltp_types::authority::MAX_READ_GRANTS;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{
     future::Future,
@@ -239,7 +239,7 @@ fn unavailable() -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WorkerResources;
+    use nabedra_resources::config::WorkerResources;
     use std::task::Poll;
     use tokio::sync::{Notify, oneshot};
     const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -249,7 +249,7 @@ mod tests {
     }
 
     fn request() -> RequestBinding {
-        let digest = crate::oltp_replication::types::Digest::from_bytes([1; 32]);
+        let digest = nabedra_oltp_types::types::Digest::from_bytes([1; 32]);
         RequestBinding {
             run_id: nabedra_rt::ids::uuid_v4(),
             request_id: nabedra_rt::ids::uuid_v4(),

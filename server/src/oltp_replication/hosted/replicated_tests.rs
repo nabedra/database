@@ -336,12 +336,12 @@ async fn propose_all(voter: &Voter, ids: std::ops::Range<u64>) {
                     ByteClass::Data,
                 )
                 .unwrap();
-                command
-                    .reserve_raft_metadata(
-                        &consensus.state._resident,
-                        OwnedRaftEntry::<Bump>::normal_metadata_bytes(),
-                    )
-                    .unwrap();
+                crate::oltp_replication::entry::reserve_raft_metadata(
+                    &command,
+                    &consensus.state._resident,
+                    OwnedRaftEntry::<Bump>::normal_metadata_bytes(),
+                )
+                .unwrap();
                 match consensus.raft.client_write(command).await {
                     Ok(_) => return,
                     Err(error)

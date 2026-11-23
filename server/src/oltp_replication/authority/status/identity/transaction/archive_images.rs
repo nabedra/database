@@ -451,12 +451,7 @@ pub(super) fn project_identity(
     record.retirement = None;
     Some(record)
 }
-pub(crate) fn identity_inventory_seed(
-    group: &GroupIdentity,
-    applied: AppliedPosition,
-) -> Result<Digest, ProtocolError> {
-    serialized_digest(&(b"nabedra/status-identities/v1".as_slice(), group, applied))
-}
+pub(crate) use nabedra_oltp_types::authority::identity_inventory_seed;
 fn identity_step(root: Digest, record: &IdentityRecord) -> Result<Digest, ProtocolError> {
     serialized_digest(&(b"nabedra/status-identity/v1".as_slice(), root, record))
 }
@@ -515,19 +510,18 @@ pub(crate) fn identity_receipt_metadata_step(
     if image.key != key(IDENTITIES, identity.reservation.request_id) || image.commit_ts.is_some() {
         return Err(invalid());
     }
-    let archived = super::archive::ArchivedIdentity {
-        origin: identity.restore_origin,
-        reservation: identity.reservation,
-        reserved_at: identity.reserved_at,
-        disposition: super::archive::identity_disposition(
+    let archived = super::archive::ArchivedIdentity::new(
+        identity.restore_origin,
+        identity.reservation,
+        identity.reserved_at,
+        super::archive::identity_disposition(
             identity.reservation,
             identity.terminal,
             identity.rejection,
             cut,
         ),
-        point_projection: None,
-        owner: None,
-    };
+        None,
+    );
     Ok(Some(receipt_step(root, &archived)?))
 }
 #[derive(Serialize, Deserialize)]

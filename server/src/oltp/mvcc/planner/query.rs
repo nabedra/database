@@ -5,13 +5,13 @@ use crate::oltp::mvcc::{
     store::scan::{ScanDomain, ScanPage, ScanRequest},
 };
 use crate::{
-    oltp::pool::{ByteClass, ScratchLease},
-    oltp_replication::{
-        owned::OwnedCommand,
-        service_rpc::{ReadScope, ScheduledReadError},
-    },
+    oltp::{pool::{ByteClass, ScratchLease}, read_attempt::ScheduledReadError},
     protocol::Query,
     query_semantics,
+};
+use nabedra_oltp_types::{
+    owned::OwnedCommand,
+    authority::ReadScope,
 };
 use serde::{
     Serialize,

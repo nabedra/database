@@ -16,6 +16,7 @@ pub(crate) use admission::{
     AdmissionTicketIssuer, OwnerAdmissionObservation, OwnerAdmissionReader, OwnerAdmissionTicket,
 };
 pub(crate) use status_service::{StatusClient, StatusEndpoint};
+#[allow(unused_imports)]
 pub(crate) use timestamp_service::VerifiedTimestampPointDecision;
 pub(crate) use timestamp_service::{BackupPublicationReader, TimestampClient, TimestampEndpoint};
 

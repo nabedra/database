@@ -8,6 +8,7 @@ use bytes::Bytes;
 use nabedra_kv::{
     Background, BlockCache, Commit, MemtableBudget, Options, Seq, StoreStats, fs::Fs,
 };
+pub(super) use nabedra_oltp_types::authority::unsupported_pool_format as unsupported_format;
 use nabedra_rt::fs::os as fs;
 use serde::Serialize;
 use std::{
@@ -247,14 +248,6 @@ pub(super) fn storage_error(error: nabedra_kv::Error) -> ProtocolError {
             "OLTP storage unavailable or corrupt",
         ),
     }
-}
-pub(super) fn unsupported_format(found: &str) -> ProtocolError {
-    failure(
-        ErrorCode::StorageUnavailable,
-        &format!(
-            "unsupported store format: {found}. For RocksDB-era OLTP pools, use the archive export and restore procedure in docs/oltp-rocksdb-upgrade.md"
-        ),
-    )
 }
 const NO_SPACE: &str = "OLTP storage device is full; the write was not applied";
 pub(crate) fn no_space() -> ProtocolError {

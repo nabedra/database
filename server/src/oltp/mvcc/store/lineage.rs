@@ -7,10 +7,18 @@ use super::{
     image_archive::{ImagePage, ImageRequest},
     lifecycle::{GuardMode, SealedLifecycleGuard},
 };
-use crate::{
-    oltp::pool::{ByteClass, ExecutionClass, ScratchLease, WorkerSharedResources},
-    oltp_replication::authority::status::SealedSettlement,
-};
+use crate::oltp::pool::{ByteClass, ExecutionClass, ScratchLease, WorkerSharedResources};
+use nabedra_oltp_types::authority::SealedSettlement;
+
+/// Authenticated response for one phase of a split.
+pub(crate) trait SplitReplyProof {
+    fn verify(
+        self,
+        source: bool,
+        group: &GroupIdentity,
+        value: &impl Serialize,
+    ) -> Result<Arc<ScratchLease>, ProtocolError>;
+}
 
 const STATE: &[u8] = b"mvcc/split-import/v1";
 const CURSOR: &[u8] = b"mvcc/split-import-cursor/v1";
@@ -34,7 +42,7 @@ pub(crate) struct VerifiedSplitSource {
 }
 impl VerifiedSplitSource {
     pub(crate) fn from_authenticated(
-        context: crate::oltp_replication::manager::shard_split::AuthenticatedSplitProof,
+        context: impl SplitReplyProof,
         value: (SplitSourceStatement, Option<CommitTs>),
         children: &[SplitBinding; 2],
     ) -> Result<Self, ProtocolError> {
@@ -171,7 +179,7 @@ pub(crate) struct VerifiedSplitImported {
 }
 impl VerifiedSplitImported {
     pub(crate) fn from_authenticated(
-        context: crate::oltp_replication::manager::shard_split::AuthenticatedSplitProof,
+        context: impl SplitReplyProof,
         statement: SplitImportedStatement,
         binding: &SplitBinding,
     ) -> Result<Self, ProtocolError> {
@@ -530,7 +538,7 @@ pub(super) fn finish_source(
     let key = source_receipt(split_id);
     let proof = settled.statement();
     let decision = proof.decision.decision;
-    let digest = crate::oltp_replication::owned::serialized_digest(settled)?;
+    let digest = nabedra_oltp_types::owned::serialized_digest(settled)?;
     if let Some(prior) = load::<Digest>(tx, &key)? {
         return if prior == digest {
             commit(tx, &ParticipantReply::SplitSourceFinished(decision))

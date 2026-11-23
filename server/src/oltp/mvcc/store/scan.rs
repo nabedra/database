@@ -70,7 +70,7 @@ impl ParticipantMachine {
             &request.domain,
             ScanDomain::Rows { .. } | ScanDomain::Index { .. }
         )
-        .then(|| crate::oltp_runtime::stage_timing::perf_stage!("test.data.scan").timer());
+        .then(|| nabedra_resources::perf_stage!("test.data.scan").timer());
         if request.max_items == 0
             || request.max_items > 128
             || request.max_bytes == 0
@@ -370,9 +370,9 @@ impl ParticipantMachine {
 impl ParticipantHandle {
     pub(crate) async fn scheduled_scan_page(
         &self,
-        scope: crate::oltp_replication::service_rpc::ReadScope,
+        scope: nabedra_oltp_types::authority::ReadScope,
         request: ScanRequest,
-    ) -> Result<OwnedCommand<ScanPage>, crate::oltp_replication::service_rpc::ScheduledReadError>
+    ) -> Result<OwnedCommand<ScanPage>, crate::oltp::read_attempt::ScheduledReadError>
     {
         if let Some(remote) = &self.remote {
             return remote.scheduled_scan_page(scope, request).await;
@@ -537,7 +537,7 @@ pub(super) fn decode_key(bytes: &[u8]) -> Result<MvccKey, ProtocolError> {
             })
         }
         2 => Ok(MvccKey::CatalogName {
-            name: crate::oltp_replication::types::Text::new(decode_text(&bytes[33..])?)
+            name: nabedra_oltp_types::types::Text::new(decode_text(&bytes[33..])?)
                 .map_err(|_| recovery_unknown())?,
         }),
         _ => Err(recovery_unknown()),

@@ -451,7 +451,7 @@ where
                         .await
                         .map_err(disk)?
                 };
-                responder.send(Applied::owned(position, reply, owner));
+                responder.send(crate::oltp_replication::authority::consensus::owned_applied(position, reply, owner));
             }
         }
         Ok(())
@@ -975,7 +975,8 @@ where
             }
             // Reserve before client_write: saturation is a typed pre-proposal
             // outcome, never a fatal WriteLogs error after Raft accepts it.
-            command.reserve_raft_metadata(
+            super::entry::reserve_raft_metadata(
+                &command,
                 &self.state._resident,
                 super::entry::OwnedRaftEntry::<C::Command>::normal_metadata_bytes(),
             )?;
@@ -994,7 +995,7 @@ where
             .timer();
             let response = self.state.machine.client_write(&self.raft, command).await?;
             let (position, reply, owner) = response.data.into_parts()?;
-            Ok(Applied::owned(
+            Ok(crate::oltp_replication::authority::consensus::owned_applied(
                 position,
                 reply.ok_or_else(unavailable)?,
                 owner,

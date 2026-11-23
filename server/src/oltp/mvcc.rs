@@ -10,9 +10,9 @@ use super::{
     pool::{ByteClass, ChargedBytes, ScratchLease, WorkerSharedResources},
 };
 use crate::{
-    oltp_replication::types::{CommitTs, Text},
     protocol::{ErrorCode, Key, ProtocolError},
 };
+use nabedra_oltp_types::types::{CommitTs, Text};
 /// Fixed commands may duplicate bounded frontend keys/rows. This is an
 /// internal message ceiling, independent of the unchanged8MiB application body.
 pub use nabedra_resources::decode_budget::{
@@ -53,6 +53,12 @@ impl PartialEq for CanonicalJson {
     }
 }
 impl Eq for CanonicalJson {}
+
+impl AsRef<str> for CanonicalJson {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
 
 impl CanonicalJson {
     /// Only the MVCC store calls this on values installed from validated
@@ -267,7 +273,7 @@ pub enum MvccKey {
     IndexEntry {
         table_id: Uuid,
         index_id: Uuid,
-        values: crate::oltp_replication::types::Page<index::IndexValue>,
+        values: nabedra_oltp_types::types::Page<index::IndexValue>,
         primary_key: Key,
     },
     /// A direct-commit dedup record. It is stored in its own `'D'` namespace,
@@ -342,7 +348,7 @@ impl PreparedWrite {
         }
     }
 }
-impl crate::oltp_replication::owned::OwnedPayload for PreparedWrite {
+impl nabedra_oltp_types::owned::OwnedPayload for PreparedWrite {
     fn heap_bytes(&self) -> Result<usize, ProtocolError> {
         let value = match &self.change {
             Change::Put(value) => value.heap_bytes()?,
@@ -364,7 +370,8 @@ impl crate::oltp_replication::owned::OwnedPayload for PreparedWrite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::WorkerResources, oltp::pool::SharedResourceConfig};
+    use crate::oltp::pool::SharedResourceConfig;
+    use nabedra_resources::config::WorkerResources;
     fn resources() -> Arc<WorkerSharedResources> {
         WorkerSharedResources::new(
             0,

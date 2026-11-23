@@ -10,15 +10,15 @@ use crate::{
         },
         recovery_unknown,
     },
-    oltp_replication::{
-        authority::status::{SealedStatusDecision, TimestampDecisionLocator},
-        owned::{OwnedCommand, OwnedPayload},
-        types::{
-            AppliedPosition, Authority, CommitTs, Digest, GroupIdentity, GroupKind, ManifestRef,
-            Page, ParticipantPlan, PreparedParticipant, ReadTs, RequestBinding, TxnDecision, TxnId,
-        },
-    },
     protocol::{ErrorCode, Key, ProtocolError},
+};
+use nabedra_oltp_types::{
+    authority::{SealedStatusDecision, TimestampDecisionLocator},
+    owned::{OwnedCommand, OwnedPayload},
+    types::{
+        AppliedPosition, Authority, CommitTs, Digest, GroupIdentity, GroupKind, ManifestRef,
+        Page, ParticipantPlan, PreparedParticipant, ReadTs, RequestBinding, TxnDecision, TxnId,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -27,6 +27,7 @@ use std::{cmp::Ordering, io, sync::Arc};
 use uuid::Uuid;
 
 pub(crate) mod archive;
+pub(crate) mod consensus;
 pub(crate) mod direct;
 mod handle;
 pub(crate) mod image_archive;
@@ -41,9 +42,11 @@ pub(crate) mod scoped_queue;
 pub(crate) mod split_closure;
 pub(crate) mod split_usage;
 pub(crate) mod timestamp_resolution;
+pub(crate) use nabedra_oltp_types::authority::ResolutionEvidence;
 pub(crate) use handle::{
     LatestRead, ParticipantEpochs, ParticipantFuture, ParticipantHandle, PointEvidenceRead,
-    RemoteParticipant, ScheduledReadFuture, VerifiedParticipantResolution, VerifiedParticipantSeal,
+    ParticipantReplyProof, RemoteParticipant, ScheduledReadFuture, VerifiedParticipantResolution,
+    VerifiedParticipantSeal,
 };
 const CONFIG: &[u8] = b"mvcc/config/v1";
 const HEAD: u8 = b'h';
@@ -89,7 +92,7 @@ struct Config {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ParticipantCommand {
     Scoped {
-        scope: crate::oltp_replication::authority::control::ScopedCatalogRead,
+        scope: nabedra_oltp_types::authority::ScopedCatalogRead,
         command: OwnedCommand<ParticipantCommand>,
     },
     FenceScopedQueue(scoped_queue::QueueFence),
@@ -110,7 +113,7 @@ pub(crate) enum ParticipantCommand {
     SplitFinishSource {
         authority: Authority,
         split_id: Uuid,
-        settled: crate::oltp_replication::authority::status::SealedSettlement,
+        settled: nabedra_oltp_types::authority::SealedSettlement,
     },
     SplitStage {
         authority: Authority,
@@ -187,7 +190,7 @@ pub(crate) enum ParticipantCommand {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ParticipantReply {
     ScopedQueueFenced(scoped_queue::QueueFenceReceipt),
-    Fenced(crate::oltp_replication::types::GroupFenceReceipt),
+    Fenced(nabedra_oltp_types::types::GroupFenceReceipt),
     Lifecycle(lifecycle::LifecycleReply),
     SplitSourceFrozen(lineage::SplitSourceStatement),
     SplitSourceFinished(TxnDecision),
@@ -318,16 +321,6 @@ enum ReadReply<'a> {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ResolutionEvidence {
-    pub group: GroupIdentity,
-    pub txn: TxnId,
-    pub request: RequestBinding,
-    pub manifest: ManifestRef,
-    pub decision: TxnDecision,
-    pub completed_at: AppliedPosition,
-}
 #[derive(Clone)]
 pub(crate) struct ParticipantMachine {
     store: GroupStore,
@@ -540,7 +533,7 @@ fn apply(
         fence_key[0] = b'F';
         fence_key[1..].copy_from_slice(transition_id.as_bytes());
         if let Some(receipt) =
-            load::<crate::oltp_replication::types::GroupFenceReceipt>(tx, &fence_key)?
+            load::<nabedra_oltp_types::types::GroupFenceReceipt>(tx, &fence_key)?
         {
             return if receipt.command_digest == command_digest {
                 commit(tx, &ParticipantReply::Fenced(receipt))
@@ -606,7 +599,7 @@ fn apply(
             return reject(tx, Fault::ResourceLimit);
         }
         tx.put_serialized(CONFIG, &next_config)?;
-        let receipt = crate::oltp_replication::types::GroupFenceReceipt {
+        let receipt = nabedra_oltp_types::types::GroupFenceReceipt {
             group: group.clone(),
             transition_id: *transition_id,
             expected: *expected,
@@ -992,7 +985,7 @@ fn apply(
                 // Do not lose this marker when cleanup beats an in-flight page.
                 let rollback = txn_key(b'b', txn);
                 if let Some(existing) =
-                    load::<crate::oltp_replication::types::DecisionStatement>(tx, &rollback)?
+                    load::<nabedra_oltp_types::types::DecisionStatement>(tx, &rollback)?
                 {
                     if existing != *statement {
                         return reject(tx, Fault::InvalidBinding);
@@ -1114,7 +1107,7 @@ fn seal(
     result_digest: Digest,
     authority: Authority,
     position: AppliedPosition,
-    scope: Option<crate::oltp_replication::authority::control::ScopedCatalogRead>,
+    scope: Option<nabedra_oltp_types::authority::ScopedCatalogRead>,
     point_home: Option<Digest>,
 ) -> Result<Transition, ProtocolError> {
     if tx.pinned(&txn_key(b'b', txn))?.is_some()
