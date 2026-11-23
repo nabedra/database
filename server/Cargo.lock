@@ -1943,6 +1943,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nabedra-sim"
+version = "0.1.0"
+dependencies = [
+ "nabedra-check",
+ "nabedra-rt",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nix"
 version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

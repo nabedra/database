@@ -1,0 +1,35 @@
+id = "sim-core-repeat"
+module = "sim"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+# List the actual tests in each build so cfg-gated tests are repeated where they exist.
+command = ["bash", "-euc", '''
+set -o pipefail
+repeat_sim_tests() {
+    cargo test --locked -j 2 -p nabedra-sim --manifest-path server/Cargo.toml --lib -- --list --format terse |
+        python3 -c '
+import json
+import sys
+
+tests = [
+    {"id": line.removesuffix(": test\n"), "file": "server/sim/src/lib.rs", "lang": "rust"}
+    for line in sys.stdin if line.endswith(": test\n")
+]
+if not tests:
+    sys.exit("no simulation core tests discovered")
+json.dump(tests, sys.stdout)
+' | python3 scripts/testing/repeat_gate.py
+}
+echo "Unseeded simulation core repetition"
+repeat_sim_tests
+export RUSTFLAGS="--cfg tokio_unstable"
+export CARGO_TARGET_DIR="$PWD/server/target/sim-repeat-seeded"
+echo "Seeded simulation core repetition"
+repeat_sim_tests
+''']
+cwd = "."
+timeout_s = 1800
+needs = []
+result_parser = "exit-code"
