@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 use nabedra_database_server::cluster::configuration::{
     ConfigurationError, MAX_TEMPLATE_BYTES, MAX_TIMING_BYTES, Storage, Template, Timing,
 };

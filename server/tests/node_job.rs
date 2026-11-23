@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 use nabedra_database_server::node::job::{
     PartMeta, PreparationValidator, encode_job, encode_part_meta, encode_result, parse_get_rows,
     parse_job, parse_part_meta, parse_result, validate_get_rows,

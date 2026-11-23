@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt;
 use nabedra_database_server::{

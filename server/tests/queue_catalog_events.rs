@@ -1,5 +1,6 @@
 //! U03 seeded event histories across RAM replicas, resource ownership and the
 //! real fenced local mutation engine. Network/process faults have separate tests.
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 use futures_util::FutureExt;
 use nabedra_database_server::{
     config::WorkerResources,

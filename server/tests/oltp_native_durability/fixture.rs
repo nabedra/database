@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // test support, also #[path]-included by unit tests; the phase 7 seam covers product code
 use std::{
     fs,
     os::unix::fs::MetadataExt,

@@ -1,4 +1,5 @@
 //! S4 regressions exercise actual conditional root updates and local execution.
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 use nabedra_database_server::{
     engine::Engine,
     partition_size::PartitionSize,

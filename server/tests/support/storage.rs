@@ -1,4 +1,5 @@
 //! Conditional in-memory object backend shared by storage and later commit tests.
+#![allow(clippy::disallowed_methods)] // test support, also #[path]-included by unit tests; the phase 7 seam covers product code
 use nabedra_database_server::storage::*;
 use std::{
     collections::BTreeMap,
