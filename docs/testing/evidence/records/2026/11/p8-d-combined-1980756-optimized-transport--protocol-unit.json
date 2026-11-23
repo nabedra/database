@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-d-combined-1980756-optimized-transport--protocol-unit.log",
+      "sha256": "15d402d2ddae4fd00b04f1b6c12bfb216553deae777d140bd48bc822595b1842"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "protocol-unit",
+  "duration_s": 16.163,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T22:57:45.290725+00:00",
+    "request_id": "p8-d-combined-1980756-optimized-transport",
+    "runner": "GitHub Actions 1000008427",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45281335956"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "1980756b8cda404c35b6cad4150f0a2793f605fc",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

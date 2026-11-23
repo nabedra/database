@@ -1,0 +1,46 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-d-combined-1980756-optimized-transport--oltp-pool-sim.log",
+      "sha256": "d88069358c945e7cb9d5e9190553039f5de96804fe7f938854fd4441eb459bd4"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-pool-sim",
+  "duration_s": 283.727,
+  "guarantees": [
+    "OLTP-G01",
+    "OLTP-G08"
+  ],
+  "kind": "S",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T23:05:22.515713+00:00",
+    "request_id": "p8-d-combined-1980756-optimized-transport",
+    "runner": "GitHub Actions 1000008486",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45281335956"
+  },
+  "scenarios": [
+    "O11",
+    "NS04",
+    "O16",
+    "O17"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "1980756b8cda404c35b6cad4150f0a2793f605fc",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

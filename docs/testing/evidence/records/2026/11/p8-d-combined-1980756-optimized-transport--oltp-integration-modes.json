@@ -1,0 +1,53 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-d-combined-1980756-optimized-transport--oltp-integration-modes.log",
+      "sha256": "75fdc759a8574f380b99dfd2e031f51d1c59fa420f08a3201f7a7f47c119ae60"
+    }
+  ],
+  "assertions": {
+    "executed": 40,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "ignored",
+        "reason": "2 tests marked #[ignore]"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-integration-modes",
+  "duration_s": 113.772,
+  "guarantees": [],
+  "kind": "U R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T22:57:05.792910+00:00",
+    "request_id": "p8-d-combined-1980756-optimized-transport",
+    "runner": "GitHub Actions 1000008418",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45281335956"
+  },
+  "scenarios": [
+    "C07",
+    "M02",
+    "O06",
+    "Q03",
+    "Q04",
+    "Q06",
+    "R01",
+    "R03",
+    "U02"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "1980756b8cda404c35b6cad4150f0a2793f605fc",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

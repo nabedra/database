@@ -1,0 +1,47 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-d-combined-1980756-optimized-transport--transport-sim-parity.log",
+      "sha256": "0b09e3aba966e208dc0512885c72bba7d830a66c3c5dc51e2d9ba62a22b36473"
+    }
+  ],
+  "assertions": {
+    "executed": 11,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "transport-sim-parity",
+  "duration_s": 38.885,
+  "guarantees": [
+    "OLTP-G04",
+    "OLTP-G08",
+    "OLTP-G09"
+  ],
+  "kind": "S",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T23:04:59.694521+00:00",
+    "request_id": "p8-d-combined-1980756-optimized-transport",
+    "runner": "GitHub Actions 1000008484",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45281335956"
+  },
+  "scenarios": [
+    "D10",
+    "O05",
+    "C07",
+    "O17"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "1980756b8cda404c35b6cad4150f0a2793f605fc",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
