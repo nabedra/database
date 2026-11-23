@@ -182,6 +182,7 @@ contract!(
     rename_replaces_an_existing_file,
     listing_follows_create_and_remove,
     lock_is_exclusive_until_dropped,
+    lock_follows_the_file_through_a_directory_rename,
     set_len_and_len_agree,
     positional_io_at_and_beyond_the_end,
     create_dir_and_remove_dir_errors,
@@ -324,6 +325,27 @@ fn lock_is_exclusive_until_dropped(b: &dyn Backend) {
     let again = fs.lock(&path).unwrap();
     drop((again, other));
     assert!(fs.exists(&path).unwrap(), "the lock file stays");
+}
+
+fn lock_follows_the_file_through_a_directory_rename(b: &dyn Backend) {
+    let fs = b.fs();
+    let from = b.root().join("staging");
+    let to = b.root().join("active");
+    b.create_dir(&from).unwrap();
+    let original = fs.lock(&from.join("LOCK")).unwrap();
+    fs.rename(&from, &to).unwrap();
+    let path = to.join("LOCK");
+    assert_eq!(kind(fs.lock(&path)), io::ErrorKind::WouldBlock);
+    drop(original);
+    let held = fs.lock(&path).unwrap();
+
+    fs.remove(&path).unwrap();
+    let replacement = fs.lock(&path).unwrap();
+    drop(held);
+    assert_eq!(kind(fs.lock(&path)), io::ErrorKind::WouldBlock);
+    drop(replacement);
+    assert!(fs.lock(&path).is_ok());
+    assert_eq!(kind(fs.lock(&to)), io::ErrorKind::IsADirectory);
 }
 
 fn set_len_and_len_agree(b: &dyn Backend) {
