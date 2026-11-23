@@ -1,0 +1,46 @@
+{
+  "artifacts": [
+    {
+      "name": "p9-oltp-fs-smoke-018dde8-170408--oltp-pool-sim.log",
+      "sha256": "ee82b43cddec9e4f2be3330e1168e6333f6c964cc76997bcb21c0903559980c2"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 1,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-pool-sim",
+  "duration_s": 179.355,
+  "guarantees": [
+    "OLTP-G01",
+    "OLTP-G08"
+  ],
+  "kind": "S",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T16:04:34.314539+00:00",
+    "request_id": "p9-oltp-fs-smoke-018dde8-170408",
+    "runner": "GitHub Actions 1000006576",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45212264077"
+  },
+  "scenarios": [
+    "O11",
+    "NS04",
+    "O16",
+    "O17"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "018dde8e8bb9cf3bb73bf90b421266cbbe7f308c",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
