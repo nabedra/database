@@ -4,8 +4,13 @@ kinds = ["R"]
 guarantees = ["CACHE-G05", "CACHE-G06"]
 scenarios = ["K03"]
 tiers = ["T1", "T2"]
-command = ["bash", "scripts/cache-acceptance/cluster.sh", "--from-checkout", "target/testing-logs/cache-cluster-real"]
+command = ["bash", "-euc", '''
+for attempt in 1 2 3 4 5; do
+    echo "Cache K03 Docker attempt $attempt/5"
+    bash scripts/cache-acceptance/cluster.sh --from-checkout "target/testing-logs/cache-cluster-real/$attempt"
+done
+''']
 cwd = "."
-timeout_s = 1800
+timeout_s = 2400
 needs = ["docker"]
 result_parser = "exit-code"
