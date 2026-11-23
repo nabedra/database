@@ -46,6 +46,10 @@ use crate::{
     oltp_runtime::direct::{DirectConfig, DirectExecutor, DirectGate, DirectTable, StaticSchema},
     protocol::{TableDescriptor, TableFormat},
 };
+use nabedra_check::{
+    checker::direct,
+    history::{Event, EventType},
+};
 use openraft::type_config::async_runtime::watch::WatchReceiver;
 use serde_json::{Value, json};
 use std::{
@@ -716,6 +720,49 @@ impl TopologySource for Source {
     }
 }
 
+async fn record_gateway_answer(
+    history: &mut Vec<Event>,
+    process: u64,
+    gateway: &DirectGateway,
+    body: &[u8],
+) -> Answer {
+    let request: Value = serde_json::from_slice(body).unwrap();
+    let request_id: Uuid = serde_json::from_value(request["request_id"].clone()).unwrap();
+    let payload = &request["payload"];
+    let (operation, key, input) = match request["operation"].as_str().unwrap() {
+        "table.insert" => ("insert", &payload["row"]["id"], payload["row"].clone()),
+        "table.get" => ("get", &payload["key"], Value::Null),
+        operation => panic!("no history mapping for {operation}"),
+    };
+    let mut event = Event {
+        index: history.len(),
+        kind: EventType::Invoke,
+        process,
+        f: operation.into(),
+        key: Some(format!("{}/{key}", payload["table_id"])),
+        value: input,
+        request_id: Some(request_id.to_string()),
+        node: None,
+        time_ns: None,
+    };
+    history.push(event.clone());
+    let completion = answer(gateway, body, request_id).await;
+    (event.kind, event.value) = match &completion {
+        Answer::Data(data) => (EventType::Ok, data.clone()),
+        Answer::Error(code, outcome) => (
+            match outcome {
+                Outcome::NotApplied => EventType::Fail,
+                Outcome::Unknown => EventType::Info,
+            },
+            json!({"code": code, "outcome": outcome}),
+        ),
+        Answer::Queued => panic!("the direct history fixture entered the queue"),
+    };
+    event.index = history.len();
+    history.push(event);
+    completion
+}
+
 fn direct_on() -> Arc<GatewaySwitch> {
     let switch = Arc::new(GatewaySwitch::default());
     switch.set_active(true);
@@ -1368,7 +1415,9 @@ async fn d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome() {
     let source = Source::new(vec![cluster.fill(&[group])], cluster.voters());
     let transport = cluster.transport();
     let switch = direct_on();
-    let gateway = cluster.gateway(switch.clone(), source, transport.clone());
+    let gateway = cluster.gateway(switch.clone(), source.clone(), transport.clone());
+    let fresh = cluster.gateway(direct_on(), source, transport.clone());
+    let mut history = Vec::new();
     let id = nabedra_rt::ids::uuid_v4();
     let insert = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
     let deny = Arc::downgrade(&transport);
@@ -1377,7 +1426,7 @@ async fn d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome() {
     }));
     transport.lose.store(1, Ordering::SeqCst);
 
-    let lost_reply = answer(&gateway, &insert, id).await;
+    let lost_reply = record_gateway_answer(&mut history, 1, &gateway, &insert).await;
     let (version, row) = cluster.latest(group, 0, 7).await;
     assert!(version.is_some());
     assert_eq!(row, Some(json!({"id": 7, "value": 1})));
@@ -1388,11 +1437,21 @@ async fn d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome() {
         json!({"row": {"id": 8, "value": 2}}),
     );
     assert_eq!(
-        answer(&gateway, &refused, refused_id).await,
+        record_gateway_answer(&mut history, 1, &gateway, &refused).await,
         Answer::Error(ErrorCode::Unauthorized, Outcome::NotApplied)
     );
     assert_eq!(cluster.latest(group, 0, 8).await, (None, None));
     transport.deny.store(false, Ordering::SeqCst);
+    let read = cluster.body(nabedra_rt::ids::uuid_v4(), "table.get", json!({"key": 7}));
+    assert_eq!(
+        record_gateway_answer(&mut history, 2, &fresh, &read).await,
+        Answer::Data(json!({"id": 7, "value": 1})),
+        "the second gateway sees the commit before the retry"
+    );
+    assert_eq!(
+        record_gateway_answer(&mut history, 2, &fresh, &insert).await,
+        Answer::Data(Value::Null)
+    );
     switch.set_direct_oltp(false);
     assert_eq!(
         answer(&gateway, &insert, id).await,
@@ -1400,10 +1459,29 @@ async fn d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome() {
     );
     let changed = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 2}}));
     assert_eq!(
-        answer(&gateway, &changed, id).await,
+        record_gateway_answer(&mut history, 1, &gateway, &changed).await,
         Answer::Error(ErrorCode::Conflict, Outcome::NotApplied)
     );
     assert_eq!(cluster.latest(group, 0, 7).await.0, version);
+    let elsewhere = cluster.body(id, "table.insert", json!({"row": {"id": 9, "value": 2}}));
+    assert_eq!(
+        record_gateway_answer(&mut history, 2, &fresh, &elsewhere).await,
+        Answer::Data(Value::Null)
+    );
+    assert!(cluster.settled(group, 7, id).await);
+    assert!(cluster.settled(group, 9, id).await);
+    assert!(!cluster.settled(group, 8, refused_id).await);
+    let verdict = direct::check(&history);
+    assert!(verdict.valid, "{verdict:?}");
+    assert_eq!(history.len(), 12);
+    let before_retry = &mut history[..6];
+    before_retry[1].kind = EventType::Fail;
+    before_retry[1].value =
+        json!({"code": ErrorCode::Unauthorized, "outcome": Outcome::NotApplied});
+    assert!(
+        !direct::check(before_retry).valid,
+        "a false refusal cannot explain the committed row"
+    );
     cluster.shutdown().await;
     assert_eq!(
         lost_reply,
