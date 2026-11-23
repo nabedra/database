@@ -30,8 +30,8 @@ path = "src/main.rs"
 
 [features]
 default = ["olap", "s3"]
-olap = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:parquet"]
-oltp = ["dep:nabedra-oltp-types", "dep:nabedra-kv", "dep:openraft", "dep:tokio-rustls", "dep:socket2"]
+olap = ["dep:nabedra-protocol", "dep:nabedra-resources", "dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:parquet"]
+oltp = ["dep:nabedra-protocol", "dep:nabedra-resources", "dep:nabedra-oltp-types", "dep:nabedra-kv", "dep:openraft", "dep:tokio-rustls", "dep:socket2"]
 cache = ["nabedra-rt/net", "dep:clock-bound-client", "dep:hashbrown", "dep:smallvec", "dep:toml", "dep:openraft", "dep:tokio-rustls"]
 test-hooks = ["cache"]
 oltp-backup-s3 = ["oltp", "s3"]
@@ -71,8 +71,8 @@ socket2 = { version = "=0.6.5", optional = true }
 bytes = "=1.12.1"
 nabedra-kv = { path = "kv", version = "0.1.0", optional = true }
 nabedra-rt = { path = "rt", version = "0.1.0" }
-nabedra-protocol = { path = "protocol", version = "0.1.0" }
-nabedra-resources = { path = "resources", version = "0.1.0" }
+nabedra-protocol = { path = "protocol", version = "0.1.0", optional = true }
+nabedra-resources = { path = "resources", version = "0.1.0", optional = true }
 nabedra-oltp-types = { path = "oltp-types", version = "0.1.0", optional = true }
 hashbrown = { version = "=0.17.1", default-features = false, optional = true }
 smallvec = { version = "=1.16.5", optional = true }
