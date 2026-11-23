@@ -701,15 +701,27 @@ impl PreparedNative {
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 struct NativeExecutor {
+    #[cfg(feature = "sim")]
+    sim_sender: Option<tokio::sync::mpsc::UnboundedSender<Job>>,
     sender: Option<mpsc::Sender<Job>>,
     threads: Vec<JoinHandle<()>>,
     slots: Arc<Semaphore>,
 }
 impl NativeExecutor {
     fn new(count: usize, name: &str) -> Result<Self, ProtocolError> {
+        #[cfg(feature = "sim")]
+        if let Some(world) = nabedra_rt::sim::world() {
+            if !nabedra_rt::sim::current_node().is_some_and(|node| world.is_up(node)) {
+                return Err(capacity());
+            }
+            return Ok(Self::new_sim(count));
+        }
+
         let (sender, receiver) = mpsc::channel::<Job>();
         let receiver = Arc::new(Mutex::new(receiver));
         let mut executor = Self {
+            #[cfg(feature = "sim")]
+            sim_sender: None,
             sender: Some(sender),
             threads: Vec::new(),
             slots: Arc::new(Semaphore::new(count)),
@@ -736,7 +748,36 @@ impl NativeExecutor {
         }
         Ok(executor)
     }
+    #[cfg(feature = "sim")]
+    fn new_sim(count: usize) -> Self {
+        // As on the thread path, every queued job already owns a slot.
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Job>();
+        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+        for _ in 0..count {
+            let receiver = receiver.clone();
+            // Only node tasks own the receiver. A crash drops any queued jobs
+            // with the last task, including their compute and native leases.
+            nabedra_rt::task::spawn(async move {
+                loop {
+                    let job = receiver.lock().await.recv().await;
+                    let Some(job) = job else { break };
+                    let _ = nabedra_rt::task::spawn_blocking(job).await;
+                }
+            });
+        }
+        Self {
+            sim_sender: Some(sender),
+            sender: None,
+            threads: Vec::new(),
+            slots: Arc::new(Semaphore::new(count)),
+        }
+    }
+
     fn send(&self, job: Job) -> Result<(), ProtocolError> {
+        #[cfg(feature = "sim")]
+        if let Some(sender) = &self.sim_sender {
+            return sender.send(job).map_err(|_| capacity());
+        }
         self.sender
             .as_ref()
             .ok_or_else(capacity)?
@@ -747,6 +788,10 @@ impl NativeExecutor {
 impl Drop for NativeExecutor {
     fn drop(&mut self) {
         self.slots.close();
+        #[cfg(feature = "sim")]
+        // WorkerSharedResources::drain waits for job settlement. Closing the
+        // channel lets the node tasks exit even if the final owner is a job.
+        self.sim_sender.take();
         self.sender.take();
         for thread in self.threads.drain(..) {
             if thread.thread().id() != thread::current().id() {
@@ -755,6 +800,9 @@ impl Drop for NativeExecutor {
         }
     }
 }
+
+#[cfg(all(test, feature = "sim"))]
+mod sim_tests;
 
 #[cfg(test)]
 mod tests {
