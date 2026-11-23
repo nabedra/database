@@ -1459,10 +1459,14 @@ async fn d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome() {
     );
     let changed = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 2}}));
     assert_eq!(
-        record_gateway_answer(&mut history, 1, &gateway, &changed).await,
+        answer(&gateway, &changed, id).await,
         Answer::Error(ErrorCode::Conflict, Outcome::NotApplied)
     );
     assert_eq!(cluster.latest(group, 0, 7).await.0, version);
+    assert_eq!(
+        record_gateway_answer(&mut history, 2, &fresh, &changed).await,
+        Answer::Error(ErrorCode::Conflict, Outcome::NotApplied)
+    );
     let elsewhere = cluster.body(id, "table.insert", json!({"row": {"id": 9, "value": 2}}));
     assert_eq!(
         record_gateway_answer(&mut history, 2, &fresh, &elsewhere).await,
@@ -1479,7 +1483,7 @@ async fn d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome() {
     before_retry[1].value =
         json!({"code": ErrorCode::Unauthorized, "outcome": Outcome::NotApplied});
     assert!(
-        !direct::check(before_retry).valid,
+        direct::check(before_retry).has("failed-write-observed"),
         "a false refusal cannot explain the committed row"
     );
     cluster.shutdown().await;
