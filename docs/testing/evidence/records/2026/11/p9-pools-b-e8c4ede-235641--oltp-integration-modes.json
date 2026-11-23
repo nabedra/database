@@ -1,0 +1,53 @@
+{
+  "artifacts": [
+    {
+      "name": "p9-pools-b-e8c4ede-235641--oltp-integration-modes.log",
+      "sha256": "8880305f10a17c0ed200e01a7eb00cf8b6fec22594e4c63152d6b09a3fc7d2da"
+    }
+  ],
+  "assertions": {
+    "executed": 40,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "ignored",
+        "reason": "2 tests marked #[ignore]"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-integration-modes",
+  "duration_s": 113.508,
+  "guarantees": [],
+  "kind": "U R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T23:07:05.173883+00:00",
+    "request_id": "p9-pools-b-e8c4ede-235641",
+    "runner": "GitHub Actions 1000008501",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45284383948"
+  },
+  "scenarios": [
+    "C07",
+    "M02",
+    "O06",
+    "Q03",
+    "Q04",
+    "Q06",
+    "R01",
+    "R03",
+    "U02"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "e8c4ede01918660cc84ce291c3f2edd6590b0fb1",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
