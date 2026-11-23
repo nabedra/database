@@ -1,0 +1,11 @@
+id = "rt-fs-sites"
+module = "testing"
+kinds = ["U"]
+guarantees = ["OLTP-G01"]
+scenarios = ["O11"]
+tiers = ["T0", "T1"]
+command = ["sh", "-ec", "python3 scripts/testing/fs_sites.py --check && python3 -m unittest discover -s scripts/testing -p test_fs_sites.py"]
+cwd = "."
+timeout_s = 60
+needs = []
+result_parser = "exit-code"
