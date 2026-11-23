@@ -7,8 +7,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use super::Space;
-use crate::fs::{FaultFile, FaultFs, Fs, FsFile, FsKind, FsLock, FsStat, OpenMode};
-use crate::sim::volumes::{self, CAPACITY_BYTES, Route};
+use crate::fs::{
+    DescriptorInode, FaultFile, FaultFs, Fs, FsFile, FsKind, FsLock, FsStat, OpenMode,
+};
+use crate::sim::volumes::{self, CAPACITY_BYTES, DescriptorPath, Route};
 
 /// `S_IFREG` and `S_IFDIR`.
 const S_IFREG: u32 = 0o100_000;
@@ -42,6 +44,8 @@ fn invalid(message: &'static str) -> io::Error {
 pub(super) struct SimFile {
     fs: FaultFs,
     path: PathBuf,
+    inode: DescriptorInode,
+    descriptor: DescriptorPath,
     /// `None` for a directory.
     file: Option<FaultFile>,
     position: Mutex<u64>,
@@ -71,17 +75,18 @@ impl SimFile {
             return Err(invalid("create or truncate without write access"));
         }
         let existing = match fs.stat(path) {
-            Ok(stat) => Some(stat.kind),
+            Ok(stat) => Some(stat),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
-        if flags.custom & libc::O_DIRECTORY != 0 && existing != Some(FsKind::Dir) {
-            return Err(match existing {
+        let kind = existing.map(|stat| stat.kind);
+        if flags.custom & libc::O_DIRECTORY != 0 && kind != Some(FsKind::Dir) {
+            return Err(match kind {
                 None => io::ErrorKind::NotFound.into(),
                 Some(_) => io::ErrorKind::NotADirectory.into(),
             });
         }
-        let file = match existing {
+        let file = match kind {
             Some(FsKind::Dir) if flags.create_new => {
                 return Err(io::ErrorKind::AlreadyExists.into());
             }
@@ -109,9 +114,18 @@ impl SimFile {
         {
             file.set_len(0)?;
         }
+        let inode = match &file {
+            Some(file) => file.descriptor_inode(),
+            None => {
+                DescriptorInode::Directory(existing.expect("opened directory").ino - fs.ino_base())
+            }
+        };
+        let descriptor = DescriptorPath::new(fs.clone(), inode, path);
         Ok(SimFile {
             fs,
             path: path.to_path_buf(),
+            inode,
+            descriptor,
             file,
             position: Mutex::new(0),
             append: flags.append,
@@ -120,8 +134,8 @@ impl SimFile {
         })
     }
 
-    pub(super) fn path(&self) -> &Path {
-        &self.path
+    pub(super) fn fd_path(&self) -> PathBuf {
+        self.descriptor.path()
     }
 
     fn file(&self) -> io::Result<&FaultFile> {
@@ -131,23 +145,23 @@ impl SimFile {
     }
 
     pub(super) fn metadata(&self) -> io::Result<FsStat> {
-        match &self.file {
-            Some(file) => file.stat(),
-            None => self.fs.stat(&self.path),
+        match self.inode {
+            DescriptorInode::File(_) => self.file()?.stat(),
+            DescriptorInode::Directory(ino) => self.fs.stat_directory_descriptor(ino, &self.path),
         }
     }
 
     pub(super) fn sync_all(&self) -> io::Result<()> {
-        match &self.file {
-            Some(file) => file.sync_all(),
-            None => self.fs.sync_dir(&self.path),
+        match self.inode {
+            DescriptorInode::File(_) => self.file()?.sync_all(),
+            DescriptorInode::Directory(ino) => self.fs.sync_directory_descriptor(ino, &self.path),
         }
     }
 
     pub(super) fn sync_data(&self) -> io::Result<()> {
-        match &self.file {
-            Some(file) => file.sync_data(),
-            None => self.fs.sync_dir(&self.path),
+        match self.inode {
+            DescriptorInode::File(_) => self.file()?.sync_data(),
+            DescriptorInode::Directory(ino) => self.fs.sync_directory_descriptor(ino, &self.path),
         }
     }
 
@@ -167,13 +181,14 @@ impl SimFile {
 
     pub(super) fn try_lock_exclusive(&self) -> io::Result<bool> {
         let mut slot = lock(&self.lock);
-        if slot.is_some() {
-            // flock again on the same open file description succeeds.
-            return Ok(true);
-        }
-        match self.fs.lock_existing(&self.path) {
+        match self
+            .fs
+            .lock_descriptor(self.inode, &self.path, slot.is_some())
+        {
             Ok(held) => {
-                *slot = Some(held);
+                if let Some(held) = held {
+                    *slot = Some(held);
+                }
                 Ok(true)
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
@@ -250,6 +265,7 @@ pub(super) fn st_mode(stat: &FsStat) -> u32 {
 pub(super) struct SimEntry {
     fs: FaultFs,
     path: PathBuf,
+    descriptor_relative: bool,
 }
 
 impl SimEntry {
@@ -262,32 +278,51 @@ impl SimEntry {
     }
 
     pub(super) fn metadata(&self) -> io::Result<FsStat> {
+        if self.descriptor_relative {
+            let Route::Volume(fs, path) = volumes::route(&self.path)? else {
+                return Err(io::ErrorKind::NotFound.into());
+            };
+            return fs.stat(&path);
+        }
         self.fs.stat(&self.path)
     }
 }
 
-pub(super) fn read_dir(fs: FaultFs, dir: &Path) -> io::Result<std::vec::IntoIter<SimEntry>> {
+pub(super) fn read_dir(
+    fs: FaultFs,
+    dir: &Path,
+    requested: &Path,
+) -> io::Result<std::vec::IntoIter<SimEntry>> {
     let mut paths = fs.list(dir)?;
     paths.sort();
+    let descriptor_relative = dir != requested;
     Ok(paths
         .into_iter()
-        .map(|path| SimEntry {
-            fs: fs.clone(),
-            path,
+        .map(|path| {
+            let path = if descriptor_relative {
+                requested.join(path.file_name().expect("directory entry has a name"))
+            } else {
+                path
+            };
+            SimEntry {
+                fs: fs.clone(),
+                path,
+                descriptor_relative,
+            }
         })
         .collect::<Vec<_>>()
         .into_iter())
 }
 
 pub(super) fn rename(fs: FaultFs, from: &Path, to: &Path, noreplace: bool) -> io::Result<()> {
-    match volumes::route(to)? {
-        Route::Volume(target) => volumes::same_device(&fs, &target)?,
-        Route::Host => return Err(io::ErrorKind::CrossesDevices.into()),
-    }
+    let Route::Volume(target, to) = volumes::route(to)? else {
+        return Err(io::ErrorKind::CrossesDevices.into());
+    };
+    volumes::same_device(&fs, &target)?;
     if noreplace {
-        fs.rename_noreplace(from, to)
+        fs.rename_noreplace(from, &to)
     } else {
-        fs.rename(from, to)
+        fs.rename(from, &to)
     }
 }
 

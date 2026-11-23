@@ -22,12 +22,11 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "sim")]
 mod sim;
 
-/// Runs `$sim` with the volume for `$path` and returns its result, when the caller is a
-/// simulated node with volumes. Expands to nothing in a product build.
+/// Runs `$sim` with the volume and the resolved path. Expands to nothing in product builds.
 macro_rules! on_volume {
-    ($path:expr, $fs:ident => $sim:expr) => {
+    ($path:expr, $fs:ident, $resolved:ident => $sim:expr) => {
         #[cfg(feature = "sim")]
-        if let crate::sim::volumes::Route::Volume($fs) =
+        if let crate::sim::volumes::Route::Volume($fs, $resolved) =
             crate::sim::volumes::route(::std::convert::AsRef::<Path>::as_ref(&$path))?
         {
             return $sim;
@@ -108,18 +107,18 @@ impl File {
     /// [`std::fs::File::open`].
     #[inline]
     pub fn open(path: impl AsRef<Path>) -> io::Result<File> {
-        on_volume!(path, fs => OpenOptions::new().read(true).open_on(fs, path.as_ref()));
+        on_volume!(path, fs, resolved => OpenOptions::new().read(true).open_on(fs, resolved.as_ref()));
         std::fs::File::open(path).map(|file| File(wrap(file)))
     }
 
     /// [`std::fs::File::create`].
     #[inline]
     pub fn create(path: impl AsRef<Path>) -> io::Result<File> {
-        on_volume!(path, fs => OpenOptions::new()
+        on_volume!(path, fs, resolved => OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open_on(fs, path.as_ref()));
+            .open_on(fs, resolved.as_ref()));
         std::fs::File::create(path).map(|file| File(wrap(file)))
     }
 
@@ -193,12 +192,14 @@ impl File {
 
     /// A path that names this open file: `/proc/self/fd/<fd>` in product, so lookups
     /// relative to an open directory keep their meaning after a rename of an ancestor.
-    /// Under `sim` it is the path the file was opened as.
+    /// Under `sim`, the alias is usable within its world and node incarnation while
+    /// this descriptor is open and its inode has a name. Descriptor-relative paths on
+    /// a simulated volume cannot cross another mount or traverse `..`.
     #[inline]
     #[must_use]
     pub fn fd_path(&self) -> PathBuf {
         dispatch!(self.0, file => PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
-            file => file.path().to_path_buf())
+            file => file.fd_path())
     }
 }
 
@@ -384,7 +385,7 @@ impl OpenOptions {
 
     #[inline]
     pub fn open(&self, path: impl AsRef<Path>) -> io::Result<File> {
-        on_volume!(path, fs => self.open_on(fs, path.as_ref()));
+        on_volume!(path, fs, resolved => self.open_on(fs, resolved.as_ref()));
         self.std.open(path).map(|file| File(wrap(file)))
     }
 
@@ -541,28 +542,30 @@ impl DirEntry {
 /// [`std::fs::metadata`].
 #[inline]
 pub fn metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
-    on_volume!(path, fs => fs.stat(path.as_ref()).map(|stat| Metadata(Inner::Sim(stat))));
+    on_volume!(path, fs, resolved => fs.stat(resolved.as_ref()).map(|stat| Metadata(Inner::Sim(stat))));
     std::fs::metadata(path).map(|meta| Metadata(wrap(meta)))
 }
 
 /// [`std::fs::symlink_metadata`].
 #[inline]
 pub fn symlink_metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
-    on_volume!(path, fs => fs.stat(path.as_ref()).map(|stat| Metadata(Inner::Sim(stat))));
+    on_volume!(path, fs, resolved => fs.stat(resolved.as_ref()).map(|stat| Metadata(Inner::Sim(stat))));
     std::fs::symlink_metadata(path).map(|meta| Metadata(wrap(meta)))
 }
 
 /// [`std::fs::read_dir`].
 #[inline]
 pub fn read_dir(path: impl AsRef<Path>) -> io::Result<ReadDir> {
-    on_volume!(path, fs => sim::read_dir(fs, path.as_ref()).map(|e| ReadDir(Inner::Sim(e))));
+    on_volume!(path, fs, resolved => {
+        sim::read_dir(fs, resolved.as_ref(), path.as_ref()).map(|e| ReadDir(Inner::Sim(e)))
+    });
     std::fs::read_dir(path).map(|entries| ReadDir(wrap(entries)))
 }
 
 /// [`std::fs::rename`].
 #[inline]
 pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
-    on_volume!(from, fs => sim::rename(fs, from.as_ref(), to.as_ref(), false));
+    on_volume!(from, fs, resolved => sim::rename(fs, resolved.as_ref(), to.as_ref(), false));
     std::fs::rename(from, to)
 }
 
@@ -572,7 +575,7 @@ pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
 #[inline]
 pub fn rename_noreplace(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    on_volume!(from, fs => sim::rename(fs, from.as_ref(), to.as_ref(), true));
+    on_volume!(from, fs, resolved => sim::rename(fs, resolved.as_ref(), to.as_ref(), true));
     let from = std::ffi::CString::new(from.as_ref().as_os_str().as_bytes())?;
     let to = std::ffi::CString::new(to.as_ref().as_os_str().as_bytes())?;
     // SAFETY: both paths are NUL-terminated and outlive the call.
@@ -595,49 +598,49 @@ pub fn rename_noreplace(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Res
 /// [`std::fs::remove_file`].
 #[inline]
 pub fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {
-    on_volume!(path, fs => super::Fs::remove(&fs, path.as_ref()));
+    on_volume!(path, fs, resolved => super::Fs::remove(&fs, resolved.as_ref()));
     std::fs::remove_file(path)
 }
 
 /// [`std::fs::remove_dir`].
 #[inline]
 pub fn remove_dir(path: impl AsRef<Path>) -> io::Result<()> {
-    on_volume!(path, fs => fs.remove_dir(path.as_ref()));
+    on_volume!(path, fs, resolved => fs.remove_dir(resolved.as_ref()));
     std::fs::remove_dir(path)
 }
 
 /// [`std::fs::remove_dir_all`].
 #[inline]
 pub fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
-    on_volume!(path, fs => fs.remove_dir_all(path.as_ref()));
+    on_volume!(path, fs, resolved => fs.remove_dir_all(resolved.as_ref()));
     std::fs::remove_dir_all(path)
 }
 
 /// [`std::fs::create_dir`].
 #[inline]
 pub fn create_dir(path: impl AsRef<Path>) -> io::Result<()> {
-    on_volume!(path, fs => fs.create_dir(path.as_ref()));
+    on_volume!(path, fs, resolved => fs.create_dir(resolved.as_ref()));
     std::fs::create_dir(path)
 }
 
 /// [`std::fs::create_dir_all`].
 #[inline]
 pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
-    on_volume!(path, fs => super::Fs::create_dir_all(&fs, path.as_ref()));
+    on_volume!(path, fs, resolved => super::Fs::create_dir_all(&fs, resolved.as_ref()));
     std::fs::create_dir_all(path)
 }
 
 /// [`std::fs::read`].
 #[inline]
 pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
-    on_volume!(path, fs => sim::read(fs, path.as_ref()));
+    on_volume!(path, fs, resolved => sim::read(fs, resolved.as_ref()));
     std::fs::read(path)
 }
 
 /// [`std::fs::read_to_string`].
 #[inline]
 pub fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
-    on_volume!(path, fs => sim::read(fs, path.as_ref()).and_then(|bytes| {
+    on_volume!(path, fs, resolved => sim::read(fs, resolved.as_ref()).and_then(|bytes| {
         String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }));
     std::fs::read_to_string(path)
@@ -646,21 +649,21 @@ pub fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
 /// [`std::fs::write`].
 #[inline]
 pub fn write(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> io::Result<()> {
-    on_volume!(path, _fs => File::create(path.as_ref())?.write_all(bytes.as_ref()));
+    on_volume!(path, _fs, _resolved => File::create(path.as_ref())?.write_all(bytes.as_ref()));
     std::fs::write(path, bytes)
 }
 
 /// `std::fs::set_permissions(path, Permissions::from_mode(mode))`.
 #[inline]
 pub fn set_mode(path: impl AsRef<Path>, mode: u32) -> io::Result<()> {
-    on_volume!(path, fs => fs.set_mode(path.as_ref(), mode));
+    on_volume!(path, fs, resolved => fs.set_mode(resolved.as_ref(), mode));
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 /// [`Path::try_exists`].
 #[inline]
 pub fn try_exists(path: impl AsRef<Path>) -> io::Result<bool> {
-    on_volume!(path, fs => super::Fs::exists(&fs, path.as_ref()));
+    on_volume!(path, fs, resolved => super::Fs::exists(&fs, resolved.as_ref()));
     path.as_ref().try_exists()
 }
 
@@ -668,7 +671,7 @@ pub fn try_exists(path: impl AsRef<Path>) -> io::Result<bool> {
 /// exist; it comes back with `.` and `..` resolved (there are no symlinks).
 #[inline]
 pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
-    on_volume!(path, fs => sim::canonicalize(fs, path.as_ref()));
+    on_volume!(path, fs, resolved => sim::canonicalize(fs, resolved.as_ref()));
     std::fs::canonicalize(path)
 }
 
@@ -676,7 +679,7 @@ pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
 /// `File::open(dir)?.sync_all()` idiom.
 #[inline]
 pub fn sync_dir(path: impl AsRef<Path>) -> io::Result<()> {
-    on_volume!(path, fs => super::Fs::sync_dir(&fs, path.as_ref()));
+    on_volume!(path, fs, resolved => super::Fs::sync_dir(&fs, resolved.as_ref()));
     std::fs::File::open(path)?.sync_all()
 }
 
