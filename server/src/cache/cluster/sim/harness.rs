@@ -18,8 +18,8 @@ use super::super::{
     clock::{Clock, ClockMode},
     controller::{self, MAX_MOVES_PER_WORKER, RECONCILE_MS, SimConfig, SimRaftMetrics},
     protocol::{
-        Admin, CONTROL_FRAME, Member, Progress, RENEW_MS, Reply, Request, Slot, Topology, VERSION,
-        WorkerId,
+        Admin, CONTROL_FRAME, LEASE_MS, Member, Progress, RENEW_MS, Reply, Request, Slot, Topology,
+        VERSION, WorkerId,
     },
     transport::{Endpoint, PeerTls},
     worker::{self, SlotSample, Worker},
@@ -44,6 +44,11 @@ const PEER: u16 = 9202;
 const RESP: u16 = 9203;
 const MIB: usize = 1 << 20;
 const START_BUDGET: u64 = 15_000;
+// A committed freeze with matching baselines can be between primaries.
+// Allow one lease fence, two reconciliation turns, and three heartbeats
+// to report the freeze, cut over, and install the grant. One more heartbeat
+// covers alignment, clock uncertainty, and message time.
+const HANDOFF_BUDGET_MS: u64 = LEASE_MS + 2 * RECONCILE_MS + 4 * RENEW_MS;
 
 fn replica_repair_budget_ms(pending: usize) -> u64 {
     // K03 Convergence is separate from the 15 s client/primary deadline.
@@ -697,12 +702,25 @@ impl Cluster {
 
     /// Returns a witness key if the fault schedule destroyed every copy of a slot.
     pub async fn verify_quiescence(&mut self, cold: bool) -> Option<String> {
+        let handoff_deadline = self.now() + HANDOFF_BUDGET_MS;
         let (latest, reports) = self.recovery_reports().await;
         let mut lost = BTreeSet::new();
+        let mut handoffs = BTreeSet::new();
         for (index, &slot) in latest.slots.iter().enumerate() {
             let index = index as u16;
             let primary = baseline(&reports, index, slot.epoch, slot.primary);
             if primary.is_some_and(|p| p.serving_primary) {
+                continue;
+            }
+            if !cold
+                && let Some(moving) = slot.moving
+                && moving.freeze_requested
+                && !moving.replica_only
+                && let Some(source) = primary
+                && baseline(&reports, index, slot.epoch, Some(moving.target))
+                    .is_some_and(|target| target.sequence == source.sequence)
+            {
+                handoffs.insert(index);
                 continue;
             }
             let lost_primary = !cold
@@ -738,7 +756,13 @@ impl Cluster {
                 lost.first().unwrap()
             ));
         }
-        self.verify_final_reads(cold, &lost).await;
+        self.verify_final_reads(cold, &lost, &handoffs).await;
+        let (latest, reports) = if handoffs.is_empty() {
+            (latest, reports)
+        } else {
+            self.verify_handoffs(&handoffs, handoff_deadline).await;
+            self.recovery_reports().await
+        };
         self.verify_replica_convergence(cold, &lost, &latest, reports)
             .await;
         let slot = *lost.first()?;
@@ -798,8 +822,7 @@ impl Cluster {
             let replica = self.sample(placement.replica, slot).await;
             match (primary, replica) {
                 (Some(p), Some(r))
-                    if p.authorized
-                        && p.baseline
+                    if p.baseline
                         && r.baseline
                         && (p.generation, p.epoch, p.sequence, p.digest)
                             == (r.generation, r.epoch, r.sequence, r.digest) =>
@@ -823,21 +846,23 @@ impl Cluster {
         }
     }
 
-    async fn verify_final_reads(&mut self, cold: bool, lost: &BTreeSet<u16>) {
+    async fn verify_final_reads(
+        &mut self,
+        cold: bool,
+        lost: &BTreeSet<u16>,
+        handoffs: &BTreeSet<u16>,
+    ) {
         let keys = Arc::clone(&self.keys);
         for key in keys.iter() {
-            let reply = self.send(key, Op::Get, None).await;
-            if lost.contains(&key_slot(key.as_bytes())) {
-                self.check_lost_reply(key, reply);
+            let slot = key_slot(key.as_bytes());
+            if handoffs.contains(&slot) {
                 continue;
             }
-            match reply {
-                Some(Response::Bulk(value)) => {
-                    if cold && value.is_some() {
-                        self.violate("ColdStartEmpty", format!("old key {key} still readable"));
-                    }
-                }
-                reply => self.violate("Liveness", format!("final read {key}: {reply:?}")),
+            if lost.contains(&slot) {
+                let reply = self.send(key, Op::Get, None).await;
+                self.check_lost_reply(key, reply);
+            } else {
+                self.verify_final_read(key, cold).await;
             }
         }
         if let Some(worker) = self.workers.values().next() {
@@ -852,6 +877,50 @@ impl Cluster {
                     ),
                 );
             }
+        }
+    }
+
+    async fn verify_handoffs(&mut self, handoffs: &BTreeSet<u16>, deadline: u64) {
+        let mut pending = handoffs.clone();
+        while !pending.is_empty() {
+            for slot in std::mem::take(&mut pending) {
+                let placement = self.slot(slot);
+                if !self
+                    .sample(placement.primary, slot)
+                    .await
+                    .is_some_and(|sample| sample.authorized && sample.epoch == placement.epoch)
+                {
+                    pending.insert(slot);
+                }
+            }
+            if pending.is_empty() || self.now() >= deadline {
+                break;
+            }
+            self.step(RECONCILE_MS.min(deadline - self.now())).await;
+        }
+        if let Some(slot) = pending.first() {
+            self.violate(
+                "Liveness",
+                format!("slot {slot} had no authority after its fenced handoff"),
+            );
+        }
+        let keys = Arc::clone(&self.keys);
+        for key in keys
+            .iter()
+            .filter(|key| handoffs.contains(&key_slot(key.as_bytes())))
+        {
+            self.verify_final_read(key, false).await;
+        }
+    }
+
+    async fn verify_final_read(&mut self, key: &str, cold: bool) {
+        match self.send(key, Op::Get, None).await {
+            Some(Response::Bulk(value)) => {
+                if cold && value.is_some() {
+                    self.violate("ColdStartEmpty", format!("old key {key} still readable"));
+                }
+            }
+            reply => self.violate("Liveness", format!("final read {key}: {reply:?}")),
         }
     }
 

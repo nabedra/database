@@ -27,6 +27,11 @@ const HEAL_MS: u64 = 15_000;
 const REGRESSION_SEEDS: &[u64] = &[
     7, 12, 14, 16, 20, 21, 37, 38, 46, 55, 65, 115, 198, 211, 219,
 ];
+const NIGHTLY_RECOVERY_SEEDS: &[u64] = &[
+    4_524_674_007_700_564,
+    4_524_674_007_700_871,
+    4_524_674_007_700_908,
+];
 const FIRST_WORKER: u64 = 11;
 const MIB: usize = 1 << 20;
 const REPLAY: &str = concat!(
@@ -581,6 +586,29 @@ fn seed_sweep() {
         })
     );
     report.assert_passed();
+}
+
+#[test]
+fn nightly_recovery_regressions() {
+    let config = SweepConfig::from_env("cache", REPLAY);
+    let reports = sweep::parallel_map(NIGHTLY_RECOVERY_SEEDS, config.jobs, |&seed| {
+        let single = SweepConfig {
+            first: seed,
+            count: 1,
+            jobs: 1,
+            verify_replay: 1.0,
+            ..config.clone()
+        };
+        sweep::sweep(&single, run_seed)
+    });
+    for report in reports {
+        report.assert_passed();
+        let seed = &report.seeds[0];
+        println!(
+            "Cache regression seed {}: passed=true trace={:016x} events={} virtual_ms={}",
+            seed.seed, seed.trace_hash, seed.trace_events, seed.virtual_ms,
+        );
+    }
 }
 
 #[test]
