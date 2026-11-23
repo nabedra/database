@@ -591,7 +591,7 @@ def cmd_verify(repo, bugs, args, out):
 #   nabedra-sim-seed: {"seed": <int>, "result": "pass" | "violation", "kinds": [<str>...]}
 # A run that prints no such line for a seed it was asked to run is an error, never a pass.
 
-SEED_LINE = re.compile(r"^nabedra-sim-seed: (\{.*\})$", re.MULTILINE)
+SEED_LINE = re.compile(r"^(?:test [^\n]+? \.\.\. )?nabedra-sim-seed: (\{.*\})$", re.MULTILINE)
 
 
 def sweep_command(args):

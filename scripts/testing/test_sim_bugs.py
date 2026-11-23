@@ -274,7 +274,7 @@ class SimBugsTest(unittest.TestCase):
 
     def test_seed_lines_and_first_match(self):
         output = "\n".join([
-            'nabedra-sim-seed: {"seed": 1, "result": "pass", "kinds": []}',
+            'test suite::sweep ... nabedra-sim-seed: {"seed": 1, "result": "pass", "kinds": []}',
             'nabedra-sim-seed: {"seed": 2, "result": "violation", "kinds": ["Other"]}',
             'nabedra-sim-seed: {"seed": 99, "result": "violation", "kinds": "Other"}',
             "nabedra-sim-seed: not json",
