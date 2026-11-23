@@ -1027,6 +1027,29 @@ fn freeze_stops_a_node_without_aborting_it() {
 }
 
 #[test]
+fn freeze_stops_join_set_tasks_until_thaw() {
+    run(80, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.freeze(1);
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_task = ran.clone();
+        let mut set = task::JoinSet::new();
+        in_node(1, async {
+            task::spawn_in(&mut set, async move {
+                ran_in_task.store(true, Ordering::SeqCst);
+                crate::sim::current_node()
+            });
+        })
+        .await;
+        tokio::time::sleep(ms(1)).await;
+        assert!(!ran.load(Ordering::SeqCst), "the frozen JoinSet task ran");
+        world.thaw(1);
+        assert_eq!(set.join_next().await.unwrap().unwrap(), Some(1));
+        assert!(ran.load(Ordering::SeqCst));
+    });
+}
+
+#[test]
 fn a_panicking_extension_callback_keeps_the_slot() {
     run(79, |world| async move {
         world.insert_ext(42_u32);

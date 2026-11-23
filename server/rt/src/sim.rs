@@ -431,14 +431,18 @@ impl World {
         F::Output: Send + 'static,
     {
         self.assert_runtime(target);
-        let gated = Gate {
+        let task = NODE.scope(Some(node), self.gate(node, future));
+        let handle = target.spawn(task);
+        self.register(node, handle.abort_handle());
+        handle
+    }
+
+    fn gate<F>(&self, node: u64, future: F) -> Gate<F> {
+        Gate {
             world: self.me.clone(),
             node,
             future: Box::pin(future),
-        };
-        let handle = target.spawn(NODE.scope(Some(node), gated));
-        self.register(node, handle.abort_handle());
-        handle
+        }
     }
 
     fn register(&self, node: u64, handle: AbortHandle) {
@@ -991,7 +995,7 @@ where
     match (current_node(), world()) {
         (Some(node), Some(world)) => {
             world.assert_runtime(&Handle::current());
-            let task = set.spawn(NODE.scope(node, future));
+            let task = set.spawn(NODE.scope(Some(node), world.gate(node, future)));
             world.register(node, task.clone());
             task
         }
