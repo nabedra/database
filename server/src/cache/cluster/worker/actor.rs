@@ -20,6 +20,8 @@ use crate::cache::wire::Response;
 
 use super::super::clock::{Clock, ClockBounds, ClockMode};
 use super::super::protocol::{Frozen, Lease, Progress, Topology, WorkerId};
+#[cfg(feature = "sim")]
+use super::super::sim::hooks::{self, Observed};
 use super::peer::{Packet, Probe};
 use super::{MIB, frozen, invalid, unavailable};
 use copies::Copies;
@@ -77,6 +79,23 @@ pub(super) enum Control {
         telemetry: bool,
         reply: oneshot::Sender<ActorReport>,
     },
+    #[cfg(feature = "sim")]
+    Sample {
+        slot: u16,
+        reply: oneshot::Sender<Option<SlotSample>>,
+    },
+}
+
+#[cfg(feature = "sim")]
+#[derive(Clone, Copy, Debug)]
+pub(in crate::cache::cluster) struct SlotSample {
+    pub generation: u64,
+    pub epoch: u64,
+    pub sequence: u64,
+    pub digest: [u8; 20],
+    pub authorized: bool,
+    pub baseline: bool,
+    pub lease: Option<Lease>,
 }
 
 #[derive(Serialize)]
@@ -146,6 +165,32 @@ enum Role {
     Copy(WorkerId),
 }
 
+struct ActorReceivers {
+    clients: mpsc::Receiver<ClientTurn>,
+    control: mpsc::Receiver<Control>,
+    transfer: mpsc::Receiver<Transfer>,
+}
+
+impl ActorHandle {
+    fn channels(max_pending: usize) -> (Self, ActorReceivers) {
+        let (clients, client_rx) = mpsc::channel(max_pending);
+        let (control, control_rx) = mpsc::channel(CONTROL_PENDING);
+        let (transfer, transfer_rx) = mpsc::channel(TRANSFER_PENDING);
+        (
+            Self {
+                clients,
+                control,
+                transfer,
+            },
+            ActorReceivers {
+                clients: client_rx,
+                control: control_rx,
+                transfer: transfer_rx,
+            },
+        )
+    }
+}
+
 struct Shard {
     epoch: u64,
     role: Role,
@@ -186,12 +231,12 @@ impl Shard {
     }
 
     fn authorized(&self, now: ClockBounds) -> bool {
-        self.role == Role::Primary
-            && self.baseline
-            && !self.freeze_requested
-            && self.lease.is_some_and(|lease| {
-                now.fenced(lease.not_before_ms) && now.allows(lease.expires_ms)
-            })
+        self.write_eligible() && self.lease.is_some_and(|lease| lease_authorizes(lease, now))
+    }
+
+    #[inline]
+    fn write_eligible(&self) -> bool {
+        self.role == Role::Primary && self.baseline && !self.freeze_requested
     }
 
     fn freeze(&mut self, clock: &mut Clock) {
@@ -207,6 +252,15 @@ impl Shard {
             });
         }
     }
+}
+
+#[inline]
+pub(in crate::cache::cluster) fn lease_authorizes(lease: Lease, now: ClockBounds) -> bool {
+    #[cfg(feature = "sim")]
+    if hooks::knobs().lease_ignores_error_bound {
+        return now.upper_ms >= lease.not_before_ms && now.lower_ms < lease.expires_ms;
+    }
+    now.fenced(lease.not_before_ms) && now.allows(lease.expires_ms)
 }
 
 struct State {
@@ -250,9 +304,7 @@ pub(super) fn spawn(
     index: usize,
     config: ActorConfig,
 ) -> io::Result<(ActorHandle, thread::JoinHandle<()>)> {
-    let (clients, client_rx) = mpsc::channel(config.max_pending);
-    let (control, control_rx) = mpsc::channel(CONTROL_PENDING);
-    let (transfer, transfer_rx) = mpsc::channel(TRANSFER_PENDING);
+    let (handle, receivers) = ActorHandle::channels(config.max_pending);
     let (startup, started) = std::sync::mpsc::sync_channel(1);
     let thread = task::spawn_service(format!("cache-actor-{index}"), move || {
         let state = State::new(index, config).and_then(|state| {
@@ -264,7 +316,7 @@ pub(super) fn spawn(
         match state {
             Ok((state, runtime)) => {
                 if startup.send(Ok(())).is_ok() {
-                    runtime.block_on(state.run(client_rx, control_rx, transfer_rx));
+                    runtime.block_on(state.run(receivers));
                 }
             }
             Err(error) => {
@@ -273,14 +325,7 @@ pub(super) fn spawn(
         }
     })?;
     match started.recv() {
-        Ok(Ok(())) => Ok((
-            ActorHandle {
-                clients,
-                control,
-                transfer,
-            },
-            thread,
-        )),
+        Ok(Ok(())) => Ok((handle, thread)),
         result => {
             let _ = thread.join();
             match result {
@@ -289,6 +334,14 @@ pub(super) fn spawn(
             }
         }
     }
+}
+
+#[cfg(feature = "sim")]
+pub(super) fn spawn_sim(index: usize, config: ActorConfig) -> io::Result<ActorHandle> {
+    let state = State::new(index, config)?;
+    let (handle, receivers) = ActorHandle::channels(config.max_pending);
+    drop(task::spawn(state.run(receivers)));
+    Ok(handle)
 }
 
 impl State {
@@ -308,12 +361,12 @@ impl State {
         })
     }
 
-    async fn run(
-        mut self,
-        mut clients: mpsc::Receiver<ClientTurn>,
-        mut control: mpsc::Receiver<Control>,
-        mut transfer: mpsc::Receiver<Transfer>,
-    ) {
+    async fn run(mut self, receivers: ActorReceivers) {
+        let ActorReceivers {
+            mut clients,
+            mut control,
+            mut transfer,
+        } = receivers;
         let mut expiry = interval(Duration::from_millis(10));
         expiry.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut front = None;
@@ -382,7 +435,26 @@ impl State {
                 }
                 let _ = reply.send(self.progress(telemetry, front.as_ref(), clients.len()));
             }
+            #[cfg(feature = "sim")]
+            Control::Sample { slot, reply } => {
+                let _ = reply.send(self.sample(slot));
+            }
         }
+    }
+
+    #[cfg(feature = "sim")]
+    fn sample(&mut self, slot: u16) -> Option<SlotSample> {
+        let shard = self.slots.get(&slot)?;
+        let now = self.clock.now().ok();
+        Some(SlotSample {
+            generation: self.topology.generation,
+            epoch: shard.epoch,
+            sequence: shard.sequence,
+            digest: shard.store.digest(0),
+            authorized: now.is_some_and(|now| shard.authorized(now)),
+            baseline: shard.baseline,
+            lease: shard.lease,
+        })
     }
 
     fn progress(
@@ -482,6 +554,19 @@ impl State {
                 state.lease = Some(grant);
             }
         }
+        #[cfg(feature = "sim")]
+        for slot in hooks::watched_slots() {
+            if usize::from(slot) % self.config.count == self.index {
+                let shard = self.slots.get(&slot);
+                hooks::observe(Observed::Lease {
+                    worker: self.config.id,
+                    slot,
+                    writable: shard.is_some_and(Shard::write_eligible),
+                    epoch: shard.map_or(0, |state| state.epoch),
+                    lease: shard.and_then(|state| state.lease),
+                });
+            }
+        }
     }
 
     fn reconcile(&mut self, topology: &Topology) {
@@ -511,6 +596,11 @@ impl State {
                 self.copies.forget(slot_number);
                 continue;
             };
+            #[cfg(feature = "sim")]
+            let old_primary = self
+                .slots
+                .get(&slot_number)
+                .and_then(|state| (state.role == Role::Primary).then_some(state.epoch));
             let state = self.slots.entry(slot_number).or_insert_with(|| {
                 Shard::new(
                     placement.epoch,
@@ -557,6 +647,11 @@ impl State {
                     .is_some_and(|intent| intent.freeze_requested);
                 state.freeze(&mut self.clock);
                 self.storage.primary += state.store.charged_bytes();
+                #[cfg(feature = "sim")]
+                if old_primary != Some(state.epoch) && state.baseline && hooks::watched(slot_number)
+                {
+                    observe_publication(self.config.id, topology.generation, slot_number, state);
+                }
                 if !state.store.is_empty() {
                     self.expiry_keys.insert(slot_number);
                 }
@@ -596,7 +691,9 @@ impl State {
             let turn = state
                 .store
                 .prepare(operation, now.upper_ms, self.config.turns);
-            match publish(
+            #[cfg(feature = "sim")]
+            let sequence = state.sequence;
+            let published = publish(
                 &self.config,
                 || self.clock.now(),
                 &mut self.journal,
@@ -604,8 +701,27 @@ impl State {
                 slot,
                 state,
                 turn,
-            ) {
+            );
+            #[cfg(feature = "sim")]
+            if sequence != state.sequence {
+                observe_mutation(
+                    &self.config,
+                    self.topology.generation,
+                    &self.storage,
+                    slot,
+                    state,
+                );
+            }
+            match published {
                 Published::Reply(reply) => {
+                    #[cfg(feature = "sim")]
+                    if !matches!(reply, Reply::Error(_)) {
+                        hooks::observe(Observed::Served {
+                            worker: self.config.id,
+                            slot,
+                            epoch: state.epoch,
+                        });
+                    }
                     state.operations = state.operations.saturating_add(1);
                     if matches!(
                         operation,
@@ -657,6 +773,8 @@ impl State {
                 let turn = state
                     .store
                     .prepare_expiry(now.upper_ms, 32, Duration::from_micros(100));
+                #[cfg(feature = "sim")]
+                let sequence = state.sequence;
                 let _ = publish(
                     &self.config,
                     || self.clock.now(),
@@ -666,6 +784,16 @@ impl State {
                     state,
                     turn,
                 );
+                #[cfg(feature = "sim")]
+                if sequence != state.sequence {
+                    observe_mutation(
+                        &self.config,
+                        self.topology.generation,
+                        &self.storage,
+                        slot,
+                        state,
+                    );
+                }
             }
             if state.store.is_empty() || state.role != Role::Primary {
                 self.expiry_keys.remove(&slot);
@@ -785,10 +913,66 @@ impl State {
         if state.role != Role::Copy(source) || state.epoch != packet.epoch {
             return;
         }
+        #[cfg(feature = "sim")]
+        let before = (state.baseline, state.sequence, packet.slot);
         let _ = self
             .copies
             .apply(&self.config, state, packet, &mut self.storage);
+        #[cfg(feature = "sim")]
+        if state.baseline && (!before.0 || state.sequence != before.1) {
+            let slot = before.2;
+            observe_charge(&self.config, &self.storage, slot, state);
+            if hooks::watched(slot) {
+                hooks::observe(Observed::ReplicaApplied {
+                    worker: self.config.id,
+                    source,
+                    generation: self.topology.generation,
+                    slot,
+                    epoch: state.epoch,
+                    sequence: state.sequence,
+                    digest: state.store.digest(0),
+                });
+            }
+        }
     }
+}
+
+#[cfg(feature = "sim")]
+fn observe_mutation(
+    config: &ActorConfig,
+    generation: u64,
+    storage: &StoreBytes,
+    slot: u16,
+    shard: &Shard,
+) {
+    observe_charge(config, storage, slot, shard);
+    if hooks::watched(slot) {
+        observe_publication(config.id, generation, slot, shard);
+    }
+}
+
+#[cfg(feature = "sim")]
+fn observe_publication(worker: WorkerId, generation: u64, slot: u16, shard: &Shard) {
+    hooks::observe(Observed::Published {
+        worker,
+        generation,
+        slot,
+        epoch: shard.epoch,
+        sequence: shard.sequence,
+        digest: shard.store.digest(0),
+    });
+}
+
+#[cfg(feature = "sim")]
+fn observe_charge(config: &ActorConfig, storage: &StoreBytes, slot: u16, shard: &Shard) {
+    hooks::observe(Observed::Charged {
+        worker: config.id,
+        slot,
+        slot_bytes: shard.store.charged_bytes(),
+        slot_limit: config.slot_bytes,
+        actor_bytes: storage.primary + storage.replica,
+        actor_limit: config.primary_bytes + config.replica_bytes,
+    });
 }
 
 enum Published {

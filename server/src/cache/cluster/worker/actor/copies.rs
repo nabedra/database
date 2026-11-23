@@ -240,6 +240,16 @@ impl Copies {
                 effects,
                 digest,
             } if state.baseline && state.sequence.checked_add(1) == Some(sequence) => {
+                #[cfg(feature = "sim")]
+                let effects = {
+                    let mut effects = effects;
+                    if super::hooks::knobs().replica_keeps_deleted_keys {
+                        effects.retain(|effect| {
+                            !matches!(effect, crate::cache::store::Effect::Delete(_))
+                        });
+                    }
+                    effects
+                };
                 merge(
                     &mut state.store,
                     effects,

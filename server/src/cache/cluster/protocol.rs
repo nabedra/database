@@ -23,6 +23,7 @@ pub(super) struct WorkerId {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(all(test, feature = "sim"), derive(Hash))]
 pub(super) struct Member {
     pub id: WorkerId,
     pub zone: String,
@@ -68,6 +69,7 @@ impl SlotRange {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(all(test, feature = "sim"), derive(Hash))]
 pub(super) struct Lease {
     pub expires_ms: u64,
     pub not_before_ms: u64,
@@ -75,6 +77,7 @@ pub(super) struct Lease {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(all(test, feature = "sim"), derive(Hash))]
 pub(super) struct Move {
     pub operation: Uuid,
     pub target: WorkerId,
@@ -86,6 +89,7 @@ pub(super) struct Move {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(all(test, feature = "sim"), derive(Hash))]
 pub(super) struct Frozen {
     pub lease_expires_ms: u64,
     pub sequence: u64,
@@ -94,6 +98,7 @@ pub(super) struct Frozen {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(all(test, feature = "sim"), derive(Hash))]
 pub(super) struct ReplicaSeed {
     pub previous_primary: WorkerId,
     pub previous_epoch: u64,
@@ -102,6 +107,7 @@ pub(super) struct ReplicaSeed {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(all(test, feature = "sim"), derive(Hash))]
 pub(super) struct Slot {
     pub epoch: u64,
     pub primary: Option<WorkerId>,
@@ -117,6 +123,7 @@ pub(super) struct Slot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(all(test, feature = "sim"), derive(Hash))]
 pub(super) struct Topology {
     pub generation: u64,
     pub revision: u64,

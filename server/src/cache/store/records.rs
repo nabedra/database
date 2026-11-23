@@ -1,6 +1,47 @@
+use std::collections::hash_map::RandomState;
+
 use super::*;
 
-type Index = HashMap<Bytes, usize, RandomState>;
+type Index = HashMap<Bytes, usize, IndexHasher>;
+
+#[cfg(not(feature = "sim"))]
+type IndexHasher = RandomState;
+
+#[cfg(feature = "sim")]
+#[derive(Clone)]
+enum IndexHasher {
+    Product(RandomState),
+    Seeded(u64),
+}
+
+#[cfg(feature = "sim")]
+impl Default for IndexHasher {
+    fn default() -> Self {
+        if nabedra_rt::sim::world().is_some() {
+            Self::Seeded(nabedra_rt::ids::random_u64())
+        } else {
+            Self::Product(RandomState::new())
+        }
+    }
+}
+
+#[cfg(feature = "sim")]
+impl std::hash::BuildHasher for IndexHasher {
+    type Hasher = std::collections::hash_map::DefaultHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        use std::hash::Hasher;
+        match self {
+            Self::Product(state) => state.build_hasher(),
+            Self::Seeded(seed) => {
+                // Prefix the input to the table hash with a per-node seed.
+                let mut hasher = Self::Hasher::new();
+                hasher.write_u64(*seed);
+                hasher
+            }
+        }
+    }
+}
 
 // Each owning key/value may have a shared Bytes control block and padding.
 // Bodies are exact-sized allocations supplied by the wire reader.
@@ -23,7 +64,7 @@ pub(super) struct Record {
 }
 
 impl Record {
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(any(test, feature = "test-hooks", feature = "sim"))]
     pub fn key(&self) -> &Bytes {
         &self.key
     }
@@ -141,7 +182,7 @@ impl Records {
         self.entries.len()
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(any(test, feature = "test-hooks", feature = "sim"))]
     pub fn iter(&self) -> impl Iterator<Item = &Record> {
         self.entries.iter()
     }
