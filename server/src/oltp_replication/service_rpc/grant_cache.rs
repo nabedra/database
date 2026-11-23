@@ -76,6 +76,7 @@ pub(crate) type WarmRead = (
 pub(crate) type Refresh = Arc<dyn Fn() -> Option<WarmRead> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "sim", derive(PartialOrd, Ord))]
 pub(crate) struct GrantKey([u8; 32]);
 impl GrantKey {
     /// `None` for an action this cache never holds.
@@ -137,6 +138,12 @@ struct Warm {
     backoff: Option<Instant>,
 }
 
+// A seed must replay the same sequence of background Control reads.
+#[cfg(feature = "sim")]
+type WarmGrants = std::collections::BTreeMap<GrantKey, Warm>;
+#[cfg(not(feature = "sim"))]
+type WarmGrants = HashMap<GrantKey, Warm>;
+
 #[derive(Default)]
 struct Grants {
     /// Role checks passed, by key, with their expiry.
@@ -144,7 +151,7 @@ struct Grants {
     revision: Option<u64>,
     observed: Option<Observed>,
     /// Keys refreshed in the background, with their last use.
-    warm: HashMap<GrantKey, Warm>,
+    warm: WarmGrants,
     /// Whether the warm task runs.
     warming: bool,
 }
@@ -913,5 +920,41 @@ mod tests {
             (2..=12).contains(&reads),
             "{reads} background reads in 20 s"
         );
+    }
+
+    /// P10-DET: the warm task refreshes the keys due in one tick in key
+    /// order, not in the map's hash order, so a simulation seed replays the
+    /// same sequence of Control reads.
+    #[cfg(feature = "sim")]
+    #[tokio::test(start_paused = true)]
+    async fn rd2_warm_refreshes_run_in_key_order() {
+        let cache = GrantCache::default();
+        let order = Arc::new(Mutex::new(Vec::<GrantKey>::new()));
+        let keys: Vec<_> = (0..16).map(|index| GrantKey([index; 32])).collect();
+        for &key in keys.iter().rev() {
+            let refresh: Refresh = {
+                let order = order.clone();
+                Arc::new(move || {
+                    let order = order.clone();
+                    Some((
+                        Some(1),
+                        Box::pin(async move {
+                            order.lock().unwrap().push(key);
+                            Ok(None)
+                        }) as Pin<Box<dyn Future<Output = _> + Send>>,
+                    ))
+                })
+            };
+            cache
+                .role_warm(Some(key), Some(1), || async { Ok(None) }, || refresh)
+                .await
+                .unwrap();
+        }
+        // Every entry was recorded at the same instant, so all of them fall
+        // due in the same tick, about GRANT_TTL - WARM_AHEAD later.
+        nabedra_rt::time::sleep(GRANT_TTL).await;
+        let order = order.lock().unwrap().clone();
+        assert_eq!(order.len(), keys.len(), "one refresh per key");
+        assert_eq!(order, keys);
     }
 }
