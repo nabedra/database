@@ -902,7 +902,7 @@ async fn calculate(
                 .scheduler
                 .reserve_on(peers.sequence, peers.cap, local, budget)
                 .await?;
-            let work = move |_, _: &tokio::runtime::Runtime| match op {
+            let work = move |_, _: &crate::worker_pool::WorkerRuntime| match op {
                 Operation::Get(_) => Ok(ExecuteResult::Row(rows.pop())),
                 Operation::Collect(p) => {
                     crate::engine::reduce_collect(&table, &p.query, &rows).map(ExecuteResult::Rows)
