@@ -1,0 +1,21 @@
+diff --git a/server/src/oltp_replication/service_rpc.rs b/server/src/oltp_replication/service_rpc.rs
+index 6d2638e..fbf7f73 100644
+--- a/server/src/oltp_replication/service_rpc.rs
++++ b/server/src/oltp_replication/service_rpc.rs
+@@ -918,16 +918,6 @@ impl Client {
+                         continue;
+                     }
+                     Ok(Err(error)) => return Err(error.into()),
+-                    Err(CallError::Transport(RequestError::PeerRejected { worker, error }))
+-                        if matches!(method, Method::ParticipantFence { .. })
+-                            && worker.worker_id == member.worker_id
+-                            && placement_rejected_before_execution(&error) =>
+-                    {
+-                        // Control retains the placement while replicas reopen.
+-                        // This peer had no route for the fence, so try the
+-                        // other verified voters before refreshing membership.
+-                        continue;
+-                    }
+                     Err(CallError::Transport(error)) => {
+                         match &error {
+                             RequestError::Protocol(detail)

@@ -152,7 +152,7 @@ pub(super) fn framed_reader(body: Body) -> super::payload_stream::Reader {
 pub(crate) async fn cpu<T, F>(pool: &WorkerPool, work: F) -> Result<T>
 where
     T: Send + 'static,
-    F: FnOnce(&tokio::runtime::Runtime) -> Result<T> + Send + 'static,
+    F: FnOnce(&crate::worker_pool::WorkerRuntime) -> Result<T> + Send + 'static,
 {
     pool.submit(0, move |_, runtime| work(runtime))
         .await?

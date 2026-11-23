@@ -1,0 +1,46 @@
+# Reverted fix BUG1-auth (phase 10, design section 4.1). The patch is applied only in a scratch
+# worktree by scripts/testing/sim_bugs.py, never in the shipped tree.
+schema = "nabedra.sim-bug/1"
+id = "bug1-auth"
+bug = "BUG1-auth"
+set = "direct"
+phase = 10
+class = "uncertain-outcome"
+guarantees = ["OLTP-G03", "OLTP-G04"]
+scenarios = ["D02", "O10"]
+fix_commits = ["d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2", "259da02c2369527ebce3d292dac83dd5ffad2d71"]
+reverts = "d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"
+port = "hand"
+port_notes = """
+The whole fix conflicts with HEAD. This ports one line of the d7b9d63c hunk in
+server/src/oltp_runtime/application/direct.rs (DirectGateway, the DirectSendError::NotApplied arm):
+`return Err(if *uncertain { unknown() } else { error });` goes back to `return Err(error);`, so an
+Unauthorized refusal of a retry erases the uncertainty a lost reply left. The 259da02c test hunk
+(the refused second insert) stays, as no test hunk is reverted.
+"""
+workload = "direct"
+# lost-reply on the first attempt after apply, then auth-flap on the retry (lead decision 4:
+# a stale enrollment revision at the transport first).
+profile = ["lost-reply", "auth-flap"]
+expect = ["NotAppliedNeverCommitted", "failed-write-observed"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_runtime::application::direct::tests::d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome"
+mode = "on"
+# The direct-history fixture now detects the false refusal at the pre-retry read.
+# The recorded run below predates that fixture change and failed the original outcome assertion.
+failure_contains = ["failed-write-observed", "completed not_applied"]
+
+[regression.evidence]
+digest = "41b14a61c5962534320122e99c57f88b420855d36105ed442b26df5087ae82e3"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148935717", sha = "53a5716f844aa9690739daed32fd335c68bc0f8a", result = "passed", note = "request p10-bugs-clean-53a5716-103844, direct_oltp on" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148914295", sha = "8f29086e28080d0096c9396f77932104f81d0d99", result = "failed", note = "scratch/sim-bug-bug1-auth, request p10-bugs-bug1-auth-8f29086-103844, direct_oltp on", output = """
+test oltp_runtime::application::direct::tests::d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome ... FAILED
+panicked at src/oltp_runtime/application/direct/tests.rs:1408:5:
+assertion `left == right` failed
+  left: Error(Unauthorized, NotApplied)
+ right: Error(OutcomeUnknown, Unknown)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 585 filtered out; finished in 2.14s
+""" }

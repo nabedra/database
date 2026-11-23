@@ -4,6 +4,7 @@ use super::{
     partition::{self, ReadFile},
     query,
 };
+use crate::worker_pool::WorkerRuntime;
 use crate::{
     node::{
         LocalOutput,
@@ -17,10 +18,9 @@ use crate::{
     snapshot,
     storage::{ObjectStore, PartitionFile, Storage},
 };
-use tokio::runtime::Runtime;
 
 pub(crate) fn run_captured<B: ObjectStore>(
-    runtime: &Runtime,
+    runtime: &WorkerRuntime,
     storage: &Storage<B>,
     job: &JobEnvelope,
     output: &mut LocalOutput<'_>,
