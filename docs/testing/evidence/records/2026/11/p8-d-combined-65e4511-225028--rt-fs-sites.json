@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-d-combined-65e4511-225028--rt-fs-sites.log",
+      "sha256": "64f1a1cf04bc888006f0e6b259d00744f998ac5934f04f1a6db18a7281f03cb4"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "rt-fs-sites",
+  "duration_s": 1.92,
+  "guarantees": [
+    "OLTP-G01"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T22:41:14.601627+00:00",
+    "request_id": "p8-d-combined-65e4511-225028",
+    "runner": "GitHub Actions 1000008326",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45273714382"
+  },
+  "scenarios": [
+    "O11"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "65e45114e01f694f396eb549875a2fa91638a069",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

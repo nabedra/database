@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-d-combined-65e4511-225028--oltp-direct-history-component.log",
+      "sha256": "7642d6338b36b049c9eb79b7cad25f7b24755e2625d71a14bcf9525e8f9ae14e"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-direct-history-component",
+  "duration_s": 236.46,
+  "guarantees": [],
+  "kind": "H",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T22:38:28.396398+00:00",
+    "request_id": "p8-d-combined-65e4511-225028",
+    "runner": "GitHub Actions 1000008316",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45273714382"
+  },
+  "scenarios": [
+    "D02",
+    "D03",
+    "O10"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "65e45114e01f694f396eb549875a2fa91638a069",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
