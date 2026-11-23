@@ -10,5 +10,5 @@ lowest_regression = "oltp::pool::sim_tests::o11_snapshot_install_recovers_the_ge
 seed = 41
 why_not_caught = "The existing process interruption test kept the operating system directory cache intact."
 invariant_added = "A power cut after activation retains the file and its directory path. A cut before activation retains the previous generation."
-fix_commits = ["359143e122033e6cb667f1d9828370049e245673"]
+fix_commits = ["606c28dc4b144fae8132971419cc5f75585748c8"]
 revert_patch_ok = true

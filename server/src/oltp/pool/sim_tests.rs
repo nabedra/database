@@ -1,6 +1,6 @@
 //! Pool-level fault model on the same per-node volume as the KV store.
+use super::tests::{group_identity, meta, shared};
 use super::*;
-use crate::{config::WorkerResources, oltp_replication::types::WorkerIdentity};
 use nabedra_rt::{
     fs::FsCall,
     sim::{self, Cut, NodeClock, VolumeInfo, Wipe, World},
@@ -22,20 +22,14 @@ fn identity() -> PoolIdentity {
     }
 }
 
-fn resources() -> Arc<WorkerSharedResources> {
-    WorkerSharedResources::new(
-        NODE,
-        WorkerResources {
-            max_threads: 16,
-            ..Default::default()
-        },
-        SharedResourceConfig::default(),
+fn open() -> OltpPool {
+    OltpPool::open_development_on(
+        DATA,
+        identity(),
+        shared(SharedResourceConfig::default()),
+        nabedra_rt::fs::real(),
     )
     .unwrap()
-}
-
-fn open() -> OltpPool {
-    OltpPool::open_development_on(DATA, identity(), resources(), nabedra_rt::fs::real()).unwrap()
 }
 
 fn put(pool: &OltpPool, key: &[u8], durability: Durability) -> Result<(), ProtocolError> {
@@ -167,12 +161,7 @@ fn expectation(info: &VolumeInfo) -> mount::PoolMountExpectation {
     let identity = identity();
     mount::PoolMountExpectation {
         profile: mount::PoolMountProfile::Ebs,
-        worker: WorkerIdentity {
-            worker_id: identity.worker_id,
-            incarnation: Uuid::from_u128(4),
-            certificate_sha256: Digest::from_bytes([5; 32]),
-            enrollment_revision: 1,
-        },
+        worker: mount::tests::worker_identity(identity.worker_id, Uuid::from_u128(4)),
         identity,
         generation: 1,
         mount_path: info.mount_path.clone(),
@@ -225,7 +214,12 @@ fn o17_mount_identity_and_disk_budget_follow_volume() {
                     0
                 );
                 let old_inode = observed.root_inode;
-                let pool = OltpPool::open_registered(mount, identity(), resources()).unwrap();
+                let pool = OltpPool::open_registered(
+                    mount,
+                    identity(),
+                    shared(SharedResourceConfig::default()),
+                )
+                .unwrap();
                 put(&pool, b"mounted", Durability::Sync).unwrap();
                 // The fixture provisions the pool directory durably on the simulated mount.
                 fs::sync_dir(DATA).unwrap();
@@ -238,7 +232,12 @@ fn o17_mount_identity_and_disk_budget_follow_volume() {
             sim::in_node(NODE, async {
                 let mount = VerifiedPoolMount::verify(expected.clone(), None).unwrap();
                 assert_eq!(mount.observation().root_inode, old_inode);
-                let pool = OltpPool::open_registered(mount, identity(), resources()).unwrap();
+                let pool = OltpPool::open_registered(
+                    mount,
+                    identity(),
+                    shared(SharedResourceConfig::default()),
+                )
+                .unwrap();
                 assert_key(&pool, b"mounted", true);
             })
             .await;
@@ -273,28 +272,20 @@ fn o17_mount_identity_and_disk_budget_follow_volume() {
 
 #[test]
 fn o11_snapshot_install_recovers_the_generation_at_activation() {
-    use crate::oltp_replication::types::{AppliedPosition, GroupKind, Text};
-
     const SOURCE: &str = "/sim/n1/source";
     let replay = |after_activation| {
         sim::run(SEED, |world| async move {
             mount_data(&world);
             world.mount(NODE, SOURCE);
             let volume = world.volume(NODE, Path::new(DATA)).unwrap();
-            let identity = GroupIdentity {
-                cluster_id: identity().cluster_id,
-                database: Text::try_from("default").unwrap(),
-                group_id: Uuid::from_u128(6),
-                kind: GroupKind::Catalog,
-                group_format_version: 1,
-            };
             let budget = TransactionBudget {
                 scratch_bytes: 64 << 10,
                 batch_bytes: 64 << 10,
                 output_bytes: 64 << 10,
             };
-            let target = sim::in_node(NODE, async {
+            let (target, identity) = sim::in_node(NODE, async {
                 let target = open();
+                let identity = group_identity(&target);
                 let source = OltpPool::open_development_on(
                     SOURCE,
                     PoolIdentity {
@@ -312,22 +303,10 @@ fn o11_snapshot_install_recovers_the_generation_at_activation() {
                     (&source_group, 1, b"new".as_slice()),
                 ] {
                     group
-                        .transaction(
-                            ApplyMeta {
-                                position: AppliedPosition {
-                                    term: 1,
-                                    node_id: NODE,
-                                    index,
-                                },
-                                command_digest: Digest::from_bytes([index as u8; 32]),
-                                membership: None,
-                            },
-                            budget,
-                            move |tx| {
-                                tx.put(b"key", value)?;
-                                Ok(Transition::Commit(tx.copy_output(b"ok")?))
-                            },
-                        )
+                        .transaction(meta(index), budget, move |tx| {
+                            tx.put(b"key", value)?;
+                            Ok(Transition::Commit(tx.copy_output(b"ok")?))
+                        })
                         .await
                         .unwrap();
                 }
@@ -348,7 +327,7 @@ fn o11_snapshot_install_recovers_the_generation_at_activation() {
                         .is_err()
                 );
                 assert!(volume.is_crashed(), "installation must reach the cut");
-                target
+                (target, identity)
             })
             .await;
             world.crash(NODE);

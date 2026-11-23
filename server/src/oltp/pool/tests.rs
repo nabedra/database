@@ -20,7 +20,7 @@ impl Drop for Dir {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-fn shared(config: SharedResourceConfig) -> Arc<WorkerSharedResources> {
+pub(super) fn shared(config: SharedResourceConfig) -> Arc<WorkerSharedResources> {
     WorkerSharedResources::new(
         17,
         WorkerResources {
@@ -40,7 +40,7 @@ fn pool_identity() -> PoolIdentity {
         pool_id: nabedra_rt::ids::uuid_v4(),
     }
 }
-fn group_identity(pool: &OltpPool) -> GroupIdentity {
+pub(super) fn group_identity(pool: &OltpPool) -> GroupIdentity {
     GroupIdentity {
         cluster_id: pool.identity().cluster_id,
         database: Text::try_from("default").unwrap(),
@@ -56,7 +56,7 @@ fn budget() -> TransactionBudget {
         output_bytes: 64 << 10,
     }
 }
-fn meta(index: u64) -> ApplyMeta {
+pub(super) fn meta(index: u64) -> ApplyMeta {
     ApplyMeta {
         position: AppliedPosition {
             term: 0,
