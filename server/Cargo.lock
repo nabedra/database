@@ -1938,6 +1938,9 @@ dependencies = [
 name = "nabedra-rt"
 version = "0.1.0"
 dependencies = [
+ "openraft-rt",
+ "openraft-rt-tokio",
+ "rand 0.10.4",
  "tokio",
  "uuid",
 ]

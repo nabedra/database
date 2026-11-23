@@ -16,10 +16,20 @@ name = "nabedra_rt"
 # inline blocking work. Never enable it in a product build; `server/src/main.rs` refuses
 # to compile with it.
 sim = ["tokio/test-util"]
+# openraft 0.10's runtime on the simulated node context (`sim::openraft10`). Sim only; the
+# three crates are already in the product graph through openraft at these versions.
+sim-openraft = ["sim", "dep:openraft-rt", "dep:openraft-rt-tokio", "dep:rand"]
 
 [dependencies]
 tokio = { version = "=1.54.1", default-features = false, features = ["rt", "time"] }
 uuid = { version = "=1.29.2", features = ["v4"] }
+openraft-rt = { version = "=0.10.0", optional = true }
+openraft-rt-tokio = { version = "=0.10.0", optional = true }
+rand = { version = "=0.10.4", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "=1.54.1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
+
+[lints.rust]
+# Simulation builds may pass `--cfg tokio_unstable` (see `sim::runtime_seeded`).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
