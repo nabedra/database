@@ -1489,6 +1489,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "mime",
+ "nabedra-protocol",
  "nabedra-rt",
  "openraft 0.10.0",
  "parquet",
@@ -1561,6 +1562,16 @@ dependencies = [
  "libc",
  "nabedra-rt",
  "tokio",
+]
+
+[[package]]
+name = "nabedra-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "uuid",
 ]
 
 [[package]]

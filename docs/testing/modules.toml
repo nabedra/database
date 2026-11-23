@@ -50,7 +50,10 @@ paths = [
   "server/src/oltp.rs",
   "server/src/oltp_*/**",
   "server/src/oltp_*.rs",
-  "server/src/migration_interchange.rs",
+  "server/protocol/Cargo.toml",
+  "server/protocol/src/lib.rs",
+  "server/protocol/src/queue_error.rs",
+  "server/protocol/src/migration_interchange.rs",
   # Shared server entry points: both engines link them.
   "server/src/lib.rs",
   "server/src/main.rs",
@@ -64,8 +67,8 @@ paths = [
   "server/src/executor.rs",
   "server/src/maintenance.rs",
   "server/src/network.rs",
-  "server/src/protocol.rs",
-  "server/src/query_semantics.rs",
+  "server/protocol/src/protocol.rs",
+  "server/protocol/src/query_semantics.rs",
   "server/src/response.rs",
   "server/src/runtime.rs",
   "server/src/supervisor.rs",
@@ -126,7 +129,7 @@ hot_paths = [
   "server/src/oltp/codec.rs",
   "server/src/oltp_replication/typed_log/**",
   "server/src/oltp_replication/multiplex/**",
-  "server/src/protocol.rs",
+  "server/protocol/src/protocol.rs",
 ]
 
 [[module]]
@@ -155,10 +158,13 @@ paths = [
   "server/src/config.rs",
   "server/src/executor.rs",
   "server/src/maintenance.rs",
-  "server/src/migration_interchange.rs",
+  "server/protocol/Cargo.toml",
+  "server/protocol/src/lib.rs",
+  "server/protocol/src/queue_error.rs",
+  "server/protocol/src/migration_interchange.rs",
   "server/src/network.rs",
-  "server/src/protocol.rs",
-  "server/src/query_semantics.rs",
+  "server/protocol/src/protocol.rs",
+  "server/protocol/src/query_semantics.rs",
   "server/src/response.rs",
   "server/src/runtime.rs",
   "server/src/supervisor.rs",
@@ -200,7 +206,7 @@ hot_paths = [
   "server/src/engine/partition.rs",
   "server/src/snapshot.rs",
   "server/src/snapshot/**",
-  "server/src/query_semantics.rs",
+  "server/protocol/src/query_semantics.rs",
   "server/src/node/payload/**",
 ]
 

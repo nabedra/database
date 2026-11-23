@@ -14,7 +14,7 @@ include = ["/src/", "/tests/", "/examples/", "/Cargo.lock", "/README.md", "/LICE
 
 [workspace]
 # `nabedra-kv` builds and tests alone: `cargo test -p nabedra-kv`.
-members = [".", "kv", "check", "rt", "sim"]
+members = [".", "kv", "check", "rt", "protocol", "sim"]
 # Plain `cargo build` and `cargo test` here build only the server, as before `sim` joined.
 # The simulation crates are members but never default members: they enable
 # `nabedra-rt/sim`, which `src/main.rs` refuses to compile. Name them with `-p`.
@@ -71,6 +71,7 @@ socket2 = { version = "=0.6.5", optional = true }
 bytes = "=1.12.1"
 nabedra-kv = { path = "kv", version = "0.1.0", optional = true }
 nabedra-rt = { path = "rt", version = "0.1.0" }
+nabedra-protocol = { path = "protocol", version = "0.1.0" }
 hashbrown = { version = "=0.17.1", default-features = false, optional = true }
 smallvec = { version = "=1.16.5", optional = true }
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde"], optional = true }

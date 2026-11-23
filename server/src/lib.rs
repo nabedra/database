@@ -33,7 +33,7 @@ pub mod executor;
 #[cfg(feature = "olap")]
 pub mod maintenance;
 #[cfg(any(feature = "olap", feature = "oltp"))]
-pub mod migration_interchange;
+pub use nabedra_protocol::migration_interchange;
 #[cfg(any(feature = "olap", feature = "oltp"))]
 pub(crate) mod network;
 #[cfg(feature = "olap")]
@@ -58,9 +58,9 @@ pub mod oltp_runtime;
 #[cfg(any(feature = "olap", feature = "oltp"))]
 pub mod partition_size;
 #[cfg(any(feature = "olap", feature = "oltp"))]
-pub mod protocol;
+pub use nabedra_protocol::protocol;
 #[cfg(any(feature = "olap", feature = "oltp"))]
-pub(crate) mod query_semantics;
+pub(crate) use nabedra_protocol::query_semantics;
 #[cfg(any(feature = "olap", feature = "oltp"))]
 pub mod request_queue;
 #[cfg(feature = "oltp")]

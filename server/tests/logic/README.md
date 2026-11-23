@@ -133,7 +133,7 @@ logical table name on the scan line.
 The wire format has no NULL values. A row must contain every schema column,
 and a filter value must be a non-null scalar of the column's exact type. NULL
 tests therefore check that null is rejected, and `NULL` appears in output only
-for absent JSON values. Comparisons follow `server/src/query_semantics.rs`:
+for absent JSON values. Comparisons follow `server/protocol/src/query_semantics.rs`:
 strings compare by bytes, `false < true`, floats compare numerically with
 `-0.0 == 0.0`, and every sort breaks ties by the primary key. There are no
 aggregates other than `query.count` and no group-by.

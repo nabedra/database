@@ -10,9 +10,7 @@ pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 pub const MAX_BATCH_ROWS: usize = 10_000;
 pub const MAX_RESULT_ROWS: usize = 10_000;
-#[cfg(feature = "olap")]
 pub const MAX_TABLE_ROWS: usize = 100_000;
-#[cfg(feature = "olap")]
 pub const MAX_DECODED_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SCHEMA_COLUMNS: usize = 128;
 /// Root predicate has depth one, including comparison leaves.
@@ -669,7 +667,8 @@ impl<'de> Deserialize<'de> for LogicalPredicate {
 }
 // Serde structs can otherwise accept positional JSON arrays. Wire objects must
 // carry named fields, including nested query/order/predicate objects.
-pub(crate) fn deserialize_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+#[doc(hidden)]
+pub fn deserialize_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
 ) -> Result<T, D::Error> {
     struct ObjectVisitor<T>(std::marker::PhantomData<T>);
@@ -777,18 +776,20 @@ impl Predicate {
 
 /// Lexical limits before typed JSON decoding, including opaque RawValue fields.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum JsonBoundsError {
+#[doc(hidden)]
+pub enum JsonBoundsError {
     LimitExceeded,
     InvalidRecord,
 }
-pub(crate) fn json_input(bytes: &[u8], cap: usize) -> Result<(), JsonBoundsError> {
+#[doc(hidden)]
+pub fn json_input(bytes: &[u8], cap: usize) -> Result<(), JsonBoundsError> {
     json_input_at_depth(bytes, cap, 32)
 }
 /// Logical predicate nodes may contain both an object and an args array.
 /// Preserve the public depth-32 predicate contract without relaxing internal
 /// storage/control JSON. This remains below serde_json's depth-128 stack guard.
-#[cfg(feature = "oltp")]
-pub(crate) fn request_json_input(bytes: &[u8]) -> Result<(), JsonBoundsError> {
+#[doc(hidden)]
+pub fn request_json_input(bytes: &[u8]) -> Result<(), JsonBoundsError> {
     json_input_at_depth(bytes, MAX_BODY_BYTES, (2 * MAX_PREDICATE_DEPTH + 8) as u32)
 }
 fn json_input_at_depth(bytes: &[u8], cap: usize, max_depth: u32) -> Result<(), JsonBoundsError> {
