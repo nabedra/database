@@ -281,6 +281,60 @@ fn fd_path_names_the_open_file() {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
+/// An open descriptor and a relative path captured before a rename still address the
+/// same directory, even after a new directory occupies its original name.
+#[cfg(target_os = "linux")]
+pub(crate) fn directory_descriptor_after_rename(root: &Path) -> (File, PathBuf) {
+    let original = root.join("pool");
+    let moved = root.join("old-pool");
+    create_dir(&original).unwrap();
+    write(original.join("identity"), b"original").unwrap();
+    let directory = File::open(&original).unwrap();
+    let opening_inode = directory.metadata().unwrap().ino();
+    let base = directory.fd_path();
+    let relative_identity = base.join("identity");
+    let entry = read_dir(&base).unwrap().next().unwrap().unwrap();
+    let entry_inode = entry.metadata().unwrap().ino();
+    assert!(directory.try_lock_exclusive().unwrap());
+
+    rename(&original, &moved).unwrap();
+    create_dir(&original).unwrap();
+    write(original.join("identity"), b"replacement").unwrap();
+    let replacement = File::open(&original).unwrap();
+    assert_ne!(replacement.metadata().unwrap().ino(), opening_inode);
+    assert_eq!(directory.metadata().unwrap().ino(), opening_inode);
+    assert_eq!(read(&relative_identity).unwrap(), b"original");
+    assert_eq!(read(entry.path()).unwrap(), b"original");
+    assert_eq!(entry.metadata().unwrap().ino(), entry_inode);
+    assert_eq!(
+        read(directory.fd_path().join("identity")).unwrap(),
+        b"original"
+    );
+    assert!(replacement.try_lock_exclusive().unwrap());
+    let moved_directory = File::open(&moved).unwrap();
+    assert!(!moved_directory.try_lock_exclusive().unwrap());
+    directory.unlock();
+    assert!(moved_directory.try_lock_exclusive().unwrap());
+
+    write(directory.fd_path().join("manifest"), b"published").unwrap();
+    directory.sync_all().unwrap();
+    directory.sync_data().unwrap();
+    assert_eq!(read(moved.join("manifest")).unwrap(), b"published");
+    assert!(!try_exists(original.join("manifest")).unwrap());
+    (directory, relative_identity)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn directory_descriptor_follows_rename_on_the_host() {
+    let root = host_dir("directory-rename");
+    let (directory, relative_identity) = directory_descriptor_after_rename(&root);
+    remove_dir_all(root.join("old-pool")).unwrap();
+    assert!(read(&relative_identity).is_err());
+    drop(directory);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(not(feature = "sim"))]
 #[test]
 fn product_wrappers_are_the_std_types() {

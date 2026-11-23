@@ -15,6 +15,8 @@
 //! the replacement image. [`World::wipe`] replaces one volume by an empty one: the RV-REP #3
 //! condition, a wiped data volume next to a surviving key volume, is one call.
 
+#[cfg(unix)]
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,8 @@ use std::sync::{Arc, Mutex, Weak};
 use uuid::Uuid;
 
 use super::{NodeContext, SimEvent, World, current_node_context, lock, world};
+#[cfg(unix)]
+use crate::fs::DescriptorInode;
 use crate::fs::{FaultFs, Fs, FsFile, FsLock, OpenMode, PowerLoss};
 
 /// The identity of a simulated volume, as the mount code reads it from the host.
@@ -88,6 +92,10 @@ struct TableState {
     next_minor: u32,
     next_mount_id: u64,
     unmounted_errors: u64,
+    #[cfg(unix)]
+    next_descriptor: u64,
+    #[cfg(unix)]
+    descriptors: BTreeMap<u64, OpenDescriptor>,
 }
 
 /// The world's mount table.
@@ -147,22 +155,122 @@ impl Table {
     }
 }
 
-/// Where a filesystem call made by the current thread goes.
-pub(crate) enum Route {
+/// The namespace reserved for descriptor paths in the ambient simulation.
+#[cfg(unix)]
+const DESCRIPTORS: &str = "/.nabedra-sim-fd";
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct OpenDescriptor {
+    context: NodeContext,
+    fs: FaultFs,
+    inode: DescriptorInode,
+    opened_as: PathBuf,
+}
+
+/// Owns an open descriptor's pathname alias within its world and node incarnation.
+#[cfg(unix)]
+pub(crate) struct DescriptorPath {
+    world: Weak<World>,
+    id: u64,
+}
+
+#[cfg(unix)]
+impl DescriptorPath {
+    pub(crate) fn new(fs: FaultFs, inode: DescriptorInode, path: &Path) -> Self {
+        let world = world().expect("a simulated descriptor is opened in a world");
+        let context = current_node_context().expect("a simulated descriptor is opened on a node");
+        let mut table = lock(&world.volumes.state);
+        let id = table.next_descriptor;
+        table.next_descriptor += 1;
+        table.descriptors.insert(
+            id,
+            OpenDescriptor {
+                context,
+                fs,
+                inode,
+                opened_as: path.to_path_buf(),
+            },
+        );
+        Self {
+            world: world.me.clone(),
+            id,
+        }
+    }
+
+    pub(crate) fn path(&self) -> PathBuf {
+        Path::new(DESCRIPTORS).join(self.id.to_string())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DescriptorPath {
+    fn drop(&mut self) {
+        if let Some(world) = self.world.upgrade() {
+            lock(&world.volumes.state).descriptors.remove(&self.id);
+        }
+    }
+}
+
+/// Where an ambient filesystem call goes, and the path it uses on that volume.
+#[cfg(unix)]
+pub(crate) enum Route<'a> {
     /// No world, no node, or a node without mounts: the host filesystem.
     Host,
-    Volume(FaultFs),
+    Volume(FaultFs, Cow<'a, Path>),
 }
 
 /// Routes `path` for the current world and node.
-pub(crate) fn route(path: &Path) -> io::Result<Route> {
+#[cfg(unix)]
+pub(crate) fn route(path: &Path) -> io::Result<Route<'_>> {
+    if let Ok(descriptor) = path.strip_prefix(DESCRIPTORS) {
+        return route_descriptor(descriptor);
+    }
     let (Some(world), Some(context)) = (world(), current_node_context()) else {
         return Ok(Route::Host);
     };
     Ok(match world.resolve_node_path(context, path)? {
-        Some(fs) => Route::Volume(fs),
+        Some(fs) => Route::Volume(fs, Cow::Borrowed(path)),
         None => Route::Host,
     })
+}
+
+#[cfg(unix)]
+fn route_descriptor(relative: &Path) -> io::Result<Route<'_>> {
+    let missing = || io::Error::from(io::ErrorKind::NotFound);
+    let world = world().ok_or_else(missing)?;
+    let context = current_node_context().ok_or_else(missing)?;
+    let mut components = relative.components();
+    let id = components
+        .next()
+        .and_then(|id| id.as_os_str().to_str())
+        .and_then(|id| id.parse().ok())
+        .ok_or_else(missing)?;
+    let descriptor = lock(&world.volumes.state)
+        .descriptors
+        .get(&id)
+        .filter(|open| open.context == context)
+        .cloned()
+        .ok_or_else(missing)?;
+    let suffix = components.as_path();
+    if suffix
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(io::ErrorKind::Unsupported.into());
+    }
+    if !suffix.as_os_str().is_empty() && matches!(descriptor.inode, DescriptorInode::File(_)) {
+        return Err(io::ErrorKind::NotADirectory.into());
+    }
+    let opened = descriptor
+        .fs
+        .descriptor_path(descriptor.inode, &descriptor.opened_as)?;
+    let path = opened.join(suffix);
+    let mounted = world
+        .resolve_node_path(context, &path)?
+        .ok_or_else(missing)?;
+    same_device(&descriptor.fs, &mounted)?;
+    Ok(Route::Volume(descriptor.fs, Cow::Owned(path)))
 }
 
 /// Whether a simulated node with mounts is calling (`fs::os::euid` reports

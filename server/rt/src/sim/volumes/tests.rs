@@ -43,6 +43,42 @@ fn fs_os_on_a_volume_matches_the_host_transcript() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn directory_descriptor_follows_rename_on_a_volume() {
+    run(1, |world| async move {
+        let root = Path::new("/sim/n1/data");
+        node_with(&world, 1, &["/sim/n1/data"]);
+        let volume = world.volume(1, root).unwrap();
+        on(1, || {
+            let (directory, relative_identity) =
+                crate::fs::os::tests::directory_descriptor_after_rename(root);
+            let syncs: Vec<_> = volume
+                .calls()
+                .into_iter()
+                .filter(|call| call.op == fs::FsOp::SyncDir)
+                .map(|call| call.path)
+                .collect();
+            assert_eq!(syncs, vec![root.join("old-pool"); 2]);
+
+            os::remove_dir_all(root.join("old-pool")).unwrap();
+            assert!(directory.metadata().is_err());
+            assert!(directory.sync_all().is_err());
+            assert!(directory.sync_data().is_err());
+            assert!(directory.try_lock_exclusive().is_err());
+            assert!(os::read(&relative_identity).is_err());
+            drop(directory);
+            assert!(os::read(&relative_identity).is_err());
+            assert_eq!(
+                os::read(root.join("pool/identity")).unwrap(),
+                b"replacement"
+            );
+        })
+        .await;
+        assert_eq!(world.unmounted_path_errors(), 0);
+    });
+}
+
 #[test]
 fn a_mount_has_a_seeded_identity() {
     let infos = |seed| {
