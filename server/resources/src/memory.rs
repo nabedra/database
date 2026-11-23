@@ -682,6 +682,41 @@ mod tests {
     use crate::{config::WorkerResources, scheduling::ResourceScheduler};
 
     #[test]
+    fn f03_working_scratch_releases_scheduler_charge_before_worker_drop() {
+        struct Owner {
+            scheduler: ResourceScheduler,
+            bytes_at_drop: Arc<AtomicUsize>,
+        }
+
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.bytes_at_drop
+                    .store(self.scheduler.usage()[0].2 as usize, Ordering::Release);
+            }
+        }
+
+        let scheduler = ResourceScheduler::new(vec![(1, WorkerResources::default())]).unwrap();
+        let bytes_at_drop = Arc::new(AtomicUsize::new(usize::MAX));
+        let owner = Arc::new(Owner {
+            scheduler: scheduler.clone(),
+            bytes_at_drop: bytes_at_drop.clone(),
+        });
+        let weak = Arc::downgrade(&owner);
+        let counter = Arc::new(AtomicUsize::new(1024));
+        let charge = scheduler.charge_memory(1, 1024).unwrap();
+        let scratch = Arc::new(ScratchLease::working(owner, charge, counter.clone()));
+        let clone = scratch.clone();
+
+        drop(scratch);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(scheduler.usage(), vec![(1, 0, 1024)]);
+        drop(clone);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        assert_eq!(bytes_at_drop.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn f03_last_buffer_releases_its_bytes_before_releasing_its_owner() {
         struct Owner {
             arena: Arc<ByteArena>,
