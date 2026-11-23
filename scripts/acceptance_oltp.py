@@ -169,6 +169,11 @@ def source_identity():
     digest = hashlib.sha256()
     paths = [ROOT / "server/Cargo.toml", ROOT / "server/Cargo.lock", Path(__file__)]
     paths += sorted((ROOT / "server/src").rglob("*.rs"))
+    for package in ("resources", "transport"):
+        crate = ROOT / "server" / package
+        if (crate / "Cargo.toml").is_file():
+            paths.append(crate / "Cargo.toml")
+            paths += sorted((crate / "src").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.py"))
     paths += sorted((ROOT / "server/tests").rglob("*.c"))
@@ -208,6 +213,32 @@ def build_tests(env, output):
         if process.wait() or executable is None:
             raise RuntimeError(f"OLTP test build failed; see {output}")
     return Path(executable), Path(server) if server else None
+
+
+def run_native_assertions(test_executable, cases):
+    """Run the exact production-library assertions across the built packages."""
+    executables = dict.fromkeys(filter(None, [
+        test_executable,
+        os.environ.get("NABEDRA_RESOURCES_TEST_EXE"),
+        os.environ.get("NABEDRA_TRANSPORT_TEST_EXE"),
+    ]))
+    names = {}
+    for executable in executables:
+        listed = subprocess.check_output([executable, "--list"], text=True, timeout=15)
+        for line in listed.splitlines():
+            if line.endswith(": test"):
+                name = line.removesuffix(": test")
+                names.setdefault(name.rsplit("::", 1)[-1], []).append((executable, name))
+    for case in cases:
+        matches = names.get(case, [])
+        if len(matches) != 1:
+            raise AssertionError(f"{case}: expected one native test, found {len(matches)}")
+        executable, name = matches[0]
+        result = subprocess.run([executable, "--exact", name, "--nocapture"],
+                                capture_output=True, text=True, timeout=90)
+        print(result.stdout, end="", flush=True)
+        print(result.stderr, end="", file=sys.stderr, flush=True)
+        assert result.returncode == 0 and "test result: ok. 1 passed; 0 failed; 0 ignored;" in result.stdout, name
 
 
 def run_scenario(binary, name, scenario, env, output, timeout):

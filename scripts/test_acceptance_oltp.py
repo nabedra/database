@@ -1,5 +1,8 @@
 """Acceptance reporting must not convert missing assertions into a pass."""
+from contextlib import redirect_stdout
+import io
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -7,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import acceptance_oltp as acceptance
@@ -28,6 +32,28 @@ class EssentialRunnerTests(unittest.TestCase):
             self.assertIn("O01 not-run: executed 0/6 clauses", result.stdout)
             self.assertEqual(report['summary'], {'passed': 0, 'failed': 0, 'not-run': 1})
             self.assertEqual(next(r for r in report['results'] if r['scenario'] == 'O01')['status'], 'not-run')
+
+    def test_native_assertions_resolve_tests_moved_into_workspace_crates(self):
+        with tempfile.TemporaryDirectory(prefix="nabedra-native-assertions-") as directory:
+            root = Path(directory)
+            binaries = {}
+            for package, name in [("server", "held_request"), ("resources", "caps"), ("transport", "lane")]:
+                file = root / package
+                file.write_text(f"#!/bin/sh\n"
+                                f'if [ "$1" = --list ]; then echo "{package}::{name}: test"; exit; fi\n'
+                                f'test "$1:$2" = "--exact:{package}::{name}" || exit 1\n'
+                                f'echo "{package}::{name}"; echo "test result: ok. 1 passed; 0 failed; 0 ignored;"\n')
+                file.chmod(0o700)
+                binaries[package] = str(file)
+            with patch.dict(os.environ, {
+                "NABEDRA_RESOURCES_TEST_EXE": binaries["resources"],
+                "NABEDRA_TRANSPORT_TEST_EXE": binaries["transport"],
+            }), redirect_stdout(io.StringIO()) as output:
+                acceptance.run_native_assertions(binaries["server"], ["held_request", "caps", "lane"])
+                with self.assertRaisesRegex(AssertionError, "missing: expected one native test, found 0"):
+                    acceptance.run_native_assertions(binaries["server"], ["missing"])
+            self.assertEqual(output.getvalue().splitlines()[::2],
+                             ["server::held_request", "resources::caps", "transport::lane"])
 
     def test_rubric_preserves_all_scenarios_scheduler_ids_and_regressions(self):
         self.assertEqual(sorted(s.number for s in acceptance.SCENARIOS), list(range(1, 30)))
