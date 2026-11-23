@@ -10,5 +10,5 @@ lowest_regression = "sim::volumes::tests::directory_descriptor_follows_rename_on
 seed = 1
 why_not_caught = "The host and FaultFs transcript locked and synced directory handles only while their original names still referred to the opened inode."
 invariant_added = "A simulated open directory retains its inode across rename and replacement. Metadata, locks, sync and descriptor-relative operations address that inode, and detached descriptors refuse operations that require a linked name."
-fix_commits = ["cd02f3b9148f6025d0192eacfb623a356347589d"]
+fix_commits = ["46f075a54aff764c31a6eda50c2d77fbdba5c2b1"]
 revert_patch_ok = true
