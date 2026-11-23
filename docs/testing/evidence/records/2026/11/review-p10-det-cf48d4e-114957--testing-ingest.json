@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "review-p10-det-cf48d4e-114957--testing-ingest.log",
+      "sha256": "f724c5bccdc293c0ec4f036e23d7ffb9014c895e3ffa53f3938f03739d0e8da5"
+    }
+  ],
+  "assertions": {
+    "executed": 19,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "testing-ingest",
+  "duration_s": 2.92,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T11:56:44.876364+00:00",
+    "request_id": "review-p10-det-cf48d4e-114957",
+    "runner": "GitHub Actions 1000005699",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45168690615"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "cf48d4e1f3d7e790852373fd9865dce9033398a6",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
