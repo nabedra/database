@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 #![cfg(all(feature = "oltp", unix))]
 //! NS10 phase B: OLTP pools on `nabedra-kv` killed with SIGKILL under write load.
 //!

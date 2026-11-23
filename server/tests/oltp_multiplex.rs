@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 #![cfg(feature = "oltp")]
 //! Real mTLS routing/progress fixtures, independent of the authority/Raft tests.
 #[path = "support/tls.rs"]

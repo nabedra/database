@@ -186,7 +186,7 @@ where
                 };
                 let acceptor = tls.server.clone();
                 let handler = Arc::clone(&handler);
-                sessions.spawn(async move {
+                nabedra_rt::task::spawn_in(&mut sessions, async move {
                     let _permit = permit;
                     let _ = serve_session(socket, acceptor, frame_limit, &*handler).await;
                 });

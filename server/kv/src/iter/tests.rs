@@ -1396,7 +1396,7 @@ fn ns18_memtable_lookup_and_scan_bench() {
         }
     }
     let n = GROUPS * ROWS;
-    let insert_ns = start.elapsed().as_nanos() as f64 / n as f64;
+    let insert_ns = nabedra_rt::time::elapsed(start).as_nanos() as f64 / n as f64;
     let snapshot = seq - 1;
 
     let mut rng = Rng::new(18);
@@ -1411,7 +1411,7 @@ fn ns18_memtable_lookup_and_scan_bench() {
             hits += 1;
         }
     }
-    let get_ns = start.elapsed().as_nanos() as f64 / lookups as f64;
+    let get_ns = nabedra_rt::time::elapsed(start).as_nanos() as f64 / lookups as f64;
     assert_eq!(hits, lookups);
 
     // Calibration on this machine: a plain BTreeMap of encoded internal keys.
@@ -1433,7 +1433,7 @@ fn ns18_memtable_lookup_and_scan_bench() {
             plain_hits += 1;
         }
     }
-    let plain_ns = start.elapsed().as_nanos() as f64 / lookups as f64;
+    let plain_ns = nabedra_rt::time::elapsed(start).as_nanos() as f64 / lookups as f64;
     assert_eq!(plain_hits, lookups);
 
     let sources = vec![Source::Mem(mem.clone())];
@@ -1458,7 +1458,7 @@ fn ns18_memtable_lookup_and_scan_bench() {
             it.next();
         }
     }
-    let scan_elapsed = start.elapsed().as_nanos() as f64;
+    let scan_elapsed = nabedra_rt::time::elapsed(start).as_nanos() as f64;
     let scan_ns = scan_elapsed / (scans * 128) as f64;
     let seek_ns = scan_elapsed / scans as f64;
 
@@ -1476,7 +1476,7 @@ fn ns18_memtable_lookup_and_scan_bench() {
         full += 1;
         it.next();
     }
-    let full_ns = start.elapsed().as_nanos() as f64 / full as f64;
+    let full_ns = nabedra_rt::time::elapsed(start).as_nanos() as f64 / full as f64;
     assert_eq!(full, n);
     assert_eq!(scanned, scans * 128);
     eprintln!(

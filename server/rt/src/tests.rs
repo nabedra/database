@@ -103,8 +103,60 @@ async fn spawned_work_runs_on_the_runtime() {
     );
 
     let mut set = task::JoinSet::new();
-    set.spawn(async { 5 });
+    task::spawn_in(&mut set, async { 5 });
     assert_eq!(set.join_next().await.unwrap().unwrap(), 5);
+    let pending = task::spawn_in(&mut set, std::future::pending::<u8>());
+    pending.abort();
+    assert!(set.join_next().await.unwrap().unwrap_err().is_cancelled());
+    assert!(set.is_empty());
+}
+
+#[test]
+fn elapsed_reads_the_std_clock() {
+    let start = time::now_std();
+    time::thread_sleep(Duration::from_millis(20));
+    let measured = time::elapsed(start);
+    assert!(measured >= Duration::from_millis(20));
+    assert!(measured <= start.elapsed());
+    // A start in the future gives zero, as Instant::elapsed does.
+    assert_eq!(
+        time::elapsed(time::now_std() + Duration::from_secs(3_600)),
+        Duration::ZERO
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn elapsed_reads_the_tokio_clock() {
+    let start = time::now();
+    tokio::time::advance(Duration::from_millis(1_234)).await;
+    assert_eq!(time::elapsed(start), Duration::from_millis(1_234));
+    assert_eq!(time::elapsed(start), start.elapsed());
+    assert_eq!(
+        time::elapsed(time::now() + Duration::from_secs(1)),
+        Duration::ZERO
+    );
+}
+
+#[test]
+fn spawn_blocking_on_uses_the_given_runtime() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    // The calling thread has no runtime entered when the work is submitted.
+    let caller = std::thread::current().id();
+    let target = runtime.handle();
+    let ran = task::spawn_blocking_on(target, move || {
+        (
+            std::thread::current().id(),
+            tokio::runtime::Handle::current().id(),
+        )
+    });
+    let (thread, runtime_id) = runtime.block_on(ran).unwrap();
+    assert_ne!(thread, caller);
+    assert_eq!(runtime_id, target.id());
+    let panicked = task::spawn_blocking_on(target, || -> u8 { panic!("planted") });
+    assert!(runtime.block_on(panicked).unwrap_err().is_panic());
 }
 
 #[test]
@@ -166,4 +218,145 @@ fn ids_are_random_version_4() {
     assert_eq!(unique.len(), draws.len());
     let union = draws.iter().fold(0, |acc, value| acc | value);
     assert_ne!(union >> 62, 0, "the top bits are never set");
+}
+
+/// The P7-BANS wrappers inside a simulated world: `spawn_in` and `spawn_blocking_on`
+/// keep the node context and registry, and `elapsed` follows the node clock (O09).
+#[cfg(feature = "sim")]
+mod in_a_world {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use crate::sim::{NodeClock, current_node, in_node, run, runtime};
+    use crate::{task, time};
+
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    #[test]
+    fn spawn_in_carries_the_node_and_joins_its_registry() {
+        run(11, |world| async move {
+            world.add_node(
+                1,
+                NodeClock {
+                    mono_offset: ms(7_000),
+                    ..NodeClock::default()
+                },
+            );
+            world.add_node(2, NodeClock::default());
+            let start = world.start();
+            let mut set = task::JoinSet::new();
+            let mut sleepers = task::JoinSet::new();
+            in_node(1, async {
+                // A session handler reads its node's clock, not the runtime's.
+                task::spawn_in(&mut set, async move {
+                    (current_node(), time::now().duration_since(start))
+                });
+                task::spawn_in(&mut sleepers, time::sleep(ms(10_000)));
+            })
+            .await;
+            in_node(2, async {
+                task::spawn_in(&mut sleepers, time::sleep(ms(50)));
+            })
+            .await;
+            assert_eq!(
+                set.join_next().await.unwrap().unwrap(),
+                (Some(1), ms(7_000))
+            );
+            tokio::task::yield_now().await;
+            assert_eq!(world.live_tasks(1), 1, "the sleeping task is registered");
+
+            // A crash aborts node 1's JoinSet task; node 2's task in the same set runs on.
+            world.crash(1);
+            assert!(
+                sleepers
+                    .join_next()
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+            sleepers.join_next().await.unwrap().unwrap();
+            assert_eq!(world.live_tasks(1), 0);
+
+            // Spawning into a down node aborts at once, as task::spawn does.
+            in_node(1, async {
+                task::spawn_in(&mut set, async { (None, Duration::ZERO) });
+            })
+            .await;
+            assert!(set.join_next().await.unwrap().unwrap_err().is_cancelled());
+
+            // Outside a node the task is an ordinary runtime task.
+            task::spawn_in(&mut set, async { (current_node(), Duration::ZERO) });
+            assert_eq!(
+                set.join_next().await.unwrap().unwrap(),
+                (None, Duration::ZERO)
+            );
+        });
+    }
+
+    #[test]
+    fn spawn_blocking_on_runs_inline_in_the_node_context() {
+        run(12, |world| async move {
+            world.add_node(3, NodeClock::default());
+            let handle = tokio::runtime::Handle::current();
+            let ran = Arc::new(AtomicBool::new(false));
+            let ran_in_job = ran.clone();
+            let node = in_node(3, async move {
+                let job = task::spawn_blocking_on(&handle, move || {
+                    ran_in_job.store(true, Ordering::SeqCst);
+                    current_node()
+                });
+                assert!(
+                    ran.load(Ordering::SeqCst),
+                    "spawn_blocking_on did not run inline"
+                );
+                job.await.unwrap()
+            })
+            .await;
+            assert_eq!(node, Some(3));
+            let handle = tokio::runtime::Handle::current();
+            let panicked = task::spawn_blocking_on(&handle, || -> u8 { panic!("planted") });
+            assert!(panicked.await.unwrap_err().is_panic());
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "a simulated world cannot spawn onto another runtime")]
+    fn spawn_blocking_on_rejects_a_foreign_runtime() {
+        let foreign = runtime().unwrap();
+        let target = foreign.handle();
+        run(13, |_world| async move {
+            drop(task::spawn_blocking_on(target, || ()));
+        });
+    }
+
+    #[test]
+    fn elapsed_follows_the_node_clock_and_ignores_wall_jumps() {
+        run(14, |world| async move {
+            // 10% fast.
+            world.add_node(
+                4,
+                NodeClock {
+                    drift_ppm: 100_000,
+                    ..NodeClock::default()
+                },
+            );
+            let (tokio_start, std_start) =
+                in_node(4, async { (time::now(), time::now_std()) }).await;
+            tokio::time::advance(ms(1_000)).await;
+            // O09: a wall clock jump moves neither measured duration.
+            world.jump_wall_backward(4, Duration::from_secs(3_600));
+            let (tokio_elapsed, std_elapsed) = in_node(4, async {
+                (time::elapsed(tokio_start), time::elapsed(std_start))
+            })
+            .await;
+            assert_eq!(tokio_elapsed, ms(1_100));
+            assert_eq!(std_elapsed, ms(1_100));
+            // Outside the node the runtime's virtual clock applies.
+            assert_eq!(time::elapsed(world.start()), ms(1_000));
+        });
+    }
 }

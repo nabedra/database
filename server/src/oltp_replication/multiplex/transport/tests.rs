@@ -938,7 +938,7 @@ async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
         reserve(start + Duration::from_millis(50)).await,
         Err(RequestError::OutgoingLaneFull { .. })
     ));
-    assert!(start.elapsed() >= Duration::from_millis(50));
+    assert!(nabedra_rt::time::elapsed(start) >= Duration::from_millis(50));
     assert_ne!(transport.common.refusals.snapshot(), refused);
     // The last slot is still there for a caller that refuses at once.
     let headroom = client.try_outgoing(leader, class).unwrap();

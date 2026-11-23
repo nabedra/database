@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 #![cfg(all(feature = "oltp", unix))]
 //! Real OS-process RAM queue/mTLS failures, with fixture-only authority and
 //! deterministic pinned reads. No Control-Raft, transaction, production remote

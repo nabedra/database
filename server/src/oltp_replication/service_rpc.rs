@@ -422,7 +422,7 @@ impl DirectRouting {
         }
     }
     fn now_ms(&self) -> u64 {
-        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+        u64::try_from(nabedra_rt::time::elapsed(self.epoch).as_millis()).unwrap_or(u64::MAX)
     }
     fn idle(&self) -> bool {
         self.now_ms()

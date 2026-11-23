@@ -662,7 +662,7 @@ async fn o09_d06_perf2a_allocate_direct_takes_one_round_trip_on_warm_routes() {
         endpoint.hang.store(true, Ordering::SeqCst);
         let started = nabedra_rt::time::now_std();
         let error = client.allocate_direct(1).await.unwrap_err();
-        let elapsed = started.elapsed();
+        let elapsed = nabedra_rt::time::elapsed(started);
         assert!(
             elapsed < Duration::from_millis(5500),
             "{elapsed:?} {error:?}"
