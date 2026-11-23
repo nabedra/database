@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "p9-oltp-fs-fixtures-9ebb894-171642--crate-graph.log",
+      "sha256": "d495ae737dba64900c1c59e1aff29126f075cf2a4268ba8a11b540b0d1b42823"
+    }
+  ],
+  "assertions": {
+    "executed": 19,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "skipped",
+        "reason": "2 tests skipped"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "crate-graph",
+  "duration_s": 8.485,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T16:19:17.835674+00:00",
+    "request_id": "p9-oltp-fs-fixtures-9ebb894-171642",
+    "runner": "GitHub Actions 1000006685",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45214671160"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "9ebb894013a1aeb6ff3218e2dc9b46e12bbf411d",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
