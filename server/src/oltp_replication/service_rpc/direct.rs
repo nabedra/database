@@ -463,7 +463,7 @@ impl DirectLink {
                 DirectSendError::Uncertain(error)
             }
         };
-        let _timer = crate::oltp_runtime::stage_timing::perf_stage!("gw.direct.send").timer();
+        let _timer = nabedra_resources::perf_stage!("gw.direct.send").timer();
         // PERF1: wait for a slot on the leader's lane instead of refusing a
         // request that finds it full. The lane keeps its bound (the leader's
         // handler slots); requests over it queue here, in arrival order, for
@@ -475,7 +475,7 @@ impl DirectLink {
         let start = nabedra_rt::time::now();
         let reservation = {
             let _timer =
-                crate::oltp_runtime::stage_timing::perf_stage!("gw.direct.lane_wait").timer();
+                nabedra_resources::perf_stage!("gw.direct.lane_wait").timer();
             self.client
                 .transport
                 .reserve_outgoing(

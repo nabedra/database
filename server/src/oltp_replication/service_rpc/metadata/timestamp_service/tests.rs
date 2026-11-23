@@ -1,6 +1,6 @@
+use nabedra_resources::config::{ExecutionConfig, WorkerResources};
 use super::*;
 use crate::{
-    config::{ExecutionConfig, WorkerResources},
     oltp::mvcc::catalog::CaptureRead,
     oltp_replication::authority::{
         status::{StatusHandle, StatusMachine},
@@ -166,7 +166,7 @@ async fn terminal_copy(
 /// The RF1 profile the services were started with: a host re-attaches only
 /// with the same configuration digest.
 fn raft_config() -> openraft::Config {
-    crate::oltp_runtime::bootstrap::raft_config()
+    crate::oltp_replication::raft_config()
 }
 
 // O09/O13/O14/O22/C07/F03/Q06/R03. Use the actual typed service, durable

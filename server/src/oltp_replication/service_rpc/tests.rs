@@ -1,6 +1,6 @@
+use nabedra_resources::config::{ExecutionConfig, WorkerResources};
 use super::*;
 use crate::{
-    config::{ExecutionConfig, WorkerResources},
     oltp::mvcc::{CanonicalJson, store::initial_root},
     oltp_replication::authority::{
         control::ControlRoutes,

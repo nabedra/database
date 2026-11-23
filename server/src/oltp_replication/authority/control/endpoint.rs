@@ -1495,7 +1495,7 @@ impl ControlClient {
             .encode_in(ByteClass::Progress, request, HEADER_LIMIT)?;
         // PERF1: Control reads this process issues, by request kind.
         let _timer =
-            crate::oltp_runtime::stage_timing::json_variant("control.read.", header.as_slice())
+            nabedra_resources::stage_timing::json_variant("control.read.", header.as_slice())
                 .timer();
         let placement_role = matches!(request, ReadRequest::ServiceRoleAtReplica { .. });
         let role_dependency = placement_role
@@ -1792,12 +1792,12 @@ impl ControlClient {
         }
         let quorum = voters.len() / 2 + 1;
         // D01/REP6 evidence: majority reads and the RPCs they send, by kind.
-        let _call = crate::oltp_runtime::stage_timing::json_variant(
+        let _call = nabedra_resources::stage_timing::json_variant(
             "control.quorum_read.",
             header.as_slice(),
         )
         .timer();
-        let rpc = crate::oltp_runtime::stage_timing::json_variant(
+        let rpc = nabedra_resources::stage_timing::json_variant(
             "control.quorum_rpc.",
             header.as_slice(),
         );
