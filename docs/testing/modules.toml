@@ -50,7 +50,6 @@ paths = [
   "server/src/oltp.rs",
   "server/src/oltp_*/**",
   "server/src/oltp_*.rs",
-  "server/sim-oltp/**",
   "server/src/migration_interchange.rs",
   # Shared server entry points: both engines link them.
   "server/src/lib.rs",
