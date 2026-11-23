@@ -150,6 +150,14 @@ class SimBugsTest(unittest.TestCase):
         self.f.commit("product change")
         self.assert_check(1, "no longer applies to HEAD")
 
+    def test_missing_fix_history_fails_in_a_shallow_clone(self):
+        self.f.commit("bug record and patch")
+        shallow = self.root / "shallow"
+        sh(self.root, "clone", "--quiet", "--no-local", "--depth", "1", str(self.f.repo), str(shallow))
+        out = StringIO()
+        self.assertEqual(sim_bugs.main(["check"], repo=shallow, out=out), 1, out.getvalue())
+        self.assertIn(f"fix commit {self.f.fix} does not resolve", out.getvalue())
+
     def test_apply_check_uses_head_not_the_working_tree(self):
         # An uncommitted edit in the shipped tree neither breaks nor satisfies the check.
         self.f.write("server/src/lib.rs", "garbage\n")

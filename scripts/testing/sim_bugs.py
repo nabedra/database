@@ -156,11 +156,6 @@ def apply_check_head(repo, patch):
     return result.returncode == 0, (result.stderr or result.stdout).strip()
 
 
-def is_shallow(repo):
-    result = git(repo, "rev-parse", "--is-shallow-repository", check=False)
-    return result.stdout.strip() == "true"
-
-
 # --------------------------------------------------------------------------------------------
 # Loading and validation.
 
@@ -322,16 +317,12 @@ def validate_patch_paths(patch):
     return [problem for problem in map(path_problem, files) if problem]
 
 
-def validate_git(bug, repo, warnings):
+def validate_git(bug, repo):
     """Checks that need history: SHAs resolve, the patch applies and its changed lines match."""
     m, problems = bug.manifest, []
     missing = [sha for sha in m["fix_commits"]
                if git(repo, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode]
-    if missing:
-        if is_shallow(repo):
-            warnings.append(f"{bug.id}: {len(missing)} fix commits absent from this shallow clone")
-        else:
-            problems.extend(f"fix commit {sha} does not resolve" for sha in missing)
+    problems.extend(f"fix commit {sha} does not resolve; fetch full history" for sha in missing)
     for sha in set(m["fix_commits"]) - set(missing):
         if git(repo, "merge-base", "--is-ancestor", sha, "HEAD", check=False).returncode:
             problems.append(f"fix commit {sha} is not an ancestor of HEAD")
@@ -381,11 +372,11 @@ def select(bugs, ids, set_name):
 
 def cmd_check(repo, bugs, out):
     records, known = load_bug_records(repo), guarantee_ids(repo)
-    failed, warnings = 0, []
+    failed = 0
     for bug in bugs:
         problems = validate_manifest(bug, records, known)
         if not problems:
-            problems = validate_git(bug, repo, warnings)
+            problems = validate_git(bug, repo)
         status = "FAILED" if problems else "ok"
         failed += bool(problems)
         print(f"{bug.id}: {status} ({bug.manifest.get('port', '?')} port of "
@@ -393,8 +384,6 @@ def cmd_check(repo, bugs, out):
               f"{', '.join(patch_files(bug.patch)) or 'none'})", file=out)
         for problem in problems:
             print(f"  {problem}", file=out)
-    for warning in warnings:
-        print(f"warning: {warning}", file=out)
     print(f"sim-bugs check: {len(bugs) - failed} of {len(bugs)} patches valid and applying to HEAD",
           file=out)
     return 1 if failed else 0
