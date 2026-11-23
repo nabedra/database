@@ -1,0 +1,6 @@
+{"type":"invoke","process":0,"f":"upsert","key":"k1","value":{"id":"k1","value":1},"request_id":"r1"}
+{"type":"ok","process":0,"f":"upsert","key":"k1","value":null,"request_id":"r1"}
+{"type":"invoke","process":1,"f":"upsert","key":"k2","value":{"id":"k2","value":2},"request_id":"r1"}
+{"type":"fail","process":1,"f":"upsert","key":"k2","value":{"not_applied":true,"code":"conflict"},"request_id":"r1"}
+{"type":"invoke","process":1,"f":"get","key":"k2"}
+{"type":"ok","process":1,"f":"get","key":"k2","value":null}

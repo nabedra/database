@@ -2,7 +2,7 @@
 //! flagged with the right kind, and valid histories (including `info` ops that did and did not
 //! take effect) must pass. Files live in `tests/corpus/`.
 
-use nabedra_check::checker::{Verdict, edn, linearizable, outcome, queue, relaxed_kv, txn};
+use nabedra_check::checker::{Verdict, direct, edn, linearizable, outcome, queue, relaxed_kv, txn};
 use nabedra_check::history::{Event, Outcome, pair, read_jsonl, write_jsonl};
 use std::path::PathBuf;
 
@@ -46,6 +46,115 @@ const CASES: &[(&str, &str, Checker, &[&str])] = &[
         "linearizable",
         linearizable::check_kv,
         &["non-linearizable"],
+    ),
+    // Direct-path operations on the per-key register (P10-CHECK): `insert` sets only from
+    // absent and its `conflict` refusal reads present; `update` writes only when present;
+    // the existence flag of `update` and `delete` constrains the state before them.
+    (
+        "lin_valid_direct_ops",
+        "linearizable",
+        linearizable::check_kv,
+        &[],
+    ),
+    ("lin_valid_direct_ops", "direct", direct::check, &[]),
+    (
+        "lin_insert_double",
+        "linearizable",
+        linearizable::check_kv,
+        &["non-linearizable"],
+    ),
+    (
+        "lin_insert_conflict_absent",
+        "linearizable",
+        linearizable::check_kv,
+        &["non-linearizable"],
+    ),
+    (
+        "lin_update_absent_existed",
+        "linearizable",
+        linearizable::check_kv,
+        &["non-linearizable"],
+    ),
+    (
+        "lin_update_missing_written",
+        "linearizable",
+        linearizable::check_kv,
+        &["non-linearizable"],
+    ),
+    (
+        "lin_delete_missing_existed",
+        "linearizable",
+        linearizable::check_kv,
+        &["non-linearizable"],
+    ),
+    (
+        "lin_insert_many_partial",
+        "linearizable",
+        linearizable::check_kv,
+        &["non-linearizable"],
+    ),
+    // Direct-path request identity (OLTP-G03) and outcome truth (OLTP-G04): D02, D03, D04.
+    ("direct_valid_retries", "direct", direct::check, &[]),
+    (
+        "direct_valid_retries",
+        "linearizable",
+        linearizable::check_kv,
+        &[],
+    ),
+    (
+        "direct_retry_reapplied",
+        "direct",
+        direct::check,
+        &["non-linearizable"],
+    ),
+    // Without the request identity, the reapplied retry looks like a second write.
+    (
+        "direct_retry_reapplied",
+        "linearizable",
+        linearizable::check_kv,
+        &[],
+    ),
+    (
+        "direct_retry_conflict_after_lost_reply",
+        "direct",
+        direct::check,
+        &["non-linearizable"],
+    ),
+    (
+        "direct_retry_conflict_after_lost_reply",
+        "linearizable",
+        linearizable::check_kv,
+        &[],
+    ),
+    (
+        "direct_dedup_miss",
+        "direct",
+        direct::check,
+        &["dedup-miss", "non-linearizable"],
+    ),
+    (
+        "direct_reuse_undetected",
+        "direct",
+        direct::check,
+        &["request-id-reuse-undetected"],
+    ),
+    (
+        "direct_reuse_misdetected",
+        "direct",
+        direct::check,
+        &["request-id-reuse-misdetected"],
+    ),
+    (
+        "direct_failed_update_observed",
+        "direct",
+        direct::check,
+        &["failed-write-observed"],
+    ),
+    (
+        "direct_failed_insert_many_observed",
+        "direct",
+        direct::check,
+        &["failed-write-observed"],
     ),
     // Elle-style transactions.
     ("txn_g0", "txn", txn::check, &["G0"]),
@@ -237,6 +346,9 @@ fn corpus_covers_every_anomaly_class() {
         "resurrection",
         "out-of-order",
         "redelivery-missing",
+        "dedup-miss",
+        "request-id-reuse-undetected",
+        "request-id-reuse-misdetected",
     ];
     for kind in required {
         assert!(
