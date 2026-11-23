@@ -802,7 +802,6 @@ impl GroupStore {
                 return Err(storage_error_message());
             }
             file.sync_all().map_err(file_error)?;
-            sync_directory(path.parent().ok_or_else(storage_error_message)?)?;
             file.seek(SeekFrom::Start(0))
                 .map_err(|_| storage_error_message())?;
             let mut checksum = Sha256::new();
