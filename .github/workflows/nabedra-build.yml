@@ -26,6 +26,7 @@
 #   live3, live3-fixture  LIVE3 Linux release binaries per engine; the library test executable
 #   campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1  long, image and measurement jobs
 #   engine-tests, check-tests  Cache, OLAP and nabedra-check tests, also in the base jobs
+#   clippy      the phase 7 runtime seam bans (server/clippy.toml) for every product feature set, also a base job
 #   fuzz, mutants  libFuzzer targets or mutation tests on the diff from main's merge base
 #
 # Builds. The `build` job compiles the debug OLTP server and every OLTP test executable once and shares them as
@@ -60,11 +61,11 @@ on:
         required: true
         type: string
       base:
-        description: Base jobs (kv, features, Cache, OLAP, nabedra-check, OLTP, Events, quarantine)
+        description: Base jobs (kv, features, clippy, Cache, OLAP, nabedra-check, OLTP, Events, quarantine)
         type: boolean
         default: true
       jobs:
-        description: "Comma-separated opt-in jobs: direct, acceptance, o02, growth, rep1, rep4-mixed, o22, blackhole, migrate, live3, live3-fixture, campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1, engine-tests, check-tests, fuzz, mutants"
+        description: "Comma-separated opt-in jobs: direct, acceptance, o02, growth, rep1, rep4-mixed, o22, blackhole, migrate, live3, live3-fixture, campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1, engine-tests, check-tests, clippy, fuzz, mutants"
         type: string
         default: ""
       checks:
@@ -164,7 +165,7 @@ jobs:
             [[ "$REPEAT" =~ ^[0-9]+$ ]] && [ "$REPEAT" -ge 1 ] && [ "$REPEAT" -le 200 ] || fail "repeat must be 1-200"
             [[ "$FUZZ_SECONDS" =~ ^[0-9]+$ ]] && [ "$FUZZ_SECONDS" -ge 1 ] || fail "fuzz_seconds must be a positive integer"
           fi
-          known=",direct,acceptance,o02,growth,rep1,rep4-mixed,o22,blackhole,migrate,live3,live3-fixture,campaign,docker,memory,bench,perf,g7,gc1,perf1,snap1,engine-tests,check-tests,fuzz,mutants,"
+          known=",direct,acceptance,o02,growth,rep1,rep4-mixed,o22,blackhole,migrate,live3,live3-fixture,campaign,docker,memory,bench,perf,g7,gc1,perf1,snap1,engine-tests,check-tests,clippy,fuzz,mutants,"
           selected=","
           add() { [[ "$selected" == *",$1,"* ]] || selected+="$1,"; }
           has() { [[ "$selected" == *",$1,"* ]]; }
@@ -608,9 +609,8 @@ jobs:
       - name: Build
         working-directory: server
         run: |
-          # server/clippy.toml bans direct clock, task and id calls (phase 7). The P7-BANS
-          # step enforces it once every module goes through nabedra-rt; until then it is allowed.
-          cargo clippy --locked -p nabedra-kv --all-targets -- -D warnings -A clippy::disallowed_methods
+          # -D warnings includes server/clippy.toml's runtime seam bans (phase 7).
+          cargo clippy --locked -p nabedra-kv --all-targets -- -D warnings
           cargo test --locked -p nabedra-kv --no-run
       - name: Stage Cargo cache without workspace crates
         if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
@@ -661,6 +661,66 @@ jobs:
             g7-memory.log
           if-no-files-found: ignore
           retention-days: 14
+
+  # Phase 7 runtime seam bans (server/clippy.toml): no direct clock, task or id call outside
+  # nabedra-rt, for every product feature set. `-p` with `--no-deps` lints only the named
+  # package, so the dev-only crates (nabedra-check, nabedra-sim, nabedra-sim-oltp) are never
+  # linted against the bans, and no simulation crate joins a product build's feature set.
+  # nabedra-kv is linted with -D warnings in the kv job.
+  clippy:
+    name: clippy runtime seam bans (phase 7)
+    needs: revision
+    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',clippy,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - name: Restore Cargo cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: clippy-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: |
+            clippy-${{ env.RUST_TOOLCHAIN }}-
+            features-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: Clippy with -D clippy::disallowed_methods
+        working-directory: server
+        run: |
+          set -eux
+          lint() { cargo clippy --locked --no-deps "$@" -- -D clippy::disallowed_methods; }
+          lint -p nabedra-database --all-targets
+          lint -p nabedra-database --all-targets --no-default-features --features oltp
+          lint -p nabedra-database --all-targets --no-default-features --features oltp-backup-s3
+          lint -p nabedra-database --all-targets --no-default-features --features cache
+          lint -p nabedra-database --all-targets --no-default-features --features cache,test-hooks
+          lint -p nabedra-rt --all-targets
+      - name: Stage Cargo cache without workspace crates
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf ~/cargo-cache && mkdir -p ~/cargo-cache && cp -al server/target ~/cargo-cache/target
+          CARGO_TARGET_DIR=~/cargo-cache/target cargo clean --offline --locked --manifest-path server/Cargo.toml -p nabedra-database -p nabedra-kv -p nabedra-rt
+          rm -rf ~/cargo-cache/target/cargo-timings && du -sh ~/cargo-cache/target
+      - name: Save Cargo cache
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   features:
     name: feature builds (O02, NS26)
