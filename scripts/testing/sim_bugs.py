@@ -235,9 +235,13 @@ def validate_manifest(bug, records, known_guarantees):
     for key in ("guarantees", "scenarios", "fix_commits", "profile", "expect"):
         if not m[key] or not strings(m[key]):
             problems.append(f"{key} must be a nonempty array of nonempty strings")
+    if problems:
+        return problems
     seeds = m["seeds"]
     if not (len(seeds) == 2 and all(type(s) is int for s in seeds) and 1 <= seeds[0] <= seeds[1]):
         problems.append("seeds must be [first, last] with 1 <= first <= last")
+    elif m["phase"] == 10 and seeds[1] - seeds[0] >= 10_000:
+        problems.append("phase 10 bug search may use at most 10000 seeds")
     elif "found_seed" in m and not seeds[0] <= m["found_seed"] <= seeds[1]:
         problems.append("found_seed must lie inside seeds")
     for sha in m["fix_commits"] + [m["reverts"]]:
@@ -279,6 +283,8 @@ def validate_regression(bug):
         problems.append("regression.mode must be on or off")
     if "failure_contains" in r and not strings(r["failure_contains"]):
         problems.append("regression.failure_contains must be an array of nonempty strings")
+    if kind == "acceptance" and not r.get("failure_contains"):
+        problems.append("an acceptance regression needs failure_contains for its specific failure")
     if not 1 <= r.get("attempts", 1) <= 10:
         problems.append("regression.attempts must be between 1 and 10")
     evidence = r.get("evidence")
@@ -299,7 +305,8 @@ def validate_regression(bug):
 
 def path_problem(name):
     """Why a patch may not touch `name`, or None for a product source."""
-    if not name.startswith("server/") or name.startswith(BUGS_DIR.parent.as_posix() + "/"):
+    if not name.startswith("server/") or name.startswith(("server/sim-oltp/", "server/sim/",
+                                                           "server/check/", "server/fuzz/")):
         return f"revert.patch touches {name}, outside the product sources"
     if TEST_FILE.search(name):
         return f"revert.patch touches the test file {name}"
@@ -480,11 +487,11 @@ def classify_libtest(code, output, name):
     results = LIBTEST_RESULT.findall(output)
     if len(results) != 1:
         return "not-run"
-    _, passed, failed = results[0]
-    if (passed, failed) == ("1", "0") and code == 0:
+    status, passed, failed = results[0]
+    if (status, passed, failed, code) == ("ok", "1", "0", 0):
         return "passed"
-    if (passed, failed) == ("0", "1") and re.search(rf"^test {re.escape(name)} \.\.\. FAILED$",
-                                                    output, re.MULTILINE):
+    if (status, passed, failed, code) == ("FAILED", "0", "1", 101) and re.search(
+            rf"^test {re.escape(name)} \.\.\. FAILED$", output, re.MULTILINE):
         return "failed"
     return "not-run"
 
@@ -502,7 +509,17 @@ def run_regression(bug, tree, exe, server, env, log):
     code, output = run_logged([sys.executable, "scripts/acceptance_oltp.py", "--test-binary", exe,
                                "--server-binary", server, "--scenario", r["scenario"],
                                "--output", str(out_dir)], tree, env, log, timeout)
-    return {0: "passed", 1: "failed", None: "timeout"}.get(code, "not-run"), output
+    scenario_log = out_dir / f"{r['scenario']}.log"
+    if not scenario_log.is_file():
+        return ("timeout" if code is None else "not-run"), output
+    scenario_output = scenario_log.read_text(errors="replace")
+    results = LIBTEST_RESULT.findall(scenario_output)
+    output += scenario_output
+    if code == 0 and results and results[-1] == ("ok", "1", "0"):
+        return "passed", output
+    if code == 1 and results and results[-1] == ("FAILED", "0", "1"):
+        return "failed", output
+    return ("timeout" if code is None else "not-run"), output
 
 
 def matches_failure(bug, output):
@@ -526,8 +543,15 @@ def regression_verdict(bug, tree, exe, server, env, log, patched):
         if not patched and status != "passed":
             break
     if not patched:
-        return seen[-1], ""
-    return ("failed-otherwise" if "failed-otherwise" in seen else seen[-1]), ""
+        return seen[-1], output
+    return ("failed-otherwise" if "failed-otherwise" in seen else seen[-1]), output
+
+
+def print_regression_result(bug, output, out):
+    markers = bug.regression.get("failure_contains", [])
+    for line in output.splitlines():
+        if LIBTEST_RESULT.match(line) or any(marker in line for marker in markers):
+            print(line, file=out, flush=True)
 
 
 def cmd_verify(repo, bugs, args, out):
@@ -544,13 +568,15 @@ def cmd_verify(repo, bugs, args, out):
         exe, server = build_lib_tests(args, tree, env, log, need_server)
         clean = {}
         for bug in bugs:
-            clean[bug.id], _ = regression_verdict(bug, tree, exe, server, env, log, patched=False)
+            clean[bug.id], output = regression_verdict(bug, tree, exe, server, env, log, patched=False)
             print(f"{bug.id}: without the patch {clean[bug.id]}", file=out, flush=True)
+            print_regression_result(bug, output, out)
         for bug in bugs:
             scratch.apply(bug)
             try:
                 p_exe, p_server = build_lib_tests(args, tree, env, log, need_server)
-                patched, _ = regression_verdict(bug, tree, p_exe, p_server, env, log, patched=True)
+                patched, output = regression_verdict(bug, tree, p_exe, p_server, env, log, patched=True)
+                print_regression_result(bug, output, out)
             except Failure as error:
                 patched = "not-run"
                 print(f"{bug.id}: {error}", file=out, flush=True)
@@ -591,7 +617,9 @@ def parse_seeds(output):
             entry = json.loads(match.group(1))
         except ValueError:
             continue
-        if type(entry.get("seed")) is int and entry.get("result") in ("pass", "violation"):
+        if (type(entry.get("seed")) is int and entry.get("result") in ("pass", "violation")
+                and strings(entry.get("kinds"))
+                and bool(entry["kinds"]) == (entry["result"] == "violation")):
             seeds.append(entry)
     return seeds
 
@@ -617,10 +645,13 @@ def sweep(args, tree, env, log, bug, first, count, expect):
 
 
 def cmd_run(repo, bugs, args, out):
-    if not (repo / HARNESS_MANIFEST).is_file():
+    if git(repo, "cat-file", "-e", f"HEAD:{HARNESS_MANIFEST.as_posix()}", check=False).returncode:
         print(f"{NOT_RUN_MARKER}: {HARNESS_MANIFEST} does not exist yet, so no seed was searched "
               f"for {', '.join(b.id for b in bugs)}", file=out)
         return 0
+    if cmd_check(repo, bugs, out):
+        return 1
+    print("Fault model: seeded OLTP simulation with one historical fix reverted at a time", file=out)
     target = Path(args.target_dir or repo / "server/target/sim-bugs").resolve()
     log_path = Path(args.log or target / "sim-bugs-run.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -638,13 +669,26 @@ def cmd_run(repo, bugs, args, out):
                                     bug.manifest["expect"])
             finally:
                 scratch.reset()
+            if code not in (0, 101):
+                print(f"{bug.id}: NOT found; patched test exited {code}", file=out)
+                continue
+            reported = {entry["seed"] for entry in seeds}
+            if len(reported) != len(seeds) or any(not first <= seed <= last for seed in reported):
+                print(f"{bug.id}: NOT found; duplicate or out-of-budget seed lines in [{first}, {last}]",
+                      file=out)
+                continue
             hit = first_match(seeds, bug.manifest["expect"])
             if hit is None:
                 why = "no seed line" if not seeds else f"{len(seeds)} seeds without {bug.manifest['expect']}"
                 print(f"{bug.id}: NOT found in [{first}, {last}] ({why}, exit {code})", file=out)
                 continue
             code, replay = sweep(args, tree, env, log, bug, hit["seed"], 1, [])
-            clean = replay[0]["result"] if replay and replay[0]["seed"] == hit["seed"] else "missing"
+            if code != 0:
+                clean = f"failed (exit {code})"
+            elif len(replay) == 1 and replay[0]["seed"] == hit["seed"]:
+                clean = replay[0]["result"]
+            else:
+                clean = "missing or ambiguous"
             ok = clean == "pass"
             found += ok
             print(f"{bug.id}: seed {hit['seed']} reports {sorted(hit['kinds'])} after "
@@ -669,6 +713,8 @@ def main(argv=None, *, repo=REPO, out=sys.stdout):
     parser.add_argument("--seeds", type=int, help="run: cap the seeds searched per bug")
     parser.add_argument("--keep", action="store_true", help="keep the scratch worktree")
     args = parser.parse_args(argv)
+    if args.jobs < 1 or (args.seeds is not None and args.seeds < 1):
+        parser.error("--jobs and --seeds must be positive")
     repo = Path(repo)
     try:
         bugs, errors = load_bugs(repo)
@@ -684,6 +730,8 @@ def main(argv=None, *, repo=REPO, out=sys.stdout):
         if args.command == "check":
             return cmd_check(repo, chosen, out)
         if args.command == "verify":
+            if cmd_check(repo, chosen, out):
+                return 1
             return cmd_verify(repo, chosen, args, out)
         return cmd_run(repo, chosen, args, out)
     except Failure as error:

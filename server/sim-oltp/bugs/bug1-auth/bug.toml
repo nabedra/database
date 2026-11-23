@@ -29,7 +29,9 @@ seeds = [1, 10000]
 kind = "lib-test"
 test = "oltp_runtime::application::direct::tests::d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome"
 mode = "on"
-failure_contains = ["left: Error(Unauthorized, NotApplied)", "right: Error(OutcomeUnknown, Unknown)"]
+# The direct-history fixture now detects the false refusal at the pre-retry read.
+# The recorded run below predates that fixture change and failed the original outcome assertion.
+failure_contains = ["failed-write-observed", "completed not_applied"]
 
 [regression.evidence]
 digest = "41b14a61c5962534320122e99c57f88b420855d36105ed442b26df5087ae82e3"

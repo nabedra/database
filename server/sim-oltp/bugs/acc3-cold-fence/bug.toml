@@ -27,6 +27,7 @@ kind = "acceptance"
 scenario = "O15"
 mode = "on"
 timeout_s = 3600
+failure_contains = ["registered startup ValidationError: worker does not host target replica node", "AssertionError: ['RF3 cold run']"]
 # O15 caught this patch in 1 of 5 patched runs: run 45148928008 (on failed, off passed) and 0 of 3
 # attempts in the oltp-sim-bugs-regression run 45150522656. It is a timing window, so O15 does not
 # gate this patch (the regression check leaves it out); the seed search must find it.

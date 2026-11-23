@@ -9,6 +9,7 @@ import sys
 from tempfile import TemporaryDirectory
 import textwrap
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run_check  # noqa: E402
@@ -233,6 +234,7 @@ class SimBugsTest(unittest.TestCase):
 
     def test_run_with_a_harness_never_passes_without_seed_lines(self):
         self.f.write("server/sim-oltp/Cargo.toml", "[package]\n")
+        self.f.commit("install the test harness manifest")
         fake = self.root / "silent_cargo.py"
         fake.write_text("print('test result: ok. 1 passed; 0 failed;')\n")
         status, output = self.f.run("run", "--cargo", f"{sys.executable} {fake}", "--seeds", "3",
@@ -241,10 +243,32 @@ class SimBugsTest(unittest.TestCase):
         self.assertIn("fix-one: NOT found in [1, 3] (no seed line", output)
         self.assertIn("0 of 1 reverted fixes found", output)
 
+    def test_run_rejects_out_of_budget_and_duplicate_seeds(self):
+        self.f.write("server/sim-oltp/Cargo.toml", "[package]\n")
+        self.f.commit("install the test harness manifest")
+        hit = dict(seed=1, result="violation", kinds=["NotAppliedNeverCommitted"])
+        for entries in ([dict(hit, seed=4)], [hit, hit]):
+            with self.subTest(entries=entries), patch.object(sim_bugs, "sweep", return_value=(0, entries)) as sweep:
+                status, output = self.f.run("run", "--seeds", "3")
+                self.assertEqual(status, 1, output)
+                self.assertIn("duplicate or out-of-budget seed lines", output)
+                self.assertEqual(sweep.call_count, 1)
+
+    def test_run_requires_a_successful_clean_replay(self):
+        self.f.write("server/sim-oltp/Cargo.toml", "[package]\n")
+        self.f.commit("install the test harness manifest")
+        hit = dict(seed=1, result="violation", kinds=["NotAppliedNeverCommitted"])
+        clean = dict(seed=1, result="pass", kinds=[])
+        for code, expected_status in ((101, 1), (0, 0)):
+            with self.subTest(code=code), patch.object(sim_bugs, "sweep", side_effect=[(0, [hit]), (code, [clean])]):
+                status, output = self.f.run("run", "--seeds", "3")
+                self.assertEqual(status, expected_status, output)
+
     def test_seed_lines_and_first_match(self):
         output = "\n".join([
             'nabedra-sim-seed: {"seed": 1, "result": "pass", "kinds": []}',
             'nabedra-sim-seed: {"seed": 2, "result": "violation", "kinds": ["Other"]}',
+            'nabedra-sim-seed: {"seed": 99, "result": "violation", "kinds": "Other"}',
             "nabedra-sim-seed: not json",
             'nabedra-sim-seed: {"seed": 3, "result": "violation", "kinds": ["Liveness"]}',
         ])
@@ -325,8 +349,8 @@ class SimBugsTest(unittest.TestCase):
             evidence = bug.regression.get("evidence")
             if evidence:
                 self.assertEqual(evidence["digest"], sim_bugs.digest(bug.patch), bug.id)
-                for text in bug.regression.get("failure_contains", []):
-                    self.assertIn(text, evidence["patched"]["output"], bug.id)
+                # The historical failure text can differ from the current regression's signature.
+                self.assertIn("test result: FAILED. 0 passed; 1 failed", evidence["patched"]["output"], bug.id)
 
 
 def extra_line(patch):
