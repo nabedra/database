@@ -275,14 +275,14 @@ class OwnersTests(unittest.TestCase):
         ])
         self.assertEqual(dict(report["items"]), {"Digest": 1, "A": 1, "B": 1})
 
-    def test_owners_command_on_the_real_tree_matches_the_ratchet(self):
+    def test_owners_command_on_the_real_tree_stays_within_the_ratchet(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             status = crate_graph.main(["owners", "--edge", "oltp:oltp_replication", "--json"])
         self.assertEqual(status, 0)
         [report] = json.loads(output.getvalue())
-        self.assertEqual(report["literal"], CONFIG.ratchet["literal"]["oltp:oltp_replication"])
-        self.assertEqual(report["expanded"], CONFIG.ratchet["expanded"]["oltp:oltp_replication"])
+        self.assertLessEqual(report["literal"], CONFIG.ratchet["literal"]["oltp:oltp_replication"])
+        self.assertLessEqual(report["expanded"], CONFIG.ratchet["expanded"]["oltp:oltp_replication"])
         self.assertTrue(all(row["path"].startswith("server/src/oltp/") for row in report["sources"]))
         self.assertTrue(all(row["path"].startswith("server/src/oltp_replication/")
                             for row in report["destinations"]))

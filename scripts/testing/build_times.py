@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Record server build times and rebuild sets for a base and a head revision (BLD6, BLD9).
 
-Checks out both revisions into worktrees under one work directory and builds them with one shared
-target directory, so registry dependencies build once and both sides start from the same warm
-dependencies. Workspace packages have different package ids in the two worktrees, so their
-artifacts never collide. Each step runs `--rounds` times, alternating the side that goes first.
+Checks out both revisions under one work directory and gives each revision its own Cargo target
+directory. Cargo can reuse artifacts for same-name workspace packages across worktrees when they
+share a target directory. Warm up each side before measuring it. Each step runs `--rounds` times,
+alternating the side that goes first.
 
 Steps (phase 8 design, 5.3):
   cold    warm dependencies, cold workspace: `cargo build --lib` per engine and the Events build,
@@ -79,8 +79,8 @@ SERVER_OLTP = ("--no-default-features", "--features", f"{SERVER}/oltp")
 class Probe:
     """One edited file per crate. The first existing candidate is used on each side.
 
-    A probe without `always` runs only when its first candidate (its own crate) exists on at least
-    one side; the other side then measures the same edit at its pre-split path.
+    For a probe without `always`, the last candidate is the pre-split fallback. The probe runs
+    once any of its extracted paths exists on at least one side.
     """
     name: str
     candidates: tuple[str, ...]
@@ -344,8 +344,9 @@ def resolve_probes(trees: dict[str, Tree], names: list[str] | None) -> list[tupl
     for probe in PROBES:
         if names and probe.name not in names:
             continue
-        own = probe.candidates[0]
-        if not probe.always and not any((tree.path / own).is_file() for tree in trees.values()):
+        if not probe.always and not any(
+            (tree.path / path).is_file() for tree in trees.values() for path in probe.candidates[:-1]
+        ):
             continue  # the crate does not exist on either side yet
         paths = {}
         for side, tree in trees.items():
@@ -365,8 +366,8 @@ def package_args(tree: Tree, package: str) -> list[str]:
 
 
 class Session:
-    def __init__(self, runner: Runner, trees: dict[str, Tree], rounds: int, log=print):
-        self.runner = runner
+    def __init__(self, runners: dict[str, Runner], trees: dict[str, Tree], rounds: int, log=print):
+        self.runners = runners
         self.trees = trees
         self.rounds = rounds
         self.log = log
@@ -393,18 +394,19 @@ class Session:
     def cold(self, feature_sets) -> None:
         for feature_set in feature_sets:
             for tree in self.trees.values():  # warm the dependencies, unmeasured
-                self.runner.build("build", ["--lib", *feature_set.args], tree.path / feature_set.manifest, COLD_ENV)
+                self.runners[tree.side].build("build", ["--lib", *feature_set.args], tree.path / feature_set.manifest, COLD_ENV)
             for index in range(self.rounds):
                 for side in round_order(index):
                     tree = self.trees[side]
+                    runner = self.runners[side]
                     cwd = tree.path / feature_set.manifest
                     packages = self.workspace(tree, feature_set.manifest)
-                    self.runner.clean(packages, cwd)
-                    result, built = self.runner.build("build", ["--lib", "--timings", *feature_set.args], cwd, COLD_ENV)
+                    runner.clean(packages, cwd)
+                    result, built = runner.build("build", ["--lib", "--timings", *feature_set.args], cwd, COLD_ENV)
                     dirty = sorted({package_name(a["package_id"]) for a in built if not a.get("fresh")} & set(packages))
                     if not dirty:
                         raise MeasurementError(f"cold {feature_set.label} on the {side}: no workspace crate rebuilt")
-                    timing = self.runner.target / "cargo-timings" / "cargo-timing.html"
+                    timing = runner.target / "cargo-timings" / "cargo-timing.html"
                     units = unit_data(timing.read_text(encoding="utf-8", errors="replace"))
                     mine = [u for u in units if u["name"] in packages]
                     top = sorted(units, key=lambda u: -u["duration"])[:15]
@@ -413,17 +415,18 @@ class Session:
 
     def test(self) -> None:
         for tree in self.trees.values():
-            self.runner.build("test", ["--no-run", "--lib", "--tests", *self.test_args(tree)], tree.path / "server",
-                              COLD_ENV)
+            self.runners[tree.side].build(
+                "test", ["--no-run", "--lib", "--tests", *self.test_args(tree)], tree.path / "server", COLD_ENV)
         for index in range(self.rounds):
             for side in round_order(index):
                 tree = self.trees[side]
+                runner = self.runners[side]
                 cwd = tree.path / "server"
-                self.runner.clean(sorted(tree.packages), cwd)
-                result, built = self.runner.build(
+                runner.clean(sorted(tree.packages), cwd)
+                result, built = runner.build(
                     "test", ["--no-run", "--lib", "--tests", "--timings", *self.test_args(tree)], cwd, COLD_ENV)
                 executables = sum(1 for a in built if a.get("executable") and a.get("profile", {}).get("test"))
-                units = unit_data((self.runner.target / "cargo-timings" / "cargo-timing.html").read_text(
+                units = unit_data((runner.target / "cargo-timings" / "cargo-timing.html").read_text(
                     encoding="utf-8", errors="replace"))
                 mine = [u for u in units if u["name"] in tree.packages]
                 self.sample("test", "oltp", side, index, result, test_executables=executables, workspace_units=mine)
@@ -437,7 +440,7 @@ class Session:
 
     def edit(self, probes) -> None:
         for tree in self.trees.values():  # the edit loop starts from cold, non-incremental outputs
-            self.runner.clean(sorted(tree.packages), tree.path / "server")
+            self.runners[tree.side].clean(sorted(tree.packages), tree.path / "server")
         originals = {}
         previous = None
         try:
@@ -460,6 +463,7 @@ class Session:
 
     def edit_round(self, probe: Probe, side: str, path: str, owner: str, index: int) -> None:
         tree = self.trees[side]
+        runner = self.runners[side]
         cwd = tree.path / "server"
         file = tree.path / path
         original = file.read_bytes().split(b"\n#[allow(dead_code)]\nconst BUILD_TIMES_PROBE")[0]
@@ -468,14 +472,14 @@ class Session:
             file.write_bytes(original + f"\n#[allow(dead_code)]\nconst BUILD_TIMES_PROBE: u32 = {value};\n".encode())
 
         edit(index + 1)
-        check, check_built = self.runner.build("check", ["--lib", *package_args(tree, owner)], cwd, EDIT_ENV)
-        test, _ = self.runner.build("test", ["--no-run", "--lib", *package_args(tree, owner)], cwd, EDIT_ENV)
+        check, check_built = runner.build("check", ["--lib", *package_args(tree, owner)], cwd, EDIT_ENV)
+        test, _ = runner.build("test", ["--no-run", "--lib", *package_args(tree, owner)], cwd, EDIT_ENV)
         if owner == SERVER:
             graph, graph_built = check, check_built
         else:
             # The OLTP graph above the owner: what an edit here rebuilds before the server links.
             edit(index + 1001)
-            graph, graph_built = self.runner.build("check", ["--lib", *package_args(tree, SERVER)], cwd, EDIT_ENV)
+            graph, graph_built = runner.build("check", ["--lib", *package_args(tree, SERVER)], cwd, EDIT_ENV)
         rebuilt = sorted({package_name(a["package_id"]) for a in graph_built if not a.get("fresh")}
                          & set(tree.packages))
         if index < 0:
@@ -499,7 +503,7 @@ class Session:
             for feature_set in FEATURE_SETS:
                 if feature_set.manifest != "server":
                     continue
-                output = self.runner.capture(
+                output = self.runners[side].capture(
                     ["tree", "--locked", "-d", "-e", "normal", *feature_set.args], cwd)
                 row["duplicates"][feature_set.label] = duplicates(output)
                 features = set(feature_set.args[-1].split(","))
@@ -570,7 +574,7 @@ def main(argv=None) -> int:
     parser.add_argument("--cargo", default="cargo", help="Cargo executable (a slot wrapper's wait counts as time)")
     parser.add_argument("--jobs", type=int, help="pass -j to Cargo (default: CARGO_BUILD_JOBS or Cargo's)")
     parser.add_argument("--work-dir", type=Path, default=DEFAULT_WORK_DIR,
-                        help="parent for the worktrees and the shared target (default: sibling <checkout>-build-times)")
+                        help="parent for the worktrees and their target directories (default: sibling <checkout>-build-times)")
     parser.add_argument("--record", type=Path, help="write the measurements as JSON")
     args = parser.parse_args(argv)
     steps = [step.strip() for step in args.steps.split(",") if step.strip()]
@@ -589,15 +593,16 @@ def main(argv=None) -> int:
         args.work_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="nabedra-build-times-", dir=args.work_dir) as scratch:
             work = Path(scratch)
-            runner = Runner(args.cargo, work / "target", args.jobs)
             with checkout(work / "base", base) as base_path, checkout(work / "head", head) as head_path:
                 trees = {"base": Tree("base", base_path, base), "head": Tree("head", head_path, head)}
-                for tree in trees.values():
-                    tree.metadata = json.loads(runner.capture(
+                runners = {side: Runner(args.cargo, tree.path / "target", args.jobs)
+                           for side, tree in trees.items()}
+                for side, tree in trees.items():
+                    tree.metadata = json.loads(runners[side].capture(
                         ["metadata", "--format-version", "1", "--no-deps", "--offline"], tree.path / "server"))
-                record["context"] = context(runner, trees["head"], work)
+                record["context"] = context(runners["head"], trees["head"], work)
                 record["packages"] = {side: sorted(tree.packages) for side, tree in trees.items()}
-                session = Session(runner, trees, args.rounds)
+                session = Session(runners, trees, args.rounds)
                 for step in steps:
                     session.mark_load(step, "before")
                     if step == "cold":

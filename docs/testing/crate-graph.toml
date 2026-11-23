@@ -16,6 +16,10 @@ name = "harness"
 packages = ["nabedra-check"]
 
 [[layer]]
+name = "simulation"
+packages = ["nabedra-sim"]
+
+[[layer]]
 name = "protocol"
 packages = ["nabedra-protocol", "nabedra-kv"]
 
@@ -62,6 +66,9 @@ oltp_runtime = "nabedra-database"
 [planned.nabedra-rt]
 
 [planned.nabedra-check]
+
+[planned.nabedra-sim]
+normal = ["nabedra-rt", "nabedra-check"]
 
 [planned.nabedra-kv]
 normal = ["nabedra-rt"]

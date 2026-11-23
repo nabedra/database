@@ -6,8 +6,8 @@ scenarios = []
 # Nightly, and dispatched on each phase 8 extraction PR head. Times are recorded, not gated; the
 # check fails only when a measurement is incomplete or the head breaks a rebuild-set rule.
 tiers = ["T2"]
-# The base is the pre-split baseline (BLD6). Both checkouts share one target directory, and the
-# runner's preinstalled SDKs are removed first to make room for debug, test and incremental outputs.
+# The base is the pre-split baseline (BLD6). The runner's preinstalled SDKs are removed first
+# to make room for the independent debug, test and incremental outputs of the two revisions.
 command = ["bash", "-ec", '''
 if [[ ${GITHUB_ACTIONS:-} == true ]]; then
     sudo -n rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true

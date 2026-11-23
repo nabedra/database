@@ -196,6 +196,16 @@ class TreeTests(unittest.TestCase):
         only = build_times.resolve_probes({"base": base, "head": head}, ["runtime"])
         self.assertEqual([p.name for p, _ in only], ["runtime"])
 
+    def test_the_alternate_transport_path_enables_the_probe(self):
+        fallback = "server/src/oltp_replication/multiplex/transport/session.rs"
+        extracted = "server/transport/src/session.rs"
+        base = self.tree("base", [fallback], {"nabedra-database": "server"})
+        head = self.tree("head", [extracted],
+                         {"nabedra-database": "server", "nabedra-transport": "server/transport"})
+        [(probe, paths)] = build_times.resolve_probes({"base": base, "head": head}, ["transport"])
+        self.assertEqual(probe.name, "transport")
+        self.assertEqual(paths, {"base": fallback, "head": extracted})
+
     def test_a_probe_without_any_file_on_one_side_is_an_error(self):
         base = self.tree("base", self.PRE[1:], {"nabedra-database": "server"})
         head = self.tree("head", self.PRE, {"nabedra-database": "server"})
@@ -247,7 +257,8 @@ class SessionTests(unittest.TestCase):
 
     def session(self, dirty, rounds=3):
         runner = FakeRunner(self.tmp / "target", dirty)
-        return build_times.Session(runner, self.trees, rounds, log=lambda *a, **k: print(*a, file=self.log)), runner
+        return build_times.Session(dict.fromkeys(self.trees, runner), self.trees, rounds,
+                                   log=lambda *a, **k: print(*a, file=self.log)), runner
 
     def test_cold_cleans_the_workspace_before_every_measured_build_and_alternates(self):
         session, runner = self.session(lambda verb, args, cwd: ["nabedra-database", "nabedra-rt"])
@@ -365,6 +376,15 @@ class MainTests(unittest.TestCase):
             status = build_times.main(["--base", "a", "--head", "b", "--steps", "extras",
                                        "--work-dir", str(tmp / "work"), "--record", str(record), *argv])
         return status, json.loads(record.read_text(encoding="utf-8")), output.getvalue()
+
+    def test_revisions_use_distinct_cargo_target_directories(self):
+        def extra(session):
+            targets = {side: runner.env({})["CARGO_TARGET_DIR"] for side, runner in session.runners.items()}
+            self.assertEqual(set(targets), {"base", "head"})
+            self.assertNotEqual(targets["base"], targets["head"])
+
+        status, _, output = self.run_main(extra)
+        self.assertEqual(status, 0, output)
 
     def test_complete_run_writes_the_record(self):
         def extra(session):
