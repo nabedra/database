@@ -527,7 +527,7 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
             let started = nabedra_rt::time::now_std();
             let (status, envelope) =
                 call(&app, body(nabedra_rt::ids::uuid_v4(), operation, payload), true).await;
-            latencies.push(nabedra_rt::time::now_std().saturating_duration_since(started));
+            latencies.push(nabedra_rt::time::elapsed(started));
             if normalized(status, envelope.clone(), 0) != queued[index].1 {
                 eprintln!("d01 rf1 mismatch at {index}: leader {}", leader());
             }
@@ -815,7 +815,7 @@ async fn o15_d03_m3_rollback_queued_gets_propose_no_data_entry() {
                 "{envelope}"
             );
         }
-        let elapsed = nabedra_rt::time::now_std().saturating_duration_since(started);
+        let elapsed = nabedra_rt::time::elapsed(started);
         let after = snapshot().await;
         let (entries, markers, forwards, journal, commits) = (
             after.0 - before.0,

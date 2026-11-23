@@ -378,7 +378,7 @@ mod tests {
                     let offset = (i * 64) % (data.len() - size + 1);
                     acc ^= path(acc, std::hint::black_box(&data[offset..offset + size]));
                 }
-                let secs = started.elapsed().as_secs_f64();
+                let secs = nabedra_rt::time::elapsed(started).as_secs_f64();
                 std::hint::black_box(acc);
                 println!(
                     "crc32c {name:>9} {size:>8} B blocks: {:>8.0} MB/s",

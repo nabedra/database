@@ -388,7 +388,7 @@ fn ns18_memtable_range_delete_churn_bench() {
             seq += 1;
             let _ = mem.get(b"@g000001/state", seq);
         }
-        let per = start.elapsed() / rounds as u32;
+        let per = nabedra_rt::time::elapsed(start) / rounds as u32;
         // The same with an iterator's handle taken after every purge, so each purge
         // copies the chunk handles it shares with that iterator.
         let start = nabedra_rt::time::now_std();
@@ -404,7 +404,7 @@ fn ns18_memtable_range_delete_churn_bench() {
             let held = mem.fragmented_tombstones();
             let _ = held.max_covering_seq(b"@g000001/log/0", seq);
         }
-        let per_held = start.elapsed() / rounds as u32;
+        let per_held = nabedra_rt::time::elapsed(start) / rounds as u32;
         let start = nabedra_rt::time::now_std();
         for r in 0..rounds {
             let mut b = WriteBatch::new();
@@ -416,7 +416,7 @@ fn ns18_memtable_range_delete_churn_bench() {
             seq += 1;
             let _ = mem.get(b"@g000001/state", seq);
         }
-        let base = start.elapsed() / rounds as u32;
+        let base = nabedra_rt::time::elapsed(start) / rounds as u32;
         println!(
             "{existing:>6} tombstones in the active memtable: purge + get = {per:?}; \
              purge + iterator handle = {per_held:?}; put + get = {base:?}"

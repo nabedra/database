@@ -401,7 +401,7 @@ async fn write_frames(
             _ = stopped(&mut stop) => false,
         };
         if let Some(timing) = &frame.timing {
-            timing.write.record(started.elapsed());
+            timing.write.record(nabedra_rt::time::elapsed(started));
         }
         if let Some(ack) = frame.ack {
             let _ = ack.send(if written {
@@ -601,7 +601,7 @@ impl ClientSession {
                     if let Some((at, mark)) = written {
                         if self.received.load(Ordering::Relaxed) != mark {
                             written = None;
-                        } else if at.elapsed() >= ping_timeout {
+                        } else if nabedra_rt::time::elapsed(at) >= ping_timeout {
                             tracing::debug!(peer=%self.identity.worker_id,
                                 "peer session ping unanswered; closing");
                             break;
@@ -827,7 +827,7 @@ impl Drop for StreamGuard<'_> {
         if let Some(WriteOutcome::Written(at)) = self.outcome
             && let Some((_, mark)) = self.written
             && pending
-            && at.elapsed() >= self.session.silent_limit
+            && nabedra_rt::time::elapsed(at) >= self.session.silent_limit
             && self.session.received.load(Ordering::Relaxed) == mark
         {
             tracing::debug!(peer=%self.session.identity.worker_id,
@@ -1457,7 +1457,7 @@ pub(super) async fn serve(
                 // caller stopped pinging, give their slot back.
                 let silence = progress.silence();
                 if lock(&state.active).is_empty()
-                    && (lock(&state.lane).is_none() && started.elapsed() >= config.ping_idle
+                    && (lock(&state.lane).is_none() && nabedra_rt::time::elapsed(started) >= config.ping_idle
                         || silence >= config.ping_idle * SERVER_IDLE_PINGS)
                 {
                     tracing::debug!(peer=?bound.map(|peer| peer.worker_id),
@@ -1635,7 +1635,7 @@ async fn run_stream(
         sections,
         preflight,
     } = work;
-    S_SPAWN.get(class).record(spawned.elapsed());
+    S_SPAWN.get(class).record(nabedra_rt::time::elapsed(spawned));
     let mut trace = RaftTransportTrace {
         group: group_id,
         purpose,
@@ -1649,7 +1649,7 @@ async fn run_stream(
             .reserve_scratch(class.byte_class(), header_decode_bytes(class, header.len()))?;
         let preflight_started = nabedra_rt::time::now();
         let plan = endpoint.preflight(&session, header.as_slice()).await?;
-        S_PREFLIGHT.get(class).record(preflight_started.elapsed());
+        S_PREFLIGHT.get(class).record(nabedra_rt::time::elapsed(preflight_started));
         drop(header_scratch);
         validate_plan(&common.config, class, plan)?;
         let handler = common
@@ -1681,7 +1681,7 @@ async fn run_stream(
         }
         let handle_started = nabedra_rt::time::now();
         let reply = endpoint.handle(session, header, sections).await?;
-        S_HANDLE.get(class).record(handle_started.elapsed());
+        S_HANDLE.get(class).record(nabedra_rt::time::elapsed(handle_started));
         validate_reply(&common.config, class, &reply)?;
         Ok((reply, handler))
     })
@@ -1723,7 +1723,7 @@ async fn run_stream(
         if outgoing.send(frame).await.is_ok()
             && let Ok(WriteOutcome::Written(_)) = written.await
         {
-            S_TOTAL.get(class).record(arrived.elapsed());
+            S_TOTAL.get(class).record(nabedra_rt::time::elapsed(arrived));
         }
     }
     drop(handler);

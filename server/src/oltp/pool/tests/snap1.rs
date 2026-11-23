@@ -61,7 +61,7 @@ async fn snap1_o11_applies_proceed_while_a_snapshot_file_is_written() {
         let group = group.clone();
         async move {
             let snapshot = group.export_snapshot(budget()).await;
-            (snapshot, started.elapsed())
+            (snapshot, nabedra_rt::time::elapsed(started))
         }
     });
     let mut latencies = Vec::new();
@@ -69,7 +69,7 @@ async fn snap1_o11_applies_proceed_while_a_snapshot_file_is_written() {
     while !export.is_finished() {
         let begun = nabedra_rt::time::now_std();
         probe(&group, next).await;
-        latencies.push(begun.elapsed());
+        latencies.push(nabedra_rt::time::elapsed(begun));
         next += 1;
     }
     let (snapshot, took) = export.await.unwrap();

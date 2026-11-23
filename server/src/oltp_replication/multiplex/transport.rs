@@ -1011,7 +1011,7 @@ impl WorkerTransport {
                     let Ok(permit)=self.common.handshakes.clone().try_acquire_owned() else {drop(socket);continue};
                     let owner=self.clone();
                     let stopped=stopped.clone();
-                    tasks.spawn(async move {owner.accept(socket,permit,stopped).await;});
+                    nabedra_rt::task::spawn_in(&mut tasks, async move {owner.accept(socket,permit,stopped).await;});
                 }
             }
         }

@@ -251,13 +251,12 @@ impl AppliedPeerDirectory {
     /// worker's revocation view; `None` where Control is local.
     pub(crate) fn revocation_view_age(&self) -> Option<Duration> {
         let remote = self.remote.get()?;
-        Some(
-            remote
+        Some(nabedra_rt::time::elapsed(
+            *remote
                 .refreshed
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .elapsed(),
-        )
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ))
     }
 
     /// Records each revocation not yet known and drops its directory entry.

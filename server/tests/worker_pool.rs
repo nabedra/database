@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // integration tests drive real processes and real time; the phase 7 seam covers server/src
 #![cfg(any(feature = "olap", feature = "oltp"))]
 
 use nabedra_database_server::{

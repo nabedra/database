@@ -1701,7 +1701,7 @@ impl Worker {
                     let owner = self.clone();
                     let root = root.clone();
                     let id = record.identity();
-                    tasks.spawn(async move {
+                    nabedra_rt::task::spawn_in(&mut tasks, async move {
                         let _active = ActiveRequest {
                             owner: owner.clone(),
                             id: id.clone(),

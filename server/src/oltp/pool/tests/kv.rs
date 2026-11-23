@@ -1130,7 +1130,7 @@ async fn ns08_ns17_l0_slowdown_paces_writes_off_the_executor() {
             .transaction(meta(1), budget(), put_entry(1, b"row", vec![7u8; 16 << 10]))
             .await
             .unwrap();
-        started.elapsed()
+        nabedra_rt::time::elapsed(started)
     });
     nabedra_rt::time::sleep(Duration::from_millis(50)).await;
     assert!(!paced.is_finished(), "the write was not paced");
@@ -1191,7 +1191,7 @@ async fn ns08_ns17_l0_slowdown_paces_writes_off_the_executor() {
     .await
     .expect("a write cancelled while the executor built it was dropped");
     // It took the paced path: 200 ms in the executor, then the pacing delay.
-    let landed = started.elapsed();
+    let landed = nabedra_rt::time::elapsed(started);
     assert!(
         landed >= Duration::from_millis(350),
         "landed after {landed:?}"

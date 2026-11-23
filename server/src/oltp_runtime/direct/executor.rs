@@ -219,10 +219,10 @@ impl DirectExecutor {
             }
         };
         if get {
-            self.stats.get_time(nabedra_rt::time::now_std().saturating_duration_since(started));
+            self.stats.get_time(nabedra_rt::time::elapsed(started));
             perf_stage!("leader.get.total").since(started);
         } else {
-            self.stats.mutation_time(nabedra_rt::time::now_std().saturating_duration_since(started));
+            self.stats.mutation_time(nabedra_rt::time::elapsed(started));
             perf_stage!("leader.mutation.total").since(started);
         }
         self.count(&response);
