@@ -372,12 +372,16 @@ impl Fixture {
             .unwrap();
             if release == Release::SessionV2 {
                 let common = Arc::get_mut(&mut transport.common).unwrap();
-                (common.connector, common.acceptor) = tls[index].transports(&[SESSION_ALPN, ALPN]);
+                (common.connector, common.acceptor) =
+                    tls[index].transports(&[SESSION_ALPN, ONE_SHOT_ALPN]);
             }
             if release == Release::SessionV3 {
                 let common = Arc::get_mut(&mut transport.common).unwrap();
-                (common.connector, common.acceptor) =
-                    tls[index].transports(&[LEGACY_INDEX_RECLAIM_ALPN, SESSION_ALPN, ALPN]);
+                (common.connector, common.acceptor) = tls[index].transports(&[
+                    LEGACY_INDEX_RECLAIM_ALPN,
+                    SESSION_ALPN,
+                    ONE_SHOT_ALPN,
+                ]);
             }
             transport
         };

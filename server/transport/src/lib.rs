@@ -308,6 +308,12 @@ impl Deref for ReceivedReply {
     }
 }
 impl ReceivedReply {
+    /// Keep the decode charge while retaining an owned value from the reply.
+    #[inline]
+    pub fn scratch_lease(&self) -> Arc<ScratchLease> {
+        self.scratch.clone()
+    }
+
     /// Metadata readers use the worker's independent bounded reply decoder,
     /// never the query working budget or an arena holding their raw frames.
     pub async fn reserve_reply_decode(

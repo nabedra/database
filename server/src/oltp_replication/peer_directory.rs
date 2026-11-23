@@ -10,7 +10,7 @@ use crate::oltp_replication::{
     types::{Digest, GroupIdentity, GroupKind, Text, WorkerEnrollment, WorkerIdentity},
 };
 use crate::protocol::{ErrorCode, Outcome, ProtocolError};
-use nabedra_transport::{EndpointFuture, PeerDirectory, Purpose, TransportTrust};
+use nabedra_transport::{EndpointFuture, PeerDirectory, Purpose, ReceivedReply, TransportTrust};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::{
@@ -689,7 +689,7 @@ impl AppliedPeerDirectory {
             .execute(ExecutionClass::Control, 0, 0, move || {
                 let raw = reply.sections[0].as_ref().ok_or_else(invalid)?;
                 let page = serde_json::from_slice(raw.as_slice()).map_err(|_| invalid())?;
-                Ok((page, reply.scratch.clone()))
+                Ok((page, reply.scratch_lease()))
             })
             .await
     }

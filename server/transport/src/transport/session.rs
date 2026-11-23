@@ -2014,7 +2014,7 @@ mod tests {
 
     #[tokio::test]
     async fn d10_vectored_frame_write_emits_exact_bytes_in_order() {
-        let shared = super::tests::test_memory(1, Default::default());
+        let shared = crate::transport::tests::test_memory(1, Default::default());
         let header = shared
             .copy_bytes_in(ByteClass::Progress, b"header")
             .unwrap();

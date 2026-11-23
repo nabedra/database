@@ -196,9 +196,7 @@ fn resolve_host(endpoint: &str) -> Vec<SocketAddr> {
     let Ok(port) = port.parse() else {
         return Vec::new();
     };
-    let mut addresses = backend::current()
-        .resolve(host.trim_matches(['[', ']']), port)
-        .unwrap_or_default();
+    let mut addresses = backend::current().resolve(host, port).unwrap_or_default();
     addresses.truncate(MAX_ADDRESSES);
     addresses
 }
