@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "p12-final-f0533c1-173326--cache-differential-unit.log",
+      "sha256": "f57b24b15586d7d45803738e5918b72ef4090ffced15f78802eee38af9026842"
+    }
+  ],
+  "assertions": {
+    "executed": 14,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-differential-unit",
+  "duration_s": 2.82,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T16:41:38.543894+00:00",
+    "request_id": "p12-final-f0533c1-173326",
+    "runner": "GitHub Actions 1000006837",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45217832702"
+  },
+  "scenarios": [
+    "K01"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "f0533c15c5ddbadaeb4f6ee968c6d6b2e47a11d3",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
