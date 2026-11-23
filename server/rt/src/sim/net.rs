@@ -215,13 +215,32 @@ struct Message {
 #[derive(Debug, Default)]
 struct Pipe {
     queue: VecDeque<Message>,
-    /// The sender shut down (FIN): the reader sees EOF once the queue drains.
-    fin: bool,
+    fin: Fin,
     /// A message was dropped: later ones vanish.
     stalled: bool,
     sent: u64,
     last_ready: Option<Instant>,
     reader: Option<Waker>,
+}
+
+/// FIN travels in order with the data and can be held by a black hole.
+#[derive(Debug, Default)]
+enum Fin {
+    #[default]
+    Open,
+    Sent(Instant),
+    Received,
+}
+
+impl Pipe {
+    fn finish(&mut self) {
+        if matches!(self.fin, Fin::Open) {
+            self.fin = Fin::Sent(Instant::now());
+        }
+        if let Some(waker) = self.reader.take() {
+            waker.wake();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,12 +313,41 @@ impl Connection {
     }
 }
 
+/// Each pending future owns its registration. Cancelling it releases its waker.
+#[derive(Debug, Default)]
+struct Waiters(Vec<Weak<Waker>>);
+
+impl Waiters {
+    fn register(&mut self, waiter: &mut Option<Arc<Waker>>, waker: &Waker) {
+        if waiter
+            .as_ref()
+            .is_some_and(|current| current.will_wake(waker))
+        {
+            return;
+        }
+        let registered = Arc::new(waker.clone());
+        *waiter = Some(registered.clone());
+        self.0.retain(|entry| entry.strong_count() > 0);
+        self.0.push(Arc::downgrade(&registered));
+    }
+
+    fn wake_all(&mut self) {
+        self.0.retain(|entry| {
+            let Some(waker) = entry.upgrade() else {
+                return false;
+            };
+            waker.wake_by_ref();
+            true
+        });
+    }
+}
+
 #[derive(Debug)]
 struct Slot {
     id: u64,
     node: Option<u64>,
     backlog: VecDeque<u64>,
-    acceptors: Vec<Waker>,
+    acceptors: Waiters,
 }
 
 #[derive(Default)]
@@ -313,7 +361,7 @@ struct State {
     holes: BTreeMap<(Option<u64>, Option<u64>), Instant>,
     planner: Option<Box<dyn Planner>>,
     /// Dials waiting for a network change.
-    dialers: Vec<Waker>,
+    dialers: Waiters,
     next_conn: u64,
     next_listener: u64,
     next_port: u16,
@@ -366,9 +414,9 @@ impl State {
             }
         }
         for slot in self.listeners.values_mut() {
-            slot.acceptors.drain(..).for_each(Waker::wake);
+            slot.acceptors.wake_all();
         }
-        self.dialers.drain(..).for_each(Waker::wake);
+        self.dialers.wake_all();
     }
 
     fn reset(&mut self, conn: u64) {
@@ -391,7 +439,8 @@ impl State {
                 conn.reset();
             }
         }
-        slot.acceptors.drain(..).for_each(Waker::wake);
+        slot.acceptors.wake_all();
+        self.dialers.wake_all();
         self.collect();
     }
 
@@ -546,10 +595,7 @@ impl World {
         self.with_net(|state| {
             if let Some(conn) = state.conns.get_mut(&conn.0) {
                 for pipe in &mut conn.pipes {
-                    pipe.fin = true;
-                    if let Some(waker) = pipe.reader.take() {
-                        waker.wake();
-                    }
+                    pipe.finish();
                 }
             }
         });
@@ -649,6 +695,7 @@ pub async fn dial(target: Target<'_>) -> io::Result<Pending> {
 }
 
 async fn dial_one(net: &Arc<Net>, from: Option<u64>, addr: SocketAddr) -> io::Result<Pending> {
+    let mut waiter = None;
     poll_fn(|cx| {
         let mut state = net.lock();
         let state = &mut *state;
@@ -673,7 +720,7 @@ async fn dial_one(net: &Arc<Net>, from: Option<u64>, addr: SocketAddr) -> io::Re
                 format!("simulated dial to {addr} refused"),
             ))),
             Dial::Hang => {
-                state.dialers.push(cx.waker().clone());
+                state.dialers.register(&mut waiter, cx.waker());
                 Poll::Pending
             }
             Dial::Connect => {
@@ -704,7 +751,7 @@ async fn dial_one(net: &Arc<Net>, from: Option<u64>, addr: SocketAddr) -> io::Re
                     .get_mut(&addr)
                     .expect("the listener was found above");
                 slot.backlog.push_back(id);
-                slot.acceptors.drain(..).for_each(Waker::wake);
+                slot.acceptors.wake_all();
                 Poll::Ready(Ok(Pending {
                     half: Half::new(net.clone(), id, Side::Client),
                 }))
@@ -746,7 +793,7 @@ fn bind(net: Arc<Net>, node: Option<u64>, addr: SocketAddr) -> io::Result<SimLis
             id,
             node,
             backlog: VecDeque::new(),
-            acceptors: Vec::new(),
+            acceptors: Waiters::default(),
         },
     );
     drop(state);
@@ -780,6 +827,7 @@ impl SimListener {
     }
 
     pub async fn accept(&self) -> io::Result<(Pending, SocketAddr)> {
+        let mut waiter = None;
         poll_fn(|cx| {
             let mut state = self.net.lock();
             let state = &mut *state;
@@ -807,7 +855,7 @@ impl SimListener {
                     )))
                 }
                 None => {
-                    slot.acceptors.push(cx.waker().clone());
+                    slot.acceptors.register(&mut waiter, cx.waker());
                     Poll::Pending
                 }
             }
@@ -911,7 +959,7 @@ impl Half {
             return Err(reset_error());
         }
         let tx = self.side.tx();
-        if conn.pipes[tx].fin {
+        if !matches!(conn.pipes[tx].fin, Fin::Open) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "the simulated stream was shut down",
@@ -924,10 +972,6 @@ impl Half {
             ));
         }
         let pipe = &mut conn.pipes[tx];
-        if pipe.stalled {
-            pipe.sent += 1;
-            return Ok(());
-        }
         let bytes: &[u8] = match &body {
             Body::Data(bytes) => bytes,
             _ => &[],
@@ -947,6 +991,7 @@ impl Half {
             .map_or(Fate::NOW, |planner| planner.message(&envelope));
         pipe.sent += 1;
         match fate {
+            Fate::Deliver { .. } if pipe.stalled => Ok(()),
             Fate::Deliver { delay } => {
                 let now = Instant::now();
                 let ready_at = pipe
@@ -994,22 +1039,26 @@ impl Half {
                 let from = conn.end(self.peer()).node;
                 let to = conn.end(self.side).node;
                 let pipe = &mut conn.pipes[self.side.rx()];
+                let held = |sent| {
+                    state
+                        .holes
+                        .get(&(from, to))
+                        .is_some_and(|opened| sent >= *opened)
+                };
                 let ready_at = match pipe.queue.front() {
-                    None if pipe.fin => return Poll::Ready(Ok(None)),
-                    None => {
+                    Some(message) if message.read != 0 || !held(message.ready_at) => {
+                        message.ready_at
+                    }
+                    None if matches!(pipe.fin, Fin::Received) => return Poll::Ready(Ok(None)),
+                    None if matches!(pipe.fin, Fin::Sent(sent) if !held(sent)) => {
+                        pipe.fin = Fin::Received;
+                        return Poll::Ready(Ok(None));
+                    }
+                    _ => {
                         pipe.reader = Some(cx.waker().clone());
                         return Poll::Pending;
                     }
-                    Some(message) => message.ready_at,
                 };
-                let held = state
-                    .holes
-                    .get(&(from, to))
-                    .is_some_and(|opened| ready_at >= *opened);
-                if held {
-                    pipe.reader = Some(cx.waker().clone());
-                    return Poll::Pending;
-                }
                 if ready_at <= Instant::now() {
                     return Poll::Ready(Ok(Some(take(&mut pipe.queue))));
                 }
@@ -1055,10 +1104,7 @@ impl Drop for Half {
             conn.open[self.side.tx()] = false;
             let pipe = &mut conn.pipes[self.side.tx()];
             if !pipe.stalled {
-                pipe.fin = true;
-            }
-            if let Some(waker) = pipe.reader.take() {
-                waker.wake();
+                pipe.finish();
             }
         }
         state.collect();
@@ -1353,10 +1399,7 @@ impl AsyncWrite for SimStream {
         if let Some(conn) = state.conns.get_mut(&this.half.conn) {
             let pipe = &mut conn.pipes[this.half.side.tx()];
             if !pipe.stalled {
-                pipe.fin = true;
-            }
-            if let Some(waker) = pipe.reader.take() {
-                waker.wake();
+                pipe.finish();
             }
         }
         Poll::Ready(Ok(()))

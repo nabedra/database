@@ -313,38 +313,53 @@ fn each_flush_is_one_message_with_its_stream_and_direction_visible() {
 
 #[test]
 fn a_dropped_reply_stalls_its_direction_until_the_connection_resets() {
-    // The lost-reply cut: the request is delivered and handled, its reply never arrives.
+    // The request and replies share a stream id in the first eight bytes of each frame.
     run(6, |world| async move {
         nodes(&world, &[1, 2]);
-        let log = record(&world, |envelope| {
-            match (envelope.direction, envelope.kind) {
-                (Direction::ToClient, Kind::Data) => Fate::Drop,
-                _ => Fate::NOW,
-            }
+        let request_id = 23_u64.to_be_bytes();
+        let other_id = 24_u64.to_be_bytes();
+        let log = record(&world, move |envelope| match envelope {
+            super::Envelope {
+                direction: Direction::ToClient,
+                bytes,
+                ..
+            } if bytes.starts_with(&request_id) => Fate::Drop,
+            super::Envelope {
+                direction: Direction::ToClient,
+                bytes,
+                ..
+            } if bytes.starts_with(&other_id) && bytes.ends_with(b"reset") => Fate::Reset,
+            _ => Fate::NOW,
         });
         let (mut client, mut server) = streams(&world, 2, 1).await;
-        send(&mut client, b"request").await.unwrap();
+        let request = [request_id.as_slice(), b"request"].concat();
+        send(&mut client, &request).await.unwrap();
         assert_eq!(
             read_some(&mut server, ms(10)).await.unwrap().unwrap(),
-            b"request"
+            request
         );
-        send(&mut server, b"reply").await.unwrap();
-        world.clear_net_planner();
-        // Later messages on the stalled direction vanish too, without being planned.
-        send(&mut server, b"second").await.unwrap();
+
+        send(&mut server, &[request_id.as_slice(), b"reply"].concat())
+            .await
+            .unwrap();
+        // A later frame on the same TCP direction is still planned, but cannot arrive.
+        send(&mut server, &[other_id.as_slice(), b"reply"].concat())
+            .await
+            .unwrap();
         assert!(read_some(&mut client, ms(1_000)).await.is_none());
-        assert_eq!(log.take().iter().filter(|r| r.5 == Kind::Data).count(), 2);
-        // The other direction still works.
+        assert_eq!(log.take().iter().filter(|r| r.5 == Kind::Data).count(), 3);
+
+        // The reverse direction still works, and a later plan can reset the connection.
         send(&mut client, b"more").await.unwrap();
         assert_eq!(
             read_some(&mut server, ms(10)).await.unwrap().unwrap(),
             b"more"
         );
-
-        world.reset_connection(client.id());
-        let error = read_some(&mut client, ms(10)).await.unwrap().unwrap_err();
+        let error = send(&mut server, &[other_id.as_slice(), b"reset"].concat())
+            .await
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
-        let error = send(&mut server, b"late").await.unwrap_err();
+        let error = read_some(&mut client, ms(10)).await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
     });
 }
@@ -503,6 +518,51 @@ fn a_black_hole_holds_messages_and_dials_until_healed() {
         server.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"ab");
         assert!(dialing.await.unwrap().is_ok());
+
+        // A frame handed to the reader stays available through a later partition.
+        send(&mut client, b"cd").await.unwrap();
+        let mut byte = [0];
+        server.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, *b"c");
+        world.black_hole(Some(2), Some(1));
+        assert_eq!(read_some(&mut server, ms(10)).await.unwrap().unwrap(), b"d");
+    });
+}
+
+#[test]
+fn a_black_hole_holds_shutdown_until_healed() {
+    run(18, |world| async move {
+        nodes(&world, &[1, 2]);
+        let (mut client, mut server) = streams(&world, 2, 1).await;
+        world.black_hole(Some(2), Some(1));
+        client.shutdown().await.unwrap();
+
+        assert!(read_some(&mut server, ms(1_000)).await.is_none());
+        world.heal(Some(2), Some(1));
+        assert_eq!(read_some(&mut server, ms(10)).await.unwrap().unwrap(), b"");
+
+        world.black_hole(Some(2), Some(1));
+        assert_eq!(read_some(&mut server, ms(10)).await.unwrap().unwrap(), b"");
+    });
+}
+
+#[test]
+fn dropping_a_listener_refuses_a_waiting_dial() {
+    run(19, |world| async move {
+        nodes(&world, &[1, 2]);
+        let listener = world.listen(1, any(0)).unwrap();
+        let addr = listener.local_addr();
+        world.black_hole(Some(2), Some(1));
+        let mut dialing = world.spawn_node(2, dial(Target::Addr(addr)));
+        assert!(time::timeout(ms(1), &mut dialing).await.is_err());
+
+        drop(listener);
+        let error = time::timeout(ms(10), dialing)
+            .await
+            .expect("dial should wake when the listener closes")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
     });
 }
 
