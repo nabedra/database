@@ -1,0 +1,19 @@
+id = "sim-core-unit"
+# The shared simulation core (server/sim, crate nabedra-sim) maps to the `sim` module in
+# modules.toml. These are the core's own unit tests: pinned trace, stream and net-plan values
+# (compatibility with the Events phase 6 simulator), known-bad observations for each Raft
+# invariant, the nemesis schedule, shrinking, and a toy cluster on nabedra-rt's World that
+# checks same-seed determinism, the double-run check, failure artifacts and the planted
+# search. Tooling for the simulators, so it proves no product guarantee by itself.
+module = "sim"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+# Unseeded first, then with tokio's rng seeded (`--cfg tokio_unstable`, as every simulation
+# sweep runs) in its own target directory, so the RUSTFLAGS never invalidate other builds.
+command = ["sh", "-ec", "cargo test --locked -j 2 -p nabedra-sim --lib && RUSTFLAGS='--cfg tokio_unstable' CARGO_TARGET_DIR=target/sim cargo test --locked -j 2 -p nabedra-sim --lib"]
+cwd = "server"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"
