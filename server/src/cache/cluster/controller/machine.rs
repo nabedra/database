@@ -151,6 +151,13 @@ impl RaftStateMachine<RaftConfig> for Machine {
                 }
                 EntryPayload::Normal(command) => current.state.apply(command, responder.is_some()),
             };
+            #[cfg(feature = "sim")]
+            super::super::sim::hooks::committed(
+                id.index,
+                id.leader_id.term,
+                id.leader_id.node_id,
+                &current.state.topology,
+            );
             drop(current);
             if let Some(responder) = responder {
                 responder.send(response);
@@ -188,6 +195,15 @@ impl RaftStateMachine<RaftConfig> for Machine {
         current.state = saved.state;
         current.last_applied = saved.meta.last_log_id;
         current.membership = saved.meta.last_membership;
+        #[cfg(feature = "sim")]
+        if let Some(id) = current.last_applied {
+            super::super::sim::hooks::committed(
+                id.index,
+                id.leader_id.term,
+                id.leader_id.node_id,
+                &current.state.topology,
+            );
+        }
         Ok(())
     }
 

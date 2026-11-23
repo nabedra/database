@@ -49,6 +49,39 @@ fn only(effect: Effect) -> Effects {
     effects
 }
 
+#[cfg(feature = "sim")]
+#[test]
+fn k03_slot_observation_does_not_advance_the_lease_clock() {
+    use nabedra_rt::sim::{self, EPOCH_MS, NodeClock};
+
+    sim::run(11, |world| async move {
+        world.add_node(1, NodeClock::default());
+        sim::in_node(1, async {
+            let config = config(node(1));
+            let mut actor = State::new(0, config).unwrap();
+            let mut shard = Shard::new(1, Role::Primary, true, config);
+            shard.lease = Some(Lease {
+                not_before_ms: EPOCH_MS,
+                expires_ms: EPOCH_MS + 2_000,
+            });
+            actor.slots.insert(0, shard);
+            actor.clock.now().unwrap();
+
+            // An observation at the forward step must not establish a new floor
+            // for the actor's subsequent reads when the step is undone.
+            world.jump_wall_forward(1, Duration::from_secs(3));
+            assert!(!actor.sample(0).unwrap().authorized);
+            world.jump_wall_backward(1, Duration::from_secs(3));
+            let now = actor
+                .clock
+                .now()
+                .expect("observation changed clock rollback state");
+            assert!(actor.slots[&0].authorized(now));
+        })
+        .await;
+    });
+}
+
 #[test]
 fn k03_final_lease_check_never_publishes_staged_mutation() {
     let config = config(node(1));
