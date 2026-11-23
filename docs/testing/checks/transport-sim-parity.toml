@@ -11,3 +11,5 @@ cwd = "server"
 timeout_s = 1800
 needs = []
 result_parser = "cargo-test"
+# Seed Tokio's select order so the fixtures can compare replay trace hashes.
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim" }
