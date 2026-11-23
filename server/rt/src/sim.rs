@@ -386,6 +386,7 @@ impl World {
     /// Crashes `node`: marks it down and aborts every registered task. Service threads
     /// cannot be aborted; see the module documentation.
     pub fn crash(&self, node: u64) {
+        net::crash(self, node);
         let tasks = self.with_node(node, |entry| {
             entry.up = false;
             std::mem::take(&mut entry.tasks)
@@ -793,6 +794,7 @@ where
     })
 }
 
+pub mod net;
 #[cfg(feature = "sim-openraft")]
 pub mod openraft10;
 
