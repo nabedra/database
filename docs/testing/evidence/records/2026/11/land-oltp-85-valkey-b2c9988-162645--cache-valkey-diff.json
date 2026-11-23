@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "land-oltp-85-valkey-b2c9988-162645--cache-valkey-diff.log",
+      "sha256": "323cced471b60d2c594909c04b76108a414118733571e90735db6aaa94672f42"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-valkey-diff",
+  "duration_s": 66.626,
+  "guarantees": [
+    "CACHE-G01",
+    "CACHE-G02"
+  ],
+  "kind": "D",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T16:30:15.980363+00:00",
+    "request_id": "land-oltp-85-valkey-b2c9988-162645",
+    "runner": "GitHub Actions 1000006751",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45216583033"
+  },
+  "scenarios": [
+    "K01"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "b2c9988fbcba7ba93cab53271270f9d8e64ceafb",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
