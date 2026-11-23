@@ -1,7 +1,6 @@
 use super::*;
 use crate::oltp_replication::{
-    authority::control::ReplacementMountProof, manager::ManagedControl,
-    multiplex::AppliedPeerDirectory,
+    AppliedPeerDirectory, authority::control::ReplacementMountProof, manager::ManagedControl,
 };
 use std::time::Duration;
 use tokio::time::Instant;

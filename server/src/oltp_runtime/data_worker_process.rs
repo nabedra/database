@@ -24,7 +24,7 @@ use crate::{
         live::{InventoryPin, UsageSample, process_counters},
     },
     oltp_replication::{
-        TlsMaterial,
+        AppliedPeerDirectory, TlsMaterial,
         authority::{
             control::{
                 ControlClient, ControlReply, DataWorkerClient, DataWorkerIntent,
@@ -34,10 +34,7 @@ use crate::{
             status::{PartitionedStatus, StatusService, StatusTopology},
         },
         manager::{GroupPlacement, HostedGroupManager, RemotePlacementTarget, shard_split::SplitEndpoint},
-        multiplex::{
-            AppliedPeerDirectory, EndpointRegistry, Purpose, TransportConfig, WorkerClient,
-            WorkerTransport,
-        },
+        multiplex::{EndpointRegistry, Purpose, TransportConfig, WorkerClient, WorkerTransport},
         service_rpc::{StatusClient, TimestampClient},
         types::*,
     },
