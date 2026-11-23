@@ -882,7 +882,7 @@ impl WorkerTransport {
     }
     /// A peer as released before persistent sessions: it offers and accepts
     /// only the one-shot `NABOTP01` exchange.
-    #[cfg(any(test, feature = "sim"))]
+    #[cfg(any(test, feature = "sim", feature = "test-hooks"))]
     pub fn one_shot_for_test(
         local: &WorkerEnrollment,
         tls: &TlsMaterial,
