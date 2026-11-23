@@ -1,4 +1,4 @@
-{"schema":"nabedra.catalog/1","count":2617,"tests":[
+{"schema":"nabedra.catalog/1","count":2618,"tests":[
 {"file":"orm/python/tests/events/test_client.py","hash":"202d453fc9458842","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_ack_uses_exact_offset_and_rejects_foreign_delivery_before_request","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"1c426c67dd348a60","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_claim_reuses_uuid_after_missing_response","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"b8d2b5c0d984c70e","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_error_metadata_and_duplicate_fields","lang":"python"},
@@ -655,6 +655,7 @@
 {"file":"server/check/tests/core_env.rs","hash":"2bbc6e2d57bb87fe","id":"server/check/tests/core_env.rs::evidence_uses_the_tested_revision","lang":"rust"},
 {"file":"server/check/tests/history_cache_sim.rs","hash":"49a45440e115367d","id":"server/check/tests/history_cache_sim.rs::cache_sim_allows_lost_delete_inside_lag_window","lang":"rust"},
 {"file":"server/check/tests/history_cache_sim.rs","hash":"281c99810c02effa","id":"server/check/tests/history_cache_sim.rs::cache_sim_clean_history_passes","lang":"rust"},
+{"file":"server/check/tests/history_cache_sim.rs","hash":"27116bbd579ee65f","id":"server/check/tests/history_cache_sim.rs::cache_sim_expiry_clock_allows_early_absence_within_tolerance","lang":"rust"},
 {"file":"server/check/tests/history_cache_sim.rs","hash":"a370e379f6656d7d","id":"server/check/tests/history_cache_sim.rs::cache_sim_rejects_invented_value","lang":"rust"},
 {"file":"server/check/tests/history_cache_sim.rs","hash":"a40529139091dad7","id":"server/check/tests/history_cache_sim.rs::cache_sim_rejects_resurrection_after_delete","lang":"rust"},
 {"file":"server/check/tests/history_cache_sim.rs","hash":"d52832cd919dad06","id":"server/check/tests/history_cache_sim.rs::cache_sim_rejects_resurrection_after_promoted_replica_showed_absence","lang":"rust"},
