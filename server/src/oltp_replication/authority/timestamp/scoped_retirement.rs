@@ -9,7 +9,6 @@ use crate::{
         proof::hash,
     },
 };
-use nabedra_oltp_types::queue::RecordVersion;
 use uuid::Uuid;
 
 pub(crate) use nabedra_oltp_types::queue::{ScopedTerminalStatement, ScopedTimestampEpoch};

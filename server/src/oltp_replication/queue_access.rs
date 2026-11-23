@@ -209,7 +209,7 @@ impl JoinObservation {
         }
         Ok(JoinObservation {
             worker: *worker,
-            statement: statement.as_ref().clone(),
+            statement: **statement,
             nonce: *nonce,
         })
     }

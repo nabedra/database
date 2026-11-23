@@ -1799,24 +1799,11 @@ def activation_boundary(test_executable):
 
 def run_native_assertions(test_executable, cases):
     """Run exact production-library assertions and retain their libtest output."""
-    executables = dict.fromkeys(
-        os.path.abspath(path) for path in (
-            test_executable, os.environ.get('NABEDRA_RESOURCES_TEST_EXE'),
-            os.environ.get('NABEDRA_TRANSPORT_TEST_EXE'),
-        ) if path
-    )
-    names = {}
-    for executable in executables:
-        listed = subprocess.check_output([executable, '--list'], text=True, timeout=15)
-        for line in listed.splitlines():
-            if line.endswith(': test'):
-                name = line.removesuffix(': test')
-                names.setdefault(name.rsplit('::', 1)[-1], []).append((executable, name))
+    listed = subprocess.check_output([test_executable, '--list'], text=True, timeout=15)
+    names = [line.removesuffix(': test') for line in listed.splitlines() if line.endswith(': test')]
     for case in cases:
-        matches = names.get(case, [])
-        assert len(matches) == 1, f'{case}: expected one native test in {list(executables)}, found {matches}'
-        executable, name = matches[0]
-        result = subprocess.run([executable, '--exact', name, '--nocapture'],
+        name, = [name for name in names if name.rsplit('::', 1)[-1] == case]
+        result = subprocess.run([test_executable, '--exact', name, '--nocapture'],
                                 capture_output=True, text=True, timeout=90)
         print(result.stdout, end='', flush=True)
         print(result.stderr, end='', file=sys.stderr, flush=True)
