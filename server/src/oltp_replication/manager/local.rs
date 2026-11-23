@@ -18,9 +18,9 @@ pub(crate) use registered::{
     GroupPlacement, RegisteredConfig, RegisteredSystemGroups, RegisteredWorker, SystemPlacement,
 };
 pub(crate) use restore::RegisteredRestoreConfig;
+use nabedra_rt::fs::os::{File, OpenOptions, self as fs};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -98,15 +98,8 @@ impl LocalWorker {
     ) -> Result<Self, ProtocolError> {
         let database = Text::try_from(database).map_err(|_| invalid())?;
         let ownership = Arc::new(lock_directory(path)?);
-        if ownership
-            .path
-            .join("RESTORE_IN_PROGRESS.json")
-            .symlink_metadata()
-            .is_ok()
-            && !ownership
-                .path
-                .join("RESTORED_GENESIS.json")
-                .symlink_metadata()
+        if fs::symlink_metadata(ownership.path.join("RESTORE_IN_PROGRESS.json")).is_ok()
+            && !fs::symlink_metadata(ownership.path.join("RESTORED_GENESIS.json"))
                 .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
         {
             return Err(invalid());
@@ -203,8 +196,8 @@ fn topology(owner: &DirectoryOwner, database: &Text<128>) -> Result<LocalTopolog
                 // The pool's store exists: `pool/kv/CURRENT` (format 2). A format 1
                 // `pool/CURRENT` (previous engine) passes here so the pool open refuses it with
                 // a clear unsupported-format error (NS22).
-                || !(path.join("pool").join("kv").join("CURRENT").is_file()
-                    || path.join("pool").join("CURRENT").is_file())
+                || !(fs::metadata(path.join("pool/kv/CURRENT")).is_ok_and(|meta| meta.is_file())
+                    || fs::metadata(path.join("pool/CURRENT")).is_ok_and(|meta| meta.is_file()))
                 || t.format != 1
                 || t.database != *database
                 || t.node_id == 0
@@ -229,7 +222,9 @@ fn topology(owner: &DirectoryOwner, database: &Text<128>) -> Result<LocalTopolog
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // A legacy RF1 directory must be migrated explicitly, never opened
             // as an unrelated empty typed database alongside committed data.
-            if path.join("NABEDRA_OLTP.json").exists() || path.join("CURRENT").exists() {
+            if fs::try_exists(path.join("NABEDRA_OLTP.json")).unwrap_or(false)
+                || fs::try_exists(path.join("CURRENT")).unwrap_or(false)
+            {
                 return Err(ProtocolError::new(
                     ErrorCode::ValidationError,
                     "legacy OLTP directory requires explicit migration to typed groups",
@@ -257,9 +252,7 @@ fn topology(owner: &DirectoryOwner, database: &Text<128>) -> Result<LocalTopolog
             let mut output = private_file(&file, true).map_err(storage)?;
             output.write_all(&bytes).map_err(storage)?;
             output.sync_all().map_err(storage)?;
-            File::open(path)
-                .and_then(|f| f.sync_all())
-                .map_err(storage)?;
+            fs::sync_dir(path).map_err(storage)?;
             Ok(t)
         }
         Err(error) => Err(storage(error)),
@@ -267,12 +260,11 @@ fn topology(owner: &DirectoryOwner, database: &Text<128>) -> Result<LocalTopolog
 }
 #[cfg(unix)]
 fn lock_directory(path: &Path) -> Result<DirectoryOwner, ProtocolError> {
-    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
     fs::create_dir_all(path).map_err(storage)?;
     let meta = fs::symlink_metadata(path).map_err(storage)?;
     if !meta.is_dir()
         || meta.file_type().is_symlink()
-        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.uid() != fs::euid()
         || meta.mode() & 0o022 != 0
     {
         return Err(invalid());
@@ -281,7 +273,7 @@ fn lock_directory(path: &Path) -> Result<DirectoryOwner, ProtocolError> {
     if !lock.metadata().map_err(storage)?.is_file() {
         return Err(invalid());
     }
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if !lock.try_lock_exclusive().unwrap_or(false) {
         return Err(ProtocolError::new(
             ErrorCode::Conflict,
             "another local OLTP process owns this data directory",
@@ -307,7 +299,6 @@ fn private_file(path: &Path, new: bool) -> std::io::Result<File> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         options
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
@@ -319,7 +310,6 @@ fn bounded_read(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
     options.read(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
@@ -337,8 +327,7 @@ fn bounded_read(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
 fn private_directory(path: &Path) -> Result<(), ProtocolError> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(storage)?;
+        fs::set_mode(path, 0o700).map_err(storage)?;
     }
     Ok(())
 }
@@ -410,7 +399,15 @@ fn development_tls(path: &Path) -> Result<TlsMaterial, ProtocolError> {
     .map_err(storage)
 }
 fn openssl(path: &Path, args: &[&str]) -> Result<(), ProtocolError> {
-    let log = private_file(&path.join("openssl.log"), false).map_err(storage)?;
+    // The host child needs a real descriptor for stderr.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let log = options.open(path.join("openssl.log")).map_err(storage)?;
     log.set_len(0).map_err(storage)?;
     let mut child = Command::new("openssl")
         .args(args)
@@ -455,7 +452,6 @@ fn storage(error: std::io::Error) -> ProtocolError {
 
 #[cfg(unix)]
 fn directory_identity(owner: &DirectoryOwner) -> Result<(u64, u64, u64, u64), ProtocolError> {
-    use std::os::unix::fs::MetadataExt;
     let directory = fs::metadata(&owner.path).map_err(storage)?;
     let lock = owner._lock.metadata().map_err(storage)?;
     Ok((directory.dev(), directory.ino(), lock.dev(), lock.ino()))
@@ -472,5 +468,5 @@ fn replace_topology(path: &Path, topology: &LocalTopology) -> Result<(), Protoco
     file.sync_all().map_err(storage)?;
     drop(file);
     fs::rename(&next, path.join("NABEDRA_TYPED_WORKER.json")).map_err(storage)?;
-    File::open(path).and_then(|f| f.sync_all()).map_err(storage)
+    fs::sync_dir(path).map_err(storage)
 }

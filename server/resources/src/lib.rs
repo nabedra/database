@@ -3,6 +3,7 @@
 use nabedra_protocol::protocol;
 
 pub mod config;
+pub mod decode_budget;
 #[doc(hidden)]
 pub mod memory;
 pub mod partition_size;

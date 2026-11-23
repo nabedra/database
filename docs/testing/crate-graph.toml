@@ -112,7 +112,7 @@ crate = "nabedra_oltp_replication"
 # Case 6: every `impl ...Proof for` block lives in the replication crate, so lower crates can take
 # a proof by trait but never forge one. The case runs once `requires` exists.
 [proofs]
-requires = "server/oltp-replication/Cargo.toml"
+requires = "server/oltp-replication/src/oltp_replication/mod.rs"
 allowed = ["server/oltp-replication/"]
 scan = ["server"]
 

@@ -28,6 +28,7 @@ const MAX_PEM_BYTES: usize = 128 << 10;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(all(test, feature = "sim"), derive(Hash))]
 pub(super) struct Endpoint {
     pub host: String,
     pub port: u16,
@@ -70,14 +71,28 @@ pub(super) struct TlsConfig {
     pub private_key: PathBuf,
 }
 
+#[cfg(not(feature = "sim"))]
+type TlsBackend<T> = T;
+#[cfg(feature = "sim")]
+type TlsBackend<T> = Option<T>;
+
 #[derive(Clone)]
 pub(super) struct PeerTls {
-    server: TlsAcceptor,
-    client: TlsConnector,
+    server: TlsBackend<TlsAcceptor>,
+    client: TlsBackend<TlsConnector>,
     pub fingerprint: Fingerprint,
 }
 
 impl PeerTls {
+    #[cfg(all(test, feature = "sim"))]
+    pub fn sim(fingerprint: Fingerprint) -> Self {
+        Self {
+            server: None,
+            client: None,
+            fingerprint,
+        }
+    }
+
     pub fn load(config: &TlsConfig, root: &Path) -> io::Result<Self> {
         let chain = read_certs(&root.join(&config.certificate))?;
         let fingerprint = digest(&chain[0]);
@@ -106,9 +121,13 @@ impl PeerTls {
             .with_root_certificates(roots)
             .with_client_auth_cert(chain, key)
             .map_err(io::Error::other)?;
+        let server = TlsAcceptor::from(Arc::new(server));
+        let client = TlsConnector::from(Arc::new(client));
+        #[cfg(feature = "sim")]
+        let (server, client) = (Some(server), Some(client));
         Ok(Self {
-            server: TlsAcceptor::from(Arc::new(server)),
-            client: TlsConnector::from(Arc::new(client)),
+            server,
+            client,
             fingerprint,
         })
     }
@@ -122,7 +141,10 @@ impl PeerTls {
             let (stream, fingerprint) = match peer {
                 Conn::Tcp(stream) => {
                     stream.set_nodelay(true)?;
-                    let tls = self.client.connect(name, stream).await?;
+                    let client = &self.client;
+                    #[cfg(feature = "sim")]
+                    let client = client.as_ref().ok_or_else(|| invalid("missing TCP client TLS"))?;
+                    let tls = client.connect(name, stream).await?;
                     let fingerprint = peer_fingerprint(tls.get_ref().1.peer_certificates())?;
                     #[cfg(feature = "sim")]
                     let tls = Established::Real(tls);
@@ -216,7 +238,7 @@ where
 
 async fn serve_session<H, R>(
     socket: Conn,
-    acceptor: TlsAcceptor,
+    acceptor: TlsBackend<TlsAcceptor>,
     limit: usize,
     handler: &H,
 ) -> io::Result<()>
@@ -227,6 +249,8 @@ where
     let (mut socket, fingerprint) = match socket {
         Conn::Tcp(socket) => {
             socket.set_nodelay(true)?;
+            #[cfg(feature = "sim")]
+            let acceptor = acceptor.ok_or_else(|| invalid("missing TCP server TLS"))?;
             let tls = timeout(RPC_TIMEOUT, acceptor.accept(socket)).await??;
             let fingerprint = peer_fingerprint(tls.get_ref().1.peer_certificates())?;
             #[cfg(feature = "sim")]

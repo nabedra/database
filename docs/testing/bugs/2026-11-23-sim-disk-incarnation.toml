@@ -1,0 +1,14 @@
+id = "SIM-DISK-INCARNATION"
+title = "Old simulated tasks and filesystem handles could mutate a restarted node's disk"
+class = "fence-lifecycle-order"
+module = "sim"
+guarantees = ["LSM-G01", "OLTP-G01"]
+scenarios = ["NS04", "O11"]
+found_by = "review"
+found_date = "2026-11-23"
+lowest_regression = "sim::volumes::tests::immediate_restart_fences_a_cancelled_tasks_destructor"
+seed = 18
+why_not_caught = "The crash test awaited task cancellation before reopening disks, so the destructor only encountered the old halted image."
+invariant_added = "While a node is down or the caller belongs to an earlier incarnation, reject path operations on its mounted volumes. Require a fresh NodeFs after restart."
+fix_commits = ["5c12a6d994d81a7230970f833bf8d2901dfbfb0f"]
+revert_patch_ok = true

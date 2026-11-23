@@ -14,7 +14,7 @@ include = ["/src/", "/tests/", "/examples/", "/Cargo.lock", "/README.md", "/LICE
 
 [workspace]
 # `nabedra-kv` builds and tests alone: `cargo test -p nabedra-kv`.
-members = [".", "kv", "check", "rt", "protocol", "resources", "oltp-types", "transport", "sim"]
+members = [".", "kv", "check", "rt", "protocol", "resources", "oltp-types", "transport", "oltp-storage", "oltp-replication", "sim"]
 # Plain `cargo build` and `cargo test` here build only the server, as before `sim` joined.
 # The simulation crates are members but never default members: they enable
 # `nabedra-rt/sim`, which `src/main.rs` refuses to compile. Name them with `-p`.
@@ -30,15 +30,15 @@ path = "src/main.rs"
 
 [features]
 default = ["olap", "s3"]
-olap = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:parquet"]
-oltp = ["dep:nabedra-oltp-types", "dep:nabedra-transport", "dep:nabedra-kv", "dep:openraft", "dep:tokio-rustls", "dep:socket2"]
+olap = ["dep:nabedra-protocol", "dep:nabedra-resources", "dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:parquet"]
+oltp = ["dep:nabedra-protocol", "dep:nabedra-resources", "dep:nabedra-oltp-types", "dep:nabedra-transport", "dep:nabedra-kv", "dep:openraft", "dep:tokio-rustls", "dep:socket2"]
 cache = ["nabedra-rt/net", "dep:clock-bound-client", "dep:hashbrown", "dep:smallvec", "dep:toml", "dep:openraft", "dep:tokio-rustls"]
 test-hooks = ["cache"]
 oltp-backup-s3 = ["oltp", "s3"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-http-client"]
 # Simulation builds of the library only (nabedra-rt deterministic runtime). src/main.rs
 # refuses to compile with it, so no simulation build produces a server binary.
-sim = ["nabedra-rt/sim", "nabedra-rt/sim-openraft"]
+sim = ["nabedra-rt/sim", "nabedra-rt/sim-openraft", "dep:nabedra-sim", "nabedra-kv?/sim"]
 
 [dependencies]
 ring = "=0.17.14"
@@ -71,10 +71,11 @@ socket2 = { version = "=0.6.5", optional = true }
 bytes = "=1.12.1"
 nabedra-kv = { path = "kv", version = "0.1.0", optional = true }
 nabedra-rt = { path = "rt", version = "0.1.0" }
-nabedra-protocol = { path = "protocol", version = "0.1.0" }
-nabedra-resources = { path = "resources", version = "0.1.0" }
+nabedra-protocol = { path = "protocol", version = "0.1.0", optional = true }
+nabedra-resources = { path = "resources", version = "0.1.0", optional = true }
 nabedra-oltp-types = { path = "oltp-types", version = "0.1.0", optional = true }
 nabedra-transport = { path = "transport", version = "0.1.0", optional = true }
+nabedra-sim = { path = "sim", version = "0.1.0", optional = true }
 hashbrown = { version = "=0.17.1", default-features = false, optional = true }
 smallvec = { version = "=1.16.5", optional = true }
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde"], optional = true }

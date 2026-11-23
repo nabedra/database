@@ -223,8 +223,9 @@ def summarize(samples: list[dict]) -> list[dict]:
     return rows
 
 
-def evaluate_rules(rebuilds: dict[str, dict], head_packages: set[str]) -> list[dict]:
-    """Check the head's rebuild sets. A rule whose packages do not exist on the head is n/a."""
+def evaluate_rules(rebuilds: dict[str, dict], head_packages: set[str],
+                   pending_owners: frozenset[str] = frozenset()) -> list[dict]:
+    """Check the head's rebuild sets once the relevant sources have moved."""
     results = []
     for rule in REBUILD_RULES:
         forbidden = [name for name in rule.forbidden if name in head_packages]
@@ -233,6 +234,8 @@ def evaluate_rules(rebuilds: dict[str, dict], head_packages: set[str]) -> list[d
         if rule.owner not in head_packages or not forbidden:
             missing = [rule.owner] if rule.owner not in head_packages else list(rule.forbidden)
             row.update(result="n/a", reason=f"not on the head yet: {', '.join(missing)}")
+        elif rule.owner in pending_owners:
+            row.update(result="n/a", reason=f"probe sources have yet to move into {rule.owner}")
         elif observed is None:
             row.update(result="fail", reason="the probe did not run")
         elif observed["owner"] != rule.owner:
@@ -327,6 +330,14 @@ class Tree:
             row["name"]: Path(row["manifest_path"]).parent.relative_to(self.path)
             for row in self.metadata["packages"] if row["id"] in members
         }
+
+    def pending_rebuild_owners(self) -> frozenset[str]:
+        workspace = set(self.metadata["workspace_members"])
+        return frozenset(
+            row["name"] for row in self.metadata["packages"]
+            if row["id"] in workspace
+            and (row.get("metadata") or {}).get("nabedra", {}).get("extraction-pending") is True
+        )
 
     def owner(self, relative: str) -> str:
         best, length = None, -1
@@ -622,7 +633,12 @@ def main(argv=None) -> int:
                 record["rebuild_sets"] = session.rebuilds
                 record["extras"] = session.extras
                 if "edit" in steps:
-                    rules = evaluate_rules(session.rebuilds.get("head", {}), set(trees["head"].packages))
+                    head_tree = trees["head"]
+                    rules = evaluate_rules(
+                        session.rebuilds.get("head", {}),
+                        set(head_tree.packages),
+                        head_tree.pending_rebuild_owners(),
+                    )
                     record["rebuild_rules"] = rules
                     for rule in rules:
                         print(f"nabedra-rebuild-rule: {rule['probe']} {rule['result']}"

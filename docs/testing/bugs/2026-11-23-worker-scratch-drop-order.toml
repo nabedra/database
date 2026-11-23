@@ -1,0 +1,14 @@
+id = "WORKER-SCRATCH-DROP-ORDER"
+title = "Working scratch released its worker before the scheduler charge"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G09"]
+scenarios = ["F03"]
+found_by = "review"
+found_date = "2026-11-23"
+lowest_regression = "memory::tests::f03_working_scratch_releases_scheduler_charge_before_worker_drop"
+seed = "unknown"
+why_not_caught = "The worker-lifetime test observed the final accounting state after the lease and worker had both dropped."
+invariant_added = "The final working scratch clone releases its scheduler charge before releasing the worker it retains."
+fix_commits = ["83d1f7975ffdee74210b91c169419e3b70902f5e"]
+revert_patch_ok = true

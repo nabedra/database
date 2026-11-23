@@ -298,6 +298,33 @@ mod in_a_world {
     }
 
     #[test]
+    fn spawn_in_aborts_before_polling_a_retired_incarnation() {
+        run(15, |world| async move {
+            world.add_node(1, NodeClock::default());
+            let mut set = task::JoinSet::new();
+            let ran = Arc::new(AtomicBool::new(false));
+            let ran_in_task = ran.clone();
+            in_node(1, async {
+                world.restart_with(1, crate::sim::volumes::Cut::Kill);
+                task::spawn_in(&mut set, async move {
+                    ran_in_task.store(true, Ordering::SeqCst);
+                });
+            })
+            .await;
+            let result = tokio::time::timeout(ms(1_000), set.join_next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                result.is_err_and(|error| error.is_cancelled()),
+                "the retired task joined the replacement node"
+            );
+            assert!(!ran.load(Ordering::SeqCst));
+            assert_eq!(world.live_tasks(1), 0);
+        });
+    }
+
+    #[test]
     fn spawn_blocking_on_runs_inline_in_the_node_context() {
         run(12, |world| async move {
             world.add_node(3, NodeClock::default());
@@ -359,4 +386,115 @@ mod in_a_world {
             assert_eq!(time::elapsed(world.start()), ms(1_000));
         });
     }
+}
+
+/// The product queue service: run waits on the doorbell where step would idle.
+struct Echo {
+    shared: Arc<(std::sync::Mutex<Vec<u32>>, crate::sync::Condvar)>,
+    seen: std::sync::mpsc::Sender<(Option<String>, u32)>,
+}
+
+impl task::Stepped for Echo {
+    fn step(&mut self) -> task::Step {
+        match self.shared.0.lock().unwrap().pop() {
+            Some(0) => task::Step::Exit,
+            Some(value) => {
+                self.seen.send((task::current_service(), value)).unwrap();
+                task::Step::Worked
+            }
+            None => task::Step::Idle(None),
+        }
+    }
+
+    fn doorbell(&self) -> &crate::sync::Condvar {
+        &self.shared.1
+    }
+
+    fn run(mut self) {
+        loop {
+            match self.step() {
+                task::Step::Exit => return,
+                task::Step::Worked => {}
+                task::Step::Idle(_) => {
+                    let guard = self.shared.0.lock().unwrap();
+                    let _guard = self.shared.1.wait_while(guard, |items| items.is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn stepped_services_are_named_threads_running_their_loop() {
+    let shared = Arc::new((
+        std::sync::Mutex::new(Vec::new()),
+        crate::sync::Condvar::new(),
+    ));
+    let (seen, received) = std::sync::mpsc::channel();
+    let handle = task::spawn_stepped(
+        "kv-journal",
+        256 * 1024,
+        Echo {
+            shared: Arc::clone(&shared),
+            seen,
+        },
+    )
+    .unwrap();
+    assert!(!handle.is_current());
+    shared.0.lock().unwrap().push(5);
+    shared.1.notify_one();
+    assert_eq!(received.recv().unwrap(), (Some("kv-journal".to_owned()), 5));
+    assert!(!handle.is_finished());
+    shared.0.lock().unwrap().push(0);
+    shared.1.notify_all();
+    handle.join().unwrap();
+    assert_eq!(
+        task::current_service(),
+        std::thread::current().name().map(str::to_owned)
+    );
+}
+
+#[test]
+fn drive_until_is_none_outside_a_world() {
+    let value = task::drive_until::<()>("product", || panic!("ready must not be called"));
+    assert_eq!(value, None);
+}
+
+#[test]
+fn spawn_oneshot_is_a_named_thread() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    task::spawn_oneshot("oltp-damage", 256 * 1024, move || {
+        sender.send(task::current_service()).unwrap();
+    })
+    .unwrap();
+    assert_eq!(receiver.recv().unwrap().as_deref(), Some("oltp-damage"));
+}
+
+#[test]
+fn condvar_forwards_to_std() {
+    let pair = Arc::new((std::sync::Mutex::new(false), crate::sync::Condvar::new()));
+    let (lock, condvar) = &*pair;
+    let guard = lock.lock().unwrap();
+    let (guard, timeout) = condvar
+        .wait_timeout(guard, Duration::from_millis(5))
+        .unwrap();
+    assert!(timeout.timed_out());
+    drop(guard);
+    let notifier = Arc::clone(&pair);
+    let thread = std::thread::spawn(move || {
+        *notifier.0.lock().unwrap() = true;
+        notifier.1.notify_all();
+    });
+    let guard = condvar
+        .wait_while(lock.lock().unwrap(), |ready| !*ready)
+        .unwrap();
+    assert!(*guard);
+    drop(guard);
+    thread.join().unwrap();
+    #[cfg(not(feature = "sim"))]
+    assert_eq!(
+        std::mem::size_of::<crate::sync::Condvar>(),
+        std::mem::size_of::<std::sync::Condvar>(),
+        "repr(transparent) in product"
+    );
 }

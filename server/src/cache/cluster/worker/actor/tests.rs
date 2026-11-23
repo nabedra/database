@@ -49,6 +49,39 @@ fn only(effect: Effect) -> Effects {
     effects
 }
 
+#[cfg(feature = "sim")]
+#[test]
+fn k03_slot_observation_does_not_advance_the_lease_clock() {
+    use nabedra_rt::sim::{self, EPOCH_MS, NodeClock};
+
+    sim::run(11, |world| async move {
+        world.add_node(1, NodeClock::default());
+        sim::in_node(1, async {
+            let config = config(node(1));
+            let mut actor = State::new(0, config).unwrap();
+            let mut shard = Shard::new(1, Role::Primary, true, config);
+            shard.lease = Some(Lease {
+                not_before_ms: EPOCH_MS,
+                expires_ms: EPOCH_MS + 2_000,
+            });
+            actor.slots.insert(0, shard);
+            actor.clock.now().unwrap();
+
+            // An observation at the forward step must not establish a new floor
+            // for the actor's subsequent reads when the step is undone.
+            world.jump_wall_forward(1, Duration::from_secs(3));
+            assert!(!actor.sample(0).unwrap().authorized);
+            world.jump_wall_backward(1, Duration::from_secs(3));
+            let now = actor
+                .clock
+                .now()
+                .expect("observation changed clock rollback state");
+            assert!(actor.slots[&0].authorized(now));
+        })
+        .await;
+    });
+}
+
 #[test]
 fn k03_final_lease_check_never_publishes_staged_mutation() {
     let config = config(node(1));
@@ -569,5 +602,98 @@ fn k02_k03_full_slot_can_pin_and_install_bounded_snapshot() {
             destination.store.prepare(&get, 5_100, config.turns).reply(),
             Reply::Bulk(None)
         ));
+    }
+}
+
+/// Drives the real actor one turn at a time under its node clock.
+#[cfg(feature = "sim")]
+pub(in crate::cache::cluster) struct LeaseActorFixture(State);
+
+#[cfg(feature = "sim")]
+impl LeaseActorFixture {
+    pub fn new(id: WorkerId) -> Self {
+        Self(
+            State::new(
+                0,
+                ActorConfig {
+                    clock: ClockMode::ClockBound,
+                    ..config(id)
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    pub fn install_topology(&mut self, topology: Topology) {
+        let grants = vec![None; topology.slots.len()];
+        self.0.install(Arc::new(topology), &grants);
+    }
+
+    pub fn install_update(&mut self, update: crate::cache::cluster::protocol::Update) {
+        assert_eq!(update.worker, self.0.config.id);
+        let topology = update.topology.expect("the controller sends its topology");
+        let mut grants = vec![None; topology.slots.len()];
+        for grant in update.grants {
+            for slot in grant.range.first..=grant.range.last {
+                let slot = usize::from(slot);
+                assert_eq!(topology.slots[slot].primary, Some(update.worker));
+                assert_eq!(topology.slots[slot].epoch, grant.range.epoch);
+                assert!(grants[slot].replace(grant.lease).is_none());
+            }
+        }
+        self.0.install(Arc::new(topology), &grants);
+    }
+
+    pub fn copy_first_write_from(&mut self, primary: &Self, slot: u16, epoch: u64) {
+        let source = primary.0.config.id;
+        self.0.apply(
+            source,
+            Packet {
+                slot,
+                epoch,
+                data: Data::Empty(0),
+            },
+        );
+        let effects = primary
+            .0
+            .journal
+            .get(slot, epoch, 1)
+            .expect("the primary published its first write")
+            .clone();
+        let mut digest = Sha256::new();
+        hash_effects(&effects, &mut digest);
+        self.0.apply(
+            source,
+            Packet {
+                slot,
+                epoch,
+                data: Data::Delta {
+                    sequence: 1,
+                    effects,
+                    digest: digest.finalize().into(),
+                },
+            },
+        );
+        assert_eq!(self.0.slots[&slot].sequence, 1);
+        assert!(self.0.slots[&slot].baseline);
+    }
+
+    pub fn progress(&mut self, slot: u16) -> Progress {
+        self.0
+            .progress(false, None, 0)
+            .slots
+            .into_iter()
+            .find(|progress| progress.slot == slot)
+            .expect("the actor owns the slot")
+    }
+
+    pub fn write(&mut self, key: &'static [u8], value: &'static [u8], epoch: u64) -> Response {
+        self.0.execute(
+            key_slot(key),
+            self.0.topology.generation,
+            epoch,
+            time::now_std(),
+            &set(Bytes::from_static(key), Bytes::from_static(value)),
+        )
     }
 }

@@ -18,6 +18,7 @@ pub mod fs;
 pub mod ids;
 #[cfg(feature = "net")]
 pub mod net;
+pub mod sync;
 pub mod task;
 pub mod time;
 

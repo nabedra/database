@@ -29,9 +29,11 @@ COPY server/protocol/Cargo.toml ./protocol/
 COPY server/resources/Cargo.toml ./resources/
 COPY server/oltp-types/Cargo.toml ./oltp-types/
 COPY server/transport/Cargo.toml ./transport/
+COPY server/oltp-storage/Cargo.toml ./oltp-storage/
+COPY server/oltp-replication/Cargo.toml ./oltp-replication/
 COPY server/sim/Cargo.toml ./sim/
-RUN mkdir -p src kv/src check/src rt/src protocol/src resources/src oltp-types/src transport/src sim/src tests examples /out/timings && \
-    echo 'fn main() {}' > src/main.rs && : > src/lib.rs && : > kv/src/lib.rs && : > check/src/lib.rs && : > rt/src/lib.rs && : > protocol/src/lib.rs && : > resources/src/lib.rs && : > oltp-types/src/lib.rs && : > transport/src/lib.rs && : > sim/src/lib.rs && \
+RUN mkdir -p src kv/src check/src rt/src protocol/src resources/src oltp-types/src transport/src oltp-storage/src oltp-replication/src sim/src tests examples /out/timings && \
+    echo 'fn main() {}' > src/main.rs && : > src/lib.rs && : > kv/src/lib.rs && : > check/src/lib.rs && : > rt/src/lib.rs && : > protocol/src/lib.rs && : > resources/src/lib.rs && : > oltp-types/src/lib.rs && : > transport/src/lib.rs && : > oltp-storage/src/lib.rs && : > oltp-replication/src/lib.rs && : > sim/src/lib.rs && \
     awk -F'"' '/^\[\[(test|example)\]\]/ { dir = ($0 ~ /test/) ? "tests" : "examples"; next } \
                /^\[/ { dir = "" } \
                dir != "" && /^name *=/ { print dir "/" $2 ".rs" }' Cargo.toml | xargs -r touch && \

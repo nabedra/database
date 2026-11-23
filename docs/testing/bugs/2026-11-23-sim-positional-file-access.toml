@@ -1,0 +1,14 @@
+id = "SIM-POSITIONAL-FILE-ACCESS"
+title = "Simulated positional I/O ignored descriptor access and Linux append semantics"
+class = "other"
+module = "testing"
+guarantees = ["OLTP-G01"]
+scenarios = ["NS04"]
+found_by = "review"
+found_date = "2026-11-23"
+lowest_regression = "sim::volumes::tests::fs_os_on_a_volume_matches_the_host_transcript"
+seed = 1
+why_not_caught = "The host comparison exercised positional I/O only on a read-write descriptor without append mode."
+invariant_added = "Positional I/O on a simulated descriptor matches the host access errors and Linux O_APPEND writes append without moving the cursor."
+fix_commits = ["9833c212466a6578b39a1ffe9a360b4eb10e796d"]
+revert_patch_ok = true

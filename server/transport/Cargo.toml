@@ -3,13 +3,28 @@ name = "nabedra-transport"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94.1"
-description = "Authenticated peer transport for Nabedra"
 license = "MIT"
 repository = "https://github.com/zPy52/nabedra-database"
 publish = ["crates-io"]
+description = "Nabedra OLTP peer transport"
+
+[package.metadata.nabedra]
+extraction-pending = true
+
+[features]
+sim = ["nabedra-rt/sim"]
 
 [dependencies]
-rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+nabedra-rt = { path = "../rt", version = "0.1.0" }
+nabedra-protocol = { path = "../protocol", version = "0.1.0" }
+nabedra-resources = { path = "../resources", version = "0.1.0" }
+nabedra-oltp-types = { path = "../oltp-types", version = "0.1.0" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.154", features = ["raw_value", "arbitrary_precision"] }
 sha2 = "=0.11.1"
-tokio = { version = "=1.54.1", default-features = false, features = ["net"] }
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal", "io-util"] }
+tracing = "=0.1.44"
+uuid = { version = "=1.29.2", features = ["serde", "v4"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+socket2 = "=0.6.5"
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["tls12", "ring"] }

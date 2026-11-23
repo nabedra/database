@@ -18,6 +18,12 @@ use crate::{
     scheduling::MemoryCharge,
 };
 
+mod worker;
+
+pub use worker::{ExecutionClass, GroupCapacityLease, WorkerMemory};
+#[cfg(feature = "test-hooks")]
+pub use worker::{GROUP_ENDPOINT_BYTES, GROUP_HANDLE_BYTES};
+
 pub const RAFT_REPLICA_BYTES: usize = 8 << 20;
 
 pub const DEFAULT_REPLY_DECODE_BYTES: usize = 1 << 20;
@@ -62,6 +68,110 @@ impl Default for SharedResourceConfig {
             max_group_handles: 128,
             max_resident_groups: 64,
             precharge_group_capacity: false,
+        }
+    }
+}
+
+/// Choose this from the authenticated endpoint role. Queue/data payloads must
+/// never consume Progress, which keeps small authority/settlement exchanges live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ByteClass {
+    Progress,
+    Data,
+}
+pub struct ScratchLease {
+    backing: ScratchBacking,
+}
+enum ScratchBacking {
+    Arena(ByteReservation),
+    Combined {
+        parts: [Arc<ScratchLease>; 2],
+        owner: Arc<dyn Any + Send + Sync>,
+    },
+    Working {
+        charge: Mutex<MemoryCharge>,
+        counter: Arc<AtomicUsize>,
+        owner: Arc<dyn Any + Send + Sync>,
+    },
+}
+impl ScratchLease {
+    #[inline]
+    fn arena(charge: ByteReservation) -> Self {
+        Self {
+            backing: ScratchBacking::Arena(charge),
+        }
+    }
+
+    #[inline]
+    fn working(
+        owner: Arc<dyn Any + Send + Sync>,
+        charge: MemoryCharge,
+        counter: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            backing: ScratchBacking::Working {
+                charge: Mutex::new(charge),
+                counter,
+                owner,
+            },
+        }
+    }
+
+    fn combined(owner: Arc<dyn Any + Send + Sync>, parts: [Arc<Self>; 2]) -> Self {
+        Self {
+            backing: ScratchBacking::Combined { parts, owner },
+        }
+    }
+
+    fn belongs_to(&self, owner: &Arc<dyn Any + Send + Sync>) -> bool {
+        match &self.backing {
+            ScratchBacking::Arena(charge) => Arc::ptr_eq(&charge._owner, owner),
+            ScratchBacking::Combined {
+                owner: retained, ..
+            }
+            | ScratchBacking::Working {
+                owner: retained, ..
+            } => Arc::ptr_eq(retained, owner),
+        }
+    }
+
+    /// Only a codec with a checked aggregate retained-heap bound may release
+    /// unused decode scratch. Every clone observes the same smaller charge.
+    #[doc(hidden)]
+    pub fn shrink_unused(&self, bytes: usize) -> Result<(), ProtocolError> {
+        let ScratchBacking::Working {
+            charge, counter, ..
+        } = &self.backing
+        else {
+            return Err(capacity());
+        };
+        let mut charge = charge.lock().map_err(|_| capacity())?;
+        let old = charge.bytes() as usize;
+        charge.shrink_to(bytes as u64)?;
+        counter.fetch_sub(old - bytes, Ordering::AcqRel);
+        Ok(())
+    }
+
+    pub fn bytes(&self) -> usize {
+        match &self.backing {
+            ScratchBacking::Arena(charge) => charge.remaining(),
+            ScratchBacking::Combined { parts, .. } => parts.iter().map(|part| part.bytes()).sum(),
+            ScratchBacking::Working { charge, .. } => {
+                charge.lock().expect("scratch charge").bytes() as usize
+            }
+        }
+    }
+}
+impl Drop for ScratchLease {
+    fn drop(&mut self) {
+        if let ScratchBacking::Working {
+            charge, counter, ..
+        } = &mut self.backing
+        {
+            counter.fetch_sub(
+                charge.get_mut().expect("scratch charge").bytes() as usize,
+                Ordering::AcqRel,
+            );
         }
     }
 }
@@ -160,6 +270,7 @@ impl ByteArena {
         if bytes == 0 {
             return self.reserve(0);
         }
+        let owner = self.owner(bytes)?;
         let ticket = {
             let mut allocation = self.allocation.lock().map_err(|_| capacity())?;
             if self.closed.load(Ordering::Acquire) {
@@ -168,6 +279,17 @@ impl ByteArena {
             let next = allocation.next.checked_add(1).ok_or_else(capacity)?;
             allocation.pending.try_reserve(1).map_err(|_| capacity())?;
             allocation.next = next;
+            // With no queued waiter to age or bypass, this request can take
+            // the same first-fit grant while it already holds the lock.
+            if allocation.pending.is_empty()
+                && bytes <= self.capacity - self.used.load(Ordering::Acquire)
+                && !self.closed.load(Ordering::Acquire)
+            {
+                self.used.fetch_add(bytes, Ordering::AcqRel);
+                drop(allocation);
+                self.settled.notify_waiters();
+                return Ok(self.reservation(bytes, owner));
+            }
             allocation.pending.push_back(ArenaWaiter {
                 ticket: next,
                 bytes,
@@ -186,16 +308,41 @@ impl ByteArena {
             if self.closed.load(Ordering::Acquire) {
                 return Err(capacity());
             }
-            if let Ok(reservation) = self.reserve_ticket(bytes, Some(ticket)) {
+            if self.reserve_ticket(bytes, Some(ticket)).is_ok() {
                 waiting.active = false;
-                return Ok(reservation);
+                return Ok(self.reservation(bytes, owner));
             }
             notified.await;
         }
     }
+    #[inline]
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<ByteReservation, ProtocolError> {
-        self.reserve_ticket(bytes, None)
+        let owner = self.owner(bytes)?;
+        self.reserve_ticket(bytes, None)?;
+        Ok(self.reservation(bytes, owner))
     }
+
+    #[inline]
+    fn owner(&self, bytes: usize) -> Result<Arc<dyn Any + Send + Sync>, ProtocolError> {
+        self.worker
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| self.reservation_error(bytes, "owner unavailable"))
+    }
+
+    #[inline]
+    fn reservation(
+        self: &Arc<Self>,
+        bytes: usize,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> ByteReservation {
+        ByteReservation {
+            arena: self.clone(),
+            _owner: owner,
+            remaining: bytes,
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn oldest_waiter_bypasses(&self) -> Option<u32> {
         self.allocation
@@ -206,29 +353,23 @@ impl ByteArena {
             .map(|waiter| waiter.bypassed)
     }
 
-    fn reserve_ticket(
-        self: &Arc<Self>,
-        bytes: usize,
-        ticket: Option<u64>,
-    ) -> Result<ByteReservation, ProtocolError> {
-        let unavailable = |reason: &str| {
-            capacity_context(format!(
-                "byte arena {reason} requested={bytes} used={} capacity={} waiting={}",
-                self.used.load(Ordering::Acquire),
-                self.capacity,
-                self.waiting.load(Ordering::Acquire)
-            ))
-        };
-        let waiting = |reason: &str| {
+    #[cold]
+    fn reservation_error(&self, bytes: usize, reason: &str) -> ProtocolError {
+        capacity_context(format!(
+            "byte arena {reason} requested={bytes} used={} capacity={} waiting={}",
+            self.used.load(Ordering::Acquire),
+            self.capacity,
+            self.waiting.load(Ordering::Acquire)
+        ))
+    }
+
+    fn reserve_ticket(&self, bytes: usize, ticket: Option<u64>) -> Result<(), ProtocolError> {
+        let unavailable = |reason| self.reservation_error(bytes, reason);
+        let waiting = |reason| {
             let mut error = unavailable(reason);
             error.code = ErrorCode::Overloaded;
             error
         };
-        let owner = self
-            .worker
-            .get()
-            .and_then(Weak::upgrade)
-            .ok_or_else(|| unavailable("owner unavailable"))?;
         let mut allocation = self
             .allocation
             .lock()
@@ -292,11 +433,7 @@ impl ByteArena {
         self.used.fetch_add(bytes, Ordering::AcqRel);
         drop(allocation);
         self.settled.notify_waiters();
-        Ok(ByteReservation {
-            arena: self.clone(),
-            _owner: owner,
-            remaining: bytes,
-        })
+        Ok(())
     }
 }
 struct ByteWaiter {
@@ -390,6 +527,7 @@ impl ByteReservation {
     pub fn remaining(&self) -> usize {
         self.remaining
     }
+    #[inline]
     pub fn split(&mut self, bytes: usize) -> Result<Self, ProtocolError> {
         self.remaining = self.remaining.checked_sub(bytes).ok_or_else(capacity)?;
         Ok(Self {
@@ -414,6 +552,7 @@ impl ByteReservation {
             _charge: charge,
         })))
     }
+    #[inline]
     pub fn copy(&mut self, bytes: &[u8]) -> Result<ChargedBytes, ProtocolError> {
         let charge = self.split(bytes.len())?;
         let mut data = Vec::new();
@@ -465,6 +604,7 @@ struct ChargedData {
 #[derive(Clone)]
 pub struct ChargedBytes(Arc<ChargedData>);
 impl ChargedBytes {
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
         &self.0.data
     }
@@ -552,6 +692,41 @@ impl io::Write for CountingWriter {
 mod tests {
     use super::*;
     use crate::{config::WorkerResources, scheduling::ResourceScheduler};
+
+    #[test]
+    fn f03_working_scratch_releases_scheduler_charge_before_worker_drop() {
+        struct Owner {
+            scheduler: ResourceScheduler,
+            bytes_at_drop: Arc<AtomicUsize>,
+        }
+
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.bytes_at_drop
+                    .store(self.scheduler.usage()[0].2 as usize, Ordering::Release);
+            }
+        }
+
+        let scheduler = ResourceScheduler::new(vec![(1, WorkerResources::default())]).unwrap();
+        let bytes_at_drop = Arc::new(AtomicUsize::new(usize::MAX));
+        let owner = Arc::new(Owner {
+            scheduler: scheduler.clone(),
+            bytes_at_drop: bytes_at_drop.clone(),
+        });
+        let weak = Arc::downgrade(&owner);
+        let counter = Arc::new(AtomicUsize::new(1024));
+        let charge = scheduler.charge_memory(1, 1024).unwrap();
+        let scratch = Arc::new(ScratchLease::working(owner, charge, counter.clone()));
+        let clone = scratch.clone();
+
+        drop(scratch);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(scheduler.usage(), vec![(1, 0, 1024)]);
+        drop(clone);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        assert_eq!(bytes_at_drop.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn f03_last_buffer_releases_its_bytes_before_releasing_its_owner() {

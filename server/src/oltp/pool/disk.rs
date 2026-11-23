@@ -1,10 +1,10 @@
 //! Admission accounting for the filesystem behind a pool's journal.
 use crate::protocol::{ErrorCode, Outcome, ProtocolError};
 use nabedra_kv::journal::format::{BLOCK, RECORD_HEADER_LEN};
+use nabedra_rt::fs::os::File;
 use serde::Serialize;
 use std::{
     collections::HashMap,
-    fs::File,
     path::Path,
     sync::{Arc, Mutex, OnceLock, Weak},
 };
@@ -107,9 +107,6 @@ impl PoolDisk {
     }
 
     pub(super) fn open(path: &Path, segment_bytes: u64) -> Result<Self, ProtocolError> {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-
         let directory = File::open(path).map_err(|_| refused())?;
         #[cfg(unix)]
         let device = directory.metadata().map_err(|_| refused())?.dev();
@@ -222,15 +219,8 @@ pub(crate) struct DiskReservationStats {
 
 #[cfg(unix)]
 fn available_bytes(directory: &File) -> std::io::Result<u64> {
-    use std::os::fd::AsRawFd;
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: fstatvfs fills the buffer on success and borrows the open fd.
-    if unsafe { libc::fstatvfs(directory.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let stats = unsafe { stats.assume_init() };
-    #[allow(clippy::unnecessary_cast)]
-    Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+    let stats = directory.statvfs()?;
+    Ok(stats.available.saturating_mul(stats.block_size))
 }
 
 #[cfg(not(unix))]
