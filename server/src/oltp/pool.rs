@@ -266,15 +266,11 @@ impl OltpPool {
         identity.validate()?;
         super::native::validate_thread_defaults(shared.thread_budget())?;
         shared.bind_worker(identity.worker_id)?;
-        let pool_slot = shared
-            .pool_slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| capacity())?;
+        let pool_slot = shared.reserve_pool_slot()?;
         let overhead = shared.pool_overhead()?;
         open_pool_manifest(path, &identity, mount.is_some())?;
         let mut options =
-            storage::store_options(&shared.storage, fs, shared.config.write_buffer_bytes);
+            storage::store_options(&shared.storage, fs, shared.config().write_buffer_bytes);
         tune(&mut options);
         // KV's NodeFs routes by the volume's absolute path. The mount retains
         // the descriptor, which still anchors the pool's other filesystem calls.
