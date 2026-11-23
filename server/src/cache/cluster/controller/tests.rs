@@ -458,6 +458,74 @@ fn k03_repairs_a_replica_after_its_incarnation_retires() {
 }
 
 #[test]
+fn k03_replaces_a_retired_replica_before_resuming_same_zone_rebalance() {
+    let mut state = fixture();
+    let original = state.topology.slots[0];
+    let primary = original.primary.unwrap();
+    let retired = original.replica.unwrap();
+    let target = make_member(4, 1).id;
+    state.topology.workers.get_mut(&target.node).unwrap().zone =
+        state.topology.member(primary).unwrap().zone.clone();
+    assert!(matches!(
+        admin(
+            &mut state,
+            9,
+            Admin::Rebalance {
+                first: 0,
+                last: 0,
+                target: target.node
+            },
+            0
+        ),
+        Reply::Applied { .. }
+    ));
+    let mut observed = Observations::default();
+    let baseline = Progress {
+        slot: 0,
+        epoch: original.epoch,
+        sequence: 2,
+        baseline: true,
+        serving_primary: true,
+        frozen: None,
+    };
+    report(&mut observed, &state, primary, 1_000, Some(baseline));
+    report(&mut observed, &state, retired, 1_000, Some(baseline));
+    report(&mut observed, &state, target, 1_000, None);
+    assert!(state.reconcile(1_000, observed.plan(&state, bounds(1_000))));
+    assert_eq!(state.topology.slots[0].moving.unwrap().target, target);
+
+    let restarted = make_member(retired.node, 2);
+    assert!(matches!(
+        state.apply(
+            Command::Enroll {
+                member: restarted.clone(),
+                certificate: [retired.node as u8; 32],
+            },
+            true,
+        ),
+        Some(Reply::Applied { .. })
+    ));
+    report(&mut observed, &state, restarted.id, 1_010, None);
+    report(&mut observed, &state, target, 1_010, Some(baseline));
+    assert!(state.reconcile(1_010, observed.plan(&state, bounds(1_010))));
+    assert!(state.topology.slots[0].moving.is_none());
+    assert_eq!(state.topology.slots[0].primary, Some(primary));
+
+    assert!(state.reconcile(1_020, observed.plan(&state, bounds(1_020))));
+    let repair = state.topology.slots[0].moving.unwrap();
+    assert!(repair.replica_only);
+    assert_eq!(repair.target, restarted.id);
+    report(&mut observed, &state, restarted.id, 1_030, Some(baseline));
+    assert!(state.reconcile(1_030, observed.plan(&state, bounds(1_030))));
+    assert_eq!(state.topology.slots[0].replica, Some(restarted.id));
+
+    assert!(state.reconcile(1_040, observed.plan(&state, bounds(1_040))));
+    let move_again = state.topology.slots[0].moving.unwrap();
+    assert!(!move_again.replica_only);
+    assert_eq!(move_again.target, target);
+}
+
+#[test]
 fn k03_drain_keeps_current_replica_until_verified_replacement() {
     let mut state = fixture();
     let slot = state.topology.slots[0];

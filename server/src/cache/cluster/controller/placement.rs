@@ -432,7 +432,15 @@ impl<'a> Placement<'a> {
             {
                 return Some(step);
             }
-            if !moving.freeze_requested && !self.eligible(moving.target) && source.is_some() {
+            // An unfrozen owner can keep serving while its replica is
+            // repaired. Release a same-zone handoff whose third member
+            // retired. Its order stays pending and can resume after repair.
+            let cannot_keep_replica =
+                !moving.replica_only && !self.has_replica_zone(moving.target, slot);
+            if !moving.freeze_requested
+                && (!self.eligible(moving.target) || cannot_keep_replica)
+                && source.is_some()
+            {
                 return Some(Slot {
                     moving: None,
                     ..slot
@@ -584,10 +592,7 @@ impl<'a> Placement<'a> {
         let source = source?;
         if !moving.freeze_requested
             && close_enough(source, target)
-            && (self.distinct_zones(moving.target, slot.primary?)
-                || slot
-                    .replica
-                    .is_some_and(|id| self.distinct_zones(moving.target, id)))
+            && self.has_replica_zone(moving.target, slot)
         {
             return Some(Slot {
                 moving: Some(Move {
@@ -649,6 +654,13 @@ impl<'a> Placement<'a> {
             .member(primary)
             .zip(self.topo.member(replica))
             .is_some_and(|(primary, replica)| primary.zone != replica.zone)
+    }
+
+    fn has_replica_zone(&self, target: WorkerId, slot: Slot) -> bool {
+        [slot.primary, slot.replica]
+            .into_iter()
+            .flatten()
+            .any(|worker| self.distinct_zones(target, worker))
     }
 
     fn replica_for(&self, primary: WorkerId, old: Option<WorkerId>) -> Option<WorkerId> {
