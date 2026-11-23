@@ -707,6 +707,11 @@ jobs:
           lint -p nabedra-database --all-targets --no-default-features --features cache
           lint -p nabedra-database --all-targets --no-default-features --features cache,test-hooks
           lint -p nabedra-rt --all-targets
+          for crate in protocol resources oltp-types; do
+            if [ -f "$crate/Cargo.toml" ]; then
+              lint -p "nabedra-$crate" --all-targets
+            fi
+          done
       - name: Stage Cargo cache without workspace crates
         if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
         run: |
