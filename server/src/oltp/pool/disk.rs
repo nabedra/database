@@ -57,6 +57,28 @@ impl Filesystem {
     }
 }
 
+/// What one admission budget covers: a filesystem, by device id.
+#[cfg(not(feature = "sim"))]
+type BudgetKey = u64;
+#[cfg(not(feature = "sim"))]
+#[inline]
+fn budget_key(device: u64) -> BudgetKey {
+    device
+}
+
+/// In a simulation every node runs in this one process, usually on one real
+/// filesystem, and a sweep may run several worlds on parallel threads. Each
+/// simulated node gets its own budget, as a real node on its own machine has:
+/// the key is the installed world (by address, unique while it lives), the
+/// current node and the device.
+#[cfg(feature = "sim")]
+type BudgetKey = (usize, Option<u64>, u64);
+#[cfg(feature = "sim")]
+fn budget_key(device: u64) -> BudgetKey {
+    let world = nabedra_rt::sim::world().map_or(0, |world| Arc::as_ptr(&world) as usize);
+    (world, nabedra_rt::sim::current_node(), device)
+}
+
 pub(super) struct PoolDisk {
     device: u64,
     directory: File,
@@ -105,13 +127,13 @@ impl PoolDisk {
         let device = directory.metadata().map_err(|_| refused())?.dev();
         #[cfg(not(unix))]
         let device = 0;
-        static BUDGETS: OnceLock<Mutex<HashMap<u64, Weak<Filesystem>>>> = OnceLock::new();
+        static BUDGETS: OnceLock<Mutex<HashMap<BudgetKey, Weak<Filesystem>>>> = OnceLock::new();
         let mut budgets = BUDGETS
             .get_or_init(Mutex::default)
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         budgets.retain(|_, budget| budget.strong_count() != 0);
-        let slot = budgets.entry(device).or_default();
+        let slot = budgets.entry(budget_key(device)).or_default();
         let budget = slot.upgrade().unwrap_or_else(|| {
             let budget = Arc::new(Filesystem::default());
             *slot = Arc::downgrade(&budget);
@@ -245,5 +267,39 @@ mod tests {
             filesystem.reserve(charge, || Ok(protected)).err(),
             Some(refused())
         );
+    }
+
+    /// P10-DET: simulated nodes in one process never share a disk budget,
+    /// while pools of one node on one filesystem still do.
+    #[cfg(feature = "sim")]
+    #[test]
+    fn sim_nodes_have_separate_disk_budgets() {
+        let directory = std::env::temp_dir();
+        nabedra_rt::sim::run(7, |world| async move {
+            world.add_node(1, nabedra_rt::sim::NodeClock::default());
+            world.add_node(2, nabedra_rt::sim::NodeClock::default());
+            let open = |node| {
+                let directory = directory.clone();
+                world.spawn_node(
+                    node,
+                    async move { PoolDisk::open(&directory, 4096).unwrap() },
+                )
+            };
+            let (first, second, other) = (
+                open(1).await.unwrap(),
+                open(1).await.unwrap(),
+                open(2).await.unwrap(),
+            );
+            assert!(Arc::ptr_eq(&first.budget, &second.budget));
+            assert!(!Arc::ptr_eq(&first.budget, &other.budget));
+            assert_eq!(
+                first.stats().protected_bytes,
+                2 * 4096 * PROTECTED_SEGMENTS_PER_POOL
+            );
+            assert_eq!(
+                other.stats().protected_bytes,
+                4096 * PROTECTED_SEGMENTS_PER_POOL
+            );
+        });
     }
 }

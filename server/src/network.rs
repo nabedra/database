@@ -254,16 +254,18 @@ impl IdleRegistry {
     /// whose head is arriving, is never chosen.
     fn evict_oldest_idle(&self) -> bool {
         let connections = self.connections.lock().unwrap();
+        // Equal `since` (common under paused or simulated time) goes to the
+        // connection registered first, not to the map's hash order.
         let oldest = connections
-            .values()
-            .filter_map(|connection| {
+            .iter()
+            .filter_map(|(id, connection)| {
                 let state = connection.state.lock().unwrap();
                 match state.phase {
-                    Phase::Idle { since } if !state.evicted => Some((since, connection)),
+                    Phase::Idle { since } if !state.evicted => Some(((since, *id), connection)),
                     _ => None,
                 }
             })
-            .min_by_key(|(since, _)| *since);
+            .min_by_key(|(order, _)| *order);
         let Some((_, connection)) = oldest else {
             return false;
         };
@@ -923,6 +925,25 @@ mod keep_alive_tests {
         idle: Duration::from_secs(3),
         header_read: Duration::from_secs(1),
     };
+
+    /// P10-DET: among connections idle since the same instant, a full
+    /// listener evicts the one registered first, not one in hash order.
+    #[test]
+    fn idle_eviction_breaks_ties_by_registration_order() {
+        let registry = std::sync::Arc::new(IdleRegistry::default());
+        let trackers: Vec<IdleTracker> = (0..32)
+            .map(|_| registry.register(Duration::from_secs(1)))
+            .collect();
+        let since = nabedra_rt::time::now_std();
+        for tracker in &trackers {
+            tracker.phase.state.lock().unwrap().phase = Phase::Idle { since };
+        }
+        for tracker in &trackers {
+            assert!(registry.evict_oldest_idle());
+            assert!(tracker.phase.state.lock().unwrap().evicted);
+        }
+        assert!(!registry.evict_oldest_idle());
+    }
 
     /// PERF2e: the client-facing OLTP listeners keep an idle connection 30 s
     /// (the ORMs reuse one for at most 25 s) and give a request head 5 s.

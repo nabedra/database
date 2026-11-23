@@ -42,7 +42,7 @@ use crate::{
 use serde_json::value::RawValue;
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex, Weak},
     time::{Duration, UNIX_EPOCH},
 };
@@ -1707,7 +1707,10 @@ impl DirectExecutor {
         let handles: Vec<Arc<ParticipantHandle>> = {
             let mut served = self.served.lock().unwrap_or_else(|p| p.into_inner());
             served.retain(|_, handle| handle.strong_count() > 0);
-            let mut handles: HashMap<Uuid, Arc<ParticipantHandle>> = served
+            // Group id order, not hash order, so a simulation proposes the
+            // same DirectExpire sequence for the same seed. The passes are
+            // independent per group, so any order is valid.
+            let mut handles: BTreeMap<Uuid, Arc<ParticipantHandle>> = served
                 .iter()
                 .filter_map(|(group, handle)| Some((*group, handle.upgrade()?)))
                 .collect();

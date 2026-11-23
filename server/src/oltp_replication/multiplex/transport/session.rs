@@ -471,6 +471,15 @@ struct Waiters {
     streams: HashMap<u64, oneshot::Sender<Result<RawReply, RequestError>>>,
 }
 
+/// The waiters of a closing session, oldest stream first. Each gets the same
+/// error, so any order is valid; a fixed one lets a simulation seed wake
+/// their tasks in the same order every run.
+fn in_stream_order<T>(streams: HashMap<u64, T>) -> Vec<T> {
+    let mut streams: Vec<(u64, T)> = streams.into_iter().collect();
+    streams.sort_unstable_by_key(|&(stream_id, _)| stream_id);
+    streams.into_iter().map(|(_, waiter)| waiter).collect()
+}
+
 struct ClientSession {
     enrollment: WorkerEnrollment,
     identity: WorkerIdentity,
@@ -633,7 +642,7 @@ impl ClientSession {
             waiters.closed = true;
             std::mem::take(&mut waiters.streams)
         };
-        for waiter in streams.into_values() {
+        for waiter in in_stream_order(streams) {
             let _ = waiter.send(Err(RequestError::Unreachable));
         }
         self.closed.send_replace(true);
@@ -1009,7 +1018,12 @@ impl PeerSessions {
             .sum()
     }
     pub(super) fn close_all(&self) {
-        for slot in lock(&self.slots).values() {
+        // Key order, not hash order: closing a session wakes its waiters, so
+        // a simulation seed needs a fixed order. Any order is valid.
+        let slots = lock(&self.slots);
+        let mut slots: Vec<_> = slots.iter().collect();
+        slots.sort_unstable_by_key(|&(key, _)| *key);
+        for (_, slot) in slots {
             if let Some(session) = lock(&slot.current).take() {
                 session.close();
             }
@@ -1033,14 +1047,21 @@ impl PeerSessions {
         if let Some(slot) = slots.get(&key) {
             return slot.clone();
         }
-        // A new incarnation retires every lane of the previous one.
-        slots.retain(|&(worker, incarnation, _), slot| {
+        // A new incarnation retires every lane of the previous one. They
+        // close in key order, not hash order, as in `close_all`.
+        let mut retired = Vec::new();
+        slots.retain(|&slot_key, slot| {
+            let (worker, incarnation, _) = slot_key;
             let keep = worker != peer.worker_id || incarnation == peer.incarnation;
             if !keep && let Some(session) = lock(&slot.current).take() {
-                session.close();
+                retired.push((slot_key, session));
             }
             keep
         });
+        retired.sort_unstable_by_key(|&(slot_key, _)| slot_key);
+        for (_, session) in retired {
+            session.close();
+        }
         slots.entry(key).or_default().clone()
     }
     async fn route(
@@ -2021,5 +2042,16 @@ mod tests {
             free.iter().all(|&n| n == 1),
             "the handler slot was held while its reply was written: {free:?}"
         );
+    }
+
+    /// P10-DET: a closing session fails its waiters oldest stream first,
+    /// whatever the map's hash order, so their tasks wake in a fixed order.
+    #[test]
+    fn closing_session_fails_waiters_in_stream_order() {
+        let ids: Vec<u64> = (0..64).map(|i| (i * 7_919) % 1_009).collect();
+        let streams: HashMap<u64, u64> = ids.iter().map(|&id| (id, id)).collect();
+        let mut sorted = ids;
+        sorted.sort_unstable();
+        assert_eq!(in_stream_order(streams), sorted);
     }
 }
