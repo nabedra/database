@@ -1,4 +1,4 @@
-//! Nabedra's runtime seam: the clock, task spawning and ids.
+//! Nabedra's runtime seam: the clock, task spawning, ids and the filesystem ([`fs`]).
 //!
 //! Server code reaches tokio, std and uuid through these functions instead of calling
 //! them directly (`server/clippy.toml` bans the direct calls outside this crate). In a
@@ -14,6 +14,7 @@
 // This crate is the one place that makes the direct calls `server/clippy.toml` bans.
 #![allow(clippy::disallowed_methods)]
 
+pub mod fs;
 pub mod ids;
 #[cfg(feature = "net")]
 pub mod net;

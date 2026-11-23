@@ -1,10 +1,11 @@
-//! Every byte the engine reads or writes goes through [`Fs`], so tests can inject
-//! crashes, torn writes, bit flips and I/O errors (task NS1 owns `fault.rs`).
+//! The filesystem seam. Every byte nabedra-kv reads or writes goes through [`Fs`], so
+//! tests can inject crashes, torn writes, bit flips and I/O errors with [`FaultFs`].
+//! nabedra-kv re-exports this module as `nabedra_kv::fs`, so its paths are unchanged.
 //!
 //! Sync semantics: [`FsFile::sync_data`] is `fdatasync` on Linux and `F_FULLFSYNC` on
 //! Apple targets (what `std::fs::File::sync_data` does); [`FsFile::sync_all`] is `fsync`
-//! or `F_FULLFSYNC`. A sync that returns an error must never be retried: the caller
-//! latches [`crate::Error::RecoveryRequired`].
+//! or `F_FULLFSYNC`. A sync that returns an error must never be retried: nabedra-kv
+//! latches `Error::RecoveryRequired`.
 
 use std::any::Any;
 use std::io;

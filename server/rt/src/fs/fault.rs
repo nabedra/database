@@ -1123,12 +1123,20 @@ impl SplitMix {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Error;
 
     const S: usize = POWER_LOSS_SECTOR as usize;
 
     fn p(path: &str) -> PathBuf {
         PathBuf::from(path)
+    }
+
+    /// Whether `error` is the one an injected `kind` returns (EIO or ENOSPC on Unix).
+    fn is_error(error: &io::Error, kind: FaultError) -> bool {
+        let expected = kind.to_io();
+        match expected.raw_os_error() {
+            Some(code) => error.raw_os_error() == Some(code),
+            None => error.kind() == expected.kind(),
+        }
     }
 
     /// A filesystem with a durable `/db`.
@@ -1414,7 +1422,7 @@ mod tests {
         fs.inject(Fault::on(FsOp::Write).nth(2).error(FaultError::Enospc));
         file.write_all_at(b"1", 10).unwrap();
         let error = file.write_all_at(b"2", 11).unwrap_err();
-        assert_eq!(Error::from(error), Error::NoSpace);
+        assert!(is_error(&error, FaultError::Enospc), "{error:?}");
         file.write_all_at(b"3", 12).unwrap();
         assert_eq!(&fs.contents(&p("/db/f")).unwrap()[10..], b"1\x003");
 
@@ -1443,11 +1451,8 @@ mod tests {
                     FsOp::Open => fs.open(&p("/db/f"), OpenMode::Read).map(drop),
                     _ => unreachable!(),
                 };
-                let error = Error::from(result.unwrap_err());
-                match kind {
-                    FaultError::Eio => assert!(matches!(error, Error::Io(_)), "{op:?}"),
-                    FaultError::Enospc => assert_eq!(error, Error::NoSpace, "{op:?}"),
-                }
+                let error = result.unwrap_err();
+                assert!(is_error(&error, kind), "{op:?}: {error:?}");
                 let last = fs.calls().pop().unwrap();
                 assert_eq!((last.op, last.ok), (op, false));
                 // The failed call changed nothing.
@@ -1713,7 +1718,7 @@ mod tests {
         file.read_exact_at(&mut buf, 4608).unwrap();
         for at in [4096 - 511, 4096, 4096 + 511] {
             let err = file.read_exact_at(&mut buf, at).unwrap_err();
-            assert!(matches!(Error::from(err), Error::Io(_)), "{at}");
+            assert!(is_error(&err, FaultError::Eio), "{at}");
         }
         // Writes, syncs and other files never match a read fault.
         file.write_all_at(&[1; 10], 4096).unwrap();
