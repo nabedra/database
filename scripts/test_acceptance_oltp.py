@@ -1,5 +1,7 @@
 """Acceptance reporting must not convert missing assertions into a pass."""
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -13,6 +15,71 @@ import acceptance_oltp as acceptance
 
 
 class EssentialRunnerTests(unittest.TestCase):
+    def test_native_assertions_resolve_across_server_and_resources(self):
+        scenario = next(s for s in acceptance.SCENARIOS if s.id == 'O22')
+        passed = 'test result: ok. 1 passed; 0 failed; 0 ignored;'
+        with tempfile.TemporaryDirectory(prefix='nabedra-native-fixtures-') as directory:
+            root = Path(directory)
+            server, resources = root / 'server-tests', root / 'resources-tests'
+            runtime = acceptance.ROOT / 'server/tests'
+            fixture = (
+                'import sys\n'
+                f'sys.path.insert(0, {str(runtime)!r})\n'
+                'from oltp_runtime_acceptance import assertion, run_native_assertions\n'
+                "run_native_assertions(sys.argv[1], ['server_case', 'resource_case'])\n"
+                f"for clause in {scenario.clauses!r}:\n"
+                "    assertion('O22', clause, {'fixture': 'unit test'})\n"
+                f'print({passed!r})\n'
+            )
+            run_fixture = shlex.join([sys.executable, '-c', fixture])
+            server.write_text(
+                '#!/bin/sh\n'
+                'if [ "$1" = --list ]; then\n'
+                '    printf "%s\\n" "acceptance_o22: test" "runtime::server_case: test"\n'
+                'elif [ "$2" = acceptance_o22 ]; then\n'
+                f'    exec {run_fixture} "$0"\n'
+                'else\n'
+                '    test "$1:$2" = "--exact:runtime::server_case" || exit 1\n'
+                f'    printf "%s\\n" "$2" {shlex.quote(passed)}\n'
+                'fi\n'
+            )
+            server.chmod(0o700)
+
+            for selector, extra_listing, expected_error in [
+                ('resource_case', '', None),
+                ('resource_case', 'scheduler::server_case: test', 'server_case: expected one native test, found 2'),
+                ('other', '', 'resource_case: expected one native test, found 0'),
+            ]:
+                with self.subTest(error=expected_error):
+                    selector = f'scheduler::{selector}'
+                    listing = [f'{selector}: test', extra_listing]
+                    resources.write_text(
+                        '#!/bin/sh\n'
+                        f'if [ "$1" = --list ]; then printf "%s\\n" {shlex.join(listing)}; exit; fi\n'
+                        f'test "$1:$2" = "--exact:{selector}" || exit 1\n'
+                        f'printf "%s\\n" "$2" {shlex.quote(passed)}\n'
+                    )
+                    resources.chmod(0o700)
+                    output = root / 'report'
+                    result = subprocess.run(
+                        [sys.executable, acceptance.__file__, '--scenario', 'O22',
+                         '--test-binary', str(server), '--target-dir', str(root / 'target'),
+                         '--output', str(output)],
+                        env=os.environ | {'NABEDRA_RESOURCES_TEST_EXE': str(resources)},
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    log = (output / 'O22.log').read_text()
+                    self.assertEqual(result.returncode, int(expected_error is not None), log)
+                    if expected_error:
+                        self.assertIn(expected_error, log)
+                    else:
+                        self.assertIn('runtime::server_case\n', log)
+                        self.assertIn('scheduler::resource_case\n', log)
+                        self.assertIn('O22 passed: executed 4/4 clauses', result.stdout)
+                    report = json.loads((output / 'results.json').read_text())
+                    self.assertEqual(report['resources_test_binary_sha256'],
+                                     hashlib.sha256(resources.read_bytes()).hexdigest())
+
     def test_supporting_component_does_not_pass_a_missing_production_scenario(self):
         with tempfile.TemporaryDirectory(prefix='nabedra-runner-cli-') as directory:
             root = Path(directory)

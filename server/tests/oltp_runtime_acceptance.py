@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / 'scripts'), str(ROOT / 'orm/python/src')]
 from acceptance_nodes import announcement
 from acceptance_nabedra import child_pids, reaped
+from acceptance_oltp import RESOURCES_TEST_EXE, native_assertion_targets
 from nabedra import Database
 from nabedra._cli_config import protected_write
 from oltp_direct_cluster import Http, IDENTITY_FIELDS, Rf3Cluster, WORKERS, call, operation, write_json
@@ -1799,11 +1800,11 @@ def activation_boundary(test_executable):
 
 def run_native_assertions(test_executable, cases):
     """Run exact production-library assertions and retain their libtest output."""
-    listed = subprocess.check_output([test_executable, '--list'], text=True, timeout=15)
-    names = [line.removesuffix(': test') for line in listed.splitlines() if line.endswith(': test')]
-    for case in cases:
-        name, = [name for name in names if name.rsplit('::', 1)[-1] == case]
-        result = subprocess.run([test_executable, '--exact', name, '--nocapture'],
+    executables = [test_executable]
+    if resources := os.environ.get(RESOURCES_TEST_EXE):
+        executables.append(resources)
+    for executable, name in native_assertion_targets(executables, cases):
+        result = subprocess.run([executable, '--exact', name, '--nocapture'],
                                 capture_output=True, text=True, timeout=90)
         print(result.stdout, end='', flush=True)
         print(result.stderr, end='', file=sys.stderr, flush=True)
