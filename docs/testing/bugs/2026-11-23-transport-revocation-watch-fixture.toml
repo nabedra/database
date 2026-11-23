@@ -1,0 +1,14 @@
+id = "TRANSPORT-REVOCATION-WATCH-FIXTURE"
+title = "Periodic revocation polling could satisfy the watch fixture early"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17", "REP6"]
+found_by = "ci-flake"
+found_date = "2026-11-23"
+lowest_regression = "transport::tests::sessions::real::revoked_session_closes"
+seed = "unknown"
+why_not_caught = "The fixture checked the watch close counter but let the periodic directory scan race with the watch."
+invariant_added = "The receiver closes the authenticated session and refuses further requests when the directory sends a revocation notification with periodic polling suspended in the fixture."
+fix_commits = ["83b5668216a31cb83614e2b9390af81801221bda"]
+revert_patch_ok = true

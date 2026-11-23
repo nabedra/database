@@ -371,7 +371,8 @@ fn oltp_transport() -> u64 {
                         Purpose::ApiIngress,
                         resources[0].encode_in(ByteClass::Data, &value, 64).unwrap(),
                         std::array::from_fn(|_| None),
-                        4096,
+                        // The bounded JSON decoder charges 4096 bytes plus the raw header.
+                        8 << 10,
                     )
                     .await
                     .unwrap();
