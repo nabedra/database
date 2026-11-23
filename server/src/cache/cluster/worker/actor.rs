@@ -443,9 +443,11 @@ impl State {
     }
 
     #[cfg(feature = "sim")]
-    fn sample(&mut self, slot: u16) -> Option<SlotSample> {
+    fn sample(&self, slot: u16) -> Option<SlotSample> {
         let shard = self.slots.get(&slot)?;
-        let now = self.clock.now().ok();
+        // Apply rollback and uncertainty checks without advancing the actor's
+        // clock endpoints. Observations must not change later lease decisions.
+        let now = self.clock.clone().now().ok();
         Some(SlotSample {
             generation: self.topology.generation,
             epoch: shard.epoch,
