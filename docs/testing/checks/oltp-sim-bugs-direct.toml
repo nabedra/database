@@ -1,0 +1,17 @@
+id = "oltp-sim-bugs-direct"
+module = "oltp"
+kinds = ["S", "H"]
+# Fault-model simulation evidence. Each phase 10 reverted fix must be found by a seed in [1, 10000]
+# that reports its expected invariant or anomaly, and that seed must pass on the unpatched build.
+# Not runnable yet: until the nabedra-sim-oltp harness exists the command prints the marker below
+# and the record is not-run. It stays out of T2 so the nightly does not dispatch it.
+guarantees = ["OLTP-G01", "OLTP-G03", "OLTP-G04", "OLTP-G07", "OLTP-G08"]
+scenarios = ["D02", "D04", "O10", "O15", "R04", "O26"]
+tiers = ["weekly", "T3"]
+command = ["python3", "scripts/testing/sim_bugs.py", "run", "--set", "direct", "--jobs", "4"]
+cwd = "."
+timeout_s = 18000
+needs = []
+result_parser = "exit-code"
+not_run_marker = "not-run: sim-harness-missing"
+env = { RUSTFLAGS = "--cfg tokio_unstable" }
