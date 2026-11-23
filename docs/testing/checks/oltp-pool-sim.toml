@@ -1,0 +1,25 @@
+id = "oltp-pool-sim"
+module = "oltp"
+kinds = ["S"]
+guarantees = ["OLTP-G01", "OLTP-G08"]
+scenarios = ["O11", "NS04", "O16", "O17"]
+tiers = ["T1"]
+# Fault model: replay each simulated cut and verify mount and disk identity.
+command = ["bash", "-ec", '''
+echo "Fault model: OLTP pool on a per-node simulated volume"
+export CARGO_TARGET_DIR="$PWD/$CARGO_TARGET_DIR"
+cargo test --locked -j 2 -p nabedra-database --no-default-features --features oltp,sim --lib oltp::pool::sim_tests -- --nocapture --test-threads=1
+python3 ../scripts/testing/repeat_gate.py --features oltp,sim <<'JSON'
+[
+  {"id": "ns04_o11_restart_and_crash_at_each_commit_operation_replay", "file": "server/src/oltp/pool/sim_tests.rs", "lang": "rust"},
+  {"id": "ns04_o11_process_kill_preserves_unsynced_pool_writes", "file": "server/src/oltp/pool/sim_tests.rs", "lang": "rust"},
+  {"id": "o17_mount_identity_and_disk_budget_follow_volume", "file": "server/src/oltp/pool/sim_tests.rs", "lang": "rust"},
+  {"id": "o11_snapshot_install_recovers_the_generation_at_activation", "file": "server/src/oltp/pool/sim_tests.rs", "lang": "rust"}
+]
+JSON
+''']
+cwd = "server"
+timeout_s = 3600
+needs = []
+result_parser = "cargo-test"
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim" }

@@ -1,0 +1,14 @@
+id = "OLTP-SNAPSHOT-PARENT-SYNC"
+title = "Snapshot activation could retain a reference to a directory lost in a power cut"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G01"]
+scenarios = ["O11", "O16", "NS04"]
+found_by = "campaign"
+found_date = "2026-11-23"
+lowest_regression = "oltp::pool::sim_tests::o11_snapshot_install_recovers_the_generation_at_activation"
+seed = 41
+why_not_caught = "The existing process interruption test kept the operating system directory cache intact."
+invariant_added = "A power cut after activation retains the file and its directory path. A cut before activation retains the previous generation."
+fix_commits = ["606c28dc4b144fae8132971419cc5f75585748c8"]
+revert_patch_ok = true
