@@ -1,0 +1,45 @@
+{
+  "artifacts": [
+    {
+      "name": "p12-seams-f737bae-172814--cache-peer-seam.log",
+      "sha256": "70d50c200203d738c675b84d21e60d4dcbc2131b46d9b3de96922a48a8ca886d"
+    }
+  ],
+  "assertions": {
+    "executed": 0,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "parser",
+        "reason": "no cargo-test summary line in the output (exit 101)"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-peer-seam",
+  "duration_s": 54.121,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T16:29:51.368396+00:00",
+    "request_id": "p12-seams-f737bae-172814",
+    "runner": "GitHub Actions 1000006742",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45216863981"
+  },
+  "scenarios": [
+    "K03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "f737bae59b2671f941713fa1f5074185c73e5fc9",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

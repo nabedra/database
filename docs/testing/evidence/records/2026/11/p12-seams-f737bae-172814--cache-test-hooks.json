@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "p12-seams-f737bae-172814--cache-test-hooks.log",
+      "sha256": "48336b4a32bd4e70d46c5f2003e1605c0cb74c8706eb9696493fec595f42a945"
+    }
+  ],
+  "assertions": {
+    "executed": 5,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-test-hooks",
+  "duration_s": 43.485,
+  "guarantees": [
+    "CACHE-G02"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T16:33:38.424056+00:00",
+    "request_id": "p12-seams-f737bae-172814",
+    "runner": "GitHub Actions 1000006778",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45216863981"
+  },
+  "scenarios": [
+    "K01"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "f737bae59b2671f941713fa1f5074185c73e5fc9",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
