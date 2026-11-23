@@ -5,6 +5,7 @@
 //! | [`linearizable::check_kv`] | per-key registers are linearizable | `non-linearizable` |
 //! | [`txn::check`] | transactions are (strictly) serializable | `G0` `G1a` `G1b` `G1c` `G-single` `G2`, the `-realtime` variants, `incompatible-order`, `garbage-read`, `duplicate-elements` |
 //! | [`outcome::check`] | a failed or `not_applied` write never takes effect | `failed-write-observed` |
+//! | [`direct::check`] | direct-path registers and single-range batches are linearizable, each request identity commits at most once, and failed attempts have no effects | `non-linearizable` `failed-write-observed` `dedup-miss` `request-id-reuse-undetected` `request-id-reuse-misdetected` |
 //! | [`queue::check`] | log offsets, ordering, durability and redelivery | `duplicate-offset` `duplicate-event` `offset-gap` `out-of-order` `lost-publish` `redelivery-missing` |
 //! | [`relaxed_kv::check`] | asynchronous Cache replica promise (CACHE-G05) | `invented-value` `resurrection` `stale-read` `lost-write` |
 //!
@@ -13,6 +14,7 @@
 
 use serde::Serialize;
 
+pub mod direct;
 pub mod edn;
 pub mod linearizable;
 pub mod outcome;

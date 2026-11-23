@@ -1,0 +1,4 @@
+{"type":"invoke","process":0,"f":"update","key":"k","value":{"value":2},"request_id":"a"}
+{"type":"ok","process":0,"f":"update","key":"k","value":false,"request_id":"a"}
+{"type":"invoke","process":1,"f":"get","key":"k"}
+{"type":"ok","process":1,"f":"get","key":"k","value":{"id":"k","value":2}}

@@ -1,0 +1,8 @@
+{"type":"invoke","process":0,"f":"insert","key":"k","value":{"id":"k","value":1},"request_id":"a"}
+{"type":"ok","process":0,"f":"insert","key":"k","value":null,"request_id":"a"}
+{"type":"invoke","process":0,"f":"delete","key":"k","request_id":"b"}
+{"type":"ok","process":0,"f":"delete","key":"k","value":true,"request_id":"b"}
+{"type":"invoke","process":1,"f":"insert","key":"k","value":{"id":"k","value":2},"request_id":"c"}
+{"type":"fail","process":1,"f":"insert","key":"k","value":{"not_applied":true,"code":"conflict"},"request_id":"c"}
+{"type":"invoke","process":0,"f":"get","key":"k"}
+{"type":"ok","process":0,"f":"get","key":"k","value":null}
