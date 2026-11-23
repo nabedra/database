@@ -3,12 +3,17 @@ id = "rt-fs-contract"
 module = "sim"
 # The same cases run against RealFs in a temporary directory and against FaultFs, so the
 # fake is trusted only for behaviour the real backend confirms (D), plus a FaultFs-only
-# NS15 call-log case (U). NS04 and NS05 cut on FaultFs, which this suite keeps honest.
+# NS15 call-log case (U). FaultFs is a fault model used by NS04 and NS05.
+# This check does not execute the engine crash campaign or real power-loss scenarios.
 kinds = ["U", "D"]
 guarantees = ["LSM-G01"]
 scenarios = ["NS04", "NS05", "NS15"]
 tiers = ["T0", "T1"]
-command = ["sh", "-ec", "cargo test --locked -j 2 -p nabedra-rt --test fs_contract && cargo test --locked -j 2 -p nabedra-rt --features sim --test fs_contract"]
+command = ["sh", "-ec", '''
+echo 'Filesystem contract: RealFs on the runner and FaultFs as a fault model'
+cargo test --locked -j 2 -p nabedra-rt --test fs_contract
+cargo test --locked -j 2 -p nabedra-rt --features sim --test fs_contract
+''']
 cwd = "server"
 timeout_s = 900
 needs = []

@@ -9,7 +9,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use nabedra_rt::fs::{FaultFs, Fs, FsKind, FsOp, FsStat, OpenMode, RealFs};
 
@@ -178,6 +178,7 @@ macro_rules! contract {
 
 contract!(
     create_new_and_open_errors,
+    create_new_has_one_winner,
     rename_replaces_an_existing_file,
     listing_follows_create_and_remove,
     lock_is_exclusive_until_dropped,
@@ -244,6 +245,28 @@ fn create_new_and_open_errors(b: &dyn Backend) {
     assert!(fs.exists(&path).unwrap());
     assert!(fs.exists(b.root()).unwrap());
     assert!(!fs.exists(&b.root().join("missing")).unwrap());
+}
+
+fn create_new_has_one_winner(b: &dyn Backend) {
+    let fs = b.fs();
+    let path = b.root().join("raced");
+    let arrive = Barrier::new(2);
+    let (first, second) = std::thread::scope(|scope| {
+        let create = |payload: u8| {
+            arrive.wait();
+            fs.open(&path, OpenMode::CreateNew)
+                .and_then(|file| file.write_all_at(&[payload], 0))
+        };
+        let first = scope.spawn(move || create(1));
+        let second = scope.spawn(move || create(2));
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    let winner = match (first, second) {
+        (Ok(()), Err(error)) if error.kind() == io::ErrorKind::AlreadyExists => 1,
+        (Err(error), Ok(())) if error.kind() == io::ErrorKind::AlreadyExists => 2,
+        results => panic!("expected one creator and one AlreadyExists: {results:?}"),
+    };
+    assert_eq!(read(&*fs, &path), [winner]);
 }
 
 fn rename_replaces_an_existing_file(b: &dyn Backend) {
