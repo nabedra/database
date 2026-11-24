@@ -126,6 +126,92 @@ fn copy(
 }
 
 #[tokio::test(start_paused = true)]
+async fn o14_accepted_retry_waits_for_published_ready_view() {
+    use crate::oltp_replication::multiplex::EndpointFuture;
+    use crate::oltp_runtime::{
+        coordinator::{QueueCoordinator, ReplicaTransport},
+        worker_endpoint::AuthorityReader,
+    };
+    use std::sync::Mutex;
+
+    struct Published(QueueAuthority);
+    impl AuthorityReader for Published {
+        fn current<'a>(&'a self, _: &'a QueueScope) -> EndpointFuture<'a, QueueAuthority> {
+            Box::pin(async { Ok(self.0) })
+        }
+    }
+
+    struct Follower(Mutex<WorkerReplica>);
+    impl ReplicaTransport for Follower {
+        fn install<'a>(
+            &'a self,
+            target: WorkerIdentity,
+            frame: &'a RecordFrame,
+        ) -> EndpointFuture<'a, CopyAcknowledgement> {
+            Box::pin(async move {
+                let mut follower = self.0.lock().unwrap();
+                assert_eq!(target, follower.local_identity());
+                let authority = follower.authority();
+                follower
+                    .install(authority, authority.owner, frame)
+                    .map_err(QueueError::protocol)
+            })
+        }
+    }
+
+    let fixture = Fixture::new(2);
+    let previous = fixture.authority;
+    let mut next = previous;
+    next.ready.view.membership_revision += 1;
+    let id = nabedra_rt::ids::uuid_v4();
+    let body = fixture.body(id);
+    let context = fixture.context(id, &body);
+    let mut owner = fixture.replica(0);
+    let mut followers = [fixture.replica(1)];
+    let pending = owner
+        .propose(previous, body.clone(), context.clone(), 0)
+        .unwrap();
+    let accepted = copy(&mut owner, &mut followers, &pending).unwrap();
+    copy(&mut owner, &mut followers, &accepted);
+    let [follower] = followers;
+    let owner = Arc::new(Mutex::new(owner));
+    let follower = Arc::new(Follower(Mutex::new(follower)));
+    let coordinator =
+        QueueCoordinator::new(owner.clone(), Arc::new(Published(next)), follower.clone());
+
+    // Control has published readiness while the source still holds its old
+    // view and the exact accepted record. An identical retry must wait here.
+    let retry = coordinator.ensure_copies(next, id);
+    tokio::pin!(retry);
+    let before_reload = futures_util::poll!(&mut retry);
+    assert!(before_reload.is_pending(), "{before_reload:?}");
+
+    for replica in [&*owner, &follower.0] {
+        let mut replica = replica.lock().unwrap();
+        replica
+            .fenced_takeover(previous, next, fixture.members.clone())
+            .unwrap();
+    }
+    let version = retry.await.unwrap();
+    assert_eq!(version.request_id, id);
+    for replica in [&*owner, &follower.0] {
+        let replica = replica.lock().unwrap();
+        assert_eq!(replica.frame(id).unwrap().record_version().unwrap(), version);
+        let record = replica.record(id).unwrap();
+        assert_eq!(replica.authority(), next);
+        assert_eq!(record.version, version.version);
+        assert!(record.accepted);
+        assert_eq!(record.state, RequestState::Queued);
+        assert_eq!(record.body, body);
+        assert_eq!(
+            serde_json::from_slice::<AcceptedContext>(record.pinned_catalog.as_deref().unwrap())
+                .unwrap(),
+            context
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn c07_m02_f03_o22_o23_read_grant_copy_retries_only_the_blocked_replica() {
     use crate::oltp_replication::{multiplex::EndpointFuture, service_rpc::ReadScope};
     use crate::oltp_runtime::{
