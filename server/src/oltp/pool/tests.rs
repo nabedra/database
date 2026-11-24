@@ -9,9 +9,9 @@ use std::{
     time::Duration,
 };
 
-struct Dir(PathBuf);
+pub(crate) struct Dir(pub(crate) PathBuf);
 impl Dir {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(std::env::temp_dir().join(format!("oltp-pool-{}", nabedra_rt::ids::uuid_v4())))
     }
 }
@@ -20,7 +20,7 @@ impl Drop for Dir {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-pub(super) fn shared(config: SharedResourceConfig) -> Arc<WorkerSharedResources> {
+pub(crate) fn shared(config: SharedResourceConfig) -> Arc<WorkerSharedResources> {
     WorkerSharedResources::new(
         17,
         WorkerResources {
@@ -31,7 +31,7 @@ pub(super) fn shared(config: SharedResourceConfig) -> Arc<WorkerSharedResources>
     )
     .unwrap()
 }
-fn pool_identity() -> PoolIdentity {
+pub(crate) fn pool_identity() -> PoolIdentity {
     PoolIdentity {
         engine: "oltp".into(),
         pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
@@ -40,7 +40,7 @@ fn pool_identity() -> PoolIdentity {
         pool_id: nabedra_rt::ids::uuid_v4(),
     }
 }
-pub(super) fn group_identity(pool: &OltpPool) -> GroupIdentity {
+pub(crate) fn group_identity(pool: &OltpPool) -> GroupIdentity {
     GroupIdentity {
         cluster_id: pool.identity().cluster_id,
         database: Text::try_from("default").unwrap(),
@@ -49,14 +49,14 @@ pub(super) fn group_identity(pool: &OltpPool) -> GroupIdentity {
         group_format_version: 1,
     }
 }
-fn budget() -> TransactionBudget {
+pub(crate) fn budget() -> TransactionBudget {
     TransactionBudget {
         scratch_bytes: 64 << 10,
         batch_bytes: 64 << 10,
         output_bytes: 64 << 10,
     }
 }
-pub(super) fn meta(index: u64) -> ApplyMeta {
+pub(crate) fn meta(index: u64) -> ApplyMeta {
     ApplyMeta {
         position: AppliedPosition {
             term: 0,
@@ -67,7 +67,7 @@ pub(super) fn meta(index: u64) -> ApplyMeta {
         membership: None,
     }
 }
-async fn get(group: &GroupStore, key: &'static [u8]) -> Vec<u8> {
+pub(crate) async fn get(group: &GroupStore, key: &'static [u8]) -> Vec<u8> {
     group
         .read(budget(), move |view| {
             view.get(key).and_then(|value| value.ok_or_else(capacity))
@@ -1987,9 +1987,8 @@ async fn m02_c07_reply_decode_has_independent_bounded_ownership_with_raw_and_wir
     assert_eq!(resources.control_bytes_used(), 0);
 }
 
-mod kv;
+pub(crate) mod kv;
 mod snap1;
-pub(crate) use kv::o29_pool_recovery;
 
 pub(crate) fn acceptance_damaged_checkpoints() {
     o11_o16_inconsistent_snapshot_header_body_is_rejected_without_changing_active_state();

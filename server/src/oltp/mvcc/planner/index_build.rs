@@ -15,8 +15,8 @@ impl NativePlanner {
         progress: IndexProgress,
         owner: Arc<crate::oltp::pool::ScratchLease>,
     ) -> Result<MutationPlan, PlanError> {
-        #[cfg(test)]
-        crate::oltp_runtime::recovery_tests::index_faults::checkpoint(
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::oltp::test_hooks::index_faults::checkpoint(
             "backfill",
             maintenance.index_id,
             &progress,
@@ -138,13 +138,13 @@ impl NativePlanner {
                             )
                             .into());
                         }
-                        #[cfg(test)]
-                        if crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
+                        #[cfg(any(test, feature = "test-hooks"))]
+                        if crate::oltp::test_hooks::index_holds::checkpoint(
                             maintenance.index_id,
-                            crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::Validation,
+                            crate::oltp::test_hooks::index_holds::Checkpoint::Validation,
                             || None,
                         )
-                        .await || crate::oltp_runtime::recovery_tests::index_faults::checkpoint(
+                        .await || crate::oltp::test_hooks::index_faults::checkpoint(
                             "validation",
                             maintenance.index_id,
                             &serde_json::json!({
@@ -209,9 +209,9 @@ impl NativePlanner {
             let (table_version, table) =
                 value(self.catalog.describe(pin, maintenance.table_id).await?)?;
             let table = table.ok_or_else(not_found)?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             if kind == IndexClosedKind::Ready {
-                crate::oltp_runtime::recovery_tests::index_faults::checkpoint(
+                crate::oltp::test_hooks::index_faults::checkpoint(
                     "ready-plan",
                     maintenance.index_id,
                     &serde_json::json!({

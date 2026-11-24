@@ -1,13 +1,10 @@
 use super::*;
 use crate::oltp_runtime::coordinator::QueueCoordinator;
+use crate::oltp::test_hooks::continuation;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use std::path::PathBuf;
+use std::{future::Future, path::PathBuf};
 use uuid::Uuid;
-
-tokio::task_local! {
-    pub(super) static GRANT: ReadGrant;
-}
 
 fn fixture(scope: ReadScope, group: Uuid) -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
@@ -40,19 +37,23 @@ fn digest(payload: &ChargedBytes) -> Digest {
     Digest::from_bytes(Sha256::digest(payload.as_slice()).into())
 }
 
-pub(crate) fn applied(position: AppliedPosition) {
-    let _ = GRANT.try_with(|grant| {
-        if let Some(base) = fixture(grant.scope, grant.group) {
-            write(
-                &base,
-                &format!("applied-{}", grant.ticket),
-                json!({
-                    "grant": grant,
-                    "applied": position,
-                }),
-            );
-        }
-    });
+pub(super) async fn observe_read<T>(grant: ReadGrant, read: impl Future<Output = T>) -> T {
+    continuation::observe(
+        move |position| {
+            if let Some(base) = fixture(grant.scope, grant.group) {
+                write(
+                    &base,
+                    &format!("applied-{}", grant.ticket),
+                    json!({
+                        "grant": grant,
+                        "applied": position,
+                    }),
+                );
+            }
+        },
+        read,
+    )
+    .await
 }
 
 pub(super) fn page(grant: ReadGrant, payload: &ChargedBytes, page: &ScanPage) {
