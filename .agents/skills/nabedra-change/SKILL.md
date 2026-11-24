@@ -24,8 +24,9 @@ When you are given a task or asked to make a change, do the following:
 
 Use the [Nabedra builds skill](../nabedra-builds/SKILL.md) to choose where to
 run builds and expensive checks. Apply it when coordinating concurrent agents.
-Pushes alone start no CI. Follow the dispatch procedure in
-[GitHub Actions for checks](../code-review/references/gh-actions.md).
+The PR gate selects automatic baseline jobs from the diff. Follow
+[GitHub Actions for checks](../code-review/references/gh-actions.md) to dispatch registered checks
+and any additional suites required on the final commit.
 
 When agents work in parallel on one codebase, every hot file has a single owner
 per wave. See the hot-file rule in the
