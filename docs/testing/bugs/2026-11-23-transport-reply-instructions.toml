@@ -1,0 +1,14 @@
+id = "TRANSPORT-REPLY-INSTRUCTIONS"
+title = "Multiplex extraction exceeded the paired instruction limit"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G13"]
+scenarios = ["O05", "O09", "D10"]
+found_by = "acceptance"
+found_date = "2026-11-23"
+lowest_regression = "rt-zero-cost workload oltp-transport"
+seed = "unknown"
+why_not_caught = "The original instruction comparison did not exercise authenticated requests over the multiplex."
+invariant_added = "The paired comparison includes 512 loopback mTLS requests and checks the phase 8 per-workload instruction limit. Reply decoding preserves its distinct input and reservation errors."
+fix_commits = ["d9160aed2375f590107d6dd30902150a3c9217ff"]
+revert_patch_ok = true

@@ -613,6 +613,10 @@ def o05(binary, test_executable):
         'o05_c07_committed_storage_apply_uses_private_capacity_with_full_transport_arenas',
         'c01_c07_f03_owned_executor_exceeds_callers_blocking_capacity_and_retains_cancelled_native_charges',
         'f03_cancelled_append_keeps_callback_order_and_drain_until_native_settles',
+    ])
+    transport_tests = os.environ.get('NABEDRA_TRANSPORT_TEST_EXE')
+    assert transport_tests, 'O05 requires NABEDRA_TRANSPORT_TEST_EXE'
+    run_native_assertions(transport_tests, [
         'd10_c07_o05_exhausted_lane_overloads_while_raft_progress_advances',
     ])
     with transactions(binary, test_executable, 'O05') as fixture:
