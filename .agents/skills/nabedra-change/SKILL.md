@@ -10,15 +10,16 @@ When you are given a task or asked to make a change, do the following:
 3. Before implementing a plan that changes a topology or a protocol, or touches an L2 or L3 module, run the `design-review` skill of this repo. Implement only after its [gate](../design-review/SKILL.md#gate-implementation) holds. The plan, the spec and the implementation share the branch and the PR. A change to `specs/` is not docs-only.
 4. Always when you are done with the implementation, tell the user you are ready to run the code review (he might want you to add more features). If he asks for the review, run a deep code review/QA using the `code-review` skill of this repo
 5. When you are done, file a PR in GitHub
-6. For docs-only changes, review the diff, examples and links locally. Skip
-   runtime tests and GitHub Actions.
-   Put `[skip ci]` in the PR head commit message and in the commit message that
-   lands on the base branch. For other changes, run the applicable checks and
-   tests, including GitHub Actions dispatched on the PR's head commit when
-   appropriate. Wait for the applicable PR gate, fix failures, and rerun
-   affected checks. Before merging any PR, confirm that the applicable checks
-   pass and the [non-author reviewer](../code-review/SKILL.md#verification-rules)
-   approves.
+6. Verify the change before merging.
+   - For docs-only changes, review the diff, examples and links locally. Skip
+     tests and GitHub Actions. The author can merge after the local review.
+     Put `[skip ci]` in the PR head commit message and in the commit message
+     that lands on the base branch.
+   - For other changes, run the applicable checks and tests, including GitHub
+     Actions dispatched on the PR's head commit when appropriate. Wait for
+     the applicable PR gate, fix failures, and rerun affected checks. Merge
+     after the applicable checks pass and a
+     [non-author reviewer](../code-review/SKILL.md#verification-rules) approves.
 7. After the merge, remove the PR branch and worktree if they are no longer needed. Then run `git pull` on the base branch.
 
 Use the [Nabedra builds skill](../nabedra-builds/SKILL.md) to choose where to
