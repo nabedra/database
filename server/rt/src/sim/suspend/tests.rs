@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::super::{Cut, NodeClock, SimEvent, SplitMix64, World, in_node, run};
-use super::{Side, StoragePause};
+use super::{ClockRead, Side, StoragePause};
 use crate::fs::{self, FsFile, FsOp, OpenMode};
 use crate::sync::Condvar;
 use crate::task::{self, Step, Stepped};
@@ -508,4 +508,302 @@ fn a_lock_held_across_a_pause_fails_the_run() {
     let panic = result.unwrap_err();
     let text = panic.downcast_ref::<String>().unwrap();
     assert!(text.contains("holds a lock it needs"), "{text}");
+}
+
+/// A store that two nodes write. It serves one lease holder at a time, by epoch, and the
+/// clean one refuses a write from an earlier holder.
+#[derive(Default)]
+struct Store {
+    epoch: AtomicU64,
+    fenced: bool,
+    stale_writes: AtomicU64,
+}
+
+impl Store {
+    fn write(&self, epoch: u64) {
+        if epoch < self.epoch.load(SeqCst) && !self.fenced {
+            self.stale_writes.fetch_add(1, SeqCst);
+        }
+    }
+}
+
+/// How a run stops node 1.
+#[derive(Clone, Copy, Debug)]
+enum Stops {
+    /// At random times, between polls.
+    Freezes,
+    /// Between a clock read and its use.
+    ClockFreezes,
+}
+
+/// One run; whether the first holder's write took effect after the second took over. The
+/// holder reads its exact clock, finds its lease valid, and writes, with no await between.
+/// The planted store trusts that; its clean twin checks the holder's epoch.
+fn writes_after_its_lease(seed: u64, planted: bool, stops: Stops) -> bool {
+    run(seed, move |world| async move {
+        world.add_node(1, NodeClock::default());
+        let lease = ms(50);
+        let end = time::now() + lease;
+        let store = Arc::new(Store {
+            fenced: !planted,
+            epoch: AtomicU64::new(1),
+            ..Store::default()
+        });
+        if let Stops::ClockFreezes = stops {
+            world.set_clock_freezes(50, ms(40));
+        }
+        let holder = store.clone();
+        world.spawn_node(1, async move {
+            loop {
+                time::sleep(us(900)).await;
+                if time::now() < end {
+                    holder.write(1);
+                }
+            }
+        });
+        let successor = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(lease + ms(1)).await;
+            successor.epoch.store(2, SeqCst);
+        });
+        let mut rng = SplitMix64::new(seed);
+        for _ in 0..4 {
+            let before = us(rng.below(25_000));
+            let frozen = us(rng.below(25_000));
+            tokio::time::sleep(before).await;
+            if let Stops::Freezes = stops {
+                world.freeze(1);
+            }
+            tokio::time::sleep(frozen).await;
+            if let Stops::Freezes = stops {
+                world.thaw(1);
+            }
+        }
+        tokio::time::sleep(ms(50)).await;
+        store.stale_writes.load(SeqCst) > 0
+    })
+}
+
+/// Finding H-04: a freeze acted between polls only, so a node that read its clock and
+/// found its lease valid always used that at once.
+#[test]
+fn clock_freezes_expose_a_stale_lease_check() {
+    let count = |planted, stops, seeds: u64| {
+        (0..seeds)
+            .filter(|&seed| writes_after_its_lease(seed, planted, stops))
+            .count()
+    };
+    assert_eq!(count(true, Stops::Freezes, 300), 0, "unreachable without");
+    let caught = count(true, Stops::ClockFreezes, 100);
+    println!("the planted lease check is caught on {caught} of 100 seeds");
+    assert!(caught > 5);
+    assert_eq!(count(false, Stops::ClockFreezes, 300), 0, "the clean twin");
+}
+
+/// The freeze lands right after the chosen read: the code goes on at the thaw with the
+/// value it read, and nothing of its node runs meanwhile.
+#[test]
+fn a_freeze_lands_after_a_chosen_clock_read() {
+    run(9, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.add_node(2, NodeClock::default());
+        let (stage, ticks) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let other = ticks.clone();
+        world.spawn_node(1, async move {
+            loop {
+                time::sleep(ms(1)).await;
+                other.fetch_add(1, SeqCst);
+            }
+        });
+        world.freeze_after_clock_read(1, ClockRead::nth(2).in_file("sim/suspend/tests.rs"));
+        let at = stage.clone();
+        let reads = world.spawn_node(1, async move {
+            time::sleep(ms(5)).await;
+            let first = time::now();
+            at.store(1, SeqCst);
+            let second = time::unix_ms();
+            at.store(2, SeqCst);
+            (first, second, time::now())
+        });
+        tokio::time::timeout(ms(20), world.frozen_at_read(1))
+            .await
+            .unwrap();
+        assert!(world.is_frozen(1));
+        assert_eq!(
+            stage.load(SeqCst),
+            1,
+            "frozen between the second read and its use"
+        );
+        let before = ticks.load(SeqCst);
+        world
+            .spawn_node(2, async { time::sleep(ms(30)).await })
+            .await
+            .unwrap();
+        assert_eq!((stage.load(SeqCst), ticks.load(SeqCst)), (1, before));
+        world.thaw(1);
+        let (first, second, third) = reads.await.unwrap();
+        let first = first.duration_since(world.start());
+        assert_eq!(second, super::super::EPOCH_MS + first.as_millis() as u64);
+        assert_eq!(third.duration_since(world.start()), first + ms(30));
+        assert!(!world.is_frozen_at_read(1));
+        tokio::time::sleep(ms(5)).await;
+        assert!(ticks.load(SeqCst) > before);
+    });
+}
+
+/// A job reads its clock too, and a clock of another crate reports its reads.
+#[test]
+fn a_freeze_lands_in_a_job_and_after_a_reported_read() {
+    run(10, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.insert_ext(7_u64);
+        world.freeze_after_clock_read(1, ClockRead::nth(1));
+        let node = world.clone();
+        let job = world.spawn_node(1, async move {
+            task::spawn_blocking(move || {
+                // Inside an extension slot a freeze would leave it empty.
+                let value = node.with_ext::<u64, _>(|value| {
+                    super::super::clock_read();
+                    *value
+                });
+                assert!(!node.is_frozen(1));
+                super::super::clock_read();
+                value
+            })
+            .await
+        });
+        world.frozen_at_read(1).await;
+        assert_eq!(world.with_ext::<u64, _>(|value| *value), Some(7));
+        tokio::time::sleep(ms(3)).await;
+        assert!(!job.is_finished());
+        world.thaw(1);
+        assert_eq!(job.await.unwrap().unwrap(), Some(7));
+    });
+}
+
+/// A crash during the freeze is the end of the poll: no later line runs, and destructors
+/// do. The next incarnation starts clean.
+#[test]
+fn a_crash_lands_between_a_clock_read_and_its_use() {
+    run(11, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.freeze_after_clock_read(1, ClockRead::nth(1));
+        let (used, dropped) = (Arc::new(AtomicBool::new(false)), OnDrop(Arc::default()));
+        let (flag, unwound) = (used.clone(), dropped.0.clone());
+        let task = world.spawn_node(1, async move {
+            let _dropped = dropped;
+            time::now();
+            flag.store(true, SeqCst);
+        });
+        world.frozen_at_read(1).await;
+        world.crash(1);
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(unwound.load(SeqCst) && !used.load(SeqCst));
+        world.restart(1);
+        assert!(!world.is_frozen(1));
+        let reads = world.spawn_node(1, async { time::now() });
+        assert_eq!(reads.await.unwrap(), world.start());
+        assert!(!used.load(SeqCst));
+    });
+}
+
+/// A run that ends with a poll suspended ends, and drops the task.
+#[test]
+fn a_run_ends_with_a_poll_suspended() {
+    let dropped = OnDrop(Arc::default());
+    let flag = dropped.0.clone();
+    run(12, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.freeze_after_clock_read(1, ClockRead::nth(1));
+        drop(world.spawn_node(1, async move {
+            let _dropped = dropped;
+            time::now();
+        }));
+        world.frozen_at_read(1).await;
+    });
+    assert!(flag.load(SeqCst));
+}
+
+/// Polls on a helper thread behave as polls: they yield, spawn, sleep, block, race
+/// branches, panic and cancel. The trace lists what each step saw.
+fn polls(seed: u64) -> Vec<String> {
+    run(seed, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.set_clock_freezes(300, ms(3));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for task in 0..4_u64 {
+            let log = log.clone();
+            tasks.push(world.spawn_node(1, async move {
+                for round in 0..10 {
+                    time::sleep(us(300 + 100 * task)).await;
+                    let read = time::now();
+                    tokio::task::yield_now().await;
+                    let spawned = task::spawn(async { time::now() }).await.unwrap();
+                    let blocked = task::spawn_blocking(time::unix_ms).await.unwrap();
+                    let branch = tokio::select! {
+                        () = std::future::ready(()) => 0,
+                        () = std::future::ready(()) => 1,
+                        () = std::future::ready(()) => 2,
+                    };
+                    let timed = time::timeout(us(50), std::future::pending::<()>()).await;
+                    assert!(timed.is_err());
+                    // Without `--cfg tokio_unstable` the branch is not seeded.
+                    let branch = if super::super::TOKIO_RNG_SEEDED {
+                        branch
+                    } else {
+                        0
+                    };
+                    let seen = (spawned - read, time::elapsed(read), blocked, branch);
+                    log.lock().unwrap().push(format!("{task} {round} {seen:?}"));
+                }
+                assert!(task != 3, "a panic in a poll reaches its join handle");
+            }));
+        }
+        let mut ends = Vec::new();
+        for task in tasks {
+            ends.push(task.await.map_err(|error| error.is_panic()));
+        }
+        assert_eq!(ends, [Ok(()), Ok(()), Ok(()), Err(true)]);
+        log.lock().unwrap().clone()
+    })
+}
+
+#[test]
+fn polls_on_a_helper_thread_replay() {
+    for seed in 0..10 {
+        assert_eq!(polls(seed), polls(seed), "seed {seed}");
+    }
+}
+
+/// With `--cfg tokio_unstable` the branches a poll races replay on a helper thread too.
+#[test]
+fn a_poll_on_a_helper_thread_races_branches_by_the_seed() {
+    let branches = |seed| {
+        run(seed, |world| async move {
+            world.add_node(1, NodeClock::default());
+            // A rule that never fires keeps every poll on the helper.
+            world.freeze_after_clock_read(1, ClockRead::nth(u64::MAX));
+            world
+                .spawn_node(1, async {
+                    let mut taken = Vec::new();
+                    for _ in 0..40 {
+                        taken.push(tokio::select! {
+                            () = std::future::ready(()) => 0,
+                            () = std::future::ready(()) => 1,
+                        });
+                        tokio::task::yield_now().await;
+                    }
+                    taken
+                })
+                .await
+                .unwrap()
+        })
+    };
+    if super::super::TOKIO_RNG_SEEDED {
+        assert_eq!(branches(1), branches(1));
+        assert_ne!(branches(1), branches(2));
+    } else {
+        assert_eq!(branches(1).len(), 40);
+    }
 }
