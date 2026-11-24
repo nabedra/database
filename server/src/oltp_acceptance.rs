@@ -161,3 +161,49 @@ pub(crate) fn clause(scenario: &str, assertion: &str, status: &str, detail: &str
     });
     println!("NABEDRA_OLTP_ASSERT {marker}");
 }
+
+/// PR #121 review: process checks, run through the workflow's `tests` input.
+#[cfg(target_os = "linux")]
+fn review_process(script: &str, args: &[&str]) {
+    let status = process_driver(script)
+        .args(args)
+        .arg(process_binary().expect("shared-build OLTP binary"))
+        .arg(std::env::current_exe().unwrap())
+        .env(
+            "PYTHONPATH",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../orm/python/src"),
+        )
+        .status()
+        .expect("launch review driver");
+    assert!(status.success(), "{script} {args:?} failed");
+}
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "PR #121 review"]
+fn r121_ready_fence_outlives_a_timestamp_outage() {
+    review_process("review121_fence.py", &["20"]);
+}
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "PR #121 review"]
+fn r121_ready_fence_without_an_outage() {
+    review_process("review121_fence.py", &["0"]);
+}
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "PR #121 review"]
+fn r121_wiped_replacement_never_rejoins() {
+    review_process("review121_wipe.py", &["wipe"]);
+}
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "PR #121 review"]
+fn r121_suite_voter_refresh() {
+    review_process("review121_wipe.py", &["voter-refresh"]);
+}
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "PR #121 review"]
+fn r121_suite_restart() {
+    review_process("review121_wipe.py", &["restart"]);
+}

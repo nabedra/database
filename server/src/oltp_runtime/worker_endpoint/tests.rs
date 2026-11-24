@@ -787,3 +787,197 @@ async fn c07_m02_blocked_authority_preflight_and_full_data_arena_leave_receipt_p
     drop(fill);
     assert_eq!(shared.control_bytes_used(), 0);
 }
+
+/// Independent review test for BUG2 (PR #121 review), written from fd5aa4a3
+/// and its record only. A copy is authorized under one ready view and is in
+/// flight while the receiver moves to the next view. The receiver must answer
+/// retryable and unknown, never "invalid, not applied", and the same request
+/// must install once the owner sends it under the new view.
+struct MovingAuthority(Mutex<QueueAuthority>);
+impl AuthorityReader for MovingAuthority {
+    fn current<'a>(&'a self, _: &'a QueueScope) -> EndpointFuture<'a, QueueAuthority> {
+        let current = *self.0.lock().unwrap();
+        Box::pin(async move { Ok(current) })
+    }
+}
+
+#[tokio::test]
+async fn r121_bug2_copy_in_flight_across_a_view_change_is_retryable() {
+    use sha2::{Digest as _, Sha256};
+    let resources = |node| {
+        WorkerSharedResources::new(
+            node,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap()
+    };
+    let shared = resources(92);
+    let base = nabedra_rt::ids::uuid_v4().as_u128() & !0xff;
+    let worker = |id: u128| WorkerIdentity {
+        worker_id: Uuid::from_u128(base + id),
+        incarnation: nabedra_rt::ids::uuid_v4(),
+        certificate_sha256: Digest::from_bytes([id as u8; 32]),
+        enrollment_revision: 1,
+    };
+    let [owner, follower, removed] = [worker(1), worker(2), worker(3)];
+    let scope = QueueScope {
+        cluster_id: nabedra_rt::ids::uuid_v4(),
+        database: Text::try_from("default").unwrap(),
+    };
+    let run_id = nabedra_rt::ids::uuid_v4();
+    let authority = |membership_revision, members: &[WorkerIdentity]| {
+        let mut root = ReadySetHasher::default();
+        for member in members {
+            root.push(*member).unwrap();
+        }
+        QueueAuthority {
+            ready: ReadyMembership {
+                view: AuthorityView {
+                    run_id,
+                    owner_term: 2,
+                    membership_revision,
+                },
+                ready_root: root.finish(),
+                ready_count: root.count(),
+            },
+            owner,
+        }
+    };
+    let (old_members, new_members) = ([owner, follower, removed], [owner, follower]);
+    let (old, new) = (authority(3, &old_members), authority(4, &new_members));
+    let limits = QueueLimits {
+        max_pending_requests: 4,
+        max_queue_bytes_per_replica: 1 << 20,
+        max_retained_result_bytes_per_worker: 1 << 20,
+        result_retention_ms: 300_000,
+    };
+    let replica = |shared: Arc<WorkerSharedResources>, local| {
+        WorkerReplica::new(shared, scope.clone(), local, old, old_members, limits).unwrap()
+    };
+    let mut sender = replica(resources(91), owner);
+    let receiver = Arc::new(Mutex::new(replica(shared.clone(), follower)));
+    let control = Arc::new(MovingAuthority(Mutex::new(old)));
+    let endpoint = QueueEndpoint::new(
+        receiver.clone(),
+        shared.clone(),
+        scope.clone(),
+        control.clone(),
+        128 << 20,
+    )
+    .unwrap();
+    let group = GroupIdentity {
+        cluster_id: scope.cluster_id,
+        database: scope.database.clone(),
+        group_id: nabedra_rt::ids::uuid_v4(),
+        kind: GroupKind::Control,
+        group_format_version: GROUP_FORMAT_VERSION,
+    };
+    let id = nabedra_rt::ids::uuid_v4();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "request_id": id, "operation": "table.get",
+        "payload": {"table_id": nabedra_rt::ids::uuid_v4(), "key": 9}
+    }))
+    .unwrap();
+    let context = AcceptedContext {
+        authorization: OriginalAuthorization {
+            database: scope.database.clone(),
+            principal: Digest::from_bytes([2; 32]),
+            policy_revision: 1,
+            ingress_id: nabedra_rt::ids::uuid_v4(),
+            ingress_incarnation: nabedra_rt::ids::uuid_v4(),
+            credential_expires_at_ms: None,
+        },
+        read: Some(QueueReadToken {
+            identity: PinIdentity {
+                run_id,
+                request_id: id,
+                digest: Digest::from_bytes(Sha256::digest(&body).into()),
+                nonce: nabedra_rt::ids::uuid_v4(),
+            },
+            storage_pin: StoragePin {
+                pin_id: nabedra_rt::ids::uuid_v4(),
+                read_ts: Timestamp::new(1).unwrap(),
+                allocator_epoch: 1,
+            },
+            catalog_root: Digest::from_bytes([3; 32]),
+            schema_epoch: 1,
+            routing_epoch: 1,
+        }),
+    };
+    let session = || {
+        AuthenticatedSession::for_test(
+            follower,
+            owner,
+            group.clone(),
+            Purpose::QueueData,
+            nabedra_rt::ids::uuid_v4(),
+        )
+    };
+    let install = |record| {
+        shared
+            .encode(&QueueRequest::Install { record }, MAX_RECORD_HEADER_BYTES)
+            .unwrap()
+    };
+    let frame = sender
+        .propose(old, body.clone(), context.clone(), 1)
+        .unwrap();
+    let record = frame.decode_header().unwrap();
+    let sections = |frame: &RecordFrame| {
+        ChargedSections::for_test(&shared, ByteClass::Data, frame.sections.clone(), 0).unwrap()
+    };
+    // Reception is authorized under the old view.
+    endpoint
+        .preflight(&session(), install(record.clone()).as_ref())
+        .await
+        .unwrap();
+    // The view changes while the payload is on the wire.
+    *control.0.lock().unwrap() = new;
+    receiver
+        .lock()
+        .unwrap()
+        .fenced_takeover(old, new, new_members)
+        .unwrap();
+    let Err(error) = endpoint
+        .handle(session(), install(record.clone()), sections(&frame))
+        .await
+    else {
+        panic!("a copy of the old view was installed under the new one");
+    };
+    assert_eq!(
+        (error.status_code(), error.code, error.outcome),
+        (503, ErrorCode::StorageUnavailable, Outcome::Unknown),
+        "a well-formed copy of another ready view is retryable: {error}"
+    );
+    assert!(receiver.lock().unwrap().record(id).is_none());
+    // A malformed copy stays invalid, whatever its view.
+    let mut malformed = record;
+    malformed.sequence = 0;
+    let Err(error) = endpoint
+        .handle(session(), install(malformed), sections(&frame))
+        .await
+    else {
+        panic!("a malformed copy was installed");
+    };
+    assert_eq!(
+        (error.status_code(), error.outcome),
+        (400, Outcome::NotApplied)
+    );
+    // After its own takeover the owner's copy of the same request installs.
+    sender.fenced_takeover(old, new, new_members).unwrap();
+    let frame = sender
+        .record(id)
+        .is_none()
+        .then(|| sender.propose(new, body, context, 2).unwrap());
+    if let Some(frame) = frame {
+        endpoint
+            .handle(
+                session(),
+                install(frame.decode_header().unwrap()),
+                sections(&frame),
+            )
+            .await
+            .unwrap();
+        assert!(receiver.lock().unwrap().record(id).is_some());
+    }
+}

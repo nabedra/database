@@ -14,6 +14,7 @@
 //! the release. The damage is a `FaultFs` fault model, not a power cut.
 #[path = "../../../../tests/support/tls.rs"]
 mod tls;
+mod review121;
 use nabedra_resources::config::WorkerResources;
 use super::*;
 use crate::{
@@ -61,18 +62,25 @@ impl Drop for Temporary {
 struct Directory {
     cluster: Uuid,
     workers: BTreeMap<Uuid, WorkerEnrollment>,
+    prepared: std::sync::Mutex<BTreeSet<Uuid>>,
 }
 impl PeerDirectory for Directory {
     fn verify(
         &self,
         peer: WorkerIdentity,
         group: &GroupIdentity,
-        _: Purpose,
+        purpose: Purpose,
     ) -> Result<TransportTrust, ProtocolError> {
         if group.cluster_id != self.cluster
             || WorkerIdentity::from(&self.resolve(peer.worker_id)?) != peer
         {
             return Err(invalid());
+        }
+        if group.kind == GroupKind::Control
+            && purpose == Purpose::ControlDelegation
+            && self.prepared.lock().unwrap().contains(&peer.worker_id)
+        {
+            return Ok(TransportTrust::PreparedControl);
         }
         Ok(TransportTrust::AppliedEnrollment)
     }
@@ -162,7 +170,7 @@ struct Cluster {
     tls: Vec<crate::oltp_replication::TlsMaterial>,
     enrollments: Vec<WorkerEnrollment>,
     pools: Vec<Uuid>,
-    directory: Arc<Directory>,
+    directories: Vec<Arc<Directory>>,
     control: GroupIdentity,
     group: GroupIdentity,
     pins: BTreeSet<Digest>,
@@ -220,14 +228,19 @@ impl Cluster {
             });
             listeners.push(listener);
         }
-        let directory = Arc::new(Directory {
-            cluster,
-            workers: enrollments
-                .iter()
-                .cloned()
-                .map(|worker| (worker.worker_id, worker))
-                .collect(),
-        });
+        let directories = (0..WORKERS)
+            .map(|_| {
+                Arc::new(Directory {
+                    cluster,
+                    workers: enrollments
+                        .iter()
+                        .cloned()
+                        .map(|worker| (worker.worker_id, worker))
+                        .collect(),
+                    prepared: Default::default(),
+                })
+            })
+            .collect();
         let pins = enrollments
             .iter()
             .map(|worker| worker.certificate_sha256)
@@ -237,7 +250,7 @@ impl Cluster {
             tls,
             pools: (0..WORKERS).map(|_| nabedra_rt::ids::uuid_v4()).collect(),
             enrollments,
-            directory,
+            directories,
             control,
             group,
             pins,
@@ -370,7 +383,7 @@ impl Cluster {
                 &self.enrollments[index],
                 &self.tls[index],
                 shared.clone(),
-                self.directory.clone(),
+                self.directories[index].clone(),
                 registry.clone(),
                 TransportConfig::default(),
             )
