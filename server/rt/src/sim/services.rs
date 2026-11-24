@@ -374,7 +374,7 @@ async fn driver(world: Weak<World>, cell: Arc<Cell>) {
             }
             Outcome::Stepped(Step::Idle(None)) => cell.bell.changed(seen.0).await,
             Outcome::Stepped(Step::Idle(Some(at))) => {
-                let wait = at.saturating_duration_since(crate::time::now_std());
+                let wait = at.saturating_duration_since(super::mono_now_std());
                 tokio::select! {
                     biased;
                     () = cell.bell.changed(seen.0) => {}
@@ -673,7 +673,7 @@ fn drive<T>(
         }
         match earliest_deadline(world, context) {
             Some(at) => {
-                let wait = at.saturating_duration_since(crate::time::now_std());
+                let wait = at.saturating_duration_since(super::mono_now_std());
                 // A deadline already due would loop forever without moving time.
                 let wait = wait.max(Duration::from_micros(1));
                 world.pause_all(super::to_runtime_duration(wait));

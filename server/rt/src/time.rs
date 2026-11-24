@@ -15,10 +15,11 @@ use std::future::Future;
 
 /// The monotonic clock of the current node.
 #[inline]
+#[cfg_attr(feature = "sim", track_caller)]
 pub fn now() -> Instant {
     #[cfg(feature = "sim")]
     {
-        crate::sim::mono_now()
+        after_read(crate::sim::mono_now())
     }
     #[cfg(not(feature = "sim"))]
     {
@@ -29,10 +30,11 @@ pub fn now() -> Instant {
 /// The monotonic clock as a std [`std::time::Instant`], for synchronous code that stores
 /// the std type. Under `sim` it is a fixed base plus the node's virtual elapsed time.
 #[inline]
+#[cfg_attr(feature = "sim", track_caller)]
 pub fn now_std() -> std::time::Instant {
     #[cfg(feature = "sim")]
     {
-        crate::sim::mono_now_std()
+        after_read(crate::sim::mono_now_std())
     }
     #[cfg(not(feature = "sim"))]
     {
@@ -47,6 +49,7 @@ pub fn now_std() -> std::time::Instant {
 /// Product: `start.elapsed()`. Under `sim`, `now_std()` or `now()` minus `start`, so a
 /// duration measured in a simulated node follows that node's clock.
 #[inline]
+#[cfg_attr(feature = "sim", track_caller)]
 pub fn elapsed<I: MonotonicInstant>(start: I) -> Duration {
     start.elapsed_on_node()
 }
@@ -55,6 +58,7 @@ pub fn elapsed<I: MonotonicInstant>(start: I) -> Duration {
 /// [`Instant`]. Sealed; it exists so [`elapsed`] takes either type.
 pub trait MonotonicInstant: sealed::Sealed + Copy {
     #[doc(hidden)]
+    #[cfg_attr(feature = "sim", track_caller)]
     fn elapsed_on_node(self) -> Duration;
 }
 
@@ -66,6 +70,7 @@ mod sealed {
 
 impl MonotonicInstant for std::time::Instant {
     #[inline]
+    #[cfg_attr(feature = "sim", track_caller)]
     fn elapsed_on_node(self) -> Duration {
         #[cfg(feature = "sim")]
         {
@@ -80,6 +85,7 @@ impl MonotonicInstant for std::time::Instant {
 
 impl MonotonicInstant for Instant {
     #[inline]
+    #[cfg_attr(feature = "sim", track_caller)]
     fn elapsed_on_node(self) -> Duration {
         #[cfg(feature = "sim")]
         {
@@ -94,10 +100,11 @@ impl MonotonicInstant for Instant {
 
 /// The wall clock of the current node.
 #[inline]
+#[cfg_attr(feature = "sim", track_caller)]
 pub fn wall_now() -> SystemTime {
     #[cfg(feature = "sim")]
     {
-        crate::sim::wall_now()
+        after_read(crate::sim::wall_now())
     }
     #[cfg(not(feature = "sim"))]
     {
@@ -107,23 +114,27 @@ pub fn wall_now() -> SystemTime {
 
 /// [`wall_now`] as milliseconds since the Unix epoch, 0 if it is before the epoch.
 #[inline]
+#[cfg_attr(feature = "sim", track_caller)]
 pub fn unix_ms() -> u64 {
     since_epoch().map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 /// [`wall_now`] as microseconds since the Unix epoch, 0 if it is before the epoch.
 #[inline]
+#[cfg_attr(feature = "sim", track_caller)]
 pub fn unix_micros() -> u64 {
     since_epoch().map_or(0, |elapsed| elapsed.as_micros() as u64)
 }
 
 /// [`wall_now`] as nanoseconds since the Unix epoch, 0 if it is before the epoch.
 #[inline]
+#[cfg_attr(feature = "sim", track_caller)]
 pub fn unix_nanos() -> u128 {
     since_epoch().map_or(0, |elapsed| elapsed.as_nanos())
 }
 
 #[inline]
+#[cfg_attr(feature = "sim", track_caller)]
 fn since_epoch() -> Option<Duration> {
     wall_now().duration_since(UNIX_EPOCH).ok()
 }
@@ -212,6 +223,14 @@ pub fn thread_sleep(duration: Duration) {
     {
         std::thread::sleep(duration)
     }
+}
+
+/// A clock freeze may land here, between the read and its use (`sim/suspend.rs`).
+#[cfg(feature = "sim")]
+#[track_caller]
+fn after_read<T>(value: T) -> T {
+    crate::sim::clock_read();
+    value
 }
 
 #[inline]
