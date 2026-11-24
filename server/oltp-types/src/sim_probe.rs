@@ -258,12 +258,11 @@ pub fn active() -> bool {
 
 type LedgerSource = Box<dyn Fn() -> bool + Send>;
 
-/// The run's ledger owners with the node that created each, in creation order.
-#[derive(Default)]
-struct LedgerSources(Vec<(Option<u64>, LedgerSource)>);
+/// The run's ledger owners, by address, with the node that created each.
+struct LedgerSources(Vec<(usize, Option<u64>, LedgerSource)>);
 
 /// Makes [`snapshot_ledgers`] call `report` for `owner` while it is alive. `report` must
-/// only read ledgers and [`emit`] their sizes.
+/// only read ledgers and [`emit`] their sizes. Tracking an owner again changes nothing.
 pub fn track_ledgers<T: Send + Sync + 'static>(owner: &Arc<T>, report: fn(&T)) {
     let Some(world) = nabedra_rt::sim::world() else {
         return;
@@ -271,11 +270,15 @@ pub fn track_ledgers<T: Send + Sync + 'static>(owner: &Arc<T>, report: fn(&T)) {
     let weak = Arc::downgrade(owner);
     let source: LedgerSource =
         Box::new(move || weak.upgrade().map(|owner| report(&owner)).is_some());
-    let mut entry = Some((nabedra_rt::sim::current_node(), source));
-    if world
-        .with_ext::<LedgerSources, _>(|sources| sources.0.extend(entry.take()))
-        .is_none()
-    {
+    // The source's weak reference keeps the address from being reused.
+    let address = Arc::as_ptr(owner).cast::<()>() as usize;
+    let mut entry = Some((address, nabedra_rt::sim::current_node(), source));
+    let known = world.with_ext::<LedgerSources, _>(|sources| {
+        if sources.0.iter().all(|(tracked, ..)| *tracked != address) {
+            sources.0.extend(entry.take());
+        }
+    });
+    if known.is_none() {
         world.insert_ext(LedgerSources(entry.take().into_iter().collect()));
     }
 }
@@ -288,7 +291,7 @@ pub fn snapshot_ledgers(node: u64) {
     world.with_ext::<LedgerSources, _>(|sources| {
         sources
             .0
-            .retain(|(owner, report)| *owner != Some(node) || report());
+            .retain(|(_, owner, report)| *owner != Some(node) || report());
     });
 }
 
@@ -346,6 +349,7 @@ mod tests {
             };
             let (first, second, other) =
                 (Arc::new(Owner(5)), Arc::new(Owner(6)), Arc::new(Owner(7)));
+            nabedra_rt::sim::in_node(1, async { track(&first) }).await;
             nabedra_rt::sim::in_node(1, async { track(&first) }).await;
             nabedra_rt::sim::in_node(1, async { track(&second) }).await;
             nabedra_rt::sim::in_node(2, async { track(&other) }).await;

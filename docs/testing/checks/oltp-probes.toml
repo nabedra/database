@@ -3,13 +3,13 @@ module = "oltp"
 kinds = ["U"]
 # P10-PROBES units: the sim_probe sink (inert outside a world, re-entrant), the probe-driven
 # invariants against synthetic probe streams (each rule with a passing and a violating case),
-# and the nabedra.trace/1 line format. The seeded runs are in oltp-sim and oltp-probes-planted.
+# subscriptions, and the nabedra.trace/1 line format. The seeded runs are in oltp-sim and oltp-probes-planted.
 guarantees = []
 scenarios = []
 tiers = ["T0", "T1"]
 command = ["bash", "-euc", '''
 cargo test --locked -j 2 -p nabedra-oltp-types --features sim --lib sim_probe:: -- --test-threads=1
-exec cargo test --locked -j 2 -p nabedra-sim-oltp --lib -- --test-threads=1 invariants::protocol:: trace::
+exec cargo test --locked -j 2 -p nabedra-sim-oltp --lib -- --test-threads=1 invariants::protocol:: probes:: trace::
 ''']
 cwd = "server"
 timeout_s = 2400

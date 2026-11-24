@@ -47,6 +47,8 @@ pub(crate) struct Checks {
     resources: BTreeMap<u64, ResourceUsage>,
     /// Per worker: every ledger at the resource baseline, from probes.
     ledger_baseline: BTreeMap<u64, Ledgers>,
+    /// Per worker: the stats and ledgers [`Invariants::resources_at_baseline`] last observed.
+    ledger_observed: BTreeMap<u64, (Value, Ledgers)>,
     reported: BTreeSet<(String, String)>,
     violations: Vec<String>,
     trace: Option<TraceObserver>,
@@ -96,10 +98,12 @@ impl Invariants {
         self.trace(world, describe(event));
     }
 
-    /// NotAppliedNeverCommitted over the finished client history.
+    /// NotAppliedNeverCommitted over the finished client history. Call it last: it also
+    /// traces how often each rule ran.
     pub fn check_outcomes(&self, world: &World, events: &[Event]) {
         if let Some(probes) = self.probes() {
             probes.check_outcomes(world, events);
+            self.trace(world, format!("{RULES_RAN} {:?}", probes.exercised()));
         }
     }
 
@@ -193,12 +197,21 @@ impl Invariants {
     }
 
     /// ResourceBaseline: every ledger the probes report is back at its baseline, and so is
-    /// the public subset in the worker's stats.
+    /// the public subset in the worker's stats. After a wait it judges the observation
+    /// [`Self::resources_at_baseline`] made together with `stats`, not a later instant at
+    /// which a periodic Raft message may hold a charge.
     pub fn check_resources(&self, world: &World, worker: u64, stats: &Value) {
-        let ledgers = self.ledgers(worker);
+        let observed = self.checks.lock().unwrap().ledger_observed.remove(&worker);
+        let ledgers = match observed {
+            Some((seen, ledgers)) if seen == *stats => Some(ledgers),
+            _ => self.ledgers(worker),
+        };
         let mut checks = self.checks.lock().unwrap();
         if let Some(now) = &ledgers {
             let moved = checks.ledgers_moved(worker, now);
+            if let Some(probes) = &checks.probes {
+                probes.ran(protocol::RESOURCE_BASELINE, now.len() as u64);
+            }
             if !moved.is_empty() {
                 checks.violate(
                     world,
@@ -234,9 +247,13 @@ impl Invariants {
     /// ResourceBaseline. Missing observations leave the expectation pending.
     pub fn resources_at_baseline(&self, worker: u64, stats: &Value) -> bool {
         let ledgers = self.ledgers(worker);
-        let checks = self.checks.lock().unwrap();
-        if ledgers.is_some_and(|now| !checks.ledgers_moved(worker, &now).is_empty()) {
-            return false;
+        let mut checks = self.checks.lock().unwrap();
+        if let Some(now) = ledgers {
+            let moved = !checks.ledgers_moved(worker, &now).is_empty();
+            checks.ledger_observed.insert(worker, (stats.clone(), now));
+            if moved {
+                return false;
+            }
         }
         let (Some(baseline), Some(now)) = (
             checks.resources.get(&worker),
@@ -325,7 +342,6 @@ impl Invariants {
         drop(checks);
         if let Some(probes) = &probes {
             probes.check_routes(world);
-            self.trace(world, format!("{RULES_RAN} {:?}", probes.exercised()));
         }
         if let Some(Err(error)) = probes.map(|probes| probes.finish()) {
             self.violate(
@@ -376,6 +392,9 @@ impl Checks {
         let Some(baseline) = self.ledger_baseline.get(&worker) else {
             return vec!["no baseline snapshot".into()];
         };
+        if now.is_empty() {
+            return vec!["no ledger reported".into()];
+        }
         let keys: BTreeSet<_> = baseline.keys().chain(now.keys()).collect();
         keys.into_iter()
             .filter_map(|key| {
@@ -451,9 +470,13 @@ impl Checks {
 
     fn violate(&mut self, world: &World, name: &str, detail: impl Into<String>) {
         let detail = detail.into();
-        if self.violations.len() == MAX_VIOLATIONS
-            || !self.reported.insert((name.to_owned(), detail.clone()))
-        {
+        // Cap each kind on its own, so a frequent one never hides another.
+        let reported = self
+            .violations
+            .iter()
+            .filter(|line| nabedra_sim::shrink::violation_kind(line) == name)
+            .count();
+        if reported == MAX_VIOLATIONS || !self.reported.insert((name.to_owned(), detail.clone())) {
             return;
         }
         let now = elapsed_ms(world);

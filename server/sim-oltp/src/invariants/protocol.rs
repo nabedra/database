@@ -199,8 +199,8 @@ impl Protocol {
         &self.exercised
     }
 
-    fn ran(&mut self, rule: &'static str) {
-        *self.exercised.entry(rule).or_default() += 1;
+    pub(crate) fn ran(&mut self, rule: &'static str, times: u64) {
+        *self.exercised.entry(rule).or_default() += times;
     }
 
     /// Checks `probe` and updates the state. Returns what it violates.
@@ -272,7 +272,7 @@ impl Protocol {
                 let from = after.map_or(0, |after| after.index.saturating_add(1));
                 let log = self.durable.entry((*group, *replica)).or_default();
                 let removed = log.split_off(&from);
-                self.ran(TRUNCATION);
+                self.ran(TRUNCATION, 1);
                 for (index, id) in removed {
                     if self.is_applied(*group, index, id) {
                         out.push((
@@ -337,7 +337,7 @@ impl Protocol {
             } => {
                 let served = self.served.get(group).copied();
                 if served.is_some() {
-                    self.ran(RANGE_CLOCK_RULE1);
+                    self.ran(RANGE_CLOCK_RULE1, 1);
                 }
                 if let Some(served) = served
                     && *commit_ts <= served
@@ -421,7 +421,7 @@ impl Protocol {
             }
             Probe::GuardReleased => {
                 if let Some(node) = node {
-                    self.ran(EXACTLY_ONCE_RELEASE);
+                    self.ran(EXACTLY_ONCE_RELEASE, 1);
                     let (acquired, released) = self.native.entry(node).or_default();
                     *released += 1;
                     if *released > *acquired {
@@ -458,7 +458,7 @@ impl Protocol {
     ) {
         let (term, leader, committed) = vote;
         if let Some(old) = self.votes.insert((group, replica), vote) {
-            self.ran(MONOTONIC_VOTE);
+            self.ran(MONOTONIC_VOTE, 1);
             if vote < old {
                 out.push((
                     MONOTONIC_VOTE,
@@ -475,7 +475,7 @@ impl Protocol {
     /// Raft node in the vote, so a second claimant is another process with that ID.
     fn leads(&mut self, node: Option<u64>, group: Uuid, vote: LogPoint, out: &mut Vec<Violation>) {
         let Some(node) = node else { return };
-        self.ran(ELECTION_SAFETY);
+        self.ran(ELECTION_SAFETY, 1);
         let first = *self.leaders.entry((group, vote)).or_insert(node);
         if first != node {
             out.push((
@@ -551,7 +551,7 @@ impl Protocol {
         out: &mut Vec<Violation>,
     ) {
         let key = (group, replica);
-        self.ran(REBUILD);
+        self.ran(REBUILD, 1);
         if let Some(purged) = purged {
             self.purged.insert(key, purged);
         }
@@ -568,7 +568,7 @@ impl Protocol {
         let Some(node) = origin.node else { return };
         for (identity, commit_ts, digest) in self.staged.remove(&(node, group)).unwrap_or_default()
         {
-            self.ran(DEDUP_UNIQUE);
+            self.ran(DEDUP_UNIQUE, 1);
             let DedupIdentity {
                 table,
                 key,
@@ -610,9 +610,9 @@ impl Protocol {
         out: &mut Vec<Violation>,
     ) {
         let id = point(entry);
-        self.ran(MONOTONIC_COMMIT);
-        self.ran(LOG_MATCHING);
-        self.ran(APPLIED_PREFIXES_AGREE);
+        self.ran(MONOTONIC_COMMIT, 1);
+        self.ran(LOG_MATCHING, 1);
+        self.ran(APPLIED_PREFIXES_AGREE, 1);
         if let Some(node) = origin.node {
             let last = self
                 .last_applied
@@ -654,7 +654,7 @@ impl Protocol {
             Some(_) => {}
             None => {
                 self.applied.insert((group, entry.index), (id, digest));
-                self.ran(MAJORITY_REACHED);
+                self.ran(MAJORITY_REACHED, 1);
                 self.majority(group, entry.index, id, out);
             }
         }
@@ -730,7 +730,7 @@ impl Protocol {
                 format!("table {table} epoch {epoch} at {ts}: routes {spans:?}, unreadable page {broken:?}"),
             )
         });
-        self.ran(KEYSPACE_COVERAGE);
+        self.ran(KEYSPACE_COVERAGE, 1);
         violation
     }
 

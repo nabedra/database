@@ -183,6 +183,7 @@ impl Probes {
             let Some(request) = &event.request_id else {
                 continue;
             };
+            self.ran(NOT_APPLIED_NEVER_COMMITTED, 1);
             for key in keys(event, events) {
                 if let Some(t_ns) = committed.get(&(key.clone(), request.clone())) {
                     self.report(world, NOT_APPLIED_NEVER_COMMITTED, format!(
@@ -198,6 +199,11 @@ impl Probes {
     /// was not exercised and must be reported as not run.
     pub fn exercised(&self) -> BTreeMap<&'static str, u64> {
         self.lock().protocol.exercised().clone()
+    }
+
+    /// Counts evaluations of a rule that the harness drives.
+    pub(crate) fn ran(&self, rule: &'static str, times: u64) {
+        self.lock().protocol.ran(rule, times);
     }
 
     pub(crate) fn check_routes(&self, world: &World) {

@@ -75,7 +75,9 @@ def expand(tree, target_dir, package, crate, features, defaults):
         command += ["--features", features]
     command += ["--", "-Zunpretty=expanded"]
     # Unstable flags for this crate only, so no dependency sees a nightly compiler.
-    env = os.environ | {"CARGO_TARGET_DIR": str(target_dir), "RUSTC_BOOTSTRAP": crate, "CARGO_INCREMENTAL": "0"}
+    # sccache fails on a compilation that writes no output.
+    env = os.environ | {"CARGO_TARGET_DIR": str(target_dir), "RUSTC_BOOTSTRAP": crate, "CARGO_INCREMENTAL": "0",
+                        "RUSTC_WRAPPER": ""}
     env.pop("RUSTFLAGS", None)
     result = subprocess.run(command, cwd=tree / "server", env=env, capture_output=True, text=True)
     if result.returncode:
@@ -104,9 +106,9 @@ def main():
             for package, crate, features, defaults in TARGETS:
                 if args.only and package != args.only:
                     continue
-                # One build directory per side: both sides share no artifact by accident.
-                old = expand(before, args.target_dir / "base", package, crate, features, defaults)
-                new = expand(after, args.target_dir / "head", package, crate, features, defaults)
+                # The two trees have different paths, so they share registry artifacts only.
+                old = expand(before, args.target_dir / "build", package, crate, features, defaults)
+                new = expand(after, args.target_dir / "build", package, crate, features, defaults)
                 label = f"{package} [{'default' if defaults else 'no default'}{',' + features if features else ''}]"
                 if not old.strip():
                     raise SystemExit(f"{label}: empty expansion, so nothing was compared")
