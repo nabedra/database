@@ -1,0 +1,48 @@
+{
+  "artifacts": [
+    {
+      "name": "sim-faults-87d4531-185554--worker-pool-sim.log",
+      "sha256": "59d733d139740af4fc9854dda9611983960095146ffb8a75e6883813b82d35c1"
+    }
+  ],
+  "assertions": {
+    "executed": 10,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "worker-pool-sim",
+  "duration_s": 187.269,
+  "guarantees": [
+    "SCHED-G01",
+    "OLAP-G07",
+    "OLTP-G09"
+  ],
+  "kind": "S U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T18:27:59.719747+00:00",
+    "request_id": "sim-faults-87d4531-185554",
+    "runner": "GitHub Actions 1000012699",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45453935712"
+  },
+  "scenarios": [
+    "C04",
+    "C06",
+    "F01",
+    "F02",
+    "F03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "87d4531965177d19b67376349f2758d25e9d7679",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
