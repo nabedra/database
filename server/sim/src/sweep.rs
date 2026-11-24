@@ -30,6 +30,7 @@ use serde_json::{Value, json};
 
 use crate::rng::stream_seed;
 use crate::shrink::{self, DEFAULT_SHRINK_BUDGET};
+use crate::tla_trace;
 
 /// What one run of one seed produced.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -429,7 +430,8 @@ fn report_failure(
     let shrunk = (config.shrink && !first.passed() && deterministic).then(|| {
         let kinds = shrink::kinds(&first.violations);
         shrink::shrink_tape(first.tape.clone(), &kinds, config.shrink_budget, |g| {
-            guarded(run, seed, g).violations
+            // A candidate tape is another run of this seed, so it must not take its trace.
+            tla_trace::suppressed(|| guarded(run, seed, g).violations)
         })
     });
     let mut write = |name: &str, bytes: &[u8]| {
