@@ -1,4 +1,4 @@
-{"schema":"nabedra.catalog/1","count":2881,"tests":[
+{"schema":"nabedra.catalog/1","count":2882,"tests":[
 {"file":"orm/python/tests/events/test_client.py","hash":"202d453fc9458842","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_ack_uses_exact_offset_and_rejects_foreign_delivery_before_request","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"1c426c67dd348a60","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_claim_reuses_uuid_after_missing_response","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"b8d2b5c0d984c70e","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_error_metadata_and_duplicate_fields","lang":"python"},
@@ -669,6 +669,7 @@
 {"file":"scripts/testing/test_sim_bugs.py","hash":"9638543ed1bfdf5c","id":"scripts/testing/test_sim_bugs.py::FoolTest::test_one_hit_under_two_ids","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs.py","hash":"b849027ebe06fd7d","id":"scripts/testing/test_sim_bugs.py::FoolTest::test_one_patch_with_a_comment_more","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs.py","hash":"f4c4f99cb653c2b1","id":"scripts/testing/test_sim_bugs.py::FoolTest::test_patch_inside_code_compiled_only_for_the_simulator","lang":"python"},
+{"file":"scripts/testing/test_sim_bugs.py","hash":"0b37bb7e42b679d6","id":"scripts/testing/test_sim_bugs.py::FoolTest::test_patch_is_read_as_its_bytes","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs.py","hash":"ced17358ec8fedd7","id":"scripts/testing/test_sim_bugs.py::FoolTest::test_patch_of_the_simulator_runtime","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs.py","hash":"0182e698dd88c8d3","id":"scripts/testing/test_sim_bugs.py::FoolTest::test_patch_review","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs.py","hash":"81920fb127598647","id":"scripts/testing/test_sim_bugs.py::FoolTest::test_patch_that_acts_only_in_the_simulator","lang":"python"},

@@ -1052,6 +1052,12 @@ class FoolTest(HarnessCase):
                 problems = sim_bugs.validate_patch_paths(patch_bytes.decode())
                 self.assertTrue(any("cannot see" in problem for problem in problems), problems)
 
+    def test_patch_is_read_as_its_bytes(self):
+        # The same lines with other line ends are other bytes than the review's digest covers.
+        path = self.f.repo / BUG / "revert.patch"
+        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+        self.assert_refused("is not part of a `diff --git` section")
+
     def test_regression_that_contradicts_the_review(self):
         f = self.f
         for assertion in ("timeout", "counter"):
