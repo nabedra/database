@@ -1,0 +1,32 @@
+id = "oltp-growth-activation-repeat"
+module = "oltp"
+kinds = ["R"]
+guarantees = []
+scenarios = ["O16"]
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+out=$(mktemp -d)
+trap 'rm -rf "$out"' EXIT
+status=0
+for mode in on off; do
+    passed=0
+    for attempt in $(seq 20); do
+        dir="$out/$mode-$attempt"
+        echo "O16 direct_oltp=$mode attempt $attempt/20"
+        if NABEDRA_TEST_DIRECT_OLTP="$mode" python3 scripts/acceptance_oltp.py --scenario O16 --output "$dir"; then
+            passed=$((passed + 1))
+        else
+            status=1
+        fi
+        if [ -f "$dir/O16.log" ]; then cat "$dir/O16.log"
+        elif [ -f "$dir/build.log" ]; then cat "$dir/build.log"
+        fi
+    done
+    echo "O16 direct_oltp=$mode: $passed/20 passed"
+done
+exit "$status"
+''']
+cwd = "."
+timeout_s = 10000
+needs = []
+result_parser = "cargo-test"
