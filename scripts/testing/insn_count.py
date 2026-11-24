@@ -36,6 +36,7 @@ class Workload:
 
 WORKLOADS = (
     Workload("oltp-storage", "oltp", 512),
+    Workload("oltp-transport", "oltp", 512),
     Workload("kv-write-flush", "oltp", 1024),
     Workload("cache-set", "cache", 8192),
     Workload("olap-queue", "olap", 512),
@@ -122,10 +123,43 @@ def instruction_count(profile):
     return count
 
 
-def measure(counter, binary, workload, directory):
+def prepare_transport_tls(directory):
+    """Reuse the same CA and peer material for both revisions and every sample."""
+    directory.mkdir()
+    (directory / "peer.ext").write_text(
+        "basicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature\n"
+        "extendedKeyUsage=serverAuth,clientAuth\n"
+        "subjectAltName=DNS:localhost\n",
+        encoding="utf-8",
+    )
+    algorithm = ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes"]
+    run(
+        ["openssl", "req", "-x509", *algorithm, "-subj", "/CN=nabedra-insn-ca",
+         "-days", "1", "-keyout", "ca.key", "-out", "ca.pem"],
+        directory, capture=True, timeout=30,
+    )
+    for index in (1, 2):
+        name = f"peer-{index}"
+        run(
+            ["openssl", "req", *algorithm, "-subj", "/CN=localhost",
+             "-keyout", f"{name}.key", "-out", f"{name}.csr"],
+            directory, capture=True, timeout=30,
+        )
+        run(
+            ["openssl", "x509", "-req", "-in", f"{name}.csr", "-CA", "ca.pem",
+             "-CAkey", "ca.key", "-set_serial", str(index), "-days", "1",
+             "-extfile", "peer.ext", "-out", f"{name}.pem"],
+            directory, capture=True, timeout=30,
+        )
+
+
+def measure(counter, binary, workload, directory, transport_tls=None):
     # Reuse the same working directory path for both binaries and all runs.
     directory.mkdir()
     try:
+        if workload.name == "oltp-transport":
+            (directory / "tls").symlink_to(transport_tls, target_is_directory=True)
         profile = directory / "callgrind.out"
         output = run(
             [
@@ -170,6 +204,9 @@ def benchmark(base_sha, head_sha, cargo, counter, workloads, work_dir):
     work_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="nabedra-insn-", dir=work_dir) as scratch:
         work = Path(scratch)
+        transport_tls = work / "tls"
+        if any(workload.name == "oltp-transport" for workload in workloads):
+            prepare_transport_tls(transport_tls)
         with checkout(work / "base", base_sha) as base, checkout(work / "head", head_sha) as head:
             trees = {"base": base, "head": head}
             for tree in trees.values():
@@ -187,7 +224,7 @@ def benchmark(base_sha, head_sha, cargo, counter, workloads, work_dir):
                         order = ("base", "head") if index % 2 == 0 else ("head", "base")
                         for side in order:
                             counts[side].append(
-                                measure(counter, binaries[side], workload, work / "run")
+                                measure(counter, binaries[side], workload, work / "run", transport_tls)
                             )
                     yield workload.name, counts
 
