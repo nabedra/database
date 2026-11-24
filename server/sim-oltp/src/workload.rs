@@ -642,6 +642,31 @@ mod tests {
 
     use nabedra_sim::sweep::{SweepConfig, sweep};
 
+    /// Seed 66: with fewer session slots than peers the second gateway never activated the
+    /// direct path, so its retry of a committed insert was answered `outcome_unknown` for ever.
+    #[test]
+    fn smoke_seed_66_reaches_the_direct_path_through_both_gateways() {
+        let mut config = SweepConfig::new("oltp-sim-smoke-66", 66, 1);
+        config.require_seeded = true;
+        config.verify_replay = 1.0;
+        config.replay = concat!(
+            "RUST_MIN_STACK=16777216 RUSTFLAGS=\"--cfg tokio_unstable\" ",
+            "CARGO_TARGET_DIR=target/sim cargo test --locked --release ",
+            "-p nabedra-sim-oltp --lib ",
+            "workload::tests::smoke_seed_66_reaches_the_direct_path_through_both_gateways ",
+            "-- --exact --nocapture --test-threads=1",
+        )
+        .into();
+        if let Some(dir) = std::env::var_os("NABEDRA_SIM_ARTIFACTS") {
+            config.artifacts = dir.into();
+        }
+        let setup = Setup::smoke();
+        let report = sweep(&config, |seed, generator| {
+            run(seed, generator, Defect::None, None, &setup).run
+        });
+        report.assert_passed();
+    }
+
     #[test]
     fn cold_start_reopens_mounted_workers() {
         let mut config = SweepConfig::new("oltp-sim-cold-start", 1, 1);
