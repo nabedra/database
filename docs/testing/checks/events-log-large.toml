@@ -1,0 +1,13 @@
+# EventsLog at larger bounds, TLC simulation (labelled).
+id = "events-log-large"
+module = "events"
+kinds = ["T"]
+guarantees = ["EVT-G01", "EVT-G02", "EVT-G03", "EVT-G04", "EVT-G06"]
+scenarios = ["EV01", "EV02", "EV07"]
+tiers = ["T2"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/events", "EventsLog", "--tier", "T2",
+           "--simulate", "--seed", "1", "--num", "500000"]
+cwd = "."
+timeout_s = 7200
+needs = ["tlc"]
+result_parser = "tlc"

@@ -1,0 +1,12 @@
+# Design spec EventsLog (plans/events.md): publish durability, offsets, dedup, batch atomicity, read barrier; baselines, then mutants.
+id = "events-log"
+module = "events"
+kinds = ["T"]
+guarantees = ["EVT-G01", "EVT-G02", "EVT-G03", "EVT-G04", "EVT-G06"]
+scenarios = ["EV01", "EV02", "EV07"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/events", "EventsLog"]
+cwd = "."
+timeout_s = 15000
+needs = ["tlc"]
+result_parser = "tlc"
