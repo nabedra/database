@@ -58,6 +58,10 @@ pub fn session_alpn(alpn: Option<&[u8]>) -> bool {
 }
 pub(super) const REPLY_PREFIX_BYTES: usize = 53;
 const FRAME_BYTES: usize = 13;
+// Keep the existing RPC trace filter and test subscribers working after the move.
+const TRACE_TARGET: &str =
+    "nabedra_database_server::oltp_replication::multiplex::transport::session";
+
 const REQUEST: u8 = 1;
 const REPLY: u8 = 2;
 const CANCEL: u8 = 4;
@@ -665,7 +669,7 @@ impl ClientSession {
                         if self.received.load(Ordering::Relaxed) != mark {
                             written = None;
                         } else if nabedra_rt::time::elapsed(at) >= ping_timeout {
-                            tracing::debug!(peer=%self.identity.worker_id,
+                            tracing::debug!(target: TRACE_TARGET, peer=%self.identity.worker_id,
                                 "peer session ping unanswered; closing");
                             break;
                         }
@@ -893,7 +897,7 @@ impl Drop for StreamGuard<'_> {
             && nabedra_rt::time::elapsed(at) >= self.session.silent_limit
             && self.session.received.load(Ordering::Relaxed) == mark
         {
-            tracing::debug!(peer=%self.session.identity.worker_id,
+            tracing::debug!(target: TRACE_TARGET, peer=%self.session.identity.worker_id,
                 "peer session silent past a reply deadline; closing");
             self.session.close();
         }
@@ -1520,7 +1524,7 @@ pub(super) async fn serve(
             _ = trust_changed(&mut changes) => {
                 let bound = *lock(&state.bound);
                 if bound.is_some_and(|peer| !enrolled(&*transport.common.directory, peer)) {
-                    tracing::debug!(peer=?bound.map(|peer| peer.worker_id),
+                    tracing::debug!(target: TRACE_TARGET, peer=?bound.map(|peer| peer.worker_id),
                         "closing a revoked peer's session");
                     transport.common.revoked_closes.fetch_add(1, Ordering::Relaxed);
                     break false;
@@ -1538,7 +1542,7 @@ pub(super) async fn serve(
                     && (lock(&state.lane).is_none() && nabedra_rt::time::elapsed(started) >= config.ping_idle
                         || silence >= config.ping_idle * SERVER_IDLE_PINGS)
                 {
-                    tracing::debug!(peer=?bound.map(|peer| peer.worker_id),
+                    tracing::debug!(target: TRACE_TARGET, peer=?bound.map(|peer| peer.worker_id),
                         "closing an idle or unidentified peer session");
                     break false;
                 }
@@ -1774,7 +1778,7 @@ async fn run_stream(
         Ok(Ok((reply, handler))) => (Some(reply_frame(stream_id, nonce, 0, reply)), Some(handler)),
         Ok(Err(error)) => {
             if matches!(purpose, Purpose::Raft | Purpose::RaftProgress) {
-                tracing::debug!(group=%group_id, ?purpose, phase=?trace.phase,
+                tracing::debug!(target: TRACE_TARGET, group=%group_id, ?purpose, phase=?trace.phase,
                     code=?error.code, "Raft transport rejected request");
             }
             (

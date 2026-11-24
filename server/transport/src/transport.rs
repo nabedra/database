@@ -38,6 +38,9 @@ pub use session::{FrameKind, StreamFrame, session_alpn};
 #[cfg(test)]
 mod tests;
 
+// Keep the existing RPC trace filter and test subscribers working after the move.
+const TRACE_TARGET: &str = "nabedra_database_server::oltp_replication::multiplex::transport";
+
 // Engine capability is fixed in the authenticated protocol, before variable
 // metadata. An OLAP worker does not implement this listener or enrollment.
 pub const ONE_SHOT_ALPN: &[u8] = b"nabedra-oltp-worker/1";
@@ -218,7 +221,7 @@ fn direct_admission_disabled() -> bool {
             std::env::var_os(NO_DIRECT_ADMISSION_ENV).is_some_and(|value| value == "1");
         if disabled {
             tracing::warn!(
-                "{NO_DIRECT_ADMISSION_ENV}=1: direct requests use the ingress handler slots (benchmark only)"
+                target: TRACE_TARGET, "{NO_DIRECT_ADMISSION_ENV}=1: direct requests use the ingress handler slots (benchmark only)"
             );
         }
         disabled
@@ -718,7 +721,7 @@ struct LaneRefusals {
 impl LaneRefusals {
     fn outgoing(&self, class: TrafficClass, direct: bool) {
         self.outgoing[class as usize].fetch_add(1, Ordering::Relaxed);
-        tracing::debug!("{}", outgoing_lane_message(class, direct));
+        tracing::debug!(target: TRACE_TARGET, "{}", outgoing_lane_message(class, direct));
     }
     fn handler(&self, class: TrafficClass) {
         self.handler[class as usize].fetch_add(1, Ordering::Relaxed);
@@ -779,7 +782,7 @@ impl Drop for RaftTransportTrace {
         if matches!(self.purpose, Purpose::Raft | Purpose::RaftProgress)
             && !matches!(self.phase, RaftTransportPhase::Complete)
         {
-            tracing::debug!(group=%self.group, purpose=?self.purpose, phase=?self.phase,
+            tracing::debug!(target: TRACE_TARGET, group=%self.group, purpose=?self.purpose, phase=?self.phase,
                 "Raft transport ended before completion");
         }
     }
@@ -1158,7 +1161,7 @@ impl WorkerTransport {
         .await;
         if let Err(error) = result {
             if matches!(hello.purpose, Purpose::Raft | Purpose::RaftProgress) {
-                tracing::debug!(group=%hello.group_id, purpose=?hello.purpose, phase=?trace.phase,
+                tracing::debug!(target: TRACE_TARGET, group=%hello.group_id, purpose=?hello.purpose, phase=?trace.phase,
                     code=?error.code, "Raft transport rejected request");
             }
             trace.phase = RaftTransportPhase::SendReply;

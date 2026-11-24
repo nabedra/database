@@ -23,6 +23,9 @@ use std::{
 };
 use uuid::Uuid;
 
+// Keep the existing RPC trace filter and test subscribers working after the move.
+const TRACE_TARGET: &str = "nabedra_database_server::oltp_replication::multiplex::directory";
+
 /// REP6: a Data-only worker refreshes its revocation view this often.
 pub(crate) const REVOCATION_REFRESH: Duration = Duration::from_secs(1);
 /// One refresh waits at most this long for a Control majority.
@@ -223,14 +226,14 @@ impl AppliedPeerDirectory {
                 perf_stage!("peer.revocations.refresh").record(Duration::ZERO);
                 self.mark_refreshed(nabedra_rt::time::now_std());
                 if learned > 0 {
-                    tracing::info!(learned, "Data-only revocation view learned revocations");
+                    tracing::info!(target: TRACE_TARGET, learned, "Data-only revocation view learned revocations");
                 }
             }
             Err(error) => {
                 perf_stage!("peer.revocations.refresh_failed").record(Duration::ZERO);
                 let age = self.revocation_view_age().unwrap_or_default();
                 if age > REVOCATION_STALE_AFTER && !remote.stale.swap(true, Ordering::AcqRel) {
-                    tracing::warn!(code=?error.code, age_ms=age.as_millis() as u64,
+                    tracing::warn!(target: TRACE_TARGET, code=?error.code, age_ms=age.as_millis() as u64,
                         "Data-only revocation view is stale: no Control majority refresh; \
                          enforcing the revocations already learned");
                 }
@@ -245,7 +248,7 @@ impl AppliedPeerDirectory {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
             if remote.stale.swap(false, Ordering::AcqRel) {
-                tracing::info!("Data-only revocation view refreshed from a Control majority again");
+                tracing::info!(target: TRACE_TARGET, "Data-only revocation view refreshed from a Control majority again");
             }
         }
     }
@@ -668,7 +671,7 @@ impl AppliedPeerDirectory {
                         changed=stop.changed()=>{if changed.is_err()||*stop.borrow(){return}continue},
                         result=self.refresh(&control)=>result,
                     };
-                    if let Err(error)=result{tracing::warn!(code=?error.code,outcome=?error.outcome,"Control enrollment refresh incomplete; prior verified peers retained");}
+                    if let Err(error)=result{tracing::warn!(target: TRACE_TARGET, code=?error.code,outcome=?error.outcome,"Control enrollment refresh incomplete; prior verified peers retained");}
                 }
             }
         }
