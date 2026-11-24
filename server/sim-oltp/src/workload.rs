@@ -195,17 +195,30 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
             assertions.insert("cluster readiness", startup.is_ok());
             match startup {
                 Ok(()) if workload != Workload::Smoke => {
-                    let report = workloads::direct::run(
-                        &mut cluster,
-                        &config,
-                        history.clone(),
-                        generator,
-                        seed,
-                        workload,
-                        &setup.selection,
-                        setup.quiet,
-                    )
-                    .await;
+                    let report = if workload == Workload::Topology {
+                        workloads::topology::run(
+                            &mut cluster,
+                            &config,
+                            history.clone(),
+                            generator,
+                            seed,
+                            &setup.selection,
+                            setup.quiet,
+                        )
+                        .await
+                    } else {
+                        workloads::direct::run(
+                            &mut cluster,
+                            &config,
+                            history.clone(),
+                            generator,
+                            seed,
+                            workload,
+                            &setup.selection,
+                            setup.quiet,
+                        )
+                        .await
+                    };
                     match report {
                         Ok(report) => {
                             for (name, passed) in report.assertions {

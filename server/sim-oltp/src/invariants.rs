@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+pub(crate) mod topology;
+
 use nabedra_check::checker::Verdict;
 use nabedra_rt::{
     fs::FaultFs,

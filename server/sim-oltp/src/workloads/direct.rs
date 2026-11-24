@@ -354,7 +354,7 @@ pub(crate) async fn run(
 
 /// Poll until every worker and gateway reports the run ready with the direct path active, and
 /// a read of one key succeeds through each gateway.
-async fn converge(cluster: &Cluster, ctx: &Ctx, deadline: Duration) -> Result<(), String> {
+pub(crate) async fn converge(cluster: &Cluster, ctx: &Ctx, deadline: Duration) -> Result<(), String> {
     loop {
         let state = if cluster.converged().await {
             clients::read_each(ctx).await
@@ -370,7 +370,7 @@ async fn converge(cluster: &Cluster, ctx: &Ctx, deadline: Duration) -> Result<()
 }
 
 /// The run cannot converge: stop the clients and keep the violations already recorded.
-async fn abandon(
+pub(crate) async fn abandon(
     cluster: &mut Cluster,
     ctx: &Ctx,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -446,7 +446,7 @@ async fn create_table(cluster: &Cluster, history: &Arc<Mutex<History>>) -> Resul
 
 /// Wait for transient resource gauges to return to their baseline, or 2 s. The second pool a
 /// move mounted has no row in the baseline, so it is split off: it must reserve nothing.
-async fn settle(
+pub(crate) async fn settle(
     cluster: &Cluster,
     second: Option<SecondPool>,
 ) -> Result<(Vec<(u64, Value)>, Option<(u64, String)>), String> {

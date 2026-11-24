@@ -13,6 +13,7 @@ pub(crate) mod direct;
 pub(crate) mod moves;
 pub(crate) mod old_peer;
 pub(crate) mod paused;
+pub(crate) mod topology;
 
 use std::{collections::BTreeSet, fmt};
 
@@ -23,6 +24,7 @@ pub(crate) enum Workload {
     Direct,
     Cold,
     Move,
+    Topology,
 }
 
 /// The workloads `mixed` rotates through, in seed order.
@@ -35,6 +37,7 @@ impl Workload {
             Workload::Direct => "direct",
             Workload::Cold => "cold",
             Workload::Move => "move",
+            Workload::Topology => "topology",
         }
     }
 
@@ -44,6 +47,7 @@ impl Workload {
             Workload::Direct,
             Workload::Cold,
             Workload::Move,
+            Workload::Topology,
         ]
         .into_iter()
         .find(|workload| workload.name() == name)

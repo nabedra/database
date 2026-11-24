@@ -1,0 +1,21 @@
+id = "oltp-sim-topology"
+module = "oltp"
+kinds = ["S", "H"]
+# Fault model. The phase 11 topology workload: splits, moves and leader transfers under load,
+# index publication, a table drop, and gateway routes of random age. A scenario is claimed only
+# when every one of its clauses ran. A seed that splits under direct load is red until the
+# product publishes such a split.
+guarantees = ["OLTP-G02", "OLTP-G03", "OLTP-G06"]
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+"${build[@]}" --no-run
+"${build[@]}" -- --test-threads=2 workloads:: invariants::topology::
+exec timeout 1500s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1
+''']
+cwd = "server"
+timeout_s = 4200
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "topology", NABEDRA_SEEDS = "24", NABEDRA_SIM_JOBS = "2", NABEDRA_SIM_VERIFY_REPLAY = "0.25", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-topology", NABEDRA_SIM_GUARANTEES = "OLTP-G02,OLTP-G03,OLTP-G06", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-topology" }
