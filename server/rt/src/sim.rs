@@ -28,7 +28,10 @@
 //!
 //! Deadlines and durations given to the node clock are mapped back to the runtime's
 //! virtual clock, rounded up so a timer never fires before the node clock reaches its
-//! deadline. A timer armed before a later drift change keeps its original mapping.
+//! deadline. A timer armed before a later drift change keeps its original mapping, so a
+//! slowdown makes it fire early, unless the node has a timer floor
+//! ([`World::set_timer_floor_ppm`]): its timers are then mapped at the slowest rate its
+//! clock may take, and no drift change makes one fire early.
 //!
 //! # Ids
 //!
@@ -190,7 +193,13 @@ struct Clock {
     anchor_local: Duration,
     drift_ppm: i64,
     wall_offset_nanos: i128,
+    /// See [`World::set_timer_floor_ppm`].
+    timer_floor_ppm: Option<i64>,
 }
+
+/// Added to a timer's length on the node clock under a timer floor. A re-anchor may round
+/// the clock down by less than a nanosecond, so this covers a thousand drift changes.
+const TIMER_SLACK_NANOS: i128 = 1_000;
 
 impl Clock {
     fn new(settings: NodeClock) -> Self {
@@ -200,6 +209,7 @@ impl Clock {
             anchor_local: settings.mono_offset,
             drift_ppm: settings.drift_ppm,
             wall_offset_nanos: settings.wall_offset_nanos,
+            timer_floor_ppm: None,
         }
     }
 
@@ -227,6 +237,27 @@ impl Clock {
             .saturating_add(nanos(div_ceil(ahead * PPM, self.rate())))
     }
 
+    /// The virtual length of a timer that needs `ahead` nanoseconds on this clock, which
+    /// it has whatever the drift becomes meanwhile if the clock has a timer floor.
+    fn timer_length(&self, ahead: i128) -> Duration {
+        match self.timer_floor_ppm {
+            Some(floor) => nanos(div_ceil(
+                (ahead + TIMER_SLACK_NANOS) * PPM,
+                PPM + i128::from(floor),
+            )),
+            None => nanos(div_ceil(ahead * PPM, self.rate())),
+        }
+    }
+
+    /// The virtual time at which a timer for `local`, armed at `virtual_elapsed`, fires.
+    fn timer_at(&self, local: i128, virtual_elapsed: Duration) -> Duration {
+        let ahead = local - self.local(virtual_elapsed).as_nanos() as i128;
+        if self.timer_floor_ppm.is_none() || ahead <= 0 {
+            return self.virtual_at(local);
+        }
+        virtual_elapsed.saturating_add(self.timer_length(ahead))
+    }
+
     fn reanchor(&mut self, virtual_elapsed: Duration) {
         self.anchor_local = self.local(virtual_elapsed);
         self.anchor_virtual = self.anchor_virtual.max(virtual_elapsed);
@@ -238,6 +269,15 @@ fn assert_drift(drift_ppm: i64) {
         drift_ppm > -1_000_000,
         "a drift of {drift_ppm} ppm stops or reverses the clock"
     );
+}
+
+fn assert_floor(drift_ppm: i64, floor_ppm: Option<i64>) {
+    if let Some(floor_ppm) = floor_ppm {
+        assert!(
+            drift_ppm >= floor_ppm,
+            "a drift of {drift_ppm} ppm is below the node's timer floor of {floor_ppm} ppm"
+        );
+    }
 }
 
 fn div_ceil(numerator: i128, denominator: i128) -> i128 {
@@ -407,12 +447,38 @@ impl World {
     }
 
     /// Changes `node`'s drift from now on. The clock stays continuous.
+    ///
+    /// # Panics
+    ///
+    /// If the drift is at or below -1,000,000 ppm, or below the node's timer floor.
     pub fn set_drift_ppm(&self, node: u64, drift_ppm: i64) {
         assert_drift(drift_ppm);
         let elapsed = self.elapsed();
         self.with_node(node, |entry| {
+            assert_floor(drift_ppm, entry.clock.timer_floor_ppm);
             entry.clock.reanchor(elapsed);
             entry.clock.drift_ppm = drift_ppm;
+        });
+    }
+
+    /// Declares that `node`'s drift never goes below `floor_ppm`, and maps the timers it
+    /// arms from now on at that rate, as if its timer hardware always ran at the slowest
+    /// rate its clock may take. Without a floor (`None`, the default) a slowdown makes
+    /// timers armed before it fire before the node clock reaches their deadline, which no
+    /// kernel does. With one, a timer never fires early, and fires at most as late as it
+    /// would on a node whose drift was at the floor from the start, so a design that
+    /// tolerates the declared drift tolerates it. It covers every timer of
+    /// [`crate::time`], a [`crate::time::interval`]'s period included, and none armed
+    /// before this call.
+    ///
+    /// # Panics
+    ///
+    /// If the floor is at or below -1,000,000 ppm, or above the node's present drift.
+    pub fn set_timer_floor_ppm(&self, node: u64, floor_ppm: Option<i64>) {
+        floor_ppm.into_iter().for_each(assert_drift);
+        self.with_node(node, |entry| {
+            assert_floor(entry.clock.drift_ppm, floor_ppm);
+            entry.clock.timer_floor_ppm = floor_ppm;
         });
     }
 
@@ -991,10 +1057,25 @@ pub(crate) fn to_runtime_instant(deadline: Instant) -> Instant {
         };
         world
             .start
-            .checked_add(clock.virtual_at(local).saturating_sub(paused))
+            .checked_add(
+                clock
+                    .timer_at(local, world.elapsed())
+                    .saturating_sub(paused),
+            )
             .unwrap_or(deadline)
     })
     .unwrap_or(deadline)
+}
+
+/// The virtual length of a timer of `duration` on the current node's clock.
+pub(crate) fn to_runtime_timer(duration: Duration) -> Duration {
+    node_clock(|_, clock| {
+        clock
+            .filter(|clock| clock.timer_floor_ppm.is_some() && !duration.is_zero())
+            .map(|clock| clock.timer_length(duration.as_nanos() as i128))
+    })
+    .flatten()
+    .unwrap_or_else(|| to_runtime_duration(duration))
 }
 
 /// A duration on the current node's clock as a duration on the runtime's virtual clock.
