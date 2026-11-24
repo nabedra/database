@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-tooling-b97cc8f-151222--testing-matrix.log",
+      "sha256": "97ab5149e4fb66cdcc3c9f6cc7f0aff0ce650b3e43c265024e9dbc4049a2b575"
+    }
+  ],
+  "assertions": {
+    "executed": 87,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "testing-matrix",
+  "duration_s": 2.922,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T14:12:36.994899+00:00",
+    "request_id": "dr-tooling-b97cc8f-151222",
+    "runner": "GitHub Actions 1000011357",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45411472493"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "b97cc8f7ca474873f076115a5f0893380ba15c67",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
