@@ -1,0 +1,15 @@
+# Observed on main in Actions run 45329066299, job 138225923800.
+id = "O14-SAME-RUN-REJOIN-503"
+title = "An accepted request retry can race the local ready view reload"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G03", "OLTP-G07"]
+scenarios = ["O14", "Q04", "Q05", "R03"]
+found_by = "ci-flake"
+found_date = "2026-11-23"
+lowest_regression = "oltp_runtime::replica::tests::o14_accepted_retry_waits_for_published_ready_view"
+seed = "unknown"
+why_not_caught = "The process fixture waited for Control readiness and inspected the original records. Whether its first retry fell before the owner installed the published view depended on membership polling."
+invariant_added = "Copying an existing accepted record waits boundedly for the exact Control-published view, rechecks Control, and preserves the accepted identity, body, context, and queued state."
+fix_commits = ["262ffb74ddace0fb5ef2d0a6d06658432f033c20"]
+revert_patch_ok = true

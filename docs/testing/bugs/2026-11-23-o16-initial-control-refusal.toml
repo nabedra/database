@@ -1,0 +1,15 @@
+# Evidence: https://github.com/zPy52/nabedra-database/actions/runs/45273293831/job/138055768464
+id = "O16-INITIAL-CONTROL-REFUSAL"
+title = "A Control election could abort initial worker enrollment"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G06"]
+scenarios = ["O16"]
+found_by = "ci-flake"
+found_date = "2026-11-23"
+lowest_regression = "server/src/oltp_runtime/bootstrap/registered/initial.rs::o16_initial_control_proposal_retries_preappend_refusal_with_same_id"
+seed = "unknown"
+why_not_caught = "The fresh RF3 worker passed a Control read barrier but received a pre-append refusal when it proposed its enrollment. The process test depended on election timing to hit the gap between the read and the write."
+invariant_added = "Retry the initial Control proposal within the startup deadline with its original operation ID. Propagate a completed Control rejection without retrying it."
+fix_commits = ["925757af56fcf942bfa214d122fce3d0ea305c04"]
+revert_patch_ok = false
