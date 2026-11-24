@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-d-queue-4374146-054051--oltp-sim-determinism-unit.log",
+      "sha256": "1f5c08cd93f8364cd0fe6f0cbd50e76923c2bb52937aa60474273422adb2e513"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim-determinism-unit",
+  "duration_s": 203.096,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T04:44:29.862207+00:00",
+    "request_id": "p8-d-queue-4374146-054051",
+    "runner": "GitHub Actions 1000009791",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45328046182"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "437414658598782bcafc0a268fe4a5bfb2a02eeb",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
