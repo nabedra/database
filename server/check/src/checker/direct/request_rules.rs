@@ -80,21 +80,57 @@
 //! - A no-op or `conflict` answer is not an observation if its identity had been used before, with
 //!   the same body or another. A protocol that records no-ops and refusals could give it without
 //!   any effect, so this rule does not depend on the decision about the first.
+//! - Of the `conflict` answers, only the row conflict counts: the one to an `insert` or
+//!   `insert_many` whose recorded message says that a key "already exists". Any other, and any
+//!   without a message, is neither an observation nor a refusal that covers earlier attempts. The
+//!   queued path uses the code when a run was abandoned or fenced, a preparation conflicted, or
+//!   the schema or a route moved, and both paths use it when the identity is taken. None of these
+//!   says that a row exists, and they can mean that another execution of the request holds its
+//!   identity. `sim-oltp` always records the message.
 //! - A completion of type `fail` that does not say `not_applied` is not a refusal here.
 //! - If the history is not linearizable to begin with on the keys involved, apart from those
 //!   answers, [`super::check`] reports that, and this rule says nothing about them.
 //!
-//! Known false hit (found in review, not fixed): like the default, this rule reads the `conflict`
-//! of an insert, on an identity not used before, as an existing row. After a fallback the queued
-//! path uses the code for other reasons, such as an abandoned run. If the covered attempt is the
-//! only thing that could have written such a row, the default accepts the history and this rule
-//! flags it, although nothing took effect. The same holds for a row change the checker does not
-//! model, such as a dropped table.
+//! A change of a row that the checker does not model, such as a dropped table, can still produce a
+//! hit on a legal history.
 //!
 //! A search that reaches its limit is reported as `check-limit`, so it cannot pass silently.
+//!
+//! # Known limits against the decided retry rule
+//!
+//! The retry rule is lead decision 11 of 2026-11-24: "Retry results" in section 4 of
+//! `plans/oltp-direct-path.md`, OLTP-G03 and O08. Neither rule here is that rule. The differences
+//! that the independent review of PR #126 listed:
+//!
+//! 1. Overlapping attempts that disagree are not flagged. The retry rule gives an identity one
+//!    result, so one of the two answers is wrong.
+//! 2. A lone no-op `false` whose effect then appears is flagged by neither rule, and a lone row
+//!    conflict whose effect appears only by the second.
+//! 3. A row conflict is not a result if another body was invoked before its answer, even if the
+//!    message says "already exists" and that other body was refused with a `429`.
+//! 4. Another body that commits after a recorded no-op or row conflict is not flagged, also not by
+//!    default. The retry rule does not say whether those results hold the identity against
+//!    another body. This needs a decision.
+//! 5. The retry rule holds while the dedup record is retained. These rules assume that no record
+//!    expires and do not use `time_ns`.
+//! 6. Row conflicts are recognised by their message. Without one, the first rule counts every
+//!    `conflict` of an insert and the second none. Both include `insert_many`, and the retry rule
+//!    names only `insert`.
+//! 7. Refusals that the retry rule does not list are not results here: a deadline, an abandoned
+//!    request, a preparation conflict, a changed schema, a missing table, a limit and reuse.
+//! 8. The first rule compares pairs of answers by their order, not with "the first" result. The
+//!    recorded result of an attempt that was never answered is invisible to it.
+//! 9. Only the existence flag and the batch count are compared, and an absent one is not.
+//!
+//! The default check is further from the retry rule. It rejects the replay of a recorded no-op or
+//! row conflict, and a refused other body after a no-op. The corpus case `direct_valid_retries`
+//! predates decision 11: it records the shipped recomputing (`false`, then `true`) as valid, which
+//! the plan now calls a known gap. The case and the default are unchanged, so the first rule flags
+//! it.
 
 use super::super::linearizable::{
-    self, Identities, anchor, body, classify, committed_answer, error_code, existed, rows_of,
+    self, DEFAULT_MAX_CONFIGS, Identities, anchor, body, classify, committed_answer, error_code,
+    existed, rows_of,
 };
 use super::super::{Anomaly, Verdict};
 use super::describe;
@@ -103,13 +139,26 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The opt-in rules that [`super::check_with`] adds. The default adds none.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     /// Definite results of one identity and body agree (`unstable-result`).
     pub stable_results: bool,
     /// `not_applied` speaks for the earlier attempts of the request
     /// (`not-applied-took-effect`).
     pub request_not_applied: bool,
+    /// The bound on each search that `request_not_applied` makes, as in
+    /// [`linearizable::Options`].
+    pub max_configs: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            stable_results: false,
+            request_not_applied: false,
+            max_configs: DEFAULT_MAX_CONFIGS,
+        }
+    }
 }
 
 /// The attempts of each identity and body, in invocation order.
@@ -226,16 +275,29 @@ fn says_not_applied(op: &Op) -> bool {
             || op.complete_value.get("not_applied") == Some(&Value::Bool(true)))
 }
 
+fn is_conflict(op: &Op) -> bool {
+    op.outcome == Outcome::Fail && error_code(op) == Some("conflict")
+}
+
+/// A `conflict` whose message says that a row was in the way. Others may be about the identity,
+/// a run, the schema or a route.
+fn is_row_conflict(op: &Op) -> bool {
+    matches!(classify(&op.f), Some("insert" | "insert_many"))
+        && is_conflict(op)
+        && str_field(&op.complete_value, "message").is_some_and(|m| m.contains("already exists"))
+}
+
 /// `not-applied-took-effect`, at most once per identity and body.
-pub(super) fn request_not_applied(events: &[Event], ops: &[Op]) -> Verdict {
+pub(super) fn request_not_applied(events: &[Event], ops: &[Op], max_configs: usize) -> Verdict {
     let ids = Identities::new(ops);
     let requests = requests(&ids, ops);
-    let replays = possible_replays(&ids, ops);
+    let ignored = not_observations(&ids, ops);
     let mut anomalies = Vec::new();
     let mut checked = 0;
     for ((anchor, rid, _), attempts) in requests {
         let mut scope = None;
-        for &refused in attempts.iter().filter(|&&i| says_not_applied(&ops[i])) {
+        let refuses = |op: &Op| says_not_applied(op) && (!is_conflict(op) || is_row_conflict(op));
+        for &refused in attempts.iter().filter(|&&i| refuses(&ops[i])) {
             let returned = ops[refused].ret_pos();
             let committed = |op: &Op| committed_answer(op) == Some(true) && op.call < returned;
             if attempts.iter().any(|&i| committed(&ops[i])) {
@@ -250,7 +312,8 @@ pub(super) fn request_not_applied(events: &[Event], ops: &[Op]) -> Verdict {
                 continue;
             }
             checked += 1;
-            let scope = scope.get_or_insert_with(|| Scope::new(events, ops, &replays, &anchor));
+            let scope = scope
+                .get_or_insert_with(|| Scope::new(events, ops, &ignored, &anchor, max_configs));
             if !scope.base.valid {
                 let limit = scope
                     .base
@@ -294,15 +357,18 @@ pub(super) fn request_not_applied(events: &[Event], ops: &[Op]) -> Verdict {
     Verdict::new(checked, anomalies)
 }
 
-/// No-op and `conflict` answers under an identity that had been used before.
-fn possible_replays(ids: &Identities, ops: &[Op]) -> BTreeSet<usize> {
-    let conflict = |op: &Op| op.outcome == Outcome::Fail && error_code(op) == Some("conflict");
-    let mut out = BTreeSet::new();
+/// Answers that may say nothing about the rows: no-ops and `conflict` refusals under an identity
+/// that had been used before, and every `conflict` that is not a row conflict.
+fn not_observations(ids: &Identities, ops: &[Op]) -> BTreeSet<usize> {
+    let mut out: BTreeSet<usize> = (0..ops.len())
+        .filter(|&i| is_conflict(&ops[i]) && !is_row_conflict(&ops[i]))
+        .collect();
     for members in ids.by_id.values() {
         for &i in members {
             let op = &ops[i];
             let used = |&j: &usize| j != i && ops[j].call < op.ret_pos();
-            if (committed_answer(op) == Some(false) || conflict(op)) && members.iter().any(used) {
+            if (committed_answer(op) == Some(false) || is_conflict(op)) && members.iter().any(used)
+            {
                 out.insert(i);
             }
         }
@@ -316,6 +382,7 @@ struct Scope<'a> {
     ops: &'a [Op],
     /// Operations on the keys that batches connect to the request's anchor.
     members: Vec<usize>,
+    max_configs: usize,
     /// The verdict with every attempt in place.
     base: Verdict,
 }
@@ -324,8 +391,9 @@ impl<'a> Scope<'a> {
     fn new(
         events: &'a [Event],
         ops: &'a [Op],
-        replays: &BTreeSet<usize>,
+        ignored: &BTreeSet<usize>,
         request_anchor: &str,
+        max_configs: usize,
     ) -> Self {
         let mut keys = BTreeSet::from([request_anchor.to_string()]);
         loop {
@@ -346,16 +414,17 @@ impl<'a> Scope<'a> {
             }
         }
         let members: Vec<usize> = (0..ops.len())
-            .filter(|i| classify(&ops[*i].f).is_some() && !replays.contains(i))
+            .filter(|i| classify(&ops[*i].f).is_some() && !ignored.contains(i))
             .filter(|&i| anchor(&ops[i]).is_some_and(|key| keys.contains(&key)))
             .collect();
         let mut scope = Scope {
             events,
             ops,
             members,
+            max_configs,
             base: Verdict::new(0, Vec::new()),
         };
-        scope.base = check(scope.history(|_| true, None, None));
+        scope.base = scope.check(scope.history(|_| true, None, None));
         scope
     }
 
@@ -364,7 +433,7 @@ impl<'a> Scope<'a> {
     /// flight at that position.
     fn without(&self, covered: &BTreeSet<usize>, returned: usize, until: bool) -> Verdict {
         let keep = |i: usize| !covered.contains(&i);
-        check(if until {
+        self.check(if until {
             self.history(keep, Some(returned), None)
         } else {
             self.history(keep, None, Some(returned))
@@ -401,14 +470,14 @@ impl<'a> Scope<'a> {
         events.sort_by_key(|&(position, _)| position);
         events.into_iter().map(|(_, event)| event).collect()
     }
-}
 
-fn check(history: Vec<Event>) -> Verdict {
-    linearizable::check_kv_opts(
-        &history,
-        &linearizable::Options {
-            request_dedup: true,
-            ..linearizable::Options::default()
-        },
-    )
+    fn check(&self, history: Vec<Event>) -> Verdict {
+        linearizable::check_kv_opts(
+            &history,
+            &linearizable::Options {
+                request_dedup: true,
+                max_configs: self.max_configs,
+            },
+        )
+    }
 }

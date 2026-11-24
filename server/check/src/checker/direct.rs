@@ -73,7 +73,11 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
         verdicts.push(request_rules::stable_results(&paired.ops));
     }
     if opts.request_not_applied {
-        verdicts.push(request_rules::request_not_applied(events, &paired.ops));
+        verdicts.push(request_rules::request_not_applied(
+            events,
+            &paired.ops,
+            opts.max_configs,
+        ));
     }
     Verdict::merge(verdicts)
 }

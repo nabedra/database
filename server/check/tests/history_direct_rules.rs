@@ -12,6 +12,7 @@
 //! is neither a valid control nor a planned reproduction (`dr-repro` report).
 
 use nabedra_check::checker::direct::{self, Options};
+use nabedra_check::checker::linearizable::DEFAULT_MAX_CONFIGS;
 use nabedra_check::checker::{Anomaly, Verdict};
 use nabedra_check::history::{Event, EventType, Outcome, pair, read_jsonl, reindex};
 use nabedra_check::rng::SplitMix64;
@@ -25,14 +26,17 @@ const EFFECT: &str = "not-applied-took-effect";
 const STABLE_RESULTS: Options = Options {
     stable_results: true,
     request_not_applied: false,
+    max_configs: DEFAULT_MAX_CONFIGS,
 };
 const NOT_APPLIED: Options = Options {
     stable_results: false,
     request_not_applied: true,
+    max_configs: DEFAULT_MAX_CONFIGS,
 };
 const BOTH: Options = Options {
     stable_results: true,
     request_not_applied: true,
+    max_configs: DEFAULT_MAX_CONFIGS,
 };
 
 fn tests_dir() -> PathBuf {
@@ -176,14 +180,83 @@ fn hits_on_the_existing_corpus_and_fixtures() {
         [
             // Expected invalid already, by `dedup-miss`: `true` and then `false`.
             ("direct_dedup_miss", UNSTABLE),
-            // Expected invalid already, as `non-linearizable`: an insert is refused over the row that
-            // its own lost attempt wrote.
-            ("direct_retry_conflict_after_lost_reply", EFFECT),
             // Expected valid by the default, which follows the shipped executor. `update` r2
             // answers `false`, another client inserts the row, and the retry of r2 answers `true`.
             ("direct_valid_retries", UNSTABLE),
         ]
     );
+}
+
+/// Histories that are legal, or too ambiguous to call illegal, because a `conflict` is not about a
+/// row: a reason of the queued path, a taken identity, or no recorded reason. As another client's
+/// answer (`observer_*`, where nothing took effect) it shows no row. As the refusal (`refused_*`)
+/// it may mean that another execution holds the identity. The rule of `e4f44961` flagged every one.
+#[test]
+fn legal_conflicts_that_are_not_about_a_row_are_not_flagged() {
+    let files = jsonl_files(&tests_dir().join("fixtures/legal_conflicts"));
+    assert_eq!(files.len(), 22);
+    let mut flagged = Vec::new();
+    for (name, path) in files {
+        let events = read(&path);
+        let default = direct::check(&events);
+        assert!(default.valid, "{name}: {:#?}", default.anomalies);
+        if !added(&events, &BOTH).is_empty() {
+            flagged.push(name);
+            continue;
+        }
+        // The same history with a row conflict in its place is flagged.
+        let mut row = events.clone();
+        for event in row.iter_mut().filter(|e| e.kind == EventType::Fail) {
+            if event.value["code"] == "conflict" {
+                event.value["message"] = json!("primary key already exists");
+            }
+        }
+        assert_eq!(kinds(&added(&row, &NOT_APPLIED)), [EFFECT], "{name}");
+    }
+    assert!(flagged.is_empty(), "flagged: {flagged:#?}");
+}
+
+/// Every search of the rule reports its limit: whatever the bound, a history that the rule flags
+/// is flagged or reported as `check-limit`, and never passes.
+#[test]
+fn request_not_applied_reports_its_search_limit() {
+    let text = "3> upsert k 8 a
+         3< info
+         4> upsert k 9 b
+         4< info
+         0> insert k 1 r
+         0< info
+         2> insert k 1 r
+         2< refused overloaded
+         1> get k
+         1< ok 8
+         1> delete k null gone
+         1< ok true
+         1> get k
+         1< ok 1
+         1> get k
+         1< ok 9";
+    let events = history(text);
+    assert!(direct::check(&events).valid);
+    let mut seen = BTreeSet::new();
+    let mut bound = 0;
+    loop {
+        let rules = Options {
+            max_configs: bound,
+            ..NOT_APPLIED
+        };
+        let hits = added(&events, &rules);
+        assert_eq!(hits.len(), 1, "bound {bound}: {hits:#?}");
+        seen.insert(hits[0].detail.split("gave up").next().unwrap().to_string());
+        if hits[0].kind == EFFECT {
+            break;
+        }
+        assert_eq!(hits[0].kind, "check-limit", "bound {bound}");
+        bound += 1;
+        assert!(bound < 10_000);
+    }
+    println!("flagged from bound {bound}: {seen:#?}");
+    assert!(bound > 1);
 }
 
 /// A history from a compact text, one event per line:
@@ -295,6 +368,18 @@ fn stable_results_cases() {
          1< ok true
          1> update k 2 r
          1< ok true",
+    );
+    // The first attempt sent overlaps all others, so the two retries are the ones to compare.
+    flagged(
+        "two later answers under an attempt that is still open",
+        "0> update k 2 r
+         1> update k 2 r
+         1< ok false
+         2> insert k 1 other
+         2< ok
+         3> update k 2 r
+         3< ok true
+         0< ok true",
     );
     // Two commits with different answers are also a default anomaly. The kind is still added.
     let recommitted = "1> insert k 1 other
@@ -520,6 +605,22 @@ fn request_not_applied_cases() {
          3< refused overloaded
          1> get k
          1< ok null",
+    );
+
+    // The links are found last to first, so one pass over the batches misses c. The read of c rules
+    // out y, and then only r explains the refusal of x.
+    flagged(
+        "a key two batch links away",
+        r#"3> insert_many b [{"id":"b","value":7},{"id":"c","value":8}] y
+           3< info
+           0> insert a 1 r
+           0< info
+           2> insert a 1 r
+           2< refused overloaded
+           1> insert_many a [{"id":"a","value":5},{"id":"b","value":6}] x
+           1< exists
+           1> get c
+           1< ok null"#,
     );
 
     legal(
@@ -768,6 +869,7 @@ fn rules_are_off_by_default() {
         Options {
             stable_results: false,
             request_not_applied: false,
+            max_configs: DEFAULT_MAX_CONFIGS,
         }
     );
     for (_, path) in jsonl_files(&tests_dir().join("fixtures/unreviewed_dr1_dr2")) {
@@ -899,7 +1001,9 @@ struct Attempt {
 /// Concurrent clients over few keys. Replies get lost, attempts arrive late, requests are retried
 /// after every kind of answer (also by another client at the same time) and refused before they
 /// run, and some IDs are used again with another body.
-fn generated(seed: u64, operations: usize, reading: Reading) -> Vec<Event> {
+/// With `queued`, some inserts are refused with a `conflict` of the queued path, which is recorded
+/// nowhere and stops nothing.
+fn generated(seed: u64, operations: usize, reading: Reading, queued: bool) -> Vec<Event> {
     let mut rng = SplitMix64::new(seed);
     let mut below = move |n: u64| rng.next_u64() % n;
     let mut store = Store::default();
@@ -1000,6 +1104,12 @@ fn generated(seed: u64, operations: usize, reading: Reading) -> Vec<Event> {
                         }
                     }
                     refusal("overloaded", "direct in-flight budget is full")
+                } else if queued
+                    && request.f.starts_with("insert")
+                    && store.record(request).is_none()
+                    && below(5) == 0
+                {
+                    refusal("conflict", "original request run was abandoned")
                 } else {
                     store.run(request, reading)
                 });
@@ -1033,12 +1143,13 @@ fn a_store_that_keeps_both_promises_is_never_flagged() {
     let (mut unstable, mut effects) = (0, 0);
     let (mut identity_accepted, mut plan_accepted) = (0, 0);
     for seed in 0..200 {
-        let events = generated(seed, 60, Reading::Identity);
-        let hits = added(&events, &BOTH);
-        assert!(hits.is_empty(), "seed {seed}: {hits:#?}");
-        identity_accepted += usize::from(direct::check(&events).valid);
-
-        let events = generated(seed, 60, Reading::Plan);
+        for queued in [false, true] {
+            let events = generated(seed, 60, Reading::Identity, queued);
+            let hits = added(&events, &BOTH);
+            assert!(hits.is_empty(), "seed {seed}, queued {queued}: {hits:#?}");
+            identity_accepted += usize::from(direct::check(&events).valid && !queued);
+        }
+        let events = generated(seed, 60, Reading::Plan, false);
         unstable += usize::from(!added(&events, &STABLE_RESULTS).is_empty());
         effects += usize::from(!added(&events, &NOT_APPLIED).is_empty());
         plan_accepted += usize::from(direct::check(&events).valid);
