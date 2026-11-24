@@ -1702,7 +1702,7 @@
 {"file":"server/src/cache/cluster/sim/mutants.rs","hash":"f7448355065f4dc7","id":"server/src/cache/cluster/sim/mutants.rs::planted_staged_promotion_before_fence_scripted_and_search","lang":"rust"},
 {"file":"server/src/cache/cluster/sim/mutants.rs","hash":"6d362fbda760c6c6","id":"server/src/cache/cluster/sim/mutants.rs::planted_staged_promotion_beyond_lag_scripted_and_search","lang":"rust"},
 {"file":"server/src/cache/cluster/sim/mutants.rs","hash":"8c0ddb65c3e38dda","id":"server/src/cache/cluster/sim/mutants.rs::planted_staged_promotion_on_retirement_scripted_and_search","lang":"rust"},
-{"file":"server/src/cache/cluster/sim/mutants.rs","hash":"9566194aa7a4fc4e","id":"server/src/cache/cluster/sim/mutants.rs::staged_promotion_after_live_source_retirement_waits_for_grant","lang":"rust"},
+{"file":"server/src/cache/cluster/sim/mutants.rs","hash":"279009a775342894","id":"server/src/cache/cluster/sim/mutants.rs::staged_promotion_after_live_source_retirement_waits_for_grant","lang":"rust"},
 {"file":"server/src/cache/cluster/sim/tests.rs","hash":"f45a3790ffa7594b","id":"server/src/cache/cluster/sim/tests.rs::nightly_regressions","lang":"rust"},
 {"file":"server/src/cache/cluster/sim/tests.rs","hash":"efa4cb7f7343eae8","id":"server/src/cache/cluster/sim/tests.rs::same_seed_same_trace","lang":"rust"},
 {"file":"server/src/cache/cluster/sim/tests.rs","hash":"52fffb3eecac3eb0","id":"server/src/cache/cluster/sim/tests.rs::seed_sweep","lang":"rust"},

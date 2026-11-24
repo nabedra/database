@@ -355,8 +355,10 @@ impl Cluster {
     /// running. The enrollment retires the running incarnation, as an
     /// operator replacement does when the old host is cut off but alive.
     /// The replacement presents the node's certificate, so the request is
-    /// sent from the node's address. Only that request crosses the
-    /// controller links: they are opened for it and closed again.
+    /// sent from the node's address over links opened to the leader until it
+    /// answers. The old process shares that address, so its own heartbeat can
+    /// cross too: it renews before the enrollment applies, and is refused
+    /// after. Read the committed grant after this returns.
     pub async fn enroll_replacement(&mut self, node: u64) -> Reply {
         self.next_incarnation += 1;
         let member = member(node, Uuid::from_u128(u128::from(self.next_incarnation)));

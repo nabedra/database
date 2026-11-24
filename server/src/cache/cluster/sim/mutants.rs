@@ -83,7 +83,7 @@ impl Case {
             declared_ppm: 10,
             skew: matches!(
                 self,
-                Self::BoundIgnored | Self::LocalSkew | Self::ExcessDrift(_)
+                Self::BoundIgnored | Self::LocalSkew | Self::ExcessDrift(_) | Self::RetiredStaged
             ),
             gradual_drift: false,
             knobs: Knobs {
@@ -444,6 +444,10 @@ async fn retired_source_schedule(
     cluster.isolate_controller_links(old.node);
     let reply = cluster.enroll_replacement(old.node).await;
     assert!(matches!(reply, Reply::Applied { .. }), "{reply:?}");
+    cluster.trace(format_args!(
+        "retired source {} staged target {}",
+        old.node, target.node
+    ));
     let grant = cluster.slot(slot).lease.expect("source grant");
     let expiry = grant.expires_ms - nabedra_rt::sim::EPOCH_MS;
     assert!(
@@ -496,14 +500,16 @@ async fn retired_source_schedule(
         assert_eq!(promoted.lease.unwrap().not_before_ms, grant.expires_ms);
     }
 
-    // The retired source still accepts writes until its grant ends.
-    let _ = cluster
-        .send(
-            key,
-            Op::Set("source-after-retire".into(), None),
-            Some(old.node),
-        )
-        .await;
+    // The retired source still accepts writes after the promotion commits.
+    assert!(write_ok(
+        cluster
+            .send(
+                key,
+                Op::Set("source-after-retire".into(), None),
+                Some(old.node),
+            )
+            .await
+    ));
     let deadline = expiry + STAGED_RESET_GRACE_MS + 2 * RENEW_MS;
     let first_authorized = loop {
         if cluster
@@ -779,17 +785,21 @@ fn planted_staged_promotion_on_retirement_scripted_and_search() {
     search(Case::RetiredStaged);
 }
 
-/// R-cache-14 and decision 6: retirement alone never lets the staged target
-/// serve while the retired source's grant is live.
+/// R-cache-14 and decision 6: retirement alone does not let the staged target
+/// serve while the retired source's grant is live. Clocks sit at the edges of
+/// their bound. Node 11 runs slow and the other workers run fast.
 #[test]
 fn staged_promotion_after_live_source_retirement_waits_for_grant() {
-    for seed in [1, 2, 3] {
-        let clean = run_case(Case::RetiredStaged, seed, false, false, true);
+    let runs = [(1, false), (2, false), (3, false)]
+        .into_iter()
+        .chain((1..=12).map(|seed| (seed, true)));
+    for (seed, generated) in runs {
+        let clean = run_case(Case::RetiredStaged, seed, generated, false, true);
         assert_clean(Case::RetiredStaged, seed, &clean);
-        let replay = run_case(Case::RetiredStaged, seed, false, false, true);
+        let replay = run_case(Case::RetiredStaged, seed, generated, false, true);
         assert_replay(seed, &clean, &replay);
         println!(
-            "Cache staged promotion after retirement seed {seed}: trace {:016x} events {}",
+            "Cache staged promotion after retirement seed {seed} generated {generated}: trace {:016x} events {}",
             clean.trace_hash, clean.trace_events
         );
     }
