@@ -649,13 +649,10 @@ impl QuorumEndpoint {
     async fn check_mount(
         &self,
         proof: ReplacementMountProof,
-        retained: bool,
+        _retained: bool,
     ) -> Result<bool, ProtocolError> {
         let control = &self.control;
         let mounted = control.check_replacement_mount(&proof).await?;
-        if mounted && !retained {
-            return Err(mounted_conflict());
-        }
         Ok(mounted)
     }
 
