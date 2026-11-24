@@ -97,7 +97,6 @@ checks the register requires. Follow the [evidence rules](references/evidence.md
 ## Pull request body
 
 Every pull request body carries the following four lines.
-`scripts/testing/pr_lint.py` checks them in the pull-request gate.
 
 ```text
 Guarantees: <affected guarantee IDs, or none>
@@ -108,6 +107,15 @@ Reviewers: <non-author reviewers and their verdicts, or pending cross-model revi
 
 A pull request that carries a reviewed plan adds the `Design:` line from
 the [design review](../design-review/SKILL.md#pull-request-body).
+
+Actions does not check the body. The author and the reviewer run
+`scripts/testing/pr_lint.py` by hand on the final body. It also says when
+the diff needs the `Design:` line.
+
+```sh
+gh pr view "$PR" --json body --jq .body | python3 scripts/testing/pr_lint.py - \
+  --base "$(git merge-base origin/main HEAD)" --head "$(git rev-parse HEAD)"
+```
 
 ## Rubric-style reviewing
 

@@ -54,9 +54,15 @@ the wall-clock budget of each run: 15 minutes for L1 and L2, 60 for L3.
 and every kind T check when `specs/lib/**` or `specs/tools/**` changes.
 
 Every `INVARIANT` and `PROPERTY` of a baseline needs a mutant whose
-`\* expect:` line names it. Only a type invariant may be exempted, with a
-line in the baseline cfg such as
+`\* expect:` line names it, and the baselines check at least one. Only a
+type invariant, with `Type` in its name, may be exempted, with a line in the
+baseline cfg such as
 `\* no-mutant: TypeOK -- the type invariant; every run checks it.`
+
+A `CONSTRAINT`, an `ACTION_CONSTRAINT` and an override of a defined operator
+need a line `\* limit: <Name> -- <reason>` in the cfg. The runner refuses
+other limits on the search, such as a depth limit or a `VIEW`. See
+[limits on the search](../.agents/skills/design-review/references/tla.md#limits-on-the-search).
 
 ## Run
 
@@ -152,7 +158,7 @@ length, or the trace counts. Logs and counterexamples are artifacts.
 | Outcome | Result |
 | --- | --- |
 | Every baseline exhaustive and clean, every action covered, every property mutated, every mutant caught on its property | `pass` |
-| A baseline violation, a coverage gap, an unmutated property, or a mutant that passes, errs or fails on another property | `fail` |
+| A baseline violation, a coverage gap, no property or an unmutated one, an undeclared or refused limit on the search, or a mutant that passes, errs or fails on another property | `fail` |
 | A baseline stopped at the time budget or a state cap, with no failure | `not-run` |
 | A baseline TLC error, such as a parse or evaluation error, or a success message with a nonzero exit | `error` |
 | A trace no behavior explains, a lint failure, or an expected rejection or trace mutant that does not happen as expected | `fail` |

@@ -192,7 +192,7 @@ interim rule until it lands.
 | `T` in `KINDS` in `scripts/testing/evidence.py`, read by `matrix.py` and `run_check.py` | Landed | None. A T check needs `needs = ["tlc"]` and `result_parser = "tlc"`. |
 | A pinned TLC and Apalache image (`specs/tools/`), and a `tlc` need for the `checks` job | Landed | None. Run `specs/tools/tlc` locally; results stay `local, unattested`. |
 | A `tlc` result parser in `run_check.py`, fed by `scripts/testing/tla_check.py` and `tla_trace.py` | Landed | None. |
-| A `Design:` line check in `scripts/testing/pr_lint.py` | Landed | None. The pull-request gate requires the line when the diff changes `specs/**`, a plan's `## Design review` section, or a path of an L2 or L3 module that is not Markdown or is a design document such as `DESIGN.md`. Write `none: <reason>` when no spec applies. |
+| A `Design:` line check in `scripts/testing/pr_lint.py` | Landed | None. Nothing on Actions runs it: the author and the reviewer [run it by hand](../code-review/SKILL.md#pull-request-body). It requires the line when the diff changes `specs/**`, a plan's `## Design review` section, or a path of an L2 or L3 module that is not Markdown or is a design document such as `DESIGN.md`. Write `none: <reason>` when no spec applies. |
 | Trace output from simulation workloads | Missing | The first plan that specs a module adds trace output to its workload, in the format of `nabedra.trace/1`. The simulator wave owns the workloads; see `wave-p8/design-review.md` in the wave files. |
 
 [Specs](../../../specs/README.md) lists the tool versions, the commands and
