@@ -1,0 +1,17 @@
+id = "oltp-initial-control-proposal"
+module = "oltp"
+kinds = ["U"]
+guarantees = []
+scenarios = ["O16", "NS14"]
+tiers = ["T1"]
+command = ["bash", "-ec", '''
+python3 scripts/testing/repeat_gate.py --features oltp <<'JSON'
+[
+  {"id":"o16_initial_control_proposal_retries_preappend_refusal_with_same_id","file":"server/src/oltp_runtime/bootstrap/registered/initial.rs","lang":"rust"}
+]
+JSON
+''']
+cwd = "."
+timeout_s = 1800
+needs = []
+result_parser = "exit-code"

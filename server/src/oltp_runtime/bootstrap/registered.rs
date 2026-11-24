@@ -20,6 +20,7 @@ use crate::oltp_replication::{
 
 mod cold;
 mod data_worker;
+mod initial;
 mod restart;
 mod system_replacement;
 
@@ -276,16 +277,16 @@ impl LocalServices {
                         Some(_) if worker.restored.is_some() => return Err(unavailable()),
                         Some(_) => return Err(failure("registered initial run or topology policy differs")),
                         None if local.worker_id == seed => {
-                            accepted(
-                                control
-                                    .initialize_local(
-                                        operator,
-                                        id(worker.bootstrap_id, b"initialize"),
-                                        worker.initial_run,
-                                    )
-                                    .await?
-                                    .reply,
-                            )?;
+                            initial::propose(
+                                deadline,
+                                &error_trace,
+                                "initialize Control",
+                                id(worker.bootstrap_id, b"initialize"),
+                                |operation| {
+                                    control.initialize_local(operator, operation, worker.initial_run)
+                                },
+                            )
+                            .await?;
                         }
                         _ => {}
                     }
@@ -296,18 +297,22 @@ impl LocalServices {
                     if old.is_some() {
                         return Err(failure("registered worker enrollment differs"));
                     }
-                    accepted(
-                        control
-                            .enroll_local(
+                    initial::propose(
+                        deadline,
+                        &error_trace,
+                        "enroll initial worker",
+                        id(local.incarnation, b"enroll"),
+                        |operation| {
+                            control.enroll_local(
                                 operator,
-                                id(local.incarnation, b"enroll"),
+                                operation,
                                 None,
                                 worker.enrollment.clone(),
                                 None,
                             )
-                            .await?
-                            .reply,
-                    )?;
+                        },
+                    )
+                    .await?;
                 }
                 None
             };
