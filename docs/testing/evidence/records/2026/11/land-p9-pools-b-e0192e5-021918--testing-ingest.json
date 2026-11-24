@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p9-pools-b-e0192e5-021918--testing-ingest.log",
+      "sha256": "9ccbe9dbe4e3c716c51b8fac2a1e6c1b8cd5fd89a04fdc42c1b3d372ddd17b78"
+    }
+  ],
+  "assertions": {
+    "executed": 19,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "testing-ingest",
+  "duration_s": 3.171,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T02:47:35.091632+00:00",
+    "request_id": "land-p9-pools-b-e0192e5-021918",
+    "runner": "GitHub Actions 1000009544",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45311493319"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "e0192e5d4dcb6125e42b82cf924bfa2fb80c80ec",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
