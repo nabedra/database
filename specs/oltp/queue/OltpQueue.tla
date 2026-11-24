@@ -17,10 +17,9 @@
 \* A1 Control (ready view, owner, run) and Status (identity reservation and
 \*    decision) are linearizable, so each update is one step.
 \* A2 A queue copy is one step: the owner sends its current version and the
-\*    holder installs and acknowledges it. A lost install or a lost reply to
-\*    a client is the step not being taken, because only the receiver
-\*    changes. A lost copy acknowledgment reaches the same state as an owner
-\*    crash right after the install, because the barrier is volatile.
+\*    holder installs it. A lost install is the step not being taken; a lost
+\*    acknowledgment is a budgeted branch. A lost reply to a client is
+\*    ReplyClient not being taken, which changes only ghost variables.
 \* A3 The phase is the record version, and holders receive the payload,
 \*    accepted and terminal versions. The code also copies a Running version
 \*    before dispatch; the spec keeps execution state in the attempt, because
@@ -51,7 +50,8 @@ CONSTANTS
     MaxPartition,   \* a live worker cut off from Control and peers
     MaxStop,        \* full stops of every worker (operator or power)
     MaxLane,        \* a transient local lane refusal during execution
-    MaxReceiptFault \* a transient receipt lookup failure
+    MaxReceiptFault, \* a transient receipt lookup failure
+    MaxLostAck      \* a copy installed by its holder whose ACK is lost
 
 -----------------------------------------------------------------------------
 \* Variables
@@ -76,7 +76,7 @@ VARIABLES
     \* Attempts. A submitted decision outlives its worker.
     atts,
     \* Fault budget counters.
-    nCrash, nPart, nStop, nLane, nRcpt,
+    nCrash, nPart, nStop, nLane, nRcpt, nLostAck,
     \* Ghost variables for client-visible properties.
     applied,    \* applied[r]: Data publications of r
     commitRun,  \* run of the attempt that published r
@@ -93,7 +93,7 @@ VARIABLES
 control == <<run, ready, owner, joining, sealed>>
 durable == <<ident, fenceRun>>
 worker  == <<up, conn, view, q, acks, held>>
-faults  == <<nCrash, nPart, nStop, nLane, nRcpt>>
+faults  == <<nCrash, nPart, nStop, nLane, nRcpt, nLostAck>>
 ghost   == <<applied, commitRun, firstRun, ackRun, obs, everAb, everNA,
              everAcc, regress, lostHeld, spurious>>
 ghostNoAcc == <<applied, commitRun, firstRun, ackRun, obs, everAb, everNA,
@@ -195,6 +195,7 @@ Init ==
     /\ held = [w \in Workers |-> [r \in Reqs |-> 0]]
     /\ atts = {}
     /\ nCrash = 0 /\ nPart = 0 /\ nStop = 0 /\ nLane = 0 /\ nRcpt = 0
+    /\ nLostAck = 0
     /\ applied = [r \in Reqs |-> 0] /\ commitRun = [r \in Reqs |-> 0]
     /\ firstRun = [r \in Reqs |-> 0] /\ ackRun = [r \in Reqs |-> 0]
     /\ obs = [r \in Reqs |-> "none"]
@@ -263,8 +264,14 @@ InstallCopy(w, r) ==
     /\ w \notin acks[r]
     /\ Rank(q[w][r]) <= Rank(q[owner][r])
     /\ q' = [q EXCEPT ![w][r] = q[owner][r]]
-    /\ acks' = [acks EXCEPT ![r] = @ \cup {w}]
-    /\ UNCHANGED <<control, durable, up, conn, view, held, atts, faults, ghostNoAcc>>
+    /\ \/ /\ acks' = [acks EXCEPT ![r] = @ \cup {w}]
+          /\ UNCHANGED nLostAck
+       \/ \* Fully transmitted but unacknowledged: the owner sends it again.
+          /\ nLostAck < MaxLostAck
+          /\ nLostAck' = nLostAck + 1
+          /\ UNCHANGED acks
+    /\ UNCHANGED <<control, durable, up, conn, view, held, atts, nCrash, nPart,
+                   nStop, nLane, nRcpt, ghostNoAcc>>
     /\ AccSeen
 
 \* The last payload ACK lets the owner create the accepted version
@@ -282,19 +289,20 @@ AcceptStaged(r) ==
 \* receipt (receipt_owned). Acceptance follows a complete barrier on the
 \* accepted version. A terminal record answers "succeeded" only with its
 \* terminal copy confirmed in the owner's current view, else "committing"
-\* (pending). The candidate fix fix_receipt_from_status answers a terminal
-\* mutation from its durable Status decision instead.
+\* (pending). The candidate fix fix_receipt_from_status answers a mutation
+\* from its durable Status decision whenever Status has one, whatever the
+\* local record says.
 ReplyClient(r) ==
     /\ OwnerOK
     /\ LET p == q[owner][r]
-           ans == CASE p = "queued" -> "accepted"
+           decided == Mutant = "fix_receipt_from_status" /\ ident[r].st = "committed"
+           ans == CASE p \in {"queued", "done"} /\ decided -> "succeeded"
+                    [] p = "queued" -> "accepted"
                     [] p = "done" /\ Copied(r) -> "succeeded"
-                    [] p = "done" /\ Mutant = "fix_receipt_from_status"
-                                  /\ ident[r].st = "committed" -> "succeeded"
                     [] p = "done" -> "pending"
                     [] OTHER -> "failed"
        IN /\ p \in AccPh
-          /\ p = "queued" => Complete(r)
+          /\ ans = "accepted" => Complete(r)
           /\ p = "failed" => Copied(r)
           /\ ans = "pending" => (obs[r] \in TermObs /\ ~regress)
           /\ ans # "pending" => obs[r] # ans
@@ -359,7 +367,7 @@ LaneRefused(a) ==
                     /\ acks' = [acks EXCEPT ![a.r] = {a.w}]
                ELSE UNCHANGED <<q, acks>>
        ELSE UNCHANGED <<atts, held, q, acks>>
-    /\ UNCHANGED <<control, durable, up, conn, view, nCrash, nPart, nStop, nRcpt, ghost>>
+    /\ UNCHANGED <<control, durable, up, conn, view, nCrash, nPart, nStop, nRcpt, nLostAck, ghost>>
 
 \* Status applies the decision once per identity (OLTP-G03), and only for
 \* the run its fence admits (T05, O15). A fenced write applies nothing.
@@ -444,7 +452,7 @@ ReceiptFault(r) ==
     /\ nRcpt' = nRcpt + 1
     /\ Observe(r, IF Mutant = "acc3_receipt_early" THEN "notapplied" ELSE "unknown")
     /\ UNCHANGED <<control, durable, worker, atts, nCrash, nPart, nStop, nLane,
-                   applied, commitRun, firstRun, ackRun, everAcc, lostHeld, spurious>>
+                   nLostAck, applied, commitRun, firstRun, ackRun, everAcc, lostHeld, spurious>>
 
 -----------------------------------------------------------------------------
 \* Membership: view installation, removal, rejoin and join (plan: "Recover
@@ -554,14 +562,14 @@ Crash(w) ==
     /\ acks' = IF w = owner THEN [r \in Reqs |-> {}] ELSE acks
     /\ joining' = IF w = joining THEN NoW ELSE joining
     /\ sealed' = IF w = owner \/ w = joining THEN FALSE ELSE sealed
-    /\ UNCHANGED <<run, ready, owner, durable, conn, nPart, nStop, nLane, nRcpt, ghost>>
+    /\ UNCHANGED <<run, ready, owner, durable, conn, nPart, nStop, nLane, nRcpt, nLostAck, ghost>>
 
 Partition(w) ==
     /\ up[w] /\ conn[w] /\ nPart < MaxPartition
     /\ nPart' = nPart + 1
     /\ conn' = [conn EXCEPT ![w] = FALSE]
     /\ UNCHANGED <<control, durable, up, view, q, acks, held, atts, nCrash,
-                   nStop, nLane, nRcpt, ghost>>
+                   nStop, nLane, nRcpt, nLostAck, ghost>>
 
 Heal(w) ==
     /\ ~conn[w]
@@ -580,7 +588,7 @@ StopAll ==
     /\ atts' = {[a EXCEPT !.w = NoW] : a \in {b \in atts : b.st = "put"}}
     /\ acks' = [r \in Reqs |-> {}]
     /\ joining' = NoW /\ sealed' = FALSE
-    /\ UNCHANGED <<run, ready, owner, durable, conn, nCrash, nPart, nLane, nRcpt, ghost>>
+    /\ UNCHANGED <<run, ready, owner, durable, conn, nCrash, nPart, nLane, nRcpt, nLostAck, ghost>>
 
 -----------------------------------------------------------------------------
 \* Cold start (plan: "A deliberate cold start after all queue holders have
