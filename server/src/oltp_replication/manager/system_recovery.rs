@@ -15,6 +15,7 @@ use crate::{
         },
     },
 };
+use nabedra_oltp_types::queue::{PeerReachability, QueueScope};
 use openraft::{Instant as _, type_config::TypeConfigExt as _};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -500,9 +501,18 @@ impl HostedGroupManager {
     }
 }
 
+pub(crate) type ProbeQueuePeer = fn(
+    &HostedGroupManager,
+    &GroupIdentity,
+    WorkerIdentity,
+    QueueScope,
+    ReadyMembership,
+) -> EndpointFuture<'static, PeerReachability>;
+
 pub(crate) struct QuorumEndpoint {
     pub manager: Arc<HostedGroupManager>,
     pub control: Arc<ControlHandle>,
+    pub probe_queue_peer: ProbeQueuePeer,
 }
 impl QuorumEndpoint {
     fn parse(
@@ -538,10 +548,6 @@ impl QuorumEndpoint {
 }
 impl QuorumEndpoint {
     async fn mount(&self, proof: ReplacementMountProof) -> Result<(), ProtocolError> {
-        use crate::oltp_runtime::{
-            replica::QueueScope,
-            worker_endpoint::{PeerReachability, QueuePeerClient},
-        };
         let control = &self.control;
         let running = self.manager.local_control(control.identity())?;
         if running.raft.current_leader().await != Some(running.state.resident().node_id()) {
@@ -574,13 +580,10 @@ impl QuorumEndpoint {
                 cluster_id: control.identity().cluster_id,
                 database: control.identity().database.clone(),
             };
-            let peer = QueuePeerClient::new(
-                self.manager.client(),
-                self.manager.shared.clone(),
-                control.identity().clone(),
-            )?;
             let lost = record.intent.previous;
-            match peer.probe(lost, scope, state.ready).await {
+            match (self.probe_queue_peer)(&self.manager, control.identity(), lost, scope, state.ready)
+                .await?
+            {
                 PeerReachability::Unreachable => {}
                 PeerReachability::Reachable => return Err(reachable()),
                 PeerReachability::Indeterminate => return Err(unavailable()),

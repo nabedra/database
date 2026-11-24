@@ -949,8 +949,8 @@ fn unavailable() -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nabedra_resources::config::WorkerResources;
     use crate::{
-        config::WorkerResources,
         oltp::pool::SharedResourceConfig,
         oltp_replication::types::{Digest, Text},
     };

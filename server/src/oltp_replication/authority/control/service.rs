@@ -9,14 +9,12 @@ use crate::{
         authority::consensus::{Applied, Consensus},
         multiplex::{AuthenticatedSession, EndpointFuture, Purpose},
         owned::OwnedCommand,
+        queue_access::{AuthorityReader, JoinObservation, QueueCopySource, RemovalObservation},
         types::*,
-    },
-    oltp_runtime::{
-        replica::{QueueAuthority, QueueScope},
-        worker_endpoint::AuthorityReader,
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
+use nabedra_oltp_types::queue::{QueueAuthority, QueueScope};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc};
 use uuid::Uuid;
@@ -154,11 +152,11 @@ pub(crate) struct RemovalCopyVerifier {
 impl RemovalCopyVerifier {
     pub(crate) fn observe_local(
         &mut self,
-        replica: &crate::oltp_runtime::replica::WorkerReplica,
+        replica: &impl QueueCopySource,
     ) -> Result<(), ProtocolError> {
         if replica
             .removal_statement(self.statement.ticket)
-            .map_err(crate::request_queue::QueueError::protocol)?
+            .map_err(nabedra_protocol::QueueError::protocol)?
             != self.statement
         {
             return Err(unauthorized());
@@ -169,7 +167,7 @@ impl RemovalCopyVerifier {
     }
     pub(crate) fn observe(
         &mut self,
-        observation: crate::oltp_runtime::worker_endpoint::RemovalObservation,
+        observation: RemovalObservation,
     ) -> Result<(), ProtocolError> {
         let (worker, statement, nonce) = observation.into_parts();
         if nonce.is_nil() || statement != self.statement {
@@ -179,15 +177,15 @@ impl RemovalCopyVerifier {
     }
     pub(crate) fn finish(
         self,
-        source: &crate::oltp_runtime::replica::WorkerReplica,
+        source: &impl QueueCopySource,
     ) -> Result<VerifiedQueueCopy, ProtocolError> {
         let (root, count) = source
             .removal_ready_root(self.statement.ticket)
-            .map_err(crate::request_queue::QueueError::protocol)?;
+            .map_err(nabedra_protocol::QueueError::protocol)?;
         if !source.removal_frozen(self.statement.ticket)
             || source
                 .removal_statement(self.statement.ticket)
-                .map_err(crate::request_queue::QueueError::protocol)?
+                .map_err(nabedra_protocol::QueueError::protocol)?
                 != self.statement
             || self.ready.finish() != root
             || self.ready.count() != count
@@ -201,7 +199,7 @@ impl RemovalCopyVerifier {
 }
 impl VerifiedQueueCopy {
     pub(crate) fn begin_removal(
-        source: &crate::oltp_runtime::replica::WorkerReplica,
+        source: &impl QueueCopySource,
         ticket: JoinTicket,
     ) -> Result<RemovalCopyVerifier, ProtocolError> {
         if source.local_identity() != source.authority().owner || !source.removal_frozen(ticket) {
@@ -210,18 +208,18 @@ impl VerifiedQueueCopy {
         Ok(RemovalCopyVerifier {
             statement: source
                 .removal_statement(ticket)
-                .map_err(crate::request_queue::QueueError::protocol)?,
+                .map_err(nabedra_protocol::QueueError::protocol)?,
             ready: crate::oltp_replication::ReadySetHasher::default(),
         })
     }
     pub(crate) fn from_join(
-        source: &crate::oltp_runtime::replica::WorkerReplica,
-        current: crate::oltp_runtime::replica::QueueAuthority,
-        target: crate::oltp_runtime::worker_endpoint::JoinObservation,
+        source: &impl QueueCopySource,
+        current: QueueAuthority,
+        target: JoinObservation,
     ) -> Result<Self, ProtocolError> {
         let statement = source
             .join_statement(current)
-            .map_err(crate::request_queue::QueueError::protocol)?;
+            .map_err(nabedra_protocol::QueueError::protocol)?;
         let (worker, observed, nonce) = target.into_parts();
         if nonce.is_nil()
             || source.local_identity() != statement.source
@@ -234,12 +232,12 @@ impl VerifiedQueueCopy {
     }
     pub(crate) fn from_empty_worker(
         ticket: JoinTicket,
-        replica: &crate::oltp_runtime::replica::WorkerReplica,
+        replica: &impl QueueCopySource,
     ) -> Result<Self, ProtocolError> {
         Ok(Self {
             statement: replica
                 .empty_bootstrap_statement(ticket)
-                .map_err(crate::request_queue::QueueError::protocol)?,
+                .map_err(nabedra_protocol::QueueError::protocol)?,
         })
     }
 }
@@ -917,7 +915,7 @@ impl ControlHandle {
         &self,
         read: impl FnOnce(&mut GroupRead<'_>) -> Result<ChargedBytes, ProtocolError> + Send + 'static,
     ) -> impl std::future::Future<Output = Result<ChargedBytes, ProtocolError>> + Send + '_ {
-        let site = crate::oltp_runtime::stage_timing::site(
+        let site = nabedra_resources::stage_timing::site(
             "control.barrier.site.",
             std::panic::Location::caller(),
         );

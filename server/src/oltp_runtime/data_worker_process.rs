@@ -500,8 +500,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         if let Some(limits) = scoped_limits {
             replica.install_scoped_queues(limits).map_err(QueueError::protocol)?;
         }
-        let replica = Arc::new(Mutex::new(replica));
-        shared.bind_read_replica(&replica)?;
+        let replica = replica.bind_for_reads(&shared)?;
         let endpoint = QueueEndpoint::new(
             replica.clone(),
             shared.clone(),

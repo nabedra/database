@@ -1,4 +1,5 @@
 use super::super::tests::{Fixture, ready, worker};
+use nabedra_oltp_types::queue::OriginalAuthorization;
 use super::*;
 use crate::{
     oltp::{
@@ -24,7 +25,6 @@ use crate::{
         multiplex::{ChargedSections, MAX_SECTIONS},
         owned::serialized_digest,
     },
-    oltp_runtime::replica::OriginalAuthorization,
 };
 
 // Apply real log entries locally and model only the Raft read barrier.

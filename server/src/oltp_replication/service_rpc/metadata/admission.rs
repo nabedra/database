@@ -2,34 +2,27 @@
 //! executable body; the owner retains the real UUID gate until Status settles.
 use super::*;
 use crate::oltp_replication::authority::consensus::ConsensusFuture;
-use crate::oltp_runtime::worker_runtime::VerifiedNeverAccepted;
+use crate::oltp_replication::queue_access::NeverAcceptedAdmission;
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct OwnerAdmissionTicket {
-    pub owner: WorkerIdentity,
-    pub nonce: Uuid,
-    pub status_group: GroupIdentity,
-    pub expected: RejectedIdentity,
+pub(crate) use nabedra_oltp_types::queue::OwnerAdmissionTicket;
+
+pub(crate) fn ticket_matches(ticket: &OwnerAdmissionTicket, cap: &dyn NeverAcceptedAdmission, group: &GroupIdentity) -> bool {
+    ticket.nonce != Uuid::nil()
+        && ticket.status_group == *group
+        && ticket.expected.reservation == cap.reservation()
+        && ticket.expected.view == cap.view()
+        && ticket.expected.identity == *cap.identity()
+        && ticket.expected.pin == cap.pin()
+        && ticket.expected.request == cap.request()
+        && ticket.expected.failure.result().err().as_ref() == Some(cap.failure())
 }
-impl OwnerAdmissionTicket {
-    pub(crate) fn matches(&self, cap: &VerifiedNeverAccepted, group: &GroupIdentity) -> bool {
-        self.nonce != Uuid::nil()
-            && self.status_group == *group
-            && self.expected.reservation == cap.reservation()
-            && self.expected.view == cap.view()
-            && self.expected.identity == *cap.identity()
-            && self.expected.pin == cap.pin()
-            && self.expected.request == cap.request()
-            && self.expected.failure.result().err().as_ref() == Some(cap.failure())
-    }
-}
+
 /// Implemented by the owner registry. It registers only a live, owned gate.
 pub(crate) trait AdmissionTicketIssuer: Send + Sync {
     fn issue<'a>(
         &'a self,
-        cap: &'a VerifiedNeverAccepted,
+        cap: &'a dyn NeverAcceptedAdmission,
         status: &'a GroupIdentity,
     ) -> ConsensusFuture<'a, OwnerAdmissionTicket>;
 }

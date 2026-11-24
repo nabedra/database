@@ -1,28 +1,27 @@
 pub(crate) use crate::oltp::read_attempt::{ScheduledReadError, UnsettledRead};
-use crate::{
-    oltp::{mvcc::store::consensus::ConsensusFuture, read_attempt::ReadGrantSettlement},
-    oltp_runtime::coordinator::QueueCoordinator,
+use crate::oltp::{
+    mvcc::store::consensus::ConsensusFuture, pool::WorkerSharedResources,
+    read_attempt::ReadGrantSettlement,
 };
+use crate::protocol::ProtocolError;
 pub use nabedra_oltp_types::authority::{ReadGrant, ReadScope};
+use nabedra_oltp_types::types::{Authority, WorkerIdentity};
+use nabedra_resources::memory::{ChargedBytes, capacity};
+use std::sync::{Arc, Weak};
+use uuid::Uuid;
 
 #[cfg(test)]
 pub(crate) mod fixture;
 
-impl ReadGrantSettlement for QueueCoordinator {
-    fn settle_read_grant(&self, grant: ReadGrant) -> ConsensusFuture<'_, ()> {
-        Box::pin(QueueCoordinator::settle_read_grant(self, grant))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WorkerResources;
     use crate::oltp::{
         pool::WorkerSharedResources,
         read_attempt::{ATTEMPT_BYTES, UNUSED_LIFETIME},
     };
     use nabedra_oltp_types::types::{Authority, Digest, ReadTs, RequestBinding, WorkerIdentity};
+    use nabedra_resources::config::WorkerResources;
     use uuid::Uuid;
 
     #[tokio::test(start_paused = true)]
@@ -101,4 +100,89 @@ mod tests {
         assert!(book.claim(live.ticket, worker, group, grant.node).is_err());
         assert_eq!(shared.scheduler().usage(), base);
     }
+}
+
+/// The worker-local view used to verify and route scheduled participant reads.
+pub(crate) trait ReplicaReadSource: Send + Sync + 'static {
+    fn scan_context(
+        &self,
+        scope: ReadScope,
+        owner: WorkerIdentity,
+        target: WorkerIdentity,
+    ) -> Result<ChargedBytes, ProtocolError>;
+
+    fn knows_read_grant(&self, grant: ReadGrant) -> Result<bool, ProtocolError>;
+
+    fn read_member(
+        &self,
+        authority: Authority,
+        worker: Uuid,
+    ) -> Result<Option<WorkerIdentity>, ProtocolError>;
+
+    fn local_identity(&self) -> Result<WorkerIdentity, ProtocolError>;
+}
+
+impl<T: ReplicaReadSource> ReplicaReadSource for std::sync::Mutex<T> {
+    fn scan_context(
+        &self,
+        scope: ReadScope,
+        owner: WorkerIdentity,
+        target: WorkerIdentity,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.lock()
+            .map_err(|_| super::unavailable())?
+            .scan_context(scope, owner, target)
+    }
+
+    fn knows_read_grant(&self, grant: ReadGrant) -> Result<bool, ProtocolError> {
+        self.lock()
+            .map_err(|_| super::unavailable())?
+            .knows_read_grant(grant)
+    }
+
+    fn read_member(
+        &self,
+        authority: Authority,
+        worker: Uuid,
+    ) -> Result<Option<WorkerIdentity>, ProtocolError> {
+        self.lock()
+            .map_err(|_| super::unavailable())?
+            .read_member(authority, worker)
+    }
+
+    fn local_identity(&self) -> Result<WorkerIdentity, ProtocolError> {
+        self.lock()
+            .map_err(|_| super::unavailable())?
+            .local_identity()
+    }
+}
+
+/// The owner retains the read grant across retries until all copies settle.
+pub(crate) trait QueueReadSource: ReadGrantSettlement + 'static {
+    fn resume_read_continuation(&self, scope: ReadScope) -> ConsensusFuture<'_, ()>;
+    fn open_read_grant(&self, grant: ReadGrant) -> ConsensusFuture<'_, ()>;
+    fn finish_read_grant(&self, grant: ReadGrant) -> ConsensusFuture<'_, ()>;
+}
+
+// Storage keeps weak, type-erased bindings. Each runtime owner retains its
+// sized slot, which points weakly back to the owner through the read interface.
+pub(crate) type ReplicaReadSlot = Weak<dyn ReplicaReadSource>;
+pub(crate) type QueueReadSlot = Weak<dyn QueueReadSource>;
+
+pub(super) fn read_replica(
+    shared: &WorkerSharedResources,
+) -> Result<Arc<dyn ReplicaReadSource>, ProtocolError> {
+    shared
+        .read_replica::<ReplicaReadSlot>()?
+        .upgrade()
+        .ok_or_else(capacity)
+}
+
+pub(super) fn read_queue(
+    shared: &WorkerSharedResources,
+) -> Result<Arc<dyn QueueReadSource>, ProtocolError> {
+    shared
+        .read_queue::<QueueReadSlot>()?
+        .upgrade()
+        .ok_or_else(capacity)
 }

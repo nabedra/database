@@ -1,11 +1,14 @@
 //! Consensus-backed timestamp service. Every mutation below returns only after
 //! its native state and applied metadata have committed in the same sync batch.
+use nabedra_oltp_types::queue::OriginalAuthorization;
 use super::super::status::ScopedAdmission;
 use super::*;
 use crate::{
     oltp::pool::ByteClass,
-    oltp_replication::authority::consensus::{Applied, Consensus},
-    oltp_runtime::replica::OriginalAuthorization,
+    oltp_replication::{
+        authority::consensus::{Applied, Consensus},
+        queue_access::TerminalQueueReader,
+    },
 };
 
 #[derive(Clone)]
@@ -20,7 +23,7 @@ pub(crate) struct TimestampHandle {
 #[derive(Clone)]
 pub(super) struct ReleaseReader {
     pub(super) control: Arc<super::super::control::ControlClient>,
-    pub(super) queue: Arc<crate::oltp_runtime::worker_endpoint::QueuePeerClient>,
+    pub(super) queue: Arc<dyn TerminalQueueReader>,
 }
 #[cfg(test)]
 struct ReleasePause {
@@ -268,7 +271,7 @@ impl TimestampHandle {
     pub(crate) fn install_release_reader(
         &self,
         control: Arc<super::super::control::ControlClient>,
-        queue: Arc<crate::oltp_runtime::worker_endpoint::QueuePeerClient>,
+        queue: Arc<dyn TerminalQueueReader>,
     ) -> Result<(), ProtocolError> {
         self.release_reader
             .set(ReleaseReader { control, queue })
@@ -282,7 +285,8 @@ impl TimestampHandle {
             control::InventoryPage,
             proof::{AuthenticatedAck, TerminalVerifier},
         };
-        use crate::oltp_runtime::{replica::QueueScope, worker_endpoint::AuthorityReader};
+        use crate::oltp_replication::queue_access::AuthorityReader;
+        use nabedra_oltp_types::queue::QueueScope;
         // Only one release can walk Control and the Ready queue copies. Check
         // the durable record even when another request owns that work.
         let proof_slot = self.release_proof.try_lock();
@@ -357,7 +361,7 @@ impl TimestampHandle {
                 }
                 let observation = reader
                     .queue
-                    .terminal_state(worker, scope.clone(), &statement, self.identity().group_id)
+                    .terminal_observation(worker, scope.clone(), &statement, self.identity().group_id)
                     .await?;
                 let (member, observed, nonce) = observation.into_parts();
                 if observed != statement {

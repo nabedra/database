@@ -95,7 +95,7 @@ impl ReplicaPlacement {
                 None
             } else {
                 #[cfg(test)]
-                if crate::oltp_runtime::recovery_tests::elect_move_source(plan.id) {
+                if elect_move_source(plan.id) {
                     let group = &plan.request.group;
                     let node = plan.request.remove_node;
                     let source = self.factory.manager.hosted_data(group, node)?;
@@ -359,8 +359,8 @@ impl ReplicaPlacement {
             _owner: observation._owner.clone(),
         };
         let membership = VerifiedMembership::from_consensus(observation, plan.id, plan.authority)?;
-        #[cfg(test)]
-        crate::oltp_runtime::recovery_tests::pause("replica_move_activated", plan.id).await;
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::oltp::test_hooks::pause("replica_move_activated", plan.id).await;
         let operation = nabedra_rt::ids::uuid_v4();
         loop {
             // The admin executor owns this future independently of the socket.
@@ -769,4 +769,12 @@ fn conflict() -> ProtocolError {
         "replica move ID or expected placement differs",
         Outcome::NotApplied,
     )
+}
+
+#[cfg(test)]
+fn elect_move_source(request: uuid::Uuid) -> bool {
+    std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").is_some_and(|directory| {
+        let trigger = std::path::PathBuf::from(directory).join(format!("move-elect-source-{request}"));
+        std::fs::remove_file(trigger).is_ok()
+    })
 }

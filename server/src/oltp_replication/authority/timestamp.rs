@@ -308,7 +308,7 @@ pub(crate) enum TimestampReply {
     Snapshot(StoragePin),
     ScopedSnapshot {
         pin: StoragePin,
-        origin: crate::oltp_runtime::replica::OriginalAuthorization,
+        origin: nabedra_oltp_types::queue::OriginalAuthorization,
     },
     ContextBound(StoragePin),
     Commit(CommitStamp),

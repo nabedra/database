@@ -1,5 +1,6 @@
 //! A fresh data worker is prepared by an operator against an exact durable
 //! growth claim. Its mounted key is provisioned out of band with that volume.
+use nabedra_oltp_types::queue::QueueAuthority;
 use super::{
     restart::{RestartMountKey, RestartMountProof},
     worker_drain::NativeWorkerTarget,
@@ -12,7 +13,6 @@ use crate::{
         planner::Action,
     },
     oltp_replication::{owned::serialized_digest, types::*},
-    oltp_runtime::replica::QueueAuthority,
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
 use serde::{Deserialize, Serialize};
