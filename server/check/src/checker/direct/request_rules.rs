@@ -42,9 +42,7 @@
 //!   come before or after a result.
 //! - A `conflict` that another body under the identity could explain (that body was invoked
 //!   before the answer), a `conflict` of an `upsert`, `update` or `delete` (only reuse causes it),
-//!   and a `conflict` whose recorded message does not say that a key "already exists". The queued
-//!   path uses the same code for a moved route and an abandoned run. Without a recorded message,
-//!   every other `conflict` of an insert counts as a row conflict.
+//!   and a `conflict` that [`insert_conflict`] does not recognise as a row conflict.
 //! - A single answer, however wrong. A lone no-op `false` whose effect then appears hits neither
 //!   rule: this one needs the request to be answered again, and the second one needs a
 //!   `not_applied` answer.
@@ -80,13 +78,15 @@
 //! - A no-op or `conflict` answer is not an observation if its identity had been used before, with
 //!   the same body or another. A protocol that records no-ops and refusals could give it without
 //!   any effect, so this rule does not depend on the decision about the first.
-//! - Of the `conflict` answers, only the row conflict counts: the one to an `insert` or
-//!   `insert_many` whose recorded message says that a key "already exists". Any other, and any
-//!   without a message, is neither an observation nor a refusal that covers earlier attempts. The
-//!   queued path uses the code when a run was abandoned or fenced, a preparation conflicted, or
-//!   the schema or a route moved, and both paths use it when the identity is taken. None of these
-//!   says that a row exists, and they can mean that another execution of the request holds its
-//!   identity. `sim-oltp` always records the message.
+//! - Of the `conflict` answers, only the row conflict that [`insert_conflict`] recognises counts.
+//!   Any other is neither an observation nor a refusal that covers earlier attempts. As an
+//!   observation it says nothing about a row. As a refusal, a taken identity may be held by
+//!   another execution of the request, and a conflicted preparation or a moved schema or route may
+//!   be its doing. An abandoned run and a fenced authority are different: they claim that the
+//!   request did not apply at least as firmly as a `429` does, and leaving them out is a choice, to
+//!   rely on one recognised kind of `conflict` only. The consequence is the same for all of them:
+//!   **an effect of an earlier attempt that appears after such a refusal is not flagged**.
+//!   `tests/fixtures/accepted_misses/` holds histories of that shape.
 //! - A completion of type `fail` that does not say `not_applied` is not a refusal here.
 //! - If the history is not linearizable to begin with on the keys involved, apart from those
 //!   answers, [`super::check`] reports that, and this rule says nothing about them.
@@ -95,6 +95,18 @@
 //! hit on a legal history.
 //!
 //! A search that reaches its limit is reported as `check-limit`, so it cannot pass silently.
+//!
+//! # Unclassified conflicts
+//!
+//! Both rules tell row conflicts from others by the message text, and the product has no code for
+//! them. If a text changes, or a writer records none, the rules would go quiet. So they count every
+//! `conflict` of an insert that [`insert_conflict`] cannot place, in
+//! [`Verdict::unclassified_conflicts`]. It is not an anomaly, and it is zero unless a rule is on. A
+//! run with a count above zero has checked less than it seems, and its zero hits mean less. The
+//! texts are pinned against both product paths by
+//! `d03_o08_insert_conflict_texts_are_the_ones_the_history_checker_knows` in
+//! `server/src/oltp_runtime/worker_runtime/direct_gateway/tests.rs` (check
+//! `oltp-conflict-text-pin`).
 //!
 //! # Known limits against the decided retry rule
 //!
@@ -113,9 +125,9 @@
 //!    another body. This needs a decision.
 //! 5. The retry rule holds while the dedup record is retained. These rules assume that no record
 //!    expires and do not use `time_ns`.
-//! 6. Row conflicts are recognised by their message. Without one, the first rule counts every
-//!    `conflict` of an insert and the second none. Both include `insert_many`, and the retry rule
-//!    names only `insert`.
+//! 6. Row conflicts are recognised by their message. Without one, or with an unknown one, neither
+//!    rule counts the answer and the verdict counts it as unclassified. Both include `insert_many`,
+//!    and the retry rule names only `insert`.
 //! 7. Refusals that the retry rule does not list are not results here: a deadline, an abandoned
 //!    request, a preparation conflict, a changed schema, a missing table, a limit and reuse.
 //! 8. The first rule compares pairs of answers by their order, not with "the first" result. The
@@ -129,8 +141,8 @@
 //! it.
 
 use super::super::linearizable::{
-    self, DEFAULT_MAX_CONFIGS, Identities, anchor, body, classify, committed_answer, error_code,
-    existed, rows_of,
+    self, DEFAULT_MAX_CONFIGS, Identities, anchor, body, classify, code_of, committed_answer,
+    existed, message_of, rows_of,
 };
 use super::super::{Anomaly, Verdict};
 use super::describe;
@@ -159,6 +171,62 @@ impl Default for Options {
             max_configs: DEFAULT_MAX_CONFIGS,
         }
     }
+}
+
+/// The message of a refusal over an existing row.
+pub const ROW_CONFLICT: &str = "primary key already exists";
+
+/// The messages of the other `conflict` refusals that an insert can get: of the request itself, of
+/// its identity, and of the queued path.
+const OTHER_CONFLICTS: &[&str] = &[
+    "duplicate primary key in batch",
+    "request_id was already used with a different request body",
+    "request identity has a different body",
+    "request UUID conflicts with its durable identity",
+    "original request run was abandoned",
+    "original execution authority was fenced",
+    "transaction preparation conflicted with an existing version",
+    "transaction preparation conflicted after exhausting snapshot retries",
+    "captured schema or lifecycle changed",
+    "pinned Catalog route moved before queue admission",
+    "participant routing lineage changed",
+];
+
+/// What a `conflict` refusal of an `insert` or `insert_many` is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertConflict {
+    Row,
+    Other,
+    /// No recorded message, or one that is not known here.
+    Unclassified,
+}
+
+/// Classifies an answer to an insert by its message, in every spelling in which its code is read.
+/// `None` if its code is not `conflict`.
+pub fn insert_conflict(answer: &Value) -> Option<InsertConflict> {
+    if code_of(answer) != Some("conflict") {
+        return None;
+    }
+    Some(match message_of(answer) {
+        Some(ROW_CONFLICT) => InsertConflict::Row,
+        Some(message) if OTHER_CONFLICTS.contains(&message) => InsertConflict::Other,
+        _ => InsertConflict::Unclassified,
+    })
+}
+
+/// [`insert_conflict`] of a refused insert.
+fn refused_insert(op: &Op) -> Option<InsertConflict> {
+    let insert = matches!(classify(&op.f), Some("insert" | "insert_many"));
+    if !insert || op.outcome != Outcome::Fail {
+        return None;
+    }
+    insert_conflict(&op.complete_value)
+}
+
+pub(super) fn unclassified_conflicts(ops: &[Op]) -> usize {
+    ops.iter()
+        .filter(|op| refused_insert(op) == Some(InsertConflict::Unclassified))
+        .count()
 }
 
 /// The attempts of each identity and body, in invocation order.
@@ -208,14 +276,8 @@ fn definite_answer(ops: &[Op], ids: &Identities, i: usize) -> Option<Answer> {
             }
             _ => Some(Answer::Success),
         },
-        Outcome::Fail => {
-            let row_conflict = matches!(class, "insert" | "insert_many")
-                && error_code(op) == Some("conflict")
-                && str_field(&op.complete_value, "message")
-                    .is_none_or(|m| m.contains("already exists"))
-                && !another_body_before(ops, ids, i);
-            row_conflict.then_some(Answer::RowConflict)
-        }
+        Outcome::Fail => (is_row_conflict(op) && !another_body_before(ops, ids, i))
+            .then_some(Answer::RowConflict),
     }
 }
 
@@ -276,15 +338,11 @@ fn says_not_applied(op: &Op) -> bool {
 }
 
 fn is_conflict(op: &Op) -> bool {
-    op.outcome == Outcome::Fail && error_code(op) == Some("conflict")
+    op.outcome == Outcome::Fail && code_of(&op.complete_value) == Some("conflict")
 }
 
-/// A `conflict` whose message says that a row was in the way. Others may be about the identity,
-/// a run, the schema or a route.
 fn is_row_conflict(op: &Op) -> bool {
-    matches!(classify(&op.f), Some("insert" | "insert_many"))
-        && is_conflict(op)
-        && str_field(&op.complete_value, "message").is_some_and(|m| m.contains("already exists"))
+    refused_insert(op) == Some(InsertConflict::Row)
 }
 
 /// `not-applied-took-effect`, at most once per identity and body.

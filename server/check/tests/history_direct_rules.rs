@@ -11,7 +11,9 @@
 //! as a control, but its own first retry went on the wire and became the delayed attempt, so it
 //! is neither a valid control nor a planned reproduction (`dr-repro` report).
 
-use nabedra_check::checker::direct::{self, Options};
+use nabedra_check::checker::direct::{
+    self, InsertConflict, Options, ROW_CONFLICT, insert_conflict,
+};
 use nabedra_check::checker::linearizable::DEFAULT_MAX_CONFIGS;
 use nabedra_check::checker::{Anomaly, Verdict};
 use nabedra_check::history::{Event, EventType, Outcome, pair, read_jsonl, reindex};
@@ -187,33 +189,163 @@ fn hits_on_the_existing_corpus_and_fixtures() {
     );
 }
 
-/// Histories that are legal, or too ambiguous to call illegal, because a `conflict` is not about a
-/// row: a reason of the queued path, a taken identity, or no recorded reason. As another client's
-/// answer (`observer_*`, where nothing took effect) it shows no row. As the refusal (`refused_*`)
-/// it may mean that another execution holds the identity. The rule of `e4f44961` flagged every one.
+/// With the message of a row conflict in place of every other `conflict`, the history must be
+/// flagged: it is the message that decides.
+fn over_a_row(events: &[Event]) -> Vec<Event> {
+    let mut row = events.to_vec();
+    for event in row.iter_mut().filter(|e| e.kind == EventType::Fail) {
+        if event.value["code"] == "conflict" {
+            event.value["message"] = json!(ROW_CONFLICT);
+        }
+    }
+    row
+}
+
+/// Legal histories in which nothing took effect. Another client's insert gets a `conflict` that is
+/// not about a row: a reason of the queued path, or no recorded reason. The rule of `e4f44961`
+/// flagged every one.
 #[test]
 fn legal_conflicts_that_are_not_about_a_row_are_not_flagged() {
     let files = jsonl_files(&tests_dir().join("fixtures/legal_conflicts"));
-    assert_eq!(files.len(), 22);
-    let mut flagged = Vec::new();
+    assert_eq!(files.len(), 12);
     for (name, path) in files {
         let events = read(&path);
         let default = direct::check(&events);
         assert!(default.valid, "{name}: {:#?}", default.anomalies);
-        if !added(&events, &BOTH).is_empty() {
-            flagged.push(name);
-            continue;
-        }
-        // The same history with a row conflict in its place is flagged.
-        let mut row = events.clone();
-        for event in row.iter_mut().filter(|e| e.kind == EventType::Fail) {
-            if event.value["code"] == "conflict" {
-                event.value["message"] = json!("primary key already exists");
-            }
-        }
-        assert_eq!(kinds(&added(&row, &NOT_APPLIED)), [EFFECT], "{name}");
+        assert!(added(&events, &BOTH).is_empty(), "{name}");
+        assert_eq!(
+            direct::check_with(&events, &BOTH).unclassified_conflicts,
+            usize::from(name.ends_with("no_message")),
+            "{name}"
+        );
+        let row = added(&over_a_row(&events), &NOT_APPLIED);
+        assert_eq!(kinds(&row), [EFFECT], "{name}");
     }
-    assert!(flagged.is_empty(), "flagged: {flagged:#?}");
+}
+
+/// Not legal, or not certainly: an effect of an earlier attempt appears after a refusal that says
+/// `not_applied`. The refusal is not a row conflict, so rule 2 leaves these out (its module doc
+/// says why). A stricter rule may flag them, and then they move out of here.
+#[test]
+fn accepted_misses() {
+    let files = jsonl_files(&tests_dir().join("fixtures/accepted_misses"));
+    assert_eq!(files.len(), 10);
+    for (name, path) in files {
+        let events = read(&path);
+        assert!(direct::check(&events).valid, "{name}");
+        assert!(added(&events, &BOTH).is_empty(), "{name}");
+        let row = added(&over_a_row(&events), &NOT_APPLIED);
+        assert_eq!(kinds(&row), [EFFECT], "{name}");
+    }
+}
+
+/// The message is read wherever the code is. For each spelling: an "abandoned" refusal is no
+/// result (rule 1) and no row (rule 2), and a row conflict is both a result and a refusal.
+#[test]
+fn every_spelling_of_a_conflict_is_classified() {
+    let files = jsonl_files(&tests_dir().join("fixtures/conflict_spellings"));
+    assert_eq!(files.len(), 15);
+    for (name, path) in files {
+        let events = read(&path);
+        assert!(direct::check(&events).valid, "{name}");
+        let expected: &[&str] = if name.starts_with("row_") {
+            &[UNSTABLE, EFFECT]
+        } else {
+            &[]
+        };
+        assert_eq!(kinds(&added(&events, &BOTH)), expected, "{name}");
+        let verdict = direct::check_with(&events, &BOTH);
+        assert_eq!(verdict.unclassified_conflicts, 0, "{name}");
+    }
+}
+
+/// If the product rewords the row conflict, or a writer drops it, the rules go quiet on it. The
+/// verdict must say how many answers they left out, once, with either rule on and never by
+/// default.
+#[test]
+fn a_reworded_row_conflict_is_counted() {
+    let dir = tests_dir().join("fixtures/unreviewed_dr1_dr2");
+    let captured = read(&dir.join("dr1_insert_refused-seed-1.jsonl"));
+    let verdict = direct::check_with(&captured, &BOTH);
+    assert_eq!(verdict.unclassified_conflicts, 0);
+    for message in [json!("a row with this key already exists"), Value::Null] {
+        let mut reworded = captured.clone();
+        let refused = reworded
+            .iter_mut()
+            .find(|e| e.value["message"] == ROW_CONFLICT)
+            .unwrap();
+        refused.value["message"] = message;
+        for (rules, count) in [
+            (&STABLE_RESULTS, 1),
+            (&NOT_APPLIED, 1),
+            (&BOTH, 1),
+            (&Options::default(), 0),
+        ] {
+            let verdict = direct::check_with(&reworded, rules);
+            assert!(verdict.valid, "{:#?}", verdict.anomalies);
+            assert_eq!(verdict.unclassified_conflicts, count);
+            let json = serde_json::to_value(&verdict).unwrap();
+            let shown = json.get("unclassified_conflicts").cloned();
+            assert_eq!(
+                shown,
+                (count > 0).then(|| json!(count)),
+                "the default is as before"
+            );
+        }
+        // Also when the history is flagged for something else.
+        reworded.extend(
+            read(&dir.join("dr2_leader_link-seed-1.jsonl"))
+                .into_iter()
+                .map(|mut e| {
+                    if !e.is_nemesis() {
+                        e.process += 1000;
+                    }
+                    e.key = e.key.map(|k| format!("other-{k}"));
+                    e
+                }),
+        );
+        reindex(&mut reworded);
+        let verdict = direct::check_with(&reworded, &NOT_APPLIED);
+        assert_eq!(
+            (verdict.kinds(), verdict.unclassified_conflicts),
+            (vec![EFFECT.into()], 1)
+        );
+    }
+}
+
+#[test]
+fn only_the_refusals_of_inserts_are_classified() {
+    let conflict = |message: &str| json!({"code": "conflict", "message": message});
+    assert_eq!(
+        insert_conflict(&conflict(ROW_CONFLICT)),
+        Some(InsertConflict::Row)
+    );
+    for other in [
+        "index name already exists",
+        "Primary key already exists",
+        "",
+    ] {
+        let found = insert_conflict(&conflict(other));
+        assert_eq!(found, Some(InsertConflict::Unclassified), "{other:?}");
+    }
+    assert_eq!(insert_conflict(&json!({"code": "overloaded"})), None);
+    assert_eq!(insert_conflict(&json!(null)), None);
+    // An upsert is never refused over a row, whatever the message says.
+    let mut events = history(
+        "1> upsert k 1 seed
+         1< ok
+         0> upsert k 2 r
+         0< info
+         2> upsert k 2 r
+         2< exists
+         1> get k
+         1< ok 2",
+    );
+    let verdict = direct::check_with(&events, &NOT_APPLIED);
+    assert!(!verdict.has(EFFECT), "{:#?}", verdict.anomalies);
+    events[5].value["message"] = json!("unknown");
+    let verdict = direct::check_with(&events, &NOT_APPLIED);
+    assert_eq!(verdict.unclassified_conflicts, 0);
 }
 
 /// Every search of the rule reports its limit: whatever the bound, a history that the rule flags
@@ -516,8 +648,10 @@ fn stable_results_cases() {
     );
     moved[3].value["message"] = json!("pinned Catalog route moved before queue admission");
     assert!(added(&moved, &STABLE_RESULTS).is_empty());
-    // Without a message, a conflict of an insert is a row conflict.
+    // Without a message it may be any of them.
     moved[3].value.as_object_mut().unwrap().remove("message");
+    assert!(added(&moved, &STABLE_RESULTS).is_empty());
+    moved[3].value["message"] = json!(ROW_CONFLICT);
     assert_eq!(kinds(&added(&moved, &STABLE_RESULTS)), [UNSTABLE]);
 
     // Batch counts: a different count disagrees, a missing one does not.

@@ -36,6 +36,14 @@ pub struct Verdict {
     pub valid: bool,
     pub anomalies: Vec<Anomaly>,
     pub checked_ops: usize,
+    /// Refusals that an opt-in rule could not classify and therefore left out. Not an anomaly, but
+    /// a rule that leaves many out checks little. See [`direct::request_rules`].
+    #[serde(skip_serializing_if = "none")]
+    pub unclassified_conflicts: usize,
+}
+
+fn none(count: &usize) -> bool {
+    *count == 0
 }
 
 impl Verdict {
@@ -44,6 +52,7 @@ impl Verdict {
             valid: anomalies.is_empty(),
             anomalies,
             checked_ops,
+            unclassified_conflicts: 0,
         }
     }
 
@@ -74,11 +83,16 @@ impl Verdict {
     pub fn merge(verdicts: impl IntoIterator<Item = Verdict>) -> Verdict {
         let mut anomalies = Vec::new();
         let mut checked = 0;
+        let mut unclassified = 0;
         for v in verdicts {
             checked = checked.max(v.checked_ops);
+            unclassified = unclassified.max(v.unclassified_conflicts);
             anomalies.extend(v.anomalies);
         }
-        Verdict::new(checked, anomalies)
+        Verdict {
+            unclassified_conflicts: unclassified,
+            ..Verdict::new(checked, anomalies)
+        }
     }
 }
 

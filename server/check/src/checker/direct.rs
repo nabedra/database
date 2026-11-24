@@ -44,7 +44,7 @@ use super::linearizable::{
 };
 use super::{Anomaly, Verdict, outcome};
 use crate::history::{Event, Op, Outcome, pair};
-pub use request_rules::Options;
+pub use request_rules::{InsertConflict, Options, ROW_CONFLICT, insert_conflict};
 
 /// Every direct-path check over one history, without the opt-in rules.
 pub fn check(events: &[Event]) -> Verdict {
@@ -79,7 +79,11 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
             opts.max_configs,
         ));
     }
-    Verdict::merge(verdicts)
+    let mut verdict = Verdict::merge(verdicts);
+    if opts.stable_results || opts.request_not_applied {
+        verdict.unclassified_conflicts = request_rules::unclassified_conflicts(&paired.ops);
+    }
+    verdict
 }
 
 /// The request ID rules in the table above.
