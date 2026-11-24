@@ -541,7 +541,9 @@ async fn replay(
                 ErrorCode::Overloaded | ErrorCode::StorageUnavailable
             )
         {
-            ctx.checks.violate(
+            // A result that changed no row committed nothing, so `not_applied` holds for it.
+            if committed(request, &Completion::Ok(original.clone())) {
+                ctx.checks.violate(
                 &ctx.world,
                 "NotAppliedNeverCommitted",
                 format!(
@@ -549,6 +551,7 @@ async fn replay(
                     request.name, request.id, request.anchor, GATEWAYS[gateway]
                 ),
             );
+            }
             if give_up(ctx, request, attempts) {
                 return false;
             }

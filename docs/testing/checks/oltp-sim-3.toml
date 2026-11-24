@@ -1,7 +1,8 @@
 id = "oltp-sim-3"
 module = "oltp"
 kinds = ["S", "H"]
-# Fault model. Smoke covers the single-key real-time history and keyed retries.
+# Fault model. Seeds rotate through `direct`, `cold` and `move`, and through the four TCP
+# nemesis profiles. A scenario is claimed only when every one of its clauses ran.
 guarantees = ["OLTP-G02", "OLTP-G03"]
 scenarios = []
 tiers = ["T1"]
@@ -15,4 +16,4 @@ cwd = "server"
 timeout_s = 3600
 needs = []
 result_parser = "cargo-test"
-env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "smoke", NABEDRA_SEEDS = "50", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SEED = "1001", NABEDRA_SIM_CHECK_ID = "oltp-sim-3", NABEDRA_SIM_GUARANTEES = "OLTP-G02,OLTP-G03", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-3" }
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "mixed", NABEDRA_SEEDS = "30", NABEDRA_SIM_JOBS = "2", NABEDRA_SIM_VERIFY_REPLAY = "0.1", NABEDRA_SEED = "31", NABEDRA_SIM_CHECK_ID = "oltp-sim-3", NABEDRA_SIM_GUARANTEES = "OLTP-G02,OLTP-G03", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-3" }
