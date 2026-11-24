@@ -2117,9 +2117,9 @@ where
         .unwrap()
         .block_on(case());
 
-    const SEED: u64 = 0x4e41_4245_4452_4108;
-    let run = || {
-        sim::run(SEED, |world| {
+    const FIRST_SEED: u64 = 0x4e41_4245_4452_4108;
+    let run = |seed| {
+        sim::run(seed, |world| {
             let case = &case;
             async move {
                 for node in [CALLER_NODE, RECEIVER_NODE, OTHER_NODE] {
@@ -2149,5 +2149,11 @@ where
             }
         })
     };
-    assert_eq!(run(), run(), "network trace diverged for seed {SEED}");
+    for seed in FIRST_SEED..FIRST_SEED + 5 {
+        assert_eq!(
+            run(seed),
+            run(seed),
+            "network trace diverged for seed {seed}"
+        );
+    }
 }
