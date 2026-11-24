@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "flake-hunt-o22-073553--oltp-protected-progress-repeat.log",
+      "sha256": "94816a0c2fde033d58e48b18806d6aa28e49ffcd25501af9adffc6114101a139"
+    }
+  ],
+  "assertions": {
+    "executed": 600,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-protected-progress-repeat",
+  "duration_s": 2370.89,
+  "guarantees": [],
+  "kind": "R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T06:39:27.837231+00:00",
+    "request_id": "flake-hunt-o22-073553",
+    "runner": "GitHub Actions 1000010373",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45341629977"
+  },
+  "scenarios": [
+    "O22"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "a809ab085d9f53757e5b016d1a5feacf2a849373",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
