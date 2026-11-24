@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "land-harness-6656734-144506--rt-zero-cost.log",
+      "sha256": "b77f3ef0ea71a45528813447d94e1137986f3751a704f0618663596de58c2154"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "rt-zero-cost",
+  "duration_s": 1393.655,
+  "guarantees": [
+    "OLTP-G13"
+  ],
+  "kind": "P",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T13:45:35.409735+00:00",
+    "request_id": "land-harness-6656734-144506",
+    "runner": "GitHub Actions 1000011315",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45406650702"
+  },
+  "scenarios": [
+    "O09"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "6656734dc4e20a4a2c9bb7bed56008e93edfd901",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

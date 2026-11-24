@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "land-harness-6656734-144506--crate-graph.log",
+      "sha256": "58eba4f9457c623ff4a04c71e0dc172ac22e4fd0d4e1cbae34d18b6a4abce66d"
+    }
+  ],
+  "assertions": {
+    "executed": 23,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "crate-graph",
+  "duration_s": 26.953,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T13:45:39.605919+00:00",
+    "request_id": "land-harness-6656734-144506",
+    "runner": "GitHub Actions 1000011318",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45406650702"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "6656734dc4e20a4a2c9bb7bed56008e93edfd901",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

@@ -1,0 +1,41 @@
+{
+  "artifacts": [
+    {
+      "name": "land-harness-6656734-144506--oltp-sim.log",
+      "sha256": "3b0be559fbaa20b516cebf9d727f39c53d605084fc17741cff8e2a7cc06b44ab"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim",
+  "duration_s": 1495.856,
+  "guarantees": [
+    "OLTP-G02",
+    "OLTP-G03"
+  ],
+  "kind": "S H",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T13:45:37.907208+00:00",
+    "request_id": "land-harness-6656734-144506",
+    "runner": "GitHub Actions 1000011312",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45406650702"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "6656734dc4e20a4a2c9bb7bed56008e93edfd901",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
