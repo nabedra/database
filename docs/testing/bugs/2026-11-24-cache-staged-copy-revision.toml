@@ -7,6 +7,7 @@ scenarios = ["K03"]
 found_by = "review"
 found_date = "2026-11-24"
 lowest_regression = "server/src/cache/cluster/controller/tests.rs::k03_staged_promotion_checks_fence_lag_and_copy_at_apply"
+seed = "unknown"
 why_not_caught = "The controller fixture reported only the latest topology. A replica target can discard a copy and later be named in another transfer of the same slot epoch."
 invariant_added = "Persist the staging revision and require the target to report a verified baseline from that revision or later. Recheck the revision in the committed staged promotion."
 fix_commits = ["fc1aceaefed1211e17a37c39ecba28f02ef01e17"]
