@@ -1,0 +1,14 @@
+id = "CACHE-retired-source-move-capacity"
+title = "Retired Cache move sources consumed capacity on surviving workers"
+class = "resource-release-order"
+module = "cache"
+guarantees = ["CACHE-G05", "CACHE-G07"]
+scenarios = ["K03"]
+found_by = "campaign"
+found_date = "2026-11-23"
+lowest_regression = "server/src/cache/cluster/controller/tests.rs::k03_retired_source_does_not_hold_replica_move_capacity"
+seed = 4524674007700564
+why_not_caught = "The handoff tests did not leave a full worker wave pointing to a retired source while the target needed to repair other slots."
+invariant_added = "Only moves with enrolled endpoints reserve placement transfer capacity."
+fix_commits = ["b0e938a987ca120f7af9b28c6f8a8a241ff0a5e3"]
+revert_patch_ok = true

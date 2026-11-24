@@ -1,0 +1,11 @@
+{"index":0,"type":"invoke","process":100,"f":"set","key":"{lease-753}","value":"old-value","node":"11","time_ns":1767225602726000000}
+{"index":1,"type":"ok","process":100,"f":"set","key":"{lease-753}","value":{"epoch":1,"value":null},"node":"11","time_ns":1767225602726000000}
+{"index":2,"type":"invoke","process":100,"f":"set","key":"{lease-753}","value":"overwritten","node":"11","time_ns":1767225602826000000}
+{"index":3,"type":"ok","process":100,"f":"set","key":"{lease-753}","value":{"epoch":1,"value":null},"node":"11","time_ns":1767225602826000000}
+{"index":4,"type":"invoke","process":100,"f":"get","key":"{lease-753}","value":null,"node":"11","time_ns":1767225602826000000}
+{"index":5,"type":"ok","process":100,"f":"get","key":"{lease-753}","value":{"epoch":1,"value":"overwritten"},"node":"11","time_ns":1767225602826000000}
+{"index":6,"type":"invoke","process":100,"f":"del","key":"{lease-753}","value":null,"node":"11","time_ns":1767225602826000000}
+{"index":7,"type":"ok","process":100,"f":"del","key":"{lease-753}","value":{"epoch":1,"value":1},"node":"11","time_ns":1767225602826000000}
+{"index":8,"type":"info","process":"nemesis","f":"failover","key":"{lease-753}","value":{"epoch":2},"time_ns":1767225606752000000}
+{"index":9,"type":"invoke","process":100,"f":"get","key":"{lease-753}","value":null,"node":"12","time_ns":1767225607686000000}
+{"index":10,"type":"ok","process":100,"f":"get","key":"{lease-753}","value":{"epoch":2,"value":null},"node":"12","time_ns":1767225607686000000}

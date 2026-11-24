@@ -1,0 +1,14 @@
+id = "CACHE-seeded-harness-selection"
+title = "The Cache component check selected Raft tests without the seeded executor"
+class = "other"
+module = "cache"
+guarantees = ["CACHE-G06", "CACHE-G07"]
+scenarios = ["K03"]
+found_by = "campaign"
+found_date = "2026-11-23"
+lowest_regression = "docs/testing/checks/cache-sim-seams.toml"
+seed = "unknown"
+why_not_caught = "The component check was registered on the seams branch before the Raft harness was part of its selected module."
+invariant_added = "Only a seeded Tokio build registers the Raft harness. The release checks require discovery of seed_sweep before executing."
+fix_commits = ["127a95c98e089dfcd67ee20b5fe7fb482df9fabf"]
+revert_patch_ok = true

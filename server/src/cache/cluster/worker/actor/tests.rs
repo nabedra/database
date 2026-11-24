@@ -538,6 +538,95 @@ fn k02_promoted_then_refilled_roles_stay_within_total_data_capacity() {
 }
 
 #[test]
+fn k03_replica_requests_a_snapshot_when_delta_cannot_fit() {
+    let origin = node(1);
+    let recipient = node(2);
+    let mut config = config(origin);
+    config.slot_bytes = MIB;
+    let mut source = Shard::new(1, Role::Primary, true, config);
+    let mut replica = Shard::new(1, Role::Copy(origin), true, config);
+    let key = Bytes::from_static(b"{compact}value");
+    let slot = key_slot(&key);
+    let old_value = Bytes::from_static(b"old");
+    let old = set(key.clone(), old_value.clone());
+    for store in [&mut source.store, &mut replica.store] {
+        let staged = store.prepare(&old, 100, config.turns);
+        assert_eq!(store.commit(staged), Reply::Ok);
+    }
+    // The same logical prefix can have different retained allocations after
+    // restoring a snapshot or after a history of inserts and deletes.
+    for number in 0..256 {
+        let temporary = Bytes::from(format!("{{compact}}{number}"));
+        let operation = set(temporary, Bytes::from_static(b"x"));
+        let staged = replica.store.prepare(&operation, 100, config.turns);
+        assert_eq!(replica.store.commit(staged), Reply::Ok);
+    }
+    for number in 0..256 {
+        let temporary = Bytes::from(format!("{{compact}}{number}"));
+        let staged = replica
+            .store
+            .prepare(&Operation::Delete(vec![temporary]), 100, config.turns);
+        assert_eq!(replica.store.commit(staged), Reply::Integer(1));
+    }
+    assert_eq!(replica.store.digest(100), source.store.digest(100));
+    assert!(replica.store.charged_bytes() > source.store.charged_bytes() + 4096);
+    let body = Bytes::from(vec![87; MIB - 4096]);
+    let operation = set(key.clone(), body.clone());
+    let staged = source.store.prepare(&operation, 100, config.turns);
+    let effects = staged.effects().iter().cloned().collect();
+    assert_eq!(source.store.commit(staged), Reply::Ok);
+    source.sequence = 2;
+    replica.sequence = 1;
+
+    let mut receiver = Copies::new(config.snapshot_bytes, config.slot_bytes);
+    let mut storage = StoreBytes {
+        replica: replica.store.charged_bytes(),
+        ..StoreBytes::default()
+    };
+    let delta = Packet {
+        slot,
+        epoch: 1,
+        data: Data::Delta {
+            sequence: 2,
+            effects,
+            digest: [0; 32],
+        },
+    };
+    assert_eq!(
+        receiver.apply(&config, &mut replica, delta, &mut storage),
+        Err(StoreError::OutOfMemory)
+    );
+    assert_eq!(replica.sequence, 1);
+    assert!(
+        replica.baseline,
+        "the original replica prefix is still intact"
+    );
+
+    let probe = receiver.probe(slot, &replica);
+    assert!(
+        !probe.baseline,
+        "ask for a new snapshot instead of the same delta"
+    );
+    assert_eq!(probe.sequence, 1);
+    let mut sender = Copies::new(config.snapshot_bytes, config.slot_bytes);
+    let journal = Journal::new(config.journal_bytes).unwrap();
+    let mut wire = Vec::new();
+    sender
+        .fetch(recipient, &probe, &source, &journal, &mut wire, 2 * MIB)
+        .unwrap();
+    let packet = super::super::peer::single_record_for_test(&wire).unwrap();
+    receiver
+        .apply(&config, &mut replica, packet, &mut storage)
+        .unwrap();
+
+    assert_eq!(replica.sequence, 2);
+    assert!(replica.baseline && receiver.probe(slot, &replica).baseline);
+    assert_eq!(source.store.digest(100), replica.store.digest(100));
+    assert_eq!(storage.replica, replica.store.charged_bytes());
+    assert!(storage.replica <= config.slot_bytes);
+}
+
+#[test]
 fn k02_k03_full_slot_can_pin_and_install_bounded_snapshot() {
     let origin = node(1);
     let recipient = node(2);

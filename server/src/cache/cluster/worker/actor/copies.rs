@@ -102,7 +102,7 @@ impl Copies {
             slot,
             epoch: state.epoch,
             sequence: state.sequence,
-            baseline: state.baseline,
+            baseline: state.baseline && !state.copy_needs_snapshot,
             resume: self.incoming.get(&slot).map(|copy| Resume {
                 id: copy.id,
                 offset: copy.next,
@@ -228,6 +228,7 @@ impl Copies {
                 state.store = SlotStore::new(config.slot_bytes, config.eviction);
                 state.sequence = cut;
                 state.baseline = true;
+                state.copy_needs_snapshot = false;
                 state.digest = None;
             }
             Data::Delta {
@@ -250,12 +251,19 @@ impl Copies {
                     }
                     effects
                 };
-                merge(
+                if let Err(error) = merge(
                     &mut state.store,
                     effects,
                     available,
                     config.turns.growth_bytes,
-                )?;
+                ) {
+                    // A snapshot and its source can have different retained
+                    // allocation capacities. A delta that fits on the primary
+                    // may never fit this copy. Keep the verified prefix for
+                    // failover and ask for a freshly built image on the wire.
+                    state.copy_needs_snapshot |= error == StoreError::OutOfMemory;
+                    return Err(error);
+                }
                 self.incoming.remove(&slot);
                 state.sequence = sequence;
                 state.digest = Some(digest);
@@ -265,6 +273,7 @@ impl Copies {
                     state.store = store;
                     state.sequence = cut;
                     state.baseline = true;
+                    state.copy_needs_snapshot = false;
                     state.digest = None;
                 }
             }

@@ -5,7 +5,11 @@ pub(in crate::cache::cluster) use actor::LeaseActorFixture;
 #[cfg(feature = "sim")]
 pub(in crate::cache::cluster) use actor::{SlotSample, lease_authorizes};
 mod peer;
+#[cfg(all(test, feature = "sim"))]
+pub(super) use peer::PROBES;
 mod sync;
+#[cfg(all(test, feature = "sim"))]
+pub(super) use sync::{REPLICATION_POLL, sim_renew_once};
 
 use std::collections::BTreeMap;
 use std::io;
