@@ -263,10 +263,8 @@ fn invalid() -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        config::WorkerResources,
-        oltp::{mvcc::CanonicalJson, pool::SharedResourceConfig},
-    };
+    use crate::oltp::{mvcc::CanonicalJson, pool::SharedResourceConfig};
+    use nabedra_resources::config::WorkerResources;
     #[derive(Serialize, Deserialize)]
     struct Payload {
         fixed: CanonicalJson,

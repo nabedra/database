@@ -443,15 +443,15 @@ impl TimestampHandle {
                 Outcome::NotApplied,
             ));
         }
-        let _total = crate::oltp_runtime::stage_timing::perf_stage!("ts.allocate.total").timer();
+        let _total = nabedra_resources::perf_stage!("ts.allocate.total").timer();
         // Plan section 5: a valid leader lease, else ReadIndex (PERF1). The
         // window rule below still compares the applied leader ID. RD1: the
         // lease is checked on this task and the applied position comes from
         // consensus memory: the window is in-memory state, which the machine
         // updates before an entry counts as applied, so a store read of the
         // applied position adds nothing to it.
-        let applied = crate::oltp_runtime::stage_timing::timed(
-            crate::oltp_runtime::stage_timing::perf_stage!("ts.allocate.barrier"),
+        let applied = nabedra_resources::stage_timing::timed(
+            nabedra_resources::perf_stage!("ts.allocate.barrier"),
             self.consensus.lease_read_position(),
         )
         .await?;
@@ -462,7 +462,7 @@ impl TimestampHandle {
             return Ok(range);
         }
         let _refill_timer =
-            crate::oltp_runtime::stage_timing::perf_stage!("ts.allocate.refill").timer();
+            nabedra_resources::perf_stage!("ts.allocate.refill").timer();
         let _refill = direct.refill.lock().await;
         if let Some(range) = direct.take(leader, count) {
             return Ok(range);
@@ -563,7 +563,7 @@ impl TimestampHandle {
                 let started = nabedra_rt::time::now_std();
                 match nabedra_rt::time::timeout(PREFILL_DEADLINE, handle.prefill_direct_window()).await {
                     Ok(Ok(true)) => {
-                        crate::oltp_runtime::stage_timing::perf_stage!("ts.window.prefilled")
+                        nabedra_resources::perf_stage!("ts.window.prefilled")
                             .since(started);
                     }
                     Ok(Ok(false)) => {}

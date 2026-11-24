@@ -839,7 +839,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         // the apply worker; with `propose_to_first_ack` and
         // `propose_to_apply` this splits quorum -> commit -> apply.
         if id.is_some() && matches!(self.store.identity().kind, GroupKind::Data { .. }) {
-            super::hosted::proposal_clock::mark(crate::oltp_runtime::stage_timing::perf_stage!(
+            super::hosted::proposal_clock::mark(nabedra_resources::perf_stage!(
                 "raft.data.propose_to_commit"
             ));
         }

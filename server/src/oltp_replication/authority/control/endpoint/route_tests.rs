@@ -1,7 +1,7 @@
+use nabedra_resources::config::WorkerResources;
 use super::*;
 
 use crate::{
-    config::WorkerResources,
     oltp::pool::{OltpPool, SharedResourceConfig},
     oltp_replication::{
         authority::control::{ControlMachine, ControlReply, OperatorPolicy, VerifiedMembership},

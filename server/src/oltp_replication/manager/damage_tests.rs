@@ -5,9 +5,9 @@
 //! evidence is that fault model, not a physical power cut.
 #[path = "../../../tests/support/tls.rs"]
 mod tls;
+use nabedra_resources::config::WorkerResources;
 use super::*;
 use crate::{
-    config::WorkerResources,
     oltp::pool::{OltpPool, PoolIdentity, ReleaseOutcome, SharedResourceConfig, TransactionBudget},
     oltp_replication::{
         ReadySetHasher,

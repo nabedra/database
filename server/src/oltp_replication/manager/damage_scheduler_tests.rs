@@ -14,9 +14,9 @@
 //! the release. The damage is a `FaultFs` fault model, not a power cut.
 #[path = "../../../tests/support/tls.rs"]
 mod tls;
+use nabedra_resources::config::WorkerResources;
 use super::*;
 use crate::{
-    config::WorkerResources,
     oltp::{
         mvcc::store::{KeySpan, ParticipantHandle},
         pool::{OltpPool, PoolIdentity, SharedResourceConfig, TransactionBudget},
