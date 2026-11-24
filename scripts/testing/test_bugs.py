@@ -1,13 +1,14 @@
 """Exercise the bug-record command with valid data and planted errors."""
 
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bugs  # noqa: E402
@@ -202,6 +203,30 @@ revert_patch_ok = true
                 status, _, errors = self.run_fixture("validate", fixture)
                 self.assertEqual(status, 1 if diagnostic else 0)
                 self.assertIn(diagnostic, errors)
+
+    def test_default_clock_is_the_utc_date_of_now(self):
+        class Clock:
+            @staticmethod
+            def now(tz=None):
+                # Local time is already the next day.
+                return datetime(2031, 5, 6, 23, 30, tzinfo=tz) if tz is timezone.utc else datetime(2031, 5, 7, 1, 30)
+
+        with patch.object(bugs, "datetime", Clock):
+            self.assertEqual(bugs.utc_today(), date(2031, 5, 6))
+            for expires, status in (("2031-05-05", 1), ("2031-05-06", 0)):
+                with self.subTest(expires=expires):
+                    fixture = self.open_fixture.replace("2026-12-01", expires)
+                    self.assertEqual(self.run_fixture("validate", fixture)[0], status)
+
+    def test_summary_lists_a_module_and_finder_with_only_open_records(self):
+        (self.directory / "fixed.toml").write_text(
+            self.fixture.replace('id = "TEST"', 'id = "FIXED"'), encoding="utf-8"
+        )
+        fixture = self.open_fixture.replace('module = "oltp"', 'module = "cache"').replace('"acceptance"', '"review"')
+        status, output, errors = self.run_fixture("summary", fixture, today=self.today)
+        self.assertEqual((status, errors), (0, ""))
+        for row in ("| cache | 0 | 1 |", "| oltp | 1 | 0 |", "| review | 0 | 1 |", "| acceptance | 1 | 0 |"):
+            self.assertIn(row, output.splitlines())
 
     def test_summary_does_not_count_open_records_as_fixed(self):
         (self.directory / "fixed.toml").write_text(
