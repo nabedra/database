@@ -133,11 +133,18 @@ class TlcParserTests(unittest.TestCase):
         self.assertEqual(run_check.classify("tlc", "nabedra-tla-summary: {bad json\n", 1)[0], "fail")
         self.assertEqual(run_check.classify("tlc", 'nabedra-tla-summary: {"verdict": "pass"}\n', 0)[0], "fail")
 
-    def test_last_summary_wins_and_zero_executed_is_not_run(self):
-        output = tla_summary("fail", 1, 1) + tla_summary("pass", 0, 0)
-        result, p = run_check.classify("tlc", output, 0)
+    def test_zero_executed_is_not_run(self):
+        result, p = run_check.classify("tlc", tla_summary("pass", 0, 0), 0)
         self.assertEqual(result, "not-run")
         self.assertEqual(p.not_run[-1]["id"], "zero-assertions")
+
+    def test_more_than_one_summary_is_error(self):
+        # A later pass must not hide an earlier failure.
+        for output in (tla_summary("fail", 1, 1) + tla_summary("pass", 3, 0),
+                       tla_summary("pass", 3, 0) + tla_summary("pass", 3, 0)):
+            result, p = run_check.classify("tlc", output, 0)
+            self.assertEqual(result, "error")
+            self.assertIn("nabedra-tla-summary lines", p.not_run[0]["reason"])
 
 
 class CheckFileTests(unittest.TestCase):
@@ -238,6 +245,19 @@ class ExecuteTests(unittest.TestCase):
                 print("rid=" + os.environ["NABEDRA_REQUEST_ID"] + " knob=" + os.environ["KNOB"])
             elif mode == "sleep":
                 time.sleep(30)
+            elif mode == "tla-big":
+                import json
+                detail = "x" * 300
+                facts = {"spec": "specs/x/X", "mode": "exhaustive", "tier": "T1", "tools": "tlc 1.8.0",
+                         "runs": [{"cfg": f"X.v{i}.cfg", "verdict": "pass", "detail": detail} for i in range(20)],
+                         "mutants": [{"name": f"m{i:02d}", "expect": "Inv", "observed": "Inv" if i else "none",
+                                      "ok": i != 0, "cex_length": 7, "detail": detail} for i in range(50)]}
+                arts = [{"name": f"tla/mutant-m{i:02d}.log", "sha256": "0" * 64} for i in range(39)]
+                arts.append({"name": "tla/summary.json", "sha256": "1" * 64})
+                print("nabedra-tla-summary: " + json.dumps({
+                    "verdict": "fail", "executed": 71, "failed": 1, "tla": facts, "not_run": [],
+                    "artifacts": arts}))
+                sys.exit(1)
             elif mode.startswith("tla-"):
                 import json
                 facts = {"spec": "specs/x/X", "mode": "simulation", "tier": "T2", "tools": "tlc 1.8.0"}
@@ -284,6 +304,17 @@ class ExecuteTests(unittest.TestCase):
         self.assertIn("tla/X.log", [a["name"] for a in record["artifacts"]])
         record, _ = self.run_mode("tla-not-run", parser="tlc")
         self.assertEqual(record["result"], "not-run")
+
+    def test_large_tlc_record_is_fitted_under_the_limit(self):
+        record, path = self.run_mode("tla-big", parser="tlc")
+        self.assertLessEqual(path.stat().st_size, 20 * 1024)
+        self.assertEqual((record["result"], record["assertions"]["failed"]), ("fail", 1))
+        self.assertTrue(record["tla"]["truncated"])
+        mutants = {m["name"]: m for m in record["tla"]["mutants"]}
+        self.assertFalse(mutants["m00"]["ok"])  # the failing mutant is kept
+        names = [a["name"] for a in record["artifacts"]]
+        self.assertTrue(names[0].endswith(".log") and not names[0].startswith("tla/"))
+        self.assertIn("tla/summary.json", names)
 
     def test_zero_assertions_record_is_not_run(self):
         record, _ = self.run_mode("zero")

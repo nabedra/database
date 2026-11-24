@@ -114,6 +114,7 @@
         "min_action_coverage": {"type": ["integer", "null"], "minimum": 0},
         "uncovered": {"type": "array", "maxItems": 50, "items": {"type": "string", "maxLength": 120}},
         "unmutated": {"type": "array", "maxItems": 50, "items": {"type": "string", "maxLength": 120}},
+        "truncated": {"type": "boolean", "description": "Runs, mutants or details were dropped to fit the record size limit; summary.json has them all."},
         "runs": {
           "type": "array",
           "maxItems": 20,

@@ -64,7 +64,7 @@ A missing need makes the result `not-run` with the reason below, and the command
 | `unittest` | `Ran N tests` and `OK` or `FAILED (failures=.., errors=..)` | N minus skipped | failures + errors |
 | `node-test` | TAP `# pass`, `# fail`, `# cancelled`, `# skipped` | pass + fail + cancelled | fail + cancelled |
 | `exit-code` | the exit status | 1 | 1 if the status is nonzero |
-| `tlc` | the last `nabedra-tla-summary: {json}` line of `scripts/testing/tla_check.py` or `tla_trace.py` | the runner's assertions | the runner's failed assertions |
+| `tlc` | the one `nabedra-tla-summary: {json}` line of `scripts/testing/tla_check.py` or `tla_trace.py` | the runner's assertions | the runner's failed assertions |
 
 The result follows these rules, in order:
 
@@ -80,7 +80,10 @@ The `tlc` parser also takes the runner's own verdict: a `not-run` (a baseline st
 budget or a state cap) or an `error` (a TLC error) with no failed assertion is recorded as such, never
 as `pass`. Its record carries a `tla` object (mode, distinct states, depth, coverage, mutants with
 their counterexample lengths, or trace counts) and lists the TLC logs and counterexamples in
-`artifacts`. [specs/README.md](../../../specs/README.md) describes the runners and how their results map.
+`artifacts`. Output with more than one summary line is `error`, so a later pass cannot hide an
+earlier failure. When the facts would push the record over 20 KB, passing runs, caught mutants and
+details are dropped, failures are kept, and `tla.truncated` is set; `summary.json` has them all.
+[specs/README.md](../../../specs/README.md) describes the runners and how their results map.
 
 Ignored, skipped and todo tests are listed in the record's `assertions.not_run`.
 If a check prints one or more lines starting with `nabedra-s3-requests: <n>`,

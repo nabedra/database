@@ -291,14 +291,20 @@ _TLA_SUMMARY = "nabedra-tla-summary: "
 
 
 def parse_tlc(output: str, returncode: int) -> Parsed:
-    """Reads the last `nabedra-tla-summary: {json}` line of tla_check.py or tla_trace.py."""
+    """Reads the `nabedra-tla-summary: {json}` line of tla_check.py or tla_trace.py.
+
+    A check runs one runner, so it prints one summary. More than one would let a later pass hide an
+    earlier failure, so it is an error."""
+    lines = [line for line in output.splitlines() if line.startswith(_TLA_SUMMARY)]
+    if len(lines) > 1:
+        return Parsed(0, 0, [{"id": "parser", "reason": f"{len(lines)} nabedra-tla-summary lines; a kind T "
+                              "check runs one runner"}], True, "error")
     summary = None
-    for line in output.splitlines():
-        if line.startswith(_TLA_SUMMARY):
-            try:
-                summary = json.loads(line[len(_TLA_SUMMARY):])
-            except json.JSONDecodeError:
-                continue
+    if lines:
+        try:
+            summary = json.loads(lines[0][len(_TLA_SUMMARY):])
+        except json.JSONDecodeError:
+            summary = None
     if not isinstance(summary, dict):
         return Parsed(0, 0, [], False)
     try:
@@ -355,6 +361,51 @@ def classify(parser: str, output: str, returncode: int | None, timed_out: bool =
         parsed.not_run.append({"id": "zero-assertions", "reason": "the command executed zero assertions"})
         return "not-run", parsed
     return "pass", parsed
+
+
+def fit_record(record: dict) -> None:
+    """Shrinks a record's tool facts (`tla`) and tool artifacts until it fits the record size limit.
+
+    It drops, in order: the details of passing runs and caught mutants; tool artifacts other than the
+    command log and tla/summary.json; passing runs and caught mutants, last first; and it shortens the
+    remaining details. Failures are kept. `tla.truncated` says that facts were dropped. The full facts
+    stay in the summary.json artifact."""
+    tla = record.get("tla")
+
+    def fits() -> bool:
+        return len(evidence.dumps(record).encode("utf-8")) <= evidence.MAX_RECORD_BYTES
+
+    if fits() or not isinstance(tla, dict):
+        return
+    tla["truncated"] = True
+    runs, mutants = tla.get("runs", []), tla.get("mutants", [])
+
+    def run_ok(r: dict) -> bool:
+        return r.get("verdict") == "pass"
+
+    def mutant_ok(m: dict) -> bool:
+        return m.get("ok") is True
+
+    for items, ok in ((runs, run_ok), (mutants, mutant_ok)):
+        for item in items:
+            if ok(item):
+                item.pop("detail", None)
+    artifacts = record.get("artifacts", [])
+    for i in range(len(artifacts) - 1, 0, -1):
+        if fits():
+            return
+        if artifacts[i].get("name") != "tla/summary.json":
+            del artifacts[i]
+    for items, ok in ((mutants, mutant_ok), (runs, run_ok)):
+        for i in range(len(items) - 1, -1, -1):
+            if fits():
+                return
+            if ok(items[i]):
+                del items[i]
+    for item in [*runs, *mutants, *tla.get("traces", {}).get("failing", [])]:
+        for key in ("detail", "reason"):
+            if isinstance(item.get(key), str):
+                item[key] = item[key][:60]
 
 
 # --------------------------------------------------------------------------------------------
@@ -449,6 +500,7 @@ def execute(check: Check, *, evidence_dir: Path | None, log_dir: Path, request_i
         s3_requests=s3_requests, tla=tla,
         mode={"tla": tla["mode"]} if isinstance(tla, dict) and isinstance(tla.get("mode"), str) else None,
     )
+    fit_record(record)
     path = evidence.write(record, evidence_dir)
     return record, path
 
