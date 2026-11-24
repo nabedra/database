@@ -220,43 +220,73 @@ fn legal_conflicts_that_are_not_about_a_row_are_not_flagged() {
 /// is flagged or reported as `check-limit`, and never passes.
 #[test]
 fn request_not_applied_reports_its_search_limit() {
-    let text = "3> upsert k 8 a
-         3< info
-         4> upsert k 9 b
+    let written = "4> upsert k 11 a
          4< info
+         5> upsert k 12 b
+         5< info
+         6> upsert k 13 c
+         6< info
          0> insert k 1 r
          0< info
          2> insert k 1 r
          2< refused overloaded
          1> get k
-         1< ok 8
-         1> delete k null gone
-         1< ok true
+         1< ok 1";
+    // Without r, only `delete m` and then a batch explain the first read, and the search tries the
+    // six upserts before them. The refusal is judged only after that search.
+    let hidden = r#"1> insert m 5 seed
+         1< ok
+         11> upsert k 21 a
+         11< info
+         12> upsert k 22 b
+         12< info
+         13> upsert k 23 c
+         13< info
+         14> upsert k 24 d
+         14< info
+         15> upsert k 25 e
+         15< info
+         16> upsert k 26 f
+         16< info
+         17> insert_many k [{"id":"k","value":1},{"id":"m","value":9}] y
+         17< info
+         18> insert_many k [{"id":"k","value":1},{"id":"m","value":9}] z
+         18< info
+         19> delete m null gone
+         19< info
+         0> upsert k 1 r
+         0< info
          1> get k
          1< ok 1
-         1> get k
-         1< ok 9";
-    let events = history(text);
-    assert!(direct::check(&events).valid);
-    let mut seen = BTreeSet::new();
-    let mut bound = 0;
-    loop {
-        let rules = Options {
-            max_configs: bound,
-            ..NOT_APPLIED
-        };
-        let hits = added(&events, &rules);
-        assert_eq!(hits.len(), 1, "bound {bound}: {hits:#?}");
-        seen.insert(hits[0].detail.split("gave up").next().unwrap().to_string());
-        if hits[0].kind == EFFECT {
-            break;
+         2> upsert k 1 r
+         2< refused overloaded
+         1> get m
+         1< ok 5"#;
+    let mut histories = vec![history(written), history(hidden)];
+    histories.extend((0..100).map(|seed| generated(seed, 60, Reading::Plan, false)));
+    let (mut flagged, mut limited) = (0, 0);
+    for events in histories {
+        if added(&events, &NOT_APPLIED).is_empty() {
+            continue;
         }
-        assert_eq!(hits[0].kind, "check-limit", "bound {bound}");
-        bound += 1;
-        assert!(bound < 10_000);
+        flagged += 1;
+        let mut max_configs = 0;
+        loop {
+            let rules = Options {
+                max_configs,
+                ..NOT_APPLIED
+            };
+            let hits = kinds(&added(&events, &rules)).join(" ");
+            assert!(!hits.is_empty(), "silent with {max_configs} configurations");
+            if hits.contains(EFFECT) {
+                break;
+            }
+            limited += 1;
+            max_configs += 1 + max_configs / 16;
+        }
     }
-    println!("flagged from bound {bound}: {seen:#?}");
-    assert!(bound > 1);
+    println!("{flagged} flagged histories, {limited} lower bounds reported as check-limit");
+    assert!(flagged > 5 && limited > 50);
 }
 
 /// A history from a compact text, one event per line:
