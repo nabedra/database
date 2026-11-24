@@ -544,21 +544,31 @@ async fn settle(cluster: &Cluster) -> Result<Vec<(u64, Value)>, String> {
 mod tests {
     use super::*;
 
+    use nabedra_sim::sweep::{SweepConfig, sweep};
+
     #[test]
     fn cold_start_reopens_mounted_workers() {
-        let seeded = nabedra_sim::runtime::SEEDED;
-        assert!(seeded, "set RUSTFLAGS='--cfg tokio_unstable'");
-        let seed = 1;
-        let once = || {
-            let mut generator = nabedra_sim::sweep::workload_gen(seed);
-            run(seed, &mut generator, Defect::None, Some(DiskCut::Power)).run
-        };
-        let first = once();
-        assert!(first.passed(), "{:?}", first.violations);
-        let replay = once();
-        assert!(replay.passed(), "{:?}", replay.violations);
-        assert_eq!(first.trace_hash, replay.trace_hash);
-        assert_eq!(first.trace_events, replay.trace_events);
-        assert_eq!(first.history, replay.history);
+        let mut config = SweepConfig::new("oltp-sim-cold-start", 1, 1);
+        config.require_seeded = true;
+        config.verify_replay = 1.0;
+        config.replay = concat!(
+            "RUST_MIN_STACK=16777216 RUSTFLAGS=\"--cfg tokio_unstable\" ",
+            "CARGO_TARGET_DIR=target/sim cargo test --locked --release ",
+            "-p nabedra-sim-oltp --lib workload::tests::cold_start_reopens_mounted_workers ",
+            "-- --exact --nocapture --test-threads=1",
+        )
+        .into();
+        if let Some(dir) = std::env::var_os("NABEDRA_SIM_ARTIFACTS") {
+            config.artifacts = dir.into();
+        }
+        let report = sweep(&config, |seed, generator| {
+            run(seed, generator, Defect::None, Some(DiskCut::Power)).run
+        });
+        report.assert_passed();
+        let seed = &report.seeds[0];
+        println!(
+            "Fault model cold start seed {} replayed: trace {:016x} ({} events)",
+            seed.seed, seed.trace_hash, seed.trace_events,
+        );
     }
 }
