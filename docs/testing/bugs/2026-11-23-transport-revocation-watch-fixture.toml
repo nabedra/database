@@ -10,5 +10,5 @@ lowest_regression = "transport::tests::sessions::real::revoked_session_closes"
 seed = "unknown"
 why_not_caught = "The fixture checked the watch close counter but let the periodic directory scan race with the watch."
 invariant_added = "The receiver closes the authenticated session and refuses further requests when the directory sends a revocation notification with periodic polling suspended in the fixture."
-fix_commits = ["267d2e0f6dd8da1d5fa163ca54b1b45325d79f6e"]
+fix_commits = ["9ed692c4235f0202ebaec2683b17b72dabaa0d9d", "7e454cb35a9253c7f7ccba5163d09d0bff83a54c"]
 revert_patch_ok = true
