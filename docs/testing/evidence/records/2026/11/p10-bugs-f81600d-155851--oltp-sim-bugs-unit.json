@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "p10-bugs-f81600d-155851--oltp-sim-bugs-unit.log",
+      "sha256": "c7b8315208d4033a4e118bbbd137e3a5c47a0602c5809686067d7f28683c6043"
+    }
+  ],
+  "assertions": {
+    "executed": 25,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim-bugs-unit",
+  "duration_s": 248.464,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T14:59:54.329040+00:00",
+    "request_id": "p10-bugs-f81600d-155851",
+    "runner": "GitHub Actions 1000011517",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45420132800"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "f81600dffd8f1c6cfc0c2fc30b4ac33a2c5ad662",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
