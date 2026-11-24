@@ -20,7 +20,10 @@ sweep() {
     grep -vE "FAULTS|Compiling" /tmp/probe.txt | grep -E "^error|violation|seed [0-9]+ (failed|is not)|t=[0-9]+ms|panicked|holds a lock|suspended|nondeterministic|failing|test result|trace:" | cut -c1-300 | head -60
 }
 export NABEDRA_LATE=1
+sweep "$1" 0 0 1
+grep -E "seed\":(66|185)" /tmp/probe.txt
+for d in "$PWD"/../target/testing-logs/probe-oltp/*; do echo "$d"; done
 sweep "$1" 20 0 1
-sweep "$1" 0 1 300
-sweep "$1" 20 1 300
+for f in "$PWD"/../target/testing-logs/probe-oltp/*seed-66/history.jsonl; do tail -c 3000 "$f"; done
+for f in "$PWD"/../target/testing-logs/probe-oltp/*seed-66/trace-tail.txt; do tail -n 60 "$f" | cut -c1-300; done
 echo done
