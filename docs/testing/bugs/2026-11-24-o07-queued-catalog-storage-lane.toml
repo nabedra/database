@@ -1,0 +1,16 @@
+# Original failure: Actions run 45329826953 job 138229946238.
+# Reproduction: Actions run 45341514058 job 138266314979, on attempt 4 and off attempt 14 of 20.
+id = "O07-QUEUED-CATALOG-STORAGE-LANE"
+title = "Outgoing Storage lane saturation failed an accepted Catalog read"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G07", "OLTP-G09"]
+scenarios = ["O07", "Q01"]
+found_by = "ci-flake"
+found_date = "2026-11-24"
+lowest_regression = "oltp_runtime::worker_runtime::direct_gateway::tests::o07_q01_accepted_query_waits_for_catalog_storage_lane"
+seed = "unknown"
+why_not_caught = "The QLANE component held Storage while an accepted batch prepared. The O07 split race exposed a local refusal while fetching Catalog metadata after acceptance. Normal runs did not force an occupied lane at the first Catalog read."
+invariant_added = "Hold the same charged Catalog read at its original timestamp through a bounded local pre-send wait, and return the exact result and same-body retry without changing the accepted pin."
+fix_commits = ["39e4450840a66cf4b97afa8bd193b9c20b175876"]
+revert_patch_ok = true

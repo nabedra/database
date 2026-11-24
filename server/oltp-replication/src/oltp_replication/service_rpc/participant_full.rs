@@ -1316,8 +1316,18 @@ impl ParticipantClient {
                 shared.encode_in(ByteClass::Data, &KeyPayload(key), max_key_bytes)
             })
             .await?;
+        // An accepted queued query still needs its pinned Catalog view.
+        // Wait for a local slot with the same charged read before sending.
+        let outgoing_deadline =
+            (matches!(action, ServiceAction::Owner) && client.group.kind == GroupKind::Catalog)
+                .then(|| nabedra_rt::time::now() + SERVICE_CONVERGENCE);
         let response = client
-            .call_as(action, Method::ParticipantRead { read_ts }, Some(payload))
+            .call_with_outgoing_deadline(
+                action,
+                Method::ParticipantRead { read_ts },
+                Some(payload),
+                outgoing_deadline,
+            )
             .await?;
         response.reply.sections[0].clone().ok_or_else(invalid)
     }
