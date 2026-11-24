@@ -15,18 +15,27 @@ port_notes = """
 refreshes run together with join_all under GRANT_TTL again, without backoff.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "cold"
 profile = ["staggered-reopen", "control-delay"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `WarmReadsSerial`, designs/phase-10-11-oltp-sim.md, 4.2, row 20: "a probe rule allows at most one background Control
+#     lane slot"
+#   `Liveness`, designs/phase-10-11-oltp-sim.md, 3.7: "convergence within 30 s of the heal; the cold start, move or
+#     index build finishes within its bound"
+#   `Liveness`, designs/phase-10-11-oltp-sim.md, 4.2, row 20: "`Liveness`; a probe rule allows at most one background
+#     Control lane slot"
 expect = ["WarmReadsSerial", "Liveness"]
 seeds = [1, 10000]
 
+# The assertion below is a counter (how many stubbed reads are in flight), not a state check.
 [regression]
 kind = "lib-test"
 test = "oltp_replication::service_rpc::grant_cache::tests::c07_rd2_warm_refreshes_hold_at_most_one_read_while_control_hangs"
 mode = "on"
 failure_contains = ["in_flight.load(Ordering::Relaxed) <= 1"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "b90865494b335bbe16d4a4679245fbc20db6ff5b470da6b3f31c3ad57cac795f"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, c07_rd2_warm_refreshes_hold_at_most_one_read_while_control_hangs, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -34,3 +43,10 @@ patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/454359
 assertion failed: in_flight.load(Ordering::Relaxed) <= 1
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.00s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact. Kept apart from the author's evidence above. These are workflow `tests`, `scenarios` or growth runs
+# in mode on, not attested checks, and not a detection.
+# - sensitive by the review's own test: the in-tree assertion is a counter (see [regression]). The lane in the review's test is a model.
+# - oltp_replication::service_rpc::grant_cache::tests::r121_rd2_hung_background_reads_leave_the_foreground_a_lane_slot: clean https://github.com/zPy52/nabedra-database/actions/runs/45461651504 (01c4af20) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45461681739 (600bbac1) 3 of 3 failed: `the foreground found the Control lane full 140 times of 200`, with a modelled four-slot lane.
+# - the [regression] test, the counter: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456677709 (79f07747) 3 of 3 failed: `in_flight.load(Ordering::Relaxed) <= 1`, a count of stubbed reads.

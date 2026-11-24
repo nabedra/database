@@ -19,9 +19,14 @@ receipt, conflict `original execution authority was fenced` (run 45440132415); i
 (run 45440153575). O08 passed with the patch.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "queued"
 profile = ["owner-kill", "prepared-hold"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `AcceptedSettlesInRun`, docs/testing/scheduler-contract.md, introduction: "Retain accepted work through individual
+#     failures while a request copy survives."
+#   `AcceptedSettlesInRun`, docs/testing/guarantees/oltp.md, OLTP-G07: "Accepted queued work stays recoverable while a
+#     complete copy survives. A full worker stop abandons outstanding work."
 expect = ["AcceptedSettlesInRun"]
 seeds = [1, 10000]
 
@@ -31,6 +36,7 @@ test = "oltp_replication::authority::status::identity::tests::o10_o14_r01_q06_fe
 mode = "on"
 failure_contains = ["expected retry abort, got Rejected(InvalidBinding)"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "919565cb643c1ba88338c5eddacf1cd5cac017638726187fffc9fce3e989ed40"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o10_o14_r01_q06_fenced_retry_abort_requires_exact_settlement, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -38,3 +44,9 @@ patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/454360
 expected retry abort, got Rejected(InvalidBinding)
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.38s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: the behaviour before 4287df82, without both fixes. Kept apart from the author's evidence above. These are
+# workflow `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456592380 (5ab39d79) 3 of 3 failed: `Rejected(InvalidBinding)`.
+# - the retained-restart suite (r121_suite_restart), the same runs: clean 3 of 3 passed, patched 3 of 3 failed: receipt `failed`, conflict `original execution authority was fenced`.

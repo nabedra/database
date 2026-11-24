@@ -17,10 +17,14 @@ certifies the named removal from the current voter set, ignoring the durable pla
 retain_removed (REP5, REP6) keeps its values.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "membership"
 profile = ["replacement", "leader-crash", "lost-reply"]
-expect = ["Liveness", "RetryCertifiesNamedRemoval"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   Empty. Not detectable yet: design 3.7 lists RetryCertifiesNamedRemoval by name only, so there is no rule text to
+#     quote, and it looks unreachable through the API (author and reviewer read the code, neither ran it). Design 4.2
+#     and decision 9 give row 14 no Liveness rule.
+expect = []
 seeds = [1, 10000]
 
 [regression]
@@ -29,6 +33,7 @@ test = "oltp_replication::typed_network::tests::o06_o16_o17_rf3_lost_timestamp_v
 mode = "on"
 failure_contains = ["stable membership must not certify a different removal"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "b5dc5e10eaf10de5dbaa191c21ebd4d22c65f456057dfe1f87bae13fb700ced9"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o06_o16_o17_rf3_lost_timestamp_voter_replacement, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -36,3 +41,8 @@ patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/454358
 stable membership must not certify a different removal
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 3.43s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact in substance. Kept apart from the author's evidence above. These are workflow `tests`, `scenarios`
+# or growth runs in mode on, not attested checks, and not a detection.
+# - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456630499 (2ef7a82c) 3 of 3 failed: `stable membership must not certify a different removal`.

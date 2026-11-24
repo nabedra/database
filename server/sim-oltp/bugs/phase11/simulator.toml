@@ -1,7 +1,16 @@
 # What each phase 11 reverted fix needs from the simulator before a search can count (P11-BUGS).
 # Nothing here is a detection. `faults` names the schedule, `trigger` the protocol point to place it at,
-# `invariant` the rule that must fire (names marked new are proposals for the workload owners), and
-# `gaps` what the simulator or the design lacks today.
+# `rules` the names in the manifest's `expect` with their source text, and `gaps` what the simulator or the
+# design lacks today.
+#
+# `sensitivity` is the independent review's word (PR #121, 2026-11-24): sensitive, partial or not sensitive. The runs are
+# in the manifests. A partial patch cannot count for the bar (amendment to lead decision 9).
+#
+# `rules` holds only what lead decision 9 and its amendments allow: the rules design 4.2 names for the row, except where
+# decision 9 rules them out, and the replacements it permits. A rule without text to quote is left out. `text` is a literal
+# quote of `file`. designs/ is outside this repository. A name here is not a working rule: decision 9 also wants an author
+# who did not write the patch and works from the quoted text alone, legal and illegal fixtures, and a run on unpatched
+# main first. Not detectable yet rows say so in `not_detectable_yet`.
 #
 # reach: reachable (workload only), needs-workload, needs-client, needs-invariant, needs-probe,
 # needs-trigger, needs-fault, needs-hook, narrower or partly (than the original defect), nightly,
@@ -10,10 +19,12 @@
 [acc3-receipt]
 row = 1
 workload = "queued"
+sensitivity = "sensitive"
 reach = "needs-invariant"
+not_detectable_yet = "not detectable yet: no plan, contract or register text is quoted for a rule that can fire (lead decision 9 and its amendment after review-121). ReceiptObservationPatience is dropped."
 faults = "One receipt observation from an API fails with a retryable error (session reset, refused lane) after acceptance and before the terminal result; the owner stays up."
 trigger = "Queue acceptance of a request that an API process waits for on POST /v1/operations (queued read, or direct_oltp off)."
-invariant = "ReceiptObservationPatience (new): while the owner answers again within RECEIPT_OBSERVATION_TIMEOUT, the waiting call returns the terminal result."
+rules = []
 gaps = [
     "The design's `outcome::check` and receipt check cannot see it: http.rs `accepted_failure` (G1) already turns a failed wait into outcome_unknown, which is legal, and the receipt stays correct.",
 ]
@@ -21,33 +32,51 @@ gaps = [
 [bug1-encode-submit]
 row = 2
 workload = "queued"
+sensitivity = "sensitive"
 reach = "needs-fault"
 faults = "The owner worker has no Data (or ApiIngress header) buffer bytes left at the moment it encodes the submission receipt. The client reads its definite refusal and does not retry; a later read sees the write."
 trigger = "Between QueueCoordinator acceptance and ApplicationEndpoint::finish_reply."
-invariant = "NotAppliedNeverCommitted for the queued identity, then failed-write-observed; QueueRetention for a refused identity whose record is accepted."
+rules = [
+    { rule = "failed-write-observed", file = "docs/testing/guarantees/oltp.md", where = "OLTP-G04", text = "Return `not_applied` only with proof of non-application. Otherwise, report uncertainty as `outcome_unknown`." },
+    { rule = "failed-write-observed", file = "designs/phase-10-11-oltp-sim.md", where = "4.2, row 2", text = "`failed-write-observed`, `QueueRetention`" },
+    { rule = "QueueRetention", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "an accepted request keeps a complete copy while any holder lives, and the new run is empty after a full stop" },
+    { rule = "QueueRetention", file = "docs/testing/guarantees/oltp.md", where = "OLTP-G07", text = "Accepted queued work stays recoverable while a complete copy survives. A full worker stop abandons outstanding work." },
+]
 gaps = [
     "S7 in wave-dr/sim-mapping/fault-model.md: no one-off byte or lane refusal at a chosen step. Per-seed Data budgets reach it only if other load holds the bytes at that instant.",
+    "QueueRetention as design 3.7 words it may not fire: the accepted record keeps its copies and only the answer is wrong (read, not run).",
+    "NotAppliedNeverCommitted is an existing design 3.7 rule and OLTP-G04's, but neither design 4.2 nor decision 9 names it for this row, so `expect` leaves it out.",
 ]
 
 [bug1-stream]
 row = 3
 workload = "queued"
+sensitivity = "sensitive"
 reach = "needs-client"
 faults = "The reply of a direct single-key mutation is cut after commit; the client retries the same ID and body without Content-Length (chunked)."
 trigger = "GatewayAttempt done and HTTP reply cut."
-invariant = "Liveness (every request resolved): after the heal, a streamed retry of a committed direct identity returns the original result. Patched, it answers outcome_unknown every time."
+rules = [
+    { rule = "Liveness", file = "docs/testing/guarantees/oltp.md", where = "OLTP-G03", text = "On the direct path, a retry of a mutation with the same request ID and body returns the first definite result of that identity, including a no-op or row conflict, while its dedup record is retained." },
+    { rule = "Liveness", file = "docs/testing/oltp-contract.md", where = "D02", text = "One committed version, the original result, one dedup record." },
+]
 gaps = [
     "OneExecutionPerIdentity as designed cannot fire: the queue owner settles the identity at its anchor first (settle_before_reserve, T7c) and refuses the streamed body with outcome_unknown, so nothing runs twice.",
     "The harness client always sends Full<Bytes> with a length (sim-oltp/src/client.rs); it needs a streamed body mode.",
+    "A no-op or refused insert that is recomputed on retry is DR-1, a known gap in the OLTP register, not this patch. Decision 8 masks such a hit.",
+    "OneExecutionPerIdentity is the name in design 4.2. Decision 9 allows this retry rule instead.",
 ]
 
 [topo1-child-schema]
 row = 4
 workload = "topology"
+sensitivity = "sensitive"
 reach = "blocked"
+not_detectable_yet = "not detectable yet: blocked by the split finding in gaps."
 faults = "None beyond client load. The worker that led the parent at its first direct epoch must lead the child at its first epoch."
 trigger = "Index publication to Ready, then a split of the same range, then inserts routed to the child."
-invariant = "CoveringIndexComplete: an insert acknowledged after Ready is returned by every covering scan at a later snapshot."
+rules = [
+    { rule = "CoveringIndexComplete", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "an acknowledged insert appears in every covering index scan at a later snapshot" },
+]
 gaps = [
     "Blocked today: P10-WORKLOADS reports that a split never publishes under direct load (4 of 4 seeds), only with idle clients. The workload must split while idle and resume writers, or that finding must be resolved.",
 ]
@@ -55,39 +84,56 @@ gaps = [
 [bug2]
 row = 5
 workload = "queued"
+sensitivity = "sensitive"
 reach = "narrower"
 faults = "A complete copy of another ready view reaches a replica: a delayed Install frame across a view change, or a scoped copy (replica/scoped.rs, scoped_store.rs) while the local view lags."
 trigger = "Ready-view publication while an Install or scoped payload frame is in flight."
-invariant = "QueueCopyStaleNotInvalid on the receiver preflight result, with QueueRetention for the accepted request."
+rules = [
+    { rule = "QueueCopyStaleNotInvalid", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "a well-formed copy from a newer authority is refused as `Stale`" },
+    { rule = "QueueRetention", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "an accepted request keeps a complete copy while any holder lives, and the new run is empty after a full stop" },
+    { rule = "QueueRetention", file = "docs/testing/guarantees/oltp.md", where = "OLTP-G07", text = "Accepted queued work stays recoverable while a complete copy survives. A full worker stop abandons outstanding work." },
+]
 gaps = [
     "Narrower than the original: worker_endpoint.rs now waits for a lagging local view before preflight (O21CAP fix), so the legacy path reaches it only when the local view is ahead of the copy or the owner changed at the same membership revision.",
+    "The quoted rule speaks of a copy from a newer authority. The window the review left open (the local view ahead of the copy, or the owner changed at the same revision) is the other direction, so the rule's author must say what it covers.",
+    "P11-QUEUED's unmerged branch leaves QueueCopyStaleNotInvalid out: it found no text in the contract, the register or the scheduling plan, and no probe reports a refused installation.",
 ]
 
 [rd1]
 row = 6
 workload = "topology"
+sensitivity = "sensitive"
 reach = "needs-invariant"
 faults = "A DDL fence applies on the group after a mutation looked up its descriptor and before its snapshot. Waiting for a hot key latch keeps that window open for a commit round trip."
 trigger = "DirectSchemaChange::Fence of an index publication, with writers queued on one key latch."
-invariant = "CoveringIndexComplete on the published index. SchemaEpochAtCommit as designed cannot fire: the commit carries the new epoch; only its descriptor is old. It needs the descriptor lifecycle in the DirectProposed probe."
-gaps = []
+rules = [
+    { rule = "CoveringIndexComplete", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "an acknowledged insert appears in every covering index scan at a later snapshot" },
+]
+gaps = [
+    "SchemaEpochAtCommit as designed cannot fire: the commit carries the new epoch, only its descriptor is old. It needs the descriptor lifecycle in the DirectProposed probe.",
+    "The quoted rule speaks of inserts. The author's and the review's tests used an update, so the workload must also insert in the window, and nobody has run that.",
+]
 
 [idxhot]
 row = 7
 workload = "topology"
+sensitivity = "sensitive"
 reach = "needs-invariant"
+not_detectable_yet = "not detectable yet: no plan, contract or register text is quoted for a rule that can fire (lead decision 9 and its amendment after review-121). Design 4.2 names Liveness (index build), but decision 9 asks row 7 for its own text."
 faults = "None. One client updates the first backfilled key without think time while the index is Building."
 trigger = "Index declaration with writers that win every refresh attempt of one row."
-invariant = "Liveness (index build) measured while the writers run. A bound that starts at the heal or after the writers stop never fires."
+rules = []
 gaps = []
 
 [o21cap]
 row = 8
 workload = "queued"
+sensitivity = "sensitive"
 reach = "needs-invariant"
+not_detectable_yet = "not detectable yet: no plan, contract or register text is quoted for a rule that can fire (lead decision 9 and its amendment after review-121). SubmitDuringViewInstall is dropped; design 4.2's Liveness and receipt check cannot see the patched answer."
 faults = "A worker joins; the owner or one follower applies the new ready view up to 2 s late (its membership poll)."
 trigger = "Control ReadyPublished, then a POST /v1/requests table.create before the lagging worker installs the view."
-invariant = "SubmitDuringViewInstall (new): a submission while every ready holder is live is accepted within the 3 s install bound."
+rules = []
 gaps = [
     "Liveness after heal and the receipt check do not see it: the patched answer is storage_unavailable with outcome unknown, which is legal, and a retry succeeds once the view installs.",
 ]
@@ -95,10 +141,13 @@ gaps = [
 [acc2]
 row = 9
 workload = "topology"
+sensitivity = "sensitive"
 reach = "needs-workload"
 faults = "Ready validation fails after the fence: a split or move changes the table routing epoch during the backfill, or a Catalog read fails."
 trigger = "Index progress done on every shard, then a routing change or Catalog leader loss before the Ready plan."
-invariant = "FenceAfterValidation: every Data group direct lifecycle names a lifecycle the Catalog published (checked at quiescence and after each failed build)."
+rules = [
+    { rule = "FenceAfterValidation", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "a Data fence epoch names a published Catalog lifecycle" },
+]
 gaps = [
     "The design's `unique index over duplicates` does not exist: an index definition has no unique flag. The natural cause in index_build.rs is `index routing changed during backfill`.",
 ]
@@ -106,41 +155,62 @@ gaps = [
 [acc3-ready-fence]
 row = 10
 workload = "cold"
+sensitivity = "sensitive"
 reach = "needs-trigger"
 faults = "Freeze or isolate the Timestamp quorum for longer than one service call (over 10 s) while a worker is between its sealed ready revision and the fence receipt."
 trigger = "Control ReadySealed for the joining worker (not a probe in the design list)."
-invariant = "Liveness (the join or cold start finishes) or ProcessExit of the joining worker."
+rules = [
+    { rule = "Liveness", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "convergence within 30 s of the heal; the cold start, move or index build finishes within its bound" },
+    { rule = "Liveness", file = "designs/phase-10-11-oltp-sim.md", where = "4.2, row 10", text = "`Liveness` (cold start)" },
+]
 gaps = [
     "Without a probe at ReadySealed the window is a few milliseconds per join.",
+    "ProcessExit of the joining worker is the harness's own kind. Design 4.2 and decision 9 do not name it for this row and no text is quoted for it, so `expect` leaves it out.",
 ]
 
 [acc3-delegation]
 row = 11
 workload = "membership"
+sensitivity = "sensitive"
 reach = "reachable"
 faults = "Rolling restart of a retained worker whose Control session to one voter was authenticated while its role was still prepared; delay frames between the voters."
 trigger = "CompleteRestart applied at one voter while another still holds the prepared session."
-invariant = "Liveness (the rolling restart finishes) or ProcessExit."
-gaps = []
+rules = [
+    { rule = "Liveness", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "convergence within 30 s of the heal; the cold start, move or index build finishes within its bound" },
+    { rule = "Liveness", file = "designs/phase-10-11-oltp-sim.md", where = "4.2, row 11", text = "`Liveness`, `outcome::check`" },
+]
+gaps = [
+    "ProcessExit is left out as in acc3-ready-fence. Design 4.2's `outcome::check` has no kind named for this row.",
+]
 
 [fixc-owner-fence]
 row = 12
 workload = "queued"
+sensitivity = "sensitive"
 reach = "needs-invariant"
+not_detectable_yet = "not detectable yet: AcceptedSettlesInRun is not on main, and its quoted text may not cover the patched answer, see gaps."
 faults = "Kill or fence the queue owner after a queued mutation sealed its manifest, while another ready holder keeps the complete accepted record."
 trigger = "Status Seal (prepared, undecided) for a queued transaction."
-invariant = "AcceptedSettlesInRun (new, part of the receipt check): in one run an accepted mutation with a surviving copy ends with its own result, never with an abort the fence caused (patched receipt: failed, conflict `original execution authority was fenced`)."
+rules = [
+    { rule = "AcceptedSettlesInRun", file = "docs/testing/scheduler-contract.md", where = "introduction", text = "Retain accepted work through individual failures while a request copy survives." },
+    { rule = "AcceptedSettlesInRun", file = "docs/testing/guarantees/oltp.md", where = "OLTP-G07", text = "Accepted queued work stays recoverable while a complete copy survives. A full worker stop abandons outstanding work." },
+]
 gaps = [
     "`outcome::check` cannot see it: the abort is decided, so the conflict is a true not_applied.",
+    "The quoted text says accepted work is retained and stays recoverable. It does not say that accepted work cannot end in a definite refusal, which is what the patched build gives (a receipt that failed with the conflict `original execution authority was fenced`). A rule on P11-QUEUED's unmerged branch, written from the contract's words, fires on a missing or abandoned answer and accepts any terminal one (db4d4fe9, read, not run). Rows 12 and 21 share one rule, so neither may reword it.",
 ]
 
 [fixb-cold-publish]
 row = 13
 workload = "membership"
+sensitivity = "sensitive"
 reach = "needs-trigger"
 faults = "Stop every worker between the Mount commit of a system replacement and its group publications, then cold start the survivors and the retained candidate."
 trigger = "Control SystemReplacementMounted (not a probe in the design list)."
-invariant = "Liveness (replacement): the replacement publishes every group within its bound after the cold start."
+rules = [
+    { rule = "Liveness", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "convergence within 30 s of the heal; the cold start, move or index build finishes within its bound" },
+    { rule = "Liveness", file = "designs/phase-10-11-oltp-sim.md", where = "4.2, row 13", text = "`Liveness` (replacement)" },
+]
 gaps = [
     "A clean kill or crash image is enough. A cut inside the Mount write sequence (R-sim-05) is not needed.",
 ]
@@ -148,32 +218,44 @@ gaps = [
 [rep2]
 row = 14
 workload = "membership"
+sensitivity = "sensitive"
 reach = "partly"
+not_detectable_yet = "not detectable yet: design 3.7 lists RetryCertifiesNamedRemoval by name only, so there is no rule text to quote, and it looks unreachable through the API (author and reviewer read the code, neither ran it). Design 4.2 and decision 9 give row 14 no Liveness rule."
 faults = "Crash the Data leader after it entered joint consensus for a damaged-voter replacement, or lose the Replaced reply, and let the scheduler retry the plan."
 trigger = "Joint membership committed (Applied of a membership entry with two configs)."
-invariant = "Liveness (the replacement resumes from joint consensus). RetryCertifiesNamedRemoval compares the certified (removed, replacement) with the membership entries that committed."
+rules = []
 gaps = [
     "RetryCertifiesNamedRemoval looks unreachable through the API: every caller derives `next` from the plan it retries, and one claim per group keeps a second change out (read from the code, not run).",
+    "Liveness (the replacement resumes from joint consensus) is the reachable symptom, read by author and reviewer. Counting it needs quoted text and the lead's word.",
 ]
 
 [rv-rep-3]
 row = 15
 workload = "membership"
+sensitivity = "sensitive"
 reach = "blocked"
+not_detectable_yet = "not detectable yet: blocked by H-05 and S12 in gaps."
 faults = "Wipe the replacement's pool after its Mount committed while its mount signing key survives, then restart it under the same identity."
 trigger = "SystemReplacementMounted and stable RF3 in every group."
-invariant = "WipedNeverVotes: votes under a node identity come from the storage generation that first voted under it."
+rules = [
+    { rule = "WipedNeverVotes", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "votes under a node identity come from the storage generation that first voted under it" },
+]
 gaps = [
     "H-05: sim-oltp/src/disk.rs mounts one ROOT per worker, so a wipe removes the signing key too and RestartMount::open refuses for another reason. It needs separate key and data volumes (S12).",
+    "The in-tree regression fails only on a timeout. The review's state check is the evidence.",
 ]
 
 [fixb-voter-refresh]
 row = 16
 workload = "membership"
+sensitivity = "sensitive"
 reach = "needs-workload"
 faults = "Two sequential Control voter replacements, so the original voter set keeps no majority. A Data-only worker runs through both."
 trigger = "Second Control SystemReplacementPublished."
-invariant = "Liveness on a revocation probe: the Data-only worker adopts the published Control voters and refreshes revocations within its bound."
+rules = [
+    { rule = "Liveness", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "convergence within 30 s of the heal; the cold start, move or index build finishes within its bound" },
+    { rule = "Liveness", file = "designs/phase-10-11-oltp-sim.md", where = "4.2, row 16", text = "`Liveness`, revocation probe" },
+]
 gaps = [
     "Needs data_worker_process::run nodes, which the harness does not start yet, and system replacement twice in one seed.",
 ]
@@ -181,67 +263,100 @@ gaps = [
 [cap1]
 row = 17
 workload = "membership"
+sensitivity = "partial"
 reach = "needs-hook"
+not_countable = "not countable: the patch is partial."
 faults = "One enrolled voter does not advertise data.index.reclaim (known_features_for_test), or joins later without it, while an index is retired and reclaimed."
 trigger = "Index retirement settled and its Timestamp pin released."
-invariant = "CapabilityBeforeUse: no ReclaimIndex entry commits while a voter of the group lacks the advert."
+rules = [
+    { rule = "CapabilityBeforeUse", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "no entry needing feature F commits while a voter lacks F" },
+]
 gaps = [
     "One binary: every replica still decodes the entry, so only the probe invariant can fire, never a diverging apply. Needs known_features_for_test under cfg(sim) and an index drop in the workload.",
+    "The review's joiner received the entry and never advertised (hosted managers, no advert, run in the manifest). The in-tree CAP1 test says nothing, because its direct fixture has no HostedGroupManager.",
 ]
 
 [rv-rep-2]
 row = 18
 workload = "membership"
+sensitivity = "partial"
 reach = "nightly"
+not_detectable_yet = "not detectable yet: a black-box seed needs 1,025 replacements. The patch is partial."
 faults = "1,025 system replacements (each revokes one worker), then a Control restart."
 trigger = "1,025th SystemReplacementMounted."
-invariant = "Liveness (Control): every Control voter reopens and serves after the restart."
+rules = [
+    { rule = "Liveness", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "convergence within 30 s of the heal; the cold start, move or index build finishes within its bound" },
+    { rule = "Liveness", file = "designs/phase-10-11-oltp-sim.md", where = "4.2, row 18", text = "`Liveness` (Control)" },
+]
 gaps = [
     "A black-box seed needs 1,025 enrolled replacements. A seeded durable revocation set would make it affordable, but that is not a black-box step (design 3.5).",
+    "The patched Control does not stop and a restart does not fail (review): it reopens and retries its revocations forever with trust_available() false. Whether Liveness (Control) sees that has not been run.",
 ]
 
 [flake3-epoch]
 row = 19
 workload = "resources"
+sensitivity = "sensitive"
 reach = "unreachable"
+not_detectable_yet = "not detectable yet: looks unreachable through a RaftCore (read by author and reviewer, not run)."
 faults = "An append must be queued behind a vote, truncation or purge that still waits for the writer, then the node must lose power between the two writes."
 trigger = "Not available: RaftCore awaits save_vote, purge and truncate_after inline (openraft 0.10.0 core/raft_core.rs 2539-2603), so it never submits an append while one is pending."
-invariant = "MonotonicVote across the restart, then LogMatching and MajorityReached."
+rules = [
+    { rule = "LogMatching", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "the same `(group, index)` always applies the same log id and payload hash" },
+    { rule = "MajorityReached", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "an applied entry is durable on a majority, rebuilt from the volume at each start" },
+]
 gaps = [
     "Looks unreachable through a RaftCore; the regression drives the log store directly (read from the code, not run).",
     "H-01 would hide it anyway: storage jobs are atomic, so no crash lands between the early append and the vote sync.",
+    "The in-tree regression's assertion is a counter. The review's state check drives the log store directly, so it does not contradict the reading above.",
 ]
 
 [rd2]
 row = 20
 workload = "cold"
+sensitivity = "sensitive"
 reach = "needs-probe"
 faults = "Control answers slowly or not at all (one-stream delay or partition of the Control leader) while several DirectLeader roles are warm."
 trigger = "Two or more ranges led by workers that called Timestamp or Catalog on the direct path within WARM_IDLE."
-invariant = "WarmReadsSerial (the probe rule in design 4.2): at most one background grant read in flight per worker."
+rules = [
+    { rule = "WarmReadsSerial", file = "designs/phase-10-11-oltp-sim.md", where = "4.2, row 20", text = "a probe rule allows at most one background Control lane slot" },
+    { rule = "Liveness", file = "designs/phase-10-11-oltp-sim.md", where = "3.7", text = "convergence within 30 s of the heal; the cold start, move or index build finishes within its bound" },
+    { rule = "Liveness", file = "designs/phase-10-11-oltp-sim.md", where = "4.2, row 20", text = "`Liveness`; a probe rule allows at most one background Control lane slot" },
+]
 gaps = [
     "The probe list has no warm-read start and end events. Liveness alone needs the warm reads to fill the Control lane during a cold fence, which one table and one range does not do.",
+    "WarmReadsSerial is the author's label for the quoted probe rule. The design says one background Control lane slot, not one grant read per worker.",
+    "The in-tree regression's assertion is a counter. The review's state check uses a modelled lane.",
 ]
 
 [qlane]
 row = 21
 workload = "queued"
+sensitivity = "sensitive"
 reach = "needs-invariant"
+not_detectable_yet = "not detectable yet: AcceptedSettlesInRun is not on main, and its quoted text may not cover the patched answer, see gaps."
 faults = "Outgoing Storage lane of the owner full when an accepted batch prepares, seals or resolves."
 trigger = "Queue acceptance of a multi-range batch with small per-seed lanes."
-invariant = "AcceptedSettlesInRun (new): an accepted mutation never ends because a local lane was full."
+rules = [
+    { rule = "AcceptedSettlesInRun", file = "docs/testing/scheduler-contract.md", where = "introduction", text = "Retain accepted work through individual failures while a request copy survives." },
+    { rule = "AcceptedSettlesInRun", file = "docs/testing/guarantees/oltp.md", where = "OLTP-G07", text = "Accepted queued work stays recoverable while a complete copy survives. A full worker stop abandons outstanding work." },
+]
 gaps = [
     "`outcome::check` cannot see it: the abort is decided, so the refusal is a true not_applied.",
     "S7: lane sizes are per seed only, no refusal at a chosen step. A one-slot lane with concurrent batches may reach it by load.",
+    "The quoted text says accepted work is retained and stays recoverable. It does not say that accepted work cannot end in a definite refusal, which is what the patched build gives (429 `worker outgoing lane full (Storage)`, not_applied). A rule on P11-QUEUED's unmerged branch, written from the contract's words, fires on a missing or abandoned answer and accepts any terminal one (db4d4fe9, read, not run). Rows 12 and 21 share one rule, so neither may reword it.",
 ]
 
 [gc1-double-guard]
 row = 22
 workload = "resources"
+sensitivity = "not sensitive"
 reach = "needs-invariant"
+not_detectable_yet = "not detectable yet: decision 9 says OneGuardPerAppend counts an implementation detail and detects nothing for the bar, and design 4.2's ExactlyOnceRelease holds under this patch."
 faults = "None. Every append has two guards; cancellation is not needed."
 trigger = "Any append."
-invariant = "OneGuardPerAppend (new): GuardAcquired minus GuardReleased equals the appends in flight. ExactlyOnceRelease as designed holds under this patch, because both guards are acquired and released once."
+rules = []
 gaps = [
     "The defect changes only the count. drain still waits for every write, so no history, log or liveness check can see it.",
+    "The review found the patch not sensitive: a counter is the only thing that changes.",
 ]

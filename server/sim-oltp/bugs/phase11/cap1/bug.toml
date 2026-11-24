@@ -17,14 +17,22 @@ is gone: ALPN nabedra-otp/3, PeerFeature::IndexReclamation, RequestTarget::Featu
 required-feature refusal (9be40820), and the sender gates (414dcf79). The gate therefore asks for
 PeerFeature::DirectAdmission (otp/4), the surviving half of the original
 `direct_admission || alpn == INDEX_RECLAIM_ALPN`. With one binary every session passes both forms.
+The missing sender gates make the patch wider than the original on the sender side: the calls
+ParticipantStoredIndex, ParticipantIndexReclaim and TimestampCall 42 go to any session. The record's consequence, an old
+build that cannot apply the entry, cannot happen with one binary. What the review measured: the ReclaimIndex entry
+commits with no member advertising it and Control not enabling it, and a worker that never advertised joins afterwards.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "membership"
 profile = ["mixed-features", "index-drop", "worker-join"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `CapabilityBeforeUse`, designs/phase-10-11-oltp-sim.md, 3.7: "no entry needing feature F commits while a voter lacks
+#     F"
 expect = ["CapabilityBeforeUse"]
 seeds = [1, 10000]
 
+# The probe is the patch author's. What confirms this row is the review's run below, not the probe.
 [regression]
 kind = "lib-test"
 test = "oltp_replication::manager::damage_scheduler_tests::probe_cap1_no_reclamation_before_the_cluster_feature"
@@ -32,6 +40,7 @@ mode = "on"
 probe = true
 failure_contains = ["before Control enabled data.index.reclaim"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "709d7c994a53a0c42ff9414da3fe54666378b16cfdc09893882109836db1eaaa"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, probe_cap1_no_reclamation_before_the_cluster_feature, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -39,3 +48,9 @@ patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/454359
 a ReclaimIndex entry committed at AppliedPosition { term: 1, node_id: 1, index: 3 } before Control enabled data.index.reclaim
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 194 filtered out; finished in 1.58s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): partial.
+# Patch read: the proposal gate and the ungated sweep only; wider than the original on the sender side. Kept apart from
+# the author's evidence above. These are workflow `tests`, `scenarios` or growth runs in mode on, not attested checks,
+# and not a detection.
+# - oltp_replication::manager::damage_scheduler_tests::review121::r121_cap1_no_reclaim_entry_where_a_member_lacks_the_advert: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 (refused not_applied; with the flag set the same core commits) passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456438171 (835ba4ae) 3 of 3 failed: the entry committed with all three members advertised false and enabled false, and the joiner that received it never advertised.

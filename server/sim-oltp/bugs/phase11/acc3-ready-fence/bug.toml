@@ -16,12 +16,17 @@ registered startup is one call again instead of a startup_read loop. O14, where 
 once with the patch. The probe holds the joining worker at the fence and stops the Timestamp quorum.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "cold"
 profile = ["staggered-reopen", "rolling-restart", "freeze-two"]
-expect = ["Liveness", "ProcessExit"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `Liveness`, designs/phase-10-11-oltp-sim.md, 3.7: "convergence within 30 s of the heal; the cold start, move or
+#     index build finishes within its bound"
+#   `Liveness`, designs/phase-10-11-oltp-sim.md, 4.2, row 10: "`Liveness` (cold start)"
+expect = ["Liveness"]
 seeds = [1, 10000]
 
+# The probe is the patch author's. What confirms this row is the review's run below, not the probe.
 [regression]
 kind = "lib-test"
 test = "oltp_acceptance::probe_acc3_ready_fence_survives_a_timestamp_outage"
@@ -31,6 +36,7 @@ needs_server = true
 timeout_s = 1800
 failure_contains = ["the joining worker exited when one ready-fence call failed", "no registered group leader completed the strong service call"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "be165f2b93bf0495efd084298ae08d6966bcb0d4778090a3a7ef4aefa6e68be2"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, probe_acc3_ready_fence_survives_a_timestamp_outage, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -41,3 +47,9 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out
     assert alive, 'the joining worker exited when one ready-fence call failed'
 AssertionError: the joining worker exited when one ready-fence call failed
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact inverse of afbc048b. Kept apart from the author's evidence above. These are workflow `tests`,
+# `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - oltp_acceptance::r121_ready_fence_outlives_a_timestamp_outage (real processes, no product hook): clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456447292 (635e06a0) 3 of 3 failed: the joiner exited 6.9 to 7.9 s into the outage, its fence not committed.
+# - control without an outage, r121_ready_fence_without_an_outage: passed 3 of 3 on both sides (the same runs).

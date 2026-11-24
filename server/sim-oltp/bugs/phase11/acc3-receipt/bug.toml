@@ -16,10 +16,13 @@ nabedra_rt::time (phase 7 renamed the clock calls). The unscoped wait loop ends 
 observation error again; `observation_deadline` is gone.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "queued"
 profile = ["receipt-fault", "session-drop", "api-restart"]
-expect = ["ReceiptObservationPatience"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   Empty. Not detectable yet: no plan, contract or register text is quoted for a rule that can fire (lead decision 9
+#     and its amendment after review-121). ReceiptObservationPatience is dropped.
+expect = []
 seeds = [1, 10000]
 
 [regression]
@@ -29,6 +32,7 @@ mode = "on"
 timeout_s = 3600
 failure_contains = ["in transient_receipt_observation", "original accepted request requires reconciliation"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "7791b2808ce173149d870bff23223de90e53e642ae1fa97dd7effda46ce14542"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, acceptance O13, direct_oltp on, on mode, over main c8426fe1" }
@@ -37,3 +41,8 @@ patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/454362
 AssertionError: (503, {'request_id': '338e9d33-7f69-4b5e-9c87-b5d9c56d38c5', 'error': {'code': 'outcome_unknown', 'message': 'original accepted request requires reconciliation', 'outcome': 'unknown'}})
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 113.12s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact inverse of d6eb811a. Kept apart from the author's evidence above. These are workflow `tests`,
+# `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - acceptance O13: clean https://github.com/zPy52/nabedra-database/actions/runs/45463637377 (01c4af20) 1 of 1 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45463650016 (995fb417) 1 of 1 failed: 503 outcome_unknown, `original accepted request requires reconciliation`.

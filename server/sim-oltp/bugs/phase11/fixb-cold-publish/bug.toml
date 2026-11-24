@@ -16,9 +16,13 @@ original run instead of the revocation that Mount wrote, so a cold start between
 forever. c7249204's resume path stays; it cannot publish past this check.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "membership"
 profile = ["replacement", "full-stop"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `Liveness`, designs/phase-10-11-oltp-sim.md, 3.7: "convergence within 30 s of the heal; the cold start, move or
+#     index build finishes within its bound"
+#   `Liveness`, designs/phase-10-11-oltp-sim.md, 4.2, row 13: "`Liveness` (replacement)"
 expect = ["Liveness"]
 seeds = [1, 10000]
 
@@ -28,6 +32,7 @@ test = "oltp_replication::authority::control::tests::system_recovery::r04_o17_co
 mode = "on"
 failure_contains = ["Rejected(Stale)"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "34e5cf1287dbef5031d0ee6c78af6879c81ee11c3b88e7a71425e582db3b70cf"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, r04_o17_cold_fence_after_mount_completes_publication, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -35,3 +40,8 @@ patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/454358
 Rejected(Stale)
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.06s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: one of the fix's hunks, the deciding one. Kept apart from the author's evidence above. These are workflow
+# `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456611631 (4275a39b) 3 of 3 failed: `Rejected(Stale)`.

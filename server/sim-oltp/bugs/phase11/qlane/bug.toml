@@ -16,9 +16,14 @@ client.call again, so a full outgoing Storage lane refuses an accepted batch. Th
 (b179b584) stays for its other callers.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "queued"
 profile = ["lane-exhaust", "cross-range-batches"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `AcceptedSettlesInRun`, docs/testing/scheduler-contract.md, introduction: "Retain accepted work through individual
+#     failures while a request copy survives."
+#   `AcceptedSettlesInRun`, docs/testing/guarantees/oltp.md, OLTP-G07: "Accepted queued work stays recoverable while a
+#     complete copy survives. A full worker stop abandons outstanding work."
 expect = ["AcceptedSettlesInRun"]
 seeds = [1, 10000]
 
@@ -28,6 +33,7 @@ test = "oltp_runtime::worker_runtime::direct_gateway::tests::o07_o13_q01_accepte
 mode = "on"
 failure_contains = ["worker outgoing lane full (Storage)"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "07e2d4b3d81c1a77a5f74a66d092131c6494925bd5035a8837dc02425522aec9"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -38,3 +44,8 @@ assertion `left == right` failed
  right: (200, Object {"data": Number(2), "request_id": String("e94baff9-bbfe-497c-80c4-68c1e5e6becd")})
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 0.98s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact inverse of 7ddad3bb, including the error mapping. Kept apart from the author's evidence above. These
+# are workflow `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456693715 (17c0a6ee) 3 of 3 failed: the accepted batch ended 429 `worker outgoing lane full (Storage)`.

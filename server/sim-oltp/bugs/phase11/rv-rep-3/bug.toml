@@ -15,12 +15,17 @@ The 2def358f refusal reversed where it decides, QuorumEndpoint::check_mount in m
 mount that Control already committed is accepted even when the process retained nothing.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "membership"
 profile = ["replacement", "wipe-data"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `WipedNeverVotes`, designs/phase-10-11-oltp-sim.md, 3.7: "votes under a node identity come from the storage
+#     generation that first voted under it"
 expect = ["WipedNeverVotes"]
 seeds = [1, 10000]
 
+# The text below is a timeout, not a state check: the suite's assertions after the 30 s exit wait never run. The
+# review's state check (below) is on a scratch branch, so this manifest cannot name it as its test.
 [regression]
 kind = "recovery-suite"
 suite = "replacement-wipe"
@@ -28,6 +33,7 @@ mode = "on"
 timeout_s = 3600
 failure_contains = ["assert attempt.popen.wait(timeout=30) != 0", "subprocess.TimeoutExpired"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "64486e0a7b958daef9aff9b543103587cdbe65ef7a3e661b28a4da0560a9b70b"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45440153575", sha = "c5d1cc5c6a0bb7ff2d5a21e35253d5c619f01850", result = "passed", note = "request p11-bugs-clean-suites-c5d1cc5-174205, scratch_recovery_suite_replacement_wipe, 1 of 1 attempts, on mode, over main c8426fe1" }
@@ -36,3 +42,9 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 199 filtered out
     assert attempt.popen.wait(timeout=30) != 0
 subprocess.TimeoutExpired: Command '['/home/runner/work/nabedra-database/nabedra-database/server/target/debug/deps/nabedra_database_server-030e6d568b85f86d', '--exact', 'oltp_runtime::recovery_tests::actual_runtime_child', '--ignored', '--nocapture']' timed out after 30 seconds
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: the 2def358f refusal only. Kept apart from the author's evidence above. These are workflow `tests`,
+# `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - sensitive by the review's own test: the in-tree suite fails only on a timeout (see [regression]).
+# - oltp_acceptance::r121_wiped_replacement_never_rejoins (server/tests/review121_wipe.py on scratch/review-121-clean): clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456457593 (cfa5585c) 3 of 3 failed: `pool_reopened=True stable_rf3_again=True`: the wiped voter reopened a blank pool and applied stable RF3 in every group.

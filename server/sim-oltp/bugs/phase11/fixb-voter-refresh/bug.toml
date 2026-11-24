@@ -15,9 +15,13 @@ port_notes = """
 published-voter read reserves HEADER_LIMIT (4096) instead of 64 KiB of decode memory.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "membership"
 profile = ["data-only-worker", "replacement"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `Liveness`, designs/phase-10-11-oltp-sim.md, 3.7: "convergence within 30 s of the heal; the cold start, move or
+#     index build finishes within its bound"
+#   `Liveness`, designs/phase-10-11-oltp-sim.md, 4.2, row 16: "`Liveness`, revocation probe"
 expect = ["Liveness"]
 seeds = [1, 10000]
 
@@ -28,6 +32,7 @@ mode = "on"
 timeout_s = 3600
 failure_contains = ["Data-only worker adopted the published Control voters"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "91b31eb189463773c7944db26c1952a9a8303cdf230c4629b7515e0dcb75d59f"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45440153575", sha = "c5d1cc5c6a0bb7ff2d5a21e35253d5c619f01850", result = "passed", note = "request p11-bugs-clean-suites-c5d1cc5-174205, scratch_recovery_suite_replacement_voter_refresh, 1 of 1 attempts, on mode, over main c8426fe1" }
@@ -36,3 +41,8 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 199 filtered out
 AssertionError: Data-only worker adopted the published Control voters: False
 AssertionError: Data-only worker adopted the published Control voters: False. Current voters ["78d165d5-63a1-4211-a118-3193aee9b20c","97ce071e-0065-40af-82e4-fa8a3ea0e0d9","ddc79ee5-09f2-413e-aac9-698926717475"], expected ['09295983-5485-4042-89e7-b67693a440d8', '78d165d5-63a1-4211-a118-3193aee9b20c
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact inverse of 780db860. Kept apart from the author's evidence above. These are workflow `tests`,
+# `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - oltp_acceptance::r121_suite_voter_refresh (the [regression] suite): clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456473067 (4174135d) 3 of 3 failed: a bounded wait, but it prints the old voter set where the published one is expected.

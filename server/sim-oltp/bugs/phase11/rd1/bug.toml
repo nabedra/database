@@ -19,12 +19,16 @@ with this patch, but only on its retry counter: it fences before the lookup, whi
 probe fences between lookup and snapshot and shows the old descriptor committing.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "topology"
 profile = ["index-publish", "same-range-writers"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `CoveringIndexComplete`, designs/phase-10-11-oltp-sim.md, 3.7: "an acknowledged insert appears in every covering
+#     index scan at a later snapshot"
 expect = ["CoveringIndexComplete"]
 seeds = [1, 10000]
 
+# The probe is the patch author's. What confirms this row is the review's run below, not the probe.
 [regression]
 kind = "lib-test"
 test = "oltp_runtime::direct::tests::probe_rd1_a_fence_during_the_latch_wait_is_not_bypassed"
@@ -32,6 +36,7 @@ mode = "on"
 probe = true
 failure_contains = ["the old descriptor must not commit under the new epoch"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "3ac3f93325ea6bdcddafa6757d41687d0a9d9d67158acad340a6f83dde3e9fce"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45438486602", sha = "c33845aaa3e95f987af6151e8b7ba454f2cd72a1", result = "passed", note = "request p11-bugs-clean-rd1-c33845a-173325, probe_rd1_a_fence_during_the_latch_wait_is_not_bypassed, 5 of 5 attempts, on mode, over main c8426fe1" }
@@ -41,3 +46,9 @@ assertion `left == right` failed: the old descriptor must not commit under the n
  right: Fallback { reason: Schema }
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out; finished in 1.89s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: the lookup is fixed for all attempts again, as before f2e21999; not wider than the original. Kept apart
+# from the author's evidence above. These are workflow `tests`, `scenarios` or growth runs in mode on, not attested
+# checks, and not a detection.
+# - oltp_runtime::direct::tests::review121::r121_rd1_published_index_has_every_acknowledged_update and r121_rd1_no_write_between_fence_and_publication: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 each passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456409559 (4db94d3d) 3 of 3 each failed: the update was acknowledged `Done(true)` and the published index has no entry for it.

@@ -16,18 +16,25 @@ epoch again, so a task whose own append was already covered can take jobs queued
 truncation or purge.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "resources"
 profile = ["leader-move", "append-load", "crash-leader"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `LogMatching`, designs/phase-10-11-oltp-sim.md, 3.7: "the same `(group, index)` always applies the same log id and
+#     payload hash"
+#   `MajorityReached`, designs/phase-10-11-oltp-sim.md, 3.7: "an applied entry is durable on a majority, rebuilt from
+#     the volume at each start"
 expect = ["LogMatching", "MajorityReached"]
 seeds = [1, 10000]
 
+# The assertion below is a counter (how many syncs happened), not a state check.
 [regression]
 kind = "lib-test"
 test = "oltp_replication::typed_log::tests::o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote"
 mode = "on"
 failure_contains = ["the vote must sync before the post-vote batch starts"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "44a619dbc910f2fcad82e491bf5684e07498864f92366e8afb48e3d606f115ae"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -37,3 +44,10 @@ assertion `left == right` failed: the vote must sync before the post-vote batch 
  right: 6
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.02s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact inverse of 38fc414d. Kept apart from the author's evidence above. These are workflow `tests`,
+# `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - sensitive by the review's own test: the in-tree assertion is a counter (see [regression]).
+# - oltp_replication::typed_log::tests::r121_flake3_a_crash_never_keeps_a_post_vote_entry_without_its_vote: clean https://github.com/zPy52/nabedra-database/actions/runs/45461651504 (01c4af20) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45461667560 (236975bd) 3 of 3 failed: the durable image taken when the first post-vote append is acknowledged holds entry 3 and `vote: None`.
+# - the [regression] test, the counter: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456657296 (e72bbff0) 3 of 3 failed: `left: 5`, `right: 6`.

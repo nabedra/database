@@ -18,12 +18,16 @@ patch (opt-level-1 growth job, `fresh scan omitted an acknowledged mutation`, ru
 without it (run 45440174171), one run each.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "topology"
 profile = ["index-publish", "split"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `CoveringIndexComplete`, designs/phase-10-11-oltp-sim.md, 3.7: "an acknowledged insert appears in every covering
+#     index scan at a later snapshot"
 expect = ["CoveringIndexComplete"]
 seeds = [1, 10000]
 
+# The stronger regression is acceptance O28: author patched 1 of 1 failed, clean 1 of 1 passed (port_notes); review below.
 [regression]
 kind = "lib-test"
 test = "oltp_runtime::worker_runtime::index_backend::acceptance_tests::probe_topo1_a_reused_direct_epoch_reads_the_new_lifecycle"
@@ -31,6 +35,7 @@ mode = "on"
 probe = true
 failure_contains = ["the child group used the parent's cached pre-index descriptor"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "f79a31cf1342d3fccf7319e470acb34c2fe59503e90478c750aef9ef9888e071"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, probe_topo1_a_reused_direct_epoch_reads_the_new_lifecycle, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -40,3 +45,9 @@ assertion `left == right` failed: the child group used the parent's cached pre-i
  right: (bcabb7b1-10b7-4acb-81f0-aef15a8c201d, 1)
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out; finished in 1.55s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact inverse of 40e0c7f7. Kept apart from the author's evidence above. These are workflow `tests`,
+# `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - acceptance O28 (jobs=growth), the stronger regression: clean https://github.com/zPy52/nabedra-database/actions/runs/45456492306 (f75c41a7) 1 of 1 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456488237 (f9c64c4a) 1 of 1 failed: `fresh scan omitted an acknowledged mutation`.
+# - the same again: clean https://github.com/zPy52/nabedra-database/actions/runs/45456504514 (f75c41a7) 1 of 1 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456497079 (f9c64c4a) 1 of 1 failed: the same.

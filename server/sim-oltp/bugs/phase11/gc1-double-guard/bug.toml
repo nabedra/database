@@ -12,21 +12,27 @@ reverts = "b694f75b3a2198c6a02aff222a2f62dd1161adde"
 port = "hand"
 port_notes = """
 b694f75b reversed in typed_log.rs (log targets changed around it): each AppendJob carries a second
-PendingGuard besides its task's guard.
+PendingGuard besides its task's guard. Not sensitive: the regression fails on the pending counter only. The defect
+changes only the count. Both guards are acquired and released once each, so there is no other behaviour to test.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "resources"
 profile = ["cancel", "drain"]
-expect = ["OneGuardPerAppend"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   Empty. Not detectable yet: decision 9 says OneGuardPerAppend counts an implementation detail and detects nothing for
+#     the bar, and design 4.2's ExactlyOnceRelease holds under this patch.
+expect = []
 seeds = [1, 10000]
 
+# The assertion below is a counter (pending guards), not a state check.
 [regression]
 kind = "lib-test"
 test = "oltp_replication::typed_log::tests::c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_group_vote"
 mode = "on"
 failure_contains = ["left: 2", "right: 1"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "c9c22d769b2cddb4fc072d0efdfdb7c4370e5dd15493f119bbffbe5ce16c0b4a"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_group_vote, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -36,3 +42,9 @@ assertion `left == right` failed
  right: 1
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.05s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): not sensitive.
+# Patch read: exact inverse of b694f75b. Kept apart from the author's evidence above. These are workflow `tests`,
+# `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - not sensitive by the review's rule: the failure is the pending counter and nothing else.
+# - the [regression] test, the counter: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456711262 (1bf1064d) 3 of 3 failed: `left: 2`, `right: 1`.

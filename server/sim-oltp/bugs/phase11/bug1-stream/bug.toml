@@ -16,9 +16,14 @@ http.rs before d7b9d63c kept the direct gateway only with a declared length
 `length.is_some()` at its one use. A body without Content-Length skips the anchor check again.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "queued"
 profile = ["lost-http-reply", "streamed-retry"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `Liveness`, docs/testing/guarantees/oltp.md, OLTP-G03: "On the direct path, a retry of a mutation with the same
+#     request ID and body returns the first definite result of that identity, including a no-op or row conflict, while
+#     its dedup record is retained."
+#   `Liveness`, docs/testing/oltp-contract.md, D02: "One committed version, the original result, one dedup record."
 expect = ["Liveness"]
 seeds = [1, 10000]
 
@@ -28,6 +33,7 @@ test = "oltp_runtime::worker_runtime::direct_gateway::tests::d03_q05_bug1_direct
 mode = "on"
 failure_contains = ["request id already committed on the direct path; retry it to read the result"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "84fe7bcf41edff390308a449f8a90dc1c9979d87a6dd9961f2b9fe9a189efff9"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, d03_q05_bug1_direct_retry_without_content_length_replays_original_result, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -37,3 +43,8 @@ assertion `left == right` failed
  right: (200, Object {"data": Null, "request_id": String("73491c84-2ed3-42d3-82ee-cd032dab4187")})
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 1.59s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: the gateway rule before d7b9d63c; what both fix commits added goes. Kept apart from the author's evidence
+# above. These are workflow `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456544262 (aaf38a4c) 3 of 3 failed: 503 instead of the original 200 result.

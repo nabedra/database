@@ -16,12 +16,17 @@ Barrier or Propose over a prepared-only session is refused as invalid instead of
 was found, passed once with the patch.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "membership"
 profile = ["rolling-restart", "leader-move"]
-expect = ["Liveness", "ProcessExit"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `Liveness`, designs/phase-10-11-oltp-sim.md, 3.7: "convergence within 30 s of the heal; the cold start, move or
+#     index build finishes within its bound"
+#   `Liveness`, designs/phase-10-11-oltp-sim.md, 4.2, row 11: "`Liveness`, `outcome::check`"
+expect = ["Liveness"]
 seeds = [1, 10000]
 
+# The probe is the patch author's. What confirms this row is the review's run below, not the probe.
 [regression]
 kind = "lib-test"
 test = "oltp_replication::manager::damage_scheduler_tests::probe_acc3_delegation_waits_for_the_applied_promotion"
@@ -29,6 +34,7 @@ mode = "on"
 probe = true
 failure_contains = ["from a worker whose promotion is not applied here"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "6c32d5510986d42864feb53ddccf27a81e146da3395407dae8a861b3d3eadf1d"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, probe_acc3_delegation_waits_for_the_applied_promotion, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -38,3 +44,8 @@ assertion `left == right` failed: barrier from a worker whose promotion is not a
  right: (StorageUnavailable, NotApplied)
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 194 filtered out; finished in 1.35s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact inverse of 6ad8a99c. Kept apart from the author's evidence above. These are workflow `tests`,
+# `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - oltp_replication::manager::damage_scheduler_tests::review121::r121_acc3_delegation_heals_when_the_promotion_applies: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456424289 (799d9682) 3 of 3 failed: `Unauthorized` after about 0.5 ms, never retried.

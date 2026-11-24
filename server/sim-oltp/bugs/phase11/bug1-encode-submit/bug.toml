@@ -16,9 +16,17 @@ encoding refusal itself (not_applied) after the queue accepted the request. `fin
 `submits` parameter (unused) because the regression calls it. The rest of d7b9d63c belongs to other bugs.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "queued"
 profile = ["low-data-bytes", "lane-exhaust"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `failed-write-observed`, docs/testing/guarantees/oltp.md, OLTP-G04: "Return `not_applied` only with proof of
+#     non-application. Otherwise, report uncertainty as `outcome_unknown`."
+#   `failed-write-observed`, designs/phase-10-11-oltp-sim.md, 4.2, row 2: "`failed-write-observed`, `QueueRetention`"
+#   `QueueRetention`, designs/phase-10-11-oltp-sim.md, 3.7: "an accepted request keeps a complete copy while any holder
+#     lives, and the new run is empty after a full stop"
+#   `QueueRetention`, docs/testing/guarantees/oltp.md, OLTP-G07: "Accepted queued work stays recoverable while a
+#     complete copy survives. A full worker stop abandons outstanding work."
 expect = ["failed-write-observed", "QueueRetention"]
 seeds = [1, 10000]
 
@@ -28,6 +36,7 @@ test = "oltp_runtime::application::q05_o13_bug1_submission_encoding_failure_pres
 mode = "on"
 failure_contains = ["left: NotApplied"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "2b04ed65b0896fdd68e2edadf7d89427916c2556aa0e92553eecf4724e351049"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -37,3 +46,8 @@ assertion `left == right` failed
  right: Unknown
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 0.00s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact for the application.rs hunks of d7b9d63c. Kept apart from the author's evidence above. These are
+# workflow `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - the [regression] test (helper level): clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456531479 (081b4da8) 3 of 3 failed: `left: NotApplied`, `right: Unknown`.

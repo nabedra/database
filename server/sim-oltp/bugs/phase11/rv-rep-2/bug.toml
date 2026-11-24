@@ -11,25 +11,35 @@ fix_commits = ["8b3c44b2c55b51c4aae414567924ace705fdf048", "2def358f9c98bb149107
 reverts = "8b3c44b2c55b51c4aae414567924ace705fdf048"
 port = "hand"
 port_notes = """
-8b3c44b2 reversed (system_trust.rs loads 1,024 revocations), plus the 2def358f capacity refusal in
-system_recovery.rs. 8b3c44b2 alone is clean but cannot be reached: since 2def358f Control refuses the mount
-that would write the 1,025th revocation, so only an old durable image holds one. With both, the 1,025th
-mount commits and Control cannot load its revocations again. refresh_or_retry (2def358f) stays, so a running
-core keeps retrying instead of stopping; a restart fails.
+Partial: two fixes are reversed and the record's consequence is not back. `reverts` holds one SHA, so it names
+8b3c44b2 only; this patch reverses 8b3c44b2c55b51c4aae414567924ace705fdf048 (system_trust.rs loads 1,024 revocations)
+and 2def358f9c98bb14910726ac5888ba3be2a80441's capacity refusal in system_recovery.rs. Neither alone has the defect
+after a mount at the limit (review, local runs). 8b3c44b2 alone shows only on an old durable image (author, run
+45435939958, `!restarted.revoked(survivor)`): since 2def358f Control refuses the mount that would write the 1,025th
+revocation. With both, that mount commits and Control cannot load its revocations again. The title, `The 1,025th worker revocation could stop Control`, is not put back: refresh_or_retry
+(2def358f) stays, so a running core keeps going, and a restart does not fail either: with_replacement_directory returns
+Ok and retries forever with trust_available() false. The regression fails at its first assertion, the 2def358f refusal,
+and never reaches the 8b3c44b2 half.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "membership"
 profile = ["revocation-storm"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   `Liveness`, designs/phase-10-11-oltp-sim.md, 3.7: "convergence within 30 s of the heal; the cold start, move or
+#     index build finishes within its bound"
+#   `Liveness`, designs/phase-10-11-oltp-sim.md, 4.2, row 18: "`Liveness` (Control)"
 expect = ["Liveness"]
 seeds = [1, 10000]
 
+# The text below shows the 2def358f half only.
 [regression]
 kind = "lib-test"
 test = "oltp_replication::authority::control::tests::system_recovery::o17_revocation_limit_and_failed_refresh_preserve_the_committed_mount"
 mode = "on"
 failure_contains = ["left: SystemReplacementMounted"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "1b4c64d0f1d1f7cb9d6d897512e9b292be2503829270e2e378e440c035867e58"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o17_revocation_limit_and_failed_refresh_preserve_the_committed_mount, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -39,3 +49,11 @@ assertion `left == right` failed
  right: Rejected(Busy)
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.69s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): partial.
+# Patch read: two fixes reversed, and the original consequence (Control stops) is not back. Kept apart from the author's
+# evidence above. These are workflow `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a
+# detection.
+# - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456643380 (8d9849ee) 3 of 3 failed: `left: SystemReplacementMounted`, `right: Rejected(Busy)`, the 2def358f half only.
+# - which hunk matters, LOCAL runs on 26f1ea29, 3 attempts each, not on CI: clean passed 3 of 3, both hunks failed 3 of 3 (`load: Err ... Control transition cannot be proven`), only the mount hunk passed 3 of 3, only the load hunk passed 3 of 3.
+# - not evidence: https://github.com/zPy52/nabedra-database/actions/runs/45461695209, https://github.com/zPy52/nabedra-database/actions/runs/45461707881 and https://github.com/zPy52/nabedra-database/actions/runs/45461722335 passed on the patched builds, because that first test only checked that opening Control succeeds.

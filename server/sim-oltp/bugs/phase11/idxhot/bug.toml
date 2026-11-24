@@ -15,10 +15,14 @@ The fix's hunks reversed in nabedra-oltp-storage mvcc/index/build.rs (imports ch
 conflicted backfill refresh ends the build, and row_written_since_source with its imports is gone.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
-# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "topology"
 profile = ["index-publish", "hot-key-writers"]
-expect = ["Liveness"]
+# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
+#   Empty. Not detectable yet: no plan, contract or register text is quoted for a rule that can fire (lead decision 9
+#     and its amendment after review-121). Design 4.2 names Liveness (index build), but decision 9 asks row 7 for its
+#     own text.
+expect = []
 seeds = [1, 10000]
 
 [regression]
@@ -27,6 +31,7 @@ test = "oltp_runtime::worker_runtime::index_backend::acceptance_tests::o12_hot_k
 mode = "on"
 failure_contains = ["backfill must finish while every refresh attempt races a committed write"]
 
+# The patch author's own runs.
 [regression.evidence]
 digest = "a3413bb4fcdb130ee645115884aa744620c5736d3f332d8db7047a3485b4a124"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o12_hot_key_cannot_starve_backfill, 3 of 3 attempts, on mode, over main c8426fe1" }
@@ -34,3 +39,8 @@ patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/454361
 backfill must finish while every refresh attempt races a committed write: ProtocolError { code: Conflict, message: "transaction preparation conflicted with an existing version", outcome: NotApplied }
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 1.48s
 """ }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact. Kept apart from the author's evidence above. These are workflow `tests`, `scenarios` or growth runs
+# in mode on, not attested checks, and not a detection.
+# - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456558794 (c10f5d32) 3 of 3 failed: the backfill ended with `Conflict`.
