@@ -3,6 +3,7 @@
 
 - Parsing TLC's `-tool` output: verdicts, statistics, coverage and counterexample length.
 - Reading `.cfg` files: the properties they check and the `\\* expect:` and `\\* no-mutant:` lines.
+- Stripping comments from `.tla` and `.cfg` text.
 - Running TLC through the pinned image (specs/tools/tlc) with a wall-clock budget.
 - The time budget from the module's level in docs/testing/modules.toml.
 - The `nabedra-tla-summary: {json}` line that run_check.py's `tlc` parser reads.
@@ -43,6 +44,7 @@ class TlaError(Exception):
 # TLC -tool output.
 
 _MSG = re.compile(r"@!@!@STARTMSG (\d+):(\d+) @!@!@\n(.*?)@!@!@ENDMSG \1 @!@!@", re.S)
+_STARTMSG = re.compile(r"^@!@!@STARTMSG ", re.M)
 _COVERAGE = re.compile(
     r"^<(\w+) line (\d+), col (\d+) to line \d+, col \d+ of module (\w+)(?: \((\d+) (\d+) \d+ \d+\))?>: (\d+):(\d+)\s*$"
 )
@@ -50,6 +52,9 @@ _STATS = re.compile(r"([\d,]+) states generated, ([\d,]+) distinct states found,
 _DEPTH = re.compile(r"The depth of the complete state graph search is (\d+)")
 _SIM_STATES = re.compile(r"The number of states generated: (\d+)")
 _TRACE_REJECTED = re.compile(r'<<"nabedra-trace-rejected", (-?\d+), (\d+)>>')
+# TLC wraps long values, so a tuple may span lines.
+_TRACE_LINE = re.compile(r'<<\s*"nabedra-trace-line",\s*(\d+),\s*"(\w+)",\s*"((?:[^"\\]|\\.)*)"\s*>>')
+_TRACE_INDEX = re.compile(r"^(?:/\\ )?traceIndex = (\d+)$", re.M)
 
 # Message codes (tlc2.output.EC).
 EC_SUCCESS = 2193
@@ -94,11 +99,20 @@ class TlcResult:
     lasso: bool = False
     trace_rejected_at: int | None = None  # TraceAccepted's printed index of the first unexplained line
     trace_lines: int | None = None
+    trace_notes: list[tuple[int, str, str]] = field(default_factory=list)  # (index, kind, variable)
+    last_trace_index: int | None = None   # traceIndex in the last state of a printed behavior
     exit_code: int | None = None
     timed_out: bool = False
 
     def violation(self) -> tuple[str, str] | None:
         return self.violations[0] if self.violations else None
+
+
+def _error_reason(body: str) -> str:
+    """One line. TLC puts the cause of an unexpected exception after `The exception was a <class>`."""
+    cause = re.search(r"^The exception was an? [\w.$]+\s*\n?:?\s*(.+)", body, re.S | re.M)
+    lines = (cause.group(1) if cause else body).splitlines()
+    return " ".join(" ".join(lines[:2]).split())
 
 
 def _int(text: str) -> int:
@@ -111,20 +125,24 @@ def parse_tlc_output(text: str, exit_code: int | None = None) -> TlcResult:
     m = _TRACE_REJECTED.search(text)
     if m:
         res.trace_rejected_at, res.trace_lines = int(m.group(1)), int(m.group(2))
+    res.trace_notes = sorted({(int(n.group(1)), n.group(2), n.group(3)) for n in _TRACE_LINE.finditer(text)})
+    reported = False  # TLC printed a success message, whatever else it printed
     for msg in _MSG.finditer(text):
         code, cls, body = int(msg.group(1)), int(msg.group(2)), msg.group(3).strip()
         if code == EC_SUCCESS:
-            res.complete = True
+            res.complete = reported = True
         elif code == EC_STATS:
+            # A line the parser cannot read must not leave an earlier line's empty queue standing.
             s = _STATS.search(body)
-            if s:
-                res.generated, res.distinct, res.left = (_int(g) for g in s.groups())
+            res.generated, res.distinct, res.left = (_int(g) for g in s.groups()) if s else (None, None, None)
+            if not s:
+                res.errors.append(f"unreadable statistics: {body[:120]}")
         elif code == EC_DEPTH:
             d = _DEPTH.search(body)
             if d:
                 res.depth = int(d.group(1))
         elif code == EC_SIM_DONE:
-            res.simulation_done = True
+            res.simulation_done = reported = True
             s = _SIM_STATES.search(body)
             if s:
                 res.generated = int(s.group(1))
@@ -145,6 +163,9 @@ def parse_tlc_output(text: str, exit_code: int | None = None) -> TlcResult:
                 res.coverage_unparsed.append(body[:120])
         elif code == EC_STATE:
             res.cex_states += 1
+            at = _TRACE_INDEX.search(body)
+            if at:
+                res.last_trace_index = int(at.group(1))
         elif code in (EC_STUTTER, EC_BACK_TO_STATE):
             res.lasso = True
         elif cls in (1, 2):  # 1: error, 2: TLC bug
@@ -156,12 +177,20 @@ def parse_tlc_output(text: str, exit_code: int | None = None) -> TlcResult:
                     break
             else:
                 if code not in _CONTEXT_CODES:
-                    res.errors.append(f"TLC message {code}: {body.splitlines()[0] if body else ''}"[:300])
+                    res.errors.append(f"TLC message {code}: {_error_reason(body)}"[:300])
     # TLC prints "Model checking completed. No error has been found." even when it stopped early, at
     # tlc2.TLC.stopAfter or TLCSet("exit", TRUE). Only a final statistics line with an empty queue
     # means the search was exhaustive; without that line nothing shows that it was.
     if res.complete and res.left != 0:
         res.complete = False
+    if exit_code is not None:  # None: killed at the budget, so cut-off output is expected
+        if reported and exit_code != 0 and not res.violations:
+            res.complete = res.simulation_done = False
+            res.errors.append(f"TLC exited with status {exit_code} after it reported success")
+        unread = len(_STARTMSG.findall(text)) - len(_MSG.findall(text))
+        if unread:
+            res.complete = False
+            res.errors.append(f"{unread} unterminated messages in TLC's output")
     if not res.complete and not res.simulation_done and not res.violations and not res.errors:
         tail = [l for l in _MSG.sub("", text).splitlines() if l.strip() and not l.startswith(("Parsing", "Semantic", "Linting", "Picked up"))]
         if exit_code not in (0, None) and tail:
@@ -189,6 +218,47 @@ class Cfg:
     expect: str | None
     no_mutant: dict[str, str]
     check_deadlock: bool
+    postconditions: list[str] = field(default_factory=list)
+    # Every keyword except CONSTANT(S) and CHECK_DEADLOCK, in the singular, with the names listed under it.
+    sections: dict[str, list[str]] = field(default_factory=dict)
+    overrides: list[str] = field(default_factory=list)  # names a CONSTANT section gives a value
+
+
+def strip_tla_comments(text: str, keep_strings: bool = True) -> str:
+    """The text without `\\*` and (nested) `(* *)` comments. Newlines stay.
+
+    Inside a block comment only `(*` and `*)` count, as in TLC. Without `keep_strings`, the content of
+    string literals goes too."""
+    out: list[str] = []
+    depth, i, n = 0, 0, len(text)
+    while i < n:
+        two = text[i:i + 2]
+        if two == "(*":
+            depth += 1
+            i += 2
+        elif depth and two == "*)":
+            depth -= 1
+            i += 2
+            if not depth:
+                out.append(" ")
+        elif depth:
+            if text[i] == "\n":
+                out.append("\n")
+            i += 1
+        elif two == "\\*":
+            while i < n and text[i] != "\n":
+                i += 1
+        elif text[i] == '"':
+            j = i + 1
+            while j < n and text[j] not in '"\n':
+                j += 2 if text[j] == "\\" else 1
+            j = min(j + 1, n)
+            out.append(text[i:j] if keep_strings else '""')
+            i = j
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
 
 
 def parse_cfg(path: Path) -> Cfg:
@@ -201,28 +271,32 @@ def parse_cfg(path: Path) -> Cfg:
         nm = _NO_MUTANT.match(line.strip())
         if nm:
             no_mutant[nm.group(1)] = (nm.group(2) or "").strip()
-    body = re.sub(r"\(\*.*?\*\)", " ", text, flags=re.S)
-    body = re.sub(r"\\\*[^\n]*", " ", body)
-    tokens = body.split()
+    body = strip_tla_comments(text, keep_strings=False)
+    tokens = re.findall(r"\w+|<-|[^\w\s]", body)
     section = None
-    invariants: list[str] = []
-    properties: list[str] = []
+    sections: dict[str, list[str]] = {}
+    overrides: list[str] = []
     deadlock = True
     i = 0
     while i < len(tokens):
         tok = tokens[i]
         if tok in _CFG_KEYWORDS:
-            section = tok
+            section = {"PROPERTIES": "PROPERTY", "ALIAS": "ALIAS"}.get(tok, tok.removesuffix("S"))
+            if section != "CHECK_DEADLOCK":
+                sections.setdefault(section, [])
             if tok == "CHECK_DEADLOCK" and i + 1 < len(tokens):
                 deadlock = tokens[i + 1].upper() != "FALSE"
                 i += 1
-        elif section in ("INVARIANT", "INVARIANTS") and re.fullmatch(r"\w+", tok):
-            invariants.append(tok)
-        elif section in ("PROPERTY", "PROPERTIES") and re.fullmatch(r"\w+", tok):
-            properties.append(tok)
+        elif section == "CONSTANT":
+            if re.fullmatch(r"\w+", tok) and i + 1 < len(tokens) and tokens[i + 1] in ("<-", "="):
+                overrides.append(tok)
+        elif section in sections and re.fullmatch(r"\w+", tok):
+            sections[section].append(tok)
         i += 1
-    return Cfg(Path(path), invariants, properties, expect_match.group(1) if expect_match else None,
-               no_mutant, deadlock)
+    sections.pop("CONSTANT", None)
+    return Cfg(Path(path), sections.get("INVARIANT", []), sections.get("PROPERTY", []),
+               expect_match.group(1) if expect_match else None, no_mutant, deadlock,
+               sections.get("POSTCONDITION", []), sections, overrides)
 
 
 # --------------------------------------------------------------------------------------------
