@@ -271,3 +271,48 @@ fn f03_native_crash_drops_queued_work_and_releases_accounting() {
         assert_eq!(ran.load(Ordering::Relaxed), 0, "an outstanding job ran");
     });
 }
+
+#[test]
+fn f02_f03_native_crash_contains_panics_in_queued_job_cleanup() {
+    struct PanicOnDrop(Arc<AtomicU64>);
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            panic!("queued native guard panicked during crash cleanup");
+        }
+    }
+
+    replay("native crash with panicking guards", async |world, _| {
+        let pool = sim::in_node(NODE, async { open() }).await;
+        let resources = pool.resources();
+        let baseline = resources.scheduler().usage();
+        let panics = Arc::new(AtomicU64::new(0));
+        world.freeze(NODE);
+
+        let first = resources.prepare(ExecutionClass::Query).await.unwrap();
+        let first_compute = first.reserve_compute(1, TASK_BYTES).await.unwrap();
+        let second = resources.prepare(ExecutionClass::Query).await.unwrap();
+        let second_compute = second.reserve_compute(2, TASK_BYTES).await.unwrap();
+        let mut cancelled =
+            Box::pin(first.run_with_guard((first_compute, PanicOnDrop(panics.clone())), || Ok(())));
+        let mut waiting = std::pin::pin!(
+            second.run_with_guard((second_compute, PanicOnDrop(panics.clone())), || Ok(()))
+        );
+        assert!(futures_util::poll!(&mut cancelled).is_pending());
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        drop(cancelled);
+        assert_eq!(
+            resources.scheduler().usage(),
+            [(NODE, 2, baseline[0].2 + 2 * TASK_BYTES)]
+        );
+
+        world.crash(NODE);
+        assert_eq!(waiting.await.err(), Some(crate::oltp::recovery_unknown()));
+        resources.drain().await;
+        assert_eq!(panics.load(Ordering::Relaxed), 2);
+        assert_eq!(resources.scheduler().usage(), baseline);
+        assert_eq!(resources.query.slots.available_permits(), 2);
+        sim::in_node(NODE, async { drop(pool) }).await;
+    });
+}

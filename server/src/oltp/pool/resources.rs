@@ -700,9 +700,32 @@ impl PreparedNative {
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(feature = "sim")]
+struct SimJob(Option<Job>);
+
+#[cfg(feature = "sim")]
+impl SimJob {
+    fn run(mut self) {
+        let job = self.0.take().expect("queued native job");
+        job();
+    }
+}
+
+#[cfg(feature = "sim")]
+impl Drop for SimJob {
+    fn drop(&mut self) {
+        if let Some(job) = self.0.take() {
+            // A crash drops the receiver and all queued jobs in one step.
+            // Contain each job's cleanup panic so the next job still settles.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(job)));
+        }
+    }
+}
+
 struct NativeExecutor {
     #[cfg(feature = "sim")]
-    sim_sender: Option<tokio::sync::mpsc::UnboundedSender<Job>>,
+    sim_sender: Option<tokio::sync::mpsc::UnboundedSender<SimJob>>,
     sender: Option<mpsc::Sender<Job>>,
     threads: Vec<JoinHandle<()>>,
     slots: Arc<Semaphore>,
@@ -751,7 +774,7 @@ impl NativeExecutor {
     #[cfg(feature = "sim")]
     fn new_sim(count: usize) -> Self {
         // As on the thread path, every queued job already owns a slot.
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Job>();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<SimJob>();
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
         for _ in 0..count {
             let receiver = receiver.clone();
@@ -761,7 +784,7 @@ impl NativeExecutor {
                 loop {
                     let job = receiver.lock().await.recv().await;
                     let Some(job) = job else { break };
-                    let _ = nabedra_rt::task::spawn_blocking(job).await;
+                    let _ = nabedra_rt::task::spawn_blocking(move || job.run()).await;
                 }
             });
         }
@@ -776,7 +799,7 @@ impl NativeExecutor {
     fn send(&self, job: Job) -> Result<(), ProtocolError> {
         #[cfg(feature = "sim")]
         if let Some(sender) = &self.sim_sender {
-            return sender.send(job).map_err(|_| capacity());
+            return sender.send(SimJob(Some(job))).map_err(|_| capacity());
         }
         self.sender
             .as_ref()
