@@ -1,4 +1,4 @@
-{"schema":"nabedra.catalog/1","count":2645,"tests":[
+{"schema":"nabedra.catalog/1","count":2649,"tests":[
 {"file":"orm/python/tests/events/test_client.py","hash":"202d453fc9458842","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_ack_uses_exact_offset_and_rejects_foreign_delivery_before_request","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"1c426c67dd348a60","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_claim_reuses_uuid_after_missing_response","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"b8d2b5c0d984c70e","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_error_metadata_and_duplicate_fields","lang":"python"},
@@ -1921,6 +1921,10 @@
 {"file":"server/src/oltp/pool/resources.rs","hash":"dadc00d839a0f853","id":"server/src/oltp/pool/resources.rs::m03_o19_byte_arena_distinguishes_waiting_from_impossible_work","lang":"rust"},
 {"file":"server/src/oltp/pool/resources.rs","hash":"d81f9e6b2684c0a9","id":"server/src/oltp/pool/resources.rs::o05_c02_m02_registered_group_capacity_precharges_and_recovers_each_lease","lang":"rust"},
 {"file":"server/src/oltp/pool/resources.rs","hash":"6e73dd0397ec8de0","id":"server/src/oltp/pool/resources.rs::o06_d07_t7b_an_apply_waits_for_the_previous_writes_batch_charge","lang":"rust"},
+{"file":"server/src/oltp/pool/resources/sim_tests.rs","hash":"5e0e2bc060fc1d7d","id":"server/src/oltp/pool/resources/sim_tests.rs::c04_c06_f01_f02_native_slots_refill_and_isolate_failures","lang":"rust"},
+{"file":"server/src/oltp/pool/resources/sim_tests.rs","hash":"8fd2e68d2150067b","id":"server/src/oltp/pool/resources/sim_tests.rs::f02_f03_native_crash_contains_panics_in_queued_job_cleanup","lang":"rust"},
+{"file":"server/src/oltp/pool/resources/sim_tests.rs","hash":"6d57ca2405915633","id":"server/src/oltp/pool/resources/sim_tests.rs::f03_native_crash_drops_queued_work_and_releases_accounting","lang":"rust"},
+{"file":"server/src/oltp/pool/resources/sim_tests.rs","hash":"acaec0067a1575f2","id":"server/src/oltp/pool/resources/sim_tests.rs::f03_native_drain_keeps_cancelled_work_until_settlement","lang":"rust"},
 {"file":"server/src/oltp/pool/sim_tests.rs","hash":"b5704861a3b51c0c","id":"server/src/oltp/pool/sim_tests.rs::ns04_o11_process_kill_preserves_unsynced_pool_writes","lang":"rust"},
 {"file":"server/src/oltp/pool/sim_tests.rs","hash":"98342803bf50f8e1","id":"server/src/oltp/pool/sim_tests.rs::ns04_o11_restart_and_crash_at_each_commit_operation_replay","lang":"rust"},
 {"file":"server/src/oltp/pool/sim_tests.rs","hash":"aeb2666b357e1853","id":"server/src/oltp/pool/sim_tests.rs::o11_snapshot_install_recovers_the_generation_at_activation","lang":"rust"},
