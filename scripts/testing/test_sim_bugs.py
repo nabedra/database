@@ -6,6 +6,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -121,6 +122,9 @@ def line(seed, ks):
         print("nabedra-sim-seed: " + json.dumps(row))
     if seed == script.get("garbage") and searching:
         print("nabedra-sim-seed: {not json")
+if PATCHED and "FAKE_HANG" in env:
+    import time
+    time.sleep(60)
 if script.get("silent"):
     print("test result: ok. 1 passed; 0 failed;")
     sys.exit(0)
@@ -211,7 +215,7 @@ class Fixture:
 
     def commit(self, message):
         sh(self.repo, "add", "-A")
-        sh(self.repo, "commit", "-q", "-m", message)
+        sh(self.repo, "commit", "-q", "--allow-empty", "-m", message)
         return sh(self.repo, "rev-parse", "HEAD").strip()
 
     def manifest(self, port="clean", regression=None, tables="", **extra):
@@ -458,6 +462,7 @@ class SimBugsTest(unittest.TestCase):
 
     def test_later_phases_use_their_own_directory(self):
         patch_text = self.f.patch
+        shutil.rmtree(self.f.repo / BUG)
         manifest = self.f.manifest().replace('"fix-one"', '"fix-two"').replace("phase = 10", "phase = 11")
         for where, text, expected in (("phase11/fix-two", manifest, 0), ("fix-two", manifest, 1),
                                       ("phase11/fix-two", manifest.replace("phase = 11", "phase = 10"), 1)):
@@ -467,7 +472,7 @@ class SimBugsTest(unittest.TestCase):
                 self.f.write(f"{base}/revert.patch", patch_text)
                 status, output = self.f.run("check")
                 self.assertEqual(status, expected, output)
-                self.assertIn("2 of 2 patches valid" if expected == 0 else "phase must be", output)
+                self.assertIn("1 of 1 patches valid" if expected == 0 else "phase must be", output)
                 (self.f.repo / base / "bug.toml").unlink()
                 (self.f.repo / base / "revert.patch").unlink()
                 (self.f.repo / base).rmdir()
@@ -617,7 +622,8 @@ class HarnessCase(unittest.TestCase):
         calls.unlink(missing_ok=True)
         shutil.rmtree(out, ignore_errors=True)
         env = {"FAKE_SWEEP": str(sweep_src), "FAKE_CALLS": str(calls), "RUSTFLAGS": "",
-               "FAKE_SCRIPT": json.dumps(script or {}), **env}
+               "FAKE_SCRIPT": json.dumps(script or {}), "GITHUB_SERVER_URL": "https://github.com",
+               "GITHUB_REPOSITORY": "o/r", "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1", **env}
         with patch.dict(os.environ, env):
             status, output = self.f.run("run", "--cargo", f"{sys.executable} {cargo}",
                                         *(["--seeds", str(seeds)] if seeds else []),
@@ -685,6 +691,17 @@ def digest_of(patch_text):
 
 class FoolTest(HarnessCase):
     """Ways to make the tool count something that is not a detection. Each one must be refused."""
+
+    def phase_11(self):
+        """A fresh fixture whose target is in phase 11: (fixture, its directory, its manifest)."""
+        (self.root / "other").mkdir()
+        f = self.f = Fixture(self.root / "other")
+        shutil.rmtree(f.repo / BUG)
+        where = "server/sim-oltp/bugs/phase11/fix-one"
+        f.write(f"{where}/revert.patch", f.patch)
+        text = f.manifest(tables=toml_table("review", REVIEW)).replace("phase = 10", "phase = 11")
+        f.write(f"{where}/bug.toml", text)
+        return f, where, text
 
     def second_bug(self, name="fix-two", bug="FIX-TWO", patch_text=None, change=lambda text: text):
         """The same target entered again under another id and another bug record."""
@@ -798,7 +815,7 @@ class FoolTest(HarnessCase):
     # 2. The expected kinds.
 
     def test_expect_kinds_of_the_harness_itself(self):
-        for kind in ("harness", "determinism", " Harness", "HARNESS "):
+        for kind in ("harness", "determinism", " Harness", "HARNESS ", f"{KIND},harness"):
             with self.subTest(kind=kind):
                 self.f.edit(f'expect = ["{KIND}"]', f'expect = ["{kind}"]')
                 status, output = self.f.run("check")
@@ -922,11 +939,8 @@ class FoolTest(HarnessCase):
         f.edit(f'expect = ["{KIND}"]', "expect = []")
         self.assert_refused("expect")
         # Phase 11 may say why no rule can detect a target. It is never searched and never counts.
-        text = (f.repo / BUG / "bug.toml").read_text()
-        text = text[:text.index("[detection]")].replace("phase = 10", "phase = 11")
-        shutil.rmtree(f.repo / BUG)
-        where = "server/sim-oltp/bugs/phase11/fix-one"
-        f.write(f"{where}/revert.patch", f.patch)
+        f, where, text = self.phase_11()
+        text = text.replace(f'expect = ["{KIND}"]', "expect = []")
         f.write(f"{where}/bug.toml", text)
         status, output = f.run("check")
         self.assertEqual(status, 1, output)
@@ -980,9 +994,10 @@ class FoolTest(HarnessCase):
                 (good.replace("lib.rs", "the code"), "detection.mechanism"),
                 (good.replace(hit_identity(3)["trace_hash"], "the trace"), "detection.mechanism")):
             with self.subTest(prose=prose):
+                text = (f.repo / BUG / "bug.toml").read_text()
                 f.edit(good, prose)
                 self.assert_refused(needle)
-                f.edit(prose, good)
+                f.write(f"{BUG}/bug.toml", text)
 
     def test_confirmation_lines_must_come_from_this_hit(self):
         f = self.f
@@ -1161,8 +1176,7 @@ class SearchTest(HarnessCase):
 
     def set_detection(self, seed, **changes):
         f = self.f
-        text = (f.repo / BUG / "bug.toml").read_text()
-        text = text[:text.index("[detection]")]
+        text = (f.repo / BUG / "bug.toml").read_text().split("[detection]")[0]
         f.write(f"{BUG}/bug.toml", text + toml_table("detection", detection(seed, search=self.search_hash(), **changes)))
         f.commit("confirm the hit")
 
@@ -1200,6 +1214,9 @@ class SearchTest(HarnessCase):
     def test_a_red_twin_is_masked_and_the_search_continues(self):
         # Main reports the kind itself at seed 1, another kind at seed 2, and is nondeterministic nowhere.
         script = {"hit": 1, "clean": {"1": [KIND], "2": ["Other"]}}
+        text = (self.f.repo / BUG / "bug.toml").read_text()
+        self.f.write(f"{BUG}/bug.toml", text[:text.index("[detection]")])
+        self.f.commit("not confirmed")
         status, output, summary, calls = self.harness_run(script=script)
         row = summary["bugs"][0]
         self.assertEqual((status, row["result"]), (1, "candidate"), output)
@@ -1240,8 +1257,9 @@ class SearchTest(HarnessCase):
         row = self.assert_not_counted("incomplete", script={}, seeds=4, result="incomplete")
         self.assertEqual(row["tried"], 4)
         self.assert_not_counted("incomplete", script={"hit": 3}, seeds=2, result="incomplete")
-        self.assert_not_counted("incomplete", "time limit", script={"hit": 3}, result="incomplete",
-                                FAKE_HANG="1", argv=())
+        status, output, summary, _ = self.harness_run("--time-limit", "3", script={"hit": 3}, FAKE_HANG="1")
+        self.assertEqual((status, summary["bugs"][0]["result"]), (1, "incomplete"), output)
+        self.assertIn("the time limit passed after 0 seeds", output)
 
     def test_seeds_run_in_chunks(self):
         status, output, summary, calls = self.harness_run("--chunk", "2", script={"hit": 5, "clean": {"2": ["Other"]}})
@@ -1302,27 +1320,28 @@ class SearchTest(HarnessCase):
         self.assert_refused("masked and in detection")
 
     def test_rules_from_phase_11(self):
-        f = self.f
-        text = (f.repo / BUG / "bug.toml").read_text()
-        where = "server/sim-oltp/bugs/phase11/fix-one"
-        searches = (f.repo / BUG / "searches.jsonl").read_text()
-        shutil.rmtree(f.repo / BUG)
-        text = text.replace("phase = 10", "phase = 11")
-        f.write(f"{where}/revert.patch", f.patch)
-        f.write(f"{where}/searches.jsonl", searches)
-        f.write(f"{where}/bug.toml", text)
-        status, output = f.run("check")
-        self.assertEqual(status, 1, output)
-        self.assertIn("cannot leave the tree", output)
+        f, where, text = FoolTest.phase_11(self)
+        _, output = f.run("check")
+        self.assertIn("cannot count: no expected kind has the text its rule enforces in [[rules]]", output)
         rule = {"kind": KIND, "source": "docs/testing/guarantees/oltp.md", "text": "One outcome"}
         for change, needle in (({}, None), ({"kind": "Other"}, "rules"), ({"text": "Two outcomes"}, "is not in"),
                                ({"source": " "}, "rules")):
-            f.write(f"{where}/bug.toml", text + toml_table("[rules]", {**rule, **change}))
-            _, output = f.run("check")
-            if needle:
-                self.assertIn(needle, output)
-            else:
-                self.assertNotIn("rules", output)
+            with self.subTest(change=change):
+                f.write(f"{where}/bug.toml", text + toml_table("[rules]", {**rule, **change}))
+                status, output = f.run("check")
+                self.assertEqual(status, 1 if needle else 0, output)
+                self.assertIn(needle, output) if needle else self.assertNotIn("rules", output)
+        # A list of reverted commits is for a hand port, and each must be a fix commit.
+        one = f'reverts = "{f.fix}"'
+        for reverts, port, needle in ((f'reverts = ["{f.fix}"]', "clean", None),
+                                      (f'reverts = ["{f.fix}", "{"b" * 40}"]', "hand", "reverts must be one of"),
+                                      (f'reverts = ["{f.fix}", "{f.fix}"]', "clean", "reverts exactly one commit"),
+                                      ("reverts = []", "hand", "reverts must be")):
+            with self.subTest(reverts=reverts):
+                f.write(f"{where}/bug.toml", text.replace(one, reverts).replace('port = "clean"', f'port = "{port}"'))
+                status, output = f.run("check")
+                self.assertEqual(status, 1 if needle else 0, output)
+                self.assertIn(needle or "fix-one: ok (clean port of", output)
 
     def test_run_never_passes_on_a_tooling_or_harness_fault(self):
         cases = (
@@ -1385,7 +1404,6 @@ class SearchTest(HarnessCase):
         self.assertEqual(status, 2, output)
         # Removing the whole target does not remove its searches.
         shutil.rmtree(f.repo / BUG)
-        f.write("server/sim-oltp/bugs/other/bug.toml", "x = 1\n")
         status, output = f.run("check")
         self.assertEqual(status, 1, output)
         self.assertIn("cannot leave the tree", output)
@@ -1401,17 +1419,28 @@ class SearchTest(HarnessCase):
                   "tree_clean": True, "result": "pass", "run": {"url": "https://github.com/o/r/actions/runs/1"},
                   "artifacts": [{"name": "a.log", "sha256": hashlib.sha256(log.encode()).hexdigest()}]}
         records = self.root / "records"
+        search = json.loads((f.repo / BUG / "searches.jsonl").read_text())["search"]
+        self.assertEqual(search["run"], "https://github.com/o/r/actions/runs/7")
+        line = "sim-bugs-search: " + json.dumps(search, sort_keys=True, separators=(",", ":"))
 
-        def run(log_text=log, **changes):
+        def run(log_text=log, search_text=line + "\n", **changes):
             shutil.rmtree(records, ignore_errors=True)
             records.mkdir()
             (records / "a.log").write_text(log_text)
             (records / "a.json").write_text(json.dumps({**record, **changes}))
+            (records / "b.log").write_text(search_text)
+            (records / "b.json").write_text(json.dumps(
+                {**record, "check": "oltp-sim-bugs-direct", "sha": search["sha"], "result": "fail",
+                 "run": {"url": search["run"]},
+                 "artifacts": [{"name": "b.log", "sha256": hashlib.sha256(search_text.encode()).hexdigest()}]}))
             return f.run("evidence", "--records", str(records))
 
         status, output = run()
         self.assertEqual(status, 0, output)
         self.assertIn("fix-one: the recorded lines are in the log", output)
+        status, output = run(search_text=line.replace('"tried":3', '"tried":2') + "\n")
+        self.assertEqual(status, 1, output)
+        self.assertIn("entry 1 of searches.jsonl is not in an attested log", output)
         for changes in ({"log_text": log + "x"}, {"sha": "d" * 40}, {"tree_clean": False}, {"result": "fail"},
                         {"check": "other"}, {"run": {"url": "https://github.com/o/r/actions/runs/2"}}):
             with self.subTest(changes=changes):
@@ -1433,6 +1462,13 @@ class SearchTest(HarnessCase):
         f.commit("scratch: undo, and something else")
         f.write("server/src/lib.rs", LIB)
         more = f.commit("scratch: the patch again")
+        f.write("server/src/lib.rs", FIXED)
+        f.commit("scratch: undo")
+        f.write("server/src/lib.rs", LIB)
+        f.write("server/src/other.rs", "pub fn other() { /* what makes the test fail */ }\n")
+        both = f.commit("scratch: the patch and something else")
+        f.write("server/src/lib.rs", LIB + "// another line\n")
+        wrong = f.commit("scratch: another change")
         regression = f.evidence()
         e = regression["evidence"]
         e["patched"].update(sha=patched, output=e["patched"]["output"].split("fix-one:")[0])
@@ -1444,7 +1480,10 @@ class SearchTest(HarnessCase):
         e["patched"]["sha"] = more
         errors, _ = sim_bugs.regression_evidence(bug(), f.repo)
         self.assertEqual(errors, [])
-        e["patched"]["sha"] = clean
+        e["patched"]["sha"] = both
+        errors, _ = sim_bugs.regression_evidence(bug(), f.repo)
+        self.assertTrue(any("also changes ['server/src/other.rs']" in problem for problem in errors), errors)
+        e["patched"]["sha"] = wrong
         errors, _ = sim_bugs.regression_evidence(bug(), f.repo)
         self.assertTrue(any("does not differ" in problem for problem in errors), errors)
         e["patched"]["sha"] = "e" * 40
@@ -1479,6 +1518,8 @@ def extra_line(patch):
     first = next(i for i, line in enumerate(lines)
                  if line[:1] in "+-" and not line.startswith(("+++", "---")))
     lines.insert(first + 1, "+    // an extra change\n")
+    header = next(i for i, line in enumerate(lines) if line.startswith("@@ "))
+    lines[header] = re.sub(r"\+(\d+),(\d+)", lambda m: f"+{m[1]},{int(m[2]) + 1}", lines[header])
     return "".join(lines)
 
 
