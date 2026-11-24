@@ -75,7 +75,11 @@ baselines, so a terminal stuttering step counts and a liveness baseline with
 exhausted fault budgets causes no gap.
 
 `tla_trace.py check` lints each trace, then runs `<Name>Trace.tla` once per
-trace with `TRACE_PATH` set. A rejected trace is reported with the 0-based
+trace with `TRACE_PATH` set. `<Name>Trace.cfg` must list the invariant
+`TraceIndexIsLevel` from `NabedraTrace`: every `TraceNext` step consumes
+exactly one line, which `TraceAccepted` relies on to count the lines a
+behavior explains. A step that consumes no line is a trace spec error. A
+rejected trace is reported with the 0-based
 index (its `seq`) and the content of the first line no behavior explains.
 Every trace under `--expect-rejected` must be rejected, at index `n` when
 the file is named `*.at-<n>.ndjson`.
