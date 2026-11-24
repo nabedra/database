@@ -89,6 +89,7 @@ class TlcResult:
     left: int | None = None
     depth: int | None = None
     coverage: dict[str, tuple[int, int]] = field(default_factory=dict)  # action -> (distinct, generated)
+    coverage_unparsed: list[str] = field(default_factory=list)  # action coverage lines the parser did not read
     cex_states: int = 0
     lasso: bool = False
     trace_rejected_at: int | None = None  # TraceAccepted's printed index of the first unexplained line
@@ -129,6 +130,7 @@ def parse_tlc_output(text: str, exit_code: int | None = None) -> TlcResult:
                 res.generated = int(s.group(1))
         elif code == EC_COVERAGE_START:
             res.coverage = {}  # a later report replaces an earlier, periodic one
+            res.coverage_unparsed = []
         elif code == EC_COVERAGE_ACTION:
             c = _COVERAGE.match(body)
             if c:
@@ -138,11 +140,14 @@ def parse_tlc_output(text: str, exit_code: int | None = None) -> TlcResult:
                 distinct, generated = int(c.group(7)), int(c.group(8))
                 old = res.coverage.get(key, (0, 0))
                 res.coverage[key] = (old[0] + distinct, old[1] + generated)
+            else:
+                # An action the parser cannot name could hide a zero count, so the coverage check fails on it.
+                res.coverage_unparsed.append(body[:120])
         elif code == EC_STATE:
             res.cex_states += 1
         elif code in (EC_STUTTER, EC_BACK_TO_STATE):
             res.lasso = True
-        elif cls == 1:
+        elif cls in (1, 2):  # 1: error, 2: TLC bug
             for kind, pattern in _VIOLATIONS:
                 v = pattern.match(body)
                 if v:
@@ -153,8 +158,9 @@ def parse_tlc_output(text: str, exit_code: int | None = None) -> TlcResult:
                 if code not in _CONTEXT_CODES:
                     res.errors.append(f"TLC message {code}: {body.splitlines()[0] if body else ''}"[:300])
     # TLC prints "Model checking completed. No error has been found." even when it stopped early, at
-    # tlc2.TLC.stopAfter or TLCSet("exit", TRUE). Only an empty queue means the search was exhaustive.
-    if res.complete and res.left:
+    # tlc2.TLC.stopAfter or TLCSet("exit", TRUE). Only a final statistics line with an empty queue
+    # means the search was exhaustive; without that line nothing shows that it was.
+    if res.complete and res.left != 0:
         res.complete = False
     if not res.complete and not res.simulation_done and not res.violations and not res.errors:
         tail = [l for l in _MSG.sub("", text).splitlines() if l.strip() and not l.startswith(("Parsing", "Semantic", "Linting", "Picked up"))]
@@ -287,12 +293,16 @@ def run_tlc(spec_dir: Path, args: list[str], *, out_dir: Path, log_path: Path, b
             code = proc.wait(timeout=budget_s + KILL_GRACE_S)
         except subprocess.TimeoutExpired:
             timed_out = True
-            subprocess.run(["docker", "kill", name], capture_output=True)
+            try:
+                subprocess.run(["docker", "kill", name], capture_output=True, timeout=60)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
             proc.kill()
             code = proc.wait()
     elapsed = time.monotonic() - start
     text = log_path.read_text(encoding="utf-8", errors="replace")
-    res = parse_tlc_output(text, code)
+    # A killed run stopped at the budget: its exit status and cut-off output are not a TLC error.
+    res = parse_tlc_output(text, None if timed_out else code)
     # A simulation that ran into the budget stopped early, even though TLC reports it as finished.
     res.timed_out = timed_out or (elapsed >= budget_s and not res.complete and not res.violations)
     return res, elapsed

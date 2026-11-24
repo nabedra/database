@@ -115,6 +115,31 @@ class ParseOutputTests(unittest.TestCase):
         self.assertTrue(tc.parse_tlc_output("java: command not found\n", 127).errors)
         self.assertEqual(tc.parse_tlc_output("", 0).errors, [])
 
+    def test_success_without_final_statistics_is_not_exhaustive(self):
+        # Crafted: TLC's success message alone does not show that the queue was empty.
+        text = fixture("pass").replace("STARTMSG 2199:0", "STARTMSG 2299:0").replace("ENDMSG 2199", "ENDMSG 2299")
+        res = tc.parse_tlc_output(text, 0)
+        self.assertIsNone(res.left)
+        self.assertFalse(res.complete)
+
+    def test_unreadable_coverage_line_is_kept(self):
+        text = fixture("pass").replace("<RMPrepare line", "<RMPrepare(r) line", 1)
+        res = tc.parse_tlc_output(text, 0)
+        self.assertNotIn("RMPrepare", res.coverage)
+        self.assertEqual(len(res.coverage_unparsed), 1)
+
+    def test_tlc_bug_message_is_an_error(self):
+        text = fixture("pass").replace("@!@!@STARTMSG 2193:0 @!@!@",
+                                       "@!@!@STARTMSG 1000:2 @!@!@\nTLC Bug: something broke\n"
+                                       "@!@!@ENDMSG 1000 @!@!@\n@!@!@STARTMSG 2193:0 @!@!@")
+        self.assertTrue(tc.parse_tlc_output(text, 0).errors)
+
+    def test_unnamed_temporal_violation(self):
+        text = fixture("liveness").replace("Temporal properties Termination were violated",
+                                           "Temporal properties were violated")
+        text = text.replace("Temporal property Termination was violated", "Temporal properties were violated")
+        self.assertEqual(tc.parse_tlc_output(text, 13).violation(), ("temporal", ""))
+
     def test_counterexample_text(self):
         lines = tc.counterexample_text(fixture("invariant"))
         self.assertTrue(lines[0].startswith("1: <Initial predicate>"))
@@ -167,13 +192,19 @@ class CfgAndBudgetTests(unittest.TestCase):
 
 FAKE_WRAPPER = textwrap.dedent('''\
     #!/usr/bin/env python3
-    # A stand-in for specs/tools/tlc: prints the fixture FAKE_TLC_MAP names for the -config file.
-    import json, os, sys
+    # A stand-in for specs/tools/tlc: prints the fixture FAKE_TLC_MAP names for the -config file,
+    # with FAKE_TLC_EDIT's [old, new] replacements, then sleeps FAKE_TLC_SLEEP seconds.
+    import json, os, sys, time
     args = sys.argv[1:]
     cfg = os.path.basename(args[args.index("-config") + 1])
     mapping = json.loads(os.environ["FAKE_TLC_MAP"])
     name, code = mapping.get(cfg, mapping.get("*", ["pass", 0]))
-    sys.stdout.write(open(os.path.join(os.environ["FAKE_TLC_FIXTURES"], name + ".txt")).read())
+    text = open(os.path.join(os.environ["FAKE_TLC_FIXTURES"], name + ".txt")).read()
+    for old, new in json.loads(os.environ.get("FAKE_TLC_EDIT", "[]")):
+        text = text.replace(old, new)
+    sys.stdout.write(text)
+    sys.stdout.flush()
+    time.sleep(float(os.environ.get("FAKE_TLC_SLEEP", "0")))
     sys.exit(code)
 ''')
 
@@ -181,7 +212,7 @@ FAKE_WRAPPER = textwrap.dedent('''\
 class FakeTlc:
     """A temporary spec folder (a copy of the self-test's cfgs) and a fake wrapper."""
 
-    def __init__(self, mapping: dict, drop_mutants: tuple = ()):
+    def __init__(self, mapping: dict, drop_mutants: tuple = (), **env: str):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.spec = root / "spec"
@@ -196,12 +227,12 @@ class FakeTlc:
         self.wrapper.chmod(0o755)
         self.out = root / "out"
         self.env = {"NABEDRA_TLC_WRAPPER": str(self.wrapper), "FAKE_TLC_MAP": json.dumps(mapping),
-                    "FAKE_TLC_FIXTURES": str(FIXTURES)}
+                    "FAKE_TLC_FIXTURES": str(FIXTURES), **env}
 
-    def run(self, *extra: str) -> tuple[int, dict, str]:
+    def run(self, *extra: str, budget: str = "60") -> tuple[int, dict, str]:
         out = io.StringIO()
         with patch.dict(os.environ, self.env), redirect_stdout(out):
-            code = tla_check.main([str(self.spec), "TwoPhase", "--budget-s", "60", "--out", str(self.out), *extra])
+            code = tla_check.main([str(self.spec), "TwoPhase", "--budget-s", budget, "--out", str(self.out), *extra])
         return code, tc.read_summary(out.getvalue()), out.getvalue()
 
     def close(self):
@@ -213,10 +244,10 @@ GOOD = {"TwoPhase.cfg": ["pass", 0], "commit_one_prepared.cfg": ["invariant", 12
 
 
 class CheckOrchestrationTests(unittest.TestCase):
-    def run_fake(self, mapping, drop_mutants=(), extra=()):
-        fake = FakeTlc(mapping, drop_mutants)
+    def run_fake(self, mapping, drop_mutants=(), extra=(), budget="60", **env):
+        fake = FakeTlc(mapping, drop_mutants, **env)
         self.addCleanup(fake.close)
-        return fake.run(*extra)
+        return fake.run(*extra, budget=budget)
 
     def test_pass(self):
         code, summary, text = self.run_fake(GOOD)
@@ -262,6 +293,39 @@ class CheckOrchestrationTests(unittest.TestCase):
                 code, summary, _ = self.run_fake(dict(GOOD, **{"TwoPhase.cfg": [fx, 0]}))
                 self.assertEqual((code, summary["verdict"]), (2, "not-run"))
                 self.assertTrue(any("states left on queue" in n["reason"] for n in summary["not_run"]))
+
+    def test_unreadable_coverage_fails(self):
+        edit = json.dumps([["<RMPrepare line", "<RMPrepare(r) line"]])
+        code, summary, text = self.run_fake(GOOD, FAKE_TLC_EDIT=edit)
+        self.assertEqual((code, summary["verdict"]), (1, "fail"))
+        self.assertIn("unreadable action coverage lines", text)
+
+    def test_success_without_statistics_is_not_run(self):
+        edit = json.dumps([["STARTMSG 2199:0", "STARTMSG 2299:0"], ["ENDMSG 2199", "ENDMSG 2299"]])
+        code, summary, _ = self.run_fake(GOOD, FAKE_TLC_EDIT=edit)
+        self.assertEqual((code, summary["verdict"]), (2, "not-run"))
+
+    def test_killed_at_the_budget_is_not_run(self):
+        # TLC ignores its own stop, so the runner kills it: not-run, never error or pass.
+        with patch.object(tc, "KILL_GRACE_S", 0):
+            code, summary, _ = self.run_fake(dict(GOOD, **{"TwoPhase.cfg": ["time_budget", 137]}),
+                                             budget="1", FAKE_TLC_SLEEP="5")
+        self.assertEqual((code, summary["verdict"]), (2, "not-run"))
+        self.assertTrue(any("time budget" in n["reason"] for n in summary["not_run"]))
+
+    def test_simulation_that_ran_into_the_budget_is_not_run(self):
+        code, summary, _ = self.run_fake({"TwoPhase.large.cfg": ["simulation", 0]}, budget="1",
+                                         extra=("--tier", "T2", "--simulate"), FAKE_TLC_SLEEP="1.2")
+        self.assertEqual((code, summary["verdict"]), (2, "not-run"))
+        self.assertEqual(summary["tla"]["mode"], "simulation")
+
+    def test_mutant_with_unnamed_liveness_violation_fails(self):
+        edit = json.dumps([["Temporal properties Termination were violated", "Temporal properties were violated"],
+                           ["Temporal property Termination was violated", "Temporal properties were violated"]])
+        code, summary, _ = self.run_fake(GOOD, FAKE_TLC_EDIT=edit)
+        self.assertEqual(summary["verdict"], "fail")
+        mutant = next(m for m in summary["tla"]["mutants"] if m["name"] == "no_resend")
+        self.assertFalse(mutant["ok"])
 
     def test_baseline_tlc_error_is_error(self):
         code, summary, _ = self.run_fake(dict(GOOD, **{"TwoPhase.cfg": ["parse_error", 150]}))

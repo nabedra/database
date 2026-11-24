@@ -178,6 +178,7 @@ def design_check(rep: Report, spec_dir: Path, name: str, model: str, out: Path, 
     )
     runs: list[dict] = []
     coverage: dict[str, int] = {}
+    unparsed: list[str] = []
     distinct = depth = None
     for cfg in baselines:
         res = run_baseline(rep, spec_dir, model, cfg, out, budget, workers, runs)
@@ -186,11 +187,14 @@ def design_check(rep: Report, spec_dir: Path, name: str, model: str, out: Path, 
         if res.complete and not res.violations and not res.errors:
             for action, (_, generated) in res.coverage.items():
                 coverage[action] = max(coverage.get(action, 0), generated)
+            unparsed.extend(res.coverage_unparsed)
 
     uncovered = sorted(a for a, n in coverage.items() if n == 0)
     if any(r["verdict"] == "pass" for r in runs):
         if not coverage:
             rep.check(False, "coverage", "no coverage report in any completed baseline")
+        elif unparsed:
+            rep.check(False, "coverage", f"unreadable action coverage lines: {'; '.join(unparsed[:3])}")
         else:
             rep.check(not uncovered, "coverage",
                       f"zero coverage: {', '.join(uncovered)}" if uncovered
