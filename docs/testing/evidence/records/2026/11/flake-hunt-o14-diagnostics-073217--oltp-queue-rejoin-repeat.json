@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "flake-hunt-o14-diagnostics-073217--oltp-queue-rejoin-repeat.log",
+      "sha256": "79ed14598847c01b911c95baa634694f8b8a6d648238710f2df2c8e2197feeb6"
+    }
+  ],
+  "assertions": {
+    "executed": 80,
+    "failed": 6,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-queue-rejoin-repeat",
+  "duration_s": 2203.162,
+  "guarantees": [],
+  "kind": "R",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T06:35:20.308350+00:00",
+    "request_id": "flake-hunt-o14-diagnostics-073217",
+    "runner": "GitHub Actions 1000010347",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45341180710"
+  },
+  "scenarios": [
+    "O14"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "a01f0d215c51dd8876f916fb54759423e2e9097d",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
