@@ -7,7 +7,7 @@
       "K03 simulated controller disk loss is `not-run` pending modelled Raft storage."
     ]
   },
-  "head": "297e7e91af810d85cf324607c77cd4edf061afb6",
+  "head": "152cdaf59ee341fbc706925d75d8855d1a16f849",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -297,10 +297,19 @@
           "state": "n/a"
         },
         "R": {
-          "executed": 0,
-          "failed": 0,
+          "behind": 20,
+          "checks": [
+            "cache-cluster-real"
+          ],
+          "date": "2026-11-24T18:03:34.376324+00:00",
+          "executed": 1,
+          "failed": 1,
+          "last": "fail",
+          "reason": "failed: cache-cluster-real",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45451373400",
+          "sha": "36da95b3dd89270fcaf39ebeaaf2c34d6bcf96f7",
+          "state": "stale"
         },
         "S": {
           "executed": 0,
@@ -357,10 +366,19 @@
           "state": "n/a"
         },
         "R": {
-          "executed": 0,
-          "failed": 0,
+          "behind": 20,
+          "checks": [
+            "cache-cluster-real"
+          ],
+          "date": "2026-11-24T18:03:34.376324+00:00",
+          "executed": 1,
+          "failed": 1,
+          "last": "fail",
+          "reason": "failed: cache-cluster-real",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45451373400",
+          "sha": "36da95b3dd89270fcaf39ebeaaf2c34d6bcf96f7",
+          "state": "stale"
         },
         "S": {
           "executed": 0,
@@ -4002,5 +4020,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
