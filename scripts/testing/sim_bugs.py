@@ -111,7 +111,7 @@ VERDICTS = ("sensitive", "partial", "not-sensitive")
 ASSERTIONS = ("state", "counter", "timeout")
 SEED_BUDGET = 10_000
 SEARCHES = "searches.jsonl"
-TARGET_FILE = re.compile(r"server/sim-oltp/bugs/(?:README\.md|(?:phase[0-9]+/)?(?:simulator\.toml|[a-z0-9-]+/"
+TARGET_FILE = re.compile(r"server/sim-oltp/bugs/(?:README\.md|SHARDS\.md|(?:phase[0-9]+/)?(?:simulator\.toml|[a-z0-9-]+/"
                          r"(?:bug\.toml|revert\.patch|probe\.patch|searches\.jsonl)))")
 SEARCH_SCHEMA = "nabedra.sim-bug-search/1"
 SEARCH_FIELDS = {"schema", "id", "sha", "run", "attempt", "plan", "digest", "patch_sha256", "result", "seeds",
