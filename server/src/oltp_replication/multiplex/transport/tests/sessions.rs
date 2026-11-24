@@ -273,12 +273,12 @@ impl Fixture {
                 build(local, &tls[index], shared, peers.clone(), registry, config).unwrap();
             if release == Release::SessionV2 {
                 let common = Arc::get_mut(&mut transport.common).unwrap();
-                (common.connector, common.acceptor) = tls[index].transports(&[SESSION_ALPN, ALPN]);
+                (common.connector, common.acceptor) = peer_transports(&tls[index], &[SESSION_ALPN, ALPN]);
             }
             if release == Release::SessionV3 {
                 let common = Arc::get_mut(&mut transport.common).unwrap();
                 (common.connector, common.acceptor) =
-                    tls[index].transports(&[LEGACY_INDEX_RECLAIM_ALPN, SESSION_ALPN, ALPN]);
+                    peer_transports(&tls[index], &[LEGACY_INDEX_RECLAIM_ALPN, SESSION_ALPN, ALPN]);
             }
             transport
         };

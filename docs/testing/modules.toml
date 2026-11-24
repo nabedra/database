@@ -48,6 +48,7 @@ register = "docs/testing/guarantees/oltp.md"
 paths = [
   "server/src/oltp/**",
   "server/oltp-types/**",
+  "server/transport/**",
   "server/resources/src/stage_timing.rs",
   "server/resources/src/memory.rs",
   "server/resources/src/memory/**",

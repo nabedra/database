@@ -25,6 +25,7 @@ use tokio::{
     time::Instant,
 };
 use nabedra_rt::time::{timeout, timeout_at};
+use nabedra_transport::tls::{accept_peer, connect_peer, peer_transports};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 mod resolve;
@@ -897,13 +898,13 @@ impl WorkerTransport {
         }
         let direct_admission = !direct_admission_disabled();
         let (connector, acceptor) = if sessions_enabled && !direct_admission {
-            tls.transports(&[SESSION_ALPN, ALPN])
+            peer_transports(tls, &[SESSION_ALPN, ALPN])
         } else if sessions_enabled {
-            tls.transports(&[DIRECT_ADMISSION_ALPN, SESSION_ALPN, ALPN])
+            peer_transports(tls, &[DIRECT_ADMISSION_ALPN, SESSION_ALPN, ALPN])
         } else {
-            tls.transports(&[ALPN])
+            peer_transports(tls, &[ALPN])
         };
-        let (_, one_shot_acceptor) = tls.transports(&[ALPN]);
+        let (_, one_shot_acceptor) = peer_transports(tls, &[ALPN]);
         Ok(Self {
             common: Arc::new(Common {
                 local: WorkerIdentity::from(local),
@@ -1035,7 +1036,7 @@ impl WorkerTransport {
         } else {
             &self.common.one_shot_acceptor
         };
-        let Ok(Ok(stream)) = timeout_at(deadline, acceptor.accept(socket)).await else {
+        let Ok(Ok(stream)) = timeout_at(deadline, accept_peer(acceptor, socket)).await else {
             return;
         };
         if let Some(pending) = pending

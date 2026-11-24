@@ -1,1 +1,3 @@
-//! OLTP peer transport. Its implementation moves here during the crate split.
+//! Authenticated connections between Nabedra peers.
+
+pub mod tls;
