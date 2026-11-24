@@ -40,6 +40,74 @@ def edit(index, **changes):
     return out
 
 
+def msg(code, body, cls=0):
+    return f"@!@!@STARTMSG {code}:{cls} @!@!@\n{body}\n@!@!@ENDMSG {code} @!@!@\n"
+
+
+STATS = msg(tc.EC_STATS, "9 states generated, 9 distinct states found, 0 states left on queue.")
+DONE = msg(tc.EC_SUCCESS, "Model checking completed. No error has been found.") + STATS
+
+
+class CommonTests(unittest.TestCase):
+    """tla_common.py: TLC's exit status and messages, comments and cfg sections."""
+
+    def test_nonzero_exit_after_success_is_an_error(self):
+        self.assertTrue(tc.parse_tlc_output(DONE, 0).complete)
+        for code in (1, 137):
+            res = tc.parse_tlc_output(DONE, code)
+            self.assertFalse(res.complete)
+            self.assertIn(f"status {code}", res.errors[0])
+        sim = msg(tc.EC_SIM_DONE, "The number of states generated: 5")
+        self.assertTrue(tc.parse_tlc_output(sim, 0).simulation_done)
+        res = tc.parse_tlc_output(sim, 1)
+        self.assertFalse(res.simulation_done)
+        self.assertTrue(res.errors)
+
+    def test_violation_with_its_own_exit_status_is_not_an_error(self):
+        text = msg(2110, "Invariant Consistent is violated.", 1) + STATS
+        res = tc.parse_tlc_output(text, 12)
+        self.assertEqual((res.violation(), res.errors), (("invariant", "Consistent"), []))
+
+    def test_unterminated_message_is_an_error(self):
+        cut = "@!@!@STARTMSG 1000:1 @!@!@\nout of memory\n" + DONE
+        res = tc.parse_tlc_output(cut, 0)
+        self.assertFalse(res.complete)
+        self.assertIn("unterminated", " ".join(res.errors))
+        # A run killed at its budget has cut-off output and no exit status.
+        self.assertEqual(tc.parse_tlc_output(STATS + "@!@!@STARTMSG 2200:0 @!@!@\npro").errors, [])
+
+    def test_comments(self):
+        for text, want in (("a (* x *) b", "a   b"), ("a (* (* x *) y *) b", "a   b"), ("a \\* (* b\nc", "a \nc"),
+                           ("(* \\* *) a", "  a"), ('"(*" a', '"(*" a'), ('"a\\"(*" b', '"a\\"(*" b'),
+                           ("(* a\nb *)c", "\n c"), ("a (* b", "a ")):
+            self.assertEqual(tc.strip_tla_comments(text), want, text)
+        self.assertEqual(tc.strip_tla_comments('x = "INVARIANT" y', keep_strings=False), 'x = "" y')
+
+    def cfg(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "x.cfg"
+            path.write_text(text)
+            return tc.parse_cfg(path)
+
+    def test_cfg_sections(self):
+        c = self.cfg("CONSTANTS\n A <- B\n C = 1\n D <- [M]E\nINVARIANTS I1 I2\nPROPERTY P\nVIEW V\n"
+                     "CONSTRAINT C1\nACTION_CONSTRAINTS A1 A2\nPOSTCONDITION TraceAccepted\nCHECK_DEADLOCK FALSE\n")
+        self.assertEqual((c.invariants, c.properties, c.postconditions, c.check_deadlock),
+                         (["I1", "I2"], ["P"], ["TraceAccepted"], False))
+        self.assertEqual(c.overrides, ["A", "C", "D"])
+        self.assertEqual((c.sections["VIEW"], c.sections["CONSTRAINT"], c.sections["ACTION_CONSTRAINT"]),
+                         (["V"], ["C1"], ["A1", "A2"]))
+
+    def test_cfg_comments_are_read_as_tlc_reads_them(self):
+        # Each case was checked against TLC 1.8.0.
+        self.assertEqual(self.cfg("(* (* *) INVARIANT I *)\n").invariants, [])
+        self.assertEqual(self.cfg("(* \\* *) INVARIANT I\n").invariants, ["I"])
+        self.assertEqual(self.cfg("\\* (*\nINVARIANT I\n").invariants, ["I"])
+        self.assertEqual(self.cfg('CONSTANT S = "(*"\nINVARIANT I\n').invariants, ["I"])
+        self.assertEqual(self.cfg("INVARIANT I (*x*)J\n").invariants, ["I", "J"])
+        self.assertEqual(self.cfg('CONSTANT S = "INVARIANT I"\n').invariants, [])
+
+
 class LintTests(unittest.TestCase):
     def test_samples_are_valid(self):
         self.assertEqual(tla_trace.lint_file(ACCEPTED), [])
