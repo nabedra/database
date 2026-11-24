@@ -4,7 +4,7 @@ This is the serialization argument required by P0 of [the OLTP plan](../../plans
 
 Each existing call is one transaction. Read-only operations may scan predicates, order rows and apply a limit. A mutating call reads and writes a known bounded set of primary keys, including absence checks. Create/drop also require lifecycle guards. There are no predicate mutations, multi-call transactions or application read-modify-write transactions. Adding those operations invalidates this restricted argument unless their read and predicate dependencies receive additional validation.
 
-The standalone RF1 engine and its argument were removed; [OLTP storage](../../server/src/oltp/DESIGN.md) describes the group stores that replaced it. A single replicated group can order atomic operations directly and authorize reads with a fresh quorum barrier plus applied-position wait. That does not establish a common snapshot or atomic commit across independent groups.
+The standalone RF1 engine and its argument were removed; [OLTP storage](../../server/oltp-storage/src/oltp/DESIGN.md) describes the group stores that replaced it. A single replicated group can order atomic operations directly and authorize reads with a fresh quorum barrier plus applied-position wait. That does not establish a common snapshot or atomic commit across independent groups.
 
 The removed single-group dependency spike logged deterministic `Operation` commands. It was not the target cold-start implementation: replaying such a command still evaluates an application operation. The production command families must instead replay fixed prepared storage changes and authoritative decisions. Control, timestamp and status command types cannot contain application `Request`, `Operation` or `Row` payloads.
 

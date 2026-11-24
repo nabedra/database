@@ -1,0 +1,25 @@
+id = "oltp-storage-sim"
+module = "oltp"
+kinds = ["S"]
+guarantees = ["OLTP-G01", "OLTP-G08", "OLTP-G09", "SCHED-G01"]
+scenarios = ["C04", "C06", "F01", "F02", "F03", "NS04", "O11", "O16", "O17"]
+tiers = ["T1"]
+command = ["bash", "-eo", "pipefail", "-c", '''
+echo "Fault model: native pool and executor on simulated worker volumes"
+executable=$(cargo test --locked -j 2 -p nabedra-oltp-storage --features sim --lib --no-run \
+    --message-format=json-render-diagnostics |
+    jq -er 'select(.reason == "compiler-artifact" and .target.name == "nabedra_oltp_storage"
+                   and .profile.test and .executable != null) | .executable')
+for suite in oltp::pool::sim_tests:: oltp::pool::resources::sim_tests:: oltp::pool::disk::tests::; do
+    for attempt in $(seq 50); do
+        output=$("$executable" "$suite" --test-threads=1) || { printf "%s\n" "$output"; exit 1; }
+        printf "%s\n" "$output"
+        grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' <<< "$output"
+    done
+done
+''']
+cwd = "server"
+timeout_s = 3600
+needs = []
+result_parser = "cargo-test"
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim" }
