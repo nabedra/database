@@ -1,0 +1,41 @@
+{
+  "artifacts": [
+    {
+      "name": "land-flakes-104-8fde223-111337--oltp-initial-control-proposal.log",
+      "sha256": "95472fcde5fcf177b85e3844608d7ffae8a205577087fa9ce085e27f3446506a"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-initial-control-proposal",
+  "duration_s": 155.782,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T10:14:02.236867+00:00",
+    "request_id": "land-flakes-104-8fde223-111337",
+    "runner": "GitHub Actions 1000010986",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45372718575"
+  },
+  "scenarios": [
+    "O16",
+    "NS14"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "8fde223e253137bfe7bf45b5cc2dababfa5d9253",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
