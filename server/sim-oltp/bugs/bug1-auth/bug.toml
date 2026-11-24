@@ -35,12 +35,9 @@ failure_contains = ["failed-write-observed", "completed not_applied"]
 
 [regression.evidence]
 digest = "41b14a61c5962534320122e99c57f88b420855d36105ed442b26df5087ae82e3"
-clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148935717", sha = "53a5716f844aa9690739daed32fd335c68bc0f8a", result = "passed", note = "request p10-bugs-clean-53a5716-103844, direct_oltp on" }
-patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148914295", sha = "8f29086e28080d0096c9396f77932104f81d0d99", result = "failed", note = "scratch/sim-bug-bug1-auth, request p10-bugs-bug1-auth-8f29086-103844, direct_oltp on", output = """
-test oltp_runtime::application::direct::tests::d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome ... FAILED
-panicked at src/oltp_runtime/application/direct/tests.rs:1408:5:
-assertion `left == right` failed
-  left: Error(Unauthorized, NotApplied)
- right: Error(OutcomeUnknown, Unknown)
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 585 filtered out; finished in 2.14s
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45413905217", sha = "5953e85183f733a73658dc75ef9cd10d8c21e5cc", result = "passed", note = "check oltp-sim-bugs-regression, request p10-bugs-5953e85-152526, direct_oltp on" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45413905217", sha = "5953e85183f733a73658dc75ef9cd10d8c21e5cc", result = "failed", note = "check oltp-sim-bugs-regression, request p10-bugs-5953e85-152526, direct_oltp on; patch applied to this SHA in a scratch worktree", output = """
+Verdict { valid: false, anomalies: [Anomaly { kind: "non-linearizable", detail: "key \\"\\\\\\"b3956782-c097-412c-93e3-5e7cf135f1d2\\\\\\"/7\\": no linearization once p2 read 1 (ok, event 4) completes; window: p2 read 1 (ok, event 4)", events: [4, 5] }, Anomaly { kind: "failed-write-observed", detail: "p0 insert of 1 to key \\"\\\\\\"b3956782-c097-412c-93e3-5e7cf135f1d2\\\\\\"/7\\" completed not_applied (event 1), yet p2 get observed it (event 5)", events: [0, 1, 4, 5] }], checked_ops: 5 }
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 1.01s
+bug1-auth: with the patch failed; verified (digest 41b14a61c5962534320122e99c57f88b420855d36105ed442b26df5087ae82e3)
 """ }

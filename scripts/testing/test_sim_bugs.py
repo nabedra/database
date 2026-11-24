@@ -1,5 +1,6 @@
 """Exercise sim_bugs.py on a throwaway Git repository with planted errors and a fake cargo."""
 
+import hashlib
 from io import StringIO
 import json
 import os
@@ -51,6 +52,80 @@ sys.exit(0 if fixed else 101)
     os.chmod(exe, 0o755)
     print(json.dumps({"reason": "compiler-artifact", "profile": {"test": True},
                       "target": {"kind": ["lib"]}, "executable": exe}))
+'''
+
+# A fake cargo for `run`: `test --no-run` writes a fake nabedra-sim-oltp sweep test that follows the
+# harness interface (environment in, seed lines and sweep-report.json out). The bug shows when the
+# tree it runs in lacks the fix, from seed FAKE_HIT on. FAKE_* variables plant tooling faults.
+FAKE_SIM_CARGO = '''
+import json, os, sys
+target = os.environ["CARGO_TARGET_DIR"]
+if "--no-run" in sys.argv:
+    exe = os.path.join(target, "release", "deps", "nabedra_sim_oltp-fake")
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    with open(exe, "w") as f:
+        f.write(open(os.environ["FAKE_SWEEP"]).read())
+    os.chmod(exe, 0o755)
+    print(json.dumps({"reason": "compiler-artifact", "profile": {"test": True},
+                      "target": {"kind": ["lib"], "name": "nabedra_sim_oltp"}, "executable": exe}))
+'''
+FAKE_SWEEP = '''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+env = os.environ
+assert sys.argv[1:] == ["sweep::tests::sweep", "--exact", "--nocapture", "--test-threads=1"], sys.argv
+assert env["RUST_MIN_STACK"] == "16777216" and "--cfg tokio_unstable" in env["RUSTFLAGS"]
+workload = env["NABEDRA_SIM_WORKLOAD"]
+if workload not in ("direct", "smoke"):
+    # The text of the real test: `expect` prints the error with its quotes escaped.
+    print("OLTP smoke sweep report: " + json.dumps(f'OLTP workload "{workload}" is unavailable; use smoke'))
+    sys.exit(101)
+if workload == "smoke" and "NABEDRA_SIM_PROFILE" in env:
+    sys.exit(101)
+first, count = int(env["NABEDRA_SEED"]), int(env["NABEDRA_SEEDS"])
+patched = "fixed" not in Path("../src/lib.rs").read_text()
+with open(env["FAKE_CALLS"], "a") as calls:
+    calls.write(json.dumps({"patched": patched, "first": first, "count": count,
+                            "expect": env.get("NABEDRA_SIM_EXPECT"), "defect": env.get("NABEDRA_SIM_DEFECT"),
+                            "profile": env.get("NABEDRA_SIM_PROFILE")}) + "\\n")
+kind = env.get("NABEDRA_SIM_EXPECT", "NotAppliedNeverCommitted").split(",")[0]
+def kinds(seed, replay=False):
+    if workload == "smoke":
+        return ["non-linearizable"] if env.get("NABEDRA_SIM_DEFECT") == "lost-write" and seed >= 2 else []
+    if not patched:
+        if seed == int(env.get("FAKE_CLEAN_KIND_AT", "0")):
+            return [kind]
+        return ["Other"] if env.get("FAKE_CLEAN_FAILS") else []
+    return [kind] if seed >= int(env.get("FAKE_HIT", "2")) and not (replay and env.get("FAKE_FLAKY")) else []
+def line(seed, ks):
+    print("nabedra-sim-seed: " + json.dumps({"seed": seed, "result": "violation" if ks else "pass", "kinds": ks}))
+if env.get("FAKE_SILENT"):
+    print("test result: ok. 1 passed; 0 failed;")
+    sys.exit(0)
+if "NABEDRA_SIM_EXPECT" in env:
+    for seed in range(first, first + count):
+        ks = kinds(seed)
+        line(seed + 100 if env.get("FAKE_OUT_OF_BUDGET") else seed, ks)
+        if env.get("FAKE_DUPLICATE"):
+            line(seed, ks)
+        if ks:
+            sys.exit(0)
+    sys.exit(101)
+assert count == 1 and env["NABEDRA_SIM_VERIFY_REPLAY"] == "1"
+seed, label = first, env["NABEDRA_SIM_CHECK_ID"]
+ks, again = kinds(seed), kinds(seed, replay=True)
+art = Path(env["NABEDRA_SIM_ARTIFACTS"])
+seed_dir = art / f"{label}-seed-{seed}"
+seed_dir.mkdir(parents=True, exist_ok=True)
+(seed_dir / "history.jsonl").write_text(json.dumps({"seed": seed, "patched": patched}) + "\\n")
+if ks:
+    (seed_dir / "summary.json").write_text(json.dumps({"violations": [f"t=5ms {k}: detail" for k in ks]}))
+(art / "sweep-report.json").write_text(json.dumps({"seeds": [{
+    "seed": seed, "trace_hash": ("%016x" % (seed * 7919 + patched)), "trace_events": 40 + seed,
+    "virtual_ms": 1000, "replayed": True, "deterministic": ks == again, "violations": ks,
+    "config_hash": "c0ffee"}]}))
+line(seed, ks)
+sys.exit(101 if ks else 0)
 '''
 
 
@@ -184,6 +259,44 @@ class SimBugsTest(unittest.TestCase):
                                  "server/src/other.rs"))
         self.assert_check(0, "fix-one: ok (clean port")
 
+    def test_clean_port_follows_a_crate_move(self):
+        f, old, new = self.f, "server/src/oltp_replication/net.rs", "server/oltp-replication/src/oltp_replication/net.rs"
+        f.write(old, LIB)
+        f.commit("replication code")
+        f.write(old, FIXED)
+        fix = f.commit("a replication fix")
+        (f.repo / new).parent.mkdir(parents=True)
+        sh(f.repo, "mv", old, new)
+        f.commit("phase 8 crate move")
+        record = f.repo / "docs/testing/bugs/2026-11-23-fix-one.toml"
+        record.write_text(record.read_text().replace(f'["{f.fix}"]', f'["{f.fix}", "{fix}"]'))
+        manifest = f.manifest().replace(f'reverts = "{f.fix}"', f'reverts = "{fix}"').replace(
+            f'fix_commits = ["{f.fix}"]', f'fix_commits = ["{fix}"]')
+        stale = sh(f.repo, "diff", fix, f"{fix}^", "--", old)
+        f.write_bug(manifest, stale)
+        self.assert_check(1, "no longer applies to HEAD")
+        f.write_bug(manifest, stale.replace(old, new))
+        self.assert_check(0, f"fix-one: ok (clean port of {fix[:8]}, files: {new})")
+        f.write_bug(manifest, extra_line(stale.replace(old, new)))
+        self.assert_check(1, "port = clean, but the patch does not change exactly the lines")
+
+    def test_verify_runs_before_a_refreshed_patch_has_evidence(self):
+        # A moved hand port changes its digest; verify is what records the new evidence.
+        fake = self.root / "fake_cargo.py"
+        fake.write_text(FAKE_CARGO)
+        self.f.write_bug(self.f.manifest(port="hand", regression=self.f.evidence(digest="0" * 64)))
+        self.assert_check(1, "differ from those its regression evidence used")
+        status, output = self.f.run("verify", "--cargo", f"{sys.executable} {fake}",
+                                    "--target-dir", str(self.root / "target"))
+        self.assertEqual(status, 0, output)
+        self.assertIn("fix-one: with the patch failed; verified", output)
+        # run needs the evidence: it is the check that counts.
+        self.f.write("server/sim-oltp/Cargo.toml", "[package]\n")
+        self.f.commit("install the test harness manifest")
+        status, output = self.f.run("run", "--seeds", "1")
+        self.assertEqual(status, 1, output)
+        self.assertIn("differ from those its regression evidence used", output)
+
     def test_hand_port_needs_matching_evidence(self):
         self.f.write_bug(self.f.manifest(port="hand"))
         self.assert_check(1, "a hand port counts only with regression evidence")
@@ -240,37 +353,136 @@ class SimBugsTest(unittest.TestCase):
         result, parsed = run_check.classify(check.result_parser, output, 0, False, check.not_run_marker)
         self.assertEqual((result, parsed.executed), ("not-run", 0))
 
-    def test_run_with_a_harness_never_passes_without_seed_lines(self):
-        self.f.write("server/sim-oltp/Cargo.toml", "[package]\n")
-        self.f.commit("install the test harness manifest")
-        fake = self.root / "silent_cargo.py"
-        fake.write_text("print('test result: ok. 1 passed; 0 failed;')\n")
-        status, output = self.f.run("run", "--cargo", f"{sys.executable} {fake}", "--seeds", "3",
-                                    "--target-dir", str(self.root / "target"))
+    def harness_run(self, *argv, **faults):
+        """`run` against the fake harness; returns (status, output, summary or None, calls)."""
+        if not (self.f.repo / "server/sim-oltp/Cargo.toml").exists():
+            self.f.write("server/sim-oltp/Cargo.toml", "[package]\n")
+            self.f.commit("install the test harness manifest")
+        cargo, sweep_src = self.root / "fake_sim_cargo.py", self.root / "fake_sweep.py"
+        cargo.write_text(FAKE_SIM_CARGO)
+        sweep_src.write_text(FAKE_SWEEP)
+        calls, out = self.root / "calls.jsonl", self.root / "out"
+        calls.unlink(missing_ok=True)
+        env = {"FAKE_SWEEP": str(sweep_src), "FAKE_CALLS": str(calls), "RUSTFLAGS": "",
+               **{f"FAKE_{k.upper()}": str(v) for k, v in faults.items()}}
+        with patch.dict(os.environ, env):
+            status, output = self.f.run("run", "--cargo", f"{sys.executable} {cargo}", "--seeds", "5",
+                                        "--target-dir", str(self.root / "target"), "--out", str(out),
+                                        *argv)
+        summary = sim_bugs.read_json(out / "sim-bugs-run.json")
+        lines = calls.read_text().splitlines() if calls.exists() else []
+        return status, output, summary, [json.loads(line) for line in lines]
+
+    def record_detection(self, hit, **changes):
+        history = json.dumps({"seed": hit, "patched": True}) + "\n"
+        detection = {"seed": hit, "trace_hash": "%016x" % (hit * 7919 + 1), "mechanism": "the lost reply",
+                     "history_sha256": hashlib.sha256(history.encode()).hexdigest(), **changes}
+        table = "".join(f"{key} = {json.dumps(value)}\n" for key, value in detection.items())
+        self.f.write_bug(self.f.manifest() + "[detection]\n" + table)
+
+    def test_a_hit_is_only_a_candidate_without_its_own_recorded_mechanism(self):
+        status, output, summary, _ = self.harness_run(hit=3)
         self.assertEqual(status, 1, output)
-        self.assertIn("fix-one: NOT found in [1, 3] (no seed line", output)
+        self.assertIn("fix-one: candidate (NOT counted: no reviewed mechanism is recorded", output)
         self.assertIn("0 of 1 reverted fixes found", output)
-
-    def test_run_rejects_out_of_budget_and_duplicate_seeds(self):
-        self.f.write("server/sim-oltp/Cargo.toml", "[package]\n")
-        self.f.commit("install the test harness manifest")
-        hit = dict(seed=1, result="violation", kinds=["NotAppliedNeverCommitted"])
-        for entries in ([dict(hit, seed=4)], [hit, hit]):
-            with self.subTest(entries=entries), patch.object(sim_bugs, "sweep", return_value=(0, entries)) as sweep:
-                status, output = self.f.run("run", "--seeds", "3")
+        self.assertEqual(summary["bugs"][0]["result"], "candidate")
+        for change in ({"seed": 4}, {"trace_hash": "0" * 16}, {"history_sha256": "0" * 64}):
+            with self.subTest(change=change):
+                self.record_detection(3, **change)
+                status, output, _, _ = self.harness_run(hit=3)
                 self.assertEqual(status, 1, output)
-                self.assertIn("duplicate or out-of-budget seed lines", output)
-                self.assertEqual(sweep.call_count, 1)
+                self.assertIn("the recorded mechanism is for another hit", output)
+        self.record_detection(3, mechanism=" ")
+        self.assert_check(1, "detection.mechanism must say how")
 
-    def test_run_requires_a_successful_clean_replay(self):
-        self.f.write("server/sim-oltp/Cargo.toml", "[package]\n")
-        self.f.commit("install the test harness manifest")
-        hit = dict(seed=1, result="violation", kinds=["NotAppliedNeverCommitted"])
-        clean = dict(seed=1, result="pass", kinds=[])
-        for code, expected_status in ((101, 1), (0, 0)):
-            with self.subTest(code=code), patch.object(sim_bugs, "sweep", side_effect=[(0, [hit]), (code, [clean])]):
-                status, output = self.f.run("run", "--seeds", "3")
-                self.assertEqual(status, expected_status, output)
+    def test_later_phases_use_their_own_directory(self):
+        patch_text = self.f.patch
+        manifest = self.f.manifest().replace('"fix-one"', '"fix-two"').replace("phase = 10", "phase = 11")
+        for where, text, expected in (("phase11/fix-two", manifest, 0), ("fix-two", manifest, 1),
+                                      ("phase11/fix-two", manifest.replace("phase = 11", "phase = 10"), 1)):
+            with self.subTest(where=where, expected=expected):
+                base = f"server/sim-oltp/bugs/{where}"
+                self.f.write(f"{base}/bug.toml", text)
+                self.f.write(f"{base}/revert.patch", patch_text)
+                status, output = self.f.run("check")
+                self.assertEqual(status, expected, output)
+                self.assertIn("2 of 2 patches valid" if expected == 0 else "phase must be", output)
+                (self.f.repo / base / "bug.toml").unlink()
+                (self.f.repo / base / "revert.patch").unlink()
+                (self.f.repo / base).rmdir()
+
+    def test_run_finds_the_seed_and_replays_it_patched_and_clean(self):
+        self.record_detection(3)
+        before = (self.f.repo / "server/src/lib.rs").read_text()
+        # An inherited defect or expectation never reaches the harness outside a rehearsal.
+        with patch.dict(os.environ, {"NABEDRA_SIM_DEFECT": "lost-write", "NABEDRA_SIM_EXPECT": "x"}):
+            status, output, summary, calls = self.harness_run(hit=3)
+        self.assertEqual(status, 0, output)
+        self.assertIn("fix-one: found seed 3 after 3 seeds in [1, 5]; patched ['NotAppliedNeverCommitted']", output)
+        self.assertIn("clean twin pass", output)
+        self.assertIn("1 of 1 reverted fixes found", output)
+        # Patched search, patched replay of the hit, clean replay of it, clean control over the prefix.
+        self.assertEqual([(c["patched"], c["first"], c["count"], c["expect"]) for c in calls],
+                         [(True, 1, 5, "NotAppliedNeverCommitted"), (True, 3, 1, None), (False, 3, 1, None),
+                          (False, 1, 3, "NotAppliedNeverCommitted")])
+        self.assertTrue(all(c["defect"] is None and c["profile"] == "lost-reply" for c in calls))
+        row = summary["bugs"][0]
+        self.assertEqual((summary["mode"], summary["evidence"], row["result"], row["found_seed"], row["tried"]),
+                         ("evidence", "fault-model", "found", 3, 3))
+        self.assertEqual(row["patch_sha256"], hashlib.sha256(self.f.patch.encode()).hexdigest())
+        self.assertNotEqual(row["patched"]["trace_hash"], row["clean"]["trace_hash"])
+        self.assertTrue(row["patched"]["deterministic"] and row["clean"]["deterministic"])
+        self.assertEqual(row["patched"]["violations"], ["t=5ms NotAppliedNeverCommitted: detail"])
+        history = Path(row["patched"]["history"])
+        self.assertEqual(row["patched"]["history_sha256"], hashlib.sha256(history.read_bytes()).hexdigest())
+        self.assertEqual(json.loads(history.read_text())["patched"], True)
+        self.assertEqual(json.loads(Path(row["clean"]["history"]).read_text())["patched"], False)
+        # The patch went only into the scratch worktree, which is gone.
+        self.assertEqual((self.f.repo / "server/src/lib.rs").read_text(), before)
+        self.assertEqual(len(sh(self.f.repo, "worktree", "list").splitlines()), 1)
+
+    def test_run_never_passes_on_a_tooling_or_harness_fault(self):
+        cases = {
+            "silent": "no seed line",
+            "out_of_budget": "duplicate or out-of-budget seed lines in [1, 5]",
+            "duplicate": "duplicate or out-of-budget seed lines in [1, 5]",
+            "clean_fails": "clean replay of seed 2: the unpatched build reported ['Other']",
+            "flaky": "patched replay of seed 2: the seed's two runs differed",
+            "hit": "5 seeds without ['NotAppliedNeverCommitted']",
+            "clean_kind_at": "not attributable to the patch: the unpatched build reports "
+                             "['NotAppliedNeverCommitted'] at seed 1",
+        }
+        for fault, needle in cases.items():
+            with self.subTest(fault=fault):
+                status, output, summary, _ = self.harness_run(**{fault: 9 if fault == "hit" else 1})
+                self.assertEqual(status, 1, output)
+                self.assertIn(needle, output)
+                self.assertIn("0 of 1 reverted fixes found", output)
+                self.assertEqual(summary["bugs"][0]["result"], "not-found")
+
+    def test_run_is_not_run_while_the_workload_is_missing(self):
+        manifest = self.f.manifest().replace('workload = "direct"', 'workload = "cold"')
+        self.f.write_bug(manifest)
+        status, output, summary, _ = self.harness_run()
+        self.assertEqual(status, 0, output)
+        self.assertIn("fix-one: not-run (the harness has no cold workload)", output)
+        check = run_check.parse_check(tomllib_load(Path(__file__).resolve().parents[2]
+                                                   / "docs/testing/checks/oltp-sim-bugs-direct.toml"))
+        result, parsed = run_check.classify(check.result_parser, output, status, False, check.not_run_marker)
+        self.assertEqual((result, parsed.executed), ("not-run", 0))
+
+    def test_rehearsal_on_smoke_is_labelled_and_keeps_the_clean_twin_clean(self):
+        status, output, summary, calls = self.harness_run(
+            "--workload", "smoke", "--profile", "", "--expect", "non-linearizable",
+            "--rehearse-defect", "lost-write")
+        self.assertEqual(status, 0, output)
+        self.assertIn("(rehearsal: manifest workload, profile or expectation overridden", output)
+        self.assertIn("sim-bugs run (rehearsal): 1 of 1 pipeline rehearsals completed", output)
+        self.assertIn("fix-one: rehearsed (defect lost-write, not the patch) seed 2", output)
+        self.assertNotIn("reverted fixes found", output)
+        self.assertEqual(summary["mode"], "rehearsal")
+        self.assertEqual([(c["defect"], c["profile"]) for c in calls],
+                         [("lost-write", None), ("lost-write", None), (None, None), (None, None)])
 
     def test_seed_lines_and_first_match(self):
         output = "\n".join([
@@ -335,6 +547,10 @@ class SimBugsTest(unittest.TestCase):
         self.assertEqual(verdict(True), "passed")
         outcomes[:] = [("failed", "other"), ("passed", ""), ("passed", "")]
         self.assertEqual(verdict(True), "failed-otherwise")
+        # A passing last attempt must not hide an earlier one that never ran.
+        outcomes[:] = [("not-run", ""), ("timeout", ""), ("passed", "")]
+        self.assertEqual(sim_bugs.regression_verdict(bug, None, None, None, {}, None, True)[::2],
+                         ("passed", ["not-run", "timeout", "passed"]))
         outcomes[:] = [("passed", ""), ("failed", "x")]
         self.assertEqual(verdict(False), "failed")
         outcomes[:] = [("passed", "")] * 3
