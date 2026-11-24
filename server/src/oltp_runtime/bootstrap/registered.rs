@@ -20,6 +20,7 @@ use crate::oltp_replication::{
 
 mod cold;
 mod data_worker;
+mod initial;
 mod restart;
 mod system_replacement;
 
@@ -276,16 +277,18 @@ impl LocalServices {
                         Some(_) if worker.restored.is_some() => return Err(unavailable()),
                         Some(_) => return Err(failure("registered initial run or topology policy differs")),
                         None if local.worker_id == seed => {
-                            accepted(
-                                control
-                                    .initialize_local(
-                                        operator,
-                                        id(worker.bootstrap_id, b"initialize"),
-                                        worker.initial_run,
-                                    )
-                                    .await?
-                                    .reply,
-                            )?;
+                            initial::propose(
+                                deadline,
+                                &error_trace,
+                                "initialize Control",
+                                id(worker.bootstrap_id, b"initialize"),
+                                |operation| {
+                                    let proposal =
+                                        control.initialize_local(operator, operation, worker.initial_run);
+                                    async move { Ok(proposal.await?.reply) }
+                                },
+                            )
+                            .await?;
                         }
                         _ => {}
                     }
@@ -296,18 +299,23 @@ impl LocalServices {
                     if old.is_some() {
                         return Err(failure("registered worker enrollment differs"));
                     }
-                    accepted(
-                        control
-                            .enroll_local(
+                    initial::propose(
+                        deadline,
+                        &error_trace,
+                        "enroll initial worker",
+                        id(local.incarnation, b"enroll"),
+                        |operation| {
+                            let proposal = control.enroll_local(
                                 operator,
-                                id(local.incarnation, b"enroll"),
+                                operation,
                                 None,
                                 worker.enrollment.clone(),
                                 None,
-                            )
-                            .await?
-                            .reply,
-                    )?;
+                            );
+                            async move { Ok(proposal.await?.reply) }
+                        },
+                    )
+                    .await?;
                 }
                 None
             };
@@ -861,12 +869,12 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, ProtocolError>>,
 {
-    loop {
+    while nabedra_rt::time::now() < deadline {
         match nabedra_rt::time::timeout_at(deadline, read()).await {
             Ok(Ok(value)) => return Ok(value),
             Ok(Err(error)) if bootstrap_transient(&error) => {
                 tracing::debug!(stage, code=?error.code, outcome=?error.outcome, message=error.message,
-                    "registered authoritative read retry");
+                    "registered startup attempt retry");
                 *last_error.lock().map_err(|_| unavailable())? = Some(error);
             }
             Ok(Err(error)) => return Err(error),
@@ -874,6 +882,7 @@ where
         }
         wait_startup(deadline).await?;
     }
+    Err(unavailable())
 }
 pub(in crate::oltp_runtime) async fn wait_startup(deadline: tokio::time::Instant) -> Result<(), ProtocolError> {
     if nabedra_rt::time::now() >= deadline {
