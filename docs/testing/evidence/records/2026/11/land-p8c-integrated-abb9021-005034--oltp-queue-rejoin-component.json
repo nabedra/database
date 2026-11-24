@@ -1,0 +1,44 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p8c-integrated-abb9021-005034--oltp-queue-rejoin-component.log",
+      "sha256": "2d348d87c138fcbd1ec1b0fdfd19e97167f18ba73dbcf09559e85b83e931929e"
+    }
+  ],
+  "assertions": {
+    "executed": 20,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-queue-rejoin-component",
+  "duration_s": 740.603,
+  "guarantees": [],
+  "kind": "R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T00:51:29.146054+00:00",
+    "request_id": "land-p8c-integrated-abb9021-005034",
+    "runner": "GitHub Actions 1000009027",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45300409359"
+  },
+  "scenarios": [
+    "O14",
+    "Q03",
+    "Q04",
+    "Q05",
+    "R03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "abb902126649f653de3f1cb487b1dee495799f48",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

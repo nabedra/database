@@ -1,0 +1,46 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p8c-integrated-abb9021-005034--oltp-pool-sim.log",
+      "sha256": "1c0f345934ab970954e6d9b1186e214b450aa3fa16c649955c9efe459e7fdfe5"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-pool-sim",
+  "duration_s": 289.122,
+  "guarantees": [
+    "OLTP-G01",
+    "OLTP-G08"
+  ],
+  "kind": "S",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T00:51:00.078193+00:00",
+    "request_id": "land-p8c-integrated-abb9021-005034",
+    "runner": "GitHub Actions 1000009020",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45300409359"
+  },
+  "scenarios": [
+    "O11",
+    "NS04",
+    "O16",
+    "O17"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "abb902126649f653de3f1cb487b1dee495799f48",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
