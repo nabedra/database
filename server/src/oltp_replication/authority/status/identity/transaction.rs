@@ -5,6 +5,7 @@ use super::super::{
     VerifiedSettlement, VerifiedStatusDecision,
 };
 use super::*;
+use nabedra_oltp_types::authority::manifest_root_step as root_step;
 use crate::oltp::{
     mvcc::{
         CanonicalJson,
@@ -155,13 +156,6 @@ fn transaction_prefix(request_id: Uuid) -> Vec<u8> {
     let mut prefix = txn_key(b't', TxnId { request_id, attempt: 0 }, &[]);
     prefix.truncate(prefix.len() - 8);
     prefix
-}
-
-fn root_step(prior: Digest, participant: &ParticipantPlan) -> Result<Digest, ProtocolError> {
-    super::super::metadata_digest(
-        b"nabedra/status-manifest-participant/v1\0",
-        &(prior, participant),
-    )
 }
 
 pub(super) fn apply(

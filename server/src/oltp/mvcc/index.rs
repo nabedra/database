@@ -4,9 +4,9 @@ pub(crate) mod build;
 use super::{catalog::PinnedCatalog, store::KeySpan};
 use crate::{
     oltp::failure,
-    oltp_replication::types::{Page, StoragePin, Text},
     protocol::{ErrorCode, ProtocolError, Row, Scalar, TableDescriptor},
 };
+use nabedra_oltp_types::types::{Page, StoragePin, Text};
 use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, collections::BTreeSet};
 use uuid::Uuid;
@@ -367,13 +367,13 @@ pub(crate) enum IndexClosedKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct IndexAttemptClosedRecord {
-    pub owner: crate::oltp_replication::types::MaintenanceOwnerRef,
+    pub owner: nabedra_oltp_types::types::MaintenanceOwnerRef,
     pub pin: StoragePin,
-    pub closed_by: crate::oltp_replication::types::TxnId,
+    pub closed_by: nabedra_oltp_types::types::TxnId,
     pub kind: IndexClosedKind,
 }
 pub(crate) fn closure_id(
-    owner: &crate::oltp_replication::types::MaintenanceOwnerRef,
+    owner: &nabedra_oltp_types::types::MaintenanceOwnerRef,
 ) -> Result<Uuid, ProtocolError> {
     use sha2::{Digest as _, Sha256};
     let bytes = serde_json::to_vec(owner).map_err(|_| invalid("index owner"))?;

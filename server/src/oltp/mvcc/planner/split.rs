@@ -9,7 +9,7 @@ use crate::oltp::mvcc::{
         split_closure::{CatalogSplitClosed, MAX_SPLIT_CLOSURE_BYTES, SplitChildImage},
     },
 };
-use crate::oltp_replication::types::{GroupKind, ReadTs, StoragePin};
+use nabedra_oltp_types::types::{GroupKind, ReadTs, StoragePin};
 
 pub(crate) struct PlannedSplit {
     split_id: Uuid,

@@ -1,5 +1,11 @@
 //! Bounded memory reservations and byte buffers shared by OLTP components.
 
+mod decoded;
+mod replica_metadata;
+
+pub use decoded::{Decoded, MAX_SECTIONS};
+pub use replica_metadata::{ReplicaMetadata, ReplicaMetadataOwner};
+
 use std::{
     any::Any,
     collections::VecDeque,

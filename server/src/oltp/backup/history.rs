@@ -22,15 +22,15 @@ use crate::{
             ByteClass, DEFAULT_REPLY_DECODE_BYTES, GroupRead, ScratchLease, WorkerSharedResources,
         },
     },
-    oltp_replication::{
-        authority::{
-            status::{ArchivedDecision, ArchivedIdentity, StatusTopology},
-            timestamp::archive::ArchiveClosureStatement,
-        },
-        owned::{OwnedCommand, OwnedPayload, serialized_digest},
-        types::*,
-    },
     protocol::{ErrorCode, ProtocolError},
+};
+use nabedra_oltp_types::{
+    authority::{
+        ArchiveClosureStatement, ArchivedDecision, ArchivedIdentity, StatusTopology,
+        identity_inventory_seed,
+    },
+    owned::{OwnedCommand, OwnedPayload, serialized_digest},
+    types::*,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -487,7 +487,15 @@ pub(crate) fn split_child_scope(
     })
 }
 
+// Only the Status authority knows its native identity record format.
+pub(crate) type IdentityMetadataStep = fn(
+    &WorkerSharedResources,
+    Digest,
+    &MetadataImage,
+) -> Result<Option<(Uuid, Digest)>, ProtocolError>;
+
 struct Chain {
+    identity_metadata_step: IdentityMetadataStep,
     scope: Option<HistoryScope>,
     status: Option<ArchiveClosureStatement>,
     status_topology: Option<StatusTopology>,
@@ -512,8 +520,9 @@ struct Chain {
     finished: bool,
 }
 impl Chain {
-    fn new() -> Self {
+    fn new(identity_metadata_step: IdentityMetadataStep) -> Self {
         Self {
+            identity_metadata_step,
             scope: None,
             status: None,
             status_topology: None,
@@ -612,7 +621,8 @@ impl Chain {
                 }
                 self.identity_count = 0;
                 self.previous_identity = None;
-                self.identity_root=crate::oltp_replication::authority::status::identity::transaction::archive_images::identity_inventory_seed(&closure.status,closure.status_applied_at)?;
+                self.identity_root =
+                    identity_inventory_seed(&closure.status, closure.status_applied_at)?;
                 self.identities_complete &=
                     closure.identity_count.is_some() && closure.identity_root.is_some();
                 self.status = Some(closure.clone());
@@ -789,13 +799,17 @@ impl Chain {
                     if image.group != closure.status {
                         return Err(invalid());
                     }
-                    if let Some((id,root))=crate::oltp_replication::authority::status::identity::transaction::archive_images::identity_metadata_step(shared,self.identity_root,image)?{
+                    if let Some((id, root)) =
+                        (self.identity_metadata_step)(shared, self.identity_root, image)?
+                    {
                         if self.previous_identity.is_some_and(|old| old >= id)
                             || self.status_topology.as_ref().ok_or_else(invalid)?.request(id) != &closure.status
                         {
                             return Err(invalid());
                         }
-                        self.previous_identity=Some(id);self.identity_root=root;self.identity_count=self.identity_count.checked_add(1).ok_or_else(invalid)?;
+                        self.previous_identity = Some(id);
+                        self.identity_root = root;
+                        self.identity_count = self.identity_count.checked_add(1).ok_or_else(invalid)?;
                     }
                 } else if image.group.group_id != scope.timestamp_group {
                     return Err(invalid());
@@ -1028,11 +1042,14 @@ pub(crate) struct HistoryWriter<W> {
     chain: Chain,
 }
 impl<W: Write> HistoryWriter<W> {
-    pub(crate) fn new(mut output: W) -> Result<Self, ProtocolError> {
+    pub(crate) fn new(
+        identity_metadata_step: IdentityMetadataStep,
+        mut output: W,
+    ) -> Result<Self, ProtocolError> {
         output.write_all(MAGIC).map_err(|_| invalid())?;
         Ok(Self {
             output,
-            chain: Chain::new(),
+            chain: Chain::new(identity_metadata_step),
         })
     }
     pub(crate) fn write(
@@ -1091,7 +1108,10 @@ pub(crate) struct HistoryReader<R> {
     eof_checked: bool,
 }
 impl<R: Read> HistoryReader<R> {
-    pub(crate) fn new(mut input: R) -> Result<Self, ProtocolError> {
+    pub(crate) fn new(
+        identity_metadata_step: IdentityMetadataStep,
+        mut input: R,
+    ) -> Result<Self, ProtocolError> {
         let mut magic = [0; 16];
         input.read_exact(&mut magic).map_err(|_| invalid())?;
         if &magic != MAGIC {
@@ -1099,7 +1119,7 @@ impl<R: Read> HistoryReader<R> {
         }
         Ok(Self {
             input,
-            chain: Chain::new(),
+            chain: Chain::new(identity_metadata_step),
             eof_checked: false,
         })
     }

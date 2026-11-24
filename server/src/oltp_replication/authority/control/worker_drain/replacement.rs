@@ -142,6 +142,30 @@ pub(crate) struct EksReplacementPermit {
     pub(crate) added: EksAddedPool,
 }
 
+impl crate::oltp::pool::mount::PoolReopenProof for EksReplacementPermit {
+    type Key = RestartMountKey;
+
+    fn previous(&self) -> &PoolMountExpectation {
+        &self.previous
+    }
+
+    fn previous_root_inode(&self) -> u64 {
+        self.previous_root_inode
+    }
+
+    fn next(&self) -> &PoolMountExpectation {
+        &self.next.mount
+    }
+
+    fn next_mount_public_key(&self) -> Digest {
+        self.next.mount_public_key
+    }
+
+    fn drain_id(&self) -> Uuid {
+        self.drain_id
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EksMountedReplacement {

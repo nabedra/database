@@ -60,7 +60,7 @@ const UNIX_HIGH: &[u8] = b"mvcc/direct-unix-high/v1";
 
 /// `direct_dedup_retention_ms` default: 24 hours. `result_retention_ms` is
 /// bounded against it at startup (RV-FINAL M2).
-pub(crate) const DEFAULT_DIRECT_DEDUP_RETENTION_MS: u64 = crate::config::DIRECT_MARKER_RETENTION_MS;
+pub(crate) const DEFAULT_DIRECT_DEDUP_RETENTION_MS: u64 = nabedra_resources::config::DIRECT_MARKER_RETENTION_MS;
 /// Dedup records deleted per `DirectExpire` entry at most.
 pub(crate) const MAX_DIRECT_EXPIRE_ITEMS: u16 = 128;
 /// Rows per command. `insert_many` above this uses the queued path.
@@ -1299,7 +1299,7 @@ impl DirectForward {
     }
 }
 
-impl crate::oltp_replication::owned::OwnedPayload for DirectCommit {
+impl nabedra_oltp_types::owned::OwnedPayload for DirectCommit {
     fn heap_bytes(&self) -> Result<usize, ProtocolError> {
         let mut bytes = self
             .writes
@@ -1342,7 +1342,7 @@ impl crate::oltp_replication::owned::OwnedPayload for DirectCommit {
 
 impl DirectBatch {
     pub(crate) fn heap_bytes(&self) -> Result<usize, ProtocolError> {
-        use crate::oltp_replication::owned::OwnedPayload as _;
+        use nabedra_oltp_types::owned::OwnedPayload as _;
         let mut bytes = self
             .members
             .capacity()
@@ -1356,14 +1356,14 @@ impl DirectBatch {
         Ok(bytes)
     }
     pub(crate) fn attach_fields(&self, owner: Arc<ScratchLease>) -> Result<(), ProtocolError> {
-        use crate::oltp_replication::owned::OwnedPayload as _;
+        use nabedra_oltp_types::owned::OwnedPayload as _;
         for member in &self.members {
             member.attach_fields(owner.clone())?;
         }
         Ok(())
     }
     pub(crate) fn fields_attached(&self) -> bool {
-        use crate::oltp_replication::owned::OwnedPayload as _;
+        use nabedra_oltp_types::owned::OwnedPayload as _;
         self.members.iter().all(DirectCommit::fields_attached)
     }
 }

@@ -38,9 +38,9 @@
 use super::super::{encode_key, key_length};
 use crate::{
     oltp::{failure, mvcc::MvccKey, pool::GroupStore},
-    oltp_replication::types::{AppliedPosition, CommitTs, ReadTs},
     protocol::{ErrorCode, ProtocolError},
 };
+use nabedra_oltp_types::types::{AppliedPosition, CommitTs, ReadTs};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex, MutexGuard, OnceLock, Weak},

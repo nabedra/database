@@ -12,48 +12,9 @@ use crate::oltp_replication::authority::status::{
 
 pub(crate) const POINT_IMAGE: &[u8] = b"ts/point-archive/v1/";
 pub(super) const MAX_POINT_IMAGE_BYTES: usize = 16 << 10;
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PointArchiveCut {
-    pub applied: AppliedPosition,
-    pub count: u64,
-    pub root: Digest,
-}
+pub(crate) use nabedra_oltp_types::authority::PointArchiveCut;
 
-pub(super) fn at_or_before(at: AppliedPosition, cut: AppliedPosition) -> bool {
-    at.term != 0
-        && at.node_id != 0
-        && at.index != 0
-        && at.term <= cut.term
-        && at.index <= cut.index
-        && (at.index != cut.index || at == cut)
-}
-
-impl PointArchiveCut {
-    pub(crate) fn new(applied: AppliedPosition) -> Self {
-        Self {
-            applied,
-            count: 0,
-            root: Digest::from_bytes([0; 32]),
-        }
-    }
-
-    pub(crate) fn valid(&self) -> bool {
-        at_or_before(self.applied, self.applied)
-            && self.count != 0
-            && self.root != Digest::from_bytes([0; 32])
-    }
-
-    pub(crate) fn push(&mut self, proof: &TimestampPointProjection) -> Result<(), ProtocolError> {
-        self.root = serialized_digest(&(
-            b"nabedra/archive-timestamp-point/v1".as_slice(),
-            self.root,
-            proof,
-        ))?;
-        self.count = self.count.checked_add(1).ok_or_else(unknown)?;
-        Ok(())
-    }
-}
+pub(super) use nabedra_oltp_types::authority::point_at_or_before as at_or_before;
 
 pub(super) fn validate_projection(
     proof: &TimestampPointProjection,

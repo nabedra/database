@@ -12,15 +12,14 @@ use crate::{
         failure,
         pool::{ChargedBytes, ExecutionClass, ScratchLease, WorkerSharedResources},
     },
-    oltp_replication::{
-        authority::control::{ScopedCatalogRead, ScopedQueuePlacement},
-        types::{
-            Authority, CommitTs, Digest, GroupIdentity, GroupKind, ManifestRef, Page, ReadTs,
-            RequestBinding, Text, TxnId,
-        },
-    },
-    oltp_runtime::replica::QueueReadToken,
     protocol::{ErrorCode, Key, ProtocolError, TableDescriptor},
+};
+use nabedra_oltp_types::{
+    authority::{IdentityReservation, QueueReadToken, ScopedCatalogRead, ScopedQueuePlacement},
+    types::{
+        Authority, CommitTs, Digest, GroupIdentity, GroupKind, ManifestRef, Page, ReadTs,
+        RequestBinding, Text, TxnId,
+    },
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
@@ -62,7 +61,7 @@ pub(super) fn lifecycle_anchor(
         return Ok(stored);
     }
     let version = version.ok_or_else(invalid)?;
-    let digest = crate::oltp_replication::owned::serialized_digest(&(
+    let digest = nabedra_oltp_types::owned::serialized_digest(&(
         b"nabedra/legacy-table-lifecycle/v1".as_slice(),
         table_id,
         schema_epoch,
@@ -593,7 +592,7 @@ fn invalid() -> ProtocolError {
 /// table's immutable identities/versions. Capturing it does not clone all tables.
 pub(crate) struct CatalogCapture {
     pub pin: PinnedCatalog,
-    pub catalog_root: crate::oltp_replication::types::Digest,
+    pub catalog_root: nabedra_oltp_types::types::Digest,
     pub table_id: Option<Uuid>,
     pub name_version: Option<CommitTs>,
     pub table_version: Option<CommitTs>,
@@ -616,7 +615,7 @@ impl CatalogCapture {
     fn lineage_digest(&self) -> Result<Digest, ProtocolError> {
         // Authority terms fence execution while the immutable cut survives a
         // same-run takeover.
-        crate::oltp_replication::owned::serialized_digest(&(
+        nabedra_oltp_types::owned::serialized_digest(&(
             b"nabedra/pinned-catalog-lineage/v1".as_slice(),
             &self.pin.catalog,
             self.pin.read_ts,
@@ -637,7 +636,7 @@ impl CatalogCapture {
     pub(crate) fn point_for(
         &self,
         pin: &PinnedCatalog,
-        root: crate::oltp_replication::types::Digest,
+        root: nabedra_oltp_types::types::Digest,
     ) -> Option<&PointCatalog> {
         if self.catalog_root != root
             || self.pin.catalog != pin.catalog
@@ -685,17 +684,13 @@ impl CatalogHandle {
 
     pub(crate) async fn capture_scoped_lineage(
         &self,
-        placement: &crate::oltp_replication::authority::control::ScopedQueuePlacement,
-        reservation: crate::oltp_replication::authority::status::IdentityReservation,
-        identity: &crate::oltp_replication::types::PinIdentity,
-        storage_pin: crate::oltp_replication::types::StoragePin,
+        placement: &ScopedQueuePlacement,
+        reservation: IdentityReservation,
+        identity: &nabedra_oltp_types::types::PinIdentity,
+        storage_pin: nabedra_oltp_types::types::StoragePin,
         key: &crate::protocol::Key,
         authority: Authority,
     ) -> Result<ScopedCapture, ProtocolError> {
-        use crate::oltp_replication::{
-            authority::control::ScopedCatalogRead,
-            types::{Digest, RequestBinding},
-        };
         let GroupKind::Data { table_id, .. } = placement.group.kind else {
             return Err(invalid());
         };
@@ -769,7 +764,7 @@ impl CatalogHandle {
         }
         let mut capture = CatalogCapture {
             pin: pin.clone(),
-            catalog_root: crate::oltp_replication::types::Digest::from_bytes([0; 32]),
+            catalog_root: nabedra_oltp_types::types::Digest::from_bytes([0; 32]),
             table_id: None,
             name_version: None,
             table_version: None,

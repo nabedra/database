@@ -11,65 +11,7 @@ const READ_BUDGET: TransactionBudget = TransactionBudget {
     output_bytes: MAX_POINT_PROJECTION_BYTES,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TimestampPointProjection {
-    completion: TimestampPointResolution,
-    projected_at: AppliedPosition,
-}
-
-impl TimestampPointProjection {
-    pub(crate) fn validate_for(
-        &self,
-        locator: &TimestampDecisionLocator,
-    ) -> Result<(), ProtocolError> {
-        self.completion.validate_for(locator)?;
-        if !valid_position(self.projected_at) {
-            return Err(unknown());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn completion(&self) -> &TimestampPointResolution {
-        &self.completion
-    }
-
-    pub(crate) fn projected_at(&self) -> AppliedPosition {
-        self.projected_at
-    }
-
-    fn digest(&self) -> Result<Digest, ProtocolError> {
-        super::super::super::super::metadata_digest(
-            b"nabedra/status-timestamp-point-projection/v1\0",
-            self,
-        )
-    }
-
-    fn statement(&self) -> DecisionStatement {
-        let decision = self.completion.decision();
-        let home = decision.locator();
-        DecisionStatement {
-            txn: home.binding.txn,
-            request: home.binding.request,
-            manifest: home.manifest,
-            decided_at: self.projected_at,
-            decision: decision.decision(),
-        }
-    }
-
-    fn evidence(&self) -> ResolutionEvidence {
-        let decision = self.completion.decision();
-        let home = decision.locator();
-        ResolutionEvidence {
-            group: home.binding.participant.group.clone(),
-            txn: home.binding.txn,
-            request: home.binding.request,
-            manifest: home.manifest,
-            decision: decision.decision(),
-            completed_at: self.completion.completed_at(),
-        }
-    }
-}
+pub(crate) use nabedra_oltp_types::authority::TimestampPointProjection;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -251,10 +193,7 @@ pub(in super::super::super) fn apply(
     if !valid_position(position) {
         return Err(unknown());
     }
-    let record = TimestampPointProjection {
-        completion: completion.clone(),
-        projected_at: position,
-    };
+    let record = TimestampPointProjection::new(completion.clone(), position);
     let encoded = tx.encode_value(&StoredProjection {
         digest: record.digest()?,
         record: record.clone(),

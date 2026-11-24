@@ -105,6 +105,11 @@ impl VerifiedExclusion {
         &self.stamp
     }
 }
+impl crate::oltp::pool::mount::PoolExclusionProof for VerifiedExclusion {
+    fn excluded_worker(&self) -> WorkerIdentity {
+        self.stamp().worker
+    }
+}
 pub(crate) struct VerifiedMembership {
     stamp: GroupMembershipStamp,
 }

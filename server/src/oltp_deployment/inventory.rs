@@ -9,7 +9,8 @@ use crate::{
         pool::{
             ByteClass, ExecutionClass, OltpPool, ScratchLease, WorkerSharedResources,
             mount::{
-                MountedPoolObservation, PoolMountExpectation, PoolMountProfile, VerifiedMountAnchor,
+                MountedPoolObservation, PoolExclusionProof, PoolMountExpectation, PoolMountProfile,
+                VerifiedMountAnchor,
             },
         },
     },
@@ -226,7 +227,7 @@ impl WorkerPools {
             {
                 return Err(unavailable("secondary pools reuse the same growth claim"));
             }
-            let anchor = next.mount.clone().inspect_mount()?;
+            let anchor = VerifiedMountAnchor::inspect(next.mount.clone())?;
             distinct(primary, anchor.observation())?;
             for old in &anchors {
                 distinct(old.observation(), anchor.observation())?;
@@ -260,7 +261,7 @@ impl WorkerPools {
         let pools = self.clone();
         self.shared
             .execute(ExecutionClass::Control, 0, 0, move || {
-                let anchor = config.mount.clone().inspect_mount()?;
+                let anchor = VerifiedMountAnchor::inspect(config.mount.clone())?;
                 pools.open_secondary(&config, anchor, None, false)
             })
             .await
@@ -325,7 +326,10 @@ impl WorkerPools {
             }
         }
         let observed = observed.clone();
-        let mount = crate::oltp::pool::VerifiedPoolMount::from_anchor(anchor, exclusion)?;
+        let mount = crate::oltp::pool::VerifiedPoolMount::from_anchor(
+            anchor,
+            exclusion.map(|proof| proof as &dyn PoolExclusionProof),
+        )?;
         let pool =
             OltpPool::open_registered(mount, config.mount.identity.clone(), self.shared.clone())?;
         self.entries

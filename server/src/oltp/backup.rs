@@ -4,22 +4,17 @@ pub(crate) mod history;
 pub(crate) mod lifecycle;
 pub(crate) mod restore;
 use crate::{
-    oltp_replication::{
-        owned::serialized_digest,
-        types::{Digest, StoragePin},
-    },
     protocol::{ErrorCode, Outcome, ProtocolError},
+};
+use nabedra_oltp_types::{
+    owned::serialized_digest,
+    types::{Digest, StoragePin},
 };
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use uuid::Uuid;
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct BackupOwnerRef {
-    pub backup_id: Uuid,
-    pub attempt: u64,
-}
+pub(crate) use nabedra_oltp_types::authority::BackupOwnerRef;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BackupPublishedStatement {
@@ -107,7 +102,7 @@ pub(crate) struct BackupManifest {
     pub format_version: u32,
     pub owner: BackupOwnerRef,
     pub pin: StoragePin,
-    pub catalog: crate::oltp_replication::types::GroupIdentity,
+    pub catalog: nabedra_oltp_types::types::GroupIdentity,
     pub catalog_root: Digest,
     pub archive_id: Uuid,
     pub archive_sha256: Digest,

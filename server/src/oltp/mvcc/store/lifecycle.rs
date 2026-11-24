@@ -3,8 +3,8 @@
 //! a drop waits; the wait itself occurs outside native execution.
 use super::*;
 use crate::oltp::mvcc::index::{IndexAttemptClosedRecord, IndexClosedKind, closure_id};
-use crate::oltp_replication::authority::consensus::Applied;
-use crate::oltp_replication::types::MaintenanceOwnerRef;
+use crate::oltp::mvcc::store::consensus::Applied;
+use nabedra_oltp_types::types::MaintenanceOwnerRef;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GuardMode {
@@ -72,7 +72,7 @@ pub(crate) struct VerifiedLifecycleGuard {
 }
 impl VerifiedLifecycleGuard {
     pub(crate) fn from_authenticated(
-        context: crate::oltp_replication::service_rpc::AuthenticatedParticipantReplyContext,
+        context: impl super::ParticipantReplyProof,
         guard: SealedLifecycleGuard,
         binding: &LifecycleBinding,
     ) -> Result<Self, ProtocolError> {
@@ -83,7 +83,7 @@ impl VerifiedLifecycleGuard {
             return Err(invalid());
         }
         context.verify_payload(
-            crate::oltp_replication::service_rpc::ParticipantProofKind::Lifecycle,
+            nabedra_oltp_types::authority::ParticipantProofKind::Lifecycle,
             &guard,
         )?;
         Ok(Self { guard })
@@ -121,18 +121,18 @@ pub(crate) enum LifecycleCommand {
     CancelPending {
         authority: Authority,
         binding: LifecycleBinding,
-        settled: crate::oltp_replication::authority::status::SealedSettlement,
+        settled: nabedra_oltp_types::authority::SealedSettlement,
     },
     Release {
         authority: Authority,
         guard: SealedLifecycleGuard,
-        settled: crate::oltp_replication::authority::status::SealedSettlement,
+        settled: nabedra_oltp_types::authority::SealedSettlement,
     },
     RecoverIndexPublication {
         authority: Authority,
         owner: MaintenanceOwnerRef,
         binding: LifecycleBinding,
-        settled: crate::oltp_replication::authority::status::SealedSettlement,
+        settled: nabedra_oltp_types::authority::SealedSettlement,
     },
     Acquire {
         authority: Authority,
@@ -408,7 +408,7 @@ fn recover_index_publication(
     authority: Authority,
     owner: &MaintenanceOwnerRef,
     binding: &LifecycleBinding,
-    settled: &crate::oltp_replication::authority::status::SealedSettlement,
+    settled: &nabedra_oltp_types::authority::SealedSettlement,
 ) -> Result<Transition, ProtocolError> {
     if group.kind != GroupKind::Catalog
         || config.authority != authority
@@ -658,7 +658,7 @@ impl ParticipantHandle {
         authority: Authority,
         owner: MaintenanceOwnerRef,
         binding: LifecycleBinding,
-        settled: crate::oltp_replication::authority::status::VerifiedSettlement,
+        settled: impl nabedra_oltp_types::authority::SettlementProof,
     ) -> Result<(), ProtocolError> {
         let applied = self
             .propose(OwnedCommand::new_owned(
@@ -684,7 +684,7 @@ impl ParticipantHandle {
         &self,
         authority: Authority,
         guard: VerifiedLifecycleGuard,
-        settled: crate::oltp_replication::authority::status::VerifiedSettlement,
+        settled: impl nabedra_oltp_types::authority::SettlementProof,
     ) -> Result<Applied<ParticipantReply>, ProtocolError> {
         self.propose(OwnedCommand::new_owned(
             ParticipantCommand::Lifecycle(LifecycleCommand::Release {
@@ -701,7 +701,7 @@ impl ParticipantHandle {
         &self,
         authority: Authority,
         binding: LifecycleBinding,
-        settled: crate::oltp_replication::authority::status::VerifiedSettlement,
+        settled: impl nabedra_oltp_types::authority::SettlementProof,
     ) -> Result<Applied<ParticipantReply>, ProtocolError> {
         self.propose(OwnedCommand::new_owned(
             ParticipantCommand::Lifecycle(LifecycleCommand::CancelPending {
@@ -716,7 +716,7 @@ impl ParticipantHandle {
     }
     pub(crate) async fn scoped_lifecycle_guard(
         &self,
-        scope: crate::oltp_replication::authority::control::ScopedCatalogRead,
+        scope: nabedra_oltp_types::authority::ScopedCatalogRead,
         txn: TxnId,
     ) -> Result<Option<VerifiedLifecycleGuard>, ProtocolError> {
         if self.identity().kind != GroupKind::Catalog || txn.request_id != scope.request.request_id || txn.attempt != 1 {
@@ -903,7 +903,7 @@ impl ParticipantHandle {
         &self,
         binding: LifecycleBinding,
         mode: GuardMode,
-        scope: Option<crate::oltp_replication::authority::control::ScopedCatalogRead>,
+        scope: Option<nabedra_oltp_types::authority::ScopedCatalogRead>,
     ) -> Result<Option<VerifiedLifecycleGuard>, ProtocolError> {
         let command = ParticipantCommand::Lifecycle(LifecycleCommand::Acquire {
             authority: binding.authority,
@@ -979,14 +979,12 @@ impl ParticipantHandle {
 #[cfg(test)]
 mod index_recovery_tests {
     use super::*;
-    use crate::{
-        config::WorkerResources,
-        oltp::pool::{OltpPool, PoolIdentity, SharedResourceConfig, WorkerSharedResources},
-        oltp_replication::{
-            authority::status::{SettlementStatement, VerifiedSettlement},
-            types::{DecisionStatement, StoragePin, Text},
-        },
+    use crate::oltp::pool::{OltpPool, PoolIdentity, SharedResourceConfig, WorkerSharedResources};
+    use nabedra_oltp_types::{
+        authority::{SealedSettlement, SettlementStatement},
+        types::{DecisionStatement, StoragePin, Text},
     };
+    use nabedra_resources::config::WorkerResources;
 
     #[tokio::test]
     async fn o08_o12_t06_recover_exact_settled_ready_guard() {
@@ -1072,7 +1070,7 @@ mod index_recovery_tests {
         };
         let commit_ts = CommitTs::new(12).unwrap();
         let decision = TxnDecision::Commit { commit_ts };
-        let settled = VerifiedSettlement::model_for_test(SettlementStatement {
+        let settled = SealedSettlement::seal(SettlementStatement {
             txn,
             request: binding.request,
             manifest,
@@ -1086,8 +1084,7 @@ mod index_recovery_tests {
             resolved_count: 1,
             settled_at: position,
         })
-        .unwrap()
-        .into_sealed();
+        .unwrap();
         let closure = IndexAttemptClosedRecord {
             owner,
             pin: StoragePin {

@@ -9,7 +9,7 @@ use crate::oltp::{
     },
     pool::{ByteClass, ScratchLease},
 };
-use crate::oltp_replication::types::{MaintenanceOwnerRef, StoragePin};
+use nabedra_oltp_types::types::{MaintenanceOwnerRef, StoragePin};
 
 // Its serialized shape is also the immutable TSO release digest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,13 +165,13 @@ impl std::fmt::Debug for VerifiedIndexAttemptClosed {
 }
 impl VerifiedIndexAttemptClosed {
     pub(crate) fn from_authenticated(
-        context: crate::oltp_replication::service_rpc::AuthenticatedParticipantReplyContext,
+        context: impl super::ParticipantReplyProof,
         reply: IndexClosureReply,
         expected: MaintenanceOwnerRef,
     ) -> Result<Self, ProtocolError> {
         reply.validate(context.group(), expected)?;
         context.verify_payload(
-            crate::oltp_replication::service_rpc::ParticipantProofKind::IndexClosed,
+            nabedra_oltp_types::authority::ParticipantProofKind::IndexClosed,
             &reply,
         )?;
         Ok(Self {

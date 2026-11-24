@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct IndexPayload {
-    pub base_version: Option<crate::oltp_replication::types::CommitTs>,
+    pub base_version: Option<nabedra_oltp_types::types::CommitTs>,
     pub cover: Row,
 }
 /// The entries one index changes when a row goes from `old` to `new`.
@@ -209,7 +209,7 @@ impl NativePlanner {
         pin: &PinnedCatalog,
         participant: &ParticipantHandle,
         key: MvccKey,
-    ) -> Result<Option<crate::oltp_replication::types::CommitTs>, PlanError> {
+    ) -> Result<Option<nabedra_oltp_types::types::CommitTs>, PlanError> {
         let read = participant.read_at(pin.read_ts, key).await?;
         let (version, _) =
             value(decode_record::<serde::de::IgnoredAny>(self.catalog.resources(), read).await?)?;
@@ -259,7 +259,7 @@ impl NativePlanner {
         definition.validate(&table.ok_or_else(not_found)?.descriptor)?;
         let (_, name) = value(self.catalog.read::<IndexNameRecord>(pin, MvccKey::CatalogIndexName {
             table_id: definition.table_id,
-            name: crate::oltp_replication::types::Text::try_from(definition.name.as_str()).map_err(|_| not_found())?,
+            name: nabedra_oltp_types::types::Text::try_from(definition.name.as_str()).map_err(|_| not_found())?,
         }).await?)?;
         let (_, record) = value(self.catalog.read::<IndexRecord>(pin, MvccKey::CatalogIndex {
             table_id: definition.table_id,
@@ -309,7 +309,7 @@ impl NativePlanner {
                         pin,
                         MvccKey::CatalogIndexName {
                             table_id,
-                            name: crate::oltp_replication::types::Text::try_from(
+                            name: nabedra_oltp_types::types::Text::try_from(
                                 definition.name.as_str(),
                             )
                             .map_err(|_| not_found())?,
@@ -400,7 +400,7 @@ impl NativePlanner {
                 PreparedWrite {
                     key: MvccKey::CatalogIndexName {
                         table_id,
-                        name: crate::oltp_replication::types::Text::try_from(
+                        name: nabedra_oltp_types::types::Text::try_from(
                             definition.name.as_str(),
                         )
                         .map_err(|_| not_found())?,

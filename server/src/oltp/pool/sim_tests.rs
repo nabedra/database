@@ -260,7 +260,7 @@ fn o17_mount_identity_and_disk_budget_follow_volume() {
             assert_ne!(reformatted.filesystem_uuid, info.filesystem_uuid);
             sim::in_node(NODE, async {
                 assert!(
-                    expected.inspect_mount().is_err(),
+                    mount::VerifiedMountAnchor::inspect(expected).is_err(),
                     "old inventory accepted wiped data"
                 );
                 assert_eq!(

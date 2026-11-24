@@ -1,15 +1,10 @@
 use super::*;
-use crate::{
-    config::WorkerResources,
-    oltp::{
-        mvcc::CanonicalJson,
-        pool::{ByteClass, OltpPool, PoolIdentity, SharedResourceConfig, WorkerSharedResources},
-    },
-    oltp_replication::{
-        authority::status::VerifiedStatusDecision,
-        types::{AbortReason, DecisionStatement, Text, Timestamp},
-    },
+use crate::oltp::{
+    mvcc::CanonicalJson,
+    pool::{ByteClass, OltpPool, PoolIdentity, SharedResourceConfig, WorkerSharedResources},
 };
+use nabedra_oltp_types::types::{AbortReason, DecisionStatement, Text, Timestamp};
+use nabedra_resources::config::WorkerResources;
 use std::path::PathBuf;
 struct Dir(PathBuf);
 impl Drop for Dir {
@@ -244,9 +239,7 @@ impl Fixture {
             },
             decision,
         };
-        let proof = VerifiedStatusDecision::model_for_test(statement)
-            .unwrap()
-            .into_sealed();
+        let proof = SealedStatusDecision::seal(statement).unwrap();
         self.submit(ParticipantCommand::Resolve {
             authority: self.authority,
             proof,
@@ -434,8 +427,8 @@ async fn o16_o28_source_image_pages_charge_exact_native_and_wire_owners() {
                 .unwrap();
         drop(wire);
         assert_eq!(
-            crate::oltp_replication::owned::serialized_digest(&decoded).unwrap(),
-            crate::oltp_replication::owned::serialized_digest(&image).unwrap()
+            nabedra_oltp_types::owned::serialized_digest(&decoded).unwrap(),
+            nabedra_oltp_types::owned::serialized_digest(&image).unwrap()
         );
         let page = decoded.payload().unwrap();
         let ImagePage::Images {
@@ -643,7 +636,7 @@ pub(crate) async fn index_reclamation_storage_evidence() -> (u64, u64) {
 #[tokio::test]
 async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry() {
     use super::{image_archive::ImagePage, lineage::SplitBinding};
-    use crate::oltp_replication::authority::status::{SettlementStatement, VerifiedSettlement};
+    use nabedra_oltp_types::authority::{SealedSettlement, SettlementStatement};
     struct Child {
         machine: ParticipantMachine,
         index: u64,
@@ -661,7 +654,7 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
             &mut self,
             command: OwnedCommand<ParticipantCommand>,
         ) -> ParticipantReply {
-            let digest = crate::oltp_replication::owned::serialized_digest(&command).unwrap();
+            let digest = nabedra_oltp_types::owned::serialized_digest(&command).unwrap();
             let position = AppliedPosition {
                 term: 1,
                 node_id: 1,
@@ -839,7 +832,7 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
             node_id: 1,
             index: 80,
         };
-        VerifiedSettlement::model_for_test(SettlementStatement {
+        SealedSettlement::seal(SettlementStatement {
             txn,
             request,
             manifest,
@@ -854,7 +847,6 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
             },
         })
         .unwrap()
-        .into_sealed()
     };
     let mut cancelled_bindings = bindings.clone();
     let cancelled_id = nabedra_rt::ids::uuid_v4();
@@ -1228,8 +1220,7 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
     }
 }
 
-/// Deterministic participant-storage evidence. The Status proof is modeled;
-/// this does not establish authenticated distributed archive closure.
+/// Deterministic participant-storage evidence with an exact decision statement.
 #[tokio::test]
 async fn o19_o28_archive_pages_preserve_put_delete_keep_and_require_full_resolution() {
     let mut f = Fixture::new().await;
@@ -1241,31 +1232,28 @@ async fn o19_o28_archive_pages_preserve_put_delete_keep_and_require_full_resolut
     let p = f.plan(10, &[writes.clone()]);
     f.prepare(&p, 0, writes).await;
     f.seal(&p).await;
-    let proof = || {
-        VerifiedStatusDecision::model_for_test(DecisionStatement {
-            txn: p.txn,
-            request: p.request,
-            manifest: p.manifest,
-            decided_at: AppliedPosition {
-                term: 2,
-                node_id: 2,
-                index: 10,
-            },
-            decision: committed(11),
-        })
-        .unwrap()
+    let statement = DecisionStatement {
+        txn: p.txn,
+        request: p.request,
+        manifest: p.manifest,
+        decided_at: AppliedPosition {
+            term: 2,
+            node_id: 2,
+            index: 10,
+        },
+        decision: committed(11),
     };
     f.resolve(&p, committed(11), 1).await;
     assert!(
         f.machine
-            .archive_effect_page(proof(), 0, 1, 64 << 10)
+            .archive_effect_page_from_statement(&statement, 0, 1, 64 << 10)
             .await
             .is_err()
     );
     f.resolve(&p, committed(11), 128).await;
     let first = f
         .machine
-        .archive_effect_page(proof(), 0, 1, 64 << 10)
+        .archive_effect_page_from_statement(&statement, 0, 1, 64 << 10)
         .await
         .unwrap();
     let page = first.payload().unwrap();
@@ -1286,7 +1274,7 @@ async fn o19_o28_archive_pages_preserve_put_delete_keep_and_require_full_resolut
     );
     let second = f
         .machine
-        .archive_effect_page(proof(), 1, 1, 64 << 10)
+        .archive_effect_page_from_statement(&statement, 1, 1, 64 << 10)
         .await
         .unwrap();
     let page = second.payload().unwrap();
@@ -1296,7 +1284,7 @@ async fn o19_o28_archive_pages_preserve_put_delete_keep_and_require_full_resolut
     assert!(page.effects[0].value.is_none());
     let last = f
         .machine
-        .archive_effect_page(proof(), 2, 1, 64 << 10)
+        .archive_effect_page_from_statement(&statement, 2, 1, 64 << 10)
         .await
         .unwrap();
     let page = last.payload().unwrap();
@@ -1308,7 +1296,7 @@ async fn o19_o28_archive_pages_preserve_put_delete_keep_and_require_full_resolut
     );
     assert!(
         f.machine
-            .archive_effect_page(proof(), 4, 1, 64 << 10)
+            .archive_effect_page_from_statement(&statement, 4, 1, 64 << 10)
             .await
             .is_err()
     );
@@ -1508,7 +1496,7 @@ async fn o07_o09_fixed_pages_seal_exact_plan_and_delayed_commit_stays_discoverab
 /// Exercises native participant state with modeled Status and quorum replies.
 #[tokio::test]
 async fn o06_o07_o10_partial_resolution_witness_requires_exact_decision_and_current_quorum() {
-    use crate::oltp_replication::authority::consensus::{Applied, Consensus, ReadBarrier};
+    use crate::oltp::mvcc::store::consensus::{Applied, Consensus, ReadBarrier};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct ModeledQuorum(AtomicBool);
@@ -1558,9 +1546,7 @@ async fn o06_o07_o10_partial_resolution_witness_requires_exact_decision_and_curr
         decision: committed(11),
     };
     let as_proof = |statement| {
-        VerifiedStatusDecision::model_for_test(statement)
-            .unwrap()
-            .into_sealed()
+        SealedStatusDecision::seal(statement).unwrap()
     };
     let proof = as_proof(statement.clone());
     let quorum = Arc::new(ModeledQuorum(AtomicBool::new(true)));

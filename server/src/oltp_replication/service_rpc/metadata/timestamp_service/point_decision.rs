@@ -50,7 +50,12 @@ impl VerifiedTimestampPointDecision {
         &self.decision
     }
 
-    pub(crate) fn into_parts(self) -> (PointDecision, Arc<ScratchLease>) {
+}
+
+impl nabedra_oltp_types::authority::TimestampPointDecisionProof
+    for VerifiedTimestampPointDecision
+{
+    fn into_parts(self) -> (PointDecision, Arc<ScratchLease>) {
         (self.decision, self.charge)
     }
 }

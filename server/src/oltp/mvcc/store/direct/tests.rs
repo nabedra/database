@@ -1,18 +1,16 @@
 //! Store-level evidence for direct commits (plan sections 4 and 5): real
 //! group stores, model consensus (sequential apply positions, no Raft).
 use super::*;
-use crate::{
-    config::WorkerResources,
-    oltp::{
-        mvcc::{Change, PreparedWrite, index::IndexValue},
-        pool::{ByteClass, OltpPool, PoolIdentity, SharedResourceConfig, WorkerSharedResources},
-    },
-    oltp_replication::{
-        authority::status::VerifiedStatusDecision,
-        owned::OwnedCommand,
-        types::{DecisionStatement, Page, Text, Timestamp, TxnDecision},
-    },
+use crate::oltp::{
+    mvcc::{Change, PreparedWrite, index::IndexValue},
+    pool::{ByteClass, OltpPool, PoolIdentity, SharedResourceConfig, WorkerSharedResources},
 };
+use nabedra_oltp_types::{
+    authority::SealedStatusDecision,
+    owned::OwnedCommand,
+    types::{DecisionStatement, Page, Text, Timestamp, TxnDecision},
+};
+use nabedra_resources::config::WorkerResources;
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -80,7 +78,7 @@ async fn apply_at(
     command: ParticipantCommand,
 ) -> ParticipantReply {
     let command = OwnedCommand::new_owned(command, shared, ByteClass::Data).unwrap();
-    let digest = crate::oltp_replication::owned::serialized_digest(&command).unwrap();
+    let digest = nabedra_oltp_types::owned::serialized_digest(&command).unwrap();
     let raw = machine
         .apply(
             ApplyMeta {
@@ -476,7 +474,7 @@ impl Fixture {
             .await,
             ParticipantReply::Sealed(_)
         ));
-        let proof = VerifiedStatusDecision::model_for_test(DecisionStatement {
+        let proof = SealedStatusDecision::seal(DecisionStatement {
             txn: p.txn,
             request: p.request,
             manifest: p.manifest,
@@ -489,8 +487,7 @@ impl Fixture {
                 commit_ts: ts(commit_ts),
             },
         })
-        .unwrap()
-        .into_sealed();
+        .unwrap();
         assert!(matches!(
             self.submit(ParticipantCommand::Resolve {
                 authority: self.authority,
@@ -1319,7 +1316,7 @@ async fn d03_o16_dedup_records_follow_their_anchor_row_through_a_split() {
 
 impl Replica {
     async fn apply_owned(&mut self, command: OwnedCommand<ParticipantCommand>) -> ParticipantReply {
-        let digest = crate::oltp_replication::owned::serialized_digest(&command).unwrap();
+        let digest = nabedra_oltp_types::owned::serialized_digest(&command).unwrap();
         let index = self.index;
         self.index += 1;
         let raw = self
@@ -1937,11 +1934,11 @@ async fn o02_direct_variants_use_new_tags_that_an_older_decoder_rejects() {
     let mut f = f;
     let before = f.dump().await;
     let scoped = ParticipantCommand::Scoped {
-        scope: crate::oltp_replication::authority::control::ScopedCatalogRead {
+        scope: nabedra_oltp_types::authority::ScopedCatalogRead {
             queue_group_id: nabedra_rt::ids::uuid_v4(),
             data_generation: nabedra_rt::ids::uuid_v4(),
             queue_generation: nabedra_rt::ids::uuid_v4(),
-            queue_view: crate::oltp_replication::types::AuthorityView {
+            queue_view: nabedra_oltp_types::types::AuthorityView {
                 run_id: f.authority.run_id,
                 owner_term: f.authority.owner_term,
                 membership_revision: 1,

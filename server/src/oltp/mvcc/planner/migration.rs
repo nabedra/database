@@ -14,7 +14,7 @@ impl NativePlanner {
         if descriptor.id.is_nil() {
             return Err(failure(ErrorCode::ValidationError, "import table UUID is nil").into());
         }
-        let name = crate::oltp_replication::types::Text::try_from(descriptor.name.as_str())
+        let name = nabedra_oltp_types::types::Text::try_from(descriptor.name.as_str())
             .map_err(|_| not_found())?;
         let (name_version, existing) = value(
             self.catalog

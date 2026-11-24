@@ -1,5 +1,6 @@
 use super::*;
-use crate::{oltp::pool::GroupRead, oltp_replication::multiplex::Decoded, protocol::Outcome};
+use crate::{oltp::pool::GroupRead, protocol::Outcome};
+use nabedra_resources::memory::Decoded;
 
 #[derive(Clone, Copy)]
 pub(crate) enum PointEvidenceRead {

@@ -1,0 +1,17 @@
+id = "oltp-integration"
+module = "oltp"
+kinds = ["U", "R"]
+guarantees = []
+scenarios = ["C07", "M02", "O06", "Q03", "Q04", "Q06", "R01", "R03", "U02"]
+tiers = ["T1"]
+# These suites exercise shared interfaces. T9 and the targeted process fixtures
+# configure direct_oltp on and off.
+command = [
+    "cargo", "test", "--locked", "-j", "4", "--no-default-features", "--features", "oltp",
+    "--test", "oltp_multiplex", "--test", "oltp_worker_queue", "--test", "worker_pool",
+    "--test", "executor", "--test", "protocol",
+]
+cwd = "server"
+timeout_s = 3600
+needs = []
+result_parser = "cargo-test"

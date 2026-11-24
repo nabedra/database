@@ -2,12 +2,26 @@
 //! The returned native lease pins generation/membership through publication;
 //! a parsed DTO or an arbitrary applied-index number cannot construct it.
 use super::*;
-use crate::oltp_replication::{
-    manager::{AppliedPlacementMembership, GroupMembershipObservation},
+use nabedra_oltp_types::{
     owned::serialized_digest,
     types::{Page, ReplicaMember, WorkerIdentity},
 };
 use tokio::sync::OwnedRwLockReadGuard;
+
+/// A stable membership observed by replication, including the decoder for
+/// the durable membership that will be checked under the generation guard.
+pub(crate) trait ActivationMembershipProof<const EXACT: bool>: Sync {
+    fn group(&self) -> &GroupIdentity;
+    fn voters(&self) -> &[ReplicaMember];
+    fn position(&self) -> AppliedPosition;
+
+    fn matches_stored_membership(
+        bytes: &[u8],
+        voters: &[ReplicaMember],
+        minimum: AppliedPosition,
+    ) -> Result<bool, ProtocolError>;
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReplicaActivationStatement {
@@ -34,34 +48,27 @@ impl VerifiedReplicaActivation {
     }
 }
 impl GroupStore {
-    pub(crate) async fn replica_activation(
+    pub(crate) async fn replica_activation<P: ActivationMembershipProof<false>>(
         &self,
-        minimum: &GroupMembershipObservation,
+        minimum: &P,
     ) -> Result<VerifiedReplicaActivation, ProtocolError> {
-        self.replica_activation_at(
-            minimum.group(),
-            minimum.replicas(),
-            minimum.applied_at(),
-            false,
-        )
-        .await
+        self.replica_activation_at::<P, false>(minimum).await
     }
 
-    pub(crate) async fn replica_activation_applied(
+    pub(crate) async fn replica_activation_applied<P: ActivationMembershipProof<true>>(
         &self,
-        minimum: &AppliedPlacementMembership,
+        minimum: &P,
     ) -> Result<VerifiedReplicaActivation, ProtocolError> {
-        self.replica_activation_at(minimum.group(), minimum.voters(), minimum.position(), true)
-            .await
+        self.replica_activation_at::<P, true>(minimum).await
     }
 
-    async fn replica_activation_at(
+    async fn replica_activation_at<P: ActivationMembershipProof<EXACT>, const EXACT: bool>(
         &self,
-        group: &GroupIdentity,
-        voters: &[ReplicaMember],
-        minimum: AppliedPosition,
-        exact_membership: bool,
+        proof: &P,
     ) -> Result<VerifiedReplicaActivation, ProtocolError> {
+        let group = proof.group();
+        let voters = proof.voters();
+        let minimum = proof.position();
         if group != self.identity()
             || !voters.iter().any(|replica| {
                 replica.pool_id == self.pool().identity().pool_id
@@ -100,25 +107,7 @@ impl GroupStore {
                         return Err(recovery_unknown());
                     }
                     let membership = applied.membership.as_ref().ok_or_else(recovery_unknown)?;
-                    let stored =
-                        crate::oltp_replication::entry::stored_membership(membership.as_slice())?;
-                    if stored.membership().get_joint_config().len() != 1
-                        || (exact_membership
-                            && stored
-                                .log_id()
-                                .map(crate::oltp_replication::hosted::position)
-                                != Some(minimum))
-                    {
-                        return Err(recovery_unknown());
-                    }
-                    let voting = &stored.membership().get_joint_config()[0];
-                    let actual = stored
-                        .membership()
-                        .nodes()
-                        .filter(|(id, _)| voting.contains(id))
-                        .map(|(_, replica)| replica.clone())
-                        .collect::<Vec<ReplicaMember>>();
-                    if actual.as_slice() != &*voters {
+                    if !P::matches_stored_membership(membership.as_slice(), &voters, minimum)? {
                         return Err(recovery_unknown());
                     }
                     let native_generation = view

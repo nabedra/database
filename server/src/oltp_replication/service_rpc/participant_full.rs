@@ -24,6 +24,8 @@ use crate::oltp_replication::{
     },
     owned::{OwnedCommand, OwnedPayload},
 };
+use crate::oltp_runtime::{coordinator::QueueCoordinator, replica::WorkerReplica};
+use std::sync::Mutex;
 use uuid::Uuid;
 
 #[path = "participant_full_timestamp_point.rs"]
@@ -341,7 +343,7 @@ impl ParticipantEndpoint {
         if !matches!(session.group().kind, GroupKind::Data { .. }) {
             return Err(invalid());
         }
-        let replica = shared.read_replica()?;
+        let replica = shared.read_replica::<Mutex<WorkerReplica>>()?;
         let context = replica
             .lock()
             .map_err(|_| unavailable())?
@@ -696,7 +698,7 @@ impl Endpoint for ParticipantEndpoint {
                             return Err(unavailable());
                         }
                         Self::read_scope(&shared, &session, scope)?;
-                        if !shared.read_replica()?.lock().map_err(|_| unavailable())?.knows_read_grant(grant) {
+                        if !shared.read_replica::<Mutex<WorkerReplica>>()?.lock().map_err(|_| unavailable())?.knows_read_grant(grant) {
                             return Err(invalid());
                         }
                         #[cfg(test)]
@@ -1075,8 +1077,8 @@ impl Endpoint for ParticipantEndpoint {
                     }
                     Method::Direct(header) | Method::DirectForward(header) => {
                         let forward = matches!(head.method, Method::DirectForward(_));
-                        crate::oltp_runtime::stage_timing::timed(
-                            crate::oltp_runtime::stage_timing::perf_stage!("rpc.direct.serve"),
+                        nabedra_resources::stage_timing::timed(
+                            nabedra_resources::perf_stage!("rpc.direct.serve"),
                             direct::serve(&self.proof.handle, &session, header, forward, &sections),
                         )
                         .await
@@ -1431,7 +1433,7 @@ impl RemoteParticipant for ParticipantClient {
                         error
                     }
                 })?;
-            Ok(Applied::owned(value.position, value.reply, owner))
+            Ok(crate::oltp_replication::authority::consensus::owned_applied(value.position, value.reply, owner))
         })
     }
     fn resolve_timestamp_point(
@@ -1513,8 +1515,8 @@ impl RemoteParticipant for ParticipantClient {
                     }
                 })
                 .await?;
-            let replica = client.shared.read_replica()?;
-            let queue = client.shared.read_queue()?;
+            let replica = client.shared.read_replica::<Mutex<WorkerReplica>>()?;
+            let queue = client.shared.read_queue::<QueueCoordinator>()?;
             #[cfg(test)]
             let continuation = continuation_fixture::checkpoint(scope, client, &payload, digest).await;
             if continuing {
@@ -1572,9 +1574,9 @@ impl RemoteParticipant for ParticipantClient {
                         return Err(invalid().into());
                     }
                     drop(opened);
-                    let read = UnsettledRead {
-                        queue: queue.clone(),
-                        grant: Box::new(ReadGrant {
+                    let read = UnsettledRead::new(
+                        queue.clone(),
+                        ReadGrant {
                             scope,
                             owner: replica.lock().map_err(|_| unavailable())?.local_identity(),
                             worker,
@@ -1582,8 +1584,8 @@ impl RemoteParticipant for ParticipantClient {
                             node: member.node_id,
                             ticket,
                             input: digest,
-                        }),
-                    };
+                        },
+                    );
                     if let Err(cause) = queue.open_read_grant(*read.grant).await {
                         if read.settle().await {
                             return Err(cause.into());
@@ -1702,13 +1704,13 @@ impl RemoteParticipant for ParticipantClient {
                 .await
         })
     }
-    fn archive_effect_page(
-        &self,
-        proof: crate::oltp_replication::authority::status::VerifiedStatusDecision,
+    fn archive_effect_page<'a>(
+        &'a self,
+        proof: &'a dyn nabedra_oltp_types::authority::StatusDecisionProof,
         after: u64,
         max_items: u16,
         max_bytes: usize,
-    ) -> ParticipantFuture<'_, OwnedCommand<ArchiveEffects>> {
+    ) -> ParticipantFuture<'a, OwnedCommand<ArchiveEffects>> {
         Box::pin(async move {
             let expected = proof.statement().clone();
             let response = self

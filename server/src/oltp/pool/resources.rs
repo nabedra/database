@@ -1,7 +1,7 @@
 //! Worker-owned physical execution and native-memory resources.
-use crate::{
+use crate::{oltp::read_attempt::ReadAttempts, protocol::ProtocolError};
+use nabedra_resources::{
     config::{ExecutionConfig, WorkerResources},
-    protocol::ProtocolError,
     scheduling::{MemoryCharge, ResourceScheduler},
 };
 use nabedra_resources::memory::WorkerMemory;
@@ -14,6 +14,7 @@ pub(crate) use nabedra_resources::memory::{
 };
 use serde::Serialize;
 use std::{
+    any::Any,
     collections::BTreeMap,
     sync::{
         Arc, Mutex, OnceLock, Weak,
@@ -37,9 +38,9 @@ pub struct WorkerSharedResources {
     #[cfg(test)]
     native_jobs: [AtomicU64; 2],
     thread_budget: super::super::NativeThreadBudget,
-    pub(crate) read_attempts: crate::oltp_replication::service_rpc::ReadAttempts,
-    read_replica: OnceLock<Weak<Mutex<crate::oltp_runtime::replica::WorkerReplica>>>,
-    read_queue: OnceLock<Weak<crate::oltp_runtime::coordinator::QueueCoordinator>>,
+    pub(crate) read_attempts: ReadAttempts,
+    read_replica: OnceLock<Box<dyn Any + Send + Sync>>,
+    read_queue: OnceLock<Box<dyn Any + Send + Sync>>,
     worker_id: Mutex<Option<Uuid>>,
     query: NativeExecutor,
     control: NativeExecutor,
@@ -53,6 +54,15 @@ pub(crate) struct BlockCacheUsage {
     configured_bytes: usize,
     usage_bytes: usize,
     pinned_bytes: usize,
+}
+
+impl std::ops::Deref for WorkerSharedResources {
+    type Target = WorkerMemory;
+
+    #[inline]
+    fn deref(&self) -> &WorkerMemory {
+        &self.memory
+    }
 }
 
 impl WorkerSharedResources {
@@ -375,38 +385,40 @@ impl WorkerSharedResources {
         workers.insert(worker_id, Arc::downgrade(self));
         Ok(())
     }
-    pub(crate) fn bind_read_replica(
+    pub(crate) fn bind_read_replica<T: Send + Sync + 'static>(
         &self,
-        replica: &Arc<Mutex<crate::oltp_runtime::replica::WorkerReplica>>,
+        replica: &Arc<T>,
     ) -> Result<(), ProtocolError> {
         self.read_replica
-            .set(Arc::downgrade(replica))
+            .set(Box::new(Arc::downgrade(replica)))
             .map_err(|_| capacity())
     }
 
-    pub(crate) fn read_replica(
+    pub(crate) fn read_replica<T: Send + Sync + 'static>(
         &self,
-    ) -> Result<Arc<Mutex<crate::oltp_runtime::replica::WorkerReplica>>, ProtocolError> {
+    ) -> Result<Arc<T>, ProtocolError> {
         self.read_replica
             .get()
+            .and_then(|slot| slot.downcast_ref::<Weak<T>>())
             .and_then(Weak::upgrade)
             .ok_or_else(capacity)
     }
 
-    pub(crate) fn bind_read_queue(
+    pub(crate) fn bind_read_queue<T: Send + Sync + 'static>(
         &self,
-        queue: &Arc<crate::oltp_runtime::coordinator::QueueCoordinator>,
+        queue: &Arc<T>,
     ) -> Result<(), ProtocolError> {
         self.read_queue
-            .set(Arc::downgrade(queue))
+            .set(Box::new(Arc::downgrade(queue)))
             .map_err(|_| capacity())
     }
 
-    pub(crate) fn read_queue(
+    pub(crate) fn read_queue<T: Send + Sync + 'static>(
         &self,
-    ) -> Result<Arc<crate::oltp_runtime::coordinator::QueueCoordinator>, ProtocolError> {
+    ) -> Result<Arc<T>, ProtocolError> {
         self.read_queue
             .get()
+            .and_then(|slot| slot.downcast_ref::<Weak<T>>())
             .and_then(Weak::upgrade)
             .ok_or_else(capacity)
     }
@@ -529,7 +541,7 @@ impl WorkerSharedResources {
         task_bytes: u64,
         work: impl FnOnce() -> Result<T, ProtocolError> + Send + 'static,
     ) -> Result<T, ProtocolError> {
-        use crate::oltp_runtime::stage_timing::perf_stage;
+        use nabedra_resources::perf_stage;
         let started = nabedra_rt::time::now_std();
         let prepared = self.prepare(class).await?;
         let grant = prepared.reserve_compute(request, task_bytes).await?;

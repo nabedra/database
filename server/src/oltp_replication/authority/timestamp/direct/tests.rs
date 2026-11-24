@@ -233,7 +233,7 @@ impl Consensus<TimestampCommand, TimestampReply> for ModelConsensus {
                 .resources()
                 .reserve_scratch_wait(ByteClass::Progress, 64, 0)
                 .await?;
-            Ok(Applied::owned(position, reply.unwrap(), Arc::new(owner)))
+            Ok(crate::oltp_replication::authority::consensus::owned_applied(position, reply.unwrap(), Arc::new(owner)))
         })
     }
     fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {

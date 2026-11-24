@@ -1,180 +1,14 @@
 //! Immutable Status home for an authoritative Timestamp point decision.
 use super::*;
-use crate::oltp_replication::authority::{
-    control::ScopedCatalogRead, status::outcome::MutationValue, timestamp::ScopedTimestampEpoch,
-};
+use nabedra_oltp_types::authority::ScopedCatalogRead;
 
 pub(crate) mod projection;
 
 const HOMES: &[u8] = b"status/timestamp-point-home/";
 pub(crate) const TIMESTAMP_POINT_LOCATOR_REPLY_LIMIT: usize = 4096;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TimestampPointBinding {
-    pub status_group: GroupIdentity,
-    pub timestamps_group: GroupIdentity,
-    pub participant: ParticipantPlan,
-    pub created_authority: Authority,
-    pub txn: TxnId,
-    pub request: RequestBinding,
-    pub pin_identity: PinIdentity,
-    pub storage_pin: StoragePin,
-    pub result_digest: Digest,
-    pub reservation: IdentityReservation,
-    pub original_epoch: ScopedTimestampEpoch,
-    pub original_scope: ScopedCatalogRead,
-    pub catalog_root: Digest,
-}
-
-impl TimestampPointBinding {
-    pub(crate) fn roots(&self) -> Result<(Digest, ManifestRef), ProtocolError> {
-        let status = &self.status_group;
-        let timestamps = &self.timestamps_group;
-        let data = &self.participant.group;
-        let scope = self.original_scope;
-        if status.validate().is_err()
-            || timestamps.validate().is_err()
-            || self.participant.validate().is_err()
-            || !matches!(status.kind, GroupKind::Status { .. })
-            || timestamps.kind != GroupKind::Timestamps
-            || !matches!(data.kind, GroupKind::Data { table_id, .. } if table_id == scope.table_id)
-            || timestamps.cluster_id != status.cluster_id
-            || data.cluster_id != status.cluster_id
-            || timestamps.database != status.database
-            || data.database != status.database
-            || status.group_id == timestamps.group_id
-            || status.group_id == data.group_id
-            || timestamps.group_id == data.group_id
-            || self.participant.write_count != 1
-            || self.participant.page_count != 1
-            || self.created_authority.validate().is_err()
-            || self.created_authority.run_id != self.request.run_id
-            || self.txn.request_id.is_nil()
-            || self.txn.request_id != self.request.request_id
-            || self.txn.attempt != 1
-            || self.pin_identity.run_id != self.request.run_id
-            || self.pin_identity.request_id != self.request.request_id
-            || self.pin_identity.digest != self.request.digest
-            || self.pin_identity.nonce.is_nil()
-            || self.storage_pin.pin_id.is_nil()
-            || self.storage_pin.allocator_epoch == 0
-            || self.storage_pin.read_ts != self.participant.read_ts
-            || scope.request != self.request
-            || scope.queue_group_id != data.group_id
-            || scope.queue_generation.is_nil()
-            || scope.data_generation.is_nil()
-            || scope.queue_view.validate().is_err()
-            || scope.queue_view.run_id != self.request.run_id
-            || scope.read_ts != self.storage_pin.read_ts
-            || !self.matches_reservation(self.reservation)
-            || self.original_epoch.queue_group_id != scope.queue_group_id
-            || self.original_epoch.queue_generation != scope.queue_generation
-            || self.original_epoch.view != scope.queue_view
-            || !self.original_epoch.admits(self.reservation.scoped)
-        {
-            return Err(invalid());
-        }
-        let initial = super::super::super::metadata_digest(
-            b"nabedra/status-scoped-timestamp-point-manifest/v1\0",
-            &(
-                status,
-                timestamps,
-                self.created_authority,
-                self.txn,
-                self.request,
-                &self.pin_identity,
-                self.storage_pin,
-                self.result_digest,
-                self.reservation,
-                self.original_epoch,
-                scope,
-                self.catalog_root,
-            ),
-        )?;
-        Ok((
-            initial,
-            ManifestRef {
-                status_group_id: status.group_id,
-                digest: root_step(initial, &self.participant)?,
-                participant_count: 1,
-            },
-        ))
-    }
-
-    pub(crate) fn matches_scope(&self, mut scope: ScopedCatalogRead) -> bool {
-        if scope.queue_view.validate().is_err()
-            || scope.data_generation.is_nil()
-            || scope.queue_view.run_id != self.original_scope.queue_view.run_id
-            || scope.queue_view.owner_term < self.original_scope.queue_view.owner_term
-            || scope.queue_view.membership_revision
-                < self.original_scope.queue_view.membership_revision
-            || (scope.queue_view.owner_term == self.original_scope.queue_view.owner_term
-                && (scope.queue_view != self.original_scope.queue_view
-                    || scope.data_generation != self.original_scope.data_generation))
-        {
-            return false;
-        }
-        // Callers authenticate the replacement placement at its current fence.
-        scope.queue_view = self.original_scope.queue_view;
-        scope.data_generation = self.original_scope.data_generation;
-        scope == self.original_scope
-    }
-
-    pub(crate) fn accepts_authority(&self, authority: Authority) -> bool {
-        authority.run_id == self.created_authority.run_id
-            && authority.owner_term >= self.created_authority.owner_term
-    }
-
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.status_group.database.capacity_bytes()
-            + self.timestamps_group.database.capacity_bytes()
-            + self.participant.group.database.capacity_bytes()
-    }
-
-    fn matches_reservation(&self, reservation: IdentityReservation) -> bool {
-        reservation == self.reservation
-            && reservation.kind == RequestKind::Mutation
-            && reservation.binds(self.request)
-            && reservation.reservation_id == self.pin_identity.nonce
-            && ScopedStatusEpoch::from_scope(self.original_scope)
-                .admits(reservation.scoped, self.status_group.group_id)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TimestampDecisionLocator {
-    pub binding: TimestampPointBinding,
-    pub manifest: ManifestRef,
-}
-
-impl TimestampDecisionLocator {
-    pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
-        if self.binding.roots()?.1 != self.manifest {
-            return Err(invalid());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn digest(&self) -> Result<Digest, ProtocolError> {
-        self.validate()?;
-        super::super::super::metadata_digest(b"nabedra/timestamp-point-home/v1\0", self)
-    }
-
-    pub(crate) fn matches_seal(&self, seal: &PreparedParticipant) -> bool {
-        self.binding.txn == seal.txn
-            && self.manifest == seal.manifest
-            && self.binding.participant == seal.participant
-            && self.binding.accepts_authority(seal.authority)
-            && self.binding.result_digest == seal.result_digest
-            && projection::valid_position(seal.sealed_at)
-    }
-
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.binding.heap_bytes()
-    }
-}
+pub(crate) use nabedra_oltp_types::authority::{TimestampDecisionLocator, TimestampPointBinding};
+pub(crate) use nabedra_oltp_types::authority::valid_outcome;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -210,16 +44,6 @@ pub(crate) enum TimestampPointHome {
     Absent,
     Legacy,
     Installed(LocatedTimestampManifest),
-}
-
-pub(crate) fn valid_outcome(
-    outcome: &MutationOutcome,
-    expected: Digest,
-) -> Result<bool, ProtocolError> {
-    Ok(matches!(
-        outcome,
-        MutationOutcome::Success(MutationValue::Changed(true))
-    ) && outcome.digest()? == expected)
 }
 
 pub(crate) fn mode_conflict() -> ProtocolError {

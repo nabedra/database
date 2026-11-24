@@ -1,5 +1,6 @@
 //! Protocol records and identities shared between OLTP components.
 
+pub mod authority;
 mod identity;
 pub mod owned;
 pub mod types;

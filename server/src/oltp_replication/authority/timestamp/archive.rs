@@ -3,7 +3,7 @@
 pub(crate) mod metadata;
 pub(crate) mod point;
 use super::*;
-use crate::oltp::backup::BackupOwnerRef;
+use nabedra_oltp_types::authority::BackupOwnerRef;
 use crate::oltp::pool::ByteClass;
 use crate::oltp_replication::{
     authority::status::{MutationOutcome, StatusService},
@@ -17,28 +17,7 @@ const PAGE_BUDGET: TransactionBudget = TransactionBudget {
     output_bytes: 128 << 10,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ArchiveClosureStatement {
-    pub timestamps: GroupIdentity,
-    pub status: GroupIdentity,
-    pub authority: Authority,
-    pub owner: BackupOwnerRef,
-    pub pin: StoragePin,
-    pub archive_id: uuid::Uuid,
-    pub base_exclusive: Option<CommitTs>,
-    pub status_applied_at: AppliedPosition,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity_count: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity_root: Option<Digest>,
-    pub committed_count: u64,
-    pub decision_root: Digest,
-    pub allocation_count: u64,
-    pub allocation_root: Digest,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub point_history: Option<PointArchiveCut>,
-}
+pub(crate) use nabedra_oltp_types::authority::ArchiveClosureStatement;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SealedArchiveClosure {

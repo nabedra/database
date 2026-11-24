@@ -1177,7 +1177,7 @@ impl Consensus<ControlCommand, ControlReply> for NativeModelConsensus {
                     .resources()
                     .reserve_scratch(ByteClass::Progress, 4096)?,
             );
-            Ok(Applied::owned(position, decode(result.as_ref())?, owner))
+            Ok(crate::oltp_replication::authority::consensus::owned_applied(position, decode(result.as_ref())?, owner))
         })
     }
     fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {

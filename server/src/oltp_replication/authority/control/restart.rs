@@ -107,6 +107,16 @@ impl RestartMountKey {
     }
 }
 
+impl crate::oltp::pool::mount::RestartMountKeyProof for RestartMountKey {
+    fn from_mount_seed(seed: &[u8; 32]) -> Result<Self, ProtocolError> {
+        Self::from_seed(seed)
+    }
+
+    fn public_key(&self) -> Digest {
+        self.public_key()
+    }
+}
+
 fn invalid() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::Unauthorized,

@@ -110,7 +110,7 @@ impl VerifiedNativeRestore {
             reader.verify_complete()?;
             file.sync_all().map_err(|_| unknown())?;
             file.rewind().map_err(|_| unknown())?;
-            let mut reader = HistoryReader::new(&mut file)?;
+            let mut reader = HistoryReader::new(identity_metadata_step, &mut file)?;
             let mut group = None;
             let mut split = SplitTranscript::default();
             let mut point_transcript = point_history::PointTranscript::default();
@@ -230,7 +230,7 @@ impl VerifiedNativeRestore {
                 history_root: origin.history_root,
                 cut: origin.cut,
             };
-            let mut reader = HistoryReader::new(file)?;
+            let mut reader = HistoryReader::new(identity_metadata_step, file)?;
             let mut group = None;
             let mut split = None;
             let mut status = None;

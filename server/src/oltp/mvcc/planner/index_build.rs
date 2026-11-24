@@ -4,7 +4,7 @@ use crate::oltp::mvcc::index::{
     IndexAttemptClosedRecord, IndexClosedKind, IndexPhase, IndexProgress, IndexRecord, closure_id,
     progress_id,
 };
-use crate::oltp_replication::types::MaintenanceOwnerRef;
+use nabedra_oltp_types::types::MaintenanceOwnerRef;
 impl NativePlanner {
     pub(crate) async fn plan_index_progress(
         &self,

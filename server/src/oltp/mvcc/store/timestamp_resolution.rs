@@ -1,15 +1,13 @@
 //! Native Data settlement and exact evidence for a Timestamp decision home.
 use super::*;
-use crate::{
-    oltp::pool::{ByteClass, GroupRead, ScratchLease},
-    oltp_replication::{
-        authority::{
-            consensus::Applied, control::ScopedCatalogRead,
-            timestamp::point_decision::PointDecision,
-        },
-        types::AbortReason,
-    },
+use super::consensus::Applied;
+use crate::oltp::pool::{ByteClass, GroupRead};
+use nabedra_oltp_types::{
+    authority::{PointDecision, ScopedCatalogRead},
+    types::AbortReason,
 };
+
+pub(crate) use nabedra_oltp_types::authority::{SealedTimestampPointDecision, TimestampPointResolution};
 
 const REJECTION: u8 = b'j';
 const COMPLETION: u8 = b'P';
@@ -231,107 +229,6 @@ pub(super) fn apply_rejection(
     commit(tx, &ParticipantReply::TimestampPointRejected(position))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SealedTimestampPointDecision {
-    decision: PointDecision,
-    digest: Digest,
-}
-
-impl SealedTimestampPointDecision {
-    pub(crate) fn locator(&self) -> &TimestampDecisionLocator {
-        self.decision.locator()
-    }
-
-    fn digest(decision: &PointDecision) -> Result<Digest, ProtocolError> {
-        hash(b"nabedra/mvcc-timestamp-point-decision/v1\0", decision)
-    }
-
-    pub(super) fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.decision.heap_bytes()
-    }
-
-    pub(crate) fn from_verified(
-        verified: crate::oltp_replication::service_rpc::VerifiedTimestampPointDecision,
-    ) -> Result<(Self, Arc<ScratchLease>), ProtocolError> {
-        let (decision, owner) = verified.into_parts();
-        decision.verify_locator(decision.locator())?;
-        let digest = Self::digest(&decision)?;
-        Ok((Self { decision, digest }, owner))
-    }
-
-    fn validate_for(&self, locator: &TimestampDecisionLocator) -> Result<(), ProtocolError> {
-        self.decision.verify_locator(locator)?;
-        if Self::digest(&self.decision)? != self.digest {
-            return Err(recovery_unknown());
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TimestampPointResolution {
-    proof: SealedTimestampPointDecision,
-    completed_at: AppliedPosition,
-}
-
-impl TimestampPointResolution {
-    pub(crate) fn decision(&self) -> &PointDecision {
-        &self.proof.decision
-    }
-
-    pub(crate) fn completed_at(&self) -> AppliedPosition {
-        self.completed_at
-    }
-
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.decision().heap_bytes()
-    }
-
-    pub(crate) fn validate_for(
-        &self,
-        locator: &TimestampDecisionLocator,
-    ) -> Result<(), ProtocolError> {
-        self.proof.validate_for(locator)?;
-        let before = match self.decision().decision() {
-            TxnDecision::Commit { .. } => Some(self.decision().resolution_seal()?),
-            TxnDecision::Abort {
-                reason: AbortReason::Conflict,
-            } => Some(
-                self.decision()
-                    .rejection_at()
-                    .ok_or_else(recovery_unknown)?,
-            ),
-            TxnDecision::Abort {
-                reason: AbortReason::AbandonedByFence,
-            } => None,
-            TxnDecision::Abort { .. } => return Err(recovery_unknown()),
-        };
-        if !valid_position(self.completed_at)
-            || before.is_some_and(|before| {
-                self.completed_at.index <= before.index || self.completed_at.term < before.term
-            })
-        {
-            return Err(recovery_unknown());
-        }
-        Ok(())
-    }
-
-    fn evidence(&self) -> ResolutionEvidence {
-        let locator = self.proof.locator();
-        let binding = &locator.binding;
-        ResolutionEvidence {
-            group: binding.participant.group.clone(),
-            txn: binding.txn,
-            request: binding.request,
-            manifest: locator.manifest,
-            decision: self.decision().decision(),
-            completed_at: self.completed_at,
-        }
-    }
-}
-
 pub(super) fn apply_resolution(
     tx: &mut GroupTransaction<'_>,
     group: &GroupIdentity,
@@ -346,9 +243,9 @@ pub(super) fn apply_resolution(
     let original = binding.created_authority;
     proof.validate_for(locator)?;
     if &binding.participant.group != group
-        || authority.owner_term < proof.decision.authority().owner_term
-        || (authority.owner_term == proof.decision.authority().owner_term
-            && authority != proof.decision.authority())
+        || authority.owner_term < proof.decision().authority().owner_term
+        || (authority.owner_term == proof.decision().authority().owner_term
+            && authority != proof.decision().authority())
         || match scope {
             Some(scope) => !matches_scope(locator, scope) || authority.run_id != original.run_id,
             None => {
@@ -364,7 +261,7 @@ pub(super) fn apply_resolution(
     let completion_key = txn_key(COMPLETION, txn);
     let resolution_key = txn_key(b'd', txn);
     let rollback_key = txn_key(b'b', txn);
-    let decision = proof.decision.decision();
+    let decision = proof.decision().decision();
     let mut state = load::<Txn>(tx, &key)?;
     match decision {
         TxnDecision::Commit { .. } if rejection_exists(tx, txn)? => {
@@ -374,7 +271,7 @@ pub(super) fn apply_resolution(
             reason: AbortReason::Conflict,
         } => {
             let rejection = load(tx, &txn_key(REJECTION, txn))?.ok_or_else(recovery_unknown)?;
-            verify_rejection(locator, &proof.decision, &rejection)?;
+            verify_rejection(locator, proof.decision(), &rejection)?;
             if state.is_some() {
                 return Err(recovery_unknown());
             }
@@ -389,9 +286,9 @@ pub(super) fn apply_resolution(
         completed.validate_for(locator)?;
         let resolution = load::<ResolutionEvidence>(tx, &resolution_key)?;
         let rollback = load::<Digest>(tx, &rollback_key)?;
-        if &completed.proof != proof
+        if completed.proof() != proof
             || resolution.as_ref() != Some(&evidence)
-            || !at_or_before(completed.completed_at, position)
+            || !at_or_before(completed.completed_at(), position)
         {
             return Err(recovery_unknown());
         }
@@ -417,16 +314,13 @@ pub(super) fn apply_resolution(
 
     if matches!(decision, TxnDecision::Commit { .. }) {
         let state = state.as_ref().ok_or_else(recovery_unknown)?;
-        let seal = check_seal(locator, state, proof.decision.authority())?;
-        if seal.sealed_at != proof.decision.resolution_seal()? {
+        let seal = check_seal(locator, state, proof.decision().authority())?;
+        if seal.sealed_at != proof.decision().resolution_seal()? {
             return Err(recovery_unknown());
         }
     }
 
-    let completed = TimestampPointResolution {
-        proof: proof.clone(),
-        completed_at: position,
-    };
+    let completed = TimestampPointResolution::new(proof.clone(), position);
     completed.validate_for(locator)?;
     encoded_length(&completed, METADATA_BYTES).map_err(|_| recovery_unknown())?;
     if let Some(state) = &mut state {
@@ -436,7 +330,7 @@ pub(super) fn apply_resolution(
         tx.put_serialized(&key, state)?;
     }
     if matches!(decision, TxnDecision::Abort { .. }) {
-        tx.put_serialized(&rollback_key, &proof.digest)?;
+        tx.put_serialized(&rollback_key, &proof.proof_digest())?;
     }
     let evidence = completed.evidence();
     tx.put_serialized(&completion_key, &completed)?;
@@ -512,10 +406,10 @@ fn check_completion_state(
         }
         TxnDecision::Abort {
             reason: AbortReason::Conflict,
-        } if rollback == Some(completed.proof.digest) && state.is_none() => {}
+        } if rollback == Some(completed.proof().proof_digest()) && state.is_none() => {}
         TxnDecision::Abort {
             reason: AbortReason::AbandonedByFence,
-        } if rollback == Some(completed.proof.digest) => {}
+        } if rollback == Some(completed.proof().proof_digest()) => {}
         _ => return Err(recovery_unknown()),
     }
     Ok(())
@@ -546,7 +440,7 @@ pub(super) fn read_completion(
         _ => {}
     }
     if evidence != completed.evidence()
-        || !at_or_before(completed.completed_at, applied)
+        || !at_or_before(completed.completed_at(), applied)
         || view.pinned(&txn_key(RESOLUTION_WITNESS, txn))?.is_some()
     {
         return Err(recovery_unknown());

@@ -3,7 +3,7 @@
 use super::{handle::rejected, *};
 use crate::{
     oltp_replication::{
-        authority::{consensus::Applied, control::ScopedQueuePlacement, status::ScopedAdmission},
+        authority::{consensus::Applied, control::ScopedQueuePlacement},
         multiplex::{Purpose, ReceivedReply},
         owned::serialized_digest,
         proof::hash,
@@ -12,60 +12,7 @@ use crate::{
 };
 use uuid::Uuid;
 
-const SCOPED_EPOCH_PREFIX: &[u8] = b"ts/scoped-retirement-epoch/";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ScopedTimestampEpoch {
-    pub queue_group_id: Uuid,
-    pub queue_generation: Uuid,
-    pub view: AuthorityView,
-    placement: Digest,
-}
-
-impl ScopedTimestampEpoch {
-    pub(crate) fn from_placement(placement: &ScopedQueuePlacement) -> Result<Self, ProtocolError> {
-        placement.validate(&placement.group)?;
-        Ok(Self {
-            queue_group_id: placement.group.group_id,
-            queue_generation: placement.queue_generation,
-            view: placement.view,
-            placement: serialized_digest(&("nabedra/scoped-terminal/placement-v1", placement))?,
-        })
-    }
-
-    pub(super) fn key(self) -> [u8; SCOPED_EPOCH_PREFIX.len() + 48] {
-        let mut key = [0; SCOPED_EPOCH_PREFIX.len() + 48];
-        let offset = SCOPED_EPOCH_PREFIX.len();
-        key[..offset].copy_from_slice(SCOPED_EPOCH_PREFIX);
-        key[offset..offset + 16].copy_from_slice(self.queue_group_id.as_bytes());
-        key[offset + 16..offset + 32].copy_from_slice(self.queue_generation.as_bytes());
-        key[offset + 32..].copy_from_slice(self.view.run_id.as_bytes());
-        key
-    }
-
-    pub(super) fn valid(self) -> bool {
-        !self.queue_group_id.is_nil()
-            && !self.queue_generation.is_nil()
-            && self.view.validate().is_ok()
-    }
-
-    pub(crate) fn admits(self, admission: Option<ScopedAdmission>) -> bool {
-        admission.is_some_and(|admission| {
-            admission.protocol_version == ScopedAdmission::VERSION
-                && admission.queue_group_id == self.queue_group_id
-                && admission.queue_generation == self.queue_generation
-        })
-    }
-
-    pub(crate) fn advances(self, old: Self) -> bool {
-        self.queue_group_id == old.queue_group_id
-            && self.queue_generation == old.queue_generation
-            && self.view.run_id == old.view.run_id
-            && self.view.owner_term > old.view.owner_term
-            && self.view.membership_revision >= old.view.membership_revision
-    }
-}
+pub(crate) use nabedra_oltp_types::authority::ScopedTimestampEpoch;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

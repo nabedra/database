@@ -101,7 +101,7 @@ impl ParticipantEndpoint {
             {
                 return Err(unavailable());
             }
-            let response = Applied::owned(
+            let response = crate::oltp_replication::authority::consensus::owned_applied(
                 first.completed_at,
                 ParticipantReply::Resolved {
                     next_ordinal: writes,
@@ -196,7 +196,7 @@ impl ParticipantClient {
             ) {
                 return Err(unavailable());
             }
-            Ok(Applied::owned(value.position, value.reply, owner))
+            Ok(crate::oltp_replication::authority::consensus::owned_applied(value.position, value.reply, owner))
         })
         .await
         .map_err(|_| unavailable())?
