@@ -12,7 +12,7 @@ reverts = "2df6cd9aefeeeed22d56a2c5cf87cebded9f54df"
 port = "hand"
 port_notes = """
 The fix conflicts in five files. This ports its decision point, raft_sender in
-server/src/oltp_replication/typed_network.rs: `if replaying_history || membership...` goes back to
+typed_network.rs of nabedra-oltp-replication: `if replaying_history || membership...` goes back to
 `if membership.nodes().next().is_none()`, so a learner replaying a historical membership refuses
 bootstrap voters it does not list ("sender is outside enrolled replica membership"). The
 catch_up_before plumbing stays and `replaying_history` becomes an unused variable (a warning).

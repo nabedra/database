@@ -28,14 +28,18 @@ scenario = "O15"
 mode = "on"
 timeout_s = 3600
 failure_contains = ["registered startup ValidationError: worker does not host target replica node", "AssertionError: ['RF3 cold run']"]
-# O15 is a timing window and has NOT re-verified this patch since the crate split.
-# - Before it: 1 of 5 patched runs failed (run 45148928008 failed with direct_oltp on at 3998c378
-#   with "worker does not host target replica node", and passed with it off; run 45150522656
-#   passed 3 of 3 attempts). The clean run was 45148935717 at 53a5716f.
+# This patch is NOT shown to be sensitive: O15 is a timing window and no test has failed because of
+# the patch since the crate split.
+# - Before it: 1 of at most 5 patched runs failed (run 45148928008 failed with direct_oltp on at
+#   3998c378 with "worker does not host target replica node", and passed with it off; run
+#   45150522656 allowed 3 attempts, none failed and the last passed, and its log did not list them).
+#   The clean run was 45148935717 at 53a5716f.
 # - After it: oltp-sim-bugs-regression-acc3 at 5953e85 (run 45413905217) allowed 10 attempts and
 #   none failed. The unpatched side passed all 10. That run's log did not list the patched
-#   attempts, so it shows no failure and a passing last attempt, not ten passes.
+#   attempts, so it shows no failure and a passing last attempt, not ten passes. Run 45422532178
+#   at a7292e3 listed every attempt: 10 of 10 patched and 10 of 10 unpatched passed.
 # The old runs are not recorded as [regression.evidence]: their digest was for the old path, and
-# the re-verification that would justify a new one did not fail. A clean port needs no evidence,
-# and the cold workload's seed search has to detect this patch.
+# the re-verification that would justify a new one did not fail. `check` accepts a clean port
+# without evidence. By lead decision 8 a simulator hit on this patch does not count until a test
+# fails because of it. sim_bugs.py run does not enforce that yet.
 attempts = 10
