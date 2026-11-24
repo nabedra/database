@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "land-harness-ba6158c-140607--events-sim-planted.log",
+      "sha256": "49885bbefb2a96661c40ceca758da4b9a57f5ad6866a05dcceff58bc264662dc"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "events-sim-planted",
+  "duration_s": 83.182,
+  "guarantees": [],
+  "kind": "S H",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T13:09:02.447111+00:00",
+    "request_id": "land-harness-ba6158c-140607",
+    "runner": "GitHub Actions 1000011263",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45399946283"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "ba6158cf7c26716e966736e64ebb2b7070814282",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
