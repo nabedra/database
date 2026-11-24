@@ -85,7 +85,8 @@ MANIFEST_FIELDS = {
 REQUIRED = MANIFEST_FIELDS.keys() - {"port_notes", "found_seed", "detection"}
 # A reviewed diagnosis of one hit: its identity, and how its history and trace show the reverted
 # fix's mechanism rather than another defect that reports the same kind.
-DETECTION_FIELDS = {"seed": int, "trace_hash": str, "history_sha256": str, "mechanism": str}
+DETECTION_FIELDS = {"seed": int, "trace_hash": str, "history_sha256": str, "mechanism": str,
+                    "detector": str}
 REGRESSION_FIELDS = {"kind": str, "test": str, "scenario": str, "mode": str,
                      "failure_contains": list, "timeout_s": int, "attempts": int, "evidence": dict}
 EVIDENCE_FIELDS = {"digest": str, "patched": dict, "clean": dict}
@@ -296,6 +297,8 @@ def validate_manifest(bug, records, known_guarantees, require_evidence=True):
     if record is None:
         problems.append(f"bug {m['bug']!r} has no record in {RECORDS_DIR}")
     else:
+        if record.get("status") == "open":
+            problems.append(f"bug {m['bug']!r} is open; it has no fix to revert")
         if record.get("class") != m["class"]:
             problems.append(f"class {m['class']!r} differs from the bug record's {record.get('class')!r}")
         for key in ("guarantees", "scenarios", "fix_commits"):
@@ -304,6 +307,8 @@ def validate_manifest(bug, records, known_guarantees, require_evidence=True):
                 problems.append(f"{key} {extra} are not in the bug record")
     if "detection" in m:
         typed(problems, "detection", m["detection"], DETECTION_FIELDS, DETECTION_FIELDS)
+        if m["detection"].get("detector") not in m["expect"]:
+            problems.append("detection.detector must be one of expect: the check that found the bug")
         if not m["detection"].get("mechanism", "").strip():
             problems.append("detection.mechanism must say how the history shows the reverted fix")
     problems.extend(validate_regression(bug, require_evidence))
@@ -949,8 +954,10 @@ def search_bug(args, scratch, env, log, bug, plan, out_dir, clean_exe):
         row.update(result="candidate", why="no reviewed mechanism is recorded for this hit")
     elif any(detection[key] != value for key, value in identity.items()):
         row.update(result="candidate", why="the recorded mechanism is for another hit")
+    elif detection["detector"] not in patched.kinds:
+        row.update(result="candidate", why=f"{detection['detector']} did not report this hit")
     else:
-        row.update(result="found", mechanism=detection["mechanism"])
+        row.update(result="found", mechanism=detection["mechanism"], detector=detection["detector"])
     return row
 
 

@@ -87,7 +87,7 @@ patched = "fixed" not in Path("../src/lib.rs").read_text()
 with open(env["FAKE_CALLS"], "a") as calls:
     calls.write(json.dumps({"patched": patched, "first": first, "count": count,
                             "expect": env.get("NABEDRA_SIM_EXPECT"), "defect": env.get("NABEDRA_SIM_DEFECT"),
-                            "profile": env.get("NABEDRA_SIM_PROFILE")}) + "\\n")
+                            "profile": env.get("NABEDRA_SIM_PROFILE"), "workload": workload}) + "\\n")
 kind = env.get("NABEDRA_SIM_EXPECT", "NotAppliedNeverCommitted").split(",")[0]
 def kinds(seed, replay=False):
     if workload == "smoke":
@@ -328,6 +328,12 @@ class SimBugsTest(unittest.TestCase):
         self.f.write_bug(self.f.manifest().replace('class = "uncertain-outcome"', 'class = "other"'))
         self.assert_check(1, "differs from the bug record")
 
+    def test_open_record_has_no_fix_to_revert(self):
+        # sim_bugs reads the TOML itself, so a malformed open record that lists a SHA must fail here.
+        record = self.f.repo / "docs/testing/bugs/2026-11-23-fix-one.toml"
+        record.write_text(record.read_text() + 'status = "open"\n')
+        self.assert_check(1, "bug 'FIX-ONE' is open; it has no fix to revert")
+
     def test_unknown_fields_shas_and_missing_tests(self):
         self.f.write_bug(self.f.manifest(surprise="x"))
         self.assert_check(1, "unknown field surprise")
@@ -376,6 +382,7 @@ class SimBugsTest(unittest.TestCase):
     def record_detection(self, hit, **changes):
         history = json.dumps({"seed": hit, "patched": True}) + "\n"
         detection = {"seed": hit, "trace_hash": "%016x" % (hit * 7919 + 1), "mechanism": "the lost reply",
+                     "detector": "NotAppliedNeverCommitted",
                      "history_sha256": hashlib.sha256(history.encode()).hexdigest(), **changes}
         table = "".join(f"{key} = {json.dumps(value)}\n" for key, value in detection.items())
         self.f.write_bug(self.f.manifest() + "[detection]\n" + table)
@@ -392,6 +399,8 @@ class SimBugsTest(unittest.TestCase):
                 status, output, _, _ = self.harness_run(hit=3)
                 self.assertEqual(status, 1, output)
                 self.assertIn("the recorded mechanism is for another hit", output)
+        self.record_detection(3, detector="failed-write-observed")
+        self.assert_check(1, "detection.detector must be one of expect")
         self.record_detection(3, mechanism=" ")
         self.assert_check(1, "detection.mechanism must say how")
 
@@ -426,7 +435,10 @@ class SimBugsTest(unittest.TestCase):
                          [(True, 1, 5, "NotAppliedNeverCommitted"), (True, 3, 1, None), (False, 3, 1, None),
                           (False, 1, 3, "NotAppliedNeverCommitted")])
         self.assertTrue(all(c["defect"] is None and c["profile"] == "lost-reply" for c in calls))
+        # The twin and the control run the search's own workload and profile.
+        self.assertEqual({(c["workload"], c["profile"]) for c in calls}, {("direct", "lost-reply")})
         row = summary["bugs"][0]
+        self.assertEqual(row["detector"], "NotAppliedNeverCommitted")
         self.assertEqual((summary["mode"], summary["evidence"], row["result"], row["found_seed"], row["tried"]),
                          ("evidence", "fault-model", "found", 3, 3))
         self.assertEqual(row["patch_sha256"], hashlib.sha256(self.f.patch.encode()).hexdigest())
