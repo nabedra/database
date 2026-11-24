@@ -1,0 +1,11 @@
+id = "sim-faults-hash-cache"
+module = "sim"
+kinds = ["S"]
+guarantees = []
+scenarios = []
+tiers = ["weekly"]
+command = ["bash", "scripts/testing/sim_faults_hash.sh", "cache", "b9ca8e1daf75825a6e27b9361f886a68d5b8e8a3"]
+cwd = "."
+timeout_s = 9000
+needs = []
+result_parser = "exit-code"
