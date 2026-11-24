@@ -133,7 +133,7 @@ hot_paths = [
   "server/src/oltp/pool/**",
   "server/src/oltp/codec.rs",
   "server/src/oltp_replication/typed_log/**",
-  "server/src/oltp_replication/multiplex/**",
+  "server/transport/src/**",
   "server/protocol/src/protocol.rs",
 ]
 

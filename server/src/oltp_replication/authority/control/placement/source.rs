@@ -208,7 +208,7 @@ impl VerifiedRemoteRetirement {
         verify(control, plan, &value.stamp, &value.signature)?;
         Ok(Self {
             attestation: value,
-            _owner: reply.scratch.clone(),
+            _owner: reply.scratch_lease(),
         })
     }
 

@@ -1,15 +1,53 @@
 use super::*;
-use crate::{
-    config::WorkerResources,
-    oltp::pool::SharedResourceConfig,
-    oltp_replication::types::{Text, WorkerEnrollment},
+use nabedra_oltp_types::types::{Text, WorkerEnrollment};
+use nabedra_resources::{
+    config::WorkerResources, memory::SharedResourceConfig, scheduling::ResourceScheduler,
 };
 use std::{future::ready, path::PathBuf, pin::Pin, sync::mpsc};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc as async_mpsc, oneshot};
 
 mod sessions;
-#[path = "../../../../tests/support/tls.rs"]
 mod tls;
+
+pub(super) struct TestMemory(Arc<WorkerMemory>);
+
+impl Deref for TestMemory {
+    type Target = WorkerMemory;
+
+    fn deref(&self) -> &WorkerMemory {
+        &self.0
+    }
+}
+
+impl ResourceOwner for TestMemory {
+    fn worker_memory(&self) -> &Arc<WorkerMemory> {
+        &self.0
+    }
+
+    fn bind_worker(self: &Arc<Self>, _: Uuid) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
+
+pub(super) fn test_memory(node: u64, config: SharedResourceConfig) -> Arc<TestMemory> {
+    let limits = WorkerResources::default();
+    let scheduler = ResourceScheduler::new(vec![(node, limits)]).unwrap();
+    let memory = Arc::new(
+        WorkerMemory::new(
+            config,
+            scheduler,
+            node,
+            limits.task_memory_limit_bytes as usize,
+            0,
+        )
+        .unwrap(),
+    );
+    let owner = Arc::new(TestMemory(memory));
+    let erased: Arc<dyn std::any::Any + Send + Sync> = owner.clone();
+    owner.bind_owner(Arc::downgrade(&erased));
+    owner
+}
 
 const GONE: &str = "removed-worker.example:443";
 const OTHER: &str = "other-worker.example:443";
@@ -77,17 +115,140 @@ fn identity() -> WorkerIdentity {
 }
 
 #[test]
+fn reply_header_checks_bounds_before_deserializing() {
+    let worker = test_memory(1, SharedResourceConfig::default());
+    let resources = MemoryHandle::new(worker);
+    let local = identity();
+    let group = GroupIdentity {
+        cluster_id: nabedra_rt::ids::uuid_v4(),
+        database: "reply-bounds".try_into().unwrap(),
+        group_id: nabedra_rt::ids::uuid_v4(),
+        kind: GroupKind::Control,
+        group_format_version: 1,
+    };
+    let reply = |bytes: &[u8], budget| ReceivedReply {
+        reply: ChargedReply {
+            header: resources.copy_bytes_in(ByteClass::Data, bytes).unwrap(),
+            sections: [None, None, None],
+        },
+        scratch: Arc::new(resources.reserve_scratch(ByteClass::Data, budget).unwrap()),
+        session: AuthenticatedSession::for_test(
+            local,
+            local,
+            group.clone(),
+            Purpose::Authority,
+            nabedra_rt::ids::uuid_v4(),
+        ),
+        resources: resources.clone(),
+    };
+    for (bytes, budget, message) in [
+        (
+            vec![b'1'; MAX_HEADER_BYTES + 1],
+            8192,
+            "RPC reply header exceeds JSON bounds",
+        ),
+        (vec![b'['; 33], 8192, "RPC reply header exceeds JSON bounds"),
+        (
+            b"1".to_vec(),
+            4096,
+            "RPC reply decode reservation is too small",
+        ),
+        (b"invalid".to_vec(), 8192, "invalid RPC reply header"),
+    ] {
+        let error = reply(&bytes, budget)
+            .decode_header::<u64>()
+            .err()
+            .expect("invalid reply header");
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        assert_eq!(error.outcome, Outcome::NotApplied);
+        assert_eq!(error.message, message);
+    }
+    assert_eq!(*reply(b"1", 4098).decode_header::<u64>().unwrap(), 1);
+}
+
+#[test]
+fn o05_c07_sections_keep_decode_and_wire_charges_until_drop() {
+    let owner = test_memory(1, SharedResourceConfig::default());
+    let other = test_memory(2, SharedResourceConfig::default());
+    let usage = || {
+        (
+            owner.buffer_bytes_used(ByteClass::Data),
+            owner.working_decode_bytes(),
+        )
+    };
+    let baseline = usage();
+    let body = b"123";
+    let budget = json_decode_budget(body).unwrap();
+    let sections = |body| {
+        ChargedSections::for_test(
+            &owner,
+            ByteClass::Data,
+            [
+                Some(owner.copy_bytes_in(ByteClass::Data, body).unwrap()),
+                None,
+                None,
+            ],
+            budget,
+        )
+        .unwrap()
+    };
+
+    let decoded = sections(body).decode::<u64>(0).unwrap();
+    assert_eq!(*decoded, 123);
+    assert_eq!(usage(), (baseline.0 + body.len(), baseline.1 + budget));
+    drop(decoded);
+    assert_eq!(usage(), baseline);
+
+    assert!(sections(b"bad").decode::<u64>(0).is_err());
+    assert_eq!(usage(), baseline);
+
+    assert!(sections(body).reserve_decode(&other, budget).is_err());
+    assert_eq!(usage(), baseline);
+}
+
+#[test]
+fn lane_refusal_keeps_the_server_rpc_trace_target() {
+    struct EventTarget(mpsc::Sender<&'static str>);
+
+    impl tracing::Subscriber for EventTarget {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.0.send(event.metadata().target()).unwrap();
+        }
+    }
+
+    let (send, receive) = mpsc::channel();
+    tracing::subscriber::with_default(EventTarget(send), || {
+        LaneRefusals::default().outgoing(TrafficClass::ApiIngress, true);
+    });
+    assert_eq!(
+        receive.try_recv().unwrap(),
+        "nabedra_database_server::oltp_replication::multiplex::transport",
+    );
+}
+
+#[test]
 fn o05_m02_failed_replica_reservation_releases_unused_group_capacity() {
-    let shared = WorkerSharedResources::new(
+    let shared = test_memory(
         1,
-        WorkerResources::default(),
         SharedResourceConfig {
             max_resident_groups: 2,
             precharge_group_capacity: true,
             ..Default::default()
         },
-    )
-    .unwrap();
+    );
     let registry = EndpointRegistry::new(shared.clone());
     let first = GroupIdentity {
         cluster_id: nabedra_rt::ids::uuid_v4(),
@@ -250,28 +411,53 @@ async fn o14_o22_c07_f03_hostname_lookup_owns_slots_across_cancellations() {
     assert_eq!(resolver.active_for_test(), [0, 0]);
 }
 
-#[derive(Default)]
-struct TestDirectory(
-    Mutex<BTreeMap<Uuid, WorkerEnrollment>>,
-    Mutex<Vec<WorkerIdentity>>,
-);
+struct TestDirectory {
+    workers: Mutex<BTreeMap<Uuid, WorkerEnrollment>>,
+    apis: Mutex<Vec<WorkerIdentity>>,
+    revoked: Mutex<Vec<WorkerIdentity>>,
+    changes: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for TestDirectory {
+    fn default() -> Self {
+        Self {
+            workers: Mutex::default(),
+            apis: Mutex::default(),
+            revoked: Mutex::default(),
+            changes: tokio::sync::watch::channel(0).0,
+        }
+    }
+}
 
 impl TestDirectory {
     fn install(&self, item: WorkerEnrollment) {
-        self.0.lock().unwrap().insert(item.worker_id, item);
+        self.workers.lock().unwrap().insert(item.worker_id, item);
     }
     fn install_api(&self, item: WorkerEnrollment) {
-        self.1.lock().unwrap().push(WorkerIdentity::from(&item));
+        self.apis.lock().unwrap().push(WorkerIdentity::from(&item));
         self.install(item);
+    }
+    fn revoke(&self, peer: WorkerIdentity) {
+        self.revoked.lock().unwrap().push(peer);
+        self.changes.send_modify(|revision| *revision += 1);
     }
 }
 
 impl PeerDirectory for TestDirectory {
     fn is_api(&self, peer: WorkerIdentity) -> bool {
-        self.1.lock().unwrap().contains(&peer)
+        self.apis.lock().unwrap().contains(&peer)
     }
     fn resolve(&self, worker: Uuid) -> Result<WorkerEnrollment, ProtocolError> {
-        self.0
+        if self
+            .revoked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|peer| peer.worker_id == worker)
+        {
+            return Err(unavailable());
+        }
+        self.workers
             .lock()
             .unwrap()
             .get(&worker)
@@ -285,10 +471,21 @@ impl PeerDirectory for TestDirectory {
         _group: &GroupIdentity,
         _purpose: Purpose,
     ) -> Result<TransportTrust, ProtocolError> {
+        if self.revoked(peer) {
+            return Err(revoked_peer());
+        }
         if WorkerIdentity::from(&self.resolve(peer.worker_id)?) != peer {
             return Err(malformed("worker differs from test enrollment"));
         }
         Ok(TransportTrust::AppliedEnrollment)
+    }
+
+    fn revoked(&self, peer: WorkerIdentity) -> bool {
+        self.revoked.lock().unwrap().contains(&peer)
+    }
+
+    fn trust_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.changes.subscribe())
     }
 }
 
@@ -359,16 +556,9 @@ impl Endpoint for RejectProbe {
 /// settle. Local resolver contention must not contribute to its miss streak.
 #[tokio::test]
 async fn r05_f03_queue_probe_resolver_contention_is_indeterminate() {
-    use crate::{
-        oltp_replication::types::{AuthorityView, ReadyMembership},
-        oltp_runtime::{
-            replica::QueueScope,
-            worker_endpoint::{PeerReachability, QueuePeerClient, QueueRequest},
-        },
-    };
-
-    let temp =
-        TestDirectoryPath(std::env::temp_dir().join(format!("probe-dns-{}", nabedra_rt::ids::uuid_v4())));
+    let temp = TestDirectoryPath(
+        std::env::temp_dir().join(format!("probe-dns-{}", nabedra_rt::ids::uuid_v4())),
+    );
     std::fs::create_dir(&temp.0).unwrap();
     let tls = tls::certificates(&temp.0, 2);
     let group = GroupIdentity {
@@ -377,19 +567,6 @@ async fn r05_f03_queue_probe_resolver_contention_is_indeterminate() {
         group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Control,
         group_format_version: 1,
-    };
-    let scope = QueueScope {
-        cluster_id: group.cluster_id,
-        database: group.database.clone(),
-    };
-    let ready = ReadyMembership {
-        view: AuthorityView {
-            run_id: nabedra_rt::ids::uuid_v4(),
-            owner_term: 1,
-            membership_revision: 1,
-        },
-        ready_root: Digest::from_bytes([1; 32]),
-        ready_count: 2,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (resolver, mut lookup) =
@@ -413,12 +590,7 @@ async fn r05_f03_queue_probe_resolver_contention_is_indeterminate() {
     }
 
     let transport = |local: &WorkerEnrollment, node, index: usize| {
-        let shared = WorkerSharedResources::new(
-            node,
-            WorkerResources::default(),
-            SharedResourceConfig::default(),
-        )
-        .unwrap();
+        let shared = test_memory(node, SharedResourceConfig::default());
         let registry = Arc::new(EndpointRegistry::new(shared.clone()));
         WorkerTransport::new(
             local,
@@ -439,10 +611,17 @@ async fn r05_f03_queue_probe_resolver_contention_is_indeterminate() {
         .unwrap();
     let mut caller = transport(&caller, 1, 0);
     Arc::get_mut(&mut caller.common).unwrap().resolver = resolver;
-    let queue =
-        QueuePeerClient::new(caller.client(), caller.common.shared.clone(), group.clone()).unwrap();
-    let probe =
-        |peer: &WorkerEnrollment| queue.probe(WorkerIdentity::from(peer), scope.clone(), ready);
+    let client = caller.client();
+    let probe_header = || {
+        caller
+            .common
+            .shared
+            .encode_in(ByteClass::Progress, &"ping", 1024)
+            .unwrap()
+    };
+    let probe = |peer: &WorkerEnrollment| {
+        client.request_queue_probe(&group, WorkerIdentity::from(peer), probe_header(), 4096)
+    };
     let (stop, shutdown) = oneshot::channel();
     let worker = nabedra_rt::task::spawn(receiver.run(listener, async {
         let _ = shutdown.await;
@@ -456,20 +635,9 @@ async fn r05_f03_queue_probe_resolver_contention_is_indeterminate() {
         }
         assert_eq!(caller.common.resolver.active_for_test(), [0, 2]);
         for _ in 0..3 {
-            assert_eq!(probe(&live).await, PeerReachability::Indeterminate);
+            assert!(matches!(probe(&live).await, Err(RequestError::Protocol(error)) if error.code == ErrorCode::StorageUnavailable));
         }
-        let header = caller
-            .common
-            .shared
-            .encode_in(
-                ByteClass::Progress,
-                &QueueRequest::Ping {
-                    scope: scope.clone(),
-                    view: ready.view,
-                },
-                1024,
-            )
-            .unwrap();
+        let header = probe_header();
         assert!(matches!(
             caller
                 .client()
@@ -487,34 +655,39 @@ async fn r05_f03_queue_probe_resolver_contention_is_indeterminate() {
         assert!(lookup.started.try_recv().is_err());
 
         lookup.release(OTHER);
-        assert_eq!(probe(&second).await, PeerReachability::Unreachable);
+        assert!(matches!(probe(&second).await, Err(RequestError::Unreachable)));
         assert_eq!(caller.common.resolver.active_for_test(), [0, 1]);
-        assert_eq!(probe(&alias).await, PeerReachability::Indeterminate);
+        assert!(matches!(probe(&alias).await, Err(RequestError::Protocol(error)) if error.code == ErrorCode::StorageUnavailable));
         assert!(lookup.started.try_recv().is_err());
 
         let mut waiter = Box::pin(probe(&first));
         assert_pending(waiter.as_mut()).await;
-        assert_eq!(waiter.await, PeerReachability::Indeterminate);
+        assert!(matches!(waiter.await, Err(RequestError::Protocol(error)) if error.code == ErrorCode::StorageUnavailable));
         assert_eq!(caller.common.resolver.active_for_test(), [0, 1]);
         lookup.release(GONE);
-        assert_eq!(probe(&first).await, PeerReachability::Unreachable);
+        assert!(matches!(probe(&first).await, Err(RequestError::Unreachable)));
         assert_eq!(caller.common.resolver.active_for_test(), [0, 0]);
 
-        assert_eq!(probe(&live).await, PeerReachability::Reachable);
+        assert!(matches!(
+            probe(&live).await,
+            Err(RequestError::PeerRejected { worker, .. }) if worker == WorkerIdentity::from(&live)
+        ));
         lookup.next(LIVE).await;
     })
     .await
     .unwrap();
     stop.send(()).unwrap();
     worker.await.unwrap().unwrap();
-    assert_eq!(probe(&live).await, PeerReachability::Unreachable);
+    assert!(matches!(probe(&live).await, Err(RequestError::Unreachable)));
 }
 
 /// O14/O22/C07/F03. Numeric and hostname targets use real authenticated
 /// transport while both ordinary DNS slots remain occupied.
 #[tokio::test]
 async fn o14_o22_c07_f03_mtls_progress_survives_held_hostname_lookups() {
-    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("peer-dns-{}", nabedra_rt::ids::uuid_v4())));
+    let temp = TestDirectoryPath(
+        std::env::temp_dir().join(format!("peer-dns-{}", nabedra_rt::ids::uuid_v4())),
+    );
     std::fs::create_dir(&temp.0).unwrap();
     let tls = tls::certificates(&temp.0, 2);
     let group = GroupIdentity {
@@ -544,12 +717,7 @@ async fn o14_o22_c07_f03_mtls_progress_survives_held_hostname_lookups() {
     }
 
     let transport = |local: &WorkerEnrollment, node, index: usize| {
-        let shared = WorkerSharedResources::new(
-            node,
-            WorkerResources::default(),
-            SharedResourceConfig::default(),
-        )
-        .unwrap();
+        let shared = test_memory(node, SharedResourceConfig::default());
         let registry = Arc::new(EndpointRegistry::new(shared.clone()));
         WorkerTransport::new(
             local,
@@ -658,8 +826,9 @@ async fn o14_o22_c07_f03_mtls_progress_survives_held_hostname_lookups() {
 /// then uses the first available slot without blocking other Authority reads.
 #[tokio::test]
 async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
-    let temp =
-        TestDirectoryPath(std::env::temp_dir().join(format!("authority-{}", nabedra_rt::ids::uuid_v4())));
+    let temp = TestDirectoryPath(
+        std::env::temp_dir().join(format!("authority-{}", nabedra_rt::ids::uuid_v4())),
+    );
     std::fs::create_dir(&temp.0).unwrap();
     let tls = tls::certificates(&temp.0, 2);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -681,12 +850,7 @@ async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
     config.handler_slots[authority] = 2;
     config.preflight_slots[authority] = 1;
     let transport = |local, node, index: usize| {
-        let shared = WorkerSharedResources::new(
-            node,
-            WorkerResources::default(),
-            SharedResourceConfig::default(),
-        )
-        .unwrap();
+        let shared = test_memory(node, SharedResourceConfig::default());
         let registry = Arc::new(EndpointRegistry::new(shared.clone()));
         WorkerTransport::new(
             local,
@@ -804,82 +968,6 @@ async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
     worker.await.unwrap().unwrap();
 }
 
-/// RV-FINAL L1, C07, M02, LIVE1 (5 peers): caller slots of one class are
-/// capped across peer lanes at `OUTGOING_CLASS_LANES` lanes' worth. A paused
-/// peer fills only its own lane, so the others keep sending (LIVE1); four
-/// full lanes reach the class cap, and a fifth peer's empty lane is refused
-/// locally instead of adding a lane of in-flight calls per peer. Other
-/// classes (Control consensus) are not affected.
-#[tokio::test]
-async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
-    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("lanes-{}", nabedra_rt::ids::uuid_v4())));
-    std::fs::create_dir(&temp.0).unwrap();
-    let tls = tls::certificates(&temp.0, 1);
-    let local = WorkerEnrollment {
-        worker_id: nabedra_rt::ids::uuid_v4(),
-        incarnation: nabedra_rt::ids::uuid_v4(),
-        enrollment_revision: 1,
-        certificate_sha256: Digest::parse(tls[0].certificate_sha256()).unwrap(),
-        endpoint: Text::new("127.0.0.1:1".to_owned()).unwrap(),
-        server_name: Text::try_from("localhost").unwrap(),
-    };
-    let peers = Arc::new(TestDirectory::default());
-    peers.install(local.clone());
-    let config = TransportConfig::default();
-    let shared = WorkerSharedResources::new(
-        1,
-        WorkerResources::default(),
-        SharedResourceConfig::default(),
-    )
-    .unwrap();
-    let registry = Arc::new(EndpointRegistry::new(shared.clone()));
-    let transport =
-        WorkerTransport::new(&local, &tls[0], shared, peers, registry, config.clone()).unwrap();
-    let client = transport.client();
-    let class = TrafficClass::DataConsensus;
-    let lane = config.handler_slots[class as usize];
-    let cap = lane * OUTGOING_CLASS_LANES;
-    let targets: Vec<Uuid> = (0..=OUTGOING_CLASS_LANES).map(|_| nabedra_rt::ids::uuid_v4()).collect();
-    let mut held = Vec::new();
-    // A paused peer holds only its own lane.
-    for _ in 0..lane {
-        held.push(client.try_outgoing(targets[0], class).unwrap());
-    }
-    assert!(matches!(
-        client.try_outgoing(targets[0], class),
-        Err(RequestError::OutgoingLaneFull { .. })
-    ));
-    // The other peers still send, up to the class cap.
-    for target in &targets[1..OUTGOING_CLASS_LANES] {
-        for _ in 0..lane {
-            held.push(client.try_outgoing(*target, class).unwrap());
-        }
-    }
-    assert_eq!(held.len(), cap);
-    assert_eq!(
-        transport.common.outgoing_class[class as usize].available_permits(),
-        0
-    );
-    // A fifth peer's lane is empty, but the class is at its cap.
-    let fifth = targets[OUTGOING_CLASS_LANES];
-    assert!(matches!(
-        client.try_outgoing(fifth, class),
-        Err(RequestError::OutgoingLaneFull { .. })
-    ));
-    // Control traffic is never starved by Data consensus.
-    let control = client
-        .try_outgoing(fifth, TrafficClass::ControlConsensus)
-        .unwrap();
-    // A finished call on any lane admits the fifth peer.
-    held.pop();
-    let admitted = client.try_outgoing(fifth, class).unwrap();
-    drop((control, admitted, held));
-    assert_eq!(
-        transport.common.outgoing_class[class as usize].available_permits(),
-        cap
-    );
-}
-
 /// PERF1 (O03, D01): a direct request that finds its leader's lane full
 /// waits for a slot, in arrival order, until its deadline, instead of being
 /// refused at once. Waiting callers hold at most one slot less than the lane,
@@ -888,7 +976,9 @@ async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
 /// local, not-applied `OutgoingLaneFull`.
 #[tokio::test]
 async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
-    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("lanes-{}", nabedra_rt::ids::uuid_v4())));
+    let temp = TestDirectoryPath(
+        std::env::temp_dir().join(format!("lanes-{}", nabedra_rt::ids::uuid_v4())),
+    );
     std::fs::create_dir(&temp.0).unwrap();
     let tls = tls::certificates(&temp.0, 1);
     let local = WorkerEnrollment {
@@ -902,12 +992,7 @@ async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
     let peers = Arc::new(TestDirectory::default());
     peers.install(local.clone());
     let config = TransportConfig::default();
-    let shared = WorkerSharedResources::new(
-        1,
-        WorkerResources::default(),
-        SharedResourceConfig::default(),
-    )
-    .unwrap();
+    let shared = test_memory(1, SharedResourceConfig::default());
     let registry = Arc::new(EndpointRegistry::new(shared.clone()));
     let transport =
         WorkerTransport::new(&local, &tls[0], shared, peers, registry, config.clone()).unwrap();
@@ -986,7 +1071,9 @@ async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
 /// `/v1/runtime/stats`; a waiting Authority probe that later succeeds is not.
 #[tokio::test]
 async fn ns11_f8_lane_full_refusals_are_counted_per_class() {
-    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("refusals-{}", nabedra_rt::ids::uuid_v4())));
+    let temp = TestDirectoryPath(
+        std::env::temp_dir().join(format!("refusals-{}", nabedra_rt::ids::uuid_v4())),
+    );
     std::fs::create_dir(&temp.0).unwrap();
     let tls = tls::certificates(&temp.0, 1);
     let local = WorkerEnrollment {
@@ -1000,12 +1087,7 @@ async fn ns11_f8_lane_full_refusals_are_counted_per_class() {
     let peers = Arc::new(TestDirectory::default());
     peers.install(local.clone());
     let config = TransportConfig::default();
-    let shared = WorkerSharedResources::new(
-        1,
-        WorkerResources::default(),
-        SharedResourceConfig::default(),
-    )
-    .unwrap();
+    let shared = test_memory(1, SharedResourceConfig::default());
     let registry = Arc::new(EndpointRegistry::new(shared.clone()));
     let transport =
         WorkerTransport::new(&local, &tls[0], shared, peers, registry, config.clone()).unwrap();

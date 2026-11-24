@@ -26,7 +26,7 @@ use crate::{
 
 mod worker;
 
-pub use worker::{ExecutionClass, GroupCapacityLease, WorkerMemory};
+pub use worker::{ExecutionClass, GroupCapacityLease, ResourceOwner, WorkerMemory};
 #[cfg(feature = "test-hooks")]
 pub use worker::{GROUP_ENDPOINT_BYTES, GROUP_HANDLE_BYTES};
 

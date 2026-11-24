@@ -178,7 +178,7 @@ impl VerifiedRemoteActivation {
         verify(control, plan, &value.activation, &value.signature, key)?;
         Ok(Self {
             attestation: value,
-            _owner: reply.scratch.clone(),
+            _owner: reply.scratch_lease(),
         })
     }
 

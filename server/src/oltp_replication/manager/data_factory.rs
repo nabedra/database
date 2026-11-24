@@ -628,7 +628,7 @@ impl DataGroupClient {
         shared
             .execute(ExecutionClass::Control, member.node_id, 0, move || {
                 let value = serde_json::from_slice(input.as_slice()).map_err(|_| invalid())?;
-                Ok((value, reply.scratch.clone()))
+                Ok((value, reply.scratch_lease()))
             })
             .await
     }
