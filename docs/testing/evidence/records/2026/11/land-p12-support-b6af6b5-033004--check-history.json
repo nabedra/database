@@ -1,0 +1,46 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p12-support-b6af6b5-033004--check-history.log",
+      "sha256": "e6b1c0323a9596db5bdba6847a61f8c25192b5ebb8ad68cfd1adcf9ad4a151c1"
+    }
+  ],
+  "assertions": {
+    "executed": 25,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "check-history",
+  "duration_s": 19.661,
+  "guarantees": [
+    "OLTP-G02",
+    "OLTP-G03",
+    "OLTP-G04",
+    "EVT-G01",
+    "EVT-G02",
+    "EVT-G03",
+    "CACHE-G05"
+  ],
+  "kind": "H",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T03:30:31.995092+00:00",
+    "request_id": "land-p12-support-b6af6b5-033004",
+    "runner": "GitHub Actions 1000009576",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45319937069"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "b6af6b5edd123e6688a14808c9c936c25eea14bd",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
