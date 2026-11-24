@@ -263,7 +263,7 @@ impl HostedGroupManager {
         client: WorkerClient,
         registry: Arc<EndpointRegistry>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let manager = Arc::new(Self {
             shared,
             client,
             registry,
@@ -273,8 +273,32 @@ impl HostedGroupManager {
             damage_sink: Arc::new(Mutex::new(None)),
             health: Arc::default(),
             features: Arc::default(),
-        })
+        });
+        #[cfg(feature = "sim")]
+        manager.register_sim_crash();
+        manager
     }
+
+    #[cfg(feature = "sim")]
+    fn register_sim_crash(self: &Arc<Self>) {
+        if let (Some(world), Some(node)) =
+            (nabedra_rt::sim::world(), nabedra_rt::sim::current_node())
+        {
+            let manager = Arc::downgrade(self);
+            world.observe(Arc::new(move |event| {
+                if matches!(event, nabedra_rt::sim::SimEvent::Crash { node: cut } if *cut == node)
+                    && let Some(manager) = manager.upgrade()
+                {
+                    // Simulating SIGKILL aborts the cores. Release the routing
+                    // graph this process would otherwise keep until it exits.
+                    let routes = std::mem::take(&mut *manager.routes.lock().unwrap());
+                    let sink = manager.damage_sink.lock().unwrap().take();
+                    drop((routes, sink));
+                }
+            }));
+        }
+    }
+
     #[doc(hidden)]
     pub fn resources(&self) -> &Arc<WorkerSharedResources> {
         &self.shared

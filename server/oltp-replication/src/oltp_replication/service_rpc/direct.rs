@@ -269,6 +269,10 @@ pub fn install(
     let key = resources_key(resources);
     let mut entries = registry().lock().unwrap_or_else(|p| p.into_inner());
     entries.retain(|(k, s)| *k != key && s.strong_count() > 0);
+    #[cfg(feature = "sim")]
+    if let Some(world) = nabedra_rt::sim::world() {
+        world.track_registry("DirectService", service);
+    }
     entries.push((key, Arc::downgrade(service)));
 }
 
@@ -304,6 +308,10 @@ pub fn register_replica(handle: &Arc<crate::oltp::mvcc::store::ParticipantHandle
     let key = resources_key(handle.resources());
     let mut entries = replicas().lock().unwrap_or_else(|p| p.into_inner());
     entries.retain(|(_, replica)| replica.strong_count() > 0);
+    #[cfg(feature = "sim")]
+    if let Some(world) = nabedra_rt::sim::world() {
+        world.track_registry("DirectReplica", handle);
+    }
     entries.push((key, Arc::downgrade(handle)));
 }
 
