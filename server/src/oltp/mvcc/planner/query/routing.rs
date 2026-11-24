@@ -206,9 +206,9 @@ impl<'a> RoutingCursor<'a> {
             let Some(id) = self.next_page else {
                 return Ok(None);
             };
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             if self.pages_read == 1 {
-                crate::oltp_growth_acceptance::pause_routing_page(self.pin.read_ts.get()).await;
+                crate::oltp::test_hooks::growth::pause_routing_page(self.pin.read_ts.get()).await;
             }
             self.page = None;
             let (_, page) = value(

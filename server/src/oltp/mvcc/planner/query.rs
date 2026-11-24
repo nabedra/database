@@ -318,8 +318,8 @@ impl NativePlanner {
             order,
             _container: container,
         };
-        #[cfg(test)]
-        if count && crate::oltp_growth_acceptance::count_overflow_requested(pin.read_ts.get()) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if count && crate::oltp::test_hooks::growth::count_overflow_requested(pin.read_ts.get()) {
             state.matched = u64::MAX - 1;
         }
         let (bounds, choice) = match access {
@@ -376,8 +376,8 @@ impl NativePlanner {
                             break;
                         }
                         if let Some(cursor) = cursor {
-                            #[cfg(test)]
-                            crate::oltp_runtime::recovery_tests::transaction_checkpoint(
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            crate::oltp::test_hooks::transaction_checkpoint(
                                 "scan-page",
                                 binding.request_id,
                                 &state.matched,

@@ -384,8 +384,8 @@ impl ParticipantHandle {
         request: ScanRequest,
     ) -> Result<OwnedCommand<ScanPage>, ProtocolError> {
         let _barrier = self.local_consensus().ensure_linearizable().await?;
-        #[cfg(test)]
-        crate::oltp_replication::service_rpc::continuation_fixture::applied(_barrier.applied);
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::oltp::test_hooks::continuation::applied(_barrier.applied);
         self.local_machine()
             .scan_page_with_budget(request, true)
             .await

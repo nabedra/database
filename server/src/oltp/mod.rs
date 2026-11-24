@@ -10,6 +10,8 @@ pub(crate) mod backup;
 pub mod mvcc;
 pub mod pool;
 mod query;
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod test_hooks;
 
 use crate::protocol::{ErrorCode, Outcome, ProtocolError};
 
@@ -19,7 +21,7 @@ pub(crate) fn failure(code: ErrorCode, message: &str) -> ProtocolError {
 
 pub(crate) use nabedra_oltp_types::valid_database;
 
-fn recovery_unknown() -> ProtocolError {
+pub(crate) fn recovery_unknown() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::OutcomeUnknown,
         "OLTP storage requires reopening after an uncertain native write",

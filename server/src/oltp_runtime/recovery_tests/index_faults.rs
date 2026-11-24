@@ -1,24 +1,26 @@
-//! File commands and checkpoints for the mounted index fault test executable.
+//! File commands for the mounted index fault test executable.
 use crate::{
-    oltp::mvcc::{
-        index::{IndexDefinition, IndexRecord},
-        store::lifecycle::LifecycleBinding,
+    oltp::{
+        mvcc::{
+            index::{IndexDefinition, IndexRecord},
+            store::lifecycle::LifecycleBinding,
+        },
+        test_hooks::index_faults::{WATCHDOG, write},
     },
     oltp_replication::types::{GroupIdentity, MaintenanceOwnerRef, PinIdentity, StoragePin, TxnId},
     oltp_runtime::worker_runtime::WorkerRuntime,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use std::{
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 use uuid::Uuid;
 
-const DIRECTORY: &str = "NABEDRA_OLTP_TEST_INDEX_FAULT_DIR";
-const WATCHDOG: Duration = Duration::from_secs(120);
+pub(crate) use crate::oltp::test_hooks::index_faults::observe_attempt;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, tag = "command", rename_all = "snake_case")]
@@ -68,58 +70,6 @@ impl Command {
     }
 }
 
-pub(crate) fn observe_attempt(txn: TxnId, identity: &PinIdentity, pin: StoragePin) {
-    if let Some(directory) = std::env::var_os(DIRECTORY) {
-        write(
-            &PathBuf::from(directory).join(format!("index-attempt-{}.json", txn.request_id)),
-            &json!({"txn": txn, "identity": identity, "pin": pin}),
-        );
-    }
-}
-
-pub(crate) fn observe_lifecycle(binding: &LifecycleBinding) {
-    if let Some(directory) = std::env::var_os(DIRECTORY).map(PathBuf::from) {
-        let request = binding.txn.request_id;
-        if directory
-            .join(format!("inspect-lifecycle-{request}"))
-            .is_file()
-        {
-            write(
-                &directory.join(format!("lifecycle-{request}.json")),
-                binding,
-            );
-        }
-    }
-}
-
-pub(crate) async fn checkpoint(stage: &str, index: Uuid, observed: &impl Serialize) -> bool {
-    let Some(directory) = std::env::var_os(DIRECTORY).map(PathBuf::from) else {
-        return false;
-    };
-    let gate = format!("{index}-{stage}");
-    if !directory.join(format!("hold-{gate}")).is_file() {
-        return false;
-    }
-    let reached = directory.join(format!("index-{gate}.json"));
-    if reached.exists() {
-        return false;
-    }
-    write(&reached, observed);
-    let release = directory.join(format!("release-{gate}"));
-    let deadline = nabedra_rt::time::now() + WATCHDOG;
-    while !release.is_file() {
-        assert!(
-            nabedra_rt::time::now() < deadline,
-            "mounted index checkpoint watchdog expired: {gate}"
-        );
-        nabedra_rt::time::sleep(Duration::from_millis(10)).await;
-    }
-    std::fs::read_to_string(&release)
-        .expect("read mounted index checkpoint release")
-        .trim()
-        == "reject"
-}
-
 pub(in crate::oltp_runtime) async fn serve(runtime: Arc<WorkerRuntime>, directory: PathBuf) {
     let metadata =
         std::fs::symlink_metadata(&directory).expect("stat mounted index fault directory");
@@ -166,14 +116,6 @@ pub(in crate::oltp_runtime) async fn serve(runtime: Arc<WorkerRuntime>, director
         nabedra_rt::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("mounted index fault command directory became unreadable");
-}
-
-fn write(path: &Path, value: &impl Serialize) {
-    let mut temp = path.as_os_str().to_os_string();
-    temp.push(".next");
-    let bytes = serde_json::to_vec(value).expect("encode mounted index observation");
-    std::fs::write(&temp, bytes).expect("write mounted index observation");
-    std::fs::rename(&temp, path).expect("publish mounted index observation");
 }
 
 #[tokio::test(start_paused = true)]
