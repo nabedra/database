@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use super::{
     Scenarios, Workload, clauses,
     clients::{self, Ctx, Plan},
-    cold, moves,
+    cold, moves, paused,
 };
 use crate::{
     bootstrap::{CLIENTS, GATEWAYS, WORKERS},
@@ -30,6 +30,7 @@ pub(crate) const CHAOS: Duration = Duration::from_secs(20);
 /// Bound for convergence after the heal: every retry and the final reads (design 3.6).
 pub(crate) const CONVERGE_LIMIT: Duration = Duration::from_secs(30);
 const SETUP_DEADLINE: Duration = Duration::from_secs(20);
+const CONVERGE_POLL: Duration = Duration::from_millis(100);
 const TICK: Duration = Duration::from_millis(50);
 
 /// What one workload run executed, for the seed's report.
@@ -108,16 +109,20 @@ pub(crate) async fn run(
     if let Some(stop) = staggered {
         // Heal, then stop every worker while the clients still send requests, and reopen
         // the workers staggered. Restarts the nemesis owes would only race the full stop.
-        if let Some(chaos) = chaos.as_mut()
-            && let Err(error) = chaos.heal(cluster, &ctx).await
-        {
-            cluster
-                .checks
-                .violate(&cluster.world, "Liveness", format!("heal: {error}"));
-            return abandon(cluster, &ctx, tasks, report).await;
+        if let Some(chaos) = chaos.as_mut() {
+            if let Err(error) = chaos.heal(cluster, &ctx).await {
+                cluster
+                    .checks
+                    .violate(&cluster.world, "Liveness", format!("heal: {error}"));
+                return abandon(cluster, &ctx, tasks, report).await;
+            }
+            chaos.before_full_stop(cluster, &ctx).await;
         }
         let started = cluster.world.elapsed();
         let cold = stop.run(cluster, &ctx).await;
+        if let Some(chaos) = chaos.as_mut() {
+            chaos.after_full_stop(cluster).await;
+        }
         report
             .assertions
             .push(("cold start within bound", cold.is_ok()));
@@ -158,9 +163,23 @@ pub(crate) async fn run(
             .violate(&cluster.world, "Liveness", format!("heal: {error}"));
         return abandon(cluster, &ctx, tasks, report).await;
     }
+    if let Some(moving) = moving.as_mut() {
+        moving.delay_ended(cluster);
+    }
+    // Convergence may be polled for 30 s after the heal. Everything after it is sent once.
+    let converged = converge(cluster, &ctx, healed + CONVERGE_LIMIT).await;
+    report
+        .assertions
+        .push(("converged after the heal", converged.is_ok()));
+    if let Err(error) = &converged {
+        cluster
+            .checks
+            .violate(&cluster.world, "Liveness", format!("convergence: {error}"));
+    }
     for task in tasks {
         let _ = task.await;
     }
+    cluster.checks.recovered(&cluster.world, "convergence");
     let final_checks = clients::final_checks(&ctx).await;
     report.assertions.push((
         "final writes and reads through both gateways",
@@ -171,11 +190,13 @@ pub(crate) async fn run(
             .checks
             .violate(&cluster.world, "Liveness", error.clone());
     }
-    cluster.checks.recovered(&cluster.world, "convergence");
     let mut reread = false;
     if let Some(chaos) = chaos.as_mut().filter(|chaos| chaos.split_pending()) {
         chaos.finish_split(cluster, &ctx).await;
         reread = true;
+    }
+    if let Some(chaos) = chaos.as_ref() {
+        chaos.check_abandoned(cluster, &ctx).await;
     }
     if let Some(moving) = moving.as_mut() {
         let moved = moving.finish(cluster, &ctx, healed).await;
@@ -213,6 +234,15 @@ pub(crate) async fn run(
             format!("request unresolved {CONVERGE_LIMIT:?} after the heal: {request}"),
         );
     }
+    if paused::selected(config, workload) {
+        if converged.is_ok() && final_checks.is_ok() && cluster.converged().await {
+            let observed = paused::run(cluster, &ctx, config.deadline()).await;
+            report.scenarios.extend(observed);
+        } else {
+            cluster.record("D05 not run: the cluster did not converge".into());
+        }
+    }
+
     let no_quorum = cluster.no_quorum();
     let drops = chaos.as_ref().map(Chaos::session_drops).unwrap_or_default();
     let outcome = clauses::Evidence {
@@ -223,6 +253,7 @@ pub(crate) async fn run(
         reuse_other_key: observed.reuse_other_key,
         session_drops: &drops,
         no_quorum: &no_quorum,
+        delayed: moving.as_ref().and_then(moves::Move::delayed),
         deadline_ms: config.deadline().as_millis() as u64,
     }
     .evaluate();
@@ -262,10 +293,28 @@ pub(crate) async fn run(
         "reuse_other_key": observed.reuse_other_key,
         "not_applied_checks": observed.not_applied_checks,
         "unresolved": observed.unresolved.len(),
+        "one_paused_late": outcome.one_paused_late,
         "heal_cold_start": chaos.as_ref().is_some_and(|chaos| chaos.heal_cold),
     });
     cluster.record(format!("workload summary {}", report.summary));
     Ok(report)
+}
+
+/// Poll until every worker and gateway reports the run ready with the direct path active, and
+/// a read of one key succeeds through each gateway.
+async fn converge(cluster: &Cluster, ctx: &Ctx, deadline: Duration) -> Result<(), String> {
+    loop {
+        let state = if cluster.converged().await {
+            clients::read_each(ctx).await
+        } else {
+            Err("some worker or gateway is not ready".into())
+        };
+        match state {
+            Ok(()) => return Ok(()),
+            Err(error) if cluster.world.elapsed() >= deadline => return Err(error),
+            Err(_) => time::sleep(CONVERGE_POLL).await,
+        }
+    }
 }
 
 /// The run cannot converge: stop the clients and keep the violations already recorded.

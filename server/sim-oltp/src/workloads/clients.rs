@@ -222,7 +222,7 @@ pub(crate) struct Request {
     payload: Value,
     input: Value,
     anchor: i64,
-    id: Uuid,
+    pub(crate) id: Uuid,
 }
 
 impl Request {
@@ -246,7 +246,7 @@ impl Request {
         }
     }
 
-    fn row(name: &'static str, table: &str, key: i64, value: i64, id: Uuid) -> Self {
+    pub(crate) fn row(name: &'static str, table: &str, key: i64, value: i64, id: Uuid) -> Self {
         let row = json!({"id": key, "value": value});
         Self {
             name,
@@ -407,7 +407,7 @@ pub(crate) async fn attempt(
     completion
 }
 
-fn unknown(completion: &Completion) -> bool {
+pub(crate) fn unknown(completion: &Completion) -> bool {
     match completion {
         Completion::Ok(_) => false,
         Completion::Refused(error) => error.outcome == Outcome::Unknown,
@@ -742,7 +742,22 @@ pub(crate) async fn final_checks(ctx: &Ctx) -> Result<(), String> {
     ))
 }
 
-fn failure(completion: &Completion) -> Option<String> {
+/// One read of key 1 through each gateway, not retried.
+pub(crate) async fn read_each(ctx: &Ctx) -> Result<(), String> {
+    let mut client = ctx.new_client();
+    for (index, gateway) in GATEWAYS.into_iter().enumerate() {
+        let node = CLIENTS[index % CLIENTS.len()];
+        let id = in_node(node, async { uuid_v4() }).await;
+        let request = Request::get(&ctx.table, 1, id);
+        let completion = attempt(ctx, &mut client, node, gateway, &request, false).await;
+        if let Some(why) = failure(&completion) {
+            return Err(format!("read of key 1 through n{gateway}: {why}"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn failure(completion: &Completion) -> Option<String> {
     match completion {
         Completion::Ok(_) => None,
         Completion::Refused(error) => Some(format!("{:?} {}", error.code, error.message)),

@@ -539,8 +539,14 @@ impl Cluster {
         }
         if self.prepared.contains(&node) {
             // Control holds one preparation at a time, so a process that did not come up
-            // starts again from the bootstrap file it already has, as a supervisor does.
-            return self.start_prepared(index, how).await;
+            // starts again from the bootstrap file it already has, as a supervisor does. Once
+            // that process has enrolled, the preparation is spent and a fresh one is needed.
+            let connection = self.admin("cluster.connection", json!({})).await?;
+            if !self.enrolled(index, &connection) {
+                return self.start_prepared(index, how).await;
+            }
+            self.record(format!("n{node} enrolled before it stopped: prepare again"));
+            self.prepared.remove(&node);
         }
         let survivors: Vec<u64> = WORKERS
             .into_iter()
@@ -574,6 +580,13 @@ impl Cluster {
         );
         self.prepared.insert(node);
         self.start_prepared(index, how).await
+    }
+
+    /// Whether Control lists the enrollment that worker `index` was prepared with.
+    fn enrolled(&self, index: usize, connection: &Value) -> bool {
+        connection["control_peers"]
+            .as_array()
+            .is_some_and(|peers| peers.contains(self.config.worker_enrollment(index)))
     }
 
     async fn start_prepared(&mut self, index: usize, how: DiskCut) -> Result<(), String> {

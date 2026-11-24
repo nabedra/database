@@ -46,6 +46,10 @@ fn run(
 ) -> RunResult {
     let workload = setup.workloads.of(seed);
     let mut config = Config::sample(seed);
+    if workloads::paused::samples(seed, workload) || setup.selection.focus.d05 {
+        let deadline = workloads::paused::DEADLINE.as_millis() as u64;
+        config.force("request_deadline_ms", json!(deadline));
+    }
     if setup.selection.focus.batch {
         config.force("data.direct.batch", json!(true));
     }

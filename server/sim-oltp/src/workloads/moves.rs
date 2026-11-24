@@ -30,8 +30,8 @@ use crate::{
     node::Cluster,
 };
 
-/// Where the secondary volume is mounted on the moving worker.
-pub(crate) const EXTENSION: &str = "/sim-oltp-ext";
+/// Where the secondary volumes of the moving worker are mounted, one per growth claim.
+const EXTENSION: &str = "/sim-oltp-ext";
 const FINISH_LIMIT: Duration = Duration::from_secs(60);
 const RETRY: Duration = Duration::from_millis(500);
 /// One move request may run as long as the acceptance test allows it.
@@ -47,6 +47,17 @@ enum State {
     Retired,
 }
 
+/// One growth claim. It names the worker's incarnation, so a worker that restarts before the
+/// claim completes needs another claim and another volume. Until then retries keep its IDs.
+struct Claim {
+    identity: Value,
+    path: String,
+    policy_id: Uuid,
+    pool_id: Uuid,
+    claim: Uuid,
+    move_id: Uuid,
+}
+
 pub(crate) struct Move {
     start_ms: u64,
     /// The scheduler owner that gets the new pool, once it is known.
@@ -56,6 +67,10 @@ pub(crate) struct Move {
     next_ms: u64,
     last_error: String,
     faults: Option<NetFaults>,
+    claim: Option<Claim>,
+    claims: u32,
+    /// When the old voters' frames were delayed, in virtual ms.
+    delayed: Option<(u64, Option<u64>)>,
 }
 
 impl Move {
@@ -68,6 +83,23 @@ impl Move {
             next_ms: 0,
             last_error: String::new(),
             faults: None,
+            claim: None,
+            claims: 0,
+            delayed: None,
+        }
+    }
+
+    /// The window in which the old voters' frames were delayed: a fault like any other for
+    /// the assertions that need an otherwise healthy cluster.
+    pub(crate) fn delayed(&self) -> Option<(u64, u64)> {
+        self.delayed
+            .map(|(from, to)| (from, to.unwrap_or(u64::MAX)))
+    }
+
+    /// The heal cleared every network window.
+    pub(crate) fn delay_ended(&mut self, cluster: &Cluster) {
+        if let Some((_, to)) = &mut self.delayed {
+            to.get_or_insert(elapsed_ms(&cluster.world));
         }
     }
 
@@ -78,7 +110,8 @@ impl Move {
     /// The second pool's node and device once it is mounted.
     pub(crate) fn second_pool(&self, world: &World) -> Option<SecondPool> {
         let node = self.node?;
-        let info = world.volume_info(node, Path::new(EXTENSION))?;
+        let path = &self.claim.as_ref()?.path;
+        let info = world.volume_info(node, Path::new(path))?;
         Some((node, info.dev))
     }
 
@@ -112,6 +145,7 @@ impl Move {
                 if let Some(faults) = &self.faults {
                     let old: Vec<u64> = WORKERS.into_iter().filter(|old| *old != node).collect();
                     faults.slow(Some((old, self.delay)));
+                    self.delayed = Some((elapsed_ms(&cluster.world), None));
                 }
                 cluster.record(format!("move {id} prepared on n{node}: {payload}"));
                 self.state = State::Moving {
@@ -146,6 +180,7 @@ impl Move {
                         faults.slow(None);
                     }
                     self.state = State::Retired;
+                    self.delay_ended(cluster);
                     Ok(())
                 } else {
                     Err(format!("move {id} phase {}", result["phase"]))
@@ -157,7 +192,7 @@ impl Move {
 
     /// Mount and enroll the secondary pool, then build the move request.
     async fn prepare(
-        &self,
+        &mut self,
         cluster: &mut Cluster,
         ctx: &Ctx,
         node: u64,
@@ -176,8 +211,36 @@ impl Move {
                 )
             })
             .collect();
-        let ids = in_node(BOOTSTRAP_CLIENT, async { [(); 4].map(|()| uuid_v4()) }).await;
-        let [policy_id, pool_id, claim, move_id] = ids;
+        if self
+            .claim
+            .as_ref()
+            .is_none_or(|claim| claim.identity != identity)
+        {
+            let ids = in_node(BOOTSTRAP_CLIENT, async { [(); 4].map(|()| uuid_v4()) }).await;
+            let [policy_id, pool_id, claim, move_id] = ids;
+            self.claims += 1;
+            let path = match self.claims {
+                1 => EXTENSION.to_owned(),
+                claims => format!("{EXTENSION}-{claims}"),
+            };
+            self.claim = Some(Claim {
+                identity: identity.clone(),
+                path,
+                policy_id,
+                pool_id,
+                claim,
+                move_id,
+            });
+        }
+        let Claim {
+            path,
+            policy_id,
+            pool_id,
+            claim,
+            move_id,
+            ..
+        } = self.claim.as_ref().expect("growth claim");
+        let (policy_id, pool_id, claim, move_id) = (*policy_id, *pool_id, *claim, *move_id);
         let policy = json!({
             "policy_id": policy_id, "volume_cost_per_gib": 1, "worker_cost": 1,
             "initial_monthly_spend": 0, "monthly_spend_ceiling": 30, "max_attempts": 3,
@@ -188,11 +251,11 @@ impl Move {
         cluster
             .admin("storage.growth.configure", json!({"policy": policy}))
             .await?;
-        if cluster.world.volume(node, Path::new(EXTENSION)).is_none() {
-            cluster.world.mount(node, EXTENSION);
+        if cluster.world.volume(node, Path::new(path)).is_none() {
+            cluster.world.mount(node, path);
         }
         let mount = in_node(node, async {
-            cluster.config.secondary_pool(worker, EXTENSION, pool_id)
+            cluster.config.secondary_pool(worker, path, pool_id)
         })
         .await
         .map_err(|error| format!("write the secondary volume marker: {error}"))?;
@@ -226,6 +289,7 @@ impl Move {
         if mounted["phase"] != "complete" {
             return Err(format!("secondary pool not mounted: {mounted}"));
         }
+        cluster.config.list_secondary_pool(worker, &mount, claim);
         let (group, placement) = placement(cluster, ctx).await?;
         let members = placement["members"].as_array().cloned().unwrap_or_default();
         let source = members

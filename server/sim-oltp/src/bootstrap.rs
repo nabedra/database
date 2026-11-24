@@ -327,8 +327,8 @@ impl Bootstrap {
     /// marker on the calling node's volume.
     pub fn secondary_pool(&self, index: usize, path: &str, pool_id: Uuid) -> io::Result<Value> {
         let node = WORKERS[index];
-        let volume = format!("sim-oltp-{node}-ext");
-        let marker = uuid_v4();
+        let volume = format!("sim-oltp-{node}{}", path.replace('/', "-"));
+        let marker = pool_id;
         let file = format!("{path}/.nabedra-docker-volume.json");
         let mut out = os::OpenOptions::new()
             .create(true)
@@ -354,6 +354,32 @@ impl Bootstrap {
             "provider_volume_id": format!("docker-volume:{volume}"),
             "filesystem_uuid": "",
         }))
+    }
+
+    /// List a mounted secondary pool in the worker's bootstrap file. A restarted worker opens
+    /// only the pools its bootstrap lists, so a restart without this entry can never host the
+    /// replicas that live there.
+    pub fn list_secondary_pool(&mut self, index: usize, mount: &Value, claim: Uuid) {
+        self.worker_configs[index]["node"]["secondary_pools"] =
+            json!([{"mount": mount, "growth_claim": claim}]);
+    }
+
+    /// Move a node's secondary pool mounts to the worker identity of its next process.
+    fn advance_secondary(node: &mut Value, worker: &Value) {
+        let pools = node
+            .get_mut("secondary_pools")
+            .and_then(Value::as_array_mut);
+        for pool in pools.into_iter().flatten() {
+            let mount = &mut pool["mount"];
+            let generation = mount["generation"].as_u64().unwrap();
+            mount["worker"] = worker.clone();
+            mount["generation"] = json!(generation + 1);
+        }
+    }
+
+    /// The enrollment the worker's bootstrap file presents.
+    pub fn worker_enrollment(&self, index: usize) -> &Value {
+        &self.worker_configs[index]["node"]["enrollment"]
     }
 
     /// A retained same-run restart of one worker, as `retained_config` in
@@ -395,6 +421,7 @@ impl Bootstrap {
         if let Some(fields) = node.as_object_mut() {
             fields.remove("cold");
         }
+        Self::advance_secondary(node, &identity);
         let mount = &mut node["mount"];
         let generation = mount["generation"].as_u64().unwrap();
         mount["worker"] = identity;
@@ -417,6 +444,7 @@ impl Bootstrap {
             enrollment["enrollment_revision"] = json!(revision + 1);
             enrollment["incarnation"] = json!(uuid_v4());
             let worker = Self::identity(enrollment);
+            Self::advance_secondary(node, &worker);
             let mount = &mut node["mount"];
             let generation = mount["generation"].as_u64().unwrap();
             mount["worker"] = worker;
