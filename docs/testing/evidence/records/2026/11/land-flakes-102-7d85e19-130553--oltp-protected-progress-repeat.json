@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "land-flakes-102-7d85e19-130553--oltp-protected-progress-repeat.log",
+      "sha256": "06dcdcfec7f32a8a5bf6fb0d612822382262b962958bda8331286c2ff51782cf"
+    }
+  ],
+  "assertions": {
+    "executed": 600,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-protected-progress-repeat",
+  "duration_s": 2375.391,
+  "guarantees": [],
+  "kind": "R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T12:06:08.061695+00:00",
+    "request_id": "land-flakes-102-7d85e19-130553",
+    "runner": "GitHub Actions 1000011146",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45390230031"
+  },
+  "scenarios": [
+    "O22"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "7d85e1927db57762443e945e9c2fed44060e0b68",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
