@@ -365,26 +365,6 @@ pub(super) fn retire_on_cold_fence(tx: &mut GroupTransaction<'_>) -> Result<(), 
     Ok(())
 }
 
-fn revocation_capacity_available(tx: &mut GroupTransaction<'_>) -> Result<bool, ProtocolError> {
-    let mut count = 0;
-    let mut after = None;
-    loop {
-        let mut next = None;
-        let page = tx.scan_page(REVOKED_WORKERS, after.as_deref(), 128, |key, _| {
-            count += 1;
-            next = Some(key.to_vec());
-            Ok(())
-        })?;
-        if count >= MAX_REVOCATIONS {
-            return Ok(false);
-        }
-        if page.exhausted {
-            return Ok(true);
-        }
-        after = next;
-    }
-}
-
 fn certificate_unused(
     tx: &mut GroupTransaction<'_>,
     certificate: Digest,
@@ -517,9 +497,6 @@ fn mount(
         || !covers_every_group(tx, &record, defer_data)?
     {
         return fault(Fault::Stale);
-    }
-    if hardened && !revocation_capacity_available(tx)? {
-        return fault(Fault::Busy);
     }
     let next_revision = state
         .enrollment_revision

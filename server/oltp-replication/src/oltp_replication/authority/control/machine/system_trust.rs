@@ -5,10 +5,6 @@ use crate::oltp_replication::{
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{Mutex, mpsc};
 
-// REP4 could commit one revocation past its limit before refresh stopped the
-// Raft core. Read that durable record on upgrade, while refusing new mounts.
-const MAX_RETAINED_REVOCATIONS: usize = system_recovery::MAX_REVOCATIONS + 1;
-
 #[derive(Clone)]
 pub(super) struct ReplacementTrust {
     pub(super) directory: Arc<AppliedPeerDirectory>,
@@ -61,7 +57,7 @@ impl ControlMachine {
                             after.as_deref(),
                             128,
                             |key, bytes| {
-                                if revoked.len() == MAX_RETAINED_REVOCATIONS {
+                                if revoked.len() == system_recovery::MAX_REVOCATIONS {
                                     return Err(unknown());
                                 }
                                 revoked.push(decode::<WorkerIdentity>(bytes)?);
@@ -149,7 +145,7 @@ impl ControlMachine {
         mut self,
         directory: Arc<AppliedPeerDirectory>,
     ) -> Result<Self, ProtocolError> {
-        directory.reserve_revocations(MAX_RETAINED_REVOCATIONS)?;
+        directory.reserve_revocations(system_recovery::MAX_REVOCATIONS)?;
         directory.require_revocation_snapshot();
         let (retry, mut pending) = mpsc::channel(1);
         let order = Arc::new(Mutex::new(()));
