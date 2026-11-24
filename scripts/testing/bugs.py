@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Validate historical bug records or print their Markdown counts."""
+"""Validate bug records, including open bugs without a fix, or print their Markdown counts."""
 
 import argparse
 from collections import Counter
+from datetime import date, datetime, timezone
 from pathlib import Path
 import re
 import subprocess
@@ -33,6 +34,9 @@ STRING_FIELDS = (
     "invariant_added",
 )
 LIST_FIELDS = ("guarantees", "scenarios", "fix_commits")
+OPEN_FIELDS = ("owner", "expires")
+NOT_AN_OWNER = ("unknown", "unassigned", "none", "tbd")
+ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 GUARANTEE_ID = re.compile(r"(?:OLTP|OLAP|OLAP-STR|EVT|CACHE|LSM|ORM|SCHED)-G[0-9]{2}")
 REGISTER_ROW = re.compile(r"^\|\s*([A-Z][A-Z-]*-G[0-9]{2})\s*\|", re.MULTILINE)
 
@@ -46,7 +50,53 @@ def register_ids(directory):
 SHA = re.compile(r"[0-9a-f]{40}")
 
 
-def check_fields(record, known_ids=None):
+def utc_today():
+    return datetime.now(timezone.utc).date()
+
+
+def is_open(record):
+    """An open bug has no fix. It never counts as fixed, replayed or detected."""
+    return record.get("status") == "open"
+
+
+def check_open(record, today):
+    """Return the errors in the fields that mark a bug as open."""
+    if "status" not in record:
+        return [
+            f'{field} is only valid on a record with status = "open"'
+            for field in OPEN_FIELDS
+            if field in record
+        ]
+    if not is_open(record):
+        return [f'unknown status {record["status"]!r}; use "open", or omit it for a fixed bug']
+    errors = []
+    owner = record.get("owner")
+    if not isinstance(owner, str) or owner.strip().casefold() in ("", *NOT_AN_OWNER):
+        errors.append("an open record must name an owner")
+    expires = record.get("expires")
+    try:
+        if not isinstance(expires, str) or not ISO_DATE.fullmatch(expires):
+            raise ValueError
+        expiry = date.fromisoformat(expires)
+    except ValueError:
+        errors.append('an open record must have an expires date, as a "YYYY-MM-DD" string')
+    else:
+        if expiry < today:
+            errors.append(
+                f"open record expired on {expires} (owner {owner}): fix the bug and cite the fix, "
+                "or renew the expiry"
+            )
+    if record["fix_commits"]:
+        errors.append(
+            "an open record must have fix_commits = []; "
+            "once the bug is fixed, remove status, owner and expires"
+        )
+    if record["revert_patch_ok"]:
+        errors.append("an open record must have revert_patch_ok = false, as it has no fix to revert")
+    return errors
+
+
+def check_fields(record, known_ids=None, today=None):
     errors = []
     for field in (*STRING_FIELDS, *LIST_FIELDS, "seed", "revert_patch_ok"):
         if field not in record:
@@ -78,7 +128,8 @@ def check_fields(record, known_ids=None):
             errors.append(f"invalid guarantee ID {guarantee!r}")
         elif known_ids is not None and guarantee not in known_ids:
             errors.append(f"guarantee ID {guarantee!r} is not in the guarantee registers")
-    if not record["fix_commits"]:
+    errors.extend(check_open(record, today or utc_today()))
+    if not record["fix_commits"] and not is_open(record):
         errors.append("fix_commits must contain at least one Git commit SHA")
     for sha in record["fix_commits"]:
         if not SHA.fullmatch(sha):
@@ -96,8 +147,12 @@ def is_shallow(repo):
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
-def load_records(directory, repo, registers=REGISTER_DIR, warnings=None):
-    """Return (records, errors). Shallow-clone notes go to `warnings`."""
+def load_records(directory, repo, registers=REGISTER_DIR, warnings=None, today=None):
+    """Return (records, errors). Shallow-clone notes go to `warnings`.
+
+    Open records are included. Filter them out with `is_open` before counting fixed bugs.
+    An open record that expired before `today` (default: the UTC date) is an error.
+    """
     records = {}
     errors = []
     if warnings is None:
@@ -114,7 +169,7 @@ def load_records(directory, repo, registers=REGISTER_DIR, warnings=None):
         except (OSError, ValueError) as error:
             errors.append(f"{path.name}: {error}")
             continue
-        field_errors = check_fields(record, known_ids)
+        field_errors = check_fields(record, known_ids, today)
         if field_errors:
             errors.extend(f"{path.name}: {error}" for error in field_errors)
             continue
@@ -159,30 +214,43 @@ def load_records(directory, repo, registers=REGISTER_DIR, warnings=None):
 
 
 def markdown_summary(records):
-    lines = ["# Bug summary", "", f"Total records: {len(records)}"]
+    def cell(value):
+        return value.replace("\n", " ").replace("|", "\\|")
+
+    fixed = [record for record in records.values() if not is_open(record)]
+    unfixed = [record for record in records.values() if is_open(record)]
+    lines = ["# Bug summary", "", f"Fixed records: {len(fixed)}", "", f"Open records: {len(unfixed)}"]
     for label, field in (("Class", "class"), ("Module", "module"), ("Finder", "found_by")):
-        counts = Counter(record[field] for record in records.values())
-        values = sorted(CLASSES if field == "class" else counts)
-        lines.extend(["", f"## By {label.lower()}", "", f"| {label} | Count |", "| --- | ---: |"])
+        counts = Counter(record[field] for record in fixed)
+        open_counts = Counter(record[field] for record in unfixed)
+        values = sorted(CLASSES if field == "class" else counts.keys() | open_counts.keys())
+        lines.extend(
+            ["", f"## By {label.lower()}", "", f"| {label} | Fixed | Open |", "| --- | ---: | ---: |"]
+        )
         for value in values:
-            escaped = value.replace("\n", " ").replace("|", "\\|")
-            lines.append(f"| {escaped} | {counts[value]} |")
+            lines.append(f"| {cell(value)} | {counts[value]} | {open_counts[value]} |")
+    if unfixed:
+        lines.extend(["", "## Open", "", "| ID | Owner | Expires |", "| --- | --- | --- |"])
+        for record in sorted(unfixed, key=lambda record: (record["expires"], record["id"])):
+            lines.append(f"| {cell(record['id'])} | {cell(record['owner'])} | {record['expires']} |")
     return "\n".join(lines)
 
 
-def main(argv=None, *, directory=BUG_DIR, repo=REPO, registers=REGISTER_DIR):
+def main(argv=None, *, directory=BUG_DIR, repo=REPO, registers=REGISTER_DIR, today=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("validate", "summary"))
     args = parser.parse_args(argv)
     warnings = []
-    records, errors = load_records(directory, repo, registers, warnings)
+    records, errors = load_records(directory, repo, registers, warnings, today)
     if warnings:
         print("\n".join(warnings), file=sys.stderr)
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
     if args.command == "validate":
-        print(f"Validated {len(records)} bug records.")
+        open_count = sum(map(is_open, records.values()))
+        suffix = f" {open_count} open." if open_count else ""
+        print(f"Validated {len(records)} bug records.{suffix}")
     else:
         print(markdown_summary(records))
     return 0
