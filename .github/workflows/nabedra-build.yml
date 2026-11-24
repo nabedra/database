@@ -191,8 +191,8 @@ jobs:
           growth=()
           if has growth; then
             # SCRATCH (batch1 triage): ten O28 direct_oltp=off runs on the one opt-level-1 build, nothing else.
-            for n in 01 02 03 04 05 06 07 08 09 10; do
-              growth+=("{\"scenario\":\"O28\",\"modes\":\"off\",\"label\":\"off-$n\",\"opt1\":true,\"timeout\":3600}")
+            for n in picks clean-1 clean-2 node-1 node-2 dup21-1 dup21-2 dup21-3 dup23-1 dup23-2; do
+              growth+=("{\"scenario\":\"O28\",\"modes\":\"off\",\"label\":\"$n\",\"opt1\":true,\"timeout\":3600}")
             done
           fi
           has_growth=false; [ "${#growth[@]}" -gt 0 ] && has_growth=true
@@ -1668,91 +1668,23 @@ jobs:
 
   # The one opt-level-1 build of the OLTP server and library test executable that O21 and O28 need
   # (debug builds time out). Its own target directory, so its paths never collide with the shared build.
-  growth-build:
-    name: OLTP opt-level-1 build (O21, O28)
-    needs: revision
-    if: contains(needs.revision.outputs.jobs, ',growth,')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    env:
-      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
-      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TESTED_SHA }}
-      - name: Toolchain
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
-          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
-      - name: Restore Cargo cache
-        id: cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/cargo-cache
-          key: oltp-opt1-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
-          restore-keys: oltp-opt1-${{ env.RUST_TOOLCHAIN }}-
-      - name: Use restored target
-        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target-opt1; fi
-      - name: Build
-        working-directory: server
-        run: |
-          set -o pipefail
-          cargo test --locked --no-default-features --features oltp --lib --no-run --target-dir target-opt1 \
-            --message-format=json-render-diagnostics > ../build-opt1.json
-          cargo build --locked --no-default-features --features oltp --bin nabedra-db --target-dir target-opt1
-          cd ..
-          jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib")))
-                 | ["lib", .target.name, .executable] | @tsv' build-opt1.json | sed "s#\t$GITHUB_WORKSPACE/#\t#" > bins.tsv
-          printf 'server\tnabedra-db\tserver/target-opt1/debug/nabedra-db\n' >> bins.tsv
-          test "$(awk -F'\t' '$1 == "lib"' bins.tsv | wc -l)" = 1
-          cat bins.tsv
-      - name: Stage Cargo cache without workspace crates
-        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
-        run: |
-          rm -rf ~/cargo-cache && mkdir -p ~/cargo-cache && cp -al server/target-opt1 ~/cargo-cache/target
-          CARGO_TARGET_DIR=~/cargo-cache/target cargo clean --offline --locked --manifest-path server/Cargo.toml -p nabedra-database -p nabedra-kv
-          du -sh ~/cargo-cache/target
-      - name: Save Cargo cache
-        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/cargo-cache
-          key: ${{ steps.cache.outputs.cache-primary-key }}
-      - name: Pack
-        run: |
-          printf 'source=%s\n' "$TESTED_SHA" > bins-source.txt
-          tar -I 'zstd -T0 -3' -cf oltp-bins-opt1.tar.zst bins.tsv bins-source.txt $(cut -f3 bins.tsv)
-          echo "OLTP opt-level-1 build artifact: $(du -h oltp-bins-opt1.tar.zst | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: oltp-bins-opt1
-          path: oltp-bins-opt1.tar.zst
-          compression-level: 0
-          retention-days: 3
-
-  # Growth acceptance (O16, O21, O26, O28): O16 and O26 on the shared build, every mode in one job;
-  # O21 and O28 on the opt-level-1 build, one job per mode. The plan comes from `revision`.
+  # SCRATCH (batch1 triage): O28 on the binaries of run 45484607482 with w2's HTTP port forced to
+  # another worker's, as pick_port can return it. Never merge.
   growth:
-    name: ${{ matrix.scenario }} growth acceptance, direct_oltp ${{ matrix.modes }}
-    needs: [revision, growth-build]
+    name: ${{ matrix.label }} O28 port repro
+    needs: revision
     if: needs.revision.outputs.has_growth == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
-      max-parallel: 5
+      max-parallel: 4
       matrix: ${{ fromJSON(needs.revision.outputs.growth) }}
     env:
-      SCENARIO: ${{ matrix.scenario }}
-      MODES: ${{ matrix.modes }}
-      LIMIT: ${{ matrix.timeout }}
+      LABEL: ${{ matrix.label }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1762,34 +1694,48 @@ jobs:
           python-version: "3.11"
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ matrix.opt1 && 'oltp-bins-opt1' || 'oltp-bins' }}
-      - name: Unpack the ${{ matrix.opt1 && 'opt-level-1' || 'shared' }} build
+          name: oltp-bins-opt1
+          run-id: 45484607482
+          github-token: ${{ github.token }}
+      - name: Repro
         run: |
-          tar -I zstd -xf oltp-bins*.tar.zst && rm oltp-bins*.tar.zst
-          grep -qx "source=$TESTED_SHA" bins-source.txt || { echo "::error::the build is not $TESTED_SHA"; exit 1; }
-          echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
-          echo "NABEDRA_BIN=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "server" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
-      - name: Run ${{ matrix.scenario }}
-        run: |
-          status=0
-          for mode in $MODES; do
-            echo "direct_oltp=$mode"
-            rc=0
-            NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
-              --server-binary "$NABEDRA_BIN" --scenario "$SCENARIO" --timeout "$LIMIT" \
-              --output "artifacts/$SCENARIO-$mode" || rc=$?
-            python scripts/ci_acceptance_summary.py "artifacts/$SCENARIO-$mode/results.json" >> "$GITHUB_STEP_SUMMARY" || true
-            # Exit 2 = not every clause executed: shown as not-run, never as passed.
-            if [ "$rc" = 2 ]; then echo "::warning::$SCENARIO direct_oltp=$mode: not-run (see results.json)"; elif [ "$rc" != 0 ]; then status=1; fi
-          done
-          exit "$status"
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: growth-${{ matrix.scenario }}-${{ matrix.label }}
-          path: artifacts
-          if-no-files-found: ignore
-          retention-days: 14
+          tar -I zstd -xf oltp-bins-opt1.tar.zst
+          grep -qx "source=$TESTED_SHA" bins-source.txt
+          EXE=$GITHUB_WORKSPACE/$(awk -F'	' '$1 == "lib" {print $3}' bins.tsv)
+          BIN=$GITHUB_WORKSPACE/$(awk -F'	' '$1 == "server" {print $3}' bins.tsv)
+          cat > /tmp/repro.py <<'PY'
+          import os, sys
+          sys.path.insert(0, os.environ['GITHUB_WORKSPACE'] + '/server/tests')
+          label = os.environ['LABEL']
+          import harness_ports
+          import oltp_direct_cluster as c
+          orig = c.Rf3Cluster.prepare_workers
+          first = []
+          def prepare(self):
+              orig(self)
+              if not first:
+                  first.append(1)
+                  if label.startswith('dup21'): self.config['w2']['bind'] = self.config['w1']['bind']
+                  if label.startswith('dup23'): self.config['w2']['bind'] = self.config['w3']['bind']
+                  if label.startswith('node'): self.config['w2']['bind'] = self.config['w1']['node']['bind']
+                  print('REPRO', label, {n: (self.config[n]['bind'], self.config[n]['node']['bind']) for n in self.config}, flush=True)
+          c.Rf3Cluster.prepare_workers = prepare
+          if label.startswith('picks'):
+              bad = [0, 0, 0]
+              n = 1000000
+              for _ in range(n):
+                  p = [harness_ports.pick_port() for _ in range(6)]
+                  bad[0] += len(set(p)) < 6
+                  bad[1] += len(set(p[3:])) < 3
+                  bad[2] += bool(set(p[:3]) & set(p[3:]))
+              print('PICKS', n, 'any-dup', bad[0], 'http=http', bad[1], 'node=http', bad[2], flush=True)
+              sys.exit(0)
+          import oltp_growth_acceptance as g
+          sys.argv = ['oltp_growth_acceptance.py', '--scenario', 'O28', '--binary', sys.argv[1], '--test-executable', sys.argv[2]]
+          g.main()
+          PY
+          uname -r
+          NABEDRA_TEST_DIRECT_OLTP=off PYTHONDONTWRITEBYTECODE=1 timeout 900 python /tmp/repro.py "$BIN" "$EXE"
 
   # REP1-REP5 worker recovery process suites on the shared build, one invocation each: SCALE1's scale,
   # direct-mode rollback, retained restart, system replacement and REP5's abandon, wipe and data-trust
