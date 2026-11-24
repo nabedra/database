@@ -1,0 +1,46 @@
+{
+  "artifacts": [
+    {
+      "name": "p10-harness-3b2ac92-100453--oltp-sim.log",
+      "sha256": "6dd08989cc6f0740af871d6c700777fe89e17b39dc9016455dce2246fab92fb4"
+    }
+  ],
+  "assertions": {
+    "executed": 0,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "parser",
+        "reason": "no cargo-test summary line in the output (exit 101)"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim",
+  "duration_s": 8.941,
+  "guarantees": [
+    "OLTP-G02",
+    "OLTP-G03"
+  ],
+  "kind": "S H",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T09:06:44.450034+00:00",
+    "request_id": "p10-harness-3b2ac92-100453",
+    "runner": "GitHub Actions 1000010775",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45361769072"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "3b2ac923e58dbbba80f1185d4c75c898143417a2",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
