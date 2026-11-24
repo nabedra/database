@@ -1,0 +1,47 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p9-pools-b-drain-226851f-235815--oltp-native-executor-sim.log",
+      "sha256": "2251916b36dcc4d81d18f0c5a45b11647f608b4246b623bbbbb475dabd6be4ee"
+    }
+  ],
+  "assertions": {
+    "executed": 3,
+    "failed": 1,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-native-executor-sim",
+  "duration_s": 167.438,
+  "guarantees": [
+    "OLTP-G09",
+    "SCHED-G01"
+  ],
+  "kind": "S U",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T23:58:33.633309+00:00",
+    "request_id": "land-p9-pools-b-drain-226851f-235815",
+    "runner": "GitHub Actions 1000008724",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45293260014"
+  },
+  "scenarios": [
+    "C04",
+    "C06",
+    "F01",
+    "F02",
+    "F03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "226851f2f22738de186741db3d8c6d8fe9299e20",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
