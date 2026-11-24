@@ -16,7 +16,10 @@ pub(in crate::cache::cluster) fn has_clock_bound() -> bool {
         .is_some()
 }
 
-use super::super::protocol::{Lease, Topology, WorkerId};
+use super::super::{
+    controller::StagedPromotion,
+    protocol::{Lease, Topology, WorkerId},
+};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::cache::cluster) struct Knobs {
@@ -24,6 +27,8 @@ pub(in crate::cache::cluster) struct Knobs {
     pub replica_keeps_deleted_keys: bool,
     pub owner_change_keeps_epoch: bool,
     pub cold_reset_ignores_live_lease: bool,
+    pub staged_ignores_fence: bool,
+    pub staged_ignores_lag: bool,
 }
 
 pub(in crate::cache::cluster) enum Observed {
@@ -79,7 +84,7 @@ pub(in crate::cache::cluster) enum Observed {
 }
 
 type Observe = dyn Fn(u64, Observed) + Send + Sync;
-type Commit = dyn Fn(u64, u64, u64, u64, &Topology) + Send + Sync;
+type Commit = dyn Fn(u64, u64, u64, u64, &Topology, &[(u16, StagedPromotion)]) + Send + Sync;
 
 pub(super) struct Hooks {
     pub knobs: Knobs,
@@ -111,9 +116,12 @@ pub(in crate::cache::cluster) fn committed(
     term: u64,
     leader: u64,
     topology: &Topology,
+    staged: &[(u16, StagedPromotion)],
 ) {
     if let (Some(world), Some(node)) = (sim::world(), sim::current_node()) {
-        world.with_ext::<Hooks, _>(|hooks| (hooks.committed)(node, index, term, leader, topology));
+        world.with_ext::<Hooks, _>(|hooks| {
+            (hooks.committed)(node, index, term, leader, topology, staged)
+        });
     }
 }
 

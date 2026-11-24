@@ -17,6 +17,9 @@
 //! data loss and starts an empty store. Simulated mutations can carry a `sequence` in the
 //! completion. A failover marker can carry the retained `prefix_epoch` and `prefix_sequence`
 //! of the promoted copy. In that case only the unreplicated suffix may be lost.
+//! A simulated staged promotion includes its committed `reported_sequence`,
+//! `source_sequence`, and `max_lag` under `staged_promotion`. A larger gap reports
+//! `promotion-lag`, even if the worker catches up before it installs the new epoch.
 //!
 //! Register keys (no `incr`):
 //! - `invented-value`: a value read that no op wrote, or read before its write was invoked;
@@ -262,6 +265,28 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
     }
     let mut anomalies = Vec::new();
     let mut checked = 0;
+    for marker in &ctx.failovers {
+        let Some(proof) = marker.value.get("staged_promotion") else {
+            continue;
+        };
+        let (Some(retained), Some(source), Some(max_lag)) = (
+            proof["reported_sequence"].as_u64(),
+            proof["source_sequence"].as_u64(),
+            proof["max_lag"].as_u64(),
+        ) else {
+            return Verdict::malformed(
+                "staged promotion needs retained, source and lag sequences".into(),
+            );
+        };
+        if source.saturating_sub(retained) > max_lag {
+            anomalies.push(Anomaly::new(
+                "promotion-lag",
+                format!("retained sequence {retained}, source {source}, allowed lag {max_lag}"),
+                vec![marker.index],
+            ));
+        }
+        checked += 1;
+    }
     for (key, ops) in &mut keys {
         ops.sort_by_key(|op| op.call);
         checked += ops.len();

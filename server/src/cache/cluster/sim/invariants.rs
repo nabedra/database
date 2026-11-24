@@ -7,7 +7,10 @@ use nabedra_check::history::{Event, EventType, NEMESIS};
 use nabedra_sim::Trace;
 use serde_json::json;
 
-use super::super::protocol::{Lease, Slot, Topology, WorkerId};
+use super::super::{
+    controller::{MAX_CUTOVER_LAG, StagedPromotion},
+    protocol::{Lease, Slot, Topology, WorkerId},
+};
 use super::hooks::Observed;
 use crate::cache::command::{SLOT_COUNT, key_slot};
 
@@ -33,9 +36,10 @@ pub(super) struct Observations {
 }
 
 impl Observations {
-    pub fn new(check_replica_prefix: bool) -> Self {
+    pub fn new(check_replica_prefix: bool, keep_full_trace: bool) -> Self {
         Self {
-            trace: Trace::new().keep_full(nabedra_sim::trace::full_trace_requested()),
+            trace: Trace::new()
+                .keep_full(keep_full_trace || nabedra_sim::trace::full_trace_requested()),
             check_replica_prefix,
             ..Self::default()
         }
@@ -64,6 +68,7 @@ impl Observations {
         now: u64,
         state: &Topology,
         keys: &[String],
+        staged: &[(u16, StagedPromotion)],
     ) {
         let signature = (term, leader, topology_hash(state));
         if let Some(prior) = self.applied.insert(node, index)
@@ -148,14 +153,22 @@ impl Observations {
                         .or_default()
                         .push(self.history.len());
                 }
-                self.history.push(event(
-                    EventType::Info,
-                    NEMESIS,
-                    marker,
-                    key,
-                    json!({"epoch": new.epoch}),
-                    now,
-                ));
+                let mut value = json!({"epoch": new.epoch});
+                if marker == "failover"
+                    && let Some((_, proof)) = staged.iter().find(|(index, _)| *index == slot)
+                {
+                    self.trace
+                        .record(now, format_args!("staged promotion slot={slot} {proof:?}"));
+                    value["prefix_epoch"] = proof.retained_epoch.into();
+                    value["prefix_sequence"] = proof.retained_sequence.into();
+                    value["staged_promotion"] = json!({
+                        "reported_sequence": proof.retained_sequence,
+                        "source_sequence": proof.source_sequence,
+                        "max_lag": MAX_CUTOVER_LAG,
+                    });
+                }
+                self.history
+                    .push(event(EventType::Info, NEMESIS, marker, key, value, now));
             }
         }
         self.latest = Some(state.clone());

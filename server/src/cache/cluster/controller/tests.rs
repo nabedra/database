@@ -180,6 +180,7 @@ fn renew(state: &mut State, worker: WorkerId, expires_ms: u64) {
             revision: state.topology.revision,
             worker,
             expires_ms,
+            staged_progress: Vec::new(),
         },
         true,
     );
@@ -729,6 +730,136 @@ fn k03_stalled_move_resumes_source_under_a_new_epoch_only_after_fence() {
     assert!(resumed.moving.is_none());
 }
 
+#[test]
+fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
+    use super::placement::{Change, MAX_CUTOVER_LAG};
+
+    let mut state = fixture();
+    let source = state.topology.slots[0].primary.unwrap();
+    state.topology.slots[0].replica = None;
+    let target = make_member(4, 1).id;
+    let report_source = Progress {
+        slot: 0,
+        epoch: 1,
+        sequence: 100,
+        baseline: true,
+        serving_primary: true,
+        frozen: None,
+    };
+    let mut observations = Observations::default();
+    renew(&mut state, source, 4_000);
+    report(
+        &mut observations,
+        &state,
+        source,
+        1_000,
+        Some(report_source),
+    );
+    report(&mut observations, &state, target, 1_000, None);
+    let changes = observations.plan(&state, bounds(1_000));
+    assert!(state.reconcile(1_000, changes));
+    let staged = state.topology.slots[0];
+    assert_eq!(staged.moving.unwrap().target, target);
+
+    // Commit a higher source watermark while staging, then take over with
+    // a fresh observation cache and just the state machine's saved state.
+    state.apply(
+        Command::Renew {
+            generation: state.topology.generation,
+            revision: state.topology.revision,
+            worker: source,
+            expires_ms: 5_000,
+            staged_progress: vec![Progress {
+                sequence: 120,
+                ..report_source
+            }],
+        },
+        false,
+    );
+    let mut state: State = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    let mut observations = Observations::default();
+    let copy = Progress {
+        sequence: 120 - MAX_CUTOVER_LAG,
+        serving_primary: false,
+        ..report_source
+    };
+    report(&mut observations, &state, target, 4_999, Some(copy));
+    let changes = observations.plan(&state, bounds(4_999));
+    assert!(!state.reconcile(4_999, changes));
+    let changes = observations.plan(&state, bounds(5_000));
+    let promotion = changes
+        .into_iter()
+        .find(|change| {
+            matches!(
+                change,
+                Change::Slot {
+                    index: 0,
+                    staged: Some(_),
+                    ..
+                }
+            )
+        })
+        .expect("eligible staged promotion");
+
+    let mut bad = promotion.clone();
+    if let Change::Slot {
+        staged: Some(ref mut proof),
+        ..
+    } = bad
+    {
+        proof.retained_sequence += 1;
+    }
+    assert!(!state.reconcile(5_000, vec![bad]));
+    assert!(!state.reconcile(4_999, vec![promotion.clone()]));
+
+    let mut lagged = state.clone();
+    let mut late = Observations::default();
+    report(
+        &mut late,
+        &lagged,
+        target,
+        7_999,
+        Some(Progress {
+            sequence: copy.sequence - 1,
+            ..copy
+        }),
+    );
+    let changes = late.plan(&lagged, bounds(7_999));
+    assert!(!lagged.reconcile(7_999, changes));
+    let changes = late.plan(&lagged, bounds(8_000));
+    assert!(lagged.reconcile(8_000, changes));
+    let reset = lagged.topology.slots[0];
+    assert!(reset.cold);
+    assert_eq!(reset.epoch, 2);
+    assert!(reset.lease.is_none());
+    assert!(reset.moving.is_none());
+
+    // A retirement can commit before expiry. It cannot give the target
+    // writable authority before the last grant's deadline.
+    let mut retired = state.clone();
+    assert!(matches!(
+        retired.apply(
+            Command::Enroll {
+                member: make_member(source.node, 2),
+                certificate: [source.node as u8; 32],
+            },
+            true
+        ),
+        Some(Reply::Applied { .. })
+    ));
+    let mut observations = Observations::default();
+    report(&mut observations, &retired, target, 4_000, Some(copy));
+    let changes = observations.plan(&retired, bounds(4_000));
+    assert!(retired.reconcile(4_000, changes));
+    let next = retired.topology.slots[0];
+    assert_eq!(next.primary, Some(target));
+    assert_eq!(next.epoch, 2);
+    assert_eq!(next.lease.unwrap().not_before_ms, 5_000);
+
+    assert!(state.reconcile(5_000, vec![promotion]));
+    assert_eq!(state.topology.slots[0], next);
+}
+
 /// The existing controller fixture and placement decisions, without the Raft transport.
 #[cfg(feature = "sim")]
 pub(in crate::cache::cluster) struct LeaseControllerFixture {
@@ -758,6 +889,7 @@ impl LeaseControllerFixture {
                 // The fixture asks for the complete topology as well as its grants.
                 revision: 0,
                 worker,
+                staged_progress: Vec::new(),
                 expires_ms: now.lower_ms.checked_add(LEASE_MS).unwrap(),
             },
             true,

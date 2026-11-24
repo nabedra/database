@@ -27,6 +27,7 @@ const HEAL_MS: u64 = 15_000;
 const REGRESSION_SEEDS: &[u64] = &[
     7, 12, 14, 16, 20, 21, 37, 38, 46, 55, 65, 115, 198, 211, 219,
 ];
+const STAGED_RECOVERY_SEED: u64 = 4_528_675_707_300_134;
 const NIGHTLY_REGRESSION_SEEDS: &[u64] = &[
     4_524_674_007_700_389,
     4_524_674_007_700_564,
@@ -34,6 +35,7 @@ const NIGHTLY_REGRESSION_SEEDS: &[u64] = &[
     4_524_674_007_700_908,
     4_524_674_007_700_909,
     4_527_531_587_501_106,
+    STAGED_RECOVERY_SEED,
 ];
 const FIRST_WORKER: u64 = 11;
 const MIB: usize = 1 << 20;
@@ -142,6 +144,7 @@ fn config(g: &mut Gen) -> Config {
         gradual_drift: true,
         knobs: Knobs::default(),
         check_replica_prefix: true,
+        keep_full_trace: false,
     }
 }
 
@@ -470,7 +473,8 @@ fn result(cluster: &Cluster, seed: u64, workload: Workload) -> SeedRun {
 
 fn run_seed(seed: u64, g: &mut Gen) -> SeedRun {
     let workload = Workload::for_seed(seed);
-    let config = config(g);
+    let mut config = config(g);
+    config.keep_full_trace = seed == STAGED_RECOVERY_SEED;
     nabedra_sim::runtime::run(seed, |world| async move {
         let worker_loss = (4..8).contains(&(seed % 16));
         let keys = workload.keys(config.groups, worker_loss);
@@ -572,7 +576,7 @@ fn seed_sweep() {
         config.jobs,
     );
     for seed in &report.seeds {
-        if REGRESSION_SEEDS.contains(&seed.seed) {
+        if REGRESSION_SEEDS.contains(&seed.seed) || NIGHTLY_REGRESSION_SEEDS.contains(&seed.seed) {
             println!(
                 "Cache regression seed {}: passed={} trace={:016x} events={} virtual_ms={}",
                 seed.seed, seed.passed, seed.trace_hash, seed.trace_events, seed.virtual_ms,
@@ -602,7 +606,23 @@ fn nightly_regressions() {
             verify_replay: 1.0,
             ..config.clone()
         };
-        sweep::sweep(&single, run_seed)
+        let trace = std::sync::Mutex::new(None);
+        sweep::sweep(&single, |seed, generator| {
+            let result = run_seed(seed, generator);
+            if seed == STAGED_RECOVERY_SEED {
+                let full = result
+                    .full_trace
+                    .as_ref()
+                    .expect("retain full regression trace");
+                let mut prior = trace.lock().unwrap();
+                if let Some(prior) = prior.take() {
+                    assert!(full == &prior, "staged recovery trace changed on replay");
+                } else {
+                    *prior = Some(full.clone());
+                }
+            }
+            result
+        })
     });
     for report in reports {
         report.assert_passed();

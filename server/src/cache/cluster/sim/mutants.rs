@@ -6,8 +6,12 @@ use nabedra_check::{
 };
 use nabedra_sim::{PlantedSearch, runtime};
 
-use super::super::super::clock::ClockMode;
 use super::super::super::protocol::{Admin, Reply};
+use super::super::super::{
+    clock::ClockMode,
+    controller::{MAX_CUTOVER_LAG, RECONCILE_MS, STAGED_RESET_GRACE_MS},
+    protocol::{LEASE_MS, RENEW_MS},
+};
 use super::super::harness::{Cluster, Config, memory_limit};
 use super::super::history::Op;
 use super::super::hooks::Knobs;
@@ -22,6 +26,8 @@ enum Case {
     LiveReset,
     ExcessDrift(i64),
     LocalSkew,
+    UnfencedStaged,
+    LaggedStaged,
 }
 
 impl Case {
@@ -33,14 +39,19 @@ impl Case {
             Self::LiveReset => "P4",
             Self::ExcessDrift(_) => "E1",
             Self::LocalSkew => "E2",
+            Self::UnfencedStaged => "P5",
+            Self::LaggedStaged => "P6",
         }
     }
 
     fn invariant(self) -> &'static str {
         match self {
-            Self::BoundIgnored | Self::LiveReset | Self::ExcessDrift(_) | Self::LocalSkew => {
-                "LeaseExclusive"
-            }
+            Self::BoundIgnored
+            | Self::LiveReset
+            | Self::ExcessDrift(_)
+            | Self::LocalSkew
+            | Self::UnfencedStaged => "LeaseExclusive",
+            Self::LaggedStaged => "promotion-lag",
             Self::DeleteIgnored | Self::ExpiryDeleteIgnored => "ReplicaPrefix",
             Self::EpochReused => "SlotOwnership",
         }
@@ -78,8 +89,11 @@ impl Case {
                     && matches!(self, Self::DeleteIgnored | Self::ExpiryDeleteIgnored),
                 owner_change_keeps_epoch: enabled && self == Self::EpochReused,
                 cold_reset_ignores_live_lease: enabled && self == Self::LiveReset,
+                staged_ignores_fence: enabled && self == Self::UnfencedStaged,
+                staged_ignores_lag: enabled && self == Self::LaggedStaged,
             },
             check_replica_prefix: true,
+            keep_full_trace: false,
         }
     }
 }
@@ -99,7 +113,10 @@ struct Trial {
 fn run_case(case: Case, seed: u64, generated: bool, enabled: bool, history_only: bool) -> Trial {
     runtime::run(seed, |world| async move {
         let mut choices = nabedra_sim::sweep::workload_gen(seed);
-        let slot_max = if generated {
+        let staged = matches!(case, Case::UnfencedStaged | Case::LaggedStaged);
+        let slot_max = if generated && staged {
+            1 + choices.below(63) as u16
+        } else if generated {
             1 + choices.below(250) as u16
         } else {
             32
@@ -112,6 +129,17 @@ fn run_case(case: Case, seed: u64, generated: bool, enabled: bool, history_only:
         let mut config = case.config(enabled);
         config.check_replica_prefix = !history_only;
         let mut cluster = Cluster::boot(world, vec![key.clone()], config).await;
+        if staged {
+            staged_schedule(
+                &mut cluster,
+                &key,
+                case,
+                enabled,
+                generated.then(|| choices.below(30)),
+            )
+            .await;
+            return trial(&cluster, case == Case::LaggedStaged);
+        }
         let before = cluster.slot(slot);
         let old = before.primary.unwrap();
         let replica = before.replica.unwrap();
@@ -250,32 +278,131 @@ fn run_case(case: Case, seed: u64, generated: bool, enabled: bool, history_only:
                 }
             }
         }
-        let observed = cluster.observed.lock().unwrap();
-        let mut violations: Vec<_> = observed
-            .violations
-            .iter()
-            .map(|(name, detail)| format!("{name}: {detail}"))
-            .collect();
-        if history_only {
-            let verdict = relaxed_kv::check(&observed.history);
-            violations.extend(
-                verdict
-                    .anomalies
-                    .into_iter()
-                    .map(|anomaly| format!("{}: {}", anomaly.kind, anomaly.detail)),
-            );
-        }
-        let mut events = observed.history.clone();
-        reindex(&mut events);
-        let mut history = Vec::new();
-        write_jsonl(&mut history, &events).expect("serialize trial history");
-        Trial {
-            trace_hash: observed.trace.hash(),
-            trace_events: observed.trace.events(),
-            history,
-            violations,
-        }
+        trial(&cluster, history_only)
     })
+}
+
+async fn staged_schedule(
+    cluster: &mut Cluster,
+    key: &str,
+    case: Case,
+    enabled: bool,
+    jitter: Option<u64>,
+) {
+    let slot = key_slot(key.as_bytes());
+    let initial = cluster.slot(slot);
+    let old = initial.primary.unwrap();
+    let replica = initial.replica.unwrap();
+    assert!(write_ok(
+        cluster
+            .send(key, Op::Set("retained".into(), None), Some(old.node))
+            .await
+    ));
+    cluster.crash(replica.node);
+    let deadline = cluster.now() + 2 * LEASE_MS;
+    let target = loop {
+        if let Some(moving) = cluster.slot(slot).moving {
+            assert!(moving.replica_only);
+            break moving.target;
+        }
+        assert!(cluster.now() < deadline, "staging did not start");
+        cluster.step(10).await;
+    };
+    cluster.immediate_delivery();
+    // Install the move on the target before withholding its progress reports.
+    cluster.renew_once(target.node).await.unwrap();
+    cluster.isolate_controller_links(target.node);
+    let deadline = cluster.now() + LEASE_MS;
+    loop {
+        if cluster
+            .sample(Some(target), slot)
+            .await
+            .is_some_and(|copy| copy.baseline)
+        {
+            break;
+        }
+        assert!(cluster.now() < deadline, "staged copy did not finish");
+        cluster.step(10).await;
+    }
+    if case == Case::LaggedStaged {
+        cluster.link(target.node, old.node, true);
+        for i in 0..=MAX_CUTOVER_LAG {
+            assert!(write_ok(
+                cluster
+                    .send(key, Op::Set(format!("update-{i}"), None), Some(old.node))
+                    .await
+            ));
+        }
+    }
+    cluster.renew_once(old.node).await.unwrap();
+    if let Some(jitter) = jitter {
+        cluster.step(jitter).await;
+    }
+    cluster.heal();
+    cluster.isolate_controller_links(old.node);
+    if case == Case::LaggedStaged {
+        cluster.crash(old.node);
+    }
+    cluster.renew_once(target.node).await.unwrap();
+    cluster.reconcile_once().await;
+    cluster.renew_once(target.node).await.unwrap();
+    cluster.sample_leases().await;
+
+    // This fixture fits in one reconciliation batch. Allow the prior
+    // lease, the report grace period, placement and two grant heartbeats.
+    let deadline = cluster.now() + LEASE_MS + STAGED_RESET_GRACE_MS + RECONCILE_MS + 2 * RENEW_MS;
+    let successor = loop {
+        let placement = cluster.slot(slot);
+        if placement.epoch > initial.epoch
+            && cluster
+                .sample(placement.primary, slot)
+                .await
+                .is_some_and(|sample| sample.authorized)
+        {
+            break placement;
+        }
+        assert!(
+            cluster.now() < deadline,
+            "no authorized successor for {case:?}"
+        );
+        cluster.step(25).await;
+    };
+    let reset = case == Case::LaggedStaged && !enabled;
+    assert_eq!(successor.cold, reset);
+    let expected = if reset {
+        Response::Bulk(None)
+    } else {
+        Response::bulk(b"retained")
+    };
+    assert_eq!(cluster.send(key, Op::Get, None).await, Some(expected));
+}
+
+fn trial(cluster: &Cluster, history_only: bool) -> Trial {
+    let observed = cluster.observed.lock().unwrap();
+    let mut violations: Vec<_> = observed
+        .violations
+        .iter()
+        .map(|(name, detail)| format!("{name}: {detail}"))
+        .collect();
+    if history_only {
+        let verdict = relaxed_kv::check(&observed.history);
+        violations.extend(
+            verdict
+                .anomalies
+                .into_iter()
+                .map(|anomaly| format!("{}: {}", anomaly.kind, anomaly.detail)),
+        );
+    }
+    let mut events = observed.history.clone();
+    reindex(&mut events);
+    let mut history = Vec::new();
+    write_jsonl(&mut history, &events).expect("serialize trial history");
+    Trial {
+        trace_hash: observed.trace.hash(),
+        trace_events: observed.trace.events(),
+        history,
+        violations,
+    }
 }
 
 fn catches(violations: &[String], name: &str) -> bool {
@@ -470,4 +597,16 @@ fn planted_replica_delete_history() {
         std::fs::write(dir.join("cache-delete-clean.jsonl"), clean.history)
             .expect("write clean delete history");
     }
+}
+
+#[test]
+fn planted_staged_promotion_before_fence_scripted_and_search() {
+    scripted(Case::UnfencedStaged);
+    search(Case::UnfencedStaged);
+}
+
+#[test]
+fn planted_staged_promotion_beyond_lag_scripted_and_search() {
+    scripted(Case::LaggedStaged);
+    search(Case::LaggedStaged);
 }

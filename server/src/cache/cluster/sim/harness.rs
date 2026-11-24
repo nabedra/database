@@ -83,6 +83,7 @@ pub(super) struct Config {
     pub gradual_drift: bool,
     pub knobs: Knobs,
     pub check_replica_prefix: bool,
+    pub keep_full_trace: bool,
 }
 
 struct Network {
@@ -158,7 +159,10 @@ impl Cluster {
     pub async fn boot(world: Arc<World>, keys: Vec<String>, config: Config) -> Self {
         let keys = Arc::new(keys);
         let watched = keys.iter().map(|key| key_slot(key.as_bytes())).collect();
-        let observed = Arc::new(Mutex::new(Observations::new(config.check_replica_prefix)));
+        let observed = Arc::new(Mutex::new(Observations::new(
+            config.check_replica_prefix,
+            config.keep_full_trace,
+        )));
         let plan = Arc::new(Mutex::new(NetPlan::new(world.seed())));
         let immediate = Arc::new(AtomicBool::new(false));
         let observer = Arc::clone(&observed);
@@ -173,7 +177,7 @@ impl Cluster {
                 let now = runtime::virtual_ms(&observe_world.upgrade().unwrap());
                 observer.lock().unwrap().observe(node, event, now);
             }),
-            committed: Box::new(move |node, index, term, leader, topology| {
+            committed: Box::new(move |node, index, term, leader, topology, staged| {
                 let now = runtime::virtual_ms(&commit_world.upgrade().unwrap());
                 commits.lock().unwrap().committed(
                     node,
@@ -183,6 +187,7 @@ impl Cluster {
                     now,
                     topology,
                     &commit_keys,
+                    staged,
                 );
             }),
         });

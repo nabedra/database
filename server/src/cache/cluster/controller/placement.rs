@@ -13,7 +13,10 @@ use super::state::State;
 pub(in crate::cache::cluster) const MAX_MOVES_PER_WORKER: usize = 64;
 const MAX_CHANGES: usize = 256;
 const REPORT_AGE_MS: u64 = 3_000;
-const MAX_CUTOVER_LAG: u64 = 32;
+pub(in crate::cache::cluster) const MAX_CUTOVER_LAG: u64 = 32;
+// Give healthy candidates a full report window after the last lease fence.
+// This also covers fresh observations after a controller leadership change.
+pub(in crate::cache::cluster) const STAGED_RESET_GRACE_MS: u64 = REPORT_AGE_MS;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Order {
@@ -30,9 +33,47 @@ pub(super) enum Change {
         expected: Slot,
         next: Slot,
         evidence: Option<Progress>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        staged: Option<StagedPromotion>,
     },
     Drained(u64),
     OrderDone(Uuid),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::cache::cluster) enum SourceFence {
+    Retired,
+    LeaseExpired,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(in crate::cache::cluster) struct StagedPromotion {
+    pub target: WorkerId,
+    pub retained_epoch: u64,
+    pub retained_sequence: u64,
+    pub source: WorkerId,
+    pub source_sequence: u64,
+    pub prior_lease: Option<Lease>,
+    pub fence: SourceFence,
+}
+
+impl StagedPromotion {
+    fn cutoff(self, lower_ms: u64) -> u64 {
+        #[cfg(feature = "sim")]
+        if super::super::sim::hooks::knobs().staged_ignores_fence {
+            return lower_ms;
+        }
+        let _ = lower_ms;
+        self.prior_lease.map_or(0, |lease| lease.expires_ms)
+    }
+
+    fn within_lag(self) -> bool {
+        #[cfg(feature = "sim")]
+        if super::super::sim::hooks::knobs().staged_ignores_lag {
+            return true;
+        }
+        self.source_sequence.saturating_sub(self.retained_sequence) <= MAX_CUTOVER_LAG
+    }
 }
 
 #[derive(Default)]
@@ -56,28 +97,43 @@ impl Observations {
         }
     }
 
-    pub fn record(&mut self, topo: &Topology, heartbeat: Heartbeat, received_ms: u64) {
+    pub fn record(
+        &mut self,
+        topo: &Topology,
+        heartbeat: Heartbeat,
+        received_ms: u64,
+    ) -> Vec<Progress> {
         if heartbeat.generation != topo.generation {
-            return;
+            return Vec::new();
         }
         self.reports.retain(|id, report| {
             topo.member(*id).is_some()
                 && received_ms < report.received_ms.saturating_add(REPORT_AGE_MS)
         });
         let worker = heartbeat.worker;
+        let mut staged_progress = Vec::new();
         let slots = heartbeat
             .progress
             .into_iter()
             .filter_map(|report| {
                 let slot = topo.slots.get(usize::from(report.slot))?;
-                (report.epoch == slot.epoch
-                    && (slot.primary == Some(worker)
-                        || slot.replica == Some(worker)
-                        || slot.moving.is_some_and(|moving| moving.target == worker)))
-                .then_some((report.slot, report))
+                if report.epoch != slot.epoch {
+                    return None;
+                }
+                if slot.primary == Some(worker) {
+                    if report.baseline && slot.moving.is_some_and(|moving| moving.replica_only) {
+                        staged_progress.push(report);
+                    }
+                } else if slot.replica != Some(worker)
+                    && slot.moving.is_none_or(|moving| moving.target != worker)
+                {
+                    return None;
+                }
+                Some((report.slot, report))
             })
             .collect();
         self.reports.insert(worker, Report { received_ms, slots });
+        staged_progress
     }
 
     fn live(&self, worker: WorkerId, now: ClockBounds) -> bool {
@@ -136,14 +192,26 @@ impl Observations {
         let topo = &state.topology;
         let mut placement = Placement::new(topo, self, now);
         let mut changes = Vec::new();
+        let mut staged_recovery = Vec::new();
         for (index, slot) in topo.slots.iter().copied().enumerate() {
             let index = index as u16;
-            if let Some(next) = placement.plan_slot(index, slot, &state.orders) {
+            if let Some(change) = placement.recover_staged(index, slot, state) {
+                staged_recovery.push(change);
+                if staged_recovery.len() == MAX_CHANGES {
+                    return staged_recovery;
+                }
+                continue;
+            }
+            if changes.len() < MAX_CHANGES
+                && let Some(next) = placement.plan_slot(index, slot, &state.orders)
+            {
                 let advances_ownership = next.epoch != slot.epoch;
                 #[cfg(feature = "sim")]
                 let advances_ownership = advances_ownership || next.primary != slot.primary;
+                let starts_staging =
+                    slot.moving.is_none() && next.moving.is_some_and(|moving| moving.replica_only);
                 let evidence = self.baseline(
-                    if advances_ownership {
+                    if advances_ownership || starts_staging {
                         next.primary
                     } else {
                         next.replica
@@ -157,11 +225,20 @@ impl Observations {
                     expected: slot,
                     next,
                     evidence,
+                    staged: None,
                 });
-                if changes.len() == MAX_CHANGES {
-                    return changes;
-                }
             }
+        }
+        if !staged_recovery.is_empty() {
+            staged_recovery.extend(
+                changes
+                    .into_iter()
+                    .take(MAX_CHANGES - staged_recovery.len()),
+            );
+            changes = staged_recovery;
+        }
+        if changes.len() == MAX_CHANGES {
+            return changes;
         }
 
         for order in &state.orders {
@@ -217,16 +294,39 @@ impl State {
                     expected,
                     next,
                     evidence,
+                    staged,
                 } => {
                     let Some(old) = self.topology.slots.get(usize::from(index)).copied() else {
                         continue;
                     };
                     // Compare the committed grant as well as the placement.
                     // A renewal that raced the planner invalidates its proof.
-                    if old != expected
-                        || !valid_change(&self.topology, index, lower_ms, old, next, evidence)
-                    {
+                    if old != expected {
                         continue;
+                    }
+                    let valid = match staged {
+                        Some(proof) => {
+                            self.valid_staged(index, lower_ms, old, next, evidence, proof)
+                        }
+                        None => valid_change(&self.topology, index, lower_ms, old, next, evidence),
+                    };
+                    if !valid {
+                        continue;
+                    }
+                    if next.epoch != old.epoch || next.moving != old.moving {
+                        self.staged_sequences.remove(&index);
+                        if old.moving.is_none()
+                            && next.moving.is_some_and(|moving| moving.replica_only)
+                            && let Some(source) = evidence.filter(|source| {
+                                source.baseline && source.slot == index && source.epoch == old.epoch
+                            })
+                        {
+                            self.staged_sequences.insert(index, source.sequence);
+                        }
+                    }
+                    #[cfg(feature = "sim")]
+                    if let Some(proof) = staged {
+                        self.applied_staged.push((index, proof));
                     }
                     self.topology.slots[usize::from(index)] = next;
                     changed = true;
@@ -265,14 +365,74 @@ impl State {
     }
 }
 
-fn valid_change(
-    topo: &Topology,
-    index: u16,
+impl State {
+    fn valid_staged(
+        &self,
+        index: u16,
+        lower_ms: u64,
+        old: Slot,
+        next: Slot,
+        evidence: Option<Progress>,
+        proof: StagedPromotion,
+    ) -> bool {
+        let topo = &self.topology;
+        let cutoff = proof.cutoff(lower_ms);
+        old.moving
+            .is_some_and(|moving| moving.replica_only && moving.target == proof.target)
+            && old.primary == Some(proof.source)
+            && proof.target != proof.source
+            && old.lease == proof.prior_lease
+            && source_fenced(self, proof.source, old.lease, lower_ms, proof.fence)
+            && self.staged_sequences.get(&index) == Some(&proof.source_sequence)
+            && proof.retained_epoch == old.epoch
+            && proof.within_lag()
+            && evidence.is_some_and(|copy| {
+                copy.baseline
+                    && copy.slot == index
+                    && copy.epoch == proof.retained_epoch
+                    && copy.sequence == proof.retained_sequence
+            })
+            && next.primary == Some(proof.target)
+            && old.epoch.checked_add(1) == Some(next.epoch)
+            && !next.cold
+            && next.moving.is_none()
+            && next.replica_seed.is_none()
+            && next.lease == Some(fenced_lease(cutoff))
+            && valid_members(topo, old, next)
+    }
+}
+
+fn source_fenced(
+    state: &State,
+    source: WorkerId,
+    lease: Option<Lease>,
     lower_ms: u64,
-    old: Slot,
-    next: Slot,
-    evidence: Option<Progress>,
+    fence: SourceFence,
 ) -> bool {
+    #[cfg(feature = "sim")]
+    if super::super::sim::hooks::knobs().staged_ignores_fence {
+        return true;
+    }
+    match fence {
+        SourceFence::Retired => state.is_retired(source),
+        SourceFence::LeaseExpired => lease.is_none_or(|lease| lower_ms >= lease.expires_ms),
+    }
+}
+
+fn staged_reset_at(lease: Option<Lease>) -> u64 {
+    lease
+        .map_or(0, |lease| lease.expires_ms)
+        .saturating_add(STAGED_RESET_GRACE_MS)
+}
+
+fn fenced_lease(cutoff: u64) -> Lease {
+    Lease {
+        expires_ms: cutoff,
+        not_before_ms: cutoff,
+    }
+}
+
+fn valid_members(topo: &Topology, old: Slot, next: Slot) -> bool {
     let Some(primary) = next.primary.and_then(|id| topo.member(id)) else {
         return false;
     };
@@ -281,13 +441,28 @@ fn valid_change(
     // staging or canceling the move. A new assignment must be enrolled.
     let replica_unchanged =
         next.primary == old.primary && next.epoch == old.epoch && next.replica == old.replica;
-    if let Some(replica) = next.replica
-        && match topo.member(replica) {
-            Some(member) => primary.zone == member.zone,
-            None => !replica_unchanged,
-        }
-    {
+    next.replica
+        .is_none_or(|replica| match topo.member(replica) {
+            Some(member) => primary.zone != member.zone,
+            None => replica_unchanged,
+        })
+}
+
+fn valid_change(
+    topo: &Topology,
+    index: u16,
+    lower_ms: u64,
+    old: Slot,
+    next: Slot,
+    evidence: Option<Progress>,
+) -> bool {
+    if !valid_members(topo, old, next) {
         return false;
+    }
+    if next.cold && old.epoch.checked_add(1) == Some(next.epoch) {
+        return old.moving.is_some_and(|moving| moving.replica_only)
+            && lower_ms >= staged_reset_at(old.lease)
+            && next == old.cold_reset(next.primary.unwrap(), next.replica);
     }
     let evidence =
         evidence.filter(|proof| proof.baseline && proof.slot == index && proof.epoch == old.epoch);
@@ -321,14 +496,7 @@ fn valid_change(
         return false;
     };
     let old_deadline = old.lease.map_or(0, |lease| lease.expires_ms);
-    let has_fence = |cutoff| {
-        lower_ms >= cutoff
-            && next.lease
-                == Some(Lease {
-                    expires_ms: cutoff,
-                    not_before_ms: cutoff,
-                })
-    };
+    let has_fence = |cutoff| lower_ms >= cutoff && next.lease == Some(fenced_lease(cutoff));
     if next.primary == old.replica && next.replica_seed.is_none() && has_fence(old_deadline) {
         return true;
     }
@@ -404,6 +572,95 @@ impl<'a> Placement<'a> {
             }
         }
         placement
+    }
+
+    fn recover_staged(&mut self, index: u16, slot: Slot, state: &State) -> Option<Change> {
+        let source = slot.primary?;
+        let moving = slot.moving.filter(|moving| moving.replica_only)?;
+        let retired = state.is_retired(source);
+        let source_progress = self
+            .observed
+            .baseline(Some(source), index, slot.epoch, self.now);
+        let unavailable = retired || source_progress.is_none();
+        #[cfg(feature = "sim")]
+        let unavailable = unavailable || super::super::sim::hooks::knobs().staged_ignores_fence;
+        if !unavailable {
+            return None;
+        }
+
+        // Prefer the existing failover path if the assigned replica is ready.
+        if slot
+            .replica
+            .is_some_and(|replica| self.topo.member(replica).is_some())
+            && self
+                .observed
+                .baseline(slot.replica, index, slot.epoch, self.now)
+                .is_some()
+        {
+            return None;
+        }
+
+        let fence = if retired {
+            SourceFence::Retired
+        } else {
+            SourceFence::LeaseExpired
+        };
+        if source_fenced(state, source, slot.lease, self.now.lower_ms, fence)
+            && self.topo.member(moving.target).is_some()
+            && let Some(copy) =
+                self.observed
+                    .baseline(Some(moving.target), index, slot.epoch, self.now)
+            && let Some(&source_sequence) = state.staged_sequences.get(&index)
+        {
+            let proof = StagedPromotion {
+                target: moving.target,
+                retained_epoch: copy.epoch,
+                retained_sequence: copy.sequence,
+                source,
+                source_sequence,
+                prior_lease: slot.lease,
+                fence,
+            };
+            if proof.within_lag() {
+                // Retirement prevents further renewals. An isolated old
+                // incarnation can still spend a grant it already received.
+                let cutoff = proof.cutoff(self.now.lower_ms);
+                let next = self.switch_owner(slot, moving.target, cutoff, None)?;
+                return Some(Change::Slot {
+                    index,
+                    expected: slot,
+                    next,
+                    evidence: Some(copy),
+                    staged: Some(proof),
+                });
+            }
+        }
+
+        if !self.now.fenced(staged_reset_at(slot.lease)) {
+            return None;
+        }
+        let primary = self
+            .topo
+            .workers
+            .get(&source.node)
+            .map(|member| member.id)
+            .filter(|&id| self.eligible(id))
+            .or_else(|| {
+                self.topo
+                    .workers
+                    .values()
+                    .map(|member| member.id)
+                    .find(|&id| self.eligible(id))
+            })?;
+        let replica = self.replica_for(primary, None);
+        slot.epoch.checked_add(1)?;
+        Some(Change::Slot {
+            index,
+            expected: slot,
+            next: slot.cold_reset(primary, replica),
+            evidence: None,
+            staged: None,
+        })
     }
 
     fn plan_slot(&mut self, index: u16, slot: Slot, orders: &[Order]) -> Option<Slot> {
@@ -644,10 +901,7 @@ impl<'a> Placement<'a> {
             epoch,
             primary: Some(primary),
             replica,
-            lease: Some(Lease {
-                expires_ms: cutoff,
-                not_before_ms: cutoff,
-            }),
+            lease: Some(fenced_lease(cutoff)),
             moving: None,
             replica_seed: None,
             cold: false,

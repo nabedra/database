@@ -4,8 +4,10 @@ mod log;
 mod machine;
 mod network;
 mod placement;
+#[cfg(feature = "sim")]
+pub(super) use placement::StagedPromotion;
 #[cfg(all(test, feature = "sim"))]
-pub(super) use placement::MAX_MOVES_PER_WORKER;
+pub(super) use placement::{MAX_CUTOVER_LAG, MAX_MOVES_PER_WORKER, STAGED_RESET_GRACE_MS};
 #[cfg(all(test, feature = "sim"))]
 mod simulation;
 mod state;
@@ -456,7 +458,7 @@ impl Controller {
         };
         let (generation, revision, worker) =
             (heartbeat.generation, heartbeat.revision, heartbeat.worker);
-        let accepted = self
+        let staged_progress = self
             .machine
             .read(|state| {
                 let topo = &state.topology;
@@ -464,18 +466,20 @@ impl Controller {
                     .member(worker)
                     .is_some_and(|member| member.authenticates(certificate))
                 {
-                    return false;
+                    return None;
                 }
-                if let Ok(mut observed) = self.observed.lock() {
-                    observed.reset_if_changed(term, topo.generation);
-                    observed.record(topo, heartbeat, now.lower_ms);
-                }
-                true
+                Some(self.observed.lock().map_or_else(
+                    |_| Vec::new(),
+                    |mut observed| {
+                        observed.reset_if_changed(term, topo.generation);
+                        observed.record(topo, heartbeat, now.lower_ms)
+                    },
+                ))
             })
             .await;
-        if !accepted {
+        let Some(staged_progress) = staged_progress else {
             return Reply::Refused("heartbeat identity is not enrolled".into());
-        }
+        };
         let Some(expires_ms) = now.lower_ms.checked_add(LEASE_MS) else {
             return Reply::Retry;
         };
@@ -484,6 +488,7 @@ impl Controller {
             revision,
             worker,
             expires_ms,
+            staged_progress,
         })
         .await
     }
