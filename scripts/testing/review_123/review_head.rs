@@ -102,7 +102,7 @@ fn writes_late(seed: u64, stops: u8, fenced: bool) -> bool {
         match stops {
             0 => {}
             1 => world.set_clock_freezes(60, ms(30)),
-            _ => world.freeze_after_clock_read(1, ClockRead::nth(90 + seed % 30).in_file("review123.rs")),
+            _ => world.freeze_after_clock_read(1, ClockRead::nth(30 + seed % 12).in_file("review123.rs")),
         }
         let late = Arc::new(AtomicU64::new(0));
         let l = late.clone();
