@@ -1,0 +1,13 @@
+{"index":0,"type":"invoke","process":0,"f":"insert","key":"1696fdae-6186-ac6f-9fe3-d3077422a52a/900","value":{"id":900,"value":1},"request_id":"81f0fab7-3d31-433a-8ca9-d21094fc89e2","node":"n101","time_ns":8900000000}
+{"index":1,"type":"ok","process":0,"f":"insert","key":"1696fdae-6186-ac6f-9fe3-d3077422a52a/900","value":null,"request_id":"81f0fab7-3d31-433a-8ca9-d21094fc89e2","node":"n101","time_ns":8994000000}
+{"index":2,"type":"invoke","process":1,"f":"insert","key":"1696fdae-6186-ac6f-9fe3-d3077422a52a/901","value":{"id":901,"value":1},"request_id":"2a167866-09bd-4c25-adf0-17fb36c076d9","node":"n102","time_ns":8994000000}
+{"index":3,"type":"ok","process":1,"f":"insert","key":"1696fdae-6186-ac6f-9fe3-d3077422a52a/901","value":null,"request_id":"2a167866-09bd-4c25-adf0-17fb36c076d9","node":"n102","time_ns":9038000000}
+{"index":4,"type":"ok","process":"nemesis","f":"leader","value":1,"time_ns":9044000000}
+{"index":5,"type":"invoke","process":2,"f":"update","key":"1696fdae-6186-ac6f-9fe3-d3077422a52a/7","value":{"id":7,"value":111},"request_id":"63113a8f-8db7-47f5-8dd4-9e1d18a2ae0e","node":"n101","time_ns":9044000000}
+{"index":6,"type":"ok","process":2,"f":"update","key":"1696fdae-6186-ac6f-9fe3-d3077422a52a/7","value":false,"request_id":"63113a8f-8db7-47f5-8dd4-9e1d18a2ae0e","node":"n101","time_ns":9048000000}
+{"index":7,"type":"invoke","process":3,"f":"insert","key":"1696fdae-6186-ac6f-9fe3-d3077422a52a/7","value":{"id":7,"value":222},"request_id":"de31c811-c86a-446c-8ef3-abe3a2edb422","node":"n101","time_ns":9048000000}
+{"index":8,"type":"ok","process":3,"f":"insert","key":"1696fdae-6186-ac6f-9fe3-d3077422a52a/7","value":null,"request_id":"de31c811-c86a-446c-8ef3-abe3a2edb422","node":"n101","time_ns":9056000000}
+{"index":9,"type":"invoke","process":2,"f":"update","key":"1696fdae-6186-ac6f-9fe3-d3077422a52a/7","value":{"id":7,"value":111},"request_id":"63113a8f-8db7-47f5-8dd4-9e1d18a2ae0e","node":"n101","time_ns":9056000000}
+{"index":10,"type":"ok","process":2,"f":"update","key":"1696fdae-6186-ac6f-9fe3-d3077422a52a/7","value":true,"request_id":"63113a8f-8db7-47f5-8dd4-9e1d18a2ae0e","node":"n101","time_ns":9064000000}
+{"index":11,"type":"invoke","process":3,"f":"get","key":"1696fdae-6186-ac6f-9fe3-d3077422a52a/7","value":null,"request_id":"ceb4c063-a42d-4736-bef4-d877d83c9203","node":"n101","time_ns":9064000000}
+{"index":12,"type":"ok","process":3,"f":"get","key":"1696fdae-6186-ac6f-9fe3-d3077422a52a/7","value":{"id":7,"value":111},"request_id":"ceb4c063-a42d-4736-bef4-d877d83c9203","node":"n101","time_ns":9068000000}

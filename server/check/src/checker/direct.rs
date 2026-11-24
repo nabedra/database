@@ -3,8 +3,9 @@
 //!
 //! [`check`] runs three checks over one history and merges their verdicts:
 //!
-//! 1. [`linearizable::check_kv_opts`] with [`Options::request_dedup`]: linearizability
-//!    across the rows in each single-range batch, including request-ID replay and reuse.
+//! 1. [`linearizable::check_kv_opts`] with [`linearizable::Options::request_dedup`]:
+//!    linearizability across the rows in each single-range batch, including request-ID replay
+//!    and reuse.
 //! 2. [`outcome::check`] (`failed-write-observed`) over possible writes and row observations.
 //! 3. [`check_identity`]: specific diagnostics for replay and reuse violations.
 //!
@@ -31,31 +32,49 @@
 //! existence flag (`true`, `false`, or `{"data": b}`). An `insert_many` success count,
 //! when recorded, must equal the number of input rows. These histories use primary-key
 //! conflicts. A workload with other uniqueness constraints needs to identify those refusals.
+//!
+//! [`check_with`] can add two rules for a decision that is still open, described in
+//! [`request_rules`]: `unstable-result` and `not-applied-took-effect`. Both are off by default.
+
+pub mod request_rules;
 
 use super::linearizable::{
-    self, Identities, Options, anchor, body, classify, committed_answer, error_code, rows_of,
+    self, Identities, anchor, body, classify, committed_answer, error_code, rows_of,
 };
 use super::{Anomaly, Verdict, outcome};
 use crate::history::{Event, Op, Outcome, pair};
+pub use request_rules::Options;
 
-/// Every direct-path check over one history.
+/// Every direct-path check over one history, without the opt-in rules.
 pub fn check(events: &[Event]) -> Verdict {
+    check_with(events, &Options::default())
+}
+
+/// [`check`], plus the opt-in rules that `opts` selects.
+pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
     let lin = linearizable::check_kv_opts(
         events,
-        &Options {
+        &linearizable::Options {
             request_dedup: true,
-            ..Options::default()
+            ..linearizable::Options::default()
         },
     );
     let paired = match pair(events) {
         Ok(paired) => paired,
         Err(e) => return Verdict::malformed(e),
     };
-    Verdict::merge([
+    let mut verdicts = vec![
         lin,
         outcome::check(&for_outcome(events, &paired.ops)),
         identity_verdict(&paired.ops),
-    ])
+    ];
+    if opts.stable_results {
+        verdicts.push(request_rules::stable_results(&paired.ops));
+    }
+    if opts.request_not_applied {
+        verdicts.push(request_rules::request_not_applied(events, &paired.ops));
+    }
+    Verdict::merge(verdicts)
 }
 
 /// The request ID rules in the table above.
