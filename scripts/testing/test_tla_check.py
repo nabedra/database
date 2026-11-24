@@ -23,6 +23,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import evidence  # noqa: E402
 import tla_check  # noqa: E402
 import tla_common as tc  # noqa: E402
 
@@ -235,6 +236,11 @@ def add_to_model(*lines: str, extends: str = ""):
     """A prep step that adds definitions, and modules to EXTENDS, to MCTwoPhase.tla."""
     return lambda spec: edit(spec / "MCTwoPhase.tla", ("MCRMLarge ==", "\n".join(lines) + "\nMCRMLarge =="),
                              ("EXTENDS TwoPhase", "EXTENDS TwoPhase" + extends))
+
+
+def run_check_errors(summary: dict) -> list[str] | None:
+    """Why the schema refuses the summary's facts, or None."""
+    return evidence.schema_errors(summary["tla"], evidence.load_schema()["properties"]["tla"]) or None
 
 
 NO_LIVENESS = (("PROPERTIES Termination\n", ""),)
@@ -556,6 +562,31 @@ class CheckOrchestrationTests(unittest.TestCase):
         code, summary, text = self.run_fake(GOOD, prep=[add_to_model(
             '(* TLCGet("level") (* nested *) *)', "\\* RandomElement", 'Text == "TLCGet"')])
         self.assertEqual(code, 0, text)
+
+    def test_text_around_a_module_does_not_count(self):
+        def around(before, after):
+            return lambda spec: (spec / "MCTwoPhase.tla").write_text(
+                before + (spec / "MCTwoPhase.tla").read_text() + after)
+
+        code, _, text = self.run_fake(GOOD, prep=[around("A note on TLCGet.\n", "\nTLCSet and RandomElement are refused.\n")])
+        self.assertEqual(code, 0, text)
+        # Nor can it declare a constant or define a constraint that the model has not got.
+        self.assert_fails("override Nat has no", prep=[around("", "\nCONSTANT Nat\n"), lambda spec: edit(
+            spec / "TwoPhase.cfg", ("CONSTANTS\n", "CONSTANTS\n    Nat <- Mine\n"))])
+        self.assert_fails("CONSTRAINT Few: ", FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]), prep=[
+            *self.limited("Other == crashes <= 1"), around("", "\nFew == crashes <= 1\n")])
+
+    def test_unreadable_statistics_are_an_error_with_no_counts(self):
+        stats = re.search(r"@!@!@STARTMSG 2199:0 @!@!@\n.*?ENDMSG 2199 @!@!@\n", fixture("pass"), re.S).group(0)
+        second = re.sub(r"(@!@!@STARTMSG 2199:0 @!@!@\n).*\n", r"\g<1>1.2M states generated, 55K left.\n", stats)
+        edits = json.dumps([[stats, stats + second]])
+        code, summary, text = self.run_fake(GOOD, FAKE_TLC_EDIT=edits)
+        self.assertEqual((code, summary["verdict"]), (3, "error"), text)
+        self.assertEqual((summary["tla"]["distinct_states"], summary["tla"]["runs"][0]["states_left"]), (None, None))
+        self.assertIn("unreadable statistics", summary["not_run"][0]["reason"])
+        self.assertIsNone(run_check_errors(summary))
+        code, summary, _ = self.run_fake({"TwoPhase.large.cfg": ["pass", 0]}, extra=("--tier", "T2"), FAKE_TLC_EDIT=edits)
+        self.assertEqual((code, summary["verdict"], summary["tla"]["distinct_states"]), (3, "error", None))
 
     def test_t2_applies_the_search_rule(self):
         cap = [add_to_model('Few == TLCGet("level") < 9')]

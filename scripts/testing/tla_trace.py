@@ -613,12 +613,12 @@ def cmd_check(args: argparse.Namespace) -> int:
             if at_lint:
                 failed += 1
                 why = "the lint accepts it, but must refuse it"
-                failing.append({"file": label[:200], "index": None, "reason": why})
+                failing.append({"file": label, "index": None, "reason": why})
                 print(f"[tla_trace] FAIL {label}: {why}")
                 continue
             if lint:
                 failed += 1
-                failing.append({"file": label[:200], "index": None, "reason": _printable("lint: " + lint[0])[:300]})
+                failing.append({"file": label, "index": None, "reason": _printable("lint: " + lint[0])})
                 print(f"[tla_trace] FAIL {label}: not a valid {FORMAT} trace")
                 for e in lint[:20]:
                     print(f"    {_printable(e)}")
@@ -626,14 +626,14 @@ def cmd_check(args: argparse.Namespace) -> int:
             header = json.loads(read_lines(trace)[0])
             if header["spec"] != args.name:
                 failed += 1
-                failing.append({"file": label[:200], "index": None,
+                failing.append({"file": label, "index": None,
                                 "reason": f"header spec is {header['spec']}, not {args.name}"})
                 print(f"[tla_trace] FAIL {label}: header spec is {header['spec']}, not {args.name}")
                 continue
             result = check_trace(spec_dir, args.name, trace, out, budget, f"trace-{index:03d}")
             if result["outcome"] == "error":
                 where = f" at index {result['at']}" if result["at"] is not None else ""
-                errors.append(f"{label}:{where} {result['detail']}"[:300])
+                errors.append(f"{label}:{where} {result['detail']}")
                 print(f"[tla_trace] ERROR {label}:{where} {result['detail']} (log {result['log']})")
                 continue
             if result["outcome"] == "accepted":
@@ -655,19 +655,19 @@ def cmd_check(args: argparse.Namespace) -> int:
                     failed += 1
                     why = ("accepted, but it must be rejected" if result["outcome"] == "accepted"
                            else f"rejected at index {at}, expected {want}")
-                    failing.append({"file": label[:200], "index": at, "reason": why})
+                    failing.append({"file": label, "index": at, "reason": why})
                     print(f"[tla_trace] FAIL {label}: {why}")
             elif result["outcome"] == "accepted":
                 print(f"[tla_trace] ok   {label}: accepted, {len(lines) - 1} steps")
             else:
                 failed += 1
-                failing.append({"file": label[:200], "index": at, "reason": f"{result['detail']}: {content}"[:300]})
+                failing.append({"file": label, "index": at, "reason": f"{result['detail']}: {content}"})
                 print(f"[tla_trace] FAIL {label}: REJECTED at index {at} (seq {at}, file line "
                       f"{at + 2 if at is not None else '?'}), {result['detail']}:\n    {content}")
         if control is not None:
             problem = wildcard_error(spec_dir, args.name, control, out, budget)
             if problem:
-                errors.append(problem[:300])
+                errors.append(problem)
                 print(f"[tla_trace] ERROR {problem}")
             else:
                 print(f"[tla_trace] ok   control: a line with the unknown action {CONTROL_ACTION} is rejected")
@@ -677,12 +677,12 @@ def cmd_check(args: argparse.Namespace) -> int:
             problem = check_mutant(spec_dir, args.name, cfg, out, budget)
             if problem:
                 failed += 1
-                failing.append({"file": f"trace-mutants/{cfg.name}"[:200], "index": None, "reason": problem[:300]})
+                failing.append({"file": f"trace-mutants/{cfg.name}", "index": None, "reason": problem})
                 print(f"[tla_trace] FAIL trace-mutants/{cfg.name}: {problem}")
             else:
                 print(f"[tla_trace] ok   trace-mutants/{cfg.name}: {cfg.read_text().splitlines()[0][3:]}")
     except (tc.TlaError, OSError, ValueError) as exc:
-        errors.append(f"setup: {exc}"[:300])
+        errors.append(f"setup: {exc}")
         print(f"[tla_trace] ERROR setup: {exc}")
 
     tla["traces"] = {"checked": executed - mutants, "accepted": accepted, "rejected": rejected,
@@ -701,18 +701,16 @@ def cmd_check(args: argparse.Namespace) -> int:
         verdict = "pass"
     artifacts = []
     if out is not None and Path(out).exists():
-        # summary.json keeps every fact and is always listed. The record below has limits.
+        # Nothing is cut here. summary.json keeps every fact, and run_check.py trims the record, counts what
+        # it drops and keeps this artifact.
         (Path(out) / "summary.json").write_text(json.dumps({
             "verdict": verdict, "executed": executed, "failed": failed, "not_run": not_run, "tla": tla},
             indent=2) + "\n", encoding="utf-8")
         for f in sorted(Path(out).glob("*"), key=lambda f: (f.name != "summary.json", f.name)):
-            if f.is_file() and len(artifacts) < 40:
-                artifacts.append({"name": f"tla/{f.name}"[:200],
+            if f.is_file():
+                artifacts.append({"name": f"tla/{f.name}",
                                   "sha256": hashlib.sha256(f.read_bytes()).hexdigest()})
-    if len(failing) > 20 or len(not_run) > 200:
-        tla["traces"]["failing"] = failing[:20]
-        tla["truncated"] = True
-    tc.print_summary({"verdict": verdict, "executed": executed, "failed": failed, "not_run": not_run[:200],
+    tc.print_summary({"verdict": verdict, "executed": executed, "failed": failed, "not_run": not_run,
                       "tla": tla, "artifacts": artifacts})
     return EXIT[verdict]
 

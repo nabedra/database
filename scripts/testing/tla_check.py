@@ -54,6 +54,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tla_common as tc  # noqa: E402
+import tla_trace  # noqa: E402
 
 EXIT = {"pass": 0, "fail": 1, "not-run": 2, "error": 3}
 
@@ -149,7 +150,7 @@ class Model:
                         None)
             if name in self.texts or path is None:
                 continue
-            text = tc.strip_tla_comments(path.read_text(encoding="utf-8"), keep_strings=False)
+            text = tla_trace._module_text(path.read_text(encoding="utf-8"))
             self.texts[name] = text
             for m in _IMPORT.finditer(text):
                 imported = [i.strip() for i in (m.group(1) or m.group(2)).split(",")]
