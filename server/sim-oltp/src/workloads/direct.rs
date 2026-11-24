@@ -143,6 +143,8 @@ pub(crate) async fn run(
             .violate(&cluster.world, "Liveness", format!("heal: {error}"));
         return abandon(cluster, &ctx, tasks, report).await;
     }
+    // A run without a nemesis still delays the old voters of a move until here.
+    faults.clear();
     // Everything is undone and every process is started. The bounds below run from here.
     let healed = cluster.world.elapsed();
     cluster
