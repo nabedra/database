@@ -1875,3 +1875,6 @@ pub(crate) fn invalid() -> ProtocolError {
         Outcome::NotApplied,
     )
 }
+
+#[cfg(test)]
+mod tests;

@@ -2427,3 +2427,6 @@ fn allocate_direct_permitted(action: &ServiceAction) -> bool {
         ServiceAction::Owner | ServiceAction::ParticipantProof { .. } | ServiceAction::DirectLeader
     )
 }
+
+#[cfg(test)]
+mod tests;
