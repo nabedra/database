@@ -1,0 +1,44 @@
+{
+  "artifacts": [
+    {
+      "name": "p12-fix-s2-expiry-checks-f53b38c-001230--cache-store-model.log",
+      "sha256": "d01fd6fc7e6ed9ce03296dd9fa9c228c171541caaab4cfcd82aaa2e5a468c539"
+    }
+  ],
+  "assertions": {
+    "executed": 6,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-store-model",
+  "duration_s": 41.337,
+  "guarantees": [
+    "CACHE-G02",
+    "CACHE-G03"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T23:19:47.632343+00:00",
+    "request_id": "p12-fix-s2-expiry-checks-f53b38c-001230",
+    "runner": "GitHub Actions 1000008571",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45286761877"
+  },
+  "scenarios": [
+    "K01",
+    "K02"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "f53b38c630ee87269bde6c6b41abf66e2c59783f",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
