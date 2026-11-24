@@ -10,7 +10,7 @@ equals the filename stem.
 ```toml
 id = "cache-store-model"
 module = "cache"
-kinds = ["U"]                    # M U S H F D R P K
+kinds = ["U"]                    # M U S H F D R P K, and T once its tooling lands
 guarantees = ["CACHE-G02", "CACHE-G03"]
 scenarios = ["K01", "K02"]
 tiers = ["T0", "T1"]             # T0 T1 T2 T3 weekly
