@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "flake-hunt-o07-storage-17f29ceb-073457--oltp-snapshot-atomicity-repeat.log",
+      "sha256": "d540523b4f5f7e5f006ad43305c4f9fbce5c85a3ee93adfbc319fd10a58fba76"
+    }
+  ],
+  "assertions": {
+    "executed": 40,
+    "failed": 2,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-snapshot-atomicity-repeat",
+  "duration_s": 1489.548,
+  "guarantees": [],
+  "kind": "R",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T06:35:55.770211+00:00",
+    "request_id": "flake-hunt-o07-storage-17f29ceb-073457",
+    "runner": "GitHub Actions 1000010350",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45341514058"
+  },
+  "scenarios": [
+    "O07"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "17f29ceb4a5623f5ef0ff23b7d306931ef23ea56",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
