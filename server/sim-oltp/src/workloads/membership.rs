@@ -779,7 +779,19 @@ impl Membership {
                 self.cut(cluster, g, node).await
             };
             self.down(cluster, ctx, window(g, 0, 2_000)).await;
-            cluster.restart_worker(node, how).await?;
+            if let Err(error) = cluster.prepare_restart(node).await {
+                // `docs/oltp-recovery.md`, step 7: "Once queue join begins, a process restart
+                // requires the normal retained-mount procedure with a new incarnation."
+                if SPARES.contains(&node) {
+                    cluster.checks.violate(
+                        &cluster.world,
+                        "ReplacementRestart",
+                        format!("the survivors refuse the retained restart of the replacement n{node}: {error}"),
+                    );
+                }
+                return Err(error);
+            }
+            cluster.start_prepared(index, how).await?;
             self.wait_members(cluster, ctx, CHECK_LIMIT).await?;
             let connection = self.connection(cluster).await?;
             let run = connection["run_id"]

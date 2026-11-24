@@ -535,7 +535,17 @@ impl Bootstrap {
             .remove("system_replacement");
         self.worker_configs[index] = config;
         self.nodes[index] = spare;
+        let mut pins: Vec<String> = self
+            .worker_configs
+            .iter()
+            .filter_map(|config| {
+                let enrollment = &config["node"]["enrollment"];
+                Some(enrollment["certificate_sha256"].as_str()?.to_owned())
+            })
+            .collect();
+        pins.sort_unstable();
         for config in &mut self.worker_configs {
+            config["node"]["operator_pins"] = json!(pins);
             let placements = config["node"]["placements"]
                 .as_object_mut()
                 .expect("system placements");
