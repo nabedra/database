@@ -56,8 +56,6 @@ Docker image, crash campaign and acceptance jobs there.
 
 We only accept bug fixes from outside contributors. Read
 [CONTRIBUTING.md](CONTRIBUTING.md) before you open an issue or a pull request.
-If you change how workers execute or recover requests, also follow
-[AGENTS.md](AGENTS.md).
 
 ## License
 
