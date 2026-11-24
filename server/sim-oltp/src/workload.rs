@@ -25,22 +25,43 @@ use crate::{
     history::{Client, Completion, History, Operation},
     invariants::{Invariants, STEP, TraceObserver, elapsed_ms},
     node::Cluster,
-    sweep::{Defect, RunResult},
+    sweep::{Defect, RunResult, Setup},
+    workloads::{self, Scenarios, Workload},
 };
 
 const OPERATIONS: &str = "/v1/operations";
 const SETUP_DEADLINE: Duration = Duration::from_secs(20);
 const SETTLE_LIMIT: Duration = Duration::from_secs(2);
 
-pub(crate) fn run_seed(seed: u64, generator: &mut Gen, defect: Defect) -> RunResult {
-    run(seed, generator, defect, None)
+pub(crate) fn run_seed(seed: u64, generator: &mut Gen, defect: Defect, setup: &Setup) -> RunResult {
+    run(seed, generator, defect, None, setup)
 }
 
-fn run(seed: u64, generator: &mut Gen, defect: Defect, cold_start: Option<DiskCut>) -> RunResult {
-    let config = Config::sample(seed);
-    let program = Program::generate(generator);
+fn run(
+    seed: u64,
+    generator: &mut Gen,
+    defect: Defect,
+    cold_start: Option<DiskCut>,
+    setup: &Setup,
+) -> RunResult {
+    let workload = setup.workloads.of(seed);
+    let mut config = Config::sample(seed);
+    if setup.selection.focus.batch {
+        config.force("data.direct.batch", json!(true));
+    }
+    let program = (workload == Workload::Smoke).then(|| Program::generate(generator));
     let (mut result, world) = nabedra_sim::runtime::run(seed, |world| async move {
-        let result = execute(seed, config, program, defect, cold_start, world.clone()).await;
+        let body = Body {
+            seed,
+            config,
+            program,
+            defect,
+            cold_start,
+            workload,
+            setup,
+            generator,
+        };
+        let result = execute(body, world.clone()).await;
         (result, world)
     });
     // The runtime has dropped, including cancelled task futures and blocking helpers.
@@ -80,14 +101,30 @@ impl Program {
     }
 }
 
-async fn execute(
+struct Body<'a> {
     seed: u64,
     config: Config,
-    program: Program,
+    program: Option<Program>,
     defect: Defect,
     cold_start: Option<DiskCut>,
-    world: Arc<World>,
-) -> RunResult {
+    workload: Workload,
+    setup: &'a Setup,
+    generator: &'a mut Gen,
+}
+
+async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
+    let Body {
+        seed,
+        config,
+        program,
+        defect,
+        cold_start,
+        workload,
+        setup,
+        generator,
+    } = body;
+    let mut scenarios = Scenarios::new();
+    let mut summary = Value::Null;
     config.setup(&world);
     let configuration = config.report();
     let trace = Arc::new(Mutex::new(RunTrace::default()));
@@ -98,8 +135,8 @@ async fn execute(
     observer(0, format!("configuration {}", configuration["hash"]));
     let checks = Invariants::new();
     checks.set_trace(observer.clone());
-    let mut history = History::default();
-    history.set_trace(observer.clone());
+    let history = Arc::new(Mutex::new(History::default()));
+    history.lock().unwrap().set_trace(observer.clone());
     let mut assertions = BTreeMap::new();
     // This ticker uses runtime time. Drifting node clocks never alter the
     // invariant sampling frequency.
@@ -130,8 +167,36 @@ async fn execute(
             let startup = cluster.start().await;
             assertions.insert("cluster readiness", startup.is_ok());
             match startup {
+                Ok(()) if workload != Workload::Smoke => {
+                    let report = workloads::direct::run(
+                        &mut cluster,
+                        &config,
+                        history.clone(),
+                        generator,
+                        seed,
+                        workload,
+                        &setup.selection,
+                        setup.quiet,
+                    )
+                    .await;
+                    match report {
+                        Ok(report) => {
+                            for (name, passed) in report.assertions {
+                                assertions.insert(name, passed);
+                            }
+                            scenarios = report.scenarios;
+                            summary = report.summary;
+                        }
+                        Err(error) => {
+                            assertions.insert("public HTTP workload completed", false);
+                            checks.violate(&world, "Workload", error);
+                        }
+                    }
+                }
                 Ok(()) => {
-                    match smoke(&mut cluster, &config, &program, defect, &mut history).await {
+                    let program = program.as_ref().expect("smoke program");
+                    let mut history = history.lock().unwrap();
+                    match smoke(&mut cluster, &config, program, defect, &mut history).await {
                         Ok(table) => {
                             assertions.insert("public HTTP workload completed", true);
                             if let Some(cut) = cold_start {
@@ -140,7 +205,7 @@ async fn execute(
                                     &mut cluster,
                                     &mut history,
                                     &table,
-                                    &program,
+                                    program,
                                     cut,
                                 )
                                 .await;
@@ -188,6 +253,7 @@ async fn execute(
         !has_violation(&checks, "MountedDeviceIdentity"),
     );
     assertions.insert("liveness", !has_violation(&checks, "Liveness"));
+    let history = std::mem::take(&mut *history.lock().unwrap());
     if history.events().iter().any(|event| event.key.is_some()) {
         let verdict = history.check_direct();
         assertions.insert(
@@ -214,6 +280,9 @@ async fn execute(
         },
         assertions,
         blocking_cpu: None,
+        workload,
+        scenarios,
+        summary,
     }
 }
 
@@ -561,8 +630,9 @@ mod tests {
         if let Some(dir) = std::env::var_os("NABEDRA_SIM_ARTIFACTS") {
             config.artifacts = dir.into();
         }
+        let setup = Setup::smoke();
         let report = sweep(&config, |seed, generator| {
-            run(seed, generator, Defect::None, Some(DiskCut::Power)).run
+            run(seed, generator, Defect::None, Some(DiskCut::Power), &setup).run
         });
         report.assert_passed();
         let seed = &report.seeds[0];

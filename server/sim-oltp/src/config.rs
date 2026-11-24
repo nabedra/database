@@ -53,6 +53,12 @@ impl Config {
         Self { knobs }
     }
 
+    /// Override one sampled knob, as a seed-search focus token asks (`batch`).
+    pub fn force(&mut self, knob: &str, value: Value) {
+        assert!(self.knobs.contains_key(knob), "unknown knob {knob}");
+        self.knobs.insert(knob.into(), value);
+    }
+
     pub fn deadline(&self) -> Duration {
         Duration::from_millis(self.knobs["request_deadline_ms"].as_u64().unwrap())
     }
