@@ -1,0 +1,66 @@
+{
+  "artifacts": [
+    {
+      "name": "land-tooling-b737a83-154404--specs-selftest-trace.log",
+      "sha256": "f658468c84e8e79e84619e4cc408e8307118ca0668af846220662c639ee08279"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "6c179bee2dfcde228d85521a9037ed1702fbb9c5904b3775e421755fba4245ed"
+    },
+    {
+      "name": "tla/trace-000.log",
+      "sha256": "da509ade531c84e22641d57872628a2c5cd0c5188dde60d9244aa5bd8afe7754"
+    },
+    {
+      "name": "tla/trace-001.log",
+      "sha256": "25a7502ba38b1a710dcfc037132f4fefca6960e2f9d6eb70a6356e479e018183"
+    }
+  ],
+  "assertions": {
+    "executed": 2,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "specs-selftest-trace",
+  "duration_s": 1.921,
+  "guarantees": [],
+  "kind": "T",
+  "mode": {
+    "tla": "trace"
+  },
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T14:44:41.443114+00:00",
+    "request_id": "land-tooling-b737a83-154404",
+    "runner": "GitHub Actions 1000011462",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45417380925"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "b737a83973b299994d371cdceff24eef4430d0c8",
+  "sim_core_hours": null,
+  "tla": {
+    "budget_s": 900,
+    "mode": "trace",
+    "spec": "specs/selftest/TwoPhase",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "traces": {
+      "accepted": 1,
+      "checked": 2,
+      "expected_rejections": 1,
+      "failing": [],
+      "rejected": 1
+    }
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}

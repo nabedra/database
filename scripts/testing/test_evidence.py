@@ -80,6 +80,45 @@ class ValidatorTests(unittest.TestCase):
             self.assertNotEqual(evidence.validate(bad), [])
         self.assertNotEqual(evidence.validate(good(kind="T Z")), [])
 
+    def test_limits_and_dropped_counts_are_optional_facts(self):
+        rec = good(kind="T")
+        rec["tla"] = {"spec": "specs/x/X", "mode": "exhaustive", "tier": "T1", "tools": "t", "truncated": True,
+                      "limits": ["X.cfg: CONSTRAINT Few: terms"], "dropped": {"mutants": 3, "failing_mutants": 1}}
+        self.assertEqual(evidence.validate(rec), [])
+        for dropped in ({"mutants": 0}, {"mutants": "3"}, [3]):
+            rec["tla"]["dropped"] = dropped
+            self.assertNotEqual(evidence.validate(rec), [])
+
+    def test_records_written_before_the_new_facts_still_validate(self):
+        # The attested records of run 45417380925, written by #110 before `limits` and `dropped`.
+        records = sorted((Path(__file__).resolve().parent / "testdata" / "tla" / "records").glob("*.json"))
+        self.assertEqual(sorted(p.stem for p in records), ["specs-selftest", "specs-selftest-large", "specs-selftest-trace"])
+        for path in records:
+            with self.subTest(path.stem):
+                record = json.loads(path.read_text())
+                self.assertEqual(evidence.validate(record), [])
+                self.assertEqual(evidence.tla_contradictions(record["tla"]), [])
+
+    def test_tla_contradictions(self):
+        facts = {"spec": "s", "mode": "exhaustive", "tier": "T1", "tools": "t",
+                 "runs": [{"cfg": "X.cfg", "verdict": "pass", "states_left": 0}],
+                 "mutants": [{"name": "m", "ok": True}], "uncovered": []}
+        self.assertEqual(evidence.tla_contradictions(facts), [])
+        for change in ({"mode": "guess"}, {"mode": None}, {"uncovered": ["A"]}, {"mutants": [{"name": "m", "ok": False}]},
+                       {"mutants": [{"name": "m"}]}, {"runs": [{"cfg": "X.cfg", "verdict": "incomplete"}]},
+                       {"runs": [{"cfg": "X.cfg", "verdict": "pass", "states_left": 4}]},
+                       {"runs": [{"cfg": "X.cfg", "verdict": "pass", "states_left": None}]},
+                       {"traces": {"failing": [{"file": "a"}]}}, {"dropped": {"failing_mutants": 1}},
+                       {"dropped": {"uncovered": 2}}, {"dropped": {"failing_runs": 1}},
+                       {"dropped": {"failing_traces": 1}}):
+            with self.subTest(change=change):
+                self.assertEqual(len(evidence.tla_contradictions({**facts, **change})), 1)
+        self.assertEqual(evidence.tla_contradictions(None), ["no tla facts"])
+        # A simulation ends with states it never visited, and dropped passing facts contradict nothing.
+        self.assertEqual(evidence.tla_contradictions(
+            {"mode": "simulation", "runs": [{"cfg": "X.cfg", "verdict": "pass", "states_left": None}],
+             "dropped": {"mutants": 9, "artifacts": 2}}), [])
+
     def test_zero_assertions_can_never_pass(self):
         rec = good()
         rec["assertions"]["executed"] = 0

@@ -156,6 +156,37 @@ def validate(record: dict, schema: dict | None = None) -> list[str]:
     return errors
 
 
+def tla_contradictions(tla: Any) -> list[str]:
+    """Why a kind T record's facts do not support a `pass`. Empty when nothing contradicts it.
+
+    The runners derive their verdict from these facts, so a disagreement means one of the two is wrong."""
+    if not isinstance(tla, dict):
+        return ["no tla facts"]
+    out = []
+    if tla.get("mode") not in ("exhaustive", "simulation", "trace"):
+        out.append(f"unknown mode {tla.get('mode')!r}")
+
+    def entries(value: Any) -> list[dict]:
+        return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+    for run in entries(tla.get("runs")):
+        if run.get("verdict") != "pass":
+            out.append(f"run {run.get('cfg')} is {run.get('verdict')}")
+        elif tla.get("mode") == "exhaustive" and run.get("states_left", 0) != 0:
+            out.append(f"run {run.get('cfg')} left {run.get('states_left')} states")
+    out.extend(f"mutant {m.get('name')} failed" for m in entries(tla.get("mutants")) if m.get("ok") is not True)
+    if tla.get("uncovered"):
+        out.append("uncovered actions")
+    traces = tla.get("traces")
+    if isinstance(traces, dict) and traces.get("failing"):
+        out.append("failing traces")
+    dropped = tla.get("dropped")
+    for key in ("failing_runs", "failing_mutants", "failing_traces", "uncovered"):
+        if isinstance(dropped, dict) and dropped.get(key):
+            out.append(f"{dropped[key]} dropped {key.replace('_', ' ')}")
+    return out
+
+
 def dumps(record: dict) -> str:
     return json.dumps(record, indent=2, sort_keys=True) + "\n"
 

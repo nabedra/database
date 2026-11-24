@@ -114,7 +114,13 @@
         "min_action_coverage": {"type": ["integer", "null"], "minimum": 0},
         "uncovered": {"type": "array", "maxItems": 50, "items": {"type": "string", "maxLength": 120}},
         "unmutated": {"type": "array", "maxItems": 50, "items": {"type": "string", "maxLength": 120}},
-        "truncated": {"type": "boolean", "description": "Runs, mutants or details were dropped to fit the record size limit; summary.json has them all."},
+        "limits": {"type": "array", "maxItems": 50, "description": "Constraints and overridden definitions the baselines declare, with the states each constraint kept.", "items": {"type": "string", "maxLength": 200}},
+        "truncated": {"type": "boolean", "description": "Something was dropped or shortened to fit the record; `dropped` counts it and the summary.json artifact has it all."},
+        "dropped": {
+          "description": "How many entries of each list are not in this record: runs, failing_runs, mutants, failing_mutants, failing_traces, uncovered, unmutated, limits, not_run, artifacts, details (removed) and shortened (cut texts).",
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 1}
+        },
         "runs": {
           "type": "array",
           "maxItems": 20,
