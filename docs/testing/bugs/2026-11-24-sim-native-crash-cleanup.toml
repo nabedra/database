@@ -1,0 +1,14 @@
+id = "SIM-NATIVE-CRASH-CLEANUP"
+title = "Panicking queued native guards aborted simulated crash cleanup"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G09", "SCHED-G01"]
+scenarios = ["F02", "F03"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "oltp::pool::resources::sim_tests::f02_f03_native_crash_contains_panics_in_queued_job_cleanup"
+seed = 41
+why_not_caught = "The crash test queued ordinary guards. The panic test ran a job to completion on the blocking helper, outside the receiver's crash cleanup."
+invariant_added = "A node crash contains each abandoned native job's cleanup panic independently. All queued jobs drop their guards and release their native slots and compute charges."
+fix_commits = ["8a9bb38523ba3846587ac8a50c2442fd5609891b"]
+revert_patch_ok = false
