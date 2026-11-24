@@ -29,6 +29,7 @@ CONSTANTS
     MaxPartitions,      \* network partitions between brokers
     MaxDrops,           \* lost client request or reply
     MaxDups,            \* duplicated client request: a retry racing its original
+    MaxFaults,          \* faults of all kinds together in one behavior
     Mutant              \* "none" in EventsLog.cfg, a mutant name in mutants/*.cfg
 
 ASSUME Cardinality(Nodes) >= 3
@@ -159,7 +160,10 @@ Pending(m) ==
 
 Waiting(m) == m \notin req /\ ~(\E r \in rep : r.rq = m) /\ ~Pending(m)
 
-Budget(k, max) == used[k] < max
+RECURSIVE SumUsed(_)
+SumUsed(S) ==
+    IF S = {} THEN 0 ELSE LET k == CHOOSE x \in S : TRUE IN used[k] + SumUsed(S \ {k})
+Budget(k, max) == used[k] < max /\ SumUsed(DOMAIN used) < MaxFaults
 Spend(k) == used' = [used EXCEPT ![k] = @ + 1]
 
 -----------------------------------------------------------------------------
@@ -195,8 +199,11 @@ Init ==
 Voters(n, t) ==
     {v \in Nodes : Alive(v) /\ Conn(n, v) /\ term[v] < t /\ UpToDate(log[n], log[v])}
 
+\* n campaigns above every reachable term: a candidacy that a higher term
+\* rejects only teaches n that term (OpenRaft, vote rejection), and those
+\* failed rounds are merged into this step.
 Election(n) ==
-    LET t == term[n] + 1
+    LET t == 1 + MaxOf({term[v] : v \in {u \in Nodes : Alive(u) /\ Conn(n, u)}})
         Q == Voters(n, t)
     IN
     /\ Alive(n)

@@ -30,8 +30,12 @@ CONSTANTS
     MaxPartitions,      \* the leader is isolated in a minority and a new leader takes over
     MaxDrops,           \* lost client request or reply
     MaxDups,            \* duplicated client request: a retry racing its original
-    MaxClockBacks,      \* a broker clock steps back by one tick
-    MaxConsumerCrashes  \* a consumer dies holding its lease
+    MaxClockJumps,      \* a broker clock jumps one tick forward or back, within MaxDrift
+    MaxDrift,           \* the assumed bound on a broker clock's error, in ticks
+    MaxConsumerCrashes, \* a consumer dies holding its lease
+    MaxFaults,          \* faults of all kinds together in one behavior; T1 runs set it
+                        \* to the sum of the budgets, so it bounds nothing
+    Variant             \* "none", or a candidate design fix under review
 
 ASSUME Cardinality(Nodes) >= 3 /\ PageLimit >= 1 /\ LeaseTtl >= 1
 
@@ -41,7 +45,7 @@ VARIABLES
     pend,       \* commands the leader appended and has not committed, in log order
     stale,      \* an isolated former leader and its applied state (poll_local_read only)
     now,        \* true time
-    skew,       \* broker n's clock reads now - skew[n]
+    skew,       \* broker n's clock reads now - skew[n]; negative is ahead
     req, rep,   \* client channel
     pst,        \* producer: index of the batch it is sending
     cst,        \* consumer state
@@ -64,13 +68,18 @@ ghostVars == <<receipts, seen, delivered, expiredIds, maxAckCkpt, maxRcpt, lastR
                fence, saw410>>
 vars == <<logVars, envVars, clientVars, used, ghostVars>>
 
+\* Broker n's clock: true time with an error of at most MaxDrift (the plan
+\* monitors skew; it states no bound, so the spec fixes one tick).
 Clock(n) == IF now >= skew[n] THEN now - skew[n] ELSE 0
 Stamps == {Clock(n) : n \in Nodes}
 NoStale == [on |-> FALSE, b |-> "none", sm |-> Init0]
 
 Pending(m) == \E i \in 1..Len(pend) : pend[i].rq = m
 Waiting(m) == m \notin req /\ ~(\E r \in rep : r.rq = m) /\ ~Pending(m)
-Budget(k, max) == used[k] < max
+RECURSIVE SumUsed(_)
+SumUsed(S) ==
+    IF S = {} THEN 0 ELSE LET k == CHOOSE x \in S : TRUE IN used[k] + SumUsed(S \ {k})
+Budget(k, max) == used[k] < max /\ SumUsed(DOMAIN used) < MaxFaults
 Spend(k) == used' = [used EXCEPT ![k] = @ + 1]
 
 Init ==
@@ -177,25 +186,6 @@ HandleWrite(m, keep, t) ==
     /\ Consume(m, keep)
     /\ UNCHANGED <<sm, ldr, stale, envVars, rep, pst, cst, ghostVars>>
 
-\* http::poll: Group::read confirms leadership with a quorum and waits for the
-\* applied index, so it reads the committed state. Mutant poll_local_read: an
-\* isolated former leader answers from its own applied state.
-HandlePoll(m, keep) ==
-    /\ m \in req /\ m.type = "poll"
-    /\ keep => Budget("dup", MaxDups)
-    /\ \E src \in {"leader"} \cup (IF stale.on THEN {"stale"} ELSE {}) :
-       LET S == IF src = "leader" THEN sm ELSE stale.sm
-           clock == IF src = "leader" THEN Clock(ldr) ELSE Clock(stale.b)
-           res == PollResult(S, m, clock)
-       IN /\ rep' = rep \cup {Reply(m, res)}
-          /\ seen' = seen \cup res.evs
-          /\ lastRead' = [ckpt |-> S.ckpt, tail |-> TailOff(S),
-                          minCkpt |-> maxAckCkpt, minTail |-> maxRcpt]
-          /\ fence' = (fence \/ (res.type # "lost" /\ m.gen < sm.lease.gen))
-    /\ Consume(m, keep)
-    /\ UNCHANGED <<logVars, envVars, pst, cst, receipts, delivered, expiredIds,
-                   maxAckCkpt, maxRcpt, saw410>>
-
 \* Control::retain on the leader: append a retention floor from its clock when
 \* the oldest retained event is older than the cutoff.
 RetainTick ==
@@ -241,17 +231,6 @@ SendClaim(c) ==
     /\ req' = req \cup {ClaimReq(c, cst[c].cid)}
     /\ UNCHANGED <<logVars, envVars, rep, pst, used, ghostVars>>
 
-SendPoll(c) ==
-    /\ cst[c].ph = "ready"
-    /\ cst' = [cst EXCEPT ![c].ph = "wait", ![c].cur = PollReq(c, cst[c].gen)]
-    /\ req' = req \cup {PollReq(c, cst[c].gen)}
-    /\ UNCHANGED <<logVars, envVars, rep, pst, used, ghostVars>>
-
-ConsumerRetry(c) ==
-    /\ cst[c].ph = "wait" /\ Waiting(cst[c].cur)
-    /\ req' = req \cup {cst[c].cur}
-    /\ UNCHANGED <<logVars, envVars, rep, pst, cst, used, ghostVars>>
-
 \* A lost lease: claim again with a new claim id, or stop once ids run out.
 LoseLease(c) ==
     IF cst[c].cid < MaxClaims
@@ -259,6 +238,46 @@ LoseLease(c) ==
     ELSE [ph |-> "retired", cid |-> cst[c].cid, gen |-> 0, cur |-> NoReq]
 
 Ready(c, g) == [ph |-> "ready", cid |-> cst[c].cid, gen |-> g, cur |-> NoReq]
+
+\* http::poll (Group::read confirms leadership with a quorum, waits for the
+\* applied index, then reads the committed state) as one step: the consumer
+\* blocks on its own response, so a lost or reordered poll reply only repeats
+\* the poll. Mutant poll_local_read: an isolated former leader answers from its
+\* own applied state. Then process the page and ack a prefix of it
+\* (subscriptions::read, http::poll and http::ack).
+Poll(c) ==
+    /\ cst[c].ph = "ready"
+    /\ \E src \in {"leader"} \cup (IF stale.on THEN {"stale"} ELSE {}) :
+       LET S == IF src = "leader" THEN sm ELSE stale.sm
+           clock == IF src = "leader" THEN Clock(ldr) ELSE Clock(stale.b)
+           m == PollReq(c, cst[c].gen)
+           res == PollResult(S, m, clock)
+       IN /\ seen' = seen \cup res.evs
+          /\ lastRead' = [ckpt |-> S.ckpt, tail |-> TailOff(S),
+                          minCkpt |-> maxAckCkpt, minTail |-> maxRcpt]
+          /\ fence' = (fence \/ (res.type # "lost" /\ m.gen < sm.lease.gen))
+          /\ CASE res.type = "lost" ->
+                    /\ cst' = [cst EXCEPT ![c] = LoseLease(c)]
+                    /\ UNCHANGED <<req, delivered, saw410>>
+               [] res.type = "expired" ->
+                    /\ saw410' = TRUE
+                    /\ UNCHANGED <<cst, req, delivered>>
+               [] res.type = "events" /\ res.evs = {} ->
+                    /\ UNCHANGED <<cst, req, delivered, saw410>>
+               [] res.type = "events" /\ res.evs # {} ->
+                    /\ delivered' = delivered \cup {e.off : e \in res.evs}
+                    /\ \E th \in (res.after + 1)..res.last :
+                          LET a == AckReq(c, cst[c].gen, res.after, res.last, th) IN
+                          /\ cst' = [cst EXCEPT ![c].ph = "wait", ![c].cur = a]
+                          /\ req' = req \cup {a}
+                    /\ UNCHANGED saw410
+    /\ UNCHANGED <<logVars, envVars, rep, pst, used, receipts, expiredIds, maxAckCkpt,
+                   maxRcpt>>
+
+ConsumerRetry(c) ==
+    /\ cst[c].ph = "wait" /\ Waiting(cst[c].cur)
+    /\ req' = req \cup {cst[c].cur}
+    /\ UNCHANGED <<logVars, envVars, rep, pst, cst, used, ghostVars>>
 
 ConsumerReceive(c) ==
     \E r \in rep :
@@ -277,17 +296,6 @@ ConsumerReceive(c) ==
               /\ cst' = [cst EXCEPT ![c] = Ready(c, cst[c].gen)]
               /\ saw410' = TRUE
               /\ UNCHANGED <<req, delivered>>
-         [] r.type = "events" /\ r.evs = {} ->
-              /\ cst' = [cst EXCEPT ![c] = Ready(c, cst[c].gen)]
-              /\ UNCHANGED <<req, delivered, saw410>>
-         [] r.type = "events" /\ r.evs # {} ->
-              \* Process the page (the destination is idempotent), then ack a prefix.
-              /\ delivered' = delivered \cup {e.off : e \in r.evs}
-              /\ \E th \in (r.after + 1)..r.last :
-                    LET a == AckReq(c, r.rq.gen, r.after, r.last, th) IN
-                    /\ cst' = [cst EXCEPT ![c].cur = a]
-                    /\ req' = req \cup {a}
-              /\ UNCHANGED saw410
          [] OTHER ->  \* ckpt, invalid
               /\ cst' = [cst EXCEPT ![c] = Ready(c, cst[c].gen)]
               /\ UNCHANGED <<req, delivered, saw410>>
@@ -319,9 +327,11 @@ DropReply ==
         /\ Spend("drop")
         /\ UNCHANGED <<logVars, envVars, req, pst, cst, ghostVars>>
 
-ClockBack(n) ==
-    /\ Budget("clock", MaxClockBacks) /\ skew[n] = 0 /\ now > 0
-    /\ skew' = [skew EXCEPT ![n] = 1]
+ClockJump(n) ==
+    /\ Budget("clock", MaxClockJumps) /\ skew[n] = 0
+    /\ \E d \in {-MaxDrift, MaxDrift} :
+           /\ d <= now
+           /\ skew' = [skew EXCEPT ![n] = d]
     /\ Spend("clock")
     /\ UNCHANGED <<logVars, now, clientVars, ghostVars>>
 
@@ -350,18 +360,17 @@ Done ==
     /\ UNCHANGED vars
 
 HandleAnyWrite == \E m \in req, keep \in BOOLEAN, t \in Stamps : HandleWrite(m, keep, t)
-HandleAnyPoll == \E m \in req, keep \in BOOLEAN : HandlePoll(m, keep)
 Failover == \E k \in 0..Len(pend), b \in Nodes : LeaderFails(k, b)
 Isolate == \E k \in 0..Len(pend), b \in Nodes : LeaderIsolated(k, b)
 
 Next ==
-    \/ CommitNext \/ HandleAnyWrite \/ HandleAnyPoll \/ RetainTick \/ OperatorReset
+    \/ CommitNext \/ HandleAnyWrite \/ RetainTick \/ OperatorReset
     \/ \E p \in Producers : ProducerRetry(p) \/ ProducerReceive(p)
-    \/ \E c \in Consumers : SendClaim(c) \/ SendPoll(c) \/ ConsumerRetry(c)
+    \/ \E c \in Consumers : SendClaim(c) \/ Poll(c) \/ ConsumerRetry(c)
                             \/ ConsumerReceive(c) \/ ConsumerCrash(c)
     \/ DiscardReply \/ DropRequest \/ DropReply
     \/ Failover \/ Isolate \/ Heal
-    \/ \E n \in Nodes : ClockBack(n)
+    \/ \E n \in Nodes : ClockJump(n)
     \/ Tick
     \/ Done
 
@@ -372,14 +381,13 @@ Fairness ==
     /\ WF_vars(CommitNext)
     \* HTTP handlers on the leader, reached through route refresh
     /\ WF_vars(\E m \in req, t \in Stamps : HandleWrite(m, FALSE, t))
-    /\ WF_vars(\E m \in req : HandlePoll(m, FALSE))
     \* Control::retain loop and the 410 runbook
     /\ WF_vars(RetainTick) /\ WF_vars(OperatorReset)
     \* SDK retry timers and response handling
     /\ \A p \in Producers : WF_vars(ProducerRetry(p)) /\ WF_vars(ProducerReceive(p))
     /\ \A c \in Consumers : WF_vars(ConsumerRetry(c)) /\ WF_vars(ConsumerReceive(c))
     \* The consumer pool keeps claiming and polling (sub.claim(), lease.poll())
-    /\ \A c \in Consumers : WF_vars(SendClaim(c)) /\ WF_vars(SendPoll(c))
+    /\ \A c \in Consumers : WF_vars(SendClaim(c)) /\ WF_vars(Poll(c))
     /\ WF_vars(DiscardReply)
     \* The partition heals; time passes
     /\ WF_vars(Heal) /\ WF_vars(Tick)
@@ -392,7 +400,7 @@ TypeOK ==
     /\ \A i \in 1..Len(pend) :
            pend[i].type \in {"publish", "claim", "ack", "retain", "reset"}
     /\ stale.on \in BOOLEAN
-    /\ now \in 0..MaxTime /\ skew \in [Nodes -> {0, 1}]
+    /\ now \in 0..MaxTime /\ skew \in [Nodes -> (-MaxDrift)..MaxDrift]
     /\ \A m \in req : m.type \in {"publish", "claim", "poll", "ack"}
     /\ \A r \in rep : r.rq.type \in {"publish", "claim", "poll", "ack"}
     /\ \A c \in Consumers :
@@ -438,9 +446,13 @@ G06_PollLinearizable ==
     lastRead.ckpt >= lastRead.minCkpt /\ lastRead.tail >= lastRead.minTail
 
 \* EVT-G08: retention removes events by publish time only, never before their
-\* retention period, and publish time is nondecreasing in offset order.
+\* retention period, and publish time is nondecreasing in offset order. The
+\* register names no clock tolerance, so the property is strict. Variant
+\* drift_bound_stated is the candidate fix: the plan states a clock bound and
+\* the guarantee allows early removal by at most that bound.
 G08_RetentionByPublishTime ==
-    \A x \in sm.removed : x.pt + RetainAfter < now
+    \A x \in sm.removed :
+        x.pt + RetainAfter < now + (IF Variant = "drift_bound_stated" THEN MaxDrift ELSE 0)
 
 G08_PublishTimeMonotone ==
     \A e, f \in sm.evs : e.off < f.off => e.pt <= f.pt
