@@ -381,8 +381,8 @@ to 12 design commits to it; **no** = not injectable.
 | a crash at every step, including recovery | today (L: `crash_after` enumeration, NS04) | none |
 | media damage of a synced record (`MaxMedia`: bit flip or EIO) | today (L: `flip_bit`, read EIO by range) | none |
 | disk loss (`MaxDiskLoss`) | not driven: the campaign has no wipe step (`CutKind` is Crash, Kill, PowerLoss, PowerLoss4k) | **harness gap** |
-| fsync EIO | today (L: `EioSyncData`, `EioSyncAll`, `EioSyncDir`) | **spec gap** if Lsm does not model a failed sync (fsyncgate): the sim injects it in every campaign run |
-| ENOSPC, write and rename EIO | today (L) | **spec gap** unless Lsm models them |
+| fsync EIO | today (L: `EioSyncData`, `EioSyncAll`, `EioSyncDir`) | **spec gap**: `Lsm.tla` states "no ENOSPC or fsync errors" |
+| ENOSPC, write and rename EIO | today (L) | **spec gap** (same note in `Lsm.tla`) |
 
 #### cache: `CacheCluster` (dr-cache), L2
 
@@ -399,19 +399,18 @@ to 12 design commits to it; **no** = not injectable.
 | process pause between the clock sample and the effect | **no**: freeze stops a node only at `.await` points | **sim gap** (R-sim-19, H-04) |
 | controller disk loss | deferred (lead decision 4: controller log on `/dev/shm`) | `not-run` until the controller uses a modelled volume |
 
-#### events: `EventsPartition` (dr-events), L2
+#### events: `EventsLog` and `EventsDelivery` (dr-events), L2
 
-The spec was incomplete at the time of writing (no fault actions yet). From the prompt: crash and restart with and
-without the disk, partitions, loss, duplication and reordering.
-
-| Spec fault (planned) | Simulator | Gap |
+| Spec fault | Simulator | Gap |
 | --- | --- | --- |
-| crash, restart with the disk | today (E: broker removed, `FaultFs::crash()` image) | E never uses `Cut::Kill` or power loss: unsynced data never survives a crash, and never tears |
-| restart without the disk | API (`SimConfig::wipes`, no test enables it) | **harness gap** |
-| partitions | today (E isolate, block) | none |
-| loss, duplication, reordering | today (E `SimNetRpc`: drop until the deadline, duplicate copy, delays) | the duplicate copy crosses a link blocked after the original arrived (finding 4) |
-| pause | today, router pause only (the node keeps running) | a process pause is not injected (H-04) |
-| clock jumps | today (E: `advance_mono`, wall jumps) | **spec gap** unless the spec models them: EVT-G05 ("the lease clock never moves backward") and EVT-G08 depend on them |
+| `Crash(n)`, `Restart(n)` (EventsLog) | today (E: broker removed, `FaultFs::crash()` image) | E never uses a kill or a power-loss image: unsynced data never survives a crash, and never tears |
+| `RestartWithoutDisk(n)` (EventsLog, `MaxWipes`; mutant `prefix_empty_disk_rejoins_voter`) | API (`SimConfig::wipes`, no test enables it) | **harness gap**, and it blocks a seeded check of events R-04 |
+| `MaxStopAll` (full stop) | API (`Cluster::stop_all`); not checked whether a test drives it mid-run | confirm with the simulator wave |
+| partition, `Isolate`, `Heal` | today (E isolate, block) | none |
+| `DropRequest`, `DropReply`, duplicates | today (E: drop until the deadline, duplicate copy, delays) | the duplicate copy crosses a link blocked after the original arrived (finding 4) |
+| `ClockBack(n)` (EventsDelivery) | today (E wall jumps) | none for a backward step. Monotonic stalls (`advance_mono`) have no spec action |
+| `LoseLease`, consumer crash, failover | not checked | confirm with dr-events |
+| process pause | **no**: router pause only, the broker keeps running | **sim gap** if a spec adds it |
 
 #### olap: `OlapCommit` (dr-olap), L2
 
@@ -421,7 +420,7 @@ without the disk, partitions, loss, duplication and reordering.
 | `LoseReply` (applied, reply lost) | today (`Fault::LostResponse`) | none |
 | `PutDelayTimeout` (applies after the deadline) | today (`Fault::DelayApply`) | none |
 | `SchedulerTakeover`, `ColdStart` | `ColdStart` fence today (A T05). I found no same-run takeover in `commit_protocol_tests.rs` | **sim gap** for `SchedulerTakeover` |
-| 5xx, 412, 409, 404, embedded error | today (`Fault::Status`, `EmbeddedError`) | **spec gap** unless OlapCommit models the 5xx-on-PUT as ambiguous and the embedded error |
+| 5xx, 412, 409, 404, embedded error | today (`Fault::Status`, `EmbeddedError`) | OlapCommit models an ambiguous root PUT, which covers 5xx and the embedded error |
 | object-store network partition, process pause | **no** (in-process store) | not needed by the store semantics |
 
 #### olap-stream: `OlapStream` (dr-olap-stream), L2
@@ -432,7 +431,7 @@ without the disk, partitions, loss, duplication and reordering.
 | `DropReply` | today (S: lost reply) | none |
 | `DropRequest`, `DropInstall`, duplicate install (`MaxDup`), `Partition`, `Heal` | **no**: S calls the coordinator in process; peer transfer runs only in process tests | **sim gap**: replica-transfer loss, duplication and partitions have no seeded executor |
 | `SealExpire` | today (S cold start abandons old handles) | none |
-| GET 503 from the object store | today (S) | **spec gap** unless OlapStream models a failed read during a demand |
+| GET 503 from the object store | today (S) | **spec gap**: I found no failed read in `OlapStream.tla` |
 
 ### 3. Gaps in the simulator (a spec models it, the sim cannot inject it)
 
@@ -537,3 +536,46 @@ durable state of the same volume (not modelled yet: the shipped simulator cannot
 | H-03: P10 per-frame network faults are stronger than TCP | **Partly confirmed.** Refuted for loss and duplication: a planned drop or a profile `Cut` stalls the whole direction until a reset (`Fate::Drop`, `net.rs:1066`), and the OLTP Router absorbs duplicates (`sim-oltp/src/net/mod.rs:209`). Confirmed for reordering: `Fate::Frame{stream, delay}` lets frames of other streams overtake within one session ("one-stream delay", #101), which TCP cannot do (finding 6, witness `reach_frame_overtake`) |
 | P10 has one volume per worker | **Confirmed.** #106 `sim-oltp/src/disk.rs` mounts one `ROOT` per server process; keys, bootstrap and pool share it. The two-mount RV-REP #3 shape exists only in `oltp-storage/src/oltp/pool/sim_tests.rs` |
 | P2 is misframed | **Refuted for P2; confirmed for P5.** P2 (`World::crash` aborts tasks before halting volumes) is a real simulator-level defect with a detector (`sim/volumes/tests.rs:292` `no_mutating_call_reaches_a_volume_after_a_crash`) and a spec mutant (`disk/mutants/abort_before_halt.cfg`, `NoWriteAfterCut`). The independent read's "misframed" verdict is about **P5** ("`Wipe::Reformat` keeps the old inode base"), which is the realistic behaviour of `mkfs`: finding 2. Note: #106 changes the crash order to network first, then volumes (`cut_node`); both happen in one synchronous call, so no task runs in between and the order does not matter for P2 |
+
+### 9. Planted bugs and reverted fixes of phases 9 to 12: design level or code level
+
+**Design level** means a guard or an order is removed from the protocol, so a spec mutant should reject it. **Code
+level** means the rule is right and an implementation detail is wrong, so only the simulator or a test can see it.
+**Simulator level** plants a defect in the fault model or the harness. I classified from the designs, the bug records'
+titles and the independent read, and did not read the fix diffs. Rows marked "?" need them. The last column is a spec
+mutant that exists in another agent's worktree now and matches by name. I did not run those mutants.
+
+| Phase | Design level | Code level | Simulator level | Matching spec mutants seen |
+| --- | --- | --- | --- | --- |
+| 9 | R1, R2?, P1 | R3, R4 | P2, P3, P4, P6. P5 is the real behaviour of `mkfs`, not a defect | R1 `lsm/no_open_dir_sync`; P1 `lsm/flush_no_journal_sync`; R2 `lsm/retire_before_edit`?; P2 `sim/disk/abort_before_halt` |
+| 10 | BUG1, FIXA, D04, ACC3 O15 (liveness), AZ2 (liveness) | spares BUG1-encode-direct, BUG1-pre-append, FIXA-unproposed? | none | not compared (dr-oltp-direct's mutants were not in its folder yet) |
+| 11 uncertain outcome | 1 ACC3-receipt | 2 BUG1-encode-submit, 3 BUG1-stream | | not compared |
+| 11 stale route, topology, schema | 4 TOPO1, 5 BUG2, 6 RD1 | 7 IDXHOT?, 8 O21CAP? | | TOPO1 `oltp/child_stale_schema` |
+| 11 fence, lifecycle | 9 ACC2, 10 ACC3-ready-fence, 11 ACC3-delegation, 12 FIXC, 13 FIXB-cold-publish | | | not compared |
+| 11 membership, trust | 14 REP2, 15 RV-REP-3, 17 CAP1 | 16 FIXB-voter-refresh, 18 RV-REP-2 | | REP2 `oltp/rep2_any_removal`; RV-REP-3 `oltp/wiped_resumes` |
+| 11 resource release | 20 RD2? | 19 FLAKE3-epoch, 21 QLANE, 22 GC1-double-guard | | none |
+| 12 | P1, P2 (a coarse stand-in: it drops every delete, not the SET-after-DEL race the plan names), P3, P4, both lead decision 6 defects | | E1, E2 are expected failures of the fault model | P1 `cache/no_uncertainty`; P2 `cache/replica_keeps_deleted`; P3 `cache/owner_change_keeps_epoch`; P4 `cache/cold_reset_ignores_live_lease`; E1 `cache/drift_beyond_bound`, `sim/clock/e1_beyond_bound`; LD 6 `cache/staged_ignores_fence`, `cache/staged_ignores_lag` |
+
+The code-level rows depend most on interleaving and fault granularity. H-01 (atomic storage jobs) is the main risk for
+FLAKE3-epoch and GC1-double-guard, whose windows may not exist in the simulator.
+
+#### Simulator invariants with no spec property yet
+
+Compared by name with the specs on disk at 17:00. A "no" means I found no property with that meaning.
+
+| Simulator invariant | Spec property |
+| --- | --- |
+| `SlotOwnership`, `LeaseExclusive`, `ServedEpochOrder`, `ReplicaPrefix`, `ColdStartEmpty`, `ClockAssumption` | yes (`CacheCluster`; `ClockAssumption` also here) |
+| `ReplicaNotAhead`, `Convergence` (Cache) | no (`G05_ReplicaPrefix` may imply the first; ask dr-cache) |
+| `MemoryCap`, `RedirectAgrees` (Cache) | no. Reasons to leave them out: a capacity count, and client routing |
+| `SingleLeader`, `MonotonicCommit`, `AppliedPrefixesAgree` (Cache controllers) | no: the controllers are abstracted as one log |
+| `ElectionSafety`, `AppliedPrefixesAgree` (Events) | yes (`EventsLog`) |
+| `ElectionSafety`, `MonotonicVote` (OLTP) | yes (`OltpRanges` one leader and one vote per term) |
+| `LogMatching`, `MajorityReached` (OLTP) | partly (`G01_CommittedNeverLost`) |
+| `KeyspaceCoverage` (OLTP) | no property with that name in `OltpRanges` |
+| `WipedNeverVotes`, `RetryCertifiesNamedRemoval` | yes in effect (`OltpRanges` mutants `wiped_resumes`, `rep2_any_removal`) |
+| `SchemaEpochAtCommit` | partly (`OltpRanges` mutants `child_stale_schema`, `ddl_publish_first`) |
+| `CoveringIndexComplete`, `FenceAfterValidation` (index), `CapabilityBeforeUse` | no |
+| `DedupUnique`, `NotAppliedNeverCommitted`, `RangeClockRule1`, `QueueRetention`, `OneExecutionPerIdentity`, `QueueCopyStaleNotInvalid` | `OltpQueue` had `QueueRetention`, `G03_OnceExecution`, `G07_NoStaleRecord` and `G04_NotAppliedHasProof` at 15:30. I did not compare `OltpDirect` |
+| `ResourceBaseline`, `ExactlyOnceRelease`, `ReleaseAfterWork` | `OltpQueue` had `G09_SettleOnce`; nothing models the ledgers or native guards |
+| `CrashOrder`, `MountedDeviceIdentity` (harness) | `NoWriteAfterCut`, `UuidAnchorRejectsWipe` here |
