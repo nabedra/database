@@ -83,7 +83,7 @@ NOT_PRODUCT_PART = re.compile(r"sim|sim_\w*|\w*_sim|planted\w*|\w*acceptance\w*|
 # Text through which a line can act in the simulator alone, or read the build or its environment.
 SIM_ONLY = re.compile(r'\bsim(?:_\w+|ulat\w*)?\b|\w_sim\b|\bWorld\b|\bcfg|\bfeature\s*=|\btokio_unstable\b|'
                       r'\b(?:option_)?env!|\benv::|\bvar_os\b|\bcurrent_exe\b|\binclude(?:_str|_bytes)?!|#\[path')
-# A fix may have moved test code, so its revert may add this one attribute.
+# A fix may have moved test code, so its revert may change this one attribute.
 TEST_CFG = "#[cfg(test)]"
 # What a cfg predicate names when its code is compiled for the simulator and not for the product.
 SIM_CFG = re.compile(r'feature\s*=\s*"sim"|\btokio_unstable\b')
@@ -602,9 +602,9 @@ def validate_patch_paths(patch):
                             f"{', '.join(diff.headers) or 'no hunk'}")
     if len({diff.name for diff in files}) != len(files):
         problems.append("revert.patch has two sections for one file")
-    for name, (_, added) in changed_lines(patch).items():
-        problems.extend(f"revert.patch adds to {name} a line that can act only in the simulator, or that reads the "
-                        f"build or its environment: {line.strip()[:80]!r}" for line in added
+    for name, (removed, added) in changed_lines(patch).items():
+        problems.extend(f"revert.patch changes in {name} a line that can act only in the simulator, or that reads the "
+                        f"build or its environment: {line.strip()[:80]!r}" for line in [*removed, *added]
                         if SIM_ONLY.search(line) and line.strip() != TEST_CFG)
     return problems
 

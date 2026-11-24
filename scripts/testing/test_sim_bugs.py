@@ -142,7 +142,7 @@ def line(seed, ks):
         print("nabedra-sim-seed: " + json.dumps(row))
     if seed == script.get("garbage") and searching:
         print("nabedra-sim-seed: {not json")
-if PATCHED and "FAKE_HANG" in env:
+if env.get("FAKE_HANG") == ("search" if searching else "replay" if replaying else "base"):
     import time
     time.sleep(60)
 if script.get("silent"):
@@ -192,6 +192,7 @@ report = {"evidence": "fault-model", "workload": workload, "defect": env.get("NA
 report.update(script.get(side + "_report", {}))
 for row in rows:
     row.update(script.get(side + "_row", {}))
+    row.update({} if replaying else script.get(side + "_base_row", {}))
     for key in script.get(side + "_row_without", []):
         del row[key]
 art.mkdir(parents=True, exist_ok=True)
@@ -811,6 +812,15 @@ class FoolTest(HarnessCase):
                 problems = sim_bugs.validate_patch_paths(f.revert_diff("server/src/lib.rs", text))
                 self.assertTrue(any("simulator" in problem for problem in problems), problems)
 
+    def test_patch_that_removes_the_simulators_exception(self):
+        # Without its attribute, the line runs in the simulator and nothing changes in the product.
+        f = self.f
+        text = FIXED.replace("    if uncertain", '    #[cfg(not(feature = "sim"))]\n    if uncertain', 1)
+        f.write("server/src/lib.rs", text)
+        f.commit("a line the simulator leaves out")
+        problems = sim_bugs.validate_patch_paths(f.revert_diff("server/src/lib.rs", FIXED))
+        self.assertTrue(any("simulator" in problem for problem in problems), problems)
+
     def test_patch_inside_code_compiled_only_for_the_simulator(self):
         f = self.f
         gated = FIXED + ('#[cfg(any(test, feature = "sim"))]\nmod planted {\n    pub fn lose() -> bool {\n'
@@ -851,7 +861,7 @@ class FoolTest(HarnessCase):
                 self.f.edit(f'expect = ["{KIND}"]', f'expect = ["{kind}"]')
                 status, output = self.f.run("check")
                 self.assertEqual(status, 1, output)
-                self.assertIn("expect", output)
+                self.assertIn("expect may not name", output)
                 self.f.edit(f'expect = ["{kind}"]', f'expect = ["{KIND}"]')
         self.f.edit(f'expect = ["{KIND}"]', 'expect = ["harness"]')
         self.f.edit(f'detector = "{KIND}"', 'detector = "harness"')
@@ -876,6 +886,18 @@ class FoolTest(HarnessCase):
         # The output edited as well: the commit the run tested holds another patch.
         f.edit(f"(digest {old})", f"(digest {sim_bugs.digest(text)})")
         self.assert_refused("holds a patch with other changed lines")
+
+    def test_evidence_of_a_commit_outside_the_history(self):
+        # A side branch holds the patch, and nothing on it was ever reviewed or merged.
+        f = self.f
+        side = sh(f.repo, "commit-tree", f"{self.tested}^{{tree}}", "-m", "elsewhere").strip()
+        f.edit(self.tested, side)
+        f.commit("cite a commit of no branch")
+        self.assert_not_counted("is not in HEAD's history", result="candidate")
+
+    def test_manifest_digest_alone(self):
+        self.f.edit(f'digest = "{sim_bugs.digest(self.f.patch)}"', f'digest = "{"0" * 64}"')
+        self.assert_refused("differ from those its regression evidence used")
 
     def test_digest_and_commit_pointed_at_an_unrelated_commit(self):
         f = self.f
@@ -1053,6 +1075,9 @@ class FoolTest(HarnessCase):
                 self.f.edit(old, author)
                 self.assert_refused("detection.confirmed_by")
                 self.f.edit(author, old)
+        self.f.edit('reviewer = "reviewer A"', 'reviewer = "Author  B"')
+        self.assert_refused("review.reviewer wrote the patch")
+        self.f.edit('reviewer = "Author  B"', 'reviewer = "reviewer A"')
         self.f.edit('confirmed_by = "reviewer A"', 'confirmed_by = " "')
         self.assert_refused("detection.confirmed_by")
 
@@ -1088,11 +1113,15 @@ class FoolTest(HarnessCase):
                 self.f.edit("seeds = [1, 10000]", f"seeds = {seeds}")
                 self.assert_refused("seeds must be [1, 10000]", script={"hit": 3, "clean": {"1": [KIND]}})
                 self.f.edit(f"seeds = {seeds}", "seeds = [1, 10000]")
+        self.f.edit("seeds = [1, 10000]", "seeds = [1, 10000]\nfound_seed = 4")
+        self.assert_refused("found_seed must be the seed of [detection]")
 
     def test_missing_seed_lines(self):
         self.assert_not_counted("seed lines", script={"hit": 3, "patched_search_skip": [1, 2]}, result="error")
         self.assert_not_counted("seed lines", script={"hit": 3, "patched_search_skip": [2]}, result="error")
         self.assert_not_counted("seed lines", script={"hit": 3, "clean_base_skip": [2]}, result="error")
+        self.assert_not_counted("the base run's seed lines and its sweep report disagree", result="error",
+                                script={"hit": 3, "clean_base_row": {"violations": ["Other"]}})
         self.assert_not_counted("seed line", script={"hit": 3, "patched_replay_skip": [3]}, result="error")
         self.assert_not_counted("seed line", script={"hit": 3, "clean_replay_skip": [3]}, result="error")
 
@@ -1141,6 +1170,9 @@ class FoolTest(HarnessCase):
                     sh(self.f.repo, "update-index", "--assume-unchanged", f"{BUG}/bug.toml")
                 self.assert_not_counted("differs from HEAD")
                 self.f.edit('profile = ["anything-else"]', 'profile = ["lost-reply"]')
+        sh(self.f.repo, "update-index", "--no-assume-unchanged", f"{BUG}/bug.toml")
+        self.f.write("docs/testing/guarantees/oltp.md", REGISTER + "| OLTP-G99 | invented |\n")
+        self.assert_not_counted("differs from HEAD")
 
     def test_inherited_variables_do_not_reach_the_harness(self):
         _, _, calls = self.assert_found(script={"hit": 3}, NABEDRA_SIM_DEFECT="lost-write", NABEDRA_SIM_EXPECT="x",
@@ -1213,6 +1245,12 @@ class FoolTest(HarnessCase):
         sh(self.root, "clone", "--quiet", "--no-local", "--depth", "1", str(self.f.repo), str(shallow))
         bugs, _ = sim_bugs.load_bugs(shallow)
         self.assertTrue(any("shallow" in problem for problem in sim_bugs.static_count_problems(bugs[0], shallow)))
+
+    def test_recorded_search_of_another_hit(self):
+        self.harness_run(script={"hit": 4})
+        self.f.edit(self.search_hash(), self.record())
+        self.f.commit("name the search that hit seed 4")
+        self.assert_not_counted("detection.search did not produce this hit", result="candidate")
 
     def test_rewritten_search_record(self):
         path = self.f.repo / BUG / "searches.jsonl"
@@ -1344,9 +1382,18 @@ class SearchTest(HarnessCase):
         row = self.assert_not_counted("incomplete", script={}, seeds=4, result="incomplete")
         self.assertEqual(row["tried"], 4)
         self.assert_not_counted("incomplete", script={"hit": 3}, seeds=2, result="incomplete")
-        status, output, summary, _ = self.harness_run("--time-limit", "3", script={"hit": 3}, FAKE_HANG="1")
+        status, output, summary, _ = self.harness_run("--time-limit", "3", script={"hit": 3}, seeds=None,
+                                                      FAKE_HANG="search")
         self.assertEqual((status, summary["bugs"][0]["result"]), (1, "incomplete"), output)
         self.assertIn("the time limit passed after 0 seeds", output)
+        # A hit whose base rate did not finish.
+        status, output, summary, _ = self.harness_run("--search-timeout", "5", script={"hit": 3}, FAKE_HANG="base")
+        self.assertEqual((status, summary["bugs"][0]["result"]), (1, "candidate"), output)
+        self.assertIn("the base rate over the seeds tried is incomplete", output)
+
+    def test_a_tree_that_holds_more_than_the_patch(self):
+        with patch.object(sim_bugs.Scratch, "changed", return_value=["server/src/lib.rs", "server/src/x.rs"]):
+            self.assert_not_counted("the patch changed ['server/src/lib.rs', 'server/src/x.rs']", result="error")
 
     def test_seeds_run_in_chunks(self):
         status, output, summary, calls = self.harness_run("--chunk", "2", script={"hit": 5, "clean": {"2": ["Other"]}})
@@ -1486,6 +1533,17 @@ class SearchTest(HarnessCase):
         first, second = map(json.loads, lines)
         self.assertEqual((first["n"], first["prev"], second["n"]), (1, None, 2))
         self.assertEqual(second["prev"], hashlib.sha256(lines[0].encode()).hexdigest())
+        # An entry that does not follow the one before it, before anyone commits it.
+        path = f.repo / BUG / "searches.jsonl"
+        for change in ({"prev": "0" * 64}, {"prev": None}, {"n": 3}):
+            with self.subTest(change=change):
+                path.write_text("\n".join(lines) + "\n")
+                entry = {**second, **change}
+                path.write_text(lines[0] + "\n" + json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
+                status, output = f.run("check")
+                self.assertEqual(status, 1, output)
+                self.assertIn("its number or the hash of the line before is wrong", output)
+        path.write_text("\n".join(lines) + "\n")
         # A search of another commit's patch or of another target is not this target's.
         status, output = f.run("record", "fix-one", "--from", str(self.root / "missing.json"))
         self.assertEqual(status, 2, output)
