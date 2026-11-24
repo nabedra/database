@@ -23,8 +23,9 @@ Commands:
                  applies the patch, builds, searches the manifest's seeds for the first one that
                  reports an expected kind, replays that seed alone on the patched build (it must
                  fail the same way, deterministically, with a history), resets the tree and
-                 replays the seed on the unpatched build, which must pass deterministically. It
-                 writes sim-bugs-run.json (seeds tried, found seed, kinds, trace hashes, history
+                 replays the seed on the unpatched build, which must pass deterministically. The
+                 unpatched build must also report no expected kind on any seed tried, so that a
+                 failure it already has is never credited to the patch. It writes sim-bugs-run.json (seeds tried, found seed, kinds, trace hashes, history
                  digests, patch SHA-256) beside the harness artifacts. While the harness or a
                  bug's workload is missing it prints `not-run: sim-harness-missing` and exits 0,
                  which the check records as not-run, never as a pass.
@@ -900,6 +901,23 @@ def search_bug(args, scratch, env, log, bug, plan, out_dir, clean_exe):
     if problem:
         row["why"] = f"clean replay of seed {hit['seed']}: {problem}"
         return row
+    # A patched build has another schedule, so one clean twin can pass by luck while the unpatched
+    # build reports the same kind on other seeds. None of the seeds tried may report it there.
+    control_env = sim_env(env, plan, label, out_dir / bug.id / "control", plan.first, row["tried"],
+                          expect=True, jobs=args.sim_jobs)
+    code, output = run_sweep(clean_exe, tree, control_env, log, args.search_timeout)
+    control = parse_seeds(output)
+    wanted = list(range(plan.first, plan.first + row["tried"]))
+    matched = first_match(control, plan.expect)
+    row["control"] = {"exit": code, "seeds": len(control), "seed": matched and matched["seed"],
+                      "kinds": matched and matched["kinds"]}
+    if matched:
+        row["why"] = (f"not attributable to the patch: the unpatched build reports "
+                      f"{matched['kinds']} at seed {matched['seed']}")
+        return row
+    if code != 101 or [entry["seed"] for entry in control] != wanted:
+        row["why"] = f"the clean control did not run every seed tried (exit {code})"
+        return row
     row["result"] = "found"
     return row
 
@@ -915,7 +933,8 @@ def describe(row):
             f"[{row['seeds'][0]}, {row['seeds'][1]}]; patched {patched['kinds']} trace "
             f"{patched['trace_hash']} ({patched['trace_events']} events, replay deterministic), "
             f"history sha256 {patched['history_sha256']}; clean twin pass trace {clean['trace_hash']} "
-            f"(replay deterministic); patch sha256 {row['patch_sha256']}")
+            f"(replay deterministic); clean control {row['control']['seeds']} seeds without "
+            f"{row['expect']}; patch sha256 {row['patch_sha256']}")
 
 
 def cmd_run(repo, bugs, args, out):

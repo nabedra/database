@@ -92,6 +92,8 @@ def kinds(seed, replay=False):
     if workload == "smoke":
         return ["non-linearizable"] if env.get("NABEDRA_SIM_DEFECT") == "lost-write" and seed >= 2 else []
     if not patched:
+        if seed == int(env.get("FAKE_CLEAN_KIND_AT", "0")):
+            return [kind]
         return ["Other"] if env.get("FAKE_CLEAN_FAILS") else []
     return [kind] if seed >= int(env.get("FAKE_HIT", "2")) and not (replay and env.get("FAKE_FLAKY")) else []
 def line(seed, ks):
@@ -379,9 +381,10 @@ class SimBugsTest(unittest.TestCase):
         self.assertIn("fix-one: found seed 3 after 3 seeds in [1, 5]; patched ['NotAppliedNeverCommitted']", output)
         self.assertIn("clean twin pass", output)
         self.assertIn("1 of 1 reverted fixes found", output)
-        # Clean build, patched search, patched replay of the hit, clean replay of the hit.
+        # Patched search, patched replay of the hit, clean replay of it, clean control over the prefix.
         self.assertEqual([(c["patched"], c["first"], c["count"], c["expect"]) for c in calls],
-                         [(True, 1, 5, "NotAppliedNeverCommitted"), (True, 3, 1, None), (False, 3, 1, None)])
+                         [(True, 1, 5, "NotAppliedNeverCommitted"), (True, 3, 1, None), (False, 3, 1, None),
+                          (False, 1, 3, "NotAppliedNeverCommitted")])
         self.assertTrue(all(c["defect"] is None and c["profile"] == "lost-reply" for c in calls))
         row = summary["bugs"][0]
         self.assertEqual((summary["mode"], summary["evidence"], row["result"], row["found_seed"], row["tried"]),
@@ -406,6 +409,8 @@ class SimBugsTest(unittest.TestCase):
             "clean_fails": "clean replay of seed 2: the unpatched build reported ['Other']",
             "flaky": "patched replay of seed 2: the seed's two runs differed",
             "hit": "5 seeds without ['NotAppliedNeverCommitted']",
+            "clean_kind_at": "not attributable to the patch: the unpatched build reports "
+                             "['NotAppliedNeverCommitted'] at seed 1",
         }
         for fault, needle in cases.items():
             with self.subTest(fault=fault):
@@ -435,7 +440,7 @@ class SimBugsTest(unittest.TestCase):
         self.assertIn("sim-bugs run (rehearsal): 1 of 1", output)
         self.assertEqual(summary["mode"], "rehearsal")
         self.assertEqual([(c["defect"], c["profile"]) for c in calls],
-                         [("lost-write", None), ("lost-write", None), (None, None)])
+                         [("lost-write", None), ("lost-write", None), (None, None), (None, None)])
 
     def test_seed_lines_and_first_match(self):
         output = "\n".join([

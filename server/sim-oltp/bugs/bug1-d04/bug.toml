@@ -27,7 +27,8 @@ redirect.
 workload = "direct"
 # drain-leader between Applied and the reply, and crash-leader.
 profile = ["drain-leader", "crash-leader"]
-expect = ["NotAppliedNeverCommitted"]
+# failed-write-observed is the history form of the same defect (a read sees the refused write).
+expect = ["NotAppliedNeverCommitted", "failed-write-observed"]
 seeds = [1, 10000]
 
 [regression]
