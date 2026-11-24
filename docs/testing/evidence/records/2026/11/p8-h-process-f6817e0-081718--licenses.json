@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-h-process-f6817e0-081718--licenses.log",
+      "sha256": "05af2b800aad729bd6f7c0c26557331616597d8dc190cc7514fe7921a9d5275a"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "licenses",
+  "duration_s": 13.752,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T08:21:22.499428+00:00",
+    "request_id": "p8-h-process-f6817e0-081718",
+    "runner": "GitHub Actions 1000010654",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45354787872"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "f6817e088a51ea0872c78f0a65373f6b7912aa7c",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
