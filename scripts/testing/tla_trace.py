@@ -8,12 +8,15 @@
 `lint` checks the format (wave-p8/design-review.md, "Trace format", and
 .agents/skills/design-review/references/trace-validation.md): line 1 is the header
 {"trace":"nabedra.trace/1","spec","seed","sha","workload","params"}, and every later line is a step
-{"seq","t","node","action","vars"[,"msg"]} with seq counting from 0 and t never decreasing. Values are
-JSON objects, arrays, strings, booleans and integers: no floats and no nulls.
+{"seq","t","node","action","vars"[,"msg"]} with seq counting from 0 and t never decreasing. A trace has
+at least one step. Values are JSON objects, arrays, strings, booleans and integers: no floats and no
+nulls.
 
 `check` lints each trace, then runs `<Name>Trace.tla` with `<Name>Trace.cfg` once per trace, with
 TRACE_PATH set, in the pinned image. A trace is accepted when some behavior of the spec consumes every
-line (the POSTCONDITION TraceAccepted from specs/lib/NabedraTrace.tla). For a rejected trace it prints
+line (the POSTCONDITION TraceAccepted from specs/lib/NabedraTrace.tla). The trace cfg must also list
+the invariant TraceIndexIsLevel, which makes every step consume one line, as TraceAccepted assumes; a
+violation of it is a trace spec error, not a rejection. For a rejected trace it prints
 the 0-based index and the content of the first line no behavior explains. A directory argument means
 its `*.ndjson` files. Every trace under --expect-rejected must be rejected, and one named
 `*.at-<n>.ndjson` must be rejected at index n. One assertion per trace. The last line is
@@ -42,6 +45,8 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 AT = re.compile(r"\.at-(\d+)\.ndjson$")
 EXIT = {"pass": 0, "fail": 1, "not-run": 2, "error": 3}
 U64_MAX = 2**64 - 1
+# specs/lib/NabedraTrace.tla: every step consumes one line, which TraceAccepted relies on.
+LEVEL_INVARIANT = "TraceIndexIsLevel"
 
 
 def _is_int(v) -> bool:
@@ -72,6 +77,8 @@ def lint_lines(lines: list[str]) -> list[str]:
     errors: list[str] = []
     if not lines:
         return ["line 1: the trace is empty; the header is missing"]
+    if len(lines) == 1:
+        errors.append("line 2: the trace has no steps, so it shows nothing")
     prev_t = None
     for number, raw in enumerate(lines, start=1):
         where = f"line {number}"
@@ -115,7 +122,7 @@ def lint_lines(lines: list[str]) -> list[str]:
             errors.append(f"{where}: step misses {sorted(missing)}")
         if extra:
             errors.append(f"{where}: step has unknown keys {sorted(extra)}")
-        if "seq" in obj and obj["seq"] != number - 2:
+        if "seq" in obj and not (_is_int(obj["seq"]) and obj["seq"] == number - 2):
             errors.append(f"{where}: seq is {obj['seq']!r}, expected {number - 2}")
         if "t" in obj:
             if not (_is_int(obj["t"]) and obj["t"] >= 0):
@@ -175,6 +182,10 @@ def check_trace(spec_dir: Path, name: str, trace: Path, out: Path, budget: int, 
     v = res.violation()
     if v is not None:
         kind, prop = v
+        if (kind, prop) == ("invariant", LEVEL_INVARIANT):
+            return {"outcome": "error", "at": None, "log": f"{stem}.log",
+                    "detail": f"{name}Trace.tla takes a step that consumes no line ({LEVEL_INVARIANT} violated), "
+                              "so TraceAccepted cannot tell how many lines a behavior explains"}
         if kind == "postcondition":
             at = res.trace_rejected_at
             return {"outcome": "rejected", "at": at, "detail": "no behavior explains this line",
@@ -216,6 +227,9 @@ def cmd_check(args: argparse.Namespace) -> int:
         for needed in (f"{args.name}Trace.tla", f"{args.name}Trace.cfg"):
             if not (spec_dir / needed).exists():
                 raise tc.TlaError(f"{rel}/{needed} does not exist")
+        if LEVEL_INVARIANT not in tc.parse_cfg(spec_dir / f"{args.name}Trace.cfg").invariants:
+            raise tc.TlaError(f"{rel}/{args.name}Trace.cfg must list the invariant {LEVEL_INVARIANT} "
+                              "(specs/lib/NabedraTrace.tla)")
         if out is None:
             out = tc.REPO_ROOT / "target" / "tla" / rel / f"{args.name}Trace"
             shutil.rmtree(out, ignore_errors=True)

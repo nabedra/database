@@ -76,10 +76,17 @@ MatchSet(v, value) == Logged(v) => ToSet(LoggedValue(v)) = value
 
 -----------------------------------------------------------------------------
 
+\* INVARIANT. Every step consumes exactly one line, so a state's depth in
+\* the search equals traceIndex. TraceAccepted relies on it: a step that
+\* consumes no line would make a behavior longer than the lines it
+\* explains. Every <Name>Trace.cfg lists it, and tla_trace.py checks that.
+TraceIndexIsLevel == TLCGet("level") = traceIndex
+
 \* POSTCONDITION. It holds only when some behavior consumed every line.
 \* The diameter is the length in states of the longest behavior TLC found,
-\* so diameter - 1 lines were consumed. On rejection it prints the 0-based
-\* index of the first line no behavior explains, which tla_trace.py reads.
+\* so, with TraceIndexIsLevel, diameter - 1 lines were consumed. On
+\* rejection it prints the 0-based index of the first line no behavior
+\* explains, which tla_trace.py reads.
 TraceAccepted ==
     LET consumed == TLCGet("stats").diameter - 1 IN
     IF consumed = Len(Trace)

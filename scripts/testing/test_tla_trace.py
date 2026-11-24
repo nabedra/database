@@ -70,6 +70,9 @@ class LintTests(unittest.TestCase):
         self.assertLint(lines()[:2] + ["{not json"], "not JSON")
         self.assertLint(lines()[:2] + [""] + lines()[2:], "blank line")
         self.assertLint(lines()[:2] + ["[1]"], "not a JSON object")
+        self.assertLint(edit(1, seq=0.0), "seq is 0.0, expected 0")
+        self.assertLint(edit(2, seq=True), "seq is True, expected 1")
+        self.assertLint(lines()[:1], "no steps")
 
     def test_lint_command(self):
         out = io.StringIO()
@@ -88,8 +91,12 @@ FAKE_WRAPPER = textwrap.dedent('''\
     name = "trace_rejected" if "at-" in os.environ.get("TRACE_PATH", "") else "trace_accepted"
     if "error" in os.environ.get("TRACE_PATH", ""):
         name = "parse_error"
-    sys.stdout.write(open(os.path.join(os.environ["FAKE_TLC_FIXTURES"], name + ".txt")).read())
-    sys.exit({"trace_rejected": 10, "trace_accepted": 0, "parse_error": 150}[name])
+    if "silent" in os.environ.get("TRACE_PATH", ""):
+        name = "invariant"
+    text = open(os.path.join(os.environ["FAKE_TLC_FIXTURES"], name + ".txt")).read()
+    # "silent": a trace spec step that consumes no line breaks TraceIndexIsLevel.
+    sys.stdout.write(text.replace("Invariant Consistent is violated", "Invariant TraceIndexIsLevel is violated"))
+    sys.exit({"trace_rejected": 10, "trace_accepted": 0, "parse_error": 150, "invariant": 12}[name])
 ''')
 
 
@@ -164,6 +171,19 @@ class CheckTests(unittest.TestCase):
         empty.mkdir()
         code, summary, _ = self.check(str(empty))
         self.assertEqual((code, summary["verdict"]), (2, "not-run"))
+
+    def test_step_that_consumes_no_line_is_error(self):
+        shutil.copy(ACCEPTED, self.good / "silent.ndjson")
+        code, summary, text = self.check(str(self.good))
+        self.assertEqual((code, summary["verdict"]), (3, "error"))
+        self.assertIn("consumes no line", text)
+
+    def test_trace_cfg_without_level_invariant_is_error(self):
+        cfg = self.spec / "TwoPhaseTrace.cfg"
+        cfg.write_text(cfg.read_text().replace(" TraceIndexIsLevel", ""))
+        code, summary, text = self.check(str(self.good))
+        self.assertEqual((code, summary["verdict"]), (3, "error"))
+        self.assertIn("must list the invariant TraceIndexIsLevel", text)
 
     def test_missing_trace_spec_is_error(self):
         (self.spec / "TwoPhaseTrace.cfg").unlink()
