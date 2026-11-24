@@ -1,4 +1,8 @@
-These reusable acceptance cases preserve the user's worker, queue, utilization, and fault-tolerance requirements from 2026-11-15. They specify future tests, not executed results. Use them for future scheduler, worker, storage, and autoscaling changes alongside [the design contract](../../plans/resource-aware-scheduling.md).
+These reusable acceptance cases preserve the worker, queue, utilization, and fault-tolerance requirements from 2026-11-15. Use them alongside the [scheduling plan](../../plans/resource-aware-scheduling.md) for changes to request admission, queues, scheduling, workers, partition memory, mutation publication, recovery, or autoscaling.
+
+Preserve applicable scenarios, cite their IDs in implementation plans and test evidence, and add regression cases for new failures. Report a scenario as passing only after executing its assertions.
+
+For eligible OLTP operations, apply the [OLTP direct-path plan](../../plans/oltp-direct-path.md) where it supersedes Q03, Q05, or O23. Apply the queued scenarios to operations that still use the queue.
 
 The queue lives in replicated worker memory. Retain accepted work through individual failures while a request copy survives. A complete worker shutdown abandons outstanding work; it does not roll back committed data. Test assertions must distinguish those outcomes from silent loss.
 
