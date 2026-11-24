@@ -84,7 +84,7 @@ pub(crate) struct LocalWorker {
     pub operator: LocalOperatorPermit,
     pub transport: Arc<WorkerTransport>,
     pub listener: TcpListener,
-    pub directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+    pub directory: Arc<crate::oltp_replication::peer_directory::AppliedPeerDirectory>,
     ownership: Arc<DirectoryOwner>,
 }
 impl LocalWorker {
@@ -134,7 +134,7 @@ impl LocalWorker {
             enrollment_revision: topology.enrollment_revision,
         };
         let registry = Arc::new(EndpointRegistry::new(shared.clone()));
-        let directory = crate::oltp_replication::multiplex::AppliedPeerDirectory::from_bootstrap(
+        let directory = crate::oltp_replication::peer_directory::AppliedPeerDirectory::from_bootstrap(
             topology.group(GroupKind::Control)?,
             vec![enrollment.clone()],
             shared.clone(),
