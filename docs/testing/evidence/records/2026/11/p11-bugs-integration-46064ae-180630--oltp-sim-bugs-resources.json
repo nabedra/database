@@ -1,0 +1,53 @@
+{
+  "artifacts": [
+    {
+      "name": "p11-bugs-integration-46064ae-180630--oltp-sim-bugs-resources.log",
+      "sha256": "fdd7e110b03d361162c6b31656da3532732ae5e602f963fb59bc1862495664f2"
+    }
+  ],
+  "assertions": {
+    "executed": 0,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "output-marker",
+        "reason": "not-run: sim-harness-missing"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim-bugs-resources",
+  "duration_s": 2038.215,
+  "guarantees": [
+    "OLTP-G01",
+    "OLTP-G07",
+    "OLTP-G09"
+  ],
+  "kind": "S H",
+  "mode": null,
+  "result": "not-run",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T17:12:02.282377+00:00",
+    "request_id": "p11-bugs-integration-46064ae-180630",
+    "runner": "GitHub Actions 1000012277",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45444813598"
+  },
+  "scenarios": [
+    "C07",
+    "F03",
+    "O06",
+    "O11",
+    "O15"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "46064aeda6198efeeebdd435f8eca19ae1d0c832",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
