@@ -22,7 +22,7 @@ pub use transport::{
     WorkerClient, WorkerTransport,
 };
 #[cfg(feature = "sim")]
-pub use transport::{FrameKind, StreamFrame, session_alpn};
+pub use transport::{FrameKind, SimLimits, StreamFrame, session_alpn};
 
 pub use nabedra_resources::memory::{Decoded, MAX_SECTIONS, ReplicaMetadata, ResourceOwner};
 

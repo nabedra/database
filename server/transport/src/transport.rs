@@ -861,6 +861,14 @@ impl From<RequestError> for ProtocolError {
         }
     }
 }
+/// Node transport limits sampled by the OLTP harness.
+#[cfg(feature = "sim")]
+#[derive(Clone, Copy)]
+pub struct SimLimits {
+    pub session_slots: usize,
+    pub direct_handler_slots: usize,
+}
+
 impl WorkerTransport {
     pub fn new(
         local: &WorkerEnrollment,
@@ -870,6 +878,17 @@ impl WorkerTransport {
         registry: Arc<EndpointRegistry>,
         config: TransportConfig,
     ) -> Result<Self, ProtocolError> {
+        #[cfg(feature = "sim")]
+        let config = nabedra_rt::sim::world()
+            .and_then(|world| world.with_ext::<SimLimits, _>(|limits| *limits))
+            .map_or_else(
+                || config.clone(),
+                |limits| TransportConfig {
+                    session_slots: [limits.session_slots; CLASSES],
+                    direct_handler_slots: limits.direct_handler_slots,
+                    ..config.clone()
+                },
+            );
         Self::build(local, tls, shared, directory, registry, config, true)
     }
     /// A peer as released before persistent sessions: it offers and accepts
@@ -906,6 +925,23 @@ impl WorkerTransport {
         config.validate()?;
         if local.certificate_sha256.to_string() != tls.certificate_sha256() {
             return Err(malformed("local certificate differs from enrollment"));
+        }
+        // In a simulated process kill no host process exits to release
+        // service-routing cycles. Break those cycles after I/O has been cut.
+        #[cfg(feature = "sim")]
+        if let (Some(world), Some(node)) =
+            (nabedra_rt::sim::world(), nabedra_rt::sim::current_node())
+        {
+            let registry = Arc::downgrade(&registry);
+            world.observe(Arc::new(move |event| {
+                if matches!(event, nabedra_rt::sim::SimEvent::Crash { node: cut } if *cut == node)
+                    && let Some(registry) = registry.upgrade()
+                {
+                    registry
+                        .close_worker()
+                        .expect("close crashed simulated registry");
+                }
+            }));
         }
         let direct_admission = !direct_admission_disabled();
         let (connector, acceptor) = if sessions_enabled && !direct_admission {
