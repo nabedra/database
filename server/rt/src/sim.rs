@@ -28,7 +28,10 @@
 //!
 //! Deadlines and durations given to the node clock are mapped back to the runtime's
 //! virtual clock, rounded up so a timer never fires before the node clock reaches its
-//! deadline. A timer armed before a later drift change keeps its original mapping.
+//! deadline. A timer armed before a later drift change keeps its original mapping, so a
+//! slowdown makes it fire early, unless the node has a timer floor
+//! ([`World::set_timer_floor_ppm`]): its timers are then mapped at the slowest rate its
+//! clock may take, and no drift change makes one fire early.
 //!
 //! # Ids
 //!
@@ -42,7 +45,9 @@
 //!   node down, marks its stepped services dead, then aborts every registered task; a
 //!   task spawned into a down node is aborted at once. [`World::restart`] marks it up
 //!   again with an empty registry. [`World::freeze`] stops polling a node's tasks
-//!   without aborting them, until [`World::thaw`].
+//!   without aborting them, until [`World::thaw`]. [`World::freeze_after_clock_read`] and
+//!   [`World::set_clock_freezes`] stop it in the middle of a poll, between a clock read
+//!   and the code that uses it (`sim/suspend.rs`).
 //! - [`crate::task::spawn_blocking`] runs the closure to completion before it returns,
 //!   while the simulation thread waits, so no OS scheduling decision reaches the
 //!   schedule and virtual time stands still meanwhile. The closure runs on one helper
@@ -50,7 +55,8 @@
 //!   code (nabedra-kv's journal handoff) calls tokio's `blocking_recv`, which tokio
 //!   refuses on a runtime thread. The helper has the runtime handle entered and the
 //!   node context installed. The returned handle resolves at once, with a panic as a
-//!   `JoinError`.
+//!   `JoinError`. [`World::pause_storage`] and [`World::set_storage_pauses`] suspend a
+//!   job in the middle instead, at a filesystem call (`sim/suspend.rs`).
 //! - [`crate::task::spawn_service`] starts a helper OS thread with the requested name
 //!   (and stack size), the runtime handle entered and the node context installed, and
 //!   records it in the node's registry. A crash cannot abort an OS thread: it marks the
@@ -136,6 +142,8 @@ enum Role {
 thread_local! {
     static WORLD: RefCell<Option<Arc<World>>> = const { RefCell::new(None) };
     static ROLE: Cell<Role> = const { Cell::new(Role::Main) };
+    /// Nested [`World::with_ext`] calls on this thread.
+    static EXT: Cell<u32> = const { Cell::new(0) };
     /// The blocking helper of this simulation thread. It stops when the thread exits.
     static HELPER: RefCell<Option<std::sync::mpsc::Sender<Job>>> = const { RefCell::new(None) };
 }
@@ -190,7 +198,13 @@ struct Clock {
     anchor_local: Duration,
     drift_ppm: i64,
     wall_offset_nanos: i128,
+    /// See [`World::set_timer_floor_ppm`].
+    timer_floor_ppm: Option<i64>,
 }
+
+/// Added to a timer's length on the node clock under a timer floor. A re-anchor may round
+/// the clock down by less than a nanosecond, so this covers a thousand drift changes.
+const TIMER_SLACK_NANOS: i128 = 1_000;
 
 impl Clock {
     fn new(settings: NodeClock) -> Self {
@@ -200,6 +214,7 @@ impl Clock {
             anchor_local: settings.mono_offset,
             drift_ppm: settings.drift_ppm,
             wall_offset_nanos: settings.wall_offset_nanos,
+            timer_floor_ppm: None,
         }
     }
 
@@ -227,6 +242,27 @@ impl Clock {
             .saturating_add(nanos(div_ceil(ahead * PPM, self.rate())))
     }
 
+    /// The virtual length of a timer that needs `ahead` nanoseconds on this clock, which
+    /// it has whatever the drift becomes meanwhile if the clock has a timer floor.
+    fn timer_length(&self, ahead: i128) -> Duration {
+        match self.timer_floor_ppm {
+            Some(floor) => nanos(div_ceil(
+                (ahead + TIMER_SLACK_NANOS) * PPM,
+                PPM + i128::from(floor),
+            )),
+            None => nanos(div_ceil(ahead * PPM, self.rate())),
+        }
+    }
+
+    /// The virtual time at which a timer for `local`, armed at `virtual_elapsed`, fires.
+    fn timer_at(&self, local: i128, virtual_elapsed: Duration) -> Duration {
+        let ahead = local - self.local(virtual_elapsed).as_nanos() as i128;
+        if self.timer_floor_ppm.is_none() || ahead <= 0 {
+            return self.virtual_at(local);
+        }
+        virtual_elapsed.saturating_add(self.timer_length(ahead))
+    }
+
     fn reanchor(&mut self, virtual_elapsed: Duration) {
         self.anchor_local = self.local(virtual_elapsed);
         self.anchor_virtual = self.anchor_virtual.max(virtual_elapsed);
@@ -238,6 +274,15 @@ fn assert_drift(drift_ppm: i64) {
         drift_ppm > -1_000_000,
         "a drift of {drift_ppm} ppm stops or reverses the clock"
     );
+}
+
+fn assert_floor(drift_ppm: i64, floor_ppm: Option<i64>) {
+    if let Some(floor_ppm) = floor_ppm {
+        assert!(
+            drift_ppm >= floor_ppm,
+            "a drift of {drift_ppm} ppm is below the node's timer floor of {floor_ppm} ppm"
+        );
+    }
 }
 
 fn div_ceil(numerator: i128, denominator: i128) -> i128 {
@@ -265,6 +310,8 @@ struct Node {
     tasks: Vec<AbortHandle>,
     services: Vec<String>,
     frozen: bool,
+    /// Freezes so far.
+    freezes: u64,
     /// Tasks that found the node frozen, woken by [`World::thaw`].
     parked: Vec<Waker>,
 }
@@ -306,6 +353,7 @@ pub struct World {
     #[cfg(target_os = "linux")]
     blocking_cpu_nanos: AtomicU64,
     services: services::Registry,
+    faults: suspend::Faults,
     volumes: volumes::Table,
     hooks: Hooks,
 }
@@ -338,6 +386,7 @@ impl World {
             #[cfg(target_os = "linux")]
             blocking_cpu_nanos: AtomicU64::new(0),
             services: services::Registry::new(seed),
+            faults: suspend::Faults::new(seed),
             volumes: volumes::Table::default(),
             hooks: Hooks::default(),
         })
@@ -400,6 +449,7 @@ impl World {
             tasks: Vec::new(),
             services: Vec::new(),
             frozen: false,
+            freezes: 0,
             parked: Vec::new(),
         };
         let previous = self.lock().nodes.insert(node, entry);
@@ -407,12 +457,38 @@ impl World {
     }
 
     /// Changes `node`'s drift from now on. The clock stays continuous.
+    ///
+    /// # Panics
+    ///
+    /// If the drift is at or below -1,000,000 ppm, or below the node's timer floor.
     pub fn set_drift_ppm(&self, node: u64, drift_ppm: i64) {
         assert_drift(drift_ppm);
         let elapsed = self.elapsed();
         self.with_node(node, |entry| {
+            assert_floor(drift_ppm, entry.clock.timer_floor_ppm);
             entry.clock.reanchor(elapsed);
             entry.clock.drift_ppm = drift_ppm;
+        });
+    }
+
+    /// Declares that `node`'s drift never goes below `floor_ppm`, and maps the timers it
+    /// arms from now on at that rate, as if its timer hardware always ran at the slowest
+    /// rate its clock may take. Without a floor (`None`, the default) a slowdown makes
+    /// timers armed before it fire before the node clock reaches their deadline, which no
+    /// kernel does. With one, a timer never fires early, and fires at most as late as it
+    /// would on a node whose drift was at the floor from the start, so a design that
+    /// tolerates the declared drift tolerates it. It covers every timer of
+    /// [`crate::time`], a [`crate::time::interval`]'s period included, and none armed
+    /// before this call.
+    ///
+    /// # Panics
+    ///
+    /// If the floor is at or below -1,000,000 ppm, or above the node's present drift.
+    pub fn set_timer_floor_ppm(&self, node: u64, floor_ppm: Option<i64>) {
+        floor_ppm.into_iter().for_each(assert_drift);
+        self.with_node(node, |entry| {
+            assert_floor(entry.clock.drift_ppm, floor_ppm);
+            entry.clock.timer_floor_ppm = floor_ppm;
         });
     }
 
@@ -479,11 +555,12 @@ impl World {
         handle
     }
 
-    fn gate<F>(&self, node: u64, future: F) -> Gate<F> {
+    fn gate<F: Future>(&self, node: u64, future: F) -> Gate<F> {
         Gate {
             world: self.me.clone(),
             node,
-            future: Box::pin(future),
+            future: Some(Box::pin(future)),
+            poll: None,
         }
     }
 
@@ -520,9 +597,10 @@ impl World {
 
     /// After cutting the network, halts every volume of the node (the disk cut: no
     /// later call changes an image), marks it down, marks its stepped services dead (a
-    /// dead service is never stepped again and joins at once), then aborts every
-    /// registered task. Destructors that run during the crash or the abort therefore find
-    /// halted volumes and no live service to wait for. Helper-thread services
+    /// dead service is never stepped again and joins at once), unwinds its suspended jobs
+    /// (`sim/suspend.rs`), then aborts every registered task. Destructors that run during
+    /// the crash or the abort therefore find halted volumes and no live service to wait
+    /// for. Helper-thread services
     /// (`spawn_service`) cannot be stopped; see the module documentation.
     fn cut_node(&self, node: u64, black_hole: bool) {
         net::crash(self, node, black_hole);
@@ -542,6 +620,7 @@ impl World {
         });
         let dead = self.services.kill_node(context);
         self.emit(&SimEvent::Crash { node });
+        self.faults.cancel(self, context);
         // Service destructors run here, after the services are dead and before any task
         // is aborted. They keep the retired context even when the harness initiated the cut.
         with_node_context(Some(context), || drop(dead));
@@ -594,7 +673,14 @@ impl World {
     /// stepped services stop with their driver tasks. Code outside the node that drives
     /// its services inline ([`crate::task::drive_until`]) is not stopped.
     pub fn freeze(&self, node: u64) {
-        self.with_node(node, |entry| entry.frozen = true);
+        self.with_node(node, |entry| {
+            entry.frozen = true;
+            entry.freezes += 1;
+        });
+    }
+
+    fn freezes(&self, node: u64) -> u64 {
+        self.with_node(node, |entry| entry.freezes)
     }
 
     /// Resumes a frozen `node`'s tasks.
@@ -646,7 +732,9 @@ impl World {
         let value = slot
             .downcast_mut::<T>()
             .expect("extension slots are keyed by their stored type");
+        EXT.set(EXT.get() + 1);
         let result = catch_unwind(AssertUnwindSafe(|| f(value)));
+        EXT.set(EXT.get() - 1);
         if let std::collections::btree_map::Entry::Vacant(entry) = lock(&self.hooks.ext).entry(key)
         {
             entry.insert(slot);
@@ -760,6 +848,19 @@ pub enum SimEvent<'a> {
     Pause {
         by: Duration,
     },
+    /// A job stopped at a filesystem call ([`World::pause_storage`]).
+    StoragePaused {
+        node: u64,
+        call: &'a PausedCall,
+    },
+    /// A stopped job went on. A crash while it is stopped reports none.
+    StorageResumed {
+        node: u64,
+    },
+    /// A node froze right after a clock read ([`World::freeze_after_clock_read`]).
+    ClockFrozen {
+        node: u64,
+    },
     /// A call on a node's simulated volume, as its `FaultFs` logged it.
     Fs {
         node: u64,
@@ -779,28 +880,111 @@ pub enum SimEvent<'a> {
     },
 }
 
+fn in_ext() -> bool {
+    EXT.get() > 0
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A node task's future: not polled while its node is frozen.
-struct Gate<F> {
+struct Gate<F: Future> {
     world: Weak<World>,
     node: u64,
-    future: Pin<Box<F>>,
+    /// `None` while a poll of it is suspended.
+    future: Option<Pin<Box<F>>>,
+    poll: Option<suspend::Parked<suspend::Polled<F>>>,
 }
 
-impl<F: Future> Future for Gate<F> {
+impl<F> Future for Gate<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
     type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
-        if let Some(world) = self.world.upgrade()
-            && world.park_if_frozen(self.node, cx.waker())
-        {
-            return Poll::Pending;
+        if let Some(world) = self.world.upgrade() {
+            world.faults.moved();
+            if world.park_if_frozen(self.node, cx.waker()) {
+                return Poll::Pending;
+            }
+            if let Some(poll) = self.poll.take() {
+                let run = poll.resume(&world);
+                return self.polled(&world, run, cx);
+            }
+            if let Some((freeze, seed)) = world.faults.poll(self.node) {
+                let future = self.future.take().expect("a task is polled until it ends");
+                let run = poll_on_helper(&world, freeze, seed, future, cx.waker().clone());
+                return self.polled(&world, run, cx);
+            }
         }
-        self.future.as_mut().poll(cx)
+        let future = self.future.as_mut();
+        future
+            .expect("a task is polled until it ends")
+            .as_mut()
+            .poll(cx)
     }
+}
+
+impl<F: Future> Gate<F> {
+    /// Takes what a poll on a helper thread left.
+    fn polled(
+        &mut self,
+        world: &World,
+        run: suspend::Run<suspend::Polled<F>>,
+        cx: &mut Context<'_>,
+    ) -> Poll<F::Output> {
+        match run {
+            suspend::Run::Suspended(poll) => {
+                self.poll = Some(poll);
+                if !world.park_if_frozen(self.node, cx.waker()) {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            }
+            suspend::Run::Done(Ok((future, outcome))) => {
+                self.future = Some(future);
+                match outcome {
+                    Ok(poll) => poll,
+                    // The node crashed, and this task is being aborted.
+                    Err(panic) if suspend::was_cancelled(&*panic) => Poll::Pending,
+                    Err(panic) => resume_unwind(panic),
+                }
+            }
+            suspend::Run::Done(Err(panic)) => resume_unwind(panic),
+        }
+    }
+}
+
+/// Polls `future`, the current task's, on a helper thread, where it can stop at a clock
+/// read. The simulation thread waits, as for blocking work.
+fn poll_on_helper<F>(
+    world: &Arc<World>,
+    freeze: Option<(u64, Duration)>,
+    seed: u64,
+    future: Pin<Box<F>>,
+    waker: Waker,
+) -> suspend::Run<suspend::Polled<F>>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let context = current_node_context();
+    let simulation = Handle::current();
+    let (waiting, link) = suspend::Job::poll(context, freeze);
+    let owner = world.clone();
+    on_helper(move || {
+        let _installed = Installed::new(owner.clone());
+        link.run(&owner, || {
+            with_node_context(context, || {
+                suspend::poll_once(seed, &simulation, future, &waker)
+            })
+        })
+        .report();
+    });
+    waited(waiting, world)
 }
 
 /// Installs `world` on this thread until the guard drops.
@@ -991,10 +1175,25 @@ pub(crate) fn to_runtime_instant(deadline: Instant) -> Instant {
         };
         world
             .start
-            .checked_add(clock.virtual_at(local).saturating_sub(paused))
+            .checked_add(
+                clock
+                    .timer_at(local, world.elapsed())
+                    .saturating_sub(paused),
+            )
             .unwrap_or(deadline)
     })
     .unwrap_or(deadline)
+}
+
+/// The virtual length of a timer of `duration` on the current node's clock.
+pub(crate) fn to_runtime_timer(duration: Duration) -> Duration {
+    node_clock(|_, clock| {
+        clock
+            .filter(|clock| clock.timer_floor_ppm.is_some() && !duration.is_zero())
+            .map(|clock| clock.timer_length(duration.as_nanos() as i128))
+    })
+    .flatten()
+    .unwrap_or_else(|| to_runtime_duration(duration))
 }
 
 /// A duration on the current node's clock as a duration on the runtime's virtual clock.
@@ -1087,9 +1286,9 @@ where
     let Some(world) = world() else {
         return tokio::task::spawn_blocking(f);
     };
-    let outcome = run_blocking(world, f);
+    let run = run_blocking(world, f);
     spawn(async move {
-        match outcome {
+        match run.outcome().await {
             Ok(value) => value,
             Err(panic) => std::panic::resume_unwind(panic),
         }
@@ -1105,9 +1304,9 @@ where
         return handle.spawn_blocking(f);
     };
     world.assert_runtime(handle);
-    let outcome = run_blocking(world, f);
+    let run = run_blocking(world, f);
     spawn_on(handle, async move {
-        match outcome {
+        match run.outcome().await {
             Ok(value) => value,
             Err(panic) => std::panic::resume_unwind(panic),
         }
@@ -1130,22 +1329,25 @@ where
     }
 }
 
-/// Runs `work` on this thread's blocking helper and waits for it. Only one job runs at a
-/// time and the simulation thread does nothing meanwhile, so the outcome is deterministic.
+/// Runs `work` on this thread's blocking helper and waits until it ends or a pause
+/// suspends it. Only one job runs at a time and the simulation thread does nothing
+/// meanwhile, so the outcome is deterministic.
 fn run_blocking<R: Send + 'static>(
     world: Arc<World>,
     work: impl FnOnce() -> R + Send + 'static,
-) -> std::thread::Result<R> {
+) -> suspend::Run<R> {
     let context = current_node_context();
     let handle = tokio::runtime::Handle::try_current().ok();
-    let (reply, result) = std::sync::mpsc::sync_channel(1);
-    let job: Job = Box::new(move || {
+    let (waiting, link) = suspend::Job::blocking(&world, context);
+    let owner = world.clone();
+    owner.faults.moved();
+    on_helper(move || {
         let _entered = handle.as_ref().map(tokio::runtime::Handle::enter);
         #[cfg(target_os = "linux")]
         let started = blocking_thread_cpu_nanos();
         let _installed = Installed::new(world.clone());
         ROLE.set(Role::Blocking(context));
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+        let finished = link.run(&world, work);
         ROLE.set(Role::Main);
         #[cfg(target_os = "linux")]
         if let Some((before, after)) = started.zip(blocking_thread_cpu_nanos()) {
@@ -1153,8 +1355,14 @@ fn run_blocking<R: Send + 'static>(
                 .blocking_cpu_nanos
                 .fetch_add(after.saturating_sub(before), Ordering::Relaxed);
         }
-        let _ = reply.send(outcome);
+        finished.report();
     });
+    waited(waiting, &owner)
+}
+
+/// Sends `job` to this thread's blocking helper.
+fn on_helper(job: impl FnOnce() + Send + 'static) {
+    let job: Job = Box::new(job);
     HELPER.with(|helper| {
         helper
             .borrow_mut()
@@ -1162,9 +1370,16 @@ fn run_blocking<R: Send + 'static>(
             .send(job)
             .expect("the simulation blocking helper is running")
     });
-    result
-        .recv()
-        .expect("the simulation blocking helper replies")
+}
+
+/// Waits until a job on this thread's helper ends or stops.
+fn waited<R>(waiting: suspend::Job<R>, world: &Arc<World>) -> suspend::Run<R> {
+    let run = waiting.started(world);
+    if matches!(run, suspend::Run::Suspended(_)) {
+        // The helper keeps the suspended job's stack, and stops after the job.
+        HELPER.take();
+    }
+    run
 }
 
 #[cfg(target_os = "linux")]
@@ -1236,8 +1451,10 @@ pub mod net;
 #[cfg(feature = "sim-openraft")]
 pub mod openraft10;
 pub(crate) mod services;
+pub(crate) mod suspend;
 pub mod volumes;
 
+pub use suspend::{ClockRead, PausedCall, Side, StoragePause, clock_read};
 pub use volumes::{Cut, VolumeInfo, Wipe, volume_for};
 
 #[cfg(test)]
