@@ -554,13 +554,17 @@ jobs:
           set -o pipefail
           cargo test --locked --no-default-features --features oltp --lib --tests --no-run --timings \
             --message-format=json-render-diagnostics > ../build.json
-          cargo test --locked -p nabedra-resources -p nabedra-transport -p nabedra-oltp-storage -p nabedra-oltp-replication --lib --no-run \
+          # Every OLTP crate's unit tests (phase 8 split), so none silently stops running.
+          cargo test --locked -p nabedra-protocol -p nabedra-resources -p nabedra-oltp-types -p nabedra-transport \
+            -p nabedra-oltp-storage -p nabedra-oltp-replication --lib --no-run \
             --message-format=json-render-diagnostics >> ../build.json
           cargo build --locked --no-default-features --features oltp --bin nabedra-db
           cd ..
           # kind, name, workspace-relative path of every test executable, then the server.
           jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null)
-                 | [(if .target.name == "nabedra_resources" then "resources"
+                 | [(if .target.name == "nabedra_protocol" then "protocol"
+                     elif .target.name == "nabedra_resources" then "resources"
+                     elif .target.name == "nabedra_oltp_types" then "oltp-types"
                      elif .target.name == "nabedra_transport" then "transport"
                      elif .target.name == "nabedra_oltp_storage" then "storage"
                      elif .target.name == "nabedra_oltp_replication" then "replication"
@@ -568,11 +572,9 @@ jobs:
                      else .target.kind[0] end), .target.name, .executable] | @tsv' build.json \
             | sed "s#\t$GITHUB_WORKSPACE/#\t#" > bins.tsv
           printf 'server\tnabedra-db\tserver/target/debug/nabedra-db\n' >> bins.tsv
-          test "$(awk -F'\t' '$1 == "lib"' bins.tsv | wc -l)" = 1
-          test "$(awk -F'\t' '$1 == "resources"' bins.tsv | wc -l)" = 1
-          test "$(awk -F'\t' '$1 == "transport"' bins.tsv | wc -l)" = 1
-          test "$(awk -F'\t' '$1 == "storage"' bins.tsv | wc -l)" = 1
-          test "$(awk -F'\t' '$1 == "replication"' bins.tsv | wc -l)" = 1
+          for kind in lib protocol resources oltp-types transport storage replication; do
+            test "$(awk -F'\t' -v k="$kind" '$1 == k' bins.tsv | wc -l)" = 1 || { echo "::error::expected one $kind test executable"; exit 1; }
+          done
           cat bins.tsv
       - uses: actions/upload-artifact@v4
         with:
@@ -1051,6 +1053,19 @@ jobs:
         run: |
           set -o pipefail
           "$NABEDRA_TRANSPORT_TEST_EXE" --test-threads=1 2>&1 | tee ../oltp-transport.log
+      - name: Protocol, resources and OLTP types library suites
+        if: ${{ !cancelled() }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          status=0
+          for kind in protocol resources oltp-types; do
+            exe=$(awk -F'\t' -v k="$kind" '$1 == k {print $3}' ../bins.tsv)
+            [ -n "$exe" ] || { echo "::error::the $kind test executable was not built"; status=1; continue; }
+            echo "     Running $kind ($exe)" | tee -a ../oltp-shared-crates.log
+            NABEDRA_TEST_DIRECT_OLTP=on "$GITHUB_WORKSPACE/$exe" --test-threads 4 2>&1 | tee -a ../oltp-shared-crates.log || status=1
+          done
+          exit "$status"
       - name: Integration tests
         if: ${{ !cancelled() }}
         working-directory: server
@@ -1068,7 +1083,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: oltp-test-logs
-          path: oltp-*.log
+          path: |
+            oltp-*.log
+            bins.tsv
           retention-days: 14
 
   events:
@@ -1506,6 +1523,21 @@ jobs:
         run: |
           set -o pipefail
           NABEDRA_TEST_DIRECT_OLTP=off "$NABEDRA_OLTP_REPLICATION_TEST_EXE" --test-threads 4 $QUARANTINE_SKIPS 2>&1 | tee ../artifacts/oltp-replication-direct-off.log
+      - name: Transport, protocol, resources and OLTP types library suites, direct_oltp off
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.mode == 'off' }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          status=0
+          for kind in transport protocol resources oltp-types; do
+            exe=$(awk -F'\t' -v k="$kind" '$1 == k {print $3}' ../bins.tsv)
+            [ -n "$exe" ] || { echo "::error::the $kind test executable was not built"; status=1; continue; }
+            threads=4; [ "$kind" = transport ] && threads=1
+            echo "     Running $kind ($exe)" | tee -a ../artifacts/oltp-shared-crates-direct-off.log
+            NABEDRA_TEST_DIRECT_OLTP=off "$GITHUB_WORKSPACE/$exe" --test-threads "$threads" 2>&1 \
+              | tee -a ../artifacts/oltp-shared-crates-direct-off.log || status=1
+          done
+          exit "$status"
       - name: OLTP integration tests, direct_oltp off
         if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.mode == 'off' }}
         working-directory: server
@@ -2056,36 +2088,13 @@ jobs:
           MODE: ${{ matrix.mode }}
         run: |
           read -r -a names <<< "$TESTS"
-          server_cases=()
-          transport_cases=()
-          storage_cases=()
-          replication_cases=()
-          for name in "${names[@]}"; do
-            case "$name" in
-              transport::*) transport_cases+=("$name") ;;
-              oltp::*) storage_cases+=("$name") ;;
-              oltp_replication::*|oltp_deployment::*|oltp_backup_repository::*) replication_cases+=("$name") ;;
-              *) server_cases+=("$name") ;;
-            esac
+          # Each name runs on the OLTP test executable (server library or crate) that lists it.
+          executables=()
+          for kind in lib transport storage replication resources protocol oltp-types; do
+            executables+=(--executable "$GITHUB_WORKSPACE/$(awk -F'\t' -v k="$kind" '$1 == k {print $3}' ../bins.tsv)")
           done
-          repeat() {
-            python3 ../scripts/ci_repeat_tests.py --mode "$MODE" --repeat "$REPEAT" \
-              --log ../tests.log "$@" >> "$GITHUB_STEP_SUMMARY"
-          }
-          status=0
-          if [ "${#server_cases[@]}" -gt 0 ]; then
-            repeat --executable "$NABEDRA_TEST_EXE" "${server_cases[@]}" || status=1
-          fi
-          if [ "${#transport_cases[@]}" -gt 0 ]; then
-            repeat --executable "$NABEDRA_TRANSPORT_TEST_EXE" "${transport_cases[@]}" || status=1
-          fi
-          if [ "${#storage_cases[@]}" -gt 0 ]; then
-            repeat --executable "$NABEDRA_OLTP_STORAGE_TEST_EXE" "${storage_cases[@]}" || status=1
-          fi
-          if [ "${#replication_cases[@]}" -gt 0 ]; then
-            repeat --executable "$NABEDRA_OLTP_REPLICATION_TEST_EXE" "${replication_cases[@]}" || status=1
-          fi
-          exit "$status"
+          python3 ../scripts/ci_repeat_tests.py --mode "$MODE" --repeat "$REPEAT" \
+            --log ../tests.log "${executables[@]}" "${names[@]}" >> "$GITHUB_STEP_SUMMARY"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -2130,7 +2139,12 @@ jobs:
         run: |
           tests=$(python3 ../scripts/ci_quarantine.py tests)
           if [ -z "$tests" ]; then echo "No quarantined tests." >> "$GITHUB_STEP_SUMMARY"; exit 0; fi
-          python3 ../scripts/ci_repeat_tests.py --mode on --repeat 5 --log ../quarantine-tests.log --report-only $tests >> "$GITHUB_STEP_SUMMARY"
+          executables=()
+          for kind in lib transport storage replication resources protocol oltp-types; do
+            executables+=(--executable "$GITHUB_WORKSPACE/$(awk -F'\t' -v k="$kind" '$1 == k {print $3}' ../bins.tsv)")
+          done
+          python3 ../scripts/ci_repeat_tests.py --mode on --repeat 5 --log ../quarantine-tests.log --report-only \
+            "${executables[@]}" $tests >> "$GITHUB_STEP_SUMMARY"
       - name: Quarantined scenarios, both modes
         if: ${{ !cancelled() }}
         run: |

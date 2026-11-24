@@ -1,0 +1,21 @@
+id = "oltp-crate-units"
+module = "oltp"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+# T2 puts the split crates' unit tests in the nightly as well. Phase 8 moved most OLTP unit tests
+# out of the server library into these crates; protocol-unit and transport-unit cover the other two.
+tiers = ["T0", "T1", "T2"]
+# Both direct_oltp modes, as the gate's oltp job (on) and the direct job (off) run them.
+command = ["bash", "-eo", "pipefail", "-c", '''
+packages=(-p nabedra-resources -p nabedra-oltp-types -p nabedra-oltp-storage -p nabedra-oltp-replication)
+cargo test --locked -j 2 "${packages[@]}" --lib --no-run
+for mode in on off; do
+    echo "direct_oltp=$mode"
+    NABEDRA_TEST_DIRECT_OLTP=$mode cargo test --locked -j 2 "${packages[@]}" --lib -- --test-threads 4
+done
+''']
+cwd = "server"
+timeout_s = 3600
+needs = []
+result_parser = "cargo-test"
