@@ -105,6 +105,8 @@ if env.get("FAKE_SILENT"):
 if "NABEDRA_SIM_EXPECT" in env:
     for seed in range(first, first + count):
         ks = kinds(seed)
+        if not patched and seed == int(env.get("FAKE_CONTROL_SKIPS", "0")):
+            continue
         line(seed + 100 if env.get("FAKE_OUT_OF_BUDGET") else seed, ks)
         if env.get("FAKE_DUPLICATE"):
             line(seed, ks)
@@ -117,14 +119,18 @@ ks, again = kinds(seed), kinds(seed, replay=True)
 art = Path(env["NABEDRA_SIM_ARTIFACTS"])
 seed_dir = art / f"{label}-seed-{seed}"
 seed_dir.mkdir(parents=True, exist_ok=True)
-(seed_dir / "history.jsonl").write_text(json.dumps({"seed": seed, "patched": patched}) + "\\n")
+if not (patched and env.get("FAKE_NO_HISTORY")):
+    (seed_dir / "history.jsonl").write_text(json.dumps({"seed": seed, "patched": patched}) + "\\n")
 if ks:
     (seed_dir / "summary.json").write_text(json.dumps({"violations": [f"t=5ms {k}: detail" for k in ks]}))
 (art / "sweep-report.json").write_text(json.dumps({"seeds": [{
     "seed": seed, "trace_hash": ("%016x" % (seed * 7919 + patched)), "trace_events": 40 + seed,
-    "virtual_ms": 1000, "replayed": True, "deterministic": ks == again, "violations": ks,
+    "virtual_ms": 1000, "replayed": True, "violations": ks,
+    "deterministic": ks == again and (patched or not env.get("FAKE_CLEAN_FLAKY")),
     "config_hash": "c0ffee"}]}))
 line(seed, ks)
+if env.get("FAKE_PATCHED_EXIT" if patched else "FAKE_CLEAN_EXIT"):
+    ks = not ks
 sys.exit(101 if ks else 0)
 '''
 
@@ -401,6 +407,14 @@ class SimBugsTest(unittest.TestCase):
                 self.assertIn("the recorded mechanism is for another hit", output)
         self.record_detection(3, detector="failed-write-observed")
         self.assert_check(1, "detection.detector must be one of expect")
+        # An expected kind that the patched replay did not report is not the detector either.
+        bug = self.f.repo / "server/sim-oltp/bugs/fix-one/bug.toml"
+        bug.write_text(bug.read_text().replace('expect = ["NotAppliedNeverCommitted"]',
+                                               'expect = ["NotAppliedNeverCommitted", "failed-write-observed"]'))
+        status, output, summary, _ = self.harness_run(hit=3)
+        self.assertEqual(status, 1, output)
+        self.assertIn("failed-write-observed did not report this hit", output)
+        self.assertEqual(summary["bugs"][0]["result"], "candidate")
         self.record_detection(3, mechanism=" ")
         self.assert_check(1, "detection.mechanism must say how")
 
@@ -449,6 +463,8 @@ class SimBugsTest(unittest.TestCase):
         self.assertEqual(row["patched"]["history_sha256"], hashlib.sha256(history.read_bytes()).hexdigest())
         self.assertEqual(json.loads(history.read_text())["patched"], True)
         self.assertEqual(json.loads(Path(row["clean"]["history"]).read_text())["patched"], False)
+        # No binary lands in the artifact directory, which the workflow uploads (design 3.10).
+        self.assertEqual([p for p in (self.root / "out").rglob("*") if p.is_file() and p.stat().st_mode & 0o111], [])
         # The patch went only into the scratch worktree, which is gone.
         self.assertEqual((self.f.repo / "server/src/lib.rs").read_text(), before)
         self.assertEqual(len(sh(self.f.repo, "worktree", "list").splitlines()), 1)
@@ -460,6 +476,11 @@ class SimBugsTest(unittest.TestCase):
             "duplicate": "duplicate or out-of-budget seed lines in [1, 5]",
             "clean_fails": "clean replay of seed 2: the unpatched build reported ['Other']",
             "flaky": "patched replay of seed 2: the seed's two runs differed",
+            "patched_exit": "patched replay of seed 2: the sweep did not fail on the seed alone (exit 0)",
+            "no_history": "patched replay of seed 2: the harness wrote no history",
+            "clean_flaky": "clean replay of seed 2: the seed's two runs differed",
+            "clean_exit": "clean replay of seed 2: the unpatched sweep did not pass (exit 101)",
+            "control_skips": "the clean control did not run every seed tried",
             "hit": "5 seeds without ['NotAppliedNeverCommitted']",
             "clean_kind_at": "not attributable to the patch: the unpatched build reports "
                              "['NotAppliedNeverCommitted'] at seed 1",

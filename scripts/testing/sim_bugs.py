@@ -759,6 +759,11 @@ def build_sweep(args, tree, env, log, dest):
     return dest
 
 
+def sweep_binary(env, name):
+    """Outside the artifact directory: no build in this job may produce a binary artifact."""
+    return Path(env["CARGO_TARGET_DIR"]) / "sweeps" / f"{name}-sweep"
+
+
 def run_sweep(exe, tree, env, log, timeout=None):
     return run_logged([str(exe), SWEEP_TEST, "--exact", "--nocapture", "--test-threads=1"],
                       tree / "server" / "sim-oltp", env, log, timeout)
@@ -883,7 +888,7 @@ def search_bug(args, scratch, env, log, bug, plan, out_dir, clean_exe):
     scratch.apply(bug)
     try:
         row["scratch_worktree"] = str(tree)
-        exe = build_sweep(args, tree, env, log, out_dir / "bin" / f"{bug.id}-sweep")
+        exe = build_sweep(args, tree, env, log, sweep_binary(env, bug.id))
         count = plan.last - plan.first + 1
         search_env = sim_env(env, plan, label, out_dir / bug.id / "search", plan.first, count,
                              expect=True, defect=plan.defect, jobs=args.sim_jobs)
@@ -1000,7 +1005,7 @@ def cmd_run(repo, bugs, args, out):
         sha = git(scratch.path, "rev-parse", "HEAD").stdout.strip()
         print(f"sim-bugs run on {sha}, artifacts {out_dir}", file=out, flush=True)
         # The unpatched build first: every clean twin replays on it.
-        clean_exe = build_sweep(args, scratch.path, env, log, out_dir / "bin" / "clean-sweep")
+        clean_exe = build_sweep(args, scratch.path, env, log, sweep_binary(env, "clean"))
         for bug in bugs:
             try:
                 row = search_bug(args, scratch, env, log, bug, Plan.of(bug, args), out_dir, clean_exe)
