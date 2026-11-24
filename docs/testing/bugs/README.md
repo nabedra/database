@@ -111,5 +111,5 @@ python3 -m unittest scripts.testing.test_bugs
 
 The summary prints Markdown counts of fixed and open bugs by class, module and
 finder. The [`testing-bugs` check](../checks/testing-bugs.toml) runs validation
-in T0 and T1, and [`testing-bugs-unit`](../checks/testing-bugs-unit.toml) runs
+in T0, T1 and T2, and [`testing-bugs-unit`](../checks/testing-bugs-unit.toml) runs
 the unit tests.

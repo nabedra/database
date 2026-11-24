@@ -21,7 +21,7 @@ selected checks. Cover each guarantee or explain why it does not apply.
 Give a reason for every check you add or skip. See [guarantees](references/guarantees.md).
 
 For a docs-only diff, review the content, examples and links and record the
-local results. Use the [docs-only CI rule](../nabedra-change/SKILL.md).
+local results. Follow the [docs-only merge rule](../nabedra-change/SKILL.md).
 
 ## Build the review rubric
 
@@ -79,8 +79,8 @@ checks the register requires. Follow the [evidence rules](references/evidence.md
 - Update the plan before changing a public interface, such as a wire
   protocol, HTTP API, ORM signature, configuration, CLI or on-disk format.
   The plan gives a success measure and the scenario IDs.
-- Merge only after a non-author reviewer approves and all blocking findings
-  are resolved.
+- Resolve all blocking findings before merging. Require non-author approval
+  for PRs outside the docs-only merge rule above.
 - Put every new or changed test through `scripts/testing/repeat_gate.py`.
   Run unit tests 50 times and real-environment cases 5 times. Run simulation
   workloads with 5 times their usual seeds. The test catalog at
