@@ -68,8 +68,8 @@ In that table:
 | K | Soak |
 | T | TLA+ design spec checked by TLC or Apalache, and trace validation against it. See [design review](../../design-review/SKILL.md) |
 
-Kind T is not yet accepted by `matrix.py` or `run_check.py`. Until it is, follow the
-[interim rules](../../design-review/SKILL.md#tooling-status) and leave T out of register rows.
+A kind T check runs through `scripts/testing/tla_check.py` or `tla_trace.py` with the pinned TLC
+image (`needs = ["tlc"]`, `result_parser = "tlc"`). See [specs](../../../../specs/README.md).
 
 Registers are hot files. Their owner for the wave makes every edit. A change never removes a
 required check kind to turn a cell green. Moving a kind to n/a needs a reason in the row and an

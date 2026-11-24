@@ -11,15 +11,15 @@ One TOML file per check, named `<id>.toml`.
 ```toml
 id = "cache-store-model"            # unique kebab-case, equal to the file name
 module = "cache"                    # a module name from docs/testing/modules.toml
-kinds = ["U"]                    # check kinds this run provides: M U S H F D R P K
+kinds = ["U"]                    # check kinds this run provides: M U S H F D R P K T
 guarantees = ["CACHE-G02", "CACHE-G03"]
 scenarios = ["K01", "K02"]
 tiers = ["T0", "T1"]             # any of T0 T1 T2 T3 weekly
 command = ["cargo", "test", "--no-default-features", "--features", "cache", "--lib", "cache::store::model_tests"]
 cwd = "server"                   # relative to the repository root
 timeout_s = 900
-needs = []                       # any of: docker, kind, s3, rust-nightly, node, python-orm, valkey
-result_parser = "cargo-test"     # cargo-test | unittest | node-test | exit-code
+needs = []                       # any of: docker, kind, s3, rust-nightly, node, python-orm, valkey, tlc
+result_parser = "cargo-test"     # cargo-test | unittest | node-test | exit-code | tlc
 env = { NABEDRA_CASES = "1000" } # optional
 ```
 
@@ -27,7 +27,7 @@ env = { NABEDRA_CASES = "1000" } # optional
 | --- | --- | --- |
 | `id` | yes | Kebab-case, equal to the file name without `.toml`. |
 | `module` | yes | A module in `docs/testing/modules.toml`, or `misc`. |
-| `kinds` | yes | A non-empty list of distinct kind letters (plan revision 1, "check kinds"). |
+| `kinds` | yes | A non-empty list of distinct kind letters (plan revision 1, "check kinds"). A kind T check needs `needs = ["tlc"]` and `result_parser = "tlc"`. |
 | `guarantees` | yes | Guarantee IDs from `docs/testing/guarantees/*.md`. May be empty for tooling checks. `matrix.py lint` fails on an unknown ID. |
 | `scenarios` | no | Scenario IDs, copied into the record. |
 | `tiers` | yes | Where the check runs. `matrix.py select` picks the T1 checks of the touched modules, including modules declared by changed check files. A removed check file selects all T1 checks. |
@@ -54,6 +54,7 @@ A missing need makes the result `not-run` with the reason below, and the command
 | `node` | a `node` binary is on `PATH` | `node-missing` |
 | `python-orm` | `import nabedra` succeeds with `orm/python/src` on `PYTHONPATH` | `python-orm-unavailable` |
 | `valkey` | `valkey-server` is on `PATH`, or `NABEDRA_TEST_VALKEY_URL` is set | `valkey-unavailable` |
+| `tlc` | the pinned TLC image is loaded, or `specs/tools/tlc --tla-ensure` builds it (Docker works) | `tlc-unavailable` |
 
 ## Result parsers
 
@@ -63,6 +64,7 @@ A missing need makes the result `not-run` with the reason below, and the command
 | `unittest` | `Ran N tests` and `OK` or `FAILED (failures=.., errors=..)` | N minus skipped | failures + errors |
 | `node-test` | TAP `# pass`, `# fail`, `# cancelled`, `# skipped` | pass + fail + cancelled | fail + cancelled |
 | `exit-code` | the exit status | 1 | 1 if the status is nonzero |
+| `tlc` | the one `nabedra-tla-summary: {json}` line of `scripts/testing/tla_check.py` or `tla_trace.py` | the runner's assertions | the runner's failed assertions |
 
 The result follows these rules, in order:
 
@@ -73,6 +75,15 @@ The result follows these rules, in order:
 5. Nonzero exit with no failed assertion parsed: `error`.
 6. Zero executed assertions: `not-run` with reason `zero-assertions`. Never `pass`.
 7. Otherwise `pass`.
+
+The `tlc` parser also takes the runner's own verdict: a `not-run` (a baseline stopped at the time
+budget or a state cap) or an `error` (a TLC error) with no failed assertion is recorded as such, never
+as `pass`. Its record carries a `tla` object (mode, distinct states, depth, coverage, mutants with
+their counterexample lengths, or trace counts) and lists the TLC logs and counterexamples in
+`artifacts`. Output with more than one summary line is `error`, so a later pass cannot hide an
+earlier failure. When the facts would push the record over 20 KB, passing runs, caught mutants and
+details are dropped, failures are kept, and `tla.truncated` is set; `summary.json` has them all.
+[specs/README.md](../../../specs/README.md) describes the runners and how their results map.
 
 Ignored, skipped and todo tests are listed in the record's `assertions.not_run`.
 If a check prints one or more lines starting with `nabedra-s3-requests: <n>`,

@@ -1,0 +1,16 @@
+# Trace validation of the TwoPhase self-test spec: the accepted sample must be a behavior of the spec,
+# and the rejected sample must be rejected at the line its name gives (.at-<index>).
+id = "specs-selftest-trace"
+module = "testing"
+kinds = ["T"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+command = [
+  "python3", "scripts/testing/tla_trace.py", "check", "specs/selftest", "TwoPhase",
+  "specs/selftest/traces/accepted", "--expect-rejected", "specs/selftest/traces/rejected", "--module", "testing",
+]
+cwd = "."
+timeout_s = 1800
+needs = ["tlc"]
+result_parser = "tlc"

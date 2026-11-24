@@ -10,15 +10,15 @@ equals the filename stem.
 ```toml
 id = "cache-store-model"
 module = "cache"
-kinds = ["U"]                    # M U S H F D R P K, and T once its tooling lands
+kinds = ["U"]                    # M U S H F D R P K T
 guarantees = ["CACHE-G02", "CACHE-G03"]
 scenarios = ["K01", "K02"]
 tiers = ["T0", "T1"]             # T0 T1 T2 T3 weekly
 command = ["cargo", "test", "--no-default-features", "--features", "cache", "--lib", "cache::store::model_tests"]
 cwd = "server"                   # relative to the repository root
 timeout_s = 900
-needs = []                       # docker, kind, s3, rust-nightly, node, python-orm, valkey
-result_parser = "cargo-test"     # cargo-test, unittest, node-test or exit-code
+needs = []                       # docker, kind, s3, rust-nightly, node, python-orm, valkey, tlc
+result_parser = "cargo-test"     # cargo-test, unittest, node-test, exit-code or tlc
 env = { NABEDRA_CASES = "1000" } # optional
 ```
 
