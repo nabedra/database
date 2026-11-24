@@ -375,7 +375,9 @@ fn a_wipe_replaces_one_volume_and_keeps_the_others() {
             ((meta.dev(), meta.ino()), open)
         })
         .await;
+        world.crash(1);
         world.wipe(1, Path::new("/sim/n1/data"), Wipe::Reformat);
+        world.restart_with(1, Cut::Kill);
         let after = world.volume_info(1, Path::new("/sim/n1/data")).unwrap();
         let old = &infos[1];
         assert_eq!(
@@ -399,15 +401,135 @@ fn a_wipe_replaces_one_volume_and_keeps_the_others() {
         assert_eq!(key, b"key", "the key volume survives");
         assert!(!identity, "the data volume is empty");
         assert_eq!(recreated.0, anchor.0, "a reformat keeps the device");
+        // Not what mkfs does: see `mkfs_inodes_repeat_after_a_reformat`.
         assert_ne!(
             recreated.1, anchor.1,
-            "a reformat must not reuse inode numbers (P5)"
+            "a seeded inode base must differ after a reformat (P5)"
         );
+        world.crash(1);
         world.wipe(1, Path::new("/sim/n1/data"), Wipe::Replace);
         let replaced = world.volume_info(1, Path::new("/sim/n1/data")).unwrap();
         assert_ne!(replaced.dev, after.dev);
         assert_eq!(world.mounts(1), vec![p("/sim/n1/keys"), p("/sim/n1/data")]);
     });
+}
+
+/// What a process could record about the directory it trusts, to recognise it later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Anchor {
+    dev: u64,
+    ino: u64,
+    uuid: uuid::Uuid,
+}
+
+/// The anchors of `/sim/n1/data/pool` before and after the volume is wiped.
+fn anchors(seed: u64, mkfs: bool, how: Wipe) -> (Anchor, Anchor) {
+    run(seed, move |world| async move {
+        world.set_mkfs_inodes(mkfs);
+        node_with(&world, 1, &["/sim/n1/data"]);
+        let create = async |world: &Arc<World>| {
+            let uuid = world
+                .volume_info(1, Path::new("/sim/n1/data"))
+                .unwrap()
+                .filesystem_uuid;
+            on(1, move || {
+                os::create_dir("/sim/n1/data/pool").unwrap();
+                let meta = os::metadata("/sim/n1/data/pool").unwrap();
+                Anchor {
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                    uuid,
+                }
+            })
+            .await
+        };
+        let before = create(&world).await;
+        world.crash(1);
+        world.wipe(1, Path::new("/sim/n1/data"), how);
+        world.restart(1);
+        (before, create(&world).await)
+    })
+}
+
+/// Finding 2 of the fault-model review. The planted defect recognises a volume by device
+/// and inode number, as if a reformat always changed them. The clean twin compares the
+/// filesystem uuid. With seeded inode bases the planted check looks sound on every seed.
+#[test]
+fn mkfs_inodes_repeat_after_a_reformat() {
+    let planted = |a: &Anchor, b: &Anchor| (a.dev, a.ino) == (b.dev, b.ino);
+    let clean = |a: &Anchor, b: &Anchor| a.uuid == b.uuid;
+    let accepted = |mkfs, check: &dyn Fn(&Anchor, &Anchor) -> bool| {
+        (0..500)
+            .filter(|&seed| {
+                let (before, after) = anchors(seed, mkfs, Wipe::Reformat);
+                check(&before, &after)
+            })
+            .count()
+    };
+    assert_eq!(
+        accepted(false, &planted),
+        0,
+        "unreachable without the fault"
+    );
+    assert_eq!(accepted(true, &planted), 500, "caught on every seed");
+    assert_eq!(accepted(false, &clean), 0);
+    assert_eq!(
+        accepted(true, &clean),
+        0,
+        "the clean twin refuses the new disk"
+    );
+
+    // A replaced device repeats the inode number and not the device.
+    let (before, after) = anchors(1, true, Wipe::Replace);
+    assert_eq!(before.ino, after.ino);
+    assert_ne!(before.dev, after.dev);
+
+    // Seeded draws, and with them every other identity, are the same either way.
+    let seeded = anchors(1, false, Wipe::Reformat);
+    let mkfs = anchors(1, true, Wipe::Reformat);
+    assert_eq!((seeded.0.uuid, seeded.1.uuid), (mkfs.0.uuid, mkfs.1.uuid));
+}
+
+/// A process whose disk went away, then came back empty, under the incarnation that
+/// committed `identity`. It returns whether that incarnation ran on against the new disk.
+fn loses_its_disk(crash_first: bool) -> std::thread::Result<bool> {
+    std::panic::catch_unwind(|| {
+        run(19, move |world| async move {
+            node_with(&world, 1, &["/sim/n1/data"]);
+            let data = Path::new("/sim/n1/data");
+            let process = world.spawn_node(1, async {
+                os::write("/sim/n1/data/identity", b"id").unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                os::write("/sim/n1/data/after", b"on an empty disk").is_ok()
+                    && !os::try_exists("/sim/n1/data/identity").unwrap()
+            });
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            if crash_first {
+                world.crash(1);
+            }
+            world.wipe(1, data, Wipe::Reformat);
+            if crash_first {
+                world.restart(1);
+            }
+            process.await.unwrap_or(false)
+        })
+    })
+}
+
+/// Finding 5 of the fault-model review. The planted defect is a harness that wipes a live
+/// node: before the assertion the live incarnation silently ran on against the empty disk.
+#[test]
+fn a_wipe_refuses_a_live_node() {
+    let panic = loses_its_disk(false).expect_err("a harness wiped a live node unnoticed");
+    let text = panic.downcast_ref::<String>().unwrap();
+    assert!(
+        text.contains("node 1 is up: crash it before wiping"),
+        "{text}"
+    );
+    assert!(
+        !loses_its_disk(true).unwrap(),
+        "the crashed process survived"
+    );
 }
 
 #[test]
@@ -461,6 +583,7 @@ fn volume_calls_cuts_and_wipes_are_observed_in_order() {
             on(1, || os::write("/sim/n1/data/f", b"x").unwrap()).await;
             world.restart_with(1, Cut::PowerLoss { seed });
             on(1, || os::try_exists("/sim/n1/data/f").unwrap()).await;
+            world.crash(1);
             world.wipe(1, Path::new("/sim/n1/data"), Wipe::Reformat);
             events.lock().unwrap().clone()
         })
