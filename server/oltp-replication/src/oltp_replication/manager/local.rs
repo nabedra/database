@@ -170,6 +170,8 @@ impl LocalWorker {
             shared.clone(),
             ownership.clone(),
         )?;
+        #[cfg(feature = "sim")]
+        manager.register_sim_crash();
         Ok(Self {
             manager,
             shared,

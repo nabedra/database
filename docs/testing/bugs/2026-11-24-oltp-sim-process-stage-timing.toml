@@ -1,0 +1,15 @@
+id = "OLTP-sim-process-stage-timing"
+title = "An OLTP simulation seed replayed differently in a fresh test process"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G02", "OLTP-G03"]
+scenarios = []
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "server/src/oltp_runtime/stage_timing.rs::sim_tests::sim_world_stats_omit_process_stage_timing"
+seed = 2
+trace_hash = "d3b90ea3305d7c82"
+why_not_caught = "Public worker stats embedded the process-wide stage histograms that all simulated worlds share, and local runs always warmed the process with seed 1 first, so the larger later bodies and their changed polling order went unseen."
+invariant_added = "Inside a simulation world, public stats report no process-wide stage timings, so cold and warm test processes record byte-identical traces, including HTTP response lengths, for the same seed."
+fix_commits = ["d139700e7786bec9809082ec76d0faaa904743e9"]
+revert_patch_ok = true

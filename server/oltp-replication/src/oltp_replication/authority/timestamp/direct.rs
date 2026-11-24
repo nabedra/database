@@ -237,6 +237,10 @@ impl DirectWindows {
             return windows;
         }
         let windows = Arc::new(Self::new());
+        #[cfg(feature = "sim")]
+        if let Some(world) = nabedra_rt::sim::world() {
+            world.track_registry("DirectWindows", &windows);
+        }
         registry.insert(key, Arc::downgrade(&windows));
         windows
     }

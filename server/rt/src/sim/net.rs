@@ -331,12 +331,25 @@ struct Connection {
     /// Whether each side's handle (pending or stream) is alive.
     open: [bool; 2],
     reset: bool,
+    power_cut: bool,
     alpn: Option<Vec<u8>>,
 }
 
 impl Connection {
     fn end(&self, side: Side) -> End {
         self.ends[side.tx()]
+    }
+
+    fn black_hole(&mut self) {
+        self.power_cut = true;
+        for pipe in &mut self.pipes {
+            pipe.queue.clear();
+            pipe.fin = Fin::Open;
+            pipe.stalled = true;
+            if let Some(waker) = pipe.reader.take() {
+                waker.wake();
+            }
+        }
     }
 
     fn reset(&mut self) {
@@ -426,10 +439,9 @@ impl State {
     fn port_free(&self, ip: IpAddr, port: u16) -> bool {
         let addr = SocketAddr::new(ip, port);
         !self.listeners.contains_key(&addr)
-            && !self
-                .conns
-                .values()
-                .any(|conn| !conn.reset && conn.ends.iter().any(|end| end.addr == addr))
+            && !self.conns.values().any(|conn| {
+                !conn.reset && !conn.power_cut && conn.ends.iter().any(|end| end.addr == addr)
+            })
     }
 
     /// The next free port on `ip`, from the world-wide counter.
@@ -473,13 +485,21 @@ impl State {
         if id.is_some_and(|id| self.listeners.get(&addr).is_none_or(|slot| slot.id != id)) {
             return;
         }
+        self.disconnect_listener(addr, false);
+    }
+
+    fn disconnect_listener(&mut self, addr: SocketAddr, black_hole: bool) {
         let Some(mut slot) = self.listeners.remove(&addr) else {
             return;
         };
         for conn in slot.backlog.drain(..) {
             if let Some(conn) = self.conns.get_mut(&conn) {
                 conn.open[Side::Server.tx()] = false;
-                conn.reset();
+                if black_hole {
+                    conn.black_hole();
+                } else {
+                    conn.reset();
+                }
             }
         }
         slot.acceptors.wake_all();
@@ -551,7 +571,7 @@ fn installed() -> io::Result<Arc<Net>> {
 
 /// The crash rule: resets the node's connections and closes its listeners. Called by
 /// [`World::crash`] before it aborts the node's tasks.
-pub(crate) fn crash(world: &World, node: u64) {
+pub(crate) fn crash(world: &World, node: u64, black_hole: bool) {
     let Some(net) = find(&mut registry(), world) else {
         return;
     };
@@ -563,11 +583,15 @@ pub(crate) fn crash(world: &World, node: u64) {
         .map(|(addr, _)| *addr)
         .collect();
     for addr in addrs {
-        state.close_listener(addr, None);
+        state.disconnect_listener(addr, black_hole);
     }
     for conn in state.conns.values_mut() {
         if conn.ends.iter().any(|end| end.node == Some(node)) {
-            conn.reset();
+            if black_hole {
+                conn.black_hole();
+            } else {
+                conn.reset();
+            }
         }
     }
     state.wake_all();
@@ -799,6 +823,7 @@ async fn dial_one(net: &Arc<Net>, from: Option<u64>, addr: SocketAddr) -> io::Re
                         pipes: [Pipe::default(), Pipe::default()],
                         open: [true, true],
                         reset: false,
+                        power_cut: false,
                         alpn: None,
                     },
                 );
@@ -1011,6 +1036,9 @@ impl Half {
         };
         if conn.reset {
             return Err(reset_error());
+        }
+        if conn.power_cut {
+            return Ok(());
         }
         let tx = self.side.tx();
         if !matches!(conn.pipes[tx].fin, Fin::Open) {

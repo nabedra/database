@@ -319,6 +319,10 @@ impl<C: TypedConfig> TypedLogStore<C> {
                 .and_then(Weak::upgrade)
                 .unwrap_or_else(|| {
                     let writes = Arc::new(WriterState::default());
+                    #[cfg(feature = "sim")]
+                    if let Some(world) = nabedra_rt::sim::world() {
+                        world.track_registry("RaftWriterState", &writes);
+                    }
                     registry.insert(key, Arc::downgrade(&writes));
                     writes
                 })

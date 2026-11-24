@@ -1,6 +1,15 @@
-//! Deterministic simulation components for the OLTP harness.
+//! Deterministic black-box simulation of the registered OLTP cluster.
 
+mod bootstrap;
+mod client;
+mod config;
+pub mod disk;
+pub mod history;
+pub mod invariants;
 pub mod net;
+mod node;
+pub mod sweep;
+mod workload;
 
 #[cfg(test)]
 use nabedra_transport::tls;

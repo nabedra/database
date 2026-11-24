@@ -135,8 +135,21 @@ pub async fn run_api_configured(
     cold_start: bool,
     migrate_catalog: bool,
 ) -> Result<(), &'static str> {
+    #[cfg(feature = "sim")]
+    if let Some(mut channel) = super::sim::supervisor() {
+        return run_api_with_channel(path, &mut channel, cold_start, migrate_catalog).await;
+    }
     let mut channel = crate::supervisor::open().map_err(|_| "protocol_error")?;
-    let result = process(&path, &mut channel, cold_start, migrate_catalog).await;
+    run_api_with_channel(path, &mut channel, cold_start, migrate_catalog).await
+}
+
+async fn run_api_with_channel(
+    path: PathBuf,
+    channel: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+    cold_start: bool,
+    migrate_catalog: bool,
+) -> Result<(), &'static str> {
+    let result = process(&path, channel, cold_start, migrate_catalog).await;
     if let Err(error) = &result {
         let code = match error.code {
             ErrorCode::ValidationError | ErrorCode::UnsupportedOperation => "invalid_config",
@@ -144,7 +157,7 @@ pub async fn run_api_configured(
             _ => "startup_failed",
         };
         let _ = crate::supervisor::send(
-            &mut channel,
+            channel,
             &serde_json::json!({"version":1,"type":"fatal","code":code}),
             nabedra_rt::time::now() + Duration::from_secs(2),
         )
@@ -154,7 +167,7 @@ pub async fn run_api_configured(
 }
 async fn process(
     path: &Path,
-    channel: &mut tokio::net::UnixStream,
+    channel: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
     cold_start: bool,
     migrate_catalog: bool,
 ) -> Result<(), ProtocolError> {
@@ -292,6 +305,13 @@ async fn process(
         if activate.version!=1||activate.kind!="activate"{return Err(invalid("invalid supervisor activation"));}
         let application=runtime.application(auth.data_token,config.database,auth.admin_token)?;
         crate::supervisor::send(channel,&serde_json::json!({"version":1,"type":"ready","cluster_id":cluster_id,"bound_url":bound_url}),deadline).await.map_err(|_|unavailable())?;
+        #[cfg(feature = "sim")]
+        if nabedra_rt::sim::world().is_some() {
+            return crate::network::serve_router_keep_alive(listener, application, tls, async {
+                let _ = crate::supervisor::frame(channel, None).await;
+                runtime.stop_accepting();
+            }).await.map_err(|_| unavailable());
+        }
         let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|unavailable())?;
         let mut interrupt=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).map_err(|_|unavailable())?;
         crate::network::serve_router_keep_alive(listener,application,tls,async {
@@ -324,6 +344,7 @@ pub(super) async fn bind_http(addr: SocketAddr) -> std::io::Result<ApiListener> 
     }
 }
 
+#[cfg(not(feature = "sim"))]
 pub(super) fn regular(path: &Path, secret: bool) -> Result<std::fs::File, ProtocolError> {
     use std::os::unix::{
         fs::PermissionsExt,
@@ -346,6 +367,24 @@ pub(super) fn regular(path: &Path, secret: bool) -> Result<std::fs::File, Protoc
     }
     Ok(file)
 }
+#[cfg(feature = "sim")]
+pub(super) fn regular(path: &Path, secret: bool) -> Result<nabedra_rt::fs::os::File, ProtocolError> {
+    use nabedra_rt::fs::os;
+    let file = os::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| invalid("API material unreadable"))?;
+    let info = file.metadata().map_err(|_| invalid("API material unreadable"))?;
+    if !info.is_file()
+        || info.len() > 65536
+        || (secret && (info.mode() & 0o077 != 0 || info.uid() != os::euid()))
+    {
+        return Err(invalid("invalid protected API material"));
+    }
+    Ok(file)
+}
+
 pub(super) fn protected_json<T: serde::de::DeserializeOwned>(
     path: &Path,
 ) -> Result<T, ProtocolError> {

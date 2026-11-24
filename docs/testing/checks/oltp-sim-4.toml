@@ -1,0 +1,18 @@
+id = "oltp-sim-4"
+module = "oltp"
+kinds = ["S", "H"]
+# Fault model. Smoke covers the single-key real-time history and keyed retries.
+guarantees = ["OLTP-G02", "OLTP-G03"]
+scenarios = []
+tiers = ["T1"]
+# Shard 4 of 4. Build once, then allow the measured sweep at most 15 minutes.
+command = ["bash", "-euc", '''
+build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+"${build[@]}" --no-run
+exec timeout 900s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1
+''']
+cwd = "server"
+timeout_s = 3600
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "smoke", NABEDRA_SEEDS = "50", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SEED = "1501", NABEDRA_SIM_CHECK_ID = "oltp-sim-4", NABEDRA_SIM_GUARANTEES = "OLTP-G02,OLTP-G03", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-4" }

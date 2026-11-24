@@ -1,0 +1,339 @@
+//! Rust counterpart of the RF3 fixture in tests/oltp_direct_cluster.py.
+//! All paths refer to the calling node's own volume.
+
+use std::{
+    io::{self, Write},
+    net::SocketAddr,
+    path::Path,
+};
+
+use nabedra_database_server::oltp::pool::POOL_FORMAT_VERSION;
+use nabedra_oltp_types::types::Digest;
+use nabedra_rt::{fs::os, ids::uuid_v4, sim::net::node_ip};
+use nabedra_transport::tls::TlsMaterial;
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+pub(crate) const WORKERS: [u64; 3] = [1, 2, 3];
+pub(crate) const GATEWAYS: [u64; 2] = [101, 102];
+pub(crate) const BOOTSTRAP_CLIENT: u64 = 1001;
+pub(crate) const CLIENTS: [u64; 2] = [1002, 1003];
+pub(crate) const DATABASE: &str = "test";
+pub(crate) const ROOT: &str = "/sim-oltp";
+pub(crate) const CONFIG: &str = "/sim-oltp/bootstrap.json";
+const AUTH: &str = "/sim-oltp/auth.json";
+const CERT: &str = "/sim-oltp/node.pem";
+const KEY: &str = "/sim-oltp/node.key";
+const CA: &str = "/sim-oltp/ca.pem";
+const MARKER: &str = "/sim-oltp/.nabedra-docker-volume.json";
+
+pub(crate) fn http_addr(node: u64) -> SocketAddr {
+    SocketAddr::new(node_ip(node), 20_000 + node as u16)
+}
+
+fn peer_addr(node: u64) -> SocketAddr {
+    SocketAddr::new(node_ip(node), 21_000 + node as u16)
+}
+
+fn material(node: u64) -> (&'static [u8], &'static [u8]) {
+    macro_rules! pem {
+        ($id:literal) => {
+            (
+                include_bytes!(concat!("../fixtures/tls/", $id, ".pem")),
+                include_bytes!(concat!("../fixtures/tls/", $id, ".key")),
+            )
+        };
+    }
+    match node {
+        1 => pem!("1"),
+        2 => pem!("2"),
+        3 => pem!("3"),
+        101 => pem!("101"),
+        102 => pem!("102"),
+        _ => unreachable!("no certificate for node {node}"),
+    }
+}
+
+fn certificate_authority() -> &'static [u8] {
+    include_bytes!("../fixtures/tls/ca.pem")
+}
+
+fn write(path: &str, data: &[u8]) -> io::Result<()> {
+    let mut file = os::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    os::sync_dir(Path::new(ROOT))
+}
+
+fn write_json(path: &str, value: &Value) -> io::Result<()> {
+    write(path, &serde_json::to_vec(value)?)
+}
+
+fn resources() -> Value {
+    json!({
+        "max_threads": 2,
+        "memory_limit_bytes": 2048_u64 << 20,
+        "task_memory_limit_bytes": 512 << 20,
+        "control_memory_reserve_bytes": 128 << 20,
+    })
+}
+
+fn execution() -> Value {
+    json!({
+        "max_workers_per_request": 1,
+        "max_pending_requests": 128,
+        "max_queue_bytes_per_replica": 8 << 20,
+        "max_retained_result_bytes_per_worker": 8 << 20,
+        "result_retention_ms": 600_000,
+        "queue_replication": "all_ready_workers",
+        "queue_lifetime": "live_cluster",
+        "partition_size": "64 MiB",
+        "direct_oltp": true,
+    })
+}
+
+fn enrollment(node: u64) -> io::Result<Value> {
+    let (cert, key) = material(node);
+    let tls = TlsMaterial::from_pem(cert, key, certificate_authority())?;
+    Ok(json!({
+        "worker_id": uuid_v4(),
+        "incarnation": uuid_v4(),
+        "enrollment_revision": 1,
+        "certificate_sha256": tls.certificate_sha256(),
+        "endpoint": peer_addr(node),
+        "server_name": "localhost",
+    }))
+}
+
+pub(crate) struct Bootstrap {
+    pub cluster_id: Uuid,
+    pub run_id: Uuid,
+    pub data_token: String,
+    pub admin_token: String,
+    enrollment_token: String,
+    worker_configs: [Value; 3],
+    api_enrollments: [Value; 2],
+}
+
+impl Bootstrap {
+    /// Generate all identities in the bootstrap client's own seeded node context.
+    pub fn new() -> io::Result<Self> {
+        let cluster_id = uuid_v4();
+        let run_id = uuid_v4();
+        let bootstrap_id = uuid_v4();
+        let data_token = format!("data-{}", uuid_v4().to_string().repeat(2));
+        let admin_token = format!("admin-{}", uuid_v4().to_string().repeat(2));
+        let enrollment_token = format!("enroll-{}", uuid_v4().to_string().repeat(2));
+        let enrollments = [enrollment(1)?, enrollment(2)?, enrollment(3)?];
+        let pools = WORKERS.map(|_| uuid_v4());
+        let place = |offset: usize, kind: Value| {
+            let voters: Vec<_> = (0..WORKERS.len())
+                .map(|voter| {
+                    let local = (voter + offset) % WORKERS.len();
+                    json!({"node_id": voter + 1, "worker_id": enrollments[local]["worker_id"], "pool_id": pools[local]})
+                })
+                .collect();
+            json!({
+                "identity": {
+                    "cluster_id": cluster_id, "database": DATABASE, "group_id": uuid_v4(),
+                    "group_format_version": 1, "kind": kind,
+                },
+                "voters": voters,
+            })
+        };
+        let placements = json!({
+            "control": place(0, json!("control")),
+            "timestamps": place(1, json!("timestamps")),
+            "status": place(2, json!({"status": {"bucket": 0}})),
+            "catalog": place(3, json!("catalog")),
+        });
+        let (peers, pins) = Self::peer_inventory(enrollments.to_vec());
+        let worker_configs = std::array::from_fn(|local| {
+            let node = WORKERS[local];
+            let enrollment = &enrollments[local];
+            let marker = uuid_v4();
+            json!({
+                "version": 1,
+                "bind": http_addr(node),
+                "auth_file": AUTH,
+                "resources": resources(),
+                "execution": execution(),
+                "node": {
+                    "format": 1,
+                    "directory": ROOT,
+                    "pool_id": pools[local],
+                    "scheduler_node_id": node,
+                    "enrollment": enrollment,
+                    "bind": peer_addr(node),
+                    "certificate": CERT,
+                    "private_key": KEY,
+                    "authority_ca": CA,
+                    "bootstrap_id": bootstrap_id,
+                    "initial_run": run_id,
+                    "required_voters": WORKERS.len(),
+                    "placements": placements,
+                    "control_enrollments": peers,
+                    "operator_pins": pins,
+                    "mount": {
+                        "profile": {"docker": {"volume_marker": marker}},
+                        "worker": Self::identity(enrollment),
+                        "generation": 1,
+                        "identity": {
+                            "engine": "oltp", "pool_format_version": POOL_FORMAT_VERSION,
+                            "cluster_id": cluster_id, "worker_id": enrollment["worker_id"], "pool_id": pools[local],
+                        },
+                        "mount_path": ROOT,
+                        "provider_volume_id": format!("docker-volume:sim-oltp-{node}"),
+                        "filesystem_uuid": "",
+                    },
+                },
+            })
+        });
+        let api_enrollments = [
+            json!({"database": DATABASE, "enrollment": enrollment(GATEWAYS[0])?}),
+            json!({"database": DATABASE, "enrollment": enrollment(GATEWAYS[1])?}),
+        ];
+        Ok(Self {
+            cluster_id,
+            run_id,
+            data_token,
+            admin_token,
+            enrollment_token,
+            worker_configs,
+            api_enrollments,
+        })
+    }
+
+    fn identity(enrollment: &Value) -> Value {
+        json!({
+            "worker_id": enrollment["worker_id"],
+            "incarnation": enrollment["incarnation"],
+            "enrollment_revision": enrollment["enrollment_revision"],
+            "certificate_sha256": enrollment["certificate_sha256"],
+        })
+    }
+
+    fn peer_inventory(mut peers: Vec<Value>) -> (Vec<Value>, Vec<String>) {
+        peers.sort_by(|a, b| a["worker_id"].as_str().cmp(&b["worker_id"].as_str()));
+        let mut pins: Vec<_> = peers
+            .iter()
+            .map(|peer| peer["certificate_sha256"].as_str().unwrap().to_owned())
+            .collect();
+        pins.sort_unstable();
+        (peers, pins)
+    }
+
+    pub fn certificate_digest(&self, node: u64) -> [u8; 32] {
+        let enrollment = if let Some(index) = WORKERS.iter().position(|id| *id == node) {
+            &self.worker_configs[index]["node"]["enrollment"]
+        } else {
+            let index = GATEWAYS
+                .iter()
+                .position(|id| *id == node)
+                .expect("known process");
+            &self.api_enrollments[index]["enrollment"]
+        };
+        *Digest::parse(enrollment["certificate_sha256"].as_str().unwrap())
+            .expect("generated SHA-256 fingerprint")
+            .as_bytes()
+    }
+
+    fn write_material(&self, node: u64) -> io::Result<()> {
+        let (cert, key) = material(node);
+        write(CERT, cert)?;
+        write(KEY, key)?;
+        write(CA, certificate_authority())?;
+        write_json(
+            AUTH,
+            &json!({
+                "data_token": self.data_token,
+                "admin_token": self.admin_token,
+                "enrollment_token": self.enrollment_token,
+            }),
+        )
+    }
+
+    pub fn write_worker(&self, index: usize) -> io::Result<()> {
+        let node = WORKERS[index];
+        self.write_material(node)?;
+        let config = &self.worker_configs[index];
+        write_json(
+            MARKER,
+            &json!({
+                "format_version": 1,
+                "volume_name": format!("sim-oltp-{node}"),
+                "volume_marker": config["node"]["mount"]["profile"]["docker"]["volume_marker"],
+            }),
+        )?;
+        write_json(CONFIG, config)
+    }
+
+    pub fn api_enrollment(&self, index: usize) -> &Value {
+        &self.api_enrollments[index]
+    }
+
+    pub fn write_gateway(&self, index: usize, connection: &Value) -> io::Result<()> {
+        let node = GATEWAYS[index];
+        self.write_material(node)?;
+        write_json(
+            CONFIG,
+            &json!({
+                "version": 1,
+                "engine": "oltp",
+                "bind": SocketAddr::from(([127, 0, 0, 1], http_addr(node).port())),
+                "database": DATABASE,
+                "auth_file": AUTH,
+                "topology": {
+                    "mode": "remote",
+                    "cluster_id": self.cluster_id,
+                    "control_group_id": connection["control_group_id"],
+                    "control_peers": connection["control_peers"],
+                    "enrollment": self.api_enrollment(index),
+                    "worker_tls": {"cert_file": CERT, "key_file": KEY, "ca_file": CA},
+                    "direct_oltp": true,
+                },
+                "worker": {"resources": resources(), "execution": execution(), "queue_size": 128},
+            }),
+        )
+    }
+
+    /// Update the original topology through the same explicit cold-start profile as RF3.
+    /// The durable volumes and peer certificate pins stay in place.
+    pub fn prepare_cold_start(&mut self) {
+        let next_run = uuid_v4();
+        let profile = json!({
+            "previous_run": self.run_id,
+            "next_run": next_run,
+            "transition_id": uuid_v4(),
+        });
+        for config in &mut self.worker_configs {
+            let node = &mut config["node"];
+            let enrollment = &mut node["enrollment"];
+            let revision = enrollment["enrollment_revision"].as_u64().unwrap();
+            enrollment["enrollment_revision"] = json!(revision + 1);
+            enrollment["incarnation"] = json!(uuid_v4());
+            let worker = Self::identity(enrollment);
+            let mount = &mut node["mount"];
+            let generation = mount["generation"].as_u64().unwrap();
+            mount["worker"] = worker;
+            mount["generation"] = json!(generation + 1);
+            node["cold"] = profile.clone();
+        }
+        let (peers, pins) = Self::peer_inventory(
+            self.worker_configs
+                .iter()
+                .map(|config| config["node"]["enrollment"].clone())
+                .collect(),
+        );
+        for config in &mut self.worker_configs {
+            config["node"]["control_enrollments"] = json!(peers);
+            config["node"]["operator_pins"] = json!(pins);
+        }
+        self.run_id = next_run;
+    }
+}

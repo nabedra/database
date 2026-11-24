@@ -600,6 +600,8 @@ impl RegisteredWorker {
             health: Arc::default(),
             features: Arc::default(),
         });
+        #[cfg(feature = "sim")]
+        manager.register_sim_crash();
         let mut restart_mount = None;
         let mut replacement_mount_committed = false;
         if let Some(record) = &replacement {

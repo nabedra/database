@@ -120,7 +120,7 @@ impl DirectSwitch {
         local: WorkerIdentity,
         direct_oltp: bool,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let switch = Arc::new(Self {
             control,
             local,
             direct_oltp,
@@ -136,7 +136,24 @@ impl DirectSwitch {
             watcher: Mutex::new(None),
             executor: Mutex::new(None),
             catalog: Mutex::new(None),
-        })
+        });
+        #[cfg(feature = "sim")]
+        if let (Some(world), Some(node)) =
+            (nabedra_rt::sim::world(), nabedra_rt::sim::current_node())
+        {
+            let switch = Arc::downgrade(&switch);
+            world.observe(Arc::new(move |event| {
+                if matches!(event, nabedra_rt::sim::SimEvent::Crash { node: cut } if *cut == node)
+                    && let Some(switch) = switch.upgrade()
+                {
+                    // The executor also holds its gate (this switch). Normal
+                    // drain breaks the cycle after joining; SIGKILL cannot drain.
+                    let executor = switch.executor.lock().unwrap().take();
+                    drop(executor);
+                }
+            }));
+        }
+        switch
     }
 
     /// Control activated `data.direct.v1` (as last observed; never reverts).
@@ -471,6 +488,10 @@ impl crate::oltp_runtime::direct::DirectGate for DirectSwitch {
         self.is_direct_active()
     }
     fn direct_batch(&self) -> bool {
+        #[cfg(feature = "sim")]
+        if crate::oltp_runtime::sim::limits().is_some_and(|limits| !limits.direct_batch) {
+            return false;
+        }
         self.is_batch_enabled()
     }
     fn history_settling(&self) -> bool {
@@ -547,7 +568,7 @@ impl DirectSwitch {
             remote,
         );
         *self.catalog.lock().unwrap_or_else(|e| e.into_inner()) = Some(catalog.clone());
-        #[cfg_attr(not(test), allow(unused_mut))]
+        #[cfg_attr(not(any(test, feature = "sim")), allow(unused_mut))]
         let mut config = crate::oltp_runtime::direct::DirectConfig::default();
         // T9 D12: a registered test child can shrink the leader's in-flight budget
         // so a process-level load deterministically exceeds it.
@@ -557,6 +578,10 @@ impl DirectSwitch {
             .and_then(|value| value.parse().ok())
         {
             config.max_in_flight = limit;
+        }
+        #[cfg(feature = "sim")]
+        if let Some(limits) = crate::oltp_runtime::sim::limits() {
+            config.max_in_flight = limits.direct_max_in_flight;
         }
         let executor = crate::oltp_runtime::direct::DirectExecutor::new(
             services.shared.clone(),

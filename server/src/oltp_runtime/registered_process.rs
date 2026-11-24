@@ -49,6 +49,11 @@ pub async fn run(path: PathBuf) -> Result<(), &'static str> {
         return Err("automatic shard splitting requires a mounted pool and a valid policy");
     }
     let native = native_resources(&config).map_err(report_startup_error)?;
+    #[cfg(feature = "sim")]
+    let native = super::sim::limits().map_or(native, |limits| SharedResourceConfig {
+        data_apply_reply_bytes: limits.data_apply_reply_bytes,
+        ..native
+    });
     let auth: Auth = super::api_process::protected_json(&config.auth_file)
         .map_err(|_| "worker authentication unreadable")?;
     let tokens = [&auth.admin_token, &auth.data_token, &auth.enrollment_token];
@@ -93,6 +98,15 @@ pub async fn run(path: PathBuf) -> Result<(), &'static str> {
         let application = runtime
             .application_with_admin(auth.data_token, auth.admin_token)
             .map_err(|_| "worker application invalid")?;
+        #[cfg(feature = "sim")]
+        if let Some(stop) = super::sim::worker_stop() {
+            return crate::network::serve_router(listener, application, None, async {
+                let _ = stop.await;
+                runtime.stop_accepting();
+            })
+            .await
+            .map_err(|_| "worker HTTP server failed");
+        }
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .map_err(|_| "worker signal failed")?;

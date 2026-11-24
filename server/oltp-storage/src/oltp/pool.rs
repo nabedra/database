@@ -4,6 +4,8 @@ mod activation;
 mod closed;
 mod damage;
 mod disk;
+#[cfg(feature = "sim")]
+pub use disk::registries_empty;
 #[doc(hidden)]
 pub use activation::{
     ActivationMembershipProof, ReplicaActivationStatement, VerifiedReplicaActivation,

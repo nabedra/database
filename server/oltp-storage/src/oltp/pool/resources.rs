@@ -400,6 +400,10 @@ impl WorkerSharedResources {
             return Err(capacity());
         }
         *current = Some(worker_id);
+        #[cfg(feature = "sim")]
+        if let Some(world) = nabedra_rt::sim::world() {
+            world.track_registry("WorkerSharedResources", self);
+        }
         workers.insert(worker_id, Arc::downgrade(self));
         Ok(())
     }
