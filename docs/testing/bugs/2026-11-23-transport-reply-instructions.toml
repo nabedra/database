@@ -10,5 +10,5 @@ lowest_regression = "rt-zero-cost workload oltp-transport"
 seed = "unknown"
 why_not_caught = "The original instruction comparison did not exercise authenticated requests over the multiplex."
 invariant_added = "The paired comparison includes 512 loopback mTLS requests and checks the phase 8 per-workload instruction limit. Reply decoding preserves its distinct input and reservation errors."
-fix_commits = ["d9160aed2375f590107d6dd30902150a3c9217ff"]
+fix_commits = ["576e5f811a6b7a01128b7698595f90a799901a7c", "82f86c28c0ad80c62f57df5f3712c84cc4c4a308"]
 revert_patch_ok = true
