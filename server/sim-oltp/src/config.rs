@@ -23,6 +23,10 @@ const CLOCKS: &[(u64, &str, &str)] = &[
     (1003, "n1003.drift_ppm", "n1003.wall_jump_ms"),
 ];
 
+/// The largest fixed Data apply reply budget, `META.output_bytes` in
+/// `oltp-replication`'s `hosted.rs`.
+const MIN_APPLY_REPLY_BYTES: i64 = 128 << 10;
+
 pub(crate) struct Config {
     knobs: BTreeMap<String, Value>,
 }
@@ -34,7 +38,10 @@ impl Config {
             Knob::IntRange("request_deadline_ms", 250, 10_000),
             Knob::IntRange("executor.max_in_flight", 4, 256),
             Knob::IntRange("transport.session_slots", 4, 256),
-            Knob::IntRange("data.apply_reply_bytes", 1 << 16, 1 << 20),
+            // Production fixes this arena at 1 MiB. A Data apply reserves up to
+            // 128 KiB of it at once, and a larger request than the arena can never
+            // be granted, so smaller samples only stall worker startup.
+            Knob::IntRange("data.apply_reply_bytes", MIN_APPLY_REPLY_BYTES, 1 << 20),
         ];
         for &(_, drift, jump) in CLOCKS {
             knobs.push(Knob::IntRange(drift, -200, 200));
@@ -96,5 +103,23 @@ impl Config {
         let mut config = json!(self.knobs);
         config["hash"] = json!(format!("{:016x}", fnv(&bytes)));
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Seed 22 sampled a 124,761-byte arena and no worker ever bound HTTP.
+    #[test]
+    fn sampled_reply_arena_fits_the_largest_apply_budget() {
+        for seed in 1..=2_000 {
+            let config = Config::sample(seed);
+            let bytes = config.knobs["data.apply_reply_bytes"].as_i64().unwrap();
+            assert!(
+                (MIN_APPLY_REPLY_BYTES..=1 << 20).contains(&bytes),
+                "seed {seed}: {bytes}"
+            );
+        }
     }
 }
