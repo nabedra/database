@@ -101,12 +101,14 @@ normal = [
   "nabedra-transport", "nabedra-oltp-storage",
 ]
 
+dev = ["nabedra-resources", "nabedra-transport", "nabedra-oltp-storage"]
+
 [planned.nabedra-database]
 normal = [
   "nabedra-rt", "nabedra-kv", "nabedra-protocol", "nabedra-resources", "nabedra-oltp-types",
   "nabedra-transport", "nabedra-oltp-storage", "nabedra-oltp-replication",
 ]
-dev = ["nabedra-check", "nabedra-oltp-storage"]
+dev = ["nabedra-check", "nabedra-transport", "nabedra-oltp-storage", "nabedra-oltp-replication"]
 
 [planned.nabedra-sim-oltp]
 normal = [
@@ -156,7 +158,7 @@ sha = "148ed66e6ad298f3f107147a2c3813f8c0bc9aec"
 "oltp:oltp_deployment" = 0
 "oltp:oltp_replication" = 0
 "oltp:oltp_runtime" = 0
-"oltp_backup_repository:*" = 1
+"oltp_backup_repository:*" = 0
 "oltp_backup_repository:oltp_runtime" = 0
 "oltp_deployment:*" = 0
 "oltp_deployment:oltp_runtime" = 0
@@ -196,7 +198,7 @@ sha = "148ed66e6ad298f3f107147a2c3813f8c0bc9aec"
 "oltp:oltp_deployment" = 0
 "oltp:oltp_replication" = 0
 "oltp:oltp_runtime" = 0
-"oltp_backup_repository:*" = 2
+"oltp_backup_repository:*" = 0
 "oltp_backup_repository:oltp_runtime" = 0
 "oltp_deployment:*" = 0
 "oltp_deployment:oltp_runtime" = 0

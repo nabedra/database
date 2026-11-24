@@ -6,6 +6,9 @@
 //! `BehaviorVersion::latest()` in everything but the crypto provider: native
 //! root certificates, proxy settings from the environment and the SDK's
 //! per-settings connector cache.
+//!
+//! Keep the connector settings in sync with the other engine in
+//! `../oltp-replication/src/aws_http.rs`. Each engine compiles its own connector.
 use aws_smithy_http_client::{Builder, Connector, proxy::ProxyConfig, tls};
 
 pub(crate) fn https_client() -> aws_sdk_s3::config::SharedHttpClient {

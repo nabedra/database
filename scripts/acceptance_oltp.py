@@ -7,6 +7,8 @@ With --test-binary, set NABEDRA_RESOURCES_TEST_EXE to the prebuilt resources
 test executable when running O13 or O22 and NABEDRA_TRANSPORT_TEST_EXE to
 the prebuilt transport executable when running O05. Set NABEDRA_OLTP_STORAGE_TEST_EXE
 to the storage test executable for O02–O05, O13, O20 and O22–O24.
+Set NABEDRA_OLTP_REPLICATION_TEST_EXE for native replication assertions in
+O05, O13, O15 and O22.
 """
 import argparse
 from contextlib import contextmanager
@@ -30,6 +32,7 @@ ASSERTION_MARKER = "NABEDRA_OLTP_ASSERT "
 RESOURCES_TEST_EXE = "NABEDRA_RESOURCES_TEST_EXE"
 TRANSPORT_TEST_EXE = "NABEDRA_TRANSPORT_TEST_EXE"
 STORAGE_TEST_EXE = "NABEDRA_OLTP_STORAGE_TEST_EXE"
+REPLICATION_TEST_EXE = "NABEDRA_OLTP_REPLICATION_TEST_EXE"
 # Clause IDs follow the Required assertions column of docs/testing/oltp-contract.md.
 # Each ID covers the complete named observation, including its required variations.
 CLAUSES = {
@@ -176,11 +179,13 @@ def source_identity():
     digest = hashlib.sha256()
     paths = [ROOT / "server/Cargo.toml", ROOT / "server/Cargo.lock",
              ROOT / "server/resources/Cargo.toml", ROOT / "server/transport/Cargo.toml",
-             ROOT / "server/oltp-storage/Cargo.toml", Path(__file__)]
+             ROOT / "server/oltp-storage/Cargo.toml",
+             ROOT / "server/oltp-replication/Cargo.toml", Path(__file__)]
     paths += sorted((ROOT / "server/src").rglob("*.rs"))
     paths += sorted((ROOT / "server/resources/src").rglob("*.rs"))
     paths += sorted((ROOT / "server/transport/src").rglob("*.rs"))
     paths += sorted((ROOT / "server/oltp-storage/src").rglob("*.rs"))
+    paths += sorted((ROOT / "server/oltp-replication/src").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.py"))
     paths += sorted((ROOT / "server/tests").rglob("*.c"))
@@ -229,8 +234,8 @@ def build_tests(env, output, *, package=None):
 
 def native_assertion_targets(executables, cases):
     """Find exactly one libtest target per selector across the fixture binaries."""
-    if storage := os.environ.get(STORAGE_TEST_EXE):
-        executables = [*executables, storage]
+    executables = [*executables, *(os.environ[variable] for variable in
+                                    (STORAGE_TEST_EXE, REPLICATION_TEST_EXE) if os.environ.get(variable))]
     names = {}
     for executable in executables:
         listed = subprocess.check_output([executable, "--list"], text=True, timeout=15)
@@ -362,6 +367,7 @@ def main():
                 ("transport", TRANSPORT_TEST_EXE, {"O05"}),
                 ("oltp-storage", STORAGE_TEST_EXE,
                  {"O02", "O03", "O04", "O05", "O13", "O20", "O22", "O23", "O24"}),
+                ("oltp-replication", REPLICATION_TEST_EXE, {"O05", "O13", "O15", "O22"}),
             )
             binary = Path(temp) / "acceptance-tests"
             shutil.copy2(built, binary)

@@ -7,12 +7,11 @@ scenarios = []
 tiers = ["T1"]
 command = ["bash", "-euo", "pipefail", "-c", '''
 echo "Fault model: OLTP simulation ordering and disk-budget isolation"
-python3 scripts/testing/repeat_gate.py --features oltp,sim <<'JSON'
-[
-  {"id": "rd2_warm_refreshes_run_in_key_order", "file": "server/src/oltp_replication/service_rpc/grant_cache.rs", "lang": "rust"}
-]
-JSON
 for attempt in $(seq 50); do
+    cargo test --locked -j 2 -p nabedra-oltp-replication --manifest-path server/Cargo.toml --features sim \
+        --lib oltp_replication::service_rpc::grant_cache::tests::rd2_warm_refreshes_run_in_key_order \
+        -- --exact --test-threads=1 |
+        grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;"
     cargo test --locked -j 2 --manifest-path server/oltp-storage/Cargo.toml --features sim --lib oltp::pool::disk::tests::o08_o13_o21_same_filesystem_reserves_once_and_releases -- --exact --test-threads=1 |
         grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;"
     cargo test --locked -j 2 --manifest-path server/oltp-storage/Cargo.toml --features sim --lib oltp::pool::disk::tests::sim_nodes_have_separate_disk_budgets -- --exact --test-threads=1 |

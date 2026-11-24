@@ -22,7 +22,10 @@
 !server/oltp-storage/src/
 !server/oltp-storage/src/**
 !server/oltp-replication/Cargo.toml
+!server/oltp-replication/src/
+!server/oltp-replication/src/**
 !server/sim/Cargo.toml
+!server/sim-oltp/Cargo.toml
 !server/src/
 !orm/python/pyproject.toml
 !orm/python/README.md
