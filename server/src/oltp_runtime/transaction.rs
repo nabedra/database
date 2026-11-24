@@ -733,39 +733,10 @@ impl TransactionCoordinator {
                 .await?
                 .ok_or_else(unknown)?
         } else if authority.owner_term > state.created_authority.owner_term {
-            // An unavailable capability read leaves the attempt undecided.
-            // Only a definite answer can select the terminal fallback.
-            if state.created_authority.run_id == authority.run_id
-                && state.manifest.is_some()
-                && let Some(control) = retry_control
-                && control.queued_snapshot_retry_enabled().await?
-            {
-                let (reason, message) = if txn.attempt < MAX_QUEUED_MUTATION_ATTEMPTS {
-                    (
-                        AbortReason::RetrySnapshot,
-                        "queued mutation owner was fenced",
-                    )
-                } else {
-                    (
-                        AbortReason::AbandonedByFence,
-                        "queued mutation owner was fenced after exhausting snapshot retries",
-                    )
-                };
-                self.status
-                    .abort(
-                        authority,
-                        txn,
-                        reason,
-                        ProtocolError::new(
-                            ErrorCode::StorageUnavailable,
-                            message,
-                            Outcome::NotApplied,
-                        ),
-                    )
-                    .await?
-            } else {
-                self.status.abandon_fenced(authority, txn).await?
-            }
+            // This also closes unsealed drafts. A newer fenced owner cannot
+            // infer missing writes or rerun an abandoned application request.
+            let _ = retry_control;
+            self.status.abandon_fenced(authority, txn).await?
         } else {
             return Ok(None);
         };
