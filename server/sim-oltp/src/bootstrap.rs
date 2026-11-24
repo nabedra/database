@@ -448,6 +448,14 @@ impl Bootstrap {
         id: Uuid,
         control_peers: &Value,
     ) -> io::Result<Candidate> {
+        // A preparation that never enrolled does not change who was lost.
+        let lost = &self.worker_enrollment(index)["worker_id"];
+        let previous = control_peers
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|peer| peer["worker_id"] == *lost)
+            .ok_or_else(|| io::Error::other("Control does not list the lost worker"))?;
         let next = enrollment(spare)?;
         let (pool_id, marker) = (uuid_v4(), uuid_v4());
         let mut seed = [0; 32];
@@ -478,7 +486,7 @@ impl Bootstrap {
         let intent = json!({
             "id": id,
             "run_id": self.run_id,
-            "previous": Self::identity(self.worker_enrollment(index)),
+            "previous": Self::identity(previous),
             "next": next,
             "mount": mount,
             "mount_public_key": public_key,
@@ -607,6 +615,37 @@ impl Bootstrap {
     pub fn tls(&self, node: u64) -> io::Result<TlsMaterial> {
         let (cert, key) = material(node);
         TlsMaterial::from_pem(cert, key, certificate_authority())
+    }
+
+    /// The system groups as the bootstrap files place them: the label, the group and its voters.
+    pub fn system_groups(&self) -> Vec<(String, Uuid, Vec<Value>)> {
+        self.worker_configs[0]["node"]["placements"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(label, placement)| {
+                let group = placement["identity"]["group_id"].as_str()?;
+                Some((
+                    label.clone(),
+                    Uuid::parse_str(group).ok()?,
+                    placement["voters"].as_array()?.clone(),
+                ))
+            })
+            .collect()
+    }
+
+    /// The secondary pools that worker `index` opens when it starts.
+    pub fn secondary_pools(&self, index: usize) -> Vec<Value> {
+        self.worker_configs[index]["node"]["secondary_pools"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// List `pools` before the ones worker `index` already opens.
+    pub fn list_more_pools(&mut self, index: usize, mut pools: Vec<Value>) {
+        pools.extend(self.secondary_pools(index));
+        self.worker_configs[index]["node"]["secondary_pools"] = json!(pools);
     }
 
     /// The worker no longer has a secondary pool to open.

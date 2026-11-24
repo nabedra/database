@@ -144,6 +144,12 @@ impl Move {
         Some((node, info.dev))
     }
 
+    /// The next [`Move::prepare`] mounts another pool. A pool that held a replica of the group
+    /// keeps its retired state, and is refused as a target.
+    pub(super) fn another_pool(&mut self) {
+        self.claim = None;
+    }
+
     /// Advance the move by at most one operator step.
     pub(crate) async fn tick(&mut self, cluster: &mut Cluster, ctx: &Ctx) {
         let now = elapsed_ms(&cluster.world);

@@ -7,7 +7,7 @@
 //! - `rolling`: every worker stops (kill, power loss or drain) and restarts on its retained
 //!   mount, with queued requests outstanding at each stop. Each restarted worker is a joiner
 //!   that must receive the queue state (R03).
-//! - `moves`: the scheduler owner's Data replica moves to a second pool and back. Each move is
+//! - `moves`: the scheduler owner's Data replica moves to a second pool and a third. Each move is
 //!   retried under its ID after it completed, also after a later move undid it, with another
 //!   body, and next to requests that name a voter that is no member.
 //! - `replace`: a worker is lost for good and a spare one takes its place through
@@ -198,8 +198,8 @@ pub(crate) struct Membership {
     spares: Vec<u64>,
     /// Workers whose process may end on its own.
     expected_exit: BTreeSet<u64>,
-    /// The pool and device that a move mounted, by worker.
-    second_pool: Option<(u64, u64)>,
+    /// The pools that moves mounted: the worker and the device.
+    second_pools: BTreeSet<(u64, u64)>,
     /// Workers whose resources were captured.
     baselines: BTreeSet<u64>,
     clauses: Scenarios,
@@ -226,7 +226,7 @@ impl Membership {
             generations: BTreeMap::new(),
             spares: SPARES.into_iter().rev().collect(),
             expected_exit: BTreeSet::new(),
-            second_pool: None,
+            second_pools: BTreeSet::new(),
             baselines: BTreeSet::new(),
             clauses: Scenarios::new(),
             enabled: false,
@@ -266,6 +266,7 @@ impl Membership {
             self.generations.insert(node, 0);
         }
         self.queue = QueueHandoff::new(cluster.config.run_id);
+        self.system_votes(cluster);
         let plan = Plan::draw(g, selection.focus.contention, selection.focus.idle);
         let ctx = Ctx::new(
             cluster.world.clone(),
@@ -490,6 +491,40 @@ impl Membership {
         Some(placement)
     }
 
+    /// The system groups' voters that never lost their storage voted from it.
+    fn system_votes(&mut self, cluster: &Cluster) {
+        for (_, group, members) in cluster.config.system_groups() {
+            for member in &members {
+                if let Some(node) = worker_node(cluster, member)
+                    && self.generations.get(&node) == Some(&0)
+                    && let Some(replica) = member["node_id"].as_u64()
+                {
+                    let verdict = self.wiped.voted(group, replica, 0);
+                    self.judge(cluster, "WipedNeverVotes", verdict);
+                }
+            }
+        }
+    }
+
+    /// Each voter of a group, with the storage generation it runs on while it can take part.
+    fn taking_part(
+        &self,
+        cluster: &Cluster,
+        members: &[Value],
+        frozen: u64,
+    ) -> Vec<(u64, Option<u64>)> {
+        members
+            .iter()
+            .filter_map(|member| {
+                let replica = member["node_id"].as_u64()?;
+                let generation = worker_node(cluster, member)
+                    .filter(|node| *node != frozen && cluster.is_running(*node))
+                    .and_then(|node| self.generations.get(&node).copied());
+                Some((replica, generation))
+            })
+            .collect()
+    }
+
     async fn final_capability(&mut self, cluster: &Cluster) {
         for node in cluster.config.nodes() {
             let Ok(stats) = cluster.stats(node).await else {
@@ -519,11 +554,13 @@ impl Membership {
             let (mut clean, mut snapshots) = (true, Vec::new());
             for node in cluster.config.nodes() {
                 let mut stats = cluster.stats(node).await?;
-                if let Some((moved, device)) = self.second_pool
-                    && moved == node
-                    && let Some(rows) = stats["storage_reservations"].as_array_mut()
-                {
-                    rows.retain(|row| row["device"] != device);
+                let pools = &self.second_pools;
+                if let Some(rows) = stats["storage_reservations"].as_array_mut() {
+                    rows.retain(|row| {
+                        row["device"]
+                            .as_u64()
+                            .is_none_or(|device| !pools.contains(&(node, device)))
+                    });
                 }
                 clean &= cluster.checks.resources_at_baseline(node, &stats);
                 snapshots.push((node, stats));
@@ -595,15 +632,30 @@ impl Membership {
         }
     }
 
-    /// One receipt through `gateway`, by its state.
-    async fn receipt(&self, ctx: &Ctx, gateway: u64, run: Uuid, id: Uuid) -> Option<String> {
+    /// One receipt through `gateway`, by its state. An abandoned request answers `not_found`
+    /// and says so.
+    async fn receipt(
+        &self,
+        cluster: &Cluster,
+        ctx: &Ctx,
+        gateway: u64,
+        run: Uuid,
+        id: Uuid,
+    ) -> Option<String> {
         let path = format!("/v1/requests/{run}/{id}");
         let reply = request(CLIENTS[0], gateway, &path, &ctx.token, None, ADMIN_LIMIT)
             .await
             .ok()?;
-        (reply.status == 200)
-            .then(|| reply.body["state"].as_str().map(str::to_owned))
-            .flatten()
+        if reply.status == 200 {
+            return reply.body["state"].as_str().map(str::to_owned);
+        }
+        let error = &reply.body["error"];
+        cluster.record(format!("receipt {run}/{id}: {} {error}", reply.status));
+        (error["code"] == "not_found"
+            && error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("abandoned")))
+        .then(|| "abandoned".to_owned())
     }
 
     /// Poll every outstanding receipt once. Returns whether none is left.
@@ -611,7 +663,7 @@ impl Membership {
         let run = cluster.config.run_id;
         for (index, id) in self.queue.outstanding().into_iter().enumerate() {
             let gateway = GATEWAYS[index % GATEWAYS.len()];
-            let Some(state) = self.receipt(ctx, gateway, run, id).await else {
+            let Some(state) = self.receipt(cluster, ctx, gateway, run, id).await else {
                 continue;
             };
             let now = match state.as_str() {
@@ -885,7 +937,15 @@ impl Membership {
             .wait_ready_within(&survivors, true, survivors.len(), CHECK_LIMIT)
             .await
             .map_err(|error| format!("survivors never dropped n{lost}: {error}"))?;
-        let previous = identity(cluster.config.worker_enrollment(index));
+        // A preparation that never enrolled does not change who was lost.
+        let lost_id = cluster.config.worker_enrollment(index)["worker_id"].clone();
+        let previous = self.connection(cluster).await?["control_peers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|peer| peer["worker_id"] == lost_id)
+            .map(identity)
+            .ok_or("Control does not list the lost worker")?;
         let check = json!({"run_id": cluster.config.run_id, "previous": previous});
         let id = cluster.split_id().await;
         self.leader_admin(
@@ -943,6 +1003,7 @@ impl Membership {
         }
         self.check_replaced(cluster, &plans, &previous, intent_id, &groups);
         cluster.adopt(candidate, &groups);
+        self.system_votes(cluster);
         self.expected_exit.remove(&spare);
         self.generations.remove(&lost);
         self.wait_members(cluster, ctx, CHECK_LIMIT).await?;
@@ -1384,14 +1445,61 @@ impl Membership {
             .filter(|node| *node != without)
             .collect();
         let frozen = others[g.below(others.len() as u64) as usize];
+        let survivor = others
+            .iter()
+            .copied()
+            .find(|node| *node != frozen)
+            .expect("three workers");
         cluster.freeze(frozen);
         let from = cluster.world.elapsed() + IN_FLIGHT;
         let until = cluster.world.elapsed() + EVIDENCE;
+        time::sleep(IN_FLIGHT).await;
+        // A write that needs the Control quorum, and one that needs Timestamps and Catalog.
+        let policy = growth_policy(cluster, self.next_sample_ms);
+        let limit = EVIDENCE - IN_FLIGHT * 2;
+        let control = cluster.admin_task(
+            survivor,
+            cluster.split_id().await,
+            "storage.growth.configure",
+            json!({"policy": policy}),
+            limit,
+        );
+        let table = nabedra_rt::task::spawn(create_probe_table(ctx.token.clone(), limit));
         while cluster.world.elapsed() < until {
-            // The sampled placement needs Control, which has no quorum here either.
             time::sleep(POLL).await;
         }
         let to = elapsed_ms(&cluster.world);
+        let system = [
+            (control.await, &["control"][..]),
+            (table.await, &["timestamps", "catalog"][..]),
+        ];
+        let groups = cluster.config.system_groups();
+        for (answer, needed) in system {
+            let answer = answer.unwrap_or_else(|error| Err(error.to_string()));
+            cluster.record(format!(
+                "evidence: {needed:?} beside n{without}: {}",
+                match &answer {
+                    Ok(_) => "acknowledged",
+                    Err(error) => error,
+                }
+            ));
+            if answer.is_err() {
+                continue;
+            }
+            for (label, group, members) in &groups {
+                if needed.contains(&label.as_str()) {
+                    let voters = self.taking_part(cluster, members, frozen);
+                    let verdict = self
+                        .wiped
+                        .committed(*group, &voters)
+                        .map_err(|detail| format!("{label}: {detail}"));
+                    self.judge(cluster, "WipedNeverVotes", verdict);
+                }
+            }
+        }
+        // Judge with the processes as they were in the window.
+        let members = placement["members"].as_array().cloned().unwrap_or_default();
+        let voters = self.taking_part(cluster, &members, frozen);
         cluster.thaw(frozen);
         let from = from.as_millis() as u64;
         let writes: Vec<(Uuid, u64, u64)> = ctx
@@ -1407,17 +1515,6 @@ impl Membership {
                     && attempt.completed < to
             })
             .map(|attempt| (attempt.id, attempt.invoked, attempt.completed))
-            .collect();
-        let members = placement["members"].as_array().cloned().unwrap_or_default();
-        let voters: Vec<(u64, Option<u64>)> = members
-            .iter()
-            .filter_map(|member| {
-                let replica = member["node_id"].as_u64()?;
-                let generation = worker_node(cluster, member)
-                    .filter(|node| *node != frozen && cluster.is_running(*node))
-                    .and_then(|node| self.generations.get(&node).copied());
-                Some((replica, generation))
-            })
             .collect();
         cluster.record(format!(
             "evidence: n{frozen} frozen beside n{without}, voters {voters:?}, {} writes acknowledged",
@@ -1509,7 +1606,8 @@ impl Membership {
             let mut next = Vec::new();
             for (index, id) in pending.into_iter().enumerate() {
                 let gateway = GATEWAYS[index % GATEWAYS.len()];
-                match self.receipt(ctx, gateway, run, id).await.as_deref() {
+                let state = self.receipt(cluster, ctx, gateway, run, id).await;
+                match state.as_deref() {
                     Some("abandoned" | "failed") => {}
                     Some("succeeded") => {
                         if let Some(queued) = self.queued.get(&id) {
@@ -1542,7 +1640,7 @@ impl Membership {
         Ok(())
     }
 
-    /// Move the scheduler owner's Data replica to a second pool and back, with retries.
+    /// Move the scheduler owner's Data replica to a second pool and a third, with retries.
     async fn moves(
         &mut self,
         cluster: &mut Cluster,
@@ -1587,32 +1685,32 @@ impl Membership {
         self.hostile_retries(cluster, ctx, g, owner, id, &payload)
             .await;
 
-        // Back to the primary pool, under another ID.
+        // On to a third pool, under another ID. The primary pool keeps the first move's retired
+        // replica, so it is refused as a target.
+        self.second_pools
+            .extend(pool.second_pool_of(&cluster.world, owner));
         let index = cluster.config.index_of(owner).expect("known worker");
-        let (group, current) = moves::placement(cluster, ctx).await?;
-        let members = current["members"].as_array().cloned().unwrap_or_default();
-        let source = members
-            .iter()
-            .find(|member| worker_node(cluster, member) == Some(owner))
-            .cloned()
-            .ok_or_else(|| format!("n{owner} hosts no replica: {current}"))?;
-        let mut target = source.clone();
-        target["node_id"] = json!(nodes(&members).last().copied().unwrap_or(0) + 1);
-        target["pool_id"] = cluster.config.pool(index);
-        let back = json!({
-            "group": group, "expected_generation": current["record"]["generation"],
-            "remove_node": source["node_id"], "target": target,
-            "worker": cluster.config.worker_identity(index),
-            "pool_generation": cluster.config.mount_generation(index),
-        });
-        let back_id = cluster.split_id().await;
+        let listed = cluster.config.secondary_pools(index);
+        pool.another_pool();
+        let deadline = cluster.world.elapsed() + CHECK_LIMIT;
+        let (back_id, back) = loop {
+            match pool.prepare(cluster, ctx, owner).await {
+                Ok(prepared) => break prepared,
+                Err(error) if cluster.world.elapsed() >= deadline => {
+                    return Err(format!("third pool: {error}"));
+                }
+                Err(_) => self.pause(cluster, ctx, POLL).await,
+            }
+        };
+        cluster.config.list_more_pools(index, listed);
+        self.second_pools
+            .extend(pool.second_pool_of(&cluster.world, owner));
         self.drive(cluster, ctx, g, owner, back_id, &back).await?;
         // A late retry of the first move, after the second one undid it.
         self.hostile_retries(cluster, ctx, g, owner, id, &payload)
             .await;
         self.hostile_retries(cluster, ctx, g, owner, back_id, &back)
             .await;
-        self.second_pool = pool.second_pool_of(&cluster.world, owner);
         self.clauses.insert("O17:move-sequence");
         Ok(())
     }
@@ -1850,6 +1948,49 @@ fn shown(answer: &Result<Completion, String>) -> String {
         Ok(Completion::Ok(record)) => format!("phase {}", record["phase"]["state"]),
         Ok(Completion::Refused(error)) => format!("{:?} {}", error.code, error.message),
         Ok(Completion::Unknown(error)) | Err(error) => format!("unknown ({error})"),
+    }
+}
+
+/// A growth policy that changes nothing a run depends on. Configuring it is a Control write.
+fn growth_policy(cluster: &Cluster, salt: u64) -> Value {
+    let zones: serde_json::Map<String, Value> = (0..WORKERS.len())
+        .map(|index| {
+            let worker = cluster.config.worker_identity(index);
+            let id = worker["worker_id"].as_str().unwrap_or_default().to_owned();
+            (id, json!(format!("fixture-{index}")))
+        })
+        .collect();
+    json!({
+        "policy_id": Uuid::from_u128(0x5157_0000_0000_0000_0000 + u128::from(salt)),
+        "volume_cost_per_gib": 1, "worker_cost": 1,
+        "initial_monthly_spend": 0, "monthly_spend_ceiling": 30, "max_attempts": 3,
+        "cooldown_seconds": 1, "max_volume_bytes": 2_u64 << 30,
+        "zones": zones.values().cloned().collect::<Vec<_>>(),
+        "initial_replica_zones": zones,
+    })
+}
+
+/// Create a table of its own through the first gateway.
+async fn create_probe_table(token: String, limit: Duration) -> Result<Value, String> {
+    let id = in_node(CLIENTS[0], async { uuid_v4() }).await;
+    let payload = json!({
+        "name": format!("probe_{}", id.simple()),
+        "schema": {"id": "int64", "value": "int64"}, "key": "id", "format": "parquet",
+    });
+    match request(
+        CLIENTS[0],
+        GATEWAYS[0],
+        "/v1/operations",
+        &token,
+        Some(operation(id, "table.create", payload)),
+        limit,
+    )
+    .await
+    .and_then(|reply| reply.completion(id))?
+    {
+        Completion::Ok(created) => Ok(created),
+        Completion::Refused(error) => Err(format!("{:?} {}", error.code, error.message)),
+        Completion::Unknown(error) => Err(error),
     }
 }
 
