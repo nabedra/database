@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "land-tooling-b737a83-154404--testing-tools.log",
+      "sha256": "a68f955d360d9518094bd4e00463cc3bd1a098185d5d972a67e6041ebb71a6e3"
+    }
+  ],
+  "assertions": {
+    "executed": 126,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "testing-tools",
+  "duration_s": 10.397,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T14:44:34.807195+00:00",
+    "request_id": "land-tooling-b737a83-154404",
+    "runner": "GitHub Actions 1000011461",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45417380925"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "b737a83973b299994d371cdceff24eef4430d0c8",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
