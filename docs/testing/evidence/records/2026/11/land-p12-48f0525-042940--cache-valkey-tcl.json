@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p12-48f0525-042940--cache-valkey-tcl.log",
+      "sha256": "abd3f973789c7474e1dcc8fed5d6e3c51b589d7dff3cad8a146eec9cfa534ce9"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-valkey-tcl",
+  "duration_s": 63.932,
+  "guarantees": [],
+  "kind": "R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T04:32:04.354688+00:00",
+    "request_id": "land-p12-48f0525-042940",
+    "runner": "GitHub Actions 1000009731",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45326771345"
+  },
+  "scenarios": [
+    "K01"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "48f05250632ac60d43c7ec0c19835f7e248513f4",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
