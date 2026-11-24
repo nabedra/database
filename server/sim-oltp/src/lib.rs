@@ -8,6 +8,7 @@ pub mod history;
 pub mod invariants;
 pub mod net;
 mod node;
+mod scripted;
 pub mod sweep;
 mod workload;
 
