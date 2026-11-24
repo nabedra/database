@@ -11,13 +11,16 @@
 //! - traces of two planted defects of the workload itself, which the writer accepts because
 //!   they are well formed and only the spec can refuse;
 //! - traces that carry less than their actions declare, under `incomplete/`. The writer
-//!   refuses to write them. Whether TLC refuses a hand-edited file is a question about
-//!   the trace specs, so a check of its own (`sim-two-phase-trace-incomplete`) asks it.
+//!   refuses to write them. Whether a hand-edited file is refused is a question about the
+//!   trace specs and the lint, so a check of its own (`sim-two-phase-trace-incomplete`) asks
+//!   it. Each name says who must refuse it: TLC at a line, or the lint (`.at-lint.ndjson`).
+//!   The unedited traces they were made from are in `clean/` and must be accepted there.
 //!
 //! With `NABEDRA_TRACE_DIR` set the accepted traces go there and the others to directories
 //! beside it, so no trace directory holds another; otherwise everything goes to a temporary
-//! directory. Outside the check only what Rust can see is checked: that the runs do what they should, that the bytes
-//! replay, and that every refused trace differs from an accepted one as intended.
+//! directory. Outside the check only what Rust can see is checked: that the runs do what they
+//! should, that the bytes replay, and that every refused trace differs from an accepted one
+//! as intended.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -647,21 +650,12 @@ const EDITS: [(&str, Edit); 6] = [
     ("corrupt-message", corrupt_message),
 ];
 
-/// Takes the variables off every line from `from` on that `matches`, and returns the first.
-fn strip(doc: &mut Doc, matches: impl Fn(&Value) -> bool, edit: impl Fn(&mut Value)) -> usize {
-    let first = doc.find(0, &matches).unwrap();
-    for step in doc.steps.iter_mut().filter(|step| matches(step)) {
-        edit(step);
-    }
-    first
-}
-
 /// Traces that carry less than their actions declare, or something TLC misreads.
-fn incomplete(doc: &Doc) -> Vec<(&'static str, usize, Doc)> {
-    let received = |step: &Value| step["action"] == "TMRcvPrepared";
+/// With each the line TLC must refuse, or `None` when the lint must refuse the file.
+fn incomplete(doc: &Doc) -> Vec<(&'static str, Option<usize>, Doc)> {
     let first = doc.named(0, "TMRcvPrepared").unwrap();
     let mut edits = Vec::new();
-    let mut edit = |label, change: &dyn Fn(&mut Doc) -> usize| {
+    let mut edit = |label, change: &dyn Fn(&mut Doc) -> Option<usize>| {
         let mut doc = doc.clone();
         let at = change(&mut doc);
         edits.push((label, at, doc));
@@ -670,22 +664,28 @@ fn incomplete(doc: &Doc) -> Vec<(&'static str, usize, Doc)> {
     edit("omitted-variable", &|doc| {
         let vars = doc.steps[first]["vars"].as_object_mut().unwrap();
         vars.remove("tmPrepared").unwrap();
-        first
+        Some(first)
     });
     // The variable is there, wrong, under a misspelt name.
     edit("misspelt-variable", &|doc| {
         let vars = doc.steps[first]["vars"].as_object_mut().unwrap();
         vars.remove("tmPrepared").unwrap();
         vars.insert("tmPrepard".into(), json!(["r1", "r2", "r3"]));
-        first
+        Some(first)
+    });
+    // Every variable is there and right, beside one the spec does not have.
+    edit("unknown-variable", &|doc| {
+        let vars = doc.steps[first]["vars"].as_object_mut().unwrap();
+        vars.insert("tmPrepard".into(), json!(["r1", "r2", "r3"]));
+        Some(first)
     });
     // Nothing but action names, nodes and messages.
     edit("bare-actions", &|doc| {
-        strip(
-            doc,
-            |step| step["vars"] != json!({}),
-            |step| step["vars"] = json!({}),
-        )
+        let first = doc.find(0, |step| step["vars"] != json!({}));
+        for step in &mut doc.steps {
+            step["vars"] = json!({});
+        }
+        first
     });
     // The commit announces nothing, or an abort.
     let commit = doc.named(0, "TMCommit").unwrap();
@@ -695,11 +695,11 @@ fn incomplete(doc: &Doc) -> Vec<(&'static str, usize, Doc)> {
             .unwrap()
             .remove("msg")
             .unwrap();
-        commit
+        Some(commit)
     });
     edit("wrong-message", &|doc| {
         doc.steps[commit]["msg"]["type"] = "Abort".into();
-        commit
+        Some(commit)
     });
     // A wrong value that TLC reads as the right one: 2^32 + n wraps to n.
     edit("oversized-integer", &|doc| {
@@ -707,7 +707,7 @@ fn incomplete(doc: &Doc) -> Vec<(&'static str, usize, Doc)> {
             .header
             .replace("\"MaxCrashes\":2", "\"MaxCrashes\":4294967298");
         assert!(doc.header.contains("4294967298"));
-        strip(doc, received, |_| ())
+        None
     });
     edits
 }
@@ -815,25 +815,24 @@ fn traces_for_tlc() {
         .iter()
         .find(|(_, doc)| doc.named(0, "TMCommit").is_some())
         .expect("a run commits");
+    let dir = root.with_file_name("incomplete");
     for (label, at, doc) in incomplete(doc) {
-        doc.write(
-            &root
-                .with_file_name("incomplete")
-                .join(format!("TwoPhase-{label}.ndjson")),
-        );
-        eprintln!("incomplete/TwoPhase-{label}: first incomplete line {at}");
+        let at = at.map_or_else(|| "lint".into(), |at| at.to_string());
+        doc.write(&dir.join(format!("TwoPhase-{label}.at-{at}.ndjson")));
     }
     // A wrong value under a key the line also has right. No `Value` can hold it, so the
     // writer cannot write it; the file is edited as text.
-    let clean = format!("TwoPhase-{seed}.ndjson");
-    let text = fs::read_to_string(root.join(clean)).unwrap();
+    let recorded = root.join(format!("TwoPhase-{seed}.ndjson"));
+    let text = fs::read_to_string(&recorded).unwrap();
     let key = "\"vars\":{\"rmState\":";
     assert!(text.contains(key));
     let twice = text.replacen(key, "\"vars\":{\"rmState\":\"aborted\",\"rmState\":", 1);
-    let path = root
-        .with_file_name("incomplete")
-        .join("TwoPhase-duplicate-key.ndjson");
-    fs::write(path, twice).unwrap();
+    fs::write(dir.join("TwoPhase-duplicate-key.at-lint.ndjson"), twice).unwrap();
+
+    // What the incomplete traces were made from: the edits are all that is wrong with them.
+    let clean = root.with_file_name("clean");
+    doc.write(&clean.join(format!("TwoPhase-{seed}-rewritten.ndjson")));
+    fs::copy(&recorded, clean.join(format!("TwoPhase-{seed}.ndjson"))).unwrap();
 
     let count = |dir: &Path| {
         fs::read_dir(dir)
@@ -846,7 +845,8 @@ fn traces_for_tlc() {
     };
     assert_eq!(count(&root), seeds().len());
     assert_eq!(count(&rejected), EDITS.len() * 3 + 2);
-    assert_eq!(count(&root.with_file_name("incomplete")), 7);
+    assert_eq!(count(&dir), 8);
+    assert_eq!(count(&clean), 2);
 }
 
 /// Traces of the two defects. Their first impossible step is computed from the defect, and
