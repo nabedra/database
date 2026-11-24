@@ -34,7 +34,7 @@ use nabedra_check::Gen;
 use nabedra_protocol::protocol::{ErrorCode, Outcome};
 use nabedra_rt::{ids::uuid_v4, sim::in_node, time};
 use serde_json::{Value, json};
-use tokio::task::JoinHandle;
+use tokio::{sync::Semaphore, task::JoinHandle};
 use uuid::Uuid;
 
 use super::{
@@ -81,7 +81,7 @@ const ADMIN_LIMIT: Duration = Duration::from_secs(10);
 const QUERY_LIMIT: Duration = Duration::from_secs(30);
 /// How long a table at rest may keep falling back before it counts as stuck.
 const REST_LIMIT: Duration = Duration::from_secs(30);
-const STATUS_POLL: Duration = Duration::from_millis(150);
+const STATUS_POLL: Duration = Duration::from_millis(300);
 const RETRY: Duration = Duration::from_millis(250);
 /// Rounds of definite, retryable refusals before an index is declared under a new build ID, as
 /// `create_d11_index` in `tests/oltp_direct_acceptance.py` does it.
@@ -448,6 +448,9 @@ struct Topo {
     run: Arc<Mutex<Uuid>>,
     /// Virtual ms by which topology changes must settle; unbounded during chaos.
     change_by: Arc<AtomicU64>,
+    /// A worker serves two administration requests at a time. The operator sends one, so that
+    /// the other is free for restarts and the replica move. The heal holds this permit.
+    gate: Arc<Semaphore>,
 }
 
 /// What the workers answered to one operator request.
@@ -479,6 +482,12 @@ impl Topo {
         elapsed_ms(&self.main.world)
     }
 
+    /// The chaos window is over and the heal has not finished.
+    fn healing(&self) -> bool {
+        self.main.stopping.load(Ordering::Acquire)
+            && self.change_by.load(Ordering::Acquire) == u64::MAX
+    }
+
     fn change_over(&self) -> bool {
         self.now() >= self.change_by.load(Ordering::Acquire)
     }
@@ -508,6 +517,11 @@ impl Topo {
 
     /// One operator request, sent to each worker until one that executes it answers.
     async fn admin(&self, id: Uuid, name: &str, payload: &Value) -> Reply {
+        let _permit = self.gate.acquire().await.expect("open gate");
+        self.send(id, name, payload).await
+    }
+
+    async fn send(&self, id: Uuid, name: &str, payload: &Value) -> Reply {
         let mut why = Vec::new();
         let mut unknown = false;
         for node in WORKERS {
@@ -606,10 +620,17 @@ fn definite(code: ErrorCode) -> bool {
     )
 }
 
-/// A definite refusal because another schema change came first. The request ID keeps that
-/// result, so the operator asks again under a new one.
+/// A definite refusal because another schema change or another owner came first. The request
+/// ID keeps that result, so the operator asks again under a new one. A name or an ID that is
+/// taken stays taken, and a split that its source refuses to freeze is the same split.
 fn overtaken(code: ErrorCode, why: &str) -> bool {
-    code == ErrorCode::Conflict && why.contains("captured schema or lifecycle changed")
+    const FINAL: [&str; 4] = [
+        "already exists",
+        "already binds",
+        "differs from Catalog",
+        "source refused the exact split freeze",
+    ];
+    code == ErrorCode::Conflict && !FINAL.iter().any(|text| why.contains(text))
 }
 
 fn copy(completion: &Completion) -> Completion {
@@ -988,10 +1009,19 @@ async fn life(
         |id: Uuid| json!({"table_id": table, "index_id": index_id, "build_id": id, "attempt": 1});
     t.log(|log| log.selectors.insert(id, selector(id)));
     let mut open = false;
+    let mut opened: Vec<Uuid> = Vec::new();
     let mut refusals = 0;
-    let mut state = loop {
+    let mut state = 'declare: loop {
         let invoked = t.next();
-        match t.admin(id, "storage.index.create", definition).await {
+        let reply = match plan.kind {
+            // Beside the gate, so that it can overlap the declaration it races. The heal
+            // holds the gate, and then the rival waits like any other request.
+            IndexKind::SameName if t.gate.available_permits() > 0 || !t.healing() => {
+                t.send(id, "storage.index.create", definition).await
+            }
+            _ => t.admin(id, "storage.index.create", definition).await,
+        };
+        match reply {
             Reply::Ok(data) => {
                 let completed = t.next();
                 if t.take_defect(Defect::LieAboutRefusal) {
@@ -1012,6 +1042,19 @@ async fn life(
                     time::sleep(RETRY).await;
                     continue;
                 }
+                // The name may be taken by an earlier declaration of this index that was
+                // never answered.
+                for &earlier in &opened {
+                    let invoked = t.next();
+                    let ask = fresh_id(BOOTSTRAP_CLIENT).await;
+                    let earlier_build = selector(earlier);
+                    let asked = t.admin(ask, "storage.index.status", &earlier_build).await;
+                    if let Reply::Ok(data) = asked {
+                        let completed = t.next();
+                        id = earlier;
+                        break 'declare record_status(t, &plan.name, invoked, completed, &data);
+                    }
+                }
                 build.refused = true;
                 let expected = plan.kind != IndexKind::Valid
                     || plan.table == Table::Victim
@@ -1028,11 +1071,15 @@ async fn life(
                     build.stuck = Some(format!("declaration unanswered: {why}"));
                     return;
                 }
-                if !open && refusals >= FRESH_BUILD {
-                    t.log(|log| log.refused.insert(id, why));
+                if refusals >= FRESH_BUILD {
+                    if open {
+                        opened.push(id);
+                    } else {
+                        t.log(|log| log.refused.insert(id, why));
+                    }
                     id = fresh_id(BOOTSTRAP_CLIENT).await;
                     t.log(|log| log.selectors.insert(id, selector(id)));
-                    refusals = 0;
+                    (open, refusals) = (false, 0);
                 }
                 time::sleep(RETRY).await;
             }
@@ -1184,6 +1231,8 @@ async fn drop_table(t: Topo, at: Duration, gateway: usize) -> Option<String> {
     let payload = json!({"table_id": t.victim.table});
     let mut gateway = gateway;
     let mut open = false;
+    let mut ambiguous = false;
+    let mut refusals = 0;
     if t.take_defect(Defect::FakeDrop) {
         t.note("seeded-fake-drop", payload);
     } else {
@@ -1204,7 +1253,11 @@ async fn drop_table(t: Topo, at: Duration, gateway: usize) -> Option<String> {
                     if error.outcome == Outcome::NotApplied
                         && error.code == ErrorCode::NotFound =>
                 {
-                    // Nothing else drops this table, so it is gone because of this request.
+                    // Nothing else drops this table, so it is gone because of this request, or
+                    // of an earlier ID that was given up without an answer.
+                    if ambiguous {
+                        break;
+                    }
                     t.main.checks.violate(
                         &t.main.world,
                         topology::REFUSED_DDL,
@@ -1215,12 +1268,15 @@ async fn drop_table(t: Topo, at: Duration, gateway: usize) -> Option<String> {
                     );
                     return None;
                 }
-                Completion::Refused(error)
-                    if error.outcome == Outcome::NotApplied
-                        && overtaken(error.code, &error.message) =>
-                {
-                    id = fresh_id(node).await;
-                    open = false;
+                Completion::Refused(error) if error.outcome == Outcome::NotApplied => {
+                    refusals += 1;
+                    // A queued request keeps its definite failure, so asking again takes a new
+                    // ID. With an unanswered attempt the old ID gets the same time as a build.
+                    if !open || overtaken(error.code, &error.message) || refusals >= FRESH_BUILD {
+                        ambiguous |= open;
+                        id = fresh_id(node).await;
+                        (open, refusals) = (false, 0);
+                    }
                 }
                 other => open |= clients::unknown(other),
             }
@@ -1256,7 +1312,7 @@ async fn drop_table(t: Topo, at: Duration, gateway: usize) -> Option<String> {
 
 /// D11: a row of the dropped table must not be in its successor.
 async fn recreate(t: &Topo, client: &mut Client, node: u64) -> Option<String> {
-    let id = fresh_id(node).await;
+    let mut id = fresh_id(node).await;
     let payload = json!({
         "name": "sim_victim", "schema": {"id": "int64", "value": "int64"},
         "key": "id", "format": "parquet",
@@ -1273,6 +1329,9 @@ async fn recreate(t: &Topo, client: &mut Client, node: u64) -> Option<String> {
                 return Some(format!(
                     "the dropped table's name cannot be used again: {why}"
                 ));
+            }
+            Completion::Refused(error) if error.outcome == Outcome::NotApplied => {
+                id = fresh_id(node).await;
             }
             _ => {}
         }
@@ -1448,6 +1507,7 @@ pub(crate) async fn run(
         order: Arc::new(AtomicU64::new(1)),
         run: Arc::new(Mutex::new(cluster.config.run_id)),
         change_by: Arc::new(AtomicU64::new(u64::MAX)),
+        gate: Arc::new(Semaphore::new(1)),
     };
     t.log(|log| log.defect = defect);
     let ctx = t.main.clone();
@@ -1556,9 +1616,14 @@ pub(crate) async fn run(
     }
 
     let mut report = direct::Report::default();
-    if let Some(chaos) = chaos.as_mut()
-        && let Err(error) = chaos.heal(cluster, &ctx).await
-    {
+    let gate = t.gate.clone();
+    let held = gate.acquire().await.expect("open gate");
+    let healed = match chaos.as_mut() {
+        Some(chaos) => chaos.heal(cluster, &ctx).await,
+        None => Ok(()),
+    };
+    drop(held);
+    if let Err(error) = healed {
         cluster
             .checks
             .violate(&cluster.world, "Liveness", format!("heal: {error}"));
