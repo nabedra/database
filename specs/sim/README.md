@@ -142,11 +142,11 @@ Counterexample lengths are in states. TLC with two workers may report a slightly
 | disk | `no_chain_dependency` | mutant | `NoDoubleLink` | 7 |
 | disk | `rename_not_atomic` | mutant | `NoDoubleLink` | 6 |
 | disk | `rename_skips_pending` | mutant | `OsIsDurablePlusPending` | 3 |
-| disk | `abort_before_halt` (P2) | mutant | `NoWriteAfterCut` | 4 |
+| disk | `abort_before_halt` (phase 9 P2) | mutant | `NoWriteAfterCut` | 4 |
 | disk | `no_incarnation_fence` | mutant | `NoWriteAfterCut` | 6 |
 | disk | `wipe_keeps_uuid` | mutant | `UuidAnchorRejectsWipe` | 4 |
 | disk | `prefix_wipe_while_up` | finding 5 | `IncarnationSeesOneVolume` | 2 |
-| disk | `gap_realistic_reformat` (P5) | gap, finding 2 | `DevInoAnchorRejectsWipe` | 4 |
+| disk | `gap_realistic_reformat` (phase 9 P5) | gap, finding 2 | `DevInoAnchorRejectsWipe` | 4 |
 | disk | `gap_writeback` | gap | `OnlyLatestOrOld` | 8 |
 | disk | `reach_4k_destroys_synced` | witness | `SyncedSectorsSurviveAnyCut` | 9 |
 | disk | `reach_fsyncgate` | witness | `CleanMeansDurable` | 5 |
@@ -394,7 +394,7 @@ to 12 design commits to it; **no** = not injectable.
 | Spec fault | Simulator | Gap |
 | --- | --- | --- |
 | `Crash(w)`, `Restart(w)` (new incarnation, empty RAM), `Replace(w)` | today for crash and restart (C `CrashWorker`, `RestartWorker`). `Replace` is not in the nemesis | **harness gap** for `Replace` |
-| `CutCtrl(w)`, `CutPeer(w)`, `HealCtrl`, `HealPeer` | today (C `link`, `isolate_controller_links`) | the Cache planner turns every message sent across a blocked link into a stalled connection (finding 3): a renewal sent during the cut is lost for good, not delivered after the heal |
+| `CutCtrl(w)`, `CutPeer(w)`, `HealCtrl`, `HealPeer` | today for loss (C `link`, `isolate_controller_links`) | **The #89 sweeps' partition evidence covers loss, not late delivery** (finding 3; the simulator lead agrees). A message sent across a blocked link stalls its direction for good and never arrives after the heal. Two late paths remain in the code and neither was measured: a message already in flight when the cut begins is held and arrives after the heal, and a paused worker reads its queue after the thaw (`PauseWorker`, up to 4 s). Neither replaces a message sent during a cut and delivered after a failover |
 | `DropPacket(w, s)` | today (C filters: drop -> stall) | none (the spec's per-packet drop is stronger) |
 | `HoldReply`, `DeliverHeld` | today (delay up to 60 ms, black hole, freeze) | none |
 | `LeaderChange` | today (crash the controller leader) | none |
@@ -492,7 +492,7 @@ Numbered as in `specs/sim/README.md` and the dr-sim report:
    workers mid-run). Small: at 200 ppm declared drift a change of up to 400 ppm moves a 3 s timer by about 1.2 ms. Mutant `prefix_early_timer` holds the counterexample.
 2. **Reformat never repeats inode numbers** (SimDisk, fidelity gap in the phase 9 design and `World::wipe`): a real
    `mkfs` gives its root a fixed inode number (2 on ext4), so a reformat of the same device repeats the root's
-   `(dev, ino)`. The sim always draws a new base, the phase 9 design lists the realistic case as planted bug P5, and
+   `(dev, ino)`. The sim always draws a new base, the phase 9 design lists the realistic case as its planted bug P5, and
    `oltp-pool-sim` asserts `assert_ne!(root_inode, old_inode)`. **Product impact: none found.** The stored-inode
    comparison (`pool/mount.rs:585`, reopen permit) runs after a filesystem-uuid equality check (`:575`), and
    `verify_directory_anchor` (`registered.rs:881`) compares the locked directory with the mount inspected moments
@@ -534,13 +534,18 @@ durable state of the same volume (not modelled yet: the shipped simulator cannot
 
 ### 8. Verdicts on the early findings posted for the simulator wave
 
+**Corrected 17:40.** The first version answered "P2 is misframed" for phase 9's P2 and refuted it. Item 5 is about phase
+12's P2, which section 9 of this file already called a coarse stand-in, so the two sections disagreed. Planted bugs
+are named with their phase below, because both phases use P1 to P4.
+
 | Lead | Verdict | Evidence in the shipped code |
 | --- | --- | --- |
 | H-01: storage jobs are atomic; no crash point between a write, its fsync and the acknowledgement | **Confirmed.** `task::spawn_blocking` runs the closure to completion on the helper while the simulation thread waits (`rt/src/sim.rs:46-53`, `run_blocking`); `World::crash` runs on the simulation thread, so it can only land between jobs (read from the code, not run). Inside a job only a pre-armed `crash_after(n)` halts the volume at an operation, and the node keeps running until the harness crashes it. A cross-thread ack-before-fsync bug cannot fail. Not modelled in `SimDisk` (concurrency, not disk semantics); matrix S11 |
 | H-04: freeze or pause cannot land between the clock read and the serve | **Confirmed.** `World::freeze` gates polls (`Gate`, `sim.rs:740`): a frozen node stops at its next `.await`. A sample-then-serve path with no await in between has a zero pause window. The Cache `pause` is `freeze` plus `NetPlan::pause` (`harness.rs:390`); Events' pause is a router pause only. Matrix S6 |
 | H-03: P10 per-frame network faults are stronger than TCP | **Partly confirmed.** Refuted for loss and duplication: a planned drop or a profile `Cut` stalls the whole direction until a reset (`Fate::Drop`, `net.rs:1066`), and the OLTP Router absorbs duplicates (`sim-oltp/src/net/mod.rs:209`). Confirmed for reordering: `Fate::Frame{stream, delay}` lets frames of other streams overtake within one session ("one-stream delay", #101), which TCP cannot do (finding 6, witness `reach_frame_overtake`) |
 | P10 has one volume per worker | **Confirmed.** #106 `sim-oltp/src/disk.rs` mounts one `ROOT` per server process; keys, bootstrap and pool share it. The two-mount RV-REP #3 shape exists only in `oltp-storage/src/oltp/pool/sim_tests.rs` |
-| P2 is misframed | **Refuted for P2; confirmed for P5.** P2 (`World::crash` aborts tasks before halting volumes) is a real simulator-level defect with a detector (`sim/volumes/tests.rs:292` `no_mutating_call_reaches_a_volume_after_a_crash`) and a spec mutant (`disk/mutants/abort_before_halt.cfg`, `NoWriteAfterCut`). The independent read's "misframed" verdict is about **P5** ("`Wipe::Reformat` keeps the old inode base"), which is the realistic behaviour of `mkfs`: finding 2. Note: #106 changes the crash order to network first, then volumes (`cut_node`); both happen in one synchronous call, so no task runs in between and the order does not matter for P2 |
+| Phase 12 P2 (`replica_keeps_deleted_keys`) is not the plan's bug (this is lead item 5) | **Confirmed: phase 12's planted bug P2 is not the plan's bug, and the follow-up (F5) is needed.** The plan names "a replica that applies a SET after the primary's synthesized DEL of the same expired key", an ordering race. The knob `replica_keeps_deleted_keys` removes every `Effect::Delete` from a delta (`worker/actor/copies.rs:247-250`, the same on main `c8426fe1`). Deltas still apply only at `state.sequence + 1` (`:242`), so a SET older than the DEL is refused with or without the knob, and the race is never exercised. Two scripted cases use the knob: an explicit DEL (`DeleteIgnored`) and a synthesized expiry DEL (`ExpiryDeleteIgnored`, TTL 1.5 s), so the expiry trigger is covered, the order is not. Only the explicit DEL has a seeded search and a history-only proof. I found no spec mutant for a stale SET in the same epoch: `cache/replica_keeps_deleted` matches the knob, and `accept_retired_epoch` is about epochs. Read from the code, not run |
+| Phase 9 P2 (`World::crash` order) is misframed (not what item 5 meant) | **Refuted: phase 9's planted bug P2 is a sound plant.** `World::crash` aborting tasks before it halts the volumes has a detector (`sim/volumes/tests.rs:292` `no_mutating_call_reaches_a_volume_after_a_crash`) and a spec mutant (`disk/mutants/abort_before_halt.cfg`, `NoWriteAfterCut`). #106 cuts the network first, then the volumes, in one synchronous call, so no task runs in between. Read line 529 does not call it misframed. Phase 9's **P5** is the one the read marks "Misframed" (line 532), and that is confirmed: finding 2 |
 
 ### 9. Planted bugs and reverted fixes of phases 9 to 12: design level or code level
 
@@ -552,14 +557,14 @@ mutant that exists in another agent's worktree now and matches by name. I did no
 
 | Phase | Design level | Code level | Simulator level | Matching spec mutants seen |
 | --- | --- | --- | --- | --- |
-| 9 | R1, R2?, P1 | R3, R4 | P2, P3, P4, P6. P5 is the real behaviour of `mkfs`, not a defect | R1 `lsm/no_open_dir_sync`; P1 `lsm/flush_no_journal_sync`; R2 `lsm/retire_before_edit`?; P2 `sim/disk/abort_before_halt` |
+| 9 | R1, R2?, phase 9 P1 | R3, R4 | Phase 9 P2, P3, P4, P6. Phase 9 P5 is the real behaviour of `mkfs`, not a defect | R1 `lsm/no_open_dir_sync`; phase 9 P1 `lsm/flush_no_journal_sync`; R2 `lsm/retire_before_edit`?; phase 9 P2 `sim/disk/abort_before_halt` |
 | 10 | BUG1, FIXA, D04, ACC3 O15 (liveness), AZ2 (liveness) | spares BUG1-encode-direct, BUG1-pre-append, FIXA-unproposed? | none | not compared (dr-oltp-direct's mutants were not in its folder yet) |
 | 11 uncertain outcome | 1 ACC3-receipt | 2 BUG1-encode-submit, 3 BUG1-stream | | not compared |
 | 11 stale route, topology, schema | 4 TOPO1, 5 BUG2, 6 RD1 | 7 IDXHOT?, 8 O21CAP? | | TOPO1 `oltp/child_stale_schema` |
 | 11 fence, lifecycle | 9 ACC2, 10 ACC3-ready-fence, 11 ACC3-delegation, 12 FIXC, 13 FIXB-cold-publish | | | not compared |
 | 11 membership, trust | 14 REP2, 15 RV-REP-3, 17 CAP1 | 16 FIXB-voter-refresh, 18 RV-REP-2 | | REP2 `oltp/rep2_any_removal`; RV-REP-3 `oltp/wiped_resumes` |
 | 11 resource release | 20 RD2? | 19 FLAKE3-epoch, 21 QLANE, 22 GC1-double-guard | | none |
-| 12 | P1, P2 (a coarse stand-in: it drops every delete, not the SET-after-DEL race the plan names), P3, P4, both lead decision 6 defects | | E1, E2 are expected failures of the fault model | P1 `cache/no_uncertainty`; P2 `cache/replica_keeps_deleted`; P3 `cache/owner_change_keeps_epoch`; P4 `cache/cold_reset_ignores_live_lease`; E1 `cache/drift_beyond_bound`, `sim/clock/e1_beyond_bound`; LD 6 `cache/staged_ignores_fence`, `cache/staged_ignores_lag` |
+| 12 | Phase 12 P1, P3, P4, both lead decision 6 defects. Phase 12 P2 **as the plan names it** (the SET-after-DEL order) is design level and is **not planted** | Phase 12 P2 **as shipped** (drops every delete) is a code mutation that stands in for it, see section 8 | E1, E2 are expected failures of the fault model | Phase 12 P1 `cache/no_uncertainty`; the shipped P2 knob `cache/replica_keeps_deleted`, the plan's P2 race none found; phase 12 P3 `cache/owner_change_keeps_epoch`; phase 12 P4 `cache/cold_reset_ignores_live_lease`; E1 `cache/drift_beyond_bound`, `sim/clock/e1_beyond_bound`; LD 6 `cache/staged_ignores_fence`, `cache/staged_ignores_lag` |
 
 The code-level rows depend most on interleaving and fault granularity. H-01 (atomic storage jobs) is the main risk for
 FLAKE3-epoch and GC1-double-guard, whose windows may not exist in the simulator.
