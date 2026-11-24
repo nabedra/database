@@ -75,7 +75,9 @@ const REPLACE_LIMIT: Duration = Duration::from_secs(120);
 /// How long a worker that must stay out is watched.
 const REFUSAL_WATCH: Duration = Duration::from_secs(10);
 /// How long one voter is frozen beside a wiped one.
-const EVIDENCE: Duration = Duration::from_secs(12);
+const EVIDENCE: Duration = Duration::from_secs(20);
+/// One attempt of a write in that window.
+const EVIDENCE_ATTEMPT: Duration = Duration::from_secs(3);
 /// Messages already on the wire when the voter froze have settled after this time.
 const IN_FLIGHT: Duration = Duration::from_millis(500);
 const RECEIPT_LIMIT: Duration = Duration::from_secs(30);
@@ -242,11 +244,14 @@ impl Membership {
         cluster.split_volumes();
         let delays = self.delays;
         let capability = &mut self.capability;
-        cluster
+        let mut early = 0;
+        let started = cluster
             .start_staggered(delays, async |cluster| {
-                observe_capability(cluster, capability).await;
+                early += observe_capability(cluster, capability).await;
             })
-            .await
+            .await;
+        self.notes.insert("early capability answers", early);
+        started
     }
 
     pub(crate) async fn run(
@@ -1014,6 +1019,8 @@ impl Membership {
             self.clauses.insert("O17:replacement-fault");
         }
         self.check_replaced(cluster, &plans, &previous, intent_id, &groups);
+        let former = cluster.config.worker_enrollment(index).clone();
+        let former_pool = cluster.config.pool(index);
         cluster.adopt(candidate, &groups);
         self.system_votes(cluster);
         self.expected_exit.remove(&spare);
@@ -1028,7 +1035,7 @@ impl Membership {
         let connection = self.connection(cluster).await?;
         let run = uuid(&connection["run_id"]);
         self.judge(cluster, "QueueHandoff", self.queue.run(run));
-        self.stays_out(cluster, ctx, lost).await
+        self.stays_out(cluster, ctx, lost, former, former_pool).await
     }
 
     /// Prepare an intent that never mounts, abandon it, and check that it stays abandoned.
@@ -1363,8 +1370,32 @@ impl Membership {
         cluster: &mut Cluster,
         ctx: &Ctx,
         removed: u64,
+        former: Value,
+        former_pool: Value,
     ) -> Result<(), String> {
         self.expected_exit.insert(removed);
+        // Control must not prepare a restart for it either, under any next incarnation.
+        let id = cluster.split_id().await;
+        let mut next = former.clone();
+        next["incarnation"] = json!(cluster.split_id().await);
+        next["enrollment_revision"] =
+            json!(former["enrollment_revision"].as_u64().unwrap_or(0) + 1);
+        let intent = json!({
+            "id": id, "run_id": cluster.config.run_id, "previous": identity(&former),
+            "next": next, "pool_id": former_pool, "mount_generation": 1_000,
+        });
+        for node in cluster.config.nodes() {
+            let answer = cluster
+                .admin_answer(node, id, "worker.restart.prepare", intent.clone(), ADMIN_LIMIT)
+                .await;
+            if let Ok(Completion::Ok(prepared)) = answer {
+                cluster.checks.violate(
+                    &cluster.world,
+                    "RemovedNeverRejoins",
+                    format!("n{removed} was replaced, and its restart is prepared: {prepared}"),
+                );
+            }
+        }
         cluster.restart_removed(removed);
         let deadline = cluster.world.elapsed() + REFUSAL_WATCH;
         while cluster.world.elapsed() < deadline {
@@ -1468,26 +1499,44 @@ impl Membership {
         time::sleep(IN_FLIGHT).await;
         // A write that needs the Control quorum, and one that needs Timestamps and Catalog.
         let policy = growth_policy(cluster, self.next_sample_ms);
-        let limit = EVIDENCE - IN_FLIGHT * 2;
-        let control = cluster.admin_task(
-            survivor,
-            cluster.split_id().await,
-            "storage.growth.configure",
-            json!({"policy": policy}),
-            limit,
-        );
-        let table = nabedra_rt::task::spawn(create_probe_table(ctx.token.clone(), limit));
+        let policy_id = cluster.split_id().await;
+        let table_id = in_node(CLIENTS[0], async { uuid_v4() }).await;
+        let (mut control, mut table) = (Err(String::new()), Err(String::new()));
+        while cluster.world.elapsed() + EVIDENCE_ATTEMPT < until {
+            let began = cluster.world.elapsed();
+            let configure = cluster.admin_task(
+                survivor,
+                policy_id,
+                "storage.growth.configure",
+                json!({"policy": policy}),
+                EVIDENCE_ATTEMPT,
+            );
+            let create = nabedra_rt::task::spawn(create_probe_table(
+                ctx.token.clone(),
+                table_id,
+                EVIDENCE_ATTEMPT,
+            ));
+            // The same IDs are sent again: only an answer in the window counts.
+            for (known, attempt) in [(&mut control, configure), (&mut table, create)] {
+                let answer = attempt.await.unwrap_or_else(|error| Err(error.to_string()));
+                if known.is_err() {
+                    *known = answer;
+                }
+            }
+            if let Some(wait) = (began + POLL).checked_sub(cluster.world.elapsed()) {
+                time::sleep(wait).await;
+            }
+        }
         while cluster.world.elapsed() < until {
             time::sleep(POLL).await;
         }
         let to = elapsed_ms(&cluster.world);
         let system = [
-            (control.await, &["control"][..]),
-            (table.await, &["timestamps", "catalog"][..]),
+            (control, &["control"][..]),
+            (table, &["timestamps", "catalog"][..]),
         ];
         let groups = cluster.config.system_groups();
         for (answer, needed) in system {
-            let answer = answer.unwrap_or_else(|error| Err(error.to_string()));
             cluster.record(format!(
                 "evidence: {needed:?} beside n{without}: {}",
                 match &answer {
@@ -1983,8 +2032,7 @@ fn growth_policy(cluster: &Cluster, salt: u64) -> Value {
 }
 
 /// Create a table of its own through the first gateway.
-async fn create_probe_table(token: String, limit: Duration) -> Result<Value, String> {
-    let id = in_node(CLIENTS[0], async { uuid_v4() }).await;
+async fn create_probe_table(token: String, id: Uuid, limit: Duration) -> Result<Value, String> {
     let payload = json!({
         "name": format!("probe_{}", id.simple()),
         "schema": {"id": "int64", "value": "int64"}, "key": "id", "format": "parquet",
@@ -2007,7 +2055,11 @@ async fn create_probe_table(token: String, limit: Duration) -> Result<Value, Str
 }
 
 /// What every running worker reports about the gated capabilities.
-async fn observe_capability(cluster: &Cluster, rule: &mut CapabilityBeforeUse) {
+///
+/// Returns how many workers answered while some voter had not run: only those answers can show
+/// a capability that is in use too early.
+async fn observe_capability(cluster: &Cluster, rule: &mut CapabilityBeforeUse) -> u64 {
+    let mut early = 0;
     let voters = cluster.config.nodes();
     for node in voters {
         if cluster.is_running(node) {
@@ -2021,6 +2073,7 @@ async fn observe_capability(cluster: &Cluster, rule: &mut CapabilityBeforeUse) {
         let Ok(stats) = cluster.stats(node).await else {
             continue;
         };
+        early += u64::from(rule.some_never_ran(&voters));
         let capability = &stats["direct_capability"];
         let applied = stats["direct"]["entries_applied"].as_u64().unwrap_or(0) > 0;
         for (used, capability, what) in [
@@ -2038,6 +2091,7 @@ async fn observe_capability(cluster: &Cluster, rule: &mut CapabilityBeforeUse) {
             }
         }
     }
+    early
 }
 
 #[cfg(test)]

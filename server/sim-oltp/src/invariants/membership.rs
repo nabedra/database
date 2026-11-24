@@ -299,6 +299,11 @@ impl CapabilityBeforeUse {
         Ok(())
     }
 
+    /// Whether some of `voters` never ran, so that a capability must not be in use.
+    pub(crate) fn some_never_ran(&self, voters: &[u64]) -> bool {
+        voters.iter().any(|voter| !self.ran.contains(voter))
+    }
+
     /// Control answers that `capability` is not active.
     pub(crate) fn inactive(&self, capability: Capability) -> Result<(), String> {
         if self.active.contains(&capability) {
