@@ -724,7 +724,8 @@ async fn d03_o08_insert_conflict_texts_are_the_ones_the_history_checker_knows() 
                 }
             }
             let after = gateway.stats();
-            assert_eq!(after.direct_done > before.direct_done, direct, "{after:?}");
+            // Only the queued path settles the request at its anchor first.
+            assert_eq!(after.forwards > before.forwards, !direct, "{after:?}");
         }
         runtime.drain().await.unwrap();
     })

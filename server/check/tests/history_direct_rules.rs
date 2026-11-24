@@ -310,6 +310,8 @@ fn a_reworded_row_conflict_is_counted() {
             (verdict.kinds(), verdict.unclassified_conflicts),
             (vec![EFFECT.into()], 1)
         );
+        let merged = Verdict::merge([Verdict::new(0, Vec::new()), verdict]);
+        assert_eq!(merged.unclassified_conflicts, 1);
     }
 }
 
