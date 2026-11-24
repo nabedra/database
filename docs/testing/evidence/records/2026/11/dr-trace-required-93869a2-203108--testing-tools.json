@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-trace-required-93869a2-203108--testing-tools.log",
+      "sha256": "ac9cd32cc5150ce50f6ec71ff613e635687a1d84cfddf78966e7d1671c5f2cef"
+    }
+  ],
+  "assertions": {
+    "executed": 162,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "testing-tools",
+  "duration_s": 11.487,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T19:33:30.542713+00:00",
+    "request_id": "dr-trace-required-93869a2-203108",
+    "runner": "GitHub Actions 1000013036",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45471033870"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "93869a2c67ceb1f603ed590248db028ecd09eeda",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

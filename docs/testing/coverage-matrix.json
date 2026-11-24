@@ -7,8 +7,25 @@
       "K03 simulated controller disk loss is `not-run` pending modelled Raft storage."
     ]
   },
-  "head": "297e7e91af810d85cf324607c77cd4edf061afb6",
-  "ignored_records": [],
+  "head": "83862ceda001c2398a724a4079b4b61db9746d43",
+  "ignored_records": [
+    {
+      "path": "dr-trace-required-93869a2-203108--specs-selftest-trace.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "dr-trace-required-93869a2-203108--specs-selftest.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "dr-trace-required-93869a2-203108--testing-matrix.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "dr-trace-required-93869a2-203108--testing-tools.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -2917,7 +2934,7 @@
           "state": "n/a"
         }
       },
-      "guarantee": "Each request identity executes once, cluster-wide on the queued path and per table and key on the direct path.",
+      "guarantee": "Each request identity executes once, cluster-wide on the queued path and per table and key on the direct path. On the direct path, a retry of a mutation with the same request ID and body returns the first definite result of that identity, including a no-op or row conflict, while its dedup record is retained.",
       "id": "OLTP-G03",
       "level": "L3",
       "module": "oltp",
@@ -4002,5 +4019,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
