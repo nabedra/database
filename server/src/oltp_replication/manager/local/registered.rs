@@ -192,7 +192,7 @@ pub(crate) struct RegisteredWorker {
     pub restart_mount: Option<restart::RestartMount>,
     pub operator: LocalOperatorPermit,
     pub transport: Arc<WorkerTransport>,
-    pub listener: Option<TcpListener>,
+    pub listener: Option<Listener>,
     pub directory: Arc<crate::oltp_replication::peer_directory::AppliedPeerDirectory>,
 }
 /// The system groups are hosted on each configured voter, but are initialized
@@ -546,7 +546,7 @@ impl RegisteredWorker {
             shared.clone(),
             ownership.clone(),
         )?;
-        let listener = TcpListener::bind(config.bind).await.map_err(storage)?;
+        let listener = backend::current().bind(config.bind).await.map_err(storage)?;
         if listener.local_addr().map_err(storage)?.port() != config.bind.port()
             || config.bind.port() == 0
         {
