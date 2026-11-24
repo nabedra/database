@@ -52,6 +52,7 @@ labelled as a fault model and does not replace the real-environment checks the r
 | R | Real environment: processes, Docker, kind or real S3 |
 | P | Performance, paired A/B only |
 | K | Soak |
+| T | TLA+ design spec and trace validation, see [design review](../../.agents/skills/design-review/SKILL.md). Not yet accepted by the tooling |
 
 ### Assurance levels and tiers
 
