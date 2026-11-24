@@ -1,10 +1,9 @@
 //! Authenticated conditional-object HTTP transport. No redirects or PUT retries.
 
-pub(crate) mod connector;
-
 use super::{
     Download, Namespace, ObjectAccessError, ObjectKey, ObjectStore, StorageError, WriteCondition,
 };
+use crate::network::connector;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http_body_util::{BodyExt, Full};

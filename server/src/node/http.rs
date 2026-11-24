@@ -8,8 +8,9 @@ use crate::{
         controller::OwnershipObservation, member::Node, startup_material::files::TlsMaterial,
         state::Control,
     },
+    network::connector,
     protocol::{ErrorCode, Outcome, ProtocolError},
-    storage::{RuntimeStore, Storage, http::connector},
+    storage::{RuntimeStore, Storage},
     worker_pool::WorkerPool,
 };
 use axum::{

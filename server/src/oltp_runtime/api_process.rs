@@ -373,6 +373,7 @@ mod sim_net_tests {
     use super::*;
     use crate::{
         executor::Executor,
+        network::connector,
         oltp_replication::multiplex::EndpointFuture,
         oltp_runtime::{
             application::PointRequest,
@@ -383,8 +384,8 @@ mod sim_net_tests {
         scheduling::{MemoryCharge, ResourceScheduler},
     };
     use http_body_util::{BodyExt, Empty};
-    use hyper::{Request, body::Bytes, client::conn::http1};
-    use hyper_util::rt::TokioIo;
+    use hyper::{Request, body::Bytes};
+    use hyper_util::{client::legacy::Client, rt::TokioExecutor};
     use nabedra_rt::sim::{
         self, NodeClock,
         net::{Envelope, Fate, Kind, Planner},
@@ -394,6 +395,7 @@ mod sim_net_tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     const HTTP_CLIENT: u64 = 1001;
@@ -402,6 +404,9 @@ mod sim_net_tests {
     struct ReadyRuntime {
         scheduler: ResourceScheduler,
         calls: AtomicUsize,
+        in_flight: Notify,
+        resume: Notify,
+        finished: AtomicUsize,
     }
 
     impl HttpRuntime for ReadyRuntime {
@@ -437,7 +442,11 @@ mod sim_net_tests {
         fn health(&self) -> EndpointFuture<'_, EncodedResponse> {
             Box::pin(async {
                 assert_eq!(sim::current_node(), Some(API_NODE));
-                self.calls.fetch_add(1, Ordering::Relaxed);
+                if self.calls.fetch_add(1, Ordering::Relaxed) == 1 {
+                    self.in_flight.notify_one();
+                    self.resume.notified().await;
+                    self.finished.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(EncodedResponse {
                     status: 200,
                     body: br#"{"ready":true}"#.to_vec(),
@@ -498,6 +507,9 @@ mod sim_net_tests {
                         )])
                         .unwrap(),
                         calls: AtomicUsize::new(0),
+                        in_flight: Notify::new(),
+                        resume: Notify::new(),
+                        finished: AtomicUsize::new(0),
                     });
                     let app = crate::oltp_runtime::http::router_for(
                         runtime.clone(),
@@ -505,43 +517,59 @@ mod sim_net_tests {
                         "sim".into(),
                     )
                     .unwrap();
-                    let (stop, shutdown) = tokio::sync::oneshot::channel();
                     let server = world.spawn_node(
                         API_NODE,
-                        crate::network::serve_router_keep_alive(listener, app, None, async {
-                            let _ = shutdown.await;
-                        }),
+                        crate::network::serve_router_keep_alive(
+                            listener,
+                            app,
+                            None,
+                            std::future::pending(),
+                        ),
                     );
-                    let exchange = sim::in_node(HTTP_CLIENT, async {
-                        let conn = nabedra_transport::backend::current()
-                            .dial(nabedra_rt::net::Target::Addr(endpoint))
-                            .await
-                            .unwrap();
-                        let (mut client, connection) =
-                            http1::handshake(TokioIo::new(conn.plain())).await.unwrap();
-                        let driver = nabedra_rt::task::spawn(connection);
-                        let response = client
-                            .send_request(
-                                Request::get("/health/ready")
-                                    .header("host", endpoint.to_string())
-                                    .body(Empty::<Bytes>::new())
-                                    .unwrap(),
-                            )
-                            .await
-                            .unwrap();
-                        assert_eq!(response.status(), 200);
-                        assert_eq!(response.headers()["content-type"], "application/json");
-                        let body = response.into_body().collect().await.unwrap().to_bytes();
-                        assert_eq!(body.as_ref(), br#"{"ready":true}"#);
-                        drop(client);
-                        driver.await.unwrap().unwrap();
-                    });
-                    nabedra_rt::time::timeout(Duration::from_secs(10), exchange)
+                    let ready = format!("http://{endpoint}/health/ready");
+                    let request = || Request::get(&ready).body(Empty::<Bytes>::new()).unwrap();
+                    let client = Client::builder(TokioExecutor::new())
+                        .build(connector::new(Duration::from_secs(1)));
+                    nabedra_rt::time::timeout(
+                        Duration::from_secs(10),
+                        sim::in_node(HTTP_CLIENT, async {
+                            let response = client.request(request()).await.unwrap();
+                            assert_eq!(response.status(), 200);
+                            assert_eq!(response.headers()["content-type"], "application/json");
+                            let body = response.into_body().collect().await.unwrap().to_bytes();
+                            assert_eq!(body.as_ref(), br#"{"ready":true}"#);
+                        }),
+                    )
+                    .await
+                    .expect("readiness request deadline");
+
+                    let pending = world.spawn_node(HTTP_CLIENT, client.request(request()));
+                    nabedra_rt::time::timeout(Duration::from_secs(10), runtime.in_flight.notified())
                         .await
+                        .expect("second request reached the readiness handler");
+                    world.freeze(API_NODE);
+                    runtime.resume.notify_one();
+                    // Wake the handler while its node is frozen and give it a turn.
+                    nabedra_rt::time::sleep(Duration::from_millis(20)).await;
+                    assert_eq!(
+                        runtime.finished.load(Ordering::Relaxed),
+                        0,
+                        "frozen API ran"
+                    );
+                    assert!(!pending.is_finished(), "frozen API replied");
+                    world.crash(API_NODE);
+                    assert!(server.await.unwrap_err().is_cancelled());
+                    let result = nabedra_rt::time::timeout(Duration::from_secs(10), pending)
+                        .await
+                        .expect("client did not observe the API crash")
                         .unwrap();
-                    stop.send(()).unwrap();
-                    server.await.unwrap().unwrap();
-                    assert_eq!(runtime.calls.load(Ordering::Relaxed), 1);
+                    assert!(result.is_err(), "crashed API replied");
+                    assert_eq!(runtime.calls.load(Ordering::Relaxed), 2);
+                    assert_eq!(
+                        runtime.finished.load(Ordering::Relaxed),
+                        0,
+                        "crashed API ran"
+                    );
                     let trace = trace.lock().unwrap();
                     assert!(trace.events() >= 2);
                     trace.hash()

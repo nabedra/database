@@ -1,5 +1,9 @@
 //! Shared bounded HTTP/TLS listener. Engine bootstrap and operation admission
 //! remain with their runtimes; transport budgets are identical for both engines.
+#[cfg(any(feature = "olap", all(test, feature = "oltp", feature = "sim")))]
+#[path = "storage/http/connector.rs"]
+pub(crate) mod connector;
+
 #[cfg(feature = "olap")]
 use crate::api::response;
 #[cfg(feature = "oltp")]
@@ -738,7 +742,20 @@ async fn serve_bounded(
     let app = match nabedra_rt::sim::current_node() {
         Some(node) => app.layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| async move {
-                nabedra_rt::sim::in_node(node, next.run(request)).await
+                use axum::response::IntoResponse as _;
+                // axum-server spawns its connection task on Tokio. Run the
+                // request in a registered node task for freeze and crash.
+                // Dropping the service future also drops the set and aborts the request.
+                let mut task = nabedra_rt::task::JoinSet::new();
+                nabedra_rt::sim::in_node(node, async {
+                    nabedra_rt::task::spawn_in(&mut task, next.run(request));
+                })
+                .await;
+                match task.join_next().await.expect("one simulated API request") {
+                    Ok(response) => response,
+                    Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                    Err(_) => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                }
             },
         )),
         None => app,
