@@ -1,0 +1,191 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-sim-ea4f3751-163352--sim-sim-clock.log",
+      "sha256": "f6b85a2c8713f58be72f09a40997c4dc483c40e8c1e6b862b8e3aecfd417921d"
+    },
+    {
+      "name": "tla/SimClock.log",
+      "sha256": "5430f30038c671065fc71dafb66fc086ffea5885db2ba1f26c6f67fc64834349"
+    },
+    {
+      "name": "tla/SimClock.timers.log",
+      "sha256": "302809c9d2859f5dae8a8f4c22c4ad3db2cc5b4bbfd5dc810490ab096de133d3"
+    },
+    {
+      "name": "tla/mutant-e1_beyond_bound.cex.json",
+      "sha256": "a8127061b676162a51f39d15cc3d0f5ec5b3b8bd23b9b2dc04b8fa9e00209853"
+    },
+    {
+      "name": "tla/mutant-e1_beyond_bound.log",
+      "sha256": "20015408fdcba2ca8bd8d26e0558833ff3aba3eb1f356e937f968ec61a005ad7"
+    },
+    {
+      "name": "tla/mutant-e2_local_docker.cex.json",
+      "sha256": "78bf06e5f5c92cda38dfe8bdf616e57ae886d325b12f17761d47151415398b11"
+    },
+    {
+      "name": "tla/mutant-e2_local_docker.log",
+      "sha256": "5770db9ab5134e902f471c4be07340e7fdf22124753f434945e688201ed166b5"
+    },
+    {
+      "name": "tla/mutant-error_ages_on_local.cex.json",
+      "sha256": "06cf3f056b43b1463b6ffff6f968eb3a54539c60762d38578c67507338d343d8"
+    },
+    {
+      "name": "tla/mutant-error_ages_on_local.log",
+      "sha256": "3c7e5904083efa3bb649b77570d0108b770c9915652d6b5cead696ff189313a6"
+    },
+    {
+      "name": "tla/mutant-no_reanchor_budget.cex.json",
+      "sha256": "e64458ba29b4e29be08ed450ed3607077a3aa0cb64e31d70f2455cda4f3cb086"
+    },
+    {
+      "name": "tla/mutant-no_reanchor_budget.log",
+      "sha256": "a9841758568ddf7cc841083a1646f18354e981b93c0783c5cbe74ea71266a286"
+    },
+    {
+      "name": "tla/mutant-prefix_early_timer.cex.json",
+      "sha256": "93e3e4a8d91e28b96e024c2c39a4418c2dc45f9c936feb68af0da96d924a73b7"
+    },
+    {
+      "name": "tla/mutant-prefix_early_timer.log",
+      "sha256": "626269974059598197402a861c1b54aec50fb7c70b83871eda6ef42b8ed26bba"
+    },
+    {
+      "name": "tla/mutant-reanchor_drops_local.cex.json",
+      "sha256": "3f93fd833e1ef0853c9c2545090f544fedcc0eb7e7c4c07047992076a900fda7"
+    },
+    {
+      "name": "tla/mutant-reanchor_drops_local.log",
+      "sha256": "a45a782e9b68342db52acfec13dd01048369690d64fe22919a4844f7dd12fcf2"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "12a2901588b6f6d126da42be15f24d2c3a61e665a1a1be2c092e34a6845da124"
+    }
+  ],
+  "assertions": {
+    "executed": 12,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "sim-sim-clock",
+  "duration_s": 49.467,
+  "guarantees": [
+    "CACHE-G06",
+    "OLTP-G02"
+  ],
+  "kind": "T",
+  "mode": {
+    "tla": "exhaustive"
+  },
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T15:34:24.102876+00:00",
+    "request_id": "dr-sim-ea4f3751-163352",
+    "runner": "GitHub Actions 1000011606",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45426950795"
+  },
+  "scenarios": [
+    "K03",
+    "O09"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "ea4f37519dccd27723f082999c662ebe5cab4d52",
+  "sim_core_hours": null,
+  "tla": {
+    "actions": 11,
+    "budget_s": 900,
+    "depth": 17,
+    "distinct_states": 784050,
+    "min_action_coverage": 32940,
+    "mode": "exhaustive",
+    "mutants": [
+      {
+        "cex_length": 6,
+        "detail": "invariant ClockAssumption violated, counterexample of 6 states",
+        "expect": "ClockAssumption",
+        "name": "e1_beyond_bound",
+        "observed": "ClockAssumption",
+        "ok": true
+      },
+      {
+        "cex_length": 3,
+        "detail": "invariant ClockAssumption violated, counterexample of 3 states",
+        "expect": "ClockAssumption",
+        "name": "e2_local_docker",
+        "observed": "ClockAssumption",
+        "ok": true
+      },
+      {
+        "cex_length": 11,
+        "detail": "invariant ClockAssumption violated, counterexample of 11 states",
+        "expect": "ClockAssumption",
+        "name": "error_ages_on_local",
+        "observed": "ClockAssumption",
+        "ok": true
+      },
+      {
+        "cex_length": 10,
+        "detail": "invariant ClockAssumption violated, counterexample of 10 states",
+        "expect": "ClockAssumption",
+        "name": "no_reanchor_budget",
+        "observed": "ClockAssumption",
+        "ok": true
+      },
+      {
+        "cex_length": 7,
+        "detail": "action property TimerNeverEarly violated, counterexample of 7 states",
+        "expect": "TimerNeverEarly",
+        "name": "prefix_early_timer",
+        "observed": "TimerNeverEarly",
+        "ok": true
+      },
+      {
+        "cex_length": 3,
+        "detail": "action property MonoNeverBackward violated, counterexample of 3 states",
+        "expect": "MonoNeverBackward",
+        "name": "reanchor_drops_local",
+        "observed": "MonoNeverBackward",
+        "ok": true
+      }
+    ],
+    "runs": [
+      {
+        "cfg": "SimClock.cfg",
+        "depth": 17,
+        "detail": "",
+        "distinct_states": 784050,
+        "duration_s": 14.7,
+        "states_left": 0,
+        "verdict": "pass"
+      },
+      {
+        "cfg": "SimClock.timers.cfg",
+        "depth": 16,
+        "detail": "",
+        "distinct_states": 1491366,
+        "duration_s": 29.4,
+        "states_left": 0,
+        "verdict": "pass"
+      }
+    ],
+    "spec": "specs/sim/clock/SimClock",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "uncovered": [],
+    "unmutated": [
+      "TypeOK"
+    ]
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}
