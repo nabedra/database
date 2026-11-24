@@ -6,7 +6,7 @@ Scenario tests end in acceptance_oNN. Existing regression tests remain intact.
 With --test-binary, set NABEDRA_RESOURCES_TEST_EXE to the prebuilt resources
 test executable when running O13 or O22 and NABEDRA_TRANSPORT_TEST_EXE to
 the prebuilt transport executable when running O05. Set NABEDRA_OLTP_STORAGE_TEST_EXE
-to the storage test executable for O13, O20, O22 and O24.
+to the storage test executable for O02–O05, O13, O20 and O22–O24.
 """
 import argparse
 from contextlib import contextmanager
@@ -360,7 +360,8 @@ def main():
             fixtures = (
                 ("resources", RESOURCES_TEST_EXE, {"O13", "O22"}),
                 ("transport", TRANSPORT_TEST_EXE, {"O05"}),
-                ("oltp-storage", STORAGE_TEST_EXE, {"O13", "O20", "O22", "O24"}),
+                ("oltp-storage", STORAGE_TEST_EXE,
+                 {"O02", "O03", "O04", "O05", "O13", "O20", "O22", "O23", "O24"}),
             )
             binary = Path(temp) / "acceptance-tests"
             shutil.copy2(built, binary)

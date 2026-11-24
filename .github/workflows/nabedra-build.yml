@@ -1523,6 +1523,11 @@ jobs:
           tar -xf o02-inputs.tar && rm o02-inputs.tar
           grep -qx "source=$TESTED_SHA" o02-inputs/source.txt || { echo "::error::the O02 inputs are not $TESTED_SHA"; exit 1; }
           lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
+          storage=$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)
+          [[ -n "$storage" && -x "$GITHUB_WORKSPACE/$storage" ]]
+          "$GITHUB_WORKSPACE/$storage" --list |
+            grep -Fx "oltp::pool::tests::kv::ns22_rocksdb_pools_and_legacy_stores_are_refused_untouched: test"
+          echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$storage" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
