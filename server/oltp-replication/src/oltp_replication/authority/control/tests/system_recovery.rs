@@ -679,11 +679,15 @@ async fn r121_rv_rep_2_control_reopens_after_the_mount_at_the_limit() {
     .unwrap();
     let reopened = ControlMachine::new(recovery.fixture.machine.store().clone())
         .unwrap()
-        .with_replacement_directory(restarted)
-        .await;
+        .with_replacement_directory(restarted.clone())
+        .await
+        .unwrap();
+    // Opening defers a failed load to a retry loop, so ask for the load itself.
+    let load = reopened.refresh_replacement_trust(&restarted).await;
+    let mounted = matches!(reply, ControlReply::SystemReplacementMounted);
     assert!(
-        reopened.is_ok(),
-        "Control cannot reopen after the mount at the limit answered {reply:?}: {:?}",
-        reopened.err()
+        load.is_ok() && restarted.revoked(record.intent.previous) == mounted,
+        "the mount at the limit answered {reply:?}; reopened Control loads its revocations: {load:?},          the worker it replaced is revoked: {}",
+        restarted.revoked(record.intent.previous)
     );
 }
