@@ -81,6 +81,10 @@ class DesignLineTests(unittest.TestCase):
         reason = pr_lint.design_reason(["server/src/oltp_runtime/direct/executor.rs"], [], modules)
         self.assertIn("L3 module oltp", reason)
         self.assertIsNone(pr_lint.design_reason(["scripts/testing/README.md", "README.md"], [], modules))
+        # Markdown under an L2 module path is documentation, not a design change.
+        self.assertIsNone(pr_lint.design_reason(["server/events/README.md", "docs/cache/overview.md"], [], modules))
+        self.assertIn("L2 module events", pr_lint.design_reason(["server/events/src/raft/mod.rs"], [], modules))
+        self.assertIn("L3 module lsm", pr_lint.design_reason(["docs/x.md", "server/kv/src/lib.rs"], [], modules))
         self.assertIsNone(pr_lint.design_reason([], [], modules))
 
     def test_design_section(self):

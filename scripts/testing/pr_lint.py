@@ -6,10 +6,12 @@
 Every pull request body needs the four lines `Guarantees:`, `Evidence:`, `Not run:` and
 `Reviewers:`. A fifth line, `Design:`, is required when the pull request changes `specs/**`, changes
 a `## Design review` section of a plan in `plans/`, or touches a path of an L2 or L3 module in
-docs/testing/modules.toml (.agents/skills/design-review/SKILL.md, "Pull request body"). Its value is
+docs/testing/modules.toml other than a Markdown file (.agents/skills/design-review/SKILL.md, "Pull
+request body"). Its value is
 spec paths with T check run URLs and their verdicts, or `none: <reason>`. The changed files come from
-`git diff base...head`, or from a newline-separated --changed-files list. Without either, the
-`Design:` line is checked only when present.
+`git diff base...head`, or from a newline-separated --changed-files list. With a list, a changed plan
+that has a `## Design review` section counts as changing it. Without either, the `Design:` line is
+checked only when present.
 """
 
 import argparse
@@ -144,6 +146,8 @@ def design_reason(changed, section_changed=(), modules=None):
     if section_changed:
         return f"the pull request changes the Design review section of {section_changed[0]}"
     for f in changed:
+        if f.endswith(".md"):
+            continue  # documentation, such as a module README, is not a design change
         for name, level, paths, exclude in modules or []:
             if any(p.match(f) for p in paths) and not any(e.match(f) for e in exclude):
                 return f"the pull request touches {f} in {level} module {name}"
