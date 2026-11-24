@@ -550,17 +550,17 @@ impl IndexService {
                                 .await?;
                         }
                         ScanPage::Records { records, exhausted } => {
-                            #[cfg(test)]
-                            crate::oltp_runtime::recovery_tests::maintenance::hold_index_page(
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            crate::oltp::test_hooks::maintenance::hold_index_page(
                                 maintenance.index_id,
                                 records.len(),
                             )
                             .await;
-                            #[cfg(test)]
-                            if crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            if crate::oltp::test_hooks::index_holds::checkpoint(
                                 maintenance.index_id,
-                                crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::Backfill,
-                                || Some(crate::oltp_runtime::recovery_tests::index_holds::PageBuffers {
+                                crate::oltp::test_hooks::index_holds::Checkpoint::Backfill,
+                                || Some(crate::oltp::test_hooks::index_holds::PageBuffers {
                                     rows: records.len(),
                                     source_rows: records.iter().filter(|record| record.value.is_some()).count(),
                                     page_bytes: response.decode_owner().unwrap().bytes(),
@@ -594,10 +594,10 @@ impl IndexService {
                                     {
                                         return Err(error);
                                     }
-                                    #[cfg(test)]
-                                    if crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
+                                    #[cfg(any(test, feature = "test-hooks"))]
+                                    if crate::oltp::test_hooks::index_holds::checkpoint(
                                         maintenance.index_id,
-                                        crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::Refresh,
+                                        crate::oltp::test_hooks::index_holds::Checkpoint::Refresh,
                                         || None,
                                     ).await {
                                         return Err(failure(ErrorCode::StorageUnavailable, "index fixture interrupted refresh"));
@@ -697,11 +697,11 @@ impl IndexService {
                 Ok(plan) => plan,
                 Err(error) => return self.failed(metadata, error).await.map(|()| authority),
             };
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             if matches!(publication, BackfillPublication::Ready) {
-                crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
+                crate::oltp::test_hooks::index_holds::checkpoint(
                     maintenance.index_id,
-                    crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::ReadyCommit,
+                    crate::oltp::test_hooks::index_holds::Checkpoint::ReadyCommit,
                     || None,
                 )
                 .await;

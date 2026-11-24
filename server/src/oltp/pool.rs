@@ -19,8 +19,10 @@ mod storage;
 pub use snapshot::{
     GroupSnapshot, GroupSnapshotHeader, IncomingSnapshot, PoolSnapshotFile, SnapshotCut,
 };
+#[cfg(all(test, feature = "sim", target_os = "linux"))]
+mod sim_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 pub use resources::{
     ByteClass, ChargedBuffer, ChargedBytes, ExecutionClass, NativeComputeGuard, PreparedNative,
     QueueLease, ScratchLease, SharedResourceConfig, WorkerSharedResources,
@@ -28,7 +30,7 @@ pub use resources::{
 use resources::{ByteReservation, capacity};
 pub(crate) use resources::{DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease, RAFT_REPLICA_BYTES};
 #[cfg(test)]
-pub(crate) use tests::{acceptance_damaged_checkpoints, o29_pool_recovery};
+pub(crate) use tests::acceptance_damaged_checkpoints;
 
 use super::{failure, recovery_unknown};
 use crate::{
@@ -38,10 +40,10 @@ use crate::{
 };
 use bytes::Bytes;
 use nabedra_kv::{Durability, Snapshot, Store, WriteBatch};
+use nabedra_rt::fs::os::{File, OpenOptions, self as fs};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::Path,
     sync::{
@@ -63,35 +65,7 @@ const POOL_KEY: &[u8] = b"\0typed-pool-v1";
 const MAX_KEY_BYTES: usize = 2 * crate::protocol::MAX_BODY_BYTES + 256;
 const MAX_IDENTITY_BYTES: u64 = 4096;
 const BATCH_OVERHEAD: usize = 32;
-/// Pool format 2: a `nabedra-kv` store in `kv/`. Format 1 (the previous engine) is
-/// refused (Q1).
-pub const POOL_FORMAT_VERSION: u32 = 2;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PoolIdentity {
-    pub engine: String,
-    pub pool_format_version: u32,
-    pub cluster_id: Uuid,
-    pub worker_id: Uuid,
-    pub pool_id: Uuid,
-}
-impl PoolIdentity {
-    pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.engine != "oltp"
-            || self.pool_format_version != POOL_FORMAT_VERSION
-            || self.cluster_id.is_nil()
-            || self.worker_id.is_nil()
-            || self.pool_id.is_nil()
-        {
-            return Err(failure(
-                ErrorCode::StorageUnavailable,
-                "invalid typed OLTP pool identity",
-            ));
-        }
-        Ok(())
-    }
-}
+pub use nabedra_oltp_types::{POOL_FORMAT_VERSION, PoolIdentity};
 
 struct PoolInner {
     /// Declared first so the store closes before the slot, charges and mount drop.
@@ -277,8 +251,8 @@ impl OltpPool {
         mount: Option<VerifiedPoolMount>,
     ) -> Result<Self, ProtocolError> {
         let fs = nabedra_kv::fs::real();
-        #[cfg(test)]
-        let fs = crate::oltp_runtime::recovery_tests::pool_sync::wrap(fs);
+        #[cfg(any(test, feature = "test-hooks"))]
+        let fs = crate::oltp::test_hooks::pool_sync::wrap(fs);
         Self::open_path_on(path, identity, shared, mount, fs, &|_| {})
     }
     fn open_path_on(
@@ -292,17 +266,28 @@ impl OltpPool {
         identity.validate()?;
         super::native::validate_thread_defaults(shared.thread_budget())?;
         shared.bind_worker(identity.worker_id)?;
-        let pool_slot = shared
-            .pool_slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| capacity())?;
+        let pool_slot = shared.reserve_pool_slot()?;
         let overhead = shared.pool_overhead()?;
-        open_pool_manifest(path, &identity)?;
+        open_pool_manifest(path, &identity, mount.is_some())?;
         let mut options =
-            storage::store_options(&shared.storage, fs, shared.config.write_buffer_bytes);
+            storage::store_options(&shared.storage, fs, shared.config().write_buffer_bytes);
         tune(&mut options);
-        let store_path = path.join(storage::STORE_DIR);
+        // KV's NodeFs routes by the volume's absolute path. The mount retains
+        // the descriptor, which still anchors the pool's other filesystem calls.
+        #[cfg(feature = "sim")]
+        let resolved_path;
+        #[cfg(feature = "sim")]
+        let path_for_kv = if mount.as_ref().is_some_and(|mount| {
+            nabedra_rt::sim::volume_for(&mount.observation().expected.mount_path).is_some()
+        }) {
+            resolved_path = fs::canonicalize(path).map_err(|_| storage_error_message())?;
+            resolved_path.as_path()
+        } else {
+            path
+        };
+        #[cfg(not(feature = "sim"))]
+        let path_for_kv = path;
+        let store_path = path_for_kv.join(storage::STORE_DIR);
         let journal_path = store_path.join(nabedra_kv::manifest::JOURNAL_DIR);
         let journal_path = journal_path.as_path();
         let segment_bytes = options.journal.segment_bytes;
@@ -314,7 +299,7 @@ impl OltpPool {
         // FaultFs keeps the journal in memory, with only the pool manifest on
         // disk. Real stores measure the device of the journal itself.
         #[cfg(test)]
-        let journal_path = if journal_path.exists() {
+        let journal_path = if fs::try_exists(journal_path).unwrap_or(false) {
             journal_path
         } else {
             path
@@ -2053,8 +2038,12 @@ fn group_key(id: Uuid, tag: u8, suffix: &[u8]) -> Vec<u8> {
 fn identity_key(id: Uuid) -> Vec<u8> {
     group_key(id, b'i', &[])
 }
-fn open_pool_manifest(path: &Path, identity: &PoolIdentity) -> Result<(), ProtocolError> {
-    if path.exists() {
+fn open_pool_manifest(
+    path: &Path,
+    identity: &PoolIdentity,
+    mounted: bool,
+) -> Result<(), ProtocolError> {
+    if fs::try_exists(path).unwrap_or(false) {
         let meta = fs::symlink_metadata(path).map_err(|_| storage_error_message())?;
         if !meta.is_dir() || meta.file_type().is_symlink() {
             return Err(storage_error_message());
@@ -2063,7 +2052,7 @@ fn open_pool_manifest(path: &Path, identity: &PoolIdentity) -> Result<(), Protoc
         fs::create_dir_all(path).map_err(|_| storage_error_message())?;
     }
     let manifest = path.join(POOL_MANIFEST);
-    if manifest.exists() {
+    if fs::try_exists(&manifest).unwrap_or(false) {
         let file = File::open(&manifest).map_err(|_| storage_error_message())?;
         if !file
             .metadata()
@@ -2105,6 +2094,12 @@ fn open_pool_manifest(path: &Path, identity: &PoolIdentity) -> Result<(), Protoc
         }
         return Err(storage_error_message());
     }
+    if mounted {
+        // Make the pool entry durable through the verified mount descriptor before
+        // publishing its first manifest. KV only syncs directories inside the pool.
+        let parent = path.parent().ok_or_else(storage_error_message)?;
+        fs::sync_dir(parent).map_err(|_| storage_error_message())?;
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2114,9 +2109,7 @@ fn open_pool_manifest(path: &Path, identity: &PoolIdentity) -> Result<(), Protoc
     file.flush()
         .and_then(|_| file.sync_all())
         .map_err(|_| storage_error_message())?;
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|_| storage_error_message())?;
+    fs::sync_dir(path).map_err(|_| storage_error_message())?;
     Ok(())
 }
 fn storage_error_message() -> ProtocolError {
@@ -2145,6 +2138,11 @@ impl Drop for OwnedStore {
         let Some(store) = self.0.take() else {
             return;
         };
+        #[cfg(feature = "sim")]
+        if nabedra_rt::sim::current_node().is_some() {
+            drop(store);
+            return;
+        }
         match tokio::runtime::Handle::try_current() {
             Ok(runtime)
                 if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>

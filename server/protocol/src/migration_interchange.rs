@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn migration_interchange_roundtrip_order_and_corruption() {
         let table = TableDescriptor {
-            id: nabedra_rt::ids::uuid_v4(),
+            id: Uuid::from_u128(1),
             name: "typed".into(),
             schema: std::collections::BTreeMap::from([
                 ("id".into(), crate::protocol::ColumnType::Int64),
@@ -412,7 +412,7 @@ mod tests {
         };
         let header = ArchiveHeader {
             format_version: 1,
-            archive_id: nabedra_rt::ids::uuid_v4(),
+            archive_id: Uuid::from_u128(2),
             source_engine: SourceEngine::Olap,
             source_snapshot: [11; 32],
         };

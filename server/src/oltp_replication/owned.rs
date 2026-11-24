@@ -13,28 +13,8 @@ use std::{
     mem::size_of,
     sync::{Arc, OnceLock},
 };
-/// Hash an already-owned bounded DTO without allocating a second encoded
-/// buffer. Call this from the owned native codec/apply job.
-pub(crate) fn serialized_digest(
-    value: &impl Serialize,
-) -> Result<crate::oltp_replication::types::Digest, ProtocolError> {
-    use sha2::{Digest as _, Sha256};
-    struct Writer(Sha256);
-    impl std::io::Write for Writer {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.update(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut writer = Writer(Sha256::new());
-    serde_json::to_writer(&mut writer, value).map_err(|_| invalid())?;
-    Ok(crate::oltp_replication::types::Digest::from_bytes(
-        writer.0.finalize().into(),
-    ))
-}
+
+pub(crate) use nabedra_oltp_types::owned::serialized_digest;
 
 /// Implementations count all uncharged retained heap, including Vec capacity
 /// and String capacity. Field attachment must retain the same whole-command
@@ -283,10 +263,8 @@ fn invalid() -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        config::WorkerResources,
-        oltp::{mvcc::CanonicalJson, pool::SharedResourceConfig},
-    };
+    use crate::oltp::{mvcc::CanonicalJson, pool::SharedResourceConfig};
+    use nabedra_resources::config::WorkerResources;
     #[derive(Serialize, Deserialize)]
     struct Payload {
         fixed: CanonicalJson,

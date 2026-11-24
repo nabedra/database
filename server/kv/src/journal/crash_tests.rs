@@ -1252,6 +1252,20 @@ fn g7_zero_fill_drops_its_pages_as_it_goes() {
 /// EIO leaves the rename pending exactly as a stop right before the sync would.
 #[test]
 fn ns04_kvfix4_kill_before_a_rolls_dir_sync_then_crash_after_reopen_keeps_synced_records() {
+    check_reopened_segment_name_is_durable();
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn phase9_sim_reopened_segment_name_is_durable() {
+    use nabedra_rt::sim::{self, NodeClock};
+    sim::run(4242, |world| async move {
+        world.add_node(1, NodeClock::default());
+        sim::in_node(1, async { check_reopened_segment_name_is_durable() }).await;
+    });
+}
+
+fn check_reopened_segment_name_is_durable() {
     let fs = FaultFs::new();
     fs.create_dir_all_durable(Path::new("/db"));
     let dir = Path::new("/db/journal");
@@ -1268,6 +1282,9 @@ fn ns04_kvfix4_kill_before_a_rolls_dir_sync_then_crash_after_reopen_keeps_synced
         put(&j, format!("a{i:03}")).unwrap();
         synced += 1;
     }
+    nabedra_rt::task::drive_until("journal spare after an unsynced roll", || {
+        (free(&j) != 0).then_some(())
+    });
     let deadline = nabedra_rt::time::now_std() + std::time::Duration::from_secs(10);
     while free(&j) == 0 {
         assert!(nabedra_rt::time::now_std() < deadline, "no spare prepared");

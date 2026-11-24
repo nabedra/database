@@ -67,6 +67,9 @@ def assert_no_sim(name, tree):
             assert 'sim' not in features, (name, package, 'sim enabled')
         if package == 'nabedra-kv':
             assert 'sim' not in features, (name, package, 'sim enabled')
+        if package == 'nabedra-resources':
+            test_features = features & {'test-defaults', 'test-hooks'}
+            assert not test_features, (name, package, 'test features enabled', sorted(test_features))
         if package == 'tokio':
             assert 'test-util' not in features, (name, package, 'test-util enabled')
     assert runtime, (name, 'nabedra-rt is not in the graph')

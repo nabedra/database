@@ -379,6 +379,20 @@ fn ns04_ns13_crash_at_every_operation_full() {
 /// segment" (NS10 long campaign, seed 69).
 #[test]
 fn ns13_gc_relocation_records_fit_small_segments() {
+    check_relocation_records_fit_small_segments();
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn phase9_sim_relocation_records_fit_small_segments() {
+    use nabedra_rt::sim::{self, NodeClock};
+    sim::run(69, |world| async move {
+        world.add_node(1, NodeClock::default());
+        sim::in_node(1, async { check_relocation_records_fit_small_segments() }).await;
+    });
+}
+
+fn check_relocation_records_fit_small_segments() {
     let (fs, dir) = fault_fs();
     let bg = Background::new(2).unwrap();
     let mut o = options(&fs, &bg);

@@ -18,8 +18,6 @@ use grant_cache::GrantKey;
 mod metadata;
 mod participant;
 mod participant_full;
-#[cfg(test)]
-pub(crate) use participant_full::continuation_fixture;
 mod read_attempt;
 pub(crate) use metadata::{
     AdmissionTicketIssuer, AuthenticatedMetadataReply, BackupPublicationReader,

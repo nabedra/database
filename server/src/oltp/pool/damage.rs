@@ -29,6 +29,7 @@ use crate::{
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
 use nabedra_kv::{Damage, DamageReason, Durability, Store, WriteBatch};
+use nabedra_rt::fs::os as fs;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -138,7 +139,7 @@ impl DamageState {
             return;
         };
         let spawned =
-            nabedra_rt::task::spawn_service_with_stack("oltp-damage", nabedra_kv::THREAD_STACK_BYTES, move || {
+            nabedra_rt::task::spawn_oneshot("oltp-damage", nabedra_kv::THREAD_STACK_BYTES, move || {
                 let Some(inner) = pool.upgrade() else {
                     return;
                 };
@@ -170,7 +171,7 @@ pub(super) fn admit(
         .collect();
     let accepted = read_accepted(store)?.unwrap_or_default();
     let override_file = path.join(ACCEPT_DAMAGE_FILE);
-    let operator_accepts = override_file.exists();
+    let operator_accepts = fs::try_exists(&override_file).unwrap_or(false);
     let new: BTreeSet<Uuid> = if operator_accepts {
         BTreeSet::new()
     } else {
@@ -215,9 +216,9 @@ pub(super) fn persist_accepted(
 ) -> Result<(), ProtocolError> {
     write_accepted(store, accepted)?;
     let override_file = path.join(ACCEPT_DAMAGE_FILE);
-    if override_file.exists() {
-        std::fs::remove_file(&override_file)
-            .and_then(|_| std::fs::File::open(path).and_then(|dir| dir.sync_all()))
+    if fs::try_exists(&override_file).unwrap_or(false) {
+        fs::remove_file(&override_file)
+            .and_then(|_| fs::sync_dir(path))
             .map_err(|_| {
                 failure(
                     ErrorCode::StorageUnavailable,

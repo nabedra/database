@@ -1,0 +1,14 @@
+id = "lsm-campaign-sim"
+module = "lsm"
+kinds = ["S", "D"]
+guarantees = ["LSM-G01", "LSM-G02", "LSM-G03"]
+scenarios = ["LSM01", "NS04", "NS05"]
+tiers = ["T1"]
+# Fault model. The sim module runs the exhaustive NS04 smoke seed, the NS05
+# smoke seed, and the sampled sweep. Every run must match its second replay.
+command = ["cargo", "test", "--locked", "-j", "2", "-p", "nabedra-kv", "--features", "sim", "--test", "campaign", "sim::", "--", "--nocapture", "--test-threads=1"]
+cwd = "server"
+timeout_s = 1800
+needs = []
+result_parser = "cargo-test"
+env = { CARGO_TARGET_DIR = "target/sim", RUSTFLAGS = "--cfg tokio_unstable", NS10_SEED_BASE = "0", NS10_SEEDS = "200", NS10_STEPS = "400" }

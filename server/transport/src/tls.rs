@@ -1,9 +1,10 @@
 //! Mutual TLS material for worker peer transports. Only a CA-authenticated
 //! certificate and key pair can construct it; callers choose the ALPN list.
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject};
 use sha2::{Digest, Sha256};
 use std::{io, sync::Arc};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio::net::TcpStream;
+use tokio_rustls::{Accept, Connect, TlsAcceptor, TlsConnector};
 
 #[derive(Clone)]
 pub struct TlsMaterial {
@@ -60,19 +61,37 @@ impl TlsMaterial {
     pub fn certificate_sha256(&self) -> &str {
         &self.certificate_sha256
     }
-    /// Offer the protocols in preference order. The server selects the first
-    /// of its own list that the client offers, so an old peer that offers only
-    /// the one-shot protocol still negotiates it.
-    pub(super) fn transports(&self, alpn: &[&[u8]]) -> (TlsConnector, TlsAcceptor) {
-        let mut client = (*self.client).clone();
-        let mut server = (*self.server).clone();
-        client.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
-        server.alpn_protocols = client.alpn_protocols.clone();
-        (
-            TlsConnector::from(Arc::new(client)),
-            TlsAcceptor::from(Arc::new(server)),
-        )
-    }
+}
+
+/// Offer the protocols in preference order. The server selects the first of
+/// its own list that the client offers, including when an older peer offers
+/// only the one-shot protocol.
+#[doc(hidden)]
+pub fn peer_transports(material: &TlsMaterial, alpn: &[&[u8]]) -> (TlsConnector, TlsAcceptor) {
+    let mut client = (*material.client).clone();
+    let mut server = (*material.server).clone();
+    client.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
+    server.alpn_protocols = client.alpn_protocols.clone();
+    (
+        TlsConnector::from(Arc::new(client)),
+        TlsAcceptor::from(Arc::new(server)),
+    )
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn connect_peer(
+    connector: &TlsConnector,
+    name: ServerName<'static>,
+    socket: TcpStream,
+) -> Connect<TcpStream> {
+    connector.connect(name, socket)
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn accept_peer(acceptor: &TlsAcceptor, socket: TcpStream) -> Accept<TcpStream> {
+    acceptor.accept(socket)
 }
 
 fn hex(bytes: &[u8]) -> String {

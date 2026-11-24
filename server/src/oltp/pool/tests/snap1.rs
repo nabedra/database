@@ -205,7 +205,7 @@ async fn snap1_o11_ns10_crash_between_cut_and_transfer_leaves_nothing_on_reopen(
     let orphan = snapshot
         .path
         .with_file_name(format!("send-{}.bin", nabedra_rt::ids::uuid_v4()));
-    fs::copy(&snapshot.path, &orphan).unwrap();
+    std::fs::copy(&snapshot.path, &orphan).unwrap();
     drop(snapshot);
     drop(group);
     drop(pool);

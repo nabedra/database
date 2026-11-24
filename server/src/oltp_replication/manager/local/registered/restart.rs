@@ -62,16 +62,13 @@ impl RestartMount {
                 output.write_all(&seed).map_err(storage)?;
                 output.sync_all().map_err(storage)?;
                 fs::rename(temporary, &path).map_err(storage)?;
-                File::open(&owner.path)
-                    .and_then(|file| file.sync_all())
-                    .map_err(storage)?;
+                fs::sync_dir(&owner.path).map_err(storage)?;
                 seed
             }
             Err(error) => return Err(storage(error)),
         };
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
             let metadata = fs::symlink_metadata(&path).map_err(storage)?;
             if !metadata.is_file() || metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
                 return Err(invalid());

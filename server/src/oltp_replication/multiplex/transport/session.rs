@@ -1225,9 +1225,7 @@ async fn connect(
     .map_err(|_| RequestError::Unreachable)?;
     tune_socket(&socket);
     *phase = RaftTransportPhase::Tls;
-    let stream = common
-        .connector
-        .connect(name, socket)
+    let stream = connect_peer(&common.connector, name, socket)
         .await
         .map_err(|_| RequestError::Unreachable)?;
     let alpn = stream.get_ref().1.alpn_protocol();

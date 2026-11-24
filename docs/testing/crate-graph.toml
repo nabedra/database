@@ -77,6 +77,7 @@ normal = ["nabedra-rt"]
 
 [planned.nabedra-resources]
 normal = ["nabedra-rt", "nabedra-protocol"]
+dev = ["nabedra-check"]
 
 [planned.nabedra-oltp-types]
 normal = ["nabedra-protocol", "nabedra-resources"]
@@ -111,7 +112,7 @@ crate = "nabedra_oltp_replication"
 # Case 6: every `impl ...Proof for` block lives in the replication crate, so lower crates can take
 # a proof by trait but never forge one. The case runs once `requires` exists.
 [proofs]
-requires = "server/oltp-replication/Cargo.toml"
+requires = "server/oltp-replication/src/oltp_replication/mod.rs"
 allowed = ["server/oltp-replication/"]
 scan = ["server"]
 
@@ -121,7 +122,7 @@ scan = ["server"]
 # `literal` counts `crate::<module>` tokens with comments (the design's 2.1 method); `expanded`
 # strips comments and expands grouped imports, so `use crate::{a::B}` cannot hide an edge.
 [ratchet]
-sha = "53a5716f844aa9690739daed32fd335c68bc0f8a"
+sha = "148ed66e6ad298f3f107147a2c3813f8c0bc9aec"
 
 [ratchet.literal]
 "migration_interchange:*" = 0
@@ -140,8 +141,8 @@ sha = "53a5716f844aa9690739daed32fd335c68bc0f8a"
 "oltp_backup_repository:oltp_runtime" = 0
 "oltp_deployment:*" = 0
 "oltp_deployment:oltp_runtime" = 1
-"oltp_replication:*" = 18
-"oltp_replication:oltp_runtime" = 102
+"oltp_replication:*" = 17
+"oltp_replication:oltp_runtime" = 79
 "protocol:*" = 0
 "protocol:oltp" = 0
 "protocol:oltp_backup_repository" = 0
@@ -180,8 +181,8 @@ sha = "53a5716f844aa9690739daed32fd335c68bc0f8a"
 "oltp_backup_repository:oltp_runtime" = 0
 "oltp_deployment:*" = 0
 "oltp_deployment:oltp_runtime" = 1
-"oltp_replication:*" = 39
-"oltp_replication:oltp_runtime" = 136
+"oltp_replication:*" = 25
+"oltp_replication:oltp_runtime" = 113
 "protocol:*" = 0
 "protocol:oltp" = 0
 "protocol:oltp_backup_repository" = 0
@@ -196,7 +197,7 @@ sha = "53a5716f844aa9690739daed32fd335c68bc0f8a"
 "query_semantics:oltp_replication" = 0
 "query_semantics:oltp_runtime" = 0
 "query_semantics:scheduling" = 0
-"scheduling:*" = 1
+"scheduling:*" = 0
 "scheduling:oltp" = 0
 "scheduling:oltp_backup_repository" = 0
 "scheduling:oltp_deployment" = 0

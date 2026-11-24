@@ -260,8 +260,7 @@ impl ResourceScheduler {
     }
     /// Coordinator metadata/encoding stages use working RAM, outside the
     /// per-partition task limit. Leave headroom for ingress and child progress.
-    #[cfg(any(feature = "olap", test))]
-    pub(crate) async fn reserve_coordinator_memory(
+    pub async fn reserve_coordinator_memory(
         &self,
         request: u64,
         node: u64,
@@ -563,11 +562,14 @@ impl ResourceScheduler {
             .map(|(&id, n)| (id, n.threads, n.bytes + n.retained))
             .collect()
     }
-    #[cfg(feature = "oltp")]
-    pub(crate) fn oltp_capacity(&self, id: u64) -> Option<(u64, u64, WorkerResources)> {
+    pub fn oltp_capacity(&self, id: u64) -> Option<(u64, u64, WorkerResources)> {
         let state = self.shared.state.lock().ok()?;
         let node = state.nodes.get(&id)?;
-        Some((node.threads, node.bytes.checked_add(node.retained)?, node.limits))
+        Some((
+            node.threads,
+            node.bytes.checked_add(node.retained)?,
+            node.limits,
+        ))
     }
     /// Stop new reservations and wake all waiters, including storage downloads
     /// waiting only for memory. Existing owners retain their charges until drop.
@@ -863,7 +865,7 @@ fn resource() -> ProtocolError {
 
 // Budget checks at the active pool job boundary. Outside a compute job, existing codec limits apply.
 thread_local! {static TASK_LIMIT:std::cell::Cell<Option<u64>>=const {std::cell::Cell::new(None)};}
-pub(crate) fn with_task_limit<T>(bytes: u64, work: impl FnOnce() -> T) -> T {
+pub fn with_task_limit<T>(bytes: u64, work: impl FnOnce() -> T) -> T {
     struct Reset(Option<u64>);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -875,16 +877,14 @@ pub(crate) fn with_task_limit<T>(bytes: u64, work: impl FnOnce() -> T) -> T {
     drop(reset);
     result
 }
-#[cfg(feature = "olap")]
-pub(crate) fn check_task_memory(bytes: u64) -> Result<(), ProtocolError> {
+pub fn check_task_memory(bytes: u64) -> Result<(), ProtocolError> {
     if TASK_LIMIT.with(|limit| limit.get().is_some_and(|limit| bytes > limit)) {
         Err(resource())
     } else {
         Ok(())
     }
 }
-#[cfg(feature = "olap")]
-pub(crate) fn task_memory_limit() -> Option<u64> {
+pub fn task_memory_limit() -> Option<u64> {
     TASK_LIMIT.with(std::cell::Cell::get)
 }
 
