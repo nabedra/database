@@ -1,4 +1,4 @@
-{"schema":"nabedra.catalog/1","count":2734,"tests":[
+{"schema":"nabedra.catalog/1","count":2740,"tests":[
 {"file":"orm/python/tests/events/test_client.py","hash":"202d453fc9458842","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_ack_uses_exact_offset_and_rejects_foreign_delivery_before_request","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"1c426c67dd348a60","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_claim_reuses_uuid_after_missing_response","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"b8d2b5c0d984c70e","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_error_metadata_and_duplicate_fields","lang":"python"},
@@ -361,6 +361,10 @@
 {"file":"scripts/testing/ci/test_plan_checks.py","hash":"b45da71d6a255bae","id":"scripts/testing/ci/test_plan_checks.py::CheckMatrixTests::test_rejects_unregistered_ids_and_invalid_manifests","lang":"python"},
 {"file":"scripts/testing/ci/test_plan_fuzz.py","hash":"1969398df0c59f34","id":"scripts/testing/ci/test_plan_fuzz.py::FuzzMatrixTests::test_absent_fuzz_workspace_is_not_run","lang":"python"},
 {"file":"scripts/testing/ci/test_plan_fuzz.py","hash":"10136e734cbfe942","id":"scripts/testing/ci/test_plan_fuzz.py::FuzzMatrixTests::test_target_features_keep_incompatible_engines_separate","lang":"python"},
+{"file":"scripts/testing/ci/test_plan_pr_jobs.py","hash":"11ca829b64e56c3f","id":"scripts/testing/ci/test_plan_pr_jobs.py::PullRequestJobsTests::test_build_inputs_and_unclassified_paths_select_full_baseline","lang":"python"},
+{"file":"scripts/testing/ci/test_plan_pr_jobs.py","hash":"d9a3038c2bb4f405","id":"scripts/testing/ci/test_plan_pr_jobs.py::PullRequestJobsTests::test_documentation_and_simulation_only_changes_skip_baseline","lang":"python"},
+{"file":"scripts/testing/ci/test_plan_pr_jobs.py","hash":"8afe648c11fd5084","id":"scripts/testing/ci/test_plan_pr_jobs.py::PullRequestJobsTests::test_engine_only_changes_select_their_own_suites","lang":"python"},
+{"file":"scripts/testing/ci/test_plan_pr_jobs.py","hash":"451c3c59ce278110","id":"scripts/testing/ci/test_plan_pr_jobs.py::PullRequestJobsTests::test_suites_combine_across_paths_and_include_known_consumers","lang":"python"},
 {"file":"scripts/testing/ci/test_shard_tests.py","hash":"160b8b95e044658c","id":"scripts/testing/ci/test_shard_tests.py::ShardTests::test_empty_listing_does_not_select_the_full_suite","lang":"python"},
 {"file":"scripts/testing/ci/test_shard_tests.py","hash":"8e81c9f850bd6464","id":"scripts/testing/ci/test_shard_tests.py::ShardTests::test_shards_are_stable_disjoint_and_cover_every_suite","lang":"python"},
 {"file":"scripts/testing/kind/test_faults.py","hash":"2670369868d65629","id":"scripts/testing/kind/test_faults.py::KindFaultTests::test_delete_drain_pause_and_heal","lang":"python"},
@@ -415,6 +419,7 @@
 {"file":"scripts/testing/test_api_manifest.py","hash":"8731c439edb7154c","id":"scripts/testing/test_api_manifest.py::ApiManifestTests::test_rejects_unsynced_versions","lang":"python"},
 {"file":"scripts/testing/test_bugs.py","hash":"49c0803b1e21ac8e","id":"scripts/testing/test_bugs.py::BugRecordsTest::test_accepts_cache_and_lsm_register_ids","lang":"python"},
 {"file":"scripts/testing/test_bugs.py","hash":"8fce2e1103684f02","id":"scripts/testing/test_bugs.py::BugRecordsTest::test_accepts_open_record_without_fix","lang":"python"},
+{"file":"scripts/testing/test_bugs.py","hash":"31be5212be55b3c5","id":"scripts/testing/test_bugs.py::BugRecordsTest::test_default_clock_is_the_utc_date_of_now","lang":"python"},
 {"file":"scripts/testing/test_bugs.py","hash":"d5d02ed370bb5678","id":"scripts/testing/test_bugs.py::BugRecordsTest::test_empty_fix_commits_needs_open_status","lang":"python"},
 {"file":"scripts/testing/test_bugs.py","hash":"da946056d602207b","id":"scripts/testing/test_bugs.py::BugRecordsTest::test_expiry_uses_the_current_date_by_default","lang":"python"},
 {"file":"scripts/testing/test_bugs.py","hash":"c65675b46ff5adb7","id":"scripts/testing/test_bugs.py::BugRecordsTest::test_fixed_record_cannot_keep_open_fields","lang":"python"},
@@ -432,6 +437,7 @@
 {"file":"scripts/testing/test_bugs.py","hash":"1e577b8794bdfa50","id":"scripts/testing/test_bugs.py::BugRecordsTest::test_rejects_unknown_status","lang":"python"},
 {"file":"scripts/testing/test_bugs.py","hash":"25a6fd889cc3f58b","id":"scripts/testing/test_bugs.py::BugRecordsTest::test_shallow_clone_warns_instead_of_failing","lang":"python"},
 {"file":"scripts/testing/test_bugs.py","hash":"d8496c1513fa5020","id":"scripts/testing/test_bugs.py::BugRecordsTest::test_summary_does_not_count_open_records_as_fixed","lang":"python"},
+{"file":"scripts/testing/test_bugs.py","hash":"7b40804aa1494f71","id":"scripts/testing/test_bugs.py::BugRecordsTest::test_summary_lists_a_module_and_finder_with_only_open_records","lang":"python"},
 {"file":"scripts/testing/test_bugs.py","hash":"6af1bf992674158b","id":"scripts/testing/test_bugs.py::BugRecordsTest::test_unknown_is_not_a_fix_commit","lang":"python"},
 {"file":"scripts/testing/test_bugs.py","hash":"2cb9a7fcf4432786","id":"scripts/testing/test_bugs.py::BugRecordsTest::test_valid_record_and_markdown_counts","lang":"python"},
 {"file":"scripts/testing/test_build_times.py","hash":"8ec24b337b11875a","id":"scripts/testing/test_build_times.py::MainTests::test_a_failed_measurement_exits_2_and_still_writes_the_record","lang":"python"},
