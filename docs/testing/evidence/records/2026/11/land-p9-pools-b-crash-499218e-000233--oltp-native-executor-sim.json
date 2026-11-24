@@ -1,0 +1,52 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p9-pools-b-crash-499218e-000233--oltp-native-executor-sim.log",
+      "sha256": "4f9ddbd8fc79943bac65626c09ee5a1c2b7e6b1bc1129a30d8afae773fc58035"
+    }
+  ],
+  "assertions": {
+    "executed": 0,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "parser",
+        "reason": "no cargo-test summary line in the output (exit 101)"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-native-executor-sim",
+  "duration_s": 155.216,
+  "guarantees": [
+    "OLTP-G09",
+    "SCHED-G01"
+  ],
+  "kind": "S U",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T00:03:02.142576+00:00",
+    "request_id": "land-p9-pools-b-crash-499218e-000233",
+    "runner": "GitHub Actions 1000008759",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45293856146"
+  },
+  "scenarios": [
+    "C04",
+    "C06",
+    "F01",
+    "F02",
+    "F03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "499218eadc8a859d53eab1d0d2252392d7dbfd1a",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
