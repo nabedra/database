@@ -74,7 +74,7 @@ fn loses_a_publish(seed: u64, planted: bool, pauses: bool) -> bool {
         world.restart_with(1, Cut::Crash);
         acked > 0 && {
             let volume = world.volume(1, Path::new(DATA)).unwrap();
-            volume.contents(Path::new(&format!("{DATA}/v{acked}"))).is_none()
+            volume.contents(Path::new(&format!("{DATA}/v{acked}"))).is_err()
         }
     })
 }
