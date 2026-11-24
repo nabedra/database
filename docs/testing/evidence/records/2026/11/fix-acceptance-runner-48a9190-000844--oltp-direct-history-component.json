@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "fix-acceptance-runner-48a9190-000844--oltp-direct-history-component.log",
+      "sha256": "7642d6338b36b049c9eb79b7cad25f7b24755e2625d71a14bcf9525e8f9ae14e"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-direct-history-component",
+  "duration_s": 200.284,
+  "guarantees": [],
+  "kind": "H",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T23:19:20.006375+00:00",
+    "request_id": "fix-acceptance-runner-48a9190-000844",
+    "runner": "GitHub Actions 1000008568",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45286195650"
+  },
+  "scenarios": [
+    "D02",
+    "D03",
+    "O10"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "48a9190579473ad8ccf43d55b3c933deb3688c97",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

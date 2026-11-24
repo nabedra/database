@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "fix-acceptance-runner-48a9190-000844--rt-zero-cost.log",
+      "sha256": "683f8959f3b65bca5e8e14087fd8a68f3431737b07e3fa5263e2b2b36846c069"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "rt-zero-cost",
+  "duration_s": 1167.663,
+  "guarantees": [
+    "OLTP-G13"
+  ],
+  "kind": "P",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-23T23:44:22.668540+00:00",
+    "request_id": "fix-acceptance-runner-48a9190-000844",
+    "runner": "GitHub Actions 1000008697",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45286195650"
+  },
+  "scenarios": [
+    "O09"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "48a9190579473ad8ccf43d55b3c933deb3688c97",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
