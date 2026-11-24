@@ -163,9 +163,6 @@ pub(crate) async fn run(
             .violate(&cluster.world, "Liveness", format!("heal: {error}"));
         return abandon(cluster, &ctx, tasks, report).await;
     }
-    if let Some(moving) = moving.as_mut() {
-        moving.delay_ended(cluster);
-    }
     // Convergence may be polled for 30 s after the heal. Everything after it is sent once.
     let converged = converge(cluster, &ctx, healed + CONVERGE_LIMIT).await;
     report
@@ -233,7 +230,6 @@ pub(crate) async fn run(
                     .violate(&cluster.world, "Liveness", format!("replica move: {error}"))
             }
         }
-        report.scenarios.extend(std::mem::take(&mut moving.clauses));
         reread = true;
     }
     if reread && let Err(error) = clients::final_checks(&ctx).await {
@@ -254,6 +250,30 @@ pub(crate) async fn run(
             "Liveness",
             format!("request unresolved {CONVERGE_LIMIT:?} after the heal: {request}"),
         );
+    }
+    // The drain moves the replica once more, so it has its own convergence and final reads.
+    if let Some(moving) = moving.as_mut() {
+        if report.assertions.contains(&("replica move retired", true)) {
+            let drained = match moving.drain_pool(cluster, &ctx).await {
+                Ok(()) => {
+                    let limit = cluster.world.elapsed() + CONVERGE_LIMIT;
+                    converge(cluster, &ctx, limit).await
+                }
+                Err(error) => Err(error),
+            };
+            let checked = match drained {
+                Ok(()) => clients::final_checks(&ctx).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = checked {
+                cluster.checks.violate(
+                    &cluster.world,
+                    "Liveness",
+                    format!("draining the moved pool: {error}"),
+                );
+            }
+        }
+        report.scenarios.extend(std::mem::take(&mut moving.clauses));
     }
     if old_peer::selected(seed, workload, selection.focus.old_peer) {
         if converged.is_ok() && final_checks.is_ok() && cluster.converged().await {
@@ -282,7 +302,7 @@ pub(crate) async fn run(
         reuse_other_key: observed.reuse_other_key,
         session_drops: &drops,
         no_quorum: &no_quorum,
-        delayed: moving.as_ref().and_then(moves::Move::delayed),
+        moving: moving.as_ref().and_then(moves::Move::window),
         deadline_ms: config.deadline().as_millis() as u64,
     }
     .evaluate();
@@ -291,10 +311,10 @@ pub(crate) async fn run(
     }
     report.scenarios.extend(outcome.clauses);
 
-    let second = moving
+    let extra = moving
         .as_ref()
-        .and_then(|moving| moving.second_pool(&cluster.world));
-    let (stats, leftover) = settle(cluster, second).await?;
+        .map_or(Vec::new(), |moving| moving.extra_pools(&cluster.world));
+    let (stats, leftover) = settle(cluster, &extra).await?;
     if !selection.focus.idle {
         cluster.checks.check_direct_path(&cluster.world, &stats);
     }
@@ -305,7 +325,7 @@ pub(crate) async fn run(
         cluster.checks.violate(
             &cluster.world,
             "ResourceBaseline",
-            format!("n{node} keeps reservations in its second pool after quiescence: {row}"),
+            format!("n{node} keeps reservations in an added pool after quiescence: {row}"),
         );
     }
     // Last: a quarantined group stays quarantined, and its leader keeps a replication batch
@@ -448,11 +468,11 @@ async fn create_table(cluster: &Cluster, history: &Arc<Mutex<History>>) -> Resul
     }
 }
 
-/// Wait for transient resource gauges to return to their baseline, or 2 s. The second pool a
-/// move mounted has no row in the baseline, so it is split off: it must reserve nothing.
+/// Wait for transient resource gauges to return to their baseline, or 2 s. The pools a move
+/// mounted have no row in the baseline, so they are split off: they must reserve nothing.
 pub(crate) async fn settle(
     cluster: &Cluster,
-    second: Option<SecondPool>,
+    extra: &[ExtraPool],
 ) -> Result<(Vec<(u64, Value)>, Option<(u64, String)>), String> {
     let deadline = cluster.world.elapsed() + Duration::from_secs(2);
     loop {
@@ -461,12 +481,11 @@ pub(crate) async fn settle(
         let mut leftover = None;
         for node in WORKERS {
             let mut stats = cluster.stats(node).await?;
-            if let Some((moved, device)) = second
-                && moved == node
-                && let Some(rows) = stats["storage_reservations"].as_array_mut()
-            {
+            if let Some(rows) = stats["storage_reservations"].as_array_mut() {
                 rows.retain(|row| {
-                    let extra = row["device"] == device;
+                    let extra = extra
+                        .iter()
+                        .any(|&(moved, device)| moved == node && row["device"] == device);
                     if extra && (row["reserved_bytes"] != 0 || row["reservations"] != 0) {
                         leftover = Some((node, row.to_string()));
                     }
@@ -483,5 +502,5 @@ pub(crate) async fn settle(
     }
 }
 
-/// The node and device of the pool a replica move mounted.
-pub(crate) type SecondPool = (u64, u64);
+/// The node and device of a pool that a replica move mounted.
+pub(crate) type ExtraPool = (u64, u64);

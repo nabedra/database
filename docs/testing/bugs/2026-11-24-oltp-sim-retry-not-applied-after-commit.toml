@@ -1,0 +1,17 @@
+id = "OLTP-sim-retry-not-applied-after-commit"
+title = "A retry of a committed request is answered not_applied when its gateway cannot route it"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G04"]
+scenarios = ["D04", "O08"]
+found_by = "campaign"
+found_date = "2026-11-24"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 2
+why_not_caught = "The history checker reads not_applied as a statement about one attempt, and runners retry until a success."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=direct NABEDRA_SIM_PROFILE=crash-leader, seed 2 (NotAppliedNeverCommitted): an identity answered not_applied has no committed entry. Here request 347456a2. With the probes of #116, all 3 such refusals in 12 seeds were answered to a retry sent after the commit."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-23"

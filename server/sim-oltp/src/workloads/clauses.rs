@@ -198,8 +198,8 @@ pub(crate) struct Evidence<'a> {
     pub session_drops: &'a [u64],
     /// Intervals in which at least two of three workers were frozen or down.
     pub no_quorum: &'a [(u64, u64)],
-    /// When a replica move delayed the old voters' frames.
-    pub delayed: Option<(u64, u64)>,
+    /// When a replica move ran.
+    pub moving: Option<(u64, u64)>,
     /// The request deadline.
     pub deadline_ms: u64,
 }
@@ -406,7 +406,7 @@ impl Evidence<'_> {
                     let (from, to) = Self::window(fault);
                     fault.action == Action::SessionDrop || !attempt.overlaps(from, to)
                 }) && self
-                    .delayed
+                    .moving
                     .is_none_or(|(from, to)| !attempt.overlaps(from, to));
                 if !alone {
                     continue;
@@ -474,7 +474,7 @@ mod tests {
             reuse_other_key: 0,
             session_drops: &[],
             no_quorum,
-            delayed: None,
+            moving: None,
             deadline_ms: 300,
         }
         .evaluate()
@@ -557,7 +557,7 @@ mod tests {
             1_500,
             Answer::Refused(ErrorCode::StorageUnavailable),
         );
-        let run = |faults: &[Fault], delayed| {
+        let run = |faults: &[Fault], moving| {
             let evidence = Evidence {
                 faults,
                 attempts: std::slice::from_ref(&refused),
@@ -566,7 +566,7 @@ mod tests {
                 reuse_other_key: 0,
                 session_drops: &[1_400],
                 no_quorum: &[],
-                delayed,
+                moving,
                 deadline_ms: 300,
             };
             let out = evidence.evaluate();
@@ -575,7 +575,7 @@ mod tests {
         assert_eq!(run(&[], None), (1, 1));
         let partition = fault(Action::Partition, 1, 500, 2_000);
         assert_eq!(run(&[partition], None), (0, 0));
-        // Move seed 7: the move delayed every frame of the old voters by 177 ms.
+        // Move seed 7: the same refusals came with the drop and the delay switched off.
         assert_eq!(run(&[], Some((500, 2_000))), (0, 0));
         assert_eq!(run(&[], Some((2_000, 3_000))), (1, 1));
     }

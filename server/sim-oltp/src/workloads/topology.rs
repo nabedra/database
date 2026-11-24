@@ -181,7 +181,6 @@ enum Table {
     Main,
     Ranged,
     Victim,
-    Quiet,
 }
 
 impl Table {
@@ -190,7 +189,6 @@ impl Table {
             Table::Main => "main",
             Table::Ranged => "ranged",
             Table::Victim => "victim",
-            Table::Quiet => "quiet",
         }
     }
 }
@@ -470,7 +468,6 @@ impl Topo {
             Table::Main => &self.main,
             Table::Ranged => &self.ranged,
             Table::Victim => &self.victim,
-            Table::Quiet => unreachable!("the quiet table has its own stage"),
         }
     }
 
@@ -1599,9 +1596,6 @@ pub(crate) async fn run(
         judge(cluster, &t);
         return direct::abandon(cluster, &ctx, tasks, report).await;
     }
-    if let Some(moving) = moving.as_mut() {
-        moving.delay_ended(cluster);
-    }
     let mut converged = Ok(());
     for ctx in [Some(&t.main), Some(&t.ranged), moved.as_ref()] {
         let Some(ctx) = ctx else { continue };
@@ -1659,6 +1653,28 @@ pub(crate) async fn run(
                 .violate(&cluster.world, "Liveness", format!("replica move: {error}"));
         }
         report.scenarios.extend(std::mem::take(&mut moving.clauses));
+    }
+    let mut drained = Ok(());
+    if let (Some(moving), Some(moved), true) = (
+        moving.as_mut(),
+        moved.as_ref(),
+        report.assertions.contains(&("replica move retired", true)),
+    ) {
+        drained = match moving.drain_pool(cluster, moved).await {
+            Ok(()) => {
+                let limit = cluster.world.elapsed() + CONVERGE_LIMIT;
+                direct::converge(cluster, moved, limit).await
+            }
+            Err(error) => Err(error),
+        };
+        report.scenarios.extend(std::mem::take(&mut moving.clauses));
+    }
+    if let Err(error) = drained {
+        cluster.checks.violate(
+            &cluster.world,
+            "Liveness",
+            format!("draining the moved pool: {error}"),
+        );
     }
     let mut live = vec![
         (t.main.clone(), Table::Main),
@@ -1721,10 +1737,10 @@ pub(crate) async fn run(
         moving.as_ref(),
         &mut report,
     );
-    let second = moving
+    let extra = moving
         .as_ref()
-        .and_then(|moving| moving.second_pool(&cluster.world));
-    let (stats, leftover) = direct::settle(cluster, second).await?;
+        .map_or(Vec::new(), |moving| moving.extra_pools(&cluster.world));
+    let (stats, leftover) = direct::settle(cluster, &extra).await?;
     if !selection.focus.idle {
         cluster.checks.check_direct_path(&cluster.world, &stats);
     }
@@ -1735,7 +1751,7 @@ pub(crate) async fn run(
         cluster.checks.violate(
             &cluster.world,
             "ResourceBaseline",
-            format!("n{node} keeps reservations in its second pool after quiescence: {row}"),
+            format!("n{node} keeps reservations in an added pool after quiescence: {row}"),
         );
     }
     summarize(
@@ -2255,7 +2271,7 @@ fn clauses_of(
             scenarios.insert("D11:drop");
         }
     });
-    if let Some((from, to)) = moving.and_then(moves::Move::delayed)
+    if let Some((from, to)) = moving.and_then(moves::Move::window)
         && (committed(Table::Main, from, to) || committed(Table::Ranged, from, to))
     {
         scenarios.insert("O16:move-during-commits");
@@ -2309,7 +2325,7 @@ fn evaluate(
         reuse_other_key: other,
         session_drops: &drops,
         no_quorum: &no_quorum,
-        delayed: moving.and_then(moves::Move::delayed),
+        moving: moving.and_then(moves::Move::window),
         deadline_ms: config.deadline().as_millis() as u64,
     }
     .evaluate();
@@ -2317,6 +2333,32 @@ fn evaluate(
         cluster.checks.violate(&cluster.world, invariant, detail);
     }
     report.scenarios.extend(outcome.clauses);
+}
+
+/// An observation beside the verdict. The `direct` checks read every `conflict` as a key or
+/// body conflict, because nothing else conflicts on the direct path. A mutation that fell back
+/// to the queued path during a schema change can be refused with a `conflict` of its own. The
+/// verdict of the run keeps the strict reading; this counts those refusals, and the kinds that
+/// remain when they are read as any other definite refusal.
+fn without_schema_conflicts(history: &History) -> (u64, BTreeMap<String, u64>) {
+    let mut events = history.events().to_vec();
+    let mut conflicts = 0;
+    for event in &mut events {
+        let overtaken = event.key.is_some()
+            && event.value["code"] == "conflict"
+            && event.value["message"] == "captured schema or lifecycle changed";
+        if overtaken {
+            conflicts += 1;
+            event.value["code"] = json!("storage_unavailable");
+        }
+    }
+    let mut kinds = BTreeMap::new();
+    if conflicts > 0 {
+        for anomaly in nabedra_check::checker::direct::check(&events).anomalies {
+            *kinds.entry(anomaly.kind).or_default() += 1;
+        }
+    }
+    (conflicts, kinds)
 }
 
 fn summarize(
@@ -2330,8 +2372,11 @@ fn summarize(
     let counts = |actions: &BTreeMap<Action, u32>| -> BTreeMap<&'static str, u32> {
         actions.iter().map(|(a, n)| (a.name(), *n)).collect()
     };
+    let (ddl_conflicts, remaining) = without_schema_conflicts(&t.main.history.lock().unwrap());
     report.summary = t.log(|log| {
         json!({
+            "schema_conflicts": ddl_conflicts,
+            "anomalies_without_schema_conflicts": remaining,
             "workload": Workload::Topology.name(),
             "profile": chaos.map(Chaos::profile_name),
             "executed": chaos.map(|chaos| counts(&chaos.executed)),

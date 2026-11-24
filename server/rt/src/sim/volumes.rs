@@ -12,8 +12,8 @@
 //! cut reaches a disk image. [`World::restart_with`] replaces each volume by its `kill`,
 //! `crash` or power-loss image; files opened before the cut keep pointing at the halted
 //! old image and fail. Old node contexts and `NodeFs` handles cannot reopen paths on
-//! the replacement image. [`World::wipe`] replaces one volume by an empty one: the RV-REP #3
-//! condition, a wiped data volume next to a surviving key volume, is one call.
+//! the replacement image. [`World::wipe`] replaces one volume of a crashed node by an empty
+//! one: the RV-REP #3 condition, a wiped data volume next to a surviving key volume, is one call.
 
 #[cfg(unix)]
 use std::borrow::Cow;
@@ -55,7 +55,8 @@ pub enum Cut {
     PowerLoss4k { seed: u64 },
 }
 
-/// How [`World::wipe`] replaces a volume.
+/// How [`World::wipe`] replaces a volume. A new inode base is gentler than any real
+/// filesystem; [`World::set_mkfs_inodes`] gives the inode numbers `mkfs` does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wipe {
     /// Same device numbers, a new filesystem uuid, a new inode base and a new mount id.
@@ -91,6 +92,7 @@ struct TableState {
     volumes: BTreeMap<u64, Vec<Volume>>,
     next_minor: u32,
     next_mount_id: u64,
+    mkfs_inodes: bool,
     unmounted_errors: u64,
     #[cfg(unix)]
     next_descriptor: u64,
@@ -435,8 +437,24 @@ impl World {
             mount_id: 100 + table.next_mount_id,
             mount_path: path.to_path_buf(),
         };
+        if table.mkfs_inodes {
+            return (info, 0);
+        }
         // Inode bases are multiples of 2^20 below 2^44, far apart for any test volume.
         (info, (base >> 44) << 20)
+    }
+
+    /// Whether volumes created from now on ([`World::mount`], [`World::wipe`]) number their
+    /// inodes from the start, as `mkfs` does on every device. A reformat then repeats the
+    /// `(dev, ino)` of the mount root, and of every file recreated in the same order, and a
+    /// replaced or second volume repeats the inode numbers under its own device. Only the
+    /// filesystem uuid and the mount id tell a reformatted volume from the old one.
+    ///
+    /// Off by default: every volume then has its own inode base, which no real filesystem
+    /// gives it, so a check that trusts an inode number alone looks sound. Seeded draws are
+    /// the same either way.
+    pub fn set_mkfs_inodes(&self, on: bool) {
+        lock(&self.volumes.state).mkfs_inodes = on;
     }
 
     fn new_volume(&self, node: u64, info: VolumeInfo, ino_base: u64) -> Volume {
@@ -541,13 +559,20 @@ impl World {
         self.restart(node);
     }
 
-    /// Replaces the volume mounted at `path` on `node` with an empty one. The old image is
-    /// halted, so files still open on it fail.
+    /// Replaces the volume mounted at `path` on a crashed `node` with an empty one. The old
+    /// image is halted, so files still open on it fail.
     ///
     /// # Panics
     ///
-    /// If there is no such volume.
+    /// If there is no such volume, or `node` is up: paths resolve on each call, so a live
+    /// process would carry on against the empty volume as if nothing had happened, which
+    /// no real disk loss allows. Crash the node first.
     pub fn wipe(&self, node: u64, path: &Path, how: Wipe) {
+        assert!(
+            !self.is_up(node),
+            "node {node} is up: crash it before wiping {}",
+            path.display()
+        );
         let (old_info, old_fs) = self
             .volumes
             .find(node, path, |volume| {
@@ -560,7 +585,7 @@ impl World {
             Wipe::Replace => None,
         };
         let (info, mut base) = self.new_identity(path, minor);
-        if base == old_fs.ino_base() {
+        if base == old_fs.ino_base() && !lock(&self.volumes.state).mkfs_inodes {
             base += 1 << 20;
         }
         let volume = self.new_volume(node, info, base);

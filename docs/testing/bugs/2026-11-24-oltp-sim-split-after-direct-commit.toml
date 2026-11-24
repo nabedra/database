@@ -1,0 +1,17 @@
+id = "OLTP-sim-split-after-direct-commit"
+title = "A manual split of a range with direct commits never publishes: the source refuses the freeze with DirectCommitAboveCut"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = []
+scenarios = ["D07"]
+found_by = "campaign"
+found_date = "2026-11-24"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 1
+why_not_caught = "No runner splits a range that has taken direct commits while the direct path stays on."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=direct NABEDRA_SIM_PROFILE=split, seeds 1 and 2: a requested split publishes within 60 s of the heal."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-23"
