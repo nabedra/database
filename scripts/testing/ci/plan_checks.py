@@ -9,7 +9,7 @@ import re
 import tomllib
 
 
-NEEDS = {"docker", "kind", "node", "python-orm", "rust-nightly", "s3", "valkey"}
+NEEDS = {"docker", "kind", "node", "python-orm", "rust-nightly", "s3", "tlc", "valkey"}
 # Setup, tool installation and the check's own build come on top of its timeout_s.
 SETUP_MINUTES = 30
 MAX_JOB_MINUTES = 360

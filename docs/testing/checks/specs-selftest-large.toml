@@ -1,0 +1,15 @@
+# The T2 form of the self-test: TwoPhase.large.cfg as a seeded TLC simulation, labelled as simulation.
+id = "specs-selftest-large"
+module = "testing"
+kinds = ["T"]
+guarantees = []
+scenarios = []
+tiers = ["T2"]
+command = [
+  "python3", "scripts/testing/tla_check.py", "specs/selftest", "TwoPhase", "--module", "testing",
+  "--tier", "T2", "--simulate", "--seed", "1", "--num", "20000", "--depth", "60",
+]
+cwd = "."
+timeout_s = 1800
+needs = ["tlc"]
+result_parser = "tlc"

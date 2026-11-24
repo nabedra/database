@@ -263,16 +263,20 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          # The changed files decide whether the Design: line is required.
+          fetch-depth: 0
           persist-credentials: false
       - name: Lint the pull request body
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           if [ ! -f scripts/testing/pr_lint.py ]; then
             echo "PR body lint not-run: pr_lint.py is absent." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          python3 scripts/testing/pr_lint.py
+          python3 scripts/testing/pr_lint.py --base "$BASE" --head "$HEAD"
 
   select:
     name: Select checks for the diff (non-blocking)
@@ -374,6 +378,32 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends valkey-server
           sudo systemctl stop valkey-server
+      # Kind T checks: the pinned TLC and Apalache image (specs/tools). Its tag hashes the Dockerfile and
+      # versions.toml, and the saved image follows the cache rule above (saved from main dispatches).
+      - name: Restore the pinned TLC image
+        id: tlc-cache
+        if: contains(matrix.tools, 'tlc')
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/tlc-image.tar
+          key: tlc-image-${{ hashFiles('specs/tools/Dockerfile', 'specs/tools/versions.toml') }}
+      - name: Load or build the pinned TLC image
+        if: contains(matrix.tools, 'tlc')
+        env:
+          CACHE_HIT: ${{ steps.tlc-cache.outputs.cache-hit }}
+        run: |
+          if [ -f "$RUNNER_TEMP/tlc-image.tar" ]; then docker load -i "$RUNNER_TEMP/tlc-image.tar"; fi
+          tag=$(specs/tools/tlc --tla-ensure)
+          echo "TLC image: \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$CACHE_HIT" != true ] && [ "$SAVE_CACHE" = true ]; then
+            docker save -o "$RUNNER_TEMP/tlc-image.tar" "$tag"
+          fi
+      - name: Save the pinned TLC image
+        if: contains(matrix.tools, 'tlc') && steps.tlc-cache.outputs.cache-hit != 'true' && env.SAVE_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/tlc-image.tar
+          key: tlc-image-${{ hashFiles('specs/tools/Dockerfile', 'specs/tools/versions.toml') }}
       - name: Assume the test bucket role
         if: contains(matrix.tools, 's3') && env.NABEDRA_TEST_S3_BUCKET != ''
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
@@ -402,6 +432,7 @@ jobs:
           path: |
             evidence/
             target/testing-logs/
+            target/tla/
           retention-days: 14
       - name: Attest the evidence records
         if: ${{ !cancelled() && hashFiles('evidence/**/*.json') != '' }}

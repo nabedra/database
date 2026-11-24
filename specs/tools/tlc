@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Run TLC or Apalache from the pinned image, building the image on first use.
+
+  specs/tools/tlc [wrapper options] <tlc args>          TLC (tlc2.TLC)
+  specs/tools/apalache-mc [wrapper options] <args>      Apalache (a link to this script)
+  specs/tools/tlc --tla-ensure                          build or reuse the image, print its tag
+  specs/tools/tlc --tla-image                           print the image tag only
+
+Run it from a folder inside specs/. The image is specs/tools/Dockerfile built with the versions in
+specs/tools/versions.toml, tagged `nabedra-tla:<hash of both files>`, so a version change builds a new
+image and an unchanged pair reuses the one already loaded (locally, or from the Actions cache). The
+container mounts specs/ read-only at /specs and starts in the matching folder, so specs/lib is on the
+library path. Docker is the only host requirement, the same locally and on GitHub Actions.
+
+Wrapper options come before the tool's own arguments:
+  --tla-out DIR      mount DIR read-write at /out (logs, -dumpTrace files, -metadir)
+  --tla-traces DIR   mount DIR read-only at /traces
+  --tla-name NAME    container name, so a caller can `docker kill` it
+TRACE_PATH is passed through. NABEDRA_TLC_HEAP (default 2g) sets the JVM heap, and
+NABEDRA_TLC_JAVA_OPTS adds JVM options, such as -Dtlc2.TLC.stopAfter=<seconds>. Without -metadir, TLC keeps its state
+files inside the container, and without -teSpecOutDir it writes no trace-exploration spec, because
+specs/ is read-only.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+TOOLS = Path(__file__).resolve().parent
+SPECS = TOOLS.parent
+VERSIONS = TOOLS / "versions.toml"
+DOCKERFILE = TOOLS / "Dockerfile"
+
+
+def versions() -> dict:
+    return tomllib.loads(VERSIONS.read_text(encoding="utf-8"))
+
+
+def image_tag() -> str:
+    override = os.environ.get("NABEDRA_TLA_IMAGE")
+    if override:
+        return override
+    digest = hashlib.sha256(DOCKERFILE.read_bytes() + b"\0" + VERSIONS.read_bytes()).hexdigest()
+    return f"nabedra-tla:{digest[:16]}"
+
+
+def build_args() -> list[str]:
+    v = versions()
+    pairs = {
+        "BASE_IMAGE": v["base"]["image"],
+        "TLC_VERSION": v["tlc"]["version"], "TLC_URL": v["tlc"]["url"], "TLC_SHA256": v["tlc"]["sha256"],
+        "CM_VERSION": v["community_modules"]["version"], "CM_URL": v["community_modules"]["url"],
+        "CM_SHA256": v["community_modules"]["sha256"],
+        "APALACHE_VERSION": v["apalache"]["version"], "APALACHE_URL": v["apalache"]["url"],
+        "APALACHE_SHA256": v["apalache"]["sha256"],
+    }
+    out = []
+    for key, value in pairs.items():
+        out += ["--build-arg", f"{key}={value}"]
+    return out
+
+
+def ensure_image(quiet: bool = False) -> str:
+    tag = image_tag()
+    present = subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode == 0
+    if present:
+        return tag
+    if os.environ.get("NABEDRA_TLA_IMAGE"):
+        raise SystemExit(f"tlc: image {tag} (NABEDRA_TLA_IMAGE) is not loaded")
+    print(f"tlc: building {tag} from {DOCKERFILE}", file=sys.stderr)
+    cmd = ["docker", "build", "-t", tag, *build_args(), "-f", str(DOCKERFILE), str(TOOLS)]
+    result = subprocess.run(cmd, stdout=sys.stderr if not quiet else subprocess.DEVNULL, stderr=sys.stderr)
+    if result.returncode != 0:
+        raise SystemExit(f"tlc: docker build failed with status {result.returncode}")
+    return tag
+
+
+def main(argv: list[str]) -> int:
+    tool = "apalache-mc" if Path(sys.argv[0]).name.startswith("apalache") else "tlc"
+    out_dir = traces = name = None
+    args = list(argv)
+    while args and args[0].startswith("--tla-"):
+        opt = args.pop(0)
+        if opt == "--tla-image":
+            print(image_tag())
+            return 0
+        if opt == "--tla-ensure":
+            print(ensure_image())
+            return 0
+        if opt in ("--tla-out", "--tla-traces", "--tla-name"):
+            if not args:
+                raise SystemExit(f"tlc: {opt} needs a value")
+            value = args.pop(0)
+            if opt == "--tla-out":
+                out_dir = Path(value).resolve()
+                out_dir.mkdir(parents=True, exist_ok=True)
+            elif opt == "--tla-traces":
+                traces = Path(value).resolve()
+            else:
+                name = value
+            continue
+        raise SystemExit(f"tlc: unknown wrapper option {opt}")
+
+    cwd = Path.cwd().resolve()
+    try:
+        rel = cwd.relative_to(SPECS.resolve())
+    except ValueError:
+        raise SystemExit(f"tlc: run it from a folder inside {SPECS} (now in {cwd})")
+    tag = ensure_image()
+    if tool == "tlc":
+        if "-metadir" not in args:
+            args = ["-metadir", "/tmp/tlc-states", *args]
+        if "-teSpecOutDir" not in args and "-noGenerateSpecTE" not in args:
+            args = ["-noGenerateSpecTE", *args]
+    elif out_dir is not None and args and not any(a.startswith("--out-dir") for a in args):
+        args = [args[0], "--out-dir=/out/apalache", *args[1:]]
+
+    heap = os.environ.get("NABEDRA_TLC_HEAP", "2g")
+    java_opts = " ".join(filter(None, [f"-Xmx{heap}", os.environ.get("NABEDRA_TLC_JAVA_OPTS", "")]))
+    cmd = ["docker", "run", "--rm", "--init", "-u", f"{os.getuid()}:{os.getgid()}",
+           "-v", f"{SPECS.resolve()}:/specs:ro",
+           "-w", "/specs" if rel.as_posix() == "." else f"/specs/{rel.as_posix()}",
+           "-e", f"JAVA_TOOL_OPTIONS={java_opts}"]
+    if out_dir is not None:
+        cmd += ["-v", f"{out_dir}:/out"]
+    if traces is not None:
+        cmd += ["-v", f"{traces}:/traces:ro"]
+    if name:
+        cmd += ["--name", name]
+    if "TRACE_PATH" in os.environ:
+        cmd += ["-e", f"TRACE_PATH={os.environ['TRACE_PATH']}"]
+    cmd += [tag, tool, *args]
+    return subprocess.run(cmd).returncode
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

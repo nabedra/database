@@ -39,8 +39,8 @@ MODULES_PATH = REPO_ROOT / "docs" / "testing" / "modules.toml"
 DEFAULT_LOG_DIR = REPO_ROOT / "target" / "testing-logs"
 
 TIERS = ("T0", "T1", "T2", "T3", "weekly")
-NEEDS = ("docker", "kind", "s3", "rust-nightly", "node", "python-orm", "valkey")
-PARSERS = ("cargo-test", "unittest", "node-test", "exit-code")
+NEEDS = ("docker", "kind", "s3", "rust-nightly", "node", "python-orm", "valkey", "tlc")
+PARSERS = ("cargo-test", "unittest", "node-test", "exit-code", "tlc")
 GUARANTEE_RE = re.compile(r"^[A-Z]+(-[A-Z]+)*-G[0-9]{2}$")
 ID_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 FIELDS = {
@@ -140,6 +140,8 @@ def parse_check(data: dict, path: Path | None = None, modules: set[str] | None =
             problems.append(f"unknown need {need!r} (known: {', '.join(NEEDS)})")
     if check.result_parser not in PARSERS:
         problems.append(f"result_parser must be one of {list(PARSERS)}")
+    if "T" in check.kinds and (check.result_parser != "tlc" or "tlc" not in check.needs):
+        problems.append('a kind T check needs result_parser = "tlc" and needs = ["tlc"]')
     if not all(isinstance(k, str) and isinstance(v, str) for k, v in check.env.items()):
         problems.append("env values must be strings")
     if check.not_run_marker is not None and (
@@ -173,6 +175,12 @@ def _succeeds(cmd: list[str], timeout: float = 30.0, env: dict | None = None) ->
         return False
 
 
+def _tlc(env: dict[str, str]) -> bool:
+    """The pinned TLC image is loaded, or Docker can build it (specs/tools/tlc --tla-ensure)."""
+    wrapper = REPO_ROOT / "specs" / "tools" / "tlc"
+    return wrapper.exists() and _succeeds([str(wrapper), "--tla-ensure"], timeout=900, env=env)
+
+
 def _python_orm(env: dict[str, str]) -> bool:
     src = REPO_ROOT / "orm" / "python" / "src"
     child_env = dict(env, PYTHONPATH=os.pathsep.join(filter(None, [str(src), env.get("PYTHONPATH", "")])))
@@ -188,6 +196,8 @@ NEED_PROBES: dict[str, tuple[str, Callable[[dict[str, str]], bool]]] = {
     "python-orm": ("python-orm-unavailable: `import nabedra` from orm/python/src failed", _python_orm),
     "valkey": ("valkey-unavailable: no `valkey-server` on PATH and NABEDRA_TEST_VALKEY_URL unset",
                lambda env: bool(env.get("NABEDRA_TEST_VALKEY_URL")) or shutil.which("valkey-server", path=env.get("PATH")) is not None),
+    "tlc": ("tlc-unavailable: the pinned TLC image is not loaded and `specs/tools/tlc --tla-ensure` failed "
+            "(Docker unavailable or the image build failed)", _tlc),
 }
 
 
@@ -210,6 +220,8 @@ class Parsed:
     failed: int
     not_run: list[dict]
     found: bool  # False when the output has no summary line at all
+    verdict: str | None = None  # set by parsers whose tool reports its own result (tlc)
+    extra: dict = field(default_factory=dict)  # tool facts for the record (tlc: `tla`, `artifacts`)
 
 
 _CARGO = re.compile(
@@ -275,11 +287,39 @@ def parse_exit_code(output: str, returncode: int) -> Parsed:
     return Parsed(1, 0 if returncode == 0 else 1, [], True)
 
 
+_TLA_SUMMARY = "nabedra-tla-summary: "
+
+
+def parse_tlc(output: str, returncode: int) -> Parsed:
+    """Reads the last `nabedra-tla-summary: {json}` line of tla_check.py or tla_trace.py."""
+    summary = None
+    for line in output.splitlines():
+        if line.startswith(_TLA_SUMMARY):
+            try:
+                summary = json.loads(line[len(_TLA_SUMMARY):])
+            except json.JSONDecodeError:
+                continue
+    if not isinstance(summary, dict):
+        return Parsed(0, 0, [], False)
+    try:
+        executed, failed = int(summary["executed"]), int(summary["failed"])
+        verdict = summary["verdict"]
+    except (KeyError, TypeError, ValueError):
+        return Parsed(0, 0, [], False)
+    not_run = [
+        {"id": str(n.get("id", ""))[:200], "reason": str(n.get("reason", ""))[:300]}
+        for n in summary.get("not_run", []) if isinstance(n, dict)
+    ]
+    extra = {k: summary[k] for k in ("tla", "artifacts") if isinstance(summary.get(k), (dict, list))}
+    return Parsed(executed, failed, not_run, True, verdict if verdict in evidence.RESULTS else None, extra)
+
+
 PARSER_FUNCS = {
     "cargo-test": parse_cargo_test,
     "unittest": parse_unittest,
     "node-test": parse_node_test,
     "exit-code": parse_exit_code,
+    "tlc": parse_tlc,
 }
 
 
@@ -298,6 +338,14 @@ def classify(parser: str, output: str, returncode: int | None, timed_out: bool =
     if not parsed.found:
         parsed.not_run.append({"id": "parser", "reason": f"no {parser} summary line in the output (exit {returncode})"})
         return "fail", parsed
+    # A tool that reports its own result: a stop at a budget or cap is not-run, never pass.
+    if parsed.verdict in ("not-run", "error") and parsed.failed == 0:
+        if parsed.verdict == "not-run" and not parsed.not_run:
+            parsed.not_run.append({"id": "tool", "reason": "the tool reported not-run"})
+        return parsed.verdict, parsed
+    if parsed.verdict == "fail" and parsed.failed == 0:
+        parsed.not_run.append({"id": "tool", "reason": "the tool reported fail with no failed assertion"})
+        return "error", parsed
     if parsed.failed > 0:
         return "fail", parsed
     if returncode != 0:
@@ -392,11 +440,14 @@ def execute(check: Check, *, evidence_dir: Path | None, log_dir: Path, request_i
         result, parsed = classify(check.result_parser, output, code, timed_out, check.not_run_marker)
         s3_requests = evidence.parse_s3_requests(output)
         artifacts.append({"name": log_path.name, "sha256": evidence.sha256_file(log_path)})
+        artifacts.extend(a for a in parsed.extra.get("artifacts", [])[:40] if isinstance(a, dict))
+    tla = parsed.extra.get("tla") if not missing else None
     record = evidence.new_record(
         check.id, check.kinds, result=result, executed=parsed.executed, failed=parsed.failed,
         not_run=parsed.not_run[:200], guarantees=check.guarantees, scenarios=check.scenarios,
         duration_s=time.monotonic() - start, run=run, artifacts=artifacts, repo=repo,
-        s3_requests=s3_requests,
+        s3_requests=s3_requests, tla=tla,
+        mode={"tla": tla["mode"]} if isinstance(tla, dict) and isinstance(tla.get("mode"), str) else None,
     )
     path = evidence.write(record, evidence_dir)
     return record, path
