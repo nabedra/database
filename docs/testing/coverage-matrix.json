@@ -7,7 +7,7 @@
       "K03 simulated controller disk loss is `not-run` pending modelled Raft storage."
     ]
   },
-  "head": "d1a56fbe765d0a86cc765cc3f9301cc0a5470f4e",
+  "head": "4e02e1db89eca062e5558eda4afd8fa2e053b7a2",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -2917,7 +2917,7 @@
           "state": "n/a"
         }
       },
-      "guarantee": "Each request identity executes once, cluster-wide on the queued path and per table and key on the direct path.",
+      "guarantee": "Each request identity executes once, cluster-wide on the queued path and per table and key on the direct path. On the direct path, a retry of a mutation with the same request ID and body returns the first definite result of that identity, including a no-op or row conflict, while its dedup record is retained.",
       "id": "OLTP-G03",
       "level": "L3",
       "module": "oltp",
