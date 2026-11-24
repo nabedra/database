@@ -12,8 +12,8 @@
 //! cut reaches a disk image. [`World::restart_with`] replaces each volume by its `kill`,
 //! `crash` or power-loss image; files opened before the cut keep pointing at the halted
 //! old image and fail. Old node contexts and `NodeFs` handles cannot reopen paths on
-//! the replacement image. [`World::wipe`] replaces one volume by an empty one: the RV-REP #3
-//! condition, a wiped data volume next to a surviving key volume, is one call.
+//! the replacement image. [`World::wipe`] replaces one volume of a crashed node by an empty
+//! one: the RV-REP #3 condition, a wiped data volume next to a surviving key volume, is one call.
 
 #[cfg(unix)]
 use std::borrow::Cow;
@@ -541,13 +541,20 @@ impl World {
         self.restart(node);
     }
 
-    /// Replaces the volume mounted at `path` on `node` with an empty one. The old image is
-    /// halted, so files still open on it fail.
+    /// Replaces the volume mounted at `path` on a crashed `node` with an empty one. The old
+    /// image is halted, so files still open on it fail.
     ///
     /// # Panics
     ///
-    /// If there is no such volume.
+    /// If there is no such volume, or `node` is up: paths resolve on each call, so a live
+    /// process would carry on against the empty volume as if nothing had happened, which
+    /// no real disk loss allows. Crash the node first.
     pub fn wipe(&self, node: u64, path: &Path, how: Wipe) {
+        assert!(
+            !self.is_up(node),
+            "node {node} is up: crash it before wiping {}",
+            path.display()
+        );
         let (old_info, old_fs) = self
             .volumes
             .find(node, path, |volume| {

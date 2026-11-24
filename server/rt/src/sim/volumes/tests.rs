@@ -375,7 +375,9 @@ fn a_wipe_replaces_one_volume_and_keeps_the_others() {
             ((meta.dev(), meta.ino()), open)
         })
         .await;
+        world.crash(1);
         world.wipe(1, Path::new("/sim/n1/data"), Wipe::Reformat);
+        world.restart_with(1, Cut::Kill);
         let after = world.volume_info(1, Path::new("/sim/n1/data")).unwrap();
         let old = &infos[1];
         assert_eq!(
@@ -403,11 +405,54 @@ fn a_wipe_replaces_one_volume_and_keeps_the_others() {
             recreated.1, anchor.1,
             "a reformat must not reuse inode numbers (P5)"
         );
+        world.crash(1);
         world.wipe(1, Path::new("/sim/n1/data"), Wipe::Replace);
         let replaced = world.volume_info(1, Path::new("/sim/n1/data")).unwrap();
         assert_ne!(replaced.dev, after.dev);
         assert_eq!(world.mounts(1), vec![p("/sim/n1/keys"), p("/sim/n1/data")]);
     });
+}
+
+/// A process whose disk went away, then came back empty, under the incarnation that
+/// committed `identity`. It returns whether that incarnation ran on against the new disk.
+fn loses_its_disk(crash_first: bool) -> std::thread::Result<bool> {
+    std::panic::catch_unwind(|| {
+        run(19, move |world| async move {
+            node_with(&world, 1, &["/sim/n1/data"]);
+            let data = Path::new("/sim/n1/data");
+            let process = world.spawn_node(1, async {
+                os::write("/sim/n1/data/identity", b"id").unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                os::write("/sim/n1/data/after", b"on an empty disk").is_ok()
+                    && !os::try_exists("/sim/n1/data/identity").unwrap()
+            });
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            if crash_first {
+                world.crash(1);
+            }
+            world.wipe(1, data, Wipe::Reformat);
+            if crash_first {
+                world.restart(1);
+            }
+            process.await.unwrap_or(false)
+        })
+    })
+}
+
+/// Finding 5 of the fault-model review. The planted defect is a harness that wipes a live
+/// node: before the assertion the live incarnation silently ran on against the empty disk.
+#[test]
+fn a_wipe_refuses_a_live_node() {
+    let panic = loses_its_disk(false).expect_err("a harness wiped a live node unnoticed");
+    let text = panic.downcast_ref::<String>().unwrap();
+    assert!(
+        text.contains("node 1 is up: crash it before wiping"),
+        "{text}"
+    );
+    assert!(
+        !loses_its_disk(true).unwrap(),
+        "the crashed process survived"
+    );
 }
 
 #[test]
@@ -461,6 +506,7 @@ fn volume_calls_cuts_and_wipes_are_observed_in_order() {
             on(1, || os::write("/sim/n1/data/f", b"x").unwrap()).await;
             world.restart_with(1, Cut::PowerLoss { seed });
             on(1, || os::try_exists("/sim/n1/data/f").unwrap()).await;
+            world.crash(1);
             world.wipe(1, Path::new("/sim/n1/data"), Wipe::Reformat);
             events.lock().unwrap().clone()
         })
