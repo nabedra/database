@@ -546,6 +546,17 @@ class CheckTests(unittest.TestCase):
             _, summary, _ = self.check(str(self.good))
         self.assertEqual([a["name"] for a in summary["artifacts"][:4]],
                          ["tla/summary.json", "tla/control.log", "tla/trace-002.log", "tla/a.log"])
+        # A trace rejected at another line than its name says.
+        shutil.rmtree(self.root / "out")
+        wrong = self.root / "wrong"
+        wrong.mkdir()
+        shutil.copy(REJECTED, wrong / "a.at-6.ndjson")
+        shutil.copy(REJECTED, wrong / "b.at-6.at-5.ndjson")
+        code, summary, text = self.check(str(self.good), "--expect-rejected", str(wrong))
+        self.assertEqual(summary["failed"], 1, text)
+        self.assertIn("rejected at index 6, expected 5", text)
+        last = sorted(n for n in (a["name"] for a in summary["artifacts"]) if "trace-" in n)[-1]
+        self.assertEqual(summary["artifacts"][1]["name"], last)
         code, summary, text = self.mutant("\\* expect: accepted")
         self.assertEqual(summary["failed"], 1, text)
         self.assertEqual(summary["artifacts"][1]["name"], "tla/mutant-m.log")

@@ -428,6 +428,23 @@ class FitRecordTests(unittest.TestCase):
         self.assertTrue(not_run[-1]["reason"].startswith(f"{300 - kept} more not-run entries"))
         self.assertEqual([a["name"] for a in record["artifacts"][:2]], ["x.log", "tla/summary.json"])
 
+    def test_refused_facts_do_not_cost_artifacts(self):
+        # Fitting the facts drops artifacts. Without the facts they fit, so they come back.
+        record = t_record(failed=50, mutants=[mutant(i, ok=False, name="n" * 110 + "{:02d}") for i in range(50)], nonsense=1,
+                          artifacts=[artifact(f"a{i:02d}.log") for i in range(45)] + [artifact("summary.json")])
+        run_check.ensure_valid(record)
+        self.assertEqual(run_check.evidence.validate(record), [])
+        self.assertEqual(len(record["artifacts"]), 47)
+
+    def test_artifacts_of_a_failure_go_after_caught_mutants(self):
+        arts = [artifact("summary.json"), *(artifact(f"mutant-m{i:02d}.{k}") for i in range(24) for k in ("cex.json", "log"))]
+        record = t_record(mutants=[mutant(i, ok=i >= 24, detail=0) for i in range(50)], artifacts=arts, failed=24,
+                          unmutated=["U" * 110 for _ in range(50)])
+        self.fit(record)
+        self.assertGreater(self.dropped["mutants"], 0)
+        self.assertEqual(len(self.names), 50)  # every one belongs to a failure
+        self.assertNotIn("artifacts", self.dropped)
+
     def test_more_limits_than_the_schema_allows(self):
         record = t_record(limits=[f"X.cfg: CONSTRAINT C{i}" for i in range(53)])
         self.fit(record)

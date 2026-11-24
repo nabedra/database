@@ -136,8 +136,13 @@ class DesignLineTests(unittest.TestCase):
             with self.subTest(fences):
                 text = "# P\n\n~~~\n```\n~~~\n" + body
                 self.assertEqual(pr_lint.design_section(text, fences), "## Design review\n\nVerdict: not-run")
-                text = "# P\n\n```tlc X```\n" + body
-                self.assertEqual(pr_lint.design_section(text, fences), "## Design review\n\nVerdict: not-run")
+                for start in ("```tlc X```\n", "```\nx\n``` y\n# z\n```\n"):
+                    self.assertEqual(pr_lint.design_section("# P\n\n" + start + body, fences),
+                                     "## Design review\n\nVerdict: not-run")
+        # Only the loose reading sees this one: the first fence hides the heading, or the comment ends the section.
+        both = "# P\n- a\n\n  ```\n  x\n    ```\n## Design review\n```sh\n# c\n```\n"
+        self.assertNotEqual(pr_lint.design_sections(both + "Verdict: not-run\n"),
+                            pr_lint.design_sections(both + "Verdict: pass\n"))
         # Inside the section, a fence that the strict reading never closes does not end it early either.
         inside = "# P\n## Design review\n- a\n\n  ```\n  x\n    ```\n# z\n"
         self.assertNotEqual(pr_lint.design_sections(inside + "Verdict: not-run\n"),
@@ -181,6 +186,28 @@ class DesignLineTests(unittest.TestCase):
                                            text=True, check=True).stdout.strip())
             with patch.object(pr_lint, "REPO_ROOT", root):
                 self.assertEqual(pr_lint.changed_from_git(*shas[2:]), (["plans/p.md"], ["plans/p.md"]))
+
+    def test_a_rename_counts_as_both_paths(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            old, new = root / "server/events/src/a.rs", root / "notes/a.rs"
+            old.parent.mkdir(parents=True)
+            new.parent.mkdir()
+            old.write_text("fn a() {}\n" * 20)
+            shas = []
+            for step in (lambda: None, lambda: old.rename(new)):
+                step()
+                subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+                subprocess.run([*git, "commit", "-qm", "x"], cwd=root, check=True)
+                shas.append(subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True,
+                                           text=True, check=True).stdout.strip())
+            subprocess.run(["git", "config", "diff.renames", "true"], cwd=root, check=True)
+            with patch.object(pr_lint, "REPO_ROOT", root):
+                files, _ = pr_lint.changed_from_git(*shas)
+            self.assertEqual(files, ["notes/a.rs", "server/events/src/a.rs"])
+            self.assertIn("L2 module events", pr_lint.design_reason(files, [], pr_lint.high_level_modules()))
 
     def test_changed_files_option(self):
         with TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):

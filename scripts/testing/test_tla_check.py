@@ -388,6 +388,11 @@ class CheckOrchestrationTests(unittest.TestCase):
                                              budget="1", FAKE_TLC_SLEEP="5")
         self.assertEqual((code, summary["verdict"]), (2, "not-run"))
         self.assertTrue(any("time budget" in n["reason"] for n in summary["not_run"]))
+        # Nor is a run that reported success and then had to be killed.
+        with patch.object(tc, "KILL_GRACE_S", 0):
+            code, summary, _ = self.run_fake(GOOD, budget="1", FAKE_TLC_SLEEP="5")
+        self.assertEqual((code, summary["verdict"]), (2, "not-run"))
+        self.assertEqual(summary["tla"]["runs"][0]["verdict"], "incomplete")
 
     def test_simulation_that_ran_into_the_budget_is_not_run(self):
         code, summary, _ = self.run_fake({"TwoPhase.large.cfg": ["simulation", 0]}, budget="1",
@@ -578,7 +583,7 @@ class CheckOrchestrationTests(unittest.TestCase):
             "a selecting call around the bound": " Sel(n <= 1)", "an identity call": " Id(n <= 1)", "an application": " f[n <= 1]",
             "a set": " {n <= 1}", "membership": " (n <= 1) \\in {up}", "an empty body": "", "an empty quantifier": " \\A s \\in S :",
             "an empty last conjunct": " n <= 1 /\\", "an empty conjunct": " n <= 1 /\\ () /\\ m <= 1", "no left operand": " <= 1",
-            "no right operand": " n <=", "an open bracket": " (n <= 1", "a closed bracket": " n <= 1)", "two comparisons": " n <= f[m <= 1]",
+            "no right operand": " n <=", "an open bracket": " (n <= 1", "a closed bracket": " n <= 1)", "crossed brackets": " n <= 1) + (m", "two comparisons": " n <= f[m <= 1]",
             "a call after the bound": " n <= 1 /\\ Sel(up)", "a nested group": " n <= 1 /\\ (m <= 1 /\\ up)",
             "a quantified group": " \\A s \\in S : (n <= 1 /\\ \\A t \\in S : up)", "a name of a variable": " up",
             "Unicode not-equal": " up \u2260 D \\/ n <= 0", "Unicode or": " up \u2228 n <= 0", "Unicode implies": " (up) \u21d2 n <= 0",
@@ -592,11 +597,18 @@ class CheckOrchestrationTests(unittest.TestCase):
             "a quantifier before a list": "\n  \\A s \\in S :\n    /\\ n[s] <= 1\n    /\\ m <= 2", "a nested group": " n <= 1 /\\ (m <= 1 /\\ (\\A s \\in S : n[s] < m))",
             "calls": " Cap /\\ (Cap) /\\ \\A s \\in S : Cap", "a set as an operand": " Cardinality({s \\in S : up[s]}) <= 2",
             "an expression around the operand": " (n + m) <= 1", "a tuple": " Len(<<n, m>>) =< 3", "\\land and \\leq": " n \\leq 1 \\land m \\geq 0",
+            "a list of \\land": "\n  \\land n <= 1\n  \\land m <= 2",
             "a multi-line operand in column 1": " n <= Max(m,\nn)",
         }
         for name, body in accepted.items():
             with self.subTest(name):
                 self.assertIsNone(self.bound(body, sel))
+
+    def test_every_definition_of_the_name_counts(self):
+        other = "---- MODULE Inner ----\nFew == up\n====\n"
+        self.assertIsNotNone(self.bound(" n <= 1", other))
+        self.assertIsNotNone(self.bound(" n <= 1\n" + other.rstrip()))
+        self.assertIsNone(self.bound(" n <= 1", other.replace("up", "m <= 1")))
 
     def test_a_body_ends_at_the_next_unit(self):
         for unit in ("VARIABLE x", "CONSTANT X", "ASSUME up", "THEOREM up", "LOCAL Z == up", "RECURSIVE F(_)", "INSTANCE M2",
