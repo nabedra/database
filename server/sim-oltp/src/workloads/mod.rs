@@ -8,8 +8,10 @@
 pub(crate) mod clauses;
 pub(crate) mod clients;
 pub(crate) mod cold;
+pub(crate) mod corrupt;
 pub(crate) mod direct;
 pub(crate) mod moves;
+pub(crate) mod old_peer;
 pub(crate) mod paused;
 
 use std::{collections::BTreeSet, fmt};

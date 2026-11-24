@@ -393,6 +393,27 @@ impl Cluster {
         Err(format!("{name}: {}", errors.join("; ")))
     }
 
+    /// One administration request to `node`, with the answer as the operator sees it.
+    pub async fn admin_answer(
+        &self,
+        node: u64,
+        id: Uuid,
+        name: &str,
+        payload: Value,
+        limit: Duration,
+    ) -> Result<Completion, String> {
+        request(
+            BOOTSTRAP_CLIENT,
+            node,
+            "/v1/cluster/operations",
+            &self.config.admin_token,
+            Some(operation(id, name, payload)),
+            limit,
+        )
+        .await
+        .and_then(|reply| reply.completion(id))
+    }
+
     /// One administration request to `node` in its own task, for operations that run for
     /// longer than a health check may wait.
     pub fn admin_task(
@@ -530,6 +551,13 @@ impl Cluster {
     /// incarnation from the ready set, prepare a fresh incarnation through them, then
     /// reopen the retained volume and start the worker.
     pub async fn restart_worker(&mut self, node: u64, how: DiskCut) -> Result<(), String> {
+        self.prepare_restart(node).await?;
+        let index = WORKERS.iter().position(|worker| *worker == node);
+        self.start_prepared(index.expect("known worker"), how).await
+    }
+
+    /// Prepare a retained restart through the survivors, unless one is still unspent.
+    pub async fn prepare_restart(&mut self, node: u64) -> Result<(), String> {
         let index = WORKERS
             .iter()
             .position(|worker| *worker == node)
@@ -543,7 +571,7 @@ impl Cluster {
             // that process has enrolled, the preparation is spent and a fresh one is needed.
             let connection = self.admin("cluster.connection", json!({})).await?;
             if !self.enrolled(index, &connection) {
-                return self.start_prepared(index, how).await;
+                return Ok(());
             }
             self.record(format!("n{node} enrolled before it stopped: prepare again"));
             self.prepared.remove(&node);
@@ -579,7 +607,7 @@ impl Cluster {
             &connection["control_peers"],
         );
         self.prepared.insert(node);
-        self.start_prepared(index, how).await
+        Ok(())
     }
 
     /// Whether Control lists the enrollment that worker `index` was prepared with.
@@ -589,7 +617,8 @@ impl Cluster {
             .is_some_and(|peers| peers.contains(self.config.worker_enrollment(index)))
     }
 
-    async fn start_prepared(&mut self, index: usize, how: DiskCut) -> Result<(), String> {
+    /// Start a prepared worker on its reopened volume and wait until it is ready.
+    pub async fn start_prepared(&mut self, index: usize, how: DiskCut) -> Result<(), String> {
         let node = WORKERS[index];
         disk::reopen(&self.world, &self.checks, node, how);
         self.start_worker(index).await?;

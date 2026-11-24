@@ -28,11 +28,26 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
             "O06:sync-failure",
             "O06:re-election",
             "O06:corrupt-log",
+            "O06:foreign-replica",
         ],
     ),
     ("O10", &["O10:lost-reply"]),
     ("O15", &["O15:cold-start"]),
-    ("O26", &["O26:pool-move", "O26:worker-4"]),
+    (
+        "O26",
+        &[
+            "O26:growth",
+            "O26:budgets",
+            "O26:mount-identity",
+            "O26:pool-move",
+            "O26:exact-count",
+            "O26:drain",
+            "O26:pinned-snapshot",
+            "O26:split-across-pools",
+            "O26:failed-mount",
+            "O26:worker-4",
+        ],
+    ),
     ("O29", &["O29:ambiguous-write"]),
 ];
 
@@ -41,8 +56,9 @@ pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
     Some(match clause {
         "D04:after-quorum" => "only the P10-PROBES Applied probe can prove the quorum came first",
         "D02:after-propose" => "needs the P10-PROBES proposal trigger",
-        "D10:one-shot-peer" => "the registered processes cannot offer only the one-shot protocol",
-        "O06:corrupt-log" => "design 3.6 lists no corruption action",
+        "O26:pinned-snapshot" => "a pinned query needs the queued path's barriers (phase 11)",
+        "O26:split-across-pools" => "a split never publishes after a direct commit (open finding)",
+        "O26:failed-mount" => "no phase 10 schedule loses a mount",
         "O26:worker-4" => "the data worker process binds a real TCP listener",
         _ => return None,
     })

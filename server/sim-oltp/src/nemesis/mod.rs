@@ -228,6 +228,10 @@ pub(crate) struct Focus {
     pub idle: bool,
     /// `d05`: force the 10 s request deadline that the D05 schedule runs at.
     pub d05: bool,
+    /// `corrupt`: run the O06 corrupt and foreign replica stage.
+    pub corrupt: bool,
+    /// `old-peer`: run the D10 one-shot peer stage.
+    pub old_peer: bool,
 }
 
 /// What `NABEDRA_SIM_PROFILE` selected.
@@ -263,6 +267,8 @@ impl Selection {
                     "same-range-writers" => selection.focus.contention = true,
                     "idle" => selection.focus.idle = true,
                     "d05" => selection.focus.d05 = true,
+                    "corrupt" => selection.focus.corrupt = true,
+                    "old-peer" => selection.focus.old_peer = true,
                     // The cold and move workloads always run these schedules.
                     "staggered-reopen" | "delay-old-voters" => {}
                     "none" => {}

@@ -43,6 +43,8 @@ const OPERATIONS: &str = "/v1/operations";
 const REPLY_GRACE: Duration = Duration::from_secs(1);
 /// Pause between a definite refusal and the identity check that follows it.
 const PROBE_PAUSE: Duration = Duration::from_millis(500);
+/// A count takes the queued path, whose acceptance test allows 30 s.
+const COUNT_LIMIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -755,6 +757,49 @@ pub(crate) async fn read_each(ctx: &Ctx) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `query.count` through one gateway against a read of every key through the other, with no
+/// client running. Returns what differs.
+pub(crate) async fn exact_count(ctx: &Ctx) -> Result<Option<String>, String> {
+    let mut client = ctx.new_client();
+    let mut rows = 0;
+    for key in 1..=ctx.keys {
+        let id = in_node(CLIENTS[0], async { uuid_v4() }).await;
+        let request = Request::get(&ctx.table, key, id);
+        match attempt(ctx, &mut client, CLIENTS[0], GATEWAYS[0], &request, false).await {
+            Completion::Ok(row) => rows += i64::from(!row.is_null()),
+            other => {
+                let why = failure(&other).unwrap_or_default();
+                return Err(format!("read of key {key}: {why}"));
+            }
+        }
+    }
+    let id = in_node(CLIENTS[1], async { uuid_v4() }).await;
+    let payload = json!({
+        "table_id": ctx.table,
+        "query": {"select": null, "filter": null, "order_by": null, "limit": null},
+    });
+    let answer = crate::client::request(
+        CLIENTS[1],
+        GATEWAYS[1],
+        OPERATIONS,
+        &ctx.token,
+        Some(operation(id, "query.count", payload)),
+        COUNT_LIMIT,
+    )
+    .await
+    .and_then(|reply| reply.completion(id))?;
+    match answer {
+        Completion::Ok(count) if count == json!(rows) => Ok(None),
+        Completion::Ok(count) => Ok(Some(format!(
+            "query.count answered {count} and the keys hold {rows} rows"
+        ))),
+        other => Err(format!(
+            "query.count: {}",
+            failure(&other).unwrap_or_default()
+        )),
+    }
 }
 
 pub(crate) fn failure(completion: &Completion) -> Option<String> {

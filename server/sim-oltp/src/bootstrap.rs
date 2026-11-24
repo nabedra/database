@@ -377,6 +377,36 @@ impl Bootstrap {
         }
     }
 
+    /// The TLS material of one process.
+    pub fn tls(&self, node: u64) -> io::Result<TlsMaterial> {
+        let (cert, key) = material(node);
+        TlsMaterial::from_pem(cert, key, certificate_authority())
+    }
+
+    /// The worker no longer has a secondary pool to open.
+    pub fn unlist_secondary_pools(&mut self, index: usize) {
+        if let Some(node) = self.worker_configs[index]["node"].as_object_mut() {
+            node.remove("secondary_pools");
+        }
+    }
+
+    /// The generation of worker `index`'s primary mount.
+    pub fn mount_generation(&self, index: usize) -> Value {
+        self.worker_configs[index]["node"]["mount"]["generation"].clone()
+    }
+
+    /// The primary pool in worker `index`'s bootstrap file.
+    pub fn pool(&self, index: usize) -> Value {
+        self.worker_configs[index]["node"]["pool_id"].clone()
+    }
+
+    /// Make worker `index`'s bootstrap file claim another primary pool on the same mount.
+    pub fn claim_pool(&mut self, index: usize, pool: &Value) {
+        let node = &mut self.worker_configs[index]["node"];
+        node["pool_id"] = pool.clone();
+        node["mount"]["identity"]["pool_id"] = pool.clone();
+    }
+
     /// The enrollment the worker's bootstrap file presents.
     pub fn worker_enrollment(&self, index: usize) -> &Value {
         &self.worker_configs[index]["node"]["enrollment"]

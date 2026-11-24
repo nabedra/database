@@ -40,6 +40,8 @@ struct State {
     resets: u64,
     /// When `session-drop` reset a session.
     session_drops: Vec<u64>,
+    /// A node whose multiplexed frames are counted, and how many it exchanged.
+    watched: Option<(u64, u64)>,
     /// Weak: the World owns the planner that holds this state, so a strong reference would
     /// keep the World and every mounted image alive after the run.
     world: Weak<World>,
@@ -64,6 +66,7 @@ impl NetFaults {
             windows: Windows::default(),
             resets: 0,
             session_drops: Vec::new(),
+            watched: None,
             world: Arc::downgrade(world),
         })));
         let frames = faults.clone();
@@ -145,6 +148,21 @@ impl NetFaults {
         self.0.lock().unwrap().session_drops.clone()
     }
 
+    /// Count the multiplexed frames `node` exchanges from now on.
+    pub(crate) fn watch(&self, node: u64) {
+        self.0.lock().unwrap().watched = Some((node, 0));
+    }
+
+    /// Stop counting and return the count.
+    pub(crate) fn watched(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap()
+            .watched
+            .take()
+            .map_or(0, |(_, count)| count)
+    }
+
     /// Session resets this run's windows caused.
     pub(crate) fn resets(&self) -> u64 {
         self.0.lock().unwrap().resets
@@ -157,8 +175,14 @@ impl NetFaults {
             windows,
             resets,
             session_drops,
+            watched,
             world,
         } = &mut *state;
+        if let Some((node, count)) = watched
+            && (frame.from == Some(*node) || frame.to == Some(*node))
+        {
+            *count += 1;
+        }
         if let Some(left) = windows.session_drop_after.as_mut() {
             *left = left.saturating_sub(1);
             if *left == 0 {
@@ -249,6 +273,7 @@ mod tests {
             windows: Windows::default(),
             resets: 0,
             session_drops: Vec::new(),
+            watched: None,
             world: Arc::downgrade(world),
         })))
     }

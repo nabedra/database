@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use super::{
     Scenarios, Workload, clauses,
     clients::{self, Ctx, Plan},
-    cold, moves, paused,
+    cold, corrupt, moves, old_peer, paused,
 };
 use crate::{
     bootstrap::{CLIENTS, GATEWAYS, WORKERS},
@@ -205,7 +205,27 @@ pub(crate) async fn run(
             .push(("replica move retired", moved.is_ok()));
         match moved {
             Ok(()) => {
-                report.scenarios.insert("O26:pool-move");
+                if let Err(error) = moving.check_retired(cluster, &ctx).await {
+                    cluster.checks.violate(
+                        &cluster.world,
+                        "Liveness",
+                        format!("after the replica move: {error}"),
+                    );
+                }
+                match clients::exact_count(&ctx).await {
+                    Ok(None) => {
+                        report.scenarios.insert("O26:exact-count");
+                    }
+                    Ok(Some(wrong)) => {
+                        cluster.checks.violate(&cluster.world, "ExactCount", wrong);
+                        report.scenarios.insert("O26:exact-count");
+                    }
+                    Err(error) => cluster.checks.violate(
+                        &cluster.world,
+                        "Liveness",
+                        format!("count after the replica move: {error}"),
+                    ),
+                }
             }
             Err(error) => {
                 cluster
@@ -213,6 +233,7 @@ pub(crate) async fn run(
                     .violate(&cluster.world, "Liveness", format!("replica move: {error}"))
             }
         }
+        report.scenarios.extend(std::mem::take(&mut moving.clauses));
         reread = true;
     }
     if reread && let Err(error) = clients::final_checks(&ctx).await {
@@ -233,6 +254,14 @@ pub(crate) async fn run(
             "Liveness",
             format!("request unresolved {CONVERGE_LIMIT:?} after the heal: {request}"),
         );
+    }
+    if old_peer::selected(seed, workload, selection.focus.old_peer) {
+        if converged.is_ok() && final_checks.is_ok() && cluster.converged().await {
+            let observed = old_peer::run(cluster, &ctx, &faults).await;
+            report.scenarios.extend(observed);
+        } else {
+            cluster.record("D10 old peer not run: the cluster did not converge".into());
+        }
     }
     if paused::selected(config, workload) {
         if converged.is_ok() && final_checks.is_ok() && cluster.converged().await {
@@ -279,6 +308,29 @@ pub(crate) async fn run(
             format!("n{node} keeps reservations in its second pool after quiescence: {row}"),
         );
     }
+    // Last: a quarantined group stays quarantined, and its leader keeps a replication batch
+    // for it, so the resource checks above must not see it.
+    if corrupt::selected(seed, workload, selection.focus.corrupt) {
+        if converged.is_ok() && final_checks.is_ok() && cluster.converged().await {
+            let observed = corrupt::run(cluster, &ctx).await;
+            report.scenarios.extend(observed);
+            let healed = cluster.world.elapsed();
+            let after = match converge(cluster, &ctx, healed + CONVERGE_LIMIT).await {
+                Ok(()) => clients::final_checks(&ctx).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = after {
+                cluster.checks.violate(
+                    &cluster.world,
+                    "Liveness",
+                    format!("after the O06 stage: {error}"),
+                );
+            }
+        } else {
+            cluster.record("O06 stage not run: the cluster did not converge".into());
+        }
+    }
+
     report.summary = json!({
         "workload": workload.name(),
         "profile": chaos.as_ref().map(Chaos::profile_name),
