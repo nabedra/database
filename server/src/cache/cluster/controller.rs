@@ -7,7 +7,9 @@ mod placement;
 #[cfg(feature = "sim")]
 pub(super) use placement::StagedPromotion;
 #[cfg(all(test, feature = "sim"))]
-pub(super) use placement::{MAX_CUTOVER_LAG, MAX_MOVES_PER_WORKER, STAGED_RESET_GRACE_MS};
+pub(super) use placement::{
+    MAX_CUTOVER_LAG, MAX_MOVES_PER_WORKER, STAGED_RESET_GRACE_MS, SourceFence,
+};
 #[cfg(all(test, feature = "sim"))]
 mod simulation;
 mod state;

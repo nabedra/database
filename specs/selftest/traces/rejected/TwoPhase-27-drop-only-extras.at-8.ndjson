@@ -1,0 +1,13 @@
+{"trace":"nabedra.trace/1","spec":"TwoPhase","seed":27,"sha":"0000000000000000000000000000000000000000","workload":"selftest-handwritten","params":{"RM":["r1","r2"],"MaxCrashes":1,"MaxDrops":1}}
+{"seq":0,"t":1000,"node":"r1","action":"RMPrepare","vars":{"rmState":"prepared"},"msg":{"type":"Prepared","rm":"r1"}}
+{"seq":1,"t":2000,"node":"r2","action":"RMPrepare","vars":{"rmState":"prepared"},"msg":{"type":"Prepared","rm":"r2"}}
+{"seq":2,"t":3000,"node":"tm","action":"TMRcvPrepared","vars":{"tmDecision":"init","tmPrepared":["r1"],"tmUp":true},"msg":{"type":"Prepared","rm":"r1"}}
+{"seq":3,"t":4000,"node":"tm","action":"TMCrash","vars":{"tmPrepared":[],"tmUp":false}}
+{"seq":4,"t":5000,"node":"tm","action":"TMRestart","vars":{"tmPrepared":[],"tmUp":true}}
+{"seq":5,"t":6000,"node":"tm","action":"TMRcvPrepared","vars":{"tmDecision":"init","tmPrepared":["r1"],"tmUp":true},"msg":{"type":"Prepared","rm":"r1"}}
+{"seq":6,"t":7000,"node":"tm","action":"TMRcvPrepared","vars":{"tmDecision":"init","tmPrepared":["r1","r2"],"tmUp":true},"msg":{"type":"Prepared","rm":"r2"}}
+{"seq":7,"t":8000,"node":"tm","action":"TMCommit","vars":{"tmDecision":"committed","tmPrepared":["r1","r2"],"tmUp":true},"msg":{"type":"Commit"}}
+{"seq":8,"t":9000,"node":"tm","action":"DropMessage","vars":{},"msg":{"to":"r1","cause":"plan"}}
+{"seq":9,"t":10000,"node":"tm","action":"TMResend","vars":{"tmDecision":"committed","tmPrepared":["r1","r2"],"tmUp":true},"msg":{"type":"Commit"}}
+{"seq":10,"t":11000,"node":"r1","action":"RMRcvCommit","vars":{"rmState":"committed"},"msg":{"type":"Commit"}}
+{"seq":11,"t":12000,"node":"r2","action":"RMRcvCommit","vars":{"rmState":"committed"},"msg":{"type":"Commit"}}

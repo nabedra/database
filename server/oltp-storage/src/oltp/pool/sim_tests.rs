@@ -186,10 +186,13 @@ fn expectation(info: &VolumeInfo) -> mount::PoolMountExpectation {
     }
 }
 
-#[test]
-fn o17_mount_identity_and_disk_budget_follow_volume() {
+/// A reformat gives the data mount its old root inode back when `mkfs_inodes` is set, as a
+/// real `mkfs` does, and another one otherwise. The old inventory is refused either way:
+/// the filesystem uuid tells the volumes apart, not the inode number.
+fn reformat_refuses_the_old_inventory(mkfs_inodes: bool) {
     let replay = || {
         sim::run(SEED, |world| async move {
+            world.set_mkfs_inodes(mkfs_inodes);
             let info = mount_data(&world);
             let keys = world.mount(NODE, KEYS);
             let expected = expectation(&info);
@@ -268,7 +271,11 @@ fn o17_mount_identity_and_disk_budget_follow_volume() {
                     b"identity"
                 );
                 let mount = VerifiedPoolMount::verify(expectation(&reformatted), None).unwrap();
-                assert_ne!(mount.observation().root_inode, old_inode);
+                assert_eq!(
+                    mount.observation().root_inode == old_inode,
+                    mkfs_inodes,
+                    "only a real mkfs repeats the root inode"
+                );
             })
             .await;
             assert_eq!(world.unmounted_path_errors(), 0);
@@ -278,6 +285,16 @@ fn o17_mount_identity_and_disk_budget_follow_volume() {
         })
     };
     assert_eq!(replay(), replay());
+}
+
+#[test]
+fn o17_mount_identity_and_disk_budget_follow_volume() {
+    reformat_refuses_the_old_inventory(false);
+}
+
+#[test]
+fn o17_mount_identity_survives_a_reformat_that_repeats_inodes() {
+    reformat_refuses_the_old_inventory(true);
 }
 
 #[test]
