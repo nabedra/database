@@ -960,6 +960,11 @@ impl Chaos {
         }
     }
 
+    /// A split was requested in this run.
+    pub(crate) fn split_requested(&self) -> bool {
+        self.split_requested
+    }
+
     /// A split was requested and has not published.
     pub(crate) fn split_pending(&self) -> bool {
         self.split.is_some()

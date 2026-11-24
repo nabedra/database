@@ -1,0 +1,17 @@
+id = "OLTP-sim-paused-owner-cold-route"
+title = "With one follower paused, a gateway without a cached route refuses a write after its whole deadline"
+class = "stale-route-topology-schema"
+module = "oltp"
+guarantees = ["OLTP-G10"]
+scenarios = ["D05"]
+found_by = "campaign"
+found_date = "2026-11-24"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 8
+why_not_caught = "The D05 runner writes only through a gateway that has just served a write."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=direct, default profile, seed 8 (OnePausedProgress): at the 10 s deadline every write through either gateway succeeds with one follower paused. The gateway asked Control once a second and never contacted the Data leader."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-23"

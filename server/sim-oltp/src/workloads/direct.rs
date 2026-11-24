@@ -253,7 +253,10 @@ pub(crate) async fn run(
     }
     // The drain moves the replica once more, so it has its own convergence and final reads.
     if let Some(moving) = moving.as_mut() {
-        if report.assertions.contains(&("replica move retired", true)) {
+        let split = chaos.as_ref().is_some_and(Chaos::split_requested);
+        if let Some(why) = moving.drain_blocked(cluster, split) {
+            cluster.record(format!("O26 drain not run: {why}"));
+        } else {
             let drained = match moving.drain_pool(cluster, &ctx).await {
                 Ok(()) => {
                     let limit = cluster.world.elapsed() + CONVERGE_LIMIT;

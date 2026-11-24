@@ -412,18 +412,29 @@ impl Move {
         Ok(())
     }
 
-    /// Drain the pool the replica moved to, once it retired.
+    /// Why the drain schedule cannot run: it moves the replica once more, from the pool and the
+    /// range the first move ended with, and only the owner that moved it can do that.
+    pub(crate) fn drain_blocked(&self, cluster: &Cluster, split: bool) -> Option<&'static str> {
+        let (State::Retired, Some(node), Some(claim)) = (&self.state, self.node, &self.claim)
+        else {
+            return Some("the replica move did not retire");
+        };
+        if cluster.config.worker_identity(worker_of(node)) != claim.identity {
+            return Some("the moving worker restarted, so its mount and ownership changed");
+        }
+        split.then_some("a split replaced the moved range")
+    }
+
+    /// Drain the pool the replica moved to.
     pub(crate) async fn drain_pool(
         &mut self,
         cluster: &mut Cluster,
         ctx: &Ctx,
     ) -> Result<(), String> {
-        match (&self.state, self.node, self.moved.clone()) {
-            (State::Retired, Some(node), Some((_, _, mount))) => {
-                self.drain(cluster, ctx, node, &mount).await
-            }
-            _ => Err("the replica move did not retire".into()),
-        }
+        let (Some(node), Some((_, _, mount))) = (self.node, self.moved.clone()) else {
+            return Err("no replica moved".into());
+        };
+        self.drain(cluster, ctx, node, &mount).await
     }
 
     /// `drain_and_detach` of the acceptance test: a pool with a live replica may not be

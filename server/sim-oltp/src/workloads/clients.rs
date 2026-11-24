@@ -775,30 +775,39 @@ pub(crate) async fn exact_count(ctx: &Ctx) -> Result<Option<String>, String> {
             }
         }
     }
-    let id = in_node(CLIENTS[1], async { uuid_v4() }).await;
     let payload = json!({
         "table_id": ctx.table,
         "query": {"select": null, "filter": null, "order_by": null, "limit": null},
     });
-    let answer = crate::client::request(
-        CLIENTS[1],
-        GATEWAYS[1],
-        OPERATIONS,
-        &ctx.token,
-        Some(operation(id, "query.count", payload)),
-        COUNT_LIMIT,
-    )
-    .await
-    .and_then(|reply| reply.completion(id))?;
-    match answer {
-        Completion::Ok(count) if count == json!(rows) => Ok(None),
-        Completion::Ok(count) => Ok(Some(format!(
-            "query.count answered {count} and the keys hold {rows} rows"
-        ))),
-        other => Err(format!(
-            "query.count: {}",
-            failure(&other).unwrap_or_default()
-        )),
+    // A refused count is asked again under a new ID, as `read_after_transition` does.
+    let deadline = ctx.world.elapsed() + COUNT_LIMIT;
+    loop {
+        let id = in_node(CLIENTS[1], async { uuid_v4() }).await;
+        let answer = crate::client::request(
+            CLIENTS[1],
+            GATEWAYS[1],
+            OPERATIONS,
+            &ctx.token,
+            Some(operation(id, "query.count", payload.clone())),
+            COUNT_LIMIT,
+        )
+        .await
+        .and_then(|reply| reply.completion(id))?;
+        match answer {
+            Completion::Ok(count) if count == json!(rows) => return Ok(None),
+            Completion::Ok(count) => {
+                return Ok(Some(format!(
+                    "query.count answered {count} and the keys hold {rows} rows"
+                )));
+            }
+            other if ctx.world.elapsed() >= deadline => {
+                return Err(format!(
+                    "query.count: {}",
+                    failure(&other).unwrap_or_default()
+                ));
+            }
+            _ => time::sleep(Duration::from_millis(500)).await,
+        }
     }
 }
 
