@@ -128,7 +128,7 @@ length, or the trace counts. Logs and counterexamples are artifacts.
 | Every baseline exhaustive and clean, every action covered, every property mutated, every mutant caught on its property | `pass` |
 | A baseline violation, a coverage gap, an unmutated property, or a mutant that passes, errs or fails on another property | `fail` |
 | A baseline stopped at the time budget or a state cap, with no failure | `not-run` |
-| A baseline TLC error, such as a parse or evaluation error | `error` |
+| A baseline TLC error, such as a parse or evaluation error, or a success message with a nonzero exit | `error` |
 | A trace no behavior explains, a lint failure, or an expected rejection or trace mutant that does not happen as expected | `fail` |
 | A trace spec the check refuses, a control that is accepted, or a TLC error on a trace | `error` |
 

@@ -131,9 +131,9 @@ def parse_tlc_output(text: str, exit_code: int | None = None) -> TlcResult:
         if code == EC_SUCCESS:
             res.complete = True
         elif code == EC_STATS:
+            # A line the parser cannot read must not leave an earlier line's empty queue standing.
             s = _STATS.search(body)
-            if s:
-                res.generated, res.distinct, res.left = (_int(g) for g in s.groups())
+            res.generated, res.distinct, res.left = (_int(g) for g in s.groups()) if s else (None, None, None)
         elif code == EC_DEPTH:
             d = _DEPTH.search(body)
             if d:

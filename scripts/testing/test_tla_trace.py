@@ -87,6 +87,13 @@ class CommonTests(unittest.TestCase):
         self.assertEqual(tla_trace._notes(res, 7), "different value: a very long variable name; missing: tmUp")
         self.assertEqual(tla_trace._notes(res, 5), "")
 
+    def test_unreadable_final_statistics_are_not_exhaustive(self):
+        unreadable = msg(tc.EC_STATS, "9 states generated and 5 states still to do")
+        self.assertTrue(tc.parse_tlc_output(DONE, 0).complete)
+        for text in (DONE + unreadable, msg(tc.EC_SUCCESS, "Model checking completed. No error has been found.") + unreadable):
+            res = tc.parse_tlc_output(text, 0)
+            self.assertEqual((res.complete, res.left, res.distinct), (False, None, None))
+
     def test_comments(self):
         for text, want in (("a (* x *) b", "a   b"), ("a (* (* x *) y *) b", "a   b"), ("a \\* (* b\nc", "a \nc"),
                            ("(* \\* *) a", "  a"), ('"(*" a', '"(*" a'), ('"a\\"(*" b', '"a\\"(*" b'),
@@ -455,6 +462,25 @@ class CheckTests(unittest.TestCase):
         full = json.loads((self.root / "out" / "summary.json").read_text())
         self.assertEqual(len(full["tla"]["traces"]["failing"]), 25)
         self.assertNotIn("truncated", full["tla"])
+        self.assertEqual((full["executed"], full["failed"], full["not_run"]), (26, 25, []))
+
+    def test_summary_is_listed_before_other_artifacts(self):
+        (self.root / "out").mkdir()
+        for i in range(45):
+            (self.root / "out" / f"mutant-{i:02d}.log").write_text("x")
+        _, summary, _ = self.check(str(self.good))
+        names = [a["name"] for a in summary["artifacts"]]
+        self.assertEqual((names[0], len(names)), ("tla/summary.json", 40))
+
+    def test_more_errors_than_the_record_holds(self):
+        for i in range(201):
+            shutil.copy(ACCEPTED, self.good / f"t{i:03d}.ndjson")
+        error = {"outcome": "error", "at": None, "detail": "broken", "log": "x.log"}
+        with patch.object(tla_trace, "check_trace", return_value=error):
+            _, summary, _ = self.check(str(self.good))
+        self.assertEqual((summary["verdict"], len(summary["not_run"]), summary["tla"]["truncated"]), ("error", 200, True))
+        full = json.loads((self.root / "out" / "summary.json").read_text())
+        self.assertEqual(len(full["not_run"]), 202)
 
     def mutant(self, first, second="\\* trace: traces/a.at-6.ndjson"):
         folder = self.spec / "trace-mutants"

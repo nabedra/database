@@ -570,13 +570,15 @@ def cmd_check(args: argparse.Namespace) -> int:
         verdict = "pass"
     artifacts = []
     if out is not None and Path(out).exists():
-        (Path(out) / "summary.json").write_text(json.dumps({"verdict": verdict, "tla": tla}, indent=2) + "\n",
-                                                encoding="utf-8")
-        for f in sorted(Path(out).glob("*")):
+        # summary.json keeps every fact and is always listed. The record below has limits.
+        (Path(out) / "summary.json").write_text(json.dumps({
+            "verdict": verdict, "executed": executed, "failed": failed, "not_run": not_run, "tla": tla},
+            indent=2) + "\n", encoding="utf-8")
+        for f in sorted(Path(out).glob("*"), key=lambda f: (f.name != "summary.json", f.name)):
             if f.is_file() and len(artifacts) < 40:
                 artifacts.append({"name": f"tla/{f.name}"[:200],
                                   "sha256": hashlib.sha256(f.read_bytes()).hexdigest()})
-    if len(failing) > 20:  # the record's limit; summary.json above has them all
+    if len(failing) > 20 or len(not_run) > 200:
         tla["traces"]["failing"] = failing[:20]
         tla["truncated"] = True
     tc.print_summary({"verdict": verdict, "executed": executed, "failed": failed, "not_run": not_run[:200],
