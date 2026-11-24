@@ -8,7 +8,7 @@ guarantees = []
 scenarios = []
 tiers = ["weekly"]
 command = ["python3", "scripts/testing/cfg_unchanged.py",
-           "--base", "c8426fe1e98063d90a82941b1e02075c1e9d8649", "--head", "a530257d702fa04ad43edde12a9d7d0a707659b5"]
+           "--base", "c8426fe1e98063d90a82941b1e02075c1e9d8649", "--head", "d458f36f5cad7c6f883269deb4fe2a50171a4aa2"]
 cwd = "."
 timeout_s = 5400
 needs = []
