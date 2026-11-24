@@ -35,7 +35,7 @@ pub struct Bell {
 }
 
 impl Bell {
-    fn generation(&self) -> u64 {
+    pub(super) fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
     }
 
@@ -45,7 +45,7 @@ impl Bell {
     }
 
     /// Returns once the generation differs from `seen`.
-    async fn changed(&self, seen: u64) {
+    pub(super) async fn changed(&self, seen: u64) {
         loop {
             let mut notified = pin!(self.notify.notified());
             notified.as_mut().enable();
@@ -205,6 +205,21 @@ impl Registry {
         dead
     }
 
+    /// How many services are mid-step.
+    pub(super) fn mid_step(&self) -> usize {
+        lock(&self.stack).len()
+    }
+
+    /// Takes the services above the first `below` off the step stack, while the job that
+    /// steps them is suspended.
+    pub(super) fn take_steps(&self, below: usize) -> Vec<Arc<Cell>> {
+        lock(&self.stack).split_off(below)
+    }
+
+    pub(super) fn put_steps(&self, steps: Vec<Arc<Cell>>) {
+        lock(&self.stack).extend(steps);
+    }
+
     /// Drops finished services of `node` from the registry.
     pub(crate) fn forget_finished(&self, node: u64) {
         lock(&self.cells).retain(|cell| cell.node() != Some(node) || !cell.finished());
@@ -342,16 +357,24 @@ async fn driver(world: Weak<World>, cell: Arc<Cell>) {
         let job_cell = Arc::clone(&cell);
         let job_world = Arc::clone(&strong);
         drop(strong);
-        let outcome =
-            match run_blocking(job_world.clone(), move || step_cell(&job_world, &job_cell)) {
-                Ok(outcome) => outcome,
-                Err(panic) => std::panic::resume_unwind(panic),
-            };
+        let run = run_blocking(job_world.clone(), move || step_cell(&job_world, &job_cell));
+        let outcome = match run.outcome().await {
+            Ok(outcome) => outcome,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
         match outcome {
-            Outcome::Stepped(Step::Worked) | Outcome::Busy => tokio::task::yield_now().await,
+            Outcome::Stepped(Step::Worked) => tokio::task::yield_now().await,
+            // A suspended job is stepping it, which takes virtual time.
+            Outcome::Busy => {
+                tokio::select! {
+                    biased;
+                    () = cell.bell.changed(seen.0) => {}
+                    () = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+            }
             Outcome::Stepped(Step::Idle(None)) => cell.bell.changed(seen.0).await,
             Outcome::Stepped(Step::Idle(Some(at))) => {
-                let wait = at.saturating_duration_since(crate::time::now_std());
+                let wait = at.saturating_duration_since(super::mono_now_std());
                 tokio::select! {
                     biased;
                     () = cell.bell.changed(seen.0) => {}
@@ -561,7 +584,7 @@ where
     };
     let job_world = Arc::clone(&world);
     let job = async move {
-        let outcome = run_blocking(job_world, move || {
+        let run = run_blocking(job_world, move || {
             ONESHOT.with(|slot| *slot.borrow_mut() = Some(name));
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(f));
             ONESHOT.with(|slot| *slot.borrow_mut() = None);
@@ -569,7 +592,7 @@ where
                 std::panic::resume_unwind(panic);
             }
         });
-        if let Err(panic) = outcome {
+        if let Err(panic) = run.outcome().await {
             std::panic::resume_unwind(panic);
         }
     };
@@ -645,12 +668,12 @@ fn drive<T>(
             "drive_until({site}): no result after {MAX_PASSES} passes; services:{}",
             world.services.describe(node)
         );
-        if progress {
+        if progress || world.faults.resume_one(world, context) {
             continue;
         }
         match earliest_deadline(world, context) {
             Some(at) => {
-                let wait = at.saturating_duration_since(crate::time::now_std());
+                let wait = at.saturating_duration_since(super::mono_now_std());
                 // A deadline already due would loop forever without moving time.
                 let wait = wait.max(Duration::from_micros(1));
                 world.pause_all(super::to_runtime_duration(wait));
@@ -734,7 +757,8 @@ pub(crate) fn block_on_inline<F: Future>(
         let progress = pass(&world, context, || {
             !was_woken && flag.0.load(Ordering::SeqCst)
         });
-        if !progress && !flag.0.load(Ordering::SeqCst) {
+        if !progress && !flag.0.load(Ordering::SeqCst) && !world.faults.resume_one(&world, context)
+        {
             panic!(
                 "block_on_inline at {caller}: the future needs virtual time or another task \
                  to make progress, which cannot happen while it blocks the simulation; \
