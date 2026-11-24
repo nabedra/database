@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-h-peer-seams-f6817e0-083655--queue-scheduler-properties.log",
+      "sha256": "fc840ecb11d6092173dd19db26b9ef9d2b7a1f69c805eef13faacb1d525ec6f3"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "queue-scheduler-properties",
+  "duration_s": 157.517,
+  "guarantees": [
+    "SCHED-G04",
+    "OLAP-G07"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T08:37:22.973847+00:00",
+    "request_id": "p8-h-peer-seams-f6817e0-083655",
+    "runner": "GitHub Actions 1000010699",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45357656043"
+  },
+  "scenarios": [
+    "U03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "f6817e088a51ea0872c78f0a65373f6b7912aa7c",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
