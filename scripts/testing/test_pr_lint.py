@@ -87,10 +87,62 @@ class DesignLineTests(unittest.TestCase):
         self.assertIn("L3 module lsm", pr_lint.design_reason(["docs/x.md", "server/kv/src/lib.rs"], [], modules))
         self.assertIsNone(pr_lint.design_reason([], [], modules))
 
+    def test_design_documents_are_not_exempt(self):
+        modules = pr_lint.high_level_modules()
+        for path in ("server/oltp-storage/src/oltp/DESIGN.md", "server/oltp-storage/src/oltp/pool/DESIGN.md",
+                     "server/events/design-notes.md"):
+            with self.subTest(path=path):
+                self.assertIn(path, pr_lint.design_reason([path], [], modules) or "")
+        # Every tracked DESIGN.md under an L2 or L3 path is covered, and specs/** has no Markdown exemption.
+        self.assertIn("specs/oltp/NOTES.md", pr_lint.design_reason(["specs/oltp/NOTES.md"], [], modules))
+        self.assertIsNone(pr_lint.design_reason(["docs/design.md"], [], modules))
+
     def test_design_section(self):
         plan = "# Plan\n\n## Goal\n\nx\n\n## Design review\n\n| a | b |\n\n### Sub\n\ny\n\n## Next\n\nz\n"
         self.assertEqual(pr_lint.design_section(plan), "## Design review\n\n| a | b |\n\n### Sub\n\ny")
         self.assertIsNone(pr_lint.design_section("# Plan\n\n## Goal\n"))
+
+    def test_design_section_sees_past_fences(self):
+        plan = ("# P\n\n## Design review\n\nRun it:\n\n```sh\n# exhaustive\ntlc X\n```\n\n"
+                "Verdict: not-run\n\n## Next\n\nz\n")
+        changed = plan.replace("Verdict: not-run", "Verdict: pass")
+        self.assertIn("Verdict: not-run", pr_lint.design_section(plan))
+        self.assertNotEqual(pr_lint.design_section(plan), pr_lint.design_section(changed))
+        self.assertNotIn("z", pr_lint.design_section(plan).splitlines())
+        # A change outside the section, and a heading inside a fence, are not the section's.
+        self.assertEqual(pr_lint.design_section(plan), pr_lint.design_section(plan.replace("\nz\n", "\ny\n")))
+        self.assertIsNone(pr_lint.design_section("# P\n\n~~~md\n## Design review\nx\n~~~\n"))
+
+    def test_every_form_and_every_section_counts(self):
+        for heading in ("## Design Review", "## design review", "## Design review: direct path",
+                        "### Design review", "## 7. Design review", "## Design review (2026-11-24)",
+                        "   ## Design review ##"):
+            with self.subTest(heading=heading):
+                self.assertIsNotNone(pr_lint.design_section(f"# P\n{heading}\nx\n"))
+        for heading in ("## Design reviews", "## Redesign review", "# Design review", "Design review"):
+            with self.subTest(heading=heading):
+                self.assertIsNone(pr_lint.design_section(f"# P\n{heading}\nx\n"))
+        two = "## Design review\na\n## X\nm\n## Design review\nb\n"
+        self.assertEqual(pr_lint.design_section(two), "## Design review\na\n## Design review\nb")
+        nested = "## 2. Protocol\n### Design review\na\n#### Sub\nb\n### Other\nc\n"
+        self.assertEqual(pr_lint.design_section(nested), "### Design review\na\n#### Sub\nb")
+
+    def test_changed_from_git_reports_a_change_after_a_fenced_comment(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
+            plan = root / "plans" / "p.md"
+            plan.parent.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            shas = []
+            for verdict in ("not-run", "pass"):
+                plan.write_text(f"# P\n## Design review\n```sh\n# x\n```\nVerdict: {verdict}\n## Next\n")
+                subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+                subprocess.run([*git, "commit", "-qm", verdict], cwd=root, check=True)
+                shas.append(subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True,
+                                           text=True, check=True).stdout.strip())
+            with patch.object(pr_lint, "REPO_ROOT", root):
+                self.assertEqual(pr_lint.changed_from_git(*shas), (["plans/p.md"], ["plans/p.md"]))
 
     def test_changed_files_option(self):
         with TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
