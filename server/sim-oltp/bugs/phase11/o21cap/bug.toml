@@ -1,0 +1,30 @@
+# Reverted fix O21CAP (phase 11, design section 4.2, row 8).
+schema = "nabedra.sim-bug/1"
+id = "o21cap"
+bug = "O21CAP"
+set = "queued"
+phase = 11
+class = "stale-route-topology-schema"
+guarantees = ["OLTP-G06", "OLTP-G07"]
+scenarios = ["O21"]
+fix_commits = ["c4fad97e65892eddf3f96cfe26287a8b04175300", "c7761409efaad8613c3fa0991730a14862d46879"]
+reverts = "c4fad97e65892eddf3f96cfe26287a8b04175300"
+port = "hand"
+port_notes = """
+c4fad97e and c7761409 reversed at their two wait points: QueueCoordinator::stage and the Install branch of
+worker_endpoint.rs no longer wait for the published ready view. wait_for_local_ready_view stays because
+#103 (262ffb74) uses it for queued retries, a different defect.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+workload = "queued"
+profile = ["worker-join", "view-install-delay", "table-create"]
+expect = ["SubmitDuringViewInstall"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_acceptance::growth::o21_capacity_deficit"
+mode = "on"
+needs_server = true
+timeout_s = 3600

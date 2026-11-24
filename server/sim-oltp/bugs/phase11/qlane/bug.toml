@@ -1,0 +1,29 @@
+# Reverted fix QLANE (phase 11, design section 4.2, row 21).
+schema = "nabedra.sim-bug/1"
+id = "qlane"
+bug = "QLANE"
+set = "queued"
+phase = 11
+class = "resource-release-order"
+guarantees = ["OLTP-G05", "OLTP-G07", "OLTP-G09"]
+scenarios = ["O07", "O08"]
+fix_commits = ["b179b5840b06d2ec7bf0bf001325101b06629dad", "7ddad3bbf4c3871c2db88a579312e81dc33fbd2a"]
+reverts = "7ddad3bbf4c3871c2db88a579312e81dc33fbd2a"
+port = "hand"
+port_notes = """
+7ddad3bb reversed at its decision in service_rpc/participant_full.rs: PreparePage, Seal and Resolve use
+client.call again, so a full outgoing Storage lane refuses an accepted batch. The boxed lane wait
+(b179b584) stays for its other callers.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+workload = "queued"
+profile = ["lane-exhaust", "cross-range-batches"]
+expect = ["AcceptedSettlesInRun"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_runtime::worker_runtime::direct_gateway::tests::o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane"
+mode = "on"
+failure_contains = ["batch ended with Storage held"]

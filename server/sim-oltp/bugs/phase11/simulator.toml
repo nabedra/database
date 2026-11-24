@@ -1,0 +1,246 @@
+# What each phase 11 reverted fix needs from the simulator before a search can count (P11-BUGS).
+# Nothing here is a detection. `faults` names the schedule, `trigger` the protocol point to place it at,
+# `invariant` the rule that must fire (names marked new are proposals for the workload owners), and
+# `gaps` what the simulator or the design lacks today.
+#
+# reach: reachable (workload only), needs-workload, needs-client, needs-invariant, needs-probe,
+# needs-trigger, needs-fault, needs-hook, narrower or partly (than the original defect), nightly,
+# blocked (by a missing seam or an open finding), unreachable (through the product core).
+
+[acc3-receipt]
+row = 1
+workload = "queued"
+reach = "needs-invariant"
+faults = "One receipt observation from an API fails with a retryable error (session reset, refused lane) after acceptance and before the terminal result; the owner stays up."
+trigger = "Queue acceptance of a request that an API process waits for on POST /v1/operations (queued read, or direct_oltp off)."
+invariant = "ReceiptObservationPatience (new): while the owner answers again within RECEIPT_OBSERVATION_TIMEOUT, the waiting call returns the terminal result."
+gaps = [
+    "The design's `outcome::check` and receipt check cannot see it: http.rs `accepted_failure` (G1) already turns a failed wait into outcome_unknown, which is legal, and the receipt stays correct.",
+]
+
+[bug1-encode-submit]
+row = 2
+workload = "queued"
+reach = "needs-fault"
+faults = "The owner worker has no Data (or ApiIngress header) buffer bytes left at the moment it encodes the submission receipt. The client reads its definite refusal and does not retry; a later read sees the write."
+trigger = "Between QueueCoordinator acceptance and ApplicationEndpoint::finish_reply."
+invariant = "NotAppliedNeverCommitted for the queued identity, then failed-write-observed; QueueRetention for a refused identity whose record is accepted."
+gaps = [
+    "S7 in wave-dr/sim-mapping/fault-model.md: no one-off byte or lane refusal at a chosen step. Per-seed Data budgets reach it only if other load holds the bytes at that instant.",
+]
+
+[bug1-stream]
+row = 3
+workload = "queued"
+reach = "needs-client"
+faults = "The reply of a direct single-key mutation is cut after commit; the client retries the same ID and body without Content-Length (chunked)."
+trigger = "GatewayAttempt done and HTTP reply cut."
+invariant = "dedup-miss or request-id-reuse-misdetected from the single-key checker."
+gaps = [
+    "The harness client always sends Full<Bytes> with a length (sim-oltp/src/client.rs); it needs a streamed body mode.",
+]
+
+[topo1-child-schema]
+row = 4
+workload = "topology"
+reach = "blocked"
+faults = "None beyond client load. The worker that led the parent at its first direct epoch must lead the child at its first epoch."
+trigger = "Index publication to Ready, then a split of the same range, then inserts routed to the child."
+invariant = "CoveringIndexComplete: an insert acknowledged after Ready is returned by every covering scan at a later snapshot."
+gaps = [
+    "Blocked today: P10-WORKLOADS reports that a split never publishes under direct load (4 of 4 seeds), only with idle clients. The workload must split while idle and resume writers, or that finding must be resolved.",
+]
+
+[bug2]
+row = 5
+workload = "queued"
+reach = "narrower"
+faults = "A complete copy of another ready view reaches a replica: a delayed Install frame across a view change, or a scoped copy (replica/scoped.rs, scoped_store.rs) while the local view lags."
+trigger = "Ready-view publication while an Install or scoped payload frame is in flight."
+invariant = "QueueCopyStaleNotInvalid on the receiver preflight result, with QueueRetention for the accepted request."
+gaps = [
+    "Narrower than the original: worker_endpoint.rs now waits for a lagging local view before preflight (O21CAP fix), so the legacy path reaches it only when the local view is ahead of the copy or the owner changed at the same membership revision.",
+]
+
+[rd1]
+row = 6
+workload = "topology"
+reach = "needs-invariant"
+faults = "A DDL fence applies on the group after a mutation looked up its descriptor and before its snapshot. Waiting for a hot key latch keeps that window open for a commit round trip."
+trigger = "DirectSchemaChange::Fence of an index publication, with writers queued on one key latch."
+invariant = "CoveringIndexComplete on the published index. SchemaEpochAtCommit as designed cannot fire: the commit carries the new epoch; only its descriptor is old. It needs the descriptor lifecycle in the DirectProposed probe."
+gaps = []
+
+[idxhot]
+row = 7
+workload = "topology"
+reach = "needs-invariant"
+faults = "None. One client updates the first backfilled key without think time while the index is Building."
+trigger = "Index declaration with writers that win every refresh attempt of one row."
+invariant = "Liveness (index build) measured while the writers run. A bound that starts at the heal or after the writers stop never fires."
+gaps = []
+
+[o21cap]
+row = 8
+workload = "queued"
+reach = "needs-invariant"
+faults = "A worker joins; the owner or one follower applies the new ready view up to 2 s late (its membership poll)."
+trigger = "Control ReadyPublished, then a POST /v1/requests table.create before the lagging worker installs the view."
+invariant = "SubmitDuringViewInstall (new): a submission while every ready holder is live is accepted within the 3 s install bound."
+gaps = [
+    "Liveness after heal and the receipt check do not see it: the patched refusal is a proved not_applied and a retry succeeds once the view installs.",
+]
+
+[acc2]
+row = 9
+workload = "topology"
+reach = "needs-workload"
+faults = "Ready validation fails after the fence: a split or move changes the table routing epoch during the backfill, or a Catalog read fails."
+trigger = "Index progress done on every shard, then a routing change or Catalog leader loss before the Ready plan."
+invariant = "FenceAfterValidation: every Data group direct lifecycle names a lifecycle the Catalog published (checked at quiescence and after each failed build)."
+gaps = [
+    "The design's `unique index over duplicates` does not exist: an index definition has no unique flag. The natural cause in index_build.rs is `index routing changed during backfill`.",
+]
+
+[acc3-ready-fence]
+row = 10
+workload = "cold"
+reach = "needs-trigger"
+faults = "Freeze or isolate the Timestamp quorum for longer than one service call (over 10 s) while a worker is between its sealed ready revision and the fence receipt."
+trigger = "Control ReadySealed for the joining worker (not a probe in the design list)."
+invariant = "Liveness (the join or cold start finishes) or ProcessExit of the joining worker."
+gaps = [
+    "Without a probe at ReadySealed the window is a few milliseconds per join.",
+]
+
+[acc3-delegation]
+row = 11
+workload = "membership"
+reach = "reachable"
+faults = "Rolling restart of a retained worker whose Control session to one voter was authenticated while its role was still prepared; delay frames between the voters."
+trigger = "CompleteRestart applied at one voter while another still holds the prepared session."
+invariant = "Liveness (the rolling restart finishes) or ProcessExit."
+gaps = []
+
+[fixc-owner-fence]
+row = 12
+workload = "queued"
+reach = "needs-invariant"
+faults = "Kill or fence the queue owner after a queued mutation sealed its manifest, while another ready holder keeps the complete accepted record."
+trigger = "Status Seal (prepared, undecided) for a queued transaction."
+invariant = "AcceptedSettlesInRun (new, part of the receipt check): in one run an accepted mutation with a surviving copy ends with its own result, never with an abort the fence caused."
+gaps = [
+    "`outcome::check` cannot see it: the abort is decided, so the conflict is a true not_applied. The regression proves the Status hunk; O08 is the process regression for the runtime hunk.",
+]
+
+[fixb-cold-publish]
+row = 13
+workload = "membership"
+reach = "needs-trigger"
+faults = "Stop every worker between the Mount commit of a system replacement and its group publications, then cold start the survivors and the retained candidate."
+trigger = "Control SystemReplacementMounted (not a probe in the design list)."
+invariant = "Liveness (replacement): the replacement publishes every group within its bound after the cold start."
+gaps = [
+    "A clean kill or crash image is enough. A cut inside the Mount write sequence (R-sim-05) is not needed.",
+]
+
+[rep2]
+row = 14
+workload = "membership"
+reach = "partly"
+faults = "Crash the Data leader after it entered joint consensus for a damaged-voter replacement, or lose the Replaced reply, and let the scheduler retry the plan."
+trigger = "Joint membership committed (Applied of a membership entry with two configs)."
+invariant = "Liveness (the replacement resumes from joint consensus). RetryCertifiesNamedRemoval compares the certified (removed, replacement) with the membership entries that committed."
+gaps = [
+    "RetryCertifiesNamedRemoval looks unreachable through the API: every caller derives `next` from the plan it retries, and one claim per group keeps a second change out (read from the code, not run).",
+]
+
+[rv-rep-3]
+row = 15
+workload = "membership"
+reach = "blocked"
+faults = "Wipe the replacement's pool after its Mount committed while its mount signing key survives, then restart it under the same identity."
+trigger = "SystemReplacementMounted and stable RF3 in every group."
+invariant = "WipedNeverVotes: votes under a node identity come from the storage generation that first voted under it."
+gaps = [
+    "H-05: sim-oltp/src/disk.rs mounts one ROOT per worker, so a wipe removes the signing key too and RestartMount::open refuses for another reason. It needs separate key and data volumes (S12).",
+]
+
+[fixb-voter-refresh]
+row = 16
+workload = "membership"
+reach = "needs-workload"
+faults = "Two sequential Control voter replacements, so the original voter set keeps no majority. A Data-only worker runs through both."
+trigger = "Second Control SystemReplacementPublished."
+invariant = "Liveness on a revocation probe: the Data-only worker adopts the published Control voters and refreshes revocations within its bound."
+gaps = [
+    "Needs data_worker_process::run nodes, which the harness does not start yet, and system replacement twice in one seed.",
+]
+
+[cap1]
+row = 17
+workload = "membership"
+reach = "needs-hook"
+faults = "One enrolled voter does not advertise data.index.reclaim (known_features_for_test), or joins later without it, while an index is retired and reclaimed."
+trigger = "Index retirement settled and its Timestamp pin released."
+invariant = "CapabilityBeforeUse: no ReclaimIndex entry commits while a voter of the group lacks the advert."
+gaps = [
+    "One binary: every replica still decodes the entry, so only the probe invariant can fire, never a diverging apply. Needs known_features_for_test under cfg(sim) and an index drop in the workload.",
+]
+
+[rv-rep-2]
+row = 18
+workload = "membership"
+reach = "nightly"
+faults = "1,025 system replacements (each revokes one worker), then a Control restart."
+trigger = "1,025th SystemReplacementMounted."
+invariant = "Liveness (Control): every Control voter reopens and serves after the restart."
+gaps = [
+    "A black-box seed needs 1,025 enrolled replacements. A seeded durable revocation set would make it affordable, but that is not a black-box step (design 3.5).",
+]
+
+[flake3-epoch]
+row = 19
+workload = "resources"
+reach = "unreachable"
+faults = "An append must be queued behind a vote, truncation or purge that still waits for the writer, then the node must lose power between the two writes."
+trigger = "Not available: RaftCore awaits save_vote, purge and truncate_after inline (openraft 0.10.0 core/raft_core.rs 2539-2603), so it never submits an append while one is pending."
+invariant = "MonotonicVote across the restart, then LogMatching and MajorityReached."
+gaps = [
+    "Looks unreachable through a RaftCore; the regression drives the log store directly (read from the code, not run).",
+    "H-01 would hide it anyway: storage jobs are atomic, so no crash lands between the early append and the vote sync.",
+]
+
+[rd2]
+row = 20
+workload = "cold"
+reach = "needs-probe"
+faults = "Control answers slowly or not at all (one-stream delay or partition of the Control leader) while several DirectLeader roles are warm."
+trigger = "Two or more ranges led by workers that called Timestamp or Catalog on the direct path within WARM_IDLE."
+invariant = "WarmReadsSerial (the probe rule in design 4.2): at most one background grant read in flight per worker."
+gaps = [
+    "The probe list has no warm-read start and end events. Liveness alone needs the warm reads to fill the Control lane during a cold fence, which one table and one range does not do.",
+]
+
+[qlane]
+row = 21
+workload = "queued"
+reach = "needs-invariant"
+faults = "Outgoing Storage lane of the owner full when an accepted batch prepares, seals or resolves."
+trigger = "Queue acceptance of a multi-range batch with small per-seed lanes."
+invariant = "AcceptedSettlesInRun (new): an accepted mutation never ends because a local lane was full."
+gaps = [
+    "`outcome::check` cannot see it: the abort is decided, so the refusal is a true not_applied.",
+    "S7: lane sizes are per seed only, no refusal at a chosen step. A one-slot lane with concurrent batches may reach it by load.",
+]
+
+[gc1-double-guard]
+row = 22
+workload = "resources"
+reach = "needs-invariant"
+faults = "None. Every append has two guards; cancellation is not needed."
+trigger = "Any append."
+invariant = "OneGuardPerAppend (new): GuardAcquired minus GuardReleased equals the appends in flight. ExactlyOnceRelease as designed holds under this patch, because both guards are acquired and released once."
+gaps = [
+    "The defect changes only the count. drain still waits for every write, so no history, log or liveness check can see it.",
+]

@@ -1,0 +1,28 @@
+# Reverted fix FIXB-cold-publish (phase 11, design section 4.2, row 13).
+schema = "nabedra.sim-bug/1"
+id = "fixb-cold-publish"
+bug = "FIXB-cold-publish"
+set = "membership"
+phase = 11
+class = "fence-lifecycle-order"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17", "R04"]
+fix_commits = ["c7249204deb25eff3c49afc677a2f0a4a7afc2e2", "d509f66bbc1e01b8687eec8429a236a0a1016ef5"]
+reverts = "d509f66bbc1e01b8687eec8429a236a0a1016ef5"
+port = "hand"
+port_notes = """
+The d509f66b hunk in authority/control/machine/system_recovery.rs reversed: Publish requires the replacement's
+original run instead of the revocation that Mount wrote, so a cold start between them makes Publish Stale
+forever. c7249204's resume path stays; it cannot publish past this check.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+workload = "membership"
+profile = ["replacement", "full-stop"]
+expect = ["Liveness"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_replication::authority::control::tests::system_recovery::r04_o17_cold_fence_after_mount_completes_publication"
+mode = "on"

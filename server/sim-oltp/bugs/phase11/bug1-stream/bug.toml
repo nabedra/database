@@ -1,0 +1,28 @@
+# Reverted fix BUG1-stream (phase 11, design section 4.2, row 3).
+schema = "nabedra.sim-bug/1"
+id = "bug1-stream"
+bug = "BUG1-stream"
+set = "queued"
+phase = 11
+class = "uncertain-outcome"
+guarantees = ["OLTP-G03"]
+scenarios = ["D03", "Q05"]
+fix_commits = ["c9d7c5b86280e174f613ab6ddacc747c7aafda0c", "d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+reverts = "c9d7c5b86280e174f613ab6ddacc747c7aafda0c"
+port = "hand"
+port_notes = """
+http.rs before d7b9d63c kept the direct gateway only with a declared length
+(`.zip(declared_length(..))`). PERF1 restructured that code, so the port filters the gateway on
+`length.is_some()` at its one use. A body without Content-Length skips the anchor check again.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+workload = "queued"
+profile = ["lost-http-reply", "streamed-retry"]
+expect = ["OneExecutionPerIdentity"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_runtime::worker_runtime::direct_gateway::tests::d03_q05_bug1_direct_retry_without_content_length_replays_original_result"
+mode = "on"

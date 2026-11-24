@@ -1,0 +1,33 @@
+# Reverted fix CAP1 (phase 11, design section 4.2, row 17).
+schema = "nabedra.sim-bug/1"
+id = "cap1"
+bug = "CAP1"
+set = "membership"
+phase = 11
+class = "membership-replacement-trust"
+guarantees = ["OLTP-G06", "OLTP-G08"]
+scenarios = ["O02", "O12"]
+fix_commits = ["9be40820c5d2385d24e8bc4d5b3b441820567f04", "414dcf79c8f29eb01a4b1a5961b078eacb477232", "2920a442d269135de2a7471001d6af9ea4c45853"]
+reverts = "2920a442d269135de2a7471001d6af9ea4c45853"
+port = "hand"
+port_notes = """
+Partial. Put back: the per-connection proposal gate 2920a442 replaced (check_index_reclamation_voters,
+peer_features set by HostedGroupManager) and the ungated reclamation loop. Not put back, because the code
+is gone: ALPN nabedra-otp/3, PeerFeature::IndexReclamation, RequestTarget::Feature and the session's
+required-feature refusal (9be40820), and the sender gates (414dcf79). The gate therefore asks for
+PeerFeature::DirectAdmission (otp/4), the surviving half of the original
+`direct_admission || alpn == INDEX_RECLAIM_ALPN`. With one binary every session passes both forms.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+workload = "membership"
+profile = ["mixed-features", "index-drop", "worker-join"]
+expect = ["CapabilityBeforeUse"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_replication::manager::damage_scheduler_tests::probe_cap1_no_reclamation_before_the_cluster_feature"
+mode = "on"
+probe = true
+failure_contains = ["before Control enabled data.index.reclaim"]

@@ -1,0 +1,31 @@
+# Reverted fix ACC3-ready-fence (phase 11, design section 4.2, row 10).
+schema = "nabedra.sim-bug/1"
+id = "acc3-ready-fence"
+bug = "ACC3-ready-fence"
+set = "membership"
+phase = 11
+class = "fence-lifecycle-order"
+guarantees = ["OLTP-G07"]
+scenarios = ["O15"]
+fix_commits = ["afbc048bb192cdb86b86bb279e80d911864a90ce"]
+reverts = "afbc048bb192cdb86b86bb279e80d911864a90ce"
+port = "clean"
+port_notes = """
+`git diff afbc048b afbc048b^` on oltp_runtime/bootstrap/registered.rs: the Timestamp ready fence of a
+registered startup is one call again instead of a startup_read loop.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+workload = "cold"
+profile = ["staggered-reopen", "rolling-restart", "freeze-two"]
+expect = ["Liveness", "ProcessExit"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_acceptance::probe_acc3_ready_fence_survives_a_timestamp_outage"
+mode = "on"
+probe = true
+needs_server = true
+timeout_s = 1800
+failure_contains = ["the joining worker exited when one ready-fence call failed"]

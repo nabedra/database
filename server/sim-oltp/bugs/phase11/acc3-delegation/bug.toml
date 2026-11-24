@@ -1,0 +1,29 @@
+# Reverted fix ACC3-delegation (phase 11, design section 4.2, row 11).
+schema = "nabedra.sim-bug/1"
+id = "acc3-delegation"
+bug = "ACC3-delegation"
+set = "membership"
+phase = 11
+class = "fence-lifecycle-order"
+guarantees = ["OLTP-G07", "OLTP-G08"]
+scenarios = ["O14", "R03"]
+fix_commits = ["6ad8a99c2561ba48c0bcb4a2b8252d9c1e2ad30b"]
+reverts = "6ad8a99c2561ba48c0bcb4a2b8252d9c1e2ad30b"
+port = "clean"
+port_notes = """
+`git diff 6ad8a99c 6ad8a99c^` on authority/control/forwarding.rs (moved to nabedra-oltp-replication): a
+Barrier or Propose over a prepared-only session is refused as invalid instead of deferred.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+workload = "membership"
+profile = ["rolling-restart", "leader-move"]
+expect = ["Liveness", "ProcessExit"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_replication::manager::damage_scheduler_tests::probe_acc3_delegation_waits_for_the_applied_promotion"
+mode = "on"
+probe = true
+failure_contains = ["from a worker whose promotion is not applied here"]
