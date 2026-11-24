@@ -1,0 +1,108 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-tooling-fixes-c3529f8-174835--specs-selftest.log",
+      "sha256": "9f0a611f646338e55a8bd02bcd9ccd8b0c8a1c208add10a9221e1a793f33d0a3"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "4bd8a938f83d5fb71f6c0277b01ddfadb5400642cc8e4cb0ded89885e522b414"
+    },
+    {
+      "name": "tla/TwoPhase.log",
+      "sha256": "00b8334af5c4a05ea2aea60a79b4a504bf47d78d280e661c16b120477941c539"
+    },
+    {
+      "name": "tla/mutant-commit_one_prepared.cex.json",
+      "sha256": "11ba55ef61bf1a9594237bf874606a007664a5c3a49ecb70fcaf9fec9697db77"
+    },
+    {
+      "name": "tla/mutant-commit_one_prepared.log",
+      "sha256": "74a6d1ff8ae8d8754f6ce8aa6e3ea396b3d36382e5838aed1945beb43c4453e0"
+    },
+    {
+      "name": "tla/mutant-no_resend.cex.json",
+      "sha256": "058b18dad6aab0f84436096b120789520770ed55bec52fa1a3eb64799dabf8b0"
+    },
+    {
+      "name": "tla/mutant-no_resend.log",
+      "sha256": "1cec41b86a5c8e83b7c93946c6820a2eccb62b2e3bebcd36e1292d729d8c10f8"
+    }
+  ],
+  "assertions": {
+    "executed": 9,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "specs-selftest",
+  "duration_s": 6.236,
+  "guarantees": [],
+  "kind": "T",
+  "mode": {
+    "tla": "exhaustive"
+  },
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T16:55:18.509919+00:00",
+    "request_id": "dr-tooling-fixes-c3529f8-174835",
+    "runner": "GitHub Actions 1000012156",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45441401265"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "c3529f80c335446ba87c44e7815824bf6df34b80",
+  "sim_core_hours": null,
+  "tla": {
+    "actions": 11,
+    "budget_s": 900,
+    "depth": 15,
+    "distinct_states": 2750,
+    "min_action_coverage": 8,
+    "mode": "exhaustive",
+    "mutants": [
+      {
+        "cex_length": 6,
+        "detail": "invariant Consistent violated, counterexample of 6 states",
+        "expect": "Consistent",
+        "name": "commit_one_prepared",
+        "observed": "Consistent",
+        "ok": true
+      },
+      {
+        "cex_length": 8,
+        "detail": "liveness property Termination violated, counterexample of 8 states (lasso)",
+        "expect": "Termination",
+        "name": "no_resend",
+        "observed": "Termination",
+        "ok": true
+      }
+    ],
+    "runs": [
+      {
+        "cfg": "TwoPhase.cfg",
+        "depth": 15,
+        "detail": "",
+        "distinct_states": 2750,
+        "duration_s": 4.3,
+        "states_left": 0,
+        "verdict": "pass"
+      }
+    ],
+    "spec": "specs/selftest/TwoPhase",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "uncovered": [],
+    "unmutated": [
+      "TypeOK"
+    ]
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}
