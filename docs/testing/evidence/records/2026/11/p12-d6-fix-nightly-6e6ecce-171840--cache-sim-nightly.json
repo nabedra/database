@@ -1,0 +1,50 @@
+{
+  "artifacts": [
+    {
+      "name": "p12-d6-fix-nightly-6e6ecce-171840--cache-sim-nightly.log",
+      "sha256": "6dec719c8b95104919f5a84c76832a14d0f771f8d19fa96c4c9b0598e38f523d"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-sim-nightly",
+  "duration_s": 3631.946,
+  "guarantees": [
+    "CACHE-G02",
+    "CACHE-G03",
+    "CACHE-G05",
+    "CACHE-G06",
+    "CACHE-G07",
+    "CACHE-G08",
+    "CACHE-G09"
+  ],
+  "kind": "S H",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T16:37:32.584040+00:00",
+    "request_id": "p12-d6-fix-nightly-6e6ecce-171840",
+    "runner": "GitHub Actions 1000012041",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45435613812"
+  },
+  "scenarios": [
+    "K01",
+    "K02",
+    "K03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "6e6eccec2d2606c21e735258282912565853e47f",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
