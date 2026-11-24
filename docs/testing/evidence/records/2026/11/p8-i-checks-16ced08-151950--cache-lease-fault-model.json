@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-i-checks-16ced08-151950--cache-lease-fault-model.log",
+      "sha256": "bcafde91ada42f589501548aa1f2497554771860dcf3c14926a0b9173f67cf4b"
+    }
+  ],
+  "assertions": {
+    "executed": 2,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-lease-fault-model",
+  "duration_s": 132.185,
+  "guarantees": [],
+  "kind": "S",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T14:24:13.194944+00:00",
+    "request_id": "p8-i-checks-16ced08-151950",
+    "runner": "GitHub Actions 1000011421",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45412853815"
+  },
+  "scenarios": [
+    "K03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "16ced08fec170e296f024395b5bb502363fdd018",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
