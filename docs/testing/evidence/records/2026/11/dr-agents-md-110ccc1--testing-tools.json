@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-agents-md-110ccc1--testing-tools.log",
+      "sha256": "26b1213d08988e8a1cf64b79c49a36b6a80fdc3cb52ce753fd5f0afa8e2f679c"
+    }
+  ],
+  "assertions": {
+    "executed": 127,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "testing-tools",
+  "duration_s": 9.688,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T14:57:35.012732+00:00",
+    "request_id": "dr-agents-md-110ccc1",
+    "runner": "GitHub Actions 1000011502",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45419675396"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "110ccc1d98c409a9f2a81f01ae4c02871a8695f0",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
