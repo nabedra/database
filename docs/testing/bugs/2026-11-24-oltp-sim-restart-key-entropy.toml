@@ -1,0 +1,17 @@
+id = "OLTP-sim-restart-key-entropy"
+title = "Simulated OLTP workers register restart keys drawn from unseeded entropy, so Control entries differ between runs of one seed"
+class = "other"
+module = "oltp"
+guarantees = []
+scenarios = []
+found_by = "campaign"
+found_date = "2026-11-24"
+lowest_regression = "unknown"
+seed = 1
+why_not_caught = "The run trace hashes frame metadata and history, which the key does not change, and no probe hashed an applied Control entry before P10-PROBES."
+invariant_added = "Two runs of one seed apply Control entries with the same digests. Seeds 1 to 3 each differed only in the public key and evidence of three register_restart_mount entries, and did not differ once the key in registered/restart.rs was fixed. Until that holds, the probe trace leaves Control digests out."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-23"
