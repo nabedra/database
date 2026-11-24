@@ -1252,6 +1252,14 @@ fn resolve_writes(
             Ok(())
         })?;
     }
+    #[cfg(feature = "sim")]
+    if let TxnDecision::Commit { commit_ts } = decision
+        && until == state.writes
+    {
+        nabedra_oltp_types::sim_probe::emit(|| {
+            nabedra_oltp_types::sim_probe::Probe::WritesResolved { commit_ts: commit_ts.get() }
+        });
+    }
     Ok(())
 }
 

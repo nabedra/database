@@ -20,9 +20,14 @@ use nabedra_sim::raft::MAX_VIOLATIONS;
 use serde_json::Value;
 
 use crate::probes::{ProbeEvent, Probes, describe};
+use protocol::Ledgers;
 
 pub const STEP: Duration = Duration::from_millis(10);
 pub const RECOVERY_LIMIT: Duration = Duration::from_secs(30);
+
+/// Prefix of the trace line that counts how often each probe rule ran. A rule it does not
+/// name did not run, and is not a pass.
+pub const RULES_RAN: &str = "probe rules ran";
 
 pub type TraceObserver = Arc<dyn Fn(u64, String) + Send + Sync>;
 
@@ -40,8 +45,8 @@ pub(crate) struct Checks {
     volumes: BTreeMap<u64, VolumeInfo>,
     deadlines: BTreeMap<String, Duration>,
     resources: BTreeMap<u64, ResourceUsage>,
-    /// Per worker: native leases outstanding at the resource baseline, from probes.
-    native_baseline: BTreeMap<u64, u64>,
+    /// Per worker: every ledger at the resource baseline, from probes.
+    ledger_baseline: BTreeMap<u64, Ledgers>,
     reported: BTreeSet<(String, String)>,
     violations: Vec<String>,
     trace: Option<TraceObserver>,
@@ -171,8 +176,8 @@ impl Invariants {
     pub fn capture_resources(&self, world: &World, worker: u64, stats: &Value) {
         let ledgers = self.ledgers(worker);
         let mut checks = self.checks.lock().unwrap();
-        if let Some((native, _)) = ledgers {
-            checks.native_baseline.insert(worker, native);
+        if let Some(ledgers) = ledgers {
+            checks.ledger_baseline.insert(worker, ledgers);
         }
         match ResourceUsage::from_stats(stats) {
             Some(usage) => {
@@ -187,23 +192,20 @@ impl Invariants {
         }
     }
 
-    /// Checks the public subset of ResourceBaseline. The full resource ledger
-    /// and RangeClock pending sets require their probe observations.
+    /// ResourceBaseline: every ledger the probes report is back at its baseline, and so is
+    /// the public subset in the worker's stats.
     pub fn check_resources(&self, world: &World, worker: u64, stats: &Value) {
         let ledgers = self.ledgers(worker);
         let mut checks = self.checks.lock().unwrap();
-        if let Some(ledgers) = ledgers
-            && !checks.ledgers_within(worker, ledgers)
-        {
-            let baseline = checks.native_baseline.get(&worker).copied();
-            checks.violate(
-                world,
-                "ResourceBaseline",
-                format!(
-                    "n{worker} probes report {} native leases (baseline {baseline:?}) and {} pending RangeClock commits after quiescence",
-                    ledgers.0, ledgers.1
-                ),
-            );
+        if let Some(now) = &ledgers {
+            let moved = checks.ledgers_moved(worker, now);
+            if !moved.is_empty() {
+                checks.violate(
+                    world,
+                    "ResourceBaseline",
+                    format!("n{worker} ledgers after quiescence: {}", moved.join(", ")),
+                );
+            }
         }
         let Some(now) = ResourceUsage::from_stats(stats) else {
             checks.violate(
@@ -233,9 +235,7 @@ impl Invariants {
     pub fn resources_at_baseline(&self, worker: u64, stats: &Value) -> bool {
         let ledgers = self.ledgers(worker);
         let checks = self.checks.lock().unwrap();
-        if let Some(ledgers) = ledgers
-            && !checks.ledgers_within(worker, ledgers)
-        {
+        if ledgers.is_some_and(|now| !checks.ledgers_moved(worker, &now).is_empty()) {
             return false;
         }
         let (Some(baseline), Some(now)) = (
@@ -325,6 +325,7 @@ impl Invariants {
         drop(checks);
         if let Some(probes) = &probes {
             probes.check_routes(world);
+            self.trace(world, format!("{RULES_RAN} {:?}", probes.exercised()));
         }
         if let Some(Err(error)) = probes.map(|probes| probes.finish()) {
             self.violate(
@@ -335,9 +336,9 @@ impl Invariants {
         }
     }
 
-    /// The probe ledgers of `worker`, without holding the checks lock.
-    fn ledgers(&self, worker: u64) -> Option<(u64, u64)> {
-        self.probes().map(|probes| probes.ledgers(worker))
+    /// A probe snapshot of `worker`'s ledgers, without holding the checks lock.
+    fn ledgers(&self, worker: u64) -> Option<Ledgers> {
+        self.probes().map(|probes| probes.snapshot(worker))
     }
 
     pub fn violate(&self, world: &World, invariant: &str, detail: impl Into<String>) {
@@ -369,14 +370,24 @@ fn deadline_message(label: &str, deadline: Duration) -> String {
 }
 
 impl Checks {
-    /// ResourceBaseline from probes: native leases back at (or below) the baseline and
-    /// no RangeClock commit pending.
-    fn ledgers_within(&self, worker: u64, (native, pending): (u64, u64)) -> bool {
-        pending == 0
-            && self
-                .native_baseline
-                .get(&worker)
-                .is_none_or(|baseline| native <= *baseline)
+    /// ResourceBaseline from probes: the ledgers of `worker` that differ from its baseline.
+    /// A ledger its baseline did not have starts at zero.
+    fn ledgers_moved(&self, worker: u64, now: &Ledgers) -> Vec<String> {
+        let Some(baseline) = self.ledger_baseline.get(&worker) else {
+            return vec!["no baseline snapshot".into()];
+        };
+        let keys: BTreeSet<_> = baseline.keys().chain(now.keys()).collect();
+        keys.into_iter()
+            .filter_map(|key| {
+                let at = |ledgers: &Ledgers| ledgers.get(key).copied().unwrap_or(0);
+                (at(baseline) != at(now)).then(|| {
+                    let group = key
+                        .1
+                        .map_or_else(String::new, |group| format!(" of group {group}"));
+                    format!("{:?}{group} {} (baseline {})", key.0, at(now), at(baseline))
+                })
+            })
+            .collect()
     }
 
     fn check_storage_devices(&mut self, world: &World, node: u64, usage: &ResourceUsage) {

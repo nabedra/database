@@ -675,6 +675,49 @@ impl<C: TypedConfig> TypedLogStore<C> {
         ))
     }
 }
+#[cfg(feature = "sim")]
+impl<C: TypedConfig> TypedLogStore<C> {
+    /// Reports the log entries on the volume when a core starts. The scan is extra IO that
+    /// only a simulation with a probe sink does, and its failure changes nothing.
+    async fn probe_recovered(&self, purged: Option<LogId>) {
+        use nabedra_oltp_types::sim_probe::{Probe, active, emit};
+        if !active() {
+            return;
+        }
+        let mut found: Vec<LogId> = Vec::new();
+        let mut start = 0u64;
+        loop {
+            let page = self
+                .store
+                .log_read_metadata(META, move |read| {
+                    let mut ids: Vec<LogId> = Vec::new();
+                    let after = start.checked_sub(1).map(|index| index_key(ID, index));
+                    read.scan_page(&[ID], after.as_ref().map(|key| &key[..]), 64, |_, value| {
+                        ids.push(serde_json::from_slice(value).map_err(|_| protocol("corrupt Raft entry ID"))?);
+                        Ok(())
+                    })?;
+                    read.encode(&ids)
+                })
+                .await;
+            let ids: Vec<LogId> = match page.map(|bytes| serde_json::from_slice(bytes.as_slice())) {
+                Ok(Ok(ids)) => ids,
+                _ => return,
+            };
+            match ids.last().and_then(|id| id.index.checked_add(1)) {
+                Some(next) => start = next,
+                None => break,
+            }
+            found.extend(ids);
+        }
+        emit(|| Probe::Recovered {
+            group: self.store.identity().group_id,
+            kind: self.store.identity().kind.clone(),
+            replica: self.node_id,
+            purged: purged.map(super::hosted::position),
+            entries: found.into_iter().map(super::hosted::position).collect(),
+        });
+    }
+}
 impl<C: TypedConfig> RaftLogReader<C> for TypedLogStore<C> {
     async fn try_get_log_entries<R: RangeBounds<u64> + Clone + Debug + Send>(
         &mut self,
@@ -785,6 +828,8 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             .map_err(disk)?;
         let (last_purged_log_id, last_log_id) =
             serde_json::from_slice(bytes.as_slice()).map_err(|_| invalid("corrupt log state"))?;
+        #[cfg(feature = "sim")]
+        self.probe_recovered(last_purged_log_id).await;
         Ok(LogState {
             last_purged_log_id,
             last_log_id,

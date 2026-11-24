@@ -17,7 +17,7 @@
 //! would run product destructors while the product is mid-step.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, Weak},
 };
 
@@ -27,11 +27,12 @@ use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
 pub use nabedra_oltp_types::sim_probe::{Ledger, LogEntry, Probe, ProbeSink, RouteRecord, Span};
+use nabedra_oltp_types::{sim_probe, types::GroupKind};
 
 use crate::{
     invariants::{
         Invariants,
-        protocol::{NOT_APPLIED_NEVER_COMMITTED, Origin, Protocol},
+        protocol::{Ledgers, NOT_APPLIED_NEVER_COMMITTED, Origin, Protocol},
     },
     trace::TraceFile,
 };
@@ -48,7 +49,7 @@ pub struct ProbeEvent {
     pub t_ns: u64,
     /// The simulated node that emitted it, if any.
     pub node: Option<u64>,
-    /// How many times that node was cut before.
+    /// How many times that node's process ended before.
     pub incarnation: u64,
     /// False when the node was already cut: a destructor of a dead incarnation sent it.
     pub live: bool,
@@ -77,6 +78,10 @@ impl Subscription {
 struct Hub {
     seq: u64,
     incarnations: BTreeMap<u64, u64>,
+    /// Nodes cut and not restarted yet.
+    down: BTreeSet<u64>,
+    /// The node whose ledgers are being snapshotted. Its probes come from no node context.
+    snapshot: Option<u64>,
     protocol: Protocol,
     subscribers: Vec<(Filter, mpsc::UnboundedSender<ProbeEvent>)>,
     trace: Option<TraceFile>,
@@ -96,6 +101,8 @@ impl Probes {
             hub: Arc::new(Mutex::new(Hub {
                 seq: 0,
                 incarnations: BTreeMap::new(),
+                down: BTreeSet::new(),
+                snapshot: None,
                 protocol: Protocol::new(),
                 subscribers: Vec::new(),
                 trace: TraceFile::from_env(world.seed(), workload),
@@ -134,50 +141,56 @@ impl Probes {
         Subscription { events }
     }
 
-    /// Native leases and RangeClock commits outstanding on `node` in its current
-    /// incarnation, as the probes report them.
-    pub fn ledgers(&self, node: u64) -> (u64, u64) {
-        let hub = self.lock();
-        (
-            hub.protocol.native_outstanding(node),
-            hub.protocol.clock_pending(node),
-        )
+    /// Reads every ledger the live resource owners of `node` hold, through `LedgerSnapshot`
+    /// probes.
+    pub fn snapshot(&self, node: u64) -> Ledgers {
+        {
+            let mut hub = self.lock();
+            hub.protocol.clear_ledgers(node);
+            hub.snapshot = Some(node);
+        }
+        sim_probe::snapshot_ledgers(node);
+        let mut hub = self.lock();
+        hub.snapshot = None;
+        hub.protocol.ledgers(node)
+    }
+
+    /// Native leases the probes saw acquired and not released on `node` in its current
+    /// incarnation.
+    pub fn native_outstanding(&self, node: u64) -> u64 {
+        self.lock().protocol.native_outstanding(node)
     }
 
     /// NotAppliedNeverCommitted: after a definite `not_applied` answer, no replica ever
-    /// commits a direct entry carrying that identity. Design 3.7 exempts nothing.
+    /// applies a direct entry that commits that identity. Design 3.7 exempts nothing, so
+    /// neither a retry of the ID nor another body under it excuses a commit.
     pub fn check_outcomes(&self, world: &World, events: &[Event]) {
-        let mut violations = Vec::new();
-        {
-            let hub = self.lock();
-            let committed: BTreeMap<_, _> = hub
-                .protocol
-                .dedup_records()
-                .map(|(identity, t_ns)| {
-                    let key = format!("{}/{}", identity.table, identity.key.history());
-                    ((key, identity.request_id.to_string()), t_ns)
-                })
-                .collect();
-            for event in events {
-                if event.kind != EventType::Fail
-                    || event.value.get("not_applied").and_then(Value::as_bool) != Some(true)
-                {
-                    continue;
-                }
-                let (Some(key), Some(request)) = (&event.key, &event.request_id) else {
-                    continue;
-                };
-                let Some(t_ns) = committed.get(&(key.clone(), request.clone())) else {
-                    continue;
-                };
-                violations.push(format!(
-                    "{key} request {request}: answered not_applied at history event {} but a replica committed it at {t_ns} ns",
-                    event.index
-                ));
+        let committed: BTreeMap<_, _> = self
+            .lock()
+            .protocol
+            .committed()
+            .map(|(identity, t_ns)| {
+                let key = format!("{}/{}", identity.table, identity.key.history());
+                ((key, identity.request_id.to_string()), t_ns)
+            })
+            .collect();
+        for event in events {
+            if event.kind != EventType::Fail
+                || event.value.get("not_applied").and_then(Value::as_bool) != Some(true)
+            {
+                continue;
             }
-        }
-        for detail in violations {
-            self.report(world, NOT_APPLIED_NEVER_COMMITTED, detail);
+            let Some(request) = &event.request_id else {
+                continue;
+            };
+            for key in keys(event, events) {
+                if let Some(t_ns) = committed.get(&(key.clone(), request.clone())) {
+                    self.report(world, NOT_APPLIED_NEVER_COMMITTED, format!(
+                        "{key} request {request}: answered not_applied at history event {} but a replica committed it at {t_ns} ns",
+                        event.index
+                    ));
+                }
+            }
         }
     }
 
@@ -210,11 +223,11 @@ impl Probes {
     }
 
     fn receive(&self, world: &World, probe: Probe) {
-        let node = sim::current_node();
         let t_ns = u64::try_from(world.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let live = node.is_none_or(|node| world.is_up(node));
         let (event, violations, invariants) = {
             let mut hub = self.lock();
+            let node = hub.snapshot.or_else(sim::current_node);
+            let live = node.is_none_or(|node| world.is_up(node));
             let incarnation = node.map_or(0, |node| *hub.incarnations.get(&node).unwrap_or(&0));
             let event = ProbeEvent {
                 seq: hub.seq,
@@ -258,10 +271,18 @@ impl Probes {
         let (node, action) = match event {
             SimEvent::Crash { node } => {
                 *hub.incarnations.entry(*node).or_default() += 1;
+                hub.down.insert(*node);
                 hub.protocol.crashed(*node);
                 (*node, "Crash")
             }
-            SimEvent::Restart { node } => (*node, "Restart"),
+            SimEvent::Restart { node } => {
+                // A restart without a cut follows a drained process.
+                if !hub.down.remove(node) {
+                    *hub.incarnations.entry(*node).or_default() += 1;
+                    hub.protocol.crashed(*node);
+                }
+                (*node, "Restart")
+            }
             SimEvent::Wipe { node, .. } => {
                 hub.protocol.wiped(*node);
                 (*node, "Wipe")
@@ -281,17 +302,50 @@ impl Probes {
     }
 }
 
-/// The probe's fields without its name and without digests. Digests cover payload bytes,
-/// which can hold values from `ring`'s own generator (the registered worker's restart
-/// key, for example), so they may differ between replays of one seed. The invariants
-/// compare them within a run; traces never record them.
+/// The `table/key` names an operation's history event covers: its own key, or the rows its
+/// invocation listed.
+fn keys(event: &Event, events: &[Event]) -> Vec<String> {
+    if let Some(key) = &event.key {
+        return vec![key.clone()];
+    }
+    events
+        .iter()
+        .filter(|invoke| {
+            invoke.kind == EventType::Invoke
+                && invoke.process == event.process
+                && invoke.request_id == event.request_id
+                && invoke.index < event.index
+        })
+        .filter_map(|invoke| invoke.value.as_array())
+        .flatten()
+        .filter_map(|row| row.get("key").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The probe's fields without its name.
+///
+/// The digest of an applied Control entry is left out (design 3.9): each Docker-profile
+/// worker registers its restart key there (`RegisterRestartMount`), and
+/// `registered/restart.rs` draws that key from `ring`'s `SystemRandom`, which no simulation
+/// seeds. Its public key and the evidence over it are the only bytes that differed between
+/// two runs of a seed, and they stopped differing once the key was fixed. The invariants
+/// still compare these digests within a run.
 pub(crate) fn fields(probe: &Probe) -> Map<String, Value> {
     let mut fields = match serde_json::to_value(probe) {
         Ok(Value::Object(fields)) => fields,
         _ => Map::new(),
     };
     fields.remove("probe");
-    fields.remove("digest");
+    if matches!(
+        probe,
+        Probe::Applied {
+            kind: GroupKind::Control,
+            ..
+        }
+    ) {
+        fields.remove("digest");
+    }
     fields
 }
 

@@ -161,6 +161,14 @@ impl RangeClock {
         if let Some(world) = nabedra_rt::sim::world() {
             world.track_registry("RangeClock", &clock);
         }
+        #[cfg(feature = "sim")]
+        nabedra_oltp_types::sim_probe::track_ledgers(&clock, |clock: &Self| {
+            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::LedgerSnapshot {
+                ledger: nabedra_oltp_types::sim_probe::Ledger::RangeClockPending,
+                group: Some(clock._store.identity().group_id),
+                outstanding: clock.lock().pending.len() as u64,
+            });
+        });
         registry.insert(key, Arc::downgrade(&clock));
         clock
     }
@@ -169,6 +177,12 @@ impl RangeClock {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The range's group (simulation only).
+    #[cfg(feature = "sim")]
+    pub fn group(&self) -> uuid::Uuid {
+        self._store.identity().group_id
     }
 
     /// The highest snapshot timestamp served on this range, if any.
@@ -245,21 +259,17 @@ impl RangeClock {
         }
         state.pending.insert(commit_ts, keys);
         #[cfg(feature = "sim")]
-        self.probe(&state, Some(commit_ts.get()));
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::DirectProposed {
+            group: self._store.identity().group_id,
+            commit_ts: commit_ts.get(),
+            term: token.term,
+        });
         Ok(())
     }
 
     /// Remove a pending commit. Idempotent.
     pub fn settle(&self, commit_ts: CommitTs) {
-        #[cfg(not(feature = "sim"))]
         let removed = self.lock().remove(commit_ts);
-        #[cfg(feature = "sim")]
-        let removed = {
-            let mut state = self.lock();
-            let removed = state.remove(commit_ts);
-            self.probe(&state, None);
-            removed
-        };
         if removed {
             self.changed.notify_waiters();
         }
@@ -278,8 +288,6 @@ impl RangeClock {
         state.leader_term = Some(term);
         state.generation += 1;
         state.clear();
-        #[cfg(feature = "sim")]
-        self.probe(&state, None);
         drop(state);
         self.changed.notify_waiters();
     }
@@ -293,8 +301,6 @@ impl RangeClock {
         state.leader_term = None;
         state.generation += 1;
         state.clear();
-        #[cfg(feature = "sim")]
-        self.probe(&state, None);
         drop(state);
         self.changed.notify_waiters();
     }
@@ -351,22 +357,6 @@ impl RangeClock {
         let generation = self.lock().generation;
         self.wait_since(generation, |state| !state.pending_keys.contains_key(&key))
             .await
-    }
-
-    /// Reports a registration at `commit_ts`, if any, and the pending ledger (simulation only).
-    #[cfg(feature = "sim")]
-    fn probe(&self, state: &ClockState, commit_ts: Option<u64>) {
-        use nabedra_oltp_types::sim_probe::{Ledger, Probe, emit};
-        let group = self._store.identity().group_id;
-        if let Some(commit_ts) = commit_ts {
-            let term = state.leader_term.unwrap_or_default();
-            emit(|| Probe::DirectProposed { group, commit_ts, term });
-        }
-        emit(|| Probe::LedgerSnapshot {
-            ledger: Ledger::RangeClockPending,
-            group: Some(group),
-            outstanding: state.pending.len() as u64,
-        });
     }
 
     async fn wait_since(

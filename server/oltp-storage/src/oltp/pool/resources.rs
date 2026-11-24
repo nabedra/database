@@ -404,6 +404,8 @@ impl WorkerSharedResources {
         if let Some(world) = nabedra_rt::sim::world() {
             world.track_registry("WorkerSharedResources", self);
         }
+        #[cfg(feature = "sim")]
+        nabedra_oltp_types::sim_probe::track_ledgers(self, Self::probe_ledgers);
         workers.insert(worker_id, Arc::downgrade(self));
         Ok(())
     }
@@ -519,7 +521,6 @@ impl WorkerSharedResources {
             #[cfg(feature = "sim")]
             nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GuardAcquired {
                 class: class_name(class),
-                outstanding: state.count as u64,
             });
         }
         let mut lease = NativeLease {
@@ -624,20 +625,9 @@ struct NativeLease {
 struct NativeSettlement(Arc<NativeLeases>);
 impl Drop for NativeSettlement {
     fn drop(&mut self) {
-        #[cfg(not(feature = "sim"))]
-        {
-            self.0.state.lock().expect("native lease state").count -= 1;
-        }
+        self.0.state.lock().expect("native lease state").count -= 1;
         #[cfg(feature = "sim")]
-        {
-            let mut state = self.0.state.lock().expect("native lease state");
-            state.count -= 1;
-            nabedra_oltp_types::sim_probe::emit(|| {
-                nabedra_oltp_types::sim_probe::Probe::GuardReleased {
-                    outstanding: state.count as u64,
-                }
-            });
-        }
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GuardReleased);
         self.0.settled.notify_waiters();
     }
 }
@@ -754,6 +744,52 @@ impl PreparedNative {
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(feature = "sim")]
+impl WorkerSharedResources {
+    /// Reports every transient ledger this worker owns (simulation only).
+    fn probe_ledgers(&self) {
+        use nabedra_oltp_types::sim_probe::{Ledger, Probe, emit};
+        let snapshot = |ledger, outstanding: u64| {
+            emit(|| Probe::LedgerSnapshot { ledger, group: None, outstanding })
+        };
+        let (progress, data) = (
+            self.buffer_bytes_used(ByteClass::Progress) as u64,
+            self.buffer_bytes_used(ByteClass::Data) as u64,
+        );
+        let (apply, decode, data_apply) = (
+            self.apply_bytes_used() as u64,
+            self.reply_decode_bytes_used() as u64,
+            self.data_apply_reply_bytes_used() as u64,
+        );
+        // `control_bytes_used` sums all eight arenas; the rest is the raw-reply pair.
+        let replies = (self.control_bytes_used() as u64)
+            .saturating_sub(progress + data + apply + decode + data_apply);
+        for (class, bytes) in [
+            ("progress", progress),
+            ("data", data),
+            ("apply", apply),
+            ("reply_decode", decode),
+            ("data_apply_reply", data_apply),
+            ("reply", replies),
+        ] {
+            snapshot(Ledger::ChargedBytes(class), bytes);
+        }
+        let node = self.scheduler_node_id();
+        for (_, threads, bytes) in self.scheduler().usage().into_iter().filter(|row| row.0 == node) {
+            snapshot(Ledger::ComputeGuards, threads);
+            snapshot(Ledger::SchedulerBytes, bytes);
+        }
+        let leases = self.leases.state.lock().expect("native lease state").count;
+        snapshot(Ledger::NativeLeases, leases as u64);
+        snapshot(Ledger::ScratchBytes, self.working_decode_bytes() as u64);
+        for disk in self.storage_reservations() {
+            let (device, reservations, bytes) = disk.ledger();
+            snapshot(Ledger::DiskReservations { device }, reservations);
+            snapshot(Ledger::DiskReservedBytes { device }, bytes);
+        }
+    }
+}
 
 #[cfg(feature = "sim")]
 fn class_name(class: ExecutionClass) -> &'static str {

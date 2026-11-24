@@ -6,9 +6,8 @@
 //! `Applied` probes show the same index twice in one incarnation, which
 //! `MonotonicCommit` reports.
 //!
-//! The `oltp-probes-planted` check applies the patch in a scratch worktree and runs
-//! this test there. On the shipped tree it fails, because nothing is applied twice; the
-//! T1 `oltp-sim` shards are the clean twin.
+//! The `oltp-probes-planted` check runs the same seeds in a scratch worktree twice: first
+//! without the patch, where `clean_twin_reports_nothing` must pass, then with it.
 
 use std::sync::Arc;
 
@@ -26,10 +25,10 @@ use uuid::Uuid;
 use super::{ProbeEvent, Probes};
 use crate::{
     invariants::{
-        Invariants,
+        Invariants, RULES_RAN,
         protocol::{MONOTONIC_COMMIT, NOT_APPLIED_NEVER_COMMITTED, PROBE_INVARIANTS},
     },
-    sweep::Defect,
+    sweep::{Defect, RunResult},
     workload::run_seed,
 };
 
@@ -132,27 +131,69 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-#[test]
-#[ignore = "needs probes/double-apply.patch applied; run by the oltp-probes-planted check"]
-fn planted_double_apply_is_caught_only_by_probes() {
+/// Runs `seed` twice and checks that it replays. Returns the first run.
+fn replayed(seed: u64) -> RunResult {
     assert!(
         nabedra_sim::runtime::SEEDED,
         "build with RUSTFLAGS=\"--cfg tokio_unstable\" and CARGO_TARGET_DIR=target/sim"
     );
+    let [run, replay] = [(); 2].map(|()| run_seed(seed, &mut workload_gen(seed), Defect::None));
+    let rules = run
+        .run
+        .trace_tail
+        .iter()
+        .find(|line| line.contains(RULES_RAN));
+    println!(
+        "seed {seed}: trace {:016x} ({} events), violations {:#?}, assertions {:?}, {}",
+        run.run.trace_hash,
+        run.run.trace_events,
+        run.run.violations,
+        run.assertions,
+        rules.expect("the probes were installed and the trace tail says which rules ran")
+    );
+    let outcome = |run: &RunResult| {
+        let run = &run.run;
+        (
+            run.trace_hash,
+            run.trace_events,
+            run.history.clone(),
+            run.violations.clone(),
+        )
+    };
+    assert_eq!(
+        outcome(&replay),
+        outcome(&run),
+        "seed {seed} did not replay"
+    );
+    run
+}
+
+fn seeds() -> std::ops::Range<u64> {
     let first = env_u64("NABEDRA_SEED", 1);
-    let count = env_u64("NABEDRA_SEEDS", 3);
-    for seed in first..first + count {
-        let run = run_seed(seed, &mut workload_gen(seed), Defect::None);
-        let replay = run_seed(seed, &mut workload_gen(seed), Defect::None);
-        let kinds = shrink::kinds(&run.run.violations);
-        println!(
-            "planted double-apply seed {seed}: trace {:016x} ({} events), kinds {kinds:?}, assertions {:?}",
-            run.run.trace_hash, run.run.trace_events, run.assertions
+    first..first + env_u64("NABEDRA_SEEDS", 3)
+}
+
+#[test]
+#[ignore = "needs probes installed in the smoke workload; run by the oltp-probes-planted check"]
+fn clean_twin_reports_nothing() {
+    for seed in seeds() {
+        let run = replayed(seed);
+        assert!(
+            run.run.violations.is_empty() && run.assertions.values().all(|passed| *passed),
+            "seed {seed}: the clean twin is not clean"
         );
+    }
+}
+
+#[test]
+#[ignore = "needs probes/double-apply.patch applied; run by the oltp-probes-planted check"]
+fn planted_double_apply_is_caught_only_by_probes() {
+    for seed in seeds() {
+        let run = replayed(seed);
+        let kinds = shrink::kinds(&run.run.violations);
         assert!(
             kinds.contains(MONOTONIC_COMMIT),
-            "seed {seed}: MonotonicCommit did not fire: {:?}",
-            run.run.violations
+            "seed {seed}: MonotonicCommit did not fire"
         );
         assert!(
             kinds
@@ -166,20 +207,5 @@ fn planted_double_apply_is_caught_only_by_probes() {
                 "seed {seed}: black-box assertion {name:?} failed"
             );
         }
-        assert_eq!(
-            (
-                replay.run.trace_hash,
-                replay.run.trace_events,
-                &replay.run.history,
-                &replay.run.violations
-            ),
-            (
-                run.run.trace_hash,
-                run.run.trace_events,
-                &run.run.history,
-                &run.run.violations
-            ),
-            "seed {seed}: the detection did not replay"
-        );
     }
 }

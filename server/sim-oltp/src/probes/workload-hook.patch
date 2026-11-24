@@ -1,0 +1,29 @@
+diff --git a/server/sim-oltp/src/workload.rs b/server/sim-oltp/src/workload.rs
+index 1a0b8a7b..9bf2f65f 100644
+--- a/server/sim-oltp/src/workload.rs
++++ b/server/sim-oltp/src/workload.rs
+@@ -29,6 +29,7 @@ use crate::{
+ };
+ 
+ const OPERATIONS: &str = "/v1/operations";
++const SMOKE: &str = "smoke";
+ const SETUP_DEADLINE: Duration = Duration::from_secs(20);
+ const SETTLE_LIMIT: Duration = Duration::from_secs(2);
+ 
+@@ -98,6 +99,7 @@ async fn execute(
+     observer(0, format!("configuration {}", configuration["hash"]));
+     let checks = Invariants::new();
+     checks.set_trace(observer.clone());
++    checks.install_probes(&world, SMOKE);
+     let mut history = History::default();
+     history.set_trace(observer.clone());
+     let mut assertions = BTreeMap::new();
+@@ -196,6 +198,8 @@ async fn execute(
+         );
+         checks.check_history(&world, &verdict);
+     }
++    checks.check_outcomes(&world, history.events());
++    assertions.insert("probe invariants", checks.probe_invariants_hold());
+     let mut capture = trace.lock().unwrap();
+     capture.flush_frames();
+     let trace = &capture.trace;

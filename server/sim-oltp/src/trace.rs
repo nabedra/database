@@ -6,10 +6,9 @@
 //! the one in `wave-p8/design-review.md` ("Trace format"), which
 //! `scripts/testing/tla_trace.py lint` checks.
 //!
-//! Action names come from [`ACTIONS`]. The design-review wave's `sim-mapping/oltp*.md`
-//! files did not exist when this sink was written, so every probe keeps its own name and
-//! its fields, except payload digests, go into `vars` under their probe field names.
-//! Update the table when the mapping lands. A replayed seed rewrites the same file with the same bytes.
+//! These traces are not mapped to a spec: no module spec or mapping exists yet, so every
+//! probe keeps its own name and fields. When `sha` is all zeros the commit was unknown, and
+//! the file belongs to no commit.
 
 use std::{
     io,
