@@ -1,4 +1,4 @@
-{"schema":"nabedra.catalog/1","count":2777,"tests":[
+{"schema":"nabedra.catalog/1","count":2781,"tests":[
 {"file":"orm/python/tests/events/test_client.py","hash":"202d453fc9458842","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_ack_uses_exact_offset_and_rejects_foreign_delivery_before_request","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"1c426c67dd348a60","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_claim_reuses_uuid_after_missing_response","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"b8d2b5c0d984c70e","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_error_metadata_and_duplicate_fields","lang":"python"},
@@ -2729,6 +2729,10 @@
 {"file":"server/tests/storage.rs","hash":"d453081df29cc098","id":"server/tests/storage.rs::partition_metadata_rejects_invalid_manifests","lang":"rust"},
 {"file":"server/tests/storage.rs","hash":"cfdff626f12a29f1","id":"server/tests/storage.rs::unreadable_catalog_never_resets","lang":"rust"},
 {"file":"server/tests/test_oltp_blackhole.py","hash":"7e3508224cd18775","id":"server/tests/test_oltp_blackhole.py::BlackholeTrafficTests::test_o06_o18_client_can_observe_recovery_within_the_failover_bound","lang":"python"},
+{"file":"server/tests/test_oltp_harness_ports.py","hash":"41ab014a53b9c648","id":"server/tests/test_oltp_harness_ports.py::Listener::test_a_child_owns_for_its_parent","lang":"python"},
+{"file":"server/tests/test_oltp_harness_ports.py","hash":"128040a300fcf9a7","id":"server/tests/test_oltp_harness_ports.py::Listener::test_a_listener_of_another_process","lang":"python"},
+{"file":"server/tests/test_oltp_harness_ports.py","hash":"1f405df13094ca85","id":"server/tests/test_oltp_harness_ports.py::Listener::test_no_listener","lang":"python"},
+{"file":"server/tests/test_oltp_harness_ports.py","hash":"dc086f9f0ab8783f","id":"server/tests/test_oltp_harness_ports.py::Listener::test_own_listener","lang":"python"},
 {"file":"server/tests/test_oltp_harness_ports.py","hash":"31cce3c02ee56448","id":"server/tests/test_oltp_harness_ports.py::PickPort::test_a_repeated_kernel_answer_is_not_handed_out_twice","lang":"python"},
 {"file":"server/tests/test_oltp_harness_ports.py","hash":"8d7fcd9b1e6fee0f","id":"server/tests/test_oltp_harness_ports.py::PickPort::test_concurrent_picks_are_distinct","lang":"python"},
 {"file":"server/tests/test_oltp_harness_ports.py","hash":"743b9953e82775a3","id":"server/tests/test_oltp_harness_ports.py::PickPort::test_every_pick_is_logged","lang":"python"},

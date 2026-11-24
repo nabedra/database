@@ -9,6 +9,7 @@ import io
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -145,6 +146,52 @@ class PickPort(Case):
         self.assertTrue(harness_ports.port_taken(held))
 
 
+@unittest.skipUnless(sys.platform.startswith('linux'), 'needs /proc')
+class Listener(Case):
+    def listening(self, host):
+        sock = socket.socket()
+        self.addCleanup(sock.close)
+        sock.bind((host, 0))
+        sock.listen()
+        return sock.getsockname()[1]
+
+    def child(self):
+        process = subprocess.Popen([sys.executable, '-c', 'import time; print(1, flush=True); time.sleep(60)'],
+                                   stdout=subprocess.PIPE)
+        self.addCleanup(lambda: (process.kill(), process.wait(), process.stdout.close()))
+        process.stdout.readline()
+        return process.pid
+
+    def test_own_listener(self):
+        for host in ('127.0.0.1', '0.0.0.0'):
+            self.assertEqual(harness_ports.listener(os.getpid(), '127.0.0.1', self.listening(host)),
+                             ('own', [os.getpid()]))
+
+    def test_a_listener_of_another_process(self):
+        port = self.listening('127.0.0.1')
+        self.assertEqual(harness_ports.listener(self.child(), '127.0.0.1', port), ('other', [os.getpid()]))
+
+    def test_a_child_owns_for_its_parent(self):
+        source = ('import socket, time; s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(); '
+                  'print(s.getsockname()[1], flush=True); time.sleep(60)')
+        # The shell is the launched process and its child has the listener, as under `sudo ip netns exec`.
+        process = subprocess.Popen(['sh', '-c', '"$0" -c "$1"; true', sys.executable, source],
+                                   stdout=subprocess.PIPE, start_new_session=True)
+        self.addCleanup(lambda: (os.killpg(process.pid, 9), process.wait(), process.stdout.close()))
+        port = int(process.stdout.readline())
+        state, owners = harness_ports.listener(process.pid, '127.0.0.1', port)
+        self.assertEqual((state, len(owners)), ('own', 1))
+        self.assertNotIn(process.pid, owners)
+
+    def test_no_listener(self):
+        port = self.listening('127.0.0.1')
+        # The same port on another address, and a socket that is bound and does not listen.
+        self.assertEqual(harness_ports.listener(os.getpid(), '127.0.0.2', port), ('none', []))
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            self.assertEqual(harness_ports.listener(os.getpid(), '127.0.0.1', sock.getsockname()[1]), ('none', []))
+
+
 class Workers(Case):
     def setUp(self):
         super().setUp()
@@ -173,14 +220,17 @@ class Workers(Case):
             self.bound(cluster, name)
 
     def bound(self, cluster, name):
-        """Wait until the worker's address has a listener, so a later worker on that address loses it."""
-        if cluster.config[name].get('fake') in ('crash', 'slow', 'silent'):
-            return
+        """Wait until the worker registered and, unless it delays that, its address has a listener, so a later
+        worker on that address loses it."""
         host, port = cluster.config[name]['bind'].rsplit(':', 1)
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline and cluster.workers[name].alive():
-            with contextlib.suppress(OSError), socket.create_connection((host, int(port)), timeout=1):
-                return
+            with contextlib.suppress(OSError):
+                if cluster.config[name].get('fake') in ('slow', 'silent'):
+                    (cluster.root / f'{name}.registered').stat()
+                    return
+                with socket.create_connection((host, int(port)), timeout=1):
+                    return
             time.sleep(0.02)
 
     def alive(self, cluster):

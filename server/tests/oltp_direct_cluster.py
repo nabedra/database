@@ -372,9 +372,38 @@ class Rf3Cluster:
         output = log_since(self.root / f'{name}.log', self.log_offsets.get(name, 0))
         config = self.config[name]
         ports = [int(config['bind'].rsplit(':', 1)[1]), int(config['node']['bind'].rsplit(':', 1)[1])]
+        exited = f'{self.label(name)} exited with status {self.workers[name].popen.returncode} during startup'
         if harness_ports.lost_bind(output, ports):
-            raise PortLost(f'{name} lost one of its ports {ports}:\n{output}')
-        raise AssertionError(f'{name} exited during startup:\n{output}')
+            raise PortLost(f'{exited} and lost one of its ports {ports}:\n{output}')
+        raise AssertionError(f'{exited}:\n{output}')
+
+    def label(self, name):
+        return f'{name} (pid {self.workers[name].pid})'
+
+    def check_answer(self, name, ready):
+        """A response at a worker's URL counts only from that worker: one of two workers with the same port
+        loses it, and the other answers for it."""
+        address = urlsplit(self.urls[name])
+        found = harness_ports.listener(self.workers[name].pid, address.hostname, address.port)
+        if not self.workers[name].alive():
+            self.check_lost_port(name)
+        if found is None or found[0] == 'own':
+            return
+        state, pids = found
+        output = log_since(self.root / f'{name}.log', self.log_offsets.get(name, 0))
+        if state == 'other':
+            holders = ', '.join(next((self.label(other) for other, process in self.workers.items()
+                                      if process.pid == pid), f'pid {pid}') for pid in pids) or 'an unknown process'
+            raise PortLost(f'{self.label(name)} does not listen on {address.netloc}; '
+                           f'{holders} does and answered for it:\n{output}')
+        assert not ready, f'{self.label(name)} stopped listening on {address.netloc} after it was ready:\n{output}'
+
+    def check_still_running(self, name):
+        """A worker that was ready and then exited fails the start. It had its ports, so this is no PortLost."""
+        if not self.workers[name].alive():
+            output = log_since(self.root / f'{name}.log', self.log_offsets.get(name, 0))
+            raise AssertionError(f'{self.label(name)} exited with status {self.workers[name].popen.returncode} '
+                                 f'after it was ready:\n{output}')
 
     def barrier_dir(self, name):
         return self.root / 'barriers' / name
@@ -389,11 +418,16 @@ class Rf3Cluster:
                     self.check_lost_port(name)
                 try:
                     status, ready = call(self.urls[name], '/health/ready', token=self.auth['data_token'], timeout=3)
-                    last[name] = ready
-                    if status == 200 and ready.get('replication_factor') == 3 and ready.get('ready_workers') == 3:
-                        pending.discard(name)
                 except (OSError, http.client.HTTPException, ValueError) as error:
                     last[name] = repr(error)
+                    continue
+                last[name] = ready
+                complete = status == 200 and ready.get('replication_factor') == 3 and ready.get('ready_workers') == 3
+                self.check_answer(name, complete)
+                if complete:
+                    pending.discard(name)
+            for name in sorted(set(names) - pending):
+                self.check_still_running(name)
             if pending:
                 assert time.monotonic() < deadline, f'workers not ready: {last}'
                 time.sleep(0.25)
