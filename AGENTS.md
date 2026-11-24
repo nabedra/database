@@ -36,6 +36,17 @@ refactor plan, or scenarios Q03, Q05 and O23 for an eligible operation, the
 direct path plan wins. The plan describes target behavior and does not claim
 the runtime implements it.
 
+# Design review
+
+Before implementing a plan that changes a topology or a protocol, or touches
+an L2 or L3 module, follow the [design review](.agents/skills/design-review/SKILL.md).
+The user decided on 2026-11-24 that such plans are modelled in raw TLA+ in
+`specs/<module>/` and checked with TLC, and that a counterexample fixes the plan
+before any code is written. Implementation starts only when the T checks pass
+with attested evidence and the user approves the reviewed plan. Code review then
+checks simulation traces against the spec. Kind T is defined ahead of its
+tooling; until it lands, follow the skill's interim rules.
+
 # ORM parity
 
 For every ORM change and any database change that affects ORM callers, follow the

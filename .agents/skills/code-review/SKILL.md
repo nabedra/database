@@ -37,6 +37,10 @@ local results. Use the [docs-only CI rule](../nabedra-change/SKILL.md).
   [ORM parity checks](../../../docs/testing/orm-parity.md).
 - Check compatibility against the approved plan. Resolve any unspecified
   change to a public contract before approving it.
+- When the plan had a [design review](../design-review/SKILL.md), or the
+  diff touches a protocol with a spec in `specs/`, include its T checks and
+  trace validation. A rejected trace is a blocking finding. When the code
+  follows the design and the design is wrong, return to the design review.
 
 Use [the sample rubrics](references/example.md) to pick 3 to 10 essential
 tests per use case. For variations, express each test as a property or
@@ -101,6 +105,9 @@ Evidence: <commands and run URLs, each with its raw result lines>
 Not run: <every selected check that did not execute, and why, or none>
 Reviewers: <non-author reviewers and their verdicts, or pending cross-model review>
 ```
+
+A pull request that carries a reviewed plan adds the `Design:` line from
+the [design review](../design-review/SKILL.md#pull-request-body).
 
 ## Rubric-style reviewing
 

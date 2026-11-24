@@ -66,6 +66,10 @@ In that table:
 | R | Real environment: processes, Docker, kind or real S3 |
 | P | Performance, through the paired A/B runner |
 | K | Soak |
+| T | TLA+ design spec checked by TLC or Apalache, and trace validation against it. See [design review](../../design-review/SKILL.md) |
+
+Kind T is not yet accepted by `matrix.py` or `run_check.py`. Until it is, follow the
+[interim rules](../../design-review/SKILL.md#tooling-status) and leave T out of register rows.
 
 Registers are hot files. Their owner for the wave makes every edit. A change never removes a
 required check kind to turn a cell green. Moving a kind to n/a needs a reason in the row and an
@@ -78,7 +82,7 @@ The level sets the required checks and the budgets.
 | Level | Typical scope | Required checks | T1 budget | Release budget |
 | --- | --- | --- | --- | --- |
 | L1 | Standalone engines, query semantics, scheduler internals, ORM clients | U with generators, D against a reference, F on every decoder, golden logic tests, R smoke in Docker, P paired A/B | 1,000 generated cases per property | 100,000 cases per property |
-| L2 | Replicated or coordinated protocols: controllers, leases, failover, logs, commit protocols, streaming recovery | L1 plus an M model of the core protocol, S with a nemesis, H with the module's checker, R with faults in Docker and kind, an upgrade and downgrade matrix | 500 seeds per touched workload | 200,000 clean seeds on the release SHA |
+| L2 | Replicated or coordinated protocols: controllers, leases, failover, logs, commit protocols, streaming recovery | L1 plus a T spec of the design with trace validation, an M model of the core protocol, S with a nemesis, H with the module's checker, R with faults in Docker and kind, an upgrade and downgrade matrix | 500 seeds per touched workload | 200,000 clean seeds on the release SHA |
 | L3 | The strictly serializable transactional path | L2 plus the strict-serializability checker, the bug-replay corpus at 80%, mutation runs on all touched code | 2,000 seeds | 1,000,000 seeds |
 
 The nightly core-hour split between modules lives in `docs/testing/modules.toml`, so the

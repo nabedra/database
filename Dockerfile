@@ -19,7 +19,7 @@ RUN case "$NABEDRA_ENGINE" in olap|oltp|cache) ;; *) exit 2 ;; esac && \
 # an empty stub. The stubs stay: the image build never compiles them, and keeping them
 # means test-only changes do not rebuild the image. The workspace crates' stub outputs
 # are cleaned so the real sources always rebuild, whatever their timestamps. The
-# dev-only `nabedra-check` and `nabedra-sim` members need only their manifests and
+# Dev-only harness and simulation members need only their manifests and
 # empty crate roots so Cargo can load the workspace.
 COPY server/Cargo.toml server/Cargo.lock ./
 COPY server/kv/Cargo.toml ./kv/
@@ -32,16 +32,17 @@ COPY server/transport/Cargo.toml ./transport/
 COPY server/oltp-storage/Cargo.toml ./oltp-storage/
 COPY server/oltp-replication/Cargo.toml ./oltp-replication/
 COPY server/sim/Cargo.toml ./sim/
-RUN mkdir -p src kv/src check/src rt/src protocol/src resources/src oltp-types/src transport/src oltp-storage/src oltp-replication/src sim/src tests examples /out/timings && \
-    echo 'fn main() {}' > src/main.rs && : > src/lib.rs && : > kv/src/lib.rs && : > check/src/lib.rs && : > rt/src/lib.rs && : > protocol/src/lib.rs && : > resources/src/lib.rs && : > oltp-types/src/lib.rs && : > transport/src/lib.rs && : > oltp-storage/src/lib.rs && : > oltp-replication/src/lib.rs && : > sim/src/lib.rs && \
+COPY server/sim-oltp/Cargo.toml ./sim-oltp/
+RUN mkdir -p src kv/src check/src rt/src protocol/src resources/src oltp-types/src transport/src oltp-storage/src oltp-replication/src sim/src sim-oltp/src tests examples /out/timings && \
+    echo 'fn main() {}' > src/main.rs && : > src/lib.rs && : > kv/src/lib.rs && : > check/src/lib.rs && : > rt/src/lib.rs && : > protocol/src/lib.rs && : > resources/src/lib.rs && : > oltp-types/src/lib.rs && : > transport/src/lib.rs && : > oltp-storage/src/lib.rs && : > oltp-replication/src/lib.rs && : > sim/src/lib.rs && : > sim-oltp/src/lib.rs && \
     awk -F'"' '/^\[\[(test|example)\]\]/ { dir = ($0 ~ /test/) ? "tests" : "examples"; next } \
                /^\[/ { dir = "" } \
                dir != "" && /^name *=/ { print dir "/" $2 ".rs" }' Cargo.toml | xargs -r touch && \
     cargo build --locked --release ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} --timings \
         --bin nabedra-db --no-default-features --features "$(cat /src/features)" && \
-    cargo clean --offline --locked --release -p nabedra-database -p nabedra-kv -p nabedra-rt -p nabedra-protocol -p nabedra-resources -p nabedra-oltp-types -p nabedra-transport -p nabedra-oltp-storage && \
+    cargo clean --offline --locked --release -p nabedra-database -p nabedra-kv -p nabedra-rt -p nabedra-protocol -p nabedra-resources -p nabedra-oltp-types -p nabedra-transport -p nabedra-oltp-storage -p nabedra-oltp-replication && \
     mv target/cargo-timings/cargo-timing.html /out/timings/dependencies.html && \
-    rm -rf target/cargo-timings src kv/src rt/src protocol/src resources/src oltp-types/src transport/src oltp-storage/src
+    rm -rf target/cargo-timings src kv/src rt/src protocol/src resources/src oltp-types/src transport/src oltp-storage/src oltp-replication/src
 
 # The real sources. The layer below keeps only the binary and the timing report, so a
 # `mode=max` cache export does not carry the server crate's build outputs.
@@ -52,6 +53,7 @@ COPY server/resources/src ./resources/src
 COPY server/oltp-types/src ./oltp-types/src
 COPY server/transport/src ./transport/src
 COPY server/oltp-storage/src ./oltp-storage/src
+COPY server/oltp-replication/src ./oltp-replication/src
 COPY server/src ./src
 RUN cargo build --locked --release ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} --timings \
         --bin nabedra-db --no-default-features --features "$(cat /src/features)" && \

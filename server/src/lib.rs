@@ -10,7 +10,7 @@ compile_error!("select exactly one engine: olap, oltp, or cache");
 #[cfg(all(feature = "cache", feature = "s3"))]
 compile_error!("the cache engine does not support S3");
 
-#[cfg(feature = "s3")]
+#[cfg(all(feature = "olap", feature = "s3"))]
 pub(crate) mod aws_http;
 #[cfg(feature = "cache")]
 pub mod cache;
@@ -45,14 +45,14 @@ pub use nabedra_oltp_storage::oltp;
 #[cfg(all(test, feature = "oltp"))]
 mod oltp_acceptance;
 #[cfg(feature = "oltp")]
-pub(crate) mod oltp_backup_repository;
+pub(crate) use nabedra_oltp_replication::oltp_backup_repository;
 #[cfg(feature = "oltp")]
-pub mod oltp_deployment;
+pub use nabedra_oltp_replication::oltp_deployment;
 #[cfg(all(test, feature = "oltp"))]
 #[path = "oltp_acceptance/growth.rs"]
 mod oltp_growth_acceptance;
 #[cfg(feature = "oltp")]
-pub mod oltp_replication;
+pub use nabedra_oltp_replication::oltp_replication;
 #[cfg(feature = "oltp")]
 pub mod oltp_runtime;
 #[cfg(any(feature = "olap", feature = "oltp"))]

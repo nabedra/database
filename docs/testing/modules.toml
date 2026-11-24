@@ -48,6 +48,7 @@ register = "docs/testing/guarantees/oltp.md"
 paths = [
   "server/src/oltp/**",
   "server/oltp-storage/**",
+  "server/oltp-replication/**",
   "server/oltp-types/**",
   "server/transport/**",
   "server/sim-oltp/**",
@@ -137,7 +138,8 @@ hot_paths = [
   "server/oltp-storage/src/oltp/mvcc/**",
   "server/oltp-storage/src/oltp/pool/**",
   "server/oltp-storage/src/oltp/codec.rs",
-  "server/src/oltp_replication/typed_log/**",
+  "server/oltp-replication/src/oltp_replication/typed_log.rs",
+  "server/oltp-replication/src/oltp_replication/typed_log/**",
   "server/transport/src/**",
   "server/protocol/src/protocol.rs",
 ]

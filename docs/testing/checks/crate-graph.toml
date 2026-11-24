@@ -6,8 +6,8 @@ kinds = ["U"]
 guarantees = []
 scenarios = []
 tiers = ["T0", "T1"]
-# Case 5 (planted source edge) runs against the storage skeleton. Case 6 (proof impls)
-# waits for the replication sources to move in P8-H and is recorded as not run until then.
+# Case 5 exercises the source edge in storage. Case 6 requires the replication proofs
+# and checks their placement and the rejection of a forged implementation.
 command = ["python3", "-m", "unittest", "discover", "-v", "-s", "scripts/testing", "-p", "test_crate_graph.py"]
 cwd = "."
 timeout_s = 600
