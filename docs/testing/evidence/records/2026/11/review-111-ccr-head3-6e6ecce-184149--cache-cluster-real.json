@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "review-111-ccr-head3-6e6ecce-184149--cache-cluster-real.log",
+      "sha256": "ec2d3a3bc643a73fe7932adfacd2f5e50feabe7da6f5fee11bf2aa0beffeb8bd"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-cluster-real",
+  "duration_s": 311.878,
+  "guarantees": [
+    "CACHE-G05",
+    "CACHE-G06"
+  ],
+  "kind": "R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T18:05:27.827799+00:00",
+    "request_id": "review-111-ccr-head3-6e6ecce-184149",
+    "runner": "GitHub Actions 1000012571",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45451382734"
+  },
+  "scenarios": [
+    "K03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "6e6eccec2d2606c21e735258282912565853e47f",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
