@@ -14,7 +14,6 @@ use std::{
     time::Duration,
 };
 use nabedra_rt::time::timeout_at;
-use tokio::net::TcpListener;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -244,7 +243,7 @@ async fn process(
     } else {
         None
     };
-    let listener = TcpListener::bind(config.bind)
+    let listener = bind_http(config.bind)
         .await
         .map_err(|_| unavailable())?;
     let address = listener.local_addr().map_err(|_| unavailable())?;
@@ -309,6 +308,22 @@ fn absolute(parent: &Path, path: &mut PathBuf) {
         *path = parent.join(&*path);
     }
 }
+#[cfg(not(feature = "sim"))]
+type ApiListener = nabedra_rt::net::TcpListener;
+#[cfg(feature = "sim")]
+type ApiListener = nabedra_rt::net::AnyListener;
+
+pub(super) async fn bind_http(addr: SocketAddr) -> std::io::Result<ApiListener> {
+    #[cfg(not(feature = "sim"))]
+    {
+        ApiListener::bind(addr).await
+    }
+    #[cfg(feature = "sim")]
+    {
+        nabedra_transport::backend::current().bind(addr).await
+    }
+}
+
 pub(super) fn regular(path: &Path, secret: bool) -> Result<std::fs::File, ProtocolError> {
     use std::os::unix::{
         fs::PermissionsExt,
@@ -351,4 +366,219 @@ fn unavailable() -> ProtocolError {
         "OLTP API supervisor unavailable",
         Outcome::Unknown,
     )
+}
+
+#[cfg(all(test, feature = "sim"))]
+mod sim_net_tests {
+    use super::*;
+    use crate::{
+        executor::Executor,
+        network::connector,
+        oltp_replication::multiplex::EndpointFuture,
+        oltp_runtime::{
+            application::PointRequest,
+            http_runtime::{HttpRuntime, OwnedReceipt},
+        },
+        request_queue::RequestRecord,
+        response::EncodedResponse,
+        scheduling::{MemoryCharge, ResourceScheduler},
+    };
+    use http_body_util::{BodyExt, Empty};
+    use hyper::{Request, body::Bytes};
+    use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+    use nabedra_rt::sim::{
+        self, NodeClock,
+        net::{Envelope, Fate, Kind, Planner},
+    };
+    use nabedra_sim::trace::Trace;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::sync::Notify;
+    use uuid::Uuid;
+
+    const HTTP_CLIENT: u64 = 1001;
+    const API_NODE: u64 = 101;
+
+    struct ReadyRuntime {
+        scheduler: ResourceScheduler,
+        calls: AtomicUsize,
+        in_flight: Notify,
+        resume: Notify,
+        finished: AtomicUsize,
+    }
+
+    impl HttpRuntime for ReadyRuntime {
+        fn ingress(&self) -> &Executor {
+            unreachable!("ready does not admit an operation")
+        }
+
+        fn scheduler(&self) -> ResourceScheduler {
+            self.scheduler.clone()
+        }
+
+        fn scheduler_node_id(&self) -> u64 {
+            API_NODE
+        }
+
+        fn submit(
+            self: Arc<Self>,
+            _: Vec<u8>,
+            _: MemoryCharge,
+            _: Option<PointRequest>,
+        ) -> EndpointFuture<'static, RequestRecord> {
+            unreachable!("ready does not submit work")
+        }
+
+        fn receipt(&self, _: Uuid, _: Uuid) -> EndpointFuture<'_, OwnedReceipt> {
+            unreachable!("ready does not read a receipt")
+        }
+
+        fn wait<'a>(&'a self, _: &'a RequestRecord) -> EndpointFuture<'a, EncodedResponse> {
+            unreachable!("ready does not wait for a receipt")
+        }
+
+        fn health(&self) -> EndpointFuture<'_, EncodedResponse> {
+            Box::pin(async {
+                assert_eq!(sim::current_node(), Some(API_NODE));
+                if self.calls.fetch_add(1, Ordering::Relaxed) == 1 {
+                    self.in_flight.notify_one();
+                    self.resume.notified().await;
+                    self.finished.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(EncodedResponse {
+                    status: 200,
+                    body: br#"{"ready":true}"#.to_vec(),
+                })
+            })
+        }
+    }
+
+    struct Record(Arc<Mutex<Trace>>, Duration);
+
+    impl Planner for Record {
+        fn message(&mut self, envelope: &Envelope<'_>) -> Fate {
+            assert_eq!(envelope.kind, Kind::Data);
+            assert!(envelope.alpn.is_none());
+            self.0.lock().unwrap().record(
+                envelope.seq,
+                format_args!(
+                    "http {} {:?} {:?} {:?} bytes={}",
+                    envelope.conn.0,
+                    envelope.direction,
+                    envelope.from,
+                    envelope.to,
+                    envelope.bytes.len(),
+                ),
+            );
+            Fate::Deliver { delay: self.1 }
+        }
+    }
+
+    #[test]
+    fn sim_net_reaches_oltp_handler() {
+        let seeded = sim::TOKIO_RNG_SEEDED;
+        assert!(seeded, "set RUSTFLAGS='--cfg tokio_unstable'");
+        let cases: u64 = std::env::var("NABEDRA_CASES").map_or(50, |value| value.parse().unwrap());
+        let first: u64 = std::env::var("NABEDRA_SEED").map_or(1, |value| value.parse().unwrap());
+        assert!(cases > 0);
+        for seed in first..first.checked_add(cases).unwrap() {
+            let run = || {
+                sim::run(seed, |world| async move {
+                    for node in [API_NODE, HTTP_CLIENT] {
+                        world.add_node(node, NodeClock::default());
+                    }
+                    let trace = Arc::new(Mutex::new(Trace::new()));
+                    world.set_net_planner(Record(
+                        trace.clone(),
+                        Duration::from_millis(1 + seed % 7),
+                    ));
+                    let listener =
+                        sim::in_node(API_NODE, bind_http("127.0.0.1:0".parse().unwrap()))
+                            .await
+                            .unwrap();
+                    let endpoint = listener.local_addr().unwrap();
+                    assert_eq!(endpoint.ip(), sim::net::node_ip(API_NODE));
+                    let runtime = Arc::new(ReadyRuntime {
+                        scheduler: ResourceScheduler::new(vec![(
+                            API_NODE,
+                            WorkerResources::default(),
+                        )])
+                        .unwrap(),
+                        calls: AtomicUsize::new(0),
+                        in_flight: Notify::new(),
+                        resume: Notify::new(),
+                        finished: AtomicUsize::new(0),
+                    });
+                    let app = crate::oltp_runtime::http::router_for(
+                        runtime.clone(),
+                        "sim-data".into(),
+                        "sim".into(),
+                    )
+                    .unwrap();
+                    let server = world.spawn_node(
+                        API_NODE,
+                        crate::network::serve_router_keep_alive(
+                            listener,
+                            app,
+                            None,
+                            std::future::pending(),
+                        ),
+                    );
+                    let ready = format!("http://{endpoint}/health/ready");
+                    let request = || Request::get(&ready).body(Empty::<Bytes>::new()).unwrap();
+                    let client = Client::builder(TokioExecutor::new())
+                        .build(connector::new(Duration::from_secs(1)));
+                    nabedra_rt::time::timeout(
+                        Duration::from_secs(10),
+                        sim::in_node(HTTP_CLIENT, async {
+                            let response = client.request(request()).await.unwrap();
+                            assert_eq!(response.status(), 200);
+                            assert_eq!(response.headers()["content-type"], "application/json");
+                            let body = response.into_body().collect().await.unwrap().to_bytes();
+                            assert_eq!(body.as_ref(), br#"{"ready":true}"#);
+                        }),
+                    )
+                    .await
+                    .expect("readiness request deadline");
+
+                    let pending = world.spawn_node(HTTP_CLIENT, client.request(request()));
+                    nabedra_rt::time::timeout(Duration::from_secs(10), runtime.in_flight.notified())
+                        .await
+                        .expect("second request reached the readiness handler");
+                    world.freeze(API_NODE);
+                    runtime.resume.notify_one();
+                    // Wake the handler while its node is frozen and give it a turn.
+                    nabedra_rt::time::sleep(Duration::from_millis(20)).await;
+                    assert_eq!(
+                        runtime.finished.load(Ordering::Relaxed),
+                        0,
+                        "frozen API ran"
+                    );
+                    assert!(!pending.is_finished(), "frozen API replied");
+                    world.crash(API_NODE);
+                    assert!(server.await.unwrap_err().is_cancelled());
+                    let result = nabedra_rt::time::timeout(Duration::from_secs(10), pending)
+                        .await
+                        .expect("client did not observe the API crash")
+                        .unwrap();
+                    assert!(result.is_err(), "crashed API replied");
+                    assert_eq!(runtime.calls.load(Ordering::Relaxed), 2);
+                    assert_eq!(
+                        runtime.finished.load(Ordering::Relaxed),
+                        0,
+                        "crashed API ran"
+                    );
+                    let trace = trace.lock().unwrap();
+                    assert!(trace.events() >= 2);
+                    trace.hash()
+                })
+            };
+            let hash = run();
+            assert_eq!(hash, run(), "handler replay diverged for seed {seed}");
+            println!("sim-net axum-handler seed={seed} replay={hash:016x}");
+        }
+        println!("sim-net axum-handler: {cases}/{cases} passing with matching replay hashes");
+    }
 }

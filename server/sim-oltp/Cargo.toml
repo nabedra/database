@@ -1,0 +1,24 @@
+[package]
+name = "nabedra-sim-oltp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+license = "MIT"
+publish = false
+description = "Deterministic simulation of Nabedra OLTP"
+
+[dependencies]
+nabedra-rt = { path = "../rt", features = ["sim"] }
+nabedra-sim = { path = "../sim" }
+nabedra-oltp-types = { path = "../oltp-types" }
+nabedra-protocol = { path = "../protocol" }
+nabedra-resources = { path = "../resources" }
+nabedra-transport = { path = "../transport", features = ["sim"] }
+tokio = { version = "=1.54.1", features = ["sync", "time"] }
+uuid = "=1.29.2"
+http-body-util = "=0.1.5"
+hyper = { version = "=1.12.0", features = ["client", "http1"] }
+hyper-util = { version = "=0.1.21", features = ["tokio"] }
+
+[dev-dependencies]
+nabedra-resources = { path = "../resources", features = ["test-defaults"] }

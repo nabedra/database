@@ -14,7 +14,7 @@ include = ["/src/", "/tests/", "/examples/", "/Cargo.lock", "/README.md", "/LICE
 
 [workspace]
 # `nabedra-kv` builds and tests alone: `cargo test -p nabedra-kv`.
-members = [".", "kv", "check", "rt", "protocol", "resources", "oltp-types", "transport", "oltp-storage", "oltp-replication", "sim"]
+members = [".", "kv", "check", "rt", "protocol", "resources", "oltp-types", "transport", "oltp-storage", "oltp-replication", "sim", "sim-oltp"]
 # Plain `cargo build` and `cargo test` here build only the server, as before `sim` joined.
 # The simulation crates are members but never default members: they enable
 # `nabedra-rt/sim`, which `src/main.rs` refuses to compile. Name them with `-p`.
@@ -38,7 +38,7 @@ oltp-backup-s3 = ["oltp", "s3"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-http-client"]
 # Simulation builds of the library only (nabedra-rt deterministic runtime). src/main.rs
 # refuses to compile with it, so no simulation build produces a server binary.
-sim = ["nabedra-rt/sim", "nabedra-rt/sim-openraft", "dep:nabedra-sim", "nabedra-kv?/sim", "nabedra-transport?/sim", "nabedra-oltp-storage?/sim"]
+sim = ["dep:tower-service", "nabedra-rt/sim", "nabedra-rt/sim-openraft", "dep:nabedra-sim", "nabedra-kv?/sim", "nabedra-transport?/sim", "nabedra-oltp-storage?/sim"]
 
 [dependencies]
 ring = "=0.17.14"
@@ -86,6 +86,7 @@ hyper = { version = "=1.12.0", default-features = false, features = ["client", "
 hyper-util = { version = "=0.1.21", default-features = false, features = ["client-legacy", "http1", "tokio"] }
 hyper-rustls = { version = "=0.27.10", default-features = false, features = ["http1", "tls12", "ring"] }
 tokio-util = { version = "=0.7.20", features = ["io"] }
+tower-service = { version = "=0.3.3", optional = true }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 
 [dependencies.arrow-ipc]

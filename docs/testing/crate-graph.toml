@@ -43,6 +43,10 @@ packages = ["nabedra-oltp-replication"]
 name = "server"
 packages = ["nabedra-database"]
 
+[[layer]]
+name = "oltp-simulation"
+packages = ["nabedra-sim-oltp"]
+
 # Top-level modules of the server crate and the package their code moves to. The ratchet counts
 # literal `crate::<dst>` references (phase 8 design, 2.1) from each mapped module into a module of
 # a higher layer. Modules not listed stay in `default`, the top of the graph.
@@ -103,6 +107,13 @@ normal = [
   "nabedra-transport", "nabedra-oltp-storage", "nabedra-oltp-replication",
 ]
 dev = ["nabedra-check", "nabedra-oltp-storage"]
+
+[planned.nabedra-sim-oltp]
+normal = [
+  "nabedra-rt", "nabedra-sim", "nabedra-oltp-types", "nabedra-protocol",
+  "nabedra-resources", "nabedra-transport",
+]
+dev = ["nabedra-resources"]
 
 # The upward edge the planted cases add: storage naming replication.
 [plant]

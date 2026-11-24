@@ -87,7 +87,7 @@ pub async fn run(path: PathBuf) -> Result<(), &'static str> {
         ));
     }
     let result = async {
-        let listener = tokio::net::TcpListener::bind(config.bind)
+        let listener = super::api_process::bind_http(config.bind)
             .await
             .map_err(|_| "worker HTTP bind failed")?;
         let application = runtime
