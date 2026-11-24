@@ -12,6 +12,10 @@
 # who did not write the patch and works from the quoted text alone, legal and illegal fixtures, and a run on unpatched
 # main first. Not detectable yet rows say so in `not_detectable_yet`.
 #
+# Count (2026-11-24). 15 rows have a rule: 2, 3, 4, 5, 6, 9, 10, 11, 13, 15, 16, 17, 18, 19, 20. 13 of them have a sensitive
+# patch, because 17 and 18 are partial. 12 of those 13 remain without 19, which looks unreachable: 2, 3, 4, 5, 6, 9, 10, 11,
+# 13, 15, 16, 20. Of the 12, 4 and 15 are blocked. Seven rows have no rule: 1, 7, 8, 12, 14, 21, 22. The bar is 15.
+#
 # reach: reachable (workload only), needs-workload, needs-client, needs-invariant, needs-probe,
 # needs-trigger, needs-fault, needs-hook, narrower or partly (than the original defect), nightly,
 # blocked (by a missing seam or an open finding), unreachable (through the product core).
@@ -188,16 +192,13 @@ row = 12
 workload = "queued"
 sensitivity = "sensitive"
 reach = "needs-invariant"
-not_detectable_yet = "not detectable yet: AcceptedSettlesInRun is not on main, and its quoted text may not cover the patched answer, see gaps."
+not_detectable_yet = "not detectable yet, and does not count (lead, 2026-11-24). Decision 9 names only this text for AcceptedSettlesInRun: docs/testing/scheduler-contract.md, \"Retain accepted work through individual failures while a request copy survives.\", and docs/testing/guarantees/oltp.md, OLTP-G07, \"Accepted queued work stays recoverable while a complete copy survives. A full worker stop abandons outstanding work.\" Neither sentence says accepted work cannot end in a definite refusal, which is what the patched build gives: a receipt that failed with the conflict `original execution authority was fenced`."
 faults = "Kill or fence the queue owner after a queued mutation sealed its manifest, while another ready holder keeps the complete accepted record."
 trigger = "Status Seal (prepared, undecided) for a queued transaction."
-rules = [
-    { rule = "AcceptedSettlesInRun", file = "docs/testing/scheduler-contract.md", where = "introduction", text = "Retain accepted work through individual failures while a request copy survives." },
-    { rule = "AcceptedSettlesInRun", file = "docs/testing/guarantees/oltp.md", where = "OLTP-G07", text = "Accepted queued work stays recoverable while a complete copy survives. A full worker stop abandons outstanding work." },
-]
+rules = []
 gaps = [
     "`outcome::check` cannot see it: the abort is decided, so the conflict is a true not_applied.",
-    "The quoted text says accepted work is retained and stays recoverable. It does not say that accepted work cannot end in a definite refusal, which is what the patched build gives (a receipt that failed with the conflict `original execution authority was fenced`). A rule on P11-QUEUED's unmerged branch, written from the contract's words, fires on a missing or abandoned answer and accepts any terminal one (db4d4fe9, read, not run). Rows 12 and 21 share one rule, so neither may reword it.",
+    "AcceptedSettlesInRun on P11-QUEUED's unmerged branch (db4d4fe9), written from the contract's words, fires on a missing or abandoned answer and accepts any terminal one (read, not run).",
 ]
 
 [fixb-cold-publish]
@@ -334,17 +335,14 @@ row = 21
 workload = "queued"
 sensitivity = "sensitive"
 reach = "needs-invariant"
-not_detectable_yet = "not detectable yet: AcceptedSettlesInRun is not on main, and its quoted text may not cover the patched answer, see gaps."
+not_detectable_yet = "not detectable yet, and does not count (lead, 2026-11-24). Decision 9 names only this text for AcceptedSettlesInRun: docs/testing/scheduler-contract.md, \"Retain accepted work through individual failures while a request copy survives.\", and docs/testing/guarantees/oltp.md, OLTP-G07, \"Accepted queued work stays recoverable while a complete copy survives. A full worker stop abandons outstanding work.\" Neither sentence says accepted work cannot end in a definite refusal, which is what the patched build gives: 429 `worker outgoing lane full (Storage)`, not_applied."
 faults = "Outgoing Storage lane of the owner full when an accepted batch prepares, seals or resolves."
 trigger = "Queue acceptance of a multi-range batch with small per-seed lanes."
-rules = [
-    { rule = "AcceptedSettlesInRun", file = "docs/testing/scheduler-contract.md", where = "introduction", text = "Retain accepted work through individual failures while a request copy survives." },
-    { rule = "AcceptedSettlesInRun", file = "docs/testing/guarantees/oltp.md", where = "OLTP-G07", text = "Accepted queued work stays recoverable while a complete copy survives. A full worker stop abandons outstanding work." },
-]
+rules = []
 gaps = [
     "`outcome::check` cannot see it: the abort is decided, so the refusal is a true not_applied.",
     "S7: lane sizes are per seed only, no refusal at a chosen step. A one-slot lane with concurrent batches may reach it by load.",
-    "The quoted text says accepted work is retained and stays recoverable. It does not say that accepted work cannot end in a definite refusal, which is what the patched build gives (429 `worker outgoing lane full (Storage)`, not_applied). A rule on P11-QUEUED's unmerged branch, written from the contract's words, fires on a missing or abandoned answer and accepts any terminal one (db4d4fe9, read, not run). Rows 12 and 21 share one rule, so neither may reword it.",
+    "AcceptedSettlesInRun on P11-QUEUED's unmerged branch (db4d4fe9), written from the contract's words, fires on a missing or abandoned answer and accepts any terminal one (read, not run).",
 ]
 
 [gc1-double-guard]

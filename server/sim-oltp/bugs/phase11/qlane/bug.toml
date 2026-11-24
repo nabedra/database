@@ -20,11 +20,13 @@ client.call again, so a full outgoing Storage lane refuses an accepted batch. Th
 workload = "queued"
 profile = ["lane-exhaust", "cross-range-batches"]
 # expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
-#   `AcceptedSettlesInRun`, docs/testing/scheduler-contract.md, introduction: "Retain accepted work through individual
-#     failures while a request copy survives."
-#   `AcceptedSettlesInRun`, docs/testing/guarantees/oltp.md, OLTP-G07: "Accepted queued work stays recoverable while a
-#     complete copy survives. A full worker stop abandons outstanding work."
-expect = ["AcceptedSettlesInRun"]
+#   Empty. Not detectable yet, and does not count (lead, 2026-11-24). Decision 9 names only this text for
+#     AcceptedSettlesInRun: docs/testing/scheduler-contract.md, "Retain accepted work through individual failures while
+#     a request copy survives.", and docs/testing/guarantees/oltp.md, OLTP-G07, "Accepted queued work stays recoverable
+#     while a complete copy survives. A full worker stop abandons outstanding work." Neither sentence says accepted work
+#     cannot end in a definite refusal, which is what the patched build gives: 429 `worker outgoing lane full
+#     (Storage)`, not_applied.
+expect = []
 seeds = [1, 10000]
 
 [regression]
