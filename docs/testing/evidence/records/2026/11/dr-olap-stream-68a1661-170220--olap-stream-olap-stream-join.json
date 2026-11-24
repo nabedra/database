@@ -1,0 +1,167 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-olap-stream-68a1661-170220--olap-stream-olap-stream-join.log",
+      "sha256": "fa2dfc2f951f2b440f4e64136797cae08195d2266491d30b69ab581e17b18e7d"
+    },
+    {
+      "name": "tla/OlapStreamJoin.fanout.log",
+      "sha256": "ce4d6622d0b9fb26eaf65205c68f74dc2cf23fe275b97e2379b7ce18064a909f"
+    },
+    {
+      "name": "tla/OlapStreamJoin.live.log",
+      "sha256": "53ca6bda9c7e029697a947de45d62bde345b5f5770cfdbbdb0108096e53400ff"
+    },
+    {
+      "name": "tla/OlapStreamJoin.log",
+      "sha256": "d37336697cf72c15c2e13181c0a4e57aeecbad9802aae8f238873dc3cfce8a1c"
+    },
+    {
+      "name": "tla/OlapStreamJoin.repair.log",
+      "sha256": "2fd2bea3cb69073958abc1dcf37d4d4fb148c88df8451c9a3bc35a1cc7193a78"
+    },
+    {
+      "name": "tla/mutant-prefix_join_seal_expiry.cex.json",
+      "sha256": "8488555562cb3267be04b358010044ba6f02e5f9d300ac5ae305c4dc1be842ee"
+    },
+    {
+      "name": "tla/mutant-prefix_join_seal_expiry.log",
+      "sha256": "666dbe321fdb7548c496c1930c96e64a44e536f42962278686a35ab3d541231e"
+    },
+    {
+      "name": "tla/mutant-prefix_join_seal_expiry_serving.cex.json",
+      "sha256": "89a2bd25397b68e657f0a796b98c046cf50019b8a7775d9662475ae6dbde4247"
+    },
+    {
+      "name": "tla/mutant-prefix_join_seal_expiry_serving.log",
+      "sha256": "7f940e0d116d6354b537e07a65ee8d7eb9d01fdb08225712a31a3aeb78e1eaec"
+    },
+    {
+      "name": "tla/mutant-seal_never_released.cex.json",
+      "sha256": "9499b05e72832a60611728b2f849ff6c50b52f53f040d82269ac9e995a3a1adb"
+    },
+    {
+      "name": "tla/mutant-seal_never_released.log",
+      "sha256": "f8aa283ec9539a3d852a51d36e69d8870c0ed0c42a6ce865cf4bdc413586c3c9"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "4d432fa6e10b7da360dd95840cec1aa757632747518ccb8d8efa8351e4d8cfe4"
+    }
+  ],
+  "assertions": {
+    "executed": 11,
+    "failed": 1,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "olap-stream-olap-stream-join",
+  "duration_s": 35.665,
+  "guarantees": [
+    "OLAP-STR-G04"
+  ],
+  "kind": "T",
+  "mode": {
+    "tla": "exhaustive"
+  },
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T16:02:53.633800+00:00",
+    "request_id": "dr-olap-stream-68a1661-170220",
+    "runner": "GitHub Actions 1000011770",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45432418977"
+  },
+  "scenarios": [
+    "ST04"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "68a16619fcba0b39d21b19c61830b4b6b3596bfe",
+  "sim_core_hours": null,
+  "tla": {
+    "actions": 11,
+    "budget_s": 900,
+    "depth": 14,
+    "distinct_states": 18401,
+    "min_action_coverage": 384,
+    "mode": "exhaustive",
+    "mutants": [
+      {
+        "cex_length": 5,
+        "detail": "invariant G04_ReadyHoldsReplied violated, counterexample of 5 states",
+        "expect": "G04_ReadyHoldsReplied",
+        "name": "prefix_join_seal_expiry",
+        "observed": "G04_ReadyHoldsReplied",
+        "ok": true
+      },
+      {
+        "cex_length": 6,
+        "detail": "invariant G04_ServingIsCurrent violated, counterexample of 6 states",
+        "expect": "G04_ServingIsCurrent",
+        "name": "prefix_join_seal_expiry_serving",
+        "observed": "G04_ServingIsCurrent",
+        "ok": true
+      },
+      {
+        "cex_length": 5,
+        "detail": "expected JoinProgress, got: deadlock violated, counterexample of 5 states",
+        "expect": "JoinProgress",
+        "name": "seal_never_released",
+        "observed": "Deadlock",
+        "ok": false
+      }
+    ],
+    "runs": [
+      {
+        "cfg": "OlapStreamJoin.cfg",
+        "depth": 14,
+        "detail": "",
+        "distinct_states": 18401,
+        "duration_s": 2.5,
+        "states_left": 0,
+        "verdict": "pass"
+      },
+      {
+        "cfg": "OlapStreamJoin.fanout.cfg",
+        "depth": 13,
+        "detail": "",
+        "distinct_states": 18001,
+        "duration_s": 2.5,
+        "states_left": 0,
+        "verdict": "pass"
+      },
+      {
+        "cfg": "OlapStreamJoin.live.cfg",
+        "depth": 14,
+        "detail": "",
+        "distinct_states": 192840,
+        "duration_s": 24.3,
+        "states_left": 0,
+        "verdict": "pass"
+      },
+      {
+        "cfg": "OlapStreamJoin.repair.cfg",
+        "depth": 13,
+        "detail": "",
+        "distinct_states": 23421,
+        "duration_s": 2.5,
+        "states_left": 0,
+        "verdict": "pass"
+      }
+    ],
+    "spec": "specs/olap-stream/join/OlapStreamJoin",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "uncovered": [],
+    "unmutated": [
+      "TypeOK"
+    ]
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}
