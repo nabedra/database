@@ -90,11 +90,14 @@ faithfully.
 | `clock/SimClock.cfg` | 1 ClockBound node, drift in {-1, 0, 1} per 4 ticks, base error 1, 9 ticks, 5 drift changes, 1 resync, 1 pause | 5 changes are the fewest that make the truncation budget matter (mutant `no_reanchor_budget`) |
 | `clock/SimClock.timers.cfg` | 1 node, 2 timers, 8 ticks, 2 drift changes, 1 pause, 1 wall jump, 1 monotonic stall | a timer armed before a drift change |
 
-Two bounds were split while iterating, because the first versions did not finish in the local budget. The disk faults
-that were in one configuration (every cut, with wipes) are three baselines, so **a wipe combined with a rename chain,
-and a 512-byte loss combined with a 4 KiB loss, are not covered together**. The clock baselines have one node each
-instead of three: no action reads two nodes' clocks, so every property is per node. The ClockBound faults and the
-timer faults are not combined.
+`SimDisk.full.cfg` takes the union of the disk bounds (3 names, 2 writes, 3 ops, 1 EIO, 2 crashes, 1 wipe, every cut),
+and `SimClock.joint.cfg` runs the ClockBound faults with a timer (3 drift changes). The smaller baselines were written
+first, because the full ones did not finish on a shared laptop. They stay because they are fast to run locally. Two
+things are still not combined: 2 wipes run only in `SimDisk.wipe.cfg`, and wall jumps and monotonic stalls only with
+timers. The clock baselines have one node each: no action reads two nodes' clocks, so every property is per node.
+
+The model draws a wipe's inode base from bases the volume never used. The shipped guard compares only with the
+previous base, so a repeat of an older one is possible there, with a chance of about 2^-20 per wipe.
 
 No fairness: liveness is optional at L1 and is not modelled. `MaxTime` and the budgets are the only state bounds.
 
@@ -110,14 +113,16 @@ The attested runs are named in the pull request body, with the SHA they tested. 
 | `SimDisk.cfg` | 283,511 | 17 | pass, exhaustive |
 | `SimDisk.p4k.cfg` | 36,577 | 16 | pass, exhaustive |
 | `SimDisk.wipe.cfg` | 6,307 | 14 | pass, exhaustive |
+| `SimDisk.full.cfg` | 1,078,645 | 19 | pass, exhaustive (Actions) |
 | `SimNet.cfg` | 19,080 | 16 | pass, exhaustive |
 | `SimNetRpc.cfg` | 210,456 | 21 | pass, exhaustive |
 | `SimClock.cfg` | 784,050 | 17 | pass, exhaustive |
 | `SimClock.timers.cfg` | 1,491,366 | 16 | pass, exhaustive |
+| `SimClock.joint.cfg` | 4,448,286 | 17 | pass, exhaustive (Actions) |
 
 Minimum action coverage (generated states): disk 270 over 17 actions, net 2,364 over 11, net-rpc 10,668 over 13, clock
-32,940 over 11. An earlier single `SimDisk.cfg` and a three-node `SimClock.cfg` stopped at the time budget. They are
-`not-run`, and the split above replaced them.
+32,940 over 11. A three-node `SimClock.cfg` stopped at the local time
+budget. It is `not-run`. The depth varies by one between runs with several workers.
 
 **What the pass means.** The baselines of `SimClock`, `SimNetRpc` and `SimDisk` model the proposed fix for findings 1,
 4 and 5, and `SimNet` models the OLTP planner, not the Cache one (finding 3). On the shipped behaviour those four
