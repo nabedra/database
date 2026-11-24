@@ -1,0 +1,95 @@
+{
+  "artifacts": [
+    {
+      "name": "sim-trace-a687e7a-174956--sim-two-phase-trace-incomplete.log",
+      "sha256": "df9114292160d953e5ae690d33e9a043694c43ff426da7b9d00ed62bedb24fa4"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "8967ea4e4aa7e7ca8b035ed93d5ecc5405120ffd6095812155265a83b9ca4559"
+    },
+    {
+      "name": "tla/trace-000.log",
+      "sha256": "6bbdb042f4786438229cb31f765d7a0b136e889e460a7fcc6697197926c5e013"
+    },
+    {
+      "name": "tla/trace-001.log",
+      "sha256": "fbe7b5cc0da5ddb6268a980c41c986c04314baa2c176df1856553f1eaad4eb5b"
+    },
+    {
+      "name": "tla/trace-002.log",
+      "sha256": "59f2fed281150b590b0514cfd0376d626e6532456f190826ac7707e6a206252a"
+    },
+    {
+      "name": "tla/trace-003.log",
+      "sha256": "46c8bef9b44dcc3cd7737541923ee0ef4b177354f7d1e4f6527a38243eda3f31"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 4,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "sim-two-phase-trace-incomplete",
+  "duration_s": 26.282,
+  "guarantees": [],
+  "kind": "T",
+  "mode": {
+    "tla": "trace"
+  },
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T16:53:44.545698+00:00",
+    "request_id": "sim-trace-a687e7a-174956",
+    "runner": "GitHub Actions 1000012135",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45441658940"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "a687e7a42f76f18c9107f106776872fa8deb8fc9",
+  "sim_core_hours": null,
+  "tla": {
+    "budget_s": 900,
+    "mode": "trace",
+    "spec": "specs/selftest/TwoPhase",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "traces": {
+      "accepted": 4,
+      "checked": 4,
+      "expected_rejections": 0,
+      "failing": [
+        {
+          "file": "TwoPhase-bare-actions.ndjson",
+          "index": null,
+          "reason": "accepted, but it must be rejected"
+        },
+        {
+          "file": "TwoPhase-misspelt-variable.ndjson",
+          "index": null,
+          "reason": "accepted, but it must be rejected"
+        },
+        {
+          "file": "TwoPhase-omitted-variable.ndjson",
+          "index": null,
+          "reason": "accepted, but it must be rejected"
+        },
+        {
+          "file": "TwoPhase-oversized-integer.ndjson",
+          "index": null,
+          "reason": "accepted, but it must be rejected"
+        }
+      ],
+      "rejected": 0
+    }
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}
