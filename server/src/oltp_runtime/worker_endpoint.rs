@@ -1328,21 +1328,11 @@ impl Endpoint for QueueEndpoint {
                 // Preflight authorizes reception. Check the local view before
                 // decoding, then recheck Control immediately before installation.
                 let local = self.replica.lock().map_err(|_| unavailable())?.authority();
-                let current = if local.view_is_behind(record.ready.view) {
-                    #[cfg(test)]
+                #[cfg(test)]
+                if local.view_is_behind(record.ready.view) {
                     super::recovery_tests::observe_o21_stale_copy(record.request_id);
-                    // Control published this view before the local membership
-                    // actor installed it. Keep the charged frame and wait
-                    // only for that exact view. An old owner or old frame
-                    // still fails the authoritative checks.
-                    let current = self.check(&session, &request).await?;
-                    wait_for_local_ready_view(&self.replica, current)
-                        .await
-                        .map_err(QueueError::protocol)?;
-                    current
-                } else {
-                    local
-                };
+                }
+                let current = local;
                 if session.remote() != current.owner {
                     return Err(QueueError::Stale.protocol());
                 }
