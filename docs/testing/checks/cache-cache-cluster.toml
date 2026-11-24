@@ -1,0 +1,12 @@
+# Design check of specs/cache/CacheCluster.tla: baselines with coverage, then every mutant.
+id = "cache-cache-cluster"
+module = "cache"
+kinds = ["T"]
+guarantees = ["CACHE-G02", "CACHE-G05", "CACHE-G06", "CACHE-G07", "CACHE-G09"]
+scenarios = ["K03"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/cache", "CacheCluster"]
+cwd = "."
+timeout_s = 20700
+needs = ["tlc"]
+result_parser = "tlc"
