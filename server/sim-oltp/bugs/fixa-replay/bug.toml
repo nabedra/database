@@ -35,3 +35,12 @@ an applied batch replay must return its result or an unknown outcome: Failed(Pro
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 0.93s
 fixa-replay: with the patch failed; verified (digest 8ce2dcc915f0141bf4efdd27cf8a769596641a0b3de5643ef557b801532c3960)
 """ }
+
+# Transcribed from that review. It applied the patch itself and ran the named test with and without it, locally and
+# unattested. The assertion type is P10-BUGS-2's reading of the failure text, not the review's word.
+[review]
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (LAND-113, independent review of PR #113, wrote none of it)"
+source = "https://github.com/zPy52/nabedra-database/pull/113, review of heads 67ea0db3 and 90b869b3"
+notes = "The replayed batch answers NotApplied for an applied mutation with the patch."

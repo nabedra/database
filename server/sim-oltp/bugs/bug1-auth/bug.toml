@@ -40,3 +40,12 @@ Verdict { valid: false, anomalies: [Anomaly { kind: "non-linearizable", detail: 
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 1.01s
 bug1-auth: with the patch failed; verified (digest 41b14a61c5962534320122e99c57f88b420855d36105ed442b26df5087ae82e3)
 """ }
+
+# Transcribed from that review. It applied the patch itself and ran the named test with and without it, locally and
+# unattested. The assertion type is P10-BUGS-2's reading of the failure text, not the review's word.
+[review]
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (LAND-113, independent review of PR #113, wrote none of it)"
+source = "https://github.com/zPy52/nabedra-database/pull/113, review of heads 67ea0db3 and 90b869b3"
+notes = "The history fixture reports failed-write-observed and non-linearizable with the patch."

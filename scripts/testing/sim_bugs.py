@@ -81,8 +81,12 @@ NOT_PRODUCT_CRATES = ("sim", "check", "fuzz", "rt")
 NOT_PRODUCT_PART = re.compile(r"sim|sim_\w*|\w*_sim|planted\w*|\w*acceptance\w*|testing|test_\w+|"
                               r"\w*fixtures?\w*|faults?")
 # Text through which a line can act in the simulator alone, or read the build or its environment.
-SIM_ONLY = re.compile(r'\bsim\b|\bnabedra_sim|\bcfg!|\bcfg_attr\b|\bfeature\s*=|\b(?:option_)?env!|\benv::|'
-                      r'\bvar_os\b|\binclude(?:_str|_bytes)?!|#\[path')
+SIM_ONLY = re.compile(r'\bsim(?:_\w+|ulat\w*)?\b|\w_sim\b|\bWorld\b|\bcfg|\bfeature\s*=|\btokio_unstable\b|'
+                      r'\b(?:option_)?env!|\benv::|\bvar_os\b|\bcurrent_exe\b|\binclude(?:_str|_bytes)?!|#\[path')
+# A fix may have moved test code, so its revert may add this one attribute.
+TEST_CFG = "#[cfg(test)]"
+# What a cfg predicate names when its code is compiled for the simulator and not for the product.
+SIM_CFG = re.compile(r'feature\s*=\s*"sim"|\btokio_unstable\b')
 LIBTEST_RESULT = re.compile(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed;", re.MULTILINE)
 NOT_RUN_MARKER = "not-run: sim-harness-missing"
 # Phase 8 moved these product trees into their own crates. Patches use the current paths; the
@@ -157,6 +161,8 @@ class Bug:
 # Git and patch helpers.
 
 def git(repo, *args, env=None, input=None, check=True):
+    # `git replace` refs would show another object under a commit's name.
+    env = dict(os.environ if env is None else env, GIT_NO_REPLACE_OBJECTS="1")
     result = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True,
                             env=env, input=input)
     if check and result.returncode:
@@ -319,6 +325,9 @@ def load_bugs(repo):
     seen = set()
     for path, phase in sorted(paths):
         name = path.relative_to(repo).as_posix()
+        if any(part.is_symlink() for part in (path.parent, path, *path.rglob("*"))):
+            errors.append(f"{name}: symbolic links are not allowed here")
+            continue
         try:
             with (path / "bug.toml").open("rb") as stream:
                 manifest = tomllib.load(stream)
@@ -374,6 +383,8 @@ def validate_manifest(bug, records, known_guarantees, require_evidence=True):
         problems.append(f"schema must be {SCHEMA!r}")
     if m["id"] != bug.path.name or not ID.fullmatch(m["id"]):
         problems.append("id must be kebab-case and equal to the directory name")
+    if (m["phase"] == 10) != (m["set"] == "direct"):
+        problems.append("phase 10 is the set direct, and the set direct is phase 10")
     if m["set"] not in SETS:
         problems.append(f"set must be one of {', '.join(SETS)}")
     if m["port"] not in PORTS:
@@ -390,7 +401,7 @@ def validate_manifest(bug, records, known_guarantees, require_evidence=True):
         return problems
     if not all(ID.fullmatch(name) for name in [m["workload"], *m["profile"]]):
         problems.append("workload and profile names must be kebab-case")
-    if m["seeds"] != [1, SEED_BUDGET]:
+    if m["seeds"] != [1, SEED_BUDGET] or any(type(seed) is not int for seed in m["seeds"]):
         problems.append(f"seeds must be [1, {SEED_BUDGET}]: a search may not choose its seeds")
     if "found_seed" in m and m["found_seed"] != m.get("detection", {}).get("seed"):
         problems.append("found_seed must be the seed of [detection]")
@@ -502,6 +513,8 @@ def validate_hits(bug):
         problems.append("detection.search must be the hash of a search in searches.jsonl")
     if any(same_person(d["confirmed_by"], d[key]) for key in ("patch_author", "workload_author")):
         problems.append("detection.confirmed_by wrote the patch or the workload, so it does not confirm")
+    if "review" in m and same_person(m["review"]["reviewer"], d["patch_author"]):
+        problems.append("review.reviewer wrote the patch, so it does not review it")
     # The tool cannot judge prose. It can refuse prose that does not name this hit and this patch,
     # or that names another hit.
     text, own = d["mechanism"], {d["trace_hash"], d["history_sha256"], d["search"], *m["fix_commits"]}
@@ -591,7 +604,8 @@ def validate_patch_paths(patch):
         problems.append("revert.patch has two sections for one file")
     for name, (_, added) in changed_lines(patch).items():
         problems.extend(f"revert.patch adds to {name} a line that can act only in the simulator, or that reads the "
-                        f"build or its environment: {line.strip()[:80]!r}" for line in added if SIM_ONLY.search(line))
+                        f"build or its environment: {line.strip()[:80]!r}" for line in added
+                        if SIM_ONLY.search(line) and line.strip() != TEST_CFG)
     return problems
 
 
@@ -610,16 +624,16 @@ def closing(code, start):
 
 
 def sim_only_lines(text):
-    """Line numbers of Rust code under a cfg predicate that names the `sim` feature. Approximate, and
-    it errs on the side of calling code simulator-only."""
+    """Line numbers of Rust code under a cfg predicate that names the simulator's build. Approximate,
+    and it errs on the side of calling code simulator-only."""
     code = RUST_TEXT.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), text)
     gated = set()
     for match in CFG.finditer(code):
         opening = match.start(2) if match.group(2) else match.start(3)
         end = closing(code, opening)
         predicate = text[opening:end]
-        if not re.search(r'feature\s*=\s*"sim"', predicate) or re.fullmatch(
-                r'\(\s*not\s*\(\s*feature\s*=\s*"sim"\s*\)\s*\)', predicate):
+        if not SIM_CFG.search(predicate) or re.fullmatch(
+                rf"\(\s*not\s*\(\s*(?:{SIM_CFG.pattern})\s*\)\s*\)", predicate):
             continue
         if match.group(1):
             return set(range(1, text.count("\n") + 2))
@@ -691,9 +705,9 @@ def regression_evidence(bug, repo):
         errors.append("the patch's changed lines differ from those its regression evidence "
                       f"used (digest {want}); verify it again and record the run")
     output = patched.get("output", "")
-    results = LIBTEST_RESULT.findall(output)
-    if results != [("FAILED", "0", "1")]:
-        errors.append("the recorded output must hold the run's one `test result: FAILED. 0 passed; 1 failed` line")
+    if set(LIBTEST_RESULT.findall(output)) != {("FAILED", "0", "1")}:
+        errors.append("the recorded output must hold the run's `test result: FAILED. 0 passed; 1 failed` line, and no "
+                      "other result")
     missing = [text for text in bug.regression.get("failure_contains", []) if text not in output]
     if missing:
         errors.append(f"the recorded output lacks the failure_contains text {missing}")
@@ -725,10 +739,11 @@ def regression_evidence(bug, repo):
         files = patch_files(bug.patch)
         tested = git(repo, "diff", "--no-renames", "--no-ext-diff", "--no-color", clean["sha"], patched["sha"],
                      "--", *files).stdout
-        extra = set(git(repo, "diff", "--no-renames", "--name-only", f"{patched['sha']}^", patched["sha"],
-                        check=False).stdout.split()) - set(files) - set(patch_files(getattr(bug, "probe", None) or ""))
-        if extra:
-            return [f"{patched['sha'][:8]}, which its regression run tested, also changes {sorted(extra)}"], uncounted
+        own = set(files) | set(patch_files(getattr(bug, "probe", None) or ""))
+        extras = [set(git(repo, "diff", "--no-renames", "--name-only", base, patched["sha"]).stdout.split()) - own
+                  for base in (f"{patched['sha']}^", clean["sha"])]
+        if all(extras):
+            return [f"{patched['sha'][:8]}, which its regression run tested, also changes {sorted(extras[0])}"], uncounted
     try:
         same_lines, same_hunks = digest(tested) == want, hunk_texts(tested) == hunk_texts(bug.patch)
     except Failure as error:
@@ -765,21 +780,31 @@ def static_count_problems(bug, repo):
     return problems
 
 
-def unrecorded_plans(bug, repo):
-    """Plans of earlier committed manifests that searches.jsonl does not account for."""
-    entries, _ = load_searches(bug)
-    known = [plan_of(bug.manifest)]
-    known += [entry["search"]["plan"] if "search" in entry else entry["never_searched"]["plan"] for entry in entries]
-    name, problems = (bug.path.relative_to(repo) / "bug.toml").as_posix(), []
+def manifest_history(bug, repo):
+    """(commit, manifest or None when it is unreadable) of every committed version."""
+    name = (bug.path.relative_to(repo) / "bug.toml").as_posix()
     for sha in git(repo, "log", "--full-history", "--format=%H", "HEAD", "--", name).stdout.split():
         text = git(repo, "show", f"{sha}:{name}", check=False)
         if text.returncode:
             continue
         try:
-            plan = plan_of(tomllib.loads(text.stdout))
+            yield sha, tomllib.loads(text.stdout)
         except ValueError:
+            yield sha, None
+
+
+def unrecorded_plans(bug, repo):
+    """Plans of earlier committed manifests that searches.jsonl does not account for."""
+    if git(repo, "rev-parse", "--is-shallow-repository").stdout.strip() != "false":
+        return ["the clone is shallow, so earlier plans and searches are not visible"]
+    entries, _ = load_searches(bug)
+    known, problems = [plan_of(bug.manifest)], []
+    known += [entry["search"]["plan"] if "search" in entry else entry["never_searched"]["plan"] for entry in entries]
+    for sha, manifest in manifest_history(bug, repo):
+        if manifest is None:
             problems.append(f"the manifest of {sha[:8]} is unreadable, so its plan is unknown")
             continue
+        plan = plan_of(manifest)
         if plan not in known:
             known.append(plan)
             problems.append(f"the manifest of {sha[:8]} has an earlier plan ({plan['workload']}, {plan['profile']}, "
@@ -846,12 +871,13 @@ def validate_searches(bug, repo):
     return problems
 
 
-def vanished_searches(repo):
-    """Records that were committed once and are gone. A replaced target stays listed."""
+def vanished(repo):
+    """Targets and records that were committed once and are gone. A replaced target stays listed, or
+    a set could pass because the target that was not found had left it."""
     names = git(repo, "log", "--full-history", "--format=", "--name-only", "HEAD", "--",
-                f":(glob){BUGS_DIR.as_posix()}/**/{SEARCHES}", check=False).stdout.split()
-    return [f"{name}: a record of searches cannot leave the tree" for name in dict.fromkeys(names)
-            if not (repo / name).is_file()]
+                *(f":(glob){BUGS_DIR.as_posix()}/**/{name}" for name in (SEARCHES, "bug.toml")), check=False).stdout
+    return [f"{name}: a committed target or record of searches cannot leave the tree"
+            for name in dict.fromkeys(names.split()) if not (repo / name).is_file()]
 
 
 def duplicate_problems(bugs):
@@ -914,6 +940,11 @@ def validate_git(bug, repo, require_evidence=True):
     if require_evidence:
         problems.extend(regression_evidence(bug, repo)[0])
         problems.extend(validate_searches(bug, repo))
+        for sha, old in manifest_history(bug, repo):
+            if old and any(old.get(key) != m[key] for key in ("bug", "phase", "set")):
+                problems.append(f"a target keeps its bug record, phase and set; {sha[:8]} has "
+                                f"{old.get('bug')}, {old.get('phase')}, {old.get('set')}")
+                break
     for rule in m.get("rules", []):
         if rule["source"].startswith(("docs/", "plans/")):
             source = git(repo, "show", f"HEAD:{rule['source']}", check=False).stdout
@@ -984,7 +1015,7 @@ class Scratch:
     def __init__(self, repo, keep=False):
         self.repo, self.keep = repo, keep
         base = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir())
-        self.path = base / f"sim-bugs-{os.getpid()}-{int(time.time())}"
+        self.path = base / f"sim-bugs-{os.getpid()}-{time.time_ns()}"
 
     def __enter__(self):
         if self.path.resolve() == self.repo.resolve():
@@ -1148,7 +1179,10 @@ def cmd_verify(repo, bugs, args, out):
     target = Path(args.target_dir or repo / "server/target/sim-bugs").resolve()
     log_path = Path(args.log or target / "sim-bugs-verify.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, CARGO_TARGET_DIR=str(target))
+    # The product's own build: no flag of the simulator's, and no inherited one.
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(("NABEDRA_SIM_", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"))}
+    env["CARGO_TARGET_DIR"] = str(target)
     need_server = any(b.regression.get("kind") == "acceptance" for b in bugs)
     verdicts = {}
     with log_path.open("a", encoding="utf-8") as log, Scratch(repo, args.keep) as scratch:
@@ -1548,9 +1582,23 @@ def judge(harness, bug, plan, label, exe, hit):
     return None, patched, clean
 
 
+def not_mains_build(repo):
+    """Why the unpatched build is not main's, or None. Only the bug directories may differ."""
+    base = git(repo, "merge-base", "HEAD", "refs/remotes/origin/main", check=False)
+    if base.returncode:
+        return "origin/main is unknown, so the unpatched build cannot be shown to be main's"
+    changed = git(repo, "diff", "--no-renames", "--name-only", base.stdout.strip(), "HEAD", "--", "server",
+                  "scripts/testing/sim_bugs.py", f":(exclude){BUGS_DIR.as_posix()}").stdout.split()
+    if changed:
+        return f"the unpatched build is not main's: HEAD changes {', '.join(changed[:3])} ({len(changed)} files)"
+    return None
+
+
 def count_problems(bug, repo, row, patched, clean):
     """Every reason why this hit is not a detection. Only an empty list counts."""
     problems = static_count_problems(bug, repo)
+    if other := not_mains_build(repo):
+        problems.append(other)
     m, d, seed = bug.manifest, bug.manifest.get("detection"), row["found_seed"]
     if row.get("rates") is None:
         problems.append("the base rate over the seeds tried is incomplete")
@@ -1689,6 +1737,17 @@ def describe(row):
             f"{row['patch_sha256']}{confirmed}")
 
 
+def regression_fails_now(repo, bug, args, target, out):
+    """Verify the target's regression on this commit and in this job, so that a recorded run is not
+    the only thing that shows the patch to be sensitive."""
+    options = argparse.Namespace(**{**vars(args), "target_dir": str(target / "regression"), "log": None})
+    try:
+        return cmd_verify(repo, [bug], options, out) == 0
+    except Failure as error:
+        print(f"{bug.id}: {error}", file=out, flush=True)
+        return False
+
+
 def differs_from_head(repo, scratch, bugs):
     """Files the run would read that are not the ones HEAD holds. The summary names HEAD."""
     status = git(repo, "status", "--porcelain", "--untracked-files=no").stdout
@@ -1728,8 +1787,8 @@ def cmd_run(repo, bugs, args, out, every=None):
         if differing:
             print(f"the working tree differs from HEAD, which this run would name: {', '.join(differing)}", file=out)
             return 1
-        merged = not git(repo, "merge-base", "--is-ancestor", sha, "origin/main", check=False).returncode
-        print(f"sim-bugs run on {sha} ({'on' if merged else 'not on'} origin/main), artifacts {out_dir}",
+        other = not_mains_build(repo)
+        print(f"sim-bugs run on {sha}, artifacts {out_dir}" + (f"\nNOT countable: {other}" if other else ""),
               file=out, flush=True)
         # The unpatched build first: every clean twin and the base rate run on it.
         clean_exe = build_sweep(args, scratch.path, env, log, sweep_binary(env, "clean"))
@@ -1738,6 +1797,9 @@ def cmd_run(repo, bugs, args, out, every=None):
             own = [time.monotonic() + args.search_timeout] if args.search_timeout else []
             harness.deadline = min(limits + own, default=None)
             row = search_bug(args, repo, scratch, harness, bug, Plan.of(bug, args))
+            if row["result"] == "found" and not regression_fails_now(repo, bug, args, target, out):
+                why = "its regression did not pass without the patch and fail with it in this run"
+                row.update(result="candidate", why=why, problems=[why])
             rows.append(row)
             print(describe(row), file=out, flush=True)
             if mode == "evidence" and row["result"] in SEARCHED:
@@ -1747,13 +1809,13 @@ def cmd_run(repo, bugs, args, out, every=None):
                                            if "search" in e and e["search"]["plan"] != row["search"]["plan"]]
                 print(f"sim-bugs-search: {canonical(row['search'])}", file=out, flush=True)
     summary = {"schema": "nabedra.sim-bugs-run/2", "evidence": "fault-model", "mode": mode,
-               "sha": sha, "on_main": merged, "set": args.set_name, "bugs": rows}
+               "sha": sha, "not_mains_build": other, "set": args.set_name, "bugs": rows}
     (out_dir / "sim-bugs-run.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     found = sum(row["result"] == ("rehearsed" if mode == "rehearsal" else "found") for row in rows)
     not_run = [row["id"] for row in rows if row["result"] == "not-run"]
     what = ("pipeline rehearsals completed; no reverted fix was searched for" if mode == "rehearsal" else
             "reverted fixes found within budget, each with a passing clean twin, a base rate over the same "
-            "seeds and a confirmed mechanism")
+            "seeds, a confirmed mechanism and its regression failing in this run")
     print(f"sim-bugs run{' (rehearsal)' if mode == 'rehearsal' else ''}: {found} of {len(rows)} "
           f"{what}; summary {out_dir / 'sim-bugs-run.json'}", file=out)
     if found == len(rows):
@@ -1900,7 +1962,7 @@ def main(argv=None, *, repo=REPO, out=sys.stdout):
     repo = Path(repo)
     try:
         bugs, errors = load_bugs(repo)
-        errors = [*errors, *vanished_searches(repo)]
+        errors = [*errors, *vanished(repo)]
         if errors:
             for error in errors:
                 print(error, file=out)
