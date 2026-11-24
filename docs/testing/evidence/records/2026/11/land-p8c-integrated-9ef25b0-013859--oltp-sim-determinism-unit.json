@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p8c-integrated-9ef25b0-013859--oltp-sim-determinism-unit.log",
+      "sha256": "5568a4b539cb9f4acacf6b8f8369cac48efc7f038880b14bc5e66e69a1ca990a"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim-determinism-unit",
+  "duration_s": 217.95,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T01:40:46.272375+00:00",
+    "request_id": "land-p8c-integrated-9ef25b0-013859",
+    "runner": "GitHub Actions 1000009248",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45306585066"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "9ef25b0f7d9231e17fc0fa6955677bb3d9912241",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

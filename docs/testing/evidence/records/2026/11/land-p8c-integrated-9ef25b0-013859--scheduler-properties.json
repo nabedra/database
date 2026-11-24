@@ -1,0 +1,45 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p8c-integrated-9ef25b0-013859--scheduler-properties.log",
+      "sha256": "597c4865b084ee7b72565f7d223ed5e6f8acfb1ff74e1f8310e29d6b385bc2c7"
+    }
+  ],
+  "assertions": {
+    "executed": 5,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "scheduler-properties",
+  "duration_s": 23.904,
+  "guarantees": [
+    "SCHED-G01",
+    "SCHED-G02",
+    "SCHED-G03",
+    "OLAP-G07"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T01:42:55.263153+00:00",
+    "request_id": "land-p8c-integrated-9ef25b0-013859",
+    "runner": "GitHub Actions 1000009256",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45306585066"
+  },
+  "scenarios": [
+    "U03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "9ef25b0f7d9231e17fc0fa6955677bb3d9912241",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
