@@ -455,7 +455,12 @@ pub(super) fn observe_decision(
 #[test]
 #[ignore = "internal child process, launched by acceptance_o15"]
 fn actual_runtime_child() {
-    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{filter::LevelFilter, prelude::*};
+    let (snapshot, policy) = if std::env::var_os("NABEDRA_OLTP_TEST_SHORT_DATA_SNAPSHOTS").is_some() {
+        (LevelFilter::INFO, LevelFilter::DEBUG)
+    } else {
+        (LevelFilter::OFF, LevelFilter::OFF)
+    };
     let _ = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -471,6 +476,12 @@ fn actual_runtime_child() {
                             "nabedra_database_server::oltp_replication::typed_log",
                             tracing::Level::WARN,
                         )
+                        .with_target(
+                            "nabedra_database_server::oltp_replication::typed_network::snapshot",
+                            snapshot,
+                        )
+                        .with_target("openraft::replication::snapshot_transmitter", snapshot)
+                        .with_target("openraft::engine::handler::log_handler", policy)
                         .with_target(
                             "nabedra_database_server::oltp_replication::service_rpc",
                             tracing::Level::DEBUG,
