@@ -1,0 +1,14 @@
+id = "TRANSPORT-SESSION-CAPACITY-PER-LANE"
+title = "Peer sessions had no per-lane capacity, so a full session pool could starve Raft progress"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G04", "OLTP-G09"]
+scenarios = ["D10", "C07"]
+found_by = "unknown"
+found_date = "2026-11-19"
+lowest_regression = "server/transport/src/transport/tests/sessions.rs d10_c07_full_session_pools_reject_typed_and_keep_raft_progress"
+seed = "unknown"
+why_not_caught = "unknown"
+invariant_added = "A full session lane refuses another session with a typed error, and Raft progress continues, on the loopback mTLS backend and on the simulated network."
+fix_commits = ["d234d76b748c7f1f0ccd61ed55eb871f2c108ba2"]
+revert_patch_ok = false
