@@ -6,9 +6,10 @@
 //! retry through the other gateway (D02) and reuse an earlier request ID with another body on
 //! the same and on another key (D03). A success reached by a retry is replayed through the
 //! other gateway and must return the original result (D02, D04, O10). After any definite
-//! refusal of a mutation the client sends another body under the same identity: if the
-//! first had committed, the dedup record refuses it as a conflict, which the client reports
-//! as `NotAppliedNeverCommitted` (OLTP-G04).
+//! refusal of a write the client reads the key: finding the refused request's unique value
+//! is `NotAppliedNeverCommitted` (OLTP-G04). Sending another body under the refused identity
+//! would not prove a commit, because a request that fell back to the queued path leaves a
+//! forward marker that also refuses the other body.
 
 use std::{
     collections::BTreeMap,
@@ -40,8 +41,6 @@ use crate::{
 const OPERATIONS: &str = "/v1/operations";
 /// Extra client time past the server's request deadline, so deadline answers arrive.
 const REPLY_GRACE: Duration = Duration::from_secs(1);
-/// The most attempts of one request before the client gives up.
-const MAX_ATTEMPTS: u32 = 64;
 /// Pause between a definite refusal and the identity check that follows it.
 const PROBE_PAUSE: Duration = Duration::from_millis(500);
 
@@ -185,7 +184,31 @@ impl Ctx {
     }
 
     /// Every client decision passes here. A trace adapter attaches to this call.
-    pub(crate) fn step(&self, _gateway: u64, _request: &Request, _step: Step<'_>) {}
+    pub(crate) fn step(&self, call: Call<'_>, step: Step<'_>) {
+        let answer = match step {
+            Step::Answered(completion) => answer(call.request, completion),
+            Step::DeadlineExpired | Step::ConnectionLost => Answer::Unknown,
+            Step::Sent | Step::Retry | Step::Replay | Step::GaveUp => return,
+        };
+        self.observed.lock().unwrap().attempts.push(Attempt {
+            id: call.request.id,
+            mutation: call.request.mutation(),
+            fresh: call.fresh,
+            gateway: call.gateway,
+            invoked: call.invoked,
+            completed: self.now_ms(),
+            answer,
+        });
+    }
+
+    fn again<'a>(&self, gateway: u64, request: &'a Request) -> Call<'a> {
+        Call {
+            gateway,
+            request,
+            fresh: false,
+            invoked: self.now_ms(),
+        }
+    }
 
     pub(crate) fn new_client(&self) -> Client {
         self.history.lock().unwrap().client()
@@ -205,6 +228,12 @@ pub(crate) struct Request {
 impl Request {
     fn mutation(&self) -> bool {
         self.name != "table.get"
+    }
+
+    /// Whether `value` is the one this request writes at its anchor. Deletes write none.
+    fn wrote(&self, value: &Value) -> bool {
+        let row = self.input.as_array().map_or(&self.input, |rows| &rows[0]);
+        value.is_number() && self.mutation() && row["value"] == *value
     }
 
     pub(crate) fn get(table: &str, key: i64, id: Uuid) -> Self {
@@ -269,6 +298,16 @@ impl Request {
     }
 }
 
+/// The call a client step is about.
+#[derive(Clone, Copy)]
+pub(crate) struct Call<'a> {
+    pub gateway: u64,
+    pub request: &'a Request,
+    /// A first attempt under a new identity.
+    pub fresh: bool,
+    pub invoked: u64,
+}
+
 /// One decision or observation of a client. Every one goes through [`Ctx::step`], so a trace
 /// adapter sees the whole client protocol in one place.
 pub(crate) enum Step<'a> {
@@ -314,7 +353,13 @@ pub(crate) async fn attempt(
         )
     };
     let started = ctx.now_ms();
-    ctx.step(gateway, request, Step::Sent);
+    let call = Call {
+        gateway,
+        request,
+        fresh,
+        invoked: started,
+    };
+    ctx.step(call, Step::Sent);
     let completion = match crate::client::request(
         node,
         gateway,
@@ -343,23 +388,13 @@ pub(crate) async fn attempt(
         Err(error) => Completion::Unknown(error),
     };
     ctx.step(
-        gateway,
-        request,
+        call,
         match &completion {
             Completion::Unknown(reason) if reason.ends_with(" deadline") => Step::DeadlineExpired,
             Completion::Unknown(_) => Step::ConnectionLost,
             completion => Step::Answered(completion),
         },
     );
-    ctx.observed.lock().unwrap().attempts.push(Attempt {
-        id: request.id,
-        mutation: request.mutation(),
-        fresh,
-        gateway,
-        invoked: started,
-        completed: ctx.now_ms(),
-        answer: answer(request, &completion),
-    });
     let recorded = match &completion {
         Completion::Ok(value) => Completion::Ok(value.clone()),
         Completion::Refused(error) => Completion::Refused(error.clone()),
@@ -447,16 +482,17 @@ async fn resolve(
         if switch {
             gateway = 1 - gateway;
         }
-        ctx.step(GATEWAYS[gateway], request, Step::Retry);
+        ctx.step(ctx.again(GATEWAYS[gateway], request), Step::Retry);
         pause(attempts).await;
     }
 }
 
 fn give_up(ctx: &Ctx, request: &Request, attempts: u32) -> bool {
     let budget = ctx.converge_by.load(Ordering::Acquire);
-    let ended = attempts >= MAX_ATTEMPTS || ctx.now_ms() >= budget;
+    // Only the convergence budget ends retries: a long cold start takes many of them.
+    let ended = ctx.now_ms() >= budget;
     if ended {
-        ctx.step(0, request, Step::GaveUp);
+        ctx.step(ctx.again(0, request), Step::GaveUp);
         ctx.observed.lock().unwrap().unresolved.push(format!(
             "{} {} key {} after {attempts} attempts",
             request.name, request.id, request.anchor
@@ -482,7 +518,7 @@ async fn replay(
     let mut attempts = 0;
     loop {
         attempts += 1;
-        ctx.step(GATEWAYS[gateway], request, Step::Replay);
+        ctx.step(ctx.again(GATEWAYS[gateway], request), Step::Replay);
         let completion = attempt(ctx, client, node, GATEWAYS[gateway], request, false).await;
         let result = match &completion {
             Completion::Ok(value) => value.to_string(),
@@ -628,7 +664,6 @@ pub(crate) async fn run(ctx: Ctx, program: Program) {
                     node,
                     planned.gateway,
                     &request,
-                    value,
                     error.code,
                 )
                 .await;
@@ -638,38 +673,32 @@ pub(crate) async fn run(ctx: Ctx, program: Program) {
     }
 }
 
-/// After a definite refusal, send another body under the same identity. A dedup record
-/// of the refused request makes the product refuse it as a conflict.
+/// After a definite refusal, read the key. Values are unique, so the refused value there
+/// means the request had committed.
 async fn check_not_applied(
     ctx: &Ctx,
     client: &mut Client,
     node: u64,
     gateway: usize,
     refused: &Request,
-    value: i64,
     code: ErrorCode,
 ) {
     time::sleep(PROBE_PAUSE).await;
-    let probe = Request::row(
-        "table.upsert",
-        &ctx.table,
-        refused.anchor,
-        value + 5,
-        refused.id,
-    );
-    let completion = resolve(ctx, client, node, gateway, true, &probe, false).await;
-    ctx.observed.lock().unwrap().not_applied_checks += 1;
-    if let Completion::Refused(error) = &completion
-        && error.code == ErrorCode::Conflict
-    {
-        ctx.checks.violate(
-            &ctx.world,
-            "NotAppliedNeverCommitted",
-            format!(
-                "{} {} on key {} was answered {code:?} not_applied, yet its identity holds a dedup record: another body under it was refused with conflict ({})",
-                refused.name, refused.id, refused.anchor, error.message
-            ),
-        );
+    let id = in_node(node, async { uuid_v4() }).await;
+    let read = Request::get(&ctx.table, refused.anchor, id);
+    let completion = resolve(ctx, client, node, gateway, true, &read, false).await;
+    if let Completion::Ok(row) = &completion {
+        ctx.observed.lock().unwrap().not_applied_checks += 1;
+        if refused.wrote(&row["value"]) {
+            ctx.checks.violate(
+                &ctx.world,
+                "NotAppliedNeverCommitted",
+                format!(
+                    "{} {} on key {} was answered {code:?} not_applied, yet the key holds its value: {row}",
+                    refused.name, refused.id, refused.anchor
+                ),
+            );
+        }
     }
 }
 
@@ -740,5 +769,26 @@ pub(crate) async fn burst(ctx: Ctx, gateway: usize, count: u64, first_key: i64) 
     }
     for task in tasks {
         let _ = task.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refused write is reported only when its own value is in the row. A conflict on the
+    /// refused identity is not enough: cold seed 6 found a forward marker there while the
+    /// row still held another request's value.
+    #[test]
+    fn only_the_refused_value_proves_a_commit() {
+        let insert = Request::row("table.insert", "t", 7, 2_000_580, Uuid::nil());
+        assert!(insert.wrote(&json!(2_000_580)));
+        assert!(!insert.wrote(&json!(2_000_320)));
+        assert!(!insert.wrote(&Value::Null));
+        let many = Request::insert_many("t", 7, 10, 2, 30, Uuid::nil());
+        assert!(many.wrote(&json!(10)));
+        let delete = Request::delete("t", 7, Uuid::nil());
+        assert!(!delete.wrote(&Value::Null));
+        assert!(!Request::get("t", 7, Uuid::nil()).wrote(&Value::Null));
     }
 }

@@ -46,6 +46,8 @@ pub(crate) struct Cluster {
     /// The last `direct.mutations` counter seen per worker, for leader tracking.
     mutations: BTreeMap<u64, u64>,
     leader: Option<u64>,
+    /// Workers whose retained restart is prepared and has not become ready yet.
+    prepared: BTreeSet<u64>,
     /// Per worker, the intervals in which it was frozen or had no process.
     outages: BTreeMap<u64, Vec<(u64, Option<u64>)>>,
 }
@@ -96,6 +98,7 @@ impl Cluster {
             frozen: BTreeSet::new(),
             mutations: BTreeMap::new(),
             leader: None,
+            prepared: BTreeSet::new(),
             outages: BTreeMap::new(),
         })
     }
@@ -500,7 +503,7 @@ impl Cluster {
 
     pub async fn crash(&mut self, node: u64, how: DiskCut) {
         self.record(format!("cut n{node} {how:?}"));
-        self.frozen.remove(&node);
+        self.unpause(node);
         if WORKERS.contains(&node) {
             self.outage(node);
         }
@@ -534,6 +537,11 @@ impl Cluster {
         if self.world.is_up(node) {
             self.crash(node, DiskCut::Kill).await;
         }
+        if self.prepared.contains(&node) {
+            // Control holds one preparation at a time, so a process that did not come up
+            // starts again from the bootstrap file it already has, as a supervisor does.
+            return self.start_prepared(index, how).await;
+        }
         let survivors: Vec<u64> = WORKERS
             .into_iter()
             .filter(|other| *other != node && self.is_running(*other))
@@ -564,11 +572,19 @@ impl Cluster {
             prepared["identity"].clone(),
             &connection["control_peers"],
         );
+        self.prepared.insert(node);
+        self.start_prepared(index, how).await
+    }
+
+    async fn start_prepared(&mut self, index: usize, how: DiskCut) -> Result<(), String> {
+        let node = WORKERS[index];
         disk::reopen(&self.world, &self.checks, node, how);
         self.start_worker(index).await?;
         let ready = self.wait_ready(&[node], true).await;
         if ready.is_err() {
             self.abort_start(node).await;
+        } else {
+            self.prepared.remove(&node);
         }
         ready
     }
@@ -577,7 +593,7 @@ impl Cluster {
     /// its startup error, which the caller reports.
     async fn abort_start(&mut self, node: u64) {
         self.record(format!("abort start n{node}"));
-        self.frozen.remove(&node);
+        self.unpause(node);
         if WORKERS.contains(&node) {
             self.outage(node);
         }
@@ -667,6 +683,7 @@ impl Cluster {
             }
             self.processes.remove(&node);
         }
+        self.prepared.clear();
         in_node(BOOTSTRAP_CLIENT, async { self.config.prepare_cold_start() }).await;
         for node in WORKERS {
             disk::reopen(&self.world, &self.checks, node, how);
@@ -776,6 +793,13 @@ impl Cluster {
         self.world.freeze(node);
     }
 
+    /// A killed process is no longer frozen: its next process must reach the network.
+    fn unpause(&mut self, node: u64) {
+        if self.frozen.remove(&node) {
+            self.net.update_plan(|plan| plan.resume(node));
+        }
+    }
+
     pub fn thaw(&mut self, node: u64) {
         if !self.frozen.remove(&node) {
             return;
@@ -842,7 +866,27 @@ fn overlaps(mut edges: Vec<(u64, i32)>) -> Vec<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::overlaps;
+    use std::sync::Arc;
+
+    use super::{Cluster, overlaps};
+    use crate::{config::Config, disk::DiskCut, invariants::Invariants};
+
+    /// Direct seed 8: a worker killed while frozen kept its links held, so its next process
+    /// had no network and never became ready.
+    #[test]
+    fn a_killed_frozen_worker_gets_its_network_back() {
+        nabedra_sim::runtime::run(1, |world| async move {
+            Config::sample(1).setup(&world);
+            let checks = Invariants::new();
+            let mut cluster = Cluster::new(world, checks, 1, Arc::new(|_, _| {}), |_, _, _| {})
+                .await
+                .unwrap();
+            cluster.freeze(2);
+            assert!(cluster.net().update_plan(|plan| plan.is_paused(2)));
+            cluster.crash(2, DiskCut::Kill).await;
+            assert!(!cluster.net().update_plan(|plan| plan.is_paused(2)));
+        });
+    }
 
     #[test]
     fn no_quorum_needs_two_overlapping_outages() {

@@ -146,13 +146,12 @@ impl Chaos {
         Some(fault)
     }
 
-    /// Nothing else is open and the cluster reports itself converged.
+    /// Nothing else is open, a pending split included, and the cluster reports itself
+    /// converged.
     async fn quiet(&self, cluster: &Cluster) -> bool {
-        let open = self
-            .log
-            .iter()
-            .any(|fault| fault.to.is_none() && fault.action != Action::Split);
-        !open && !self.faults.open() && cluster.converged().await
+        self.log.iter().all(|fault| fault.to.is_some())
+            && !self.faults.open()
+            && cluster.converged().await
     }
 
     fn reap_bursts(&mut self, cluster: &Cluster) {

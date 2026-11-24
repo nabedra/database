@@ -44,7 +44,7 @@ enum State {
         payload: Value,
         attempt: Option<JoinHandle<Result<Value, String>>>,
     },
-    Retired(Value),
+    Retired,
 }
 
 pub(crate) struct Move {
@@ -145,13 +145,13 @@ impl Move {
                     if let Some(faults) = &self.faults {
                         faults.slow(None);
                     }
-                    self.state = State::Retired(result);
+                    self.state = State::Retired;
                     Ok(())
                 } else {
                     Err(format!("move {id} phase {}", result["phase"]))
                 }
             }
-            State::Retired(_) => Ok(()),
+            State::Retired => Ok(()),
         }
     }
 
@@ -262,14 +262,14 @@ impl Move {
         healed: Duration,
     ) -> Result<(), String> {
         let deadline = healed + FINISH_LIMIT;
-        while !matches!(self.state, State::Retired(_)) {
+        while !matches!(self.state, State::Retired) {
             if let Err(error) = self.step(cluster, ctx).await {
                 if error != self.last_error {
                     cluster.record(format!("move step: {error}"));
                 }
                 self.last_error = error;
             }
-            if cluster.world.elapsed() >= deadline && !matches!(self.state, State::Retired(_)) {
+            if cluster.world.elapsed() >= deadline && !matches!(self.state, State::Retired) {
                 return Err(format!(
                     "the replica move did not retire within {FINISH_LIMIT:?} after the heal: {}",
                     self.last_error

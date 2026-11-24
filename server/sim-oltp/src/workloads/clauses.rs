@@ -327,9 +327,17 @@ impl Evidence<'_> {
     }
 
     /// D10: callers across a dropped session see a success, an unknown outcome or overload.
+    /// An attempt that also met another fault proves nothing about the drop.
     fn session_drops(&self, out: &mut Outcome) {
         for &at in self.session_drops {
             for attempt in self.attempts.iter().filter(|attempt| attempt.spans(at)) {
+                let alone = self.faults.iter().all(|fault| {
+                    let (from, to) = Self::window(fault);
+                    fault.action == Action::SessionDrop || !attempt.overlaps(from, to)
+                });
+                if !alone {
+                    continue;
+                }
                 out.clauses.insert("D10:session-drop");
                 let allowed = match attempt.answer {
                     Answer::Committed | Answer::Ok | Answer::Unknown => true,
@@ -463,6 +471,33 @@ mod tests {
         assert!(!run(&resolved(6_000, true)), "the old leader was back");
         assert!(!run(&resolved(2_000, false)), "no replay was compared");
         assert!(!run(&BTreeMap::new()));
+    }
+
+    /// Direct seed 2: the refusal came from the partition that was open, not from the drop.
+    #[test]
+    fn a_session_drop_is_judged_only_without_another_fault() {
+        let refused = attempt(
+            1,
+            1_000,
+            1_500,
+            Answer::Refused(ErrorCode::StorageUnavailable),
+        );
+        let run = |faults: &[Fault]| {
+            let evidence = Evidence {
+                faults,
+                attempts: std::slice::from_ref(&refused),
+                resolved: &BTreeMap::new(),
+                reuse_same_key: 0,
+                reuse_other_key: 0,
+                session_drops: &[1_400],
+                no_quorum: &[],
+                deadline_ms: 300,
+            };
+            let out = evidence.evaluate();
+            (out.clauses.len(), out.violations.len())
+        };
+        assert_eq!(run(&[]), (1, 1));
+        assert_eq!(run(&[fault(Action::Partition, 1, 500, 2_000)]), (0, 0));
     }
 
     #[test]
