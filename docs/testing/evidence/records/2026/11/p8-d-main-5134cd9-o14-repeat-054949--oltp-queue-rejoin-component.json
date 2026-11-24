@@ -1,0 +1,44 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-d-main-5134cd9-o14-repeat-054949--oltp-queue-rejoin-component.log",
+      "sha256": "f6d0286c20410b5106a331d48e9c1e7298e23f7f4da808637cb2ef38c7e211c9"
+    }
+  ],
+  "assertions": {
+    "executed": 12,
+    "failed": 1,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-queue-rejoin-component",
+  "duration_s": 467.68,
+  "guarantees": [],
+  "kind": "R",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T04:51:46.633819+00:00",
+    "request_id": "p8-d-main-5134cd9-o14-repeat-054949",
+    "runner": "GitHub Actions 1000009860",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45329066299"
+  },
+  "scenarios": [
+    "O14",
+    "Q03",
+    "Q04",
+    "Q05",
+    "R03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "5134cd9ba1cfa70d3e8acf89d074b7cebe8f5e55",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
