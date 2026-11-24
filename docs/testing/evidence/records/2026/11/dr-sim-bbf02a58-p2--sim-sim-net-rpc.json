@@ -1,0 +1,180 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-sim-bbf02a58-p2--sim-sim-net-rpc.log",
+      "sha256": "248d8d3e4e43b9f0817e5da7d755fcdf6c0db08068cd1c8f37735cc0fe99b6cb"
+    },
+    {
+      "name": "tla/SimNetRpc.log",
+      "sha256": "6b94bb4c1af4cc069a0f130ef922ad4f394fbf75ecb9dc9624752db739f19b3c"
+    },
+    {
+      "name": "tla/mutant-link_checked_at_send_only.cex.json",
+      "sha256": "76d0cb6641989f467e6e25994e1489fc87ceb2294ac0e4b1e28d03eec92f568f"
+    },
+    {
+      "name": "tla/mutant-link_checked_at_send_only.log",
+      "sha256": "f614f504e7eca27a0f82c238eb97572f7b100a7155cd262d2bfe12d40d0aff6d"
+    },
+    {
+      "name": "tla/mutant-pause_ignored.cex.json",
+      "sha256": "5ab124a126417920097a6661709932fe0938acb3e627af289ed717325d25d2e2"
+    },
+    {
+      "name": "tla/mutant-pause_ignored.log",
+      "sha256": "5d6699105967b51f75074354abec5efb5082b069cda2febe9d0e97b8df5049db"
+    },
+    {
+      "name": "tla/mutant-prefix_dup_crosses_block.cex.json",
+      "sha256": "f3fe1477aff3111afee72e1736e3c5f68b883b1d6fd1d4ee8b27d5b3d5fb812a"
+    },
+    {
+      "name": "tla/mutant-prefix_dup_crosses_block.log",
+      "sha256": "8aa0cc4157379699d1619475d33e909e737f0cabc93948ce5c813649e164fb3e"
+    },
+    {
+      "name": "tla/mutant-reach_lost_reply_applied.cex.json",
+      "sha256": "80b483d88ca67873cac5c4e7ae49ab73fc69fbe00608c1a796c3c9e3b6c044ea"
+    },
+    {
+      "name": "tla/mutant-reach_lost_reply_applied.log",
+      "sha256": "ef765dd4ef509e01d4deec33d733c1a16218fd1b6be6851f8c4a61ccdbb75cd1"
+    },
+    {
+      "name": "tla/mutant-reach_rpc_duplicate.cex.json",
+      "sha256": "4e9f7201e8d60e98be6784fd5e0a242ef2746aaa3dd35fe45b64bb0c0aa424af"
+    },
+    {
+      "name": "tla/mutant-reach_rpc_duplicate.log",
+      "sha256": "b2404416201fd9b91e3753126de39f6f363b145a1c1fe6141db2907f7f4f466a"
+    },
+    {
+      "name": "tla/mutant-reach_rpc_reorder.cex.json",
+      "sha256": "d0b02d90bedad0dd52648f7d7dbb2c5b8b4ed44f8a7c1ed97eb48153fe9fe83d"
+    },
+    {
+      "name": "tla/mutant-reach_rpc_reorder.log",
+      "sha256": "46db5306be8936382a656e5a0e626c9f1ebc73a97a6e45105966502f7e97c5f2"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "2d4592f50b6098fa9cf18358ca4848c3cdc6e444e336958333a1ddbb85d9d097"
+    }
+  ],
+  "assertions": {
+    "executed": 10,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "sim-sim-net-rpc",
+  "duration_s": 12.358,
+  "guarantees": [
+    "EVT-G01",
+    "EVT-G03",
+    "EVT-G06"
+  ],
+  "kind": "T",
+  "mode": {
+    "tla": "exhaustive"
+  },
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T15:58:05.073717+00:00",
+    "request_id": "dr-sim-bbf02a58-p2",
+    "runner": "GitHub Actions 1000011746",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45431485710"
+  },
+  "scenarios": [
+    "EV01",
+    "EV02",
+    "EV07"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "bbf02a58c8f4ba8fd89aa66aecdb04f80164ef70",
+  "sim_core_hours": null,
+  "tla": {
+    "actions": 13,
+    "budget_s": 900,
+    "depth": 21,
+    "distinct_states": 210456,
+    "min_action_coverage": 10668,
+    "mode": "exhaustive",
+    "mutants": [
+      {
+        "cex_length": 4,
+        "detail": "invariant NothingCrossesBlockedLink violated, counterexample of 4 states",
+        "expect": "NothingCrossesBlockedLink",
+        "name": "link_checked_at_send_only",
+        "observed": "NothingCrossesBlockedLink",
+        "ok": true
+      },
+      {
+        "cex_length": 6,
+        "detail": "invariant PausedRunsNothing violated, counterexample of 6 states",
+        "expect": "PausedRunsNothing",
+        "name": "pause_ignored",
+        "observed": "PausedRunsNothing",
+        "ok": true
+      },
+      {
+        "cex_length": 6,
+        "detail": "invariant NothingCrossesBlockedLink violated, counterexample of 6 states",
+        "expect": "NothingCrossesBlockedLink",
+        "name": "prefix_dup_crosses_block",
+        "observed": "NothingCrossesBlockedLink",
+        "ok": true
+      },
+      {
+        "cex_length": 5,
+        "detail": "invariant NoneMeansNotHandled violated, counterexample of 5 states",
+        "expect": "NoneMeansNotHandled",
+        "name": "reach_lost_reply_applied",
+        "observed": "NoneMeansNotHandled",
+        "ok": true
+      },
+      {
+        "cex_length": 5,
+        "detail": "invariant AtMostOnceHandling violated, counterexample of 5 states",
+        "expect": "AtMostOnceHandling",
+        "name": "reach_rpc_duplicate",
+        "observed": "AtMostOnceHandling",
+        "ok": true
+      },
+      {
+        "cex_length": 8,
+        "detail": "invariant HandledInOrder violated, counterexample of 8 states",
+        "expect": "HandledInOrder",
+        "name": "reach_rpc_reorder",
+        "observed": "HandledInOrder",
+        "ok": true
+      }
+    ],
+    "runs": [
+      {
+        "cfg": "SimNetRpc.cfg",
+        "depth": 21,
+        "detail": "",
+        "distinct_states": 210456,
+        "duration_s": 7.6,
+        "states_left": 0,
+        "verdict": "pass"
+      }
+    ],
+    "spec": "specs/sim/net-rpc/SimNetRpc",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "uncovered": [],
+    "unmutated": [
+      "TypeOK"
+    ]
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}

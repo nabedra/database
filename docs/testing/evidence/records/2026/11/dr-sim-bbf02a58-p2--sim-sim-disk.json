@@ -1,0 +1,411 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-sim-bbf02a58-p2--sim-sim-disk.log",
+      "sha256": "c3a8da1e39fecdeb2ce11591c3ce31a716788e549698d056ba1761b8c9b8281d"
+    },
+    {
+      "name": "tla/SimDisk.full.log",
+      "sha256": "446068e21fa913b1eed030441424b58334acd79e1939ef13a17d18cf230c5fed"
+    },
+    {
+      "name": "tla/SimDisk.log",
+      "sha256": "f24b18bd7b24d384d0610cb0c1ec5521e79878fe504d2bde90fbf21bd4303c41"
+    },
+    {
+      "name": "tla/SimDisk.p4k.log",
+      "sha256": "798a91f21b268f54ca7d1cf4d4afbbe214b3b608280108eb3dedf5c94edcf5da"
+    },
+    {
+      "name": "tla/SimDisk.wipe.log",
+      "sha256": "dc914cf237215cde7fb5748b0a8d292f1f78265f8f711f33ce73a19107d77a01"
+    },
+    {
+      "name": "tla/mutant-abort_before_halt.cex.json",
+      "sha256": "5c489668884459e29a93e3ac19e707b0d1fb3284a164c7e36c3cb42cebba4364"
+    },
+    {
+      "name": "tla/mutant-abort_before_halt.log",
+      "sha256": "7d4433ebb7bd90e6b236179e1087f92de5dffd9300e3184ac4afa40fd8c5d64e"
+    },
+    {
+      "name": "tla/mutant-gap_realistic_reformat.cex.json",
+      "sha256": "d17acea1f5a177f65d96827a3c81d88030e28fc9c0667be5143d2d5bc0349a85"
+    },
+    {
+      "name": "tla/mutant-gap_realistic_reformat.log",
+      "sha256": "6a94f3d622e65f4615333152b1a7f3b80f6e5edcd1c64f11313831a1485986e8"
+    },
+    {
+      "name": "tla/mutant-gap_writeback.cex.json",
+      "sha256": "c3d50b47414d1f21b97b5ac4e356e22f7d5258ec5273f383896a7054f364bd6e"
+    },
+    {
+      "name": "tla/mutant-gap_writeback.log",
+      "sha256": "09c27fded10b8e3049fe0ef2fa2aacc4c20f06917c20b0b641711a4c6c6bdd4b"
+    },
+    {
+      "name": "tla/mutant-garbage_in_512.cex.json",
+      "sha256": "7f2958db6193a09b9d31f03289fd9b6114a91a849c5a4f9a0cab1111ba78a739"
+    },
+    {
+      "name": "tla/mutant-garbage_in_512.log",
+      "sha256": "2a92d0cd1dbcf8626b8b5044b92fe17b1cfff17d022c077ca902ae05f486e36d"
+    },
+    {
+      "name": "tla/mutant-no_chain_dependency.cex.json",
+      "sha256": "db08bc9a2f7160808db18f0511da74cf5e330a10a8dd9596cbdca4b29015a4c4"
+    },
+    {
+      "name": "tla/mutant-no_chain_dependency.log",
+      "sha256": "abf532123cd7e43ea254913bd0d8f75792d3cc995a7368e66f34e52471804af1"
+    },
+    {
+      "name": "tla/mutant-no_incarnation_fence.cex.json",
+      "sha256": "6aececdf754083f558982f696ea751220bde8b3be6726d05daabb80f75fd4b22"
+    },
+    {
+      "name": "tla/mutant-no_incarnation_fence.log",
+      "sha256": "dbad7108c97ffa56c358dfb867f82d9ca550147a44c2c1cca448286cf7a6178d"
+    },
+    {
+      "name": "tla/mutant-prefix_wipe_while_up.cex.json",
+      "sha256": "b4e3abf3cc68e47770975f58d5d7e409a666f50902d5928b9c53f5d720b5cbeb"
+    },
+    {
+      "name": "tla/mutant-prefix_wipe_while_up.log",
+      "sha256": "ba61d9838807a4a632567f843a561903ba56229e6a84a4d59d17fd97c9bae59c"
+    },
+    {
+      "name": "tla/mutant-reach_4k_destroys_synced.cex.json",
+      "sha256": "f41b6a6709e27170f3b83066f78bd8354a1deceb2a8ac4442a4747c372b59ba2"
+    },
+    {
+      "name": "tla/mutant-reach_4k_destroys_synced.log",
+      "sha256": "51eda61ee5d06b79826baa72eb5562858034c8e375341be59be053a25b6e7f5c"
+    },
+    {
+      "name": "tla/mutant-reach_fsyncgate.cex.json",
+      "sha256": "d358d5eb80ee74cb1d18d95a7c42c899cda5954c9c348861d5ed58bc714278cc"
+    },
+    {
+      "name": "tla/mutant-reach_fsyncgate.log",
+      "sha256": "09883cfaa22308aeaa686f7882acba72bff903f0ecee8e6613bb6f958304dd72"
+    },
+    {
+      "name": "tla/mutant-reach_kill_keeps_unsynced.cex.json",
+      "sha256": "148fdf77e367cd4623057e2d5a7bd6cf72047a7b95ba52c811dbe946de371c77"
+    },
+    {
+      "name": "tla/mutant-reach_kill_keeps_unsynced.log",
+      "sha256": "30895ebd76ef0729c0b5f37875e7721c4621e2063f737f0ac47716537df183bf"
+    },
+    {
+      "name": "tla/mutant-reach_lost_dir_op.cex.json",
+      "sha256": "0d6d5ae8df940b3d0a9be4464cb59a2e2311a288e631bbdc95a7a97d071b711d"
+    },
+    {
+      "name": "tla/mutant-reach_lost_dir_op.log",
+      "sha256": "33fdb97111bf8b3ad506971c670e70b9c66d56abd8528fc3615eb3b9e2a5e3eb"
+    },
+    {
+      "name": "tla/mutant-reach_torn_sector.cex.json",
+      "sha256": "e14471ae910dcb7eba7e3a1d6d1ee4d10b371f15008e9bab77eb80fcdef85f68"
+    },
+    {
+      "name": "tla/mutant-reach_torn_sector.log",
+      "sha256": "07a9a69f1b2dc434b3f2de8c609f358bf4afaf39879b216dadd9eddfdbf9f82b"
+    },
+    {
+      "name": "tla/mutant-rename_not_atomic.cex.json",
+      "sha256": "8b9cd5189debc25b5ff07b6220463772d19eb424f2308a5c400c96a103955cb4"
+    },
+    {
+      "name": "tla/mutant-rename_not_atomic.log",
+      "sha256": "64637133efbd9654d80fbfef9a47a2489229401b02973a2a54dcde0f7b55059a"
+    },
+    {
+      "name": "tla/mutant-rename_skips_pending.cex.json",
+      "sha256": "d8c7d42770874912a6bec0647fd7308721cbc3159c4418722f6a5d71bb461f9c"
+    },
+    {
+      "name": "tla/mutant-rename_skips_pending.log",
+      "sha256": "20006cfd16f0264aec15d4f7d956dd288ebebf92445cd11231969263c106a917"
+    },
+    {
+      "name": "tla/mutant-sync_skips_dirty.cex.json",
+      "sha256": "61487a0d0226e20cfa1f4102e0c372dfe25caacfc8f17c17596cacb70d4d4718"
+    },
+    {
+      "name": "tla/mutant-sync_skips_dirty.log",
+      "sha256": "32d8952ac58ad652cdcfd04469b60f069fc3dcf5576e95468347ff568b33f4d5"
+    },
+    {
+      "name": "tla/mutant-syncdir_noop.cex.json",
+      "sha256": "98d177dadf4d5256f381a171f2c6aebe1d3e397deb42a7a3aa2fa89a47677844"
+    },
+    {
+      "name": "tla/mutant-syncdir_noop.log",
+      "sha256": "1292149f4dab8d1a7916d3f8ae4cbfb715a8549d7374dd9598b033c5f58c5d46"
+    },
+    {
+      "name": "tla/mutant-tear_clean_sectors.cex.json",
+      "sha256": "837302a1738585058793a1bfef1d1a26f2834294fde701b2ea6073b5ee6dc83e"
+    },
+    {
+      "name": "tla/mutant-tear_clean_sectors.log",
+      "sha256": "d30bd2094b964177ca949ffcae4a3e287c9b43efa6d4e0a211d072ef7c2a647e"
+    },
+    {
+      "name": "tla/mutant-wipe_keeps_uuid.cex.json",
+      "sha256": "f4a9d92003c49c4247dc94d95d44c1758c83cfa062dea6f5d560ff6de75b307a"
+    },
+    {
+      "name": "tla/mutant-wipe_keeps_uuid.log",
+      "sha256": "97e5f7dade6d0a12c4c54be179b612bec753a1bfdc4b97f1da15c23bc1abf5c6"
+    }
+  ],
+  "assertions": {
+    "executed": 33,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "sim-sim-disk",
+  "duration_s": 303.219,
+  "guarantees": [
+    "LSM-G01",
+    "LSM-G02",
+    "LSM-G03",
+    "OLTP-G01",
+    "OLTP-G08"
+  ],
+  "kind": "T",
+  "mode": {
+    "tla": "exhaustive"
+  },
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T15:58:09.163155+00:00",
+    "request_id": "dr-sim-bbf02a58-p2",
+    "runner": "GitHub Actions 1000011747",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45431485710"
+  },
+  "scenarios": [
+    "NS04",
+    "NS05",
+    "NS15",
+    "O11",
+    "O17"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "bbf02a58c8f4ba8fd89aa66aecdb04f80164ef70",
+  "sim_core_hours": null,
+  "tla": {
+    "actions": 17,
+    "budget_s": 900,
+    "depth": 17,
+    "distinct_states": 283511,
+    "min_action_coverage": 270,
+    "mode": "exhaustive",
+    "mutants": [
+      {
+        "cex_length": 4,
+        "detail": "invariant NoWriteAfterCut violated, counterexample of 4 states",
+        "expect": "NoWriteAfterCut",
+        "name": "abort_before_halt",
+        "observed": "NoWriteAfterCut",
+        "ok": true
+      },
+      {
+        "cex_length": 4,
+        "detail": "invariant DevInoAnchorRejectsWipe violated, counterexample of 4 states",
+        "expect": "DevInoAnchorRejectsWipe",
+        "name": "gap_realistic_reformat",
+        "observed": "DevInoAnchorRejectsWipe",
+        "ok": true
+      },
+      {
+        "cex_length": 7,
+        "detail": "action property OnlyLatestOrOld violated, counterexample of 7 states",
+        "expect": "OnlyLatestOrOld",
+        "name": "gap_writeback",
+        "observed": "OnlyLatestOrOld",
+        "ok": true
+      },
+      {
+        "cex_length": 8,
+        "detail": "action property CrashImageAllowed violated, counterexample of 8 states",
+        "expect": "CrashImageAllowed",
+        "name": "garbage_in_512",
+        "observed": "CrashImageAllowed",
+        "ok": true
+      },
+      {
+        "cex_length": 7,
+        "detail": "invariant NoDoubleLink violated, counterexample of 7 states",
+        "expect": "NoDoubleLink",
+        "name": "no_chain_dependency",
+        "observed": "NoDoubleLink",
+        "ok": true
+      },
+      {
+        "cex_length": 6,
+        "detail": "invariant NoWriteAfterCut violated, counterexample of 6 states",
+        "expect": "NoWriteAfterCut",
+        "name": "no_incarnation_fence",
+        "observed": "NoWriteAfterCut",
+        "ok": true
+      },
+      {
+        "cex_length": 2,
+        "detail": "invariant IncarnationSeesOneVolume violated, counterexample of 2 states",
+        "expect": "IncarnationSeesOneVolume",
+        "name": "prefix_wipe_while_up",
+        "observed": "IncarnationSeesOneVolume",
+        "ok": true
+      },
+      {
+        "cex_length": 10,
+        "detail": "action property SyncedSectorsSurviveAnyCut violated, counterexample of 10 states",
+        "expect": "SyncedSectorsSurviveAnyCut",
+        "name": "reach_4k_destroys_synced",
+        "observed": "SyncedSectorsSurviveAnyCut",
+        "ok": true
+      },
+      {
+        "cex_length": 7,
+        "detail": "invariant CleanMeansDurable violated, counterexample of 7 states",
+        "expect": "CleanMeansDurable",
+        "name": "reach_fsyncgate",
+        "observed": "CleanMeansDurable",
+        "ok": true
+      },
+      {
+        "cex_length": 6,
+        "detail": "invariant KillImageDurable violated, counterexample of 6 states",
+        "expect": "KillImageDurable",
+        "name": "reach_kill_keeps_unsynced",
+        "observed": "KillImageDurable",
+        "ok": true
+      },
+      {
+        "cex_length": 6,
+        "detail": "action property UnsyncedOpsSurvive violated, counterexample of 6 states",
+        "expect": "UnsyncedOpsSurvive",
+        "name": "reach_lost_dir_op",
+        "observed": "UnsyncedOpsSurvive",
+        "ok": true
+      },
+      {
+        "cex_length": 6,
+        "detail": "invariant NoTornSector violated, counterexample of 6 states",
+        "expect": "NoTornSector",
+        "name": "reach_torn_sector",
+        "observed": "NoTornSector",
+        "ok": true
+      },
+      {
+        "cex_length": 6,
+        "detail": "invariant NoDoubleLink violated, counterexample of 6 states",
+        "expect": "NoDoubleLink",
+        "name": "rename_not_atomic",
+        "observed": "NoDoubleLink",
+        "ok": true
+      },
+      {
+        "cex_length": 6,
+        "detail": "invariant OsIsDurablePlusPending violated, counterexample of 6 states",
+        "expect": "OsIsDurablePlusPending",
+        "name": "rename_skips_pending",
+        "observed": "OsIsDurablePlusPending",
+        "ok": true
+      },
+      {
+        "cex_length": 9,
+        "detail": "action property SyncedSurvives violated, counterexample of 9 states",
+        "expect": "SyncedSurvives",
+        "name": "sync_skips_dirty",
+        "observed": "SyncedSurvives",
+        "ok": true
+      },
+      {
+        "cex_length": 6,
+        "detail": "action property SyncedSurvives violated, counterexample of 6 states",
+        "expect": "SyncedSurvives",
+        "name": "syncdir_noop",
+        "observed": "SyncedSurvives",
+        "ok": true
+      },
+      {
+        "cex_length": 8,
+        "detail": "action property SyncedSectorsSurvive violated, counterexample of 8 states",
+        "expect": "SyncedSectorsSurvive",
+        "name": "tear_clean_sectors",
+        "observed": "SyncedSectorsSurvive",
+        "ok": true
+      },
+      {
+        "cex_length": 4,
+        "detail": "invariant UuidAnchorRejectsWipe violated, counterexample of 4 states",
+        "expect": "UuidAnchorRejectsWipe",
+        "name": "wipe_keeps_uuid",
+        "observed": "UuidAnchorRejectsWipe",
+        "ok": true
+      }
+    ],
+    "runs": [
+      {
+        "cfg": "SimDisk.cfg",
+        "depth": 17,
+        "detail": "",
+        "distinct_states": 283511,
+        "duration_s": 34.3,
+        "states_left": 0,
+        "verdict": "pass"
+      },
+      {
+        "cfg": "SimDisk.full.cfg",
+        "depth": 19,
+        "detail": "",
+        "distinct_states": 1078645,
+        "duration_s": 241.8,
+        "states_left": 0,
+        "verdict": "pass"
+      },
+      {
+        "cfg": "SimDisk.p4k.cfg",
+        "depth": 16,
+        "detail": "",
+        "distinct_states": 36577,
+        "duration_s": 5.4,
+        "states_left": 0,
+        "verdict": "pass"
+      },
+      {
+        "cfg": "SimDisk.wipe.cfg",
+        "depth": 14,
+        "detail": "",
+        "distinct_states": 6307,
+        "duration_s": 2.0,
+        "states_left": 0,
+        "verdict": "pass"
+      }
+    ],
+    "spec": "specs/sim/disk/SimDisk",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "uncovered": [],
+    "unmutated": [
+      "TypeOK"
+    ]
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}

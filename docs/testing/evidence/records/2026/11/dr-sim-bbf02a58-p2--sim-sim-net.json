@@ -1,0 +1,230 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-sim-bbf02a58-p2--sim-sim-net.log",
+      "sha256": "8dd2b89f02fe8988ef110278191c7d93703a65e0b8d03df0623032aca29d0816"
+    },
+    {
+      "name": "tla/SimNet.log",
+      "sha256": "04e0b9bc4ed439a0689ba86cc311c88738457890d0874c27858f4bf8e5921f39"
+    },
+    {
+      "name": "tla/mutant-deliver_duplicates.cex.json",
+      "sha256": "ce22dc3b6057b467ad66eff725cd6e8056a48c83d193e7f563fb937e51c0785d"
+    },
+    {
+      "name": "tla/mutant-deliver_duplicates.log",
+      "sha256": "508246e8ae76965bdfcda41387e56bc63e12a92cfcc825c6546fb1051a05dc9e"
+    },
+    {
+      "name": "tla/mutant-drop_without_stall.cex.json",
+      "sha256": "79a0254e86363fce7a32e69e4068e911658e5a5e62ab7ce6249962ea54e30a5a"
+    },
+    {
+      "name": "tla/mutant-drop_without_stall.log",
+      "sha256": "dabbeff40fa16f893ff7089bf8333333ccd3ab8ba1f5737aafcba2691da7001d"
+    },
+    {
+      "name": "tla/mutant-frames_ignore_stream.cex.json",
+      "sha256": "7bccfbb1dd14cc532b9275eb65b2d04a9478c4ce750fb7c47c6d4beb2fab2dca"
+    },
+    {
+      "name": "tla/mutant-frames_ignore_stream.log",
+      "sha256": "6fe0400d48bb975f904c55ec8ab3ce57946742c71b1402b8ce48151e36dbf55f"
+    },
+    {
+      "name": "tla/mutant-gap_crash_sends_fin.cex.json",
+      "sha256": "2246edd651260fed0b5bf2d2f38dfcfd5e20f10179e04aac5cca1b024f8d8b8a"
+    },
+    {
+      "name": "tla/mutant-gap_crash_sends_fin.log",
+      "sha256": "a3d41ec7237bb58d9b8e44f41cc0f3733c2310c85de7492448cd08ed68a9ec6b"
+    },
+    {
+      "name": "tla/mutant-hole_ignores_in_flight.cex.json",
+      "sha256": "d3ab5082bbb3571c74012b06c9d87345d82d074363c756d7178783d6b07b8834"
+    },
+    {
+      "name": "tla/mutant-hole_ignores_in_flight.log",
+      "sha256": "2335bbae26ddd8e3d788e68d7414539c3bb2410e916e417e543b07514c5b1001"
+    },
+    {
+      "name": "tla/mutant-prefix_cache_partition_stall.cex.json",
+      "sha256": "6573176dda43768e9f2af38264cabb8d7fdd4eb1b45e621f347d107a61563e7d"
+    },
+    {
+      "name": "tla/mutant-prefix_cache_partition_stall.log",
+      "sha256": "45b16241b2836cf85878df88017ecdb77262ff062a23b5858dd69923f3f8d50e"
+    },
+    {
+      "name": "tla/mutant-reach_frame_overtake.cex.json",
+      "sha256": "5c8649026b0bd121692846c837a0c04fed55ccd08dd7ce1c20c66158cf0a1724"
+    },
+    {
+      "name": "tla/mutant-reach_frame_overtake.log",
+      "sha256": "d8f85d7f48f49ed0dec8d000daa394573b3a1edddda3a320e3d2a2c98c207d2d"
+    },
+    {
+      "name": "tla/mutant-reach_lost_message.cex.json",
+      "sha256": "521219b0650c1246328aaf42f5d8f8d8fa1ccd3a147f69cd8ab67dc4f72e5f46"
+    },
+    {
+      "name": "tla/mutant-reach_lost_message.log",
+      "sha256": "2390247b58d315be5086e1588d63d89b911770b41c2579dbdd7c7bc0cad98f4f"
+    },
+    {
+      "name": "tla/mutant-reset_keeps_queue.cex.json",
+      "sha256": "e1421799a8661a80cb840ec617d169f1be97dda1cf3398d07fcb48a01a797916"
+    },
+    {
+      "name": "tla/mutant-reset_keeps_queue.log",
+      "sha256": "d36a4732c488c7d0c7c125d9bdc4463ca6e281f71aa7c58a5578deef864284c1"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "338cfd6c5e3fc38aa40784715ed34f0d23be67ccbdf3f0d6b784bc9640d3da0a"
+    }
+  ],
+  "assertions": {
+    "executed": 17,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "sim-sim-net",
+  "duration_s": 12.645,
+  "guarantees": [
+    "OLTP-G03",
+    "OLTP-G04",
+    "CACHE-G05",
+    "CACHE-G06"
+  ],
+  "kind": "T",
+  "mode": {
+    "tla": "exhaustive"
+  },
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T15:58:02.225306+00:00",
+    "request_id": "dr-sim-bbf02a58-p2",
+    "runner": "GitHub Actions 1000011745",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45431485710"
+  },
+  "scenarios": [
+    "D02",
+    "D10",
+    "O10",
+    "K03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "bbf02a58c8f4ba8fd89aa66aecdb04f80164ef70",
+  "sim_core_hours": null,
+  "tla": {
+    "actions": 11,
+    "budget_s": 900,
+    "depth": 16,
+    "distinct_states": 19080,
+    "min_action_coverage": 2364,
+    "mode": "exhaustive",
+    "mutants": [
+      {
+        "cex_length": 6,
+        "detail": "invariant NoDuplicateDelivery violated, counterexample of 6 states",
+        "expect": "NoDuplicateDelivery",
+        "name": "deliver_duplicates",
+        "observed": "NoDuplicateDelivery",
+        "ok": true
+      },
+      {
+        "cex_length": 5,
+        "detail": "invariant ReceivedIsPrefix violated, counterexample of 5 states",
+        "expect": "ReceivedIsPrefix",
+        "name": "drop_without_stall",
+        "observed": "ReceivedIsPrefix",
+        "ok": true
+      },
+      {
+        "cex_length": 5,
+        "detail": "invariant ReceivedIsPrefix violated, counterexample of 5 states",
+        "expect": "ReceivedIsPrefix",
+        "name": "frames_ignore_stream",
+        "observed": "ReceivedIsPrefix",
+        "ok": true
+      },
+      {
+        "cex_length": 5,
+        "detail": "action property NoStaleFromCrashed violated, counterexample of 5 states",
+        "expect": "NoStaleFromCrashed",
+        "name": "gap_crash_sends_fin",
+        "observed": "NoStaleFromCrashed",
+        "ok": true
+      },
+      {
+        "cex_length": 4,
+        "detail": "invariant HoleHoldsInFlight violated, counterexample of 4 states",
+        "expect": "HoleHoldsInFlight",
+        "name": "hole_ignores_in_flight",
+        "observed": "HoleHoldsInFlight",
+        "ok": true
+      },
+      {
+        "cex_length": 3,
+        "detail": "invariant HeldNotLost violated, counterexample of 3 states",
+        "expect": "HeldNotLost",
+        "name": "prefix_cache_partition_stall",
+        "observed": "HeldNotLost",
+        "ok": true
+      },
+      {
+        "cex_length": 5,
+        "detail": "invariant ConnectionFifo violated, counterexample of 5 states",
+        "expect": "ConnectionFifo",
+        "name": "reach_frame_overtake",
+        "observed": "ConnectionFifo",
+        "ok": true
+      },
+      {
+        "cex_length": 2,
+        "detail": "invariant NothingLost violated, counterexample of 2 states",
+        "expect": "NothingLost",
+        "name": "reach_lost_message",
+        "observed": "NothingLost",
+        "ok": true
+      },
+      {
+        "cex_length": 5,
+        "detail": "action property NoDeliveryAfterReset violated, counterexample of 5 states",
+        "expect": "NoDeliveryAfterReset",
+        "name": "reset_keeps_queue",
+        "observed": "NoDeliveryAfterReset",
+        "ok": true
+      }
+    ],
+    "runs": [
+      {
+        "cfg": "SimNet.cfg",
+        "depth": 16,
+        "detail": "",
+        "distinct_states": 19080,
+        "duration_s": 5.3,
+        "states_left": 0,
+        "verdict": "pass"
+      }
+    ],
+    "spec": "specs/sim/net/SimNet",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "uncovered": [],
+    "unmutated": [
+      "TypeOK"
+    ]
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}
