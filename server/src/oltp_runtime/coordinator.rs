@@ -559,31 +559,41 @@ impl QueueCoordinator {
         let gate = self.gate(id)?;
         let _progress = gate.lock().await;
         loop {
-            let (frame, local, targets) = {
+            let copy = {
                 let mut replica = self
                     .replica
                     .lock()
                     .map_err(|_| QueueError::Unavailable.protocol())?;
                 if replica.authority() != current {
-                    return Err(QueueError::Stale.protocol());
-                }
-                if if promote {
+                    None
+                } else if if promote {
                     replica.copies_complete(id)
                 } else {
                     replica.payloads_complete(id)
                 } {
-                    (
+                    Some((
                         replica.frame(id).map_err(QueueError::protocol)?,
                         replica.local_identity(),
                         None,
-                    )
+                    ))
                 } else {
                     let frame = replica.resume(current, id).map_err(QueueError::protocol)?;
                     let targets = replica
                         .next_copy_batch(id, MAX_PARALLEL_QUEUE_COPIES)
                         .map_err(QueueError::protocol)?;
-                    (frame, replica.local_identity(), Some(targets))
+                    Some((frame, replica.local_identity(), Some(targets)))
                 }
+            };
+            let Some((frame, local, targets)) = copy else {
+                // An existing record can be retried after Control publishes
+                // the ready view but before the local membership actor installs it.
+                wait_for_local_ready_view(&self.replica, current)
+                    .await
+                    .map_err(QueueError::protocol)?;
+                if self.current().await? != current {
+                    return Err(QueueError::Stale.protocol());
+                }
+                continue;
             };
             let Some(targets) = targets else {
                 if self.current().await? != current {
