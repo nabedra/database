@@ -1,5 +1,58 @@
+# Analysis below: wave-p8 report k03-docker.md, 2026-11-25, kept with its data outside this repository.
+# It is one author's local, unattested and unreviewed work on a binary built from e3d73663. It is not evidence for K03.
+#
+# Rate. All 80 cache-cluster-real artifacts retained on 2026-11-25, 74 of them with five-repetition runs:
+#   47 of 74 runs red (64 %, 95 % CI 52 to 74), 47 of 243 repetitions failed (19.3 %, 95 % CI 15 to 25; Wilson).
+#   One call site (cluster.py:416) and one error. A run stops at its first failed repetition, and people dispatched
+#   extra runs after reds, so this is not a random sample.
+#   Failures by repetition number: 1: 15/74, 2: 17/59, 3: 5/42, 4: 6/37, 5: 4/31.
+#   At this rate a five-repetition run is green about 1 time in 3 by chance (34 % expected, 27 of 74 seen).
+#   Repetitions on WSL Docker failed less often, 2 of 120. The reason is not known.
+#
+# Proposed mechanism, not reviewed. After c1 and c2 are paused for about 3 s every lease has expired, and a new
+# controller leader starts with no worker reports. It treats a worker that has not reported in its term as unavailable,
+# so the first worker heard takes slots from healthy workers, 256 per 250 ms tick, often with no replica. Repair starts
+# 64 slots per wave, about 2.1 s per wave, so the wait misses 30 s from about 960 such slots. It converged later in
+# every local repetition (145 of 145). Whether this is a controller defect or a check deadline defect is not settled.
+#
+# Falsification test: in 145 local repetitions, is a slot ever taken, in a later term, from a primary that had already
+# renewed in that term? 0 of 34,816 transfers. Every displaced primary renewed later, median 0.28 s, max 2.07 s.
+# Pausing w3 for 1.7 s past the controllers' resume missed 30 s in 5 of 5.
+#
+# Predictions that failed:
+#   1. Pausing w3 for 0.6 s should leave 512 to 768 slots without a replica. Seen: 0, 192, 960, 1408 and 1472.
+#   2. Releasing all three workers together should leave none. 3 of 15 repetitions had 256. That variant did not
+#      separate the cases (29 of 120 unmodified repetitions had some), so it supports nothing.
+#
+# Missing: no CI controller WAL has been read. The failing WAL is local, and there w2 took w1's slots, whereas in the
+# CI failures w1 holds single copies of w3's slots. CI matches only in shape (metrics, 64-slot steps). Why CI fails more
+# often is open.
+#
+# Not evidence. Green runs on a SHA where an earlier run or attempt of the same check was red. "Retried" is read from
+# order and request names; some were dispatched together. Reds first, then the greens:
+#   b2c9988f: 45216487642 attempt 1 | 45216487642 attempt 2, 45217743445
+#   46f6755e: 45231799672, 45233174515, 45234355773 | 45234097217, 45234360877
+#   e32eadb5: 45241287638, 45242638289 | 45243835370
+#   d7261259: 45259879188 | 45261304834
+#   98bcab53: 45267584767, 45268936953 | 45270660973
+#   aedc3d11: 45275323729, 45277548355, 45281400937, 45282958660 | 45284344006, 45284340049
+#   f53b38c6: 45286761877, 45288995852, 45292122784 | 45292126356
+#   faec1184: 45298312628 | 45299054364
+#   f7eb0e8d: 45301342381, 45302552015, 45303318886 | 45304279601
+#   b6af6b5e: 45319932817, 45320844879 | 45321727007
+#   f600e08a: 45444070680 | 45452245120
+# Greens inside planned repeats, where the same SHA also went red. Not evidence either:
+#   36da95b3: 45451318381, 45451397557 (4 reds of 6)
+#   6e6eccec: 45451328628, 45451382734 (6 reds of 8)
+#   e3d73663: 45489740788 (5 reds of 6)
+# The other greens had no red on their own SHA. They are single draws at the rate above: 6702e5b9 45238460162,
+# dfa72b21 45310838093, 63ac6cfb 45312899506, 48f05250 45326771345, 3f2bc01e 45419455689, b65deeeb 45446887284
+# (after reds on two earlier heads of its PR, 16ced08f and e842431c), 2560c7cd 45477601623, a28875d7 45484254552.
+#
+# The scratch repro and the proposed controller change are in that report. Both are unreviewed. The change is untested
+# and needs design review. This record does not recommend merging either.
 id = "CACHE-K03-DOCKER-PLACEMENT"
-title = "The K03 Docker fleet did not commit a ready placement before the online move"
+title = "The K03 Docker fleet did not reach a ready placement within 30 s before the online move"
 class = "other"
 module = "cache"
 guarantees = ["CACHE-G05", "CACHE-G06"]
@@ -8,10 +61,10 @@ found_by = "ci-flake"
 found_date = "2026-11-23"
 lowest_regression = "check cache-cluster-real (scripts/cache-acceptance/cluster.py history, wait_placement)"
 seed = "unknown"
-why_not_caught = "The check repeats the fleet five times. The first repetition passed in each failed run on 16ced08f and e842431c, and the second timed out."
-invariant_added = "Every one of the five K03 fleet repetitions commits a ready placement within the fixture's deadline. The cause is not established, so this may be a fixture deadline or a controller fault."
+why_not_caught = "The failure is intermittent, 47 of 243 CI repetitions (19.3 %, 95 % CI 15 to 25) and 47 of 74 runs, so about 1 in 3 five-repetition runs is green by chance and rerunning a red check until it passed hid it."
+invariant_added = "Intended, not met: each of the five K03 fleet repetitions reaches 16,384 ready primaries and replicas within the check's 30 s wait before the online move. No contract states that deadline, and the cause is not reviewed, so this may be a controller fault or a fixture deadline."
 fix_commits = []
 revert_patch_ok = false
 status = "open"
 owner = "zPy52"
-expires = "2026-12-07"
+expires = "2026-12-02"
