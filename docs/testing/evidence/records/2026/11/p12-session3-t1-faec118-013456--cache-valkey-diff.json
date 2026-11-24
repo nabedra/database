@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "p12-session3-t1-faec118-013456--cache-valkey-diff.log",
+      "sha256": "687cecb0dfc7be0298884b467584a3239a1717b833529e4a4f6b8a9fb4bdcb0e"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-valkey-diff",
+  "duration_s": 47.58,
+  "guarantees": [
+    "CACHE-G01",
+    "CACHE-G02"
+  ],
+  "kind": "D",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T00:37:31.574781+00:00",
+    "request_id": "p12-session3-t1-faec118-013456",
+    "runner": "GitHub Actions 1000008942",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45298312628"
+  },
+  "scenarios": [
+    "K01"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "faec11844ba653e3efca640d45a0e8c60b3e67de",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
