@@ -397,9 +397,12 @@ pub(crate) fn fence_at_rest(rest: &[AtRest]) -> Vec<String> {
 }
 
 /// [`ROUTES`]: the number of ranges a query plan covers against the splits that published.
-pub(crate) fn route_count(table: &str, published_splits: u64, planned: u64) -> Option<String> {
-    (planned != published_splits + 1).then(|| {
-        format!("{table} has {published_splits} published splits and a plan over {planned} ranges")
+/// A split that was never answered for good may have published as well.
+pub(crate) fn route_count(table: &str, published: u64, open: u64, planned: u64) -> Option<String> {
+    (!(published + 1..=published + open + 1).contains(&planned)).then(|| {
+        format!(
+            "{table} has {published} published and {open} unanswered splits, and a plan over {planned} ranges"
+        )
     })
 }
 

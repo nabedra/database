@@ -239,10 +239,14 @@ fn fence_public_form() {
 
 #[test]
 fn route_coverage() {
-    assert!(route_count("main", 0, 1).is_none());
-    assert!(route_count("main", 2, 3).is_none());
-    assert!(route_count("main", 1, 1).is_some());
-    assert!(route_count("main", 0, 2).is_some());
+    assert!(route_count("main", 0, 0, 1).is_none());
+    assert!(route_count("main", 2, 0, 3).is_none());
+    assert!(route_count("main", 1, 0, 1).is_some());
+    assert!(route_count("main", 0, 0, 2).is_some());
+    // An unanswered split may have published, and no more than that.
+    assert!(route_count("main", 0, 1, 1).is_none());
+    assert!(route_count("main", 0, 1, 2).is_none());
+    assert!(route_count("main", 0, 1, 3).is_some());
 }
 
 #[test]

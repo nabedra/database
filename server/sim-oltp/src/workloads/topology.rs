@@ -62,8 +62,9 @@ use crate::{
 };
 
 /// `NABEDRA_SIM_TOPOLOGY`: force parts of the drawn plan, for diagnosis and for running a
-/// search both ways. A comma list of `split-under-load`, `split-before-load`, `move` and
-/// `no-move`. An unknown entry is an error.
+/// search both ways. A comma list of `split-under-load`, `split-before-load`, `move`,
+/// `no-move`, and `drop-race` or `no-drop-race` for the index publication that races the drop.
+/// An unknown entry is an error.
 pub(crate) const MODE_ENV: &str = "NABEDRA_SIM_TOPOLOGY";
 /// `NABEDRA_SIM_TOPOLOGY_DEFECT`: one seeded defect of [`Defect`].
 pub(crate) const DEFECT_ENV: &str = "NABEDRA_SIM_TOPOLOGY_DEFECT";
@@ -154,6 +155,7 @@ enum SplitTiming {
 struct Forced {
     split: Option<SplitTiming>,
     moving: Option<bool>,
+    drop_race: Option<bool>,
 }
 
 impl Forced {
@@ -165,6 +167,8 @@ impl Forced {
                 "split-before-load" => forced.split = Some(SplitTiming::BeforeLoad),
                 "move" => forced.moving = Some(true),
                 "no-move" => forced.moving = Some(false),
+                "drop-race" => forced.drop_race = Some(true),
+                "no-drop-race" => forced.drop_race = Some(false),
                 other => return Err(format!("unknown {MODE_ENV} entry {other:?}")),
             }
         }
@@ -332,7 +336,8 @@ impl TopoPlan {
             start: drop_at.saturating_sub(ms(g, 0, 1_500)),
             retire: None,
         };
-        if g.bool() {
+        let drawn_race = g.bool();
+        if forced.drop_race.unwrap_or(drawn_race) {
             indexes.push(racing);
         }
         let moving = g.bool();
@@ -431,6 +436,8 @@ struct Log {
     /// Splits of `ranged`: requested, published.
     split: Option<(u64, Option<u64>)>,
     split_error: Option<String>,
+    /// How many split IDs were sent for `ranged`.
+    split_ids: u64,
     defect: Option<Defect>,
 }
 
@@ -1036,6 +1043,24 @@ async fn life(
                     t.log(|log| log.refused.insert(id, format!("{code:?} {why}")));
                 }
                 if overtaken(code, &why) && !t.change_over() {
+                    // A declaration that was never answered can hold the table's guard until
+                    // its own ID is sent again.
+                    let mut unanswered = Vec::new();
+                    for earlier in std::mem::take(&mut opened) {
+                        let invoked = t.next();
+                        match t.admin(earlier, "storage.index.create", definition).await {
+                            Reply::Ok(data) => {
+                                let completed = t.next();
+                                id = earlier;
+                                break 'declare record_status(
+                                    t, &plan.name, invoked, completed, &data,
+                                );
+                            }
+                            Reply::Definite(..) => {}
+                            Reply::Retry { .. } => unanswered.push(earlier),
+                        }
+                    }
+                    opened = unanswered;
                     id = fresh_id(BOOTSTRAP_CLIENT).await;
                     t.log(|log| log.selectors.insert(id, selector(id)));
                     (open, refusals) = (false, 0);
@@ -1386,7 +1411,10 @@ async fn split(t: Topo, table: String, cluster_id: Uuid, boundary: i64, at: Dura
     let mut run = *t.run.lock().unwrap();
     let mut id = fresh_id(BOOTSTRAP_CLIENT).await;
     let requested = t.now();
-    t.log(|log| log.split = Some((requested, None)));
+    t.log(|log| {
+        log.split = Some((requested, None));
+        log.split_ids = 1;
+    });
     t.note("split-ranged", json!({"id": id, "boundary": boundary}));
     let mut last = String::new();
     loop {
@@ -1395,6 +1423,7 @@ async fn split(t: Topo, table: String, cluster_id: Uuid, boundary: i64, at: Dura
         if now != run {
             run = now;
             id = fresh_id(BOOTSTRAP_CLIENT).await;
+            t.log(|log| log.split_ids += 1);
             t.note(
                 "split-ranged",
                 json!({"id": id, "boundary": boundary, "run": run}),
@@ -1411,6 +1440,7 @@ async fn split(t: Topo, table: String, cluster_id: Uuid, boundary: i64, at: Dura
             Reply::Definite(code, why) => {
                 if overtaken(code, &why) {
                     id = fresh_id(BOOTSTRAP_CLIENT).await;
+                    t.log(|log| log.split_ids += 1);
                     t.note(
                         "split-ranged",
                         json!({"id": id, "boundary": boundary, "after": why}),
@@ -1973,12 +2003,23 @@ async fn final_scans(
             .iter()
             .any(|fault| fault.action == Action::Split && fault.observed)
     });
-    let split = t.log(|log| log.split);
+    // The nemesis's split can be pending, and a full stop can have abandoned another.
+    let asked = chaos.map_or(0, |chaos| {
+        let splits = chaos.log.iter().filter(|f| f.action == Action::Split);
+        let stops = chaos.log.iter().filter(|f| f.action == Action::Cold);
+        splits.count() as u64 * (1 + stops.count() as u64 + u64::from(chaos.heal_cold))
+    });
+    let (split, split_ids) = t.log(|log| (log.split, log.split_ids));
     for table in [Table::Main, Table::Ranged] {
-        let published = match table {
-            Table::Main => nemesis_split,
-            _ => split.is_some_and(|(_, published)| published.is_some()),
+        let (published, asked) = match table {
+            Table::Main => (nemesis_split, asked),
+            _ => (
+                split.is_some_and(|(_, published)| published.is_some()),
+                split_ids,
+            ),
         };
+        // One range splits once, whichever of its IDs did it.
+        let open = u64::from(!published && asked > 0);
         for (gateway, _) in GATEWAYS.iter().enumerate() {
             let node = CLIENTS[gateway % CLIENTS.len()];
             if let Some(why) = scan(t, &mut client, node, gateway, table).await {
@@ -1995,7 +2036,7 @@ async fn final_scans(
             if t.take_defect(Defect::LoseRange) {
                 ranges -= 1;
             }
-            if let Some(found) = route_count(table.name(), u64::from(published), ranges) {
+            if let Some(found) = route_count(table.name(), u64::from(published), open, ranges) {
                 cluster
                     .checks
                     .violate(&cluster.world, topology::ROUTES, found);

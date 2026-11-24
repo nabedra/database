@@ -48,6 +48,19 @@ and excludes the injected deletion from the client history. For the seeded stale
 records a previously observed row in place of the latest HTTP response. Both controls are
 part of the development-only harness.
 
+## Topology workload
+
+`NABEDRA_SIM_WORKLOAD=topology` runs splits, replica moves, leader transfers, index publication, a
+table drop and gateways with old routes next to the phase 10 nemesis and clients. The rules and the
+text each one quotes are in `src/invariants/topology.rs`. Rules that no public answer can judge have
+fixtures there and are `not_run` in the sweep record until probes feed them.
+
+`NABEDRA_SIM_TOPOLOGY` forces parts of the drawn plan: `split-under-load` or `split-before-load`, and
+`move` or `no-move`, as a comma list. A split under direct load does not publish today, and those
+seeds stay red. `NABEDRA_SIM_TOPOLOGY_DEFECT` seeds one defect (`lose-row`, `duplicate-row`,
+`choose-building`, `fake-drop`, `refresh-twice`, `lie-about-refusal`, `stuck-fence`, `lose-range`).
+The same seed without it is the clean twin.
+
 ## Evidence scope
 
 The sweep report stores seed and configuration hashes, trace hashes, replay counts, virtual
