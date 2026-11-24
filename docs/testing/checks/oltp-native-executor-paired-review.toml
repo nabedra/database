@@ -1,0 +1,43 @@
+id = "oltp-native-executor-paired-review"
+module = "oltp"
+kinds = ["P"]
+guarantees = []
+tiers = ["T0"]
+# Scratch review harness. The committed candidate and its base are the timed revisions.
+command = ["bash", "-ec", '''
+base_sha="6b01afb5746a77e9e714e787449f41c1f337e859"
+head_sha="e0192e5d4dcb6125e42b82cf924bfa2fb80c80ec"
+echo "paired OLTP point update base: $base_sha"
+echo "paired OLTP point update head: $head_sha"
+git merge-base --is-ancestor "$base_sha" "$head_sha"
+work=$(mktemp -d "${RUNNER_TEMP:?}/oltp-native-ab.XXXXXX")
+for side in base head; do
+    sha="$base_sha"
+    if [[ "$side" == head ]]; then sha="$head_sha"; fi
+    mkdir "$work/$side"
+    git archive "$sha" | tar -x -C "$work/$side"
+done
+toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+docker run --rm -v "$work:/work" -w /work -e CARGO_HOME=/work/cargo -e CARGO_TARGET_DIR=/work/target \
+    -e CARGO_BUILD_JOBS=4 "rust:$toolchain-bookworm" sh -ec '
+    for side in base head; do
+        cargo build --manifest-path "$side/server/Cargo.toml" --locked --release \
+            --no-default-features --features oltp --bin nabedra-db
+        cp target/release/nabedra-db "$side/nabedra-db"
+    done'
+export NABEDRA_PERF_OLTP_IMAGE=nabedra-oltp-native-ab:bookworm
+docker build -t "$NABEDRA_PERF_OLTP_IMAGE" - <<'DOCKERFILE'
+FROM python:3.11-slim-bookworm
+ENV TOKIO_WORKER_THREADS=2
+DOCKERFILE
+status=0
+python3 scripts/testing/ab.py docs/testing/perf/oltp/point-update.toml \
+    "$work/base/nabedra-db" "$work/head/nabedra-db" --output "$work/ab" || status=$?
+if [[ -f "$work/ab/summary.md" ]]; then cat "$work/ab/summary.md"; fi
+if [[ -f "$work/ab/results.json" ]]; then cat "$work/ab/results.json"; fi
+exit "$status"
+''']
+cwd = "."
+timeout_s = 3600
+needs = ["docker"]
+result_parser = "exit-code"
