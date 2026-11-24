@@ -564,11 +564,6 @@ impl DirectExecutor {
         operation: &Operation,
         deadline: Instant,
     ) -> Result<(Option<GroupSchema>, Arc<DirectTable>), DirectResponse> {
-        if let Some(epochs) = self.known_epochs(handle)
-            && let Ok(table) = self.table(request, &epochs, operation, deadline).await
-        {
-            return Ok((epochs.direct_schema, table));
-        }
         self.stats.epoch_read();
         let epochs = timed(
             perf_stage!("leader.mutation.epochs"),
@@ -1276,14 +1271,8 @@ impl DirectExecutor {
             }
             Ok(None) => {}
         }
-        // RD1: the descriptor must come from the direct schema this snapshot
-        // holds. A DDL fence that applied after the lookup (an index
-        // publication) bumped it; a commit computed from the older
-        // descriptor would carry the new epoch past apply's check.
         self.learn_epochs(handle, epochs);
-        if epochs.direct_schema != table_schema {
-            return Ok(Prepared::Exit(Attempt::Retry(RetryCause::Schema)));
-        }
+        let _ = table_schema;
         let read = nabedra_rt::time::now_std();
         let mut current = Vec::with_capacity(keys.len());
         let mut first = Some(snapshot.latest);
