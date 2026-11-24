@@ -1,0 +1,15 @@
+# Reproduced in Actions run 45328759638, job 138226753983, on db493b497697a605a2d555d78c40f09bc039c38f.
+id = "O03-storage-process-probes"
+title = "The extracted storage crate dropped the queued point-read probe"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G06"]
+scenarios = ["O03"]
+found_by = "acceptance"
+found_date = "2026-11-24"
+seed = "unknown"
+lowest_regression = "server/tests/oltp_acc6_acceptance.py::o03"
+why_not_caught = "The unit suites still compiled probe calls under cfg(test). The server process fixture links storage as a dependency, where only test-hooks is set."
+invariant_added = "O03 in queued mode observes three point-read probes and zero scan probes from the linked test fixture."
+fix_commits = ["d248db1178e1366a80e9ed471b7f920a5d06af18"]
+revert_patch_ok = false
