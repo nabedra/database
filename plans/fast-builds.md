@@ -204,7 +204,9 @@ check fails if one breaks a phase 8 rule.
 | P8-G (storage extracted) | `e42f87d3`, [job 138263860899](https://github.com/zPy52/nabedra-database/actions/runs/45340789755/job/138263860899) | AMD EPYC 7763 |
 | P8-H (replication extracted, first head) | `f6817e08`, [job 138309942107](https://github.com/zPy52/nabedra-database/actions/runs/45354787718/job/138309942107) | Intel Xeon 6975P-C |
 | P8-H (replication extracted, final review head) | `ee387c2b`, [job 138399122333](https://github.com/zPy52/nabedra-database/actions/runs/45380577146/job/138399122333) | Intel Xeon 6975P-C |
-| P8-I (phase 8 acceptance head, after #106) | `16ced08f`, [job 138511374032](https://github.com/zPy52/nabedra-database/actions/runs/45412853815/job/138511374032) | AMD EPYC 7763 |
+| P8-I (candidate head after #106) | `16ced08f`, [job 138511374032](https://github.com/zPy52/nabedra-database/actions/runs/45412853815/job/138511374032) | AMD EPYC 7763 |
+
+The `build-times` record on the final head of PR #109 is linked in that PR, because a commit cannot cite its own run.
 
 Medians, base then head, from the `ee387c2b` and `16ced08f` records. Compare each head with its own base only:
 the two records ran on different CPUs.
