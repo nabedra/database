@@ -28,6 +28,7 @@ use nabedra_transport::{StreamFrame, session_alpn};
 
 type Link = (Option<u64>, Option<u64>);
 type Profile<T, A> = Box<dyn FnMut(T) -> A + Send>;
+type TraceObserver = Arc<dyn Fn(u64, Option<ConnId>, &str) + Send + Sync>;
 
 /// A multiplexed frame's routing metadata. The body never reaches the profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +73,7 @@ struct State {
     dial_profile: Option<Profile<Link, Dial>>,
     world: Weak<World>,
     trace: Trace,
+    trace_observer: Option<TraceObserver>,
 }
 
 /// Installs profiles on the network used by the existing transport backend.
@@ -93,6 +95,7 @@ impl SimNet {
             dial_profile: None,
             world: Arc::downgrade(world),
             trace: Trace::new(),
+            trace_observer: None,
         }));
         world.set_net_planner(Router(state.clone()));
         Self {
@@ -164,6 +167,15 @@ impl SimNet {
         self.world.net_changed();
     }
 
+    /// Forward frame metadata to a chronological harness trace. The observer
+    /// runs under the planner lock and must not call the network.
+    pub fn set_trace_observer(
+        &self,
+        observer: impl Fn(u64, Option<ConnId>, &str) + Send + Sync + 'static,
+    ) {
+        self.state.lock().unwrap().trace_observer = Some(Arc::new(observer));
+    }
+
     pub fn trace(&self) -> Trace {
         self.state.lock().unwrap().trace.clone()
     }
@@ -171,9 +183,21 @@ impl SimNet {
 
 impl State {
     fn record(&mut self, event: std::fmt::Arguments<'_>) {
+        self.record_observed(event, event, None);
+    }
+
+    fn record_observed(
+        &mut self,
+        event: std::fmt::Arguments<'_>,
+        observed: std::fmt::Arguments<'_>,
+        connection: Option<ConnId>,
+    ) {
         if let Some(world) = self.world.upgrade() {
-            self.trace
-                .record(world.elapsed().as_millis().try_into().unwrap(), event);
+            let ms = world.elapsed().as_millis().try_into().unwrap();
+            self.trace.record(ms, event);
+            if let Some(observer) = &self.trace_observer {
+                observer(ms, connection, &observed.to_string());
+            }
         }
     }
 }
@@ -223,15 +247,21 @@ impl Planner for Router {
             Action::Pass => base,
             action => action,
         };
-        state.record(format_args!(
-            "conn={} seq={} {:?} {:?} {:?} len={} {action:?}",
-            envelope.conn.0,
-            envelope.seq,
-            envelope.direction,
-            message,
-            envelope.alpn,
-            envelope.bytes.len(),
-        ));
+        let len = envelope.bytes.len();
+        let metadata = format_args!(
+            "conn={} seq={} {:?} {:?} {:?}",
+            envelope.conn.0, envelope.seq, envelope.direction, message, envelope.alpn,
+        );
+        let event = format_args!("{metadata} len={len} {action:?}");
+        if matches!(message, Message::Http(_)) && envelope.direction == Direction::ToClient {
+            // Public stats responses contain host-dependent profiling counters.
+            // Observe HTTP response boundaries and fates alongside the parsed
+            // client history. Worker frames still include their wire sizes.
+            state.record_observed(event, format_args!("{metadata} {action:?}"), None);
+        } else {
+            let connection = matches!(message, Message::Frame(_)).then_some(envelope.conn);
+            state.record_observed(event, event, connection);
+        }
         let delay = match action {
             Action::Pass => Duration::ZERO,
             Action::Delay(delay) => delay,
