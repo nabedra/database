@@ -239,16 +239,16 @@ SubmitRequest(r) ==
                    applied, commitRun, ackRun, lostHeld, spurious>>
     /\ AccSeen
 
-\* O14, PR #103: Control published a newer ready view and the owner's local
-\* membership actor has not installed it. The fixed code waits up to 3 s for
-\* that exact view, so a retry is not handled until ApplyView. The reverted
-\* fix answered 503 to a same-run retry of accepted work.
+\* O14, PR #103: a same-body retry reaches the owner after Control published
+\* a newer ready view and before the owner's local membership actor installed
+\* it. The fixed code waits up to 3 s for that exact view: the retry stays
+\* pending (this step changes nothing) until ApplyView. The reverted fix
+\* answered 503 to a same-run retry of accepted work.
 RetryDuringViewLag(r) ==
-    /\ Mutant = "prefix_o14_ready_view"
     /\ owner # NoW /\ Live(owner) /\ owner \in ready /\ view[owner] = "stale"
     /\ q[owner][r] \in AccPh
     /\ ~spurious
-    /\ spurious' = TRUE
+    /\ spurious' = (Mutant = "prefix_o14_ready_view")
     /\ UNCHANGED <<control, durable, worker, atts, faults, applied, commitRun,
                    firstRun, ackRun, obs, everAb, everNA, everAcc, regress,
                    lostHeld>>

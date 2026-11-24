@@ -1,0 +1,14 @@
+# The replicated RAM request queue (all-ready policy) on the OLTP queued path: admission copies,
+# takeover, rejoin and join, settlement, receipts, cold start. specs/oltp/queue/OltpQueue.tla. The T1
+# baseline is exhaustive at 4 workers and 2 requests; OltpQueue.live.cfg adds liveness.
+id = "oltp-oltp-queue"
+module = "oltp"
+kinds = ["T"]
+guarantees = ["OLTP-G03", "OLTP-G04", "OLTP-G07", "OLTP-G08", "OLTP-G09", "SCHED-G04"]
+scenarios = ["Q03", "Q04", "Q05", "Q06", "O14", "O15", "O17", "O32", "R01", "R02", "R03", "R04", "R05", "T04", "T05", "F03"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/oltp/queue", "OltpQueue", "--module", "oltp"]
+cwd = "."
+timeout_s = 14400
+needs = ["tlc"]
+result_parser = "tlc"
