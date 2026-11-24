@@ -1,0 +1,99 @@
+diff --git a/server/oltp-replication/src/oltp_replication/manager/damage_scheduler_tests.rs b/server/oltp-replication/src/oltp_replication/manager/damage_scheduler_tests.rs
+index c6ad9f5e..7697652c 100644
+--- a/server/oltp-replication/src/oltp_replication/manager/damage_scheduler_tests.rs
++++ b/server/oltp-replication/src/oltp_replication/manager/damage_scheduler_tests.rs
+@@ -1122,6 +1122,77 @@ async fn ns23_o06_o17_ns14b_g3_journal_value_damage_is_replaced_by_control() {
+     .expect("NS14b G3 watchdog");
+ }
+ 
++/// Scratch probe for ACC3-delegation (never shipped): a retained worker can finish enrollment
++/// through one voter before another applies its promotion. That voter must defer the
++/// delegation (retryable, not applied), not refuse the request as malformed.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn probe_acc3_delegation_waits_for_the_applied_promotion() {
++    use crate::oltp_replication::multiplex::Endpoint as _;
++    timeout(Duration::from_secs(120), async {
++        let cluster = Cluster::new(1, &[]).await;
++        {
++            let (raw, handle, _) = cluster.running(0).control.as_ref().unwrap();
++            let shared = cluster.workers[0].shared.clone();
++            let reads = ControlEndpoint::new(handle.clone(), shared.clone()).unwrap();
++            let hosted =
++                HostedControlEndpoint::new(reads, raw.clone(), shared, cluster.pins.clone())
++                    .unwrap();
++            let session = || {
++                AuthenticatedSession::for_test(
++                    cluster.identity(0),
++                    cluster.identity(1),
++                    cluster.control.clone(),
++                    Purpose::ControlDelegation,
++                    nabedra_rt::ids::uuid_v4(),
++                )
++            };
++            let header = |operation: &str, payload: u64| {
++                serde_json::json!({
++                    "control_consensus": operation,
++                    "to_node": raw.state.resident().node_id(),
++                    "payload_bytes": payload,
++                })
++                .to_string()
++            };
++            // The enrolled peer's ordinary session may delegate.
++            timeout(Duration::from_secs(30), async {
++                while hosted
++                    .preflight(&session(), header("barrier", 0).as_bytes())
++                    .await
++                    .is_err()
++                {
++                    nabedra_rt::time::sleep(Duration::from_millis(50)).await;
++                }
++            })
++            .await
++            .expect("the peer's enrollment applied");
++            // Its prepared-only session, before the directory refresh, must be deferred.
++            for (operation, payload) in [("barrier", 0), ("propose", 64)] {
++                let error = hosted
++                    .preflight(
++                        &session().recovery_only_for_test(),
++                        header(operation, payload).as_bytes(),
++                    )
++                    .await
++                    .err()
++                    .expect("a prepared-only role cannot delegate");
++                assert_eq!(
++                    (error.code, error.outcome),
++                    (
++                        ErrorCode::StorageUnavailable,
++                        crate::protocol::Outcome::NotApplied
++                    ),
++                    "{operation} from a worker whose promotion is not applied here: {}",
++                    error.message,
++                );
++            }
++        }
++        cluster.shutdown().await;
++    })
++    .await
++    .expect("probe watchdog");
++}
++
+ /// NS23 / O17: the Control leader stops after the Data group enters joint
+ /// consensus. The successor must finish the same plan.
+ #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+diff --git a/server/transport/src/lib.rs b/server/transport/src/lib.rs
+index c0470f68..18c57f63 100644
+--- a/server/transport/src/lib.rs
++++ b/server/transport/src/lib.rs
+@@ -169,6 +169,12 @@ impl AuthenticatedSession {
+             recovery_only: false,
+         }
+     }
++    #[cfg(any(test, feature = "test-hooks"))]
++    #[doc(hidden)]
++    pub fn recovery_only_for_test(mut self) -> Self {
++        self.recovery_only = true;
++        self
++    }
+     #[inline]
+     pub fn local(&self) -> WorkerIdentity {
+         self.local
