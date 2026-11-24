@@ -1,0 +1,18 @@
+id = "oltp-protected-progress-fixture"
+module = "oltp"
+kinds = ["U"]
+guarantees = []
+scenarios = ["O22", "C07"]
+tiers = ["T1"]
+command = ["bash", "-ec", '''
+python3 scripts/testing/repeat_gate.py <<'JSON'
+[
+  {"id":"O22RecoveryFixtureTest.test_transient_executor_refusal_retries_metadata","file":"server/tests/oltp_acc6_acceptance.py","lang":"python"},
+  {"id":"O22RecoveryFixtureTest.test_persistent_executor_refusal_exhausts_recovery","file":"server/tests/oltp_acc6_acceptance.py","lang":"python"}
+]
+JSON
+''']
+cwd = "."
+timeout_s = 120
+needs = []
+result_parser = "exit-code"

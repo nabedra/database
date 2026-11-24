@@ -18,6 +18,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import unittest
+from unittest.mock import Mock, patch
 
 from oltp_compatibility import OlapServer, interrupt_fixture
 from oltp_direct_acceptance import Database, admin_owner, col, dump
@@ -801,6 +803,52 @@ def saturated_history(db, exchange, worker_stats, directories, run, memory_limit
             release_snapshot(request)
 
 
+def o22_recovered_table(db, expected_id, rows):
+    current = None
+    overloads = 0
+
+    def restored_rows():
+        nonlocal current, overloads
+        try:
+            if current is None:
+                current = db.table('o22_rows')
+                assert current.id == expected_id
+            return current.query().collect()
+        except OverloadedError as error:
+            # Recovery can briefly fill owner actor slots after the ready-view
+            # change invalidates the terminal-copy confirmations.
+            assert (error.status_code, error.outcome, str(error)) == (
+                429, 'not_applied', 'executor admission capacity exhausted'), error
+            overloads += 1
+            return None
+
+    assert wait_until(restored_rows, 'same-run table read after queue recovery', timeout=15) == rows
+    return current, overloads
+
+
+class O22RecoveryFixtureTest(unittest.TestCase):
+    def test_transient_executor_refusal_retries_metadata(self):
+        db = Mock()
+        table = Mock(id='original')
+        rows = [{'id': 1}]
+        table.query.return_value.collect.return_value = rows
+        refusal = OverloadedError('executor admission capacity exhausted', status_code=429)
+        db.table.side_effect = [refusal, table]
+        self.assertEqual(o22_recovered_table(db, table.id, rows), (table, 1))
+        self.assertEqual(db.table.call_count, 2)
+        table.query.return_value.collect.assert_called_once_with()
+
+    def test_persistent_executor_refusal_exhausts_recovery(self):
+        db = Mock()
+        db.table.side_effect = OverloadedError('executor admission capacity exhausted', status_code=429)
+        with patch('oltp_runtime_acceptance.time') as clock:
+            # The clock reaches the deadline only after two refused calls.
+            clock.monotonic.side_effect = [0, 1, 14, 15]
+            with self.assertRaisesRegex(TimeoutError, 'same-run table read after queue recovery'):
+                o22_recovered_table(db, 'original', [])
+        self.assertEqual(db.table.call_count, 2)
+
+
 def o22(binary, test_executable):
     run_native_assertions(test_executable, [
         'c01_c02_heterogeneous_limits_and_impossible_work',
@@ -910,25 +958,7 @@ def o22(binary, test_executable):
             same_run_ready(cluster, cluster.run_id, WORKERS, 3)
             ready_replica_view(cluster, WORKERS, newer_than=removed_view['membership_revision'])
             assert cluster.stats(target)['native_thread_budget']['query_threads'] == 3
-            current = None
-            overloads = 0
-
-            def restored_rows():
-                nonlocal current, overloads
-                try:
-                    if current is None:
-                        current = db.table('o22_rows')
-                        assert current.id == table.id
-                    return current.query().collect()
-                except OverloadedError as error:
-                    # The new view invalidates terminal-copy confirmations.
-                    # Recovery can briefly occupy all four owner actor slots.
-                    assert (error.status_code, error.outcome, str(error)) == (
-                        429, 'not_applied', 'executor admission capacity exhausted'), error
-                    overloads += 1
-                    return None
-
-            assert wait_until(restored_rows, 'same-run table read after queue recovery', timeout=15) == rows
+            current, overloads = o22_recovered_table(db, table.id, rows)
             route_after = [current.where(id=key).explain().split('owning shard ', 1)[1].splitlines()[0]
                            for key in (-1, 1)]
             assert route_after == route_before, (route_before, route_after)
