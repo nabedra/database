@@ -1,0 +1,304 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-events-fd58ce9d-163242--events-log.log",
+      "sha256": "71bea7b7bee5c8a863123ad72e31370682c395328192846d9766f5f0b48ccac9"
+    },
+    {
+      "name": "tla/EventsLog.cex.json",
+      "sha256": "7a9bba08beb11acd7cbe5a556dcace85d3c300c31265e854beb0118ebd493ebb"
+    },
+    {
+      "name": "tla/EventsLog.live.cex.json",
+      "sha256": "aa1014fda8eb89dd4e2401126ec7b43ffb984067ae5647ddb1df021ff047c289"
+    },
+    {
+      "name": "tla/EventsLog.live.log",
+      "sha256": "829f449495ba47350eaaf171a41e0366d3adbdb41a5395a8e562edfa5bf83491"
+    },
+    {
+      "name": "tla/EventsLog.log",
+      "sha256": "3dbc705a54cec0c5a1df263ad0773950b1d66bc03166138f5ff224ffb826a69f"
+    },
+    {
+      "name": "tla/mutant-ack_before_fsync.cex.json",
+      "sha256": "89713a4470262ecb13f3f879c5b458583973183ddee1cee0834431445c481fd1"
+    },
+    {
+      "name": "tla/mutant-ack_before_fsync.log",
+      "sha256": "50ad0d1f9d5387db63a85cf9da16b4331baea23bb27bbd065938bc59ab3983f6"
+    },
+    {
+      "name": "tla/mutant-ack_unreachable_appends.cex.json",
+      "sha256": "bc623df081d6dbe861f680161087f7690d08b89b0760c81f6540a1bb54ee09fe"
+    },
+    {
+      "name": "tla/mutant-ack_unreachable_appends.log",
+      "sha256": "217c1ee3295afe426e96af0f3c14176e871c12bebd38a003c2eb10bcc0926fff"
+    },
+    {
+      "name": "tla/mutant-conflict_consumes_offsets.cex.json",
+      "sha256": "7921eab99446f57b12f720f78288d50cd601148ebd2b10ce915e62fec3bae265"
+    },
+    {
+      "name": "tla/mutant-conflict_consumes_offsets.log",
+      "sha256": "b0bb45d3aef74328188b00bbeaec117a699c0366865fcfa7602eae4527589b7c"
+    },
+    {
+      "name": "tla/mutant-dedup_ignore_body.cex.json",
+      "sha256": "d2364be2895cf5415a0b3c909b6d6e3b8f04f46e9a8356c1e5f7638f54661597"
+    },
+    {
+      "name": "tla/mutant-dedup_ignore_body.log",
+      "sha256": "6142f5315fb53600ae63ec87044e41dfd90d240749a7de6dc3e87f53a968bb8c"
+    },
+    {
+      "name": "tla/mutant-no_retry.cex.json",
+      "sha256": "f8277dbcfa4ba5d605a0d8a4093d583e8c99c40eaf8d1b4ce6043900888526a3"
+    },
+    {
+      "name": "tla/mutant-no_retry.log",
+      "sha256": "d511099f39a804dab1c5ea9597e12f1d751617bf7861b2a90fdb5cb2b5672a68"
+    },
+    {
+      "name": "tla/mutant-partial_batch.cex.json",
+      "sha256": "563213b4a278262aaf7b95934bb4173aee34d6c2a9a430c7fd7074c40fbade50"
+    },
+    {
+      "name": "tla/mutant-partial_batch.log",
+      "sha256": "9af0cfb1a0db9f7e069ce10dd961d58b547171ab3d31e5ba6d8246a206abf140"
+    },
+    {
+      "name": "tla/mutant-poll_local_read.cex.json",
+      "sha256": "29546c1bc5099ee9688587c0cb08b043c46082239783c7c8a92fc9feaca7bb25"
+    },
+    {
+      "name": "tla/mutant-poll_local_read.log",
+      "sha256": "902a4d3e784492ffb79bc4cb135686359327c53601b7f1c40a2fd926423fea7e"
+    },
+    {
+      "name": "tla/mutant-prefix_empty_disk_rejoins_voter.cex.json",
+      "sha256": "ffcf15f74aa4fe20fb29744a5c795204b8d5f6749e68e03965ebe13bb93946b6"
+    },
+    {
+      "name": "tla/mutant-prefix_empty_disk_rejoins_voter.log",
+      "sha256": "05d741ce35dd4e07f63657784b77dc49d4928560a195c6ec4a4638cfb3f27f79"
+    },
+    {
+      "name": "tla/mutant-reexecute_on_retry.cex.json",
+      "sha256": "54c350ca3138bf9e628ffc54ea1fc377648838338aee718a37a6abf49ee7035b"
+    },
+    {
+      "name": "tla/mutant-reexecute_on_retry.log",
+      "sha256": "51ea1c3bb0b69ac24f4c5ff8fe31d1f23e0a9a4caac3d9c3b98d5ecbef0ba070"
+    },
+    {
+      "name": "tla/mutant-reuse_offset_after_dedup.cex.json",
+      "sha256": "2231d5718e6aa9e2107ac92e4219a9ab3642af75f24cf0bd97c1f1865ef0ed47"
+    },
+    {
+      "name": "tla/mutant-reuse_offset_after_dedup.log",
+      "sha256": "2ea74fcbd3df98e8f9e00203ce0433eb49efd5b395c1f9b46e33bf141a199717"
+    },
+    {
+      "name": "tla/mutant-stop_replication_after_commit.cex.json",
+      "sha256": "cc4287d85045501e6386d1cf06d8b773c376f26a8cfafd1300de11a2b7abd2a6"
+    },
+    {
+      "name": "tla/mutant-stop_replication_after_commit.log",
+      "sha256": "1de8988ce241b17d5b6148f072983c2d1368d91b8b4a9d6f9a4ed9fb3516484f"
+    },
+    {
+      "name": "tla/mutant-volatile_vote.cex.json",
+      "sha256": "6ea775453e6f17d558daf5fa625c9661437d9d359bc1c49b2d4b925f5788a5f4"
+    },
+    {
+      "name": "tla/mutant-volatile_vote.log",
+      "sha256": "a28a51b7bac92b3c3f7e1d2954026326487dae18c281d817574ce91c9310f3b4"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "1bb33e28ef8f7f07c6f624a1cdb568208ead938a935567cd2eccdb6e7fde50f1"
+    }
+  ],
+  "assertions": {
+    "executed": 23,
+    "failed": 2,
+    "not_run": [
+      {
+        "id": "coverage",
+        "reason": "no baseline completed, so coverage was not evaluated"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "events-log",
+  "duration_s": 210.968,
+  "guarantees": [
+    "EVT-G01",
+    "EVT-G02",
+    "EVT-G03",
+    "EVT-G04",
+    "EVT-G06"
+  ],
+  "kind": "T",
+  "mode": {
+    "tla": "exhaustive"
+  },
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T15:33:11.647078+00:00",
+    "request_id": "dr-events-fd58ce9d-163242",
+    "runner": "GitHub Actions 1000011602",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45426720754"
+  },
+  "scenarios": [
+    "EV01",
+    "EV02",
+    "EV07"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "fd58ce9d6e995887877cb2472c1d7b0cbf0773cf",
+  "sim_core_hours": null,
+  "tla": {
+    "actions": 0,
+    "budget_s": 900,
+    "depth": 11,
+    "distinct_states": 769609,
+    "min_action_coverage": null,
+    "mode": "exhaustive",
+    "mutants": [
+      {
+        "cex_length": 5,
+        "detail": "invariant G01_AckedPublishSurvives violated, counterexample of 5 states",
+        "expect": "G01_AckedPublishSurvives",
+        "name": "ack_before_fsync",
+        "observed": "G01_AckedPublishSurvives",
+        "ok": true
+      },
+      {
+        "cex_length": 5,
+        "detail": "invariant G01_AckedPublishSurvives violated, counterexample of 5 states",
+        "expect": "G01_AckedPublishSurvives",
+        "name": "ack_unreachable_appends",
+        "observed": "G01_AckedPublishSurvives",
+        "ok": true
+      },
+      {
+        "cex_length": 4,
+        "detail": "invariant G02_Contiguous violated, counterexample of 4 states",
+        "expect": "G02_Contiguous",
+        "name": "conflict_consumes_offsets",
+        "observed": "G02_Contiguous",
+        "ok": true
+      },
+      {
+        "cex_length": 4,
+        "detail": "invariant G02_OffsetsStable violated, counterexample of 4 states",
+        "expect": "G02_OffsetsStable",
+        "name": "dedup_ignore_body",
+        "observed": "G02_OffsetsStable",
+        "ok": true
+      },
+      {
+        "cex_length": 5,
+        "detail": "liveness property L_PublishCompletes violated, counterexample of 5 states (lasso)",
+        "expect": "L_PublishCompletes",
+        "name": "no_retry",
+        "observed": "L_PublishCompletes",
+        "ok": true
+      },
+      {
+        "cex_length": 4,
+        "detail": "invariant G04_BatchWhole violated, counterexample of 4 states",
+        "expect": "G04_BatchWhole",
+        "name": "partial_batch",
+        "observed": "G04_BatchWhole",
+        "ok": true
+      },
+      {
+        "cex_length": 5,
+        "detail": "invariant G06_ReadIndexSafe violated, counterexample of 5 states",
+        "expect": "G06_ReadIndexSafe",
+        "name": "poll_local_read",
+        "observed": "G06_ReadIndexSafe",
+        "ok": true
+      },
+      {
+        "cex_length": 6,
+        "detail": "invariant G01_CommittedPrefixesAgree violated, counterexample of 6 states",
+        "expect": "G01_CommittedPrefixesAgree",
+        "name": "prefix_empty_disk_rejoins_voter",
+        "observed": "G01_CommittedPrefixesAgree",
+        "ok": true
+      },
+      {
+        "cex_length": 4,
+        "detail": "invariant G03_RetryReturnsOriginal violated, counterexample of 4 states",
+        "expect": "G03_RetryReturnsOriginal",
+        "name": "reexecute_on_retry",
+        "observed": "G03_RetryReturnsOriginal",
+        "ok": true
+      },
+      {
+        "cex_length": 5,
+        "detail": "invariant G02_OffsetsStable violated, counterexample of 5 states",
+        "expect": "G02_OffsetsStable",
+        "name": "reuse_offset_after_dedup",
+        "observed": "G02_OffsetsStable",
+        "ok": true
+      },
+      {
+        "cex_length": 7,
+        "detail": "liveness property L_Replicated violated, counterexample of 7 states (lasso)",
+        "expect": "L_Replicated",
+        "name": "stop_replication_after_commit",
+        "observed": "L_Replicated",
+        "ok": true
+      },
+      {
+        "cex_length": 8,
+        "detail": "invariant G01_CommittedPrefixesAgree violated, counterexample of 8 states",
+        "expect": "G01_CommittedPrefixesAgree",
+        "name": "volatile_vote",
+        "observed": "G01_CommittedPrefixesAgree",
+        "ok": true
+      }
+    ],
+    "runs": [
+      {
+        "cfg": "EventsLog.cfg",
+        "depth": 11,
+        "detail": "deadlock violated, counterexample of 10 states",
+        "distinct_states": 769609,
+        "duration_s": 61.2,
+        "states_left": 450011,
+        "verdict": "deadlock"
+      },
+      {
+        "cfg": "EventsLog.live.cfg",
+        "depth": 8,
+        "detail": "liveness property L_PublishCompletes violated, counterexample of 7 states (lasso)",
+        "distinct_states": 379769,
+        "duration_s": 66.2,
+        "states_left": 268642,
+        "verdict": "temporal"
+      }
+    ],
+    "spec": "specs/events/EventsLog",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "uncovered": [],
+    "unmutated": [
+      "TypeOK"
+    ]
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}
