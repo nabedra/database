@@ -393,7 +393,7 @@ pub(in crate::oltp_replication::service_rpc) async fn decode_point_reply<
             let raw = response.reply.sections[0].as_ref().ok_or_else(invalid)?;
             crate::protocol::json_input(raw.as_slice(), raw.len()).map_err(|_| invalid())?;
             let value = serde_json::from_slice(raw.as_slice()).map_err(|_| invalid())?;
-            Ok((value, response.reply.scratch.clone()))
+            Ok((value, response.reply.scratch_lease()))
         })
         .await
 }
