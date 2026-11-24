@@ -115,7 +115,7 @@ def run_baseline(rep: Report, spec_dir: Path, model: str, cfg: Path, out: Path, 
         rep.check(False, label, describe(res) + f" (log {stem}.log)")
         for line in tc.counterexample_text((out / f"{stem}.log").read_text(encoding="utf-8", errors="replace")):
             print(f"    {line}")
-    elif res.complete or res.simulation_done:
+    elif res.complete or (res.simulation_done and not res.timed_out):
         fact["verdict"] = "pass"
         rep.check(True, label, f"{res.distinct if res.distinct is not None else res.generated} "
                                f"{'distinct' if res.distinct is not None else 'generated'} states, depth {res.depth}")

@@ -1,0 +1,47 @@
+Picked up JAVA_TOOL_OPTIONS: -Xmx2g
+@!@!@STARTMSG 2262:0 @!@!@
+TLC2 Version 2026.11.19.180144 (rev: bc1b506)
+@!@!@ENDMSG 2262 @!@!@
+@!@!@STARTMSG 2187:0 @!@!@
+Running breadth-first search Model-Checking with fp 126 and seed -3487454281089766122 with 1 worker on 16 cores with 1820MB heap and 64MB offheap memory [pid: 7] (Linux 6.18.58.1-microsoft-standard-WSL2 amd64, Eclipse Adoptium 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue).
+@!@!@ENDMSG 2187 @!@!@
+@!@!@STARTMSG 2220:0 @!@!@
+Starting SANY...
+@!@!@ENDMSG 2220 @!@!@
+Parsing file /specs/_fx/Err.tla
+***Parse Error***
+Encountered "====" at line 6, column 1 and token "+" 
+
+Residual stack trace follows:
+ExtendableExpr starting at line 6, column 1.
+ExtendableExpr starting at line 5, column 14.
+ExtendableExpr starting at line 5, column 9.
+Expression starting at line 5, column 9.
+Definition starting at line 5, column 1.
+
+
+Fatal errors while parsing TLA+ spec in file Err
+
+In module Err
+
+Could not parse module Err from file Err.tla
+*** Errors: 1
+
+In module Err
+
+Could not parse module Err from file Err.tla
+
+
+
+@!@!@STARTMSG 2219:0 @!@!@
+SANY finished.
+@!@!@ENDMSG 2219 @!@!@
+@!@!@STARTMSG 2185:0 @!@!@
+Starting... (2026-11-24 13:57:06)
+@!@!@ENDMSG 2185 @!@!@
+@!@!@STARTMSG 3002:1 @!@!@
+Parsing or semantic analysis failed.
+@!@!@ENDMSG 3002 @!@!@
+@!@!@STARTMSG 2186:0 @!@!@
+Finished in 162ms at (2026-11-24 13:57:06)
+@!@!@ENDMSG 2186 @!@!@

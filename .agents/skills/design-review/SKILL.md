@@ -182,17 +182,16 @@ only runs it started.
 
 ## Tooling status
 
-Kind T is defined ahead of its tooling. Until each piece lands, follow its
-interim rule.
+Kind T was defined ahead of its tooling. Each piece below follows its
+interim rule until it lands.
 
 | Piece | Status | Interim rule |
 | --- | --- | --- |
-| `T` in `KINDS` in `scripts/testing/evidence.py`, read by `matrix.py` and `run_check.py` | Missing | Leave T out of register rows and check files. List the planned T checks in the plan's design review section. |
-| A pinned TLC and Apalache image, and a `tlc` need for the `checks` job | Missing | Run TLC locally in Docker with the versions in `specs/README.md`. Label the results `local, unattested`. |
-| A `tlc` result parser in `run_check.py` | Missing | None. Report the distinct states, depth, coverage and verdict by hand. |
-| A `Design:` line check in `scripts/testing/pr_lint.py` | Missing | Write the line by hand. |
-| Trace output from simulation workloads | Missing | The first plan that specs a module adds trace output to its workload. |
+| `T` in `KINDS` in `scripts/testing/evidence.py`, read by `matrix.py` and `run_check.py` | Landed | None. A T check needs `needs = ["tlc"]` and `result_parser = "tlc"`. |
+| A pinned TLC and Apalache image (`specs/tools/`), and a `tlc` need for the `checks` job | Landed | None. Run `specs/tools/tlc` locally; results stay `local, unattested`. |
+| A `tlc` result parser in `run_check.py`, fed by `scripts/testing/tla_check.py` and `tla_trace.py` | Landed | None. |
+| A `Design:` line check in `scripts/testing/pr_lint.py` | Landed | None. |
+| Trace output from simulation workloads | Missing | The first plan that specs a module adds trace output to its workload, in the format of `nabedra.trace/1`. The simulator wave owns the workloads; see `wave-p8/design-review.md` in the wave files. |
 
-Until the first three land, the first condition of the
-[gate](#gate-implementation) cannot hold. Tell the user, and let them
-approve the plan with that gap named.
+[Specs](../../../specs/README.md) lists the tool versions, the commands and
+the self-test that proves the pipeline end to end.

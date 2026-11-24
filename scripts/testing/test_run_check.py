@@ -32,6 +32,15 @@ UNITTEST_FAIL = "..F.E\n--------------------------------------------------------
 UNITTEST_ZERO = "\n----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nNO TESTS RAN\n"
 NODE_OK = "TAP version 13\nok 1 - a\n# tests 4\n# suites 0\n# pass 3\n# fail 0\n# cancelled 0\n# skipped 1\n# todo 0\n"
 NODE_FAIL = "TAP version 13\nnot ok 1 - a\n# tests 3\n# pass 1\n# fail 1\n# cancelled 1\n# skipped 0\n"
+TLA_FACTS = {"spec": "specs/selftest/TwoPhase", "mode": "exhaustive", "tier": "T1", "tools": "tlc 1.8.0",
+             "distinct_states": 2750, "depth": 15,
+             "mutants": [{"name": "m", "expect": "Inv", "observed": "Inv", "ok": True, "cex_length": 6}]}
+
+
+def tla_summary(verdict, executed, failed, not_run=(), **extra):
+    body = {"verdict": verdict, "executed": executed, "failed": failed, "not_run": list(not_run),
+            "tla": TLA_FACTS, **extra}
+    return "TLC noise\nnabedra-tla-summary: " + json.dumps(body) + "\n"
 
 
 def check_data(**over):
@@ -102,6 +111,35 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(run_check.classify("exit-code", marker, 0, True, marker)[0], "error")
 
 
+class TlcParserTests(unittest.TestCase):
+    def test_pass_fail_and_facts(self):
+        result, p = run_check.classify("tlc", tla_summary("pass", 6, 0), 0)
+        self.assertEqual((result, p.executed, p.failed), ("pass", 6, 0))
+        self.assertEqual(p.extra["tla"]["distinct_states"], 2750)
+        self.assertEqual(run_check.classify("tlc", tla_summary("fail", 6, 2), 1)[0], "fail")
+
+    def test_not_run_and_error_are_never_pass(self):
+        reason = [{"id": "baseline TwoPhase.cfg", "reason": "stopped at the 900 s time budget"}]
+        result, p = run_check.classify("tlc", tla_summary("not-run", 3, 0, reason), 2)
+        self.assertEqual(result, "not-run")
+        self.assertEqual(p.not_run[0]["reason"], "stopped at the 900 s time budget")
+        result, p = run_check.classify("tlc", tla_summary("error", 1, 0, [{"id": "tlc-error", "reason": "parse"}]), 3)
+        self.assertEqual(result, "error")
+        # A failed assertion wins over a not-run baseline.
+        self.assertEqual(run_check.classify("tlc", tla_summary("not-run", 3, 1), 2)[0], "fail")
+
+    def test_missing_or_broken_summary_fails(self):
+        self.assertEqual(run_check.classify("tlc", "no summary here\n", 1)[0], "fail")
+        self.assertEqual(run_check.classify("tlc", "nabedra-tla-summary: {bad json\n", 1)[0], "fail")
+        self.assertEqual(run_check.classify("tlc", 'nabedra-tla-summary: {"verdict": "pass"}\n', 0)[0], "fail")
+
+    def test_last_summary_wins_and_zero_executed_is_not_run(self):
+        output = tla_summary("fail", 1, 1) + tla_summary("pass", 0, 0)
+        result, p = run_check.classify("tlc", output, 0)
+        self.assertEqual(result, "not-run")
+        self.assertEqual(p.not_run[-1]["id"], "zero-assertions")
+
+
 class CheckFileTests(unittest.TestCase):
     def test_fixture_checks_load(self):
         checks = run_check.load_all(FIXTURE_CHECKS, {"cache", "events", "testing", "misc"})
@@ -124,6 +162,8 @@ class CheckFileTests(unittest.TestCase):
             "bad guarantee": check_data(guarantees=["CACHE-2"]),
             "unknown module": check_data(module="nope"),
             "bool timeout": check_data(timeout_s=True),
+            "T without tlc parser": check_data(kinds=["T"], needs=["tlc"]),
+            "T without tlc need": check_data(kinds=["T"], result_parser="tlc"),
         }
         for name, data in cases.items():
             with self.subTest(name), self.assertRaises(run_check.CheckError):
@@ -133,6 +173,23 @@ class CheckFileTests(unittest.TestCase):
         with self.assertRaises(run_check.CheckError) as cm:
             run_check.parse_check(check_data(), Path("other.toml"))
         self.assertIn("does not match the file name", str(cm.exception))
+
+
+class KindTTests(unittest.TestCase):
+    def test_kind_t_check_is_valid(self):
+        check = run_check.parse_check(check_data(kinds=["T"], needs=["tlc"], result_parser="tlc"))
+        self.assertEqual((check.kinds, check.needs), (["T"], ["tlc"]))
+
+    def test_selftest_checks_are_registered(self):
+        checks = {c.id: c for c in run_check.load_all(run_check.CHECKS_DIR, run_check.module_names())}
+        for cid in ("specs-selftest", "specs-selftest-trace", "specs-selftest-large"):
+            self.assertEqual(checks[cid].kinds, ["T"])
+            self.assertEqual(checks[cid].result_parser, "tlc")
+
+    def test_tlc_need_without_docker_is_not_run(self):
+        check = run_check.parse_check(check_data(kinds=["T"], needs=["tlc"], result_parser="tlc"))
+        reasons = [m["reason"].split(":")[0] for m in run_check.missing_needs(check, {"PATH": "/nonexistent"})]
+        self.assertEqual(reasons, ["tlc-unavailable"])
 
 
 class NeedsTests(unittest.TestCase):
@@ -181,6 +238,15 @@ class ExecuteTests(unittest.TestCase):
                 print("rid=" + os.environ["NABEDRA_REQUEST_ID"] + " knob=" + os.environ["KNOB"])
             elif mode == "sleep":
                 time.sleep(30)
+            elif mode.startswith("tla-"):
+                import json
+                facts = {"spec": "specs/x/X", "mode": "simulation", "tier": "T2", "tools": "tlc 1.8.0"}
+                verdict = mode[4:]
+                print("nabedra-tla-summary: " + json.dumps({
+                    "verdict": verdict, "executed": 1, "failed": 0, "tla": facts,
+                    "not_run": [] if verdict == "pass" else [{"id": "b", "reason": "time budget"}],
+                    "artifacts": [{"name": "tla/X.log", "sha256": "0" * 64}]}))
+                sys.exit({"pass": 0, "not-run": 2}[verdict])
         """))
         subprocess.run(["git", "add", "."], cwd=cls.repo, check=True)
         subprocess.run([*g, "commit", "-qm", "c"], cwd=cls.repo, check=True)
@@ -208,6 +274,16 @@ class ExecuteTests(unittest.TestCase):
         log = self.logs / "req-ok--demo.log"
         self.assertIn("Ran 3 tests", log.read_text())
         self.assertEqual(record["artifacts"][0]["name"], log.name)
+
+    def test_tlc_record_carries_tla_facts_and_mode(self):
+        # The tlc need is left out so that the fake command runs without Docker.
+        record, path = self.run_mode("tla-pass", parser="tlc")
+        self.assertEqual(record["result"], "pass")
+        self.assertEqual(record["tla"]["mode"], "simulation")
+        self.assertEqual(record["mode"], {"tla": "simulation"})
+        self.assertIn("tla/X.log", [a["name"] for a in record["artifacts"]])
+        record, _ = self.run_mode("tla-not-run", parser="tlc")
+        self.assertEqual(record["result"], "not-run")
 
     def test_zero_assertions_record_is_not_run(self):
         record, _ = self.run_mode("zero")

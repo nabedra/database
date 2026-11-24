@@ -152,6 +152,10 @@ def parse_tlc_output(text: str, exit_code: int | None = None) -> TlcResult:
             else:
                 if code not in _CONTEXT_CODES:
                     res.errors.append(f"TLC message {code}: {body.splitlines()[0] if body else ''}"[:300])
+    # TLC prints "Model checking completed. No error has been found." even when it stopped early, at
+    # tlc2.TLC.stopAfter or TLCSet("exit", TRUE). Only an empty queue means the search was exhaustive.
+    if res.complete and res.left:
+        res.complete = False
     if not res.complete and not res.simulation_done and not res.violations and not res.errors:
         tail = [l for l in _MSG.sub("", text).splitlines() if l.strip() and not l.startswith(("Parsing", "Semantic", "Linting", "Picked up"))]
         if exit_code not in (0, None) and tail:
@@ -255,11 +259,13 @@ def default_heap() -> str:
 
 def run_tlc(spec_dir: Path, args: list[str], *, out_dir: Path, log_path: Path, budget_s: int,
             traces_dir: Path | None = None, trace_path: str | None = None,
-            wrapper: Path = TLC_WRAPPER) -> tuple[TlcResult, float]:
+            wrapper: Path | None = None) -> tuple[TlcResult, float]:
     """Runs the wrapper in `spec_dir` with `-tool`, logs the output, and parses it.
 
     TLC stops itself after `budget_s` (states left on queue, so the run reads as incomplete). The
     container is killed `KILL_GRACE_S` later if it is still running."""
+    # NABEDRA_TLC_WRAPPER replaces specs/tools/tlc, for the runners' own tests.
+    wrapper = wrapper or Path(os.environ.get("NABEDRA_TLC_WRAPPER") or TLC_WRAPPER)
     name = f"nabedra-tla-{uuid.uuid4().hex[:12]}"
     cmd = [str(wrapper), "--tla-out", str(out_dir), "--tla-name", name]
     if traces_dir is not None:
@@ -287,6 +293,7 @@ def run_tlc(spec_dir: Path, args: list[str], *, out_dir: Path, log_path: Path, b
     elapsed = time.monotonic() - start
     text = log_path.read_text(encoding="utf-8", errors="replace")
     res = parse_tlc_output(text, code)
+    # A simulation that ran into the budget stopped early, even though TLC reports it as finished.
     res.timed_out = timed_out or (elapsed >= budget_s and not res.complete and not res.violations)
     return res, elapsed
 

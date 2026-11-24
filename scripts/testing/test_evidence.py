@@ -54,6 +54,32 @@ class ValidatorTests(unittest.TestCase):
                 mutate(rec)
                 self.assertNotEqual(evidence.validate(rec), [], name)
 
+    def test_kind_t_and_tla_facts(self):
+        self.assertIn("T", evidence.KINDS)
+        rec = good(kind="T")
+        rec["tla"] = {
+            "spec": "specs/oltp/DirectPath", "mode": "exhaustive", "tier": "T1", "tools": "tlc 1.8.0",
+            "budget_s": 3600, "distinct_states": 10, "depth": 4, "actions": 3, "min_action_coverage": 1,
+            "uncovered": [], "unmutated": ["TypeOK"],
+            "runs": [{"cfg": "DirectPath.cfg", "verdict": "pass", "distinct_states": 10, "depth": 4,
+                      "states_left": 0, "duration_s": 1.5, "detail": ""}],
+            "mutants": [{"name": "no_fence", "expect": "Safe", "observed": "Safe", "ok": True,
+                         "cex_length": 5, "detail": ""}],
+        }
+        self.assertEqual(evidence.validate(rec), [])
+        trace = good(kind="T")
+        trace["tla"] = {"spec": "specs/oltp/DirectPath", "mode": "trace", "tier": "T0", "tools": "t",
+                        "traces": {"checked": 2, "accepted": 1, "rejected": 1, "expected_rejections": 1,
+                                   "failing": [{"file": "a.ndjson", "index": 3, "reason": "x"}]}}
+        self.assertEqual(evidence.validate(trace), [])
+        for mutate in (lambda t: t.update(mode="random"), lambda t: t.update(extra=1),
+                       lambda t: t.pop("tools"), lambda t: t["mutants"][0].pop("ok"),
+                       lambda t: t.update(tier="T9")):
+            bad = copy.deepcopy(rec)
+            mutate(bad["tla"])
+            self.assertNotEqual(evidence.validate(bad), [])
+        self.assertNotEqual(evidence.validate(good(kind="T Z")), [])
+
     def test_zero_assertions_can_never_pass(self):
         rec = good()
         rec["assertions"]["executed"] = 0
