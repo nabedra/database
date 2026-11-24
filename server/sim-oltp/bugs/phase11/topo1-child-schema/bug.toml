@@ -13,7 +13,9 @@ port = "clean"
 port_notes = """
 `git diff 40e0c7f7 40e0c7f7^` on its two product files (store/direct.rs moved to nabedra-oltp-storage): the
 executor's schema cache key is (table, route epoch, group epoch) without the lifecycle, and DirectSchema
-loses its now unused Hash. The probe drives CatalogSchema directly; O28 is the recorded process regression.
+loses its now unused Hash. The probe drives CatalogSchema directly. The bug record's O28 also fails with the
+patch (opt-level-1 growth job, `fresh scan omitted an acknowledged mutation`, run 45440163383) and passes
+without it (run 45440174171), one run each.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
 # not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
