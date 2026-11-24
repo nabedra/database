@@ -18,13 +18,13 @@ mod transport;
 
 pub use transport::{
     EndpointRegistry, ONE_SHOT_ALPN, OutgoingReservation, PeerDirectory, PeerFeature, ReplicaLease,
-    RequestError, RequestTarget, ResidentGroup, ResidentLease, TransportConfig,
-    TransportTrust, WorkerClient, WorkerTransport,
+    RequestError, RequestTarget, ResidentGroup, ResidentLease, TransportConfig, TransportTrust,
+    WorkerClient, WorkerTransport,
 };
 #[cfg(feature = "sim")]
 pub use transport::{FrameKind, StreamFrame, session_alpn};
 
-pub use nabedra_resources::memory::ResourceOwner;
+pub use nabedra_resources::memory::{Decoded, MAX_SECTIONS, ReplicaMetadata, ResourceOwner};
 
 struct MemoryHandle {
     memory: Arc<WorkerMemory>,
@@ -54,7 +54,6 @@ impl Deref for MemoryHandle {
     }
 }
 
-pub use nabedra_resources::memory::{Decoded, MAX_SECTIONS, ReplicaMetadata};
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 pub const RAFT_PROGRESS_HEADER_BYTES: usize = 1024;
 pub const RAFT_PROGRESS_DECODE_BYTES: usize = 4096;

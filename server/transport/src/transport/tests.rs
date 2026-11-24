@@ -167,6 +167,79 @@ fn reply_header_checks_bounds_before_deserializing() {
 }
 
 #[test]
+fn o05_c07_sections_keep_decode_and_wire_charges_until_drop() {
+    let owner = test_memory(1, SharedResourceConfig::default());
+    let other = test_memory(2, SharedResourceConfig::default());
+    let usage = || {
+        (
+            owner.buffer_bytes_used(ByteClass::Data),
+            owner.working_decode_bytes(),
+        )
+    };
+    let baseline = usage();
+    let body = b"123";
+    let budget = json_decode_budget(body).unwrap();
+    let sections = |body| {
+        ChargedSections::for_test(
+            &owner,
+            ByteClass::Data,
+            [
+                Some(owner.copy_bytes_in(ByteClass::Data, body).unwrap()),
+                None,
+                None,
+            ],
+            budget,
+        )
+        .unwrap()
+    };
+
+    let decoded = sections(body).decode::<u64>(0).unwrap();
+    assert_eq!(*decoded, 123);
+    assert_eq!(usage(), (baseline.0 + body.len(), baseline.1 + budget));
+    drop(decoded);
+    assert_eq!(usage(), baseline);
+
+    assert!(sections(b"bad").decode::<u64>(0).is_err());
+    assert_eq!(usage(), baseline);
+
+    assert!(sections(body).reserve_decode(&other, budget).is_err());
+    assert_eq!(usage(), baseline);
+}
+
+#[test]
+fn lane_refusal_keeps_the_server_rpc_trace_target() {
+    struct EventTarget(mpsc::Sender<&'static str>);
+
+    impl tracing::Subscriber for EventTarget {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.0.send(event.metadata().target()).unwrap();
+        }
+    }
+
+    let (send, receive) = mpsc::channel();
+    tracing::subscriber::with_default(EventTarget(send), || {
+        LaneRefusals::default().outgoing(TrafficClass::ApiIngress, true);
+    });
+    assert_eq!(
+        receive.try_recv().unwrap(),
+        "nabedra_database_server::oltp_replication::multiplex::transport",
+    );
+}
+
+#[test]
 fn o05_m02_failed_replica_reservation_releases_unused_group_capacity() {
     let shared = test_memory(
         1,
