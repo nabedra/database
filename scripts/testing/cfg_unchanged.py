@@ -2,13 +2,14 @@
 """Prove that two revisions compile the same product code.
 
 For each product crate and feature set, both revisions are macro- and cfg-expanded by the
-pinned rustc (`-Zunpretty=expanded`), and the expansions must be byte-identical. Code behind
+pinned rustc (`-Zunpretty=expanded`), and the expansions must be identical, blank lines
+aside: the printer copies those from the source, and they are no code. Code behind
 `#[cfg(feature = "sim")]`, comments and formatting are gone from an expansion, so a
 sim-only change passes and any statement, block or item that a product build compiles
 fails. A sim-only site moves the lines below it, and macros expand line numbers, so each
 changed source file of the base is first padded with a blank line per line the head
 added. A head that changed or removed a line, rather than adding some, cannot be padded
-and fails. Nothing else is normalised.
+and fails.
 
 With `--binary FEATURES`, it instead builds the release server of both revisions with those
 features, at one path, and the two executables must be byte-identical. The base then
@@ -60,18 +61,25 @@ def show(revision, path):
 
 
 def padded(base, head):
-    """`base` with a blank line for each line `head` added, or None if it did more than add."""
-    old, new = base.split("\n"), head.split("\n")
-    out = []
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
-        if tag == "equal":
-            out += old[i1:i2]
-        elif tag == "insert":
-            out += [""] * (j2 - j1)
-        else:
-            return None
+    """`base` with a blank line for each line `head` added, or None if it did more than add.
+
+    Where an added block ends like the code before it, as with a closing brace, the first
+    match is the old line: the block was added after it."""
+    old, new = base.splitlines(), head.splitlines()
+    out, at = [], 0
+    for line in new:
+        same = at < len(old) and line == old[at]
+        out.append(line if same else "")
+        at += same
+    if at < len(old):
+        # An added line equals the old line after it, so the first match was not the old line.
+        out = []
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+            if tag not in ("equal", "insert"):
+                return None
+            out += old[i1:i2] if tag == "equal" else [""] * (j2 - j1)
     assert [line for line in out if line] == [line for line in old if line] and len(out) == len(new)
-    return "\n".join(out)
+    return "\n".join(out) + "\n"
 
 
 def pad(tree, base, head):
@@ -120,6 +128,11 @@ def expand(tree, target_dir, package, crate, features, defaults):
     return result.stdout
 
 
+def code(text):
+    """The lines of an expansion that are not blank."""
+    return "".join(line for line in text.splitlines(keepends=True) if line.strip())
+
+
 def compare_expansions(parent, target_dir, base, head, only):
     failed = 0
     with worktree(parent, "base", base) as before, worktree(parent, "head", head) as after:
@@ -133,6 +146,7 @@ def compare_expansions(parent, target_dir, base, head, only):
             label = f"{package} [{'default' if defaults else 'no default'}{',' + features if features else ''}]"
             if not old.strip():
                 raise SystemExit(f"{label}: empty expansion, so nothing was compared")
+            old, new = code(old), code(new)
             digest = hashlib.sha256(new.encode()).hexdigest()
             if old == new:
                 print(f"{label}: identical, {new.count(chr(10))} lines, sha256 {digest}", flush=True)

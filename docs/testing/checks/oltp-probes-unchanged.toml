@@ -2,9 +2,9 @@ id = "oltp-probes-unchanged"
 module = "oltp"
 kinds = ["U"]
 # P10-PROBES changed no source that a build without `sim` compiles: both revisions expand to the
-# same source, byte for byte, for the four product crates and every product feature set. Lines
-# above a site are aligned by padding the base, not ignored. Both revisions are pinned, so the
-# result stays reproducible. oltp-probes-machine-code compares the code.
+# same source, blank lines aside, for the four product crates and every product feature set. Line
+# numbers are aligned by padding the base, not ignored. Both revisions are pinned, so the result
+# stays reproducible. oltp-probes-machine-code compares the code.
 guarantees = []
 scenarios = []
 tiers = ["weekly"]
