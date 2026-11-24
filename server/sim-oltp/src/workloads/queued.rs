@@ -1912,10 +1912,20 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
     let old = cluster.config.run_id;
     let power = g.bool();
     let cut = if power { DiskCut::Power } else { DiskCut::Kill };
-    let count = 12 + g.below(24) as i64;
+    // A backlog: with two worker threads, most of these are still pending when the workers stop.
+    let count = 40 + g.below(40) as i64;
     let since = q.now();
     let tasks = burst(q, 0, count, false);
-    time::sleep(window(g, 0, 120)).await;
+    // The stop needs accepted work to abandon or to keep. It comes as soon as some is accepted,
+    // or after 2 s; a seed without any leaves the clauses unexecuted.
+    let wanted = match finale {
+        Finale::LastHolder => 3,
+        _ => 1 + g.below(6) as usize,
+    };
+    let give_up = q.now() + 2_000;
+    while q.now() < give_up && required(q, old, since, q.now(), q.now()) < wanted {
+        time::sleep(Duration::from_millis(2)).await;
+    }
     if finale == Finale::LastHolder {
         last_holder(q, cluster, cut, since, g).await;
     }
@@ -1976,7 +1986,7 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
         let node = CLIENTS[index % CLIENTS.len()];
         loop {
             let seen = lookup(q, node, GATEWAYS[index % 2], old, &open.req).await;
-            abandoned += u64::from(seen == Seen::Abandoned);
+            abandoned += u64::from(seen == Seen::Abandoned && open.req.body.mutation);
             q.count(match &seen {
                 Seen::Abandoned => "old receipt abandoned",
                 Seen::Terminal(Terminal::Succeeded(_)) => "old receipt succeeded",
@@ -2020,7 +2030,7 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
     if abandoned > 0 {
         q.clause("R04:abandoned");
     }
-    cluster.record(format!("queued finale: {abandoned} old receipts abandoned"));
+    cluster.record(format!("queued finale: {abandoned} mutations abandoned"));
     if q.take_defect(Defect::ReplayAbandoned) {
         replay_abandoned(q).await;
     }
