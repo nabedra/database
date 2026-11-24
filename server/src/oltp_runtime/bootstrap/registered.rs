@@ -283,7 +283,9 @@ impl LocalServices {
                                 "initialize Control",
                                 id(worker.bootstrap_id, b"initialize"),
                                 |operation| {
-                                    control.initialize_local(operator, operation, worker.initial_run)
+                                    let proposal =
+                                        control.initialize_local(operator, operation, worker.initial_run);
+                                    async move { Ok(proposal.await?.reply) }
                                 },
                             )
                             .await?;
@@ -303,13 +305,14 @@ impl LocalServices {
                         "enroll initial worker",
                         id(local.incarnation, b"enroll"),
                         |operation| {
-                            control.enroll_local(
+                            let proposal = control.enroll_local(
                                 operator,
                                 operation,
                                 None,
                                 worker.enrollment.clone(),
                                 None,
-                            )
+                            );
+                            async move { Ok(proposal.await?.reply) }
                         },
                     )
                     .await?;
