@@ -62,7 +62,9 @@ impl LocalServices {
                 Outcome::NotApplied,
             ));
         }
-        let mut worker = RegisteredWorker::open_development(
+        let mut worker = RegisteredWorker::open_development::<
+            crate::oltp_runtime::worker_runtime::archive::VerifiedNativeRestore,
+        >(
             config,
             resources,
             SharedResourceConfig {

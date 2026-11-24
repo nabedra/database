@@ -361,7 +361,7 @@ impl RegisteredWorker {
             catalog,
         })
     }
-    pub(crate) async fn open_development(
+    pub(crate) async fn open_development<R: RegisteredRestore>(
         mut config: RegisteredConfig,
         limits: WorkerResources,
         resources: SharedResourceConfig,
@@ -521,7 +521,7 @@ impl RegisteredWorker {
         let restore = match &config.restore {
             Some(input) => Some(
                 input
-                    .verify(&config, shared.clone(), archive_keys)
+                    .verify::<R>(&config, shared.clone(), archive_keys)
                     .await?,
             ),
             None => None,
@@ -663,11 +663,11 @@ impl RegisteredWorker {
             )?;
             let target = restore
                 .as_ref()
-                .map(|verified| OfflineRestoreTarget::claim_mounted(&mount, &verified.plan))
+                .map(|verified| OfflineRestoreTarget::claim_mounted(&mount, verified.plan()))
                 .transpose()?;
             let pool = OltpPool::open_registered(mount, identity, shared.clone())?;
             if let Some((verified, target)) = restore.zip(target) {
-                let (genesis, _) = verified.install(target, &pool).await?;
+                let genesis = verified.install(target, &pool).await?;
                 retained.restore_policy =
                     Some(super::restore::registered_policy(&config, &genesis)?);
                 restored = Some(genesis);
