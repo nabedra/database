@@ -45,7 +45,7 @@ use crate::oltp::{mvcc::CanonicalJson, pool::ScratchLease};
 pub(crate) mod clock;
 #[allow(unused_imports)] // Consumed by the leader executor (T5).
 #[doc(hidden)]
-pub use clock::{ClockRejection, LeaderToken, RANGE_CLOCK_WAIT, RangeClock};
+pub use clock::{ClockRejection, LeaderToken, RangeClock};
 
 /// Logical key tag of `MvccKey::DirectDedup`. It sorts after every head tag.
 pub(crate) const DEDUP_TAG: u8 = 14;

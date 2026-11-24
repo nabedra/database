@@ -40,6 +40,7 @@ pub struct WorkerSharedResources {
     #[cfg(any(test, feature = "test-hooks"))]
     native_jobs: [AtomicU64; 2],
     thread_budget: super::super::NativeThreadBudget,
+    #[doc(hidden)]
     pub read_attempts: ReadAttempts,
     read_replica: OnceLock<Box<dyn Any + Send + Sync>>,
     read_queue: OnceLock<Box<dyn Any + Send + Sync>>,
@@ -63,6 +64,7 @@ impl nabedra_resources::memory::ResourceOwner for WorkerSharedResources {
 }
 
 #[derive(Serialize)]
+#[doc(hidden)]
 pub struct BlockCacheUsage {
     configured_bytes: usize,
     usage_bytes: usize,
@@ -247,11 +249,13 @@ impl WorkerSharedResources {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
     pub fn reset_working_decode_peak(&self) {
         self.memory.reset_working_decode_peak()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
     pub fn peak_working_decode_bytes(&self) -> usize {
         self.memory.peak_working_decode_bytes()
     }
@@ -373,6 +377,7 @@ impl WorkerSharedResources {
         self.memory.reserve_pool_slot()
     }
 
+    #[doc(hidden)]
     pub fn request_actor_bytes(execution: &ExecutionConfig) -> Option<u64> {
         WorkerMemory::request_actor_bytes(execution)
     }
@@ -398,6 +403,7 @@ impl WorkerSharedResources {
         workers.insert(worker_id, Arc::downgrade(self));
         Ok(())
     }
+    #[doc(hidden)]
     pub fn bind_read_replica<T: Send + Sync + 'static>(
         &self,
         replica: &Arc<T>,
@@ -407,6 +413,7 @@ impl WorkerSharedResources {
             .map_err(|_| capacity())
     }
 
+    #[doc(hidden)]
     pub fn read_replica<T: Send + Sync + 'static>(
         &self,
     ) -> Result<Arc<T>, ProtocolError> {
@@ -417,6 +424,7 @@ impl WorkerSharedResources {
             .ok_or_else(capacity)
     }
 
+    #[doc(hidden)]
     pub fn bind_read_queue<T: Send + Sync + 'static>(
         &self,
         queue: &Arc<T>,
@@ -426,6 +434,7 @@ impl WorkerSharedResources {
             .map_err(|_| capacity())
     }
 
+    #[doc(hidden)]
     pub fn read_queue<T: Send + Sync + 'static>(
         &self,
     ) -> Result<Arc<T>, ProtocolError> {
@@ -473,6 +482,7 @@ impl WorkerSharedResources {
             }
         }
     }
+    #[doc(hidden)]
     pub fn block_cache_usage(&self) -> BlockCacheUsage {
         BlockCacheUsage {
             configured_bytes: self.config().cache_bytes,
@@ -481,9 +491,11 @@ impl WorkerSharedResources {
         }
     }
     /// Store counters of every open pool on this worker (`/v1/runtime/stats`).
+    #[doc(hidden)]
     pub fn storage_stats(&self) -> super::StorageStats {
         self.storage.stats()
     }
+    #[doc(hidden)]
     pub fn storage_reservations(&self) -> Vec<super::disk::DiskReservationStats> {
         self.storage.disk_stats()
     }
@@ -523,6 +535,7 @@ impl WorkerSharedResources {
     }
     /// Native jobs prepared so far in `class`.
     #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
     pub fn native_jobs(&self, class: ExecutionClass) -> u64 {
         self.native_jobs[class as usize].load(Ordering::Relaxed)
     }

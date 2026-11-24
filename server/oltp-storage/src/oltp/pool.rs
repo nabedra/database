@@ -196,6 +196,7 @@ pub struct GroupStore {
 /// writes again, since no running log replays them (RV-T2 Q5). Only the claim
 /// that set the switch clears it: an old host dropped after a new one started
 /// leaves the new host's deferral alone (RV-NS6 F6).
+#[doc(hidden)]
 pub struct DeferredApplies {
     group: Arc<GroupInner>,
     owner: u64,
@@ -227,6 +228,7 @@ impl OltpPool {
     /// `FaultFs`, to inject I/O errors or to drop the unsynced journal tail).
     /// Journal segments are 1 MiB so an in-memory filesystem stays small.
     #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
     pub fn open_development_on(
         path: impl AsRef<Path>,
         identity: PoolIdentity,
@@ -237,6 +239,7 @@ impl OltpPool {
     }
     /// Test-only: [`Self::open_development_on`] with store options adjusted by `tune`.
     #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
     pub fn open_development_tuned(
         path: impl AsRef<Path>,
         identity: PoolIdentity,
@@ -252,6 +255,7 @@ impl OltpPool {
     /// Test-only: the pool's store, for engine stats and blocking maintenance
     /// (`flush`, `compact`, `gc_journal`; call those off the async runtime).
     #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
     pub fn kv_store(&self) -> &Store {
         &self.inner.store
     }
@@ -415,6 +419,7 @@ impl OltpPool {
     pub fn identity(&self) -> &PoolIdentity {
         &self.inner.identity
     }
+    #[doc(hidden)]
     pub fn reserve_proposal_disk(
         &self,
         encoded_bytes: usize,
@@ -425,6 +430,7 @@ impl OltpPool {
     pub fn resources(&self) -> &Arc<WorkerSharedResources> {
         &self.inner.shared
     }
+    #[doc(hidden)]
     pub fn observe_registered_mount(
         &self,
     ) -> Result<mount::MountedPoolObservation, ProtocolError> {
@@ -557,6 +563,7 @@ impl OltpPool {
         Ok(())
     }
     /// True while a visible write may still be lost by a crash.
+    #[doc(hidden)]
     pub fn has_unsynced_writes(&self) -> bool {
         self.inner.store.visible_seq() > self.inner.store.durable_seq()
     }
@@ -573,6 +580,7 @@ impl OltpPool {
     pub async fn group(&self, identity: GroupIdentity) -> Result<GroupStore, ProtocolError> {
         self.open_group(identity, true, None).await
     }
+    #[doc(hidden)]
     pub async fn retained_group(
         &self,
         identity: GroupIdentity,
@@ -929,6 +937,7 @@ impl GroupStore {
     /// one journal and one sync domain. Dropping the token turns deferral off,
     /// unless a newer host took it over in the meantime (RV-NS6 F6).
     #[must_use = "application writes are synced again once the token drops"]
+    #[doc(hidden)]
     pub fn defer_apply_sync(&self, log: &GroupStore) -> Option<DeferredApplies> {
         if !Arc::ptr_eq(&self.pool().inner, &log.pool().inner) || self.identity() != log.identity()
         {
@@ -1000,6 +1009,7 @@ impl GroupStore {
     /// No sync is needed (RV-T2 Q2): the applied write is visible, so it precedes
     /// the purge record in the journal, and the purge record is itself synced.
     /// A durable purge therefore implies durable applied state up to its index.
+    #[doc(hidden)]
     pub async fn ensure_applied_durable(&self, index: u64) -> Result<(), ProtocolError> {
         if !self.applies_deferred() && self.unsynced_applied_index().is_none() {
             return Ok(());
@@ -1323,6 +1333,7 @@ impl GroupStore {
     }
     /// Bounded current application metadata such as durable participant seals
     /// uses the protected execution lane and one native snapshot.
+    #[doc(hidden)]
     pub async fn read_metadata(
         &self,
         budget: TransactionBudget,
@@ -1343,6 +1354,7 @@ impl GroupStore {
     /// Bulk backup/history traversal uses query execution and reply budgets,
     /// even for Status/TSO groups. It cannot consume their protected metadata
     /// lane while waiting for an owned working-memory decode reservation.
+    #[doc(hidden)]
     pub async fn read_archive(
         &self,
         budget: TransactionBudget,
@@ -1814,6 +1826,7 @@ impl<'a> GroupRead<'a> {
             Ok(false)
         })
     }
+    #[doc(hidden)]
     pub fn scan_page_until(
         &mut self,
         prefix: &[u8],

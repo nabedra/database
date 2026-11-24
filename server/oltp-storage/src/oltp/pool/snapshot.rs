@@ -113,6 +113,7 @@ impl SnapshotCut {
     }
     /// True while the cut still pins its view (test probe).
     #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
     pub fn pins_view(&self) -> bool {
         self.view.lock().map(|view| view.is_some()).unwrap_or(false)
     }

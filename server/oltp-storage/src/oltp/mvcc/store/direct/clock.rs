@@ -50,7 +50,7 @@ use std::{
 /// A read never waits longer than this for an in-flight commit. A pending
 /// entry that outlives it was leaked by its executor, so the read fails
 /// explicitly instead of hanging.
-pub const RANGE_CLOCK_WAIT: Duration = Duration::from_secs(10);
+const RANGE_CLOCK_WAIT: Duration = Duration::from_secs(10);
 
 /// Why a commit could not register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

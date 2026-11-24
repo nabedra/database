@@ -309,12 +309,14 @@ impl OltpPool {
         self.inner.damage.events.subscribe()
     }
     /// Writes of quarantined groups refused since this open (rule 1 evidence).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
     pub fn quarantine_refusals(&self) -> u64 {
         self.inner.damage.refused_writes.load(Ordering::Relaxed)
     }
     /// Damaged groups released since this open.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
     pub fn damage_releases(&self) -> u64 {
         self.inner.damage.releases.load(Ordering::Relaxed)
     }

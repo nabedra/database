@@ -193,6 +193,7 @@ fn tag(v: &IndexValue) -> u8 {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[doc(hidden)]
 pub struct IndexDefinition {
     pub index_id: Uuid,
     pub table_id: Uuid,
@@ -262,6 +263,7 @@ impl IndexDefinition {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[doc(hidden)]
 pub enum IndexPhase {
     Building {
         build_id: Uuid,
@@ -320,6 +322,7 @@ impl IndexPhase {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[doc(hidden)]
 pub struct IndexRecord {
     pub definition: IndexDefinition,
     pub phase: IndexPhase,
@@ -328,11 +331,13 @@ pub struct IndexRecord {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[doc(hidden)]
 pub struct IndexNameRecord {
     pub index_id: Uuid,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[doc(hidden)]
 pub struct IndexRoot {
     pub first_page: Option<Uuid>,
     pub last_page: Option<Uuid>,
@@ -340,6 +345,7 @@ pub struct IndexRoot {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[doc(hidden)]
 pub struct IndexPage {
     pub indexes: Page<Uuid>,
     pub next_page: Option<Uuid>,
@@ -359,6 +365,7 @@ fn invalid(message: &'static str) -> ProtocolError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[doc(hidden)]
 pub enum IndexClosedKind {
     Ready,
     Failed,
@@ -367,12 +374,14 @@ pub enum IndexClosedKind {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[doc(hidden)]
 pub struct IndexAttemptClosedRecord {
     pub owner: nabedra_oltp_types::types::MaintenanceOwnerRef,
     pub pin: StoragePin,
     pub closed_by: nabedra_oltp_types::types::TxnId,
     pub kind: IndexClosedKind,
 }
+#[doc(hidden)]
 pub fn closure_id(
     owner: &nabedra_oltp_types::types::MaintenanceOwnerRef,
 ) -> Result<Uuid, ProtocolError> {
