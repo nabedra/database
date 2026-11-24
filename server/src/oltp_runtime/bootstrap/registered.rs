@@ -869,12 +869,12 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, ProtocolError>>,
 {
-    loop {
+    while nabedra_rt::time::now() < deadline {
         match nabedra_rt::time::timeout_at(deadline, read()).await {
             Ok(Ok(value)) => return Ok(value),
             Ok(Err(error)) if bootstrap_transient(&error) => {
                 tracing::debug!(stage, code=?error.code, outcome=?error.outcome, message=error.message,
-                    "registered authoritative read retry");
+                    "registered startup attempt retry");
                 *last_error.lock().map_err(|_| unavailable())? = Some(error);
             }
             Ok(Err(error)) => return Err(error),
@@ -882,6 +882,7 @@ where
         }
         wait_startup(deadline).await?;
     }
+    Err(unavailable())
 }
 pub(in crate::oltp_runtime) async fn wait_startup(deadline: tokio::time::Instant) -> Result<(), ProtocolError> {
     if nabedra_rt::time::now() >= deadline {

@@ -7,7 +7,8 @@ tiers = ["T1"]
 command = ["bash", "-ec", '''
 python3 scripts/testing/repeat_gate.py --features oltp <<'JSON'
 [
-  {"id":"o16_initial_control_proposal_retries_preappend_refusal_with_same_id","file":"server/src/oltp_runtime/bootstrap/registered/initial.rs","lang":"rust"}
+  {"id":"o16_initial_control_proposal_retries_preappend_refusal_with_same_id","file":"server/src/oltp_runtime/bootstrap/registered/initial.rs","lang":"rust"},
+  {"id":"o16_initial_control_proposal_bounds_unavailability_and_preserves_rejection","file":"server/src/oltp_runtime/bootstrap/registered/initial.rs","lang":"rust"}
 ]
 JSON
 ''']
