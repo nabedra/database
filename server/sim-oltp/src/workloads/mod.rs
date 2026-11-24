@@ -5,6 +5,7 @@
 //! seed's workload tape; clients draw their whole program before the run starts, so the
 //! nemesis is the only consumer of the tape while the cluster runs.
 
+pub(crate) mod clauses;
 pub(crate) mod clients;
 pub(crate) mod cold;
 pub(crate) mod direct;
@@ -59,7 +60,11 @@ pub(crate) struct WorkloadChoice(Vec<Workload>);
 impl WorkloadChoice {
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         let mut chosen = Vec::new();
-        for name in value.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+        for name in value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
             if name == "mixed" {
                 chosen.extend(ROTATION);
             } else {
@@ -99,14 +104,10 @@ impl WorkloadChoice {
     }
 }
 
-/// Phase 10 scenario tags. A seed carries a tag when the scenario's assertions executed in
-/// it: its faults happened while requests were in flight and its checks ran.
+/// The scenario clauses whose assertions executed in a seed.
 pub(crate) type Scenarios = BTreeSet<&'static str>;
 
-/// Every scenario a phase 10 workload can tag.
-pub(crate) const SCENARIOS: [&str; 11] = [
-    "D02", "D03", "D04", "D05", "D07", "D10", "O06", "O10", "O15", "O26", "O29",
-];
+pub(crate) use clauses::SCENARIOS;
 
 #[cfg(test)]
 mod tests {
@@ -121,9 +122,6 @@ mod tests {
         assert_eq!(order[3..], ROTATION);
         assert!(WorkloadChoice::parse("smoke,direct").is_err());
         assert!(WorkloadChoice::parse("bogus").is_err());
-        assert_eq!(
-            WorkloadChoice::parse("cold").unwrap().of(5),
-            Workload::Cold
-        );
+        assert_eq!(WorkloadChoice::parse("cold").unwrap().of(5), Workload::Cold);
     }
 }

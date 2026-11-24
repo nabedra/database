@@ -6,13 +6,13 @@ use std::{
     time::Duration,
 };
 
-use nabedra_rt::sim::net::Direction;
-use nabedra_sim::{
-    Draw, SplitMix64,
-    rng::stream,
-};
+use nabedra_rt::sim::{World, net::Direction};
+use nabedra_sim::{Draw, SplitMix64, rng::stream};
 
-use crate::net::{Action as NetAction, Frame, FrameKind, HttpFlush, SimNet};
+use crate::{
+    invariants::elapsed_ms,
+    net::{Action as NetAction, Frame, FrameKind, HttpFlush, SimNet},
+};
 
 #[derive(Default)]
 struct Windows {
@@ -38,6 +38,9 @@ struct State {
     rng: SplitMix64,
     windows: Windows,
     resets: u64,
+    /// When `session-drop` reset a session.
+    session_drops: Vec<u64>,
+    world: Arc<World>,
 }
 
 /// Shared fault windows behind the SimNet frame and HTTP profiles of one run.
@@ -45,11 +48,13 @@ struct State {
 pub(crate) struct NetFaults(Arc<Mutex<State>>);
 
 impl NetFaults {
-    pub(crate) fn install(net: &SimNet, seed: u64) -> Self {
+    pub(crate) fn install(net: &SimNet, world: Arc<World>, seed: u64) -> Self {
         let faults = NetFaults(Arc::new(Mutex::new(State {
             rng: stream(seed, "oltp-nemesis-net"),
             windows: Windows::default(),
             resets: 0,
+            session_drops: Vec::new(),
+            world,
         })));
         let frames = faults.clone();
         net.set_frame_profile(move |frame| frames.frame(frame));
@@ -115,6 +120,21 @@ impl NetFaults {
         });
     }
 
+    /// Whether a fault window is open that could stall a worker's restart.
+    pub(crate) fn open(&self) -> bool {
+        let state = self.0.lock().unwrap();
+        let w = &state.windows;
+        w.reply_reset.is_some()
+            || w.delay.is_some()
+            || w.frame_drop.is_some()
+            || w.black_hole.is_some()
+            || w.reorder_ms.is_some()
+    }
+
+    pub(crate) fn session_drops(&self) -> Vec<u64> {
+        self.0.lock().unwrap().session_drops.clone()
+    }
+
     /// Session resets this run's windows caused.
     pub(crate) fn resets(&self) -> u64 {
         self.0.lock().unwrap().resets
@@ -126,12 +146,15 @@ impl NetFaults {
             rng,
             windows,
             resets,
+            session_drops,
+            world,
         } = &mut *state;
         if let Some(left) = windows.session_drop_after.as_mut() {
             *left = left.saturating_sub(1);
             if *left == 0 {
                 windows.session_drop_after = None;
                 *resets += 1;
+                session_drops.push(elapsed_ms(world));
                 return NetAction::Reset;
             }
         }
@@ -179,6 +202,7 @@ impl NetFaults {
             rng,
             windows,
             resets,
+            ..
         } = &mut *state;
         if let Some((gateway, per_mille)) = windows.http_reset
             && flush.direction == Direction::ToClient

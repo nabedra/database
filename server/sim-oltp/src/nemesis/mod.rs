@@ -116,7 +116,10 @@ impl Action {
     }
 
     pub(crate) fn beyond_tcp(self) -> bool {
-        matches!(self, Action::FrameDrop | Action::BlackHole | Action::Reorder)
+        matches!(
+            self,
+            Action::FrameDrop | Action::BlackHole | Action::Reorder
+        )
     }
 
     /// Aliases a manifest may use for one action family.
@@ -136,7 +139,7 @@ impl fmt::Display for Action {
     }
 }
 
-/// The generic profiles. Weights are per mille of the profile's total.
+/// The generic profiles. Each weights every TCP action (design 3.6); they differ in emphasis.
 const MIXED: &[(Action, u64)] = &[
     (Action::Clock, 6),
     (Action::FreezeFollower, 8),
@@ -157,31 +160,32 @@ const MIXED: &[(Action, u64)] = &[
     (Action::DiskError, 2),
     (Action::Cold, 1),
 ];
-const PROCESS: &[(Action, u64)] = &[
-    (Action::Clock, 2),
-    (Action::KillGateway, 6),
-    (Action::CrashLeader, 8),
-    (Action::PowerLeader, 4),
-    (Action::DrainLeader, 8),
-    (Action::DiskError, 3),
-    (Action::Cold, 1),
+/// The actions a profile emphasizes keep this multiple of their `mixed` weight.
+const EMPHASIS: u64 = 6;
+const PROCESS: &[Action] = &[
+    Action::KillGateway,
+    Action::CrashLeader,
+    Action::PowerLeader,
+    Action::DrainLeader,
+    Action::DiskError,
+    Action::Cold,
 ];
-const NETWORK: &[(Action, u64)] = &[
-    (Action::Partition, 6),
-    (Action::LeaderMove, 6),
-    (Action::SessionDrop, 8),
-    (Action::LostReply, 10),
-    (Action::LostHttpReply, 8),
-    (Action::DeadlineEdge, 8),
-    (Action::AuthFlap, 6),
+const NETWORK: &[Action] = &[
+    Action::Partition,
+    Action::LeaderMove,
+    Action::SessionDrop,
+    Action::LostReply,
+    Action::LostHttpReply,
+    Action::DeadlineEdge,
+    Action::AuthFlap,
 ];
-const PAUSE: &[(Action, u64)] = &[
-    (Action::Clock, 6),
-    (Action::FreezeFollower, 8),
-    (Action::FreezeTwo, 6),
-    (Action::LaneExhaust, 6),
-    (Action::Split, 4),
-    (Action::DeadlineEdge, 4),
+const PAUSE: &[Action] = &[
+    Action::Clock,
+    Action::FreezeFollower,
+    Action::FreezeTwo,
+    Action::LaneExhaust,
+    Action::Split,
+    Action::DeadlineEdge,
 ];
 const BEYOND_TCP: &[(Action, u64)] = &[
     (Action::FrameDrop, 4),
@@ -193,15 +197,24 @@ const BEYOND_TCP: &[(Action, u64)] = &[
 /// The profiles the regular sweep rotates through. `beyond-tcp` is opt-in only.
 pub(crate) const SWEPT: [&str; 4] = ["mixed", "process", "network", "pause"];
 
-fn profile_actions(name: &str) -> Option<&'static [(Action, u64)]> {
-    Some(match name {
-        "mixed" => MIXED,
+fn profile_actions(name: &str) -> Option<Vec<(Action, u64)>> {
+    let emphasized = match name {
+        "mixed" => &[][..],
         "process" => PROCESS,
         "network" => NETWORK,
         "pause" => PAUSE,
-        "beyond-tcp" => BEYOND_TCP,
+        "beyond-tcp" => return Some(BEYOND_TCP.to_vec()),
         _ => return None,
-    })
+    };
+    let weighted = MIXED.iter().map(|&(action, weight)| {
+        let factor = if emphasized.contains(&action) {
+            EMPHASIS
+        } else {
+            1
+        };
+        (action, weight * factor)
+    });
+    Some(weighted.collect())
 }
 
 /// Workload tokens a seed-search manifest may list beside profiles and actions.
@@ -282,7 +295,7 @@ impl Selection {
         let base = profile_actions(name).expect("known profile");
         let mut profile = Profile::new(name, (400, 2_500));
         if self.actions.is_empty() {
-            for &(action, weight) in base {
+            for (action, weight) in base {
                 profile = profile.with(action, weight);
             }
             return profile;
@@ -292,7 +305,7 @@ impl Selection {
             let weight = MIXED
                 .iter()
                 .chain(BEYOND_TCP)
-                .chain(base)
+                .chain(&base)
                 .find(|(candidate, _)| *candidate == action)
                 .map_or(1, |(_, weight)| *weight);
             profile = profile.with(action, weight);
@@ -337,7 +350,11 @@ mod tests {
         assert!(selection.profiles.is_empty());
         assert_eq!(
             selection.actions,
-            BTreeSet::from([Action::CrashLeader, Action::PowerLeader, Action::DrainLeader])
+            BTreeSet::from([
+                Action::CrashLeader,
+                Action::PowerLeader,
+                Action::DrainLeader
+            ])
         );
         assert!(selection.focus.batch);
         let profile = selection.profile(7);
@@ -361,17 +378,17 @@ mod tests {
     }
 
     #[test]
-    fn every_tcp_action_is_swept() {
-        let swept: BTreeSet<Action> = SWEPT
-            .into_iter()
-            .flat_map(|name| profile_actions(name).unwrap().iter().map(|(a, _)| *a))
-            .collect();
-        for action in Action::ALL {
-            assert_eq!(
-                swept.contains(&action),
-                !action.beyond_tcp(),
-                "{action} sweep membership"
-            );
+    fn every_profile_weights_every_tcp_action() {
+        for name in SWEPT {
+            let actions = profile_actions(name).unwrap();
+            for action in Action::ALL {
+                let weight: u64 = actions
+                    .iter()
+                    .filter(|(candidate, _)| *candidate == action)
+                    .map(|(_, weight)| weight)
+                    .sum();
+                assert_eq!(weight > 0, !action.beyond_tcp(), "{action} in {name}");
+            }
         }
     }
 }

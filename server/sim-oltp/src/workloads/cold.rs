@@ -9,10 +9,7 @@ use nabedra_check::Gen;
 use super::clients::Ctx;
 use crate::{
     disk::DiskCut,
-    nemesis::{
-        apply::{COLD_LIMIT, Chaos},
-        window,
-    },
+    nemesis::{apply::COLD_LIMIT, window},
     node::Cluster,
 };
 
@@ -30,26 +27,13 @@ impl Stop {
         }
     }
 
-    pub(crate) async fn run(
-        &self,
-        cluster: &mut Cluster,
-        ctx: &Ctx,
-        chaos: Option<&mut Chaos>,
-    ) -> Result<(), String> {
-        // Restarts the nemesis still owes would only race the full stop.
-        if let Some(chaos) = chaos {
-            chaos.heal(cluster, ctx).await?;
-            chaos.abandon_split();
-        }
+    pub(crate) async fn run(&self, cluster: &mut Cluster, ctx: &Ctx) -> Result<(), String> {
         let cut = if self.power {
             DiskCut::Power
         } else {
             DiskCut::Kill
         };
-        cluster.record(format!(
-            "cold stop {cut:?}, starts after {:?}",
-            self.delays
-        ));
+        cluster.record(format!("cold stop {cut:?}, starts after {:?}", self.delays));
         ctx.history.lock().unwrap().marker(
             &cluster.world,
             "cold-stop",

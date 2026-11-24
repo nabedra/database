@@ -46,8 +46,8 @@ pub(crate) struct Cluster {
     /// The last `direct.mutations` counter seen per worker, for leader tracking.
     mutations: BTreeMap<u64, u64>,
     leader: Option<u64>,
-    /// Workers whose process started again during the run.
-    restarted: BTreeSet<u64>,
+    /// Per worker, the intervals in which it was frozen or had no process.
+    outages: BTreeMap<u64, Vec<(u64, Option<u64>)>>,
 }
 
 struct Process {
@@ -96,7 +96,7 @@ impl Cluster {
             frozen: BTreeSet::new(),
             mutations: BTreeMap::new(),
             leader: None,
-            restarted: BTreeSet::new(),
+            outages: BTreeMap::new(),
         })
     }
 
@@ -140,9 +140,7 @@ impl Cluster {
 
     async fn start_worker(&mut self, index: usize) -> Result<(), String> {
         let node = WORKERS[index];
-        if self.world.elapsed() > Duration::from_secs(1) {
-            self.restarted.insert(node);
-        }
+        self.outage_ended(node);
         in_node(node, async { self.config.write_worker(index) })
             .await
             .map_err(|error| format!("write worker n{node} bootstrap: {error}"))?;
@@ -305,9 +303,31 @@ impl Cluster {
         self.frozen.is_empty() && WORKERS.into_iter().all(|node| self.is_running(node))
     }
 
-    /// Workers whose process started again after the initial bootstrap.
-    pub fn restarted(&self) -> &BTreeSet<u64> {
-        &self.restarted
+    fn outage(&mut self, node: u64) {
+        let now = elapsed_ms(&self.world);
+        let outages = self.outages.entry(node).or_default();
+        if outages.last().is_none_or(|(_, to)| to.is_some()) {
+            outages.push((now, None));
+        }
+    }
+
+    fn outage_ended(&mut self, node: u64) {
+        let now = elapsed_ms(&self.world);
+        if let Some((_, to)) = self.outages.get_mut(&node).and_then(|all| all.last_mut()) {
+            to.get_or_insert(now);
+        }
+    }
+
+    /// Intervals in which at least two workers were frozen or down.
+    pub fn no_quorum(&self) -> Vec<(u64, u64)> {
+        let mut edges: Vec<(u64, i32)> = Vec::new();
+        for node in WORKERS {
+            for (from, to) in self.outages.get(&node).into_iter().flatten() {
+                edges.push((*from, 1));
+                edges.push((to.unwrap_or(u64::MAX), -1));
+            }
+        }
+        overlaps(edges)
     }
 
     pub fn frozen(&self) -> &BTreeSet<u64> {
@@ -368,6 +388,38 @@ impl Cluster {
             }
         }
         Err(format!("{name}: {}", errors.join("; ")))
+    }
+
+    /// One administration request to `node` in its own task, for operations that run for
+    /// longer than a health check may wait.
+    pub fn admin_task(
+        &self,
+        node: u64,
+        id: Uuid,
+        name: &'static str,
+        payload: Value,
+        limit: Duration,
+    ) -> JoinHandle<Result<Value, String>> {
+        let token = self.config.admin_token.clone();
+        nabedra_rt::task::spawn(async move {
+            match request(
+                BOOTSTRAP_CLIENT,
+                node,
+                "/v1/cluster/operations",
+                &token,
+                Some(operation(id, name, payload)),
+                limit,
+            )
+            .await
+            .and_then(|reply| reply.completion(id))
+            {
+                Ok(Completion::Ok(data)) => Ok(data),
+                Ok(Completion::Refused(err)) => {
+                    Err(format!("n{node} {:?}: {}", err.code, err.message))
+                }
+                Ok(Completion::Unknown(err)) | Err(err) => Err(format!("n{node} {err}")),
+            }
+        })
     }
 
     fn validate_connection(&self, data: &Value) -> Result<(), String> {
@@ -449,11 +501,18 @@ impl Cluster {
     pub async fn crash(&mut self, node: u64, how: DiskCut) {
         self.record(format!("cut n{node} {how:?}"));
         self.frozen.remove(&node);
+        if WORKERS.contains(&node) {
+            self.outage(node);
+        }
+        // A process that ended before anything stopped it is a failure, whatever it returned.
+        let alone = self.processes.get(&node).is_some_and(|process| {
+            process.task.is_finished() && !matches!(process.stop, Stop::Signalled)
+        });
         let image = disk::cut(&self.world, node, how);
         if let Some(process) = self.processes.remove(&node) {
             match process.task.await {
                 Err(error) if error.is_cancelled() => {}
-                Ok(Ok(())) => {}
+                Ok(Ok(())) if !alone => {}
                 result => {
                     self.checks
                         .violate(&self.world, "ProcessExit", format!("n{node}: {result:?}"))
@@ -483,7 +542,8 @@ impl Cluster {
             .await
             .map_err(|error| format!("survivors never dropped n{node}: {error}"))?;
         let connection = self.admin("cluster.connection", json!({})).await?;
-        let (id, plan, next) = in_node(BOOTSTRAP_CLIENT, async { self.config.rolling_plan(index) }).await;
+        let (id, plan, next) =
+            in_node(BOOTSTRAP_CLIENT, async { self.config.rolling_plan(index) }).await;
         let deadline = self.world.elapsed() + PREPARE_LIMIT;
         let prepared = loop {
             match self
@@ -518,9 +578,19 @@ impl Cluster {
     async fn abort_start(&mut self, node: u64) {
         self.record(format!("abort start n{node}"));
         self.frozen.remove(&node);
+        if WORKERS.contains(&node) {
+            self.outage(node);
+        }
         let image = disk::cut(&self.world, node, DiskCut::Kill);
-        if let Some(process) = self.processes.remove(&node) {
-            let _ = process.task.await;
+        if let Some(process) = self.processes.remove(&node)
+            && let Err(error) = process.task.await
+            && error.is_panic()
+        {
+            self.checks.violate(
+                &self.world,
+                "ProcessExit",
+                format!("n{node} panicked during startup: {error}"),
+            );
         }
         self.checks.check_crash(&self.world, node, &image);
     }
@@ -620,32 +690,49 @@ impl Cluster {
         Ok(())
     }
 
-    /// Split the table's first range at `boundary`, retrying the same split ID until the
-    /// split publishes or `limit` passes. Returns the publication.
-    pub async fn split(
-        &self,
-        id: Uuid,
-        table: Uuid,
-        boundary: i64,
-        limit: Duration,
-    ) -> Result<Value, String> {
+    /// One attempt to split the table's first range at `boundary` under `id`. Returns the
+    /// publication, or why the split is still pending.
+    pub async fn split(&self, id: Uuid, table: Uuid, boundary: i64) -> Result<Value, String> {
         let source = initial_range(self.config.cluster_id, table);
         let payload = json!({"source": source, "boundary": boundary, "page_bytes": 1 << 20});
-        let deadline = self.world.elapsed() + limit;
-        loop {
-            let last = match self
-                .admin_with_id(&WORKERS, id, "storage.shard.split", payload.clone())
-                .await
-            {
-                Ok(result) if result["state"] == "published" => return Ok(result),
-                Ok(result) => format!("{result}"),
-                Err(error) => error,
-            };
-            if self.world.elapsed() >= deadline {
-                return Err(format!("split {id} did not publish: {last}"));
-            }
-            time::sleep(Duration::from_millis(250)).await;
+        match self
+            .admin_with_id(&WORKERS, id, "storage.shard.split", payload)
+            .await
+        {
+            Ok(result) if result["state"] == "published" => Ok(result),
+            Ok(result) => Err(result.to_string()),
+            Err(error) => Err(error),
         }
+    }
+
+    /// Whether every worker and gateway reports the run ready and the direct path active.
+    pub async fn converged(&self) -> bool {
+        if !self.healthy() {
+            return false;
+        }
+        for node in WORKERS {
+            let stats = self.stats(node).await;
+            if !stats.is_ok_and(|stats| stats["direct_capability"]["active"] == true) {
+                return false;
+            }
+        }
+        for node in WORKERS.into_iter().chain(GATEWAYS) {
+            let ready = request(
+                BOOTSTRAP_CLIENT,
+                node,
+                "/health/ready",
+                &self.config.data_token,
+                None,
+                HTTP_TIMEOUT,
+            )
+            .await;
+            if !ready.is_ok_and(|reply| {
+                reply.status == 200 && reply.body["ready_workers"] == json!(WORKERS.len())
+            }) {
+                return false;
+            }
+        }
+        true
     }
 
     /// A fresh operation ID from the bootstrap client's stream.
@@ -684,6 +771,7 @@ impl Cluster {
     pub fn freeze(&mut self, node: u64) {
         self.record(format!("freeze n{node}"));
         self.frozen.insert(node);
+        self.outage(node);
         self.net.update_plan(|plan| plan.pause(node));
         self.world.freeze(node);
     }
@@ -693,6 +781,7 @@ impl Cluster {
             return;
         }
         self.record(format!("thaw n{node}"));
+        self.outage_ended(node);
         self.world.thaw(node);
         self.net.update_plan(|plan| plan.resume(node));
     }
@@ -729,4 +818,39 @@ async fn supervisor_receive(channel: &mut DuplexStream, phase: &str) -> Result<(
         return Err(format!("supervisor expected {phase}, received {message}"));
     }
     Ok(())
+}
+
+/// Intervals in which at least two of the outages that `edges` open and close overlap.
+fn overlaps(mut edges: Vec<(u64, i32)>) -> Vec<(u64, u64)> {
+    edges.sort_unstable();
+    let (mut down, mut since, mut windows) = (0, None, Vec::new());
+    for (at, change) in edges {
+        down += change;
+        match (down >= 2, since) {
+            (true, None) => since = Some(at),
+            (false, Some(from)) => {
+                if at > from {
+                    windows.push((from, at));
+                }
+                since = None;
+            }
+            _ => {}
+        }
+    }
+    windows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::overlaps;
+
+    #[test]
+    fn no_quorum_needs_two_overlapping_outages() {
+        assert_eq!(overlaps(vec![(1, 1), (5, -1), (5, 1), (9, -1)]), []);
+        assert_eq!(overlaps(vec![(1, 1), (9, -1), (3, 1), (6, -1)]), [(3, 6)]);
+        assert_eq!(
+            overlaps(vec![(1, 1), (u64::MAX, -1), (3, 1), (u64::MAX, -1)]),
+            [(3, u64::MAX)]
+        );
+    }
 }

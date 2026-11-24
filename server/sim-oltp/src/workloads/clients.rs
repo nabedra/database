@@ -4,13 +4,14 @@
 //! with an unknown outcome (a deadline, a cut reply, `outcome_unknown`) is retried with the
 //! same request ID and body until it resolves or the convergence budget ends. A program may
 //! retry through the other gateway (D02) and reuse an earlier request ID with another body on
-//! the same and on another key (D03). After a definite `not_applied` answer that is not a
-//! row conflict, the client sends another body under the same identity: if the first had
-//! committed, the dedup record refuses it as a conflict, which the client reports as
-//! `NotAppliedNeverCommitted` (OLTP-G04).
+//! the same and on another key (D03). A success reached by a retry is replayed through the
+//! other gateway and must return the original result (D02, D04, O10). After any definite
+//! refusal of a mutation the client sends another body under the same identity: if the
+//! first had committed, the dedup record refuses it as a conflict, which the client reports
+//! as `NotAppliedNeverCommitted` (OLTP-G04).
 
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -28,6 +29,7 @@ use nabedra_rt::{
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use super::clauses::{Answer, Attempt, Resolved};
 use crate::{
     bootstrap::{CLIENTS, GATEWAYS},
     client::operation,
@@ -124,24 +126,17 @@ impl Plan {
 /// What the clients observed, for scenario tags and post-run assertions.
 #[derive(Default, Debug)]
 pub(crate) struct Observations {
-    /// Requests that saw an unknown outcome and later resolved.
-    pub resolved_after_unknown: u64,
-    /// Of those, requests whose retry went through another gateway (D02).
-    pub resolved_across_gateways: u64,
+    /// Every completed attempt, in completion order.
+    pub attempts: Vec<Attempt>,
+    /// Mutations whose retries ended in a success that was then replayed.
+    pub resolved: BTreeMap<Uuid, Resolved>,
     pub reuse_same_key: u64,
     pub reuse_other_key: u64,
     /// Identity checks after a definite refusal, and how many found a commit.
     pub not_applied_checks: u64,
     /// Requests still unresolved when the convergence budget ended.
     pub unresolved: Vec<String>,
-    /// First attempts of fresh writes: (invoke ms, completion ms, committed `ok`).
-    pub fresh_writes: Vec<(u64, u64, bool)>,
     pub completed: u64,
-    /// Final reads answered with a refusal or an unknown outcome before they succeeded.
-    pub refused_final_reads: u64,
-    pub first_refusal: Option<String>,
-    /// Attempts answered `overloaded` (D10, lane exhaustion).
-    pub overloaded: u64,
 }
 
 /// State the clients, the nemesis and the workload share during a run.
@@ -159,8 +154,6 @@ pub(crate) struct Ctx {
     pub stopping: Arc<AtomicBool>,
     /// Virtual ms by which retries must resolve; unbounded during chaos.
     pub converge_by: Arc<AtomicU64>,
-    /// Mutation attempts currently awaiting an answer.
-    pub writes_in_flight: Arc<AtomicU64>,
 }
 
 impl Ctx {
@@ -184,13 +177,15 @@ impl Ctx {
             observed: Arc::default(),
             stopping: Arc::default(),
             converge_by: Arc::new(AtomicU64::new(u64::MAX)),
-            writes_in_flight: Arc::default(),
         }
     }
 
     fn now_ms(&self) -> u64 {
         elapsed_ms(&self.world)
     }
+
+    /// Every client decision passes here. A trace adapter attaches to this call.
+    pub(crate) fn step(&self, _gateway: u64, _request: &Request, _step: Step<'_>) {}
 
     pub(crate) fn new_client(&self) -> Client {
         self.history.lock().unwrap().client()
@@ -274,6 +269,25 @@ impl Request {
     }
 }
 
+/// One decision or observation of a client. Every one goes through [`Ctx::step`], so a trace
+/// adapter sees the whole client protocol in one place.
+pub(crate) enum Step<'a> {
+    /// The request was sent through this gateway.
+    Sent,
+    /// The gateway answered, with a definite outcome or `outcome_unknown`.
+    Answered(&'a Completion),
+    /// The client's deadline expired with the call in flight.
+    DeadlineExpired,
+    /// The connection was refused, reset or cut before the answer arrived.
+    ConnectionLost,
+    /// The same ID and body is sent again after an unknown outcome.
+    Retry,
+    /// A resolved ID and body is sent again to compare its result.
+    Replay,
+    /// The client stops retrying with the outcome unknown.
+    GaveUp,
+}
+
 /// Send one attempt through `gateway` and record it in the history.
 pub(crate) async fn attempt(
     ctx: &Ctx,
@@ -281,6 +295,7 @@ pub(crate) async fn attempt(
     node: u64,
     gateway: u64,
     request: &Request,
+    fresh: bool,
 ) -> Completion {
     let key = request.anchor.to_string();
     let invoked = {
@@ -298,9 +313,8 @@ pub(crate) async fn attempt(
             },
         )
     };
-    if request.mutation() {
-        ctx.writes_in_flight.fetch_add(1, Ordering::AcqRel);
-    }
+    let started = ctx.now_ms();
+    ctx.step(gateway, request, Step::Sent);
     let completion = match crate::client::request(
         node,
         gateway,
@@ -311,19 +325,41 @@ pub(crate) async fn attempt(
     )
     .await
     {
-        Ok(reply) => reply
-            .completion(request.id)
-            .unwrap_or_else(Completion::Unknown),
+        Ok(reply) => match reply.completion(request.id) {
+            Ok(completion) => completion,
+            Err(error) => {
+                // A complete reply that breaks the public envelope is never just lost.
+                ctx.checks.violate(
+                    &ctx.world,
+                    "HttpEnvelope",
+                    format!(
+                        "{} {} through n{gateway}: {error}",
+                        request.name, request.id
+                    ),
+                );
+                Completion::Unknown(error)
+            }
+        },
         Err(error) => Completion::Unknown(error),
     };
-    if request.mutation() {
-        ctx.writes_in_flight.fetch_sub(1, Ordering::AcqRel);
-    }
-    if let Completion::Refused(error) = &completion
-        && error.code == ErrorCode::Overloaded
-    {
-        ctx.observed.lock().unwrap().overloaded += 1;
-    }
+    ctx.step(
+        gateway,
+        request,
+        match &completion {
+            Completion::Unknown(reason) if reason.ends_with(" deadline") => Step::DeadlineExpired,
+            Completion::Unknown(_) => Step::ConnectionLost,
+            completion => Step::Answered(completion),
+        },
+    );
+    ctx.observed.lock().unwrap().attempts.push(Attempt {
+        id: request.id,
+        mutation: request.mutation(),
+        fresh,
+        gateway,
+        invoked: started,
+        completed: ctx.now_ms(),
+        answer: answer(request, &completion),
+    });
     let recorded = match &completion {
         Completion::Ok(value) => Completion::Ok(value.clone()),
         Completion::Refused(error) => Completion::Refused(error.clone()),
@@ -353,10 +389,13 @@ fn committed(request: &Request, completion: &Completion) -> bool {
     }
 }
 
-/// The result of one logical request after its retries.
-struct Resolved {
-    completion: Completion,
-    attempts: u32,
+fn answer(request: &Request, completion: &Completion) -> Answer {
+    match completion {
+        completion if unknown(completion) => Answer::Unknown,
+        Completion::Refused(error) => Answer::Refused(error.code),
+        completion if committed(request, completion) => Answer::Committed,
+        _ => Answer::Ok,
+    }
 }
 
 /// Retry `request` with the same ID and body while its outcome is unknown.
@@ -368,54 +407,129 @@ async fn resolve(
     switch: bool,
     request: &Request,
     fresh: bool,
-) -> Resolved {
+) -> Completion {
     let mut gateway = first_gateway;
-    let mut gateways = BTreeSet::new();
-    let mut saw_unknown = false;
     let mut attempts = 0;
     loop {
         attempts += 1;
-        gateways.insert(gateway);
-        let invoked = ctx.now_ms();
-        let completion = attempt(ctx, client, node, GATEWAYS[gateway], request).await;
-        if fresh && attempts == 1 && request.mutation() {
-            ctx.observed.lock().unwrap().fresh_writes.push((
-                invoked,
-                ctx.now_ms(),
-                committed(request, &completion),
-            ));
-        }
+        let completion = attempt(
+            ctx,
+            client,
+            node,
+            GATEWAYS[gateway],
+            request,
+            fresh && attempts == 1,
+        )
+        .await;
         if !unknown(&completion) {
-            let mut observed = ctx.observed.lock().unwrap();
-            observed.completed += 1;
-            if saw_unknown {
-                observed.resolved_after_unknown += 1;
-                if gateways.len() > 1 {
-                    observed.resolved_across_gateways += 1;
-                }
+            ctx.observed.lock().unwrap().completed += 1;
+            if attempts > 1
+                && request.mutation()
+                && let Completion::Ok(original) = &completion
+            {
+                let at = ctx.now_ms();
+                let replayed = replay(ctx, client, node, 1 - gateway, request, original).await;
+                ctx.observed.lock().unwrap().resolved.insert(
+                    request.id,
+                    Resolved {
+                        attempts,
+                        at,
+                        gateway: GATEWAYS[gateway],
+                        replayed,
+                    },
+                );
             }
-            return Resolved {
-                completion,
-                attempts,
-            };
+            return completion;
         }
-        saw_unknown = true;
-        let budget = ctx.converge_by.load(Ordering::Acquire);
-        if attempts >= MAX_ATTEMPTS || ctx.now_ms() >= budget {
-            ctx.observed.lock().unwrap().unresolved.push(format!(
-                "{} {} key {} after {attempts} attempts",
-                request.name, request.id, request.anchor
-            ));
-            return Resolved {
-                completion,
-                attempts,
-            };
+        if give_up(ctx, request, attempts) {
+            return completion;
         }
         if switch {
             gateway = 1 - gateway;
         }
-        let pause = Duration::from_millis(50 * u64::from(attempts.min(10)));
-        time::sleep(pause).await;
+        ctx.step(GATEWAYS[gateway], request, Step::Retry);
+        pause(attempts).await;
+    }
+}
+
+fn give_up(ctx: &Ctx, request: &Request, attempts: u32) -> bool {
+    let budget = ctx.converge_by.load(Ordering::Acquire);
+    let ended = attempts >= MAX_ATTEMPTS || ctx.now_ms() >= budget;
+    if ended {
+        ctx.step(0, request, Step::GaveUp);
+        ctx.observed.lock().unwrap().unresolved.push(format!(
+            "{} {} key {} after {attempts} attempts",
+            request.name, request.id, request.anchor
+        ));
+    }
+    ended
+}
+
+async fn pause(attempts: u32) {
+    time::sleep(Duration::from_millis(50 * u64::from(attempts.min(10)))).await;
+}
+
+/// Send a resolved request once more through the other gateway: the same identity must
+/// return the original result. Returns whether a definite answer was compared.
+async fn replay(
+    ctx: &Ctx,
+    client: &mut Client,
+    node: u64,
+    gateway: usize,
+    request: &Request,
+    original: &Value,
+) -> bool {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        ctx.step(GATEWAYS[gateway], request, Step::Replay);
+        let completion = attempt(ctx, client, node, GATEWAYS[gateway], request, false).await;
+        let result = match &completion {
+            Completion::Ok(value) => value.to_string(),
+            Completion::Refused(error) if !unknown(&completion) => {
+                format!("{:?} {}", error.code, error.message)
+            }
+            _ => {
+                if give_up(ctx, request, attempts) {
+                    return false;
+                }
+                pause(attempts).await;
+                continue;
+            }
+        };
+        // The identity committed, so `not_applied` is wrong whatever refused it. Retry to
+        // compare the result as well.
+        if let Completion::Refused(error) = &completion
+            && matches!(
+                error.code,
+                ErrorCode::Overloaded | ErrorCode::StorageUnavailable
+            )
+        {
+            ctx.checks.violate(
+                &ctx.world,
+                "NotAppliedNeverCommitted",
+                format!(
+                    "{} {} on key {} had resolved to {original}, and its replay through n{} was answered not_applied ({result})",
+                    request.name, request.id, request.anchor, GATEWAYS[gateway]
+                ),
+            );
+            if give_up(ctx, request, attempts) {
+                return false;
+            }
+            pause(attempts).await;
+            continue;
+        }
+        if !matches!(&completion, Completion::Ok(value) if value == original) {
+            ctx.checks.violate(
+                &ctx.world,
+                "DedupUnique",
+                format!(
+                    "{} {} on key {} resolved to {original} and its replay through n{} returned {result}",
+                    request.name, request.id, request.anchor, GATEWAYS[gateway]
+                ),
+            );
+        }
+        return true;
     }
 }
 
@@ -426,7 +540,8 @@ pub(crate) async fn run(ctx: Ctx, program: Program) {
     let mut client = ctx.new_client();
     // Committed mutations whose IDs D03 may reuse: (request ID, key).
     let mut committed_ids: Vec<(Uuid, i64)> = Vec::new();
-    for (index, planned) in program.ops.iter().enumerate() {
+    // The program repeats until the chaos window closes, so load covers all of it.
+    for (index, planned) in program.ops.iter().cycle().enumerate() {
         if ctx.stopping.load(Ordering::Acquire) {
             break;
         }
@@ -446,7 +561,11 @@ pub(crate) async fn run(ctx: Ctx, program: Program) {
                 true,
                 None,
             ),
-            Kind::Update => (Request::update(table, planned.key, value, fresh_id), true, None),
+            Kind::Update => (
+                Request::update(table, planned.key, value, fresh_id),
+                true,
+                None,
+            ),
             Kind::Delete => (Request::delete(table, planned.key, fresh_id), true, None),
             Kind::InsertMany => (
                 Request::insert_many(table, planned.key, value, planned.rows, ctx.keys, fresh_id),
@@ -473,7 +592,7 @@ pub(crate) async fn run(ctx: Ctx, program: Program) {
                 )
             }
         };
-        let resolved = resolve(
+        let completion = resolve(
             &ctx,
             &mut client,
             node,
@@ -484,7 +603,7 @@ pub(crate) async fn run(ctx: Ctx, program: Program) {
         )
         .await;
         if let Some(same) = reuse
-            && !unknown(&resolved.completion)
+            && !unknown(&completion)
         {
             let mut observed = ctx.observed.lock().unwrap();
             if same {
@@ -493,28 +612,26 @@ pub(crate) async fn run(ctx: Ctx, program: Program) {
                 observed.reuse_other_key += 1;
             }
         }
-        match &resolved.completion {
-            completion @ Completion::Ok(_) if request.mutation() && fresh => {
-                if committed(&request, completion) {
+        match &completion {
+            Completion::Ok(_) if request.mutation() && fresh => {
+                if committed(&request, &completion) {
                     committed_ids.push((request.id, request.anchor));
                 }
             }
+            // Every definite refusal, also one that ended a retry (design 3.7).
             Completion::Refused(error)
-                if request.mutation()
-                    && fresh
-                    && resolved.attempts == 1
-                    && error.outcome == Outcome::NotApplied
-                    && !matches!(
-                        error.code,
-                        ErrorCode::Conflict
-                            | ErrorCode::ValidationError
-                            | ErrorCode::NotFound
-                            | ErrorCode::UnsupportedOperation
-                            | ErrorCode::LimitExceeded
-                    ) =>
+                if request.mutation() && fresh && error.outcome == Outcome::NotApplied =>
             {
-                check_not_applied(&ctx, &mut client, node, planned.gateway, &request, value, error.code)
-                    .await;
+                check_not_applied(
+                    &ctx,
+                    &mut client,
+                    node,
+                    planned.gateway,
+                    &request,
+                    value,
+                    error.code,
+                )
+                .await;
             }
             _ => {}
         }
@@ -533,10 +650,16 @@ async fn check_not_applied(
     code: ErrorCode,
 ) {
     time::sleep(PROBE_PAUSE).await;
-    let probe = Request::row("table.upsert", &ctx.table, refused.anchor, value + 5, refused.id);
-    let resolved = resolve(ctx, client, node, gateway, true, &probe, false).await;
+    let probe = Request::row(
+        "table.upsert",
+        &ctx.table,
+        refused.anchor,
+        value + 5,
+        refused.id,
+    );
+    let completion = resolve(ctx, client, node, gateway, true, &probe, false).await;
     ctx.observed.lock().unwrap().not_applied_checks += 1;
-    if let Completion::Refused(error) = &resolved.completion
+    if let Completion::Refused(error) = &completion
         && error.code == ErrorCode::Conflict
     {
         ctx.checks.violate(
@@ -550,62 +673,53 @@ async fn check_not_applied(
     }
 }
 
-/// How long a final read may be refused before it counts as a liveness failure.
-const FINAL_READ_LIMIT: Duration = Duration::from_secs(5);
-
-/// Read every key through both gateways after convergence. A refused read is retried for
-/// a short while, so a stale route shows up in `refused_final_reads` rather than as loss.
-pub(crate) async fn final_reads(ctx: &Ctx) -> Result<(), String> {
+/// After convergence: one write through each gateway must commit, then every key is read
+/// once through each gateway. Nothing is retried, so a refusal or a lost reply fails.
+pub(crate) async fn final_checks(ctx: &Ctx) -> Result<(), String> {
     let mut client = ctx.new_client();
-    for gateway in 0..GATEWAYS.len() {
+    let mut failed = Vec::new();
+    for (index, gateway) in GATEWAYS.into_iter().enumerate() {
+        let node = CLIENTS[index % CLIENTS.len()];
+        let id = in_node(node, async { uuid_v4() }).await;
+        let key = 1 + index as i64;
+        let request = Request::row("table.upsert", &ctx.table, key, 900_000_000 + key, id);
+        let completion = attempt(ctx, &mut client, node, gateway, &request, true).await;
+        if let Some(why) = failure(&completion) {
+            failed.push(format!("write of key {key} through n{gateway}: {why}"));
+        }
+    }
+    for (index, gateway) in GATEWAYS.into_iter().enumerate() {
+        let node = CLIENTS[index % CLIENTS.len()];
         for key in 1..=ctx.keys {
-            let node = CLIENTS[gateway % CLIENTS.len()];
-            let deadline = ctx.world.elapsed() + FINAL_READ_LIMIT;
-            loop {
-                let id = in_node(node, async { uuid_v4() }).await;
-                let request = Request::get(&ctx.table, key, id);
-                let resolved =
-                    resolve(ctx, &mut client, node, gateway, false, &request, false).await;
-                let refusal = match &resolved.completion {
-                    Completion::Refused(error) => {
-                        let text = format!("{:?} {}", error.code, error.message);
-                        if !matches!(
-                            error.code,
-                            ErrorCode::StorageUnavailable | ErrorCode::Overloaded
-                        ) {
-                            return Err(format!(
-                                "final read of key {key} through n{}: {text}",
-                                GATEWAYS[gateway]
-                            ));
-                        }
-                        text
-                    }
-                    Completion::Ok(_) => break,
-                    Completion::Unknown(reason) => reason.clone(),
-                };
-                let mut observed = ctx.observed.lock().unwrap();
-                observed.refused_final_reads += 1;
-                if observed.first_refusal.is_none() {
-                    observed.first_refusal = Some(format!(
-                        "key {key} through n{}: {refusal}",
-                        GATEWAYS[gateway]
-                    ));
-                }
-                drop(observed);
-                if ctx.world.elapsed() >= deadline {
-                    return Err(format!(
-                        "final read of key {key} through n{} refused for {FINAL_READ_LIMIT:?}: {refusal}",
-                        GATEWAYS[gateway]
-                    ));
-                }
-                time::sleep(Duration::from_millis(200)).await;
+            let id = in_node(node, async { uuid_v4() }).await;
+            let request = Request::get(&ctx.table, key, id);
+            let completion = attempt(ctx, &mut client, node, gateway, &request, false).await;
+            if let Some(why) = failure(&completion) {
+                failed.push(format!("read of key {key} through n{gateway}: {why}"));
             }
         }
     }
-    Ok(())
+    let total = failed.len();
+    if total == 0 {
+        return Ok(());
+    }
+    failed.truncate(3);
+    Err(format!(
+        "{total} final operations failed: {}",
+        failed.join("; ")
+    ))
 }
 
-/// A burst of reads at one gateway, past its lanes (D10). Each read is its own process.
+fn failure(completion: &Completion) -> Option<String> {
+    match completion {
+        Completion::Ok(_) => None,
+        Completion::Refused(error) => Some(format!("{:?} {}", error.code, error.message)),
+        Completion::Unknown(reason) => Some(reason.clone()),
+    }
+}
+
+/// A burst of reads and writes at one gateway, past its lanes (D10). Each operation is its
+/// own process, and the writes carry unique values.
 pub(crate) async fn burst(ctx: Ctx, gateway: usize, count: u64, first_key: i64) {
     let mut tasks = Vec::new();
     for offset in 0..count {
@@ -615,8 +729,13 @@ pub(crate) async fn burst(ctx: Ctx, gateway: usize, count: u64, first_key: i64) 
             let key = 1 + (first_key - 1 + offset as i64) % ctx.keys;
             let id = in_node(node, async { uuid_v4() }).await;
             let mut client = ctx.new_client();
-            attempt(&ctx, &mut client, node, GATEWAYS[gateway], &Request::get(&ctx.table, key, id))
-                .await;
+            let request = if offset % 2 == 0 {
+                Request::get(&ctx.table, key, id)
+            } else {
+                let value = 500_000_000 + ctx.now_ms() as i64 * 1_000 + offset as i64;
+                Request::row("table.upsert", &ctx.table, key, value, id)
+            };
+            attempt(&ctx, &mut client, node, GATEWAYS[gateway], &request, false).await;
         }));
     }
     for task in tasks {

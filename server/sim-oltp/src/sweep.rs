@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use crate::{
     nemesis::Selection,
     workload::run_seed,
-    workloads::{SCENARIOS, Scenarios, Workload, WorkloadChoice},
+    workloads::{SCENARIOS, Scenarios, Workload, WorkloadChoice, clauses},
 };
 
 const REPLAY: &str = "RUST_MIN_STACK=16777216 RUSTFLAGS=\"--cfg tokio_unstable\" CARGO_TARGET_DIR=target/sim \
@@ -52,6 +52,20 @@ impl Defect {
         }
     }
 }
+
+/// The invariants of design 3.7 that need the P10-PROBES event stream.
+const PROBE_INVARIANTS: [&str; 10] = [
+    "ElectionSafety",
+    "MonotonicVote",
+    "MonotonicCommit",
+    "LogMatching",
+    "AppliedPrefixesAgree",
+    "MajorityReached",
+    "DedupUnique over Applied",
+    "NotAppliedNeverCommitted over Applied",
+    "RangeClockRule1",
+    "KeyspaceCoverage over RouteEpochPublished",
+];
 
 /// A completed run's named assertion verdicts. Omit families that did not execute.
 pub(crate) struct RunResult {
@@ -251,10 +265,17 @@ fn run_search(
     let observed = Mutex::new(BTreeMap::new());
     let result = search.run(|seed| {
         let result = run_seed(seed, &mut sweep::workload_gen(seed), defect, setup);
-        observed.lock().expect("search observations poisoned").insert(
-            seed,
-            (shrink::kinds(&result.run.violations), result.workload, result.scenarios),
-        );
+        observed
+            .lock()
+            .expect("search observations poisoned")
+            .insert(
+                seed,
+                (
+                    shrink::kinds(&result.run.violations),
+                    result.workload,
+                    result.scenarios,
+                ),
+            );
         result.run.violations
     });
     // Core may finish other seeds in the same parallel batch. Report only the prefix
@@ -406,7 +427,9 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             kinds.insert("determinism".to_owned());
         }
         let seed_workload = observation.map_or(setup.workloads.of(seed), |row| row.workload);
-        let tags = observation.map(|row| row.scenarios.clone()).unwrap_or_default();
+        let tags = observation
+            .map(|row| row.scenarios.clone())
+            .unwrap_or_default();
         seed_line(seed, &kinds, seed_workload, setup.profile(seed), &tags);
         for tag in &tags {
             let entry = scenario_seeds.entry(tag).or_default();
@@ -452,7 +475,9 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     let mut scenario_assertions = BTreeMap::new();
     for (tag, (seeds, failed)) in &scenario_seeds {
         scenario_assertions.insert(*tag, failed == &0);
-        eprintln!("Fault model scenario {tag}: assertions executed in {seeds} seeds, {failed} failing");
+        eprintln!(
+            "Fault model clause {tag}: assertions executed in {seeds} seeds, {failed} failing"
+        );
     }
     if report.replayed() > 0 {
         assertions.insert(
@@ -649,10 +674,19 @@ fn write_record(
     let mut record = Record::new(&config.label, "S H");
     record.fill_from_env();
     record.guarantees = env_list("NABEDRA_SIM_GUARANTEES");
-    // Claim only scenarios whose assertions executed in this range.
-    record.scenarios = input.scenarios.keys().map(|tag| (*tag).to_owned()).collect();
+    // Claim only scenarios whose every clause executed its assertions in this range.
+    let complete: BTreeSet<&str> = SCENARIOS
+        .iter()
+        .filter(|(_, required)| {
+            required
+                .iter()
+                .all(|clause| input.scenarios.contains_key(clause))
+        })
+        .map(|(scenario, _)| *scenario)
+        .collect();
+    record.scenarios = complete.iter().map(|tag| (*tag).to_owned()).collect();
     for listed in env_list("NABEDRA_SIM_SCENARIOS") {
-        if !input.scenarios.contains_key(listed.as_str()) {
+        if !complete.contains(listed.as_str()) {
             eprintln!("Fault model scenario {listed}: listed by the check, no seed executed it");
         }
     }
@@ -691,21 +725,33 @@ fn write_record(
     if input.defects_skipped {
         record.not_run("seeded defects", "the unmodified smoke sweep failed");
     }
-    record.not_run("probe-driven invariants", "P10-PROBES integration pending");
+    for invariant in PROBE_INVARIANTS {
+        record.not_run(invariant, "P10-PROBES integration pending");
+    }
+    record.not_run(
+        "ResourceBaseline ledger and RangeClock pending sets",
+        "P10-PROBES integration pending",
+    );
+    record.not_run("ConsistentCommittedData", "P10-PROBES integration pending");
     if input.smoke {
         for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {
             record.not_run(scenario, &format!("runs in the {workload} workload"));
         }
     } else {
-        for scenario in SCENARIOS {
-            if !input.scenarios.contains_key(scenario) {
-                record.not_run(scenario, "no seed in this range executed its assertions");
+        for (scenario, required) in SCENARIOS {
+            let missing: Vec<_> = required
+                .iter()
+                .filter(|clause| !input.scenarios.contains_key(*clause))
+                .collect();
+            for clause in &missing {
+                let why = clauses::unreachable(clause)
+                    .unwrap_or("no seed in this range executed its assertions");
+                record.not_run(clause, why);
+            }
+            if !missing.is_empty() {
+                record.not_run(scenario, &format!("clauses that did not run: {missing:?}"));
             }
         }
-        record.not_run(
-            "D10 old one-shot peer",
-            "the registered worker entry point offers no fallback-only peer; oltp-sim-net covers the component",
-        );
     }
     if report.replayed() == 0 {
         record.not_run(
