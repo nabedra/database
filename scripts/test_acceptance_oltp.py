@@ -21,12 +21,13 @@ class EssentialRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='nabedra-native-fixtures-') as directory:
             root = Path(directory)
             server, resources = root / 'server-tests', root / 'resources-tests'
+            transport = root / 'transport-tests'
             runtime = acceptance.ROOT / 'server/tests'
             fixture = (
                 'import sys\n'
                 f'sys.path.insert(0, {str(runtime)!r})\n'
                 'from oltp_runtime_acceptance import assertion, run_native_assertions\n'
-                "run_native_assertions(sys.argv[1], ['server_case', 'resource_case'])\n"
+                "run_native_assertions(sys.argv[1], ['server_case', 'resource_case', 'transport_case'])\n"
                 f"for clause in {scenario.clauses!r}:\n"
                 "    assertion('O22', clause, {'fixture': 'unit test'})\n"
                 f'print({passed!r})\n'
@@ -44,6 +45,14 @@ class EssentialRunnerTests(unittest.TestCase):
                 'fi\n'
             )
             server.chmod(0o700)
+
+            transport.write_text(
+                '#!/bin/sh\n'
+                'if [ "$1" = --list ]; then echo "mux::transport_case: test"; exit; fi\n'
+                'test "$1:$2" = "--exact:mux::transport_case" || exit 1\n'
+                f'    printf "%s\\n" "$2" {shlex.quote(passed)}\n'
+            )
+            transport.chmod(0o700)
 
             for selector, extra_listing, expected_error in [
                 ('resource_case', '', None),
@@ -65,7 +74,10 @@ class EssentialRunnerTests(unittest.TestCase):
                         [sys.executable, acceptance.__file__, '--scenario', 'O22',
                          '--test-binary', str(server), '--target-dir', str(root / 'target'),
                          '--output', str(output)],
-                        env=os.environ | {'NABEDRA_RESOURCES_TEST_EXE': str(resources)},
+                        env=os.environ | {
+                            'NABEDRA_RESOURCES_TEST_EXE': str(resources),
+                            'NABEDRA_TRANSPORT_TEST_EXE': str(transport),
+                        },
                         capture_output=True, text=True, timeout=30,
                     )
                     log = (output / 'O22.log').read_text()
@@ -75,10 +87,13 @@ class EssentialRunnerTests(unittest.TestCase):
                     else:
                         self.assertIn('runtime::server_case\n', log)
                         self.assertIn('scheduler::resource_case\n', log)
+                        self.assertIn('mux::transport_case\n', log)
                         self.assertIn('O22 passed: executed 4/4 clauses', result.stdout)
                     report = json.loads((output / 'results.json').read_text())
                     self.assertEqual(report['resources_test_binary_sha256'],
                                      hashlib.sha256(resources.read_bytes()).hexdigest())
+                    self.assertEqual(report['transport_test_binary_sha256'],
+                                     hashlib.sha256(transport.read_bytes()).hexdigest())
 
     def test_supporting_component_does_not_pass_a_missing_production_scenario(self):
         with tempfile.TemporaryDirectory(prefix='nabedra-runner-cli-') as directory:

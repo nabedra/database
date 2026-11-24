@@ -4,7 +4,8 @@
 Development: --scenario O07. Shared Cargo lane: --cargo test ...
 Scenario tests end in acceptance_oNN. Existing regression tests remain intact.
 With --test-binary, set NABEDRA_RESOURCES_TEST_EXE to the prebuilt resources
-test executable when running O13 or O22.
+test executable when running O13 or O22 and NABEDRA_TRANSPORT_TEST_EXE to
+the prebuilt transport executable when running O05.
 """
 import argparse
 from contextlib import contextmanager
@@ -26,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MARKER = "NABEDRA_OLTP_ACCEPTANCE "
 ASSERTION_MARKER = "NABEDRA_OLTP_ASSERT "
 RESOURCES_TEST_EXE = "NABEDRA_RESOURCES_TEST_EXE"
+TRANSPORT_TEST_EXE = "NABEDRA_TRANSPORT_TEST_EXE"
 # Clause IDs follow the Required assertions column of docs/testing/oltp-contract.md.
 # Each ID covers the complete named observation, including its required variations.
 CLAUSES = {
@@ -171,9 +173,10 @@ def environment(target):
 def source_identity():
     digest = hashlib.sha256()
     paths = [ROOT / "server/Cargo.toml", ROOT / "server/Cargo.lock",
-             ROOT / "server/resources/Cargo.toml", Path(__file__)]
+             ROOT / "server/resources/Cargo.toml", ROOT / "server/transport/Cargo.toml", Path(__file__)]
     paths += sorted((ROOT / "server/src").rglob("*.rs"))
     paths += sorted((ROOT / "server/resources/src").rglob("*.rs"))
+    paths += sorted((ROOT / "server/transport/src").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.py"))
     paths += sorted((ROOT / "server/tests").rglob("*.c"))
@@ -190,16 +193,16 @@ def source_identity():
                 source_sha256=digest.hexdigest())
 
 
-def build_tests(env, output, *, resources=False):
+def build_tests(env, output, *, package=None):
     command = ["cargo", "test", "--locked", "--manifest-path", "server/Cargo.toml",
                "--lib", "--no-run", "--message-format=json-render-diagnostics"]
-    if resources:
-        command += ["-p", "nabedra-resources"]
+    if package:
+        command += ["-p", package]
     else:
         command += ["--no-default-features", "--features", "oltp", "--tests"]
     executable = None
     server = None
-    with output.open("a" if resources else "w") as log:
+    with output.open("a" if package else "w") as log:
         process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         for line in process.stdout:
             try:
@@ -215,7 +218,7 @@ def build_tests(env, output, *, resources=False):
             if record.get("reason") == "compiler-message":
                 log.write(record["message"].get("rendered", ""))
         if process.wait() or executable is None:
-            target = "nabedra-resources" if resources else "OLTP"
+            target = package or "OLTP"
             raise RuntimeError(f"{target} test build failed; see {output}")
     return Path(executable), Path(server) if server else None
 
@@ -348,14 +351,19 @@ def main():
         with cargo_lane(target), tempfile.TemporaryDirectory(prefix="nabedra-oltp-acceptance-") as temp:
             build_log = args.output / "build.log"
             built, server = (args.test_binary, args.server_binary) if args.test_binary else build_tests(env, build_log)
-            resources = env.get(RESOURCES_TEST_EXE)
-            if not resources and not args.test_binary and any(s.id in {"O13", "O22"} for s in selected):
-                resources, _ = build_tests(env, build_log, resources=True)
-            if resources:
-                resources_copy = Path(temp) / "nabedra-resources-tests"
-                shutil.copy2(resources, resources_copy)
-                env[RESOURCES_TEST_EXE] = str(resources_copy)
-                report["resources_test_binary_sha256"] = hashlib.sha256(resources_copy.read_bytes()).hexdigest()
+            fixtures = (
+                ("resources", RESOURCES_TEST_EXE, {"O13", "O22"}),
+                ("transport", TRANSPORT_TEST_EXE, {"O05"}),
+            )
+            for crate, variable, scenarios in fixtures:
+                fixture = env.get(variable)
+                if not fixture and not args.test_binary and any(s.id in scenarios for s in selected):
+                    fixture, _ = build_tests(env, build_log, package=f"nabedra-{crate}")
+                if fixture:
+                    fixture_copy = Path(temp) / f"nabedra-{crate}-tests"
+                    shutil.copy2(fixture, fixture_copy)
+                    env[variable] = str(fixture_copy)
+                    report[f"{crate}_test_binary_sha256"] = hashlib.sha256(fixture_copy.read_bytes()).hexdigest()
             binary = Path(temp) / "acceptance-tests"
             shutil.copy2(built, binary)
             report["test_binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
