@@ -838,6 +838,30 @@ fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
     assert!(!state.reconcile(5_000, vec![stale_proof]));
     assert!(!state.reconcile(4_999, vec![promotion.clone()]));
 
+    // The prior deadline has passed, but a new leader needs time to hear
+    // from the still-verified target before it can discard this epoch.
+    let mut new_leader = Observations::default();
+    new_leader.reset_if_changed(2, state.topology.generation, bounds(8_000));
+    report(&mut new_leader, &state, make_member(3, 1).id, 8_001, None);
+    let changes = new_leader.plan(&state, bounds(8_001));
+    assert!(!state.clone().reconcile(8_001, changes));
+    report(&mut new_leader, &state, target, 8_002, Some(copy));
+    let changes = new_leader.plan(&state, bounds(8_002));
+    let mut recovered = state.clone();
+    assert!(recovered.reconcile(8_002, changes));
+    assert_eq!(recovered.topology.slots[0].primary, Some(target));
+    assert!(!recovered.topology.slots[0].cold);
+
+    let mut no_copy = state.clone();
+    let mut new_leader = Observations::default();
+    new_leader.reset_if_changed(2, state.topology.generation, bounds(8_000));
+    report(&mut new_leader, &state, make_member(3, 1).id, 10_999, None);
+    let changes = new_leader.plan(&no_copy, bounds(10_999));
+    assert!(!no_copy.reconcile(10_999, changes));
+    let changes = new_leader.plan(&no_copy, bounds(11_000));
+    assert!(no_copy.reconcile(11_000, changes));
+    assert!(no_copy.topology.slots[0].cold);
+
     let mut lagged = state.clone();
     let mut late = Observations::default();
     report(

@@ -14,8 +14,8 @@ pub(in crate::cache::cluster) const MAX_MOVES_PER_WORKER: usize = 64;
 const MAX_CHANGES: usize = 256;
 const REPORT_AGE_MS: u64 = 3_000;
 pub(in crate::cache::cluster) const MAX_CUTOVER_LAG: u64 = 32;
-// Give healthy candidates a full report window after the last lease fence.
-// This also covers fresh observations after a controller leadership change.
+// Give healthy candidates a full report window after the last lease fence
+// and after the controller starts collecting observations in a new term.
 pub(in crate::cache::cluster) const STAGED_RESET_GRACE_MS: u64 = REPORT_AGE_MS;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,6 +87,7 @@ pub(super) struct Staging {
 pub(super) struct Observations {
     term: u64,
     generation: u64,
+    cold_reset_not_before_ms: u64,
     reports: BTreeMap<WorkerId, Report>,
 }
 
@@ -97,10 +98,11 @@ struct Report {
 }
 
 impl Observations {
-    pub fn reset_if_changed(&mut self, term: u64, generation: u64) {
+    pub fn reset_if_changed(&mut self, term: u64, generation: u64, now: ClockBounds) {
         if self.term != term || self.generation != generation {
             self.term = term;
             self.generation = generation;
+            self.cold_reset_not_before_ms = now.lower_ms.saturating_add(STAGED_RESET_GRACE_MS);
             self.reports.clear();
         }
     }
@@ -685,7 +687,8 @@ impl<'a> Placement<'a> {
             }
         }
 
-        if !self.now.fenced(staged_reset_at(slot.lease)) {
+        let reset_at = staged_reset_at(slot.lease).max(self.observed.cold_reset_not_before_ms);
+        if !self.now.fenced(reset_at) {
             return None;
         }
         let primary = self

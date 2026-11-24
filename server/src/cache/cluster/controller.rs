@@ -441,7 +441,7 @@ impl Controller {
                 if let Some(now) = now
                     && let Ok(mut observed) = self.observed.lock()
                 {
-                    observed.reset_if_changed(term, topo.generation);
+                    observed.reset_if_changed(term, topo.generation, now);
                     (topo.ready_primaries, topo.ready_replicas) = observed.ready(&topo, now);
                 }
                 Reply::Status(topo)
@@ -471,7 +471,7 @@ impl Controller {
                 Some(self.observed.lock().map_or_else(
                     |_| Vec::new(),
                     |mut observed| {
-                        observed.reset_if_changed(term, topo.generation);
+                        observed.reset_if_changed(term, topo.generation, now);
                         observed.record(topo, heartbeat, now.lower_ms)
                     },
                 ))
@@ -520,7 +520,7 @@ impl Controller {
             .machine
             .read(|state| {
                 let mut observed = self.observed.lock().ok()?;
-                observed.reset_if_changed(term, state.topology.generation);
+                observed.reset_if_changed(term, state.topology.generation, now);
                 let changes = observed.plan(state, now);
                 (!changes.is_empty()).then_some(Command::Reconcile {
                     generation: state.topology.generation,
