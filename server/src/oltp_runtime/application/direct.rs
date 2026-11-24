@@ -588,7 +588,11 @@ impl DirectGateway {
             cache: TopologyCache::new(),
             fill: tokio::sync::Mutex::new(()),
             stats: GatewayStats::default(),
+            #[cfg(not(feature = "sim"))]
             deadline: GATEWAY_DEADLINE,
+            #[cfg(feature = "sim")]
+            deadline: crate::oltp_runtime::sim::limits()
+                .map_or(GATEWAY_DEADLINE, |limits| limits.direct_deadline),
         })
     }
     /// As `new` with another deadline (tests).
