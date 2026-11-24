@@ -4,6 +4,10 @@ mod log;
 mod machine;
 mod network;
 mod placement;
+#[cfg(feature = "sim")]
+pub(super) use placement::StagedPromotion;
+#[cfg(all(test, feature = "sim"))]
+pub(super) use placement::{MAX_CUTOVER_LAG, MAX_MOVES_PER_WORKER, STAGED_RESET_GRACE_MS};
 #[cfg(all(test, feature = "sim"))]
 mod simulation;
 mod state;
@@ -57,6 +61,7 @@ openraft::declare_raft_types!(
 type Raft = openraft::Raft<RaftConfig, Machine>;
 const RAFT_SESSIONS: usize = 8;
 const CONTROL_SESSIONS: usize = 56;
+pub(super) const RECONCILE_MS: u64 = 250;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -436,7 +441,7 @@ impl Controller {
                 if let Some(now) = now
                     && let Ok(mut observed) = self.observed.lock()
                 {
-                    observed.reset_if_changed(term, topo.generation);
+                    observed.reset_if_changed(term, topo.generation, now);
                     (topo.ready_primaries, topo.ready_replicas) = observed.ready(&topo, now);
                 }
                 Reply::Status(topo)
@@ -453,7 +458,7 @@ impl Controller {
         };
         let (generation, revision, worker) =
             (heartbeat.generation, heartbeat.revision, heartbeat.worker);
-        let accepted = self
+        let staged_progress = self
             .machine
             .read(|state| {
                 let topo = &state.topology;
@@ -461,18 +466,20 @@ impl Controller {
                     .member(worker)
                     .is_some_and(|member| member.authenticates(certificate))
                 {
-                    return false;
+                    return None;
                 }
-                if let Ok(mut observed) = self.observed.lock() {
-                    observed.reset_if_changed(term, topo.generation);
-                    observed.record(topo, heartbeat, now.lower_ms);
-                }
-                true
+                Some(self.observed.lock().map_or_else(
+                    |_| Vec::new(),
+                    |mut observed| {
+                        observed.reset_if_changed(term, topo.generation, now);
+                        observed.record(topo, heartbeat, now.lower_ms)
+                    },
+                ))
             })
             .await;
-        if !accepted {
+        let Some(staged_progress) = staged_progress else {
             return Reply::Refused("heartbeat identity is not enrolled".into());
-        }
+        };
         let Some(expires_ms) = now.lower_ms.checked_add(LEASE_MS) else {
             return Reply::Retry;
         };
@@ -481,6 +488,7 @@ impl Controller {
             revision,
             worker,
             expires_ms,
+            staged_progress,
         })
         .await
     }
@@ -493,33 +501,37 @@ impl Controller {
     }
 
     async fn reconcile(&self) {
-        let mut ticks = interval(Duration::from_millis(250));
+        let mut ticks = interval(Duration::from_millis(RECONCILE_MS));
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticks.tick().await;
-            let Some(term) = self.leader_term() else {
-                continue;
-            };
-            let Ok(now) = self.now() else {
-                continue;
-            };
-            let proposal = self
-                .machine
-                .read(|state| {
-                    let mut observed = self.observed.lock().ok()?;
-                    observed.reset_if_changed(term, state.topology.generation);
-                    let changes = observed.plan(state, now);
-                    (!changes.is_empty()).then_some(Command::Reconcile {
-                        generation: state.topology.generation,
-                        revision: state.topology.revision,
-                        lower_ms: now.lower_ms,
-                        changes,
-                    })
+            self.reconcile_once().await;
+        }
+    }
+
+    async fn reconcile_once(&self) {
+        let Some(term) = self.leader_term() else {
+            return;
+        };
+        let Ok(now) = self.now() else {
+            return;
+        };
+        let proposal = self
+            .machine
+            .read(|state| {
+                let mut observed = self.observed.lock().ok()?;
+                observed.reset_if_changed(term, state.topology.generation, now);
+                let changes = observed.plan(state, now);
+                (!changes.is_empty()).then_some(Command::Reconcile {
+                    generation: state.topology.generation,
+                    revision: state.topology.revision,
+                    lower_ms: now.lower_ms,
+                    changes,
                 })
-                .await;
-            if let Some(proposal) = proposal {
-                let _ = timeout(Duration::from_millis(700), self.commit(proposal)).await;
-            }
+            })
+            .await;
+        if let Some(proposal) = proposal {
+            let _ = timeout(Duration::from_millis(700), self.commit(proposal)).await;
         }
     }
 }

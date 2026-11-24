@@ -1,0 +1,14 @@
+id = "CACHE-sim-planned-handoff-boundary"
+title = "The Cache simulation mistook a fenced handoff for lost authority or divergent data"
+class = "other"
+module = "cache"
+guarantees = ["CACHE-G05", "CACHE-G06", "CACHE-G07"]
+scenarios = ["K03"]
+found_by = "campaign"
+found_date = "2026-11-23"
+lowest_regression = "server/src/cache/cluster/sim/tests.rs::nightly_recovery_regressions"
+seed = 4524674007700871
+why_not_caught = "Prior schedules did not place the liveness or later convergence sample between a committed freeze and the next grant."
+invariant_added = "Check ordinary primary availability at 15 seconds. A specific committed handoff with matching baselines must finish within a separate lease and heartbeat bound. Data equality has its own assertion."
+fix_commits = ["5e0e30306d2082d5505cce35272ed96b7d851d9c"]
+revert_patch_ok = true

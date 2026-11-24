@@ -1,0 +1,14 @@
+id = "CACHE-rebalance-replica-retirement"
+title = "A same-zone Cache rebalance blocked replacement of its retired replica"
+class = "membership-replacement-trust"
+module = "cache"
+guarantees = ["CACHE-G05", "CACHE-G07"]
+scenarios = ["K03"]
+found_by = "campaign"
+found_date = "2026-11-23"
+lowest_regression = "server/src/cache/cluster/controller/tests.rs::k03_replaces_a_retired_replica_before_resuming_same_zone_rebalance"
+seed = 198
+why_not_caught = "The previous drain and handoff tests did not retire the only distinct-zone copy after staging a same-zone move."
+invariant_added = "An unfrozen same-zone handoff releases its move slot when it loses the distinct-zone replica, so replacement and then the original rebalance can proceed."
+fix_commits = ["b7279ba7c996b92542c7acac660a546f4b84b699"]
+revert_patch_ok = true

@@ -6,11 +6,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::super::protocol::{
-    Admin, Grant, Lease, MAX_WORKERS, Member, Reply, Slot, SlotRange, Topology, Update, VERSION,
-    WorkerId,
+    Admin, Grant, Lease, MAX_WORKERS, Member, Progress, Reply, Slot, SlotRange, Topology, Update,
+    VERSION, WorkerId,
 };
 use super::super::transport::{Fingerprint, bounded_json};
-use super::placement::{Change, Order};
+use super::placement::{Change, Order, Staging};
 use crate::cache::command::SLOT_COUNT;
 
 const MAX_OPERATIONS: usize = 8_192;
@@ -27,6 +27,8 @@ pub(super) enum Command {
         revision: u64,
         worker: WorkerId,
         expires_ms: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        staged_progress: Vec<Progress>,
     },
     Admin {
         id: Uuid,
@@ -60,6 +62,12 @@ pub(super) struct State {
     retired: BTreeSet<WorkerId>,
     operations: BTreeMap<Uuid, Receipt>,
     groups: usize,
+    // Replica-only moves keep the source watermark and the start revision across terms.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) staging: BTreeMap<u16, Staging>,
+    #[cfg(feature = "sim")]
+    #[serde(skip)]
+    pub(super) applied_staged: Vec<(u16, super::placement::StagedPromotion)>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -69,6 +77,10 @@ struct Receipt {
 }
 
 impl State {
+    pub(super) fn is_retired(&self, worker: WorkerId) -> bool {
+        self.retired.contains(&worker)
+    }
+
     pub fn apply(&mut self, command: Command, respond: bool) -> Option<Reply> {
         match command {
             Command::Enroll {
@@ -88,7 +100,15 @@ impl State {
                 revision,
                 worker,
                 expires_ms,
-            } => self.renew(generation, revision, worker, expires_ms, respond),
+                staged_progress,
+            } => self.renew(
+                generation,
+                revision,
+                worker,
+                expires_ms,
+                staged_progress,
+                respond,
+            ),
             Command::Admin {
                 id,
                 action,
@@ -163,6 +183,7 @@ impl State {
         revision: u64,
         worker: WorkerId,
         expires_ms: u64,
+        staged_progress: Vec<Progress>,
         respond: bool,
     ) -> Option<Reply> {
         let topo = &mut self.topology;
@@ -171,6 +192,30 @@ impl State {
         }
         let mut grants: Vec<Grant> = Vec::new();
         if generation == topo.generation {
+            for progress in staged_progress {
+                if progress.baseline
+                    && topo
+                        .slots
+                        .get(usize::from(progress.slot))
+                        .is_some_and(|slot| {
+                            slot.epoch == progress.epoch
+                                && slot.primary == Some(worker)
+                                && slot.moving.is_some_and(|moving| moving.replica_only)
+                        })
+                {
+                    let staging = self.staging.entry(progress.slot).or_insert(Staging {
+                        revision: topo.revision,
+                        source_sequence: None,
+                    });
+                    staging.source_sequence = Some(
+                        staging
+                            .source_sequence
+                            .map_or(progress.sequence, |sequence| {
+                                sequence.max(progress.sequence)
+                            }),
+                    );
+                }
+            }
             for (index, slot) in topo.slots.iter_mut().enumerate() {
                 if slot.primary != Some(worker)
                     || slot.moving.is_some_and(|moving| moving.freeze_requested)
@@ -467,17 +512,13 @@ impl State {
         }
         self.orders
             .retain(|order| usize::from(order.last) < first || usize::from(order.first) > last);
+        self.staging
+            .retain(|&index, _| !(first..=last).contains(&usize::from(index)));
         for (slot, (primary, replica)) in self.topology.slots[first..=last]
             .iter_mut()
             .zip(assignments)
         {
-            *slot = Slot {
-                epoch: slot.epoch + 1,
-                primary: Some(primary),
-                replica,
-                cold: true,
-                ..Slot::default()
-            };
+            *slot = slot.cold_reset(primary, replica);
         }
         Ok(())
     }
@@ -488,6 +529,12 @@ impl State {
             && self.topology.workers.len() <= MAX_WORKERS
             && self.retired.len() <= MAX_RETIRED_BOOTS
             && self.groups <= MAX_WORKERS
+            && self.staging.keys().all(|&index| {
+                self.topology
+                    .slots
+                    .get(usize::from(index))
+                    .is_some_and(|slot| slot.moving.is_some_and(|moving| moving.replica_only))
+            })
             && self
                 .orders
                 .iter()

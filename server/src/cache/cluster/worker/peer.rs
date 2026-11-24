@@ -20,7 +20,7 @@ pub(super) use codec::{
     encode_delta, encode_empty, encode_fetch, encode_snapshot, hash_effects, replies,
 };
 
-pub(super) const PROBES: usize = 256;
+pub(in crate::cache::cluster) const PROBES: usize = 256;
 pub(super) const DELTAS_PER_PROBE: usize = 8;
 pub(super) const CHUNK_BYTES: usize = (1 << 20) + (64 << 10);
 pub(super) const MAX_ITEMS: usize = 1024;

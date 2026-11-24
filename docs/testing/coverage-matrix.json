@@ -1,6 +1,13 @@
 {
   "allow_unattested": false,
-  "head": "8498d0ee2c61a3df8557091412665b0e73f47bdc",
+  "coverage_notes": {
+    "cache": [
+      "K01 Tcl canary is `not-run` for coverage. It executed zero assertions and reported five setup exceptions. [Canary run](https://github.com/zPy52/nabedra-database/actions/runs/45301342381/job/138134435377).",
+      "K03 Docker has an intermittent full-placement timeout. [Main baseline](https://github.com/zPy52/nabedra-database/actions/runs/45233126481/job/137897811340).",
+      "K03 simulated controller disk loss is `not-run` pending modelled Raft storage."
+    ]
+  },
+  "head": "297e7e91af810d85cf324607c77cd4edf061afb6",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -130,7 +137,10 @@
       "level": "L2",
       "module": "cache",
       "scenarios": [
-        "K01"
+        "K01",
+        "K03",
+        "(expiry",
+        "preservation)"
       ]
     },
     {
@@ -304,7 +314,7 @@
           "state": "n/a"
         }
       },
-      "guarantee": "Failover may lose writes acknowledged within the replication lag window. It never invents a value or resurrects a deleted or expired key. Replicas converge after writes stop.",
+      "guarantee": "Failover may lose writes acknowledged within the replication lag window. This includes a DEL, so the previous value can reappear if the promoted replica missed the deletion. Stale or delayed updates never bring back a key whose deletion or expiry survived failover. Reads never return invented values. Replicas converge after writes stop. During replica replacement, a still-staged target can become primary after source fencing if it has a verified current-epoch baseline within the controller's cutover lag limit. The committed transition records both incarnations, the retained prefix and the fence. If neither a ready assigned replica nor an eligible staged copy can take over, the unavailable slot takes a fenced cold reset within the controller's repair budget.",
       "id": "CACHE-G05",
       "level": "L2",
       "module": "cache",

@@ -13,7 +13,7 @@ use nabedra_rt::time::{self, UNIX_EPOCH};
 use serde::Deserialize;
 
 const NANOS_PER_MILLISECOND: u64 = 1_000_000;
-const MAX_UNCERTAINTY_NS: u64 = 10 * NANOS_PER_MILLISECOND;
+pub(super) const MAX_UNCERTAINTY_NS: u64 = 10 * NANOS_PER_MILLISECOND;
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]

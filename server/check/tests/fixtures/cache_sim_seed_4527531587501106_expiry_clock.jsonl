@@ -1,0 +1,4 @@
+{"index":0,"type":"invoke","process":100,"f":"set","key":"cache-sim:Ttl:4","value":{"at_ns":1767225608619000000,"value":"ttl-10045"},"node":"12","time_ns":1767225607952000000}
+{"index":1,"type":"ok","process":100,"f":"set","key":"cache-sim:Ttl:4","value":{"epoch":1,"sequence":1,"value":null},"node":"12","time_ns":1767225607952000000}
+{"index":2,"type":"invoke","process":100,"f":"get","key":"cache-sim:Ttl:4","value":null,"node":"12","time_ns":1767225608618000000}
+{"index":3,"type":"ok","process":100,"f":"get","key":"cache-sim:Ttl:4","value":{"epoch":1,"value":null},"node":"12","time_ns":1767225608618000000}
