@@ -910,13 +910,15 @@ def o22(binary, test_executable):
             same_run_ready(cluster, cluster.run_id, WORKERS, 3)
             ready_replica_view(cluster, WORKERS, newer_than=removed_view['membership_revision'])
             assert cluster.stats(target)['native_thread_budget']['query_threads'] == 3
-            current = db.table('o22_rows')
-            assert current.id == table.id
+            current = None
             overloads = 0
 
             def restored_rows():
-                nonlocal overloads
+                nonlocal current, overloads
                 try:
+                    if current is None:
+                        current = db.table('o22_rows')
+                        assert current.id == table.id
                     return current.query().collect()
                 except OverloadedError as error:
                     # The new view invalidates terminal-copy confirmations.
