@@ -1688,6 +1688,57 @@ def failure_boundaries(test_executable):
                 server.log.close()
 
 
+def staged_cold_abandonment(test_executable):
+    with tempfile.TemporaryDirectory(prefix='nabedra-o15-staged-') as directory:
+        server = RuntimeServer(test_executable, directory)
+        server.test_executable = str(Path(test_executable).resolve())
+        with server:
+            db = Database(server.url, server.token, database='test', timeout=20)
+            table = db.create_table('cold_staged', {'id': str, 'value': int}, key='id')
+            table.insert({'id': 'seed', 'value': 1})
+            request = operation('table.insert', dict(table_id=table.id, row={'id': 'staged', 'value': 2}))
+            old_run = server.run_id
+            gates(server.root, [(request, 'bound')])
+
+            def submit():
+                with closing(Http(server.url, server.token)) as client:
+                    return client.exchange('/v1/requests', request)
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pending = pool.submit(submit)
+                try:
+                    wait_reached([server.root], request, 'bound')
+                    assert not pending.done(), 'tentative copy returned an admission receipt'
+                    server.stats()
+                    record = server.root / f"record-{request['request_id']}.json"
+                    assert json.loads(record.read_text())['accepted'] is False
+                finally:
+                    server.stop(abrupt=True)
+                try:
+                    reply = pending.result()
+                except TRANSPORT_ERRORS:
+                    pass
+                else:
+                    assert_unknown(reply, request)
+
+            record.unlink()
+            gates(server.root, [(request, 'queued')])
+            server.start(cold_start=True)
+            assert server.run_id != old_run
+            queue = server.stats()['queue']
+            assert queue['queued_records'] == queue['running_records'] == queue['reconciling_records'] == 0, queue
+            assert not record.exists(), 'cold start restored the tentative body'
+            with closing(Http(server.url, server.token)) as client:
+                assert_abandoned(client.exchange(receipt_path(old_run, request)), request)
+                assert_abandoned(client.exchange('/v1/requests', request), request)
+            table = Database(server.url, server.token, database='test', timeout=20).table('cold_staged')
+            assert table.get('staged') is None
+            assert table.get('seed') == {'id': 'seed', 'value': 1}
+            attempts = server.root / f"attempts-{request['request_id']}"
+            assert attempts.read_text().splitlines() == ['bound']
+            evidence('O15', 'R04-unaccepted-copy', tentative_copy_abandoned=True, direct_oltp=DIRECT)
+
+
 def wait_direct_active(server):
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
@@ -1881,6 +1932,8 @@ def cold_recovery_acceptance(binary, test_executable):
     with check_case('RF1 cold run', failures):
         failure_boundaries(test_executable)
         evidence('O15', 'rf1-cold-queue', interruptions=list(FENCE_STAGES), direct_oltp=DIRECT)
+    with check_case('RF1 staged copy cold run', failures):
+        staged_cold_abandonment(test_executable)
     with check_case('capability activation boundary', failures):
         activation_boundary(test_executable)
     with check_case('RF1 direct write boundaries', failures):
