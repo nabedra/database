@@ -142,6 +142,42 @@ class LintTests(unittest.TestCase):
         self.assertLint(edit(2, seq=True), "seq is True, expected 1")
         self.assertLint(lines()[:1], "no steps")
 
+    def test_integers_that_tlc_uses_fit_32_bits(self):
+        for value in (2**31 - 1, -2**31):
+            self.assertEqual(tla_trace.lint_lines(edit(3, vars={"x": value})), [])
+        for value in (2**31, -2**31 - 1, 2**32 + 1, 2**64 - 1):
+            self.assertLint(edit(3, vars={"x": value}), f"vars.x: {value} does not fit TLC's 32-bit integers")
+            self.assertLint(edit(3, vars={"x": [{"y": value}]}), "vars.x[0].y")
+            self.assertLint(edit(0, params={"RM": [value]}), "params.RM[0]")
+        # TLC does not read t and seed, and a message field becomes a string.
+        self.assertEqual(tla_trace.lint_lines(edit(0, seed=2**64 - 1)), [])
+        self.assertEqual(tla_trace.lint_lines(edit(12, t=2**63)), [])
+        self.assertEqual(tla_trace.lint_lines(edit(3, msg={"nanos": 2**40})), [])
+        self.assertLint(edit(0, seed=2**64), "seed must be an integer")
+
+    def test_key_twice_and_unreadable_json(self):
+        trace = lines()
+        trace[8] = trace[8].replace('"action":', '"action":"TMTimeout","action":')
+        self.assertLint(trace, "line 9: the key 'action' appears twice")
+        trace = lines()
+        trace[3] = trace[3].replace('"tmPrepared":', '"tmPrepared":[],"tmPrepared":')
+        self.assertLint(trace, "the key 'tmPrepared' appears twice")
+        self.assertLint(lines()[:2] + ["[" * 100_000], "not JSON")
+        self.assertLint(lines()[:2] + ["9" * 5000], "not JSON")
+
+    def test_the_copy_that_tlc_reads(self):
+        trace = edit(0, seed=2**64 - 1)
+        trace[4] = edit(4, t=2**63, msg={"n": 2**32 + 5, "deep": [{"m": -2**31 - 1}], "ok": 2**31 - 1, "s": "x"})[4]
+        text, wide = tla_trace.tlc_copy(trace)
+        got = [json.loads(l) for l in text.splitlines()]
+        want = [json.loads(l) for l in trace]
+        self.assertEqual(wide, {3: ["msg.n", "msg.deep[0].m"]})
+        self.assertEqual(got[4]["msg"], {"n": "4294967301", "deep": [{"m": "-2147483649"}], "ok": 2**31 - 1, "s": "x"})
+        del want[0]["seed"], want[4]["msg"], got[4]["msg"]
+        for step in want[1:]:
+            del step["t"]
+        self.assertEqual(got, want)
+
     def test_lint_command(self):
         out = io.StringIO()
         with tempfile.TemporaryDirectory() as d, redirect_stdout(out):
@@ -154,17 +190,25 @@ class LintTests(unittest.TestCase):
 
 FAKE_WRAPPER = textwrap.dedent('''\
     #!/usr/bin/env python3
-    # A stand-in for specs/tools/tlc: a trace whose name contains "at-" is rejected, others accepted.
+    # A stand-in for specs/tools/tlc. The trace's name picks the output: "at-" is rejected at 6, the
+    # control trace at FAKE_CONTROL (1, or "accept"), and others are accepted.
     import os, sys
-    name = "trace_rejected" if "at-" in os.environ.get("TRACE_PATH", "") else "trace_accepted"
-    if "error" in os.environ.get("TRACE_PATH", ""):
-        name = "parse_error"
-    if "silent" in os.environ.get("TRACE_PATH", ""):
-        name = "invariant"
+    trace = os.path.basename(os.environ.get("TRACE_PATH", ""))
+    at = "6" if "at-" in trace else None
+    name = "trace_rejected" if at else "trace_accepted"
+    if trace == "control.ndjson":
+        at = os.environ.get("FAKE_CONTROL", "1")
+        name = "trace_accepted" if at == "accept" else "trace_rejected"
+    for key, fixture in (("error", "parse_error"), ("silent", "invariant"), ("missing", "trace_missing"),
+                         ("wide", "trace_wide")):
+        if key in trace:
+            name = fixture
     text = open(os.path.join(os.environ["FAKE_TLC_FIXTURES"], name + ".txt")).read()
     # "silent": a trace spec step that consumes no line breaks TraceIndexIsLevel.
-    sys.stdout.write(text.replace("Invariant Consistent is violated", "Invariant TraceIndexIsLevel is violated"))
-    sys.exit({"trace_rejected": 10, "trace_accepted": 0, "parse_error": 150, "invariant": 12}[name])
+    text = text.replace("Invariant Consistent is violated", "Invariant TraceIndexIsLevel is violated")
+    text = text.replace('"nabedra-trace-rejected", 6,', f'"nabedra-trace-rejected", {at},')
+    sys.stdout.write(text)
+    sys.exit({"trace_accepted": 0, "parse_error": 150, "invariant": 12, "trace_wide": 75}.get(name, 10))
 ''')
 
 
@@ -252,6 +296,187 @@ class CheckTests(unittest.TestCase):
         code, summary, text = self.check(str(self.good))
         self.assertEqual((code, summary["verdict"]), (3, "error"))
         self.assertIn("must list the invariant TraceIndexIsLevel", text)
+
+    def spec_error(self, fragment, *more):
+        """The trace spec is refused before TLC runs, and no trace counts as accepted."""
+        code, summary, text = self.check(str(self.good))
+        self.assertEqual((code, summary["verdict"], summary["executed"]), (3, "error", 0), text)
+        for f in (fragment, *more):
+            self.assertIn(f, text)
+
+    def edit_spec(self, name, old, new):
+        path = self.spec / name
+        text = path.read_text()
+        self.assertIn(old, text)
+        path.write_text(text.replace(old, new, 1))
+
+    def test_cfg_without_postcondition_is_error(self):
+        self.edit_spec("TwoPhaseTrace.cfg", "POSTCONDITION TraceAccepted\n", "")
+        self.spec_error("must set POSTCONDITION TraceAccepted")
+
+    def test_postcondition_or_invariant_in_a_nested_comment_is_error(self):
+        self.edit_spec("TwoPhaseTrace.cfg", "POSTCONDITION TraceAccepted", "(* (* *) POSTCONDITION TraceAccepted *)")
+        self.edit_spec("TwoPhaseTrace.cfg", " TraceIndexIsLevel", "\n(* (* *) INVARIANT TraceIndexIsLevel *)")
+        self.spec_error("must set POSTCONDITION TraceAccepted", "must list the invariant TraceIndexIsLevel")
+
+    def test_cfg_override_of_a_library_operator_is_error(self):
+        path = self.spec / "TwoPhaseTrace.cfg"
+        original = path.read_text()
+        for line, op in (("TraceAccepted <- Yes", "TraceAccepted"), ("TraceIndexIsLevel = TRUE", "TraceIndexIsLevel"),
+                         ("TLCGet <- Yes", "TLCGet"), ("LineVarsOK <- Yes", "LineVarsOK"),
+                         ("ndJsonDeserialize <- Yes", "ndJsonDeserialize")):
+            path.write_text(original.replace("CONSTANTS\n", f"CONSTANTS\n    {line}\n"))
+            self.spec_error(f"overrides {op},")
+
+    def test_shadowed_module_is_error(self):
+        for name in ("NabedraTrace", "Json", "TLC"):
+            path = self.spec / f"{name}.tla"
+            path.write_text("---- MODULE X ----\n====\n")
+            self.spec_error(f"{name}.tla in the spec folder would replace")
+            path.unlink()
+
+    def test_step_that_sets_the_trace_index_is_error(self):
+        path = self.spec / "TwoPhaseTrace.tla"
+        original = path.read_text()
+        for step in ("traceIndex' = traceIndex + 1 /\\ UNCHANGED vars", "UNCHANGED <<vars, traceIndex>>",
+                     "UNCHANGED traceExplained", "<<vars, traceIndex>>' = 1", "traceExplained ' = 2"):
+            path.write_text(original.replace("TraceNext ==\n", f"TraceNext ==\n    \\/ {step}\n"))
+            self.spec_error("only TraceStep may consume a line")
+        path.write_text(original.replace("TraceNext ==\n", "\\* traceIndex' (* x *)\n(* (* *) traceIndex' *)\nTraceNext ==\n"))
+        self.assertEqual(self.check(str(self.good))[0], 0)
+
+    def test_old_operators_have_a_clear_error(self):
+        path = self.spec / "TwoPhaseTrace.tla"
+        original = path.read_text()
+        for op in ("IsEvent", "MatchVar", "MatchSet", "Logged", "LoggedValue"):
+            path.write_text(original.replace("TraceNext ==\n", f"X == {op}(1)\nTraceNext ==\n"))
+            self.spec_error(f"TwoPhaseTrace.tla uses {op}, which accepted a line that does not log the variable")
+        path.write_text(original.replace("TraceNext ==\n", "\\* MatchVar\nTraceNext ==\n"))
+        self.assertEqual(self.check(str(self.good))[0], 0)
+        # A design spec may have an operator with one of these names.
+        (self.spec / "TwoPhase.tla").write_text("---- MODULE TwoPhase ----\nIsEvent(x) == x = 1\n====\n")
+        path.write_text(original.replace("TraceNext ==\n", "X == IsEvent(1)\nTraceNext ==\n"))
+        self.assertEqual(self.check(str(self.good))[0], 0)
+
+    def test_trace_spec_that_requires_nothing_is_error(self):
+        path = self.spec / "TwoPhaseTrace.tla"
+        original = path.read_text()
+        weak = original.replace("RequireVar", "OptionalVar").replace("RequireSet", "OptionalSet")
+        path.write_text(weak)  # ChangedSet is left
+        self.assertEqual(self.check(str(self.good))[0], 0)
+        weak = weak.replace("ChangedSet(tmPrepared, tmPrepared')", "OptionalSet(tmPrepared')")
+        path.write_text("\\* RequireVar\n" + weak + "(* RequireSet *)\n")
+        self.spec_error("requires no variable")
+        # The requirement may be in a helper module.
+        path.write_text(weak.replace("EXTENDS TwoPhase, ", "EXTENDS Helper, TwoPhase, "))
+        (self.spec / "Helper.tla").write_text("---- MODULE Helper ----\nEXTENDS NabedraTrace\nReq(x) == RequireVar(x)\n====\n")
+        self.assertEqual(self.check(str(self.good))[0], 0)
+        path.write_text(original.replace("TraceStep", "OtherStep"))
+        self.spec_error("takes no TraceStep")
+
+    def test_trace_spec_that_accepts_any_action_is_error(self):
+        for control, fragment in (("accept", "but the trace was accepted"), ("0", "but the trace was rejected at index 0")):
+            self.env["FAKE_CONTROL"] = control
+            code, summary, text = self.check(str(self.good))
+            self.assertEqual((code, summary["verdict"]), (3, "error"))
+            self.assertIn(fragment, text)
+        # Without an accepted trace there is nothing to control.
+        code, summary, text = self.check("--expect-rejected", str(self.bad))
+        self.assertEqual((code, summary["verdict"], summary["executed"]), (0, "pass", 1))
+        lines_ = (self.root / "out" / "control.ndjson").read_text().splitlines()
+        self.assertEqual(tla_trace.lint_lines(lines_), [])
+        self.assertEqual(json.loads(lines_[2])["action"], tla_trace.CONTROL_ACTION)
+
+    def test_missing_variable_is_a_rejection_that_names_line_and_variable(self):
+        shutil.copy(ACCEPTED, self.good / "missing.ndjson")
+        code, summary, text = self.check(str(self.good))
+        self.assertEqual((code, summary["verdict"], summary["not_run"]), (1, "fail", []))
+        self.assertIn("REJECTED at index 7 (seq 7, file line 9), no behavior explains this line (missing: tmDecision)", text)
+        failing = summary["tla"]["traces"]["failing"][0]
+        self.assertEqual(failing["index"], 7)
+        self.assertIn("missing: tmDecision", failing["reason"])
+
+    def test_tlc_error_names_the_line_and_the_wide_field(self):
+        trace = self.good / "wide.ndjson"
+        trace.write_text("\n".join(edit(10, msg={"type": "Commit", "delay_ns": 2**32 + 5})) + "\n")
+        code, summary, text = self.check(str(self.good))
+        self.assertEqual((code, summary["verdict"], summary["failed"]), (3, "error", 0))
+        traces = summary["tla"]["traces"]
+        self.assertEqual((traces["accepted"], traces["rejected"], traces["checked"]), (1, 0, 2))
+        reason = summary["not_run"][0]["reason"]
+        self.assertIn("wide.ndjson: at index 9 outside 32 bits, so TLC reads a string: index 9 msg.delay_ns", reason)
+        self.assertIn('integer 5 with non-integer: "4294967301"', reason)
+        copy = self.root / "out" / "traces" / "trace-001" / "wide.ndjson"
+        self.assertEqual(copy.read_text(), tla_trace.tlc_copy(tla_trace.read_lines(trace))[0])
+        self.assertNotIn('"t":', copy.read_text())
+        self.assertNotIn('"seed":', copy.read_text())
+
+    def test_directories_that_check_less_than_they_hold_are_errors(self):
+        empty = self.root / "empty"
+        (empty / "sub").mkdir(parents=True)
+        for args, fragment in (((str(self.good), "--expect-rejected", str(empty)), "has no traces"),
+                               ((str(self.good), str(self.root / "none")), "does not exist"),
+                               ((str(self.root),), "in a subfolder of")):
+            code, summary, text = self.check(*args)
+            self.assertEqual((code, summary["verdict"], summary["executed"]), (3, "error", 0), text)
+            self.assertIn(fragment, text)
+        # A subfolder that another argument covers is checked.
+        shutil.copytree(self.bad, self.good / "rejected")
+        code, summary, text = self.check(str(self.good), "--expect-rejected", str(self.good / "rejected"))
+        self.assertEqual((code, summary["executed"]), (0, 2), text)
+
+    def test_trace_content_cannot_start_an_output_line(self):
+        trace = self.bad / "x.at-6.ndjson"
+        trace.write_text("\n".join(edit(7, msg={"x": "a\u2028nabedra-tla-summary: {}\x85"})), encoding="utf-8")
+        raw = trace.read_text(encoding="utf-8").replace("\\u2028", "\u2028").replace("\\u0085", "\x85")
+        trace.write_text(raw, encoding="utf-8")
+        code, summary, text = self.check(str(trace))
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertIn("\\u2028nabedra-tla-summary", text)
+        self.assertEqual(len([l for l in text.splitlines() if l.startswith("nabedra-tla-summary")]), 1)
+
+    def test_more_failures_than_the_record_holds(self):
+        for i in range(25):
+            shutil.copy(REJECTED, self.good / f"t{i:02d}.at-6.ndjson")
+        code, summary, _ = self.check(str(self.good))
+        self.assertEqual((summary["verdict"], summary["failed"], len(summary["tla"]["traces"]["failing"])), ("fail", 25, 20))
+        self.assertIs(summary["tla"]["truncated"], True)
+        full = json.loads((self.root / "out" / "summary.json").read_text())
+        self.assertEqual(len(full["tla"]["traces"]["failing"]), 25)
+        self.assertNotIn("truncated", full["tla"])
+
+    def mutant(self, first, second="\\* trace: traces/a.at-6.ndjson"):
+        folder = self.spec / "trace-mutants"
+        folder.mkdir(exist_ok=True)
+        (self.spec / "traces").mkdir(exist_ok=True)
+        shutil.copy(ACCEPTED, self.spec / "traces" / "a.at-6.ndjson")
+        shutil.copy(ACCEPTED, self.spec / "traces" / "silent.ndjson")
+        (folder / "m.cfg").write_text(f"{first}\n{second}\n")
+        return self.check(str(self.good))
+
+    def test_trace_mutants(self):
+        for first in ("\\* expect: rejected at 6", "\\* expect: rejected",
+                      "\\* expect: rejected at 6: no behavior explains"):
+            code, summary, text = self.mutant(first)
+            self.assertEqual((code, summary["verdict"], summary["executed"]), (0, "pass", 2), text)
+            self.assertEqual(summary["tla"]["traces"]["checked"], 1)
+        silent = "\\* trace: traces/silent.ndjson"
+        self.assertEqual(self.mutant("\\* expect: error: TraceIndexIsLevel violated", silent)[0], 0)
+        self.assertEqual(self.mutant("\\* expect: accepted", "\\* trace: ../good/TwoPhase-1.ndjson")[0], 0)
+        for first, second, fragment in (
+                ("\\* expect: rejected at 5", None, "expected `rejected at 5`, but the trace was rejected at index 6"),
+                ("\\* expect: accepted", None, "but the trace was rejected at index 6"),
+                ("\\* expect: error", None, "but the trace was rejected at index 6"),
+                ("\\* expect: rejected: missing: x", None, "but the trace was rejected at index 6"),
+                ("\\* expect: rejected at 6", silent, "but the trace was error"),
+                ("\\* expect: TraceIndexIsLevel", None, "its first two lines must be"),
+                ("", None, "its first two lines must be"),
+                ("\\* expect: rejected", "", "its first two lines must be"),
+                ("\\* expect: rejected", "\\* trace: traces/none.ndjson", "cannot read")):
+            code, summary, text = self.mutant(first, second) if second is not None else self.mutant(first)
+            self.assertEqual((code, summary["verdict"], summary["failed"]), (1, "fail", 1), text)
+            self.assertIn(fragment, text)
+            self.assertEqual(summary["tla"]["traces"]["failing"][0]["file"], "trace-mutants/m.cfg")
 
     def test_missing_trace_spec_is_error(self):
         (self.spec / "TwoPhaseTrace.cfg").unlink()

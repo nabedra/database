@@ -8,6 +8,8 @@
 (* - msgs: the channel. Lines describe the message sent or received in   *)
 (*   "msg", and the action takes it from there;                          *)
 (* - crashes, drops: fault counters, which the harness does not log.     *)
+(* TMResend and DropMessage change only these, so their lines carry no   *)
+(* variables.                                                             *)
 (***************************************************************************)
 EXTENDS TwoPhase, NabedraTrace
 
@@ -17,32 +19,28 @@ TraceRM == ToSet(TraceParams.RM)
 TraceMaxCrashes == TraceParams.MaxCrashes
 TraceMaxDrops == TraceParams.MaxDrops
 
-RMEvent(name, A(_)) ==
-    /\ IsEvent(name)
-    /\ LineNode \in RM
-    /\ A(LineNode)
-    /\ MatchVar("rmState", rmState'[LineNode])
+RMStep(name, A(_)) ==
+    TraceStep(name, LineNode \in RM /\ A(LineNode),
+              [rmState |-> RequireVar(rmState'[LineNode])])
 
-TMEvent(name, A) ==
-    /\ IsEvent(name)
-    /\ LineNode = "tm"
-    /\ A
-    /\ MatchVar("tmDecision", tmDecision')
-    /\ MatchSet("tmPrepared", tmPrepared')
-    /\ MatchVar("tmUp", tmUp')
+TMStep(name, A, checks) == TraceStep(name, LineNode = "tm" /\ A, checks)
 
 TraceNext ==
-    \/ RMEvent("RMPrepare", RMPrepare)
-    \/ RMEvent("RMChooseToAbort", RMChooseToAbort)
-    \/ RMEvent("RMRcvCommit", RMRcvCommit)
-    \/ RMEvent("RMRcvAbort", RMRcvAbort)
-    \/ TMEvent("TMRcvPrepared", TMRcvPrepared(LineMsg.rm))
-    \/ TMEvent("TMCommit", TMCommit)
-    \/ TMEvent("TMTimeout", TMTimeout)
-    \/ TMEvent("TMResend", TMResend)
-    \/ TMEvent("TMCrash", TMCrash)
-    \/ TMEvent("TMRestart", TMRestart)
-    \/ TMEvent("DropMessage", DropMessage(LineMsg))
+    \/ RMStep("RMPrepare", RMPrepare)
+    \/ RMStep("RMChooseToAbort", RMChooseToAbort)
+    \/ RMStep("RMRcvCommit", RMRcvCommit)
+    \/ RMStep("RMRcvAbort", RMRcvAbort)
+    \/ TMStep("TMRcvPrepared", TMRcvPrepared(LineMsg.rm),
+              [tmPrepared |-> RequireSet(tmPrepared')])
+    \/ TMStep("TMCommit", TMCommit, [tmDecision |-> RequireVar(tmDecision')])
+    \/ TMStep("TMTimeout", TMTimeout, [tmDecision |-> RequireVar(tmDecision')])
+    \/ TMStep("TMResend", TMResend, NoVars)
+    \* A crash changes tmPrepared only when the TM had read a message.
+    \/ TMStep("TMCrash", TMCrash,
+              [tmUp |-> RequireVar(tmUp'),
+               tmPrepared |-> ChangedSet(tmPrepared, tmPrepared')])
+    \/ TMStep("TMRestart", TMRestart, [tmUp |-> RequireVar(tmUp')])
+    \/ TMStep("DropMessage", DropMessage(LineMsg), NoVars)
 
 TraceInitState == Init /\ TraceInit
 

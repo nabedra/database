@@ -108,6 +108,13 @@ class TlcResult:
         return self.violations[0] if self.violations else None
 
 
+def _error_reason(body: str) -> str:
+    """One line. TLC puts the cause of an unexpected exception after `The exception was a <class>`."""
+    cause = re.search(r"^The exception was an? [\w.$]+\s*\n?:?\s*(.+)", body, re.S | re.M)
+    lines = (cause.group(1) if cause else body).splitlines()
+    return " ".join(" ".join(lines[:2]).split())
+
+
 def _int(text: str) -> int:
     return int(text.replace(",", ""))
 
@@ -167,7 +174,7 @@ def parse_tlc_output(text: str, exit_code: int | None = None) -> TlcResult:
                     break
             else:
                 if code not in _CONTEXT_CODES:
-                    res.errors.append(f"TLC message {code}: {body.splitlines()[0] if body else ''}"[:300])
+                    res.errors.append(f"TLC message {code}: {_error_reason(body)}"[:300])
     # TLC prints "Model checking completed. No error has been found." even when it stopped early, at
     # tlc2.TLC.stopAfter or TLCSet("exit", TRUE). Only a final statistics line with an empty queue
     # means the search was exhaustive; without that line nothing shows that it was.
