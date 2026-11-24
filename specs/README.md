@@ -43,6 +43,7 @@ v0.62.4, was taken.
 | `specs/<module>/mutants/<mutant>.cfg` | One per mutant. The first line is `\* expect: <Property>` (or `Deadlock`) |
 | `specs/<module>/<Name>Trace.tla` and `.cfg` | Trace validation, extending `<Name>` and `NabedraTrace` |
 | `specs/<module>/traces/` | Optional committed traces, such as a bug-replay corpus |
+| `specs/<module>/trace-mutants/*.cfg` | Optional broken trace specs, run with `<Name>TraceMutants.tla` |
 | `specs/lib/NabedraTrace.tla` | Shared trace helpers, on TLC's library path |
 | `specs/tools/` | The pinned tools |
 | `specs/selftest/` | The self-test spec |
@@ -75,14 +76,73 @@ baselines, so a terminal stuttering step counts and a liveness baseline with
 exhausted fault budgets causes no gap.
 
 `tla_trace.py check` lints each trace, then runs `<Name>Trace.tla` once per
-trace with `TRACE_PATH` set. `<Name>Trace.cfg` must list the invariant
-`TraceIndexIsLevel` from `NabedraTrace`: every `TraceNext` step consumes
-exactly one line, which `TraceAccepted` relies on to count the lines a
-behavior explains. A step that consumes no line is a trace spec error. A
-rejected trace is reported with the 0-based
-index (its `seq`) and the content of the first line no behavior explains.
+trace with `TRACE_PATH` set. TLC integers have 32 bits, so TLC reads a copy
+of the trace without `t` and `seed`, where an integer in `msg` that does not
+fit is a decimal string. The lint refuses such an integer in `vars` and
+`params`. A rejected trace is reported with the 0-based index (its `seq`)
+and the content of the first line no behavior explains, and with the
+variables that are missing, logged but not checked, or different there.
 Every trace under `--expect-rejected` must be rejected, at index `n` when
-the file is named `*.at-<n>.ndjson`.
+the file is named `*.at-<n>.ndjson`, or refused by the lint when it is named
+`*.at-lint.ndjson`. Otherwise a lint failure is a failure there too. Without a trace to accept, the result
+is `not-run`, never `pass`: rejected samples, trace mutants and the control
+only show that the check works. A path that does not exist, a directory
+without traces next to other traces, and traces in a subfolder that no
+argument covers are errors.
+
+A trace spec takes its steps through `TraceStep`, which requires the line's
+variables. See [trace validation](../.agents/skills/design-review/references/trace-validation.md).
+Before any trace, the check reads the text of `<Name>Trace.cfg`,
+`<Name>Trace.tla` and the modules of the spec folder that it extends or
+instantiates, and refuses:
+
+- a cfg without the invariant `TraceIndexIsLevel` or `POSTCONDITION
+  TraceAccepted` (comments, also nested, do not count), or one that overrides
+  an operator the check relies on;
+- a module in the spec folder with the name of a shared or standard module,
+  one that defines an operator of `NabedraTrace` or instantiates it, and a
+  trace spec that does not extend it;
+- a module that uses `traceIndex` or `traceExplained`, except to look ahead
+  with `Trace[traceIndex + 1]`;
+- a `TraceStep` whose action name is not a fixed string, so that one step
+  could take any line;
+- `ChangedVar` or `ChangedSet` with a primed first argument;
+- a removed operator (`IsEvent`, `MatchVar`, `MatchSet`), no `TraceStep`, or
+  no step that requires a variable.
+
+TLC then counts a line as consumed only when a `TraceStep` took it. A step
+that consumes no line is an error. A step that skips a line is an error
+unless it also counts `traceExplained` itself, which the text check refuses.
+After an accepted trace, one control run checks that a line with an unknown
+action, no variables and no message is rejected.
+
+Not detected, and left to the review of the trace spec:
+
+- a step that takes a weaker action than its name says, such as one that
+  stutters under the name of a fault;
+- a `msg` field or a `node` that the step does not compare, and the extra
+  fields that `RequireMsg` allows;
+- that the variables and `msg` fields a trace writer declares for an action
+  are the ones the trace spec's step checks, until a trace shows it;
+- `OptionalVar` or `NoVars` without a reason, and a check that does not
+  depend on the next state;
+- an initial state weaker than `Init`, and a constant from `params` that
+  hides a difference;
+- the order of the array that logs a set, and an empty object in place of an
+  empty one;
+- that `RequireVar` is reached on every action. The text checks find
+  mistakes. They do not stop a spec that is written to evade them.
+
+Known false alarms: `ChangedVar` on a variable that changes between a string
+and a record is a TLC error, because TLC compares the two, so use
+`RequireVar` there. So is any comparison of a logged value with a value of
+another type.
+
+When `trace-mutants/` exists, each `*.cfg` there runs
+`<Name>TraceMutants.tla`, a broken version of the trace spec, on one trace.
+Its first two lines are `\* expect: rejected at 6` (or `accepted` or
+`error`, with an optional index and an optional `: <text in the reason>`)
+and `\* trace: <path in the spec folder>`. Each is one assertion.
 
 Both print `nabedra-tla-summary: {json}` last. As the check's
 `result_parser = "tlc"`, it becomes the evidence record, with a `tla` object
@@ -94,8 +154,9 @@ length, or the trace counts. Logs and counterexamples are artifacts.
 | Every baseline exhaustive and clean, every action covered, every property mutated, every mutant caught on its property | `pass` |
 | A baseline violation, a coverage gap, an unmutated property, or a mutant that passes, errs or fails on another property | `fail` |
 | A baseline stopped at the time budget or a state cap, with no failure | `not-run` |
-| A baseline TLC error, such as a parse or evaluation error | `error` |
-| A trace no behavior explains, a lint failure, or an expected rejection that does not happen | `fail` |
+| A baseline TLC error, such as a parse or evaluation error, or a success message with a nonzero exit | `error` |
+| A trace no behavior explains, a lint failure, or an expected rejection or trace mutant that does not happen as expected | `fail` |
+| A trace spec the check refuses, a control that is accepted, or a TLC error on a trace | `error` |
 
 ## Check files
 
@@ -111,8 +172,16 @@ manager that crashes and restarts and a channel that loses messages. It has
 `TypeOK`, the safety invariant `Consistent`, the liveness property
 `Termination` under fairness named for its timers, its receive loop and its
 supervisor, two mutants (`commit_one_prepared` breaks `Consistent`,
-`no_resend` breaks `Termination`), a trace spec, and one accepted and one
-rejected sample trace. The checks `specs-selftest` (T0, T1),
+`no_resend` breaks `Termination`), and a trace spec. The accepted sample
+traces include one with 64-bit times and a 64-bit seed. The rejected ones
+cover a step the spec does not allow, missing variables (one, a set, one of
+two, all), a variable that nothing checks, a wrong value and set, an element
+logged twice, messages that are wrong, missing, out of place or have a field
+too many, and traces the lint refuses. One accepted trace logs every variable of the transaction
+manager on its own steps and what the fault defines on the others. The
+trace mutants cover steps that skip or consume no line, trace specs that
+read `t`, `seed` or a wide `msg` field, and what each check in
+`NabedraTrace` requires. The checks `specs-selftest` (T0, T1),
 `specs-selftest-trace` (T0, T1) and `specs-selftest-large` (T2, simulation)
 prove the pipeline end to end.
 
