@@ -907,7 +907,7 @@ impl NativePlanner {
         ),
         PlanError,
     > {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let _point = nabedra_resources::perf_stage!("test.data.point").timer();
         value(
             decode_record(

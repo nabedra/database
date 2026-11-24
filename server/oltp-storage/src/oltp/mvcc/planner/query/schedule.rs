@@ -105,7 +105,7 @@ impl QueryScheduler {
                 if !pending.read.settle().await {
                     continue;
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 pending.read.record("coordinator-confirmed");
                 let mut active = active
                     .lock()
@@ -167,7 +167,7 @@ impl QueryExecution {
     }
 
     pub(super) fn quarantine(&self, read: UnsettledRead, owner: Reservation) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         read.record("coordinator-quarantined");
         let mut active = self
             .active

@@ -65,7 +65,7 @@ impl ParticipantMachine {
         request: ScanRequest,
         scheduled: bool,
     ) -> Result<OwnedCommand<ScanPage>, ProtocolError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let _scan = matches!(
             &request.domain,
             ScanDomain::Rows { .. } | ScanDomain::Index { .. }

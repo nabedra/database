@@ -969,7 +969,7 @@ impl GroupStore {
             {
                 return Err(storage_error_message());
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             self.observe_install_cut("staged", header.applied, generation, &mut scratch)?;
             hook(InstallPoint::BeforeActivation)?;
             let mut activate = WriteBatch::with_capacity_bytes(budget.batch_bytes);
@@ -1007,7 +1007,7 @@ impl GroupStore {
             self.pool().durable_write(&scope, activate)?;
             retained = true;
             stage = None;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             self.observe_install_cut("activated", header.applied, generation, &mut scratch)?;
             hook(InstallPoint::AfterActivation)?;
             sync_directory(path.parent().ok_or_else(storage_error_message)?)?;
@@ -1027,7 +1027,7 @@ impl GroupStore {
         result
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     fn observe_install_cut(
         &self,
         phase: &str,
