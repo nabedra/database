@@ -12,7 +12,8 @@ reverts = "6ad8a99c2561ba48c0bcb4a2b8252d9c1e2ad30b"
 port = "clean"
 port_notes = """
 `git diff 6ad8a99c 6ad8a99c^` on authority/control/forwarding.rs (moved to nabedra-oltp-replication): a
-Barrier or Propose over a prepared-only session is refused as invalid instead of deferred.
+Barrier or Propose over a prepared-only session is refused as invalid instead of deferred. O14, where the fix
+was found, passed once with the patch.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
 # not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
@@ -27,3 +28,13 @@ test = "oltp_replication::manager::damage_scheduler_tests::probe_acc3_delegation
 mode = "on"
 probe = true
 failure_contains = ["from a worker whose promotion is not applied here"]
+
+[regression.evidence]
+digest = "6c32d5510986d42864feb53ddccf27a81e146da3395407dae8a861b3d3eadf1d"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, probe_acc3_delegation_waits_for_the_applied_promotion, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45436093996", sha = "af47594b829dc53e11ae08eda608629c2065aae7", result = "failed", note = "request p11-bugs-acc3-delegation-af47594-172108, probe_acc3_delegation_waits_for_the_applied_promotion, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+assertion `left == right` failed: barrier from a worker whose promotion is not applied here: Control operator delegation identity or request differs
+  left: (Unauthorized, NotApplied)
+ right: (StorageUnavailable, NotApplied)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 194 filtered out; finished in 1.35s
+""" }

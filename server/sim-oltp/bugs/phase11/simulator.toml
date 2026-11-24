@@ -35,8 +35,9 @@ workload = "queued"
 reach = "needs-client"
 faults = "The reply of a direct single-key mutation is cut after commit; the client retries the same ID and body without Content-Length (chunked)."
 trigger = "GatewayAttempt done and HTTP reply cut."
-invariant = "dedup-miss or request-id-reuse-misdetected from the single-key checker."
+invariant = "Liveness (every request resolved): after the heal, a streamed retry of a committed direct identity returns the original result. Patched, it answers outcome_unknown every time."
 gaps = [
+    "OneExecutionPerIdentity as designed cannot fire: the queue owner settles the identity at its anchor first (settle_before_reserve, T7c) and refuses the streamed body with outcome_unknown, so nothing runs twice.",
     "The harness client always sends Full<Bytes> with a length (sim-oltp/src/client.rs); it needs a streamed body mode.",
 ]
 
@@ -88,7 +89,7 @@ faults = "A worker joins; the owner or one follower applies the new ready view u
 trigger = "Control ReadyPublished, then a POST /v1/requests table.create before the lagging worker installs the view."
 invariant = "SubmitDuringViewInstall (new): a submission while every ready holder is live is accepted within the 3 s install bound."
 gaps = [
-    "Liveness after heal and the receipt check do not see it: the patched refusal is a proved not_applied and a retry succeeds once the view installs.",
+    "Liveness after heal and the receipt check do not see it: the patched answer is storage_unavailable with outcome unknown, which is legal, and a retry succeeds once the view installs.",
 ]
 
 [acc2]
@@ -128,9 +129,9 @@ workload = "queued"
 reach = "needs-invariant"
 faults = "Kill or fence the queue owner after a queued mutation sealed its manifest, while another ready holder keeps the complete accepted record."
 trigger = "Status Seal (prepared, undecided) for a queued transaction."
-invariant = "AcceptedSettlesInRun (new, part of the receipt check): in one run an accepted mutation with a surviving copy ends with its own result, never with an abort the fence caused."
+invariant = "AcceptedSettlesInRun (new, part of the receipt check): in one run an accepted mutation with a surviving copy ends with its own result, never with an abort the fence caused (patched receipt: failed, conflict `original execution authority was fenced`)."
 gaps = [
-    "`outcome::check` cannot see it: the abort is decided, so the conflict is a true not_applied. The regression proves the Status hunk; O08 is the process regression for the runtime hunk.",
+    "`outcome::check` cannot see it: the abort is decided, so the conflict is a true not_applied.",
 ]
 
 [fixb-cold-publish]

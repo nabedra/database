@@ -12,7 +12,8 @@ reverts = "afbc048bb192cdb86b86bb279e80d911864a90ce"
 port = "clean"
 port_notes = """
 `git diff afbc048b afbc048b^` on oltp_runtime/bootstrap/registered.rs: the Timestamp ready fence of a
-registered startup is one call again instead of a startup_read loop.
+registered startup is one call again instead of a startup_read loop. O14, where the fix was found, passed
+once with the patch. The probe holds the joining worker at the fence and stops the Timestamp quorum.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
 # not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
@@ -28,4 +29,15 @@ mode = "on"
 probe = true
 needs_server = true
 timeout_s = 1800
-failure_contains = ["the joining worker exited when one ready-fence call failed"]
+failure_contains = ["the joining worker exited when one ready-fence call failed", "no registered group leader completed the strong service call"]
+
+[regression.evidence]
+digest = "be165f2b93bf0495efd084298ae08d6966bcb0d4778090a3a7ef4aefa6e68be2"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, probe_acc3_ready_fence_survives_a_timestamp_outage, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45436207074", sha = "4b2cc9ef03731bec2096463d922b1b485dd1ba38", result = "failed", note = "request p11-bugs-acc3-ready-fence-4b2cc9e-172143, probe_acc3_ready_fence_survives_a_timestamp_outage, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out; finished in 34.98s
+nabedra-db: registered startup StorageUnavailable: no registered group leader completed the strong service call
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out; finished in 8.32s
+    assert alive, 'the joining worker exited when one ready-fence call failed'
+AssertionError: the joining worker exited when one ready-fence call failed
+""" }

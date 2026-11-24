@@ -27,3 +27,12 @@ suite = "replacement-voter-refresh"
 mode = "on"
 timeout_s = 3600
 failure_contains = ["Data-only worker adopted the published Control voters"]
+
+[regression.evidence]
+digest = "91b31eb189463773c7944db26c1952a9a8303cdf230c4629b7515e0dcb75d59f"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45440153575", sha = "c5d1cc5c6a0bb7ff2d5a21e35253d5c619f01850", result = "passed", note = "request p11-bugs-clean-suites-c5d1cc5-174205, scratch_recovery_suite_replacement_voter_refresh, 1 of 1 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45440262486", sha = "7e5018ce71721bdec6eed8eba60288d529267065", result = "failed", note = "request p11-bugs-fixb-voter-refresh-suite-7e5018c-174239, scratch_recovery_suite_replacement_voter_refresh, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 199 filtered out; finished in 104.58s
+AssertionError: Data-only worker adopted the published Control voters: False
+AssertionError: Data-only worker adopted the published Control voters: False. Current voters ["78d165d5-63a1-4211-a118-3193aee9b20c","97ce071e-0065-40af-82e4-fa8a3ea0e0d9","ddc79ee5-09f2-413e-aac9-698926717475"], expected ['09295983-5485-4042-89e7-b67693a440d8', '78d165d5-63a1-4211-a118-3193aee9b20c
+""" }

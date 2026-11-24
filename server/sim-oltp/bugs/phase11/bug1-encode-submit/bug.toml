@@ -27,3 +27,13 @@ kind = "lib-test"
 test = "oltp_runtime::application::q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity"
 mode = "on"
 failure_contains = ["left: NotApplied"]
+
+[regression.evidence]
+digest = "2b04ed65b0896fdd68e2edadf7d89427916c2556aa0e92553eecf4724e351049"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435466712", sha = "f5b4e6ed14fc853f4f3abc33bd20b028b8b6c9fb", result = "failed", note = "request p11-bugs-bug1-encode-submit-f5b4e6e-171758, q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+assertion `left == right` failed
+  left: NotApplied
+ right: Unknown
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 0.00s
+""" }

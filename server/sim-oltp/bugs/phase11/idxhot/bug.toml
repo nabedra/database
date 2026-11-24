@@ -26,3 +26,11 @@ kind = "lib-test"
 test = "oltp_runtime::worker_runtime::index_backend::acceptance_tests::o12_hot_key_cannot_starve_backfill"
 mode = "on"
 failure_contains = ["backfill must finish while every refresh attempt races a committed write"]
+
+[regression.evidence]
+digest = "a3413bb4fcdb130ee645115884aa744620c5736d3f332d8db7047a3485b4a124"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o12_hot_key_cannot_starve_backfill, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45436162718", sha = "5f15ce8c72d73543ca944b011484025f0f80ff9f", result = "failed", note = "request p11-bugs-idxhot-5f15ce8-172129, o12_hot_key_cannot_starve_backfill, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+backfill must finish while every refresh attempt races a committed write: ProtocolError { code: Conflict, message: "transaction preparation conflicted with an existing version", outcome: NotApplied }
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 1.48s
+""" }

@@ -12,7 +12,8 @@ reverts = "fd5aa4a3cef443fc1635ff5667e232b071b6c007"
 port = "hand"
 port_notes = """
 The fix's two hunks reversed in server/oltp-types/src/queue.rs, where RecordHeader::preflight moved from
-oltp_runtime/replica.rs. A ready view or owner mismatch is part of the malformed check again.
+oltp_runtime/replica.rs. A ready view or owner mismatch is part of the malformed check again. The bug record's
+O16 (direct_oltp off) passed once with the patch, so it is not a steady regression.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
 # not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
@@ -27,3 +28,13 @@ test = "oltp_runtime::replica::tests::probe_bug2_a_copy_under_a_newer_authority_
 mode = "on"
 probe = true
 failure_contains = ["a copy under a newer ready view", "left: Some(Invalid)"]
+
+[regression.evidence]
+digest = "ebe0d865b9c52eb4282f5f1312545aade25ba3afcd94045bb6cb1f95a82df89d"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, probe_bug2_a_copy_under_a_newer_authority_is_stale_not_invalid, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45436122024", sha = "96e5ef762735d7c5e09eb368f02b063799db43be", result = "failed", note = "request p11-bugs-bug2-96e5ef7-172116, probe_bug2_a_copy_under_a_newer_authority_is_stale_not_invalid, 1 of 1 attempts, off mode, over main c8426fe1", output = """
+assertion `left == right` failed: a copy under a newer ready view
+  left: Some(Invalid)
+ right: Some(Stale)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out; finished in 0.00s
+""" }

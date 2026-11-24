@@ -13,7 +13,8 @@ port = "hand"
 port_notes = """
 c4fad97e and c7761409 reversed at their two wait points: QueueCoordinator::stage and the Install branch of
 worker_endpoint.rs no longer wait for the published ready view. wait_for_local_ready_view stays because
-#103 (262ffb74) uses it for queued retries, a different defect.
+#103 (262ffb74) uses it for queued retries, a different defect. The regression stops at the owner's wait; with only the
+endpoint hunk reversed it fails too, at the follower (run 45442322524).
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
 # not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
@@ -24,7 +25,17 @@ seeds = [1, 10000]
 
 [regression]
 kind = "lib-test"
-test = "oltp_acceptance::growth::o21_capacity_deficit"
+test = "oltp_growth_acceptance::o21_capacity_deficit"
 mode = "on"
 needs_server = true
 timeout_s = 3600
+failure_contains = ["in create_with_lagging_queue_replicas", "request replication or scheduler authority unavailable"]
+
+[regression.evidence]
+digest = "c79cbf5de6cdf4f85270ebbf6bd1a654ee0dbbaf0137c1160f561a14b183d47b"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45438219830", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-o21-b0a6d05-173204, o21_capacity_deficit, 1 of 1 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45438209361", sha = "8f27ad05065d7f214d8e7f7f1b14d179d89cf4e1", result = "failed", note = "request p11-bugs-o21cap-b-8f27ad0-173201, o21_capacity_deficit, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 15.64s
+  File "/home/runner/work/nabedra-database/nabedra-database/server/tests/oltp_growth_acceptance.py", line 664, in create_with_lagging_queue_replicas
+AssertionError: (503, {'request_id': '2fb57147-2dce-4301-915e-1800886603df', 'error': {'code': 'storage_unavailable', 'message': 'request replication or scheduler authority unavailable', 'outcome': 'unknown'}})
+""" }
