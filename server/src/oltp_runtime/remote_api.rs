@@ -11,12 +11,9 @@ use crate::{
     executor::Executor,
     oltp::pool::{ByteClass, ExecutionClass, SharedResourceConfig, WorkerSharedResources},
     oltp_replication::{
-        TlsMaterial,
+        AppliedPeerDirectory, TlsMaterial,
         authority::control::{ApiEnrollment, ControlClient, ControlRoutes},
-        multiplex::{
-            AppliedPeerDirectory, EndpointFuture, EndpointRegistry, TransportConfig,
-            WorkerTransport,
-        },
+        multiplex::{EndpointFuture, EndpointRegistry, TransportConfig, WorkerTransport},
         types::*,
     },
     protocol::{ErrorCode, Outcome, ProtocolError},

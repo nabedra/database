@@ -636,7 +636,7 @@ impl HostedGroupManager {
         peers: BTreeMap<u64, ReplicaMember>,
         catch_up_before: Option<u64>,
         config: openraft::Config,
-        directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+        directory: Arc<crate::oltp_replication::peer_directory::AppliedPeerDirectory>,
     ) -> Result<ManagedControl, ProtocolError> {
         let machine = ControlMachine::new(store)?.with_replacement_directory(directory).await?;
         self.start(machine, local, peers, catch_up_before, config)

@@ -80,7 +80,7 @@ pub(crate) struct LocalServices {
     pub queue: Arc<QueueCoordinator>,
     pub(super) scoped: Option<super::scoped_worker::ScopedWorkerServices>,
     pub manager: Arc<HostedGroupManager>,
-    pub directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+    pub directory: Arc<crate::oltp_replication::AppliedPeerDirectory>,
     refresh: Mutex<Option<JoinHandle<()>>>,
     membership: Mutex<Option<JoinHandle<()>>>,
     stop: watch::Sender<bool>,
