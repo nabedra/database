@@ -146,7 +146,7 @@ Send(st, plan) ==
 (* ----------------------------------------------------------------------- *)
 Barrier(k) ==
     \A j \in 1..(k - 1) :
-        (Mutant = "frames_ignore_stream" \/ StreamOf(queue[j]) = StreamOf(queue[k])) => queue[j].ready
+        (Mutant # "frames_ignore_stream" /\ StreamOf(queue[j]) = StreamOf(queue[k])) => queue[j].ready
 
 BecomeReady(k) ==
     /\ k \in 1..Len(queue)

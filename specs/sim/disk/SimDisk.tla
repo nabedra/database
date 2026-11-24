@@ -389,7 +389,7 @@ SyncDir ==
 \* n-th mutating call; the calls that follow fail without effect. Crash below may
 \* happen after any call, so it covers every crash_after boundary (NS04).
 
-\* World::crash (sim.rs:501): halt every volume, mark the node down and its services
+\* World::crash (sim.rs, cut_node since #106): cut the network, halt every volume, mark the node down and its services
 \* dead, then abort its tasks. Mutant abort_before_halt is the phase 9 planted bug P2.
 Crash ==
     /\ up
@@ -520,8 +520,9 @@ RestartPowerLoss(mode) ==
 \* disk. Reformat keeps the device number; Replace takes a new one. The shipped code
 \* draws a new filesystem uuid and an inode base different from the old one.
 Wipe(how) ==
-    \* Every shipped harness wipes a node that is down (sim-oltp disk.rs, Events
-    \* cluster.rs). World::wipe itself does not check: mutant prefix_wipe_while_up.
+    \* Every cluster harness that wipes does so on a node that is down (sim-oltp
+    \* disk.rs, the pool sim tests). World::wipe itself does not check, and one rt unit
+    \* test wipes a live node: mutant prefix_wipe_while_up.
     /\ phase = "down" \/ (Mutant = "prefix_wipe_while_up" /\ up)
     /\ budget.wipes < MaxWipes
     /\ \E b \in Bases :
@@ -603,21 +604,21 @@ SyncedSurvives ==
             /\ osData'[osNs'[n]] = osData[osNs[n]]]_vars
 
 \* POSIX: a sector a successful sync covered, and that was not written since, survives.
-SectorSurvives(cuts) ==
-    [][IsRestart /\ ImageCut \in cuts =>
+SectorStep(cuts) ==
+    IsRestart /\ ImageCut \in cuts =>
         \A n \in Names :
             (osNs[n] # NoIno /\ linkAcked[n]) =>
                 \A s \in sectorAcked[osNs[n]] :
                     /\ osNs'[n] # NoIno
                     /\ s <= Len(osData'[osNs'[n]])
-                    /\ osData'[osNs'[n]][s] = osData[osNs[n]][s]]_vars
+                    /\ osData'[osNs'[n]][s] = osData[osNs[n]][s]
 
 NotPower4k == Cuts \ {"power4k"}
 AnyCut == Cuts
-SyncedSectorsSurvive == SectorSurvives(NotPower4k)
+SyncedSectorsSurvive == [][SectorStep(NotPower4k)]_vars
 \* Witness only: fails on the baseline, because a 4 KiB destroying power loss takes
 \* synced neighbours of a dirty sector with it (stronger than POSIX).
-SyncedSectorsSurviveAnyCut == SectorSurvives(AnyCut)
+SyncedSectorsSurviveAnyCut == [][SectorStep(AnyCut)]_vars
 
 \* Every crash image is one the POSIX model allows: the namespace is the durable one
 \* plus a dependency-closed set of pending ops, and each sector holds its old value, a
