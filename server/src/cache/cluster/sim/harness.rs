@@ -351,6 +351,48 @@ impl Cluster {
         self.trace(format_args!("worker start {node}"));
     }
 
+    /// Commits a new incarnation for `node` while its current process keeps
+    /// running. The enrollment retires the running incarnation, as an
+    /// operator replacement does when the old host is cut off but alive.
+    /// The replacement presents the node's certificate, so the request is
+    /// sent from the node's address. Only that request crosses the
+    /// controller links: they are opened for it and closed again.
+    pub async fn enroll_replacement(&mut self, node: u64) -> Reply {
+        self.next_incarnation += 1;
+        let member = member(node, Uuid::from_u128(u128::from(self.next_incarnation)));
+        self.trace(format_args!(
+            "enroll replacement incarnation {} for {node}",
+            self.next_incarnation
+        ));
+        let end = self.now() + START_BUDGET;
+        loop {
+            if let Some(leader) = self.leader() {
+                self.link(node, leader, false);
+                self.link(leader, node, false);
+                let request = Request::Enroll(member.clone());
+                let result = sim::in_node(node, async move {
+                    PeerTls::sim(fingerprint(node))
+                        .connect(&endpoint(leader, CONTROL))
+                        .await?
+                        .json::<_, Reply>(&request, CONTROL_FRAME)
+                        .await
+                })
+                .await;
+                self.link(node, leader, true);
+                self.link(leader, node, true);
+                if let Ok(reply) = result
+                    && !matches!(reply, Reply::Retry)
+                {
+                    return reply;
+                }
+            }
+            if self.now() >= end {
+                return Reply::Retry;
+            }
+            self.step(25).await;
+        }
+    }
+
     pub fn crash(&mut self, node: u64) {
         self.trace(format_args!("crash {node}"));
         self.world.crash(node);

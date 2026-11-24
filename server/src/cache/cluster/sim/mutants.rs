@@ -9,7 +9,7 @@ use nabedra_sim::{PlantedSearch, runtime};
 use super::super::super::protocol::{Admin, Reply};
 use super::super::super::{
     clock::ClockMode,
-    controller::{MAX_CUTOVER_LAG, RECONCILE_MS, STAGED_RESET_GRACE_MS},
+    controller::{MAX_CUTOVER_LAG, RECONCILE_MS, STAGED_RESET_GRACE_MS, SourceFence},
     protocol::{LEASE_MS, RENEW_MS},
 };
 use super::super::harness::{Cluster, Config, memory_limit};
@@ -28,6 +28,7 @@ enum Case {
     LocalSkew,
     UnfencedStaged,
     LaggedStaged,
+    RetiredStaged,
 }
 
 impl Case {
@@ -41,6 +42,7 @@ impl Case {
             Self::LocalSkew => "E2",
             Self::UnfencedStaged => "P5",
             Self::LaggedStaged => "P6",
+            Self::RetiredStaged => "P7",
         }
     }
 
@@ -50,7 +52,8 @@ impl Case {
             | Self::LiveReset
             | Self::ExcessDrift(_)
             | Self::LocalSkew
-            | Self::UnfencedStaged => "LeaseExclusive",
+            | Self::UnfencedStaged
+            | Self::RetiredStaged => "LeaseExclusive",
             Self::LaggedStaged => "promotion-lag",
             Self::DeleteIgnored | Self::ExpiryDeleteIgnored => "ReplicaPrefix",
             Self::EpochReused => "SlotOwnership",
@@ -91,6 +94,7 @@ impl Case {
                 cold_reset_ignores_live_lease: enabled && self == Self::LiveReset,
                 staged_ignores_fence: enabled && self == Self::UnfencedStaged,
                 staged_ignores_lag: enabled && self == Self::LaggedStaged,
+                staged_retire_is_fence: enabled && self == Self::RetiredStaged,
             },
             check_replica_prefix: true,
             keep_full_trace: false,
@@ -113,7 +117,10 @@ struct Trial {
 fn run_case(case: Case, seed: u64, generated: bool, enabled: bool, history_only: bool) -> Trial {
     runtime::run(seed, |world| async move {
         let mut choices = nabedra_sim::sweep::workload_gen(seed);
-        let staged = matches!(case, Case::UnfencedStaged | Case::LaggedStaged);
+        let staged = matches!(
+            case,
+            Case::UnfencedStaged | Case::LaggedStaged | Case::RetiredStaged
+        );
         let slot_max = if generated && staged {
             1 + choices.below(63) as u16
         } else if generated {
@@ -129,6 +136,11 @@ fn run_case(case: Case, seed: u64, generated: bool, enabled: bool, history_only:
         let mut config = case.config(enabled);
         config.check_replica_prefix = !history_only;
         let mut cluster = Cluster::boot(world, vec![key.clone()], config).await;
+        if case == Case::RetiredStaged {
+            let jitter = generated.then(|| choices.below(30));
+            retired_source_schedule(&mut cluster, &key, enabled, jitter).await;
+            return trial(&cluster, true);
+        }
         if staged {
             staged_schedule(
                 &mut cluster,
@@ -377,6 +389,162 @@ async fn staged_schedule(
     assert_eq!(cluster.send(key, Op::Get, None).await, Some(expected));
 }
 
+/// R-cache-14: the source of a replica-only move is cut off from the
+/// controllers but still serves clients, and its incarnation retires while
+/// its last grant is live. The controller may commit the staged promotion at
+/// once, but the target must not serve before that grant's expiry.
+async fn retired_source_schedule(
+    cluster: &mut Cluster,
+    key: &str,
+    enabled: bool,
+    jitter: Option<u64>,
+) {
+    let slot = key_slot(key.as_bytes());
+    let initial = cluster.slot(slot);
+    let old = initial.primary.unwrap();
+    let replica = initial.replica.unwrap();
+    assert!(write_ok(
+        cluster
+            .send(key, Op::Set("retained".into(), None), Some(old.node))
+            .await
+    ));
+    cluster.crash(replica.node);
+    let deadline = cluster.now() + 2 * LEASE_MS;
+    let target = loop {
+        if let Some(moving) = cluster.slot(slot).moving {
+            assert!(moving.replica_only);
+            break moving.target;
+        }
+        assert!(cluster.now() < deadline, "staging did not start");
+        cluster.step(10).await;
+    };
+    cluster.immediate_delivery();
+    // Keep the move staged: the controller must not hear the verified copy
+    // while the source is still reporting.
+    cluster.renew_once(target.node).await.unwrap();
+    cluster.isolate_controller_links(target.node);
+    let deadline = cluster.now() + LEASE_MS;
+    loop {
+        if cluster
+            .sample(Some(target), slot)
+            .await
+            .is_some_and(|copy| copy.baseline)
+        {
+            break;
+        }
+        assert!(cluster.now() < deadline, "staged copy did not finish");
+        cluster.step(10).await;
+    }
+    cluster.renew_once(old.node).await.unwrap();
+    if let Some(jitter) = jitter {
+        cluster.step(jitter).await;
+    }
+    cluster.heal();
+    // The source keeps its client and peer links. Only the controllers lose it.
+    cluster.isolate_controller_links(old.node);
+    let reply = cluster.enroll_replacement(old.node).await;
+    assert!(matches!(reply, Reply::Applied { .. }), "{reply:?}");
+    let grant = cluster.slot(slot).lease.expect("source grant");
+    let expiry = grant.expires_ms - nabedra_rt::sim::EPOCH_MS;
+    assert!(
+        cluster.now() + 500 < expiry,
+        "source grant already near expiry"
+    );
+    assert!(
+        cluster
+            .sample(Some(old), slot)
+            .await
+            .is_some_and(|sample| sample.authorized),
+        "retired source must still hold a live grant"
+    );
+
+    // Let the target report its verified copy and the leader plan.
+    let deadline = cluster.now() + 2 * RENEW_MS;
+    let promoted = loop {
+        let _ = cluster.renew_once(target.node).await;
+        cluster.reconcile_once().await;
+        let placement = cluster.slot(slot);
+        if placement.epoch > initial.epoch {
+            break placement;
+        }
+        assert!(cluster.now() < deadline, "staged promotion did not commit");
+        cluster.step(25).await;
+    };
+    let _ = cluster.renew_once(target.node).await;
+    cluster.sample_leases().await;
+    assert_eq!(promoted.primary, Some(target));
+    assert!(!promoted.cold);
+    if !enabled {
+        // The transition committed on the retirement proof, before the
+        // source's grant ended, and carries that grant as its start.
+        let (at, _, proof) = cluster
+            .observed
+            .lock()
+            .unwrap()
+            .staged
+            .iter()
+            .copied()
+            .find(|(_, index, _)| *index == slot)
+            .expect("committed staged proof");
+        assert_eq!(proof.fence, SourceFence::Retired);
+        assert_eq!(proof.source, old);
+        assert_eq!(proof.prior_lease, Some(grant));
+        assert!(
+            at < expiry,
+            "promotion committed at {at}, grant ends {expiry}"
+        );
+        assert_eq!(promoted.lease.unwrap().not_before_ms, grant.expires_ms);
+    }
+
+    // The retired source still accepts writes until its grant ends.
+    let _ = cluster
+        .send(
+            key,
+            Op::Set("source-after-retire".into(), None),
+            Some(old.node),
+        )
+        .await;
+    let deadline = expiry + STAGED_RESET_GRACE_MS + 2 * RENEW_MS;
+    let first_authorized = loop {
+        if cluster
+            .sample(Some(target), slot)
+            .await
+            .is_some_and(|sample| sample.authorized)
+        {
+            break cluster.now();
+        }
+        if cluster
+            .sample(Some(old), slot)
+            .await
+            .is_some_and(|sample| sample.authorized)
+        {
+            let _ = cluster
+                .send(key, Op::Set("source-live".into(), None), Some(old.node))
+                .await;
+        }
+        assert!(cluster.now() < deadline, "target never became writable");
+        cluster.step(5).await;
+    };
+    cluster.trace(format_args!(
+        "staged target writable at {first_authorized} ms, source grant ends at {expiry} ms"
+    ));
+    if !enabled {
+        assert!(
+            first_authorized >= expiry,
+            "target writable at {first_authorized}, before {expiry}"
+        );
+    }
+    // Write on both owners. Only the planted defect lets both grants overlap.
+    for (node, value) in [(target.node, "successor"), (old.node, "previous")] {
+        let _ = cluster
+            .send(key, Op::Set(value.into(), None), Some(node))
+            .await;
+    }
+    cluster.sample_leases().await;
+    cluster.step(LEASE_MS).await;
+    let _ = cluster.send(key, Op::Get, Some(target.node)).await;
+}
+
 fn trial(cluster: &Cluster, history_only: bool) -> Trial {
     let observed = cluster.observed.lock().unwrap();
     let mut violations: Vec<_> = observed
@@ -603,6 +771,28 @@ fn planted_replica_delete_history() {
 fn planted_staged_promotion_before_fence_scripted_and_search() {
     scripted(Case::UnfencedStaged);
     search(Case::UnfencedStaged);
+}
+
+#[test]
+fn planted_staged_promotion_on_retirement_scripted_and_search() {
+    scripted(Case::RetiredStaged);
+    search(Case::RetiredStaged);
+}
+
+/// R-cache-14 and decision 6: retirement alone never lets the staged target
+/// serve while the retired source's grant is live.
+#[test]
+fn staged_promotion_after_live_source_retirement_waits_for_grant() {
+    for seed in [1, 2, 3] {
+        let clean = run_case(Case::RetiredStaged, seed, false, false, true);
+        assert_clean(Case::RetiredStaged, seed, &clean);
+        let replay = run_case(Case::RetiredStaged, seed, false, false, true);
+        assert_replay(seed, &clean, &replay);
+        println!(
+            "Cache staged promotion after retirement seed {seed}: trace {:016x} events {}",
+            clean.trace_hash, clean.trace_events
+        );
+    }
 }
 
 #[test]

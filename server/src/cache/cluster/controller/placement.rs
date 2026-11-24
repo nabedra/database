@@ -61,8 +61,13 @@ pub(in crate::cache::cluster) struct StagedPromotion {
 impl StagedPromotion {
     fn cutoff(self, lower_ms: u64) -> u64 {
         #[cfg(feature = "sim")]
-        if super::super::sim::hooks::knobs().staged_ignores_fence {
-            return lower_ms;
+        {
+            let knobs = super::super::sim::hooks::knobs();
+            if knobs.staged_ignores_fence
+                || (knobs.staged_retire_is_fence && self.fence == SourceFence::Retired)
+            {
+                return lower_ms;
+            }
         }
         let _ = lower_ms;
         self.prior_lease.map_or(0, |lease| lease.expires_ms)

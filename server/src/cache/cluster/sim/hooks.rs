@@ -29,6 +29,10 @@ pub(in crate::cache::cluster) struct Knobs {
     pub cold_reset_ignores_live_lease: bool,
     pub staged_ignores_fence: bool,
     pub staged_ignores_lag: bool,
+    // Reads decision 6's first draft literally: a retired source counts as
+    // fenced, so the target's grant starts at once instead of at the
+    // source's last committed expiry (design review R-cache-14).
+    pub staged_retire_is_fence: bool,
 }
 
 pub(in crate::cache::cluster) enum Observed {
