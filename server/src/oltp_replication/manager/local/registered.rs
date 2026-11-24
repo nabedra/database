@@ -1,7 +1,7 @@
 //! Operator-pinned directory-profile multi-worker startup. This constructor
 //! proves exclusive local process/directory ownership. It does not attest an
 //! EBS/CSI mount or an AZ, and never grants queue readiness by itself.
-use super::{restore::RegisteredRestore, *};
+use super::*;
 use crate::config::ExecutionConfig;
 use crate::oltp::backup::restore::{
     OfflineRestoreTarget, RestoredGenesis, verified_restore_marker,
@@ -890,7 +890,7 @@ fn same_local_roots(previous: &SystemPlacement, next: &SystemPlacement, worker: 
 
 #[cfg(test)]
 mod status_tests {
-    use super::{restore::RegisteredRestore, *};
+    use super::*;
 
     #[test]
     fn o17_replacement_leaves_system_groups_without_the_lost_worker_unchanged() {
