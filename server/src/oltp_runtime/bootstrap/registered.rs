@@ -548,6 +548,8 @@ impl LocalServices {
             if let Some(restart) = &worker.rolling {
                 super::super::recovery_tests::pause("rolling_before_join", restart.intent.id).await;
             }
+            #[cfg(test)]
+            let probe_restart = worker.rolling.as_ref().map(|restart| restart.intent.id);
             let operator = Arc::new(worker.operator);
             system_replacement::spawn(
                 manager.clone(),
@@ -683,6 +685,10 @@ impl LocalServices {
                 "nabedra-db: registered {} queue ready revision sealed",
                 local.worker_id
             );
+            #[cfg(test)]
+            if let Some(id) = probe_restart {
+                super::super::recovery_tests::pause("probe_before_ready_fence", id).await;
+            }
             let fence = TimestampClient::new(
                 placements.timestamps.identity.clone(),
                 shared.clone(),

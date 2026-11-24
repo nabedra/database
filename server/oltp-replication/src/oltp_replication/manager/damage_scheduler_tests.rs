@@ -852,6 +852,55 @@ impl Cluster {
     }
 }
 
+/// Scratch probe for CAP1 (never shipped): on hosted workers whose sessions negotiate
+/// `nabedra-otp/4`, a Data leader proposes no `ReclaimIndex` while Control has not enabled
+/// `data.index.reclaim`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_cap1_no_reclamation_before_the_cluster_feature() {
+    use crate::oltp::mvcc::store::{ParticipantCommand, index_reclaim::ReclaimIndex};
+    use crate::oltp_replication::{authority::consensus::Consensus as _, owned::OwnedCommand};
+    timeout(Duration::from_secs(120), async {
+        let cluster = Cluster::new(1, &[]).await;
+        let leader = cluster.data_leader().await;
+        let host = cluster.data_host(leader).unwrap();
+        let mut refused = false;
+        for _ in 0..200 {
+            let command = OwnedCommand::new_owned(
+                ParticipantCommand::ReclaimIndex(ReclaimIndex {
+                    authority: cluster.authority(cluster.term),
+                    catalog_group_id: nabedra_rt::ids::uuid_v4(),
+                    table_id: nabedra_rt::ids::uuid_v4(),
+                    index_id: nabedra_rt::ids::uuid_v4(),
+                    retired_at: crate::oltp_replication::types::CommitTs::new(1).unwrap(),
+                    safe_ts: crate::oltp_replication::types::CommitTs::new(2).unwrap(),
+                    routing_version: None,
+                }),
+                &cluster.workers[leader].shared,
+                crate::oltp::pool::ByteClass::Progress,
+            )
+            .unwrap();
+            match host.propose(command).await {
+                Ok(applied) => panic!(
+                    "a ReclaimIndex entry committed at {:?} before Control enabled data.index.reclaim",
+                    applied.position
+                ),
+                Err(error) if error.message.contains("data.index.reclaim is not enabled") => {
+                    assert_eq!(error.outcome, crate::protocol::Outcome::NotApplied);
+                    refused = true;
+                    break;
+                }
+                // Not leading, or a peer session is not up yet.
+                Err(_) => nabedra_rt::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        assert!(refused, "the cluster feature refused the entry");
+        drop(host);
+        cluster.shutdown().await;
+    })
+    .await
+    .expect("probe watchdog");
+}
+
 fn invalid() -> ProtocolError {
     ProtocolError::new(ErrorCode::ValidationError, "invalid", Outcome::NotApplied)
 }
@@ -1120,6 +1169,77 @@ async fn ns23_o06_o17_ns14b_g3_journal_value_damage_is_replaced_by_control() {
     )
     .await
     .expect("NS14b G3 watchdog");
+}
+
+/// Scratch probe for ACC3-delegation (never shipped): a retained worker can finish enrollment
+/// through one voter before another applies its promotion. That voter must defer the
+/// delegation (retryable, not applied), not refuse the request as malformed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_acc3_delegation_waits_for_the_applied_promotion() {
+    use crate::oltp_replication::multiplex::Endpoint as _;
+    timeout(Duration::from_secs(120), async {
+        let cluster = Cluster::new(1, &[]).await;
+        {
+            let (raw, handle, _) = cluster.running(0).control.as_ref().unwrap();
+            let shared = cluster.workers[0].shared.clone();
+            let reads = ControlEndpoint::new(handle.clone(), shared.clone()).unwrap();
+            let hosted =
+                HostedControlEndpoint::new(reads, raw.clone(), shared, cluster.pins.clone())
+                    .unwrap();
+            let session = || {
+                AuthenticatedSession::for_test(
+                    cluster.identity(0),
+                    cluster.identity(1),
+                    cluster.control.clone(),
+                    Purpose::ControlDelegation,
+                    nabedra_rt::ids::uuid_v4(),
+                )
+            };
+            let header = |operation: &str, payload: u64| {
+                serde_json::json!({
+                    "control_consensus": operation,
+                    "to_node": raw.state.resident().node_id(),
+                    "payload_bytes": payload,
+                })
+                .to_string()
+            };
+            // The enrolled peer's ordinary session may delegate.
+            timeout(Duration::from_secs(30), async {
+                while hosted
+                    .preflight(&session(), header("barrier", 0).as_bytes())
+                    .await
+                    .is_err()
+                {
+                    nabedra_rt::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("the peer's enrollment applied");
+            // Its prepared-only session, before the directory refresh, must be deferred.
+            for (operation, payload) in [("barrier", 0), ("propose", 64)] {
+                let error = hosted
+                    .preflight(
+                        &session().recovery_only_for_test(),
+                        header(operation, payload).as_bytes(),
+                    )
+                    .await
+                    .err()
+                    .expect("a prepared-only role cannot delegate");
+                assert_eq!(
+                    (error.code, error.outcome),
+                    (
+                        ErrorCode::StorageUnavailable,
+                        crate::protocol::Outcome::NotApplied
+                    ),
+                    "{operation} from a worker whose promotion is not applied here: {}",
+                    error.message,
+                );
+            }
+        }
+        cluster.shutdown().await;
+    })
+    .await
+    .expect("probe watchdog");
 }
 
 /// NS23 / O17: the Control leader stops after the Data group enters joint

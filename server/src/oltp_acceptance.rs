@@ -93,6 +93,28 @@ fn acceptance_o01() {
     );
 }
 
+/// Scratch probe for ACC3-ready-fence (never shipped).
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "real RF3 processes and loopback mounts, run through the CI tests input"]
+fn probe_acc3_ready_fence_survives_a_timestamp_outage() {
+    let status = process_driver("probe_ready_fence.py")
+        .arg("--binary")
+        .arg(process_binary().expect("shared-build OLTP binary"))
+        .arg("--test-executable")
+        .arg(std::env::current_exe().unwrap())
+        .env(
+            "PYTHONPATH",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../orm/python/src"),
+        )
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .status();
+    assert!(
+        status.expect("launch ready-fence probe").success(),
+        "the rolling join did not survive the Timestamp outage"
+    );
+}
+
 #[test]
 #[ignore = "run through scripts/acceptance_oltp.py"]
 fn acceptance_o06() {
