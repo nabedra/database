@@ -2,16 +2,20 @@ id = "oltp-sim-bugs-direct"
 module = "oltp"
 kinds = ["S", "H"]
 # Fault-model simulation evidence. Each phase 10 reverted fix must be found by a seed in [1, 10000]
-# that reports its expected invariant or anomaly, and that seed must pass on the unpatched build.
-# Not runnable yet: until the nabedra-sim-oltp harness exists the command prints the marker below
-# and the record is not-run. It stays out of T2 so the nightly does not dispatch it.
+# that reports its expected invariant or anomaly. That seed, replayed alone on the patched build,
+# must fail the same way twice (deterministic) and leave a history; replayed on the unpatched build
+# it must pass twice. sim-bugs-run.json in the uploaded target/testing-logs/oltp-sim-bugs-direct
+# holds the seeds tried, found seed, kinds, trace hashes, history digests and patch SHA-256.
+# While the harness lacks a bug's workload, the command prints the marker below and the record is
+# not-run, never a pass. It stays out of T2 so the nightly does not dispatch it.
 guarantees = ["OLTP-G01", "OLTP-G03", "OLTP-G04", "OLTP-G07", "OLTP-G08"]
 scenarios = ["D02", "D04", "O10", "O15", "R04", "O26"]
 tiers = ["weekly", "T3"]
-command = ["python3", "scripts/testing/sim_bugs.py", "run", "--set", "direct", "--jobs", "4"]
+command = ["python3", "scripts/testing/sim_bugs.py", "run", "--set", "direct", "--jobs", "4",
+           "--sim-jobs", "4", "--out", "target/testing-logs/oltp-sim-bugs-direct"]
 cwd = "."
 timeout_s = 18000
 needs = []
 result_parser = "exit-code"
 not_run_marker = "not-run: sim-harness-missing"
-env = { RUSTFLAGS = "--cfg tokio_unstable" }
+env = { RUSTFLAGS = "--cfg tokio_unstable", RUST_MIN_STACK = "16777216" }

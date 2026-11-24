@@ -1,0 +1,17 @@
+id = "oltp-sim-bugs-regression-acc3"
+module = "oltp"
+kinds = ["U"]
+# Tooling: the ACC3 cold-fence patch, applied in a scratch worktree, makes O15 fail with its
+# recorded failure text, and O15 passes without it. O15 caught this patch in 1 of 5 patched runs
+# before the crate split (runs 45148928008 and 45150522656), so the manifest allows up to 10
+# attempts: every unpatched attempt must pass, and the first patched attempt with the expected
+# failure decides. Kept apart from oltp-sim-bugs-regression so that timing window cannot gate the
+# four deterministic library regressions. Finding the window reliably is oltp-sim-bugs-direct's job.
+guarantees = []
+scenarios = []
+tiers = ["T3"]
+command = ["python3", "scripts/testing/sim_bugs.py", "verify", "acc3-cold-fence", "--jobs", "4"]
+cwd = "."
+timeout_s = 18000
+needs = []
+result_parser = "exit-code"
