@@ -10,6 +10,7 @@ pub(crate) mod clients;
 pub(crate) mod cold;
 pub(crate) mod direct;
 pub(crate) mod moves;
+pub(crate) mod queued;
 
 use std::{collections::BTreeSet, fmt};
 
@@ -20,6 +21,7 @@ pub(crate) enum Workload {
     Direct,
     Cold,
     Move,
+    Queued,
 }
 
 /// The workloads `mixed` rotates through, in seed order.
@@ -32,6 +34,7 @@ impl Workload {
             Workload::Direct => "direct",
             Workload::Cold => "cold",
             Workload::Move => "move",
+            Workload::Queued => "queued",
         }
     }
 
@@ -41,6 +44,7 @@ impl Workload {
             Workload::Direct,
             Workload::Cold,
             Workload::Move,
+            Workload::Queued,
         ]
         .into_iter()
         .find(|workload| workload.name() == name)

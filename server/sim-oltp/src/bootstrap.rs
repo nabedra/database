@@ -98,17 +98,35 @@ fn resources() -> Value {
     })
 }
 
-fn execution() -> Value {
+/// What the queued workload varies. The other workloads use the default.
+#[derive(Clone, Copy)]
+pub(crate) struct QueueSettings {
+    pub direct_oltp: bool,
+    pub scoped_oltp: bool,
+    pub result_retention_ms: u64,
+}
+
+impl Default for QueueSettings {
+    fn default() -> Self {
+        Self {
+            direct_oltp: true,
+            scoped_oltp: false,
+            result_retention_ms: 600_000,
+        }
+    }
+}
+
+fn execution(queue: QueueSettings) -> Value {
     json!({
         "max_workers_per_request": 1,
         "max_pending_requests": 128,
         "max_queue_bytes_per_replica": 8 << 20,
         "max_retained_result_bytes_per_worker": 8 << 20,
-        "result_retention_ms": 600_000,
+        "result_retention_ms": queue.result_retention_ms,
         "queue_replication": "all_ready_workers",
         "queue_lifetime": "live_cluster",
         "partition_size": "64 MiB",
-        "direct_oltp": true,
+        "direct_oltp": queue.direct_oltp,
     })
 }
 
@@ -133,6 +151,7 @@ pub(crate) struct Bootstrap {
     enrollment_token: String,
     worker_configs: [Value; 3],
     api_enrollments: [Value; 2],
+    queue: QueueSettings,
 }
 
 impl Bootstrap {
@@ -177,7 +196,7 @@ impl Bootstrap {
                 "bind": http_addr(node),
                 "auth_file": AUTH,
                 "resources": resources(),
-                "execution": execution(),
+                "execution": execution(QueueSettings::default()),
                 "node": {
                     "format": 1,
                     "directory": ROOT,
@@ -221,7 +240,19 @@ impl Bootstrap {
             enrollment_token,
             worker_configs,
             api_enrollments,
+            queue: QueueSettings::default(),
         })
+    }
+
+    /// Choose the queue protocol and the direct path, before any process starts.
+    pub fn set_queue(&mut self, queue: QueueSettings) {
+        self.queue = queue;
+        for config in &mut self.worker_configs {
+            config["execution"] = execution(queue);
+            if queue.scoped_oltp {
+                config["node"]["scoped_oltp"] = json!(true);
+            }
+        }
     }
 
     fn identity(enrollment: &Value) -> Value {
@@ -295,9 +326,7 @@ impl Bootstrap {
     pub fn write_gateway(&self, index: usize, connection: &Value) -> io::Result<()> {
         let node = GATEWAYS[index];
         self.write_material(node)?;
-        write_json(
-            CONFIG,
-            &json!({
+        let mut config = json!({
                 "version": 1,
                 "engine": "oltp",
                 "bind": SocketAddr::from(([127, 0, 0, 1], http_addr(node).port())),
@@ -310,11 +339,14 @@ impl Bootstrap {
                     "control_peers": connection["control_peers"],
                     "enrollment": self.api_enrollment(index),
                     "worker_tls": {"cert_file": CERT, "key_file": KEY, "ca_file": CA},
-                    "direct_oltp": true,
+                    "direct_oltp": self.queue.direct_oltp,
                 },
-                "worker": {"resources": resources(), "execution": execution(), "queue_size": 128},
-            }),
-        )
+                "worker": {"resources": resources(), "execution": execution(self.queue), "queue_size": 128},
+        });
+        if self.queue.scoped_oltp {
+            config["topology"]["scoped_oltp"] = json!(true);
+        }
+        write_json(CONFIG, &config)
     }
 
     /// The current mounted identity of worker `index` (its `mount.worker` field).

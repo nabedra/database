@@ -164,21 +164,41 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     .await
     {
         Ok(mut cluster) => {
-            let startup = cluster.start().await;
+            let configured = match workload {
+                Workload::Queued => workloads::queued::configure(&mut cluster.config, seed),
+                _ => Ok(()),
+            };
+            let startup = match configured {
+                Ok(()) => cluster.start().await,
+                Err(error) => Err(error),
+            };
             assertions.insert("cluster readiness", startup.is_ok());
             match startup {
                 Ok(()) if workload != Workload::Smoke => {
-                    let report = workloads::direct::run(
-                        &mut cluster,
-                        &config,
-                        history.clone(),
-                        generator,
-                        seed,
-                        workload,
-                        &setup.selection,
-                        setup.quiet,
-                    )
-                    .await;
+                    let report = if workload == Workload::Queued {
+                        workloads::queued::run(
+                            &mut cluster,
+                            &config,
+                            history.clone(),
+                            generator,
+                            seed,
+                            &setup.selection,
+                            setup.quiet,
+                        )
+                        .await
+                    } else {
+                        workloads::direct::run(
+                            &mut cluster,
+                            &config,
+                            history.clone(),
+                            generator,
+                            seed,
+                            workload,
+                            &setup.selection,
+                            setup.quiet,
+                        )
+                        .await
+                    };
                     match report {
                         Ok(report) => {
                             for (name, passed) in report.assertions {
@@ -255,11 +275,15 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     assertions.insert("liveness", !has_violation(&checks, "Liveness"));
     let history = std::mem::take(&mut *history.lock().unwrap());
     if history.events().iter().any(|event| event.key.is_some()) {
-        let verdict = history.check_direct();
-        assertions.insert(
-            "linearizability and keyed dedup",
-            verdict.anomalies.is_empty(),
-        );
+        let (assertion, verdict) = if workload == Workload::Queued {
+            (
+                "transactions, per-key linearizability and outcomes",
+                workloads::queued::check(history.events()),
+            )
+        } else {
+            ("linearizability and keyed dedup", history.check_direct())
+        };
+        assertions.insert(assertion, verdict.anomalies.is_empty());
         checks.check_history(&world, &verdict);
     }
     let mut capture = trace.lock().unwrap();

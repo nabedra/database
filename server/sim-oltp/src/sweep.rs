@@ -301,6 +301,8 @@ fn replay_command(defect: Defect) -> String {
         "NABEDRA_SIM_WORKLOAD",
         "NABEDRA_SIM_PROFILE",
         "NABEDRA_SIM_BEYOND_TCP",
+        crate::workloads::queued::MODE_ENV,
+        crate::workloads::queued::DEFECT_ENV,
     ] {
         if let Some(value) = env(name) {
             prefix.push_str(&format!("{name}={value} "));
@@ -727,6 +729,9 @@ fn write_record(
     }
     for invariant in PROBE_INVARIANTS {
         record.not_run(invariant, "P10-PROBES integration pending");
+    }
+    for (rule, why) in crate::invariants::queued::NOT_RUN {
+        record.not_run(rule, why);
     }
     record.not_run(
         "ResourceBaseline ledger and RangeClock pending sets",

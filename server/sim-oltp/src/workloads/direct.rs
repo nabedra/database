@@ -285,7 +285,10 @@ async fn abandon(
 }
 
 /// Create the workload's table through the first gateway, retrying the same ID.
-async fn create_table(cluster: &Cluster, history: &Arc<Mutex<History>>) -> Result<String, String> {
+pub(crate) async fn create_table(
+    cluster: &Cluster,
+    history: &Arc<Mutex<History>>,
+) -> Result<String, String> {
     let node = CLIENTS[0];
     let gateway = GATEWAYS[0];
     let id = in_node(node, async { uuid_v4() }).await;
@@ -345,7 +348,7 @@ async fn create_table(cluster: &Cluster, history: &Arc<Mutex<History>>) -> Resul
 
 /// Wait for transient resource gauges to return to their baseline, or 2 s. The second pool a
 /// move mounted has no row in the baseline, so it is split off: it must reserve nothing.
-async fn settle(
+pub(crate) async fn settle(
     cluster: &Cluster,
     second: Option<SecondPool>,
 ) -> Result<(Vec<(u64, Value)>, Option<(u64, String)>), String> {
