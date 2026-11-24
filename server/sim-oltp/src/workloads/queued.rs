@@ -419,13 +419,18 @@ fn code(error: &ProtocolError) -> String {
         .unwrap_or_default()
 }
 
-/// Record the value a get returned. Only its first answer counts: a later receipt or replay
-/// repeats an old result. The read happened between the first submission and that answer.
+/// Record the values a get or a whole-table query returned. Only the first answer counts: a
+/// later receipt or replay repeats an old result. The read happened between the first
+/// submission and that answer.
 fn observe_rows(q: &Q, req: &Req, result: &Value, invoked: u64) {
-    if req.name != "table.get" {
-        return;
-    }
-    let Some(key) = req.body.anchor else { return };
+    let seen: Vec<(i64, Option<i64>)> = match (req.name, req.body.anchor) {
+        ("table.get", Some(key)) => vec![(key, result["value"].as_i64())],
+        ("query.collect", _) => rows(result)
+            .into_iter()
+            .map(|(key, value)| (key, Some(value)))
+            .collect(),
+        _ => return,
+    };
     let mut shared = q.shared.lock().unwrap();
     if !shared.read_ids.insert(req.body.id) {
         return;
@@ -439,13 +444,16 @@ fn observe_rows(q: &Q, req: &Req, result: &Value, invoked: u64) {
         .min()
         .unwrap_or(invoked)
         .min(invoked);
-    let read = Read {
-        key,
-        value: result["value"].as_i64(),
-        invoked: first,
-        completed: q.now(),
-    };
-    shared.log.reads.push(read);
+    let completed = q.now();
+    shared
+        .log
+        .reads
+        .extend(seen.into_iter().map(|(key, value)| Read {
+            key,
+            value,
+            invoked: first,
+            completed,
+        }));
 }
 
 /// Send one attempt. `asynchronous` submits through `POST /v1/requests`.
@@ -1926,6 +1934,14 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
         loop {
             let seen = lookup(q, node, GATEWAYS[index % 2], old, &open.req).await;
             abandoned += u64::from(seen == Seen::Abandoned);
+            q.count(match &seen {
+                Seen::Abandoned => "old receipt abandoned",
+                Seen::Terminal(Terminal::Succeeded(_)) => "old receipt succeeded",
+                Seen::Terminal(Terminal::Failed(_)) => "old receipt failed",
+                Seen::Missing => "old receipt missing",
+                Seen::Pending => "old receipt pending",
+                Seen::Unknown => "old receipt unknown",
+            });
             match seen {
                 Seen::Pending => {
                     // An old run's request is settled or abandoned, never pending.

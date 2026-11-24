@@ -226,6 +226,13 @@ fn an_abandoned_mutation_has_no_effect() {
     log.submissions
         .push(succeeded(body(1, 1, 1), 200, json!(null)));
     assert_eq!(kinds(&log), [RETENTION]);
+    // So does a receipt that reported success before the stop.
+    log.submissions.pop();
+    log.lookups.insert(0, lookup(1, 300, ok(json!(true))));
+    assert_eq!(kinds(&log), [RETENTION]);
+    // A success that changed no row decided nothing durable.
+    log.lookups[0] = lookup(1, 300, ok(json!(false)));
+    assert!(kinds(&log).is_empty());
 }
 
 #[test]

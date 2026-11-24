@@ -404,15 +404,29 @@ impl Log {
                     ),
                 );
             }
-            let succeeded = self.submissions.iter().find(|s| {
-                s.body == *body && matches!(s.answer, Answer::Terminal(Terminal::Succeeded(_)))
+            // A success that changed rows was a durable commit decision, wherever it was seen.
+            let answered = self.submissions.iter().find_map(|s| match &s.answer {
+                Answer::Terminal(Terminal::Succeeded(result))
+                    if s.body == *body && changed(result) =>
+                {
+                    Some(s.completed)
+                }
+                _ => None,
             });
-            if let Some(other) = succeeded {
+            let receipt = self.lookups.iter().find_map(|other| match &other.seen {
+                Seen::Terminal(Terminal::Succeeded(result))
+                    if other.run == lookup.run && other.id == lookup.id && changed(result) =>
+                {
+                    Some(other.completed)
+                }
+                _ => None,
+            });
+            if let Some(at) = answered.or(receipt) {
                 out.violate(
                     RETENTION,
                     format!(
-                        "{} was reported abandoned at {}ms and succeeded at {}ms",
-                        lookup.id, lookup.completed, other.completed
+                        "{} was reported abandoned at {}ms and succeeded at {at}ms",
+                        lookup.id, lookup.completed
                     ),
                 );
             }
