@@ -36,7 +36,8 @@ labelled as a fault model and does not replace the real-environment checks the r
 | `repeat_gate.py` | Repeat new and changed tests before they count |
 | `triage.py` | Rerun a real-environment failure under the statistical rule |
 | `ab.py` | Paired A/B performance runs of base against head on one runner |
-| `pr_lint.py` | Check the four required lines of a pull request body |
+| `pr_lint.py` | Check the four required lines of a pull request body, and the `Design:` line when the diff needs one |
+| `tla_check.py`, `tla_trace.py` | Kind T: check a design spec with the pinned TLC (baselines, coverage, mutants), and validate traces against it. See [specs/README.md](../../specs/README.md) |
 | `licenses.py` | Fail on a dependency license outside the allowlist |
 
 ### Check kinds
@@ -52,7 +53,7 @@ labelled as a fault model and does not replace the real-environment checks the r
 | R | Real environment: processes, Docker, kind or real S3 |
 | P | Performance, paired A/B only |
 | K | Soak |
-| T | TLA+ design spec and trace validation, see [design review](../../.agents/skills/design-review/SKILL.md). Not yet accepted by the tooling |
+| T | TLA+ design spec and trace validation, see [design review](../../.agents/skills/design-review/SKILL.md) and [specs](../../specs/README.md) |
 
 ### Assurance levels and tiers
 
