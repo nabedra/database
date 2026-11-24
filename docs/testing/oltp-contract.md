@@ -11,9 +11,9 @@ Use deterministic barriers, a controllable timestamp allocator, a serial operati
 | O05 | Saturate caches/native buffers and overlap scan, compaction, flush, snapshot transfer and index build | Aggregate native threads and memory remain within declared budgets, including pinned blocks and page cache measurement. Bound scan pollution, merge memory, I/O queues and disk growth. Inject allocation failures and verify unrelated work progresses. |
 | O06 | Lose quorum, delay/fsync-fail a voter, corrupt a log/checkpoint and re-elect leaders | No durable acknowledgment precedes required stable storage. Read/write authority requires the right quorum and applied state. Reject corrupt/foreign replicas. Preserve every acknowledged mutation under the stated one-AZ failure model; never fabricate availability without quorum. |
 | O07 | Single- and multi-shard batches with a failure at every prepare/decision/apply boundary | Before COMMIT, rows/indexes are private. After COMMIT, every successful snapshot read includes all relevant changes or none according to its timestamp, even when one participant has not finalized. No second decision or mutation application. Prove cross-shard duplicate-key conflicts abort the whole batch. |
-| O08 | Concurrent same-key mutations, overlapping batches, uniqueness/absence checks, create/drop and pool-space reservation races | Histories admit the specified serial order. No lost updates, invalid uniqueness, storage reservation overshoot, stale schema write, deadlock or unbounded retry. No-op and conflict results remain stable by identity. Mutations that retry recompute from the required fresh snapshot without creating another logical request. |
+| O08 | Concurrent same-key mutations, overlapping batches, uniqueness/absence checks, create/drop and pool-space reservation races | Histories admit the specified serial order. No lost updates, invalid uniqueness, storage reservation overshoot, stale schema write, deadlock or unbounded retry. No-op and row conflict results remain stable by identity: a retry with the same request ID and body returns the first definite result. On the direct path this holds while the dedup record is retained ([direct-path retry results](#direct-path-retry-results)). Mutations that retry recompute from the required fresh snapshot without creating another logical request. |
 | O09 | Timestamp allocation overlaps prepare, scans, allocator failover, old leader resume and clock jumps | Timestamp monotonicity and real-time constraints hold. Commit timestamps follow all participant prepares. Reads resolve ambiguous older intents for missing/base/index keys and cannot miss a committed insert. Cached/batched timestamps must not appear behind previously completed operations. |
-| O10 | Kill coordinator after COMMIT, delay decision responses, retry resolutions and lose terminal replication | Any authorized survivor recovers the same decision and exact result using the original identity/digest. Status-group uncertainty never becomes a locally invented ABORT or COMMIT. Receipt-race handling preserves immutable terminal records and accepted authorization snapshots. |
+| O10 | Kill coordinator after COMMIT, delay decision responses, retry resolutions and lose terminal replication | Any authorized survivor recovers the same decision and exact result using the original identity/digest. Status-group uncertainty never becomes a locally invented ABORT or COMMIT. Receipt-race handling preserves immutable terminal records and accepted authorization snapshots. On the direct path, the [retry rule](#direct-path-retry-results) also applies. |
 | O11 | Crash between Raft log sync, state batch write, applied-position update, checkpoint and log truncation | Recovery replays only the committed state that is required, with data/index/result/applied-position agreement. Repeated application is idempotent. Torn/truncated/corrupt state fails explicitly. A proposed 1PC or local/follower-read optimization must pass these and O07/O09 under its exact durability settings. |
 | O12 | Pause/fail online index build during backfill, change replay, validation and epoch publication | Queries never choose an incomplete index. Committed writes during the build are present exactly once. Recovered/restarted builds and retired index versions retain the correct snapshot behavior without unbounded RAM/disk. |
 | O13 | Saturate CPU, queue bytes/counts, retention and disk headroom while submitting valid work | Reuse Q01-Q06/M01-M03/F01-F03 assertions. Every accepted identity remains represented until terminal; overload before acceptance is explicit. Disk reserves still allow consensus/ABORT/COMMIT/settlement. No reservation leaks or invented successes after result expiry. |
@@ -132,8 +132,8 @@ queued path. Run the existing OLTP library suite, the OLTP integration tests,
 | ID | Scenario | Required assertions |
 | --- | --- | --- |
 | D01 | All eligible operations through both ORMs at RF1 and RF3 | Results, errors and types equal the queued path for the same program. Stats show zero queue copies and one Data entry per mutation. |
-| D02 | Kill the gateway after the leader proposes, then retry the same ID and body through another gateway | One committed version, the original result, one dedup record. |
-| D03 | Same ID with a different body on the same key, then on a different key | The first is a conflict. The second executes. |
+| D02 | Kill the gateway after the leader proposes, then retry the same ID and body through another gateway | One committed version, the original result, one dedup record. For a no-op or row conflict: no committed version, the first definite result, one dedup record. |
+| D03 | Same ID with a different body on the same key, then on a different key | The first is a conflict. The second executes. The [retry rule](#direct-path-retry-results) covers the same body only. |
 | D04 | Kill the leader before quorum and after quorum | No acknowledged write is lost and none applies twice. The retry completes on the new leader. |
 | D05 | Pause one follower, then two | One paused: writes succeed within the deadline. Two paused: no success response and the row is unchanged. |
 | D06 | A snapshot scan at `s` races direct commits, including across a Timestamp leader change | The scan sees every commit at or below `s` and none above. No commit appears below a snapshot that already read the range. |
@@ -178,6 +178,27 @@ A paused follower is TCP-alive but answers nothing, unlike a killed one. D05 reg
 
 D09 at RF3 needs each pool on a Docker-profile mount, because a cold start refuses a pool
 without one. Host processes get tmpfs mounts through `sudo -n` (Linux CI).
+
+### Direct-path retry results
+
+This rule (lead decision 2026-11-24, at the user's request) applies to O08, O10, D02 and D03.
+
+On the direct path, a retry of a mutation with the same request ID and body returns the
+first definite result of that identity while its dedup record is retained. That includes
+a no-op (`update` or `delete` of a missing row) and a row conflict (`insert` of a
+present row). Unknown outcomes, unavailable or overloaded answers and validation errors
+are not results and are not recorded. Reads have no identity. A dedup record is retained
+for `direct_dedup_retention_ms`, 24 h by default. Once it is deleted, a retry runs as a
+new request. The cost is a Data log entry for outcomes that commit none today, so no-ops
+and refused inserts get slower.
+
+The rule covers the same body only and leaves D03 as written for a different body.
+Recomputing a mutation that has no definite result yet (O08) is unchanged.
+
+Status: the shipped executor recomputes no-ops and row conflicts on retry today, which
+is a known gap (DR-1, draft PR #118, reproduced locally on one seed in a simulation
+fault model, not independently reviewed), and the implementation waits for a design
+review.
 
 ## Mapping to existing requirements
 
