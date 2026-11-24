@@ -1,0 +1,41 @@
+{
+  "artifacts": [
+    {
+      "name": "flake-hunt-combined-074318--oltp-initial-control-proposal.log",
+      "sha256": "ec527d5ca1aa5ee351f7c99d6f4281e92f76eb57d61bd74678fdaee08971ffcb"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-initial-control-proposal",
+  "duration_s": 156.026,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T07:08:04.197195+00:00",
+    "request_id": "flake-hunt-combined-074318",
+    "runner": "GitHub Actions 1000010449",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45342541796"
+  },
+  "scenarios": [
+    "O16",
+    "NS14"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "336c67783c6821a468f24a099a4a5f85a34444b5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "flake-hunt-combined-074318--testing-bugs.log",
+      "sha256": "3920d34a0feca6d2cb5811b1d48a1d11ac4c5591723956ff436010a4322e37ff"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "testing-bugs",
+  "duration_s": 0.065,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T07:04:25.615366+00:00",
+    "request_id": "flake-hunt-combined-074318",
+    "runner": "GitHub Actions 1000010452",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45342541796"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "336c67783c6821a468f24a099a4a5f85a34444b5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

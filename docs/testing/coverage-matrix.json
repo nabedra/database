@@ -7,8 +7,41 @@
       "K03 simulated controller disk loss is `not-run` pending modelled Raft storage."
     ]
   },
-  "head": "297e7e91af810d85cf324607c77cd4edf061afb6",
-  "ignored_records": [],
+  "head": "847e72aaf8ec482276e21c60f277e193627545cb",
+  "ignored_records": [
+    {
+      "path": "flake-hunt-combined-074318--oltp-growth-activation-repeat.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "flake-hunt-combined-074318--oltp-initial-control-proposal.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "flake-hunt-combined-074318--oltp-protected-progress-repeat.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "flake-hunt-combined-074318--oltp-queue-rejoin-ready-view.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "flake-hunt-combined-074318--oltp-queue-rejoin-repeat.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "flake-hunt-combined-074318--oltp-snapshot-atomicity-repeat.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "flake-hunt-combined-074318--rt-zero-cost.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "flake-hunt-combined-074318--testing-bugs.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -4002,5 +4035,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
