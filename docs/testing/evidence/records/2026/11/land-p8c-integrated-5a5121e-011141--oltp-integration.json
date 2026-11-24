@@ -1,0 +1,53 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p8c-integrated-5a5121e-011141--oltp-integration.log",
+      "sha256": "dd20e9b7373cbaf44342e168266c81d50b294134709fd8cbf861763df82e15b0"
+    }
+  ],
+  "assertions": {
+    "executed": 20,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "ignored",
+        "reason": "1 tests marked #[ignore]"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-integration",
+  "duration_s": 114.721,
+  "guarantees": [],
+  "kind": "U R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T01:15:34.517302+00:00",
+    "request_id": "land-p8c-integrated-5a5121e-011141",
+    "runner": "GitHub Actions 1000009159",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45303164904"
+  },
+  "scenarios": [
+    "C07",
+    "M02",
+    "O06",
+    "Q03",
+    "Q04",
+    "Q06",
+    "R01",
+    "R03",
+    "U02"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "5a5121eb41993097e9921e3f38e3a90c2285292e",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

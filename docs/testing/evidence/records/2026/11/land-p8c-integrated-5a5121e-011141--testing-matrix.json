@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p8c-integrated-5a5121e-011141--testing-matrix.log",
+      "sha256": "8eb7364d9f0ab496131b2cf879dfe0098df883b79ece24e8c87092f8f504af1e"
+    }
+  ],
+  "assertions": {
+    "executed": 75,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "testing-matrix",
+  "duration_s": 2.67,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T01:24:40.138679+00:00",
+    "request_id": "land-p8c-integrated-5a5121e-011141",
+    "runner": "GitHub Actions 1000009207",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45303164904"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "5a5121eb41993097e9921e3f38e3a90c2285292e",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
