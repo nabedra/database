@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-i-final-checks-e842431-171109--oltp-sim-net.log",
+      "sha256": "fa74fd3d744b23f1100fbe98fa2da7420b4c31369403e801d5c54e7d0753f062"
+    }
+  ],
+  "assertions": {
+    "executed": 5,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim-net",
+  "duration_s": 352.081,
+  "guarantees": [
+    "OLTP-G04"
+  ],
+  "kind": "S",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T16:17:41.509671+00:00",
+    "request_id": "p8-i-final-checks-e842431-171109",
+    "runner": "GitHub Actions 1000011898",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45434132886"
+  },
+  "scenarios": [
+    "D10"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "e842431c758b6bbf9bf57e12836b8d60f4b1401e",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
