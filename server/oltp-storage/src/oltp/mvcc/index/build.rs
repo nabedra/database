@@ -4,10 +4,9 @@ use super::*;
 use crate::oltp::{
     mvcc::{
         MvccKey,
-        catalog::{CatalogRead, IntentRef, decode_record},
+        catalog::{CatalogRead, IntentRef},
         planner::{MutationPlan, NativePlanner, PlanError, ResolveFuture},
         store::{
-            ParticipantHandle,
             index::VerifiedIndexAttemptClosed,
             lifecycle::{GuardMode, LifecycleBinding, VerifiedLifecycleGuard},
             scan::{ScanDomain, ScanPage, ScanRequest},
@@ -20,7 +19,7 @@ use crate::{
 };
 use nabedra_oltp_types::{
     owned::serialized_digest,
-    types::{Authority, Digest, MaintenanceOwnerRef, ReadTs, RequestBinding, TxnId},
+    types::{Authority, Digest, MaintenanceOwnerRef, RequestBinding, TxnId},
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -433,30 +432,6 @@ impl IndexService {
             )
             .await
     }
-    async fn row_written_since_source(
-        &self,
-        participant: &ParticipantHandle,
-        key: &MvccKey,
-        source_ts: ReadTs,
-    ) -> Result<bool, ProtocolError> {
-        // The declaration's lifecycle guard and Data fence order every writer
-        // that could omit this index before the source cut. A committed newer
-        // row version (including a tombstone) has already maintained the index
-        // in its own atomic Data write. An intent alone proves nothing.
-        let latest = ReadTs::new(u64::MAX).map_err(|_| blocked_index())?;
-        let resources = self.backend.planner().catalog().resources();
-        for _ in 0..8 {
-            let raw = participant.read_at(latest, key.clone()).await?;
-            match decode_record::<serde::de::IgnoredAny>(resources, raw).await? {
-                CatalogRead::Value { version, .. } => {
-                    return Ok(version.is_some_and(|stamp| stamp > source_ts));
-                }
-                CatalogRead::Blocked(intent) => self.backend.help(intent).await?,
-            }
-        }
-        Err(blocked_index())
-    }
-
     async fn backfill(
         &self,
         maintenance: MaintenanceOwnerRef,
@@ -577,23 +552,9 @@ impl IndexService {
                                         return Err(invalid("index source row key"));
                                     };
                                     let job = refresh_job(maintenance, primary_key)?;
-                                    let refreshed = self
-                                        .backend
+                                    self.backend
                                         .refresh(maintenance.table_id, primary_key.clone(), job)
-                                        .await;
-                                    if let Err(error) = refreshed
-                                        && (error.code != ErrorCode::Conflict
-                                            || error.outcome != Outcome::NotApplied
-                                            || !self
-                                                .row_written_since_source(
-                                                    &participant,
-                                                    &record.key,
-                                                    source.read_ts,
-                                                )
-                                                .await?)
-                                    {
-                                        return Err(error);
-                                    }
+                                        .await?;
                                     #[cfg(any(test, feature = "test-hooks"))]
                                     if crate::oltp::test_hooks::index_holds::checkpoint(
                                         maintenance.index_id,
