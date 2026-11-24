@@ -2,7 +2,7 @@
 //! so they only read their own state and draw from their own seeded stream.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -40,7 +40,17 @@ struct State {
     resets: u64,
     /// When `session-drop` reset a session.
     session_drops: Vec<u64>,
-    world: Arc<World>,
+    /// Weak: the World owns the planner that holds this state, so a strong reference would
+    /// keep the World and every mounted image alive after the run.
+    world: Weak<World>,
+}
+
+/// The World a due fault happens in. A fault that comes due without one would be missed
+/// silently, so that fails the run.
+fn running(world: &Weak<World>) -> Arc<World> {
+    world
+        .upgrade()
+        .expect("a network fault came due after its World was freed")
 }
 
 /// Shared fault windows behind the SimNet frame and HTTP profiles of one run.
@@ -48,13 +58,13 @@ struct State {
 pub(crate) struct NetFaults(Arc<Mutex<State>>);
 
 impl NetFaults {
-    pub(crate) fn install(net: &SimNet, world: Arc<World>, seed: u64) -> Self {
+    pub(crate) fn install(net: &SimNet, world: &Arc<World>, seed: u64) -> Self {
         let faults = NetFaults(Arc::new(Mutex::new(State {
             rng: stream(seed, "oltp-nemesis-net"),
             windows: Windows::default(),
             resets: 0,
             session_drops: Vec::new(),
-            world,
+            world: Arc::downgrade(world),
         })));
         let frames = faults.clone();
         net.set_frame_profile(move |frame| frames.frame(frame));
@@ -154,7 +164,7 @@ impl NetFaults {
             if *left == 0 {
                 windows.session_drop_after = None;
                 *resets += 1;
-                session_drops.push(elapsed_ms(world));
+                session_drops.push(elapsed_ms(&running(world)));
                 return NetAction::Reset;
             }
         }
@@ -213,5 +223,52 @@ impl NetFaults {
             return NetAction::Reset;
         }
         NetAction::Pass
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nabedra_rt::sim::net::ConnId;
+
+    use super::*;
+
+    fn frame() -> Frame {
+        Frame {
+            connection: ConnId(1),
+            from: Some(1),
+            to: Some(2),
+            direction: Direction::ToServer,
+            stream: 1,
+            kind: FrameKind::Request,
+        }
+    }
+
+    fn state(world: &Arc<World>) -> NetFaults {
+        NetFaults(Arc::new(Mutex::new(State {
+            rng: stream(1, "oltp-nemesis-net"),
+            windows: Windows::default(),
+            resets: 0,
+            session_drops: Vec::new(),
+            world: Arc::downgrade(world),
+        })))
+    }
+
+    /// The planner must not keep a finished run's World, and a drop that comes due without
+    /// one must not pass silently.
+    #[test]
+    fn a_due_fault_needs_its_world_and_does_not_keep_it() {
+        let (faults, world) = nabedra_sim::runtime::run(1, |world| async move {
+            let faults = state(&world);
+            faults.drop_session_after(1);
+            assert!(matches!(faults.frame(frame()), NetAction::Reset));
+            assert_eq!(faults.session_drops().len(), 1);
+            faults.drop_session_after(1);
+            (faults, Arc::downgrade(&world))
+        });
+        assert!(world.upgrade().is_none(), "the fault state kept its World");
+        let missed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            faults.frame(frame());
+        }));
+        assert!(missed.is_err(), "a missed fault passed silently");
     }
 }

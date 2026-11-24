@@ -69,7 +69,7 @@ pub(crate) async fn run(
         config.deadline(),
         plan.keys,
     );
-    let faults = NetFaults::install(cluster.net(), cluster.world.clone(), seed);
+    let faults = NetFaults::install(cluster.net(), &cluster.world, seed);
     config.jump_clocks(&cluster.world);
     let start = elapsed_ms(&cluster.world);
     let profile = selection.profile(seed);
