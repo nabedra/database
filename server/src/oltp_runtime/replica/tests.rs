@@ -194,9 +194,9 @@ async fn o14_accepted_retry_waits_for_published_ready_view() {
     }
     let version = retry.await.unwrap();
     assert_eq!(version.request_id, id);
-    assert_eq!(version.digest, hash(&body));
     for replica in [&*owner, &follower.0] {
         let replica = replica.lock().unwrap();
+        assert_eq!(replica.frame(id).unwrap().record_version().unwrap(), version);
         let record = replica.record(id).unwrap();
         assert_eq!(replica.authority(), next);
         assert_eq!(record.version, version.version);
