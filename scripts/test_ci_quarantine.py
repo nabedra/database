@@ -69,6 +69,27 @@ class RepeatTests(unittest.TestCase):
             self.assertEqual(repeat.main(['a::bad', '--log', str(log), '--executable', str(exe), '--report-only']), 0)
             self.assertIn('a::none direct_oltp=on run 1/1: not-run', log.read_text())
 
+    def test_names_route_to_the_executable_that_lists_them(self):
+        import ci_repeat_tests as repeat
+        with tempfile.TemporaryDirectory(prefix='nabedra-repeat-') as directory:
+            root = Path(directory)
+            executables = []
+            for crate, test in (('server', 'runtime::ok'), ('storage', 'oltp::ok')):
+                exe = root / crate
+                exe.write_text(f'#!{sys.executable}\nimport sys\n'
+                               f'if sys.argv[1] == "--list": print("{test}: test"); sys.exit(0)\n'
+                               f'if sys.argv[2] == "{test}": print("test result: ok. 1 passed; 0 failed; 0 ignored;")\n'
+                               'else: print("test result: ok. 0 passed; 0 failed; 0 ignored;")\n')
+                exe.chmod(0o700)
+                executables += ['--executable', str(exe)]
+            log = root / 'log'
+            self.assertEqual(repeat.main(['runtime::ok', 'oltp::ok', '--log', str(log), *executables]), 0)
+            self.assertEqual(repeat.main(['transport::missing', '--log', str(log), *executables]), 1)
+            text = log.read_text()
+            self.assertIn('oltp::ok direct_oltp=on run 1/1: passed', text)
+            self.assertIn('transport::missing direct_oltp=on run 1/1: not-run', text)
+            self.assertIn('no test executable lists transport::missing', text)
+
 
 if __name__ == '__main__':
     unittest.main()

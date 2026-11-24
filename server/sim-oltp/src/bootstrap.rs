@@ -360,8 +360,12 @@ impl Bootstrap {
     /// only the pools its bootstrap lists, so a restart without this entry can never host the
     /// replicas that live there.
     pub fn list_secondary_pool(&mut self, index: usize, mount: &Value, claim: Uuid) {
-        self.worker_configs[index]["node"]["secondary_pools"] =
-            json!([{"mount": mount, "growth_claim": claim}]);
+        let pools = &mut self.worker_configs[index]["node"]["secondary_pools"];
+        if pools.is_null() {
+            *pools = json!([]);
+        }
+        let pool = json!({"mount": mount, "growth_claim": claim});
+        pools.as_array_mut().expect("pool list").push(pool);
     }
 
     /// Move a node's secondary pool mounts to the worker identity of its next process.
@@ -383,16 +387,15 @@ impl Bootstrap {
         TlsMaterial::from_pem(cert, key, certificate_authority())
     }
 
-    /// The worker no longer has a secondary pool to open.
-    pub fn unlist_secondary_pools(&mut self, index: usize) {
-        if let Some(node) = self.worker_configs[index]["node"].as_object_mut() {
-            node.remove("secondary_pools");
+    /// The worker no longer opens this secondary pool.
+    pub fn unlist_secondary_pool(&mut self, index: usize, pool: &Value) {
+        let node = &mut self.worker_configs[index]["node"];
+        if let Some(pools) = node
+            .get_mut("secondary_pools")
+            .and_then(Value::as_array_mut)
+        {
+            pools.retain(|entry| entry["mount"]["identity"]["pool_id"] != *pool);
         }
-    }
-
-    /// The generation of worker `index`'s primary mount.
-    pub fn mount_generation(&self, index: usize) -> Value {
-        self.worker_configs[index]["node"]["mount"]["generation"].clone()
     }
 
     /// The primary pool in worker `index`'s bootstrap file.

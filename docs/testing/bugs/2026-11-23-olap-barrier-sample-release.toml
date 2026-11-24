@@ -1,0 +1,17 @@
+id = "OLAP-BARRIER-SAMPLE-RELEASE"
+title = "The barrier sample cleanup test sometimes finds a sample that is not refused, invalid or settled"
+class = "other"
+module = "olap"
+guarantees = []
+scenarios = []
+found_by = "ci-flake"
+found_date = "2026-11-23"
+lowest_regression = "node::payload_owner::installation_tests::barrier_sample_worker_cleanup_and_release_handoff"
+seed = "unknown"
+why_not_caught = "The failure is intermittent. On 16ced08f it failed in the process run and passed in the pull request gate."
+invariant_added = "After cleanup the discard and release samples are refused, the old sample is invalid and the settled sample is valid (installation_tests.rs:3484). The cause is not established."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-06"

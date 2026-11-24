@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::{clients::Ctx, direct::SecondPool};
+use super::{clients::Ctx, direct::ExtraPool};
 use crate::{
     bootstrap::{BOOTSTRAP_CLIENT, ROOT, WORKERS, initial_range},
     history::Completion,
@@ -40,6 +40,8 @@ use crate::{
 
 /// Where the secondary volumes of the moving worker are mounted, one per growth claim.
 const EXTENSION: &str = "/sim-oltp-ext";
+/// The pool the drained replica moves to.
+const REPLACEMENT: &str = "/sim-oltp-ext-replacement";
 const FINISH_LIMIT: Duration = Duration::from_secs(60);
 /// A pool closes once its last replica is gone (`drain_and_detach`).
 const CLOSE_LIMIT: Duration = Duration::from_secs(40);
@@ -88,8 +90,8 @@ pub(crate) struct Move {
     moved: Option<(Value, Value, Value)>,
     /// O26 clauses whose assertions ran.
     pub clauses: Vec<&'static str>,
-    /// When the old voters' frames were delayed, in virtual ms.
-    delayed: Option<(u64, Option<u64>)>,
+    /// When the operator mounted the pool and moved the replica, in virtual ms.
+    moving: Option<(u64, Option<u64>)>,
 }
 
 impl Move {
@@ -107,34 +109,32 @@ impl Move {
             before: None,
             moved: None,
             clauses: Vec::new(),
-            delayed: None,
+            moving: None,
         }
     }
 
-    /// The window in which the old voters' frames were delayed: a fault like any other for
-    /// the assertions that need an otherwise healthy cluster.
-    pub(crate) fn delayed(&self) -> Option<(u64, u64)> {
-        self.delayed
-            .map(|(from, to)| (from, to.unwrap_or(u64::MAX)))
-    }
-
-    /// The heal cleared every network window.
-    pub(crate) fn delay_ended(&mut self, cluster: &Cluster) {
-        if let Some((_, to)) = &mut self.delayed {
-            to.get_or_insert(elapsed_ms(&cluster.world));
-        }
+    /// The window in which the move ran. A move of the leader's own replica stops the range
+    /// for seconds without any fault (move seed 7), so an assertion about one fault alone may
+    /// not judge a request that overlaps it.
+    pub(crate) fn window(&self) -> Option<(u64, u64)> {
+        self.moving.map(|(from, to)| (from, to.unwrap_or(u64::MAX)))
     }
 
     pub(crate) fn set_faults(&mut self, faults: NetFaults) {
         self.faults = Some(faults);
     }
 
-    /// The second pool's node and device once it is mounted.
-    pub(crate) fn second_pool(&self, world: &World) -> Option<SecondPool> {
-        let node = self.node?;
-        let path = &self.claim.as_ref()?.path;
-        let info = world.volume_info(node, Path::new(path))?;
-        Some((node, info.dev))
+    /// The node and device of every pool the move mounted.
+    pub(crate) fn extra_pools(&self, world: &World) -> Vec<ExtraPool> {
+        let Some(node) = self.node else {
+            return Vec::new();
+        };
+        let claimed = self.claim.iter().map(|claim| claim.path.as_str());
+        claimed
+            .chain([REPLACEMENT])
+            .filter_map(|path| world.volume_info(node, Path::new(path)))
+            .map(|info| (node, info.dev))
+            .collect()
     }
 
     /// Advance the move by at most one operator step.
@@ -167,8 +167,8 @@ impl Move {
                 if let Some(faults) = &self.faults {
                     let old: Vec<u64> = WORKERS.into_iter().filter(|old| *old != node).collect();
                     faults.slow(Some((old, self.delay)));
-                    self.delayed = Some((elapsed_ms(&cluster.world), None));
                 }
+                self.moving = Some((elapsed_ms(&cluster.world), None));
                 cluster.record(format!("move {id} prepared on n{node}: {payload}"));
                 self.state = State::Moving {
                     id,
@@ -202,7 +202,9 @@ impl Move {
                         faults.slow(None);
                     }
                     self.state = State::Retired;
-                    self.delay_ended(cluster);
+                    if let Some((_, to)) = &mut self.moving {
+                        to.get_or_insert(elapsed_ms(&cluster.world));
+                    }
                     Ok(())
                 } else {
                     Err(format!("move {id} phase {}", result["phase"]))
@@ -356,8 +358,7 @@ impl Move {
         Ok((move_id, payload))
     }
 
-    /// After the move retired: the placement changed exactly as the move said, and the pool is
-    /// drained before it may be detached.
+    /// After the move retired: the placement changed exactly as the move said.
     pub(crate) async fn check_retired(
         &mut self,
         cluster: &mut Cluster,
@@ -408,7 +409,21 @@ impl Move {
             );
         }
         self.clauses.push("O26:pool-move");
-        self.drain(cluster, ctx, node, &mount).await
+        Ok(())
+    }
+
+    /// Drain the pool the replica moved to, once it retired.
+    pub(crate) async fn drain_pool(
+        &mut self,
+        cluster: &mut Cluster,
+        ctx: &Ctx,
+    ) -> Result<(), String> {
+        match (&self.state, self.node, self.moved.clone()) {
+            (State::Retired, Some(node), Some((_, _, mount))) => {
+                self.drain(cluster, ctx, node, &mount).await
+            }
+            _ => Err("the replica move did not retire".into()),
+        }
     }
 
     /// `drain_and_detach` of the acceptance test: a pool with a live replica may not be
@@ -472,9 +487,12 @@ impl Move {
             );
         }
 
-        // Move the replica back to the primary pool.
+        // Move the replica to a replacement pool.
         let worker = worker_of(node);
         let identity = cluster.config.worker_identity(worker);
+        let policy = self.claim.as_ref().map(|claim| claim.policy_id);
+        let policy = policy.ok_or("no growth policy")?;
+        let replacement = add_replacement(cluster, node, policy).await?;
         let (group, current) = placement(cluster, ctx).await?;
         let members = sorted(&current);
         let source = members
@@ -490,11 +508,11 @@ impl Move {
             .unwrap_or(0)
             + 1;
         target["node_id"] = json!(next);
-        target["pool_id"] = cluster.config.pool(worker);
+        target["pool_id"] = replacement["identity"]["pool_id"].clone();
         let payload = json!({
             "group": group, "expected_generation": current["record"]["generation"],
             "remove_node": source["node_id"], "target": target, "worker": identity,
-            "pool_generation": cluster.config.mount_generation(worker),
+            "pool_generation": replacement["generation"],
         });
         let move_id = cluster.split_id().await;
         let deadline = cluster.world.elapsed() + FINISH_LIMIT;
@@ -513,7 +531,7 @@ impl Move {
                 _ if cluster.world.elapsed() >= deadline => {
                     let last = answer.map(|answer| shown(&answer));
                     return Err(format!(
-                        "the replica did not move back within {FINISH_LIMIT:?}: {last:?}"
+                        "the replica did not leave the draining pool within {FINISH_LIMIT:?}: {last:?}"
                     ));
                 }
                 _ => time::sleep(RETRY).await,
@@ -553,7 +571,8 @@ impl Move {
                 format!("the pool closed as {closed}, permit {}", shown(&permit)),
             );
         }
-        cluster.config.unlist_secondary_pools(worker);
+        let drained = &mount["identity"]["pool_id"];
+        cluster.config.unlist_secondary_pool(worker, drained);
         self.clauses.push("O26:drain");
         Ok(())
     }
@@ -583,6 +602,51 @@ impl Move {
         }
         Ok(())
     }
+}
+
+/// `add_pool`: claim, attempt, provision and mount one more pool on the worker.
+async fn add_replacement(cluster: &mut Cluster, node: u64, policy: Uuid) -> Result<Value, String> {
+    let worker = worker_of(node);
+    let identity = cluster.config.worker_identity(worker);
+    let [pool_id, claim] = in_node(BOOTSTRAP_CLIENT, async { [(); 2].map(|()| uuid_v4()) }).await;
+    cluster.world.mount(node, REPLACEMENT);
+    let mount = in_node(node, async {
+        cluster.config.secondary_pool(worker, REPLACEMENT, pool_id)
+    })
+    .await
+    .map_err(|error| format!("write the replacement volume marker: {error}"))?;
+    let intent = json!({
+        "policy_id": policy, "claim_id": claim, "worker": identity, "pool_id": pool_id,
+        "pool_generation": mount["generation"], "quoted_monthly_cost": 1,
+        "monthly_spend_ceiling": 30, "max_attempts": 3, "cooldown_seconds": 1,
+        "action": {
+            "kind": "add_pool", "worker": identity["worker_id"],
+            "zone": format!("fixture-{node}"), "bytes": 1_u64 << 30,
+        },
+    });
+    let resource = mount["provider_volume_id"].clone();
+    let steps = [
+        ("storage.growth.claim", json!({"intent": intent})),
+        ("storage.growth.attempt", json!({"claim_id": claim})),
+        (
+            "storage.growth.provisioned",
+            json!({"claim_id": claim, "resource_id": resource}),
+        ),
+        (
+            "storage.growth.mounted",
+            json!({"claim_id": claim, "mount": mount}),
+        ),
+    ];
+    let mut last = Value::Null;
+    for (name, payload) in steps {
+        let id = cluster.split_id().await;
+        last = cluster.admin_with_id(&[node], id, name, payload).await?;
+    }
+    if last["phase"] != "complete" {
+        return Err(format!("the replacement pool is not mounted: {last}"));
+    }
+    cluster.config.list_secondary_pool(worker, &mount, claim);
+    Ok(mount)
 }
 
 fn worker_of(node: u64) -> usize {

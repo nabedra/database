@@ -1,0 +1,17 @@
+id = "CACHE-K03-DOCKER-PLACEMENT"
+title = "The K03 Docker fleet did not commit a ready placement before the online move"
+class = "other"
+module = "cache"
+guarantees = ["CACHE-G05", "CACHE-G06"]
+scenarios = ["K03"]
+found_by = "ci-flake"
+found_date = "2026-11-23"
+lowest_regression = "check cache-cluster-real (scripts/cache-acceptance/cluster.py history, wait_placement)"
+seed = "unknown"
+why_not_caught = "The check repeats the fleet five times. The first repetition passed in each failed run on 16ced08f and e842431c, and the second timed out."
+invariant_added = "Every one of the five K03 fleet repetitions commits a ready placement within the fixture's deadline. The cause is not established, so this may be a fixture deadline or a controller fault."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-07"
