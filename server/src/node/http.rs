@@ -8,6 +8,7 @@ use crate::{
         controller::OwnershipObservation, member::Node, startup_material::files::TlsMaterial,
         state::Control,
     },
+    network::connector,
     protocol::{ErrorCode, Outcome, ProtocolError},
     storage::{RuntimeStore, Storage},
     worker_pool::WorkerPool,
@@ -18,10 +19,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use hyper_rustls::HttpsConnector;
-use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
-    rt::TokioExecutor,
-};
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use nabedra_rt::time::{Instant, timeout_at};
 use sha2::{Digest, Sha256};
 use std::{
@@ -175,7 +173,7 @@ pub(crate) async fn load_root(
 
 #[derive(Clone)]
 pub(crate) struct HttpClient {
-    client: Client<HttpsConnector<HttpConnector>, Body>,
+    client: Client<HttpsConnector<connector::HttpConnector>, Body>,
 }
 impl HttpClient {
     pub(crate) fn new(material: Option<&TlsMaterial>) -> Result<Self> {
@@ -189,9 +187,7 @@ impl HttpClient {
         .map_err(|_| invalid())?
         .with_root_certificates(roots)
         .with_no_client_auth();
-        let mut connector = HttpConnector::new();
-        connector.enforce_http(false);
-        connector.set_connect_timeout(Some(Duration::from_secs(5)));
+        let connector = connector::new(Duration::from_secs(5));
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls)
             .https_or_http()

@@ -41,7 +41,7 @@ pub mod node;
 #[cfg(feature = "olap")]
 pub mod olap_export;
 #[cfg(feature = "oltp")]
-pub mod oltp;
+pub use nabedra_oltp_storage::oltp;
 #[cfg(all(test, feature = "oltp"))]
 mod oltp_acceptance;
 #[cfg(feature = "oltp")]

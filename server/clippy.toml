@@ -4,7 +4,8 @@
 #
 # Enforcement: the `clippy` job of .github/workflows/nabedra-build.yml (a base job, so
 # also the PR gate) runs clippy with `-D clippy::disallowed_methods` on the server for
-# every product feature set and on nabedra-rt; the `kv` job runs nabedra-kv with
+# every product feature set and on the extracted library crates, including
+# nabedra-oltp-storage. The `kv` job runs nabedra-kv with
 # `-D warnings`. The clippy job names packages with `-p` and `--no-deps`, so the dev-only
 # crates are not held to these bans: nabedra-check (its evidence records carry
 # real dates) and the simulation crates (nabedra-sim, later nabedra-sim-oltp), which

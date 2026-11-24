@@ -1,0 +1,15 @@
+# Reproduced in Actions run 45328759638, job 138229132693, on db493b497697a605a2d555d78c40f09bc039c38f.
+id = "O02-storage-test-executable"
+title = "O02 could not discover the moved NS22 storage assertion"
+class = "other"
+module = "oltp"
+guarantees = []
+scenarios = ["O02", "NS22"]
+found_by = "acceptance"
+found_date = "2026-11-24"
+seed = "unknown"
+lowest_regression = ".github/workflows/nabedra-build.yml O02 unpack and native fixture execution"
+why_not_caught = "The shared build packaged storage and the base feature job compiled every engine. Only the O02 process job omitted the storage executable."
+invariant_added = "The O02 job checks the NS22 selector in the packaged storage executable before the process scenario executes it."
+fix_commits = ["1f6141ee5a36175ea4bd25730ad7ffef41879145"]
+revert_patch_ok = false

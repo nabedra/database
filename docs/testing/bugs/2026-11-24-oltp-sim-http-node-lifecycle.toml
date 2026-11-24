@@ -1,0 +1,15 @@
+id = "OLTP-sim-http-node-lifecycle"
+title = "Simulated API requests kept running while their node was frozen"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G04"]
+scenarios = ["D10"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "server/src/oltp_runtime/api_process.rs::sim_net_tests::sim_net_reaches_oltp_handler"
+seed = 1
+trace_hash = "d3b43616e06da918"
+why_not_caught = "The readiness fixture proved that the handler saw its node ID. It did not wake an in-flight request while the API was frozen."
+invariant_added = "The network fixture completes a readiness call through the internal HTTP connector, freezes the API node with a second call in flight, wakes the handler and requires it to stay stopped through the crash."
+fix_commits = ["88d05b9612c76b59d08e3f3f435d954721848a24"]
+revert_patch_ok = true

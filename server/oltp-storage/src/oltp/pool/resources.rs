@@ -1,0 +1,1157 @@
+//! Worker-owned physical execution and native-memory resources.
+use crate::{oltp::read_attempt::ReadAttempts, protocol::ProtocolError};
+use nabedra_resources::{
+    config::{ExecutionConfig, WorkerResources},
+    scheduling::{MemoryCharge, ResourceScheduler},
+};
+use nabedra_resources::memory::WorkerMemory;
+pub use nabedra_resources::memory::{
+    ByteClass, ChargedBuffer, ChargedBytes, ExecutionClass, ScratchLease, SharedResourceConfig,
+};
+pub(super) use nabedra_resources::memory::{ByteReservation, ScratchBuffer, capacity};
+pub(crate) use nabedra_resources::memory::{
+    DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease,
+};
+#[cfg(any(test, feature = "test-hooks"))]
+pub use nabedra_resources::memory::RAFT_REPLICA_BYTES;
+use serde::Serialize;
+use std::{
+    any::Any,
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
+    thread::{self, JoinHandle},
+};
+use uuid::Uuid;
+static WORKERS: Mutex<BTreeMap<Uuid, Weak<WorkerSharedResources>>> = Mutex::new(BTreeMap::new());
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
+
+/// One owner per worker, shared by all volumes, groups and RAM queue accounting.
+/// The scheduler ID is not a permanent Raft node ID or worker enrollment UUID.
+pub struct WorkerSharedResources {
+    /// Block cache, memtable budget and flush/compaction threads of every pool.
+    pub(super) storage: super::storage::NativeStorage,
+    next_native_job: AtomicU64,
+    /// Native jobs prepared per class (Query, Control), for tests that
+    /// count a request's handoffs (PERF2b).
+    #[cfg(any(test, feature = "test-hooks"))]
+    native_jobs: [AtomicU64; 2],
+    thread_budget: super::super::NativeThreadBudget,
+    #[doc(hidden)]
+    pub read_attempts: ReadAttempts,
+    read_replica: OnceLock<Box<dyn Any + Send + Sync>>,
+    read_queue: OnceLock<Box<dyn Any + Send + Sync>>,
+    worker_id: Mutex<Option<Uuid>>,
+    query: NativeExecutor,
+    control: NativeExecutor,
+    queue_claim: Arc<AtomicBool>,
+    memory: Arc<WorkerMemory>,
+    leases: Arc<NativeLeases>,
+}
+
+impl nabedra_resources::memory::ResourceOwner for WorkerSharedResources {
+    #[inline]
+    fn worker_memory(&self) -> &Arc<WorkerMemory> {
+        &self.memory
+    }
+
+    fn bind_worker(self: &Arc<Self>, worker_id: Uuid) -> Result<(), ProtocolError> {
+        WorkerSharedResources::bind_worker(self, worker_id)
+    }
+}
+
+#[derive(Serialize)]
+#[doc(hidden)]
+pub struct BlockCacheUsage {
+    configured_bytes: usize,
+    usage_bytes: usize,
+    pinned_bytes: usize,
+}
+
+impl std::ops::Deref for WorkerSharedResources {
+    type Target = WorkerMemory;
+
+    #[inline]
+    fn deref(&self) -> &WorkerMemory {
+        &self.memory
+    }
+}
+
+impl WorkerSharedResources {
+    pub fn new(
+        scheduler_node_id: u64,
+        limits: WorkerResources,
+        config: SharedResourceConfig,
+    ) -> Result<Arc<Self>, ProtocolError> {
+        limits.validate().map_err(|_| capacity())?;
+        if config.query_threads == 0
+            || config.control_threads == 0
+            || !(2..=128).contains(&config.background_threads)
+            || config.query_threads as u64 > limits.max_threads
+            || config.control_threads > 16
+            || config.cache_bytes < 1 << 20
+            || config.write_buffer_bytes < 1 << 20
+            || config.control_bytes == 0
+            || config.apply_bytes_per_slot == 0
+            || config.query_reply_bytes == 0
+            || config.control_reply_bytes == 0
+            || config.reply_decode_bytes == 0
+            || config.data_apply_reply_bytes == 0
+            || config.progress_bytes == 0
+            || config.progress_bytes >= config.control_bytes
+            || config.control_bytes as u64 > limits.task_memory_limit_bytes
+            || config.max_open_pools == 0
+            || config.max_group_handles == 0
+            || config.max_resident_groups == 0
+            || [
+                config.max_open_pools,
+                config.max_group_handles,
+                config.max_resident_groups,
+            ]
+            .iter()
+            .any(|&n| n > Semaphore::MAX_PERMITS)
+        {
+            return Err(capacity());
+        }
+        let scheduler = ResourceScheduler::new(vec![(
+            scheduler_node_id,
+            WorkerResources {
+                max_threads: config.query_threads as u64,
+                ..limits
+            },
+        )])?;
+        // Stack reservation and native overhead are conservative logical charges.
+        // The OS page cache and allocator RSS still require measured deployment limits.
+        let thread_budget = super::super::NativeThreadBudget::with_pools(
+            config.query_threads,
+            config.control_threads,
+            config.background_threads,
+            config.max_open_pools,
+        )?;
+        let native_bytes = config
+            .cache_bytes
+            .checked_add(config.write_buffer_bytes)
+            .and_then(|n| n.checked_add(thread_budget.total_stack_reservation_bytes))
+            .and_then(|n| n.checked_add(16 << 20))
+            .ok_or_else(capacity)?;
+        let memory = Arc::new(WorkerMemory::new(
+            config,
+            scheduler,
+            scheduler_node_id,
+            limits.task_memory_limit_bytes as usize,
+            native_bytes,
+        )?);
+        let owner = Arc::new(Self {
+            storage: super::storage::NativeStorage::new(
+                config.cache_bytes,
+                config.write_buffer_bytes,
+                config.background_threads as usize,
+            )?,
+            next_native_job: AtomicU64::new(1),
+            #[cfg(any(test, feature = "test-hooks"))]
+            native_jobs: Default::default(),
+            thread_budget,
+            read_attempts: Default::default(),
+            read_replica: OnceLock::new(),
+            read_queue: OnceLock::new(),
+            worker_id: Mutex::new(None),
+            query: NativeExecutor::new(config.query_threads, "oltp-query")?,
+            control: NativeExecutor::new(config.control_threads, "oltp-control")?,
+            queue_claim: Arc::new(AtomicBool::new(false)),
+            memory,
+            leases: Arc::new(NativeLeases::default()),
+        });
+        let weak: Weak<Self> = Arc::downgrade(&owner);
+        owner.memory.bind_owner(weak);
+        Ok(owner)
+    }
+    pub fn reply_waiters(&self, class: ExecutionClass) -> usize {
+        self.memory.reply_waiters(class)
+    }
+
+    pub fn apply_bytes_used(&self) -> usize {
+        self.memory.apply_bytes_used()
+    }
+
+    pub fn scheduler(&self) -> ResourceScheduler {
+        self.memory.scheduler()
+    }
+
+    pub fn task_memory_limit_bytes(&self) -> usize {
+        self.memory.task_memory_limit_bytes()
+    }
+
+    pub fn scheduler_node_id(&self) -> u64 {
+        self.memory.scheduler_node_id()
+    }
+
+    pub fn control_bytes_used(&self) -> usize {
+        self.memory.control_bytes_used()
+    }
+
+    /// The multi-Raft owner must hold this through task termination. A storage
+    /// handle going inactive never releases an advertised voter's residency.
+    pub fn reserve_group_residency(&self) -> Result<OwnedSemaphorePermit, ProtocolError> {
+        self.memory.reserve_group_residency()
+    }
+
+    /// Actual live Raft task owners are bounded separately from registered
+    /// endpoint groups. A relocation learner may share the logical group ID,
+    /// but it still consumes its own task capacity until joined shutdown.
+    pub fn reserve_replica_residency(&self) -> Result<OwnedSemaphorePermit, ProtocolError> {
+        self.memory.reserve_replica_residency()
+    }
+
+    pub(crate) fn lease_group_residency(&self) -> Result<GroupCapacityLease, ProtocolError> {
+        self.memory.lease_group_residency()
+    }
+
+    pub(crate) fn lease_replica_residency(&self) -> Result<GroupCapacityLease, ProtocolError> {
+        self.memory.lease_replica_residency()
+    }
+
+    pub(super) fn reserve_group_handle(&self) -> Result<GroupCapacityLease, ProtocolError> {
+        self.memory.reserve_group_handle()
+    }
+
+    pub fn buffer_bytes_used(&self, class: ByteClass) -> usize {
+        self.memory.buffer_bytes_used(class)
+    }
+
+    pub fn allocate_bytes(
+        &self,
+        class: ByteClass,
+        len: usize,
+    ) -> Result<ChargedBuffer, ProtocolError> {
+        self.memory.allocate_bytes(class, len)
+    }
+
+    #[inline]
+    pub fn reserve_scratch(
+        &self,
+        class: ByteClass,
+        bytes: usize,
+    ) -> Result<ScratchLease, ProtocolError> {
+        self.memory.reserve_scratch(class, bytes)
+    }
+
+    /// Planning may retain bounded derived keys/maps beyond the decoded body.
+    /// Add only the missing working charge before those copies are allocated.
+    pub(crate) fn ensure_scratch_budget(
+        &self,
+        current: Arc<ScratchLease>,
+        required: usize,
+    ) -> Result<Arc<ScratchLease>, ProtocolError> {
+        self.memory.ensure_scratch_budget(current, required)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn reset_working_decode_peak(&self) {
+        self.memory.reset_working_decode_peak()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn peak_working_decode_bytes(&self) -> usize {
+        self.memory.peak_working_decode_bytes()
+    }
+
+    pub fn working_decode_bytes(&self) -> usize {
+        self.memory.working_decode_bytes()
+    }
+
+    pub fn copy_bytes(&self, bytes: &[u8]) -> Result<ChargedBytes, ProtocolError> {
+        self.memory.copy_bytes(bytes)
+    }
+
+    #[inline]
+    pub fn copy_bytes_in(
+        &self,
+        class: ByteClass,
+        bytes: &[u8],
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.memory.copy_bytes_in(class, bytes)
+    }
+
+    pub fn encode<T: Serialize>(
+        &self,
+        value: &T,
+        max_bytes: usize,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.memory.encode(value, max_bytes)
+    }
+
+    pub fn encode_in<T: Serialize>(
+        &self,
+        class: ByteClass,
+        value: &T,
+        max_bytes: usize,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.memory.encode_in(class, value, max_bytes)
+    }
+
+    pub(super) fn reserve_bytes_in(
+        &self,
+        class: ByteClass,
+        bytes: usize,
+    ) -> Result<ByteReservation, ProtocolError> {
+        self.memory.reserve_bytes_in(class, bytes)
+    }
+
+    #[inline]
+    pub(super) async fn reply_budget(
+        &self,
+        class: ExecutionClass,
+        bytes: usize,
+    ) -> Result<ByteReservation, ProtocolError> {
+        self.memory.reply_budget(class, bytes).await
+    }
+
+    /// Reply decoding cannot borrow the raw-reply arena: fully occupied raw
+    /// replies would otherwise wait on their own release. This separately
+    /// reserved ceiling retains decoded DTOs through responders and clones.
+    /// Acquire it before native codec execution, and bound the lexical/DTO
+    /// allocation estimate before deserializing.
+    #[inline]
+    pub(super) async fn data_apply_reply_budget(
+        &self,
+        bytes: usize,
+    ) -> Result<ByteReservation, ProtocolError> {
+        self.memory.data_apply_reply_budget(bytes).await
+    }
+
+    pub fn data_apply_reply_bytes_used(&self) -> usize {
+        self.memory.data_apply_reply_bytes_used()
+    }
+
+    pub async fn reserve_reply_decode(&self, bytes: usize) -> Result<ScratchLease, ProtocolError> {
+        self.memory.reserve_reply_decode(bytes).await
+    }
+
+    pub fn reply_decode_bytes_used(&self) -> usize {
+        self.memory.reply_decode_bytes_used()
+    }
+
+    pub async fn reserve_scratch_wait(
+        &self,
+        class: ByteClass,
+        bytes: usize,
+        request: u64,
+    ) -> Result<ScratchLease, ProtocolError> {
+        self.memory
+            .reserve_scratch_wait(class, bytes, request)
+            .await
+    }
+
+    pub(super) fn pool_overhead(&self) -> Result<MemoryCharge, ProtocolError> {
+        self.memory.pool_overhead()
+    }
+
+    pub(crate) fn validate_registered_group_capacity(
+        &self,
+        execution: &ExecutionConfig,
+        configured_pools: usize,
+        system_groups: usize,
+    ) -> Result<(), ProtocolError> {
+        self.memory
+            .validate_registered_group_capacity(execution, configured_pools, system_groups)
+    }
+
+    pub fn config(&self) -> SharedResourceConfig {
+        self.memory.config()
+    }
+
+    pub(crate) fn resident_group_usage(&self) -> (usize, usize) {
+        self.memory.resident_group_usage()
+    }
+
+    pub fn native_baseline_bytes(&self) -> u64 {
+        self.memory.native_baseline_bytes()
+    }
+
+    pub(super) fn reserve_pool_slot(&self) -> Result<OwnedSemaphorePermit, ProtocolError> {
+        self.memory.reserve_pool_slot()
+    }
+
+    #[doc(hidden)]
+    pub fn request_actor_bytes(execution: &ExecutionConfig) -> Option<u64> {
+        WorkerMemory::request_actor_bytes(execution)
+    }
+
+    /// Bind the one physical worker accounting owner before pools or queue
+    /// enrollment. A second live owner cannot reset that worker's limits.
+    pub fn bind_worker(self: &Arc<Self>, worker_id: Uuid) -> Result<(), ProtocolError> {
+        if worker_id.is_nil() {
+            return Err(capacity());
+        }
+        let mut workers = WORKERS.lock().map_err(|_| capacity())?;
+        workers.retain(|_, owner| owner.strong_count() > 0);
+        if let Some(other) = workers.get(&worker_id).and_then(Weak::upgrade)
+            && !Arc::ptr_eq(&other, self)
+        {
+            return Err(capacity());
+        }
+        let mut current = self.worker_id.lock().map_err(|_| capacity())?;
+        if current.is_some_and(|id| id != worker_id) {
+            return Err(capacity());
+        }
+        *current = Some(worker_id);
+        workers.insert(worker_id, Arc::downgrade(self));
+        Ok(())
+    }
+    #[doc(hidden)]
+    pub fn bind_read_replica<T: Send + Sync + 'static>(
+        &self,
+        replica: &Arc<T>,
+    ) -> Result<(), ProtocolError> {
+        self.read_replica
+            .set(Box::new(Arc::downgrade(replica)))
+            .map_err(|_| capacity())
+    }
+
+    #[doc(hidden)]
+    pub fn read_replica<T: Send + Sync + 'static>(
+        &self,
+    ) -> Result<Arc<T>, ProtocolError> {
+        self.read_replica
+            .get()
+            .and_then(|slot| slot.downcast_ref::<Weak<T>>())
+            .and_then(Weak::upgrade)
+            .ok_or_else(capacity)
+    }
+
+    #[doc(hidden)]
+    pub fn bind_read_queue<T: Send + Sync + 'static>(
+        &self,
+        queue: &Arc<T>,
+    ) -> Result<(), ProtocolError> {
+        self.read_queue
+            .set(Box::new(Arc::downgrade(queue)))
+            .map_err(|_| capacity())
+    }
+
+    #[doc(hidden)]
+    pub fn read_queue<T: Send + Sync + 'static>(
+        &self,
+    ) -> Result<Arc<T>, ProtocolError> {
+        self.read_queue
+            .get()
+            .and_then(|slot| slot.downcast_ref::<Weak<T>>())
+            .and_then(Weak::upgrade)
+            .ok_or_else(capacity)
+    }
+
+    pub fn worker_id(&self) -> Option<Uuid> {
+        *self.worker_id.lock().expect("worker enrollment state")
+    }
+
+    /// The one physical queue owner contains every database scope under shared
+    /// count/byte/result ceilings. A scoped wrapper must not create another owner.
+    pub fn claim_queue(self: &Arc<Self>) -> Result<QueueLease, ProtocolError> {
+        if self.worker_id().is_none() || self.leases.state.lock().map_err(|_| capacity())?.closed {
+            return Err(capacity());
+        }
+        self.queue_claim
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| capacity())?;
+        Ok(QueueLease {
+            owner: self.clone(),
+        })
+    }
+    /// Zero denotes an independent internal phase, not one shared logical
+    /// request. Give those phases distinct caps so free native lanes can run.
+    pub(crate) fn next_native_request_id(&self) -> Result<u64, ProtocolError> {
+        let mut current = self.next_native_job.load(Ordering::Relaxed);
+        loop {
+            let next = current
+                .checked_add(1)
+                .filter(|n| *n < (1u64 << 63))
+                .ok_or_else(capacity)?;
+            match self.next_native_job.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(current | (1u64 << 63)),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+    #[doc(hidden)]
+    pub fn block_cache_usage(&self) -> BlockCacheUsage {
+        BlockCacheUsage {
+            configured_bytes: self.config().cache_bytes,
+            usage_bytes: self.storage.cache.usage_bytes(),
+            pinned_bytes: self.storage.cache.pinned_bytes(),
+        }
+    }
+    /// Store counters of every open pool on this worker (`/v1/runtime/stats`).
+    #[doc(hidden)]
+    pub fn storage_stats(&self) -> super::StorageStats {
+        self.storage.stats()
+    }
+    #[doc(hidden)]
+    pub fn storage_reservations(&self) -> Vec<super::disk::DiskReservationStats> {
+        self.storage.disk_stats()
+    }
+    pub fn thread_budget(&self) -> super::super::NativeThreadBudget {
+        self.thread_budget
+    }
+    pub async fn prepare(
+        self: &Arc<Self>,
+        class: ExecutionClass,
+    ) -> Result<PreparedNative, ProtocolError> {
+        {
+            let mut state = self.leases.state.lock().map_err(|_| capacity())?;
+            if state.closed {
+                return Err(capacity());
+            }
+            state.count += 1;
+        }
+        let mut lease = NativeLease {
+            permit: None,
+            owner: self.clone(),
+            settlement: NativeSettlement(self.leases.clone()),
+        };
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.native_jobs[class as usize].fetch_add(1, Ordering::Relaxed);
+        let executor = match class {
+            ExecutionClass::Query => &self.query,
+            ExecutionClass::Control => &self.control,
+        };
+        let permit = executor
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| capacity())?;
+        lease.permit = Some(permit);
+        Ok(PreparedNative { class, lease })
+    }
+    /// Native jobs prepared so far in `class`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn native_jobs(&self, class: ExecutionClass) -> u64 {
+        self.native_jobs[class as usize].load(Ordering::Relaxed)
+    }
+    /// Close admission and wait for prepared and dispatched native work.
+    /// A dispatched job settles after it returns its guards to a live caller
+    /// or drops them after cancellation. Callers must release their own guards.
+    pub async fn drain(&self) {
+        {
+            let mut state = self.leases.state.lock().expect("native lease state");
+            state.closed = true;
+            self.query.slots.close();
+            self.control.slots.close();
+            self.memory.close_reply_arenas();
+        }
+        loop {
+            let notified = self.leases.settled.notified();
+            if self.leases.state.lock().expect("native lease state").count == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+    /// Physical capacity precedes CPU admission, even with a caller Tokio
+    /// runtime whose blocking pool has only one thread.
+    pub async fn execute<T: Send + 'static>(
+        self: &Arc<Self>,
+        class: ExecutionClass,
+        request: u64,
+        task_bytes: u64,
+        work: impl FnOnce() -> Result<T, ProtocolError> + Send + 'static,
+    ) -> Result<T, ProtocolError> {
+        use nabedra_resources::perf_stage;
+        let started = nabedra_rt::time::now_std();
+        let prepared = self.prepare(class).await?;
+        let grant = prepared.reserve_compute(request, task_bytes).await?;
+        let admitted = nabedra_rt::time::now_std();
+        let result = prepared.run_with_guard(grant, work).await;
+        match class {
+            ExecutionClass::Query => {
+                perf_stage!("native.query.admit").record(admitted - started);
+                perf_stage!("native.query.run").since(admitted);
+            }
+            ExecutionClass::Control => {
+                perf_stage!("native.control.admit").record(admitted - started);
+                perf_stage!("native.control.run").since(admitted);
+            }
+        }
+        result?.0
+    }
+}
+
+pub struct QueueLease {
+    owner: Arc<WorkerSharedResources>,
+}
+impl Drop for QueueLease {
+    fn drop(&mut self) {
+        self.owner.queue_claim.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Default)]
+struct NativeLeases {
+    state: Mutex<LeaseState>,
+    settled: Notify,
+}
+#[derive(Default)]
+struct LeaseState {
+    closed: bool,
+    count: usize,
+}
+struct NativeLease {
+    permit: Option<OwnedSemaphorePermit>,
+    owner: Arc<WorkerSharedResources>,
+    settlement: NativeSettlement,
+}
+/// Tracks job settlement without keeping the worker or its executor alive.
+struct NativeSettlement(Arc<NativeLeases>);
+impl Drop for NativeSettlement {
+    fn drop(&mut self) {
+        self.0.state.lock().expect("native lease state").count -= 1;
+        self.0.settled.notify_waiters();
+    }
+}
+pub struct NativeComputeGuard {
+    _reservation: Option<crate::scheduling::Reservation>,
+}
+pub struct PreparedNative {
+    class: ExecutionClass,
+    lease: NativeLease,
+}
+impl PreparedNative {
+    pub(super) async fn buffers(
+        &self,
+        budget: super::TransactionBudget,
+        output: ByteReservation,
+    ) -> Result<(ByteReservation, ByteReservation, ByteReservation), ProtocolError> {
+        let owner = &self.lease.owner;
+        let working = budget
+            .scratch_bytes
+            .checked_add(budget.batch_bytes)
+            .ok_or_else(capacity)?;
+        // Reply capacity was acquired without a physical or CPU permit. Every
+        // active native slot owns this bounded working maximum, but a finished
+        // write hands its batch charge to the journal, which drops it only once
+        // the write is visible, after this slot was released. Wait for it: a
+        // failed reservation here would fail a committed Raft apply, which is
+        // fatal to the replica (T7b, D07).
+        let mut all = owner.memory.reserve_apply(self.class, working).await?;
+        let scratch = all.split(budget.scratch_bytes)?;
+        let batch = all.split(budget.batch_bytes)?;
+        Ok((scratch, batch, output))
+    }
+    pub async fn execute<T: Send + 'static>(
+        self,
+        request: u64,
+        task_bytes: u64,
+        work: impl FnOnce() -> Result<T, ProtocolError> + Send + 'static,
+    ) -> Result<T, ProtocolError> {
+        let grant = self.reserve_compute(request, task_bytes).await?;
+        self.run_with_guard(grant, work).await?.0
+    }
+
+    /// Query compute follows max_threads. Control has its separately bounded
+    /// physical executor and precharged memory, so a busy query cannot consume
+    /// its progress capacity or be counted as an extra query worker.
+    pub async fn reserve_compute(
+        &self,
+        request: u64,
+        task_bytes: u64,
+    ) -> Result<NativeComputeGuard, ProtocolError> {
+        let owner = &self.lease.owner;
+        let reservation = match self.class {
+            ExecutionClass::Control => {
+                if task_bytes != 0 {
+                    return Err(capacity());
+                }
+                None
+            }
+            ExecutionClass::Query => {
+                let request = if request == 0 {
+                    owner.next_native_request_id()?
+                } else {
+                    request
+                };
+                Some(owner.memory.reserve_compute(request, task_bytes).await?)
+            }
+        };
+        Ok(NativeComputeGuard {
+            _reservation: reservation,
+        })
+    }
+    /// The caller acquires its scheduler grant after prepare and passes that
+    /// owner here. It stays inside native work through future cancellation.
+    pub async fn run_with_guard<T: Send + 'static, G: Send + 'static>(
+        self,
+        guard: G,
+        work: impl FnOnce() -> Result<T, ProtocolError> + Send + 'static,
+    ) -> Result<(Result<T, ProtocolError>, G), ProtocolError> {
+        let owner = self.lease.owner.clone();
+        let executor = match self.class {
+            ExecutionClass::Query => &owner.query,
+            ExecutionClass::Control => &owner.control,
+        };
+        let (tx, rx) = oneshot::channel();
+        let job = (guard, work, self.lease);
+        executor.send(Box::new(move || {
+            let (guard, work, lease) = job;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                .unwrap_or_else(|_| Err(super::super::recovery_unknown()));
+            // Release the slot and the worker owner before the caller can see
+            // the result: a caller that then drops its last owner must find the
+            // worker unbound, or a reopen is refused (C02, CIfix1).
+            let NativeLease {
+                permit,
+                owner,
+                settlement,
+            } = lease;
+            drop(permit);
+            drop(owner);
+            // Keep the job tracked until receipt or until the undelivered
+            // result and guard have both dropped.
+            let _ = tx.send((result, guard, settlement));
+        }))?;
+        let (result, guard, _settlement) =
+            rx.await.map_err(|_| super::super::recovery_unknown())?;
+        Ok((result, guard))
+    }
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(feature = "sim")]
+struct SimJob(Option<Job>);
+
+#[cfg(feature = "sim")]
+impl SimJob {
+    fn run(mut self) {
+        let job = self.0.take().expect("queued native job");
+        job();
+    }
+}
+
+#[cfg(feature = "sim")]
+impl Drop for SimJob {
+    fn drop(&mut self) {
+        if let Some(job) = self.0.take() {
+            // A crash drops the receiver and all queued jobs in one step.
+            // Contain each job's cleanup panic so the next job still settles.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(job)));
+        }
+    }
+}
+
+struct NativeExecutor {
+    #[cfg(feature = "sim")]
+    sim_sender: Option<tokio::sync::mpsc::UnboundedSender<SimJob>>,
+    sender: Option<mpsc::Sender<Job>>,
+    threads: Vec<JoinHandle<()>>,
+    slots: Arc<Semaphore>,
+}
+impl NativeExecutor {
+    fn new(count: usize, name: &str) -> Result<Self, ProtocolError> {
+        #[cfg(feature = "sim")]
+        if let Some(world) = nabedra_rt::sim::world() {
+            if !nabedra_rt::sim::current_node().is_some_and(|node| world.is_up(node)) {
+                return Err(capacity());
+            }
+            return Ok(Self::new_sim(count));
+        }
+
+        let (sender, receiver) = mpsc::channel::<Job>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut executor = Self {
+            #[cfg(feature = "sim")]
+            sim_sender: None,
+            sender: Some(sender),
+            threads: Vec::new(),
+            slots: Arc::new(Semaphore::new(count)),
+        };
+        for index in 0..count {
+            let receiver = receiver.clone();
+            let thread = nabedra_rt::task::spawn_service_with_stack(
+                format!("{name}-{index}"),
+                2 << 20,
+                move || {
+                    loop {
+                        let job = receiver.lock().unwrap().recv();
+                        match job {
+                            Ok(job) => {
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                },
+            )
+            .map_err(|_| capacity())?;
+            executor.threads.push(thread);
+        }
+        Ok(executor)
+    }
+    #[cfg(feature = "sim")]
+    fn new_sim(count: usize) -> Self {
+        // As on the thread path, every queued job already owns a slot.
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<SimJob>();
+        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+        for _ in 0..count {
+            let receiver = receiver.clone();
+            // Only node tasks own the receiver. A crash drops any queued jobs
+            // with the last task, including their compute and native leases.
+            nabedra_rt::task::spawn(async move {
+                loop {
+                    let job = receiver.lock().await.recv().await;
+                    let Some(job) = job else { break };
+                    let _ = nabedra_rt::task::spawn_blocking(move || job.run()).await;
+                }
+            });
+        }
+        Self {
+            sim_sender: Some(sender),
+            sender: None,
+            threads: Vec::new(),
+            slots: Arc::new(Semaphore::new(count)),
+        }
+    }
+
+    fn send(&self, job: Job) -> Result<(), ProtocolError> {
+        #[cfg(feature = "sim")]
+        if let Some(sender) = &self.sim_sender {
+            return sender.send(SimJob(Some(job))).map_err(|_| capacity());
+        }
+        self.sender
+            .as_ref()
+            .ok_or_else(capacity)?
+            .send(job)
+            .map_err(|_| capacity())
+    }
+}
+impl Drop for NativeExecutor {
+    fn drop(&mut self) {
+        self.slots.close();
+        #[cfg(feature = "sim")]
+        // WorkerSharedResources::drain waits for job settlement. Closing the
+        // channel lets the node tasks exit even if the final owner is a job.
+        self.sim_sender.take();
+        self.sender.take();
+        for thread in self.threads.drain(..) {
+            if thread.thread().id() != thread::current().id() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "sim"))]
+mod sim_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{ErrorCode, Outcome};
+    use nabedra_resources::memory::{GROUP_ENDPOINT_BYTES, GROUP_HANDLE_BYTES};
+    use std::{future::Future, task::Poll};
+
+    #[tokio::test]
+    async fn f03_detached_worker_memory_does_not_grant_scratch_after_worker_drop() {
+        let resources = WorkerSharedResources::new(
+            1,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let memory = resources.memory.clone();
+        let worker = Arc::downgrade(&resources);
+        let scratch = resources.reserve_scratch(ByteClass::Data, 1024).unwrap();
+        drop(resources);
+        assert!(worker.upgrade().is_some());
+        assert_eq!(memory.working_decode_bytes(), 1024);
+
+        drop(scratch);
+        assert!(worker.upgrade().is_none());
+        assert_eq!(memory.working_decode_bytes(), 0);
+        let baseline = memory.scheduler().usage();
+        assert!(memory.reserve_scratch(ByteClass::Data, 1024).is_err());
+        for class in [ByteClass::Data, ByteClass::Progress] {
+            let mut reservation = std::pin::pin!(memory.reserve_scratch_wait(class, 1024, 1));
+            std::future::poll_fn(|context| {
+                assert!(matches!(
+                    reservation.as_mut().poll(context),
+                    Poll::Ready(Err(_))
+                ));
+                Poll::Ready(())
+            })
+            .await;
+        }
+        assert_eq!(memory.working_decode_bytes(), 0);
+        assert_eq!(memory.scheduler().usage(), baseline);
+    }
+
+    /// T7b (D07, T5 concern 4, T6 concern 1): a write's batch charge
+    /// outlives its native slot (the journal drops it once the write is
+    /// visible). The next apply on that slot, for another group, used to fail
+    /// at once with "byte arena insufficient bytes", which openraft treats as
+    /// a fatal apply error: the replica's Raft core stopped and its group lost
+    /// a voter. It now waits for the charge and then proceeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn o06_d07_t7b_an_apply_waits_for_the_previous_writes_batch_charge() {
+        let resources = WorkerSharedResources::new(
+            1,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let budget = super::super::TransactionBudget {
+            scratch_bytes: (32 << 20) + (128 << 10),
+            batch_bytes: (32 << 20) + (128 << 10),
+            output_bytes: 0,
+        };
+        let first = resources.prepare(ExecutionClass::Query).await.unwrap();
+        let output = resources
+            .reply_budget(ExecutionClass::Query, 0)
+            .await
+            .unwrap();
+        let (scratch, batch, _) = first.buffers(budget, output).await.unwrap();
+        // The write is submitted: its slot and scratch go, its batch charge
+        // stays with the journal.
+        drop(scratch);
+        drop(first);
+        let second = resources.prepare(ExecutionClass::Query).await.unwrap();
+        let output = resources
+            .reply_budget(ExecutionClass::Query, 0)
+            .await
+            .unwrap();
+        let mut waiting = Box::pin(second.buffers(budget, output));
+        std::future::poll_fn(|cx| {
+            assert!(
+                waiting.as_mut().poll(cx).is_pending(),
+                "waits for the in-flight batch instead of failing"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        // The journal makes the write visible and drops the charge.
+        drop(batch);
+        let granted = nabedra_rt::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("granted once the batch charge drops");
+        assert!(granted.is_ok());
+    }
+
+    #[test]
+    fn o05_c02_m02_registered_group_capacity_precharges_and_recovers_each_lease() {
+        let config = SharedResourceConfig {
+            max_resident_groups: 2,
+            max_group_handles: 3,
+            precharge_group_capacity: true,
+            ..Default::default()
+        };
+        let resources = WorkerSharedResources::new(1, WorkerResources::default(), config).unwrap();
+        let arena = resources.memory.group_capacity_arena().unwrap();
+        let budget = 2 * (GROUP_ENDPOINT_BYTES + RAFT_REPLICA_BYTES) + 3 * GROUP_HANDLE_BYTES;
+        let scheduler = resources.scheduler();
+        let baseline = scheduler.usage()[0].2;
+        assert_eq!(arena.capacity(), budget);
+        assert_eq!(baseline, resources.native_baseline_bytes());
+        let groups = [(); 2].map(|()| resources.lease_group_residency().unwrap());
+        let [replica, other_replica] =
+            [(); 2].map(|()| resources.lease_replica_residency().unwrap());
+        let handles = [(); 3].map(|()| resources.reserve_group_handle().unwrap());
+        assert_eq!(arena.used(), budget);
+        assert_eq!(scheduler.usage()[0].2, baseline);
+        for (error, message) in [
+            (
+                resources.lease_group_residency().err().unwrap(),
+                "worker resident-group placement capacity exhausted",
+            ),
+            (
+                resources.lease_replica_residency().err().unwrap(),
+                "worker active Raft replica capacity exhausted",
+            ),
+            (
+                resources.reserve_group_handle().err().unwrap(),
+                "worker storage group-handle capacity exhausted",
+            ),
+        ] {
+            assert_eq!(error.code, ErrorCode::Overloaded);
+            assert_eq!(error.outcome, Outcome::NotApplied);
+            assert_eq!(error.message, message);
+        }
+        drop(replica);
+        assert_eq!(arena.used(), budget - RAFT_REPLICA_BYTES);
+        let replica = resources.lease_replica_residency().unwrap();
+        assert_eq!(arena.used(), budget);
+        drop((groups, replica, other_replica, handles));
+        assert_eq!(arena.used(), 0);
+        assert_eq!(scheduler.usage()[0].2, baseline);
+        let execution = ExecutionConfig::default();
+        resources
+            .validate_registered_group_capacity(&execution, 1, 2)
+            .unwrap();
+        let error = resources
+            .validate_registered_group_capacity(&execution, 1, 3)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        let stock_limits = WorkerResources {
+            memory_limit_bytes: 1536 << 20,
+            task_memory_limit_bytes: 256 << 20,
+            control_memory_reserve_bytes: 128 << 20,
+            ..WorkerResources::default()
+        };
+        let larger = SharedResourceConfig {
+            max_resident_groups: 272,
+            max_group_handles: 320,
+            ..config
+        };
+        let error = WorkerSharedResources::new(2, stock_limits, larger)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        let declared = WorkerResources {
+            memory_limit_bytes: 3 << 30,
+            ..stock_limits
+        };
+        let fixture_execution = ExecutionConfig {
+            max_pending_requests: 16,
+            max_queue_bytes_per_replica: 8 << 20,
+            max_retained_result_bytes_per_worker: 8 << 20,
+            ..execution
+        };
+        let profile = WorkerSharedResources::new(2, declared, larger).unwrap();
+        profile
+            .validate_registered_group_capacity(&fixture_execution, 1, 4)
+            .unwrap();
+        let error = profile
+            .validate_registered_group_capacity(&fixture_execution, 8, 4)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        let impossible = SharedResourceConfig {
+            max_resident_groups: Semaphore::MAX_PERMITS,
+            ..config
+        };
+        let error = WorkerSharedResources::new(2, WorkerResources::default(), impossible)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        drop(resources);
+        assert_eq!(scheduler.usage()[0].2, 0);
+    }
+
+    #[tokio::test]
+    async fn m03_c07_f03_immediate_progress_preserves_fitting_waiter_headroom() {
+        let resources = WorkerSharedResources::new(
+            1,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let arena = resources.memory.progress_arena();
+        let used = || resources.buffer_bytes_used(ByteClass::Progress);
+        let waiters = || arena.waiters();
+        let scheduler = resources.scheduler();
+        let baseline = scheduler.usage();
+        let retained = resources
+            .reserve_scratch(ByteClass::Progress, 176_925)
+            .unwrap();
+        let blocker = arena.reserve(arena.capacity() - retained.bytes()).unwrap();
+        let mut older = Box::pin(resources.reserve_scratch_wait(ByteClass::Progress, 16 << 10, 0));
+        std::future::poll_fn(|cx| {
+            assert!(older.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(waiters(), 1);
+        drop(blocker);
+        assert_eq!(used(), retained.bytes());
+
+        let progress = resources.reserve_scratch(ByteClass::Progress, 383).unwrap();
+        assert_eq!(progress.bytes(), 383);
+        assert_eq!(used(), retained.bytes() + 383);
+        assert_eq!(arena.oldest_waiter_bypasses(), Some(0));
+
+        let mut younger = Box::pin(resources.reserve_scratch_wait(ByteClass::Progress, 1, 0));
+        let granted = std::future::poll_fn(|cx| {
+            assert!(younger.as_mut().poll(cx).is_pending());
+            assert_eq!(waiters(), 2);
+            let Poll::Ready(granted) = older.as_mut().poll(cx) else {
+                panic!("older waiter must still fit while progress holds its bytes");
+            };
+            Poll::Ready(granted.unwrap())
+        })
+        .await;
+        assert_eq!(granted.bytes(), 16 << 10);
+        assert_eq!(waiters(), 1);
+        drop(younger);
+        assert_eq!(waiters(), 0);
+        assert_eq!(
+            used(),
+            retained.bytes() + progress.bytes() + granted.bytes()
+        );
+        drop((retained, progress, granted));
+        assert_eq!(used(), 0);
+        assert_eq!(scheduler.usage(), baseline);
+    }
+
+    #[tokio::test]
+    async fn m03_o19_byte_arena_distinguishes_waiting_from_impossible_work() {
+        let resources = WorkerSharedResources::new(
+            1,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let arena = resources.memory.progress_arena();
+        let held = arena.reserve(arena.capacity()).unwrap();
+        let mut earlier = std::pin::pin!(arena.reserve_wait(arena.capacity() - 382));
+        std::future::poll_fn(|cx| {
+            assert!(earlier.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(held);
+        let blocked = resources
+            .reserve_scratch(ByteClass::Progress, 383)
+            .err()
+            .expect("older waiter gets this space");
+        assert_eq!(blocked.code, ErrorCode::Overloaded);
+        assert_eq!(blocked.outcome, Outcome::NotApplied);
+        assert_eq!(
+            blocked.message,
+            format!(
+                "worker storage capacity unavailable; byte arena older fitting waiter requested=383 used=0 capacity={} waiting=1",
+                arena.capacity()
+            )
+        );
+        assert_eq!(resources.buffer_bytes_used(ByteClass::Progress), 0);
+        let impossible = arena
+            .reserve_wait(arena.capacity() + 1)
+            .await
+            .err()
+            .expect("request exceeds arena capacity");
+        assert_eq!(impossible.code, ErrorCode::LimitExceeded);
+        assert_eq!(impossible.outcome, Outcome::NotApplied);
+        let remaining = resources.reserve_scratch(ByteClass::Progress, 382).unwrap();
+        let earlier = std::future::poll_fn(|cx| {
+            let Poll::Ready(granted) = earlier.as_mut().poll(cx) else {
+                panic!("older waiter must fit when it has exactly enough bytes");
+            };
+            Poll::Ready(granted.unwrap())
+        })
+        .await;
+        assert_eq!(
+            resources.buffer_bytes_used(ByteClass::Progress),
+            arena.capacity()
+        );
+        drop((remaining, earlier));
+        assert_eq!(resources.buffer_bytes_used(ByteClass::Progress), 0);
+        assert_eq!(arena.waiters(), 0);
+    }
+}

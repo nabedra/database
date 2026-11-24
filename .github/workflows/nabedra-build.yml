@@ -523,7 +523,7 @@ jobs:
           set -o pipefail
           cargo test --locked --no-default-features --features oltp --lib --tests --no-run --timings \
             --message-format=json-render-diagnostics > ../build.json
-          cargo test --locked -p nabedra-resources -p nabedra-transport --lib --no-run \
+          cargo test --locked -p nabedra-resources -p nabedra-transport -p nabedra-oltp-storage --lib --no-run \
             --message-format=json-render-diagnostics >> ../build.json
           cargo build --locked --no-default-features --features oltp --bin nabedra-db
           cd ..
@@ -531,6 +531,7 @@ jobs:
           jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null)
                  | [(if .target.name == "nabedra_resources" then "resources"
                      elif .target.name == "nabedra_transport" then "transport"
+                     elif .target.name == "nabedra_oltp_storage" then "storage"
                      elif (.target.kind | index("lib")) then "lib"
                      else .target.kind[0] end), .target.name, .executable] | @tsv' build.json \
             | sed "s#\t$GITHUB_WORKSPACE/#\t#" > bins.tsv
@@ -538,6 +539,7 @@ jobs:
           test "$(awk -F'\t' '$1 == "lib"' bins.tsv | wc -l)" = 1
           test "$(awk -F'\t' '$1 == "resources"' bins.tsv | wc -l)" = 1
           test "$(awk -F'\t' '$1 == "transport"' bins.tsv | wc -l)" = 1
+          test "$(awk -F'\t' '$1 == "storage"' bins.tsv | wc -l)" = 1
           cat bins.tsv
       - uses: actions/upload-artifact@v4
         with:
@@ -714,7 +716,7 @@ jobs:
           lint -p nabedra-database --all-targets --no-default-features --features cache
           lint -p nabedra-database --all-targets --no-default-features --features cache,test-hooks
           lint -p nabedra-rt --all-targets
-          for crate in protocol resources oltp-types transport; do
+          for crate in protocol resources oltp-types transport oltp-storage; do
             if [ -f "$crate/Cargo.toml" ]; then
               lint -p "nabedra-$crate" --all-targets
             fi
@@ -976,6 +978,7 @@ jobs:
           transport=$(awk -F'\t' '$1 == "transport" {print $3}' bins.tsv)
           [[ -n "$transport" && -x "$GITHUB_WORKSPACE/$transport" ]]
           echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
+          echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -987,6 +990,12 @@ jobs:
         run: |
           set -o pipefail
           "$NABEDRA_TEST_EXE" --test-threads 4 $QUARANTINE_SKIPS 2>&1 | tee ../oltp-lib.log
+      - name: Storage library suite
+        if: ${{ !cancelled() }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          NABEDRA_TEST_DIRECT_OLTP=on "$NABEDRA_OLTP_STORAGE_TEST_EXE" --test-threads 4 $QUARANTINE_SKIPS 2>&1 | tee ../oltp-storage.log
       - name: Transport library suite
         if: ${{ !cancelled() }}
         working-directory: server
@@ -1331,6 +1340,7 @@ jobs:
           transport=$(awk -F'\t' '$1 == "transport" {print $3}' bins.tsv)
           [[ -n "$transport" && -x "$GITHUB_WORKSPACE/$transport" ]]
           echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
+          echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_RESOURCES_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "resources" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -1393,6 +1403,7 @@ jobs:
           transport=$(awk -F'\t' '$1 == "transport" {print $3}' bins.tsv)
           [[ -n "$transport" && -x "$GITHUB_WORKSPACE/$transport" ]]
           echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
+          echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_RESOURCES_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "resources" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -1432,6 +1443,12 @@ jobs:
         run: |
           set -o pipefail
           NABEDRA_TEST_DIRECT_OLTP=off "$NABEDRA_TEST_EXE" --test-threads 4 $QUARANTINE_SKIPS 2>&1 | tee ../artifacts/oltp-lib-direct-off.log
+      - name: Storage library suite, direct_oltp off
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.mode == 'off' }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          NABEDRA_TEST_DIRECT_OLTP=off "$NABEDRA_OLTP_STORAGE_TEST_EXE" --test-threads 4 $QUARANTINE_SKIPS 2>&1 | tee ../artifacts/oltp-storage-direct-off.log
       - name: OLTP integration tests, direct_oltp off
         if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.mode == 'off' }}
         working-directory: server
@@ -1506,6 +1523,11 @@ jobs:
           tar -xf o02-inputs.tar && rm o02-inputs.tar
           grep -qx "source=$TESTED_SHA" o02-inputs/source.txt || { echo "::error::the O02 inputs are not $TESTED_SHA"; exit 1; }
           lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
+          storage=$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)
+          [[ -n "$storage" && -x "$GITHUB_WORKSPACE/$storage" ]]
+          "$GITHUB_WORKSPACE/$storage" --list |
+            grep -Fx "oltp::pool::tests::kv::ns22_rocksdb_pools_and_legacy_stores_are_refused_untouched: test"
+          echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$storage" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -1909,6 +1931,7 @@ jobs:
           transport=$(awk -F'\t' '$1 == "transport" {print $3}' bins.tsv)
           [[ -n "$transport" && -x "$GITHUB_WORKSPACE/$transport" ]]
           echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
+          echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_RESOURCES_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "resources" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -1960,6 +1983,7 @@ jobs:
           transport=$(awk -F'\t' '$1 == "transport" {print $3}' bins.tsv)
           [[ -n "$transport" && -x "$GITHUB_WORKSPACE/$transport" ]]
           echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
+          echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -1975,9 +1999,11 @@ jobs:
           read -r -a names <<< "$TESTS"
           server_cases=()
           transport_cases=()
+          storage_cases=()
           for name in "${names[@]}"; do
             case "$name" in
               transport::*) transport_cases+=("$name") ;;
+              oltp::*) storage_cases+=("$name") ;;
               *) server_cases+=("$name") ;;
             esac
           done
@@ -1991,6 +2017,9 @@ jobs:
           fi
           if [ "${#transport_cases[@]}" -gt 0 ]; then
             repeat --executable "$NABEDRA_TRANSPORT_TEST_EXE" "${transport_cases[@]}" || status=1
+          fi
+          if [ "${#storage_cases[@]}" -gt 0 ]; then
+            repeat --executable "$NABEDRA_OLTP_STORAGE_TEST_EXE" "${storage_cases[@]}" || status=1
           fi
           exit "$status"
       - if: always()
@@ -2025,6 +2054,7 @@ jobs:
           grep -qx "source=$TESTED_SHA" bins-source.txt || { echo "::error::the shared build is not $TESTED_SHA"; exit 1; }
           lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
+          echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_RESOURCES_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "resources" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
