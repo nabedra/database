@@ -3,7 +3,7 @@
 //!
 //! `tests/fixtures/unreviewed_dr1_dr2/` holds histories captured by PR #118 at `9b810d96`: one
 //! seed, one local run, a simulated fault model. They are **unreviewed findings**. DR-1 and DR-2
-//! are open, and whether they break a guarantee is the user's later decision. These tests say
+//! are open, and whether they break a guarantee is for a later review. These tests say
 //! what the rules report on them. They do not say that a guarantee passes or fails, and this
 //! file is not part of the `check-history` evidence.
 //!
@@ -179,8 +179,8 @@ fn hits_on_the_existing_corpus_and_fixtures() {
             // Expected invalid already, as `non-linearizable`: an insert is refused over the row that
             // its own lost attempt wrote.
             ("direct_retry_conflict_after_lost_reply", EFFECT),
-            // Expected valid: it records the other reading. `update` r2 answers `false`, another
-            // client inserts the row, and the retry of r2 answers `true`.
+            // Expected valid by the default, which follows the shipped executor. `update` r2
+            // answers `false`, another client inserts the row, and the retry of r2 answers `true`.
             ("direct_valid_retries", UNSTABLE),
         ]
     );
@@ -712,9 +712,9 @@ fn request_not_applied_cases() {
     assert_eq!(verdict(after, &NOT_APPLIED).kinds(), ["non-linearizable"]);
 }
 
-/// The default follows the plan's reading, also against the other one: the replay of a recorded
-/// no-op or row conflict is `non-linearizable` there once the row changed. The rules accept it
-/// and keep judging the rest of the key.
+/// The default follows the shipped executor, also against the decided retry rule: the replay of a
+/// recorded no-op or row conflict is `non-linearizable` there once the row changed. The rules
+/// accept it and keep judging the rest of the key.
 #[test]
 fn the_default_rejects_the_replay_of_a_recorded_no_op() {
     let replayed = "0> update k 2 r
@@ -787,8 +787,8 @@ enum Reading {
     /// Both rules hold: every result is recorded, also a no-op and a row conflict, and a refusal
     /// stops the attempts of its request that are still on their way.
     Identity,
-    /// `plans/oltp-direct-path.md` as written: only commits are recorded, and a refusal speaks
-    /// for its attempt alone.
+    /// The shipped executor, and `plans/oltp-direct-path.md` before 2026-11-24: only commits are
+    /// recorded, and a refusal speaks for its attempt alone.
     Plan,
 }
 
@@ -1027,7 +1027,7 @@ fn generated(seed: u64, operations: usize, reading: Reading) -> Vec<Event> {
 }
 
 /// A store that keeps both promises is never flagged. The same clients on a store that follows
-/// the plan's text are, often, which shows that the first half is not empty.
+/// the shipped executor are, often, which shows that the first half is not empty.
 #[test]
 fn a_store_that_keeps_both_promises_is_never_flagged() {
     let (mut unstable, mut effects) = (0, 0);

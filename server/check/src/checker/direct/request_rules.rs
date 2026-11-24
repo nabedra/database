@@ -1,14 +1,17 @@
 //! Opt-in rules about what one answer says for the whole request identity.
 //!
-//! Both are off by default ([`Options`]). They test one reading of an open question, and
-//! [`super::check`] follows the other one. `plans/oltp-direct-path.md`, section 4: "Read-only
-//! outcomes such as `update` on a missing row commit nothing and are recomputed on retry"; and
-//! section 6, step 1: "When full, return `429 overloaded` with `not_applied`". Until the user
-//! decides which text is the contract, a hit is a finding to review. It is not a failed
-//! guarantee, and a history without hits is not evidence for one.
+//! Both are off by default ([`Options`]), and [`super::check`] does not depend on them. The first
+//! is close to the retry rule that `plans/oltp-direct-path.md`, section 4, states since
+//! 2026-11-24 ("Retry results"), but it is not that rule: see "Not flagged" below.
+//! [`super::check`] still follows the shipped executor, which recomputes no-ops and row conflicts
+//! on retry ("a known gap" in the same text). The second tests a reading of `not_applied` that
+//! nobody has decided: section 6, step 1, of the plan says "When full, return `429 overloaded`
+//! with `not_applied`", and does not say whether that speaks for the request or for one attempt.
+//! A hit of either rule is a finding to review. It is not a failed guarantee, and a history
+//! without hits is not evidence for one.
 //!
-//! The rules only add anomalies. They do not make the default accept the other reading: a retry
-//! that replays `false` after the row was inserted is `non-linearizable` there.
+//! The rules only add anomalies. They do not make the default accept the decided retry rule: a
+//! retry that replays `false` after the row was inserted is `non-linearizable` there.
 //!
 //! The identity and the body are those of [`super`]: the table-qualified anchor key and the
 //! request ID, and `f` plus the invoke value. Reads have no identity (plan addendum, RV-FINAL
@@ -17,9 +20,11 @@
 //!
 //! # Stable results (`unstable-result`)
 //!
-//! From `AGENTS.md`, "OLTP direct path": "a retry with the same request ID and body returns the
-//! original result"; and O08 in `docs/testing/oltp-contract.md`: "No-op and conflict results
-//! remain stable by identity". D02 also requires "the original result".
+//! From OLTP-G03 in `docs/testing/guarantees/oltp.md`: "On the direct path, a retry of a mutation
+//! with the same request ID and body returns the first definite result of that identity,
+//! including a no-op or row conflict, while its dedup record is retained"; and O08 in
+//! `docs/testing/oltp-contract.md`: "No-op and conflict results remain stable by identity". D02
+//! also requires "the original result".
 //!
 //! Two attempts of one identity and body that both got a definite result must agree, if the
 //! second was invoked after the first was answered. Definite results are:
@@ -38,9 +43,11 @@
 //! - A `conflict` that another body under the identity could explain (that body was invoked
 //!   before the answer), a `conflict` of an `upsert`, `update` or `delete` (only reuse causes it),
 //!   and a `conflict` whose recorded message does not say that a key "already exists". The queued
-//!   path uses the same code for a moved route and an abandoned run.
-//! - A single answer, however wrong. A no-op answered `false` whose effect then appears is
-//!   flagged only if the request is answered again.
+//!   path uses the same code for a moved route and an abandoned run. Without a recorded message,
+//!   every other `conflict` of an insert counts as a row conflict.
+//! - A single answer, however wrong. A lone no-op `false` whose effect then appears hits neither
+//!   rule: this one needs the request to be answered again, and the second one needs a
+//!   `not_applied` answer.
 //!
 //! # Request-level `not_applied` (`not-applied-took-effect`)
 //!
@@ -76,6 +83,13 @@
 //! - A completion of type `fail` that does not say `not_applied` is not a refusal here.
 //! - If the history is not linearizable to begin with on the keys involved, apart from those
 //!   answers, [`super::check`] reports that, and this rule says nothing about them.
+//!
+//! Known false hit (found in review, not fixed): like the default, this rule reads the `conflict`
+//! of an insert, on an identity not used before, as an existing row. After a fallback the queued
+//! path uses the code for other reasons, such as an abandoned run. If the covered attempt is the
+//! only thing that could have written such a row, the default accepts the history and this rule
+//! flags it, although nothing took effect. The same holds for a row change the checker does not
+//! model, such as a dropped table.
 //!
 //! A search that reaches its limit is reported as `check-limit`, so it cannot pass silently.
 

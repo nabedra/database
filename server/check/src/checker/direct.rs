@@ -33,8 +33,9 @@
 //! when recorded, must equal the number of input rows. These histories use primary-key
 //! conflicts. A workload with other uniqueness constraints needs to identify those refusals.
 //!
-//! [`check_with`] can add two rules for a decision that is still open, described in
-//! [`request_rules`]: `unstable-result` and `not-applied-took-effect`. Both are off by default.
+//! [`check_with`] can add two rules about request identities, described in [`request_rules`]:
+//! `unstable-result` and `not-applied-took-effect`. Both are off by default, and their hits are
+//! findings to review.
 
 pub mod request_rules;
 
