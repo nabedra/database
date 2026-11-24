@@ -51,7 +51,7 @@ pub struct WorkerSharedResources {
     leases: Arc<NativeLeases>,
 }
 
-impl nabedra_transport::ResourceOwner for WorkerSharedResources {
+impl nabedra_resources::memory::ResourceOwner for WorkerSharedResources {
     #[inline]
     fn worker_memory(&self) -> &Arc<WorkerMemory> {
         &self.memory
