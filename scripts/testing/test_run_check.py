@@ -164,6 +164,7 @@ class TlcParserTests(unittest.TestCase):
             "not_run of strings": line(not_run=["x"]),
             "not an object": "nabedra-tla-summary: [1]\n",
             "deep nesting": "nabedra-tla-summary: " + "[" * 100000 + "\n",
+            "NaN in the facts": line(tla={**TLA_FACTS, "depth": float("nan")}),
             "no tla facts": line(tla=...),
             "tla facts of another type": line(tla=[]),
             "pass with not-run entries": line(not_run=[{"id": "b", "reason": "stopped at the budget"}]),
@@ -297,6 +298,17 @@ class FitRecordTests(unittest.TestCase):
         self.assertEqual((len(self.tla["mutants"]), len(self.tla["runs"])), (50, 20))
         self.assertEqual(self.names[1], "tla/summary.json")
 
+    def test_artifacts_of_no_failure_go_before_caught_mutants(self):
+        arts = [artifact("summary.json"), *(artifact(f"mutant-m{i:02d}.{k}") for i in range(24) for k in ("cex.json", "log"))]
+        record = t_record(mutants=[mutant(i, ok=i != 23, detail=0) for i in range(50)], artifacts=arts,
+                          runs=[run_fact(i, detail=0) for i in range(20)], unmutated=["U" * 110 for _ in range(24)])
+        self.fit(record)
+        self.assertEqual(list(self.dropped), ["artifacts"])
+        self.assertIn("tla/mutant-m23.log", self.names)
+        self.assertIn("tla/mutant-m23.cex.json", self.names)
+        self.assertNotIn("tla/mutant-m22.log", self.names)  # the last ones went
+        self.assertIn("tla/mutant-m00.log", self.names)
+
     def test_caught_mutants_and_passing_runs_go_before_any_failure(self):
         record = t_record(mutants=[mutant(i, ok=i % 10 != 0, name="n" * 100 + "{:02d}") for i in range(50)],
                           runs=[run_fact(i, ok=i != 7) for i in range(20)], failed=6,
@@ -349,6 +361,12 @@ class FitRecordTests(unittest.TestCase):
                                   traces={"checked": n, "accepted": 0, "rejected": 0, "failing": []})
                 self.fit(record)
                 self.assertTrue(record["assertions"]["not_run"][0]["reason"].startswith("seed-0.ndjson"))
+
+    def test_more_short_not_run_entries_than_the_schema_allows(self):
+        record = t_record(result="error", executed=0, failed=0, not_run=[{"id": "t", "reason": "r"}] * 215)
+        self.fit(record)
+        self.assertEqual(self.dropped, {"not_run": 16})
+        self.assertEqual(len(record["assertions"]["not_run"]), 200)
 
     def test_unlisted_failing_traces_are_counted(self):
         failing = [{"file": f"t{i}.ndjson", "index": 3, "reason": "r" * 100} for i in range(20)]
