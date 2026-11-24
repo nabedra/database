@@ -1,0 +1,14 @@
+id = "TRANSPORT-RPC-TRACE-TARGET"
+title = "The extracted transport stopped matching the server RPC trace filter"
+class = "other"
+module = "oltp"
+guarantees = []
+scenarios = ["D10", "C07", "REP6"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "transport::tests::lane_refusal_keeps_the_server_rpc_trace_target"
+seed = "unknown"
+why_not_caught = "The transport tests exercised protocol behavior without checking the target used by the server diagnostics subscriber."
+invariant_added = "Extracted transport and peer-directory events retain the targets selected by the existing RPC trace filter. The unit test checks the target on a lane refusal."
+fix_commits = ["0581aaba1bc3c2d057d6b615e61b64fe0f3228aa"]
+revert_patch_ok = true
