@@ -156,6 +156,9 @@ pub struct Envelope<'a> {
 pub enum Fate {
     /// Delivered after `delay` of virtual time, and never before an earlier message.
     Deliver { delay: Duration },
+    /// Deliver a complete transport frame, preserving order within this stream.
+    /// The planner must use this only at established, whole-frame boundaries.
+    Frame { stream: u64, delay: Duration },
     /// Lost; its direction stalls until the connection is reset.
     Drop,
     /// The connection is reset instead; the sender's flush fails.
@@ -209,6 +212,7 @@ enum Body {
 #[derive(Debug)]
 struct Message {
     ready_at: Instant,
+    stream: Option<u64>,
     body: Body,
     /// Bytes of a `Data` body already read.
     read: usize,
@@ -221,7 +225,6 @@ struct Pipe {
     /// A message was dropped: later ones vanish.
     stalled: bool,
     sent: u64,
-    last_ready: Option<Instant>,
     reader: Option<Waker>,
 }
 
@@ -235,6 +238,39 @@ enum Fin {
 }
 
 impl Pipe {
+    fn push(&mut self, body: Body, stream: Option<u64>, delay: Duration) {
+        let deadline = Instant::now() + delay;
+        let preserves_order = |message: &Message| {
+            message.read != 0
+                || stream.is_none()
+                || message.stream.is_none()
+                || message.stream == stream
+        };
+        let ready_at = self
+            .queue
+            .iter()
+            .filter(|message| preserves_order(message))
+            .map(|message| message.ready_at)
+            .fold(deadline, Instant::max);
+        let index = self
+            .queue
+            .iter()
+            .rposition(|message| preserves_order(message) || message.ready_at <= ready_at)
+            .map_or(0, |index| index + 1);
+        self.queue.insert(
+            index,
+            Message {
+                ready_at,
+                stream,
+                body,
+                read: 0,
+            },
+        );
+        if let Some(waker) = self.reader.take() {
+            waker.wake();
+        }
+    }
+
     fn finish(&mut self) {
         if matches!(self.fin, Fin::Open) {
             self.fin = Fin::Sent(Instant::now());
@@ -1003,24 +1039,17 @@ impl Half {
             .map_or(Fate::NOW, |planner| planner.message(&envelope));
         pipe.sent += 1;
         match fate {
-            Fate::Deliver { .. } if pipe.stalled => Ok(()),
+            Fate::Deliver { .. } | Fate::Frame { .. } if pipe.stalled => Ok(()),
             Fate::Deliver { delay } => {
                 if let Body::ServerHello { alpn, .. } = &body {
                     conn.alpn.clone_from(alpn);
                 }
-                let now = Instant::now();
-                let ready_at = pipe
-                    .last_ready
-                    .map_or(now + delay, |last| last.max(now + delay));
-                pipe.last_ready = Some(ready_at);
-                pipe.queue.push_back(Message {
-                    ready_at,
-                    body,
-                    read: 0,
-                });
-                if let Some(waker) = pipe.reader.take() {
-                    waker.wake();
-                }
+                pipe.push(body, None, delay);
+                Ok(())
+            }
+            Fate::Frame { stream, delay } => {
+                debug_assert!(kind == Kind::Data && conn.alpn.is_some());
+                pipe.push(body, Some(stream), delay);
                 Ok(())
             }
             Fate::Drop => {
