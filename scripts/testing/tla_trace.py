@@ -28,7 +28,8 @@ Its first lines name what must come out and the trace, relative to the spec fold
   \\* expect: rejected at 6     or `accepted` or `error`, optionally `at <n>` and `: <text in the reason>`
   \\* trace: traces/rejected/<file>
 
-One assertion per trace and per trace mutant. The last line is `nabedra-tla-summary: {json}`.
+One assertion per trace and per trace mutant. Without a trace to accept the result is never a pass:
+rejected samples, trace mutants and the control only show that the check works. The last line is `nabedra-tla-summary: {json}`.
 Exit status: 0 pass, 1 fail, 2 not-run, 3 error.
 """
 
@@ -72,6 +73,10 @@ REMOVED = {
 STANDARD_MODULES = {"Naturals", "Integers", "Sequences", "FiniteSets", "Json", "IOUtils", "TLC", "TLCExt"}
 # What NabedraTrace takes from them, so a configuration must not override it.
 STANDARD_OPERATORS = {"ndJsonDeserialize", "IOEnv", "TLCGet", "TLCSet", "PrintT", "SubSeq", "Len"}
+# Only NabedraTrace may define these. A copy of the library under another name could leave checks out.
+LIB_INTERFACE = {"TraceStep", "RequireVar", "RequireSet", "ChangedVar", "ChangedSet", "OptionalVar", "OptionalSet",
+                 "NoVars", "RequireMsg", "TraceInit", "TraceIndexIsLevel", "TraceAccepted", "Trace", "TraceFileLines",
+                 "Line", "LineNode", "LineMsg", "HasMsg"}
 CONTROL_ACTION = "NabedraTraceControl"
 _EXPECT_TRACE = re.compile(r"^\\\*\s*expect:\s*(accepted|rejected|error)(?:\s+at\s+(\d+))?(?:\s*:\s*(.+?))?\s*$")
 _MUTANT_TRACE = re.compile(r"^\\\*\s*trace:\s*(\S+)\s*$")
@@ -275,8 +280,36 @@ def tlc_copy(lines: list[str]) -> tuple[str, dict[int, list[str]]]:
     return "\n".join(out) + "\n", wide
 
 
+_HEADER = re.compile(r"^[ \t]*-{4,}[ \t]*MODULE[ \t]+\w+[ \t]*-{4,}", re.M)
+_END = re.compile(r"^[ \t]*={4,}", re.M)
+_PARAM = r"\w+(?:\s*\([_,\s]*\))?"
+_DEFINITION = re.compile(
+    rf"(?:^([ \t]*)(?:LOCAL\s+)?|\bLET\s+)(\w+)\s*(?:\(\s*({_PARAM}(?:\s*,\s*{_PARAM})*)\s*\))?\s*==", re.M)
+
+
+def _module_text(raw: str) -> str:
+    """The module without comments, string contents, and the text around it, which TLC ignores too."""
+    header = _HEADER.search(raw)
+    text = tc.strip_tla_comments(raw[header.start():] if header else raw, keep_strings=False)
+    depth, pos = 0, 0
+    while True:  # a module may contain others
+        start, end = _HEADER.search(text, pos), _END.search(text, pos)
+        if end is None:
+            return text
+        if start is not None and start.start() < end.start():
+            depth, pos = depth + 1, start.end()
+            continue
+        depth, pos = depth - 1, end.end()
+        if depth <= 0:
+            return text[:end.start()]
+
+
+def _extended(text: str) -> list[str]:
+    return [m for names in re.findall(r"\bEXTENDS\s+(\w+(?:\s*,\s*\w+)*)", text) for m in re.findall(r"\w+", names)]
+
+
 def _closure(spec_dir: Path, name: str) -> dict[str, str]:
-    """The module and the modules of its folder that it extends or instantiates, comments removed."""
+    """The module and the modules of its folder that it extends or instantiates."""
     found: dict[str, str] = {}
     todo = [name]
     while todo:
@@ -284,28 +317,96 @@ def _closure(spec_dir: Path, name: str) -> dict[str, str]:
         path = spec_dir / f"{mod}.tla"
         if mod in found or not path.exists():
             continue
-        text = tc.strip_tla_comments(path.read_text(encoding="utf-8"), keep_strings=False)
-        found[mod] = text
-        for m in re.finditer(r"\bEXTENDS\s+(\w+(?:\s*,\s*\w+)*)", text):
-            todo += re.findall(r"\w+", m.group(1))
-        todo += re.findall(r"\bINSTANCE\s+(\w+)", text)
+        found[mod] = text = _module_text(path.read_text(encoding="utf-8"))
+        todo += _extended(text) + re.findall(r"\bINSTANCE\s+(\w+)", text)
     return found
 
 
+def _params(params: str | None) -> list[str]:
+    return re.findall(r"(\w+)\s*(?:\([^)]*\))?", params or "")
+
+
 def _defines(text: str, op: str) -> bool:
-    return re.search(rf"(?<![\w!]){op}\s*(?:\([^)]*\))?\s*==", text) is not None
+    return any(m.group(2) == op or op in _params(m.group(3)) for m in _DEFINITION.finditer(text))
 
 
 def lib_operators() -> set[str]:
     text = tc.strip_tla_comments((tc.SPECS_DIR / "lib" / f"{LIB_MODULE}.tla").read_text(encoding="utf-8"))
-    return set(re.findall(r"^\s*(?:LOCAL\s+)?(\w+)\s*(?:\([^)]*\))?\s*==", text, re.M)) | {"traceIndex", "traceExplained"}
+    return {m.group(2) for m in _DEFINITION.finditer(text)} | {"traceIndex", "traceExplained"}
+
+
+def _arguments(text: str, start: int) -> list[str] | None:
+    """The arguments of the application whose `(` follows `start`, or None."""
+    m = re.compile(r"\s*\(").match(text, start)
+    if not m:
+        return None
+    out, depth, begin, i = [], 1, m.end(), m.end()
+    while i < len(text):
+        two = text[i:i + 2]
+        if two in ("<<", ">>"):
+            depth += 1 if two == "<<" else -1
+            i += 2
+            continue
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if not depth:
+                return [*out, text[begin:i].strip()]
+        elif c == "," and depth == 1:
+            out.append(text[begin:i].strip())
+            begin = i + 1
+        i += 1
+    return None
+
+
+def _name_errors(modules: dict[str, str]) -> list[str]:
+    """Steps whose action name is not a fixed string, so one step could take any line.
+
+    The name is the first argument of TraceStep. It is a string, a name bound over a set of strings, or a
+    parameter of the operator that contains the step; then the same holds for that operator's uses."""
+    errors: list[str] = []
+    todo, seen = [("TraceStep", 0)], set()
+    while todo:
+        op, index = todo.pop()
+        if (op, index) in seen:
+            continue
+        seen.add((op, index))
+        for mod, text in modules.items():
+            heads = list(_DEFINITION.finditer(text))
+            top = min((len(h.group(1)) for h in heads if h.group(1) is not None), default=0)
+            for use in re.finditer(rf"\b{op}\b", text):
+                if any(h.start(2) == use.start() for h in heads):
+                    continue
+                line = text.count("\n", 0, use.start()) + 1
+                where = f"{mod}.tla, use {op} in line {line} of the module,"
+                args = _arguments(text, use.end())
+                if args is None or index >= len(args):
+                    errors.append(f"{where} must apply it directly, so that its action name can be read")
+                    continue
+                name = args[index]
+                while name.startswith("(") and name.endswith(")"):
+                    name = name[1:-1].strip()
+                if name == '""':
+                    continue
+                unit = max((h.start() for h in heads if h.group(1) is not None and len(h.group(1)) == top
+                            and h.start() < use.start()), default=0)
+                owner = [h for h in heads if unit <= h.start() < use.start() and name in _params(h.group(3))]
+                if owner:
+                    todo.append((owner[-1].group(2), _params(owner[-1].group(3)).index(name)))
+                elif not (re.fullmatch(r"\w+", name) and re.search(
+                        rf'\\E\s+{name}\s*\\in\s*\{{\s*""(?:\s*,\s*"")*\s*\}}', text[unit:use.start()])):
+                    errors.append(f"{where} has the action name {name[:40]!r}, which is not a string, so one step "
+                                  "could take lines of any action")
+    return errors
 
 
 def trace_spec_errors(spec_dir: Path, name: str) -> list[str]:
     """Why `<Name>Trace.tla` and its cfg could accept a trace they do not explain.
 
-    It finds the mistakes that leave a trace unchecked. It cannot tell that a spec action is too weak, that
-    a TraceStep stutters under an action's name, or that OptionalVar or NoVars is used without a reason."""
+    It reads the text of the modules in the spec folder and finds the likely mistakes. specs/README.md
+    lists what it cannot tell."""
     errors: list[str] = []
     trace_mod = f"{name}Trace"
     lib = {p.stem for p in (tc.SPECS_DIR / "lib").glob("*.tla")} | STANDARD_MODULES
@@ -323,17 +424,31 @@ def trace_spec_errors(spec_dir: Path, name: str) -> list[str]:
 
     modules = _closure(spec_dir, trace_mod)
     for op, instead in REMOVED.items():
-        users = [m for m, text in modules.items() if re.search(rf"\b{op}\b", text)]
+        users = [m for m, text in modules.items() if re.search(rf"\b{op}\s*\(", text)]
         if users and not any(_defines(text, op) for text in modules.values()):
             errors.append(f"{users[0]}.tla uses {op}, which accepted a line that does not log the variable and "
                           f"was removed. Use {instead}")
-    used = modules.get(trace_mod, "")
+    if not any(LIB_MODULE in _extended(text) for text in modules.values()):
+        errors.append(f"{trace_mod}.tla must extend {LIB_MODULE}")
+    for mod, text in modules.items():
+        own = sorted(op for op in LIB_INTERFACE if _defines(text, op))
+        if own:
+            errors.append(f"{mod}.tla defines {own[0]}, which belongs to {LIB_MODULE}")
+        if re.search(rf"\bINSTANCE\s+{LIB_MODULE}\b", text):
+            errors.append(f"{mod}.tla instantiates {LIB_MODULE}; extend it instead")
+        # Trace[traceIndex + 1] may look ahead.
+        if re.search(r"\btrace(?:Index|Explained)\b", re.sub(r"\bTrace\[\s*traceIndex\b[^]]*]", "", text)):
+            errors.append(f"{mod}.tla uses traceIndex or traceExplained; only TraceStep may consume a line")
+        for call in re.finditer(r"\bChanged(?:Var|Set)\b", text):
+            args = _arguments(text, call.end())
+            if args and "'" in args[0]:
+                errors.append(f"{mod}.tla: the first argument of {call.group()} must be unprimed, not {args[0][:40]!r}; "
+                              "otherwise it never requires the variable")
+    errors += _name_errors(modules)
     helpers = "\n".join(modules.values())
-    if re.search(r"\btrace(?:Index|Explained)\s*(?:>>\s*)?'|\bUNCHANGED\s*(?:<<[^>]*)?\btrace(?:Index|Explained)\b", used):
-        errors.append(f"{trace_mod}.tla sets traceIndex or traceExplained; only TraceStep may consume a line")
     if not re.search(r"\bTraceStep\b", helpers):
         errors.append(f"{trace_mod}.tla takes no TraceStep, so it consumes no line")
-    if not re.search(rf"\b(?:{'|'.join(REQUIRING)})\b", helpers):
+    if not re.search(rf"\b(?:{'|'.join(REQUIRING)})\s*\(", helpers):
         errors.append(f"{trace_mod}.tla requires no variable: no step uses {', '.join(REQUIRING[:-1])} or "
                       f"{REQUIRING[-1]}, so a trace of action names alone is accepted")
     return errors
@@ -341,7 +456,7 @@ def trace_spec_errors(spec_dir: Path, name: str) -> list[str]:
 
 def _printable(text: str) -> str:
     """One ASCII line, so that trace content cannot look like another line of the output."""
-    return text.encode("ascii", "backslashreplace").decode()
+    return "".join(c if " " <= c <= "~" else c.encode("unicode_escape").decode() for c in text)
 
 
 _NOTE = {"missing": "missing", "unchecked": "logged but not checked by the step", "different": "different value"}
@@ -422,7 +537,7 @@ def check_mutant(spec_dir: Path, name: str, cfg: Path, out: Path, budget: int) -
     path = spec_dir / trace.group(1)
     lint = lint_file(path)
     if lint:
-        return f"{trace.group(1)}: {lint[0]}"
+        return _printable(f"{trace.group(1)}: {lint[0]}")
     got = check_trace(spec_dir, name, path, out, budget, f"mutant-{cfg.stem}", module=f"{name}TraceMutants",
                       cfg=f"{cfg.parent.name}/{cfg.name}")
     want = (expect.group(1), int(expect.group(2)) if expect.group(2) else got["at"], expect.group(3) or "")
@@ -439,7 +554,7 @@ def cmd_lint(paths: list[Path]) -> int:
     for f in files:
         errors = lint_file(f)
         for e in errors:
-            print(f"{f}: {e}")
+            print(_printable(f"{f}: {e}"))
         bad += bool(errors)
     print(f"{len(files) - bad} valid, {bad} invalid")
     return 1 if bad else 0
@@ -449,6 +564,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     executed = failed = mutants = 0
     errors: list[str] = []
     failing: list[dict] = []
+    plain: list[tuple[Path, bool]] = []
     spec_dir = args.spec_dir.resolve()
     rel = spec_dir.relative_to(tc.REPO_ROOT).as_posix() if spec_dir.is_relative_to(tc.REPO_ROOT) else str(spec_dir)
     tla = {"spec": f"{rel}/{args.name}", "mode": "trace", "tier": args.tier, "tools": tc.tool_versions()}
@@ -476,22 +592,22 @@ def cmd_check(args: argparse.Namespace) -> int:
         covered = [t for t, _ in plain + negative]
         for problem in uncovered(args.traces + args.expect_rejected, covered):
             raise tc.TlaError(problem)
-        for d in args.expect_rejected:
+        for d in args.expect_rejected + (args.traces if plain else []):
             if not collect([d]):
-                raise tc.TlaError(f"{d} (--expect-rejected) has no traces")
+                raise tc.TlaError(f"{d} has no traces")
         control = None
         print(f"[tla_trace] {tla['spec']}: {len(plain)} traces to accept, {len(negative)} to reject, "
               f"budget {budget} s per trace", flush=True)
         for index, (trace, must_reject) in enumerate(plain + negative):
             executed += 1
-            label = trace.name
+            label = _printable(trace.name)
             lint = lint_file(trace)
             if lint:
                 failed += 1
-                failing.append({"file": label[:200], "index": None, "reason": ("lint: " + lint[0])[:300]})
+                failing.append({"file": label[:200], "index": None, "reason": _printable("lint: " + lint[0])[:300]})
                 print(f"[tla_trace] FAIL {label}: not a valid {FORMAT} trace")
                 for e in lint[:20]:
-                    print(f"    {e}")
+                    print(f"    {_printable(e)}")
                 continue
             header = json.loads(read_lines(trace)[0])
             if header["spec"] != args.name:
@@ -559,13 +675,15 @@ def cmd_check(args: argparse.Namespace) -> int:
     tla["traces"] = {"checked": executed - mutants, "accepted": accepted, "rejected": rejected,
                      "expected_rejections": expected_rejections, "failing": failing}
     not_run = [{"id": "tlc-error", "reason": e} for e in errors]
+    # Rejected samples, trace mutants and the control show that the check works, not that a trace is valid.
+    if not plain:
+        not_run.append({"id": "zero-traces", "reason": "no trace files were given"})
     if errors:
         verdict = "error"
     elif failed:
         verdict = "fail"
-    elif executed == 0:
+    elif not plain:
         verdict = "not-run"
-        not_run.append({"id": "zero-traces", "reason": "no trace files were given"})
     else:
         verdict = "pass"
     artifacts = []

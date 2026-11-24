@@ -126,20 +126,23 @@ def parse_tlc_output(text: str, exit_code: int | None = None) -> TlcResult:
     if m:
         res.trace_rejected_at, res.trace_lines = int(m.group(1)), int(m.group(2))
     res.trace_notes = sorted({(int(n.group(1)), n.group(2), n.group(3)) for n in _TRACE_LINE.finditer(text)})
+    reported = False  # TLC printed a success message, whatever else it printed
     for msg in _MSG.finditer(text):
         code, cls, body = int(msg.group(1)), int(msg.group(2)), msg.group(3).strip()
         if code == EC_SUCCESS:
-            res.complete = True
+            res.complete = reported = True
         elif code == EC_STATS:
             # A line the parser cannot read must not leave an earlier line's empty queue standing.
             s = _STATS.search(body)
             res.generated, res.distinct, res.left = (_int(g) for g in s.groups()) if s else (None, None, None)
+            if not s:
+                res.errors.append(f"unreadable statistics: {body[:120]}")
         elif code == EC_DEPTH:
             d = _DEPTH.search(body)
             if d:
                 res.depth = int(d.group(1))
         elif code == EC_SIM_DONE:
-            res.simulation_done = True
+            res.simulation_done = reported = True
             s = _SIM_STATES.search(body)
             if s:
                 res.generated = int(s.group(1))
@@ -181,7 +184,7 @@ def parse_tlc_output(text: str, exit_code: int | None = None) -> TlcResult:
     if res.complete and res.left != 0:
         res.complete = False
     if exit_code is not None:  # None: killed at the budget, so cut-off output is expected
-        if (res.complete or res.simulation_done) and exit_code != 0 and not res.violations:
+        if reported and exit_code != 0 and not res.violations:
             res.complete = res.simulation_done = False
             res.errors.append(f"TLC exited with status {exit_code} after it reported success")
         unread = len(_STARTMSG.findall(text)) - len(_MSG.findall(text))
@@ -278,7 +281,7 @@ def parse_cfg(path: Path) -> Cfg:
     while i < len(tokens):
         tok = tokens[i]
         if tok in _CFG_KEYWORDS:
-            section = {"PROPERTIES": "PROPERTY"}.get(tok, tok.removesuffix("S"))
+            section = {"PROPERTIES": "PROPERTY", "ALIAS": "ALIAS"}.get(tok, tok.removesuffix("S"))
             if section != "CHECK_DEADLOCK":
                 sections.setdefault(section, [])
             if tok == "CHECK_DEADLOCK" and i + 1 < len(tokens):

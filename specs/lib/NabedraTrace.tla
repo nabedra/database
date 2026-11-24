@@ -18,6 +18,9 @@
 (* optional, so a step cannot leave a variable unchecked silently:        *)
 (* OptionalVar and NoVars say what they give up.                          *)
 (*                                                                         *)
+(* The step checks "node" and "msg" itself, in its second argument. See  *)
+(* RequireMsg. A field that no step compares is not checked.             *)
+(*                                                                         *)
 (* The copy of the trace that TLC reads has no "t" and no "seed", because  *)
 (* TLC integers have 32 bits. A trace spec that reads Line.t or           *)
 (* TraceHeader.seed gets a TLC error. An integer outside 32 bits in "msg" *)
@@ -28,7 +31,7 @@
 (* TraceIndexIsLevel and sets POSTCONDITION TraceAccepted. A trace is    *)
 (* accepted when some behavior of the spec consumes every line.           *)
 (***************************************************************************)
-EXTENDS Naturals, Sequences, Json, IOUtils, TLC
+EXTENDS Naturals, Sequences, FiniteSets, Json, IOUtils, TLC
 
 \* The whole file, header and steps, as TLA+ values. JSON objects become
 \* records, arrays become sequences, strings and integers stay as they are.
@@ -87,7 +90,9 @@ RequireSet(new) == [must |-> TRUE, set |-> TRUE, new |-> new]
 
 \* The line carries the variable when the step changes it. A line without
 \* it says that the step left it as it was. Use it for a variable that only
-\* some of the action's steps change.
+\* some of the action's steps change. old is unprimed. TLC compares old and
+\* new, so a change between a string and a record is a TLC error: use
+\* RequireVar for such a variable.
 ChangedVar(old, new) == [must |-> old # new, set |-> FALSE, new |-> new]
 ChangedSet(old, new) == [must |-> old # new, set |-> TRUE, new |-> new]
 
@@ -102,9 +107,13 @@ NoVars == [v \in {} |-> v]
 
 LOCAL Logged == DOMAIN Line.vars
 
+\* A set is logged as an array without duplicates. Its order is not
+\* checked, because TLC does not order strings.
 LOCAL Agrees(v, check) ==
-    IF check.set THEN ToSet(Line.vars[v]) = check.new
-                 ELSE Line.vars[v] = check.new
+    LET value == Line.vars[v] IN
+    IF check.set THEN /\ Len(value) = Cardinality(ToSet(value))
+                      /\ ToSet(value) = check.new
+                 ELSE value = check.new
 
 \* Keeps the problems of the furthest line, for TraceAccepted to print.
 LOCAL Note(notes) ==
@@ -113,6 +122,18 @@ LOCAL Note(notes) ==
     ELSE TLCSet(TraceRegister,
                 [old EXCEPT !.at = traceIndex,
                             !.notes = notes \cup (IF old.at = traceIndex THEN @ ELSE {})])
+
+\* The line's msg carries every field of m, with its value. Fields that m
+\* does not have are not checked. Use it in the second argument of a
+\* TraceStep, after the spec action, such as
+\* TMCommit /\ RequireMsg([type |-> "Commit"]).
+RequireMsg(m) ==
+    LET have == IF HasMsg THEN DOMAIN LineMsg ELSE {}
+        notes ==
+            {<<"missing", "msg." \o f>> : f \in DOMAIN m \ have}
+            \cup {<<"different", "msg." \o f>> :
+                     f \in {g \in DOMAIN m \cap have : LineMsg[g] # m[g]}}
+    IN IF notes = {} THEN TRUE ELSE Note(notes) /\ FALSE
 
 \* Counts the line as explained. A line consumed in any other way is not.
 LOCAL Explained ==
@@ -161,6 +182,7 @@ TraceIndexIsLevel ==
 \* diameter is the length in states of the longest behavior TLC found, so,
 \* with TraceIndexIsLevel, diameter - 1 lines were consumed. The lines that
 \* TraceStep explained bound it, so it does not rest on the invariant alone.
+\* traceExplained counts them, so nothing else may set it.
 \* On rejection it prints the 0-based index of the first line no behavior
 \* explains, and the variable problems found at that line, which
 \* tla_trace.py reads.

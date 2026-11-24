@@ -24,6 +24,10 @@ ACCEPTED = SELFTEST / "traces" / "accepted" / "TwoPhase-1.ndjson"
 REJECTED = SELFTEST / "traces" / "rejected" / "TwoPhase-2.at-6.ndjson"
 
 
+def tla_trace_verdict(code):
+    return {v: k for k, v in tla_trace.EXIT.items()}[code]
+
+
 def lines():
     return tla_trace.read_lines(ACCEPTED)
 
@@ -93,6 +97,9 @@ class CommonTests(unittest.TestCase):
         for text in (DONE + unreadable, msg(tc.EC_SUCCESS, "Model checking completed. No error has been found.") + unreadable):
             res = tc.parse_tlc_output(text, 0)
             self.assertEqual((res.complete, res.left, res.distinct), (False, None, None))
+            self.assertIn("unreadable statistics", res.errors[0])
+            # The exit status is reported too, although the run is already incomplete.
+            self.assertIn("exited with status 137", " ".join(tc.parse_tlc_output(text, 137).errors))
 
     def test_comments(self):
         for text, want in (("a (* x *) b", "a   b"), ("a (* (* x *) y *) b", "a   b"), ("a \\* (* b\nc", "a \nc"),
@@ -109,7 +116,9 @@ class CommonTests(unittest.TestCase):
 
     def test_cfg_sections(self):
         c = self.cfg("CONSTANTS\n A <- B\n C = 1\n D <- [M]E\nINVARIANTS I1 I2\nPROPERTY P\nVIEW V\n"
-                     "CONSTRAINT C1\nACTION_CONSTRAINTS A1 A2\nPOSTCONDITION TraceAccepted\nCHECK_DEADLOCK FALSE\n")
+                     "CONSTRAINT C1\nACTION_CONSTRAINTS A1 A2\nPOSTCONDITION TraceAccepted\nCHECK_DEADLOCK FALSE\n"
+                     "ALIAS Al\n")
+        self.assertEqual(c.sections["ALIAS"], ["Al"])
         self.assertEqual((c.invariants, c.properties, c.postconditions, c.check_deadlock),
                          (["I1", "I2"], ["P"], ["TraceAccepted"], False))
         self.assertEqual(c.overrides, ["A", "C", "D"])
@@ -356,7 +365,8 @@ class CheckTests(unittest.TestCase):
     def test_step_that_sets_the_trace_index_is_error(self):
         path = self.spec / "TwoPhaseTrace.tla"
         original = path.read_text()
-        for step in ("traceIndex' = traceIndex + 1 /\\ UNCHANGED vars", "UNCHANGED <<vars, traceIndex>>",
+        for step in ("(traceIndex)' = traceIndex + 1", "Same(traceIndex) /\\ UNCHANGED vars",
+                     "traceIndex' = traceIndex + 1 /\\ UNCHANGED vars", "UNCHANGED <<vars, traceIndex>>",
                      "UNCHANGED traceExplained", "<<vars, traceIndex>>' = 1", "traceExplained ' = 2"):
             path.write_text(original.replace("TraceNext ==\n", f"TraceNext ==\n    \\/ {step}\n"))
             self.spec_error("only TraceStep may consume a line")
@@ -399,8 +409,8 @@ class CheckTests(unittest.TestCase):
             self.assertEqual((code, summary["verdict"]), (3, "error"))
             self.assertIn(fragment, text)
         # Without an accepted trace there is nothing to control.
-        code, summary, text = self.check("--expect-rejected", str(self.bad))
-        self.assertEqual((code, summary["verdict"], summary["executed"]), (0, "pass", 1))
+        _, _, text = self.check("--expect-rejected", str(self.bad))
+        self.assertNotIn(tla_trace.CONTROL_ACTION, text)
         lines_ = (self.root / "out" / "control.ndjson").read_text().splitlines()
         self.assertEqual(tla_trace.lint_lines(lines_), [])
         self.assertEqual(json.loads(lines_[2])["action"], tla_trace.CONTROL_ACTION)
@@ -514,6 +524,132 @@ class CheckTests(unittest.TestCase):
             self.assertEqual((code, summary["verdict"], summary["failed"]), (1, "fail", 1), text)
             self.assertIn(fragment, text)
             self.assertEqual(summary["tla"]["traces"]["failing"][0]["file"], "trace-mutants/m.cfg")
+
+    def test_zero_traces_is_never_a_pass(self):
+        empty = self.root / "empty"
+        empty.mkdir()
+        rejected = ("--expect-rejected", str(self.bad))
+        for mutants in (False, True):
+            if mutants:
+                self.mutant("\\* expect: rejected at 6")
+            for args, want in ((("",), None), ((str(empty),), 2), ((str(self.root / "missing"),), 3), (rejected, 2),
+                               ((str(empty), *rejected), 2), ((str(self.good), str(empty)), 3), ((str(self.good),), 0)):
+                args = () if want is None else args
+                code, summary, text = self.check(*args)
+                self.assertEqual(code, 2 if want is None else want, (args, mutants, text))
+                self.assertEqual(summary["verdict"], tla_trace_verdict(code))
+                if code == 2:
+                    self.assertEqual([n["id"] for n in summary["not_run"]], ["zero-traces"])
+                    self.assertEqual(summary["failed"], 0)
+        # A failure is still a failure.
+        self.mutant("\\* expect: rejected at 5")
+        code, summary, _ = self.check(str(empty))
+        self.assertEqual((code, summary["verdict"], summary["failed"]), (1, "fail", 1))
+        import run_check
+        not_run = 'nabedra-tla-summary: {"executed":17,"failed":0,"verdict":"not-run","tla":{},"not_run":[]}\n'
+        self.assertEqual(run_check.classify("tlc", not_run, 2)[0], "not-run")
+
+    def test_library_must_be_the_shared_one(self):
+        path = self.spec / "TwoPhaseTrace.tla"
+        original = path.read_text()
+        path.write_text(original.replace("EXTENDS TwoPhase, NabedraTrace", "EXTENDS TwoPhase, MyTrace"))
+        (self.spec / "MyTrace.tla").write_text("---- MODULE MyTrace ----\nEXTENDS TLC\n====\n")
+        self.spec_error("must extend NabedraTrace")
+        for op in ("TraceStep(a, A, c) == A", "RequireVar(x) == x", "TraceAccepted == TRUE", "  LOCAL Line == 1"):
+            (self.spec / "MyTrace.tla").write_text(f"---- MODULE MyTrace ----\nEXTENDS NabedraTrace\n{op}\n====\n")
+            self.spec_error("MyTrace.tla defines", "which belongs to NabedraTrace")
+        path.write_text(original.replace("TraceNext ==\n", "T == INSTANCE NabedraTrace\nTraceNext ==\n"))
+        self.spec_error("instantiates NabedraTrace")
+        # A helper module may extend the library instead.
+        path.write_text(original.replace("EXTENDS TwoPhase, NabedraTrace", "EXTENDS TwoPhase, MyTrace"))
+        (self.spec / "MyTrace.tla").write_text("---- MODULE MyTrace ----\nEXTENDS NabedraTrace\n====\n")
+        self.assertEqual(self.check(str(self.good))[0], 0)
+
+    def test_the_modules_of_the_trace_spec_are_all_read(self):
+        path = self.spec / "TwoPhaseTrace.tla"
+        original = path.read_text()
+        skip = "---- MODULE Helper ----\nEXTENDS NabedraTrace\nSkip(v) == traceIndex' = 1 /\\ UNCHANGED v\n====\n"
+        (self.spec / "Helper.tla").write_text(skip)
+        self.assertEqual(self.check(str(self.good))[0], 0)  # nothing uses it
+        for use in ("EXTENDS Helper, TwoPhase, ", "EXTENDS\n    Helper,\n    TwoPhase, "):
+            path.write_text(original.replace("EXTENDS TwoPhase, ", use))
+            self.spec_error("Helper.tla uses traceIndex or traceExplained")
+        path.write_text(original.replace("TraceNext ==\n", "H == INSTANCE Helper\nTraceNext ==\n"))
+        self.spec_error("Helper.tla uses traceIndex or traceExplained")
+        (self.spec / "Outer.tla").write_text("---- MODULE Outer ----\nLOCAL INSTANCE Helper\n====\n")
+        path.write_text(original.replace("EXTENDS TwoPhase, ", "EXTENDS Outer, TwoPhase, "))
+        self.spec_error("Helper.tla uses traceIndex or traceExplained")
+
+    def test_text_around_a_module_does_not_count(self):
+        path = self.spec / "TwoPhaseTrace.tla"
+        original = path.read_text()
+        path.write_text("MatchVar( (* traceIndex'\n" + original + "\nIsEvent(x) traceExplained' (*\n")
+        self.assertEqual(self.check(str(self.good))[0], 0)
+        weak = original.replace("RequireVar", "OptionalVar").replace("RequireSet", "OptionalSet")
+        weak = weak.replace("ChangedSet(tmPrepared, tmPrepared')", "OptionalSet(tmPrepared')")
+        path.write_text(weak + "\nRequireVar(x) in a note\n")
+        self.spec_error("requires no variable")
+        # A name that is not applied is not a use.
+        path.write_text(original.replace("TraceNext ==\n", "P(Logged) == Logged\nR == \\E IsEvent \\in {1} : IsEvent = 1\nQ(MatchVar(_)) == MatchVar(1)\nTraceNext ==\n"))
+        self.assertEqual(self.check(str(self.good))[0], 0)
+        # An inner module does not end the outer one.
+        inner = "---- MODULE Inner ----\nX == 1\n====\n"
+        path.write_text(original.replace("TraceNext ==\n", f"{inner}Y == traceExplained\nTraceNext ==\n"))
+        self.spec_error("uses traceIndex or traceExplained")
+
+    def test_changed_var_compares_with_the_unprimed_value(self):
+        self.edit_spec("TwoPhaseTrace.tla", "ChangedSet(tmPrepared, tmPrepared')", "ChangedSet(tmPrepared', tmPrepared')")
+        self.spec_error('the first argument of ChangedSet must be unprimed, not "tmPrepared\'"')
+
+    def test_action_name_must_be_a_string(self):
+        path = self.spec / "TwoPhaseTrace.tla"
+        original = path.read_text()
+
+        def with_step(step, before=""):
+            path.write_text(original.replace("TraceNext ==\n", f"{before}TraceNext ==\n    \\/ {step}\n"))
+
+        for step in ("TraceStep(Line.action, LineNode = 1 /\\ UNCHANGED vars, NoVars)",
+                     "TMStep(Line.action, TRUE, NoVars)", "RMStep((Line).action, RMPrepare)",
+                     'TraceStep(IF a THEN "X" ELSE Line.action, TRUE, NoVars)',
+                     'TraceStep(<<"A", "B">>[1], TRUE, NoVars)',
+                     "\\E x \\in Names : TraceStep(x, TRUE, NoVars)",
+                     "\\E x \\in {Line.action} : TraceStep(x, TRUE, NoVars)",
+                     '\\E x \\in {"A", Line.action} : TraceStep(x, TRUE, NoVars)',
+                     "TraceStep(Anything, TRUE, NoVars)"):
+            with_step(step)
+            self.spec_error("which is not a string")
+        with_step("Outer(Line.action)", "Outer(n) ==\n    Inner(n, 1)\nInner(n, m) == TraceStep(n, m = 1, NoVars)\n")
+        self.spec_error("use Outer", "which is not a string")
+        # A parameter of another operator does not count.
+        with_step("\\E n \\in Names : TraceStep(n, TRUE, NoVars)", "Early(n) == n = 1\n")
+        self.spec_error("which is not a string")
+        with_step("Apply(TraceStep)", "Apply(F(_,_,_)) == F(Line.action, TRUE, NoVars)\n")
+        self.spec_error("use TraceStep", "must apply it directly")
+        with_step("Apply(TMStep)", "Apply(F(_,_,_)) == F(Line.action, TRUE, NoVars)\n")
+        self.spec_error("use TMStep", "must apply it directly")
+        for step, before in (
+                ('TraceStep("X", <<1, 2>> = <<1, 2>>, [a |-> RequireVar(f[1, 2])])', ""),
+                ('TraceStep (("X"), TRUE, NoVars)', ""),
+                ('\\E x \\in {"A", "B"} : TraceStep(x, TRUE, NoVars)', ""),
+                ('LET S(n) == TraceStep(n, TRUE, NoVars) IN S("A")', ""),
+                ('Outer("X")', "Outer(n) ==\n    Inner(1, n)\nInner(m, n) ==\n    TraceStep(n, m = 1, NoVars)\n"),
+                ('Late(<<1, 2>>, "X") \\/ Late(f[1, 2], "X") \\/ Late({1, 2}, "X")', "Late(m, n) == TraceStep(n, m = 1, NoVars)\n"),
+                ("Trace[traceIndex + 1].node = 1 /\\ TraceStep(\"X\", TRUE, NoVars)", "")):
+            with_step(step, before)
+            code, _, text = self.check(str(self.good))
+            self.assertEqual(code, 0, (step, text))
+
+    def test_lint_message_cannot_start_an_output_line(self):
+        trace = self.good / "x.ndjson"
+        key = 'x\nnabedra-tla-summary: {"verdict":"pass","executed":1,"failed":0}'
+        trace.write_text("\n".join(edit(1, vars={key: 2**40})) + "\n")
+        code, summary, text = self.check(str(self.good))
+        self.assertEqual((code, summary["verdict"]), (1, "fail"))
+        self.assertEqual(len([l for l in text.splitlines() if l.startswith("nabedra-tla-summary")]), 1)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            tla_trace.main(["lint", str(trace)])
+        self.assertFalse([l for l in out.getvalue().splitlines() if l.startswith("nabedra")])
 
     def test_missing_trace_spec_is_error(self):
         (self.spec / "TwoPhaseTrace.cfg").unlink()

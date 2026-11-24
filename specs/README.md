@@ -83,34 +83,56 @@ fit is a decimal string. The lint refuses such an integer in `vars` and
 and the content of the first line no behavior explains, and with the
 variables that are missing, logged but not checked, or different there.
 Every trace under `--expect-rejected` must be rejected, at index `n` when
-the file is named `*.at-<n>.ndjson`. A directory that does not exist, an
-empty `--expect-rejected` directory, and traces in a subfolder that no
+the file is named `*.at-<n>.ndjson`. Without a trace to accept, the result
+is `not-run`, never `pass`: rejected samples, trace mutants and the control
+only show that the check works. A path that does not exist, a directory
+without traces next to other traces, and traces in a subfolder that no
 argument covers are errors.
 
 A trace spec takes its steps through `TraceStep`, which requires the line's
 variables. See [trace validation](../.agents/skills/design-review/references/trace-validation.md).
-Before any trace, the check refuses a trace spec that could accept anything:
+Before any trace, the check reads the text of `<Name>Trace.cfg`,
+`<Name>Trace.tla` and the modules of the spec folder that it extends or
+instantiates, and refuses:
 
-- `<Name>Trace.cfg` without the invariant `TraceIndexIsLevel` or
-  `POSTCONDITION TraceAccepted` (comments, also nested, do not count), or one
-  that overrides an operator the check relies on;
-- a module in the spec folder with the name of a shared or standard module;
-- a trace spec that takes no `TraceStep`, sets `traceIndex` or
-  `traceExplained` itself, uses a removed operator (`IsEvent`, `MatchVar`,
-  `MatchSet`), or requires no variable.
+- a cfg without the invariant `TraceIndexIsLevel` or `POSTCONDITION
+  TraceAccepted` (comments, also nested, do not count), or one that overrides
+  an operator the check relies on;
+- a module in the spec folder with the name of a shared or standard module,
+  one that defines an operator of `NabedraTrace` or instantiates it, and a
+  trace spec that does not extend it;
+- a module that uses `traceIndex` or `traceExplained`, except to look ahead
+  with `Trace[traceIndex + 1]`;
+- a `TraceStep` whose action name is not a fixed string, so that one step
+  could take any line;
+- `ChangedVar` or `ChangedSet` with a primed first argument;
+- a removed operator (`IsEvent`, `MatchVar`, `MatchSet`), no `TraceStep`, or
+  no step that requires a variable.
 
+TLC then counts a line as consumed only when a `TraceStep` took it. A step
+that consumes no line is an error. A step that skips a line is an error
+unless it also counts `traceExplained` itself, which the text check refuses.
 After an accepted trace, one control run checks that a line with an unknown
-action is rejected, which a step that takes any action name would accept.
-`TraceIndexIsLevel` and `TraceAccepted` count only the lines that
-`TraceStep` explained. A step that skips a line or consumes none is an
-error, also when the cfg checks above miss it.
+action, no variables and no message is rejected.
 
-Not detected, and left to the review of the trace spec: a step that takes a
-weaker action than its name says, such as one that stutters; `OptionalVar`
-or `NoVars` without a reason; a step that checks a variable against an
-expression that does not depend on the next state; and a constant from
-`params` that hides a difference. The check reads `.tla` text and does not
-prove that `RequireVar` is reached on every action.
+Not detected, and left to the review of the trace spec:
+
+- a step that takes a weaker action than its name says, such as one that
+  stutters under the name of a fault;
+- a `msg` field or a `node` that the step does not compare;
+- `OptionalVar` or `NoVars` without a reason, and a check that does not
+  depend on the next state;
+- an initial state weaker than `Init`, and a constant from `params` that
+  hides a difference;
+- the order of the array that logs a set, and an empty object in place of an
+  empty one;
+- that `RequireVar` is reached on every action. The text checks find
+  mistakes. They do not stop a spec that is written to evade them.
+
+Known false alarms: `ChangedVar` on a variable that changes between a string
+and a record is a TLC error, because TLC compares the two, so use
+`RequireVar` there. So is any comparison of a logged value with a value of
+another type.
 
 When `trace-mutants/` exists, each `*.cfg` there runs
 `<Name>TraceMutants.tla`, a broken version of the trace spec, on one trace.
@@ -149,7 +171,8 @@ supervisor, two mutants (`commit_one_prepared` breaks `Consistent`,
 `no_resend` breaks `Termination`), and a trace spec. The accepted sample
 traces include one with 64-bit times and a 64-bit seed. The rejected ones
 cover a step the spec does not allow, missing variables (one, a set, one of
-two, all), a variable that nothing checks, and a wrong value and set. The
+two, all), a variable that nothing checks, a wrong value and set, an element
+logged twice, and messages that are wrong, missing or out of place. The
 trace mutants cover steps that skip or consume no line, trace specs that
 read `t`, `seed` or a wide `msg` field, and what each check in
 `NabedraTrace` requires. The checks `specs-selftest` (T0, T1),

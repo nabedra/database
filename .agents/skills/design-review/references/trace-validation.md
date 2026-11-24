@@ -12,8 +12,12 @@ follows Cirstea, Kuppe, Loillier and Merz,
 - The module's simulation workload writes one JSON line per protocol step:
   `seq`, `node`, the spec action name, and the variables the action
   changes, under their spec names. A line must carry every variable that
-  its trace spec step requires. A line that does not is rejected, with the
-  line index and the variable name.
+  its trace spec step requires, and no variable that the step does not
+  check. Otherwise the line is rejected, with the line index and the
+  variable name. A key appears once in an object.
+- A spec set is a sorted array without duplicates.
+- `msg` is the message the step sent or received, or the fault's
+  parameters, under the spec's field names.
 - Write a line at the point where the step takes effect, such as after the
   fsync or after the reply is sent, not where it starts.
 - Times come from the simulated clock, and the trace is deterministic for a
@@ -53,6 +57,16 @@ a sorted array. Join two records with `@@`.
 | `ChangedVar`, `ChangedSet` | Carries the variable when the step changes it. Without it, the step must leave the variable as it was. For a variable that only some of the action's steps change |
 | `OptionalVar`, `OptionalSet` | May carry the variable. Without it, any value is accepted |
 | `NoVars` | Carries no variable. For an action that changes none that the code can log, such as most faults |
+
+`node` and `msg` are checked only where the step compares them, in its
+second argument. Write it so that a wrong node, a wrong message and a
+missing message are rejected: `LineNode \in RM`, and
+`TMCommit /\ RequireMsg([type |-> "Commit"])`, which needs the line's `msg`
+to carry those fields with those values, or `~HasMsg` for a step without a
+message. Add a rejected sample for each.
+
+The first argument is a string, a name bound over a set of strings, or a
+parameter that its callers fill with one.
 
 A line that carries a variable the step does not name is rejected too, so a
 misspelt name cannot go unnoticed. A variable the code cannot log is left
