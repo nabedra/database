@@ -146,6 +146,8 @@ pub struct Envelope<'a> {
     /// The message's position in its direction, from 0, counting handshake messages.
     pub seq: u64,
     pub kind: Kind,
+    /// Negotiated ALPN for data messages, if the connection used a handshake.
+    pub alpn: Option<&'a [u8]>,
     pub bytes: &'a [u8],
 }
 
@@ -284,6 +286,7 @@ struct Connection {
     /// Whether each side's handle (pending or stream) is alive.
     open: [bool; 2],
     reset: bool,
+    alpn: Option<Vec<u8>>,
 }
 
 impl Connection {
@@ -751,6 +754,7 @@ async fn dial_one(net: &Arc<Net>, from: Option<u64>, addr: SocketAddr) -> io::Re
                         pipes: [Pipe::default(), Pipe::default()],
                         open: [true, true],
                         reset: false,
+                        alpn: None,
                     },
                 );
                 let slot = state.listeners.get_mut(&addr).unwrap();
@@ -988,6 +992,9 @@ impl Half {
             to: conn.ends[self.side.rx()].node,
             seq: pipe.sent,
             kind,
+            alpn: (kind == Kind::Data)
+                .then_some(conn.alpn.as_deref())
+                .flatten(),
             bytes,
         };
         let fate = state
@@ -998,6 +1005,9 @@ impl Half {
         match fate {
             Fate::Deliver { .. } if pipe.stalled => Ok(()),
             Fate::Deliver { delay } => {
+                if let Body::ServerHello { alpn, .. } = &body {
+                    conn.alpn.clone_from(alpn);
+                }
                 let now = Instant::now();
                 let ready_at = pipe
                     .last_ready

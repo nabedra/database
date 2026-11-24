@@ -1,4 +1,7 @@
 //! Authenticated conditional-object HTTP transport. No redirects or PUT retries.
+
+pub(crate) mod connector;
+
 use super::{
     Download, Namespace, ObjectAccessError, ObjectKey, ObjectStore, StorageError, WriteCondition,
 };
@@ -10,10 +13,7 @@ use hyper::{
     header::{self, HeaderMap, HeaderValue},
 };
 use hyper_rustls::HttpsConnector;
-use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
-    rt::TokioExecutor,
-};
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use std::{
     future::Future,
@@ -40,7 +40,7 @@ const MAX_OBJECT: usize = 80 * 1024 * 1024;
 /// Neither this type nor its errors expose the token or transport diagnostics.
 #[derive(Clone)]
 pub struct HttpStore {
-    client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    client: Client<HttpsConnector<connector::HttpConnector>, Full<Bytes>>,
     base: String,
     namespace: Namespace,
     authorization: HeaderValue,
@@ -175,9 +175,7 @@ impl HttpStore {
         .map_err(|_| invalid)?
         .with_root_certificates(roots)
         .with_no_client_auth();
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
-        http.set_connect_timeout(Some(CONNECT_TIMEOUT));
+        let http = connector::new(CONNECT_TIMEOUT);
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls)
             .https_or_http()

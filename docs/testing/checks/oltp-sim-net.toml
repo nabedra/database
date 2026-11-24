@@ -1,0 +1,34 @@
+id = "oltp-sim-net"
+module = "oltp"
+kinds = ["S"]
+guarantees = ["OLTP-G04"]
+scenarios = ["D10"]
+tiers = ["T0", "T1"]
+# Component fault model. The process scenarios also run over real networking.
+command = ["bash", "-euo", "pipefail", "-c", '''
+log=$(mktemp)
+trap 'rm -f "$log"' EXIT
+echo "fault model: OLTP network profiles, seeds 1 through 50 replayed twice"
+export NABEDRA_SEED=1
+(
+cargo test --locked -p nabedra-sim-oltp --lib -j 2 -- --test-threads=1 --nocapture
+cargo test --locked -p nabedra-database --no-default-features --features oltp,sim --lib -j 2 oltp_runtime::api_process::sim_net_tests::sim_net_reaches_oltp_handler -- --exact --test-threads=1 --nocapture
+) | tee "$log"
+for case in request-cut reply-cut stream-delay fallback-only axum-handler; do
+    grep -F "sim-net $case: 50/50 passing with matching replay hashes" "$log"
+done
+NABEDRA_CASES=1 python3 ../scripts/testing/repeat_gate.py --features oltp,sim <<'JSON'
+[
+  {"id": "net::tests::request_cut", "file": "server/sim-oltp/src/net/tests.rs", "lang": "rust"},
+  {"id": "net::tests::reply_cut", "file": "server/sim-oltp/src/net/tests.rs", "lang": "rust"},
+  {"id": "net::tests::stream_delay", "file": "server/sim-oltp/src/net/tests.rs", "lang": "rust"},
+  {"id": "net::tests::fallback_only", "file": "server/sim-oltp/src/net/tests.rs", "lang": "rust"},
+  {"id": "oltp_runtime::api_process::sim_net_tests::sim_net_reaches_oltp_handler", "file": "server/src/oltp_runtime/api_process.rs", "lang": "rust"}
+]
+JSON
+''']
+cwd = "server"
+timeout_s = 1800
+needs = []
+result_parser = "cargo-test"
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_CASES = "50" }

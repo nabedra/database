@@ -255,7 +255,13 @@ fn a_certificate_override_impersonates_another_node() {
 fn each_flush_is_one_message_with_its_stream_and_direction_visible() {
     run(5, |world| async move {
         nodes(&world, &[1, 2]);
-        let log = record(&world, |_| Fate::NOW);
+        let log = record(&world, |envelope| {
+            match envelope.kind {
+                Kind::Handshake => assert_eq!(envelope.alpn, None),
+                Kind::Data => assert_eq!(envelope.alpn, Some(OTP4)),
+            }
+            Fate::NOW
+        });
         let (mut client, mut server) = streams(&world, 2, 1).await;
         let conn = client.id();
         assert_eq!(server.id(), conn);
