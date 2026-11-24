@@ -33,7 +33,7 @@ UNITTEST_ZERO = "\n-------------------------------------------------------------
 NODE_OK = "TAP version 13\nok 1 - a\n# tests 4\n# suites 0\n# pass 3\n# fail 0\n# cancelled 0\n# skipped 1\n# todo 0\n"
 NODE_FAIL = "TAP version 13\nnot ok 1 - a\n# tests 3\n# pass 1\n# fail 1\n# cancelled 1\n# skipped 0\n"
 TLA_FACTS = {"spec": "specs/selftest/TwoPhase", "mode": "exhaustive", "tier": "T1", "tools": "tlc 1.8.0",
-             "distinct_states": 2750, "depth": 15,
+             "distinct_states": 2750, "depth": 15, "runs": [{"cfg": "TwoPhase.cfg", "verdict": "pass", "states_left": 0}],
              "mutants": [{"name": "m", "expect": "Inv", "observed": "Inv", "ok": True, "cex_length": 6}]}
 
 
@@ -167,6 +167,7 @@ class TlcParserTests(unittest.TestCase):
             "NaN in the facts": line(tla={**TLA_FACTS, "depth": float("nan")}),
             "no tla facts": line(tla=...),
             "tla facts of another type": line(tla=[]),
+            "pass of an exhaustive run with no run": line(tla={k: v for k, v in TLA_FACTS.items() if k != "runs"}),
             "pass with not-run entries": line(not_run=[{"id": "b", "reason": "stopped at the budget"}]),
             "pass with an uncovered action": line(tla={**TLA_FACTS, "uncovered": ["A"]}),
             "pass with a failed mutant": line(tla={**TLA_FACTS, "mutants": [{"name": "m", "ok": False}]}),
@@ -408,7 +409,29 @@ class FitRecordTests(unittest.TestCase):
                     self.assertEqual(run_check.evidence.validate(record), [])
                     self.assertEqual(record["result"], want)
                     self.assertNotIn("tla", record)
-                    self.assertIn("truncated", record["assertions"]["not_run"][0]["reason"])
+                    first, *rest = record["assertions"]["not_run"]
+                    self.assertIn("truncated", first["reason"])
+                    # What is not the tool's facts stays.
+                    self.assertEqual(rest, [{"id": "a", "reason": "b"}])
+                    self.assertEqual([a["name"] for a in record["artifacts"]], ["x.log", "tla/summary.json"])
+
+    def test_refused_facts_beside_many_not_run_entries(self):
+        entries = [{"id": "tlc-error", "reason": f"e{i} " + "x" * 280} for i in range(300)]
+        record = t_record(result="error", executed=300, failed=0, not_run=entries, mode="trace", nonsense=1,
+                          artifacts=[artifact(f"trace-{i:03d}.log") for i in range(60)] + [artifact("summary.json")])
+        run_check.ensure_valid(record)
+        self.assertEqual(run_check.evidence.validate(record), [])
+        not_run = record["assertions"]["not_run"]
+        self.assertEqual([not_run[0]["id"], not_run[-1]["id"]], ["record", "truncated"])
+        kept = sum(n["id"] == "tlc-error" for n in not_run)
+        self.assertGreater(kept, 50)
+        self.assertTrue(not_run[-1]["reason"].startswith(f"{300 - kept} more not-run entries"))
+        self.assertEqual([a["name"] for a in record["artifacts"][:2]], ["x.log", "tla/summary.json"])
+
+    def test_more_limits_than_the_schema_allows(self):
+        record = t_record(limits=[f"X.cfg: CONSTRAINT C{i}" for i in range(53)])
+        self.fit(record)
+        self.assertEqual((len(self.tla["limits"]), self.dropped), (50, {"limits": 3}))
 
     def test_bad_artifacts_are_dropped_and_counted(self):
         record = t_record(artifacts=[{"name": "tla/a"}, artifact("n" * 300), artifact("summary.json")])

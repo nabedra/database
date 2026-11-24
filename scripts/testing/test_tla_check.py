@@ -543,6 +543,94 @@ class CheckOrchestrationTests(unittest.TestCase):
                 self.assert_fails("FAIL search of TwoPhase.cfg: CONSTRAINT Few: ", FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]),
                                   prep=self.limited(definition))
 
+    def bound(self, body, extra=""):
+        """What the rule says about `Few`, in a module with the given definition."""
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "M.tla").write_text(
+                "---- MODULE M ----\nEXTENDS Naturals\nCONSTANT S\nVARIABLES n, m, up\nvars == <<n, m, up>>\n"
+                f"{extra}Few =={body}\nAfter == n\n====\n")
+            return tla_check.Model(Path(d), "M.tla").bound_problem("Few")
+
+    def test_each_selecting_operator_is_refused_beside_one_order_comparison(self):
+        # Each body has one order comparison outside every bracket, so only the operator can refuse it.
+        bodies = {
+            "=": "n <= f[m = 1]", "#": "n <= f[m # 1]", "/=": "n <= f[m /= 1]", "\\neq": "n <= f[m \\neq 1]",
+            "\\notin": "n <= f[m \\notin S]", "~": "~ n <= 1", "\\lnot": "\\lnot n <= 1", "\\neg": "\\neg n <= 1",
+            "=>": "up => n <= 1", "<=>": "up <=> n <= 1", "\\equiv": "up \\equiv n <= 1", "\\/": "up \\/ n <= 1",
+            "\\lor": "n <= 1 \\lor up", "\\E": "\\E s \\in S : n <= 1", "\\A": "\\A s \\in {t \\in S : up} : 1 <= 0",
+            "\\subseteq": "n <= f[S \\subseteq {m}]", "==": "n <= 1\n  Other == m", '"': 'n <= f["a"]',
+            "IF": "IF up THEN n <= 1 ELSE up", "CASE": "CASE up -> n <= 1 [] OTHER -> up", "ENABLED": "ENABLED n <= 1",
+            "CHOOSE": "CHOOSE b \\in BOOLEAN : n <= 1", "LAMBDA": "LAMBDA x : n <= 1",
+        }
+        self.assertEqual(set(bodies), tla_check._SELECTS)
+        for token, body in bodies.items():
+            with self.subTest(token):
+                used = "a string" if token == '"' else token
+                self.assertIn(f"Few uses {used}, so it selects states", self.bound(" " + body) or "accepted")
+        for body in ("n <= f[m]", "n <= m", "(n <= m)"):  # the same shapes without one
+            self.assertIsNone(self.bound(" " + body))
+
+    def test_a_body_the_rule_cannot_read_is_refused(self):
+        sel = "Sel(p) == p \\/ up\nId(p) == p\nCap == n <= 3\n"
+        refused = {
+            'a body in column 1': '\nup["r1"] # "x"', "a quantifier body in column 1": " \\A s \\in S :\nup[s] # m",
+            "a second conjunct in column 1": " n <= 1 /\\\nup", "an operand in column 1": " n <=\n1 \\/ up",
+            "a selecting call around the bound": " Sel(n <= 1)", "an identity call": " Id(n <= 1)", "an application": " f[n <= 1]",
+            "a set": " {n <= 1}", "membership": " (n <= 1) \\in {up}", "an empty body": "", "an empty quantifier": " \\A s \\in S :",
+            "an empty last conjunct": " n <= 1 /\\", "an empty conjunct": " n <= 1 /\\ () /\\ m <= 1", "no left operand": " <= 1",
+            "no right operand": " n <=", "an open bracket": " (n <= 1", "a closed bracket": " n <= 1)", "two comparisons": " n <= f[m <= 1]",
+            "a call after the bound": " n <= 1 /\\ Sel(up)", "a nested group": " n <= 1 /\\ (m <= 1 /\\ up)",
+            "a quantified group": " \\A s \\in S : (n <= 1 /\\ \\A t \\in S : up)", "a name of a variable": " up",
+            "Unicode not-equal": " up \u2260 D \\/ n <= 0", "Unicode or": " up \u2228 n <= 0", "Unicode implies": " (up) \u21d2 n <= 0",
+            "Unicode and": " n <= 1 \u2227 up", "Unicode order": " n \u2264 1", "Unicode not": " \u00ac(n <= 1)",
+        }
+        for name, body in refused.items():
+            with self.subTest(name):
+                self.assertIsNotNone(self.bound(body, sel))
+        accepted = {
+            "a body in column 1": "\nn <= 1", "a bulleted list": "\n  /\\ n <= 1\n  /\\ m <= 2", "in column 1": "\n/\\ n <= 1\n/\\ m <= 2",
+            "a quantifier before a list": "\n  \\A s \\in S :\n    /\\ n[s] <= 1\n    /\\ m <= 2", "a nested group": " n <= 1 /\\ (m <= 1 /\\ (\\A s \\in S : n[s] < m))",
+            "calls": " Cap /\\ (Cap) /\\ \\A s \\in S : Cap", "a set as an operand": " Cardinality({s \\in S : up[s]}) <= 2",
+            "an expression around the operand": " (n + m) <= 1", "a tuple": " Len(<<n, m>>) =< 3", "\\land and \\leq": " n \\leq 1 \\land m \\geq 0",
+            "a multi-line operand in column 1": " n <= Max(m,\nn)",
+        }
+        for name, body in accepted.items():
+            with self.subTest(name):
+                self.assertIsNone(self.bound(body, sel))
+
+    def test_a_body_ends_at_the_next_unit(self):
+        for unit in ("VARIABLE x", "CONSTANT X", "ASSUME up", "THEOREM up", "LOCAL Z == up", "RECURSIVE F(_)", "INSTANCE M2",
+                     "Z(a,\n  b) == up", "Z[a \\in S] == up", "----", "====\nup"):
+            with self.subTest(unit):
+                self.assertIsNone(self.bound(f" n <= 1\n{unit}"))
+
+    def test_an_override_cannot_bring_in_the_search_state(self):
+        def model(*definitions):
+            return [safety_only, add_to_model(*definitions, "L == Lvl(1)", "Few == L < 9", extends=", TLC\nCONSTANT Lvl(_)"),
+                    add_to_cfg("CONSTRAINT Few", "\\* limit: Few -- counters")]
+
+        depth = model()
+
+        def override(line):
+            return lambda spec: edit(spec / "TwoPhase.cfg", ("CONSTANTS\n", f"CONSTANTS\n    {line}\n"))
+
+        for line in ("Lvl <- TLCGet", "Lvl <- [MCTwoPhase]TLCGet", "Lvl <- RandomElement", "Lvl <- JavaTime"):
+            with self.subTest(line):
+                summary = self.assert_fails("the cfg uses", FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]), prep=[*depth, override(line)])
+                self.assertEqual(summary["tla"]["runs"][0]["verdict"], "pass")  # TLC itself saw nothing
+        # Any other operator that the model does not define, under another name.
+        for line in ("Lvl <- Trace", "Lvl <- Cardinality", "Lvl <- [MCTwoPhase] SortSeq"):
+            with self.subTest(line):
+                self.assert_fails("which the model's modules do not define", FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]),
+                                  prep=[*depth, override(line)])
+        self.assert_fails("the cfg uses TLCGet", prep=[lambda spec: edit(spec / "TwoPhase.cfg", (
+            "CHECK_DEADLOCK TRUE", "ALIAS TLCGet\nCHECK_DEADLOCK TRUE"))])
+        # A comment is no use, and an operator of the model may take the constant's place, wherever it is defined.
+        for definition in ("Own(x) == 1", "  Own(x) == 1", "Own[x \\in RM] == 1"):
+            code, _, text = self.run_fake(GOOD, FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]), prep=[
+                *model(definition), override("Lvl <- Own \\* not TLCGet")])
+            self.assertEqual(code, 0, text)
+
     def test_depth_limit_and_state_cap_fail(self):
         for body in ('TLCGet("level") < 9', 'TLCGet("distinct") < 800', 'TLCGet("stats").diameter < 5',
                      "TLCGetOrDefault(1, 0) <= 5", "JavaTime < 5", "RandomElement(1..3) <= 2"):
@@ -625,21 +713,29 @@ class CheckOrchestrationTests(unittest.TestCase):
                 with self.subTest(form):
                     self.assert_fails(f"the cfg overrides {name}, which it checks or runs", prep=[
                         add_to_model("Yes == TRUE"), override(form)])
+        mine = add_to_model("Mine == 1")
         for name in ("Next", "Nat", "SendMsg"):
-            self.assert_fails(f"override {name} has no `\\* limit: {name} -- <reason>` line", prep=[override(f"{name} <- Mine")])
-            code, summary, text = self.run_fake(GOOD, prep=[override(f"{name} <- Mine"), lambda spec: edit(
+            self.assert_fails(f"override {name} has no `\\* limit: {name} -- <reason>` line", prep=[mine, override(f"{name} <- Mine")])
+            code, summary, text = self.run_fake(GOOD, prep=[mine, override(f"{name} <- Mine"), lambda spec: edit(
                 spec / "TwoPhase.cfg", ("CONSTANTS\n", f"\\* limit: {name} -- a finite set\nCONSTANTS\n"))])
             self.assertEqual((code, summary["tla"]["limits"]), (0, [f"TwoPhase.cfg: override {name}: a finite set"]), text)
         # The cfg that declares it is the one that overrides it.
-        self.assert_fails("override Nat has no", prep=[override("Nat <- Mine"), lambda spec: edit(
+        self.assert_fails("override Nat has no", prep=[mine, override("Nat <- Mine"), lambda spec: edit(
             spec / "TwoPhase.large.cfg", ("CONSTANTS\n", "\\* limit: Nat -- elsewhere\nCONSTANTS\n"))])
+        # INIT, NEXT and POSTCONDITION names are the cfg's own too.
+        for lines, name in ((("INIT Init", "NEXT Next"), "Init"), (("INIT Init", "NEXT Next"), "Next"),
+                            (("POSTCONDITION Post",), "Post"), (("ACTION_CONSTRAINT Few", "\\* limit: Few -- x"), "Few")):
+            with self.subTest(name):
+                self.assert_fails(f"the cfg overrides {name}, which it checks or runs", FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]),
+                                  prep=[add_to_model("Mine == 1", "Post == TRUE", "Few == crashes <= 1"), add_to_cfg(*lines),
+                                        override(f"{name} <- Mine")])
         # A mutant must check the same property as the baseline.
         self.assert_fails("mutant commit_one_prepared: its cfg overrides Consistent", prep=[lambda spec: edit(
             spec / "mutants" / "commit_one_prepared.cfg", ("CONSTANTS\n", "CONSTANTS\n    Consistent <- No\n"))])
 
     def test_constraint_override_fails(self):
         self.assert_fails("overrides Few, which it checks or runs", FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]),
-                          prep=[*self.limited("Few == crashes <= 1"), lambda spec: edit(
+                          prep=[*self.limited("Few == crashes <= 1"), add_to_model("Mine == 1"), lambda spec: edit(
                               spec / "TwoPhase.cfg", ("CONSTANTS\n", "CONSTANTS\n    Few <- Mine\n"))])
 
     def test_selftest_model_constants(self):

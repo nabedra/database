@@ -93,7 +93,8 @@ to no failure, caught mutants, passing runs, then longer texts, and failures las
 that something was dropped or cut. `tla.dropped` counts it by list, with failures apart, and the last
 `not_run` entry counts the dropped ones. The command log and `tla/summary.json` stay in `artifacts`, and
 `summary.json` keeps every fact. Facts the schema refuses are dropped, and the result is `error` unless
-it is already `fail`.
+it is already `fail`. The `not_run` entries and artifacts then stay as far as they fit, without counts
+for the facts.
 [specs/README.md](../../../specs/README.md) describes the runners and how their results map.
 
 Ignored, skipped and todo tests are listed in the record's `assertions.not_run`.

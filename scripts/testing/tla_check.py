@@ -19,19 +19,23 @@ T2 applies the search rule and runs `<Name>.large.cfg`, exhaustively or, with --
 simulation labelled as such.
 
 The search rule. TLC reports an exhaustive search whatever a cfg cuts away, so:
-  - a module of the model may not read or set TLC's search state, the trace, the clock, the environment or
-    random values (TLCGet, TLCSet, TLCExt, RandomElement, ...), so no constraint can be a depth limit or a
-    state cap in those terms;
+  - a module of the model, and its cfg, may not read or set TLC's search state, the trace, the clock, the
+    environment or random values (TLCGet, TLCSet, TLCExt, RandomElement, ...), so no constraint can be a depth
+    limit or a state cap in those terms. A cfg may override a name only with an operator that the model's own
+    modules define, so it cannot bring one in either;
   - a CONSTRAINT or ACTION_CONSTRAINT must be declared in its cfg by `\\* limit: <Name> -- <reason>` and must
     only bound counters: a conjunction, possibly under \\A, of order comparisons (<, <=, >, >=). Equality,
-    negation, implication, disjunction and string values select protocol states, which is not a bound;
-  - a constraint or a symmetry set may not be active in a run that checks liveness (TLC says which runs do);
+    negation, implication, disjunction and string values select protocol states, which is not a bound. What
+    the rule cannot read, such as Unicode operators, is refused;
+  - a constraint or a symmetry set may not be active in an exhaustive run that checks liveness. TLC says which
+    runs do. In a simulation it says nothing, so there this part does not apply;
   - VIEW is refused, because it merges states that the properties may tell apart;
   - a cfg may not override a name it checks, its constraints or its INIT, NEXT or SPECIFICATION. Giving a
     declared CONSTANT its value is free. Overriding any other definition, such as Nat, needs a `limit` line.
 The record lists the declared limits and how many states each constraint kept. What the rule cannot see: a
-counter that every action increments, so that its bound is a depth limit; a constraint over an operator that
-encodes protocol state as a number; a CONSTANT value, INIT or NEXT that leaves behavior out.
+counter that every action increments, so that its bound is a depth limit; a lower bound, or a bound between
+two variables, that cuts protocol states; a constraint over an operator that encodes protocol state as a
+number; a CONSTANT value, INIT or NEXT that leaves behavior out. Mutant cfgs are checked for overrides only.
 
 The model module is MC<Name>.tla if it exists, else <Name>.tla. Each run gets the per-run budget:
 --budget-s, else the module's level in docs/testing/modules.toml (L1 and L2 900 s, L3 3600 s). The
@@ -124,14 +128,20 @@ _SEARCH_STATE = re.compile(r"\b(?:TLC(?:Get|Set)\w*|RandomElement|RandomSubset\w
 _SEARCH_MODULES = {"TLCExt", "Randomization", "IOUtils", "IOUtilsExt"}
 _IMPORT = re.compile(r"\bEXTENDS\s+(\w+(?:\s*,\s*\w+)*)|\bINSTANCE\s+(\w+)")
 _CONSTANT_DECL = re.compile(r"\bCONSTANTS?\s+(\w+(?:\([\s,_]*\))?(?:\s*,\s*\w+(?:\([\s,_]*\))?)*)")
-# A definition starts in column 1. Its body ends where the next unit starts in column 1.
-_DEFINITION = re.compile(r"^(?:LOCAL[ \t]+)?(\w+)[ \t]*(?:\([^=]*?\)|\[[^=]*?\])?[ \t]*==(?!=)(.*?)(?=^\w|^-{4}|^={4}|\Z)",
-                         re.M | re.S)
-_TOKEN = re.compile(r"\\\w+|\w+|<<|>>|<=>|<=|>=|=<|=>|/=|\\/|\|->|->|<-|==|[^\s\w]")
+# A definition starts in column 1. Its body ends where the next unit starts in column 1, so a word in column 1
+# that starts no unit belongs to the body.
+_HEAD = r"\w+[ \t]*(?:\([^=]*?\)|\[[^=]*?\])?[ \t]*==(?!=)"
+_UNIT = (r"(?:LOCAL|RECURSIVE|VARIABLES?|CONSTANTS?|ASSUME|ASSUMPTION|AXIOM|THEOREM|LEMMA|PROPOSITION|COROLLARY|"
+         r"INSTANCE|EXTENDS|PROOF|USE|HIDE)\b")
+_DEFINITION = re.compile(rf"^(?:LOCAL[ \t]+)?(?=(\w+)){_HEAD}(.*?)(?=^{_UNIT}|^{_HEAD}|^-{{4}}|^={{4}}|\Z)", re.M | re.S)
+_TOKEN = re.compile(r"\\\w+|\w+|<<|>>|<=>|<=|>=|=<|=>|/=|/\\|\\/|\|->|->|<-|==|[^\s\w]")
+_OPEN, _CLOSE = {"(", "[", "{", "<<"}, {")", "]", "}", ">>"}
 _ORDER = {"<", "<=", "=<", "\\leq", ">", ">=", "\\geq"}
+# Beside one order comparison, each of these can make a conjunct select states.
 _SELECTS = {"=", "#", "/=", "\\neq", "\\notin", "~", "\\lnot", "\\neg", "=>", "<=>", "\\equiv", "\\/", "\\lor", "\\E", "\\A",
-            "\\subseteq", "==", '"', "IF", "CASE", "LET", "TRUE", "FALSE", "ENABLED"}
-_QUANTIFIER = re.compile(r"^\\A\s[^:{]*:")
+            "\\subseteq", "==", '"', "IF", "CASE", "ENABLED", "CHOOSE", "LAMBDA"}
+_QUANTIFIER = re.compile(r"\\A\s[^:{]*:")
+_OVERRIDE = re.compile(r"(\w+)\s*<-\s*(?:\[\s*\w+\s*\]\s*)?(\w+)")
 
 
 class Model:
@@ -162,36 +172,58 @@ class Model:
             for m in _CONSTANT_DECL.finditer(text):
                 self.constants.update(re.findall(r"\w+", re.sub(r"\([^)]*\)", "", m.group(1))))
 
+    def defines(self, name: str) -> bool:
+        """The model's modules declare or define the name, anywhere in a line."""
+        pattern = re.compile(rf"(?<![\w!]){name}\s*(?:\([^)=]*\)|\[[^\]=]*\])?\s*==(?!=)")
+        return name in self.constants or any(pattern.search(text) for text in self.texts.values())
+
     def bound_problem(self, name: str, seen: frozenset = frozenset()) -> str | None:
         """Why the operator is not just a bound on counters, or None."""
         bodies = self.definitions.get(name)
         if not bodies or name in seen:
             return f"{name} has no definition that starts a line in the model's modules"
-        for body in bodies:
-            for conjunct in re.split(r"/\\|\\land\b", body):
-                problem = self._conjunct_problem(name, conjunct, seen | {name})
-                if problem:
-                    return problem
-        return None
+        return next(filter(None, (self._problem(name, body, seen | {name}) for body in bodies)), None)
 
-    def _conjunct_problem(self, name: str, text: str, seen: frozenset) -> str | None:
+    def _problem(self, name: str, text: str, seen: frozenset) -> str | None:
+        """Reads a conjunction, which a quantifier may start and parentheses may wrap. What it cannot read is a
+        problem, so that nothing passes unread."""
         text = text.strip()
-        while True:
-            inner = _QUANTIFIER.sub("", text.lstrip("( \n\t")).strip()
-            if inner == text:
-                break
-            text = inner
+        if not text.isascii():
+            return f"{name} uses characters other than ASCII, such as Unicode operators, which are not read"
+        for lead in ("/\\", "\\land"):
+            if text.startswith(lead):
+                return self._problem(name, text[len(lead):], seen)
         if not text:
-            return None  # the text before a leading /\
-        call = re.fullmatch(r"(\w+)(?:\([^<>]*\))?\)*", text)
-        if call and call.group(1) in self.definitions:
-            return self.bound_problem(call.group(1), seen)
-        tokens = _TOKEN.findall(text)
-        selects = sorted(_SELECTS.intersection(tokens))
+            return f"{name} has an empty conjunct or body"
+        quantifier = _QUANTIFIER.match(text)
+        if quantifier:  # it reaches to the end
+            return self._problem(name, text[quantifier.end():], seen)
+        # The tokens with their bracket depth.
+        tokens: list[tuple[str, int, int]] = []
+        depth = 0
+        for m in _TOKEN.finditer(text):
+            token = m.group()
+            depth -= token in _CLOSE
+            tokens.append((token, depth, m.start()))
+            depth += token in _OPEN
+        if depth or any(d < 0 for _, d, _ in tokens):
+            return f"{name} has unbalanced brackets: {' '.join(text.split())[:80]}"
+        if tokens[0][0] == "(" and [t for t in tokens if t[1] == 0] == [tokens[0], tokens[-1]]:
+            return self._problem(name, text[1:-1], seen)
+        for token, d, start in tokens:
+            if d == 0 and token in ("/\\", "\\land"):
+                return self._problem(name, text[:start], seen) or self._problem(name, text[start + len(token):], seen)
+        words = [t[0] for t in tokens]
+        # A name, or a call with nothing but its arguments behind it: the definition must be a bound.
+        if words[0] in self.definitions and (len(words) == 1 or (
+                words[1] == "(" and [t for t in tokens if t[1] == 0] == [tokens[0], tokens[1], tokens[-1]])):
+            return self.bound_problem(words[0], seen)
+        selects = sorted(_SELECTS.intersection(words))
         if selects:
             used = " ".join("a string" if s == '"' else s for s in selects)
             return f"{name} uses {used}, so it selects states instead of bounding a counter"
-        if sum(t in _ORDER for t in tokens) != 1:
+        order = [i for i, t in enumerate(tokens) if t[0] in _ORDER]
+        if len(order) != 1 or tokens[order[0]][1] or order[0] in (0, len(tokens) - 1):
             return f"{name} has a conjunct that is not one order comparison: {' '.join(text.split())[:80]}"
         return None
 
@@ -227,6 +259,11 @@ def search_problems(model: Model, cfg: Path) -> tuple[list[str], list[tuple[str,
             if problem:
                 problems.append(f"{kind} {name}: {problem}")
     problems += [f"VIEW {name} merges states" for name in parsed.sections.get("VIEW", [])]
+    text = tc.strip_tla_comments(cfg.read_text(encoding="utf-8"), keep_strings=False)
+    problems += [f"the cfg uses {used}" for used in sorted(set(_SEARCH_STATE.findall(text)))]
+    # A standard operator given to a constant or a definition reaches the model without its module naming it.
+    problems += [f"the cfg overrides {name} with {target}, which the model's modules do not define"
+                 for name, target in _OVERRIDE.findall(text) if not model.defines(target)]
     checked = checked_names(parsed)
     for name in dict.fromkeys(parsed.overrides):
         if name in checked:

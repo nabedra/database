@@ -121,15 +121,16 @@ When a design bug is fixed, the reverted fix becomes a mutant named
 ## Limits on the search
 
 TLC reports "0 states left on queue" whatever a configuration cuts away, so
-the runner checks what can limit a baseline or a `.large.cfg` run:
+the runner checks what can limit a baseline or a `.large.cfg` run. It reads
+text, and refuses what it cannot read:
 
 | Limit | Rule |
 | --- | --- |
-| `CONSTRAINT`, `ACTION_CONSTRAINT` | Allowed on counters, in a run without liveness. Declare it in the configuration: `\* limit: <Name> -- <reason>`. Its definition is a conjunction, under `\A` if needed, of order comparisons: `<`, `<=`, `>`, `>=`. Anything that selects protocol states, such as `=`, `#`, `~`, `=>`, `\/` or a string, fails. Model a budget constant instead |
-| A depth limit or a state cap | Fails. No module of the model may use `TLCGet`, `TLCSet`, `TLCExt`, `RandomElement`, `Randomization`, `JavaTime` or `IOUtils` |
-| `SYMMETRY` or a constraint with a liveness property | Fails. TLC reports which runs check liveness. Use a separate `<Name>.live.cfg` without them. Action properties such as `[][A]_vars` are safety, so they may stay |
+| `CONSTRAINT`, `ACTION_CONSTRAINT` | Allowed on counters, in a run without liveness. Declare it in the configuration: `\* limit: <Name> -- <reason>`. Its definition is a conjunction, under `\A` if needed, of order comparisons: `<`, `<=`, `>`, `>=`. Anything that selects protocol states, such as `=`, `#`, `~`, `=>`, `\/` or a string, fails, and so do Unicode operators. Model a budget constant instead |
+| A depth limit or a state cap through TLC's own search state | Fails. No module of the model and no configuration may use `TLCGet`, `TLCSet`, `TLCExt`, `RandomElement`, `Randomization`, `JavaTime` or `IOUtils` |
+| `SYMMETRY` or a constraint with a liveness property | Fails in an exhaustive run, where TLC reports whether it checks liveness. TLC does not report it in a simulation, so the runner does not see it there. A simulation never makes a T cell green. Use a separate `<Name>.live.cfg` without them. Action properties such as `[][A]_vars` are safety, so they may stay |
 | `VIEW` | Fails. It merges states, and TLC does not check that the merge is sound |
-| An override (`Op <- X` or `Op = x`) | A declared `CONSTANT` is free. Overriding a property, a constraint, or the `INIT`, `NEXT` or `SPECIFICATION` it runs fails. Overriding another definition, such as `Nat`, needs a `limit` line |
+| An override (`Op <- X` or `Op = x`) | `X` must be defined in the model's own modules, not in a standard one. A declared `CONSTANT` is free. Overriding a property, a constraint, or the `INIT`, `NEXT` or `SPECIFICATION` it runs fails. Overriding another definition, such as `Nat`, needs a `limit` line |
 
 The evidence record lists the declared limits, and how many states TLC kept
 for each constraint. The reviewer of the plan judges whether the bound is
@@ -137,9 +138,13 @@ wide enough. The rule does not detect:
 
 - a counter that every action increments, so that its bound is a depth
   limit;
+- a lower bound, or a bound between two variables, that cuts protocol
+  states, such as `n >= 1` or an `ACTION_CONSTRAINT` `n' >= n`;
 - a constraint over an operator that encodes protocol state as a number;
 - a `CONSTANT` value, or an `INIT` or `NEXT` written in `MC<Name>.tla`, that
   leaves behavior out;
+- the same limits in a mutant configuration, which is checked only for
+  overrides of what it checks or runs;
 - an action that coverage counts once although one of its cases never
   happens. TLC sums every case of an operator, such as `Crash(1)` and
   `Crash(2)`, or the branches of an `IF`, and does not report an action

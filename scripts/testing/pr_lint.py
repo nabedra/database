@@ -27,6 +27,7 @@ import tomllib
 REQUIRED = ("Guarantees", "Evidence", "Not run", "Reviewers")
 FIELD = re.compile(r"^(Guarantees|Evidence|Not run|Reviewers|Design):[ \t]*(.*)$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+LOOSE_FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULES_PATH = REPO_ROOT / "docs" / "testing" / "modules.toml"
 RUN_URL = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/actions/runs/\d+")
@@ -129,20 +130,23 @@ def high_level_modules(path=MODULES_PATH):
     return out
 
 
-def design_section(text):
+def design_section(text, fences="strict"):
     """The text of every `## Design review` section of a plan, or None.
 
-    A section runs to the next heading of its level or above. A `#` line in a fenced block is not a
-    heading."""
+    A section runs to the next heading of its level or above. A `#` line in a fenced block is not a heading.
+    Renderers differ on fences in lists, so `fences` is the way to read them: "strict" as CommonMark does at
+    the top level, "loose" with a closing fence at any indent, or "none" with every line as text."""
     out, level, fence = [], 0, ""
     for line in text.splitlines():
-        marker = FENCE.match(line)
+        marker = None if fences == "none" else (LOOSE_FENCE if fences == "loose" and fence else FENCE).match(line)
         if marker:
             run, tail = marker.groups()
             if fence and run.startswith(fence) and not tail.strip():
                 fence = ""
-            elif not fence:
+            elif not fence and not (run[0] == "`" and "`" in tail):  # such a line is inline code
                 fence = run
+            else:
+                marker = None
         heading = None if marker or fence else HEADING.match(line)
         if heading:
             depth = len(heading.group(1))
@@ -153,6 +157,11 @@ def design_section(text):
         if level:
             out.append(line)
     return "\n".join(out).strip() or None
+
+
+def design_sections(text):
+    """design_section under every reading of the fences. A change in any of them is a change of the section."""
+    return tuple(design_section(text, fences) for fences in ("strict", "loose", "none"))
 
 
 def design_reason(changed, section_changed=(), modules=None):
@@ -185,7 +194,7 @@ def changed_from_git(base, head):
     merge_base = _git("merge-base", base, head).strip()
     files = [f for f in _git("diff", "--name-only", "--no-renames", "-z", merge_base, head).split("\0") if f]
     sections = [f for f in files if f.startswith("plans/") and f.endswith(".md")
-                and design_section(_show(merge_base, f)) != design_section(_show(head, f))]
+                and design_sections(_show(merge_base, f)) != design_sections(_show(head, f))]
     return files, sections
 
 
@@ -212,8 +221,8 @@ def main(argv=None):
         if args.changed_files:
             changed = [l.strip() for l in args.changed_files.read_text(encoding="utf-8").splitlines() if l.strip()]
             sections = [f for f in changed if f.startswith("plans/") and f.endswith(".md")
-                        and design_section((REPO_ROOT / f).read_text(encoding="utf-8")
-                                           if (REPO_ROOT / f).exists() else "") is not None]
+                        and any(design_sections((REPO_ROOT / f).read_text(encoding="utf-8")
+                                                if (REPO_ROOT / f).exists() else ""))]
         if args.base:
             changed, sections = changed_from_git(args.base, args.head)
         reason = design_reason(changed, sections, high_level_modules() if changed else None)

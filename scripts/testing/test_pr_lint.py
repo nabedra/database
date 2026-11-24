@@ -113,6 +113,36 @@ class DesignLineTests(unittest.TestCase):
         self.assertEqual(pr_lint.design_section(plan), pr_lint.design_section(plan.replace("\nz\n", "\ny\n")))
         self.assertIsNone(pr_lint.design_section("# P\n\n~~~md\n## Design review\nx\n~~~\n"))
 
+    def test_no_reading_of_a_fence_hides_a_change(self):
+        body = "\n## Design review\n\nVerdict: not-run\n\n## Next\n"
+        before = {
+            "inline code of three backticks": "```tlc X```\n",
+            "a fence closed at four spaces in a list": "- a\n\n  ```\n  x\n    ```\n",
+            "a fence that never closes": "```\nx\n",
+            "a fence inside a deeper list": "1. a\n   - b\n\n     ```\n     # x\n     ```\n",
+            "a closing fence with text": "```\nx\n``` y\n# z\n```\n",
+            "tildes around backticks": "~~~\n```\n~~~\n",
+            "a longer fence around a shorter one": "````\n```\n````\n",
+        }
+        for name, text in before.items():
+            with self.subTest(name):
+                plan = "# P\n\n" + text + body
+                sections = pr_lint.design_sections(plan)
+                self.assertNotEqual(sections, pr_lint.design_sections(plan.replace("not-run", "pass")))
+                # A change after the section is not one of its own, as far as the fence lets the reader tell.
+                if "never" not in name and "deeper" not in name:
+                    self.assertEqual(sections, pr_lint.design_sections(plan + "\nmore\n"))
+        for fences in ("strict", "loose"):
+            with self.subTest(fences):
+                text = "# P\n\n~~~\n```\n~~~\n" + body
+                self.assertEqual(pr_lint.design_section(text, fences), "## Design review\n\nVerdict: not-run")
+                text = "# P\n\n```tlc X```\n" + body
+                self.assertEqual(pr_lint.design_section(text, fences), "## Design review\n\nVerdict: not-run")
+        # Inside the section, a fence that the strict reading never closes does not end it early either.
+        inside = "# P\n## Design review\n- a\n\n  ```\n  x\n    ```\n# z\n"
+        self.assertNotEqual(pr_lint.design_sections(inside + "Verdict: not-run\n"),
+                            pr_lint.design_sections(inside + "Verdict: pass\n"))
+
     def test_every_form_and_every_section_counts(self):
         for heading in ("## Design Review", "## design review", "## Design review: direct path",
                         "### Design review", "## 7. Design review", "## Design review (2026-11-24)",
@@ -143,6 +173,14 @@ class DesignLineTests(unittest.TestCase):
                                            text=True, check=True).stdout.strip())
             with patch.object(pr_lint, "REPO_ROOT", root):
                 self.assertEqual(pr_lint.changed_from_git(*shas), (["plans/p.md"], ["plans/p.md"]))
+            # The same through a fence that only the loose reading closes.
+            for verdict in ("not-run", "pass"):
+                plan.write_text(f"# P\n- a\n\n  ```\n  x\n    ```\n## Design review\nVerdict: {verdict}\n")
+                subprocess.run([*git, "commit", "-qam", verdict], cwd=root, check=True)
+                shas.append(subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True,
+                                           text=True, check=True).stdout.strip())
+            with patch.object(pr_lint, "REPO_ROOT", root):
+                self.assertEqual(pr_lint.changed_from_git(*shas[2:]), (["plans/p.md"], ["plans/p.md"]))
 
     def test_changed_files_option(self):
         with TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):

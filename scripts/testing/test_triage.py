@@ -151,6 +151,19 @@ class KindTTests(unittest.TestCase):
         self.assertEqual((code, reran), (1, False))
         self.assertIn("kind T is never retried", text)
 
+    def test_unknown_check_is_never_passed(self):
+        self.record("real", "R")
+        for check in ("specc", "spec ", "SPEC", "x/../spec", "../checks/spec"):
+            for exit_code in (0, 1):
+                with self.subTest(check=check, exit_code=exit_code):
+                    code, reran, text = self.run_main(check, "R", exit_code)
+                    self.assertEqual((code, reran), (1, False))
+                    self.assertIn("unknown check", text)
+        # A known one that passed is, registered or not.
+        self.record("unregistered", "R")
+        for check in ("real", "unregistered"):
+            self.assertEqual(self.run_main(check, "R", 0)[0], 0)
+
     def test_registered_r_check_still_retries(self):
         self.record("real", "R")
         code, reran, text = self.run_main("real", "R")

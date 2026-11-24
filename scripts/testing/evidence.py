@@ -169,6 +169,9 @@ def tla_contradictions(tla: Any) -> list[str]:
     def entries(value: Any) -> list[dict]:
         return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
 
+    dropped = tla.get("dropped") if isinstance(tla.get("dropped"), dict) else {}
+    if tla.get("mode") == "exhaustive" and not entries(tla.get("runs")) and not dropped.get("runs"):
+        out.append("no run")
     for run in entries(tla.get("runs")):
         if run.get("verdict") != "pass":
             out.append(f"run {run.get('cfg')} is {run.get('verdict')}")
@@ -180,9 +183,8 @@ def tla_contradictions(tla: Any) -> list[str]:
     traces = tla.get("traces")
     if isinstance(traces, dict) and traces.get("failing"):
         out.append("failing traces")
-    dropped = tla.get("dropped")
     for key in ("failing_runs", "failing_mutants", "failing_traces", "uncovered"):
-        if isinstance(dropped, dict) and dropped.get(key):
+        if dropped.get(key):
             out.append(f"{dropped[key]} dropped {key.replace('_', ' ')}")
     return out
 

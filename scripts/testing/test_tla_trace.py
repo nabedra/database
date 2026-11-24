@@ -513,6 +513,43 @@ class CheckTests(unittest.TestCase):
         self.assertEqual([a["name"] for a in record["artifacts"][:2]], ["x.log", "tla/summary.json"])
         self.assertEqual(len(record["artifacts"]) + record["tla"]["dropped"]["artifacts"], 95)
 
+    def test_the_log_of_a_failing_trace_outlives_the_others(self):
+        for i in range(60):
+            bad = i in (37, 59)
+            shutil.copy(REJECTED if bad else ACCEPTED, self.good / f"t{i:03d}{'.at-6' if bad else ''}.ndjson")
+        code, summary, text = self.check(str(self.good))
+        self.assertEqual((summary["verdict"], summary["failed"]), ("fail", 2))
+        bad = [a["name"] for a in summary["artifacts"][1:3]]
+        record = self.record(code, text)
+        names = [a["name"] for a in record["artifacts"]]
+        self.assertEqual(len(names), 50)
+        self.assertEqual(names[:2], ["x.log", "tla/summary.json"])
+        logs = [(self.root / "out" / n.removeprefix("tla/")).read_text() for n in bad]
+        self.assertTrue(all("nabedra-trace-rejected" in log for log in logs), bad)
+        self.assertGreater(min(bad), "tla/trace-030.log")  # not the first ones anyway
+        self.assertTrue(set(bad) <= set(names))
+
+    def test_the_logs_of_errors_controls_and_mutants_come_first(self):
+        for i in range(3):
+            shutil.copy(ACCEPTED, self.good / f"t{i}.ndjson")
+        real = tla_trace.check_trace
+
+        def one_error(spec_dir, name, trace, out, budget, stem, **kw):
+            got = real(spec_dir, name, trace, out, budget, stem, **kw)
+            return {**got, "outcome": "error", "detail": "broken"} if stem == "trace-002" else got
+
+        with patch.object(tla_trace, "check_trace", one_error), \
+                patch.object(tla_trace, "wildcard_error", return_value="accepted"):
+            (self.root / "out").mkdir(exist_ok=True)
+            (self.root / "out" / "control.log").write_text("x")
+            (self.root / "out" / "a.log").write_text("x")
+            _, summary, _ = self.check(str(self.good))
+        self.assertEqual([a["name"] for a in summary["artifacts"][:4]],
+                         ["tla/summary.json", "tla/control.log", "tla/trace-002.log", "tla/a.log"])
+        code, summary, text = self.mutant("\\* expect: accepted")
+        self.assertEqual(summary["failed"], 1, text)
+        self.assertEqual(summary["artifacts"][1]["name"], "tla/mutant-m.log")
+
     def test_more_errors_than_the_record_holds(self):
         # A check with about 95 TLC errors left no record before run_check.py trimmed the not-run entries.
         for count, detail in ((100, "broken " * 40), (250, "broken " * 40), (250, "b")):

@@ -16,6 +16,7 @@ Results: `pass` needs at least one executed assertion and no failure. Zero execu
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -583,7 +584,9 @@ def fit_record(record: dict) -> None:
 
 def ensure_valid(record: dict) -> None:
     """Fits the record. Tool facts that the schema still refuses are dropped, and a result that rested on
-    them becomes `error`, so a check that ran always leaves a record."""
+    them becomes `error`, so a check that ran always leaves a record. Its not-run entries and artifacts stay,
+    as far as they fit."""
+    given = copy.deepcopy(record)
     try:
         fit_record(record)
         errors = evidence.validate(record)
@@ -591,13 +594,14 @@ def ensure_valid(record: dict) -> None:
         errors = [f"{type(exc).__name__}: {exc}"]
     if not errors or "tla" not in record:
         return
+    record.update(given)
     del record["tla"]
     record["mode"] = None
-    del record["artifacts"][1:]
     reason = f"the tool's facts do not fit the record and were dropped (truncated): {errors[0]}"
-    record["assertions"]["not_run"] = [{"id": "record", "reason": _clip(reason, 300)}]
+    record["assertions"]["not_run"].insert(0, {"id": "record", "reason": reason})
     if record["result"] != "fail":
         record["result"] = "error"
+    fit_record(record)
 
 
 # --------------------------------------------------------------------------------------------

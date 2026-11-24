@@ -228,6 +228,8 @@ class BuildTests(MatrixFixtureTests):
 def t_record(check, result="pass", mode="exhaustive", tier="T1", kind="T", reason="stopped at the budget",
              behind=0, sha="a" * 40, **facts):
     tla = None if mode is None else {"spec": "specs/x/X", "mode": mode, "tier": tier, "tools": "t", **facts}
+    if mode == "exhaustive":
+        tla.setdefault("runs", [{"cfg": "X.cfg", "verdict": "pass", "states_left": 0}])
     record = {"check": check, "kind": kind, "guarantees": ["OLTP-G03"], "sha": sha, "result": result,
               "assertions": {"executed": 3, "failed": 1 if result == "fail" else 0,
                              "not_run": [{"id": "b", "reason": reason}] if result == "not-run" else []},
@@ -303,6 +305,10 @@ class KindTCellTests(unittest.TestCase):
                 cell = self.cell(t_record("a", **facts))
                 self.assertEqual(cell.state, "fail")
                 self.assertIn("contradict", cell.reason)
+                # Also beside a clean exhaustive pass, whatever the mode of the record that contradicts itself.
+                for mode in ("simulation", "trace"):
+                    cell = self.cell(t_record("a"), t_record("b", mode=mode, **facts))
+                    self.assertEqual((cell.state, cell.green()), ("fail", False))
         self.assertTrue(self.cell(t_record("a", dropped={"mutants": 3}, truncated=True)).green())
 
     def test_the_run_must_be_on_the_cells_own_sha(self):

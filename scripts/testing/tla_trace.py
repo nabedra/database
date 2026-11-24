@@ -565,6 +565,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     executed = failed = mutants = 0
     errors: list[str] = []
     failing: list[dict] = []
+    bad_logs: set[str] = set()
     plain: list[tuple[Path, bool]] = []
     spec_dir = args.spec_dir.resolve()
     rel = spec_dir.relative_to(tc.REPO_ROOT).as_posix() if spec_dir.is_relative_to(tc.REPO_ROOT) else str(spec_dir)
@@ -631,6 +632,8 @@ def cmd_check(args: argparse.Namespace) -> int:
                 print(f"[tla_trace] FAIL {label}: header spec is {header['spec']}, not {args.name}")
                 continue
             result = check_trace(spec_dir, args.name, trace, out, budget, f"trace-{index:03d}")
+            if result["outcome"] != ("rejected" if must_reject else "accepted"):
+                bad_logs.add(result["log"])
             if result["outcome"] == "error":
                 where = f" at index {result['at']}" if result["at"] is not None else ""
                 errors.append(f"{label}:{where} {result['detail']}")
@@ -653,6 +656,7 @@ def cmd_check(args: argparse.Namespace) -> int:
                           f"{content}")
                 else:
                     failed += 1
+                    bad_logs.add(result["log"])
                     why = ("accepted, but it must be rejected" if result["outcome"] == "accepted"
                            else f"rejected at index {at}, expected {want}")
                     failing.append({"file": label, "index": at, "reason": why})
@@ -667,6 +671,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         if control is not None:
             problem = wildcard_error(spec_dir, args.name, control, out, budget)
             if problem:
+                bad_logs.add("control.log")
                 errors.append(problem)
                 print(f"[tla_trace] ERROR {problem}")
             else:
@@ -677,6 +682,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             problem = check_mutant(spec_dir, args.name, cfg, out, budget)
             if problem:
                 failed += 1
+                bad_logs.add(f"mutant-{cfg.stem}.log")
                 failing.append({"file": f"trace-mutants/{cfg.name}", "index": None, "reason": problem})
                 print(f"[tla_trace] FAIL trace-mutants/{cfg.name}: {problem}")
             else:
@@ -706,7 +712,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         (Path(out) / "summary.json").write_text(json.dumps({
             "verdict": verdict, "executed": executed, "failed": failed, "not_run": not_run, "tla": tla},
             indent=2) + "\n", encoding="utf-8")
-        for f in sorted(Path(out).glob("*"), key=lambda f: (f.name != "summary.json", f.name)):
+        for f in sorted(Path(out).glob("*"), key=lambda f: (f.name != "summary.json", f.name not in bad_logs, f.name)):
             if f.is_file():
                 artifacts.append({"name": f"tla/{f.name}",
                                   "sha256": hashlib.sha256(f.read_bytes()).hexdigest()})

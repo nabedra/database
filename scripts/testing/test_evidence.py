@@ -114,6 +114,10 @@ class ValidatorTests(unittest.TestCase):
             with self.subTest(change=change):
                 self.assertEqual(len(evidence.tla_contradictions({**facts, **change})), 1)
         self.assertEqual(evidence.tla_contradictions(None), ["no tla facts"])
+        # An exhaustive pass needs a run, kept or dropped.
+        for runs in ([], None, "x", [3]):
+            self.assertEqual(evidence.tla_contradictions({**facts, "runs": runs}), ["no run"])
+        self.assertEqual(evidence.tla_contradictions({**facts, "runs": [], "dropped": {"runs": 2}}), [])
         # A simulation ends with states it never visited, and dropped passing facts contradict nothing.
         self.assertEqual(evidence.tla_contradictions(
             {"mode": "simulation", "runs": [{"cfg": "X.cfg", "verdict": "pass", "states_left": None}],

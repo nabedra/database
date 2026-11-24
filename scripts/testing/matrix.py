@@ -437,7 +437,8 @@ def _combine_t(group: list[Counted]) -> tuple[str, str, int, int, list[str]]:
         return "not-run", "; ".join([what, *reasons]), executed, failed, checks
     if open_runs:
         names = sorted({c.record["check"] for c in open_runs})
-        return "not-run", "; ".join([f"exhaustive run not finished: {', '.join(names)}", *reasons]),             executed, failed, checks
+        reason = "; ".join([f"exhaustive run not finished: {', '.join(names)}", *reasons])
+        return "not-run", reason, executed, failed, checks
     return "pass", "", executed, failed, checks
 
 

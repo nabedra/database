@@ -98,23 +98,27 @@ def baseline(directory, check, today):
 
 
 def known_kinds(check, evidence):
-    """The kinds of the registered check, else of its evidence records, as a set of letters."""
+    """The kinds of the registered check, else of its evidence records, as a set of letters. None when the
+    check is not registered and has no record."""
     path = CHECKS_DIR / f"{check}.toml"
     if path.parent == CHECKS_DIR and path.exists():
         declared = tomllib.loads(path.read_text(encoding="utf-8")).get("kinds")
         if not isinstance(declared, list) or not all(isinstance(k, str) for k in declared):
             raise ValueError(f"{path}: kinds is not a list of strings")
         return set(declared)
-    kinds = set()
+    kinds, found = set(), False
     for record_path in sorted(evidence.rglob("*.json")):
         record = json.loads(record_path.read_text(encoding="utf-8"))
         if isinstance(record, dict) and record.get("check") == check:
+            found = True
             kinds.update(str(record.get("kind", "")).split())
-    return kinds
+    return kinds if found else None
 
 
 def triage(kind, returncode, log, get_baseline, rerun, known=()):
     # Before the exit status: run_check.py exits 0 on a not-run, which is no pass.
+    if known is None:
+        return Decision(True, "unknown check: it is not registered and has no evidence record")
     if "T" in kind.split() or "T" in known:
         return Decision(True, "kind T is never retried or unblocked: read the check's evidence record")
     if crash := crash_signature(returncode, log):
