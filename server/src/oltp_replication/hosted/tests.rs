@@ -2,9 +2,9 @@
 //! and commit hints, and the purge/snapshot durability boundary. NS7: the Raft
 //! log on journal values at pool level (NS13, NS04 relocation crashes, write
 //! amplification).
+use nabedra_resources::config::WorkerResources;
 use super::*;
 use crate::{
-    config::WorkerResources,
     oltp::pool::{
         ByteClass, OltpPool, PoolIdentity, ScratchLease, SharedResourceConfig, TransactionBudget,
         WorkerSharedResources,

@@ -256,7 +256,7 @@ impl Inner {
         }
     }
     async fn call(&self, count: u64) -> Result<DirectTimestampRange, ProtocolError> {
-        let _timer = crate::oltp_runtime::stage_timing::perf_stage!("ts.client.call").timer();
+        let _timer = nabedra_resources::perf_stage!("ts.client.call").timer();
         self.calls.fetch_add(1, Ordering::Relaxed);
         if let Some(local) = self.local.as_ref().filter(|local| local.may_answer()) {
             let skip = self
@@ -268,7 +268,7 @@ impl Inner {
                 match nabedra_rt::time::timeout(self.local_deadline, local.allocate_direct(count)).await
                 {
                     Ok(Ok(range)) => {
-                        crate::oltp_runtime::stage_timing::perf_stage!("ts.client.local_answered")
+                        nabedra_resources::perf_stage!("ts.client.local_answered")
                             .record(Duration::ZERO);
                         self.local_calls.fetch_add(1, Ordering::Relaxed);
                         return Ok(range);
@@ -283,8 +283,8 @@ impl Inner {
                 }
             }
         }
-        crate::oltp_runtime::stage_timing::timed(
-            crate::oltp_runtime::stage_timing::perf_stage!("ts.client.remote"),
+        nabedra_resources::stage_timing::timed(
+            nabedra_resources::perf_stage!("ts.client.remote"),
             self.remote.allocate_direct(count),
         )
         .await

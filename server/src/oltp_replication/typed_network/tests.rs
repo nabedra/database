@@ -1,8 +1,8 @@
+use nabedra_resources::config::WorkerResources;
 use super::*;
 #[path = "../../../tests/support/tls.rs"]
 mod tls;
 use crate::{
-    config::WorkerResources,
     oltp::pool::{OltpPool, PoolIdentity, SharedResourceConfig, TransactionBudget},
     oltp_replication::{
         authority::{

@@ -210,7 +210,7 @@ impl GrantCache {
     where
         F: Future<Output = Result<Option<ServiceAuthorization>, ProtocolError>>,
     {
-        use crate::oltp_runtime::stage_timing::perf_stage;
+        use nabedra_resources::perf_stage;
         if key.is_some_and(|key| self.allowed(key, revision)) {
             perf_stage!("grant.role.hit").record(Duration::ZERO);
             return Ok(());
@@ -352,7 +352,7 @@ fn warming_disabled() -> bool {
 /// Refreshes the warm keys whose entries are missing or close to expiry,
 /// until no key was used within [`WARM_IDLE`] or the cache is dropped.
 async fn warm_loop(cache: Weak<Mutex<Grants>>) {
-    use crate::oltp_runtime::stage_timing::perf_stage;
+    use nabedra_resources::perf_stage;
     loop {
         nabedra_rt::time::sleep(WARM_TICK).await;
         let due: Vec<(GrantKey, Refresh)> = {
