@@ -648,6 +648,9 @@ fn seed_sweep() {
             "virtual_hours": report.virtual_ms() as f64 / 3_600_000.0,
             "fault_model": "Cache K01 expiry, K02 memory, K03 cluster",
             "partitions": partitions_name(partitions),
+            // Any acknowledged write above the promoted copy's prefix may be
+            // lost, however old. Only the prefix itself is checked.
+            "lag_window_ns": relaxed_kv::Options::default().lag_window_ns,
             "replayed": report.replayed(),
         })
     );

@@ -1,4 +1,4 @@
-{"schema":"nabedra.catalog/1","count":2661,"tests":[
+{"schema":"nabedra.catalog/1","count":2775,"tests":[
 {"file":"orm/python/tests/events/test_client.py","hash":"202d453fc9458842","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_ack_uses_exact_offset_and_rejects_foreign_delivery_before_request","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"1c426c67dd348a60","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_claim_reuses_uuid_after_missing_response","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"b8d2b5c0d984c70e","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_error_metadata_and_duplicate_fields","lang":"python"},
@@ -1716,7 +1716,7 @@
 {"file":"server/src/cache/cluster/sim/stale_set.rs","hash":"2d74da9d46eb22f0","id":"server/src/cache/cluster/sim/stale_set.rs::ttl_form_is_hidden_from_clients_by_the_deadline_check","lang":"rust"},
 {"file":"server/src/cache/cluster/sim/tests.rs","hash":"46ed92823cac3b4b","id":"server/src/cache/cluster/sim/tests.rs::nightly_regressions","lang":"rust"},
 {"file":"server/src/cache/cluster/sim/tests.rs","hash":"2934452f4220e683","id":"server/src/cache/cluster/sim/tests.rs::same_seed_same_trace","lang":"rust"},
-{"file":"server/src/cache/cluster/sim/tests.rs","hash":"1443c180cfc05084","id":"server/src/cache/cluster/sim/tests.rs::seed_sweep","lang":"rust"},
+{"file":"server/src/cache/cluster/sim/tests.rs","hash":"76167ec009d484e7","id":"server/src/cache/cluster/sim/tests.rs::seed_sweep","lang":"rust"},
 {"file":"server/src/cache/cluster/transport/tests.rs","hash":"2123edf71127ad50","id":"server/src/cache/cluster/transport/tests.rs::k03_peer_session_checks_fingerprints_and_crash_cuts_connection","lang":"rust"},
 {"file":"server/src/cache/cluster/worker/actor/tests.rs","hash":"ecb70d4f643dcef4","id":"server/src/cache/cluster/worker/actor/tests.rs::k02_k03_full_slot_can_pin_and_install_bounded_snapshot","lang":"rust"},
 {"file":"server/src/cache/cluster/worker/actor/tests.rs","hash":"a97448aa9a23ecca","id":"server/src/cache/cluster/worker/actor/tests.rs::k02_promoted_then_refilled_roles_stay_within_total_data_capacity","lang":"rust"},
