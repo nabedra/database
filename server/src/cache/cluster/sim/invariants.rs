@@ -30,6 +30,8 @@ pub(super) struct Observations {
     applied: BTreeMap<u64, u64>,
     served: BTreeMap<u16, (u64, WorkerId, u64)>,
     failover_markers: BTreeMap<(u16, u64), Vec<usize>>,
+    /// Committed staged promotions with the virtual time of first apply.
+    pub staged: Vec<(u64, u16, StagedPromotion)>,
     primary: BTreeMap<(Version, WorkerId), Digest>,
     replicas: BTreeMap<(Version, WorkerId), (WorkerId, Digest)>,
     pub check_replica_prefix: bool,
@@ -95,6 +97,8 @@ impl Observations {
             }
             return;
         }
+        self.staged
+            .extend(staged.iter().map(|&(slot, proof)| (now, slot, proof)));
         self.revisions.insert((state.generation, state.revision));
         if let Some(err) = invalid_placement(state) {
             self.violate("SlotOwnership", err);
