@@ -67,6 +67,22 @@ type BudgetKey = u64;
 #[cfg(feature = "sim")]
 type BudgetKey = (usize, Option<u64>, u64);
 
+static BUDGETS: OnceLock<Mutex<HashMap<BudgetKey, Weak<Filesystem>>>> = OnceLock::new();
+
+/// Checks for live capacity reservations left by a completed simulation world.
+/// Other worlds may still run concurrent seeds.
+#[cfg(feature = "sim")]
+pub fn registries_empty(world: &nabedra_rt::sim::World) -> bool {
+    let world = std::ptr::from_ref(world) as usize;
+    if let Some(budgets) = BUDGETS.get() {
+        let mut budgets = budgets.lock().unwrap_or_else(|p| p.into_inner());
+        budgets.retain(|_, budget| budget.strong_count() != 0);
+        budgets.keys().all(|key| key.0 != world)
+    } else {
+        true
+    }
+}
+
 pub(super) struct PoolDisk {
     device: u64,
     directory: File,
@@ -112,7 +128,6 @@ impl PoolDisk {
         let device = directory.metadata().map_err(|_| refused())?.dev();
         #[cfg(not(unix))]
         let device = 0;
-        static BUDGETS: OnceLock<Mutex<HashMap<BudgetKey, Weak<Filesystem>>>> = OnceLock::new();
         let mut budgets = BUDGETS
             .get_or_init(Mutex::default)
             .lock()
@@ -138,6 +153,10 @@ impl PoolDisk {
                 #[cfg(feature = "sim")]
                 _world: world.as_ref().map(Arc::downgrade),
             });
+            #[cfg(feature = "sim")]
+            if let Some(world) = &world {
+                world.track_registry("mounted PoolDisk", &budget);
+            }
             *slot = Arc::downgrade(&budget);
             budget
         });

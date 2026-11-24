@@ -157,6 +157,10 @@ impl RangeClock {
             changed: tokio::sync::Notify::new(),
             _store: store.clone(),
         });
+        #[cfg(feature = "sim")]
+        if let Some(world) = nabedra_rt::sim::world() {
+            world.track_registry("RangeClock", &clock);
+        }
         registry.insert(key, Arc::downgrade(&clock));
         clock
     }
