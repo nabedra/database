@@ -1,0 +1,29 @@
+# Reverted fix BUG1-encode-submit (phase 11, design section 4.2, row 2).
+schema = "nabedra.sim-bug/1"
+id = "bug1-encode-submit"
+bug = "BUG1-encode-submit"
+set = "queued"
+phase = 11
+class = "uncertain-outcome"
+guarantees = ["OLTP-G04", "OLTP-G07"]
+scenarios = ["Q05", "O13"]
+fix_commits = ["d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+reverts = "d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"
+port = "hand"
+port_notes = """
+The application.rs hunks of d7b9d63c, reversed by hand: `encode_submission` and `finish_reply` return the
+encoding refusal itself (not_applied) after the queue accepted the request. `finish_reply` keeps its
+`submits` parameter (unused) because the regression calls it. The rest of d7b9d63c belongs to other bugs.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+workload = "queued"
+profile = ["low-data-bytes", "lane-exhaust"]
+expect = ["failed-write-observed", "QueueRetention"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_runtime::application::q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity"
+mode = "on"
+failure_contains = ["left: NotApplied"]

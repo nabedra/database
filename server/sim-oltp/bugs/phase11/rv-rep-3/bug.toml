@@ -1,0 +1,28 @@
+# Reverted fix RV-REP-3 (phase 11, design section 4.2, row 15).
+schema = "nabedra.sim-bug/1"
+id = "rv-rep-3"
+bug = "RV-REP-3"
+set = "membership"
+phase = 11
+class = "membership-replacement-trust"
+guarantees = ["OLTP-G01", "OLTP-G08"]
+scenarios = ["O17", "NS23"]
+fix_commits = ["96d892ea0c3de91af4c7c14a272c66d15ec1e5db", "2def358f9c98bb14910726ac5888ba3be2a80441"]
+reverts = "2def358f9c98bb14910726ac5888ba3be2a80441"
+port = "hand"
+port_notes = """
+The 2def358f refusal reversed where it decides, QuorumEndpoint::check_mount in manager/system_recovery.rs: a
+mount that Control already committed is accepted even when the process retained nothing.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+workload = "membership"
+profile = ["replacement", "wipe-data"]
+expect = ["WipedNeverVotes"]
+seeds = [1, 10000]
+
+[regression]
+kind = "recovery-suite"
+suite = "replacement-wipe"
+mode = "on"
+timeout_s = 3600

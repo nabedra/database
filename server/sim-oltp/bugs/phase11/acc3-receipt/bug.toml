@@ -1,0 +1,30 @@
+# Reverted fix ACC3-receipt (phase 11, design section 4.2, row 1).
+schema = "nabedra.sim-bug/1"
+id = "acc3-receipt"
+bug = "ACC3-receipt"
+set = "queued"
+phase = 11
+class = "uncertain-outcome"
+guarantees = ["OLTP-G03", "OLTP-G07"]
+scenarios = ["O13", "O14"]
+fix_commits = ["d6eb811a9846485713937fb9bedff51f22b2bce1"]
+reverts = "d6eb811a9846485713937fb9bedff51f22b2bce1"
+port = "hand"
+port_notes = """
+`git diff d6eb811a d6eb811a^` on server/src/oltp_runtime/remote_api.rs, with the same lines on
+nabedra_rt::time (phase 7 renamed the clock calls). The unscoped wait loop ends on the first retryable
+observation error again; `observation_deadline` is gone.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+workload = "queued"
+profile = ["receipt-fault", "session-drop", "api-restart"]
+expect = ["ReceiptObservationPatience"]
+seeds = [1, 10000]
+
+[regression]
+kind = "acceptance"
+scenario = "O13"
+mode = "on"
+timeout_s = 3600
+failure_contains = ["in transient_receipt_observation"]

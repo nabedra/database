@@ -1,0 +1,28 @@
+# Reverted fix RD2 (phase 11, design section 4.2, row 20).
+schema = "nabedra.sim-bug/1"
+id = "rd2"
+bug = "RD2"
+set = "resources"
+phase = 11
+class = "resource-release-order"
+guarantees = ["OLTP-G07", "OLTP-G09"]
+scenarios = ["C07", "O15"]
+fix_commits = ["116f03f811997edbff331d619f9baee328856948"]
+reverts = "116f03f811997edbff331d619f9baee328856948"
+port = "hand"
+port_notes = """
+116f03f8 reversed in service_rpc/grant_cache.rs, where #68 added a sim-only ordered map around it: warm
+refreshes run together with join_all under GRANT_TTL again, without backoff.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+workload = "cold"
+profile = ["staggered-reopen", "control-delay"]
+expect = ["WarmReadsSerial", "Liveness"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_replication::service_rpc::grant_cache::tests::c07_rd2_warm_refreshes_hold_at_most_one_read_while_control_hangs"
+mode = "on"
+failure_contains = ["in_flight.load(Ordering::Relaxed) <= 1"]

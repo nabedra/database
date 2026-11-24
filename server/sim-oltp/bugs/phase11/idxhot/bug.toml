@@ -1,0 +1,28 @@
+# Reverted fix IDXHOT (phase 11, design section 4.2, row 7).
+schema = "nabedra.sim-bug/1"
+id = "idxhot"
+bug = "IDXHOT"
+set = "topology"
+phase = 11
+class = "stale-route-topology-schema"
+guarantees = ["OLTP-G06"]
+scenarios = ["O12", "D11"]
+fix_commits = ["4fda542014c4d3aa129124503122b75c405a6084"]
+reverts = "4fda542014c4d3aa129124503122b75c405a6084"
+port = "hand"
+port_notes = """
+The fix's hunks reversed in nabedra-oltp-storage mvcc/index/build.rs (imports changed around them): a
+conflicted backfill refresh ends the build, and row_written_since_source with its imports is gone.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+workload = "topology"
+profile = ["index-publish", "hot-key-writers"]
+expect = ["Liveness"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_runtime::worker_runtime::index_backend::acceptance_tests::o12_hot_key_cannot_starve_backfill"
+mode = "on"
+failure_contains = ["backfill must finish while every refresh attempt races a committed write"]

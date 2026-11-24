@@ -1,0 +1,29 @@
+# Reverted fix RD1 (phase 11, design section 4.2, row 6).
+schema = "nabedra.sim-bug/1"
+id = "rd1"
+bug = "RD1"
+set = "topology"
+phase = 11
+class = "stale-route-topology-schema"
+guarantees = ["OLTP-G06"]
+scenarios = ["O12", "D11"]
+fix_commits = ["f2e21999dfb5801dcaee413b4c4c524254fa4511"]
+reverts = "f2e21999dfb5801dcaee413b4c4c524254fa4511"
+port = "hand"
+port_notes = """
+f2e21999 conflicts with later executor changes. The port removes its two decision points and leaves the
+latch loop: mutation_table reads the group's epochs from the store before the latch (no known_epochs
+shortcut), and prepare no longer compares the snapshot's direct schema with the one the descriptor was
+looked up with. Keeping the shortcut would widen the window beyond the original.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
+workload = "topology"
+profile = ["index-publish", "same-range-writers"]
+expect = ["CoveringIndexComplete"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_runtime::direct::tests::o12_d11_rd1_a_fence_after_the_descriptor_lookup_restarts_the_mutation"
+mode = "on"
