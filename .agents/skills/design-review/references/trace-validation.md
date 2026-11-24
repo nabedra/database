@@ -35,6 +35,16 @@ of the first line no behavior explains.
 
 ## Run
 
+`specs/lib/NabedraTrace.tla` holds the shared helpers: `Trace`,
+`TraceHeader`, `TraceParams`, `IsEvent`, `MatchVar`, `MatchSet` and the
+`TraceAccepted` postcondition. `python3 scripts/testing/tla_trace.py lint`
+checks the format, and `tla_trace.py check` runs the trace spec once per
+trace and reports the first line no behavior explains. Every TraceNext
+step consumes exactly one line, and `<Name>Trace.cfg` lists the invariant
+`TraceIndexIsLevel`, which checks that. See
+`specs/selftest/TwoPhaseTrace.tla` for a complete example and
+[specs](../../../../specs/README.md) for the commands.
+
 A trace-validation check is kind T, with an ID ending in `-trace`. It lists
 the same guarantees as its design spec.
 

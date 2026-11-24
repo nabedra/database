@@ -32,7 +32,7 @@ MAX_RECORD_BYTES = 20 * 1024
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = REPO_ROOT / "docs" / "testing" / "evidence" / "schema.json"
 DEFAULT_RECORDS_DIR = REPO_ROOT / "docs" / "testing" / "evidence" / "records"
-KINDS = "MUSHFDRPK"
+KINDS = "MUSHFDRPKT"
 RESULTS = ("pass", "fail", "not-run", "quarantined", "error")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -241,6 +241,7 @@ def new_record(
     s3_requests: int | None = None,
     artifacts: list[dict] | None = None,
     env: dict[str, str] | None = None,
+    tla: dict | None = None,
     repo: Path = REPO_ROOT,
 ) -> dict:
     """Builds a record, filling `sha` and `tree_clean` from git and `run` from the environment."""
@@ -270,6 +271,8 @@ def new_record(
     }
     if s3_requests is not None:
         record["s3_requests"] = s3_requests
+    if tla is not None:
+        record["tla"] = tla
     return record
 
 

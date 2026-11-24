@@ -45,6 +45,11 @@ REGISTER_HEADER = ["id", "guarantee", "failure model", "scenarios", "checks", "n
 TEST_FILE_GLOBS = ("server/**/tests/**", "**/test_*.py", "orm/**/test/**", "orm/**/tests/**",
                    "orm/contract/**")
 CHECK_FILE = re.compile(r"docs/testing/checks/([a-z0-9-]+)\.toml")
+# Design specs (.agents/skills/design-review). specs/<module>/** selects that module's checks, which
+# include its kind T checks. The shared tooling selects the testing module and every T check.
+SPEC_FILE = re.compile(r"specs/([^/]+)/.+")
+SPEC_TOOLING = ("specs/lib/", "specs/tools/")
+SPEC_TESTING = (*SPEC_TOOLING, "specs/selftest/", "specs/README.md")
 
 
 class MatrixError(ValueError):
@@ -565,6 +570,19 @@ def guarantees_for_module(name: str, modules: Modules, registers: list[Register]
     return out
 
 
+def spec_module(path: str, modules: Modules) -> str | None:
+    """The module a path under specs/ belongs to by folder convention, or None.
+
+    specs/<module>/** belongs to <module> when it is a module in modules.toml. The shared spec
+    tooling (specs/lib, specs/tools, specs/selftest) and specs/README.md belong to `testing`."""
+    if path.startswith(SPEC_TESTING):
+        return "testing" if modules.get("testing") else None
+    m = SPEC_FILE.fullmatch(path)
+    if m and modules.get(m.group(1)):
+        return m.group(1)
+    return None
+
+
 def select(paths: Paths, base: str, head: str, changed: list[str] | None = None) -> dict:
     git = Git(paths.repo)
     files = changed if changed is not None else git.changed(git.rev(base), git.rev(head))
@@ -576,6 +594,9 @@ def select(paths: Paths, base: str, head: str, changed: list[str] | None = None)
     hot: dict[str, list[str]] = {}
     for f in files:
         owners = modules.modules_for(f)
+        spec_owner = spec_module(f, modules)
+        if spec_owner:
+            owners = list(dict.fromkeys([*(n for n in owners if n != modules.fallback), spec_owner]))
         check_file = CHECK_FILE.fullmatch(f)
         if check_file:
             owner = check_modules.get(check_file[1], modules.fallback)
@@ -586,7 +607,9 @@ def select(paths: Paths, base: str, head: str, changed: list[str] | None = None)
             if mod and glob_match(f, mod.hot_paths):
                 hot.setdefault(name, []).append(f)
     full = modules.fallback in touched
-    t1 = [c for c in checks if "T1" in c.tiers and (full or c.module in touched)]
+    every_t = any(f.startswith(SPEC_TOOLING) for f in files)
+    t1 = [c for c in checks if "T1" in c.tiers
+          and (full or c.module in touched or (every_t and "T" in c.kinds))]
     guarantees: list[str] = []
     for name in sorted(touched):
         for gid in guarantees_for_module(name, modules, registers):
@@ -601,6 +624,7 @@ def select(paths: Paths, base: str, head: str, changed: list[str] | None = None)
         "modules": {name: {"level": (modules.get(name).level if modules.get(name) else None),
                            "files": fs} for name, fs in sorted(touched.items())},
         "full_t1": full,
+        "all_t_checks": every_t,
         "t1_checks": [{"id": c.id, "module": c.module, "kinds": c.kinds, "needs": c.needs} for c in t1],
         "guarantees": guarantees,
         "paired_ab": {name: fs for name, fs in sorted(hot.items())},
@@ -614,6 +638,8 @@ def render_select(sel: dict) -> str:
         out.append(f"- {name} ({info['level'] or 'unmapped'}): {len(info['files'])} files")
     if sel["full_t1"]:
         out += ["", "Some paths map to no module, so every T1 check is selected."]
+    if sel.get("all_t_checks"):
+        out += ["", "The shared spec tooling changed, so every kind T check is selected."]
     out += ["", "## T1 checks", ""]
     out += [f"- `{c['id']}` ({c['module']}, {' '.join(c['kinds'])})" for c in sel["t1_checks"]] or ["- none registered"]
     out += ["", "## Guarantees the review must cover", ""]

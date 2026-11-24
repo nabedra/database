@@ -1,0 +1,13 @@
+# The kind T pipeline proving itself: the TwoPhase self-test spec's baseline (exhaustive, with
+# coverage) and its two mutants, through the pinned TLC image. See specs/README.md, "Self-test".
+id = "specs-selftest"
+module = "testing"
+kinds = ["T"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/selftest", "TwoPhase", "--module", "testing"]
+cwd = "."
+timeout_s = 3600
+needs = ["tlc"]
+result_parser = "tlc"

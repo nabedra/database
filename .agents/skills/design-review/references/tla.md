@@ -109,13 +109,36 @@ When a design bug is fixed, the reverted fix becomes a mutant named
 
 ## Run
 
-Run TLC in Docker with the versions pinned in `specs/README.md`. Set
-`SPEC` to the spec name and `MODULE` to its folder.
+TLC and Apalache run in the pinned image `specs/tools/Dockerfile`, with the
+versions in `specs/tools/versions.toml`. The wrapper `specs/tools/tlc`
+builds the image on first use and reuses it after, locally and on Actions.
+Docker is the only host requirement. Set `SPEC` to the spec name and
+`MODULE` to its folder.
 
 ```sh
-docker run --rm -v "$PWD/specs:/specs" -w "/specs/$MODULE" "$TLC_IMAGE" \
-  tlc -workers auto -coverage 1 -dumpTrace json "$SPEC.trace.json" \
-  -config "$SPEC.cfg" "MC$SPEC.tla"
+python3 scripts/testing/tla_check.py "specs/$MODULE" "$SPEC"            # T1: baselines, coverage, mutants
+python3 scripts/testing/tla_check.py "specs/$MODULE" "$SPEC" --tier T2 \
+  --simulate --seed 1 --num 100000                                     # T2: <Name>.large.cfg as a simulation
+```
+
+`tla_check.py` runs every baseline (`<Name>.cfg` and any other
+`<Name>.<variant>.cfg` except `.large.cfg`) exhaustively with coverage,
+checks that every action was taken and that every invariant and property
+has a mutant, then runs every mutant and checks that it fails on the
+property its `\* expect:` line names. Each run gets the level's wall-clock
+budget. It reports a violation, a deadlock, a liveness violation and a TLC
+error separately, and a stop at the budget or a state cap as `not-run`.
+Logs, `-dumpTrace json` counterexamples and a summary go to
+`target/tla/specs/<module>/<Name>/`. [Specs](../../../../specs/README.md)
+describes the layout rules, the options and how results map to evidence.
+
+To run TLC by hand, call the wrapper from the spec folder. It mounts
+`specs/` read-only, so write outputs under `--tla-out`:
+
+```sh
+cd "specs/$MODULE"
+../tools/tlc --tla-out /tmp/tlc -workers 2 -coverage 1 \
+  -dumpTrace json "/out/$SPEC.cex.json" -config "$SPEC.cfg" "MC$SPEC.tla"
 ```
 
 - `-coverage 1` prints action counts every minute and at the end. Every
@@ -126,15 +149,18 @@ docker run --rm -v "$PWD/specs:/specs" -w "/specs/$MODULE" "$TLC_IMAGE" \
   only on `.large.cfg` runs, and label the result as simulation.
 - `-fpmem` and `-workers` change memory and CPU use, not coverage.
 
-TLC exits nonzero on a violation, a deadlock or an error. Read its output
-for which one occurred. Record the distinct states, the depth and the
-verdict for each run.
+TLC exits nonzero on a violation, a deadlock or an error. It prints "No
+error has been found" even when it stopped early, so a run is exhaustive
+only when the queue is empty: `0 states left on queue`. Record the distinct
+states, the depth and the verdict for each run.
 
 Apalache checks bounded-length behaviors symbolically and needs type
 annotations.
 
 ```sh
-apalache-mc check --length="$LENGTH" --inv="$INVARIANT" --config="$SPEC.cfg" "MC$SPEC.tla"
+cd "specs/$MODULE"
+../tools/apalache-mc --tla-out /tmp/apalache check --length="$LENGTH" \
+  --inv="$INVARIANT" --config="$SPEC.cfg" "MC$SPEC.tla"
 ```
 
 An Apalache run covers behaviors up to `--length` steps only. State the

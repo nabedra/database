@@ -266,6 +266,41 @@ class SelectTests(MatrixFixtureTests):
         self.assertTrue(sel["full_t1"])
         self.assertEqual([c["id"] for c in sel["t1_checks"]], ["cache-unit", "events-unit"])
 
+    def spec_checks(self):
+        """The fixture checks plus a kind T check for the cache module."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        checks = Path(tmp.name)
+        for p in self.fx.paths.checks.glob("*.toml"):
+            (checks / p.name).write_text(p.read_text())
+        (checks / "cache-lease.toml").write_text(
+            'id = "cache-lease"\nmodule = "cache"\nkinds = ["T"]\nguarantees = ["CACHE-G01"]\n'
+            'tiers = ["T1"]\ncommand = ["python3", "scripts/testing/tla_check.py", "specs/cache", "Lease"]\n'
+            'cwd = "."\ntimeout_s = 3600\nneeds = ["tlc"]\nresult_parser = "tlc"\n')
+        return replace(self.fx.paths, checks=checks)
+
+    def test_spec_folder_selects_its_module_and_t_checks(self):
+        paths = self.spec_checks()
+        sel = matrix.select(paths, "x", "y", changed=["specs/cache/Lease.tla"])
+        self.assertEqual(list(sel["modules"]), ["cache"])
+        self.assertFalse(sel["full_t1"])
+        self.assertIn("cache-lease", [c["id"] for c in sel["t1_checks"]])
+        self.assertNotIn("events-unit", [c["id"] for c in sel["t1_checks"]])
+
+    def test_spec_tooling_selects_every_t_check(self):
+        paths = self.spec_checks()
+        sel = matrix.select(paths, "x", "y", changed=["specs/lib/NabedraTrace.tla"])
+        self.assertEqual(list(sel["modules"]), ["testing"])
+        self.assertTrue(sel["all_t_checks"])
+        self.assertEqual([c["id"] for c in sel["t1_checks"]], ["cache-lease"])
+        self.assertIn("every kind T check", matrix.render_select(sel))
+        sel = matrix.select(paths, "x", "y", changed=["specs/selftest/TwoPhase.tla"])
+        self.assertEqual((list(sel["modules"]), sel["all_t_checks"]), (["testing"], False))
+
+    def test_unknown_spec_folder_falls_back(self):
+        sel = matrix.select(self.spec_checks(), "x", "y", changed=["specs/nomodule/X.tla"])
+        self.assertTrue(sel["full_t1"])
+
     def test_repository_path_ownership(self):
         modules = matrix.load_modules(matrix.Paths().modules)
         examples = {

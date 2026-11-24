@@ -1,0 +1,29 @@
+# The single source of the pinned TLA+ tool versions (specs/README.md, "Tools").
+#
+# specs/tools/tlc reads this file and passes every value to specs/tools/Dockerfile as a build
+# argument. The image tag is a hash of this file and the Dockerfile, so any change here builds a new
+# image. Each download is checked against its SHA-256 before it is installed.
+
+schema = "nabedra.tla-tools/1"
+
+[base]
+# eclipse-temurin:21-jre, pinned by the digest of its multi-platform index.
+image = "eclipse-temurin:21-jre@sha256:d77e090ae1f6970c047b443c6f0a6c1358b0426d44432bb5a7753408cd43de0d"
+
+[tlc]
+# v1.8.0 "The Clarke release", a pre-release published 2026-11-19. v1.7.4 has no -dumpTrace.
+version = "1.8.0"
+url = "https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar"
+sha256 = "fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713"
+
+[community_modules]
+# Json (ndJsonDeserialize) and IOUtils (IOEnv) for trace validation.
+version = "202611060952"
+url = "https://github.com/tlaplus/CommunityModules/releases/download/202611060952/CommunityModules-deps.jar"
+sha256 = "a3b27c40f1fb5085f30c6ead37e918457f8cfc62c1e50a1dc668ef592ad2b5fb"
+
+[apalache]
+# Released 2026-10-12. Pin a release at least two weeks old.
+version = "0.62.4"
+url = "https://github.com/apalache-mc/apalache/releases/download/v0.62.4/apalache-0.62.4.tgz"
+sha256 = "b781b53bba32fac14ac2e02b0332e1dc2edc64cb7b850c0608d8142cc7aa2ef4"

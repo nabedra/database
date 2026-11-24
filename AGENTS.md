@@ -44,8 +44,7 @@ The user decided on 2026-11-24 that such plans are modelled in raw TLA+ in
 `specs/<module>/` and checked with TLC, and that a counterexample fixes the plan
 before any code is written. Implementation starts only when the T checks pass
 with attested evidence and the user approves the reviewed plan. Code review then
-checks simulation traces against the spec. Kind T is defined ahead of its
-tooling; until it lands, follow the skill's interim rules.
+checks simulation traces against the spec.
 
 # ORM parity
 
