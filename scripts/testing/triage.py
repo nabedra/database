@@ -15,7 +15,7 @@ import sys
 
 MAX_RETRIES = 10
 TOLERANCE = Fraction(1, 100)
-KINDS = set("MUSHFDRPK")
+KINDS = set("MUSHFDRPKT")
 CRASH_CODES = {
     -signal.SIGABRT, -signal.SIGKILL, -signal.SIGSEGV,
     128 + signal.SIGABRT, 128 + signal.SIGKILL, 128 + signal.SIGSEGV,
@@ -132,7 +132,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     kinds = set(args.kind.split())
     if not kinds or kinds - KINDS:
-        parser.error("--kind must contain check kinds from M U S H F D R P K")
+        parser.error("--kind must contain check kinds from M U S H F D R P K T")
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
 
     def rerun():

@@ -102,3 +102,9 @@ class TriageTests(unittest.TestCase):
                 stamp = datetime(day.year, day.month, day.day, 12, tzinfo=timezone.utc).timestamp()
                 os.utime(path, (stamp, stamp))
             self.assertEqual(triage.baseline(Path(directory), "probe", today), (1, 1))
+
+
+class KindListTest(unittest.TestCase):
+    def test_triage_accepts_every_evidence_kind(self):
+        import evidence
+        self.assertEqual(triage.KINDS, set(evidence.KINDS))
