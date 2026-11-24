@@ -51,6 +51,7 @@ pub(in crate::cache::cluster) struct StagedPromotion {
     pub target: WorkerId,
     pub retained_epoch: u64,
     pub retained_sequence: u64,
+    pub target_revision: u64,
     pub source: WorkerId,
     pub source_sequence: u64,
     pub prior_lease: Option<Lease>,
@@ -76,6 +77,12 @@ impl StagedPromotion {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct Staging {
+    pub revision: u64,
+    pub source_sequence: Option<u64>,
+}
+
 #[derive(Default)]
 pub(super) struct Observations {
     term: u64,
@@ -84,6 +91,7 @@ pub(super) struct Observations {
 }
 
 struct Report {
+    revision: u64,
     received_ms: u64,
     slots: HashMap<u16, Progress>,
 }
@@ -132,7 +140,14 @@ impl Observations {
                 Some((report.slot, report))
             })
             .collect();
-        self.reports.insert(worker, Report { received_ms, slots });
+        self.reports.insert(
+            worker,
+            Report {
+                revision: heartbeat.revision,
+                received_ms,
+                slots,
+            },
+        );
         staged_progress
     }
 
@@ -203,7 +218,7 @@ impl Observations {
                 continue;
             }
             if changes.len() < MAX_CHANGES
-                && let Some(next) = placement.plan_slot(index, slot, &state.orders)
+                && let Some(next) = placement.plan_slot(index, slot, state)
             {
                 let advances_ownership = next.epoch != slot.epoch;
                 #[cfg(feature = "sim")]
@@ -314,14 +329,22 @@ impl State {
                         continue;
                     }
                     if next.epoch != old.epoch || next.moving != old.moving {
-                        self.staged_sequences.remove(&index);
-                        if old.moving.is_none()
-                            && next.moving.is_some_and(|moving| moving.replica_only)
-                            && let Some(source) = evidence.filter(|source| {
-                                source.baseline && source.slot == index && source.epoch == old.epoch
-                            })
-                        {
-                            self.staged_sequences.insert(index, source.sequence);
+                        self.staging.remove(&index);
+                        if next.moving.is_some_and(|moving| moving.replica_only) {
+                            let source_sequence = evidence
+                                .filter(|source| {
+                                    source.baseline
+                                        && source.slot == index
+                                        && source.epoch == old.epoch
+                                })
+                                .map(|source| source.sequence);
+                            self.staging.insert(
+                                index,
+                                Staging {
+                                    revision,
+                                    source_sequence,
+                                },
+                            );
                         }
                     }
                     #[cfg(feature = "sim")]
@@ -383,7 +406,10 @@ impl State {
             && proof.target != proof.source
             && old.lease == proof.prior_lease
             && source_fenced(self, proof.source, old.lease, lower_ms, proof.fence)
-            && self.staged_sequences.get(&index) == Some(&proof.source_sequence)
+            && self.staging.get(&index).is_some_and(|staging| {
+                staging.source_sequence == Some(proof.source_sequence)
+                    && (staging.revision..=topo.revision).contains(&proof.target_revision)
+            })
             && proof.retained_epoch == old.epoch
             && proof.within_lag()
             && evidence.is_some_and(|copy| {
@@ -574,6 +600,26 @@ impl<'a> Placement<'a> {
         placement
     }
 
+    fn staged_copy(
+        &self,
+        index: u16,
+        slot: Slot,
+        target: WorkerId,
+        state: &State,
+    ) -> Option<(Progress, u64)> {
+        let staging = state.staging.get(&index)?;
+        let revision = self.observed.reports.get(&target)?.revision;
+        // A heartbeat from before this transfer may name a copy that the
+        // target has already discarded, even if the slot epoch is unchanged.
+        if !(staging.revision..=self.topo.revision).contains(&revision) {
+            return None;
+        }
+        let copy = self
+            .observed
+            .baseline(Some(target), index, slot.epoch, self.now)?;
+        Some((copy, revision))
+    }
+
     fn recover_staged(&mut self, index: u16, slot: Slot, state: &State) -> Option<Change> {
         let source = slot.primary?;
         let moving = slot.moving.filter(|moving| moving.replica_only)?;
@@ -607,15 +653,18 @@ impl<'a> Placement<'a> {
         };
         if source_fenced(state, source, slot.lease, self.now.lower_ms, fence)
             && self.topo.member(moving.target).is_some()
-            && let Some(copy) =
-                self.observed
-                    .baseline(Some(moving.target), index, slot.epoch, self.now)
-            && let Some(&source_sequence) = state.staged_sequences.get(&index)
+            && let Some((copy, target_revision)) =
+                self.staged_copy(index, slot, moving.target, state)
+            && let Some(source_sequence) = state
+                .staging
+                .get(&index)
+                .and_then(|staging| staging.source_sequence)
         {
             let proof = StagedPromotion {
                 target: moving.target,
                 retained_epoch: copy.epoch,
                 retained_sequence: copy.sequence,
+                target_revision,
                 source,
                 source_sequence,
                 prior_lease: slot.lease,
@@ -663,7 +712,7 @@ impl<'a> Placement<'a> {
         })
     }
 
-    fn plan_slot(&mut self, index: u16, slot: Slot, orders: &[Order]) -> Option<Slot> {
+    fn plan_slot(&mut self, index: u16, slot: Slot, state: &State) -> Option<Slot> {
         let primary = slot.primary?;
         let source = self
             .observed
@@ -675,11 +724,9 @@ impl<'a> Placement<'a> {
         let expired = self.now.fenced(deadline);
 
         if let Some(moving) = slot.moving {
-            let target = self
-                .observed
-                .baseline(Some(moving.target), index, slot.epoch, self.now);
             if moving.replica_only {
-                if let (Some(source), Some(target)) = (source, target)
+                if let (Some(source), Some((target, _))) =
+                    (source, self.staged_copy(index, slot, moving.target, state))
                     && close_enough(source, target)
                 {
                     return Some(Slot {
@@ -689,10 +736,13 @@ impl<'a> Placement<'a> {
                         ..slot
                     });
                 }
-            } else if let Some(step) =
-                self.plan_move(slot, moving, source, target, replica, expired)
-            {
-                return Some(step);
+            } else {
+                let target =
+                    self.observed
+                        .baseline(Some(moving.target), index, slot.epoch, self.now);
+                if let Some(step) = self.plan_move(slot, moving, source, target, replica, expired) {
+                    return Some(step);
+                }
             }
             // An unfrozen owner can keep serving while its replica is
             // repaired. Release a same-zone handoff whose third member
@@ -752,7 +802,8 @@ impl<'a> Placement<'a> {
             });
         }
 
-        let request = orders
+        let request = state
+            .orders
             .iter()
             .find(|order| index >= order.first && index <= order.last)
             .map(|order| (order.id, order.target))

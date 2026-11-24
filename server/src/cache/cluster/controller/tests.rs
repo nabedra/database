@@ -756,6 +756,7 @@ fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
         Some(report_source),
     );
     report(&mut observations, &state, target, 1_000, None);
+    let before_staging_revision = state.topology.revision;
     let changes = observations.plan(&state, bounds(1_000));
     assert!(state.reconcile(1_000, changes));
     let staged = state.topology.slots[0];
@@ -783,6 +784,22 @@ fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
         serving_primary: false,
         ..report_source
     };
+    // A delayed report can describe a copy that was discarded before this
+    // transfer was installed, even if the source and slot epoch are unchanged.
+    observations.record(
+        &state.topology,
+        Heartbeat {
+            worker: target,
+            version: VERSION,
+            generation: state.topology.generation,
+            revision: before_staging_revision,
+            progress: vec![copy],
+        },
+        4_999,
+    );
+    let changes = observations.plan(&state, bounds(5_000));
+    assert!(!state.reconcile(5_000, changes));
+
     report(&mut observations, &state, target, 4_999, Some(copy));
     let changes = observations.plan(&state, bounds(4_999));
     assert!(!state.reconcile(4_999, changes));
@@ -810,6 +827,15 @@ fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
         proof.retained_sequence += 1;
     }
     assert!(!state.reconcile(5_000, vec![bad]));
+    let mut stale_proof = promotion.clone();
+    if let Change::Slot {
+        staged: Some(ref mut proof),
+        ..
+    } = stale_proof
+    {
+        proof.target_revision = before_staging_revision;
+    }
+    assert!(!state.reconcile(5_000, vec![stale_proof]));
     assert!(!state.reconcile(4_999, vec![promotion.clone()]));
 
     let mut lagged = state.clone();

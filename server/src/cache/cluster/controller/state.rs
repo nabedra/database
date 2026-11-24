@@ -10,7 +10,7 @@ use super::super::protocol::{
     VERSION, WorkerId,
 };
 use super::super::transport::{Fingerprint, bounded_json};
-use super::placement::{Change, Order};
+use super::placement::{Change, Order, Staging};
 use crate::cache::command::SLOT_COUNT;
 
 const MAX_OPERATIONS: usize = 8_192;
@@ -62,9 +62,9 @@ pub(super) struct State {
     retired: BTreeSet<WorkerId>,
     operations: BTreeMap<Uuid, Receipt>,
     groups: usize,
-    // Only replica-only moves need a source watermark across controller terms.
+    // Replica-only moves keep the source watermark and the start revision across terms.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(super) staged_sequences: BTreeMap<u16, u64>,
+    pub(super) staging: BTreeMap<u16, Staging>,
     #[cfg(feature = "sim")]
     #[serde(skip)]
     pub(super) applied_staged: Vec<(u16, super::placement::StagedPromotion)>,
@@ -203,8 +203,17 @@ impl State {
                                 && slot.moving.is_some_and(|moving| moving.replica_only)
                         })
                 {
-                    let sequence = self.staged_sequences.entry(progress.slot).or_default();
-                    *sequence = (*sequence).max(progress.sequence);
+                    let staging = self.staging.entry(progress.slot).or_insert(Staging {
+                        revision: topo.revision,
+                        source_sequence: None,
+                    });
+                    staging.source_sequence = Some(
+                        staging
+                            .source_sequence
+                            .map_or(progress.sequence, |sequence| {
+                                sequence.max(progress.sequence)
+                            }),
+                    );
                 }
             }
             for (index, slot) in topo.slots.iter_mut().enumerate() {
@@ -503,7 +512,7 @@ impl State {
         }
         self.orders
             .retain(|order| usize::from(order.last) < first || usize::from(order.first) > last);
-        self.staged_sequences
+        self.staging
             .retain(|&index, _| !(first..=last).contains(&usize::from(index)));
         for (slot, (primary, replica)) in self.topology.slots[first..=last]
             .iter_mut()
@@ -520,7 +529,7 @@ impl State {
             && self.topology.workers.len() <= MAX_WORKERS
             && self.retired.len() <= MAX_RETIRED_BOOTS
             && self.groups <= MAX_WORKERS
-            && self.staged_sequences.keys().all(|&index| {
+            && self.staging.keys().all(|&index| {
                 self.topology
                     .slots
                     .get(usize::from(index))
