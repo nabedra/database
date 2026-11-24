@@ -1,0 +1,46 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p8e-624edf8-043147-checks--oltp-pool-sim.log",
+      "sha256": "d87d14ec68b29ba1af95727ca361fa16bea4129c215d1fa6c27ac5af7eacbe9d"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-pool-sim",
+  "duration_s": 301.257,
+  "guarantees": [
+    "OLTP-G01",
+    "OLTP-G08"
+  ],
+  "kind": "S",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T03:41:01.285216+00:00",
+    "request_id": "land-p8e-624edf8-043147-checks",
+    "runner": "GitHub Actions 1000009661",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45320149349"
+  },
+  "scenarios": [
+    "O11",
+    "NS04",
+    "O16",
+    "O17"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "624edf8d17bd595c5bfe4494024f0a3a2f553417",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
