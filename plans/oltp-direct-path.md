@@ -251,7 +251,7 @@ Add these to [the OLTP contract](../docs/testing/oltp-contract.md) under "Direct
 | ID | Scenario | Required assertions |
 | --- | --- | --- |
 | D01 | All eligible operations through both ORMs at RF1 and RF3 | Results, errors and types equal the queued path for the same program. Stats show zero queue copies and one Data entry per mutation. |
-| D02 | Kill the gateway after the leader proposes, then retry the same ID and body through another gateway | One committed version, the original result, one dedup record. For a no-op or row conflict: no committed version, the first definite result, one dedup record. |
+| D02 | Kill the gateway after the leader proposes, then retry the same ID and body through another gateway | One committed version, the original result, one dedup record. |
 | D03 | Same ID with a different body on the same key, then on a different key | The first is a conflict. The second executes, as decided above. The retry rule in section 4 covers the same body only. |
 | D04 | Kill the leader before quorum and after quorum | No acknowledged write is lost and none applies twice. The retry completes on the new leader. |
 | D05 | Pause one follower, then two | One paused: writes succeed within the deadline. Two paused: no success response and the row is unchanged. |
