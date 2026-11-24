@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p9-pools-b-ab-e0192e5-021920--oltp-native-executor-paired-review.log",
+      "sha256": "a567f85d1d66d73e6edf18b588ac472bc4b5a6ab94ea1f730c11f6eeb7468f5b"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-native-executor-paired-review",
+  "duration_s": 822.061,
+  "guarantees": [],
+  "kind": "P",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T02:20:54.240877+00:00",
+    "request_id": "land-p9-pools-b-ab-e0192e5-021920",
+    "runner": "GitHub Actions 1000009408",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45311497153"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "7dec33b76444b0674e7f24ff77cb8fd271cd1431",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
