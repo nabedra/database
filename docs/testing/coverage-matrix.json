@@ -7,8 +7,25 @@
       "K03 simulated controller disk loss is `not-run` pending modelled Raft storage."
     ]
   },
-  "head": "297e7e91af810d85cf324607c77cd4edf061afb6",
-  "ignored_records": [],
+  "head": "847e72aaf8ec482276e21c60f277e193627545cb",
+  "ignored_records": [
+    {
+      "path": "p10-harness-d551aca-101354--oltp-sim-2.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p10-harness-d551aca-101354--oltp-sim-3.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p10-harness-d551aca-101354--oltp-sim-4.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p10-harness-d551aca-101354--oltp-sim.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -2816,6 +2833,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "4 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2844,6 +2862,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "4 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2880,6 +2899,7 @@
         "H": {
           "executed": 0,
           "failed": 0,
+          "reason": "4 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2908,6 +2928,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "4 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -4002,5 +4023,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
