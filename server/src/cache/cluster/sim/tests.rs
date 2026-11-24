@@ -8,7 +8,7 @@ use serde_json::json;
 
 use super::super::{
     clock::{ClockMode, MAX_UNCERTAINTY_NS},
-    protocol::Admin,
+    protocol::{Admin, LEASE_MS, RENEW_MS, Reply},
 };
 use super::harness::{Cluster, Config};
 use super::history::Op;
@@ -25,7 +25,7 @@ mod mutants;
 const FAULT_MS: u64 = 20_000;
 const HEAL_MS: u64 = 15_000;
 const REGRESSION_SEEDS: &[u64] = &[
-    7, 12, 14, 16, 20, 21, 37, 38, 46, 55, 65, 115, 198, 211, 219,
+    7, 12, 14, 16, 20, 21, 37, 38, 46, 55, 65, 115, 198, 211, 212, 219,
 ];
 const STAGED_RECOVERY_SEED: u64 = 4_528_675_707_300_134;
 const NIGHTLY_REGRESSION_SEEDS: &[u64] = &[
@@ -383,18 +383,27 @@ async fn cold_reset(cluster: &mut Cluster, lost_key: Option<&str>) {
     for &node in &nodes {
         cluster.crash(node);
     }
-    cluster.step(super::super::protocol::LEASE_MS + 1000).await;
-    for node in nodes {
+    let fence_budget = LEASE_MS + RENEW_MS;
+    cluster.step(fence_budget).await;
+    for &node in &nodes {
         cluster.start_worker(node).await;
     }
-    cluster.step(2_000).await;
-    if !matches!(
-        cluster.admin(Admin::ColdReset { slot: None }).await,
-        super::super::protocol::Reply::Applied { .. }
-    ) {
+    cluster.step(2 * RENEW_MS).await;
+    let mut reset = cluster.admin(Admin::ColdReset { slot: None }).await;
+    if matches!(&reset, Reply::Refused(reason) if reason == "prior authority is still live") {
+        // Scoped repair can grant a lease to a newly enrolled worker before
+        // the full reset. Quiesce renewals to fence those fresh grants too.
+        for node in nodes {
+            cluster.isolate_controller_links(node);
+        }
+        cluster.step(fence_budget).await;
+        reset = cluster.admin(Admin::ColdReset { slot: None }).await;
+        cluster.heal();
+    }
+    if !matches!(reset, Reply::Applied { .. }) {
         cluster.violate(
             "ColdStartEmpty",
-            "controller refused reset after full worker stop".into(),
+            format!("controller refused reset after full worker stop: {reset:?}"),
         );
     }
     cluster.step(HEAL_MS).await;
