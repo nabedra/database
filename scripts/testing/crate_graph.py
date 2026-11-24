@@ -660,8 +660,8 @@ def main(argv=None) -> int:
         if args.command == "proofs":
             crate = config.proofs.get("requires", "")
             if crate and not (repo / crate).exists():
-                print(f"not-run: {crate} does not exist yet")
-                return 0
+                print(f"FAIL missing replication crate source: {crate}")
+                return 1
             report = proof_report(repo, config)
             for row in report["outside"]:
                 print(f"FAIL {row} is outside {', '.join(report['allowed'])}")

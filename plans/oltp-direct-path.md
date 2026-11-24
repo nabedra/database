@@ -21,7 +21,7 @@ One serial `table.update` on three workers, from [the latency evidence](../docs/
 | --- | --- | --- |
 | New TCP and mTLS handshake per RPC, Raft appends and heartbeats included | [`multiplex/transport.rs`](../server/src/oltp_replication/multiplex/transport.rs) | One persistent multiplexed session per peer pair |
 | About 42 RPCs and 15 Raft writes across Control, Status, Timestamp, Catalog and Data | [`worker_runtime.rs`](../server/src/oltp_runtime/worker_runtime.rs), [`transaction.rs`](../server/src/oltp_runtime/transaction.rs) | 1 Data entry, 0 or 1 coalesced Timestamp RPC |
-| One entry per append, about 3 fsyncs per entry per replica | [`hosted.rs`](../server/src/oltp_replication/hosted.rs), [`pool.rs`](../server/oltp-storage/src/oltp/pool.rs) | Batched appends, one group-committed fsync per replica |
+| One entry per append, about 3 fsyncs per entry per replica | [`hosted.rs`](../server/oltp-replication/src/oltp_replication/hosted.rs), [`pool.rs`](../server/oltp-storage/src/oltp/pool.rs) | Batched appends, one group-committed fsync per replica |
 | Four queue copy phases to every ready worker | `oltp_runtime/replica` | None |
 | Gateway polls for completion, sleeping 50 to 500 ms | [`remote_api.rs`](../server/src/oltp_runtime/remote_api.rs) | Reply on the request stream |
 | 88 MiB charged per request before the body is read | [`http.rs`](../server/src/oltp_runtime/http.rs) | Charge the actual body size |
@@ -66,7 +66,7 @@ The leader returns `Fallback` when the key holds an intent from a queued transac
 
 ## 1. Persistent peer sessions
 
-Replace connect-per-RPC in [`multiplex/transport.rs`](../server/src/oltp_replication/multiplex/transport.rs) and [`typed_network.rs`](../server/src/oltp_replication/typed_network.rs) with one long-lived mTLS connection per ordered peer pair and traffic class. Negotiate it with ALPN `nabedra-otp/2` and fall back to the one-shot `NABOTP01` exchange when the peer does not offer it.
+Replace connect-per-RPC in [`multiplex/transport.rs`](../server/src/oltp_replication/multiplex/transport.rs) and [`typed_network.rs`](../server/oltp-replication/src/oltp_replication/typed_network.rs) with one long-lived mTLS connection per ordered peer pair and traffic class. Negotiate it with ALPN `nabedra-otp/2` and fall back to the one-shot `NABOTP01` exchange when the peer does not offer it.
 
 ```rust
 // Each frame on a session. The body is the existing prologue, header and sections.
@@ -86,11 +86,11 @@ impl PeerSessions {
 
 ## 2. Raft batching and group commit
 
-In [`hosted.rs`](../server/src/oltp_replication/hosted.rs) replace `single_entry_config` with byte-bounded batching: at most 64 entries and 1 MiB per append, `api_batch_linger_ms = 0`. Then change the three storage calls.
+In [`hosted.rs`](../server/oltp-replication/src/oltp_replication/hosted.rs) replace `single_entry_config` with byte-bounded batching: at most 64 entries and 1 MiB per append, `api_batch_linger_ms = 0`. Then change the three storage calls.
 
 | Write | Today | Change |
 | --- | --- | --- |
-| Log append in [`typed_log.rs`](../server/src/oltp_replication/typed_log.rs) | One synced `WriteBatch` per entry | One synced `WriteBatch` per append batch. The pool's nabedra-kv journal group-commits concurrent syncs from other groups on the same pool. |
+| Log append in [`typed_log.rs`](../server/oltp-replication/src/oltp_replication/typed_log.rs) | One synced `WriteBatch` per entry | One synced `WriteBatch` per append batch. The pool's nabedra-kv journal group-commits concurrent syncs from other groups on the same pool. |
 | `save_committed` | Synced | Unsynced. OpenRaft treats it as a recovery hint. |
 | Apply in [`pool.rs`](../server/oltp-storage/src/oltp/pool.rs) `mutate` | One synced batch per entry | One unsynced batch for all entries in the apply call, with position, reply and membership inside it. |
 
@@ -148,11 +148,11 @@ An existing dedup record with the same digest returns `Replayed`. A different di
 
 **Cluster features (GC2).** As with ScyllaDB's cluster features, every worker advertises the features its build supports, and Control enables a feature once every enrolled worker advertised it with its current identity. Every Control voter and learner is an enrolled worker, so it then runs a build that knows the feature. The enablement is a durable Control fact that never reverts, and afterwards a worker identity that did not advertise it cannot join a Data group or the ready set. The advert is an ordinary `data.direct.v1` `Advertise { version: 1 }` whose operation ID is derived from the feature name and the exact worker identity, so Control replicas of the previous build apply it byte for byte alike; the feature-aware build reads the advert from its operation receipt. Downgrading a worker below a build that knows an enabled feature is unsupported, as for `data.direct.v1`. The features form one registry (CAP1): `data.direct.batch`, `status.queued-snapshot-retry` and `data.index.reclaim`. Data leaders propose `ReclaimIndex` entries, and workers send the index reclamation service calls, only once `data.index.reclaim` is enabled. A per-connection ALPN capability is kept only for transport behaviour that changes no frame, entry or log format (`nabedra-otp/4`, direct admission); the former `nabedra-otp/3` gate for index reclamation is retired.
 
-**Mixed versions.** Add a Control capability `data.direct.v1` next to the existing [scoped-queue capability](../server/src/oltp_replication/authority/control/machine/scoped_queue/capability.rs). Control activates it automatically when every voter and learner advertises it. No leader proposes `Direct` before activation, since an older replica cannot decode the variant.
+**Mixed versions.** Add a Control capability `data.direct.v1` next to the existing [scoped-queue capability](../server/oltp-replication/src/oltp_replication/authority/control/machine/scoped_queue/capability.rs). Control activates it automatically when every voter and learner advertises it. No leader proposes `Direct` before activation, since an older replica cannot decode the variant.
 
 ## 5. Commit timestamps
 
-Direct commits need timestamps from the same domain as queued snapshots, so cross-shard snapshot reads stay consistent. Today every allocation is a Timestamp Raft write. Add a durable window in [`authority/timestamp.rs`](../server/src/oltp_replication/authority/timestamp.rs).
+Direct commits need timestamps from the same domain as queued snapshots, so cross-shard snapshot reads stay consistent. Today every allocation is a Timestamp Raft write. Add a durable window in [`authority/timestamp.rs`](../server/oltp-replication/src/oltp_replication/authority/timestamp.rs).
 
 ```rust
 TimestampCommand::ReserveWindow { authority: Authority, count: u64 }   // high_watermark += count, replies with the range

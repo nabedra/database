@@ -523,7 +523,7 @@ jobs:
           set -o pipefail
           cargo test --locked --no-default-features --features oltp --lib --tests --no-run --timings \
             --message-format=json-render-diagnostics > ../build.json
-          cargo test --locked -p nabedra-resources -p nabedra-transport -p nabedra-oltp-storage --lib --no-run \
+          cargo test --locked -p nabedra-resources -p nabedra-transport -p nabedra-oltp-storage -p nabedra-oltp-replication --lib --no-run \
             --message-format=json-render-diagnostics >> ../build.json
           cargo build --locked --no-default-features --features oltp --bin nabedra-db
           cd ..
@@ -532,6 +532,7 @@ jobs:
                  | [(if .target.name == "nabedra_resources" then "resources"
                      elif .target.name == "nabedra_transport" then "transport"
                      elif .target.name == "nabedra_oltp_storage" then "storage"
+                     elif .target.name == "nabedra_oltp_replication" then "replication"
                      elif (.target.kind | index("lib")) then "lib"
                      else .target.kind[0] end), .target.name, .executable] | @tsv' build.json \
             | sed "s#\t$GITHUB_WORKSPACE/#\t#" > bins.tsv
@@ -540,6 +541,7 @@ jobs:
           test "$(awk -F'\t' '$1 == "resources"' bins.tsv | wc -l)" = 1
           test "$(awk -F'\t' '$1 == "transport"' bins.tsv | wc -l)" = 1
           test "$(awk -F'\t' '$1 == "storage"' bins.tsv | wc -l)" = 1
+          test "$(awk -F'\t' '$1 == "replication"' bins.tsv | wc -l)" = 1
           cat bins.tsv
       - uses: actions/upload-artifact@v4
         with:
@@ -721,6 +723,7 @@ jobs:
               lint -p "nabedra-$crate" --all-targets
             fi
           done
+          lint -p nabedra-oltp-replication --all-targets --features s3
       - name: Stage Cargo cache without workspace crates
         if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
         run: |
@@ -791,6 +794,14 @@ jobs:
             ~/.cargo/registry/cache
             ~/cargo-cache
           key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: OLTP backup S3 loopback fixture
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked -p nabedra-oltp-replication --features s3 --lib \
+            oltp_backup_repository::tests::o19_s3_conditional_put_reconciles_only_verified_exact_bytes \
+            -- --exact | tee "$RUNNER_TEMP/oltp-s3-fixture.log"
+          grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;" "$RUNNER_TEMP/oltp-s3-fixture.log"
       # Inputs for the o02 job: the same-commit engine matrix (installed binaries, compile guards) and an
       # OLAP server for O01's ORM parity and O02's cross-engine worker check. Built after the cache is saved.
       - name: Build installed engine variants and check feature guards (O02)
@@ -979,6 +990,7 @@ jobs:
           [[ -n "$transport" && -x "$GITHUB_WORKSPACE/$transport" ]]
           echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
           echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
+          echo "NABEDRA_OLTP_REPLICATION_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "replication" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -996,6 +1008,12 @@ jobs:
         run: |
           set -o pipefail
           NABEDRA_TEST_DIRECT_OLTP=on "$NABEDRA_OLTP_STORAGE_TEST_EXE" --test-threads 4 $QUARANTINE_SKIPS 2>&1 | tee ../oltp-storage.log
+      - name: Replication library suite
+        if: ${{ !cancelled() }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          NABEDRA_TEST_DIRECT_OLTP=on "$NABEDRA_OLTP_REPLICATION_TEST_EXE" --test-threads 4 $QUARANTINE_SKIPS 2>&1 | tee ../oltp-replication.log
       - name: Transport library suite
         if: ${{ !cancelled() }}
         working-directory: server
@@ -1341,6 +1359,7 @@ jobs:
           [[ -n "$transport" && -x "$GITHUB_WORKSPACE/$transport" ]]
           echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
           echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
+          echo "NABEDRA_OLTP_REPLICATION_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "replication" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_RESOURCES_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "resources" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -1404,6 +1423,7 @@ jobs:
           [[ -n "$transport" && -x "$GITHUB_WORKSPACE/$transport" ]]
           echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
           echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
+          echo "NABEDRA_OLTP_REPLICATION_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "replication" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_RESOURCES_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "resources" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -1449,6 +1469,12 @@ jobs:
         run: |
           set -o pipefail
           NABEDRA_TEST_DIRECT_OLTP=off "$NABEDRA_OLTP_STORAGE_TEST_EXE" --test-threads 4 $QUARANTINE_SKIPS 2>&1 | tee ../artifacts/oltp-storage-direct-off.log
+      - name: Replication library suite, direct_oltp off
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.mode == 'off' }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          NABEDRA_TEST_DIRECT_OLTP=off "$NABEDRA_OLTP_REPLICATION_TEST_EXE" --test-threads 4 $QUARANTINE_SKIPS 2>&1 | tee ../artifacts/oltp-replication-direct-off.log
       - name: OLTP integration tests, direct_oltp off
         if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.mode == 'off' }}
         working-directory: server
@@ -1932,6 +1958,7 @@ jobs:
           [[ -n "$transport" && -x "$GITHUB_WORKSPACE/$transport" ]]
           echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
           echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
+          echo "NABEDRA_OLTP_REPLICATION_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "replication" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_RESOURCES_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "resources" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -1984,6 +2011,7 @@ jobs:
           [[ -n "$transport" && -x "$GITHUB_WORKSPACE/$transport" ]]
           echo "NABEDRA_TRANSPORT_TEST_EXE=$GITHUB_WORKSPACE/$transport" >> "$GITHUB_ENV"
           echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
+          echo "NABEDRA_OLTP_REPLICATION_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "replication" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
@@ -2000,10 +2028,12 @@ jobs:
           server_cases=()
           transport_cases=()
           storage_cases=()
+          replication_cases=()
           for name in "${names[@]}"; do
             case "$name" in
               transport::*) transport_cases+=("$name") ;;
               oltp::*) storage_cases+=("$name") ;;
+              oltp_replication::*|oltp_deployment::*|oltp_backup_repository::*) replication_cases+=("$name") ;;
               *) server_cases+=("$name") ;;
             esac
           done
@@ -2020,6 +2050,9 @@ jobs:
           fi
           if [ "${#storage_cases[@]}" -gt 0 ]; then
             repeat --executable "$NABEDRA_OLTP_STORAGE_TEST_EXE" "${storage_cases[@]}" || status=1
+          fi
+          if [ "${#replication_cases[@]}" -gt 0 ]; then
+            repeat --executable "$NABEDRA_OLTP_REPLICATION_TEST_EXE" "${replication_cases[@]}" || status=1
           fi
           exit "$status"
       - if: always()
@@ -2055,6 +2088,7 @@ jobs:
           lib=$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
           echo "NABEDRA_TEST_EXE=$GITHUB_WORKSPACE/$lib" >> "$GITHUB_ENV"
           echo "NABEDRA_OLTP_STORAGE_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "storage" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
+          echo "NABEDRA_OLTP_REPLICATION_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "replication" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_RESOURCES_TEST_EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "resources" {print $3}' bins.tsv)" >> "$GITHUB_ENV"
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"

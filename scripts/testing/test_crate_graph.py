@@ -325,8 +325,7 @@ class ProofTests(unittest.TestCase):
     def test_proof_impls(self):
         """Case 6: every `impl ...Proof for` lives in the replication crate."""
         requires = CONFIG.proofs["requires"]
-        if not (ROOT / requires).exists():
-            self.skipTest(f"not-run: {requires} does not exist yet (P8-H creates the replication crate)")
+        self.assertTrue((ROOT / requires).is_file(), f"missing replication crate source: {requires}")
         report = crate_graph.proof_report(ROOT, CONFIG)
         self.assertTrue(report["impls"], "no `impl ...Proof for` blocks found; the case would pass vacuously")
         self.assertEqual(report["outside"], [])

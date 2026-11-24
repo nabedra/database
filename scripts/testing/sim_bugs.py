@@ -147,12 +147,24 @@ def digest(patch):
     return h.hexdigest()
 
 
+def patch_for_tree(repo, patch):
+    """Keep historical digests while applying patches at the extracted source paths."""
+    if not (repo / "server/oltp-replication/src/oltp_replication").is_dir():
+        return patch
+    return "".join(
+        line.replace("/server/src/oltp_replication/", "/server/oltp-replication/src/oltp_replication/")
+        if line.startswith(("diff --git ", "--- ", "+++ ")) else line
+        for line in patch.splitlines(keepends=True)
+    )
+
+
 def apply_check_head(repo, patch):
     """`git apply --check` against HEAD's tree through a private index. Touches no worktree."""
     with tempfile.TemporaryDirectory(prefix="sim-bugs-index-") as tmp:
         env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
         git(repo, "read-tree", "HEAD", env=env)
-        result = git(repo, "apply", "--check", "--cached", "-", env=env, input=patch, check=False)
+        result = git(repo, "apply", "--check", "--cached", "-", env=env,
+                     input=patch_for_tree(repo, patch), check=False)
     return result.returncode == 0, (result.stderr or result.stdout).strip()
 
 
@@ -416,7 +428,7 @@ class Scratch:
     def apply(self, bug):
         if self.path.resolve() == self.repo.resolve():
             raise Failure("refusing to apply patches in the shipped tree")
-        git(self.path, "apply", "-", input=bug.patch)
+        git(self.path, "apply", "-", input=patch_for_tree(self.path, bug.patch))
 
     def reset(self):
         git(self.path, "checkout", "--quiet", "--", ".")
@@ -439,10 +451,11 @@ def run_logged(cmd, cwd, env, log, timeout=None):
     return result.returncode, result.stdout
 
 
-def build_lib_tests(args, tree, env, log, need_server):
+def build_lib_tests(args, tree, env, log, need_server, package=None):
     """Build the OLTP library test executable (and the server for acceptance); return paths."""
     cargo = args.cargo.split()
-    common = ["--locked", "-j", str(args.jobs), *LIB_TEST_FEATURES]
+    features = ["-p", package] if package else LIB_TEST_FEATURES
+    common = ["--locked", "-j", str(args.jobs), *features]
     code, output = run_logged([*cargo, "test", *common, "--lib", "--no-run",
                                "--message-format=json-render-diagnostics"], tree / "server", env, log)
     if code != 0:
@@ -554,16 +567,32 @@ def cmd_verify(repo, bugs, args, out):
         tree = scratch.path
         sha = git(tree, "rev-parse", "HEAD").stdout.strip()
         print(f"sim-bugs verify on {sha}, log {log_path}", file=out, flush=True)
-        exe, server = build_lib_tests(args, tree, env, log, need_server)
+        replication = (tree / "server/oltp-replication/src/oltp_replication").is_dir()
+        packages = {
+            bug.id: "nabedra-oltp-replication"
+            if replication and bug.regression.get("test", "").startswith("oltp_replication::")
+            else None
+            for bug in bugs
+        }
+
+        def build(package):
+            server_build = need_server and package is None
+            if replication and server_build:
+                fixture, _ = build_lib_tests(args, tree, env, log, False, "nabedra-oltp-replication")
+                env["NABEDRA_OLTP_REPLICATION_TEST_EXE"] = fixture
+            return build_lib_tests(args, tree, env, log, server_build, package)
+
+        clean_builds = {package: build(package) for package in dict.fromkeys(packages.values())}
         clean = {}
         for bug in bugs:
+            exe, server = clean_builds[packages[bug.id]]
             clean[bug.id], output = regression_verdict(bug, tree, exe, server, env, log, patched=False)
             print(f"{bug.id}: without the patch {clean[bug.id]}", file=out, flush=True)
             print_regression_result(bug, output, out)
         for bug in bugs:
             scratch.apply(bug)
             try:
-                p_exe, p_server = build_lib_tests(args, tree, env, log, need_server)
+                p_exe, p_server = build(packages[bug.id])
                 patched, output = regression_verdict(bug, tree, p_exe, p_server, env, log, patched=True)
                 print_regression_result(bug, output, out)
             except Failure as error:
