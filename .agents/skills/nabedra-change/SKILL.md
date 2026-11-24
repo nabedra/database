@@ -10,29 +10,39 @@ When you are given a task or asked to make a change, do the following:
 3. Before implementing a plan that changes a topology or a protocol, or touches an L2 or L3 module, run the `design-review` skill of this repo. Implement only after its [gate](../design-review/SKILL.md#gate-implementation) holds. The plan, the spec and the implementation share the branch and the PR. A change to `specs/` is not docs-only.
 4. Always when you are done with the implementation, tell the user you are ready to run the code review (he might want you to add more features). If he asks for the review, run a deep code review/QA using the `code-review` skill of this repo
 5. When you are done, file a PR in GitHub
-6. For docs-only changes, review the diff, examples and links locally. Skip
-   runtime tests and GitHub Actions.
-   Put `[skip ci]` in the PR head commit message and in the commit message that
-   lands on the base branch. For other changes, run the applicable checks and
-   tests, including GitHub Actions dispatched on the PR's head commit when
-   appropriate. Wait for the applicable PR gate, fix failures, and rerun
-   affected checks. Before merging any PR, confirm that the applicable checks
-   pass and the [non-author reviewer](../code-review/SKILL.md#verification-rules)
-   approves.
+6. Review and verify changes during development.
+   - For docs-only changes, review the diff, examples and links locally. Skip
+     tests and GitHub Actions. The author can merge after the local review.
+   - For other changes, review the diff and run applicable local checks. Manually dispatch
+     focused Actions checks on the PR head when useful during development. Merge after the
+     applicable [review](../code-review/SKILL.md#verification-rules), then run broad Actions verification once on the resulting `main` SHA
+     after a batch of PRs merges.
 7. After the merge, remove the PR branch and worktree if they are no longer needed. Then run `git pull` on the base branch.
 
 Use the [Nabedra builds skill](../nabedra-builds/SKILL.md) to choose where to
 run builds and expensive checks. Apply it when coordinating concurrent agents.
-Pushes alone start no CI. Follow the dispatch procedure in
-[GitHub Actions for checks](../code-review/references/gh-actions.md).
+GitHub Actions runs by manual dispatch only. Follow
+[GitHub Actions for checks](../code-review/references/gh-actions.md) for dispatch commands.
 
 When agents work in parallel on one codebase, every hot file has a single owner
 per wave. See the hot-file rule in the
 [subagent-driven development workflow](references/subagent-driven-development.md#prepare-the-work).
 
+# Contracts for the change
+
+- For changes to request admission, queues, scheduling, workers, partition
+  memory, mutation publication, recovery, or autoscaling, use the
+  [scheduler test contract](../../../docs/testing/scheduler-contract.md).
+- For OLTP request-path changes, start with the
+  [OLTP direct-path plan](../../../plans/oltp-direct-path.md).
+- For ORM changes and database changes that affect ORM callers, follow the
+  [ORM parity checks](../../../docs/testing/orm-parity.md).
+
 # Feedback tiers
 
-For changes that need runtime checks, use the tiers below.
+For changes that need runtime checks, use the tiers below and follow the
+[testing guide](../../../docs/testing/README.md) and
+[verification rules](../code-review/SKILL.md#verification-rules).
 `python3 scripts/testing/matrix.py select --base <sha> --head <sha>` picks
 the checks for a diff. `python3 scripts/testing/run_check.py --list --tier <tier>`
 lists a tier's checks.
@@ -41,8 +51,8 @@ lists a tier's checks.
 | --- | --- | --- |
 | T0 | Locally, before each commit | In-process checks of touched modules, each under 10 s. Aim for under 60 s including the incremental build. Simulation uses one thread and about 20 seeds. |
 | T1 | On Actions, dispatched on the final SHA before review | The set from `matrix.py select`, the repetition gate for new or changed tests, and paired A/B for hot paths listed in `docs/testing/modules.toml`. Run the Valkey differential when Cache changes. |
-| T2 | Nightly, scheduled on the SHA of `main` | Long seed runs, fuzzing, real S3 and kind suites |
-| Weekly | Scheduled on `main` | The upgrade and downgrade matrix |
+| T2 | Manually dispatched on the SHA of `main` | Long seed runs, fuzzing, real S3 and kind suites |
+| Weekly | Manually dispatched on `main` | The upgrade and downgrade matrix |
 | T3 | Release SHA | Every in-scope matrix cell green on that SHA |
 
 Never start a T2 or T3 run from a task branch. Record what each tier ran as

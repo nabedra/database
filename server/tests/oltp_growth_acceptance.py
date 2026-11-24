@@ -101,6 +101,24 @@ def query(facade, table, kind='collect', expression=None, api='api1'):
     return facade.data(operation(f'query.{kind}', dict(table_id=table.id, query=query._to_wire())), api)
 
 
+# Lead decision 7 (2026-11-24): O28's 100,001-row counts take 16 to 30 s on Actions runners in
+# the debug-assertion test build, against the default 30 s read deadline. That is test-environment
+# timing, not a product latency guarantee, so these counts get 120 s and print their latency.
+LARGE_COUNT_DEADLINE_SECONDS = 120
+
+
+def large_count(facade, table, expression=None, *, label, api='api1'):
+    query = table.query() if expression is None else expression
+    body = operation('query.count', dict(table_id=table.id, query=query._to_wire()))
+    started = time.monotonic()
+    status, response = facade.api(api, OPERATIONS, body, timeout=LARGE_COUNT_DEADLINE_SECONDS)
+    elapsed = time.monotonic() - started
+    print(f'O28 large count ({label}): status {status} in {elapsed:.2f} s, '
+          f'deadline {LARGE_COUNT_DEADLINE_SECONDS} s', flush=True)
+    assert status == 200 and response['request_id'] == body['request_id'], (status, response)
+    return response['data']
+
+
 def read_after_transition(facade, body, api='api2', *, timeout=8):
     request = body
 
@@ -1210,9 +1228,9 @@ def o28(facade):
             fields = [dict(id=f'{prefix}.bulk-{index:06}', category=9, value=index)
                       for index in range(offset, min(offset + 1024, count))]
             insert_exact(facade, table, fields)
-    assert query(facade, table, 'count') == total
-    assert query(facade, table, 'count', table.query().limit(100_000)) == 100_000
-    assert query(facade, table, 'count', table.where(category=9)) == needed + len(prefix_rows)
+    assert large_count(facade, table, label='all rows') == total
+    assert large_count(facade, table, table.query().limit(100_000), label='limit 100,000') == 100_000
+    assert large_count(facade, table, table.where(category=9), label='category 9') == needed + len(prefix_rows)
     passed('O28', 'large-counts',
            'Both routing pages contributed to a count of 100,001. The explicit limit returned 100,000 and the checked overflow case returned limit_exceeded.')
     if archive_error is not None:
