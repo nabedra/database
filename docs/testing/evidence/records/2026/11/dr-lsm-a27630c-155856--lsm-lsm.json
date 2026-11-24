@@ -1,0 +1,519 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-lsm-a27630c-155856--lsm-lsm.log",
+      "sha256": "604950109dea98410a805d8620cbcb0f6f8d2d996399929901f59740371f2575"
+    },
+    {
+      "name": "tla/Lsm.live.log",
+      "sha256": "f47015fd3f1b92132211078295a79455428b2450c993b86897e85a787d31fa55"
+    },
+    {
+      "name": "tla/Lsm.log",
+      "sha256": "7ec4dd8a3951e045aecd6c3dc96ac6aed2f57650682b5f49a673f8328207afff"
+    },
+    {
+      "name": "tla/Lsm.media.log",
+      "sha256": "38c42530e9a2c6d92662021baf363021e7a5b8aed91c0936c5b858351a61d336"
+    },
+    {
+      "name": "tla/Lsm.ops.log",
+      "sha256": "39b3bb3346819de47f5be2bd7e7215575815a8d79cdefaf88c8d8b1eb7fe94cf"
+    },
+    {
+      "name": "tla/Lsm.values.log",
+      "sha256": "c6fc31f15931870b1f0698663c1d64f576962d3fdde910f0ef15d713b8e66267"
+    },
+    {
+      "name": "tla/Lsm.wipe.log",
+      "sha256": "dd7467abb2cfef04c147f07f791c8c286714f0b59367d5e6858b7d8f0224075f"
+    },
+    {
+      "name": "tla/mutant-ack_before_sync.cex.json",
+      "sha256": "b78751193c3552c7ff713cfc71fc50223a78d7d3beaa442e7ea94cd7a40f18cd"
+    },
+    {
+      "name": "tla/mutant-ack_before_sync.log",
+      "sha256": "4b002d407cdc62a22c29fbf9e1a3bfc3b2322f4344c200cf5f5d20c20cd40002"
+    },
+    {
+      "name": "tla/mutant-cleanup_before_current_sync.log",
+      "sha256": "682189a9f0da5a5984b48c6ed110d1b234f0f53f49cda24652da43dd0f5c10dc"
+    },
+    {
+      "name": "tla/mutant-compaction_ignores_snapshots.log",
+      "sha256": "b2aa894fc6f0596a2f80db2cf5047e91f7d3635aea9c2b1acf52323fd7929b9e"
+    },
+    {
+      "name": "tla/mutant-eio_as_torn.cex.json",
+      "sha256": "4921b7a19fb31fea758dfdb6d4b91f262d0803f81640d761a9f8086e3b036275"
+    },
+    {
+      "name": "tla/mutant-eio_as_torn.log",
+      "sha256": "e286d8b3b7f8d3dbef59df7ccb981acece62e13feda13493bb18f5c74a4dfc3d"
+    },
+    {
+      "name": "tla/mutant-flush_drops_tombstones.cex.json",
+      "sha256": "c8be67f248ad2f6ef0994255f59b1e14d6c6681b9f505bc1103bb36c5e9b4d93"
+    },
+    {
+      "name": "tla/mutant-flush_drops_tombstones.log",
+      "sha256": "2252c018cd16504987120cfe420e88ce8fc539f9d58517db7c5c01d18f1df27b"
+    },
+    {
+      "name": "tla/mutant-flush_no_journal_sync.cex.json",
+      "sha256": "bda6427c4b59b4bb6d6dfe6919c3dcd812fe3730d317f6de79421c0bd8dbbd53"
+    },
+    {
+      "name": "tla/mutant-flush_no_journal_sync.log",
+      "sha256": "3a20cd04e906ad5ee41dd3cbe40d6875fc60b97d619528d75b0887e4ceed32a9"
+    },
+    {
+      "name": "tla/mutant-flush_waits_without_sync_request.cex.json",
+      "sha256": "8f3abab61d3c71bc972e3431894ff7682c805503d9b48158926d2953c9c8161a"
+    },
+    {
+      "name": "tla/mutant-flush_waits_without_sync_request.log",
+      "sha256": "c58804597c624cf0a58cddebbf511e2c433c36e48f633c3fc48b62fff41f30de"
+    },
+    {
+      "name": "tla/mutant-keep_later_segments.cex.json",
+      "sha256": "1fb1258b0e3198059e376cb11af07a74a042ac0fef9e29841aa3c96595040c17"
+    },
+    {
+      "name": "tla/mutant-keep_later_segments.log",
+      "sha256": "a9d4d37069b6177880adfe7aac2d5630f92475b4b01b1a0b4acc4764115f82da"
+    },
+    {
+      "name": "tla/mutant-no_evidence_check.cex.json",
+      "sha256": "e219ceea3087321e69e4ffa2948b19e5a2da935d17e3334f45297ff0eaa93202"
+    },
+    {
+      "name": "tla/mutant-no_evidence_check.log",
+      "sha256": "82be398053dbca67949c660ce22fbcbb270961abc2dee3d753999083fc4aeaf9"
+    },
+    {
+      "name": "tla/mutant-no_open_dir_sync.log",
+      "sha256": "14866ad8625f5d0ca6e0e78bac2144a74723c02c30e5c2c4f4905cf8e8d76ad5"
+    },
+    {
+      "name": "tla/mutant-no_open_sync.cex.json",
+      "sha256": "878888f0f9f30d145f7be747330a1fd68112b0128f7bc9dd156879057e54b872"
+    },
+    {
+      "name": "tla/mutant-no_open_sync.log",
+      "sha256": "1f5599909bc69ef796fdce96c58866a871726026ba6a4e72229688118f019414"
+    },
+    {
+      "name": "tla/mutant-no_run_dir_sync.cex.json",
+      "sha256": "324402f9e4341de574bdc683c13967d1b94506c0bdd2faa9c0332a3c5679c88a"
+    },
+    {
+      "name": "tla/mutant-no_run_dir_sync.log",
+      "sha256": "72619f09f664959d9ed0d559ba524180511a7db2cfd6078c4bba8bb8281f86db"
+    },
+    {
+      "name": "tla/mutant-no_sync_pad.cex.json",
+      "sha256": "9322424b24d608c49b00c18f108bda4ce6d6695bdee47b44b1ffc11a86b603f1"
+    },
+    {
+      "name": "tla/mutant-no_sync_pad.log",
+      "sha256": "ecced83701ef920134ac420d9c569d9e01512994708f76b4ab8a272424b0e0ec"
+    },
+    {
+      "name": "tla/mutant-no_zero_tail.log",
+      "sha256": "deb71321ba7274c9a717414b04dcc0e038e435f5eb84c8bfc50e52b5a1fa845a"
+    },
+    {
+      "name": "tla/mutant-open_retries_on_torn_tail.cex.json",
+      "sha256": "9b55975ee9de637305fba1fdf59857e3aa16db8fbff4c1d33eb68a09ae47e053"
+    },
+    {
+      "name": "tla/mutant-open_retries_on_torn_tail.log",
+      "sha256": "1908fa238732c90227a199cfee9c89f94f68424d50922fc044cc4a8e55d2d7a3"
+    },
+    {
+      "name": "tla/mutant-pad_after_sync.cex.json",
+      "sha256": "32c9747bafc286c553f9716842ba059c0f4a00accb7175e9907ddf71a735243a"
+    },
+    {
+      "name": "tla/mutant-pad_after_sync.log",
+      "sha256": "a94e1e2e1179e1b500a23e4d098b3325c3f1c041fea3fb6cafe76dc5966226de"
+    },
+    {
+      "name": "tla/mutant-purge_before_edit.cex.json",
+      "sha256": "171e9d4381611ff9755d249a63ef879f8ada5ac0999a85e7b5498ab1fb4c39a6"
+    },
+    {
+      "name": "tla/mutant-purge_before_edit.log",
+      "sha256": "badd0c4de0c1cd8eacc44ac7e3c25640b980738f74468ddfc5e622068ff406b8"
+    },
+    {
+      "name": "tla/mutant-purge_ignores_snapshots.cex.json",
+      "sha256": "02619655051e3c737f6b4d789c56adee8c1250aa46d3e5ffabd2d1579a2154dd"
+    },
+    {
+      "name": "tla/mutant-purge_ignores_snapshots.log",
+      "sha256": "f0e47b531bb35ead6b806885d6f8b31dddc30f0165e2c5a6348cea87a7879cbf"
+    },
+    {
+      "name": "tla/mutant-purge_only_in_compaction.cex.json",
+      "sha256": "536bdf51605137ea73f9fb3bc79ef1a062c75c3068dd6e411490ad49128f46b5"
+    },
+    {
+      "name": "tla/mutant-purge_only_in_compaction.log",
+      "sha256": "ac5239df14d838d74924c40ebc692748aef7fbc7b480926fcbd5f967afde0b1a"
+    }
+  ],
+  "assertions": {
+    "executed": 48,
+    "failed": 10,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "lsm-lsm",
+  "duration_s": 2417.359,
+  "guarantees": [
+    "LSM-G01",
+    "LSM-G02",
+    "LSM-G03"
+  ],
+  "kind": "T",
+  "mode": {
+    "tla": "exhaustive"
+  },
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T15:00:29.164888+00:00",
+    "request_id": "dr-lsm-a27630c-155856",
+    "runner": "GitHub Actions 1000011521",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45420147936"
+  },
+  "scenarios": [
+    "LSM01",
+    "NS03",
+    "NS04",
+    "NS05",
+    "NS06",
+    "NS07",
+    "NS08",
+    "NS13",
+    "NS25"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "a27630c5910bc74dde650df39546c06c5782879a",
+  "sim_core_hours": null,
+  "tla": {
+    "actions": 24,
+    "budget_s": 2400,
+    "depth": 37,
+    "distinct_states": 235530,
+    "min_action_coverage": 7811,
+    "mode": "exhaustive",
+    "mutants": [
+      {
+        "cex_length": 10,
+        "detail": "invariant G01_AckedSurvive violated, counterexample of 10 states",
+        "expect": "G01_AckedSurvive",
+        "name": "ack_before_sync",
+        "observed": "G01_AckedSurvive",
+        "ok": true
+      },
+      {
+        "cex_length": null,
+        "detail": "no violation: the mutant is not detected",
+        "expect": "G03_NoFalseDamage",
+        "name": "cleanup_before_current_sync",
+        "observed": "none",
+        "ok": false
+      },
+      {
+        "cex_length": null,
+        "detail": "no violation: the mutant is not detected",
+        "expect": "NS03_SnapshotStable",
+        "name": "compaction_ignores_snapshots",
+        "observed": "none",
+        "ok": false
+      },
+      {
+        "cex_length": 10,
+        "detail": "invariant G01_AckedSurvive violated, counterexample of 10 states",
+        "expect": "G01_AckedSurvive",
+        "name": "eio_as_torn",
+        "observed": "G01_AckedSurvive",
+        "ok": true
+      },
+      {
+        "cex_length": 12,
+        "detail": "invariant NoResurrection violated, counterexample of 12 states",
+        "expect": "NoResurrection",
+        "name": "flush_drops_tombstones",
+        "observed": "NoResurrection",
+        "ok": true
+      },
+      {
+        "cex_length": 13,
+        "detail": "invariant G03_NoFalseDamage violated, counterexample of 13 states",
+        "expect": "G03_NoFalseDamage",
+        "name": "flush_no_journal_sync",
+        "observed": "G03_NoFalseDamage",
+        "ok": true
+      },
+      {
+        "cex_length": 8,
+        "detail": "liveness property L_FlushCompletes violated, counterexample of 8 states (lasso)",
+        "expect": "L_FlushCompletes",
+        "name": "flush_waits_without_sync_request",
+        "observed": "L_FlushCompletes",
+        "ok": true
+      },
+      {
+        "cex_length": 19,
+        "detail": "invariant G02_ExactPrefix violated, counterexample of 19 states",
+        "expect": "G02_ExactPrefix",
+        "name": "keep_later_segments",
+        "observed": "G02_ExactPrefix",
+        "ok": true
+      },
+      {
+        "cex_length": 12,
+        "detail": "invariant G03_CertifiedLossDetected violated, counterexample of 12 states",
+        "expect": "G03_CertifiedLossDetected",
+        "name": "no_evidence_check",
+        "observed": "G03_CertifiedLossDetected",
+        "ok": true
+      },
+      {
+        "cex_length": null,
+        "detail": "no violation: the mutant is not detected",
+        "expect": "G01_AckedSurvive",
+        "name": "no_open_dir_sync",
+        "observed": "none",
+        "ok": false
+      },
+      {
+        "cex_length": 14,
+        "detail": "invariant G02_RecoveryIdempotent violated, counterexample of 14 states",
+        "expect": "G02_RecoveryIdempotent",
+        "name": "no_open_sync",
+        "observed": "G02_RecoveryIdempotent",
+        "ok": true
+      },
+      {
+        "cex_length": 11,
+        "detail": "invariant G03_NoFalseDamage violated, counterexample of 11 states",
+        "expect": "G03_NoFalseDamage",
+        "name": "no_run_dir_sync",
+        "observed": "G03_NoFalseDamage",
+        "ok": true
+      },
+      {
+        "cex_length": 11,
+        "detail": "invariant G01_AckedSurvive violated, counterexample of 11 states",
+        "expect": "G01_AckedSurvive",
+        "name": "no_sync_pad",
+        "observed": "G01_AckedSurvive",
+        "ok": true
+      },
+      {
+        "cex_length": null,
+        "detail": "no violation: the mutant is not detected",
+        "expect": "G02_ExactPrefix",
+        "name": "no_zero_tail",
+        "observed": "none",
+        "ok": false
+      },
+      {
+        "cex_length": 5,
+        "detail": "expected L_OpenTerminates, got: deadlock violated, counterexample of 5 states",
+        "expect": "L_OpenTerminates",
+        "name": "open_retries_on_torn_tail",
+        "observed": "Deadlock",
+        "ok": false
+      },
+      {
+        "cex_length": 10,
+        "detail": "invariant G01_AckedSurvive violated, counterexample of 10 states",
+        "expect": "G01_AckedSurvive",
+        "name": "pad_after_sync",
+        "observed": "G01_AckedSurvive",
+        "ok": true
+      },
+      {
+        "cex_length": 10,
+        "detail": "invariant NoDeletedFileRead violated, counterexample of 10 states",
+        "expect": "NoDeletedFileRead",
+        "name": "purge_before_edit",
+        "observed": "NoDeletedFileRead",
+        "ok": true
+      },
+      {
+        "cex_length": 12,
+        "detail": "invariant NoDeletedFileRead violated, counterexample of 12 states",
+        "expect": "NoDeletedFileRead",
+        "name": "purge_ignores_snapshots",
+        "observed": "NoDeletedFileRead",
+        "ok": true
+      },
+      {
+        "cex_length": 23,
+        "detail": "liveness property L_ObsoletePurged violated, counterexample of 23 states (lasso)",
+        "expect": "L_ObsoletePurged",
+        "name": "purge_only_in_compaction",
+        "observed": "L_ObsoletePurged",
+        "ok": true
+      },
+      {
+        "cex_length": 20,
+        "detail": "invariant G02_ExactPrefix violated, counterexample of 20 states",
+        "expect": "G02_ExactPrefix",
+        "name": "quarantine_volatile",
+        "observed": "G02_ExactPrefix",
+        "ok": true
+      },
+      {
+        "cex_length": 16,
+        "detail": "invariant G01_AckedSurvive violated, counterexample of 16 states",
+        "expect": "G01_AckedSurvive",
+        "name": "resume_in_page",
+        "observed": "G01_AckedSurvive",
+        "ok": true
+      },
+      {
+        "cex_length": null,
+        "detail": "no violation: the mutant is not detected",
+        "expect": "G03_NoFalseDamage",
+        "name": "retire_before_edit",
+        "observed": "none",
+        "ok": false
+      },
+      {
+        "cex_length": null,
+        "detail": "no violation: the mutant is not detected",
+        "expect": "NoDeletedFileRead",
+        "name": "retire_ignores_locators",
+        "observed": "none",
+        "ok": false
+      },
+      {
+        "cex_length": null,
+        "detail": "no violation: the mutant is not detected",
+        "expect": "NoDeletedFileRead",
+        "name": "retire_ignores_snapshots",
+        "observed": "none",
+        "ok": false
+      },
+      {
+        "cex_length": 13,
+        "detail": "invariant G01_AckedSurvive violated, counterexample of 13 states",
+        "expect": "G01_AckedSurvive",
+        "name": "roll_gap_is_end",
+        "observed": "G01_AckedSurvive",
+        "ok": true
+      },
+      {
+        "cex_length": null,
+        "detail": "no violation: the mutant is not detected",
+        "expect": "G01_AckedSurvive",
+        "name": "roll_no_dir_sync",
+        "observed": "none",
+        "ok": false
+      },
+      {
+        "cex_length": 6,
+        "detail": "liveness property L_CommitCompletes violated, counterexample of 6 states (lasso)",
+        "expect": "L_CommitCompletes",
+        "name": "sync_only_for_flush",
+        "observed": "L_CommitCompletes",
+        "ok": true
+      },
+      {
+        "cex_length": null,
+        "detail": "no violation: the mutant is not detected",
+        "expect": "G01_AckedSurvive",
+        "name": "sync_prev_segment_only",
+        "observed": "none",
+        "ok": false
+      },
+      {
+        "cex_length": 12,
+        "detail": "invariant NoResurrection violated, counterexample of 12 states",
+        "expect": "NoResurrection",
+        "name": "tombstone_ignores_snapshots",
+        "observed": "NoResurrection",
+        "ok": true
+      }
+    ],
+    "runs": [
+      {
+        "cfg": "Lsm.cfg",
+        "depth": 37,
+        "detail": "",
+        "distinct_states": 235530,
+        "duration_s": 66.3,
+        "states_left": 0,
+        "verdict": "pass"
+      },
+      {
+        "cfg": "Lsm.live.cfg",
+        "depth": 32,
+        "detail": "",
+        "distinct_states": 82969,
+        "duration_s": 56.9,
+        "states_left": 0,
+        "verdict": "pass"
+      },
+      {
+        "cfg": "Lsm.media.cfg",
+        "depth": 34,
+        "detail": "",
+        "distinct_states": 414802,
+        "duration_s": 89.4,
+        "states_left": 0,
+        "verdict": "pass"
+      },
+      {
+        "cfg": "Lsm.ops.cfg",
+        "depth": 41,
+        "detail": "",
+        "distinct_states": 11084730,
+        "duration_s": 1460.4,
+        "states_left": 0,
+        "verdict": "pass"
+      },
+      {
+        "cfg": "Lsm.values.cfg",
+        "depth": 39,
+        "detail": "",
+        "distinct_states": 650079,
+        "duration_s": 105.3,
+        "states_left": 0,
+        "verdict": "pass"
+      },
+      {
+        "cfg": "Lsm.wipe.cfg",
+        "depth": 36,
+        "detail": "",
+        "distinct_states": 82791,
+        "duration_s": 18.5,
+        "states_left": 0,
+        "verdict": "pass"
+      }
+    ],
+    "spec": "specs/lsm/Lsm",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "uncovered": [],
+    "unmutated": [
+      "TypeOK"
+    ]
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}
