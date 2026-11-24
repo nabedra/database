@@ -142,7 +142,11 @@ impl Observations {
                         );
                     }
                     "cold-reset"
-                } else if old.primary.is_some() && old.primary != new.primary {
+                } else if old.primary.is_some()
+                    && (old.epoch != new.epoch || old.primary != new.primary)
+                {
+                    // A resumed owner also carries its old prefix into the
+                    // new epoch. Later failovers cannot erase that proof.
                     "failover"
                 } else {
                     continue;
@@ -398,4 +402,38 @@ pub(super) fn event(
     let mut event = Event::new(kind, process, f).with_key(key).with_value(value);
     event.time_ns = Some((nabedra_rt::sim::EPOCH_MS + now) * 1_000_000);
     event
+}
+
+#[test]
+fn resumed_owner_marks_retained_prefix_in_history() {
+    let key = String::from("{resumed-owner}");
+    let slot = key_slot(key.as_bytes());
+    let mut topology = Topology::default();
+    let place = &mut topology.slots[usize::from(slot)];
+    place.primary = Some(WorkerId {
+        node: 11,
+        incarnation: uuid::Uuid::from_u128(1),
+    });
+    place.epoch = 1;
+    let mut observations = Observations::default();
+    observations.committed(1, 1, 1, 1, 0, &topology, std::slice::from_ref(&key), &[]);
+    topology.slots[usize::from(slot)].epoch = 2;
+    observations.committed(1, 2, 1, 1, 1, &topology, &[key], &[]);
+    observations.observe(
+        11,
+        Observed::Promoted {
+            slot,
+            epoch: 2,
+            prefix_epoch: 1,
+            prefix_sequence: 42,
+        },
+        2,
+    );
+    assert_eq!(observations.history.len(), 1);
+    let marker = &observations.history[0];
+    assert_eq!(marker.f, "failover");
+    assert_eq!(
+        marker.value,
+        json!({"epoch": 2, "prefix_epoch": 1, "prefix_sequence": 42})
+    );
 }
