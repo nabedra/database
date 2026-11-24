@@ -23,19 +23,20 @@ The search rule. TLC reports an exhaustive search whatever a cfg cuts away, so:
     environment or random values (TLCGet, TLCSet, TLCExt, RandomElement, ...), so no constraint can be a depth
     limit or a state cap in those terms. A cfg may override a name only with an operator that the model's own
     modules define, so it cannot bring one in either;
-  - a CONSTRAINT or ACTION_CONSTRAINT must be declared in its cfg by `\\* limit: <Name> -- <reason>` and must
-    only bound counters: a conjunction, possibly under \\A, of order comparisons (<, <=, >, >=). Equality,
-    negation, implication, disjunction and string values select protocol states, which is not a bound. What
-    the rule cannot read, such as Unicode operators, is refused;
+  - a CONSTRAINT must be declared in its cfg by `\\* limit: <Name> -- <reason>`, and its definition must be, from
+    end to end, what the grammar of `_Bound` accepts: a conjunction of upper bounds on counters. Everything
+    else is refused, and so is every ACTION_CONSTRAINT, which removes steps;
   - a constraint or a symmetry set may not be active in an exhaustive run that checks liveness. TLC says which
     runs do. In a simulation it says nothing, so there this part does not apply;
   - VIEW is refused, because it merges states that the properties may tell apart;
   - a cfg may not override a name it checks, its constraints or its INIT, NEXT or SPECIFICATION. Giving a
-    declared CONSTANT its value is free. Overriding any other definition, such as Nat, needs a `limit` line.
+    declared CONSTANT its value is free. Overriding any other definition, such as Nat, needs a `limit` line;
+  - a mutant cfg is held to the same rule, with the baselines' `limit` lines only. It may change nothing but
+    CONSTANTs, and has to change one where a baseline checks the same property. Otherwise it does not count
+    as caught (mutant_problems).
 The record lists the declared limits and how many states each constraint kept. What the rule cannot see: a
-counter that every action increments, so that its bound is a depth limit; a lower bound, or a bound between
-two variables, that cuts protocol states; a constraint over an operator that encodes protocol state as a
-number; a CONSTANT value, INIT or NEXT that leaves behavior out. Mutant cfgs are checked for overrides only.
+variable under an upper bound that is no counter of growth, such as a step counter that every action
+increments, or a protocol phase kept as a number; a CONSTANT value, INIT or NEXT that leaves behavior out.
 
 The model module is MC<Name>.tla if it exists, else <Name>.tla. Each run gets the per-run budget:
 --budget-s, else the module's level in docs/testing/modules.toml (L1 and L2 900 s, L3 3600 s). The
@@ -126,22 +127,189 @@ _LIMIT = re.compile(r"^[ \t]*\\\*[ \t]*limit:[ \t]*(\w+)[ \t]*--[ \t]*(\S.*?)[ \
 _SEARCH_STATE = re.compile(r"\b(?:TLC(?:Get|Set)\w*|RandomElement|RandomSubset\w*|RandomSetOfSubsets|JavaTime)\b")
 # TLCExt has the trace so far, and Randomization and IOUtils make a run depend on chance or the environment.
 _SEARCH_MODULES = {"TLCExt", "Randomization", "IOUtils", "IOUtilsExt"}
-_IMPORT = re.compile(r"\bEXTENDS\s+(\w+(?:\s*,\s*\w+)*)|\bINSTANCE\s+(\w+)")
+_EXTENDS = re.compile(r"\bEXTENDS\s+(\w+(?:\s*,\s*\w+)*)")
+_INSTANCE = re.compile(r"\bINSTANCE\s+(\w+)")
 _CONSTANT_DECL = re.compile(r"\bCONSTANTS?\s+(\w+(?:\([\s,_]*\))?(?:\s*,\s*\w+(?:\([\s,_]*\))?)*)")
-# A definition starts in column 1. Its body ends where the next unit starts in column 1, so a word in column 1
-# that starts no unit belongs to the body.
-_HEAD = r"\w+[ \t]*(?:\([^=]*?\)|\[[^=]*?\])?[ \t]*==(?!=)"
+_VARIABLE_DECL = re.compile(r"\bVARIABLES?\s+(\w+(?:\s*,\s*\w+)*)")
+# The parameters of a definition, with one level of brackets inside, as in Op(F(_), x) or f[x \in S[1]].
+_PARAMETERS = r"\((?:[^()=]|\([^()=]*\))*\)|\[(?:[^\[\]=]|\[[^\[\]=]*\])*\]"
 _UNIT = (r"(?:LOCAL|RECURSIVE|VARIABLES?|CONSTANTS?|ASSUME|ASSUMPTION|AXIOM|THEOREM|LEMMA|PROPOSITION|COROLLARY|"
-         r"INSTANCE|EXTENDS|PROOF|USE|HIDE)\b")
-_DEFINITION = re.compile(rf"^(?:LOCAL[ \t]+)?(?=(\w+)){_HEAD}(.*?)(?=^{_UNIT}|^{_HEAD}|^-{{4}}|^={{4}}|\Z)", re.M | re.S)
-_TOKEN = re.compile(r"\\\w+|\w+|<<|>>|<=>|<=|>=|=<|=>|/=|/\\|\\/|\|->|->|<-|==|[^\s\w]")
-_OPEN, _CLOSE = {"(", "[", "{", "<<"}, {")", "]", "}", ">>"}
-_ORDER = {"<", "<=", "=<", "\\leq", ">", ">=", "\\geq"}
-# Beside one order comparison, each of these can make a conjunct select states.
-_SELECTS = {"=", "#", "/=", "\\neq", "\\notin", "~", "\\lnot", "\\neg", "=>", "<=>", "\\equiv", "\\/", "\\lor", "\\E", "\\A",
-            "\\subseteq", "==", '"', "IF", "CASE", "ENABLED", "CHOOSE", "LAMBDA"}
-_QUANTIFIER = re.compile(r"\\A\s[^:{]*:")
+         r"INSTANCE)\b")
+_ORDER_DEFINITION = re.compile(r"^[ \t]*\w+\s*(?:<=|=<|\\leq|<)\s*\w+\s*==(?!=)", re.M)
 _OVERRIDE = re.compile(r"(\w+)\s*<-\s*(?:\[\s*\w+\s*\]\s*)?(\w+)")
+
+
+class _Refused(Exception):
+    """The text does not match the grammar. `at` is the offset in the module's text."""
+
+    def __init__(self, at: int, why: str) -> None:
+        super().__init__(why)
+        self.at, self.why = at, why
+
+
+class _Reader:
+    """The tokens of a definition's body, from `pos` on."""
+
+    _TOKEN = re.compile(r"\s*(\\[A-Za-z]+|\w+|<=|=<|/\\|[^\s\w])")
+    # What may follow a whole body: the end of the module, a line of dashes or equal signs, or a line that starts
+    # the next unit of the module.
+    _END = re.compile(rf"\s*\Z|\s*\n[ \t]*(?:-{{4}}|={{4}}|{_UNIT}|\w+\s*(?:{_PARAMETERS})?\s*==(?!=)|"
+                      r"\w+\s*(?:\\\w+|[^\s\w]+)\s*\w+\s*==(?!=))")
+
+    def __init__(self, model: "Model", text: str, pos: int) -> None:
+        self.model, self.text, self.pos = model, text, pos
+
+    def peek(self) -> str:
+        m = self._TOKEN.match(self.text, self.pos)
+        return m.group(1) if m else ""
+
+    def take(self) -> str:
+        m = self._TOKEN.match(self.text, self.pos)
+        if not m:
+            raise _Refused(self.pos, "the definition ends too early")
+        self.pos = m.end()
+        return m.group(1)
+
+    def refuse(self, why: str) -> None:
+        raise _Refused(self.pos + len(self.text[self.pos:]) - len(self.text[self.pos:].lstrip()), why)
+
+    def expect(self, *tokens: str) -> str:
+        if self.peek() not in tokens:
+            self.refuse(f"{self.peek()!r} instead of {' or '.join(tokens)}")
+        return self.take()
+
+    def constant(self) -> None:
+        if not self.model.is_constant(self.peek()):
+            self.refuse(f"{self.peek()!r} is not a declared CONSTANT")
+        self.take()
+
+    def end(self) -> None:
+        if not self._END.match(self.text, self.pos):
+            self.refuse(f"{self.peek()!r} after the end")
+
+
+class _ConstantSet(_Reader):
+    r"""A set made of constants:
+
+      set  ::= part { (\cup | \union) part }
+      part ::= CONSTANT | "{" CONSTANT { "," CONSTANT } "}"
+    """
+
+    def read(self) -> None:
+        self.part()
+        while self.peek() in ("\\cup", "\\union"):
+            self.take()
+            self.part()
+        self.end()
+
+    def part(self) -> None:
+        if self.peek() != "{":
+            self.constant()
+            return
+        self.take()
+        self.constant()
+        while self.peek() == ",":
+            self.take()
+            self.constant()
+        self.expect("}")
+
+
+class _Bound(_Reader):
+    r"""A constraint: upper bounds on counters, and nothing else.
+
+      body    ::= [and] item { and item }          and   ::= "/\" | \land
+      item    ::= "(" body ")" | "\A" NAME { "," NAME } \in SET ":" body | counter less limit | BOUND
+      counter ::= ref | Len "(" ref ")" | Cardinality "(" ref ")"
+      ref     ::= VARIABLE { "[" index { "," index } "]" }
+      index   ::= a NAME of an enclosing "\A" | CONSTANT
+      less    ::= "<" | "<=" | "=<" | \leq         limit ::= NUMBER | CONSTANT
+
+    VARIABLE and CONSTANT are declared in the model module or one it extends, and defined nowhere. SET is a
+    CONSTANT, or the name of a definition that _ConstantSet reads. BOUND is the name of another definition
+    that _Bound reads. The body has to match up to the next unit of the module."""
+
+    AND = ("/\\", "\\land")
+    ALLOWED = ("a constraint may only be a conjunction of upper bounds `c < limit` or `c <= limit`, under "
+               "`\\A i \\in Set` if needed, where c is v, v[i], Len(v) or Cardinality(v) of a variable v, and "
+               "limit a number or a declared CONSTANT")
+
+    def __init__(self, model: "Model", text: str, pos: int, seen: frozenset) -> None:
+        super().__init__(model, text, pos)
+        self.seen, self.names = seen, []
+
+    def read(self) -> None:
+        self.body()
+        self.end()
+
+    def body(self) -> None:
+        if self.peek() in self.AND:
+            self.take()
+        self.item()
+        while self.peek() in self.AND:
+            self.take()
+            self.item()
+
+    def item(self) -> None:
+        token = self.peek()
+        if token == "(":
+            self.take()
+            self.body()
+            self.expect(")")
+        elif token == "\\A":
+            self.quantified()
+        elif token in ("Len", "Cardinality"):
+            self.take()
+            self.expect("(")
+            self.ref()
+            self.expect(")")
+            self.limit()
+        elif self.model.is_variable(token):
+            self.ref()
+            self.limit()
+        elif re.fullmatch(r"[A-Za-z_]\w*", token) and self.model.places(token):
+            problem = self.model.bound_problem(token, self.seen)
+            if problem:
+                self.refuse(problem)
+            self.take()
+        else:
+            self.refuse(f"{token!r} starts no upper bound")
+
+    def quantified(self) -> None:
+        self.take()
+        count = len(self.names)
+        while True:
+            name = self.peek()
+            if not re.fullmatch(r"[A-Za-z_]\w*", name) or name in self.model.variables | self.model.constants:
+                self.refuse(f"{name!r} is not a fresh name")
+            self.names.append(self.take())
+            if self.expect(",", "\\in") == "\\in":
+                break
+        if not self.model.is_constant(self.peek()) and not self.model.is_constant_set(self.peek()):
+            self.refuse(f"{self.peek()!r} is not a declared set of constants")
+        self.take()
+        self.expect(":")
+        self.body()
+        del self.names[count:]
+
+    def ref(self) -> None:
+        if not self.model.is_variable(self.peek()):
+            self.refuse(f"{self.peek()!r} is not a declared VARIABLE")
+        self.take()
+        while self.peek() == "[":
+            self.take()
+            while True:
+                if self.peek() not in self.names and not self.model.is_constant(self.peek()):
+                    self.refuse(f"{self.peek()!r} is not a quantified name or a CONSTANT")
+                self.take()
+                if self.expect(",", "]") == "]":
+                    break
+
+    def limit(self) -> None:
+        self.expect("<", "<=", "=<", "\\leq")
+        if re.fullmatch(r"[0-9]+", self.peek()):
+            self.take()
+        else:
+            self.constant()
 
 
 class Model:
@@ -150,81 +318,90 @@ class Model:
 
     def __init__(self, spec_dir: Path, model: str) -> None:
         self.texts: dict[str, str] = {}
-        self.definitions: dict[str, list[str]] = {}
-        self.constants: set[str] = set()
+        self.lines: dict[str, int] = {}     # the file line where each text starts
+        self.constants: set[str] = set()    # declared in the model module or one it extends
+        self.variables: set[str] = set()
         self.problems: list[str] = []
-        todo = [model.removesuffix(".tla")]
+        todo = [(model.removesuffix(".tla"), True)]
+        self.extended: set[str] = set()
         while todo:
-            name = todo.pop()
+            name, extends = todo.pop(0)
             path = next((d / f"{name}.tla" for d in (spec_dir, tc.SPECS_DIR / "lib") if (d / f"{name}.tla").exists()),
                         None)
-            if name in self.texts or path is None:
+            if path is None or name in self.texts and (not extends or name in self.extended):
                 continue
-            text = tla_trace._module_text(path.read_text(encoding="utf-8"))
+            raw = path.read_text(encoding="utf-8")
+            text = tla_trace._module_text(raw)
+            extended = [m for names in _EXTENDS.findall(text) for m in re.findall(r"\w+", names)]
+            todo += [(m, extends) for m in extended] + [(m, False) for m in _INSTANCE.findall(text)]
+            if extends:
+                self.extended.add(name)
+                for m in _CONSTANT_DECL.finditer(text):
+                    self.constants.update(re.findall(r"\w+", re.sub(r"\([^)]*\)", "", m.group(1))))
+                for m in _VARIABLE_DECL.finditer(text):
+                    self.variables.update(re.findall(r"\w+", m.group(1)))
+            if name in self.texts:
+                continue
             self.texts[name] = text
-            for m in _IMPORT.finditer(text):
-                imported = [i.strip() for i in (m.group(1) or m.group(2)).split(",")]
-                todo.extend(imported)
-                self.problems += [f"{name}.tla uses the module {i}" for i in imported if i in _SEARCH_MODULES]
+            header = tla_trace._HEADER.search(raw)
+            self.lines[name] = raw.count("\n", 0, header.start() if header else 0) + 1
+            self.problems += [f"{name}.tla uses the module {i}" for i in [*extended, *_INSTANCE.findall(text)]
+                              if i in _SEARCH_MODULES]
             self.problems += [f"{name}.tla uses {u}" for u in sorted(set(_SEARCH_STATE.findall(text)))]
-            for m in _DEFINITION.finditer(text):
-                self.definitions.setdefault(m.group(1), []).append(m.group(2))
-            for m in _CONSTANT_DECL.finditer(text):
-                self.constants.update(re.findall(r"\w+", re.sub(r"\([^)]*\)", "", m.group(1))))
+
+    def places(self, name: str) -> list[tuple[str, re.Match]]:
+        """Every definition of the name, anywhere in a line: (module, match up to the body)."""
+        pattern = re.compile(rf"(?<![\w!]){re.escape(name)}\s*({_PARAMETERS})?\s*==(?!=)")
+        return [(module, m) for module, text in self.texts.items() for m in pattern.finditer(text)]
 
     def defines(self, name: str) -> bool:
-        """The model's modules declare or define the name, anywhere in a line."""
-        pattern = re.compile(rf"(?<![\w!]){name}\s*(?:\([^)=]*\)|\[[^\]=]*\])?\s*==(?!=)")
-        return name in self.constants or any(pattern.search(text) for text in self.texts.values())
+        return name in self.constants or bool(self.places(name))
+
+    def is_constant(self, name: str) -> bool:
+        return name in self.constants and name not in self.variables and not self.places(name)
+
+    def is_variable(self, name: str) -> bool:
+        return name in self.variables and name not in self.constants and not self.places(name)
+
+    def body(self, name: str) -> tuple[str, int] | None:
+        """(module, offset) of the body of the name's only definition, which has no parameters and is in the model
+        module or one it extends."""
+        places = self.places(name)
+        if len(places) != 1 or places[0][0] not in self.extended or places[0][1].group(1):
+            return None
+        return places[0][0], places[0][1].end()
+
+    def is_constant_set(self, name: str) -> bool:
+        place = self.body(name) if re.fullmatch(r"[A-Za-z_]\w*", name) else None
+        if place is None:
+            return False
+        try:
+            _ConstantSet(self, self.texts[place[0]], place[1]).read()
+        except _Refused:
+            return False
+        return True
 
     def bound_problem(self, name: str, seen: frozenset = frozenset()) -> str | None:
-        """Why the operator is not just a bound on counters, or None."""
-        bodies = self.definitions.get(name)
-        if not bodies or name in seen:
-            return f"{name} has no definition that starts a line in the model's modules"
-        return next(filter(None, (self._problem(name, body, seen | {name}) for body in bodies)), None)
-
-    def _problem(self, name: str, text: str, seen: frozenset) -> str | None:
-        """Reads a conjunction, which a quantifier may start and parentheses may wrap. What it cannot read is a
-        problem, so that nothing passes unread."""
-        text = text.strip()
-        if not text.isascii():
-            return f"{name} uses characters other than ASCII, such as Unicode operators, which are not read"
-        for lead in ("/\\", "\\land"):
-            if text.startswith(lead):
-                return self._problem(name, text[len(lead):], seen)
-        if not text:
-            return f"{name} has an empty conjunct or body"
-        quantifier = _QUANTIFIER.match(text)
-        if quantifier:  # it reaches to the end
-            return self._problem(name, text[quantifier.end():], seen)
-        # The tokens with their bracket depth.
-        tokens: list[tuple[str, int, int]] = []
-        depth = 0
-        for m in _TOKEN.finditer(text):
-            token = m.group()
-            depth -= token in _CLOSE
-            tokens.append((token, depth, m.start()))
-            depth += token in _OPEN
-        if depth or any(d < 0 for _, d, _ in tokens):
-            return f"{name} has unbalanced brackets: {' '.join(text.split())[:80]}"
-        if tokens[0][0] == "(" and [t for t in tokens if t[1] == 0] == [tokens[0], tokens[-1]]:
-            return self._problem(name, text[1:-1], seen)
-        for token, d, start in tokens:
-            if d == 0 and token in ("/\\", "\\land"):
-                return self._problem(name, text[:start], seen) or self._problem(name, text[start + len(token):], seen)
-        words = [t[0] for t in tokens]
-        # A name, or a call with nothing but its arguments behind it: the definition must be a bound.
-        if words[0] in self.definitions and (len(words) == 1 or (
-                words[1] == "(" and [t for t in tokens if t[1] == 0] == [tokens[0], tokens[1], tokens[-1]])):
-            return self.bound_problem(words[0], seen)
-        selects = sorted(_SELECTS.intersection(words))
-        if selects:
-            used = " ".join("a string" if s == '"' else s for s in selects)
-            return f"{name} uses {used}, so it selects states instead of bounding a counter"
-        order = [i for i, t in enumerate(tokens) if t[0] in _ORDER]
-        if len(order) != 1 or tokens[order[0]][1] or order[0] in (0, len(tokens) - 1):
-            return f"{name} has a conjunct that is not one order comparison: {' '.join(text.split())[:80]}"
+        """Why the definition is not just upper bounds on counters, or None."""
+        if name in seen:
+            return f"{name} refers to itself"
+        place = self.body(name)
+        if place is None:
+            return (f"{name} must be defined once, without parameters, in the model module or one it extends; "
+                    f"{_Bound.ALLOWED}")
+        for trusted in ("Len", "Cardinality"):
+            if self.places(trusted):
+                return f"the model defines its own {trusted}"
+        if any(_ORDER_DEFINITION.search(text) for text in self.texts.values()):
+            return "the model defines its own order operator"
+        module, pos = place
+        try:
+            _Bound(self, self.texts[module], pos, seen | {name}).read()
+        except _Refused as refused:
+            if "; a constraint may" in refused.why:  # from a definition it names
+                return refused.why
+            line = self.lines[module] + self.texts[module].count("\n", 0, refused.at)
+            return f"{module}.tla line {line}: {refused.why}; {_Bound.ALLOWED}"
         return None
 
 
@@ -239,10 +416,12 @@ def checked_names(parsed: tc.Cfg) -> set[str]:
                           "SPECIFICATION", "POSTCONDITION") for n in parsed.sections.get(key, [])}
 
 
-def search_problems(model: Model, cfg: Path) -> tuple[list[str], list[tuple[str, str, str]]]:
-    """(problems, declared limits as (kind, name, reason)) of one cfg. See the module docstring."""
+def search_problems(model: Model, cfg: Path, declared: dict[str, str] | None = None,
+                    ) -> tuple[list[str], list[tuple[str, str, str]]]:
+    """(problems, declared limits as (kind, name, reason)) of one cfg. See the module docstring. `declared` takes
+    the place of the cfg's own `limit` lines."""
     parsed = tc.parse_cfg(cfg)
-    declared = limits_of(cfg)
+    declared = limits_of(cfg) if declared is None else declared
     problems: list[str] = []
     limits: list[tuple[str, str, str]] = []
 
@@ -252,12 +431,12 @@ def search_problems(model: Model, cfg: Path) -> tuple[list[str], list[tuple[str,
         else:
             problems.append(f"{kind} {name} has no `\\* limit: {name} -- <reason>` line")
 
-    for kind in ("CONSTRAINT", "ACTION_CONSTRAINT"):
-        for name in parsed.sections.get(kind, []):
-            declare(kind, name)
-            problem = model.bound_problem(name)
-            if problem:
-                problems.append(f"{kind} {name}: {problem}")
+    for name in parsed.sections.get("CONSTRAINT", []):
+        declare("CONSTRAINT", name)
+        problem = model.bound_problem(name)
+        if problem:
+            problems.append(f"CONSTRAINT {name}: {problem}")
+    problems += [f"ACTION_CONSTRAINT {name} removes steps" for name in parsed.sections.get("ACTION_CONSTRAINT", [])]
     problems += [f"VIEW {name} merges states" for name in parsed.sections.get("VIEW", [])]
     text = tc.strip_tla_comments(cfg.read_text(encoding="utf-8"), keep_strings=False)
     problems += [f"the cfg uses {used}" for used in sorted(set(_SEARCH_STATE.findall(text)))]
@@ -268,9 +447,58 @@ def search_problems(model: Model, cfg: Path) -> tuple[list[str], list[tuple[str,
     for name in dict.fromkeys(parsed.overrides):
         if name in checked:
             problems.append(f"the cfg overrides {name}, which it checks or runs")
+        elif name in model.variables or name in ("Len", "Cardinality"):
+            problems.append(f"the cfg overrides {name}, which a constraint relies on")
         elif name not in model.constants:
             declare("override", name)
     return problems, limits
+
+
+_SPECIFICATION = ("INIT", "NEXT", "SPECIFICATION")
+
+
+def settings(cfg: Path) -> frozenset[str]:
+    """What makes a cfg's model: each constant's value, and INIT, NEXT or SPECIFICATION."""
+    text = tc.strip_tla_comments(cfg.read_text(encoding="utf-8"))
+    tokens = re.findall(r'"[^"]*"|\w+|<-|[^\s\w]', text)
+    out: list[list[str]] = []
+    section, depth = None, 0
+    for i, token in enumerate(tokens):
+        if token in tc._CFG_KEYWORDS:
+            section = token.removesuffix("S")
+            if section in _SPECIFICATION:
+                out.append([section])
+            depth = 0
+            continue
+        if section == "CONSTANT" and depth == 0 and re.fullmatch(r"\w+", token) and tokens[i + 1:i + 2] in (["="], ["<-"]):
+            out.append([])
+        depth += (token in "([{") - (token in ")]}")
+        if section in ("CONSTANT", *_SPECIFICATION) and out:
+            out[-1].append(token)
+    return frozenset(" ".join(entry) for entry in out)
+
+
+def mutant_problems(model: Model, cfg: Path, baselines: list[Path]) -> list[str]:
+    """Why this mutant cfg cannot count as caught, whatever TLC says."""
+    declared = {k: v for baseline in baselines for k, v in limits_of(baseline).items()}
+    problems = search_problems(model, cfg, declared)[0]
+    parsed, mine = tc.parse_cfg(cfg), settings(cfg)
+
+    def spec(entries: frozenset[str]) -> set[str]:
+        return {e for e in entries if e.split()[0] in _SPECIFICATION}
+
+    others = [settings(baseline) for baseline in baselines]
+    if spec(mine) not in [spec(other) for other in others]:
+        problems.append("its INIT, NEXT or SPECIFICATION is no baseline's")
+    for entry in sorted(mine - spec(mine) - frozenset().union(*others)):
+        if entry.split()[0] not in model.constants:
+            problems.append(f"it gives {entry.split()[0]}, which is no declared CONSTANT, another value")
+    for baseline, other in zip(baselines, others):
+        base = tc.parse_cfg(baseline)
+        if mine == other and parsed.expect in (
+                *base.invariants, *base.properties, *(["Deadlock"] if base.check_deadlock else [])):
+            problems.append(f"it changes no constant of {baseline.name}, which checks {parsed.expect} too")
+    return problems
 
 
 def search_check(rep: Report, model: Model, cfgs: list[Path]) -> list[tuple[str, str, str, str]]:
@@ -293,7 +521,7 @@ def liveness_problem(log: str, parsed: tc.Cfg) -> str | None:
     if "@!@!@STARTMSG 2279:" in log:  # "Declaring symmetry during liveness checking is dangerous"
         return "liveness under SYMMETRY, which can miss violations: use a cfg without it"
     if "@!@!@STARTMSG 2192:" in log:  # "Checking temporal properties"
-        names = parsed.sections.get("CONSTRAINT", []) + parsed.sections.get("ACTION_CONSTRAINT", [])
+        names = parsed.sections.get("CONSTRAINT", [])
         if names:
             return f"liveness under the constraint {', '.join(names)}, which cuts behaviors short: use a cfg without it"
     return None
@@ -356,7 +584,7 @@ def run_baseline(rep: Report, spec_dir: Path, model: str, cfg: Path, out: Path, 
 
 
 def run_mutant(rep: Report, spec_dir: Path, model: str, cfg: Path, out: Path, budget: int,
-               workers: str) -> dict:
+               workers: str, modules: Model, baselines: list[Path]) -> dict:
     parsed = tc.parse_cfg(cfg)
     name = cfg.name[: -len(".cfg")]
     fact = {"name": name, "expect": parsed.expect or "", "observed": "", "ok": False, "cex_length": None,
@@ -371,15 +599,16 @@ def run_mutant(rep: Report, spec_dir: Path, model: str, cfg: Path, out: Path, bu
         fact["detail"] = f"expects {parsed.expect}, which its cfg does not check"
         rep.check(False, label, fact["detail"])
         return fact
-    overridden = sorted(checked_names(parsed).intersection(parsed.overrides))
-    if overridden:
-        fact["detail"] = f"its cfg overrides {', '.join(overridden)}, which it checks or runs"
+    problems = mutant_problems(modules, cfg, baselines)
+    if problems:
+        fact["detail"] = "does not count: " + "; ".join(problems)
         rep.check(False, label, fact["detail"])
         return fact
     stem = f"mutant-{name}"
     args = ["-workers", workers, "-dumpTrace", "json", f"/out/{stem}.cex.json",
             "-config", cfg.relative_to(spec_dir).as_posix(), model]
     res, _ = tc.run_tlc(spec_dir, args, out_dir=out, log_path=out / f"{stem}.log", budget_s=budget)
+    liveness = liveness_problem((out / f"{stem}.log").read_text(encoding="utf-8", errors="replace"), parsed)
     v = res.violation()
     if res.errors:
         fact["observed"] = "error"
@@ -397,6 +626,8 @@ def run_mutant(rep: Report, spec_dir: Path, model: str, cfg: Path, out: Path, bu
             fact["detail"] = f"expected {parsed.expect}, got: {describe(res)}"
         elif res.exit_code == 0:
             fact["detail"] += ", but TLC exited with status 0"
+        elif liveness:
+            fact["detail"] += f", but it does not count: {liveness}"
         elif kind == "invariant" and res.cex_states < 2:
             fact["detail"] += ": false in an initial state, so no step of the mutant breaks it"
         else:
@@ -414,7 +645,8 @@ def design_check(rep: Report, spec_dir: Path, name: str, model: str, out: Path, 
     baselines = [main_cfg] + sorted(
         p for p in spec_dir.glob(f"{name}.*.cfg") if p.name != f"{name}.large.cfg"
     )
-    limits = search_check(rep, Model(spec_dir, model), baselines)
+    modules = Model(spec_dir, model)
+    limits = search_check(rep, modules, baselines)
     runs: list[dict] = []
     coverage: dict[str, int] = {}
     unparsed: list[str] = []
@@ -463,7 +695,7 @@ def design_check(rep: Report, spec_dir: Path, name: str, model: str, out: Path, 
         rep.check(prop in expects, f"mutant rule {prop}",
                   "named by a mutant" if prop in expects else "no mutant expects it, and no `no-mutant` line exempts it")
 
-    mutants = [run_mutant(rep, spec_dir, model, m, out, budget, workers) for m in mutant_cfgs]
+    mutants = [run_mutant(rep, spec_dir, model, m, out, budget, workers, modules, baselines) for m in mutant_cfgs]
     covered = [n for n in coverage.values()]
     facts.update({
         "distinct_states": distinct, "depth": depth,
@@ -553,7 +785,7 @@ def main(argv: list[str] | None = None) -> int:
     artifacts = []
     if out is not None and out.exists():
         # summary.json keeps every fact. run_check.py trims the record, and keeps this artifact.
-        files = [f for f in sorted(out.glob("*")) if f.is_file() and f.name != "summary.json"]
+        files = [f for f in sorted(out.glob("*")) if f.is_file()]  # before summary.json is written
         (out / "summary.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         artifacts = [{"name": f"tla/{f.name}", "sha256": _sha256(f)} for f in (out / "summary.json", *files)]
     tc.print_summary({**result, "artifacts": artifacts})

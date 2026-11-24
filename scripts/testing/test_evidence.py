@@ -118,6 +118,17 @@ class ValidatorTests(unittest.TestCase):
         for runs in ([], None, "x", [3]):
             self.assertEqual(evidence.tla_contradictions({**facts, "runs": runs}), ["no run"])
         self.assertEqual(evidence.tla_contradictions({**facts, "runs": [], "dropped": {"runs": 2}}), [])
+        for run in ({"cfg": "X.cfg", "verdict": "pass"}, {"cfg": "X.cfg", "verdict": "pass", "states_left": "0"}):
+            self.assertEqual(len(evidence.tla_contradictions({**facts, "runs": [run]})), 1)
+        # A trace pass accepted at least one trace, and rejected only what it had to.
+        counts = {"checked": 4, "accepted": 1, "rejected": 3, "expected_rejections": 3, "failing": []}
+        self.assertEqual(evidence.tla_contradictions({"mode": "trace", "traces": counts}), [])
+        for change in ({"accepted": 0}, {"accepted": 0, "checked": 3}, {"rejected": 2}, {"expected_rejections": 2}, {"checked": 5},
+                       {"checked": 3, "rejected": 2}, {"accepted": None}, {"rejected": "3"}, {"expected_rejections": None}):
+            with self.subTest(change=change):
+                self.assertEqual(len(evidence.tla_contradictions({"mode": "trace", "traces": {**counts, **change}})), 1)
+        for traces in (None, [], {}, {"checked": 1, "accepted": 1, "rejected": 0}):
+            self.assertEqual(evidence.tla_contradictions({"mode": "trace", "traces": traces}), ["no trace counts"])
         # A simulation ends with states it never visited, and dropped passing facts contradict nothing.
         self.assertEqual(evidence.tla_contradictions(
             {"mode": "simulation", "runs": [{"cfg": "X.cfg", "verdict": "pass", "states_left": None}],

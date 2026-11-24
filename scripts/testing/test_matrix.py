@@ -230,6 +230,8 @@ def t_record(check, result="pass", mode="exhaustive", tier="T1", kind="T", reaso
     tla = None if mode is None else {"spec": "specs/x/X", "mode": mode, "tier": tier, "tools": "t", **facts}
     if mode == "exhaustive":
         tla.setdefault("runs", [{"cfg": "X.cfg", "verdict": "pass", "states_left": 0}])
+    if mode == "trace":
+        tla.setdefault("traces", {"checked": 3, "accepted": 1, "rejected": 2, "expected_rejections": 2, "failing": []})
     record = {"check": check, "kind": kind, "guarantees": ["OLTP-G03"], "sha": sha, "result": result,
               "assertions": {"executed": 3, "failed": 1 if result == "fail" else 0,
                              "not_run": [{"id": "b", "reason": reason}] if result == "not-run" else []},
@@ -310,6 +312,19 @@ class KindTCellTests(unittest.TestCase):
                     cell = self.cell(t_record("a"), t_record("b", mode=mode, **facts))
                     self.assertEqual((cell.state, cell.green()), ("fail", False))
         self.assertTrue(self.cell(t_record("a", dropped={"mutants": 3}, truncated=True)).green())
+        # An exhaustive record has to say that nothing was left, and a trace record that it accepted something.
+        for runs in ([], [{"cfg": "X.cfg", "verdict": "pass"}], [{"cfg": "X.cfg", "verdict": "pass", "states_left": None}],
+                     [{"cfg": "X.cfg", "verdict": "pass", "states_left": 1}], "none"):
+            self.assertEqual(self.cell(t_record("a", runs=runs)).state, "fail")
+        nothing = {"checked": 3, "accepted": 0, "rejected": 3, "expected_rejections": 3, "failing": []}
+        self.assertEqual(self.cell(t_record("a"), t_record("b", mode="trace", traces=nothing)).state, "fail")
+
+    def test_the_reasons_of_a_run_that_did_not_finish_are_shown(self):
+        cell = self.cell(t_record("a"), t_record("b", "not-run", reason="r1"), t_record("c", "not-run", reason="r2", mode=None),
+                         t_record("d", "not-run", mode="trace", reason="r3"))
+        self.assertEqual(cell.reason, "exhaustive run not finished: b, c; r1; r2")
+        cell = self.cell(t_record("b", "not-run", reason="r1"), t_record("e", mode="simulation", tier="T2"))
+        self.assertEqual(cell.reason, "no passing exhaustive T0 or T1 run (only T2 simulation); r1")
 
     def test_the_run_must_be_on_the_cells_own_sha(self):
         old = t_record("d", behind=3, sha="b" * 40)

@@ -143,6 +143,13 @@ class DesignLineTests(unittest.TestCase):
         both = "# P\n- a\n\n  ```\n  x\n    ```\n## Design review\n```sh\n# c\n```\n"
         self.assertNotEqual(pr_lint.design_sections(both + "Verdict: not-run\n"),
                             pr_lint.design_sections(both + "Verdict: pass\n"))
+        # A fence on a list marker line, and a comment in a fence inside the section.
+        for marker in ("- ", "* ", "1. ", "- - ", "  - "):
+            pad = " " * len(marker)
+            listed = f"# P\n\n{marker}```\n{pad}x\n{pad}```\n## Design review\n```sh\n# c\n```\n"
+            with self.subTest(marker):
+                self.assertNotEqual(pr_lint.design_sections(listed + "Verdict: not-run\n"),
+                                    pr_lint.design_sections(listed + "Verdict: pass\n"))
         # Inside the section, a fence that the strict reading never closes does not end it early either.
         inside = "# P\n## Design review\n- a\n\n  ```\n  x\n    ```\n# z\n"
         self.assertNotEqual(pr_lint.design_sections(inside + "Verdict: not-run\n"),

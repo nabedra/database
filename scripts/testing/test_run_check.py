@@ -168,6 +168,9 @@ class TlcParserTests(unittest.TestCase):
             "no tla facts": line(tla=...),
             "tla facts of another type": line(tla=[]),
             "pass of an exhaustive run with no run": line(tla={k: v for k, v in TLA_FACTS.items() if k != "runs"}),
+            "pass of a run that does not say what is left": line(tla={**TLA_FACTS, "runs": [{"cfg": "x", "verdict": "pass"}]}),
+            "trace pass with nothing accepted": line(tla={**TLA_FACTS, "mode": "trace", "traces": {
+                "checked": 3, "accepted": 0, "rejected": 3, "expected_rejections": 3, "failing": []}}),
             "pass with not-run entries": line(not_run=[{"id": "b", "reason": "stopped at the budget"}]),
             "pass with an uncovered action": line(tla={**TLA_FACTS, "uncovered": ["A"]}),
             "pass with a failed mutant": line(tla={**TLA_FACTS, "mutants": [{"name": "m", "ok": False}]}),
@@ -267,7 +270,7 @@ class FitRecordTests(unittest.TestCase):
         self.assertEqual(bool(self.dropped.get("not_run")), len(kept) != len(not_run))
         if len(kept) != len(not_run):
             self.assertEqual(not_run[-1]["id"], "truncated")
-            self.assertTrue(not_run[-1]["reason"].startswith(f"{self.dropped['not_run']} "))
+            self.assertEqual(not_run[-1]["reason"], f"{self.dropped['not_run']} {run_check._Fitter.MORE}")
         return record
 
     def test_a_record_that_fits_is_left_alone(self):
@@ -409,6 +412,7 @@ class FitRecordTests(unittest.TestCase):
                     self.assertEqual(run_check.evidence.validate(record), [])
                     self.assertEqual(record["result"], want)
                     self.assertNotIn("tla", record)
+                    self.assertIsNone(record["mode"])
                     first, *rest = record["assertions"]["not_run"]
                     self.assertIn("truncated", first["reason"])
                     # What is not the tool's facts stays.

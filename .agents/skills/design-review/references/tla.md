@@ -107,8 +107,9 @@ its expected property. A mutant that fails with an error, or on a
 different property, does not count.
 
 An invariant that is already false in an initial state does not count
-either: no step of the mutant breaks it. A mutant configuration may not
-override the property or the specification it runs.
+either: no step of the mutant breaks it. Nor does one whose configuration
+changes nothing, or [limits the search](#limits-on-the-search) as no
+baseline may.
 
 Every invariant and property of a baseline needs a mutant, and a spec
 whose baselines check none fails. Only a type invariant, an invariant with
@@ -121,30 +122,55 @@ When a design bug is fixed, the reverted fix becomes a mutant named
 ## Limits on the search
 
 TLC reports "0 states left on queue" whatever a configuration cuts away, so
-the runner checks what can limit a baseline or a `.large.cfg` run. It reads
-text, and refuses what it cannot read:
+the runner checks what can limit a baseline, a `.large.cfg` run or a mutant.
+It reads text. A constraint has to match a small grammar from end to end,
+and everything else is refused, with the line and what is allowed.
 
 | Limit | Rule |
 | --- | --- |
-| `CONSTRAINT`, `ACTION_CONSTRAINT` | Allowed on counters, in a run without liveness. Declare it in the configuration: `\* limit: <Name> -- <reason>`. Its definition is a conjunction, under `\A` if needed, of order comparisons: `<`, `<=`, `>`, `>=`. Anything that selects protocol states, such as `=`, `#`, `~`, `=>`, `\/` or a string, fails, and so do Unicode operators. Model a budget constant instead |
+| `CONSTRAINT` | Allowed as a conjunction of upper bounds on counters, in an exhaustive run without liveness. Declare it in the configuration: `\* limit: <Name> -- <reason>` |
+| `ACTION_CONSTRAINT` | Fails. It removes steps |
 | A depth limit or a state cap through TLC's own search state | Fails. No module of the model and no configuration may use `TLCGet`, `TLCSet`, `TLCExt`, `RandomElement`, `Randomization`, `JavaTime` or `IOUtils` |
 | `SYMMETRY` or a constraint with a liveness property | Fails in an exhaustive run, where TLC reports whether it checks liveness. TLC does not report it in a simulation, so the runner does not see it there. A simulation never makes a T cell green. Use a separate `<Name>.live.cfg` without them. Action properties such as `[][A]_vars` are safety, so they may stay |
 | `VIEW` | Fails. It merges states, and TLC does not check that the merge is sound |
-| An override (`Op <- X` or `Op = x`) | `X` must be defined in the model's own modules, not in a standard one. A declared `CONSTANT` is free. Overriding a property, a constraint, or the `INIT`, `NEXT` or `SPECIFICATION` it runs fails. Overriding another definition, such as `Nat`, needs a `limit` line |
+| An override (`Op <- X` or `Op = x`) | `X` must be defined in the model's own modules, not in a standard one. A declared `CONSTANT` is free. Overriding a property, a constraint, a variable, `Len`, `Cardinality`, or the `INIT`, `NEXT` or `SPECIFICATION` it runs fails. Overriding another definition, such as `Nat`, needs a `limit` line |
+| A mutant configuration | The same rules, with the baselines' `limit` lines only. A mutant may change nothing but declared `CONSTANT`s, and must change one when a baseline checks the same property. It runs a baseline's `INIT`, `NEXT` or `SPECIFICATION`. Otherwise it does not count as caught |
 
-The evidence record lists the declared limits, and how many states TLC kept
-for each constraint. The reviewer of the plan judges whether the bound is
-wide enough. The rule does not detect:
+The grammar of a constraint. `VARIABLE` and `CONSTANT` are names that the
+model module, or one it extends, declares and nothing defines.
 
-- a counter that every action increments, so that its bound is a depth
-  limit;
-- a lower bound, or a bound between two variables, that cuts protocol
-  states, such as `n >= 1` or an `ACTION_CONSTRAINT` `n' >= n`;
-- a constraint over an operator that encodes protocol state as a number;
+```text
+body    ::= [and] item { and item }          and   ::= "/\" | "\land"
+item    ::= "(" body ")"
+          | "\A" name { "," name } "\in" set ":" body
+          | counter less limit
+          | the name of another definition whose body matches
+counter ::= ref | "Len" "(" ref ")" | "Cardinality" "(" ref ")"
+ref     ::= VARIABLE { "[" index { "," index } "]" }
+index   ::= a name that an enclosing "\A" binds | CONSTANT
+less    ::= "<" | "<=" | "=<" | "\leq"       limit ::= NUMBER | CONSTANT
+set     ::= CONSTANT | the name of a definition that is a union of
+            CONSTANTs and of enumerations of them, such as {G0} \cup Children
+```
+
+For example:
+
+```tla
+MCConstraint ==
+    /\ tso <= MaxTs
+    /\ \A g \in Groups : Len(hst[g]) <= MaxLog
+```
+
+Model anything else as a budget constant of the spec. The evidence record
+lists the declared limits, and how many states TLC kept for each
+constraint. The reviewer of the plan judges whether the bound is wide
+enough. The rule does not detect:
+
+- an upper bound on a variable that is no counter of growth, such as a step
+  counter that every action increments, or a protocol phase kept as a
+  number;
 - a `CONSTANT` value, or an `INIT` or `NEXT` written in `MC<Name>.tla`, that
   leaves behavior out;
-- the same limits in a mutant configuration, which is checked only for
-  overrides of what it checks or runs;
 - an action that coverage counts once although one of its cases never
   happens. TLC sums every case of an operator, such as `Crash(1)` and
   `Crash(2)`, or the branches of an `IF`, and does not report an action

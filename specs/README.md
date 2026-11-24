@@ -59,9 +59,11 @@ type invariant, with `Type` in its name, may be exempted, with a line in the
 baseline cfg such as
 `\* no-mutant: TypeOK -- the type invariant; every run checks it.`
 
-A `CONSTRAINT`, an `ACTION_CONSTRAINT` and an override of a defined operator
-need a line `\* limit: <Name> -- <reason>` in the cfg. The runner refuses
-other limits on the search, such as a depth limit or a `VIEW`. See
+A `CONSTRAINT` may only be a conjunction of upper bounds on counters, and it
+and an override of a defined operator need a line
+`\* limit: <Name> -- <reason>` in the cfg. The runner refuses other limits on
+the search, such as an `ACTION_CONSTRAINT`, a depth limit or a `VIEW`, in
+baselines and mutants. See
 [limits on the search](../.agents/skills/design-review/references/tla.md#limits-on-the-search).
 
 ## Run
