@@ -38,10 +38,9 @@ failure_contains = ["NotLeader { hint:"]
 
 [regression.evidence]
 digest = "ffe26b84b86b1261ad54234551a9559dd8b0a41280f95913960cc9cff24479b6"
-clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45158573590", sha = "d7f11683500b678e9c9262e4af189dc8f79abf05", result = "passed", note = "request p10-bugs-opus-clean-d7f1168-114238, direct_oltp on" }
-patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45158568925", sha = "c5dcdd0fd5baa8a5d6233af2ec1eaa35e5d143bd", result = "failed", note = "scratch/sim-bug-bug1-d04-r2, request p10-bugs-opus-d04-c5dcdd0-114238, direct_oltp on. The final assertion (outcome Unknown) fails: the stepped-down leader answered a redirect.", output = """
-test oltp_runtime::direct::tests::d04_o10_bug1_leader_shutdown_after_apply_preserves_proposal_uncertainty ... FAILED
-panicked at src/oltp_runtime/direct/tests.rs:1900:5:
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45413905217", sha = "5953e85183f733a73658dc75ef9cd10d8c21e5cc", result = "passed", note = "check oltp-sim-bugs-regression, request p10-bugs-5953e85-152526, direct_oltp on" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45413905217", sha = "5953e85183f733a73658dc75ef9cd10d8c21e5cc", result = "failed", note = "check oltp-sim-bugs-regression, request p10-bugs-5953e85-152526, direct_oltp on; patch applied to this SHA in a scratch worktree", output = """
 NotLeader { hint: None }
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 585 filtered out; finished in 5.86s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 6.86s
+bug1-d04: with the patch failed; verified (digest ffe26b84b86b1261ad54234551a9559dd8b0a41280f95913960cc9cff24479b6)
 """ }

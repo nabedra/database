@@ -29,13 +29,17 @@ mode = "on"
 timeout_s = 3600
 failure_contains = ["registered startup ValidationError: worker does not host target replica node", "AssertionError: ['RF3 cold run']"]
 # O15 caught this patch in 1 of 5 patched runs: run 45148928008 (on failed, off passed) and 0 of 3
-# attempts in the oltp-sim-bugs-regression run 45150522656. It is a timing window, so O15 does not
-# gate this patch (oltp-sim-bugs-regression leaves it out and oltp-sim-bugs-regression-acc3 runs it
-# with these attempts); the seed search must find it.
+# attempts in the oltp-sim-bugs-regression run 45150522656. After the crate split it caught it in
+# 0 of 10 attempts at 5953e85 (oltp-sim-bugs-regression-acc3, run 45413905217), while all 10
+# unpatched attempts passed: 1 of 18 in all. The patch still removes the retry (the refusal then
+# reaches the generic transport arm, which returns it), but only a replica that has not reopened
+# when the fence arrives exposes it. O15 cannot gate it; the cold workload's seed search must.
 attempts = 10
 
 [regression.evidence]
-digest = "9091b39f5632e0de8e509af569d02a3ae90e9792bd9f8737b82920cadfeefa05"
+# The changed lines are those of the historical runs below; only the path moved (phase 8
+# replication crate), which changes the digest.
+digest = "76df45f6d8b3a0a5e0c479368a8315df02698b9490020187e473e25244beda92"
 clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148935717", sha = "53a5716f844aa9690739daed32fd335c68bc0f8a", result = "passed", note = "request p10-bugs-clean-53a5716-103844, O15 direct_oltp on: all 6 required clauses passed" }
 patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148928008", sha = "3998c3780b617568a4613e5485a143489e96812b", result = "failed", note = "scratch/sim-bug-acc3-cold-fence, request p10-bugs-acc3-cold-fence-3998c37-103844. O15 failed with direct_oltp on and passed with direct_oltp off in the same run: the reopen window is timing dependent, which is why the simulator should search for it.", output = """
 nabedra-db: registered startup ValidationError: worker does not host target replica node
