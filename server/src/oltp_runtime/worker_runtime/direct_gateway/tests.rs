@@ -277,6 +277,85 @@ async fn o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o07_q01_accepted_query_waits_for_catalog_storage_lane() {
+    use crate::{
+        oltp_replication::multiplex::TrafficClass,
+        oltp_runtime::recovery_tests::index_holds::{Checkpoint, register_checkpoint},
+        request_queue::RequestState,
+    };
+
+    nabedra_rt::time::timeout(Duration::from_secs(90), async {
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "nabedra-o07-catalog-lane-{}",
+            nabedra_rt::ids::uuid_v4(),
+        )));
+        let direct = ExecutionConfig::default().direct_oltp;
+        let runtime = open(&directory.0, direct).await;
+        if direct {
+            activated(&runtime).await;
+        }
+        let app = runtime.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
+        let row = json!({"id": 1, "value": 20, "tag": "seed"});
+        let seed_id = nabedra_rt::ids::uuid_v4();
+        let seed = body(
+            seed_id,
+            "table.insert_many",
+            json!({"table_id": table, "rows": [row]}),
+        );
+        assert_eq!(
+            call(&app, seed, false).await,
+            (200, json!({"request_id": seed_id, "data": 1})),
+        );
+
+        let id = nabedra_rt::ids::uuid_v4();
+        let query = body(
+            id,
+            "query.collect",
+            json!({
+                "table_id": table,
+                "query": {"select": null, "filter": null, "order_by": null, "limit": null},
+            }),
+        );
+        let pinned = register_checkpoint(id, Checkpoint::ReadPin);
+        let result = call(&app, query.clone(), false);
+        tokio::pin!(result);
+        let hold = tokio::select! {
+            hold = pinned => hold.unwrap(),
+            reply = &mut result => panic!("query ended before planning its pinned read: {reply:?}"),
+        };
+        let accepted_pin = {
+            let replica = runtime.services.replica.lock().unwrap();
+            let record = replica.record(id).unwrap();
+            assert!(record.accepted);
+            assert_eq!(record.state, RequestState::Queued);
+            record.pinned_catalog.clone().unwrap()
+        };
+        let client = runtime.services.manager.client();
+        let storage = client.hold_outgoing_for_test(TrafficClass::Storage);
+        hold.release.send(false).unwrap();
+        tokio::select! {
+            () = client.outgoing_lane_full_for_test(TrafficClass::Storage) => {}
+            reply = &mut result => panic!("query ended while Storage was held: {reply:?}"),
+        }
+        drop(storage);
+
+        let original = result.await;
+        assert_eq!(original, (200, json!({"request_id": id, "data": [row]})));
+        assert_eq!(call(&app, query, false).await, original);
+        {
+            let replica = runtime.services.replica.lock().unwrap();
+            let record = replica.record(id).unwrap();
+            assert_eq!(record.state, RequestState::Succeeded);
+            assert_eq!(record.pinned_catalog.as_deref(), Some(accepted_pin.as_slice()));
+        }
+        runtime.drain().await.unwrap();
+    })
+    .await
+    .expect("queued Catalog read saturation watchdog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d03_q05_bug1_direct_retry_without_content_length_replays_original_result() {
     nabedra_rt::time::timeout(Duration::from_secs(90), async {
         let directory = TestDirectory(

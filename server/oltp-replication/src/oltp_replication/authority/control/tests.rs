@@ -1721,3 +1721,61 @@ async fn u01_api_ingress_enrollment_never_grants_worker_readiness_or_replica_pro
     assert!(page.done);
     assert!(handle.worker(current.worker_id).await.unwrap().is_none());
 }
+
+// A repeated initial proposal with the same operation ID and body replays the
+// stored Control reply without a second apply; the same ID with another body
+// is a conflict (O16, from the #104 review).
+#[tokio::test]
+async fn o16_repeated_initial_proposals_replay_one_application() {
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope, pool).await;
+    let initialize = ControlCommand::Initialize {
+        operation_id: nabedra_rt::ids::uuid_v4(),
+        run_id: nabedra_rt::ids::uuid_v4(),
+        authorization: authorization(),
+    };
+    let first = fixture.apply(initialize.clone()).await;
+    assert!(matches!(first, ControlReply::Initialized { .. }), "{first:?}");
+    let before = control_dump(&fixture.machine).await;
+    assert_eq!(fixture.apply(initialize.clone()).await, first);
+    let after = control_dump(&fixture.machine).await;
+    let changed: Vec<String> = after
+        .iter()
+        .filter(|entry| !before.contains(entry))
+        .map(|(key, _)| String::from_utf8_lossy(key).into_owned())
+        .collect();
+    println!("keys changed by the duplicate Initialize: {changed:?}");
+    assert_eq!(before.len(), after.len(), "duplicate Initialize added keys: {changed:?}");
+
+    let next = worker(fixture.base + 1);
+    let enroll = ControlCommand::Enroll {
+        operation_id: nabedra_rt::ids::uuid_v4(),
+        expected: None,
+        next: next.clone(),
+        authorization: authorization(),
+        previous_process: None,
+    };
+    let enrolled = fixture.apply(enroll.clone()).await;
+    assert_eq!(enrolled, ControlReply::Enrolled(WorkerIdentity::from(&next)));
+    let revision = fixture.state().await.enrollment_revision;
+    let before = control_dump(&fixture.machine).await;
+    assert_eq!(fixture.apply(enroll.clone()).await, enrolled);
+    assert_eq!(fixture.state().await.enrollment_revision, revision);
+    let after = control_dump(&fixture.machine).await;
+    assert_eq!(before.len(), after.len());
+
+    let ControlCommand::Enroll { operation_id, .. } = enroll else { unreachable!() };
+    let other = ControlCommand::Enroll {
+        operation_id,
+        expected: None,
+        next: worker(fixture.base + 2),
+        authorization: authorization(),
+        previous_process: None,
+    };
+    assert_eq!(
+        fixture.apply(other).await,
+        ControlReply::Rejected(Fault::Conflict)
+    );
+    assert_eq!(fixture.state().await.enrollment_revision, revision);
+}
