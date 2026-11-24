@@ -1,0 +1,71 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-tooling-fixes-16f53f0-175858--specs-selftest-large.log",
+      "sha256": "7eb6676648e8092c23d537367a09b7933f36dbc12e240da543ae538631a29c26"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "acd6d92debee09616039a9d6bc418bc3cb906af3d7d62dac044f9a07e77d6c6d"
+    },
+    {
+      "name": "tla/TwoPhase.large.log",
+      "sha256": "a12931ca55452416ea924dd96230c3284a0dff5a822ad6ba9205936a5a66330a"
+    }
+  ],
+  "assertions": {
+    "executed": 3,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "specs-selftest-large",
+  "duration_s": 17.527,
+  "guarantees": [],
+  "kind": "T",
+  "mode": {
+    "tla": "simulation"
+  },
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T17:04:00.431622+00:00",
+    "request_id": "dr-tooling-fixes-16f53f0-175858",
+    "runner": "GitHub Actions 1000012221",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45443362450"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "16f53f079978696e5769cbb6ce4a44f555bd8e87",
+  "sim_core_hours": null,
+  "tla": {
+    "behaviors": 20000,
+    "budget_s": 900,
+    "depth": null,
+    "distinct_states": null,
+    "mode": "simulation",
+    "runs": [
+      {
+        "cfg": "TwoPhase.large.cfg",
+        "depth": null,
+        "detail": "",
+        "distinct_states": null,
+        "duration_s": 17.4,
+        "states_left": null,
+        "verdict": "pass"
+      }
+    ],
+    "seed": 1,
+    "spec": "specs/selftest/TwoPhase",
+    "states_generated": 4931913,
+    "tier": "T2",
+    "tools": "tlc 1.8.0; community-modules 202611060952"
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}
