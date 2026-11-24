@@ -4,13 +4,13 @@
 //! them, and a run that calls none keeps its schedule.
 
 use nabedra_rt::{
-    fs::FaultFs,
-    sim::{NodeClock, Wipe},
+    fs::{FaultFs, FsOp},
+    sim::{NodeClock, StoragePause, Wipe},
 };
 
 use super::*;
 use crate::{
-    bootstrap::{Candidate, SPARES},
+    bootstrap::{Candidate, ROOT, SPARES},
     disk::DataVolume,
 };
 
@@ -175,6 +175,28 @@ impl Cluster {
         Ok(self.watch_start(node, limit).await)
     }
 
+    /// Crash `node` with a journal sync stopped just before or just after it ran, so the cut
+    /// separates durability from the acknowledgment that waits for it. Returns whether a sync
+    /// was stopped within `limit`. The crash happens either way.
+    pub async fn crash_at_sync(&mut self, node: u64, how: DiskCut, after: bool, limit: Duration) -> bool {
+        let pause = if after {
+            StoragePause::after(FsOp::SyncData)
+        } else {
+            StoragePause::before(FsOp::SyncData)
+        };
+        // The hold only keeps a rule that outlives this process from stopping the next one.
+        self.world
+            .pause_storage(node, pause.path_prefix(ROOT).hold(limit));
+        let deadline = self.world.elapsed() + limit;
+        while self.world.paused_storage(node).is_empty() && self.world.elapsed() < deadline {
+            time::sleep(Duration::from_millis(1)).await;
+        }
+        let stopped = !self.world.paused_storage(node).is_empty();
+        self.record(format!("n{node} stopped at a sync: {stopped}, after {after}"));
+        self.crash(node, how).await;
+        stopped
+    }
+
     /// Follow a start until the worker is ready, its process ended, or `limit` passed. A
     /// process that ended leaves its node down.
     pub async fn watch_start(&mut self, node: u64, limit: Duration) -> Started {
@@ -288,10 +310,7 @@ mod tests {
     use nabedra_rt::fs::os;
 
     use super::*;
-    use crate::{
-        bootstrap::{KEYS, ROOT},
-        config::Config,
-    };
+    use crate::{bootstrap::KEYS, config::Config};
 
     async fn cluster(world: &Arc<World>) -> Cluster {
         Config::sample(1).setup(world);
@@ -355,6 +374,23 @@ mod tests {
                 assert_eq!(cluster.checks.violations(), [""; 0]);
             });
         }
+    }
+
+    /// A crash stopped at a sync cuts where the sync was, and the worker restarts.
+    #[test]
+    fn a_crash_lands_at_a_stopped_sync() {
+        nabedra_sim::runtime::run(1, |world| async move {
+            let mut cluster = cluster(&world).await;
+            cluster.start().await.unwrap();
+            let stopped = cluster
+                .crash_at_sync(3, DiskCut::Power, false, Duration::from_secs(5))
+                .await;
+            assert!(stopped, "an idle cluster still syncs heartbeats and votes");
+            assert!(!world.is_up(3) && world.paused_storage(3).is_empty());
+            cluster.restart_worker(3, DiskCut::Power).await.unwrap();
+            cluster.teardown().await;
+            assert_eq!(cluster.checks.violations(), [""; 0]);
+        });
     }
 
     /// A worker that starts again on the state it stopped with, put back from a snapshot, opens

@@ -181,6 +181,10 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         let trace = trace.clone();
         move |ms, conn, line: &str| trace.lock().unwrap().record(ms, conn, line)
     };
+    if workload == Workload::Membership {
+        // A lost volume that is formatted again repeats its inode numbers, as `mkfs` does.
+        world.set_mkfs_inodes(true);
+    }
     match Cluster::new(
         world.clone(),
         checks.clone(),

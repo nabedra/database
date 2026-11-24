@@ -291,6 +291,11 @@ impl Membership {
             .map(|program| nabedra_rt::task::spawn(clients::run(ctx.clone(), program)))
             .collect();
 
+        if !quiet && g.bool() {
+            let (per_mille, max) = (1 + g.below(20), window(g, 1, 20));
+            cluster.record(format!("storage pauses {per_mille} per mille up to {max:?}"));
+            cluster.world.set_storage_pauses(per_mille as u32, max);
+        }
         let mut done = Ok(());
         for step in self.steps.clone() {
             self.observe_placement(cluster, &ctx).await;
@@ -308,6 +313,7 @@ impl Membership {
         }
         ctx.stopping.store(true, Ordering::Release);
         faults.clear();
+        cluster.world.set_storage_pauses(0, Duration::ZERO);
         for node in cluster.frozen().clone() {
             cluster.thaw(node);
         }
@@ -712,21 +718,13 @@ impl Membership {
             self.submit(cluster, ctx, 1 + g.below(3)).await;
             let outstanding = self.queue.outstanding();
             let stopped = elapsed_ms(&cluster.world);
-            let how = match g.below(3) {
-                0 => {
-                    cluster.crash(node, DiskCut::Kill).await;
-                    DiskCut::Kill
+            let how = if g.below(4) == 0 {
+                if let Err(error) = cluster.drain(node).await {
+                    return Err(format!("drain n{node}: {error}"));
                 }
-                1 => {
-                    cluster.crash(node, DiskCut::Power).await;
-                    DiskCut::Power
-                }
-                _ => {
-                    if let Err(error) = cluster.drain(node).await {
-                        return Err(format!("drain n{node}: {error}"));
-                    }
-                    DiskCut::Kill
-                }
+                DiskCut::Kill
+            } else {
+                self.cut(cluster, g, node).await
             };
             self.down(cluster, ctx, window(g, 0, 2_000)).await;
             cluster.restart_worker(node, how).await?;
@@ -743,6 +741,25 @@ impl Membership {
             }
         }
         Ok(())
+    }
+
+    /// Stop `node` without warning: a kill or a power loss, one half of them at a sync.
+    async fn cut(&mut self, cluster: &mut Cluster, g: &mut Gen, node: u64) -> DiskCut {
+        let how = if g.bool() {
+            DiskCut::Kill
+        } else {
+            DiskCut::Power
+        };
+        match g.below(4) {
+            0 | 1 => cluster.crash(node, how).await,
+            side => {
+                let at = cluster
+                    .crash_at_sync(node, how, side == 3, Duration::from_millis(500))
+                    .await;
+                self.note(if at { "cut at a sync" } else { "no sync to cut" });
+            }
+        }
+        how
     }
 
     /// Sleep with one worker down: `sample` must not take its absence for an exit.
@@ -1310,11 +1327,6 @@ impl Membership {
         index: usize,
     ) -> Result<(), String> {
         let node = cluster.config.node(index);
-        let how = if g.bool() {
-            DiskCut::Kill
-        } else {
-            DiskCut::Power
-        };
         let kind = if g.bool() {
             Wipe::Replace
         } else {
@@ -1326,7 +1338,7 @@ impl Membership {
             _ => Marker::Kept,
         };
         let prepared = g.below(3) == 0;
-        cluster.crash(node, how).await;
+        let how = self.cut(cluster, g, node).await;
         self.down(cluster, ctx, window(g, 0, 3_000)).await;
         if prepared {
             // The operator prepares the ordinary retained restart for it.

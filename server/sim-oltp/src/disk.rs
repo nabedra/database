@@ -256,6 +256,34 @@ mod tests {
         }
     }
 
+    /// With `mkfs` inodes, a formatted volume repeats the `(dev, ino)` of its root. Only the
+    /// filesystem uuid tells it from the old one.
+    #[test]
+    fn a_formatted_data_volume_repeats_its_inodes() {
+        nabedra_sim::runtime::run(1, |world| async move {
+            world.set_mkfs_inodes(true);
+            let checks = setup(&world);
+            let root = |world: &World| {
+                let volume = world.volume(NODE, Path::new(ROOT)).unwrap();
+                let stat = volume.stat(Path::new(ROOT)).unwrap();
+                (stat.dev, stat.ino)
+            };
+            let before = root(&world);
+            let old = world.volume_info(NODE, Path::new(ROOT)).unwrap();
+            cut_for_test(&world, DiskCut::Kill);
+            reopen_data(
+                &world,
+                &checks,
+                NODE,
+                DiskCut::Kill,
+                DataVolume::Empty(Wipe::Reformat),
+            );
+            assert_eq!(root(&world), before);
+            let new = world.volume_info(NODE, Path::new(ROOT)).unwrap();
+            assert_ne!(new.filesystem_uuid, old.filesystem_uuid);
+        });
+    }
+
     /// A stale volume holds an earlier durable state, keeps its identity, and keeps the
     /// inodes that a process may have retained.
     #[test]
