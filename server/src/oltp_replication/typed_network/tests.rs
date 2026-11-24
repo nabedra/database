@@ -8,7 +8,7 @@ use crate::{
         authority::{
             config::TimestampConfig,
             consensus::Consensus,
-            timestamp::{TimestampCommand, TimestampHandle, TimestampMachine},
+            timestamp::{TimestampHandle, TimestampMachine},
         },
         manager::HostedGroupManager,
         multiplex::*,

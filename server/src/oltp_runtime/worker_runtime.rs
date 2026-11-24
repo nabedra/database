@@ -2455,28 +2455,28 @@ pub(crate) struct VerifiedNeverAccepted {
     pub(super) admission_gate: Arc<tokio::sync::OwnedMutexGuard<()>>,
     pub(super) live_admission: std::sync::OnceLock<Arc<super::admission_tickets::LiveAdmission>>,
 }
-impl VerifiedNeverAccepted {
-    pub(crate) fn scope(&self) -> &QueueScope {
+impl crate::oltp_replication::queue_access::NeverAcceptedAdmission for VerifiedNeverAccepted {
+    fn scope(&self) -> &QueueScope {
         &self.scope
     }
-    pub(crate) fn view(&self) -> AuthorityView {
+    fn view(&self) -> AuthorityView {
         self.view
     }
-    pub(crate) fn reservation(
+    fn reservation(
         &self,
     ) -> crate::oltp_replication::authority::status::IdentityReservation {
         self.reservation
     }
-    pub(crate) fn identity(&self) -> &PinIdentity {
+    fn identity(&self) -> &PinIdentity {
         &self.identity
     }
-    pub(crate) fn pin(&self) -> Option<StoragePin> {
+    fn pin(&self) -> Option<StoragePin> {
         self.pin
     }
-    pub(crate) fn request(&self) -> Option<RequestBinding> {
+    fn request(&self) -> Option<RequestBinding> {
         self.request
     }
-    pub(crate) fn failure(&self) -> &ProtocolError {
+    fn failure(&self) -> &ProtocolError {
         &self.failure
     }
 }

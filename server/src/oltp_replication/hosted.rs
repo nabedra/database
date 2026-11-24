@@ -293,7 +293,7 @@ where
             {
                 proposal_clock::applying();
             }
-            let _timer = crate::oltp_runtime::stage_timing::by_kind(
+            let _timer = crate::oltp_replication::by_kind(
                 &self.store().identity().kind,
                 [
                     "raft.data.apply_entry",
@@ -347,8 +347,8 @@ where
                 // A transient failure voided the write; the replay check in
                 // `GroupStore::mutate` makes a repeated entry idempotent (F1).
                 Payload::Normal(command) => Some(
-                    crate::oltp_runtime::stage_timing::timed(
-                        crate::oltp_runtime::stage_timing::by_kind(
+                    nabedra_resources::stage_timing::timed(
+                        crate::oltp_replication::by_kind(
                             &self.store().identity().kind,
                             ["raft.data.apply_machine", "raft.ts.apply_machine", "raft.meta.apply_machine"],
                         ),
@@ -924,20 +924,20 @@ pub(crate) mod proposal_clock {
         LAST.store(now_us(), Ordering::Relaxed);
     }
     pub(super) fn applying() {
-        mark(crate::oltp_runtime::stage_timing::perf_stage!(
+        mark(nabedra_resources::perf_stage!(
             "raft.data.propose_to_apply"
         ));
     }
     /// Records the time since the latest Data proposal in `stage`, once per
     /// proposal: the first follower's acknowledgement (RD3).
-    pub(crate) fn mark_first(stage: &'static crate::oltp_runtime::stage_timing::Stage) {
+    pub(crate) fn mark_first(stage: &'static nabedra_resources::stage_timing::Stage) {
         let last = LAST.load(Ordering::Relaxed);
         if last != 0 && FIRST.swap(last, Ordering::Relaxed) != last {
             stage.record(Duration::from_micros(now_us().saturating_sub(last)));
         }
     }
     /// Records the time since the latest Data proposal in `stage`.
-    pub(crate) fn mark(stage: &'static crate::oltp_runtime::stage_timing::Stage) {
+    pub(crate) fn mark(stage: &'static nabedra_resources::stage_timing::Stage) {
         let last = LAST.load(Ordering::Relaxed);
         if last != 0 {
             stage.record(Duration::from_micros(now_us().saturating_sub(last)));
@@ -984,7 +984,7 @@ where
             if matches!(kind, GroupKind::Data { .. }) {
                 proposal_clock::proposed();
             }
-            let _timer = crate::oltp_runtime::stage_timing::by_kind(
+            let _timer = crate::oltp_replication::by_kind(
                 &kind,
                 [
                     "raft.data.client_write",
@@ -1098,10 +1098,10 @@ where
         policy: &ReadPolicy,
         lease: [&'static str; 3],
         index: [&'static str; 3],
-    ) -> crate::oltp_runtime::stage_timing::Timer {
+    ) -> nabedra_resources::stage_timing::Timer {
         let leased = matches!(policy, ReadPolicy::LeaseRead);
         let kind = self.state.store().identity().kind.clone();
-        crate::oltp_runtime::stage_timing::variant(
+        nabedra_resources::stage_timing::variant(
             if leased {
                 "raft.lease_read_by_kind."
             } else {
@@ -1110,7 +1110,7 @@ where
             &kind,
         )
         .record(std::time::Duration::ZERO);
-        crate::oltp_runtime::stage_timing::by_kind(&kind, if leased { lease } else { index })
+        crate::oltp_replication::by_kind(&kind, if leased { lease } else { index })
             .timer()
     }
     /// `read_barrier`'s Raft half: the index a read must have applied. The

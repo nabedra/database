@@ -28,6 +28,8 @@ pub mod registered_process;
 #[cfg(unix)]
 mod remote_api;
 pub mod replica;
+#[cfg(test)]
+mod replication_tests;
 mod scoped_worker;
 mod transaction;
 pub mod worker_endpoint;

@@ -172,7 +172,7 @@ pub(crate) trait StatusService: Send + Sync {
     ) -> ConsensusFuture<'a, Applied<StatusReply>>;
     fn reject_unaccepted<'a>(
         &'a self,
-        cap: &'a crate::oltp_runtime::worker_runtime::VerifiedNeverAccepted,
+        cap: &'a dyn crate::oltp_replication::queue_access::NeverAcceptedAdmission,
     ) -> ConsensusFuture<'a, VerifiedAdmissionRejection>;
     fn reject_scoped_route_moved<'a>(
         &'a self,
@@ -405,7 +405,7 @@ impl StatusService for StatusHandle {
     }
     fn reject_unaccepted<'a>(
         &'a self,
-        cap: &'a crate::oltp_runtime::worker_runtime::VerifiedNeverAccepted,
+        cap: &'a dyn crate::oltp_replication::queue_access::NeverAcceptedAdmission,
     ) -> ConsensusFuture<'a, VerifiedAdmissionRejection> {
         Box::pin(async move { StatusHandle::reject_unaccepted(self, cap).await })
     }

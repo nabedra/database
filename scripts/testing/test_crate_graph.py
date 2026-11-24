@@ -331,6 +331,30 @@ class ProofTests(unittest.TestCase):
         self.assertTrue(report["impls"], "no `impl ...Proof for` blocks found; the case would pass vacuously")
         self.assertEqual(report["outside"], [])
 
+    def test_runtime_proof_implementations(self):
+        """Each runtime queue capability has one implementation at its authority site."""
+        allowed = CONFIG.proofs["runtime_allowed"]
+        report = crate_graph.proof_report(ROOT, CONFIG, runtime=True)
+        self.assertEqual(report["outside"], [])
+        names = [line.split("impl ", 1)[1].split("::")[-1] for line in report["impls"]]
+        self.assertEqual(sorted(names), sorted(allowed))
+
+    def test_forged_runtime_queue_capability_is_reported(self):
+        base = Path(tempfile.mkdtemp(prefix="crate-graph-runtime-proofs-"))
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        write_tree(base, {
+            "server/src/oltp_runtime/replica.rs": "impl QueueCopySource for WorkerReplica {}\n",
+            "server/src/oltp_runtime/forged.rs": (
+                "impl crate::queue::NeverAcceptedAdmission for Fake {}\n"
+                "impl QueueCopySource for Fake {}\n"
+            ),
+        })
+        report = crate_graph.proof_report(base, CONFIG, runtime=True)
+        self.assertEqual(report["outside"], [
+            "server/src/oltp_runtime/forged.rs:1: impl crate::queue::NeverAcceptedAdmission",
+            "server/src/oltp_runtime/forged.rs:2: impl QueueCopySource",
+        ])
+
     def test_scanner_finds_impls_and_ignores_others(self):
         source = textwrap.dedent("""
             impl StatusDecisionProof for VerifiedStatusDecision {}

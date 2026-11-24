@@ -13,9 +13,10 @@ use crate::{
             InventoryPage,
         },
         multiplex::*,
+        queue_access::AuthorityReader,
     },
-    oltp_runtime::{replica::QueueScope, worker_endpoint::AuthorityReader},
 };
+use nabedra_oltp_types::queue::QueueScope;
 use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;

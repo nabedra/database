@@ -182,10 +182,10 @@ impl WorkerPools {
         permit: &LocalOperatorPermit,
         verified: VerifiedPoolClosed,
     ) -> Result<PoolDrainRecord, ProtocolError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         {
             let id = verified.statement().close_id;
-            crate::oltp_runtime::recovery_tests::pause("pool_native_closed", id).await;
+            crate::oltp::test_hooks::pause("pool_native_closed", id).await;
             if std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").is_some_and(|dir| {
                 std::fs::remove_file(
                     std::path::PathBuf::from(dir).join(format!("pool-lose-close-{id}")),
