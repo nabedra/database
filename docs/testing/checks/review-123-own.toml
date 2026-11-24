@@ -1,0 +1,11 @@
+id = "review-123-own"
+module = "sim"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["weekly"]
+command = ["bash", "scripts/testing/review_123/run.sh", "own", "65caee635fe6d9a57bae7b3b18ab8cfc8bd93853"]
+cwd = "."
+timeout_s = 7200
+needs = []
+result_parser = "exit-code"
