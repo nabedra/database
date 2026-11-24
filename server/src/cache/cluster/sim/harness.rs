@@ -196,6 +196,7 @@ impl Cluster {
         world.insert_ext(Hooks {
             knobs: config.knobs,
             watched,
+            expiry_readings: Default::default(),
             observe: Box::new(move |node, event| {
                 let now = runtime::virtual_ms(&observe_world.upgrade().unwrap());
                 observer.lock().unwrap().observe(node, event, now);
