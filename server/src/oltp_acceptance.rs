@@ -93,6 +93,63 @@ fn acceptance_o01() {
     );
 }
 
+/// Scratch only (never shipped): one recovery process suite through the tests input.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "real RF3 processes and loopback mounts"]
+fn scratch_recovery_suite_restart() {
+    let status = process_driver("oltp_recovery_operations.py")
+        .arg("--binary")
+        .arg(process_binary().expect("shared-build OLTP binary"))
+        .arg("--test-executable")
+        .arg(std::env::current_exe().unwrap())
+        .args(["--suite", "restart"])
+        .env(
+            "PYTHONPATH",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../orm/python/src"),
+        )
+        .status();
+    assert!(status.expect("launch recovery suite").success(), "recovery suite restart failed");
+}
+
+/// Scratch only (never shipped): one recovery process suite through the tests input.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "real RF3 processes and loopback mounts"]
+fn scratch_recovery_suite_replacement_wipe() {
+    let status = process_driver("oltp_recovery_operations.py")
+        .arg("--binary")
+        .arg(process_binary().expect("shared-build OLTP binary"))
+        .arg("--test-executable")
+        .arg(std::env::current_exe().unwrap())
+        .args(["--suite", "replacement-wipe"])
+        .env(
+            "PYTHONPATH",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../orm/python/src"),
+        )
+        .status();
+    assert!(status.expect("launch recovery suite").success(), "recovery suite replacement-wipe failed");
+}
+
+/// Scratch only (never shipped): one recovery process suite through the tests input.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "real RF3 processes and loopback mounts"]
+fn scratch_recovery_suite_replacement_voter_refresh() {
+    let status = process_driver("oltp_recovery_operations.py")
+        .arg("--binary")
+        .arg(process_binary().expect("shared-build OLTP binary"))
+        .arg("--test-executable")
+        .arg(std::env::current_exe().unwrap())
+        .args(["--suite", "replacement-voter-refresh"])
+        .env(
+            "PYTHONPATH",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../orm/python/src"),
+        )
+        .status();
+    assert!(status.expect("launch recovery suite").success(), "recovery suite replacement-voter-refresh failed");
+}
+
 #[test]
 #[ignore = "run through scripts/acceptance_oltp.py"]
 fn acceptance_o06() {
