@@ -24,13 +24,7 @@ pub use transport::{
 #[cfg(feature = "sim")]
 pub use transport::{FrameKind, StreamFrame, session_alpn};
 
-/// The worker that owns the physical accounting used by this transport.
-/// The owner retains native resources until the last transport handle is dropped.
-pub trait ResourceOwner: Send + Sync + 'static {
-    fn worker_memory(&self) -> &Arc<WorkerMemory>;
-
-    fn bind_worker(self: &Arc<Self>, worker_id: Uuid) -> Result<(), ProtocolError>;
-}
+pub use nabedra_resources::memory::ResourceOwner;
 
 struct MemoryHandle {
     memory: Arc<WorkerMemory>,
