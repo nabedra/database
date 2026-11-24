@@ -1,0 +1,26 @@
+id = "p10-probes3-trial"
+module = "oltp"
+kinds = ["S"]
+# Scratch: the probe rules on the workloads of #115. Not evidence.
+guarantees = []
+scenarios = []
+tiers = ["weekly"]
+command = ["bash", "-uc", '''
+cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib --no-run || exit 1
+run() {
+    for s in $(seq $2); do
+        echo "== $1 seed $s"
+        NABEDRA_SIM_WORKLOAD=$1 NABEDRA_SEED=$s NABEDRA_SEEDS=1 timeout 900s cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib -- --exact --nocapture --test-threads=1 sweep::tests::sweep 2>&1 | sed 's/^test result/trial result/'
+    done
+}
+run direct 8
+run cold 6
+run move 8
+run smoke 4
+echo "test result: ok. 1 passed; 0 failed; 0 ignored;"
+''']
+cwd = "server"
+timeout_s = 10000
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_JOBS = "1", NABEDRA_SIM_VERIFY_REPLAY = "0", NABEDRA_SIM_CHECK_ID = "p10-probes3-trial", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/p10-probes3-trial" }

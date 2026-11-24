@@ -162,6 +162,7 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     observer(0, format!("configuration {}", configuration["hash"]));
     let checks = Invariants::new();
     checks.set_trace(observer.clone());
+    checks.install_probes(&world, workload.name());
     let history = Arc::new(Mutex::new(History::default()));
     history.lock().unwrap().set_trace(observer.clone());
     let mut assertions = BTreeMap::new();
@@ -289,6 +290,8 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         );
         checks.check_history(&world, &verdict);
     }
+    checks.check_outcomes(&world, history.events());
+    assertions.insert("probe invariants", checks.probe_invariants_hold());
     let mut capture = trace.lock().unwrap();
     capture.flush_frames();
     let trace = &capture.trace;
@@ -487,8 +490,7 @@ async fn smoke(
     let table = created["id"]
         .as_str()
         .ok_or_else(|| format!("table.create lacks table id: {created}"))?;
-    for node in WORKERS {
-        let stats = cluster.stats(node).await?;
+    for (node, stats) in steady(cluster).await? {
         cluster
             .checks
             .capture_resources(&cluster.world, node, &stats);
@@ -617,6 +619,25 @@ async fn verify_cold_start(
         ));
     }
     Ok(())
+}
+
+/// Waits until every worker's resources stay the same, so that the baseline holds no charge
+/// of a message in flight.
+pub(crate) async fn steady(cluster: &Cluster) -> Result<Vec<(u64, Value)>, String> {
+    let deadline = cluster.world.elapsed() + SETTLE_LIMIT;
+    loop {
+        let mut steady = true;
+        let mut snapshots = Vec::new();
+        for node in WORKERS {
+            let stats = cluster.stats(node).await?;
+            steady &= cluster.checks.resources_steady(&cluster.world, node, &stats);
+            snapshots.push((node, stats));
+        }
+        if steady || cluster.world.elapsed() >= deadline {
+            return Ok(snapshots);
+        }
+        time::sleep(STEP).await;
+    }
 }
 
 async fn settle(cluster: &Cluster) -> Result<Vec<(u64, Value)>, String> {
