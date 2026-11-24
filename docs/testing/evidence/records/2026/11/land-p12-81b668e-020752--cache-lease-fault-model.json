@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p12-81b668e-020752--cache-lease-fault-model.log",
+      "sha256": "62bbd2f5db7aacc3810ccdd8ee3e2b422aaa246f6768dab7ea0e69918069ed90"
+    }
+  ],
+  "assertions": {
+    "executed": 2,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-lease-fault-model",
+  "duration_s": 66.433,
+  "guarantees": [],
+  "kind": "S",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T02:08:28.154133+00:00",
+    "request_id": "land-p12-81b668e-020752",
+    "runner": "GitHub Actions 1000009301",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45310098554"
+  },
+  "scenarios": [
+    "K03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "81b668ed6151b8cd3999d71f3abffbae96bb297e",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
