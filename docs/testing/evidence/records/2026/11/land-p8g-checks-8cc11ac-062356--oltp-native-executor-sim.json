@@ -1,0 +1,47 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p8g-checks-8cc11ac-062356--oltp-native-executor-sim.log",
+      "sha256": "6aae5bbda32b6e3773a74317c7e2ce2caf941db59428e45cd1277f7d7b68688b"
+    }
+  ],
+  "assertions": {
+    "executed": 204,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-native-executor-sim",
+  "duration_s": 78.837,
+  "guarantees": [
+    "OLTP-G09",
+    "SCHED-G01"
+  ],
+  "kind": "S U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T06:25:30.617889+00:00",
+    "request_id": "land-p8g-checks-8cc11ac-062356",
+    "runner": "GitHub Actions 1000010281",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45340143713"
+  },
+  "scenarios": [
+    "C04",
+    "C06",
+    "F01",
+    "F02",
+    "F03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "8cc11ac4e14f67ba0f0f947a5e255aad3485c140",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
