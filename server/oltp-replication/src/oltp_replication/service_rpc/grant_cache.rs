@@ -922,6 +922,52 @@ mod tests {
         );
     }
 
+    /// PR #121 review of RD2: eight warm roles, a Control that answers no
+    /// background read, and a Control lane with four slots. The foreground
+    /// must always find a slot.
+    #[tokio::test(start_paused = true)]
+    async fn r121_rd2_hung_background_reads_leave_the_foreground_a_lane_slot() {
+        let lane = Arc::new(tokio::sync::Semaphore::new(4));
+        let cache = GrantCache::default();
+        let target = group();
+        let refresh: Refresh = {
+            let lane = lane.clone();
+            Arc::new(move || {
+                let lane = lane.clone();
+                Some((
+                    Some(1),
+                    Box::pin(async move {
+                        let Ok(_slot) = lane.try_acquire() else {
+                            return Err(ProtocolError::new(
+                                crate::protocol::ErrorCode::Overloaded,
+                                "Control lane full",
+                                crate::protocol::Outcome::NotApplied,
+                            ));
+                        };
+                        std::future::pending::<()>().await;
+                        Ok(None)
+                    }) as Pin<Box<dyn Future<Output = _> + Send>>,
+                ))
+            })
+        };
+        for _ in 0..8 {
+            let key = GrantKey::new(worker(), ServiceAction::DirectLeader, &target, None);
+            cache
+                .role_warm(key, Some(1), || async { Ok(None) }, || refresh.clone())
+                .await
+                .unwrap();
+        }
+        let mut refused = 0;
+        for _ in 0..200 {
+            nabedra_rt::time::sleep(Duration::from_millis(100)).await;
+            refused += usize::from(lane.try_acquire().is_err());
+        }
+        assert_eq!(
+            refused, 0,
+            "the foreground found the Control lane full {refused} times of 200"
+        );
+    }
+
     /// P10-DET: the warm task refreshes the keys due in one tick in key
     /// order, not in the map's hash order, so a simulation seed replays the
     /// same sequence of Control reads.
