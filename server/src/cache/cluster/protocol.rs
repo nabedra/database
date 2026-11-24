@@ -121,6 +121,18 @@ pub(super) struct Slot {
     pub cold: bool,
 }
 
+impl Slot {
+    pub fn cold_reset(self, primary: WorkerId, replica: Option<WorkerId>) -> Self {
+        Self {
+            epoch: self.epoch + 1,
+            primary: Some(primary),
+            replica,
+            cold: true,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(all(test, feature = "sim"), derive(Hash))]

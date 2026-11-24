@@ -180,6 +180,7 @@ fn renew(state: &mut State, worker: WorkerId, expires_ms: u64) {
             revision: state.topology.revision,
             worker,
             expires_ms,
+            staged_progress: Vec::new(),
         },
         true,
     );
@@ -411,6 +412,180 @@ fn k03_restart_rejects_retired_incarnation_and_scoped_reset_requires_fence() {
 }
 
 #[test]
+fn k03_repairs_a_replica_after_its_incarnation_retires() {
+    let mut state = fixture();
+    let initial = state.topology.slots[0];
+    let primary = initial.primary.unwrap();
+    let retired = initial.replica.unwrap();
+    let restarted = make_member(retired.node, 2);
+    assert!(matches!(
+        state.apply(
+            Command::Enroll {
+                member: restarted.clone(),
+                certificate: [retired.node as u8; 32],
+            },
+            true,
+        ),
+        Some(Reply::Applied { .. })
+    ));
+    assert!(state.topology.member(retired).is_none());
+
+    let mut observed = Observations::default();
+    let baseline = Progress {
+        slot: 0,
+        epoch: initial.epoch,
+        sequence: 31,
+        baseline: true,
+        serving_primary: true,
+        frozen: None,
+    };
+    report(&mut observed, &state, primary, 1_000, Some(baseline));
+    report(&mut observed, &state, restarted.id, 1_000, None);
+    let changes = observed.plan(&state, bounds(1_000));
+    assert!(state.reconcile(1_000, changes));
+    let staged = state.topology.slots[0];
+    assert_eq!(staged.replica, Some(retired));
+    assert_eq!(staged.moving.unwrap().target, restarted.id);
+    assert!(staged.moving.unwrap().replica_only);
+    assert!(observed.plan(&state, bounds(1_010)).is_empty());
+
+    report(&mut observed, &state, restarted.id, 1_020, Some(baseline));
+    let changes = observed.plan(&state, bounds(1_020));
+    assert!(state.reconcile(1_020, changes));
+    assert_eq!(state.topology.slots[0].primary, Some(primary));
+    assert_eq!(state.topology.slots[0].replica, Some(restarted.id));
+    assert_eq!(state.topology.slots[0].epoch, initial.epoch);
+    assert!(state.topology.slots[0].moving.is_none());
+}
+
+#[test]
+fn k03_retired_source_does_not_hold_replica_move_capacity() {
+    use super::placement::MAX_MOVES_PER_WORKER;
+
+    let mut state = fixture();
+    let retired = make_member(1, 1).id;
+    let healthy = make_member(3, 1).id;
+    let target = make_member(2, 1).id;
+    for slot in &mut state.topology.slots[..MAX_MOVES_PER_WORKER] {
+        assert_eq!(slot.primary, Some(retired));
+        slot.moving = Some(Move {
+            operation: Uuid::from_u128(3),
+            target: healthy,
+            freeze_requested: false,
+            frozen: None,
+            replica_only: true,
+        });
+    }
+    let index = state
+        .topology
+        .slots
+        .iter()
+        .position(|slot| slot.primary == Some(healthy) && slot.replica == Some(retired))
+        .expect("a healthy source with the retired replica");
+    let restarted = make_member(retired.node, 2);
+    assert!(matches!(
+        state.apply(
+            Command::Enroll {
+                member: restarted,
+                certificate: [1; 32]
+            },
+            true,
+        ),
+        Some(Reply::Applied { .. })
+    ));
+    assert!(state.topology.member(retired).is_none());
+
+    let mut observed = Observations::default();
+    report(
+        &mut observed,
+        &state,
+        healthy,
+        1_000,
+        Some(Progress {
+            slot: index as u16,
+            epoch: state.topology.slots[index].epoch,
+            sequence: 0,
+            baseline: true,
+            serving_primary: true,
+            frozen: None,
+        }),
+    );
+    report(&mut observed, &state, target, 1_000, None);
+    assert!(state.reconcile(1_000, observed.plan(&state, bounds(1_000))));
+    let repair = state.topology.slots[index].moving.unwrap();
+    assert!(repair.replica_only);
+    assert_eq!(repair.target, target);
+}
+
+#[test]
+fn k03_replaces_a_retired_replica_before_resuming_same_zone_rebalance() {
+    let mut state = fixture();
+    let original = state.topology.slots[0];
+    let primary = original.primary.unwrap();
+    let retired = original.replica.unwrap();
+    let target = make_member(4, 1).id;
+    state.topology.workers.get_mut(&target.node).unwrap().zone =
+        state.topology.member(primary).unwrap().zone.clone();
+    assert!(matches!(
+        admin(
+            &mut state,
+            9,
+            Admin::Rebalance {
+                first: 0,
+                last: 0,
+                target: target.node
+            },
+            0
+        ),
+        Reply::Applied { .. }
+    ));
+    let mut observed = Observations::default();
+    let baseline = Progress {
+        slot: 0,
+        epoch: original.epoch,
+        sequence: 2,
+        baseline: true,
+        serving_primary: true,
+        frozen: None,
+    };
+    report(&mut observed, &state, primary, 1_000, Some(baseline));
+    report(&mut observed, &state, retired, 1_000, Some(baseline));
+    report(&mut observed, &state, target, 1_000, None);
+    assert!(state.reconcile(1_000, observed.plan(&state, bounds(1_000))));
+    assert_eq!(state.topology.slots[0].moving.unwrap().target, target);
+
+    let restarted = make_member(retired.node, 2);
+    assert!(matches!(
+        state.apply(
+            Command::Enroll {
+                member: restarted.clone(),
+                certificate: [retired.node as u8; 32],
+            },
+            true,
+        ),
+        Some(Reply::Applied { .. })
+    ));
+    report(&mut observed, &state, restarted.id, 1_010, None);
+    report(&mut observed, &state, target, 1_010, Some(baseline));
+    assert!(state.reconcile(1_010, observed.plan(&state, bounds(1_010))));
+    assert!(state.topology.slots[0].moving.is_none());
+    assert_eq!(state.topology.slots[0].primary, Some(primary));
+
+    assert!(state.reconcile(1_020, observed.plan(&state, bounds(1_020))));
+    let repair = state.topology.slots[0].moving.unwrap();
+    assert!(repair.replica_only);
+    assert_eq!(repair.target, restarted.id);
+    report(&mut observed, &state, restarted.id, 1_030, Some(baseline));
+    assert!(state.reconcile(1_030, observed.plan(&state, bounds(1_030))));
+    assert_eq!(state.topology.slots[0].replica, Some(restarted.id));
+
+    assert!(state.reconcile(1_040, observed.plan(&state, bounds(1_040))));
+    let move_again = state.topology.slots[0].moving.unwrap();
+    assert!(!move_again.replica_only);
+    assert_eq!(move_again.target, target);
+}
+
+#[test]
 fn k03_drain_keeps_current_replica_until_verified_replacement() {
     let mut state = fixture();
     let slot = state.topology.slots[0];
@@ -555,6 +730,186 @@ fn k03_stalled_move_resumes_source_under_a_new_epoch_only_after_fence() {
     assert!(resumed.moving.is_none());
 }
 
+#[test]
+fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
+    use super::placement::{Change, MAX_CUTOVER_LAG};
+
+    let mut state = fixture();
+    let source = state.topology.slots[0].primary.unwrap();
+    state.topology.slots[0].replica = None;
+    let target = make_member(4, 1).id;
+    let report_source = Progress {
+        slot: 0,
+        epoch: 1,
+        sequence: 100,
+        baseline: true,
+        serving_primary: true,
+        frozen: None,
+    };
+    let mut observations = Observations::default();
+    renew(&mut state, source, 4_000);
+    report(
+        &mut observations,
+        &state,
+        source,
+        1_000,
+        Some(report_source),
+    );
+    report(&mut observations, &state, target, 1_000, None);
+    let before_staging_revision = state.topology.revision;
+    let changes = observations.plan(&state, bounds(1_000));
+    assert!(state.reconcile(1_000, changes));
+    let staged = state.topology.slots[0];
+    assert_eq!(staged.moving.unwrap().target, target);
+
+    // Commit a higher source watermark while staging, then take over with
+    // a fresh observation cache and just the state machine's saved state.
+    state.apply(
+        Command::Renew {
+            generation: state.topology.generation,
+            revision: state.topology.revision,
+            worker: source,
+            expires_ms: 5_000,
+            staged_progress: vec![Progress {
+                sequence: 120,
+                ..report_source
+            }],
+        },
+        false,
+    );
+    let mut state: State = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    let mut observations = Observations::default();
+    let copy = Progress {
+        sequence: 120 - MAX_CUTOVER_LAG,
+        serving_primary: false,
+        ..report_source
+    };
+    // A delayed report can describe a copy that was discarded before this
+    // transfer was installed, even if the source and slot epoch are unchanged.
+    observations.record(
+        &state.topology,
+        Heartbeat {
+            worker: target,
+            version: VERSION,
+            generation: state.topology.generation,
+            revision: before_staging_revision,
+            progress: vec![copy],
+        },
+        4_999,
+    );
+    let changes = observations.plan(&state, bounds(5_000));
+    assert!(!state.reconcile(5_000, changes));
+
+    report(&mut observations, &state, target, 4_999, Some(copy));
+    let changes = observations.plan(&state, bounds(4_999));
+    assert!(!state.reconcile(4_999, changes));
+    let changes = observations.plan(&state, bounds(5_000));
+    let promotion = changes
+        .into_iter()
+        .find(|change| {
+            matches!(
+                change,
+                Change::Slot {
+                    index: 0,
+                    staged: Some(_),
+                    ..
+                }
+            )
+        })
+        .expect("eligible staged promotion");
+
+    let mut bad = promotion.clone();
+    if let Change::Slot {
+        staged: Some(ref mut proof),
+        ..
+    } = bad
+    {
+        proof.retained_sequence += 1;
+    }
+    assert!(!state.reconcile(5_000, vec![bad]));
+    let mut stale_proof = promotion.clone();
+    if let Change::Slot {
+        staged: Some(ref mut proof),
+        ..
+    } = stale_proof
+    {
+        proof.target_revision = before_staging_revision;
+    }
+    assert!(!state.reconcile(5_000, vec![stale_proof]));
+    assert!(!state.reconcile(4_999, vec![promotion.clone()]));
+
+    // The prior deadline has passed, but a new leader needs time to hear
+    // from the still-verified target before it can discard this epoch.
+    let mut new_leader = Observations::default();
+    new_leader.reset_if_changed(2, state.topology.generation, bounds(8_000));
+    report(&mut new_leader, &state, make_member(3, 1).id, 8_001, None);
+    let changes = new_leader.plan(&state, bounds(8_001));
+    assert!(!state.clone().reconcile(8_001, changes));
+    report(&mut new_leader, &state, target, 8_002, Some(copy));
+    let changes = new_leader.plan(&state, bounds(8_002));
+    let mut recovered = state.clone();
+    assert!(recovered.reconcile(8_002, changes));
+    assert_eq!(recovered.topology.slots[0].primary, Some(target));
+    assert!(!recovered.topology.slots[0].cold);
+
+    let mut no_copy = state.clone();
+    let mut new_leader = Observations::default();
+    new_leader.reset_if_changed(2, state.topology.generation, bounds(8_000));
+    report(&mut new_leader, &state, make_member(3, 1).id, 10_999, None);
+    let changes = new_leader.plan(&no_copy, bounds(10_999));
+    assert!(!no_copy.reconcile(10_999, changes));
+    let changes = new_leader.plan(&no_copy, bounds(11_000));
+    assert!(no_copy.reconcile(11_000, changes));
+    assert!(no_copy.topology.slots[0].cold);
+
+    let mut lagged = state.clone();
+    let mut late = Observations::default();
+    report(
+        &mut late,
+        &lagged,
+        target,
+        7_999,
+        Some(Progress {
+            sequence: copy.sequence - 1,
+            ..copy
+        }),
+    );
+    let changes = late.plan(&lagged, bounds(7_999));
+    assert!(!lagged.reconcile(7_999, changes));
+    let changes = late.plan(&lagged, bounds(8_000));
+    assert!(lagged.reconcile(8_000, changes));
+    let reset = lagged.topology.slots[0];
+    assert!(reset.cold);
+    assert_eq!(reset.epoch, 2);
+    assert!(reset.lease.is_none());
+    assert!(reset.moving.is_none());
+
+    // A retirement can commit before expiry. It cannot give the target
+    // writable authority before the last grant's deadline.
+    let mut retired = state.clone();
+    assert!(matches!(
+        retired.apply(
+            Command::Enroll {
+                member: make_member(source.node, 2),
+                certificate: [source.node as u8; 32],
+            },
+            true
+        ),
+        Some(Reply::Applied { .. })
+    ));
+    let mut observations = Observations::default();
+    report(&mut observations, &retired, target, 4_000, Some(copy));
+    let changes = observations.plan(&retired, bounds(4_000));
+    assert!(retired.reconcile(4_000, changes));
+    let next = retired.topology.slots[0];
+    assert_eq!(next.primary, Some(target));
+    assert_eq!(next.epoch, 2);
+    assert_eq!(next.lease.unwrap().not_before_ms, 5_000);
+
+    assert!(state.reconcile(5_000, vec![promotion]));
+    assert_eq!(state.topology.slots[0], next);
+}
+
 /// The existing controller fixture and placement decisions, without the Raft transport.
 #[cfg(feature = "sim")]
 pub(in crate::cache::cluster) struct LeaseControllerFixture {
@@ -584,6 +939,7 @@ impl LeaseControllerFixture {
                 // The fixture asks for the complete topology as well as its grants.
                 revision: 0,
                 worker,
+                staged_progress: Vec::new(),
                 expires_ms: now.lower_ms.checked_add(LEASE_MS).unwrap(),
             },
             true,

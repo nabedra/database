@@ -1,0 +1,17 @@
+id = "CACHE-sim-fleet-reset-renewal"
+title = "The Cache simulation requested a fleet reset before scoped repair grants were fenced"
+class = "fence-lifecycle-order"
+module = "cache"
+guarantees = ["CACHE-G06", "CACHE-G09"]
+scenarios = ["K03"]
+found_by = "campaign"
+found_date = "2026-11-24"
+lowest_regression = "server/src/cache/cluster/sim/tests.rs::seed_sweep"
+seed = 55
+trace_hash = "ef1ff42f496eac93"
+additional_seeds = [212]
+additional_trace_hashes = ["209481597129e9d2"]
+why_not_caught = "Before scoped recovery, freshly enrolled workers could not receive grants while their slots still named retired incarnations. With staged recovery, the fixture could request a fleet reset after some new grants."
+invariant_added = "The fixture quiesces returning workers on a live-lease refusal, waits for their grants to expire, and then checks the explicit fleet reset and empty contents."
+fix_commits = ["a91b01b7f1cfaeb91051f2b6e6eb8a0daa887185"]
+revert_patch_ok = true

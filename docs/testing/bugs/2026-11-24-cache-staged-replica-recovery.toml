@@ -1,0 +1,15 @@
+id = "CACHE-staged-replica-recovery"
+title = "A fenced Cache source left its verified replacement in staging indefinitely"
+class = "fence-lifecycle-order"
+module = "cache"
+guarantees = ["CACHE-G05", "CACHE-G06", "CACHE-G09"]
+scenarios = ["K03"]
+found_by = "campaign"
+found_date = "2026-11-24"
+lowest_regression = "server/src/cache/cluster/sim/tests.rs::nightly_regressions"
+seed = 4528675707300134
+trace_hash = "2996839bd3f018b1"
+why_not_caught = "The normal failover path considered only assigned replicas. This fault schedule retired the source while the only complete copy was still staged, leaving 30 slots without authority."
+invariant_added = "After fencing, a verified current-epoch staged target within the cutover lag can take over with a committed retained-prefix proof. Otherwise the unavailable slot takes a bounded, explicit cold reset. The regression compares the full replay trace."
+fix_commits = ["0e31c026e683903589eb6127f7828aadcd831704"]
+revert_patch_ok = true

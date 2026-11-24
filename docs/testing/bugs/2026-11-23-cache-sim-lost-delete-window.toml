@@ -1,0 +1,14 @@
+id = "CACHE-sim-lost-delete-window"
+title = "The Cache history checker rejected deletion loss within the replication lag window"
+class = "other"
+module = "cache"
+guarantees = ["CACHE-G05"]
+scenarios = ["K03"]
+found_by = "campaign"
+found_date = "2026-11-23"
+lowest_regression = "server/check/tests/history_cache_sim.rs::cache_sim_allows_lost_delete_inside_lag_window"
+seed = 4524674007700389
+why_not_caught = "The history checker applied the asynchronous loss rule to acknowledged writes and treated every acknowledged DEL as permanent. The ordinary sweep did not promote a replica missing such a DEL."
+invariant_added = "Use the same loss window for SET and DEL. A past value cannot reappear after the promoted prefix includes its deletion or a read on a later primary has already confirmed absence."
+fix_commits = ["9401607beda441ab54aa6b80aaaff4ffd3e97b52"]
+revert_patch_ok = true
