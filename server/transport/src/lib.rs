@@ -169,6 +169,12 @@ impl AuthenticatedSession {
             recovery_only: false,
         }
     }
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn recovery_only_for_test(mut self) -> Self {
+        self.recovery_only = true;
+        self
+    }
     #[inline]
     pub fn local(&self) -> WorkerIdentity {
         self.local
