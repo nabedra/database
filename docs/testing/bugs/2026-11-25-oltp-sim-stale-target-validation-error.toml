@@ -1,0 +1,17 @@
+id = "OLTP-sim-stale-target-validation-error"
+title = "A retry of a committed request is answered validation_error because its gateway holds a restarted worker's old identity"
+class = "stale-route-topology-schema"
+module = "oltp"
+guarantees = ["OLTP-G04"]
+scenarios = ["O15"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 415
+why_not_caught = "Runners read through a gateway only after it has refreshed its directory."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, seeds 208 and 415 (cold), 395 (move) and 696 (direct), DedupUnique: the retry of a committed request returns its result. The answer is target incarnation differs from cached enrollment."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

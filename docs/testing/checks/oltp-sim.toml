@@ -6,9 +6,10 @@ guarantees = ["OLTP-G02", "OLTP-G03"]
 scenarios = []
 tiers = ["T1"]
 # Shard 1 of 4. Build once, then allow the measured sweep at most 15 minutes.
-# It also runs two harness regressions: simulated stats omit process-wide stage
-# timings (seed 2 replayed differently in a fresh process), and sampled reply
-# arenas hold the largest Data apply budget (seed 22 never bound worker HTTP).
+# It also runs the harness regressions: simulated stats omit process-wide stage
+# timings (seed 2 replayed differently in a fresh process), sampled reply arenas
+# hold the largest Data apply budget (seed 22 never bound worker HTTP), and every
+# peer has a session slot (seed 66 never reached the direct path through n102).
 command = ["bash", "-euc", '''
 cargo test --locked -j 2 --release -p nabedra-database --no-default-features \
     --features oltp,sim --lib oltp_runtime::stage_timing::sim_tests:: -- --test-threads=1
@@ -16,10 +17,12 @@ build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
 exec timeout 900s "${build[@]}" -- --exact --nocapture --test-threads=1 \
     config::tests::sampled_reply_arena_fits_the_largest_apply_budget \
+    config::tests::every_peer_has_a_session_slot \
+    workload::tests::smoke_seed_66_reaches_the_direct_path_through_both_gateways \
     sweep::tests::sweep workload::tests::cold_start_reopens_mounted_workers
 ''']
 cwd = "server"
 timeout_s = 3600
 needs = []
 result_parser = "cargo-test"
-env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "smoke", NABEDRA_SEEDS = "50", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SEED = "1", NABEDRA_SIM_TEST_DEFECTS = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim", NABEDRA_SIM_GUARANTEES = "OLTP-G02,OLTP-G03", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim" }
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "smoke", NABEDRA_SEEDS = "100", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SEED = "1", NABEDRA_SIM_TEST_DEFECTS = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim", NABEDRA_SIM_GUARANTEES = "OLTP-G02,OLTP-G03", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim" }

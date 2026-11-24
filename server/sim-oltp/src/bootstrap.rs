@@ -19,6 +19,21 @@ pub(crate) const GATEWAYS: [u64; 2] = [101, 102];
 pub(crate) const BOOTSTRAP_CLIENT: u64 = 1001;
 pub(crate) const CLIENTS: [u64; 2] = [1002, 1003];
 pub(crate) const DATABASE: &str = "test";
+
+/// The Data group the registered planner derives for a new table's first range, as
+/// `initial_range` in `tests/oltp_recovery_operations.py` computes it.
+pub(crate) fn initial_range(cluster_id: Uuid, table: Uuid) -> Value {
+    let derive = |data: &[u8]| {
+        let digest = ring::digest::digest(&ring::digest::SHA256, data);
+        Uuid::from_slice(&digest.as_ref()[..16]).expect("16 bytes")
+    };
+    let shard = derive(&[table.as_bytes().as_slice(), b"initial-shard"].concat());
+    let group = derive(&[shard.as_bytes().as_slice(), b"data-group"].concat());
+    json!({
+        "cluster_id": cluster_id, "database": DATABASE, "group_id": group,
+        "kind": {"data": {"table_id": table, "shard_id": shard}}, "group_format_version": 1,
+    })
+}
 pub(crate) const ROOT: &str = "/sim-oltp";
 pub(crate) const CONFIG: &str = "/sim-oltp/bootstrap.json";
 const AUTH: &str = "/sim-oltp/auth.json";
@@ -302,6 +317,150 @@ impl Bootstrap {
         )
     }
 
+    /// The current mounted identity of worker `index` (its `mount.worker` field).
+    pub fn worker_identity(&self, index: usize) -> Value {
+        self.worker_configs[index]["node"]["mount"]["worker"].clone()
+    }
+
+    /// A Docker-profile mount record for a secondary pool on worker `index` at `path`,
+    /// as `mount_pool` in `tests/oltp_direct_cluster.py` builds it. Writes the volume
+    /// marker on the calling node's volume.
+    pub fn secondary_pool(&self, index: usize, path: &str, pool_id: Uuid) -> io::Result<Value> {
+        let node = WORKERS[index];
+        let volume = format!("sim-oltp-{node}{}", path.replace('/', "-"));
+        let marker = pool_id;
+        let file = format!("{path}/.nabedra-docker-volume.json");
+        let mut out = os::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&file)?;
+        out.write_all(&serde_json::to_vec(&json!({
+            "format_version": 1, "volume_name": volume, "volume_marker": marker,
+        }))?)?;
+        out.sync_all()?;
+        os::sync_dir(Path::new(path))?;
+        let worker = &self.worker_configs[index]["node"]["mount"]["worker"];
+        Ok(json!({
+            "profile": {"docker": {"volume_marker": marker}},
+            "worker": worker,
+            "generation": 1,
+            "identity": {
+                "engine": "oltp", "pool_format_version": POOL_FORMAT_VERSION,
+                "cluster_id": self.cluster_id, "worker_id": worker["worker_id"], "pool_id": pool_id,
+            },
+            "mount_path": path,
+            "provider_volume_id": format!("docker-volume:{volume}"),
+            "filesystem_uuid": "",
+        }))
+    }
+
+    /// List a mounted secondary pool in the worker's bootstrap file. A restarted worker opens
+    /// only the pools its bootstrap lists, so a restart without this entry can never host the
+    /// replicas that live there.
+    pub fn list_secondary_pool(&mut self, index: usize, mount: &Value, claim: Uuid) {
+        let pools = &mut self.worker_configs[index]["node"]["secondary_pools"];
+        if pools.is_null() {
+            *pools = json!([]);
+        }
+        let pool = json!({"mount": mount, "growth_claim": claim});
+        pools.as_array_mut().expect("pool list").push(pool);
+    }
+
+    /// Move a node's secondary pool mounts to the worker identity of its next process.
+    fn advance_secondary(node: &mut Value, worker: &Value) {
+        let pools = node
+            .get_mut("secondary_pools")
+            .and_then(Value::as_array_mut);
+        for pool in pools.into_iter().flatten() {
+            let mount = &mut pool["mount"];
+            let generation = mount["generation"].as_u64().unwrap();
+            mount["worker"] = worker.clone();
+            mount["generation"] = json!(generation + 1);
+        }
+    }
+
+    /// The TLS material of one process.
+    pub fn tls(&self, node: u64) -> io::Result<TlsMaterial> {
+        let (cert, key) = material(node);
+        TlsMaterial::from_pem(cert, key, certificate_authority())
+    }
+
+    /// The worker no longer opens this secondary pool.
+    pub fn unlist_secondary_pool(&mut self, index: usize, pool: &Value) {
+        let node = &mut self.worker_configs[index]["node"];
+        if let Some(pools) = node
+            .get_mut("secondary_pools")
+            .and_then(Value::as_array_mut)
+        {
+            pools.retain(|entry| entry["mount"]["identity"]["pool_id"] != *pool);
+        }
+    }
+
+    /// The primary pool in worker `index`'s bootstrap file.
+    pub fn pool(&self, index: usize) -> Value {
+        self.worker_configs[index]["node"]["pool_id"].clone()
+    }
+
+    /// Make worker `index`'s bootstrap file claim another primary pool on the same mount.
+    pub fn claim_pool(&mut self, index: usize, pool: &Value) {
+        let node = &mut self.worker_configs[index]["node"];
+        node["pool_id"] = pool.clone();
+        node["mount"]["identity"]["pool_id"] = pool.clone();
+    }
+
+    /// The enrollment the worker's bootstrap file presents.
+    pub fn worker_enrollment(&self, index: usize) -> &Value {
+        &self.worker_configs[index]["node"]["enrollment"]
+    }
+
+    /// A retained same-run restart of one worker, as `retained_config` in
+    /// `tests/oltp_recovery_operations.py` prepares it: a fresh incarnation and
+    /// enrollment revision on the same certificate, pool and mounted volume.
+    /// Returns the plan id, the `worker.restart.prepare` payload and the next enrollment.
+    pub fn rolling_plan(&self, index: usize) -> (Uuid, Value, Value) {
+        let node = &self.worker_configs[index]["node"];
+        let previous = &node["enrollment"];
+        let mut next = previous.clone();
+        next["incarnation"] = json!(uuid_v4());
+        next["enrollment_revision"] = json!(previous["enrollment_revision"].as_u64().unwrap() + 1);
+        let id = uuid_v4();
+        let plan = json!({
+            "id": id,
+            "run_id": self.run_id,
+            "previous": Self::identity(previous),
+            "next": next,
+            "pool_id": node["pool_id"],
+            "mount_generation": node["mount"]["generation"].as_u64().unwrap() + 1,
+        });
+        (id, plan, next)
+    }
+
+    /// Record a prepared retained restart in the worker's next bootstrap file.
+    pub fn apply_rolling(
+        &mut self,
+        index: usize,
+        plan: Uuid,
+        next: Value,
+        identity: Value,
+        control_peers: &Value,
+    ) {
+        let run_id = self.run_id;
+        let node = &mut self.worker_configs[index]["node"];
+        node["enrollment"] = next;
+        node["control_enrollments"] = control_peers.clone();
+        node["rolling"] = json!({"preparation_id": plan, "run_id": run_id});
+        if let Some(fields) = node.as_object_mut() {
+            fields.remove("cold");
+        }
+        Self::advance_secondary(node, &identity);
+        let mount = &mut node["mount"];
+        let generation = mount["generation"].as_u64().unwrap();
+        mount["worker"] = identity;
+        mount["generation"] = json!(generation + 1);
+    }
+
     /// Update the original topology through the same explicit cold-start profile as RF3.
     /// The durable volumes and peer certificate pins stay in place.
     pub fn prepare_cold_start(&mut self) {
@@ -318,11 +477,15 @@ impl Bootstrap {
             enrollment["enrollment_revision"] = json!(revision + 1);
             enrollment["incarnation"] = json!(uuid_v4());
             let worker = Self::identity(enrollment);
+            Self::advance_secondary(node, &worker);
             let mount = &mut node["mount"];
             let generation = mount["generation"].as_u64().unwrap();
             mount["worker"] = worker;
             mount["generation"] = json!(generation + 1);
             node["cold"] = profile.clone();
+            if let Some(fields) = node.as_object_mut() {
+                fields.remove("rolling");
+            }
         }
         let (peers, pins) = Self::peer_inventory(
             self.worker_configs

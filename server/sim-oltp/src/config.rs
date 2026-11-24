@@ -27,6 +27,11 @@ const CLOCKS: &[(u64, &str, &str)] = &[
 /// `oltp-replication`'s `hosted.rs`.
 const MIN_APPLY_REPLY_BYTES: i64 = 128 << 10;
 
+/// Session slots count per traffic class, and every worker and gateway holds a session on the
+/// Control leader's. The product fixes 256. With fewer slots than peers the last one is refused
+/// for good: smoke seeds 66, 209 and 454 sampled 4, and n102 never activated the direct path.
+const MIN_SESSION_SLOTS: u64 = (WORKERS.len() + GATEWAYS.len()) as u64;
+
 pub(crate) struct Config {
     knobs: BTreeMap<String, Value>,
 }
@@ -50,7 +55,19 @@ impl Config {
         let mut generator = Gen::from_seed(stream_seed(seed, "oltp-config"));
         let mut knobs = sample(&mut generator, &knobs);
         knobs.insert("direct_oltp".into(), json!(true));
+        // Raised after sampling, so every other seed keeps its configuration.
+        let slots = knobs["transport.session_slots"].as_u64().unwrap();
+        knobs.insert(
+            "transport.session_slots".into(),
+            json!(slots.max(MIN_SESSION_SLOTS)),
+        );
         Self { knobs }
+    }
+
+    /// Override one sampled knob, as a seed-search focus token asks (`batch`).
+    pub fn force(&mut self, knob: &str, value: Value) {
+        assert!(self.knobs.contains_key(knob), "unknown knob {knob}");
+        self.knobs.insert(knob.into(), value);
     }
 
     pub fn deadline(&self) -> Duration {
@@ -109,6 +126,17 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seed 66 sampled four slots for five peers.
+    #[test]
+    fn every_peer_has_a_session_slot() {
+        let slots = |seed| {
+            let config = Config::sample(seed);
+            config.knobs["transport.session_slots"].as_u64().unwrap()
+        };
+        assert_eq!(slots(66), 5);
+        assert!((1..=2_000).all(|seed| slots(seed) >= MIN_SESSION_SLOTS));
+    }
 
     /// Seed 22 sampled a 124,761-byte arena and no worker ever bound HTTP.
     #[test]
