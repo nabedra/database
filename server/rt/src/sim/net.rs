@@ -146,6 +146,8 @@ pub struct Envelope<'a> {
     /// The message's position in its direction, from 0, counting handshake messages.
     pub seq: u64,
     pub kind: Kind,
+    /// Negotiated ALPN for data messages, if the connection used a handshake.
+    pub alpn: Option<&'a [u8]>,
     pub bytes: &'a [u8],
 }
 
@@ -154,6 +156,9 @@ pub struct Envelope<'a> {
 pub enum Fate {
     /// Delivered after `delay` of virtual time, and never before an earlier message.
     Deliver { delay: Duration },
+    /// Deliver a complete transport frame, preserving order within this stream.
+    /// The planner must use this only at established, whole-frame boundaries.
+    Frame { stream: u64, delay: Duration },
     /// Lost; its direction stalls until the connection is reset.
     Drop,
     /// The connection is reset instead; the sender's flush fails.
@@ -207,6 +212,7 @@ enum Body {
 #[derive(Debug)]
 struct Message {
     ready_at: Instant,
+    stream: Option<u64>,
     body: Body,
     /// Bytes of a `Data` body already read.
     read: usize,
@@ -219,7 +225,6 @@ struct Pipe {
     /// A message was dropped: later ones vanish.
     stalled: bool,
     sent: u64,
-    last_ready: Option<Instant>,
     reader: Option<Waker>,
 }
 
@@ -233,6 +238,48 @@ enum Fin {
 }
 
 impl Pipe {
+    fn push(&mut self, body: Body, stream: Option<u64>, delay: Duration) {
+        let deadline = Instant::now() + delay;
+        let (index, ready_at) = match stream {
+            None => {
+                let ready_at = self
+                    .queue
+                    .back()
+                    .map_or(deadline, |last| deadline.max(last.ready_at));
+                (self.queue.len(), ready_at)
+            }
+            Some(stream) => {
+                // Unframed messages, a partial read, and the same stream are
+                // barriers. The queue is sorted by delivery time, FIFO on ties.
+                let ready_at = self
+                    .queue
+                    .iter()
+                    .rfind(|message| {
+                        message.read != 0
+                            || message.stream.is_none()
+                            || message.stream == Some(stream)
+                    })
+                    .map_or(deadline, |last| deadline.max(last.ready_at));
+                let index = self
+                    .queue
+                    .partition_point(|message| message.ready_at <= ready_at);
+                (index, ready_at)
+            }
+        };
+        self.queue.insert(
+            index,
+            Message {
+                ready_at,
+                stream,
+                body,
+                read: 0,
+            },
+        );
+        if let Some(waker) = self.reader.take() {
+            waker.wake();
+        }
+    }
+
     fn finish(&mut self) {
         if matches!(self.fin, Fin::Open) {
             self.fin = Fin::Sent(Instant::now());
@@ -284,6 +331,7 @@ struct Connection {
     /// Whether each side's handle (pending or stream) is alive.
     open: [bool; 2],
     reset: bool,
+    alpn: Option<Vec<u8>>,
 }
 
 impl Connection {
@@ -751,6 +799,7 @@ async fn dial_one(net: &Arc<Net>, from: Option<u64>, addr: SocketAddr) -> io::Re
                         pipes: [Pipe::default(), Pipe::default()],
                         open: [true, true],
                         reset: false,
+                        alpn: None,
                     },
                 );
                 let slot = state.listeners.get_mut(&addr).unwrap();
@@ -988,6 +1037,9 @@ impl Half {
             to: conn.ends[self.side.rx()].node,
             seq: pipe.sent,
             kind,
+            alpn: (kind == Kind::Data)
+                .then_some(conn.alpn.as_deref())
+                .flatten(),
             bytes,
         };
         let fate = state
@@ -996,21 +1048,17 @@ impl Half {
             .map_or(Fate::NOW, |planner| planner.message(&envelope));
         pipe.sent += 1;
         match fate {
-            Fate::Deliver { .. } if pipe.stalled => Ok(()),
+            Fate::Deliver { .. } | Fate::Frame { .. } if pipe.stalled => Ok(()),
             Fate::Deliver { delay } => {
-                let now = Instant::now();
-                let ready_at = pipe
-                    .last_ready
-                    .map_or(now + delay, |last| last.max(now + delay));
-                pipe.last_ready = Some(ready_at);
-                pipe.queue.push_back(Message {
-                    ready_at,
-                    body,
-                    read: 0,
-                });
-                if let Some(waker) = pipe.reader.take() {
-                    waker.wake();
+                if let Body::ServerHello { alpn, .. } = &body {
+                    conn.alpn.clone_from(alpn);
                 }
+                pipe.push(body, None, delay);
+                Ok(())
+            }
+            Fate::Frame { stream, delay } => {
+                debug_assert!(kind == Kind::Data && conn.alpn.is_some());
+                pipe.push(body, Some(stream), delay);
                 Ok(())
             }
             Fate::Drop => {

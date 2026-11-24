@@ -5,7 +5,8 @@ Development: --scenario O07. Shared Cargo lane: --cargo test ...
 Scenario tests end in acceptance_oNN. Existing regression tests remain intact.
 With --test-binary, set NABEDRA_RESOURCES_TEST_EXE to the prebuilt resources
 test executable when running O13 or O22 and NABEDRA_TRANSPORT_TEST_EXE to
-the prebuilt transport executable when running O05.
+the prebuilt transport executable when running O05. Set NABEDRA_OLTP_STORAGE_TEST_EXE
+to the storage test executable for O02–O05, O13, O20 and O22–O24.
 """
 import argparse
 from contextlib import contextmanager
@@ -28,6 +29,7 @@ MARKER = "NABEDRA_OLTP_ACCEPTANCE "
 ASSERTION_MARKER = "NABEDRA_OLTP_ASSERT "
 RESOURCES_TEST_EXE = "NABEDRA_RESOURCES_TEST_EXE"
 TRANSPORT_TEST_EXE = "NABEDRA_TRANSPORT_TEST_EXE"
+STORAGE_TEST_EXE = "NABEDRA_OLTP_STORAGE_TEST_EXE"
 # Clause IDs follow the Required assertions column of docs/testing/oltp-contract.md.
 # Each ID covers the complete named observation, including its required variations.
 CLAUSES = {
@@ -173,10 +175,12 @@ def environment(target):
 def source_identity():
     digest = hashlib.sha256()
     paths = [ROOT / "server/Cargo.toml", ROOT / "server/Cargo.lock",
-             ROOT / "server/resources/Cargo.toml", ROOT / "server/transport/Cargo.toml", Path(__file__)]
+             ROOT / "server/resources/Cargo.toml", ROOT / "server/transport/Cargo.toml",
+             ROOT / "server/oltp-storage/Cargo.toml", Path(__file__)]
     paths += sorted((ROOT / "server/src").rglob("*.rs"))
     paths += sorted((ROOT / "server/resources/src").rglob("*.rs"))
     paths += sorted((ROOT / "server/transport/src").rglob("*.rs"))
+    paths += sorted((ROOT / "server/oltp-storage/src").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.py"))
     paths += sorted((ROOT / "server/tests").rglob("*.c"))
@@ -225,6 +229,8 @@ def build_tests(env, output, *, package=None):
 
 def native_assertion_targets(executables, cases):
     """Find exactly one libtest target per selector across the fixture binaries."""
+    if storage := os.environ.get(STORAGE_TEST_EXE):
+        executables = [*executables, storage]
     names = {}
     for executable in executables:
         listed = subprocess.check_output([executable, "--list"], text=True, timeout=15)
@@ -354,7 +360,13 @@ def main():
             fixtures = (
                 ("resources", RESOURCES_TEST_EXE, {"O13", "O22"}),
                 ("transport", TRANSPORT_TEST_EXE, {"O05"}),
+                ("oltp-storage", STORAGE_TEST_EXE,
+                 {"O02", "O03", "O04", "O05", "O13", "O20", "O22", "O23", "O24"}),
             )
+            binary = Path(temp) / "acceptance-tests"
+            shutil.copy2(built, binary)
+            report["test_binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+            scenario_binaries = [binary]
             for crate, variable, scenarios in fixtures:
                 fixture = env.get(variable)
                 if not fixture and not args.test_binary and any(s.id in scenarios for s in selected):
@@ -363,23 +375,26 @@ def main():
                     fixture_copy = Path(temp) / f"nabedra-{crate}-tests"
                     shutil.copy2(fixture, fixture_copy)
                     env[variable] = str(fixture_copy)
-                    report[f"{crate}_test_binary_sha256"] = hashlib.sha256(fixture_copy.read_bytes()).hexdigest()
-            binary = Path(temp) / "acceptance-tests"
-            shutil.copy2(built, binary)
-            report["test_binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+                    report[f"{crate.replace('-', '_')}_test_binary_sha256"] = hashlib.sha256(fixture_copy.read_bytes()).hexdigest()
+                    scenario_binaries.append(fixture_copy)
             if args.server_binary or server:
                 server_copy = Path(temp) / "nabedra-db"
                 shutil.copy2(args.server_binary or server, server_copy)
                 env["NABEDRA_OLTP_BINARY"] = str(server_copy)
                 report["server_binary_sha256"] = hashlib.sha256(server_copy.read_bytes()).hexdigest()
-            listed = subprocess.check_output([str(binary), "--list"], cwd=ROOT, env=env, text=True)
-            names = [line[:-6] for line in listed.splitlines() if line.endswith(": test")]
+            tests = []
+            for executable in scenario_binaries:
+                listed = subprocess.check_output([str(executable), "--list"], cwd=ROOT, env=env, text=True)
+                tests.extend((executable, line.removesuffix(": test"))
+                             for line in listed.splitlines() if line.endswith(": test"))
             for s in SCENARIOS:
                 result = s.result()
                 if s in selected:
-                    matches = [name for name in names if name.rsplit("::", 1)[-1] == f"acceptance_o{s.number:02d}"]
+                    matches = [(executable, name) for executable, name in tests
+                               if name.rsplit("::", 1)[-1] == f"acceptance_o{s.number:02d}"]
                     if len(matches) == 1:
-                        result = run_scenario(binary, matches[0], s, env, args.output / f"{s.id}.log", args.timeout)
+                        executable, name = matches[0]
+                        result = run_scenario(executable, name, s, env, args.output / f"{s.id}.log", args.timeout)
                     else:
                         result = s.result("failed" if matches else "not-run", "duplicate scenario definitions" if matches else "production scenario assertions not integrated")
                     print_scenario(result)

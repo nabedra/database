@@ -1,5 +1,9 @@
 //! Shared bounded HTTP/TLS listener. Engine bootstrap and operation admission
 //! remain with their runtimes; transport budgets are identical for both engines.
+#[cfg(any(feature = "olap", all(test, feature = "oltp", feature = "sim")))]
+#[path = "storage/http/connector.rs"]
+pub(crate) mod connector;
+
 #[cfg(feature = "olap")]
 use crate::api::response;
 #[cfg(feature = "oltp")]
@@ -15,7 +19,47 @@ use std::{
     sync::{Arc, Mutex, Weak},
     task::Context,
 };
+#[cfg(any(test, not(all(feature = "oltp", feature = "sim"))))]
 use tokio::net::TcpListener;
+#[cfg(all(feature = "oltp", feature = "sim"))]
+pub(crate) use nabedra_rt::net::AnyListener as ApiListener;
+#[cfg(not(all(feature = "oltp", feature = "sim")))]
+pub(crate) type ApiListener = TcpListener;
+
+#[cfg(all(feature = "oltp", feature = "sim"))]
+type ApiStream = nabedra_rt::net::Established<tokio::net::TcpStream>;
+#[cfg(not(all(feature = "oltp", feature = "sim")))]
+type ApiStream = tokio::net::TcpStream;
+
+#[cfg(all(feature = "oltp", feature = "sim"))]
+#[derive(Clone)]
+struct ApiAddress(std::net::SocketAddr);
+
+#[cfg(all(feature = "oltp", feature = "sim"))]
+struct ApiIncoming(ApiListener);
+
+#[cfg(all(feature = "oltp", feature = "sim"))]
+impl axum_server::Address for ApiAddress {
+    type Stream = ApiStream;
+    type Listener = ApiIncoming;
+}
+
+#[cfg(all(feature = "oltp", feature = "sim"))]
+impl axum_server::AddrListener<ApiStream, ApiAddress> for ApiIncoming {
+    async fn bind_to(address: ApiAddress) -> io::Result<Self> {
+        nabedra_transport::backend::current().bind(address.0).await.map(Self)
+    }
+
+    async fn accept_stream(&self) -> io::Result<(ApiStream, ApiAddress)> {
+        let (conn, peer) = self.0.accept().await?;
+        Ok((conn.plain(), ApiAddress(peer)))
+    }
+
+    fn get_local_addr(&self) -> io::Result<ApiAddress> {
+        self.0.local_addr().map(ApiAddress)
+    }
+}
+
 #[cfg(feature = "olap")]
 use tokio::time::{Instant, Sleep};
 
@@ -416,9 +460,9 @@ struct BoundedAccept<A> {
     idle: Option<std::sync::Arc<IdleRegistry>>,
     header_read: std::time::Duration,
 }
-impl<A> axum_server::accept::Accept<tokio::net::TcpStream, axum::Router> for BoundedAccept<A>
+impl<A> axum_server::accept::Accept<ApiStream, axum::Router> for BoundedAccept<A>
 where
-    A: axum_server::accept::Accept<tokio::net::TcpStream, axum::Router> + Clone + Send + 'static,
+    A: axum_server::accept::Accept<ApiStream, axum::Router> + Clone + Send + 'static,
     A::Future: Send,
     A::Stream: Send + 'static,
     A::Service: Send + 'static,
@@ -427,10 +471,15 @@ where
     type Service = A::Service;
     type Future =
         std::pin::Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
-    fn accept(&self, stream: tokio::net::TcpStream, service: axum::Router) -> Self::Future {
+    fn accept(&self, stream: ApiStream, service: axum::Router) -> Self::Future {
         // A response is one write, but the TLS handshake flight and a reused
         // connection's next exchange must not wait on Nagle's algorithm.
+        #[cfg(not(all(feature = "oltp", feature = "sim")))]
         let _ = stream.set_nodelay(true);
+        #[cfg(all(feature = "oltp", feature = "sim"))]
+        if let ApiStream::Real(stream) = &stream {
+            let _ = stream.set_nodelay(true);
+        }
         let header = self.headers.clone().try_acquire_owned();
         let permit = self.total.clone().try_acquire_owned();
         // A full keep-alive listener first takes the slot of its oldest idle
@@ -520,7 +569,7 @@ impl hyper::body::Body for NetworkBody {
 }
 
 pub(crate) async fn serve_router(
-    listener: TcpListener,
+    listener: impl Into<ApiListener>,
     app: axum::Router,
     tls: Option<RustlsConfig>,
     shutdown: impl Future<Output = ()>,
@@ -537,7 +586,7 @@ pub(crate) async fn serve_router(
 /// or unauthenticated caller cannot hold an idle slot of the budget.
 #[cfg(feature = "oltp")]
 pub(crate) async fn serve_router_keep_alive(
-    listener: TcpListener,
+    listener: impl Into<ApiListener>,
     app: axum::Router,
     tls: Option<RustlsConfig>,
     shutdown: impl Future<Output = ()>,
@@ -546,7 +595,7 @@ pub(crate) async fn serve_router_keep_alive(
 }
 
 pub(crate) async fn serve_router_with_budget(
-    listener: TcpListener,
+    listener: impl Into<ApiListener>,
     app: axum::Router,
     tls: Option<RustlsConfig>,
     data_connections: usize,
@@ -556,7 +605,7 @@ pub(crate) async fn serve_router_with_budget(
 }
 
 async fn serve_bounded(
-    listener: TcpListener,
+    listener: impl Into<ApiListener>,
     app: axum::Router,
     tls: Option<RustlsConfig>,
     data_connections: usize,
@@ -689,8 +738,34 @@ async fn serve_bounded(
                 .map(|body| axum::body::Body::new(ResponseBody { body, phase }))
         },
     ));
+    #[cfg(all(feature = "oltp", feature = "sim"))]
+    let app = match nabedra_rt::sim::current_node() {
+        Some(node) => app.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                use axum::response::IntoResponse as _;
+                // axum-server spawns its connection task on Tokio. Run the
+                // request in a registered node task for freeze and crash.
+                // Dropping the service future also drops the set and aborts the request.
+                let mut task = nabedra_rt::task::JoinSet::new();
+                nabedra_rt::sim::in_node(node, async {
+                    nabedra_rt::task::spawn_in(&mut task, next.run(request));
+                })
+                .await;
+                match task.join_next().await.expect("one simulated API request") {
+                    Ok(response) => response,
+                    Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                    Err(_) => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                }
+            },
+        )),
+        None => app,
+    };
     let handle = Handle::new();
-    let mut server = axum_server::from_tcp(listener.into_std()?)?
+    #[cfg(not(all(feature = "oltp", feature = "sim")))]
+    let server = axum_server::from_tcp(listener.into().into_std()?)?;
+    #[cfg(all(feature = "oltp", feature = "sim"))]
+    let server = axum_server::Server::<ApiAddress>::from_listener(ApiIncoming(listener.into()));
+    let mut server = server
         .http1_only()
         .handle(handle.clone())
         .first_request_timeout(std::time::Duration::from_secs(5));
