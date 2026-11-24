@@ -5,10 +5,13 @@ from datetime import date, timedelta
 from io import StringIO
 from pathlib import Path
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 
-from scripts.testing import bugs, sim_bugs
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import bugs  # noqa: E402
+import sim_bugs  # noqa: E402
 
 
 class BugRecordsTest(unittest.TestCase):
