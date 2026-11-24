@@ -114,7 +114,18 @@ pub struct QueueCoordinator {
     peers: Arc<dyn ReplicaTransport>,
     progress: Mutex<BTreeMap<Uuid, Weak<AsyncMutex<()>>>>,
     copy_slots: Semaphore,
+    #[cfg(test)]
+    read_grant_hold: Mutex<Option<ReadGrantHold>>,
 }
+#[cfg(test)]
+type ReadGrantReached = (ReadGrant, tokio::sync::oneshot::Sender<()>);
+
+#[cfg(test)]
+struct ReadGrantHold {
+    request: Uuid,
+    reached: tokio::sync::oneshot::Sender<ReadGrantReached>,
+}
+
 impl QueueCoordinator {
     /// Collect survivor records before sealing the source inventory. Readiness
     /// requires a fresh statement from every surviving incarnation after repair.
@@ -323,6 +334,8 @@ impl QueueCoordinator {
                 peers,
                 progress: Mutex::new(BTreeMap::new()),
                 copy_slots: Semaphore::new(MAX_PARALLEL_QUEUE_COPIES),
+                #[cfg(test)]
+                read_grant_hold: Mutex::new(None),
             }
         })
     }
@@ -717,7 +730,33 @@ impl QueueCoordinator {
     }
 
     pub(crate) async fn open_read_grant(&self, grant: ReadGrant) -> Result<(), ProtocolError> {
-        self.change_read_grant(grant, true).await
+        self.change_read_grant(grant, true).await?;
+        #[cfg(test)]
+        {
+            let hold = {
+                let mut hold = self.read_grant_hold.lock().unwrap();
+                hold.take_if(|hold| hold.request == grant.scope.request.request_id)
+            };
+            if let Some(hold) = hold {
+                let (release, released) = tokio::sync::oneshot::channel();
+                if hold.reached.send((grant, release)).is_ok() {
+                    let _ = released.await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn hold_open_read_grant(
+        &self,
+        request: Uuid,
+    ) -> tokio::sync::oneshot::Receiver<ReadGrantReached> {
+        let (reached, receiver) = tokio::sync::oneshot::channel();
+        let mut slot = self.read_grant_hold.lock().unwrap();
+        assert!(slot.is_none());
+        *slot = Some(ReadGrantHold { request, reached });
+        receiver
     }
 
     pub(crate) async fn finish_read_grant(&self, grant: ReadGrant) -> Result<(), ProtocolError> {
