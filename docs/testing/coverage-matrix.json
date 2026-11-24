@@ -7,7 +7,7 @@
       "K03 simulated controller disk loss is `not-run` pending modelled Raft storage."
     ]
   },
-  "head": "297e7e91af810d85cf324607c77cd4edf061afb6",
+  "head": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -120,10 +120,18 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "cache-sim-nightly"
+          ],
+          "date": "2026-11-24T04:29:57.205160+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45326767893",
+          "sha": "48f05250632ac60d43c7ec0c19835f7e248513f4",
+          "state": "stale"
         },
         "U": {
           "executed": 0,
@@ -183,10 +191,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "cache-sim-nightly"
+          ],
+          "date": "2026-11-24T04:29:57.205160+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45326767893",
+          "sha": "48f05250632ac60d43c7ec0c19835f7e248513f4",
+          "state": "stale"
         },
         "U": {
           "executed": 0,
@@ -275,10 +291,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "cache-sim-nightly"
+          ],
+          "date": "2026-11-24T04:29:57.205160+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45326767893",
+          "sha": "48f05250632ac60d43c7ec0c19835f7e248513f4",
+          "state": "stale"
         },
         "K": {
           "reason": "A quiescent check after targeted failover tests convergence",
@@ -303,10 +327,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "cache-sim-nightly"
+          ],
+          "date": "2026-11-24T04:29:57.205160+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45326767893",
+          "sha": "48f05250632ac60d43c7ec0c19835f7e248513f4",
+          "state": "stale"
         },
         "U": {
           "reason": "Failover spans epochs and replicas",
@@ -335,10 +367,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "cache-sim-nightly"
+          ],
+          "date": "2026-11-24T04:29:57.205160+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45326767893",
+          "sha": "48f05250632ac60d43c7ec0c19835f7e248513f4",
+          "state": "stale"
         },
         "K": {
           "reason": "Directed pauses cross the lease boundary",
@@ -363,10 +403,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "cache-sim-nightly"
+          ],
+          "date": "2026-11-24T04:29:57.205160+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45326767893",
+          "sha": "48f05250632ac60d43c7ec0c19835f7e248513f4",
+          "state": "stale"
         },
         "U": {
           "reason": "Lease authority spans workers, clocks, and the controller",
@@ -421,10 +469,18 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "cache-sim-nightly"
+          ],
+          "date": "2026-11-24T04:29:57.205160+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45326767893",
+          "sha": "48f05250632ac60d43c7ec0c19835f7e248513f4",
+          "state": "stale"
         },
         "U": {
           "reason": "Ownership is checked across committed transitions",
@@ -479,10 +535,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "cache-sim-nightly"
+          ],
+          "date": "2026-11-24T04:29:57.205160+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45326767893",
+          "sha": "48f05250632ac60d43c7ec0c19835f7e248513f4",
+          "state": "stale"
         },
         "U": {
           "reason": "Redirects span workers and the controller map",
@@ -537,10 +601,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 1,
+          "checks": [
+            "cache-sim-nightly"
+          ],
+          "date": "2026-11-24T04:29:57.205160+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45326767893",
+          "sha": "48f05250632ac60d43c7ec0c19835f7e248513f4",
+          "state": "stale"
         },
         "U": {
           "reason": "Cold start concerns worker lifecycle",
@@ -4002,5 +4074,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
