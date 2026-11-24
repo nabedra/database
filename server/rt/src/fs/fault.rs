@@ -1046,6 +1046,22 @@ impl State {
     }
 }
 
+/// Runs one call between its pause points (`sim/suspend.rs`), which a simulation may stop
+/// at. The filesystem's lock is not held there.
+#[inline]
+fn pausable<T>(op: FsOp, path: &Path, call: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    #[cfg(feature = "sim")]
+    crate::sim::suspend::storage_point(op, crate::sim::Side::Before, path);
+    let result = call();
+    #[cfg(feature = "sim")]
+    if result.is_ok() {
+        crate::sim::suspend::storage_point(op, crate::sim::Side::After, path);
+    }
+    #[cfg(not(feature = "sim"))]
+    let _ = (op, path);
+    result
+}
+
 fn crashed() -> io::Error {
     io::Error::other("FaultFs: the simulated machine has crashed")
 }
@@ -1478,15 +1494,17 @@ impl FaultFs {
     /// `rename` that fails with `AlreadyExists` instead of replacing `to`
     /// (`renameat2(RENAME_NOREPLACE)`).
     pub fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
-        let mut state = self.state();
-        let result = state.admit(FsOp::Rename, from, true).and_then(|()| {
-            if state.os.files.contains_key(to) || state.os.dirs.contains_key(to) {
-                return Err(io::ErrorKind::AlreadyExists.into());
-            }
-            state.rename(from, to)
-        });
-        state.log(FsOp::Rename, from, Some(to), 0, 0, result.is_ok());
-        result
+        pausable(FsOp::Rename, from, || {
+            let mut state = self.state();
+            let result = state.admit(FsOp::Rename, from, true).and_then(|()| {
+                if state.os.files.contains_key(to) || state.os.dirs.contains_key(to) {
+                    return Err(io::ErrorKind::AlreadyExists.into());
+                }
+                state.rename(from, to)
+            });
+            state.log(FsOp::Rename, from, Some(to), 0, 0, result.is_ok());
+            result
+        })
     }
 
     /// Resolves a descriptor's current name. Unlinked inodes have no usable name.
@@ -1522,11 +1540,13 @@ impl FaultFs {
 
     #[cfg(all(unix, feature = "sim"))]
     pub(crate) fn sync_directory_descriptor(&self, ino: Ino, opened_as: &Path) -> io::Result<()> {
-        let mut state = self.state();
-        let path = state
-            .descriptor_path(DescriptorInode::Directory(ino), opened_as)?
-            .to_path_buf();
-        state.sync_dir(&path)
+        pausable(FsOp::SyncDir, opened_as, || {
+            let mut state = self.state();
+            let path = state
+                .descriptor_path(DescriptorInode::Directory(ino), opened_as)?
+                .to_path_buf();
+            state.sync_dir(&path)
+        })
     }
 
     /// Takes an advisory lock on an open inode without creating a pathname.
@@ -1650,12 +1670,14 @@ impl Fs for FaultFs {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        let mut state = self.state();
-        let result = state
-            .admit(FsOp::Rename, from, true)
-            .and_then(|()| state.rename(from, to));
-        state.log(FsOp::Rename, from, Some(to), 0, 0, result.is_ok());
-        result
+        pausable(FsOp::Rename, from, || {
+            let mut state = self.state();
+            let result = state
+                .admit(FsOp::Rename, from, true)
+                .and_then(|()| state.rename(from, to));
+            state.log(FsOp::Rename, from, Some(to), 0, 0, result.is_ok());
+            result
+        })
     }
 
     fn remove(&self, path: &Path) -> io::Result<()> {
@@ -1722,7 +1744,7 @@ impl Fs for FaultFs {
     }
 
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
-        self.state().sync_dir(dir)
+        pausable(FsOp::SyncDir, dir, || self.state().sync_dir(dir))
     }
 
     fn lock(&self, path: &Path) -> io::Result<FsLock> {
@@ -1884,7 +1906,7 @@ impl Drop for FaultFile {
 
 impl FsFile for FaultFile {
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        self.call(FsOp::Write, offset, buf.len() as u64, true, |inode| {
+        let write = |inode: &mut Inode| {
             if buf.is_empty() {
                 return Ok(());
             }
@@ -1897,6 +1919,9 @@ impl FsFile for FaultFile {
             let last = (end as u64 - 1) / POWER_LOSS_SECTOR;
             inode.dirty.extend(first..=last);
             Ok(())
+        };
+        pausable(FsOp::Write, &self.path, || {
+            self.call(FsOp::Write, offset, buf.len() as u64, true, write)
         })
     }
 
@@ -1914,11 +1939,11 @@ impl FsFile for FaultFile {
     }
 
     fn sync_data(&self) -> io::Result<()> {
-        self.sync(FsOp::SyncData)
+        pausable(FsOp::SyncData, &self.path, || self.sync(FsOp::SyncData))
     }
 
     fn sync_all(&self) -> io::Result<()> {
-        self.sync(FsOp::SyncAll)
+        pausable(FsOp::SyncAll, &self.path, || self.sync(FsOp::SyncAll))
     }
 
     fn preallocate(&self, len: u64) -> io::Result<()> {
