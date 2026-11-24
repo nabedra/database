@@ -47,6 +47,7 @@ level = "L3"
 register = "docs/testing/guarantees/oltp.md"
 paths = [
   "server/src/oltp/**",
+  "server/oltp-storage/**",
   "server/oltp-types/**",
   "server/transport/**",
   "server/sim-oltp/**",
@@ -133,6 +134,9 @@ hot_paths = [
   "server/src/oltp/mvcc/**",
   "server/src/oltp/pool/**",
   "server/src/oltp/codec.rs",
+  "server/oltp-storage/src/oltp/mvcc/**",
+  "server/oltp-storage/src/oltp/pool/**",
+  "server/oltp-storage/src/oltp/codec.rs",
   "server/src/oltp_replication/typed_log/**",
   "server/transport/src/**",
   "server/protocol/src/protocol.rs",

@@ -1904,6 +1904,7 @@ dependencies = [
  "mime",
  "nabedra-check",
  "nabedra-kv",
+ "nabedra-oltp-storage",
  "nabedra-oltp-types",
  "nabedra-protocol",
  "nabedra-resources",
@@ -1972,12 +1973,14 @@ name = "nabedra-oltp-storage"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures-util",
  "libc",
  "nabedra-kv",
  "nabedra-oltp-types",
  "nabedra-protocol",
  "nabedra-resources",
  "nabedra-rt",
+ "nabedra-sim",
  "serde",
  "serde_json",
  "sha2 0.11.1",
