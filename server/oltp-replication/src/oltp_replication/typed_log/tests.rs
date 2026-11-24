@@ -1365,3 +1365,66 @@ async fn ns13_o05_drain_waits_until_the_append_task_dropped_its_state() {
         "drain returned while the append task still held its captured state"
     );
 }
+
+/// PR #121 review of FLAKE3-epoch: an entry acknowledged after a vote must
+/// not survive a crash that loses that vote. The image is the durable state
+/// at the moment the first post-vote append is acknowledged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r121_flake3_a_crash_never_keeps_a_post_vote_entry_without_its_vote() {
+    nabedra_rt::time::timeout(Duration::from_secs(120), async {
+        for round in 0..20 {
+            let rig = GatedLog::new();
+            let (pool, mut log) = rig.open(Arc::new(rig.gated.clone()), true).await;
+            let held_sync = rig.gated.hold();
+            let mut acks = Vec::new();
+            let mut append = async |log: &mut TypedLogStore<TestConfig>, index: u64| {
+                let (sent, acked) = TestConfig::oneshot();
+                log.append([blank(index)], IOFlushed::signal(sent)).await.unwrap();
+                acks.push(acked);
+            };
+            append(&mut log, 0).await;
+            rig.gated.wait_for_sync().await;
+            for index in [1, 2] {
+                append(&mut log, index).await;
+            }
+            let mut voter = log.clone();
+            let new_vote = Vote::new_committed(2, 1);
+            let mut vote = Box::pin(voter.save_vote(&new_vote));
+            assert!(
+                std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(vote.as_mut().poll(cx).is_pending())
+                })
+                .await
+            );
+            for index in [3, 4] {
+                append(&mut log, index).await;
+            }
+            let last = acks.pop().unwrap();
+            let post_vote = acks.pop().unwrap();
+            let gated = rig.gated.inner.clone();
+            let image = nabedra_rt::task::spawn(async move {
+                post_vote.await.unwrap().unwrap();
+                gated.crash()
+            });
+            drop(held_sync);
+            vote.await.unwrap();
+            let image = image.await.unwrap();
+            last.await.unwrap().unwrap();
+            for ack in acks {
+                ack.await.unwrap().unwrap();
+            }
+            log.drain().await;
+            drop((voter, log, pool));
+            let (_pool, mut recovered) = rig.open(Arc::new(image), false).await;
+            let entries = log_ids(recovered.try_get_log_entries(..).await.unwrap());
+            let vote = recovered.read_vote().await.unwrap();
+            eprintln!("r121 round {round}: entries {entries:?} vote {vote:?}");
+            assert!(
+                !entries.contains(&id(3)) || vote == Some(new_vote),
+                "round {round}: a crash kept post-vote entries {entries:?} without the vote: {vote:?}"
+            );
+        }
+    })
+    .await
+    .expect("r121 FLAKE3 watchdog");
+}

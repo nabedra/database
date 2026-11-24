@@ -640,3 +640,50 @@ async fn o17_rep6_revocation_pages_list_every_committed_revocation() {
     assert_eq!(listed, expected);
     assert_eq!(pages, 2);
 }
+
+/// PR #121 review of RV-REP-2: whatever Control answers to the mount that
+/// would revoke the 1,025th worker, a Control replica must be able to load
+/// its durable revocations again.
+#[tokio::test]
+async fn r121_rv_rep_2_control_reopens_after_the_mount_at_the_limit() {
+    let directory = Directory::new();
+    let mut recovery = Recovery::open(&directory).await;
+    recovery
+        .seed(|tx| {
+            for i in 1..1024 {
+                let revoked = WorkerIdentity::from(&worker(i));
+                let key = revoked_id(revoked.worker_id);
+                let raw = tx.encode_value(&revoked)?;
+                tx.put(&key, raw.as_ref())?;
+            }
+            Ok(())
+        })
+        .await;
+    let (record, key) = recovery.prepare(recovery.voters[2], 4).await;
+    assert_eq!(
+        recovery.mount(&record, &key).await,
+        ControlReply::SystemReplacementMounted
+    );
+    recovery.publish(&record).await;
+    let (record, key) = recovery.prepare(recovery.voters[1], 5).await;
+    let reply = recovery.mount(&record, &key).await;
+    let survivor = recovery.voters[0];
+    let restarted = AppliedPeerDirectory::from_bootstrap(
+        recovery.group.identity.clone(),
+        vec![WorkerEnrollment {
+            incarnation: survivor.incarnation,
+            ..worker(survivor.worker_id.as_u128())
+        }],
+        recovery.fixture.machine.store().resources().clone(),
+    )
+    .unwrap();
+    let reopened = ControlMachine::new(recovery.fixture.machine.store().clone())
+        .unwrap()
+        .with_replacement_directory(restarted)
+        .await;
+    assert!(
+        reopened.is_ok(),
+        "Control cannot reopen after the mount at the limit answered {reply:?}: {:?}",
+        reopened.err()
+    );
+}
