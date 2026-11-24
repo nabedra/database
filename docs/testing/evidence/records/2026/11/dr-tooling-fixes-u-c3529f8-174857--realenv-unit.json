@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-tooling-fixes-u-c3529f8-174857--realenv-unit.log",
+      "sha256": "601f1fcecbca88551d58b16030a48e981c86355e97c174e2cb10e91c7809e03e"
+    }
+  ],
+  "assertions": {
+    "executed": 30,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "realenv-unit",
+  "duration_s": 0.766,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T16:56:43.349244+00:00",
+    "request_id": "dr-tooling-fixes-u-c3529f8-174857",
+    "runner": "GitHub Actions 1000012172",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45441464233"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "c3529f80c335446ba87c44e7815824bf6df34b80",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

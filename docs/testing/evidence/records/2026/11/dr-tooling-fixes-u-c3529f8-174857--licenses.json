@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-tooling-fixes-u-c3529f8-174857--licenses.log",
+      "sha256": "05af2b800aad729bd6f7c0c26557331616597d8dc190cc7514fe7921a9d5275a"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "licenses",
+  "duration_s": 11.341,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T16:57:08.192651+00:00",
+    "request_id": "dr-tooling-fixes-u-c3529f8-174857",
+    "runner": "GitHub Actions 1000012176",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45441464233"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "c3529f80c335446ba87c44e7815824bf6df34b80",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

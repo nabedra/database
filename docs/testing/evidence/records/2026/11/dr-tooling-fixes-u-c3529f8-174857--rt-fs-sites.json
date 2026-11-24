@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-tooling-fixes-u-c3529f8-174857--rt-fs-sites.log",
+      "sha256": "a29fdd8efc9c7003a1dd52559aad89056e4f013f8483d70d72abd613682ccd46"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "rt-fs-sites",
+  "duration_s": 2.721,
+  "guarantees": [
+    "OLTP-G01"
+  ],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T16:56:22.512343+00:00",
+    "request_id": "dr-tooling-fixes-u-c3529f8-174857",
+    "runner": "GitHub Actions 1000012169",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45441464233"
+  },
+  "scenarios": [
+    "O11"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "c3529f80c335446ba87c44e7815824bf6df34b80",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
