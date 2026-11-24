@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p8d-91-497c6aa-005926--protocol-unit.log",
+      "sha256": "cc82a416e50de00182d4649407b3e320edbeb1c16814e99b23547a87627f2b90"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "protocol-unit",
+  "duration_s": 14.554,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T00:00:34.173280+00:00",
+    "request_id": "land-p8d-91-497c6aa-005926",
+    "runner": "GitHub Actions 1000008740",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45293417968"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "497c6aa2b0282148670a3d9c6b0807aeb95e7fb9",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
