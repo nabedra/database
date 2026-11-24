@@ -25,7 +25,9 @@ Commands:
                  fail the same way, deterministically, with a history), resets the tree and
                  replays the seed on the unpatched build, which must pass deterministically. The
                  unpatched build must also report no expected kind on any seed tried, so that a
-                 failure it already has is never credited to the patch. It writes sim-bugs-run.json (seeds tried, found seed, kinds, trace hashes, history
+                 failure it already has is never credited to the patch. The hit is then only a
+                 candidate, until the manifest's [detection] table records the reviewed mechanism
+                 for that exact seed, trace hash and history. It writes sim-bugs-run.json (seeds tried, found seed, kinds, trace hashes, history
                  digests, patch SHA-256) beside the harness artifacts. While the harness or a
                  bug's workload is missing it prints `not-run: sim-harness-missing` and exits 0,
                  which the check records as not-run, never as a pass.
@@ -78,9 +80,12 @@ MANIFEST_FIELDS = {
     "schema": str, "id": str, "bug": str, "set": str, "phase": int, "class": str,
     "guarantees": list, "scenarios": list, "fix_commits": list, "reverts": str, "port": str,
     "port_notes": str, "workload": str, "profile": list, "expect": list, "seeds": list,
-    "found_seed": int, "regression": dict,
+    "found_seed": int, "regression": dict, "detection": dict,
 }
-REQUIRED = MANIFEST_FIELDS.keys() - {"port_notes", "found_seed"}
+REQUIRED = MANIFEST_FIELDS.keys() - {"port_notes", "found_seed", "detection"}
+# A reviewed diagnosis of one hit: its identity, and how its history and trace show the reverted
+# fix's mechanism rather than another defect that reports the same kind.
+DETECTION_FIELDS = {"seed": int, "trace_hash": str, "history_sha256": str, "mechanism": str}
 REGRESSION_FIELDS = {"kind": str, "test": str, "scenario": str, "mode": str,
                      "failure_contains": list, "timeout_s": int, "attempts": int, "evidence": dict}
 EVIDENCE_FIELDS = {"digest": str, "patched": dict, "clean": dict}
@@ -211,7 +216,12 @@ def load_bugs(repo):
     root = repo / BUGS_DIR
     if not root.is_dir():
         return bugs, [f"{BUGS_DIR}: no bug directory"]
-    for path in sorted(p for p in root.iterdir() if p.is_dir()):
+    # Phase 10's bugs sit directly in the directory, later phases in phase<N>/.
+    groups = [(p, int(p.name[5:])) for p in root.iterdir() if p.is_dir() and re.fullmatch(r"phase[0-9]+", p.name)]
+    paths = [(p, 10) for p in root.iterdir() if p.is_dir() and p not in dict(groups)]
+    paths += [(p, phase) for group, phase in groups for p in group.iterdir() if p.is_dir()]
+    seen = set()
+    for path, phase in sorted(paths):
         name = path.relative_to(repo).as_posix()
         try:
             with (path / "bug.toml").open("rb") as stream:
@@ -220,6 +230,11 @@ def load_bugs(repo):
         except (OSError, ValueError) as error:
             errors.append(f"{name}: {error}")
             continue
+        if manifest.get("phase") != phase:
+            errors.append(f"{name}: phase must be {phase} in this directory")
+        if path.name in seen:
+            errors.append(f"{name}: the id is used twice")
+        seen.add(path.name)
         bugs.append(Bug(path, manifest, patch))
     if not bugs and not errors:
         errors.append(f"{BUGS_DIR}: no bug directories")
@@ -287,6 +302,10 @@ def validate_manifest(bug, records, known_guarantees, require_evidence=True):
             extra = sorted(set(m[key]) - set(record.get(key, [])))
             if extra:
                 problems.append(f"{key} {extra} are not in the bug record")
+    if "detection" in m:
+        typed(problems, "detection", m["detection"], DETECTION_FIELDS, DETECTION_FIELDS)
+        if not m["detection"].get("mechanism", "").strip():
+            problems.append("detection.mechanism must say how the history shows the reverted fix")
     problems.extend(validate_regression(bug, require_evidence))
     problems.extend(validate_patch_paths(bug.patch))
     return problems
@@ -919,19 +938,33 @@ def search_bug(args, scratch, env, log, bug, plan, out_dir, clean_exe):
     if code != 101 or [entry["seed"] for entry in control] != wanted:
         row["why"] = f"the clean control did not run every seed tried (exit {code})"
         return row
-    row["result"] = "found"
+    if rehearsal(args):
+        row["result"] = "rehearsed"
+        return row
+    # A matching kind is not a diagnosis: other defects report the same kinds.
+    detection = bug.manifest.get("detection")
+    identity = {"seed": hit["seed"], "trace_hash": row["patched"]["trace_hash"],
+                "history_sha256": row["patched"]["history_sha256"]}
+    if detection is None:
+        row.update(result="candidate", why="no reviewed mechanism is recorded for this hit")
+    elif any(detection[key] != value for key, value in identity.items()):
+        row.update(result="candidate", why="the recorded mechanism is for another hit")
+    else:
+        row.update(result="found", mechanism=detection["mechanism"])
     return row
 
 
 def describe(row):
     if row["result"] == "not-run":
         return f"{row['id']}: not-run ({row['why']})"
-    if row["result"] != "found":
+    if row["result"] not in ("found", "candidate", "rehearsed"):
         where = f"seed {row['found_seed']}" if "found_seed" in row else f"[{row['seeds'][0]}, {row['seeds'][1]}]"
         return f"{row['id']}: NOT found ({where}: {row.get('why', 'unknown')})"
     patched, clean = row["patched"], row["clean"]
     by = f" (defect {row['rehearse_defect']}, not the patch)" if row.get("rehearse_defect") else ""
-    return (f"{row['id']}: found{by} seed {row['found_seed']} after {row['tried']} seeds in "
+    if row["result"] == "candidate":
+        by = f" (NOT counted: {row['why']})"
+    return (f"{row['id']}: {row['result']}{by} seed {row['found_seed']} after {row['tried']} seeds in "
             f"[{row['seeds'][0]}, {row['seeds'][1]}]; patched {patched['kinds']} trace "
             f"{patched['trace_hash']} ({patched['trace_events']} events, replay deterministic), "
             f"history sha256 {patched['history_sha256']}; clean twin pass trace {clean['trace_hash']} "
@@ -972,10 +1005,11 @@ def cmd_run(repo, bugs, args, out):
     summary = {"schema": "nabedra.sim-bugs-run/1", "evidence": "fault-model", "mode": mode,
                "sha": sha, "set": args.set_name, "bugs": rows}
     (out_dir / "sim-bugs-run.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    found = sum(row["result"] == "found" for row in rows)
+    found = sum(row["result"] == ("rehearsed" if mode == "rehearsal" else "found") for row in rows)
     not_run = [row["id"] for row in rows if row["result"] == "not-run"]
     what = ("pipeline rehearsals completed; no reverted fix was searched for" if mode == "rehearsal" else
-            "reverted fixes found within budget, each with a passing clean twin and control")
+            "reverted fixes found within budget, each with a passing clean twin, a clean control and a "
+            "recorded mechanism")
     print(f"sim-bugs run{' (rehearsal)' if mode == 'rehearsal' else ''}: {found} of {len(rows)} "
           f"{what}; summary {out_dir / 'sim-bugs-run.json'}", file=out)
     if found == len(rows):

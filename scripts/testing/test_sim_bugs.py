@@ -373,7 +373,46 @@ class SimBugsTest(unittest.TestCase):
         lines = calls.read_text().splitlines() if calls.exists() else []
         return status, output, summary, [json.loads(line) for line in lines]
 
+    def record_detection(self, hit, **changes):
+        history = json.dumps({"seed": hit, "patched": True}) + "\n"
+        detection = {"seed": hit, "trace_hash": "%016x" % (hit * 7919 + 1), "mechanism": "the lost reply",
+                     "history_sha256": hashlib.sha256(history.encode()).hexdigest(), **changes}
+        table = "".join(f"{key} = {json.dumps(value)}\n" for key, value in detection.items())
+        self.f.write_bug(self.f.manifest() + "[detection]\n" + table)
+
+    def test_a_hit_is_only_a_candidate_without_its_own_recorded_mechanism(self):
+        status, output, summary, _ = self.harness_run(hit=3)
+        self.assertEqual(status, 1, output)
+        self.assertIn("fix-one: candidate (NOT counted: no reviewed mechanism is recorded", output)
+        self.assertIn("0 of 1 reverted fixes found", output)
+        self.assertEqual(summary["bugs"][0]["result"], "candidate")
+        for change in ({"seed": 4}, {"trace_hash": "0" * 16}, {"history_sha256": "0" * 64}):
+            with self.subTest(change=change):
+                self.record_detection(3, **change)
+                status, output, _, _ = self.harness_run(hit=3)
+                self.assertEqual(status, 1, output)
+                self.assertIn("the recorded mechanism is for another hit", output)
+        self.record_detection(3, mechanism=" ")
+        self.assert_check(1, "detection.mechanism must say how")
+
+    def test_later_phases_use_their_own_directory(self):
+        patch_text = self.f.patch
+        manifest = self.f.manifest().replace('"fix-one"', '"fix-two"').replace("phase = 10", "phase = 11")
+        for where, text, expected in (("phase11/fix-two", manifest, 0), ("fix-two", manifest, 1),
+                                      ("phase11/fix-two", manifest.replace("phase = 11", "phase = 10"), 1)):
+            with self.subTest(where=where, expected=expected):
+                base = f"server/sim-oltp/bugs/{where}"
+                self.f.write(f"{base}/bug.toml", text)
+                self.f.write(f"{base}/revert.patch", patch_text)
+                status, output = self.f.run("check")
+                self.assertEqual(status, expected, output)
+                self.assertIn("2 of 2 patches valid" if expected == 0 else "phase must be", output)
+                (self.f.repo / base / "bug.toml").unlink()
+                (self.f.repo / base / "revert.patch").unlink()
+                (self.f.repo / base).rmdir()
+
     def test_run_finds_the_seed_and_replays_it_patched_and_clean(self):
+        self.record_detection(3)
         before = (self.f.repo / "server/src/lib.rs").read_text()
         # An inherited defect or expectation never reaches the harness outside a rehearsal.
         with patch.dict(os.environ, {"NABEDRA_SIM_DEFECT": "lost-write", "NABEDRA_SIM_EXPECT": "x"}):
@@ -439,7 +478,7 @@ class SimBugsTest(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.assertIn("(rehearsal: manifest workload, profile or expectation overridden", output)
         self.assertIn("sim-bugs run (rehearsal): 1 of 1 pipeline rehearsals completed", output)
-        self.assertIn("fix-one: found (defect lost-write, not the patch) seed 2", output)
+        self.assertIn("fix-one: rehearsed (defect lost-write, not the patch) seed 2", output)
         self.assertNotIn("reverted fixes found", output)
         self.assertEqual(summary["mode"], "rehearsal")
         self.assertEqual([(c["defect"], c["profile"]) for c in calls],
