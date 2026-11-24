@@ -85,8 +85,11 @@ normal = ["nabedra-protocol", "nabedra-resources"]
 [planned.nabedra-transport]
 normal = ["nabedra-rt", "nabedra-protocol", "nabedra-resources", "nabedra-oltp-types"]
 
+# Storage is extracted. Cargo enforces its dependencies and the source plant below
+# exercises the unresolved upward import in the real crate.
 [planned.nabedra-oltp-storage]
-normal = ["nabedra-rt", "nabedra-kv", "nabedra-protocol", "nabedra-resources", "nabedra-oltp-types"]
+normal = ["nabedra-rt", "nabedra-kv", "nabedra-protocol", "nabedra-resources", "nabedra-oltp-types", "nabedra-sim"]
+dev = ["nabedra-resources"]
 
 [planned.nabedra-oltp-replication]
 normal = [
@@ -99,7 +102,7 @@ normal = [
   "nabedra-rt", "nabedra-kv", "nabedra-protocol", "nabedra-resources", "nabedra-oltp-types",
   "nabedra-transport", "nabedra-oltp-storage", "nabedra-oltp-replication",
 ]
-dev = ["nabedra-check"]
+dev = ["nabedra-check", "nabedra-oltp-storage"]
 
 # The upward edge the planted cases add: storage naming replication.
 [plant]
