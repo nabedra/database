@@ -1,0 +1,44 @@
+{
+  "artifacts": [
+    {
+      "name": "flake-hunt-matrix-080730--oltp-queue-rejoin-component.log",
+      "sha256": "ba6f1b138d66966523f4fbde41602d6ffe2213ecd7bae0232d29253f8fc4d05b"
+    }
+  ],
+  "assertions": {
+    "executed": 20,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-queue-rejoin-component",
+  "duration_s": 690.268,
+  "guarantees": [],
+  "kind": "R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T07:30:19.592693+00:00",
+    "request_id": "flake-hunt-matrix-080730",
+    "runner": "GitHub Actions 1000010530",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45345562461"
+  },
+  "scenarios": [
+    "O14",
+    "Q03",
+    "Q04",
+    "Q05",
+    "R03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "336c67783c6821a468f24a099a4a5f85a34444b5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

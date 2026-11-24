@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "flake-hunt-matrix-080730--testing-matrix.log",
+      "sha256": "feb39d269e5625a02174d03f053bcc0a3db1484bdaf68192ff62eb1f2d46e627"
+    }
+  ],
+  "assertions": {
+    "executed": 75,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "testing-matrix",
+  "duration_s": 3.422,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T07:32:59.146207+00:00",
+    "request_id": "flake-hunt-matrix-080730",
+    "runner": "GitHub Actions 1000010538",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45345562461"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "336c67783c6821a468f24a099a4a5f85a34444b5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

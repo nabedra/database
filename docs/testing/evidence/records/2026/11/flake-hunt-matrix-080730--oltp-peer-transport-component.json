@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "flake-hunt-matrix-080730--oltp-peer-transport-component.log",
+      "sha256": "890d83fb2ba65d0ef9964132c240d37dfbb93c02fcd63e6c3f65f0813bebd4ca"
+    }
+  ],
+  "assertions": {
+    "executed": 35,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-peer-transport-component",
+  "duration_s": 54.234,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T07:25:14.136562+00:00",
+    "request_id": "flake-hunt-matrix-080730",
+    "runner": "GitHub Actions 1000010521",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45345562461"
+  },
+  "scenarios": [
+    "D10",
+    "O05",
+    "C07"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "336c67783c6821a468f24a099a4a5f85a34444b5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

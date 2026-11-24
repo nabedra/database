@@ -1,0 +1,47 @@
+{
+  "artifacts": [
+    {
+      "name": "flake-hunt-matrix-080730--oltp-native-executor-sim.log",
+      "sha256": "a218c95af634d5d1f77df76d18a2641ee87378c57a9ecc5d637bb7860c200a7d"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-native-executor-sim",
+  "duration_s": 209.837,
+  "guarantees": [
+    "OLTP-G09",
+    "SCHED-G01"
+  ],
+  "kind": "S U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T07:24:56.048859+00:00",
+    "request_id": "flake-hunt-matrix-080730",
+    "runner": "GitHub Actions 1000010520",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45345562461"
+  },
+  "scenarios": [
+    "C04",
+    "C06",
+    "F01",
+    "F02",
+    "F03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "336c67783c6821a468f24a099a4a5f85a34444b5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
