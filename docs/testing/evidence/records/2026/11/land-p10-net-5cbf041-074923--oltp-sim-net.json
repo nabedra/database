@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p10-net-5cbf041-074923--oltp-sim-net.log",
+      "sha256": "a691a6ad6736193f5fb8bb65f76f1ccf3e38540c3474cbec94803c577d57143e"
+    }
+  ],
+  "assertions": {
+    "executed": 5,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim-net",
+  "duration_s": 290.092,
+  "guarantees": [
+    "OLTP-G04"
+  ],
+  "kind": "S",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T07:51:25.676782+00:00",
+    "request_id": "land-p10-net-5cbf041-074923",
+    "runner": "GitHub Actions 1000010578",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45350954381"
+  },
+  "scenarios": [
+    "D10"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "5cbf041fddc5759a30ac0209b6c3c6e8ab0f2bdb",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
