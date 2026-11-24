@@ -6,9 +6,10 @@ guarantees = ["OLTP-G02", "OLTP-G03"]
 scenarios = []
 tiers = ["T1"]
 # Shard 1 of 4. Build once, then allow the measured sweep at most 15 minutes.
-# It also runs two harness regressions: simulated stats omit process-wide stage
-# timings (seed 2 replayed differently in a fresh process), and sampled reply
-# arenas hold the largest Data apply budget (seed 22 never bound worker HTTP).
+# It also runs the harness regressions: simulated stats omit process-wide stage
+# timings (seed 2 replayed differently in a fresh process), sampled reply arenas
+# hold the largest Data apply budget (seed 22 never bound worker HTTP), and every
+# peer has a session slot (seed 66 never reached the direct path through n102).
 command = ["bash", "-euc", '''
 cargo test --locked -j 2 --release -p nabedra-database --no-default-features \
     --features oltp,sim --lib oltp_runtime::stage_timing::sim_tests:: -- --test-threads=1
