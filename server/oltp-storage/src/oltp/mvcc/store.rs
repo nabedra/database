@@ -378,15 +378,6 @@ impl ParticipantMachine {
     pub(super) async fn observe_snapshot(&self, read_ts: ReadTs) -> Result<(), ProtocolError> {
         if matches!(self.store.identity().kind, GroupKind::Data { .. }) {
             self.clock.observe_snapshot(read_ts).await?;
-            #[cfg(feature = "sim")]
-            if read_ts.get() != u64::MAX {
-                nabedra_oltp_types::sim_probe::emit(|| {
-                    nabedra_oltp_types::sim_probe::Probe::SnapshotServed {
-                        group: self.store.identity().group_id,
-                        read_ts: read_ts.get(),
-                    }
-                });
-            }
         }
         Ok(())
     }
@@ -473,6 +464,8 @@ impl ParticipantMachine {
                     if !owns(&group, &config.span, &key) {
                         return Err(invalid());
                     }
+                    #[cfg(feature = "sim")]
+                    snapshot_probe(&group, read_ts);
                     let length = key_length(&key)?;
                     view.with_scratch_buffer(length + 9, |view, buffer| {
                         encode_key(&key, &mut buffer[1..1 + length]);
@@ -1270,6 +1263,18 @@ fn resolve_writes(
     Ok(())
 }
 
+/// Reports a snapshot read that this Data range admits (simulation only). `u64::MAX` is the
+/// "latest" sentinel, not a timestamp.
+#[cfg(feature = "sim")]
+fn snapshot_probe(group: &GroupIdentity, read_ts: ReadTs) {
+    if matches!(group.kind, GroupKind::Data { .. }) && read_ts.get() != u64::MAX {
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::SnapshotServed {
+            group: group.group_id,
+            read_ts: read_ts.get(),
+        });
+    }
+}
+
 /// Reports a committed Catalog routing root or page (simulation only). `None` is a delete.
 #[cfg(feature = "sim")]
 fn route_probe(logical: &[u8], value: Option<&RawValue>, commit_ts: CommitTs) {
@@ -1290,7 +1295,7 @@ fn route_probe(logical: &[u8], value: Option<&RawValue>, commit_ts: CommitTs) {
             RouteRecord::Page {
                 page_id: id(17..33),
                 next_page: page.next_page,
-                spans: page.shards.iter().map(|route| Span { start: route.span.start.clone(), end: route.span.end.clone() }).collect(),
+                spans: page.shards.iter().map(|route| Span { group: route.group.group_id, start: route.span.start.clone(), end: route.span.end.clone() }).collect(),
             }
         }),
         (_, None) => Ok(RouteRecord::PageDeleted { page_id: id(17..33) }),

@@ -1379,6 +1379,13 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             })
             .await
             .map_err(disk)?;
+        #[cfg(feature = "sim")]
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::Purged {
+            group: self.store.identity().group_id,
+            kind: self.store.identity().kind.clone(),
+            replica: self.node_id,
+            upto: super::hosted::position(id),
+        });
         Ok(())
     }
 }

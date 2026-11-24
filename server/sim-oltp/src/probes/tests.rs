@@ -1,4 +1,4 @@
-//! The planted defect that only a probe-driven invariant can catch.
+//! The planted defects that only a probe-driven invariant can catch.
 //!
 //! `double-apply.patch` beside this file makes every replica apply each normal Raft entry
 //! a second time. The state machine's replay check turns the second apply into a no-op,
@@ -6,15 +6,24 @@
 //! `Applied` probes show the same index twice in one incarnation, which
 //! `MonotonicCommit` reports.
 //!
+//! `recurring-charge.patch` makes each worker that applied a direct entry hold 564 bytes of
+//! its progress arena for 50 of every 51 ms, from then on. `ResourceBaseline` reports it.
+//!
 //! The `oltp-probes-planted` check runs the same seeds in a scratch worktree twice: first
-//! without the patch, where `clean_twin_reports_nothing` must pass, then with it.
+//! without the first patch, where `clean_twin_reports_nothing` must pass, then with it. The
+//! `oltp-probes-baseline` check does so with 50 clean seeds and the second patch.
+//!
+//! `control_digests_replay` is the failing assertion of the open bug
+//! OLTP-sim-restart-key-entropy. `fixed-restart-key.patch` fixes the key, and the
+//! `oltp-probes-restart-key` check shows that the assertion fails without it and passes
+//! with it.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nabedra_check::history::{Event, EventType};
 use nabedra_oltp_types::{
     sim_probe::{Probe, emit},
-    types::Digest,
+    types::{Digest, GroupKind},
 };
 use nabedra_protocol::protocol::Key;
 use nabedra_rt::sim::{self, NodeClock, World, in_node};
@@ -26,7 +35,7 @@ use super::{ProbeEvent, Probes};
 use crate::{
     invariants::{
         Invariants, RULES_RAN,
-        protocol::{MONOTONIC_COMMIT, NOT_APPLIED_NEVER_COMMITTED, PROBE_INVARIANTS},
+        protocol::{MONOTONIC_COMMIT, NOT_APPLIED_NEVER_COMMITTED, RESOURCE_BASELINE},
     },
     sweep::{Defect, RunResult},
     workload::run_seed,
@@ -173,10 +182,14 @@ fn seeds() -> std::ops::Range<u64> {
     first..first + env_u64("NABEDRA_SEEDS", 3)
 }
 
+/// Seed 18 is judged while a Raft message is in flight on n1: a charge that returns to its
+/// baseline within 10 ms and comes back, which is no leak.
+const RAFT_FRAME_SEED: u64 = 18;
+
 #[test]
 #[ignore = "needs probes installed in the smoke workload; run by the oltp-probes-planted check"]
 fn clean_twin_reports_nothing() {
-    for seed in seeds() {
+    for seed in seeds().chain([RAFT_FRAME_SEED]) {
         let run = replayed(seed);
         assert!(
             run.run.violations.is_empty() && run.assertions.values().all(|passed| *passed),
@@ -185,27 +198,103 @@ fn clean_twin_reports_nothing() {
     }
 }
 
+/// Every seed reports `rule` and nothing else, and every assertion in `black_box` passes.
+fn only_detector(rule: &str, black_box: &[&str]) {
+    for seed in seeds() {
+        let run = replayed(seed);
+        let kinds: Vec<_> = shrink::kinds(&run.run.violations).into_iter().collect();
+        assert_eq!(kinds, [rule], "seed {seed}");
+        for name in black_box {
+            assert_eq!(
+                run.assertions.get(name),
+                Some(&true),
+                "seed {seed}: black-box assertion {name:?}"
+            );
+        }
+        let others = run
+            .assertions
+            .iter()
+            .filter(|(name, _)| !black_box.contains(name));
+        for (name, passed) in others {
+            println!("seed {seed}: not a black-box assertion here: {name:?} {passed}");
+        }
+    }
+}
+
+const BLACK_BOX: [&str; 9] = [
+    "cluster readiness",
+    "crash teardown",
+    "direct path observed",
+    "linearizability and keyed dedup",
+    "liveness",
+    "mounted device identity",
+    "original keyed retry result",
+    "public HTTP workload completed",
+    "registries empty",
+];
+
 #[test]
 #[ignore = "needs probes/double-apply.patch applied; run by the oltp-probes-planted check"]
 fn planted_double_apply_is_caught_only_by_probes() {
-    for seed in seeds() {
-        let run = replayed(seed);
-        let kinds = shrink::kinds(&run.run.violations);
-        assert!(
-            kinds.contains(MONOTONIC_COMMIT),
-            "seed {seed}: MonotonicCommit did not fire"
-        );
-        assert!(
-            kinds
-                .iter()
-                .all(|kind| PROBE_INVARIANTS.contains(&kind.as_str())),
-            "seed {seed}: a non-probe check also fired, so probes are not the only detector: {kinds:?}"
-        );
-        for (name, passed) in &run.assertions {
-            assert!(
-                *passed || *name == "probe invariants",
-                "seed {seed}: black-box assertion {name:?} failed"
-            );
-        }
+    let black_box = [&BLACK_BOX[..], &["public resource baseline"]].concat();
+    only_detector(MONOTONIC_COMMIT, &black_box);
+}
+
+/// The public stats do not show the arena the charge is in, but the assertion named after
+/// them is false for any ResourceBaseline report.
+#[test]
+#[ignore = "needs probes/recurring-charge.patch applied; run by the oltp-probes-baseline check"]
+fn planted_recurring_charge_is_caught_only_by_probes() {
+    only_detector(RESOURCE_BASELINE, &BLACK_BOX);
+}
+
+/// The Control entries the current run applied, while a test collects them.
+static CONTROL: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+pub(super) fn record_control(event: &ProbeEvent) {
+    if let Probe::Applied {
+        kind: GroupKind::Control,
+        replica,
+        entry,
+        digest,
+        ..
+    } = &event.probe
+        && let Some(entries) = CONTROL.lock().unwrap().as_mut()
+    {
+        entries.push(format!(
+            "replica {replica} index {}: {digest:?}",
+            entry.index
+        ));
     }
+}
+
+#[test]
+#[ignore = "red while OLTP-sim-restart-key-entropy is open; run by the oltp-probes-restart-key check"]
+fn control_digests_replay() {
+    let mut differing = 0;
+    for seed in seeds() {
+        let [first, second] = [(); 2].map(|()| {
+            *CONTROL.lock().unwrap() = Some(Vec::new());
+            run_seed(seed, &mut workload_gen(seed), Defect::None);
+            CONTROL.lock().unwrap().take().unwrap()
+        });
+        assert!(
+            !first.is_empty() && first.len() == second.len(),
+            "seed {seed}: {} and {} Control entries applied",
+            first.len(),
+            second.len()
+        );
+        let pairs = first.iter().zip(&second).filter(|(a, b)| a != b);
+        let entries: Vec<_> = pairs.collect();
+        println!(
+            "seed {seed}: {} of {} applied Control digests differ between two runs: {entries:#?}",
+            entries.len(),
+            first.len()
+        );
+        differing += entries.len();
+    }
+    assert_eq!(
+        differing, 0,
+        "applied Control digests differ between two runs of one seed"
+    );
 }

@@ -17,8 +17,9 @@
 //! would run product destructors while the product is mid-step.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{Arc, Mutex, Weak},
+    thread::{self, ThreadId},
 };
 
 use nabedra_check::history::{Event, EventType};
@@ -82,6 +83,9 @@ struct Hub {
     down: BTreeSet<u64>,
     /// The node whose ledgers are being snapshotted. Its probes come from no node context.
     snapshot: Option<u64>,
+    /// The threads that emitted a probe, numbered in order. A job that a storage pause
+    /// stops keeps its thread, so the number says which job a probe belongs to.
+    threads: HashMap<ThreadId, u64>,
     protocol: Protocol,
     subscribers: Vec<(Filter, mpsc::UnboundedSender<ProbeEvent>)>,
     trace: Option<TraceFile>,
@@ -103,6 +107,7 @@ impl Probes {
                 incarnations: BTreeMap::new(),
                 down: BTreeSet::new(),
                 snapshot: None,
+                threads: HashMap::new(),
                 protocol: Protocol::new(),
                 subscribers: Vec::new(),
                 trace: TraceFile::from_env(world.seed(), workload),
@@ -244,18 +249,23 @@ impl Probes {
                 probe,
             };
             hub.seq += 1;
+            let known = hub.threads.len() as u64;
+            let thread = *hub.threads.entry(thread::current().id()).or_insert(known);
             let violations = hub.protocol.observe(
                 Origin {
                     node,
                     incarnation,
                     t_ns,
                     live,
+                    thread,
                 },
                 &event.probe,
             );
             if let Some(trace) = &mut hub.trace {
                 trace.probe(&event);
             }
+            #[cfg(test)]
+            tests::record_control(&event);
             hub.subscribers.retain_mut(|(filter, sender)| {
                 !sender.is_closed() && (!filter(&event) || sender.send(event.clone()).is_ok())
             });
@@ -336,7 +346,8 @@ fn keys(event: &Event, events: &[Event]) -> Vec<String> {
 /// `registered/restart.rs` draws that key from `ring`'s `SystemRandom`, which no simulation
 /// seeds. Its public key and the evidence over it are the only bytes that differed between
 /// two runs of a seed, and they stopped differing once the key was fixed. The invariants
-/// still compare these digests within a run.
+/// still compare these digests within a run, and `control_digests_replay` compares them
+/// between runs: it is red until the key is seeded (OLTP-sim-restart-key-entropy).
 pub(crate) fn fields(probe: &Probe) -> Map<String, Value> {
     let mut fields = match serde_json::to_value(probe) {
         Ok(Value::Object(fields)) => fields,

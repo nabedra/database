@@ -13,10 +13,15 @@
 //! Without the `sim` feature this module and every call site compile away, so product
 //! builds keep their instructions.
 //!
-//! The simulator runs every node on one thread, and blocking jobs run on its helper while
-//! that thread waits, so probes arrive in one deterministic order. The sink runs outside
-//! the world's extension slot: a probe emitted while the sink handles another one still
-//! reaches it. A sink must not call back into product code.
+//! The simulator runs every node on one thread, and a blocking job runs on a helper thread
+//! while that thread waits, so probes arrive in one deterministic order. A job is atomic
+//! only while no storage pause is set: `World::pause_storage` and `set_storage_pauses` stop
+//! it at a filesystem call, and other jobs and tasks then emit between two of its probes.
+//! A stopped job keeps its thread and goes on there, so a sink can pair the probes of one
+//! transaction by thread, never by node.
+//!
+//! The sink runs outside the world's extension slot: a probe emitted while the sink handles
+//! another one still reaches it. A sink must not call back into product code.
 //!
 //! Probes carry identities, positions and digests, never payload bytes.
 
@@ -53,9 +58,10 @@ pub enum Ledger {
     RangeClockPending,
 }
 
-/// A route's half-open key span. `None` is unbounded.
+/// A route: a half-open key span, unbounded where it is `None`, and the group that owns it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Span {
+    pub group: Uuid,
     pub start: Option<Key>,
     pub end: Option<Key>,
 }
@@ -116,6 +122,14 @@ pub enum Probe {
         replica: u64,
         after: Option<AppliedPosition>,
     },
+    /// A replica purged its log up to `upto`, whose effects its state machine or an installed
+    /// snapshot holds durably.
+    Purged {
+        group: Uuid,
+        kind: GroupKind,
+        replica: u64,
+        upto: AppliedPosition,
+    },
     /// A replica saved its vote for `leader` in `term`. `committed` means a quorum granted
     /// it, so `leader` leads `term`.
     VoteSaved {
@@ -155,7 +169,8 @@ pub enum Probe {
         commit_ts: u64,
         digest: Digest,
     },
-    /// A snapshot read at `read_ts` passed the range clock (rule 2) and may be served.
+    /// A snapshot read at `read_ts` passed the linearizable barrier, the range clock (rule 2)
+    /// and the range's split lineage, and reads its data next.
     SnapshotServed { group: Uuid, read_ts: u64 },
     /// The range leader registered a direct commit at `commit_ts` before proposing it.
     DirectProposed {
@@ -205,6 +220,7 @@ impl Probe {
             Self::Appended { .. } => "Appended",
             Self::Recovered { .. } => "Recovered",
             Self::Truncated { .. } => "Truncated",
+            Self::Purged { .. } => "Purged",
             Self::VoteSaved { .. } => "VoteSaved",
             Self::Applied { .. } => "Applied",
             Self::LeaderSeen { .. } => "LeaderSeen",

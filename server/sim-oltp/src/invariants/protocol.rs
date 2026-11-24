@@ -10,6 +10,57 @@
 //! nothing. Synced log entries survive a crash only if the `Recovered` probe finds them on
 //! the volume at the next start, and a wipe drops them. Applied positions belong to one
 //! process incarnation.
+//!
+//! # What each rule cannot see
+//!
+//! No rule sees a step that emits no probe, and none runs before its probe is emitted. A
+//! rule that [`Protocol::exercised`] does not name compared nothing in that run.
+//!
+//! - ElectionSafety: OpenRaft's leader IDs name the Raft node, so a second leader of one vote
+//!   is seen only as a second simulated node. Two cores of one replica in one process, and a
+//!   leader that takes over again after a restart, look like one leader. `LeaderSeen` covers
+//!   Data groups only.
+//! - MonotonicVote: the vote a replica reads back at a start is not compared, only the votes
+//!   it saves. A vote lost with its volume is seen once the replica saves a lower one.
+//! - MonotonicCommit: the applied index, within one incarnation. A commit marker that moves
+//!   back without an apply emits no probe. An incarnation ends at a crash or at the restart
+//!   after a drain, so a core that stops and starts inside one process stays in it.
+//! - LogMatching, AppliedPrefixesAgree: entries some replica applied. What an apply wrote is
+//!   not compared, except the dedup records; state that arrives by snapshot, split import or
+//!   backup is not compared at all.
+//! - MajorityReached: at the first apply, configurations the run appended and the log copies
+//!   synced by then. A later configuration that only a holder of the entry has appended
+//!   counts, as it does for a leader. At a start, the newest applied configuration, and a
+//!   newer one that committed the entry itself: entries another replica synced but nobody
+//!   applied are not protected, a loss between two starts is seen at the next start in the
+//!   group, and a purged entry counts as held while its purge marker matches an applied
+//!   entry, whatever the state machine holds. A configuration the run did not append, as in a
+//!   restored group, is unknown, and then nothing has a majority. A wipe of one volume counts
+//!   for every replica of its node until they start again. No wipe is exempt, although the
+//!   loss of a volume is the fault plan's work.
+//! - MajorityReached/truncation: a removed or overwritten entry that some replica applied
+//!   before. One applied only afterwards is left to LogMatching.
+//! - DedupUnique: records written by applied direct entries. Records that arrive by snapshot,
+//!   split import or backup, forward markers and queued requests are not seen, and neither is
+//!   a record that disappears. Retention is not modelled: after it expires, 24 hours by
+//!   default, a legal second execution is red. A retried transaction's records are compared
+//!   with the other replicas' one by one, not as a set. Of two replicas of a group on one
+//!   node, either can be named in a report.
+//! - NotAppliedNeverCommitted: direct commits whose dedup record some replica wrote. Queued
+//!   commits and commits without a record are not seen.
+//! - RangeClockRule1: committed entries of the direct path, by the time they registered. A
+//!   read counts once the range admits it, so one that fails later counts as completed. A
+//!   commit that never registered is not judged, and one that registered before a read but
+//!   was proposed after it counts as proposed before. A split's children inherit the reads of
+//!   their source once a Catalog replica resolved the new routes, and an earlier split is
+//!   unknown if its routes arrived by snapshot. A latest read (`u64::MAX`) has no timestamp.
+//!   Reads that do not take the range clock, as on the queued write path, are not seen.
+//! - KeyspaceCoverage: routes that a Catalog replica resolved from their transaction, at each
+//!   root. Routes that arrive by snapshot, and a page rewritten without a new root, are not
+//!   checked: only a new root publishes an epoch.
+//! - ExactlyOnceRelease: native leases, counted per node. Two errors that cancel out within a
+//!   node stay hidden, and a lease that is never released is left to ResourceBaseline.
+//! - ResourceBaseline: see [`super::Invariants::check_resources`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -55,13 +106,15 @@ pub const PROBE_INVARIANTS: [&str; 12] = [
 pub type Violation = (&'static str, String);
 
 /// Where and when a probe was emitted. `live` is false for a probe a destructor emits
-/// after its node was cut: it belongs to a dead incarnation and changes no state.
+/// after its node was cut: it belongs to a dead incarnation and changes no state. `thread`
+/// tells apart jobs that a storage pause interleaves: each runs on one thread to its end.
 #[derive(Clone, Copy, Debug)]
 pub struct Origin {
     pub node: Option<u64>,
     pub incarnation: u64,
     pub t_ns: u64,
     pub live: bool,
+    pub thread: u64,
 }
 
 /// A key in route spans and dedup anchors, ordered like the product's primary key order.
@@ -105,6 +158,7 @@ fn quorum(joint: &[Vec<u64>], holders: &BTreeSet<u64>) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct RouteSpan {
+    group: Uuid,
     start: Option<OrdKey>,
     end: Option<OrdKey>,
 }
@@ -112,9 +166,18 @@ struct RouteSpan {
 impl RouteSpan {
     fn new(span: &Span) -> Self {
         Self {
+            group: span.group,
             start: span.start.as_ref().map(OrdKey::new),
             end: span.end.as_ref().map(OrdKey::new),
         }
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        let before = |end: &Option<OrdKey>, start: &Option<OrdKey>| match (end, start) {
+            (Some(end), Some(start)) => end <= start,
+            _ => false,
+        };
+        !before(&self.end, &other.start) && !before(&other.end, &self.start)
     }
 }
 
@@ -150,11 +213,31 @@ pub type Ledgers = BTreeMap<(Ledger, Option<Uuid>), u64>;
 /// A dedup record: the identity, its commit timestamp and its digest.
 type DedupRecord = (DedupIdentity, u64, Digest);
 
+/// A direct entry on one node: the node, its group and the log index.
+type DirectEntry = (u64, Uuid, u64);
+
+/// A group's applied entry.
+struct AppliedEntry {
+    id: LogPoint,
+    digest: Digest,
+    /// The newest configuration with a majority of it at its first apply.
+    committed_by: Option<(u64, LogPoint)>,
+}
+
+/// A registered direct commit.
+struct Proposal {
+    term: u64,
+    /// The position of its registration in the probe stream.
+    seq: u64,
+}
+
 type Root = (Option<Uuid>, u64);
 type Page = (Option<Uuid>, Vec<RouteSpan>);
 
 #[derive(Default)]
 pub struct Protocol {
+    /// Probes observed so far.
+    seq: u64,
     /// Per replica: its newest durable vote `(term, leader, committed)`.
     votes: BTreeMap<Replica, (u64, u64, bool)>,
     /// Per group and committed vote: the simulated node that claimed it as leader.
@@ -163,28 +246,42 @@ pub struct Protocol {
     voters: BTreeMap<Uuid, BTreeMap<(u64, LogPoint), Vec<Vec<u64>>>>,
     /// Per replica: its durable log, index to log id.
     durable: BTreeMap<Replica, BTreeMap<u64, LogPoint>>,
-    /// Per replica: the index up to which its log was purged when its core last started.
-    purged: BTreeMap<Replica, u64>,
-    /// Per group and index: the first applied log id and digest.
-    applied: BTreeMap<(Uuid, u64), (LogPoint, Digest)>,
+    /// Per replica: the entry up to which its log is purged.
+    purged: BTreeMap<Replica, (u64, LogPoint)>,
+    /// Per group: its applied entries, as first applied.
+    applied: BTreeMap<Uuid, BTreeMap<u64, AppliedEntry>>,
+    /// Entries already reported as lost.
+    lost: BTreeSet<(Uuid, u64)>,
     /// Per node incarnation and replica: the last applied index.
     last_applied: BTreeMap<(u64, u64, Replica), u64>,
     /// Where each replica runs.
     replica_node: BTreeMap<Replica, u64>,
     /// Identities whose committed entry some replica applied, and when the first did.
     committed: BTreeMap<DedupIdentity, u64>,
-    /// Per node and group: the direct entry its last transaction started to apply.
-    applying: BTreeMap<(u64, Uuid), u64>,
-    /// Per node, group and log index: dedup records written by transactions applying that
-    /// entry and not published yet. Two replicas of a group can share a node, so each
-    /// `Applied` publishes one copy.
-    staged: BTreeMap<(u64, Uuid, u64), Vec<DedupRecord>>,
-    /// The first visible dedup record per identity.
-    dedup: BTreeMap<DedupIdentity, (u64, Digest)>,
+    /// Transactions started to apply a direct entry.
+    attempts: u64,
+    /// Per thread: the direct entry its last transaction started to apply, and the attempt.
+    applying: BTreeMap<u64, (DirectEntry, u64)>,
+    /// Per direct entry: the dedup records that each attempt to apply it wrote and that are
+    /// not published yet. Two replicas of a group can share a node, so each `Applied`
+    /// publishes one attempt.
+    staged: BTreeMap<DirectEntry, BTreeMap<u64, Vec<DedupRecord>>>,
+    /// Per identity: the entry of its first visible dedup record, and the record.
+    dedup: BTreeMap<DedupIdentity, (Uuid, u64, u64, Digest)>,
+    /// Per direct entry of a group: the identities its first applied transaction recorded.
+    recorded: BTreeMap<(Uuid, u64), BTreeSet<DedupIdentity>>,
     /// Dedup records made visible, per node incarnation and replica.
     dedup_seen: BTreeSet<(u64, u64, Replica, DedupIdentity)>,
-    /// Per group: the highest snapshot timestamp served on any replica.
-    served: BTreeMap<Uuid, u64>,
+    /// Per group: the highest snapshot timestamp served on any replica, each time it rose.
+    served: BTreeMap<Uuid, Vec<(u64, u64)>>,
+    /// Per group and commit timestamp: the registrations of a direct commit.
+    proposals: BTreeMap<(Uuid, u64), Vec<Proposal>>,
+    /// Committed direct commits by group and timestamp: where they registered, and whether
+    /// RangeClockRule1 reported them.
+    direct: BTreeMap<(Uuid, u64), (u64, bool)>,
+    /// Per group that a split created: its source, and where in the stream the source's
+    /// reads stop counting. `None` while no route names the source any more.
+    sources: BTreeMap<Uuid, BTreeMap<Uuid, Option<u64>>>,
     /// Per table: committed routing roots and pages by commit timestamp. `None` is a delete.
     roots: BTreeMap<Uuid, BTreeMap<u64, Option<Root>>>,
     pages: BTreeMap<(Uuid, Uuid), BTreeMap<u64, Option<Page>>>,
@@ -217,6 +314,7 @@ impl Protocol {
             return out;
         }
         let node = origin.node;
+        self.seq += 1;
         match probe {
             Probe::VoteSaved {
                 group,
@@ -242,9 +340,12 @@ impl Protocol {
                 ..
             } => {
                 self.place(*group, *replica, node);
-                let log = self.durable.entry((*group, *replica)).or_default();
                 for entry in entries {
-                    log.insert(entry.at.index, point(&entry.at));
+                    let (index, id) = (entry.at.index, point(&entry.at));
+                    let log = self.durable.entry((*group, *replica)).or_default();
+                    if let Some(old) = log.insert(index, id).filter(|old| *old != id) {
+                        self.removed(*group, *replica, "overwrote", index, old, &mut out);
+                    }
                     if let Some(voters) = &entry.voters {
                         self.voters
                             .entry(*group)
@@ -264,7 +365,7 @@ impl Protocol {
                 self.recovered(
                     *group,
                     *replica,
-                    purged.map(|at| at.index),
+                    purged.map(|at| (at.index, point(&at))),
                     entries.iter().map(|at| (at.index, point(at))).collect(),
                     &mut out,
                 );
@@ -279,18 +380,19 @@ impl Protocol {
                 let from = after.map_or(0, |after| after.index.saturating_add(1));
                 let log = self.durable.entry((*group, *replica)).or_default();
                 let removed = log.split_off(&from);
-                self.ran(TRUNCATION, 1);
                 for (index, id) in removed {
-                    if self.is_applied(*group, index, id) {
-                        out.push((
-                            MAJORITY_REACHED,
-                            format!(
-                                "group {group} replica {replica} truncated applied entry {index} (term {}, leader {})",
-                                id.0, id.1
-                            ),
-                        ));
-                    }
+                    self.removed(*group, *replica, "truncated", index, id, &mut out);
                 }
+            }
+            Probe::Purged {
+                group,
+                replica,
+                upto,
+                ..
+            } => {
+                self.place(*group, *replica, node);
+                self.purged
+                    .insert((*group, *replica), (upto.index, point(upto)));
             }
             Probe::Applied {
                 group,
@@ -301,11 +403,17 @@ impl Protocol {
             } => {
                 self.place(*group, *replica, node);
                 self.apply(origin, *group, *replica, entry, *digest, &mut out);
-                self.publish_dedup(origin, (*group, *replica), entry.index, &mut out);
+                self.publish_dedup(origin, (*group, *replica), entry, &mut out);
             }
             Probe::DirectApplying { group, index } => {
                 if let Some(node) = node {
-                    self.applying.insert((node, *group), *index);
+                    let entry = (node, *group, *index);
+                    self.attempts += 1;
+                    self.applying.insert(origin.thread, (entry, self.attempts));
+                    self.staged
+                        .entry(entry)
+                        .or_default()
+                        .insert(self.attempts, Vec::new());
                 }
             }
             Probe::LeaderSeen {
@@ -330,37 +438,36 @@ impl Protocol {
                 self.committed
                     .entry(identity.clone())
                     .or_insert(origin.t_ns);
-                if let Some(node) = node
-                    && let Some(index) = self.applying.get(&(node, *group))
+                let applying = self.applying.get(&origin.thread);
+                if let Some((entry, attempt)) = applying
+                    && node == Some(entry.0)
+                    && *group == entry.1
+                    && let Some(records) = self
+                        .staged
+                        .get_mut(entry)
+                        .and_then(|attempts| attempts.get_mut(attempt))
                 {
-                    self.staged
-                        .entry((node, *group, *index))
-                        .or_default()
-                        .push((identity, *commit_ts, *digest));
+                    records.push((identity, *commit_ts, *digest));
                 }
             }
             Probe::SnapshotServed { group, read_ts } => {
                 let served = self.served.entry(*group).or_default();
-                *served = (*served).max(*read_ts);
+                if served.last().is_none_or(|(_, highest)| highest < read_ts) {
+                    served.push((self.seq, *read_ts));
+                }
             }
             Probe::DirectProposed {
-                group, commit_ts, ..
-            } => {
-                let served = self.served.get(group).copied();
-                if served.is_some() {
-                    self.ran(RANGE_CLOCK_RULE1, 1);
-                }
-                if let Some(served) = served
-                    && *commit_ts <= served
-                {
-                    out.push((
-                        RANGE_CLOCK_RULE1,
-                        format!(
-                            "group {group}: direct commit at {commit_ts} registered after a snapshot at {served} was served"
-                        ),
-                    ));
-                }
-            }
+                group,
+                commit_ts,
+                term,
+            } => self
+                .proposals
+                .entry((*group, *commit_ts))
+                .or_default()
+                .push(Proposal {
+                    term: *term,
+                    seq: self.seq,
+                }),
             Probe::RouteEpochPublished {
                 table,
                 commit_ts,
@@ -409,6 +516,7 @@ impl Protocol {
                     .collect();
                 for table in tables {
                     out.extend(self.check_route(table, *commit_ts));
+                    self.learn_splits(table, &mut out);
                 }
             }
             Probe::LedgerSnapshot {
@@ -498,31 +606,66 @@ impl Protocol {
 
     fn is_applied(&self, group: Uuid, index: u64, id: LogPoint) -> bool {
         self.applied
-            .get(&(group, index))
-            .is_some_and(|(applied, _)| *applied == id)
+            .get(&group)
+            .and_then(|entries| entries.get(&index))
+            .is_some_and(|entry| entry.id == id)
+    }
+
+    /// MajorityReached: a replica removed `index` from its log, which nobody may have applied.
+    fn removed(
+        &mut self,
+        group: Uuid,
+        replica: u64,
+        how: &str,
+        index: u64,
+        id: LogPoint,
+        out: &mut Vec<Violation>,
+    ) {
+        self.ran(TRUNCATION, 1);
+        if self.is_applied(group, index, id) {
+            out.push((
+                MAJORITY_REACHED,
+                format!(
+                    "group {group} replica {replica} {how} applied entry {index} (term {}, leader {})",
+                    id.0, id.1
+                ),
+            ));
+        }
     }
 
     /// True when `replica` holds the entry: in its log, or purged below its state machine.
+    /// A purge marker speaks for the entries before it only if it is itself an applied entry.
     fn holds(&self, replica: &Replica, index: u64, id: LogPoint) -> bool {
         self.durable
             .get(replica)
             .is_some_and(|log| log.get(&index) == Some(&id))
-            || self
-                .purged
-                .get(replica)
-                .is_some_and(|purged| index <= *purged)
+            || self.purged.get(replica).is_some_and(|(upto, marker)| {
+                (index < *upto || (index == *upto && id == *marker))
+                    && self.is_applied(replica.0, *upto, *marker)
+            })
     }
 
-    /// MajorityReached for an applied entry. The configurations that may have committed it
-    /// are the one in force at its index and any later one: a leader counts with its
-    /// newest appended configuration. Each must itself be applied, or be in a holder's log.
-    fn majority(&self, group: Uuid, index: u64, id: LogPoint, out: &mut Vec<Violation>) {
-        let replicas = || self.durable.keys().filter(|(of, _)| *of == group);
+    /// MajorityReached for an entry at its first apply. The configurations that may have
+    /// committed it are the one in force at its index and any later one: a leader counts with
+    /// its newest appended configuration. Each must itself be applied, or be in a holder's
+    /// log. Returns the newest that has a majority.
+    fn majority(
+        &self,
+        group: Uuid,
+        index: u64,
+        id: LogPoint,
+        out: &mut Vec<Violation>,
+    ) -> Option<(u64, LogPoint)> {
+        let replicas = || {
+            let logs = self.durable.keys();
+            logs.chain(self.purged.keys())
+                .filter(|(of, _)| *of == group)
+        };
         let holders: BTreeSet<u64> = replicas()
             .filter(|replica| self.holds(replica, index, id))
             .map(|(_, replica)| *replica)
             .collect();
-        let known: Vec<(u64, &Vec<Vec<u64>>)> = self
+        let known: Vec<((u64, LogPoint), &Vec<Vec<u64>>)> = self
             .voters
             .get(&group)
             .into_iter()
@@ -533,15 +676,17 @@ impl Protocol {
                         .iter()
                         .any(|holder| self.holds(&(group, *holder), *at, *config))
             })
-            .map(|((at, _), voters)| (*at, voters))
+            .map(|(config, voters)| (*config, voters))
             .collect();
-        let in_force = known.iter().rev().find(|(at, _)| *at <= index);
-        let later = known.iter().filter(|(at, _)| *at > index);
-        if !in_force
+        let in_force = known.iter().rev().find(|((at, _), _)| *at <= index);
+        let later = known.iter().filter(|((at, _), _)| *at > index);
+        let newest = in_force
             .into_iter()
             .chain(later)
-            .any(|(_, voters)| quorum(voters, &holders))
-        {
+            .filter(|(_, voters)| quorum(voters, &holders))
+            .map(|(config, _)| *config)
+            .max();
+        if newest.is_none() {
             out.push((
                 MAJORITY_REACHED,
                 format!(
@@ -550,6 +695,7 @@ impl Protocol {
                 ),
             ));
         }
+        newest
     }
 
     /// A core started on the log found on its volume.
@@ -557,61 +703,125 @@ impl Protocol {
         &mut self,
         group: Uuid,
         replica: u64,
-        purged: Option<u64>,
+        purged: Option<(u64, LogPoint)>,
         entries: BTreeMap<u64, LogPoint>,
         out: &mut Vec<Violation>,
     ) {
         let key = (group, replica);
-        self.ran(REBUILD, 1);
-        if let Some(purged) = purged {
-            self.purged.insert(key, purged);
-        }
-        let old = self.durable.insert(key, entries).unwrap_or_default();
-        for (index, id) in old {
-            if !self.holds(&key, index, id) && self.is_applied(group, index, id) {
-                self.majority(group, index, id, out);
+        match purged {
+            Some(purged) => self.purged.insert(key, purged),
+            None => self.purged.remove(&key),
+        };
+        self.durable.insert(key, entries);
+        self.rebuild(group, replica, out);
+    }
+
+    /// MajorityReached at a start of `starting`: every applied entry of the group is durable
+    /// on a majority of the voters in force now. Those are the newest applied configuration,
+    /// or a newer one that is not applied yet but committed the entry. A configuration that a
+    /// newer applied one replaced no longer counts, and neither do the voters it removed.
+    fn rebuild(&mut self, group: Uuid, starting: u64, out: &mut Vec<Violation>) {
+        let Some(entries) = self.applied.get(&group).filter(|of| !of.is_empty()) else {
+            return;
+        };
+        let configurations = self.voters.get(&group);
+        let in_force = configurations
+            .into_iter()
+            .flatten()
+            .rfind(|((at, id), _)| self.is_applied(group, *at, *id));
+        let mut found = Vec::new();
+        for (index, entry) in entries {
+            let holds = |replica: &u64| self.holds(&(group, *replica), *index, entry.id);
+            let majority = |voters: &Vec<Vec<u64>>| {
+                let holders = voters.iter().flatten().copied().filter(|r| holds(r));
+                quorum(voters, &holders.collect())
+            };
+            let newer = entry
+                .committed_by
+                .filter(|config| in_force.is_none_or(|(applied, _)| config > applied));
+            let held = in_force.is_some_and(|(_, voters)| majority(voters))
+                || newer
+                    .and_then(|config| configurations?.get(&config))
+                    .is_some_and(majority);
+            if !held && !self.lost.contains(&(group, *index)) {
+                let holders: Vec<u64> = self
+                    .replica_node
+                    .keys()
+                    .filter(|(of, replica)| *of == group && holds(replica))
+                    .map(|(_, replica)| *replica)
+                    .collect();
+                found.push((
+                    *index,
+                    format!(
+                        "group {group} index {index} (term {}, leader {}) was applied, but at the start of replica {starting} it is durable on {holders:?}, voters in force {in_force:?}",
+                        entry.id.0, entry.id.1
+                    ),
+                ));
             }
+        }
+        self.ran(REBUILD, 1);
+        for (index, detail) in found {
+            self.lost.insert((group, index));
+            out.push((MAJORITY_REACHED, detail));
         }
     }
 
-    /// DedupUnique: the entry at `index` applied on `replica`, so the records its
-    /// transaction wrote are visible. A retried transaction wrote further copies of them.
+    /// DedupUnique: `entry` applied on `replica`, so the records one attempt to apply it
+    /// wrote are visible. An identity has one record, from one entry, on every replica.
     fn publish_dedup(
         &mut self,
         origin: Origin,
         replica: Replica,
-        index: u64,
+        entry: &AppliedPosition,
         out: &mut Vec<Violation>,
     ) {
-        let Some(node) = origin.node else { return };
-        let mut published: Vec<DedupRecord> = Vec::new();
-        if let Some(staged) = self.staged.get_mut(&(node, replica.0, index)) {
-            staged.retain(|record| {
-                let first = !published.contains(record);
-                if first {
-                    published.push(record.clone());
-                }
-                !first
-            });
+        let (Some(node), group, index) = (origin.node, replica.0, entry.index) else {
+            return;
+        };
+        let Some(attempts) = self.staged.get_mut(&(node, group, index)) else {
+            return;
+        };
+        // The newest attempt of the replica that retried is the one that committed.
+        let retried = attempts.len() > 1;
+        let Some((_, published)) = attempts.pop_last() else {
+            return;
+        };
+        if attempts.is_empty() {
+            self.staged.remove(&(node, group, index));
         }
-        for (identity, commit_ts, digest) in published {
+        let records: BTreeSet<DedupIdentity> = published.iter().map(|of| of.0.clone()).collect();
+        if !retried {
+            let first = self
+                .recorded
+                .entry((group, index))
+                .or_insert_with(|| records.clone());
+            if *first != records {
+                out.push((
+                    DEDUP_UNIQUE,
+                    format!(
+                        "group {group} index {index}: replica {} on n{node} recorded {records:?}, the first replica {first:?}",
+                        replica.1
+                    ),
+                ));
+            }
+        }
+        for (position, (identity, commit_ts, digest)) in published.iter().enumerate() {
             self.ran(DEDUP_UNIQUE, 1);
             let DedupIdentity {
                 table,
                 key,
                 request_id,
-            } = &identity;
-            let record = *self
-                .dedup
-                .entry(identity.clone())
-                .or_insert((commit_ts, digest));
+            } = identity;
+            let now = (group, index, *commit_ts, *digest);
+            let first = *self.dedup.entry(identity.clone()).or_insert(now);
+            let twice = published[..position].iter().any(|of| of.0 == *identity);
             let seen = (node, origin.incarnation, replica, identity.clone());
-            if record != (commit_ts, digest) {
+            if first != now || twice {
                 out.push((
                     DEDUP_UNIQUE,
                     format!(
-                        "table {table} key {key:?} request {request_id}: dedup record at {commit_ts} differs from the one at {}",
-                        record.0
+                        "table {table} key {key:?} request {request_id}: the dedup record of group {group} index {index} at {commit_ts} is not the first, which group {} index {} wrote at {}",
+                        first.0, first.1, first.2
                     ),
                 ));
             } else if !self.dedup_seen.insert(seen) {
@@ -622,6 +832,108 @@ impl Protocol {
                         replica.1
                     ),
                 ));
+            }
+            self.committed_direct(group, *commit_ts, entry.term, out);
+        }
+    }
+
+    /// The highest snapshot timestamp that the range of `group` had served before `seq`,
+    /// on the group itself and on the ranges it was split from.
+    fn served_before(&self, group: Uuid, seq: u64) -> Option<u64> {
+        let mut highest = None;
+        let mut pending = vec![(group, seq)];
+        let mut seen = BTreeSet::new();
+        while let Some((group, seq)) = pending.pop() {
+            if !seen.insert(group) {
+                continue;
+            }
+            let served = self.served.get(&group).into_iter().flatten().rev();
+            highest = highest.max(served.copied().find(|(at, _)| *at < seq).map(|(_, ts)| ts));
+            let sources = self.sources.get(&group).into_iter().flatten();
+            pending.extend(sources.map(|(of, until)| (*of, until.map_or(seq, |at| at.min(seq)))));
+        }
+        highest
+    }
+
+    /// RangeClockRule1: a direct commit at `commit_ts` was applied in an entry of `term`. Its
+    /// registration, the one of that term if there are several, must precede every snapshot
+    /// served at or above it. A registration that never commits breaks nothing: a deposed
+    /// leader may register below reads its successor served.
+    fn committed_direct(
+        &mut self,
+        group: Uuid,
+        commit_ts: u64,
+        term: u64,
+        out: &mut Vec<Violation>,
+    ) {
+        let key = (group, commit_ts);
+        let Some(proposals) = self.proposals.get(&key) else {
+            return;
+        };
+        let same_term = proposals.iter().rev().find(|of| of.term == term);
+        let Some(proposal) = same_term.or_else(|| proposals.last()) else {
+            return;
+        };
+        let seq = proposal.seq;
+        if let std::collections::btree_map::Entry::Vacant(commit) = self.direct.entry(key) {
+            commit.insert((seq, false));
+            if self.served_before(group, seq).is_some() {
+                self.ran(RANGE_CLOCK_RULE1, 1);
+            }
+            self.range_clock(key, out);
+        }
+    }
+
+    fn range_clock(&mut self, key: (Uuid, u64), out: &mut Vec<Violation>) {
+        let Some(&(seq, false)) = self.direct.get(&key) else {
+            return;
+        };
+        let (group, commit_ts) = key;
+        if let Some(served) = self.served_before(group, seq)
+            && commit_ts <= served
+        {
+            self.direct.insert(key, (seq, true));
+            out.push((
+                RANGE_CLOCK_RULE1,
+                format!(
+                    "group {group}: direct commit at {commit_ts} registered after a snapshot at {served} was served on its range"
+                ),
+            ));
+        }
+    }
+
+    /// Learns from the resolved route epochs of `table` which groups a split created, and
+    /// judges the direct commits their reads now bind. A source that a newer epoch still
+    /// routes keeps only part of the span, so only its reads so far count.
+    fn learn_splits(&mut self, table: Uuid, out: &mut Vec<Violation>) {
+        let timestamps: Vec<u64> = self.roots[&table].keys().copied().collect();
+        let mut learned = BTreeSet::new();
+        for pair in timestamps.windows(2) {
+            let (Ok(old), Ok(new)) = (self.routes(table, pair[0]), self.routes(table, pair[1]))
+            else {
+                continue;
+            };
+            for child in &new {
+                if old.iter().any(|route| route.group == child.group) {
+                    continue;
+                }
+                for source in old.iter().filter(|route| route.overlaps(child)) {
+                    let routed = new.iter().any(|route| route.group == source.group);
+                    let until = routed.then_some(self.seq);
+                    let sources = self.sources.entry(child.group).or_default();
+                    if let std::collections::btree_map::Entry::Vacant(link) =
+                        sources.entry(source.group)
+                    {
+                        link.insert(until);
+                        learned.insert(child.group);
+                    }
+                }
+            }
+        }
+        if !learned.is_empty() {
+            let commits: Vec<_> = self.direct.keys().copied().collect();
+            for key in commits {
+                self.range_clock(key, out);
             }
         }
     }
@@ -662,26 +974,36 @@ impl Protocol {
                 }
             }
         }
-        match self.applied.get(&(group, entry.index)) {
-            Some((first, _)) if *first != id => out.push((
+        let entries = self.applied.entry(group).or_default();
+        match entries.get(&entry.index) {
+            Some(first) if first.id != id => out.push((
                 LOG_MATCHING,
                 format!(
                     "group {group} index {}: replica {replica} applied term {} leader {}, first apply was term {} leader {}",
-                    entry.index, id.0, id.1, first.0, first.1
+                    entry.index, id.0, id.1, first.id.0, first.id.1
                 ),
             )),
-            Some((_, first)) if *first != digest => out.push((
+            Some(first) if first.digest != digest => out.push((
                 APPLIED_PREFIXES_AGREE,
                 format!(
-                    "group {group} index {}: replica {replica} applied digest {digest:?}, first apply had {first:?}",
-                    entry.index
+                    "group {group} index {}: replica {replica} applied digest {digest:?}, first apply had {:?}",
+                    entry.index, first.digest
                 ),
             )),
             Some(_) => {}
             None => {
-                self.applied.insert((group, entry.index), (id, digest));
+                let first = AppliedEntry {
+                    id,
+                    digest,
+                    committed_by: None,
+                };
+                entries.insert(entry.index, first);
                 self.ran(MAJORITY_REACHED, 1);
-                self.majority(group, entry.index, id, out);
+                let committed_by = self.majority(group, entry.index, id, out);
+                let entries = self.applied.entry(group).or_default();
+                if let Some(first) = entries.get_mut(&entry.index) {
+                    first.committed_by = committed_by;
+                }
             }
         }
     }
@@ -691,7 +1013,7 @@ impl Protocol {
         self.native.remove(&node);
         self.ledgers.remove(&node);
         self.staged.retain(|(owner, ..), _| *owner != node);
-        self.applying.retain(|(owner, _), _| *owner != node);
+        self.applying.retain(|_, ((owner, ..), _)| *owner != node);
     }
 
     /// The node's volume was replaced: its replicas lost their logs. A vote the old
@@ -726,15 +1048,12 @@ impl Protocol {
         self.ledgers.get(&node).cloned().unwrap_or_default()
     }
 
-    /// KeyspaceCoverage: the root of `table` committed at `ts` must reach pages, as of that
-    /// timestamp, that cover the key space once. `WritesResolved` triggers it, when every
-    /// record of the commit is in place.
-    fn check_route(&mut self, table: Uuid, ts: u64) -> Option<Violation> {
-        let Some(Some((first, epoch))) = self.roots.get(&table)?.get(&ts) else {
-            return None;
-        };
-        let (mut spans, mut seen, mut next) = (Vec::new(), BTreeSet::new(), *first);
-        let mut broken = None;
+    /// The routes that the root of `table` committed at `ts` reaches, as of that timestamp,
+    /// in page order. An unreadable page is the error, after the routes before it.
+    fn routes(&self, table: Uuid, ts: u64) -> Result<Vec<RouteSpan>, (Vec<RouteSpan>, Uuid)> {
+        let root = self.roots.get(&table).and_then(|roots| roots.get(&ts));
+        let mut next = root.and_then(|root| root.and_then(|(first, _)| first));
+        let (mut spans, mut seen) = (Vec::new(), BTreeSet::new());
         while let Some(page_id) = next {
             let page = self
                 .pages
@@ -742,15 +1061,30 @@ impl Protocol {
                 .and_then(|page| page.range(..=ts).next_back());
             match page {
                 Some((_, Some((following, routes)))) if seen.insert(page_id) => {
-                    spans.extend(routes.iter().map(|r| (r.start.clone(), r.end.clone())));
+                    spans.extend(routes.iter().cloned());
                     next = *following;
                 }
-                _ => {
-                    broken = Some(page_id);
-                    break;
-                }
+                _ => return Err((spans, page_id)),
             }
         }
+        Ok(spans)
+    }
+
+    /// KeyspaceCoverage: the root of `table` committed at `ts` must reach pages, as of that
+    /// timestamp, that cover the key space once. `WritesResolved` triggers it, when every
+    /// record of the commit is in place.
+    fn check_route(&mut self, table: Uuid, ts: u64) -> Option<Violation> {
+        let Some(Some((_, epoch))) = self.roots.get(&table)?.get(&ts) else {
+            return None;
+        };
+        let (routes, broken) = match self.routes(table, ts) {
+            Ok(routes) => (routes, None),
+            Err((routes, page)) => (routes, Some(page)),
+        };
+        let spans: Vec<_> = routes
+            .into_iter()
+            .map(|route| (route.start, route.end))
+            .collect();
         let violation = (broken.is_some() || !covers_keyspace(&spans)).then(|| {
             (
                 KEYSPACE_COVERAGE,
@@ -796,6 +1130,7 @@ mod tests {
             incarnation: 0,
             t_ns: 0,
             live: true,
+            thread: 0,
         }
     }
 
@@ -929,6 +1264,195 @@ mod tests {
         );
         let lost = protocol.observe(origin(3), &recovered(3, None, &log[..1]));
         assert_eq!(kinds(&lost), [MAJORITY_REACHED]);
+    }
+
+    /// Voters move from {1, 2, 3} to `next` after entry 2 was applied, and every current
+    /// voter holds the log. Returns the state and the log.
+    fn moved_to(next: &[u64]) -> (Protocol, [AppliedPosition; 4]) {
+        let mut protocol = Protocol::new();
+        let log = [at(1, 1), at(2, 1), at(3, 1), at(4, 1)];
+        for replica in 1..=3 {
+            protocol.observe(origin(replica), &appended(replica, &log[..2]));
+        }
+        for entry in &log[..2] {
+            assert!(
+                protocol
+                    .observe(origin(1), &applied(1, *entry, 9))
+                    .is_empty()
+            );
+        }
+        let joint = vec![vec![1, 2, 3], next.to_vec()];
+        let members = [(log[2], joint), (log[3], vec![next.to_vec()])];
+        for (entry, voters) in &members {
+            for replica in (1..=3).chain(next.iter().copied()) {
+                let probe = Probe::Appended {
+                    group: GROUP,
+                    kind: GroupKind::Catalog,
+                    replica,
+                    entries: vec![LogEntry {
+                        at: *entry,
+                        voters: Some(voters.clone()),
+                    }],
+                };
+                protocol.observe(origin(replica), &probe);
+            }
+            assert!(
+                protocol
+                    .observe(origin(1), &applied(1, *entry, 9))
+                    .is_empty()
+            );
+        }
+        for replica in next {
+            protocol.observe(origin(*replica), &appended(*replica, &log[..2]));
+        }
+        (protocol, log)
+    }
+
+    #[test]
+    fn a_loss_after_a_membership_change_is_judged_by_the_current_voters() {
+        // B1 of the review of #116: voter 2 and the removed voter 3 hold entry 2.
+        for (next, losers) in [([1, 2, 4], [1, 4]), ([1, 4, 5], [4, 5])] {
+            let (mut protocol, log) = moved_to(&next);
+            let lost = [log[0], log[2], log[3]];
+            let first = protocol.observe(origin(losers[0]), &recovered(losers[0], None, &lost));
+            assert!(first.is_empty(), "one of three may lose it: {first:?}");
+            let second = protocol.observe(origin(losers[1]), &recovered(losers[1], None, &lost));
+            assert_eq!(kinds(&second), [MAJORITY_REACHED], "voters {next:?}");
+        }
+        // The removed voter may lose everything.
+        let (mut protocol, _) = moved_to(&[1, 2, 4]);
+        assert!(
+            protocol
+                .observe(origin(3), &recovered(3, None, &[]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_wiped_voter_no_longer_holds_an_applied_entry() {
+        let mut protocol = Protocol::new();
+        let log = [at(1, 1), at(2, 1)];
+        protocol.observe(origin(1), &appended(1, &log));
+        protocol.observe(origin(2), &appended(2, &log));
+        protocol.observe(origin(3), &appended(3, &log[..1]));
+        protocol.observe(origin(1), &applied(1, log[0], 9));
+        assert!(
+            protocol
+                .observe(origin(1), &applied(1, log[1], 9))
+                .is_empty()
+        );
+        protocol.crashed(2);
+        protocol.wiped(2);
+        let start = protocol.observe(origin(2), &recovered(2, None, &[]));
+        assert_eq!(kinds(&start), [MAJORITY_REACHED]);
+    }
+
+    #[test]
+    fn overwriting_an_applied_entry_violates_majority_reached() {
+        let mut protocol = Protocol::new();
+        for replica in 1..=3 {
+            protocol.observe(origin(replica), &appended(replica, &[at(1, 1), at(2, 1)]));
+        }
+        protocol.observe(origin(1), &applied(1, at(1, 1), 9));
+        // Entry 2 was never applied: a newer leader may replace it.
+        assert!(
+            protocol
+                .observe(origin(3), &appended(3, &[at(2, 2)]))
+                .is_empty()
+        );
+        protocol.observe(origin(1), &applied(1, at(2, 1), 9));
+        let overwritten = protocol.observe(origin(2), &appended(2, &[at(2, 2)]));
+        assert_eq!(kinds(&overwritten), [MAJORITY_REACHED]);
+    }
+
+    #[test]
+    fn a_purge_marker_under_another_log_id_holds_nothing() {
+        let mut protocol = Protocol::new();
+        let log = [at(1, 1), at(2, 1)];
+        for replica in 1..=3 {
+            protocol.observe(origin(replica), &appended(replica, &log));
+        }
+        for entry in &log {
+            protocol.observe(origin(1), &applied(1, *entry, 9));
+        }
+        let first = protocol.observe(origin(2), &recovered(2, Some(at(2, 9)), &[]));
+        assert!(first.is_empty(), "one of three may lose it: {first:?}");
+        let second = protocol.observe(origin(3), &recovered(3, Some(at(2, 9)), &[]));
+        assert!(kinds(&second).contains(&MAJORITY_REACHED), "{second:?}");
+    }
+
+    fn dedup_at(commit_ts: u64) -> Probe {
+        Probe::DedupApplied {
+            group: GROUP,
+            table: Uuid::from_u128(1),
+            anchor: Key::Int64(5),
+            request_id: Uuid::from_u128(2),
+            commit_ts,
+            digest: Digest::from_bytes([1; 32]),
+        }
+    }
+
+    #[test]
+    fn a_second_entry_for_one_identity_is_caught_after_a_restart() {
+        let mut protocol = Protocol::new();
+        for replica in 1..=3 {
+            protocol.observe(origin(replica), &appended(replica, &[at(1, 1), at(2, 1)]));
+        }
+        let mut write = |incarnation, index| {
+            let from = Origin {
+                incarnation,
+                ..origin(1)
+            };
+            let applying = Probe::DirectApplying {
+                group: GROUP,
+                index,
+            };
+            protocol.observe(from, &applying);
+            protocol.observe(from, &dedup_at(10));
+            kinds(&protocol.observe(from, &applied(1, at(index, 1), 9)))
+        };
+        assert!(write(0, 1).is_empty());
+        // The restart applies the same entry again.
+        assert!(write(1, 1).is_empty());
+        // Another entry executes the identity, with the same timestamp and digest.
+        assert_eq!(write(2, 2), [DEDUP_UNIQUE]);
+    }
+
+    #[test]
+    fn two_members_of_one_batch_cannot_carry_one_identity() {
+        let mut protocol = Protocol::new();
+        for replica in 1..=3 {
+            protocol.observe(origin(replica), &appended(replica, &[at(1, 1)]));
+        }
+        let applying = Probe::DirectApplying {
+            group: GROUP,
+            index: 1,
+        };
+        protocol.observe(origin(1), &applying);
+        protocol.observe(origin(1), &dedup_at(10));
+        protocol.observe(origin(1), &dedup_at(10));
+        assert_eq!(
+            kinds(&protocol.observe(origin(1), &applied(1, at(1, 1), 9))),
+            [DEDUP_UNIQUE]
+        );
+    }
+
+    #[test]
+    fn a_deposed_leaders_registration_is_not_a_commit() {
+        let mut protocol = Protocol::new();
+        protocol.observe(
+            origin(2),
+            &Probe::SnapshotServed {
+                group: GROUP,
+                read_ts: 20,
+            },
+        );
+        let late = Probe::DirectProposed {
+            group: GROUP,
+            commit_ts: 15,
+            term: 1,
+        };
+        assert!(protocol.observe(origin(1), &late).is_empty());
     }
 
     #[test]
@@ -1096,23 +1620,262 @@ mod tests {
         // The same record from a second entry of one incarnation is a second record.
         assert_eq!(write(2, 2, 2, 10, 1), [DEDUP_UNIQUE]);
         assert_eq!(protocol.committed().count(), 1);
+    }
 
+    fn served(group: Uuid, read_ts: u64) -> Probe {
+        Probe::SnapshotServed { group, read_ts }
+    }
+
+    fn proposed(group: Uuid, commit_ts: u64, term: u64) -> Probe {
+        Probe::DirectProposed {
+            group,
+            commit_ts,
+            term,
+        }
+    }
+
+    /// Replica 1 of `group` applies a direct commit at `index`, of term 1.
+    fn commits(protocol: &mut Protocol, group: Uuid, index: u64, commit_ts: u64) -> Vec<Violation> {
+        let mut out = Vec::new();
+        let probes = [
+            Probe::Appended {
+                group,
+                kind: GroupKind::Catalog,
+                replica: 1,
+                entries: vec![LogEntry {
+                    at: at(index, 1),
+                    voters: (index == 1).then(|| vec![vec![1]]),
+                }],
+            },
+            Probe::DirectApplying { group, index },
+            Probe::DedupApplied {
+                group,
+                table: Uuid::from_u128(1),
+                anchor: Key::Int64(5),
+                request_id: Uuid::from_u128(u128::from(commit_ts)),
+                commit_ts,
+                digest: Digest::from_bytes([1; 32]),
+            },
+            Probe::Applied {
+                group,
+                kind: GroupKind::Catalog,
+                replica: 1,
+                entry: at(index, 1),
+                digest: Digest::from_bytes([1; 32]),
+            },
+        ];
+        for probe in &probes {
+            out.extend(protocol.observe(origin(1), probe));
+        }
+        out
+    }
+
+    #[test]
+    fn a_commit_must_register_above_the_snapshots_served() {
+        let mut protocol = Protocol::new();
+        protocol.observe(origin(1), &proposed(GROUP, 15, 1));
+        protocol.observe(origin(1), &served(GROUP, 20));
+        protocol.observe(origin(1), &proposed(GROUP, 21, 1));
+        protocol.observe(origin(1), &proposed(GROUP, 20, 1));
+        // Registered before the read, and above it.
+        assert!(commits(&mut protocol, GROUP, 1, 15).is_empty());
+        assert!(commits(&mut protocol, GROUP, 2, 21).is_empty());
+        let below = commits(&mut protocol, GROUP, 3, 20);
+        assert_eq!(kinds(&below), [RANGE_CLOCK_RULE1]);
+        assert_eq!(protocol.exercised()[RANGE_CLOCK_RULE1], 2);
+    }
+
+    #[test]
+    fn a_commit_is_judged_by_the_registration_of_its_own_term() {
+        let mut protocol = Protocol::new();
+        protocol.observe(origin(1), &proposed(GROUP, 15, 1));
+        protocol.observe(origin(2), &served(GROUP, 20));
+        // A deposed leader registers the timestamp again, below a read its successor served.
+        protocol.observe(origin(3), &proposed(GROUP, 15, 2));
+        assert!(commits(&mut protocol, GROUP, 1, 15).is_empty());
+    }
+
+    #[test]
+    fn a_split_child_keeps_the_reads_of_its_source() {
+        let (table, page_id) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let [left, right, third] = [21, 22, 23].map(Uuid::from_u128);
+        let span = |group, start: Option<i64>, end: Option<i64>| Span {
+            group,
+            start: start.map(Key::Int64),
+            end: end.map(Key::Int64),
+        };
+        let publish = |protocol: &mut Protocol, commit_ts, spans: Vec<Span>| {
+            let root = RouteRecord::Root {
+                first_page: Some(page_id),
+                routing_epoch: 1,
+            };
+            let page = RouteRecord::Page {
+                page_id,
+                next_page: None,
+                spans,
+            };
+            let mut out = Vec::new();
+            for record in [root, page] {
+                let probe = Probe::RouteEpochPublished {
+                    table,
+                    commit_ts,
+                    record,
+                };
+                out.extend(protocol.observe(origin(1), &probe));
+            }
+            out.extend(protocol.observe(origin(1), &Probe::WritesResolved { commit_ts }));
+            out
+        };
+        let halves = || vec![span(left, None, Some(5)), span(right, Some(5), None)];
+        let split = |protocol: &mut Protocol| publish(protocol, 30, halves());
+        let read = || {
+            let mut protocol = Protocol::new();
+            assert!(publish(&mut protocol, 5, vec![span(GROUP, None, None)]).is_empty());
+            protocol.observe(origin(1), &served(GROUP, 35));
+            protocol
+        };
+        // The child commits below the read, and above it.
+        let mut protocol = read();
+        assert!(split(&mut protocol).is_empty());
+        protocol.observe(origin(1), &proposed(left, 34, 1));
+        protocol.observe(origin(1), &proposed(right, 36, 1));
+        assert!(commits(&mut protocol, right, 1, 36).is_empty());
+        let below = commits(&mut protocol, left, 1, 34);
+        assert_eq!(kinds(&below), [RANGE_CLOCK_RULE1]);
+        // The child commits before a Catalog replica resolved the routes.
+        let mut protocol = read();
+        protocol.observe(origin(1), &proposed(left, 34, 1));
+        assert!(commits(&mut protocol, left, 1, 34).is_empty());
+        assert_eq!(kinds(&split(&mut protocol)), [RANGE_CLOCK_RULE1]);
+        // A read before the registration only.
+        let mut protocol = Protocol::new();
+        publish(&mut protocol, 5, vec![span(GROUP, None, None)]);
+        protocol.observe(origin(1), &proposed(left, 34, 1));
+        protocol.observe(origin(1), &served(GROUP, 35));
+        assert!(split(&mut protocol).is_empty());
+        assert!(commits(&mut protocol, left, 1, 34).is_empty());
+        // A split of the child, and a source that keeps part of its span: its reads after
+        // the split are not on the new child's keys.
+        let mut protocol = read();
+        split(&mut protocol);
+        protocol.observe(origin(1), &served(left, 41));
+        let halves = vec![
+            span(left, None, Some(3)),
+            span(third, Some(3), Some(5)),
+            span(right, Some(5), None),
+        ];
+        assert!(publish(&mut protocol, 50, halves).is_empty());
+        protocol.observe(origin(1), &served(left, 60));
+        for (commit_ts, index) in [(55, 1), (40, 2), (34, 3)] {
+            protocol.observe(origin(1), &proposed(third, commit_ts, 1));
+            let found = commits(&mut protocol, third, index, commit_ts);
+            let expected: &[&str] = if commit_ts == 55 {
+                &[]
+            } else {
+                &[RANGE_CLOCK_RULE1]
+            };
+            assert_eq!(kinds(&found), expected, "commit at {commit_ts}");
+        }
+    }
+
+    #[test]
+    fn jobs_that_a_storage_pause_interleaves_keep_their_own_records() {
+        // Two replicas of a group on one node apply entries 1 and 2 at the same time.
+        let on = |thread| Origin {
+            thread,
+            ..origin(1)
+        };
+        let mut protocol = Protocol::new();
+        for replica in 1..=3 {
+            protocol.observe(origin(replica), &appended(replica, &[at(1, 1), at(2, 1)]));
+        }
+        let applying = |index| Probe::DirectApplying {
+            group: GROUP,
+            index,
+        };
+        let dedup = |request: u128, commit_ts| Probe::DedupApplied {
+            group: GROUP,
+            table: Uuid::from_u128(1),
+            anchor: Key::Int64(5),
+            request_id: Uuid::from_u128(request),
+            commit_ts,
+            digest: Digest::from_bytes([1; 32]),
+        };
+        protocol.observe(on(1), &applying(1));
+        protocol.observe(on(2), &applying(2));
+        protocol.observe(on(1), &dedup(7, 10));
+        protocol.observe(on(2), &dedup(8, 11));
+        assert!(protocol.observe(on(1), &applied(1, at(1, 1), 9)).is_empty());
+        assert!(protocol.observe(on(2), &applied(4, at(2, 1), 9)).is_empty());
+        // Node 2 applies them one after the other and records the same.
+        for (index, request, commit_ts) in [(1, 7, 10), (2, 8, 11)] {
+            protocol.observe(origin(2), &applying(index));
+            protocol.observe(origin(2), &dedup(request, commit_ts));
+            let found = protocol.observe(origin(2), &applied(2, at(index, 1), 9));
+            assert!(found.is_empty(), "index {index}: {found:?}");
+        }
+        // A replica that applies the entry without its record disagrees.
+        protocol.observe(origin(3), &applying(1));
+        let missing = protocol.observe(origin(3), &applied(3, at(1, 1), 9));
+        assert_eq!(kinds(&missing), [DEDUP_UNIQUE]);
+    }
+
+    #[test]
+    fn a_replica_that_installed_a_snapshot_holds_what_it_purged() {
+        let (mut protocol, log) = moved_to(&[1, 2, 4]);
+        // Replica 4 never had entries 1 and 2 in its log: they are below its snapshot.
+        protocol.observe(origin(4), &recovered(4, None, &log[2..]));
         protocol.observe(
-            origin(1),
-            &Probe::SnapshotServed {
+            origin(4),
+            &Probe::Purged {
                 group: GROUP,
-                read_ts: 20,
+                kind: GroupKind::Catalog,
+                replica: 4,
+                upto: log[1],
             },
         );
-        let proposed = |commit_ts| Probe::DirectProposed {
+        let lost = [log[0], log[2], log[3]];
+        let first = protocol.observe(origin(1), &recovered(1, None, &lost));
+        assert!(first.is_empty(), "2 and 4 hold it: {first:?}");
+        let second = protocol.observe(origin(2), &recovered(2, None, &lost));
+        assert_eq!(kinds(&second), [MAJORITY_REACHED]);
+    }
+
+    #[test]
+    fn an_unapplied_configuration_that_committed_an_entry_still_protects_it() {
+        let member = |replica, index, voters: Vec<Vec<u64>>| Probe::Appended {
             group: GROUP,
-            commit_ts,
-            term: 1,
+            kind: GroupKind::Catalog,
+            replica,
+            entries: vec![LogEntry {
+                at: at(index, 1),
+                voters: Some(voters),
+            }],
         };
-        assert!(protocol.observe(origin(2), &proposed(21)).is_empty());
+        let mut protocol = Protocol::new();
+        let joint = || vec![vec![1, 2, 3], vec![4]];
+        for replica in 1..=4 {
+            protocol.observe(origin(replica), &member(replica, 1, joint()));
+        }
+        assert!(
+            protocol
+                .observe(origin(4), &applied(4, at(1, 1), 9))
+                .is_empty()
+        );
+        protocol.observe(origin(4), &appended(4, &[at(2, 1)]));
+        protocol.observe(origin(4), &member(4, 3, vec![vec![4]]));
+        assert!(
+            protocol
+                .observe(origin(4), &applied(4, at(2, 1), 9))
+                .is_empty()
+        );
+        // Voters 1 to 3 never had entry 2, and need not.
+        let held = recovered(1, None, &[at(1, 1)]);
+        assert!(protocol.observe(origin(1), &held).is_empty());
+        let gone = recovered(4, None, &[at(1, 1), at(3, 1)]);
         assert_eq!(
-            kinds(&protocol.observe(origin(2), &proposed(20))),
-            [RANGE_CLOCK_RULE1]
+            kinds(&protocol.observe(origin(4), &gone)),
+            [MAJORITY_REACHED]
         );
     }
 
@@ -1120,6 +1883,7 @@ mod tests {
     fn committed_routes_must_cover_the_key_space() {
         let (table, page_id) = (Uuid::from_u128(1), Uuid::from_u128(2));
         let span = |start: Option<i64>, end: Option<i64>| Span {
+            group: GROUP,
             start: start.map(Key::Int64),
             end: end.map(Key::Int64),
         };

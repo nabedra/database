@@ -183,6 +183,7 @@ mod tests {
                     page_id: uuid::Uuid::nil(),
                     next_page: None,
                     spans: vec![Span {
+                        group: uuid::Uuid::nil(),
                         start: None,
                         end: Some(Key::Int64(4)),
                     }],
@@ -203,7 +204,7 @@ mod tests {
             json!({"seq":0,"t":5,"node":"n2","action":"RouteEpochPublished","vars":{
                 "table":"00000000-0000-0000-0000-000000000000","commit_ts":1,
                 "record":{"page":{"page_id":"00000000-0000-0000-0000-000000000000",
-                "spans":[{"end":4}]}},"incarnation":1}})
+                "spans":[{"group":"00000000-0000-0000-0000-000000000000","end":4}]}},"incarnation":1}})
         );
         // Time never decreases, and seq counts every step.
         assert_eq!(lines[2]["seq"], 1);

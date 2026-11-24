@@ -2,7 +2,7 @@ id = "oltp-probes-planted"
 module = "oltp"
 kinds = ["S", "H"]
 # Fault model. Sensitivity of the probe-driven invariants (P10-PROBES). In a scratch worktree the
-# same seeds run twice. The clean twin must report nothing. Then
+# same seeds run twice. The clean twin must report nothing, on seed 18 too. Then
 # server/sim-oltp/src/probes/double-apply.patch makes every replica apply each normal Raft entry
 # twice. The state machine's replay check hides the repeat from clients, so the history checkers
 # and public stats stay clean, and only MonotonicCommit (from the Applied probes) reports it. Both
