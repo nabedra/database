@@ -11,7 +11,7 @@ pub use peers::{PeerDirectory, PeerProtocol};
 
 use std::{
     collections::BTreeSet,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -25,7 +25,6 @@ use nabedra_sim::{
 };
 pub use nabedra_transport::FrameKind;
 use nabedra_transport::{StreamFrame, session_alpn};
-use tokio::time::Instant;
 
 type Link = (Option<u64>, Option<u64>);
 type Profile<T, A> = Box<dyn FnMut(T) -> A + Send>;
@@ -71,7 +70,7 @@ struct State {
     frame_profile: Option<Profile<Frame, Action>>,
     http_profile: Option<Profile<HttpFlush, Action>>,
     dial_profile: Option<Profile<Link, Dial>>,
-    started: Instant,
+    world: Weak<World>,
     trace: Trace,
 }
 
@@ -92,7 +91,7 @@ impl SimNet {
             frame_profile: None,
             http_profile: None,
             dial_profile: None,
-            started: Instant::now(),
+            world: Arc::downgrade(world),
             trace: Trace::new(),
         }));
         world.set_net_planner(Router(state.clone()));
@@ -172,10 +171,10 @@ impl SimNet {
 
 impl State {
     fn record(&mut self, event: std::fmt::Arguments<'_>) {
-        self.trace.record(
-            self.started.elapsed().as_millis().try_into().unwrap(),
-            event,
-        );
+        if let Some(world) = self.world.upgrade() {
+            self.trace
+                .record(world.elapsed().as_millis().try_into().unwrap(), event);
+        }
     }
 }
 

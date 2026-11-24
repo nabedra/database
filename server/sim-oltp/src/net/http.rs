@@ -13,7 +13,6 @@ use nabedra_transport::backend::{self, Target};
 /// simulated client's node context and reuse it for sequential requests.
 pub struct HttpConnection {
     sender: SendRequest<Full<Bytes>>,
-    driver: tokio::task::JoinHandle<()>,
 }
 
 impl HttpConnection {
@@ -22,10 +21,11 @@ impl HttpConnection {
         let (sender, connection) = http1::handshake(TokioIo::new(stream))
             .await
             .map_err(io::Error::other)?;
-        let driver = nabedra_rt::task::spawn(async move {
+        // Hyper drives any outstanding body to completion when the sender is dropped.
+        drop(nabedra_rt::task::spawn(async move {
             let _ = connection.await;
-        });
-        Ok(Self { sender, driver })
+        }));
+        Ok(Self { sender })
     }
 
     pub async fn send(
@@ -34,11 +34,5 @@ impl HttpConnection {
     ) -> Result<Response<Incoming>, hyper::Error> {
         self.sender.ready().await?;
         self.sender.send_request(request).await
-    }
-}
-
-impl Drop for HttpConnection {
-    fn drop(&mut self) {
-        self.driver.abort();
     }
 }

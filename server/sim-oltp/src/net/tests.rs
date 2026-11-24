@@ -62,7 +62,7 @@ fn run_replays(name: &str, scenario: impl AsyncFn(&Arc<World>, &SimNet, u64)) {
 }
 
 async fn timeout<F: Future>(future: F) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(10), future)
+    nabedra_rt::time::timeout(Duration::from_secs(10), future)
         .await
         .expect("simulated network scenario deadline")
 }
@@ -347,14 +347,14 @@ fn stream_delay() {
 
         let slow = world.spawn_node(CLIENT, fixture.call(1));
         planned.notified().await;
-        let start = Instant::now();
+        let start = world.elapsed();
         ok(fixture.call(2), 2).await;
         ok(fixture.call(3), 3).await;
-        assert!(start.elapsed() < delay);
+        assert!(world.elapsed() - start < delay);
         assert!(!slow.is_finished());
         let reply = slow.await.unwrap().unwrap();
         assert_eq!(reply.header.as_slice(), b"1");
-        assert!(start.elapsed() >= delay);
+        assert!(world.elapsed() - start >= delay);
         assert_eq!(world.connections().len(), 1, "calls must share a session");
         fixture.stop().await;
     });

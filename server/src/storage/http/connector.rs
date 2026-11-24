@@ -70,7 +70,9 @@ mod simulated {
 
             let timeout = self.timeout;
             Box::pin(async move {
-                let host = uri.host().ok_or(io::ErrorKind::InvalidInput)?;
+                let host = uri
+                    .host()
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
                 let host = host
                     .strip_prefix('[')
                     .and_then(|ip| ip.strip_suffix(']'))
