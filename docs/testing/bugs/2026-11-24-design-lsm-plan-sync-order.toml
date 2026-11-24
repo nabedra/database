@@ -1,0 +1,15 @@
+# Design review dr-lsm (wave-dr), finding F3. Plan text only: the shipped code is correct. Open until the plan text is fixed.
+id = "DR-LSM-3"
+title = "The plan pads after fdatasync and syncs only the previous segment across rolls, so a destroyed 4 KiB page or an older segment loses acknowledged writes"
+class = "other"
+module = "lsm"
+guarantees = ["LSM-G01"]
+scenarios = ["NS05", "NS08", "LSM01"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "specs/lsm/mutants/pad_after_sync.cfg"
+seed = "unknown"
+why_not_caught = "The code writes the pad before the sync and syncs every dirty segment, so tests built from the code pass; only the plan text is wrong."
+invariant_added = "No write touches a 4 KiB page that holds bytes a completed sync covered: the pad is written before the sync, and a sync covers every segment with unsynced bytes."
+fix_commits = []
+revert_patch_ok = false

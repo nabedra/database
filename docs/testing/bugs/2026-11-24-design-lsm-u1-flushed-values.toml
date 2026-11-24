@@ -1,0 +1,15 @@
+# Design review dr-lsm (wave-dr), finding F2. Open: no fix yet.
+id = "DR-LSM-2"
+title = "Silent damage of a flushed journal record truncates its group at open and orphans the run locators into it"
+class = "other"
+module = "lsm"
+guarantees = ["LSM-G01", "LSM-G03"]
+scenarios = ["NS07", "NS13", "LSM01"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "NS07"
+seed = "unknown"
+why_not_caught = "NS07 flips bits in a cleanly closed store, whose close pad certifies every record, so the no-evidence path never meets a record at or below flushed_seq."
+invariant_added = "A non-valid journal position at or below flushed_seq is damage with evidence: recovery skips it and never zeroes or re-epochs bytes a run may reference."
+fix_commits = []
+revert_patch_ok = false

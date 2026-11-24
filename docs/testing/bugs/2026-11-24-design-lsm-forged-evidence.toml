@@ -1,0 +1,15 @@
+# Design review dr-lsm (wave-dr), finding F1. Open: no fix yet.
+id = "DR-LSM-1"
+title = "Client bytes inside a journal payload can pass as recovery evidence or as a replayed record after a torn header"
+class = "other"
+module = "lsm"
+guarantees = ["LSM-G02", "LSM-G03"]
+scenarios = ["NS05", "NS25", "LSM01"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "NS05"
+seed = "unknown"
+why_not_caught = "The campaign generates values from a seeded generator and never writes a value that embeds a valid record header at a 4 KiB boundary, and the spec models records, not bytes."
+invariant_added = "Recovery accepts as evidence or as a resync point only a header authenticated by a per-store secret, so bytes a client wrote never count as a journal record."
+fix_commits = []
+revert_patch_ok = false
