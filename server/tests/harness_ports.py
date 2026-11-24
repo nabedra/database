@@ -16,6 +16,7 @@ probing the port, then the next attempt starts at once.
 import errno
 import os
 import socket
+import sys
 
 ATTEMPTS = 5
 
@@ -38,6 +39,7 @@ def pick_port():
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
     _picks += 1
+    print(f'harness_ports: pick {_picks} is port {port}', file=sys.stderr, flush=True)
     collisions = os.environ.get('NABEDRA_TEST_PORT_COLLISIONS', '')
     if str(_picks) in collisions.split(','):
         holder = socket.socket()

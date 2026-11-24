@@ -361,6 +361,8 @@ class Rf3Cluster:
         else:
             command = [self.binary, 'worker', '--bootstrap', str(path)]
         self.workers[name] = Process(name, [*prefix, *command], env, self.root / f'{name}.log')
+        print(f'direct cluster: launched {name} (pid {self.workers[name].pid}), HTTP {config["bind"]}, '
+              f'node {config["node"]["bind"]}', file=sys.stderr, flush=True)
 
     def check_lost_port(self, name):
         """A worker that exited during startup because another process took one of its
@@ -462,6 +464,9 @@ class Rf3Cluster:
         assert message.get('event') == 'nabedra.serve.launched', message
         port = urlsplit(message['bound_url']).port
         self.api_urls[name] = f'https://localhost:{port}'
+        endpoint = config['topology']['enrollment']['enrollment']['endpoint']
+        print(f'direct cluster: launched {name} (pid {process.pid}), HTTPS port {port}, enrolled {endpoint}',
+              file=sys.stderr, flush=True)
         deadline = time.monotonic() + 90
         while True:
             assert process.alive(), f'{name} exited:\n{self.tail(name)}'
@@ -629,6 +634,7 @@ class Rf1Serve:
         if cold_start:
             command.append('--cold-start')
         self.process = Process('serve', command, env, self.root / 'serve.log')
+        print(f'direct cluster: launched serve (pid {self.process.pid}), HTTP port {port}', file=sys.stderr, flush=True)
         self.url = f'http://127.0.0.1:{port}'
         deadline = time.monotonic() + 90
         while True:
