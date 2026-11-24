@@ -476,6 +476,12 @@ def dump(cluster):
         matched = [line[:400] for line in lines if pattern.search(line)][-300:]
         print(f'===== {name} snapshot/membership lines ({len(matched)}) =====', file=sys.stderr, flush=True)
         print('\n'.join(matched), file=sys.stderr, flush=True)
+        refusals = [line for line in lines
+                    if 'OutgoingLaneFull { class: Storage' in line
+                    or 'worker outgoing lane full (Storage)' in line][-50:]
+        print(f'===== {name} outgoing Storage refusals ({len(refusals)}) =====',
+              file=sys.stderr, flush=True)
+        print('\n'.join(refusals), file=sys.stderr, flush=True)
 
 
 def create_d11_index(admin, definition):
