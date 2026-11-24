@@ -1,0 +1,14 @@
+id = "CACHE-sim-early-expiry-clock"
+title = "The Cache history checker rejected expiry within the simulated clock tolerance"
+class = "other"
+module = "cache"
+guarantees = ["CACHE-G02", "CACHE-G05"]
+scenarios = ["K01", "K03"]
+found_by = "campaign"
+found_date = "2026-11-24"
+lowest_regression = "server/check/tests/history_cache_sim.rs::cache_sim_expiry_clock_allows_early_absence_within_tolerance"
+seed = 4527531587501106
+why_not_caught = "Prior test histories exercised the nominal deadline and the tolerance for late values. This seed read at the early edge of the uncertain expiry interval."
+invariant_added = "Within the declared expiry tolerance a read may observe absence. A read showing absence before the full tolerance still fails when no other operation can remove the key."
+fix_commits = ["9b41eb5dd7315a908060cee1f13de6cf561bc333"]
+revert_patch_ok = true

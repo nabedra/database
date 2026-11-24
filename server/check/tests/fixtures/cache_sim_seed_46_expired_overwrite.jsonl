@@ -1,0 +1,6 @@
+{"index":0,"type":"invoke","process":100,"f":"set","key":"cache-sim:Ttl:10","value":{"at_ns":1767225611027000000,"value":"ttl-10061"},"node":"11","time_ns":1767225610307000000}
+{"index":1,"type":"ok","process":100,"f":"set","key":"cache-sim:Ttl:10","value":{"epoch":1,"value":null},"node":"11","time_ns":1767225610307000000}
+{"index":2,"type":"invoke","process":100,"f":"set","key":"cache-sim:Ttl:10","value":{"at_ns":1767225610703000000,"value":"ttl-10063"},"node":"11","time_ns":1767225610431000000}
+{"index":3,"type":"ok","process":100,"f":"set","key":"cache-sim:Ttl:10","value":{"epoch":1,"value":null},"node":"11","time_ns":1767225610431000000}
+{"index":4,"type":"invoke","process":100,"f":"get","key":"cache-sim:Ttl:10","value":null,"node":"11","time_ns":1767225610950000000}
+{"index":5,"type":"ok","process":100,"f":"get","key":"cache-sim:Ttl:10","value":{"epoch":1,"value":null},"node":"11","time_ns":1767225610950000000}

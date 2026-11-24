@@ -1,0 +1,14 @@
+id = "CACHE-replica-delta-capacity"
+title = "A Cache replica retried a delta that could not fit its retained allocations"
+class = "resource-release-order"
+module = "cache"
+guarantees = ["CACHE-G03", "CACHE-G05"]
+scenarios = ["K02", "K03"]
+found_by = "campaign"
+found_date = "2026-11-23"
+lowest_regression = "server/src/cache/cluster/worker/actor/tests.rs::k03_replica_requests_a_snapshot_when_delta_cannot_fit"
+seed = 115
+why_not_caught = "Snapshot and replay tests did not combine different retained allocation sizes for the same prefix with a delta near the slot limit."
+invariant_added = "After the replica cannot allocate a delta, it keeps the verified prefix and requests a bounded snapshot to catch up."
+fix_commits = ["4f1955dedf1873598d110c97bb962ab3e6e0226f"]
+revert_patch_ok = true

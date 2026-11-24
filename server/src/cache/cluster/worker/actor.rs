@@ -196,6 +196,7 @@ struct Shard {
     role: Role,
     store: SlotStore,
     baseline: bool,
+    copy_needs_snapshot: bool,
     sequence: u64,
     digest: Option<[u8; 32]>,
     lease: Option<Lease>,
@@ -216,6 +217,7 @@ impl Shard {
             role,
             store: SlotStore::new(config.slot_bytes, config.eviction),
             baseline,
+            copy_needs_snapshot: false,
             sequence: 0,
             digest: None,
             lease: None,
@@ -637,6 +639,15 @@ impl State {
                     self.config,
                 );
                 if retain {
+                    #[cfg(feature = "sim")]
+                    if role == Role::Primary && hooks::watched(slot_number) {
+                        hooks::observe(Observed::Promoted {
+                            slot: slot_number,
+                            epoch: placement.epoch,
+                            prefix_epoch: state.epoch,
+                            prefix_sequence: state.sequence,
+                        });
+                    }
                     std::mem::swap(&mut replacement.store, &mut state.store);
                     replacement.baseline = true;
                 }
@@ -722,6 +733,7 @@ impl State {
                             worker: self.config.id,
                             slot,
                             epoch: state.epoch,
+                            sequence: state.sequence,
                         });
                     }
                     state.operations = state.operations.saturating_add(1);

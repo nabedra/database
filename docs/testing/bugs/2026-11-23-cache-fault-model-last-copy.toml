@@ -1,0 +1,14 @@
+id = "CACHE-fault-model-last-copy"
+title = "The Cache simulation expected automatic recovery after all baselines for a slot were lost"
+class = "other"
+module = "cache"
+guarantees = ["CACHE-G05", "CACHE-G08", "CACHE-G09"]
+scenarios = ["K03"]
+found_by = "campaign"
+found_date = "2026-11-23"
+lowest_regression = "server/src/cache/cluster/sim/tests.rs::seed_sweep"
+seed = 55
+why_not_caught = "A single RAM-loss fault can follow a failover before its replacement replica installs a baseline, even with no second worker crash."
+invariant_added = "Surviving copies must recover within the primary deadline. A provably missing last baseline must produce CLUSTERDOWN and require a fenced cold reset before the slot can serve an empty value."
+fix_commits = ["9d14ae6e1e9bc0cf2dea596270f1874e9688ada1"]
+revert_patch_ok = false

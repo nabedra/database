@@ -1,0 +1,8 @@
+{"index":0,"type":"invoke","process":100,"f":"set","key":"{cache-sim:Register:24913}","value":"register-10025","node":"11","time_ns":1767225605395000000}
+{"index":1,"type":"ok","process":100,"f":"set","key":"{cache-sim:Register:24913}","value":{"epoch":1,"value":null},"node":"11","time_ns":1767225605395000000}
+{"index":2,"type":"info","process":"nemesis","f":"failover","key":"{cache-sim:Register:24913}","value":{"epoch":2},"time_ns":1767225614002000000}
+{"index":3,"type":"invoke","process":100,"f":"del","key":"{cache-sim:Register:24913}","value":null,"node":"12","time_ns":1767225620050000000}
+{"index":4,"type":"ok","process":100,"f":"del","key":"{cache-sim:Register:24913}","value":{"epoch":2,"value":1},"node":"12","time_ns":1767225620050000000}
+{"index":5,"type":"info","process":"nemesis","f":"failover","key":"{cache-sim:Register:24913}","value":{"epoch":3},"time_ns":1767225620502000000}
+{"index":6,"type":"invoke","process":100,"f":"get","key":"{cache-sim:Register:24913}","value":null,"node":"14","time_ns":1767225622297000000}
+{"index":7,"type":"ok","process":100,"f":"get","key":"{cache-sim:Register:24913}","value":{"epoch":3,"value":"register-10025"},"node":"14","time_ns":1767225622297000000}

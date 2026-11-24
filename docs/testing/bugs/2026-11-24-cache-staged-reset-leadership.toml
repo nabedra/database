@@ -1,0 +1,14 @@
+id = "CACHE-staged-reset-leadership"
+title = "A new Cache leader could cold-reset before hearing a surviving staged copy"
+class = "fence-lifecycle-order"
+module = "cache"
+guarantees = ["CACHE-G05", "CACHE-G09"]
+scenarios = ["K03"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "server/src/cache/cluster/controller/tests.rs::k03_staged_promotion_checks_fence_lag_and_copy_at_apply"
+seed = "unknown"
+why_not_caught = "The previous deadline used only the old lease expiry. A new leader after that deadline could collect an unrelated worker's heartbeat and reset before the surviving copy reported."
+invariant_added = "Give a full report window after both the lease fence and the current term's initial observation. A qualifying staged copy can promote as soon as it reports. With no qualifying copy the reset still happens at the deadline."
+fix_commits = ["3bb54aa1ab10e342b9ee61511957a031a028068c"]
+revert_patch_ok = true
