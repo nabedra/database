@@ -484,6 +484,11 @@ async fn smoke(
     for &key in &program.extra_reads {
         scenario.get(1, table, key, None).await?;
     }
+    if std::env::var("NABEDRA_DISARM").is_ok_and(|v| v == "1") {
+        cluster.world.set_clock_freezes(0, Duration::ZERO);
+        cluster.world.set_storage_pauses(0, Duration::ZERO);
+        time::sleep(Duration::from_secs(3)).await;
+    }
     let stats = settle(cluster).await?;
     cluster.checks.check_direct_path(&cluster.world, &stats);
     for (node, stats) in stats {

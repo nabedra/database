@@ -397,6 +397,9 @@ impl Cluster {
 
     pub fn heal(&self) {
         self.trace(format_args!("heal"));
+        if std::env::var("NABEDRA_DISARM").is_ok_and(|v| v == "1") {
+            self.world.set_clock_freezes(0, std::time::Duration::ZERO);
+        }
         for node in CONTROLLERS
             .into_iter()
             .chain(worker_nodes(self.config.nodes))

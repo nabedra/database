@@ -6,7 +6,9 @@ use super::clock_bound::SimClockBound;
 
 pub(in crate::cache::cluster) fn clock_bound() -> Option<io::Result<(u64, u64)>> {
     let world = sim::world()?;
-    world.with_ext::<SimClockBound, _>(|bound| bound.sample(&world))
+    let sample = world.with_ext::<SimClockBound, _>(|bound| bound.sample(&world));
+    sim::clock_read();
+    sample
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -1,10 +1,10 @@
-id = "review-123-hash-cache"
+id = "review-123-probe-cache"
 module = "sim"
 kinds = ["S"]
 guarantees = []
 scenarios = []
 tiers = ["weekly"]
-command = ["bash", "scripts/testing/review_123_hash.sh", "cache", "83862ceda001c2398a724a4079b4b61db9746d43"]
+command = ["bash", "scripts/testing/review_123_probe.sh", "cache"]
 cwd = "."
 timeout_s = 9000
 needs = []

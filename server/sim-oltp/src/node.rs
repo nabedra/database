@@ -24,7 +24,9 @@ use crate::{
     net::SimNet,
 };
 
-const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+fn http_timeout() -> Duration {
+    if std::env::var("NABEDRA_LONG").is_ok_and(|v| v == "1") { Duration::from_secs(30) } else { Duration::from_secs(2) }
+}
 const READINESS_POLL: Duration = Duration::from_millis(100);
 
 pub(crate) struct Cluster {
@@ -209,7 +211,7 @@ impl Cluster {
                     "/health/ready",
                     &self.config.data_token,
                     None,
-                    HTTP_TIMEOUT,
+                    http_timeout(),
                 )
                 .await;
                 let ready = match ready {
@@ -267,7 +269,7 @@ impl Cluster {
                 "/v1/cluster/operations",
                 &self.config.admin_token,
                 Some(body.clone()),
-                HTTP_TIMEOUT,
+                http_timeout(),
             )
             .await
             .and_then(|reply| reply.completion(id))
@@ -278,6 +280,17 @@ impl Cluster {
                 }
                 Ok(Completion::Unknown(err)) | Err(err) => errors.push(format!("n{node} {err}")),
             }
+        }
+        if name == "api.enroll" {
+            self.world.set_clock_freezes(0, Duration::ZERO);
+            time::sleep(Duration::from_secs(5)).await;
+            for node in WORKERS {
+                let again = request(BOOTSTRAP_CLIENT, node, "/v1/cluster/operations", &self.config.admin_token, Some(body.clone()), Duration::from_secs(20)).await;
+                eprintln!("ENROLL-PROBE first answers {errors:?}; the same request, faults off, via n{node}: {}", match again { Ok(r) => format!("{} {}", r.status, r.body), Err(e) => e });
+            }
+            let other = operation(in_node(BOOTSTRAP_CLIENT, async { uuid_v4() }).await, "cluster.connection", json!({}));
+            let seen = request(BOOTSTRAP_CLIENT, WORKERS[0], "/v1/cluster/operations", &self.config.admin_token, Some(other), Duration::from_secs(20)).await;
+            eprintln!("ENROLL-PROBE connection: {}", match seen { Ok(r) => r.body.to_string().chars().take(200).collect::<String>(), Err(e) => e });
         }
         Err(format!("{name}: {}", errors.join("; ")))
     }
@@ -298,7 +311,7 @@ impl Cluster {
             "/v1/runtime/stats",
             &self.config.data_token,
             None,
-            HTTP_TIMEOUT,
+            http_timeout(),
         )
         .await?;
         if reply.status != 200 {

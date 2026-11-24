@@ -54,6 +54,7 @@ impl Config {
     }
 
     pub fn deadline(&self) -> Duration {
+        if std::env::var("NABEDRA_LONG").is_ok_and(|v| v == "1") { return Duration::from_secs(30); }
         Duration::from_millis(self.knobs["request_deadline_ms"].as_u64().unwrap())
     }
 
