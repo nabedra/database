@@ -13,7 +13,7 @@ class TriageTests(unittest.TestCase):
     def test_initial_pass_and_ineligible_kinds_never_rerun(self):
         get_baseline, rerun = Mock(), Mock()
         self.assertFalse(triage.triage("R", 0, "", get_baseline, rerun).blocked)
-        for kind in ("S", "M", "H", "U", "R H"):
+        for kind in ("S", "M", "H", "U", "T", "R H", "R T", "T R"):
             with self.subTest(kind=kind):
                 self.assertTrue(triage.triage(kind, 1, "assertion failed", get_baseline, rerun).blocked)
         get_baseline.assert_not_called()

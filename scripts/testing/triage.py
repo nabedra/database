@@ -96,7 +96,7 @@ def triage(kind, returncode, log, get_baseline, rerun):
     if returncode == 0:
         return Decision(False, "initial check passed")
     kinds = set(kind.split())
-    if "R" not in kinds or kinds.intersection({"S", "M", "H"}):
+    if "R" not in kinds or kinds.intersection({"S", "M", "H", "T"}):
         return Decision(True, f"kind {kind} is ineligible for retries")
 
     main_passed, main_runs = get_baseline()
