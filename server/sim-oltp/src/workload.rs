@@ -131,6 +131,7 @@ async fn execute(
             assertions.insert("cluster readiness", startup.is_ok());
             match startup {
                 Ok(()) => {
+                    nabedra_rt::sim::arm(&world);
                     match smoke(&mut cluster, &config, &program, defect, &mut history).await {
                         Ok(table) => {
                             assertions.insert("public HTTP workload completed", true);

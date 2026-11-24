@@ -1075,8 +1075,9 @@ where
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0)
     };
-    world.set_storage_pauses(env("NABEDRA_PAUSE"), Duration::from_millis(5));
-    world.set_clock_freezes(env("NABEDRA_FREEZE"), Duration::from_millis(u64::from(env("NABEDRA_FREEZE_MS"))));
+    if env("NABEDRA_LATE") == 0 {
+        arm(&world);
+    }
     let counts = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
     let seen = counts.clone();
     world.observe(Arc::new(move |event| match event {
@@ -1096,6 +1097,18 @@ where
     }
     let _report = Report(seed, counts);
     runtime.block_on(async { body(world).await })
+}
+
+/// Scratch: arms the faults the environment names.
+pub fn arm(world: &World) {
+    let env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    world.set_storage_pauses(env("NABEDRA_PAUSE"), Duration::from_millis(5));
+    world.set_clock_freezes(env("NABEDRA_FREEZE"), Duration::from_millis(u64::from(env("NABEDRA_FREEZE_MS"))));
 }
 
 /// The node the current task or thread belongs to, if any.
