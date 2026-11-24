@@ -1,16 +1,21 @@
 //! Exact mutation outcomes contain only the existing metadata/unit/count/bool
 //! results or a bounded protocol error. Row/query results are never accepted.
-use super::*;
+use super::proofs::invalid;
 use crate::{
-    oltp::mvcc::CanonicalJson,
-    oltp_replication::types::{Page, Text},
-    protocol::{ColumnType, TableDescriptor, TableFormat},
+    owned::serialized_digest,
+    types::{Digest, Page, Text},
 };
+use nabedra_protocol::protocol::{
+    ColumnType, ErrorCode, ErrorResponse, Outcome, ProtocolError, SuccessResponse, TableDescriptor,
+    TableFormat,
+};
+use nabedra_resources::memory::ScratchLease;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 /// Equality describes the durable value. The local ownership lease is excluded
 /// from serialization and follows every clone of heap-bearing reply metadata.
 #[derive(Clone, Default)]
-struct ReplyOwner(Option<std::sync::Arc<crate::oltp::pool::ScratchLease>>);
+struct ReplyOwner(Option<std::sync::Arc<ScratchLease>>);
 impl fmt::Debug for ReplyOwner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ReplyOwner")
@@ -24,7 +29,7 @@ impl PartialEq for ReplyOwner {
 impl Eq for ReplyOwner {}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct OutcomeColumn {
+pub struct OutcomeColumn {
     name: Text<64>,
     #[serde(deserialize_with = "bounded_column_type")]
     ty: ColumnType,
@@ -43,7 +48,7 @@ fn bounded_column_type<'de, D: serde::Deserializer<'de>>(
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct OutcomeTable {
+pub struct OutcomeTable {
     id: uuid::Uuid,
     name: Text<64>,
     key: Text<64>,
@@ -53,7 +58,7 @@ pub(crate) struct OutcomeTable {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum MutationValue {
+pub enum MutationValue {
     Unit,
     Count(u64),
     Changed(bool),
@@ -61,7 +66,7 @@ pub(crate) enum MutationValue {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MutationFailure {
+pub struct MutationFailure {
     code: ErrorCode,
     message: Text<4096>,
     outcome: Outcome,
@@ -70,12 +75,12 @@ pub(crate) struct MutationFailure {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum MutationOutcome {
+pub enum MutationOutcome {
     Success(MutationValue),
     Failure(MutationFailure),
 }
 impl MutationOutcome {
-    pub(crate) fn is_not_applied(&self) -> bool {
+    pub fn is_not_applied(&self) -> bool {
         matches!(
             self,
             Self::Failure(MutationFailure {
@@ -84,35 +89,31 @@ impl MutationOutcome {
             })
         )
     }
-    pub(crate) fn retain_owner(&mut self, owner: std::sync::Arc<crate::oltp::pool::ScratchLease>) {
+    pub fn retain_owner(&mut self, owner: std::sync::Arc<ScratchLease>) {
         match self {
             Self::Success(MutationValue::Created(table)) => table.owner.0 = Some(owner),
             Self::Failure(error) => error.owner.0 = Some(owner),
             _ => {}
         }
     }
-    pub(crate) fn response_hash(&self, request_id: uuid::Uuid) -> Result<Digest, ProtocolError> {
+    pub fn response_hash(&self, request_id: uuid::Uuid) -> Result<Digest, ProtocolError> {
         match self.result() {
-            Ok(data) => crate::oltp_replication::owned::serialized_digest(
-                &crate::protocol::SuccessResponse { request_id, data },
-            ),
-            Err(error) => {
-                crate::oltp_replication::owned::serialized_digest(&crate::protocol::ErrorResponse {
-                    request_id: Some(request_id),
-                    error,
-                })
-            }
+            Ok(data) => serialized_digest(&SuccessResponse { request_id, data }),
+            Err(error) => serialized_digest(&ErrorResponse {
+                request_id: Some(request_id),
+                error,
+            }),
         }
     }
-    pub(crate) fn digest(&self) -> Result<Digest, ProtocolError> {
+    pub fn digest(&self) -> Result<Digest, ProtocolError> {
         let value = match self.result() {
             Ok(value) => value,
             Err(error) => serde_json::to_value(error).map_err(|_| invalid())?,
         };
-        crate::oltp_replication::owned::serialized_digest(&value)
+        serialized_digest(&value)
     }
-    pub(crate) fn from_success(json: &CanonicalJson) -> Result<Self, ProtocolError> {
-        let input = json.as_str();
+    pub fn from_success(json: &impl AsRef<str>) -> Result<Self, ProtocolError> {
+        let input = json.as_ref();
         let value = match input.as_bytes().first() {
             Some(b'n') if input == "null" => MutationValue::Unit,
             Some(b't' | b'f') => {
@@ -207,7 +208,7 @@ impl MutationOutcome {
         };
         Ok(Self::Success(value))
     }
-    pub(crate) fn failure(error: ProtocolError) -> Result<Self, ProtocolError> {
+    pub fn failure(error: ProtocolError) -> Result<Self, ProtocolError> {
         Ok(Self::Failure(MutationFailure {
             owner: ReplyOwner::default(),
             code: error.code,
@@ -215,7 +216,7 @@ impl MutationOutcome {
             outcome: error.outcome,
         }))
     }
-    pub(crate) fn heap_bytes(&self) -> usize {
+    pub fn heap_bytes(&self) -> usize {
         match self {
             Self::Success(MutationValue::Created(table)) => {
                 table.name.capacity_bytes()
@@ -231,7 +232,7 @@ impl MutationOutcome {
             _ => 0,
         }
     }
-    pub(crate) fn result(&self) -> Result<serde_json::Value, ProtocolError> {
+    pub fn result(&self) -> Result<serde_json::Value, ProtocolError> {
         match self {
             Self::Success(value) => match value {
                 MutationValue::Unit => Ok(serde_json::Value::Null),

@@ -20,10 +20,11 @@ pub use transport::{
     WorkerClient, WorkerTransport,
 };
 pub(crate) use transport::{
-    OutgoingReservation, PeerFeature, ReplicaLease, ReplicaMetadata, RequestError, RequestTarget,
+    OutgoingReservation, PeerFeature, ReplicaLease, RequestError, RequestTarget,
 };
 
-pub const MAX_SECTIONS: usize = 3;
+pub use nabedra_resources::memory::{Decoded, MAX_SECTIONS};
+pub(crate) use nabedra_resources::memory::ReplicaMetadata;
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 pub(super) const RAFT_PROGRESS_HEADER_BYTES: usize = 1024;
 pub(super) const RAFT_PROGRESS_DECODE_BYTES: usize = 4096;
@@ -202,11 +203,7 @@ impl ChargedSections {
         self.sections.get(index).and_then(Option::as_ref)
     }
     pub fn retain_decoded<T>(&self, value: T) -> Decoded<T> {
-        Decoded {
-            value,
-            _sections: self.sections.clone(),
-            _scratch: self.scratch.clone(),
-        }
+        Decoded::new(value, self.sections.clone(), self.scratch.clone())
     }
     pub fn decode<T: DeserializeOwned>(&self, index: usize) -> Result<Decoded<T>, ProtocolError> {
         let bytes = self
@@ -220,20 +217,6 @@ impl ChargedSections {
         let value = serde_json::from_slice(bytes.as_slice())
             .map_err(|_| malformed("invalid RPC section"))?;
         Ok(self.retain_decoded(value))
-    }
-}
-
-/// Move this wrapper into native work. Extracting a bare decoded value is not
-/// exposed, so cancellation cannot drop its scratch owner while work continues.
-pub struct Decoded<T> {
-    value: T,
-    _sections: [Option<ChargedBytes>; MAX_SECTIONS],
-    _scratch: Arc<ScratchLease>,
-}
-impl<T> Deref for Decoded<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.value
     }
 }
 
@@ -303,11 +286,7 @@ impl ReceivedReply {
         }
         let value = serde_json::from_slice(self.reply.header.as_slice())
             .map_err(|_| malformed("invalid RPC reply header"))?;
-        Ok(Decoded {
-            value,
-            _sections: self.reply.sections.clone(),
-            _scratch: self.scratch.clone(),
-        })
+        Ok(Decoded::new(value, self.reply.sections.clone(), self.scratch.clone()))
     }
     pub fn decode_section<T: DeserializeOwned>(
         &self,

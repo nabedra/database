@@ -8,17 +8,21 @@ use crate::{
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
+use nabedra_oltp_types::authority::{SettlementProof, StatusDecisionProof, metadata_digest};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
+
+pub(crate) use nabedra_oltp_types::authority::{
+    MutationOutcome, SealedSettlement, SealedStatusDecision, SettlementStatement,
+};
 pub(crate) mod identity;
-mod outcome;
 mod routing;
 mod service;
 pub(crate) use identity::{
-    ArchiveCursor, ArchivedDecision, ArchivedIdentity, ArchivedIdentityDisposition,
-    CommittedArchivePage, IdentityArchiveCursor, IdentityArchivePage, StatusArchiveCutStatement,
-    VerifiedStatusArchiveCut,
+    ArchiveCursor, ArchivedDecision, CommittedArchivePage, IdentityArchiveCursor,
+    IdentityArchivePage, StatusArchiveCutStatement, VerifiedStatusArchiveCut,
 };
+#[allow(unused_imports)]
+pub(crate) use identity::{ArchivedIdentity, ArchivedIdentityDisposition};
 pub(crate) use identity::{
     IdentityLookup, IdentityReservation, ManifestDraft, ManifestInventoryPage, RejectedIdentity,
     RequestKind, RetirementCertificate, ScopedAdmission, ScopedTerminalReceipt, SealedAdmissionRejection, StatusCommand, StatusFault,
@@ -26,10 +30,11 @@ pub(crate) use identity::{
     VerifiedAdmissionRejection, VerifiedTerminalRetirement,
 };
 pub(crate) use identity::transaction::timestamp_point::{
-    LocatedTimestampManifest, TimestampDecisionLocator, TimestampPointBinding, TimestampPointHome,
+    LocatedTimestampManifest, TimestampDecisionLocator, TimestampPointHome,
     TimestampPointManifest, projection::TimestampPointProjection,
 };
-pub(crate) use outcome::MutationOutcome;
+#[allow(unused_imports)]
+pub(crate) use nabedra_oltp_types::authority::TimestampPointBinding;
 pub(crate) use routing::{PartitionedStatus, StatusTopology};
 pub(crate) use service::{PointManifest, StatusService};
 
@@ -148,47 +153,6 @@ pub(crate) struct CommitStamp {
     pub commit_ts: CommitTs,
     pub allocated_at: AppliedPosition,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SettlementStatement {
-    pub txn: TxnId,
-    pub request: RequestBinding,
-    pub manifest: ManifestRef,
-    pub decision: DecisionStatement,
-    pub resolved_count: u64,
-    pub settled_at: AppliedPosition,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SealedSettlement {
-    statement: SettlementStatement,
-    proof_digest: Digest,
-}
-impl SealedSettlement {
-    pub(crate) fn statement(&self) -> &SettlementStatement {
-        &self.statement
-    }
-    pub(crate) fn validate_for(
-        &self,
-        txn: TxnId,
-        request: &RequestBinding,
-        manifest: &ManifestRef,
-    ) -> Result<&SettlementStatement, ProtocolError> {
-        let s = &self.statement;
-        if s.txn != txn
-            || &s.request != request
-            || &s.manifest != manifest
-            || s.decision.txn != txn
-            || s.decision.request != *request
-            || s.decision.manifest != *manifest
-            || s.resolved_count != manifest.participant_count
-            || self.proof_digest != metadata_digest(b"nabedra/settled-participants/v1\0", s)?
-        {
-            return Err(invalid());
-        }
-        Ok(s)
-    }
-}
 #[derive(Clone, Debug)]
 pub(crate) struct VerifiedSettlement(SealedSettlement);
 impl VerifiedSettlement {
@@ -224,14 +188,7 @@ impl VerifiedSettlement {
         self.0
     }
     fn from_strong_settled_read(statement: SettlementStatement) -> Result<Self, ProtocolError> {
-        let proof_digest = metadata_digest(b"nabedra/settled-participants/v1\0", &statement)?;
-        let sealed = SealedSettlement {
-            statement,
-            proof_digest,
-        };
-        let s = &sealed.statement;
-        sealed.validate_for(s.txn, &s.request, &s.manifest)?;
-        Ok(Self(sealed))
+        Ok(Self(SealedSettlement::seal(statement)?))
     }
     #[cfg(test)]
     pub(crate) fn model_for_test(statement: SettlementStatement) -> Result<Self, ProtocolError> {
@@ -240,36 +197,6 @@ impl VerifiedSettlement {
 
     pub(crate) fn statement(&self) -> &SettlementStatement {
         self.0.statement()
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SealedStatusDecision {
-    statement: DecisionStatement,
-    proof_digest: Digest,
-}
-impl SealedStatusDecision {
-    pub(crate) fn validate_for(
-        &self,
-        txn: TxnId,
-        manifest: &ManifestRef,
-        request: &RequestBinding,
-    ) -> Result<&DecisionStatement, ProtocolError> {
-        if self.statement.txn != txn
-            || &self.statement.manifest != manifest
-            || &self.statement.request != request
-            || self.proof_digest != digest(&self.statement)?
-        {
-            return Err(invalid());
-        }
-        Ok(&self.statement)
-    }
-    pub(crate) fn statement(&self) -> &DecisionStatement {
-        &self.statement
-    }
-    pub(crate) fn digest(&self) -> Digest {
-        self.proof_digest
     }
 }
 
@@ -339,7 +266,7 @@ impl VerifiedStatusDecision {
         Self::from_strong_status_read(statement)
     }
     pub(crate) fn statement(&self) -> &DecisionStatement {
-        &self.proof.statement
+        self.proof.statement()
     }
     pub(crate) fn into_sealed(self) -> SealedStatusDecision {
         self.proof
@@ -358,39 +285,30 @@ impl VerifiedStatusDecision {
         Ok(verified)
     }
     fn from_strong_status_read(statement: DecisionStatement) -> Result<Self, ProtocolError> {
-        let proof_digest = digest(&statement)?;
         Ok(Self {
-            proof: SealedStatusDecision {
-                statement,
-                proof_digest,
-            },
+            proof: SealedStatusDecision::seal(statement)?,
             outcome: None,
             _owner: None,
         })
     }
 }
-fn digest(statement: &DecisionStatement) -> Result<Digest, ProtocolError> {
-    metadata_digest(b"nabedra/status-decision/v1\0", statement)
-}
-fn metadata_digest(
-    domain: &'static [u8],
-    statement: &impl Serialize,
-) -> Result<Digest, ProtocolError> {
-    struct Writer(Sha256);
-    impl std::io::Write for Writer {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.update(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+
+impl SettlementProof for VerifiedSettlement {
+    fn into_sealed(self) -> SealedSettlement {
+        self.into_sealed()
     }
-    let mut writer = Writer(Sha256::new());
-    writer.0.update(domain);
-    serde_json::to_writer(&mut writer, statement).map_err(|_| invalid())?;
-    Ok(Digest::from_bytes(writer.0.finalize().into()))
 }
+
+impl StatusDecisionProof for VerifiedStatusDecision {
+    fn statement(&self) -> &DecisionStatement {
+        self.statement()
+    }
+
+    fn into_sealed(self) -> SealedStatusDecision {
+        self.into_sealed()
+    }
+}
+
 fn invalid() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::ValidationError,

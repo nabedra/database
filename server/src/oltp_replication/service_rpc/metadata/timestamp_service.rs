@@ -1932,7 +1932,7 @@ impl TimestampClient {
             .decoded(&self.client.shared)
             .await
             .map_err(mutation_uncertain)?;
-        Ok(Applied::owned(applied.position, applied.reply, owner))
+        Ok(crate::oltp_replication::authority::consensus::owned_applied(applied.position, applied.reply, owner))
     }
     pub(crate) async fn fence_ready(
         &self,

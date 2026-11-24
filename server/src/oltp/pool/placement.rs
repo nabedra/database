@@ -1,5 +1,5 @@
 use super::*;
-use crate::oltp_replication::{authority::control::ReplicaRetiredStamp, types::GroupKind};
+use nabedra_oltp_types::{authority::ReplicaRetiredStamp, types::GroupKind};
 use uuid::Uuid;
 
 pub(super) fn learner_key(group: Uuid) -> Vec<u8> {

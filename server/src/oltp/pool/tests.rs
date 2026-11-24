@@ -1,8 +1,6 @@
 use super::*;
-use crate::{
-    config::WorkerResources,
-    oltp_replication::types::{GroupKind, Text},
-};
+use nabedra_oltp_types::types::{GroupKind, Text};
+use nabedra_resources::config::WorkerResources;
 use std::{
     path::PathBuf,
     sync::{Condvar, Mutex},
@@ -1145,7 +1143,7 @@ async fn o05_m01_wide_internal_log_read_retains_dynamic_owner_without_apply_or_r
         },
         pool::ScratchLease,
     };
-    use crate::oltp_replication::owned::OwnedCommand;
+    use nabedra_oltp_types::owned::OwnedCommand;
     use sha2::{Digest as _, Sha256};
     let resources = shared(SharedResourceConfig::default());
     let dir = Dir::new();

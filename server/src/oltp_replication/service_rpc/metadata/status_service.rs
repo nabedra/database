@@ -1867,7 +1867,7 @@ impl StatusClient {
         };
         let mut reply = applied.reply;
         reply.retain_owner(owner.clone());
-        Ok(Applied::owned(applied.position, reply, owner))
+        Ok(crate::oltp_replication::authority::consensus::owned_applied(applied.position, reply, owner))
     }
     pub(crate) async fn lookup_identity(
         &self,
@@ -2293,7 +2293,7 @@ impl StatusClient {
             .map_err(mutation_uncertain)?;
         let mut reply = applied.reply;
         reply.retain_owner(owner.clone());
-        Ok(Applied::owned(applied.position, reply, owner))
+        Ok(crate::oltp_replication::authority::consensus::owned_applied(applied.position, reply, owner))
     }
     pub(crate) async fn failure_settled_proof(
         &self,

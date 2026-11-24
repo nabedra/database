@@ -556,7 +556,11 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
     // A gap cannot pass even though both individual histories are complete.
     let mut plan = crate::oltp::backup::restore::RestorePlanValidator::new(last.pin.read_ts);
     for (index, path) in [&base_path, &last_path].iter().enumerate() {
-        let mut reader = HistoryReader::new(File::open(history_path(path)).unwrap()).unwrap();
+        let mut reader = HistoryReader::new(
+            identity_metadata_step,
+            File::open(history_path(path)).unwrap(),
+        )
+        .unwrap();
         while reader.next(&source.services.shared).unwrap().is_some() {}
         let result = plan.include(&reader.verified().unwrap());
         if index == 0 {
@@ -567,8 +571,12 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
     }
     // A checksummed writer refuses an omitted participant before it can write
     // a matching transaction footer. This checks semantic completeness.
-    let mut reader = HistoryReader::new(File::open(history_path(&base_path)).unwrap()).unwrap();
-    let mut writer = HistoryWriter::new(Vec::new()).unwrap();
+    let mut reader = HistoryReader::new(
+        identity_metadata_step,
+        File::open(history_path(&base_path)).unwrap(),
+    )
+    .unwrap();
+    let mut writer = HistoryWriter::new(identity_metadata_step, Vec::new()).unwrap();
     let mut omitted = false;
     let mut refused = false;
     while let Some(frame) = reader.next(&source.services.shared).unwrap() {
@@ -594,9 +602,12 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
     assert!(omitted && refused, "missing participant accepted");
     // Recomputing every frame checksum/footer must not conceal a lost
     // metadata-only reserved UUID. The authoritative Status inventory binds it.
-    let mut identity_reader =
-        HistoryReader::new(File::open(history_path(&base_path)).unwrap()).unwrap();
-    let mut identity_writer = HistoryWriter::new(Vec::new()).unwrap();
+    let mut identity_reader = HistoryReader::new(
+        identity_metadata_step,
+        File::open(history_path(&base_path)).unwrap(),
+    )
+    .unwrap();
+    let mut identity_writer = HistoryWriter::new(identity_metadata_step, Vec::new()).unwrap();
     let mut omitted_identity = false;
     let mut omitted_identity_metadata = false;
     while let Some(frame) = identity_reader.next(&source.services.shared).unwrap() {
@@ -626,8 +637,11 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
         "missing reserved identity accepted with recomputed checksums"
     );
     let original = std::fs::read(history_path(&base_path)).unwrap();
-    let mut truncated =
-        HistoryReader::new(std::io::Cursor::new(&original[..original.len() - 1])).unwrap();
+    let mut truncated = HistoryReader::new(
+        identity_metadata_step,
+        std::io::Cursor::new(&original[..original.len() - 1]),
+    )
+    .unwrap();
     let mut truncation_refused = false;
     loop {
         match truncated.next(&source.services.shared) {
@@ -642,7 +656,8 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
     assert!(truncation_refused, "truncated footer accepted");
     let mut corrupted = original.clone();
     corrupted[100] ^= 1;
-    let mut corrupted = HistoryReader::new(std::io::Cursor::new(corrupted)).unwrap();
+    let mut corrupted =
+        HistoryReader::new(identity_metadata_step, std::io::Cursor::new(corrupted)).unwrap();
     assert!(
         corrupted.next(&source.services.shared).is_err(),
         "checksum corruption accepted"
@@ -714,7 +729,11 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
     )
     .await;
     let old_id = Uuid::parse_str(&obsolete).unwrap();
-    let mut reader = HistoryReader::new(File::open(history_path(&base_path)).unwrap()).unwrap();
+    let mut reader = HistoryReader::new(
+        identity_metadata_step,
+        File::open(history_path(&base_path)).unwrap(),
+    )
+    .unwrap();
     let old_group = loop {
         let frame = reader.next(&target.services.shared).unwrap().unwrap();
         if let HistoryFrame::BeginGroup(scope) = frame.payload().unwrap()
@@ -843,7 +862,11 @@ async fn o12_o19_native_index_closure_pitr_and_repeat_restore() {
     }
 
     fn archived_closure(path: &Path, runtime: &WorkerRuntime) -> ArchivedIndexClosure {
-        let mut reader = HistoryReader::new(File::open(history_path(path)).unwrap()).unwrap();
+        let mut reader = HistoryReader::new(
+            identity_metadata_step,
+            File::open(history_path(path)).unwrap(),
+        )
+        .unwrap();
         let mut closure = None;
         while let Some(frame) = reader.next(&runtime.services.shared).unwrap() {
             if let HistoryFrame::CatalogIndexClosure(evidence) = frame.payload().unwrap() {
@@ -941,9 +964,12 @@ async fn o12_o19_native_index_closure_pitr_and_repeat_restore() {
     assert!(proof.restored_observation().is_none());
     assert_eq!(archived_closure(&ready_path, &source), original);
     {
-        let mut reader =
-            HistoryReader::new(File::open(history_path(&ready_path)).unwrap()).unwrap();
-        let mut writer = HistoryWriter::new(Vec::new()).unwrap();
+        let mut reader = HistoryReader::new(
+            identity_metadata_step,
+            File::open(history_path(&ready_path)).unwrap(),
+        )
+        .unwrap();
+        let mut writer = HistoryWriter::new(identity_metadata_step, Vec::new()).unwrap();
         let mut removed = false;
         let mut refused = false;
         while let Some(frame) = reader.next(&source.services.shared).unwrap() {
@@ -982,8 +1008,11 @@ async fn o12_o19_native_index_closure_pitr_and_repeat_restore() {
     {
         let shared = &source.services.shared;
         let mut graph = super::restore_graph::RestoreGraph::new(shared.clone()).unwrap();
-        let mut reader =
-            HistoryReader::new(File::open(history_path(&ready_base_path)).unwrap()).unwrap();
+        let mut reader = HistoryReader::new(
+            identity_metadata_step,
+            File::open(history_path(&ready_base_path)).unwrap(),
+        )
+        .unwrap();
         let mut group = None;
         let mut removed = 0;
         while let Some(frame) = reader.next(shared).unwrap() {

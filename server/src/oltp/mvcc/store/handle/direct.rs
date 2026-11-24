@@ -8,7 +8,7 @@
 // T6 (gateway) and T7 (activation) construct and call this; until then only tests do.
 #![cfg_attr(not(test), allow(dead_code))]
 use super::*;
-use crate::oltp_replication::authority::consensus::ReadBarrier;
+use crate::oltp::mvcc::store::consensus::ReadBarrier;
 
 /// The newest committed state of one key on this replica.
 #[derive(Debug)]

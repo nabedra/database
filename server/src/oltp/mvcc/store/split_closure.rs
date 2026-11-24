@@ -5,7 +5,7 @@ use super::{
     lineage::{SplitBinding, child_digest},
     *,
 };
-use crate::oltp_replication::types::{DecisionStatement, StoragePin};
+use nabedra_oltp_types::types::{DecisionStatement, StoragePin};
 
 pub(crate) const MAX_SPLIT_CLOSURE_BYTES: usize = 48 << 10;
 

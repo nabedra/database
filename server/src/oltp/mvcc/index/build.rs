@@ -16,11 +16,11 @@ use crate::oltp::{
     pool::ScratchLease,
 };
 use crate::{
-    oltp_replication::{
-        owned::serialized_digest,
-        types::{Authority, Digest, MaintenanceOwnerRef, ReadTs, RequestBinding, TxnId},
-    },
     protocol::Outcome,
+};
+use nabedra_oltp_types::{
+    owned::serialized_digest,
+    types::{Authority, Digest, MaintenanceOwnerRef, ReadTs, RequestBinding, TxnId},
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +30,7 @@ pub(crate) struct IndexAttempt {
     pub txn: TxnId,
     pub request: RequestBinding,
     pub owner: Arc<ScratchLease>,
-    pub identity: crate::oltp_replication::types::PinIdentity,
+    pub identity: nabedra_oltp_types::types::PinIdentity,
     pub storage_pin: StoragePin,
 }
 
@@ -488,7 +488,7 @@ impl IndexService {
             for route in page.shards.iter() {
                 self.backend.checkpoint().await?;
                 let current = self.backend.planner().catalog().snapshot(
-                    crate::oltp_replication::types::ReadTs::new(u64::MAX)
+                    nabedra_oltp_types::types::ReadTs::new(u64::MAX)
                         .map_err(|_| blocked_index())?,
                     source.authority,
                 )?;

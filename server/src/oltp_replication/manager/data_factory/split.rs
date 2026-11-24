@@ -172,8 +172,8 @@ pub(crate) struct AuthenticatedSplitProof {
     digest: Digest,
     owner: Arc<ScratchLease>,
 }
-impl AuthenticatedSplitProof {
-    pub(crate) fn verify(
+impl crate::oltp::mvcc::store::lineage::SplitReplyProof for AuthenticatedSplitProof {
+    fn verify(
         self,
         source: bool,
         group: &GroupIdentity,

@@ -4,6 +4,7 @@ use crate::oltp_replication::{
     TlsMaterial,
     types::{Digest, GroupKind},
 };
+use nabedra_resources::memory::{ReplicaMetadata, ReplicaMetadataOwner};
 use rustls::pki_types::ServerName;
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -340,6 +341,10 @@ struct ReplicaResidency {
 #[derive(Clone)]
 pub(crate) struct ReplicaLease(Arc<ReplicaResidency>);
 impl ReplicaLease {
+    pub(crate) fn owns_metadata(&self, metadata: &ReplicaMetadata) -> bool {
+        metadata.belongs_to(&self.0)
+    }
+
     pub(crate) fn retain_owner(&self, owner: Arc<dyn Send + Sync>) -> Result<(), ProtocolError> {
         self.0
             .ownership
@@ -434,39 +439,22 @@ impl ReplicaLease {
                 .ok_or_else(|| overloaded("replica metadata capacity exhausted"))?;
             match counter.compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => {
-                    return Ok(ReplicaMetadata {
-                        owner: self.clone(),
-                        bytes,
-                        log,
-                    });
+                    return Ok(ReplicaMetadata::new(self.0.clone(), bytes, log));
                 }
                 Err(current) => used = current,
             }
         }
     }
 }
-pub(crate) struct ReplicaMetadata {
-    owner: ReplicaLease,
-    bytes: usize,
-    log: bool,
-}
-impl ReplicaMetadata {
-    pub(crate) fn bytes(&self) -> usize {
-        self.bytes
-    }
-    pub(crate) fn same_replica(&self, resident: &ReplicaLease) -> bool {
-        Arc::ptr_eq(&self.owner.0, &resident.0)
-    }
-}
-impl Drop for ReplicaMetadata {
-    fn drop(&mut self) {
-        (if self.log {
-            &self.owner.0.log_metadata_used
+impl ReplicaMetadataOwner for ReplicaResidency {
+    fn release_metadata(&self, bytes: usize, log: bool) {
+        let counter = if log {
+            &self.log_metadata_used
         } else {
-            &self.owner.0.metadata_used
-        })
-        .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
-        self.owner.0.metadata_released.notify_waiters();
+            &self.metadata_used
+        };
+        counter.fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+        self.metadata_released.notify_waiters();
     }
 }
 #[derive(Clone)]

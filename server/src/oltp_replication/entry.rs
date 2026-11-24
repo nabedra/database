@@ -23,6 +23,17 @@ pub type CommittedLeaderId = <LeaderId as RaftLeaderId>::Committed;
 pub type LogId = openraft::LogId<CommittedLeaderId>;
 pub type Vote = openraft::impls::Vote<LeaderId>;
 pub type Membership = openraft::impls::Membership<u64, ReplicaMember>;
+pub(super) fn reserve_raft_metadata(
+    command: &OwnedCommand<impl OwnedPayload>,
+    resident: &super::multiplex::ReplicaLease,
+    bytes: usize,
+) -> Result<(), ProtocolError> {
+    command.attach_raft_metadata(
+        || resident.proposal_metadata(bytes),
+        |owner| resident.owns_metadata(owner) && owner.bytes() >= bytes,
+    )
+}
+
 pub type Payload<D> = openraft::impls::EntryPayload<OwnedCommand<D>, Membership>;
 pub trait CommandData: OwnedPayload + fmt::Display {}
 impl<T: OwnedPayload + fmt::Display> CommandData for T {}
@@ -77,7 +88,7 @@ impl<D: CommandData> OwnedRaftEntry<D> {
         let bytes = self.resident_bytes()?;
         let owner = match self.payload() {
             Payload::Normal(command) => match command.raft_metadata() {
-                Some(owner) if owner.same_replica(resident) && owner.bytes() >= bytes => owner,
+                Some(owner) if resident.owns_metadata(&owner) && owner.bytes() >= bytes => owner,
                 Some(_) => return Err(invalid("entry proposal residency differs")),
                 None => Arc::new(resident.log_metadata(bytes)?),
             },
@@ -337,6 +348,26 @@ pub(crate) fn stored_membership(
     let stored: BoundedStoredMembership =
         serde_json::from_slice(input).map_err(|_| invalid("invalid bounded stored membership"))?;
     Ok(stored.0)
+}
+pub(super) fn activation_membership_matches(
+    bytes: &[u8],
+    voters: &[ReplicaMember],
+    minimum: super::types::AppliedPosition,
+    exact: bool,
+) -> Result<bool, ProtocolError> {
+    let stored = stored_membership(bytes)?;
+    let membership = stored.membership();
+    let joint = membership.get_joint_config();
+    if joint.len() != 1 || (exact && stored.log_id().map(super::hosted::position) != Some(minimum)) {
+        return Ok(false);
+    }
+    let voting = &joint[0];
+    let actual = membership
+        .nodes()
+        .filter(|(id, _)| voting.contains(id))
+        .map(|(_, replica)| replica.clone())
+        .collect::<Vec<ReplicaMember>>();
+    Ok(actual.as_slice() == voters)
 }
 impl<'de> Deserialize<'de> for BoundedMembership {
     fn deserialize<T: Deserializer<'de>>(deserializer: T) -> Result<Self, T::Error> {

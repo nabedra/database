@@ -13,11 +13,11 @@ use super::{
 };
 use crate::{
     oltp::{failure, pool::ChargedBytes},
-    oltp_replication::{
-        authority::control::ScopedCatalogRead,
-        types::{GroupIdentity, GroupKind, Page, RequestBinding, TxnId},
-    },
     protocol::{self, ErrorCode, Key, Operation, ProtocolError, Row, TableDescriptor},
+};
+use nabedra_oltp_types::{
+    authority::ScopedCatalogRead,
+    types::{GroupIdentity, GroupKind, Page, RequestBinding, TxnId},
 };
 use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
@@ -556,7 +556,7 @@ impl NativePlanner {
                 writes.sort_by(|a, b| super::store::compare_keys(&a.key, &b.key));
                 let (schema_epoch, routing_epoch) = if matches!(
                     participant.identity().kind,
-                    crate::oltp_replication::types::GroupKind::Catalog
+                    nabedra_oltp_types::types::GroupKind::Catalog
                 ) {
                     (catalog_epochs.schema_epoch, catalog_epochs.routing_epoch)
                 } else {
@@ -606,7 +606,7 @@ impl NativePlanner {
         request: RequestBinding,
         owner: Arc<crate::oltp::pool::ScratchLease>,
     ) -> Result<MutationPlan, PlanError> {
-        let name = crate::oltp_replication::types::Text::try_from(payload.name.as_str())
+        let name = nabedra_oltp_types::types::Text::try_from(payload.name.as_str())
             .map_err(|_| not_found())?;
         let (name_version, existing) = value(
             self.catalog
@@ -668,7 +668,7 @@ impl NativePlanner {
         txn: TxnId,
         request: RequestBinding,
         table: OwnedRecord<TableRecord>,
-        version: Option<crate::oltp_replication::types::CommitTs>,
+        version: Option<nabedra_oltp_types::types::CommitTs>,
         owner: Arc<crate::oltp::pool::ScratchLease>,
     ) -> Result<MutationPlan, PlanError> {
         let id = table.descriptor.id;
@@ -686,7 +686,7 @@ impl NativePlanner {
         let planned = async {
             let epochs = self.catalog.participant().epochs().await?;
             let name =
-                crate::oltp_replication::types::Text::try_from(table.descriptor.name.as_str())
+                nabedra_oltp_types::types::Text::try_from(table.descriptor.name.as_str())
                     .map_err(|_| not_found())?;
             let (name_version, name_record) = value(
                 self.catalog
@@ -770,7 +770,7 @@ impl NativePlanner {
         pin: &PinnedCatalog,
         txn: TxnId,
         request: RequestBinding,
-        granted_under: crate::oltp_replication::types::Authority,
+        granted_under: nabedra_oltp_types::types::Authority,
     ) -> Result<LifecycleBinding, PlanError> {
         let (id, version, schema_epoch) = if matches!(operation, Operation::Create(_)) {
             let id = derived_uuid(
@@ -793,7 +793,7 @@ impl NativePlanner {
         txn: TxnId,
         request: RequestBinding,
         table_id: Uuid,
-        lifecycle_version: Option<crate::oltp_replication::types::CommitTs>,
+        lifecycle_version: Option<nabedra_oltp_types::types::CommitTs>,
         schema_epoch: u64,
         mode: GuardMode,
     ) -> Result<VerifiedLifecycleGuard, PlanError> {
@@ -815,10 +815,10 @@ impl NativePlanner {
         txn: TxnId,
         request: RequestBinding,
         table_id: Uuid,
-        lifecycle_version: Option<crate::oltp_replication::types::CommitTs>,
+        lifecycle_version: Option<nabedra_oltp_types::types::CommitTs>,
         schema_epoch: u64,
         mode: GuardMode,
-        authority: crate::oltp_replication::types::Authority,
+        authority: nabedra_oltp_types::types::Authority,
     ) -> Result<VerifiedLifecycleGuard, PlanError> {
         let binding = self.lifecycle_binding(pin, txn, request, table_id, lifecycle_version, schema_epoch, authority);
         #[cfg(any(test, feature = "test-hooks"))]
@@ -836,9 +836,9 @@ impl NativePlanner {
         txn: TxnId,
         request: RequestBinding,
         table_id: Uuid,
-        lifecycle_version: Option<crate::oltp_replication::types::CommitTs>,
+        lifecycle_version: Option<nabedra_oltp_types::types::CommitTs>,
         schema_epoch: u64,
-        authority: crate::oltp_replication::types::Authority,
+        authority: nabedra_oltp_types::types::Authority,
     ) -> LifecycleBinding {
         LifecycleBinding {
             guard_id: derived_uuid(b"nabedra/lifecycle-guard/v1", table_id, txn.request_id),
@@ -898,13 +898,13 @@ impl NativePlanner {
         participant: &ParticipantHandle,
     ) -> Result<
         (
-            Option<crate::oltp_replication::types::CommitTs>,
+            Option<nabedra_oltp_types::types::CommitTs>,
             Option<OwnedRecord<Row>>,
         ),
         PlanError,
     > {
         #[cfg(test)]
-        let _point = crate::oltp_runtime::stage_timing::perf_stage!("test.data.point").timer();
+        let _point = nabedra_resources::perf_stage!("test.data.point").timer();
         value(
             decode_record(
                 self.catalog.resources(),
@@ -964,7 +964,7 @@ impl NativePlanner {
                     primary_key: row.key.clone(),
                 })
                 .collect();
-            let request = crate::oltp_replication::owned::OwnedCommand::new_owned(
+            let request = nabedra_oltp_types::owned::OwnedCommand::new_owned(
                 PointReadRequest {
                     read_ts: pin.read_ts,
                     keys: Page::new(keys).map_err(|_| not_found())?,
@@ -1034,7 +1034,7 @@ impl NativePlanner {
         table: OwnedRecord<TableRecord>,
         participant: Arc<ParticipantHandle>,
         candidate: &CandidateRow,
-        expected: Option<crate::oltp_replication::types::CommitTs>,
+        expected: Option<nabedra_oltp_types::types::CommitTs>,
         old: Option<OwnedRecord<Row>>,
         grouped: &mut MutationGroups,
         owner: &mut Arc<crate::oltp::pool::ScratchLease>,
@@ -1111,7 +1111,7 @@ fn value<T>(
     read: CatalogRead<T>,
 ) -> Result<
     (
-        Option<crate::oltp_replication::types::CommitTs>,
+        Option<nabedra_oltp_types::types::CommitTs>,
         Option<OwnedRecord<T>>,
     ),
     PlanError,

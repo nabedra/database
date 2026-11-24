@@ -1,13 +1,9 @@
 //! The queue owner can change independently of the participant's Raft owner.
 use super::*;
-use crate::{
-    oltp::pool::ByteClass,
-    oltp_replication::{
-        authority::control::{
-            ScopedCatalogRead, ScopedQueueInventory, ScopedQueuePlacement, ScopedQueueTransition,
-        },
-        types::AuthorityView,
-    },
+use crate::oltp::pool::ByteClass;
+use nabedra_oltp_types::{
+    authority::{ScopedCatalogRead, ScopedQueueInventory, ScopedQueuePlacement, ScopedQueueTransition},
+    types::AuthorityView,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

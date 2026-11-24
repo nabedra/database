@@ -1,6 +1,6 @@
 //! Pinned point routes for the scoped queue prototype.
 use super::*;
-use crate::oltp_replication::types::{Authority, GroupKind, ReadTs};
+use nabedra_oltp_types::types::{Authority, GroupKind, ReadTs};
 
 /// Owns one charged catalog page. Placement selection can borrow the selected
 /// range, including long UTF-8 bounds, without allocating a second copy.

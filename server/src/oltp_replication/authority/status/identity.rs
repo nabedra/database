@@ -38,87 +38,8 @@ const BUDGET: TransactionBudget = TransactionBudget {
     output_bytes: 128 << 10,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RequestKind {
-    Read,
-    Mutation,
-}
-/// Persistent placement for a scoped queue admission. It has no executable
-/// bytes and cannot reconstruct the request after its RAM holders stop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ScopedAdmission {
-    pub protocol_version: u32,
-    pub queue_group_id: Uuid,
-    pub queue_generation: Uuid,
-    pub status_group_id: Uuid,
-}
-impl ScopedAdmission {
-    pub(crate) const VERSION: u32 = 2;
+pub use nabedra_oltp_types::authority::{IdentityReservation, RequestKind, ScopedAdmission, TerminalIdentity};
 
-    fn valid_for(self, status_group_id: Uuid) -> bool {
-        self.protocol_version == Self::VERSION
-            && !self.queue_group_id.is_nil()
-            && !self.queue_generation.is_nil()
-            && self.queue_group_id != status_group_id
-            && self.status_group_id == status_group_id
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct IdentityReservation {
-    pub request_id: Uuid,
-    pub digest: Digest,
-    pub original_run: Uuid,
-    pub reservation_id: Uuid,
-    pub kind: RequestKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scoped: Option<ScopedAdmission>,
-}
-impl IdentityReservation {
-    pub(crate) fn binds(self, request: RequestBinding) -> bool {
-        self.request_id == request.request_id
-            && self.digest == request.digest
-            && self.original_run == request.run_id
-    }
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum TerminalIdentity {
-    ReadExpired {
-        reservation: IdentityReservation,
-        request: RequestBinding,
-        terminal_version: u64,
-        response_hash: Digest,
-        recorded_at: AppliedPosition,
-    },
-    Committed {
-        reservation: IdentityReservation,
-        decision: DecisionStatement,
-        outcome: super::MutationOutcome,
-    },
-    Failed {
-        reservation: IdentityReservation,
-        request: RequestBinding,
-        outcome: super::MutationOutcome,
-        recorded_at: AppliedPosition,
-    },
-}
-impl TerminalIdentity {
-    pub(crate) fn request_binding(&self) -> RequestBinding {
-        match self {
-            Self::ReadExpired { request, .. } | Self::Failed { request, .. } => *request,
-            Self::Committed { decision, .. } => decision.request,
-        }
-    }
-
-    pub(crate) fn retain_owner(&mut self, owner: Arc<ScratchLease>) {
-        if let Self::Committed { outcome, .. } | Self::Failed { outcome, .. } = self {
-            outcome.retain_owner(owner);
-        }
-    }
-}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum IdentityLookup {
@@ -140,15 +61,8 @@ impl IdentityLookup {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RestoredHistoryOrigin {
-    pub restore_id: Uuid,
-    pub source_cluster: Uuid,
-    pub source_archive: Uuid,
-    pub source_root: Digest,
-    pub through_cut: CommitTs,
-}
+pub use nabedra_oltp_types::authority::{RestoredHistoryOrigin};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdentityRecord {
@@ -172,27 +86,7 @@ pub(crate) struct RetirementCertificate {
     recorded_at: AppliedPosition,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RejectedIdentity {
-    pub reservation: IdentityReservation,
-    pub view: AuthorityView,
-    pub identity: PinIdentity,
-    pub pin: Option<StoragePin>,
-    pub request: Option<RequestBinding>,
-    pub failure: super::MutationOutcome,
-    pub recorded_at: AppliedPosition,
-}
-impl RejectedIdentity {
-    fn same_disposition(&self, expected: &Self) -> bool {
-        self.reservation == expected.reservation
-            && self.view == expected.view
-            && self.identity == expected.identity
-            && self.pin == expected.pin
-            && self.request == expected.request
-            && self.failure == expected.failure
-    }
-}
+pub use nabedra_oltp_types::authority::{RejectedIdentity};
 
 pub(crate) fn scoped_route_moved_failure() -> Result<MutationOutcome, ProtocolError> {
     MutationOutcome::failure(ProtocolError::new(
@@ -1639,7 +1533,7 @@ impl StatusHandle {
     ) -> Result<Applied<StatusReply>, ProtocolError> {
         let (position, mut reply, owner) = self.consensus.propose(command).await?.into_parts()?;
         reply.retain_owner(owner.clone());
-        Ok(Applied::owned(position, reply, owner))
+        Ok(crate::oltp_replication::authority::consensus::owned_applied(position, reply, owner))
     }
 }
 impl RetirementCertificate {

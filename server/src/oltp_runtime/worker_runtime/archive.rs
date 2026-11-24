@@ -22,7 +22,9 @@ use crate::{
         UploadSession,
     },
     oltp_replication::{
-        authority::status::StatusService,
+        authority::status::{
+            StatusService, identity::transaction::archive_images::identity_metadata_step,
+        },
         owned::{OwnedCommand, serialized_digest},
     },
 };
@@ -364,7 +366,7 @@ impl WorkerRuntime {
             std::fs::remove_file(&staging.0).map_err(|_| unknown())?;
         }
         let mut export = Export {
-            writer: HistoryWriter::new(file)?,
+            writer: HistoryWriter::new(identity_metadata_step, file)?,
             shared: self.services.shared.clone(),
         };
         export.frame(HistoryFrame::Scope(scope.clone())).await?;
@@ -466,7 +468,7 @@ impl WorkerRuntime {
         file.sync_all().map_err(|_| unknown())?;
         file.rewind().map_err(|_| unknown())?;
         let shared = self.services.shared.clone();
-        let mut validator = HistoryReader::new(&mut file)?;
+        let mut validator = HistoryReader::new(identity_metadata_step, &mut file)?;
         let split_graph = restore_graph::RestoreGraph::new(shared.clone())?;
         let mut split_transcript = restore_graph::SplitTranscript::default();
         let mut point_transcript = point_history::PointTranscript::default();

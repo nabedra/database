@@ -16,90 +16,13 @@ use crate::{
         types::*,
     },
 };
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use super::identity::transaction::archive_images::MetadataArchivePage;
 
-const MAX_STATUS_PARTITIONS: usize = 16;
-
-/// Immutable, bucket-ordered identities. Changing group membership cannot
-/// change the home of a request. The algorithm is part of registered format 2.
-#[derive(Clone)]
-pub(crate) struct StatusTopology {
-    groups: Arc<[GroupIdentity]>,
-}
-
-impl StatusTopology {
-    pub(crate) fn new(groups: Vec<GroupIdentity>) -> Result<Self, ProtocolError> {
-        let first = groups.first().ok_or_else(invalid_route)?;
-        let mut ids = BTreeSet::new();
-        if groups.len() > MAX_STATUS_PARTITIONS
-            || groups.iter().enumerate().any(|(index, group)| {
-                group.validate().is_err()
-                    || group.kind
-                        != (GroupKind::Status {
-                            bucket: index as u32,
-                        })
-                    || group.cluster_id != first.cluster_id
-                    || group.database != first.database
-                    || !ids.insert(group.group_id)
-            })
-        {
-            return Err(invalid_route());
-        }
-        Ok(Self {
-            groups: groups.into(),
-        })
-    }
-
-    pub(crate) fn groups(&self) -> &[GroupIdentity] {
-        &self.groups
-    }
-
-    fn bucket(&self, request_id: Uuid) -> usize {
-        if self.groups.len() == 1 {
-            return 0;
-        }
-        let mut hash = Sha256::new();
-        hash.update(b"nabedra/status-routing/v1\0");
-        hash.update(request_id.as_bytes());
-        let hash = hash.finalize();
-        let prefix = u64::from_be_bytes(hash[..8].try_into().expect("SHA-256 prefix"));
-        (prefix % self.groups.len() as u64) as usize
-    }
-
-    pub(crate) fn request(&self, request_id: Uuid) -> &GroupIdentity {
-        &self.groups[self.bucket(request_id)]
-    }
-
-    pub(crate) fn manifest(
-        &self,
-        txn: TxnId,
-        manifest: ManifestRef,
-    ) -> Result<&GroupIdentity, ProtocolError> {
-        let group = self.request(txn.request_id);
-        if group.group_id != manifest.status_group_id {
-            return Err(invalid_route());
-        }
-        Ok(group)
-    }
-
-    pub(crate) fn contains(&self, group: &GroupIdentity) -> bool {
-        match group.kind {
-            GroupKind::Status { bucket } => self.groups.get(bucket as usize) == Some(group),
-            _ => false,
-        }
-    }
-}
-
-fn invalid_route() -> ProtocolError {
-    ProtocolError::new(
-        ErrorCode::StorageUnavailable,
-        "request does not belong to the supplied Status topology or group",
-        Outcome::Unknown,
-    )
-}
+pub(crate) use nabedra_oltp_types::authority::StatusTopology;
+use nabedra_oltp_types::authority::invalid_status_route as invalid_route;
 
 /// Request operations route directly to their home. Group operations with
 /// observable applied positions are performed on individual services.

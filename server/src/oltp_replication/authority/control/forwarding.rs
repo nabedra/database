@@ -394,7 +394,7 @@ impl Consensus<ControlCommand, ControlReply> for ForwardedControl {
                 .await?;
             let (applied, owner): (Applied<ControlReply>, _) =
                 self.forwarded(operation, Some(payload), None).await?;
-            Ok(Applied::owned(applied.position, applied.reply, owner))
+            Ok(crate::oltp_replication::authority::consensus::owned_applied(applied.position, applied.reply, owner))
         })
     }
     fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {

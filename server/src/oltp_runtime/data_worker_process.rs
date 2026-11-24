@@ -29,7 +29,7 @@ use crate::{
             control::{
                 ControlClient, ControlReply, DataWorkerClient, DataWorkerIntent,
                 EksReplacementPermit, Fault, GroupRecord, InventoryPage, PublishedControlRoutes,
-                ServiceAction, WorkerDrainPhase,
+                RestartMountKey, ServiceAction, WorkerDrainPhase,
             },
             status::{PartitionedStatus, StatusService, StatusTopology},
         },
@@ -280,7 +280,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 Some(permit) => VerifiedPoolMount::reopen_eks(permit)?,
                 None => VerifiedPoolMount::verify(expectation.clone(), None)?,
             };
-            let key = native.data_worker_key()?;
+            let key = native.data_worker_key::<RestartMountKey>()?;
             let pool = OltpPool::open_registered(native, expectation.identity, mount_resources)?;
             Ok((pool, key, added))
         }),

@@ -2,7 +2,7 @@
 //! allocated timestamp at/below the cut can acquire a later COMMIT decision.
 //! UUID history has a separately recorded Status applied cut; it is never
 //! described as an untimestamped MVCC snapshot at the application data cut.
-use super::timestamp_point::projection::{TimestampPointProjection, read_for_transaction};
+use super::timestamp_point::projection::read_for_transaction;
 use super::*;
 use crate::oltp::backup::history::{ARCHIVE_PAGE_WIRE_BYTES, ArchivePageBudget};
 use crate::oltp_replication::authority::timestamp::VerifiedArchiveClosure;
@@ -53,17 +53,9 @@ pub(crate) struct ArchiveCursor {
     pub request_id: Uuid,
     pub attempt: u64,
 }
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ArchivedDecision {
-    pub reservation: IdentityReservation,
-    pub statement: DecisionStatement,
-    pub outcome: MutationOutcome,
-    pub read_ts: ReadTs,
-    pub settled_at: AppliedPosition,
-    #[serde(skip)]
-    owner: Option<Arc<ScratchLease>>,
-}
+pub(crate) use nabedra_oltp_types::authority::{
+    ArchivedDecision, ArchivedIdentity, ArchivedIdentityDisposition,
+};
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CommittedArchivePage {
@@ -77,30 +69,6 @@ pub(crate) struct CommittedArchivePage {
     #[serde(skip)]
     owner: Option<Arc<ScratchLease>>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum ArchivedIdentityDisposition {
-    PreCutCommitted {
-        decision: DecisionStatement,
-        outcome: MutationOutcome,
-    },
-    RestoreExcluded {
-        source_decision: DecisionStatement,
-        restore_cut: CommitTs,
-    },
-    /// These immutable failures are idempotency history at status_applied_at,
-    /// not a claim that the untimestamped failure already existed at data cut.
-    CurrentFailed {
-        terminal: TerminalIdentity,
-    },
-    CurrentRejected {
-        rejection: RejectedIdentity,
-    },
-    Reserved,
-    ExpiredRead {
-        terminal: TerminalIdentity,
-    },
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct IdentityArchiveCursor {
@@ -108,20 +76,6 @@ pub(crate) struct IdentityArchiveCursor {
     pub data_cut: CommitTs,
     pub status_applied_at: AppliedPosition,
     pub request_id: Uuid,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ArchivedIdentity {
-    #[serde(default)]
-    pub origin: Option<RestoredHistoryOrigin>,
-    pub reservation: IdentityReservation,
-    /// None denotes source records from before reservation-position tracking.
-    pub reserved_at: Option<AppliedPosition>,
-    pub disposition: ArchivedIdentityDisposition,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub point_projection: Option<Box<TimestampPointProjection>>,
-    #[serde(skip)]
-    pub(super) owner: Option<Arc<ScratchLease>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,8 +97,7 @@ impl CommittedArchivePage {
         )
         .into_inner();
         for item in &mut items {
-            item.outcome.retain_owner(owner.clone());
-            item.owner = Some(owner.clone());
+            item.retain_owner(owner.clone());
         }
         self.items = Page::new(items).map_err(|_| unknown())?;
         self.owner = Some(owner);
@@ -159,19 +112,7 @@ impl IdentityArchivePage {
         )
         .into_inner();
         for item in &mut items {
-            match &mut item.disposition {
-                ArchivedIdentityDisposition::PreCutCommitted { outcome, .. }
-                | ArchivedIdentityDisposition::CurrentFailed {
-                    terminal:
-                        TerminalIdentity::Failed { outcome, .. }
-                        | TerminalIdentity::Committed { outcome, .. },
-                } => outcome.retain_owner(owner.clone()),
-                ArchivedIdentityDisposition::CurrentRejected { rejection } => {
-                    rejection.failure.retain_owner(owner.clone())
-                }
-                _ => {}
-            }
-            item.owner = Some(owner.clone());
+            item.retain_owner(owner.clone());
         }
         self.items = Page::new(items).map_err(|_| unknown())?;
         self.owner = Some(owner);
@@ -332,14 +273,13 @@ impl StatusHandle {
                                 if *decision != statement || *outcome != state.outcome {
                                     return Err(unknown());
                                 }
-                                let item = ArchivedDecision {
-                                    reservation: identity.reservation,
+                                let item = ArchivedDecision::new(
+                                    identity.reservation,
                                     statement,
-                                    outcome: state.outcome,
-                                    read_ts: state.read_ts,
-                                    settled_at: state.settled_at.ok_or_else(unknown)?,
-                                    owner: None,
-                                };
+                                    state.outcome,
+                                    state.read_ts,
+                                    state.settled_at.ok_or_else(unknown)?,
+                                );
                                 if !budget.include(view, &item)? {
                                     break;
                                 }
@@ -379,8 +319,7 @@ impl StatusHandle {
                     serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())?;
                 let mut items = page.items.into_inner();
                 for item in &mut items {
-                    item.outcome.retain_owner(owner.clone());
-                    item.owner = Some(owner.clone());
+                    item.retain_owner(owner.clone());
                 }
                 page.items = Page::new(items).map_err(|_| unknown())?;
                 page.owner = Some(owner);
@@ -492,14 +431,13 @@ impl StatusHandle {
                     } else {
                         None
                     };
-                    let item = ArchivedIdentity {
-                        origin: identity.restore_origin,
-                        reservation: identity.reservation,
-                        reserved_at: identity.reserved_at,
+                    let item = ArchivedIdentity::new(
+                        identity.restore_origin,
+                        identity.reservation,
+                        identity.reserved_at,
                         disposition,
-                        point_projection: point_projection.map(Box::new),
-                        owner: None,
-                    };
+                        point_projection.map(Box::new),
+                    );
                     if !budget.include(view, &item)? {
                         break;
                     }
@@ -532,21 +470,7 @@ impl StatusHandle {
                     serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())?;
                 let mut items = page.items.into_inner();
                 for item in &mut items {
-                    match &mut item.disposition {
-                        ArchivedIdentityDisposition::PreCutCommitted { outcome, .. } => {
-                            outcome.retain_owner(owner.clone())
-                        }
-                        ArchivedIdentityDisposition::CurrentFailed {
-                            terminal:
-                                TerminalIdentity::Failed { outcome, .. }
-                                | TerminalIdentity::Committed { outcome, .. },
-                        } => outcome.retain_owner(owner.clone()),
-                        ArchivedIdentityDisposition::CurrentRejected { rejection } => {
-                            rejection.failure.retain_owner(owner.clone())
-                        }
-                        _ => {}
-                    }
-                    item.owner = Some(owner.clone());
+                    item.retain_owner(owner.clone());
                 }
                 page.items = Page::new(items).map_err(|_| unknown())?;
                 page.owner = Some(owner);
@@ -595,15 +519,6 @@ pub(super) fn identity_disposition(
 macro_rules! debug_fields {
     ($name:ident,$($field:ident),+)=>{impl std::fmt::Debug for $name {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.debug_struct(stringify!($name))$(.field(stringify!($field),&self.$field))+.finish()}}};
 }
-debug_fields!(
-    ArchivedDecision,
-    reservation,
-    statement,
-    outcome,
-    read_ts,
-    settled_at
-);
-debug_fields!(ArchivedIdentity, reservation, reserved_at, disposition);
 debug_fields!(
     CommittedArchivePage,
     status_group,

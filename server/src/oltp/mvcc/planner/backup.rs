@@ -9,8 +9,8 @@ use crate::oltp::mvcc::{
 use crate::{
     migration_interchange::{ArchiveSummary, ArchiveWriter, IndexDescriptor},
     oltp::{backup::BackupBackend, pool::ByteClass},
-    oltp_replication::types::Digest,
 };
+use nabedra_oltp_types::types::Digest;
 use std::{fs::File, path::PathBuf};
 impl NativePlanner {
     pub(crate) async fn export_logical_snapshot(

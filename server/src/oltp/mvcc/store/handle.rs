@@ -1,26 +1,37 @@
 //! Strong participant capabilities. These wrappers cannot be deserialized by
 //! callers; only the leader's quorum barrier plus durable snapshot creates one.
 use super::*;
-use crate::{
-    oltp::pool::{ExecutionClass, ScratchLease},
-    oltp_replication::authority::{
-        consensus::{Applied, Consensus},
-        control::{ScopedCatalogRead, ScopedQueueTransition},
-    },
+use super::consensus::{Applied, Consensus, ConsensusFuture};
+use crate::oltp::{
+    pool::{ExecutionClass, ScratchLease},
+    read_attempt::ScheduledReadError,
 };
+use nabedra_oltp_types::authority::{
+    ParticipantProofKind, ReadScope, ScopedCatalogRead, ScopedQueueTransition, StatusDecisionProof,
+};
+
+/// Authenticated strong-read context bound to one participant reply.
+pub(crate) trait ParticipantReplyProof {
+    fn group(&self) -> &GroupIdentity;
+    fn owner(&self) -> Arc<ScratchLease>;
+    fn verify_payload(
+        &self,
+        kind: ParticipantProofKind,
+        value: &impl Serialize,
+    ) -> Result<(), ProtocolError>;
+}
+
 const META: TransactionBudget = TransactionBudget {
     scratch_bytes: 128 << 10,
     batch_bytes: 0,
     output_bytes: 16 << 10,
 };
-pub(crate) type ParticipantFuture<'a, T> =
-    crate::oltp_replication::authority::consensus::ConsensusFuture<'a, T>;
+pub(crate) type ParticipantFuture<'a, T> = ConsensusFuture<'a, T>;
 pub(crate) type ScheduledReadFuture<'a> = std::pin::Pin<
     Box<
         dyn std::future::Future<
                 Output = Result<
-                    OwnedCommand<super::scan::ScanPage>,
-                    crate::oltp_replication::service_rpc::ScheduledReadError,
+                    OwnedCommand<super::scan::ScanPage>, ScheduledReadError,
                 >,
             > + Send
             + 'a,
@@ -68,16 +79,16 @@ pub(crate) trait RemoteParticipant: Send + Sync {
         &self,
         request: OwnedCommand<super::image_archive::ImageRequest>,
     ) -> ParticipantFuture<'_, OwnedCommand<super::image_archive::ImagePage>>;
-    fn archive_effect_page(
-        &self,
-        proof: crate::oltp_replication::authority::status::VerifiedStatusDecision,
+    fn archive_effect_page<'a>(
+        &'a self,
+        proof: &'a dyn StatusDecisionProof,
         after: u64,
         max_items: u16,
         max_bytes: usize,
-    ) -> ParticipantFuture<'_, OwnedCommand<super::archive::ArchiveEffects>>;
+    ) -> ParticipantFuture<'a, OwnedCommand<super::archive::ArchiveEffects>>;
     fn scheduled_scan_page(
         &self,
-        scope: crate::oltp_replication::service_rpc::ReadScope,
+        scope: ReadScope,
         request: super::scan::ScanRequest,
     ) -> ScheduledReadFuture<'_>;
     fn scan_page(
@@ -124,14 +135,14 @@ pub(crate) trait RemoteParticipant: Send + Sync {
     }
     fn strong_index_attempt_closed(
         &self,
-        owner: crate::oltp_replication::types::MaintenanceOwnerRef,
+        owner: nabedra_oltp_types::types::MaintenanceOwnerRef,
     ) -> ParticipantFuture<'_, super::index::VerifiedIndexAttemptClosed>;
     fn fence_current(
         &self,
         transition_id: Uuid,
         expected: Authority,
         next: Authority,
-    ) -> ParticipantFuture<'_, crate::oltp_replication::types::GroupFenceReceipt>;
+    ) -> ParticipantFuture<'_, nabedra_oltp_types::types::GroupFenceReceipt>;
     fn fence_scoped_queue<'a>(
         &'a self,
         transfer: &'a ScopedQueueTransition,
@@ -162,7 +173,7 @@ impl std::fmt::Debug for VerifiedParticipantResolution {
 }
 impl VerifiedParticipantSeal {
     pub(crate) fn from_authenticated(
-        context: crate::oltp_replication::service_rpc::AuthenticatedParticipantReplyContext,
+        context: impl ParticipantReplyProof,
         evidence: PreparedParticipant,
         txn: TxnId,
         manifest: ManifestRef,
@@ -174,7 +185,7 @@ impl VerifiedParticipantSeal {
             return Err(invalid());
         }
         context.verify_payload(
-            crate::oltp_replication::service_rpc::ParticipantProofKind::Seal,
+            ParticipantProofKind::Seal,
             &evidence,
         )?;
         Ok(Self {
@@ -197,7 +208,7 @@ pub(crate) struct VerifiedParticipantResolution {
 }
 impl VerifiedParticipantResolution {
     pub(crate) fn from_authenticated(
-        context: crate::oltp_replication::service_rpc::AuthenticatedParticipantReplyContext,
+        context: impl ParticipantReplyProof,
         evidence: ResolutionEvidence,
         txn: TxnId,
         manifest: ManifestRef,
@@ -209,7 +220,7 @@ impl VerifiedParticipantResolution {
             return Err(invalid());
         }
         context.verify_payload(
-            crate::oltp_replication::service_rpc::ParticipantProofKind::Resolution,
+            ParticipantProofKind::Resolution,
             &evidence,
         )?;
         Ok(Self {
@@ -334,7 +345,7 @@ impl ParticipantHandle {
     pub(crate) async fn resolve(
         &self,
         authority: Authority,
-        decision: crate::oltp_replication::authority::status::VerifiedStatusDecision,
+        decision: impl StatusDecisionProof,
         max_items: u16,
     ) -> Result<Applied<ParticipantReply>, ProtocolError> {
         self.propose(OwnedCommand::new_owned(
@@ -608,7 +619,7 @@ impl ParticipantHandle {
         schema_epoch: u64,
         routing_epoch: u64,
         span: KeySpan,
-    ) -> Result<crate::oltp_replication::types::GroupFenceReceipt, ProtocolError> {
+    ) -> Result<nabedra_oltp_types::types::GroupFenceReceipt, ProtocolError> {
         self.fence_command(ParticipantCommand::Fence {
             transition_id,
             expected: None,
@@ -625,7 +636,7 @@ impl ParticipantHandle {
         transition_id: Uuid,
         expected: Authority,
         next: Authority,
-    ) -> Result<crate::oltp_replication::types::GroupFenceReceipt, ProtocolError> {
+    ) -> Result<nabedra_oltp_types::types::GroupFenceReceipt, ProtocolError> {
         if let Some(remote) = &self.remote {
             return remote.fence_current(transition_id, expected, next).await;
         }
@@ -729,7 +740,7 @@ impl ParticipantHandle {
     async fn fence_command(
         &self,
         command: ParticipantCommand,
-    ) -> Result<crate::oltp_replication::types::GroupFenceReceipt, ProtocolError> {
+    ) -> Result<nabedra_oltp_types::types::GroupFenceReceipt, ProtocolError> {
         let applied = self
             .propose(OwnedCommand::new_owned(
                 command,

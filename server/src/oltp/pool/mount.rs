@@ -1,14 +1,16 @@
 //! A registered pool opens only on its expected mounted block device. The
 //! directory descriptor and exclusive ownership lock live as long as the store.
 //! The caller obtains expectations from authenticated operator inventory.
-use super::{PoolIdentity, ProtocolError};
-use crate::{
-    oltp::failure,
-    oltp_replication::{authority::control::VerifiedExclusion, types::WorkerIdentity},
-    protocol::ErrorCode,
+use super::{Digest, PoolIdentity, ProtocolError};
+#[cfg(not(target_os = "linux"))]
+use crate::{oltp::failure, protocol::ErrorCode};
+use nabedra_oltp_types::types::WorkerIdentity;
+pub(crate) use nabedra_oltp_types::authority::{
+    MountedPoolObservation, PoolMountExpectation, PoolMountProfile,
 };
-use crate::oltp_replication::authority::control::EksReplacementPermit;
-use serde::{Deserialize, Serialize};
+use nabedra_oltp_types::authority::mount_unavailable as invalid;
+#[cfg(target_os = "linux")]
+use nabedra_oltp_types::authority::docker_volume_name;
 #[cfg(target_os = "linux")]
 use nabedra_rt::fs::os::{File, OpenOptions, self as fs};
 use std::path::{Path, PathBuf};
@@ -16,39 +18,28 @@ mod closed;
 #[cfg(target_os = "linux")]
 pub(super) use closed::prove_closed;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum PoolMountProfile {
-    #[default]
-    Ebs,
-    Docker {
-        volume_marker: uuid::Uuid,
-    },
+/// Verified previous-incarnation exclusion for a retained mount.
+pub(crate) trait PoolExclusionProof {
+    fn excluded_worker(&self) -> WorkerIdentity;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PoolMountExpectation {
-    #[serde(default)]
-    pub profile: PoolMountProfile,
-    pub identity: PoolIdentity,
-    pub worker: WorkerIdentity,
-    pub generation: u64,
-    pub mount_path: PathBuf,
-    pub provider_volume_id: String,
-    pub filesystem_uuid: String,
+/// Constructs the signer while the mount-verified seed is still in scope.
+pub(crate) trait RestartMountKeyProof: Sized {
+    fn from_mount_seed(seed: &[u8; 32]) -> Result<Self, ProtocolError>;
+    fn public_key(&self) -> Digest;
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct MountedPoolObservation {
-    pub expected: PoolMountExpectation,
-    pub mount_id: u64,
-    pub device_major: u32,
-    pub device_minor: u32,
-    pub root_inode: u64,
-    pub total_bytes: u64,
-    pub available_bytes: u64,
+
+/// Supplies the authorized retained mount and its next owner.
+pub(crate) trait PoolReopenProof {
+    type Key: RestartMountKeyProof;
+
+    fn previous(&self) -> &PoolMountExpectation;
+    fn previous_root_inode(&self) -> u64;
+    fn next(&self) -> &PoolMountExpectation;
+    fn next_mount_public_key(&self) -> Digest;
+    fn drain_id(&self) -> uuid::Uuid;
 }
+
 pub struct VerifiedPoolMount {
     observation: MountedPoolObservation,
     #[cfg(target_os = "linux")]
@@ -80,13 +71,12 @@ impl VerifiedMountAnchor {
             Err(invalid())
         }
     }
-}
-impl PoolMountExpectation {
-    pub(crate) fn inspect_mount(self) -> Result<VerifiedMountAnchor, ProtocolError> {
-        self.validate()?;
+
+    pub(crate) fn inspect(expected: PoolMountExpectation) -> Result<Self, ProtocolError> {
+        expected.validate()?;
         #[cfg(target_os = "linux")]
         {
-            linux::inspect(self)
+            linux::inspect(expected)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -96,50 +86,9 @@ impl PoolMountExpectation {
             ))
         }
     }
-    pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
-        self.refuse_legacy_format()?;
-        self.identity.validate()?;
-        self.worker.validate().map_err(|_| invalid())?;
-        if self.identity.worker_id != self.worker.worker_id
-            || self.generation == 0
-            || !self.mount_path.is_absolute()
-            || self.mount_path == Path::new("/")
-            || self.mount_path.components().any(|c| {
-                matches!(
-                    c,
-                    std::path::Component::ParentDir | std::path::Component::CurDir
-                )
-            })
-            || self.mount_path.as_os_str().len() > 4096
-            || match &self.profile {
-                PoolMountProfile::Ebs => {
-                    !valid_volume_id(&self.provider_volume_id)
-                        || uuid::Uuid::parse_str(&self.filesystem_uuid).is_err()
-                }
-                PoolMountProfile::Docker { volume_marker } => {
-                    volume_marker.is_nil()
-                        || !self.filesystem_uuid.is_empty()
-                        || docker_volume_name(&self.provider_volume_id).is_none()
-                }
-            }
-        {
-            return Err(invalid());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn refuse_legacy_format(&self) -> Result<(), ProtocolError> {
-        if self.identity.engine == "oltp" && self.identity.pool_format_version == 1 {
-            return Err(super::storage::unsupported_format(&format!(
-                "{}: pool_format_version 1",
-                self.mount_path.display()
-            )));
-        }
-        Ok(())
-    }
 }
 impl VerifiedPoolMount {
-    pub(crate) fn reopen_eks(permit: &EksReplacementPermit) -> Result<Self, ProtocolError> {
+    pub(crate) fn reopen_eks(permit: &impl PoolReopenProof) -> Result<Self, ProtocolError> {
         #[cfg(target_os = "linux")]
         {
             linux::reopen_eks(permit)
@@ -150,9 +99,7 @@ impl VerifiedPoolMount {
             Err(invalid())
         }
     }
-    pub(crate) fn data_worker_key(
-        &self,
-    ) -> Result<crate::oltp_replication::authority::control::RestartMountKey, ProtocolError> {
+    pub(crate) fn data_worker_key<K: RestartMountKeyProof>(&self) -> Result<K, ProtocolError> {
         #[cfg(target_os = "linux")]
         {
             linux::data_worker_key(self)
@@ -188,13 +135,13 @@ impl VerifiedPoolMount {
     }
     pub(crate) fn verify(
         expected: PoolMountExpectation,
-        exclusion: Option<&VerifiedExclusion>,
+        exclusion: Option<&dyn PoolExclusionProof>,
     ) -> Result<Self, ProtocolError> {
-        Self::from_anchor(expected.inspect_mount()?, exclusion)
+        Self::from_anchor(VerifiedMountAnchor::inspect(expected)?, exclusion)
     }
     pub(crate) fn from_anchor(
         anchor: VerifiedMountAnchor,
-        exclusion: Option<&VerifiedExclusion>,
+        exclusion: Option<&dyn PoolExclusionProof>,
     ) -> Result<Self, ProtocolError> {
         #[cfg(target_os = "linux")]
         {
@@ -228,46 +175,22 @@ impl VerifiedPoolMount {
         }
     }
 }
-fn invalid() -> ProtocolError {
-    failure(
-        ErrorCode::StorageUnavailable,
-        "registered pool mount, device or exclusive ownership does not match inventory",
-    )
-}
-fn valid_volume_id(value: &str) -> bool {
-    value.strip_prefix("vol-").is_some_and(|id| {
-        matches!(id.len(), 8 | 17)
-            && id
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    })
-}
-fn docker_volume_name(value: &str) -> Option<&str> {
-    value.strip_prefix("docker-volume:").filter(|name| {
-        !name.is_empty()
-            && name.len() <= 255
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-            && name.as_bytes()[0].is_ascii_alphanumeric()
-    })
-}
-
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use serde::Deserialize;
     use std::io::{BufRead, BufReader, Read, Write};
     const MANIFEST: &str = ".nabedra-volume-v1.json";
     const LIMIT: usize = 16 << 10;
-    pub(super) fn data_worker_key(
+    pub(super) fn data_worker_key<K: RestartMountKeyProof>(
         mount: &VerifiedPoolMount,
-    ) -> Result<crate::oltp_replication::authority::control::RestartMountKey, ProtocolError> {
+    ) -> Result<K, ProtocolError> {
         reobserve(mount)?;
         read_data_worker_key(mount)
     }
-    fn read_data_worker_key(
+    fn read_data_worker_key<K: RestartMountKeyProof>(
         mount: &VerifiedPoolMount,
-    ) -> Result<crate::oltp_replication::authority::control::RestartMountKey, ProtocolError> {
+    ) -> Result<K, ProtocolError> {
         let path = mount.directory.fd_path()
             .join(".nabedra-data-worker-key");
         let mut file = OpenOptions::new()
@@ -287,7 +210,7 @@ mod linux {
         }
         let mut seed = [0u8; 32];
         let result = file.read_exact(&mut seed).map_err(|_| invalid()).and_then(|()| {
-            crate::oltp_replication::authority::control::RestartMountKey::from_seed(&seed)
+            K::from_mount_seed(&seed)
         });
         seed.fill(0);
         result
@@ -543,7 +466,7 @@ mod linux {
     }
     pub(super) fn verify(
         anchor: VerifiedMountAnchor,
-        exclusion: Option<&VerifiedExclusion>,
+        exclusion: Option<&dyn PoolExclusionProof>,
     ) -> Result<VerifiedPoolMount, ProtocolError> {
         let VerifiedMountAnchor {
             observation,
@@ -570,7 +493,7 @@ mod linux {
                         || old.provider_volume_id != expected.provider_volume_id
                         || old.filesystem_uuid != expected.filesystem_uuid
                         || expected.generation <= old.generation
-                        || exclusion.is_none_or(|proof| proof.stamp().worker != old.worker)
+                        || exclusion.is_none_or(|proof| proof.excluded_worker() != old.worker)
                     {
                         return Err(invalid());
                     }
@@ -638,9 +561,12 @@ mod linux {
         Ok(lock)
     }
 
-    pub(super) fn reopen_eks(permit: &EksReplacementPermit) -> Result<VerifiedPoolMount, ProtocolError> {
-        let previous = &permit.previous;
-        let next = &permit.next.mount;
+    pub(super) fn reopen_eks<P: PoolReopenProof>(
+        permit: &P,
+    ) -> Result<VerifiedPoolMount, ProtocolError> {
+        let previous = permit.previous();
+        let next = permit.next();
+        let drain_id = permit.drain_id();
         if previous.profile != PoolMountProfile::Ebs
             || next.profile != previous.profile
             || next.identity != previous.identity
@@ -650,19 +576,19 @@ mod linux {
             || previous.generation.checked_add(1) != Some(next.generation)
             || previous.worker.worker_id != next.worker.worker_id
             || previous.worker.incarnation == next.worker.incarnation
-            || permit.drain_id.is_nil()
+            || drain_id.is_nil()
         {
             return Err(invalid());
         }
         let VerifiedMountAnchor { observation, directory } = inspect_for_close(next.clone())?;
-        if observation.root_inode != permit.previous_root_inode {
+        if observation.root_inode != permit.previous_root_inode() {
             return Err(invalid());
         }
         let base = directory.fd_path();
         let lock = lock_mount(&base, false)?;
         let mount = VerifiedPoolMount { observation, directory, _lock: VolumeLock(lock) };
         revalidate(&mount.directory, &mount.observation)?;
-        if read_data_worker_key(&mount)?.public_key() != permit.next.mount_public_key {
+        if read_data_worker_key::<P::Key>(&mount)?.public_key() != permit.next_mount_public_key() {
             return Err(invalid());
         }
         let manifest = base.join(MANIFEST);
@@ -672,9 +598,9 @@ mod linux {
         }
         let current: PoolMountExpectation = serde_json::from_slice(&bounded(&manifest, LIMIT)?).map_err(|_| invalid())?;
         let closed = base.join(super::closed::CLOSED);
-        let receipt = base.join(format!(".nabedra-reopened-{}.json", permit.drain_id));
-        let still_closed = super::closed::read_marker(&closed, previous, permit.drain_id)?;
-        let reopened = super::closed::read_marker(&receipt, previous, permit.drain_id)?;
+        let receipt = base.join(format!(".nabedra-reopened-{}.json", drain_id));
+        let still_closed = super::closed::read_marker(&closed, previous, drain_id)?;
+        let reopened = super::closed::read_marker(&receipt, previous, drain_id)?;
         if still_closed == reopened || (&current != next && (!still_closed || &current != previous)) {
             return Err(invalid());
         }
@@ -817,6 +743,7 @@ mod linux {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use nabedra_oltp_types::authority::valid_volume_id;
 
     pub(in crate::oltp::pool) fn worker_identity(
         worker_id: uuid::Uuid,

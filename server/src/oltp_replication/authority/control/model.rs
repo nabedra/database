@@ -92,15 +92,7 @@ pub(crate) struct GroupBuild {
     pub retired_count: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReplicaRetiredStamp {
-    pub group: GroupIdentity,
-    pub generation: Uuid,
-    pub replica: ReplicaMember,
-    pub worker: WorkerIdentity,
-    pub applied_at: AppliedPosition,
-}
+pub(crate) use nabedra_oltp_types::authority::ReplicaRetiredStamp;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -673,19 +665,7 @@ pub(super) fn unavailable(message: &'static str) -> ProtocolError {
     ProtocolError::new(ErrorCode::StorageUnavailable, message, Outcome::Unknown)
 }
 
-/// A current queue member reads point routing metadata at the request's
-/// original timestamp. The participant checks the exact key and table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ScopedCatalogRead {
-    pub queue_group_id: Uuid,
-    pub data_generation: Uuid,
-    pub queue_generation: Uuid,
-    pub queue_view: AuthorityView,
-    pub request: RequestBinding,
-    pub table_id: Uuid,
-    pub read_ts: ReadTs,
-}
+pub(crate) use nabedra_oltp_types::authority::ScopedCatalogRead;
 
 /// The source group is bound independently of a physical worker, which can
 /// host many logical replicas. A wire caller never receives raw proposal power.

@@ -2,7 +2,8 @@
 //! version at this transaction's unique commit timestamp and emits no effect.
 use super::*;
 use crate::oltp::pool::{ByteClass, ScratchLease};
-use crate::oltp_replication::authority::status::VerifiedStatusDecision;
+use nabedra_oltp_types::{authority::StatusDecisionProof, types::DecisionStatement};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ArchiveEffect {
@@ -26,7 +27,18 @@ pub(crate) struct ArchiveEffects {
 impl ParticipantMachine {
     pub(crate) async fn archive_effect_page(
         &self,
-        proof: VerifiedStatusDecision,
+        proof: impl StatusDecisionProof,
+        after: u64,
+        max_items: u16,
+        max_bytes: usize,
+    ) -> Result<OwnedCommand<ArchiveEffects>, ProtocolError> {
+        self.archive_effect_page_from_statement(proof.statement(), after, max_items, max_bytes)
+            .await
+    }
+
+    pub(super) async fn archive_effect_page_from_statement(
+        &self,
+        statement: &DecisionStatement,
         after: u64,
         max_items: u16,
         max_bytes: usize,
@@ -38,7 +50,7 @@ impl ParticipantMachine {
         {
             return Err(invalid());
         }
-        let statement = proof.statement().clone();
+        let statement = statement.clone();
         let TxnDecision::Commit { commit_ts } = statement.decision else {
             return Err(invalid());
         };
@@ -248,14 +260,14 @@ impl ParticipantMachine {
 impl ParticipantHandle {
     pub(crate) async fn archive_effect_page(
         &self,
-        proof: VerifiedStatusDecision,
+        proof: impl StatusDecisionProof,
         after: u64,
         max_items: u16,
         max_bytes: usize,
     ) -> Result<OwnedCommand<ArchiveEffects>, ProtocolError> {
         if let Some(remote) = &self.remote {
             return remote
-                .archive_effect_page(proof, after, max_items, max_bytes)
+                .archive_effect_page(&proof, after, max_items, max_bytes)
                 .await;
         }
         self.local_consensus().ensure_linearizable().await?;
@@ -283,7 +295,7 @@ pub(super) fn decode_logical(bytes: &[u8]) -> Result<MvccKey, ProtocolError> {
         let name = super::scan::decode_text(&bytes[33..])?;
         return Ok(MvccKey::CatalogIndexName {
             table_id,
-            name: crate::oltp_replication::types::Text::new(name)
+            name: nabedra_oltp_types::types::Text::new(name)
                 .map_err(|_| recovery_unknown())?,
         });
     }
