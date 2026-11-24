@@ -10,7 +10,7 @@ use super::super::{
     clock::{ClockMode, MAX_UNCERTAINTY_NS},
     protocol::{Admin, LEASE_MS, RENEW_MS, Reply},
 };
-use super::harness::{Cluster, Config};
+use super::harness::{Cluster, Config, Partitions};
 use super::history::Op;
 use super::hooks::Knobs;
 use crate::cache::{
@@ -21,6 +21,10 @@ use crate::cache::{
 
 #[path = "mutants.rs"]
 mod mutants;
+#[path = "partitions.rs"]
+mod partitions;
+#[path = "stale_set.rs"]
+mod stale_set;
 
 const FAULT_MS: u64 = 20_000;
 const HEAL_MS: u64 = 15_000;
@@ -43,6 +47,30 @@ const REPLAY: &str = concat!(
     "RUSTFLAGS='--cfg tokio_unstable' cargo test --release --no-default-features ",
     "--features cache,sim --lib cache::cluster::sim::tests::seed_sweep -- --exact --nocapture"
 );
+
+/// `NABEDRA_SIM_PARTITIONS` picks what the sweeps' partitions do: `late`
+/// (the default) or `loss`, the form every sweep used before.
+fn partitions_from_env() -> Partitions {
+    match std::env::var("NABEDRA_SIM_PARTITIONS").as_deref() {
+        Err(_) | Ok("" | "late") => Partitions::Late,
+        Ok("loss") => Partitions::Loss,
+        other => panic!("NABEDRA_SIM_PARTITIONS must be late or loss, not {other:?}"),
+    }
+}
+
+fn partitions_name(partitions: Partitions) -> &'static str {
+    match partitions {
+        Partitions::Late => "late",
+        Partitions::Loss => "loss",
+    }
+}
+
+fn replay(partitions: Partitions) -> String {
+    format!(
+        "NABEDRA_SIM_PARTITIONS={} {REPLAY}",
+        partitions_name(partitions)
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Workload {
@@ -125,9 +153,10 @@ fn memory_value(serial: u64, kib: usize) -> String {
     value
 }
 
-fn config(g: &mut Gen) -> Config {
+fn config(g: &mut Gen, partitions: Partitions, knobs: Knobs) -> Config {
     let groups = 3 + g.below(2) as usize;
     Config {
+        partitions,
         nodes: groups + 1,
         groups,
         actors: 1 + g.below(2) as usize,
@@ -142,7 +171,7 @@ fn config(g: &mut Gen) -> Config {
         declared_ppm: 10 + g.below(141) as u32,
         skew: g.bool(),
         gradual_drift: true,
-        knobs: Knobs::default(),
+        knobs,
         check_replica_prefix: true,
         keep_full_trace: false,
     }
@@ -474,15 +503,22 @@ fn result(cluster: &Cluster, seed: u64, workload: Workload) -> SeedRun {
             "base_error_ns": cluster.config.base_error_ns,
             "declared_ppm": cluster.config.declared_ppm,
             "skew": cluster.config.skew,
+            "partitions": partitions_name(cluster.config.partitions),
+            "held_messages": observed.held,
+            "redelivered": observed.redelivered,
         }),
         virtual_ms: cluster.now(),
         tape: Vec::new(),
     }
 }
 
-fn run_seed(seed: u64, g: &mut Gen) -> SeedRun {
+fn run_seed(seed: u64, g: &mut Gen, partitions: Partitions) -> SeedRun {
+    run_seed_with(seed, g, partitions, Knobs::default())
+}
+
+fn run_seed_with(seed: u64, g: &mut Gen, partitions: Partitions, knobs: Knobs) -> SeedRun {
     let workload = Workload::for_seed(seed);
-    let mut config = config(g);
+    let mut config = config(g, partitions, knobs);
     config.keep_full_trace = seed == STAGED_RECOVERY_SEED;
     nabedra_sim::runtime::run(seed, |world| async move {
         let worker_loss = (4..8).contains(&(seed % 16));
@@ -565,13 +601,18 @@ fn keep_history(dir: &Path, run: &SeedRun) {
 #[test]
 fn seed_sweep() {
     let started = nabedra_rt::time::now_std();
-    let config = SweepConfig::from_env("cache", REPLAY);
+    let partitions = partitions_from_env();
+    let config = SweepConfig::from_env("cache", &replay(partitions));
+    let held = std::sync::Mutex::new(std::collections::BTreeMap::new());
     let histories = std::env::var_os("NABEDRA_SIM_HISTORY_DIR").map(PathBuf::from);
     if let Some(dir) = &histories {
         std::fs::create_dir_all(dir).expect("create Cache history directory");
     }
     let report = sweep::sweep(&config, |seed, g| {
-        let run = run_seed(seed, g);
+        let run = run_seed(seed, g, partitions);
+        held.lock()
+            .unwrap()
+            .insert(seed, run.config["held_messages"].as_u64().unwrap_or(0));
         if let Some(dir) = &histories {
             keep_history(dir, &run);
         }
@@ -583,6 +624,14 @@ fn seed_sweep() {
         report.count,
         elapsed / report.count as f64,
         config.jobs,
+    );
+    let held = held.into_inner().unwrap();
+    println!(
+        "Cache partitions {}: {} of {} seeds held messages, {} messages",
+        partitions_name(partitions),
+        held.values().filter(|&&count| count > 0).count(),
+        report.count,
+        held.values().sum::<u64>(),
     );
     for seed in &report.seeds {
         if REGRESSION_SEEDS.contains(&seed.seed) || NIGHTLY_REGRESSION_SEEDS.contains(&seed.seed) {
@@ -598,6 +647,7 @@ fn seed_sweep() {
             "seeds": report.evidence_seeds(),
             "virtual_hours": report.virtual_ms() as f64 / 3_600_000.0,
             "fault_model": "Cache K01 expiry, K02 memory, K03 cluster",
+            "partitions": partitions_name(partitions),
             "replayed": report.replayed(),
         })
     );
@@ -606,7 +656,8 @@ fn seed_sweep() {
 
 #[test]
 fn nightly_regressions() {
-    let config = SweepConfig::from_env("cache", REPLAY);
+    let partitions = partitions_from_env();
+    let config = SweepConfig::from_env("cache", &replay(partitions));
     let reports = sweep::parallel_map(NIGHTLY_REGRESSION_SEEDS, config.jobs, |&seed| {
         let single = SweepConfig {
             first: seed,
@@ -617,7 +668,7 @@ fn nightly_regressions() {
         };
         let trace = std::sync::Mutex::new(None);
         sweep::sweep(&single, |seed, generator| {
-            let result = run_seed(seed, generator);
+            let result = run_seed(seed, generator, partitions);
             if seed == STAGED_RECOVERY_SEED {
                 let full = result
                     .full_trace
@@ -637,8 +688,12 @@ fn nightly_regressions() {
         report.assert_passed();
         let seed = &report.seeds[0];
         println!(
-            "Cache regression seed {}: passed=true trace={:016x} events={} virtual_ms={}",
-            seed.seed, seed.trace_hash, seed.trace_events, seed.virtual_ms,
+            "Cache regression seed {}: passed=true trace={:016x} events={} virtual_ms={} partitions={}",
+            seed.seed,
+            seed.trace_hash,
+            seed.trace_events,
+            seed.virtual_ms,
+            partitions_name(partitions),
         );
     }
 }
@@ -646,9 +701,10 @@ fn nightly_regressions() {
 #[test]
 fn same_seed_same_trace() {
     let start = sweep::env_u64("NABEDRA_SEED", 1);
+    let partitions = partitions_from_env();
     for seed in start..=start.saturating_add(3) {
-        let a = run_seed(seed, &mut sweep::workload_gen(seed));
-        let b = run_seed(seed, &mut sweep::workload_gen(seed));
+        let a = run_seed(seed, &mut sweep::workload_gen(seed), partitions);
+        let b = run_seed(seed, &mut sweep::workload_gen(seed), partitions);
         assert!(a.passed(), "seed {seed}: {:?}", a.violations);
         assert_eq!(a.trace_hash, b.trace_hash, "seed {seed}");
         assert_eq!(a.trace_events, b.trace_events, "seed {seed}");

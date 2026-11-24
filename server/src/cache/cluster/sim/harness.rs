@@ -21,7 +21,7 @@ use super::super::{
         Admin, CONTROL_FRAME, LEASE_MS, Member, Progress, RENEW_MS, Reply, Request, Slot, Topology,
         VERSION, WorkerId,
     },
-    transport::{Endpoint, PeerTls},
+    transport::{Endpoint, PeerConnection, PeerTls},
     worker::{self, SlotSample, Worker},
 };
 use super::clock_bound::{BoundSpec, SimClockBound};
@@ -69,8 +69,20 @@ fn replica_repair_budget_ms(pending: usize) -> u64 {
 pub(super) type Observed = Arc<Mutex<Observations>>;
 type Controller = (SimRaftMetrics, tokio::task::JoinHandle<io::Result<()>>);
 
+/// What a blocked link does to the messages sent across it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Partitions {
+    /// The message is lost and its direction stalls until the connection
+    /// closes. A peer that gives up never hears of it.
+    Loss,
+    /// TCP retransmits. The message waits for the heal and arrives in order,
+    /// even if its sender has timed out and closed the connection.
+    Late,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Config {
+    pub partitions: Partitions,
     pub nodes: usize,
     pub groups: usize,
     pub actors: usize,
@@ -91,13 +103,18 @@ struct Network {
     plan: Arc<Mutex<NetPlan>>,
     observed: Observed,
     world: Weak<World>,
+    partitions: Partitions,
 }
 
 impl Planner for Network {
     fn message(&mut self, envelope: &Envelope<'_>) -> Fate {
         let from = envelope.from.unwrap_or(0);
         let to = envelope.to.unwrap_or(0);
-        let plan = self.plan.lock().unwrap().plan(from, to);
+        let (plan, held) = {
+            let mut links = self.plan.lock().unwrap();
+            let held = self.partitions == Partitions::Late && links.is_blocked(from, to);
+            (links.plan(from, to), held)
+        };
         let Some(world) = self.world.upgrade() else {
             return Fate::Reset;
         };
@@ -112,6 +129,12 @@ impl Planner for Network {
             ),
         );
         match plan {
+            // `Cluster::link` also black-holes the link, which holds what is
+            // sent meanwhile until the heal.
+            Plan::Drop if held => {
+                self.observed.lock().unwrap().held += 1;
+                Fate::NOW
+            }
             Plan::Drop => Fate::Drop,
             // The TCP backend delivers one ordered byte stream. Duplicate
             // segments are invisible to its frame parser.
@@ -196,6 +219,7 @@ impl Cluster {
             plan: Arc::clone(&plan),
             observed: Arc::clone(&observed),
             world: Arc::downgrade(&world),
+            partitions: config.partitions,
         });
         let mut bounds = SimClockBound::default();
         let nodes = CONTROLLERS
@@ -424,6 +448,11 @@ impl Cluster {
             self.link(controller, node, true);
             self.link(node, controller, true);
         }
+    }
+
+    pub fn partition_operator(&self, node: u64) {
+        self.link(OPERATOR, node, true);
+        self.link(node, OPERATOR, true);
     }
 
     pub fn filters(&self, filters: Filters) {
@@ -1183,6 +1212,16 @@ fn shard_member_agrees(response: &[Response], member: &Member, role: &[u8]) -> b
 
 fn is_bulk(response: &Response, expected: &[u8]) -> bool {
     matches!(response, Response::Bulk(Some(value)) if value.as_ref() == expected)
+}
+
+pub(super) async fn operator_connection(node: u64) -> PeerConnection {
+    sim::in_node(OPERATOR, async move {
+        PeerTls::sim(fingerprint(OPERATOR))
+            .connect(&endpoint(node, CONTROL))
+            .await
+            .expect("operator connection")
+    })
+    .await
 }
 
 pub(super) fn worker_nodes(count: usize) -> std::ops::Range<u64> {
