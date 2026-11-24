@@ -16,10 +16,7 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
     ("D03", &["D03:same-key", "D03:other-key"]),
     ("D04", &["D04:before-quorum", "D04:after-quorum"]),
     ("D05", &["D05:one-paused", "D05:rejoin", "D05:two-paused"]),
-    (
-        "D07",
-        &["D07:split", "D07:leader-move", "D07:stale-routes"],
-    ),
+    ("D07", &["D07:split", "D07:leader-move", "D07:stale-routes"]),
     (
         "D10",
         &["D10:session-drop", "D10:lane", "D10:one-shot-peer"],

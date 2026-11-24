@@ -354,7 +354,11 @@ pub(crate) async fn run(
 
 /// Poll until every worker and gateway reports the run ready with the direct path active, and
 /// a read of one key succeeds through each gateway.
-pub(crate) async fn converge(cluster: &Cluster, ctx: &Ctx, deadline: Duration) -> Result<(), String> {
+pub(crate) async fn converge(
+    cluster: &Cluster,
+    ctx: &Ctx,
+    deadline: Duration,
+) -> Result<(), String> {
     loop {
         let state = if cluster.converged().await {
             clients::read_each(ctx).await
