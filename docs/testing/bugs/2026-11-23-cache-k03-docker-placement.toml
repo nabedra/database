@@ -13,5 +13,5 @@ invariant_added = "Every one of the five K03 fleet repetitions commits a ready p
 fix_commits = []
 revert_patch_ok = false
 status = "open"
-owner = "P12 Cache cluster task, to be assigned by the wave-p8 lead"
+owner = "zPy52"
 expires = "2026-12-07"

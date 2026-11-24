@@ -13,5 +13,5 @@ invariant_added = "After cleanup the discard and release samples are refused, th
 fix_commits = []
 revert_patch_ok = false
 status = "open"
-owner = "harness-followup-olap-flake"
+owner = "zPy52"
 expires = "2026-12-06"
