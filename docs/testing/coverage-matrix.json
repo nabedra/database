@@ -7,7 +7,7 @@
       "K03 simulated controller disk loss is `not-run` pending modelled Raft storage."
     ]
   },
-  "head": "297e7e91af810d85cf324607c77cd4edf061afb6",
+  "head": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -120,10 +120,17 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "cache-sim"
+          ],
+          "date": "2026-11-24T05:38:03.078534+00:00",
+          "executed": 94,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "U": {
           "executed": 0,
@@ -183,10 +190,17 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "cache-sim"
+          ],
+          "date": "2026-11-24T05:38:03.078534+00:00",
+          "executed": 94,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "U": {
           "executed": 0,
@@ -275,10 +289,17 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "cache-sim"
+          ],
+          "date": "2026-11-24T05:38:03.078534+00:00",
+          "executed": 94,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "K": {
           "reason": "A quiescent check after targeted failover tests convergence",
@@ -303,10 +324,17 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "cache-sim"
+          ],
+          "date": "2026-11-24T05:38:03.078534+00:00",
+          "executed": 94,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "U": {
           "reason": "Failover spans epochs and replicas",
@@ -335,10 +363,17 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "cache-sim"
+          ],
+          "date": "2026-11-24T05:38:03.078534+00:00",
+          "executed": 94,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "K": {
           "reason": "Directed pauses cross the lease boundary",
@@ -363,10 +398,17 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "cache-sim"
+          ],
+          "date": "2026-11-24T05:38:03.078534+00:00",
+          "executed": 94,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "U": {
           "reason": "Lease authority spans workers, clocks, and the controller",
@@ -421,10 +463,17 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "cache-sim"
+          ],
+          "date": "2026-11-24T05:38:03.078534+00:00",
+          "executed": 94,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "U": {
           "reason": "Ownership is checked across committed transitions",
@@ -479,10 +528,17 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "cache-sim"
+          ],
+          "date": "2026-11-24T05:38:03.078534+00:00",
+          "executed": 94,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "U": {
           "reason": "Redirects span workers and the controller map",
@@ -537,10 +593,17 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "cache-sim"
+          ],
+          "date": "2026-11-24T05:38:03.078534+00:00",
+          "executed": 94,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "U": {
           "reason": "Cold start concerns worker lifecycle",
@@ -746,10 +809,17 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-24T05:38:18.115584+00:00",
+          "executed": 12,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "K": {
           "reason": "Quorum loss and restart are exercised at explicit cuts",
@@ -774,10 +844,17 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-24T05:38:18.115584+00:00",
+          "executed": 12,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "U": {
           "reason": "Majority durability spans replicas and storage",
@@ -807,10 +884,17 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-24T05:38:18.115584+00:00",
+          "executed": 12,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "K": {
           "reason": "Finite histories detect gaps and reuse",
@@ -833,10 +917,17 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-24T05:38:18.115584+00:00",
+          "executed": 12,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "U": {
           "executed": 0,
@@ -866,10 +957,17 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-24T05:38:18.115584+00:00",
+          "executed": 12,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "K": {
           "reason": "Targeted lost-reply cases cover the retry",
@@ -893,10 +991,17 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-24T05:38:18.115584+00:00",
+          "executed": 12,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "U": {
           "executed": 0,
@@ -926,10 +1031,17 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-24T05:38:18.115584+00:00",
+          "executed": 12,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "K": {
           "reason": "Targeted cuts exercise the invariant",
@@ -952,10 +1064,17 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-24T05:38:18.115584+00:00",
+          "executed": 12,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "U": {
           "executed": 0,
@@ -1071,10 +1190,17 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 0,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-24T05:38:18.115584+00:00",
+          "executed": 12,
           "failed": 0,
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45334502374",
+          "sha": "43b2cd85751dedc6e701e49d003c0e8cf26d33af",
+          "state": "pass"
         },
         "U": {
           "reason": "Quorum and minority behavior need multiple replicas",
@@ -4002,5 +4128,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
