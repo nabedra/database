@@ -9,7 +9,7 @@ publish = ["crates-io"]
 description = "Nabedra OLTP replication"
 
 [features]
-sim = ["nabedra-rt/sim", "nabedra-rt/sim-openraft", "nabedra-transport/sim", "nabedra-oltp-storage/sim"]
+sim = ["nabedra-rt/sim", "nabedra-rt/sim-openraft", "nabedra-transport/sim", "nabedra-oltp-storage/sim", "nabedra-oltp-types/sim"]
 test-hooks = ["nabedra-oltp-storage/test-hooks", "nabedra-resources/test-defaults", "nabedra-resources/test-hooks", "nabedra-transport/test-hooks"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-http-client"]
 

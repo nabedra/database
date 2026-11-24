@@ -244,12 +244,16 @@ impl RangeClock {
             *state.pending_keys.entry(key.clone()).or_default() += 1;
         }
         state.pending.insert(commit_ts, keys);
+        #[cfg(feature = "sim")]
+        self.probe(&state, Some(commit_ts.get()));
         Ok(())
     }
 
     /// Remove a pending commit. Idempotent.
     pub fn settle(&self, commit_ts: CommitTs) {
         let removed = self.lock().remove(commit_ts);
+        #[cfg(feature = "sim")]
+        self.probe(&self.lock(), None);
         if removed {
             self.changed.notify_waiters();
         }
@@ -268,6 +272,8 @@ impl RangeClock {
         state.leader_term = Some(term);
         state.generation += 1;
         state.clear();
+        #[cfg(feature = "sim")]
+        self.probe(&state, None);
         drop(state);
         self.changed.notify_waiters();
     }
@@ -281,6 +287,8 @@ impl RangeClock {
         state.leader_term = None;
         state.generation += 1;
         state.clear();
+        #[cfg(feature = "sim")]
+        self.probe(&state, None);
         drop(state);
         self.changed.notify_waiters();
     }
@@ -321,13 +329,22 @@ impl RangeClock {
             }
             state.generation
         };
-        self.wait_since(generation, |state| {
-            state
-                .pending
-                .first_key_value()
-                .is_none_or(|(ts, _)| ts.get() > bound)
-        })
-        .await
+        let served = self
+            .wait_since(generation, |state| {
+                state
+                    .pending
+                    .first_key_value()
+                    .is_none_or(|(ts, _)| ts.get() > bound)
+            })
+            .await;
+        #[cfg(feature = "sim")]
+        if served.is_ok() && bound != u64::MAX {
+            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::SnapshotServed {
+                group: self._store.identity().group_id,
+                read_ts: bound,
+            });
+        }
+        served
     }
 
     /// A latest-version read of `key` (plan section 6, `table.get`) waits for
@@ -337,6 +354,22 @@ impl RangeClock {
         let generation = self.lock().generation;
         self.wait_since(generation, |state| !state.pending_keys.contains_key(&key))
             .await
+    }
+
+    /// Reports a registration at `commit_ts`, if any, and the pending ledger (simulation only).
+    #[cfg(feature = "sim")]
+    fn probe(&self, state: &ClockState, commit_ts: Option<u64>) {
+        use nabedra_oltp_types::sim_probe::{Ledger, Probe, emit};
+        let group = self._store.identity().group_id;
+        if let Some(commit_ts) = commit_ts {
+            let term = state.leader_term.unwrap_or_default();
+            emit(|| Probe::DirectProposed { group, commit_ts, term });
+        }
+        emit(|| Probe::LedgerSnapshot {
+            ledger: Ledger::RangeClockPending,
+            group: Some(group),
+            outstanding: state.pending.len() as u64,
+        });
     }
 
     async fn wait_since(

@@ -297,6 +297,15 @@ impl NativePlanner {
                 restored: None,
             };
             closure.validate(table_id, closure.split_id)?;
+            #[cfg(feature = "sim")]
+            nabedra_oltp_types::sim_probe::emit(|| {
+                crate::oltp::mvcc::catalog::route_probe(
+                    table_id,
+                    child_epoch,
+                    Some(&a.binding.source_span),
+                    [&a.binding.target_span, &b.binding.target_span],
+                )
+            });
             let mut writes = Vec::with_capacity(5);
             writes.push(PreparedWrite {
                 key: closure.key(),

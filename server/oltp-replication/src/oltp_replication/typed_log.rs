@@ -826,6 +826,15 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             })
             .await
             .map_err(disk)?;
+        #[cfg(feature = "sim")]
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::VoteSaved {
+            group: self.store.identity().group_id,
+            kind: self.store.identity().kind.clone(),
+            replica: self.node_id,
+            term: vote.leader_id.term,
+            leader: vote.leader_id.node_id,
+            committed: vote.committed,
+        });
         Ok(())
     }
     /// Unsynced: OpenRaft treats the commit marker as a recovery hint and
@@ -959,6 +968,8 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         // or discard its completion callback. The host joins pending operations
         // before releasing replica residency and stopping its runtime.
         let pending = self.pending.start();
+        #[cfg(feature = "sim")]
+        let replica = self.node_id;
         #[cfg(test)]
         let append_hook = self.append_hook.lock().expect("append test hook").take();
         #[cfg(test)]
@@ -1183,6 +1194,19 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             if let Err(error) = &result {
                 tracing::error!(target: "nabedra_database_server::oltp_replication::typed_log", group=%store.identity().group_id,kind=?store.identity().kind,io_kind=?error.kind(),error=%error,"typed durable log append failed before IOFlushed");
             }
+            #[cfg(feature = "sim")]
+            if result.is_ok() {
+                nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::Appended {
+                    group: store.identity().group_id,
+                    kind: kind.clone(),
+                    replica,
+                    entries: jobs
+                        .iter()
+                        .flat_map(|job| job.batch.iter())
+                        .map(|entry| super::hosted::position(entry.log_id))
+                        .collect(),
+                });
+            }
             // Durable and visible in the store, or failed: leave the overlay
             // before reporting, so a flushed entry is always read back stored.
             // Callbacks fire in log order.
@@ -1250,6 +1274,13 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             })
             .await
             .map_err(disk)?;
+        #[cfg(feature = "sim")]
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::Truncated {
+            group: self.store.identity().group_id,
+            kind: self.store.identity().kind.clone(),
+            replica: self.node_id,
+            after: last.map(super::hosted::position),
+        });
         Ok(())
     }
     async fn purge(&mut self, id: LogId) -> io::Result<()> {

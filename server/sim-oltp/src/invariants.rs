@@ -1,20 +1,25 @@
 //! End-to-end checks over client history, mounted disks and public observations.
-//! The optional probe stream lets workloads check protocol events synchronously.
+//! The probe stream ([`crate::probes`]) adds the protocol invariants in [`protocol`],
+//! checked synchronously as each probe arrives.
+
+pub mod protocol;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
-use nabedra_check::checker::Verdict;
+use nabedra_check::{checker::Verdict, history::Event};
 use nabedra_rt::{
     fs::FaultFs,
     sim::{VolumeInfo, World},
 };
 use nabedra_sim::raft::MAX_VIOLATIONS;
 use serde_json::Value;
+
+use crate::probes::{ProbeEvent, Probes, describe};
 
 pub const STEP: Duration = Duration::from_millis(10);
 pub const RECOVERY_LIMIT: Duration = Duration::from_secs(30);
@@ -31,13 +36,16 @@ pub struct Invariants {
 }
 
 #[derive(Default)]
-struct Checks {
+pub(crate) struct Checks {
     volumes: BTreeMap<u64, VolumeInfo>,
     deadlines: BTreeMap<String, Duration>,
     resources: BTreeMap<u64, ResourceUsage>,
+    /// Per worker: native leases outstanding at the resource baseline, from probes.
+    native_baseline: BTreeMap<u64, u64>,
     reported: BTreeSet<(String, String)>,
     violations: Vec<String>,
     trace: Option<TraceObserver>,
+    probes: Option<Probes>,
 }
 
 /// A half-open key range. An unbounded end is represented by `None`.
@@ -53,6 +61,48 @@ impl Invariants {
 
     pub fn set_trace(&self, trace: TraceObserver) {
         self.checks.lock().unwrap().trace = Some(trace);
+    }
+
+    /// Installs the run's probe sink, so the protocol invariants run and probes enter the
+    /// run trace. Call it before any node starts.
+    pub fn install_probes(&self, world: &Arc<World>, workload: &str) -> Probes {
+        Probes::install(world, self, workload)
+    }
+
+    /// The probe stream, once installed. A nemesis subscribes to it for triggers.
+    pub fn probes(&self) -> Option<Probes> {
+        self.checks.lock().unwrap().probes.clone()
+    }
+
+    pub(crate) fn set_probes(&self, probes: Probes) {
+        self.checks.lock().unwrap().probes = Some(probes);
+    }
+
+    pub(crate) fn downgrade(&self) -> Weak<Mutex<Checks>> {
+        Arc::downgrade(&self.checks)
+    }
+
+    pub(crate) fn from_checks(checks: Arc<Mutex<Checks>>) -> Self {
+        Self { checks }
+    }
+
+    /// Adds a probe to the hashed run trace.
+    pub(crate) fn record_probe(&self, world: &World, event: &ProbeEvent) {
+        self.trace(world, describe(event));
+    }
+
+    /// NotAppliedNeverCommitted over the finished client history.
+    pub fn check_outcomes(&self, world: &World, events: &[Event]) {
+        if let Some(probes) = self.probes() {
+            probes.check_outcomes(world, events);
+        }
+    }
+
+    /// True when no probe-driven invariant reported a violation.
+    pub fn probe_invariants_hold(&self) -> bool {
+        self.checks.lock().unwrap().violations.iter().all(|line| {
+            !protocol::PROBE_INVARIANTS.contains(&nabedra_sim::shrink::violation_kind(line))
+        })
     }
 
     /// Records the expected identity from the mount operation. A workload can
@@ -119,7 +169,11 @@ impl Invariants {
     /// At quiescence, capture the transient gauges that worker stats expose.
     /// Retained queue responses and caches can legitimately grow after work.
     pub fn capture_resources(&self, world: &World, worker: u64, stats: &Value) {
+        let ledgers = self.ledgers(worker);
         let mut checks = self.checks.lock().unwrap();
+        if let Some((native, _)) = ledgers {
+            checks.native_baseline.insert(worker, native);
+        }
         match ResourceUsage::from_stats(stats) {
             Some(usage) => {
                 checks.check_storage_devices(world, worker, &usage);
@@ -136,7 +190,21 @@ impl Invariants {
     /// Checks the public subset of ResourceBaseline. The full resource ledger
     /// and RangeClock pending sets require their probe observations.
     pub fn check_resources(&self, world: &World, worker: u64, stats: &Value) {
+        let ledgers = self.ledgers(worker);
         let mut checks = self.checks.lock().unwrap();
+        if let Some(ledgers) = ledgers
+            && !checks.ledgers_within(worker, ledgers)
+        {
+            let baseline = checks.native_baseline.get(&worker).copied();
+            checks.violate(
+                world,
+                "ResourceBaseline",
+                format!(
+                    "n{worker} probes report {} native leases (baseline {baseline:?}) and {} pending RangeClock commits after quiescence",
+                    ledgers.0, ledgers.1
+                ),
+            );
+        }
         let Some(now) = ResourceUsage::from_stats(stats) else {
             checks.violate(
                 world,
@@ -163,7 +231,13 @@ impl Invariants {
     /// Allows a workload to wait for transient work to settle before asserting
     /// ResourceBaseline. Missing observations leave the expectation pending.
     pub fn resources_at_baseline(&self, worker: u64, stats: &Value) -> bool {
+        let ledgers = self.ledgers(worker);
         let checks = self.checks.lock().unwrap();
+        if let Some(ledgers) = ledgers
+            && !checks.ledgers_within(worker, ledgers)
+        {
+            return false;
+        }
         let (Some(baseline), Some(now)) = (
             checks.resources.get(&worker),
             ResourceUsage::from_stats(stats),
@@ -242,11 +316,25 @@ impl Invariants {
     }
 
     pub fn finish(&self, world: &World) {
+        let probes = self.probes();
         let mut checks = self.checks.lock().unwrap();
         checks.step(world);
         for (label, deadline) in std::mem::take(&mut checks.deadlines) {
             checks.violate(world, "Liveness", deadline_message(&label, deadline));
         }
+        drop(checks);
+        if let Some(Err(error)) = probes.map(|probes| probes.finish()) {
+            self.violate(
+                world,
+                "TraceSink",
+                format!("cannot write the nabedra.trace/1 file: {error}"),
+            );
+        }
+    }
+
+    /// The probe ledgers of `worker`, without holding the checks lock.
+    fn ledgers(&self, worker: u64) -> Option<(u64, u64)> {
+        self.probes().map(|probes| probes.ledgers(worker))
     }
 
     pub fn violate(&self, world: &World, invariant: &str, detail: impl Into<String>) {
@@ -278,6 +366,16 @@ fn deadline_message(label: &str, deadline: Duration) -> String {
 }
 
 impl Checks {
+    /// ResourceBaseline from probes: native leases back at (or below) the baseline and
+    /// no RangeClock commit pending.
+    fn ledgers_within(&self, worker: u64, (native, pending): (u64, u64)) -> bool {
+        pending == 0
+            && self
+                .native_baseline
+                .get(&worker)
+                .is_none_or(|baseline| native <= *baseline)
+    }
+
     fn check_storage_devices(&mut self, world: &World, node: u64, usage: &ResourceUsage) {
         if let Some(info) = self.volumes.get(&node)
             && !usage.disk.keys().copied().eq([info.dev])
@@ -403,45 +501,5 @@ impl ResourceUsage {
                 now.reserved_bytes <= baseline.reserved_bytes
                     && now.reservations <= baseline.reservations
             })
-    }
-}
-
-type Handler<P> = Box<dyn FnMut(&World, &P, &Invariants) + Send>;
-type Describe<P> = Box<dyn Fn(&P) -> String + Send>;
-
-/// Typed adapter for the OLTP probe producer. The product sink can forward its
-/// `Probe` to `emit`, while each workload can register checks and fault triggers.
-/// Choose a trace descriptor that excludes payload bytes and cryptographic nonces.
-pub struct ProbeSink<P> {
-    invariants: Invariants,
-    describe: Describe<P>,
-    handlers: Vec<Handler<P>>,
-}
-
-impl<P: 'static> ProbeSink<P> {
-    pub fn new(invariants: Invariants, describe: impl Fn(&P) -> String + Send + 'static) -> Self {
-        Self {
-            invariants,
-            describe: Box::new(describe),
-            handlers: Vec::new(),
-        }
-    }
-
-    pub fn subscribe(&mut self, handler: impl FnMut(&World, &P, &Invariants) + Send + 'static) {
-        self.handlers.push(Box::new(handler));
-    }
-
-    pub fn install(self, world: &World) {
-        world.insert_ext(self);
-    }
-
-    pub fn emit(world: &World, probe: &P) {
-        world.with_ext::<Self, _>(|sink| {
-            sink.invariants
-                .trace(world, format!("probe {}", (sink.describe)(probe)));
-            for handler in &mut sink.handlers {
-                handler(world, probe, &sink.invariants);
-            }
-        });
     }
 }

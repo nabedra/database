@@ -516,6 +516,11 @@ impl WorkerSharedResources {
                 return Err(capacity());
             }
             state.count += 1;
+            #[cfg(feature = "sim")]
+            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GuardAcquired {
+                class: class_name(class),
+                outstanding: state.count as u64,
+            });
         }
         let mut lease = NativeLease {
             permit: None,
@@ -620,6 +625,10 @@ struct NativeSettlement(Arc<NativeLeases>);
 impl Drop for NativeSettlement {
     fn drop(&mut self) {
         self.0.state.lock().expect("native lease state").count -= 1;
+        #[cfg(feature = "sim")]
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GuardReleased {
+            outstanding: self.0.state.lock().map_or(0, |state| state.count as u64),
+        });
         self.0.settled.notify_waiters();
     }
 }
@@ -704,11 +713,17 @@ impl PreparedNative {
             ExecutionClass::Control => &owner.control,
         };
         let (tx, rx) = oneshot::channel();
+        #[cfg(feature = "sim")]
+        let class = self.class;
         let job = (guard, work, self.lease);
         executor.send(Box::new(move || {
             let (guard, work, lease) = job;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
                 .unwrap_or_else(|_| Err(super::super::recovery_unknown()));
+            #[cfg(feature = "sim")]
+            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::WorkDone {
+                class: class_name(class),
+            });
             // Release the slot and the worker owner before the caller can see
             // the result: a caller that then drops its last owner must find the
             // worker unbound, or a reopen is refused (C02, CIfix1).
@@ -730,6 +745,14 @@ impl PreparedNative {
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(feature = "sim")]
+fn class_name(class: ExecutionClass) -> &'static str {
+    match class {
+        ExecutionClass::Query => "query",
+        ExecutionClass::Control => "control",
+    }
+}
 
 #[cfg(feature = "sim")]
 struct SimJob(Option<Job>);

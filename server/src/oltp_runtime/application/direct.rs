@@ -968,6 +968,13 @@ impl DirectGateway {
                     .position(Option::is_none)
                     .expect("bounded voters");
                 pending[slot] = Some(voter.node_id);
+                #[cfg(feature = "sim")]
+                nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GatewayAttempt {
+                    request_id: request.request_id,
+                    group: request.group,
+                    voter: voter.node_id,
+                    remaining_us: u64::try_from(left.as_micros()).unwrap_or(u64::MAX),
+                });
                 let group = range.clone();
                 attempts.push(async move {
                     let reply = self
