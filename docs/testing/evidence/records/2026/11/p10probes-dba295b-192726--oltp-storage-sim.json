@@ -1,0 +1,53 @@
+{
+  "artifacts": [
+    {
+      "name": "p10probes-dba295b-192726--oltp-storage-sim.log",
+      "sha256": "b7a0135000461c99a2663f613ee1f7ccf8c60ff76a05ce1a81b2aa1292ad33cf"
+    }
+  ],
+  "assertions": {
+    "executed": 550,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-storage-sim",
+  "duration_s": 204.299,
+  "guarantees": [
+    "OLTP-G01",
+    "OLTP-G08",
+    "OLTP-G09",
+    "SCHED-G01"
+  ],
+  "kind": "S",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T18:38:27.107865+00:00",
+    "request_id": "p10probes-dba295b-192726",
+    "runner": "GitHub Actions 1000012743",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45459719572"
+  },
+  "scenarios": [
+    "C04",
+    "C06",
+    "F01",
+    "F02",
+    "F03",
+    "NS04",
+    "O11",
+    "O16",
+    "O17"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "dba295b47f197e4f9303aea66d78b8c014f710e2",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

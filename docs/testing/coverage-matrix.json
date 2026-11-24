@@ -7,8 +7,49 @@
       "K03 simulated controller disk loss is `not-run` pending modelled Raft storage."
     ]
   },
-  "head": "297e7e91af810d85cf324607c77cd4edf061afb6",
-  "ignored_records": [],
+  "head": "b37e6129a41015716ca8f8878823a9a9ecb8a93e",
+  "ignored_records": [
+    {
+      "path": "p10probes-dba295b-192726--crate-graph.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p10probes-dba295b-192726--oltp-native-executor-sim.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p10probes-dba295b-192726--oltp-pool-sim.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p10probes-dba295b-192726--oltp-probes-planted.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p10probes-dba295b-192726--oltp-probes-unchanged.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p10probes-dba295b-192726--oltp-probes.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p10probes-dba295b-192726--oltp-sim-determinism-unit.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p10probes-dba295b-192726--oltp-sim-net.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p10probes-dba295b-192726--oltp-storage-sim.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "p10probes-dba295b-192726--rt-zero-cost.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -2772,6 +2813,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -2917,7 +2959,7 @@
           "state": "n/a"
         }
       },
-      "guarantee": "Each request identity executes once, cluster-wide on the queued path and per table and key on the direct path.",
+      "guarantee": "Each request identity executes once, cluster-wide on the queued path and per table and key on the direct path. On the direct path, a retry of a mutation with the same request ID and body returns the first definite result of that identity, including a no-op or row conflict, while its dedup record is retained.",
       "id": "OLTP-G03",
       "level": "L3",
       "module": "oltp",
@@ -2973,6 +3015,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -3237,6 +3280,7 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -3300,12 +3344,14 @@
         "S": {
           "executed": 0,
           "failed": 0,
+          "reason": "2 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -3796,6 +3842,7 @@
         "U": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         }
@@ -4002,5 +4049,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
