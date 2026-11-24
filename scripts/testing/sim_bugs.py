@@ -667,7 +667,8 @@ SWEEP_TARGET = "nabedra_sim_oltp"
 SWEEP_TEST = "sweep::tests::sweep"
 # The harness needs this stack for the real worker bootstrap (server/sim-oltp/README.md).
 HARNESS_STACK = "16777216"
-UNAVAILABLE_WORKLOAD = re.compile(r'OLTP workload "([^"]+)" is unavailable')
+# The sweep test prints this error through `expect`, so its quotes are escaped.
+UNAVAILABLE_WORKLOAD = re.compile(r'OLTP workload [\\]?"([a-z0-9-]+)[\\]?" is unavailable')
 # Inherited variables that would change what the harness runs. Each run sets its own.
 HARNESS_PREFIXES = ("NABEDRA_SIM_", "NABEDRA_SEED", "NABEDRA_PLANTED_")
 
@@ -853,7 +854,7 @@ def search_bug(args, scratch, env, log, bug, plan, out_dir, clean_exe):
            "guarantees": bug.manifest["guarantees"], "scenarios": bug.manifest["scenarios"],
            "patch_sha256": hashlib.sha256(bug.patch.encode()).hexdigest(), "digest": digest(bug.patch),
            "workload": plan.workload, "profile": plan.profile, "expect": plan.expect,
-           "seeds": [plan.first, plan.last], "result": "not-found"}
+           "seeds": [plan.first, plan.last], "result": "not-found", "rehearse_defect": plan.defect}
     tree = scratch.path
     scratch.apply(bug)
     try:
@@ -929,7 +930,8 @@ def describe(row):
         where = f"seed {row['found_seed']}" if "found_seed" in row else f"[{row['seeds'][0]}, {row['seeds'][1]}]"
         return f"{row['id']}: NOT found ({where}: {row.get('why', 'unknown')})"
     patched, clean = row["patched"], row["clean"]
-    return (f"{row['id']}: found seed {row['found_seed']} after {row['tried']} seeds in "
+    by = f" (defect {row['rehearse_defect']}, not the patch)" if row.get("rehearse_defect") else ""
+    return (f"{row['id']}: found{by} seed {row['found_seed']} after {row['tried']} seeds in "
             f"[{row['seeds'][0]}, {row['seeds'][1]}]; patched {patched['kinds']} trace "
             f"{patched['trace_hash']} ({patched['trace_events']} events, replay deterministic), "
             f"history sha256 {patched['history_sha256']}; clean twin pass trace {clean['trace_hash']} "
@@ -972,9 +974,10 @@ def cmd_run(repo, bugs, args, out):
     (out_dir / "sim-bugs-run.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     found = sum(row["result"] == "found" for row in rows)
     not_run = [row["id"] for row in rows if row["result"] == "not-run"]
+    what = ("pipeline rehearsals completed; no reverted fix was searched for" if mode == "rehearsal" else
+            "reverted fixes found within budget, each with a passing clean twin and control")
     print(f"sim-bugs run{' (rehearsal)' if mode == 'rehearsal' else ''}: {found} of {len(rows)} "
-          f"reverted fixes found within budget, each with a passing clean twin; summary "
-          f"{out_dir / 'sim-bugs-run.json'}", file=out)
+          f"{what}; summary {out_dir / 'sim-bugs-run.json'}", file=out)
     if found == len(rows):
         return 0
     if not_run and found + len(not_run) == len(rows):

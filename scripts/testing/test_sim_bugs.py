@@ -77,7 +77,8 @@ assert sys.argv[1:] == ["sweep::tests::sweep", "--exact", "--nocapture", "--test
 assert env["RUST_MIN_STACK"] == "16777216" and "--cfg tokio_unstable" in env["RUSTFLAGS"]
 workload = env["NABEDRA_SIM_WORKLOAD"]
 if workload not in ("direct", "smoke"):
-    print(f'OLTP simulation: OLTP workload "{workload}" is unavailable; use smoke')
+    # The text of the real test: `expect` prints the error with its quotes escaped.
+    print("OLTP smoke sweep report: " + json.dumps(f'OLTP workload "{workload}" is unavailable; use smoke'))
     sys.exit(101)
 if workload == "smoke" and "NABEDRA_SIM_PROFILE" in env:
     sys.exit(101)
@@ -437,7 +438,9 @@ class SimBugsTest(unittest.TestCase):
             "--rehearse-defect", "lost-write")
         self.assertEqual(status, 0, output)
         self.assertIn("(rehearsal: manifest workload, profile or expectation overridden", output)
-        self.assertIn("sim-bugs run (rehearsal): 1 of 1", output)
+        self.assertIn("sim-bugs run (rehearsal): 1 of 1 pipeline rehearsals completed", output)
+        self.assertIn("fix-one: found (defect lost-write, not the patch) seed 2", output)
+        self.assertNotIn("reverted fixes found", output)
         self.assertEqual(summary["mode"], "rehearsal")
         self.assertEqual([(c["defect"], c["profile"]) for c in calls],
                          [("lost-write", None), ("lost-write", None), (None, None), (None, None)])
