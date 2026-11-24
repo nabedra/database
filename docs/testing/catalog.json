@@ -1218,7 +1218,7 @@
 {"file":"server/src/cache/cluster/controller/tests.rs","hash":"612f949c02d74db6","id":"server/src/cache/cluster/controller/tests.rs::k03_replaces_a_retired_replica_before_resuming_same_zone_rebalance","lang":"rust"},
 {"file":"server/src/cache/cluster/controller/tests.rs","hash":"eac3865545e931ad","id":"server/src/cache/cluster/controller/tests.rs::k03_restart_rejects_retired_incarnation_and_scoped_reset_requires_fence","lang":"rust"},
 {"file":"server/src/cache/cluster/controller/tests.rs","hash":"7c86c2da7c80cff2","id":"server/src/cache/cluster/controller/tests.rs::k03_retired_source_does_not_hold_replica_move_capacity","lang":"rust"},
-{"file":"server/src/cache/cluster/controller/tests.rs","hash":"0230c730ac787afa","id":"server/src/cache/cluster/controller/tests.rs::k03_staged_promotion_checks_fence_lag_and_copy_at_apply","lang":"rust"},
+{"file":"server/src/cache/cluster/controller/tests.rs","hash":"6ec21219e6896c8b","id":"server/src/cache/cluster/controller/tests.rs::k03_staged_promotion_checks_fence_lag_and_copy_at_apply","lang":"rust"},
 {"file":"server/src/cache/cluster/controller/tests.rs","hash":"d856e55e2a436155","id":"server/src/cache/cluster/controller/tests.rs::k03_stalled_move_resumes_source_under_a_new_epoch_only_after_fence","lang":"rust"},
 {"file":"server/src/cache/cluster/controller/tests.rs","hash":"824743075b6ae7b8","id":"server/src/cache/cluster/controller/tests.rs::k03_u03_failover_fences_latest_committed_lease_and_requires_baseline","lang":"rust"},
 {"file":"server/src/cache/cluster/sim/clock_bound/tests.rs","hash":"40bcb444d9128497","id":"server/src/cache/cluster/sim/clock_bound/tests.rs::k03_clock_bound_checks_sync_width_and_rollback_in_the_real_clock","lang":"rust"},
