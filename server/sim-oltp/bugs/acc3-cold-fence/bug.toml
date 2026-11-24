@@ -28,26 +28,14 @@ scenario = "O15"
 mode = "on"
 timeout_s = 3600
 failure_contains = ["registered startup ValidationError: worker does not host target replica node", "AssertionError: ['RF3 cold run']"]
-# O15 caught this patch in 1 of 5 patched runs: run 45148928008 (on failed, off passed) and 0 of 3
-# attempts in the oltp-sim-bugs-regression run 45150522656. After the crate split it caught it in
-# 0 of 10 attempts at 5953e85 (oltp-sim-bugs-regression-acc3, run 45413905217), while all 10
-# unpatched attempts passed: 1 of 18 in all. The patch still removes the retry (the refusal then
-# reaches the generic transport arm, which returns it), but only a replica that has not reopened
-# when the fence arrives exposes it. O15 cannot gate it; the cold workload's seed search must.
+# O15 is a timing window and has NOT re-verified this patch since the crate split.
+# - Before it: 1 of 5 patched runs failed (run 45148928008 failed with direct_oltp on at 3998c378
+#   with "worker does not host target replica node", and passed with it off; run 45150522656
+#   passed 3 of 3 attempts). The clean run was 45148935717 at 53a5716f.
+# - After it: oltp-sim-bugs-regression-acc3 at 5953e85 (run 45413905217) allowed 10 attempts and
+#   none failed. The unpatched side passed all 10. That run's log did not list the patched
+#   attempts, so it shows no failure and a passing last attempt, not ten passes.
+# The old runs are not recorded as [regression.evidence]: their digest was for the old path, and
+# the re-verification that would justify a new one did not fail. A clean port needs no evidence,
+# and the cold workload's seed search has to detect this patch.
 attempts = 10
-
-[regression.evidence]
-# The changed lines are those of the historical runs below; only the path moved (phase 8
-# replication crate), which changes the digest.
-digest = "76df45f6d8b3a0a5e0c479368a8315df02698b9490020187e473e25244beda92"
-clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148935717", sha = "53a5716f844aa9690739daed32fd335c68bc0f8a", result = "passed", note = "request p10-bugs-clean-53a5716-103844, O15 direct_oltp on: all 6 required clauses passed" }
-patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148928008", sha = "3998c3780b617568a4613e5485a143489e96812b", result = "failed", note = "scratch/sim-bug-acc3-cold-fence, request p10-bugs-acc3-cold-fence-3998c37-103844. O15 failed with direct_oltp on and passed with direct_oltp off in the same run: the reopen window is timing dependent, which is why the simulator should search for it.", output = """
-nabedra-db: registered startup ValidationError: worker does not host target replica node
-panicked at src/oltp_runtime/recovery_tests.rs:681:14:
-called `Result::unwrap()` on an `Err` value: "registered worker startup failed"
-AssertionError: ['RF3 cold run']
-panicked at src/oltp_runtime/recovery_tests.rs:1098:5:
-O15 process assertions failed
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 585 filtered out; finished in 47.08s
-O15 status failed: assertion process exited 101; missing clauses: cold-run-abandonment, pre-fence-decisions, abort-without-reexecution, old-receipt-outcomes, interrupted-fences
-""" }

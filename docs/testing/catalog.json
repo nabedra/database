@@ -597,7 +597,7 @@
 {"file":"scripts/testing/test_run_check.py","hash":"4c86fc1e4e4332ff","id":"scripts/testing/test_run_check.py::ParserTests::test_unittest","lang":"python"},
 {"file":"scripts/testing/test_run_check.py","hash":"4b4cb7d4fcc51004","id":"scripts/testing/test_run_check.py::ParserTests::test_zero_assertions_is_not_run_never_pass","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs.py","hash":"75b988a1bdb6bdec","id":"scripts/testing/test_sim_bugs.py::SimBugsTest::test_apply_check_uses_head_not_the_working_tree","lang":"python"},
-{"file":"scripts/testing/test_sim_bugs.py","hash":"f925863d30053d9e","id":"scripts/testing/test_sim_bugs.py::SimBugsTest::test_attempts_for_a_timing_window","lang":"python"},
+{"file":"scripts/testing/test_sim_bugs.py","hash":"66d9c1a17075628f","id":"scripts/testing/test_sim_bugs.py::SimBugsTest::test_attempts_for_a_timing_window","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs.py","hash":"da468f4f82ef9c07","id":"scripts/testing/test_sim_bugs.py::SimBugsTest::test_clean_claim_must_cover_every_product_file_of_the_fix","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs.py","hash":"e402ef554ca8bcdb","id":"scripts/testing/test_sim_bugs.py::SimBugsTest::test_clean_claim_with_other_lines_fails","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs.py","hash":"de139984202a9d99","id":"scripts/testing/test_sim_bugs.py::SimBugsTest::test_clean_port_follows_a_crate_move","lang":"python"},

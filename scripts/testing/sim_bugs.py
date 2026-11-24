@@ -562,20 +562,21 @@ def regression_verdict(bug, tree, exe, server, env, log, patched):
 
     Without the patch every attempt must pass. With it, the first attempt that fails with the
     expected text decides; a failure without that text is `failed-otherwise`, never `failed`.
+    Returns the verdict, the last attempt's output and every attempt's status.
     """
     seen = []
     for _ in range(bug.regression.get("attempts", 1)):
         status, output = run_regression(bug, tree, exe, server, env, log)
         if patched and status == "failed":
             if matches_failure(bug, output):
-                return "failed", output
+                return "failed", output, [*seen, "failed"]
             status = "failed-otherwise"
         seen.append(status)
         if not patched and status != "passed":
             break
     if not patched:
-        return seen[-1], output
-    return ("failed-otherwise" if "failed-otherwise" in seen else seen[-1]), output
+        return seen[-1], output, seen
+    return ("failed-otherwise" if "failed-otherwise" in seen else seen[-1]), output, seen
 
 
 def print_regression_result(bug, output, out):
@@ -615,14 +616,16 @@ def cmd_verify(repo, bugs, args, out):
         clean = {}
         for bug in bugs:
             exe, server = clean_builds[packages[bug.id]]
-            clean[bug.id], output = regression_verdict(bug, tree, exe, server, env, log, patched=False)
+            clean[bug.id], output, seen = regression_verdict(bug, tree, exe, server, env, log, patched=False)
             print(f"{bug.id}: without the patch {clean[bug.id]}", file=out, flush=True)
+            print(f"{bug.id}: unpatched attempts {seen}", file=out, flush=True)
             print_regression_result(bug, output, out)
         for bug in bugs:
             scratch.apply(bug)
             try:
                 p_exe, p_server = build(packages[bug.id])
-                patched, output = regression_verdict(bug, tree, p_exe, p_server, env, log, patched=True)
+                patched, output, seen = regression_verdict(bug, tree, p_exe, p_server, env, log, patched=True)
+                print(f"{bug.id}: patched attempts {seen}", file=out, flush=True)
                 print_regression_result(bug, output, out)
             except Failure as error:
                 patched = "not-run"

@@ -500,6 +500,10 @@ class SimBugsTest(unittest.TestCase):
         self.assertEqual(verdict(True), "passed")
         outcomes[:] = [("failed", "other"), ("passed", ""), ("passed", "")]
         self.assertEqual(verdict(True), "failed-otherwise")
+        # A passing last attempt must not hide an earlier one that never ran.
+        outcomes[:] = [("not-run", ""), ("timeout", ""), ("passed", "")]
+        self.assertEqual(sim_bugs.regression_verdict(bug, None, None, None, {}, None, True)[::2],
+                         ("passed", ["not-run", "timeout", "passed"]))
         outcomes[:] = [("passed", ""), ("failed", "x")]
         self.assertEqual(verdict(False), "failed")
         outcomes[:] = [("passed", "")] * 3
