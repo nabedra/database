@@ -31,6 +31,8 @@ Commands:
                  digests, patch SHA-256) beside the harness artifacts. While the harness or a
                  bug's workload is missing it prints `not-run: sim-harness-missing` and exits 0,
                  which the check records as not-run, never as a pass.
+                 A bug with `regression.probe` first applies its test-only probe.patch to
+                 both builds (never in `run`).
   digest <id>    Print the changed-lines digest to record in a manifest's evidence.
 
 Use `--set <name>` instead of ids to select the manifests of one set (direct, queued, topology,
@@ -59,11 +61,17 @@ HARNESS_MANIFEST = Path("server/sim-oltp/Cargo.toml")
 SCHEMA = "nabedra.sim-bug/1"
 SETS = ("direct", "queued", "topology", "membership", "resources")
 PORTS = ("clean", "hand")
-REGRESSION_KINDS = ("lib-test", "acceptance")
+REGRESSION_KINDS = ("lib-test", "acceptance", "recovery-suite")
 SHA = re.compile(r"[0-9a-f]{40}")
 ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 TEST_PATH = re.compile(r"[a-z_][a-z0-9_]*(?:::[a-z_][a-z0-9_]*)+")
 SCENARIO = re.compile(r"O[0-9]{2}")
+# Suites of server/tests/oltp_recovery_operations.py (RF3 processes on loopback mounts).
+RECOVERY_SUITES = ("replacement-wipe", "replacement-voter-refresh")
+# Library tests by path prefix run from the crate that owns them.
+TEST_CRATES = (("oltp_replication::", "nabedra-oltp-replication", "oltp-replication"),
+               ("oltp::", "nabedra-oltp-storage", "oltp-storage"),
+               ("transport::", "nabedra-transport", "transport"))
 GUARANTEE_ROW = re.compile(r"^\|\s*([A-Z][A-Z-]*-G[0-9]{2})\s*\|", re.MULTILINE)
 # A patch may only touch product sources: never tests, test data or the harness itself.
 TEST_FILE = re.compile(r"(^|/)(tests?|testdata|fixtures)(/|$)|(^|/)tests?\.rs$|_tests?\.rs$|(^|/)test_[^/]*\.py$")
@@ -86,7 +94,8 @@ REQUIRED = MANIFEST_FIELDS.keys() - {"port_notes", "found_seed", "detection"}
 # A reviewed diagnosis of one hit: its identity, and how its history and trace show the reverted
 # fix's mechanism rather than another defect that reports the same kind.
 DETECTION_FIELDS = {"seed": int, "trace_hash": str, "history_sha256": str, "mechanism": str}
-REGRESSION_FIELDS = {"kind": str, "test": str, "scenario": str, "mode": str,
+REGRESSION_FIELDS = {"kind": str, "test": str, "scenario": str, "suite": str, "mode": str,
+                     "probe": bool, "needs_server": bool,
                      "failure_contains": list, "timeout_s": int, "attempts": int, "evidence": dict}
 EVIDENCE_FIELDS = {"digest": str, "patched": dict, "clean": dict}
 RUN_FIELDS = {"run": str, "sha": str, "result": str, "output": str, "note": str}
@@ -101,6 +110,9 @@ class Bug:
     path: Path
     manifest: dict
     patch: str
+    # A test-only diff (`probe.patch`) that adds the regression to the scratch tree, for a fix
+    # whose only regression is an intermittent process scenario. Applied to both builds.
+    probe: str | None = None
     errors: list = field(default_factory=list)
 
     @property
@@ -182,11 +194,18 @@ def historical_path(repo, name, commit):
     return name
 
 
-def apply_check_head(repo, patch):
-    """`git apply --check` against HEAD's tree through a private index. Touches no worktree."""
+def apply_check_head(repo, patch, then=None):
+    """`git apply --check` against HEAD's tree through a private index. Touches no worktree.
+
+    With `then`, apply `patch` to that index first and check `then` on top of it."""
     with tempfile.TemporaryDirectory(prefix="sim-bugs-index-") as tmp:
         env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
         git(repo, "read-tree", "HEAD", env=env)
+        if then is not None:
+            result = git(repo, "apply", "--cached", "-", env=env, input=patch, check=False)
+            if result.returncode:
+                return False, (result.stderr or result.stdout).strip()
+            patch = then
         result = git(repo, "apply", "--check", "--cached", "-", env=env, input=patch, check=False)
     return result.returncode == 0, (result.stderr or result.stdout).strip()
 
@@ -227,6 +246,8 @@ def load_bugs(repo):
             with (path / "bug.toml").open("rb") as stream:
                 manifest = tomllib.load(stream)
             patch = (path / "revert.patch").read_text(encoding="utf-8")
+            probe_path = path / "probe.patch"
+            probe = probe_path.read_text(encoding="utf-8") if probe_path.is_file() else None
         except (OSError, ValueError) as error:
             errors.append(f"{name}: {error}")
             continue
@@ -235,7 +256,7 @@ def load_bugs(repo):
         if path.name in seen:
             errors.append(f"{name}: the id is used twice")
         seen.add(path.name)
-        bugs.append(Bug(path, manifest, patch))
+        bugs.append(Bug(path, manifest, patch, probe))
     if not bugs and not errors:
         errors.append(f"{BUGS_DIR}: no bug directories")
     return bugs, errors
@@ -308,6 +329,15 @@ def validate_manifest(bug, records, known_guarantees, require_evidence=True):
             problems.append("detection.mechanism must say how the history shows the reverted fix")
     problems.extend(validate_regression(bug, require_evidence))
     problems.extend(validate_patch_paths(bug.patch))
+    if bug.regression.get("probe", False) != (bug.probe is not None):
+        problems.append("probe.patch is required exactly when regression.probe is true")
+    if bug.probe is not None:
+        # A probe only adds tests and test hooks. It must not touch a line the revert changes.
+        changed = changed_lines(bug.probe)
+        if any(removed for removed, _ in changed.values()):
+            problems.append("probe.patch may only add lines")
+        if any(not name.startswith("server/") for name in patch_files(bug.probe)):
+            problems.append("probe.patch touches a file outside server/")
     return problems
 
 
@@ -323,12 +353,14 @@ def validate_regression(bug, require_evidence=True):
         problems.append("regression.test must be a full library test path")
     elif kind == "acceptance" and not SCENARIO.fullmatch(r.get("scenario", "")):
         problems.append("regression.scenario must be an acceptance scenario such as O15")
+    elif kind == "recovery-suite" and r.get("suite") not in RECOVERY_SUITES:
+        problems.append(f"regression.suite must be one of {', '.join(RECOVERY_SUITES)}")
     if r.get("mode", "on") not in ("on", "off"):
         problems.append("regression.mode must be on or off")
     if "failure_contains" in r and not strings(r["failure_contains"]):
         problems.append("regression.failure_contains must be an array of nonempty strings")
-    if kind == "acceptance" and not r.get("failure_contains"):
-        problems.append("an acceptance regression needs failure_contains for its specific failure")
+    if kind != "lib-test" and not r.get("failure_contains"):
+        problems.append("a process regression needs failure_contains for its specific failure")
     if not 1 <= r.get("attempts", 1) <= 10:
         problems.append("regression.attempts must be between 1 and 10")
     evidence = r.get("evidence")
@@ -378,6 +410,10 @@ def validate_git(bug, repo, require_evidence=True):
     ok, detail = apply_check_head(repo, bug.patch)
     if not ok:
         problems.append(f"revert.patch no longer applies to HEAD; refresh it: {detail}")
+    if bug.probe is not None:
+        ok, detail = apply_check_head(repo, bug.probe, bug.patch)
+        if not ok:
+            problems.append(f"probe.patch and revert.patch do not apply to HEAD together: {detail}")
     if m["port"] == "clean" and m["reverts"] not in missing:
         files = patch_files(bug.patch)
         old = [historical_path(repo, name, m["reverts"]) for name in files]
@@ -399,8 +435,11 @@ def validate_git(bug, repo, require_evidence=True):
                         f"used (digest {digest(bug.patch)}); verify it again and record the run")
     if bug.regression.get("kind") == "lib-test":
         name = bug.regression["test"].rsplit("::", 1)[-1]
-        found = git(repo, "grep", "-q", "-E", rf"fn {name}\b", "HEAD", "--", "server", check=False)
-        if found.returncode:
+        if bug.probe is not None:
+            if not re.search(rf"^\+.*fn {name}\b", bug.probe, re.MULTILINE):
+                problems.append(f"probe.patch does not add {name}")
+        elif git(repo, "grep", "-q", "-E", rf"fn {name}\b", "HEAD", "--", "server",
+                 check=False).returncode:
             problems.append(f"regression test {name} is not defined at HEAD")
     return problems
 
@@ -466,10 +505,13 @@ class Scratch:
         git(self.repo, "worktree", "remove", "--force", str(self.path), check=False)
         shutil.rmtree(self.path, ignore_errors=True)
 
-    def apply(self, bug):
+    def apply(self, bug, probe=False, revert=True):
         if self.path.resolve() == self.repo.resolve():
             raise Failure("refusing to apply patches in the shipped tree")
-        git(self.path, "apply", "-", input=bug.patch)
+        if probe and bug.probe is not None:
+            git(self.path, "apply", "-", input=bug.probe)
+        if revert:
+            git(self.path, "apply", "-", input=bug.patch)
 
     def reset(self):
         git(self.path, "checkout", "--quiet", "--", ".")
@@ -550,11 +592,20 @@ def classify_libtest(code, output, name):
 def run_regression(bug, tree, exe, server, env, log):
     r = bug.regression
     env = dict(env, NABEDRA_TEST_DIRECT_OLTP=r.get("mode", "on"))
+    if server:
+        env["NABEDRA_BIN"] = env["NABEDRA_OLTP_BINARY"] = server
+        env["NABEDRA_ACCEPTANCE_PYTHON"] = sys.executable
     timeout = r.get("timeout_s", 1200)
     if r["kind"] == "lib-test":
         code, output = run_logged([exe, "--exact", r["test"], "--include-ignored", "--test-threads", "1"],
                                   tree / "server", env, log, timeout)
         return classify_libtest(code, output, r["test"]), output
+    if r["kind"] == "recovery-suite":
+        code, output = run_logged([sys.executable, "server/tests/oltp_recovery_operations.py",
+                                   "--binary", server, "--test-executable", exe, "--suite", r["suite"]],
+                                  tree, env, log, timeout)
+        status = {None: "timeout", 0: "passed", 1: "failed"}.get(code, "not-run")
+        return status, output
     out_dir = Path(env["CARGO_TARGET_DIR"]) / "sim-bugs-acceptance" / bug.id
     shutil.rmtree(out_dir, ignore_errors=True)
     code, output = run_logged([sys.executable, "scripts/acceptance_oltp.py", "--test-binary", exe,
@@ -611,19 +662,23 @@ def cmd_verify(repo, bugs, args, out):
     log_path = Path(args.log or target / "sim-bugs-verify.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, CARGO_TARGET_DIR=str(target))
-    need_server = any(b.regression.get("kind") == "acceptance" for b in bugs)
+    def wants_server(bug):
+        return bug.regression.get("kind") != "lib-test" or bug.regression.get("needs_server", False)
+
+    need_server = any(wants_server(b) for b in bugs)
     verdicts = {}
     with log_path.open("a", encoding="utf-8") as log, Scratch(repo, args.keep) as scratch:
         tree = scratch.path
         sha = git(tree, "rev-parse", "HEAD").stdout.strip()
         print(f"sim-bugs verify on {sha}, log {log_path}", file=out, flush=True)
         replication = (tree / "server/oltp-replication/src/oltp_replication").is_dir()
-        packages = {
-            bug.id: "nabedra-oltp-replication"
-            if replication and bug.regression.get("test", "").startswith("oltp_replication::")
-            else None
-            for bug in bugs
-        }
+
+        def owner(bug):
+            test = bug.regression.get("test", "")
+            return next((package for prefix, package, crate in TEST_CRATES
+                         if test.startswith(prefix) and (tree / "server" / crate).is_dir()), None)
+
+        packages = {bug.id: owner(bug) for bug in bugs}
 
         def build(package):
             server_build = need_server and package is None
@@ -632,6 +687,9 @@ def cmd_verify(repo, bugs, args, out):
                 env["NABEDRA_OLTP_REPLICATION_TEST_EXE"] = fixture
             return build_lib_tests(args, tree, env, log, server_build, package)
 
+        # The unpatched side carries every selected probe, so one clean build serves all bugs.
+        for bug in bugs:
+            scratch.apply(bug, probe=True, revert=False)
         clean_builds = {package: build(package) for package in dict.fromkeys(packages.values())}
         clean = {}
         for bug in bugs:
@@ -640,8 +698,9 @@ def cmd_verify(repo, bugs, args, out):
             print(f"{bug.id}: without the patch {clean[bug.id]}", file=out, flush=True)
             print(f"{bug.id}: unpatched attempts {seen}", file=out, flush=True)
             print_regression_result(bug, output, out)
+        scratch.reset()
         for bug in bugs:
-            scratch.apply(bug)
+            scratch.apply(bug, probe=True)
             try:
                 p_exe, p_server = build(packages[bug.id])
                 patched, output, seen = regression_verdict(bug, tree, p_exe, p_server, env, log, patched=True)
