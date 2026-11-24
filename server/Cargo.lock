@@ -1904,6 +1904,7 @@ dependencies = [
  "mime",
  "nabedra-check",
  "nabedra-kv",
+ "nabedra-oltp-storage",
  "nabedra-oltp-types",
  "nabedra-protocol",
  "nabedra-resources",
@@ -1924,6 +1925,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tower",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1972,12 +1974,14 @@ name = "nabedra-oltp-storage"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures-util",
  "libc",
  "nabedra-kv",
  "nabedra-oltp-types",
  "nabedra-protocol",
  "nabedra-resources",
  "nabedra-rt",
+ "nabedra-sim",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -2041,6 +2045,23 @@ dependencies = [
  "nabedra-check",
  "nabedra-rt",
  "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "nabedra-sim-oltp"
+version = "0.1.0"
+dependencies = [
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "nabedra-oltp-types",
+ "nabedra-protocol",
+ "nabedra-resources",
+ "nabedra-rt",
+ "nabedra-sim",
+ "nabedra-transport",
  "tokio",
  "uuid",
 ]

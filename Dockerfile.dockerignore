@@ -19,6 +19,8 @@
 !server/transport/src/
 !server/transport/src/**
 !server/oltp-storage/Cargo.toml
+!server/oltp-storage/src/
+!server/oltp-storage/src/**
 !server/oltp-replication/Cargo.toml
 !server/sim/Cargo.toml
 !server/src/

@@ -21,7 +21,7 @@ One serial `table.update` on three workers, from [the latency evidence](../docs/
 | --- | --- | --- |
 | New TCP and mTLS handshake per RPC, Raft appends and heartbeats included | [`multiplex/transport.rs`](../server/src/oltp_replication/multiplex/transport.rs) | One persistent multiplexed session per peer pair |
 | About 42 RPCs and 15 Raft writes across Control, Status, Timestamp, Catalog and Data | [`worker_runtime.rs`](../server/src/oltp_runtime/worker_runtime.rs), [`transaction.rs`](../server/src/oltp_runtime/transaction.rs) | 1 Data entry, 0 or 1 coalesced Timestamp RPC |
-| One entry per append, about 3 fsyncs per entry per replica | [`hosted.rs`](../server/src/oltp_replication/hosted.rs), [`pool.rs`](../server/src/oltp/pool.rs) | Batched appends, one group-committed fsync per replica |
+| One entry per append, about 3 fsyncs per entry per replica | [`hosted.rs`](../server/src/oltp_replication/hosted.rs), [`pool.rs`](../server/oltp-storage/src/oltp/pool.rs) | Batched appends, one group-committed fsync per replica |
 | Four queue copy phases to every ready worker | `oltp_runtime/replica` | None |
 | Gateway polls for completion, sleeping 50 to 500 ms | [`remote_api.rs`](../server/src/oltp_runtime/remote_api.rs) | Reply on the request stream |
 | 88 MiB charged per request before the body is read | [`http.rs`](../server/src/oltp_runtime/http.rs) | Charge the actual body size |
@@ -92,7 +92,7 @@ In [`hosted.rs`](../server/src/oltp_replication/hosted.rs) replace `single_entry
 | --- | --- | --- |
 | Log append in [`typed_log.rs`](../server/src/oltp_replication/typed_log.rs) | One synced `WriteBatch` per entry | One synced `WriteBatch` per append batch. The pool's nabedra-kv journal group-commits concurrent syncs from other groups on the same pool. |
 | `save_committed` | Synced | Unsynced. OpenRaft treats it as a recovery hint. |
-| Apply in [`pool.rs`](../server/src/oltp/pool.rs) `mutate` | One synced batch per entry | One unsynced batch for all entries in the apply call, with position, reply and membership inside it. |
+| Apply in [`pool.rs`](../server/oltp-storage/src/oltp/pool.rs) `mutate` | One synced batch per entry | One unsynced batch for all entries in the apply call, with position, reply and membership inside it. |
 
 An unsynced apply is safe because the log and the state share one nabedra-kv journal. A crash loses only a suffix of the journal, and the surviving log replays what the lost applies covered. Purge the log and build snapshots only up to an applied index that a later synced write has made durable. Journal recovery follows `plans/native-storage-engine.md` section 3 (exact-prefix truncation of a torn tail, never past a record a later sync proved durable). Rerun O06, O11, O29 and the Raft-append cancellation regression on this change alone before building on it.
 
@@ -112,7 +112,7 @@ Fill an entry from one Catalog read and one Control placement read on a miss. Re
 
 ## 4. One-entry commit
 
-Add `server/src/oltp/mvcc/store/direct.rs` and one `ParticipantCommand::Direct(DirectCommit)` variant in [`store.rs`](../server/src/oltp/mvcc/store.rs).
+Add `server/src/oltp/mvcc/store/direct.rs` and one `ParticipantCommand::Direct(DirectCommit)` variant in [`store.rs`](../server/oltp-storage/src/oltp/mvcc/store.rs).
 
 ```rust
 pub(crate) struct DirectCommit {
@@ -167,7 +167,7 @@ struct RangeClock { max_read_ts: ReadTs, pending: BTreeMap<CommitTs, PendingKeys
 ```
 
 1. A direct commit takes its timestamp after latching its keys. If `commit_ts <= max_read_ts`, it fetches a new one. It registers in `pending` before proposing and leaves on apply or rejection.
-2. Every snapshot read at `s` on the leader, direct or queued, raises `max_read_ts` to `s` and waits until no `pending` entry is at or below `s`. Add this to `read_at`, `read_page` and the scan path in [`store/handle.rs`](../server/src/oltp/mvcc/store/handle.rs).
+2. Every snapshot read at `s` on the leader, direct or queued, raises `max_read_ts` to `s` and waits until no `pending` entry is at or below `s`. Add this to `read_at`, `read_page` and the scan path in [`store/handle.rs`](../server/oltp-storage/src/oltp/mvcc/store/handle.rs).
 3. A new leader serves nothing until its first entry of the new term applies. That empties `pending`.
 
 Rule 1 keeps a commit from landing below a snapshot that already read the range. Rule 2 keeps a reader from missing a commit still in flight (O07, O09). Queued prepares already conflict when a newer committed version exists, so they see direct commits as ordinary committed versions.
@@ -186,7 +186,7 @@ Mutation steps on the leader:
 1. Charge the body bytes and one in-flight slot against the worker's existing budgets. When full, return `429 overloaded` with `not_applied`.
 2. Check leadership and both epochs. Latch the keys in sorted order in a striped `KeyLatches` table, bounded by the deadline.
 3. Look up the dedup record. Read each row head and newest version from local applied state.
-4. Validate the row against the cached table descriptor. Compute the new row, the index changes and the exact result, reusing the planner's row and index functions from [`planner.rs`](../server/src/oltp/mvcc/planner.rs).
+4. Validate the row against the cached table descriptor. Compute the new row, the index changes and the exact result, reusing the planner's row and index functions from [`planner.rs`](../server/oltp-storage/src/oltp/mvcc/planner.rs).
 5. Allocate `commit_ts`, register in `pending`, propose `DirectCommit` and await apply.
 6. On `Rejected(Conflict)` from a leadership race, go back to step 3 while the deadline allows. Release the latches and reply.
 

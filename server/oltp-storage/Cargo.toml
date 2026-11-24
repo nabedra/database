@@ -8,14 +8,12 @@ repository = "https://github.com/zPy52/nabedra-database"
 publish = ["crates-io"]
 description = "Nabedra OLTP storage"
 
-[package.metadata.nabedra]
-extraction-pending = true
-
 [features]
-sim = ["nabedra-rt/sim"]
-test-hooks = []
+sim = ["nabedra-rt/sim", "nabedra-kv/sim", "dep:nabedra-sim"]
+test-hooks = ["nabedra-resources/test-defaults", "nabedra-resources/test-hooks"]
 
 [dependencies]
+nabedra-sim = { path = "../sim", version = "0.1.0", optional = true }
 nabedra-rt = { path = "../rt", version = "0.1.0" }
 nabedra-protocol = { path = "../protocol", version = "0.1.0" }
 nabedra-resources = { path = "../resources", version = "0.1.0" }
@@ -28,4 +26,10 @@ tracing = "=0.1.44"
 uuid = { version = "=1.29.2", features = ["serde", "v4"] }
 nabedra-kv = { path = "../kv", version = "0.1.0" }
 bytes = "=1.12.1"
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 libc = "=0.2.191"
+
+[dev-dependencies]
+futures-util = { version = "=0.3.34", default-features = false, features = ["async-await"] }
+nabedra-resources = { path = "../resources", version = "0.1.0", features = ["test-defaults", "test-hooks"] }
+tokio = { version = "=1.54.1", features = ["test-util"] }

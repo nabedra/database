@@ -5,18 +5,20 @@ guarantees = ["OLTP-G09", "SCHED-G01"]
 scenarios = ["C04", "C06", "F01", "F02", "F03"]
 tiers = ["T1"]
 # Fault model: native worker-local slots, job settlement and replay on a mounted pool.
-command = ["bash", "-ec", '''
+command = ["bash", "-eo", "pipefail", "-c", '''
 export CARGO_TARGET_DIR="$PWD/$CARGO_TARGET_DIR"
 echo "fault model: oltp,sim build without default features, seeds 41 to 45"
-cargo test --locked -j 2 -p nabedra-database --no-default-features --features oltp,sim --lib oltp::pool::resources::sim_tests -- --show-output --test-threads=1
-python3 ../scripts/testing/repeat_gate.py --features oltp,sim <<'JSON'
-[
-  {"id": "c04_c06_f01_f02_native_slots_refill_and_isolate_failures", "file": "server/src/oltp/pool/resources/sim_tests.rs", "lang": "rust"},
-  {"id": "f03_native_drain_keeps_cancelled_work_until_settlement", "file": "server/src/oltp/pool/resources/sim_tests.rs", "lang": "rust"},
-  {"id": "f03_native_crash_drops_queued_work_and_releases_accounting", "file": "server/src/oltp/pool/resources/sim_tests.rs", "lang": "rust"},
-  {"id": "f02_f03_native_crash_contains_panics_in_queued_job_cleanup", "file": "server/src/oltp/pool/resources/sim_tests.rs", "lang": "rust"}
-]
-JSON
+cargo test --locked -j 2 -p nabedra-oltp-storage --features sim --lib oltp::pool::resources::sim_tests -- --show-output --test-threads=1
+for attempt in $(seq 50); do
+    cargo test --locked -j 2 -p nabedra-oltp-storage --features sim --lib oltp::pool::resources::sim_tests::c04_c06_f01_f02_native_slots_refill_and_isolate_failures -- --exact --test-threads=1 |
+        grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;"
+    cargo test --locked -j 2 -p nabedra-oltp-storage --features sim --lib oltp::pool::resources::sim_tests::f03_native_drain_keeps_cancelled_work_until_settlement -- --exact --test-threads=1 |
+        grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;"
+    cargo test --locked -j 2 -p nabedra-oltp-storage --features sim --lib oltp::pool::resources::sim_tests::f03_native_crash_drops_queued_work_and_releases_accounting -- --exact --test-threads=1 |
+        grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;"
+    cargo test --locked -j 2 -p nabedra-oltp-storage --features sim --lib oltp::pool::resources::sim_tests::f02_f03_native_crash_contains_panics_in_queued_job_cleanup -- --exact --test-threads=1 |
+        grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;"
+done
 ''']
 cwd = "server"
 timeout_s = 3600
