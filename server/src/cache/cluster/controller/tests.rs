@@ -1022,6 +1022,46 @@ fn k03_staged_completion_requires_a_report_from_this_transfer() {
     }
 }
 
+/// Known to fail. A heartbeat carries no order, so a late older one replaces
+/// the source's newer report, and a copy far beyond the lag bound completes.
+#[test]
+#[ignore = "open bug 2026-11-24-cache-older-source-heartbeat"]
+fn k03_older_source_heartbeat_does_not_complete_a_lagging_copy() {
+    let (mut state, source, target, _, copy) = staging_fixture();
+    let staged = state.topology.slots[0];
+    let mut observations = Observations::default();
+    let source_at = |sequence| Progress {
+        sequence,
+        serving_primary: true,
+        ..copy
+    };
+    report(
+        &mut observations,
+        &state,
+        source,
+        1_500,
+        Some(source_at(1_000)),
+    );
+    report(&mut observations, &state, target, 1_500, Some(copy));
+    let changes = observations.plan(&state, bounds(1_500));
+    state.reconcile(1_500, changes);
+    assert_eq!(state.topology.slots[0], staged, "lag 900");
+
+    report(
+        &mut observations,
+        &state,
+        source,
+        1_501,
+        Some(source_at(copy.sequence)),
+    );
+    let changes = observations.plan(&state, bounds(1_501));
+    state.reconcile(1_501, changes);
+    assert_eq!(
+        state.topology.slots[0], staged,
+        "lag 900 hidden by an older source heartbeat"
+    );
+}
+
 /// The existing controller fixture and placement decisions, without the Raft transport.
 #[cfg(feature = "sim")]
 pub(in crate::cache::cluster) struct LeaseControllerFixture {
