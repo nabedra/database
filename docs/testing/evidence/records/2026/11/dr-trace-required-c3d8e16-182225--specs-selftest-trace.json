@@ -1,0 +1,178 @@
+{
+  "artifacts": [
+    {
+      "name": "dr-trace-required-c3d8e16-182225--specs-selftest-trace.log",
+      "sha256": "8e270a0c606799d9e31e86d0ac9ba1b5747c604e1dfb49fb6a5261595ed1ed7d"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "9054867d53d1e24b65ea340ce78db5580c23134680436c3991b1fd804a5307fa"
+    },
+    {
+      "name": "tla/control.log",
+      "sha256": "f0f46353ba190d44c0b82331a183d4d9cf52889a9257084c2c8da68879e2a52e"
+    },
+    {
+      "name": "tla/control.ndjson",
+      "sha256": "c81d7d1a8d95287f2f704500de6cf86840b9fcbd33ce7da1d391588f3a215221"
+    },
+    {
+      "name": "tla/mutant-changed_var_missing.log",
+      "sha256": "8f5f5688301fae5c204b6f81d05f05919edc8f9a207d4335c8a27a365f16ca09"
+    },
+    {
+      "name": "tla/mutant-choice.log",
+      "sha256": "1e56c419bbef326817323e2722997994095fe447b1e97eba3fe437edf13f9060"
+    },
+    {
+      "name": "tla/mutant-optional_set_missing.log",
+      "sha256": "ca97a6dbfff59f0cd37e77ce78ed510e9552558c717ba6344d3cf33c636d8cfe"
+    },
+    {
+      "name": "tla/mutant-optional_set_wrong.log",
+      "sha256": "e988e4eb5666d2a9bd3eea1dd52896c6c7f7840def3a9e1067d40de6a7c240fc"
+    },
+    {
+      "name": "tla/mutant-optional_var_missing.log",
+      "sha256": "961867415c1aaa17bf021d8643ee2ccb9920b1c9dbc0f7a0ca06a0a28612a00c"
+    },
+    {
+      "name": "tla/mutant-optional_var_wrong.log",
+      "sha256": "d342abae8c2672605d265cd03c3fe06b79b6a5bab3615511c9c33072ccab5d1a"
+    },
+    {
+      "name": "tla/mutant-reads_seed.log",
+      "sha256": "948149dee87b725a25c483476b708af58a9f450ed49b8a620c3cea7e1a1569a0"
+    },
+    {
+      "name": "tla/mutant-reads_t.log",
+      "sha256": "85293c30b82ef463f1537b73a362fee0e58e5a9c01a9d6b8470ad21a2af1dc81"
+    },
+    {
+      "name": "tla/mutant-silent_step.log",
+      "sha256": "110cafd134ee08ad84b49a93c2c00802987ac0afe86fda64358f6ec93b25eda5"
+    },
+    {
+      "name": "tla/mutant-silent_step_unchecked.log",
+      "sha256": "677b691a15c05c673d5bd5d28605e6bf2a7d6abdf92ff1c7747e51b2fbe50c27"
+    },
+    {
+      "name": "tla/mutant-skip_line.log",
+      "sha256": "5d85feda8310d4500102c37fc97ef2f15b656ae02db0ff31a00bf43ea2b12ebf"
+    },
+    {
+      "name": "tla/mutant-skip_line_unassigned.log",
+      "sha256": "603348fa2a7c5d0622228f61c1abafd8f9c858d432705c9fbb671fcb08089278"
+    },
+    {
+      "name": "tla/mutant-skip_line_unchecked.log",
+      "sha256": "dfaacc597f37014911b8b638f7c2968a8d5bada8453dcea3ae950f0ab863aa12"
+    },
+    {
+      "name": "tla/mutant-trailing_condition.log",
+      "sha256": "cda7a2df20209d76bf0775a4343a7079fbaa851a3540078c1dc919c5f6879acf"
+    },
+    {
+      "name": "tla/mutant-wide_msg_field.log",
+      "sha256": "a27c4f42c82666d17d9d7364b1ac603aaaa95d05368b3174ecba419b2a874ada"
+    },
+    {
+      "name": "tla/mutant-wide_msg_order.log",
+      "sha256": "de5027f8e91d33c9b266b2ea4613c3073e832503a23ba0720964e248db6c4947"
+    },
+    {
+      "name": "tla/mutant-wide_msg_record.log",
+      "sha256": "45f7b41f76c7325c7f52b4892b3e8a2207e88d8f6e0b3b65f39ddb68d9a177b1"
+    },
+    {
+      "name": "tla/trace-000.log",
+      "sha256": "58f813238694428d670247dd96d6d8ce157b29dfc3572ba42463f72c9bc40ec6"
+    },
+    {
+      "name": "tla/trace-001.log",
+      "sha256": "e29684d955257fc77d9591705543fa9ddde7801f10f46ea68a9a4d12c4960826"
+    },
+    {
+      "name": "tla/trace-002.log",
+      "sha256": "9785081f0b988015e8f3df40b0c6a4d83e9f08cc69675178e849a03ec07cfb88"
+    },
+    {
+      "name": "tla/trace-003.log",
+      "sha256": "6627d211901495c2a3e0fbd94e2516d5f364d8bd3814dfba1cb16563fa0f7714"
+    },
+    {
+      "name": "tla/trace-004.log",
+      "sha256": "6666567af38f2a0d6fd22100a79ee850583650c95ff94482ab5cf860d80a5233"
+    },
+    {
+      "name": "tla/trace-005.log",
+      "sha256": "cd1fc666e45585aa5fdd3c8fc0c101c0fb85b349997da6eef441a3ba164d703c"
+    },
+    {
+      "name": "tla/trace-006.log",
+      "sha256": "f5e12704fe836c710de7a6cd9fd9bc40687f30036f0257c388f41ccd1a062cbc"
+    },
+    {
+      "name": "tla/trace-007.log",
+      "sha256": "27fe9863749c5d3a27b31174297a357f2cc711cf4f36d3e33b7eabdad7293e41"
+    },
+    {
+      "name": "tla/trace-008.log",
+      "sha256": "4e7eadcceaee42140fce1a58f627791d4cb23068a300f3818836b458e6cd7f1a"
+    },
+    {
+      "name": "tla/trace-009.log",
+      "sha256": "7cb392a5c099f470597b7226c482e70444f6e594d17bd6a4a81e7e62b0fb7666"
+    },
+    {
+      "name": "tla/trace-010.log",
+      "sha256": "fa5ec6467dfd36c1983afff11a460100fe1bb1f81d6360ebf404e708f9069a8c"
+    }
+  ],
+  "assertions": {
+    "executed": 28,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "specs-selftest-trace",
+  "duration_s": 31.484,
+  "guarantees": [],
+  "kind": "T",
+  "mode": {
+    "tla": "trace"
+  },
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T17:53:49.187557+00:00",
+    "request_id": "dr-trace-required-c3d8e16-182225",
+    "runner": "GitHub Actions 1000012511",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45448214425"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "c3d8e16fef3644125a0d603e1560b08c46328d11",
+  "sim_core_hours": null,
+  "tla": {
+    "budget_s": 900,
+    "mode": "trace",
+    "spec": "specs/selftest/TwoPhase",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "traces": {
+      "accepted": 3,
+      "checked": 11,
+      "expected_rejections": 8,
+      "failing": [],
+      "rejected": 8
+    }
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}

@@ -7,8 +7,25 @@
       "K03 simulated controller disk loss is `not-run` pending modelled Raft storage."
     ]
   },
-  "head": "297e7e91af810d85cf324607c77cd4edf061afb6",
-  "ignored_records": [],
+  "head": "152cdaf59ee341fbc706925d75d8855d1a16f849",
+  "ignored_records": [
+    {
+      "path": "dr-trace-required-c3d8e16-182225--specs-selftest-trace.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "dr-trace-required-c3d8e16-182225--specs-selftest.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "dr-trace-required-c3d8e16-182225--testing-matrix.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    },
+    {
+      "path": "dr-trace-required-c3d8e16-182225--testing-tools.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -4002,5 +4019,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
