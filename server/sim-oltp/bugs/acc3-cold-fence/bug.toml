@@ -41,15 +41,6 @@ failure_contains = ["registered startup ValidationError: worker does not host ta
 # The old runs are not recorded as [regression.evidence]: their digest was for the old path, and
 # the re-verification that would justify a new one did not fail. `check` accepts a clean port
 # without evidence. By lead decision 8 a simulator hit on this patch does not count until a test
-# fails because of it, and sim_bugs.py run refuses to count one: there is no evidence, and the
-# review below does not call the patch sensitive.
+# fails because of it, and sim_bugs.py run refuses to count one: there is no evidence, and no
+# [review] calls the patch sensitive (LAND-113 wrote "not shown to be sensitive" and did not run it).
 attempts = 10
-
-# Transcribed from that review, which read the patch and did not run the test. The assertion type is P10-BUGS-2's reading
-# of O15, whose failure is a startup that does not finish.
-[review]
-verdict = "not-sensitive"
-assertion = "timeout"
-reviewer = "Claude Opus 5.5 (LAND-113, independent review of PR #113, wrote none of it)"
-source = "https://github.com/zPy52/nabedra-database/pull/113, review of heads 67ea0db3 and 90b869b3"
-notes = "Not shown to be sensitive: no test has failed because of the patch since the crate split. The review did not run it."
