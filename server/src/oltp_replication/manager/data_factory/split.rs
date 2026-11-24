@@ -324,7 +324,7 @@ impl SplitClient {
         let size = json_decode_budget(raw.as_slice())?;
         let reply = reply.reserve_reply_decode(self.shared(), size).await?;
         let decoded = serde_json::from_slice(raw.as_slice()).map_err(|_| invalid())?;
-        Ok((decoded, reply.scratch.clone()))
+        Ok((decoded, reply.scratch_lease()))
     }
     async fn typed<T: DeserializeOwned>(
         &self,

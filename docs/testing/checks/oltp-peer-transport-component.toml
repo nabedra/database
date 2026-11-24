@@ -4,7 +4,7 @@ kinds = ["U"]
 guarantees = []
 scenarios = ["D10", "O05", "C07"]
 tiers = ["T1"]
-command = ["cargo", "test", "--locked", "-j", "2", "--no-default-features", "--features", "oltp", "--lib", "oltp_replication::multiplex::transport::", "--", "--test-threads=1"]
+command = ["cargo", "test", "--locked", "-j", "2", "-p", "nabedra-transport", "--lib", "transport::", "--", "--test-threads=1"]
 cwd = "server"
 timeout_s = 1800
 needs = []

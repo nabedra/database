@@ -1,16 +1,18 @@
 //! Transport authentication uses locally installed Control enrollment. Refresh
 //! happens outside Raft handlers, so authenticating Control cannot recursively
 //! require a Control quorum call through the same saturated listener.
-use super::*;
 use crate::oltp::{
     mvcc::json_decode_budget,
-    pool::{ExecutionClass, WorkerSharedResources},
+    pool::{ExecutionClass, ScratchLease, WorkerSharedResources},
 };
 use crate::oltp_replication::{
     authority::control::{ApiEnrollment, ControlClient, InventoryPage, ReplacementRecord},
-    types::{Digest, GroupKind, WorkerEnrollment},
+    types::{Digest, GroupIdentity, GroupKind, Text, WorkerEnrollment, WorkerIdentity},
 };
+use crate::protocol::{ErrorCode, Outcome, ProtocolError};
+use nabedra_transport::{EndpointFuture, PeerDirectory, Purpose, ReceivedReply, TransportTrust};
 use serde::de::DeserializeOwned;
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -19,6 +21,10 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use uuid::Uuid;
+
+// Keep the existing RPC trace filter and test subscribers working after the move.
+const TRACE_TARGET: &str = "nabedra_database_server::oltp_replication::multiplex::directory";
 
 /// REP6: a Data-only worker refreshes its revocation view this often.
 pub(crate) const REVOCATION_REFRESH: Duration = Duration::from_secs(1);
@@ -52,7 +58,7 @@ struct RemoteRevocations {
 
 enum Role {
     Worker,
-    Api(super::super::types::Text<128>),
+    Api(Text<128>),
     BootstrapControl(GroupIdentity),
     PreparedControl,
 }
@@ -211,7 +217,7 @@ impl AppliedPeerDirectory {
     }
 
     fn refreshed(&self, result: Result<usize, ProtocolError>) {
-        use crate::oltp_runtime::stage_timing::perf_stage;
+        use nabedra_resources::perf_stage;
         let Some(remote) = self.remote.get() else {
             return;
         };
@@ -220,14 +226,14 @@ impl AppliedPeerDirectory {
                 perf_stage!("peer.revocations.refresh").record(Duration::ZERO);
                 self.mark_refreshed(nabedra_rt::time::now_std());
                 if learned > 0 {
-                    tracing::info!(learned, "Data-only revocation view learned revocations");
+                    tracing::info!(target: TRACE_TARGET, learned, "Data-only revocation view learned revocations");
                 }
             }
             Err(error) => {
                 perf_stage!("peer.revocations.refresh_failed").record(Duration::ZERO);
                 let age = self.revocation_view_age().unwrap_or_default();
                 if age > REVOCATION_STALE_AFTER && !remote.stale.swap(true, Ordering::AcqRel) {
-                    tracing::warn!(code=?error.code, age_ms=age.as_millis() as u64,
+                    tracing::warn!(target: TRACE_TARGET, code=?error.code, age_ms=age.as_millis() as u64,
                         "Data-only revocation view is stale: no Control majority refresh; \
                          enforcing the revocations already learned");
                 }
@@ -242,7 +248,7 @@ impl AppliedPeerDirectory {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
             if remote.stale.swap(false, Ordering::AcqRel) {
-                tracing::info!("Data-only revocation view refreshed from a Control majority again");
+                tracing::info!(target: TRACE_TARGET, "Data-only revocation view refreshed from a Control majority again");
             }
         }
     }
@@ -665,7 +671,7 @@ impl AppliedPeerDirectory {
                         changed=stop.changed()=>{if changed.is_err()||*stop.borrow(){return}continue},
                         result=self.refresh(&control)=>result,
                     };
-                    if let Err(error)=result{tracing::warn!(code=?error.code,outcome=?error.outcome,"Control enrollment refresh incomplete; prior verified peers retained");}
+                    if let Err(error)=result{tracing::warn!(target: TRACE_TARGET, code=?error.code,outcome=?error.outcome,"Control enrollment refresh incomplete; prior verified peers retained");}
                 }
             }
         }
@@ -686,7 +692,7 @@ impl AppliedPeerDirectory {
             .execute(ExecutionClass::Control, 0, 0, move || {
                 let raw = reply.sections[0].as_ref().ok_or_else(invalid)?;
                 let page = serde_json::from_slice(raw.as_slice()).map_err(|_| invalid())?;
-                Ok((page, reply.scratch.clone()))
+                Ok((page, reply.scratch_lease()))
             })
             .await
     }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::oltp_replication::{
-    authority::control::ReplacementRecord, multiplex::AppliedPeerDirectory,
+    authority::control::ReplacementRecord, peer_directory::AppliedPeerDirectory,
 };
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{Mutex, mpsc};

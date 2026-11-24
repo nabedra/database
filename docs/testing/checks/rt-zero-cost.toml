@@ -4,17 +4,14 @@ kinds = ["P"]
 guarantees = ["OLTP-G13"]
 scenarios = ["O09"]
 tiers = ["T1"]
-# The base is the merge base with main, so a task branch is measured against the main it
-# branched from. On main itself (merge base = HEAD) it is HEAD's first parent: the last
-# merge. Phase 7 as a whole was measured once against e3d51a6, the testing-plan baseline
-# (P7-BANS report). The checks job fetches full history, so origin/main is present.
+# Pair phase 8 extractions with the pre-split baseline used for build times.
+# The checks job fetches full history so this revision is available.
 command = ["bash", "-ec", '''
 if [[ ${GITHUB_ACTIONS:-} == true ]] && ! command -v valgrind >/dev/null; then
     sudo -n apt-get update -qq
     sudo -n apt-get install -y --no-install-recommends valgrind
 fi
-base=$(git merge-base origin/main HEAD)
-if [[ $base == "$(git rev-parse HEAD)" ]]; then base=$(git rev-parse HEAD^1); fi
+base=53a5716f844aa9690739daed32fd335c68bc0f8a
 echo "rt-zero-cost base: $base"
 exec python3 scripts/testing/insn_count.py --base "$base" --head HEAD --skip-missing-valgrind
 ''']

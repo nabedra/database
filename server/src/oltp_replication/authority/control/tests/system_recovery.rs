@@ -10,7 +10,8 @@ use crate::{
             RestartMountKey, SystemRecoveryCommand,
             machine::system_recovery::{ACTIVE, DEFERRED_DATA, abandoned, by_worker, revoked_id},
         },
-        multiplex::{AppliedPeerDirectory, PeerDirectory},
+        multiplex::PeerDirectory,
+        peer_directory::AppliedPeerDirectory,
     },
     protocol::ProtocolError,
 };

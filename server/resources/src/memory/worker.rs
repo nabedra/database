@@ -22,6 +22,14 @@ const POOL_OVERHEAD_BYTES: u64 = 64 << 20;
 pub const GROUP_HANDLE_BYTES: usize = 64 << 10;
 pub const GROUP_ENDPOINT_BYTES: usize = 64 << 10;
 
+/// The worker that owns the physical accounting used by this transport.
+/// The owner retains native resources until the last transport handle is dropped.
+pub trait ResourceOwner: Send + Sync + 'static {
+    fn worker_memory(&self) -> &Arc<WorkerMemory>;
+
+    fn bind_worker(self: &Arc<Self>, worker_id: uuid::Uuid) -> Result<(), ProtocolError>;
+}
+
 /// Memory and capacity accounting that reservations share with the full worker.
 pub struct WorkerMemory {
     config: SharedResourceConfig,

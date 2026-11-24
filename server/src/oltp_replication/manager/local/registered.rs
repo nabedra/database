@@ -192,8 +192,8 @@ pub(crate) struct RegisteredWorker {
     pub restart_mount: Option<restart::RestartMount>,
     pub operator: LocalOperatorPermit,
     pub transport: Arc<WorkerTransport>,
-    pub listener: Option<TcpListener>,
-    pub directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+    pub listener: Option<Listener>,
+    pub directory: Arc<crate::oltp_replication::peer_directory::AppliedPeerDirectory>,
 }
 /// The system groups are hosted on each configured voter, but are initialized
 /// by one deterministic bootstrap voter. Starting them grants neither queue
@@ -546,7 +546,7 @@ impl RegisteredWorker {
             shared.clone(),
             ownership.clone(),
         )?;
-        let listener = TcpListener::bind(config.bind).await.map_err(storage)?;
+        let listener = backend::current().bind(config.bind).await.map_err(storage)?;
         if listener.local_addr().map_err(storage)?.port() != config.bind.port()
             || config.bind.port() == 0
         {
@@ -560,7 +560,7 @@ impl RegisteredWorker {
         if let Some(record) = &replacement {
             bootstrap_peers.retain(|peer| peer.worker_id != record.intent.previous.worker_id);
         }
-        let directory = crate::oltp_replication::multiplex::AppliedPeerDirectory::from_bootstrap(
+        let directory = crate::oltp_replication::peer_directory::AppliedPeerDirectory::from_bootstrap(
             control_identity.clone(),
             bootstrap_peers,
             shared.clone(),
