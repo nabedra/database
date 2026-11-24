@@ -495,17 +495,6 @@ impl QueueCoordinator {
         {
             super::recovery_tests::observe_o21_stale_proposal(&body);
         }
-        // The captured snapshot names Control's published view. Wait for the
-        // local queue to install it before any copy phase can start.
-        wait_for_local_ready_view(&self.replica, current)
-            .await
-            .map_err(|error| {
-                // submit_original still proves absence under its UUID gate
-                // and seals the rejection in Status before exposing this.
-                let mut error = error.protocol();
-                error.outcome = Outcome::NotApplied;
-                error
-            })?;
         if self.current().await? != current {
             return Err(QueueError::Stale.protocol());
         }
