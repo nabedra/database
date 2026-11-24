@@ -11,7 +11,9 @@ replace specs/tools/tlc with a fake wrapper that prints a fixture per cfg, so th
 import io
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -128,6 +130,12 @@ class ParseOutputTests(unittest.TestCase):
         self.assertNotIn("RMPrepare", res.coverage)
         self.assertEqual(len(res.coverage_unparsed), 1)
 
+    def test_a_later_coverage_report_replaces_an_unreadable_one(self):
+        report = re.search(r"@!@!@STARTMSG 2201:0 @!@!@.*?ENDMSG 2202 @!@!@\n", fixture("pass"), re.S).group(0)
+        text = fixture("pass").replace(report, report.replace("<RMPrepare line", "<RMPrepare(r) line", 1) + report)
+        self.assertEqual(tc.parse_tlc_output(text, 0).coverage_unparsed, [])
+        self.assertEqual(tc.parse_tlc_output(text, 0).coverage["RMPrepare"], (21, 1269))
+
     def test_tlc_bug_message_is_an_error(self):
         text = fixture("pass").replace("@!@!@STARTMSG 2193:0 @!@!@",
                                        "@!@!@STARTMSG 1000:2 @!@!@\nTLC Bug: something broke\n"
@@ -209,15 +217,47 @@ FAKE_WRAPPER = textwrap.dedent('''\
 ''')
 
 
+def edit(path: Path, *pairs: tuple[str, str]) -> None:
+    text = path.read_text()
+    for old, new in pairs:
+        if old not in text:
+            raise AssertionError(f"{path.name} does not contain {old!r}")
+        text = text.replace(old, new)
+    path.write_text(text)
+
+
+def add_to_cfg(*lines: str, cfg: str = "TwoPhase.cfg"):
+    """A prep step that adds lines to a cfg."""
+    return lambda spec: edit(spec / cfg, ("CHECK_DEADLOCK TRUE", "\n".join(lines) + "\nCHECK_DEADLOCK TRUE"))
+
+
+def add_to_model(*lines: str, extends: str = ""):
+    """A prep step that adds definitions, and modules to EXTENDS, to MCTwoPhase.tla."""
+    return lambda spec: edit(spec / "MCTwoPhase.tla", ("MCRMLarge ==", "\n".join(lines) + "\nMCRMLarge =="),
+                             ("EXTENDS TwoPhase", "EXTENDS TwoPhase" + extends))
+
+
+NO_LIVENESS = (("PROPERTIES Termination\n", ""),)
+# FAKE_TLC_EDIT: the fixtures come from runs with a liveness property. This drops TLC's message about it.
+SAFETY_LOG = ["MSG 2192", "MSG 2190"]
+
+
+def safety_only(spec: Path) -> None:
+    for cfg in ("TwoPhase.cfg", "TwoPhase.large.cfg"):
+        edit(spec / cfg, *NO_LIVENESS)
+
+
 class FakeTlc:
     """A temporary spec folder (a copy of the self-test's cfgs) and a fake wrapper."""
+
+    process = False
 
     def __init__(self, mapping: dict, drop_mutants: tuple = (), **env: str):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.spec = root / "spec"
         (self.spec / "mutants").mkdir(parents=True)
-        for name in ("TwoPhase.cfg", "TwoPhase.large.cfg", "MCTwoPhase.tla"):
+        for name in ("TwoPhase.cfg", "TwoPhase.large.cfg", "TwoPhase.tla", "MCTwoPhase.tla"):
             shutil.copy(SELFTEST / name, self.spec / name)
         for m in (SELFTEST / "mutants").glob("*.cfg"):
             if m.stem not in drop_mutants:
@@ -231,9 +271,20 @@ class FakeTlc:
 
     def run(self, *extra: str, budget: str = "60") -> tuple[int, dict, str]:
         out = io.StringIO()
-        with patch.dict(os.environ, self.env), redirect_stdout(out):
+        # The fake wrapper is a process only where a test times or kills it. Otherwise it runs in this process.
+        run_tlc = tc.run_tlc if "FAKE_TLC_SLEEP" in self.env or self.process else self.run_tlc
+        with patch.dict(os.environ, self.env), redirect_stdout(out), patch.object(tc, "run_tlc", run_tlc):
             code = tla_check.main([str(self.spec), "TwoPhase", "--budget-s", budget, "--out", str(self.out), *extra])
         return code, tc.read_summary(out.getvalue()), out.getvalue()
+
+    def run_tlc(self, spec_dir, args, *, out_dir, log_path, budget_s):
+        mapping = json.loads(self.env["FAKE_TLC_MAP"])
+        name, code = mapping.get(Path(args[args.index("-config") + 1]).name, ["pass", 0])
+        text = fixture(name)
+        for old, new in json.loads(self.env.get("FAKE_TLC_EDIT", "[]")):
+            text = text.replace(old, new)
+        log_path.write_text(text)
+        return tc.parse_tlc_output(text, code), 0.1
 
     def close(self):
         self.tmp.cleanup()
@@ -244,16 +295,35 @@ GOOD = {"TwoPhase.cfg": ["pass", 0], "commit_one_prepared.cfg": ["invariant", 12
 
 
 class CheckOrchestrationTests(unittest.TestCase):
-    def run_fake(self, mapping, drop_mutants=(), extra=(), budget="60", **env):
+    def run_fake(self, mapping, drop_mutants=(), extra=(), budget="60", prep=(), **env):
         fake = FakeTlc(mapping, drop_mutants, **env)
         self.addCleanup(fake.close)
+        for step in prep:
+            step(fake.spec)
+        self.fake = fake
         return fake.run(*extra, budget=budget)
+
+    def assert_fails(self, *fragments, failed=1, mapping=None, prep=(), **kw):
+        """The check fails with exactly `failed` assertions, and its output has every fragment."""
+        code, summary, text = self.run_fake(mapping or GOOD, prep=prep, **kw)
+        self.assertEqual((code, summary["verdict"], summary["failed"]), (1, "fail", failed), text)
+        for fragment in fragments:
+            self.assertIn(fragment, text)
+        return summary
+
+    def test_pass_through_the_wrapper_process(self):
+        with patch.object(FakeTlc, "process", True):
+            code, summary, _ = self.run_fake(GOOD)
+            self.assertEqual((code, summary["verdict"], summary["executed"]), (0, "pass", 9))
+            code, summary, _ = self.run_fake(dict(GOOD, **{"TwoPhase.cfg": ["pass", 1]}))
+            self.assertEqual((code, summary["verdict"]), (3, "error"))
 
     def test_pass(self):
         code, summary, text = self.run_fake(GOOD)
         self.assertEqual((code, summary["verdict"]), (0, "pass"))
-        self.assertEqual((summary["executed"], summary["failed"]), (6, 0))
+        self.assertEqual((summary["executed"], summary["failed"]), (9, 0))
         tla = summary["tla"]
+        self.assertNotIn("limits", tla)
         self.assertEqual((tla["mode"], tla["distinct_states"], tla["depth"], tla["actions"]), ("exhaustive", 2750, 15, 11))
         self.assertEqual(tla["unmutated"], ["TypeOK"])
         self.assertEqual({m["name"]: (m["ok"], m["cex_length"]) for m in tla["mutants"]},
@@ -344,6 +414,263 @@ class CheckOrchestrationTests(unittest.TestCase):
         code, summary, text = fake.run()
         self.assertEqual(summary["verdict"], "fail")
         self.assertIn("first line is not", text)
+
+    # A spec that checks nothing.
+
+    def test_no_property_and_no_mutant_fails(self):
+        def drop(spec):
+            edit(spec / "TwoPhase.cfg", ("INVARIANTS TypeOK Consistent\n", ""), *NO_LIVENESS)
+            shutil.rmtree(spec / "mutants")
+
+        self.assert_fails("the baselines check no property", mapping={"TwoPhase.cfg": ["pass", 0]}, prep=[drop])
+
+    def test_only_a_type_invariant_with_a_reason_is_exempt(self):
+        def only(spec):
+            edit(spec / "TwoPhase.cfg", ("INVARIANTS TypeOK Consistent", "INVARIANTS TypeOK"), *NO_LIVENESS)
+            shutil.rmtree(spec / "mutants")
+
+        def exempt(line):
+            return lambda spec: edit(spec / "TwoPhase.cfg", ("CONSTANTS\n", f"\\* no-mutant: {line}\nCONSTANTS\n"))
+
+        self.assert_fails("no property besides exempted ones", mapping={"TwoPhase.cfg": ["pass", 0]}, prep=[only])
+        for line, fragment in (("Consistent", "gives no reason"), ("Consistent --", "gives no reason"),
+                               ("Consistent -- obvious", "only a type invariant"),
+                               ("Termination -- obvious", "only a type invariant")):
+            with self.subTest(line):
+                self.assert_fails(fragment, prep=[exempt(line)])
+        self.assert_fails("mutant rule TypeOK: its `no-mutant` line gives no reason", prep=[
+            lambda spec: edit(spec / "TwoPhase.cfg", (" -- the type invariant; every run checks it.", ""))])
+        # A property cannot be a type invariant, whatever its name.
+        self.assert_fails("mutant rule TypeLive: only a type invariant", prep=[
+            exempt("TypeLive -- x"),
+            lambda spec: edit(spec / "TwoPhase.cfg", ("PROPERTIES Termination", "PROPERTIES Termination TypeLive"))])
+
+    # What TLC printed against its exit status, and the kind of run.
+
+    def test_success_with_a_nonzero_exit_is_error(self):
+        for code in (1, 12, 137, 255):
+            with self.subTest(code=code):
+                got, summary, text = self.run_fake(dict(GOOD, **{"TwoPhase.cfg": ["pass", code]}))
+                self.assertEqual((got, summary["verdict"]), (3, "error"))
+                self.assertEqual(summary["tla"]["runs"][0]["verdict"], "error")
+                self.assertIn(f"TLC exited with status {code}", text)
+
+    def test_message_without_its_end_before_the_success_is_error(self):
+        cut = "@!@!@STARTMSG 2110:1 @!@!@\nInvariant Consistent is violated.\n@!@!@STARTMSG 2193:0 @!@!@"
+        code, summary, _ = self.run_fake(GOOD, FAKE_TLC_EDIT=json.dumps([["@!@!@STARTMSG 2193:0 @!@!@", cut]]))
+        self.assertEqual((code, summary["verdict"]), (3, "error"))
+
+    def test_mutant_violation_with_exit_0_fails(self):
+        self.assert_fails("TLC exited with status 0", mapping=dict(GOOD, **{"no_resend.cfg": ["liveness", 0]}))
+
+    def test_mutant_false_in_the_initial_state_fails(self):
+        # TLC prints the state in the message, and no counterexample states.
+        states = re.findall(r"@!@!@STARTMSG 2217:4 @!@!@\n.*?ENDMSG 2217 @!@!@\n", fixture("invariant"), re.S)
+        edits = [["Invariant Consistent is violated.", "Invariant Consistent is violated by the initial state:\nx = 1"],
+                 *([s, ""] for s in states)]
+        self.assert_fails("false in an initial state", FAKE_TLC_EDIT=json.dumps(edits))
+
+    def test_simulation_output_is_not_an_exhaustive_run(self):
+        def second(spec):
+            shutil.copy(spec / "TwoPhase.cfg", spec / "TwoPhase.more.cfg")
+
+        code, summary, _ = self.run_fake(dict(GOOD, **{"TwoPhase.more.cfg": ["simulation", 0]}), prep=[second])
+        self.assertEqual((code, summary["verdict"]), (2, "not-run"))
+        code, summary, _ = self.run_fake({"TwoPhase.large.cfg": ["simulation", 0]}, extra=("--tier", "T2"))
+        self.assertEqual((code, summary["verdict"], summary["tla"]["mode"]), (2, "not-run", "exhaustive"))
+        code, summary, _ = self.run_fake({"TwoPhase.large.cfg": ["pass", 0]}, extra=("--tier", "T2", "--simulate"))
+        self.assertEqual((code, summary["verdict"], summary["tla"]["mode"]), (2, "not-run", "simulation"))
+
+    # The search rule.
+
+    COUNTERS = "\\* limit: Few -- bounds the two fault counters"
+
+    def limited(self, *definitions, cfg=(), name="Few", kind="CONSTRAINT", declared=True):
+        """Prep steps: a safety-only baseline with one constraint."""
+        lines = [f"{kind} {name}", *([f"\\* limit: {name} -- bounds counters"] if declared else []), *cfg]
+        return [safety_only, add_to_model(*definitions), add_to_cfg(*lines)]
+
+    def test_declared_constraint_on_counters_passes_and_is_recorded(self):
+        coverage = ("@!@!@STARTMSG 2778:0 @!@!@\n<Few line 8, col 1 to line 8, col 3 of module MCTwoPhase>: {}\n"
+                    "@!@!@ENDMSG 2778 @!@!@\n")
+        log = json.dumps([SAFETY_LOG, ["@!@!@STARTMSG 2201:0", coverage.format("3:4") + "@!@!@STARTMSG 2201:0"],
+                          ["@!@!@STARTMSG 2202:0", coverage.format("5515:7379") + "@!@!@STARTMSG 2202:0"]])
+        shapes = [
+            ["Few == crashes <= 1"],
+            ["Few ==", "    /\\ crashes <= 1", "    /\\ \\A r \\in RM : Cardinality(msgs) =< 2 * 3"],
+            ["Few == (\\A r \\in RM : \\A s \\in RM : crashes < 2) /\\ MaxDrops >= drops"],
+            ["Max(a, b) == IF a > b THEN a ELSE b", "Few == One /\\ Two(RM)", "One == Max(crashes, drops) \\leq 1",
+             "Two(S) == Len(<<crashes, drops>>) < 4"],
+            # The bound of a spec on another branch (OltpRanges): history length and timestamps.
+            ["Few ==", "    /\\ crashes <= MaxCrashes \\* not = here", "    /\\ \\A g \\in RM : Len(rmState[g]) <= MaxDrops"],
+        ]
+        for definitions in shapes:
+            for kind in ("CONSTRAINT", "CONSTRAINTS", "ACTION_CONSTRAINT"):
+                with self.subTest(definitions[0], kind=kind):
+                    code, summary, text = self.run_fake(
+                        GOOD, prep=self.limited(*definitions, kind=kind), FAKE_TLC_EDIT=log)
+                    self.assertEqual((code, summary["verdict"]), (0, "pass"), text)
+                    self.assertEqual(summary["tla"]["limits"], [
+                        f"TwoPhase.cfg: {kind.removesuffix('S')} Few kept 5515 of 7379 states: bounds counters"])
+
+    def test_constraint_that_is_not_declared_fails(self):
+        for kind in ("CONSTRAINT", "ACTION_CONSTRAINT"):
+            self.assert_fails(f"{kind} Few has no `\\* limit: Few -- <reason>` line", FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]),
+                              prep=self.limited("Few == crashes <= 1", kind=kind, declared=False))
+        for line in ("\\* limit: Few", "\\* limit: Few --", "\\* limit: Other -- reason", "limit: Few -- reason",
+                     "(* limit: Few -- reason *)"):
+            with self.subTest(line):
+                self.assert_fails("has no `\\* limit: Few", FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]),
+                                  prep=self.limited("Few == crashes <= 1", cfg=[line] if line[0] != "l" else [],
+                                                    declared=False))
+
+    def test_constraint_that_selects_states_fails_even_when_declared(self):
+        for definition in ('Few == \\A r \\in RM : rmState[r] # "committed"', 'Few == tmDecision = "init"',
+                           "Few == ~tmUp", "Few == tmUp => crashes <= 1", "Few == crashes <= 1 \\/ tmUp", "Few == TRUE",
+                           "Few == tmUp", 'Few == tmDecision \\notin {"committed"}', "Few == msgs \\subseteq {}",
+                           "Few == \\E r \\in RM : crashes <= 1", "Few == LET n == crashes IN n <= 1",
+                           "Few == IF tmUp THEN crashes <= 1 ELSE drops <= 1", "Few == crashes <= 1 /\\ tmUp",
+                           "Few == Inner\nInner == tmUp",
+                           "Few == \\A r \\in {s \\in RM : tmUp} : 1 <= 0", "Few == Few", "Few(n) == crashes = n",
+                           "Other == crashes <= 1", "  Few == crashes <= 1"):
+            with self.subTest(definition):
+                self.assert_fails("FAIL search of TwoPhase.cfg: CONSTRAINT Few: ", FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]),
+                                  prep=self.limited(definition))
+
+    def test_depth_limit_and_state_cap_fail(self):
+        for body in ('TLCGet("level") < 9', 'TLCGet("distinct") < 800', 'TLCGet("stats").diameter < 5',
+                     "TLCGetOrDefault(1, 0) <= 5", "JavaTime < 5", "RandomElement(1..3) <= 2"):
+            with self.subTest(body):
+                self.assert_fails("FAIL search of the model: MCTwoPhase.tla uses", FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]),
+                                  failed=2 if '"' in body else 1, prep=self.limited(f"Few == {body}"))
+        # Anywhere in the model, also in the design module and behind an operator.
+        self.assert_fails("TwoPhase.tla uses TLCSet", prep=[
+            lambda spec: edit(spec / "TwoPhase.tla", ("vars ==", 'Stop == TLCSet("exit", TRUE)\nvars =='))])
+        for module in ("TLCExt", "Randomization", "IOUtils"):
+            self.assert_fails(f"MCTwoPhase.tla uses the module {module}", prep=[add_to_model(extends=f", {module}")])
+            self.assert_fails(f"uses the module {module}", prep=[add_to_model(f"X == INSTANCE {module}")])
+        self.assert_fails("Helper.tla uses TLCGet", prep=[
+            add_to_model(extends=", Helper"),
+            lambda spec: (spec / "Helper.tla").write_text("---- MODULE Helper ----\nD == TLCGet(1)\n====\n")])
+        # A comment or a string is not a use.
+        code, summary, text = self.run_fake(GOOD, prep=[add_to_model(
+            '(* TLCGet("level") (* nested *) *)', "\\* RandomElement", 'Text == "TLCGet"')])
+        self.assertEqual(code, 0, text)
+
+    def test_t2_applies_the_search_rule(self):
+        cap = [add_to_model('Few == TLCGet("level") < 9')]
+        for extra in (("--tier", "T2"), ("--tier", "T2", "--simulate")):
+            fx = "simulation" if "--simulate" in extra else "pass"
+            summary = self.assert_fails("search of the model", mapping={"TwoPhase.large.cfg": [fx, 0]}, extra=extra, prep=cap)
+            self.assertEqual(summary["executed"], 3)
+        self.assert_fails("CONSTRAINT Few has no", mapping={"TwoPhase.large.cfg": ["pass", 0]}, extra=("--tier", "T2"),
+                          FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]), prep=[
+                              safety_only, add_to_model("Few == crashes <= 1"),
+                              add_to_cfg("CONSTRAINT Few", cfg="TwoPhase.large.cfg")])
+
+    def test_liveness_under_a_constraint_or_symmetry_fails(self):
+        summary = self.assert_fails("liveness under the constraint Few", prep=[
+            add_to_model("Few == crashes <= 1"), add_to_cfg("CONSTRAINT Few", self.COUNTERS)])
+        self.assertEqual(summary["tla"]["runs"][0]["verdict"], "liveness-limited")
+        warning = ("@!@!@STARTMSG 2279:3 @!@!@\nDeclaring symmetry during liveness checking is dangerous.\n"
+                   "@!@!@ENDMSG 2279 @!@!@\n@!@!@STARTMSG 2193:0")
+        self.assert_fails("liveness under SYMMETRY", FAKE_TLC_EDIT=json.dumps([["@!@!@STARTMSG 2193:0", warning]]),
+                          prep=[add_to_cfg("SYMMETRY Sym")])
+        # A symmetry set in a safety run is fine: TLC does not warn.
+        code, _, text = self.run_fake(GOOD, prep=[safety_only, add_to_cfg("SYMMETRY Sym")],
+                                      FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]))
+        self.assertEqual(code, 0, text)
+
+    def test_view_fails(self):
+        self.assert_fails("VIEW V merges states", prep=[add_to_model("V == rmState"), add_to_cfg("VIEW V")])
+        self.assert_fails("VIEW V merges states", prep=[add_to_cfg("VIEW V", "\\* limit: V -- declared")])
+
+    def test_overrides(self):
+        def override(line):
+            return lambda spec: edit(spec / "TwoPhase.cfg", ("CONSTANTS\n", f"CONSTANTS\n    {line}\n"))
+
+        for name in ("Consistent", "TypeOK", "Termination", "Spec"):
+            for form in (f"{name} <- Yes", f"{name} = TRUE", f"{name} <- [TwoPhase] Yes"):
+                with self.subTest(form):
+                    self.assert_fails(f"the cfg overrides {name}, which it checks or runs", prep=[
+                        add_to_model("Yes == TRUE"), override(form)])
+        for name in ("Next", "Nat", "SendMsg"):
+            self.assert_fails(f"override {name} has no `\\* limit: {name} -- <reason>` line", prep=[override(f"{name} <- Mine")])
+            code, summary, text = self.run_fake(GOOD, prep=[override(f"{name} <- Mine"), lambda spec: edit(
+                spec / "TwoPhase.cfg", ("CONSTANTS\n", f"\\* limit: {name} -- a finite set\nCONSTANTS\n"))])
+            self.assertEqual((code, summary["tla"]["limits"]), (0, [f"TwoPhase.cfg: override {name}: a finite set"]), text)
+        # The cfg that declares it is the one that overrides it.
+        self.assert_fails("override Nat has no", prep=[override("Nat <- Mine"), lambda spec: edit(
+            spec / "TwoPhase.large.cfg", ("CONSTANTS\n", "\\* limit: Nat -- elsewhere\nCONSTANTS\n"))])
+        # A mutant must check the same property as the baseline.
+        self.assert_fails("mutant commit_one_prepared: its cfg overrides Consistent", prep=[lambda spec: edit(
+            spec / "mutants" / "commit_one_prepared.cfg", ("CONSTANTS\n", "CONSTANTS\n    Consistent <- No\n"))])
+
+    def test_constraint_override_fails(self):
+        self.assert_fails("overrides Few, which it checks or runs", FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]),
+                          prep=[*self.limited("Few == crashes <= 1"), lambda spec: edit(
+                              spec / "TwoPhase.cfg", ("CONSTANTS\n", "CONSTANTS\n    Few <- Mine\n"))])
+
+    def test_selftest_model_constants(self):
+        model = tla_check.Model(SELFTEST, "MCTwoPhase.tla")
+        self.assertEqual(set(model.texts), {"MCTwoPhase", "TwoPhase"})
+        self.assertEqual(model.problems, [])
+        self.assertTrue({"RM", "MaxCrashes", "MaxDrops", "Mutant"} <= model.constants)
+        self.assertNotIn("Next", model.constants)
+
+    # The facts.
+
+    def test_every_failure_reaches_the_facts_and_summary_json_comes_first(self):
+        def many(spec):
+            for i in range(60):
+                shutil.copy(spec / "mutants" / "commit_one_prepared.cfg", spec / "mutants" / f"z{i:02d}.cfg")
+            for i in range(25):
+                shutil.copy(spec / "TwoPhase.cfg", spec / f"TwoPhase.v{i:02d}.cfg")
+
+        mapping = {**GOOD, **{f"z{i:02d}.cfg": ["invariant", 12] for i in range(60)},
+                   **{f"TwoPhase.v{i:02d}.cfg": ["pass", 0] for i in range(25)},
+                   "z55.cfg": ["pass", 0], "TwoPhase.v24.cfg": ["invariant", 12]}
+        summary = self.assert_fails("mutant z55: no violation", failed=2, mapping=mapping, prep=[many])
+        tla = summary["tla"]
+        self.assertEqual((len(tla["mutants"]), len(tla["runs"])), (62, 26))
+        self.assertEqual([m["name"] for m in tla["mutants"] if not m["ok"]], ["z55"])
+        self.assertEqual([r["cfg"] for r in tla["runs"] if r["verdict"] != "pass"], ["TwoPhase.v24.cfg"])
+        names = [a["name"] for a in summary["artifacts"]]
+        self.assertEqual((names[0], len(names), len(set(names))), ("tla/summary.json", 89, 89))
+        stored = json.loads((self.fake.out / "summary.json").read_text())
+        self.assertEqual(stored, {k: summary[k] for k in ("verdict", "executed", "failed", "not_run", "tla")})
+
+    def test_every_error_reaches_the_summary_in_full(self):
+        names = [f"TwoPhase.v{i:03d}.cfg" for i in range(8)]
+
+        def many(spec):
+            for name in names:
+                shutil.copy(spec / "TwoPhase.cfg", spec / name)
+
+        code, summary, _ = self.run_fake({**GOOD, **{n: ["eval_error", 255] for n in names}}, prep=[many])
+        self.assertEqual((code, summary["verdict"], len(summary["not_run"])), (3, "error", 8))
+        stopped, summary, _ = self.run_fake({**GOOD, "TwoPhase.cfg": ["eval_error", 255]})
+        self.assertEqual(stopped, 3)
+        self.assertEqual(summary["not_run"][0]["id"], "tlc-error")
+
+    def test_a_used_output_folder_is_left_alone(self):
+        fake = FakeTlc(GOOD)
+        self.addCleanup(fake.close)
+        fake.out.mkdir()
+        (fake.out / "summary.json").write_text("earlier")
+        code, summary, _ = fake.run()
+        self.assertEqual((code, summary["verdict"], summary["artifacts"]), (3, "error", []))
+        self.assertEqual((fake.out / "summary.json").read_text(), "earlier")
+
+    def test_kill_without_docker_is_still_not_run(self):
+        for effect in (OSError("no docker"), subprocess.TimeoutExpired("docker", 60)):
+            with self.subTest(effect=type(effect).__name__), patch.object(tc, "KILL_GRACE_S", 0), \
+                    patch.object(tc.subprocess, "run", side_effect=effect) as run:
+                code, summary, _ = self.run_fake(dict(GOOD, **{"TwoPhase.cfg": ["time_budget", 137]}),
+                                                 budget="1", FAKE_TLC_SLEEP="3")
+                self.assertEqual((code, summary["verdict"]), (2, "not-run"))
+                self.assertTrue(all(c.kwargs.get("timeout") for c in run.call_args_list))
+                self.assertEqual(run.call_args.args[0][:2], ["docker", "kill"])
 
     def test_t2_simulation_is_labelled(self):
         code, summary, _ = self.run_fake({"TwoPhase.large.cfg": ["simulation", 0]},
