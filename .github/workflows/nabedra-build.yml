@@ -191,7 +191,7 @@ jobs:
           growth=()
           if has growth; then
             # SCRATCH (batch1 triage): ten O28 direct_oltp=off runs on the one opt-level-1 build, nothing else.
-            for n in picks clean-1 clean-2 node-1 node-2 dup21-1 dup21-2 dup21-3 dup23-1 dup23-2; do
+            for n in dup21-1 dup21-2 dup21-3 dup23-1 dup23-2; do
               growth+=("{\"scenario\":\"O28\",\"modes\":\"off\",\"label\":\"$n\",\"opt1\":true,\"timeout\":3600}")
             done
           fi
@@ -1668,7 +1668,7 @@ jobs:
 
   # The one opt-level-1 build of the OLTP server and library test executable that O21 and O28 need
   # (debug builds time out). Its own target directory, so its paths never collide with the shared build.
-  # SCRATCH (batch1 triage): O28 on the binaries of run 45484607482 with w2's HTTP port forced to
+  # SCRATCH (batch1 triage): O28 on the binaries already built for the tested commit with w2's HTTP port forced to
   # another worker's, as pick_port can return it. Never merge.
   growth:
     name: ${{ matrix.label }} O28 port repro
@@ -1695,7 +1695,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: oltp-bins-opt1
-          run-id: 45484607482
+          run-id: ${{ inputs.sha == 'b37e6129a41015716ca8f8878823a9a9ecb8a93e' && '45489723719' || '45484607482' }}
           github-token: ${{ github.token }}
       - name: Repro
         run: |
@@ -1735,7 +1735,7 @@ jobs:
           g.main()
           PY
           uname -r
-          NABEDRA_TEST_DIRECT_OLTP=off PYTHONDONTWRITEBYTECODE=1 timeout 900 python /tmp/repro.py "$BIN" "$EXE"
+          NABEDRA_TEST_DIRECT_OLTP=off PYTHONDONTWRITEBYTECODE=1 timeout 300 python /tmp/repro.py "$BIN" "$EXE"
 
   # REP1-REP5 worker recovery process suites on the shared build, one invocation each: SCALE1's scale,
   # direct-mode rollback, retained restart, system replacement and REP5's abandon, wipe and data-trust
