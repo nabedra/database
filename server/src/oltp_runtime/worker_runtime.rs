@@ -1063,6 +1063,8 @@ impl WorkerRuntime {
             .removal
             .is_some()
         {
+            #[cfg(test)]
+            eprintln!("o14 admission refused during removal");
             return Err(QueueError::Unavailable.protocol());
         }
         // The HTTP ingress owns this entire future independently of its socket.
@@ -1107,6 +1109,10 @@ impl WorkerRuntime {
             } else {
                 self.resume_staged(current, id).await
             };
+            #[cfg(test)]
+            if let Err(error) = &result {
+                eprintln!("o14 existing admission {id} accepted={accepted} failed: {error:?}");
+            }
             result.map_err(uncertain_admission)?;
         } else {
             let cleanup = self.admission_cleanup.reserve(&self.services.shared)?;

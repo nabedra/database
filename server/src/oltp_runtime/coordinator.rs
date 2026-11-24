@@ -565,6 +565,12 @@ impl QueueCoordinator {
                     .lock()
                     .map_err(|_| QueueError::Unavailable.protocol())?;
                 if replica.authority() != current {
+                    #[cfg(test)]
+                    eprintln!(
+                        "o14 copy view mismatch request {id}: local {:?}, Control {:?}",
+                        replica.authority(),
+                        current
+                    );
                     return Err(QueueError::Stale.protocol());
                 }
                 if if promote {
