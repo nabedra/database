@@ -288,6 +288,80 @@ async fn o12_failed_ready_validation_preserves_direct_schema() {
     fixture.close().await;
 }
 
+/// Scratch probe for TOPO1 (never shipped): a split child's group reuses the parent's
+/// direct epoch under a later lifecycle. The executor's schema cache must not answer
+/// with the parent's pre-index descriptor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_topo1_a_reused_direct_epoch_reads_the_new_lifecycle() {
+    use crate::oltp::mvcc::store::direct::DirectSchema as GroupSchema;
+    use crate::oltp_runtime::direct::{CatalogSchema, DirectSchema as _, SchemaLookup};
+    nabedra_rt::time::timeout(WAIT, async {
+        let fixture = Fixture::new().await;
+        let table = fixture.definition.table_id;
+        let schema = CatalogSchema::new(fixture.runtime.services.catalog.clone());
+        let authority = fixture.runtime.index_authority(None).await.unwrap();
+        let schema_epoch = {
+            let pin = fixture
+                .runtime
+                .services
+                .catalog
+                .snapshot(ReadTs::new(u64::MAX).unwrap(), authority)
+                .unwrap();
+            let crate::oltp::mvcc::catalog::CatalogRead::Value {
+                record: Some(record),
+                ..
+            } = fixture
+                .runtime
+                .services
+                .catalog
+                .describe(&pin, table)
+                .await
+                .unwrap()
+            else {
+                panic!("table record")
+            };
+            record.schema_epoch
+        };
+        // The parent group's first epoch, before the index exists.
+        let parent = schema.lifecycle(table, authority).await.unwrap().unwrap();
+        let group = |lifecycle| Some(GroupSchema { epoch: 1, lifecycle: Some(lifecycle) });
+        let SchemaLookup::Table(before) = schema
+            .table(table, schema_epoch, group(parent), authority)
+            .await
+            .unwrap()
+        else {
+            panic!("parent descriptor")
+        };
+        assert!(before.indexes.is_empty());
+
+        let record = fixture.declare().await;
+        fixture.spawn_resume(record).await.unwrap().unwrap();
+        let child = loop {
+            if let Some(child) = schema.lifecycle(table, authority).await.unwrap() {
+                break child;
+            }
+            nabedra_rt::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_ne!(child, parent, "the index publication replaced the lifecycle");
+        // The child group starts again at epoch 1, bound to the new lifecycle.
+        let SchemaLookup::Table(after) = schema
+            .table(table, schema_epoch, group(child), authority)
+            .await
+            .unwrap()
+        else {
+            panic!("child descriptor")
+        };
+        assert_eq!(
+            (after.lifecycle_id, after.indexes.len()),
+            (child, 1),
+            "the child group used the parent's cached pre-index descriptor",
+        );
+        fixture.close().await;
+    })
+    .await
+    .expect("probe watchdog");
+}
+
 const INDEX: &str = "secondary by_category";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
