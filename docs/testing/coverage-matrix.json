@@ -1,7 +1,12 @@
 {
   "allow_unattested": false,
-  "head": "8498d0ee2c61a3df8557091412665b0e73f47bdc",
-  "ignored_records": [],
+  "head": "564c87c0492bb9020bfb95eef95d556249242e2a",
+  "ignored_records": [
+    {
+      "path": "land-p12-docker2-b6af6b5-034549--cache-cluster-real.json",
+      "reason": "sha is not HEAD or an ancestor of HEAD"
+    }
+  ],
   "kinds": [
     "M",
     "U",
@@ -289,6 +294,7 @@
         "R": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -349,6 +355,7 @@
         "R": {
           "executed": 0,
           "failed": 0,
+          "reason": "1 uncounted record(s)",
           "required": true,
           "state": "missing"
         },
@@ -3992,5 +3999,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
