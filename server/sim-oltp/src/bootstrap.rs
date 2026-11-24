@@ -152,7 +152,7 @@ impl Bootstrap {
             "status": place(2, json!({"status": {"bucket": 0}})),
             "catalog": place(3, json!("catalog")),
         });
-        let (peers, pins) = Self::peer_inventory(enrollments.iter().cloned().collect());
+        let (peers, pins) = Self::peer_inventory(enrollments.to_vec());
         let worker_configs = std::array::from_fn(|local| {
             let node = WORKERS[local];
             let enrollment = &enrollments[local];

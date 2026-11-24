@@ -5,10 +5,11 @@ use std::error::Error;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nabedra_check::Gen;
 use nabedra_check::evidence::{Artifact, Record};
+use nabedra_rt::time;
 use nabedra_sim::shrink;
 use nabedra_sim::sweep::{self, PlantedSearch, SeedRun, SweepConfig, SweepReport};
 use serde_json::{Value, json};
@@ -120,9 +121,10 @@ fn usage() -> Option<Usage> {
 
 fn measured(seed: u64, generator: &mut Gen, defect: Defect) -> (RunResult, Measurement) {
     let cpu_start = usage();
-    let start = Instant::now();
+    // Both samples are outside the World installed by run_seed.
+    let start = time::now_std();
     let result = run_seed(seed, generator, defect);
-    let elapsed = start.elapsed().as_secs_f64();
+    let elapsed = time::elapsed(start).as_secs_f64();
     let cpu_end = usage();
     let blocking_cpu_s = result.blocking_cpu.map(|duration| duration.as_secs_f64());
     let measurement = Measurement {
@@ -263,7 +265,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     if test_defects && (defect != Defect::None || config.tape.is_some()) {
         return Err("seeded-defect checks require an unmodified smoke sweep".into());
     }
-    let started = Instant::now();
+    let started = time::now_std();
     let observed = Mutex::new(BTreeMap::<u64, ObservedSeed>::new());
     let report = sweep::sweep(&config, |seed, generator| {
         let (result, measurement) = measured(seed, generator, defect);
@@ -306,7 +308,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         result.run
     });
     let observed = observed.into_inner().expect("sweep observations poisoned");
-    let duration_s = started.elapsed().as_secs_f64();
+    let duration_s = time::elapsed(started).as_secs_f64();
     let mut assertions = BTreeMap::new();
     let mut config_hash = nabedra_sim::Fnv::default();
     let mut stats = Vec::with_capacity(report.seeds.len());

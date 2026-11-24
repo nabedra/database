@@ -106,7 +106,7 @@ async fn execute(
     let ticker = {
         let world = world.clone();
         let checks = checks.clone();
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             loop {
                 time::sleep(STEP).await;
                 checks.step(&world);
@@ -546,10 +546,8 @@ mod tests {
 
     #[test]
     fn cold_start_reopens_mounted_workers() {
-        assert!(
-            nabedra_sim::runtime::SEEDED,
-            "set RUSTFLAGS='--cfg tokio_unstable'"
-        );
+        let seeded = nabedra_sim::runtime::SEEDED;
+        assert!(seeded, "set RUSTFLAGS='--cfg tokio_unstable'");
         let seed = 1;
         let once = || {
             let mut generator = nabedra_sim::sweep::workload_gen(seed);
