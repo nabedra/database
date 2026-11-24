@@ -7,9 +7,10 @@ When you are given a task or asked to make a change, do the following:
 
 1. Make sure your thread has a worktree for itself such that different threads can work on the same codebase without interrupting each other
 2. For the thread, create a branch in git called `nabedra/<task-title-name>` and continue the work of your thread in that branch and worktree
-3. Always when you are done with the implementation, tell the user you are ready to run the code review (he might want you to add more features). If he asks for the review, run a deep code review/QA using the `code-review` skill of this repo
-4. When you are done, file a PR in GitHub
-5. For docs-only changes, review the diff, examples and links locally. Skip
+3. Before implementing a plan that changes a topology or a protocol, or touches an L2 or L3 module, run the `design-review` skill of this repo. Implement only after its [gate](../design-review/SKILL.md#gate-implementation) holds. The plan, the spec and the implementation share the branch and the PR. A change to `specs/` is not docs-only.
+4. Always when you are done with the implementation, tell the user you are ready to run the code review (he might want you to add more features). If he asks for the review, run a deep code review/QA using the `code-review` skill of this repo
+5. When you are done, file a PR in GitHub
+6. For docs-only changes, review the diff, examples and links locally. Skip
    runtime tests and GitHub Actions.
    Put `[skip ci]` in the PR head commit message and in the commit message that
    lands on the base branch. For other changes, run the applicable checks and
@@ -18,7 +19,7 @@ When you are given a task or asked to make a change, do the following:
    affected checks. Before merging any PR, confirm that the applicable checks
    pass and the [non-author reviewer](../code-review/SKILL.md#verification-rules)
    approves.
-6. After the merge, remove the PR branch and worktree if they are no longer needed. Then run `git pull` on the base branch.
+7. After the merge, remove the PR branch and worktree if they are no longer needed. Then run `git pull` on the base branch.
 
 Use the [Nabedra builds skill](../nabedra-builds/SKILL.md) to choose where to
 run builds and expensive checks. Apply it when coordinating concurrent agents.

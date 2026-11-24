@@ -48,6 +48,7 @@ of virtual time with parallel 5.5-hour real soaks on Actions runners.
 | R | Real-environment checks exercise running processes and integrations such as Docker, kind, or real S3. |
 | P | Performance checks measure load targets or paired A/B regressions. |
 | K | Soaks exercise sustained workloads and faults over virtual or real time. |
+| T | TLA+ specs check the design with TLC, and trace validation checks simulation traces against the spec. Registers list T once the tooling accepts it. |
 
 ## Matrix states
 
