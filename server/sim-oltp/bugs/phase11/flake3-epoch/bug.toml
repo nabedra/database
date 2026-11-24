@@ -26,5 +26,14 @@ seeds = [1, 10000]
 kind = "lib-test"
 test = "oltp_replication::typed_log::tests::o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote"
 mode = "on"
-attempts = 10
 failure_contains = ["the vote must sync before the post-vote batch starts"]
+
+[regression.evidence]
+digest = "44a619dbc910f2fcad82e491bf5684e07498864f92366e8afb48e3d606f115ae"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435960323", sha = "ab0b5567e26a47350fc2c3e3881679d03967baec", result = "failed", note = "request p11-bugs-flake3-epoch-ab0b556-172028, o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote, 20 of 20 attempts, on mode, over main c8426fe1", output = """
+assertion `left == right` failed: the vote must sync before the post-vote batch starts
+  left: 5
+ right: 6
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.02s
+""" }

@@ -26,3 +26,11 @@ kind = "lib-test"
 test = "oltp_replication::service_rpc::grant_cache::tests::c07_rd2_warm_refreshes_hold_at_most_one_read_while_control_hangs"
 mode = "on"
 failure_contains = ["in_flight.load(Ordering::Relaxed) <= 1"]
+
+[regression.evidence]
+digest = "b90865494b335bbe16d4a4679245fbc20db6ff5b470da6b3f31c3ad57cac795f"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, c07_rd2_warm_refreshes_hold_at_most_one_read_while_control_hangs, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435976562", sha = "45eec0f10487d7a93c2a31a7862d43d11b072252", result = "failed", note = "request p11-bugs-rd2-45eec0f-172033, c07_rd2_warm_refreshes_hold_at_most_one_read_while_control_hangs, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+assertion failed: in_flight.load(Ordering::Relaxed) <= 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.00s
+""" }

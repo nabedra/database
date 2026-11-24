@@ -26,3 +26,12 @@ seeds = [1, 10000]
 kind = "lib-test"
 test = "oltp_replication::authority::control::tests::system_recovery::r04_o17_cold_fence_after_mount_completes_publication"
 mode = "on"
+failure_contains = ["Rejected(Stale)"]
+
+[regression.evidence]
+digest = "34e5cf1287dbef5031d0ee6c78af6879c81ee11c3b88e7a71425e582db3b70cf"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, r04_o17_cold_fence_after_mount_completes_publication, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435849990", sha = "df5e7453c164f50c4f488b05008baee9aae76898", result = "failed", note = "request p11-bugs-fixb-cold-publish-df5e745-171955, r04_o17_cold_fence_after_mount_completes_publication, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+Rejected(Stale)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.06s
+""" }

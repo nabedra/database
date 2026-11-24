@@ -26,4 +26,15 @@ seeds = [1, 10000]
 kind = "lib-test"
 test = "oltp_runtime::worker_runtime::direct_gateway::tests::o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane"
 mode = "on"
-failure_contains = ["batch ended with Storage held"]
+failure_contains = ["worker outgoing lane full (Storage)"]
+
+[regression.evidence]
+digest = "07e2d4b3d81c1a77a5f74a66d092131c6494925bd5035a8837dc02425522aec9"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45436008436", sha = "ce3343ba76532cc93bd6d1eea882d9d2cba6cd42", result = "failed", note = "request p11-bugs-qlane-ce3343b-172042, o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+nabedra-db: transaction e94baff9-bbfe-497c-80c4-68c1e5e6becd preparation failed: Overloaded: worker outgoing lane full (Storage)
+assertion `left == right` failed
+  left: (429, Object {"error": Object {"code": String("overloaded"), "message": String("worker outgoing lane full (Storage)"), "outcome": String("not_applied")}, "request_id": String("e94baff9-bbfe-497c-80c4-68c1e5e6becd")})
+ right: (200, Object {"data": Number(2), "request_id": String("e94baff9-bbfe-497c-80c4-68c1e5e6becd")})
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 0.98s
+""" }

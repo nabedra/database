@@ -31,3 +31,11 @@ test = "oltp_replication::manager::damage_scheduler_tests::probe_cap1_no_reclama
 mode = "on"
 probe = true
 failure_contains = ["before Control enabled data.index.reclaim"]
+
+[regression.evidence]
+digest = "709d7c994a53a0c42ff9414da3fe54666378b16cfdc09893882109836db1eaaa"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, probe_cap1_no_reclamation_before_the_cluster_feature, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435906940", sha = "386b6dde6e3506647c28aa91c2629509bb28106b", result = "failed", note = "request p11-bugs-cap1-386b6dd-172011, probe_cap1_no_reclamation_before_the_cluster_feature, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+a ReclaimIndex entry committed at AppliedPosition { term: 1, node_id: 1, index: 3 } before Control enabled data.index.reclaim
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 194 filtered out; finished in 1.58s
+""" }

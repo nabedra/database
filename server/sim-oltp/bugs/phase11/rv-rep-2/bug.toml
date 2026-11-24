@@ -29,3 +29,13 @@ kind = "lib-test"
 test = "oltp_replication::authority::control::tests::system_recovery::o17_revocation_limit_and_failed_refresh_preserve_the_committed_mount"
 mode = "on"
 failure_contains = ["left: SystemReplacementMounted"]
+
+[regression.evidence]
+digest = "1b4c64d0f1d1f7cb9d6d897512e9b292be2503829270e2e378e440c035867e58"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o17_revocation_limit_and_failed_refresh_preserve_the_committed_mount, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435923449", sha = "7dd3835281dd37ee0e41fc108664954df2f1be01", result = "failed", note = "request p11-bugs-rv-rep-2-7dd3835-172017, o17_revocation_limit_and_failed_refresh_preserve_the_committed_mount, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+assertion `left == right` failed
+  left: SystemReplacementMounted
+ right: Rejected(Busy)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.69s
+""" }

@@ -26,3 +26,13 @@ kind = "recovery-suite"
 suite = "replacement-wipe"
 mode = "on"
 timeout_s = 3600
+failure_contains = ["assert attempt.popen.wait(timeout=30) != 0", "subprocess.TimeoutExpired"]
+
+[regression.evidence]
+digest = "64486e0a7b958daef9aff9b543103587cdbe65ef7a3e661b28a4da0560a9b70b"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45440153575", sha = "c5d1cc5c6a0bb7ff2d5a21e35253d5c619f01850", result = "passed", note = "request p11-bugs-clean-suites-c5d1cc5-174205, scratch_recovery_suite_replacement_wipe, 1 of 1 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45440243898", sha = "ee8c1c2399de2b0d8e417ab3d5f1ca6e7e87153f", result = "failed", note = "request p11-bugs-rv-rep-3-suite-ee8c1c2-174233, scratch_recovery_suite_replacement_wipe, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 199 filtered out; finished in 95.48s
+    assert attempt.popen.wait(timeout=30) != 0
+subprocess.TimeoutExpired: Command '['/home/runner/work/nabedra-database/nabedra-database/server/target/debug/deps/nabedra_database_server-030e6d568b85f86d', '--exact', 'oltp_runtime::recovery_tests::actual_runtime_child', '--ignored', '--nocapture']' timed out after 30 seconds
+""" }

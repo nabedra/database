@@ -28,3 +28,11 @@ kind = "lib-test"
 test = "oltp_replication::typed_network::tests::o06_o16_o17_rf3_lost_timestamp_voter_replacement"
 mode = "on"
 failure_contains = ["stable membership must not certify a different removal"]
+
+[regression.evidence]
+digest = "b5dc5e10eaf10de5dbaa191c21ebd4d22c65f456057dfe1f87bae13fb700ced9"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o06_o16_o17_rf3_lost_timestamp_voter_replacement, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435867889", sha = "8ca7d4092c429173ebf5ace157e73a4b03f76976", result = "failed", note = "request p11-bugs-rep2-8ca7d40-172000, o06_o16_o17_rf3_lost_timestamp_voter_replacement, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+stable membership must not certify a different removal
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 3.43s
+""" }

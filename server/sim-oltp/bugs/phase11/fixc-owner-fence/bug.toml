@@ -13,7 +13,10 @@ port = "hand"
 port_notes = """
 4287df82 reversed at its two decision points, after c7b93782's follow-up: TransactionCoordinator::recover_queued
 always abandons an attempt of a fenced owner, and Status refuses RetrySnapshot unless the attempt was
-created by the current authority. The helper signatures stay.
+created by the current authority. The helper signatures stay. The library test proves the Status hunk. The
+retained-restart process suite proves the runtime hunk: with the patch its fenced mutation ended as a failed
+receipt, conflict `original execution authority was fenced` (run 45440132415); it passes without
+(run 45440153575). O08 passed with the patch.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
 # not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
@@ -27,3 +30,11 @@ kind = "lib-test"
 test = "oltp_replication::authority::status::identity::tests::o10_o14_r01_q06_fenced_retry_abort_requires_exact_settlement"
 mode = "on"
 failure_contains = ["expected retry abort, got Rejected(InvalidBinding)"]
+
+[regression.evidence]
+digest = "919565cb643c1ba88338c5eddacf1cd5cac017638726187fffc9fce3e989ed40"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o10_o14_r01_q06_fenced_retry_abort_requires_exact_settlement, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45436022495", sha = "08fafb0a3343878b6a8ed9e2a179268853dfb157", result = "failed", note = "request p11-bugs-fixc-owner-fence-08fafb0-172046, o10_o14_r01_q06_fenced_retry_abort_requires_exact_settlement, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+expected retry abort, got Rejected(InvalidBinding)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.38s
+""" }

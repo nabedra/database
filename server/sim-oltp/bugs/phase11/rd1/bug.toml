@@ -14,7 +14,9 @@ port_notes = """
 f2e21999 conflicts with later executor changes. The port removes its two decision points and leaves the
 latch loop: mutation_table reads the group's epochs from the store before the latch (no known_epochs
 shortcut), and prepare no longer compares the snapshot's direct schema with the one the descriptor was
-looked up with. Keeping the shortcut would widen the window beyond the original.
+looked up with. Keeping the shortcut would widen the window beyond the original. The fix's own test fails
+with this patch, but only on its retry counter: it fences before the lookup, which the store read sees. The
+probe fences between lookup and snapshot and shows the old descriptor committing.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
 # not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
@@ -25,5 +27,17 @@ seeds = [1, 10000]
 
 [regression]
 kind = "lib-test"
-test = "oltp_runtime::direct::tests::o12_d11_rd1_a_fence_after_the_descriptor_lookup_restarts_the_mutation"
+test = "oltp_runtime::direct::tests::probe_rd1_a_fence_during_the_latch_wait_is_not_bypassed"
 mode = "on"
+probe = true
+failure_contains = ["the old descriptor must not commit under the new epoch"]
+
+[regression.evidence]
+digest = "3ac3f93325ea6bdcddafa6757d41687d0a9d9d67158acad340a6f83dde3e9fce"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45438486602", sha = "c33845aaa3e95f987af6151e8b7ba454f2cd72a1", result = "passed", note = "request p11-bugs-clean-rd1-c33845a-173325, probe_rd1_a_fence_during_the_latch_wait_is_not_bypassed, 5 of 5 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45438467565", sha = "7974f991d107a66a2390ef0e789ec6a4dc5c9c8d", result = "failed", note = "request p11-bugs-rd1b-7974f99-173320, probe_rd1_a_fence_during_the_latch_wait_is_not_bypassed, 3 of 3 attempts, on mode, over main c8426fe1", output = """
+assertion `left == right` failed: the old descriptor must not commit under the new epoch
+  left: Done(DirectData(RawValue(true)))
+ right: Fallback { reason: Schema }
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out; finished in 1.89s
+""" }

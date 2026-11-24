@@ -27,4 +27,13 @@ kind = "acceptance"
 scenario = "O13"
 mode = "on"
 timeout_s = 3600
-failure_contains = ["in transient_receipt_observation"]
+failure_contains = ["in transient_receipt_observation", "original accepted request requires reconciliation"]
+
+[regression.evidence]
+digest = "7791b2808ce173149d870bff23223de90e53e642ae1fa97dd7effda46ce14542"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, acceptance O13, direct_oltp on, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45436227045", sha = "1c20658ac8f05e74c983fe9800a16595719c4397", result = "failed", note = "request p11-bugs-acc3-receipt-1c20658-172150, acceptance O13, direct_oltp on, on mode, over main c8426fe1", output = """
+  File "/home/runner/work/nabedra-database/nabedra-database/server/tests/oltp_runtime_acceptance.py", line 1366, in transient_receipt_observation
+AssertionError: (503, {'request_id': '338e9d33-7f69-4b5e-9c87-b5d9c56d38c5', 'error': {'code': 'outcome_unknown', 'message': 'original accepted request requires reconciliation', 'outcome': 'unknown'}})
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 113.12s
+""" }

@@ -19,10 +19,21 @@ http.rs before d7b9d63c kept the direct gateway only with a declared length
 # not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
 workload = "queued"
 profile = ["lost-http-reply", "streamed-retry"]
-expect = ["OneExecutionPerIdentity"]
+expect = ["Liveness"]
 seeds = [1, 10000]
 
 [regression]
 kind = "lib-test"
 test = "oltp_runtime::worker_runtime::direct_gateway::tests::d03_q05_bug1_direct_retry_without_content_length_replays_original_result"
 mode = "on"
+failure_contains = ["request id already committed on the direct path; retry it to read the result"]
+
+[regression.evidence]
+digest = "84fe7bcf41edff390308a449f8a90dc1c9979d87a6dd9961f2b9fe9a189efff9"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, d03_q05_bug1_direct_retry_without_content_length_replays_original_result, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435480837", sha = "173c25b59224256bfa2a9682ca7251c43031016d", result = "failed", note = "request p11-bugs-bug1-stream-173c25b-171802, d03_q05_bug1_direct_retry_without_content_length_replays_original_result, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+assertion `left == right` failed
+  left: (503, Object {"error": Object {"code": String("outcome_unknown"), "message": String("request id already committed on the direct path; retry it to read the result"), "outcome": String("unknown")}, "request_id": String("73491c84-2ed3-42d3-82ee-cd032dab4187")})
+ right: (200, Object {"data": Null, "request_id": String("73491c84-2ed3-42d3-82ee-cd032dab4187")})
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 1.59s
+""" }

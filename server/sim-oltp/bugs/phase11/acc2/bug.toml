@@ -26,3 +26,13 @@ kind = "lib-test"
 test = "oltp_runtime::worker_runtime::index_backend::acceptance_tests::o12_failed_ready_validation_preserves_direct_schema"
 mode = "on"
 failure_contains = ["left the Data fence bound to its unpublished lifecycle"]
+
+[regression.evidence]
+digest = "81cad968257153b177b80ca6702c60bf2461673cb4e4695492c63c05294435ee"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o12_failed_ready_validation_preserves_direct_schema, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435509845", sha = "eb6ac17058ea0a556d2215f5f36866a30a4263cf", result = "failed", note = "request p11-bugs-acc2-eb6ac17-171811, o12_failed_ready_validation_preserves_direct_schema, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+assertion `left == right` failed: validation failed before Ready but left the Data fence bound to its unpublished lifecycle
+  left: Some(DirectSchema { epoch: 3, lifecycle: Some(86908dcb-c872-4aac-8f6c-6749894d5521) })
+ right: Some(DirectSchema { epoch: 2, lifecycle: Some(fd8a70fe-5994-e671-61d5-42fcd10194e0) })
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 1.03s
+""" }

@@ -13,7 +13,7 @@ port = "clean"
 port_notes = """
 `git diff 40e0c7f7 40e0c7f7^` on its two product files (store/direct.rs moved to nabedra-oltp-storage): the
 executor's schema cache key is (table, route epoch, group epoch) without the lifecycle, and DirectSchema
-loses its now unused Hash.
+loses its now unused Hash. The probe drives CatalogSchema directly; O28 is the recorded process regression.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
 # not a detection. ../simulator.toml says which faults, trigger and invariant, and what is missing.
@@ -28,3 +28,13 @@ test = "oltp_runtime::worker_runtime::index_backend::acceptance_tests::probe_top
 mode = "on"
 probe = true
 failure_contains = ["the child group used the parent's cached pre-index descriptor"]
+
+[regression.evidence]
+digest = "f79a31cf1342d3fccf7319e470acb34c2fe59503e90478c750aef9ef9888e071"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, probe_topo1_a_reused_direct_epoch_reads_the_new_lifecycle, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45436139781", sha = "594e8539671fc06bcc1b15087707fbb58836fb96", result = "failed", note = "request p11-bugs-topo1-child-schema-594e853-172123, probe_topo1_a_reused_direct_epoch_reads_the_new_lifecycle, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+assertion `left == right` failed: the child group used the parent's cached pre-index descriptor
+  left: (ddcf054c-1ce2-537b-9c05-1c31f01f77a9, 0)
+ right: (bcabb7b1-10b7-4acb-81f0-aef15a8c201d, 1)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out; finished in 1.55s
+""" }
