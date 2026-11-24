@@ -53,7 +53,8 @@
 //!   code (nabedra-kv's journal handoff) calls tokio's `blocking_recv`, which tokio
 //!   refuses on a runtime thread. The helper has the runtime handle entered and the
 //!   node context installed. The returned handle resolves at once, with a panic as a
-//!   `JoinError`.
+//!   `JoinError`. [`World::pause_storage`] and [`World::set_storage_pauses`] suspend a
+//!   job in the middle instead, at a filesystem call (`sim/suspend.rs`).
 //! - [`crate::task::spawn_service`] starts a helper OS thread with the requested name
 //!   (and stack size), the runtime handle entered and the node context installed, and
 //!   records it in the node's registry. A crash cannot abort an OS thread: it marks the
@@ -346,6 +347,7 @@ pub struct World {
     #[cfg(target_os = "linux")]
     blocking_cpu_nanos: AtomicU64,
     services: services::Registry,
+    faults: suspend::Faults,
     volumes: volumes::Table,
     hooks: Hooks,
 }
@@ -378,6 +380,7 @@ impl World {
             #[cfg(target_os = "linux")]
             blocking_cpu_nanos: AtomicU64::new(0),
             services: services::Registry::new(seed),
+            faults: suspend::Faults::new(seed),
             volumes: volumes::Table::default(),
             hooks: Hooks::default(),
         })
@@ -586,9 +589,10 @@ impl World {
 
     /// After cutting the network, halts every volume of the node (the disk cut: no
     /// later call changes an image), marks it down, marks its stepped services dead (a
-    /// dead service is never stepped again and joins at once), then aborts every
-    /// registered task. Destructors that run during the crash or the abort therefore find
-    /// halted volumes and no live service to wait for. Helper-thread services
+    /// dead service is never stepped again and joins at once), unwinds its suspended jobs
+    /// (`sim/suspend.rs`), then aborts every registered task. Destructors that run during
+    /// the crash or the abort therefore find halted volumes and no live service to wait
+    /// for. Helper-thread services
     /// (`spawn_service`) cannot be stopped; see the module documentation.
     fn cut_node(&self, node: u64, black_hole: bool) {
         net::crash(self, node, black_hole);
@@ -608,6 +612,7 @@ impl World {
         });
         let dead = self.services.kill_node(context);
         self.emit(&SimEvent::Crash { node });
+        self.faults.cancel(self, context);
         // Service destructors run here, after the services are dead and before any task
         // is aborted. They keep the retired context even when the harness initiated the cut.
         with_node_context(Some(context), || drop(dead));
@@ -826,6 +831,15 @@ pub enum SimEvent<'a> {
     Pause {
         by: Duration,
     },
+    /// A job stopped at a filesystem call ([`World::pause_storage`]).
+    StoragePaused {
+        node: u64,
+        call: &'a PausedCall,
+    },
+    /// A stopped job went on. A crash while it is stopped reports none.
+    StorageResumed {
+        node: u64,
+    },
     /// A call on a node's simulated volume, as its `FaultFs` logged it.
     Fs {
         node: u64,
@@ -860,10 +874,11 @@ impl<F: Future> Future for Gate<F> {
     type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
-        if let Some(world) = self.world.upgrade()
-            && world.park_if_frozen(self.node, cx.waker())
-        {
-            return Poll::Pending;
+        if let Some(world) = self.world.upgrade() {
+            world.faults.moved();
+            if world.park_if_frozen(self.node, cx.waker()) {
+                return Poll::Pending;
+            }
         }
         self.future.as_mut().poll(cx)
     }
@@ -1168,9 +1183,9 @@ where
     let Some(world) = world() else {
         return tokio::task::spawn_blocking(f);
     };
-    let outcome = run_blocking(world, f);
+    let run = run_blocking(world, f);
     spawn(async move {
-        match outcome {
+        match run.outcome().await {
             Ok(value) => value,
             Err(panic) => std::panic::resume_unwind(panic),
         }
@@ -1186,9 +1201,9 @@ where
         return handle.spawn_blocking(f);
     };
     world.assert_runtime(handle);
-    let outcome = run_blocking(world, f);
+    let run = run_blocking(world, f);
     spawn_on(handle, async move {
-        match outcome {
+        match run.outcome().await {
             Ok(value) => value,
             Err(panic) => std::panic::resume_unwind(panic),
         }
@@ -1211,22 +1226,25 @@ where
     }
 }
 
-/// Runs `work` on this thread's blocking helper and waits for it. Only one job runs at a
-/// time and the simulation thread does nothing meanwhile, so the outcome is deterministic.
+/// Runs `work` on this thread's blocking helper and waits until it ends or a pause
+/// suspends it. Only one job runs at a time and the simulation thread does nothing
+/// meanwhile, so the outcome is deterministic.
 fn run_blocking<R: Send + 'static>(
     world: Arc<World>,
     work: impl FnOnce() -> R + Send + 'static,
-) -> std::thread::Result<R> {
+) -> suspend::Run<R> {
     let context = current_node_context();
     let handle = tokio::runtime::Handle::try_current().ok();
-    let (reply, result) = std::sync::mpsc::sync_channel(1);
+    let (waiting, link) = suspend::Job::new(context);
+    let owner = world.clone();
+    owner.faults.moved();
     let job: Job = Box::new(move || {
         let _entered = handle.as_ref().map(tokio::runtime::Handle::enter);
         #[cfg(target_os = "linux")]
         let started = blocking_thread_cpu_nanos();
         let _installed = Installed::new(world.clone());
         ROLE.set(Role::Blocking(context));
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+        let finished = link.run(&world, work);
         ROLE.set(Role::Main);
         #[cfg(target_os = "linux")]
         if let Some((before, after)) = started.zip(blocking_thread_cpu_nanos()) {
@@ -1234,7 +1252,7 @@ fn run_blocking<R: Send + 'static>(
                 .blocking_cpu_nanos
                 .fetch_add(after.saturating_sub(before), Ordering::Relaxed);
         }
-        let _ = reply.send(outcome);
+        finished.report();
     });
     HELPER.with(|helper| {
         helper
@@ -1243,9 +1261,12 @@ fn run_blocking<R: Send + 'static>(
             .send(job)
             .expect("the simulation blocking helper is running")
     });
-    result
-        .recv()
-        .expect("the simulation blocking helper replies")
+    let run = waiting.started(&owner);
+    if matches!(run, suspend::Run::Suspended(_)) {
+        // The helper keeps the suspended job's stack, and stops after the job.
+        HELPER.take();
+    }
+    run
 }
 
 #[cfg(target_os = "linux")]
@@ -1317,8 +1338,10 @@ pub mod net;
 #[cfg(feature = "sim-openraft")]
 pub mod openraft10;
 pub(crate) mod services;
+pub(crate) mod suspend;
 pub mod volumes;
 
+pub use suspend::{PausedCall, Side, StoragePause};
 pub use volumes::{Cut, VolumeInfo, Wipe, volume_for};
 
 #[cfg(test)]
