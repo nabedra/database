@@ -1,4 +1,4 @@
-{"schema":"nabedra.catalog/1","count":2618,"tests":[
+{"schema":"nabedra.catalog/1","count":2621,"tests":[
 {"file":"orm/python/tests/events/test_client.py","hash":"202d453fc9458842","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_ack_uses_exact_offset_and_rejects_foreign_delivery_before_request","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"1c426c67dd348a60","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_claim_reuses_uuid_after_missing_response","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"b8d2b5c0d984c70e","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_error_metadata_and_duplicate_fields","lang":"python"},
@@ -1168,6 +1168,7 @@
 {"file":"server/src/cache/cluster/controller/tests.rs","hash":"612f949c02d74db6","id":"server/src/cache/cluster/controller/tests.rs::k03_replaces_a_retired_replica_before_resuming_same_zone_rebalance","lang":"rust"},
 {"file":"server/src/cache/cluster/controller/tests.rs","hash":"eac3865545e931ad","id":"server/src/cache/cluster/controller/tests.rs::k03_restart_rejects_retired_incarnation_and_scoped_reset_requires_fence","lang":"rust"},
 {"file":"server/src/cache/cluster/controller/tests.rs","hash":"7c86c2da7c80cff2","id":"server/src/cache/cluster/controller/tests.rs::k03_retired_source_does_not_hold_replica_move_capacity","lang":"rust"},
+{"file":"server/src/cache/cluster/controller/tests.rs","hash":"2f60c8f8b8d98fe1","id":"server/src/cache/cluster/controller/tests.rs::k03_staged_promotion_checks_fence_lag_and_copy_at_apply","lang":"rust"},
 {"file":"server/src/cache/cluster/controller/tests.rs","hash":"d856e55e2a436155","id":"server/src/cache/cluster/controller/tests.rs::k03_stalled_move_resumes_source_under_a_new_epoch_only_after_fence","lang":"rust"},
 {"file":"server/src/cache/cluster/controller/tests.rs","hash":"824743075b6ae7b8","id":"server/src/cache/cluster/controller/tests.rs::k03_u03_failover_fences_latest_committed_lease_and_requires_baseline","lang":"rust"},
 {"file":"server/src/cache/cluster/sim/clock_bound/tests.rs","hash":"40bcb444d9128497","id":"server/src/cache/cluster/sim/clock_bound/tests.rs::k03_clock_bound_checks_sync_width_and_rollback_in_the_real_clock","lang":"rust"},
@@ -1192,9 +1193,11 @@
 {"file":"server/src/cache/cluster/sim/mutants.rs","hash":"0d8c791cb0ae0b53","id":"server/src/cache/cluster/sim/mutants.rs::planted_replica_keeps_deleted_keys_scripted","lang":"rust"},
 {"file":"server/src/cache/cluster/sim/mutants.rs","hash":"346e0a55dfe646ad","id":"server/src/cache/cluster/sim/mutants.rs::planted_replica_keeps_deleted_keys_search","lang":"rust"},
 {"file":"server/src/cache/cluster/sim/mutants.rs","hash":"5d94b6750dbcb78d","id":"server/src/cache/cluster/sim/mutants.rs::planted_replica_keeps_synthesized_expiry_delete_scripted","lang":"rust"},
-{"file":"server/src/cache/cluster/sim/tests.rs","hash":"4096f2f86a31c417","id":"server/src/cache/cluster/sim/tests.rs::nightly_regressions","lang":"rust"},
+{"file":"server/src/cache/cluster/sim/mutants.rs","hash":"f7448355065f4dc7","id":"server/src/cache/cluster/sim/mutants.rs::planted_staged_promotion_before_fence_scripted_and_search","lang":"rust"},
+{"file":"server/src/cache/cluster/sim/mutants.rs","hash":"6d362fbda760c6c6","id":"server/src/cache/cluster/sim/mutants.rs::planted_staged_promotion_beyond_lag_scripted_and_search","lang":"rust"},
+{"file":"server/src/cache/cluster/sim/tests.rs","hash":"f45a3790ffa7594b","id":"server/src/cache/cluster/sim/tests.rs::nightly_regressions","lang":"rust"},
 {"file":"server/src/cache/cluster/sim/tests.rs","hash":"efa4cb7f7343eae8","id":"server/src/cache/cluster/sim/tests.rs::same_seed_same_trace","lang":"rust"},
-{"file":"server/src/cache/cluster/sim/tests.rs","hash":"2fc54622d7278d99","id":"server/src/cache/cluster/sim/tests.rs::seed_sweep","lang":"rust"},
+{"file":"server/src/cache/cluster/sim/tests.rs","hash":"52fffb3eecac3eb0","id":"server/src/cache/cluster/sim/tests.rs::seed_sweep","lang":"rust"},
 {"file":"server/src/cache/cluster/transport/tests.rs","hash":"2123edf71127ad50","id":"server/src/cache/cluster/transport/tests.rs::k03_peer_session_checks_fingerprints_and_crash_cuts_connection","lang":"rust"},
 {"file":"server/src/cache/cluster/worker/actor/tests.rs","hash":"ecb70d4f643dcef4","id":"server/src/cache/cluster/worker/actor/tests.rs::k02_k03_full_slot_can_pin_and_install_bounded_snapshot","lang":"rust"},
 {"file":"server/src/cache/cluster/worker/actor/tests.rs","hash":"a97448aa9a23ecca","id":"server/src/cache/cluster/worker/actor/tests.rs::k02_promoted_then_refilled_roles_stay_within_total_data_capacity","lang":"rust"},
