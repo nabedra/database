@@ -701,11 +701,15 @@ fn request_not_applied_cases() {
          1< ok 1";
     let both = verdict(broken, &NOT_APPLIED);
     assert_eq!(both.kinds(), ["non-linearizable", EFFECT]);
-    let same_key = broken.replace(" z ", " k ").replace("get z", "get k");
-    assert_eq!(
-        verdict(&same_key, &NOT_APPLIED).kinds(),
-        ["non-linearizable"]
-    );
+    let before = broken.replace(" z ", " k ").replace("get z", "get k");
+    assert_eq!(verdict(&before, &NOT_APPLIED).kinds(), ["non-linearizable"]);
+    let after = "0> insert k 1 r
+         0< info
+         2> insert k 1 r
+         2< refused overloaded
+         1> get k
+         1< ok 7";
+    assert_eq!(verdict(after, &NOT_APPLIED).kinds(), ["non-linearizable"]);
 }
 
 /// The default follows the plan's reading, also against the other one: the replay of a recorded
@@ -986,9 +990,10 @@ fn generated(seed: u64, operations: usize, reading: Reading) -> Vec<Event> {
                 let may_refuse = reading == Reading::Plan
                     || store.record(request).is_none()
                     || answered.contains(&(request.id.clone(), request.body()));
-                let refuse = request.f != "get" && may_refuse && below(3) == 0;
+                // A stopped attempt stops no others: a later attempt may have committed by now.
+                let refuse = request.f != "get" && !attempt.stopped && may_refuse && below(3) == 0;
                 attempt.reply = Some(if attempt.stopped || refuse {
-                    if reading == Reading::Identity {
+                    if reading == Reading::Identity && refuse {
                         late.retain(|other| !other.same(request));
                         for other in open.iter_mut().flatten() {
                             other.stopped |= other.reply.is_none() && other.request.same(request);
