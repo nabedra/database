@@ -1,9 +1,6 @@
 name: nabedra evidence
 
 on:
-  workflow_run:
-    workflows: [nabedra build]
-    types: [completed]
   workflow_dispatch:
     inputs:
       run_id:
@@ -15,15 +12,11 @@ permissions: {}
 
 jobs:
   ingest:
-    if: >-
-      github.repository == 'zPy52/nabedra-database' && github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event.workflow_run.head_repository.full_name == github.repository &&
-        contains(fromJSON('["workflow_dispatch", "schedule"]'), github.event.workflow_run.event)))
+    if: github.repository == 'zPy52/nabedra-database' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     concurrency:
-      group: nabedra-evidence-${{ inputs.run_id || github.event.workflow_run.id }}
+      group: nabedra-evidence-${{ inputs.run_id }}
       cancel-in-progress: false
     permissions:
       actions: read # Downloading even a public run's artifacts requires this scope.
@@ -31,7 +24,7 @@ jobs:
       pull-requests: write
       attestations: read
     env:
-      RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
+      RUN_ID: ${{ inputs.run_id }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:

@@ -2,15 +2,8 @@
 # How agents run it: .agents/skills/code-review/references/gh-actions.md. Where builds run:
 # .agents/skills/nabedra-builds/SKILL.md. Opt-in S3 checks use OIDC on dispatches.
 #
-# Nothing starts on push or commit. A run starts in one of three ways:
-# - A deliberate dispatch, pinned to a pushed commit:
-#     gh workflow run nabedra-build.yml --ref <branch> -f sha=<40-char sha> -f request_id=<id> [-f jobs=direct ...]
-#   Job definitions come from the --ref branch head; the code under test is `sha`. Every dispatch has its own
-#   concurrency group, so no push, commit or other dispatch can cancel it.
-# - The scheduled nightly (nabedra-nightly.yml), which resolves `main` to its SHA when it starts and dispatches
-#   this workflow pinned to that SHA, with the same uncancellable concurrency group as any dispatch.
-# - The pull-request merge gate (baseline jobs selected by changed paths on the merge commit). Only a newer
-#   head of the same pull request cancels a gate run. `[skip ci]` in the head commit skips it for docs-only PRs.
+# Manually dispatch a run pinned to a pushed commit.
+# Job definitions come from the selected ref. The sha input selects the code under test.
 #
 # Opt-in jobs (`-f jobs=a,b`; unknown names fail the run). Selecting a job may imply others; the
 # `revision` job resolves the list and writes it to the run summary:
@@ -28,7 +21,7 @@
 #   engine-tests, check-tests  Cache, OLAP and nabedra-check tests, also in the base jobs
 #   clippy      the phase 7 runtime seam bans (server/clippy.toml) for every product feature set, also a base job
 #   features    engine feature checks and the OLTP S3 loopback fixture, also a base job
-#   quarantine  non-blocking test and scenario reruns, scheduled nightly
+#   quarantine  non-blocking test and scenario reruns, available by manual dispatch
 #   fuzz, mutants  libFuzzer targets or mutation tests on the diff from main's merge base
 #
 # Builds. The `build` job compiles the debug OLTP server and every OLTP test executable once and shares them as
@@ -48,10 +41,6 @@ name: nabedra build
 run-name: ${{ github.event_name == 'workflow_dispatch' && format('{0} @ {1}', inputs.request_id, inputs.sha) || github.event.pull_request.title }}
 
 on:
-  pull_request:
-    branches:
-      - main
-    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       sha:

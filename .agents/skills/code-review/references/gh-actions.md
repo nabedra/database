@@ -19,41 +19,16 @@ that matter are elsewhere:
 
 ## What starts a run
 
-- **Deliberate dispatch.** Use a dispatch for a pinned commit. Each dispatch has its own
-  concurrency group and continues across branch updates and other dispatches.
-- **Nightly schedule.** At 01:17 UTC, `nabedra-nightly.yml` resolves `main` to a commit and
-  dispatches its T2 checks, the feature matrix and S3 loopback fixture, quarantine, and a one-hour
-  fuzz run per target. You can also start the nightly workflow manually.
-- **Pull-request gate.** Opening, updating, reopening, or marking a PR to `main` ready for review
-  runs the gate on its merge commit. A newer gate run for the same PR cancels the older one.
-  Docs-only PRs put `[skip ci]` in the head commit and skip the gate.
+Start Actions workflows manually. Use `nabedra-build.yml` for development checks and
+for broad verification on the resulting `main` SHA after a batch of PRs merges.
+Each dispatch is pinned to a commit and has its own concurrency group.
 
-## Automatic PR jobs
+Start `nabedra-nightly.yml` manually to dispatch the T2, fuzz, feature, and
+quarantine preset on `main`. Start `nabedra-evidence.yml` manually with the completed
+build run ID to ingest evidence.
 
-The gate always validates the tested revision, lints the PR body, and shows the checks selected
-for the diff. Body lint and the registered check report are non-blocking. The revision job
-also reports which baseline suites will run, using the changed paths on the tested merge commit.
-
-| Changed area | Automatic baseline jobs |
-| --- | --- |
-| Events-only paths | Events tests |
-| Cache-only paths | Cache library tests and runtime-seam Clippy |
-| OLAP-only paths | Both OLAP shards and runtime-seam Clippy |
-| OLTP runtime and acceptance paths | OLTP debug build, library and integration tests, and runtime-seam Clippy |
-| KV source | KV, OLTP, and Events tests, plus runtime-seam Clippy |
-| Shared checker | Shared Rust crate tests and all engine suites, plus runtime-seam Clippy |
-| Simulation-only paths | Dispatch the relevant registered simulation checks for T1 evidence |
-| Shared build inputs, shared server paths, or unclassified paths | Full baseline, including engine feature checks and the OLTP S3 loopback fixture |
-
-[The baseline selector](../../../../scripts/testing/ci/plan_pr_jobs.py) combines the suites for
-every changed path. Cargo manifests and lockfiles, Cargo configuration, and build scripts
-select the full baseline. The S3 client path also selects the feature job. Run registered T1
-checks from the diff report on the final SHA. Use `base=false` when dispatching just those checks
-or specific scenarios and tests. Use a full dispatch when the change calls for full baseline
-evidence on the exact head.
-
-Quarantine runs nightly and on demand with `base=false,jobs=quarantine`. The nightly also
-runs the full feature checks, available on demand with `base=false,jobs=features`.
+Use `python3 scripts/testing/matrix.py select --base <sha> --head <sha>` for the diff
+report. Dispatch relevant checks with `base=false` for focused feedback.
 
 ## Rules when many agents share Actions
 
@@ -211,7 +186,7 @@ and quarantined items in their own lines. If a job went green on a rerun, record
 ## Quarantine
 
 `.github/quarantine.tsv` lists known-flaky and known-failing tests and scenarios. Blocking jobs skip
-them. The nightly and on-demand `quarantine` job is non-blocking and reports the counts
+them. The manually dispatched `quarantine` job is non-blocking and reports the counts
 from 5 runs per test and both modes per scenario. Each row has `id` (a full test path or a scenario ID), `kind`, `owner`, `added`,
 `expires` and `exit_criteria`. `python3 scripts/ci_quarantine.py check` validates the file.
 
