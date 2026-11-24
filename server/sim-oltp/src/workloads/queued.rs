@@ -70,6 +70,8 @@ const DELETED_BASE: i64 = 1_000;
 const DELETED: i64 = 3;
 /// How often a client retries a refusal that says the request was not applied.
 const REFUSALS: u32 = 6;
+/// How many violations of one rule a run lists.
+const REPORTED: usize = 3;
 const SPLIT_LIMIT: Duration = Duration::from_secs(60);
 const SCOPED_LIMIT: Duration = Duration::from_secs(30);
 
@@ -1501,8 +1503,22 @@ fn finish(q: &Q, cluster: &Cluster, chaos: Option<&Chaos>, report: &mut direct::
     // Each wall jump moves a clock by at most 2 s; drift adds well under a second.
     shared.log.clock_slack_ms = 2_000 * (jumps + 1) + 1_000;
     let outcome = shared.log.judge();
-    for (rule, detail) in &outcome.violations {
-        cluster.checks.violate(&cluster.world, rule, detail.clone());
+    // The violation list of a run is bounded. A rule that fires often must not crowd the others
+    // out of it, so each rule reports its first few and how many there were.
+    for rule in RULES {
+        let found: Vec<&String> = outcome
+            .violations
+            .iter()
+            .filter(|(kind, _)| *kind == rule)
+            .map(|(_, detail)| detail)
+            .collect();
+        for detail in found.iter().take(REPORTED) {
+            cluster.checks.violate(
+                &cluster.world,
+                rule,
+                format!("{detail} (one of {})", found.len()),
+            );
+        }
     }
     for rule in RULES {
         if outcome.judged.contains_key(rule) {
