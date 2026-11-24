@@ -1,0 +1,14 @@
+id = "SIM-CACHE-PARTITION-STALL"
+title = "The Cache simulation planner turns a partition into a permanent connection stall"
+class = "other"
+module = "sim"
+guarantees = ["CACHE-G05", "CACHE-G06"]
+scenarios = ["K03"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "specs/sim/mutants/SimNet_prefix_cache_partition_stall.cfg"
+seed = "unknown"
+why_not_caught = "The OLTP router maps a planned drop on a held link to Pass; the Cache planner was written separately and maps every drop to Fate::Drop. No test delivers a message sent during a Cache partition after the heal."
+invariant_added = "HeldNotLost: a partition delays messages on a live connection and never loses them (specs/sim/SimNet.tla)."
+fix_commits = []
+revert_patch_ok = false
