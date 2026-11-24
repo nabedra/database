@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "land-fix-runner-bc2f61d-001450--crate-graph.log",
+      "sha256": "e99105ab257437950e02ff9b4404a9f60ca2cc68ec2a67b830dc6a862c93498b"
+    }
+  ],
+  "assertions": {
+    "executed": 20,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "skipped",
+        "reason": "1 tests skipped"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "crate-graph",
+  "duration_s": 22.537,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T00:20:55.082014+00:00",
+    "request_id": "land-fix-runner-bc2f61d-001450",
+    "runner": "GitHub Actions 1000008845",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45295576329"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "bc2f61de10342994e6e546c587458668865a2eef",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

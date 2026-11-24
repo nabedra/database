@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "land-fix-runner-bc2f61d-001450--rt-zero-cost.log",
+      "sha256": "3bb8be187423605c98bc5c751db85db1bd76fd66cfe0af10ea694bcac5114158"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "rt-zero-cost",
+  "duration_s": 1149.531,
+  "guarantees": [
+    "OLTP-G13"
+  ],
+  "kind": "P",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T00:23:32.030190+00:00",
+    "request_id": "land-fix-runner-bc2f61d-001450",
+    "runner": "GitHub Actions 1000008864",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45295576329"
+  },
+  "scenarios": [
+    "O09"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "bc2f61de10342994e6e546c587458668865a2eef",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

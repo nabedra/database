@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "land-fix-runner-bc2f61d-001450--oltp-peer-transport-preflight.log",
+      "sha256": "f9198da0f40b88912659bce4baea0fd6a165729f6cf757877e0a12ce1624a809"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-peer-transport-preflight",
+  "duration_s": 159.423,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T00:16:46.479580+00:00",
+    "request_id": "land-fix-runner-bc2f61d-001450",
+    "runner": "GitHub Actions 1000008817",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45295576329"
+  },
+  "scenarios": [
+    "C07",
+    "M02",
+    "O06"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "bc2f61de10342994e6e546c587458668865a2eef",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
