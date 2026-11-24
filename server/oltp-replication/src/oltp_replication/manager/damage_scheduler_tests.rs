@@ -852,6 +852,55 @@ impl Cluster {
     }
 }
 
+/// Scratch probe for CAP1 (never shipped): on hosted workers whose sessions negotiate
+/// `nabedra-otp/4`, a Data leader proposes no `ReclaimIndex` while Control has not enabled
+/// `data.index.reclaim`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_cap1_no_reclamation_before_the_cluster_feature() {
+    use crate::oltp::mvcc::store::{ParticipantCommand, index_reclaim::ReclaimIndex};
+    use crate::oltp_replication::{authority::consensus::Consensus as _, owned::OwnedCommand};
+    timeout(Duration::from_secs(120), async {
+        let cluster = Cluster::new(1, &[]).await;
+        let leader = cluster.data_leader().await;
+        let host = cluster.data_host(leader).unwrap();
+        let mut refused = false;
+        for _ in 0..200 {
+            let command = OwnedCommand::new_owned(
+                ParticipantCommand::ReclaimIndex(ReclaimIndex {
+                    authority: cluster.authority(cluster.term),
+                    catalog_group_id: nabedra_rt::ids::uuid_v4(),
+                    table_id: nabedra_rt::ids::uuid_v4(),
+                    index_id: nabedra_rt::ids::uuid_v4(),
+                    retired_at: crate::oltp_replication::types::CommitTs::new(1).unwrap(),
+                    safe_ts: crate::oltp_replication::types::CommitTs::new(2).unwrap(),
+                    routing_version: None,
+                }),
+                &cluster.workers[leader].shared,
+                crate::oltp::pool::ByteClass::Progress,
+            )
+            .unwrap();
+            match host.propose(command).await {
+                Ok(applied) => panic!(
+                    "a ReclaimIndex entry committed at {:?} before Control enabled data.index.reclaim",
+                    applied.position
+                ),
+                Err(error) if error.message.contains("data.index.reclaim is not enabled") => {
+                    assert_eq!(error.outcome, crate::protocol::Outcome::NotApplied);
+                    refused = true;
+                    break;
+                }
+                // Not leading, or a peer session is not up yet.
+                Err(_) => nabedra_rt::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        assert!(refused, "the cluster feature refused the entry");
+        drop(host);
+        cluster.shutdown().await;
+    })
+    .await
+    .expect("probe watchdog");
+}
+
 fn invalid() -> ProtocolError {
     ProtocolError::new(ErrorCode::ValidationError, "invalid", Outcome::NotApplied)
 }
