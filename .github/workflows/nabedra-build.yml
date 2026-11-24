@@ -9,7 +9,7 @@
 #   concurrency group, so no push, commit or other dispatch can cancel it.
 # - The scheduled nightly (nabedra-nightly.yml), which resolves `main` to its SHA when it starts and dispatches
 #   this workflow pinned to that SHA, with the same uncancellable concurrency group as any dispatch.
-# - The pull-request merge gate (base jobs and the non-blocking quarantine job on the merge commit). Only a newer
+# - The pull-request merge gate (baseline jobs selected by changed paths on the merge commit). Only a newer
 #   head of the same pull request cancels a gate run. `[skip ci]` in the head commit skips it for docs-only PRs.
 #
 # Opt-in jobs (`-f jobs=a,b`; unknown names fail the run). Selecting a job may imply others; the
@@ -27,6 +27,8 @@
 #   campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1  long, image and measurement jobs
 #   engine-tests, check-tests  Cache, OLAP and nabedra-check tests, also in the base jobs
 #   clippy      the phase 7 runtime seam bans (server/clippy.toml) for every product feature set, also a base job
+#   features    engine feature checks and the OLTP S3 loopback fixture, also a base job
+#   quarantine  non-blocking test and scenario reruns, scheduled nightly
 #   fuzz, mutants  libFuzzer targets or mutation tests on the diff from main's merge base
 #
 # Builds. The `build` job compiles the debug OLTP server and every OLTP test executable once and shares them as
@@ -61,11 +63,11 @@ on:
         required: true
         type: string
       base:
-        description: Base jobs (kv, features, clippy, Cache, OLAP, nabedra-check, OLTP, Events, quarantine)
+        description: Base jobs (kv, features, clippy, Cache, OLAP, nabedra-check, OLTP, Events)
         type: boolean
         default: true
       jobs:
-        description: "Comma-separated opt-in jobs: direct, acceptance, o02, growth, rep1, rep4-mixed, o22, blackhole, migrate, live3, live3-fixture, campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1, engine-tests, check-tests, clippy, fuzz, mutants"
+        description: "Comma-separated opt-in jobs: direct, acceptance, o02, growth, rep1, rep4-mixed, o22, blackhole, migrate, live3, live3-fixture, campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1, engine-tests, check-tests, features, clippy, quarantine, fuzz, mutants"
         type: string
         default: ""
       checks:
@@ -127,6 +129,9 @@ jobs:
     timeout-minutes: 10
     outputs:
       build: ${{ steps.plan.outputs.build }}
+      build_lib_only: ${{ steps.plan.outputs.build_lib_only }}
+      pr_jobs: ${{ steps.plan.outputs.pr_jobs }}
+      engine_suites: ${{ steps.plan.outputs.engine_suites }}
       # The resolved opt-in jobs, comma-delimited on both sides (",direct,rep1,"), for contains().
       jobs: ${{ steps.plan.outputs.jobs }}
       modes: ${{ steps.plan.outputs.modes }}
@@ -140,13 +145,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.TESTED_SHA }}
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
       - name: Check the inputs and plan the run
         id: plan
         env:
           EVENT: ${{ github.event_name }}
           SHA_INPUT: ${{ inputs.sha }}
           REQUEST_ID: ${{ inputs.request_id }}
-          BASE: ${{ github.event_name == 'pull_request' || inputs.base }}
+          BASE: ${{ inputs.base || false }}
           JOBS: ${{ inputs.jobs }}
           SCENARIOS: ${{ inputs.scenarios }}
           TESTS: ${{ inputs.tests }}
@@ -165,7 +171,7 @@ jobs:
             [[ "$REPEAT" =~ ^[0-9]+$ ]] && [ "$REPEAT" -ge 1 ] && [ "$REPEAT" -le 200 ] || fail "repeat must be 1-200"
             [[ "$FUZZ_SECONDS" =~ ^[0-9]+$ ]] && [ "$FUZZ_SECONDS" -ge 1 ] || fail "fuzz_seconds must be a positive integer"
           fi
-          known=",direct,acceptance,o02,growth,rep1,rep4-mixed,o22,blackhole,migrate,live3,live3-fixture,campaign,docker,memory,bench,perf,g7,gc1,perf1,snap1,engine-tests,check-tests,clippy,fuzz,mutants,"
+          known=",direct,acceptance,o02,growth,rep1,rep4-mixed,o22,blackhole,migrate,live3,live3-fixture,campaign,docker,memory,bench,perf,g7,gc1,perf1,snap1,engine-tests,check-tests,features,clippy,quarantine,fuzz,mutants,"
           selected=","
           add() { [[ "$selected" == *",$1,"* ]] || selected+="$1,"; }
           has() { [[ "$selected" == *",$1,"* ]]; }
@@ -205,12 +211,35 @@ jobs:
           fi
           has_growth=false; [ "${#growth[@]}" -gt 0 ] && has_growth=true
           [ "${#growth[@]}" -gt 0 ] || growth=('{"scenario":"none","modes":"on","label":"on","opt1":false,"timeout":600}')
+          pr_jobs=","
+          if [ "$EVENT" = pull_request ]; then
+            pr_jobs=$(python3 scripts/testing/ci/plan_pr_jobs.py)
+          fi
+          pr_has() { [[ "$pr_jobs" == *",$1,"* ]]; }
           build=false
-          for job in direct acceptance o02 growth rep1 rep4-mixed blackhole live3-fixture; do has "$job" && build=true; done
-          if [ "$BASE" = true ] || [ "$has_scenarios" = true ] || [ -n "$TESTS" ]; then build=true; fi
+          for job in direct acceptance o02 growth rep1 rep4-mixed blackhole live3-fixture quarantine; do
+            has "$job" && build=true
+          done
+          if [ "$BASE" = true ] || pr_has oltp || [ "$has_scenarios" = true ]; then build=true; fi
+          build_lib_only=false
+          if [ "$build" = false ] && [ -n "$TESTS" ]; then
+            build_lib_only=true
+            build=true
+          fi
+          engine_suites=()
+          if [ "$BASE" = true ] || has engine-tests || pr_has cache; then
+            engine_suites+=('{"suite":"Cache library","engine":"cache","shard":1}')
+          fi
+          if [ "$BASE" = true ] || has engine-tests || pr_has olap; then
+            engine_suites+=('{"suite":"OLAP shard 1 of 2","engine":"olap","shard":1}')
+            engine_suites+=('{"suite":"OLAP shard 2 of 2","engine":"olap","shard":2}')
+          fi
           quoted=$(printf '"%s",' "${modes[@]}")
           {
             echo "build=$build"
+            echo "build_lib_only=$build_lib_only"
+            echo "pr_jobs=$pr_jobs"
+            echo "engine_suites=[$(IFS=,; echo "${engine_suites[*]}")]"
             echo "jobs=$selected"
             echo "modes=[${quoted%,}]"
             echo "scenarios={\"include\":[$(IFS=,; echo "${include[*]}")]}"
@@ -228,7 +257,11 @@ jobs:
             echo "| Event | $EVENT |"
             echo "| Request | ${REQUEST_ID:-pull request} |"
             echo "| Workflow | \`$WORKFLOW_REF\` at \`$WORKFLOW_SHA\` |"
-            echo "| Base jobs | $BASE |"
+            echo "| Base jobs (dispatch) | $BASE |"
+            if [ "$EVENT" = pull_request ]; then
+              pr_selected=${pr_jobs#,}; pr_selected=${pr_selected%,}
+              echo "| Automatic PR suites | ${pr_selected:-none} |"
+            fi
             echo "| Opt-in jobs | ${JOBS:-none} (resolved: ${resolved:-none}) |"
             echo "| Scenarios | ${shown:-none} (modes ${MODES}) |"
             echo "| Tests | ${TESTS:-none} (x${REPEAT:-1}) |"
@@ -550,9 +583,13 @@ jobs:
         run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
       - name: Build
         working-directory: server
+        env:
+          LIB_ONLY: ${{ needs.revision.outputs.build_lib_only }}
         run: |
           set -o pipefail
-          cargo test --locked --no-default-features --features oltp --lib --tests --no-run --timings \
+          targets=(--lib)
+          if [ "$LIB_ONLY" != true ]; then targets+=(--tests); fi
+          cargo test --locked --no-default-features --features oltp "${targets[@]}" --no-run --timings \
             --message-format=json-render-diagnostics > ../build.json
           cargo test --locked -p nabedra-resources -p nabedra-transport -p nabedra-oltp-storage -p nabedra-oltp-replication --lib --no-run \
             --message-format=json-render-diagnostics >> ../build.json
@@ -625,7 +662,7 @@ jobs:
   kv:
     name: nabedra-kv
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',g7,')
+    if: inputs.base || contains(needs.revision.outputs.pr_jobs, ',kv,') || contains(needs.revision.outputs.jobs, ',g7,')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -712,7 +749,7 @@ jobs:
   clippy:
     name: clippy runtime seam bans (phase 7)
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',clippy,')
+    if: inputs.base || contains(needs.revision.outputs.pr_jobs, ',clippy,') || contains(needs.revision.outputs.jobs, ',clippy,')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -774,7 +811,7 @@ jobs:
   features:
     name: feature builds (O02, NS26)
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',o02,')
+    if: inputs.base || contains(needs.revision.outputs.pr_jobs, ',features,') || contains(needs.revision.outputs.jobs, ',o02,') || contains(needs.revision.outputs.jobs, ',features,')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -870,22 +907,13 @@ jobs:
   engine-tests:
     name: ${{ matrix.suite }} tests
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',engine-tests,')
+    if: needs.revision.outputs.engine_suites != '' && needs.revision.outputs.engine_suites != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - suite: Cache library
-            engine: cache
-            shard: 1
-          - suite: OLAP shard 1 of 2
-            engine: olap
-            shard: 1
-          - suite: OLAP shard 2 of 2
-            engine: olap
-            shard: 2
+        include: ${{ fromJSON(needs.revision.outputs.engine_suites) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -966,7 +994,7 @@ jobs:
   check-tests:
     name: Shared Rust crate tests
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',check-tests,')
+    if: inputs.base || contains(needs.revision.outputs.pr_jobs, ',check-tests,') || contains(needs.revision.outputs.jobs, ',check-tests,')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -1002,7 +1030,7 @@ jobs:
   oltp:
     name: OLTP library and integration tests
     needs: [revision, build]
-    if: github.event_name == 'pull_request' || inputs.base
+    if: inputs.base || contains(needs.revision.outputs.pr_jobs, ',oltp,')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -1074,7 +1102,7 @@ jobs:
   events:
     name: Events tests
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base
+    if: inputs.base || contains(needs.revision.outputs.pr_jobs, ',events,')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -2098,7 +2126,7 @@ jobs:
   quarantine:
     name: quarantined tests and scenarios (non-blocking)
     needs: [revision, build]
-    if: github.event_name == 'pull_request' || inputs.base
+    if: contains(needs.revision.outputs.jobs, ',quarantine,')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     continue-on-error: true

@@ -59,4 +59,4 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           gh workflow run nabedra-build.yml --repo "$GITHUB_REPOSITORY" --ref main \
             -f sha="$sha" -f request_id="$request_id" -f base=false \
-            -f checks="$checks" -f jobs=fuzz -f fuzz_seconds=3600 | tee -a "$GITHUB_STEP_SUMMARY"
+            -f checks="$checks" -f jobs=fuzz,features,quarantine -f fuzz_seconds=3600 | tee -a "$GITHUB_STEP_SUMMARY"
