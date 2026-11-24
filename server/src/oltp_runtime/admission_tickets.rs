@@ -9,6 +9,7 @@ use crate::{
             control::ControlHandle,
             status::{MutationOutcome, RejectedIdentity},
         },
+        queue_access::NeverAcceptedAdmission,
         service_rpc::{AdmissionTicketIssuer, OwnerAdmissionTicket},
         types::*,
     },
@@ -111,10 +112,13 @@ impl AdmissionTickets {
 impl AdmissionTicketIssuer for AdmissionTickets {
     fn issue<'a>(
         &'a self,
-        cap: &'a VerifiedNeverAccepted,
+        cap: &'a dyn NeverAcceptedAdmission,
         status: &'a GroupIdentity,
     ) -> ConsensusFuture<'a, OwnerAdmissionTicket> {
         Box::pin(async move {
+            let cap = (cap as &dyn std::any::Any)
+                .downcast_ref::<VerifiedNeverAccepted>()
+                .ok_or_else(invalid)?;
             let current = self.control.current(&self.scope).await?;
             if cap.scope() != &self.scope
                 || current.owner != self.local

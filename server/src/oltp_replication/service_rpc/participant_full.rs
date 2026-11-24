@@ -24,8 +24,6 @@ use crate::oltp_replication::{
     },
     owned::{OwnedCommand, OwnedPayload},
 };
-use crate::oltp_runtime::{coordinator::QueueCoordinator, replica::WorkerReplica};
-use std::sync::Mutex;
 use uuid::Uuid;
 
 #[path = "participant_full_timestamp_point.rs"]
@@ -343,13 +341,9 @@ impl ParticipantEndpoint {
         if !matches!(session.group().kind, GroupKind::Data { .. }) {
             return Err(invalid());
         }
-        let replica = shared.read_replica::<Mutex<WorkerReplica>>()?;
-        let context = replica
-            .lock()
-            .map_err(|_| unavailable())?
-            .scan_context(scope, session.remote(), session.local())
-            .map_err(crate::request_queue::QueueError::protocol)?;
-        let parsed: crate::oltp_runtime::replica::AcceptedContext =
+        let replica = read_attempt::read_replica(shared)?;
+        let context = replica.scan_context(scope, session.remote(), session.local())?;
+        let parsed: nabedra_oltp_types::queue::AcceptedContext =
             serde_json::from_slice(context.as_slice()).map_err(|_| invalid())?;
         if serialized_digest(&parsed)? != scope.request.accepted_context
             || parsed
@@ -558,7 +552,7 @@ impl ParticipantEndpoint {
                     ..
                 }) = command
                 {
-                    let scope = crate::oltp_runtime::replica::QueueScope {
+                    let scope = nabedra_oltp_types::queue::QueueScope {
                         cluster_id: session.group().cluster_id,
                         database: session.group().database.clone(),
                     };
@@ -687,7 +681,7 @@ impl Endpoint for ParticipantEndpoint {
                 // cancel a native job or release its ticket.
                 return nabedra_rt::task::spawn(async move {
                     let result = async {
-                        let queue_scope = crate::oltp_runtime::replica::QueueScope {
+                        let queue_scope = nabedra_oltp_types::queue::QueueScope {
                             cluster_id: session.group().cluster_id,
                             database: session.group().database.clone(),
                         };
@@ -698,7 +692,7 @@ impl Endpoint for ParticipantEndpoint {
                             return Err(unavailable());
                         }
                         Self::read_scope(&shared, &session, scope)?;
-                        if !shared.read_replica::<Mutex<WorkerReplica>>()?.lock().map_err(|_| unavailable())?.knows_read_grant(grant) {
+                        if !read_attempt::read_replica(&shared)?.knows_read_grant(grant)? {
                             return Err(invalid());
                         }
                         #[cfg(test)]
@@ -1515,8 +1509,8 @@ impl RemoteParticipant for ParticipantClient {
                     }
                 })
                 .await?;
-            let replica = client.shared.read_replica::<Mutex<WorkerReplica>>()?;
-            let queue = client.shared.read_queue::<QueueCoordinator>()?;
+            let replica = read_attempt::read_replica(&client.shared)?;
+            let queue = read_attempt::read_queue(&client.shared)?;
             #[cfg(test)]
             let continuation = continuation_fixture::checkpoint(scope, client, &payload, digest).await;
             if continuing {
@@ -1535,10 +1529,7 @@ impl RemoteParticipant for ParticipantClient {
                     .iter()
                     .filter(|m| (m.node_id == preferred) == prefer)
                 {
-                    let worker = replica
-                        .lock()
-                        .map_err(|_| unavailable())?
-                        .read_member(scope.authority, member.worker_id);
+                    let worker = replica.read_member(scope.authority, member.worker_id)?;
                     let Some(worker) = worker else { continue };
                     #[cfg(test)]
                     if !read_attempt::fixture::target(scope, client.group.group_id, worker) {
@@ -1578,7 +1569,7 @@ impl RemoteParticipant for ParticipantClient {
                         queue.clone(),
                         ReadGrant {
                             scope,
-                            owner: replica.lock().map_err(|_| unavailable())?.local_identity(),
+                            owner: replica.local_identity()?,
                             worker,
                             group: client.group.group_id,
                             node: member.node_id,

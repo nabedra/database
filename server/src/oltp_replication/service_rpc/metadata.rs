@@ -10,8 +10,8 @@ use crate::oltp_replication::authority::{
     },
 };
 mod admission;
-mod status_service;
-mod timestamp_service;
+pub(crate) mod status_service;
+pub(crate) mod timestamp_service;
 pub(crate) use admission::{
     AdmissionTicketIssuer, OwnerAdmissionObservation, OwnerAdmissionReader, OwnerAdmissionTicket,
 };

@@ -1,6 +1,6 @@
+use nabedra_resources::config::WorkerResources;
 use super::*;
 use crate::{
-    config::WorkerResources,
     oltp::pool::{OltpPool, PoolIdentity, SharedResourceConfig, WorkerSharedResources},
     oltp_replication::authority::consensus::{ConsensusFuture, ReadBarrier},
 };

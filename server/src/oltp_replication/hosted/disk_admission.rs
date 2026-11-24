@@ -28,9 +28,9 @@ pub(super) async fn client_write(
         return raft.client_write(command).await.map_err(client_write_error);
     };
     let encoded_bytes = encoded_length(payload, usize::MAX)?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     if is_leader(raft) {
-        crate::oltp_runtime::recovery_tests::transaction_checkpoint(
+        crate::oltp::test_hooks::transaction_checkpoint(
             "storage-admission",
             request,
             &store.identity().group_id,
@@ -49,9 +49,9 @@ pub(super) async fn client_write(
                 proposal_forwarded()
             }
         })?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     if is_leader(raft) {
-        crate::oltp_runtime::recovery_tests::transaction_checkpoint(
+        crate::oltp::test_hooks::transaction_checkpoint(
             "storage-reserved",
             request,
             &store.identity().group_id,

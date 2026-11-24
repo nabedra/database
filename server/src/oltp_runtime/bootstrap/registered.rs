@@ -153,6 +153,7 @@ impl LocalServices {
                 Arc::new(crate::oltp_replication::manager::system_recovery::QuorumEndpoint {
                     manager: manager.clone(),
                     control: control.clone(),
+                    probe_queue_peer: super::super::worker_endpoint::probe_queue_peer,
                 }),
             )?;
             let control_endpoint = ControlEndpoint::new(control.clone(), shared.clone())?;
@@ -610,8 +611,7 @@ impl LocalServices {
             if let Some(limits) = scoped_limits {
                 replica.install_scoped_queues(limits).map_err(QueueError::protocol)?;
             }
-            let replica = Arc::new(Mutex::new(replica));
-            shared.bind_read_replica(&replica)?;
+            let replica = replica.bind_for_reads(&shared)?;
             let issuer = super::super::admission_tickets::AdmissionTickets::new(
                 shared.clone(),
                 local,
@@ -703,7 +703,7 @@ impl LocalServices {
             if bootstrap {
                 let proof = {
                     let replica = replica.lock().map_err(|_| unavailable())?;
-                    VerifiedQueueCopy::from_empty_worker(ticket, &replica)?
+                    VerifiedQueueCopy::from_empty_worker(ticket, &*replica)?
                 };
                 accepted(control.publish_ready(nabedra_rt::ids::uuid_v4(), proof).await?.reply)?;
                 let current = startup_read(deadline, &error_trace, "queue authority", || control.current(&scope)).await?;
@@ -734,7 +734,7 @@ impl LocalServices {
                     .map_err(QueueError::protocol)?;
             }
             let queue = QueueCoordinator::new(replica.clone(), control.clone(), peer.clone());
-            shared.bind_read_queue(&queue)?;
+            queue.bind_for_reads(&shared)?;
             eprintln!("nabedra-db: registered {} queue active", local.worker_id);
             let membership = spawn_membership(
                 control.clone(),

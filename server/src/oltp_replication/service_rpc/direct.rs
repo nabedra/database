@@ -325,7 +325,7 @@ pub(super) async fn authorize(
     if header.action != ServiceAction::ApiIngress {
         return super::authorize(control, session, header).await;
     }
-    let scope = crate::oltp_runtime::replica::QueueScope {
+    let scope = nabedra_oltp_types::queue::QueueScope {
         cluster_id: session.group().cluster_id,
         database: session.group().database.clone(),
     };

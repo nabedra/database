@@ -36,82 +36,11 @@ const STORE_BYTES: usize = 1024;
 // Covers the shared registration and its ordered-map entry.
 const INSERT_REGISTRATION_BYTES: usize = 256;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum CopyPhase {
-    Payload,
-    Marker,
-    Terminal,
-}
+pub(crate) use nabedra_oltp_types::queue::{
+    CopyPhase, ScopedCopyStamp, ScopedInventoryEntry, placement_digest,
+};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ScopedCopyStamp {
-    placement: Digest,
-    reservation: Digest,
-    request: RequestBinding,
-    payload: RecordVersion,
-    copied: RecordVersion,
-    phase: CopyPhase,
-}
-
-impl ScopedCopyStamp {
-    fn for_payload(
-        current: &ScopedQueuePlacement,
-        reservation: IdentityReservation,
-        request: RequestBinding,
-        version: RecordVersion,
-    ) -> Result<Self, QueueError> {
-        if request.run_id != current.view.run_id
-            || !reservation.binds(request)
-            || request.request_id.is_nil()
-            || version.request_id != request.request_id
-            || version.version == 0
-            || version.version == u64::MAX
-        {
-            return Err(QueueError::Invalid);
-        }
-        Ok(Self {
-            placement: placement_digest(current)?,
-            reservation: serialized_digest(&reservation).map_err(invalid)?,
-            request,
-            payload: version,
-            copied: version,
-            phase: CopyPhase::Payload,
-        })
-    }
-
-    pub(crate) fn payload_claim(self) -> Result<(RequestBinding, RecordVersion), QueueError> {
-        if self.phase != CopyPhase::Payload {
-            return Err(QueueError::Invalid);
-        }
-        Ok((self.request, self.payload))
-    }
-
-    pub(crate) fn marker(self) -> Self {
-        Self {
-            phase: CopyPhase::Marker,
-            copied: self.payload,
-            ..self
-        }
-    }
-
-    pub(crate) fn terminal(self, version: RecordVersion) -> Self {
-        Self {
-            phase: CopyPhase::Terminal,
-            copied: version,
-            ..self
-        }
-    }
-
-    pub(crate) fn binding(self) -> RequestBinding {
-        self.request
-    }
-
-    pub(crate) fn version(self) -> RecordVersion {
-        self.copied
-    }
-}
+pub(crate) type ScopedTransferRecord = nabedra_oltp_types::queue::ScopedTransferRecord<RequestState>;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -210,11 +139,6 @@ impl ScopedCopyQuorum {
     pub(crate) fn holders(self) -> [WorkerIdentity; 2] {
         self.holders
     }
-}
-
-pub(crate) fn placement_digest(current: &ScopedQueuePlacement) -> Result<Digest, QueueError> {
-    current.validate(&current.group).map_err(invalid)?;
-    serialized_digest(&("nabedra/scoped-ram-queue/v2", current)).map_err(invalid)
 }
 
 pub(crate) fn scoped_authority(
@@ -778,21 +702,6 @@ impl ScopedSurvivor {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ScopedInventoryEntry {
-    reservation: IdentityReservation,
-    payload: ScopedCopyStamp,
-    marked: bool,
-    terminal: Option<ScopedCopyStamp>,
-}
-
-impl ScopedInventoryEntry {
-    pub(crate) fn request_id(self) -> Uuid {
-        self.payload.request.request_id
-    }
-}
-
 pub(crate) fn scoped_inventory(
     transition: &ScopedQueueTransition,
     placement: &ScopedQueuePlacement,
@@ -819,44 +728,17 @@ pub(crate) fn append_scoped_inventory(
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ScopedTransferRecord {
-    pub(crate) entry: ScopedInventoryEntry,
-    payload: RecordHeader,
-    terminal: Option<RecordHeader>,
+pub(crate) fn validate_terminal_repair(
+    record: &ScopedTransferRecord,
+    placement: &ScopedQueuePlacement,
+) -> Result<(), QueueError> {
+    validate_scoped_payload_header(placement, &record.payload)?;
+    validate_scoped_terminal_header(
+        placement,
+        record.terminal.as_ref().ok_or(QueueError::Invalid)?,
+    )?;
+    Ok(())
 }
-
-impl ScopedTransferRecord {
-    pub(crate) fn request_id(&self) -> Uuid {
-        self.entry.payload.request.request_id
-    }
-
-    pub(crate) fn payload_header(&self) -> &RecordHeader {
-        &self.payload
-    }
-
-    pub(crate) fn terminal_claim(
-        &self,
-    ) -> Result<(ScopedCopyStamp, RecordVersion, [u64; 3]), QueueError> {
-        let terminal = self.terminal.as_ref().ok_or(QueueError::Invalid)?;
-        let stamp = self.entry.terminal.ok_or(QueueError::Invalid)?;
-        Ok((self.entry.payload, stamp.copied, terminal.section_lengths))
-    }
-
-    pub(crate) fn validate_terminal_repair(
-        &self,
-        placement: &ScopedQueuePlacement,
-    ) -> Result<(), QueueError> {
-        validate_scoped_payload_header(placement, &self.payload)?;
-        validate_scoped_terminal_header(
-            placement,
-            self.terminal.as_ref().ok_or(QueueError::Invalid)?,
-        )?;
-        Ok(())
-    }
-}
-
 pub(crate) struct PreparedScopedTransfer {
     epoch: ScopedLocalEpoch,
     source: ScopedInventoryEntry,

@@ -18,14 +18,12 @@ use crate::{
         multiplex::*,
         peer_directory::MAX_VIEW_REVOCATIONS,
         service_rpc::{ParticipantClient, StatusClient, TimestampClient},
+        queue_access::AuthorityReader,
         types::*,
-    },
-    oltp_runtime::{
-        replica::{QueueAuthority, QueueScope},
-        worker_endpoint::AuthorityReader,
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
+use nabedra_oltp_types::queue::{QueueAuthority, QueueScope};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use std::{

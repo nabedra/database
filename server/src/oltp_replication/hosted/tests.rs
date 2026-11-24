@@ -1204,7 +1204,7 @@ fn d01_perf2b_inline_digest_equals_the_native_digest() {
 }
 
 pub(crate) fn acceptance_o11_storage() {
-    use crate::oltp_acceptance::clause;
+    use crate::oltp_replication::acceptance_clause as clause;
 
     d09_o11_o29_lost_unsynced_applies_replay_once_from_the_synced_log();
     o11_purge_and_snapshot_never_pass_the_durable_applied_index();

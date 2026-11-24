@@ -5,11 +5,15 @@ use super::{
     worker_endpoint::{AuthorityReader, QueuePeerClient, QueueState},
 };
 use crate::{
-    oltp::pool::ExecutionClass,
+    oltp::{
+        mvcc::store::consensus::ConsensusFuture,
+        pool::{ExecutionClass, WorkerSharedResources},
+        read_attempt::ReadGrantSettlement,
+    },
     oltp_replication::{
         authority::status::StatusService,
         multiplex::EndpointFuture,
-        service_rpc::{ReadGrant, ReadScope},
+        service_rpc::{QueueReadSlot, QueueReadSource, ReadGrant, ReadScope},
         types::{AuthorityView, JoinTicket, WorkerIdentity},
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
@@ -104,6 +108,7 @@ impl ReplicaTransport for QueuePeerClient {
 }
 
 pub struct QueueCoordinator {
+    read_slot: Arc<QueueReadSlot>,
     replica: Arc<Mutex<WorkerReplica>>,
     authority: Arc<dyn AuthorityReader>,
     peers: Arc<dyn ReplicaTransport>,
@@ -143,7 +148,7 @@ impl QueueCoordinator {
                 .begin_removal(current, ticket)
                 .map_err(QueueError::protocol)?;
             crate::oltp_replication::authority::control::VerifiedQueueCopy::begin_removal(
-                &source, ticket,
+                &*source, ticket,
             )?
         };
         loop {
@@ -214,7 +219,7 @@ impl QueueCoordinator {
                     .replica
                     .lock()
                     .map_err(|_| QueueError::Unavailable.protocol())?;
-                verifier.observe_local(&source)?;
+                verifier.observe_local(&*source)?;
             } else {
                 verifier.observe(
                     peer.removal_statement(target, scope.clone(), ticket)
@@ -230,7 +235,7 @@ impl QueueCoordinator {
             .replica
             .lock()
             .map_err(|_| QueueError::Unavailable.protocol())?;
-        verifier.finish(&source)
+        verifier.finish(&*source)
     }
 
     async fn merge_removal_inventory(
@@ -309,14 +314,22 @@ impl QueueCoordinator {
         authority: Arc<dyn AuthorityReader>,
         peers: Arc<dyn ReplicaTransport>,
     ) -> Arc<Self> {
-        Arc::new(Self {
-            replica,
-            authority,
-            peers,
-            progress: Mutex::new(BTreeMap::new()),
-            copy_slots: Semaphore::new(MAX_PARALLEL_QUEUE_COPIES),
+        Arc::new_cyclic(|owner: &Weak<Self>| {
+            let read_source: QueueReadSlot = owner.clone();
+            Self {
+                read_slot: Arc::new(read_source),
+                replica,
+                authority,
+                peers,
+                progress: Mutex::new(BTreeMap::new()),
+                copy_slots: Semaphore::new(MAX_PARALLEL_QUEUE_COPIES),
+            }
         })
     }
+    pub(super) fn bind_for_reads(&self, shared: &WorkerSharedResources) -> Result<(), ProtocolError> {
+        shared.bind_read_queue(&self.read_slot)
+    }
+
     fn gate(&self, id: Uuid) -> Result<Arc<AsyncMutex<()>>, ProtocolError> {
         let mut gates = self
             .progress
@@ -431,7 +444,7 @@ impl QueueCoordinator {
             .lock()
             .map_err(|_| QueueError::Unavailable.protocol())?;
         crate::oltp_replication::authority::control::VerifiedQueueCopy::from_join(
-            &source, current, observed,
+            &*source, current, observed,
         )
     }
 
@@ -918,5 +931,28 @@ impl QueueCoordinator {
             .map_err(QueueError::protocol)?;
         drop(grant);
         self.ensure_copies(current, id).await
+    }
+}
+
+impl QueueReadSource for QueueCoordinator {
+    fn resume_read_continuation(
+        &self,
+        scope: ReadScope,
+    ) -> ConsensusFuture<'_, ()> {
+        Box::pin(self.resume_read_continuation(scope))
+    }
+
+    fn open_read_grant(&self, grant: ReadGrant) -> ConsensusFuture<'_, ()> {
+        Box::pin(self.open_read_grant(grant))
+    }
+
+    fn finish_read_grant(&self, grant: ReadGrant) -> ConsensusFuture<'_, ()> {
+        Box::pin(self.finish_read_grant(grant))
+    }
+}
+
+impl ReadGrantSettlement for QueueCoordinator {
+    fn settle_read_grant(&self, grant: ReadGrant) -> ConsensusFuture<'_, ()> {
+        Box::pin(self.settle_read_grant(grant))
     }
 }
