@@ -240,23 +240,32 @@ enum Fin {
 impl Pipe {
     fn push(&mut self, body: Body, stream: Option<u64>, delay: Duration) {
         let deadline = Instant::now() + delay;
-        let preserves_order = |message: &Message| {
-            message.read != 0
-                || stream.is_none()
-                || message.stream.is_none()
-                || message.stream == stream
+        let (index, ready_at) = match stream {
+            None => {
+                let ready_at = self
+                    .queue
+                    .back()
+                    .map_or(deadline, |last| deadline.max(last.ready_at));
+                (self.queue.len(), ready_at)
+            }
+            Some(stream) => {
+                // Unframed messages, a partial read, and the same stream are
+                // barriers. The queue is sorted by delivery time, FIFO on ties.
+                let ready_at = self
+                    .queue
+                    .iter()
+                    .rfind(|message| {
+                        message.read != 0
+                            || message.stream.is_none()
+                            || message.stream == Some(stream)
+                    })
+                    .map_or(deadline, |last| deadline.max(last.ready_at));
+                let index = self
+                    .queue
+                    .partition_point(|message| message.ready_at <= ready_at);
+                (index, ready_at)
+            }
         };
-        let ready_at = self
-            .queue
-            .iter()
-            .filter(|message| preserves_order(message))
-            .map(|message| message.ready_at)
-            .fold(deadline, Instant::max);
-        let index = self
-            .queue
-            .iter()
-            .rposition(|message| preserves_order(message) || message.ready_at <= ready_at)
-            .map_or(0, |index| index + 1);
         self.queue.insert(
             index,
             Message {

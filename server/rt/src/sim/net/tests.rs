@@ -389,21 +389,57 @@ fn a_planned_reset_fails_the_sender_and_the_reader() {
 fn delays_take_virtual_time_and_keep_order() {
     run(8, |world| async move {
         nodes(&world, &[1, 2]);
-        let mut delays = vec![ms(50), ms(0)].into_iter();
-        record(&world, move |envelope| match envelope.kind {
-            Kind::Data => Fate::Deliver {
-                delay: delays.next().unwrap_or_default(),
-            },
-            Kind::Handshake => Fate::NOW,
-        });
-        let (mut client, mut server) = streams(&world, 2, 1).await;
+        let (dialed, accepted) = pair(&world, 2, 1, FULL, ONE_SHOT).await;
+        for (mut client, mut server) in [(dialed.unwrap().0, accepted.unwrap().0), {
+            let listener = world.listen(1, any(0)).unwrap();
+            let addr = listener.local_addr();
+            let client = in_node(2, dial(Target::Addr(addr))).await.unwrap().plain();
+            let (server, _) = listener.accept().await.unwrap();
+            (client, server.plain())
+        }] {
+            let mut delays = [ms(50), ms(0)].into_iter();
+            record(&world, move |_| Fate::Deliver {
+                delay: delays.next().unwrap(),
+            });
+            let start = tokio::time::Instant::now();
+            send(&mut client, b"first").await.unwrap();
+            send(&mut client, b"second").await.unwrap();
+            let mut got = [0; 11];
+            server.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"firstsecond");
+            assert_eq!(start.elapsed(), ms(50));
+        }
+
+        record(&world, |_| Fate::Deliver { delay: ms(20) });
         let start = tokio::time::Instant::now();
-        send(&mut client, b"first").await.unwrap();
-        send(&mut client, b"second").await.unwrap();
-        let mut got = [0; 11];
+        let (mut client, mut server) = streams(&world, 2, 1).await;
+        assert_eq!(start.elapsed(), ms(40), "both handshake flights take time");
+        record(&world, |envelope| Fate::Frame {
+            stream: u64::from(envelope.bytes[0]),
+            delay: if envelope.bytes == b"2slow" {
+                ms(30)
+            } else {
+                ms(0)
+            },
+        });
+
+        send(&mut client, b"1partial").await.unwrap();
+        assert_eq!(server.read_u8().await.unwrap(), b'1');
+        world.black_hole(Some(2), Some(1));
+        send(&mut client, b"2slow").await.unwrap();
+        send(&mut client, b"2later").await.unwrap();
+        send(&mut client, b"3fast").await.unwrap();
+        assert_eq!(
+            read_some(&mut server, ms(10)).await.unwrap().unwrap(),
+            b"partial"
+        );
+        assert!(read_some(&mut server, ms(10)).await.is_none());
+        world.heal(Some(2), Some(1));
+        let start = tokio::time::Instant::now();
+        let mut got = [0; 16];
         server.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got, b"firstsecond");
-        assert_eq!(start.elapsed(), ms(50));
+        assert_eq!(&got, b"3fast2slow2later");
+        assert_eq!(start.elapsed(), ms(20));
     });
 }
 
