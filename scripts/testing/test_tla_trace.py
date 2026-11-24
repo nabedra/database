@@ -76,6 +76,17 @@ class CommonTests(unittest.TestCase):
         # A run killed at its budget has cut-off output and no exit status.
         self.assertEqual(tc.parse_tlc_output(STATS + "@!@!@STARTMSG 2200:0 @!@!@\npro").errors, [])
 
+    def test_trace_notes(self):
+        # TLC wraps long values, and repeats a note per behavior.
+        text = ('<<"nabedra-trace-rejected", 7, 12>>\n<<"nabedra-trace-line", 7, "missing", "tmUp">>\n'
+                '<< "nabedra-trace-line",\n   7,\n   "different",\n   "a very long variable name" >>\n'
+                '<<"nabedra-trace-line", 7, "missing", "tmUp">>\n<<"nabedra-trace-line", 3, "missing", "x">>\n')
+        res = tc.parse_tlc_output(text, 10)
+        self.assertEqual(res.trace_notes, [(3, "missing", "x"), (7, "different", "a very long variable name"),
+                                           (7, "missing", "tmUp")])
+        self.assertEqual(tla_trace._notes(res, 7), "different value: a very long variable name; missing: tmUp")
+        self.assertEqual(tla_trace._notes(res, 5), "")
+
     def test_comments(self):
         for text, want in (("a (* x *) b", "a   b"), ("a (* (* x *) y *) b", "a   b"), ("a \\* (* b\nc", "a \nc"),
                            ("(* \\* *) a", "  a"), ('"(*" a', '"(*" a'), ('"a\\"(*" b', '"a\\"(*" b'),
