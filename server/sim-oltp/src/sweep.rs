@@ -14,7 +14,11 @@ use nabedra_sim::shrink;
 use nabedra_sim::sweep::{self, PlantedSearch, SeedRun, SweepConfig, SweepReport};
 use serde_json::{Value, json};
 
-use crate::workload::run_seed;
+use crate::{
+    nemesis::Selection,
+    workload::run_seed,
+    workloads::{SCENARIOS, Scenarios, Workload, WorkloadChoice, clauses},
+};
 
 const REPLAY: &str = "RUST_MIN_STACK=16777216 RUSTFLAGS=\"--cfg tokio_unstable\" CARGO_TARGET_DIR=target/sim \
     cargo test --locked --release -p nabedra-sim-oltp --lib sweep::tests::sweep -- \
@@ -49,11 +53,68 @@ impl Defect {
     }
 }
 
+/// The invariants of design 3.7 that need the P10-PROBES event stream.
+const PROBE_INVARIANTS: [&str; 10] = [
+    "ElectionSafety",
+    "MonotonicVote",
+    "MonotonicCommit",
+    "LogMatching",
+    "AppliedPrefixesAgree",
+    "MajorityReached",
+    "DedupUnique over Applied",
+    "NotAppliedNeverCommitted over Applied",
+    "RangeClockRule1",
+    "KeyspaceCoverage over RouteEpochPublished",
+];
+
 /// A completed run's named assertion verdicts. Omit families that did not execute.
 pub(crate) struct RunResult {
     pub(crate) run: SeedRun,
     pub(crate) assertions: BTreeMap<&'static str, bool>,
     pub(crate) blocking_cpu: Option<Duration>,
+    pub(crate) workload: Workload,
+    /// Scenarios whose assertions executed in this seed.
+    pub(crate) scenarios: Scenarios,
+    pub(crate) summary: Value,
+}
+
+/// The workload and nemesis selection of a sweep (`NABEDRA_SIM_WORKLOAD`,
+/// `NABEDRA_SIM_PROFILE`).
+pub(crate) struct Setup {
+    pub(crate) workloads: WorkloadChoice,
+    pub(crate) selection: Selection,
+    /// `NABEDRA_SIM_PROFILE=none`: run the workload without a nemesis.
+    pub(crate) quiet: bool,
+}
+
+impl Setup {
+    pub(crate) fn smoke() -> Self {
+        Self {
+            workloads: WorkloadChoice::parse(SMOKE).expect("smoke workload"),
+            selection: Selection::parse(&[]).expect("default selection"),
+            quiet: true,
+        }
+    }
+
+    fn from_env() -> Result<Self, String> {
+        let workloads = WorkloadChoice::parse(
+            &env("NABEDRA_SIM_WORKLOAD").unwrap_or_else(|| SMOKE.to_owned()),
+        )?;
+        let profile = env_list("NABEDRA_SIM_PROFILE");
+        if workloads.is_smoke() && !profile.is_empty() {
+            return Err("the smoke workload does not accept nemesis profiles".into());
+        }
+        Ok(Self {
+            workloads,
+            quiet: Selection::quiet(&profile),
+            selection: Selection::parse(&profile)?,
+        })
+    }
+
+    /// The profile name of `seed` for reports.
+    fn profile(&self, seed: u64) -> Option<&'static str> {
+        (!self.workloads.is_smoke() && !self.quiet).then(|| self.selection.profile(seed).name)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -64,6 +125,9 @@ pub enum Command {
 }
 
 struct ObservedSeed {
+    workload: Workload,
+    scenarios: Scenarios,
+    summary: Value,
     config: Value,
     config_hash: String,
     assertions: BTreeMap<&'static str, bool>,
@@ -119,11 +183,16 @@ fn usage() -> Option<Usage> {
     None
 }
 
-fn measured(seed: u64, generator: &mut Gen, defect: Defect) -> (RunResult, Measurement) {
+fn measured(
+    seed: u64,
+    generator: &mut Gen,
+    defect: Defect,
+    setup: &Setup,
+) -> (RunResult, Measurement) {
     let cpu_start = usage();
     // Both samples are outside the World installed by run_seed.
     let start = time::now_std();
-    let result = run_seed(seed, generator, defect);
+    let result = run_seed(seed, generator, defect, setup);
     let elapsed = time::elapsed(start).as_secs_f64();
     let cpu_end = usage();
     let blocking_cpu_s = result.blocking_cpu.map(|duration| duration.as_secs_f64());
@@ -155,13 +224,24 @@ fn env_list(name: &str) -> Vec<String> {
     })
 }
 
-fn seed_line(seed: u64, kinds: &BTreeSet<String>) {
+/// The seed-search line `scripts/testing/sim_bugs.py` parses. `workload`, `profile` and
+/// `scenarios` are informational additions to its contract.
+fn seed_line(
+    seed: u64,
+    kinds: &BTreeSet<String>,
+    workload: Workload,
+    profile: Option<&str>,
+    scenarios: &Scenarios,
+) {
     println!(
         "nabedra-sim-seed: {}",
         json!({
             "seed": seed,
             "result": if kinds.is_empty() { "pass" } else { "violation" },
             "kinds": kinds,
+            "workload": workload.name(),
+            "profile": profile,
+            "scenarios": scenarios,
         })
     );
 }
@@ -170,6 +250,7 @@ fn run_search(
     config: &SweepConfig,
     defect: Defect,
     expect: Vec<String>,
+    setup: &Setup,
 ) -> Result<bool, Box<dyn Error>> {
     if config.tape.is_some() || config.shrink {
         return Err("NABEDRA_SIM_EXPECT searches fresh seeds; use run or shrink for a tape".into());
@@ -183,12 +264,19 @@ fn run_search(
     };
     let observed = Mutex::new(BTreeMap::new());
     let result = search.run(|seed| {
-        let run = run_seed(seed, &mut sweep::workload_gen(seed), defect).run;
+        let result = run_seed(seed, &mut sweep::workload_gen(seed), defect, setup);
         observed
             .lock()
             .expect("search observations poisoned")
-            .insert(seed, shrink::kinds(&run.violations));
-        run.violations
+            .insert(
+                seed,
+                (
+                    shrink::kinds(&result.run.violations),
+                    result.workload,
+                    result.scenarios,
+                ),
+            );
+        result.run.violations
     });
     // Core may finish other seeds in the same parallel batch. Report only the prefix
     // that the search considered and require every seed in it to have a result.
@@ -199,32 +287,39 @@ fn run_search(
             .first
             .checked_add(offset)
             .ok_or("seed range overflows u64")?;
-        let kinds = observed
+        let (kinds, workload, scenarios) = observed
             .get(&seed)
             .ok_or_else(|| format!("seed {seed} did not finish"))?;
-        seed_line(seed, kinds);
+        seed_line(seed, kinds, *workload, setup.profile(seed), scenarios);
     }
     result.map(|_| true).map_err(Into::into)
 }
 
 fn replay_command(defect: Defect) -> String {
-    if defect == Defect::None {
-        REPLAY.to_owned()
-    } else {
-        format!("NABEDRA_SIM_DEFECT={} {REPLAY}", defect.name())
+    let mut prefix = String::new();
+    for name in [
+        "NABEDRA_SIM_WORKLOAD",
+        "NABEDRA_SIM_PROFILE",
+        "NABEDRA_SIM_BEYOND_TCP",
+    ] {
+        if let Some(value) = env(name) {
+            prefix.push_str(&format!("{name}={value} "));
+        }
     }
+    if defect != Defect::None {
+        prefix.push_str(&format!("NABEDRA_SIM_DEFECT={} ", defect.name()));
+    }
+    format!("{prefix}{REPLAY}")
 }
 
 /// Run the environment-selected seeds. `false` means an assertion failed.
 pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
-    let workload = env("NABEDRA_SIM_WORKLOAD").unwrap_or_else(|| SMOKE.to_owned());
-    if workload != SMOKE {
-        return Err(format!("OLTP workload {workload:?} is unavailable; use {SMOKE}").into());
-    }
-    if env("NABEDRA_SIM_PROFILE").is_some() {
-        return Err("the smoke workload does not accept nemesis profiles".into());
-    }
+    let setup = Setup::from_env()?;
+    let workload = setup.workloads.label();
     let defect = Defect::from_env()?;
+    if defect != Defect::None && !setup.workloads.is_smoke() {
+        return Err("seeded harness defects belong to the smoke workload".into());
+    }
     let label = env("NABEDRA_SIM_CHECK_ID").unwrap_or_else(|| "oltp-sim".to_owned());
     if label.len() > 80
         || !label.split('-').all(|part| {
@@ -258,17 +353,19 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     }
     let expect = env_list("NABEDRA_SIM_EXPECT");
     if !expect.is_empty() {
-        return run_search(&config, defect, expect);
+        return run_search(&config, defect, expect, &setup);
     }
 
     let test_defects = env("NABEDRA_SIM_TEST_DEFECTS").as_deref() == Some("1");
-    if test_defects && (defect != Defect::None || config.tape.is_some()) {
+    if test_defects
+        && (defect != Defect::None || config.tape.is_some() || !setup.workloads.is_smoke())
+    {
         return Err("seeded-defect checks require an unmodified smoke sweep".into());
     }
     let started = time::now_std();
     let observed = Mutex::new(BTreeMap::<u64, ObservedSeed>::new());
     let report = sweep::sweep(&config, |seed, generator| {
-        let (result, measurement) = measured(seed, generator, defect);
+        let (result, measurement) = measured(seed, generator, defect, &setup);
         let mut observed = observed.lock().expect("sweep observations poisoned");
         let observation = observed.entry(seed).or_insert_with(|| {
             let config_hash = result.run.config["hash"].as_str().map_or_else(
@@ -280,6 +377,9 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
                 str::to_owned,
             );
             ObservedSeed {
+                workload: result.workload,
+                scenarios: result.scenarios.clone(),
+                summary: result.summary.clone(),
                 config: result.run.config.clone(),
                 config_hash,
                 assertions: result.assertions,
@@ -313,6 +413,8 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     let mut config_hash = nabedra_sim::Fnv::default();
     let mut stats = Vec::with_capacity(report.seeds.len());
     let mut paths = report.artifacts.clone();
+    // Scenario tag -> (seeds that executed it, seeds among them that failed).
+    let mut scenario_seeds: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
     std::fs::create_dir_all(&config.artifacts)?;
     for summary in &report.seeds {
         let seed = summary.seed;
@@ -324,7 +426,16 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         if !summary.deterministic {
             kinds.insert("determinism".to_owned());
         }
-        seed_line(seed, &kinds);
+        let seed_workload = observation.map_or(setup.workloads.of(seed), |row| row.workload);
+        let tags = observation
+            .map(|row| row.scenarios.clone())
+            .unwrap_or_default();
+        seed_line(seed, &kinds, seed_workload, setup.profile(seed), &tags);
+        for tag in &tags {
+            let entry = scenario_seeds.entry(tag).or_default();
+            entry.0 += 1;
+            entry.1 += u64::from(!kinds.is_empty());
+        }
 
         if let Some(row) = observation {
             config_hash.write(row.config_hash.as_bytes());
@@ -344,6 +455,10 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         }
         stats.push(json!({
             "seed": seed,
+            "workload": seed_workload.name(),
+            "profile": setup.profile(seed),
+            "scenarios": tags,
+            "summary": observation.map(|row| &row.summary),
             "config": observation.map(|row| &row.config),
             "config_hash": observation.map(|row| &row.config_hash),
             "trace_hash": format!("{:016x}", summary.trace_hash),
@@ -357,6 +472,13 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         }));
     }
     assertions.insert("seed sweep", report.passed());
+    let mut scenario_assertions = BTreeMap::new();
+    for (tag, (seeds, failed)) in &scenario_seeds {
+        scenario_assertions.insert(*tag, failed == &0);
+        eprintln!(
+            "Fault model clause {tag}: assertions executed in {seeds} seeds, {failed} failing"
+        );
+    }
     if report.replayed() > 0 {
         assertions.insert(
             "trace hash, event count and history byte replay",
@@ -391,6 +513,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         serde_json::to_vec_pretty(&json!({
             "evidence": "fault-model",
             "workload": workload,
+            "scenarios": scenario_seeds.iter().map(|(tag, (seeds, failed))| (*tag, json!({"seeds": seeds, "failing": failed}))).collect::<BTreeMap<_, _>>(),
             "direct_oltp": true,
             "defect": defect.name(),
             "jobs": config.jobs,
@@ -419,6 +542,9 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         &config,
         &report,
         RecordInput {
+            workload,
+            smoke: setup.workloads.is_smoke(),
+            scenarios: scenario_assertions,
             assertions,
             defects_skipped: test_defects && !report.passed(),
             duration_s,
@@ -469,8 +595,9 @@ fn test_defect(base: &SweepConfig, defect: Defect) -> Result<DefectTest, Box<dyn
     config.shrink_budget = 4;
 
     let initial = Mutex::new(None::<(BTreeSet<String>, usize)>);
+    let setup = Setup::smoke();
     let report = sweep::sweep(&config, |seed, generator| {
-        let run = run_seed(seed, generator, defect).run;
+        let run = run_seed(seed, generator, defect, &setup).run;
         initial
             .lock()
             .expect("mutation observation poisoned")
@@ -500,7 +627,7 @@ fn test_defect(base: &SweepConfig, defect: Defect) -> Result<DefectTest, Box<dyn
                 && shrunk.is_some_and(|tape| {
                     let len = tape.len();
                     shrunk_len = Some(len);
-                    let replay = run_seed(seed, &mut Gen::from_tape(tape), defect).run;
+                    let replay = run_seed(seed, &mut Gen::from_tape(tape), defect, &setup).run;
                     let reproduced = shrink::kinds(&replay.violations).contains(EXPECTED_DEFECT);
                     shrunk_replay_detected = Some(reproduced);
                     len < original_len && reproduced
@@ -526,6 +653,10 @@ fn test_defect(base: &SweepConfig, defect: Defect) -> Result<DefectTest, Box<dyn
 }
 
 struct RecordInput {
+    workload: String,
+    smoke: bool,
+    /// Scenario tags that executed, and whether every seed that executed one passed.
+    scenarios: BTreeMap<&'static str, bool>,
     assertions: BTreeMap<&'static str, bool>,
     defects_skipped: bool,
     duration_s: f64,
@@ -543,7 +674,22 @@ fn write_record(
     let mut record = Record::new(&config.label, "S H");
     record.fill_from_env();
     record.guarantees = env_list("NABEDRA_SIM_GUARANTEES");
-    record.scenarios = env_list("NABEDRA_SIM_SCENARIOS");
+    // Claim only scenarios whose every clause executed its assertions in this range.
+    let complete: BTreeSet<&str> = SCENARIOS
+        .iter()
+        .filter(|(_, required)| {
+            required
+                .iter()
+                .all(|clause| input.scenarios.contains_key(clause))
+        })
+        .map(|(scenario, _)| *scenario)
+        .collect();
+    record.scenarios = complete.iter().map(|tag| (*tag).to_owned()).collect();
+    for listed in env_list("NABEDRA_SIM_SCENARIOS") {
+        if !complete.contains(listed.as_str()) {
+            eprintln!("Fault model scenario {listed}: listed by the check, no seed executed it");
+        }
+    }
     let binary = std::env::current_exe()?;
     record.build.profile = env("NABEDRA_SIM_BUILD_PROFILE").or_else(|| {
         binary
@@ -557,7 +703,7 @@ fn write_record(
     record.build.binary_sha256 = Some(sha256_file(&binary)?);
     record.mode = Some(BTreeMap::from([
         ("evidence".to_owned(), json!("fault-model")),
-        ("workload".to_owned(), json!(SMOKE)),
+        ("workload".to_owned(), json!(input.workload)),
         ("direct_oltp".to_owned(), json!(true)),
         ("config_hash".to_owned(), json!(input.config_hash)),
         ("seeded_defect".to_owned(), json!(input.defect.name())),
@@ -573,15 +719,39 @@ fn write_record(
     for passed in input.assertions.into_values() {
         record.assertion(passed);
     }
+    for passed in input.scenarios.values() {
+        record.assertion(*passed);
+    }
     if input.defects_skipped {
         record.not_run("seeded defects", "the unmodified smoke sweep failed");
     }
-    record.not_run("probe-driven invariants", "P10-PROBES integration pending");
-    for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {
-        record.not_run(
-            scenario,
-            &format!("requires the {workload} workload from P10-WORKLOADS"),
-        );
+    for invariant in PROBE_INVARIANTS {
+        record.not_run(invariant, "P10-PROBES integration pending");
+    }
+    record.not_run(
+        "ResourceBaseline ledger and RangeClock pending sets",
+        "P10-PROBES integration pending",
+    );
+    record.not_run("ConsistentCommittedData", "P10-PROBES integration pending");
+    if input.smoke {
+        for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {
+            record.not_run(scenario, &format!("runs in the {workload} workload"));
+        }
+    } else {
+        for (scenario, required) in SCENARIOS {
+            let missing: Vec<_> = required
+                .iter()
+                .filter(|clause| !input.scenarios.contains_key(*clause))
+                .collect();
+            for clause in &missing {
+                let why = clauses::unreachable(clause)
+                    .unwrap_or("no seed in this range executed its assertions");
+                record.not_run(clause, why);
+            }
+            if !missing.is_empty() {
+                record.not_run(scenario, &format!("clauses that did not run: {missing:?}"));
+            }
+        }
     }
     if report.replayed() == 0 {
         record.not_run(
