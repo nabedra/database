@@ -21,7 +21,7 @@ use std::{
 
 use nabedra_check::{
     Gen,
-    checker::{Verdict, linearizable, outcome, txn},
+    checker::{Anomaly, Verdict, linearizable, outcome, txn},
     history::{Event, EventType, NEMESIS},
 };
 use nabedra_protocol::protocol::{ErrorCode, Outcome as Applied, ProtocolError};
@@ -776,6 +776,9 @@ async fn poll(q: &Q, node: u64, first: usize, run: Uuid, req: &Req, polls: u32) 
         let gateway = GATEWAYS[(first + attempt as usize) % GATEWAYS.len()];
         let seen = lookup(q, node, gateway, run, req).await;
         if !matches!(seen, Seen::Pending | Seen::Unknown) {
+            // A settled receipt reads the same through the other gateway.
+            let other = GATEWAYS[(first + attempt as usize + 1) % GATEWAYS.len()];
+            lookup(q, node, other, run, req).await;
             return seen;
         }
         attempt += 1;
@@ -1424,6 +1427,7 @@ pub(crate) async fn run(
     };
     tokio::join!(finishing, observe(&q, cluster.config.run_id));
     settle(&q, cluster).await;
+    reread(&q, cluster.config.run_id).await;
     copies(&q, cluster).await;
     let finals = final_reads(&q).await;
     report
@@ -1721,6 +1725,29 @@ async fn settle(q: &Q, cluster: &Cluster) {
                 shared.last.get(&id).map_or("none", String::as_str),
             ),
         );
+    }
+}
+
+/// Look the settled receipts of `run` up again through both gateways: a terminal answer does
+/// not change, whoever served the request's faults.
+async fn reread(q: &Q, run: Uuid) {
+    let mut seen = BTreeSet::new();
+    let settled: Vec<Open> = {
+        let shared = q.shared.lock().unwrap();
+        shared
+            .open
+            .iter()
+            .rev()
+            .filter(|open| open.run == run && seen.insert(open.req.body.id))
+            .take(24)
+            .cloned()
+            .collect()
+    };
+    for (index, open) in settled.iter().enumerate() {
+        let node = CLIENTS[index % CLIENTS.len()];
+        for gateway in GATEWAYS {
+            lookup(q, node, gateway, open.run, &open.req).await;
+        }
     }
 }
 
@@ -2045,7 +2072,7 @@ async fn replay_abandoned(q: &Q) {
         .abandoned
         .iter()
         .rev()
-        .find(|req| req.name != "table.delete" && req.body.anchor.is_some_and(|key| key < 10))
+        .find(|req| !req.body.writes.is_empty())
         .cloned();
     let Some(req) = abandoned else { return };
     again(q, &req, "seeded-replay").await;
@@ -2325,12 +2352,31 @@ fn mops(op: &Logical, universe: &BTreeSet<i64>) -> Option<(Value, Value)> {
     }
 }
 
+/// The transaction checker may print another witness cycle for the same history, and the
+/// violation is part of the hashed trace. Keep one anomaly per kind and print the witnesses.
+fn stable(verdict: Verdict) -> Verdict {
+    let mut kinds = BTreeMap::new();
+    for anomaly in verdict.anomalies {
+        eprintln!("fault model {}: {}", anomaly.kind, anomaly.detail);
+        kinds.entry(anomaly.kind).or_insert(());
+    }
+    let anomalies = kinds
+        .into_keys()
+        .map(|kind| Anomaly {
+            detail: format!("the transactional history has a {kind}; its witness is in the log"),
+            kind,
+            events: Vec::new(),
+        })
+        .collect();
+    Verdict::new(verdict.checked_ops, anomalies)
+}
+
 /// Every history check of the workload (design 3.8).
 pub(crate) fn check(events: &[Event]) -> Verdict {
     let ops = logical(events);
     let keyed = keyed(&ops);
     Verdict::merge([
-        txn::check(&transactions(&ops)),
+        stable(txn::check(&transactions(&ops))),
         linearizable::check_kv(&keyed),
         outcome::check(&keyed),
     ])
