@@ -134,7 +134,7 @@ fn since_epoch() -> Option<Duration> {
 pub fn sleep(duration: Duration) -> Sleep {
     #[cfg(feature = "sim")]
     {
-        tokio::time::sleep(crate::sim::to_runtime_duration(duration))
+        tokio::time::sleep(crate::sim::to_runtime_timer(duration))
     }
     #[cfg(not(feature = "sim"))]
     {
@@ -155,7 +155,7 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
     #[cfg(feature = "sim")]
     {
-        tokio::time::timeout(crate::sim::to_runtime_duration(duration), future)
+        tokio::time::timeout(crate::sim::to_runtime_timer(duration), future)
     }
     #[cfg(not(feature = "sim"))]
     {
@@ -176,7 +176,7 @@ pub fn timeout_at<F: Future>(deadline: Instant, future: F) -> Timeout<F> {
 pub fn interval(period: Duration) -> Interval {
     #[cfg(feature = "sim")]
     {
-        tokio::time::interval(crate::sim::to_runtime_duration(period))
+        tokio::time::interval(crate::sim::to_runtime_timer(period))
     }
     #[cfg(not(feature = "sim"))]
     {
@@ -190,7 +190,7 @@ pub fn interval(period: Duration) -> Interval {
 pub fn interval_at(start: Instant, period: Duration) -> Interval {
     #[cfg(feature = "sim")]
     {
-        tokio::time::interval_at(to_runtime(start), crate::sim::to_runtime_duration(period))
+        tokio::time::interval_at(to_runtime(start), crate::sim::to_runtime_timer(period))
     }
     #[cfg(not(feature = "sim"))]
     {
