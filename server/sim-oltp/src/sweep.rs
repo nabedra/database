@@ -100,6 +100,7 @@ impl Setup {
         let workloads = WorkloadChoice::parse(
             &env("NABEDRA_SIM_WORKLOAD").unwrap_or_else(|| SMOKE.to_owned()),
         )?;
+        crate::workloads::membership::Step::from_env()?;
         let profile = env_list("NABEDRA_SIM_PROFILE");
         if workloads.is_smoke() && !profile.is_empty() {
             return Err("the smoke workload does not accept nemesis profiles".into());
@@ -301,6 +302,7 @@ fn replay_command(defect: Defect) -> String {
         "NABEDRA_SIM_WORKLOAD",
         "NABEDRA_SIM_PROFILE",
         "NABEDRA_SIM_BEYOND_TCP",
+        crate::workloads::membership::STEPS_ENV,
     ] {
         if let Some(value) = env(name) {
             prefix.push_str(&format!("{name}={value} "));
@@ -733,6 +735,11 @@ fn write_record(
         "P10-PROBES integration pending",
     );
     record.not_run("ConsistentCommittedData", "P10-PROBES integration pending");
+    if input.workload.split(',').any(|name| name == "membership") {
+        for (form, why) in crate::invariants::membership::PROBE_FORMS {
+            record.not_run(form, why);
+        }
+    }
     if input.smoke {
         for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {
             record.not_run(scenario, &format!("runs in the {workload} workload"));

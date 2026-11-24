@@ -22,13 +22,16 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    bootstrap::{BOOTSTRAP_CLIENT, Bootstrap, CLIENTS, CONFIG, GATEWAYS, WORKERS, initial_range},
+    bootstrap::{BOOTSTRAP_CLIENT, Bootstrap, CLIENTS, GATEWAYS, WORKERS, initial_range},
     client::{operation, request},
     disk::{self, DiskCut},
     history::Completion,
     invariants::{Invariants, RECOVERY_LIMIT, TraceObserver, elapsed_ms},
     net::SimNet,
 };
+
+mod members;
+pub(crate) use members::{Disk, Marker, Started};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const READINESS_POLL: Duration = Duration::from_millis(100);
@@ -50,6 +53,8 @@ pub(crate) struct Cluster {
     prepared: BTreeSet<u64>,
     /// Per worker, the intervals in which it was frozen or had no process.
     outages: BTreeMap<u64, Vec<(u64, Option<u64>)>>,
+    /// Spare workers that the workload gave a process.
+    spares: BTreeSet<u64>,
 }
 
 struct Process {
@@ -100,6 +105,7 @@ impl Cluster {
             leader: None,
             prepared: BTreeSet::new(),
             outages: BTreeMap::new(),
+            spares: BTreeSet::new(),
         })
     }
 
@@ -142,11 +148,18 @@ impl Cluster {
     }
 
     async fn start_worker(&mut self, index: usize) -> Result<(), String> {
-        let node = WORKERS[index];
-        self.outage_ended(node);
+        let node = self.config.node(index);
         in_node(node, async { self.config.write_worker(index) })
             .await
             .map_err(|error| format!("write worker n{node} bootstrap: {error}"))?;
+        self.spawn_worker(node);
+        Ok(())
+    }
+
+    /// Start `node`'s worker process from the bootstrap file that is already in place.
+    fn spawn_worker(&mut self, node: u64) {
+        self.outage_ended(node);
+        let path = PathBuf::from(self.config.config_path(node));
         let (stop, stopped) = oneshot::channel();
         self.record(format!("start worker n{node}"));
         let task = self.world.spawn_node(node, async move {
@@ -154,7 +167,7 @@ impl Cluster {
                 node,
                 process_sim::with_worker_stop(
                     stopped,
-                    registered_process::run(PathBuf::from(CONFIG)),
+                    registered_process::run(path),
                 ),
             )
             .await
@@ -164,7 +177,6 @@ impl Cluster {
             stop: Stop::Worker(stop),
         };
         assert!(self.processes.insert(node, process).is_none());
-        Ok(())
     }
 
     async fn start_gateway(&mut self, index: usize, connection: &Value) -> Result<(), String> {
@@ -172,13 +184,14 @@ impl Cluster {
         in_node(node, async { self.config.write_gateway(index, connection) })
             .await
             .map_err(|error| format!("write gateway n{node} bootstrap: {error}"))?;
+        let path = PathBuf::from(self.config.config_path(node));
         let (channel, server) = tokio::io::duplex(32 << 10);
         let task = self.world.spawn_node(node, async move {
             in_node(
                 node,
                 process_sim::with_supervisor(
                     server,
-                    api_process::run_api_configured(PathBuf::from(CONFIG), false, false),
+                    api_process::run_api_configured(path, false, false),
                 ),
             )
             .await
@@ -303,7 +316,12 @@ impl Cluster {
 
     /// Whether every worker runs and none is frozen.
     pub fn healthy(&self) -> bool {
-        self.frozen.is_empty() && WORKERS.into_iter().all(|node| self.is_running(node))
+        self.frozen.is_empty()
+            && self
+                .config
+                .nodes()
+                .into_iter()
+                .all(|node| self.is_running(node))
     }
 
     fn outage(&mut self, node: u64) {
@@ -324,7 +342,7 @@ impl Cluster {
     /// Intervals in which at least two workers were frozen or down.
     pub fn no_quorum(&self) -> Vec<(u64, u64)> {
         let mut edges: Vec<(u64, i32)> = Vec::new();
-        for node in WORKERS {
+        for node in self.config.nodes() {
             for (from, to) in self.outages.get(&node).into_iter().flatten() {
                 edges.push((*from, 1));
                 edges.push((to.unwrap_or(u64::MAX), -1));
@@ -340,7 +358,7 @@ impl Cluster {
     /// Workers whose process ended on its own, with the result it returned.
     pub async fn reap_exited(&mut self) -> Vec<(u64, String)> {
         let mut exited = Vec::new();
-        for node in WORKERS.into_iter().chain(GATEWAYS) {
+        for node in self.config.nodes().into_iter().chain(GATEWAYS) {
             if self
                 .processes
                 .get(&node)
@@ -355,7 +373,8 @@ impl Cluster {
 
     pub async fn admin(&self, name: &str, payload: Value) -> Result<Value, String> {
         let id = in_node(BOOTSTRAP_CLIENT, async { uuid_v4() }).await;
-        self.admin_with_id(&WORKERS, id, name, payload).await
+        self.admin_with_id(&self.config.nodes(), id, name, payload)
+            .await
     }
 
     /// One administration request under a caller-chosen ID, tried on each of `nodes`.
@@ -475,7 +494,7 @@ impl Cluster {
         let deadline = self.world.elapsed() + RECOVERY_LIMIT;
         loop {
             let mut active = true;
-            for node in WORKERS {
+            for node in self.config.nodes() {
                 let result = self.stats(node).await;
                 active &= result.is_ok_and(|stats| {
                     stats["direct_capability"]["active"] == true && stats["direct"].is_object()
@@ -496,7 +515,7 @@ impl Cluster {
     /// Frozen and stopped workers are never returned.
     pub async fn leader(&mut self) -> Option<u64> {
         let mut best = None::<(u64, u64)>;
-        for node in WORKERS {
+        for node in self.config.nodes() {
             if !self.is_running(node) || self.frozen.contains(&node) {
                 continue;
             }
@@ -525,7 +544,7 @@ impl Cluster {
     pub async fn crash(&mut self, node: u64, how: DiskCut) {
         self.record(format!("cut n{node} {how:?}"));
         self.unpause(node);
-        if WORKERS.contains(&node) {
+        if self.config.nodes().contains(&node) {
             self.outage(node);
         }
         // A process that ended before anything stopped it is a failure, whatever it returned.
@@ -552,16 +571,13 @@ impl Cluster {
     /// reopen the retained volume and start the worker.
     pub async fn restart_worker(&mut self, node: u64, how: DiskCut) -> Result<(), String> {
         self.prepare_restart(node).await?;
-        let index = WORKERS.iter().position(|worker| *worker == node);
+        let index = self.config.index_of(node);
         self.start_prepared(index.expect("known worker"), how).await
     }
 
     /// Prepare a retained restart through the survivors, unless one is still unspent.
     pub async fn prepare_restart(&mut self, node: u64) -> Result<(), String> {
-        let index = WORKERS
-            .iter()
-            .position(|worker| *worker == node)
-            .expect("known worker");
+        let index = self.config.index_of(node).expect("known worker");
         if self.world.is_up(node) {
             self.crash(node, DiskCut::Kill).await;
         }
@@ -576,7 +592,9 @@ impl Cluster {
             self.record(format!("n{node} enrolled before it stopped: prepare again"));
             self.prepared.remove(&node);
         }
-        let survivors: Vec<u64> = WORKERS
+        let survivors: Vec<u64> = self
+            .config
+            .nodes()
             .into_iter()
             .filter(|other| *other != node && self.is_running(*other))
             .collect();
@@ -619,7 +637,7 @@ impl Cluster {
 
     /// Start a prepared worker on its reopened volume and wait until it is ready.
     pub async fn start_prepared(&mut self, index: usize, how: DiskCut) -> Result<(), String> {
-        let node = WORKERS[index];
+        let node = self.config.node(index);
         disk::reopen(&self.world, &self.checks, node, how);
         self.start_worker(index).await?;
         let ready = self.wait_ready(&[node], true).await;
@@ -636,7 +654,7 @@ impl Cluster {
     async fn abort_start(&mut self, node: u64) {
         self.record(format!("abort start n{node}"));
         self.unpause(node);
-        if WORKERS.contains(&node) {
+        if self.config.nodes().contains(&node) {
             self.outage(node);
         }
         let image = disk::cut(&self.world, node, DiskCut::Kill);
@@ -673,7 +691,9 @@ impl Cluster {
             self.abort_start(node).await;
             return Err(error);
         }
-        let ready = WORKERS
+        let ready = self
+            .config
+            .nodes()
             .into_iter()
             .filter(|worker| self.is_running(*worker))
             .count();
@@ -685,7 +705,8 @@ impl Cluster {
         for node in self.frozen.clone() {
             self.thaw(node);
         }
-        for node in GATEWAYS.into_iter().chain(WORKERS) {
+        let workers = WORKERS.into_iter().chain(self.spares.clone());
+        for node in GATEWAYS.into_iter().chain(workers) {
             if self.world.is_up(node) {
                 self.crash(node, DiskCut::Kill).await;
             }
@@ -719,7 +740,8 @@ impl Cluster {
         for node in self.frozen.clone() {
             self.thaw(node);
         }
-        for node in WORKERS {
+        let nodes = self.config.nodes();
+        for node in nodes {
             if self.world.is_up(node) {
                 self.crash(node, how).await;
             }
@@ -727,11 +749,11 @@ impl Cluster {
         }
         self.prepared.clear();
         in_node(BOOTSTRAP_CLIENT, async { self.config.prepare_cold_start() }).await;
-        for node in WORKERS {
+        for node in nodes {
             disk::reopen(&self.world, &self.checks, node, how);
         }
         let stopped = self.world.elapsed();
-        let mut order: Vec<usize> = (0..WORKERS.len()).collect();
+        let mut order: Vec<usize> = (0..nodes.len()).collect();
         order.sort_by_key(|&index| (delays[index], index));
         for index in order {
             let at = stopped + delays[index];
@@ -741,9 +763,9 @@ impl Cluster {
             self.start_worker(index).await?;
         }
         self.checks.expect_recovery(&self.world, label, limit);
-        self.wait_ready_within(&WORKERS, true, WORKERS.len(), limit)
+        self.wait_ready_within(&nodes, true, nodes.len(), limit)
             .await?;
-        self.wait_ready_within(&GATEWAYS, false, WORKERS.len(), limit)
+        self.wait_ready_within(&GATEWAYS, false, nodes.len(), limit)
             .await?;
         self.checks.recovered(&self.world, label);
         Ok(())
@@ -755,7 +777,7 @@ impl Cluster {
         let source = initial_range(self.config.cluster_id, table);
         let payload = json!({"source": source, "boundary": boundary, "page_bytes": 1 << 20});
         match self
-            .admin_with_id(&WORKERS, id, "storage.shard.split", payload)
+            .admin_with_id(&self.config.nodes(), id, "storage.shard.split", payload)
             .await
         {
             Ok(result) if result["state"] == "published" => Ok(result),
@@ -769,13 +791,13 @@ impl Cluster {
         if !self.healthy() {
             return false;
         }
-        for node in WORKERS {
+        for node in self.config.nodes() {
             let stats = self.stats(node).await;
             if !stats.is_ok_and(|stats| stats["direct_capability"]["active"] == true) {
                 return false;
             }
         }
-        for node in WORKERS.into_iter().chain(GATEWAYS) {
+        for node in self.config.nodes().into_iter().chain(GATEWAYS) {
             let ready = request(
                 BOOTSTRAP_CLIENT,
                 node,

@@ -137,6 +137,13 @@ impl Move {
         Some((node, info.dev))
     }
 
+    /// The second pool that [`Move::prepare`] mounted on `node`.
+    pub(super) fn second_pool_of(&self, world: &World, node: u64) -> Option<SecondPool> {
+        let path = &self.claim.as_ref()?.path;
+        let info = world.volume_info(node, Path::new(path))?;
+        Some((node, info.dev))
+    }
+
     /// Advance the move by at most one operator step.
     pub(crate) async fn tick(&mut self, cluster: &mut Cluster, ctx: &Ctx) {
         let now = elapsed_ms(&cluster.world);
@@ -213,7 +220,7 @@ impl Move {
     }
 
     /// Mount and enroll the secondary pool, then build the move request.
-    async fn prepare(
+    pub(super) async fn prepare(
         &mut self,
         cluster: &mut Cluster,
         ctx: &Ctx,
@@ -739,7 +746,7 @@ async fn refused_mounts(
 }
 
 /// The table's first range and its current placement.
-async fn placement(cluster: &Cluster, ctx: &Ctx) -> Result<(Value, Value), String> {
+pub(super) async fn placement(cluster: &Cluster, ctx: &Ctx) -> Result<(Value, Value), String> {
     let table = Uuid::parse_str(&ctx.table).map_err(|error| error.to_string())?;
     let group = initial_range(cluster.config.cluster_id, table);
     let placement = cluster
@@ -751,7 +758,7 @@ async fn placement(cluster: &Cluster, ctx: &Ctx) -> Result<(Value, Value), Strin
 /// The worker that schedules Data groups. Each worker is asked to move its own replica to a
 /// pool that does not exist: only the owner gets past the owner check, and then refuses the
 /// pool.
-async fn owner(cluster: &Cluster, ctx: &Ctx) -> Result<u64, String> {
+pub(super) async fn owner(cluster: &Cluster, ctx: &Ctx) -> Result<u64, String> {
     let (group, placement) = placement(cluster, ctx).await?;
     let members = placement["members"].as_array().cloned().unwrap_or_default();
     let mut refusals = Vec::new();

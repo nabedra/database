@@ -49,6 +49,21 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
         ],
     ),
     ("O29", &["O29:ambiguous-write"]),
+    (
+        "O17",
+        &[
+            "O17:replacement",
+            "O17:replacement-fault",
+            "O17:abandoned-intent",
+            "O17:removed-worker",
+            "O17:wiped-voter",
+            "O17:move-sequence",
+            "O17:data-worker",
+            "O17:low-disk",
+            "O17:revocation-storm",
+        ],
+    ),
+    ("R03", &["R03:rolling-restart", "R03:replacement-joiner"]),
 ];
 
 /// Why a clause cannot run yet, for the sweep record.
@@ -60,6 +75,11 @@ pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
         "O26:split-across-pools" => "a split never publishes after a direct commit (open finding)",
         "O26:failed-mount" => "no phase 10 schedule loses a mount",
         "O26:worker-4" => "the data worker process binds a real TCP listener",
+        "O17:data-worker" => "the data worker process binds a real TCP listener",
+        "O17:low-disk" => "a simulated volume has no capacity limit",
+        "O17:revocation-storm" => {
+            "1,025 replacements, each with its own worker and certificate, need a separate large range"
+        }
         _ => return None,
     })
 }

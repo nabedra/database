@@ -191,21 +191,40 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     .await
     {
         Ok(mut cluster) => {
-            let startup = cluster.start().await;
+            let mut membership = (workload == Workload::Membership)
+                .then(|| workloads::membership::Membership::draw(generator));
+            let startup = match membership.as_mut() {
+                Some(membership) => membership.start(&mut cluster).await,
+                None => cluster.start().await,
+            };
             assertions.insert("cluster readiness", startup.is_ok());
             match startup {
                 Ok(()) if workload != Workload::Smoke => {
-                    let report = workloads::direct::run(
-                        &mut cluster,
-                        &config,
-                        history.clone(),
-                        generator,
-                        seed,
-                        workload,
-                        &setup.selection,
-                        setup.quiet,
-                    )
-                    .await;
+                    let report = if let Some(membership) = membership {
+                        membership
+                            .run(
+                                &mut cluster,
+                                &config,
+                                history.clone(),
+                                generator,
+                                seed,
+                                &setup.selection,
+                                setup.quiet,
+                            )
+                            .await
+                    } else {
+                        workloads::direct::run(
+                            &mut cluster,
+                            &config,
+                            history.clone(),
+                            generator,
+                            seed,
+                            workload,
+                            &setup.selection,
+                            setup.quiet,
+                        )
+                        .await
+                    };
                     match report {
                         Ok(report) => {
                             for (name, passed) in report.assertions {

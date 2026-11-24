@@ -1,6 +1,10 @@
 //! End-to-end checks over client history, mounted disks and public observations.
 //! The optional probe stream lets workloads check protocol events synchronously.
 
+pub(crate) mod membership;
+#[cfg(test)]
+mod membership_tests;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
