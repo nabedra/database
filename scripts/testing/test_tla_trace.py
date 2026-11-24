@@ -4,6 +4,7 @@
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -22,6 +23,12 @@ FIXTURES = HERE / "testdata" / "tla"
 SELFTEST = HERE.parents[1] / "specs" / "selftest"
 ACCEPTED = SELFTEST / "traces" / "accepted" / "TwoPhase-1.ndjson"
 REJECTED = SELFTEST / "traces" / "rejected" / "TwoPhase-2.at-6.ndjson"
+
+
+def weaken(spec):
+    """A trace spec that requires no variable."""
+    spec = spec.replace("RequireVar", "OptionalVar").replace("RequireSet", "OptionalSet")
+    return re.sub(r"Changed(Var|Set)\(\w+, ", r"Optional\1(", spec)
 
 
 def tla_trace_verdict(code):
@@ -390,9 +397,9 @@ class CheckTests(unittest.TestCase):
         path = self.spec / "TwoPhaseTrace.tla"
         original = path.read_text()
         weak = original.replace("RequireVar", "OptionalVar").replace("RequireSet", "OptionalSet")
-        path.write_text(weak)  # ChangedSet is left
+        path.write_text(weak)  # ChangedVar and ChangedSet are left
         self.assertEqual(self.check(str(self.good))[0], 0)
-        weak = weak.replace("ChangedSet(tmPrepared, tmPrepared')", "OptionalSet(tmPrepared')")
+        weak = weaken(original)
         path.write_text("\\* RequireVar\n" + weak + "(* RequireSet *)\n")
         self.spec_error("requires no variable")
         # The requirement may be in a helper module.
@@ -525,6 +532,29 @@ class CheckTests(unittest.TestCase):
             self.assertIn(fragment, text)
             self.assertEqual(summary["tla"]["traces"]["failing"][0]["file"], "trace-mutants/m.cfg")
 
+    def test_rejection_by_the_lint(self):
+        broken = "\n".join(edit(2, vars={"x": 2**40})) + "\n"
+        named = self.bad / "x.at-lint.ndjson"
+        named.write_text(broken)
+        code, summary, text = self.check(str(self.good), "--expect-rejected", str(self.bad))
+        self.assertEqual((code, summary["verdict"], summary["tla"]["traces"]["expected_rejections"]), (0, "pass", 2), text)
+        self.assertIn("x.at-lint.ndjson: refused by the lint as expected, line 3: vars.x: 1099511627776 does not fit", text)
+        # The name promises a lint failure, and only for a trace that must be rejected.
+        shutil.copy(ACCEPTED, named)
+        code, _, text = self.check(str(self.good), "--expect-rejected", str(self.bad))
+        self.assertEqual(code, 1)
+        self.assertIn("the lint accepts it, but must refuse it", text)
+        named.write_text(broken)
+        self.assertEqual(self.check(str(self.good), str(named))[0], 1)
+        # Without the name a malformed trace does not count as rejected.
+        for name in ("y.at-6.ndjson", "y.ndjson"):
+            (self.bad / name).write_text(broken)
+            named.unlink(missing_ok=True)
+            code, _, text = self.check(str(self.good), "--expect-rejected", str(self.bad))
+            self.assertEqual(code, 1)
+            self.assertIn(f"FAIL {name}: not a valid", text)
+            (self.bad / name).unlink()
+
     def test_zero_traces_is_never_a_pass(self):
         empty = self.root / "empty"
         empty.mkdir()
@@ -585,9 +615,7 @@ class CheckTests(unittest.TestCase):
         original = path.read_text()
         path.write_text("MatchVar( (* traceIndex'\n" + original + "\nIsEvent(x) traceExplained' (*\n")
         self.assertEqual(self.check(str(self.good))[0], 0)
-        weak = original.replace("RequireVar", "OptionalVar").replace("RequireSet", "OptionalSet")
-        weak = weak.replace("ChangedSet(tmPrepared, tmPrepared')", "OptionalSet(tmPrepared')")
-        path.write_text(weak + "\nRequireVar(x) in a note\n")
+        path.write_text(weaken(original) + "\nRequireVar(x) in a note\n")
         self.spec_error("requires no variable")
         # A name that is not applied is not a use.
         path.write_text(original.replace("TraceNext ==\n", "P(Logged) == Logged\nR == \\E IsEvent \\in {1} : IsEvent = 1\nQ(MatchVar(_)) == MatchVar(1)\nTraceNext ==\n"))

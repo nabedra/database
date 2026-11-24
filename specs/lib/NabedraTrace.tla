@@ -123,14 +123,17 @@ LOCAL Note(notes) ==
                 [old EXCEPT !.at = traceIndex,
                             !.notes = notes \cup (IF old.at = traceIndex THEN @ ELSE {})])
 
-\* The line's msg carries every field of m, with its value. Fields that m
-\* does not have are not checked. Use it in the second argument of a
-\* TraceStep, after the spec action, such as
-\* TMCommit /\ RequireMsg([type |-> "Commit"]).
-RequireMsg(m) ==
+\* The line's msg carries every field of m, with its value, and no other
+\* field except those in extras, which are not compared. Use it in the second
+\* argument of a TraceStep, such as
+\* TMCommit /\ RequireMsg([type |-> "Commit"], {}). When the spec's message
+\* is a record and the line also says where a fault hit it, project it:
+\* \E m \in msgs : DropMessage(m) /\ RequireMsg(m, {"to", "cause"}).
+RequireMsg(m, extras) ==
     LET have == IF HasMsg THEN DOMAIN LineMsg ELSE {}
         notes ==
             {<<"missing", "msg." \o f>> : f \in DOMAIN m \ have}
+            \cup {<<"unchecked", "msg." \o f>> : f \in have \ (DOMAIN m \cup extras)}
             \cup {<<"different", "msg." \o f>> :
                      f \in {g \in DOMAIN m \cap have : LineMsg[g] # m[g]}}
     IN IF notes = {} THEN TRUE ELSE Note(notes) /\ FALSE

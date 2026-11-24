@@ -83,7 +83,8 @@ fit is a decimal string. The lint refuses such an integer in `vars` and
 and the content of the first line no behavior explains, and with the
 variables that are missing, logged but not checked, or different there.
 Every trace under `--expect-rejected` must be rejected, at index `n` when
-the file is named `*.at-<n>.ndjson`. Without a trace to accept, the result
+the file is named `*.at-<n>.ndjson`, or refused by the lint when it is named
+`*.at-lint.ndjson`. Otherwise a lint failure is a failure there too. Without a trace to accept, the result
 is `not-run`, never `pass`: rejected samples, trace mutants and the control
 only show that the check works. A path that does not exist, a directory
 without traces next to other traces, and traces in a subfolder that no
@@ -119,7 +120,10 @@ Not detected, and left to the review of the trace spec:
 
 - a step that takes a weaker action than its name says, such as one that
   stutters under the name of a fault;
-- a `msg` field or a `node` that the step does not compare;
+- a `msg` field or a `node` that the step does not compare, and the extra
+  fields that `RequireMsg` allows;
+- that the variables and `msg` fields a trace writer declares for an action
+  are the ones the trace spec's step checks, until a trace shows it;
 - `OptionalVar` or `NoVars` without a reason, and a check that does not
   depend on the next state;
 - an initial state weaker than `Init`, and a constant from `params` that
@@ -172,7 +176,9 @@ supervisor, two mutants (`commit_one_prepared` breaks `Consistent`,
 traces include one with 64-bit times and a 64-bit seed. The rejected ones
 cover a step the spec does not allow, missing variables (one, a set, one of
 two, all), a variable that nothing checks, a wrong value and set, an element
-logged twice, and messages that are wrong, missing or out of place. The
+logged twice, messages that are wrong, missing, out of place or have a field
+too many, and traces the lint refuses. One accepted trace logs every variable of the transaction
+manager on its own steps and what the fault defines on the others. The
 trace mutants cover steps that skip or consume no line, trace specs that
 read `t`, `seed` or a wide `msg` field, and what each check in
 `NabedraTrace` requires. The checks `specs-selftest` (T0, T1),

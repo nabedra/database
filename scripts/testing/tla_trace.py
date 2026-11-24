@@ -20,7 +20,8 @@ specs/lib/NabedraTrace.tla). `trace_spec_errors` refuses a trace spec that could
 `wildcard_error` runs one control trace against it. For a rejected trace it prints the 0-based index
 and the content of the first line no behavior explains, and the variables that are missing, unchecked
 or different there. A directory argument means its `*.ndjson` files. Every trace under
---expect-rejected must be rejected, and one named `*.at-<n>.ndjson` must be rejected at index n.
+--expect-rejected must be rejected, and one named `*.at-<n>.ndjson` must be rejected at index n. One
+named `*.at-lint.ndjson` must be refused by the lint; for any other, a lint failure is a failure.
 
 If `<spec dir>/trace-mutants/` exists, each `*.cfg` there runs `<Name>TraceMutants.tla` on one trace.
 Its first lines name what must come out and the trace, relative to the spec folder:
@@ -52,7 +53,7 @@ STEP_REQUIRED = {"seq", "t", "node", "action", "vars"}
 STEP_KEYS = STEP_REQUIRED | {"msg"}
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
-AT = re.compile(r"\.at-(\d+)\.ndjson$")
+AT = re.compile(r"\.at-(\d+|lint)\.ndjson$")
 EXIT = {"pass": 0, "fail": 1, "not-run": 2, "error": 3}
 U64_MAX = 2**64 - 1
 I32_MIN, I32_MAX = -(2**31), 2**31 - 1
@@ -602,6 +603,19 @@ def cmd_check(args: argparse.Namespace) -> int:
             executed += 1
             label = _printable(trace.name)
             lint = lint_file(trace)
+            m = AT.search(trace.name) if must_reject else None
+            at_lint = m is not None and m.group(1) == "lint"
+            if lint and at_lint:
+                rejected += 1
+                expected_rejections += 1
+                print(f"[tla_trace] ok   {label}: refused by the lint as expected, {_printable(lint[0])}")
+                continue
+            if at_lint:
+                failed += 1
+                why = "the lint accepts it, but must refuse it"
+                failing.append({"file": label[:200], "index": None, "reason": why})
+                print(f"[tla_trace] FAIL {label}: {why}")
+                continue
             if lint:
                 failed += 1
                 failing.append({"file": label[:200], "index": None, "reason": _printable("lint: " + lint[0])[:300]})
@@ -631,7 +645,6 @@ def cmd_check(args: argparse.Namespace) -> int:
             lines = read_lines(trace)
             content = _printable(lines[at + 1]) if at is not None and 0 <= at + 1 < len(lines) else "(end of trace)"
             if must_reject:
-                m = AT.search(trace.name)
                 want = int(m.group(1)) if m else None
                 ok = result["outcome"] == "rejected" and (want is None or want == at)
                 if ok:

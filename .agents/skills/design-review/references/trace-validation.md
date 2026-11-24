@@ -61,9 +61,28 @@ a sorted array. Join two records with `@@`.
 `node` and `msg` are checked only where the step compares them, in its
 second argument. Write it so that a wrong node, a wrong message and a
 missing message are rejected: `LineNode \in RM`, and
-`TMCommit /\ RequireMsg([type |-> "Commit"])`, which needs the line's `msg`
-to carry those fields with those values, or `~HasMsg` for a step without a
-message. Add a rejected sample for each.
+`TMCommit /\ RequireMsg([type |-> "Commit"], {})`, which needs the line's
+`msg` to carry those fields with those values and no others, or `~HasMsg`
+for a step without a message. Add a rejected sample for each.
+
+The second argument of `RequireMsg` names extra fields that a line may carry
+and the spec does not use, such as where a fault hit the message. Project
+the spec's record out of the line instead of taking the whole `msg`:
+`\E m \in msgs : DropMessage(m) /\ RequireMsg(m, {"to", "cause"})`. The
+fields of `m` are still all required and compared, and a field in neither is
+rejected, so a misspelt one cannot pass as an extra. Extras are not
+compared.
+
+Requirements are per action, not per node. A fault line comes from the
+simulated world, which does not know the process's state, so its step
+requires only what the fault defines: `TMCrash` requires `tmUp`, not
+`tmDecision`. A step may still check more when the line has it:
+`[tmUp |-> RequireVar(tmUp')] @@ TMVars`, where `TMVars` has a `ChangedVar`
+for every variable of the node, accepts lines with the changed variables
+only and lines with all of them, and compares each one that is there.
+
+Nothing checks that the fields a trace writer declares for an action match
+the trace spec's step. Only a trace that uses them shows a difference.
 
 The first argument is a string, a name bound over a set of strings, or a
 parameter that its callers fill with one.
