@@ -1,0 +1,15 @@
+id = "OLTP-sim-reply-arena-range"
+title = "OLTP simulation seeds never finished bootstrap with a sampled reply arena below one Data apply budget"
+class = "other"
+module = "testing"
+guarantees = ["OLTP-G02", "OLTP-G03"]
+scenarios = []
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "server/sim-oltp/src/config.rs::tests::sampled_reply_arena_fits_the_largest_apply_budget"
+seed = 22
+trace_hash = "6f24dddcf3dc716f"
+why_not_caught = "The harness sampled data.apply_reply_bytes from 64 KiB, below the fixed 128 KiB Data apply reply budget that the arena can never grant above its capacity, and local preflights only ran seeds 1 to 3, 501, 502, 1001 and 1501."
+invariant_added = "Every sampled reply arena holds the largest fixed Data apply reply budget, so a smoke seed's workers bind HTTP within the bootstrap limit."
+fix_commits = ["1295b0b66df15e0474a70e7fdea61d3097426448"]
+revert_patch_ok = true

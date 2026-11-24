@@ -25,6 +25,8 @@ mod operator;
 pub(crate) mod recovery_tests;
 #[cfg(unix)]
 pub mod registered_process;
+#[cfg(feature = "sim")]
+pub mod sim;
 #[cfg(unix)]
 mod remote_api;
 pub mod replica;
@@ -147,16 +149,21 @@ impl ServeOptions {
 
 fn read_config<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T, ProtocolError> {
     use std::io::Read;
-    if !std::fs::metadata(path)
+    #[cfg(not(feature = "sim"))]
+    use std::fs::{OpenOptions, metadata};
+    #[cfg(feature = "sim")]
+    use nabedra_rt::fs::os::{OpenOptions, metadata};
+    if !metadata(path)
         .map_err(|_| invalid("configuration unreadable"))?
         .is_file()
     {
         return Err(invalid("configuration must be a regular file"));
     }
-    let mut open = std::fs::OpenOptions::new();
+    let mut open = OpenOptions::new();
     open.read(true);
     #[cfg(unix)]
     {
+        #[cfg(not(feature = "sim"))]
         use std::os::unix::fs::OpenOptionsExt;
         open.custom_flags(libc::O_NONBLOCK);
     }

@@ -42,9 +42,14 @@ jobs:
             include_s3=false
             echo "S3 checks omitted because the budget check failed." >> "$GITHUB_STEP_SUMMARY"
           fi
+          # Keep four OLTP shards, two Events shards and the Cache cluster sweep.
+          # The four OLTP entries join this list through their T2 check definitions.
           checks=$(python3 scripts/testing/run_check.py --list --tier T2 --json |
             jq -r --argjson include_s3 "$include_s3" \
-              '[.[] | select($include_s3 or (.needs | index("s3") == null)) | .id] | join(",")')
+              '[.[] |
+                select($include_s3 or (.needs | index("s3") == null)) |
+                select(.id != "events-sim-nightly-3" and .id != "events-sim-nightly-4") |
+                .id] | join(",")')
           # The run ID keeps a manual rerun on the same day from sharing evidence and S3 prefixes.
           request_id="nightly-${sha:0:7}-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}"
           {

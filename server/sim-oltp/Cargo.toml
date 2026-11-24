@@ -8,6 +8,11 @@ publish = false
 description = "Deterministic simulation of Nabedra OLTP"
 
 [dependencies]
+nabedra-database = { path = "..", version = "0.1.1", default-features = false, features = ["oltp", "sim"] }
+nabedra-check = { path = "../check", version = "0.1.0" }
+serde_json = "=1.0.154"
+ring = "=0.17.14"
+libc = "=0.2.191"
 nabedra-rt = { path = "../rt", features = ["sim"] }
 nabedra-sim = { path = "../sim" }
 nabedra-oltp-types = { path = "../oltp-types" }

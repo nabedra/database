@@ -282,6 +282,7 @@ type Observer = Arc<dyn Fn(&SimEvent<'_>) + Send + Sync>;
 struct Hooks {
     observers: Mutex<Vec<Observer>>,
     ext: Mutex<BTreeMap<TypeId, Box<dyn Any + Send>>>,
+    registries: Mutex<Vec<(&'static str, Box<dyn Fn() -> bool + Send>)>>,
 }
 
 impl std::fmt::Debug for Hooks {
@@ -302,6 +303,8 @@ pub struct World {
     /// Stop-the-world pauses so far, in nanoseconds: virtual time the runtime clock never
     /// ran ([`World::pause_all`]).
     paused_nanos: AtomicU64,
+    #[cfg(target_os = "linux")]
+    blocking_cpu_nanos: AtomicU64,
     services: services::Registry,
     volumes: volumes::Table,
     hooks: Hooks,
@@ -332,6 +335,8 @@ impl World {
                 nodes: BTreeMap::new(),
             }),
             paused_nanos: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            blocking_cpu_nanos: AtomicU64::new(0),
             services: services::Registry::new(seed),
             volumes: volumes::Table::default(),
             hooks: Hooks::default(),
@@ -360,6 +365,16 @@ impl World {
     /// Stop-the-world pauses so far.
     pub fn paused(&self) -> Duration {
         Duration::from_nanos(self.paused_nanos.load(Ordering::SeqCst))
+    }
+
+    /// CPU used by this world's blocking filesystem and service helper.
+    pub fn blocking_cpu_time(&self) -> Option<Duration> {
+        #[cfg(target_os = "linux")]
+        return Some(Duration::from_nanos(
+            self.blocking_cpu_nanos.load(Ordering::Relaxed),
+        ));
+        #[cfg(not(target_os = "linux"))]
+        None
     }
 
     fn with_node<T>(&self, node: u64, f: impl FnOnce(&mut Node) -> T) -> T {
@@ -492,15 +507,26 @@ impl World {
         }
     }
 
-    /// Crashes `node`, in this order: halts every volume of the node (the disk cut: no
+    /// Crashes `node`: resets its connections, then halts its volumes and aborts its tasks.
+    pub fn crash(&self, node: u64) {
+        self.cut_node(node, false);
+    }
+
+    /// Powers off `node`: black-holes existing sessions and refuses new dials,
+    /// then halts its volumes and aborts its tasks.
+    pub fn power_off(&self, node: u64) {
+        self.cut_node(node, true);
+    }
+
+    /// After cutting the network, halts every volume of the node (the disk cut: no
     /// later call changes an image), marks it down, marks its stepped services dead (a
     /// dead service is never stepped again and joins at once), then aborts every
     /// registered task. Destructors that run during the crash or the abort therefore find
     /// halted volumes and no live service to wait for. Helper-thread services
     /// (`spawn_service`) cannot be stopped; see the module documentation.
-    pub fn crash(&self, node: u64) {
+    fn cut_node(&self, node: u64, black_hole: bool) {
+        net::crash(self, node, black_hole);
         self.volumes.halt_node(node);
-        net::crash(self, node);
         let (context, tasks, parked) = self.with_node(node, |entry| {
             entry.up = false;
             entry.frozen = false;
@@ -641,6 +667,27 @@ impl World {
         let nanos = u64::try_from(by.as_nanos()).unwrap_or(u64::MAX);
         self.paused_nanos.fetch_add(nanos, Ordering::SeqCst);
         self.emit(&SimEvent::Pause { by });
+    }
+
+    /// Product registries use weak references. Record their referents against
+    /// this world without giving the registry a strong owner.
+    pub fn track_registry<T: ?Sized + Send + Sync + 'static>(
+        &self,
+        name: &'static str,
+        owner: &Arc<T>,
+    ) {
+        let weak = Arc::downgrade(owner);
+        let mut registries = lock(&self.hooks.registries);
+        registries.retain(|(_, live)| live());
+        registries.push((name, Box::new(move || weak.strong_count() != 0)));
+    }
+
+    /// Inspect entries left after this world's runtime has dropped. Other
+    /// worlds may still be executing or replaying separate seeds.
+    pub fn live_registries(&self) -> Vec<&'static str> {
+        let mut registries = lock(&self.hooks.registries);
+        registries.retain(|(_, live)| live());
+        registries.iter().map(|(name, _)| *name).collect()
     }
 
     /// Calls `observer` for every later simulation event, in order, so a harness can hash
@@ -1094,10 +1141,18 @@ fn run_blocking<R: Send + 'static>(
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     let job: Job = Box::new(move || {
         let _entered = handle.as_ref().map(tokio::runtime::Handle::enter);
-        let _installed = Installed::new(world);
+        #[cfg(target_os = "linux")]
+        let started = blocking_thread_cpu_nanos();
+        let _installed = Installed::new(world.clone());
         ROLE.set(Role::Blocking(context));
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
         ROLE.set(Role::Main);
+        #[cfg(target_os = "linux")]
+        if let Some((before, after)) = started.zip(blocking_thread_cpu_nanos()) {
+            world
+                .blocking_cpu_nanos
+                .fetch_add(after.saturating_sub(before), Ordering::Relaxed);
+        }
         let _ = reply.send(outcome);
     });
     HELPER.with(|helper| {
@@ -1110,6 +1165,21 @@ fn run_blocking<R: Send + 'static>(
     result
         .recv()
         .expect("the simulation blocking helper replies")
+}
+
+#[cfg(target_os = "linux")]
+fn blocking_thread_cpu_nanos() -> Option<u64> {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: clock_gettime initializes the writable timespec on success.
+    let time = unsafe {
+        if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()) != 0 {
+            return None;
+        }
+        time.assume_init()
+    };
+    let seconds = u64::try_from(time.tv_sec).ok()?;
+    let nanos = u64::try_from(time.tv_nsec).ok()?;
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
 }
 
 fn start_helper() -> std::sync::mpsc::Sender<Job> {

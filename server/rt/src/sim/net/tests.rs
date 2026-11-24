@@ -487,6 +487,39 @@ fn a_crash_resets_connections_and_closes_listeners_before_tasks_abort() {
 }
 
 #[test]
+fn power_off_discards_frames_without_reserving_the_restarted_listener() {
+    run(9, |world| async move {
+        nodes(&world, &[1, 2]);
+        let listener = world.listen(1, any(7100)).unwrap();
+        let addr = listener.local_addr();
+        let acceptor = world.spawn_node(1, async move {
+            let (pending, _) = listener.accept().await?;
+            let (mut stream, _) = pending.server_handshake(FULL).await?;
+            send(&mut stream, b"unread").await?;
+            std::future::pending::<io::Result<()>>().await
+        });
+        let (mut old, _) = in_node(2, async {
+            dial(Target::Addr(addr)).await?.client_handshake(FULL).await
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(ms(1)).await;
+        world.power_off(1);
+        assert!(acceptor.await.unwrap_err().is_cancelled());
+        send(&mut old, b"vanishes").await.unwrap();
+        assert!(read_some(&mut old, ms(10)).await.is_none());
+        let refused = in_node(2, dial(Target::Addr(addr))).await.unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+
+        world.restart(1);
+        let _listener = world.listen(1, any(7100)).unwrap();
+        let new = in_node(2, dial(Target::Addr(addr))).await.unwrap();
+        assert_eq!(new.peer_addr(), addr);
+        assert!(read_some(&mut old, ms(10)).await.is_none());
+    });
+}
+
+#[test]
 fn a_crashed_client_resets_the_server_side() {
     run(10, |world| async move {
         nodes(&world, &[1, 2]);

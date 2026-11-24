@@ -1,0 +1,68 @@
+# Deterministic OLTP cluster harness
+
+The smoke workload starts three registered workers and two API gateways. Each server process
+runs on its own mounted FaultFs volume. The bootstrap client provisions the workers, enrolls
+the gateways through public HTTP, and drives each gateway's supervisor handshake. Two client
+nodes then create a table, write and read a key, and check a retry through the second gateway.
+The workload checks public direct-path counters and resource gauges, mounted device identity,
+bounded readiness, and registry cleanup. The history checker checks single-key linearizability
+and keyed deduplication together.
+
+## Run and replay
+
+Run from `server/` with the pinned toolchain.
+
+```sh
+export RUSTFLAGS='--cfg tokio_unstable'
+export RUST_MIN_STACK=16777216
+export CARGO_TARGET_DIR=target/sim
+cargo run --locked -p nabedra-sim-oltp --bin nabedra-sim -- sweep
+NABEDRA_SEED=1 NABEDRA_SEEDS=1 NABEDRA_SIM_VERIFY_REPLAY=1 \
+  cargo run --locked -p nabedra-sim-oltp --bin nabedra-sim -- run
+```
+
+`NABEDRA_SEED` and `NABEDRA_SEEDS` select a contiguous seed range. A local sweep defaults to
+20 seeds and one job. `NABEDRA_SIM_VERIFY_REPLAY` selects the fraction that repeats. Each replay
+compares the trace hash, event count and history bytes. Worker frames on independent
+connections at the same virtual instant are ordered by connection. The trace preserves their
+per-connection order and history, probe, and fault boundaries. HTTP response flushes record
+delivery metadata because public stats include host-dependent profiling counters. Set `NABEDRA_SIM_TRACE=full` to save
+the whole chronological trace. `NABEDRA_SIM_ARTIFACTS` changes the artifact directory.
+Use an absolute path to share a directory between CLI and libtest invocations.
+
+```sh
+NABEDRA_SEED=1 NABEDRA_SEEDS=1 NABEDRA_SIM_VERIFY_REPLAY=1 NABEDRA_SIM_TEST_DEFECTS=1 \
+  cargo run --locked -p nabedra-sim-oltp --bin nabedra-sim -- sweep
+
+NABEDRA_SEED=1 NABEDRA_SEEDS=1 NABEDRA_SIM_DEFECT=lost-write \
+  cargo run --locked -p nabedra-sim-oltp --bin nabedra-sim -- shrink
+```
+
+The first command runs a clean seed, then runs both seeded defects and confirms the reduced
+loss tape reproduces the checker anomaly. The second command reports the expected anomaly and
+writes a reduced tape. Set `NABEDRA_SIM_TAPE` to that tape, keep the defect and seed, and use
+`run` to replay it.
+
+For the seeded lost write, the harness removes a row through HTTP after a real acknowledgement
+and excludes the injected deletion from the client history. For the seeded stale read, it
+records a previously observed row in place of the latest HTTP response. Both controls are
+part of the development-only harness.
+
+## Evidence scope
+
+The sweep report stores seed and configuration hashes, trace hashes, replay counts, virtual
+duration, run wall time, CPU including the simulated blocking helper, and the process RSS high-water mark for each
+measured run. Run with one job to calibrate the memory required by a single active seed. Report
+and history evidence are labelled fault-model. The RT stack setting leaves room for the real
+worker bootstrap in debug builds.
+
+The public checks cover the smoke history, a bounded startup, device identity and visible
+resource gauges. The first T1 shard also runs a focused power-cycle regression that
+reopens the mounted workers and reads the acknowledged value through the original gateway.
+Per-replica apply and vote state, all published key ranges, and the complete
+ledger need the P10-PROBES stream. The direct workload will supply D04 and D05, and the cold
+workload will supply O15. Those scenario claims require their own assertions and timing runs.
+
+The fixture certificates and private keys are generated exclusively for this simulator. Their
+fingerprints are stable across seeds. SimNet carries the same peer identity and negotiated
+protocol to the production authorization code. The fixture keys are public test data.

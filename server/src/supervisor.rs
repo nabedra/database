@@ -4,7 +4,7 @@ use nabedra_rt::time::{Duration, Instant, timeout_at};
 use serde::Serialize;
 use std::io;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::UnixStream,
 };
 const MAX_FRAME: usize = 16 << 10;
@@ -14,7 +14,10 @@ fn invalid() -> io::Error {
 fn timed_out() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "supervisor frame deadline")
 }
-pub(crate) async fn frame(stream: &mut UnixStream, end: Option<Instant>) -> io::Result<Vec<u8>> {
+pub(crate) async fn frame(
+    stream: &mut (impl AsyncRead + Unpin),
+    end: Option<Instant>,
+) -> io::Result<Vec<u8>> {
     let mut first = [0; 1];
     match end {
         Some(end) => {
@@ -46,7 +49,7 @@ pub(crate) async fn frame(stream: &mut UnixStream, end: Option<Instant>) -> io::
     Ok(body)
 }
 pub(crate) async fn send(
-    stream: &mut UnixStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     value: &impl Serialize,
     end: Instant,
 ) -> io::Result<()> {
