@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "land-p8h-checks-1ea3874-102813--crate-graph.log",
+      "sha256": "d6735a7baeb04fa5f91bdc2d25a30e7ebf18514599ba3c066fc443b1d1e38d0c"
+    }
+  ],
+  "assertions": {
+    "executed": 23,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "crate-graph",
+  "duration_s": 26.63,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T09:31:14.073481+00:00",
+    "request_id": "land-p8h-checks-1ea3874-102813",
+    "runner": "GitHub Actions 1000010861",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45365489588"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "1ea3874554894918cab2d7ec0970f1f79811f092",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
