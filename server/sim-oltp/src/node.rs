@@ -811,6 +811,15 @@ impl Cluster {
     }
 }
 
+/// The world owns the planner, and the planner owns the fault profiles that a workload
+/// installed. A profile may hold the world, so the cluster releases the planner it
+/// installed, also when a seed panics before its teardown.
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        self.world.clear_net_planner();
+    }
+}
+
 async fn supervisor_send(channel: &mut DuplexStream, json: &Value) -> Result<(), String> {
     let body = serde_json::to_vec(json).map_err(|err| err.to_string())?;
     channel
@@ -866,10 +875,65 @@ fn overlaps(mut edges: Vec<(u64, i32)>) -> Vec<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{Arc, Mutex, Weak},
+    };
+
+    use nabedra_rt::sim::World;
 
     use super::{Cluster, overlaps};
-    use crate::{config::Config, disk::DiskCut, invariants::Invariants};
+    use crate::{
+        config::Config, disk::DiskCut, invariants::Invariants, net::Action, workload::live_after,
+    };
+
+    /// A run of a cluster whose frame profile holds the world, as the nemesis profiles do.
+    async fn run_with_a_profile_that_holds_the_world(world: Arc<World>, panics: bool) {
+        Config::sample(1).setup(&world);
+        let checks = Invariants::new();
+        let mut cluster = Cluster::new(world.clone(), checks, 1, Arc::new(|_, _| {}), |_, _, _| {})
+            .await
+            .unwrap();
+        cluster.net().set_frame_profile(move |_| {
+            let _ = world.elapsed();
+            Action::Pass
+        });
+        assert!(!panics, "seeded harness panic");
+        cluster.teardown().await;
+    }
+
+    /// `cold` seed 4: a nemesis profile held the world, so no run's disk images were freed.
+    #[test]
+    fn a_profile_that_holds_the_world_does_not_outlive_its_run() {
+        let world = nabedra_sim::runtime::run(1, |world| async move {
+            run_with_a_profile_that_holds_the_world(world.clone(), false).await;
+            world
+        });
+        assert_eq!(live_after(world), [""; 0]);
+    }
+
+    #[test]
+    fn a_profile_that_holds_the_world_does_not_outlive_a_panic() {
+        let seen = Mutex::new(Weak::new());
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            nabedra_sim::runtime::run(1, |world| {
+                *seen.lock().unwrap() = Arc::downgrade(&world);
+                run_with_a_profile_that_holds_the_world(world, true)
+            });
+        }));
+        assert!(result.is_err());
+        let world = seen.into_inner().unwrap().upgrade();
+        assert!(world.is_none_or(|world| live_after(world).is_empty()));
+    }
+
+    /// The check between seeds reports a world that something still holds.
+    #[test]
+    fn a_retained_world_is_not_empty() {
+        let world = nabedra_sim::runtime::run(1, |world| async move { world });
+        let held = world.clone();
+        assert_eq!(live_after(world), ["World"]);
+        assert_eq!(live_after(held), [""; 0]);
+    }
 
     /// Direct seed 8: a worker killed while frozen kept its links held, so its next process
     /// had no network and never became ready.

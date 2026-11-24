@@ -64,11 +64,10 @@ fn run(
         let result = execute(body, world.clone()).await;
         (result, world)
     });
-    // The runtime has dropped, including cancelled task futures and blocking helpers.
-    // Filter the weak registry by this World so parallel seeds cannot alias its mount.
+    // The runtime has dropped, including cancelled task futures.
     result.blocking_cpu = world.blocking_cpu_time();
-    let live = world.live_registries();
-    let clean = registries_empty(&world) && live.is_empty();
+    let live = live_after(world);
+    let clean = live.is_empty();
     result.assertions.insert("registries empty", clean);
     if !clean {
         result.run.violations.push(format!(
@@ -77,6 +76,30 @@ fn run(
         ));
     }
     result
+}
+
+/// What a finished run still keeps alive. The registries hold weak references, so they
+/// miss a cycle through the world itself, which owns every mounted image: the world must
+/// be gone once this last handle drops. Entries are filtered by this world, so parallel
+/// seeds cannot alias its mounts.
+pub(crate) fn live_after(world: Arc<World>) -> Vec<&'static str> {
+    // The blocking helper replies before it drops its job's handle on the world, and it
+    // takes one job at a time, so a later job's reply means that handle is gone.
+    nabedra_sim::runtime::run(0, |_| async {
+        nabedra_rt::task::spawn_blocking(|| ())
+            .await
+            .expect("simulation blocking helper");
+    });
+    let mut live = world.live_registries();
+    if !registries_empty(&world) {
+        live.push("disk budget registry");
+    }
+    let released = Arc::downgrade(&world);
+    drop(world);
+    if released.strong_count() != 0 {
+        live.push("World");
+    }
+    live
 }
 
 struct Program {
