@@ -22,6 +22,33 @@ pub(crate) struct VerifiedNativeRestore {
     target_cut: CommitTs,
     graph: RestoreGraph,
 }
+impl crate::oltp_replication::manager::RegisteredRestore for VerifiedNativeRestore {
+    async fn verify(
+        backups: &[PathBuf],
+        target_cut: Option<CommitTs>,
+        database: &str,
+        target_run: Option<Uuid>,
+        shared: Arc<WorkerSharedResources>,
+        remote: Option<Arc<dyn Repository>>,
+        keys: Arc<ArchiveKeys>,
+    ) -> Result<Self, ProtocolError> {
+        Self::verify(backups, target_cut, database, target_run, shared, remote, keys).await
+    }
+
+    fn plan(&self) -> &VerifiedRestorePlan {
+        &self.plan
+    }
+
+    async fn install(
+        self,
+        target: OfflineRestoreTarget,
+        pool: &OltpPool,
+    ) -> Result<RestoredGenesis, ProtocolError> {
+        let (genesis, _) = self.install(target, pool).await?;
+        Ok(genesis)
+    }
+}
+
 impl VerifiedNativeRestore {
     pub(crate) async fn verify(
         backups: &[PathBuf],
