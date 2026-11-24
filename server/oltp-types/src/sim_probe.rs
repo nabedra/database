@@ -142,6 +142,8 @@ pub enum Probe {
         term: u64,
         leader: u64,
     },
+    /// A replica starts the transaction that applies the direct entry at `index`.
+    DirectApplying { group: Uuid, index: u64 },
     /// A direct commit wrote its dedup record in the transaction that applies its Raft
     /// entry. The entry is committed; the record is visible once the matching `Applied`
     /// follows, and a retried transaction reports it again before that.
@@ -206,6 +208,7 @@ impl Probe {
             Self::VoteSaved { .. } => "VoteSaved",
             Self::Applied { .. } => "Applied",
             Self::LeaderSeen { .. } => "LeaderSeen",
+            Self::DirectApplying { .. } => "DirectApplying",
             Self::DedupApplied { .. } => "DedupApplied",
             Self::SnapshotServed { .. } => "SnapshotServed",
             Self::DirectProposed { .. } => "DirectProposed",

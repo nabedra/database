@@ -636,6 +636,13 @@ fn apply(
         tx.put_serialized(&fence_key, &receipt)?;
         return commit(tx, &ParticipantReply::Fenced(receipt));
     }
+    #[cfg(feature = "sim")]
+    if matches!(command, ParticipantCommand::Direct(_) | ParticipantCommand::DirectBatch(_)) {
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::DirectApplying {
+            group: group.group_id,
+            index: position.index,
+        });
+    }
     match command {
         ParticipantCommand::Direct(direct) => {
             return direct::apply(tx, group, config.as_ref(), direct);

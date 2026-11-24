@@ -147,6 +147,9 @@ pub struct DedupIdentity {
 /// One worker's ledgers, by ledger and group, as its last snapshot reported them.
 pub type Ledgers = BTreeMap<(Ledger, Option<Uuid>), u64>;
 
+/// A dedup record: the identity, its commit timestamp and its digest.
+type DedupRecord = (DedupIdentity, u64, Digest);
+
 type Root = (Option<Uuid>, u64);
 type Page = (Option<Uuid>, Vec<RouteSpan>);
 
@@ -170,12 +173,16 @@ pub struct Protocol {
     replica_node: BTreeMap<Replica, u64>,
     /// Identities whose committed entry some replica applied, and when the first did.
     committed: BTreeMap<DedupIdentity, u64>,
-    /// Per node and group: dedup records written since its last `Applied`.
-    staged: BTreeMap<(u64, Uuid), Vec<(DedupIdentity, u64, Digest)>>,
+    /// Per node and group: the direct entry its last transaction started to apply.
+    applying: BTreeMap<(u64, Uuid), u64>,
+    /// Per node, group and log index: dedup records written by transactions applying that
+    /// entry and not published yet. Two replicas of a group can share a node, so each
+    /// `Applied` publishes one copy.
+    staged: BTreeMap<(u64, Uuid, u64), Vec<DedupRecord>>,
     /// The first visible dedup record per identity.
     dedup: BTreeMap<DedupIdentity, (u64, Digest)>,
-    /// Dedup records made visible, per node incarnation.
-    dedup_seen: BTreeSet<(u64, u64, DedupIdentity)>,
+    /// Dedup records made visible, per node incarnation and replica.
+    dedup_seen: BTreeSet<(u64, u64, Replica, DedupIdentity)>,
     /// Per group: the highest snapshot timestamp served on any replica.
     served: BTreeMap<Uuid, u64>,
     /// Per table: committed routing roots and pages by commit timestamp. `None` is a delete.
@@ -294,7 +301,12 @@ impl Protocol {
             } => {
                 self.place(*group, *replica, node);
                 self.apply(origin, *group, *replica, entry, *digest, &mut out);
-                self.publish_dedup(origin, *group, &mut out);
+                self.publish_dedup(origin, (*group, *replica), entry.index, &mut out);
+            }
+            Probe::DirectApplying { group, index } => {
+                if let Some(node) = node {
+                    self.applying.insert((node, *group), *index);
+                }
             }
             Probe::LeaderSeen {
                 group,
@@ -318,14 +330,13 @@ impl Protocol {
                 self.committed
                     .entry(identity.clone())
                     .or_insert(origin.t_ns);
-                if let Some(node) = node {
-                    // A retried apply transaction writes the same record again before its
-                    // entry's Applied, so one staged record stands for both.
-                    let record = (identity, *commit_ts, *digest);
-                    let staged = self.staged.entry((node, *group)).or_default();
-                    if !staged.contains(&record) {
-                        staged.push(record);
-                    }
+                if let Some(node) = node
+                    && let Some(index) = self.applying.get(&(node, *group))
+                {
+                    self.staged
+                        .entry((node, *group, *index))
+                        .or_default()
+                        .push((identity, *commit_ts, *digest));
                 }
             }
             Probe::SnapshotServed { group, read_ts } => {
@@ -563,11 +574,27 @@ impl Protocol {
         }
     }
 
-    /// DedupUnique: the entry that wrote the staged records applied, so they are visible.
-    fn publish_dedup(&mut self, origin: Origin, group: Uuid, out: &mut Vec<Violation>) {
+    /// DedupUnique: the entry at `index` applied on `replica`, so the records its
+    /// transaction wrote are visible. A retried transaction wrote further copies of them.
+    fn publish_dedup(
+        &mut self,
+        origin: Origin,
+        replica: Replica,
+        index: u64,
+        out: &mut Vec<Violation>,
+    ) {
         let Some(node) = origin.node else { return };
-        for (identity, commit_ts, digest) in self.staged.remove(&(node, group)).unwrap_or_default()
-        {
+        let mut published: Vec<DedupRecord> = Vec::new();
+        if let Some(staged) = self.staged.get_mut(&(node, replica.0, index)) {
+            staged.retain(|record| {
+                let first = !published.contains(record);
+                if first {
+                    published.push(record.clone());
+                }
+                !first
+            });
+        }
+        for (identity, commit_ts, digest) in published {
             self.ran(DEDUP_UNIQUE, 1);
             let DedupIdentity {
                 table,
@@ -578,6 +605,7 @@ impl Protocol {
                 .dedup
                 .entry(identity.clone())
                 .or_insert((commit_ts, digest));
+            let seen = (node, origin.incarnation, replica, identity.clone());
             if record != (commit_ts, digest) {
                 out.push((
                     DEDUP_UNIQUE,
@@ -586,14 +614,12 @@ impl Protocol {
                         record.0
                     ),
                 ));
-            } else if !self
-                .dedup_seen
-                .insert((node, origin.incarnation, identity.clone()))
-            {
+            } else if !self.dedup_seen.insert(seen) {
                 out.push((
                     DEDUP_UNIQUE,
                     format!(
-                        "table {table} key {key:?} request {request_id}: n{node} wrote a second dedup record in one incarnation"
+                        "table {table} key {key:?} request {request_id}: replica {} on n{node} wrote a second dedup record in one incarnation",
+                        replica.1
                     ),
                 ));
             }
@@ -664,7 +690,8 @@ impl Protocol {
     pub fn crashed(&mut self, node: u64) {
         self.native.remove(&node);
         self.ledgers.remove(&node);
-        self.staged.retain(|(owner, _), _| *owner != node);
+        self.staged.retain(|(owner, ..), _| *owner != node);
+        self.applying.retain(|(owner, _), _| *owner != node);
     }
 
     /// The node's volume was replaced: its replicas lost their logs. A vote the old
@@ -1045,22 +1072,29 @@ mod tests {
         for replica in 1..=3 {
             protocol.observe(origin(replica), &appended(replica, &[at(1, 1), at(2, 1)]));
         }
-        let mut write = |node, index, commit_ts, attempts| {
+        let mut write = |node, replica, index, commit_ts, attempts| {
             for _ in 0..attempts {
+                let applying = Probe::DirectApplying {
+                    group: GROUP,
+                    index,
+                };
+                assert!(protocol.observe(origin(node), &applying).is_empty());
                 assert!(
                     protocol
                         .observe(origin(node), &dedup(commit_ts, 1))
                         .is_empty()
                 );
             }
-            kinds(&protocol.observe(origin(node), &applied(node, at(index, 1), 9)))
+            kinds(&protocol.observe(origin(node), &applied(replica, at(index, 1), 9)))
         };
         // A retried transaction is one record.
-        assert!(write(1, 1, 10, 2).is_empty());
-        assert!(write(2, 1, 10, 1).is_empty());
-        assert_eq!(write(3, 1, 11, 1), [DEDUP_UNIQUE]);
+        assert!(write(1, 1, 1, 10, 2).is_empty());
+        // A second replica of the group on the same node has its own.
+        assert!(write(1, 4, 1, 10, 1).is_empty());
+        assert!(write(2, 2, 1, 10, 1).is_empty());
+        assert_eq!(write(3, 3, 1, 11, 1), [DEDUP_UNIQUE]);
         // The same record from a second entry of one incarnation is a second record.
-        assert_eq!(write(1, 2, 10, 1), [DEDUP_UNIQUE]);
+        assert_eq!(write(2, 2, 2, 10, 1), [DEDUP_UNIQUE]);
         assert_eq!(protocol.committed().count(), 1);
 
         protocol.observe(
