@@ -27,6 +27,7 @@ seeds = [1, 10000]
 kind = "lib-test"
 test = "oltp_replication::typed_network::tests::o26_learner_accepts_current_leader_while_replaying_historical_membership"
 mode = "on"
+assertion = "state"
 failure_contains = ["left: None", "right: Some(ReplicaMember { node_id: 4"]
 
 [regression.evidence]
@@ -39,11 +40,12 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out
 az2: with the patch failed; verified (digest 4c4fdbd5f4ddff31669fb5037603e7f7788b4dd6f3ac78e04d3255575916ccf6)
 """ }
 
-# Transcribed from that review. It applied the patch itself and ran the named test with and without it, locally and
-# unattested. The assertion type is P10-BUGS-2's reading of the failure text, not the review's word.
+# Transcribed from the two reviews of #113 (LAND-113), whose second one confirmed the verdict and the assertion type. The
+# reviewer applied the patch and ran the named test with and without it, locally and unattested.
 [review]
+digest = "690b6abf87297cd2e6a5dc86f820fbbc84b03f8915e24b7e7387a24b13398ae1"
 verdict = "sensitive"
 assertion = "state"
-reviewer = "Claude Opus 5.5 (LAND-113, independent review of PR #113, wrote none of it)"
-source = "https://github.com/zPy52/nabedra-database/pull/113, review of heads 67ea0db3 and 90b869b3"
+reviewer = "Claude Opus 5.5 (LAND-113, independent reviewer of PR #113, wrote no patch)"
+source = "wave-p8/reports/land-113.md, and https://github.com/zPy52/nabedra-database/pull/113#issuecomment-7141927346 and #issuecomment-7147012706"
 notes = "The verified sender identity is None with the patch."

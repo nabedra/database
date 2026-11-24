@@ -41,6 +41,6 @@ failure_contains = ["registered startup ValidationError: worker does not host ta
 # The old runs are not recorded as [regression.evidence]: their digest was for the old path, and
 # the re-verification that would justify a new one did not fail. `check` accepts a clean port
 # without evidence. By lead decision 8 a simulator hit on this patch does not count until a test
-# fails because of it, and sim_bugs.py run refuses to count one: there is no evidence, and no
-# [review] calls the patch sensitive (LAND-113 wrote "not shown to be sensitive" and did not run it).
+# fails because of it. There is no evidence and no [review] that calls it sensitive (LAND-113 wrote "not
+# shown to be sensitive" and did not run it), so sim_bugs.py run does not search it and says not shown.
 attempts = 10

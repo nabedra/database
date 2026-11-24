@@ -29,6 +29,7 @@ seeds = [1, 10000]
 kind = "lib-test"
 test = "oltp_runtime::application::direct::tests::d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome"
 mode = "on"
+assertion = "state"
 # The direct-history fixture detects the false refusal at the pre-retry read, as in the run below.
 failure_contains = ["failed-write-observed", "completed not_applied"]
 
@@ -41,11 +42,12 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out
 bug1-auth: with the patch failed; verified (digest 41b14a61c5962534320122e99c57f88b420855d36105ed442b26df5087ae82e3)
 """ }
 
-# Transcribed from that review. It applied the patch itself and ran the named test with and without it, locally and
-# unattested. The assertion type is P10-BUGS-2's reading of the failure text, not the review's word.
+# Transcribed from the two reviews of #113 (LAND-113), whose second one confirmed the verdict and the assertion type. The
+# reviewer applied the patch and ran the named test with and without it, locally and unattested.
 [review]
+digest = "6bc9acafcf3902ac2c3501c5b1a0b299f31d495127f522fe4c62c6544e64a1e0"
 verdict = "sensitive"
 assertion = "state"
-reviewer = "Claude Opus 5.5 (LAND-113, independent review of PR #113, wrote none of it)"
-source = "https://github.com/zPy52/nabedra-database/pull/113, review of heads 67ea0db3 and 90b869b3"
+reviewer = "Claude Opus 5.5 (LAND-113, independent reviewer of PR #113, wrote no patch)"
+source = "wave-p8/reports/land-113.md, and https://github.com/zPy52/nabedra-database/pull/113#issuecomment-7141927346 and #issuecomment-7147012706"
 notes = "The history fixture reports failed-write-observed and non-linearizable with the patch."

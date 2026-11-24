@@ -38,7 +38,8 @@ Commands:
                  an earlier manifest held and nobody ran.
   evidence [ids] Compare the recorded regression output and searches.jsonl with the logs of attested
                  runs in `--records <dir>`. Signatures are for `gh attestation verify`.
-  digest <id>    Print the changed-lines digest to record in a manifest's evidence.
+  digest <id>    Print the changed-lines digest to record in a manifest's evidence, and the digest
+                 of the whole patch that its [review] must name.
 
 Use `--set <name>` instead of ids to select the manifests of one set (direct, queued, topology,
 membership, resources). Exit status: 0 success, 1 failure, 2 usage or environment error.
@@ -58,6 +59,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import unicodedata
 
 REPO = Path(__file__).resolve().parents[2]
 BUGS_DIR = Path("server/sim-oltp/bugs")
@@ -103,10 +105,14 @@ TRACE_HASH = re.compile(r"[0-9a-f]{16}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
 RUN_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/[0-9]+")
 VERIFIED = re.compile(r"^(\S+): with the patch failed; verified \(digest ([0-9a-f]{64})\)$", re.MULTILINE)
+# Decision 9 wants text that exists: a plan, a contract or a register.
+RULE_SOURCE = re.compile(r"(?:docs|plans)/(?:[a-z0-9_-]+/)*[a-z0-9_-]+\.md")
 VERDICTS = ("sensitive", "partial", "not-sensitive")
 ASSERTIONS = ("state", "counter", "timeout")
 SEED_BUDGET = 10_000
 SEARCHES = "searches.jsonl"
+TARGET_FILE = re.compile(r"server/sim-oltp/bugs/(?:README\.md|(?:phase[0-9]+/)?(?:simulator\.toml|[a-z0-9-]+/"
+                         r"(?:bug\.toml|revert\.patch|probe\.patch|searches\.jsonl)))")
 SEARCH_SCHEMA = "nabedra.sim-bug-search/1"
 SEARCH_FIELDS = {"schema", "id", "sha", "run", "attempt", "plan", "digest", "patch_sha256", "result", "seeds",
                  "tried", "hit", "masked", "rates", "why"}
@@ -130,7 +136,7 @@ DETECTION_FIELDS = {"seed": int, "trace_hash": str, "history_sha256": str, "mech
 # A hit that shows a known finding instead of the reverted fix.
 MASKED_FIELDS = {"seed": int, "trace_hash": str, "history_sha256": str, "finding": str, "reason": str,
                  "confirmed_by": str, "confirmation": str}
-REVIEW_FIELDS = {"verdict": str, "assertion": str, "reviewer": str, "source": str, "notes": str}
+REVIEW_FIELDS = {"digest": str, "verdict": str, "assertion": str, "reviewer": str, "source": str, "notes": str}
 REGRESSION_FIELDS = {"kind": str, "test": str, "scenario": str, "mode": str, "assertion": str,
                      "failure_contains": list, "timeout_s": int, "attempts": int, "evidence": dict}
 EVIDENCE_FIELDS = {"digest": str, "patched": dict, "clean": dict}
@@ -331,7 +337,7 @@ def load_bugs(repo):
         try:
             with (path / "bug.toml").open("rb") as stream:
                 manifest = tomllib.load(stream)
-            patch = (path / "revert.patch").read_text(encoding="utf-8")
+            patch = (path / "revert.patch").read_bytes().decode("utf-8")
         except (OSError, ValueError) as error:
             errors.append(f"{name}: {error}")
             continue
@@ -430,7 +436,7 @@ def validate_manifest(bug, records, known_guarantees, require_evidence=True):
     problems.extend(validate_regression(bug, require_evidence))
     problems.extend(validate_patch_paths(bug.patch))
     if not problems:
-        problems.extend(validate_review(m))
+        problems.extend(validate_review(bug))
         problems.extend(validate_hits(bug))
     return problems
 
@@ -451,9 +457,16 @@ def validate_expect(m):
             for kind in m["expect"] if not KIND.fullmatch(kind) or kind.lower() in FAULT_KINDS]
 
 
-def validate_review(m):
+def whole_digest(bug):
+    """SHA-256 of everything a review of the patch reads: the whole patch, with its context and headers, and
+    the probe if there is one. Any other byte is another patch to a reviewer."""
+    probe = getattr(bug, "probe", None)
+    return hashlib.sha256((bug.patch if probe is None else f"{bug.patch}\0{probe}").encode()).hexdigest()
+
+
+def validate_review(bug):
     """[review], [[rules]] and hold."""
-    problems = []
+    m, problems = bug.manifest, []
     if "hold" in m and not m["hold"].strip():
         problems.append("hold must say why the target may not count")
     if "review" in m:
@@ -467,6 +480,11 @@ def validate_review(m):
             problems.append(f"review.assertion must be one of {', '.join(ASSERTIONS)}")
         if review["verdict"] == "sensitive" and review["assertion"] != "state":
             problems.append("review: sensitive needs a state assertion; a counter or a timeout alone shows no defect")
+        if review["digest"] != whole_digest(bug):
+            problems.append(f"review.digest is of another patch than this one ({whole_digest(bug)}): remove [review] until "
+                            "the patch has been reviewed again")
+        if bug.regression.get("assertion", review["assertion"]) != review["assertion"]:
+            problems.append("regression.assertion contradicts [review]")
         problems.extend(f"review.{key} must not be empty" for key in ("reviewer", "source") if not review[key].strip())
     for rule in m.get("rules", []):
         if (not isinstance(rule, dict) or set(rule) != {"kind", "source", "text"}
@@ -474,6 +492,10 @@ def validate_review(m):
             problems.append("rules: each needs a kind, a source and a text")
         elif rule["kind"] not in m["expect"]:
             problems.append(f"rules: {rule['kind']} is not in expect")
+        elif not RULE_SOURCE.fullmatch(rule["source"]):
+            problems.append(f"rules: the source {rule['source']!r} is no plan, contract or register of this repository")
+        elif len(rule["text"].split()) < 5:
+            problems.append(f"rules: the quote for {rule['kind']} is too short to state a rule")
     return problems
 
 
@@ -517,12 +539,14 @@ def validate_hits(bug):
         problems.append("review.reviewer wrote the patch, so it does not review it")
     # The tool cannot judge prose. It can refuse prose that does not name this hit and this patch,
     # or that names another hit.
-    text, own = d["mechanism"], {d["trace_hash"], d["history_sha256"], d["search"], *m["fix_commits"]}
-    for seed in re.findall(r"\bseeds?\s+#?(\d+)", text, re.IGNORECASE):
+    text, own = d["mechanism"], {*(d[key] for key in ("trace_hash", "history_sha256", "search")), *m["fix_commits"]}
+    own.update(entry["search"]["hit"]["twin_trace_hash"] for entry in load_searches(bug)[0]
+               if "search" in entry and search_hash(entry["search"]) == d["search"] and entry["search"]["hit"])
+    for seed in re.findall(r"\bseed\s+#?(\d+)", text, re.IGNORECASE):
         if int(seed) != d["seed"]:
             problems.append(f"detection.mechanism names seed {seed}, not this hit's seed")
-    for token in re.findall(r"\b[0-9a-f]{12,64}\b", text.lower()):
-        if token not in own:
+    for token in re.findall(r"\b[0-9a-f]{16,64}\b", text.lower()):
+        if len(token) in (16, 40, 64) and token not in own:
             problems.append(f"detection.mechanism names {token}, which is not this hit's")
     if not re.search(rf"\bseed {d['seed']}\b", text) or d["trace_hash"] not in text:
         problems.append(f"detection.mechanism must name seed {d['seed']} and its trace hash")
@@ -602,6 +626,9 @@ def validate_patch_paths(patch):
                             f"{', '.join(diff.headers) or 'no hunk'}")
     if len({diff.name for diff in files}) != len(files):
         problems.append("revert.patch has two sections for one file")
+    hidden = sorted({f"U+{ord(c):04X}" for c in patch if c not in "\n\t" and unicodedata.category(c) in ("Cc", "Cf")})
+    if hidden:
+        problems.append(f"revert.patch holds characters that a reviewer cannot see: {', '.join(hidden)}")
     for name, (removed, added) in changed_lines(patch).items():
         problems.extend(f"revert.patch changes in {name} a line that can act only in the simulator, or that reads the "
                         f"build or its environment: {line.strip()[:80]!r}" for line in [*removed, *added]
@@ -757,11 +784,25 @@ def regression_evidence(bug, repo):
     return [], uncounted
 
 
+def not_shown(bug):
+    """Why no hit on this target can count, so that a search would only take time from the others."""
+    m = bug.manifest
+    if "hold" in m:
+        return f"held: {m['hold']}"
+    if bug.regression.get("evidence") is None:
+        return "no regression evidence: no test is recorded to fail because of this patch"
+    if m.get("review", {}).get("verdict", "sensitive") != "sensitive":
+        return f"the independent review calls the patch {m['review']['verdict']}"
+    return None
+
+
 def static_count_problems(bug, repo):
     """What keeps a target from counting, whatever a search finds."""
     m, problems = bug.manifest, regression_evidence(bug, repo)[1]
     if "hold" in m:
         problems.append(f"held: {m['hold']}")
+    if "assertion" not in bug.regression:
+        problems.append("regression.assertion is not recorded")
     review = m.get("review")
     if review is None:
         problems.append("no independent review of the patch is recorded")
@@ -946,10 +987,9 @@ def validate_git(bug, repo, require_evidence=True):
                                 f"{old.get('bug')}, {old.get('phase')}, {old.get('set')}")
                 break
     for rule in m.get("rules", []):
-        if rule["source"].startswith(("docs/", "plans/")):
-            source = git(repo, "show", f"HEAD:{rule['source']}", check=False).stdout
-            if " ".join(rule["text"].split()) not in " ".join(source.split()):
-                problems.append(f"rules: the quote for {rule['kind']} is not in {rule['source']}")
+        source = git(repo, "show", f"HEAD:{rule['source']}", check=False).stdout
+        if " ".join(rule["text"].split()) not in " ".join(source.split()):
+            problems.append(f"rules: the quote for {rule['kind']} is not in {rule['source']}")
     if bug.regression.get("kind") == "lib-test":
         name = bug.regression["test"].rsplit("::", 1)[-1]
         found = git(repo, "grep", "-q", "-E", rf"fn {name}\b", "HEAD", "--", "server", check=False)
@@ -1181,7 +1221,8 @@ def cmd_verify(repo, bugs, args, out):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     # The product's own build: no flag of the simulator's, and no inherited one.
     env = {key: value for key, value in os.environ.items()
-           if not key.startswith(("NABEDRA_SIM_", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"))}
+           if not key.startswith(("NABEDRA_SIM_", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS",
+                                  "RUSTUP_TOOLCHAIN", "LD_PRELOAD"))}
     env["CARGO_TARGET_DIR"] = str(target)
     need_server = any(b.regression.get("kind") == "acceptance" for b in bugs)
     verdicts = {}
@@ -1257,6 +1298,8 @@ def cmd_verify(repo, bugs, args, out):
 
 SEED_MARK = "nabedra-sim-seed:"
 SEED_LINE = re.compile(r"^(?:test [^\n]+? \.\.\. )?nabedra-sim-seed: (\{.*\})$", re.MULTILINE)
+# A trace line: virtual milliseconds, then what happened.
+TRACE_LINE = re.compile(r"[0-9]+ (\S.*)")
 SWEEP_PACKAGE = "nabedra-sim-oltp"
 SWEEP_TARGET = "nabedra_sim_oltp"
 SWEEP_TEST = "sweep::tests::sweep"
@@ -1267,7 +1310,8 @@ HARNESS_RUSTFLAGS = "--cfg tokio_unstable"
 # The sweep test prints this error through `expect`, so its quotes are escaped.
 UNAVAILABLE_WORKLOAD = re.compile(r'OLTP workload [\\]?"([a-z0-9-]+)[\\]?" is unavailable')
 # Inherited variables that would change what the harness builds or runs. Each run sets its own.
-HARNESS_PREFIXES = ("NABEDRA_", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS")
+HARNESS_PREFIXES = ("NABEDRA_", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_", "CARGO_PROFILE_", "RUSTUP_TOOLCHAIN", "RUSTC_BOOTSTRAP",
+                    "RUSTC_WORKSPACE_WRAPPER", "LD_PRELOAD")
 SEARCHED = ("found", "candidate", "not-detected", "incomplete", "error")
 
 
@@ -1425,6 +1469,18 @@ class Replay:
                 found.update(path.read_text(encoding="utf-8", errors="replace").splitlines())
         return found
 
+    def events(self):
+        """{trace line: its text without the time}, of the lines that are neither the violation nor the
+        client history. A line without a time belongs to the text of the line before it."""
+        found = {}
+        for name in ("trace.txt", "trace-tail.txt"):
+            path = self.directory / name
+            for line in path.read_text(encoding="utf-8", errors="replace").split("\n") if path.is_file() else ():
+                match = TRACE_LINE.fullmatch(line)
+                if match and not match.group(1).startswith(("violation ", "history ")):
+                    found[line] = match.group(1)
+        return found
+
     def json(self):
         return {"kinds": self.kinds, "deterministic": self.deterministic, **self.identity,
                 "trace_events": self.entry.get("trace_events"), "virtual_ms": self.entry.get("virtual_ms"),
@@ -1452,6 +1508,8 @@ class Harness:
         code, output = run_sweep(exe, self.tree, env, self.log, remaining)
         if code is None:
             raise OutOfTime
+        if code < 0:
+            raise Failure(f"a sweep from seed {env['NABEDRA_SEED']} died with signal {-code}, so none of its seeds count")
         missing = UNAVAILABLE_WORKLOAD.search(output)
         if missing and SEED_MARK not in output:
             raise Unavailable(missing.group(1))
@@ -1548,10 +1606,12 @@ class Harness:
 
 
 def tally(kinds, expect):
-    """The seeds that report an expected kind, and those that report only other kinds."""
+    """The seeds that report an expected kind, those that report only other kinds, and those of either
+    on which the harness itself failed. The last were tried and are not clean."""
     expected = sorted(seed for seed, reported in kinds.items() if set(reported) & set(expect))
     other = sorted(seed for seed, reported in kinds.items() if reported and seed not in set(expected))
-    return {"expected": expected, "other": other}
+    return {"expected": expected, "other": other,
+            "fault": sorted(seed for seed, reported in kinds.items() if set(reported) & set(FAULT_KINDS))}
 
 
 def judge(harness, bug, plan, label, exe, hit):
@@ -1582,22 +1642,25 @@ def judge(harness, bug, plan, label, exe, hit):
     return None, patched, clean
 
 
-def not_mains_build(repo):
-    """Why the unpatched build is not main's, or None. Only the bug directories may differ."""
+def mains_build(repo):
+    """(what HEAD's build is, why it is not main's or None). Only the files of the targets may differ from
+    the merge base: a toolchain file, a Cargo configuration or a rule's source is part of the build."""
     base = git(repo, "merge-base", "HEAD", "refs/remotes/origin/main", check=False)
     if base.returncode:
-        return "origin/main is unknown, so the unpatched build cannot be shown to be main's"
-    changed = git(repo, "diff", "--no-renames", "--name-only", base.stdout.strip(), "HEAD", "--", "server",
-                  "scripts/testing/sim_bugs.py", f":(exclude){BUGS_DIR.as_posix()}").stdout.split()
+        return None, "origin/main is unknown, so the unpatched build cannot be shown to be main's"
+    base = base.stdout.strip()
+    changed = [name for name in git(repo, "diff", "--no-renames", "--name-only", "-z", base, "HEAD").stdout.split("\0")
+               if name and not TARGET_FILE.fullmatch(name)]
     if changed:
-        return f"the unpatched build is not main's: HEAD changes {', '.join(changed[:3])} ({len(changed)} files)"
-    return None
+        return None, f"the unpatched build is not main's: HEAD changes {', '.join(changed[:3])} ({len(changed)} files)"
+    behind = git(repo, "rev-list", "--count", f"{base}..refs/remotes/origin/main").stdout.strip()
+    return f"on main at {base[:8]}, {behind} commit{'' if behind == '1' else 's'} behind origin/main", None
 
 
 def count_problems(bug, repo, row, patched, clean):
     """Every reason why this hit is not a detection. Only an empty list counts."""
     problems = static_count_problems(bug, repo)
-    if other := not_mains_build(repo):
+    if other := mains_build(repo)[1]:
         problems.append(other)
     m, d, seed = bug.manifest, bug.manifest.get("detection"), row["found_seed"]
     if row.get("rates") is None:
@@ -1610,12 +1673,13 @@ def count_problems(bug, repo, row, patched, clean):
         return [*problems, "the recorded mechanism is for another hit"]
     if d["detector"] not in patched.kinds:
         problems.append(f"{d['detector']} did not report this hit")
-    here, twin = patched.lines(), clean.lines()
+    here, events, twin = patched.lines(), patched.events(), clean.events()
     for line in d["lines"]:
         if line not in here:
             problems.append(f"detection.lines: {line!r} is not a line of the hit's history or trace")
-    if all(line in twin for line in d["lines"]):
-        problems.append("the clean twin has every one of detection.lines, so they show nothing of the patch")
+    if not any(events.get(line, None) not in (None, *twin.values()) for line in d["lines"]):
+        problems.append("no line of detection.lines is an event of the trace that the clean twin lacks, other than the "
+                        "violation and the client history")
     entries, _ = load_searches(bug)
     search = next((e["search"] for e in entries if "search" in e and search_hash(e["search"]) == d["search"]), None)
     if search is None:
@@ -1639,6 +1703,8 @@ def search_bug(args, repo, scratch, harness, bug, plan):
            "result": "error", "rehearse_defect": plan.defect}
     if not plan.expect:
         return dict(row, result="no-detector", why=bug.manifest["expect_reason"])
+    if not_shown(bug) and not rehearsal(args):
+        return dict(row, result="not-shown", why=not_shown(bug))
     kinds, hit, patched, clean, stopped = {}, None, None, None, None
     try:
         scratch.apply(bug)
@@ -1716,8 +1782,12 @@ def describe(row):
     if row.get("rates"):
         base, patched, n = (row["rates"][key] for key in ("base", "patched", "seeds"))
         rates = f"; base rate {len(base['expected'])} of {n}, patched rate {len(patched['expected'])} of {n}"
+        if patched["fault"]:
+            rates += f"; {len(patched['fault'])} panicked in the harness"
     if result == "not-run":
         return f"{row['id']}: not-run ({row['why']})"
+    if result == "not-shown":
+        return f"{row['id']}: not shown, not searched ({row['why']})"
     if result == "no-detector":
         return f"{row['id']}: not detected, no rule may detect it ({row['why']})"
     if result == "not-detected":
@@ -1787,8 +1857,8 @@ def cmd_run(repo, bugs, args, out, every=None):
         if differing:
             print(f"the working tree differs from HEAD, which this run would name: {', '.join(differing)}", file=out)
             return 1
-        other = not_mains_build(repo)
-        print(f"sim-bugs run on {sha}, artifacts {out_dir}" + (f"\nNOT countable: {other}" if other else ""),
+        build, other = mains_build(repo)
+        print(f"sim-bugs run on {sha}, artifacts {out_dir}\n" + (f"NOT countable: {other}" if other else f"build {build}"),
               file=out, flush=True)
         # The unpatched build first: every clean twin and the base rate run on it.
         clean_exe = build_sweep(args, scratch.path, env, log, sweep_binary(env, "clean"))
@@ -1809,7 +1879,7 @@ def cmd_run(repo, bugs, args, out, every=None):
                                            if "search" in e and e["search"]["plan"] != row["search"]["plan"]]
                 print(f"sim-bugs-search: {canonical(row['search'])}", file=out, flush=True)
     summary = {"schema": "nabedra.sim-bugs-run/2", "evidence": "fault-model", "mode": mode,
-               "sha": sha, "not_mains_build": other, "set": args.set_name, "bugs": rows}
+               "sha": sha, "build": build, "not_mains_build": other, "set": args.set_name, "bugs": rows}
     (out_dir / "sim-bugs-run.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     found = sum(row["result"] == ("rehearsed" if mode == "rehearsal" else "found") for row in rows)
     not_run = [row["id"] for row in rows if row["result"] == "not-run"]
@@ -1820,7 +1890,8 @@ def cmd_run(repo, bugs, args, out, every=None):
           f"{what}; summary {out_dir / 'sim-bugs-run.json'}", file=out)
     if found == len(rows):
         return 0
-    if not_run and found + len(not_run) == len(rows):
+    # Not-run says nothing about the targets that cannot count, and it is never a pass.
+    if not_run and all(row["result"] in ("found", "not-run", "not-shown") for row in rows):
         print(f"{NOT_RUN_MARKER}: no workload yet for {', '.join(not_run)}", file=out)
         return 0
     return 1
@@ -1970,7 +2041,7 @@ def main(argv=None, *, repo=REPO, out=sys.stdout):
         chosen = select(bugs, args.ids, args.set_name)
         if args.command == "digest":
             for bug in chosen:
-                print(f"{bug.id} {digest(bug.patch)}", file=out)
+                print(f"{bug.id} {digest(bug.patch)} review {whole_digest(bug)}", file=out)
             return 0
         if args.command == "check":
             return cmd_check(repo, chosen, out, every=bugs)

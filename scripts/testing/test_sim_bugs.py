@@ -120,7 +120,8 @@ with open(env["FAKE_CALLS"], "a") as calls:
     calls.write(json.dumps({"patched": PATCHED, "first": first, "count": count, "replay": replaying,
                             "expect": env.get("NABEDRA_SIM_EXPECT"), "defect": env.get("NABEDRA_SIM_DEFECT"),
                             "profile": env.get("NABEDRA_SIM_PROFILE"), "workload": workload,
-                            "rustflags": env["RUSTFLAGS"],
+                            "rustflags": env["RUSTFLAGS"], "toolchain": sorted(
+                                k for k in env if k.startswith(("RUSTUP_", "RUSTC_B", "CARGO_PROFILE_", "CARGO_BUILD_"))),
                             "nabedra": sorted(k for k in env if k.startswith("NABEDRA_"))}) + "\\n")
 KIND = "NotAppliedNeverCommitted"
 def kinds(seed):
@@ -706,6 +707,14 @@ class HarnessCase(unittest.TestCase):
         self.f.commit("a manifest that check refuses")
         self.assert_not_counted(**kwargs)
 
+    def review_again(self):
+        """[review] names the patch as it is now, as it would after another review."""
+        path = self.f.repo / BUG / "bug.toml"
+        text = path.read_text()
+        head, _, tail = text.partition("[review]\n")
+        new = hashlib.sha256((self.f.repo / BUG / "revert.patch").read_bytes()).hexdigest()
+        path.write_text(head + "[review]\n" + re.sub(r'digest = "\w+"', f'digest = "{new}"', tail, count=1))
+
     def replace_patch(self, patch_text, port="hand", regression=None):
         """Commit another patch, with evidence that names its commit, and keep the detection."""
         f = self.f
@@ -867,6 +876,7 @@ class FoolTest(HarnessCase):
         self.assertEqual(sim_bugs.digest(moved), sim_bugs.digest(f.patch))
         self.replace_patch(f.patch)
         f.write(f"{BUG}/revert.patch", moved)
+        self.review_again()
         f.commit("move the reverted lines")
         self.assert_not_counted("other context than the patch its regression run tested")
 
@@ -899,6 +909,7 @@ class FoolTest(HarnessCase):
         f.write(f"{BUG}/revert.patch", text)
         f.edit('port = "clean"', 'port = "hand"')
         f.edit(f'digest = "{old}"', f'digest = "{sim_bugs.digest(text)}"')
+        self.review_again()
         self.assert_refused("its recorded output names")
         # The output edited as well: the commit the run tested holds another patch.
         f.edit(f"(digest {old})", f"(digest {sim_bugs.digest(text)})")
@@ -1254,7 +1265,10 @@ class FoolTest(HarnessCase):
     def test_inherited_variables_do_not_reach_the_harness(self):
         _, _, calls = self.assert_found(script={"hit": 3}, NABEDRA_SIM_DEFECT="lost-write", NABEDRA_SIM_EXPECT="x",
                                         NABEDRA_SEED="3", NABEDRA_TRACE_DIR="/x", NABEDRA_OTHER="1",
-                                        RUSTFLAGS="--cfg planted", CARGO_ENCODED_RUSTFLAGS="--cfg\x1fplanted")
+                                        RUSTFLAGS="--cfg planted", CARGO_ENCODED_RUSTFLAGS="--cfg\x1fplanted",
+                                        RUSTUP_TOOLCHAIN="nightly", CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS="true",
+                                        CARGO_BUILD_RUSTC="/x/rustc", RUSTC_BOOTSTRAP="1")
+        self.assertEqual([c["toolchain"] for c in calls], [[]] * len(calls))
         self.assertTrue(all(c["defect"] is None for c in calls))
         self.assertEqual({c["rustflags"] for c in calls}, {"--cfg tokio_unstable"})
         self.assertFalse(any(name in c["nabedra"] for c in calls for name in ("NABEDRA_TRACE_DIR", "NABEDRA_OTHER")))
@@ -1299,6 +1313,7 @@ class FoolTest(HarnessCase):
         f.write(f"{BUG}/revert.patch", text)
         f.edit('port = "clean"', 'port = "hand"')
         f.edit(old, sim_bugs.digest(text))
+        self.review_again()
         untested = f.commit("an untested patch")
         sh(f.repo, "replace", self.tested, untested)
         self.assert_refused("holds a patch with other changed lines")
@@ -1588,8 +1603,7 @@ class SearchTest(HarnessCase):
     def test_a_run_that_dies_is_an_error_and_no_clean_seed(self):
         for kill in ("patched_search", "clean_base", "patched_replay", "clean_replay"):
             with self.subTest(kill=kill):
-                row = self.assert_not_counted("exited -9" if kill != "patched_replay" else "", script={"hit": 3, "kill": kill},
-                                              result="error")
+                row = self.assert_not_counted("died with signal 9", script={"hit": 3, "kill": kill}, result="error")
                 if kill == "patched_search":
                     self.assertEqual((row["tried"], row["rates"]), (0, None))
 
@@ -1612,7 +1626,7 @@ class SearchTest(HarnessCase):
         f.write("docs/testing/bugs/2026-11-23-fix-two.toml", record.replace("FIX-ONE", "FIX-TWO"))
         f.write("server/src/two.rs", "pub fn two() -> u8 {\n    2\n}\n")
         f.commit("another product file")
-        other = f.revert_diff("server/src/two.rs", "pub fn two() -> u8 {\n    1\n}\n")
+        other = f.revert_diff("server/src/two.rs", "pub fn two() -> u8 {\n    1 // DEFECT\n}\n")
         f.write(f"{BUG[:-3]}two/revert.patch", other)
         sha = f.commit("another patch")
         two = f.manifest(port="hand", regression=f.evidence(sha=sha, digest=sim_bugs.digest(other), patch=other),
@@ -1620,7 +1634,7 @@ class SearchTest(HarnessCase):
         f.write(f"{BUG[:-3]}two/bug.toml", two.replace("fix-one", "fix-two").replace("FIX-ONE", "FIX-TWO").replace(
             'workload = "direct"', 'workload = "cold"'))
         f.commit("a target whose workload is missing")
-        status, output, summary, _ = self.harness_run()
+        status, output, summary, _ = self.harness_run(FAKE_DEFECT="src/two.rs")
         self.assertEqual([row["result"] for row in summary["bugs"]], ["not-shown", "not-run"], output)
         self.assertEqual(status, 0, output)
         self.assertIn(sim_bugs.NOT_RUN_MARKER, output)
