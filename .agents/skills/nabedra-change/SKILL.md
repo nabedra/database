@@ -30,9 +30,21 @@ When agents work in parallel on one codebase, every hot file has a single owner
 per wave. See the hot-file rule in the
 [subagent-driven development workflow](references/subagent-driven-development.md#prepare-the-work).
 
+# Contracts for the change
+
+- For changes to request admission, queues, scheduling, workers, partition
+  memory, mutation publication, recovery, or autoscaling, use the
+  [scheduler test contract](../../../docs/testing/scheduler-contract.md).
+- For OLTP request-path changes, start with the
+  [OLTP direct-path plan](../../../plans/oltp-direct-path.md).
+- For ORM changes and database changes that affect ORM callers, follow the
+  [ORM parity checks](../../../docs/testing/orm-parity.md).
+
 # Feedback tiers
 
-For changes that need runtime checks, use the tiers below.
+For changes that need runtime checks, use the tiers below and follow the
+[testing guide](../../../docs/testing/README.md) and
+[verification rules](../code-review/SKILL.md#verification-rules).
 `python3 scripts/testing/matrix.py select --base <sha> --head <sha>` picks
 the checks for a diff. `python3 scripts/testing/run_check.py --list --tier <tier>`
 lists a tier's checks.
