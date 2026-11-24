@@ -155,6 +155,8 @@ pub(crate) struct Ctx {
     pub stopping: Arc<AtomicBool>,
     /// Virtual ms by which retries must resolve; unbounded during chaos.
     pub converge_by: Arc<AtomicU64>,
+    /// The gateway of every mutation attempt that has no answer yet, for probe triggers.
+    in_flight: Arc<Mutex<BTreeMap<Uuid, u64>>>,
 }
 
 impl Ctx {
@@ -178,6 +180,7 @@ impl Ctx {
             observed: Arc::default(),
             stopping: Arc::default(),
             converge_by: Arc::new(AtomicU64::new(u64::MAX)),
+            in_flight: Arc::default(),
         }
     }
 
@@ -187,6 +190,18 @@ impl Ctx {
 
     /// Every client decision passes here. A trace adapter attaches to this call.
     pub(crate) fn step(&self, call: Call<'_>, step: Step<'_>) {
+        if call.request.mutation() {
+            let mut in_flight = self.in_flight.lock().unwrap();
+            match step {
+                Step::Sent => {
+                    in_flight.insert(call.request.id, call.gateway);
+                }
+                Step::Answered(_) | Step::DeadlineExpired | Step::ConnectionLost => {
+                    in_flight.remove(&call.request.id);
+                }
+                Step::Retry | Step::Replay | Step::GaveUp => {}
+            }
+        }
         let answer = match step {
             Step::Answered(completion) => answer(call.request, completion),
             Step::DeadlineExpired | Step::ConnectionLost => Answer::Unknown,
@@ -210,6 +225,11 @@ impl Ctx {
             fresh: false,
             invoked: self.now_ms(),
         }
+    }
+
+    /// The gateway through which a client waits for an answer to this request.
+    pub(crate) fn waiting(&self, request: Uuid) -> Option<u64> {
+        self.in_flight.lock().unwrap().get(&request).copied()
     }
 
     pub(crate) fn new_client(&self) -> Client {

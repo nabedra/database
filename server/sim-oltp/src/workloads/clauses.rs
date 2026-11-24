@@ -54,8 +54,6 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
 /// Why a clause cannot run yet, for the sweep record.
 pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
     Some(match clause {
-        "D04:after-quorum" => "only the P10-PROBES Applied probe can prove the quorum came first",
-        "D02:after-propose" => "needs the P10-PROBES proposal trigger",
         "O26:pinned-snapshot" => "a pinned query needs the queued path's barriers (phase 11)",
         "O26:split-across-pools" => "a split never publishes after a direct commit (open finding)",
         "O26:failed-mount" => "no phase 10 schedule loses a mount",
@@ -118,8 +116,11 @@ pub(crate) struct Fault {
     pub to: Option<u64>,
     /// The cluster was converged and nothing else was open when it started.
     pub quiet: bool,
-    /// `crash-leader` placement: `before-quorum`, `lost-replies`, or empty.
+    /// Placement: `before-quorum`, `lost-replies`, `after-quorum`, `after-propose`,
+    /// `after-apply`, or empty.
     pub variant: &'static str,
+    /// The client request a probe placed the fault at.
+    pub request: Option<Uuid>,
     /// The fault demonstrably happened: an EIO was returned, another leader served, a split
     /// published.
     pub observed: bool,
@@ -252,6 +253,19 @@ impl Evidence<'_> {
                 if retried {
                     out.clauses.insert("D02:gateway-killed");
                 }
+                // The leader had applied this very request and its gateway died before any
+                // answer. The retry through the other gateway returned the original result.
+                let placed = self.attempts.iter().any(|attempt| {
+                    Some(attempt.id) == fault.request
+                        && attempt.gateway == fault.nodes[0]
+                        && attempt.spans(from)
+                        && self
+                            .retried(attempt)
+                            .is_some_and(|resolved| resolved.gateway != fault.nodes[0])
+                });
+                if placed {
+                    out.clauses.insert("D02:after-propose");
+                }
             }
             Action::CrashLeader | Action::PowerLeader | Action::DrainLeader => {
                 // The retry completed while the old leader was still down.
@@ -261,6 +275,16 @@ impl Evidence<'_> {
                             .retried(attempt)
                             .is_some_and(|resolved| resolved.at < to)
                 });
+                let placed = self.attempts.iter().any(|attempt| {
+                    Some(attempt.id) == fault.request
+                        && attempt.spans(from)
+                        && self
+                            .retried(attempt)
+                            .is_some_and(|resolved| resolved.at < to)
+                });
+                if placed && fault.variant == "after-quorum" {
+                    out.clauses.insert("D04:after-quorum");
+                }
                 if on_new_leader {
                     if fault.variant == "before-quorum" {
                         out.clauses.insert("D04:before-quorum");
@@ -394,6 +418,7 @@ mod tests {
             to: Some(to),
             quiet: true,
             variant: "",
+            request: None,
             observed: true,
         }
     }
@@ -516,6 +541,35 @@ mod tests {
         // Move seed 7: the move delayed every frame of the old voters by 177 ms.
         assert_eq!(run(&[], Some((500, 2_000))), (0, 0));
         assert_eq!(run(&[], Some((2_000, 3_000))), (1, 1));
+    }
+
+    /// A probe-placed fault counts only for the request it was placed at.
+    #[test]
+    fn a_placed_fault_needs_its_own_request() {
+        let mut crash = fault(Action::CrashLeader, 1, 1_000, 5_000);
+        crash.variant = "after-quorum";
+        let mut kill = fault(Action::KillGateway, 101, 1_000, 5_000);
+        kill.variant = "after-propose";
+        let lost = attempt(1, 900, 1_300, Answer::Unknown);
+        let resolved = Resolved {
+            attempts: 2,
+            at: 2_000,
+            gateway: 102,
+            replayed: true,
+        };
+        let resolved = BTreeMap::from([(Uuid::from_u128(1), resolved)]);
+        for (fault, clause) in [(crash, "D04:after-quorum"), (kill, "D02:after-propose")] {
+            let run = |request| {
+                let mut fault = fault.clone();
+                fault.request = request;
+                evaluate(&[fault], std::slice::from_ref(&lost), &resolved, &[])
+                    .clauses
+                    .contains(clause)
+            };
+            assert!(run(Some(Uuid::from_u128(1))));
+            assert!(!run(Some(Uuid::from_u128(2))), "another request");
+            assert!(!run(None), "no probe placed it");
+        }
     }
 
     #[test]

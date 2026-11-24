@@ -137,7 +137,14 @@ fn replayed(seed: u64) -> RunResult {
         nabedra_sim::runtime::SEEDED,
         "build with RUSTFLAGS=\"--cfg tokio_unstable\" and CARGO_TARGET_DIR=target/sim"
     );
-    let [run, replay] = [(); 2].map(|()| run_seed(seed, &mut workload_gen(seed), Defect::None));
+    let [run, replay] = [(); 2].map(|()| {
+        run_seed(
+            seed,
+            &mut workload_gen(seed),
+            Defect::None,
+            &crate::sweep::Setup::smoke(),
+        )
+    });
     let rules = run
         .run
         .trace_tail

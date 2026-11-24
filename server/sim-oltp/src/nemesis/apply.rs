@@ -22,6 +22,7 @@ use crate::{
     disk::DiskCut,
     invariants::elapsed_ms,
     node::Cluster,
+    probes::Probe,
     workloads::{
         clauses::Fault,
         clients::{self, Ctx},
@@ -35,6 +36,8 @@ const SPLIT_LIMIT: Duration = Duration::from_secs(60);
 /// Follow-ups that cannot run yet are tried again after this pause.
 const DEFER_MS: u64 = 500;
 const RESTART_TRIES: u32 = 4;
+/// How long a probe-placed fault waits for its protocol point.
+const PLACE_LIMIT: Duration = Duration::from_secs(2);
 
 /// A requested split that has not published.
 struct PendingSplit {
@@ -137,6 +140,7 @@ impl Chaos {
             to: None,
             quiet: false,
             variant: "",
+            request: None,
             observed: false,
         });
         self.log.last_mut().expect("pushed fault")
@@ -279,6 +283,30 @@ impl Chaos {
             .filter(|node| cluster.is_running(*node) && !cluster.frozen().contains(node))
             .collect();
         (!candidates.is_empty()).then(|| *g.pick(&candidates))
+    }
+
+    /// Wait until a probe shows that `node` (or any worker) applied a direct commit that a
+    /// client still waits for: the Raft entry is committed, and no answer has left the leader.
+    /// Returns the request and the gateway that carries it.
+    async fn applied(cluster: &Cluster, ctx: &Ctx, node: Option<u64>) -> Option<(Uuid, u64)> {
+        let mut applied = cluster.checks.probes()?.subscribe(move |event| {
+            event.live
+                && matches!(event.probe, Probe::DedupApplied { .. })
+                && node.is_none_or(|node| event.node == Some(node))
+        });
+        time::timeout(PLACE_LIMIT, async {
+            while let Some(event) = applied.recv().await {
+                if let Probe::DedupApplied { request_id, .. } = event.probe
+                    && let Some(gateway) = ctx.waiting(request_id)
+                {
+                    return Some((request_id, gateway));
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     async fn act(&mut self, cluster: &mut Cluster, ctx: &Ctx, g: &mut Gen, action: Action) {
@@ -480,11 +508,24 @@ impl Chaos {
                 self.later(cluster, duration, FollowUp::RestoreCertificate(gateway));
             }
             Action::KillGateway => {
-                let gateway = *g.pick(&GATEWAYS);
+                let mut gateway = *g.pick(&GATEWAYS);
+                // After the leader proposed and applied a request, before its answer (D02).
+                let placed = if g.bool() {
+                    Self::applied(cluster, ctx, None).await
+                } else {
+                    None
+                };
+                if let Some((_, waiting)) = placed {
+                    gateway = waiting;
+                }
                 if !cluster.is_running(gateway) {
                     return self.skip(cluster, action, "the gateway is already down");
                 }
-                self.open(cluster, action, &[gateway]);
+                let fault = self.open(cluster, action, &[gateway]);
+                if let Some((request, _)) = placed {
+                    fault.variant = "after-propose";
+                    fault.request = Some(request);
+                }
                 cluster.kill_gateway(gateway).await;
                 let duration = window(g, 300, 3_000);
                 self.note(
@@ -500,7 +541,7 @@ impl Chaos {
                     return self.skip(cluster, action, "no running worker");
                 };
                 let power = action == Action::PowerLeader;
-                let variant = *g.pick(&["", "before-quorum", "lost-replies"]);
+                let variant = *g.pick(&["", "before-quorum", "lost-replies", "after-quorum"]);
                 let followers: Vec<u64> = WORKERS
                     .into_iter()
                     .filter(|node| *node != leader && !cluster.frozen().contains(node))
@@ -521,7 +562,14 @@ impl Chaos {
                     }
                     _ => {}
                 }
-                self.open(cluster, action, &[leader]).variant = variant;
+                let placed = if variant == "after-quorum" {
+                    Self::applied(cluster, ctx, Some(leader)).await
+                } else {
+                    None
+                };
+                let fault = self.open(cluster, action, &[leader]);
+                fault.variant = variant;
+                fault.request = placed.map(|(request, _)| request);
                 cluster
                     .crash(leader, if power { DiskCut::Power } else { DiskCut::Kill })
                     .await;
@@ -542,7 +590,17 @@ impl Chaos {
                 let Some(leader) = self.leader_or_any(cluster, g).await else {
                     return self.skip(cluster, action, "no running worker");
                 };
-                self.open(cluster, action, &[leader]);
+                // Between `Applied` and the reply: the lost responder.
+                let placed = if g.bool() {
+                    Self::applied(cluster, ctx, Some(leader)).await
+                } else {
+                    None
+                };
+                let fault = self.open(cluster, action, &[leader]);
+                if let Some((request, _)) = placed {
+                    fault.variant = "after-apply";
+                    fault.request = Some(request);
+                }
                 let drained = cluster.drain(leader).await;
                 cluster.crash(leader, DiskCut::Kill).await;
                 if let Err(error) = &drained {
