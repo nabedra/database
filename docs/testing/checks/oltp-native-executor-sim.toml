@@ -12,7 +12,8 @@ python3 ../scripts/testing/repeat_gate.py --features oltp,sim <<'JSON'
 [
   {"id": "c04_c06_f01_f02_native_slots_refill_and_isolate_failures", "file": "server/src/oltp/pool/resources/sim_tests.rs", "lang": "rust"},
   {"id": "f03_native_drain_keeps_cancelled_work_until_settlement", "file": "server/src/oltp/pool/resources/sim_tests.rs", "lang": "rust"},
-  {"id": "f03_native_crash_drops_queued_work_and_releases_accounting", "file": "server/src/oltp/pool/resources/sim_tests.rs", "lang": "rust"}
+  {"id": "f03_native_crash_drops_queued_work_and_releases_accounting", "file": "server/src/oltp/pool/resources/sim_tests.rs", "lang": "rust"},
+  {"id": "f02_f03_native_crash_contains_panics_in_queued_job_cleanup", "file": "server/src/oltp/pool/resources/sim_tests.rs", "lang": "rust"}
 ]
 JSON
 ''']
