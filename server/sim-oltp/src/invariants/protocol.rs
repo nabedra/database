@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use nabedra_oltp_types::{
-    sim_probe::{Ledger, Probe, Span},
+    sim_probe::{Ledger, Probe, RouteRecord, Span},
     types::{AppliedPosition, Digest},
 };
 use nabedra_protocol::protocol::Key;
@@ -25,6 +25,7 @@ pub const MONOTONIC_VOTE: &str = "MonotonicVote";
 pub const MONOTONIC_COMMIT: &str = "MonotonicCommit";
 pub const LOG_MATCHING: &str = "LogMatching";
 pub const MAJORITY_REACHED: &str = "MajorityReached";
+pub const TRUNCATION: &str = "MajorityReached/truncation";
 pub const DEDUP_UNIQUE: &str = "DedupUnique";
 pub const NOT_APPLIED_NEVER_COMMITTED: &str = "NotAppliedNeverCommitted";
 pub const RANGE_CLOCK_RULE1: &str = "RangeClockRule1";
@@ -46,9 +47,6 @@ pub const PROBE_INVARIANTS: [&str; 11] = [
     EXACTLY_ONCE_RELEASE,
     RESOURCE_BASELINE,
 ];
-
-/// Voters per group the harness configures (RF3).
-pub const DEFAULT_VOTERS: usize = 3;
 
 pub type Violation = (&'static str, String);
 
@@ -93,8 +91,12 @@ fn point(position: &AppliedPosition) -> LogPoint {
     (position.term, position.node_id)
 }
 
-fn majority(voters: usize) -> usize {
-    voters / 2 + 1
+/// True when `holders` include a majority of every configuration in `joint`.
+fn quorum(joint: &[Vec<u64>], holders: &BTreeSet<u64>) -> bool {
+    !joint.is_empty()
+        && joint.iter().all(|voters| {
+            voters.iter().filter(|id| holders.contains(id)).count() > voters.len() / 2
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -139,17 +141,17 @@ pub struct DedupIdentity {
     pub request_id: Uuid,
 }
 
+type Root = (Option<Uuid>, u64);
+type Page = (Option<Uuid>, Vec<RouteSpan>);
+
 #[derive(Default)]
 pub struct Protocol {
-    voters: usize,
     /// Per replica: its newest durable vote `(term, leader, committed)`.
     votes: BTreeMap<Replica, (u64, u64, bool)>,
-    /// Per group, election: replicas that granted (saved an uncommitted vote for) it.
-    grants: BTreeMap<(Uuid, LogPoint), BTreeSet<u64>>,
-    /// Per group: replicas that ever granted a vote, so the group's voters.
-    electors: BTreeMap<Uuid, BTreeSet<u64>>,
-    /// Elections a leader already reported committed.
-    leaders: BTreeSet<(Uuid, LogPoint)>,
+    /// Per group and committed vote: the simulated node that claimed it as leader.
+    leaders: BTreeMap<(Uuid, LogPoint), u64>,
+    /// Per group: voter configurations by log index and log id.
+    voters: BTreeMap<Uuid, BTreeMap<(u64, LogPoint), Vec<Vec<u64>>>>,
     /// Per replica: its durable log, index to log id.
     durable: BTreeMap<Replica, BTreeMap<u64, LogPoint>>,
     /// Per group and index: the first applied log id and digest.
@@ -161,8 +163,11 @@ pub struct Protocol {
     dedup: BTreeMap<DedupIdentity, (u64, Digest, u64)>,
     /// Per group: the highest snapshot timestamp served on any replica.
     served: BTreeMap<Uuid, u64>,
-    /// Per table: the current route set.
-    routes: BTreeMap<Uuid, Vec<RouteSpan>>,
+    /// Per table: committed routing roots and pages by commit timestamp. `None` is a delete.
+    roots: BTreeMap<Uuid, BTreeMap<u64, Option<Root>>>,
+    pages: BTreeMap<(Uuid, Uuid), BTreeMap<u64, Option<Page>>>,
+    /// How often each rule ran on an event of its own.
+    exercised: BTreeMap<&'static str, u64>,
     /// Per live node: native leases acquired and released by this incarnation.
     native: BTreeMap<u64, (u64, u64)>,
     /// Per live node and group: the RangeClock pending ledger.
@@ -170,11 +175,17 @@ pub struct Protocol {
 }
 
 impl Protocol {
-    pub fn new(voters: usize) -> Self {
-        Self {
-            voters,
-            ..Self::default()
-        }
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Evaluations per rule. A rule absent here never ran on this stream.
+    pub fn exercised(&self) -> &BTreeMap<&'static str, u64> {
+        &self.exercised
+    }
+
+    fn ran(&mut self, rule: &'static str) {
+        *self.exercised.entry(rule).or_default() += 1;
     }
 
     /// Checks `probe` and updates the state. Returns what it violates.
@@ -194,7 +205,13 @@ impl Protocol {
                 ..
             } => {
                 self.place(*group, *replica, node);
-                self.vote(*group, *replica, (*term, *leader, *committed), &mut out);
+                self.vote(
+                    node,
+                    *group,
+                    *replica,
+                    (*term, *leader, *committed),
+                    &mut out,
+                );
             }
             Probe::Appended {
                 group,
@@ -205,7 +222,13 @@ impl Protocol {
                 self.place(*group, *replica, node);
                 let log = self.durable.entry((*group, *replica)).or_default();
                 for entry in entries {
-                    log.insert(entry.index, point(entry));
+                    log.insert(entry.at.index, point(&entry.at));
+                    if let Some(voters) = &entry.voters {
+                        self.voters
+                            .entry(*group)
+                            .or_default()
+                            .insert((entry.at.index, point(&entry.at)), voters.clone());
+                    }
                 }
             }
             Probe::Truncated {
@@ -218,6 +241,7 @@ impl Protocol {
                 let from = after.map_or(0, |after| after.index.saturating_add(1));
                 let log = self.durable.entry((*group, *replica)).or_default();
                 let removed = log.split_off(&from);
+                *self.exercised.entry(TRUNCATION).or_default() += 1;
                 for (index, id) in removed {
                     if let Some((applied, _)) = self.applied.get(&(*group, index))
                         && *applied == id
@@ -250,6 +274,7 @@ impl Protocol {
                 digest,
                 ..
             } => {
+                self.ran(DEDUP_UNIQUE);
                 let identity = DedupIdentity {
                     table: *table,
                     key: OrdKey::new(anchor),
@@ -276,8 +301,12 @@ impl Protocol {
             Probe::DirectProposed {
                 group, commit_ts, ..
             } => {
-                if let Some(served) = self.served.get(group)
-                    && *commit_ts <= *served
+                let served = self.served.get(group).copied();
+                if served.is_some() {
+                    self.ran(RANGE_CLOCK_RULE1);
+                }
+                if let Some(served) = served
+                    && *commit_ts <= served
                 {
                     out.push((
                         RANGE_CLOCK_RULE1,
@@ -289,30 +318,43 @@ impl Protocol {
             }
             Probe::RouteEpochPublished {
                 table,
-                routing_epoch,
-                retired,
-                routes,
-            } => {
-                let current = self.routes.entry(*table).or_default();
-                let new: Vec<_> = routes.iter().map(RouteSpan::new).collect();
-                if !new.iter().all(|span| current.contains(span)) {
-                    if let Some(retired) = retired {
-                        let retired = RouteSpan::new(retired);
-                        current.retain(|span| *span != retired);
-                    }
-                    current.extend(new);
+                commit_ts,
+                record,
+            } => match record {
+                RouteRecord::Root {
+                    first_page,
+                    routing_epoch,
+                } => {
+                    let root = Some((*first_page, *routing_epoch));
+                    self.roots
+                        .entry(*table)
+                        .or_default()
+                        .insert(*commit_ts, root);
                 }
-                let spans: Vec<_> = current
-                    .iter()
-                    .map(|span| (span.start.clone(), span.end.clone()))
-                    .collect();
-                if !covers_keyspace(&spans) {
-                    out.push((
-                        KEYSPACE_COVERAGE,
-                        format!("table {table} epoch {routing_epoch} routes {current:?} do not cover its key space"),
-                    ));
+                RouteRecord::RootDeleted => {
+                    self.roots
+                        .entry(*table)
+                        .or_default()
+                        .insert(*commit_ts, None);
                 }
-            }
+                RouteRecord::Page {
+                    page_id,
+                    next_page,
+                    spans,
+                } => {
+                    let page = Some((*next_page, spans.iter().map(RouteSpan::new).collect()));
+                    self.pages
+                        .entry((*table, *page_id))
+                        .or_default()
+                        .insert(*commit_ts, page);
+                }
+                RouteRecord::PageDeleted { page_id } => {
+                    self.pages
+                        .entry((*table, *page_id))
+                        .or_default()
+                        .insert(*commit_ts, None);
+                }
+            },
             Probe::LedgerSnapshot {
                 ledger: Ledger::RangeClockPending,
                 group: Some(group),
@@ -329,6 +371,7 @@ impl Protocol {
             }
             Probe::GuardReleased { .. } => {
                 if let Some(node) = node {
+                    self.ran(EXACTLY_ONCE_RELEASE);
                     let (acquired, released) = self.native.entry(node).or_default();
                     *released += 1;
                     if *released > *acquired {
@@ -359,40 +402,33 @@ impl Protocol {
 
     fn vote(
         &mut self,
+        node: Option<u64>,
         group: Uuid,
         replica: u64,
         vote: (u64, u64, bool),
         out: &mut Vec<Violation>,
     ) {
         let (term, leader, committed) = vote;
-        if let Some(old) = self.votes.insert((group, replica), vote)
-            && vote < old
-        {
-            out.push((
-                MONOTONIC_VOTE,
-                format!("group {group} replica {replica} saved vote {vote:?} after {old:?}"),
-            ));
+        if let Some(old) = self.votes.insert((group, replica), vote) {
+            self.ran(MONOTONIC_VOTE);
+            if vote < old {
+                out.push((
+                    MONOTONIC_VOTE,
+                    format!("group {group} replica {replica} saved vote {vote:?} after {old:?}"),
+                ));
+            }
         }
-        let election = (group, (term, leader));
-        if !committed {
-            self.grants.entry(election).or_default().insert(replica);
-            self.electors.entry(group).or_default().insert(replica);
-            return;
-        }
-        // The leader saves its own committed vote once a quorum granted it.
-        if replica != leader || !self.leaders.insert(election) {
-            return;
-        }
-        let electors = self.electors.get(&group).map_or(0, BTreeSet::len);
-        let required = majority(electors.min(self.voters)).min(electors);
-        let granted = self.grants.get(&election).map_or(0, BTreeSet::len);
-        if granted < required {
-            out.push((
-                ELECTION_SAFETY,
-                format!(
-                    "group {group}: replica {leader} leads term {term} with {granted} grants of {electors} electors"
-                ),
-            ));
+        // At most one leader per (group, vote). OpenRaft's advanced leader IDs put the
+        // Raft node in the vote, so a second claimant is another process with that ID.
+        if let (true, true, Some(node)) = (committed, replica == leader, node) {
+            self.ran(ELECTION_SAFETY);
+            let first = *self.leaders.entry((group, (term, leader))).or_insert(node);
+            if first != node {
+                out.push((
+                    ELECTION_SAFETY,
+                    format!("group {group} vote ({term}, {leader}) led by n{first} and n{node}"),
+                ));
+            }
         }
     }
 
@@ -406,6 +442,8 @@ impl Protocol {
         out: &mut Vec<Violation>,
     ) {
         let id = point(entry);
+        self.ran(MONOTONIC_COMMIT);
+        self.ran(LOG_MATCHING);
         if let Some(node) = origin.node {
             let last = self
                 .last_applied
@@ -443,25 +481,37 @@ impl Protocol {
             }
             None => {
                 self.applied.insert((group, entry.index), (id, digest));
-                let holders: Vec<_> = self
+                let holders: BTreeSet<u64> = self
                     .durable
                     .iter()
-                    .filter(|((log_group, _), _)| *log_group == group)
+                    .filter(|((of, _), log)| *of == group && log.get(&entry.index) == Some(&id))
+                    .map(|((_, replica), _)| *replica)
                     .collect();
-                let durable = holders
-                    .iter()
-                    .filter(|(_, log)| log.get(&entry.index) == Some(&id))
-                    .count();
-                let required = majority(holders.len().min(self.voters)).min(holders.len());
-                if durable < required {
+                // The configuration in force: the newest at or below this index that a
+                // holder of the entry has in its own log.
+                let voters = self
+                    .voters
+                    .get(&group)
+                    .and_then(|configs| {
+                        configs.iter().rev().find(|((index, config), _)| {
+                            *index <= entry.index
+                                && holders.iter().any(|replica| {
+                                    self.durable
+                                        .get(&(group, *replica))
+                                        .and_then(|log| log.get(index))
+                                        == Some(config)
+                                })
+                        })
+                    })
+                    .map(|(_, voters)| voters.clone())
+                    .unwrap_or_default();
+                self.ran(MAJORITY_REACHED);
+                if !quorum(&voters, &holders) {
                     out.push((
                         MAJORITY_REACHED,
                         format!(
-                            "group {group} index {} (term {}, leader {}) applied while durable on {durable} of {} replicas",
-                            entry.index,
-                            id.0,
-                            id.1,
-                            holders.len()
+                            "group {group} index {} (term {}, leader {}) applied while durable on {holders:?} of voters {voters:?}",
+                            entry.index, id.0, id.1
                         ),
                     ));
                 }
@@ -505,6 +555,45 @@ impl Protocol {
             .sum()
     }
 
+    /// KeyspaceCoverage: every committed root version must reach pages, as of its own
+    /// commit timestamp, that cover the key space once.
+    pub fn check_routes(&mut self) -> Vec<Violation> {
+        let mut out = Vec::new();
+        for (table, versions) in &self.roots {
+            for (ts, root) in versions {
+                let Some((first, epoch)) = root else {
+                    continue;
+                };
+                *self.exercised.entry(KEYSPACE_COVERAGE).or_default() += 1;
+                let (mut spans, mut seen, mut next) = (Vec::new(), BTreeSet::new(), *first);
+                let mut broken = None;
+                while let Some(page_id) = next {
+                    let page = self
+                        .pages
+                        .get(&(*table, page_id))
+                        .and_then(|page| page.range(..=*ts).next_back());
+                    match page {
+                        Some((_, Some((following, routes)))) if seen.insert(page_id) => {
+                            spans.extend(routes.iter().map(|r| (r.start.clone(), r.end.clone())));
+                            next = *following;
+                        }
+                        _ => {
+                            broken = Some(page_id);
+                            break;
+                        }
+                    }
+                }
+                if broken.is_some() || !covers_keyspace(&spans) {
+                    out.push((
+                        KEYSPACE_COVERAGE,
+                        format!("table {table} epoch {epoch} at {ts}: routes {spans:?}, unreadable page {broken:?}"),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// Committed dedup records, with the virtual time of their first write.
     pub fn dedup_records(&self) -> impl Iterator<Item = (&DedupIdentity, u64)> {
         self.dedup
@@ -516,7 +605,7 @@ impl Protocol {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nabedra_oltp_types::types::GroupKind;
+    use nabedra_oltp_types::{sim_probe::LogEntry, types::GroupKind};
 
     const GROUP: Uuid = Uuid::from_u128(7);
 
@@ -542,7 +631,13 @@ mod tests {
             group: GROUP,
             kind: GroupKind::Catalog,
             replica,
-            entries: entries.to_vec(),
+            entries: entries
+                .iter()
+                .map(|at| LogEntry {
+                    at: *at,
+                    voters: (at.index == 1).then(|| vec![vec![1, 2, 3]]),
+                })
+                .collect(),
         }
     }
 
@@ -562,7 +657,7 @@ mod tests {
 
     #[test]
     fn a_clean_replicated_apply_passes() {
-        let mut protocol = Protocol::new(3);
+        let mut protocol = Protocol::new();
         for replica in 1..=3 {
             assert!(
                 protocol
@@ -583,7 +678,7 @@ mod tests {
 
     #[test]
     fn applying_one_index_twice_in_an_incarnation_violates_monotonic_commit() {
-        let mut protocol = Protocol::new(3);
+        let mut protocol = Protocol::new();
         protocol.observe(origin(1), &appended(1, &[at(1, 1)]));
         protocol.observe(origin(2), &appended(2, &[at(1, 1)]));
         assert!(
@@ -607,7 +702,7 @@ mod tests {
 
     #[test]
     fn diverging_applies_violate_log_matching() {
-        let mut protocol = Protocol::new(3);
+        let mut protocol = Protocol::new();
         protocol.observe(origin(1), &appended(1, &[at(1, 1)]));
         protocol.observe(origin(2), &appended(2, &[at(1, 1)]));
         protocol.observe(origin(1), &applied(1, at(1, 1), 9));
@@ -617,7 +712,7 @@ mod tests {
 
     #[test]
     fn an_apply_without_a_durable_majority_violates_majority_reached() {
-        let mut protocol = Protocol::new(3);
+        let mut protocol = Protocol::new();
         protocol.observe(origin(1), &appended(1, &[at(1, 1)]));
         protocol.observe(origin(2), &appended(2, &[at(1, 2)]));
         protocol.observe(origin(3), &appended(3, &[at(1, 2)]));
@@ -627,7 +722,7 @@ mod tests {
 
     #[test]
     fn truncating_an_applied_entry_violates_majority_reached() {
-        let mut protocol = Protocol::new(3);
+        let mut protocol = Protocol::new();
         for replica in 1..=2 {
             protocol.observe(origin(replica), &appended(replica, &[at(1, 1), at(2, 1)]));
         }
@@ -651,48 +746,34 @@ mod tests {
     }
 
     #[test]
-    fn votes_never_move_back_and_leaders_need_a_quorum() {
-        let mut protocol = Protocol::new(3);
-        let vote = |replica, term, leader, committed| Probe::VoteSaved {
+    fn an_apply_on_one_of_three_voters_fails_when_no_other_replica_was_seen() {
+        let mut protocol = Protocol::new();
+        protocol.observe(origin(1), &appended(1, &[at(1, 1)]));
+        let alone = protocol.observe(origin(1), &applied(1, at(1, 1), 9));
+        assert_eq!(kinds(&alone), [MAJORITY_REACHED]);
+    }
+
+    #[test]
+    fn votes_never_move_back_and_one_node_leads_a_vote() {
+        let mut protocol = Protocol::new();
+        let vote = |term, committed| Probe::VoteSaved {
             group: GROUP,
             kind: GroupKind::Catalog,
-            replica,
+            replica: 1,
             term,
-            leader,
+            leader: 1,
             committed,
         };
-        for replica in 1..=3 {
-            protocol.observe(origin(replica), &vote(replica, 1, replica, false));
-        }
-        protocol.observe(origin(2), &vote(2, 2, 1, false));
-        assert!(
-            protocol
-                .observe(origin(1), &vote(1, 2, 1, false))
-                .is_empty()
-        );
-        assert!(protocol.observe(origin(1), &vote(1, 2, 1, true)).is_empty());
-        // n3 claims term 3 with only its own grant.
-        protocol.observe(origin(3), &vote(3, 3, 3, false));
-        assert_eq!(
-            kinds(&protocol.observe(origin(3), &vote(3, 3, 3, true))),
-            [ELECTION_SAFETY]
-        );
-        assert_eq!(
-            kinds(&protocol.observe(origin(3), &vote(3, 2, 1, true))),
-            [MONOTONIC_VOTE]
-        );
-        // A wipe forgets the durable vote.
-        protocol.wiped(3);
-        assert!(
-            protocol
-                .observe(origin(3), &vote(3, 1, 1, false))
-                .is_empty()
-        );
+        assert!(protocol.observe(origin(1), &vote(2, true)).is_empty());
+        let back = protocol.observe(origin(1), &vote(1, false));
+        assert_eq!(kinds(&back), [MONOTONIC_VOTE]);
+        let twin = protocol.observe(origin(4), &vote(2, true));
+        assert_eq!(kinds(&twin), [ELECTION_SAFETY]);
     }
 
     #[test]
     fn dedup_records_agree_and_reads_fence_commits() {
-        let mut protocol = Protocol::new(3);
+        let mut protocol = Protocol::new();
         let dedup = |commit_ts, digest| Probe::DedupApplied {
             group: GROUP,
             table: Uuid::from_u128(1),
@@ -728,41 +809,43 @@ mod tests {
     }
 
     #[test]
-    fn route_publications_must_cover_the_key_space() {
-        let mut protocol = Protocol::new(3);
-        let table = Uuid::from_u128(1);
+    fn committed_routes_must_cover_the_key_space() {
+        let (table, page_id) = (Uuid::from_u128(1), Uuid::from_u128(2));
         let span = |start: Option<i64>, end: Option<i64>| Span {
             start: start.map(Key::Int64),
             end: end.map(Key::Int64),
         };
-        let publish = |retired, routes| Probe::RouteEpochPublished {
+        let publish = |commit_ts, record| Probe::RouteEpochPublished {
             table,
-            routing_epoch: 1,
-            retired,
-            routes,
+            commit_ts,
+            record,
         };
-        assert!(
-            protocol
-                .observe(origin(1), &publish(None, vec![span(None, None)]))
-                .is_empty()
-        );
-        let split = publish(
-            Some(span(None, None)),
-            vec![span(None, Some(5)), span(Some(5), None)],
-        );
-        assert!(protocol.observe(origin(1), &split).is_empty());
-        // A repeated publication changes nothing.
-        assert!(protocol.observe(origin(1), &split).is_empty());
-        let gap = publish(Some(span(Some(5), None)), vec![span(Some(6), None)]);
-        assert_eq!(
-            kinds(&protocol.observe(origin(1), &gap)),
-            [KEYSPACE_COVERAGE]
-        );
+        let root = || RouteRecord::Root {
+            first_page: Some(page_id),
+            routing_epoch: 1,
+        };
+        let page = |spans| RouteRecord::Page {
+            page_id,
+            next_page: None,
+            spans,
+        };
+        let mut protocol = Protocol::new();
+        protocol.observe(origin(1), &publish(5, page(vec![span(None, None)])));
+        protocol.observe(origin(1), &publish(5, root()));
+        assert!(protocol.check_routes().is_empty());
+        let gap = vec![span(None, Some(5)), span(Some(6), None)];
+        protocol.observe(origin(1), &publish(9, page(gap)));
+        protocol.observe(origin(1), &publish(9, root()));
+        assert_eq!(kinds(&protocol.check_routes()), [KEYSPACE_COVERAGE]);
+        // A root whose page never committed is a hole, not a pass.
+        let mut missing = Protocol::new();
+        missing.observe(origin(1), &publish(5, root()));
+        assert_eq!(kinds(&missing.check_routes()), [KEYSPACE_COVERAGE]);
     }
 
     #[test]
     fn native_leases_are_released_once_and_reset_by_a_crash() {
-        let mut protocol = Protocol::new(3);
+        let mut protocol = Protocol::new();
         let acquire = Probe::GuardAcquired {
             class: "query",
             outstanding: 1,

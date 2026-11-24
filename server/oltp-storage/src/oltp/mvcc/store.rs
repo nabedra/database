@@ -378,6 +378,15 @@ impl ParticipantMachine {
     pub(super) async fn observe_snapshot(&self, read_ts: ReadTs) -> Result<(), ProtocolError> {
         if matches!(self.store.identity().kind, GroupKind::Data { .. }) {
             self.clock.observe_snapshot(read_ts).await?;
+            #[cfg(feature = "sim")]
+            if read_ts.get() != u64::MAX {
+                nabedra_oltp_types::sim_probe::emit(|| {
+                    nabedra_oltp_types::sim_probe::Probe::SnapshotServed {
+                        group: self.store.identity().group_id,
+                        read_ts: read_ts.get(),
+                    }
+                });
+            }
         }
         Ok(())
     }
@@ -1221,6 +1230,8 @@ fn resolve_writes(
                         _ => unreachable!(),
                     };
                     tx.put_serialized(buffer, &Version { value })?;
+                    #[cfg(feature = "sim")]
+                    route_probe(&logical, value, commit_ts);
                     version = Some(commit_ts);
                 }
             }
@@ -1242,6 +1253,36 @@ fn resolve_writes(
         })?;
     }
     Ok(())
+}
+
+/// Reports a committed Catalog routing root or page (simulation only). `None` is a delete.
+#[cfg(feature = "sim")]
+fn route_probe(logical: &[u8], value: Option<&RawValue>, commit_ts: CommitTs) {
+    use super::catalog::{RoutingPage, RoutingRoot};
+    use nabedra_oltp_types::sim_probe::{Probe, RouteRecord, Span, emit};
+    let (Some(&tag @ (6 | 7)), true) = (logical.first(), logical.len() >= 33) else {
+        return;
+    };
+    let id = |range: std::ops::Range<usize>| {
+        Uuid::from_slice(&logical[range]).expect("encoded key holds UUIDs")
+    };
+    let record = match (tag, value) {
+        (6, Some(raw)) => serde_json::from_str::<RoutingRoot>(raw.get()).map(|root| {
+            RouteRecord::Root { first_page: root.first_page, routing_epoch: root.routing_epoch }
+        }),
+        (6, None) => Ok(RouteRecord::RootDeleted),
+        (_, Some(raw)) => serde_json::from_str::<RoutingPage>(raw.get()).map(|page| {
+            RouteRecord::Page {
+                page_id: id(17..33),
+                next_page: page.next_page,
+                spans: page.shards.iter().map(|route| Span { start: route.span.start.clone(), end: route.span.end.clone() }).collect(),
+            }
+        }),
+        (_, None) => Ok(RouteRecord::PageDeleted { page_id: id(17..33) }),
+    };
+    if let Ok(record) = record {
+        emit(|| Probe::RouteEpochPublished { table: id(1..17), commit_ts: commit_ts.get(), record });
+    }
 }
 
 pub(crate) fn page_fits(

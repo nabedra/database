@@ -323,6 +323,9 @@ impl Invariants {
             checks.violate(world, "Liveness", deadline_message(&label, deadline));
         }
         drop(checks);
+        if let Some(probes) = &probes {
+            probes.check_routes(world);
+        }
         if let Some(Err(error)) = probes.map(|probes| probes.finish()) {
             self.violate(
                 world,

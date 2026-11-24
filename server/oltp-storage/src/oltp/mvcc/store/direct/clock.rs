@@ -251,9 +251,15 @@ impl RangeClock {
 
     /// Remove a pending commit. Idempotent.
     pub fn settle(&self, commit_ts: CommitTs) {
+        #[cfg(not(feature = "sim"))]
         let removed = self.lock().remove(commit_ts);
         #[cfg(feature = "sim")]
-        self.probe(&self.lock(), None);
+        let removed = {
+            let mut state = self.lock();
+            let removed = state.remove(commit_ts);
+            self.probe(&state, None);
+            removed
+        };
         if removed {
             self.changed.notify_waiters();
         }
@@ -329,22 +335,13 @@ impl RangeClock {
             }
             state.generation
         };
-        let served = self
-            .wait_since(generation, |state| {
-                state
-                    .pending
-                    .first_key_value()
-                    .is_none_or(|(ts, _)| ts.get() > bound)
-            })
-            .await;
-        #[cfg(feature = "sim")]
-        if served.is_ok() && bound != u64::MAX {
-            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::SnapshotServed {
-                group: self._store.identity().group_id,
-                read_ts: bound,
-            });
-        }
-        served
+        self.wait_since(generation, |state| {
+            state
+                .pending
+                .first_key_value()
+                .is_none_or(|(ts, _)| ts.get() > bound)
+        })
+        .await
     }
 
     /// A latest-version read of `key` (plan section 6, `table.get`) waits for

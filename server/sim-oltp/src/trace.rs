@@ -164,7 +164,7 @@ fn sha() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::probes::{Probe, Span};
+    use crate::probes::{Probe, RouteRecord, Span};
     use nabedra_protocol::protocol::Key;
 
     #[test]
@@ -179,12 +179,15 @@ mod tests {
             live: true,
             probe: Probe::RouteEpochPublished {
                 table: uuid::Uuid::nil(),
-                routing_epoch: 1,
-                retired: None,
-                routes: vec![Span {
-                    start: None,
-                    end: Some(Key::Int64(4)),
-                }],
+                commit_ts: 1,
+                record: RouteRecord::Page {
+                    page_id: uuid::Uuid::nil(),
+                    next_page: None,
+                    spans: vec![Span {
+                        start: None,
+                        end: Some(Key::Int64(4)),
+                    }],
+                },
             },
         });
         trace.fault(3, 2, "Crash");
@@ -199,8 +202,9 @@ mod tests {
         assert_eq!(
             lines[1],
             json!({"seq":0,"t":5,"node":"n2","action":"RouteEpochPublished","vars":{
-                "table":"00000000-0000-0000-0000-000000000000","routing_epoch":1,
-                "routes":[{"end":4}],"incarnation":1}})
+                "table":"00000000-0000-0000-0000-000000000000","commit_ts":1,
+                "record":{"page":{"page_id":"00000000-0000-0000-0000-000000000000",
+                "spans":[{"end":4}]}},"incarnation":1}})
         );
         // Time never decreases, and seq counts every step.
         assert_eq!(lines[2]["seq"], 1);

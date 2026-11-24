@@ -624,11 +624,20 @@ struct NativeLease {
 struct NativeSettlement(Arc<NativeLeases>);
 impl Drop for NativeSettlement {
     fn drop(&mut self) {
-        self.0.state.lock().expect("native lease state").count -= 1;
+        #[cfg(not(feature = "sim"))]
+        {
+            self.0.state.lock().expect("native lease state").count -= 1;
+        }
         #[cfg(feature = "sim")]
-        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GuardReleased {
-            outstanding: self.0.state.lock().map_or(0, |state| state.count as u64),
-        });
+        {
+            let mut state = self.0.state.lock().expect("native lease state");
+            state.count -= 1;
+            nabedra_oltp_types::sim_probe::emit(|| {
+                nabedra_oltp_types::sim_probe::Probe::GuardReleased {
+                    outstanding: state.count as u64,
+                }
+            });
+        }
         self.0.settled.notify_waiters();
     }
 }

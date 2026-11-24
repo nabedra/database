@@ -26,12 +26,12 @@ use nabedra_rt::sim::{self, SimEvent, World};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
-pub use nabedra_oltp_types::sim_probe::{Ledger, Probe, ProbeSink, Span};
+pub use nabedra_oltp_types::sim_probe::{Ledger, LogEntry, Probe, ProbeSink, RouteRecord, Span};
 
 use crate::{
     invariants::{
         Invariants,
-        protocol::{DEFAULT_VOTERS, NOT_APPLIED_NEVER_COMMITTED, Origin, Protocol},
+        protocol::{NOT_APPLIED_NEVER_COMMITTED, Origin, Protocol},
     },
     trace::TraceFile,
 };
@@ -96,7 +96,7 @@ impl Probes {
             hub: Arc::new(Mutex::new(Hub {
                 seq: 0,
                 incarnations: BTreeMap::new(),
-                protocol: Protocol::new(DEFAULT_VOTERS),
+                protocol: Protocol::new(),
                 subscribers: Vec::new(),
                 trace: TraceFile::from_env(world.seed(), workload),
                 invariants: invariants.downgrade(),
@@ -144,9 +144,8 @@ impl Probes {
         )
     }
 
-    /// NotAppliedNeverCommitted: a definite `not_applied` answer for a request ID means
-    /// no replica ever commits a direct entry carrying that identity, unless the client
-    /// later retries the same ID.
+    /// NotAppliedNeverCommitted: after a definite `not_applied` answer, no replica ever
+    /// commits a direct entry carrying that identity. Design 3.7 exempts nothing.
     pub fn check_outcomes(&self, world: &World, events: &[Event]) {
         let mut violations = Vec::new();
         {
@@ -159,7 +158,7 @@ impl Probes {
                     ((key, identity.request_id.to_string()), t_ns)
                 })
                 .collect();
-            for (index, event) in events.iter().enumerate() {
+            for event in events {
                 if event.kind != EventType::Fail
                     || event.value.get("not_applied").and_then(Value::as_bool) != Some(true)
                 {
@@ -171,19 +170,27 @@ impl Probes {
                 let Some(t_ns) = committed.get(&(key.clone(), request.clone())) else {
                     continue;
                 };
-                let retried = events[index + 1..].iter().any(|later| {
-                    later.kind == EventType::Invoke && later.request_id.as_ref() == Some(request)
-                });
-                if !retried {
-                    violations.push(format!(
-                        "{key} request {request}: answered not_applied at history event {} but a replica committed it at {} ns",
-                        event.index, t_ns
-                    ));
-                }
+                violations.push(format!(
+                    "{key} request {request}: answered not_applied at history event {} but a replica committed it at {t_ns} ns",
+                    event.index
+                ));
             }
         }
         for detail in violations {
             self.report(world, NOT_APPLIED_NEVER_COMMITTED, detail);
+        }
+    }
+
+    /// How often each protocol rule ran on an event of its own. A rule that is absent
+    /// was not exercised and must be reported as not run.
+    pub fn exercised(&self) -> BTreeMap<&'static str, u64> {
+        self.lock().protocol.exercised().clone()
+    }
+
+    pub(crate) fn check_routes(&self, world: &World) {
+        let violations = self.lock().protocol.check_routes();
+        for (kind, detail) in violations {
+            self.report(world, kind, detail);
         }
     }
 

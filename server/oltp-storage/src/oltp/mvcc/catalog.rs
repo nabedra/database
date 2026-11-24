@@ -455,10 +455,6 @@ impl CatalogHandle {
             routing_epoch: route.routing_epoch,
             lifecycle_id: table_id,
         };
-        #[cfg(feature = "sim")]
-        nabedra_oltp_types::sim_probe::emit(|| {
-            route_probe(table_id, route.routing_epoch, None, [&route.span])
-        });
         let entries = [
             (
                 MvccKey::CatalogName { name },
@@ -583,25 +579,6 @@ pub(super) fn primary(a: &Key, b: &Key) -> std::cmp::Ordering {
         (Key::Utf8(a), Key::Utf8(b)) => a.cmp(b),
         (Key::Int64(_), _) => std::cmp::Ordering::Less,
         _ => std::cmp::Ordering::Greater,
-    }
-}
-/// The probe for a route publication: `routes` replace `retired` at `epoch` (simulation only).
-#[cfg(feature = "sim")]
-pub(crate) fn route_probe<'a>(
-    table: Uuid,
-    epoch: u64,
-    retired: Option<&KeySpan>,
-    routes: impl IntoIterator<Item = &'a KeySpan>,
-) -> nabedra_oltp_types::sim_probe::Probe {
-    let span = |span: &KeySpan| nabedra_oltp_types::sim_probe::Span {
-        start: span.start.clone(),
-        end: span.end.clone(),
-    };
-    nabedra_oltp_types::sim_probe::Probe::RouteEpochPublished {
-        table,
-        routing_epoch: epoch,
-        retired: retired.map(span),
-        routes: routes.into_iter().map(span).collect(),
     }
 }
 fn invalid() -> ProtocolError {

@@ -1203,7 +1203,13 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                     entries: jobs
                         .iter()
                         .flat_map(|job| job.batch.iter())
-                        .map(|entry| super::hosted::position(entry.log_id))
+                        .map(|entry| nabedra_oltp_types::sim_probe::LogEntry {
+                            at: super::hosted::position(entry.log_id),
+                            voters: match entry.payload() {
+                                Payload::Membership(membership) => Some(membership.get_joint_config().iter().map(|config| config.iter().copied().collect()).collect()),
+                                _ => None,
+                            },
+                        })
                         .collect(),
                 });
             }

@@ -43,6 +43,34 @@ pub struct Span {
     pub end: Option<Key>,
 }
 
+/// A synced log entry. `voters` is the joint voter configuration of a membership entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LogEntry {
+    #[serde(flatten)]
+    pub at: AppliedPosition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voters: Option<Vec<Vec<u64>>>,
+}
+
+/// A committed Catalog routing record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteRecord {
+    Root {
+        first_page: Option<Uuid>,
+        routing_epoch: u64,
+    },
+    RootDeleted,
+    Page {
+        page_id: Uuid,
+        next_page: Option<Uuid>,
+        spans: Vec<Span>,
+    },
+    PageDeleted {
+        page_id: Uuid,
+    },
+}
+
 /// One protocol step. The variants follow design section 3.2. `replica` is the Raft node
 /// ID of the reporting replica within `group`; the sink adds the simulated node and time.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -53,7 +81,7 @@ pub enum Probe {
         group: Uuid,
         kind: GroupKind,
         replica: u64,
-        entries: Vec<AppliedPosition>,
+        entries: Vec<LogEntry>,
     },
     /// A replica removed every log entry after `after` (all of them when `None`).
     Truncated {
@@ -106,13 +134,11 @@ pub enum Probe {
         commit_ts: u64,
         term: u64,
     },
-    /// The Catalog prepared a route publication for `table`: `routes` replace `retired`
-    /// (nothing for a new table) at `routing_epoch`.
+    /// A Catalog replica made a routing record visible at `commit_ts`.
     RouteEpochPublished {
         table: Uuid,
-        routing_epoch: u64,
-        retired: Option<Span>,
-        routes: Vec<Span>,
+        commit_ts: u64,
+        record: RouteRecord,
     },
     /// The current size of a transient ledger.
     LedgerSnapshot {

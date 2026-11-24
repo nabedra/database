@@ -114,12 +114,10 @@ fn not_applied_answers_never_have_a_committed_dedup_record() {
             event
         };
         let answered = [event(EventType::Invoke, 0), event(EventType::Fail, 1)];
-        // A later retry of the same request ID may commit it.
-        checks.check_outcomes(
-            &world,
-            &[&answered[..], &[event(EventType::Invoke, 2)]].concat(),
-        );
-        assert!(checks.probe_invariants_hold());
+        // Design 3.7: a later retry of the same ID is no exemption.
+        let retried = [&answered[..], &[event(EventType::Invoke, 2)]].concat();
+        checks.check_outcomes(&world, &retried);
+        assert!(!checks.probe_invariants_hold());
         checks.check_outcomes(&world, &answered);
         let kinds = shrink::kinds(&checks.violations());
         assert!(kinds.contains(NOT_APPLIED_NEVER_COMMITTED), "{kinds:?}");
