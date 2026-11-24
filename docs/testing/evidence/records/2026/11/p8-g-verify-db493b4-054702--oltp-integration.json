@@ -1,0 +1,53 @@
+{
+  "artifacts": [
+    {
+      "name": "p8-g-verify-db493b4-054702--oltp-integration.log",
+      "sha256": "99071aefe9581e452de9f0bc7ea21179a6696fe63725c3cbed10cd46b8cd0ed1"
+    }
+  ],
+  "assertions": {
+    "executed": 20,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "ignored",
+        "reason": "1 tests marked #[ignore]"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-integration",
+  "duration_s": 106.459,
+  "guarantees": [],
+  "kind": "U R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T04:57:22.570617+00:00",
+    "request_id": "p8-g-verify-db493b4-054702",
+    "runner": "GitHub Actions 1000009900",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45328759638"
+  },
+  "scenarios": [
+    "C07",
+    "M02",
+    "O06",
+    "Q03",
+    "Q04",
+    "Q06",
+    "R01",
+    "R03",
+    "U02"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "db493b497697a605a2d555d78c40f09bc039c38f",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
