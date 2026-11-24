@@ -1,0 +1,122 @@
+{
+  "artifacts": [
+    {
+      "name": "sim-trace-17852b7-190938--sim-two-phase-trace-incomplete.log",
+      "sha256": "930dd8f20210af2d2f0901413938132031aafefdc1ffd82ae0e6764b1232a9b9"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "b7bb3a6ebde27cc219f598d788be95e4f18c86cce25c0210fecbbe086d656813"
+    },
+    {
+      "name": "tla/trace-000.log",
+      "sha256": "5bf9872878f8964b77889d969b3beb188fde5bb8a1e4c76c4e1299c5d3ce2c3c"
+    },
+    {
+      "name": "tla/trace-001.log",
+      "sha256": "87c0fcefb2b4b5ce55da0ff1f4ec5d9f9c492aa0c15a748c54073c34921daf85"
+    },
+    {
+      "name": "tla/trace-002.log",
+      "sha256": "7d3cd54f52cf07f604e203782cd01b0570b1c1f1a7163c32f29d3ea9a392a599"
+    },
+    {
+      "name": "tla/trace-003.log",
+      "sha256": "8de9afc870f9c5c3bfb3352cc8c27ab4a1299a817ef265a911f67676da50ecfd"
+    },
+    {
+      "name": "tla/trace-004.log",
+      "sha256": "5abf40540c2386497cdfe4de280fe8cadcae87ee11285a0b283362ee4e1fe3de"
+    },
+    {
+      "name": "tla/trace-005.log",
+      "sha256": "41669933feddc3179fd807d194dde202c9a822086a7289d4d3c0d5c350436ddd"
+    },
+    {
+      "name": "tla/trace-006.log",
+      "sha256": "c5c1688d37b9822515255b3cdd2fa86423c69d0b2d9f6b1c8982a48a76cc8433"
+    }
+  ],
+  "assertions": {
+    "executed": 7,
+    "failed": 7,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "sim-two-phase-trace-incomplete",
+  "duration_s": 30.062,
+  "guarantees": [],
+  "kind": "T",
+  "mode": {
+    "tla": "trace"
+  },
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T18:32:28.030507+00:00",
+    "request_id": "sim-trace-17852b7-190938",
+    "runner": "GitHub Actions 1000012715",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45456441921"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "17852b7ce7e24e0963b812e12948f488f4994e35",
+  "sim_core_hours": null,
+  "tla": {
+    "budget_s": 900,
+    "mode": "trace",
+    "spec": "specs/selftest/TwoPhase",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "traces": {
+      "accepted": 7,
+      "checked": 7,
+      "expected_rejections": 0,
+      "failing": [
+        {
+          "file": "TwoPhase-bare-actions.ndjson",
+          "index": null,
+          "reason": "accepted, but it must be rejected"
+        },
+        {
+          "file": "TwoPhase-duplicate-key.ndjson",
+          "index": null,
+          "reason": "accepted, but it must be rejected"
+        },
+        {
+          "file": "TwoPhase-missing-message.ndjson",
+          "index": null,
+          "reason": "accepted, but it must be rejected"
+        },
+        {
+          "file": "TwoPhase-misspelt-variable.ndjson",
+          "index": null,
+          "reason": "accepted, but it must be rejected"
+        },
+        {
+          "file": "TwoPhase-omitted-variable.ndjson",
+          "index": null,
+          "reason": "accepted, but it must be rejected"
+        },
+        {
+          "file": "TwoPhase-oversized-integer.ndjson",
+          "index": null,
+          "reason": "accepted, but it must be rejected"
+        },
+        {
+          "file": "TwoPhase-wrong-message.ndjson",
+          "index": null,
+          "reason": "accepted, but it must be rejected"
+        }
+      ],
+      "rejected": 0
+    }
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}

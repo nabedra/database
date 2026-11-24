@@ -1,0 +1,214 @@
+{
+  "artifacts": [
+    {
+      "name": "sim-trace-17852b7-190938--sim-two-phase-trace.log",
+      "sha256": "2abb2be967f365d0b4fbffe6d6a67c67edada0d4eda47422a7d78c6f822961db"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "82c0bdc36b541bc18e9c63ca23d6a2288a260f09fc851ecf95c94be642295529"
+    },
+    {
+      "name": "tla/trace-000.log",
+      "sha256": "15dfa032fe6c501b7bbb520833e679d12043e455d1edd22257b346afa20b1151"
+    },
+    {
+      "name": "tla/trace-001.log",
+      "sha256": "763399d56e3536484bcb8a0b0b34809cf0fc6c18f6bd33b29c966ff8cc069431"
+    },
+    {
+      "name": "tla/trace-002.log",
+      "sha256": "7eca4e73a20b14863d4f9febceb6f3200e42367fff3b763918f60a7f7e6f6e3b"
+    },
+    {
+      "name": "tla/trace-003.log",
+      "sha256": "547ea58bb94cef7455c63f271508fd52f050f7bfedced8e7b30629f8675d0147"
+    },
+    {
+      "name": "tla/trace-004.log",
+      "sha256": "9b1d520eff18101e6150b98e7b7b5a8bbccbc5a94e242953e33b4171028372e4"
+    },
+    {
+      "name": "tla/trace-005.log",
+      "sha256": "cb2fd1d2c776cb5a0c9baf20dc0a7b4e619a49127ba9a0ee782590f1a514de52"
+    },
+    {
+      "name": "tla/trace-006.log",
+      "sha256": "753bc6ad9688d6dbea37225270de080f96e41c4ccec091123baf7946ff957a3e"
+    },
+    {
+      "name": "tla/trace-007.log",
+      "sha256": "afc8919b7e9fd3b60cf04f6a7723496c0fce98864b4252129bbdfa26dea97b39"
+    },
+    {
+      "name": "tla/trace-008.log",
+      "sha256": "1c5711bf4e05c852ed230bf3a58dbb4efdbdd035eb313765298433fbdc342a26"
+    },
+    {
+      "name": "tla/trace-009.log",
+      "sha256": "9fa3a71e5c8f286425bc73fcc9f6e481a357549ec4b2c8b9ddb0f31d307c66e6"
+    },
+    {
+      "name": "tla/trace-010.log",
+      "sha256": "6f88d4f8ed90def727aa470fd50247d22ad443add6aa5e01560a845097475a62"
+    },
+    {
+      "name": "tla/trace-011.log",
+      "sha256": "d946a3af63e76eef18b1b5ed08b8b1b67b9c65c4fc43919d88e8aeaa0092e873"
+    },
+    {
+      "name": "tla/trace-012.log",
+      "sha256": "4712c22e073f26c536b25937708c8e956d45efe691d4544ae1e9e35872300a31"
+    },
+    {
+      "name": "tla/trace-013.log",
+      "sha256": "0dfc8b1c7d53c6b2aea149ced631fc77f9e9597e611788db26d65cb9082e23b7"
+    },
+    {
+      "name": "tla/trace-014.log",
+      "sha256": "035922336ad534475f7e21ad91bb3c3114fc5b0bb151fd2d0117a27db3704c7c"
+    },
+    {
+      "name": "tla/trace-015.log",
+      "sha256": "538c31c189bd59f8118b0a50f38d6aa3f01aa17e2454f3fe7650565e40ba5cb1"
+    },
+    {
+      "name": "tla/trace-016.log",
+      "sha256": "b13a3c18e28ae3bd4f6a5e95028e978c43f709aa99a084b652eb74457e0ade27"
+    },
+    {
+      "name": "tla/trace-017.log",
+      "sha256": "3c23a8d95de5613f9d213ef3a10fb504b3f5e10ca233a92a8d1e754bc69328db"
+    },
+    {
+      "name": "tla/trace-018.log",
+      "sha256": "ebfe1d5f01deedc1b475f31c4bb1d9161e6eae4248ef8753d50cc5fd54125f9d"
+    },
+    {
+      "name": "tla/trace-019.log",
+      "sha256": "f3d5cb649078ea6123a36fbcc7c11b2a5da03d8a699d06577a8ea91e995b8e68"
+    },
+    {
+      "name": "tla/trace-020.log",
+      "sha256": "52a9e72f524fb7dab26cdf564aabf98c6b2ea2cd507c4833dae40891bbb164f1"
+    },
+    {
+      "name": "tla/trace-021.log",
+      "sha256": "575c0ec3753e2347928c820b207711e61d8f13adedb39480a97dbf284b7d179e"
+    },
+    {
+      "name": "tla/trace-022.log",
+      "sha256": "584f3fadd9d7e26be97e0491d743d58c762a56a022f16a3ca528f79192e5f28d"
+    },
+    {
+      "name": "tla/trace-023.log",
+      "sha256": "a2b65adb9c1075c08ed9416da67aa198841c04d22bb08cb92851d5db4f72885b"
+    },
+    {
+      "name": "tla/trace-024.log",
+      "sha256": "d161928e9057c2c9972e728db73d544174fb56efad2fb6ac06c27b8fe9626271"
+    },
+    {
+      "name": "tla/trace-025.log",
+      "sha256": "d84cbd8f76cc6059d28cb17ff0b4a07312094fdab7786915637d02703d285f7e"
+    },
+    {
+      "name": "tla/trace-026.log",
+      "sha256": "2807a5350e204133c72d2a51713a4a7505aff40b670d8bf7ce80a971f7a8fab0"
+    },
+    {
+      "name": "tla/trace-027.log",
+      "sha256": "7f8d8b30b598c4e1751c4c51f962badeca48550d3e5392ab4a6950fd2fff87a4"
+    },
+    {
+      "name": "tla/trace-028.log",
+      "sha256": "2df78d8999db7460c05fb3880c76fd2c8379a48bd52ae2507ba2b3ac0f1bc7d1"
+    },
+    {
+      "name": "tla/trace-029.log",
+      "sha256": "c27918de523d4d935eb81ca847eaa4e2f69420abc0faddcf8e6d385cc6ec881a"
+    },
+    {
+      "name": "tla/trace-030.log",
+      "sha256": "edf0f57a9ac65dc1c0b754420fc7d8a900a28b0bfc2a86fc8e237c72bfadbcf7"
+    },
+    {
+      "name": "tla/trace-031.log",
+      "sha256": "96b086ab3f54d60fce6aaafe8ebd8b56446644fc85d8225d8b31e18a1388c1e3"
+    },
+    {
+      "name": "tla/trace-032.log",
+      "sha256": "afb27958b021af5f998fc2ed6f3f92cdd8fcb757ebf558dc895f01b3e57f712d"
+    },
+    {
+      "name": "tla/trace-033.log",
+      "sha256": "9f3609c215e25407569af997557bf32c2caa90e16d1ca07a493d5bc042e8057a"
+    },
+    {
+      "name": "tla/trace-034.log",
+      "sha256": "6323c92286d654e59d8911c668bf5c90cdf82c5726640ee39439779d0b31b90c"
+    },
+    {
+      "name": "tla/trace-035.log",
+      "sha256": "59239807024b5235b0417b672bfa62e3dd603fdf4a574eb9e4612306751730c5"
+    },
+    {
+      "name": "tla/trace-036.log",
+      "sha256": "7746a9727bc4ab943e47ac872b6fa393bdf0c50a89c3b2720bfb0a8831308088"
+    },
+    {
+      "name": "tla/trace-037.log",
+      "sha256": "55d8680247f9f31ed2a05ec2361df9c1ed66c148610da4ecde4c004690dafbad"
+    },
+    {
+      "name": "tla/trace-038.log",
+      "sha256": "06f585d852d67157878c4dd13cb5ecf32a434f9fc998f0805386dd0c9bf418e5"
+    }
+  ],
+  "assertions": {
+    "executed": 46,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "sim-two-phase-trace",
+  "duration_s": 77.769,
+  "guarantees": [],
+  "kind": "T",
+  "mode": {
+    "tla": "trace"
+  },
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T18:21:19.026525+00:00",
+    "request_id": "sim-trace-17852b7-190938",
+    "runner": "GitHub Actions 1000012667",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45456441921"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "17852b7ce7e24e0963b812e12948f488f4994e35",
+  "sim_core_hours": null,
+  "tla": {
+    "budget_s": 900,
+    "mode": "trace",
+    "spec": "specs/selftest/TwoPhase",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "traces": {
+      "accepted": 26,
+      "checked": 46,
+      "expected_rejections": 20,
+      "failing": [],
+      "rejected": 20
+    }
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}
