@@ -191,7 +191,7 @@ jobs:
           growth=()
           if has growth; then
             # SCRATCH (harness-port): O28 startup repeats. Never merge.
-            for n in main-off-clean-25 main-on-clean-25 head-off-clean-25 head-on-clean-25 main-off-kernel-3 head-off-kernel-3 main-off-config-3 head-off-config-3; do
+            for n in head-off-held-1 head-off-finalheld-1 head-off-finalconfig-1 main-off-finalheld-1; do
               growth+=("{\"scenario\":\"O28\",\"modes\":\"off\",\"label\":\"$n\",\"opt1\":true,\"timeout\":3600}")
             done
           fi
@@ -1823,7 +1823,7 @@ jobs:
                       harness_ports.socket.socket = real_socket
               else:
                   real_prepare(self)
-                  if mode == 'config' and state['attempts'] == 1:
+                  if mode in ('config', 'finalconfig') and state['attempts'] == 1:
                       self.config['w2']['bind'] = self.config['w1']['bind']
               print('STARTUP ports', {n: (v['bind'], v['node']['bind']) for n, v in self.config.items()}, flush=True)
 
@@ -1838,6 +1838,12 @@ jobs:
               assert len(binds) == 6, binds
 
 
+          # held: a foreign listener holds w2's HTTP port (existing hook, pick 5), so the real w2 exits on its bind.
+          # final-*: one start attempt only, so the harness's own verdict is the result instead of its first-start retry.
+          if 'held' in mode:
+              os.environ['NABEDRA_TEST_PORT_COLLISIONS'] = '5'
+          if mode.startswith('final'):
+              harness_ports.ATTEMPTS = 1
           c.Rf3Cluster.prepare_workers = prepare
           g.o28 = first_create
           sys.argv = ['oltp_growth_acceptance.py', '--scenario', 'O28', '--binary', binary, '--test-executable', executable]
