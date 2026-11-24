@@ -326,13 +326,17 @@ impl TopoPlan {
         }
         let drop_at = ms(g, 3_000, 15_000);
         let drop_gateway = g.below(2) as usize;
-        indexes.push(IndexPlan {
+        // An index publication that races the drop, in half of the seeds.
+        let racing = IndexPlan {
             table: Table::Victim,
             name: "victim_value".into(),
             kind: IndexKind::Valid,
             start: drop_at.saturating_sub(ms(g, 0, 1_500)),
             retire: None,
-        });
+        };
+        if g.bool() {
+            indexes.push(racing);
+        }
         let moving = g.bool();
         let moving = forced
             .moving
@@ -603,6 +607,12 @@ fn definite(code: ErrorCode) -> bool {
             | ErrorCode::Conflict
             | ErrorCode::LimitExceeded
     )
+}
+
+/// A definite refusal because another schema change came first. The request ID keeps that
+/// result, so the operator asks again under a new one.
+fn overtaken(code: ErrorCode, why: &str) -> bool {
+    code == ErrorCode::Conflict && why.contains("captured schema or lifecycle changed")
 }
 
 fn copy(completion: &Completion) -> Completion {
@@ -998,6 +1008,13 @@ async fn life(
                 if !open {
                     t.log(|log| log.refused.insert(id, format!("{code:?} {why}")));
                 }
+                if overtaken(code, &why) && !t.change_over() {
+                    id = fresh_id(BOOTSTRAP_CLIENT).await;
+                    t.log(|log| log.selectors.insert(id, selector(id)));
+                    (open, refusals) = (false, 0);
+                    time::sleep(RETRY).await;
+                    continue;
+                }
                 build.refused = true;
                 let expected = plan.kind != IndexKind::Valid
                     || plan.table == Table::Victim
@@ -1033,6 +1050,10 @@ async fn life(
             build.stuck = Some(format!("the build is {state}"));
             return;
         }
+        // The text bounds no build of a dropped table. Other builds must not wait for it.
+        if plan.table == Table::Victim && t.log(|log| log.dropped.is_some()) {
+            return;
+        }
         if t.change_over() {
             build.stuck = Some(format!("still {state}: {last}"));
             return;
@@ -1053,9 +1074,6 @@ async fn life(
                 state = record_status(t, &plan.name, invoked, completed, &data);
             }
             Reply::Definite(code, why) => {
-                if plan.table == Table::Victim && t.log(|log| log.dropped.is_some()) {
-                    return;
-                }
                 // A build that belongs to an earlier run cannot resume, and stays invisible.
                 if name == "storage.index.resume" && *t.run.lock().unwrap() != run {
                     build.abandoned = true;
@@ -1165,7 +1183,7 @@ async fn drop_table(t: Topo, at: Duration, gateway: usize) -> Option<String> {
     time::sleep(at).await;
     let node = CLIENTS[1];
     let mut client = t.victim.new_client();
-    let id = fresh_id(node).await;
+    let mut id = fresh_id(node).await;
     let payload = json!({"table_id": t.victim.table});
     let mut gateway = gateway;
     let mut open = false;
@@ -1200,6 +1218,13 @@ async fn drop_table(t: Topo, at: Duration, gateway: usize) -> Option<String> {
                     );
                     return None;
                 }
+                Completion::Refused(error)
+                    if error.outcome == Outcome::NotApplied
+                        && overtaken(error.code, &error.message) =>
+                {
+                    id = fresh_id(node).await;
+                    open = false;
+                }
                 other => open |= clients::unknown(other),
             }
             if t.change_over() {
@@ -1216,7 +1241,7 @@ async fn drop_table(t: Topo, at: Duration, gateway: usize) -> Option<String> {
     for gateway in 0..GATEWAYS.len() {
         let id = fresh_id(node).await;
         let invoked = t.next();
-        let payload = json!({"table_id": t.victim.table});
+        let payload = json!({"name": "sim_victim"});
         let answer = t
             .public(&mut client, node, gateway, id, "table.describe", payload)
             .await;
@@ -1327,7 +1352,17 @@ async fn split(t: Topo, table: String, cluster_id: Uuid, boundary: i64, at: Dura
                 return;
             }
             Reply::Ok(data) => data.to_string(),
-            Reply::Definite(_, why) | Reply::Retry { why, .. } => why,
+            Reply::Definite(code, why) => {
+                if overtaken(code, &why) {
+                    id = fresh_id(BOOTSTRAP_CLIENT).await;
+                    t.note(
+                        "split-ranged",
+                        json!({"id": id, "boundary": boundary, "after": why}),
+                    );
+                }
+                why
+            }
+            Reply::Retry { why, .. } => why,
         };
         if why != last {
             t.note("split-ranged-pending", json!(why));
