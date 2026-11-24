@@ -2,7 +2,7 @@
 
 A one-line change in `server/src/oltp` takes 24 minutes to reach a runnable test binary with the settings agents use today on the shared development Mac, and 44 minutes to reach a local Docker image. Incremental builds with line-table debug info cut the first number to about 1.5 minutes, and a GitHub Actions runner builds the image in 7.4 minutes. This plan moves heavy builds and full suites to Actions, makes the local edit loop incremental, and removes the dependencies that cost the most.
 
-Status: measured 2026-11-20 at `b2196d2` (local) and in Actions runs `44707640355` (`7f1e328`) and `44711723599` (`fb8187f`). Nothing here is implemented. RocksDB is already gone. Every number below says where it comes from and the load it ran under. Lines marked "estimate" give their method.
+Status: measured 2026-11-20 at `b2196d2` (local) and in Actions runs `44707640355` (`7f1e328`) and `44711723599` (`fb8187f`). Nothing here is implemented. RocksDB is already gone. Every number below says where it comes from and the load it ran under. Lines marked "estimate" give their method. Phase 8 (2026-11-24) did BLD9 and measured BLD6 to BLD10 on Actions; see [measured results](#bld6-to-bld10-measured-results).
 
 ## Decisions already made
 
@@ -110,11 +110,11 @@ Ranked by the time a developer waits. The savings come from the tables above unl
 | BLD3 | Faster CI images (details below) | Up to 58 s of 444 s cold from a dependency layer; about 100 MB smaller OLTP image (estimate) | `Dockerfile`, `.dockerignore`, `server/events/deploy/Dockerfile`, workflow `docker-*` jobs | Low | A one-line change in `server/src/oltp` rebuilds the OLTP image on Actions in under 7 min. `ldd` lists only `libc`, `libm`, `libgcc_s`. |
 | BLD4 | In-tree S3 client to replace `aws-sdk-s3` and `aws-config` (details below) | 103 crates and 31% of release CPU time. The critical path shortens by about 250 s locally (estimate: the library could start once `openraft` and `clap` finish, about 480 s instead of 729 s). No effect on the default OLTP image, which builds without S3. | `server/src/storage/s3.rs`, `server/oltp-replication/src/oltp_backup_repository/s3.rs`, new `server/src/s3/` | Medium: security-critical | `cargo tree` for `oltp-backup-s3` and `olap,s3` has no `aws-*` crate. The SigV4 test vectors pass. The `oltp_backup_repository` S3 contract tests and the live-context probe pass against real S3 with explicit authorization. |
 | BLD5 | `ring` as the only TLS provider (details below) | 6 crates, 356 s of release CPU time, and the `cmake` build tool. Cold builds only. | `server/Cargo.toml`, `server/events/Cargo.toml`, the 9 `aws_lc_rs::default_provider()` call sites | Low code risk; needs the user's decision | No `aws-lc-*` or `cmake` crate in any engine or in Events (add both to `FORBIDDEN_NATIVE` in `scripts/check_engine_features.py`). The mTLS, gateway and Events TLS tests pass. |
-| BLD6 | Find out why the server crate is slow to compile | Decides whether BLD9 is worth doing | report only | None | A report that maps the module cycles, ranks codegen by function (`cargo llvm-lines` on a CI runner, not a project dependency), and explains why the release binary takes 437 s |
-| BLD7 | One OLAP integration-test binary instead of 33 | About 32 links of 5 to 22 s each, so 1.5 to 2 min wall at 4 jobs (estimate from the OLTP integration binaries' link times) | `server/tests/*.rs`, `server/Cargo.toml` `[[test]]` | Low | `cargo test --no-run` for the default features produces 1 OLAP integration binary. The test counts match before and after. |
-| BLD8 | Events dependency trims | Small: Events builds in 67 s debug and 97 s release on CI | `server/events/**` | Low | Fewer crates in Events' `cargo tree`. Events tests and NS27 pass. |
-| BLD9 | Split the server crate (only if BLD6 justifies it) | Estimate: an edit in `oltp_runtime` recompiles 47k lines plus its dependents instead of 172k | `server/src/**`, new workspace members | High: wide refactor | Follows from BLD6 |
-| BLD10 | Small dependency cleanup | `tracing-attributes` (7 s of release CPU time). `syn` 2 stays, because `openraft`'s `derive_more` needs it. | `server/Cargo.toml` | Low | `tracing` with `default-features = false, features = ["std"]` builds. Duplicate list shrinks. |
+| BLD6 | Find out why the server crate is slow to compile | Measured baseline at the pre-split `53a5716f` (see [measured results](#bld6-to-bld10-measured-results)): every OLTP edit rebuilt the one server crate, whose unit took 69.3 s of the 70.6 s cold OLTP library build and 104.5 s of the 109.3 s cold test build | report only | None | A report that maps the module cycles, ranks codegen by function (`cargo llvm-lines` on a CI runner, not a project dependency), and explains why the release binary takes 437 s. The rebuild sets and per-unit times are done; `cargo llvm-lines` is not run. |
+| BLD7 | One OLAP integration-test binary instead of 33 | Baseline measured: 39 OLAP (`olap,s3`) test targets at `53a5716f` and after the split. The saving is not measured until BLD7 lands. | `server/tests/*.rs`, `server/Cargo.toml` `[[test]]` | Low | `cargo test --no-run` for the default features produces 1 OLAP integration binary. The test counts match before and after. |
+| BLD8 | Events dependency trims | Small: Events builds in 67 s debug and 97 s release on CI. Its cold library unit measured 8.6 s with warm dependencies, before and after the split. | `server/events/**` | Low | Fewer crates in Events' `cargo tree`. Events tests and NS27 pass. |
+| BLD9 | Split the server crate (only if BLD6 justifies it) | Done in phase 8. Measured: an edit in `oltp_runtime` rebuilds only the server crate, and its check falls from 7.7 s to 1.6 s and its test build from 18.8 s to 5.4 s; the cold OLTP library build falls from 70.6 s to 58.5 s (Xeon runner; the ratios repeat on the EPYC runner class) | `server/src/**`, new workspace members | High: wide refactor | Done: see [measured results](#bld6-to-bld10-measured-results) |
+| BLD10 | Small dependency cleanup | `tracing-attributes` (7 s of release CPU time). `syn` 2 stays, because `openraft`'s `derive_more` needs it. Measured duplicate list: 15 packages in each of `oltp`, `olap,s3` and `cache`, unchanged by the split. | `server/Cargo.toml` | Low | `tracing` with `default-features = false, features = ["std"]` builds. Duplicate list shrinks. |
 
 Not recommended:
 
@@ -187,6 +187,82 @@ Requirements:
 | `time` | RFC 3339 in 2 files | keep unless a small formatter is shorter |
 | `anyhow`, `thiserror`, `tempfile`, `base64` | 70, 2, 13 and 2 uses | keep |
 | `openraft` 0.9.25 | Raft | moving to 0.10 matches the server's API. Separate workspaces share no build, so it has no build-time benefit. |
+
+### BLD6 to BLD10: measured results
+
+Phase 8 split the OLTP code into six crates (`nabedra-protocol`, `nabedra-resources`, `nabedra-oltp-types`,
+`nabedra-transport`, `nabedra-oltp-storage` and `nabedra-oltp-replication`), with `oltp_runtime` left in the
+server crate. `scripts/testing/build_times.py` (the `build-times` check) measured the pre-split base `53a5716f`
+against each extraction head on one GitHub Actions runner: 4 vCPU, rustc 1.94.1, `CARGO_BUILD_JOBS=4`. It ran 3
+alternating rounds per step and reports the median in seconds. Cold steps build with warm dependencies and cold
+workspace crates, incremental off and debug info 0. Edit steps append a constant to one file and rebuild with
+incremental on and line-table debug info. Times are recorded, not gated. The rebuild sets are deterministic, and the
+check fails if one breaks a phase 8 rule.
+
+| Record | Head | Runner CPU |
+| --- | --- | --- |
+| P8-G (storage extracted) | `e42f87d3`, [job 138263860899](https://github.com/zPy52/nabedra-database/actions/runs/45340789755/job/138263860899) | AMD EPYC 7763 |
+| P8-H (replication extracted, first head) | `f6817e08`, [job 138309942107](https://github.com/zPy52/nabedra-database/actions/runs/45354787718/job/138309942107) | Intel Xeon 6975P-C |
+| P8-H (replication extracted, final review head) | `ee387c2b`, [job 138399122333](https://github.com/zPy52/nabedra-database/actions/runs/45380577146/job/138399122333) | Intel Xeon 6975P-C |
+| P8-I (candidate head after #106) | `16ced08f`, [job 138511374032](https://github.com/zPy52/nabedra-database/actions/runs/45412853815/job/138511374032) | AMD EPYC 7763 |
+
+The `build-times` record on the final head of PR #109 is linked in that PR, because a commit cannot cite its own run.
+
+Medians, base then head, from the `ee387c2b` and `16ced08f` records. Compare each head with its own base only:
+the two records ran on different CPUs.
+
+| Step | Base (Xeon) | `ee387c2b` | Ratio | Base (EPYC) | `16ced08f` | Ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cold OLTP library (`--features oltp --lib`) | 70.6 | 58.5 | 0.83 | 93.8 | 77.7 | 0.83 |
+| Cold OLAP library (`olap,s3`) | 14.9 | 14.7 | 0.99 | 19.0 | 19.1 | 1.01 |
+| Cold Cache library | 4.8 | 5.2 | 1.09 | 6.4 | 7.1 | 1.10 |
+| Cold Events library | 8.6 | 8.6 | 1.00 | 11.0 | 11.5 | 1.05 |
+| Cold OLTP test build (server and every OLTP crate, `--lib --tests --no-run`) | 109.3 | 103.3 | 0.94 | 147.3 | 141.4 | 0.96 |
+| Edit `oltp_runtime`, then `check --lib` of the server | 7.7 | 1.6 | 0.20 | 9.8 | 2.0 | 0.21 |
+| Edit `oltp_runtime`, then `test --lib --no-run` of the server | 18.8 | 5.4 | 0.29 | 21.0 | 6.9 | 0.33 |
+| Edit replication (`typed_log.rs`), then check its crate | 7.6 | 3.8 | 0.49 | 9.8 | 4.8 | 0.49 |
+| Edit replication, then test build of its crate | 18.5 | 7.6 | 0.41 | 21.2 | 9.5 | 0.44 |
+| Edit storage (`pool.rs`), then check its crate | 7.5 | 1.4 | 0.18 | 10.3 | 1.8 | 0.17 |
+| Edit storage, then test build of its crate | 18.9 | 2.6 | 0.14 | 21.9 | 3.4 | 0.16 |
+| Edit transport (`session.rs`), then check its crate | 7.9 | 0.27 | 0.03 | 9.8 | 0.35 | 0.04 |
+| Edit transport, then test build of its crate | 17.8 | 0.65 | 0.04 | 21.0 | 0.86 | 0.04 |
+| Edit resources (`memory.rs`), then check its crate | 7.8 | 0.20 | 0.03 | 9.8 | 0.26 | 0.03 |
+| Edit resources, then test build of its crate | 18.7 | 0.36 | 0.02 | 21.1 | 0.50 | 0.02 |
+
+A crate edit followed by a check of the whole OLTP server graph took 7.2 s (storage), 5.6 s (replication), 5.8 s
+(transport) and 8.3 s (resources) on the `ee387c2b` head, against 7.5 to 7.9 s for any edit on the base. On `16ced08f`
+those steps took 9.4, 7.1, 7.2 and 10.6 s against 9.8 to 10.3 s. The `f6817e08` record agrees with `ee387c2b` within
+0.9 s on every edit step and 3.2 s on every cold or test-build step. The `e42f87d3` record ran on the EPYC runner class (cold OLTP
+library 91.2 s base and 85.2 s head) and predates the replication extraction.
+
+Rebuild sets on the head (the gated result; `nabedra-rebuild-rule: runtime, transport, storage pass` in all four
+records):
+
+| Edited file | Rebuilt workspace crates |
+| --- | --- |
+| `server/src/oltp_runtime/http.rs` | `nabedra-database` |
+| `server/transport/src/transport/session.rs` | `nabedra-transport`, `nabedra-oltp-replication`, `nabedra-database` |
+| `server/oltp-storage/src/oltp/pool.rs` | `nabedra-oltp-storage`, `nabedra-oltp-replication`, `nabedra-database` |
+| `server/oltp-replication/src/oltp_replication/typed_log.rs` | `nabedra-oltp-replication`, `nabedra-database` |
+| `server/resources/src/memory.rs` | every OLTP crate and `nabedra-database` |
+
+On the base every one of these edits rebuilt the single server crate.
+
+Per-unit times from the cold OLTP library build (`ee387c2b` medians): the base server crate took 69.3 s. On the head
+the server crate takes 27.6 s, replication 32.1 s, storage 6.8 s, OLTP types 2.1 s, `nabedra-kv` 1.6 s, and
+transport, protocol, resources and `nabedra-rt` 1.0 s or less each. In the cold test build the server's library test
+unit fell from 104.5 s to 39.2 s, and the replication crate's library test unit takes 67.1 s.
+
+Findings:
+
+- BLD9's estimate held for the runtime: an `oltp_runtime` edit no longer recompiles storage or replication.
+  Replication is now the largest unit, so a replication edit gains least (about 2x).
+- An edit in a lower crate rebuilds the crates above it, as Cargo requires. A `resources` edit rebuilds the whole
+  OLTP graph, slightly slower than the base's single crate (8.3 s against 7.8 s).
+- The duplicate lists (BLD10) and the OLAP test-target count (BLD7) are the same before and after.
+- The Cache library is about 0.4 s slower (0.6 s on the EPYC runner). `nabedra-rt` takes 0.5 s to build on the head
+  and took 0.03 s on the base. Its source grew from 1,787 lines to 14,185 over phases 8 to 10, so the comparison
+  against `53a5716f` includes more than the split.
 
 ---
 
