@@ -60,6 +60,7 @@ One JSON file per run and check, at
 | `assertions` | executed, failed, and `not_run` with a reason for each |
 | `seeds` | range, count and failing seeds |
 | `sim_core_hours`, `virtual_hours` | simulation cost and simulated time |
+| `tla` | kind T facts: spec, mode (`exhaustive`, `simulation` or `trace`), tier, states, coverage, declared limits, mutants or trace counts, and `truncated` with `dropped` counts when the record was trimmed |
 | `artifacts` | artifact names with their SHA-256s |
 
 Logs and histories stay in Actions artifacts. A record stays valid after its artifacts expire.
@@ -98,6 +99,13 @@ counts.
 | `stale (<n> behind)` | The last record is for an older commit | no |
 | `n/a` | The register gives a reason the kind does not apply | not required |
 | `missing` | No record exists | no |
+
+A T cell is `pass` only with a passing exhaustive T0 or T1 record on its SHA, and with no exhaustive T0
+or T1 record on that SHA that is `not-run`. A `not-run` record without `tla` facts, such as
+`tlc-unavailable`, counts as open until the same check passes. Simulation, trace and T2 records can turn
+the cell red, but never green, and facts that contradict a record's `pass` turn it red. When two design
+checks cover a guarantee, one `not-run` is enough to keep the cell from green. As for every kind, the
+matrix sees only records: a check with no record on the SHA goes unnoticed if another one passed.
 
 `not-run` never counts as green, whatever its reason. A deferred kind stays
 in the register's Checks column and appears as `not-run`, with the deferral

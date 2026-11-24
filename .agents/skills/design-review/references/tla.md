@@ -43,6 +43,8 @@ pins the tool versions.
   use a configuration without it.
 - A state constraint may bound counters such as terms or sequence numbers.
   Record each constraint in the plan, since it limits what the run covers.
+  See [limits on the search](#limits-on-the-search) for what the runner
+  accepts.
 - Leave deadlock checking on. A protocol that can finish adds an explicit
   terminal stuttering step.
 - Each section of the spec names, in a comment, the plan section and the
@@ -104,8 +106,44 @@ passes when the baseline passes every property and each mutant fails on
 its expected property. A mutant that fails with an error, or on a
 different property, does not count.
 
+An invariant that is already false in an initial state does not count
+either: no step of the mutant breaks it. A mutant configuration may not
+override the property or the specification it runs.
+
+Every invariant and property of a baseline needs a mutant, and a spec
+whose baselines check none fails. Only a type invariant, an invariant with
+`Type` in its name, may be exempted, with a line that gives the reason:
+`\* no-mutant: TypeOK -- every run checks it`.
+
 When a design bug is fixed, the reverted fix becomes a mutant named
 `prefix_<slug>`. See the [design bug loop](design-bug-loop.md).
+
+## Limits on the search
+
+TLC reports "0 states left on queue" whatever a configuration cuts away, so
+the runner checks what can limit a baseline or a `.large.cfg` run:
+
+| Limit | Rule |
+| --- | --- |
+| `CONSTRAINT`, `ACTION_CONSTRAINT` | Allowed on counters, in a run without liveness. Declare it in the configuration: `\* limit: <Name> -- <reason>`. Its definition is a conjunction, under `\A` if needed, of order comparisons: `<`, `<=`, `>`, `>=`. Anything that selects protocol states, such as `=`, `#`, `~`, `=>`, `\/` or a string, fails. Model a budget constant instead |
+| A depth limit or a state cap | Fails. No module of the model may use `TLCGet`, `TLCSet`, `TLCExt`, `RandomElement`, `Randomization`, `JavaTime` or `IOUtils` |
+| `SYMMETRY` or a constraint with a liveness property | Fails. TLC reports which runs check liveness. Use a separate `<Name>.live.cfg` without them. Action properties such as `[][A]_vars` are safety, so they may stay |
+| `VIEW` | Fails. It merges states, and TLC does not check that the merge is sound |
+| An override (`Op <- X` or `Op = x`) | A declared `CONSTANT` is free. Overriding a property, a constraint, or the `INIT`, `NEXT` or `SPECIFICATION` it runs fails. Overriding another definition, such as `Nat`, needs a `limit` line |
+
+The evidence record lists the declared limits, and how many states TLC kept
+for each constraint. The reviewer of the plan judges whether the bound is
+wide enough. The rule does not detect:
+
+- a counter that every action increments, so that its bound is a depth
+  limit;
+- a constraint over an operator that encodes protocol state as a number;
+- a `CONSTANT` value, or an `INIT` or `NEXT` written in `MC<Name>.tla`, that
+  leaves behavior out;
+- an action that coverage counts once although one of its cases never
+  happens. TLC sums every case of an operator, such as `Crash(1)` and
+  `Crash(2)`, or the branches of an `IF`, and does not report an action
+  that a module defines but `Next` leaves out.
 
 ## Run
 
@@ -123,9 +161,10 @@ python3 scripts/testing/tla_check.py "specs/$MODULE" "$SPEC" --tier T2 \
 
 `tla_check.py` runs every baseline (`<Name>.cfg` and any other
 `<Name>.<variant>.cfg` except `.large.cfg`) exhaustively with coverage,
-checks that every action was taken and that every invariant and property
-has a mutant, then runs every mutant and checks that it fails on the
-property its `\* expect:` line names. Each run gets the level's wall-clock
+checks that every action was taken, that every invariant and property
+has a mutant and that nothing undeclared limits the search, then runs every
+mutant and checks that it fails on the property its `\* expect:` line
+names. Each run gets the level's wall-clock
 budget. It reports a violation, a deadlock, a liveness violation and a TLC
 error separately, and a stop at the budget or a state cap as `not-run`.
 Logs, `-dumpTrace json` counterexamples and a summary go to
