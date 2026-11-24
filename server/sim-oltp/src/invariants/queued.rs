@@ -102,7 +102,9 @@ pub(crate) enum Answer {
     Abandoned,
     /// A `404` that does not.
     Missing,
-    /// No reply, `outcome_unknown`, or a refusal that says nothing about the identity.
+    /// Any other definite refusal (`not_applied`). It says nothing about the identity.
+    Refused(String),
+    /// No reply, or `outcome_unknown`.
     Unknown,
 }
 

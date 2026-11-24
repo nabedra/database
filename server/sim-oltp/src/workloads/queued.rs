@@ -24,7 +24,7 @@ use nabedra_check::{
     checker::{Verdict, linearizable, outcome, txn},
     history::{Event, EventType, NEMESIS},
 };
-use nabedra_protocol::protocol::{ErrorCode, ProtocolError};
+use nabedra_protocol::protocol::{ErrorCode, Outcome as Applied, ProtocolError};
 use nabedra_rt::{ids::uuid_v4, sim::in_node, time};
 use nabedra_sim::{Profile, rng::stream_seed};
 use serde_json::{Value, json};
@@ -68,6 +68,8 @@ const BATCH_BASE: i64 = 10_000;
 /// delete, so it skips them; the per-key check covers them.
 const DELETED_BASE: i64 = 1_000;
 const DELETED: i64 = 3;
+/// How often a client retries a refusal that says the request was not applied.
+const REFUSALS: u32 = 6;
 const SPLIT_LIMIT: Duration = Duration::from_secs(60);
 const SCOPED_LIMIT: Duration = Duration::from_secs(30);
 
@@ -288,6 +290,10 @@ struct Shared {
     /// `(clause, time)`: the clause ran if an accepted request was open across that time and
     /// was seen terminal after it.
     candidates: Vec<(&'static str, u64)>,
+    /// The last receipt answer per identity, for the failure messages.
+    last: BTreeMap<Uuid, String>,
+    /// `POST /v1/requests` answers outside the contract, after the first.
+    outside: u64,
     /// Abandoned mutations, for the seeded replay.
     abandoned: Vec<Req>,
 }
@@ -395,8 +401,16 @@ fn classify(error: &ProtocolError) -> Answer {
         ErrorCode::NotFound if error.message.contains("abandoned") => Answer::Abandoned,
         ErrorCode::NotFound => Answer::Missing,
         ErrorCode::Conflict => Answer::Terminal(Terminal::Failed("conflict".into())),
+        _ if error.outcome == Applied::NotApplied => Answer::Refused(code(error)),
         _ => Answer::Unknown,
     }
+}
+
+fn code(error: &ProtocolError) -> String {
+    serde_json::to_value(error.code)
+        .ok()
+        .and_then(|code| code.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 /// Record the value a get returned. Only its first answer counts: a later receipt or replay
@@ -451,6 +465,7 @@ async fn send(
     )
     .await;
     let mut envelope = None;
+    let mut replayed = false;
     let (answer, completion) = match reply {
         Err(error) => (Answer::Unknown, Completion::Unknown(error)),
         Ok(reply) if asynchronous && reply.status == 202 => match accepted(&reply.body, req) {
@@ -464,9 +479,25 @@ async fn send(
             }
         },
         Ok(reply) if asynchronous && reply.status == 200 => {
-            let error = format!("POST {SUBMIT} answered 200: {}", reply.body);
-            envelope = Some(error.clone());
-            (Answer::Unknown, Completion::Unknown(error))
+            // Plan: a submission answers "202: {request_id, run_id, state: "queued"}". The
+            // answer is still a definite success, and the direct path committed it.
+            replayed = true;
+            match reply.completion(req.body.id) {
+                Ok(Completion::Ok(value)) => {
+                    envelope = Some(format!("POST {SUBMIT} answered 200: {value}"));
+                    (
+                        Answer::Terminal(Terminal::Succeeded(value.clone())),
+                        Completion::Ok(value),
+                    )
+                }
+                Ok(_) | Err(_) => {
+                    envelope = Some(format!("POST {SUBMIT} answered an invalid 200"));
+                    (
+                        Answer::Unknown,
+                        Completion::Unknown("an invalid 200".into()),
+                    )
+                }
+            }
         }
         Ok(reply) => match reply.completion(req.body.id) {
             Ok(Completion::Ok(value)) => (
@@ -482,11 +513,19 @@ async fn send(
         },
     };
     if let Some(error) = envelope {
-        q.ctx.checks.violate(
-            &q.ctx.world,
-            "HttpEnvelope",
-            format!("{} {} through n{gateway}: {error}", req.name, req.body.id),
-        );
+        // One report per run: the violation list is bounded, and this must not fill it.
+        let first = {
+            let mut shared = q.shared.lock().unwrap();
+            shared.outside += 1;
+            shared.outside == 1
+        };
+        if first {
+            q.ctx.checks.violate(
+                &q.ctx.world,
+                "SubmitAnswer",
+                format!("{} {} through n{gateway}: {error}", req.name, req.body.id),
+            );
+        }
     }
     if let Answer::Terminal(Terminal::Succeeded(value)) = &answer {
         observe_rows(q, req, value, invoked);
@@ -505,7 +544,11 @@ async fn send(
     }
     shared.log.submissions.push(Submission {
         body: req.body.clone(),
-        route: req.route(q.mode, asynchronous),
+        route: if replayed {
+            Route::MaybeDirect
+        } else {
+            req.route(q.mode, asynchronous)
+        },
         fresh,
         invoked,
         completed: q.now(),
@@ -536,8 +579,12 @@ async fn lookup(q: &Q, node: u64, gateway: u64, run: Uuid, req: &Req) -> Seen {
     let reply = request(node, gateway, &path, &q.ctx.token, None, LOOKUP_LIMIT).await;
     let mut envelope = None;
     let mut failed = None;
+    let mut why = String::new();
     let mut seen = match reply {
-        Err(_) => Seen::Unknown,
+        Err(error) => {
+            why = error;
+            Seen::Unknown
+        }
         Ok(reply) if reply.status == 200 => match receipt(&reply.body, run, req.body.id) {
             Ok((seen, error)) => {
                 failed = error;
@@ -549,11 +596,14 @@ async fn lookup(q: &Q, node: u64, gateway: u64, run: Uuid, req: &Req) -> Seen {
             }
         },
         Ok(reply) => match reply.completion(req.body.id) {
-            Ok(Completion::Refused(error)) => match classify(&error) {
-                Answer::Abandoned => Seen::Abandoned,
-                Answer::Missing => Seen::Missing,
-                _ => Seen::Unknown,
-            },
+            Ok(Completion::Refused(error)) => {
+                why = format!("{:?} {}", error.code, error.message);
+                match classify(&error) {
+                    Answer::Abandoned => Seen::Abandoned,
+                    Answer::Missing => Seen::Missing,
+                    _ => Seen::Unknown,
+                }
+            }
             _ => {
                 envelope = Some("invalid receipt error".into());
                 Seen::Unknown
@@ -568,6 +618,11 @@ async fn lookup(q: &Q, node: u64, gateway: u64, run: Uuid, req: &Req) -> Seen {
         );
     }
     seen = seeded(q, req, seen);
+    q.shared
+        .lock()
+        .unwrap()
+        .last
+        .insert(req.body.id, format!("{seen:?} {why}"));
     match &seen {
         Seen::Terminal(Terminal::Succeeded(value)) => {
             record(q, gateway, req, Some(Completion::Ok(value.clone())));
@@ -681,12 +736,19 @@ async fn drive(
             limit,
         )
         .await;
-        if definite(&answer) {
-            return answer;
+        match &answer {
+            // A refusal that a client retries, a few times.
+            Answer::Refused(code)
+                if attempt < REFUSALS
+                    && matches!(code.as_str(), "overloaded" | "storage_unavailable") => {}
+            Answer::Unknown => {}
+            _ => return answer,
         }
         attempt += 1;
         if q.out_of_time() {
-            q.shared.lock().unwrap().undecided += 1;
+            if answer == Answer::Unknown {
+                q.shared.lock().unwrap().undecided += 1;
+            }
             return answer;
         }
         pause(attempt).await;
@@ -1334,12 +1396,15 @@ pub(crate) async fn run(
             .violate(&cluster.world, "Liveness", format!("heal: {error}"));
         return abandon(cluster, &q, tasks, bursts, report).await;
     }
-    for task in tasks {
-        let _ = task.await;
-    }
-    for task in std::mem::take(&mut bursts) {
-        let _ = task.await;
-    }
+    let finishing = async {
+        for task in tasks {
+            let _ = task.await;
+        }
+        for task in std::mem::take(&mut bursts) {
+            let _ = task.await;
+        }
+    };
+    tokio::join!(finishing, observe(&q, cluster.config.run_id));
     settle(&q, cluster).await;
     copies(&q, cluster).await;
     let finals = final_reads(&q).await;
@@ -1463,6 +1528,7 @@ fn finish(q: &Q, cluster: &Cluster, chaos: Option<&Chaos>, report: &mut direct::
         "terminal_regressions": shared.log.regressions(),
         "runs": shared.log.runs.len(),
         "two_frozen": shared.log.two_frozen.len(),
+        "outside_contract": shared.outside,
     });
 }
 
@@ -1570,35 +1636,19 @@ async fn never_submitted(q: Q) {
     }
 }
 
-/// After the heal, every accepted request of the current run must have a definite receipt
-/// within the convergence bound (design 3.7, `Liveness`).
-async fn settle(q: &Q, cluster: &Cluster) {
-    let run = cluster.config.run_id;
+/// Look up every unsettled receipt of `run` until none is left or the budget ends. Returns
+/// what is left.
+async fn observe(q: &Q, run: Uuid) -> BTreeSet<Uuid> {
+    let mut round = 0;
     loop {
-        let unsettled: BTreeSet<Uuid> = q
-            .shared
-            .lock()
-            .unwrap()
-            .log
-            .unsettled(run)
-            .into_iter()
-            .collect();
-        if unsettled.is_empty() {
-            return;
+        let unsettled: BTreeSet<Uuid> = {
+            let shared = q.shared.lock().unwrap();
+            shared.log.unsettled(run).into_iter().collect()
+        };
+        if unsettled.is_empty() || q.out_of_time() {
+            return unsettled;
         }
-        if q.out_of_time() {
-            for id in unsettled {
-                cluster.checks.violate(
-                    &cluster.world,
-                    "Liveness",
-                    format!(
-                        "accepted request {id} of run {run} has no definite receipt {:?} after the heal",
-                        direct::CONVERGE_LIMIT
-                    ),
-                );
-            }
-            return;
-        }
+        let mut seen = BTreeSet::new();
         let open: Vec<Open> = q
             .shared
             .lock()
@@ -1606,30 +1656,67 @@ async fn settle(q: &Q, cluster: &Cluster) {
             .open
             .iter()
             .filter(|open| open.run == run && unsettled.contains(&open.req.body.id))
+            .filter(|open| seen.insert(open.req.body.id))
             .cloned()
             .collect();
-        for (index, open) in open.iter().enumerate() {
-            let node = CLIENTS[index % CLIENTS.len()];
-            lookup(q, node, GATEWAYS[index % 2], open.run, &open.req).await;
+        for chunk in open.chunks(8) {
+            let lookups: Vec<_> = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, open)| {
+                    let (q, open) = (q.clone(), open.clone());
+                    nabedra_rt::task::spawn(async move {
+                        let node = CLIENTS[index % CLIENTS.len()];
+                        let gateway = GATEWAYS[(index + round) % GATEWAYS.len()];
+                        lookup(&q, node, gateway, open.run, &open.req).await;
+                    })
+                })
+                .collect();
+            for lookup in lookups {
+                let _ = lookup.await;
+            }
         }
+        round += 1;
         time::sleep(Duration::from_millis(200)).await;
     }
 }
 
-/// At a quiet point, every ready worker of the legacy protocol holds every accepted request
-/// that was pending the whole time its counters were read.
+/// After the heal, every accepted request of the current run must have a definite receipt
+/// within the convergence bound (design 3.7, `Liveness`).
+async fn settle(q: &Q, cluster: &Cluster) {
+    let run = cluster.config.run_id;
+    let unsettled = observe(q, run).await;
+    let shared = q.shared.lock().unwrap();
+    let total = unsettled.len();
+    for id in unsettled.into_iter().take(3) {
+        let name = shared
+            .open
+            .iter()
+            .find(|open| open.req.body.id == id)
+            .map_or("", |open| open.req.name);
+        cluster.checks.violate(
+            &cluster.world,
+            "Liveness",
+            format!(
+                "accepted {name} {id} of run {run}, one of {total}, has no definite receipt {:?} after the heal; last answer {}",
+                direct::CONVERGE_LIMIT,
+                shared.last.get(&id).map_or("none", String::as_str),
+            ),
+        );
+    }
+}
+
+/// At a quiet point, every ready worker of the legacy protocol holds every request that was
+/// accepted since (plan: "to all ready workers before acknowledging acceptance"). Only those:
+/// a worker that joined later need not hold older settled records.
 async fn copies(q: &Q, cluster: &Cluster) {
-    if q.mode.scoped {
+    if q.mode.scoped || !cluster.converged().await {
         return;
     }
-    let tasks = burst(q, 0, 12, false);
-    for task in tasks {
+    let since = q.now();
+    for task in burst(q, 0, 12, false) {
         let _ = task.await;
     }
-    if !cluster.converged().await {
-        return;
-    }
-    let run = cluster.config.run_id;
     let before = q.now();
     let mut counters = Vec::new();
     for node in WORKERS {
@@ -1639,33 +1726,40 @@ async fn copies(q: &Q, cluster: &Cluster) {
             counters.push((node, records));
         }
     }
-    let after = q.now();
-    // Accepted before the reads and not expirable by their end.
-    let required = {
-        let shared = q.shared.lock().unwrap();
-        shared
-            .log
-            .accepted()
-            .iter()
-            .filter(|((accepted, _), submission)| {
-                *accepted == run
-                    && submission.completed <= before
-                    && submission.invoked + shared.log.retention_ms > after + 10_000
-            })
-            .count()
-    };
+    let at = q.now();
+    if !cluster.converged().await {
+        return;
+    }
+    let required = required(q, cluster.config.run_id, since, before, at);
     for (node, accepted_records) in counters {
         q.shared.lock().unwrap().log.retained.push(Retained {
             node,
             required,
             accepted_records,
-            at: after,
+            at,
         });
     }
     if required > 0 {
         q.clause("Q03:copies-on-every-ready-worker");
     }
     settle(q, cluster).await;
+}
+
+/// Requests of `run` accepted between `since` and `before` whose results cannot have expired
+/// by `at`.
+fn required(q: &Q, run: Uuid, since: u64, before: u64, at: u64) -> usize {
+    let shared = q.shared.lock().unwrap();
+    shared
+        .log
+        .accepted()
+        .iter()
+        .filter(|((accepted, _), submission)| {
+            *accepted == run
+                && submission.invoked >= since
+                && submission.completed <= before
+                && submission.invoked + shared.log.retention_ms > at + 1_000
+        })
+        .count()
 }
 
 /// Read every hot and deleted key and the whole table through both gateways.
@@ -1758,10 +1852,11 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
     let power = g.bool();
     let cut = if power { DiskCut::Power } else { DiskCut::Kill };
     let count = 12 + g.below(24) as i64;
+    let since = q.now();
     let tasks = burst(q, 0, count, false);
     time::sleep(window(g, 0, 120)).await;
     if finale == Finale::LastHolder {
-        last_holder(q, cluster, cut, g).await;
+        last_holder(q, cluster, cut, since, g).await;
     }
     let begun = q.now();
     q.history().marker(
@@ -1877,7 +1972,7 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
 }
 
 /// R02: stop two workers one after the other. The last one keeps every accepted request.
-async fn last_holder(q: &Q, cluster: &mut Cluster, cut: DiskCut, g: &mut Gen) {
+async fn last_holder(q: &Q, cluster: &mut Cluster, cut: DiskCut, since: u64, g: &mut Gen) {
     let mut order = WORKERS;
     order.rotate_left(g.below(3) as usize);
     let [first, second, last] = order;
@@ -1898,19 +1993,7 @@ async fn last_holder(q: &Q, cluster: &mut Cluster, cut: DiskCut, g: &mut Gen) {
             continue;
         };
         let at = q.now();
-        let required = {
-            let shared = q.shared.lock().unwrap();
-            shared
-                .log
-                .accepted()
-                .iter()
-                .filter(|((accepted, _), submission)| {
-                    *accepted == run
-                        && submission.completed <= stopping
-                        && submission.invoked + shared.log.retention_ms > at + 10_000
-                })
-                .count()
-        };
+        let required = required(q, run, since, stopping, at);
         cluster.record(format!(
             "last holder n{last}: {accepted_records} records, {required} required"
         ));
@@ -2220,17 +2303,21 @@ fn mops(op: &Logical, universe: &BTreeSet<i64>) -> Option<(Value, Value)> {
 pub(crate) fn check(events: &[Event]) -> Verdict {
     let ops = logical(events);
     let keyed = keyed(&ops);
-    Verdict::merge([
-        txn::check(&transactions(&ops)),
-        linearizable::check_kv(&keyed),
-        outcome::check(&keyed),
-    ])
+    let started = time::now_std();
+    let transactions = txn::check(&transactions(&ops));
+    let after_txn = time::elapsed(started);
+    let per_key = linearizable::check_kv(&keyed);
+    let after_keys = time::elapsed(started);
+    let verdict = Verdict::merge([transactions, per_key, outcome::check(&keyed)]);
+    eprintln!(
+        "fault model queued history checks: transactions {after_txn:?}, per key {after_keys:?}"
+    );
+    verdict
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nabedra_protocol::protocol::Outcome as Applied;
 
     fn event(
         kind: EventType,
