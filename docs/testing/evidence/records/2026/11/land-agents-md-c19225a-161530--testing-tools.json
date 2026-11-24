@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "land-agents-md-c19225a-161530--testing-tools.log",
+      "sha256": "64a93ddca64b73c311a41096dca27e27de3115a006d9db96c0d60ee75d1146e3"
+    }
+  ],
+  "assertions": {
+    "executed": 127,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "testing-tools",
+  "duration_s": 10.194,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T15:15:56.880316+00:00",
+    "request_id": "land-agents-md-c19225a-161530",
+    "runner": "GitHub Actions 1000011560",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45423375837"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "c19225ac92f9d137372f14f33f6320dd06095d9a",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
