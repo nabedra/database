@@ -1,10 +1,10 @@
 This is the typed multi-group storage foundation that every OLTP runtime
 opens ([OLTP storage](../DESIGN.md)). Each pool stores its groups in one
 `nabedra-kv` store, specified in the
-[native storage engine plan](../../../../plans/native-storage-engine.md).
+[native storage engine plan](../../../../../plans/native-storage-engine.md).
 It is not the completed per-shard MVCC, distributed queue, index, placement,
 or transaction engine. The conditional
-[distributed serialization argument](../../../../docs/architecture/oltp-serialization.md)
+[distributed serialization argument](../../../../../docs/architecture/oltp-serialization.md)
 still requires those implementations.
 
 Pool identity and resource ownership

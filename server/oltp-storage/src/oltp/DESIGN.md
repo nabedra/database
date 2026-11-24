@@ -10,11 +10,11 @@ Storage engine
 --------------
 
 Each pool holds one `nabedra-kv` store in `<pool>/kv/`. `nabedra-kv` is the
-in-tree storage engine in [`server/kv`](../../kv), written in Rust with no C
+in-tree storage engine in [`server/kv`](../../../kv), written in Rust with no C
 dependency: an LSM with a group-committed journal, snapshots, range deletes and
 journal values for Raft log bytes. Its file layout, journal format, recovery
 and damage rules, and memory charges are specified in the
-[native storage engine plan](../../../plans/native-storage-engine.md). The
+[native storage engine plan](../../../../plans/native-storage-engine.md). The
 pool's glue (shared resources, store options, key scopes, error mapping) is in
 [`pool/storage.rs`](pool/storage.rs).
 
@@ -45,4 +45,4 @@ journal, establishes authoritative state again. `NoSpace` is the exception: it
 wrote nothing and is reported as a plain failure (O29).
 
 The distributed argument these stores support is in
-[OLTP serialization](../../../docs/architecture/oltp-serialization.md).
+[OLTP serialization](../../../../docs/architecture/oltp-serialization.md).
