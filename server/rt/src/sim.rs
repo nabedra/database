@@ -1069,6 +1069,32 @@ where
     let runtime = runtime_seeded(seed).expect("build the simulation runtime");
     let world = runtime.block_on(async { World::new(seed) });
     let _installed = Installed::new(world.clone());
+    let env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    world.set_storage_pauses(env("NABEDRA_PAUSE"), Duration::from_millis(5));
+    world.set_clock_freezes(env("NABEDRA_FREEZE"), Duration::from_millis(u64::from(env("NABEDRA_FREEZE_MS"))));
+    let counts = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+    let seen = counts.clone();
+    world.observe(Arc::new(move |event| match event {
+        SimEvent::StoragePaused { .. } => {
+            seen.0.fetch_add(1, Ordering::SeqCst);
+        }
+        SimEvent::ClockFrozen { .. } => {
+            seen.1.fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
+    }));
+    struct Report(u64, Arc<(AtomicU64, AtomicU64)>);
+    impl Drop for Report {
+        fn drop(&mut self) {
+            eprintln!("FAULTS seed {} pauses {:?} freezes {:?}", self.0, self.1.0, self.1.1);
+        }
+    }
+    let _report = Report(seed, counts);
     runtime.block_on(async { body(world).await })
 }
 

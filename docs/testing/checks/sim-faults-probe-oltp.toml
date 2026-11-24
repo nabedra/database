@@ -1,0 +1,11 @@
+id = "sim-faults-probe-oltp"
+module = "sim"
+kinds = ["S"]
+guarantees = []
+scenarios = []
+tiers = ["weekly"]
+command = ["bash", "scripts/testing/sim_faults_probe.sh", "oltp"]
+cwd = "."
+timeout_s = 9000
+needs = []
+result_parser = "exit-code"
