@@ -7,7 +7,8 @@
   matrix.py gate   --sha SHA --scope release|module:<m> [--allow-unattested] [--verify-attestations]
 
 Registers are docs/testing/guarantees/*.md. Each has a `Module:` line, a `Level:` line and one
-table with the header `| ID | Guarantee | Failure model | Scenarios | Checks | n/a |`. Records are
+table with the header `| ID | Guarantee | Failure model | Scenarios | Checks | n/a |`. Optional
+`Coverage note:` lines describe check-level scope without changing cell states. Records are
 `nabedra.evidence/1` files under docs/testing/evidence/records. Checks are
 docs/testing/checks/*.toml, and docs/testing/modules.toml maps paths to modules.
 
@@ -184,6 +185,7 @@ class Register:
     module: str
     level: str
     guarantees: list[Guarantee]
+    coverage_notes: list[str] = field(default_factory=list)
 
 
 def _split_row(line: str) -> list[str]:
@@ -251,7 +253,9 @@ def parse_register(text: str, path: Path) -> Register:
         i += 1
     if not rows:
         raise MatrixError(f"{path}: the guarantee table has no rows")
-    return Register(Path(path), module, level, rows)
+    notes = [line.removeprefix("Coverage note: ").strip()
+             for line in lines if line.startswith("Coverage note: ")]
+    return Register(Path(path), module, level, rows, notes)
 
 
 def load_registers(directory: Path) -> list[Register]:
@@ -504,6 +508,8 @@ def render_markdown(m: Matrix) -> str:
     out.append("")
     for reg in m.registers:
         out += [f"## {reg.module} ({reg.level})", "", f"Register: `{os.path.relpath(reg.path, REPO_ROOT) if reg.path.is_absolute() else reg.path}`", ""]
+        if reg.coverage_notes:
+            out += [f"- {note}" for note in reg.coverage_notes] + [""]
         out.append("| ID | Guarantee | " + " | ".join(m.kinds) + " |")
         out.append("| --- | --- | " + " | ".join("---" for _ in m.kinds) + " |")
         for g in reg.guarantees:
@@ -541,6 +547,7 @@ def render_json(m: Matrix) -> dict:
                          "scenarios": g.scenarios, "cells": cells})
     return {"schema": "nabedra.coverage-matrix/1", "head": m.head, "allow_unattested": m.allow_unattested,
             "verified_attestations": m.verified, "kinds": m.kinds, "rows": rows,
+            "coverage_notes": {reg.module: reg.coverage_notes for reg in m.registers if reg.coverage_notes},
             "ignored_records": [{"path": os.path.basename(i["path"]), "reason": i["reason"]} for i in m.ignored]}
 
 

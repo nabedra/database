@@ -13,6 +13,12 @@ and slot moves in simulation. Its absolute scale-out qualification needs
 dedicated hardware. K05 keeps deploy, replace, and drain on kind.
 See the [cache benchmark](../cache-benchmark.md).
 
+Coverage note: K01 Tcl canary is `not-run` for coverage. It executed zero assertions and reported five setup exceptions. [Canary run](https://github.com/zPy52/nabedra-database/actions/runs/45301342381/job/138134435377).
+
+Coverage note: K03 Docker has an intermittent full-placement timeout. [Main baseline](https://github.com/zPy52/nabedra-database/actions/runs/45233126481/job/137897811340).
+
+Coverage note: K03 simulated controller disk loss is `not-run` pending modelled Raft storage.
+
 | ID | Guarantee | Failure model | Scenarios | Checks | n/a |
 | --- | --- | --- | --- | --- | --- |
 | CACHE-G01 | Supported commands reply byte for byte as Valkey 8.1 does. Unsupported commands return a Valkey-compatible error. | Inputs can include malformed frames, unsupported commands, oversized requests, or integer overflow. | K01 | U D F R | M: The command reference is executable; S: One server can exercise RESP2 replies; H: The checks compare each reply directly; P: The row covers reply semantics; K: Finite generated programs cover the command cases |

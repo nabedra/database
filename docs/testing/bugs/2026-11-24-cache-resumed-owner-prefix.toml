@@ -1,0 +1,13 @@
+id = "CACHE-resumed-owner-prefix"
+title = "The Cache history omitted the retained prefix when the same owner resumed"
+class = "fence-lifecycle-order"
+module = "cache"
+guarantees = ["CACHE-G05"]
+scenarios = ["K03"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "server/src/cache/cluster/sim/invariants.rs::resumed_owner_marks_retained_prefix_in_history"
+why_not_caught = "The simulator associated failover markers with a change of worker. A stalled move can instead advance the epoch and keep the same verified owner."
+invariant_added = "Record and populate the retained-prefix marker for an epoch change even when the primary incarnation stays the same."
+fix_commits = ["f38b50f7d484f33661bc6dca511005c6e6454789"]
+revert_patch_ok = true
