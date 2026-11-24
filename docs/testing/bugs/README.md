@@ -2,8 +2,9 @@
 
 The original hardening reports were lost when their worktree was deleted. These
 records draw on fix commits, pull requests [#27], [#23] and [#20], and the
-[OLTP test evidence]. Each record cites its fix by full Git commit SHA. Where
-an earlier source survives, the record also names the PR or evidence file.
+[OLTP test evidence]. Each record of a fixed bug cites its fix by full Git
+commit SHA. Where an earlier source survives, the record also names the PR or
+evidence file.
 Several failures share a fix commit.
 
 [OLTP test evidence]: ../oltp-evidence.md
@@ -31,15 +32,44 @@ when the discovery date is unknown. Keep the record ID stable across edits.
 | `seed` | Integer or string | Nonnegative failing seed, or `unknown`. |
 | `why_not_caught` | String | One sentence about the coverage gap, when the evidence identifies one. |
 | `invariant_added` | String | The condition enforced by the regression or intended for replay. |
-| `fix_commits` | Array of strings | One or more full Git commit SHAs, newest first for replay. |
-| `revert_patch_ok` | Boolean | The listed reverts produced a nonempty patch without conflicts at the baseline. |
+| `fix_commits` | Array of strings | One or more full Git commit SHAs, newest first for replay. `[]` only on an [open record](#open-records). |
+| `revert_patch_ok` | Boolean | The listed reverts produced a nonempty patch without conflicts at the baseline. `false` on an open record. |
+| `status` | String | `open` on an open record. Omit it on a fixed one. |
+| `owner` | String | Open records only. The task, agent or person that will resolve the bug. |
+| `expires` | String | Open records only. ISO calendar date, the last UTC day on which the record is valid. |
 
 Use `"unknown"` for unknown metadata and `["unknown"]` when an array's
 contents are unknown. Use `[]` when the bug has no applicable guarantee or
-scenario. Keep all fields present. The backfill uses `bdf8d679` for the
-baseline. A false revert flag means the reverts conflicted or produced no
-patch there. Fix commits that also address other bugs can produce the same
+scenario. Keep all fields present, except `status`, `owner` and `expires`,
+which only open records have. The backfill uses `bdf8d679` for the
+baseline. On a fixed record, a false revert flag means the reverts conflicted
+or produced no patch there. Fix commits that also address other bugs can produce the same
 patch in several records.
+
+## Open records
+
+Since 2026-11-24 a bug that has no fix yet can have a record. Set
+`status = "open"`, `fix_commits = []` and `revert_patch_ok = false`, and name
+an `owner` and an `expires` date:
+
+```toml
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "<task, agent or person>"
+expires = "<YYYY-MM-DD>"
+```
+
+- A record without `status = "open"` needs at least one fix commit, and an
+  open record must not have one. `fix_commits = ["unknown"]` is invalid on
+  both, and so is the owner `unknown`.
+- The `testing-bugs` check fails from the day after `expires`. Fix the bug, or
+  renew the expiry.
+- When the fix lands, add its commit to `fix_commits`, set `revert_patch_ok`,
+  and remove `status`, `owner` and `expires`.
+- An open record never counts as fixed, replayed or detected. The summary
+  counts it in its own column. It has no fix to revert, so `sim_bugs.py`
+  rejects a manifest that names it.
 
 ## Classes
 
@@ -79,5 +109,7 @@ python3 scripts/testing/bugs.py summary
 python3 -m unittest scripts.testing.test_bugs
 ```
 
-The summary prints Markdown counts by class, module and finder. The
-[`testing-bugs` check](../checks/testing-bugs.toml) runs validation in T0 and T1.
+The summary prints Markdown counts of fixed and open bugs by class, module and
+finder. The [`testing-bugs` check](../checks/testing-bugs.toml) runs validation
+in T0, T1 and T2, and [`testing-bugs-unit`](../checks/testing-bugs-unit.toml) runs
+the unit tests.

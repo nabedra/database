@@ -31,7 +31,12 @@ wrong. The fix includes the property, fault or bound that catches the bug.
 9. **Write the bug record.** One file, `docs/testing/bugs/<date>-<slug>.toml`,
    validated by `scripts/testing/bugs.py`. Set `found_by` to `review`. Set
    `lowest_regression` to the `prefix_<slug>` mutant configuration. Set
-   `fix_commits` to the commit that fixed the plan and the spec.
+   `fix_commits` to the commit that fixed the plan and the spec. A bug that
+   has no fix yet, such as one in a shipped design, gets an
+   [open record](../../../../docs/testing/bugs/README.md#open-records) with
+   `fix_commits = []`, an owner and an expiry date. While it is open, set
+   `lowest_regression` to the configuration whose run shows the
+   counterexample.
 
 ## Review findings
 
