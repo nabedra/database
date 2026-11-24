@@ -157,6 +157,12 @@ impl Defect {
     }
 }
 
+/// Whether `seed` runs with `direct_oltp`, for its reported configuration. A bad mode is
+/// reported when the cluster is configured.
+pub(crate) fn direct(seed: u64) -> bool {
+    Mode::of(seed).is_ok_and(|mode| mode.direct)
+}
+
 /// Prepare the cluster's configuration before any process starts.
 pub(crate) fn configure(bootstrap: &mut Bootstrap, seed: u64) -> Result<(), String> {
     Defect::from_env()?;
@@ -1015,7 +1021,6 @@ struct Scheduled {
     hold: Duration,
     pick: u64,
     power: bool,
-    tries: u32,
 }
 
 /// Every run draws each kind of fault once, at drawn times, so a seed covers all of them.
@@ -1035,7 +1040,6 @@ fn faults(g: &mut Gen, start: u64, chaos_ms: u64) -> Vec<Scheduled> {
         hold: window(g, 200, 2_500),
         pick: g.below(3),
         power: g.bool(),
-        tries: 0,
     })
     .collect();
     faults.sort_by_key(|fault| fault.at);
@@ -1361,19 +1365,11 @@ pub(crate) async fn run(
         {
             let due = schedule.remove(0);
             apply(&q, cluster, &due, &mut bursts).await;
-        } else if let Some(due) = schedule.first_mut().filter(|due| due.at <= now) {
-            due.tries += 1;
         }
         time::sleep(TICK).await;
     }
-    for skipped in &schedule {
-        cluster.record(format!(
-            "queued fault {:?} skipped after {} tries",
-            skipped.fault, skipped.tries
-        ));
-    }
-
-    q.ctx.stopping.store(true, Ordering::Release);
+    // A fault that found no quiet moment runs now, after the heal and with the clients still
+    // sending, so every seed runs each of them.
     q.shared.lock().unwrap().last_turn = q.now();
     if let Some(chaos) = chaos.as_mut()
         && let Err(error) = chaos.heal(cluster, &q.ctx).await
@@ -1383,6 +1379,20 @@ pub(crate) async fn run(
             .violate(&cluster.world, "Liveness", format!("heal: {error}"));
         return abandon(cluster, &q, tasks, bursts, report).await;
     }
+    follow_run(&q, cluster);
+    let late = schedule.len();
+    for due in schedule {
+        if let Err(error) = wait_converged(cluster, direct::CONVERGE_LIMIT).await {
+            cluster.checks.violate(
+                &cluster.world,
+                "Liveness",
+                format!("before {:?}: {error}", due.fault),
+            );
+            return abandon(cluster, &q, tasks, bursts, report).await;
+        }
+        apply(&q, cluster, &due, &mut bursts).await;
+    }
+    q.ctx.stopping.store(true, Ordering::Release);
     faults_net.clear();
     follow_run(&q, cluster);
     cluster
@@ -1438,7 +1448,7 @@ pub(crate) async fn run(
     finish(&q, cluster, chaos.as_ref(), &mut report);
     report.summary["mode"] = json!(mode.name());
     report.summary["finale"] = json!(format!("{finale:?}"));
-    report.summary["skipped_faults"] = json!(schedule.len());
+    report.summary["late_faults"] = json!(late);
     report.summary["profile"] = json!(chaos.as_ref().map(Chaos::profile_name));
     cluster.record(format!("workload summary {}", report.summary));
     Ok(report)
@@ -2303,16 +2313,11 @@ fn mops(op: &Logical, universe: &BTreeSet<i64>) -> Option<(Value, Value)> {
 pub(crate) fn check(events: &[Event]) -> Verdict {
     let ops = logical(events);
     let keyed = keyed(&ops);
-    let started = time::now_std();
-    let transactions = txn::check(&transactions(&ops));
-    let after_txn = time::elapsed(started);
-    let per_key = linearizable::check_kv(&keyed);
-    let after_keys = time::elapsed(started);
-    let verdict = Verdict::merge([transactions, per_key, outcome::check(&keyed)]);
-    eprintln!(
-        "fault model queued history checks: transactions {after_txn:?}, per key {after_keys:?}"
-    );
-    verdict
+    Verdict::merge([
+        txn::check(&transactions(&ops)),
+        linearizable::check_kv(&keyed),
+        outcome::check(&keyed),
+    ])
 }
 
 #[cfg(test)]

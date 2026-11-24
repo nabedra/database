@@ -287,7 +287,15 @@ impl Log {
                     ),
                     Seen::Missing => {
                         // The result cannot have expired before the request was last seen
-                        // pending, or was accepted, plus the retention.
+                        // pending, or was first sent, plus the retention. An earlier attempt
+                        // with an unknown answer may have been the one that was accepted.
+                        let sent = self
+                            .submissions
+                            .iter()
+                            .filter(|submission| submission.body.id == id)
+                            .map(|submission| submission.invoked)
+                            .min()
+                            .unwrap_or(acceptance.invoked);
                         let pending = self
                             .lookups
                             .iter()
@@ -297,7 +305,7 @@ impl Log {
                             .map(|l| l.invoked)
                             .max()
                             .unwrap_or(0)
-                            .max(acceptance.invoked);
+                            .max(sent);
                         let expires = (pending + self.retention_ms)
                             .saturating_sub(self.clock_slack_ms);
                         if lookup.completed < expires {

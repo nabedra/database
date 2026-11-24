@@ -120,6 +120,24 @@ fn accepted_work_settles_or_expires_in_its_run() {
     assert_eq!(kinds(&pending), [ACCEPTED_SETTLES]);
 }
 
+/// Seed 10 (legacy-off, network): attempts with unknown answers from 51 s on, a 202 at 98 s,
+/// and an expired receipt right after it. The first attempt may have settled long before.
+#[test]
+fn an_earlier_unknown_attempt_may_have_settled_and_expired() {
+    let mut log = log();
+    let unknown = submit(body(1, 1, 1), 100, Answer::Unknown);
+    let late = Submission {
+        fresh: false,
+        ..accepted(1, 9_000)
+    };
+    log.submissions = vec![unknown, late];
+    log.lookups = vec![lookup(1, 9_100, Seen::Missing)];
+    assert!(kinds(&log).is_empty());
+    // Seen pending in between, so it had not settled.
+    log.lookups.insert(0, lookup(1, 8_900, Seen::Pending));
+    assert_eq!(kinds(&log), [ACCEPTED_SETTLES]);
+}
+
 #[test]
 fn a_full_stop_or_two_stopped_workers_end_the_retention_claim() {
     let mut stopped = log();
@@ -344,6 +362,21 @@ fn pending_after_terminal_is_reported_not_judged() {
     ];
     assert!(kinds(&log).is_empty());
     assert_eq!(log.regressions(), 1);
+}
+
+#[test]
+fn open_across_needs_a_terminal_receipt_after_the_fault() {
+    let mut log = log();
+    log.submissions = vec![accepted(1, 100)];
+    log.lookups = vec![
+        lookup(1, 200, Seen::Pending),
+        lookup(1, 500, ok(json!(null))),
+    ];
+    assert!(log.open_across(300));
+    assert!(!log.open_across(50), "sent after the fault");
+    assert!(!log.open_across(600), "settled before the fault");
+    log.lookups.pop();
+    assert!(!log.open_across(300), "never seen terminal");
 }
 
 #[test]

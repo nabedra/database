@@ -49,6 +49,9 @@ fn run(
     if setup.selection.focus.batch {
         config.force("data.direct.batch", json!(true));
     }
+    if workload == Workload::Queued {
+        config.force("direct_oltp", json!(workloads::queued::direct(seed)));
+    }
     let program = (workload == Workload::Smoke).then(|| Program::generate(generator));
     let (mut result, world) = nabedra_sim::runtime::run(seed, |world| async move {
         let body = Body {

@@ -516,7 +516,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             "evidence": "fault-model",
             "workload": workload,
             "scenarios": scenario_seeds.iter().map(|(tag, (seeds, failed))| (*tag, json!({"seeds": seeds, "failing": failed}))).collect::<BTreeMap<_, _>>(),
-            "direct_oltp": true,
+            "direct_oltp": direct_oltp(&workload),
             "defect": defect.name(),
             "jobs": config.jobs,
             "config_hash": config_hash,
@@ -556,6 +556,15 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             paths,
         },
     )
+}
+
+/// The queued workload draws its mode per seed; every other workload is direct.
+fn direct_oltp(workload: &str) -> Value {
+    if workload.split(',').any(|name| name == "queued") {
+        json!("per seed, in each seed's configuration")
+    } else {
+        json!(true)
+    }
 }
 
 fn write_sample(config: &SweepConfig, seed: u64, run: &SeedRun) -> io::Result<Vec<PathBuf>> {
@@ -706,7 +715,7 @@ fn write_record(
     record.mode = Some(BTreeMap::from([
         ("evidence".to_owned(), json!("fault-model")),
         ("workload".to_owned(), json!(input.workload)),
-        ("direct_oltp".to_owned(), json!(true)),
+        ("direct_oltp".to_owned(), direct_oltp(&input.workload)),
         ("config_hash".to_owned(), json!(input.config_hash)),
         ("seeded_defect".to_owned(), json!(input.defect.name())),
         ("replayed".to_owned(), json!(report.replayed())),
