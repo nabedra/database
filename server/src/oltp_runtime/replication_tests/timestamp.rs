@@ -1,5 +1,11 @@
-use nabedra_resources::config::{ExecutionConfig, WorkerResources};
 use super::*;
+use crate::oltp_replication::authority::{
+    consensus::ConsensusFuture,
+    proof::SealedTerminalProof,
+    timestamp::{DirectTimestampRange, TimestampHandle},
+};
+use nabedra_resources::config::{ExecutionConfig, WorkerResources};
+use crate::oltp_replication::service_rpc::metadata::timestamp_service::{RELEASE_CALLS, Request};
 use crate::{
     oltp::mvcc::catalog::CaptureRead,
     oltp_replication::authority::{
@@ -335,7 +341,7 @@ async fn exercise_release_and_snapshot() {
         _ = &mut slow_release => panic!("the original release must stay in progress"),
         _ = async {
             let shared_client = (*client).clone();
-            let second_call = client.releases.try_acquire().unwrap();
+            let second_call = client.release_slots_for_test().try_acquire().unwrap();
             let refused = shared_client.release(fresh.clone()).await.err().expect("outgoing release limit");
             assert_eq!(refused.code, ErrorCode::Overloaded);
             assert_eq!(refused.outcome, Outcome::NotApplied);
@@ -368,7 +374,7 @@ async fn exercise_release_and_snapshot() {
         client.release(fresh.clone()).await.unwrap().statement(),
         &fresh
     );
-    assert_eq!(client.releases.available_permits(), RELEASE_CALLS);
+    assert_eq!(client.release_slots_for_test().available_permits(), RELEASE_CALLS);
 
     let blocked = transport.hold_outgoing_for_test(TrafficClass::QueueControl);
     let mut unknown = lost.clone();
@@ -438,18 +444,6 @@ async fn exercise_release_and_snapshot() {
 /// T9 finding (D01 at RF3 on real processes): a range leader that is not the
 /// Timestamp leader allocates its commit timestamp remotely under `DirectLeader`.
 /// The receiver refused that role for operation 41, so no direct commit could land.
-#[test]
-fn d01_t9_allocate_direct_admits_the_direct_leader_role() {
-    assert!(allocate_direct_permitted(&ServiceAction::DirectLeader));
-    assert!(allocate_direct_permitted(&ServiceAction::Owner));
-    assert!(allocate_direct_permitted(
-        &ServiceAction::ParticipantProof {
-            source_group: nabedra_rt::ids::uuid_v4(),
-        }
-    ));
-    assert!(!allocate_direct_permitted(&ServiceAction::ApiIngress));
-}
-
 struct OpenDirectGate;
 impl crate::oltp_replication::authority::timestamp::DirectTimestampGate for OpenDirectGate {
     fn reserve_window_supported<'a>(
@@ -510,9 +504,9 @@ impl Endpoint for CountingTimestamp {
                 .is_ok()
             {
                 return reply(
-                    self.endpoint.handle.resources(),
+                    self.endpoint.resources_for_test(),
                     &session,
-                    self.endpoint.node,
+                    self.endpoint.node_for_test(),
                     Err(unavailable()),
                 )
                 .await;

@@ -3,7 +3,7 @@
 use super::*;
 use crate::oltp_replication::authority::{
     control::{ScopedQueuePlacement, ServiceAction},
-    timestamp::{ScopedTerminalWitness, ScopedTerminalWitnessReply},
+    timestamp::{ScopedTerminalStatement, ScopedTerminalWitness, ScopedTerminalWitnessReply},
 };
 
 impl QueuePeerClient {

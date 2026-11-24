@@ -1,8 +1,8 @@
 //! Operator-pinned directory-profile multi-worker startup. This constructor
 //! proves exclusive local process/directory ownership. It does not attest an
 //! EBS/CSI mount or an AZ, and never grants queue readiness by itself.
-use super::*;
-use crate::config::ExecutionConfig;
+use super::{restore::RegisteredRestore, *};
+use nabedra_resources::config::ExecutionConfig;
 use crate::oltp::backup::restore::{
     OfflineRestoreTarget, RestoredGenesis, verified_restore_marker,
 };

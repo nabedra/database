@@ -603,8 +603,7 @@ impl LocalServices {
             replica
                 .activate_empty_bootstrap(control.current(&scope).await?)
                 .map_err(QueueError::protocol)?;
-            let replica = Arc::new(Mutex::new(replica));
-            shared.bind_read_replica(&replica)?;
+            let replica = replica.bind_for_reads(&shared)?;
             let group = topology.group(GroupKind::Control)?;
             let registration = manager.registry().reserve(group.clone())?;
             registration.bind(
@@ -672,7 +671,7 @@ impl LocalServices {
             // PERF1: keep a window reserved after a queued allocation discards it.
             timestamps.spawn_direct_prefill();
             let queue = QueueCoordinator::new(replica.clone(), control.clone(), peer);
-            shared.bind_read_queue(&queue)?;
+            queue.bind_for_reads(&shared)?;
             Ok((
                 control,
                 timestamps,

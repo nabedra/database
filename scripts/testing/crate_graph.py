@@ -487,8 +487,8 @@ def write_ratchet(path: Path, counts: dict[str, int], sha: str) -> None:
 IMPL = re.compile(r"\bimpl\b")
 
 
-def proof_impls(text: str) -> list[tuple[int, str]]:
-    """Return (line, trait) for every `impl ... <Name>Proof for ...` header in Rust source."""
+def proof_impls(text: str, additional=()) -> list[tuple[int, str]]:
+    """Return (line, trait) for proof and explicitly named implementations."""
     found = []
     text = strip_comments(text)
     for match in IMPL.finditer(text):
@@ -510,13 +510,14 @@ def proof_impls(text: str) -> list[tuple[int, str]]:
             continue
         trait = re.sub(r"<.*", "", header.group(1).strip().lstrip("!")).strip()
         name = trait.split("::")[-1]
-        if re.fullmatch(r"[A-Za-z_]\w*Proof", name):
+        if name in additional or re.fullmatch(r"[A-Za-z_]\w*Proof", name):
             found.append((text.count("\n", 0, match.start()) + 1, trait))
     return found
 
 
-def proof_report(repo: Path, config: Config) -> dict:
+def proof_report(repo: Path, config: Config, *, runtime: bool = False) -> dict:
     allowed = config.proofs.get("allowed", [])
+    runtime_allowed = config.proofs.get("runtime_allowed", {}) if runtime else {}
     scan = config.proofs.get("scan", ["server"])
     impls, outside = [], []
     for top in scan:
@@ -530,10 +531,18 @@ def proof_report(repo: Path, config: Config) -> dict:
                     continue
                 full = Path(directory) / name
                 rel = full.relative_to(repo).as_posix()
-                for line, trait in proof_impls(full.read_text(encoding="utf-8", errors="replace")):
+                source = full.read_text(encoding="utf-8", errors="replace")
+                for line, trait in proof_impls(source, runtime_allowed):
+                    trait_name = trait.split("::")[-1]
+                    if runtime and trait_name not in runtime_allowed:
+                        continue
                     row = f"{rel}:{line}: impl {trait}"
                     impls.append(row)
-                    if not any(rel.startswith(prefix) for prefix in allowed):
+                    if runtime:
+                        permitted = rel == runtime_allowed[trait_name]
+                    else:
+                        permitted = any(rel.startswith(prefix) for prefix in allowed)
+                    if not permitted:
                         outside.append(row)
     return {"impls": impls, "outside": outside, "allowed": allowed}
 

@@ -466,8 +466,8 @@ fn invalid(message: &'static str) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nabedra_resources::config::WorkerResources;
     use crate::{
-        config::WorkerResources,
         oltp::{mvcc::CanonicalJson, pool::SharedResourceConfig},
     };
     #[derive(Serialize, Deserialize)]

@@ -255,7 +255,7 @@ impl StatusService for PartitionedStatus {
     }
     fn reject_unaccepted<'a>(
         &'a self,
-        cap: &'a crate::oltp_runtime::worker_runtime::VerifiedNeverAccepted,
+        cap: &'a dyn crate::oltp_replication::queue_access::NeverAcceptedAdmission,
     ) -> ConsensusFuture<'a, VerifiedAdmissionRejection> {
         self.request(cap.reservation().request_id)
             .reject_unaccepted(cap)

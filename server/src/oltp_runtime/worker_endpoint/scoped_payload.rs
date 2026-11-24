@@ -1,5 +1,6 @@
 //! RF3 queue copies and authenticated witnesses over the worker transport.
 
+use serde::{Deserialize, Serialize};
 use super::*;
 use crate::oltp::pool::ChargedBytes;
 use crate::{
@@ -1304,8 +1305,7 @@ impl QueueEndpoint {
         let current = self
             .scoped_payload_placement(session, scope, record.payload_header())
             .await?;
-        record
-            .validate_terminal_repair(&current)
+        scoped_store::validate_terminal_repair(&record, &current)
             .map_err(QueueError::protocol)?;
         let (_, _, section_lengths) = record.terminal_claim().map_err(QueueError::protocol)?;
         Ok(ReceivePlan {

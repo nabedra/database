@@ -67,4 +67,4 @@ pub(crate) use system_recovery::{
     ReplacementMountProof, ReplacementRecord, SystemRecoveryCommand,
 };
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

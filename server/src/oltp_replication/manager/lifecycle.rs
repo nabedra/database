@@ -166,8 +166,8 @@ where
                 .await
                 .map_err(|_| unavailable())?;
             let minimum = *reply.log_id();
-            #[cfg(test)]
-            crate::oltp_runtime::recovery_tests::pause(
+            #[cfg(any(test, feature = "test-hooks"))]
+            crate::oltp::test_hooks::pause(
                 "replacement_learner_appended", self.state.store().identity().group_id,
             ).await;
             self.raft
