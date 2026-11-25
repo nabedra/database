@@ -43,9 +43,9 @@
 //! - DedupUnique: records written by applied direct entries. Records that arrive by snapshot,
 //!   split import or backup, forward markers and queued requests are not seen, and neither is
 //!   a record that disappears. Retention is not modelled: after it expires, 24 hours by
-//!   default, a legal second execution is red. A retried transaction's records are compared
-//!   with the other replicas' one by one, not as a set. Of two replicas of a group on one
-//!   node, either can be named in a report.
+//!   default, a legal second execution is red. The records of a retried transaction, and of two
+//!   replicas on one node that apply an entry at the same time, are compared with the others'
+//!   one by one, not as a set, and either of those two replicas can be named in a report.
 //! - NotAppliedNeverCommitted: direct commits whose dedup record some replica wrote. Queued
 //!   commits and commits without a record are not seen.
 //! - RangeClockRule1: committed entries of the direct path, by the time they registered. A

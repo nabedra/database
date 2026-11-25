@@ -294,7 +294,7 @@ impl Invariants {
     ///
     /// One clean observation is not enough: a charge held 50 of every 51 ms is clean at some
     /// instant. The observations and the steps have different periods, so a charge in phase
-    /// with one of them is not in phase with the other. No message class is exempt. A Raft
+    /// with one of them is seldom in phase with the other. No message class is exempt. A Raft
     /// message in flight ends the row, and a later one is complete, because the message ends
     /// and the next one is a heartbeat away.
     ///
