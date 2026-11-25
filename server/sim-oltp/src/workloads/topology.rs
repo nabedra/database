@@ -273,8 +273,8 @@ struct TopoPlan {
     quiet_boundary: i64,
     quiet_age: Duration,
     rewarm: bool,
-    /// When the rival is sent, in per mille of a declaration at rest, before its end.
-    races: Vec<u64>,
+    /// Where the search for the rival's moment starts, in per mille of a declaration at rest.
+    race_lead: u64,
     audits: Vec<(Table, Vec<Audit>)>,
 }
 
@@ -387,7 +387,7 @@ impl TopoPlan {
             quiet_boundary: 2 + g.below(QUIET_KEYS as u64 - 2) as i64,
             quiet_age: ms(g, 0, 5_000),
             rewarm: g.bool(),
-            races: (0..RACES).map(|_| 100 + g.below(901)).collect(),
+            race_lead: 300 + g.below(601),
             audits,
         }
     }
@@ -1845,7 +1845,7 @@ pub(crate) async fn run(
                 .violate(&cluster.world, "Liveness", format!("quiet stage: {error}"));
         }
     }
-    match fence_races(cluster, &t, &fence, &plan.races).await {
+    match fence_races(cluster, &t, &fence, plan.race_lead).await {
         Ok(clauses) => report.scenarios.extend(clauses),
         Err(error) => {
             cluster
@@ -2322,7 +2322,7 @@ async fn wait_ready(t: &Topo, selector: &Value) -> Result<(), String> {
     }
 }
 
-/// Two declarations of one name, the rival sent shortly before the first is done. The loser is
+/// Two declarations of one name, the rival sent some time before the first is done. The loser is
 /// refused before it takes the table's guard, or after, by the validation under the guard. From
 /// the two answers until the winner's build publishes, no schema change of the table is open, so
 /// the direct path must serve it ([`topology::FENCE`]).
@@ -2330,7 +2330,7 @@ async fn fence_races(
     cluster: &Cluster,
     t: &Topo,
     ctx: &Ctx,
-    races: &[u64],
+    start: u64,
 ) -> Result<Scenarios, String> {
     const SCHEMA: &str = "/direct/fallbacks/schema";
     let mut clauses = Scenarios::new();
@@ -2343,8 +2343,14 @@ async fn fence_races(
     }
     wait_ready(t, &selector).await?;
     let mut rest = Vec::new();
-    for (turn, lead) in races.iter().enumerate() {
-        let lead = took * lead / 1_000;
+    // A rival sent late finds the name taken before it asks for the guard. One sent early loses
+    // the guard itself. The refusal under the guard is between the two, so search for it.
+    let (mut late, mut early) = (0_u64, took);
+    for turn in 0..RACES {
+        let lead = match turn {
+            0 => took * start / 1_000,
+            _ => late.midpoint(early),
+        };
         let name = format!("fence_{turn}");
         let first = declare(t, &ctx.table, &name);
         let rival = async {
@@ -2377,6 +2383,11 @@ async fn fence_races(
             log.selectors.insert(loser, refused);
         });
         let under_guard = why.contains("name or identity already exists");
+        if overtaken(ErrorCode::Conflict, &why) {
+            early = lead;
+        } else {
+            late = lead;
+        }
         let began = t.now();
         let (mut fell_back, mut direct) = (0, 0);
         loop {
