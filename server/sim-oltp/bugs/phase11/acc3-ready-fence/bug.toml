@@ -1,0 +1,80 @@
+# Reverted fix ACC3-ready-fence (phase 11, design section 4.2, row 10).
+schema = "nabedra.sim-bug/1"
+id = "acc3-ready-fence"
+bug = "ACC3-ready-fence"
+set = "membership"
+phase = 11
+class = "fence-lifecycle-order"
+guarantees = ["OLTP-G07"]
+scenarios = ["O15"]
+fix_commits = ["afbc048bb192cdb86b86bb279e80d911864a90ce"]
+reverts = ["afbc048bb192cdb86b86bb279e80d911864a90ce"]
+port = "clean"
+port_notes = """
+`git diff afbc048b afbc048b^` on oltp_runtime/bootstrap/registered.rs: the Timestamp ready fence of a
+registered startup is one call again instead of a startup_read loop. O14, where the fix was found, passed
+once with the patch. The probe holds the joining worker at the fence and stops the Timestamp quorum.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
+workload = "cold"
+profile = ["staggered-reopen", "rolling-restart", "freeze-two"]
+# expect is the plan. The text an expected kind enforces is in [[rules]] at the end. A kind without text there detects
+# nothing.
+# This branch's history holds an earlier plan (other `expect`). A [detection] here needs `sim_bugs.py record
+# --never-searched` for it first. No such record exists.
+expect = ["Liveness"]
+hold = """\
+Row 10. The regression cannot be seen to fail by the tool, so no run can confirm it. The probe starts a child \
+test that prints a second `test result:` line, and its own output follows `test ... ` on the line that should \
+end in FAILED. classify_libtest returns not-run for the log of the cited patched run 45436207074. Missing: a \
+regression whose patched run prints one result, its clean and patched runs, and a [review] of it.\
+"""
+seeds = [1, 10000]
+
+# The probe is the patch author's. What confirms this row is the review's run below, not the probe.
+[regression]
+kind = "lib-test"
+test = "oltp_acceptance::probe_acc3_ready_fence_survives_a_timestamp_outage"
+mode = "on"
+assertion = "state"
+probe = true
+needs_server = true
+timeout_s = 1800
+failure_contains = ["the joining worker exited when one ready-fence call failed", "no registered group leader completed the strong service call"]
+
+# The patch author's own runs.
+[regression.evidence]
+digest = "be165f2b93bf0495efd084298ae08d6966bcb0d4778090a3a7ef4aefa6e68be2"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, probe_acc3_ready_fence_survives_a_timestamp_outage, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45436207074", sha = "4b2cc9ef03731bec2096463d922b1b485dd1ba38", result = "failed", note = "request p11-bugs-acc3-ready-fence-4b2cc9e-172143, probe_acc3_ready_fence_survives_a_timestamp_outage, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out; finished in 34.98s
+nabedra-db: registered startup StorageUnavailable: no registered group leader completed the strong service call
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out; finished in 8.32s
+    assert alive, 'the joining worker exited when one ready-fence call failed'
+AssertionError: the joining worker exited when one ready-fence call failed
+""" }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact inverse of afbc048b. Kept apart from the author's evidence above. These are workflow `tests`,
+# `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - oltp_acceptance::r121_ready_fence_outlives_a_timestamp_outage (real processes, no product hook): clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456447292 (635e06a0) 3 of 3 failed: the joiner exited 6.9 to 7.9 s into the outage, its fence not committed.
+# - control without an outage, r121_ready_fence_without_an_outage: passed 3 of 3 on both sides (the same runs).
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports. The digest covers revert.patch and probe.patch. The review's patched runs applied
+# revert.patch alone.
+[review]
+digest = "9c2e866bfef58351fb2f8cc94da73fc431618592ff4f2f4a3ff8ac50cb0ffa47"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Patch read: exact inverse of afbc048b. The verdict rests on the review's own test: the joiner exited 6.9 to 7.9 \
+s into the outage and its fence was not committed. Not on the probe.\
+"""
+
+[[rules]]  # 3.7
+kind = "Liveness"
+source = "plans/testing/phase-10-11-oltp-sim.md"
+text = "convergence within 30 s of the heal; the cold start, move or index build finishes within its bound"

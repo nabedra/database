@@ -1,0 +1,60 @@
+# Reverted fix FIXB-cold-publish (phase 11, design section 4.2, row 13).
+schema = "nabedra.sim-bug/1"
+id = "fixb-cold-publish"
+bug = "FIXB-cold-publish"
+set = "membership"
+phase = 11
+class = "fence-lifecycle-order"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17", "R04"]
+fix_commits = ["c7249204deb25eff3c49afc677a2f0a4a7afc2e2", "d509f66bbc1e01b8687eec8429a236a0a1016ef5"]
+reverts = ["d509f66bbc1e01b8687eec8429a236a0a1016ef5"]
+port = "hand"
+port_notes = """
+The d509f66b hunk in authority/control/machine/system_recovery.rs reversed: Publish requires the replacement's
+original run instead of the revocation that Mount wrote, so a cold start between them makes Publish Stale
+forever. c7249204's resume path stays; it cannot publish past this check.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
+workload = "membership"
+profile = ["replacement", "full-stop"]
+# expect is the plan. The text an expected kind enforces is in [[rules]] at the end. A kind without text there detects
+# nothing.
+expect = ["Liveness"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_replication::authority::control::tests::system_recovery::r04_o17_cold_fence_after_mount_completes_publication"
+mode = "on"
+assertion = "state"
+failure_contains = ["Rejected(Stale)"]
+
+# The patch author's own runs.
+[regression.evidence]
+digest = "34e5cf1287dbef5031d0ee6c78af6879c81ee11c3b88e7a71425e582db3b70cf"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, r04_o17_cold_fence_after_mount_completes_publication, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435849990", sha = "df5e7453c164f50c4f488b05008baee9aae76898", result = "failed", note = "request p11-bugs-fixb-cold-publish-df5e745-171955, r04_o17_cold_fence_after_mount_completes_publication, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+Rejected(Stale)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.06s
+""" }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: one of the fix's hunks, the deciding one. Kept apart from the author's evidence above. These are workflow
+# `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456611631 (4275a39b) 3 of 3 failed: `Rejected(Stale)`.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports.
+[review]
+digest = "bf616b6646f0039b677b6996e15ebd4ed1f40dee6162d1f30604df3491fd9078"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = "Patch read: one of the fix's hunks, the deciding one. Patched: `Rejected(Stale)`."
+
+[[rules]]  # 3.7
+kind = "Liveness"
+source = "plans/testing/phase-10-11-oltp-sim.md"
+text = "convergence within 30 s of the heal; the cold start, move or index build finishes within its bound"

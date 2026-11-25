@@ -1,0 +1,13 @@
+diff --git a/server/src/oltp_runtime/http.rs b/server/src/oltp_runtime/http.rs
+index d484c31d..acd4846b 100644
+--- a/server/src/oltp_runtime/http.rs
++++ b/server/src/oltp_runtime/http.rs
+@@ -246,7 +246,7 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
+             None => body(request.into_body()).await?,
+         };
+         super::stage_timing::perf_stage!("http.dispatch.body").since(read);
+-        let Some(gateway) = direct else {
++        let Some(gateway) = direct.filter(|_| length.is_some()) else {
+             return Ok(enqueue(state, bytes, staging).await);
+         };
+         use super::application::direct::Routed;

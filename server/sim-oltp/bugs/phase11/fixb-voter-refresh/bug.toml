@@ -1,0 +1,64 @@
+# Reverted fix FIXB-voter-refresh (phase 11, design section 4.2, row 16).
+schema = "nabedra.sim-bug/1"
+id = "fixb-voter-refresh"
+bug = "FIXB-voter-refresh"
+set = "membership"
+phase = 11
+class = "membership-replacement-trust"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17"]
+fix_commits = ["780db860fffae8e5a0d1cb0838cc6c146eb06850", "d509f66bbc1e01b8687eec8429a236a0a1016ef5"]
+reverts = ["780db860fffae8e5a0d1cb0838cc6c146eb06850"]
+port = "clean"
+port_notes = """
+`git diff 780db860 780db860^` on authority/control/endpoint.rs (moved to nabedra-oltp-replication): the
+published-voter read reserves HEADER_LIMIT (4096) instead of 64 KiB of decode memory.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
+workload = "membership"
+profile = ["data-only-worker", "replacement"]
+# expect is the plan. The text an expected kind enforces is in [[rules]] at the end. A kind without text there detects
+# nothing.
+expect = ["Liveness"]
+seeds = [1, 10000]
+
+[regression]
+kind = "recovery-suite"
+suite = "replacement-voter-refresh"
+mode = "on"
+assertion = "state"
+timeout_s = 3600
+failure_contains = ["Data-only worker adopted the published Control voters"]
+
+# The patch author's own runs.
+[regression.evidence]
+digest = "91b31eb189463773c7944db26c1952a9a8303cdf230c4629b7515e0dcb75d59f"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45440153575", sha = "c5d1cc5c6a0bb7ff2d5a21e35253d5c619f01850", result = "passed", note = "request p11-bugs-clean-suites-c5d1cc5-174205, scratch_recovery_suite_replacement_voter_refresh, 1 of 1 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45440262486", sha = "7e5018ce71721bdec6eed8eba60288d529267065", result = "failed", note = "request p11-bugs-fixb-voter-refresh-suite-7e5018c-174239, scratch_recovery_suite_replacement_voter_refresh, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 199 filtered out; finished in 104.58s
+AssertionError: Data-only worker adopted the published Control voters: False
+AssertionError: Data-only worker adopted the published Control voters: False. Current voters ["78d165d5-63a1-4211-a118-3193aee9b20c","97ce071e-0065-40af-82e4-fa8a3ea0e0d9","ddc79ee5-09f2-413e-aac9-698926717475"], expected ['09295983-5485-4042-89e7-b67693a440d8', '78d165d5-63a1-4211-a118-3193aee9b20c
+""" }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact inverse of 780db860. Kept apart from the author's evidence above. These are workflow `tests`,
+# `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - oltp_acceptance::r121_suite_voter_refresh (the [regression] suite): clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456473067 (4174135d) 3 of 3 failed: a bounded wait, but it prints the old voter set where the published one is expected.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports.
+[review]
+digest = "4b3e088bc31d8f69207d24897ab4b372f067b123e46fff08833bf84d78b1df1c"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Patch read: exact inverse of 780db860. The review: "a bounded wait, but it prints the old voter set where the \
+published one is expected".\
+"""
+
+[[rules]]  # 3.7
+kind = "Liveness"
+source = "plans/testing/phase-10-11-oltp-sim.md"
+text = "convergence within 30 s of the heal; the cold start, move or index build finishes within its bound"

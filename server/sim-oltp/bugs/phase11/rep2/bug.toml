@@ -1,0 +1,66 @@
+# Reverted fix REP2 (phase 11, design section 4.2, row 14).
+schema = "nabedra.sim-bug/1"
+id = "rep2"
+bug = "REP2"
+set = "membership"
+phase = 11
+class = "membership-replacement-trust"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17", "NS14"]
+fix_commits = ["116fb51dd377611f0a53642fe68e1bb4f742da7d"]
+reverts = ["116fb51dd377611f0a53642fe68e1bb4f742da7d"]
+port = "hand"
+port_notes = """
+116fb51d reversed in manager/lifecycle.rs with its later signatures: reconcile_voter_replacement accepts any
+stable membership equal to `next` without checking which voter the plan removes, and replace_damaged_voter
+certifies the named removal from the current voter set, ignoring the durable plan and joint consensus.
+retain_removed (REP5, REP6) keeps its values.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
+workload = "membership"
+profile = ["replacement", "leader-crash", "lost-reply"]
+# Lead decisions are in designs/lead-decisions.md, outside this repository.
+expect = []
+expect_reason = """\
+Lead decision 9, count after review-121: "Rows 1, 7, 8, 14, 22 have no rule". Decision 13.1: "Decision 9 counts \
+design rules only for the rows it names (6, 9, 20 and the Liveness rows listed there), not for 7 or 14." Design \
+3.7 lists RetryCertifiesNamedRemoval by name only.\
+"""
+hold = """\
+Row 14. Lead decision 13.1: "Decision 9 counts design rules only for the rows it names (6, 9, 20 and the \
+Liveness rows listed there), not for 7 or 14." The tool knows no row and would take a design rule from \
+plans/testing/phase-10-11-oltp-sim.md. RetryCertifiesNamedRemoval also looks unreachable through the API (read \
+by author and reviewer, not run).\
+"""
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_replication::typed_network::tests::o06_o16_o17_rf3_lost_timestamp_voter_replacement"
+mode = "on"
+assertion = "state"
+failure_contains = ["stable membership must not certify a different removal"]
+
+# The patch author's own runs.
+[regression.evidence]
+digest = "b5dc5e10eaf10de5dbaa191c21ebd4d22c65f456057dfe1f87bae13fb700ced9"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o06_o16_o17_rf3_lost_timestamp_voter_replacement, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435867889", sha = "8ca7d4092c429173ebf5ace157e73a4b03f76976", result = "failed", note = "request p11-bugs-rep2-8ca7d40-172000, o06_o16_o17_rf3_lost_timestamp_voter_replacement, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+stable membership must not certify a different removal
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 3.43s
+""" }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact in substance. Kept apart from the author's evidence above. These are workflow `tests`, `scenarios`
+# or growth runs in mode on, not attested checks, and not a detection.
+# - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456630499 (2ef7a82c) 3 of 3 failed: `stable membership must not certify a different removal`.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports.
+[review]
+digest = "01f3ea413333781ce758223b2311d6eb56e97ba41f148f579af8a655b9c7c044"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = "Patch read: exact in substance. Patched: `stable membership must not certify a different removal`."

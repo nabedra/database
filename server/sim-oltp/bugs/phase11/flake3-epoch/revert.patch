@@ -1,0 +1,58 @@
+diff --git a/server/oltp-replication/src/oltp_replication/typed_log.rs b/server/oltp-replication/src/oltp_replication/typed_log.rs
+index 26abe757..e7b438ba 100644
+--- a/server/oltp-replication/src/oltp_replication/typed_log.rs
++++ b/server/oltp-replication/src/oltp_replication/typed_log.rs
+@@ -222,27 +222,27 @@ impl<C: TypedConfig> AppendQueue<C> {
+         let mut state = self.lock();
+         state.epoch = state.epoch.wrapping_add(1);
+     }
+-    fn push(&self, mut job: AppendJob<C>) -> u64 {
++    fn push(&self, mut job: AppendJob<C>) {
+         let mut state = self.lock();
+         job.epoch = state.epoch;
+         state.jobs.push_back(job);
+-        state.epoch
+     }
+     /// Called while holding the writer order: the head append and the
+-    /// consecutive appends in the task's epoch, up to `MAX_APPEND_ENTRIES`
+-    /// entries. If an earlier task covered this append, a vote, truncate or
+-    /// purge may still be ahead of the next epoch's jobs.
+-    fn take(&self, epoch: u64) -> Vec<AppendJob<C>> {
++    /// consecutive appends of its epoch behind it, up to
++    /// `MAX_APPEND_ENTRIES` entries. Empty when an earlier write took this
++    /// task's append.
++    fn take(&self) -> Vec<AppendJob<C>> {
+         let mut state = self.lock();
+         let mut taken: Vec<AppendJob<C>> = Vec::new();
+         let mut entries = 0usize;
+-        while let Some(next) = state.jobs.front().filter(|job| job.epoch == epoch) {
++        while let Some(next) = state.jobs.front() {
+             if let Some(previous) = taken.last() {
+                 #[cfg(any(test, feature = "test-hooks"))]
+                 if !COALESCE_APPENDS.load(std::sync::atomic::Ordering::Relaxed) {
+                     break;
+                 }
+-                if previous.last().checked_add(1) != Some(next.first())
++                if next.epoch != previous.epoch
++                    || previous.last().checked_add(1) != Some(next.first())
+                     || entries + next.batch.len() > MAX_APPEND_ENTRIES
+                 {
+                     break;
+@@ -979,7 +979,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
+         // GC1: queued in the same order as the writer place just taken. The
+         // task that gets the order first writes this append and the ones
+         // queued behind it together (see `AppendQueue`).
+-        let epoch = appends.push(AppendJob {
++        appends.push(AppendJob {
+             epoch: 0,
+             batch,
+             callback,
+@@ -1015,7 +1015,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
+                 Some(guard) => guard,
+                 None => order.await,
+             };
+-            let jobs = appends.take(epoch);
++            let jobs = appends.take();
+             if jobs.is_empty() {
+                 // An earlier write held this append's entries and fired its
+                 // callback.
