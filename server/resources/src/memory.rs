@@ -343,6 +343,7 @@ impl ByteArena {
         owner: Arc<dyn Any + Send + Sync>,
     ) -> ByteReservation {
         ByteReservation {
+            dx: dx_alloc(Arc::as_ptr(self) as usize, self.capacity, bytes),
             arena: self.clone(),
             _owner: owner,
             remaining: bytes,
@@ -464,7 +465,25 @@ impl Drop for ByteWaiter {
         }
     }
 }
+fn dx_alloc(arena: usize, capacity: usize, bytes: usize) -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let Some(world) = nabedra_rt::sim::world() else { return 0 };
+    if nabedra_rt::sim::current_node() != Some(2) || std::env::var_os("DX").is_none() { return 0 }
+    let ms = world.elapsed().as_millis();
+    let id = NEXT.fetch_add(1, Ordering::SeqCst);
+    let bt = if ms > 2500 && bytes <= 1200 && bytes > 0 { format!("{}", std::backtrace::Backtrace::force_capture()) } else { String::new() };
+    let names: Vec<&str> = bt.lines().map(str::trim).filter(|l| l.contains("nabedra")).map(|l| l.split_once(": ").map_or(l, |x| x.1)).take(9).collect();
+    println!("DXA {id} arena {arena} cap {capacity} bytes {bytes} at {ms} {}", names.join(" < "));
+    id
+}
+fn dx_free(id: u64) {
+    if id != 0 {
+        let ms = nabedra_rt::sim::world().map_or(0, |world| world.elapsed().as_millis());
+        println!("DXF {id} at {ms}");
+    }
+}
 pub struct ByteReservation {
+    dx: u64,
     _owner: Arc<dyn Any + Send + Sync>,
     arena: Arc<ByteArena>,
     remaining: usize,
@@ -537,6 +556,7 @@ impl ByteReservation {
     pub fn split(&mut self, bytes: usize) -> Result<Self, ProtocolError> {
         self.remaining = self.remaining.checked_sub(bytes).ok_or_else(capacity)?;
         Ok(Self {
+            dx: dx_alloc(Arc::as_ptr(&self.arena) as usize, self.arena.capacity, bytes),
             arena: self.arena.clone(),
             _owner: self._owner.clone(),
             remaining: bytes,
@@ -585,6 +605,7 @@ impl ByteReservation {
 }
 impl Drop for ByteReservation {
     fn drop(&mut self) {
+        dx_free(self.dx);
         self.arena.used.fetch_sub(self.remaining, Ordering::AcqRel);
         self.arena.settled.notify_waiters();
     }
