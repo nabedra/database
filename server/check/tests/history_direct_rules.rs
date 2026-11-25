@@ -623,6 +623,19 @@ fn answers_of_one_request_that_disagree_are_flagged() {
         recommitted,
         &["dedup-miss", "non-linearizable"],
     );
+    // With answers that disagree, each is judged alone.
+    by_default(
+        "a replay and then another answer",
+        "0> update k 2 r
+         0< ok false
+         1> insert k 1 other
+         1< ok
+         0> update k 2 r
+         0< ok false
+         0> update k 2 r
+         0< ok true",
+        &["non-linearizable", UNSTABLE],
+    );
     // Several requests are reported each.
     let two = "0> delete k null r
          0< ok false
@@ -1133,6 +1146,51 @@ fn a_result_without_a_commit_explains_the_refusal_of_another_body() {
          3< reused",
         &["non-linearizable"],
     );
+    // A refusal that a commit can explain says nothing about the result of the first body.
+    legal(
+        "a refusal while a third body commits",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         3> insert k 8 r
+         3< reused
+         2< ok
+         1> get k
+         1< ok 9",
+    );
+    by_default(
+        "the only holder is refused itself",
+        "0> delete k null r
+         0< info
+         2> upsert k 9 r
+         2< reused
+         0> delete k null r
+         0< reused",
+        &["non-linearizable", "request-id-reuse-misdetected"],
+    );
+    by_default(
+        "the only other attempt has the same body",
+        "2> upsert k 9 r
+         2< info
+         2> upsert k 9 r
+         2< reused",
+        &["non-linearizable", "request-id-reuse-misdetected"],
+    );
+    // A conflict without a message may be a refusal of reuse, so it is no second holder either.
+    let mut doubtful = history(
+        "0> update k 2 r
+         0< ok false
+         1> insert k 1 other
+         1< ok
+         2> insert k 3 r
+         2< exists
+         3> upsert k 9 r
+         3< reused",
+    );
+    doubtful[5].value.as_object_mut().unwrap().remove("message");
+    let verdict = direct::check(&doubtful);
+    assert!(verdict.valid, "{verdict:#?}");
+    assert_eq!(verdict.unclassified_conflicts, 1);
     // The row conflict of a batch may be recorded or not, so it is no second holder.
     legal(
         "a batch and a no-op",
@@ -1325,6 +1383,24 @@ fn the_row_conflict_of_a_batch_may_be_replayed() {
         "after its own commit",
         &format!("{batch}ok 2\n{batch}exists"),
         &["dedup-miss", "non-linearizable"],
+    );
+    by_default(
+        "replayed after it was computed again",
+        &format!("{refused}\n{batch}ok 2\n{batch}exists"),
+        &["dedup-miss", "non-linearizable"],
+    );
+    by_default(
+        "an unanswered one, its replay, and computed again",
+        &format!(
+            "1> insert b 1 other
+             1< ok
+             {batch}info
+             1> delete b null gone
+             1< ok true
+             {batch}exists
+             {batch}ok 2"
+        ),
+        &[],
     );
     // Without a message it is not known to be about a row.
     let mut unknown = history(&format!("{refused}\n{batch}exists"));

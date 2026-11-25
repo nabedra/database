@@ -142,8 +142,6 @@ struct Rules {
     replays: bool,
     /// A refusal that is known to be about a row, so it needs one.
     row: bool,
-    /// Such a result of its request excludes it.
-    once: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -215,7 +213,6 @@ impl KeyOp {
                 });
             }
             Role::Effect | Role::Unchanged | Role::Fresh if held != 0 => return None,
-            Role::Effect if mine && self.rules.once => return None,
             Role::Unchanged => {
                 let applies = self.rows.iter().all(|&(k, op)| op.step(state[k]).is_some());
                 return (!applies).then(|| recorded(state.to_vec()));
@@ -738,18 +735,15 @@ fn build(
         let result = requests.and_then(|r| r.without_effect(pre.src));
         if let Some(requests) = requests {
             let repeatable = src.f == "insert_many" || requests.spans(pre.src);
-            let open = requests.is_open(pre.src);
             op.rules = Rules {
                 records: op.role == Role::Fresh || results::may_be_row_conflict(src),
                 doubtful: op.role == Role::Conflict && !results::is_row_conflict(src),
                 replays: repeatable && (op.role == Role::Fresh || results::is_row_conflict(src)),
                 row: results::is_row_conflict(src),
-                once: open && !repeatable,
             };
             // The earliest unknown attempt of a request may have left a result without a commit.
             if op.role == Role::Effect
                 && src.outcome == Outcome::Info
-                && (open || repeatable && result.is_none())
                 && let Some(record) = record
             {
                 unchanged
@@ -818,13 +812,6 @@ fn build(
             .filter(|&((slot, body), _)| matters(slot, body))
             .map(|(_, op)| op),
     );
-    // An answer that may be a row conflict, but is not known to be, excludes no effect.
-    for (record, _) in judged {
-        for op in out.iter_mut().filter(|op| op.role == Role::Effect) {
-            let same = |r: Record| r.slot == record.slot && r.body == record.body;
-            op.rules.once &= !op.record.is_some_and(same);
-        }
-    }
     (out, keys.len() + 2 * slots.len())
 }
 

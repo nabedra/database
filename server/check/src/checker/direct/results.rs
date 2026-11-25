@@ -197,7 +197,6 @@ fn may_expire(ops: &[Op], attempts: &[usize]) -> bool {
 /// What the answers of each request say about its attempts.
 pub(crate) struct Requests {
     without_effect: HashMap<usize, Definite>,
-    open: HashSet<usize>,
     spanning: HashSet<usize>,
 }
 
@@ -205,7 +204,6 @@ impl Requests {
     pub(crate) fn new(ids: &Identities, ops: &[Op]) -> Self {
         let mut requests = Requests {
             without_effect: HashMap::new(),
-            open: HashSet::new(),
             spanning: HashSet::new(),
         };
         for attempts in ids.requests().into_values() {
@@ -222,9 +220,6 @@ impl Requests {
                     .without_effect
                     .extend(attempts.iter().map(|&i| (i, first)));
             }
-            if first.is_none() {
-                requests.open.extend(attempts);
-            }
         }
         requests
     }
@@ -232,11 +227,6 @@ impl Requests {
     /// The one result of this attempt's request, if the request never took effect.
     pub(crate) fn without_effect(&self, attempt: usize) -> Option<Definite> {
         self.without_effect.get(&attempt).copied()
-    }
-
-    /// No attempt of its request was answered with a definite result.
-    pub(crate) fn is_open(&self, attempt: usize) -> bool {
-        self.open.contains(&attempt)
     }
 
     /// Its request spans the retention.
