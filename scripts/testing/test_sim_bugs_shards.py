@@ -250,7 +250,7 @@ class ShardTest(ShardCase):
                 with self.assertRaises(SystemExit) as raised, patch("sys.stderr"):
                     self.tool("shard", "fix-one", "--shard", value)
                 self.assertEqual(raised.exception.code, 2)
-        for argv in (["shard", "fix-one"], ["shard", "--shard", "1/4", "--set", "direct", "fix-one"]):
+        for argv in (["shard", "fix-one"], ["shard", "fix-one", "--shard", "1/4", "--set", "direct"]):
             status, output, calls = self.tool(*argv)
             self.assertEqual((status, calls), (2, []), output)
         # A shard cannot choose its seeds, whatever its run is called, and neither can its merge.
