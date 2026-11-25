@@ -35,6 +35,44 @@ const SPLIT_LIMIT: Duration = Duration::from_secs(60);
 /// Follow-ups that cannot run yet are tried again after this pause.
 const DEFER_MS: u64 = 500;
 const RESTART_TRIES: u32 = 4;
+/// Between two starts of one process.
+const RESTART_PAUSE_MS: u64 = DEFER_MS * 4;
+
+/// Note a start of `node` that failed. The last one is a violation, and ends the tries.
+fn start_failed(cluster: &Cluster, node: u64, failures: u32, last: bool, error: &str) -> bool {
+    cluster.record(format!(
+        "nemesis restart n{node} failed ({failures}): {error}"
+    ));
+    let last = last || failures >= RESTART_TRIES;
+    if last {
+        cluster.checks.violate(
+            &cluster.world,
+            "Liveness",
+            format!("n{node} did not restart: {error}"),
+        );
+    }
+    last
+}
+
+/// Start a stopped gateway as its supervisor does (lead decision 18): a process that exits is
+/// started again, as often and after the same pause as the nemesis does. Returns the starts that
+/// failed, and whether the gateway runs.
+pub(crate) async fn start_gateway(cluster: &mut Cluster, gateway: u64) -> (Vec<String>, bool) {
+    let mut failed = Vec::new();
+    loop {
+        let Err(error) = cluster.restart_gateway(gateway).await else {
+            return (failed, true);
+        };
+        failed.push(format!(
+            "n{gateway} at {}ms: {error}",
+            elapsed_ms(&cluster.world)
+        ));
+        if start_failed(cluster, gateway, failed.len() as u32, false, &error) {
+            return (failed, false);
+        }
+        time::sleep(Duration::from_millis(RESTART_PAUSE_MS)).await;
+    }
+}
 
 /// A requested split that has not published.
 struct PendingSplit {
@@ -784,18 +822,10 @@ impl Chaos {
     ) {
         let failures = self.restart_failures.entry(node).or_default();
         *failures += 1;
-        cluster.record(format!(
-            "nemesis restart n{node} failed ({failures}): {error}"
-        ));
-        if healing || *failures >= RESTART_TRIES {
-            cluster.checks.violate(
-                &cluster.world,
-                "Liveness",
-                format!("n{node} did not restart: {error}"),
-            );
+        if start_failed(cluster, node, *failures, healing, &error) {
             return;
         }
-        let at = elapsed_ms(&cluster.world) + DEFER_MS * 4;
+        let at = elapsed_ms(&cluster.world) + RESTART_PAUSE_MS;
         self.scheduler.after(at, Step::Follow(follow));
     }
 

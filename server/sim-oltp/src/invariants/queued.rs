@@ -21,31 +21,64 @@ use uuid::Uuid;
 /// An accepted request never answers as missing or abandoned in the run that accepted it,
 /// unless its retained result has expired. The text gives no time bound for settling, so an
 /// accepted request that is merely late is the workload's `Liveness`, not this rule.
+///
+/// Contract, Q01: "Every accepted ID remains tracked and eventually terminates after barriers
+/// release; zero missing or duplicate logical outcomes." A receipt that failed with an unknown
+/// outcome is terminal and names no outcome. For an accepted mutation that is a missing one,
+/// unless the same identity is answered definitely later.
 pub(crate) const ACCEPTED_SETTLES: &str = "AcceptedSettlesInRun";
 
 /// Guarantees, OLTP-G07: "Accepted queued work stays recoverable while a complete copy
 /// survives. A full worker stop abandons outstanding work." Contract, Q03: "No acceptance
 /// acknowledgment precedes required replication". Contract, R02: "Outstanding requests remain
 /// on that holder". Contract, R04: "New run has no pending old work; old receipts report
-/// abandonment unless a durable commit decision proves success".
+/// abandonment unless a durable commit decision proves success". Plan: "replicate complete
+/// request bytes, identity/digest, acceptance order, and recoverable state to all ready workers
+/// before acknowledging acceptance or starting execution."
+///
+/// The legacy protocol copies to all ready workers. The scoped one needs two copies, and no
+/// public counter shows them, so its copies are judged only by what a full stop abandons.
 pub(crate) const RETENTION: &str = "QueueRetention";
 
 /// Contract, Q05: "One logical execution/receipt for identical identities, explicit conflict
 /// for a different body; one mutation decision." Contract: "no logical mutation may publish
 /// twice". Contract, Q06: "never silently execute a new logical mutation". Guarantees,
 /// OLTP-G03: "Each request identity executes once, cluster-wide on the queued path and per
-/// table and key on the direct path."
+/// table and key on the direct path." The sentence after it is [`FIRST_RESULT`].
 pub(crate) const ONE_EXECUTION: &str = "OneExecutionPerIdentity";
+
+/// Guarantees, OLTP-G03: "On the direct path, a retry of a mutation with the same request ID and
+/// body returns the first definite result of that identity, including a no-op or row conflict,
+/// while its dedup record is retained." A record is kept 24 h, longer than any run.
+///
+/// Both answers must come from `POST /v1/operations` with the direct path on. An answer that the
+/// queue gave is outside the sentence. `plans/oltp-direct-path.md` says that the product does
+/// not do this today (DR-1), so a red here is that finding until something else is shown.
+pub(crate) const FIRST_RESULT: &str = "DirectRetryResult";
 
 /// Contract: "No request may have conflicting terminal decisions". Plan: "an unknown or
 /// expired receipt must never be fabricated as successful".
 pub(crate) const RECEIPTS: &str = "ReceiptCheck";
 
 /// Every rule this module judges from public observations.
-pub(crate) const RULES: [&str; 4] = [ACCEPTED_SETTLES, RETENTION, ONE_EXECUTION, RECEIPTS];
+pub(crate) const RULES: [&str; 5] = [
+    ACCEPTED_SETTLES,
+    RETENTION,
+    ONE_EXECUTION,
+    FIRST_RESULT,
+    RECEIPTS,
+];
 
 /// What cannot run yet, and why. The sweep records each as `not_run`.
-pub(crate) const NOT_RUN: [(&str, &str); 4] = [
+pub(crate) const NOT_RUN: [(&str, &str); 6] = [
+    (
+        "QueueRetention over scoped copies",
+        "/v1/runtime/stats counts the legacy queue only, so no public counter shows where a scoped record is held",
+    ),
+    (
+        "DirectRetryResult across paths",
+        "left out: OLTP-G03 gives the first definite result to a retry on the direct path, and no sentence covers a no-op or row conflict on one path that the other path answers again",
+    ),
     (
         "QueueRetention over QueueCopy",
         "needs a probe with the holder, version and completeness of each installed copy; QueueCopy is reserved and never emitted",
@@ -86,11 +119,30 @@ pub(crate) struct Body {
     pub mutation: bool,
 }
 
-/// A definite result: the success data, or the error code.
+/// A terminal state: the success data, or the error code and whether the error leaves the
+/// outcome unknown.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Terminal {
     Succeeded(Value),
-    Failed(String),
+    Failed { code: String, unknown: bool },
+}
+
+impl Terminal {
+    pub(crate) fn failed(code: &str) -> Self {
+        Self::Failed {
+            code: code.into(),
+            unknown: false,
+        }
+    }
+
+    /// Whether it says what happened to the request.
+    pub(crate) fn decided(&self) -> bool {
+        !matches!(self, Self::Failed { unknown: true, .. })
+    }
+
+    pub(crate) fn conflict(&self) -> bool {
+        *self == Self::failed("conflict")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,11 +160,32 @@ pub(crate) enum Answer {
     Unknown,
 }
 
+impl Answer {
+    /// The request was accepted, or it ran.
+    pub(crate) fn executed(&self) -> bool {
+        matches!(
+            self,
+            Self::Accepted(_) | Self::Terminal(Terminal::Succeeded(_))
+        )
+    }
+
+    pub(crate) fn conflict(&self) -> bool {
+        matches!(self, Self::Terminal(terminal) if terminal.conflict())
+    }
+}
+
 /// One submission attempt, in virtual milliseconds.
 #[derive(Clone, Debug)]
 pub(crate) struct Submission {
     pub body: Body,
     pub route: Route,
+    /// Sent to `POST /v1/requests`.
+    pub asynchronous: bool,
+    pub gateway: u64,
+    /// The connection ended before the reply, by neither side's deadline.
+    pub cut: bool,
+    /// The client closed its socket on purpose before a reply could come.
+    pub closed: bool,
     /// The first attempt under this identity.
     pub fresh: bool,
     pub invoked: u64,
@@ -125,6 +198,8 @@ pub(crate) struct Submission {
 pub(crate) struct Lookup {
     pub run: Uuid,
     pub id: Uuid,
+    /// As [`Submission::cut`].
+    pub cut: bool,
     pub invoked: u64,
     pub completed: u64,
     pub seen: Seen,
@@ -150,14 +225,40 @@ pub(crate) struct Read {
     pub completed: u64,
 }
 
-/// A count of retained request records on one worker, from its public stats.
+/// Who a record count was taken from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Holder {
+    /// A ready worker of a cluster that nothing disturbs.
+    Ready,
+    /// The only worker that still runs.
+    Last,
+}
+
+/// The request records of one worker before and after some requests were accepted, from its
+/// public stats. Nothing may leave the queue between the two counts, so the difference counts
+/// the new requests alone: either the first count is zero, or no result can have expired yet.
 #[derive(Clone, Debug)]
 pub(crate) struct Retained {
     pub node: u64,
-    /// The accepted identities that the worker must hold then.
+    pub holder: Holder,
+    /// The identities accepted between the counts, which the worker must hold.
     pub required: usize,
-    pub accepted_records: u64,
+    pub before: u64,
+    pub after: u64,
+    /// Records of `after` that are not terminal.
+    pub pending: u64,
     pub at: u64,
+}
+
+/// A window in which one or two of three workers were frozen.
+#[derive(Clone, Debug)]
+pub(crate) struct Frozen {
+    pub nodes: Vec<u64>,
+    pub from: u64,
+    pub to: u64,
+    /// The ready workers that a running worker reported from Control, asked at `to`. A frozen
+    /// worker cannot join, so three then means that it was ready throughout.
+    pub ready: Option<u64>,
 }
 
 /// The queue counters of one worker right after a cold start, before any new submission.
@@ -187,9 +288,11 @@ pub(crate) struct Log {
     pub runs: Vec<Run>,
     /// Identities looked up that no client ever submitted.
     pub never_submitted: BTreeSet<Uuid>,
-    /// When two of three workers were frozen, in a cluster that had reported three ready
-    /// workers just before. No acceptance can finish its replication inside.
-    pub two_frozen: Vec<(u64, u64)>,
+    /// Windows with frozen workers, in a cluster that had reported three ready workers just
+    /// before.
+    pub frozen: Vec<Frozen>,
+    /// The scoped protocol: two of three copies are enough.
+    pub scoped: bool,
     /// Intervals in which two or more worker processes were stopped, per run. A request copy
     /// may be gone, so retention is not judged from their start on.
     pub two_down: Vec<u64>,
@@ -228,6 +331,7 @@ impl Log {
         self.accepted_settles(&mut out);
         self.retention(&mut out);
         self.one_execution(&mut out);
+        self.first_result(&mut out);
         self.receipts(&mut out);
         out
     }
@@ -321,20 +425,71 @@ impl Log {
                 }
                 out.judged(ACCEPTED_SETTLES);
             }
+            self.missing_outcome(run, id, acceptance, out);
         }
+    }
+
+    /// An accepted mutation whose receipt is terminal without an outcome, and which nothing
+    /// answers definitely later.
+    fn missing_outcome(&self, run: Uuid, id: Uuid, acceptance: &Submission, out: &mut Outcome) {
+        if !acceptance.body.mutation {
+            return;
+        }
+        let Some(failed) = self.lookups.iter().find(|lookup| {
+            lookup.run == run
+                && lookup.id == id
+                && matches!(&lookup.seen, Seen::Terminal(terminal) if !terminal.decided())
+                && self.in_run(acceptance.completed, lookup)
+        }) else {
+            return;
+        };
+        let decided = |terminal: &Terminal, at: u64| at > failed.completed && terminal.decided();
+        let later = self.lookups.iter().any(|lookup| {
+            lookup.run == run
+                && lookup.id == id
+                && matches!(&lookup.seen, Seen::Terminal(terminal) if decided(terminal, lookup.completed))
+        }) || self.submissions.iter().any(|submission| {
+            submission.body == acceptance.body
+                && matches!(&submission.answer, Answer::Terminal(terminal) if decided(terminal, submission.completed))
+        });
+        if !later {
+            out.violate(
+                ACCEPTED_SETTLES,
+                format!(
+                    "{id} accepted at {}ms in run {run} has the receipt {:?} at {}ms, terminal with an unknown outcome",
+                    acceptance.completed, failed.seen, failed.completed
+                ),
+            );
+        }
+    }
+
+    /// The frozen window that judges a submission, if any.
+    pub(crate) fn frozen_window(&self, submission: &Submission) -> Option<&Frozen> {
+        if !submission.fresh || submission.route != Route::Queued {
+            return None;
+        }
+        self.frozen.iter().find(|window| {
+            let judged = match window.nodes.len() {
+                // Every ready worker holds a copy before the acknowledgment, and this one
+                // could not install any while it was ready.
+                1 => !self.scoped && window.ready == Some(3),
+                // Neither protocol can copy to one worker alone.
+                _ => true,
+            };
+            judged && submission.invoked >= window.from && submission.invoked < window.to
+        })
     }
 
     fn retention(&self, out: &mut Outcome) {
         // Q03: no acknowledgment before the required replication.
         for submission in &self.submissions {
-            let inside = self
-                .two_frozen
-                .iter()
-                .any(|&(from, to)| submission.invoked >= from && submission.completed <= to);
-            if !submission.fresh || submission.route != Route::Queued || !inside {
+            let Some(window) = self.frozen_window(submission) else {
+                continue;
+            };
+            out.judged(RETENTION);
+            if submission.completed > window.to {
                 continue;
             }
-            out.judged(RETENTION);
             let acknowledged = match &submission.answer {
                 Answer::Accepted(_) => true,
                 Answer::Terminal(Terminal::Succeeded(_)) => submission.body.mutation,
@@ -344,21 +499,25 @@ impl Log {
                 out.violate(
                     RETENTION,
                     format!(
-                        "{} sent at {}ms was acknowledged at {}ms with two of three workers frozen",
-                        submission.body.id, submission.invoked, submission.completed
+                        "{} sent at {}ms was acknowledged at {}ms, while {:?} of three ready workers could not install a copy",
+                        submission.body.id, submission.invoked, submission.completed, window.nodes
                     ),
                 );
             }
         }
         // R02: outstanding requests remain on the holders.
         for held in &self.retained {
+            if held.required == 0 {
+                continue;
+            }
             out.judged(RETENTION);
-            if held.accepted_records < held.required as u64 {
+            let new = held.after.saturating_sub(held.before);
+            if new < held.required as u64 {
                 out.violate(
                     RETENTION,
                     format!(
-                        "n{} holds {} accepted records at {}ms, {} accepted requests are outstanding",
-                        held.node, held.accepted_records, held.at, held.required
+                        "n{} went from {} to {} accepted records by {}ms, and {} requests were accepted meanwhile",
+                        held.node, held.before, held.after, held.at, held.required
                     ),
                 );
             }
@@ -465,7 +624,9 @@ impl Log {
             by_id.entry(success.0.id).or_default().push(success);
         }
         for (id, members) in &by_id {
-            out.judged(ONE_EXECUTION);
+            if members.len() > 1 {
+                out.judged(ONE_EXECUTION);
+            }
             for (index, (body, route, result, at)) in members.iter().enumerate() {
                 for (other, other_route, other_result, other_at) in &members[..index] {
                     if body == other {
@@ -497,9 +658,7 @@ impl Log {
         // A body that succeeded is never answered as a conflict with another body.
         for submission in &self.submissions {
             let body = &submission.body;
-            let refused =
-                submission.answer == Answer::Terminal(Terminal::Failed("conflict".into()));
-            if !refused || !body.mutation {
+            if !submission.answer.conflict() || !body.mutation {
                 continue;
             }
             let succeeded = by_id.get(&body.id).and_then(|members| {
@@ -519,7 +678,111 @@ impl Log {
                 );
             }
         }
+        self.two_bodies(out);
         self.reappearance(out);
+    }
+
+    /// The bodies of one identity that were accepted or took effect, beyond the pairs of
+    /// definite successes: a `202` is the acceptance of that body, and a value that only one
+    /// body writes is its effect.
+    fn two_bodies(&self, out: &mut Outcome) {
+        let mut bodies: BTreeMap<Uuid, BTreeMap<&Body, (bool, Option<(Uuid, u64)>)>> =
+            BTreeMap::new();
+        for submission in self.submissions.iter().filter(|s| s.body.mutation) {
+            let known = bodies
+                .entry(submission.body.id)
+                .or_default()
+                .entry(&submission.body)
+                .or_insert((true, None));
+            known.0 &= submission.route == Route::Queued;
+            if let Answer::Accepted(run) = submission.answer {
+                known.1.get_or_insert((run, submission.completed));
+            }
+        }
+        let visible = |body: &Body| {
+            self.reads.iter().find_map(|read| {
+                let write = (read.key, read.value?);
+                body.writes.contains(&write).then_some(read.completed)
+            })
+        };
+        for (id, bodies) in bodies.iter().filter(|(_, bodies)| bodies.len() > 1) {
+            let known: Vec<_> = bodies
+                .iter()
+                .map(|(body, (queued, accepted))| (*body, *queued, *accepted, visible(body)))
+                .collect();
+            if known
+                .iter()
+                .any(|(.., accepted, seen)| accepted.is_some() || seen.is_some())
+            {
+                out.judged(ONE_EXECUTION);
+            }
+            for (index, (body, queued, accepted, seen)) in known.iter().enumerate() {
+                for (other, other_queued, other_accepted, other_seen) in &known[..index] {
+                    // Two acceptances of one run are on the queued path, which is cluster-wide.
+                    if let (Some((run, at)), Some((other_run, other_at))) =
+                        (accepted, other_accepted)
+                        && run == other_run
+                    {
+                        out.violate(
+                            ONE_EXECUTION,
+                            format!("{id} was accepted with two bodies in run {run}, at {other_at}ms and {at}ms"),
+                        );
+                        continue;
+                    }
+                    let same_key = body.anchor.is_some() && body.anchor == other.anchor;
+                    let cluster_wide = *queued && *other_queued;
+                    if let (Some(at), Some(other_at)) = (seen, other_seen)
+                        && (cluster_wide || same_key)
+                    {
+                        out.violate(
+                            ONE_EXECUTION,
+                            format!(
+                                "{id} took effect with two bodies, read at {other_at}ms and {at}ms"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Definite results that `POST /v1/operations` gave one body while the direct path was on.
+    fn first_result(&self, out: &mut Outcome) {
+        let mut results: BTreeMap<&Body, Vec<(&Terminal, u64)>> = BTreeMap::new();
+        for submission in &self.submissions {
+            if !submission.body.mutation || submission.route != Route::MaybeDirect {
+                continue;
+            }
+            if let Answer::Terminal(terminal) = &submission.answer {
+                results
+                    .entry(&submission.body)
+                    .or_default()
+                    .push((terminal, submission.completed));
+            }
+        }
+        for (body, mut results) in results.into_iter().filter(|(_, r)| r.len() > 1) {
+            out.judged(FIRST_RESULT);
+            results.sort_by_key(|(_, at)| *at);
+            let (first, at) = results[0];
+            // A committed result and another answer is `OneExecutionPerIdentity`.
+            let committed = |terminal: &Terminal| matches!(terminal, Terminal::Succeeded(result) if changed(result));
+            let reported = |other: &Terminal| {
+                committed(first) && (committed(other) || other.conflict())
+                    || committed(other) && first.conflict()
+            };
+            if let Some((other, other_at)) = results
+                .iter()
+                .find(|(other, _)| *other != first && !reported(other))
+            {
+                out.violate(
+                    FIRST_RESULT,
+                    format!(
+                        "{} answered {first:?} at {at}ms and {other:?} at {other_at}ms for one body",
+                        body.id
+                    ),
+                );
+            }
+        }
     }
 
     /// Each value is written by one body under one identity, so a value that a later read
@@ -544,13 +807,13 @@ impl Log {
                 let Some(id) = writers.get(&(key, value)) else {
                     continue;
                 };
-                out.judged(ONE_EXECUTION);
                 let replaced = reads[position + 1..]
                     .iter()
                     .find(|read| read.invoked > first.completed && read.value != first.value);
                 let Some(replaced) = replaced else {
                     continue;
                 };
+                out.judged(ONE_EXECUTION);
                 let back = reads
                     .iter()
                     .find(|read| read.invoked > replaced.completed && read.value == first.value);
@@ -607,41 +870,50 @@ impl Log {
     }
 
     /// Accepted `(run, id)` pairs of `run` that no lookup ever found terminal, expired or
-    /// abandoned.
+    /// abandoned. A mutation that failed with an unknown outcome has not settled.
     pub(crate) fn unsettled(&self, run: Uuid) -> Vec<Uuid> {
         self.accepted()
-            .into_keys()
-            .filter(|(accepted, _)| *accepted == run)
-            .filter(|(run, id)| {
+            .into_iter()
+            .filter(|((accepted, _), _)| *accepted == run)
+            .filter(|((run, id), submission)| {
                 !self.lookups.iter().any(|lookup| {
                     lookup.run == *run
                         && lookup.id == *id
-                        && matches!(
-                            lookup.seen,
-                            Seen::Terminal(_) | Seen::Missing | Seen::Abandoned
-                        )
+                        && match &lookup.seen {
+                            Seen::Terminal(terminal) => {
+                                terminal.decided() || !submission.body.mutation
+                            }
+                            Seen::Missing | Seen::Abandoned => true,
+                            Seen::Pending | Seen::Unknown => false,
+                        }
                 })
             })
-            .map(|(_, id)| id)
+            .map(|((_, id), _)| id)
             .collect()
     }
 
-    /// Whether an accepted request was sent before `at`, was not seen terminal by then, and was
-    /// seen terminal afterwards.
-    pub(crate) fn open_across(&self, at: u64) -> bool {
-        self.accepted().iter().any(|((run, id), submission)| {
-            let first = self
-                .lookups
-                .iter()
-                .filter(|lookup| {
-                    lookup.run == *run
-                        && lookup.id == *id
-                        && matches!(lookup.seen, Seen::Terminal(_))
-                })
-                .map(|lookup| lookup.completed)
-                .min();
-            submission.invoked <= at && first.is_some_and(|first| first > at)
-        })
+    /// An accepted request that was open across `at`: accepted before it, reported pending by a
+    /// lookup sent at or after it, and terminal after that, in one run. A request that nobody
+    /// looked up meanwhile may have settled long before, and does not count.
+    pub(crate) fn open_across(&self, at: u64) -> Option<(Uuid, Uuid)> {
+        self.accepted()
+            .into_iter()
+            .find_map(|((run, id), accepted)| {
+                if accepted.completed > at {
+                    return None;
+                }
+                let mine = || self.lookups.iter().filter(|l| l.run == run && l.id == id);
+                let pending = mine()
+                    .filter(|l| l.invoked >= at && l.seen == Seen::Pending)
+                    .map(|l| l.completed)
+                    .min()?;
+                mine()
+                    .any(|l| {
+                        l.completed > pending
+                            && matches!(&l.seen, Seen::Terminal(terminal) if terminal.decided())
+                    })
+                    .then_some((run, id))
+            })
     }
 
     /// Lookups that found a request pending after a terminal answer. The contract does not
@@ -662,8 +934,14 @@ impl Log {
     }
 }
 
+/// How far `jumps` wall-clock jumps may have moved a node clock: each by at most 2 s. Drift adds
+/// well under a second.
+pub(crate) fn clock_slack(jumps: u64) -> u64 {
+    2_000 * (jumps + 1) + 1_000
+}
+
 /// Whether a success changed rows. `update` and `delete` answer the existence flag.
-fn changed(result: &Value) -> bool {
+pub(crate) fn changed(result: &Value) -> bool {
     *result != Value::Bool(false)
 }
 

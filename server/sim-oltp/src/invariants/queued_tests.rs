@@ -20,6 +20,10 @@ fn submit(body: Body, at: u64, answer: Answer) -> Submission {
     Submission {
         body,
         route: Route::Queued,
+        asynchronous: true,
+        gateway: 101,
+        cut: false,
+        closed: false,
         fresh: true,
         invoked: at,
         completed: at + 10,
@@ -46,6 +50,7 @@ fn lookup(id: u128, at: u64, seen: Seen) -> Lookup {
     Lookup {
         run: RUN,
         id: Uuid::from_u128(id),
+        cut: false,
         invoked: at,
         completed: at + 10,
         seen,
@@ -57,7 +62,23 @@ fn ok(value: Value) -> Seen {
 }
 
 fn refused() -> Terminal {
-    Terminal::Failed("conflict".into())
+    Terminal::failed("conflict")
+}
+
+fn unknown() -> Seen {
+    Seen::Terminal(Terminal::Failed {
+        code: "storage_unavailable".into(),
+        unknown: true,
+    })
+}
+
+fn frozen(nodes: &[u64], ready: Option<u64>) -> Frozen {
+    Frozen {
+        nodes: nodes.to_vec(),
+        from: 1_000,
+        to: 2_000,
+        ready,
+    }
 }
 
 fn read(key: i64, value: Option<i64>, at: u64) -> Read {
@@ -159,10 +180,46 @@ fn a_full_stop_or_two_stopped_workers_end_the_retention_claim() {
     assert!(kinds(&down).is_empty());
 }
 
+/// Review 132, M4: accepted mutations settled as failed with an unknown outcome in six seeds,
+/// and nothing said so.
 #[test]
-fn no_acknowledgment_while_two_workers_are_frozen() {
+fn a_failed_receipt_without_an_outcome_is_a_missing_outcome() {
     let mut log = log();
-    log.two_frozen = vec![(1_000, 2_000)];
+    log.submissions = vec![accepted(1, 100)];
+    log.lookups = vec![lookup(1, 300, unknown())];
+    assert_eq!(kinds(&log), [ACCEPTED_SETTLES]);
+    assert_eq!(log.unsettled(RUN), [Uuid::from_u128(1)]);
+    // The same identity is answered definitely later.
+    log.submissions
+        .push(succeeded(body(1, 1, 1), 400, json!(null)));
+    assert!(kinds(&log).is_empty());
+    // Before it, that says nothing.
+    log.submissions[1].completed = 250;
+    assert_eq!(kinds(&log), [ACCEPTED_SETTLES]);
+    log.submissions.pop();
+    // A full stop ends the claim.
+    log.runs[0].stopped = Some(200);
+    assert!(kinds(&log).is_empty());
+    log.runs[0].stopped = None;
+    // A definite failure is an outcome.
+    log.lookups = vec![lookup(
+        1,
+        300,
+        Seen::Terminal(Terminal::failed("storage_unavailable")),
+    )];
+    assert!(kinds(&log).is_empty());
+    assert!(log.unsettled(RUN).is_empty());
+    // A read changes nothing, so its failure hides nothing.
+    log.submissions[0].body.mutation = false;
+    log.lookups = vec![lookup(1, 300, unknown())];
+    assert!(kinds(&log).is_empty());
+    assert!(log.unsettled(RUN).is_empty());
+}
+
+#[test]
+fn no_acknowledgment_while_a_ready_worker_cannot_install_a_copy() {
+    let mut log = log();
+    log.frozen = vec![frozen(&[1, 2], None)];
     log.submissions = vec![
         accepted(1, 1_995),
         submit(body(2, 1, 2), 1_500, Answer::Unknown),
@@ -171,6 +228,22 @@ fn no_acknowledgment_while_two_workers_are_frozen() {
     assert!(log.judge().judged[RETENTION] > 0);
     log.submissions = vec![accepted(1, 1_500)];
     assert_eq!(kinds(&log), [RETENTION]);
+    // Review 132, M2: one frozen worker leaves the copies as the only obstacle.
+    log.frozen = vec![frozen(&[1], Some(3))];
+    assert_eq!(kinds(&log), [RETENTION]);
+    // It may have left the ready set, or nothing is known about it.
+    for ready in [Some(2), None] {
+        log.frozen = vec![frozen(&[1], ready)];
+        assert!(kinds(&log).is_empty());
+        assert!(!log.judge().judged.contains_key(RETENTION));
+    }
+    // Two of three scoped copies are enough.
+    log.frozen = vec![frozen(&[1], Some(3))];
+    log.scoped = true;
+    assert!(kinds(&log).is_empty());
+    log.frozen = vec![frozen(&[1, 2], None)];
+    assert_eq!(kinds(&log), [RETENTION]);
+    log.scoped = false;
     // A retry attaches to a request that may have been replicated before.
     log.submissions[0].fresh = false;
     assert!(kinds(&log).is_empty());
@@ -179,19 +252,29 @@ fn no_acknowledgment_while_two_workers_are_frozen() {
     assert!(kinds(&log).is_empty());
 }
 
+/// Review 132, M1: 60 old records made up for 12 requests that the worker never received.
 #[test]
-fn a_holder_keeps_every_outstanding_record() {
+fn a_holder_has_every_new_record_beyond_the_old_ones() {
     let mut log = log();
-    let held = |accepted_records| Retained {
+    let held = |before, after| Retained {
         node: 2,
+        holder: Holder::Ready,
         required: 3,
-        accepted_records,
+        before,
+        after,
+        pending: 0,
         at: 900,
     };
-    log.retained = vec![held(3), held(7)];
+    log.retained = vec![held(0, 3), held(60, 63), held(60, 67)];
     assert!(kinds(&log).is_empty());
-    log.retained = vec![held(2)];
-    assert_eq!(kinds(&log), [RETENTION]);
+    for (before, after) in [(0, 2), (60, 60), (60, 62), (60, 12)] {
+        log.retained = vec![held(before, after)];
+        assert_eq!(kinds(&log), [RETENTION], "{before} to {after}");
+    }
+    // Nothing was accepted, so nothing is compared.
+    log.retained[0].required = 0;
+    assert!(kinds(&log).is_empty());
+    assert!(!log.judge().judged.contains_key(RETENTION));
 }
 
 #[test]
@@ -277,6 +360,117 @@ fn one_identity_has_one_result_and_one_body() {
         submit(body(1, 1, 10), 200, Answer::Terminal(refused())),
     ];
     assert_eq!(kinds(&refused_retry), [ONE_EXECUTION]);
+}
+
+/// Review 132, M6.
+#[test]
+fn two_bodies_accepted_under_one_identity_are_two_executions() {
+    let mut log = log();
+    let other = submit(body(1, 2, 20), 300, Answer::Accepted(RUN));
+    log.submissions = vec![accepted(1, 100), other];
+    assert_eq!(kinds(&log), [ONE_EXECUTION]);
+    // The refused body was not accepted.
+    log.submissions[1].answer = Answer::Terminal(refused());
+    assert!(kinds(&log).is_empty());
+    // Neither answer arrived, and both values are visible.
+    log.submissions = vec![
+        submit(body(1, 1, 1), 100, Answer::Unknown),
+        submit(body(1, 2, 20), 300, Answer::Unknown),
+    ];
+    log.reads = vec![read(1, Some(1), 700)];
+    assert!(kinds(&log).is_empty(), "one of them ran");
+    assert!(log.judge().judged[ONE_EXECUTION] > 0);
+    log.reads.push(read(2, Some(20), 700));
+    assert_eq!(kinds(&log), [ONE_EXECUTION]);
+    // On the direct path another key is another identity.
+    log.submissions[1].route = Route::MaybeDirect;
+    assert!(kinds(&log).is_empty());
+    // The same key is not.
+    log.submissions[1].body = body(1, 1, 20);
+    log.reads[1].key = 1;
+    assert_eq!(kinds(&log), [ONE_EXECUTION]);
+    // Two runs: the first body may have been abandoned.
+    log.reads.clear();
+    log.submissions = vec![
+        accepted(1, 100),
+        submit(body(1, 2, 20), 300, Answer::Accepted(NEXT)),
+    ];
+    assert!(kinds(&log).is_empty());
+}
+
+/// Review 132, M8: OLTP-G03's second sentence. The product does not do this today (DR-1).
+#[test]
+fn a_direct_retry_returns_the_first_definite_result() {
+    let answers = |first: Terminal, second: Terminal| {
+        let mut log = log();
+        log.submissions = [(100, first), (200, second)]
+            .map(|(at, terminal)| Submission {
+                route: Route::MaybeDirect,
+                asynchronous: false,
+                ..submit(body(1, 1, 10), at, Answer::Terminal(terminal))
+            })
+            .to_vec();
+        log
+    };
+    let done = |value| Terminal::Succeeded(value);
+    for same in [done(json!(false)), done(json!(true)), refused()] {
+        let log = answers(same.clone(), same);
+        assert!(kinds(&log).is_empty());
+        assert_eq!(log.judge().judged[FIRST_RESULT], 1);
+    }
+    let contradicted = [
+        (done(json!(false)), done(json!(true))),
+        (done(json!(true)), done(json!(false))),
+        (done(json!(false)), refused()),
+        (refused(), done(json!(false))),
+    ];
+    for (first, second) in contradicted {
+        let log = answers(first, second);
+        assert_eq!(kinds(&log), [FIRST_RESULT], "{log:?}");
+    }
+    // A committed result and a conflict are one execution's rule.
+    for (first, second) in [
+        (done(json!(true)), refused()),
+        (refused(), done(json!(null))),
+    ] {
+        assert_eq!(kinds(&answers(first, second)), [ONE_EXECUTION]);
+    }
+    // No sentence covers a no-op that the other path answers again (see NOT_RUN).
+    let mut crossed = answers(done(json!(false)), done(json!(true)));
+    crossed.submissions[1].route = Route::Queued;
+    assert!(kinds(&crossed).is_empty());
+    // A refusal or an unknown answer is not a result.
+    let mut refusal = answers(done(json!(true)), done(json!(true)));
+    refusal.submissions[0].answer = Answer::Refused("overloaded".into());
+    assert!(kinds(&refusal).is_empty());
+    assert!(!refusal.judge().judged.contains_key(FIRST_RESULT));
+}
+
+/// Review 132: one success and one read counted as two comparisons.
+#[test]
+fn judged_counts_comparisons() {
+    let mut log = log();
+    log.submissions = vec![succeeded(body(1, 1, 10), 100, json!(null))];
+    log.reads = vec![read(1, Some(10), 200)];
+    assert!(log.judge().judged.is_empty());
+    log.reads.push(read(1, Some(11), 300));
+    assert_eq!(log.judge().judged[ONE_EXECUTION], 1);
+}
+
+/// Review 132, M7: `abandon` passed no jumps, so the slack was 3 s whatever was jumped.
+#[test]
+fn the_slack_of_every_clock_jump_counts() {
+    let mut log = log();
+    log.retention_ms = 8_000;
+    log.submissions = vec![accepted(1, 100)];
+    log.lookups = vec![
+        lookup(1, 200, ok(json!(null))),
+        lookup(1, 4_900, Seen::Missing),
+    ];
+    log.clock_slack_ms = clock_slack(4);
+    assert!(kinds(&log).is_empty());
+    log.clock_slack_ms = clock_slack(0);
+    assert_eq!(kinds(&log), [ACCEPTED_SETTLES]);
 }
 
 #[test]
@@ -372,18 +566,21 @@ fn pending_after_terminal_is_reported_not_judged() {
 }
 
 #[test]
-fn open_across_needs_a_terminal_receipt_after_the_fault() {
+fn open_across_needs_a_pending_receipt_after_the_fault() {
     let mut log = log();
     log.submissions = vec![accepted(1, 100)];
     log.lookups = vec![
-        lookup(1, 200, Seen::Pending),
+        lookup(1, 300, Seen::Pending),
         lookup(1, 500, ok(json!(null))),
     ];
-    assert!(log.open_across(300));
-    assert!(!log.open_across(50), "sent after the fault");
-    assert!(!log.open_across(600), "settled before the fault");
+    assert!(log.open_across(300).is_some());
+    assert!(log.open_across(50).is_none(), "accepted after the fault");
+    assert!(log.open_across(301).is_none(), "looked up before the fault");
     log.lookups.pop();
-    assert!(!log.open_across(300), "never seen terminal");
+    assert!(log.open_across(300).is_none(), "never seen terminal");
+    // Review 132: looked up for the first time long after the fault.
+    log.lookups = vec![lookup(1, 90_000, ok(json!(null)))];
+    assert!(log.open_across(60_000).is_none());
 }
 
 #[test]

@@ -14,6 +14,7 @@ pub(crate) mod moves;
 pub(crate) mod old_peer;
 pub(crate) mod paused;
 pub(crate) mod queued;
+mod queued_clauses;
 
 use std::{collections::BTreeSet, fmt};
 

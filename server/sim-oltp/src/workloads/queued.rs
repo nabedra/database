@@ -31,9 +31,14 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::{Workload, clients::Ctx, direct};
+use super::{
+    Workload,
+    clients::Ctx,
+    direct,
+    queued_clauses::{Facts, Mark, Stop, Work},
+};
 use crate::{
-    bootstrap::{Bootstrap, CLIENTS, GATEWAYS, QueueSettings, WORKERS},
+    bootstrap::{BOOTSTRAP_CLIENT, Bootstrap, CLIENTS, GATEWAYS, QueueSettings, WORKERS},
     client::{operation, request},
     config::Config,
     disk::DiskCut,
@@ -41,13 +46,13 @@ use crate::{
     invariants::{
         elapsed_ms,
         queued::{
-            Answer, Body, Fresh, Log, Lookup, RULES, Read, Retained, Route, Run, Seen, Submission,
-            Terminal,
+            Answer, Body, Fresh, Frozen, Holder, Log, Lookup, RULES, Read, Retained, Route, Run,
+            Seen, Submission, Terminal, clock_slack,
         },
     },
     nemesis::{
         Action, NetFaults, Selection,
-        apply::{COLD_LIMIT, Chaos},
+        apply::{COLD_LIMIT, Chaos, start_gateway},
         window,
     },
     node::Cluster,
@@ -72,6 +77,14 @@ const DELETED: i64 = 3;
 const REFUSALS: u32 = 6;
 /// How many violations of one rule a run lists.
 const REPORTED: usize = 3;
+/// Retentions of at least this long do not expire within a run.
+const LONG_RETENTION_MS: u64 = 600_000;
+/// Requests that a restart of processes meets.
+const BACKLOG: i64 = 40;
+const ACCEPT_WAIT: Duration = Duration::from_secs(1);
+/// How many receipts are followed from a fault on.
+const WATCHED: usize = 8;
+const READY_LIMIT: Duration = Duration::from_secs(2);
 const SPLIT_LIMIT: Duration = Duration::from_secs(60);
 const SCOPED_LIMIT: Duration = Duration::from_secs(30);
 
@@ -96,7 +109,7 @@ impl Mode {
         let mut mode = Self {
             scoped: word & 1 == 1,
             direct: word & 2 == 2,
-            retention_ms: [4_000, 8_000, 600_000][(word >> 2) as usize % 3],
+            retention_ms: [4_000, 8_000, LONG_RETENTION_MS][(word >> 2) as usize % 3],
         };
         if let Ok(forced) = std::env::var(MODE_ENV)
             && !forced.is_empty()
@@ -284,8 +297,6 @@ struct Shared {
     log: Log,
     open: Vec<Open>,
     counts: BTreeMap<&'static str, u64>,
-    /// Scenario clauses whose assertions ran.
-    clauses: BTreeSet<&'static str>,
     /// Requests whose submission never got a definite answer.
     undecided: u64,
     defect: Option<Defect>,
@@ -295,9 +306,16 @@ struct Shared {
     bursts: i64,
     /// When the fault loop last ran, before any action of that turn.
     last_turn: u64,
-    /// `(clause, time)`: the clause ran if an accepted request was open across that time and
-    /// was seen terminal after it.
-    candidates: Vec<(&'static str, u64)>,
+    /// The queue faults that happened.
+    marks: Vec<(Mark, u64)>,
+    /// Windows in which clients were sending: `Progress` judges each of them.
+    windows: Vec<(&'static str, u64, u64)>,
+    /// The finale's full stop.
+    stop: Option<Stop>,
+    /// Every gateway start that failed (lead decision 18).
+    failed_starts: Vec<String>,
+    /// Comparisons that could not be made, and why.
+    skipped: Vec<String>,
     /// The last receipt answer per identity, for the failure messages.
     last: BTreeMap<Uuid, String>,
     /// `POST /v1/requests` answers outside the contract, after the first.
@@ -323,14 +341,16 @@ impl Q {
         *self.shared.lock().unwrap().counts.entry(name).or_default() += 1;
     }
 
-    fn clause(&self, name: &'static str) {
-        self.shared.lock().unwrap().clauses.insert(name);
+    /// Note a fault that takes effect now.
+    fn mark(&self, mark: Mark) {
+        let now = self.now();
+        self.shared.lock().unwrap().marks.push((mark, now));
     }
 
-    /// Note a clause that needs an accepted request open across this moment.
-    fn candidate(&self, name: &'static str) {
-        let now = self.now();
-        self.shared.lock().unwrap().candidates.push((name, now));
+    /// Note a comparison that could not be made.
+    fn skip(&self, cluster: &Cluster, why: String) {
+        cluster.record(format!("queued: {why}"));
+        self.shared.lock().unwrap().skipped.push(why);
     }
 
     fn history(&self) -> std::sync::MutexGuard<'_, History> {
@@ -408,10 +428,22 @@ fn classify(error: &ProtocolError) -> Answer {
     match error.code {
         ErrorCode::NotFound if error.message.contains("abandoned") => Answer::Abandoned,
         ErrorCode::NotFound => Answer::Missing,
-        ErrorCode::Conflict => Answer::Terminal(Terminal::Failed("conflict".into())),
+        ErrorCode::Conflict => Answer::Terminal(failed(error)),
         _ if error.outcome == Applied::NotApplied => Answer::Refused(code(error)),
         _ => Answer::Unknown,
     }
+}
+
+fn failed(error: &ProtocolError) -> Terminal {
+    Terminal::Failed {
+        code: code(error),
+        unknown: error.outcome == Applied::Unknown,
+    }
+}
+
+/// Whether an error of [`request`] is a connection that ended while it waited for the reply.
+fn cut(error: &str) -> bool {
+    error.starts_with("HTTP reply:") || error.starts_with("HTTP response body:")
 }
 
 fn code(error: &ProtocolError) -> String {
@@ -468,6 +500,21 @@ async fn send(
     fresh: bool,
     limit: Duration,
 ) -> Answer {
+    attempt(q, node, gateway, req, asynchronous, fresh, limit, false).await
+}
+
+/// [`send`], or with `close` a client that closes its socket after `limit`.
+#[allow(clippy::too_many_arguments)]
+async fn attempt(
+    q: &Q,
+    node: u64,
+    gateway: u64,
+    req: &Req,
+    asynchronous: bool,
+    fresh: bool,
+    limit: Duration,
+    close: bool,
+) -> Answer {
     let op = record(q, gateway, req, None).expect("open history attempt");
     let invoked = q.now();
     let path = if asynchronous { SUBMIT } else { OPERATIONS };
@@ -482,6 +529,8 @@ async fn send(
     .await;
     let mut envelope = None;
     let mut replayed = false;
+    let lost = matches!(&reply, Err(error) if cut(error));
+    let deadline = matches!(&reply, Err(error) if error.ends_with("deadline"));
     let (answer, completion) = match reply {
         Err(error) => (Answer::Unknown, Completion::Unknown(error)),
         Ok(reply) if asynchronous && reply.status == 202 => match accepted(&reply.body, req) {
@@ -565,6 +614,10 @@ async fn send(
         } else {
             req.route(q.mode, asynchronous)
         },
+        asynchronous,
+        gateway,
+        cut: lost,
+        closed: close && deadline,
         fresh,
         invoked,
         completed: q.now(),
@@ -593,6 +646,7 @@ async fn lookup(q: &Q, node: u64, gateway: u64, run: Uuid, req: &Req) -> Seen {
     let invoked = q.now();
     let path = format!("{SUBMIT}/{run}/{}", req.body.id);
     let reply = request(node, gateway, &path, &q.ctx.token, None, LOOKUP_LIMIT).await;
+    let lost = matches!(&reply, Err(error) if cut(error));
     let mut envelope = None;
     let mut failed = None;
     let mut why = String::new();
@@ -644,7 +698,7 @@ async fn lookup(q: &Q, node: u64, gateway: u64, run: Uuid, req: &Req) -> Seen {
             record(q, gateway, req, Some(Completion::Ok(value.clone())));
             observe_rows(q, req, value, invoked);
         }
-        Seen::Terminal(Terminal::Failed(_)) => {
+        Seen::Terminal(Terminal::Failed { .. }) => {
             if let Some(error) = failed {
                 record(q, gateway, req, Some(Completion::Refused(error)));
             }
@@ -657,6 +711,7 @@ async fn lookup(q: &Q, node: u64, gateway: u64, run: Uuid, req: &Req) -> Seen {
     q.shared.lock().unwrap().log.lookups.push(Lookup {
         run,
         id: req.body.id,
+        cut: lost,
         invoked,
         completed: q.now(),
         seen: seen.clone(),
@@ -709,19 +764,12 @@ fn receipt(body: &Value, run: Uuid, id: Uuid) -> Result<(Seen, Option<ProtocolEr
             Ok((Seen::Terminal(Terminal::Succeeded(result.clone())), None))
         }
         Some("failed") => match serde_json::from_value::<ProtocolError>(error.clone()) {
-            Ok(failed) => {
-                let code = error["code"].as_str().unwrap_or_default().to_owned();
-                Ok((Seen::Terminal(Terminal::Failed(code)), Some(failed)))
-            }
+            Ok(error) => Ok((Seen::Terminal(failed(&error)), Some(error))),
             Err(_) => invalid("failed without an error"),
         },
         Some("abandoned") if result.is_null() && error.is_null() => Ok((Seen::Abandoned, None)),
         _ => invalid("state"),
     }
-}
-
-fn definite(answer: &Answer) -> bool {
-    *answer != Answer::Unknown
 }
 
 async fn pause(attempt: u32) {
@@ -934,10 +982,14 @@ async fn run_client(q: Q, index: usize, program: Vec<Planned>) {
                     planned.kind = [Kind::Upsert, Kind::Batch, Kind::Get][extra];
                     let req = build(&q, id, &planned, value + 4 * (extra as i64 + 1) / 2);
                     drive(&q, node, first, &req, true, true, planned.limit).await;
+                    if req.body.mutation {
+                        sent.push(req);
+                    }
                 }
+                continue;
             }
             Style::Race => {
-                let (a, b) = tokio::join!(
+                tokio::join!(
                     send(&q, node, GATEWAYS[0], &req, true, false, planned.limit),
                     send(
                         &q,
@@ -950,9 +1002,6 @@ async fn run_client(q: Q, index: usize, program: Vec<Planned>) {
                     ),
                 );
                 q.count("raced");
-                if definite(&a) && definite(&b) {
-                    q.clause("Q05:same-id-two-apis");
-                }
                 let answer = drive(&q, node, first, &req, true, false, planned.limit).await;
                 if let Answer::Accepted(run) = answer {
                     poll(&q, node, first, run, &req, planned.polls).await;
@@ -960,19 +1009,20 @@ async fn run_client(q: Q, index: usize, program: Vec<Planned>) {
             }
             Style::Cross => {
                 let asynchronous = planned.other_key;
-                let one = drive(&q, node, first, &req, asynchronous, true, planned.limit).await;
-                let two = drive(
-                    &q,
-                    node,
-                    1 - first,
-                    &req,
-                    !asynchronous,
-                    false,
-                    planned.limit,
-                )
-                .await;
-                if definite(&one) && definite(&two) && req.body.mutation {
-                    q.clause("Q05:path-boundary");
+                let mut runs = Vec::new();
+                for (first, asynchronous, fresh) in [
+                    (first, asynchronous, true),
+                    (1 - first, !asynchronous, false),
+                ] {
+                    let limit = planned.limit;
+                    let answer = drive(&q, node, first, &req, asynchronous, fresh, limit).await;
+                    if let Answer::Accepted(run) = answer {
+                        runs.push(run);
+                    }
+                }
+                // The result of the queued half, to compare with the other one.
+                for run in runs {
+                    poll(&q, node, first, run, &req, planned.polls).await;
                 }
             }
             Style::Reuse => {
@@ -985,21 +1035,16 @@ async fn run_client(q: Q, index: usize, program: Vec<Planned>) {
                 };
                 let body = Req::row("table.upsert", &q.ctx.table, earlier.body.id, key, value);
                 let asynchronous = planned.polls % 2 == 0;
-                let answer =
-                    drive(&q, node, first, &body, asynchronous, false, planned.limit).await;
-                if answer == Answer::Terminal(Terminal::Failed("conflict".into())) {
-                    q.clause("Q05:other-body");
-                }
+                drive(&q, node, first, &body, asynchronous, false, planned.limit).await;
+                // The ID and body drawn above were not sent.
+                continue;
             }
             Style::Close => {
                 let close = Duration::from_millis(2 + planned.polls as u64 * 4);
-                send(&q, node, GATEWAYS[first], &req, true, true, close).await;
+                attempt(&q, node, GATEWAYS[first], &req, true, true, close, true).await;
                 let answer = drive(&q, node, 1 - first, &req, true, false, planned.limit).await;
                 if let Answer::Accepted(run) = answer {
-                    let seen = poll(&q, node, 1 - first, run, &req, planned.polls).await;
-                    if matches!(seen, Seen::Terminal(_)) {
-                        q.clause("Q04:closed-socket");
-                    }
+                    poll(&q, node, 1 - first, run, &req, planned.polls).await;
                 }
             }
         }
@@ -1059,13 +1104,16 @@ fn faults(g: &mut Gen, start: u64, chaos_ms: u64) -> Vec<Scheduled> {
     faults
 }
 
+/// The first of 1,000 values that nothing else writes.
+fn fresh_values(q: &Q) -> i64 {
+    let mut shared = q.shared.lock().unwrap();
+    shared.bursts += 1;
+    400_000 + shared.bursts * 1_000
+}
+
 /// Submit `count` requests concurrently from their own tasks.
-fn burst(q: &Q, gateway: usize, count: i64, retry: bool) -> Vec<JoinHandle<Answer>> {
-    let base = {
-        let mut shared = q.shared.lock().unwrap();
-        shared.bursts += 1;
-        400_000 + shared.bursts * 1_000
-    };
+fn burst(q: &Q, gateway: usize, count: i64, retry: bool) -> Vec<JoinHandle<()>> {
+    let base = fresh_values(q);
     (0..count)
         .map(|offset| {
             let q = q.clone();
@@ -1094,13 +1142,137 @@ fn burst(q: &Q, gateway: usize, count: i64, retry: bool) -> Vec<JoinHandle<Answe
                 };
                 let limit = Duration::from_secs(3);
                 if retry {
-                    drive(&q, node, gateway, &req, true, true, limit).await
+                    drive(&q, node, gateway, &req, true, true, limit).await;
                 } else {
-                    send(&q, node, GATEWAYS[gateway], &req, true, true, limit).await
+                    send(&q, node, GATEWAYS[gateway], &req, true, true, limit).await;
                 }
             })
         })
         .collect()
+}
+
+/// Wait for tasks. A panic in one is a violation, so that a lost client never reads as a quiet
+/// one.
+async fn join(cluster: &Cluster, tasks: Vec<JoinHandle<()>>) {
+    for task in tasks {
+        if let Err(error) = task.await
+            && error.is_panic()
+        {
+            cluster.checks.violate(
+                &cluster.world,
+                "Panic",
+                format!("a client task of the queued workload panicked: {error}"),
+            );
+        }
+    }
+}
+
+/// Wait until `wanted` requests sent since `since` were accepted, or `limit` ends.
+async fn wait_accepted(q: &Q, since: u64, wanted: usize, limit: Duration) {
+    let give_up = q.now() + limit.as_millis() as u64;
+    loop {
+        let accepted = q
+            .shared
+            .lock()
+            .unwrap()
+            .log
+            .accepted()
+            .values()
+            .filter(|submission| submission.invoked >= since)
+            .count();
+        if accepted >= wanted || q.now() >= give_up {
+            return;
+        }
+        time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// Follow the newest accepted requests that nobody has seen settled, from now on: this is what
+/// tells whether a fault met open work.
+fn watch(q: &Q, tasks: &mut Vec<JoinHandle<()>>) {
+    let open: Vec<Open> = {
+        let shared = q.shared.lock().unwrap();
+        let run = shared.log.runs.last().expect("a run").id;
+        let settled: BTreeSet<Uuid> = shared
+            .log
+            .lookups
+            .iter()
+            .filter(|lookup| !matches!(lookup.seen, Seen::Pending | Seen::Unknown))
+            .map(|lookup| lookup.id)
+            .collect();
+        let mut seen = BTreeSet::new();
+        shared
+            .open
+            .iter()
+            .rev()
+            .filter(|open| open.run == run && !settled.contains(&open.req.body.id))
+            .filter(|open| seen.insert(open.req.body.id))
+            .take(WATCHED)
+            .cloned()
+            .collect()
+    };
+    for (index, open) in open.into_iter().enumerate() {
+        let q = q.clone();
+        tasks.push(nabedra_rt::task::spawn(async move {
+            let node = CLIENTS[index % CLIENTS.len()];
+            poll(&q, node, index % 2, open.run, &open.req, 40).await;
+        }));
+    }
+}
+
+/// The ready workers that `node` reports from Control, in the current run.
+async fn ready_workers(cluster: &Cluster, node: u64) -> Option<u64> {
+    let reply = request(
+        BOOTSTRAP_CLIENT,
+        node,
+        "/health/ready",
+        &cluster.config.data_token,
+        None,
+        READY_LIMIT,
+    )
+    .await
+    .ok()?;
+    if reply.status != 200 || reply.body["run_id"] != json!(cluster.config.run_id) {
+        return None;
+    }
+    reply.body["ready_workers"].as_u64()
+}
+
+/// Freeze workers, submit while they are frozen, and note the window. The workers stay frozen.
+async fn freeze(
+    q: &Q,
+    cluster: &mut Cluster,
+    nodes: &[u64],
+    hold: Duration,
+    bursts: &mut Vec<JoinHandle<()>>,
+) {
+    for &node in nodes {
+        if !cluster.frozen().contains(&node) {
+            cluster.freeze(node);
+        }
+    }
+    let from = q.now() + 1;
+    time::sleep(Duration::from_millis(2)).await;
+    bursts.extend(burst(q, 0, 6, true));
+    if nodes.len() > 1 && q.peek_defect(Defect::EarlyAccept) {
+        seed_early_accept(q).await;
+    }
+    time::sleep(hold).await;
+    let to = q.now();
+    let running = WORKERS
+        .into_iter()
+        .find(|node| !nodes.contains(node))
+        .expect("a running worker");
+    let ready = ready_workers(cluster, running).await;
+    cluster.record(format!(
+        "queued: {nodes:?} frozen, n{running} reports {ready:?} ready workers"
+    ));
+    q.shared.lock().unwrap().log.frozen.push(Frozen {
+        nodes: nodes.to_vec(),
+        from,
+        to,
+        ready,
+    });
 }
 
 /// The shared nemesis has nothing open, every process runs and the cluster reports itself
@@ -1112,12 +1284,7 @@ async fn quiet(cluster: &Cluster, chaos: Option<&Chaos>, faults: &NetFaults) -> 
         && cluster.converged().await
 }
 
-async fn apply(
-    q: &Q,
-    cluster: &mut Cluster,
-    due: &Scheduled,
-    bursts: &mut Vec<JoinHandle<Answer>>,
-) {
+async fn apply(q: &Q, cluster: &mut Cluster, due: &Scheduled, bursts: &mut Vec<JoinHandle<()>>) {
     cluster.record(format!("queued fault {:?} hold {:?}", due.fault, due.hold));
     q.history().marker(
         &cluster.world,
@@ -1128,76 +1295,65 @@ async fn apply(
         Fault::FreezeAndKill { two, kill } => {
             let first = WORKERS[due.pick as usize];
             let mut frozen = vec![first];
+            // Two frozen workers also take the Control quorum, so nothing is accepted whatever
+            // the copies do. One frozen worker leaves the copies as the only obstacle, so every
+            // seed freezes one alone.
+            freeze(q, cluster, &frozen, due.hold, bursts).await;
             if two {
+                cluster.thaw(first);
+                time::sleep(due.hold / 4).await;
                 frozen.push(WORKERS[(due.pick as usize + 1) % 3]);
-            }
-            for &node in &frozen {
-                cluster.freeze(node);
-            }
-            let from = q.now() + 1;
-            time::sleep(Duration::from_millis(2)).await;
-            let scoped = q.mode.scoped;
-            bursts.extend(burst(q, 0, 6, true));
-            if two && q.peek_defect(Defect::EarlyAccept) {
-                seed_early_accept(q).await;
-            }
-            time::sleep(due.hold).await;
-            match (two, scoped) {
-                (true, true) => q.candidate("O30:two-holders-delayed"),
-                (true, false) => q.candidate("Q03:two-frozen"),
-                (false, true) => q.candidate("O30:third-holder-delayed"),
-                (false, false) => q.candidate("Q03:one-frozen"),
-            }
-            if kill != Kill::Nothing {
-                q.candidate("Q03:coordinator-killed");
+                freeze(q, cluster, &frozen, due.hold, bursts).await;
             }
             let killed = match kill {
                 Kill::Nothing => None,
                 Kill::Gateway => Some(GATEWAYS[0]),
                 Kill::Worker => WORKERS.into_iter().find(|node| !frozen.contains(node)),
             };
-            if two {
-                q.shared
-                    .lock()
-                    .unwrap()
-                    .log
-                    .two_frozen
-                    .push((from, q.now()));
-            }
             if let Some(node) = killed {
                 let cut = if due.power && kill == Kill::Worker {
                     DiskCut::Power
                 } else {
                     DiskCut::Kill
                 };
+                q.mark(Mark::CoordinatorKilled {
+                    gateway: (kill == Kill::Gateway).then_some(node),
+                });
+                if kill == Kill::Worker {
+                    q.mark(Mark::WorkerKilled);
+                }
                 cluster.crash(node, cut).await;
+                watch(q, bursts);
             }
             for node in frozen {
                 cluster.thaw(node);
             }
             match (kill, killed) {
                 (Kill::Gateway, Some(node)) => {
-                    restart(cluster, Target::Gateway(node)).await;
+                    restart(q, cluster, Target::Gateway(node)).await;
                 }
                 (Kill::Worker, Some(node)) => {
-                    restart(cluster, Target::Worker(node, due.power)).await;
+                    restart(q, cluster, Target::Worker(node, due.power)).await;
                 }
                 _ => {}
             }
         }
         Fault::RestartApis => {
-            bursts.extend(burst(q, 1, 6, true));
-            time::sleep(Duration::from_millis(20)).await;
-            q.candidate("Q04:api-restart");
+            let since = q.now();
+            bursts.extend(burst(q, 1, BACKLOG, true));
+            wait_accepted(q, since, 3, ACCEPT_WAIT).await;
+            q.mark(Mark::ApiRestart);
             for node in GATEWAYS {
                 cluster.kill_gateway(node).await;
+                watch(q, bursts);
                 time::sleep(due.hold / 4).await;
-                restart(cluster, Target::Gateway(node)).await;
+                restart(q, cluster, Target::Gateway(node)).await;
             }
         }
         Fault::Rolling => {
-            bursts.extend(burst(q, 0, 9, true));
-            time::sleep(due.hold / 8).await;
+            let since = q.now();
+            bursts.extend(burst(q, 0, BACKLOG, true));
+            wait_accepted(q, since, 3, ACCEPT_WAIT).await;
             let mut order = WORKERS;
             order.rotate_left(due.pick as usize);
             let mut all = true;
@@ -1208,20 +1364,26 @@ async fn apply(
                 } else {
                     DiskCut::Kill
                 };
+                q.mark(Mark::WorkerKilled);
                 cluster.crash(node, cut).await;
-                all &= restart(cluster, Target::Worker(node, due.power)).await;
+                watch(q, bursts);
+                all &= restart(q, cluster, Target::Worker(node, due.power)).await;
                 if !all {
                     break;
                 }
             }
-            if all {
-                for name in [
-                    "R01:worker-killed",
-                    "R03:rolling-restart",
-                    "O14:rolling-restart",
-                ] {
-                    q.shared.lock().unwrap().candidates.push((name, first_stop));
+            let end = q.now();
+            {
+                let mut shared = q.shared.lock().unwrap();
+                shared.windows.push(("rolling restart", first_stop, end));
+                if all {
+                    shared.marks.push((Mark::Rolling { end }, first_stop));
                 }
+            }
+            watch(q, bursts);
+            if all {
+                // The oldest requests too: their receipts outlived every first holder.
+                relook(q, first_stop).await;
             }
         }
     }
@@ -1232,10 +1394,44 @@ enum Target {
     Worker(u64, bool),
 }
 
-/// Restart one process. A failure is the run's `Liveness` violation.
-async fn restart(cluster: &mut Cluster, target: Target) -> bool {
+/// Look up some requests that were accepted before `at`, once each.
+async fn relook(q: &Q, at: u64) {
+    let run = q.shared.lock().unwrap().log.runs.last().expect("a run").id;
+    let open: Vec<Open> = {
+        let shared = q.shared.lock().unwrap();
+        let before: BTreeMap<Uuid, u64> = shared
+            .log
+            .accepted()
+            .into_iter()
+            .filter(|((accepted, _), submission)| *accepted == run && submission.completed <= at)
+            .map(|((_, id), submission)| (id, submission.completed))
+            .collect();
+        let mut seen = BTreeSet::new();
+        shared
+            .open
+            .iter()
+            .rev()
+            .filter(|open| open.run == run && before.contains_key(&open.req.body.id))
+            .filter(|open| seen.insert(open.req.body.id))
+            .take(WATCHED)
+            .cloned()
+            .collect()
+    };
+    for (index, open) in open.iter().enumerate() {
+        let node = CLIENTS[index % CLIENTS.len()];
+        lookup(q, node, GATEWAYS[index % 2], run, &open.req).await;
+    }
+}
+
+/// Restart one process. A failure is the run's `Liveness` violation. A gateway is started again
+/// as its supervisor does (lead decision 18); a worker has one start.
+async fn restart(q: &Q, cluster: &mut Cluster, target: Target) -> bool {
     let (node, result) = match target {
-        Target::Gateway(node) => (node, cluster.restart_gateway(node).await),
+        Target::Gateway(node) => {
+            let (failed, started) = start_gateway(cluster, node).await;
+            q.shared.lock().unwrap().failed_starts.extend(failed);
+            return started;
+        }
         Target::Worker(node, power) => {
             let cut = if power { DiskCut::Power } else { DiskCut::Kill };
             (node, cluster.restart_worker(node, cut).await)
@@ -1263,6 +1459,10 @@ async fn seed_early_accept(q: &Q) {
     q.shared.lock().unwrap().log.submissions.push(Submission {
         body: req.body,
         route: Route::Queued,
+        asynchronous: true,
+        gateway: GATEWAYS[0],
+        cut: false,
+        closed: false,
         fresh: true,
         invoked: now,
         completed: now,
@@ -1295,7 +1495,6 @@ pub(crate) async fn run(
         .map_err(|error| format!("initial convergence: {error}"))?;
     if mode.scoped {
         activate_scoped(cluster).await?;
-        report.scenarios.insert("O30:scoped-active");
     }
     let table = direct::create_table(cluster, &history).await?;
     split(cluster, &table).await?;
@@ -1324,6 +1523,7 @@ pub(crate) async fn run(
         let mut shared = q.shared.lock().unwrap();
         shared.defect = Defect::from_env()?;
         shared.log.retention_ms = mode.retention_ms;
+        shared.log.scoped = mode.scoped;
         shared.log.runs.push(Run {
             id: cluster.config.run_id,
             stopped: None,
@@ -1381,6 +1581,11 @@ pub(crate) async fn run(
         }
         time::sleep(TICK).await;
     }
+    q.shared
+        .lock()
+        .unwrap()
+        .windows
+        .push(("chaos window", start, elapsed_ms(&cluster.world)));
     // A fault that found no quiet moment runs now, after the heal and with the clients still
     // sending, so every seed runs each of them.
     q.shared.lock().unwrap().last_turn = q.now();
@@ -1390,7 +1595,7 @@ pub(crate) async fn run(
         cluster
             .checks
             .violate(&cluster.world, "Liveness", format!("heal: {error}"));
-        return abandon(cluster, &q, tasks, bursts, report).await;
+        return abandon(cluster, &q, tasks, bursts, Some(chaos), report).await;
     }
     follow_run(&q, cluster);
     let late = schedule.len();
@@ -1401,7 +1606,7 @@ pub(crate) async fn run(
                 "Liveness",
                 format!("before {:?}: {error}", due.fault),
             );
-            return abandon(cluster, &q, tasks, bursts, report).await;
+            return abandon(cluster, &q, tasks, bursts, chaos.as_ref(), report).await;
         }
         apply(&q, cluster, &due, &mut bursts).await;
     }
@@ -1417,17 +1622,13 @@ pub(crate) async fn run(
         cluster
             .checks
             .violate(&cluster.world, "Liveness", format!("heal: {error}"));
-        return abandon(cluster, &q, tasks, bursts, report).await;
+        return abandon(cluster, &q, tasks, bursts, chaos.as_ref(), report).await;
     }
-    let finishing = async {
-        for task in tasks {
-            let _ = task.await;
-        }
-        for task in std::mem::take(&mut bursts) {
-            let _ = task.await;
-        }
-    };
-    tokio::join!(finishing, observe(&q, cluster.config.run_id));
+    tasks.append(&mut bursts);
+    tokio::join!(
+        join(cluster, tasks),
+        observe(&q, cluster, cluster.config.run_id)
+    );
     settle(&q, cluster).await;
     reread(&q, cluster.config.run_id).await;
     copies(&q, cluster).await;
@@ -1472,21 +1673,20 @@ pub(crate) async fn run(
 async fn abandon(
     cluster: &mut Cluster,
     q: &Q,
-    tasks: Vec<JoinHandle<()>>,
-    bursts: Vec<JoinHandle<Answer>>,
+    mut tasks: Vec<JoinHandle<()>>,
+    mut bursts: Vec<JoinHandle<()>>,
+    chaos: Option<&Chaos>,
     mut report: direct::Report,
 ) -> Result<direct::Report, String> {
     q.ctx.converge_by.store(0, Ordering::Release);
-    for task in tasks {
+    tasks.append(&mut bursts);
+    for task in &tasks {
         task.abort();
-        let _ = task.await;
     }
-    for task in bursts {
-        task.abort();
-        let _ = task.await;
-    }
+    join(cluster, tasks).await;
     cluster.record("workload abandoned after a liveness violation".into());
-    finish(q, cluster, None, &mut report);
+    finish(q, cluster, chaos, &mut report);
+    report.summary["abandoned"] = json!(true);
     Ok(report)
 }
 
@@ -1500,8 +1700,7 @@ fn finish(q: &Q, cluster: &Cluster, chaos: Option<&Chaos>, report: &mut direct::
             .filter(|fault| fault.action == Action::Clock)
             .count() as u64
     });
-    // Each wall jump moves a clock by at most 2 s; drift adds well under a second.
-    shared.log.clock_slack_ms = 2_000 * (jumps + 1) + 1_000;
+    shared.log.clock_slack_ms = clock_slack(jumps);
     let outcome = shared.log.judge();
     // The violation list of a run is bounded. A rule that fires often must not crowd the others
     // out of it, so each rule reports its first few and how many there were.
@@ -1526,19 +1725,50 @@ fn finish(q: &Q, cluster: &Cluster, chaos: Option<&Chaos>, report: &mut direct::
             report.assertions.push((rule, held));
         }
     }
-    let mut candidates = std::mem::take(&mut shared.candidates);
+    let mut marks = shared.marks.clone();
     for fault in chaos.iter().flat_map(|chaos| &chaos.log) {
-        let name = match fault.action {
-            Action::Partition | Action::LeaderMove => "R05:partition",
-            Action::LostReply | Action::LostHttpReply => "Q06:lost-terminal",
+        let mark = match fault.action {
+            Action::Partition | Action::LeaderMove => Mark::Partition,
+            Action::LostReply | Action::LostHttpReply => Mark::LostReply {
+                to: fault.to.unwrap_or(u64::MAX),
+            },
             _ => continue,
         };
-        candidates.push((name, fault.from));
+        marks.push((mark, fault.from));
     }
-    for (name, at) in candidates {
-        if shared.log.open_across(at) {
-            shared.clauses.insert(name);
+    let facts = Facts {
+        log: &shared.log,
+        direct: q.mode.direct,
+        marks: &marks,
+        stop: shared.stop,
+    };
+    report.scenarios.extend(facts.clauses());
+    let mut worked = BTreeMap::new();
+    for &(name, from, to) in &shared.windows {
+        let work = Work::of(&shared.log, from, to);
+        let missing = progress(name, &work);
+        if !missing.is_empty() {
+            cluster.checks.violate(
+                &cluster.world,
+                "Progress",
+                format!(
+                    "{name}, {from}ms to {to}ms: no {} in {} attempts",
+                    missing.join(", no "),
+                    work.attempts
+                ),
+            );
         }
+        worked.insert(
+            format!("{name} {from}"),
+            json!({
+                "ms": to - from,
+                "attempts": work.attempts,
+                "writes": work.writes,
+                "reads": work.reads,
+                "settled": work.settled,
+                "longest_gap_ms": work.gap_ms,
+            }),
+        );
     }
     if shared.undecided > 0 {
         cluster.checks.violate(
@@ -1554,7 +1784,6 @@ fn finish(q: &Q, cluster: &Cluster, chaos: Option<&Chaos>, report: &mut direct::
     report
         .assertions
         .push(("every submission answered", shared.undecided == 0));
-    report.scenarios.extend(shared.clauses.iter().copied());
     report.summary = json!({
         "workload": Workload::Queued.name(),
         "judged": outcome.judged,
@@ -1565,9 +1794,30 @@ fn finish(q: &Q, cluster: &Cluster, chaos: Option<&Chaos>, report: &mut direct::
         "undecided": shared.undecided,
         "terminal_regressions": shared.log.regressions(),
         "runs": shared.log.runs.len(),
-        "two_frozen": shared.log.two_frozen.len(),
+        "frozen": shared.log.frozen.len(),
         "outside_contract": shared.outside,
+        "work": worked,
+        "failed_gateway_starts": shared.failed_starts,
+        "not_compared": shared.skipped,
+        "abandoned": false,
     });
+}
+
+/// What a window with sending clients must have completed and did not (lead decision 17). The
+/// chaos window needs one request that was accepted and settled as well: without one the queue
+/// was not exercised. A rolling restart stops one worker at a time (OLTP-G10: "Writes stay
+/// available with one voter paused or lost").
+fn progress(window: &str, work: &Work) -> Vec<&'static str> {
+    let queue = window == "chaos window";
+    [
+        ("write committed", work.writes == 0),
+        ("read answered", work.reads == 0),
+        ("accepted request settled", queue && work.settled == 0),
+    ]
+    .into_iter()
+    .filter(|(_, missing)| *missing)
+    .map(|(name, _)| name)
+    .collect()
 }
 
 /// Note a full stop that the shared nemesis did, by its new run.
@@ -1586,7 +1836,6 @@ fn follow_run(q: &Q, cluster: &Cluster) {
         id: run,
         stopped: None,
     });
-    shared.clauses.insert("R04:full-stop");
 }
 
 /// The range this workload's setup split is the one that the shared `split` action splits, so
@@ -1676,7 +1925,7 @@ async fn never_submitted(q: Q) {
 
 /// Look up every unsettled receipt of `run` until none is left or the budget ends. Returns
 /// what is left.
-async fn observe(q: &Q, run: Uuid) -> BTreeSet<Uuid> {
+async fn observe(q: &Q, cluster: &Cluster, run: Uuid) -> BTreeSet<Uuid> {
     let mut round = 0;
     loop {
         let unsettled: BTreeSet<Uuid> = {
@@ -1710,9 +1959,7 @@ async fn observe(q: &Q, run: Uuid) -> BTreeSet<Uuid> {
                     })
                 })
                 .collect();
-            for lookup in lookups {
-                let _ = lookup.await;
-            }
+            join(cluster, lookups).await;
         }
         round += 1;
         time::sleep(Duration::from_millis(200)).await;
@@ -1723,7 +1970,7 @@ async fn observe(q: &Q, run: Uuid) -> BTreeSet<Uuid> {
 /// within the convergence bound (design 3.7, `Liveness`).
 async fn settle(q: &Q, cluster: &Cluster) {
     let run = cluster.config.run_id;
-    let unsettled = observe(q, run).await;
+    let unsettled = observe(q, cluster, run).await;
     let shared = q.shared.lock().unwrap();
     let total = unsettled.len();
     for id in unsettled.into_iter().take(3) {
@@ -1767,41 +2014,81 @@ async fn reread(q: &Q, run: Uuid) {
     }
 }
 
+/// One worker's queue counters: accepted records, and records that are not terminal.
+async fn counters(cluster: &Cluster, node: u64) -> Result<(u64, u64), String> {
+    let stats = cluster.stats(node).await?;
+    let count = |field: &str| {
+        stats["queue"][field]
+            .as_u64()
+            .ok_or_else(|| format!("n{node} stats have no queue.{field}"))
+    };
+    let pending =
+        count("queued_records")? + count("running_records")? + count("reconciling_records")?;
+    Ok((count("accepted_records")?, pending))
+}
+
+/// The accepted records of every worker, at a point from which the count can only grow: results
+/// of a long retention do not expire within a run, and with a short one this waits until every
+/// older result has.
+async fn baseline(q: &Q, cluster: &Cluster) -> Result<BTreeMap<u64, u64>, String> {
+    let give_up = q.now() + q.mode.retention_ms + 10_000;
+    loop {
+        let mut counts = BTreeMap::new();
+        for node in WORKERS {
+            counts.insert(node, counters(cluster, node).await?.0);
+        }
+        let empty = counts.values().all(|count| *count == 0);
+        if empty || q.mode.retention_ms >= LONG_RETENTION_MS {
+            return Ok(counts);
+        }
+        if q.now() >= give_up {
+            return Err(format!("older records did not expire: {counts:?}"));
+        }
+        time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// At a quiet point, every ready worker of the legacy protocol holds every request that was
 /// accepted since (plan: "to all ready workers before acknowledging acceptance"). Only those:
 /// a worker that joined later need not hold older settled records.
 async fn copies(q: &Q, cluster: &Cluster) {
-    if q.mode.scoped || !cluster.converged().await {
+    if q.mode.scoped {
         return;
     }
+    let before = match baseline(q, cluster).await {
+        Ok(before) if cluster.converged().await => before,
+        Ok(_) => return q.skip(cluster, "copies: the cluster was not converged".into()),
+        Err(error) => return q.skip(cluster, format!("copies: {error}")),
+    };
     let since = q.now();
-    for task in burst(q, 0, 12, false) {
-        let _ = task.await;
-    }
-    let before = q.now();
-    let mut counters = Vec::new();
+    join(cluster, burst(q, 0, 12, false)).await;
+    let sent = q.now();
+    let mut after = Vec::new();
     for node in WORKERS {
-        if let Ok(stats) = cluster.stats(node).await
-            && let Some(records) = stats["queue"]["accepted_records"].as_u64()
-        {
-            counters.push((node, records));
+        match counters(cluster, node).await {
+            Ok(counts) => after.push((node, counts)),
+            Err(error) => return q.skip(cluster, format!("copies: {error}")),
         }
     }
     let at = q.now();
+    // Nothing joined or left: the workers of the count before are the ready ones.
     if !cluster.converged().await {
-        return;
+        return q.skip(cluster, "copies: the cluster changed".into());
     }
-    let required = required(q, cluster.config.run_id, since, before, at);
-    for (node, accepted_records) in counters {
+    let required = required(q, cluster.config.run_id, since, sent, at);
+    cluster.record(format!(
+        "queued copies: {required} accepted, before {before:?}, after {after:?}"
+    ));
+    for (node, (accepted, pending)) in after {
         q.shared.lock().unwrap().log.retained.push(Retained {
             node,
+            holder: Holder::Ready,
             required,
-            accepted_records,
+            before: before[&node],
+            after: accepted,
+            pending,
             at,
         });
-    }
-    if required > 0 {
-        q.clause("Q03:copies-on-every-ready-worker");
     }
     settle(q, cluster).await;
 }
@@ -1856,31 +2143,59 @@ async fn final_reads(q: &Q) -> Result<(), String> {
     Err(format!("{total} final reads failed: {}", failed.join("; ")))
 }
 
+/// Accept and settle one upsert of `key`, and read it.
+async fn settled_upsert(q: &Q, key: i64, value: i64) -> Option<Open> {
+    let node = CLIENTS[0];
+    let limit = Duration::from_secs(5);
+    let req = Req::row(
+        "table.upsert",
+        &q.ctx.table,
+        fresh_id(node).await,
+        key,
+        value,
+    );
+    let Answer::Accepted(run) = send(q, node, GATEWAYS[0], &req, true, true, limit).await else {
+        return None;
+    };
+    if !matches!(
+        poll(q, node, 0, run, &req, 40).await,
+        Seen::Terminal(Terminal::Succeeded(_))
+    ) {
+        return None;
+    }
+    let get = Req::get(&q.ctx.table, fresh_id(node).await, key);
+    send(q, node, GATEWAYS[1], &get, false, true, limit).await;
+    Some(Open { run, req })
+}
+
 /// Q06: past the retention, look a settled receipt up and send its identity again. The answer
-/// is an explicit expiry or the original result, and a mutation does not run again.
+/// is an explicit expiry or the original result, and a mutation does not run again. Some of the
+/// mutations were replaced by a newer value of their key, so that a second run is visible.
 async fn expire(q: &Q) {
-    if q.mode.retention_ms > 60_000 {
+    if q.mode.retention_ms >= LONG_RETENTION_MS {
         return;
     }
+    let mut settled: Vec<Open> = Vec::new();
+    let values = fresh_values(q);
+    for (index, key) in [1, BOUNDARY + 1, 2, BOUNDARY + 2].into_iter().enumerate() {
+        let value = values + 10 * index as i64;
+        let old = settled_upsert(q, key, value).await;
+        let new = settled_upsert(q, key, value + 1).await;
+        if let (Some(old), Some(_)) = (old, new) {
+            settled.push(old);
+        }
+    }
     time::sleep(Duration::from_millis(q.mode.retention_ms + 6_000)).await;
-    let settled: Vec<Open> = {
+    {
         let shared = q.shared.lock().unwrap();
         let run = shared.log.runs.last().expect("a run").id;
-        shared
-            .open
-            .iter()
-            .rev()
-            .filter(|open| open.run == run)
-            .take(8)
-            .cloned()
-            .collect()
-    };
-    let mut expired = false;
+        let newest = shared.open.iter().rev();
+        settled.extend(newest.filter(|open| open.run == run).take(8).cloned());
+    }
     for (index, open) in settled.iter().enumerate() {
         let node = CLIENTS[index % CLIENTS.len()];
         let gateway = index % 2;
-        let seen = lookup(q, node, GATEWAYS[gateway], open.run, &open.req).await;
-        expired |= seen == Seen::Missing;
+        lookup(q, node, GATEWAYS[gateway], open.run, &open.req).await;
         let limit = Duration::from_secs(5);
         let asynchronous = index % 3 != 0;
         let answer = send(
@@ -1897,9 +2212,6 @@ async fn expire(q: &Q) {
             poll(q, node, gateway, run, &open.req, 40).await;
         }
     }
-    if expired {
-        q.clause("Q06:expired-receipt");
-    }
     // Whatever ran again would have replaced a newer value.
     let _ = final_reads(q).await;
 }
@@ -1910,6 +2222,17 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
         return Err("the cluster was not converged before the stop".into());
     }
     let old = cluster.config.run_id;
+    let before = if finale == Finale::LastHolder {
+        match baseline(q, cluster).await {
+            Ok(before) => Some(before),
+            Err(error) => {
+                q.skip(cluster, format!("last holder: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
     let power = g.bool();
     let cut = if power { DiskCut::Power } else { DiskCut::Kill };
     // A backlog: with two worker threads, most of these are still pending when the workers stop.
@@ -1927,7 +2250,7 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
         time::sleep(Duration::from_millis(2)).await;
     }
     if finale == Finale::LastHolder {
-        last_holder(q, cluster, cut, since, g).await;
+        last_holder(q, cluster, cut, since, before, g).await;
     }
     let begun = q.now();
     q.history().marker(
@@ -1945,24 +2268,21 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
     let cold = cluster
         .cold_start_staggered("queued finale", cut, delays, COLD_LIMIT)
         .await;
-    for task in tasks {
-        let _ = task.await;
-    }
+    join(cluster, tasks).await;
     cold.map_err(|error| format!("cold start: {error}"))?;
     let run = cluster.config.run_id;
-    for node in WORKERS {
-        let stats = cluster.stats(node).await?;
-        let pending: u64 = ["queued_records", "running_records", "reconciling_records"]
-            .iter()
-            .filter_map(|field| stats["queue"][*field].as_u64())
-            .sum();
-        let fresh = Fresh {
-            node,
-            run,
-            pending_records: pending,
-            at: q.now(),
-        };
-        q.shared.lock().unwrap().log.fresh_runs.push(fresh);
+    // The counters are the legacy queue's alone, so they say nothing about a scoped one.
+    if !q.mode.scoped {
+        for node in WORKERS {
+            let (_, pending_records) = counters(cluster, node).await?;
+            let fresh = Fresh {
+                node,
+                run,
+                pending_records,
+                at: q.now(),
+            };
+            q.shared.lock().unwrap().log.fresh_runs.push(fresh);
+        }
     }
     q.shared.lock().unwrap().log.runs.push(Run {
         id: run,
@@ -1990,7 +2310,7 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
             q.count(match &seen {
                 Seen::Abandoned => "old receipt abandoned",
                 Seen::Terminal(Terminal::Succeeded(_)) => "old receipt succeeded",
-                Seen::Terminal(Terminal::Failed(_)) => "old receipt failed",
+                Seen::Terminal(Terminal::Failed { .. }) => "old receipt failed",
                 Seen::Missing => "old receipt missing",
                 Seen::Pending => "old receipt pending",
                 Seen::Unknown => "old receipt unknown",
@@ -2023,35 +2343,39 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
             }
         }
     }
-    q.clause("R04:full-stop");
-    if q.mode.scoped {
-        q.clause("O32:full-stop");
-    }
-    if abandoned > 0 {
-        q.clause("R04:abandoned");
-    }
     cluster.record(format!("queued finale: {abandoned} mutations abandoned"));
     if q.take_defect(Defect::ReplayAbandoned) {
         replay_abandoned(q).await;
     }
     // Time for a replay to run, then the reads that would see it.
     time::sleep(Duration::from_secs(3)).await;
-    final_reads(q).await?;
+    let reread = final_reads(q).await;
+    q.shared.lock().unwrap().stop = Some(Stop {
+        run: old,
+        at: begun,
+        reread: reread.is_ok(),
+    });
+    reread?;
     // The new run accepts and settles work of its own.
     q.ctx.converge_by.store(
         q.now() + direct::CONVERGE_LIMIT.as_millis() as u64,
         Ordering::Release,
     );
-    for task in burst(q, 1, 3, true) {
-        let _ = task.await;
-    }
+    join(cluster, burst(q, 1, 3, true)).await;
     settle(q, cluster).await;
     q.ctx.converge_by.store(u64::MAX, Ordering::Release);
     Ok(())
 }
 
 /// R02: stop two workers one after the other. The last one keeps every accepted request.
-async fn last_holder(q: &Q, cluster: &mut Cluster, cut: DiskCut, since: u64, g: &mut Gen) {
+async fn last_holder(
+    q: &Q,
+    cluster: &mut Cluster,
+    cut: DiskCut,
+    since: u64,
+    before: Option<BTreeMap<u64, u64>>,
+    g: &mut Gen,
+) {
     let mut order = WORKERS;
     order.rotate_left(g.below(3) as usize);
     let [first, second, last] = order;
@@ -2064,28 +2388,30 @@ async fn last_holder(q: &Q, cluster: &mut Cluster, cut: DiskCut, since: u64, g: 
     cluster.crash(second, cut).await;
     for pause_ms in [1, 2_000] {
         time::sleep(Duration::from_millis(pause_ms)).await;
-        let Ok(stats) = cluster.stats(last).await else {
-            cluster.record(format!("last holder n{last} did not answer stats"));
-            continue;
-        };
-        let Some(accepted_records) = stats["queue"]["accepted_records"].as_u64() else {
-            continue;
+        let (accepted, pending) = match counters(cluster, last).await {
+            Ok(counts) => counts,
+            Err(error) => {
+                q.skip(cluster, format!("last holder: {error}"));
+                continue;
+            }
         };
         let at = q.now();
         let required = required(q, run, since, stopping, at);
         cluster.record(format!(
-            "last holder n{last}: {accepted_records} records, {required} required"
+            "last holder n{last}: {before:?} before, {accepted} records, {pending} pending, {required} required"
         ));
+        let Some(before) = before.as_ref().map(|before| before[&last]) else {
+            continue;
+        };
         q.shared.lock().unwrap().log.retained.push(Retained {
             node: last,
+            holder: Holder::Last,
             required,
-            accepted_records,
+            before,
+            after: accepted,
+            pending,
             at,
         });
-        if required > 0 {
-            q.clause("R02:last-holder");
-            q.clause("O14:last-copy");
-        }
     }
 }
 
@@ -2550,13 +2876,48 @@ mod tests {
         );
         let error = json!({"code": "conflict", "message": "m", "outcome": "not_applied"});
         let (seen, failed) = parse(body("failed", Value::Null, error)).unwrap();
-        assert_eq!(seen, Seen::Terminal(Terminal::Failed("conflict".into())));
+        assert_eq!(seen, Seen::Terminal(Terminal::failed("conflict")));
         assert_eq!(failed.unwrap().outcome, Applied::NotApplied);
+        let error = json!({"code": "storage_unavailable", "message": "m", "outcome": "unknown"});
+        let (seen, _) = parse(body("failed", Value::Null, error)).unwrap();
+        assert!(matches!(&seen, Seen::Terminal(terminal) if !terminal.decided()));
         assert!(parse(body("running", json!(1), Value::Null)).is_err());
         assert!(parse(body("failed", Value::Null, Value::Null)).is_err());
         assert!(parse(body("bogus", Value::Null, Value::Null)).is_err());
         assert!(receipt(&body("running", Value::Null, Value::Null), id, run).is_err());
         assert!(parse(json!({"state": "running"})).is_err());
+    }
+
+    /// Decision 17: 10 of 15 rolling restarts completed nothing (review 132, M5).
+    #[test]
+    fn a_window_without_work_is_not_progress() {
+        let work = |writes, reads, settled| Work {
+            attempts: 9,
+            writes,
+            reads,
+            settled,
+            gap_ms: 0,
+        };
+        assert!(progress("chaos window", &work(1, 1, 1)).is_empty());
+        assert_eq!(progress("chaos window", &work(0, 0, 0)).len(), 3);
+        assert_eq!(
+            progress("chaos window", &work(1, 1, 0)),
+            ["accepted request settled"]
+        );
+        assert!(progress("rolling restart", &work(1, 1, 0)).is_empty());
+        assert_eq!(
+            progress("rolling restart", &work(0, 1, 0)),
+            ["write committed"]
+        );
+    }
+
+    #[test]
+    fn only_a_lost_connection_is_a_cut() {
+        assert!(cut(
+            "HTTP reply: connection closed before message completed"
+        ));
+        assert!(!cut("connect n101: refused"));
+        assert!(!cut("HTTP n101 /v1/requests deadline"));
     }
 
     #[test]
