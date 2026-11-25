@@ -54,8 +54,7 @@ pub(crate) async fn run(
 ) -> Result<Report, String> {
     cluster.wait_direct().await?;
     let table = create_table(cluster, &history).await?;
-    for node in WORKERS {
-        let stats = cluster.stats(node).await?;
+    for (node, stats) in crate::workload::steady(cluster).await? {
         cluster
             .checks
             .capture_resources(&cluster.world, node, &stats);
