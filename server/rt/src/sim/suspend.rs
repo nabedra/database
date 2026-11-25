@@ -471,7 +471,7 @@ impl Suspended {
 
 impl Ends {
     fn set(&mut self, stop: Stop) {
-        // Code stopped at a clock read goes on at the next poll: its node is frozen.
+        // Code stopped at a clock read has no time of its own: it goes on at the thaw.
         let hold = match stop.at {
             At::Call(_) => stop.hold,
             At::Clock => Some(Duration::ZERO),
@@ -545,6 +545,7 @@ impl<R> Parked<R> {
     async fn finish(self) -> std::thread::Result<R> {
         loop {
             self.job.due().await;
+            self.thawed().await;
             if let Some(outcome) = taken(&self.slot) {
                 return outcome;
             }
@@ -553,6 +554,25 @@ impl<R> Parked<R> {
             };
             self.job.advance(&world, Resume::Run);
         }
+    }
+
+    /// Returns once a job that stands at a clock read may go on, which is when its node
+    /// thaws. A task of the node can be in the middle of the poll that started or resumed
+    /// the job, so the task's own gate does not see to it.
+    async fn thawed(&self) {
+        std::future::poll_fn(|cx| {
+            let at_read = {
+                let ends = lock(&self.job.ends);
+                matches!(ends.stop.as_ref().map(|stop| &stop.at), Some(At::Clock))
+            };
+            match self.world.upgrade() {
+                Some(world) if at_read && world.park_if_frozen(self.job.context.id, cx.waker()) => {
+                    Poll::Pending
+                }
+                _ => Poll::Ready(()),
+            }
+        })
+        .await;
     }
 }
 
