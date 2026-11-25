@@ -12,7 +12,9 @@ added. A head that changed or removed a line, rather than adding some, cannot be
 and fails.
 
 With `--binary FEATURES`, it instead builds the release server of both revisions with those
-features, at one path, and the two executables must be byte-identical. The base then
+features, at one path, and the two executables must be byte-identical once the symbol
+table and the build ID are stripped: every loaded byte, so code, data and unwind tables.
+The symbol names differ in the hash that ThinLTO appends to promoted ones. The base then
 takes the head's Cargo manifests, whose feature lists cargo passes to rustc: `cargo tree` and
 the crate graph check the manifests.
 
@@ -166,7 +168,10 @@ def executable(tree, target_dir, features):
     result = subprocess.run(command, cwd=tree / "server", env=environment(target_dir), capture_output=True, text=True)
     if result.returncode:
         raise SystemExit(f"release build [{features}] failed:\n{result.stderr[-4000:]}")
-    return (target_dir / "release/nabedra-db").read_bytes()
+    built, stripped = target_dir / "release/nabedra-db", target_dir / "stripped"
+    subprocess.run(["objcopy", "--strip-all", "--remove-section=.note.gnu.build-id", str(built), str(stripped)],
+                   check=True)
+    return stripped.read_bytes()
 
 
 def compare_executables(parent, target_dir, base, head, features):
@@ -182,7 +187,7 @@ def compare_executables(parent, target_dir, base, head, features):
         git("checkout", "--force", "--detach", head, cwd=tree)
         new = executable(tree, target_dir / "binary", features)
     for label, code in (("base", old), ("head", new)):
-        print(f"{label} nabedra-db [{features}]: {len(code)} bytes, sha256 {hashlib.sha256(code).hexdigest()}")
+        print(f"{label} nabedra-db [{features}], stripped: {len(code)} bytes, sha256 {hashlib.sha256(code).hexdigest()}")
     if old != new:
         differing = sum(a != b for a, b in zip(old, new)) + abs(len(old) - len(new))
         print(f"FAILED: the release executables differ in {differing} bytes")

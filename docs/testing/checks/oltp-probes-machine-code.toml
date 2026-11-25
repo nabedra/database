@@ -2,8 +2,9 @@ id = "oltp-probes-machine-code"
 module = "oltp"
 kinds = ["U"]
 # P10-PROBES changed no machine code of the OLTP engine: the release server of both revisions, built
-# at one path with the OLTP features, is the same file, byte for byte. Source lines are aligned by
-# padding the base. The other engines are covered by oltp-probes-unchanged.
+# at one path with the OLTP features, is the same file once the symbol table and the build ID are
+# stripped. Source lines are aligned by padding the base. The other engines are covered by
+# oltp-probes-unchanged.
 guarantees = []
 scenarios = []
 tiers = ["weekly"]
