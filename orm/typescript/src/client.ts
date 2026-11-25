@@ -3,6 +3,7 @@ import { ProtocolError, TransportError, ValidationError } from "./errors.js"
 import { buildLayout, sameLayout, tableLayout, wireOptions, type EmbedOptions } from "./layout.js"
 import { tableFromDescriptor, type Table } from "./table.js"
 import {
+  checkOptions,
   floatToken,
   isJsonObject,
   Transport,
@@ -205,8 +206,9 @@ export class Database {
     keyOrOptions: K | CreateTableOptions<S, K, E>,
     { format: positionalFormat }: { format?: "parquet" } = {},
   ): Promise<Table<S, K, E>> {
-    const options = typeof keyOrOptions === "object" && keyOrOptions !== null
-      ? keyOrOptions : { key: keyOrOptions, format: positionalFormat }
+    const options = typeof keyOrOptions === "object"
+      ? checkOptions(keyOrOptions, ["key", "format", "partitionBy", "fullText", "embed"])
+      : { key: keyOrOptions, format: positionalFormat }
     const { partitionBy, fullText, embed } = options as CreateTableOptions<S, K, E>
     name = validateIdentifier(name)
     const key = validateIdentifier(options.key) as K

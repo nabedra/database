@@ -6,7 +6,7 @@ import {
   batchStream, integer, streamSnapshot, type BatchStream, type StreamOptions, type StreamSnapshot,
 } from "./stream.js"
 import { tableTransport, type Table } from "./table.js"
-import { floatToken, type JsonObject } from "./transport.js"
+import { checkOptions, floatToken, isJsonObject, type JsonObject } from "./transport.js"
 import {
   decodeRow, isRecord, validateIdentifier, validateSchema,
   type Column, type Filters, type RankedColumn, type RowOf, type Scalar, type Schema,
@@ -15,6 +15,7 @@ import { columnKind } from "./vector.js"
 
 type QueryLimit = number | bigint
 type Scored = { _score: number }
+const rankNames = ["fusion", "candidates", "recall", "exact", "consistency"]
 
 export interface RankOptions {
   fusion?: "rrf" | readonly number[]
@@ -77,6 +78,7 @@ function projectedSchema(state: QueryState): Schema {
 }
 
 function rankOptions(options: RankOptions, count: number): JsonObject {
+  checkOptions(options, rankNames)
   const { fusion = "rrf", candidates = 100, recall = 0.95, exact = false, consistency = "latest" } = options
   const weighted = Array.isArray(fusion) && fusion.length === count
     && Array.from(fusion).every((weight) => typeof weight === "number" && Number.isFinite(weight) && weight >= 0)
@@ -195,8 +197,9 @@ export class Query<S extends Schema = Schema, C extends Column<S> = Column<S>, X
   rank(...values: (Ranking | RankOptions)[]): Query<S, RankedColumn<S, C>, Scored> {
     const state = stateOf(this)
     const last = values.at(-1)
-    const options = isRecord(last) ? last as RankOptions : {}
-    const rankings = isRecord(last) ? values.slice(0, -1) : values
+    const given = last === null || isJsonObject(last)
+    const options = given ? last as RankOptions : {}
+    const rankings = given ? values.slice(0, -1) : values
     if (rankings.length === 0) throw new ValidationError("Rank requires at least one ranking")
     const checked = rankOptions(options, rankings.length)
     const wire = rankings.map((ranking) => checkRanking(ranking, state.layout))
@@ -205,7 +208,8 @@ export class Query<S extends Schema = Schema, C extends Column<S> = Column<S>, X
   }
 
   /** Score the best candidates of a ranked query again with another ranking. */
-  rerank(ranking: Ranking, { candidates = 200 }: { candidates?: number } = {}): Query<S, C, X> {
+  rerank(ranking: Ranking, options?: { candidates?: number }): Query<S, C, X> {
+    const { candidates = 200 } = checkOptions(options, ["candidates"])
     const state = stateOf(this)
     if (state.rank === null) throw new ValidationError("rerank requires rank")
     integer(candidates, 1, maxCandidates, "candidates")
@@ -214,11 +218,12 @@ export class Query<S extends Schema = Schema, C extends Column<S> = Column<S>, X
 
   /** Run one ranked query per ranking and return a result list for each, in order. */
   async rankMany(
-    rankings: readonly Ranking[], { limit, ...options }: RankOptions & { limit: QueryLimit },
+    rankings: readonly Ranking[], options: RankOptions & { limit: QueryLimit },
   ): Promise<(Pick<RowOf<S>, RankedColumn<S, C>> & Scored)[][]> {
+    const { limit, ...rankSettings } = checkOptions(options, ["limit", ...rankNames])
     const state = stateOf(this)
     if (state.rank !== null) throw new ValidationError("rank_many cannot be combined with rank")
-    const checked = rankOptions(options, 1)
+    const checked = rankOptions(rankSettings, 1)
     if (!Array.isArray(rankings) || rankings.length === 0) {
       throw new ValidationError("rank_many requires a sequence of rankings")
     }

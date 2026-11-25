@@ -88,6 +88,8 @@ def value_of(item):
             return bytes(content)
         case "$sparse" | "$object":
             return {index: value_of(weight) for index, weight in content}
+        case "$set":
+            return set(content)
         case "$repeat":
             return [value_of(content[0])] * content[1]
         case "$text":

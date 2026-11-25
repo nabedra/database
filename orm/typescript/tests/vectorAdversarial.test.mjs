@@ -150,16 +150,23 @@ test("a handle serves sixteen concurrent calls with distinct request ids", async
   assert.deepEqual(new Set(fake.requests.map((item) => item.request.payload.rows.length)), new Set([100]))
 })
 
-test("a sparse reply of half a million entries decodes quickly", async (t) => {
+test("a sparse reply of half a million entries decodes in linear time", async (t) => {
+  // Time grows with size: 20 times the entries may take at most 60 times as long, plus one second.
+  // Quadratic decoding takes 400 times as long. Load slows both replies alike.
   const { fake, chunks } = await harness(t)
-  const count = 500_000
-  const indices = Buffer.from(Uint32Array.from({ length: count }, (_, index) => index).buffer).toString("base64")
-  const weights = Buffer.from(new Float32Array(count).fill(1).buffer).toString("base64")
-  fake.reset(ok(`[{"id":"a","sp":{"sparse":{"i":"${indices}","f32":"${weights}"}},"_score":0.5}]`))
-  const started = performance.now()
-  const hits = await chunks.query().rank(col("sp").dot({ 1: 1 })).select("id", "sp").limit(1).collect()
-  assert.ok(performance.now() - started < 10_000)
-  assert.equal(Object.keys(hits[0].sp).length, count)
+  async function decode(count) {
+    const indices = Buffer.from(Uint32Array.from({ length: count }, (_, index) => index).buffer).toString("base64")
+    const weights = Buffer.from(new Float32Array(count).fill(1).buffer).toString("base64")
+    fake.reset(ok(`[{"id":"a","sp":{"sparse":{"i":"${indices}","f32":"${weights}"}},"_score":0.5}]`))
+    const started = performance.now()
+    const hits = await chunks.query().rank(col("sp").dot({ 1: 1 })).select("id", "sp").limit(1).collect()
+    const elapsed = performance.now() - started
+    assert.equal(Object.keys(hits[0].sp).length, count)
+    return elapsed
+  }
+  const small = await decode(25_000)
+  const large = await decode(500_000)
+  assert.ok(large < 60 * small + 1_000, `${large} ms for 500,000 entries, ${small} ms for 25,000`)
 })
 
 test("a float that rounds up to the largest float32 is kept", async (t) => {
@@ -223,10 +230,10 @@ test("DEFECT rank ignores an option it does not know, where Python raises TypeEr
   const ranking = col("emb").cosine([1, 0, 0])
   fake.reset(ok("[]"), ok("[]"), ok("[[]]"), { applied: 0 })
   const typos = [
-    () => chunks.query().rank(ranking, { recal: 0.5 }).limit(1).collect(),
-    () => chunks.query().rank(ranking).rerank(col("mu").cosine([[1, 0]]), { candidate: 3 }).limit(1).collect(),
-    () => chunks.query().rankMany([ranking], { limit: 1, exct: true }),
-    () => chunks.upsertMany([], { waitForEmbeding: true }),
+    async () => chunks.query().rank(ranking, { recal: 0.5 }).limit(1).collect(),
+    async () => chunks.query().rank(ranking).rerank(col("mu").cosine([[1, 0]]), { candidate: 3 }).limit(1).collect(),
+    async () => chunks.query().rankMany([ranking], { limit: 1, exct: true }),
+    async () => chunks.upsertMany([], { waitForEmbeding: true }),
   ]
   for (const call of typos) {
     await assert.rejects(call, (error) => error instanceof ValidationError || error instanceof TypeError)

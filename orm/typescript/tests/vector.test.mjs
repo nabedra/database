@@ -42,6 +42,24 @@ test("a Float32Array view is accepted and copied", () => {
   }
 })
 
+test("options objects refuse unknown names and null like Python keyword arguments", async () => {
+  const query = new Query(context).limit(1)
+  const ranking = col("vec").dot([1, 2])
+  for (const call of [
+    () => query.rank(ranking, { recal: 0.5 }), () => query.rank(ranking, null),
+    () => query.rank(ranking).rerank(ranking, { candidate: 3 }), () => query.rank(ranking).rerank(ranking, null),
+    () => query.rankMany([ranking], { limit: 1, exct: true }), () => query.rankMany([ranking], null),
+    () => query.rank(ranking, { recall: 0.5, __proto__: null, extra: 1 }),
+  ]) {
+    await assert.rejects(async () => call(), TypeError)
+  }
+  assert.doesNotThrow(() => query.rank(ranking, { recall: 0.5 }).rerank(ranking, { candidates: 3 }))
+  const db = new Database({ url: "http://127.0.0.1:9", token: "test" })
+  for (const options of [{ key: "id", partition: "id" }, null]) {
+    await assert.rejects(db.createTable("t", { id: String }, options), TypeError)
+  }
+})
+
 test("rows detach every value", () => {
   const tags = ["a"]
   const tokens = [[1, 2]]

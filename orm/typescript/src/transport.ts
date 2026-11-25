@@ -334,6 +334,16 @@ export function integerNumberToken(token: string): number | bigint {
   return Number.isSafeInteger(number) ? (number === 0 ? 0 : number) : BigInt(token)
 }
 
+/** Read an options object like keyword arguments: an unknown name or a non-object is a TypeError. */
+export function checkOptions<T extends object>(value: T | undefined, names: readonly string[]): T {
+  if (value === undefined) return {} as T
+  if (!isJsonObject(value)) throw new TypeError("Options must be an object")
+  for (const name of Object.keys(value)) {
+    if (!names.includes(name)) throw new TypeError(`Unknown option '${name}'`)
+  }
+  return value
+}
+
 export function validDuration(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0
 }

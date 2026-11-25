@@ -119,7 +119,10 @@ export class Expr {
     if (values == null || typeof values !== "object" || typeof values[Symbol.iterator] !== "function") {
       throw new ValidationError(`Column '${column}' requires a list of strings`)
     }
-    return fromNode({ op: "contains_any", column, values: Array.from(values, (value) => stringValue(value, column)) })
+    const checked = Array.from(values, (value) => stringValue(value, column))
+    // A Set keeps insertion order, but Python's set has none. Sort by UTF-8 bytes in both SDKs.
+    if (values instanceof Set) checked.sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)))
+    return fromNode({ op: "contains_any", column, values: checked })
   }
 
   /** Keep rows whose String column begins with the prefix. */

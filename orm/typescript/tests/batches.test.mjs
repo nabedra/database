@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import { once } from "node:events"
 import { createServer } from "node:http"
 import { test } from "node:test"
-import { BatchError, Database, LimitExceededError, TransportError, UnknownOutcomeError, ValidationError } from "nabedra"
+import { BatchError, Database, LimitExceededError, TransportError, UnknownOutcomeError, ValidationError, vector } from "nabedra"
 
 const limit = 8 * 1024 * 1024
 const applied = { o: "applied" }
@@ -221,4 +221,14 @@ test("waitForEmbedding reports applied rows when it times out or fails", async (
     assert.equal(error.message, "1 rows were applied and their embeddings can still be pending")
     assert.equal(error.cause?.constructor, cause)
   }
+})
+
+test("upsertMany and addColumn refuse unknown option names and null before any request", async (t) => {
+  const server = await setUp(t)
+  const table = await server.table()
+  for (const call of [() => table.upsertMany([row(1)], null), () => table.upsertMany([row(1)], { wait: true }),
+    () => table.addColumn("extra", vector(2), null), () => table.addColumn("extra", vector(2), { model: "m" })]) {
+    await assert.rejects(call, TypeError)
+  }
+  assert.deepEqual(server.chunks, [])
 })

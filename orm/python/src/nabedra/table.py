@@ -10,9 +10,10 @@ from uuid import UUID, uuid4
 
 from ._layout import OPTION_FIELDS, Layout, check_embed, extend
 from ._vector import Vector, base64_overhead, column_kind, type_to_wire
-from .client import _ERROR_TYPES, _Transport
+from .client import _Transport
 from .errors import (
-    BatchError, LimitExceededError, NabedraError, ProtocolError, RowOutcome, UnknownOutcomeError, ValidationError,
+    AuthenticationError, BatchError, ConflictError, LimitExceededError, NabedraError, NotFoundError, OverloadedError,
+    ProtocolError, RowOutcome, SearchUnavailableError, StorageError, UnknownOutcomeError, ValidationError,
 )
 from .expr import Expr
 from .query import Query
@@ -28,6 +29,12 @@ _MAX_ROWS = 10_000
 _MAX_BODY = 8 * 1024 * 1024
 _MAX_ROW = 1024 * 1024
 _DESCRIPTOR_FIELDS = {'id', 'name', 'schema', 'key', 'format'}
+# The class of a row's error follows its outcome, then its code. A not_applied row is never unknown.
+_ROW_ERRORS = {
+    'validation_error': ValidationError, 'unauthorized': AuthenticationError, 'not_found': NotFoundError,
+    'conflict': ConflictError, 'limit_exceeded': LimitExceededError, 'overloaded': OverloadedError,
+    'storage_unavailable': StorageError, 'search_unavailable': SearchUnavailableError,
+}
 _STATUS_FIELDS = {'state', 'lag_ms', 'pending_embeddings', 'failed_embeddings', 'recall'}
 
 
@@ -77,7 +84,7 @@ def _row_outcome(data: object, key: Key, request_id: str) -> RowOutcome:
             or type(error['code']) is not str or not error['code'] or type(error['message']) is not str
             or error['outcome'] != ('unknown' if unknown else 'not_applied')):
         raise ProtocolError('Invalid row outcome')
-    kind = UnknownOutcomeError if unknown else _ERROR_TYPES.get(error['code'], NabedraError)
+    kind = UnknownOutcomeError if unknown else _ROW_ERRORS.get(error['code'], NabedraError)
     return {'key': key, 'outcome': data['o'], 'error': kind(
         error['message'], code=error['code'], request_id=request_id, outcome=error['outcome'])}
 

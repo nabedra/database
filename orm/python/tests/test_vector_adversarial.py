@@ -170,16 +170,21 @@ class Inputs(Harness):
         self.assertEqual(len(ids), 16)
         self.assertEqual({len(item["request"]["payload"]["rows"]) for item in self.fake.requests}, {100})
 
-    def test_a_sparse_reply_of_half_a_million_entries_decodes_quickly(self):
-        count = 500_000
-        indices = base64.b64encode(struct.pack(f"<{count}I", *range(count))).decode()
-        weights = base64.b64encode(struct.pack(f"<{count}f", *([1.0] * count))).decode()
-        reply = '[{"id":"a","sp":{"sparse":{"i":"' + indices + '","f32":"' + weights + '"}},"_score":0.5}]'
-        self.fake.reset(ok(reply))
-        started = time.monotonic()
-        hits = (self.chunks.query().rank(col("sp").dot({1: 1.0})).select("id", "sp").limit(1).collect())
-        self.assertLess(time.monotonic() - started, 10)
-        self.assertEqual(len(hits[0]["sp"]), count)
+    def test_a_sparse_reply_of_half_a_million_entries_decodes_in_linear_time(self):
+        # Time grows with size: 20 times the entries may take at most 60 times as long, plus one second.
+        # Quadratic decoding takes 400 times as long. Load slows both replies alike.
+        def decode(count):
+            indices = base64.b64encode(struct.pack(f"<{count}I", *range(count))).decode()
+            weights = base64.b64encode(struct.pack(f"<{count}f", *([1.0] * count))).decode()
+            reply = '[{"id":"a","sp":{"sparse":{"i":"' + indices + '","f32":"' + weights + '"}},"_score":0.5}]'
+            self.fake.reset(ok(reply))
+            started = time.monotonic()
+            hits = (self.chunks.query().rank(col("sp").dot({1: 1.0})).select("id", "sp").limit(1).collect())
+            elapsed = time.monotonic() - started
+            self.assertEqual(len(hits[0]["sp"]), count)
+            return elapsed
+        small, large = decode(25_000), decode(500_000)
+        self.assertLess(large, 60 * small + 1, (large, small))
 
     def test_a_float_that_rounds_up_to_the_largest_float32_is_kept(self):
         self.fake.reset({"applied": 1})

@@ -214,6 +214,12 @@ The call stops at the first request that fails and raises `BatchError`:
 | --- | --- |
 | `applied` | Rows known to be applied, in the whole call |
 | `outcomes` | One dictionary per row of the failed request, in order, with `key`, `outcome` and `error`. `outcome` is `"applied"`, `"not_applied"` or `"outcome_unknown"`. `error` is `None` for an applied row. |
+
+The class of a row's `error` follows its outcome, then its code: `"outcome_unknown"`
+gives `UnknownOutcomeError`. A `"not_applied"` row maps `validation_error`,
+`unauthorized`, `not_found`, `conflict`, `limit_exceeded`, `overloaded`,
+`storage_unavailable` and `search_unavailable` to their classes in the
+[error table](#errors-and-uncertain-writes), and any other code to `NabedraError`.
 | `request_id` | ID of the failed request |
 | `outcome` | `"not_applied"`, `"partial"`, `"unknown"`, or `"applied"` when only the wait for embeddings failed |
 
@@ -331,7 +337,7 @@ vectors as raw float32 bytes.
 | --- | --- |
 | `col(name).cosine(query)`, `.dot(query)`, `.l2(query)` | A ranking. A string is embedded with the column's model. `cosine` rejects a zero query vector. |
 | `col(name).match(text)` | A ranking by BM25 |
-| `col(name).contains(value)`, `.contains_any(values)` | Filters on `list[str]` columns. `contains_any` of nothing matches nothing. |
+| `col(name).contains(value)`, `.contains_any(values)` | Filters on `list[str]` columns. `contains_any` of nothing matches nothing. It sends a sequence in its order and a set sorted by UTF-8 bytes. |
 | `col(name).starts_with(prefix)` | Filter on `str` columns |
 | `rank(*rankings, fusion="rrf", candidates=100, recall=0.95, exact=False, consistency="latest")` | New query ordered by one ranking, or by several fused. `fusion` is `"rrf"` or one nonnegative weight per ranking. |
 | `rerank(ranking, *, candidates=200)` | New query that scores the best candidates of `rank` again |
@@ -344,7 +350,8 @@ is a target, not a guarantee; `exact=True` is exact. `"latest"` shows every writ
 acknowledged before the query, and `"snapshot"` reads one cut across ranges.
 
 An operation that a column does not support is a `ValidationError` before any
-request. `SearchUnavailableError` (503) means that search cannot answer now.
+request. An unknown keyword argument is a `TypeError`, as for any Python call.
+`SearchUnavailableError` (503) means that search cannot answer now.
 The query can be sent again later. Streams support only scalar columns.
 
 ## Errors and uncertain writes

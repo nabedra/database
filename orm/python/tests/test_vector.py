@@ -97,6 +97,22 @@ class VectorTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             query.where(vec=first)
 
+    def test_unknown_keyword_arguments_are_type_errors_before_any_request(self):
+        query = Query(TableContext()).limit(1)
+        ranking = col('vec').dot([1.0, 2.0])
+        for call in (lambda: query.rank(ranking, recal=0.5), lambda: query.rank(ranking).rerank(ranking, candidate=3),
+                     lambda: query.rank_many([ranking], limit=1, exct=True)):
+            with self.assertRaises(TypeError):
+                call()
+
+    def test_contains_any_orders_sets_by_utf8_bytes_and_keeps_sequence_order(self):
+        query = Query(TableContext())
+        for values, expected in (({'é', 'Z', '\U0001f600', '\uffff'}, ['Z', 'é', '\uffff', '\U0001f600']),
+                                 (frozenset({'b', 'a'}), ['a', 'b']), ({'b': 1, 'a': 2}.keys(), ['a', 'b']),
+                                 (['b', 'a'], ['b', 'a']), (('b', 'a'), ('b', 'a')), (iter(['b', 'a']), ['b', 'a'])):
+            wire = query.where(col('tags').contains_any(values))._to_wire()['filter']['values']
+            self.assertEqual(wire, list(expected))
+
     def test_queries_stay_immutable(self):
         query = Query(TableContext()).limit(1)
         ranked = query.rank(col('vec').dot([1.0, 2.0]))

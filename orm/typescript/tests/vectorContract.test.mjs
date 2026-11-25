@@ -43,6 +43,7 @@ function valueOf(item) {
     case "$bytes": return Uint8Array.from(content)
     case "$sparse":
     case "$object": return Object.fromEntries(content.map(([index, weight]) => [index, valueOf(weight)]))
+    case "$set": return new Set(content)
     case "$repeat": return Array.from({ length: content[1] }, () => valueOf(content[0]))
     case "$text": return content[0].repeat(content[1])
     case "$type": return columnType(content)

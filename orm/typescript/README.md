@@ -96,7 +96,7 @@ vectors as raw float32 bytes.
 | --- | --- |
 | `col(name).cosine(query)`, `.dot(query)`, `.l2(query)` | A ranking. A string is embedded with the column's model. `cosine` rejects a zero query vector. |
 | `col(name).match(text)` | A ranking by BM25 |
-| `col(name).contains(value)`, `.containsAny(values)` | Filters on `list(String)` columns. `containsAny` of nothing matches nothing. |
+| `col(name).contains(value)`, `.containsAny(values)` | Filters on `list(String)` columns. `containsAny` of nothing matches nothing. It sends an array in its order and a `Set` sorted by UTF-8 bytes, as Python sorts a set. |
 | `col(name).startsWith(prefix)` | Filter on `String` columns |
 | `query.rank(...rankings, { fusion = "rrf", candidates = 100, recall = 0.95, exact = false, consistency = "latest" })` | New query ordered by one ranking, or by several fused. `fusion` is `"rrf"` or one nonnegative weight per ranking. |
 | `query.rerank(ranking, { candidates = 200 })` | New query that scores the best candidates of `rank` again |
@@ -112,8 +112,9 @@ is a target, not a guarantee; `exact: true` is exact. `"latest"` shows every wri
 acknowledged before the query, and `"snapshot"` reads one cut across ranges.
 
 An operation that a column does not support is a `ValidationError` before any
-request. `SearchUnavailableError` (503) means that search cannot answer now. The
-query can be sent again later. Streams support only scalar columns.
+request. An options object with an unknown name, or `null` in its place, is a
+`TypeError`, like an unknown keyword argument in Python. `SearchUnavailableError`
+(503) means that search cannot answer now. The query can be sent again later. Streams support only scalar columns.
 
 ## Batches
 
@@ -129,6 +130,14 @@ The call stops at the first request that fails and throws `BatchError`:
 | --- | --- |
 | `applied` | Rows known to be applied, in the whole call |
 | `outcomes` | One `{ key, outcome, error }` per row of the failed request, in order. `outcome` is `"applied"`, `"not_applied"` or `"outcome_unknown"`. `error` is `null` for an applied row. |
+
+The class of a row's `error` follows its outcome, then its code: `"outcome_unknown"`
+gives `UnknownOutcomeError`. A `"not_applied"` row maps `validation_error`,
+`unauthorized`, `not_found`, `conflict`, `limit_exceeded`, `overloaded`,
+`storage_unavailable` and `search_unavailable` to `ValidationError`,
+`AuthenticationError`, `NotFoundError`, `ConflictError`, `LimitExceededError`,
+`OverloadedError`, `StorageError` and `SearchUnavailableError`, and any other code to
+`NabedraError`.
 | `requestId` | ID of the failed request |
 | `outcome` | `"not_applied"`, `"partial"`, `"unknown"`, or `"applied"` when only the wait for embeddings failed |
 

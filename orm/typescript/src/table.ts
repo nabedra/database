@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto"
 import { setTimeout as delay } from "node:timers/promises"
 import {
-  BatchError, LimitExceededError, NabedraError, ProtocolError, UnknownOutcomeError, ValidationError,
-  type RowOutcome,
+  AuthenticationError, BatchError, ConflictError, LimitExceededError, NabedraError, NotFoundError, OverloadedError,
+  ProtocolError, SearchUnavailableError, StorageError, UnknownOutcomeError, ValidationError, type RowOutcome,
 } from "./errors.js"
 import type { Expr } from "./expr.js"
 import {
@@ -11,7 +11,7 @@ import {
 } from "./layout.js"
 import { Query } from "./query.js"
 import {
-  encodeJson, errorMappings, hasFields, isReceiptError, type JsonObject, type Transport,
+  checkOptions, encodeJson, hasFields, isReceiptError, type JsonObject, type Transport,
 } from "./transport.js"
 import {
   decodeRow, decodeSchema, isRecord, validateFormat, validateIdentifier, validateKey, validateRow, validateSchema,
@@ -34,6 +34,12 @@ type Chunk = Map<Key, unknown>
 const maxRows = 10_000
 const maxBody = 8 * 1024 * 1024
 const maxRow = 1024 * 1024
+// The class of a row's error follows its outcome, then its code. A not_applied row is never unknown.
+const rowErrors = new Map<string, typeof NabedraError>([
+  ["validation_error", ValidationError], ["unauthorized", AuthenticationError], ["not_found", NotFoundError],
+  ["conflict", ConflictError], ["limit_exceeded", LimitExceededError], ["overloaded", OverloadedError],
+  ["storage_unavailable", StorageError], ["search_unavailable", SearchUnavailableError],
+])
 const descriptorKeys = ["id", "name", "schema", "key", "format"]
 const tableIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const transports = new WeakMap<object, Transport>()
@@ -112,7 +118,7 @@ function rowOutcome(data: unknown, key: Key, requestId: string): RowOutcome {
   if (!isReceiptError(error) || error.code.length === 0 || error.outcome !== (unknown ? "unknown" : "not_applied")) {
     throw new ProtocolError("Invalid row outcome")
   }
-  const kind = unknown ? UnknownOutcomeError : errorMappings.get(error.code)?.type ?? NabedraError
+  const kind = unknown ? UnknownOutcomeError : rowErrors.get(error.code) ?? NabedraError
   return { key, outcome, error: new kind(error.message, { code: error.code, requestId, outcome: error.outcome }) }
 }
 
@@ -306,8 +312,9 @@ export class Table<
    */
   async upsertMany(
     rows: Iterable<RowInput<S, E>> | AsyncIterable<RowInput<S, E>>,
-    { waitForEmbedding = false }: { waitForEmbedding?: boolean } = {},
+    options?: { waitForEmbedding?: boolean },
   ): Promise<number> {
+    const { waitForEmbedding = false } = checkOptions(options, ["waitForEmbedding"])
     if (typeof waitForEmbedding !== "boolean") throw new ValidationError("wait_for_embedding must be a bool")
     if (waitForEmbedding && Object.keys(layoutOf(this).embed).length === 0) {
       throw new ValidationError("Waiting for embeddings requires an embedded column")
@@ -351,8 +358,9 @@ export class Table<
 
   /** Add a vector column online. This handle then uses the new schema. */
   async addColumn(
-    name: string, type: Vector | List<Vector<false>>, { embed = null }: { embed?: EmbedOptions | null } = {},
+    name: string, type: Vector | List<Vector<false>>, settings?: { embed?: EmbedOptions | null },
   ): Promise<void> {
+    const { embed = null } = checkOptions(settings, ["embed"])
     const options = embed === null ? null : checkEmbed(embed, layoutOf(this).schema)
     const layout = extendLayout(layoutOf(this), name, type, options)
     const added = typeToWire(layout.schema[name])
