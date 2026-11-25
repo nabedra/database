@@ -94,6 +94,10 @@ const CASES: &[(&str, &str, Checker, &[&str])] = &[
         &["non-linearizable"],
     ),
     // Direct-path request identity (OLTP-G03) and outcome truth (OLTP-G04): D02, D03, D04.
+    // `direct_valid_retries` predates the retry rule of 2026-11-24 (lead decision 11, "Retry
+    // results" in plans/oltp-direct-path.md). Its `update` r2 answers `false` and later `true`,
+    // which is the shipped recomputing that the plan calls a known gap. The case still states what
+    // the default accepts.
     ("direct_valid_retries", "direct", direct::check, &[]),
     (
         "direct_valid_retries",
