@@ -16,7 +16,7 @@ use std::{
     panic::{self, AssertUnwindSafe, PanicHookInfo},
     pin::pin,
     sync::{
-        Arc, Mutex, MutexGuard, Once, PoisonError,
+        Arc, Mutex, MutexGuard, Once, PoisonError, Weak,
         atomic::{AtomicBool, Ordering},
     },
     task::Poll,
@@ -96,20 +96,25 @@ fn record(info: &PanicHookInfo<'_>) {
     }
 }
 
-/// Keeps the panics of one world from its creation to [`Watch::finish`].
-pub(crate) struct Watch(usize);
+/// Keeps the panics of one world from its creation to [`Watch::finish`]. The weak handle keeps
+/// the world's address from being used again, so no other run can overwrite the log.
+pub(crate) struct Watch(Weak<World>);
 
 impl Watch {
     pub(crate) fn new(world: &Arc<World>) -> Self {
         install();
-        let key = Arc::as_ptr(world) as usize;
-        log().insert(key, Vec::new());
-        Self(key)
+        let watch = Self(Arc::downgrade(world));
+        log().insert(watch.key(), Vec::new());
+        watch
+    }
+
+    fn key(&self) -> usize {
+        self.0.as_ptr() as usize
     }
 
     /// Every panic since the watch began, in order.
     pub(crate) fn finish(self) -> Vec<String> {
-        log().remove(&self.0).unwrap_or_default()
+        log().remove(&self.key()).unwrap_or_default()
     }
 }
 
@@ -118,7 +123,7 @@ impl Drop for Watch {
         if std::thread::panicking() {
             POISONED.store(true, Ordering::SeqCst);
         }
-        log().remove(&self.0);
+        log().remove(&self.key());
     }
 }
 
@@ -264,6 +269,27 @@ mod tests {
         assert_eq!(kinds("smoke", "none", Some(At::Escapes), 1), ["harness"]);
         assert_eq!(kinds("smoke", "none", None, 1), ["harness"]);
         assert_eq!(kinds("direct", "mixed", None, 9), ["harness"]);
+    }
+
+    /// Review 115, L1: the log is keyed by the world's address, and a run that started between
+    /// the drop of this world and `finish` could take the address and erase its panics.
+    #[test]
+    fn a_watched_worlds_address_is_not_reused() {
+        let (watch, address) = nabedra_sim::runtime::run(1, |world| async move {
+            (Watch::new(&world), Arc::as_ptr(&world) as usize)
+        });
+        log()
+            .get_mut(&address)
+            .expect("watched")
+            .push("kept".into());
+        for _ in 0..64 {
+            nabedra_sim::runtime::run(2, |world| async move {
+                assert_ne!(Arc::as_ptr(&world) as usize, address);
+                Watch::new(&world).finish();
+            });
+        }
+        // A parallel test may panic outside every world meanwhile, which every watch records.
+        assert!(watch.finish().contains(&"kept".to_owned()));
     }
 
     /// Without a planted panic nothing is recorded, so the hook adds no red seed by itself.

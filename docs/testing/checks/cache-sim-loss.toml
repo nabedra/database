@@ -1,0 +1,23 @@
+id = "cache-sim-loss"
+module = "cache"
+kinds = ["S", "H"]
+guarantees = ["CACHE-G02", "CACHE-G03", "CACHE-G05", "CACHE-G06", "CACHE-G07", "CACHE-G08", "CACHE-G09"]
+scenarios = ["K01", "K02", "K03"]
+tiers = ["T1"]
+# Fault model. The same sweep and recorded seeds as cache-sim, with partitions
+# that lose messages and stall their connections instead of delivering late.
+# No lag window, as in cache-sim.
+command = ["bash", "-euc", '''
+sim=(cargo test --locked -j 4 --release --no-default-features --features cache,sim --lib)
+names=(seed_sweep nightly_regressions same_seed_same_trace)
+tests=$("${sim[@]}" cache::cluster::sim::tests:: -- --list --format terse)
+for name in "${names[@]}"; do
+    grep -Fxq "cache::cluster::sim::tests::$name: test" <<< "$tests"
+done
+"${sim[@]}" -- "${names[@]/#/cache::cluster::sim::tests::}" --exact --nocapture --test-threads=1
+''']
+cwd = "server"
+timeout_s = 1800
+needs = []
+result_parser = "cargo-test"
+env = { NABEDRA_SIM_PARTITIONS = "loss", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim-cache", CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true", CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS = "true", NABEDRA_SEEDS = "250", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "0.05", NABEDRA_SIM_SHRINK = "0", NABEDRA_SIM_ARTIFACTS = "../target/testing-logs/cache-sim-loss" }

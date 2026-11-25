@@ -1,0 +1,13 @@
+{"trace":"nabedra.trace/1","spec":"TwoPhase","seed":18446744073709551615,"sha":"0000000000000000000000000000000000000000","workload":"selftest-handwritten","params":{"RM":["r1","r2"],"MaxCrashes":1,"MaxDrops":1}}
+{"seq":0,"t":2147483647,"node":"r1","action":"RMPrepare","vars":{"rmState":"prepared"},"msg":{"type":"Prepared","rm":"r1"}}
+{"seq":1,"t":2147483648,"node":"r2","action":"RMPrepare","vars":{"rmState":"prepared"},"msg":{"type":"Prepared","rm":"r2"}}
+{"seq":2,"t":4294967301,"node":"tm","action":"TMRcvPrepared","vars":{"tmPrepared":["r1"]},"msg":{"type":"Prepared","rm":"r1"}}
+{"seq":3,"t":9007199254740993,"node":"tm","action":"TMCrash","vars":{"tmUp":false,"tmPrepared":[]}}
+{"seq":4,"t":9223372036854775812,"node":"tm","action":"TMRestart","vars":{"tmUp":true}}
+{"seq":5,"t":9223372036854775813,"node":"tm","action":"TMRcvPrepared","vars":{"tmPrepared":["r1"]},"msg":{"type":"Prepared","rm":"r1"}}
+{"seq":6,"t":9223372036854775814,"node":"tm","action":"TMRcvPrepared","vars":{"tmPrepared":["r1","r2"]},"msg":{"type":"Prepared","rm":"r2"}}
+{"seq":7,"t":9223372036854775815,"node":"tm","action":"TMCommit","vars":{"tmDecision":"committed"},"msg":{"type":"Commit"}}
+{"seq":8,"t":9223372036854775816,"node":"tm","action":"DropMessage","vars":{},"msg":{"type":"Commit"}}
+{"seq":9,"t":9223372036854775817,"node":"tm","action":"TMResend","vars":{},"msg":{"type":"Commit","delay_ns":4294967301}}
+{"seq":10,"t":9223372036854775818,"node":"r1","action":"RMRcvCommit","vars":{"rmState":"committed"},"msg":{"type":"Commit"}}
+{"seq":11,"t":9223372036854775819,"node":"r2","action":"RMRcvCommit","vars":{"rmState":"committed"},"msg":{"type":"Commit"}}

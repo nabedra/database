@@ -91,11 +91,11 @@ pub(crate) const RULES: [&str; 9] = [
 pub(crate) const NOT_RUN: [(&str, &str); 4] = [
     (
         SCHEMA_EPOCH,
-        "needs probes: a DirectCommit's schema epoch and timestamp at apply, and the schema epoch and timestamp of each Catalog publication and drop. #116 reports neither",
+        "needs probes: a DirectCommit's schema epoch and timestamp at apply, and the schema epoch and timestamp of each Catalog publication and drop. the probes report neither",
     ),
     (
         RETIRED,
-        "needs probes: a range leader's retirement (split source closed, replica removed) and the replica that answered a direct request. #116's GatewayAttempt names the voter asked, not the answer",
+        "needs probes: a range leader's retirement (split source closed, replica removed) and the replica that answered a direct request. the GatewayAttempt probe names the voter asked, not the answer",
     ),
     (
         "FenceAfterValidation over Data fences",

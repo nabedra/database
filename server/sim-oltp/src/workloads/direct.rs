@@ -9,9 +9,11 @@ use std::{
 use nabedra_check::Gen;
 use nabedra_rt::{ids::uuid_v4, sim::in_node, time};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use super::{
-    Scenarios, Workload, clauses,
+    Scenarios, Workload,
+    clauses::{self, Answer},
     clients::{self, Ctx, Plan},
     cold, corrupt, moves, old_peer, paused,
 };
@@ -54,8 +56,9 @@ pub(crate) async fn run(
 ) -> Result<Report, String> {
     cluster.wait_direct().await?;
     let table = create_table(cluster, &history).await?;
-    for node in WORKERS {
-        let stats = cluster.stats(node).await?;
+    let table_id = Uuid::parse_str(&table).map_err(|error| format!("table UUID: {error}"))?;
+    cluster.watch_table(table_id);
+    for (node, stats) in crate::workload::steady(cluster).await? {
         cluster
             .checks
             .capture_resources(&cluster.world, node, &stats);
@@ -75,10 +78,10 @@ pub(crate) async fn run(
     let start = elapsed_ms(&cluster.world);
     let profile = selection.profile(seed);
     let mut chaos = (!quiet && profile.total_weight() > 0)
-        .then(|| Chaos::new(profile, faults.clone(), start, g));
+        .then(|| Chaos::new(&cluster.world, profile, faults.clone(), start, g));
     let mut moving = (workload == Workload::Move).then(|| {
         let mut moving = moves::Move::draw(g);
-        moving.set_faults(faults.clone());
+        moving.start(cluster, &ctx, &faults);
         moving
     });
     let staggered = (workload == Workload::Cold).then(|| cold::Stop::draw(g));
@@ -99,10 +102,17 @@ pub(crate) async fn run(
         if let Some(chaos) = chaos.as_mut() {
             chaos.tick(cluster, &ctx, g).await;
         }
-        if let Some(moving) = moving.as_mut() {
-            moving.tick(cluster, &ctx).await;
-        }
         time::sleep(TICK).await;
+    }
+    progress(cluster, &ctx, start);
+    // The table served requests, so its range has a leader. A harness that can't see it aims its
+    // faults blindly.
+    if cluster.elections().is_empty() {
+        cluster.checks.violate(
+            &cluster.world,
+            "LeaderUnknown",
+            "no election of the table's range was seen on the wire",
+        );
     }
 
     let mut report = Report::default();
@@ -110,18 +120,28 @@ pub(crate) async fn run(
         // Heal, then stop every worker while the clients still send requests, and reopen
         // the workers staggered. Restarts the nemesis owes would only race the full stop.
         if let Some(chaos) = chaos.as_mut() {
-            if let Err(error) = chaos.heal(cluster, &ctx).await {
+            let healed = chaos.heal(cluster, &ctx).await;
+            chaos.before_full_stop(cluster).await;
+            if let Err(error) = healed {
                 cluster
                     .checks
                     .violate(&cluster.world, "Liveness", format!("heal: {error}"));
-                return abandon(cluster, &ctx, tasks, report).await;
+                return abandon(
+                    cluster,
+                    &ctx,
+                    tasks,
+                    report,
+                    (workload, start),
+                    Some(chaos),
+                    moving.as_ref(),
+                )
+                .await;
             }
-            chaos.before_full_stop(cluster, &ctx).await;
         }
         let started = cluster.world.elapsed();
         let cold = stop.run(cluster, &ctx).await;
         if let Some(chaos) = chaos.as_mut() {
-            chaos.after_full_stop(cluster).await;
+            chaos.after_full_stop().await;
         }
         report
             .assertions
@@ -134,9 +154,17 @@ pub(crate) async fn run(
             cluster
                 .checks
                 .violate(&cluster.world, "Liveness", format!("cold start: {error}"));
-            return abandon(cluster, &ctx, tasks, report).await;
+            return abandon(
+                cluster,
+                &ctx,
+                tasks,
+                report,
+                (workload, start),
+                chaos.as_ref(),
+                moving.as_ref(),
+            )
+            .await;
         }
-        report.scenarios.insert("O15:cold-start");
     }
     ctx.stopping.store(true, Ordering::Release);
 
@@ -146,10 +174,19 @@ pub(crate) async fn run(
         cluster
             .checks
             .violate(&cluster.world, "Liveness", format!("heal: {error}"));
-        return abandon(cluster, &ctx, tasks, report).await;
+        return abandon(
+            cluster,
+            &ctx,
+            tasks,
+            report,
+            (workload, start),
+            Some(chaos),
+            moving.as_ref(),
+        )
+        .await;
     }
     // A run without a nemesis still delays the old voters of a move until here.
-    faults.clear();
+    faults.heal();
     // Everything is undone and every process is started. The bounds below run from here.
     let healed = cluster.world.elapsed();
     cluster
@@ -161,7 +198,16 @@ pub(crate) async fn run(
         cluster
             .checks
             .violate(&cluster.world, "Liveness", format!("heal: {error}"));
-        return abandon(cluster, &ctx, tasks, report).await;
+        return abandon(
+            cluster,
+            &ctx,
+            tasks,
+            report,
+            (workload, start),
+            chaos.as_ref(),
+            moving.as_ref(),
+        )
+        .await;
     }
     // Convergence may be polled for 30 s after the heal. Everything after it is sent once.
     let converged = converge(cluster, &ctx, healed + CONVERGE_LIMIT).await;
@@ -185,10 +231,7 @@ pub(crate) async fn run(
     let mut move_wait_ms = 0;
     if let Some(moving) = moving.as_mut().filter(|moving| moving.running()) {
         while moving.waiting(cluster, healed) {
-            moving.retry(cluster, &ctx, healed).await;
-            if let Some(chaos) = chaos.as_mut() {
-                chaos.try_split(cluster, &ctx).await;
-            }
+            time::sleep(TICK).await;
         }
         move_wait_ms = elapsed_ms(&cluster.world) - quiet_from.as_millis() as u64;
         cluster.record(format!(
@@ -206,16 +249,20 @@ pub(crate) async fn run(
             .checks
             .violate(&cluster.world, "Liveness", error.clone());
     }
+    // O15 is about what the cold start kept, and only these reads and the history say that.
+    if workload == Workload::Cold {
+        report.scenarios.insert("O15:cold-start");
+    }
     let mut reread = false;
     if let Some(chaos) = chaos.as_mut().filter(|chaos| chaos.split_pending()) {
-        chaos.finish_split(cluster, &ctx, quiet_from).await;
+        chaos.finish_split(cluster, quiet_from).await;
         reread = true;
     }
     if let Some(chaos) = chaos.as_ref() {
-        chaos.check_abandoned(cluster, &ctx).await;
+        chaos.check_abandoned().await;
     }
     if let Some(moving) = moving.as_mut() {
-        let moved = moving.finish(cluster, &ctx, healed).await;
+        let moved = moving.finish(cluster, healed).await;
         report
             .assertions
             .push(("replica move retired", moved.is_ok()));
@@ -295,7 +342,7 @@ pub(crate) async fn run(
                 );
             }
         }
-        report.scenarios.extend(std::mem::take(&mut moving.clauses));
+        report.scenarios.extend(moving.clauses());
     }
     if old_peer::selected(seed, workload, selection.focus.old_peer) {
         if converged.is_ok() && final_checks.is_ok() && cluster.converged().await {
@@ -315,14 +362,14 @@ pub(crate) async fn run(
     }
 
     let no_quorum = cluster.no_quorum();
-    let drops = chaos.as_ref().map(Chaos::session_drops).unwrap_or_default();
+    let elections = cluster.elections();
     let outcome = clauses::Evidence {
         faults: chaos.as_ref().map_or(&[], |chaos| &chaos.log),
         attempts: &observed.attempts,
         resolved: &observed.resolved,
         reuse_same_key: observed.reuse_same_key,
         reuse_other_key: observed.reuse_other_key,
-        session_drops: &drops,
+        elections: &elections,
         no_quorum: &no_quorum,
         moving: moving.as_ref().and_then(moves::Move::window),
         deadline_ms: config.deadline().as_millis() as u64,
@@ -373,24 +420,16 @@ pub(crate) async fn run(
         }
     }
 
-    report.summary = json!({
-        "workload": workload.name(),
-        "profile": chaos.as_ref().map(Chaos::profile_name),
-        "keys": ctx.keys,
-        "executed": chaos.as_ref().map(|chaos| chaos.executed.iter().map(|(a, n)| (a.name(), *n)).collect::<std::collections::BTreeMap<_, _>>()),
-        "skipped": chaos.as_ref().map(|chaos| chaos.skipped.iter().map(|(a, n)| (a.name(), *n)).collect::<std::collections::BTreeMap<_, _>>()),
-        "session_resets": chaos.as_ref().map(Chaos::resets),
-        "completed": observed.completed,
-        "attempts": observed.attempts.len(),
-        "resolved_by_retry": observed.resolved.len(),
-        "reuse_same_key": observed.reuse_same_key,
-        "reuse_other_key": observed.reuse_other_key,
-        "not_applied_checks": observed.not_applied_checks,
-        "unresolved": observed.unresolved.len(),
-        "one_paused_late": outcome.one_paused_late,
-        "move_wait_ms": move_wait_ms,
-        "heal_cold_start": chaos.as_ref().is_some_and(|chaos| chaos.heal_cold),
-    });
+    report.summary = summary(
+        workload,
+        &ctx,
+        chaos.as_ref(),
+        moving.as_ref(),
+        start,
+        &observed,
+    );
+    report.summary["one_paused_late"] = json!(outcome.one_paused_late);
+    report.summary["move_wait_ms"] = json!(move_wait_ms);
     cluster.record(format!("workload summary {}", report.summary));
     Ok(report)
 }
@@ -416,18 +455,105 @@ pub(crate) async fn converge(
     }
 }
 
-/// The run cannot converge: stop the clients and keep the violations already recorded.
-pub(crate) async fn abandon(
+/// What the clients got done in the chaos window: fresh writes that committed, and reads that
+/// were answered, before the heal.
+pub(crate) fn work(attempts: &[clauses::Attempt], from: u64, to: u64) -> (u64, u64) {
+    let in_window = attempts
+        .iter()
+        .filter(|a| a.fresh && a.invoked >= from && a.completed <= to);
+    let (mut writes, mut reads) = (0, 0);
+    for attempt in in_window {
+        match attempt.answer {
+            Answer::Committed => writes += 1,
+            Answer::Ok if !attempt.mutation => reads += 1,
+            _ => {}
+        }
+    }
+    (writes, reads)
+}
+
+/// A seed whose clients completed no work under chaos proves nothing, so it is never clean (lead
+/// decision 17, review 115 H1).
+fn progress(cluster: &Cluster, ctx: &Ctx, start: u64) {
+    let now = elapsed_ms(&cluster.world);
+    let (writes, reads) = work(&ctx.observed.lock().unwrap().attempts, start, now);
+    if writes == 0 || reads == 0 {
+        cluster.checks.violate(
+            &cluster.world,
+            "Progress",
+            format!(
+                "{writes} writes committed and {reads} reads were answered from {start}ms to {now}ms, before the heal"
+            ),
+        );
+    }
+}
+
+fn summary(
+    workload: Workload,
+    ctx: &Ctx,
+    chaos: Option<&Chaos>,
+    moving: Option<&moves::Move>,
+    start: u64,
+    observed: &clients::Observations,
+) -> Value {
+    let chaos_end = start + CHAOS.as_millis() as u64;
+    let (writes, reads) = work(&observed.attempts, start, chaos_end);
+    // A mutation that was in flight when a fault took effect.
+    let met = chaos.map(|chaos| {
+        let effects = chaos.log.iter().flat_map(|fault| &fault.effects);
+        let effects: Vec<u64> = effects.map(|effect| effect.at).collect();
+        let in_flight = |at: &&u64| {
+            let mut attempts = observed.attempts.iter();
+            attempts.any(|a| a.mutation && a.invoked <= **at && **at <= a.completed)
+        };
+        [effects.iter().filter(in_flight).count(), effects.len()]
+    });
+    json!({
+        "workload": workload.name(),
+        "profile": chaos.map(Chaos::profile_name),
+        "keys": ctx.keys,
+        "planned": chaos.map(|chaos| chaos.counts(false)),
+        "happened": chaos.map(|chaos| chaos.counts(true)),
+        "aimed_and_hit_leader": chaos.map(Chaos::aimed),
+        "effects_met_by_a_mutation": met,
+        "skipped": chaos.map(|chaos| chaos.skipped.iter().map(|(a, n)| (a.name(), *n)).collect::<std::collections::BTreeMap<_, _>>()),
+        "windows_overran_and_max_ms": chaos.map(Chaos::overran),
+        "session_resets": chaos.map(Chaos::resets),
+        "split": chaos.map(Chaos::split_summary),
+        "move": moving.map(moves::Move::summary),
+        "chaos_writes": writes,
+        "chaos_reads": reads,
+        "completed": observed.completed,
+        "attempts": observed.attempts.len(),
+        "resolved_by_retry": observed.resolved.len(),
+        "reuse_same_key": observed.reuse_same_key,
+        "reuse_other_key": observed.reuse_other_key,
+        "not_applied_checks": observed.not_applied_checks,
+        "unresolved": observed.unresolved.len(),
+        "heal_cold_start": chaos.is_some_and(|chaos| chaos.heal_cold),
+        "abandoned": false,
+    })
+}
+
+/// The run cannot converge: stop the clients and keep the violations already recorded. None of
+/// the final assertions ran, so no scenario is claimed.
+async fn abandon(
     cluster: &mut Cluster,
     ctx: &Ctx,
     tasks: Vec<tokio::task::JoinHandle<()>>,
-    report: Report,
+    mut report: Report,
+    (workload, start): (Workload, u64),
+    chaos: Option<&Chaos>,
+    moving: Option<&moves::Move>,
 ) -> Result<Report, String> {
     ctx.converge_by.store(0, Ordering::Release);
     for task in tasks {
         task.abort();
         let _ = task.await;
     }
+    let observed = std::mem::take(&mut *ctx.observed.lock().unwrap());
+    report.summary = summary(workload, ctx, chaos, moving, start, &observed);
+    report.summary["abandoned"] = json!(true);
     cluster.record("workload abandoned after a liveness violation".into());
     Ok(report)
 }
@@ -491,8 +617,9 @@ async fn create_table(cluster: &Cluster, history: &Arc<Mutex<History>>) -> Resul
     }
 }
 
-/// Wait for transient resource gauges to return to their baseline, or 2 s. The pools a move
-/// mounted have no row in the baseline, so they are split off: they must reserve nothing.
+/// Wait for every worker's resources to stay at their baseline (three clean observations in a
+/// row, as `Invariants::resources_at_baseline` counts them), or 2 s. The pools a move mounted
+/// have no row in the baseline, so they are split off: they must reserve nothing.
 pub(crate) async fn settle(
     cluster: &Cluster,
     extra: &[ExtraPool],
@@ -527,3 +654,59 @@ pub(crate) async fn settle(
 
 /// The node and device of a pool that a replica move mounted.
 pub(crate) type ExtraPool = (u64, u64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attempt(
+        mutation: bool,
+        fresh: bool,
+        window: (u64, u64),
+        answer: Answer,
+    ) -> clauses::Attempt {
+        clauses::Attempt {
+            id: Uuid::nil(),
+            mutation,
+            fresh,
+            gateway: 101,
+            invoked: window.0,
+            completed: window.1,
+            answer,
+        }
+    }
+
+    /// Review 115, H1: seeds 638 and 158 committed no write and answered no read in 20 s, and
+    /// were clean.
+    #[test]
+    fn only_client_work_that_completed_before_the_heal_is_progress() {
+        let work = |attempts: &[clauses::Attempt]| work(attempts, 1_000, 2_000);
+        let write = |window| attempt(true, true, window, Answer::Committed);
+        assert_eq!(work(&[]), (0, 0));
+        assert_eq!(
+            work(&[write((1_900, 2_100))]),
+            (0, 0),
+            "answered after the heal"
+        );
+        assert_eq!(
+            work(&[write((900, 1_100))]),
+            (0, 0),
+            "sent before the chaos"
+        );
+        assert_eq!(
+            work(&[attempt(true, true, (1_100, 1_200), Answer::Unknown)]),
+            (0, 0)
+        );
+        assert_eq!(
+            work(&[attempt(true, false, (1_100, 1_200), Answer::Committed)]),
+            (0, 0)
+        );
+        // A mutation that changed no row is neither.
+        assert_eq!(
+            work(&[attempt(true, true, (1_100, 1_200), Answer::Ok)]),
+            (0, 0)
+        );
+        let read = attempt(false, true, (1_100, 1_200), Answer::Ok);
+        assert_eq!(work(&[write((1_100, 1_200)), read]), (1, 1));
+    }
+}

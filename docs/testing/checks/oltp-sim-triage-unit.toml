@@ -1,0 +1,12 @@
+id = "oltp-sim-triage-unit"
+module = "testing"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+# What may not count as a named cause of a red simulation seed, and what is not a clean one.
+command = ["python3", "-m", "unittest", "test_sim_triage"]
+cwd = "scripts/testing"
+timeout_s = 300
+needs = []
+result_parser = "unittest"

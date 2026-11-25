@@ -83,9 +83,8 @@ impl Run<'_> {
             .violate(&self.cluster.world, invariant, format!("D05: {detail}"));
     }
 
-    /// The worker whose mutation counter a successful write moves.
+    /// The elected leader of the range, once a write succeeds.
     async fn leader(&mut self) -> Option<u64> {
-        self.cluster.leader().await;
         let (_, answer, _) = self.write(GATEWAYS[0]).await;
         if let Some(why) = clients::failure(&answer) {
             self.violate(
@@ -94,9 +93,9 @@ impl Run<'_> {
             );
             return None;
         }
-        let leader = self.cluster.leader().await;
+        let leader = self.cluster.leader();
         if leader.is_none() {
-            self.violate("Liveness", "no worker counted the write".into());
+            self.violate("Liveness", "no elected leader runs after a write".into());
         }
         leader
     }

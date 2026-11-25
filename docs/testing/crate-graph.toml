@@ -83,8 +83,10 @@ normal = ["nabedra-rt"]
 normal = ["nabedra-rt", "nabedra-protocol"]
 dev = ["nabedra-check"]
 
+# The runtime edge is optional: only the `sim` feature takes it, for `sim_probe` (phase 10
+# design, 3.2 item 3).
 [planned.nabedra-oltp-types]
-normal = ["nabedra-protocol", "nabedra-resources"]
+normal = ["nabedra-rt", "nabedra-protocol", "nabedra-resources"]
 
 [planned.nabedra-transport]
 normal = ["nabedra-rt", "nabedra-protocol", "nabedra-resources", "nabedra-oltp-types"]

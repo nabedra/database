@@ -1,0 +1,41 @@
+id = "oltp-probes-baseline"
+module = "oltp"
+kinds = ["S", "H"]
+# Fault model. ResourceBaseline on the smoke workload with the probes installed (P10-PROBES). In a
+# scratch worktree, smoke seeds 1 to 50 must be clean and replay with every probe rule on. Then
+# server/sim-oltp/src/probes/recurring-charge.patch makes a worker hold a 564-byte charge for 50 of
+# every 51 ms after its first direct entry. Every seed must report ResourceBaseline and nothing else.
+# The scratch tree gets workload-hook.patch, as in oltp-probes-planted. It proves no product
+# guarantee by itself.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+root="$(git rev-parse --show-toplevel)"
+export CARGO_TARGET_DIR="$PWD/target/sim"
+mkdir -p "$PWD/target"
+scratch="$(mktemp -d "$PWD/target/probes-baseline.XXXXXX")"
+trap 'git -C "$root" worktree remove --force "$scratch" >/dev/null 2>&1 || true' EXIT
+git -C "$root" worktree add --detach "$scratch" HEAD >/dev/null
+probes=server/sim-oltp/src/probes
+if ! grep -q install_probes "$scratch/server/sim-oltp/src/workload.rs"; then
+    echo "The workload does not install the probes: applying workload-hook.patch to the scratch tree"
+    git -C "$scratch" apply --verbose "$probes/workload-hook.patch"
+fi
+cd "$scratch/server"
+build() { cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib --no-run; }
+run() {
+    timeout 1500s cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib -- \
+        --exact --include-ignored --nocapture --test-threads=1 "$1"
+}
+build
+NABEDRA_SEEDS=50 run sweep::tests::sweep
+git -C "$scratch" apply --verbose "$probes/recurring-charge.patch"
+build
+NABEDRA_SEEDS=3 run probes::tests::planted_recurring_charge_is_caught_only_by_probes
+''']
+cwd = "server"
+timeout_s = 5400
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", NABEDRA_SEED = "1", NABEDRA_SIM_WORKLOAD = "smoke", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SIM_CHECK_ID = "oltp-probes-baseline", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-probes-baseline" }

@@ -120,7 +120,7 @@ pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
             "placing a fault in backfill, replay, validation or publication needs a probe at each"
         }
         "O12:restarted-build" => "no operator request starts a newer attempt of a build",
-        "O12:bounded-space" => "needs the LedgerSnapshot probe of #116",
+        "O12:bounded-space" => "needs the LedgerSnapshot probe, which no sweep installs yet",
         "O16:queue-takeover" => "no public observation names the queue owner",
         "O16:snapshot-interrupted" => "needs a probe at the start of a snapshot installation",
         "O21:rows-past-100000" => {
@@ -179,20 +179,49 @@ pub(crate) struct Resolved {
     pub replayed: bool,
 }
 
-/// One applied fault window.
+/// One planned fault, and what happened.
 #[derive(Clone, Debug)]
 pub(crate) struct Fault {
     pub action: Action,
     pub nodes: Vec<u64>,
     pub from: u64,
     pub to: Option<u64>,
+    /// When it was planned to end.
+    pub until: Option<u64>,
     /// The cluster was converged and nothing else was open when it started.
     pub quiet: bool,
-    /// `crash-leader` placement: `before-quorum`, `lost-replies`, or empty.
-    pub variant: &'static str,
-    /// The fault demonstrably happened: an EIO was returned, another leader served, a split
-    /// published.
-    pub observed: bool,
+    /// When the fault took effect: a process stopped, a session was reset, an EIO was returned,
+    /// another leader was elected, a split published. A fault without an effect did not happen.
+    pub effects: Vec<Effect>,
+    /// Whether it hit the elected Data leader, for a fault aimed at one.
+    pub leader: Option<bool>,
+    /// `crash-leader` before quorum: from when every other voter was stopped.
+    pub isolated: Option<u64>,
+}
+
+/// One effect of a fault.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Effect {
+    pub at: u64,
+    /// A reset connection's ends.
+    pub ends: [Option<u64>; 2],
+    /// Requests that a reset connection left unanswered: who sent them, and when.
+    pub unanswered: Vec<(u64, u64)>,
+}
+
+impl Effect {
+    pub(crate) fn at(at: u64) -> Self {
+        Self {
+            at,
+            ..Self::default()
+        }
+    }
+}
+
+impl Fault {
+    pub(crate) fn happened(&self) -> bool {
+        !self.effects.is_empty()
+    }
 }
 
 /// What the faults and attempts of a run amount to.
@@ -200,10 +229,11 @@ pub(crate) struct Evidence<'a> {
     pub faults: &'a [Fault],
     pub attempts: &'a [Attempt],
     pub resolved: &'a BTreeMap<Uuid, Resolved>,
+    /// Reused IDs that D03's assertion judged.
     pub reuse_same_key: u64,
     pub reuse_other_key: u64,
-    /// When `session-drop` reset a session.
-    pub session_drops: &'a [u64],
+    /// Elections of the table's range: when, and which worker.
+    pub elections: &'a [(u64, u64)],
     /// Intervals in which at least two of three workers were frozen or down.
     pub no_quorum: &'a [(u64, u64)],
     /// When a replica move ran.
@@ -244,10 +274,20 @@ impl Evidence<'_> {
             .unwrap_or(u64::MAX)
     }
 
-    fn loaded(&self, from: u64, to: u64) -> bool {
-        self.attempts
-            .iter()
-            .any(|attempt| attempt.mutation && attempt.overlaps(from, to))
+    /// A mutation that got one outcome: it was answered, or its retry was and the result was
+    /// compared with a replay.
+    fn settled(&self, attempt: &Attempt) -> bool {
+        attempt.mutation
+            && (matches!(attempt.answer, Answer::Committed | Answer::Ok)
+                || self.retried(attempt).is_some())
+    }
+
+    /// The first election of another worker than `node` in a window.
+    fn replaced(&self, node: u64, from: u64, to: u64) -> Option<u64> {
+        let mut elections = self.elections.iter();
+        elections
+            .find(|(at, leader)| *leader != node && (from..=to).contains(at))
+            .map(|(at, _)| *at)
     }
 
     pub(crate) fn evaluate(&self) -> Outcome {
@@ -266,7 +306,6 @@ impl Evidence<'_> {
         for index in 0..self.faults.len() {
             self.fault(index, &mut out);
         }
-        self.session_drops(&mut out);
         out
     }
 
@@ -275,11 +314,12 @@ impl Evidence<'_> {
     fn no_quorum(&self, out: &mut Outcome) {
         for &(from, to) in self.no_quorum {
             for attempt in self.attempts.iter().filter(|a| a.mutation && a.fresh) {
-                if attempt.invoked < from || attempt.invoked >= to {
+                // One that outlives the window is answered with a quorum and proves nothing.
+                if attempt.invoked < from || attempt.completed > to {
                     continue;
                 }
                 out.clauses.insert("O06:quorum-loss");
-                if attempt.answer == Answer::Committed && attempt.completed <= to {
+                if attempt.answer == Answer::Committed {
                     out.violations.push((
                         "NoQuorumNoSuccess",
                         format!(
@@ -323,16 +363,19 @@ impl Evidence<'_> {
                     out.clauses.insert("D02:gateway-killed");
                 }
             }
-            Action::CrashLeader | Action::PowerLeader | Action::DrainLeader => {
-                // The retry completed while the old leader was still down.
-                let on_new_leader = self.attempts.iter().any(|attempt| {
-                    attempt.spans(from)
-                        && self
-                            .retried(attempt)
-                            .is_some_and(|resolved| resolved.at < to)
-                });
-                if on_new_leader {
-                    if fault.variant == "before-quorum" {
+            Action::CrashLeader | Action::PowerLeader | Action::DrainLeader
+                if fault.happened() && fault.leader == Some(true) =>
+            {
+                // The retry completed on another leader while the old one was down.
+                let retried = |attempt: &Attempt| {
+                    self.retried(attempt).is_some_and(|resolved| {
+                        resolved.at < to
+                            && self.replaced(fault.nodes[0], from, resolved.at).is_some()
+                    })
+                };
+                for attempt in self.attempts.iter().filter(|a| a.spans(from) && retried(a)) {
+                    // Sent while nothing could have replicated it.
+                    if fault.isolated.is_some_and(|since| attempt.invoked >= since) {
                         out.clauses.insert("D04:before-quorum");
                     }
                     if fault.action == Action::PowerLeader {
@@ -340,36 +383,54 @@ impl Evidence<'_> {
                     }
                 }
             }
-            Action::LeaderMove if fault.observed && self.loaded(from, to) => {
-                out.clauses.insert("D07:leader-move");
+            Action::LeaderMove => {
+                for effect in &fault.effects {
+                    let mut across = self.attempts.iter().filter(|a| a.spans(effect.at));
+                    if across.any(|attempt| self.settled(attempt)) {
+                        out.clauses.insert("D07:leader-move");
+                    }
+                }
             }
-            // It runs whether or not the split publishes: one that does not is a Liveness
-            // violation of the same seed.
-            Action::Split if self.loaded(from, to) => {
-                out.clauses.insert("D07:split");
+            Action::Split => {
+                // A request in flight at the publication, and one sent after it.
+                for effect in &fault.effects {
+                    let settled: Vec<_> =
+                        self.attempts.iter().filter(|a| self.settled(a)).collect();
+                    if settled.iter().any(|a| a.spans(effect.at))
+                        && settled.iter().any(|a| a.invoked > effect.at)
+                    {
+                        out.clauses.insert("D07:split");
+                    }
+                }
             }
             Action::LaneExhaust => self.lane(index, out),
-            Action::DiskError if fault.observed => {
-                let hit = self
-                    .attempts
-                    .iter()
-                    .filter(|attempt| attempt.mutation && attempt.overlaps(from, to));
-                for attempt in hit {
-                    out.clauses.insert("O06:sync-failure");
-                    if self.retried(attempt).is_some() {
-                        out.clauses.insert("O29:ambiguous-write");
+            Action::DiskError => {
+                for effect in &fault.effects {
+                    let hit = self
+                        .attempts
+                        .iter()
+                        .filter(|a| a.mutation && a.spans(effect.at));
+                    for attempt in hit {
+                        out.clauses.insert("O06:sync-failure");
+                        if fault.leader == Some(true) && self.retried(attempt).is_some() {
+                            out.clauses.insert("O29:ambiguous-write");
+                        }
                     }
                 }
             }
             Action::LostReply | Action::LostHttpReply => {
-                let recovered = self
-                    .attempts
-                    .iter()
-                    .any(|attempt| attempt.overlaps(from, to) && self.retried(attempt).is_some());
-                if recovered {
-                    out.clauses.insert("O10:lost-reply");
+                for effect in &fault.effects {
+                    let recovered = self.attempts.iter().any(|attempt| {
+                        attempt.spans(effect.at)
+                            && effect.ends.contains(&Some(attempt.gateway))
+                            && self.retried(attempt).is_some()
+                    });
+                    if recovered {
+                        out.clauses.insert("O10:lost-reply");
+                    }
                 }
             }
+            Action::SessionDrop => self.session_drop(index, out),
             _ => {}
         }
     }
@@ -392,12 +453,16 @@ impl Evidence<'_> {
         if !offered {
             return;
         }
+        // Judged only when nothing else could have stopped the range.
+        if !fault.quiet || self.next_fault(index, from) <= until {
+            return;
+        }
         out.clauses.insert("D10:lane");
         let progressed = self
             .attempts
             .iter()
             .any(|a| a.answer == Answer::Committed && a.completed >= from && a.completed <= until);
-        if fault.quiet && self.next_fault(index, from) > until && !progressed {
+        if !progressed {
             out.violations.push((
                 "RaftProgress",
                 format!("no write committed from {from}ms to {until}ms around a lane burst"),
@@ -405,36 +470,42 @@ impl Evidence<'_> {
         }
     }
 
-    /// D10: callers across a dropped session see a success, an unknown outcome or overload.
+    /// D10: callers whose session was dropped see a success, an unknown outcome or overload.
     /// An attempt that also met another fault proves nothing about the drop.
-    fn session_drops(&self, out: &mut Outcome) {
-        for &at in self.session_drops {
-            for attempt in self.attempts.iter().filter(|attempt| attempt.spans(at)) {
-                let alone = self.faults.iter().all(|fault| {
-                    let (from, to) = Self::window(fault);
-                    fault.action == Action::SessionDrop || !attempt.overlaps(from, to)
-                }) && self
-                    .moving
-                    .is_none_or(|(from, to)| !attempt.overlaps(from, to));
-                if !alone {
-                    continue;
+    fn session_drop(&self, index: usize, out: &mut Outcome) {
+        let Some(effect) = self.faults[index].effects.first() else {
+            return;
+        };
+        for attempt in self.attempts.iter().filter(|a| a.spans(effect.at)) {
+            // Its gateway had a request of this attempt's time unanswered on that session.
+            let carried = effect
+                .unanswered
+                .iter()
+                .any(|&(from, sent)| from == attempt.gateway && sent >= attempt.invoked);
+            let alone = self.faults.iter().all(|fault| {
+                let (from, to) = Self::window(fault);
+                fault.action == Action::SessionDrop || !attempt.overlaps(from, to)
+            }) && self
+                .moving
+                .is_none_or(|(from, to)| !attempt.overlaps(from, to));
+            if !carried || !alone {
+                continue;
+            }
+            out.clauses.insert("D10:session-drop");
+            let allowed = match attempt.answer {
+                Answer::Committed | Answer::Ok | Answer::Unknown => true,
+                Answer::Refused(code) => {
+                    matches!(code, ErrorCode::Conflict | ErrorCode::Overloaded)
                 }
-                out.clauses.insert("D10:session-drop");
-                let allowed = match attempt.answer {
-                    Answer::Committed | Answer::Ok | Answer::Unknown => true,
-                    Answer::Refused(code) => {
-                        matches!(code, ErrorCode::Conflict | ErrorCode::Overloaded)
-                    }
-                };
-                if !allowed {
-                    out.violations.push((
-                        "SessionDropAnswer",
-                        format!(
-                            "attempt {} across the session drop at {at}ms was answered {:?}",
-                            attempt.id, attempt.answer
-                        ),
-                    ));
-                }
+            };
+            if !allowed {
+                out.violations.push((
+                    "SessionDropAnswer",
+                    format!(
+                        "attempt {} across the session drop at {}ms was answered {:?}",
+                        attempt.id, effect.at, attempt.answer
+                    ),
+                ));
             }
         }
     }
@@ -462,9 +533,29 @@ mod tests {
             nodes: vec![node],
             from,
             to: Some(to),
+            until: None,
             quiet: true,
-            variant: "",
-            observed: true,
+            effects: vec![Effect::at(from)],
+            leader: Some(true),
+            isolated: None,
+        }
+    }
+
+    fn evidence<'a>(
+        faults: &'a [Fault],
+        attempts: &'a [Attempt],
+        resolved: &'a BTreeMap<Uuid, Resolved>,
+    ) -> Evidence<'a> {
+        Evidence {
+            faults,
+            attempts,
+            resolved,
+            reuse_same_key: 0,
+            reuse_other_key: 0,
+            elections: &[],
+            no_quorum: &[],
+            moving: None,
+            deadline_ms: 300,
         }
     }
 
@@ -475,17 +566,20 @@ mod tests {
         no_quorum: &[(u64, u64)],
     ) -> Outcome {
         Evidence {
-            faults,
-            attempts,
-            resolved,
-            reuse_same_key: 0,
-            reuse_other_key: 0,
-            session_drops: &[],
             no_quorum,
-            moving: None,
-            deadline_ms: 300,
+            ..evidence(faults, attempts, resolved)
         }
         .evaluate()
+    }
+
+    fn resolved(id: u128, at: u64, replayed: bool) -> BTreeMap<Uuid, Resolved> {
+        let resolved = Resolved {
+            attempts: 2,
+            at,
+            gateway: 102,
+            replayed,
+        };
+        BTreeMap::from([(Uuid::from_u128(id), resolved)])
     }
 
     /// Lead decision 10.3: a short deadline is an observation, not a D05 assertion.
@@ -520,72 +614,170 @@ mod tests {
         let out = evaluate(&[], &[commit], &none, &[(1_000, 2_000)]);
         assert!(out.clauses.contains("O06:quorum-loss"));
         assert_eq!(out.violations[0].0, "NoQuorumNoSuccess");
-        // Committed only after the thaw.
+        // Committed only after the thaw: neither a violation nor an assertion that ran.
         let thawed = attempt(2, 1_100, 2_100, Answer::Committed);
         let out = evaluate(&[], &[thawed], &none, &[(1_000, 2_000)]);
-        assert!(out.violations.is_empty());
+        assert!(out.violations.is_empty() && out.clauses.is_empty());
     }
 
+    /// Review 115, M3: a write sent before the freeze, a follower that was killed, and a retry
+    /// without a new leader are none of them "before quorum".
     #[test]
-    fn leader_loss_needs_a_retry_that_completed_on_the_new_leader() {
+    fn before_quorum_needs_the_leader_a_write_after_the_freeze_and_a_new_leader() {
         let mut crash = fault(Action::CrashLeader, 1, 1_000, 5_000);
-        crash.variant = "before-quorum";
-        let lost = attempt(1, 900, 1_300, Answer::Unknown);
-        let resolved = |at, replayed| {
-            let resolved = Resolved {
-                attempts: 2,
-                at,
-                gateway: 102,
-                replayed,
+        crash.isolated = Some(800);
+        let run = |crash: &Fault, invoked, map: &BTreeMap<Uuid, Resolved>| {
+            let lost = attempt(1, invoked, 1_300, Answer::Unknown);
+            let evidence = Evidence {
+                elections: &[(500, 1), (1_500, 2)],
+                ..evidence(
+                    std::slice::from_ref(crash),
+                    std::slice::from_ref(&lost),
+                    map,
+                )
             };
-            BTreeMap::from([(Uuid::from_u128(1), resolved)])
+            let out = evidence.evaluate();
+            out.clauses.contains("D04:before-quorum")
         };
-        let run = |map: &BTreeMap<Uuid, Resolved>| {
-            evaluate(
-                std::slice::from_ref(&crash),
-                std::slice::from_ref(&lost),
-                map,
-                &[],
-            )
-            .clauses
-            .contains("D04:before-quorum")
+        assert!(run(&crash, 900, &resolved(1, 2_000, true)));
+        assert!(
+            !run(&crash, 700, &resolved(1, 2_000, true)),
+            "sent too early"
+        );
+        assert!(!run(&crash, 900, &resolved(1, 6_000, true)), "it was back");
+        assert!(!run(&crash, 900, &resolved(1, 2_000, false)), "no replay");
+        assert!(
+            !run(&crash, 900, &resolved(1, 1_400, true)),
+            "no new leader"
+        );
+        assert!(!run(&crash, 900, &BTreeMap::new()));
+        let mut follower = crash.clone();
+        follower.leader = Some(false);
+        assert!(!run(&follower, 900, &resolved(1, 2_000, true)));
+        crash.isolated = None;
+        assert!(!run(&crash, 900, &resolved(1, 2_000, true)));
+    }
+
+    /// Review 115, M1: the tag was set before the condition of its assertion.
+    #[test]
+    fn a_lane_tag_means_that_progress_was_judged() {
+        let none = BTreeMap::new();
+        let burst = fault(Action::LaneExhaust, 101, 1_000, 1_200);
+        let attempts = [
+            attempt(1, 1_050, 1_100, Answer::Refused(ErrorCode::Overloaded)),
+            attempt(2, 1_050, 1_350, Answer::Unknown),
+        ];
+        let out = evaluate(std::slice::from_ref(&burst), &attempts, &none, &[]);
+        assert!(out.clauses.contains("D10:lane"));
+        assert_eq!(out.violations[0].0, "RaftProgress");
+        let mut busy = burst.clone();
+        busy.quiet = false;
+        let out = evaluate(&[busy], &attempts, &none, &[]);
+        assert!(out.clauses.is_empty() && out.violations.is_empty());
+        let other = fault(Action::Partition, 1, 1_300, 1_500);
+        let out = evaluate(&[burst, other], &attempts, &none, &[]);
+        assert!(out.clauses.is_empty() && out.violations.is_empty());
+    }
+
+    /// Review 115, M2: a split that never published is not D07's split.
+    #[test]
+    fn a_split_tag_needs_a_publication_and_requests_on_both_sides_of_it() {
+        let none = BTreeMap::new();
+        let mut split = fault(Action::Split, 1, 1_000, 4_000);
+        split.effects = vec![Effect::at(2_000)];
+        let across = attempt(1, 1_900, 2_100, Answer::Committed);
+        let after = attempt(2, 2_200, 2_300, Answer::Committed);
+        let lost = attempt(3, 2_200, 2_300, Answer::Unknown);
+        let run = |split: &Fault, attempts: &[Attempt]| {
+            let out = evaluate(std::slice::from_ref(split), attempts, &none, &[]);
+            out.clauses.contains("D07:split")
         };
-        assert!(run(&resolved(2_000, true)));
-        assert!(!run(&resolved(6_000, true)), "the old leader was back");
-        assert!(!run(&resolved(2_000, false)), "no replay was compared");
-        assert!(!run(&BTreeMap::new()));
+        assert!(run(&split, &[across.clone(), after.clone()]));
+        assert!(!run(&split, &[across.clone(), lost]));
+        assert!(!run(&split, std::slice::from_ref(&after)));
+        split.effects.clear();
+        assert!(!run(&split, &[across, after]));
+    }
+
+    /// Review 115, M4 and M7: a window in which no reply was lost, and an armed EIO that never
+    /// fired, tag nothing.
+    #[test]
+    fn a_fault_that_did_not_happen_tags_nothing() {
+        let write = attempt(1, 1_000, 1_500, Answer::Unknown);
+        let map = resolved(1, 2_000, true);
+        let run = |fault: &Fault| {
+            let write = std::slice::from_ref(&write);
+            evaluate(std::slice::from_ref(fault), write, &map, &[]).clauses
+        };
+        let mut reply = fault(Action::LostReply, 2, 900, 1_600);
+        reply.effects = vec![Effect {
+            at: 1_200,
+            ends: [Some(2), Some(101)],
+            unanswered: Vec::new(),
+        }];
+        assert!(run(&reply).contains("O10:lost-reply"));
+        reply.effects[0].ends = [Some(2), Some(102)];
+        assert!(run(&reply).is_empty(), "another gateway's session");
+        reply.effects.clear();
+        assert!(run(&reply).is_empty());
+        let mut disk = fault(Action::DiskError, 2, 900, 1_600);
+        disk.effects = vec![Effect::at(1_200)];
+        let both = ["O06:sync-failure", "O29:ambiguous-write"];
+        assert_eq!(run(&disk), BTreeSet::from(both));
+        disk.leader = Some(false);
+        assert_eq!(run(&disk), BTreeSet::from([both[0]]));
+        disk.effects.clear();
+        assert!(run(&disk).is_empty());
     }
 
     /// Direct seed 2: the refusal came from the partition that was open, not from the drop.
+    /// Review 115, M12: an attempt on another session was judged too.
     #[test]
-    fn a_session_drop_is_judged_only_without_another_fault() {
+    fn a_session_drop_is_judged_only_on_its_session_and_without_another_fault() {
         let refused = attempt(
             1,
             1_000,
             1_500,
             Answer::Refused(ErrorCode::StorageUnavailable),
         );
+        let drop = |from, sent| {
+            let mut drop = fault(Action::SessionDrop, 0, 1_400, 1_400);
+            drop.effects[0].unanswered = vec![(from, sent)];
+            drop
+        };
         let run = |faults: &[Fault], moving| {
+            let none = BTreeMap::new();
             let evidence = Evidence {
-                faults,
-                attempts: std::slice::from_ref(&refused),
-                resolved: &BTreeMap::new(),
-                reuse_same_key: 0,
-                reuse_other_key: 0,
-                session_drops: &[1_400],
-                no_quorum: &[],
                 moving,
-                deadline_ms: 300,
+                ..evidence(faults, std::slice::from_ref(&refused), &none)
             };
             let out = evidence.evaluate();
             (out.clauses.len(), out.violations.len())
         };
-        assert_eq!(run(&[], None), (1, 1));
+        assert_eq!(run(&[drop(101, 1_010)], None), (1, 1));
+        assert_eq!(run(&[drop(102, 1_010)], None), (0, 0), "another gateway");
+        assert_eq!(run(&[drop(101, 900)], None), (0, 0), "an earlier request");
         let partition = fault(Action::Partition, 1, 500, 2_000);
-        assert_eq!(run(&[partition], None), (0, 0));
+        assert_eq!(run(&[drop(101, 1_010), partition], None), (0, 0));
         // Move seed 7: the same refusals came with the drop and the delay switched off.
-        assert_eq!(run(&[], Some((500, 2_000))), (0, 0));
-        assert_eq!(run(&[], Some((2_000, 3_000))), (1, 1));
+        assert_eq!(run(&[drop(101, 1_010)], Some((500, 2_000))), (0, 0));
+        assert_eq!(run(&[drop(101, 1_010)], Some((2_000, 3_000))), (1, 1));
+    }
+
+    #[test]
+    fn a_leader_move_needs_an_election_and_a_request_across_it() {
+        let none = BTreeMap::new();
+        let mut moved = fault(Action::LeaderMove, 1, 1_000, 3_000);
+        moved.effects = vec![Effect::at(2_000)];
+        let run = |fault: &Fault, attempt: Attempt| {
+            let out = evaluate(std::slice::from_ref(fault), &[attempt], &none, &[]);
+            out.clauses.contains("D07:leader-move")
+        };
+        assert!(run(&moved, attempt(1, 1_900, 2_100, Answer::Committed)));
+        assert!(!run(&moved, attempt(1, 1_100, 1_900, Answer::Committed)));
+        assert!(!run(&moved, attempt(1, 1_900, 2_100, Answer::Unknown)));
+        moved.effects.clear();
+        assert!(!run(&moved, attempt(1, 1_900, 2_100, Answer::Committed)));
     }
 
     #[test]

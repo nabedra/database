@@ -1,0 +1,32 @@
+# Confirmed in the Cache fault model only, by an independent review of #111. Local and unattested.
+# Whether this loss is allowed is an open contract question. This record is neither a pass nor a
+# fail of the guarantee it names.
+#
+# Two causes, each sufficient on its own:
+# 1. Once the target installs the enrollment that retired its source, `replicate` skips the source
+#    (`worker/sync.rs`, `topology.member(source)`) and `Transfer::Apply` drops its packets
+#    (`worker/actor.rs`, `topology.member(source).is_some()`), while the source keeps serving on its grant.
+# 2. A staged promotion that commits before the grant ends makes the target the primary of the next
+#    epoch, so it drops and stops polling the source's deltas.
+#
+# 43 schedules: scripted seeds 1 to 3 and generated seeds 1 to 40, each replayed. The target kept the last
+# acknowledged write in 0 of 86 runs. Diagnostic patches for seed 1 to 20 (late commit, member gate, both):
+# `exp.patch` and `matrix.patch`, with `seeds-retire.tsv`, in the review's `land-111-data`, not in this
+# repository. With both causes removed nothing was lost.
+id = "CACHE-retired-live-source-lost-writes"
+title = "Retiring a live, controller-isolated cache primary loses the writes it acknowledges until its grant ends"
+class = "membership-replacement-trust"
+module = "cache"
+guarantees = ["CACHE-G05"]
+scenarios = ["K03"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "K03"
+seed = 1
+why_not_caught = "The relaxed Cache checker has no time window in simulation, so it allows any acknowledged write above the retained prefix, and the committed schedules neither kept the peer link open during such a retirement nor asserted the surviving value."
+invariant_added = "Pending the contract decision: either a copy keeps applying a retired source's deltas until the source's last committed grant ends, or writes acknowledged after the retirement are recorded as allowed loss."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-23"

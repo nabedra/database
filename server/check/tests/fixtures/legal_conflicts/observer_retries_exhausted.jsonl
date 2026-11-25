@@ -1,0 +1,6 @@
+{"index":0,"type":"invoke","process":0,"f":"insert","key":"k","value":1,"request_id":"r"}
+{"index":1,"type":"info","process":0,"f":"insert","key":"k","value":{"code":"outcome_unknown"},"request_id":"r"}
+{"index":2,"type":"invoke","process":2,"f":"insert","key":"k","value":1,"request_id":"r"}
+{"index":3,"type":"fail","process":2,"f":"insert","key":"k","value":{"code":"overloaded","message":"direct in-flight budget is full","not_applied":true},"request_id":"r"}
+{"index":4,"type":"invoke","process":1,"f":"insert","key":"k","value":5,"request_id":"other"}
+{"index":5,"type":"fail","process":1,"f":"insert","key":"k","value":{"code":"conflict","message":"transaction preparation conflicted after exhausting snapshot retries","not_applied":true},"request_id":"other"}

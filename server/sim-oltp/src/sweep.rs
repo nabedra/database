@@ -11,7 +11,7 @@ use nabedra_check::Gen;
 use nabedra_check::evidence::{Artifact, Record};
 use nabedra_rt::time;
 use nabedra_sim::shrink;
-use nabedra_sim::sweep::{self, PlantedSearch, SeedRun, SweepConfig, SweepReport};
+use nabedra_sim::sweep::{self, PlantedSearch, SeedRun, SeedSummary, SweepConfig, SweepReport};
 use serde_json::{Value, json};
 
 use crate::{
@@ -243,6 +243,7 @@ fn seed_line(
     workload: Workload,
     profile: Option<&str>,
     scenarios: &Scenarios,
+    verdict: Option<Verdict>,
 ) {
     println!(
         "nabedra-sim-seed: {}",
@@ -253,8 +254,37 @@ fn seed_line(
             "workload": workload.name(),
             "profile": profile,
             "scenarios": scenarios,
+            "verdict": verdict.map(Verdict::name),
         })
     );
+}
+
+/// What a sweep may say about a seed. A seed that did no work has a `Progress` violation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Verdict {
+    /// No violation, and a second run had the same trace and history.
+    Clean,
+    /// No violation, and run once. It is not clean: the run may not be reproducible.
+    Unreplayed,
+    Red,
+}
+
+impl Verdict {
+    fn of(summary: &SeedSummary) -> Self {
+        match (summary.passed && summary.deterministic, summary.replayed) {
+            (false, _) => Self::Red,
+            (true, false) => Self::Unreplayed,
+            (true, true) => Self::Clean,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Unreplayed => "unreplayed",
+            Self::Red => "red",
+        }
+    }
 }
 
 fn run_search(
@@ -306,7 +336,9 @@ fn run_search(
             .checked_add(offset)
             .ok_or("seed range overflows u64")?;
         let (kinds, workload, scenarios) = searched(&observed, seed, setup);
-        seed_line(seed, &kinds, workload, setup.profile(seed), &scenarios);
+        // A search runs each seed once, so it calls none clean.
+        let profile = setup.profile(seed);
+        seed_line(seed, &kinds, workload, profile, &scenarios, None);
     }
     result.map(|_| true).map_err(Into::into)
 }
@@ -447,6 +479,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     let mut stats = Vec::with_capacity(report.seeds.len());
     let mut paths = report.artifacts.clone();
     let mut unjudged: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    let mut verdicts = BTreeMap::new();
     // Scenario tag -> (seeds that executed it, seeds among them that failed).
     let mut scenario_seeds: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
     std::fs::create_dir_all(&config.artifacts)?;
@@ -469,7 +502,10 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
                 unjudged.entry(rule).or_default().push(seed);
             }
         }
-        seed_line(seed, &kinds, seed_workload, setup.profile(seed), &tags);
+        let verdict = Verdict::of(summary);
+        *verdicts.entry(verdict).or_insert(0_u64) += 1;
+        let profile = setup.profile(seed);
+        seed_line(seed, &kinds, seed_workload, profile, &tags, Some(verdict));
         for tag in &tags {
             let entry = scenario_seeds.entry(tag).or_default();
             entry.0 += 1;
@@ -494,6 +530,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         }
         stats.push(json!({
             "seed": seed,
+            "verdict": verdict.name(),
             "workload": seed_workload.name(),
             "profile": setup.profile(seed),
             "scenarios": tags,
@@ -511,6 +548,15 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         }));
     }
     assertions.insert("seed sweep", report.passed());
+    // A filter that matches nothing, or a sweep that stops early, is not a pass.
+    assertions.insert(
+        "every seed of the range ran",
+        config.count > 0 && report.seeds.len() as u64 == config.count,
+    );
+    let unreplayed = verdicts.get(&Verdict::Unreplayed).copied().unwrap_or(0);
+    if config.verify_replay >= 1.0 {
+        assertions.insert("every passing seed was replayed", unreplayed == 0);
+    }
     let mut scenario_assertions = BTreeMap::new();
     for (tag, (seeds, failed)) in &scenario_seeds {
         scenario_assertions.insert(*tag, failed == &0);
@@ -552,6 +598,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         serde_json::to_vec_pretty(&json!({
             "evidence": "fault-model",
             "workload": workload,
+            "verdicts": verdicts.iter().map(|(verdict, seeds)| (verdict.name(), seeds)).collect::<BTreeMap<_, _>>(),
             "scenarios": scenario_seeds.iter().map(|(tag, (seeds, failed))| (*tag, json!({"seeds": seeds, "failing": failed}))).collect::<BTreeMap<_, _>>(),
             "direct_oltp": true,
             "defect": defect.name(),
@@ -568,9 +615,11 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     )?;
     paths.insert(0, report_path);
     eprintln!(
-        "Fault model: {} clean seeds, {} replayed, {:.3} s wall, {:?} simulation CPU s, \
+        "Fault model: {} clean seeds (worked and replayed), {unreplayed} passing seeds not \
+         replayed, {} red, {} replayed, {:.3} s wall, {:?} simulation CPU s, \
          {:?} KiB process peak RSS, configuration {config_hash}",
-        report.count - report.evidence_seeds().failing.len() as u64,
+        verdicts.get(&Verdict::Clean).copied().unwrap_or(0),
+        verdicts.get(&Verdict::Red).copied().unwrap_or(0),
         report.replayed(),
         duration_s,
         total_cpu_s,
@@ -586,6 +635,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             scenarios: scenario_assertions,
             assertions,
             unjudged,
+            unreplayed,
             defects_skipped: test_defects && !report.passed(),
             duration_s,
             total_cpu_s,
@@ -700,6 +750,7 @@ struct RecordInput {
     assertions: BTreeMap<&'static str, bool>,
     /// Rules of the topology workload, and the seeds that did not judge them.
     unjudged: BTreeMap<String, Vec<u64>>,
+    unreplayed: u64,
     defects_skipped: bool,
     duration_s: f64,
     total_cpu_s: Option<f64>,
@@ -776,7 +827,7 @@ fn write_record(
         record.not_run("seeded defects", "the unmodified smoke sweep failed");
     }
     for invariant in PROBE_INVARIANTS {
-        record.not_run(invariant, "P10-PROBES integration pending");
+        record.not_run(invariant, "no sweep installs the probes yet");
     }
     if input.workload == Workload::Topology.name() {
         for (rule, why) in crate::invariants::topology::NOT_RUN {
@@ -793,9 +844,12 @@ fn write_record(
     }
     record.not_run(
         "ResourceBaseline ledger and RangeClock pending sets",
-        "P10-PROBES integration pending",
+        "no sweep installs the probes yet",
     );
-    record.not_run("ConsistentCommittedData", "P10-PROBES integration pending");
+    record.not_run(
+        "ConsistentCommittedData",
+        "no sweep installs the probes yet",
+    );
     if input.smoke {
         for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {
             record.not_run(scenario, &format!("runs in the {workload} workload"));
@@ -815,6 +869,15 @@ fn write_record(
                 record.not_run(scenario, &format!("clauses that did not run: {missing:?}"));
             }
         }
+    }
+    if input.unreplayed > 0 {
+        record.not_run(
+            "clean verdict of passing seeds",
+            &format!(
+                "{} passing seeds were run once and not replayed",
+                input.unreplayed
+            ),
+        );
     }
     if report.replayed() == 0 {
         record.not_run(
@@ -920,6 +983,37 @@ mod tests {
             });
             assert_eq!(runs.load(Ordering::SeqCst), 2);
             assert!(!report.passed(), "panic in run {panicking}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Review 115, M10: 46 of 47 seeds that were reported as clean had been run once.
+    #[test]
+    fn a_seed_that_was_not_replayed_is_not_clean() {
+        let dir = std::env::temp_dir().join(format!("p10-verdict-{}", std::process::id()));
+        for (replay, red, want) in [
+            (0.0, false, Verdict::Unreplayed),
+            (1.0, false, Verdict::Clean),
+            (1.0, true, Verdict::Red),
+            (0.0, true, Verdict::Red),
+        ] {
+            let mut config = SweepConfig::new("verdict", 1, 1);
+            config.verify_replay = replay;
+            config.artifacts = dir.clone();
+            let report = sweep::sweep(&config, |seed, _| SeedRun {
+                seed,
+                trace_events: 1,
+                violations: red
+                    .then(|| "t=1ms Progress: none".into())
+                    .into_iter()
+                    .collect(),
+                ..SeedRun::default()
+            });
+            assert_eq!(
+                Verdict::of(&report.seeds[0]),
+                want,
+                "replay {replay}, red {red}"
+            );
         }
         let _ = std::fs::remove_dir_all(dir);
     }

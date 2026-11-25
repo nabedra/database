@@ -303,7 +303,12 @@ pub(crate) fn classify(f: &str) -> Option<&'static str> {
 /// The error code of a refusal: the completion value's `code` or `error` string, or
 /// `error.code`.
 pub(crate) fn error_code(op: &Op) -> Option<&str> {
-    let v = op.complete_value.as_object()?;
+    code_of(&op.complete_value)
+}
+
+/// [`error_code`] of an answer.
+pub(crate) fn code_of(answer: &Value) -> Option<&str> {
+    let v = answer.as_object()?;
     if let Some(c) = v.get("code").and_then(Value::as_str) {
         return Some(c);
     }
@@ -312,6 +317,14 @@ pub(crate) fn error_code(op: &Op) -> Option<&str> {
         Value::Object(e) => e.get("code").and_then(Value::as_str),
         _ => None,
     }
+}
+
+/// The error message of an answer, wherever [`code_of`] finds its code: the value's `message`,
+/// or `error.message`.
+pub(crate) fn message_of(answer: &Value) -> Option<&str> {
+    let v = answer.as_object()?;
+    let nested = || v.get("error")?.as_object()?.get("message");
+    v.get("message").or_else(nested)?.as_str()
 }
 
 /// The existence flag of an `ok` `update` or `delete`: the completion value or its `data`.

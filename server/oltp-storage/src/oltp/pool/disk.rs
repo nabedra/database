@@ -83,6 +83,14 @@ pub fn registries_empty(world: &nabedra_rt::sim::World) -> bool {
     }
 }
 
+#[cfg(feature = "sim")]
+impl DiskReservationStats {
+    /// The device, its reservations and their bytes (simulation only).
+    pub(super) fn ledger(&self) -> (u64, u64, u64) {
+        (self.device, self.reservations as u64, self.reserved_bytes)
+    }
+}
+
 pub(super) struct PoolDisk {
     device: u64,
     directory: File,

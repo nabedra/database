@@ -11,8 +11,11 @@
 //! (`server/events/src/sim/net.rs`), so the same stream gives the same plans.
 
 use std::collections::BTreeSet;
+use std::fmt;
+use std::sync::Arc;
 
 use nabedra_check::Gen;
+use serde_json::Value;
 
 use crate::rng::{Draw, SplitMix64, stream};
 
@@ -56,8 +59,37 @@ impl Filters {
     }
 }
 
+/// One thing a [`NetPlan`] did, as its tap sees it, once it took effect.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum NetEvent {
+    /// A message was planned. `blocked` tells a drop on a blocked link from a random one.
+    Message {
+        from: u64,
+        to: u64,
+        plan: Plan,
+        blocked: bool,
+        /// What [`NetPlan::plan_about`] was told, or null.
+        about: Value,
+    },
+    /// An open directed link was blocked.
+    Blocked { from: u64, to: u64 },
+    /// A blocked directed link was opened on its own.
+    Unblocked { from: u64, to: u64 },
+    /// Every blocked link was opened at once.
+    Healed,
+    /// A node's messages are held from here on.
+    Held { node: u64 },
+    /// A held node's messages flow again.
+    Released { node: u64 },
+}
+
+/// Sees every [`NetEvent`], in order. It is called with whatever the router holds locked,
+/// so it must not call back into the router.
+pub type NetTap = Arc<dyn Fn(&NetEvent) + Send + Sync>;
+
 /// The network state of one run.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NetPlan {
     rng: SplitMix64,
     filters: Filters,
@@ -66,6 +98,21 @@ pub struct NetPlan {
     paused: BTreeSet<u64>,
     epoch: u64,
     messages: u64,
+    tap: Option<NetTap>,
+}
+
+/// Without the tap, so the text does not depend on whether a run is observed.
+impl fmt::Debug for NetPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NetPlan")
+            .field("rng", &self.rng)
+            .field("filters", &self.filters)
+            .field("blocked", &self.blocked)
+            .field("paused", &self.paused)
+            .field("epoch", &self.epoch)
+            .field("messages", &self.messages)
+            .finish()
+    }
 }
 
 impl NetPlan {
@@ -84,6 +131,18 @@ impl NetPlan {
             paused: BTreeSet::new(),
             epoch: 0,
             messages: 0,
+            tap: None,
+        }
+    }
+
+    /// Reports every later event to `tap`. Clones of the plan report to the same tap.
+    pub fn set_tap(&mut self, tap: Option<NetTap>) {
+        self.tap = tap;
+    }
+
+    fn emit(&self, event: &NetEvent) {
+        if let Some(tap) = &self.tap {
+            tap(event);
         }
     }
 
@@ -91,6 +150,27 @@ impl NetPlan {
     /// otherwise the draws are drop (if enabled), delay (if enabled), duplicate (if
     /// enabled), in that order.
     pub fn plan(&mut self, from: u64, to: u64) -> Plan {
+        self.plan_about(from, to, || Value::Null)
+    }
+
+    /// [`NetPlan::plan`], telling the tap what the message is. `about` is called only when
+    /// there is a tap, and never changes the plan.
+    pub fn plan_about(&mut self, from: u64, to: u64, about: impl FnOnce() -> Value) -> Plan {
+        let blocked = self.is_blocked(from, to);
+        let plan = self.draw(from, to);
+        if self.tap.is_some() {
+            self.emit(&NetEvent::Message {
+                from,
+                to,
+                plan,
+                blocked,
+                about: about(),
+            });
+        }
+        plan
+    }
+
+    fn draw(&mut self, from: u64, to: u64) -> Plan {
         self.messages += 1;
         if self.blocked.contains(&(from, to)) {
             return Plan::Drop;
@@ -158,20 +238,28 @@ impl NetPlan {
     /// Blocks the directed link `from -> to` (a one-way link failure).
     pub fn block(&mut self, from: u64, to: u64) {
         self.epoch += 1;
-        self.blocked.insert((from, to));
+        self.cut(from, to);
+    }
+
+    fn cut(&mut self, from: u64, to: u64) {
+        if self.blocked.insert((from, to)) {
+            self.emit(&NetEvent::Blocked { from, to });
+        }
     }
 
     pub fn unblock(&mut self, from: u64, to: u64) {
         self.epoch += 1;
-        self.blocked.remove(&(from, to));
+        if self.blocked.remove(&(from, to)) {
+            self.emit(&NetEvent::Unblocked { from, to });
+        }
     }
 
     /// Cuts `target` off from every other node in `nodes`, both ways.
     pub fn isolate(&mut self, target: u64, nodes: impl IntoIterator<Item = u64>) {
         self.epoch += 1;
         for other in nodes.into_iter().filter(|other| *other != target) {
-            self.blocked.insert((target, other));
-            self.blocked.insert((other, target));
+            self.cut(target, other);
+            self.cut(other, target);
         }
     }
 
@@ -183,8 +271,8 @@ impl NetPlan {
             for other in sides.iter().skip(i + 1) {
                 for &a in side {
                     for &b in other {
-                        self.blocked.insert((a, b));
-                        self.blocked.insert((b, a));
+                        self.cut(a, b);
+                        self.cut(b, a);
                     }
                 }
             }
@@ -194,26 +282,39 @@ impl NetPlan {
     /// Opens every link. Filters and pauses stay.
     pub fn heal_links(&mut self) {
         self.epoch += 1;
-        self.blocked.clear();
+        self.open_links();
+    }
+
+    fn open_links(&mut self) {
+        if !self.blocked.is_empty() {
+            self.blocked.clear();
+            self.emit(&NetEvent::Healed);
+        }
     }
 
     /// Opens every link, clears the filters and resumes every paused node.
     pub fn heal_all(&mut self) {
         self.epoch += 1;
-        self.blocked.clear();
+        self.open_links();
         self.filters = Filters::default();
-        self.paused.clear();
+        for node in std::mem::take(&mut self.paused) {
+            self.emit(&NetEvent::Released { node });
+        }
     }
 
     /// Holds everything `node` sends and receives until [`NetPlan::resume`].
     pub fn pause(&mut self, node: u64) {
         self.epoch += 1;
-        self.paused.insert(node);
+        if self.paused.insert(node) {
+            self.emit(&NetEvent::Held { node });
+        }
     }
 
     pub fn resume(&mut self, node: u64) {
         self.epoch += 1;
-        self.paused.remove(&node);
+        if self.paused.remove(&node) {
+            self.emit(&NetEvent::Released { node });
+        }
     }
 
     pub fn is_paused(&self, node: u64) -> bool {

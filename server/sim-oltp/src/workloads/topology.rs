@@ -1766,6 +1766,9 @@ pub(crate) async fn run(
     warm_quiet(&quiet).await?;
     warm_fence(&fence).await?;
     let cluster_id = cluster.config.cluster_id;
+    // The nemesis aims at the leader of `main`.
+    let watched = Uuid::parse_str(&t.main.table).map_err(|error| format!("table UUID: {error}"))?;
+    cluster.watch_table(watched);
     if plan.split == SplitTiming::BeforeLoad {
         let deadline = t.now() + CHANGE_LIMIT.as_millis() as u64;
         t.change_by.store(deadline, Ordering::Release);
@@ -1776,8 +1779,7 @@ pub(crate) async fn run(
             return Err(format!("the split before the load did not publish: {why}"));
         }
     }
-    for node in WORKERS {
-        let stats = cluster.stats(node).await?;
+    for (node, stats) in crate::workload::steady(cluster).await? {
         cluster
             .checks
             .capture_resources(&cluster.world, node, &stats);
@@ -1788,14 +1790,14 @@ pub(crate) async fn run(
     let start = elapsed_ms(&cluster.world);
     let profile = selection.profile(seed);
     let mut chaos = (!no_nemesis && profile.total_weight() > 0)
-        .then(|| Chaos::new(profile, faults.clone(), start, g));
+        .then(|| Chaos::new(&cluster.world, profile, faults.clone(), start, g));
     if no_nemesis {
         plan.stale.clear();
     }
-    let mut moving = plan.moving.take().map(|mut moving| {
-        moving.set_faults(faults.clone());
-        moving
-    });
+    let mut moving = plan.moving.take();
+    if let (Some(moving), Some(moved)) = (moving.as_mut(), moved.as_ref()) {
+        moving.start(cluster, moved, &faults);
+    }
     cluster.record(format!(
         "workload {} profile {} clients {}+{} split {:?} move {} stale {:?} quiet {:?}",
         Workload::Topology,
@@ -1857,9 +1859,6 @@ pub(crate) async fn run(
         if let Some(chaos) = chaos.as_mut() {
             chaos.tick(cluster, &ctx, g).await;
         }
-        if let (Some(moving), Some(moved)) = (moving.as_mut(), moved.as_ref()) {
-            moving.tick(cluster, moved).await;
-        }
         *t.run.lock().unwrap() = cluster.config.run_id;
         stale_windows(cluster, &t, &mut plan.stale, &mut frozen, start);
         time::sleep(TICK).await;
@@ -1871,6 +1870,13 @@ pub(crate) async fn run(
         work: progress(cluster, &t, moved.as_ref(), load),
         moved_checked: false,
     };
+    if cluster.elections().is_empty() {
+        cluster.checks.violate(
+            &cluster.world,
+            "LeaderUnknown",
+            "no election of the range of main was seen on the wire",
+        );
+    }
     if let Some((gateway, _)) = frozen.take() {
         cluster.thaw(gateway);
     }
@@ -1891,21 +1897,21 @@ pub(crate) async fn run(
             let _ = dropping.await;
         }));
         tasks.append(&mut changes);
-        t.change_by.store(0, Ordering::Release);
         judge(cluster, &t);
         summarize(
             cluster,
             &t,
             chaos.as_ref(),
-            moving.is_some(),
+            moving.as_ref(),
             plan.split,
             &seen,
             true,
             &mut report,
         );
-        return direct::abandon(cluster, &ctx, tasks, report).await;
+        abandon(cluster, &t, tasks).await;
+        return Ok(report);
     }
-    faults.clear();
+    faults.heal();
     *t.run.lock().unwrap() = cluster.config.run_id;
     let healed = cluster.world.elapsed();
     let healed_ms = elapsed_ms(&cluster.world);
@@ -1927,19 +1933,19 @@ pub(crate) async fn run(
             let _ = dropping.await;
         }));
         tasks.append(&mut changes);
-        t.change_by.store(0, Ordering::Release);
         judge(cluster, &t);
         summarize(
             cluster,
             &t,
             chaos.as_ref(),
-            moving.is_some(),
+            moving.as_ref(),
             plan.split,
             &seen,
             true,
             &mut report,
         );
-        return direct::abandon(cluster, &ctx, tasks, report).await;
+        abandon(cluster, &t, tasks).await;
+        return Ok(report);
     }
     let mut converged = Ok(());
     for ctx in [Some(&t.main), Some(&t.ranged), moved.as_ref()] {
@@ -1960,7 +1966,16 @@ pub(crate) async fn run(
         let _ = task.await;
     }
     cluster.checks.recovered(&cluster.world, "convergence");
-    // The topology changes have a budget of their own.
+    // The move and the nemesis's split run on in their own tasks, so their bounds are judged
+    // before the wait for the other changes, which have a budget of their own.
+    let quiet_from = cluster.world.elapsed();
+    let mut retired = None;
+    if let Some(moving) = moving.as_mut() {
+        retired = Some(moving.finish(cluster, healed).await);
+    }
+    if let Some(chaos) = chaos.as_mut().filter(|chaos| chaos.split_pending()) {
+        chaos.finish_split(cluster, quiet_from).await;
+    }
     for task in changes {
         let _ = task.await;
     }
@@ -1977,15 +1992,10 @@ pub(crate) async fn run(
             .violate(&cluster.world, "Workload", error.to_string()),
     }
     changes_settled(cluster, &t, &mut report);
-    if let Some(chaos) = chaos.as_mut().filter(|chaos| chaos.split_pending()) {
-        let from = cluster.world.elapsed();
-        chaos.finish_split(cluster, &ctx, from).await;
-    }
     if let Some(chaos) = chaos.as_ref() {
-        chaos.check_abandoned(cluster, &ctx).await;
+        chaos.check_abandoned().await;
     }
-    if let (Some(moving), Some(moved)) = (moving.as_mut(), moved.as_ref()) {
-        let retired = moving.finish(cluster, moved, healed).await;
+    if let (Some(moving), Some(moved), Some(retired)) = (moving.as_mut(), moved.as_ref(), retired) {
         report
             .assertions
             .push(("replica move retired", retired.is_ok()));
@@ -1998,7 +2008,6 @@ pub(crate) async fn run(
                 .checks
                 .violate(&cluster.world, "Liveness", format!("replica move: {error}"));
         }
-        report.scenarios.extend(std::mem::take(&mut moving.clauses));
     }
     let mut drained = Ok(());
     if let (Some(moving), Some(moved), true) = (
@@ -2017,7 +2026,9 @@ pub(crate) async fn run(
                 Err(error) => Err(error),
             };
         }
-        report.scenarios.extend(std::mem::take(&mut moving.clauses));
+    }
+    if let Some(moving) = moving.as_ref() {
+        report.scenarios.extend(moving.clauses());
     }
     if let Err(error) = drained {
         cluster.checks.violate(
@@ -2123,13 +2134,25 @@ pub(crate) async fn run(
         cluster,
         &t,
         chaos.as_ref(),
-        moving.is_some(),
+        moving.as_ref(),
         plan.split,
         &seen,
         false,
         &mut report,
     );
     Ok(report)
+}
+
+/// The run cannot converge: stop the clients and the changes, and keep the violations already
+/// recorded. None of the final assertions ran, so no scenario is claimed.
+async fn abandon(cluster: &Cluster, t: &Topo, tasks: Vec<JoinHandle<()>>) {
+    t.change_by.store(0, Ordering::Release);
+    t.main.converge_by.store(0, Ordering::Release);
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    cluster.record("workload abandoned after a liveness violation".into());
 }
 
 /// What the run itself saw, for the clauses and the summary.
@@ -2151,20 +2174,13 @@ struct Work {
 
 impl Work {
     fn of(attempts: &[clauses::Attempt], scans: &[(u64, u64)], load: (u64, u64)) -> Self {
-        let within = |from: u64, to: u64| load.0 <= from && to <= load.1;
-        let mut work = Self::default();
-        for attempt in attempts {
-            if !attempt.fresh || !within(attempt.invoked, attempt.completed) {
-                continue;
-            }
-            match attempt.answer {
-                Answer::Committed => work.writes += 1,
-                Answer::Ok if !attempt.mutation => work.reads += 1,
-                _ => {}
-            }
+        let within = |scan: &&(u64, u64)| load.0 <= scan.0 && scan.1 <= load.1;
+        let (writes, reads) = direct::work(attempts, load.0, load.1);
+        Self {
+            writes,
+            reads,
+            scans: scans.iter().filter(within).count() as u64,
         }
-        work.scans = scans.iter().filter(|scan| within(scan.0, scan.1)).count() as u64;
-        work
     }
 
     fn missing(&self) -> Vec<&'static str> {
@@ -2425,22 +2441,13 @@ async fn final_scans(
     report: &mut direct::Report,
 ) -> Result<(), String> {
     let mut client = t.main.new_client();
-    let nemesis_split = chaos.is_some_and(|chaos| {
-        chaos
-            .log
-            .iter()
-            .any(|fault| fault.action == Action::Split && fault.observed)
-    });
-    // The nemesis's split can be pending, and a full stop can have abandoned another.
-    let asked = chaos.map_or(0, |chaos| {
-        let splits = chaos.log.iter().filter(|f| f.action == Action::Split);
-        let stops = chaos.log.iter().filter(|f| f.action == Action::Cold);
-        splits.count() as u64 * (1 + stops.count() as u64 + u64::from(chaos.heal_cold))
-    });
+    // The nemesis's split can be pending.
+    let asked = chaos.is_some_and(Chaos::split_requested);
+    let nemesis_split = asked && !chaos.is_some_and(Chaos::split_pending);
     let (split, split_ids) = t.log(|log| (log.split, log.split_ids));
     for table in [Table::Main, Table::Ranged] {
         let (published, asked) = match table {
-            Table::Main => (nemesis_split, asked),
+            Table::Main => (nemesis_split, u64::from(asked)),
             _ => (
                 split.is_some_and(|split| split.published.is_some()),
                 split_ids,
@@ -2550,7 +2557,7 @@ async fn quiet_stage(
     match plan.quiet {
         QuietChange::Split => {
             let table = Uuid::parse_str(&ctx.table).expect("table UUID");
-            let id = cluster.split_id().await;
+            let id = fresh_id(BOOTSTRAP_CLIENT).await;
             let payload = json!({
                 "source": initial_range(cluster_id, table),
                 "boundary": plan.quiet_boundary, "page_bytes": 1 << 20,
@@ -3060,10 +3067,11 @@ fn clauses_of(
             ));
         }
         // A worker that holds a replica of every range stopped or started while a scan ran.
-        let restarted = faults.iter().filter(|fault| LOSSES.contains(&fault.action));
+        let restarted = faults
+            .iter()
+            .filter(|fault| LOSSES.contains(&fault.action) && fault.happened());
         let mut edges = restarted
-            .flat_map(|fault| [Some(fault.from), fault.to])
-            .flatten();
+            .flat_map(|fault| fault.effects.iter().map(|effect| effect.at).chain(fault.to));
         if edges.any(|at| log.scan_ms.iter().any(|(_, a, b)| *a <= at && at <= *b)) {
             scenarios.insert("O16:restart-during-scans");
         }
@@ -3149,6 +3157,10 @@ fn evaluate(
 ) {
     let mut attempts = Vec::new();
     let mut resolved = BTreeMap::new();
+    let (mut main_attempts, main_resolved) = {
+        let observed = t.main.observed.lock().unwrap();
+        (observed.attempts.clone(), observed.resolved.clone())
+    };
     let (mut same, mut other) = (0, 0);
     let mut unresolved = Vec::new();
     let contexts = [Some(&t.main), Some(&t.ranged), Some(&t.victim), moved];
@@ -3164,6 +3176,7 @@ fn evaluate(
         }
     }
     attempts.sort_by_key(|attempt| (attempt.completed, attempt.invoked));
+    main_attempts.sort_by_key(|attempt| (attempt.completed, attempt.invoked));
     report
         .assertions
         .push(("every request resolved", unresolved.is_empty()));
@@ -3175,23 +3188,30 @@ fn evaluate(
         );
     }
     let no_quorum = cluster.no_quorum();
-    let drops = chaos.map(Chaos::session_drops).unwrap_or_default();
-    let outcome = clauses::Evidence {
-        faults: chaos.map_or(&[], |chaos| &chaos.log),
-        attempts: &attempts,
-        resolved: &resolved,
-        reuse_same_key: same,
-        reuse_other_key: other,
-        session_drops: &drops,
-        no_quorum: &no_quorum,
-        moving: moving.and_then(moves::Move::window),
-        deadline_ms: config.deadline().as_millis() as u64,
-    }
-    .evaluate();
-    for (invariant, detail) in outcome.violations {
+    let elections = cluster.elections();
+    let judge = |attempts: &[clauses::Attempt], resolved: &BTreeMap<Uuid, clauses::Resolved>| {
+        clauses::Evidence {
+            faults: chaos.map_or(&[], |chaos| &chaos.log),
+            attempts,
+            resolved,
+            reuse_same_key: same,
+            reuse_other_key: other,
+            elections: &elections,
+            no_quorum: &no_quorum,
+            moving: moving.and_then(moves::Move::window),
+            deadline_ms: config.deadline().as_millis() as u64,
+        }
+        .evaluate()
+    };
+    // The faults aim at the leader of `main`, and the elections are of its range. Requests of
+    // another table can break a rule, and they show no clause about that leader.
+    let all = judge(&attempts, &resolved);
+    let main = judge(&main_attempts, &main_resolved);
+    let violations: BTreeSet<_> = all.violations.into_iter().chain(main.violations).collect();
+    for (invariant, detail) in violations {
         cluster.checks.violate(&cluster.world, invariant, detail);
     }
-    report.scenarios.extend(outcome.clauses);
+    report.scenarios.extend(main.clauses);
 }
 
 /// An observation beside the verdict. The `direct` checks read every `conflict` as a key or
@@ -3225,14 +3245,14 @@ fn summarize(
     cluster: &Cluster,
     t: &Topo,
     chaos: Option<&Chaos>,
-    moving: bool,
+    moving: Option<&moves::Move>,
     split: SplitTiming,
     seen: &Seen,
     abandoned: bool,
     report: &mut direct::Report,
 ) {
-    let counts = |actions: &BTreeMap<Action, u32>| -> BTreeMap<&'static str, u32> {
-        actions.iter().map(|(a, n)| (a.name(), *n)).collect()
+    let skipped = |chaos: &Chaos| -> BTreeMap<&'static str, u32> {
+        chaos.skipped.iter().map(|(a, n)| (a.name(), *n)).collect()
     };
     let (ddl_conflicts, remaining) = without_schema_conflicts(&t.main.history.lock().unwrap());
     report.summary = t.log(|log| {
@@ -3241,12 +3261,16 @@ fn summarize(
             "anomalies_without_schema_conflicts": remaining,
             "workload": Workload::Topology.name(),
             "profile": chaos.map(Chaos::profile_name),
-            "executed": chaos.map(|chaos| counts(&chaos.executed)),
-            "skipped": chaos.map(|chaos| counts(&chaos.skipped)),
+            "planned": chaos.map(|chaos| chaos.counts(false)),
+            "happened": chaos.map(|chaos| chaos.counts(true)),
+            "aimed_and_hit_leader": chaos.map(Chaos::aimed),
+            "skipped": chaos.map(skipped),
+            "windows_overran_and_max_ms": chaos.map(Chaos::overran),
+            "nemesis_split": chaos.map(Chaos::split_summary),
             "split": format!("{split:?}"),
             "ranged_split_ms": log.split.map(|split| json!([split.requested, split.pending, split.published])),
             "ranged_split_ids": log.split_ids,
-            "move": moving,
+            "move": moving.map(moves::Move::summary),
             "audited_writes": log.writes.values().map(Vec::len).sum::<usize>(),
             "scans": log.scans.values().map(Vec::len).sum::<usize>(),
             "explains": log.explains.len(),
