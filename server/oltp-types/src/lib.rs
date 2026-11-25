@@ -4,6 +4,8 @@ pub mod authority;
 mod identity;
 pub mod owned;
 pub mod queue;
+#[cfg(feature = "sim")]
+pub mod sim_probe;
 pub mod types;
 
 pub use identity::{POOL_FORMAT_VERSION, PoolIdentity};
