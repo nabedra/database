@@ -24,6 +24,9 @@ run builds and expensive checks. Apply it when coordinating concurrent agents.
 GitHub Actions runs by manual dispatch only. Follow
 [GitHub Actions for checks](../code-review/references/gh-actions.md) for dispatch commands.
 
+When the user asks to release, publish, tag or ship a version, or whether a release is due,
+follow [Releasing Nabedra](references/releasing.md). Never publish outside that process.
+
 When agents work in parallel on one codebase, every hot file has a single owner
 per wave. See the hot-file rule in the
 [subagent-driven development workflow](references/subagent-driven-development.md#prepare-the-work).
