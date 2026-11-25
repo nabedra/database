@@ -26,13 +26,13 @@ VARIABLES
     msgs,       \* assign, ready and drop messages
     route,      \* the gateway's cached owner
     q,          \* q[x]: [st, w, need, bar, got]
-    caught,     \* epochs whose replica had caught up when they were published
+    caught,     \* epochs whose replica held the whole range at a fresh barrier
     moves, crashes, lost
 
 vars == <<n, epoch, owner, next, ready, ws, msgs, route, q, caught, moves, crashes, lost>>
 
 First == CHOOSE w \in Workers : TRUE
-NoReplica == [e |-> 0, pos |-> 0, whole |-> FALSE, ok |-> FALSE]
+NoReplica == [e |-> 0, pos |-> 0, whole |-> FALSE, ok |-> FALSE, d |-> 0]
 
 TypeOK ==
     /\ n \in 0..MaxWrites /\ epoch \in 1..(MaxMoves + 1) /\ owner \in Workers /\ route \in Workers
@@ -41,7 +41,7 @@ TypeOK ==
 
 Init ==
     /\ n = 0 /\ epoch = 1 /\ owner = First /\ next = None /\ ready = FALSE
-    /\ ws = [w \in Workers |-> IF w = First THEN [e |-> 1, pos |-> 0, whole |-> TRUE, ok |-> TRUE] ELSE NoReplica]
+    /\ ws = [w \in Workers |-> IF w = First THEN [e |-> 1, pos |-> 0, whole |-> TRUE, ok |-> TRUE, d |-> 0] ELSE NoReplica]
     /\ msgs = {} /\ route = First /\ caught = {1}
     /\ q = [x \in Queries |-> [st |-> "idle", w |-> First, need |-> 0, bar |-> None, got |-> None]]
     /\ moves = 0 /\ crashes = 0 /\ lost = 0
@@ -75,9 +75,8 @@ RecvReady ==
 Publish ==
     /\ next # None /\ (ready \/ Mutant = "publish_before_caught_up")
     /\ epoch' = next.e /\ owner' = next.w /\ next' = None /\ ready' = FALSE
-    /\ caught' = IF ready THEN caught \cup {next.e} ELSE caught
     /\ msgs' = msgs \cup {[k |-> "drop", w |-> owner, e |-> epoch]}
-    /\ UNCHANGED <<n, ws, route, q, moves, crashes, lost>>
+    /\ UNCHANGED <<n, ws, route, q, caught, moves, crashes, lost>>
 
 -----------------------------------------------------------------------------
 (* Workers.                                                                *)
@@ -85,7 +84,8 @@ Publish ==
 RecvAssign(w) ==
     /\ \E m \in msgs :
         /\ m.k = "assign" /\ m.w = w /\ msgs' = msgs \ {m}
-        /\ ws' = IF m.e > ws[w].e THEN [ws EXCEPT ![w] = [@ EXCEPT !.e = m.e]] ELSE ws
+        /\ ws' = IF m.e > ws[w].e /\ m.e > ws[w].d THEN        \* not one that was dropped already
+                     [ws EXCEPT ![w] = [@ EXCEPT !.e = m.e]] ELSE ws
     /\ UNCHANGED <<n, epoch, owner, next, ready, route, q, caught, moves, crashes, lost>>
 
 \* A range snapshot, or what it still has from an earlier assignment.
@@ -103,16 +103,17 @@ Pull(w) ==
 Report(w) ==
     /\ ws[w].whole /\ ws[w].pos = n /\ next # None /\ next.w = w /\ ws[w].e = next.e /\ ~ready
     /\ msgs' = msgs \cup {[k |-> "ready", w |-> w, e |-> ws[w].e]}
-    /\ UNCHANGED <<n, epoch, owner, next, ready, ws, route, q, caught, moves, crashes, lost>>
+    /\ caught' = IF ws[w].ok THEN caught \cup {ws[w].e} ELSE caught
+    /\ UNCHANGED <<n, epoch, owner, next, ready, ws, route, q, moves, crashes, lost>>
 
 \* The grace period passed. The drop names the epoch it ends, so a late one cannot hit a later
 \* assignment. Mutant drop_without_epoch deletes the data of a later one, which still counts it as held.
 RecvDrop(w) ==
     /\ \E m \in msgs :
         /\ m.k = "drop" /\ m.w = w /\ msgs' = msgs \ {m}
-        /\ ws' = CASE m.e = ws[w].e -> [ws EXCEPT ![w] = NoReplica]
+        /\ ws' = CASE m.e = ws[w].e -> [ws EXCEPT ![w] = [NoReplica EXCEPT !.d = m.e]]
                    [] Mutant = "drop_without_epoch" -> [ws EXCEPT ![w].ok = FALSE]
-                   [] OTHER -> ws
+                   [] OTHER -> [ws EXCEPT ![w].d = IF @ > m.e THEN @ ELSE m.e]
     /\ UNCHANGED <<n, epoch, owner, next, ready, route, q, caught, moves, crashes, lost>>
 
 \* The disk is lost. The worker keeps its assignment and syncs again.
@@ -144,12 +145,12 @@ Barrier(x) ==
     /\ UNCHANGED <<n, epoch, owner, next, ready, ws, msgs, route, caught, moves, crashes, lost>>
 
 \* A worker with the whole range at the barrier serves, replaced or not.
-\* Mutants: old_replica_serves_empty serves with whatever is there, serve_before_whole serves during
+\* Mutants: serve_behind_barrier ignores the position, old_replica_serves_empty serves with whatever is there, serve_before_whole serves during
 \* a sync.
 Serve(x) ==
     LET w == q[x].w IN
     /\ q[x].st = "run" /\ q[x].bar # None
-    /\ \/ ws[w].whole /\ ws[w].pos >= q[x].bar
+    /\ \/ ws[w].whole /\ (ws[w].pos >= q[x].bar \/ Mutant = "serve_behind_barrier")
        \/ Mutant = "old_replica_serves_empty" /\ ws[w].e = 0
        \/ Mutant = "serve_before_whole" /\ ws[w].e # 0
     /\ q' = [q EXCEPT ![x].st = "done", ![x].got = [pos |-> ws[w].pos, whole |-> ws[w].ok]]

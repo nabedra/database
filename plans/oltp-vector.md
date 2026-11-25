@@ -233,7 +233,7 @@ row version gains  blobs: { column_id: commit_ts of the vector version it refere
 A metadata update references the existing vector version and does not rewrite it. MVCC GC, splits, snapshots, backups and restore treat `'x'`, the pending embedding record `'E'` and the failure record as belonging to their row:
 
 - A vector version is collectable only when no retained row version references it. A metadata update commits against the row version it read.
-- A replica snapshot is one engine snapshot and exact. A copy at a cut (split child, backup, restore) pins the collection safe point at its cut and takes exactly the newest version at or below the cut, never one that was already collectable, with its vector. It does not carry `'E'`: activation derives a fresh `'E'` for every copied row that has a source text and no vector. It activates after its rows and vectors are all staged. (DB-10, DB-15)
+- A replica snapshot is one engine snapshot and exact. A copy at a cut (split child, backup, restore) pins the collection safe point at its cut and takes exactly the newest version at or below the cut, never one that was already collectable, with its vector. A split copies `'E'` and failure records exactly, as the range is frozen and takes no entry. A backup carries neither, and a restore derives a fresh `'E'`, with an identity of its own, for every row that has a source text and no vector. A copy activates after its rows, vectors and records are all staged. (DB-10, DB-15, DB-22)
 - In a cross-range transaction, Prepare stages `'x'` and `'E'` under the transaction, and Resolve writes them under the commit timestamp.
 - A damaged `'x'` value is neither null nor skipped. The voter refuses the feed of that range and follows the damage rules of the [storage engine plan](native-storage-engine.md).
 - A backup that holds vector records needs a build with `data.vector.v1`. A restored range has a new group identity, so no search checkpoint of the old one is accepted.
@@ -312,7 +312,7 @@ Raft positions are per range and the index is per worker. Each worker builds its
 
 | Structure | Content | Where |
 | --- | --- | --- |
-| Row map | slot → key, range, versions with applied-at and superseded-at, columns. A slot is reused only when no entry and no checkpoint names it. | RAM plus NVMe |
+| Row map | slot → key, range, versions with applied-at and superseded-at, columns. A slot is reused only when no entry, no copy in flight and no checkpoint names it. | RAM plus NVMe |
 | Centroid tree | Balanced k-means over directions (each vector divided by its length), fanout about 100, one tree per `partition_by` value. Under 20,000 rows there is no tree and the scan is exact. | RAM |
 | Partition | 128 to 512 rows in bands of similar length: exact length, 1-bit codes and 4-bit extension of the direction, filter column blocks, `(slot, version)` | 1-bit in RAM. Extension in RAM while the budget lasts, otherwise NVMe. |
 | Raw vectors | f32, page-aligned | NVMe, `O_DIRECT` |
@@ -333,7 +333,7 @@ Raft positions are per range and the index is per worker. Each worker builds its
 Ready → Splitting → Draining → Retired          Ready → Merging → Retired
 ```
 
-A move appends to the target before it removes from the source, and removal waits until every scan and checkpoint that began before the append finished. A removal names one entry instance, never a row, so a row that moves back is safe. (DB-7) A split or merge copies every entry that a pin, a checkpoint, a retained cut or a half-applied operation can still need, not only current versions. (DB-17) A retired partition keeps its entries for the scans and checkpoints that listed it. Copies between cores name the generation of the index, and a resync makes older ones void. An entry's version is the full apply position, never shortened. Scans dedup by slot. A moved row is therefore never missed and never returned twice. Reassignment is capped per second, and re-encoding is charged to maintenance.
+A move appends to the target before it removes from the source, and removal waits until every scan and checkpoint that began before the append finished. A removal names one entry instance, never a row, so a row that moves back is safe. (DB-7) A split or merge copies every entry that a pin, a checkpoint or a retained cut can still need, and every entry beyond the applied position, because cores append ahead of it. (DB-17, DB-21) A copy that lands in a partition that drains meanwhile is sent on, so drains end. (DB-23) A resync or a drop of a range fails every scan that pinned it. (DB-24) A retired partition keeps its entries for the scans and checkpoints that listed it. Copies between cores name the generation of the index, and a resync makes older ones void. An entry's version is the full apply position, never shortened. Scans dedup by slot. A moved row is therefore never missed and never returned twice. Reassignment is capped per second, and re-encoding is charged to maintenance.
 
 **Filters.** Estimate matches from the summaries. At most 20,000 matches: score all of them. Otherwise read nearest partitions that contain a match, counting only matching rows in the stop rule. Never post-filter. If at least `limit` rows match, `limit` rows return.
 
@@ -349,12 +349,12 @@ A move appends to the target before it removes from the source, and removal wait
 
 The table option `embed` names a source column and an operator-defined model: endpoint, model, dimensions, credential reference, limits. v1 speaks the OpenAI-compatible `/v1/embeddings`, which [vLLM](https://docs.vllm.ai/en/stable/serving/openai_compatible_server/) and [TEI](https://huggingface.co/docs/text-embeddings-inference/en/quick_tour) also expose, so self-hosted models work.
 
-A model name is bound to one endpoint, model and dimension for life. Another model is another name and another column (`add_column`). Backfill of a new column writes a pending record with each existing row's current source version, if the row has no vector, pending record or failure of this incarnation, as a conditional commit under the new schema epoch. Every entry below also names the column incarnation.
+A model name is bound to one endpoint, model and dimension for life. Another model is another name and another column (`add_column`). A row version stores the source version of each embedded column. Backfill of a new column commits a row version with a source version and a pending record for each existing row that has no vector, pending record or failure of this incarnation, conditionally and under the new schema epoch. So tables without search columns keep their bytes. Every entry below also names the column incarnation.
 
-1. A write that changes the source text, or inserts the row, gets a source version: its commit timestamp. The same entry clears the old vector and any failure record and writes `'E' ‖ key ‖ column → { source_version, attempts, limit }`. A write that keeps the text keeps the vector and the pending record. (DB-11) The write is durable and acknowledged. The row is found by key, filters and BM25, and by its vector once it has one.
+1. A write that changes the source text, or inserts the row, gets a source version: its commit timestamp. The same entry clears the old vector and any failure record and writes `'E' ‖ key ‖ column → { source_version, id, attempts, limit }`, where `id` is the commit timestamp that created the record. A write that keeps the text keeps the vector and the pending record. (DB-11) The write is durable and acknowledged. The row is found by key, filters and BM25, and by its vector once it has one.
 2. Embedders lease batches from the range leader. Leases live in leader RAM and only save money: a lost lease causes a second provider call, never a wrong vector.
 3. `SetVector { key, column, source_version, vector }` is an ordinary conditional direct commit: latch, timestamp, expected row version, all epoch, intent, freeze, pause and floor checks, and a new row version. It applies only if the row exists, the source version and the column incarnation match, the column is an embedded one and the dimensions fit. It clears `'E'`. An update that read the row before it conflicts and retries, so it cannot drop the vector. If `SetVector` conflicts, the leader reads the row again and retries. One that already took effect is a no-op. (DB-12)
-4. `EmbedFailed { key, column, source_version, attempt }` counts that attempt in `'E'`, durably, once, and only if all three match. After 10 attempts the record becomes a failure record with a reason, shown in `search_status()`. `nabedra-db search retry-embeddings` requeues it: the attempt number goes on and the limit grows by 10, so a late report of an old attempt matches nothing. (DB-13, DB-18) The circuit breaker per model counts no attempt while it is open.
+4. `EmbedFailed { key, column, source_version, id, attempt }` counts that attempt in `'E'`, durably, once, and only if all of them match. After 10 attempts the record becomes a failure record with a reason, shown in `search_status()`. `nabedra-db search retry-embeddings` requeues it: the attempt number goes on and the limit grows by 10, so a late report of an old attempt matches nothing. (DB-13, DB-18) The circuit breaker per model counts no attempt while it is open.
 
 A query string is embedded before the search, with an LRU by `(model, digest)`. A provider outage fails those queries explicitly. `wait_for_embedding=True` waits after commit, and a timeout reports the write as applied with the embedding pending.
 
@@ -364,7 +364,7 @@ A query string is embedded before the search, with an LRU by `(model, digest)`. 
 
 Control stores `SearchAssignment { table_id, epoch, shards: [{ spans, workers }] }`. Adjacent ranges share a search shard, so fan-out is `ceil(table bytes / worker budget)` rather than one per range. Default two search replicas in different AZs.
 
-Create or move: assign → snapshot and tail → index → caught up to a fresh barrier → publish `epoch + 1` → the old replica keeps its data 30 s more, passing the same barrier and incarnation checks, then drops. A worker serves a range only while it holds all of it. A drop names the assignment epoch it ends, so a late one cannot hit a later assignment of the same range to the same worker. A new column builds the same way and becomes visible only when every range has a ready replica that reported this incarnation. Then every Data group gets a larger schema epoch, and then the Catalog publishes. A Data group takes only a larger schema epoch, so a late or repeated fence of an old Control leader changes nothing. (DB-20) A fence and a split exclude each other through the existing lifecycle guard. A drop fences every Data group first, and a name added again is a new incarnation that never serves old data. Interrupted builds resume or stay invisible. Splits inherit the parent's assignment. A worker re-tags the parent's slots to the children only when it holds every parent entry up to the freeze. Otherwise it installs child snapshots. Either way the children take over the bound of section 4. (DB-14, DB-19)
+Create or move: assign → snapshot and tail → index → caught up to a fresh barrier → publish `epoch + 1` → the old replica keeps its data 30 s more, passing the same barrier and incarnation checks, then drops. A worker serves a range only while it holds all of it. A drop names the assignment epoch it ends, so a late one cannot hit a later assignment of the same range to the same worker. A worker ignores an assignment at or below the largest epoch it dropped. A new column builds the same way and becomes visible only when every range has a ready replica that reported this incarnation. Then every Data group gets a larger schema epoch, and then the Catalog publishes. A Data group takes only a larger schema epoch, so a late or repeated fence of an old Control leader changes nothing. (DB-20) A fence and a split exclude each other through the existing lifecycle guard. A drop fences every Data group first, and a name added again is a new incarnation that never serves old data. Interrupted builds resume or stay invisible. Splits inherit the parent's assignment. A worker re-tags the parent's slots to the children only when it holds every parent entry up to the freeze. Otherwise it installs child snapshots. Either way the children take over the bound of section 4. (DB-14, DB-19)
 
 Search workers and embedders hold no vote, no queue copy and no lead. They are never in the ready set and do not count as workers for `data.vector.v1`. A process that is not enrolled hosts no voter. Their RPCs carry their own protocol version, `nabedra-search/1`.
 
@@ -470,7 +470,7 @@ The topology is the diagram in "Architecture". Modelled: crash and restart with 
 Left out, for the reviewer and the user to accept:
 
 - **Clock drift and lease safety.** The barrier uses OpenRaft's lease read unchanged, as `table.get` does. The specs assume that a lease check passes only while no newer leader exists, and model the check and the answer as separate steps.
-- **Raft log safety, the Timestamp group's order and the freeze that refuses open intents.** Existing OLTP mechanisms, assumed.
+- **Raft log safety, the Timestamp group's order, the freeze that refuses open intents, the split-abort path, the lifecycle guard that keeps fences out of a split, and the resolution of decided transactions before a backup's cut.** Existing OLTP mechanisms, assumed.
 - **Byzantine processes, and corruption of synced data**, which checksums detect and F and U test.
 
 ### Specs
@@ -487,11 +487,13 @@ Left out, for the reviewer and the user to accept:
 | `specs/vector/blobs/RowBlobs` | Vector versions, collection, staged transactions, copies at a cut | `vector-blobs` |
 | `specs/vector/activation/Activation` | Rolling upgrade and activation | `vector-activation` |
 
-**Abstractions.** They allow more than reality, so they hide no behavior:
+**Abstractions.** A non-author reviewer approved each:
 
 - One range against an arbitrary environment (`SearchLatest`). Every property is per range, and other ranges reach it only through the batch decision, which may come at any time or be an abort.
 - Any committed prefix stands for what any voter applied, so for any number of voters. Deposed leaders only refuse or answer from what they captured, so one suffices.
 - One search worker in `SearchLatest` and `SearchRoute`: a query reads one worker per range, workers share nothing, and a crash stands in for changing the worker. Two or three workers in `SearchAssign` and `IndexLifecycle`.
+- One range in `LocalIndex`, whose structure a resync resets as a whole. Ranges share partitions and maintenance, and each entry belongs to one.
+- Reduced T1 combinations, each covered by another baseline: the two-query `SearchLatest` run has no purge, the batch run has no repeated page or purge, and the two-range `SearchSnapshot` run has one attempt per direct commit.
 - One row or key in `EmbedApply`, `RowBlobs` and `SearchSnapshot`: rows share only the safe point, the floor and leases, which are not trusted.
 
 **Fairness.** Client retry, in-order proposal service, Raft replication and apply, the transaction coordinator and resolver, the close timer, the tail and install loops, the barrier sender with its RPC deadline, the scan loop, the embedder's poll loop, the provider client's deadline, the lease timer, the backfill job, worker heartbeats and Control's reconcile loop. Each fairness assumption in a spec names one of these.
@@ -511,19 +513,23 @@ RESULTS_TABLE
 | DB-5 | The feed derived changes from current rows and omitted deletes | Independent read | `latest/prefix_feed_omits_delete` |
 | DB-6 | A checkpoint overlapping a move lost a row | Author, independent read | `index/prefix_checkpoint_without_epoch` |
 | DB-7 | A row that moved away and back was removed | Independent read | `index/prefix_remove_by_slot` |
-| DB-8 | The bound of servable cuts missed superseded versions and deletes | Independent read, spec review | `snapshot/serve_below_retained` |
+| DB-8 | The bound of servable cuts missed superseded versions and deletes | Independent read, spec review | `snapshot/prefix_bound_of_dropped` |
 | DB-9 | A dropped column was served through a stale route | Author, independent read | `lifecycle/prefix_barrier_without_schema` |
 | DB-10 | A copy took a version that was already collectable, then lost its vector | TLC | `blobs/prefix_copy_takes_collectable` |
 | DB-11 | A changed text kept its old vector | Author, independent read | `embed/prefix_stale_vector` |
 | DB-12 | A concurrent update dropped a new vector | Independent read | `embed/prefix_setvector_unversioned` |
 | DB-13 | A late failure report marked new text as failed | Author, independent read | `embed/prefix_unfenced_failure` |
-| DB-14 | A lagging worker re-tagged a split range and lost entries | Independent read | `route/retag_before_cut` |
+| DB-14 | A lagging worker re-tagged a split range and lost entries | Independent read | `route/prefix_retag_before_cut` |
 | DB-15 | A pending embedding was lost in a split or backup | Independent read | `blobs/prefix_copy_without_pending` |
 | DB-16 | A later query could read an older position | Spec review | `latest/prefix_applied_not_committed` |
-| DB-17 | A partition split dropped superseded versions that a cut or a half-applied update needed | Spec review | `index/drain_copies_current_only` |
-| DB-18 | A repeated or requeued failure report was counted twice | Spec review | `embed/count_every_report`, `embed/requeue_resets_attempts` |
-| DB-19 | A split dropped the bound of servable cuts | Spec review | `route/retag_drops_retained` |
-| DB-20 | A late fence could serve a dropped column again | Spec review | `lifecycle/fence_not_monotone` |
+| DB-17 | A partition split dropped superseded versions that a cut or a half-applied update needed | Spec review | `index/prefix_drain_copies_current_only` |
+| DB-18 | A repeated or requeued failure report was counted twice | Spec review | `embed/prefix_count_every_report`, `embed/prefix_requeue_resets_attempts` |
+| DB-19 | A split dropped the bound of servable cuts | Spec review | `route/prefix_retag_drops_retained` |
+| DB-20 | A late fence could serve a dropped column again | Spec review | `lifecycle/prefix_fence_not_monotone` |
+| DB-21 | A partition split dropped entries that were appended ahead of the applied position | Spec re-review | `index/drain_ignores_unapplied` |
+| DB-22 | A split reset embedding attempts and turned failed rows back into pending ones | Spec re-review | `blobs/prefix_split_rederives`, `embed/rederive_keeps_identity` |
+| DB-23 | A copy to a partition that drains meanwhile blocked the drain for good | Spec re-review | `index/land_needs_ready` |
+| DB-24 | A scan went on in an index that a resync or a drop replaced | Spec re-review | `index/scan_survives_resync` |
 
 Also removed: throttling writes on search lag, which contradicted VEC-G06.
 
@@ -548,7 +554,7 @@ Also removed: throttling writes on search lag, which contradicted VEC-G06.
 
 ### Independent read and spec review
 
-A fresh agent read the plan without the specs and returned 17 suspected breaks, 11 scenarios to cover and 16 loose rules. DB-1 to DB-9 and DB-11 to DB-15 encode the breaks that are protocol steps. The loose rules became plan text in sections 2 to 7. A second agent reviewed the specs against the plan and rejected six of eight. Its 14 blocking findings are fixed: DB-8 and DB-16 to DB-20, the moves spec, resync and late copies in the index, real fault budgets, and the clock-drift statement above.
+A fresh agent read the plan without the specs and returned 17 suspected breaks, 11 scenarios to cover and 16 loose rules. DB-1 to DB-9 and DB-11 to DB-15 encode the breaks that are protocol steps. The loose rules became plan text in sections 2 to 7. A second agent reviewed the specs against the plan and rejected six of eight. Its 14 blocking findings are fixed: DB-8 and DB-16 to DB-20, the moves spec, resync and late copies in the index, real fault budgets, and the clock-drift statement above. Its re-review accepted 12 of the 14 fixes and raised six more, which are fixed as DB-21 to DB-24, two more liveness runs and the wording of VEC-G08.
 
 Covered by U or M instead of T: that a change record equals what apply did for rejected, replayed and resolved members, slot reuse, and the retry of a conflicted client update.
 
@@ -606,6 +612,6 @@ Same hosts, same recall, client on a separate machine, one system at a time: Nab
 
 ML training, OLAP, graph search, GPU indexing, S3 cold tier, cross-region, row-level security enforced by token, in-process models, server-side vector aggregation, change feed to other systems.
 
-## Awaiting the user
+## Gate
 
-Approval of the design. TLA+ starts after it.
+The user ordered the implementation on 2026-11-25, to start once this review is finished: T checks green and attested on the plan's commit, and no blocking finding open.

@@ -156,12 +156,12 @@ LearnSplit ==
     /\ UNCHANGED <<wr, wpos, base, bound, tagged, tagBase, qr, fl>>
 
 \* Re-tag only when every source entry up to the cut is here. The children inherit the bound.
-\* Mutants: retag_before_cut does it at once, retag_drops_retained forgets the bound.
+\* Mutants: prefix_retag_before_cut does it at once, prefix_retag_drops_retained forgets the bound.
 Retag ==
     /\ knows /\ ~tagged
-    /\ wpos["G0"] >= cut \/ Mutant = "retag_before_cut"
+    /\ wpos["G0"] >= cut \/ Mutant = "prefix_retag_before_cut"
     /\ tagged' = TRUE /\ tagBase' = wpos["G0"]
-    /\ bound' = IF Mutant = "retag_drops_retained" THEN 0 ELSE bound
+    /\ bound' = IF Mutant = "prefix_retag_drops_retained" THEN 0 ELSE bound
     /\ UNCHANGED <<wr, wpos, base, knows, qr, fl>>
 
 \* Otherwise it installs the children's snapshots, which hold the newest versions of the cut.

@@ -361,12 +361,13 @@ SpuriousRetry(s, r) ==
 OpenIntents(seq) ==
     {b \in Batches : Has(seq, Entry("prep", b)) /\ dec[b] = "commit" /\ ~Has(seq, Entry("res", b))}
 
+\* A leader that is not ready does not know the committed index; the mutant takes what it applied.
 \* The leader gets the RPC: it applied the first entry of its term, checks its lease, and captures the
 \* committed index, which a follower that feeds a worker may have applied before it.
 LeaderGetsBarrier(s, r) ==
     /\ asked[s][r] /\ cap[s][r] = None
     /\ ready[r] \/ Mutant = "new_leader_skips_term_entry"
-    /\ cap' = [cap EXCEPT ![s][r] = [ci |-> Len(log[r]), lp |-> lapp[r], old |-> FALSE]]
+    /\ cap' = [cap EXCEPT ![s][r] = [ci |-> IF ready[r] THEN Len(log[r]) ELSE lapp[r], lp |-> lapp[r], old |-> FALSE]]
     /\ UNCHANGED <<wvars, fvars, wait, fly, bid, asked, replies, qvars, cvars>>
 
 Reply(s, r, pos) ==
@@ -375,7 +376,7 @@ Reply(s, r, pos) ==
     /\ replies' = replies \cup {[s |-> s, r |-> r, id |-> bid[s][r], pos |-> pos]}
 
 Enough(s, r, at) ==
-    /\ at >= cap[s][r].ci \/ Mutant \in {"prefix_applied_not_committed", "position_before_resolve", "new_leader_skips_term_entry"}
+    /\ at >= cap[s][r].ci \/ Mutant \in {"prefix_applied_not_committed", "position_before_resolve"}
     /\ Mutant = "skip_intents" \/ OpenIntents(Prefix(log[r], at)) = {}
 
 \* It waits until it applied that index and resolved every committed intent, and then reads and

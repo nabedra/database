@@ -86,11 +86,11 @@ StartPublish ==
     /\ UNCHANGED <<col, epoch, ws, msgs, seen, ever, complete, gw, q, served, failovers, losses, drops, lostReports>>
 
 \* The Data group takes a fence of a larger schema epoch only.
-\* Mutant fence_not_monotone takes any.
+\* Mutant prefix_fence_not_monotone takes any.
 FenceRange(r) ==
     /\ \E f \in fences :
         /\ f.r = r
-        /\ f.se > epoch[r].se \/ (Mutant = "fence_not_monotone" /\ f.se # epoch[r].se)
+        /\ f.se > epoch[r].se \/ (Mutant = "prefix_fence_not_monotone" /\ f.se # epoch[r].se)
         /\ epoch' = [epoch EXCEPT ![r] = [se |-> f.se, c |-> f.c]]
     /\ UNCHANGED <<col, status, se, fences, ws, msgs, seen, ever, complete, gw, q, served, failovers, losses, drops, lostReports>>
 

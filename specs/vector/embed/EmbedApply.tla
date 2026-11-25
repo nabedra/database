@@ -23,8 +23,8 @@ VARIABLES
     col,        \* the incarnation of the column, each bound to one model for life
     filled,     \* backfill of this incarnation reached the row
     vec,        \* [t, c] or None: the text it was made from and the column incarnation
-    pend,       \* [v, n, max] or None: pending record, attempts so far, attempts allowed
-    failed,     \* [v, n] or None
+    pend,       \* [v, id, n, max] or None: pending record, its identity, attempts so far, attempts allowed
+    failed,     \* [v, id, n] or None
     leased,     \* leader memory: the pending record is leased
     work,       \* work[e]: the task an embedder holds, or None
     msgs,       \* SetVector and error reports in flight
@@ -38,7 +38,7 @@ vars == <<row, ver, col, filled, vec, pend, failed, leased, work, msgs, setp, up
           writes, updates, readds, leaders, crashes, lost, dups, errors, requeues>>
 budget == <<writes, updates, readds, leaders, crashes, lost, dups, errors, requeues>>
 
-MaxVer == 4 * (MaxWrites + MaxUpdates + MaxReAdds + MaxDups + MaxRequeues + 1)
+MaxVer == 5 * (MaxWrites + MaxUpdates + MaxReAdds + MaxDups + MaxRequeues + 1)
 Versions == 1..MaxVer
 
 TypeOK ==
@@ -53,7 +53,7 @@ Init ==
     /\ writes = 0 /\ updates = 0 /\ readds = 0 /\ leaders = 0 /\ crashes = 0 /\ lost = 0 /\ dups = 0
     /\ errors = 0 /\ requeues = 0
 
-Fresh(v) == [v |-> v, n |-> 0, max |-> MaxAttempts]
+Fresh(v, id) == [v |-> v, id |-> id, n |-> 0, max |-> MaxAttempts]
 
 -----------------------------------------------------------------------------
 (* Client writes.                                                          *)
@@ -67,7 +67,7 @@ Write(t) ==
        THEN row' = [row EXCEPT !.n = ver + 1] /\ UNCHANGED <<vec, pend, failed, leased>>
        ELSE /\ row' = [t |-> t, v |-> ver + 1, n |-> ver + 1]
             /\ vec' = IF Mutant = "prefix_stale_vector" THEN vec ELSE None
-            /\ pend' = Fresh(ver + 1) /\ failed' = None /\ leased' = FALSE
+            /\ pend' = Fresh(ver + 1, ver + 1) /\ failed' = None /\ leased' = FALSE
     /\ UNCHANGED <<counted, col, filled, work, msgs, setp, upd, errs, updates, readds, leaders, crashes, lost, dups, errors, requeues>>
 
 Delete ==
@@ -99,13 +99,15 @@ ReAddColumn ==
     /\ upd' = None                          \* the schema epoch refuses a write that read the old schema
     /\ UNCHANGED <<counted, row, ver, work, msgs, setp, errs, writes, updates, leaders, crashes, lost, dups, errors, requeues>>
 
-\* Backfill reaches the row: a pending record of its current source version, unless it has a vector,
-\* a pending record or a failure of this incarnation.
+\* Backfill reaches the row: a row commit that gives it a source version and a pending record, unless
+\* it has a vector, a pending record or a failure of this incarnation.
 Backfill ==
     /\ ~filled /\ filled' = TRUE
     /\ IF row # None /\ vec = None /\ pend = None /\ failed = None
-       THEN pend' = Fresh(row.v) ELSE UNCHANGED pend
-    /\ UNCHANGED <<counted, row, ver, col, vec, failed, leased, work, msgs, setp, upd, errs, budget>>
+       THEN /\ ver' = ver + 1 /\ row' = [row EXCEPT !.v = ver + 1, !.n = ver + 1]
+            /\ pend' = Fresh(ver + 1, ver + 1)
+       ELSE UNCHANGED <<ver, row, pend>>
+    /\ UNCHANGED <<counted, col, vec, failed, leased, work, msgs, setp, upd, errs, budget>>
 
 -----------------------------------------------------------------------------
 (* Embedders.                                                              *)
@@ -114,7 +116,7 @@ Backfill ==
 Lease(e) ==
     /\ pend # None /\ row # None /\ ~leased /\ work[e] = None
     /\ leased' = TRUE
-    /\ work' = [work EXCEPT ![e] = [t |-> row.t, v |-> pend.v, c |-> col, n |-> pend.n]]
+    /\ work' = [work EXCEPT ![e] = [t |-> row.t, v |-> pend.v, c |-> col, n |-> pend.n, id |-> pend.id]]
     /\ pend' = IF Mutant = "delete_pending_on_lease" THEN None ELSE pend
     /\ UNCHANGED <<counted, row, ver, col, filled, vec, failed, msgs, setp, upd, errs, budget>>
 
@@ -124,7 +126,7 @@ LeaseExpires ==
     /\ leased' = FALSE
     /\ UNCHANGED <<counted, row, ver, col, filled, vec, pend, failed, work, msgs, setp, upd, errs, budget>>
 
-Report(e, k) == [k |-> k, t |-> work[e].t, v |-> work[e].v, c |-> work[e].c, n |-> work[e].n]
+Report(e, k) == [k |-> k, t |-> work[e].t, v |-> work[e].v, c |-> work[e].c, n |-> work[e].n, id |-> work[e].id]
 
 ProviderAnswers(e) ==
     /\ work[e] # None
@@ -179,7 +181,7 @@ ApplySet ==
 
 \* An error report carries the attempt it saw. It counts that attempt once, durably, only for a
 \* matching source version, incarnation and attempt. Mutants: prefix_unfenced_failure counts a report
-\* of any version, count_every_report counts a repeated one again.
+\* of any version, prefix_count_every_report counts a repeated one again.
 HandleErr ==
     /\ \E m \in msgs :
         /\ m.k = "err"
@@ -189,10 +191,11 @@ HandleErr ==
         /\ IF /\ pend # None
               /\ pend.v = m.v \/ Mutant = "prefix_unfenced_failure"
               /\ m.c = col
-              /\ pend.n = m.n \/ Mutant \in {"count_every_report", "prefix_unfenced_failure"}
+              /\ pend.id = m.id \/ Mutant \in {"prefix_unfenced_failure", "rederive_keeps_identity"}
+              /\ pend.n = m.n \/ Mutant \in {"prefix_count_every_report", "prefix_unfenced_failure"}
            THEN /\ counted' = [counted EXCEPT ![pend.v] = @ + 1]
                 /\ IF pend.n + 1 >= pend.max
-                   THEN failed' = [v |-> pend.v, n |-> pend.n + 1] /\ pend' = None
+                   THEN failed' = [v |-> pend.v, id |-> pend.id, n |-> pend.n + 1] /\ pend' = None
                    ELSE pend' = [pend EXCEPT !.n = @ + 1] /\ UNCHANGED failed
            ELSE UNCHANGED <<pend, failed, counted>>
     /\ leased' = FALSE
@@ -200,13 +203,21 @@ HandleErr ==
 
 \* An operator requeues a failed row. The attempt number goes on, so a late report of an earlier
 \* attempt does not match.
-\* Mutant requeue_resets_attempts starts again from zero.
+\* Mutant prefix_requeue_resets_attempts starts again from zero.
 Requeue ==
     /\ failed # None /\ row # None /\ requeues < MaxRequeues /\ requeues' = requeues + 1
-    /\ LET n0 == IF Mutant = "requeue_resets_attempts" THEN 0 ELSE failed.n IN
-       pend' = [v |-> failed.v, n |-> n0, max |-> n0 + MaxAttempts]
+    /\ LET n0 == IF Mutant = "prefix_requeue_resets_attempts" THEN 0 ELSE failed.n IN
+       pend' = [v |-> failed.v, id |-> failed.id, n |-> n0, max |-> n0 + MaxAttempts]
     /\ failed' = None
     /\ UNCHANGED <<counted, row, ver, col, filled, vec, leased, work, msgs, setp, upd, errs, writes, updates, readds, leaders, crashes, lost, dups, errors>>
+
+\* A restore derives a new record for a row that lacks its vector, with an identity of its own, so that
+\* reports of the old one match nothing. Mutant rederive_keeps_identity ignores the identity.
+Rederive ==
+    /\ requeues < MaxRequeues /\ requeues' = requeues + 1
+    /\ row # None /\ vec = None /\ filled
+    /\ ver' = ver + 1 /\ pend' = Fresh(row.v, ver + 1) /\ failed' = None /\ leased' = FALSE
+    /\ UNCHANGED <<counted, row, col, filled, vec, work, msgs, setp, upd, errs, writes, updates, readds, leaders, crashes, lost, dups, errors>>
 
 -----------------------------------------------------------------------------
 (* Faults.                                                                 *)
@@ -234,7 +245,7 @@ Terminated ==
 
 Next ==
     \/ \E t \in Texts : Write(t)
-    \/ Delete \/ ReAddColumn \/ Backfill \/ ReadForUpdate \/ ApplyUpdate \/ LeaseExpires \/ LeaderChange \/ Requeue
+    \/ Delete \/ ReAddColumn \/ Backfill \/ ReadForUpdate \/ ApplyUpdate \/ LeaseExpires \/ LeaderChange \/ Requeue \/ Rederive
     \/ \E e \in Embedders : Lease(e) \/ ProviderAnswers(e) \/ ProviderFails(e) \/ EmbedderCrash(e)
     \/ ReadForSet \/ ApplySet \/ HandleErr \/ LoseMsg
     \/ Terminated

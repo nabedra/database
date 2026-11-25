@@ -11,5 +11,4 @@ MCQueries == {q1}
 MCQueries2 == {q1, q2}
 MCNone == {}
 Symm == Permutations({a, b}) \cup Permutations({p2, p3}) \cup Permutations({q1, q2})
-SymmParts == Permutations({p2, p3})
 =============================================================================

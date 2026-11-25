@@ -3,35 +3,36 @@
 (* The partitioned index inside one search worker (plans/oltp-vector.md,   *)
 (* section 5): inserts, updates, deletes, partition split, merge and       *)
 (* reassignment, scans at the applied position and at older cuts,          *)
-(* checkpoints, crashes, and resync from a range snapshot.                 *)
+(* checkpoints, crashes, resync from a range snapshot and range drop.      *)
 (*                                                                         *)
-(* `ops` is what the feed delivered, so it survives the worker. Applying   *)
-(* an operation takes two steps: the row map learns it, then the owner     *)
-(* core appends the entry, and only then is the position applied. A        *)
-(* partition belongs to one core, so a step on one partition is atomic. A  *)
-(* copy to another partition is a message between cores. A scan visits     *)
-(* partitions one at a time. An entry instance has its own identity `i`,   *)
-(* and a generation `g` that a resync replaces.                            *)
+(* `ops` is what the feed delivered, so it survives the worker. Operations *)
+(* are applied in a pipeline: cores append the entries of up to MaxFlight  *)
+(* operations beyond the applied position, in any order, and the position  *)
+(* advances over those that every core finished. A partition belongs to    *)
+(* one core, so a step on one partition is atomic. A copy to another       *)
+(* partition is a message between cores. A scan visits partitions one at a *)
+(* time. An entry instance has its own identity `i` and a generation `g`.  *)
 (*                                                                         *)
-(* Properties: VEC-G05 (ExactScan, NoDuplicate, NoLostRow), VEC-G03        *)
-(* (NoStaleEntry, SingleGeneration).                                       *)
+(* Properties: VEC-G05 (ExactScan, NoDuplicate, NoLostRow, DrainEnds),     *)
+(* VEC-G03 (NoStaleEntry, SingleGeneration).                               *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS Slots, Parts, First, Queries,
-          MaxOps, MaxDrains, MaxMoves, MaxCheckpoints, MaxCrashes, MaxResyncs, None, Mutant
+          MaxOps, MaxFlight, MaxDrains, MaxMoves, MaxCheckpoints, MaxCrashes, MaxResyncs, None, Mutant
 
 VARIABLES
     ops,        \* the feed: [s, k] with k in {"up", "del"}; an entry's version is its index here
-    rm,         \* operations the row map knows: app or app + 1
     app,        \* operations applied on every core
+    placed,     \* operations beyond app that their core finished
     low,        \* the oldest cut a scan may ask for
+    held,       \* the worker holds the range
     gen,        \* the generation of the index
     ents,       \* ents[p]: entry instances [s, a, i, g]
     st,         \* st[p]: "free", "ready", "draining" or "retired"
     tgts,       \* tgts[p]: where a draining partition goes
     sent,       \* sent[p]: instances of p already sent to a target
-    flight,     \* copies on their way to another core: [p, t, e]
+    flight,     \* copies on their way to another core: [p, t, e, src]
     waits,      \* waits[p]: readers a retired partition waits for
     rems,       \* deferred removals [p, e, w]: w is the readers to wait for, None until the copy landed
     q,          \* q[x]: [st, pt, todo, seen, cnt]
@@ -40,11 +41,10 @@ VARIABLES
     unsynced,   \* files of the installed manifest are not on disk yet; only a mutant sets it
     drains, moves, checkpoints, crashes, resyncs
 
-vars == <<ops, rm, app, low, gen, ents, st, tgts, sent, flight, waits, rems, q, ck, disk, unsynced,
-          drains, moves, checkpoints, crashes, resyncs>>
+feed == <<ops, app, placed, low, held, gen>>
 idx == <<ents, st, tgts, sent, flight, waits, rems>>
 bud == <<drains, moves, checkpoints, crashes, resyncs>>
-feed == <<ops, rm, app, low>>
+vars == <<feed, idx, q, ck, disk, unsynced, bud>>
 
 Tree == {p \in Parts : st[p] \in {"ready", "draining"}}
 Touched(s, lo, hi) == \E j \in (lo + 1)..hi : j <= Len(ops) /\ ops[j].s = s
@@ -53,15 +53,18 @@ Touched(s, lo, hi) == \E j \in (lo + 1)..hi : j <= Len(ops) /\ ops[j].s = s
 VisibleAt(s, a, n) == a <= n /\ ops[a].s = s /\ ops[a].k = "up" /\ ~Touched(s, a, n)
 LiveAt(s, n) == \E a \in 1..n : VisibleAt(s, a, n)
 
-\* Some cut that is or may still be asked for sees this version.
+\* Some cut that is or may still be asked for sees this version, or it is not applied yet.
+\* Mutant prefix_drain_copies_current_only keeps the newest applied versions only, and mutant
+\* drain_ignores_unapplied forgets entries beyond the applied position.
 Wanted(e) ==
-    IF Mutant = "drain_copies_current_only" THEN VisibleAt(e.s, e.a, rm)
-    ELSE \E n \in low..app : VisibleAt(e.s, e.a, n)
+    \/ e.a > app /\ Mutant # "drain_ignores_unapplied"
+    \/ IF Mutant = "prefix_drain_copies_current_only" THEN VisibleAt(e.s, e.a, app)
+       ELSE \E n \in low..app : VisibleAt(e.s, e.a, n)
 
 Same(e, f) == e.s = f.s /\ e.a = f.a
 Used(s, a) ==
     {e.i : e \in {f \in (UNION {ents[p] : p \in Parts}) \cup {r.e : r \in rems}
-                        \cup (UNION {sent[p] : p \in Parts}) \cup {m.e : m \in flight}
+                        \cup (UNION {sent[p] : p \in Parts}) \cup {m.e : m \in flight} \cup {m.src : m \in flight}
                        : f.s = s /\ f.a = a}}
 NewId(s, a) == CHOOSE n \in 0..Cardinality(Used(s, a)) :
                  n \notin Used(s, a) /\ \A m \in 0..n : m < n => m \in Used(s, a)
@@ -73,14 +76,15 @@ PointOf(x) == IF x = "ck" THEN ck.low ELSE q[x].pt
 Idle == [st |-> "idle", pt |-> 0, todo |-> {}, seen |-> {}, cnt |-> [s \in Slots |-> 0]]
 
 TypeOK ==
-    /\ app \in 0..Len(ops) /\ rm \in app..(app + 1) /\ low \in 0..app /\ Len(ops) <= MaxOps
+    /\ app \in 0..Len(ops) /\ low \in 0..app /\ Len(ops) <= MaxOps /\ held \in BOOLEAN
+    /\ placed \subseteq (app + 1)..Len(ops)
     /\ \A p \in Parts : st[p] \in {"free", "ready", "draining", "retired"}
     /\ \A x \in Queries : q[x].st \in {"idle", "probed", "run", "done", "failed"}
     /\ drains \in 0..MaxDrains /\ moves \in 0..MaxMoves /\ resyncs \in 0..MaxResyncs
     /\ checkpoints \in 0..MaxCheckpoints /\ crashes \in 0..MaxCrashes
 
 Init ==
-    /\ ops = <<>> /\ rm = 0 /\ app = 0 /\ low = 0 /\ gen = 0
+    /\ ops = <<>> /\ app = 0 /\ placed = {} /\ low = 0 /\ held = TRUE /\ gen = 0
     /\ ents = [p \in Parts |-> {}]
     /\ st = [p \in Parts |-> IF p \in First THEN "ready" ELSE "free"]
     /\ tgts = [p \in Parts |-> {}] /\ sent = [p \in Parts |-> {}] /\ waits = [p \in Parts |-> {}]
@@ -93,30 +97,30 @@ Init ==
 (* Applying the feed.                                                      *)
 
 NewOp(s, k) ==
-    /\ rm = Len(ops) /\ app = rm /\ Len(ops) < MaxOps
-    /\ k = "del" => LiveAt(s, app)
+    /\ Len(ops) < MaxOps /\ Len(ops) - app < MaxFlight
+    /\ k = "del" => LiveAt(s, Len(ops))
     /\ ops' = Append(ops, [s |-> s, k |-> k])
-    /\ rm' = rm + 1
-    /\ UNCHANGED <<app, low, gen, idx, q, ck, disk, unsynced, bud>>
+    /\ UNCHANGED <<app, placed, low, held, gen, idx, q, ck, disk, unsynced, bud>>
 
-\* After a crash the worker replays the feed from the checkpoint's position.
-Replay ==
-    /\ rm = app /\ app < Len(ops) /\ rm' = rm + 1
-    /\ UNCHANGED <<ops, app, low, gen, idx, q, ck, disk, unsynced, bud>>
-
-\* The owner core appends the entry, and the position counts as applied.
-Place(p) ==
-    /\ rm = app + 1 /\ st[p] = "ready"
-    /\ app' = rm
-    /\ ents' = IF ops[rm].k = "up"
-               THEN [ents EXCEPT ![p] = @ \cup {[s |-> ops[rm].s, a |-> rm, i |-> NewId(ops[rm].s, rm), g |-> gen]}]
+\* The owner core of p appends the entry of operation n. After a crash these are replays.
+AppendEntry(p, n) ==
+    /\ held /\ n \in (app + 1)..(app + MaxFlight) /\ n <= Len(ops) /\ n \notin placed /\ st[p] = "ready"
+    /\ placed' = placed \cup {n}
+    /\ ents' = IF ops[n].k = "up"
+               THEN [ents EXCEPT ![p] = @ \cup {[s |-> ops[n].s, a |-> n, i |-> NewId(ops[n].s, n), g |-> gen]}]
                ELSE ents
-    /\ UNCHANGED <<ops, rm, low, gen, st, tgts, sent, flight, waits, rems, q, ck, disk, unsynced, bud>>
+    /\ UNCHANGED <<ops, app, low, held, gen, st, tgts, sent, flight, waits, rems, q, ck, disk, unsynced, bud>>
+
+\* The position counts as applied once every core finished it.
+Advance ==
+    /\ app + 1 \in placed
+    /\ app' = app + 1 /\ placed' = placed \ {app + 1}
+    /\ UNCHANGED <<ops, low, held, gen, idx, q, ck, disk, unsynced, bud>>
 
 \* Retention moves on: older cuts are refused from now on.
 AdvanceLow ==
     /\ low < app /\ low' = low + 1
-    /\ UNCHANGED <<ops, rm, app, gen, idx, q, ck, disk, unsynced, bud>>
+    /\ UNCHANGED <<ops, app, placed, held, gen, idx, q, ck, disk, unsynced, bud>>
 
 -----------------------------------------------------------------------------
 (* Split, merge and reassignment.                                          *)
@@ -129,17 +133,15 @@ StartDrain(p, T) ==
        \/ Cardinality(T) = 1 /\ \A t \in T : st[t] = "ready"
     /\ st' = [x \in Parts |-> IF x = p THEN "draining" ELSE IF x \in T THEN "ready" ELSE st[x]]
     /\ tgts' = [tgts EXCEPT ![p] = T]
-    /\ UNCHANGED <<feed, gen, ents, sent, flight, waits, rems, q, ck, disk, unsynced, moves, checkpoints, crashes, resyncs>>
+    /\ UNCHANGED <<feed, ents, sent, flight, waits, rems, q, ck, disk, unsynced, moves, checkpoints, crashes, resyncs>>
 
-\* Mutant drain_copies_current_only: only entries of the newest version go, not those that a pinned
-\* scan, a retained cut or a half-applied operation still needs.
 SendCopy(p, t) ==
     /\ st[p] = "draining" /\ t \in tgts[p]
     /\ \E e \in ents[p] \ sent[p] :
         /\ Wanted(e)
-        /\ flight' = flight \cup {[p |-> p, t |-> t, e |-> [e EXCEPT !.i = NewId(e.s, e.a)]]}
+        /\ flight' = flight \cup {[p |-> p, t |-> t, src |-> e, e |-> [e EXCEPT !.i = NewId(e.s, e.a)]]}
         /\ sent' = [sent EXCEPT ![p] = @ \cup {e}]
-    /\ UNCHANGED <<feed, gen, ents, st, tgts, waits, rems, q, ck, disk, unsynced, bud>>
+    /\ UNCHANGED <<feed, ents, st, tgts, waits, rems, q, ck, disk, unsynced, bud>>
 
 \* Append to the target, remove from the source later. Mutant remove_before_append removes first.
 Reassign(p, t) ==
@@ -147,34 +149,35 @@ Reassign(p, t) ==
     /\ st[p] = "ready" /\ st[t] = "ready" /\ p # t
     /\ \E e \in ents[p] :
         /\ Wanted(e) /\ ~\E r \in rems : r.p = p /\ r.e = e
-        /\ flight' = flight \cup {[p |-> p, t |-> t, e |-> [e EXCEPT !.i = NewId(e.s, e.a)]]}
+        /\ flight' = flight \cup {[p |-> p, t |-> t, src |-> e, e |-> [e EXCEPT !.i = NewId(e.s, e.a)]]}
         /\ IF Mutant = "remove_before_append"
            THEN ents' = [ents EXCEPT ![p] = @ \ {e}] /\ UNCHANGED rems
            ELSE rems' = rems \cup {[p |-> p, e |-> e, w |-> None]} /\ UNCHANGED ents
-    /\ UNCHANGED <<feed, gen, st, tgts, sent, waits, q, ck, disk, unsynced, drains, checkpoints, crashes, resyncs>>
+    /\ UNCHANGED <<feed, st, tgts, sent, waits, q, ck, disk, unsynced, drains, checkpoints, crashes, resyncs>>
 
-\* The copy lands. The target may be draining meanwhile, so it goes to one of its targets' scans too.
-\* A copy of an older generation is dropped. Mutant late_copy_after_resync lands it.
+\* The copy lands, also in a partition that drains meanwhile, which then sends it on. A copy of an
+\* older generation is dropped. Mutants: land_needs_ready leaves it in flight while its target drains,
+\* late_copy_after_resync lands an old one.
 Land(t) ==
     /\ \E m \in flight :
-        /\ m.t = t /\ (st[t] = "ready" \/ m.e.g # gen)
+        /\ m.t = t
+        /\ st[t] = "ready" \/ (st[t] = "draining" /\ Mutant # "land_needs_ready") \/ m.e.g # gen
         /\ flight' = flight \ {m}
         /\ IF m.e.g = gen \/ (Mutant = "late_copy_after_resync" /\ st[t] = "ready")
            THEN /\ ents' = [ents EXCEPT ![t] = @ \cup {m.e}]
-                /\ rems' = {IF r.p = m.p /\ Same(r.e, m.e) /\ r.w = None THEN [r EXCEPT !.w = Readers] ELSE r : r \in rems}
+                /\ rems' = {IF r.p = m.p /\ r.e = m.src THEN [r EXCEPT !.w = Readers] ELSE r : r \in rems}
            ELSE UNCHANGED <<ents, rems>>
-    /\ UNCHANGED <<feed, gen, st, tgts, sent, waits, q, ck, disk, unsynced, bud>>
+    /\ UNCHANGED <<feed, st, tgts, sent, waits, q, ck, disk, unsynced, bud>>
 
-\* A target with copies on their way to it does not start to drain or free itself.
+\* Everything wanted was sent and has landed, and no copy is on its way here.
 FinishDrain(p) ==
     /\ st[p] = "draining"
     /\ \A e \in ents[p] : Wanted(e) => e \in sent[p]
     /\ ~\E m \in flight : m.p = p \/ m.t = p
-    /\ rm = app
     /\ st' = [st EXCEPT ![p] = "retired"]
     /\ waits' = [waits EXCEPT ![p] = Readers]
     /\ tgts' = [tgts EXCEPT ![p] = {}] /\ sent' = [sent EXCEPT ![p] = {}]
-    /\ UNCHANGED <<feed, gen, ents, flight, rems, q, ck, disk, unsynced, bud>>
+    /\ UNCHANGED <<feed, ents, flight, rems, q, ck, disk, unsynced, bud>>
 
 \* Mutant free_without_wait reuses a retired partition while a scan still needs it.
 FreePart(p) ==
@@ -183,7 +186,7 @@ FreePart(p) ==
     /\ ents' = [ents EXCEPT ![p] = {}]
     /\ rems' = {r \in rems : r.p # p}
     /\ waits' = [waits EXCEPT ![p] = {}]
-    /\ UNCHANGED <<feed, gen, tgts, sent, flight, q, ck, disk, unsynced, bud>>
+    /\ UNCHANGED <<feed, tgts, sent, flight, q, ck, disk, unsynced, bud>>
 
 \* Mutants: remove_without_wait ignores running scans, prefix_remove_by_slot removes every copy of
 \* the row in the partition.
@@ -193,7 +196,7 @@ RemoveMoved(p) ==
         /\ rems' = rems \ {r}
         /\ ents' = [ents EXCEPT ![p] = IF Mutant = "prefix_remove_by_slot"
                                        THEN {e \in @ : ~Same(e, r.e)} ELSE @ \ {r.e}]
-    /\ UNCHANGED <<feed, gen, st, tgts, sent, flight, waits, q, ck, disk, unsynced, bud>>
+    /\ UNCHANGED <<feed, st, tgts, sent, flight, waits, q, ck, disk, unsynced, bud>>
 
 \* A superseded entry goes once no reader and no retained cut can see it. Mutant gc_without_epoch
 \* looks at the newest version only.
@@ -204,7 +207,7 @@ Collect(p) ==
            \/ Touched(e.s, e.a, low) /\ \A x \in Readers : Touched(e.s, e.a, PointOf(x))
         /\ ents' = [ents EXCEPT ![p] = @ \ {e}]
         /\ sent' = [sent EXCEPT ![p] = @ \ {e}]
-    /\ UNCHANGED <<feed, gen, st, tgts, flight, waits, rems, q, ck, disk, unsynced, bud>>
+    /\ UNCHANGED <<feed, st, tgts, flight, waits, rems, q, ck, disk, unsynced, bud>>
 
 -----------------------------------------------------------------------------
 (* Exact scans, at the applied position (`latest`, after a barrier) or an   *)
@@ -214,17 +217,17 @@ Collect(p) ==
 \* Mutant prefix_probe_before_pin, the design before this review: the partitions are ranked while
 \* the barrier is in flight, and the point is fixed in a later step.
 StartScan(x, n) ==
-    /\ n \in low..app
+    /\ held /\ n \in low..app
     /\ IF Mutant = "prefix_probe_before_pin"
        THEN \/ q[x].st = "idle" /\ q' = [q EXCEPT ![x] = [Idle EXCEPT !.st = "probed", !.todo = Tree]]
             \/ q[x].st = "probed" /\ q' = [q EXCEPT ![x].st = "run", ![x].pt = n]
        ELSE q[x].st = "idle" /\ q' = [q EXCEPT ![x] = [Idle EXCEPT !.st = "run", !.pt = n, !.todo = Tree]]
-    /\ UNCHANGED <<feed, gen, idx, ck, disk, unsynced, bud>>
+    /\ UNCHANGED <<feed, idx, ck, disk, unsynced, bud>>
 
-\* Mutants: prefix_current_liveness judges an entry by the row map as it is now, prefix_short_version
+\* Mutants: prefix_current_liveness judges an entry by the newest applied version, prefix_short_version
 \* compares only the last bit of a version, show_superseded shows entries of old versions.
 Shows(x, e) ==
-    CASE Mutant = "prefix_current_liveness" -> e.a <= q[x].pt /\ VisibleAt(e.s, e.a, rm)
+    CASE Mutant = "prefix_current_liveness" -> e.a <= q[x].pt /\ VisibleAt(e.s, e.a, app)
       [] Mutant = "prefix_short_version" ->
             e.a <= q[x].pt /\ \E b \in 1..q[x].pt : b % 2 = e.a % 2 /\ VisibleAt(e.s, b, q[x].pt)
       [] Mutant = "show_superseded" -> e.a <= q[x].pt
@@ -240,26 +243,26 @@ Visit(x, p) ==
        q' = [q EXCEPT ![x].todo = @ \ {p},
                       ![x].seen = @ \cup {[s |-> e.s, a |-> e.a] : e \in hit},
                       ![x].cnt = [s \in Slots |-> c(s)]]
-    /\ UNCHANGED <<feed, gen, idx, ck, disk, unsynced, bud>>
+    /\ UNCHANGED <<feed, idx, ck, disk, unsynced, bud>>
 
 FinishScan(x) ==
     /\ q[x].st = "run" /\ q[x].todo = {}
     /\ q' = [q EXCEPT ![x].st = "done"]
-    /\ UNCHANGED <<feed, gen, idx, ck, disk, unsynced, bud>>
+    /\ UNCHANGED <<feed, idx, ck, disk, unsynced, bud>>
 
 -----------------------------------------------------------------------------
-(* Checkpoints, crashes and resync. A checkpoint reads like a scan.        *)
+(* Checkpoints, crashes, resync and drop. A checkpoint reads like a scan.  *)
 
 BeginCheckpoint ==
-    /\ ck = None /\ checkpoints < MaxCheckpoints
+    /\ held /\ ck = None /\ checkpoints < MaxCheckpoints
     /\ checkpoints' = checkpoints + 1
     /\ ck' = [pos |-> app, low |-> low, todo |-> Tree, got |-> {}]
-    /\ UNCHANGED <<feed, gen, idx, q, disk, unsynced, drains, moves, crashes, resyncs>>
+    /\ UNCHANGED <<feed, idx, q, disk, unsynced, drains, moves, crashes, resyncs>>
 
 WriteFile(p) ==
     /\ ck # None /\ p \in ck.todo
     /\ ck' = [ck EXCEPT !.todo = @ \ {p}, !.got = @ \cup {[s |-> e.s, a |-> e.a] : e \in ents[p]}]
-    /\ UNCHANGED <<feed, gen, idx, q, disk, unsynced, bud>>
+    /\ UNCHANGED <<feed, idx, q, disk, unsynced, bud>>
 
 \* Every file is synced, then the manifest is. Mutants: manifest_before_sync, checkpoint_ahead_of_files,
 \* whose manifest claims the position reached meanwhile, and checkpoint_forgets_low, which claims
@@ -270,57 +273,75 @@ InstallManifest ==
                 low |-> IF Mutant = "checkpoint_forgets_low" THEN 0 ELSE ck.low, got |-> ck.got]
     /\ unsynced' = (Mutant = "manifest_before_sync")
     /\ ck' = None
-    /\ UNCHANGED <<feed, gen, idx, q, bud>>
+    /\ UNCHANGED <<feed, idx, q, bud>>
 
-\* Put a set of versions into the first partition, as a new generation.
+\* Put a set of versions into the first partition, as a generation. Every running scan fails.
+\* Mutant scan_survives_resync lets it go on in the new index.
 Load(got, n, l, g) ==
-    /\ gen' = g /\ app' = n /\ rm' = n /\ low' = l
+    /\ gen' = g /\ app' = n /\ placed' = {} /\ low' = l
     /\ LET p0 == CHOOSE p \in First : TRUE IN
        ents' = [p \in Parts |-> IF p = p0 THEN {[s |-> e.s, a |-> e.a, i |-> 0, g |-> g] : e \in got} ELSE {}]
     /\ st' = [p \in Parts |-> IF p \in First THEN "ready" ELSE "free"]
     /\ tgts' = [p \in Parts |-> {}] /\ sent' = [p \in Parts |-> {}] /\ waits' = [p \in Parts |-> {}]
     /\ rems' = {} /\ ck' = None
-    /\ q' = [x \in Queries |-> IF q[x].st \in {"run", "probed"} THEN [Idle EXCEPT !.st = "failed"] ELSE q[x]]
+    /\ q' = IF Mutant = "scan_survives_resync" THEN q
+            ELSE [x \in Queries |-> IF q[x].st \in {"run", "probed"} THEN [Idle EXCEPT !.st = "failed"] ELSE q[x]]
+
+SnapshotAt(n) == {[s |-> ops[a].s, a |-> a] : a \in {b \in 1..n : VisibleAt(ops[b].s, b, n)}}
+NoDisk == [pos |-> 0, low |-> 0, got |-> {}]
 
 \* Memory is lost. The worker loads its own manifest, nothing, or a checkpoint of the other replica.
 Crash(how) ==
-    /\ crashes < MaxCrashes /\ crashes' = crashes + 1
+    /\ held /\ crashes < MaxCrashes /\ crashes' = crashes + 1
     /\ flight' = {} /\ unsynced' = FALSE
     /\ CASE how = "disk" -> /\ Load(IF unsynced THEN {} ELSE disk.got, disk.pos, disk.low, gen) /\ UNCHANGED disk
-         [] how = "empty" -> /\ Load({}, 0, 0, gen) /\ disk' = [pos |-> 0, low |-> 0, got |-> {}]
-         [] how = "peer" -> \E n \in 0..Len(ops) :
-                /\ Load({[s |-> ops[a].s, a |-> a] : a \in {b \in 1..n : VisibleAt(ops[b].s, b, n)}}, n, n, gen)
-                /\ disk' = [pos |-> 0, low |-> 0, got |-> {}]
-    /\ UNCHANGED <<ops, drains, moves, checkpoints, resyncs>>
+         [] how = "empty" -> /\ Load({}, 0, 0, gen) /\ disk' = NoDisk
+         [] how = "peer" -> \E n \in 0..Len(ops) : /\ Load(SnapshotAt(n), n, n, gen) /\ disk' = NoDisk
+    /\ UNCHANGED <<ops, held, drains, moves, checkpoints, resyncs>>
 
-\* The log was purged: a range snapshot replaces the index at once, as a new generation. It holds only
-\* the newest versions. Copies between cores may still be on their way.
+\* The log was purged, or the range was assigned again: a range snapshot replaces the index at once, as
+\* a new generation. It holds only the newest versions. Copies between cores may still be on their way.
 Resync ==
     /\ resyncs < MaxResyncs /\ resyncs' = resyncs + 1
-    /\ \E n \in app..Len(ops) :
-        Load({[s |-> ops[a].s, a |-> a] : a \in {b \in 1..n : VisibleAt(ops[b].s, b, n)}}, n, n, gen + 1)
-    /\ disk' = [pos |-> 0, low |-> 0, got |-> {}] /\ unsynced' = FALSE
+    /\ \E n \in app..Len(ops) : Load(SnapshotAt(n), n, n, gen + 1)
+    /\ held' = TRUE /\ disk' = NoDisk /\ unsynced' = FALSE
+    /\ UNCHANGED <<ops, flight, drains, moves, checkpoints, crashes>>
+
+\* The range moved to another worker: this one drops it.
+DropRange ==
+    /\ held /\ resyncs < MaxResyncs /\ resyncs' = resyncs + 1
+    /\ Load({}, 0, 0, gen + 1)
+    /\ held' = FALSE /\ disk' = NoDisk /\ unsynced' = FALSE
     /\ UNCHANGED <<ops, flight, drains, moves, checkpoints, crashes>>
 
 Terminated ==
-    /\ \A x \in Queries : q[x].st \in {"done", "failed"}
-    /\ app = Len(ops) /\ rm = app /\ ck = None
+    /\ \A x \in Queries : q[x].st \in {"done", "failed"} \/ ~held
+    /\ app = Len(ops) \/ ~held
+    /\ ck = None
+    /\ ~\E p \in Parts : st[p] = "draining"
     /\ UNCHANGED vars
 
 Next ==
     \/ \E s \in Slots, k \in {"up", "del"} : NewOp(s, k)
-    \/ Replay \/ AdvanceLow
+    \/ Advance \/ AdvanceLow
     \/ \E p \in Parts :
         \/ \E T \in SUBSET Parts : StartDrain(p, T)
         \/ \E t \in Parts : SendCopy(p, t) \/ Reassign(p, t)
-        \/ Place(p) \/ Land(p) \/ Collect(p) \/ FinishDrain(p) \/ FreePart(p) \/ WriteFile(p) \/ RemoveMoved(p)
+        \/ \E n \in 1..MaxOps : AppendEntry(p, n)
+        \/ Land(p) \/ Collect(p) \/ FinishDrain(p) \/ FreePart(p) \/ WriteFile(p) \/ RemoveMoved(p)
         \/ \E x \in Queries : Visit(x, p)
     \/ \E x \in Queries : FinishScan(x) \/ \E n \in 0..MaxOps : StartScan(x, n)
-    \/ BeginCheckpoint \/ InstallManifest \/ Resync
+    \/ BeginCheckpoint \/ InstallManifest \/ Resync \/ DropRange
     \/ \E how \in {"disk", "empty", "peer"} : Crash(how)
     \/ Terminated
 
+\* The cores' message loops and the maintenance loop.
+Fairness ==
+    \A p \in Parts : /\ WF_vars(Land(p)) /\ WF_vars(FinishDrain(p))
+                     /\ \A t \in Parts : WF_vars(SendCopy(p, t))
+
 Spec == Init /\ [][Next]_vars
+LiveSpec == Spec /\ Fairness
 
 -----------------------------------------------------------------------------
 
@@ -339,10 +360,13 @@ NoDuplicate == \A x \in Queries : q[x].st = "done" => \A s \in Slots : q[x].cnt[
 \* VEC-G05: for every cut that may be asked for, every visible row has an entry in a partition that a
 \* new scan would list. Also after a crash, while it replays and after a resync.
 NoLostRow ==
-    \A n \in low..app : \A s \in Slots : LiveAt(s, n) =>
+    held => \A n \in low..app : \A s \in Slots : LiveAt(s, n) =>
         \E p \in Tree : \E e \in ents[p] : e.s = s /\ VisibleAt(s, e.a, n)
 
-\* VEC-G03: a resync leaves no entry of the old index.
+\* VEC-G03: a resync or a drop leaves no entry of the old index.
 SingleGeneration == \A p \in Parts : \A e \in ents[p] : e.g = gen
+
+\* VEC-G05: a split or merge ends.
+DrainEnds == \A p \in Parts : (st[p] = "draining") ~> (st[p] # "draining")
 
 =============================================================================

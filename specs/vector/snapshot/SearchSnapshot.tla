@@ -208,8 +208,11 @@ Elect(r) ==
 Floor(r) ==
     Max({FloorAt(log[r], wpos[r] + 1)} \cup {m.ts : m \in {x \in cmsg : x.r = r /\ x.at <= wpos[r]}})
 
-\* The smallest timestamp whose versions are all here.
-Retained(r) == Max({log[r][i].ts : i \in {j \in Committed(log[r]) : j <= base[r]}})
+\* The smallest timestamp whose versions are all here: the newest version that superseded one that was
+\* dropped. Mutant prefix_bound_of_dropped takes the largest timestamp that was dropped.
+Retained(r) ==
+    LET there == {log[r][i].ts : i \in {j \in Committed(log[r]) : j <= base[r]}} IN
+    IF Mutant = "prefix_bound_of_dropped" THEN Max(there \ {Max(there)}) ELSE Max(there)
 
 PullFeed(r) ==
     /\ wpos[r] < Len(log[r])

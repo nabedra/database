@@ -83,7 +83,11 @@ Propose(w) ==
     /\ entries' = TRUE
     /\ UNCHANGED <<build, id, joined, advert, active, sees, restarts>>
 
+Terminated == restarts = MaxRestarts /\ UNCHANGED vars
+
 Next ==
+  \/ Terminated
+  \/
     \E w \in Workers :
         \/ \E b \in {"old", "new"} : Restart(w, b)
         \/ Join(w) \/ Advertise(w) \/ Learn(w) \/ Propose(w) \/ Activate
