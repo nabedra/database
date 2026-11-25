@@ -72,8 +72,9 @@ PORTS = ("clean", "hand")
 # The fields each kind of regression takes: its own, then the optional ones. No other kind may have them.
 REGRESSION_KINDS = {"lib-test": ("test", ("probe", "needs_server")), "acceptance": ("scenario", ()),
                     "recovery-suite": ("suite", ())}
-# Suites of server/tests/oltp_recovery_operations.py that a phase 11 regression runs.
-RECOVERY_SUITES = ("replacement-wipe", "replacement-voter-refresh")
+# Suites of server/tests/oltp_recovery_operations.py that a phase 11 regression runs, and what each reports.
+RECOVERY_SUITES = {"replacement-wipe": "O17/NS23 refuses a wiped mounted replacement",
+                   "replacement-voter-refresh": "O17 Data-only revocation after two Control voter replacements"}
 REPLICATION_TESTS = "oltp_replication::"
 SHA = re.compile(r"[0-9a-f]{40}")
 ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -92,8 +93,14 @@ SIM_ONLY = re.compile(r'\bsim(?:_\w+|ulat\w*)?\b|\w_sim\b|\bWorld\b|\bcfg|\bfeat
                       r'\b(?:option_)?env!|\benv::|\bvar_os\b|\bcurrent_exe\b|\binclude(?:_str|_bytes)?!|#\[path')
 # A fix may have moved test code, so its revert may change this one attribute.
 TEST_CFG = "#[cfg(test)]"
-# Predicates under which code is compiled for tests and never for the product.
-TEST_ONLY = re.compile(r'\(\s*(?:test|feature\s*=\s*"test-hooks"|any\(\s*test\s*,\s*feature\s*=\s*"test-hooks"\s*\))\s*\)')
+# What a probe may add to a product source: one block of this shape, whole lines, its attribute first. The rules
+# refuse whatever would take reading Rust to judge.
+PROBE_ATTRIBUTES = ("#[cfg(test)]", '#[cfg(any(test, feature = "test-hooks"))]')
+PROBE_HEAD = re.compile(r"(?:(?:pub )?(?:async )?fn \w+\([\w\s:,&]*\)(?: -> \w+)?|if [\w .:()&|=!]+) \{")
+PROBE_LET = re.compile(r"let (?:mut )?\w+ = [\w .:()&|,=!]+;")
+PROBE_STRING = re.compile(r'(?<![\w#"])"[^"]*"')
+RAW_TEXT = re.compile(r'\b(?:r|br|cr)#*"|/\*')
+NEXT_LINE = re.compile(r"(?!else\b)[A-Za-z_#}]")
 # Test code that does not carry a name of TEST_FILE: the acceptance modules of the library tests.
 ACCEPTANCE_FILE = re.compile(r"server/src/oltp_\w*acceptance\.rs")
 # A patch is what a reviewer reads: no look-alike letter, no invisible character, nothing far to the right.
@@ -122,11 +129,14 @@ RULE_SOURCE = re.compile(r"(?:docs|plans)/(?:[a-z0-9_-]+/)*[a-z0-9_-]+\.md")
 VERDICTS = ("sensitive", "partial", "not-sensitive")
 ASSERTIONS = ("state", "counter", "timeout")
 SEED_BUDGET = 10_000
-# What a build or a test may take from the machine. A compiler, a wrapper, a linker, a flag, a library path or a
-# variable of the harness comes from this script, from the tree, or not at all.
-KEPT_ENV = re.compile(r"PATH|HOME|USER|LOGNAME|SHELL|TERM|TZ|LANG|LC_\w+|TMPDIR|TMP|TEMP|RUNNER_TEMP|CI|"
-                      r"CARGO_TERM_\w+|CARGO_NET_(?:RETRY|OFFLINE)|RUST_BACKTRACE|SSL_CERT_(?:FILE|DIR)|"
-                      r"(?i:https?_proxy|no_proxy|all_proxy)")
+# What a build, a test or Git may take from the machine. Everything else in its environment is set here.
+MACHINE = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
+# Where the scratch worktree and the builds' temporary files go. No variable chooses it: Cargo reads the configuration
+# of every directory above the one it builds in.
+SCRATCH_BASE = Path("/var/tmp")
+# Git's own configuration, which could rewrite a patch or run a hook. The repository's and the machine's are not used.
+GIT_CONFIG = ("core.hooksPath=/dev/null", "core.fsmonitor=false", "core.autocrlf=false", "core.attributesFile=/dev/null",
+              "apply.whitespace=nowarn", "apply.ignoreWhitespace=no", "diff.indentHeuristic=true")
 SEARCHES = "searches.jsonl"
 TARGET_FILE = re.compile(r"server/sim-oltp/bugs/(?:README\.md|SHARDS\.md|(?:phase[0-9]+/)?(?:simulator\.toml|[a-z0-9-]+/"
                          r"(?:bug\.toml|revert\.patch|probe\.patch|searches\.jsonl)))")
@@ -186,13 +196,20 @@ class Bug:
 # --------------------------------------------------------------------------------------------
 # Git and patch helpers.
 
+def machine_env(**own):
+    """The environment of Git, a build or a test: MACHINE, and `own`."""
+    return {**{key: os.environ[key] for key in MACHINE if key in os.environ}, **own}
+
+
 def git(repo, *args, env=None, input=None, check=True):
-    # `git replace` refs would show another object under a commit's name, and inherited variables another
-    # repository. A caller's own index is the one variable that stays.
-    kept = ("GIT_INDEX_FILE",) if env is not None else ()
-    env = {k: v for k, v in (os.environ if env is None else env).items() if not k.startswith("GIT_") or k in kept}
-    env["GIT_NO_REPLACE_OBJECTS"] = "1"
-    result = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True,
+    """Run Git with its own environment and configuration. `env` adds the caller's index."""
+    # `git replace` refs would show another object under a commit's name.
+    env = {**machine_env(), "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_NO_REPLACE_OBJECTS": "1",
+           **(env or {})}
+    options = [part for setting in GIT_CONFIG for part in ("-c", setting)]
+    if args[0] == "diff":
+        args = ("diff", "--no-ext-diff", "--no-textconv", *args[1:])
+    result = subprocess.run(["git", *options, *args], cwd=repo, capture_output=True, text=True,
                             env=env, input=input)
     if check and result.returncode:
         raise Failure(f"git {' '.join(args)}: {result.stderr.strip() or result.stdout.strip()}")
@@ -316,8 +333,8 @@ def historical_path(repo, name, commit):
 
 def apply_check_head(repo, patch):
     """`git apply --check` against HEAD's tree through a private index. Touches no worktree."""
-    with tempfile.TemporaryDirectory(prefix="sim-bugs-index-") as tmp:
-        env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
+    with tempfile.TemporaryDirectory(prefix="sim-bugs-index-", dir=SCRATCH_BASE) as tmp:
+        env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
         git(repo, "read-tree", "HEAD", env=env)
         result = git(repo, "apply", "--check", "--cached", "-", env=env, input=patch, check=False)
     return result.returncode == 0, (result.stderr or result.stdout).strip()
@@ -683,6 +700,9 @@ def validate_probe(bug):
         problems.append("probe.patch needs one section per file")
     if any(removed for removed, _ in changed_lines(bug.probe).values()):
         problems.append("probe.patch may only add lines")
+    if any(re.search(r"\binclude(?:_str|_bytes)?\b|/\*", line) for name, (_, added) in changed_lines(bug.probe).items()
+           for line in added if name.endswith(".rs")):
+        problems.append("probe.patch may not include a source as text, or hold a block comment")
     name = bug.regression["test"].rsplit("::", 1)[-1]
     if not any(re.search(rf"\bfn {name}\b", line) for _, added in changed_lines(bug.probe).values() for line in added):
         problems.append(f"probe.patch does not add {name}")
@@ -691,14 +711,14 @@ def validate_probe(bug):
 
 def probe_in_tree(bug, repo):
     """What the probe does in HEAD's tree: the patch reverts the same lines with it and without it, and what it
-    adds to a product source is compiled for tests only."""
+    adds to a product source is one plain test block at a time."""
     problems, trees = [], []
     for order in ((bug.probe, bug.patch), (bug.patch, bug.probe)):
-        with tempfile.TemporaryDirectory(prefix="sim-bugs-index-") as tmp:
-            env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
+        with tempfile.TemporaryDirectory(prefix="sim-bugs-index-", dir=SCRATCH_BASE) as tmp:
+            env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
             git(repo, "read-tree", "HEAD", env=env)
             for patch in order:
-                result = git(repo, "apply", "--cached", "-", env=env, input=patch, check=False)
+                result = git(repo, "apply", "--whitespace=nowarn", "--cached", "-", env=env, input=patch, check=False)
                 if result.returncode:
                     return [f"probe.patch and revert.patch do not apply to HEAD together: {result.stderr.strip()}"]
                 trees.append(git(repo, "write-tree", env=env).stdout.strip())
@@ -708,19 +728,66 @@ def probe_in_tree(bug, repo):
         problems.append("probe.patch and revert.patch do not apply in either order to the same tree")
     added = git(repo, "diff", "--no-renames", "--no-ext-diff", "--no-color", "-U0", "HEAD", with_probe).stdout
     for name in patch_files(bug.probe):
+        before, after = (git(repo, "show", f"{tree}:{name}", check=False).stdout for tree in ("HEAD", with_probe))
+        if not exactly(before, after, name, [bug.probe]):
+            problems.append(f"{name} with the probe is not the tree plus the probe")
         if TEST_FILE.search(name) or ACCEPTANCE_FILE.fullmatch(name):
             continue
         section = added.split(f"diff --git a/{name} b/{name}\n", 1)[-1].split("\ndiff --git ", 1)[0]
-        new = {line for start, count in re.findall(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", section, re.MULTILINE)
-               for line in range(int(start), int(start) + int(count or 1))}
-        # A region counts if its attribute is the tree's, or if all of it is the probe's: an added attribute must not
-        # take product code out of the product.
-        tests = {line for region in cfg_regions(git(repo, "show", f"{with_probe}:{name}").stdout,
-                                                lambda predicate, macro: not macro and TEST_ONLY.fullmatch(predicate))
-                 for line in region if region[0] not in new or set(region) <= new}
-        if not new <= tests:
-            problems.append(f"probe.patch adds lines to {name} that are not only for tests")
+        for start, count in re.findall(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", section, re.MULTILINE):
+            if not test_block(after.split("\n"), int(start) - 1, int(count or 1)):
+                problems.append(f"what probe.patch adds at line {start} of {name} is not one plain test block")
     return problems
+
+
+def test_block(lines, start, count):
+    """Whether lines[start:start + count] are one block that only a test build compiles, in a place where that can be
+    said without reading Rust. It refuses what it cannot tell."""
+    run = lines[start:start + count]
+    indent = run[0][:len(run[0]) - len(run[0].lstrip(" "))]
+    if len(run) < 2 or run[0] not in (indent + attribute for attribute in PROBE_ATTRIBUTES):
+        return False
+    body = run[2:] if run[1] == indent + "#[doc(hidden)]" else run[1:]
+    if len(body) == 1:
+        # One `let` on one line, with no block, text or comment in it.
+        line = body[0].removeprefix(indent)
+        shape = bool(PROBE_LET.fullmatch(line)) and brackets_close(line)
+    else:
+        # A head that opens the only block, lines further in without any, and the line that closes it.
+        shape = (len(body) >= 3 and body[0].startswith(indent) and PROBE_HEAD.fullmatch(body[0].removeprefix(indent)) is not None
+                 and brackets_close(body[0].removesuffix("{")) and body[-1] == indent + "}"
+                 and all(plain_line(line, indent) for line in body[1:-1]))
+    return shape and plain_place(lines[:start], lines[start + count:])
+
+
+def plain_line(line, indent):
+    """A line of the block: further in, no brace, comment, escape, character or attribute, and whole plain strings."""
+    return (line.startswith(indent + "    ") and not re.search(r"[{}/\\'#]", line)
+            and '"' not in PROBE_STRING.sub("", line) and brackets_close(PROBE_STRING.sub("", line)))
+
+
+def brackets_close(text):
+    depth = 0
+    for c in text:
+        depth += (c in "([") - (c in ")]")
+        if depth < 0:
+            return False
+    return depth == 0
+
+
+def plain_place(before, after):
+    """Whether a statement or an item can stand between these lines: no text or comment is open, the line before
+    ends a statement, an item or the head of a block, and the line after starts one."""
+    for line in before:
+        if RAW_TEXT.search(line):
+            return False
+        # Without raw text and block comments, a line starts in code if every line before it closed its quotes.
+        quotes = re.sub(r"\\.", "", line).replace("'\"'", "").count('"')
+        if quotes % 2 and not line.lstrip().startswith("//"):
+            return False
+    code = lambda lines: [line.strip() for line in lines if line.strip() and not line.strip().startswith("//")]
+    previous, following = code(before)[-1:], code(after)[:1]
+    return (not previous or previous[0][-1] in "{};") and (not following or NEXT_LINE.match(following[0]) is not None)
 
 
 def validate_patch_paths(patch):
@@ -762,28 +829,17 @@ def closing(code, start):
 def sim_only_lines(text):
     """Line numbers of Rust code under a cfg predicate that names the simulator's build. Approximate,
     and it errs on the side of calling code simulator-only."""
-    return cfg_lines(text, lambda predicate, macro: SIM_CFG.search(predicate) and not re.fullmatch(
-        rf"\(\s*not\s*\(\s*(?:{SIM_CFG.pattern})\s*\)\s*\)", predicate))
-
-
-def cfg_lines(text, wanted):
-    return {line for lines in cfg_regions(text, wanted) for line in lines}
-
-
-def cfg_regions(text, wanted):
-    """The line ranges of the items, statements and blocks that a cfg predicate governs, its attribute included,
-    when `wanted` takes the predicate (with its brackets) and whether it is a `cfg!`."""
     code = RUST_TEXT.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), text)
-    regions = []
+    gated = set()
     for match in CFG.finditer(code):
         opening = match.start(2) if match.group(2) else match.start(3)
         end = closing(code, opening)
         predicate = text[opening:end]
-        if not wanted(predicate, bool(match.group(3))):
+        if not SIM_CFG.search(predicate) or re.fullmatch(
+                rf"\(\s*not\s*\(\s*(?:{SIM_CFG.pattern})\s*\)\s*\)", predicate):
             continue
         if match.group(1):
-            regions.append(range(1, text.count("\n") + 1 + (not text.endswith("\n"))))
-            continue
+            return set(range(1, text.count("\n") + 2))
         if match.group(2):
             end = code.index("]", end) + 1
             while attribute := re.compile(r"\s*#\s*\[").match(code, end):
@@ -799,18 +855,28 @@ def cfg_regions(text, wanted):
             if depth < 0:
                 break
             i += 1
-        regions.append(range(code.count("\n", 0, match.start()) + 1, code.count("\n", 0, i) + 2))
-    return regions
+        gated.update(range(code.count("\n", 0, match.start()) + 1, code.count("\n", 0, i) + 2))
+    return gated
+
+
+def exactly(before, after, name, patches):
+    """Whether `after` holds the lines of `before` and what the patches add and remove, and no other."""
+    expected = Counter(before.split("\n"))
+    for patch in patches:
+        removed, added = changed_lines(patch).get(name, ((), ()))
+        expected.subtract(removed)
+        expected.update(added)
+    return +expected == Counter(after.split("\n")) and min(expected.values(), default=0) >= 0
 
 
 def applied(repo, patch):
     """Apply `patch` to HEAD's tree through a private index, and say what changed in fact:
     problems with the files and line counts, and changes to code compiled only for the simulator."""
     problems = []
-    with tempfile.TemporaryDirectory(prefix="sim-bugs-index-") as tmp:
-        env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
+    with tempfile.TemporaryDirectory(prefix="sim-bugs-index-", dir=SCRATCH_BASE) as tmp:
+        env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
         git(repo, "read-tree", "HEAD", env=env)
-        git(repo, "apply", "--cached", "-", env=env, input=patch)
+        git(repo, "apply", "--whitespace=nowarn", "--cached", "-", env=env, input=patch)
         diff = git(repo, "diff", "--cached", "--no-renames", "--no-ext-diff", "--no-color", "-U0", "HEAD", env=env).stdout
         numstat = git(repo, "apply", "--numstat", "-z", "-", input=patch).stdout
         counts = {}
@@ -827,6 +893,8 @@ def applied(repo, patch):
                 problems.append(f"git changes more than lines of {changed.name}: {', '.join(changed.headers)}")
         for name in read:
             sides = (git(repo, "show", f"HEAD:{name}", check=False).stdout, git(repo, "show", f":{name}", env=env, check=False).stdout)
+            if not exactly(*sides, name, [patch]):
+                problems.append(f"{name} with the patch is not the tree plus the patch")
             gated = [sim_only_lines(side) for side in sides]
             section = diff.split(f"diff --git a/{name} b/{name}\n", 1)[-1].split("\ndiff --git ", 1)[0]
             for a, n, b, k in re.findall(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", section, re.MULTILINE):
@@ -836,6 +904,25 @@ def applied(repo, patch):
                     problems.append(f"revert.patch changes lines of {name} that are compiled only for the simulator")
                     break
     return problems
+
+
+def more_than_the_probe(bug, repo, sha, names):
+    """Why the commit with the patch is not, in these files, its parent plus the probe and the patch, byte for byte.
+    The parent has to be a commit of this history, so that nothing hides in it."""
+    parent = git(repo, "rev-parse", "--verify", "--quiet", f"{sha}^", check=False).stdout.strip()
+    if not parent or git(repo, "merge-base", "--is-ancestor", parent, "HEAD", check=False).returncode:
+        return f"the parent of {sha[:8]}, which its regression run tested, is not in HEAD's history"
+    with tempfile.TemporaryDirectory(prefix="sim-bugs-index-", dir=SCRATCH_BASE) as tmp:
+        env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
+        git(repo, "read-tree", parent, env=env)
+        for patch in (bug.probe, bug.patch):
+            result = git(repo, "apply", "--whitespace=nowarn", "--cached", "-", env=env, input=patch, check=False)
+            if result.returncode:
+                return f"the probe and the patch do not apply to the parent of {sha[:8]}: {result.stderr.strip()}"
+        tree = git(repo, "write-tree", env=env).stdout.strip()
+    if git(repo, "diff", "--no-renames", "--name-only", tree, sha, "--", *sorted(names)).stdout:
+        return f"{sha[:8]}, which its regression run tested, holds more in these files than the probe and the patch"
+    return None
 
 
 def regression_evidence(bug, repo):
@@ -901,6 +988,8 @@ def regression_evidence(bug, repo):
                 there = git(repo, "show", f"{sha}:{name}", check=False).stdout.split("\n")
                 if Counter(added) - Counter(there):
                     return [f"{sha[:8]}, which its regression run tested, does not hold the probe"], uncounted
+        if bug.probe is not None and (more := more_than_the_probe(bug, repo, patched["sha"], own)):
+            return [more], uncounted
         extras = [set(git(repo, "diff", "--no-renames", "--name-only", base, patched["sha"]).stdout.split()) - own
                   for base in (f"{patched['sha']}^", clean["sha"])]
         if all(extras):
@@ -1210,20 +1299,26 @@ def cmd_check(repo, bugs, out, require_evidence=True, every=None):
 # Scratch worktrees and builds (verify, run).
 
 class Scratch:
-    """A detached worktree of HEAD under a temporary directory, removed on exit."""
+    """A detached worktree of HEAD and a temporary directory, removed on exit."""
 
     def __init__(self, repo, keep=False):
         self.repo, self.keep = repo, keep
-        base = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir())
-        self.path = base / f"sim-bugs-{os.getpid()}-{time.time_ns()}"
+        self.path = SCRATCH_BASE / f"sim-bugs-{os.getpid()}-{time.time_ns()}"
+        self.tmp = Path(f"{self.path}-tmp")
 
     def __enter__(self):
         if self.path.resolve() == self.repo.resolve():
             raise Failure("refusing to apply patches in the shipped tree")
+        for parent in self.path.parents:
+            for name in ("config", "config.toml"):
+                if (parent / ".cargo" / name).exists():
+                    raise Failure(f"the Cargo configuration {parent / '.cargo' / name} would reach every build in {self.path}")
         git(self.repo, "worktree", "add", "--detach", "--quiet", str(self.path), "HEAD")
+        self.tmp.mkdir(mode=0o700)
         return self
 
     def __exit__(self, *exc):
+        shutil.rmtree(self.tmp, ignore_errors=True)
         if self.keep:
             print(f"kept scratch worktree {self.path}", file=sys.stderr)
             return
@@ -1233,13 +1328,17 @@ class Scratch:
     def apply(self, bug, probe=False, revert=True):
         if self.path.resolve() == self.repo.resolve():
             raise Failure("refusing to apply patches in the shipped tree")
-        expected = set()
-        for wanted, text in ((probe, bug.probe), (revert, bug.patch)):
-            if wanted and text is not None:
-                git(self.path, "apply", "-", input=text)
-                expected |= set(patch_files(text))
+        patches = [text for wanted, text in ((probe, bug.probe), (revert, bug.patch)) if wanted and text is not None]
+        for text in patches:
+            git(self.path, "apply", "--whitespace=nowarn", "-", input=text)
+        expected = {name for text in patches for name in patch_files(text)}
         if set(self.changed()) != expected:
             raise Failure(f"the patch changed {sorted(self.changed())} in the scratch tree")
+        for name in expected:
+            path = self.path / name
+            after = path.read_bytes().decode("utf-8") if path.is_file() else ""
+            if not exactly(git(self.repo, "show", f"HEAD:{name}", check=False).stdout, after, name, patches):
+                raise Failure(f"{name} in the scratch tree is not the tree plus the patch")
 
     def changed(self):
         """The files that differ from HEAD."""
@@ -1251,14 +1350,10 @@ class Scratch:
         git(self.path, "clean", "-fdq")
 
 
-def machine_env(**own):
-    """The environment of a build or a test: what KEPT_ENV takes from the machine, and `own`."""
-    env = {key: value for key, value in os.environ.items() if KEPT_ENV.fullmatch(key)}
-    # The interpreter that runs this script may need its own library directory for the scripts it starts.
+def python_env():
+    """The interpreter that runs this script may need its own library directory for the scripts it starts."""
     library = str(Path(sys.base_prefix) / "lib")
-    if library in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
-        env["LD_LIBRARY_PATH"] = library
-    return {**env, **own}
+    return {"LD_LIBRARY_PATH": library} if library in os.environ.get("LD_LIBRARY_PATH", "").split(":") else {}
 
 
 def wants_server(bug):
@@ -1336,9 +1431,15 @@ def classify_libtest(code, output, name):
     return "not-run"
 
 
-def classify_suite(code, output):
-    """The verdict of one recovery suite: it reports its scenario as passed, or it fails an assertion."""
-    passed = re.search(r'^\{.*"status": "passed".*\}$', output, re.MULTILINE)
+def classify_suite(suite, code, output):
+    """The verdict of one recovery suite: it reports its own scenario as passed, or it fails an assertion."""
+    passed = False
+    for line in output.splitlines():
+        try:
+            row = strict_json(line) if line.startswith("{") else None
+        except ValueError:
+            continue
+        passed |= isinstance(row, dict) and (row.get("scenario"), row.get("status")) == (RECOVERY_SUITES[suite], "passed")
     if code is None:
         return "timeout"
     if code == 0 and passed:
@@ -1360,10 +1461,11 @@ def run_regression(bug, tree, exe, server, env, log):
                                   tree / "server", env, log, timeout)
         return classify_libtest(code, output, r["test"]), output
     if r["kind"] == "recovery-suite":
-        env["PYTHONPATH"] = str(tree / "orm/python/src")
+        env.update(python_env(), PYTHONPATH=str(tree / "orm/python/src"))
         code, output = run_logged([sys.executable, "server/tests/oltp_recovery_operations.py", "--binary", server,
                                    "--test-executable", exe, "--suite", r["suite"]], tree, env, log, timeout)
-        return classify_suite(code, output), output
+        return classify_suite(r["suite"], code, output), output
+    env.update(python_env())
     out_dir = Path(env["CARGO_TARGET_DIR"]) / "sim-bugs-acceptance" / bug.id
     shutil.rmtree(out_dir, ignore_errors=True)
     code, output = run_logged([sys.executable, "scripts/acceptance_oltp.py", "--test-binary", exe,
@@ -1419,13 +1521,13 @@ def cmd_verify(repo, bugs, args, out):
     target = Path(args.target_dir or repo / "server/target/sim-bugs").resolve()
     log_path = Path(args.log or target / "sim-bugs-verify.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    env = machine_env(CARGO_TARGET_DIR=str(target))
-    for name in ("CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"):
-        if os.environ.get(name) == "0":
-            env[name] = "0"  # Less debug information, which decides nothing.
     verdicts = {}
     with log_path.open("a", encoding="utf-8") as log, Scratch(repo, args.keep) as scratch:
         tree = scratch.path
+        # Less debug information makes the builds smaller and decides nothing.
+        env = machine_env(CARGO_TARGET_DIR=str(target), TMPDIR=str(scratch.tmp), CARGO_PROFILE_DEV_DEBUG="0",
+                          CARGO_PROFILE_TEST_DEBUG="0")
+        print(f"cargo command: {args.cargo}", file=out, flush=True)
         sha = git(tree, "rev-parse", "HEAD").stdout.strip()
         print(f"sim-bugs verify on {sha}, log {log_path}", file=out, flush=True)
         replication = (tree / "server/oltp-replication/src/oltp_replication").is_dir()
@@ -1552,10 +1654,9 @@ def rehearsal(args):
                                                args.rehearse_defect))
 
 
-def harness_env(target):
-    env = machine_env(CARGO_TARGET_DIR=str(target), RUSTFLAGS=HARNESS_RUSTFLAGS, RUST_MIN_STACK=HARNESS_STACK)
-    env.pop("LD_LIBRARY_PATH", None)
-    return env
+def harness_env(target, scratch):
+    return machine_env(CARGO_TARGET_DIR=str(target), TMPDIR=str(scratch.tmp), RUSTFLAGS=HARNESS_RUSTFLAGS,
+                       RUST_MIN_STACK=HARNESS_STACK)
 
 
 def sim_env(env, plan, label, artifacts, first, count, *, expect=False, defect=None, jobs=1):
@@ -2047,10 +2148,11 @@ def cmd_run(repo, bugs, args, out, every=None):
     out_dir = Path(args.out or repo / "target/testing-logs" / f"sim-bugs-run-{os.getpid()}").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = Path(args.log or out_dir / "sim-bugs-run.log")
-    env = harness_env(target)
     limits = [time.monotonic() + args.time_limit] if args.time_limit else []
     rows = []
     with log_path.open("a", encoding="utf-8") as log, Scratch(repo, args.keep) as scratch:
+        env = harness_env(target, scratch)
+        print(f"cargo command: {args.cargo}", file=out, flush=True)
         sha = git(scratch.path, "rev-parse", "HEAD").stdout.strip()
         differing = differs_from_head(repo, scratch, every or bugs) if mode == "evidence" else []
         if differing:
@@ -2200,8 +2302,7 @@ def main(argv=None, *, repo=REPO, out=sys.stdout):
     parser.add_argument("command", choices=("check", "verify", "run", "record", "evidence", "digest"))
     parser.add_argument("ids", nargs="*")
     parser.add_argument("--set", dest="set_name", choices=SETS)
-    parser.add_argument("--cargo", default=os.environ.get("NABEDRA_CARGO", "cargo"),
-                        help="cargo command, for example cargo-slot (default: $NABEDRA_CARGO or cargo)")
+    parser.add_argument("--cargo", default="cargo", help="cargo command, for example cargo-slot. The output names it.")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--target-dir", help="shared target directory (default server/target/sim-bugs)")
     parser.add_argument("--log", help="build and test log (default <target-dir>/sim-bugs-<command>.log)")

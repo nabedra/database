@@ -1606,12 +1606,10 @@ class FoolTest(HarnessCase):
             self.probe_row(test + f.revert_diff("server/src/product.rs", base_before + block + base_after))
 
         for name, block, parts in (("statement block", good, (before, after)), ("statement", statement, (before, after)),
-                                   ("two blocks apart", None, None), ("item", hook, (before + after, "#[inline]\npub fn z() {}\n")),
+                                   ("item", hook, (before + after, "#[inline]\npub fn z() {}\n")),
                                    ("item at the end", hook, (before + after, "")),
                                    ("after a comment", good, (before + "    // a \"quoted\" note\n", after)),
                                    ("after a byte string", good, (before + "    c(b\"x\", '\"', \"a\\\"b\");\n", after))):
-            if block is None:
-                continue
             with self.subTest(accepted=name):
                 probe(parts[0], block, parts[1])
                 status, output = f.run("check")
@@ -1665,7 +1663,7 @@ class FoolTest(HarnessCase):
                 probe(parts[0], block, parts[1])
                 status, output = f.run("check")
                 self.assertEqual(status, 1, output)
-                self.assertIn("not one plain test block", output)
+                self.assertIn("hold a block comment" if name == "nested comment" else "not one plain test block", output)
 
     def test_probe_that_reads_the_source(self):
         f = self.f
@@ -1711,7 +1709,7 @@ class FoolTest(HarnessCase):
         self.probe_row()
         # `verify` ran on a commit that holds another probe.
         path = f.repo / BUG / "bug.toml"
-        other = f.revert_diff("server/src/tests.rs", TESTS + PROBE_TEST.replace("{}", "{ /* other */ }"))
+        other = f.revert_diff("server/src/tests.rs", TESTS + PROBE_TEST.replace("{}", "{ let _ = 1; }"))
         f.write(f"{BUG}/probe.patch", other)
         path.write_text(path.read_text().replace(review(f.patch, self.probe)["digest"], review(f.patch, other)["digest"]))
         self.assert_refused("holds another probe")
@@ -1734,7 +1732,8 @@ class FoolTest(HarnessCase):
         e = regression["evidence"]
         e["patched"].update(output=e["patched"]["output"].split("fix-one:")[0])
         bug = sim_bugs.Bug(f.repo / BUG, {"id": "fix-one", "regression": {**regression, "probe": True}}, f.patch, probe)
-        for shas, refused in (((clean_probe, patched_probe), False), ((clean, patched), True),
+        # The last patched commit's parent holds the probe already, so the commit is not its parent plus the probe.
+        for shas, refused in (((clean_probe, patched_probe), True), ((clean, patched), True),
                               ((clean, patched_probe), True), ((clean_probe, patched), True)):
             with self.subTest(shas=shas):
                 e["clean"]["sha"], e["patched"]["sha"] = shas
@@ -1976,7 +1975,8 @@ PATCHED
         _, _, calls = self.assert_found(script={"hit": 3}, LD_LIBRARY_PATH=f"/x:{library}")
         self.assertFalse(any("LD_LIBRARY_PATH" in call["environment"] for call in calls))
         with patch.dict(os.environ, {"LD_LIBRARY_PATH": f"/x:{library}"}):
-            self.assertEqual(sim_bugs.machine_env()["LD_LIBRARY_PATH"], library)
+            self.assertEqual(sim_bugs.python_env(), {"LD_LIBRARY_PATH": library})
+            self.assertNotIn("LD_LIBRARY_PATH", sim_bugs.machine_env())
         written = self.root / "environment.json"
         status, output = self.verify(FAKE_ENVIRONMENT=str(written), RUSTFLAGS="--cfg planted", **machine)
         self.assertEqual(status, 0, output)
