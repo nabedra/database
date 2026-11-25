@@ -18,7 +18,8 @@ Commands:
   verify [ids]   Heavy: build HEAD in a scratch worktree, run each bug's original regression test,
                  then apply each patch and run it again. A bug is verified when the test passes
                  without the patch and fails with it (a build failure or a missing test is never a
-                 failure of the test).
+                 failure of the test). A bug with a probe.patch, which adds its test, has it applied to
+                 both builds. `run` never builds a probe into a sweep.
   run [ids]      The seed search (`oltp-sim-bugs-<set>`) through the nabedra-sim-oltp sweep test, by
                  the rule in server/sim-oltp/bugs/README.md. It builds the unpatched sweep first.
                  Then, per bug, it builds the patched sweep in a scratch worktree, resets the tree
@@ -59,7 +60,6 @@ import sys
 import tempfile
 import time
 import tomllib
-import unicodedata
 
 REPO = Path(__file__).resolve().parents[2]
 BUGS_DIR = Path("server/sim-oltp/bugs")
@@ -69,7 +69,12 @@ HARNESS_MANIFEST = Path("server/sim-oltp/Cargo.toml")
 SCHEMA = "nabedra.sim-bug/1"
 SETS = ("direct", "queued", "topology", "membership", "resources")
 PORTS = ("clean", "hand")
-REGRESSION_KINDS = ("lib-test", "acceptance")
+# The fields each kind of regression takes: its own, then the optional ones. No other kind may have them.
+REGRESSION_KINDS = {"lib-test": ("test", ("probe", "needs_server")), "acceptance": ("scenario", ()),
+                    "recovery-suite": ("suite", ())}
+# Suites of server/tests/oltp_recovery_operations.py that a phase 11 regression runs.
+RECOVERY_SUITES = ("replacement-wipe", "replacement-voter-refresh")
+REPLICATION_TESTS = "oltp_replication::"
 SHA = re.compile(r"[0-9a-f]{40}")
 ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 TEST_PATH = re.compile(r"[a-z_][a-z0-9_]*(?:::[a-z_][a-z0-9_]*)+")
@@ -87,6 +92,13 @@ SIM_ONLY = re.compile(r'\bsim(?:_\w+|ulat\w*)?\b|\w_sim\b|\bWorld\b|\bcfg|\bfeat
                       r'\b(?:option_)?env!|\benv::|\bvar_os\b|\bcurrent_exe\b|\binclude(?:_str|_bytes)?!|#\[path')
 # A fix may have moved test code, so its revert may change this one attribute.
 TEST_CFG = "#[cfg(test)]"
+# Predicates under which code is compiled for tests and never for the product.
+TEST_ONLY = re.compile(r'\(\s*(?:test|feature\s*=\s*"test-hooks"|any\(\s*test\s*,\s*feature\s*=\s*"test-hooks"\s*\))\s*\)')
+# Test code that does not carry a name of TEST_FILE: the acceptance modules of the library tests.
+ACCEPTANCE_FILE = re.compile(r"server/src/oltp_\w*acceptance\.rs")
+# A patch is what a reviewer reads: no look-alike letter, no invisible character, nothing far to the right.
+PLAIN_LINE = re.compile(r"[\t\x20-\x7e]{0,200}")
+TARGET_FILES = ("bug.toml", "revert.patch", "probe.patch", "searches.jsonl")
 # What a cfg predicate names when its code is compiled for the simulator and not for the product.
 SIM_CFG = re.compile(r'feature\s*=\s*"sim"|\btokio_unstable\b')
 LIBTEST_RESULT = re.compile(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed;", re.MULTILINE)
@@ -110,6 +122,11 @@ RULE_SOURCE = re.compile(r"(?:docs|plans)/(?:[a-z0-9_-]+/)*[a-z0-9_-]+\.md")
 VERDICTS = ("sensitive", "partial", "not-sensitive")
 ASSERTIONS = ("state", "counter", "timeout")
 SEED_BUDGET = 10_000
+# What a build or a test may take from the machine. A compiler, a wrapper, a linker, a flag, a library path or a
+# variable of the harness comes from this script, from the tree, or not at all.
+KEPT_ENV = re.compile(r"PATH|HOME|USER|LOGNAME|SHELL|TERM|TZ|LANG|LC_\w+|TMPDIR|TMP|TEMP|RUNNER_TEMP|CI|CARGO_HOME|"
+                      r"RUSTUP_HOME|CARGO_TERM_\w+|CARGO_NET_(?:RETRY|OFFLINE)|RUST_BACKTRACE|SSL_CERT_(?:FILE|DIR)|"
+                      r"(?i:https?_proxy|no_proxy|all_proxy)")
 SEARCHES = "searches.jsonl"
 TARGET_FILE = re.compile(r"server/sim-oltp/bugs/(?:README\.md|SHARDS\.md|(?:phase[0-9]+/)?(?:simulator\.toml|[a-z0-9-]+/"
                          r"(?:bug\.toml|revert\.patch|probe\.patch|searches\.jsonl)))")
@@ -137,7 +154,8 @@ DETECTION_FIELDS = {"seed": int, "trace_hash": str, "history_sha256": str, "mech
 MASKED_FIELDS = {"seed": int, "trace_hash": str, "history_sha256": str, "finding": str, "reason": str,
                  "confirmed_by": str, "confirmation": str}
 REVIEW_FIELDS = {"digest": str, "verdict": str, "assertion": str, "reviewer": str, "source": str, "notes": str}
-REGRESSION_FIELDS = {"kind": str, "test": str, "scenario": str, "mode": str, "assertion": str,
+REGRESSION_FIELDS = {"kind": str, "test": str, "scenario": str, "suite": str, "mode": str, "assertion": str,
+                     "probe": bool, "needs_server": bool,
                      "failure_contains": list, "timeout_s": int, "attempts": int, "evidence": dict}
 EVIDENCE_FIELDS = {"digest": str, "patched": dict, "clean": dict}
 RUN_FIELDS = {"run": str, "sha": str, "result": str, "output": str, "note": str}
@@ -152,6 +170,8 @@ class Bug:
     path: Path
     manifest: dict
     patch: str
+    # A diff that only adds the regression's test (`probe.patch`), for a fix whose own test is not a steady proof.
+    probe: str | None = None
     errors: list = field(default_factory=list)
 
     @property
@@ -167,8 +187,11 @@ class Bug:
 # Git and patch helpers.
 
 def git(repo, *args, env=None, input=None, check=True):
-    # `git replace` refs would show another object under a commit's name.
-    env = dict(os.environ if env is None else env, GIT_NO_REPLACE_OBJECTS="1")
+    # `git replace` refs would show another object under a commit's name, and inherited variables another
+    # repository. A caller's own index is the one variable that stays.
+    kept = ("GIT_INDEX_FILE",) if env is not None else ()
+    env = {k: v for k, v in (os.environ if env is None else env).items() if not k.startswith("GIT_") or k in kept}
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
     result = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True,
                             env=env, input=input)
     if check and result.returncode:
@@ -189,6 +212,7 @@ EXTENDED_HEADER = re.compile(r"(index|old mode|new mode|deleted file mode|new fi
                              r"dissimilarity|Binary files) ?.*")
 # What a patch may do besides changing lines: add or delete a whole product file.
 PLAIN_HEADER = re.compile(r"index .*|(?:new|deleted) file mode 100644")
+PROBE_HEADER = re.compile(r"index .*|new file mode 100644")
 HUNK_HEADER = re.compile(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@(?: .*)?")
 
 
@@ -338,6 +362,11 @@ def load_bugs(repo):
             with (path / "bug.toml").open("rb") as stream:
                 manifest = tomllib.load(stream)
             patch = (path / "revert.patch").read_bytes().decode("utf-8")
+            probe = path / "probe.patch"
+            probe = probe.read_bytes().decode("utf-8") if probe.is_file() else None
+            extra = sorted(p.name for p in path.iterdir() if p.name not in TARGET_FILES)
+            if extra:
+                raise ValueError(f"{', '.join(extra)} is no file of a target")
         except (OSError, ValueError) as error:
             errors.append(f"{name}: {error}")
             continue
@@ -346,7 +375,7 @@ def load_bugs(repo):
         if path.name in seen:
             errors.append(f"{name}: the id is used twice")
         seen.add(path.name)
-        bugs.append(Bug(path, manifest, patch))
+        bugs.append(Bug(path, manifest, patch, probe))
     if not bugs and not errors:
         errors.append(f"{BUGS_DIR}: no bug directories")
     return bugs, errors
@@ -436,6 +465,8 @@ def validate_manifest(bug, records, known_guarantees, require_evidence=True):
     problems.extend(validate_regression(bug, require_evidence))
     problems.extend(validate_patch_paths(bug.patch))
     if not problems:
+        problems.extend(validate_probe(bug))
+    if not problems:
         problems.extend(validate_review(bug))
         problems.extend(validate_hits(bug))
     return problems
@@ -460,8 +491,7 @@ def validate_expect(m):
 def whole_digest(bug):
     """SHA-256 of everything a review of the patch reads: the whole patch, with its context and headers, and
     the probe if there is one. Any other byte is another patch to a reviewer."""
-    probe = getattr(bug, "probe", None)
-    return hashlib.sha256((bug.patch if probe is None else f"{bug.patch}\0{probe}").encode()).hexdigest()
+    return hashlib.sha256((bug.patch if bug.probe is None else f"{bug.patch}\0{bug.probe}").encode()).hexdigest()
 
 
 def validate_review(bug):
@@ -562,19 +592,31 @@ def validate_regression(bug, require_evidence=True):
         return problems
     kind = r["kind"]
     if kind not in REGRESSION_KINDS:
-        problems.append(f"regression.kind must be one of {', '.join(REGRESSION_KINDS)}")
-    elif kind == "lib-test" and not TEST_PATH.fullmatch(r.get("test", "")):
+        return [*problems, f"regression.kind must be one of {', '.join(REGRESSION_KINDS)}"]
+    own, optional = REGRESSION_KINDS[kind]
+    for other, others in REGRESSION_KINDS.values():
+        problems.extend(f"regression.{name} does not belong to the kind {kind}" for name in (other, *others)
+                        if name in r and name not in (own, *optional))
+    problems.extend(f"regression.{name} must be true or absent" for name in ("probe", "needs_server")
+                    if r.get(name, True) is not True)
+    if r.get("needs_server") and r.get("test", "").startswith(REPLICATION_TESTS):
+        problems.append("regression.needs_server: the tests of the replication crate are built without a server")
+    if not 1 <= r.get("timeout_s", 1200) <= 7200:
+        problems.append("regression.timeout_s must be between 1 and 7200")
+    if kind == "lib-test" and not TEST_PATH.fullmatch(r.get("test", "")):
         problems.append("regression.test must be a full library test path")
     elif kind == "acceptance" and not SCENARIO.fullmatch(r.get("scenario", "")):
         problems.append("regression.scenario must be an acceptance scenario such as O15")
+    elif kind == "recovery-suite" and r.get("suite") not in RECOVERY_SUITES:
+        problems.append(f"regression.suite must be one of {', '.join(RECOVERY_SUITES)}")
     if r.get("mode", "on") not in ("on", "off"):
         problems.append("regression.mode must be on or off")
     if r.get("assertion", "state") not in ASSERTIONS:
         problems.append(f"regression.assertion must be one of {', '.join(ASSERTIONS)}")
     if "failure_contains" in r and not strings(r["failure_contains"]):
         problems.append("regression.failure_contains must be an array of nonempty strings")
-    if kind == "acceptance" and not r.get("failure_contains"):
-        problems.append("an acceptance regression needs failure_contains for its specific failure")
+    if kind != "lib-test" and not r.get("failure_contains"):
+        problems.append("a process regression needs failure_contains for its specific failure")
     if not 1 <= r.get("attempts", 1) <= 10:
         problems.append("regression.attempts must be between 1 and 10")
     evidence = r.get("evidence")
@@ -612,6 +654,72 @@ def path_problem(name, strict=True):
     return None
 
 
+def plain_problems(name, patch):
+    """What a reviewer could miss: anything but plain ASCII, and lines that run out of a screen."""
+    bad = [i for i, line in enumerate(patch.split("\n"), 1) if not PLAIN_LINE.fullmatch(line)]
+    return [f"{name} must be plain ASCII, in lines of at most 200 characters: line {bad[0]}"] if bad else []
+
+
+def validate_probe(bug):
+    """A probe adds the test that the regression names, and changes nothing else that runs."""
+    if bug.regression.get("probe", False) != (bug.probe is not None):
+        return ["probe.patch is required exactly when regression.probe is true"]
+    if bug.probe is None:
+        return []
+    try:
+        files = parse_patch(bug.probe)
+    except Failure as error:
+        return [f"probe.patch: {error}"]
+    problems = plain_problems("probe.patch", bug.probe)
+    for diff in files:
+        test_code = TEST_FILE.search(diff.name) or ACCEPTANCE_FILE.fullmatch(diff.name)
+        crate = diff.name.split("/")[1] if diff.name.count("/") > 1 else ""
+        if (not diff.name.startswith("server/") or crate.startswith("sim-") or crate in NOT_PRODUCT_CRATES
+                or not diff.name.endswith((".rs", ".py")) or (not test_code and path_problem(diff.name))):
+            problems.append(f"probe.patch touches {diff.name}, which is neither a test nor a product source")
+        if any(not PROBE_HEADER.fullmatch(header) for header in diff.headers) or not diff.hunks:
+            problems.append(f"probe.patch must only add lines to {diff.name}")
+    if len({diff.name for diff in files}) != len(files) or not files:
+        problems.append("probe.patch needs one section per file")
+    if any(removed for removed, _ in changed_lines(bug.probe).values()):
+        problems.append("probe.patch may only add lines")
+    name = bug.regression["test"].rsplit("::", 1)[-1]
+    if not any(re.search(rf"\bfn {name}\b", line) for _, added in changed_lines(bug.probe).values() for line in added):
+        problems.append(f"probe.patch does not add {name}")
+    return problems
+
+
+def probe_in_tree(bug, repo):
+    """What the probe does in HEAD's tree: with the patch on top, the patch still changes exactly its own lines, and
+    what it adds to a product source is compiled for tests only."""
+    problems = []
+    with tempfile.TemporaryDirectory(prefix="sim-bugs-index-") as tmp:
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
+        git(repo, "read-tree", "HEAD", env=env)
+        for patch in (bug.probe, bug.patch):
+            result = git(repo, "apply", "--cached", "-", env=env, input=patch, check=False)
+            if result.returncode:
+                return [f"probe.patch and revert.patch do not apply to HEAD together: {result.stderr.strip()}"]
+            if patch is bug.probe:
+                with_probe = git(repo, "write-tree", env=env).stdout.strip()
+        both = git(repo, "write-tree", env=env).stdout.strip()
+    diff = git(repo, "diff", "--no-renames", "--no-ext-diff", "--no-color", with_probe, both).stdout
+    if digest(diff) != digest(bug.patch) or hunk_texts(diff) != hunk_texts(bug.patch):
+        problems.append("probe.patch and revert.patch do not apply to separate lines")
+    added = git(repo, "diff", "--no-renames", "--no-ext-diff", "--no-color", "-U0", "HEAD", with_probe).stdout
+    for name in patch_files(bug.probe):
+        if TEST_FILE.search(name) or ACCEPTANCE_FILE.fullmatch(name):
+            continue
+        tests = cfg_lines(git(repo, "show", f"{with_probe}:{name}").stdout,
+                          lambda predicate, macro: not macro and TEST_ONLY.fullmatch(predicate))
+        section = added.split(f"diff --git a/{name} b/{name}\n", 1)[-1].split("\ndiff --git ", 1)[0]
+        for start, count in re.findall(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", section, re.MULTILINE):
+            if not set(range(int(start), int(start) + int(count or 1))) <= tests:
+                problems.append(f"probe.patch adds lines to {name} that are not only for tests")
+                break
+    return problems
+
+
 def validate_patch_paths(patch):
     try:
         files = parse_patch(patch)
@@ -626,9 +734,7 @@ def validate_patch_paths(patch):
                             f"{', '.join(diff.headers) or 'no hunk'}")
     if len({diff.name for diff in files}) != len(files):
         problems.append("revert.patch has two sections for one file")
-    hidden = sorted({f"U+{ord(c):04X}" for c in patch if c not in "\n\t" and unicodedata.category(c) in ("Cc", "Cf")})
-    if hidden:
-        problems.append(f"revert.patch holds characters that a reviewer cannot see: {', '.join(hidden)}")
+    problems.extend(plain_problems("revert.patch", patch))
     for name, (removed, added) in changed_lines(patch).items():
         problems.extend(f"revert.patch changes in {name} a line that can act only in the simulator, or that reads the "
                         f"build or its environment: {line.strip()[:80]!r}" for line in [*removed, *added]
@@ -653,14 +759,20 @@ def closing(code, start):
 def sim_only_lines(text):
     """Line numbers of Rust code under a cfg predicate that names the simulator's build. Approximate,
     and it errs on the side of calling code simulator-only."""
+    return cfg_lines(text, lambda predicate, macro: SIM_CFG.search(predicate) and not re.fullmatch(
+        rf"\(\s*not\s*\(\s*(?:{SIM_CFG.pattern})\s*\)\s*\)", predicate))
+
+
+def cfg_lines(text, wanted):
+    """Line numbers of the items, statements and blocks that a cfg predicate governs, when `wanted` takes the
+    predicate (with its brackets) and whether it is a `cfg!`."""
     code = RUST_TEXT.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), text)
     gated = set()
     for match in CFG.finditer(code):
         opening = match.start(2) if match.group(2) else match.start(3)
         end = closing(code, opening)
         predicate = text[opening:end]
-        if not SIM_CFG.search(predicate) or re.fullmatch(
-                rf"\(\s*not\s*\(\s*(?:{SIM_CFG.pattern})\s*\)\s*\)", predicate):
+        if not wanted(predicate, bool(match.group(3))):
             continue
         if match.group(1):
             return set(range(1, text.count("\n") + 2))
@@ -762,11 +874,25 @@ def regression_evidence(bug, repo):
         if tested.returncode:
             return [], [*uncounted, f"{patched['sha'][:8]} holds no {name} for its regression run to have tested"]
         tested = tested.stdout
+        probe = git(repo, "show", f"{patched['sha']}:{name.replace('revert.patch', 'probe.patch')}", check=False)
+        if (probe.stdout if probe.returncode == 0 else None) != bug.probe:
+            return [f"{patched['sha'][:8]}, which its regression run tested, holds another probe"], uncounted
+        old = git(repo, "show", f"{patched['sha']}:{name.replace('revert.patch', 'bug.toml')}", check=False).stdout
+        try:
+            if regression_text(tomllib.loads(old)) != regression_text(bug.manifest):
+                uncounted.append("its regression run tested another regression than the manifest names now")
+        except ValueError:
+            uncounted.append(f"the manifest of {patched['sha'][:8]} is unreadable")
     else:
         files = patch_files(bug.patch)
         tested = git(repo, "diff", "--no-renames", "--no-ext-diff", "--no-color", clean["sha"], patched["sha"],
                      "--", *files).stdout
-        own = set(files) | set(patch_files(getattr(bug, "probe", None) or ""))
+        own = set(files) | set(patch_files(bug.probe or ""))
+        for sha in (clean["sha"], patched["sha"]):
+            for name, (_, added) in changed_lines(bug.probe or "").items():
+                there = git(repo, "show", f"{sha}:{name}", check=False).stdout.split("\n")
+                if Counter(added) - Counter(there):
+                    return [f"{sha[:8]}, which its regression run tested, does not hold the probe"], uncounted
         extras = [set(git(repo, "diff", "--no-renames", "--name-only", base, patched["sha"]).stdout.split()) - own
                   for base in (f"{patched['sha']}^", clean["sha"])]
         if all(extras):
@@ -782,6 +908,22 @@ def regression_evidence(bug, repo):
     if not same_hunks:
         uncounted.append("the patch has other context than the patch its regression run tested; verify it again")
     return [], uncounted
+
+
+def regression_text(manifest):
+    """Which test is run, how, and what its failure says."""
+    return {key: manifest.get("regression", {}).get(key) for key in
+            ("kind", "test", "scenario", "suite", "mode", "probe", "failure_contains")}
+
+
+def reviewed_regression(manifest):
+    """Everything in [regression] that a review of it judges. Its evidence and its time limit may change."""
+    return {key: value for key, value in manifest.get("regression", {}).items() if key not in ("evidence", "timeout_s")}
+
+
+def reviewed(manifest):
+    """The review itself, without what may be noted about it later."""
+    return {key: value for key, value in manifest.get("review", {}).items() if key != "notes"}
 
 
 def not_shown(bug):
@@ -962,6 +1104,8 @@ def validate_git(bug, repo, require_evidence=True):
         problems.append(f"revert.patch no longer applies to HEAD; refresh it: {detail}")
     else:
         problems.extend(applied(repo, bug.patch))
+        if bug.probe is not None:
+            problems.extend(probe_in_tree(bug, repo))
     reverts = reverted(m)[0]
     if m["port"] == "clean" and reverts not in missing:
         files = patch_files(bug.patch)
@@ -986,15 +1130,23 @@ def validate_git(bug, repo, require_evidence=True):
                 problems.append(f"a target keeps its bug record, phase and set; {sha[:8]} has "
                                 f"{old.get('bug')}, {old.get('phase')}, {old.get('set')}")
                 break
+        for sha, old in manifest_history(bug, repo):
+            if old and reviewed(m) and reviewed(old) == reviewed(m) and reviewed_regression(old) != reviewed_regression(m):
+                problems.append(f"the regression changed after its review ({sha[:8]} has the same [review] with another "
+                                "regression): it needs a new review")
+                break
     for rule in m.get("rules", []):
         source = git(repo, "show", f"HEAD:{rule['source']}", check=False).stdout
         if " ".join(rule["text"].split()) not in " ".join(source.split()):
             problems.append(f"rules: the quote for {rule['kind']} is not in {rule['source']}")
     if bug.regression.get("kind") == "lib-test":
         name = bug.regression["test"].rsplit("::", 1)[-1]
-        found = git(repo, "grep", "-q", "-E", rf"fn {name}\b", "HEAD", "--", "server", check=False)
-        if found.returncode:
+        # A patch or a probe that shows the name is not a test of the tree.
+        found = git(repo, "grep", "-q", "-E", rf"fn {name}\b", "HEAD", "--", "server/*.rs", check=False)
+        if found.returncode and bug.probe is None:
             problems.append(f"regression test {name} is not defined at HEAD")
+        elif not found.returncode and bug.probe is not None:
+            problems.append(f"{name} is in the tree already, so a probe does not add it")
     return problems
 
 
@@ -1070,10 +1222,16 @@ class Scratch:
         git(self.repo, "worktree", "remove", "--force", str(self.path), check=False)
         shutil.rmtree(self.path, ignore_errors=True)
 
-    def apply(self, bug):
+    def apply(self, bug, probe=False, revert=True):
         if self.path.resolve() == self.repo.resolve():
             raise Failure("refusing to apply patches in the shipped tree")
-        git(self.path, "apply", "-", input=bug.patch)
+        expected = set()
+        for wanted, text in ((probe, bug.probe), (revert, bug.patch)):
+            if wanted and text is not None:
+                git(self.path, "apply", "-", input=text)
+                expected |= set(patch_files(text))
+        if set(self.changed()) != expected:
+            raise Failure(f"the patch changed {sorted(self.changed())} in the scratch tree")
 
     def changed(self):
         """The files that differ from HEAD."""
@@ -1083,6 +1241,20 @@ class Scratch:
     def reset(self):
         git(self.path, "checkout", "--quiet", "--", ".")
         git(self.path, "clean", "-fdq")
+
+
+def machine_env(**own):
+    """The environment of a build or a test: what KEPT_ENV takes from the machine, and `own`."""
+    env = {key: value for key, value in os.environ.items() if KEPT_ENV.fullmatch(key)}
+    # The interpreter that runs this script may need its own library directory for the scripts it starts.
+    library = str(Path(sys.base_prefix) / "lib")
+    if library in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
+        env["LD_LIBRARY_PATH"] = library
+    return {**env, **own}
+
+
+def wants_server(bug):
+    return bug.regression.get("kind") != "lib-test" or bug.regression.get("needs_server", False)
 
 
 def run_logged(cmd, cwd, env, log, timeout=None):
@@ -1156,14 +1328,34 @@ def classify_libtest(code, output, name):
     return "not-run"
 
 
+def classify_suite(code, output):
+    """The verdict of one recovery suite: it reports its scenario as passed, or it fails an assertion."""
+    passed = re.search(r'^\{.*"status": "passed".*\}$', output, re.MULTILINE)
+    if code is None:
+        return "timeout"
+    if code == 0 and passed:
+        return "passed"
+    if code == 1 and not passed and re.search(r"^(?:AssertionError|\w*TimeoutExpired|subprocess\.TimeoutExpired)\b", output,
+                                              re.MULTILINE):
+        return "failed"
+    return "not-run"
+
+
 def run_regression(bug, tree, exe, server, env, log):
     r = bug.regression
     env = dict(env, NABEDRA_TEST_DIRECT_OLTP=r.get("mode", "on"))
+    if wants_server(bug):
+        env.update(NABEDRA_BIN=server, NABEDRA_OLTP_BINARY=server, NABEDRA_ACCEPTANCE_PYTHON=sys.executable)
     timeout = r.get("timeout_s", 1200)
     if r["kind"] == "lib-test":
         code, output = run_logged([exe, "--exact", r["test"], "--include-ignored", "--test-threads", "1"],
                                   tree / "server", env, log, timeout)
         return classify_libtest(code, output, r["test"]), output
+    if r["kind"] == "recovery-suite":
+        env["PYTHONPATH"] = str(tree / "orm/python/src")
+        code, output = run_logged([sys.executable, "server/tests/oltp_recovery_operations.py", "--binary", server,
+                                   "--test-executable", exe, "--suite", r["suite"]], tree, env, log, timeout)
+        return classify_suite(code, output), output
     out_dir = Path(env["CARGO_TARGET_DIR"]) / "sim-bugs-acceptance" / bug.id
     shutil.rmtree(out_dir, ignore_errors=True)
     code, output = run_logged([sys.executable, "scripts/acceptance_oltp.py", "--test-binary", exe,
@@ -1219,44 +1411,48 @@ def cmd_verify(repo, bugs, args, out):
     target = Path(args.target_dir or repo / "server/target/sim-bugs").resolve()
     log_path = Path(args.log or target / "sim-bugs-verify.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    # The product's own build: no flag of the simulator's, and no inherited one.
-    env = {key: value for key, value in os.environ.items()
-           if not key.startswith(("NABEDRA_SIM_", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS",
-                                  "RUSTUP_TOOLCHAIN", "LD_PRELOAD"))}
-    env["CARGO_TARGET_DIR"] = str(target)
-    need_server = any(b.regression.get("kind") == "acceptance" for b in bugs)
+    env = machine_env(CARGO_TARGET_DIR=str(target))
+    for name in ("CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"):
+        if os.environ.get(name) == "0":
+            env[name] = "0"  # Less debug information, which decides nothing.
     verdicts = {}
     with log_path.open("a", encoding="utf-8") as log, Scratch(repo, args.keep) as scratch:
         tree = scratch.path
         sha = git(tree, "rev-parse", "HEAD").stdout.strip()
         print(f"sim-bugs verify on {sha}, log {log_path}", file=out, flush=True)
         replication = (tree / "server/oltp-replication/src/oltp_replication").is_dir()
-        packages = {
-            bug.id: "nabedra-oltp-replication"
-            if replication and bug.regression.get("test", "").startswith("oltp_replication::")
-            else None
-            for bug in bugs
-        }
 
-        def build(package):
-            server_build = need_server and package is None
-            if replication and server_build:
+        def package(bug):
+            owned = replication and bug.regression.get("test", "").startswith(REPLICATION_TESTS)
+            return "nabedra-oltp-replication" if owned else None
+
+        def build(package, need_server):
+            if replication and need_server:
                 fixture, _ = build_lib_tests(args, tree, env, log, False, "nabedra-oltp-replication")
                 env["NABEDRA_OLTP_REPLICATION_TEST_EXE"] = fixture
-            return build_lib_tests(args, tree, env, log, server_build, package)
+            return build_lib_tests(args, tree, env, log, need_server, package)
 
-        clean_builds = {package: build(package) for package in dict.fromkeys(packages.values())}
+        # A clean side has no probe, or its own target's only: another's could change what passes here.
+        groups = {}
+        for bug in bugs:
+            groups.setdefault((package(bug), wants_server(bug), bug.id if bug.probe is not None else None), []).append(bug)
         clean = {}
-        for bug in bugs:
-            exe, server = clean_builds[packages[bug.id]]
-            clean[bug.id], output, seen = regression_verdict(bug, tree, exe, server, env, log, patched=False)
-            print(f"{bug.id}: without the patch {clean[bug.id]}", file=out, flush=True)
-            print(f"{bug.id}: unpatched attempts {seen}", file=out, flush=True)
-            print_regression_result(bug, output, out)
-        for bug in bugs:
-            scratch.apply(bug)
+        for (name, need_server, probed), group in groups.items():
             try:
-                p_exe, p_server = build(packages[bug.id])
+                if probed:
+                    scratch.apply(group[0], probe=True, revert=False)
+                exe, server = build(name, need_server)
+                for bug in group:
+                    clean[bug.id], output, seen = regression_verdict(bug, tree, exe, server, env, log, patched=False)
+                    print(f"{bug.id}: without the patch {clean[bug.id]}", file=out, flush=True)
+                    print(f"{bug.id}: unpatched attempts {seen}", file=out, flush=True)
+                    print_regression_result(bug, output, out)
+            finally:
+                scratch.reset()
+        for bug in bugs:
+            try:
+                scratch.apply(bug, probe=True)
+                p_exe, p_server = build(package(bug), wants_server(bug))
                 patched, output, seen = regression_verdict(bug, tree, p_exe, p_server, env, log, patched=True)
                 print(f"{bug.id}: patched attempts {seen}", file=out, flush=True)
                 print_regression_result(bug, output, out)
@@ -1309,9 +1505,6 @@ HARNESS_STACK = "16777216"
 HARNESS_RUSTFLAGS = "--cfg tokio_unstable"
 # The sweep test prints this error through `expect`, so its quotes are escaped.
 UNAVAILABLE_WORKLOAD = re.compile(r'OLTP workload [\\]?"([a-z0-9-]+)[\\]?" is unavailable')
-# Inherited variables that would change what the harness builds or runs. Each run sets its own.
-HARNESS_PREFIXES = ("NABEDRA_", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_", "CARGO_PROFILE_", "RUSTUP_TOOLCHAIN", "RUSTC_BOOTSTRAP",
-                    "RUSTC_WORKSPACE_WRAPPER", "LD_PRELOAD")
 SEARCHED = ("found", "candidate", "not-detected", "incomplete", "error")
 
 
@@ -1351,10 +1544,9 @@ def rehearsal(args):
                                                args.rehearse_defect))
 
 
-def harness_env(base):
-    env = {k: v for k, v in base.items() if not k.startswith(HARNESS_PREFIXES)}
-    env["RUSTFLAGS"] = HARNESS_RUSTFLAGS
-    env["RUST_MIN_STACK"] = HARNESS_STACK
+def harness_env(target):
+    env = machine_env(CARGO_TARGET_DIR=str(target), RUSTFLAGS=HARNESS_RUSTFLAGS, RUST_MIN_STACK=HARNESS_STACK)
+    env.pop("LD_LIBRARY_PATH", None)
     return env
 
 
@@ -1471,13 +1663,14 @@ class Replay:
 
     def events(self):
         """{trace line: its text without the time}, of the lines that are neither the violation nor the
-        client history. A line without a time belongs to the text of the line before it."""
-        found = {}
+        client history. A line without a time belongs to the text of the line before it, and so does a line of a
+        violation that only looks as if it had one."""
+        found, own = {}, {line for text in (self.summary or {}).get("violations") or [] for line in text.split("\n")}
         for name in ("trace.txt", "trace-tail.txt"):
             path = self.directory / name
             for line in path.read_text(encoding="utf-8", errors="replace").split("\n") if path.is_file() else ():
                 match = TRACE_LINE.fullmatch(line)
-                if match and not match.group(1).startswith(("violation ", "history ")):
+                if match and line not in own and not match.group(1).startswith(("violation ", "history ")):
                     found[line] = match.group(1)
         return found
 
@@ -1710,8 +1903,6 @@ def search_bug(args, repo, scratch, harness, bug, plan):
         scratch.apply(bug)
         try:
             row["scratch_worktree"] = str(scratch.path)
-            if sorted(scratch.changed()) != sorted(patch_files(bug.patch)):
-                raise Failure(f"the patch changed {sorted(scratch.changed())} in the scratch tree")
             exe = build_sweep(args, scratch.path, harness.env, harness.log, sweep_binary(harness.env, bug.id))
         finally:
             scratch.reset()
@@ -1848,7 +2039,7 @@ def cmd_run(repo, bugs, args, out, every=None):
     out_dir = Path(args.out or repo / "target/testing-logs" / f"sim-bugs-run-{os.getpid()}").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = Path(args.log or out_dir / "sim-bugs-run.log")
-    env = harness_env(dict(os.environ, CARGO_TARGET_DIR=str(target)))
+    env = harness_env(target)
     limits = [time.monotonic() + args.time_limit] if args.time_limit else []
     rows = []
     with log_path.open("a", encoding="utf-8") as log, Scratch(repo, args.keep) as scratch:

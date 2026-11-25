@@ -628,7 +628,9 @@ class HarnessCase(unittest.TestCase):
         f.write("server/sim-oltp/src/sweep.rs", "pub const PLANTED: u8 = 0;\n")
         f.write("server/rt/src/sim/net.rs", "pub const PLANTED: u8 = 0;\n")
         f.write(".gitignore", "target/\n")
-        f.write_bug()
+        untested = f.evidence()
+        del untested["evidence"]
+        f.write_bug(f.manifest(regression=untested))
         self.tested = f.commit("the patch")
         f.write_bug(f.manifest(regression=f.evidence(sha=self.tested), tables=toml_table("review", review(f.patch))))
         f.commit("the regression evidence")
@@ -735,8 +737,11 @@ class HarnessCase(unittest.TestCase):
         f = self.f
         self.probe = f.revert_diff("server/src/tests.rs", TESTS + PROBE_TEST) if probe is None else probe
         f.write(f"{BUG}/probe.patch", self.probe)
+        regression = {**f.evidence(), "test": "tests::probe_fix_one", "probe": True, **changes}
+        f.write(f"{BUG}/bug.toml", f.manifest(regression={
+            k: v for k, v in regression.items() if v is not None and k != "evidence"}))
         sha = f.commit("a probe")
-        regression = {**f.evidence(sha=sha), "test": "tests::probe_fix_one", "probe": True, **changes}
+        regression["evidence"] = f.evidence(sha=sha)["evidence"]
         tables = toml_table("review", review(f.patch, review_probe or self.probe))
         f.write(f"{BUG}/bug.toml", f.manifest(
             regression={k: v for k, v in regression.items() if v is not None},
@@ -1066,7 +1071,7 @@ class FoolTest(HarnessCase):
                                              capture_output=True).stdout
                 sh(f.repo, "checkout", "-q", "--", "server/src/lib.rs")
                 problems = sim_bugs.validate_patch_paths(patch_bytes.decode())
-                self.assertTrue(any("cannot see" in problem for problem in problems), problems)
+                self.assertTrue(any("plain ASCII" in problem for problem in problems), problems)
 
     def test_patch_is_read_as_its_bytes(self):
         # The same lines with other line ends are other bytes than the review's digest covers.
@@ -1082,6 +1087,7 @@ class FoolTest(HarnessCase):
                 self.assert_refused("regression.assertion contradicts [review]")
                 f.edit(f'assertion = "{assertion}"\nfailure_contains', 'assertion = "state"\nfailure_contains')
         f.edit('assertion = "state"\nfailure_contains', "failure_contains")
+        f.edit(REVIEW["source"], "https://github.com/o/r/pull/1#second-review")
         f.commit("what the regression asserts is not recorded")
         status, output = f.run("check")
         self.assertEqual(status, 0, output)
@@ -1307,7 +1313,7 @@ class FoolTest(HarnessCase):
         self.assert_not_counted("the unpatched build is not main's: HEAD changes server/sim-oltp/src/sweep.rs",
                                 result="candidate")
         for name in ("rust-toolchain.toml", ".cargo/config.toml", "server/.cargo/config.toml", "build.rs", ".gitattributes",
-                     "server/sim-oltp/bugs/.gitattributes", f"{BUG}/build.rs", "docs/testing/oltp-contract.md",
+                     "server/sim-oltp/bugs/.gitattributes", "docs/testing/oltp-contract.md",
                      "scripts/testing/sim_bugs.py"):
             with self.subTest(name=name):
                 sh(f.repo, "reset", "-q", "--hard", "HEAD~1")
@@ -1632,11 +1638,15 @@ class FoolTest(HarnessCase):
         other = f.revert_diff("server/src/tests.rs", "fn broken_probe() {}\n#[test]\nfn probe_fix_two() {}\n" + TESTS)
         f.write("server/src/two.rs", "pub fn two() -> u8 {\n    2\n}\n")
         f.commit("a second product file")
-        self.second_bug(patch_text=f.revert_diff("server/src/two.rs", "pub fn two() -> u8 {\n    1\n}\n"))
+        record = (f.repo / "docs/testing/bugs/2026-11-23-fix-one.toml").read_text()
+        f.write("docs/testing/bugs/2026-11-23-fix-two.toml", record.replace("FIX-ONE", "FIX-TWO"))
+        patch_text = f.revert_diff("server/src/two.rs", "pub fn two() -> u8 {\n    1\n}\n")
         two = BUG.replace("fix-one", "fix-two")
+        f.write(f"{two}/revert.patch", patch_text)
         f.write(f"{two}/probe.patch", other)
-        path = f.repo / two / "bug.toml"
-        path.write_text(path.read_text().replace("probe_fix_one", "probe_fix_two").replace('port = "clean"', 'port = "hand"'))
+        regression = {**f.evidence(patch=patch_text), "test": "tests::probe_fix_two", "probe": True}
+        manifest = f.manifest(port="hand", regression=regression, tables=toml_table("review", review(patch_text, other)))
+        f.write(f"{two}/bug.toml", manifest.replace("fix-one", "fix-two").replace("FIX-ONE", "FIX-TWO"))
         f.commit("a second target with its own probe")
         status, output = self.verify("fix-one", "fix-two")
         self.assertIn("fix-one: without the patch passed", output)
