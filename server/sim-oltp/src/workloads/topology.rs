@@ -15,6 +15,8 @@
 //! - `quiet` is written once, before the chaos. Both gateways keep a route to it that the
 //!   topology changes since then have aged. Its stage at the end changes the topology once more
 //!   and then uses each cached route, with nothing else running.
+//! - `fence` has one row. At the end pairs of declarations race for one index name on it, so that
+//!   one of them fails its validation while it holds the table's guard.
 //!
 //! Auditors own keys that nobody else writes and scan a covering index over them, so an
 //! acknowledged insert must be in every later scan. The rules are in
@@ -76,6 +78,9 @@ const SETUP_LIMIT: Duration = Duration::from_secs(30);
 /// Bound for a split or an index build after the heal. The design bounds both but gives a
 /// number only for the move, which is the one used here.
 const CHANGE_LIMIT: Duration = Duration::from_secs(60);
+/// Bound for an index build after the heal. A worker builds one index at a time, and a build
+/// sends every row of the table through the queue, so builds of two tables take minutes.
+const BUILD_LIMIT: Duration = Duration::from_secs(180);
 /// One operator request. A client-side timeout cancels its handler.
 const ADMIN_LIMIT: Duration = Duration::from_secs(10);
 /// A query takes the queued path, whose acceptance test allows 30 s.
@@ -92,6 +97,8 @@ const FLOOR: i64 = 1_000_000_000_000;
 /// Audited keys are at least this far from zero, on both sides of every split boundary.
 const AUDIT_KEYS: i64 = 1_000_000;
 const QUIET_KEYS: i64 = 10;
+/// Declarations that race for one name, until one is refused under the table's guard.
+const RACES: usize = 12;
 const VICTIM_KEYS: i64 = 6;
 
 /// Seeded defects. `LoseRow` and `FakeDrop` change what the cluster does; the others change
@@ -266,6 +273,8 @@ struct TopoPlan {
     quiet_boundary: i64,
     quiet_age: Duration,
     rewarm: bool,
+    /// When the rival is sent, in per mille of a declaration at rest, before its end.
+    races: Vec<u64>,
     audits: Vec<(Table, Vec<Audit>)>,
 }
 
@@ -378,6 +387,7 @@ impl TopoPlan {
             quiet_boundary: 2 + g.below(QUIET_KEYS as u64 - 2) as i64,
             quiet_age: ms(g, 0, 5_000),
             rewarm: g.bool(),
+            races: (0..RACES).map(|_| 100 + g.below(901)).collect(),
             audits,
         }
     }
@@ -438,6 +448,8 @@ struct Log {
     split_error: Option<String>,
     /// How many split IDs were sent for `ranged`.
     split_ids: u64,
+    /// What each fence race did.
+    races: Vec<String>,
     defect: Option<Defect>,
 }
 
@@ -472,6 +484,16 @@ enum Reply {
     },
 }
 
+impl Reply {
+    fn shown(&self) -> String {
+        match self {
+            Reply::Ok(data) => format!("ok {}", data["state"]),
+            Reply::Definite(_, why) => why.clone(),
+            Reply::Retry { why, unknown } => format!("{why} (unknown {unknown})"),
+        }
+    }
+}
+
 impl Topo {
     fn ctx(&self, table: Table) -> &Ctx {
         match table {
@@ -497,6 +519,12 @@ impl Topo {
 
     fn change_over(&self) -> bool {
         self.now() >= self.change_by.load(Ordering::Acquire)
+    }
+
+    fn builds_over(&self) -> bool {
+        let extra = (BUILD_LIMIT - CHANGE_LIMIT).as_millis() as u64;
+        let by = self.change_by.load(Ordering::Acquire);
+        self.now() >= by.saturating_add(if by == 0 { 0 } else { extra })
     }
 
     fn log<R>(&self, f: impl FnOnce(&mut Log) -> R) -> R {
@@ -1042,7 +1070,7 @@ async fn life(
                 if !open {
                     t.log(|log| log.refused.insert(id, format!("{code:?} {why}")));
                 }
-                if overtaken(code, &why) && !t.change_over() {
+                if overtaken(code, &why) && !t.builds_over() {
                     // A declaration that was never answered can hold the table's guard until
                     // its own ID is sent again.
                     let mut unanswered = Vec::new();
@@ -1083,7 +1111,7 @@ async fn life(
                 build.refused = true;
                 let expected = plan.kind != IndexKind::Valid
                     || plan.table == Table::Victim
-                    || (code == ErrorCode::Conflict && why.contains("name already exists"));
+                    || (code == ErrorCode::Conflict && why.contains("already exists"));
                 if !expected {
                     build.stuck = Some(format!("declaration refused: {why}"));
                 }
@@ -1092,7 +1120,7 @@ async fn life(
             Reply::Retry { why, unknown } => {
                 open |= unknown;
                 refusals += 1;
-                if t.change_over() {
+                if t.builds_over() {
                     build.stuck = Some(format!("declaration unanswered: {why}"));
                     return;
                 }
@@ -1123,7 +1151,7 @@ async fn life(
         if plan.table == Table::Victim && t.log(|log| log.dropped.is_some()) {
             return;
         }
-        if t.change_over() {
+        if t.builds_over() {
             build.stuck = Some(format!("still {state}: {last}"));
             return;
         }
@@ -1141,6 +1169,7 @@ async fn life(
             Reply::Ok(data) => {
                 let completed = t.next();
                 state = record_status(t, &plan.name, invoked, completed, &data);
+                last.clear();
             }
             Reply::Definite(code, why) => {
                 // A build that belongs to an earlier run cannot resume, and stays invisible.
@@ -1175,7 +1204,7 @@ async fn life(
             Reply::Definite(code, why) => last = format!("{code:?} {why}"),
             Reply::Retry { why, .. } => last = why,
         }
-        if t.change_over() {
+        if t.builds_over() {
             build.stuck = Some(format!("not retired: {last}"));
             return;
         }
@@ -1496,6 +1525,7 @@ pub(crate) async fn run(
         "sim_ranged",
         "sim_victim",
         "sim_quiet",
+        "sim_fence",
         "sim_moved",
     ] {
         if name == "sim_moved" && plan.moving.is_none() {
@@ -1524,6 +1554,7 @@ pub(crate) async fn run(
     let ranged = share(context("sim_ranged", plan.ranged.keys));
     let victim = share(context("sim_victim", VICTIM_KEYS));
     let quiet = share(context("sim_quiet", QUIET_KEYS));
+    let fence = share(context("sim_fence", 1));
     let moved = plan
         .moving
         .is_some()
@@ -1542,6 +1573,7 @@ pub(crate) async fn run(
     t.log(|log| log.defect = defect);
     let ctx = t.main.clone();
     warm_quiet(&quiet).await?;
+    warm_fence(&fence).await?;
     let cluster_id = cluster.config.cluster_id;
     if plan.split == SplitTiming::BeforeLoad {
         let deadline = t.now() + CHANGE_LIMIT.as_millis() as u64;
@@ -1811,6 +1843,14 @@ pub(crate) async fn run(
             cluster
                 .checks
                 .violate(&cluster.world, "Liveness", format!("quiet stage: {error}"));
+        }
+    }
+    match fence_races(cluster, &t, &fence, &plan.races).await {
+        Ok(clauses) => report.scenarios.extend(clauses),
+        Err(error) => {
+            cluster
+                .checks
+                .violate(&cluster.world, "Liveness", format!("fence races: {error}"));
         }
     }
     refused_builds(cluster, &t).await;
@@ -2217,6 +2257,156 @@ async fn quiet_stage(
     Ok(clauses)
 }
 
+async fn warm_fence(ctx: &Ctx) -> Result<(), String> {
+    let mut client = ctx.new_client();
+    let id = fresh_id(CLIENTS[0]).await;
+    let request = Request::row("table.insert", &ctx.table, 1, 1, id);
+    let answer = clients::resolve(ctx, &mut client, CLIENTS[0], 0, true, &request, true).await;
+    clients::failure(&answer).map_or(Ok(()), |why| Err(format!("fence insert: {why}")))
+}
+
+/// One declaration of the fence table.
+async fn declare(t: &Topo, table: &str, name: &str) -> (Uuid, Value, Reply) {
+    let index_id = fresh_id(BOOTSTRAP_CLIENT).await;
+    let id = fresh_id(BOOTSTRAP_CLIENT).await;
+    let definition = json!({
+        "index_id": index_id, "table_id": table, "name": name,
+        "columns": ["value"], "covering": ["id"],
+    });
+    let selector = json!({
+        "table_id": table, "index_id": index_id, "build_id": id, "attempt": 1,
+    });
+    let reply = t.send(id, "storage.index.create", &definition).await;
+    (id, selector, reply)
+}
+
+/// Whether the build is ready, or why that is not known.
+async fn ready(t: &Topo, selector: &Value) -> Result<bool, String> {
+    let ask = fresh_id(BOOTSTRAP_CLIENT).await;
+    match t.admin(ask, "storage.index.status", selector).await {
+        Reply::Ok(data) => Ok(data["state"] == "ready"),
+        Reply::Definite(_, why) | Reply::Retry { why, .. } => Err(why),
+    }
+}
+
+async fn wait_ready(t: &Topo, selector: &Value) -> Result<(), String> {
+    let deadline = t.now() + REST_LIMIT.as_millis() as u64;
+    loop {
+        let state = ready(t, selector).await;
+        if matches!(state, Ok(true)) {
+            return Ok(());
+        }
+        if t.now() >= deadline {
+            return Err(format!("an index of one row is not ready: {state:?}"));
+        }
+        time::sleep(STATUS_POLL).await;
+    }
+}
+
+/// Two declarations of one name, the rival sent shortly before the first is done. The loser is
+/// refused before it takes the table's guard, or after, by the validation under the guard. From
+/// the two answers until the winner's build publishes, no schema change of the table is open, so
+/// the direct path must serve it ([`topology::FENCE`]).
+async fn fence_races(
+    cluster: &Cluster,
+    t: &Topo,
+    ctx: &Ctx,
+    races: &[u64],
+) -> Result<Scenarios, String> {
+    const SCHEMA: &str = "/direct/fallbacks/schema";
+    let mut clauses = Scenarios::new();
+    let mut client = ctx.new_client();
+    let alone = t.now();
+    let (_, selector, reply) = declare(t, &ctx.table, "fence_alone").await;
+    let took = t.now() - alone;
+    if !matches!(reply, Reply::Ok(_)) {
+        return Err("a declaration at rest was not accepted".into());
+    }
+    wait_ready(t, &selector).await?;
+    let mut rest = Vec::new();
+    for (turn, lead) in races.iter().enumerate() {
+        let lead = took * lead / 1_000;
+        let name = format!("fence_{turn}");
+        let first = declare(t, &ctx.table, &name);
+        let rival = async {
+            time::sleep(Duration::from_millis(took.saturating_sub(lead))).await;
+            declare(t, &ctx.table, &name).await
+        };
+        let (first, rival) = tokio::join!(first, rival);
+        let ((_, selector, _), (loser, refused, why)) = match (first, rival) {
+            (won @ (.., Reply::Ok(_)), (id, selector, Reply::Definite(_, why)))
+            | ((id, selector, Reply::Definite(_, why)), won @ (.., Reply::Ok(_))) => {
+                (won, (id, selector, why))
+            }
+            ((_, a, first), (_, b, rival)) => {
+                // Both are still open, or neither: not the race this is about.
+                let both = format!("{} and {}", first.shown(), rival.shown());
+                t.log(|log| {
+                    log.races
+                        .push(format!("{lead} of {took} ms before: {both}"));
+                });
+                for (selector, reply) in [(a, first), (b, rival)] {
+                    if matches!(reply, Reply::Ok(_)) {
+                        wait_ready(t, &selector).await?;
+                    }
+                }
+                continue;
+            }
+        };
+        t.log(|log| {
+            log.refused.insert(loser, why.clone());
+            log.selectors.insert(loser, refused);
+        });
+        let under_guard = why.contains("name or identity already exists");
+        let began = t.now();
+        let (mut fell_back, mut direct) = (0, 0);
+        loop {
+            let gateway = GATEWAYS[turn % GATEWAYS.len()];
+            let before = direct_stat(cluster, SCHEMA).await?;
+            let id = fresh_id(CLIENTS[0]).await;
+            let value = 20_000 + turn as i64 * 100 + fell_back;
+            let request = Request::row("table.upsert", &ctx.table, 1, value, id);
+            clients::attempt(ctx, &mut client, CLIENTS[0], gateway, &request, true).await;
+            if direct_stat(cluster, SCHEMA).await? > before {
+                fell_back += 1;
+            } else {
+                direct += 1;
+            }
+            if direct > 0 || ready(t, &selector).await? {
+                break;
+            }
+        }
+        rest.push(AtRest {
+            table: "fence",
+            gateway: GATEWAYS[turn % GATEWAYS.len()],
+            writes: (fell_back + direct) as u64,
+            // One fallback may have met the publication itself.
+            schema_fallbacks: if direct == 0 && fell_back > 1 {
+                fell_back as u64
+            } else {
+                0
+            },
+            polled_ms: t.now() - began,
+        });
+        t.log(|log| {
+            log.races.push(format!(
+                "{lead} of {took} ms before: under guard {under_guard}, direct {direct}, fell back {fell_back}"
+            ));
+        });
+        wait_ready(t, &selector).await?;
+        if under_guard {
+            clauses.insert("O12:refused-under-guard");
+            break;
+        }
+    }
+    for found in fence_at_rest(&rest) {
+        cluster
+            .checks
+            .violate(&cluster.world, topology::FENCE, found);
+    }
+    Ok(clauses)
+}
+
 /// Whether a build whose declaration was refused exists anyway.
 async fn refused_builds(cluster: &Cluster, t: &Topo) {
     let refused = t.log(|log| log.refused.clone());
@@ -2502,6 +2692,7 @@ fn summarize(
             })).collect::<Vec<_>>(),
             "victim_calls": log.calls.len(),
             "dropped": log.dropped.is_some(),
+            "fence_races": log.races,
             "rules": RULES,
             "heal_cold_start": chaos.is_some_and(|chaos| chaos.heal_cold),
         })

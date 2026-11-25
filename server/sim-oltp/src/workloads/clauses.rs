@@ -60,6 +60,7 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
             "O12:present-once",
             "O12:retired",
             "O12:refused-declaration",
+            "O12:refused-under-guard",
             "O12:unique-validation",
             "O12:each-phase",
             "O12:restarted-build",
