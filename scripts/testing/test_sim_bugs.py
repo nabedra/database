@@ -1582,6 +1582,24 @@ class FoolTest(HarnessCase):
         self.probe_row(f.revert_diff("server/src/tests.rs", TESTS + PROBE_TEST) + f.revert_diff("server/src/lib.rs", near))
         self.assert_refused("probe.patch and revert.patch do not apply")
 
+    def test_probe_that_draws_the_patch_to_a_copy(self):
+        # The probe adds a copy of the lines. The patch then reverts the copy, with the same text, and the product stays.
+        f = self.f
+        pad = "".join(f"pub const PAD_{i}: u8 = {i};\n" for i in range(12))
+        tail = "".join(f"pub const TAIL_{i}: u8 = {i};\n" for i in range(12))
+        f.write("server/src/lib.rs", pad + FIXED + tail)
+        f.commit("a longer file")
+        f.patch = f.revert_diff("server/src/lib.rs", pad + LIB + tail)
+        f.write(f"{BUG}/revert.patch", f.patch)
+        lines = pad.splitlines(keepends=True)
+        lines, after = pad.splitlines(keepends=True), tail.splitlines(keepends=True)
+        copy_of_it = "#[cfg(test)]\nmod copy {\n" + "".join(lines[9:]) + FIXED + "".join(after[:3]) + "}\n"
+        copied = f.revert_diff("server/src/lib.rs", "".join(lines[:8]) + copy_of_it + "".join(lines[8:]) + FIXED + tail)
+        self.probe_row(f.revert_diff("server/src/tests.rs", TESTS + PROBE_TEST) + copied)
+        status, output = f.run("check")
+        self.assertEqual(status, 1, output)
+        self.assertIn("do not apply in either order to the same tree", output)
+
     def test_probe_that_the_evidence_did_not_have(self):
         f = self.f
         self.probe_row()
@@ -1704,6 +1722,9 @@ PATCHED
                 ("passes", 'print(json.dumps({"scenario": "O17", "status": "passed"}))', None, "passed; NOT verified"),
                 ("a traceback of the import", fails, "raise ImportError('lost the uncertain outcome')", "NOT verified"),
                 ("says nothing", fails, "sys.exit(0)", "NOT verified"),
+                ("an import that says the text", "raise ImportError('lost the uncertain outcome')", None, "not-run; NOT verified"),
+                ("reports, then fails", 'print(json.dumps({"scenario": "O17", "status": "passed"})); ' + fails, None,
+                 "not-run; NOT verified"),
                 ("reports and fails", fails, 'print(json.dumps({"status": "passed"})); sys.exit(1)', "NOT verified")):
             with self.subTest(name=name):
                 script = self.SUITE.replace("PATCHED", patched)
@@ -1771,7 +1792,7 @@ PATCHED
 
     def test_machine_variables_do_not_reach_a_build(self):
         machine = {"RUSTC": "/x", "RUSTC_WRAPPER": "/x", "RUSTC_WORKSPACE_WRAPPER": "/x", "RUSTC_BOOTSTRAP": "1",
-                   "RUSTDOC": "/x", "RUSTUP_TOOLCHAIN": "x", "CC": "/x", "CXX": "/x", "AR": "/x", "CFLAGS": "-DX", "LD": "/x",
+                   "RUSTDOC": "/x", "RUSTUP_TOOLCHAIN": "x", "CARGO_HOME": "/x", "RUSTUP_HOME": "/x", "CC": "/x", "CXX": "/x", "AR": "/x", "CFLAGS": "-DX", "LD": "/x",
                    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": "/x", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER": "/x",
                    "CARGO_BUILD_RUSTC": "/x", "CARGO_BUILD_RUSTC_WRAPPER": "/x", "CARGO_PROFILE_RELEASE_OPT_LEVEL": "0",
                    "CARGO_PROFILE_DEV_OPT_LEVEL": "3", "CARGO_ENCODED_RUSTFLAGS": "x", "CARGO_UNSTABLE_X": "1",
@@ -1781,6 +1802,12 @@ PATCHED
         self.assertTrue(calls)
         for call in calls:
             self.assertEqual(sorted(set(call["environment"]) & set(machine)), [])
+        # The interpreter's own library directory is for the scripts that `verify` starts, and not for a sweep.
+        library = str(Path(sys.base_prefix) / "lib")
+        _, _, calls = self.assert_found(script={"hit": 3}, LD_LIBRARY_PATH=f"/x:{library}")
+        self.assertFalse(any("LD_LIBRARY_PATH" in call["environment"] for call in calls))
+        with patch.dict(os.environ, {"LD_LIBRARY_PATH": f"/x:{library}"}):
+            self.assertEqual(sim_bugs.machine_env()["LD_LIBRARY_PATH"], library)
         written = self.root / "environment.json"
         status, output = self.verify(FAKE_ENVIRONMENT=str(written), RUSTFLAGS="--cfg planted", **machine)
         self.assertEqual(status, 0, output)

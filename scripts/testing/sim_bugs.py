@@ -124,8 +124,8 @@ ASSERTIONS = ("state", "counter", "timeout")
 SEED_BUDGET = 10_000
 # What a build or a test may take from the machine. A compiler, a wrapper, a linker, a flag, a library path or a
 # variable of the harness comes from this script, from the tree, or not at all.
-KEPT_ENV = re.compile(r"PATH|HOME|USER|LOGNAME|SHELL|TERM|TZ|LANG|LC_\w+|TMPDIR|TMP|TEMP|RUNNER_TEMP|CI|CARGO_HOME|"
-                      r"RUSTUP_HOME|CARGO_TERM_\w+|CARGO_NET_(?:RETRY|OFFLINE)|RUST_BACKTRACE|SSL_CERT_(?:FILE|DIR)|"
+KEPT_ENV = re.compile(r"PATH|HOME|USER|LOGNAME|SHELL|TERM|TZ|LANG|LC_\w+|TMPDIR|TMP|TEMP|RUNNER_TEMP|CI|"
+                      r"CARGO_TERM_\w+|CARGO_NET_(?:RETRY|OFFLINE)|RUST_BACKTRACE|SSL_CERT_(?:FILE|DIR)|"
                       r"(?i:https?_proxy|no_proxy|all_proxy)")
 SEARCHES = "searches.jsonl"
 TARGET_FILE = re.compile(r"server/sim-oltp/bugs/(?:README\.md|SHARDS\.md|(?:phase[0-9]+/)?(?:simulator\.toml|[a-z0-9-]+/"
@@ -690,22 +690,22 @@ def validate_probe(bug):
 
 
 def probe_in_tree(bug, repo):
-    """What the probe does in HEAD's tree: with the patch on top, the patch still changes exactly its own lines, and
-    what it adds to a product source is compiled for tests only."""
-    problems = []
-    with tempfile.TemporaryDirectory(prefix="sim-bugs-index-") as tmp:
-        env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
-        git(repo, "read-tree", "HEAD", env=env)
-        for patch in (bug.probe, bug.patch):
-            result = git(repo, "apply", "--cached", "-", env=env, input=patch, check=False)
-            if result.returncode:
-                return [f"probe.patch and revert.patch do not apply to HEAD together: {result.stderr.strip()}"]
-            if patch is bug.probe:
-                with_probe = git(repo, "write-tree", env=env).stdout.strip()
-        both = git(repo, "write-tree", env=env).stdout.strip()
-    diff = git(repo, "diff", "--no-renames", "--no-ext-diff", "--no-color", with_probe, both).stdout
-    if digest(diff) != digest(bug.patch) or hunk_texts(diff) != hunk_texts(bug.patch):
-        problems.append("probe.patch and revert.patch do not apply to separate lines")
+    """What the probe does in HEAD's tree: the patch reverts the same lines with it and without it, and what it
+    adds to a product source is compiled for tests only."""
+    problems, trees = [], []
+    for order in ((bug.probe, bug.patch), (bug.patch, bug.probe)):
+        with tempfile.TemporaryDirectory(prefix="sim-bugs-index-") as tmp:
+            env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
+            git(repo, "read-tree", "HEAD", env=env)
+            for patch in order:
+                result = git(repo, "apply", "--cached", "-", env=env, input=patch, check=False)
+                if result.returncode:
+                    return [f"probe.patch and revert.patch do not apply to HEAD together: {result.stderr.strip()}"]
+                trees.append(git(repo, "write-tree", env=env).stdout.strip())
+    # A patch that finds its context in the probe would revert the probe's copy and leave the product as it is.
+    with_probe = trees[0]
+    if trees[1] != trees[3]:
+        problems.append("probe.patch and revert.patch do not apply in either order to the same tree")
     added = git(repo, "diff", "--no-renames", "--no-ext-diff", "--no-color", "-U0", "HEAD", with_probe).stdout
     for name in patch_files(bug.probe):
         if TEST_FILE.search(name) or ACCEPTANCE_FILE.fullmatch(name):
