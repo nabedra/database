@@ -5,7 +5,7 @@ guarantees = []
 scenarios = []
 tiers = ["T1"]
 # The shards, their merge and the counting run of sim_bugs.py: every test once, then the repetition gate (50 runs of each) in
-# four processes. The harness, the library tests and `gh attestation verify` are fakes.
+# four processes. The harness, the library tests, `gh attestation verify` and GitHub's API are fakes.
 command = ["bash", "-euo", "pipefail", "-c", '''
 python3 -m unittest test_sim_bugs_shards
 python3 - <<'PY'
@@ -14,11 +14,11 @@ import json
 import subprocess
 import sys
 import unittest
-from test_sim_bugs_shards import CountTest, MergeTest, ShardTest
+from test_sim_bugs_shards import CountTest, MergeTest, RunsTest, ShardTest
 
 tests = [{"id": f"test_sim_bugs_shards.{case.__name__}.{name}", "file": "scripts/testing/test_sim_bugs_shards.py",
           "lang": "python"}
-         for case in (ShardTest, MergeTest, CountTest)
+         for case in (ShardTest, MergeTest, CountTest, RunsTest)
          for name in unittest.defaultTestLoader.getTestCaseNames(case) if name.startswith("test_")]
 
 def gate(shard):
