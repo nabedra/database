@@ -9,7 +9,7 @@ found_date = "2026-11-25"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
 seed = 1
 why_not_caught = "No runner requests a split while an index of the same table is building."
-invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=topology NABEDRA_SIM_PROFILE=none NABEDRA_SIM_TOPOLOGY=no-move,split-under-load, seeds 1, 2, 4, 8, 10 and 12 at 9a6bc79e: a requested split publishes within 60 s of the heal. It is about the ID: with a new ID after the heal the split published (review-136, seeds 1 and 12, scratch build). Read in the code: the planner checks the index phase at the snapshot that the split ID pinned, and the refusal is storage_unavailable, so the attempt is never closed. Review-136: a product behaviour about the ID, supported by the experiment and the code."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=topology NABEDRA_SIM_PROFILE=none NABEDRA_SIM_TOPOLOGY=no-move,split-under-load, seeds 1, 2, 4, 5, 8, 10 and 12 at 715e062f (all but 5 also at 9a6bc79e): a requested split publishes within 60 s of the heal. It is about the ID: with a new ID after the heal the split published (review-136, seeds 1 and 12 at 9a6bc79e, scratch build). Read in the code: the planner checks the index phase at the snapshot that the split ID pinned, and the refusal is storage_unavailable, so the attempt is never closed. Review-136: a product behaviour about the ID, supported by the experiment and the code."
 fix_commits = []
 revert_patch_ok = false
 status = "open"

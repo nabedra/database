@@ -1,8 +1,13 @@
 """Unit tests of sim_triage.py: what may not count as a named cause (review of PR #115, H3)."""
 
+import gzip
+import tempfile
 import unittest
 
 import sim_triage as triage
+
+
+HISTORY = triage.digest(['{"index":0}', '{"index":1}'])
 
 
 def usage(node, now, before, threads=0):
@@ -16,6 +21,7 @@ def usage(node, now, before, threads=0):
 def diagnosis(kinds, *lines, active_move_at="control/machine.rs:320"):
     out = triage.Diagnosis(active_move_at)
     out.kinds = set(kinds)
+    out.history = HISTORY
     for line in lines:
         out.add(line)
     return out
@@ -44,7 +50,7 @@ def red(*kinds):
 
 class Triage(unittest.TestCase):
     def classify(self, violations, known, kinds=("ResourceBaseline",)):
-        return triage.classify(red(*kinds), violations, known)[0]
+        return triage.classify(red(*kinds), violations, known, HISTORY)[0]
 
     def test_a_held_route_with_the_exact_bytes_is_named(self):
         known = diagnosis(["ResourceBaseline"], *held(ROUTE))
@@ -87,6 +93,39 @@ class Triage(unittest.TestCase):
         self.assertEqual(self.classify([usage(1, 792, 100)], known), "undiagnosed")
         self.assertEqual(self.classify([usage(1, 792, 100)], None), "undiagnosed")
         self.assertEqual(self.classify([], known, ("ResourceBaseline", "Liveness")), "undiagnosed")
+
+    def test_a_diagnostic_run_with_another_history_names_nothing(self):
+        known = diagnosis(["ResourceBaseline"], *held(ROUTE))
+        for history in (triage.digest(['{"index":0}', '{"index":2}']), triage.digest([]), None):
+            result = triage.classify(red("ResourceBaseline"), [usage(1, 792, 100)], known, history)
+            self.assertEqual(result[0], "undiagnosed")
+        known.history = None
+        self.assertEqual(self.classify([usage(1, 792, 100)], known), "undiagnosed")
+        self.assertEqual(triage.classify(red("ResourceBaseline"), [usage(1, 792, 100)], known)[0], "undiagnosed")
+
+    def test_histories_are_read_from_the_diagnostic_traces(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = f"{root}/s7.trace.gz"
+            with gzip.open(path, "wt") as out:
+                out.write('5 history {"index":0}\n6 cut n1 Kill\n6 history {"index":1}\n')
+            known = {7: triage.Diagnosis()}
+            triage.add_histories(known, [path])
+            self.assertEqual(known[7].history, HISTORY)
+
+    def test_topology_growth_is_labelled_and_stays_undiagnosed(self):
+        def violation(*ledgers):
+            off = ", ".join(f"{name} {before + size} (baseline {before})" for name, before, size in ledgers)
+            return f"t=9ms ResourceBaseline: n1 did not stay at its baseline after quiescence, last off by {off}"
+        group = "SchedulerBytes of group 00000000-0000-0000-0000-000000000000"
+        known = diagnosis(["ResourceBaseline"], *held(ROUTE))
+        for ledgers, matches in (
+                ([("ScratchBytes", 9, 16_909_672)], True), ([("SchedulerBytes", 0, 64 << 20)], True),
+                ([(group, 0, (8 << 20) + (64 << 10)), ("ScratchBytes", 100, 692)], True),
+                ([("ScratchBytes", 9, 16_909_673)], False), ([("ScratchBytes", 9, 692)], False),
+                ([("ScratchBytes", 9, 64 << 20), ("ProgressBytes", 4, 5)], False)):
+            result, causes = triage.classify(red("ResourceBaseline"), [violation(*ledgers)], known, HISTORY)
+            self.assertEqual(result, "undiagnosed")
+            self.assertEqual(triage.TOPOLOGY in causes[0], matches, causes)
 
     def test_a_split_is_named_only_by_the_recorded_refusals(self):
         text = "t=9ms Liveness: the split did not publish within 60s after the heal: {\"last\":%s,\"plans\":2}"

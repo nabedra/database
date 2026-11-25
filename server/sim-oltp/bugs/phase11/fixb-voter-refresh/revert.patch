@@ -1,0 +1,13 @@
+diff --git a/server/oltp-replication/src/oltp_replication/authority/control/endpoint.rs b/server/oltp-replication/src/oltp_replication/authority/control/endpoint.rs
+index 43ecb74a..4427440c 100644
+--- a/server/oltp-replication/src/oltp_replication/authority/control/endpoint.rs
++++ b/server/oltp-replication/src/oltp_replication/authority/control/endpoint.rs
+@@ -797,7 +797,7 @@ impl PublishedControlRoutes {
+                     &ReadRequest::Group {
+                         group_id: control.group.group_id,
+                     },
+-                    64 << 10,
++                    HEADER_LIMIT,
+                     |reply| async move {
+                         Ok((*reply.decode_section::<Option<GroupRecord>>(0)?).clone())
+                     },

@@ -1,0 +1,151 @@
+diff --git a/server/oltp-replication/src/oltp_replication/hosted.rs b/server/oltp-replication/src/oltp_replication/hosted.rs
+index f92aca4d..932e5fb8 100644
+--- a/server/oltp-replication/src/oltp_replication/hosted.rs
++++ b/server/oltp-replication/src/oltp_replication/hosted.rs
+@@ -726,6 +726,7 @@ where
+     #[doc(hidden)]
+     pub state: HostedState<C, M>,
+     pub(in crate::oltp_replication) membership_changes: tokio::sync::Mutex<()>,
++    pub(super) peer_features: OnceLock<super::multiplex::WorkerClient>,
+     /// CAP1: the cluster features the hosting worker observed enabled. Set
+     /// by the hosted-group manager; unset, no gated entry is proposed.
+     #[cfg(not(any(test, feature = "test-hooks")))]
+@@ -850,6 +851,7 @@ where
+             log,
+             state,
+             membership_changes: tokio::sync::Mutex::new(()),
++            peer_features: OnceLock::new(),
+             cluster_features: OnceLock::new(),
+             direct_watch: std::sync::Once::new(),
+             deferred_applies: std::sync::Mutex::new(deferred_applies),
+@@ -971,6 +973,46 @@ pub(crate) mod proposal_clock {
+     }
+ }
+ 
++impl<C, M> RaftConsensus<C, M>
++where
++    C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
++    M: TypedMachine<C>,
++{
++    fn check_index_reclamation_voters(&self) -> Result<(), ProtocolError> {
++        use super::multiplex::{PeerFeature, TrafficClass};
++        use openraft::type_config::async_runtime::watch::WatchReceiver;
++
++        let local = self.state.resident().node_id();
++        let metrics = self.raft.metrics();
++        let metrics = metrics.borrow_watched();
++        if metrics.current_leader != Some(local)
++            || metrics.membership_config != metrics.committed_membership_config
++        {
++            return Err(unavailable());
++        }
++        let membership = metrics.membership_config.membership();
++        if membership.nodes().any(|(node, member)| {
++            *node != local
++                && self.peer_features.get().is_none_or(|client| {
++                    [TrafficClass::RaftProgress, TrafficClass::DataConsensus]
++                        .into_iter()
++                        .all(|class| {
++                            client
++                                .peer_supports(
++                                    member.worker_id,
++                                    class,
++                                    PeerFeature::DirectAdmission,
++                                )
++                                .is_none()
++                        })
++                })
++        }) {
++            return Err(unavailable());
++        }
++        Ok(())
++    }
++}
++
+ impl<C, M> Consensus<C::Command, C::Reply> for RaftConsensus<C, M>
+ where
+     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
+@@ -979,20 +1021,13 @@ where
+     fn propose(&self, command: OwnedCommand<C::Command>) -> ConsensusFuture<'_, Applied<C::Reply>> {
+         Box::pin(async move {
+             command.ensure_charged()?;
+-            // CAP1: `ReclaimIndex` only once Control enabled
+-            // `data.index.reclaim`: then every replica host decodes it, and
+-            // Control refuses joiners whose build does not.
+-            if C::requires_index_reclamation(command.payload()?)
+-                && !self.cluster_features.get().is_some_and(|features| {
+-                    features.enabled(super::authority::control::INDEX_RECLAIM_FEATURE)
+-                })
+-            {
+-                return Err(ProtocolError::new(
+-                    ErrorCode::StorageUnavailable,
+-                    "cluster feature data.index.reclaim is not enabled",
+-                    Outcome::NotApplied,
+-                ));
+-            }
++            let _membership = if C::requires_index_reclamation(command.payload()?) {
++                let guard = self.membership_changes.lock().await;
++                self.check_index_reclamation_voters()?;
++                Some(guard)
++            } else {
++                None
++            };
+             // A full device: nothing would commit until space frees up, so
+             // the leader says so before proposing (RV-APPLY F1).
+             if self.retry.out_of_space() {
+diff --git a/server/oltp-replication/src/oltp_replication/manager.rs b/server/oltp-replication/src/oltp_replication/manager.rs
+index a2c7d3a1..34230f7a 100644
+--- a/server/oltp-replication/src/oltp_replication/manager.rs
++++ b/server/oltp-replication/src/oltp_replication/manager.rs
+@@ -577,6 +577,7 @@ impl HostedGroupManager {
+         let state = HostedState::new(machine, resident.clone())?;
+         let running =
+             RaftConsensus::start_with(config, network, log, state, self.health.clone()).await?;
++        let _ = running.peer_features.set(self.client.clone());
+         let _ = running.cluster_features.set(self.features.clone());
+         let endpoint = ReplicaEndpoint::new(
+             running.raft.clone(),
+diff --git a/server/src/oltp_runtime/worker_runtime/index_reclaim.rs b/server/src/oltp_runtime/worker_runtime/index_reclaim.rs
+index 54cb1af6..053228dc 100644
+--- a/server/src/oltp_runtime/worker_runtime/index_reclaim.rs
++++ b/server/src/oltp_runtime/worker_runtime/index_reclaim.rs
+@@ -5,10 +5,7 @@ use crate::oltp::mvcc::{
+     index::{IndexPhase, IndexRecord},
+     store::{ParticipantCommand, ParticipantReply, index_reclaim::ReclaimIndex},
+ };
+-use crate::oltp_replication::{
+-    authority::control::{INDEX_RECLAIM_FEATURE, IdlePasses},
+-    owned::OwnedCommand,
+-};
++use crate::oltp_replication::{authority::control::IdlePasses, owned::OwnedCommand};
+ use std::time::Duration;
+ 
+ const INTERVAL: Duration = Duration::from_millis(250);
+@@ -31,12 +28,6 @@ pub(super) async fn reclaim_indexes(runtime: Weak<WorkerRuntime>) {
+         if !runtime.accepting.load(Ordering::Acquire) {
+             break;
+         }
+-        // CAP1: no reclamation call or proposal before Control enabled
+-        // `data.index.reclaim` (an older build decodes neither); the
+-        // feature watch sets the flag.
+-        if !runtime.index_reclaim_enabled() {
+-            continue;
+-        }
+         let started = nabedra_rt::time::now();
+         let applied = runtime.services.control.applied_index();
+         if !idle.due(applied, &(), started) {
+@@ -83,14 +74,6 @@ pub(super) async fn reclaim_indexes(runtime: Weak<WorkerRuntime>) {
+ }
+ 
+ impl WorkerRuntime {
+-    /// CAP1: Control enabled `data.index.reclaim`, as this worker observed.
+-    pub(super) fn index_reclaim_enabled(&self) -> bool {
+-        self.services
+-            .manager
+-            .cluster_features()
+-            .enabled(INDEX_RECLAIM_FEATURE)
+-    }
+-
+     async fn reclaim_index_step(
+         &self,
+         authority: Authority,

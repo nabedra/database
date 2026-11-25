@@ -34,7 +34,11 @@ use std::{
 
 use nabedra_check::Gen;
 use nabedra_protocol::protocol::{ErrorCode, Outcome};
-use nabedra_rt::{ids::uuid_v4, sim::in_node, time};
+use nabedra_rt::{
+    ids::uuid_v4,
+    sim::{World, in_node},
+    time,
+};
 use serde_json::{Value, json};
 use tokio::{sync::Semaphore, task::JoinHandle};
 use uuid::Uuid;
@@ -52,7 +56,7 @@ use crate::{
     config::Config,
     history::{Client, Completion, History, Operation},
     invariants::{
-        elapsed_ms,
+        Invariants, elapsed_ms,
         topology::{
             self, AtRest, Chosen, Ended, RULES, Refresh, Scan, Status, TableCall, Write,
             audit_scans, dropped_silent, fence_at_rest, incomplete_chosen, refreshes_once,
@@ -1973,8 +1977,8 @@ pub(crate) async fn run(
     if let Some(moving) = moving.as_mut() {
         retired = Some(moving.finish(cluster, healed).await);
     }
-    if let Some(chaos) = chaos.as_mut().filter(|chaos| chaos.split_pending()) {
-        chaos.finish_split(cluster, quiet_from).await;
+    if let Some(chaos) = chaos.as_mut() {
+        chaos.settle_split(cluster, quiet_from).await;
     }
     for task in changes {
         let _ = task.await;
@@ -2183,6 +2187,13 @@ impl Work {
         }
     }
 
+    fn require(&self, checks: &Invariants, world: &World, load: (u64, u64)) {
+        for what in self.missing() {
+            let why = format!("no {what} from {}ms to {}ms, under load", load.0, load.1);
+            checks.violate(world, "Progress", why);
+        }
+    }
+
     fn missing(&self) -> Vec<&'static str> {
         [
             (self.writes, "write committed"),
@@ -2208,13 +2219,7 @@ fn progress(cluster: &Cluster, t: &Topo, moved: Option<&Ctx>, load: (u64, u64)) 
     }
     let scans: Vec<_> = t.log(|log| log.scan_ms.iter().map(|(_, a, b)| (*a, *b)).collect());
     let work = Work::of(&attempts, &scans, load);
-    for what in work.missing() {
-        cluster.checks.violate(
-            &cluster.world,
-            "Progress",
-            format!("no {what} from {}ms to {}ms, under load", load.0, load.1),
-        );
-    }
+    work.require(&cluster.checks, &cluster.world, load);
     work
 }
 
@@ -3361,6 +3366,24 @@ mod tests {
         assert_eq!(work(&[write((1_900, 2_100)), read], &[(1_500, 1_600)]), 1);
         let unknown = attempt(true, (1_100, 1_200), Answer::Unknown);
         assert_eq!(work(&[unknown], &[]), 3);
+    }
+
+    #[test]
+    fn a_run_without_work_under_load_is_a_progress_violation() {
+        let done = |scans| Work {
+            writes: 1,
+            reads: 1,
+            scans,
+        };
+        for (work, violations) in [(Work::default(), 3), (done(0), 1), (done(1), 0)] {
+            nabedra_sim::runtime::run(1, move |world| async move {
+                let checks = Invariants::new();
+                work.require(&checks, &world, (0, 10));
+                let found = checks.violations();
+                assert_eq!(found.len(), violations, "{found:?}");
+                assert!(found.iter().all(|line| line.contains(" Progress: ")));
+            });
+        }
     }
 
     /// Review 136, M2: 20 of 23 `O16:split-during-commits` tags were splits that never published.

@@ -1,0 +1,75 @@
+# Reverted fix BUG1-encode-submit (phase 11, design section 4.2, row 2).
+schema = "nabedra.sim-bug/1"
+id = "bug1-encode-submit"
+bug = "BUG1-encode-submit"
+set = "queued"
+phase = 11
+class = "uncertain-outcome"
+guarantees = ["OLTP-G04", "OLTP-G07"]
+scenarios = ["Q05", "O13"]
+fix_commits = ["d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+reverts = ["d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+port = "hand"
+port_notes = """
+The application.rs hunks of d7b9d63c, reversed by hand: `encode_submission` and `finish_reply` return the
+encoding refusal itself (not_applied) after the queue accepted the request. `finish_reply` keeps its
+`submits` parameter (unused) because the regression calls it. The rest of d7b9d63c belongs to other bugs.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
+workload = "queued"
+profile = ["low-data-bytes", "lane-exhaust"]
+# expect is the plan. The text an expected kind enforces is in [[rules]] at the end. A kind without text there detects
+# nothing.
+expect = ["failed-write-observed", "QueueRetention"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_runtime::application::q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity"
+mode = "on"
+assertion = "state"
+failure_contains = ["left: NotApplied"]
+
+# The patch author's own runs.
+[regression.evidence]
+digest = "2b04ed65b0896fdd68e2edadf7d89427916c2556aa0e92553eecf4724e351049"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435466712", sha = "f5b4e6ed14fc853f4f3abc33bd20b028b8b6c9fb", result = "failed", note = "request p11-bugs-bug1-encode-submit-f5b4e6e-171758, q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+assertion `left == right` failed
+  left: NotApplied
+ right: Unknown
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 0.00s
+""" }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact for the application.rs hunks of d7b9d63c. Kept apart from the author's evidence above. These are
+# workflow `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - the [regression] test (helper level): clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456531479 (081b4da8) 3 of 3 failed: `left: NotApplied`, `right: Unknown`.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports.
+[review]
+digest = "4b8050fad77624ff8b759f060c33cefbdaa23921cdb5ce8ddec76723a4e59bc0"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Patch read: exact for the application.rs hunks of d7b9d63c. Patched: `left: NotApplied right: Unknown` \
+(helper-level test).\
+"""
+
+[[rules]]  # OLTP-G04
+kind = "failed-write-observed"
+source = "docs/testing/guarantees/oltp.md"
+text = """\
+Return `not_applied` only with proof of non-application. Otherwise, report uncertainty as `outcome_unknown`.\
+"""
+
+[[rules]]  # OLTP-G07
+kind = "QueueRetention"
+source = "docs/testing/guarantees/oltp.md"
+text = """\
+Accepted queued work stays recoverable while a complete copy survives. A full worker stop abandons outstanding \
+work.\
+"""
