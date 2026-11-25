@@ -512,7 +512,8 @@ async fn adv_corpus_of_tables_without_search_columns() {
         )
         .await
         .unwrap();
-    c.line("snapshot-installed", stored(&pool2, id(10)));
+    c.line("snapshot-installed", stored_by_class(&pool2, id(10)));
+    c.line("source-by-class", stored_by_class(&pool, id(10)));
     c.line("source-after-snapshot", stored(&pool, id(10)));
 
     // A restore of the images at cut 17 into another group.
@@ -776,4 +777,38 @@ async fn adv_decode_foreign_entries() {
         writeln!(verdicts, "{n} {name} {verdict}").unwrap();
     }
     std::fs::write(output, verdicts).unwrap();
+}
+
+/// Every record of the group's scope, hashed per kind of record.
+fn stored_by_class(pool: &OltpPool, group: Uuid) -> String {
+    let mut scope = vec![0x40];
+    scope.extend_from_slice(group.as_bytes());
+    let mut end = scope.clone();
+    end.push(0xff);
+    let snapshot = pool.kv_store().snapshot();
+    let mut iterator = snapshot.iter(
+        std::ops::Bound::Included(&scope),
+        std::ops::Bound::Excluded(&end),
+        false,
+    );
+    iterator.seek(&scope);
+    let mut classes: std::collections::BTreeMap<u8, (usize, Sha256)> = std::collections::BTreeMap::new();
+    while iterator.valid() {
+        let value = iterator.value().unwrap();
+        let key = iterator.key().to_vec();
+        let class = key.get(17).copied().unwrap_or(0);
+        let entry = classes.entry(class).or_insert_with(|| (0, Sha256::new()));
+        entry.0 += 1;
+        for bytes in [&key[..], &value[..]] {
+            entry.1.update((bytes.len() as u64).to_be_bytes());
+            entry.1.update(bytes);
+        }
+        iterator.next();
+    }
+    iterator.status().unwrap();
+    classes
+        .into_iter()
+        .map(|(class, (count, hash))| format!("{}:{count}:{}", class as char, &hex(&hash.finalize())[..12]))
+        .collect::<Vec<_>>()
+        .join(" ")
 }

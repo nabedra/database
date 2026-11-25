@@ -264,7 +264,7 @@ async fn adv_dbr5_every_position_gets_the_rows_after_it_or_a_gap_that_has_a_reas
         let mut s = S::new().await;
         feed_log(&mut s).await;
         purge_changes(&s, from, through).await;
-        for after in FEED_START - 1..=last {
+        for after in FEED_START..=last {
             let purged_needed = all.iter().any(|change| change.0 > after && change.0 >= from && change.0 <= through);
             match changes(&s.f.replica.machine, after, 3).await {
                 Some(found) => {
@@ -466,7 +466,7 @@ async fn adv_vec_g07_a_damaged_staged_vector_stops_the_commit_and_not_the_abort(
         let plan = s.f.queued_plan(20, &writes);
         s.f.prepare(&plan, writes).await;
         seal(&mut s, &plan).await;
-        let (key, mut frame) = s.records(STAGED).await.into_iter().find(|(key, _)| key.len() > 30).unwrap();
+        let (key, mut frame) = s.records(STAGED).await.into_iter().max_by_key(|(key, _)| key.len()).unwrap();
         frame[6] ^= 1;
         let tampered = key.clone();
         s.tamper(move |tx| tx.put(&tampered, &frame)).await;
@@ -909,9 +909,9 @@ async fn adv_vec_g10_a_restored_range_takes_nothing_before_its_first_search_fenc
     );
     // The derived record of row 2 (text, no vector) is the restore's own.
     let records = restored.machine.embed_records(None, 128).await.unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].record.source_version, ts(11));
-    assert!(records[0].record.id > ts(20));
+    assert_eq!(records.len(), 2, "both rows have a text and no embedding");
+    assert_eq!(records.iter().map(|item| item.record.source_version).collect::<Vec<_>>(), vec![ts(10), ts(11)]);
+    assert!(records.iter().all(|item| item.record.id > ts(20)));
     let mut set = s.set_vector(2, 11, 11, 40);
     set.schema_epoch = direct.epoch;
     assert_eq!(search_reply(restored.submit(ParticipantCommand::SetVector(set)).await), SearchReply::Set { commit_ts: ts(40) });
@@ -924,34 +924,29 @@ async fn adv_vec_g10_a_copy_never_installs_a_vector_that_does_not_fit_its_column
     let mut s = S::new().await;
     let write = s.write(1, None, Some(row(1, "a")), vec![s.set(PLAIN, s.dense(1))]);
     s.direct(10, write).await;
-    let images = image_list(&s, 20).await;
-    let wrong = |work: &dyn Fn(&mut RowImage, &S)| {
-        let mut images = images.clone();
-        let search = images.iter_mut().find_map(|image| image.search.as_mut()).unwrap();
-        work(search, &s);
-        images
-    };
-    type Case = (&'static str, Vec<CommittedImage>);
-    let cases: Vec<Case> = vec![
-        ("sparse bytes for a dense column", wrong(&|search, s| search.vectors[0].value = s.value(VectorKind::Sparse, &[1; 8]))),
-        ("three floats for two", wrong(&|search, s| search.vectors[0].value = s.value(VectorKind::Dense, &[1; 12]))),
-        ("no floats", wrong(&|search, s| search.vectors[0].value = s.value(VectorKind::Dense, &[]))),
+    type Work = Box<dyn Fn(&mut RowImage, &S)>;
+    let cases: Vec<(&'static str, Work)> = vec![
+        ("control", Box::new(|_, _| {})),
+        ("sparse bytes for a dense column", Box::new(|search, s| search.vectors[0].value = s.value(VectorKind::Sparse, &[1; 8]))),
+        ("three floats for two", Box::new(|search, s| search.vectors[0].value = s.value(VectorKind::Dense, &[1; 12]))),
+        ("no floats", Box::new(|search, s| search.vectors[0].value = s.value(VectorKind::Dense, &[]))),
         (
             "a column the group has not",
-            wrong(&|search, s| {
+            Box::new(|search, s| {
                 search.blobs.0 = std::collections::BTreeMap::from([(9, ts(10))]);
                 search.vectors[0] = crate::oltp::mvcc::store::row::VectorImage { column: 9, value: s.dense(1) };
             }),
         ),
         (
             "a vector for an embedded column",
-            wrong(&|search, s| {
+            Box::new(|search, s| {
                 search.blobs.0.insert(EMBEDDED, ts(10));
                 search.vectors.push(crate::oltp::mvcc::store::row::VectorImage { column: EMBEDDED, value: s.dense(2) });
             }),
         ),
     ];
-    for (name, images) in cases {
+    let _ = &s;
+    for (name, work) in cases {
         let mut s2 = S::new().await;
         let write = s2.write(1, None, Some(row(1, "a")), vec![s2.set(PLAIN, s2.dense(1))]);
         s2.direct(10, write).await;
@@ -964,7 +959,9 @@ async fn adv_vec_g10_a_copy_never_installs_a_vector_that_does_not_fit_its_column
             )
             .await
             .unwrap();
-        let ImagePage::Images { after, search, .. } = page.payload().unwrap() else { panic!() };
+        let ImagePage::Images { after, search, images, .. } = page.payload().unwrap() else { panic!() };
+        let mut images = images.to_vec();
+        work(images.iter_mut().find_map(|image| image.search.as_mut()).unwrap(), &s2);
         let binding = split.bindings[0].clone();
         let command = ParticipantCommand::SplitImportPage {
             authority: s2.f.authority,
@@ -981,6 +978,10 @@ async fn adv_vec_g10_a_copy_never_installs_a_vector_that_does_not_fit_its_column
         };
         let before = split.children[0].dump().await;
         let reply = split.children[0].submit(command).await;
+        if name == "control" {
+            assert!(matches!(reply, ParticipantReply::SplitImported { complete: true, .. }), "{reply:?}");
+            continue;
+        }
         assert_eq!(reply, ParticipantReply::Rejected(Fault::InvalidBinding), "{name}");
         assert_eq!(split.children[0].dump().await, before, "{name}");
     }
@@ -1298,4 +1299,175 @@ fn adv_dbr5_the_raft_log_purge_deletes_the_change_records_it_covers() {
         purge.contains("purge_changes"),
         "typed_log purge never calls GroupTransaction::purge_changes: change records outlive their log entries"
     );
+}
+
+/// A transaction of two pages stages by ordinal across pages: no row gets the
+/// vector of a row of the other page, and the abort collects both pages.
+#[tokio::test]
+async fn adv_vec_g07_a_two_page_transaction_stages_each_vector_under_its_own_ordinal() {
+    for (abort, step) in [(false, 128u16), (false, 1), (true, 1), (true, 3)] {
+        let mut s = S::new().await;
+        let pages: Vec<Vec<PreparedWrite>> = vec![
+            (1..=2).map(|key| s.put_row(key, None, plain(key), vec![s.set(PLAIN, s.dense(key as u8))])).collect(),
+            (3..=4).map(|key| s.put_row(key, None, plain(key), vec![s.set(PLAIN, s.dense(key as u8))])).collect(),
+        ];
+        let txn = TxnId { request_id: nabedra_rt::ids::uuid_v4(), attempt: 0 };
+        let request = RequestBinding {
+            run_id: s.f.authority.run_id,
+            request_id: txn.request_id,
+            digest: digest(1),
+            accepted_context: digest(2),
+        };
+        let manifest = ManifestRef { status_group_id: nabedra_rt::ids::uuid_v4(), digest: digest(3), participant_count: 1 };
+        let mut plan = ParticipantPlan {
+            group: s.f.group.clone(),
+            schema_epoch: 1,
+            routing_epoch: 1,
+            read_ts: ts(20),
+            write_root: digest(0),
+            write_count: 4,
+            page_count: 2,
+        };
+        let mut roots = vec![initial_root(txn, &plan).unwrap()];
+        for (index, page) in pages.iter().enumerate() {
+            roots.push(page_root(roots[index], index as u64, page).unwrap());
+        }
+        plan.write_root = roots[2];
+        for (index, page) in pages.iter().enumerate() {
+            let guard = lifecycle::VerifiedLifecycleGuard::model_for_test(
+                lifecycle::LifecycleBinding {
+                    guard_id: nabedra_rt::ids::uuid_v4(),
+                    catalog_group_id: s.f.catalog_group_id,
+                    table_id: s.f.table,
+                    lifecycle_version: None,
+                    schema_epoch: 1,
+                    txn,
+                    request,
+                    read_ts: ts(20),
+                    authority: s.f.authority,
+                },
+                lifecycle::GuardMode::Shared,
+            )
+            .into_sealed();
+            let reply = s
+                .f
+                .submit(ParticipantCommand::PreparePage {
+                    authority: s.f.authority,
+                    txn,
+                    request,
+                    manifest,
+                    plan: plan.clone(),
+                    page_index: index as u64,
+                    previous_root: roots[index],
+                    guards: Page::new(vec![guard]).unwrap(),
+                    writes: Page::new(page.clone()).unwrap(),
+                })
+                .await;
+            assert!(matches!(reply, ParticipantReply::PreparedPage { .. }), "{reply:?}");
+        }
+        let queued = QueuedPlan { txn, request, manifest, plan, root: roots[0] };
+        seal(&mut s, &queued).await;
+        let decision = if abort { abort_decision() } else { commit_at(30) };
+        for _ in 0..4 {
+            resolve(&mut s, &queued, decision, step).await;
+        }
+        if abort {
+            assert_eq!(s.count(STAGED).await, 0, "step {step}");
+            assert_eq!(s.count(VECTOR).await, 0);
+            for key in 1..=4 {
+                assert_eq!(s.get(key).await, Got::default());
+            }
+        } else {
+            assert_eq!(s.count(STAGED).await, 0);
+            for key in 1..=4 {
+                assert_eq!(s.get(key).await.vectors[&PLAIN], (30, vec![key as u8; 8]), "row {key} step {step}");
+            }
+        }
+    }
+}
+
+/// Backfill gives an existing row a source version and a record only when it has
+/// none of the vector, the record or the failure of this incarnation.
+#[tokio::test]
+async fn adv_vec_g07_backfill_touches_only_rows_that_wait_for_nothing() {
+    let mut s = S::new().await;
+    // Row 1 has a vector, row 2 a failure, row 3 a pending record, row 4 no text,
+    // row 5 nothing yet (it was written before the column existed).
+    let before_column = vec![column(PLAIN, VectorKind::Dense, 2)];
+    let mut s0 = S::plain(Some(&FaultFs::new())).await;
+    assert!(matches!(s0.fence(before_column).await, SearchReply::Fenced { .. }));
+    for key in 1..=5 {
+        let body = if key == 4 { serde_json::json!({"id": key, "body": null}) } else { row(key, "t") };
+        let write = s0.write(key, None, Some(body), Vec::new());
+        assert_eq!(s0.direct(10 + key as u64, write).await, applied(10 + key as u64));
+    }
+    assert_eq!(s0.count(EMBED).await, 0, "no embedded column yet");
+    assert!(matches!(s0.fence(columns()).await, SearchReply::Fenced { .. }));
+    for key in 1..=5 {
+        let head = s0.get(key).await;
+        let mut write = s0.write(key, head.version, head.value.map(|value| value), Vec::new());
+        write.search = Some(Box::new(RowSearch { vectors: Vec::new(), backfill: vec![EMBEDDED] }));
+        let reply = s0.direct(30 + key as u64, write).await;
+        assert_eq!(reply, applied(30 + key as u64), "row {key}");
+    }
+    let records = s0.f.machine().embed_records(None, 128).await.unwrap();
+    let keys: Vec<_> = records.iter().map(|item| item.key.clone()).collect();
+    assert_eq!(keys.len(), 4, "rows 1, 2, 3 and 5 have a text: {keys:?}");
+    assert!(records.iter().all(|item| item.record.source_version == item.record.id && item.record.attempts == 0));
+    assert_eq!(s0.get(4).await.source, BTreeMap::new());
+    // A second backfill of the same rows changes no record, and a vector or failure
+    // of this incarnation stops it.
+    assert_eq!(s0.embed(s0.set_vector(1, 31, 31, 40)).await, SearchReply::Set { commit_ts: ts(40) });
+    for attempt in 0..EMBED_ATTEMPTS {
+        s0.fail(2, 32, 32, attempt).await;
+    }
+    let before = s0.f.machine().embed_records(None, 128).await.unwrap();
+    for key in 1..=3 {
+        let head = s0.get(key).await;
+        let mut write = s0.write(key, head.version, head.value, Vec::new());
+        write.search = Some(Box::new(RowSearch { vectors: Vec::new(), backfill: vec![EMBEDDED] }));
+        s0.direct(50 + key as u64, write).await;
+    }
+    let after = s0.f.machine().embed_records(None, 128).await.unwrap();
+    assert_eq!(after, before.iter().filter(|item| item.key != s0.f.key(1)).cloned().collect::<Vec<_>>());
+    assert_eq!(s0.get(1).await.vectors[&EMBEDDED].0, 40);
+    let _ = &mut s;
+}
+
+/// A dropped embedded column leaves no record behind after the next write of its
+/// row, and nothing can be embedded for it any more.
+#[tokio::test]
+async fn adv_vec_g14_a_dropped_embedded_column_leaves_no_record_and_takes_no_report() {
+    let mut s = S::new().await;
+    let write = s.write(1, None, Some(row(1, "a")), vec![s.set(PLAIN, s.dense(1))]);
+    s.direct(10, write).await;
+    let write = s.write(2, None, Some(row(2, "b")), Vec::new());
+    s.direct(11, write).await;
+    assert_eq!(s.embed(s.set_vector(2, 11, 11, 12)).await, SearchReply::Set { commit_ts: ts(12) });
+    assert_eq!(s.count(EMBED).await, 1);
+    let narrower = vec![column(PLAIN, VectorKind::Dense, 2), column(SPARSE, VectorKind::Sparse, 0)];
+    assert!(matches!(s.fence(narrower).await, SearchReply::Fenced { .. }));
+    // Reports for the dropped column match nothing.
+    assert_eq!(s.embed(s.set_vector(1, 10, 10, 20)).await, SearchReply::Obsolete);
+    assert_eq!(s.fail(1, 10, 10, 0).await, SearchReply::Unmatched);
+    assert_eq!(s.f.submit(requeue(&s, 1, 10, 10)).await, ParticipantReply::Search(SearchReply::Unmatched));
+    // The next write of each row collects its record and does not carry the
+    // dropped column's vector or source version.
+    let head = s.get(1).await;
+    let write = s.write(1, head.version, Some(row(1, "a")), Vec::new());
+    assert_eq!(s.direct(30, write).await, applied(30));
+    let head = s.get(2).await;
+    let write = s.write(2, head.version, Some(row(2, "b")), Vec::new());
+    assert_eq!(s.direct(31, write).await, applied(31));
+    assert_eq!(s.count(EMBED).await, 0);
+    let got = s.get(2).await;
+    assert!(got.source.is_empty() && !got.vectors.contains_key(&EMBEDDED), "{got:?}");
+    assert_eq!(s.get(1).await.vectors[&PLAIN], (10, vec![1; 8]), "a kept column keeps its vector");
+    // The old version still has the dropped column's vector, until a collector says.
+    assert_eq!(s.at(2, 12).await.vectors[&EMBEDDED], (12, vec![12; 8]));
+    // The id never comes back, with the same definition or another.
+    for definition in [embedded(EMBEDDED), column(EMBEDDED, VectorKind::Dense, 2)] {
+        let columns = vec![column(PLAIN, VectorKind::Dense, 2), definition];
+        assert_eq!(s.fence(columns).await, refused(Fault::InvalidBinding));
+    }
 }
