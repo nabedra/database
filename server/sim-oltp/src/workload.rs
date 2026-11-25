@@ -188,6 +188,7 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     observer(0, format!("configuration {}", configuration["hash"]));
     let checks = Invariants::new();
     checks.set_trace(observer.clone());
+    checks.install_probes(&world, workload.name());
     let history = Arc::new(Mutex::new(History::default()));
     history.lock().unwrap().set_trace(observer.clone());
     let mut assertions = BTreeMap::new();
@@ -321,14 +322,20 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     );
     assertions.insert("liveness", !has_violation(&checks, "Liveness"));
     let history = std::mem::take(&mut *history.lock().unwrap());
+    let mut unclassified_conflicts = 0;
+    let mut not_judged = BTreeMap::new();
     if history.events().iter().any(|event| event.key.is_some()) {
         let verdict = history.check_direct();
+        unclassified_conflicts = verdict.unclassified_conflicts;
+        not_judged = verdict.not_judged.clone();
         assertions.insert(
             "linearizability and keyed dedup",
             verdict.anomalies.is_empty(),
         );
         checks.check_history(&world, &verdict);
     }
+    checks.check_outcomes(&world, history.events(), history.bodies());
+    assertions.insert("probe invariants", checks.probe_invariants_hold());
     let mut capture = trace.lock().unwrap();
     capture.flush_frames();
     let trace = &capture.trace;
@@ -350,6 +357,12 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         workload,
         scenarios,
         summary,
+        exercised: checks
+            .probes()
+            .map(|probes| probes.exercised())
+            .unwrap_or_default(),
+        unclassified_conflicts,
+        not_judged,
     }
 }
 
@@ -439,6 +452,7 @@ impl Scenario<'_> {
                 .cloned()
                 .unwrap_or_else(|| payload.clone()),
         };
+        let body = operation(id, name, payload);
         let attempt = self.history.invoke(
             client,
             &self.cluster.world,
@@ -451,6 +465,7 @@ impl Scenario<'_> {
                 value: input,
             },
         );
+        self.history.sends(&attempt, &body);
         let deadline = if table.is_none() {
             SETUP_DEADLINE
         } else {
@@ -461,7 +476,7 @@ impl Scenario<'_> {
             gateway,
             OPERATIONS,
             &self.cluster.config.data_token,
-            Some(operation(id, name, payload)),
+            Some(body),
             deadline,
         )
         .await

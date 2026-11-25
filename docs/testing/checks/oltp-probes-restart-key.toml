@@ -7,7 +7,6 @@ kinds = ["S"]
 # draws from SystemRandom, the same assertion must pass. A pass of this check is not a fix: it says
 # that the bug is still there and that this key is its whole cause on these seeds. Once the key is
 # seeded, the first half fails: close the record and run the assertion in oltp-probes instead.
-# The scratch tree gets workload-hook.patch, as in oltp-probes-planted.
 guarantees = []
 scenarios = []
 tiers = ["T1"]
@@ -19,10 +18,6 @@ scratch="$(mktemp -d "$PWD/target/probes-restart-key.XXXXXX")"
 trap 'git -C "$root" worktree remove --force "$scratch" >/dev/null 2>&1 || true' EXIT
 git -C "$root" worktree add --detach "$scratch" HEAD >/dev/null
 probes=server/sim-oltp/src/probes
-if ! grep -q install_probes "$scratch/server/sim-oltp/src/workload.rs"; then
-    echo "The workload does not install the probes: applying workload-hook.patch to the scratch tree"
-    git -C "$scratch" apply --verbose "$probes/workload-hook.patch"
-fi
 cd "$scratch/server"
 build() { cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib --no-run; }
 run() {
