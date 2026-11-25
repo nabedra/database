@@ -7,8 +7,20 @@
 //!
 //! The sources are unclean when `server/` or `specs/` has uncommitted or untracked files, or
 //! when HEAD has moved since the executable was built and `server/` differs between the two
-//! commits. Not found: changes that were there at the build and are gone now, and an
-//! executable whose modification time was changed.
+//! commits, or git does not know where HEAD was then.
+//!
+//! **Not found:**
+//!
+//! - changes that were there at the build and are gone now. `cargo test` rebuilds after
+//!   `git checkout` or `git stash`, but not when a file comes back with its old modification
+//!   time, as `cp -p` does, and an executable that is run directly is never rebuilt;
+//! - an executable whose own modification time was changed, or that was built in an earlier
+//!   checkout at the same path and is younger than this one's first reflog entry;
+//! - files that git is told to overlook (assume-unchanged, skip-worktree, a global ignore),
+//!   and changes outside `server/` and `specs/`.
+//!
+//! A checker cannot tell either: TLC accepts any SHA and any workload name. Evidence comes
+//! from a run whose record names its own fresh checkout.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -128,9 +140,15 @@ fn moved(dir: &Path, sha: &str, built: Option<u64>) -> Option<String> {
         return Some("the build time of the executable is unknown".into());
     };
     let then = format!("HEAD@{{{built}}}");
-    let Ok(then) = text(dir, &["rev-parse", "--verify", &then]) else {
-        return Some("git has no record of where HEAD was when the executable was built".into());
+    let unknown = "git has no record of where HEAD was when the executable was built";
+    let Ok(found) = run(dir, &["rev-parse", "--verify", &then]) else {
+        return Some(unknown.into());
     };
+    // For a time before its first entry git answers with that entry, and warns.
+    if !found.status.success() || !found.stderr.is_empty() {
+        return Some(unknown.into());
+    }
+    let then = String::from_utf8_lossy(&found.stdout).trim_end().to_owned();
     let same = then == sha
         || run(dir, &["diff", "--quiet", &then, sha, "--", ":/server"])
             .is_ok_and(|out| out.status.success());

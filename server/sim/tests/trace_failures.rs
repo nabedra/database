@@ -113,6 +113,19 @@ impl Stepped for Faulty {
     fn run(self) {}
 }
 
+/// One that unwinds without running the panic hook.
+struct Resumes(Condvar);
+
+impl Stepped for Resumes {
+    fn step(&mut self) -> Step {
+        std::panic::resume_unwind(Box::new("planted"));
+    }
+    fn doorbell(&self) -> &Condvar {
+        &self.0
+    }
+    fn run(self) {}
+}
+
 #[track_caller]
 fn refuses_panic(label: &str, dir: &Scratch, result: io::Result<PathBuf>) {
     assert!(dir.traces().is_empty(), "{label}: {:?}", dir.traces());
@@ -126,7 +139,7 @@ fn refuses_panic(label: &str, dir: &Scratch, result: io::Result<PathBuf>) {
 fn a_panic_anywhere_in_the_run_leaves_no_trace() {
     let _apart = APART.write().unwrap_or_else(PoisonError::into_inner);
     type Planted = fn(Arc<World>);
-    let planted: [(&str, Planted); 9] = [
+    let planted: [(&str, Planted); 11] = [
         ("node task", |world| {
             world.spawn_node(1, async { panic!("planted") });
         }),
@@ -162,6 +175,19 @@ fn a_panic_anywhere_in_the_run_leaves_no_trace() {
                 let faulty = Faulty(Condvar::new());
                 drop(nabedra_rt::task::spawn_stepped("faulty", 1 << 20, faulty).unwrap());
             });
+        }),
+        ("stepped service that resumes an unwinding", |world| {
+            world.spawn_node(1, async {
+                let faulty = Resumes(Condvar::new());
+                drop(nabedra_rt::task::spawn_stepped("faulty", 1 << 20, faulty).unwrap());
+            });
+        }),
+        ("property", |_| {
+            let caught = nabedra_check::prop::run(
+                &|_| panic!("planted"),
+                &mut nabedra_check::Gen::from_tape(Vec::new()),
+            );
+            assert!(caught.is_err());
         }),
         ("caught", |_| {
             let caught = std::panic::catch_unwind(|| panic!("planted"));
@@ -275,6 +301,26 @@ fn a_replaced_panic_hook_refuses_the_trace() {
     assert!(dir.traces().is_empty());
 }
 
+/// The hook stands in front of the one it found, and passes panics on to it.
+#[test]
+fn the_panic_hook_passes_panics_on() {
+    let dir = Scratch::new("passes-on");
+    let said = child("hook-before", &dir.0, &[]);
+    assert!(said.contains("seen by the earlier hook: planted"), "{said}");
+    assert!(said.contains("panicked at"), "{said}");
+    assert!(dir.traces().is_empty());
+}
+
+/// A run never writes into a file that is already there, whoever made it.
+#[test]
+fn a_partial_file_that_exists_is_not_taken_over() {
+    let dir = Scratch::new("taken");
+    let said = child("taken-partial", &dir.0, &[]);
+    assert!(said.contains("installed: Err"), "{said}");
+    assert!(said.contains("left: \"of somebody else\""), "{said}");
+    assert!(dir.traces().is_empty());
+}
+
 /// Every thread opens its first trace, and so installs the hook, at the same time.
 #[test]
 fn many_threads_may_open_their_first_trace_at_once() {
@@ -371,12 +417,15 @@ fn storage_pauses_and_clock_freezes_are_logged() {
     let dir = Scratch::new("suspend");
     let path = traced(&dir.0, |world| async move {
         world.mount(1, "/data");
+        world.pause_storage(1, StoragePause::before(FsOp::Write).hold(ms(5)));
         world.pause_storage(1, StoragePause::after(FsOp::SyncData).hold(ms(5)));
         let job = world.spawn_node(1, async {
             nabedra_rt::task::spawn_blocking(|| {
                 let disk = nabedra_rt::fs::real();
                 let file = disk.open(Path::new("/data/log"), OpenMode::CreateNew);
-                file.unwrap().sync_data().unwrap();
+                let file = file.unwrap();
+                file.write_all_at(b"x", 0).unwrap();
+                file.sync_data().unwrap();
             })
             .await
             .unwrap();
@@ -399,6 +448,8 @@ fn storage_pauses_and_clock_freezes_are_logged() {
     assert_eq!(
         faults,
         [
+            r#""action":"StoragePaused","vars":{},"msg":{"op":"Write","path":"/data/log","side":"before"}}"#,
+            r#""action":"StorageResumed","vars":{}}"#,
             r#""action":"StoragePaused","vars":{},"msg":{"op":"SyncData","path":"/data/log","side":"after"}}"#,
             r#""action":"StorageResumed","vars":{}}"#,
             r#""action":"ClockFrozen","vars":{}}"#,
@@ -511,6 +562,28 @@ fn child_process() {
             });
             println!("finished: {result:?}");
         }
+        "hook-before" => {
+            std::panic::set_hook(Box::new(|info| {
+                println!(
+                    "seen by the earlier hook: {}",
+                    info.payload_as_str().unwrap_or("?")
+                );
+            }));
+            let result = traced(&dir, |_| async {
+                nabedra_rt::task::spawn(async { panic!("planted") });
+                settle().await;
+            });
+            println!("finished: {result:?}");
+        }
+        "taken-partial" => runtime::run(1, |world| {
+            // The name of this process's first partial file.
+            let name = format!("Spec-1.ndjson.{}-0.partial", std::process::id());
+            fs::write(dir.join(&name), "of somebody else").unwrap();
+            let installed = builder().install_in(&world, &dir);
+            println!("installed: {:?}", installed.map(|_| "opened"));
+            println!("left: {:?}", fs::read_to_string(dir.join(&name)).unwrap());
+            std::future::ready(())
+        }),
         "restored-hook" => {
             let result = traced(&dir, |_| async {
                 std::panic::set_hook(Box::new(|_| {}));

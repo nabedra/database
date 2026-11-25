@@ -11,13 +11,20 @@
 //!   marks only the traces it opened.
 //!
 //! A marked trace is not published, and one already published loses its name. A panic that
-//! the code caught counts too. `resume_unwind` alone runs no hook; it passes on a panic
-//! that did, or the cancellation of a suspended job, which is not one.
+//! the code caught counts too, and so does one that a property swallows: the hook of
+//! [`nabedra_check::prop`] goes in first, so this one sees the panic before it.
 //!
 //! Code that replaces the hook would blind this, so `open` and `finish` test it with a panic
 //! of their own. `finish` refuses when that goes unseen, and an `open` that has to install
-//! the hook again marks the runs that were open without it. A hook that other code replaces
-//! and puts back in between goes unnoticed.
+//! the hook again marks the runs that were open without it.
+//!
+//! **Not seen**, so the trace is published:
+//!
+//! - a panic while other code has replaced the hook, if it puts it back before `finish`;
+//! - an unwinding that starts with `resume_unwind`, which runs no hook, in a task, a
+//!   blocking job or a service thread. Only a stepped service reports it. Elsewhere
+//!   `resume_unwind` passes on a panic that the hook saw, or cancels a suspended job, which
+//!   is no panic.
 
 use std::cell::Cell;
 use std::fs::{self, File};
@@ -27,6 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, ThreadId};
 
+use nabedra_check::Gen;
 use nabedra_rt::sim::World;
 
 use super::{lock, with_suffix};
@@ -94,6 +102,8 @@ fn watch() -> Result<(), String> {
     if INSTALLED.swap(true, Ordering::Relaxed) && probe() {
         return Ok(());
     }
+    // Installs the property hook, once per process, so that it never lands in front of ours.
+    let _ = nabedra_check::prop::run(&|_| Ok(()), &mut Gen::from_tape(Vec::new()));
     let before = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         if !note(info) {
