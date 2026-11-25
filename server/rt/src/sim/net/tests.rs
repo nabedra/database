@@ -964,6 +964,32 @@ fn an_unaccepted_connection_frees_its_port_when_the_client_closes() {
     });
 }
 
+/// Closing the listener ends the server's side of what it has not accepted, so a connection
+/// whose client closed first has no handle left and is forgotten.
+#[test]
+fn a_closed_listener_forgets_what_its_clients_closed() {
+    run(54, |world| async move {
+        nodes(&world, &[1, 2]);
+        let listener = world.listen(2, any(80)).unwrap();
+        let addr = listener.local_addr();
+        let kept = plain(addr).await;
+        drop(plain(addr).await);
+        assert_eq!(connections(&world), 2);
+        drop(listener);
+        assert_eq!(connections(&world), 1);
+        drop(kept);
+        assert_eq!(connections(&world), 0);
+
+        // The same when the node crashes.
+        let _listener = world.listen(2, any(80)).unwrap();
+        drop(plain(addr).await);
+        assert_eq!(connections(&world), 1);
+        world.crash(2);
+        assert_eq!(connections(&world), 0);
+        assert_held(&world, &mut Default::default());
+    });
+}
+
 /// A frozen node accepts nothing. Its peers redial and give up, for much longer than there
 /// are ports.
 #[test]

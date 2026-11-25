@@ -385,6 +385,11 @@ struct Connection {
     /// What each end holds of its address. A reset or cut connection holds nothing, and a
     /// client that closed before it was accepted holds nothing either: the peer's kernel
     /// acknowledges the FIN, even for a stopped process, and the port is used again.
+    ///
+    /// Simplified: the client's port is free at the close even when that FIN cannot arrive
+    /// yet, because its link is held, or never will, because a dropped message stalled its
+    /// direction. A real kernel keeps the port until it gives up. An explicit bind to a port
+    /// freed this way succeeds at once, also before the counter wraps.
     holds: [Option<Hold>; 2],
     /// Whether the listener has accepted it.
     accepted: bool,
