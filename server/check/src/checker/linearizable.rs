@@ -49,7 +49,7 @@ use super::direct::results::{self, Definite};
 use super::{Anomaly, Verdict, canon};
 use crate::history::{Event, Op, Outcome, pair, payload};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Upper bound on memoized configurations per independent key group. Large states can have
 /// a lower limit so a search reports `check-limit` before it exhausts memory.
@@ -106,6 +106,8 @@ impl RegOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
     Effect,
+    /// Occupies the dedup slot where [`Role::Effect`] could, and changes no row.
+    Hold,
     Fresh,
     Conflict,
     Invalid,
@@ -157,15 +159,18 @@ impl KeyOp {
                 };
                 return allowed.then(|| state.to_vec());
             }
-            Role::Effect | Role::Fresh if held != 0 => return None,
+            Role::Effect | Role::Hold | Role::Fresh if held != 0 => return None,
             _ => {}
         }
 
         let mut next = state.to_vec();
         for &(key, op) in &self.rows {
-            next[key] = op.step(state[key])?;
+            let stepped = op.step(state[key])?;
+            if self.role != Role::Hold {
+                next[key] = stepped;
+            }
         }
-        if self.role == Role::Effect
+        if matches!(self.role, Role::Effect | Role::Hold)
             && let Some(r) = self.record
         {
             next[r.slot] = r.body;
@@ -614,6 +619,7 @@ fn build(
     }
     let mut out: Vec<KeyOp> = Vec::with_capacity(pres.len());
     let mut groups = HashMap::new();
+    let mut holds = BTreeMap::new();
     let mut slots = HashMap::new();
     let mut bodies = HashMap::new();
     let mut to_reg = |shape: &Shape| match shape {
@@ -659,6 +665,18 @@ fn build(
         // Attempts with an unknown outcome have the role of an effect, and share the result of
         // their request if it has none.
         let result = without_effect.and_then(|results| results.get(&pre.src));
+        if op.role == Role::Effect
+            && result.is_some()
+            && let Some(record) = record
+        {
+            // The earliest unknown attempt may still hold the identity.
+            holds
+                .entry((record.slot, record.body))
+                .or_insert_with(|| KeyOp {
+                    role: Role::Hold,
+                    ..op.clone()
+                });
+        }
         let merges = pre.role == Role::Effect
             || result.is_some() && results::definite_result(src) == result.copied();
         if merges && let Some(record) = record {
@@ -678,28 +696,16 @@ fn build(
         }
         out.push(op);
     }
-    // An unknown attempt of a request without effect may still hold the identity against another
-    // body, so that a refusal of that body is explained. It changes no row.
-    for g in groups.into_values().collect::<BTreeSet<usize>>() {
-        let Some(record) = out[g].record.filter(|_| out[g].role != Role::Effect) else {
-            continue;
-        };
-        let attempts = || std::iter::once(out[g].src).chain(out[g].more.iter().copied());
-        let unknown = attempts()
-            .filter(|&i| ops[i].outcome == Outcome::Info)
-            .min_by_key(|&i| ops[i].call);
-        if let Some(src) = unknown {
-            out.push(KeyOp {
-                rows: vec![],
-                record: Some(record),
-                role: Role::Effect,
-                call: ops[src].call,
-                ret: None,
-                src,
-                more: vec![],
-            });
-        }
-    }
+    // A hold only serves to explain the refusal of another body, as before decision 11.
+    let refused: Vec<Record> = out
+        .iter()
+        .filter(|op| op.role == Role::Conflict)
+        .filter_map(|op| op.record)
+        .collect();
+    out.extend(holds.into_iter().filter_map(|((slot, body), hold)| {
+        let explains = |r: &Record| r.slot == slot && r.body != body;
+        refused.iter().any(explains).then_some(hold)
+    }));
     (out, keys.len() + slots.len())
 }
 
@@ -759,7 +765,7 @@ fn search(ops: &[KeyOp], width: usize, cutoff: Option<usize>, max_configs: usize
     // Definite operations that would hide a particular value if they followed its source.
     let mut on_key = HashMap::<usize, Vec<(usize, u32, usize)>>::new();
     for (i, op) in ops.iter().enumerate() {
-        if op.role == Role::Invalid || !in_prefix(op.call) {
+        if matches!(op.role, Role::Invalid | Role::Hold) || !in_prefix(op.call) {
             continue;
         }
         let ret = op.ret.filter(|&r| in_prefix(r));

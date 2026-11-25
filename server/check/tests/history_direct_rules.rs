@@ -974,14 +974,16 @@ fn the_verdict_is_as_before_where_the_decision_is_silent() {
     );
     // With an unknown attempt of the first body the refusal was accepted, and still is. The attempt
     // holds the identity from then on and has no effect.
-    let held = "0> update k 2 r
+    let held = "0> delete k null r
          0< info
+         0> delete k null r
+         0< ok false
+         1> insert k 1 other
+         1< ok
          2> upsert k 9 r
          2< reused
-         0> update k 2 r
-         0< ok false
          1> get k
-         1< ok null";
+         1< ok 1";
     by_default(
         "another body is refused after an unknown attempt",
         held,
@@ -1002,11 +1004,19 @@ fn the_verdict_is_as_before_where_the_decision_is_silent() {
         "and the unknown attempt applies",
         &format!(
             "{held}
-             1> insert k 1 other
-             1< ok
              1> get k
-             1< ok 2"
+             1< ok null"
         ),
+        &["non-linearizable"],
+    );
+    by_default(
+        "the row that it needs was never there",
+        "0> delete k null r
+         0< info
+         2> upsert k 9 r
+         2< reused
+         0> delete k null r
+         0< ok false",
         &["non-linearizable"],
     );
     by_default(
