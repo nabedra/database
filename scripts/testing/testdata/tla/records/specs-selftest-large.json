@@ -1,0 +1,71 @@
+{
+  "artifacts": [
+    {
+      "name": "land-tooling-b737a83-154404--specs-selftest-large.log",
+      "sha256": "21475de146bfdbcde7ec175741389fba44a3dd1cdbc1a6b8a04f3d330e09c3a1"
+    },
+    {
+      "name": "tla/TwoPhase.large.log",
+      "sha256": "8e6a77fbe2e2469e4a71cd30d24d600bd038a494ebfd072a68b5e42668815cd4"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "67589ca4ae1b6f3571048fe653d4b581a0dec78d21374fe23a0bd876d63d4478"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "specs-selftest-large",
+  "duration_s": 24.18,
+  "guarantees": [],
+  "kind": "T",
+  "mode": {
+    "tla": "simulation"
+  },
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-24T14:45:14.578296+00:00",
+    "request_id": "land-tooling-b737a83-154404",
+    "runner": "GitHub Actions 1000011464",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45417380925"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "b737a83973b299994d371cdceff24eef4430d0c8",
+  "sim_core_hours": null,
+  "tla": {
+    "behaviors": 20000,
+    "budget_s": 900,
+    "depth": null,
+    "distinct_states": null,
+    "mode": "simulation",
+    "runs": [
+      {
+        "cfg": "TwoPhase.large.cfg",
+        "depth": null,
+        "detail": "",
+        "distinct_states": null,
+        "duration_s": 24.0,
+        "states_left": null,
+        "verdict": "pass"
+      }
+    ],
+    "seed": 1,
+    "spec": "specs/selftest/TwoPhase",
+    "states_generated": 4931913,
+    "tier": "T2",
+    "tools": "tlc 1.8.0; community-modules 202611060952"
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}

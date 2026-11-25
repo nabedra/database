@@ -161,6 +161,14 @@ impl RangeClock {
         if let Some(world) = nabedra_rt::sim::world() {
             world.track_registry("RangeClock", &clock);
         }
+        #[cfg(feature = "sim")]
+        nabedra_oltp_types::sim_probe::track_ledgers(&clock, |clock: &Self| {
+            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::LedgerSnapshot {
+                ledger: nabedra_oltp_types::sim_probe::Ledger::RangeClockPending,
+                group: Some(clock._store.identity().group_id),
+                outstanding: clock.lock().pending.len() as u64,
+            });
+        });
         registry.insert(key, Arc::downgrade(&clock));
         clock
     }
@@ -169,6 +177,12 @@ impl RangeClock {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The range's group (simulation only).
+    #[cfg(feature = "sim")]
+    pub fn group(&self) -> uuid::Uuid {
+        self._store.identity().group_id
     }
 
     /// The highest snapshot timestamp served on this range, if any.
@@ -244,6 +258,12 @@ impl RangeClock {
             *state.pending_keys.entry(key.clone()).or_default() += 1;
         }
         state.pending.insert(commit_ts, keys);
+        #[cfg(feature = "sim")]
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::DirectProposed {
+            group: self._store.identity().group_id,
+            commit_ts: commit_ts.get(),
+            term: token.term,
+        });
         Ok(())
     }
 

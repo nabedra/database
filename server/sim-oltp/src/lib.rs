@@ -8,7 +8,9 @@ pub mod history;
 pub mod invariants;
 pub mod net;
 mod node;
+pub mod probes;
 pub mod sweep;
+pub mod trace;
 mod workload;
 
 #[cfg(test)]

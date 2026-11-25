@@ -675,6 +675,49 @@ impl<C: TypedConfig> TypedLogStore<C> {
         ))
     }
 }
+#[cfg(feature = "sim")]
+impl<C: TypedConfig> TypedLogStore<C> {
+    /// Reports the log entries on the volume when a core starts. The scan is extra IO that
+    /// only a simulation with a probe sink does, and its failure changes nothing.
+    async fn probe_recovered(&self, purged: Option<LogId>) {
+        use nabedra_oltp_types::sim_probe::{Probe, active, emit};
+        if !active() {
+            return;
+        }
+        let mut found: Vec<LogId> = Vec::new();
+        let mut start = 0u64;
+        loop {
+            let page = self
+                .store
+                .log_read_metadata(META, move |read| {
+                    let mut ids: Vec<LogId> = Vec::new();
+                    let after = start.checked_sub(1).map(|index| index_key(ID, index));
+                    read.scan_page(&[ID], after.as_ref().map(|key| &key[..]), 64, |_, value| {
+                        ids.push(serde_json::from_slice(value).map_err(|_| protocol("corrupt Raft entry ID"))?);
+                        Ok(())
+                    })?;
+                    read.encode(&ids)
+                })
+                .await;
+            let ids: Vec<LogId> = match page.map(|bytes| serde_json::from_slice(bytes.as_slice())) {
+                Ok(Ok(ids)) => ids,
+                _ => return,
+            };
+            match ids.last().and_then(|id| id.index.checked_add(1)) {
+                Some(next) => start = next,
+                None => break,
+            }
+            found.extend(ids);
+        }
+        emit(|| Probe::Recovered {
+            group: self.store.identity().group_id,
+            kind: self.store.identity().kind.clone(),
+            replica: self.node_id,
+            purged: purged.map(super::hosted::position),
+            entries: found.into_iter().map(super::hosted::position).collect(),
+        });
+    }
+}
 impl<C: TypedConfig> RaftLogReader<C> for TypedLogStore<C> {
     async fn try_get_log_entries<R: RangeBounds<u64> + Clone + Debug + Send>(
         &mut self,
@@ -785,6 +828,8 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             .map_err(disk)?;
         let (last_purged_log_id, last_log_id) =
             serde_json::from_slice(bytes.as_slice()).map_err(|_| invalid("corrupt log state"))?;
+        #[cfg(feature = "sim")]
+        self.probe_recovered(last_purged_log_id).await;
         Ok(LogState {
             last_purged_log_id,
             last_log_id,
@@ -826,6 +871,15 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             })
             .await
             .map_err(disk)?;
+        #[cfg(feature = "sim")]
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::VoteSaved {
+            group: self.store.identity().group_id,
+            kind: self.store.identity().kind.clone(),
+            replica: self.node_id,
+            term: vote.leader_id.term,
+            leader: vote.leader_id.node_id,
+            committed: vote.committed,
+        });
         Ok(())
     }
     /// Unsynced: OpenRaft treats the commit marker as a recovery hint and
@@ -959,6 +1013,8 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         // or discard its completion callback. The host joins pending operations
         // before releasing replica residency and stopping its runtime.
         let pending = self.pending.start();
+        #[cfg(feature = "sim")]
+        let replica = self.node_id;
         #[cfg(test)]
         let append_hook = self.append_hook.lock().expect("append test hook").take();
         #[cfg(test)]
@@ -1183,6 +1239,25 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             if let Err(error) = &result {
                 tracing::error!(target: "nabedra_database_server::oltp_replication::typed_log", group=%store.identity().group_id,kind=?store.identity().kind,io_kind=?error.kind(),error=%error,"typed durable log append failed before IOFlushed");
             }
+            #[cfg(feature = "sim")]
+            if result.is_ok() {
+                nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::Appended {
+                    group: store.identity().group_id,
+                    kind: kind.clone(),
+                    replica,
+                    entries: jobs
+                        .iter()
+                        .flat_map(|job| job.batch.iter())
+                        .map(|entry| nabedra_oltp_types::sim_probe::LogEntry {
+                            at: super::hosted::position(entry.log_id),
+                            voters: match entry.payload() {
+                                Payload::Membership(membership) => Some(membership.get_joint_config().iter().map(|config| config.iter().copied().collect()).collect()),
+                                _ => None,
+                            },
+                        })
+                        .collect(),
+                });
+            }
             // Durable and visible in the store, or failed: leave the overlay
             // before reporting, so a flushed entry is always read back stored.
             // Callbacks fire in log order.
@@ -1250,6 +1325,13 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             })
             .await
             .map_err(disk)?;
+        #[cfg(feature = "sim")]
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::Truncated {
+            group: self.store.identity().group_id,
+            kind: self.store.identity().kind.clone(),
+            replica: self.node_id,
+            after: last.map(super::hosted::position),
+        });
         Ok(())
     }
     async fn purge(&mut self, id: LogId) -> io::Result<()> {
@@ -1297,6 +1379,13 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             })
             .await
             .map_err(disk)?;
+        #[cfg(feature = "sim")]
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::Purged {
+            group: self.store.identity().group_id,
+            kind: self.store.identity().kind.clone(),
+            replica: self.node_id,
+            upto: super::hosted::position(id),
+        });
         Ok(())
     }
 }
