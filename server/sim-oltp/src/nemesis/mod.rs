@@ -343,6 +343,20 @@ pub(crate) enum FollowUp {
     ClearDisk(u64, FaultId),
 }
 
+impl FollowUp {
+    fn fault(&self) -> FaultId {
+        match self {
+            FollowUp::Thaw(id)
+            | FollowUp::HealLinks(id)
+            | FollowUp::RestartWorker(_, _, id)
+            | FollowUp::RestartGateway(_, id)
+            | FollowUp::RestoreCertificate(_, id)
+            | FollowUp::ClearNet(id)
+            | FollowUp::ClearDisk(_, id) => *id,
+        }
+    }
+}
+
 /// One scheduled nemesis step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Step {

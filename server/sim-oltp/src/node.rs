@@ -743,32 +743,35 @@ impl Cluster {
         true
     }
 
-    /// Stop a process gracefully through its own stop path, with work in flight.
-    pub async fn drain(&mut self, node: u64) -> Result<(), String> {
+    /// Tell a process to stop gracefully through its own stop path, with work in flight.
+    pub async fn start_drain(&mut self, node: u64) -> Result<(), String> {
         self.record(format!("drain n{node}"));
         let process = self
             .processes
             .get_mut(&node)
             .ok_or_else(|| format!("n{node} is not running"))?;
-        let stop = std::mem::replace(&mut process.stop, Stop::Signalled);
-        match stop {
-            Stop::Worker(stop) => stop
-                .send(())
-                .map_err(|()| format!("n{node} stopped early"))?,
+        match std::mem::replace(&mut process.stop, Stop::Signalled) {
+            Stop::Worker(stop) => stop.send(()).map_err(|()| format!("n{node} stopped early")),
             Stop::Gateway(mut channel) => {
-                supervisor_send(&mut channel, &json!({"version":1, "type":"stop"})).await?;
+                supervisor_send(&mut channel, &json!({"version":1, "type":"stop"})).await
             }
-            Stop::Signalled => {}
+            Stop::Signalled => Ok(()),
         }
-        match time::timeout(RECOVERY_LIMIT, &mut process.task).await {
-            Ok(result) => {
-                self.processes.remove(&node);
-                result
-                    .map_err(|err| err.to_string())?
-                    .map_err(str::to_owned)
-            }
-            Err(_) => Err(format!("n{node} drain deadline")),
+    }
+
+    /// How a drained process ended, once it did.
+    pub async fn drained(&mut self, node: u64) -> Option<Result<(), String>> {
+        let process = self.processes.get_mut(&node)?;
+        if !process.task.is_finished() {
+            return None;
         }
+        let result = (&mut process.task).await;
+        self.processes.remove(&node);
+        Some(
+            result
+                .map_err(|err| err.to_string())
+                .and_then(|result| result.map_err(str::to_owned)),
+        )
     }
 
     pub fn freeze(&mut self, node: u64) {

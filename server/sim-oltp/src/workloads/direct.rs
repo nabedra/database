@@ -106,6 +106,15 @@ pub(crate) async fn run(
         time::sleep(TICK).await;
     }
     progress(cluster, &ctx, start);
+    // The table served requests, so its range has a leader. A harness that can't see it aims its
+    // faults blindly.
+    if cluster.elections().is_empty() {
+        cluster.checks.violate(
+            &cluster.world,
+            "LeaderUnknown",
+            "no election of the table's range was seen on the wire",
+        );
+    }
 
     let mut report = Report::default();
     if let Some(stop) = staggered {
@@ -509,6 +518,7 @@ fn summary(
         "aimed_and_hit_leader": chaos.map(Chaos::aimed),
         "effects_met_by_a_mutation": met,
         "skipped": chaos.map(|chaos| chaos.skipped.iter().map(|(a, n)| (a.name(), *n)).collect::<std::collections::BTreeMap<_, _>>()),
+        "windows_overran_and_max_ms": chaos.map(Chaos::overran),
         "session_resets": chaos.map(Chaos::resets),
         "split": chaos.map(Chaos::split_summary),
         "move": moving.map(moves::Move::summary),

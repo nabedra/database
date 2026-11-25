@@ -116,6 +116,8 @@ pub(crate) struct Fault {
     pub nodes: Vec<u64>,
     pub from: u64,
     pub to: Option<u64>,
+    /// When it was planned to end.
+    pub until: Option<u64>,
     /// The cluster was converged and nothing else was open when it started.
     pub quiet: bool,
     /// When the fault took effect: a process stopped, a session was reset, an EIO was returned,
@@ -461,6 +463,7 @@ mod tests {
             nodes: vec![node],
             from,
             to: Some(to),
+            until: None,
             quiet: true,
             effects: vec![Effect::at(from)],
             leader: Some(true),

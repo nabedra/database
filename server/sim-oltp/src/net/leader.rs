@@ -13,8 +13,9 @@ const GROUP: usize = PROLOGUE + 24;
 const PURPOSE: usize = PROLOGUE + 72;
 /// `Purpose::Raft` and `Purpose::RaftProgress`.
 const RAFT: [u8; 2] = [1, 17];
-/// The Raft header follows the prologue and the section lengths.
-const HEADER: usize = PROLOGUE + 173 + 24;
+/// The length of the Raft header ends the prologue, and the header follows it.
+const LENGTH: usize = PROLOGUE + 169;
+const HEADER: usize = PROLOGUE + 173;
 
 /// A leader that a quorum elected, first seen on the wire at `at` (virtual ms).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,8 +73,9 @@ fn append(message: &[u8]) -> Option<(Uuid, u64)> {
         return None;
     }
     let group = Uuid::from_slice(message.get(GROUP..GROUP + 16)?).ok()?;
-    let mut values = serde_json::Deserializer::from_slice(message.get(HEADER..)?).into_iter();
-    let header: Value = values.next()?.ok()?;
+    let length = message.get(LENGTH..HEADER)?.try_into().ok()?;
+    let length = u32::from_be_bytes(length) as usize;
+    let header: Value = serde_json::from_slice(message.get(HEADER..HEADER + length)?).ok()?;
     if header["method"] != "append" || header["vote"]["committed"] != true {
         return None;
     }
@@ -88,8 +90,10 @@ mod tests {
         let mut out = vec![0; HEADER];
         out[GROUP..GROUP + 16].copy_from_slice(group.as_bytes());
         out[PURPOSE] = purpose;
-        out.extend(serde_json::to_vec(header).unwrap());
-        out.extend(b"binary sections follow");
+        let header = serde_json::to_vec(header).unwrap();
+        out[LENGTH..HEADER].copy_from_slice(&(header.len() as u32).to_be_bytes());
+        out.extend(header);
+        out.extend(b"section lengths and sections follow");
         out
     }
 

@@ -23,7 +23,7 @@ use super::{Action, FaultId, FollowUp, NetFaults, Rule, Step, WindowId, window};
 use crate::{
     bootstrap::{GATEWAYS, ROOT, WORKERS, initial_range},
     disk::DiskCut,
-    invariants::{STEP, elapsed_ms},
+    invariants::{RECOVERY_LIMIT, STEP, elapsed_ms},
     node::Cluster,
     operator::Split,
     workloads::{
@@ -39,6 +39,13 @@ const SPLIT_LIMIT: Duration = Duration::from_secs(60);
 /// Follow-ups that cannot run yet are tried again after this pause.
 const DEFER_MS: u64 = 500;
 const RESTART_TRIES: u32 = 4;
+
+/// A graceful stop that has not ended.
+struct Drain {
+    id: FaultId,
+    deadline: u64,
+    restart_after: Duration,
+}
 
 /// When a sync of a worker's volume failed, as the filesystem reported it.
 #[derive(Clone, Default)]
@@ -104,6 +111,7 @@ pub(crate) struct Chaos {
     certificates: BTreeSet<u64>,
     /// Workers with an armed disk error.
     disks: BTreeMap<u64, FaultId>,
+    drains: BTreeMap<u64, Drain>,
     syncs: SyncFailures,
     watcher: JoinHandle<()>,
     beyond_tcp: bool,
@@ -143,6 +151,7 @@ impl Chaos {
             restart_failures: BTreeMap::new(),
             certificates: BTreeSet::new(),
             disks: BTreeMap::new(),
+            drains: BTreeMap::new(),
             syncs,
             watcher,
             beyond_tcp: false,
@@ -161,6 +170,24 @@ impl Chaos {
             *counts.entry(fault.action.name()).or_default() += 1;
         }
         counts
+    }
+
+    /// Windows that a blocked loop held for longer than planned: how many, and the longest
+    /// excess in ms. Process faults end when the process is ready again, so they have none.
+    pub(crate) fn overran(&self) -> [u64; 2] {
+        let windows = self.log.iter().filter(|fault| {
+            !matches!(
+                fault.action,
+                Action::CrashLeader
+                    | Action::PowerLeader
+                    | Action::DrainLeader
+                    | Action::DiskError
+                    | Action::KillGateway
+            )
+        });
+        let late = windows.filter_map(|fault| fault.to?.checked_sub(fault.until?));
+        let late: Vec<u64> = late.filter(|late| *late > DEFER_MS).collect();
+        [late.len() as u64, late.into_iter().max().unwrap_or(0)]
     }
 
     /// The faults aimed at the Data leader: how many happened, and how many hit it.
@@ -185,7 +212,41 @@ impl Chaos {
                 Step::Follow(follow) => self.follow(cluster, ctx, follow, false).await,
             }
         }
+        self.drained(cluster, ctx).await;
         self.observe(cluster, ctx);
+    }
+
+    /// End the graceful stops that are over. The loop does not wait for one, because no other
+    /// fault could end meanwhile: move seed 128's 4 s partition lasted the 30 s of a drain.
+    async fn drained(&mut self, cluster: &mut Cluster, ctx: &Ctx) {
+        for node in self.drains.keys().copied().collect::<Vec<_>>() {
+            let drained = match cluster.drained(node).await {
+                Some(result) => result,
+                None if elapsed_ms(&cluster.world) >= self.drains[&node].deadline => {
+                    Err(format!("n{node} drain deadline"))
+                }
+                None => continue,
+            };
+            let Drain {
+                id, restart_after, ..
+            } = self.drains.remove(&node).expect("pending drain");
+            self.cut(cluster, node, DiskCut::Kill).await;
+            if let Err(error) = &drained {
+                cluster.checks.violate(
+                    &cluster.world,
+                    "ProcessExit",
+                    format!("drain of n{node}: {error}"),
+                );
+            }
+            self.note(
+                cluster,
+                ctx,
+                "drained",
+                json!({"worker": node, "drained": drained.err()}),
+            );
+            let follow = FollowUp::RestartWorker(node, false, id);
+            self.later(cluster, restart_after, follow);
+        }
     }
 
     /// Note what open faults did, and end the ones that ended by themselves.
@@ -228,6 +289,7 @@ impl Chaos {
             nodes: nodes.to_vec(),
             from: elapsed_ms(&cluster.world),
             to: None,
+            until: None,
             quiet: false,
             effects: Vec::new(),
             leader: None,
@@ -378,6 +440,7 @@ impl Chaos {
 
     fn later(&mut self, cluster: &Cluster, after: Duration, follow: FollowUp) {
         let at = elapsed_ms(&cluster.world) + u64::try_from(after.as_millis()).unwrap_or(u64::MAX);
+        self.log[follow.fault()].until = Some(at);
         self.scheduler.after(at, Step::Follow(follow));
     }
 
@@ -404,7 +467,7 @@ impl Chaos {
         );
         // The same-run restart needs two live voters, and an armed disk stops its worker.
         let down = WORKERS.into_iter().any(|node| !cluster.is_running(node));
-        if process && (down || !self.disks.is_empty()) {
+        if process && (down || !self.disks.is_empty() || !self.drains.is_empty()) {
             return self.skip(cluster, action, "a worker is already down");
         }
         // A cold start blocks this loop, so no open window could end while it runs.
@@ -668,19 +731,27 @@ impl Chaos {
                 };
                 let id = self.hit(cluster, action, &[leader]);
                 self.log[id].leader = Some(cluster.elected() == Some(leader));
-                let drained = cluster.drain(leader).await;
-                self.cut(cluster, leader, DiskCut::Kill).await;
-                if let Err(error) = &drained {
+                let restart_after = window(g, 300, 3_000);
+                if let Err(error) = cluster.start_drain(leader).await {
                     cluster.checks.violate(
                         &cluster.world,
                         "ProcessExit",
                         format!("drain of n{leader}: {error}"),
                     );
                 }
-                let duration = window(g, 300, 3_000);
-                self.note(cluster, ctx, "drain-leader", json!({"worker": leader, "drained": drained.as_ref().map_err(String::as_str).err(), "restart_after_ms": duration.as_millis() as u64}));
-                let follow = FollowUp::RestartWorker(leader, false, id);
-                self.later(cluster, duration, follow);
+                let deadline = elapsed_ms(&cluster.world) + RECOVERY_LIMIT.as_millis() as u64;
+                let drain = Drain {
+                    id,
+                    deadline,
+                    restart_after,
+                };
+                self.drains.insert(leader, drain);
+                self.note(
+                    cluster,
+                    ctx,
+                    "drain-leader",
+                    json!({"worker": leader, "elected": cluster.elected(), "restart_after_ms": restart_after.as_millis() as u64}),
+                );
             }
             Action::LaneExhaust => {
                 let gateway = g.below(2) as usize;
@@ -912,6 +983,10 @@ impl Chaos {
     /// Stop the nemesis, apply every pending follow-up, undo every open fault and restart
     /// whatever is down. The cluster is healthy afterwards unless a violation says why not.
     pub(crate) async fn heal(&mut self, cluster: &mut Cluster, ctx: &Ctx) -> Result<(), String> {
+        while !self.drains.is_empty() {
+            self.drained(cluster, ctx).await;
+            time::sleep(STEP).await;
+        }
         let pending = self.scheduler.stop();
         cluster.record(format!("nemesis heal with {} follow-ups", pending.len()));
         ctx.history.lock().unwrap().marker(
