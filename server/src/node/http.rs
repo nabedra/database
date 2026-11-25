@@ -35,7 +35,9 @@ pub(crate) fn failure(code: ErrorCode) -> ProtocolError {
 pub(crate) fn unavailable() -> ProtocolError {
     failure(ErrorCode::StorageUnavailable)
 }
+#[track_caller]
 pub(crate) fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     failure(ErrorCode::ValidationError)
 }
 pub(crate) fn hex(bytes: &[u8]) -> String {

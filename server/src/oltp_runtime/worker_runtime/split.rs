@@ -570,7 +570,9 @@ fn split_plan_error(error: PlanError) -> ProtocolError {
         PlanError::Blocked(_) | PlanError::LifecyclePending(_) => unavailable(),
     }
 }
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "invalid manual shard split request",

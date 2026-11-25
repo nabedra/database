@@ -122,7 +122,9 @@ fn valid_in_state(
     decision.valid_receipt()
 }
 
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "invalid Timestamp point decision binding",

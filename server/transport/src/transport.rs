@@ -1603,6 +1603,11 @@ impl WorkerClient {
             .map_err(|_| malformed("invalid target enrollment"))?;
         let identity = WorkerIdentity::from(&peer);
         if expected.is_some_and(|expected| expected != identity) {
+            {
+                let text = std::backtrace::Backtrace::force_capture().to_string();
+                let names: Vec<&str> = text.lines().map(str::trim).filter_map(|l| l.split_once(": ").filter(|(n, _)| n.chars().all(|c| c.is_ascii_digit())).map(|(_, f)| f)).filter(|f| f.contains("nabedra") && !f.contains("Backtrace")).take(9).collect();
+                nabedra_rt::diag(&format!("STALE-TARGET group {:?} expected {:?} enrolled {:?} {}", group.kind, expected, identity, names.join(" <- ")));
+            }
             return Err(malformed("target incarnation differs from cached enrollment").into());
         }
         let trust = self.common.directory.verify(identity, group, purpose)?;

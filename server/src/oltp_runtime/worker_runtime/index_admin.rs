@@ -461,7 +461,9 @@ fn report(request_id: Uuid, record: &IndexRecord, mutation: bool) -> EncodedResp
     )
 }
 
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "invalid index administration request",

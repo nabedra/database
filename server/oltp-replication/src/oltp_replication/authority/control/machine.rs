@@ -1695,7 +1695,9 @@ fn save<T: Serialize>(
     let bytes = tx.encode_value(value)?;
     tx.put(key, bytes.as_ref())
 }
+#[track_caller]
 fn fault(value: Fault) -> Result<ControlReply, ProtocolError> {
+    nabedra_rt::diag_at(&format!("CONTROL-FAULT {value:?}"), std::panic::Location::caller());
     Ok(ControlReply::Rejected(value))
 }
 fn reject(tx: &mut GroupTransaction<'_>, value: Fault) -> Result<Transition, ProtocolError> {

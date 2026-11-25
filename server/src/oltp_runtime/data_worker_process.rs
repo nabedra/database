@@ -1262,7 +1262,9 @@ async fn replacement_token(shared: &Arc<WorkerSharedResources>) -> Result<String
     }).await
 }
 
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "invalid data worker bootstrap",

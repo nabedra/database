@@ -1173,7 +1173,9 @@ impl<R: Read> HistoryReader<R> {
         })
     }
 }
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     failure(
         ErrorCode::StorageUnavailable,
         "committed history archive is incomplete, corrupt or inconsistent with its verified cut",

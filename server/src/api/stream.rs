@@ -450,7 +450,9 @@ fn uuid(value: &str) -> std::result::Result<Uuid, ProtocolError> {
     Ok(value)
 }
 
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "invalid streaming request",

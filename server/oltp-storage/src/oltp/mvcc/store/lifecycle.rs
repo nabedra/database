@@ -919,6 +919,7 @@ impl ParticipantHandle {
             Some(scope) => self.propose_verified_scoped(scope, command).await?,
             None => self.propose(command).await?,
         };
+        nabedra_rt::diag(&format!("LIFECYCLE {:?}", applied.reply));
         match applied.reply {
             ParticipantReply::Lifecycle(LifecycleReply::Granted) => {}
             ParticipantReply::Lifecycle(LifecycleReply::Pending { .. }) => return Ok(None),

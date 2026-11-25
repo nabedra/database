@@ -1899,7 +1899,9 @@ impl AuthenticatedParticipantReplyContext {
     }
 }
 #[doc(hidden)]
+#[track_caller]
 pub fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "authenticated participant proof context differs",

@@ -184,7 +184,9 @@ impl AdmissionTicketIssuer for AdmissionTickets {
         })
     }
 }
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::StorageUnavailable,
         "original live admission guard is unavailable",

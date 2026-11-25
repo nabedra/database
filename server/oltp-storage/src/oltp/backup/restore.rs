@@ -467,7 +467,9 @@ fn write_statement(path: &Path, statement: &RestoreGenesisStatement) -> Result<(
         .and_then(|_| file.sync_all())
         .map_err(|_| invalid())
 }
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     failure(
         ErrorCode::StorageUnavailable,
         "native restore requires a verified contiguous history and an exclusive empty offline target",

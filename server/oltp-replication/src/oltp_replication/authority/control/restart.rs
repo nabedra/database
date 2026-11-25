@@ -121,7 +121,9 @@ impl crate::oltp::pool::mount::RestartMountKeyProof for RestartMountKey {
     }
 }
 
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::Unauthorized,
         "retained mount restart intent or signature differs",

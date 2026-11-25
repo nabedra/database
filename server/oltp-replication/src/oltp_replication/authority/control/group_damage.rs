@@ -369,7 +369,9 @@ pub(in crate::oltp_replication::authority::control) fn record_key(
     key
 }
 
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "invalid group damage report",

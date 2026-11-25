@@ -119,7 +119,9 @@ fn rust_stack_reservation() -> Result<usize, ProtocolError> {
         "native stack accounting is unsupported on this platform",
     ))
 }
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     failure(
         ErrorCode::ValidationError,
         "native thread stack reservation unavailable or overflowing",

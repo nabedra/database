@@ -5,7 +5,9 @@ use crate::{
     storage::context::{MAX_CONTEXT_BYTES, MAX_HEADERS, RequestContext, StorageKey},
 };
 use axum::http::HeaderMap;
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "invalid storage context",

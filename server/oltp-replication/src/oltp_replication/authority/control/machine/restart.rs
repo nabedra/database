@@ -107,6 +107,7 @@ pub(super) fn prepare(
     {
         return fault(Fault::Unauthorized);
     }
+    nabedra_rt::diag(&format!("PREPARE pending={} restart={:?} intent.prev={:?} intent.next={:?}", state.pending.is_some(), state.restart.as_ref().map(|p| (p.enrolled, &p.intent.previous, &p.intent.next)), intent.previous, intent.next));
     if state.pending.is_some()
         || state.restart.as_ref().is_some_and(|prep| {
             prep.enrolled
