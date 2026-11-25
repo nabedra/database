@@ -40,7 +40,8 @@ use crate::{
     invariants::{
         Invariants, RULES_RAN,
         protocol::{
-            BEYOND_FAULT_MODEL, MONOTONIC_COMMIT, NOT_APPLIED_NEVER_COMMITTED, RESOURCE_BASELINE,
+            BEYOND_FAULT_MODEL, EXACTLY_ONCE_RELEASE, MONOTONIC_COMMIT,
+            NOT_APPLIED_NEVER_COMMITTED, RESOURCE_BASELINE,
         },
     },
     sweep::{Defect, RunResult, Setup},
@@ -86,6 +87,71 @@ fn subscriptions_see_accepted_probes_with_their_origin() {
         assert_eq!((second.seq, second.incarnation, second.live), (2, 1, true));
         assert!(even.try_recv().is_none());
         assert!(checks.violations().is_empty() && checks.probe_invariants_hold());
+    });
+}
+
+/// A lease that reports its release when it drops, as `NativeSettlement` does.
+struct Lease;
+
+impl Lease {
+    fn acquire() -> Self {
+        emit(|| Probe::GuardAcquired { class: "query" });
+        Self
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        emit(|| Probe::GuardReleased);
+    }
+}
+
+#[test]
+fn a_retired_task_that_drops_its_lease_after_the_restart_is_dead() {
+    // Seed 82 of #146: a node is cut and reopened in one instant, and the runtime drops the
+    // aborted task only afterwards.
+    sim::run(1, |world| async move {
+        world.add_node(1, NodeClock::default());
+        let (checks, probes) = installed(&world);
+        let mut releases =
+            probes.subscribe(|event: &ProbeEvent| matches!(event.probe, Probe::GuardReleased));
+        let retired = world.spawn_node(1, async {
+            let _lease = Lease::acquire();
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(probes.native_outstanding(1), 1);
+
+        world.crash(1);
+        world.restart(1);
+        assert!(
+            releases.try_recv().is_none(),
+            "the aborted task is gone already"
+        );
+        assert!(retired.await.unwrap_err().is_cancelled());
+        let release = releases.try_recv().expect("the retired task's release");
+        assert_eq!((release.node, release.live), (Some(1), false));
+        assert!(checks.violations().is_empty(), "{:?}", checks.violations());
+
+        // The running incarnation is still counted, and judged.
+        let running = world.spawn_node(1, async {
+            drop(Lease::acquire());
+            let held = Lease::acquire();
+            std::mem::forget(held);
+        });
+        running.await.unwrap();
+        assert!(releases.try_recv().expect("a counted release").live);
+        assert_eq!(probes.native_outstanding(1), 1);
+        assert!(checks.violations().is_empty(), "{:?}", checks.violations());
+        world
+            .spawn_node(1, async {
+                drop(Lease);
+                drop(Lease);
+            })
+            .await
+            .unwrap();
+        let kinds = shrink::kinds(&checks.violations());
+        assert_eq!(kinds, [EXACTLY_ONCE_RELEASE.to_owned()].into());
     });
 }
 

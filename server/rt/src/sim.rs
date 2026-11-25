@@ -573,6 +573,13 @@ impl World {
         })
     }
 
+    /// Whether the current task, job or service belongs to the running incarnation of its
+    /// node. A destructor of a crashed incarnation does not, also when the node is up again:
+    /// the runtime drops an aborted task only later. True outside every node.
+    pub fn current_incarnation_runs(&self) -> bool {
+        self.context_active(current_node_context())
+    }
+
     fn register(&self, context: NodeContext, handle: AbortHandle) {
         let mut state = self.lock();
         match state.nodes.get_mut(&context.id) {

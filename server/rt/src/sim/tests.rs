@@ -313,6 +313,57 @@ fn crash_aborts_the_nodes_tasks_and_their_descendants() {
 }
 
 #[test]
+fn a_task_dropped_after_its_node_restarted_is_not_of_the_running_incarnation() {
+    struct Dropped(Arc<World>, Arc<Mutex<Vec<(Option<u64>, bool)>>>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            let seen = (current_node(), self.0.current_incarnation_runs());
+            self.1.lock().unwrap().push(seen);
+        }
+    }
+    run(5, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.add_node(2, NodeClock::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let held = || Dropped(world.clone(), seen.clone());
+        let pending = |dropped: Dropped| async move {
+            let _dropped = dropped;
+            std::future::pending::<()>().await;
+        };
+        let retired = world.spawn_node(1, pending(held()));
+        let other = world.spawn_node(2, pending(held()));
+        tokio::task::yield_now().await;
+
+        world.crash(1);
+        assert!(!in_node(1, async { world.current_incarnation_runs() }).await);
+        world.restart(1);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the task is not dropped yet"
+        );
+        assert!(retired.await.unwrap_err().is_cancelled());
+        assert_eq!(*seen.lock().unwrap(), [(Some(1), false)]);
+
+        // The new incarnation, its jobs, the other node and code outside every node run.
+        let dropped = held();
+        world.spawn_node(1, async { drop(dropped) }).await.unwrap();
+        let dropped = held();
+        let job = in_node(1, async { task::spawn_blocking(move || drop(dropped)) });
+        job.await.await.unwrap();
+        other.abort();
+        assert!(other.await.unwrap_err().is_cancelled());
+        drop(held());
+        let running = [
+            (Some(1), true),
+            (Some(1), true),
+            (Some(2), true),
+            (None, true),
+        ];
+        assert_eq!(seen.lock().unwrap()[1..], running);
+    });
+}
+
+#[test]
 #[allow(clippy::async_yields_async)] // in_node returns a handle spawned inside the node.
 fn spawn_on_registers_with_the_node() {
     run(6, |world| async move {
