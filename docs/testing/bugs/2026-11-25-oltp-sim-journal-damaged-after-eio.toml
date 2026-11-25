@@ -9,7 +9,7 @@ found_date = "2026-11-25"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
 seed = 376
 why_not_caught = "The sync failure runners stop after the reopen. None cuts power afterwards."
-invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, cold seeds 223, 376, 505, 541 and 577 of 1 to 720: a full stop is followed by a cold start. One worker had returned EIO for a sync, was killed and reopened. After a power loss its pool is refused, synced journal record damaged. The mechanism is not established: the recovery may trust pages that never reached the disk, or the fault model may differ from a real disk."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, cold seeds 223, 376, 505, 541 and 577 of 1 to 720: a full stop is followed by a cold start. One worker had returned EIO for a sync, was killed and reopened. After a power loss its pool is refused, synced journal record damaged. The mechanism is not established: the recovery may trust pages that never reached the disk, or the fault model may differ from a real disk. At c2aad866, where every run installs the probes and has another schedule: the same cold seeds 223 (2144cf4d8c684274), 376 (b45714d43feb989b), 505 (452fb759bf71437c), 541 (c5bedc06ef586e53) and 577 (1606063b5fe3c6cf) refuse the pool with synced journal record damaged (Actions run 45687381596, each replayed equal, and local, unattested, replayed equal)."
 fix_commits = []
 revert_patch_ok = false
 status = "open"
