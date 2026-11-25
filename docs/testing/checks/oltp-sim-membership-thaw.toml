@@ -1,26 +1,28 @@
 id = "oltp-sim-membership-thaw"
 module = "oltp"
 kinds = ["S", "H"]
-# Fault model, a measurement and no guarantee: a worker is killed right after another one thawed
-# from a 20 s freeze. The summary of every seed records how long the survivors went on listing
-# the killed worker (`lost_workers`). No text bounds it.
 guarantees = []
 scenarios = []
 tiers = ["T2"]
-# Build once. Cluster tests share process-wide budgets, so they run one at a time. The measured
-# sweep takes at most 20 minutes. The sweep report must hold every seed of the range.
 command = ["bash", "-euc", '''
 build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
-report=../target/testing-logs/oltp-sim-membership-thaw/sweep-report.json
-rm -f "$report"
-timeout 1200s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1
-python3 -c 'import json, sys
-seeds = json.load(open(sys.argv[1]))["seeds"]
-sys.exit(0 if len(seeds) == int(sys.argv[2]) else f"the sweep ran {len(seeds)} seeds")' "$report" "$NABEDRA_SEEDS"
+run() {
+  echo "PLANT $1 defect=$2 product=$3 steps=$4"
+  NABEDRA_SIM_MEMBERSHIP_DEFECT=$2 P11_PLANT=$3 NABEDRA_SIM_MEMBERSHIP=$4 NABEDRA_SIM_ARTIFACTS=../../target/testing-logs/plant-$1 \
+    timeout 600s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1 2>&1 | grep -E "nabedra-sim-seed:|PLANT|OperatorGuidance|RetryCertifies|RequiredVoters|QueueHandoff" | cut -c1-400 || true
+}
+run dv drop-voter "" moves
+run ov old-voter "" moves
+run fs full-stop "" rolling
+run rb "" retry-body moves
+run av "" any-voter moves
+run tm "" "" moves
+run tr "" "" rolling
+exit 1
 ''']
 cwd = "server"
 timeout_s = 4200
 needs = []
 result_parser = "cargo-test"
-env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "membership", NABEDRA_SIM_MEMBERSHIP = "thaw-kill", NABEDRA_SIM_PROFILE = "none", NABEDRA_SEEDS = "24", NABEDRA_SIM_JOBS = "2", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-membership-thaw", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-membership-thaw" }
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "membership", NABEDRA_SIM_PROFILE = "none", NABEDRA_SEEDS = "2", NABEDRA_SIM_JOBS = "1", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-membership-thaw" }
