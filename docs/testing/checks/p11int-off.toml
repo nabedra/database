@@ -1,0 +1,45 @@
+id = "p11int-off"
+module = "oltp"
+kinds = ["S"]
+# Scratch, never merged. It asserts nothing and always exits 1. Full traces, with and without the
+# lines that #143's probes change.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+build=(cargo test --locked -j 4 --release -p nabedra-sim-oltp --lib)
+"${build[@]}" --no-run
+out=$PWD/../target/testing-logs/p11int-off
+mkdir -p "$out"
+cat > "$out/filter.py" <<'P'
+import hashlib,re,sys,collections
+guard=re.compile(r'probe \S+ (GuardAcquired|GuardReleased|WorkStarted|WorkDone) ')
+ledger=re.compile(r'probe \S+ LedgerSnapshot .*(free_native_slots|FreeNativeSlots|pending_writes|PendingWrites)')
+full=hashlib.sha256(); kept=hashlib.sha256(); n=collections.Counter()
+for line in open(sys.argv[1],errors='replace'):
+    full.update(line.encode()); n['lines']+=1
+    if guard.search(line): n['guard']+=1; continue
+    if ledger.search(line): n['ledger']+=1; continue
+    if 'probe rules ran' in line or 'workload summary' in line: n['summary']+=1; continue
+    kept.update(line.encode()); n['kept']+=1
+print(full.hexdigest()[:16],kept.hexdigest()[:16],dict(n))
+P
+run() {
+    d=$(mktemp -d)
+    NABEDRA_SIM_TRACE=full NABEDRA_SIM_WORKLOAD=$1 NABEDRA_SEED=$2 NABEDRA_SIM_ARTIFACTS=$d timeout 600s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1 >"$d/log" 2>&1 || true
+    t=$(find "$d" -name trace.txt | head -1)
+    h=$(find "$d" -name history.jsonl | head -1)
+    echo "OFF $1 $2 $(grep -o '"trace_hash": "[0-9a-f]*"' $d/sweep-report.json | head -1) $(python3 "$out/filter.py" "$t") history $(sha256sum < "$h" | cut -c1-16) $(grep -o 'nabedra-sim-seed: .*' "$d/log" | head -1 | cut -c1-300)"
+    case "$1-$2" in smoke-1|direct-1|cold-4|move-5) gzip -c "$t" > "$out/$1-$2.trace.gz";; esac
+    rm -rf "$d"
+}
+for s in 1 2 3; do run smoke $s; done
+for s in 1 2 3; do run direct $s; run cold $((s+3)); run move $((s+4)); done
+for s in $(seq 1 24); do run mixed $s; done
+exit 1
+''']
+cwd = "server"
+timeout_s = 7200
+needs = []
+result_parser = "exit-code"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SEEDS = "1", NABEDRA_SIM_JOBS = "1", NABEDRA_SIM_VERIFY_REPLAY = "0" }
