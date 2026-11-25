@@ -269,6 +269,7 @@ impl RangeClock {
 
     /// Remove a pending commit. Idempotent.
     pub fn settle(&self, commit_ts: CommitTs) {
+        std::hint::black_box(1u32);
         let removed = self.lock().remove(commit_ts);
         if removed {
             self.changed.notify_waiters();
