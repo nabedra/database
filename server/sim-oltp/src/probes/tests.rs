@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use super::{HARNESS, LogEntry, ProbeEvent, Probes};
 use crate::{
+    history::Bodies,
     invariants::{
         Invariants, RULES_RAN,
         protocol::{
@@ -168,6 +169,84 @@ fn a_cut_node_is_marked_dead_until_it_restarts() {
     });
 }
 
+/// Lead decision 12.1. One identity commits a body. The refusals differ in the body they
+/// answer, and a body that the history does not know excuses nothing.
+#[test]
+fn a_refusal_is_excused_only_if_another_body_committed() {
+    // Bodies are numbers, and number `n` has the digest `[n; 32]`. `sent` has the process and
+    // the body of each call, and whether the harness recorded its digest.
+    let holds = |sent: &[(u64, i64, bool)], committed: &[u8], process: u64| {
+        sim::run(1, |world| {
+            let (sent, committed) = (sent.to_vec(), committed.to_vec());
+            async move {
+                world.add_node(1, NodeClock::default());
+                let (checks, _) = installed(&world);
+                let (table, request) = (Uuid::from_u128(3), Uuid::from_u128(4));
+                for digest in committed {
+                    in_node(1, async {
+                        emit(|| Probe::DedupApplied {
+                            group: Uuid::nil(),
+                            table,
+                            anchor: Key::Int64(5),
+                            request_id: request,
+                            commit_ts: 9,
+                            digest: Digest::from_bytes([digest; 32]),
+                        })
+                    })
+                    .await;
+                }
+                let (mut events, mut bodies) = (Vec::new(), Bodies::new());
+                let mut push = |kind, process, value| {
+                    let mut event = Event::new(kind, process, "upsert")
+                        .with_value(value)
+                        .with_key(&format!("{table}/5"));
+                    event.request_id = Some(request.to_string());
+                    event.index = events.len();
+                    events.push(event);
+                };
+                for (index, (process, body, recorded)) in sent.into_iter().enumerate() {
+                    push(EventType::Invoke, process, json!({"id": 5, "value": body}));
+                    if recorded {
+                        bodies.insert(index, Digest::from_bytes([body as u8; 32]));
+                    }
+                }
+                let answer = json!({"not_applied": true, "code": "conflict"});
+                push(EventType::Fail, process, answer);
+                checks.check_outcomes(&world, &events, &bodies);
+                checks.probe_invariants_hold()
+            }
+        })
+    };
+    let (a, b) = ((0, 1, true), (1, 2, true));
+    // DR-1, insert refused, and DR-2: the body that committed is refused, whatever the code.
+    assert!(!holds(&[a, (1, 1, true)], &[1], 1));
+    // D03: another body, whenever either was sent.
+    assert!(holds(&[a, b], &[1], 1));
+    assert!(holds(&[b, a], &[1], 1));
+    // The first body was refused and never ran, and then the second one committed.
+    assert!(holds(&[a, b], &[2], 0));
+    // Both bodies committed, so the refused one did.
+    assert!(!holds(&[a, b], &[1, 2], 1));
+    // The committed digest is of no body that was sent: the mapping proves nothing.
+    assert!(!holds(&[a, b], &[7], 1));
+    // The refused body was not recorded, or the committed one was not.
+    assert!(!holds(&[a, (1, 2, false)], &[1], 1));
+    assert!(!holds(&[(0, 1, false), b], &[1], 1));
+    // No invocation of the refused call.
+    assert!(!holds(&[a], &[1], 7));
+    // Two calls of the refused process are open, so the history does not say which was refused.
+    assert!(!holds(&[(1, 1, true), b], &[1], 1));
+}
+
+/// The digest of the harness is the product's: SHA-256 of the bytes on the wire.
+#[test]
+fn the_body_digest_is_the_sha_256_of_the_request_bytes() {
+    let body = crate::client::operation(Uuid::nil(), "table.get", json!({"key": 1}));
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let sha = ring::digest::digest(&ring::digest::SHA256, &bytes);
+    assert_eq!(crate::client::digest(&body).as_bytes(), sha.as_ref());
+}
+
 #[test]
 fn not_applied_answers_never_have_a_committed_dedup_record() {
     sim::run(1, |world| async move {
@@ -196,9 +275,9 @@ fn not_applied_answers_never_have_a_committed_dedup_record() {
         let answered = [event(EventType::Invoke, 0), event(EventType::Fail, 1)];
         // Design 3.7: a later retry of the same ID is no exemption.
         let retried = [&answered[..], &[event(EventType::Invoke, 2)]].concat();
-        checks.check_outcomes(&world, &retried);
+        checks.check_outcomes(&world, &retried, &Bodies::new());
         assert!(!checks.probe_invariants_hold());
-        checks.check_outcomes(&world, &answered);
+        checks.check_outcomes(&world, &answered, &Bodies::new());
         let kinds = shrink::kinds(&checks.violations());
         assert!(kinds.contains(NOT_APPLIED_NEVER_COMMITTED), "{kinds:?}");
         assert!(!checks.probe_invariants_hold());

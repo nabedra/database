@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, body::Bytes};
+use nabedra_oltp_types::types::Digest;
 use nabedra_protocol::protocol::ProtocolError;
 use nabedra_rt::{sim::in_node, time::timeout};
 use nabedra_transport::backend::Target;
@@ -68,12 +69,7 @@ pub(crate) async fn request(
             let mut connection = HttpConnection::connect(Target::Addr(addr))
                 .await
                 .map_err(|err| format!("connect n{gateway}: {err}"))?;
-            let payload = body
-                .as_ref()
-                .map(serde_json::to_vec)
-                .transpose()
-                .map_err(|err| format!("encode request: {err}"))?
-                .unwrap_or_default();
+            let payload = body.as_ref().map(encode).unwrap_or_default();
             let request = Request::builder()
                 .method(if body.is_some() { "POST" } else { "GET" })
                 .uri(path)
@@ -102,6 +98,17 @@ pub(crate) async fn request(
         .map_err(|_| format!("HTTP n{gateway} {path} deadline"))?
     })
     .await
+}
+
+/// The bytes of a request body, as they go on the wire.
+fn encode(body: &Value) -> Vec<u8> {
+    serde_json::to_vec(body).expect("JSON body")
+}
+
+/// The gateway's digest of a request: the SHA-256 of its body.
+pub(crate) fn digest(body: &Value) -> Digest {
+    let digest = ring::digest::digest(&ring::digest::SHA256, &encode(body));
+    Digest::from_bytes(digest.as_ref().try_into().expect("32 bytes"))
 }
 
 pub(crate) fn operation(id: Uuid, name: &str, payload: Value) -> Value {

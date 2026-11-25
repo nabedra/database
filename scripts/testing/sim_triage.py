@@ -117,17 +117,25 @@ class Leases:
 
 
 def usage(violation):
-    """The node and the growth of `working_decode_bytes`, if nothing else grew."""
+    """The node and the growth of `working_decode_bytes`, if nothing else grew. A scratch lease is charged to the
+    scheduler and to the scratch gauge as well, so with the probes both ledgers may have grown by the same bytes."""
     found = (re.search(r"n(\d+) has (ResourceUsage .*) after quiescence, baseline (ResourceUsage .*)$", violation)
              or re.search(r"n(\d+) did not stay at its baseline .*, last off by (ResourceUsage .*) "
-                          r"\(baseline (ResourceUsage .*)\)$", violation))
+                          r"\(baseline (ResourceUsage .*)\)$", violation)
+             or re.search(r"n(\d+) did not stay at its baseline .*, last off by SchedulerBytes \d+ \(baseline \d+\), "
+                          r"ScratchBytes \d+ \(baseline \d+\), (ResourceUsage .*) \(baseline (ResourceUsage .*)\)$",
+                          violation))
     if not found:
         return None
     node, now, before = int(found[1]), found[2], found[3]
     number = re.compile(r"working_decode_bytes: (\d+)")
     if number.sub("", now) != number.sub("", before):
         return None
-    return node, int(number.search(now)[1]) - int(number.search(before)[1])
+    growth = int(number.search(now)[1]) - int(number.search(before)[1])
+    ledgers = re.findall(r"(?:SchedulerBytes|ScratchBytes) (\d+) \(baseline (\d+)\)", violation)
+    if any(int(after) - int(base) != growth for after, base in ledgers):
+        return None
+    return node, growth
 
 
 class Diagnosis:

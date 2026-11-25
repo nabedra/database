@@ -15,6 +15,7 @@ use nabedra_sim::sweep::{self, PlantedSearch, SeedRun, SeedSummary, SweepConfig,
 use serde_json::{Value, json};
 
 use crate::{
+    invariants::protocol::{PROBE_INVARIANTS, RANGE_CLOCK_NOT_RUN, REBUILD, TRUNCATION},
     nemesis::Selection,
     panics::PANIC,
     workload::run_seed,
@@ -57,20 +58,6 @@ impl Defect {
     }
 }
 
-/// The invariants of design 3.7 that need the P10-PROBES event stream.
-const PROBE_INVARIANTS: [&str; 10] = [
-    "ElectionSafety",
-    "MonotonicVote",
-    "MonotonicCommit",
-    "LogMatching",
-    "AppliedPrefixesAgree",
-    "MajorityReached",
-    "DedupUnique over Applied",
-    "NotAppliedNeverCommitted over Applied",
-    "RangeClockRule1",
-    "KeyspaceCoverage over RouteEpochPublished",
-];
-
 /// A completed run's named assertion verdicts. Omit families that did not execute.
 pub(crate) struct RunResult {
     pub(crate) run: SeedRun,
@@ -80,6 +67,12 @@ pub(crate) struct RunResult {
     /// Scenarios whose assertions executed in this seed.
     pub(crate) scenarios: Scenarios,
     pub(crate) summary: Value,
+    /// How often each probe-driven rule ran on an event of its own.
+    pub(crate) exercised: BTreeMap<&'static str, u64>,
+    /// Refused inserts that the history checker could not place. The retry rule is quiet on them.
+    pub(crate) unclassified_conflicts: usize,
+    /// What the history checker accepted because no text decides it, by name.
+    pub(crate) not_judged: BTreeMap<String, usize>,
 }
 
 /// The workload and nemesis selection of a sweep (`NABEDRA_SIM_WORKLOAD`,
@@ -137,8 +130,11 @@ pub enum Command {
 
 struct ObservedSeed {
     workload: Workload,
+    exercised: BTreeMap<&'static str, u64>,
     scenarios: Scenarios,
     summary: Value,
+    unclassified_conflicts: usize,
+    not_judged: BTreeMap<String, usize>,
     config: Value,
     config_hash: String,
     assertions: BTreeMap<&'static str, bool>,
@@ -443,6 +439,9 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
                 workload: result.workload,
                 scenarios: result.scenarios.clone(),
                 summary: result.summary.clone(),
+                exercised: result.exercised.clone(),
+                unclassified_conflicts: result.unclassified_conflicts,
+                not_judged: result.not_judged.clone(),
                 config: result.run.config.clone(),
                 config_hash,
                 assertions: result.assertions,
@@ -472,6 +471,11 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     });
     let observed = observed.into_inner().expect("sweep observations poisoned");
     let duration_s = time::elapsed(started).as_secs_f64();
+    // Each seed once: a replay is the same run.
+    let mut exercised = BTreeMap::new();
+    for row in observed.values() {
+        count_rules(&mut exercised, &row.exercised);
+    }
     let mut assertions = BTreeMap::new();
     let mut config_hash = nabedra_sim::Fnv::default();
     let mut stats = Vec::with_capacity(report.seeds.len());
@@ -527,6 +531,8 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             "profile": setup.profile(seed),
             "scenarios": tags,
             "summary": observation.map(|row| &row.summary),
+            "unclassified_conflicts": observation.map(|row| row.unclassified_conflicts),
+            "not_judged": observation.map(|row| &row.not_judged),
             "config": observation.map(|row| &row.config),
             "config_hash": observation.map(|row| &row.config_hash),
             "trace_hash": format!("{:016x}", summary.trace_hash),
@@ -583,6 +589,18 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     let peak_rss_kib = metrics
         .filter_map(|measurement| measurement.process_peak_rss_kib)
         .max();
+    let unclassified_conflicts: usize = observed
+        .values()
+        .map(|row| row.unclassified_conflicts)
+        .sum();
+    let mut not_judged = BTreeMap::<&str, usize>::new();
+    for (name, times) in observed.values().flat_map(|row| &row.not_judged) {
+        *not_judged.entry(name).or_default() += times;
+    }
+    assertions.insert(
+        "every refused insert was classified",
+        unclassified_conflicts == 0,
+    );
     let config_hash = format!("{:016x}", config_hash.finish());
     let report_path = config.artifacts.join("sweep-report.json");
     std::fs::write(
@@ -592,10 +610,13 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             "workload": workload,
             "verdicts": verdicts.iter().map(|(verdict, seeds)| (verdict.name(), seeds)).collect::<BTreeMap<_, _>>(),
             "scenarios": scenario_seeds.iter().map(|(tag, (seeds, failed))| (*tag, json!({"seeds": seeds, "failing": failed}))).collect::<BTreeMap<_, _>>(),
+            "probe_rules": exercised,
             "direct_oltp": true,
             "defect": defect.name(),
             "jobs": config.jobs,
             "config_hash": config_hash,
+            "unclassified_conflicts": unclassified_conflicts,
+            "not_judged": not_judged,
             "duration_s": duration_s,
             "cpu_s": total_cpu_s,
             "process_peak_rss_kib": peak_rss_kib,
@@ -609,7 +630,8 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     eprintln!(
         "Fault model: {} clean seeds (worked and replayed), {unreplayed} passing seeds not \
          replayed, {} red, {} replayed, {:.3} s wall, {:?} simulation CPU s, \
-         {:?} KiB process peak RSS, configuration {config_hash}",
+         {:?} KiB process peak RSS, {unclassified_conflicts} unclassified insert conflicts, \
+         not judged {not_judged:?}, configuration {config_hash}",
         verdicts.get(&Verdict::Clean).copied().unwrap_or(0),
         verdicts.get(&Verdict::Red).copied().unwrap_or(0),
         report.replayed(),
@@ -625,6 +647,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             workload,
             smoke: setup.workloads.is_smoke(),
             scenarios: scenario_assertions,
+            exercised,
             assertions,
             unreplayed,
             defects_skipped: test_defects && !report.passed(),
@@ -738,6 +761,8 @@ struct RecordInput {
     smoke: bool,
     /// Scenario tags that executed, and whether every seed that executed one passed.
     scenarios: BTreeMap<&'static str, bool>,
+    /// Probe-driven rules, with how often they ran in the whole range.
+    exercised: BTreeMap<&'static str, u64>,
     assertions: BTreeMap<&'static str, bool>,
     unreplayed: u64,
     defects_skipped: bool,
@@ -807,17 +832,10 @@ fn write_record(
     if input.defects_skipped {
         record.not_run("seeded defects", "the unmodified smoke sweep failed");
     }
-    for invariant in PROBE_INVARIANTS {
-        record.not_run(invariant, "no sweep installs the probes yet");
+    for (rule, why) in rules_not_run(&input.exercised) {
+        record.not_run(&rule, &why);
     }
-    record.not_run(
-        "ResourceBaseline ledger and RangeClock pending sets",
-        "no sweep installs the probes yet",
-    );
-    record.not_run(
-        "ConsistentCommittedData",
-        "no sweep installs the probes yet",
-    );
+    record.not_run("ConsistentCommittedData", "no probe reports it");
     if input.smoke {
         for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {
             record.not_run(scenario, &format!("runs in the {workload} workload"));
@@ -869,6 +887,29 @@ fn write_record(
     // richer native record in that log so the attestation also binds these fields.
     print!("{}", std::fs::read_to_string(path)?);
     Ok(outcome == nabedra_check::evidence::Outcome::Pass)
+}
+
+fn count_rules(total: &mut BTreeMap<&'static str, u64>, run: &BTreeMap<&'static str, u64>) {
+    for (rule, times) in run {
+        *total.entry(*rule).or_default() += times;
+    }
+}
+
+/// What the probe-driven rules did not judge in a range: the rules that never ran, and the
+/// commits that RangeClockRule1 had to leave out.
+fn rules_not_run(exercised: &BTreeMap<&'static str, u64>) -> Vec<(String, String)> {
+    let times = |rule: &str| exercised.get(rule).copied().unwrap_or(0);
+    let never = PROBE_INVARIANTS.into_iter().chain([REBUILD, TRUNCATION]);
+    let mut rows: Vec<_> = never
+        .filter(|rule| times(rule) == 0)
+        .map(|rule| (rule.to_owned(), "no seed in this range exercised it".into()))
+        .collect();
+    let skipped = times(RANGE_CLOCK_NOT_RUN);
+    if skipped > 0 {
+        let why = format!("{skipped} committed direct entries could not be judged");
+        rows.push((RANGE_CLOCK_NOT_RUN.to_owned(), why));
+    }
+    rows
 }
 
 fn sha256_file(path: &Path) -> io::Result<String> {
@@ -953,6 +994,25 @@ mod tests {
             assert!(!report.passed(), "panic in run {panicking}");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A sub-rule that never ran, and the commits that a rule could not judge, are not hidden
+    /// behind the rules that did run.
+    #[test]
+    fn a_record_names_the_probe_rules_that_did_not_judge() {
+        let mut all = BTreeMap::new();
+        for rule in PROBE_INVARIANTS.into_iter().chain([REBUILD, TRUNCATION]) {
+            count_rules(&mut all, &BTreeMap::from([(rule, 1)]));
+            count_rules(&mut all, &BTreeMap::from([(rule, 2)]));
+        }
+        assert!(all.values().all(|times| *times == 3));
+        assert!(rules_not_run(&all).is_empty());
+        let mut part = all.clone();
+        part.remove(REBUILD);
+        part.insert(TRUNCATION, 0);
+        part.insert(RANGE_CLOCK_NOT_RUN, 4);
+        let rows: Vec<_> = rules_not_run(&part).into_iter().map(|row| row.0).collect();
+        assert_eq!(rows, [REBUILD, TRUNCATION, RANGE_CLOCK_NOT_RUN]);
     }
 
     /// Review 115, M10: 46 of 47 seeds that were reported as clean had been run once.
