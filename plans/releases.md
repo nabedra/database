@@ -57,7 +57,6 @@ REL1 and REL2 share the ORM version files, so one owner does both. REL4 can star
 ```text
 version.py check           every version below is equal; exit 1 and list the ones that differ
 version.py set <semver>    write them all, then refresh the lock files with `cargo update --workspace`
-version.py pep440 <semver> 0.3.0-rc.1 -> 0.3.0rc1
 ```
 
 It owns these and nothing else:
@@ -65,7 +64,7 @@ It owns these and nothing else:
 - `server/Cargo.toml`: `[workspace.package] version`, inherited by the members, and `[workspace.dependencies]` entries pinned as `=X.Y.Z`. `nabedra-fuzz` and `nabedra-sim-oltp` stay unpublished.
 - `server/events/Cargo.toml`, which is its own workspace, with its exact `nabedra-*` requirements
 - `server/Cargo.lock`, `server/events/Cargo.lock`, `server/fuzz/Cargo.lock` where they record these packages
-- `orm/python/pyproject.toml`, and `CLI_VERSION` in `_binary.py` (PEP 440)
+- `orm/python/pyproject.toml`, and `CLI_VERSION` in `_binary.py`. Both keep the semver spelling: `api_manifest.py` requires the two ORM version strings to be equal, and PEP 440 normalizes `0.3.0-rc.1` to `0.3.0rc1` in the built package.
 - `orm/typescript/package.json` and its lock file, `cliVersion` in `cli.ts`. Delete the unused one in `binary.ts`.
 - `orm/api-manifest.json`, `orm/cache-contract/vectors.json`
 - Test fixtures that hold a version, after REL2 makes them read it from the package where possible
