@@ -430,8 +430,19 @@ impl Suspended {
     fn advance(&self, world: &World, how: Resume) {
         {
             let mut ends = lock(&self.ends);
-            if ends.stop.take().is_none() {
+            let Some(stop) = ends.stop.take() else {
                 return;
+            };
+            if matches!(stop.at, At::Clock) {
+                eprintln!(
+                    "DIAG {:?} advance n{} kind {} how {} frozen {} hold {:?}",
+                    world.elapsed(),
+                    self.context.id,
+                    match self.kind { Kind::Job => "job", Kind::Poll => "poll" },
+                    match how { Resume::Run => "run", Resume::RunToEnd => "to-end", Resume::Cancel => "cancel" },
+                    world.is_frozen(self.context.id),
+                    stop.hold,
+                );
             }
             // A helper thread that gave up waiting has left its `Done`.
             let _ = ends.resume.send(how);
@@ -751,6 +762,7 @@ impl Stoppable {
             At::Call(call) => world.emit(&SimEvent::StoragePaused { node, call }),
             At::Clock => {
                 world.freeze(node);
+                eprintln!("DIAG {:?} clock-frozen n{node} hold {:?} kind {}", world.elapsed(), stop.hold, match self.kind { Kind::Job => "job", Kind::Poll => "poll" });
                 world.emit(&SimEvent::ClockFrozen { node });
             }
         }

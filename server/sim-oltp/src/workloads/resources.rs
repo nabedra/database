@@ -240,8 +240,10 @@ impl Stall {
         if self.reservation {
             read = read.in_file(RESERVATION);
         }
+        eprintln!("DIAG {:?} stall armed {self:?}", world.elapsed());
         world.freeze_after_clock_read(self.node, read);
         world.frozen_at_read(self.node).await;
+        eprintln!("DIAG {:?} stall sees n{} frozen at read", world.elapsed(), self.node);
         time::sleep(self.hold).await;
         world.thaw(self.node);
         stalled.lock().unwrap().remove(&self.node);
@@ -365,6 +367,7 @@ impl Overlay {
                 .world
                 .set_storage_pauses(50, Duration::from_millis(3));
         }
+        eprintln!("DIAG {:?} deadline {:?} windows {:?} freezes {:?}", cluster.world.elapsed(), ctx.timeout, self.windows, self.freezes);
         cluster.record(format!(
             "resources overlay windows {:?} drain {:?} freezes {:?} pauses {}",
             self.windows, self.drain, self.freezes, self.pauses

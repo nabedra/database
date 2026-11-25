@@ -673,6 +673,7 @@ impl World {
     /// stepped services stop with their driver tasks. Code outside the node that drives
     /// its services inline ([`crate::task::drive_until`]) is not stopped.
     pub fn freeze(&self, node: u64) {
+        eprintln!("DIAG {:?} freeze n{node} was {}", self.elapsed(), self.is_frozen(node));
         self.with_node(node, |entry| {
             entry.frozen = true;
             entry.freezes += 1;
@@ -685,6 +686,7 @@ impl World {
 
     /// Resumes a frozen `node`'s tasks.
     pub fn thaw(&self, node: u64) {
+        eprintln!("DIAG {:?} thaw n{node} was {}", self.elapsed(), self.is_frozen(node));
         let parked = self.with_node(node, |entry| {
             entry.frozen = false;
             std::mem::take(&mut entry.parked)
