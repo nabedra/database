@@ -19,6 +19,8 @@ import sys
 # Kinds that say the run itself is broken: a panic in the harness or in the product, two runs of a seed
 # that differ, and faults beyond the model.
 FAULT_KINDS = {"harness", "determinism", "Panic", "BeyondFaultModel"}
+# The kind of a known finding. A planted defect that is reported under it hides behind that finding.
+KNOWN = {"RefusedWriteInIndex"}
 RUN_LIMIT_S = 900
 
 
@@ -57,6 +59,8 @@ def detected(row, twin, defect, rule):
     """Whether a run with the defect reports its rule, against its usable clean twin."""
     where = f"{defect} seed {row['seed']}"
     usable(row, where)
+    if named := sorted((KNOWN - {rule}) & (set(row["violations"]) - set(twin["violations"]))):
+        raise Failure(f"{where} is reported as {', '.join(named)}")
     if rule not in row["violations"]:
         return False
     if not twin["summary"]["judged"].get(rule):

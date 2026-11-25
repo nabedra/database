@@ -1,15 +1,15 @@
 id = "OLTP-sim-split-after-direct-commit"
-title = "A split plan refused at the freeze, with a direct commit above its cut, holds the table against every later plan until the owner changes"
+title = "A split plan refused at the freeze, with a direct commit above its cut, holds the table against every later plan and index declaration until the owner changes"
 class = "fence-lifecycle-order"
 module = "oltp"
 guarantees = []
-scenarios = ["D07"]
+scenarios = ["D07", "O12", "O16"]
 found_by = "campaign"
 found_date = "2026-11-24"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
 seed = 1
 why_not_caught = "No runner splits a range that has taken direct commits while the direct path stays on, or asks for a second plan after a refused freeze."
-invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=direct NABEDRA_SIM_PROFILE=split, seeds 1 and 2: a requested split publishes within 60 s of the heal, if the operator replaces a refused plan. The source refuses the first plan with DirectCommitAboveCut, and every new ID is then refused with captured schema or lifecycle changed, because the refused plan keeps the exclusive lifecycle guard (traced). An exact retry is refused again, because it keeps its cut. Splits do publish after direct commits: in a mixed sweep of seeds 1 to 720, 42 published with no refusal, 5 after no other refusal than manual split interrupted by worker recovery, and seed 171 after that and one ValidationError (invalid hosted group placement or identity). Of 90 with a refused freeze 21 published, each after the scheduler owner changed and a retry settled the refused plan, and 69 did not. An earlier form of this record said that such a split never publishes, which was wrong."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=direct NABEDRA_SIM_PROFILE=split, seeds 1 and 2: a requested split publishes within 60 s of the heal, if the operator replaces a refused plan. The source refuses the first plan with DirectCommitAboveCut, and every new ID is then refused with captured schema or lifecycle changed, because the refused plan keeps the exclusive lifecycle guard (traced). An exact retry is refused again, because it keeps its cut. Splits do publish after direct commits: in a mixed sweep of seeds 1 to 720, 42 published with no refusal, 5 after no other refusal than manual split interrupted by worker recovery, and seed 171 after that and one ValidationError (invalid hosted group placement or identity). Of 90 with a refused freeze 21 published, each after the scheduler owner changed and a retry settled the refused plan, and 69 did not. An earlier form of this record said that such a split never publishes, which was wrong. Also NABEDRA_SIM_WORKLOAD=topology NABEDRA_SIM_PROFILE=none NABEDRA_SIM_TOPOLOGY=no-move,split-under-load, seeds 6, 7, 9 and 11 at d8d58e23: index declarations of the table are refused with captured schema or lifecycle changed for 180 s after the heal. Seed 6, instrumented with an unchanged trace hash (review-136): the refused split's guard is the last exclusive grant on the table, and 1,079 later acquisitions are rejected. At 9a6bc79e a scratch build that asks with new split IDs gets that conflict for them too (seeds 6 and 9)."
 fix_commits = []
 revert_patch_ok = false
 status = "open"

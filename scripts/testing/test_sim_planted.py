@@ -55,6 +55,16 @@ class VerdictTest(unittest.TestCase):
         with self.assertRaisesRegex(Failure, "trace of its clean twin"):
             detected(hit(), row(trace="00000000000000bb"), "lose-range", RULE)
 
+    def test_a_defect_may_not_be_reported_as_a_known_finding(self):
+        known = "RefusedWriteInIndex"
+        for found in (hit(known), row(violations=[known], trace="bb")):
+            with self.assertRaisesRegex(Failure, known):
+                detected(found, row(), "lose-row", RULE)
+        # The finding itself, in the clean run too, or a defect of that rule.
+        self.assertTrue(detected(hit(known), row(violations=[known]), "lose-row", RULE))
+        twin = row(summary={"abandoned": False, "judged": {known: 1}})
+        self.assertTrue(detected(row(violations=[known], trace="bb"), twin, "refused", known))
+
     def test_clean_twins_are_every_seed_and_usable(self):
         rows = [row(1), row(2, ["ResourceBaseline"])]
         self.assertEqual(list(clean_twins(rows, range(1, 3), [RULE])), [1, 2])
@@ -71,19 +81,23 @@ rows = json.loads(os.environ["FAKE"])[os.environ["NABEDRA_SIM_TOPOLOGY_DEFECT"]]
 assert "NABEDRA_SIM_EXPECT" not in os.environ
 first = int(os.environ["NABEDRA_SEED"])
 rows = [r for r in rows if first <= r["seed"] < first + int(os.environ["NABEDRA_SEEDS"])]
-if os.environ.get("FAKE_REPORT") != "none":
+if os.environ.get("FAKE_REPORT") != "none" or os.environ["NABEDRA_SIM_TOPOLOGY_DEFECT"] == "none":
     pathlib.Path(os.environ["NABEDRA_SIM_ARTIFACTS"], "sweep-report.json").write_text(json.dumps({"seeds": rows}))
 sys.exit(int(os.environ.get("FAKE_EXIT", 101 if any(r["violations"] for r in rows) else 0)))
 """
 
 
 class RunTest(unittest.TestCase):
-    def run_check(self, planted, **env):
+    def run_check(self, planted, clean=None, stale=None, **env):
         with tempfile.TemporaryDirectory() as temp:
+            if stale is not None:
+                out = pathlib.Path(temp, "out", "lose-range-1")
+                out.mkdir(parents=True)
+                (out / "sweep-report.json").write_text(json.dumps({"seeds": stale}))
             command = pathlib.Path(temp, "sweep")
             command.write_text(SWEEP)
             command.chmod(command.stat().st_mode | stat.S_IXUSR)
-            clean = [row(1), row(2, ["ResourceBaseline"])]
+            clean = clean or [row(1), row(2, ["ResourceBaseline"])]
             fake = {"none": clean, "lose-range": planted}
             before = dict(os.environ)
             os.environ.update({"FAKE": json.dumps(fake), "NABEDRA_SIM_EXPECT": "x", **env})
@@ -104,6 +118,17 @@ class RunTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as caught:
                     self.run_check(planted)
                 self.assertIn("not detected: lose-range", str(caught.exception))
+
+    def test_the_report_of_an_earlier_run_is_not_read(self):
+        with self.assertRaises(SystemExit):
+            self.run_check([hit(seed=1)], stale=[hit(seed=1)], FAKE_REPORT="none")
+
+    def test_a_hit_is_judged_against_the_twin_of_its_own_seed(self):
+        unjudged = row(2, summary={"abandoned": False, "judged": {RULE: 0}})
+        with self.assertRaises(SystemExit):
+            self.run_check([row(1), hit(seed=2)], clean=[row(1), unjudged])
+        unjudged = row(1, summary={"abandoned": False, "judged": {RULE: 0}})
+        self.run_check([row(1), hit(seed=2)], clean=[unjudged, row(2)])
 
     def test_a_run_that_reports_nothing_fails_the_check(self):
         for planted, env in (([row(1), row(2)], {}), ([], {}), ([hit(seed=1)], {"FAKE_REPORT": "none"}),

@@ -138,6 +138,33 @@ fn refused_write_in_index() {
     );
 }
 
+/// Review 136-2: with `lose-row` on seed 2 the auditor's next request on the lost row was answered
+/// as a no-op, and the lost row was reported as the known finding of a refused write.
+#[test]
+fn a_no_op_is_not_a_refusal() {
+    let acked = insert(1, 10, 1, 2);
+    let later = |value, ended| [acked.clone(), write(1, value, false, (3, 4), ended)];
+    let gone = [scan(5, 6, &[])];
+    // The row is lost: an acknowledged insert is missing, whatever later request met no row.
+    assert_eq!(kinds(&later(Some(11), Ended::NoOp), &gone), [COVERING]);
+    assert_eq!(kinds(&later(None, Ended::NoOp), &gone), [COVERING]);
+    // A refused write that took effect is still reported as that.
+    assert_eq!(kinds(&later(None, Ended::Refused), &gone), [REFUSED_WRITE]);
+    let shown = [scan(5, 6, &[(1, 11)])];
+    assert_eq!(
+        kinds(&later(Some(11), Ended::Refused), &shown),
+        [REFUSED_WRITE, REFUSED_WRITE]
+    );
+    // A no-op wrote nothing, so its value is in no scan, and it changes no row.
+    assert_eq!(
+        kinds(&later(Some(11), Ended::NoOp), &shown),
+        [EXACTLY_ONCE, COVERING]
+    );
+    let kept = [scan(5, 6, &[(1, 10)])];
+    assert_eq!(kinds(&later(Some(11), Ended::NoOp), &kept), NONE);
+    assert_eq!(kinds(&later(None, Ended::NoOp), &kept), NONE);
+}
+
 fn status(index: &str, at: (u64, u64), state: &str) -> Status {
     Status {
         index: index.into(),

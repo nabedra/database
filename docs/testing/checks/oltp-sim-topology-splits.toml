@@ -3,8 +3,8 @@ module = "oltp"
 kinds = ["S", "H"]
 # Fault model, no nemesis. The same seeds with the range split before any client starts, and with
 # the split requested under direct load. A seed whose split does not publish is red. Open records:
-# OLTP-sim-split-after-direct-commit, OLTP-sim-split-pinned-to-index-build and
-# OLTP-sim-refused-split-blocks-table. Every seed is replayed, and both halves must have run.
+# OLTP-sim-split-after-direct-commit and OLTP-sim-split-pinned-to-index-build. Every seed is
+# replayed, and both halves must have run.
 guarantees = ["OLTP-G06"]
 scenarios = []
 tiers = ["T1"]
