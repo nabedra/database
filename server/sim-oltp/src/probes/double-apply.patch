@@ -1,0 +1,26 @@
+diff --git a/server/oltp-replication/src/oltp_replication/hosted.rs b/server/oltp-replication/src/oltp_replication/hosted.rs
+--- a/server/oltp-replication/src/oltp_replication/hosted.rs
++++ b/server/oltp-replication/src/oltp_replication/hosted.rs
+@@ -294,8 +294,20 @@ where
+     where
+         S: Stream<Item = io::Result<EntryResponder<C>>> + Unpin + OptionalSend,
+     {
+-        while let Some(item) = entries.next().await {
+-            let (entry, responder) = item?;
++        // Planted defect: every normal entry is applied a second time.
++        let mut again: Option<EntryResponder<C>> = None;
++        loop {
++            let (item, repeat) = match again.take() {
++                Some(item) => (item, true),
++                None => match entries.next().await {
++                    Some(item) => (item?, false),
++                    None => break,
++                },
++            };
++            let (entry, responder) = item;
++            if !repeat && matches!(entry.payload(), Payload::Normal(_)) {
++                again = Some((entry.clone(), None));
++            }
+             if responder.is_some() && matches!(self.store().identity().kind, GroupKind::Data { .. })
+             {
+                 proposal_clock::applying();

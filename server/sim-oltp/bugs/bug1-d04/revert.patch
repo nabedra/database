@@ -1,8 +1,8 @@
 diff --git a/server/src/oltp_runtime/direct/executor.rs b/server/src/oltp_runtime/direct/executor.rs
-index 1567e66..1551d4a 100644
+index ff07d29b..971f8280 100644
 --- a/server/src/oltp_runtime/direct/executor.rs
 +++ b/server/src/oltp_runtime/direct/executor.rs
-@@ -630,10 +630,12 @@ impl DirectExecutor {
+@@ -637,10 +637,12 @@ impl DirectExecutor {
          token: LeaderToken,
          deadline: Instant,
          error: ProtocolError,
@@ -18,7 +18,7 @@ index 1567e66..1551d4a 100644
          {
              return Err(failed(error));
          }
-@@ -655,15 +657,10 @@ impl DirectExecutor {
+@@ -662,15 +664,10 @@ impl DirectExecutor {
              "direct proposal produced no reply"
          );
          if error.outcome == Outcome::NotApplied {
@@ -37,7 +37,7 @@ index 1567e66..1551d4a 100644
          }
      }
  
-@@ -695,7 +692,7 @@ impl DirectExecutor {
+@@ -702,7 +699,7 @@ impl DirectExecutor {
                  .await
                  else {
                      if !self.pause(deadline, RetryCause::Leadership).await {
@@ -46,7 +46,7 @@ index 1567e66..1551d4a 100644
                      }
                      continue;
                  };
-@@ -716,7 +713,7 @@ impl DirectExecutor {
+@@ -723,7 +720,7 @@ impl DirectExecutor {
                      Ok(Some(snapshot)) => snapshot,
                      Ok(None) => {
                          if !self.pause(deadline, RetryCause::Leadership).await {
@@ -55,7 +55,7 @@ index 1567e66..1551d4a 100644
                          }
                          continue;
                      }
-@@ -865,6 +862,7 @@ impl DirectExecutor {
+@@ -872,6 +869,7 @@ impl DirectExecutor {
                  self.token(handle, clock, deadline),
              )
              .await?;
@@ -63,7 +63,7 @@ index 1567e66..1551d4a 100644
              // RD1: a `Schema` retry looks the table up again with the epochs
              // its snapshot read, and latches the keys it derives.
              loop {
-@@ -885,6 +883,9 @@ impl DirectExecutor {
+@@ -892,6 +890,9 @@ impl DirectExecutor {
                  )
                  .await
                  .map_err(|_| {
@@ -73,7 +73,7 @@ index 1567e66..1551d4a 100644
                      failed(ProtocolError::new(
                          ErrorCode::StorageUnavailable,
                          "deadline expired waiting for a key latch",
-@@ -897,7 +898,7 @@ impl DirectExecutor {
+@@ -904,7 +905,7 @@ impl DirectExecutor {
                  self.served(handle);
                  loop {
                      if nabedra_rt::time::now() >= deadline {
@@ -82,7 +82,7 @@ index 1567e66..1551d4a 100644
                      }
                      match self
                          .attempt(
-@@ -909,6 +910,7 @@ impl DirectExecutor {
+@@ -916,6 +917,7 @@ impl DirectExecutor {
                              &parsed.operation,
                              &keys,
                              deadline,
@@ -90,7 +90,7 @@ index 1567e66..1551d4a 100644
                          )
                          .await?
                      {
-@@ -919,14 +921,14 @@ impl DirectExecutor {
+@@ -926,14 +928,14 @@ impl DirectExecutor {
                          }
                          Attempt::Retry(cause) => {
                              if !self.pause(deadline, cause).await {
@@ -107,7 +107,7 @@ index 1567e66..1551d4a 100644
                  }
              }
          }
-@@ -946,6 +948,7 @@ impl DirectExecutor {
+@@ -953,6 +955,7 @@ impl DirectExecutor {
          operation: &Operation,
          keys: &[MvccKey],
          deadline: Instant,
@@ -115,7 +115,7 @@ index 1567e66..1551d4a 100644
      ) -> Result<Attempt<DirectResponse>, DirectResponse> {
          // T4fix F4: the token is taken before the timestamp is fetched.
          let token = timed(
-@@ -971,6 +974,7 @@ impl DirectExecutor {
+@@ -978,6 +981,7 @@ impl DirectExecutor {
              operation,
              keys,
              deadline,
@@ -123,7 +123,7 @@ index 1567e66..1551d4a 100644
          );
          tokio::pin!(fetch, prepare);
          let mut fetched = None;
-@@ -1084,8 +1088,8 @@ impl DirectExecutor {
+@@ -1091,8 +1095,8 @@ impl DirectExecutor {
              Err(error) => {
                  // T4: the proposal no longer holds its local pending slot.
                  clock.settle(commit_ts);
@@ -134,7 +134,7 @@ index 1567e66..1551d4a 100644
              }
          };
          let fault = match committed {
-@@ -1176,6 +1180,7 @@ impl DirectExecutor {
+@@ -1183,6 +1187,7 @@ impl DirectExecutor {
          operation: &Operation,
          keys: &[MvccKey],
          deadline: Instant,
@@ -142,7 +142,7 @@ index 1567e66..1551d4a 100644
      ) -> Result<Prepared, DirectResponse> {
          let MvccKey::Row {
              primary_key: anchor,
-@@ -1186,7 +1191,7 @@ impl DirectExecutor {
+@@ -1193,7 +1198,7 @@ impl DirectExecutor {
          };
          let leadership = || {
              if nabedra_rt::time::now() + RETRY_PAUSE >= deadline {
@@ -151,7 +151,7 @@ index 1567e66..1551d4a 100644
              }
              Ok(Prepared::Exit(Attempt::Retry(RetryCause::Leadership)))
          };
-@@ -1555,14 +1560,15 @@ impl DirectExecutor {
+@@ -1562,14 +1567,15 @@ impl DirectExecutor {
                  .await
                  .map_err(|_| failed(unavailable_not_applied()))?;
              self.served(handle);
@@ -169,7 +169,7 @@ index 1567e66..1551d4a 100644
                      }
                      continue;
                  }
-@@ -1604,9 +1610,16 @@ impl DirectExecutor {
+@@ -1611,9 +1617,16 @@ impl DirectExecutor {
                  let applied = match by(deadline, handle.propose(command)).await {
                      Ok(applied) => applied,
                      Err(error) => {
@@ -189,7 +189,7 @@ index 1567e66..1551d4a 100644
                          }
                          continue;
                      }
-@@ -1635,7 +1648,7 @@ impl DirectExecutor {
+@@ -1642,7 +1655,7 @@ impl DirectExecutor {
                      Fault::SplitInProgress => return Err(fault_response(fault, &epochs)),
                      Fault::StaleAuthority => {
                          if !self.pause(deadline, RetryCause::Authority).await {
@@ -198,7 +198,7 @@ index 1567e66..1551d4a 100644
                          }
                      }
                      other => return Err(fault_response(other, &epochs)),
-@@ -1800,14 +1813,25 @@ fn stale_route(epochs: Option<&ParticipantEpochs>) -> DirectResponse {
+@@ -1807,14 +1820,25 @@ fn stale_route(epochs: Option<&ParticipantEpochs>) -> DirectResponse {
  }
  /// After a failed barrier: redirect when another node leads, else report
  /// the deadline.

@@ -12,7 +12,7 @@ reverts = "2df6cd9aefeeeed22d56a2c5cf87cebded9f54df"
 port = "hand"
 port_notes = """
 The fix conflicts in five files. This ports its decision point, raft_sender in
-server/src/oltp_replication/typed_network.rs: `if replaying_history || membership...` goes back to
+typed_network.rs of nabedra-oltp-replication: `if replaying_history || membership...` goes back to
 `if membership.nodes().next().is_none()`, so a learner replaying a historical membership refuses
 bootstrap voters it does not list ("sender is outside enrolled replica membership"). The
 catch_up_before plumbing stays and `replaying_history` becomes an unused variable (a warning).
@@ -27,16 +27,25 @@ seeds = [1, 10000]
 kind = "lib-test"
 test = "oltp_replication::typed_network::tests::o26_learner_accepts_current_leader_while_replaying_historical_membership"
 mode = "on"
+assertion = "state"
 failure_contains = ["left: None", "right: Some(ReplicaMember { node_id: 4"]
 
 [regression.evidence]
-digest = "4f1994b57cb410aaae4dfd07665c99365dcd28ca4d02eec824f5c657cce6d7bc"
-clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148935717", sha = "53a5716f844aa9690739daed32fd335c68bc0f8a", result = "passed", note = "request p10-bugs-clean-53a5716-103844, direct_oltp on" }
-patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45148931723", sha = "5d66e3c29479a569911d88d075f964ea613a98bb", result = "failed", note = "scratch/sim-bug-az2, request p10-bugs-az2-5d66e3c-103844, direct_oltp on", output = """
-test oltp_replication::typed_network::tests::o26_learner_accepts_current_leader_while_replaying_historical_membership ... FAILED
-panicked at src/oltp_replication/typed_network/tests.rs:62:5:
-assertion `left == right` failed
+digest = "4c4fdbd5f4ddff31669fb5037603e7f7788b4dd6f3ac78e04d3255575916ccf6"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45413905217", sha = "5953e85183f733a73658dc75ef9cd10d8c21e5cc", result = "passed", note = "check oltp-sim-bugs-regression, request p10-bugs-5953e85-152526, direct_oltp on" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45413905217", sha = "5953e85183f733a73658dc75ef9cd10d8c21e5cc", result = "failed", note = "check oltp-sim-bugs-regression, request p10-bugs-5953e85-152526, direct_oltp on; patch applied to this SHA in a scratch worktree", output = """
   left: None
- right: Some(ReplicaMember { node_id: 4, worker_id: 94a86f08-b558-47be-bde5-5cf0ecec1759, pool_id: 6df93326-d6dc-4bd6-aab1-8e0076cebffc })
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 585 filtered out; finished in 0.00s
+ right: Some(ReplicaMember { node_id: 4, worker_id: ad2aa314-7234-4706-9a24-cb1becbdfac8, pool_id: 6bf14367-f12b-4cff-a26a-000225252357 })
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.00s
+az2: with the patch failed; verified (digest 4c4fdbd5f4ddff31669fb5037603e7f7788b4dd6f3ac78e04d3255575916ccf6)
 """ }
+
+# Transcribed from the two reviews of #113 (LAND-113), whose second one confirmed the verdict and the assertion type. The
+# reviewer applied the patch and ran the named test with and without it, locally and unattested.
+[review]
+digest = "690b6abf87297cd2e6a5dc86f820fbbc84b03f8915e24b7e7387a24b13398ae1"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (LAND-113, independent reviewer of PR #113, wrote no patch)"
+source = "wave-p8/reports/land-113.md, and https://github.com/zPy52/nabedra-database/pull/113#issuecomment-7141927346 and #issuecomment-7147012706"
+notes = "The verified sender identity is None with the patch."
