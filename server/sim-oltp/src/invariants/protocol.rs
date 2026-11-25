@@ -36,8 +36,16 @@
 //!   group, and a purged entry counts as held while its purge marker matches an applied
 //!   entry, whatever the state machine holds. A configuration the run did not append, as in a
 //!   restored group, is unknown, and then nothing has a majority. A wipe of one volume counts
-//!   for every replica of its node until they start again. No wipe is exempt, although the
-//!   loss of a volume is the fault plan's work.
+//!   for every replica of its node until they start again. A wiped replica holds nothing, and
+//!   no wipe is exempt, although the loss of a volume is the fault plan's work.
+//! - BeyondFaultModel is no rule but a verdict on the run: it wiped voters of a group until
+//!   those left were no majority of the voters in force. A wiped voter counts until it holds
+//!   every applied entry up to the last one it may have lost. It excuses no other report. It
+//!   sees wipes only, judges them when they happen, and not against a configuration that is
+//!   appended but not applied. A group whose configuration the run did not append is not
+//!   judged. A node's second volume counts as wiped with the first until its replicas start,
+//!   so such a run can be called beyond the model when it is not. Without probes it sees no
+//!   wipe at all.
 //! - MajorityReached/truncation: a removed or overwritten entry that some replica applied
 //!   before. One applied only afterwards is left to LogMatching.
 //! - DedupUnique: records written by applied direct entries. Records that arrive by snapshot,
@@ -48,10 +56,14 @@
 //!   one by one, not as a set, and either of those two replicas can be named in a report.
 //! - NotAppliedNeverCommitted: direct commits whose dedup record some replica wrote. Queued
 //!   commits and commits without a record are not seen.
-//! - RangeClockRule1: committed entries of the direct path, by the time they registered. A
-//!   read counts once the range admits it, so one that fails later counts as completed. A
-//!   commit that never registered is not judged, and one that registered before a read but
-//!   was proposed after it counts as proposed before. A split's children inherit the reads of
+//! - RangeClockRule1: committed entries of the direct path, by the time they registered in
+//!   the term of their entry. A read counts once the range admits it, so one that fails later
+//!   counts as completed. A commit that did not register in that term was proposed somewhere
+//!   between the takeover of the term's leader and the first append of its entry. A read at or
+//!   above it before the takeover is red, and one after the first append is legal. With one in
+//!   between, or a takeover that the stream does not show, the commit is not judged, and
+//!   [`RANGE_CLOCK_NOT_RUN`] counts it. One that registered before a read but was proposed
+//!   after it, in one term, counts as proposed before. A split's children inherit the reads of
 //!   their source once a Catalog replica resolved the new routes, and an earlier split is
 //!   unknown if its routes arrived by snapshot. A latest read (`u64::MAX`) has no timestamp.
 //!   Reads that do not take the range clock, as on the queued write path, are not seen.
@@ -84,9 +96,15 @@ pub const REBUILD: &str = "MajorityReached/rebuild";
 pub const DEDUP_UNIQUE: &str = "DedupUnique";
 pub const NOT_APPLIED_NEVER_COMMITTED: &str = "NotAppliedNeverCommitted";
 pub const RANGE_CLOCK_RULE1: &str = "RangeClockRule1";
+/// Committed direct entries that RangeClockRule1 could not judge.
+pub const RANGE_CLOCK_NOT_RUN: &str = "RangeClockRule1/not_run";
 pub const KEYSPACE_COVERAGE: &str = "KeyspaceCoverage";
 pub const EXACTLY_ONCE_RELEASE: &str = "ExactlyOnceRelease";
 pub const RESOURCE_BASELINE: &str = "ResourceBaseline";
+
+/// The run wiped more voters of a group than the group tolerates. It is not an invariant: such
+/// a run is neither clean nor a detection, whatever else it reports.
+pub const BEYOND_FAULT_MODEL: &str = "BeyondFaultModel";
 
 /// Every invariant the probe stream checks, for the run's assertion map.
 pub const PROBE_INVARIANTS: [&str; 14] = [
@@ -227,6 +245,17 @@ struct AppliedEntry {
     committed_by: Option<(u64, LogPoint)>,
 }
 
+/// A committed direct commit.
+struct DirectCommit {
+    /// The stream positions between which it was proposed: both of its registration, or the
+    /// takeover of its leader and the first append of its entry.
+    after: u64,
+    by: u64,
+    /// RangeClockRule1 reported it, or cannot judge it.
+    reported: bool,
+    not_run: bool,
+}
+
 /// A registered direct commit.
 struct Proposal {
     term: u64,
@@ -243,8 +272,9 @@ pub struct Protocol {
     seq: u64,
     /// Per replica: its newest durable vote `(term, leader, committed)`.
     votes: BTreeMap<Replica, (u64, u64, bool)>,
-    /// Per group and committed vote: the simulated node that claimed it as leader.
-    leaders: BTreeMap<(Uuid, LogPoint), u64>,
+    /// Per group and committed vote: the simulated node that claimed it as leader first, and
+    /// when.
+    leaders: BTreeMap<(Uuid, LogPoint), (u64, u64)>,
     /// Per group: voter configurations by log index and log id.
     voters: BTreeMap<Uuid, BTreeMap<(u64, LogPoint), Vec<Vec<u64>>>>,
     /// Per replica: its durable log, index to log id.
@@ -255,6 +285,8 @@ pub struct Protocol {
     applied: BTreeMap<Uuid, BTreeMap<u64, AppliedEntry>>,
     /// Entries already reported as lost.
     lost: BTreeSet<(Uuid, u64)>,
+    /// Per wiped replica that has not caught up since: the last index it may have held.
+    wiped: BTreeMap<Replica, u64>,
     /// Per node incarnation and replica: the last applied index.
     last_applied: BTreeMap<(u64, u64, Replica), u64>,
     /// Where each replica runs.
@@ -279,9 +311,10 @@ pub struct Protocol {
     served: BTreeMap<Uuid, Vec<(u64, u64)>>,
     /// Per group and commit timestamp: the registrations of a direct commit.
     proposals: BTreeMap<(Uuid, u64), Vec<Proposal>>,
-    /// Committed direct commits by group and timestamp: where they registered, and whether
-    /// RangeClockRule1 reported them.
-    direct: BTreeMap<(Uuid, u64), (u64, bool)>,
+    /// Committed direct commits by group and timestamp.
+    direct: BTreeMap<(Uuid, u64), DirectCommit>,
+    /// Per group, log index and log id: where some replica first synced the entry.
+    appended: BTreeMap<(Uuid, u64, LogPoint), u64>,
     /// Per group that a split created: its source, and where in the stream the source's
     /// reads stop counting. `None` while no route names the source any more.
     sources: BTreeMap<Uuid, BTreeMap<Uuid, Option<u64>>>,
@@ -345,6 +378,8 @@ impl Protocol {
                 self.place(*group, *replica, node);
                 for entry in entries {
                     let (index, id) = (entry.at.index, point(&entry.at));
+                    let first = self.appended.entry((*group, index, id));
+                    first.or_insert(self.seq);
                     let log = self.durable.entry((*group, *replica)).or_default();
                     if let Some(old) = log.insert(index, id).filter(|old| *old != id) {
                         self.removed(*group, *replica, "overwrote", index, old, &mut out);
@@ -356,6 +391,7 @@ impl Protocol {
                             .insert((entry.at.index, point(&entry.at)), voters.clone());
                     }
                 }
+                self.caught_up((*group, *replica));
             }
             Probe::Recovered {
                 group,
@@ -396,6 +432,7 @@ impl Protocol {
                 self.place(*group, *replica, node);
                 self.purged
                     .insert((*group, *replica), (upto.index, point(upto)));
+                self.caught_up((*group, *replica));
             }
             Probe::Applied {
                 group,
@@ -586,7 +623,8 @@ impl Protocol {
     fn leads(&mut self, node: Option<u64>, group: Uuid, vote: LogPoint, out: &mut Vec<Violation>) {
         let Some(node) = node else { return };
         self.ran(ELECTION_SAFETY, 1);
-        let first = *self.leaders.entry((group, vote)).or_insert(node);
+        let claim = (node, self.seq);
+        let (first, _) = *self.leaders.entry((group, vote)).or_insert(claim);
         if first != node {
             out.push((
                 ELECTION_SAFETY,
@@ -704,7 +742,46 @@ impl Protocol {
             None => self.purged.remove(&key),
         };
         self.durable.insert(key, entries);
+        self.caught_up(key);
         self.rebuild(group, replica, out);
+    }
+
+    /// A wiped replica counts again once it holds what it may have lost.
+    fn caught_up(&mut self, key: Replica) {
+        let Some(upto) = self.wiped.get(&key) else {
+            return;
+        };
+        let applied = self.applied.get(&key.0).into_iter();
+        let mut entries = applied.flat_map(|entries| entries.range(..=upto));
+        if entries.all(|(index, entry)| self.holds(&key, *index, entry.id)) {
+            self.wiped.remove(&key);
+        }
+    }
+
+    /// The newest applied configuration of `group`.
+    fn in_force(&self, group: Uuid) -> Option<(&(u64, LogPoint), &Vec<Vec<u64>>)> {
+        let configurations = self.voters.get(&group)?;
+        configurations
+            .iter()
+            .rfind(|((at, id), _)| self.is_applied(group, *at, *id))
+    }
+
+    /// BeyondFaultModel: the voters of `group` that were not wiped are no majority.
+    fn beyond(&self, group: Uuid) -> Option<Violation> {
+        let (config, joint) = self.in_force(group)?;
+        let voters: BTreeSet<u64> = joint.iter().flatten().copied().collect();
+        let (wiped, left): (BTreeSet<u64>, BTreeSet<u64>) = voters
+            .into_iter()
+            .partition(|replica| self.wiped.contains_key(&(group, *replica)));
+        (!quorum(joint, &left)).then(|| {
+            (
+                BEYOND_FAULT_MODEL,
+                format!(
+                    "group {group}: the run wiped voters {wiped:?} of {joint:?} (index {}) without a recovery in between, and {left:?} are no majority",
+                    config.0
+                ),
+            )
+        })
     }
 
     /// MajorityReached at a start of `starting`: every applied entry of the group is durable
@@ -716,10 +793,7 @@ impl Protocol {
             return;
         };
         let configurations = self.voters.get(&group);
-        let in_force = configurations
-            .into_iter()
-            .flatten()
-            .rfind(|((at, id), _)| self.is_applied(group, *at, *id));
+        let in_force = self.in_force(group);
         let mut found = Vec::new();
         for (index, entry) in entries {
             let holds = |replica: &u64| self.holds(&(group, *replica), *index, entry.id);
@@ -824,7 +898,7 @@ impl Protocol {
                     ),
                 ));
             }
-            self.committed_direct(group, *commit_ts, entry.term, out);
+            self.committed_direct(group, *commit_ts, entry, out);
         }
     }
 
@@ -846,50 +920,80 @@ impl Protocol {
         highest
     }
 
-    /// RangeClockRule1: a direct commit at `commit_ts` was applied in an entry of `term`. Its
-    /// registration, the one of that term if there are several, must precede every snapshot
-    /// served at or above it. A registration that never commits breaks nothing: a deposed
-    /// leader may register below reads its successor served.
+    /// RangeClockRule1: a direct commit at `commit_ts` was applied in the entry at `entry`. Its
+    /// registration in the term of that entry must precede every snapshot served at or above
+    /// it. Without one, the entry was proposed after its leader took over and before its first
+    /// append, whatever registered in another term. A registration that never commits breaks
+    /// nothing: a deposed leader may register below reads its successor served.
     fn committed_direct(
         &mut self,
         group: Uuid,
         commit_ts: u64,
-        term: u64,
+        entry: &AppliedPosition,
         out: &mut Vec<Violation>,
     ) {
         let key = (group, commit_ts);
-        let Some(proposals) = self.proposals.get(&key) else {
+        if self.direct.contains_key(&key) {
             return;
-        };
-        let same_term = proposals.iter().rev().find(|of| of.term == term);
-        let Some(proposal) = same_term.or_else(|| proposals.last()) else {
-            return;
-        };
-        let seq = proposal.seq;
-        if let std::collections::btree_map::Entry::Vacant(commit) = self.direct.entry(key) {
-            commit.insert((seq, false));
-            if self.served_before(group, seq).is_some() {
-                self.ran(RANGE_CLOCK_RULE1, 1);
+        }
+        let proposals = self.proposals.get(&key).into_iter().flatten();
+        let registered = proposals.rev().find(|of| of.term == entry.term);
+        let took_over = self.leaders.get(&(group, point(entry)));
+        let appended = self.appended.get(&(group, entry.index, point(entry)));
+        let (after, by) = match (registered, took_over) {
+            (Some(of), _) => (of.seq, of.seq),
+            (None, Some((_, seq))) => (*seq, appended.copied().unwrap_or(self.seq)),
+            (None, None) => {
+                self.ran(RANGE_CLOCK_NOT_RUN, 1);
+                let commit = DirectCommit {
+                    after: 0,
+                    by: 0,
+                    reported: false,
+                    not_run: true,
+                };
+                self.direct.insert(key, commit);
+                return;
             }
-            self.range_clock(key, out);
+        };
+        let commit = DirectCommit {
+            after,
+            by,
+            reported: false,
+            not_run: false,
+        };
+        self.direct.insert(key, commit);
+        self.range_clock(key, out);
+        let judged = !self.direct[&key].not_run;
+        if judged && self.served_before(group, by).is_some() {
+            self.ran(RANGE_CLOCK_RULE1, 1);
         }
     }
 
     fn range_clock(&mut self, key: (Uuid, u64), out: &mut Vec<Violation>) {
-        let Some(&(seq, false)) = self.direct.get(&key) else {
+        let (group, commit_ts) = key;
+        let Some(commit) = self.direct.get(&key).filter(|of| !of.reported) else {
             return;
         };
-        let (group, commit_ts) = key;
-        if let Some(served) = self.served_before(group, seq)
-            && commit_ts <= served
-        {
-            self.direct.insert(key, (seq, true));
+        let read_before = |seq| {
+            self.served_before(group, seq)
+                .filter(|read| commit_ts <= *read)
+        };
+        let (illegal, between) = (read_before(commit.after), read_before(commit.by));
+        let unknown = between.is_some() && !commit.not_run;
+        let Some(commit) = self.direct.get_mut(&key) else {
+            return;
+        };
+        if let Some(read) = illegal {
+            commit.reported = true;
             out.push((
                 RANGE_CLOCK_RULE1,
                 format!(
-                    "group {group}: direct commit at {commit_ts} registered after a snapshot at {served} was served on its range"
+                    "group {group}: direct commit at {commit_ts} was proposed after a snapshot at {read} was served on its range"
                 ),
             ));
+        } else if unknown {
+            commit.not_run = true;
+            self.ran(RANGE_CLOCK_NOT_RUN, 1);
         }
     }
 
@@ -1009,17 +1113,30 @@ impl Protocol {
 
     /// The node's volume was replaced: its replicas lost their logs. A vote the old
     /// volume saved still binds the replica (MonotonicVote has no exemption).
-    pub fn wiped(&mut self, node: u64) {
+    /// Returns the groups that lost more voters than they tolerate.
+    pub fn wiped(&mut self, node: u64) -> Vec<Violation> {
         let lost: Vec<_> = self
             .replica_node
             .iter()
             .filter(|(_, owner)| **owner == node)
             .map(|(replica, _)| *replica)
             .collect();
+        let mut groups = BTreeSet::new();
         for replica in lost {
-            self.durable.remove(&replica);
-            self.purged.remove(&replica);
+            let log = self.durable.remove(&replica);
+            let log = log.and_then(|log| log.last_key_value().map(|(index, _)| *index));
+            let purged = self.purged.remove(&replica).map(|(upto, _)| upto);
+            let applied = self.applied.get(&replica.0);
+            let applied = applied.and_then(|of| of.last_key_value().map(|(index, _)| *index));
+            let held = log.max(purged).max(applied).unwrap_or(0);
+            let upto = self.wiped.entry(replica).or_default();
+            *upto = held.max(*upto);
+            groups.insert(replica.0);
         }
+        groups
+            .into_iter()
+            .filter_map(|group| self.beyond(group))
+            .collect()
     }
 
     /// The run's guards.
@@ -1620,6 +1737,191 @@ mod tests {
         assert_eq!(protocol.committed().count(), 1);
     }
 
+    /// Group `GROUP` with the configurations `configs`, in order, and one more entry, all held
+    /// and applied by replicas 1 to 5. Returns the log.
+    fn configured(configs: &[Vec<Vec<u64>>]) -> (Protocol, Vec<AppliedPosition>) {
+        let mut protocol = Protocol::new();
+        let mut log = Vec::new();
+        for (index, voters) in (1..).zip(configs) {
+            log.push(at(index, 1));
+            for replica in 1..=5 {
+                let probe = Probe::Appended {
+                    group: GROUP,
+                    kind: GroupKind::Catalog,
+                    replica,
+                    entries: vec![LogEntry {
+                        at: at(index, 1),
+                        voters: Some(voters.clone()),
+                    }],
+                };
+                protocol.observe(origin(replica), &probe);
+            }
+        }
+        let last = at(log.len() as u64 + 1, 1);
+        log.push(last);
+        for replica in 1..=5 {
+            protocol.observe(origin(replica), &plain(replica, &[last]));
+        }
+        for entry in &log {
+            let found = protocol.observe(origin(1), &applied(1, *entry, 9));
+            assert!(found.is_empty(), "{found:?}");
+        }
+        (protocol, log)
+    }
+
+    /// Like [`appended`], without a configuration at index 1.
+    fn plain(replica: u64, entries: &[AppliedPosition]) -> Probe {
+        Probe::Appended {
+            group: GROUP,
+            kind: GroupKind::Catalog,
+            replica,
+            entries: entries
+                .iter()
+                .map(|at| LogEntry {
+                    at: *at,
+                    voters: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Crashes and wipes each node in turn, and starts none. Returns what each wipe reports.
+    fn wipes(protocol: &mut Protocol, nodes: &[u64]) -> Vec<Vec<&'static str>> {
+        nodes
+            .iter()
+            .map(|node| {
+                protocol.crashed(*node);
+                kinds(&protocol.wiped(*node))
+            })
+            .collect()
+    }
+
+    const BEYOND: &[&str] = &[BEYOND_FAULT_MODEL];
+    const WITHIN: &[&str] = &[];
+
+    #[test]
+    fn two_of_three_wiped_voters_are_beyond_the_fault_model_with_nobody_restarting() {
+        let (mut protocol, log) = configured(&[vec![vec![1, 2, 3]]]);
+        assert_eq!(wipes(&mut protocol, &[2, 3]), [WITHIN, BEYOND]);
+        // It excuses nothing: the entries are on one of three at the next start.
+        let start = protocol.observe(origin(1), &recovered(1, None, &log));
+        assert_eq!(kinds(&start), [MAJORITY_REACHED, MAJORITY_REACHED]);
+        // All three, and a group of one.
+        let (mut protocol, _) = configured(&[vec![vec![1, 2, 3]]]);
+        assert_eq!(wipes(&mut protocol, &[1, 2, 3]), [WITHIN, BEYOND, BEYOND]);
+        let (mut protocol, _) = configured(&[vec![vec![1]]]);
+        assert_eq!(wipes(&mut protocol, &[2, 1]), [WITHIN, BEYOND]);
+        // Five voters tolerate two.
+        let (mut protocol, _) = configured(&[vec![vec![1, 2, 3, 4, 5]]]);
+        assert_eq!(wipes(&mut protocol, &[5, 1, 2]), [WITHIN, WITHIN, BEYOND]);
+    }
+
+    #[test]
+    fn one_of_three_wiped_voters_is_within_the_fault_model() {
+        let (mut protocol, _) = configured(&[vec![vec![1, 2, 3]]]);
+        // Also twice, with a start in between, and with nodes that hold no voter.
+        assert_eq!(wipes(&mut protocol, &[2, 2, 4, 5]), [WITHIN; 4]);
+        assert!(
+            protocol
+                .observe(origin(2), &recovered(2, None, &[]))
+                .is_empty()
+        );
+        assert_eq!(wipes(&mut protocol, &[2]), [WITHIN]);
+        // A group that has applied nothing is not judged.
+        let mut empty = Protocol::new();
+        for replica in 1..=3 {
+            empty.observe(origin(replica), &appended(replica, &[at(1, 1)]));
+        }
+        assert_eq!(wipes(&mut empty, &[1, 2, 3]), [WITHIN; 3]);
+    }
+
+    #[test]
+    fn a_wiped_voter_counts_again_once_it_has_caught_up() {
+        let purged = |replica, upto| Probe::Purged {
+            group: GROUP,
+            kind: GroupKind::Catalog,
+            replica,
+            upto,
+        };
+        let voters = || vec![vec![1, 2, 3]];
+        // Through the log, and then the next one through a snapshot.
+        let (mut protocol, log) = configured(&[voters()]);
+        assert_eq!(wipes(&mut protocol, &[2]), [WITHIN]);
+        protocol.observe(origin(2), &recovered(2, None, &[]));
+        protocol.observe(origin(2), &plain(2, &log));
+        assert_eq!(wipes(&mut protocol, &[3]), [WITHIN]);
+        protocol.observe(origin(3), &recovered(3, None, &[]));
+        protocol.observe(origin(3), &purged(3, log[1]));
+        assert_eq!(wipes(&mut protocol, &[1]), [WITHIN]);
+        // Without a start, with an empty one, with part of the log, and with another entry.
+        let stale = at(2, 7);
+        for steps in [
+            vec![],
+            vec![recovered(2, None, &[])],
+            vec![recovered(2, None, &[]), plain(2, &log[..1])],
+            vec![recovered(2, Some(log[0]), &[])],
+            vec![recovered(2, Some(stale), &[])],
+            vec![recovered(2, None, &[log[0], stale])],
+        ] {
+            let (mut protocol, _) = configured(&[voters()]);
+            assert_eq!(wipes(&mut protocol, &[2]), [WITHIN]);
+            for step in &steps {
+                protocol.observe(origin(2), step);
+            }
+            assert_eq!(wipes(&mut protocol, &[3]), [BEYOND], "{steps:?}");
+        }
+        // Entries applied after the wipe are no part of what it lost.
+        let (mut protocol, log) = configured(&[voters()]);
+        assert_eq!(wipes(&mut protocol, &[2]), [WITHIN]);
+        for replica in [1, 3] {
+            protocol.observe(origin(replica), &plain(replica, &[at(3, 1)]));
+        }
+        protocol.observe(origin(1), &applied(1, at(3, 1), 9));
+        protocol.observe(origin(2), &recovered(2, None, &log));
+        assert_eq!(wipes(&mut protocol, &[3]), [WITHIN]);
+        // An entry it held that is applied only later is: it may be the only other copy.
+        let (mut protocol, log) = configured(&[voters()]);
+        for replica in [1, 2] {
+            protocol.observe(origin(replica), &plain(replica, &[at(3, 1)]));
+        }
+        assert_eq!(wipes(&mut protocol, &[2]), [WITHIN]);
+        protocol.observe(origin(3), &plain(3, &[at(3, 1)]));
+        protocol.observe(origin(1), &applied(1, at(3, 1), 9));
+        protocol.observe(origin(2), &recovered(2, None, &log));
+        assert_eq!(wipes(&mut protocol, &[3]), [BEYOND]);
+    }
+
+    #[test]
+    fn wipes_are_judged_in_both_halves_of_a_joint_configuration() {
+        let joint = || vec![vec![1, 2, 3], vec![1, 4, 5]];
+        let moving = || configured(&[vec![vec![1, 2, 3]], joint()]).0;
+        // One of each half, and then two of one half.
+        assert_eq!(wipes(&mut moving(), &[2, 4]), [WITHIN, WITHIN]);
+        assert_eq!(wipes(&mut moving(), &[2, 4, 5]), [WITHIN, WITHIN, BEYOND]);
+        assert_eq!(wipes(&mut moving(), &[2, 3]), [WITHIN, BEYOND]);
+        assert_eq!(wipes(&mut moving(), &[4, 5]), [WITHIN, BEYOND]);
+        // Voter 1 is in both.
+        assert_eq!(wipes(&mut moving(), &[1, 5]), [WITHIN, BEYOND]);
+        // Once the new configuration is applied, the removed voters no longer count.
+        let moved = || configured(&[vec![vec![1, 2, 3]], joint(), vec![vec![1, 4, 5]]]).0;
+        assert_eq!(wipes(&mut moved(), &[2, 3, 4]), [WITHIN; 3]);
+        assert_eq!(wipes(&mut moved(), &[2, 4, 5]), [WITHIN, WITHIN, BEYOND]);
+        // One that is only appended does not count yet.
+        let (mut protocol, _) = configured(&[vec![vec![1, 2, 3]]]);
+        let appended_only = Probe::Appended {
+            group: GROUP,
+            kind: GroupKind::Catalog,
+            replica: 1,
+            entries: vec![LogEntry {
+                at: at(3, 1),
+                voters: Some(joint()),
+            }],
+        };
+        protocol.observe(origin(1), &appended_only);
+        assert_eq!(wipes(&mut protocol, &[4, 5, 2]), [WITHIN; 3]);
+        assert_eq!(wipes(&mut protocol, &[3]), [BEYOND]);
+    }
+
     fn served(group: Uuid, read_ts: u64) -> Probe {
         Probe::SnapshotServed { group, read_ts }
     }
@@ -1634,6 +1936,16 @@ mod tests {
 
     /// Replica 1 of `group` applies a direct commit at `index`, of term 1.
     fn commits(protocol: &mut Protocol, group: Uuid, index: u64, commit_ts: u64) -> Vec<Violation> {
+        commits_in(protocol, group, at(index, 1), commit_ts)
+    }
+
+    fn commits_in(
+        protocol: &mut Protocol,
+        group: Uuid,
+        entry: AppliedPosition,
+        commit_ts: u64,
+    ) -> Vec<Violation> {
+        let index = entry.index;
         let mut out = Vec::new();
         let probes = [
             Probe::Appended {
@@ -1641,7 +1953,7 @@ mod tests {
                 kind: GroupKind::Catalog,
                 replica: 1,
                 entries: vec![LogEntry {
-                    at: at(index, 1),
+                    at: entry,
                     voters: (index == 1).then(|| vec![vec![1]]),
                 }],
             },
@@ -1658,7 +1970,7 @@ mod tests {
                 group,
                 kind: GroupKind::Catalog,
                 replica: 1,
-                entry: at(index, 1),
+                entry,
                 digest: Digest::from_bytes([1; 32]),
             },
         ];
@@ -1691,6 +2003,119 @@ mod tests {
         // A deposed leader registers the timestamp again, below a read its successor served.
         protocol.observe(origin(3), &proposed(GROUP, 15, 2));
         assert!(commits(&mut protocol, GROUP, 1, 15).is_empty());
+    }
+
+    #[test]
+    fn a_commit_that_did_not_register_in_its_term_was_proposed_after_the_takeover() {
+        // The leader of an entry is replica 1; a takeover of term 2 is its committed vote.
+        let takeover = || Probe::VoteSaved {
+            group: GROUP,
+            kind: GroupKind::Catalog,
+            replica: 1,
+            term: 2,
+            leader: 1,
+            committed: true,
+        };
+        let run = |probes: &[Probe], term| {
+            let mut protocol = Protocol::new();
+            for probe in probes {
+                assert!(protocol.observe(origin(1), probe).is_empty());
+            }
+            let found = commits_in(&mut protocol, GROUP, at(1, term), 15);
+            let rule = |name| protocol.exercised().get(name).copied().unwrap_or(0);
+            let ran = (rule(RANGE_CLOCK_RULE1), rule(RANGE_CLOCK_NOT_RUN));
+            (kinds(&found), ran)
+        };
+        let (term_1, read) = (proposed(GROUP, 15, 1), served(GROUP, 20));
+        let red = vec![RANGE_CLOCK_RULE1];
+        // Registered in term 1, read, taken over, proposed in term 2 without registering.
+        let late = [term_1.clone(), read.clone(), takeover()];
+        assert_eq!(run(&late, 2), (red.clone(), (1, 0)));
+        // Never registered at all.
+        let never = [read.clone(), takeover()];
+        assert_eq!(run(&never, 2), (red.clone(), (1, 0)));
+        // The same registration commits in its own term, before any takeover counts.
+        assert_eq!(run(&late, 1), (vec![], (0, 0)));
+        // Registered in term 2 as well, above no read.
+        let again = [
+            term_1.clone(),
+            takeover(),
+            proposed(GROUP, 15, 2),
+            read.clone(),
+        ];
+        assert_eq!(run(&again, 2), (vec![], (0, 0)));
+        // Registered in term 2 after the read.
+        let below = [takeover(), read.clone(), proposed(GROUP, 15, 2)];
+        assert_eq!(run(&below, 2), (red, (1, 0)));
+        // Not judged: a takeover that the stream does not show.
+        assert_eq!(run(&[term_1, read], 2), (vec![], (0, 1)));
+    }
+
+    #[test]
+    fn a_read_between_the_takeover_and_the_append_is_not_judged() {
+        // The fixtures of M1 in the re-check of #116. The read is served before the entry is
+        // appended, and the stream does not say whether it was proposed by then.
+        let takeover = Probe::VoteSaved {
+            group: GROUP,
+            kind: GroupKind::Catalog,
+            replica: 1,
+            term: 2,
+            leader: 1,
+            committed: true,
+        };
+        let run = |probes: &[Probe]| {
+            let mut protocol = Protocol::new();
+            for probe in probes {
+                assert!(protocol.observe(origin(1), probe).is_empty());
+            }
+            let found = commits_in(&mut protocol, GROUP, at(1, 2), 15);
+            let rule = |name| protocol.exercised().get(name).copied().unwrap_or(0);
+            let ran = (rule(RANGE_CLOCK_RULE1), rule(RANGE_CLOCK_NOT_RUN));
+            (kinds(&found), ran)
+        };
+        let not_run = (vec![], (0, 1));
+        // Registered in term 1, never registered, and late in a long term.
+        let term_1 = [proposed(GROUP, 15, 1), takeover.clone(), served(GROUP, 20)];
+        assert_eq!(run(&term_1), not_run);
+        assert_eq!(run(&[takeover.clone(), served(GROUP, 20)]), not_run);
+        let mut long = vec![takeover.clone()];
+        long.extend((0..10).map(|n| proposed(GROUP, 30 + n, 2)));
+        long.push(served(GROUP, 25));
+        assert_eq!(run(&long), not_run);
+        // Judged: a read below the commit, one after the first append, and one before the
+        // takeover as well, which is red.
+        assert_eq!(
+            run(&[takeover.clone(), served(GROUP, 14)]),
+            (vec![], (1, 0))
+        );
+        let appended = Probe::Appended {
+            group: GROUP,
+            kind: GroupKind::Catalog,
+            replica: 1,
+            entries: vec![LogEntry {
+                at: at(1, 2),
+                voters: Some(vec![vec![1]]),
+            }],
+        };
+        let legal = [takeover.clone(), appended, served(GROUP, 20)];
+        assert_eq!(run(&legal), (vec![], (0, 0)));
+        let both = [served(GROUP, 20), takeover.clone(), served(GROUP, 21)];
+        assert_eq!(run(&both), (vec![RANGE_CLOCK_RULE1], (1, 0)));
+        // Another id at the index is another entry.
+        let other = [takeover, appended_at(at(1, 1)), served(GROUP, 20)];
+        assert_eq!(run(&other), not_run);
+    }
+
+    fn appended_at(entry: AppliedPosition) -> Probe {
+        Probe::Appended {
+            group: GROUP,
+            kind: GroupKind::Catalog,
+            replica: 1,
+            entries: vec![LogEntry {
+                at: entry,
+                voters: None,
+            }],
+        }
     }
 
     #[test]

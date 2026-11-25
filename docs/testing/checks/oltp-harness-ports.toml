@@ -1,0 +1,11 @@
+id = "oltp-harness-ports"
+module = "oltp"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+command = ["python3", "-m", "unittest", "discover", "-v", "-s", "server/tests", "-p", "test_oltp_harness_ports.py"]
+cwd = "."
+timeout_s = 180
+needs = []
+result_parser = "unittest"

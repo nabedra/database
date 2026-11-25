@@ -200,9 +200,12 @@ fn a_tape_replaces_the_fresh_draws() {
 fn an_unseeded_build_refuses_a_required_seeded_sweep() {
     let mut config = config("unseeded", 1, 1);
     config.require_seeded = true;
-    sweep(&config, |seed, _| SeedRun {
-        seed,
-        ..SeedRun::default()
+    // This panic is the test's own, not that of a trace another test has open.
+    crate::tla_trace::attributed(|| {
+        sweep(&config, |seed, _| SeedRun {
+            seed,
+            ..SeedRun::default()
+        })
     });
 }
 

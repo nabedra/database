@@ -54,9 +54,19 @@ the wall-clock budget of each run: 15 minutes for L1 and L2, 60 for L3.
 and every kind T check when `specs/lib/**` or `specs/tools/**` changes.
 
 Every `INVARIANT` and `PROPERTY` of a baseline needs a mutant whose
-`\* expect:` line names it. Only a type invariant may be exempted, with a
-line in the baseline cfg such as
+`\* expect:` line names it, and the baselines check at least one. Only a
+type invariant, with `Type` in its name, may be exempted, with a line in the
+baseline cfg such as
 `\* no-mutant: TypeOK -- the type invariant; every run checks it.`
+
+A `CONSTRAINT` may only be a conjunction of upper bounds on counters, and it
+and an override of a defined operator need a line
+`\* limit: <Name> -- <reason>` in the cfg. The runner refuses other limits on
+the search, such as an `ACTION_CONSTRAINT`, a depth limit or a `VIEW`, in
+baselines and mutants, and a cfg that sets a name twice. A mutant sets the constant `Mutant` to another value
+than the baseline that checks its property. Its control, the same cfg with
+the baseline's value, has to pass before the mutant counts. See
+[limits on the search](../.agents/skills/design-review/references/tla.md#limits-on-the-search).
 
 ## Run
 
@@ -146,13 +156,13 @@ and `\* trace: <path in the spec folder>`. Each is one assertion.
 
 Both print `nabedra-tla-summary: {json}` last. As the check's
 `result_parser = "tlc"`, it becomes the evidence record, with a `tla` object
-holding the distinct states, depth, coverage, each mutant's counterexample
-length, or the trace counts. Logs and counterexamples are artifacts.
+holding the distinct states, depth, coverage, the settings of each baseline
+and mutant, each mutant's counterexample length and control, or the trace counts. Logs and counterexamples are artifacts.
 
 | Outcome | Result |
 | --- | --- |
 | Every baseline exhaustive and clean, every action covered, every property mutated, every mutant caught on its property | `pass` |
-| A baseline violation, a coverage gap, an unmutated property, or a mutant that passes, errs or fails on another property | `fail` |
+| A baseline violation, a coverage gap, no property or an unmutated one, an undeclared or refused limit on the search, or a mutant that passes, errs or fails on another property, or whose control does not pass | `fail` |
 | A baseline stopped at the time budget or a state cap, with no failure | `not-run` |
 | A baseline TLC error, such as a parse or evaluation error, or a success message with a nonzero exit | `error` |
 | A trace no behavior explains, a lint failure, or an expected rejection or trace mutant that does not happen as expected | `fail` |
@@ -172,7 +182,8 @@ manager that crashes and restarts and a channel that loses messages. It has
 `TypeOK`, the safety invariant `Consistent`, the liveness property
 `Termination` under fairness named for its timers, its receive loop and its
 supervisor, two mutants (`commit_one_prepared` breaks `Consistent`,
-`no_resend` breaks `Termination`), and a trace spec. The accepted sample
+at a bound that needs a control run, and `no_resend` breaks `Termination`),
+and a trace spec. The accepted sample
 traces include one with 64-bit times and a 64-bit seed. The rejected ones
 cover a step the spec does not allow, missing variables (one, a set, one of
 two, all), a variable that nothing checks, a wrong value and set, an element

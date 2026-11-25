@@ -14,6 +14,8 @@
 //! - [`sweep`]: the seed sweep (seed ranges, `NABEDRA_SIM_JOBS` threads, the double-run
 //!   determinism check, failure artifacts) and the planted-bug search;
 //! - [`shrink`]: the adapter from a failing run to `nabedra_check::prop::shrink`;
+//! - [`tla_trace`]: the `nabedra.trace/1` writer and fault subscriber for TLA+ trace
+//!   validation, off unless `NABEDRA_TRACE_DIR` is set;
 //! - [`rng`] and [`runtime`]: stream derivation and the seeded paused runtime.
 //!
 //! The SplitMix64, FNV, `NetPlan::plan` and observer logic come from the Events phase 6
@@ -28,14 +30,16 @@ pub mod rng;
 pub mod runtime;
 pub mod shrink;
 pub mod sweep;
+pub mod tla_trace;
 pub mod trace;
 
 #[cfg(test)]
 mod tests;
 
 pub use nemesis::{Nemesis, Profile, Timeline};
-pub use net::{Filters, NetPlan, Plan};
+pub use net::{Filters, NetEvent, NetPlan, NetTap, Plan};
 pub use raft::{LeaderId, LogId, RaftObserver, Vote};
 pub use rng::{Draw, SplitMix64};
 pub use sweep::{PlantedSearch, SeedRun, SweepConfig, SweepReport};
+pub use tla_trace::{TlaSteps, TlaTrace};
 pub use trace::{Fnv, Trace, fnv};

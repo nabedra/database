@@ -28,6 +28,10 @@ pub const RECOVERY_LIMIT: Duration = Duration::from_secs(30);
 
 /// How many observations in a row, each at least [`STEP`] after the one before, must find a
 /// worker's resources at their baseline before it counts as settled.
+///
+/// The harness's network delays a message by 1 ms. On a slower one, message traffic alone keeps
+/// the ledgers off their baseline: with one-way delays of 1, 2 and 3 ms 20 of 20 smoke seeds
+/// settled, at 5 ms 5 of 20 were red on ResourceBaseline, and at 10 ms all 19 that were judged.
 pub const SETTLED_PASSES: u32 = 3;
 
 /// Prefix of the trace line that counts how often each probe rule ran. A rule it does not
@@ -146,10 +150,12 @@ impl Invariants {
         }
     }
 
-    /// True when no probe-driven invariant reported a violation.
+    /// True when no probe-driven invariant reported a violation, in a run that stayed within
+    /// the fault model.
     pub fn probe_invariants_hold(&self) -> bool {
         self.checks.lock().unwrap().violations.iter().all(|line| {
-            !protocol::PROBE_INVARIANTS.contains(&nabedra_sim::shrink::violation_kind(line))
+            let kind = nabedra_sim::shrink::violation_kind(line);
+            !protocol::PROBE_INVARIANTS.contains(&kind) && kind != protocol::BEYOND_FAULT_MODEL
         })
     }
 
@@ -301,10 +307,17 @@ impl Invariants {
     ///
     /// What it cannot see:
     ///
-    /// - a charge that comes and goes, and is gone for long enough to hold three observations
-    ///   and the steps between them (more than 20 ms), or that is there only between two
-    ///   samples;
-    /// - a charge first taken after the last observation. The workload stops observing once
+    /// - a charge that comes and goes, if the samples fall where it is gone. Only these pairs
+    ///   were measured (held/gone in ms), and no general bound follows from them. In the
+    ///   product on smoke seeds 1, 2 and 18, red every time: 2/1, 5/5, 8/2, 9/1, 10/10, 12/4,
+    ///   14/2, 15/1, 19/1, 18/2, 28/2, 45/5, 40/10, 49/1, 80/20, 90/10, 99/1, 150/10, 180/20,
+    ///   190/10, 285/15, 270/30, 475/25, 490/10, 980/20 and 999/1. Missed: 1/9, 160/40,
+    ///   400/100, 450/50, 800/200, 900/100 and 950/50, and 1/1 in 4 of 9 runs. In the settling
+    ///   loop alone, red in this many phases: 1/4 in 1 of 5, 2/3 in 2 of 5, 1/12 in 0 of 13,
+    ///   1/15 in 1 of 16, 2/18 in 4 of 20, 2/23 in 0 of 25 and 3/27 in 9 of 30. With requests
+    ///   of 5 or 10 ms there, 4/1 was missed in 2 of 50 cases, 9/1 in 1 and 8/2 in 4 of 100;
+    /// - a charge first taken after the last observation: one taken 40 ms or more after
+    ///   settling starts was missed. The workload stops observing once
     ///   every worker has settled at the same pass, or at its limit: if one worker never
     ///   settles, another is judged by what the limit caught, a message in flight included;
     /// - a leak by exactly what the baseline held, when the baseline was not steady

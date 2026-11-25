@@ -61,6 +61,10 @@ pub struct ProbeEvent {
     pub probe: Probe,
 }
 
+/// The kind of a fault of the harness itself, as `nabedra_sim` and `sim_bugs.py` name it. A
+/// run that reports it is not clean, and `sim_bugs.py` never counts it as a detection.
+pub(crate) const HARNESS: &str = "harness";
+
 type Filter = Box<dyn FnMut(&ProbeEvent) -> bool + Send>;
 
 /// Probe events a filter accepted, in stream order.
@@ -304,6 +308,7 @@ impl Probes {
 
     fn fault(&self, world: &World, event: &SimEvent<'_>) {
         let t_ns = u64::try_from(world.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let mut beyond = Vec::new();
         let mut hub = self.lock();
         let (node, action) = match event {
             SimEvent::Crash { node } => {
@@ -321,13 +326,19 @@ impl Probes {
                 (*node, "Restart")
             }
             SimEvent::Wipe { node, .. } => {
-                hub.protocol.wiped(*node);
+                beyond = hub.protocol.wiped(*node);
                 (*node, "Wipe")
             }
             _ => return,
         };
         if let Some(trace) = &mut hub.trace {
             trace.fault(t_ns, node, action);
+        }
+        drop(hub);
+        for (kind, detail) in beyond {
+            self.report(world, kind, detail);
+            // What every consumer already refuses to count: a fault of the harness itself.
+            self.report(world, HARNESS, format!("{kind}: not a detection"));
         }
     }
 
