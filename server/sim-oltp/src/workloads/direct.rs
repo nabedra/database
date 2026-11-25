@@ -53,7 +53,18 @@ pub(crate) async fn run(
     quiet: bool,
 ) -> Result<Report, String> {
     cluster.wait_direct().await?;
-    let table = create_table(cluster, &history).await?;
+    let table = create_table(cluster, &history, "sim_direct").await?;
+    let extra: usize = std::env::var("NABEDRA_DIAG_TABLES").map_or(0, |n| n.parse().unwrap());
+    let wall = std::time::Instant::now();
+    for index in 0..extra {
+        create_table(cluster, &history, &format!("extra_{index}")).await?;
+    }
+    if extra > 0 {
+        println!("SCRX tables {extra} created at {}ms virtual, wall {:.1}s", elapsed_ms(&cluster.world), wall.elapsed().as_secs_f64());
+        time::sleep(Duration::from_secs(5)).await;
+        for node in WORKERS { if let Ok(s) = cluster.stats(node).await { println!("SCRX n{node} working_decode_bytes {}", s["working_decode_bytes"]); } }
+        nabedra_resources::memory::diag::dump("tables");
+    }
     for node in WORKERS {
         let stats = cluster.stats(node).await?;
         cluster
@@ -415,12 +426,12 @@ async fn abandon(
 }
 
 /// Create the workload's table through the first gateway, retrying the same ID.
-async fn create_table(cluster: &Cluster, history: &Arc<Mutex<History>>) -> Result<String, String> {
+async fn create_table(cluster: &Cluster, history: &Arc<Mutex<History>>, name: &str) -> Result<String, String> {
     let node = CLIENTS[0];
     let gateway = GATEWAYS[0];
     let id = in_node(node, async { uuid_v4() }).await;
     let payload = json!({
-        "name": "sim_direct", "schema": {"id": "int64", "value": "int64"},
+        "name": name, "schema": {"id": "int64", "value": "int64"},
         "key": "id", "format": "parquet",
     });
     let mut client = history.lock().unwrap().client();
