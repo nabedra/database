@@ -11,9 +11,9 @@ tiers = ["T1"]
 # hold the largest Data apply budget (seed 22 never bound worker HTTP). Seed 66 is an
 # open finding: with fewer session slots than peers n102 never reaches the direct path.
 command = ["bash", "-euc", '''
-cargo test --locked -j 2 --release -p nabedra-database --no-default-features \
+cargo test --locked --release -p nabedra-database --no-default-features \
     --features oltp,sim --lib oltp_runtime::stage_timing::sim_tests:: -- --test-threads=1
-build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+build=(cargo test --locked --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
 report=../target/testing-logs/oltp-sim/sweep-report.json
 rm -f "$report"

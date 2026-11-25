@@ -8,8 +8,8 @@ guarantees = []
 scenarios = []
 tiers = ["T0", "T1"]
 command = ["bash", "-euc", '''
-cargo test --locked -j 2 -p nabedra-oltp-types --features sim --lib sim_probe:: -- --test-threads=1
-exec cargo test --locked -j 2 -p nabedra-sim-oltp --lib -- --test-threads=1 invariants:: probes:: trace::
+cargo test --locked -p nabedra-oltp-types --features sim --lib sim_probe:: -- --test-threads=1
+exec cargo test --locked -p nabedra-sim-oltp --lib -- --test-threads=1 invariants:: probes:: trace::
 ''']
 cwd = "server"
 timeout_s = 2400

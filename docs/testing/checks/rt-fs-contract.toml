@@ -11,8 +11,8 @@ scenarios = ["NS04", "NS05", "NS15"]
 tiers = ["T0", "T1"]
 command = ["sh", "-ec", '''
 echo 'Filesystem contract: RealFs on the runner and FaultFs as a fault model'
-cargo test --locked -j 2 -p nabedra-rt --test fs_contract
-cargo test --locked -j 2 -p nabedra-rt --features sim --test fs_contract
+cargo test --locked -p nabedra-rt --test fs_contract
+cargo test --locked -p nabedra-rt --features sim --test fs_contract
 ''']
 cwd = "server"
 timeout_s = 900

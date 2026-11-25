@@ -7,7 +7,7 @@ guarantees = []
 scenarios = []
 tiers = ["T2"]
 command = ["bash", "-euc", '''
-build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+build=(cargo test --locked --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
 exec timeout 2400s "${build[@]}" -- --ignored --exact --nocapture --test-threads=1 \
     panics::tests::no_panic_is_a_clean_seed_anywhere

@@ -8,7 +8,7 @@ scenarios = []
 tiers = ["T1"]
 # Shard 3 of 4. Build once, then allow the measured sweep at most 15 minutes.
 command = ["bash", "-euc", '''
-build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+build=(cargo test --locked --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
 # It poisons its process, so it runs alone.
 "${build[@]}" -- --ignored --exact panics::tests::an_escaped_panic_is_never_a_clean_seed_or_a_hit

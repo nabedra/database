@@ -11,7 +11,7 @@ tiers = ["T1"]
 command = ["bash", "-ec", '''
 transcripts="$PWD/../../target/testing-logs/logic-transcripts-python"
 rm -rf "$transcripts"
-(cd ../../server && NABEDRA_LOGIC_RECORD="$transcripts" cargo test --locked -j 2 --test olap_logic)
+(cd ../../server && NABEDRA_LOGIC_RECORD="$transcripts" cargo test --locked --test olap_logic)
 NABEDRA_LOGIC_TRANSCRIPTS="$transcripts" exec python3 -m unittest discover -v -s tests -p test_logic_replay.py -k test_replay
 ''']
 cwd = "orm/python"

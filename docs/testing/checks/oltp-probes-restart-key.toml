@@ -19,9 +19,9 @@ trap 'git -C "$root" worktree remove --force "$scratch" >/dev/null 2>&1 || true'
 git -C "$root" worktree add --detach "$scratch" HEAD >/dev/null
 probes=server/sim-oltp/src/probes
 cd "$scratch/server"
-build() { cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib --no-run; }
+build() { cargo test --locked --release -p nabedra-sim-oltp --lib --no-run; }
 run() {
-    timeout 900s cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib -- \
+    timeout 900s cargo test --locked --release -p nabedra-sim-oltp --lib -- \
         --exact --ignored --nocapture --test-threads=1 probes::tests::control_digests_replay
 }
 build

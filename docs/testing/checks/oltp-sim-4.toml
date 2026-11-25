@@ -8,7 +8,7 @@ scenarios = []
 tiers = ["T1"]
 # Shard 4 of 4. Build once, then allow the measured sweep at most 15 minutes.
 command = ["bash", "-euc", '''
-build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+build=(cargo test --locked --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
 report=../target/testing-logs/oltp-sim-4/sweep-report.json
 rm -f "$report"
