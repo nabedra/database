@@ -10,7 +10,7 @@ tiers = ["T1"]
 command = ["bash", "-euc", '''
 build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
-"${build[@]}" -- --test-threads=2 workloads:: nemesis:: node::tests::
+"${build[@]}" -- --test-threads=2 workloads:: nemesis:: node::tests:: panics:: sweep::tests::a_
 exec timeout 900s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1
 ''']
 cwd = "server"

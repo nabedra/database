@@ -587,6 +587,8 @@ pub(crate) async fn run(ctx: Ctx, program: Program) {
             break;
         }
         time::sleep(planned.think).await;
+        #[cfg(test)]
+        crate::panics::plant(&ctx.world, crate::panics::At::Client);
         let value = base + index as i64 * 10;
         let table = &ctx.table;
         let fresh_id = in_node(node, async { uuid_v4() }).await;

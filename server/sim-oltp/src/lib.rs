@@ -9,6 +9,7 @@ pub mod invariants;
 mod nemesis;
 pub mod net;
 mod node;
+mod panics;
 pub mod sweep;
 mod workload;
 mod workloads;

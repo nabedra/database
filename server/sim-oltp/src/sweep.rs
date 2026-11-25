@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 use crate::{
     nemesis::Selection,
+    panics::PANIC,
     workload::run_seed,
     workloads::{SCENARIOS, Scenarios, Workload, WorkloadChoice, clauses},
 };
@@ -25,6 +26,9 @@ const REPLAY: &str = "RUST_MIN_STACK=16777216 RUSTFLAGS=\"--cfg tokio_unstable\"
     --exact --nocapture --test-threads=1";
 const SMOKE: &str = "smoke";
 const EXPECTED_DEFECT: &str = "non-linearizable";
+/// The kind of a seed whose run panicked, and of one whose replay differed.
+const HARNESS: &str = "harness";
+const DETERMINISM: &str = "determinism";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Defect {
@@ -85,6 +89,9 @@ pub(crate) struct Setup {
     pub(crate) selection: Selection,
     /// `NABEDRA_SIM_PROFILE=none`: run the workload without a nemesis.
     pub(crate) quiet: bool,
+    /// A panic that a test plants in the run.
+    #[cfg(test)]
+    pub(crate) panic_at: Option<crate::panics::At>,
 }
 
 impl Setup {
@@ -93,6 +100,8 @@ impl Setup {
             workloads: WorkloadChoice::parse(SMOKE).expect("smoke workload"),
             selection: Selection::parse(&[]).expect("default selection"),
             quiet: true,
+            #[cfg(test)]
+            panic_at: None,
         }
     }
 
@@ -108,6 +117,8 @@ impl Setup {
             workloads,
             quiet: Selection::quiet(&profile),
             selection: Selection::parse(&profile)?,
+            #[cfg(test)]
+            panic_at: None,
         })
     }
 
@@ -255,6 +266,13 @@ fn run_search(
     if config.tape.is_some() || config.shrink {
         return Err("NABEDRA_SIM_EXPECT searches fresh seeds; use run or shrink for a tape".into());
     }
+    // A panic is a broken run, not a detection.
+    if let Some(kind) = expect
+        .iter()
+        .find(|kind| [HARNESS, DETERMINISM, PANIC].contains(&kind.as_str()))
+    {
+        return Err(format!("NABEDRA_SIM_EXPECT cannot search for {kind:?}").into());
+    }
     let search = PlantedSearch {
         label: config.label.clone(),
         first: config.first,
@@ -287,12 +305,25 @@ fn run_search(
             .first
             .checked_add(offset)
             .ok_or("seed range overflows u64")?;
-        let (kinds, workload, scenarios) = observed
-            .get(&seed)
-            .ok_or_else(|| format!("seed {seed} did not finish"))?;
-        seed_line(seed, kinds, *workload, setup.profile(seed), scenarios);
+        let (kinds, workload, scenarios) = searched(&observed, seed, setup);
+        seed_line(seed, &kinds, workload, setup.profile(seed), &scenarios);
     }
     result.map(|_| true).map_err(Into::into)
+}
+
+type SearchRow = (BTreeSet<String>, Workload, Scenarios);
+
+/// What the search reports for a seed of the prefix it considered. Every seed of the prefix
+/// ran. One without an observation panicked in the harness, as in a sweep: it is reported as a
+/// violation, and the seeds after it are still searched.
+fn searched(observed: &BTreeMap<u64, SearchRow>, seed: u64, setup: &Setup) -> SearchRow {
+    observed.get(&seed).cloned().unwrap_or_else(|| {
+        (
+            BTreeSet::from([HARNESS.to_owned()]),
+            setup.workloads.of(seed),
+            Scenarios::default(),
+        )
+    })
 }
 
 fn replay_command(defect: Defect) -> String {
@@ -421,10 +452,10 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         let observation = observed.get(&seed);
         let mut kinds = observation.map(|row| row.kinds.clone()).unwrap_or_default();
         if !summary.passed && observation.is_none() {
-            kinds.insert("harness".to_owned());
+            kinds.insert(HARNESS.to_owned());
         }
         if !summary.deterministic {
-            kinds.insert("determinism".to_owned());
+            kinds.insert(DETERMINISM.to_owned());
         }
         let seed_workload = observation.map_or(setup.workloads.of(seed), |row| row.workload);
         let tags = observation
@@ -798,6 +829,80 @@ fn sha256_file(path: &Path) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    /// Seed 2 panics below the hit at seed 3. Its line is a violation of kind `harness`, the
+    /// search goes on to the hit, and no panicked seed of the prefix is reported as a pass.
+    #[test]
+    fn a_panicking_seed_is_a_violation_and_the_search_goes_on() {
+        let setup = Setup::smoke();
+        for jobs in [1, 2] {
+            let observed = Mutex::new(BTreeMap::<u64, SearchRow>::new());
+            let mut search = PlantedSearch::new("panic", 1, 5, &["Expected"]);
+            search.jobs = jobs;
+            let found = search.run(|seed| {
+                assert!(seed != 2, "planted panic");
+                let violations = if seed == 3 {
+                    vec!["t=1ms Expected: hit".to_owned()]
+                } else {
+                    Vec::new()
+                };
+                let row = (
+                    shrink::kinds(&violations),
+                    Workload::Smoke,
+                    Scenarios::new(),
+                );
+                observed.lock().unwrap().insert(seed, row);
+                violations
+            });
+            let found = found.expect("the hit above the panic");
+            assert_eq!((found.seed, found.tried), (3, 3));
+            let observed = observed.into_inner().unwrap();
+            let kinds = |seed| searched(&observed, seed, &setup).0;
+            assert!(kinds(1).is_empty());
+            assert_eq!(kinds(2), BTreeSet::from([HARNESS.to_owned()]));
+            assert!(kinds(3).contains("Expected"));
+        }
+    }
+
+    /// The sweep itself: a body that panics in the first run, or only in the replay.
+    #[test]
+    fn a_panicking_seed_never_passes_a_sweep() {
+        let dir = std::env::temp_dir().join(format!("p10-panic-{}", std::process::id()));
+        for panicking in [0, 1] {
+            let mut config = SweepConfig::new("panic", 1, 1);
+            config.verify_replay = 1.0;
+            config.artifacts = dir.clone();
+            let runs = AtomicU64::new(0);
+            let report = sweep::sweep(&config, |seed, _| {
+                let run = runs.fetch_add(1, Ordering::SeqCst);
+                assert!(run != panicking, "planted panic");
+                SeedRun {
+                    seed,
+                    trace_hash: 7,
+                    trace_events: 1,
+                    ..SeedRun::default()
+                }
+            });
+            assert_eq!(runs.load(Ordering::SeqCst), 2);
+            assert!(!report.passed(), "panic in run {panicking}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A panic, or a replay that differed, cannot be what a search looks for.
+    #[test]
+    fn a_search_cannot_expect_a_panic() {
+        let setup = Setup::smoke();
+        let config = SweepConfig::new("panic", 1, 1);
+        for kind in [HARNESS, DETERMINISM, PANIC] {
+            let expect = vec!["Liveness".to_owned(), kind.to_owned()];
+            assert!(run_search(&config, Defect::None, expect, &setup).is_err());
+        }
+    }
+
     #[test]
     fn sweep() {
         assert!(super::run(super::Command::Sweep).expect("OLTP smoke sweep report"));

@@ -25,6 +25,7 @@ use crate::{
     history::{Client, Completion, History, Operation},
     invariants::{Invariants, STEP, TraceObserver, elapsed_ms},
     node::Cluster,
+    panics::{PANIC, Watch},
     sweep::{Defect, RunResult, Setup},
     workloads::{self, Scenarios, Workload},
 };
@@ -54,7 +55,12 @@ fn run(
         config.force("data.direct.batch", json!(true));
     }
     let program = (workload == Workload::Smoke).then(|| Program::generate(generator));
-    let (mut result, world) = nabedra_sim::runtime::run(seed, |world| async move {
+    let (mut result, world, panics) = nabedra_sim::runtime::run(seed, |world| async move {
+        let panics = Watch::new(&world);
+        #[cfg(test)]
+        if let Some(at) = setup.panic_at {
+            world.insert_ext(crate::panics::Planted { at, fired: false });
+        }
         let body = Body {
             seed,
             config,
@@ -66,7 +72,7 @@ fn run(
             generator,
         };
         let result = execute(body, world.clone()).await;
-        (result, world)
+        (result, world, panics)
     });
     // The runtime has dropped, including cancelled task futures.
     result.blocking_cpu = world.blocking_cpu_time();
@@ -78,6 +84,17 @@ fn run(
             "t={}ms RegistriesEmpty: live entries after runtime shutdown: {live:?}",
             result.run.virtual_ms
         ));
+    }
+    // Last, so that a panic while the runtime or the world was dropped counts as well.
+    let panicked = panics.finish();
+    result
+        .assertions
+        .insert("no task panicked", panicked.is_empty());
+    for panic in panicked {
+        result
+            .run
+            .violations
+            .push(format!("t={}ms {PANIC}: {panic}", result.run.virtual_ms));
     }
     result
 }
@@ -173,6 +190,8 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         nabedra_rt::task::spawn(async move {
             loop {
                 time::sleep(STEP).await;
+                #[cfg(test)]
+                crate::panics::plant(&world, crate::panics::At::Ticker);
                 checks.step(&world);
             }
         })
@@ -193,6 +212,11 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         Ok(mut cluster) => {
             let startup = cluster.start().await;
             assertions.insert("cluster readiness", startup.is_ok());
+            // Only then: a sweep is a test build too, and extra tasks change its schedule.
+            #[cfg(test)]
+            if setup.panic_at.is_some() {
+                plant_panics(&world);
+            }
             match startup {
                 Ok(()) if workload != Workload::Smoke => {
                     let report = workloads::direct::run(
@@ -311,6 +335,24 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         scenarios,
         summary,
     }
+}
+
+/// The panics of `panics::tests` that a started cluster can have anywhere.
+#[cfg(test)]
+fn plant_panics(world: &Arc<World>) {
+    use crate::panics::{At, plant};
+
+    plant(world, At::Body);
+    let run = |at| {
+        let world = world.clone();
+        async move { plant(&world, at) }
+    };
+    nabedra_rt::task::spawn(run(At::Task));
+    nabedra_rt::task::spawn(in_node(WORKERS[0], run(At::Node)));
+    let blocking = world.clone();
+    drop(nabedra_rt::task::spawn_blocking(move || {
+        plant(&blocking, At::Blocking);
+    }));
 }
 
 #[derive(Default)]
