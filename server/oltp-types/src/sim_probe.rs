@@ -298,6 +298,26 @@ pub fn active() -> bool {
     nabedra_rt::sim::world().is_some_and(|world| world.with_ext::<ProbeSink, _>(|_| ()).is_some())
 }
 
+/// P11-RES plants. True if `name` is selected and this is a due call of it.
+pub fn plant(name: &str, every: u64) -> bool {
+    static PLANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let chosen = PLANT.get_or_init(|| std::env::var("NABEDRA_P11RES_PLANT").ok());
+    if chosen.as_deref() != Some(name) || nabedra_rt::sim::world().is_none() {
+        return false;
+    }
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if call % every != 0 {
+        return false;
+    }
+    let fired = FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if fired.is_power_of_two() {
+        eprintln!("PLANT {name} fired {fired}");
+    }
+    true
+}
+
 /// How many guards the world has named.
 struct Guards(u64);
 

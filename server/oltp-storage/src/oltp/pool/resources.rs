@@ -536,12 +536,28 @@ impl WorkerSharedResources {
             ExecutionClass::Query => &self.query,
             ExecutionClass::Control => &self.control,
         };
+        struct LoseOnCancel(Option<NativeLease>);
+        impl Drop for LoseOnCancel {
+            fn drop(&mut self) {
+                if let Some(lease) = self.0.take()
+                    && nabedra_oltp_types::sim_probe::plant("lost-release-queue", 1)
+                {
+                    let NativeLease { permit, owner, settlement } = lease;
+                    drop(permit);
+                    drop(owner);
+                    std::mem::forget(settlement);
+                }
+            }
+        }
+        let mut waiting = LoseOnCancel(Some(lease));
         let permit = executor
             .slots
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| capacity())?;
+            .map_err(|_| capacity());
+        lease = waiting.0.take().expect("waiting lease");
+        let permit = permit?;
         #[cfg(feature = "sim")]
         let permit = SlotPermit::new(permit, class);
         lease.permit = Some(permit);
@@ -731,9 +747,20 @@ impl PreparedNative {
             self.lease.settlement.1,
             self.lease.permit.as_ref().map_or(0, |permit| permit.guard),
         );
-        let job = (guard, work, self.lease);
+        let NativeLease { mut permit, owner: lease_owner, settlement } = self.lease;
+        let mut settlement = Some(settlement);
+        // The guard stays in the caller's future, which a cancellation drops.
+        let mut _held_settlement = None;
+        let mut _held_permit = None;
+        if nabedra_oltp_types::sim_probe::plant("held-await", 1) {
+            _held_settlement = settlement.take();
+        }
+        if nabedra_oltp_types::sim_probe::plant("held-await-permit", 1) {
+            _held_permit = permit.take();
+        }
+        let job = (guard, work, (permit, lease_owner, settlement));
         executor.send(Box::new(move || {
-            let (guard, work, lease) = job;
+            let (guard, work, (permit, lease_owner, settlement)) = job;
             #[cfg(feature = "sim")]
             probe_work(&[probed, slot], None);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
@@ -743,19 +770,30 @@ impl PreparedNative {
             // Release the slot and the worker owner before the caller can see
             // the result: a caller that then drops its last owner must find the
             // worker unbound, or a reopen is refused (C02, CIfix1).
-            let NativeLease {
-                permit,
-                owner,
-                settlement,
-            } = lease;
             drop(permit);
-            drop(owner);
+            drop(lease_owner);
+            if let Some(held) = &settlement {
+                let again = tx.is_closed()
+                    && nabedra_oltp_types::sim_probe::plant("double-release", 1)
+                    || nabedra_oltp_types::sim_probe::plant("double-release-nth", 400);
+                if again {
+                    // Released here and by the receiver or the undelivered result.
+                    drop(NativeSettlement(held.0.clone(), held.1));
+                }
+            }
             // Keep the job tracked until receipt or until the undelivered
             // result and guard have both dropped.
-            let _ = tx.send((result, guard, settlement));
+            if let Err((_, _, undelivered)) = tx.send((result, guard, settlement)) {
+                if nabedra_oltp_types::sim_probe::plant("lost-release-result", 1) {
+                    std::mem::forget(undelivered);
+                }
+            }
         }))?;
-        let (result, guard, _settlement) =
+        let (result, guard, settled) =
             rx.await.map_err(|_| super::super::recovery_unknown())?;
+        if settled.is_some() && nabedra_oltp_types::sim_probe::plant("lost-release-nth", 400) {
+            std::mem::forget(settled);
+        }
         Ok((result, guard))
     }
 }

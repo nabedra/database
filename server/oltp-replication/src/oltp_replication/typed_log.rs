@@ -305,7 +305,20 @@ struct PendingGuard(
 /// the task's captured store, so `bind_worker` met the old owner).
 fn spawn_pending(pending: PendingGuard, task: impl Future<Output = ()> + Send + 'static) {
     nabedra_rt::task::spawn(async move {
+        let mut pending = Some(pending);
+        if nabedra_oltp_types::sim_probe::plant("append-early", 50) {
+            pending = None;
+        }
         task.await;
+        if pending.is_some() && nabedra_oltp_types::sim_probe::plant("append-lost", 200) {
+            std::mem::forget(pending);
+            return;
+        }
+        if let Some(held) = &pending
+            && nabedra_oltp_types::sim_probe::plant("append-double", 200)
+        {
+            drop(PendingGuard(held.0.clone(), held.1));
+        }
         drop(pending);
     });
 }
