@@ -1325,9 +1325,9 @@ def cmd_check(repo, bugs, out, require_evidence=True, every=None):
 class Scratch:
     """A detached worktree of HEAD and a temporary directory, removed on exit."""
 
-    def __init__(self, repo, keep=False):
+    def __init__(self, repo, keep=False, name=None):
         self.repo, self.keep = repo, keep
-        self.path = SCRATCH_BASE / f"sim-bugs-{os.getpid()}-{time.time_ns()}"
+        self.path = SCRATCH_BASE / f"sim-bugs-{name or f'{os.getpid()}-{time.time_ns()}'}"
         self.tmp = Path(f"{self.path}-tmp")
 
     def __enter__(self):
@@ -1337,6 +1337,8 @@ class Scratch:
             for name in ("config", "config.toml"):
                 if (parent / ".cargo" / name).exists():
                     raise Failure(f"the Cargo configuration {parent / '.cargo' / name} would reach every build in {self.path}")
+        if self.path.exists() or self.tmp.exists():
+            raise Failure(f"{self.path} is another run's, or one's that died: remove it first")
         git(self.repo, "worktree", "add", "--detach", "--quiet", str(self.path), "HEAD")
         self.tmp.mkdir(mode=0o700)
         return self
@@ -2284,7 +2286,10 @@ def open_job(repo, bugs, args, out, every):
     out_dir = Path(args.out or repo / "target/testing-logs" / f"sim-bugs-{args.command}-{os.getpid()}").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = Path(args.log or out_dir / f"sim-bugs-{args.command}.log")
-    with log_path.open("a", encoding="utf-8") as log, Scratch(repo, args.keep) as scratch:
+    # A sweep holds the path of the tree it was built in. Every job of a search in shards builds in the same one, so that
+    # the same source is the same binary.
+    name = None if args.command == "run" else hashlib.sha256(str(target).encode()).hexdigest()[:16]
+    with log_path.open("a", encoding="utf-8") as log, Scratch(repo, args.keep, name) as scratch:
         env = harness_env(target, scratch)
         print(f"cargo command: {args.cargo}", file=out, flush=True)
         sha = git(scratch.path, "rev-parse", "HEAD").stdout.strip()
@@ -2579,8 +2584,10 @@ def read_log(text, key, repo):
             raise Failure(f"it is of {what}")
     try:
         (n, parts), binaries, sha = done["shard"], done["binaries"], done["sha"]
+        if not (type(n) is type(parts) is int and 1 <= n <= parts <= SEED_BUDGET):
+            raise ValueError("it names no shard")
         first, last = shard_range(*key["plan"]["seeds"], n, parts)
-        if not (type(n) is type(parts) is int and 1 <= n <= parts <= SEED_BUDGET and done["seeds"] == [first, last]):
+        if done["seeds"] != [first, last]:
             raise ValueError("its range is not its shard's")
         if (set(binaries) != {"clean", "patched"} or not all(DIGEST.fullmatch(b) for b in binaries.values())
                 or binaries["clean"] == binaries["patched"]):
@@ -2694,7 +2701,7 @@ def read_shards(args, repo, bug, key, out):
         try:
             shards.append(read_shard(args, repo, key, name, data, record, files))
         except Failure as error:
-            problems.append(f"{record['check']} ({name}): {error}")
+            problems.append(f"{record['check']} ({name!r}): {error}")
     for problem in problems:
         print(f"{bug.id}: no shard: {problem}", file=out)
     return shards, problems
