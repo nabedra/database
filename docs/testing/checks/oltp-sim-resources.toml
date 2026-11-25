@@ -1,0 +1,22 @@
+id = "oltp-sim-resources"
+module = "oltp"
+kinds = ["S"]
+guarantees = []
+scenarios = []
+tiers = ["T2"]
+command = ["bash", "-euc", '''
+build=(cargo test --locked -j 4 --release -p nabedra-sim-oltp --lib)
+"${build[@]}" --no-run
+
+for x in "smoke 1" "smoke 2" "direct 1" "direct 2" "direct 3" "cold 1" "cold 2" "cold 4" "move 1" "move 2" "move 5" "mixed 9"; do set -- $x
+    NABEDRA_SIM_WORKLOAD=$1 NABEDRA_SEED=$2 NABEDRA_SIM_ARTIFACTS=$PWD/off/$1-$2 timeout 300s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1 >log 2>&1 || true
+    echo "OFF $x $(grep -o '"trace_hash": "[0-9a-f]*"' off/$1-$2/sweep-report.json | head -1) $(grep -o '"trace_events": [0-9]*' off/$1-$2/sweep-report.json | head -1)"
+done
+
+exit 0
+''']
+cwd = "server"
+timeout_s = 7200
+needs = []
+result_parser = "exit-code"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SEEDS = "1", NABEDRA_SIM_JOBS = "1", NABEDRA_SIM_VERIFY_REPLAY = "0" }
