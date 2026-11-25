@@ -15,7 +15,8 @@ A pass of a shard says that its range ran to the end. It is no detection and cla
 workloads.
 
 **Dispatch a shard from the commit it tests**: `--ref` a branch at that commit, and `sha=` the same commit. The attestation names the commit of the
-workflow that ran. The tool accepts only the tested commit there, so a branch with another workflow cannot write a record.
+workflow, and the run's title names the commit whose code ran and wrote the record. The tool wants both to be the record's commit. A shard that was
+dispatched from another ref is no shard.
 
 ## A shard
 
@@ -36,7 +37,7 @@ workflow that ran. The tool accepts only the tested commit there, so a branch wi
 
 **A run that dies is an `error`, not clean seeds.** A shard without its `complete` line (a signal, out of memory, a lost
 runner, a time limit, a missing or unreadable seed line) contributes nothing, not even the chunks it finished. Its range has
-to run again. A seed on which the harness panicked is a row with the kind `harness`: tried, not clean, listed in the result.
+to run again. A shard whose twin is not its base run ends with `sim-bugs-shard: disagree` and the key instead: one seed has two results. A seed on which the harness panicked is a row with the kind `harness`: tried, not clean, listed in the result.
 
 Steps 2 and 4 are ordinary sweeps. `NABEDRA_SIM_EXPECT` would stop at each hit and lose the rest of its parallel batch, and it
 reports no trace hash. Both modes report the kinds of the same run of a seed.
@@ -59,13 +60,22 @@ nondeterminism, and neither run wins.
 
 - `gh attestation verify` accepts it for this repository, the build workflow, a GitHub-hosted runner and the record's own commit, and the
   certificate names a dispatch, and the run and the attempt that the record names;
+- GitHub's API lists its run among those of that commit's workflow, as a dispatch of this repository, with that attempt, and with a title that names the
+  record's request and, as the tested commit, the record's. That commit's own workflow writes the title, so the code of that commit wrote the record;
 - its result is `pass`, its tree was clean, and its check is the one of that shard;
 - the one log it names is there, and names the same commit, run and attempt;
 - the log is whole: one `complete` line, after it nothing, and before it exactly the rows it names, one per seed and in order;
 - every row says by itself why its seed can or cannot count, and its replays fit;
 - it has this checkout's key, and its commit is in the clone and has that build.
 
-Everything else is no shard, and the merge prints why. The answer is the lowest seed that nothing masks, with `[[masked]]` of the manifest
+Everything else is no shard, and the merge prints why.
+
+**Every result of the commit has to be there.** The merge lists the jobs `Check oltp-sim-bugs-<id>-<n>`, of all attempts, of every run at that commit that
+tested it. A job that passed has to be a shard here. A job that did not pass and signed a record (its step "Attest the evidence records"
+succeeded) has to be here with that record, verified in the same way. A run or job that has not finished, a missing record, a list that is not whole and no answer
+from GitHub make the target `incomplete`. The counting run asks again. It has no token: the repository is public, and a rate limit is waited out for up to 65 minutes.
+
+The answer is the lowest seed that nothing masks, with `[[masked]]` of the manifest
 applied. **A hit counts only when every lower range is complete.** `not-detected` needs all ranges. A range that is missing,
 died, is unattested or is of another commit makes the answer `incomplete`. Ranges above the hit are not needed.
 
@@ -74,9 +84,10 @@ died, is unattested or is of another commit makes the answer `incomplete`. Range
 | `candidate` | The lowest unmasked hit. Rates and masks are over seeds 1 to the hit. Unmasked seeds above it in its range are listed and nothing more. |
 | `not-detected` | Every range is complete and every hit is masked. |
 | `incomplete` | Says nothing. |
-| `error` | Two runs of one range differ. Says nothing. |
+| `error` | Two runs of one range differ, or a signed record says `disagree`, in any range. Says nothing. |
 
-`--record` appends an answer (`candidate` or `not-detected`) to `searches.jsonl` as an entry of kind `merge`. `[detection]` names its hash.
+`--record` appends every result but `incomplete` to `searches.jsonl` as an entry of kind `merge`. `[detection]` names the hash of a `candidate`.
+**An `error` stays one**: while such an entry is there for a key, every merge and counting run of that key is an `error`, whatever records are left.
 
 ## The counting run
 
@@ -92,7 +103,8 @@ died, is unattested or is of another commit makes the answer `incomplete`. Range
 It does not search seeds 1 to the hit again. A missing or unattested shard makes the target `incomplete`.
 
 The job needs no token and no workflow change. The `checks` job fetches every branch, so the records, logs and attestations are in its clone,
-and `gh attestation verify --bundle` needs neither login nor the API. Nothing on that branch is trusted: what is not signed is not there.
+and `gh attestation verify --bundle` needs neither login nor the API. Nothing on that branch is trusted: what is not signed is not there. The branch may
+only gain files: a file that its history changed or lost makes the target `incomplete`.
 
 A sweep holds the path of the tree it was built in. So `shard` and `count` build in one path per target directory, and refuse when something is
 there. One commit then gives one binary on every runner that was compared, and the shards of one merge and the counting run have to have the
@@ -110,7 +122,9 @@ Each took the refusing answer.
 | The same seeds in two splits, or two binaries | `incomplete`. |
 | A patched replay with the sweep's kinds and another trace hash | Masked as `search-replay-disagree`. |
 | A disagreement in a range above the hit | `error` for the target. |
-| A merge entry with no answer | Not recorded. The attested logs keep `incomplete` runs. |
+| A merge entry with no answer | An `error` is recorded and binds its key. `incomplete` is not recorded: the attested logs keep those runs. |
+| A run at the commit that has not finished | `incomplete`, whatever it runs: its jobs are not all known. The run that asks is left out, but not its shard jobs. |
+| A run whose title names no commit | Its record is no shard, and its shard jobs have to be accounted for. |
 | A target that cannot count | It has no shard. `shard` and `count` say `not-shown` or `no-detector`. |
 
 **Shared base runs are not implemented.** The unpatched results of two targets with the same build, workload and profile are equal. No two
@@ -134,7 +148,9 @@ adds four runs on one thread.
 
 ## What it cannot prove
 
-- That nobody left out a run. A shard that ran twice with other rows is an `error` only if both records are on the branch. The Actions runs of the
-  checks are visible, and a reviewer lists them.
-- That a row is what the harness said. The attested job's own tool wrote it, from the commit the key names.
+- That nobody ran the same build and plan at another commit, or from another ref, or deleted a run. GitHub's list is of one commit's workflow. Such runs are
+  visible, and a reviewer looks for them.
+- That a counting run which did not repeat its hit is remembered. It is a red, attested check. Whoever runs another one has to say so, and a reviewer
+  lists the counting runs.
+- That GitHub's title, jobs and steps are what happened. They come over TLS from `api.github.com`, and a run's title cannot be edited.
 - What the README lists for every search: an invented confirmer, a mask for a finding that is not there, a hunk that acts only in the simulator.

@@ -793,7 +793,7 @@ class MergeTest(ShardCase):
         for path in self.records.glob("101-*"):
             path.unlink()
         self.keep(1, log, run=102, name="other")
-        self.assert_merge("incomplete", "shard 1 of")
+        self.assert_merge("incomplete", "no shard: oltp-sim-bugs-fix-one-1", "its log is of another shard than its check")
 
     def test_gh_that_cannot_verify(self):
         self.run_shards(1, script={"hit": 3})
@@ -1213,12 +1213,13 @@ class RunsTest(ShardCase):
                 body, output = self.answer()
                 self.assertEqual((body["result"], body["hit"]), ("incomplete", None), output)
                 self.assertIn("GitHub", body["why"])
-        for job in ({"status": None}, {"steps": "x"}, {"steps": ["x"]}, {"name": None}, {"run_attempt": None}):
+        self.api.answer = None
+        sha = sh(self.f.repo, "rev-parse", "HEAD").strip()
+        for job in ({"status": None}, {"steps": "x", "conclusion": "failure"}, {"steps": ["x"], "conclusion": "failure"},
+                    {"name": None}, {"run_attempt": None}, {"conclusion": None}):
             with self.subTest(job=job):
-                self.api.answer = None
-                self.keep(1, "", run=55, name="none", record={"check": "oltp-sim-2"}, job=job)
-                self.assertEqual(self.answer()[0]["result"], "incomplete" if job.get("name", 0) is None or "run_attempt" not in job
-                                 else "incomplete")
+                self.api.add(55, 1, "oltp-sim-bugs-fix-one-9", sha, job=job)
+                self.assertEqual(self.answer()[0]["result"], "incomplete")
         self.api.runs.pop(55)
         self.assertEqual(self.answer()[0]["result"], "candidate")
 
@@ -1245,6 +1246,19 @@ class RunsTest(ShardCase):
                     self.assertEqual(self.answer()[0]["result"], "incomplete")
                 sleep.assert_not_called()
 
+    def test_an_outage_is_tried_again(self):
+        self.run_shards(1, script={"hit": 3})
+        for tries, result in ((3, "candidate"), (2, "incomplete")):
+            left = [2]
+
+            def flaky(path):
+                left[0] -= 1
+                return self.api.get(path) if left[0] < 0 else (502, {}, {})
+            self.api.answer = flaky
+            with patch.object(sim_bugs.time, "sleep") as sleep, patch.object(sim_bugs, "API_TRIES", tries):
+                self.assertEqual(self.answer()[0]["result"], result)
+            self.assertEqual(sleep.call_count, tries - 1)
+
     def test_the_token_is_optional(self):
         self.run_shards(1, script={"hit": 3})
         clean = {key: value for key, value in os.environ.items() if key not in ("GH_TOKEN", "GITHUB_TOKEN")}
@@ -1261,7 +1275,7 @@ class RunsTest(ShardCase):
         for run in range(1000, 1230):
             self.api.add(run, 1, "oltp-sim-2", sha)
         for n in range(230):
-            self.api.add(1000, 1, f"oltp-sim-{n}", sha)
+            self.api.add(1000, 1, f"oltp-sim-x-{n}", sha)
         self.run_shards(1, script={"hit": 3})
         self.assertEqual(self.answer()[0]["result"], "candidate")
         pages = [path for path, _ in self.api.asked if "/workflows/" in path]
@@ -1354,7 +1368,7 @@ class RunsTest(ShardCase):
         self.assert_merge("candidate")
         self.nondeterministic()
         body = self.assert_merge("error", "disagree")
-        self.assertEqual([shard["run"][-3:] for shard in body["shards"]], ["101", "102", "301"])
+        self.assertEqual([shard["run"][-3:] for shard in body["shards"]], ["101", "301", "102"])
         self.assert_not_found("error", "disagree")
         # Alone it is one as well, and its absence is seen.
         for path in self.records.glob("101-*"):
@@ -1393,6 +1407,7 @@ class RunsTest(ShardCase):
         for what, text in {"another commit": other(sha="a" * 40), "another run": other(run=f"https://github.com/{REPO}/actions/runs/9"),
                            "another attempt": other(attempt="2"), "another shard": other(shard=[2, 2500]), "a field": other(more=1),
                            "cut": log.replace(line, line[:-9]), "two": log + line + "\n",
+                           "no shard": other(shard=[]), "a shard as a number": other(shard=1),
                            "a list": log.replace(line, "sim-bugs-shard: disagree []"),
                            "inside": log.replace(line, "x " + line)}.items():
             with self.subTest(what=what):
@@ -1402,7 +1417,7 @@ class RunsTest(ShardCase):
                               "another commit's run": {"run_changes": {"display_title": f"req-301 @ {'c' * 40}"}}}.items():
             with self.subTest(what=what):
                 for path in self.records.glob("sha256-*"):
-                    if sha256((self.records / "failed-1.json").read_bytes()) in path.name:
+                    if sha256((self.records / "101-1-1.json").read_bytes()) not in path.name:
                         path.unlink()
                 self.keep(1, log, run=301, name="failed-1", **{"record": {"result": "fail"}, **changes})
                 body = self.merge()[2]
@@ -1440,6 +1455,17 @@ class RunsTest(ShardCase):
         self.run_shards(1, script={"hit": 3})
         self.assert_merge("candidate")
         self.f.write(f"{BUG}/searches.jsonl", before)
+
+    def test_evidence_of_an_error(self):
+        self.run_shards(1, script={"hit": 3})
+        self.nondeterministic()
+        status, output, body = self.merge("--record")
+        self.assertIn("recorded as entry 2", output)
+        evidence = lambda: self.tool("evidence", "fix-one", "--records", str(self.records))[1]
+        self.assertNotIn("entry 2", evidence())
+        text = (self.records / "failed-1.log").read_text()
+        (self.records / "failed-1.log").write_text(text + "x")
+        self.assertIn("entry 2 of searches.jsonl rests on a record of oltp-sim-bugs-fix-one-1", evidence())
 
     def test_a_recorded_error_never_counts(self):
         self.run_shards(1, script={"hit": 3})
