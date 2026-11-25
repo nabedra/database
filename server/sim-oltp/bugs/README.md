@@ -11,7 +11,7 @@ is found when the simulator detects the reverted fix by the rule below. Results 
 | File | Content |
 | --- | --- |
 | `bug.toml` | The manifest. |
-| `revert.patch` | The patch. It changes product sources only, in the form `git diff` writes. Nothing before, between or after its `diff --git` sections, and no character that a reviewer cannot see. |
+| `revert.patch` | The patch. It changes product sources only, in the form `git diff` writes. Nothing before, between or after its `diff --git` sections, and no Unicode control or format character. |
 | `searches.jsonl` | Every search of the target, also those that a later one replaced. Append-only. Written by `sim_bugs.py record`. |
 
 A committed target or record cannot leave the tree, and a target keeps its bug record, phase and set. A target that a
@@ -155,6 +155,13 @@ Also open:
 - A `[review]` written for a patch by nobody. The digest shows which patch it is about, not that anyone read it.
 - `expect` chosen broadly before any result, or a rule whose text was added to the documents for the target.
 - A quoted line that differs between the builds and shows nothing.
+- A patch character that looks like another or like nothing (a filler letter, a line separator, a look-alike letter), and
+  code far to the right of a line. Only control and format characters are refused.
+- `regression.test` or `failure_contains` changed after the review and the evidence. The counting run repeats the test that
+  the manifest names now.
+- A quote from `plans/testing/`. `check` finds the text in the copy, and does not compare the copy with the design or know
+  which rows lead decision 13.1 lets a design rule count for.
+- Variables of the machine that the tool does not clear, such as `RUSTC`, a wrapper or a linker.
 - Recorded regression output, as far as the named run is concerned. `evidence` compares it.
 - Branch history that was rewritten before it reached main.
 - The harness of main, the compiler, Git, Cargo's home configuration and the Actions runner.

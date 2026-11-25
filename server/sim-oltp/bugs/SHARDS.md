@@ -78,25 +78,27 @@ workload runs it, after `gh attestation verify` on every record. It refuses unle
 
 Its answer is the lowest seed that nothing masks, with `[[masked]]` of the manifest applied. **A hit in a higher range counts only when
 every lower range is complete.** `not-detected` needs all four ranges and the base rate over all 10,000 seeds. A range that
-is missing, died or disagrees makes the answer `error` or `incomplete`, never `not-detected`.
+is missing, died or unattested makes the answer `incomplete`, and one that disagrees makes it `error`, never `not-detected`.
 
 It appends one entry of kind `merge` to `searches.jsonl`: the key, the answer, masks, base and patched rates, and per range the
 run URL, attempt, record and row digests. That entry goes through review like `[detection]`. `evidence` compares it with the logs.
 
 ## The counting run
 
-On main, for one target. It takes the hit from the committed merge entry, and derives again everything that says the hit is real: both
-builds, the patched replay, the clean twin, the base run of the hit and its neighbours up to the chunk size, the
-confirmation, and the regression without and with the patch. It does not search seeds 1 to the hit again.
+On main, for one target. It derives again everything that says the hit is real: both builds, the patched replay, the clean
+twin, the base run of the hit and its neighbours up to the chunk size, the confirmation, and the regression without and with
+the patch. It does not search seeds 1 to the hit again.
 
-So the counting run trusts the merge entry for two things it does not derive: that no lower seed was an unmasked hit, and
-the base rate. A forged entry could hide an earlier hit or a base rate. It could not create a hit. The reviewed merge step and
-`evidence` are what stands behind those two, and that is a weaker guarantee than the one-job search gives today.
+Lead decision 13.2: it does not trust the merge entry for earlier hits or the base rate. It recomputes both from the shards'
+attested records, which it downloads and verifies itself, and refuses an entry that differs. A missing or unattested
+shard makes the target `incomplete`. So the records and logs of every shard have to be available when the counting run
+starts, and their signatures have to be verified in that job. How is not designed yet.
 
 ## Tests the change needs
 
 Each first as a failing test, with the fake harness: a shard without its line, with a line for other rows, with a missing,
 doubled or foreign seed; two shards of different keys, SHAs of different builds, overlapping ranges, a gap below the hit;
 a higher hit with a lower range missing, dead or disagreeing; rerun rows that differ; a base-red seed counted as a hit; a twin with
-another trace hash than the base run; an edited merge entry; a record whose log digest is another's; a dead shard
+another trace hash than the base run; an edited merge entry, and one that hides an earlier hit or a base rate; a missing or
+unattested shard in the counting run; a record whose log digest is another's; a dead shard
 counted as clean seeds; and `not-detected` from three ranges.
