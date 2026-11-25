@@ -1040,16 +1040,14 @@ fn the_verdict_is_as_before_where_the_decision_is_silent() {
     );
     by_default(
         "the row was there, but the unknown attempt was sent later",
-        "1> insert k 1 other
+        "0> delete k null r
+         0< ok false
+         1> insert k 1 other
          1< ok
          2> upsert k 9 r
          2< reused
-         1> delete k null gone
-         1< ok true
          0> delete k null r
-         0< info
-         0> delete k null r
-         0< ok false",
+         0< info",
         &["non-linearizable", "request-id-reuse-misdetected"],
     );
     by_default(
