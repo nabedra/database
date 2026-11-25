@@ -177,6 +177,25 @@ pub(crate) async fn run(
         let _ = task.await;
     }
     cluster.checks.recovered(&cluster.world, "convergence");
+    // The final operations may wait for a running move, within the move's own bound (lead
+    // decision 12.3). A move that does not finish is reported by its own rule, below.
+    // A pending split is tried meanwhile, and its bound runs from here, not from the end of
+    // the wait.
+    let quiet_from = cluster.world.elapsed();
+    let mut move_wait_ms = 0;
+    if let Some(moving) = moving.as_mut().filter(|moving| moving.running()) {
+        while moving.waiting(cluster, healed) {
+            moving.retry(cluster, &ctx, healed).await;
+            if let Some(chaos) = chaos.as_mut() {
+                chaos.try_split(cluster, &ctx).await;
+            }
+        }
+        move_wait_ms = elapsed_ms(&cluster.world) - quiet_from.as_millis() as u64;
+        cluster.record(format!(
+            "final operations waited {move_wait_ms}ms for the replica move, still running {}",
+            moving.running()
+        ));
+    }
     let final_checks = clients::final_checks(&ctx).await;
     report.assertions.push((
         "final writes and reads through both gateways",
@@ -189,7 +208,7 @@ pub(crate) async fn run(
     }
     let mut reread = false;
     if let Some(chaos) = chaos.as_mut().filter(|chaos| chaos.split_pending()) {
-        chaos.finish_split(cluster, &ctx).await;
+        chaos.finish_split(cluster, &ctx, quiet_from).await;
         reread = true;
     }
     if let Some(chaos) = chaos.as_ref() {
@@ -253,7 +272,10 @@ pub(crate) async fn run(
     }
     // The drain moves the replica once more, so it has its own convergence and final reads.
     if let Some(moving) = moving.as_mut() {
-        if report.assertions.contains(&("replica move retired", true)) {
+        let split = chaos.as_ref().is_some_and(Chaos::split_requested);
+        if let Some(why) = moving.drain_blocked(cluster, split) {
+            cluster.record(format!("O26 drain not run: {why}"));
+        } else {
             let drained = match moving.drain_pool(cluster, &ctx).await {
                 Ok(()) => {
                     let limit = cluster.world.elapsed() + CONVERGE_LIMIT;
@@ -366,6 +388,7 @@ pub(crate) async fn run(
         "not_applied_checks": observed.not_applied_checks,
         "unresolved": observed.unresolved.len(),
         "one_paused_late": outcome.one_paused_late,
+        "move_wait_ms": move_wait_ms,
         "heal_cold_start": chaos.as_ref().is_some_and(|chaos| chaos.heal_cold),
     });
     cluster.record(format!("workload summary {}", report.summary));

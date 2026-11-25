@@ -1,0 +1,17 @@
+id = "OLTP-sim-enrolled-restart-blocks-prepare"
+title = "A retained restart that enrolled and then failed blocks every later restart of the run"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G07"]
+scenarios = ["D04", "O26"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 152
+why_not_caught = "The restart runners let the first start finish."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, seeds 152, 281, 293, 476, 593 and 630 of 1 to 720: a stopped worker restarts after the heal. Control answers Busy to worker.restart.prepare while an earlier preparation of that worker is enrolled, and the process that enrolled it has exited."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

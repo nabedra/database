@@ -1769,7 +1769,7 @@ pub(crate) async fn run(
     }
     changes_settled(cluster, &t, &mut report);
     if let Some(chaos) = chaos.as_mut().filter(|chaos| chaos.split_pending()) {
-        chaos.finish_split(cluster, &ctx).await;
+        chaos.finish_split(cluster, &ctx, healed).await;
     }
     if let Some(chaos) = chaos.as_ref() {
         chaos.check_abandoned(cluster, &ctx).await;
@@ -1796,13 +1796,17 @@ pub(crate) async fn run(
         moved.as_ref(),
         report.assertions.contains(&("replica move retired", true)),
     ) {
-        drained = match moving.drain_pool(cluster, moved).await {
-            Ok(()) => {
-                let limit = cluster.world.elapsed() + CONVERGE_LIMIT;
-                direct::converge(cluster, moved, limit).await
-            }
-            Err(error) => Err(error),
-        };
+        if let Some(why) = moving.drain_blocked(cluster, false) {
+            cluster.record(format!("O26 drain not run: {why}"));
+        } else {
+            drained = match moving.drain_pool(cluster, moved).await {
+                Ok(()) => {
+                    let limit = cluster.world.elapsed() + CONVERGE_LIMIT;
+                    direct::converge(cluster, moved, limit).await
+                }
+                Err(error) => Err(error),
+            };
+        }
         report.scenarios.extend(std::mem::take(&mut moving.clauses));
     }
     if let Err(error) = drained {
