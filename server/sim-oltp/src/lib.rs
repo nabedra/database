@@ -11,6 +11,7 @@ pub mod net;
 mod node;
 mod panics;
 pub mod probes;
+mod scripted;
 pub mod sweep;
 pub mod trace;
 mod workload;
