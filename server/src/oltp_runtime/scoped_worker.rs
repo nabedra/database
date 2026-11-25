@@ -996,6 +996,7 @@ impl ScopedWorker {
         };
         header.response_status = Some(result.status);
         header.completed_at_ms = Some(now());
+        if std::env::var("NABEDRA_RV132").is_ok() { eprintln!("RV132 done {} {:?}", header.request_id, tokio::time::Instant::now()); }
         header.section_lengths[2] = response.len() as u64;
         frame.header = self.resources().encode(&header, MAX_RECORD_HEADER_BYTES)?;
         frame.sections[2] = Some(response);

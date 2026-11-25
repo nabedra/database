@@ -692,7 +692,9 @@ fn apply(
                 verify_lookup_record(scope, &record, |decision, outcome| {
                     transaction::verify_terminal_in_apply(tx, decision, outcome)
                 })?;
-                if record.reservation.digest != *digest || record.reservation.kind != *kind {
+                if std::env::var("NABEDRA_P11Q_PLANT").as_deref() != Ok("ignore-body")
+                    && (record.reservation.digest != *digest || record.reservation.kind != *kind)
+                {
                     return reject(tx, StatusFault::DigestConflict);
                 }
                 if scoped.is_some() && record.reservation.scoped != *scoped {

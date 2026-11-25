@@ -621,8 +621,11 @@ impl QueueCoordinator {
                 copies.push_back(async move {
                     #[cfg(test)]
                     let started = nabedra_rt::time::now_std();
-                    let ack = if target == local {
-                        CopyAcknowledgement::authenticated(local, version)
+                    let ack = if target == local
+                        || crate::request_queue::planted("owner-only-copies")
+                        || (crate::request_queue::planted("half-copies") && id.as_u128() & 1 == 1)
+                    {
+                        CopyAcknowledgement::authenticated(target, version)
                     } else {
                         let deadline = nabedra_rt::time::now() + QUEUE_COPY_SLOT_TIMEOUT;
                         let _slot = timeout_at(deadline, self.copy_slots.acquire())

@@ -1,4 +1,4 @@
-id = "p11q-table"
+id = "p11q-plants"
 module = "oltp"
 kinds = ["S"]
 # Scratch, never merged. It runs seeds and asserts nothing, so it always exits 1: its record
@@ -9,7 +9,7 @@ tiers = ["T1"]
 command = ["bash", "-euc", '''
 cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib --no-run
 bin=$PWD/$(ls -t target/sim/release/deps/nabedra_sim_oltp-* | grep -v "[.]d$" | head -1)
-out=$PWD/../target/testing-logs/p11q-table
+out=$PWD/../target/testing-logs/p11q-plants
 mkdir -p $out
 sha256sum $bin > $out/binary.sha256
 cd sim-oltp
@@ -25,7 +25,7 @@ one() {
   rm -rf $d
 }
 export -f one; export out bin
-printf '%s\n' ,,,,1 ,,,,2 ,,,,3 ,,,,4 ,,,,5 ,,,,6 ,,,,7 ,,,,8 ,,,,9 ,,,,10 ,,,,11 ,,,,12 ,,,,13 ,,,,14 ,,,,15 ,,,,16  ,,scoped-off,none,1 | xargs -P 4 -I{} bash -c 'one {}'
+printf '%s\n' ,,,,2 owner-only-copies,,,,2 ,,,,15 owner-only-copies,,,,15 half-copies,,,,15 ,,,,7 half-copies,,,,7 ,,legacy-off,none,1 gateway-lose-pending,,legacy-off,none,1 ignore-body,,legacy-off,none,1 gateway-drop-result,,legacy-off,none,1 ,,,,3 gateway-abandon-committed,,,,3 ,lose-accepted,legacy-off,none,1 ,execute-twice,legacy-off,none,1 ,conflicting-terminal,legacy-off,none,1 ,early-accept,,,2 ,replay-abandoned,,,3 | xargs -P 4 -I{} bash -c 'one {}'
 echo "scratch finished, no assertion ran"
 exit 1
 ''']
