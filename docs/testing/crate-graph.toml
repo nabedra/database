@@ -9,7 +9,7 @@
 # each other (transport and storage, for example). A workspace package without a layer fails.
 [[layer]]
 name = "runtime"
-packages = ["nabedra-rt"]
+packages = ["nabedra-rt", "nabedra-simd"]
 
 [[layer]]
 name = "harness"
@@ -33,7 +33,7 @@ packages = ["nabedra-oltp-types"]
 
 [[layer]]
 name = "transport-and-storage"
-packages = ["nabedra-transport", "nabedra-oltp-storage"]
+packages = ["nabedra-transport", "nabedra-oltp-storage", "nabedra-vector"]
 
 [[layer]]
 name = "replication"
@@ -68,6 +68,11 @@ oltp_runtime = "nabedra-database"
 # The planned package edges (phase 8 design, 3.1). The planted-cycle cases build stub workspaces
 # from them, with no registry crates, so `cargo metadata` needs no network.
 [planned.nabedra-rt]
+
+[planned.nabedra-simd]
+
+[planned.nabedra-vector]
+normal = ["nabedra-rt", "nabedra-simd"]
 
 [planned.nabedra-check]
 
@@ -109,6 +114,7 @@ dev = ["nabedra-resources", "nabedra-transport", "nabedra-oltp-storage"]
 normal = [
   "nabedra-rt", "nabedra-kv", "nabedra-protocol", "nabedra-resources", "nabedra-oltp-types",
   "nabedra-transport", "nabedra-oltp-storage", "nabedra-oltp-replication",
+  "nabedra-vector", "nabedra-simd",
 ]
 dev = ["nabedra-check", "nabedra-transport", "nabedra-oltp-storage", "nabedra-oltp-replication"]
 

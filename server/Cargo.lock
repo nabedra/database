@@ -1911,7 +1911,9 @@ dependencies = [
  "nabedra-resources",
  "nabedra-rt",
  "nabedra-sim",
+ "nabedra-simd",
  "nabedra-transport",
+ "nabedra-vector",
  "openraft",
  "parquet",
  "ring",
@@ -2075,6 +2077,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nabedra-simd"
+version = "0.1.0"
+dependencies = [
+ "nabedra-check",
+]
+
+[[package]]
 name = "nabedra-transport"
 version = "0.1.0"
 dependencies = [
@@ -2091,6 +2100,15 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "nabedra-vector"
+version = "0.1.0"
+dependencies = [
+ "nabedra-check",
+ "nabedra-rt",
+ "nabedra-simd",
 ]
 
 [[package]]

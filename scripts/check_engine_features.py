@@ -18,7 +18,8 @@ FORBIDDEN_NATIVE = frozenset({'rocksdb', 'librocksdb-sys', 'bindgen', 'clang-sys
 # The phase 8 crate split. OLAP links the two shared crates; Cache links none of them.
 SHARED_SPLIT_CRATES = frozenset({'nabedra-protocol', 'nabedra-resources'})
 OLTP_SPLIT_CRATES = SHARED_SPLIT_CRATES | {'nabedra-oltp-types', 'nabedra-transport',
-                                           'nabedra-oltp-storage', 'nabedra-oltp-replication'}
+                                           'nabedra-oltp-storage', 'nabedra-oltp-replication',
+                                           'nabedra-vector', 'nabedra-simd'}
 CASES = (
     ('default', 'olap', True, []),
     ('olap', 'olap', False, ['--no-default-features', '--features', 'olap']),

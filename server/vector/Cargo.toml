@@ -1,0 +1,16 @@
+[package]
+name = "nabedra-vector"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+description = "Nabedra's search index: partitions, codes, scans and checkpoints"
+license = "MIT"
+repository = "https://github.com/zPy52/nabedra-database"
+publish = ["crates-io"]
+
+[dependencies]
+nabedra-rt = { path = "../rt", version = "0.1.0" }
+nabedra-simd = { path = "../simd", version = "0.1.0" }
+
+[dev-dependencies]
+nabedra-check = { path = "../check" }

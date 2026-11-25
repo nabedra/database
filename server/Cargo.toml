@@ -14,7 +14,7 @@ include = ["/src/", "/tests/", "/examples/", "/Cargo.lock", "/README.md", "/LICE
 
 [workspace]
 # `nabedra-kv` builds and tests alone: `cargo test -p nabedra-kv`.
-members = [".", "kv", "check", "rt", "protocol", "resources", "oltp-types", "transport", "oltp-storage", "oltp-replication", "sim", "sim-oltp"]
+members = [".", "kv", "check", "rt", "protocol", "resources", "oltp-types", "transport", "oltp-storage", "oltp-replication", "simd", "vector", "sim", "sim-oltp"]
 # Plain `cargo build` and `cargo test` here build only the server, as before `sim` joined.
 # The simulation crates are members but never default members: they enable
 # `nabedra-rt/sim`, which `src/main.rs` refuses to compile. Name them with `-p`.
@@ -31,7 +31,7 @@ path = "src/main.rs"
 [features]
 default = ["olap", "s3"]
 olap = ["dep:nabedra-protocol", "dep:nabedra-resources", "dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:parquet"]
-oltp = ["dep:nabedra-protocol", "dep:nabedra-resources", "dep:nabedra-oltp-types", "dep:nabedra-transport", "dep:nabedra-oltp-storage", "dep:nabedra-oltp-replication", "dep:nabedra-kv", "dep:openraft", "dep:tokio-rustls", "dep:socket2"]
+oltp = ["dep:nabedra-protocol", "dep:nabedra-resources", "dep:nabedra-oltp-types", "dep:nabedra-transport", "dep:nabedra-oltp-storage", "dep:nabedra-oltp-replication", "dep:nabedra-kv", "dep:nabedra-vector", "dep:nabedra-simd", "dep:openraft", "dep:tokio-rustls", "dep:socket2"]
 cache = ["nabedra-rt/net", "dep:clock-bound-client", "dep:hashbrown", "dep:smallvec", "dep:toml", "dep:openraft", "dep:tokio-rustls"]
 test-hooks = ["cache"]
 oltp-backup-s3 = ["oltp", "s3", "nabedra-oltp-replication/s3"]
@@ -77,6 +77,8 @@ nabedra-oltp-types = { path = "oltp-types", version = "0.1.0", optional = true }
 nabedra-transport = { path = "transport", version = "0.1.0", optional = true }
 nabedra-oltp-storage = { path = "oltp-storage", version = "0.1.0", optional = true }
 nabedra-oltp-replication = { path = "oltp-replication", version = "0.1.0", optional = true }
+nabedra-vector = { path = "vector", version = "0.1.0", optional = true }
+nabedra-simd = { path = "simd", version = "0.1.0", optional = true }
 nabedra-sim = { path = "sim", version = "0.1.0", optional = true }
 hashbrown = { version = "=0.17.1", default-features = false, optional = true }
 smallvec = { version = "=1.16.5", optional = true }
