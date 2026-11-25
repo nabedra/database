@@ -687,8 +687,9 @@ impl Log {
     /// definite successes: a `202` is the acceptance of that body, and a value that only one
     /// body writes is its effect.
     fn two_bodies(&self, out: &mut Outcome) {
-        let mut bodies: BTreeMap<Uuid, BTreeMap<&Body, (bool, Option<(Uuid, u64)>)>> =
-            BTreeMap::new();
+        // Whether every attempt was queued, and the first acceptance.
+        type Sent<'a> = BTreeMap<&'a Body, (bool, Option<(Uuid, u64)>)>;
+        let mut bodies: BTreeMap<Uuid, Sent<'_>> = BTreeMap::new();
         for submission in self.submissions.iter().filter(|s| s.body.mutation) {
             let known = bodies
                 .entry(submission.body.id)

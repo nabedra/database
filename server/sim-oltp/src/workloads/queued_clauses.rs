@@ -17,6 +17,8 @@ use crate::{
 
 /// A submission into a frozen window counts when it waited at least this long in it.
 const HELD_MS: u64 = 100;
+/// How far past its retention a result is looked up as an expired one.
+const PAST_MS: u64 = 1_000;
 
 /// A fault of the queued workload that happened, and when it took effect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -307,55 +309,76 @@ impl Facts<'_> {
         }
     }
 
-    /// Q06: the result of a mutation expired, its identity was sent again, and its value, which
-    /// a newer one had replaced, was looked for after that.
+    /// Q06: a result expired explicitly, and the identity of a mutation was sent again past the
+    /// retention of its own result. Its receipt may then come from the durable decision. Its
+    /// value, which a newer one had replaced, was looked for after that.
     fn expired(&self) -> bool {
-        self.log.accepted().into_iter().any(|((run, id), first)| {
-            let Some(missing) = self
-                .lookups(run, id)
-                .filter(|lookup| lookup.seen == Seen::Missing)
-                .map(|lookup| lookup.completed)
-                .min()
-            else {
-                return false;
-            };
-            let Some(&(key, value)) = first.body.writes.first() else {
-                return false;
-            };
-            let reads = || self.log.reads.iter().filter(move |read| read.key == key);
-            let Some(seen) = reads()
-                .filter(|read| read.value == Some(value))
-                .map(|read| read.completed)
-                .min()
-            else {
-                return false;
-            };
-            self.log
-                .submissions
-                .iter()
-                .filter(|again| {
-                    again.body == first.body
-                        && again.invoked >= missing
-                        && again.answer != Answer::Unknown
-                })
-                .any(|again| {
-                    let replaced = reads().any(|read| {
-                        read.invoked > seen
-                            && read.completed < again.invoked
-                            && read.value != Some(value)
-                    });
-                    let done = match again.answer {
-                        Answer::Accepted(run) => self
-                            .lookups(run, id)
-                            .filter(|l| !matches!(l.seen, Seen::Pending | Seen::Unknown))
-                            .map(|l| l.completed)
-                            .filter(|at| *at > again.completed)
-                            .min(),
-                        _ => Some(again.completed),
-                    };
-                    replaced && done.is_some_and(|at| reads().any(|read| read.invoked > at))
-                })
-        })
+        let explicit = self.log.lookups.iter().any(|missing| {
+            missing.seen == Seen::Missing
+                && self
+                    .lookups(missing.run, missing.id)
+                    .any(|l| l.completed <= missing.invoked && decided(&l.seen))
+        });
+        explicit
+            && self
+                .log
+                .accepted()
+                .into_iter()
+                .any(|((run, id), first)| self.resent(run, id, first))
+    }
+
+    fn resent(&self, run: Uuid, id: Uuid, first: &Submission) -> bool {
+        let settled = self
+            .lookups(run, id)
+            .filter(|lookup| decided(&lookup.seen))
+            .map(|lookup| lookup.completed)
+            .min();
+        let Some(settled) = settled else {
+            return false;
+        };
+        let past = settled + self.log.retention_ms + PAST_MS;
+        let late = self
+            .lookups(run, id)
+            .filter(|l| l.invoked >= past && (l.seen == Seen::Missing || decided(&l.seen)))
+            .map(|l| l.completed)
+            .min();
+        let Some(late) = late else {
+            return false;
+        };
+        let Some(&(key, value)) = first.body.writes.first() else {
+            return false;
+        };
+        let reads = || self.log.reads.iter().filter(move |read| read.key == key);
+        let seen = reads()
+            .filter(|read| read.value == Some(value))
+            .map(|read| read.completed)
+            .min();
+        let Some(seen) = seen else {
+            return false;
+        };
+        self.log
+            .submissions
+            .iter()
+            .filter(|again| {
+                again.body == first.body && again.invoked >= late && again.answer != Answer::Unknown
+            })
+            .any(|again| {
+                let replaced = reads().any(|read| {
+                    read.invoked > seen
+                        && read.completed < again.invoked
+                        && read.value != Some(value)
+                });
+                let done = match again.answer {
+                    Answer::Accepted(run) => self
+                        .lookups(run, id)
+                        .filter(|l| !matches!(l.seen, Seen::Pending | Seen::Unknown))
+                        .map(|l| l.completed)
+                        .filter(|at| *at > again.completed)
+                        .min(),
+                    _ => Some(again.completed),
+                };
+                replaced && done.is_some_and(|at| reads().any(|read| read.invoked > at))
+            })
     }
 
     /// R04: a request that was open at the stop is reported abandoned in the next run. The
@@ -793,21 +816,32 @@ mod tests {
         let mut log = log();
         let again = Submission {
             fresh: false,
-            answer: Answer::Missing,
-            ..accepted(1, 9_100)
+            ..submit(body(1, 1, 1), 9_100, success())
         };
-        log.submissions = vec![accepted(1, 100), again];
-        log.lookups = vec![lookup(1, 200, ok()), lookup(1, 9_000, Seen::Missing)];
+        log.submissions = vec![accepted(1, 100), accepted(2, 100), again];
+        // The mutation's receipt comes from its durable decision, and the other one expired.
+        log.lookups = vec![
+            lookup(1, 200, ok()),
+            lookup(2, 200, ok()),
+            lookup(1, 9_000, ok()),
+            lookup(2, 9_000, Seen::Missing),
+        ];
         log.reads = vec![read(1, 1, 300), read(1, 9, 9_500)];
         assert!(names(&log, &[]).is_empty(), "the last write of its key");
         log.reads.insert(1, read(1, 9, 400));
         assert_eq!(names(&log, &[]), ["Q06:expired-receipt"]);
+        log.lookups[3].seen = Seen::Pending;
+        assert!(names(&log, &[]).is_empty(), "nothing expired");
+        log.lookups[3].seen = Seen::Missing;
+        log.lookups[2].invoked = 5_300;
+        assert!(names(&log, &[]).is_empty(), "within the retention");
+        log.lookups[2].invoked = 9_000;
         log.reads.pop();
         assert!(names(&log, &[]).is_empty(), "nothing read after the resend");
         log.reads.push(read(1, 9, 9_500));
-        log.submissions[1].answer = Answer::Unknown;
+        log.submissions[2].answer = Answer::Unknown;
         assert!(names(&log, &[]).is_empty(), "the resend was not answered");
-        log.submissions[1].answer = Answer::Accepted(RUN);
+        log.submissions[2].answer = Answer::Accepted(RUN);
         assert!(names(&log, &[]).is_empty(), "it may still run");
         log.lookups.push(lookup(1, 9_200, ok()));
         assert_eq!(names(&log, &[]), ["Q06:expired-receipt"]);

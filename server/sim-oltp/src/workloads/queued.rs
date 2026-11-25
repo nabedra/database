@@ -2268,6 +2268,14 @@ async fn expire(q: &Q) {
             settled.push(old);
         }
     }
+    // A query's result is only in the queue, so its expiry is explicit.
+    let query = Req::collect(&q.ctx.table, fresh_id(CLIENTS[0]).await);
+    let limit = Duration::from_secs(5);
+    if let Answer::Accepted(run) = send(q, CLIENTS[0], GATEWAYS[0], &query, true, true, limit).await
+    {
+        poll(q, CLIENTS[0], 0, run, &query, 40).await;
+        settled.push(Open { run, req: query });
+    }
     time::sleep(Duration::from_millis(q.mode.retention_ms + 6_000)).await;
     {
         let shared = q.shared.lock().unwrap();
