@@ -1988,3 +1988,6 @@ pub use tests::index_reclamation_storage_evidence;
 
 #[cfg(test)]
 mod golden_tests;
+
+#[cfg(test)]
+mod adv_corpus;
