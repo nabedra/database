@@ -198,28 +198,29 @@ pub(crate) fn window(control: &[WindowAnswer], wiped: &[WindowAnswer], wiped_ran
     Window::NotJudged(reason)
 }
 
-/// What the prepared restart of a removed worker shows, from the survivors' answers. `pinned`
-/// says that the survivors read the worker's certificate pin when they started: without it they
-/// refuse a member's preparation too (`ReplacementRestart`), so a refusal shows nothing.
+/// What the prepared restart of a removed worker shows, from the survivors' answers. Only the
+/// refusal of Control's own state machine judges: it came after the checks that also refuse a
+/// member whose certificate pin a survivor lacks (`ReplacementRestart`).
 ///
 /// Returns whether the answers judged anything. `docs/oltp-recovery.md`, replacement, step 6:
 /// "`mounted` means Control checked the signed mount proof, revoked the lost worker ID and
 /// certificate".
-pub(crate) fn removed_stays_out(pinned: bool, answers: &[Prepared]) -> Result<bool, String> {
+pub(crate) fn removed_stays_out(answers: &[Prepared]) -> Result<bool, String> {
     if let Some(Prepared::Accepted(record)) = answers
         .iter()
         .find(|answer| matches!(answer, Prepared::Accepted(_)))
     {
         return Err(format!("its restart is prepared: {record}"));
     }
-    Ok(pinned && answers.contains(&Prepared::Unauthorized))
+    Ok(answers.contains(&Prepared::Revoked))
 }
 
 /// One answer to a restart preparation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Prepared {
     Accepted(String),
-    Unauthorized,
+    /// Control refused the worker as unauthorized.
+    Revoked,
     /// Refused for another reason, or unknown.
     Other,
 }

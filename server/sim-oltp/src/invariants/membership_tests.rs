@@ -274,32 +274,23 @@ mod removed_never_rejoins {
     use super::*;
 
     #[test]
-    fn legal_a_survivor_refuses_a_pinned_worker() {
+    fn legal_control_refuses_the_removed_worker() {
         assert_eq!(
-            removed_stays_out(true, &[Prepared::Other, Prepared::Unauthorized]),
+            removed_stays_out(&[Prepared::Other, Prepared::Revoked]),
             Ok(true)
         );
     }
 
     #[test]
-    fn nothing_is_judged_by_busy_survivors_or_without_the_pin() {
-        assert_eq!(removed_stays_out(true, &[Prepared::Other]), Ok(false));
-        assert_eq!(removed_stays_out(true, &[]), Ok(false));
-        assert_eq!(
-            removed_stays_out(false, &[Prepared::Unauthorized]),
-            Ok(false)
-        );
+    fn nothing_is_judged_by_busy_or_silent_survivors() {
+        assert_eq!(removed_stays_out(&[Prepared::Other]), Ok(false));
+        assert_eq!(removed_stays_out(&[]), Ok(false));
     }
 
     #[test]
     fn illegal_a_removed_worker_is_prepared() {
-        for pinned in [true, false] {
-            let answers = [
-                Prepared::Unauthorized,
-                Prepared::Accepted("record".to_owned()),
-            ];
-            assert!(removed_stays_out(pinned, &answers).is_err());
-        }
+        let answers = [Prepared::Revoked, Prepared::Accepted("record".to_owned())];
+        assert!(removed_stays_out(&answers).is_err());
     }
 }
 

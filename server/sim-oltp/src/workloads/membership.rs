@@ -1562,16 +1562,16 @@ impl Membership {
             answers.push(match answer {
                 Ok(Completion::Ok(record)) => Prepared::Accepted(record.to_string()),
                 Ok(Completion::Refused(error))
-                    if error.code == ErrorCode::Unauthorized
-                        && error.outcome == Outcome::NotApplied =>
+                    if error.outcome == Outcome::NotApplied
+                        && error.message
+                            == "Control could not prepare retained worker restart: Unauthorized" =>
                 {
-                    Prepared::Unauthorized
+                    Prepared::Revoked
                 }
                 _ => Prepared::Other,
             });
         }
-        // Every survivor read the original workers' pins when it started.
-        match removed_stays_out(!SPARES.contains(&removed), &answers) {
+        match removed_stays_out(&answers) {
             Ok(true) => {
                 self.clauses.insert("O17:removed-worker");
             }
@@ -1623,7 +1623,15 @@ impl Membership {
         };
         // The positive control: the same writes in the same window, with every storage in place.
         let control = self.frozen_window(cluster, ctx, nodes, true).await;
-        self.wait_members(cluster, ctx, CHECK_LIMIT).await?;
+        // The loss must not meet a worker that has not caught up after the control window: it
+        // would be a second fault. Design 3.7, `Liveness`: "convergence within 30 s of the heal".
+        // Readiness alone shows the view from before the freeze.
+        let healed = cluster.world.elapsed();
+        direct::converge(cluster, ctx, healed + CONVERGE_LIMIT)
+            .await
+            .map_err(|error| {
+                StepError::new("Liveness", format!("after the control window: {error}"))
+            })?;
         let how = self.cut(cluster, g, node).await;
         self.down(cluster, ctx, window(g, 0, 3_000)).await;
         if prepared {
@@ -2400,7 +2408,7 @@ fn every_survivor_refuses_its_role(error: &str) -> bool {
         .is_some_and(|(_, answers)| {
             answers
                 .split("; ")
-                .all(|answer| answer.ends_with("Unauthorized: Control role is not authorized"))
+                .all(|answer| answer.ends_with(": Control role is not authorized"))
         })
 }
 
