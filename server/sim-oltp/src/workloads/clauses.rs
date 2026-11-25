@@ -88,7 +88,6 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
     ),
     ("R01", &["R01:worker-killed"]),
     ("R02", &["R02:last-holder"]),
-    ("R03", &["R03:rolling-restart"]),
     ("R04", &["R04:full-stop", "R04:abandoned"]),
     ("R05", &["R05:partition", "R05:paused-owner"]),
     (
@@ -147,6 +146,31 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
             "O28:interrupted-pagination",
         ],
     ),
+    (
+        "O17",
+        &[
+            "O17:replacement",
+            "O17:replacement-fault",
+            "O17:abandoned-intent",
+            "O17:removed-worker",
+            "O17:wiped-voter-refused",
+            "O17:wiped-voter-control",
+            "O17:wiped-voter-ddl",
+            "O17:wiped-voter-data",
+            "O17:move-sequence",
+            "O17:data-worker",
+            "O17:low-disk",
+            "O17:revocation-storm",
+        ],
+    ),
+    (
+        "R03",
+        &[
+            "R03:rolling-restart",
+            "R03:replacement-joiner",
+            "R03:last-holder",
+        ],
+    ),
 ];
 
 /// Why a clause cannot run yet, for the sweep record.
@@ -194,6 +218,12 @@ pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
         "O21:automatic-split" => "the shard target is 64 MiB; the runs stay far below it",
         "O28:paged-metadata" | "O28:interrupted-pagination" => {
             "needs more ranges than one routing page holds"
+        }
+        "O17:data-worker" => "the data worker process binds a real TCP listener",
+        "O17:low-disk" => "a simulated volume has no capacity limit",
+        "R03:last-holder" => "the script settles every receipt before the next worker stops",
+        "O17:revocation-storm" => {
+            "1,025 replacements, each with its own worker and certificate, need a separate large range"
         }
         _ => return None,
     })

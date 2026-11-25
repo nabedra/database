@@ -5,6 +5,10 @@
 pub mod protocol;
 pub mod resources;
 
+pub(crate) mod membership;
+#[cfg(test)]
+mod membership_tests;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,

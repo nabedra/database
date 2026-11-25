@@ -520,7 +520,12 @@ pub(crate) fn work(attempts: &[clauses::Attempt], from: u64, to: u64) -> (u64, u
 
 /// A seed whose clients completed no work under chaos proves nothing, so it is never clean (lead
 /// decision 17, review 115 H1).
-fn progress(checks: &Invariants, world: &World, attempts: &[clauses::Attempt], start: u64) {
+pub(super) fn progress(
+    checks: &Invariants,
+    world: &World,
+    attempts: &[clauses::Attempt],
+    start: u64,
+) -> (u64, u64) {
     let now = elapsed_ms(world);
     let (writes, reads) = work(attempts, start, now);
     if writes == 0 || reads == 0 {
@@ -532,6 +537,7 @@ fn progress(checks: &Invariants, world: &World, attempts: &[clauses::Attempt], s
             ),
         );
     }
+    (writes, reads)
 }
 
 fn summary(

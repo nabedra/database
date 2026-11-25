@@ -106,6 +106,7 @@ impl Setup {
         let workloads = WorkloadChoice::parse(
             &env("NABEDRA_SIM_WORKLOAD").unwrap_or_else(|| SMOKE.to_owned()),
         )?;
+        crate::workloads::membership::Step::from_env()?;
         let profile = env_list("NABEDRA_SIM_PROFILE");
         if workloads.is_smoke() && !profile.is_empty() {
             return Err("the smoke workload does not accept nemesis profiles".into());
@@ -368,6 +369,8 @@ fn replay_command(defect: Defect) -> String {
         crate::workloads::queued::DEFECT_ENV,
         topology::MODE_ENV,
         topology::DEFECT_ENV,
+        crate::workloads::membership::STEPS_ENV,
+        crate::workloads::membership::DEFECT_ENV,
     ] {
         if let Some(value) = env(name) {
             prefix.push_str(&format!("{name}={value} "));
@@ -904,6 +907,15 @@ fn write_record(
             report.count
         );
         record.not_run(rule, &why);
+    }
+    if input.workload.split(',').any(|name| name == "membership") {
+        use crate::invariants::membership::{GUIDANCE_ONLY, NOT_RUN_FORMS};
+        for (form, why) in NOT_RUN_FORMS {
+            record.not_run(form, why);
+        }
+        for (kind, why) in GUIDANCE_ONLY {
+            record.not_run(&format!("{kind} as a counted rule"), why);
+        }
     }
     if input.smoke {
         for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {

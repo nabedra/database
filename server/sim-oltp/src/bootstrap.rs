@@ -35,12 +35,18 @@ pub(crate) fn initial_range(cluster_id: Uuid, table: Uuid) -> Value {
         "kind": {"data": {"table_id": table, "shard_id": shard}}, "group_format_version": 1,
     })
 }
+/// Workers that a run may add. They have certificates, but no process starts unless the
+/// workload asks for it.
+pub(crate) const SPARES: [u64; 4] = [4, 5, 6, 7];
 pub(crate) const ROOT: &str = "/sim-oltp";
+/// The key volume of a worker whose volumes are split (see [`Bootstrap::split_volumes`]).
+pub(crate) const KEYS: &str = "/sim-oltp-keys";
 pub(crate) const CONFIG: &str = "/sim-oltp/bootstrap.json";
 const AUTH: &str = "/sim-oltp/auth.json";
 const CERT: &str = "/sim-oltp/node.pem";
 const KEY: &str = "/sim-oltp/node.key";
 const CA: &str = "/sim-oltp/ca.pem";
+const RESTART_KEY: &str = "NABEDRA_RESTART_KEY";
 const MARKER: &str = "/sim-oltp/.nabedra-docker-volume.json";
 
 pub(crate) fn http_addr(node: u64) -> SocketAddr {
@@ -64,6 +70,10 @@ fn material(node: u64) -> (&'static [u8], &'static [u8]) {
         1 => pem!("1"),
         2 => pem!("2"),
         3 => pem!("3"),
+        4 => pem!("4"),
+        5 => pem!("5"),
+        6 => pem!("6"),
+        7 => pem!("7"),
         101 => pem!("101"),
         102 => pem!("102"),
         _ => unreachable!("no certificate for node {node}"),
@@ -83,11 +93,29 @@ fn write(path: &str, data: &[u8]) -> io::Result<()> {
         .open(path)?;
     file.write_all(data)?;
     file.sync_all()?;
-    os::sync_dir(Path::new(ROOT))
+    os::sync_dir(Path::new(path).parent().expect("absolute path"))
+}
+
+/// `path`'s file name in `dir`.
+fn placed(dir: &str, path: &str) -> String {
+    let (_, name) = path.rsplit_once('/').expect("absolute path");
+    format!("{dir}/{name}")
 }
 
 fn write_json(path: &str, value: &Value) -> io::Result<()> {
     write(path, &serde_json::to_vec(value)?)
+}
+
+/// The Docker volume marker on the calling node's data volume.
+fn write_marker(node: u64, marker: &Value) -> io::Result<()> {
+    write_json(
+        MARKER,
+        &json!({
+            "format_version": 1,
+            "volume_name": format!("sim-oltp-{node}"),
+            "volume_marker": marker,
+        }),
+    )
 }
 
 fn resources() -> Value {
@@ -144,6 +172,16 @@ fn enrollment(node: u64) -> io::Result<Value> {
     }))
 }
 
+/// A provisioned replacement of a lost worker.
+pub(crate) struct Candidate {
+    pub spare: u64,
+    /// The slot of the worker it replaces.
+    pub index: usize,
+    /// The `worker.system_replacement.prepare` payload.
+    pub intent: Value,
+    config: Value,
+}
+
 pub(crate) struct Bootstrap {
     pub cluster_id: Uuid,
     pub run_id: Uuid,
@@ -153,6 +191,10 @@ pub(crate) struct Bootstrap {
     worker_configs: [Value; 3],
     api_enrollments: [Value; 2],
     queue: QueueSettings,
+    /// The process that runs each of `worker_configs`. A replacement takes a slot over.
+    nodes: [u64; 3],
+    /// Workers keep their keys and their bootstrap file on a volume of their own.
+    split: bool,
     /// The workers' identities and secondary pools, shared with the operator's tasks.
     pub mounts: Mounts,
 }
@@ -233,6 +275,13 @@ impl Mounts {
     /// The worker no longer opens this secondary pool.
     pub fn unlist(&self, index: usize, pool: &Value) {
         self.state().pools[index].retain(|entry| entry["mount"]["identity"]["pool_id"] != *pool);
+    }
+
+    /// Another worker takes the slot over, with no pool but its own primary one.
+    fn replace(&self, index: usize, worker: Value) {
+        let mut state = self.state();
+        state.identities[index] = worker;
+        state.pools[index].clear();
     }
 
     /// The worker's next process has another identity, and its mounts follow it.
@@ -340,6 +389,8 @@ impl Bootstrap {
             worker_configs,
             api_enrollments,
             queue: QueueSettings::default(),
+            nodes: WORKERS,
+            split: false,
             mounts,
         })
     }
@@ -353,6 +404,54 @@ impl Bootstrap {
                 config["node"]["scoped_oltp"] = json!(true);
             }
         }
+    }
+
+    /// The workers that form the cluster, in slot order.
+    pub fn nodes(&self) -> [u64; 3] {
+        self.nodes
+    }
+
+    pub fn node(&self, index: usize) -> u64 {
+        self.nodes[index]
+    }
+
+    pub fn index_of(&self, node: u64) -> Option<usize> {
+        self.nodes.iter().position(|worker| *worker == node)
+    }
+
+    /// Opt in, before any worker starts: every worker's certificate, private key, CA, tokens
+    /// and bootstrap file live on the volume at [`KEYS`], as a deployment mounts its secrets
+    /// apart from its data volume. Only the pool and its volume marker stay at [`ROOT`].
+    pub fn split_volumes(&mut self) {
+        self.split = true;
+        for config in &mut self.worker_configs {
+            config["auth_file"] = json!(placed(KEYS, AUTH));
+            for (field, path) in [
+                ("certificate", CERT),
+                ("private_key", KEY),
+                ("authority_ca", CA),
+            ] {
+                config["node"][field] = json!(placed(KEYS, path));
+            }
+        }
+    }
+
+    pub fn is_split(&self) -> bool {
+        self.split
+    }
+
+    /// The volume that holds `node`'s keys and bootstrap file.
+    fn keys(&self, node: u64) -> &'static str {
+        if self.split && !GATEWAYS.contains(&node) {
+            KEYS
+        } else {
+            ROOT
+        }
+    }
+
+    /// The bootstrap file of `node`.
+    pub fn config_path(&self, node: u64) -> String {
+        placed(self.keys(node), CONFIG)
     }
 
     fn identity(enrollment: &Value) -> Value {
@@ -375,7 +474,7 @@ impl Bootstrap {
     }
 
     pub fn certificate_digest(&self, node: u64) -> [u8; 32] {
-        let enrollment = if let Some(index) = WORKERS.iter().position(|id| *id == node) {
+        let enrollment = if let Some(index) = self.index_of(node) {
             &self.worker_configs[index]["node"]["enrollment"]
         } else {
             let index = GATEWAYS
@@ -391,11 +490,12 @@ impl Bootstrap {
 
     fn write_material(&self, node: u64) -> io::Result<()> {
         let (cert, key) = material(node);
-        write(CERT, cert)?;
-        write(KEY, key)?;
-        write(CA, certificate_authority())?;
+        let dir = self.keys(node);
+        write(&placed(dir, CERT), cert)?;
+        write(&placed(dir, KEY), key)?;
+        write(&placed(dir, CA), certificate_authority())?;
         write_json(
-            AUTH,
+            &placed(dir, AUTH),
             &json!({
                 "data_token": self.data_token,
                 "admin_token": self.admin_token,
@@ -405,22 +505,46 @@ impl Bootstrap {
     }
 
     pub fn write_worker(&self, index: usize) -> io::Result<()> {
-        let node = WORKERS[index];
+        let node = self.nodes[index];
         self.write_material(node)?;
+        let config = self.worker_file(index);
+        write_marker(
+            node,
+            &config["node"]["mount"]["profile"]["docker"]["volume_marker"],
+        )?;
+        write_json(&self.config_path(node), &config)
+    }
+
+    /// Write only worker `index`'s bootstrap file, as a restart of a worker whose key volume
+    /// survived does. The data volume is not touched.
+    pub fn write_bootstrap_file(&self, index: usize) -> io::Result<()> {
+        write_json(
+            &self.config_path(self.nodes[index]),
+            &self.worker_file(index),
+        )
+    }
+
+    /// Worker `index`'s bootstrap file, with the secondary pools it opens.
+    fn worker_file(&self, index: usize) -> Value {
         let mut config = self.worker_configs[index].clone();
         let pools = self.mounts.state().pools[index].clone();
         if !pools.is_empty() {
             config["node"]["secondary_pools"] = json!(pools);
         }
-        write_json(
-            MARKER,
-            &json!({
-                "format_version": 1,
-                "volume_name": format!("sim-oltp-{node}"),
-                "volume_marker": config["node"]["mount"]["profile"]["docker"]["volume_marker"],
-            }),
-        )?;
-        write_json(CONFIG, &config)
+        config
+    }
+
+    /// Write the marker that worker `index`'s bootstrap file names on its data volume.
+    pub fn write_kept_marker(&self, index: usize) -> io::Result<()> {
+        write_marker(
+            self.nodes[index],
+            &self.worker_configs[index]["node"]["mount"]["profile"]["docker"]["volume_marker"],
+        )
+    }
+
+    /// Write the marker of a newly provisioned data volume.
+    pub fn write_fresh_marker(&self, index: usize) -> io::Result<()> {
+        write_marker(self.nodes[index], &json!(uuid_v4()))
     }
 
     pub fn api_enrollment(&self, index: usize) -> &Value {
@@ -453,10 +577,163 @@ impl Bootstrap {
         write_json(CONFIG, &config)
     }
 
+    /// The certificate fingerprint of a spare worker that no slot names yet.
+    pub fn spare_digest(spare: u64) -> io::Result<[u8; 32]> {
+        let (cert, key) = material(spare);
+        let tls = TlsMaterial::from_pem(cert, key, certificate_authority())?;
+        Ok(*Digest::parse(tls.certificate_sha256())
+            .expect("generated SHA-256 fingerprint")
+            .as_bytes())
+    }
+
+    /// Provision `spare` as the replacement of the permanently lost worker `index`, as step 3
+    /// of "Replace a permanently lost system voter" in `docs/oltp-recovery.md` says: a fresh
+    /// worker ID, incarnation, certificate and pool at revision 1 and generation 1, with its
+    /// own signing key on the mount. Runs on the spare and writes to its volumes.
+    pub fn provision_replacement(
+        &self,
+        index: usize,
+        spare: u64,
+        id: Uuid,
+        control_peers: &Value,
+    ) -> io::Result<Candidate> {
+        // A preparation that never enrolled does not change who was lost.
+        let lost = &self.worker_enrollment(index)["worker_id"];
+        let previous = control_peers
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|peer| peer["worker_id"] == *lost)
+            .ok_or_else(|| io::Error::other("Control does not list the lost worker"))?;
+        let next = enrollment(spare)?;
+        let (pool_id, marker) = (uuid_v4(), uuid_v4());
+        let mut seed = [0; 32];
+        seed[..16].copy_from_slice(uuid_v4().as_bytes());
+        seed[16..].copy_from_slice(uuid_v4().as_bytes());
+        let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed)
+            .map_err(|_| io::Error::other("replacement mount key"))?;
+        let public_key: String = ring::signature::KeyPair::public_key(&key)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let mount = json!({
+            "profile": {"docker": {"volume_marker": marker}},
+            "worker": Self::identity(&next),
+            "generation": 1,
+            "identity": {
+                "engine": "oltp", "pool_format_version": POOL_FORMAT_VERSION,
+                "cluster_id": self.cluster_id, "worker_id": next["worker_id"], "pool_id": pool_id,
+            },
+            "mount_path": ROOT,
+            "provider_volume_id": format!("docker-volume:sim-oltp-{spare}"),
+            "filesystem_uuid": "",
+        });
+        self.write_material(spare)?;
+        write_marker(spare, &json!(marker))?;
+        write(&format!("{ROOT}/{RESTART_KEY}"), &seed)?;
+        let intent = json!({
+            "id": id,
+            "run_id": self.run_id,
+            "previous": Self::identity(previous),
+            "next": next,
+            "mount": mount,
+            "mount_public_key": public_key,
+        });
+        let mut config = self.worker_configs[index].clone();
+        config["bind"] = json!(http_addr(spare));
+        let node = &mut config["node"];
+        let fields = node.as_object_mut().expect("node configuration");
+        for field in ["cold", "rolling", "secondary_pools", "system_replacement"] {
+            fields.remove(field);
+        }
+        node["pool_id"] = json!(pool_id);
+        node["scheduler_node_id"] = json!(spare);
+        node["enrollment"] = next;
+        node["bind"] = json!(peer_addr(spare));
+        node["mount"] = mount;
+        node["control_enrollments"] = control_peers.clone();
+        node["initial_run"] = json!(self.run_id);
+        Ok(Candidate {
+            spare,
+            index,
+            intent,
+            config,
+        })
+    }
+
+    /// Write the bootstrap file of a replacement whose intent Control prepared as `record`.
+    /// Runs on the spare.
+    pub fn write_candidate(&self, candidate: &mut Candidate, record: &Value) -> io::Result<()> {
+        candidate.config["node"]["system_replacement"] = record.clone();
+        write_json(&self.config_path(candidate.spare), &candidate.config)
+    }
+
+    /// The replacement is complete: it takes over the lost worker's slot, and every worker's
+    /// next bootstrap file names the current voters (step 7).
+    pub fn adopt(&mut self, candidate: Candidate, groups: &Value) {
+        let Candidate {
+            spare,
+            index,
+            mut config,
+            ..
+        } = candidate;
+        config["node"]
+            .as_object_mut()
+            .expect("node configuration")
+            .remove("system_replacement");
+        self.worker_configs[index] = config;
+        self.nodes[index] = spare;
+        // The replacement opens no pool of the lost worker.
+        let identity = self.worker_configs[index]["node"]["mount"]["worker"].clone();
+        self.mounts.replace(index, identity);
+        let mut pins: Vec<String> = self
+            .worker_configs
+            .iter()
+            .filter_map(|config| {
+                let enrollment = &config["node"]["enrollment"];
+                Some(enrollment["certificate_sha256"].as_str()?.to_owned())
+            })
+            .collect();
+        pins.sort_unstable();
+        for config in &mut self.worker_configs {
+            config["node"]["operator_pins"] = json!(pins);
+            let placements = config["node"]["placements"]
+                .as_object_mut()
+                .expect("system placements");
+            for placement in placements.values_mut() {
+                for group in groups.as_array().into_iter().flatten() {
+                    if group["record"]["identity"] == placement["identity"] {
+                        let mut voters = group["members"].as_array().cloned().unwrap_or_default();
+                        voters.sort_by_key(|voter| voter["node_id"].as_u64());
+                        placement["voters"] = json!(voters);
+                    }
+                }
+            }
+        }
+    }
+
     /// The TLS material of one process.
     pub fn tls(&self, node: u64) -> io::Result<TlsMaterial> {
         let (cert, key) = material(node);
         TlsMaterial::from_pem(cert, key, certificate_authority())
+    }
+
+    /// The system groups as the bootstrap files place them: the label, the group and its voters.
+    pub fn system_groups(&self) -> Vec<(String, Uuid, Vec<Value>)> {
+        self.worker_configs[0]["node"]["placements"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(label, placement)| {
+                let group = placement["identity"]["group_id"].as_str()?;
+                Some((
+                    label.clone(),
+                    Uuid::parse_str(group).ok()?,
+                    placement["voters"].as_array()?.clone(),
+                ))
+            })
+            .collect()
     }
 
     /// The primary pool in worker `index`'s bootstrap file.

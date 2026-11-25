@@ -219,6 +219,10 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         let trace = trace.clone();
         move |ms, conn, line: &str| trace.lock().unwrap().record(ms, conn, line)
     };
+    if workload == Workload::Membership {
+        // A lost volume that is formatted again repeats its inode numbers, as `mkfs` does.
+        world.set_mkfs_inodes(true);
+    }
     match Cluster::new(
         world.clone(),
         checks.clone(),
@@ -234,8 +238,13 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
                     Workload::Queued => workloads::queued::configure(&mut cluster.config, seed),
                     _ => Ok(()),
                 };
+                let mut membership = (workload == Workload::Membership)
+                    .then(|| workloads::membership::Membership::draw(generator));
                 let startup = match configured {
-                    Ok(()) => cluster.start().await,
+                    Ok(()) => match membership.as_mut() {
+                        Some(membership) => membership.start(&mut cluster).await,
+                        None => cluster.start().await,
+                    },
                     Err(error) => Err(error),
                 };
                 assertions.insert("cluster readiness", startup.is_ok());
@@ -246,7 +255,19 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
                 }
                 match startup {
                     Ok(()) if workload != Workload::Smoke => {
-                        let report = if workload == Workload::Queued {
+                        let report = if let Some(membership) = membership {
+                            membership
+                                .run(
+                                    &mut cluster,
+                                    &config,
+                                    history.clone(),
+                                    generator,
+                                    seed,
+                                    &setup.selection,
+                                    setup.quiet,
+                                )
+                                .await
+                        } else if workload == Workload::Queued {
                             workloads::queued::run(
                                 &mut cluster,
                                 &config,

@@ -151,6 +151,42 @@ impl Move {
         self.task = Some(nabedra_rt::task::spawn(driver.run()));
     }
 
+    /// Mount and enroll the next pool on `node`, and build the request that moves its replica
+    /// there, for a workload that drives the requests itself. A pool that held a replica of the
+    /// group keeps its retired state and is refused as a target: call [`Move::another_pool`]
+    /// before the next move.
+    pub(super) async fn prepare(
+        &mut self,
+        cluster: &Cluster,
+        ctx: &Ctx,
+        faults: &NetFaults,
+        node: u64,
+    ) -> Result<(Uuid, Value), String> {
+        let driver = Driver {
+            op: cluster.operator(),
+            table: ctx.table.clone(),
+            faults: faults.clone(),
+            start_ms: 0,
+            delay: Duration::ZERO,
+            inner: self.inner.clone(),
+        };
+        driver.prepare(node).await?;
+        let mut inner = self.inner();
+        // The workload delays frames itself.
+        if let Some(slow) = inner.slow.take() {
+            faults.end(slow);
+        }
+        match std::mem::take(&mut inner.phase) {
+            Phase::Moving { id, payload, .. } => Ok((id, payload)),
+            _ => Err("the prepared move has no request".into()),
+        }
+    }
+
+    /// The next [`Move::prepare`] mounts another pool.
+    pub(super) fn another_pool(&mut self) {
+        self.inner().claim = None;
+    }
+
     fn inner(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap()
     }
@@ -971,7 +1007,7 @@ async fn placement(op: &Operator, table: &str) -> Result<(Value, Value), String>
 
 /// The worker that schedules Data groups. Each worker is asked to move its own replica to a
 /// pool that does not exist, and only the owner gets as far as the pool.
-async fn owner(op: &Operator, table: &str) -> Result<u64, String> {
+pub(super) async fn owner(op: &Operator, table: &str) -> Result<u64, String> {
     let (group, placement) = placement(op, table).await?;
     let members = placement["members"].as_array().cloned().unwrap_or_default();
     let mut refusals = Vec::new();

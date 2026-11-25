@@ -1,0 +1,17 @@
+id = "OLTP-sim-prepared-restart-blocks-replacement"
+title = "A worker that is lost after its retained restart was prepared cannot be replaced in the run"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 1
+why_not_caught = "The replacement tests never prepare a retained restart for the worker that they then lose."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=membership, NABEDRA_SIM_MEMBERSHIP=wipe, NABEDRA_SIM_PROFILE=none, seeds 1, 6, 9, 20 and 22 of 1 to 24 at d63ba0dc (check oltp-sim-membership-wipe, Actions run 45648985850, kind StepReplacement, each after a preparation and replayed equal; seed 1 is trace 005718128f1200ee), and seeds 6, 15 and 28 of the default profile in the same run: after worker.restart.prepare, worker.system_replacement.check for that worker answers could not verify a surviving RF3 quorum on both survivors. The survivor refuses its own probe of the lost worker, target incarnation differs from cached enrollment, so the probe is indeterminate. By reading, the next check refuses while a preparation exists, and only the worker's join or a cold fence clears one. No contract gives a bound. Distinct from OLTP-sim-enrolled-restart-blocks-prepare, where the preparation had enrolled."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

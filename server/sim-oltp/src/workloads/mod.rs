@@ -11,6 +11,7 @@ pub(crate) mod cold;
 pub(crate) mod corrupt;
 pub(crate) mod direct;
 pub(crate) mod freezes;
+pub(crate) mod membership;
 pub(crate) mod moves;
 pub(crate) mod old_peer;
 pub(crate) mod paused;
@@ -30,6 +31,8 @@ pub(crate) enum Workload {
     Move,
     Queued,
     Topology,
+    /// Phase 11, not part of `mixed`.
+    Membership,
 }
 
 /// The workloads `mixed` rotates through, in seed order.
@@ -44,6 +47,7 @@ impl Workload {
             Workload::Move => "move",
             Workload::Queued => "queued",
             Workload::Topology => "topology",
+            Workload::Membership => "membership",
         }
     }
 
@@ -55,6 +59,7 @@ impl Workload {
             Workload::Move,
             Workload::Queued,
             Workload::Topology,
+            Workload::Membership,
         ]
         .into_iter()
         .find(|workload| workload.name() == name)
@@ -171,6 +176,9 @@ mod tests {
         assert!(cold.overlay() && cold.of(5) == Workload::Cold);
         assert_eq!(WorkloadChoice::parse(&cold.label()).unwrap(), cold);
         assert!(WorkloadChoice::parse("smoke,resources").is_err());
-        assert!(WorkloadChoice::parse("queued,resources").is_err());
+        for other in ["queued", "topology", "membership"] {
+            assert!(WorkloadChoice::parse(other).is_ok());
+            assert!(WorkloadChoice::parse(&format!("{other},resources")).is_err());
+        }
     }
 }
