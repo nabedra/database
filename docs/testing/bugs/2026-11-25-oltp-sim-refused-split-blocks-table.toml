@@ -1,0 +1,17 @@
+id = "OLTP-sim-refused-split-blocks-table"
+title = "After a split is refused at its freeze, its table refuses every later split ID and index declaration with a conflict"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = []
+scenarios = ["D07", "O12", "O16"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 6
+why_not_caught = "No runner splits a range with direct commits and then asks for another schema change of the table."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=topology NABEDRA_SIM_PROFILE=none NABEDRA_SIM_TOPOLOGY=no-move,split-under-load, seeds 6 and 9 at 9a6bc79e (7 and 11 end with the same refusals and were not tried with a new ID): an index declaration settles within 180 s of the heal. The split ID is answered `source refused the exact split freeze`, and every declaration of the next 180 s `captured schema or lifecycle changed`. A scratch build that also asks with new split IDs after the heal gets that conflict for them too, for 60 s (review-136). That the first split's attempt holds the table's exclusive guard is inferred. Review-136: a product behaviour, supported by the experiment, with an inferred holder. No operator operation aborts a split. The first refusal is OLTP-sim-split-after-direct-commit."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-23"

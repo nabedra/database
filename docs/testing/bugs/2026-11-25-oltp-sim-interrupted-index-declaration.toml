@@ -1,5 +1,5 @@
 id = "OLTP-sim-interrupted-index-declaration"
-title = "After the heal a table refuses every schema change with a conflict, and its writes leave the direct path or are refused with the same conflict"
+title = "An index declaration that ends between taking its table's guard and its commit is never settled, and the table refuses every schema change"
 class = "fence-lifecycle-order"
 module = "oltp"
 guarantees = []
@@ -7,9 +7,9 @@ scenarios = ["O12", "D11"]
 found_by = "campaign"
 found_date = "2026-11-25"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
-seed = 24
-why_not_caught = "The O12 and D11 runners publish an index under load and do not lose a worker while a declaration is unanswered."
-invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=topology, default profile. Seed 24 (FenceAfterValidation): 267 s after the heal, with every declaration answered, direct mutations of the table still fall back for the schema, and declarations were refused with `captured schema or lifecycle changed` for 180 s. Seeds 4 and 9: final writes are refused with that conflict. That an interrupted declaration left its fence and guard behind is inferred from the histories, not instrumented."
+seed = 4
+why_not_caught = "The O12 and D11 runners publish an index under load and do not lose a worker or a reply while a declaration runs."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=topology, default profile, instrumented at 9a6bc79e with unchanged trace hashes (review-136). Seed 4: declaration 96dc193f took the guard and its fence call returned, then its commit answered `commit permit: worker outgoing lane full (Authority)` not_applied. 1,071 later exclusive acquisitions of that table were rejected, and the final writes were refused with 409. Seed 24: declaration 95f75d2b took the guard and its fence call never returned. 998 later acquisitions were rejected, and 267 s after the heal direct mutations still fall back for the schema. Whether that fence reached Data is not known. That these declarations are the holders is inferred from the order. Read in the code: IndexService::declare returns a commit error without settling the attempt. Seed 9 ends with the same refusals and was not instrumented. Review-136: a product behaviour, supported by the instrumented runs and the code."
 fix_commits = []
 revert_patch_ok = false
 status = "open"

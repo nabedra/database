@@ -18,7 +18,7 @@ use crate::{
     nemesis::Selection,
     panics::PANIC,
     workload::run_seed,
-    workloads::{SCENARIOS, Scenarios, Workload, WorkloadChoice, clauses},
+    workloads::{SCENARIOS, Scenarios, Workload, WorkloadChoice, clauses, topology},
 };
 
 const REPLAY: &str = "RUST_MIN_STACK=16777216 RUSTFLAGS=\"--cfg tokio_unstable\" CARGO_TARGET_DIR=target/sim \
@@ -332,8 +332,8 @@ fn replay_command(defect: Defect) -> String {
         "NABEDRA_SIM_WORKLOAD",
         "NABEDRA_SIM_PROFILE",
         "NABEDRA_SIM_BEYOND_TCP",
-        crate::workloads::topology::MODE_ENV,
-        crate::workloads::topology::DEFECT_ENV,
+        topology::MODE_ENV,
+        topology::DEFECT_ENV,
     ] {
         if let Some(value) = env(name) {
             prefix.push_str(&format!("{name}={value} "));
@@ -446,6 +446,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     let mut config_hash = nabedra_sim::Fnv::default();
     let mut stats = Vec::with_capacity(report.seeds.len());
     let mut paths = report.artifacts.clone();
+    let mut unjudged: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     // Scenario tag -> (seeds that executed it, seeds among them that failed).
     let mut scenario_seeds: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
     std::fs::create_dir_all(&config.artifacts)?;
@@ -463,6 +464,11 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         let tags = observation
             .map(|row| row.scenarios.clone())
             .unwrap_or_default();
+        if seed_workload == Workload::Topology {
+            for rule in topology::not_judged(observation.map(|row| &row.summary)) {
+                unjudged.entry(rule).or_default().push(seed);
+            }
+        }
         seed_line(seed, &kinds, seed_workload, setup.profile(seed), &tags);
         for tag in &tags {
             let entry = scenario_seeds.entry(tag).or_default();
@@ -579,6 +585,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             smoke: setup.workloads.is_smoke(),
             scenarios: scenario_assertions,
             assertions,
+            unjudged,
             defects_skipped: test_defects && !report.passed(),
             duration_s,
             total_cpu_s,
@@ -691,6 +698,8 @@ struct RecordInput {
     /// Scenario tags that executed, and whether every seed that executed one passed.
     scenarios: BTreeMap<&'static str, bool>,
     assertions: BTreeMap<&'static str, bool>,
+    /// Rules of the topology workload, and the seeds that did not judge them.
+    unjudged: BTreeMap<String, Vec<u64>>,
     defects_skipped: bool,
     duration_s: f64,
     total_cpu_s: Option<f64>,
@@ -742,6 +751,14 @@ fn write_record(
         ("seeded_defect".to_owned(), json!(input.defect.name())),
         ("replayed".to_owned(), json!(report.replayed())),
     ]));
+    for (key, name) in [
+        ("topology_plan", topology::MODE_ENV),
+        ("topology_defect", topology::DEFECT_ENV),
+    ] {
+        if let (Some(mode), Some(value)) = (record.mode.as_mut(), env(name)) {
+            mode.insert(key.to_owned(), json!(value));
+        }
+    }
     record.duration_s = input.duration_s;
     let mut seeds = report.evidence_seeds();
     // The full list is always in the sweep report. The evidence schema caps this index.
@@ -761,8 +778,18 @@ fn write_record(
     for invariant in PROBE_INVARIANTS {
         record.not_run(invariant, "P10-PROBES integration pending");
     }
-    for (rule, why) in crate::invariants::topology::NOT_RUN {
-        record.not_run(rule, why);
+    if input.workload == Workload::Topology.name() {
+        for (rule, why) in crate::invariants::topology::NOT_RUN {
+            record.not_run(rule, why);
+        }
+    }
+    for (rule, seeds) in &input.unjudged {
+        let why = format!(
+            "not judged in {} of {} seeds: {seeds:?}",
+            seeds.len(),
+            report.count
+        );
+        record.not_run(rule, &why);
     }
     record.not_run(
         "ResourceBaseline ledger and RangeClock pending sets",

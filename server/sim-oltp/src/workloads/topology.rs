@@ -54,9 +54,9 @@ use crate::{
     invariants::{
         elapsed_ms,
         topology::{
-            self, AtRest, Chosen, Ended, Refresh, Scan, Status, TableCall, Write, audit_scans,
-            dropped_silent, fence_at_rest, incomplete_chosen, refreshes_once, refused_ddl,
-            route_count,
+            self, AtRest, Chosen, Ended, RULES, Refresh, Scan, Status, TableCall, Write,
+            audit_scans, dropped_silent, fence_at_rest, incomplete_chosen, refreshes_once,
+            refused_ddl, route_count,
         },
     },
     nemesis::{Action, NetFaults, Selection, apply::Chaos},
@@ -3087,6 +3087,21 @@ fn clauses_of(
     }
 }
 
+/// What a run did not judge, from its summary. A run without one judged nothing.
+pub(crate) fn not_judged(summary: Option<&Value>) -> Vec<String> {
+    let summary = summary.unwrap_or(&Value::Null);
+    let mut unjudged: Vec<String> = RULES
+        .iter()
+        .filter(|rule| summary["judged"][**rule].as_u64().unwrap_or(0) == 0)
+        .map(|rule| (*rule).to_owned())
+        .collect();
+    let tables = summary["fence_not_judged"].as_array();
+    if tables.is_some_and(|tables| !tables.is_empty()) {
+        unjudged.push(format!("{} for every table and race", topology::FENCE));
+    }
+    unjudged
+}
+
 /// How often each rule was judged in the run.
 fn judgments(log: &Log) -> BTreeMap<&'static str, u64> {
     let mut covering = 0;
@@ -3403,6 +3418,19 @@ mod tests {
         assert!(!build.is_open());
         build.open = true;
         assert!(build.is_open());
+    }
+
+    #[test]
+    fn a_rule_is_not_judged_without_a_count() {
+        assert_eq!(not_judged(None).len(), RULES.len());
+        let judged = |count: u64| -> BTreeMap<&str, u64> {
+            RULES.into_iter().map(|rule| (rule, count)).collect()
+        };
+        assert!(not_judged(Some(&json!({"judged": judged(1)}))).is_empty());
+        assert_eq!(not_judged(Some(&json!({"judged": judged(0)}))), RULES);
+        let summary = json!({"judged": judged(1), "fence_not_judged": ["main: open"]});
+        assert_eq!(not_judged(Some(&summary)).len(), 1);
+        assert_eq!(judgments(&Log::default()).len(), RULES.len());
     }
 
     /// Both split timings, with and without a move, are drawn. The plan never drops a table

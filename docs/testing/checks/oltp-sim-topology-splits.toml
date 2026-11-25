@@ -2,8 +2,9 @@ id = "oltp-sim-topology-splits"
 module = "oltp"
 kinds = ["S", "H"]
 # Fault model, no nemesis. The same seeds with the range split before any client starts, and with
-# the split requested under direct load. The second half is red while a split under direct load
-# does not publish (OLTP-sim-split-after-direct-commit).
+# the split requested under direct load. A seed whose split does not publish is red. Open records:
+# OLTP-sim-split-after-direct-commit, OLTP-sim-split-pinned-to-index-build and
+# OLTP-sim-refused-split-blocks-table. Every seed is replayed, and both halves must have run.
 guarantees = ["OLTP-G06"]
 scenarios = []
 tiers = ["T1"]
@@ -13,8 +14,13 @@ build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
 rc=0
 for way in split-before-load split-under-load; do
   echo "split timing $way"
+  report=../target/testing-logs/oltp-sim-topology-splits/$way/sweep-report.json
+  rm -f "$report"
   NABEDRA_SIM_TOPOLOGY="no-move,$way" NABEDRA_SIM_ARTIFACTS="$NABEDRA_SIM_ARTIFACTS/$way" \
     timeout 1500s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1 || rc=$?
+  python3 -c 'import json, sys
+seeds = json.load(open(sys.argv[1]))["seeds"]
+sys.exit(0 if len(seeds) == int(sys.argv[2]) else f"the sweep ran {len(seeds)} seeds")' "$report" "$NABEDRA_SEEDS" || rc=$?
 done
 exit "$rc"
 ''']
@@ -22,4 +28,4 @@ cwd = "server"
 timeout_s = 5400
 needs = []
 result_parser = "cargo-test"
-env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "topology", NABEDRA_SIM_PROFILE = "none", NABEDRA_SEEDS = "12", NABEDRA_SIM_JOBS = "2", NABEDRA_SIM_VERIFY_REPLAY = "0.25", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-topology-splits", NABEDRA_SIM_GUARANTEES = "OLTP-G06", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-topology-splits" }
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "topology", NABEDRA_SIM_PROFILE = "none", NABEDRA_SEEDS = "12", NABEDRA_SIM_JOBS = "2", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-topology-splits", NABEDRA_SIM_GUARANTEES = "OLTP-G06", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-topology-splits" }
