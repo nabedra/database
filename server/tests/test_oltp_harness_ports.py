@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import subprocess
 import sys
@@ -32,6 +33,14 @@ def lost(text):
     os._exit(101)
 
 
+def outlive_nobody():
+    # A test that is killed runs no cleanup, and the harness starts each worker in a session of its own.
+    while os.getppid() == %d:
+        time.sleep(0.2)
+    os._exit(9)
+
+
+threading.Thread(target=outlive_nobody, daemon=True).start()
 if sys.argv[1] == 'serve':
     # `nabedra-db serve`: one RF1 process that takes its port from the command line.
     port = int(sys.argv[sys.argv.index('--port') + 1])
@@ -117,7 +126,19 @@ try:
 except (OSError, ValueError):
     pass
 threading.Event().wait()
-''' % sys.executable
+''' % (sys.executable, os.getpid())
+
+
+def runs(pid):
+    """Whether the process runs. One that ended and that nobody reaped does not."""
+    state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith('Z')
+
+
+def end(pid):
+    if runs(pid):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
 
 
 def free_ports(count):
@@ -737,6 +758,27 @@ class Workers(Case):
         error = self.serve('serve-bind-error', 'serve')
         self.assertIsNotNone(error, 'the start was retried')
         self.assertIn('listener failed', str(error))
+
+    def test_a_killed_test_leaves_no_worker(self):
+        source = ('import signal, sys, time; signal.signal(signal.SIGINT, signal.default_int_handler); '
+                  'sys.path.insert(0, sys.argv[1]); import test_oltp_harness_ports as t; '
+                  'from pathlib import Path; root = Path(sys.argv[2]); binary = root / "fake-worker"; '
+                  'binary.write_text(t.FAKE_WORKER); binary.chmod(0o700); server = t.Rf1Serve(binary, root / "rf1"); '
+                  'server.start(); print(server.process.pid, flush=True); time.sleep(60)')
+        for sig in (signal.SIGKILL, signal.SIGTERM, signal.SIGINT):
+            with self.subTest(sig):
+                test = subprocess.Popen([sys.executable, '-c', source, str(Path(__file__).resolve().parent),
+                                         str(self.root)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                self.addCleanup(lambda test=test: (test.kill(), test.wait(), test.stdout.close()))
+                worker = int(test.stdout.readline())
+                self.addCleanup(end, worker)
+                self.assertTrue(runs(worker))
+                test.send_signal(sig)
+                test.wait(timeout=20)
+                deadline = time.monotonic() + 20
+                while runs(worker) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertFalse(runs(worker), 'the worker outlived its test')
 
     def test_each_launch_logs_the_worker_and_its_ports(self):
         cluster = self.prepared()
