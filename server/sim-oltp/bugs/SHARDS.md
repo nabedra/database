@@ -7,7 +7,7 @@ records. The rule for what counts is in [README.md](README.md) and does not chan
 
 | Check | Runs |
 | --- | --- |
-| `oltp-sim-bugs-<id>-1` to `-4` | One shard each: seeds 1 to 2,500, 2,501 to 5,000, 5,001 to 7,500, 7,501 to 10,000 of one target. 16 checks for the four phase 10 targets that can be found. |
+| `oltp-sim-bugs-<id>-<n>` | One shard each: 2,500 seeds of a `direct` target (4 shards), 1,250 of `az2` (8). 20 checks for the four phase 10 targets that can be found. |
 | `oltp-sim-bugs-<id>` | The counting run of one target. |
 | `oltp-sim-bugs-direct` | The counting run of all five targets: the acceptance record. It cannot pass while ACC3 is not shown. |
 
@@ -94,8 +94,9 @@ It does not search seeds 1 to the hit again. A missing or unattested shard makes
 The job needs no token and no workflow change. The `checks` job fetches every branch, so the records, logs and attestations are in its clone,
 and `gh attestation verify --bundle` needs neither login nor the API. Nothing on that branch is trusted: what is not signed is not there.
 
-Binaries of one commit have the same digest on every runner that was compared, so the shards of one merge and the counting run have to have the same
-ones.
+A sweep holds the path of the tree it was built in. So `shard` and `count` build in one path per target directory, and refuse when something is
+there. One commit then gives one binary on every runner that was compared, and the shards of one merge and the counting run have to have the
+same two. (With a path per process, two jobs of one commit had different ones. Their 300 rows were equal.)
 
 ## What this design had left open
 
@@ -119,15 +120,17 @@ share theirs, and the second is held.
 ## Cost
 
 From the attested sweeps of run 45668293011 at `137c2a2e` (240 seeds per shard of `oltp-sim`, every seed twice, 4 jobs): 3.9 CPU s per run of `direct`
-and 5.6 of `move`, 3.75 effective cores, 5.1 GB peak RSS. Nearly every base seed is red (220 of 240 `direct`, 240 of 240 `move`),
-and a red seed runs twice on both builds.
+and 5.6 of `move`, 3.75 effective cores, 5.1 GB peak RSS. Nearly every base seed is red (220 of 240 `direct`, 240 of 240 `move`), and a red
+seed runs twice on both builds, so a seed is at most four runs. A rehearsal job (150 seeds, `direct`, profile `network`) had 2.4 CPU s per run,
+3.55 cores, 4.9 GB and 18 minutes of builds.
 
-| Per shard of 2,500 seeds | Runs | CPU | Wall, without about 20 minutes of builds |
+| Per shard | Runs | CPU | Wall with builds |
 | --- | --- | --- | --- |
-| `direct` | 10,000 at most | 10.9 h | 2.9 h |
-| `move` | 10,000 at most | 15.5 h | 4.1 h |
+| `direct`, 2,500 seeds | at most 10,000 | 6.7 to 10.9 h | 2.2 to 3.3 h |
+| `move`, 1,250 seeds | at most 5,000 | 7.7 h | 2.4 h |
 
-Three `direct` targets and one `move` target: about 193 core-hours, or 51 runner-hours. A shard's limit is 17,400 s.
+Three `direct` targets and one `move` target: 141 to 193 core-hours, 45 to 59 runner-hours. A shard's limit is 17,400 s. A hit that is judged
+adds four runs on one thread.
 
 ## What it cannot prove
 
