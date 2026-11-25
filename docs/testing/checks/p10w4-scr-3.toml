@@ -1,0 +1,27 @@
+id = "p10w4-scr-3"
+module = "oltp"
+kinds = ["S"]
+# Scratch diagnostic, never merged. It prints who holds each scratch lease and asserts nothing,
+# so it always exits 1: its record must never read as a pass.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib --no-run
+bin=$PWD/$(ls -t target/sim/release/deps/nabedra_sim_oltp-* | grep -v "[.]d$" | head -1)
+out=$PWD/../target/testing-logs/p10w4-scr-3
+mkdir -p $out
+cd sim-oltp
+set +e
+for k in 0 1 2 3; do
+  (NABEDRA_SIM_EXPECT=none-such NABEDRA_SIM_ARTIFACTS=$out/a$k NABEDRA_SEED=$((241 + 60 * k)) NABEDRA_SEEDS=60 NABEDRA_SIM_JOBS=1 timeout 6000 $bin sweep::tests::sweep --exact --nocapture --test-threads=1 > $out/scr-$k.log 2>&1; echo "rc $?" >> $out/scr-$k.log) &
+done
+wait
+echo "diagnostic finished, no assertion ran"
+exit 1
+''']
+cwd = "server"
+timeout_s = 7200
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "mixed" }

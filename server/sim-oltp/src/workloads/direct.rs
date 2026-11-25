@@ -60,6 +60,7 @@ pub(crate) async fn run(
             .checks
             .capture_resources(&cluster.world, node, &stats);
     }
+    nabedra_resources::memory::diag::dump("base");
     let plan = Plan::draw(g, selection.focus.contention, selection.focus.idle);
     let ctx = Ctx::new(
         cluster.world.clone(),
@@ -323,6 +324,11 @@ pub(crate) async fn run(
     }
     for (node, stats) in &stats {
         cluster.checks.check_resources(&cluster.world, *node, stats);
+    }
+    for (label, wait) in [("e0", 0), ("e1", 37), ("e2", 211), ("e3", 1_009), ("e4", 3_001), ("e5", 7_013), ("e6", 20_011)] {
+        time::sleep(Duration::from_millis(wait)).await;
+        nabedra_resources::memory::diag::dump(label);
+        for node in WORKERS { if let Ok(s) = cluster.stats(node).await { println!("SCRT {label} n{node} {}", s["working_decode_bytes"]); } }
     }
     if let Some((node, row)) = leftover {
         cluster.checks.violate(
