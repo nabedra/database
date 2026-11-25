@@ -373,6 +373,20 @@ hot_paths = [
 ]
 
 [[module]]
+name = "vector"
+level = "L3"
+register = "docs/testing/guarantees/vector.md"
+paths = [
+  "specs/vector/**",
+  "server/vector/**",
+  "server/simd/**",
+]
+hot_paths = [
+  "server/vector/src/**",
+  "server/simd/src/**",
+]
+
+[[module]]
 name = "check"
 level = "L1"
 paths = [
