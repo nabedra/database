@@ -1878,3 +1878,6 @@ mod tests;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use tests::index_reclamation_storage_evidence;
+
+#[cfg(test)]
+mod golden_tests;
