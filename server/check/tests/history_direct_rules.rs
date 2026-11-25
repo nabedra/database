@@ -1133,6 +1133,18 @@ fn a_result_without_a_commit_explains_the_refusal_of_another_body() {
          3< reused",
         &["non-linearizable"],
     );
+    // The row conflict of a batch may be recorded or not, so it is no second holder.
+    legal(
+        "a batch and a no-op",
+        r#"1> insert b 1 other
+           1< ok
+           0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
+           0< exists
+           3> delete a null r
+           3< ok false
+           2> upsert a 9 r
+           2< reused"#,
+    );
     // What says that it is about a row needs one.
     by_default(
         "a row conflict with another body, over a missing row",

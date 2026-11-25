@@ -124,6 +124,8 @@ struct Record {
     /// Holds the bodies with a result but no commit, as a set of `bit`s.
     unchanged: usize,
     bit: u32,
+    /// The bits of batches, whose row conflict may be recorded or not.
+    batches: u32,
 }
 
 /// In a record's slot: a result without a commit was seen to hold the identity.
@@ -204,7 +206,9 @@ impl KeyOp {
                 }
                 // The one result of another body holds the identity, as this refusal shows.
                 let r = self.record?;
-                return (!mine && others.count_ones() == 1 && !self.rules.row).then(|| {
+                let sure = others & !r.batches;
+                let holder = sure.count_ones() == 1 || sure == 0 && others != 0;
+                return (!mine && holder && !self.rules.row).then(|| {
                     let mut next = state.to_vec();
                     next[r.slot] = HELD;
                     next
@@ -709,6 +713,7 @@ fn build(
                     body,
                     unchanged: slot + 1,
                     bit,
+                    batches: 0,
                 })
             })
         } else {
@@ -795,7 +800,16 @@ fn build(
                 .iter()
                 .any(|(r, rules)| r.slot == slot && r.body == body && rules.replays)
     };
+    let mut batches = HashMap::<usize, u32>::new();
+    for op in out.iter().filter(|op| ops[op.src].f == "insert_many") {
+        if let Some(r) = op.record {
+            *batches.entry(r.slot).or_default() |= r.bit;
+        }
+    }
     for op in &mut out {
+        if let Some(r) = &mut op.record {
+            r.batches = batches.get(&r.slot).copied().unwrap_or(0);
+        }
         op.rules.records &= op.record.is_some_and(|r| matters(r.slot, r.body));
     }
     out.extend(
