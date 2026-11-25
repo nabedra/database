@@ -5,7 +5,7 @@
 
 use std::arch::aarch64::*;
 
-use crate::SLICES;
+use crate::{LANES, SLICES};
 
 #[inline]
 #[target_feature(enable = "neon")]
@@ -23,8 +23,7 @@ fn load_words(p: &[u64; 2]) -> uint8x16_t {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn step<const L2: bool>(acc: float32x4_t, x: &[f32; 4], y: &[f32; 4]) -> float32x4_t {
-    let (x, y) = (load(x), load(y));
+fn step<const L2: bool>(acc: float32x4_t, x: float32x4_t, y: float32x4_t) -> float32x4_t {
     if L2 {
         let d = vsubq_f32(x, y);
         vfmaq_f32(acc, d, d)
@@ -33,31 +32,37 @@ fn step<const L2: bool>(acc: float32x4_t, x: &[f32; 4], y: &[f32; 4]) -> float32
     }
 }
 
+/// The first 4 values of `p`, zero past its end.
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_tail(p: &[f32]) -> float32x4_t {
+    let mut values = [0.0; 4];
+    for (value, &x) in values.iter_mut().zip(p) {
+        *value = x;
+    }
+    load(&values)
+}
+
 #[target_feature(enable = "neon")]
 pub(crate) fn sum<const L2: bool>(a: &[f32], b: &[f32]) -> f32 {
-    let ((a4, a1), (b4, b1)) = (a.as_chunks::<4>(), b.as_chunks::<4>());
-    let ((a16, a4), (b16, b4)) = (a4.as_chunks::<4>(), b4.as_chunks::<4>());
-    let mut acc = [vdupq_n_f32(0.0); 4];
-    for (x, y) in a16.iter().zip(b16) {
-        for i in 0..4 {
-            acc[i] = step::<L2>(acc[i], &x[i], &y[i]);
+    let ((blocks_a, a), (blocks_b, b)) = (a.as_chunks::<LANES>(), b.as_chunks::<LANES>());
+    let mut acc = [vdupq_n_f32(0.0); 16];
+    for (a, b) in blocks_a.iter().zip(blocks_b) {
+        let (a, b) = (a.as_chunks::<4>().0, b.as_chunks::<4>().0);
+        for i in 0..16 {
+            acc[i] = step::<L2>(acc[i], load(&a[i]), load(&b[i]));
         }
     }
-    for (x, y) in a4.iter().zip(b4) {
-        acc[0] = step::<L2>(acc[0], x, y);
+    for (acc, (a, b)) in acc.iter_mut().zip(a.chunks(4).zip(b.chunks(4))) {
+        *acc = step::<L2>(*acc, load_tail(a), load_tail(b));
     }
-    let mut sum = vaddvq_f32(vaddq_f32(
-        vaddq_f32(acc[0], acc[1]),
-        vaddq_f32(acc[2], acc[3]),
-    ));
-    for (&x, &y) in a1.iter().zip(b1) {
-        sum = if L2 {
-            (x - y).mul_add(x - y, sum)
-        } else {
-            x.mul_add(y, sum)
-        };
+    for half in [8, 4, 2, 1] {
+        for i in 0..half {
+            acc[i] = vaddq_f32(acc[i], acc[half + i]);
+        }
     }
-    sum
+    let pair = vadd_f32(vget_low_f32(acc[0]), vget_high_f32(acc[0]));
+    vget_lane_f32::<0>(vpadd_f32(pair, pair))
 }
 
 #[target_feature(enable = "neon")]

@@ -1,6 +1,26 @@
 //! The reference kernels. The callers in `lib.rs` check the lengths.
 
-use crate::SLICES;
+use crate::{LANES, SLICES};
+
+/// The float kernel of every level, in lanes: value `i` goes to lane `i % LANES` by a fused
+/// multiply-add, and halves of the lanes are added until one is left.
+pub(crate) fn sum<const L2: bool>(a: &[f32], b: &[f32]) -> f32 {
+    let mut lanes = [0.0f32; LANES];
+    for (a, b) in a.chunks(LANES).zip(b.chunks(LANES)) {
+        for (lane, (&x, &y)) in lanes.iter_mut().zip(a.iter().zip(b)) {
+            let (x, y) = if L2 { (x - y, x - y) } else { (x, y) };
+            *lane = x.mul_add(y, *lane);
+        }
+    }
+    let mut half = LANES / 2;
+    while half > 0 {
+        for i in 0..half {
+            lanes[i] += lanes[half + i];
+        }
+        half /= 2;
+    }
+    lanes[0]
+}
 
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f64 {
     a.iter()

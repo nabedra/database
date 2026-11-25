@@ -1,7 +1,7 @@
 //! Every level of this CPU against the scalar reference.
 
 use nabedra_check::{r#gen::Gen, prop, rng::SplitMix64};
-use nabedra_simd::{Kernels, Level, SLICES, dot, l2_sq, norm_sq, wide};
+use nabedra_simd::{Kernels, Level, SLICES, dot, l2_sq, norm_sq, relative_error, wide};
 
 fn levels() -> impl Iterator<Item = Kernels> {
     Level::ALL.into_iter().filter_map(Kernels::at)
@@ -34,7 +34,7 @@ fn values(rng: &mut SplitMix64, len: usize, range: (i32, i32)) -> Vec<f32> {
 
 /// The tolerance in the crate documentation, for terms whose magnitudes sum to `terms`.
 fn tolerance(n: usize, terms: f64) -> f64 {
-    (n / 16 + 32) as f64 * 2f64.powi(-24) * terms + n as f64 * 2f64.powi(-149)
+    relative_error(n) * terms + n as f64 * 2f64.powi(-149)
 }
 
 fn near(what: &str, level: Level, n: usize, got: f32, want: f64, terms: f64) -> Result<(), String> {
@@ -67,7 +67,11 @@ fn float_kernels(a: &[f32], b: &[f32]) -> Result<(), String> {
     if wide::dot(a, b) != naive_dot || wide::l2_sq(a, b) != naive_l2 {
         return Err("the reference is not the sum of its terms".into());
     }
+    let bits = |k: Kernels| [k.dot(a, b), k.l2_sq(a, b), k.norm_sq(a)].map(f32::to_bits);
     for k in levels() {
+        if bits(k) != bits(Kernels::detect()) {
+            return Err(format!("{k:?} n={n}: other bits than the best level"));
+        }
         near("dot", k.level(), n, k.dot(a, b), naive_dot, terms)?;
         near("l2_sq", k.level(), n, k.l2_sq(a, b), naive_l2, naive_l2)?;
         near(
@@ -154,6 +158,24 @@ fn free_functions_use_the_best_level() {
         Level::Avx2
     };
     assert!(Kernels::at(foreign).is_none());
+}
+
+/// The worst case of the stated error: every lane holds a large value, and each later term is just
+/// below half a unit in its last place, so all of them are lost.
+#[test]
+fn relative_error_holds_where_every_rounding_goes_one_way() {
+    for n in [64, 65, 128, 1000, 1024, 1025, 4096, 10_240, 65_536] {
+        for small in [-11, -12, -13, -14].map(|e| 2f32.powi(e)) {
+            for lanes in [1, 4, 16, 32, 64, 128, 1024] {
+                for other in [small, small * small] {
+                    let fill = |x: f32| (0..n).map(move |i| if i % 1024 < lanes { 1.0 } else { x });
+                    let (a, b): (Vec<f32>, Vec<f32>) =
+                        (fill(small).collect(), fill(other).collect());
+                    float_kernels(&a, &b).unwrap();
+                }
+            }
+        }
+    }
 }
 
 /// A sum past f32 is infinite or NaN at every level and correct in `wide`.

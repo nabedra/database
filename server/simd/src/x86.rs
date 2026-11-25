@@ -5,7 +5,7 @@
 
 use std::arch::x86_64::*;
 
-use crate::SLICES;
+use crate::{LANES, SLICES};
 
 pub(crate) mod avx2 {
     use super::*;
@@ -26,8 +26,7 @@ pub(crate) mod avx2 {
 
     #[inline]
     #[target_feature(enable = "avx2,fma")]
-    fn step<const L2: bool>(acc: __m256, x: &[f32; 8], y: &[f32; 8]) -> __m256 {
-        let (x, y) = (load(x), load(y));
+    fn step<const L2: bool>(acc: __m256, x: __m256, y: __m256) -> __m256 {
         if L2 {
             let d = _mm256_sub_ps(x, y);
             _mm256_fmadd_ps(d, d, acc)
@@ -36,31 +35,45 @@ pub(crate) mod avx2 {
         }
     }
 
+    /// The first 8 values of `p`, zero past its end.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn load_tail(p: &[f32]) -> __m256 {
+        let mut values = [0.0; 8];
+        for (value, &x) in values.iter_mut().zip(p) {
+            *value = x;
+        }
+        load(&values)
+    }
+
+    /// Adds the halves of the vector until one value is left.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) fn add_up(v: __m256) -> f32 {
+        let v = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+        let v = _mm_add_ps(v, _mm_movehl_ps(v, v));
+        _mm_cvtss_f32(_mm_add_ss(v, _mm_movehdup_ps(v)))
+    }
+
     #[target_feature(enable = "avx2,fma")]
     pub(crate) fn sum<const L2: bool>(a: &[f32], b: &[f32]) -> f32 {
-        let ((a8, a1), (b8, b1)) = (a.as_chunks::<8>(), b.as_chunks::<8>());
-        let ((a32, a8), (b32, b8)) = (a8.as_chunks::<4>(), b8.as_chunks::<4>());
-        let mut acc = [_mm256_setzero_ps(); 4];
-        for (x, y) in a32.iter().zip(b32) {
-            for i in 0..4 {
-                acc[i] = step::<L2>(acc[i], &x[i], &y[i]);
+        let ((blocks_a, a), (blocks_b, b)) = (a.as_chunks::<LANES>(), b.as_chunks::<LANES>());
+        let mut acc = [_mm256_setzero_ps(); 8];
+        for (a, b) in blocks_a.iter().zip(blocks_b) {
+            let (a, b) = (a.as_chunks::<8>().0, b.as_chunks::<8>().0);
+            for i in 0..8 {
+                acc[i] = step::<L2>(acc[i], load(&a[i]), load(&b[i]));
             }
         }
-        for (x, y) in a8.iter().zip(b8) {
-            acc[0] = step::<L2>(acc[0], x, y);
+        for (acc, (a, b)) in acc.iter_mut().zip(a.chunks(8).zip(b.chunks(8))) {
+            *acc = step::<L2>(*acc, load_tail(a), load_tail(b));
         }
-        let acc = _mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3]));
-        let acc = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps::<1>(acc));
-        let acc = _mm_add_ps(acc, _mm_movehl_ps(acc, acc));
-        let mut sum = _mm_cvtss_f32(_mm_add_ss(acc, _mm_movehdup_ps(acc)));
-        for (&x, &y) in a1.iter().zip(b1) {
-            sum = if L2 {
-                (x - y).mul_add(x - y, sum)
-            } else {
-                x.mul_add(y, sum)
-            };
+        for half in [4, 2, 1] {
+            for i in 0..half {
+                acc[i] = _mm256_add_ps(acc[i], acc[half + i]);
+            }
         }
-        sum
+        add_up(acc[0])
     }
 
     /// Set bits per byte.
@@ -202,22 +215,21 @@ pub(crate) mod avx512 {
 
     #[target_feature(enable = "avx512f")]
     pub(crate) fn sum<const L2: bool>(a: &[f32], b: &[f32]) -> f32 {
-        let ((a16, a1), (b16, b1)) = (a.as_chunks::<16>(), b.as_chunks::<16>());
-        let ((a64, a16), (b64, b16)) = (a16.as_chunks::<4>(), b16.as_chunks::<4>());
+        let ((blocks_a, a), (blocks_b, b)) = (a.as_chunks::<LANES>(), b.as_chunks::<LANES>());
         let mut acc = [_mm512_setzero_ps(); 4];
-        for (x, y) in a64.iter().zip(b64) {
+        for (a, b) in blocks_a.iter().zip(blocks_b) {
+            let (a, b) = (a.as_chunks::<16>().0, b.as_chunks::<16>().0);
             for i in 0..4 {
-                acc[i] = step::<L2>(acc[i], load(&x[i]), load(&y[i]));
+                acc[i] = step::<L2>(acc[i], load(&a[i]), load(&b[i]));
             }
         }
-        for (x, y) in a16.iter().zip(b16) {
-            acc[0] = step::<L2>(acc[0], load(x), load(y));
+        for (acc, (a, b)) in acc.iter_mut().zip(a.chunks(16).zip(b.chunks(16))) {
+            *acc = step::<L2>(*acc, load_tail(a), load_tail(b));
         }
-        if !a1.is_empty() {
-            acc[1] = step::<L2>(acc[1], load_tail(a1), load_tail(b1));
-        }
-        let (low, high) = (_mm512_add_ps(acc[0], acc[1]), _mm512_add_ps(acc[2], acc[3]));
-        _mm512_reduce_add_ps(_mm512_add_ps(low, high))
+        let (even, odd) = (_mm512_add_ps(acc[0], acc[2]), _mm512_add_ps(acc[1], acc[3]));
+        let v = _mm512_add_ps(even, odd);
+        let high = _mm256_castpd_ps(_mm512_extractf64x4_pd::<1>(_mm512_castps_pd(v)));
+        super::avx2::add_up(_mm256_add_ps(_mm512_castps512_ps256(v), high))
     }
 
     #[target_feature(enable = "avx512f,avx512vpopcntdq")]

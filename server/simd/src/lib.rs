@@ -4,13 +4,16 @@
 //! seen to have it, so every kernel is a safe call. [`Kernels::detect`] picks the best level;
 //! [`Kernels::at`] forces one, for tests and measurements.
 //!
-//! Accuracy of the f32 kernels, for finite inputs of `n` values: against the f64 sums in [`wide`],
-//! [`Kernels::dot`] is off by at most `(n / 16 + 32) * 2^-24 * sum|a_i * b_i| + n * 2^-149`, and
-//! [`Kernels::l2_sq`] and [`Kernels::norm_sq`] likewise against their own terms, which are all
-//! positive. That holds while the sum of the terms' magnitudes is below f32::MAX / 2. Past it a
-//! result may be infinite or NaN, but it is never a finite number where the true one does not fit
-//! f32: use [`wide`] then. The integer kernels and [`Kernels::hadamard`] return the same bits at
-//! every level.
+//! **Determinism.** Every kernel returns the same bits at every level. The float kernels define
+//! their rounding: blocks of [`BLOCK`] values, in [`LANES`] lanes of fused multiply-adds, halves of
+//! the lanes added until one is left, blocks added in f64 and rounded once. NaNs may differ in
+//! their payload.
+//!
+//! **Accuracy.** For finite inputs of `n` values, [`Kernels::dot`] is off from the true sum by at
+//! most `relative_error(n) * sum|a_i * b_i| + n * 2^-149`, and [`Kernels::l2_sq`] and
+//! [`Kernels::norm_sq`] likewise against their own terms, which are all positive. That holds while
+//! the sum of the terms' magnitudes is below f32::MAX / 2. Past it a result may be infinite or NaN,
+//! but it is never a finite number where the true one does not fit f32: use [`wide`] then.
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 use std::sync::OnceLock;
@@ -38,6 +41,21 @@ pub mod wide {
     pub fn norm_sq(a: &[f32]) -> f64 {
         crate::scalar::dot(a, a)
     }
+}
+
+/// Lanes of the float kernels.
+pub const LANES: usize = 64;
+/// Values that the float kernels add in f32. More only add up in f64, so the error stops growing.
+pub const BLOCK: usize = 1024;
+
+/// The relative error of a float kernel on `n` values, on every level (see the crate documentation).
+///
+/// With `u = 2^-24`, a term is rounded by at most `ceil(n / LANES)` multiply-adds in its lane, 6
+/// additions of lanes, two roundings of a difference that is squared and the last conversion from
+/// f64. One more `u` covers the second-order terms and the f64 additions.
+pub const fn relative_error(n: usize) -> f64 {
+    let block = if n < BLOCK { n } else { BLOCK };
+    (block.div_ceil(LANES) + 10) as f64 / (1u64 << 24) as f64
 }
 
 /// Bit slices of a query in [`Kernels::bit_distances`].
@@ -87,7 +105,7 @@ pub struct Kernels(Level);
 
 /// Calls a kernel at the level of `$k`, or runs `$scalar`.
 macro_rules! dispatch {
-    ($k:expr, $name:ident $(::<$c:tt>)? ($($arg:expr),*), $scalar:expr) => {
+    ($k:expr, $name:ident $(::<$c:ident>)? ($($arg:expr),*), $scalar:expr) => {
         match $k.0 {
             #[cfg(target_arch = "x86_64")]
             // SAFETY: `Kernels` holds `Avx2` only after `detected` saw AVX2 and FMA.
@@ -127,21 +145,27 @@ impl Kernels {
     /// `sum a_i * b_i`. Panics when the lengths differ.
     #[inline]
     pub fn dot(self, a: &[f32], b: &[f32]) -> f32 {
-        same_len(a, b);
-        dispatch!(self, sum::<false>(a, b), scalar::dot(a, b) as f32)
+        self.sum::<false>(a, b)
     }
 
     /// `sum (a_i - b_i)^2`. Panics when the lengths differ.
     #[inline]
     pub fn l2_sq(self, a: &[f32], b: &[f32]) -> f32 {
-        same_len(a, b);
-        dispatch!(self, sum::<true>(a, b), scalar::l2_sq(a, b) as f32)
+        self.sum::<true>(a, b)
     }
 
     /// `sum a_i^2`.
     #[inline]
     pub fn norm_sq(self, a: &[f32]) -> f32 {
         self.dot(a, a)
+    }
+
+    #[inline]
+    fn sum<const L2: bool>(self, a: &[f32], b: &[f32]) -> f32 {
+        same_len(a, b);
+        let blocks = a.chunks(BLOCK).zip(b.chunks(BLOCK));
+        let sums = blocks.map(|(a, b)| dispatch!(self, sum::<L2>(a, b), scalar::sum::<L2>(a, b)));
+        sums.map(f64::from).sum::<f64>() as f32
     }
 
     /// Weighted Hamming distance of each 1-bit code to a bit-sliced 4-bit query:
