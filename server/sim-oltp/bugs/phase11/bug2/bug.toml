@@ -8,7 +8,7 @@ class = "stale-route-topology-schema"
 guarantees = ["OLTP-G06", "OLTP-G07"]
 scenarios = ["O16"]
 fix_commits = ["fd5aa4a3cef443fc1635ff5667e232b071b6c007"]
-reverts = "fd5aa4a3cef443fc1635ff5667e232b071b6c007"
+reverts = ["fd5aa4a3cef443fc1635ff5667e232b071b6c007"]
 port = "hand"
 port_notes = """
 The fix's two hunks reversed in server/oltp-types/src/queue.rs, where RecordHeader::preflight moved from
@@ -19,13 +19,10 @@ O16 (direct_oltp off) passed once with the patch, so it is not a steady regressi
 # not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "queued"
 profile = ["view-change", "delay-install", "owner-kill"]
-# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
-#   `QueueCopyStaleNotInvalid`, designs/phase-10-11-oltp-sim.md, 3.7: "a well-formed copy from a newer authority is
-#     refused as `Stale`"
-#   `QueueRetention`, designs/phase-10-11-oltp-sim.md, 3.7: "an accepted request keeps a complete copy while any holder
-#     lives, and the new run is empty after a full stop"
-#   `QueueRetention`, docs/testing/guarantees/oltp.md, OLTP-G07: "Accepted queued work stays recoverable while a
-#     complete copy survives. A full worker stop abandons outstanding work."
+# expect is the plan. The text an expected kind enforces is in [[rules]] at the end. A kind without text there detects
+# nothing.
+# No [[rules]] for QueueCopyStaleNotInvalid: its only text is design 3.7, and lead decision 13.1 lists design rules for
+# rows 6, 9, 20 and the Liveness rows (read as 10, 11, 13 and 16), not for row 5.
 expect = ["QueueCopyStaleNotInvalid", "QueueRetention"]
 seeds = [1, 10000]
 
@@ -34,6 +31,7 @@ seeds = [1, 10000]
 kind = "lib-test"
 test = "oltp_runtime::replica::tests::probe_bug2_a_copy_under_a_newer_authority_is_stale_not_invalid"
 mode = "on"
+assertion = "state"
 probe = true
 failure_contains = ["a copy under a newer ready view", "left: Some(Invalid)"]
 
@@ -52,3 +50,24 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out
 # Patch read: exact inverse of fd5aa4a3. Kept apart from the author's evidence above. These are workflow `tests`,
 # `scenarios` or growth runs in mode on, not attested checks, and not a detection.
 # - oltp_runtime::worker_endpoint::tests::r121_bug2_copy_in_flight_across_a_view_change_is_retryable: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456395743 (0c8dc60c) 3 of 3 failed: `left: (400, ValidationError, NotApplied)`, `right: (503, StorageUnavailable, Unknown)`.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports. The digest covers revert.patch and probe.patch. The review's patched runs applied
+# revert.patch alone.
+[review]
+digest = "a97e3a75943de7c1f0f252af29917d430288ba456b285b2f6f32effe09c6430d"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Patch read: exact inverse of fd5aa4a3. The verdict rests on the review's own test: `left: (400, ValidationError, \
+NotApplied)`, `right: (503, StorageUnavailable, Unknown)`. Not on the probe.\
+"""
+
+[[rules]]  # OLTP-G07
+kind = "QueueRetention"
+source = "docs/testing/guarantees/oltp.md"
+text = """\
+Accepted queued work stays recoverable while a complete copy survives. A full worker stop abandons outstanding \
+work.\
+"""

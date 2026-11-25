@@ -8,7 +8,7 @@ class = "uncertain-outcome"
 guarantees = ["OLTP-G03", "OLTP-G07"]
 scenarios = ["O13", "O14"]
 fix_commits = ["d6eb811a9846485713937fb9bedff51f22b2bce1"]
-reverts = "d6eb811a9846485713937fb9bedff51f22b2bce1"
+reverts = ["d6eb811a9846485713937fb9bedff51f22b2bce1"]
 port = "hand"
 port_notes = """
 `git diff d6eb811a d6eb811a^` on server/src/oltp_runtime/remote_api.rs, with the same lines on
@@ -19,16 +19,19 @@ observation error again; `observation_deadline` is gone.
 # not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "queued"
 profile = ["receipt-fault", "session-drop", "api-restart"]
-# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
-#   Empty. Not detectable yet: no plan, contract or register text is quoted for a rule that can fire (lead decision 9
-#     and its amendment after review-121). ReceiptObservationPatience is dropped.
+# Lead decisions are in designs/lead-decisions.md, outside this repository.
 expect = []
+expect_reason = """\
+Lead decision 9, amendment after review-121: "Rows 1, 7, 8 and 22 have no quoted text and stay out of `expect` \
+until one exists." ReceiptObservationPatience is dropped.\
+"""
 seeds = [1, 10000]
 
 [regression]
 kind = "acceptance"
 scenario = "O13"
 mode = "on"
+assertion = "state"
 timeout_s = 3600
 failure_contains = ["in transient_receipt_observation", "original accepted request requires reconciliation"]
 
@@ -46,3 +49,15 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out
 # Patch read: exact inverse of d6eb811a. Kept apart from the author's evidence above. These are workflow `tests`,
 # `scenarios` or growth runs in mode on, not attested checks, and not a detection.
 # - acceptance O13: clean https://github.com/zPy52/nabedra-database/actions/runs/45463637377 (01c4af20) 1 of 1 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45463650016 (995fb417) 1 of 1 failed: 503 outcome_unknown, `original accepted request requires reconciliation`.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports.
+[review]
+digest = "a55e37c9eec537d040702fbb9fcca71547a6d2dcc7777ad6e80ccec2b63a92c0"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Patch read: exact inverse of d6eb811a. Patched O13 ends 503 outcome_unknown, `original accepted request requires \
+reconciliation`.\
+"""

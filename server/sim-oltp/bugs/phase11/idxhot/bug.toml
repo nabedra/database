@@ -8,7 +8,7 @@ class = "stale-route-topology-schema"
 guarantees = ["OLTP-G06"]
 scenarios = ["O12", "D11"]
 fix_commits = ["4fda542014c4d3aa129124503122b75c405a6084"]
-reverts = "4fda542014c4d3aa129124503122b75c405a6084"
+reverts = ["4fda542014c4d3aa129124503122b75c405a6084"]
 port = "hand"
 port_notes = """
 The fix's hunks reversed in nabedra-oltp-storage mvcc/index/build.rs (imports changed around them): a
@@ -18,17 +18,25 @@ conflicted backfill refresh ends the build, and row_written_since_source with it
 # not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "topology"
 profile = ["index-publish", "hot-key-writers"]
-# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
-#   Empty. Not detectable yet: no plan, contract or register text is quoted for a rule that can fire (lead decision 9
-#     and its amendment after review-121). Design 4.2 names Liveness (index build), but decision 9 asks row 7 for its
-#     own text.
+# Lead decisions are in designs/lead-decisions.md, outside this repository.
 expect = []
+expect_reason = """\
+Lead decision 9, amendment after review-121: "Rows 1, 7, 8 and 22 have no quoted text and stay out of `expect` \
+until one exists." Decision 13.1: "Decision 9 counts design rules only for the rows it names (6, 9, 20 and the \
+Liveness rows listed there), not for 7 or 14."\
+"""
+hold = """\
+Row 7. Lead decision 13.1: "Decision 9 counts design rules only for the rows it names (6, 9, 20 and the Liveness \
+rows listed there), not for 7 or 14." The tool knows no row and would take design 4.2's Liveness from \
+plans/testing/phase-10-11-oltp-sim.md.\
+"""
 seeds = [1, 10000]
 
 [regression]
 kind = "lib-test"
 test = "oltp_runtime::worker_runtime::index_backend::acceptance_tests::o12_hot_key_cannot_starve_backfill"
 mode = "on"
+assertion = "state"
 failure_contains = ["backfill must finish while every refresh attempt races a committed write"]
 
 # The patch author's own runs.
@@ -44,3 +52,12 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out
 # Patch read: exact. Kept apart from the author's evidence above. These are workflow `tests`, `scenarios` or growth runs
 # in mode on, not attested checks, and not a detection.
 # - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456558794 (c10f5d32) 3 of 3 failed: the backfill ended with `Conflict`.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports.
+[review]
+digest = "21268acbb45238734b01e8b714537eb2d9b23733555272e68d75812f3eec0428"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = "Patch read: exact. Patched: the backfill ended with `Conflict`."

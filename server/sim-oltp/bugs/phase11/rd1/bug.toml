@@ -8,7 +8,7 @@ class = "stale-route-topology-schema"
 guarantees = ["OLTP-G06"]
 scenarios = ["O12", "D11"]
 fix_commits = ["f2e21999dfb5801dcaee413b4c4c524254fa4511"]
-reverts = "f2e21999dfb5801dcaee413b4c4c524254fa4511"
+reverts = ["f2e21999dfb5801dcaee413b4c4c524254fa4511"]
 port = "hand"
 port_notes = """
 f2e21999 conflicts with later executor changes. The port removes its two decision points and leaves the
@@ -22,9 +22,8 @@ probe fences between lookup and snapshot and shows the old descriptor committing
 # not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "topology"
 profile = ["index-publish", "same-range-writers"]
-# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
-#   `CoveringIndexComplete`, designs/phase-10-11-oltp-sim.md, 3.7: "an acknowledged insert appears in every covering
-#     index scan at a later snapshot"
+# expect is the plan. The text an expected kind enforces is in [[rules]] at the end. A kind without text there detects
+# nothing.
 expect = ["CoveringIndexComplete"]
 seeds = [1, 10000]
 
@@ -33,6 +32,7 @@ seeds = [1, 10000]
 kind = "lib-test"
 test = "oltp_runtime::direct::tests::probe_rd1_a_fence_during_the_latch_wait_is_not_bypassed"
 mode = "on"
+assertion = "state"
 probe = true
 failure_contains = ["the old descriptor must not commit under the new epoch"]
 
@@ -52,3 +52,21 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out
 # from the author's evidence above. These are workflow `tests`, `scenarios` or growth runs in mode on, not attested
 # checks, and not a detection.
 # - oltp_runtime::direct::tests::review121::r121_rd1_published_index_has_every_acknowledged_update and r121_rd1_no_write_between_fence_and_publication: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 each passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456409559 (4db94d3d) 3 of 3 each failed: the update was acknowledged `Done(true)` and the published index has no entry for it.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports. The digest covers revert.patch and probe.patch. The review's patched runs applied
+# revert.patch alone.
+[review]
+digest = "d5464ab6d50a55d21804a52b9952e2b75d466c759872efd3bfb82be31b673341"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Patch read: the lookup is fixed for all attempts again, not wider than the original. The verdict rests on the \
+review's own tests: an acknowledged update has no entry in the published index. Not on the probe.\
+"""
+
+[[rules]]  # 3.7
+kind = "CoveringIndexComplete"
+source = "plans/testing/phase-10-11-oltp-sim.md"
+text = "an acknowledged insert appears in every covering index scan at a later snapshot"

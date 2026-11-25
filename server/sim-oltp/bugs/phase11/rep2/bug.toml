@@ -8,7 +8,7 @@ class = "membership-replacement-trust"
 guarantees = ["OLTP-G08"]
 scenarios = ["O17", "NS14"]
 fix_commits = ["116fb51dd377611f0a53642fe68e1bb4f742da7d"]
-reverts = "116fb51dd377611f0a53642fe68e1bb4f742da7d"
+reverts = ["116fb51dd377611f0a53642fe68e1bb4f742da7d"]
 port = "hand"
 port_notes = """
 116fb51d reversed in manager/lifecycle.rs with its later signatures: reconcile_voter_replacement accepts any
@@ -20,17 +20,26 @@ retain_removed (REP5, REP6) keeps its values.
 # not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "membership"
 profile = ["replacement", "leader-crash", "lost-reply"]
-# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
-#   Empty. Not detectable yet: design 3.7 lists RetryCertifiesNamedRemoval by name only, so there is no rule text to
-#     quote, and it looks unreachable through the API (author and reviewer read the code, neither ran it). Design 4.2
-#     and decision 9 give row 14 no Liveness rule.
+# Lead decisions are in designs/lead-decisions.md, outside this repository.
 expect = []
+expect_reason = """\
+Lead decision 9, count after review-121: "Rows 1, 7, 8, 14, 22 have no rule". Decision 13.1: "Decision 9 counts \
+design rules only for the rows it names (6, 9, 20 and the Liveness rows listed there), not for 7 or 14." Design \
+3.7 lists RetryCertifiesNamedRemoval by name only.\
+"""
+hold = """\
+Row 14. Lead decision 13.1: "Decision 9 counts design rules only for the rows it names (6, 9, 20 and the \
+Liveness rows listed there), not for 7 or 14." The tool knows no row and would take a design rule from \
+plans/testing/phase-10-11-oltp-sim.md. RetryCertifiesNamedRemoval also looks unreachable through the API (read \
+by author and reviewer, not run).\
+"""
 seeds = [1, 10000]
 
 [regression]
 kind = "lib-test"
 test = "oltp_replication::typed_network::tests::o06_o16_o17_rf3_lost_timestamp_voter_replacement"
 mode = "on"
+assertion = "state"
 failure_contains = ["stable membership must not certify a different removal"]
 
 # The patch author's own runs.
@@ -46,3 +55,12 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out
 # Patch read: exact in substance. Kept apart from the author's evidence above. These are workflow `tests`, `scenarios`
 # or growth runs in mode on, not attested checks, and not a detection.
 # - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456630499 (2ef7a82c) 3 of 3 failed: `stable membership must not certify a different removal`.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports.
+[review]
+digest = "01f3ea413333781ce758223b2311d6eb56e97ba41f148f579af8a655b9c7c044"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = "Patch read: exact in substance. Patched: `stable membership must not certify a different removal`."

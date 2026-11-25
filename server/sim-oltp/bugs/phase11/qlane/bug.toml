@@ -8,7 +8,7 @@ class = "resource-release-order"
 guarantees = ["OLTP-G05", "OLTP-G07", "OLTP-G09"]
 scenarios = ["O07", "O08"]
 fix_commits = ["b179b5840b06d2ec7bf0bf001325101b06629dad", "7ddad3bbf4c3871c2db88a579312e81dc33fbd2a"]
-reverts = "7ddad3bbf4c3871c2db88a579312e81dc33fbd2a"
+reverts = ["7ddad3bbf4c3871c2db88a579312e81dc33fbd2a"]
 port = "hand"
 port_notes = """
 7ddad3bb reversed at its decision in service_rpc/participant_full.rs: PreparePage, Seal and Resolve use
@@ -19,20 +19,23 @@ client.call again, so a full outgoing Storage lane refuses an accepted batch. Th
 # not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "queued"
 profile = ["lane-exhaust", "cross-range-batches"]
-# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
-#   Empty. Not detectable yet, and does not count (lead, 2026-11-24). Decision 9 names only this text for
-#     AcceptedSettlesInRun: docs/testing/scheduler-contract.md, "Retain accepted work through individual failures while
-#     a request copy survives.", and docs/testing/guarantees/oltp.md, OLTP-G07, "Accepted queued work stays recoverable
-#     while a complete copy survives. A full worker stop abandons outstanding work." Neither sentence says accepted work
-#     cannot end in a definite refusal, which is what the patched build gives: 429 `worker outgoing lane full
-#     (Storage)`, not_applied.
+# Lead decisions are in designs/lead-decisions.md, outside this repository.
 expect = []
+expect_reason = """\
+Lead decision 9, count after review-121: "Rows 12 and 21: the quoted text ("Retain accepted work through \
+individual failures while a request copy survives", OLTP-G07) doesn't forbid a definite refusal after \
+acceptance, so they don't count." The texts are docs/testing/scheduler-contract.md, "Retain accepted work \
+through individual failures while a request copy survives.", and docs/testing/guarantees/oltp.md, OLTP-G07, \
+"Accepted queued work stays recoverable while a complete copy survives. A full worker stop abandons outstanding \
+work." The patched build gives such a refusal: 429 `worker outgoing lane full (Storage)`, not_applied.\
+"""
 seeds = [1, 10000]
 
 [regression]
 kind = "lib-test"
 test = "oltp_runtime::worker_runtime::direct_gateway::tests::o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane"
 mode = "on"
+assertion = "state"
 failure_contains = ["worker outgoing lane full (Storage)"]
 
 # The patch author's own runs.
@@ -51,3 +54,15 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out
 # Patch read: exact inverse of 7ddad3bb, including the error mapping. Kept apart from the author's evidence above. These
 # are workflow `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a detection.
 # - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456693715 (17c0a6ee) 3 of 3 failed: the accepted batch ended 429 `worker outgoing lane full (Storage)`.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports.
+[review]
+digest = "828c1e0bb85dff2c8e64b6fff9d6d3ea4128fa87d9ba128df033b3f935cd0dd1"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Patch read: exact inverse of 7ddad3bb, including the error mapping. Patched: the accepted batch ended 429 \
+`worker outgoing lane full (Storage)`.\
+"""

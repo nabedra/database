@@ -8,7 +8,7 @@ class = "stale-route-topology-schema"
 guarantees = ["OLTP-G06", "OLTP-G07"]
 scenarios = ["O21"]
 fix_commits = ["c4fad97e65892eddf3f96cfe26287a8b04175300", "c7761409efaad8613c3fa0991730a14862d46879"]
-reverts = "c4fad97e65892eddf3f96cfe26287a8b04175300"
+reverts = ["c4fad97e65892eddf3f96cfe26287a8b04175300", "c7761409efaad8613c3fa0991730a14862d46879"]
 port = "hand"
 port_notes = """
 c4fad97e and c7761409 reversed at their two wait points: QueueCoordinator::stage and the Install branch of
@@ -20,17 +20,20 @@ endpoint hunk reversed it fails too, at the follower (run 45442322524).
 # not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "queued"
 profile = ["worker-join", "view-install-delay", "table-create"]
-# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
-#   Empty. Not detectable yet: no plan, contract or register text is quoted for a rule that can fire (lead decision 9
-#     and its amendment after review-121). SubmitDuringViewInstall is dropped; design 4.2's Liveness and receipt check
-#     cannot see the patched answer.
+# Lead decisions are in designs/lead-decisions.md, outside this repository.
 expect = []
+expect_reason = """\
+Lead decision 9, amendment after review-121: "Rows 1, 7, 8 and 22 have no quoted text and stay out of `expect` \
+until one exists." SubmitDuringViewInstall is dropped, and design 4.2's Liveness and receipt check cannot see \
+the patched answer.\
+"""
 seeds = [1, 10000]
 
 [regression]
 kind = "lib-test"
 test = "oltp_growth_acceptance::o21_capacity_deficit"
 mode = "on"
+assertion = "state"
 needs_server = true
 timeout_s = 3600
 failure_contains = ["in create_with_lagging_queue_replicas", "request replication or scheduler authority unavailable"]
@@ -49,3 +52,15 @@ AssertionError: (503, {'request_id': '2fb57147-2dce-4301-915e-1800886603df', 'er
 # Patch read: both waits removed, the helper kept. Kept apart from the author's evidence above. These are workflow
 # `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a detection.
 # - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45463637377 (01c4af20) 2 of 2 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45463667320 (a5ca3c89) 2 of 2 failed: 503, `request replication or scheduler authority unavailable`.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports.
+[review]
+digest = "744a42f995082798fc1a20f2eb86b038282098f5e6172d78958d36f7020f4e42"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Patch read: both waits removed, the helper kept. Patched: 503, `request replication or scheduler authority \
+unavailable`.\
+"""

@@ -8,7 +8,7 @@ class = "resource-release-order"
 guarantees = ["OLTP-G07", "OLTP-G09"]
 scenarios = ["C07", "O15"]
 fix_commits = ["116f03f811997edbff331d619f9baee328856948"]
-reverts = "116f03f811997edbff331d619f9baee328856948"
+reverts = ["116f03f811997edbff331d619f9baee328856948"]
 port = "hand"
 port_notes = """
 116f03f8 reversed in service_rpc/grant_cache.rs, where #68 added a sim-only ordered map around it: warm
@@ -18,14 +18,15 @@ refreshes run together with join_all under GRANT_TTL again, without backoff.
 # not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "cold"
 profile = ["staggered-reopen", "control-delay"]
-# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
-#   `WarmReadsSerial`, designs/phase-10-11-oltp-sim.md, 4.2, row 20: "a probe rule allows at most one background Control
-#     lane slot"
-#   `Liveness`, designs/phase-10-11-oltp-sim.md, 3.7: "convergence within 30 s of the heal; the cold start, move or
-#     index build finishes within its bound"
-#   `Liveness`, designs/phase-10-11-oltp-sim.md, 4.2, row 20: "`Liveness`; a probe rule allows at most one background
-#     Control lane slot"
+# expect is the plan. The text an expected kind enforces is in [[rules]] at the end. A kind without text there detects
+# nothing.
 expect = ["WarmReadsSerial", "Liveness"]
+hold = """\
+Row 20. The in-tree assertion is a counter (how many stubbed reads are in flight). Missing: (1) a state check in \
+the tree, such as the review's r121_rd2_hung_background_reads_leave_the_foreground_a_lane_slot, which is on \
+scratch/review-121-clean2 only and models the Control lane; (2) [regression] naming it, with clean and patched \
+runs of it; (3) a [review] of that test with assertion state.\
+"""
 seeds = [1, 10000]
 
 # The assertion below is a counter (how many stubbed reads are in flight), not a state check.
@@ -33,6 +34,7 @@ seeds = [1, 10000]
 kind = "lib-test"
 test = "oltp_replication::service_rpc::grant_cache::tests::c07_rd2_warm_refreshes_hold_at_most_one_read_while_control_hangs"
 mode = "on"
+assertion = "counter"
 failure_contains = ["in_flight.load(Ordering::Relaxed) <= 1"]
 
 # The patch author's own runs.
@@ -50,3 +52,16 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out
 # - sensitive by the review's own test: the in-tree assertion is a counter (see [regression]). The lane in the review's test is a model.
 # - oltp_replication::service_rpc::grant_cache::tests::r121_rd2_hung_background_reads_leave_the_foreground_a_lane_slot: clean https://github.com/zPy52/nabedra-database/actions/runs/45461651504 (01c4af20) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45461681739 (600bbac1) 3 of 3 failed: `the foreground found the Control lane full 140 times of 200`, with a modelled four-slot lane.
 # - the [regression] test, the counter: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456677709 (79f07747) 3 of 3 failed: `in_flight.load(Ordering::Relaxed) <= 1`, a count of stubbed reads.
+# No [review] table. The review calls the patch sensitive by its own state test only, which is not in the tree. The tool
+# ties [review] to [regression], whose assertion is a counter, and refuses `sensitive` with it. Any other verdict would
+# not be the review's. See hold.
+
+[[rules]]  # 4.2, row 20
+kind = "WarmReadsSerial"
+source = "plans/testing/phase-10-11-oltp-sim.md"
+text = "a probe rule allows at most one background Control lane slot"
+
+[[rules]]  # 3.7
+kind = "Liveness"
+source = "plans/testing/phase-10-11-oltp-sim.md"
+text = "convergence within 30 s of the heal; the cold start, move or index build finishes within its bound"

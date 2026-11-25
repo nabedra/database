@@ -8,7 +8,7 @@ class = "fence-lifecycle-order"
 guarantees = ["OLTP-G07", "OLTP-G08"]
 scenarios = ["O14", "R03"]
 fix_commits = ["6ad8a99c2561ba48c0bcb4a2b8252d9c1e2ad30b"]
-reverts = "6ad8a99c2561ba48c0bcb4a2b8252d9c1e2ad30b"
+reverts = ["6ad8a99c2561ba48c0bcb4a2b8252d9c1e2ad30b"]
 port = "clean"
 port_notes = """
 `git diff 6ad8a99c 6ad8a99c^` on authority/control/forwarding.rs (moved to nabedra-oltp-replication): a
@@ -19,10 +19,8 @@ was found, passed once with the patch.
 # not a detection. ../simulator.toml says which faults and trigger, and what is missing.
 workload = "membership"
 profile = ["rolling-restart", "leader-move"]
-# expect: only rules lead decision 9 allows, with their source text (designs/ is outside this repository).
-#   `Liveness`, designs/phase-10-11-oltp-sim.md, 3.7: "convergence within 30 s of the heal; the cold start, move or
-#     index build finishes within its bound"
-#   `Liveness`, designs/phase-10-11-oltp-sim.md, 4.2, row 11: "`Liveness`, `outcome::check`"
+# expect is the plan. The text an expected kind enforces is in [[rules]] at the end. A kind without text there detects
+# nothing.
 expect = ["Liveness"]
 seeds = [1, 10000]
 
@@ -31,6 +29,7 @@ seeds = [1, 10000]
 kind = "lib-test"
 test = "oltp_replication::manager::damage_scheduler_tests::probe_acc3_delegation_waits_for_the_applied_promotion"
 mode = "on"
+assertion = "state"
 probe = true
 failure_contains = ["from a worker whose promotion is not applied here"]
 
@@ -49,3 +48,21 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 194 filtered out
 # Patch read: exact inverse of 6ad8a99c. Kept apart from the author's evidence above. These are workflow `tests`,
 # `scenarios` or growth runs in mode on, not attested checks, and not a detection.
 # - oltp_replication::manager::damage_scheduler_tests::review121::r121_acc3_delegation_heals_when_the_promotion_applies: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456424289 (799d9682) 3 of 3 failed: `Unauthorized` after about 0.5 ms, never retried.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports. The digest covers revert.patch and probe.patch. The review's patched runs applied
+# revert.patch alone.
+[review]
+digest = "ff6fb5156ee8be86ee62af0987ac769c29ab2c9a4b49b24d1991e00987d8ec6d"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Patch read: exact inverse of 6ad8a99c. The verdict rests on the review's own test: `Unauthorized` after 0.5 ms, \
+never retried. Not on the probe.\
+"""
+
+[[rules]]  # 3.7
+kind = "Liveness"
+source = "plans/testing/phase-10-11-oltp-sim.md"
+text = "convergence within 30 s of the heal; the cold start, move or index build finishes within its bound"
