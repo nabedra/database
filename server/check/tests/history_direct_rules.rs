@@ -815,6 +815,15 @@ fn replays_of_the_first_result_are_accepted() {
          0> get k null r
          0< ok 1",
     );
+    // Nor does an unknown read hold one.
+    by_default(
+        "a read explains no refusal of reuse",
+        "0> get k null r
+         0< info
+         2> upsert k 9 r
+         2< reused",
+        &["non-linearizable", "request-id-reuse-misdetected"],
+    );
     legal(
         "requests without an ID",
         "0> delete k
