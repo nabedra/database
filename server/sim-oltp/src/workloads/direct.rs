@@ -177,6 +177,19 @@ pub(crate) async fn run(
         let _ = task.await;
     }
     cluster.checks.recovered(&cluster.world, "convergence");
+    // The final operations may wait for a running move, within the move's own bound (lead
+    // decision 12.3). A move that does not finish is reported by its own rule, below.
+    let mut moved = None;
+    let mut move_wait_ms = 0;
+    if let Some(moving) = moving.as_mut().filter(|moving| moving.running()) {
+        let from = elapsed_ms(&cluster.world);
+        let finished = moving.finish(cluster, &ctx, healed).await;
+        move_wait_ms = elapsed_ms(&cluster.world) - from;
+        cluster.record(format!(
+            "final operations waited {move_wait_ms}ms for the replica move: {finished:?}"
+        ));
+        moved = Some(finished);
+    }
     let final_checks = clients::final_checks(&ctx).await;
     report.assertions.push((
         "final writes and reads through both gateways",
@@ -196,7 +209,10 @@ pub(crate) async fn run(
         chaos.check_abandoned(cluster, &ctx).await;
     }
     if let Some(moving) = moving.as_mut() {
-        let moved = moving.finish(cluster, &ctx, healed).await;
+        let moved = match moved.take() {
+            Some(moved) => moved,
+            None => moving.finish(cluster, &ctx, healed).await,
+        };
         report
             .assertions
             .push(("replica move retired", moved.is_ok()));
@@ -369,6 +385,7 @@ pub(crate) async fn run(
         "not_applied_checks": observed.not_applied_checks,
         "unresolved": observed.unresolved.len(),
         "one_paused_late": outcome.one_paused_late,
+        "move_wait_ms": move_wait_ms,
         "heal_cold_start": chaos.as_ref().is_some_and(|chaos| chaos.heal_cold),
     });
     cluster.record(format!("workload summary {}", report.summary));

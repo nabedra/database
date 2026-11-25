@@ -642,8 +642,9 @@ mod tests {
 
     use nabedra_sim::sweep::{SweepConfig, sweep};
 
-    /// Seed 66: with fewer session slots than peers the second gateway never activated the
-    /// direct path, so its retry of a committed insert was answered `outcome_unknown` for ever.
+    /// Seed 66: with fewer session slots than peers the second gateway never activates the
+    /// direct path, and its retry of a committed insert is answered `outcome_unknown` for ever.
+    /// Red and kept (lead decision 12.4).
     #[test]
     fn smoke_seed_66_reaches_the_direct_path_through_both_gateways() {
         let mut config = SweepConfig::new("oltp-sim-smoke-66", 66, 1);

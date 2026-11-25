@@ -120,6 +120,11 @@ impl Move {
         self.moving.map(|(from, to)| (from, to.unwrap_or(u64::MAX)))
     }
 
+    /// The replica move was requested and has not retired.
+    pub(crate) fn running(&self) -> bool {
+        matches!(self.state, State::Moving { .. })
+    }
+
     pub(crate) fn set_faults(&mut self, faults: NetFaults) {
         self.faults = Some(faults);
     }

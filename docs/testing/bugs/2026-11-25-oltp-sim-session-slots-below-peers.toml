@@ -1,0 +1,17 @@
+id = "OLTP-sim-session-slots-below-peers"
+title = "A worker with fewer session slots in a class than peers refuses the last peer for good"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G03"]
+scenarios = ["D10"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/workload.rs workload::tests::smoke_seed_66_reaches_the_direct_path_through_both_gateways"
+seed = 66
+why_not_caught = "Every production transport has 256 slots per class and every test cluster has far fewer peers. The simulation samples the count."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=smoke, seeds 66, 209 and 454 of 1 to 500: a retry of a committed insert returns its result. With 4 slots and 5 peers the last gateway is refused on every poll and never activates the direct path. The slots are a fixed constant and automatic growth accepts up to 4096 workers, so the code does not rule this out in production. No run with 256 slots and more than 256 peers exists."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"
