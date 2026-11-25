@@ -512,6 +512,7 @@ pub(super) fn freeze_source(
     // The coordinator avoids this by taking the direct barrier
     // (`DirectPause`) before it allocates the cut.
     if super::direct::high(tx)?.is_some_and(|high| high > left.read_ts) {
+        nabedra_rt::diag(&format!("FREEZE DirectCommitAboveCut high {:?} cut {:?}", super::direct::high(tx)?, left.read_ts));
         return reject(tx, Fault::DirectCommitAboveCut);
     }
     let mut next = config.clone();

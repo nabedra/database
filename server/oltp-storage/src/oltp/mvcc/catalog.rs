@@ -581,7 +581,9 @@ pub(super) fn primary(a: &Key, b: &Key) -> std::cmp::Ordering {
         _ => std::cmp::Ordering::Greater,
     }
 }
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     failure(
         ErrorCode::ValidationError,
         "invalid pinned catalog or routing lineage",

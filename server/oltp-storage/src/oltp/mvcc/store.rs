@@ -1511,7 +1511,9 @@ fn reject(tx: &mut GroupTransaction<'_>, fault: Fault) -> Result<Transition, Pro
         tx.encode(&ParticipantReply::Rejected(fault))?,
     ))
 }
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     failure(
         ErrorCode::ValidationError,
         "invalid fixed MVCC participant binding",

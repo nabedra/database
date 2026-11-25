@@ -1544,7 +1544,9 @@ fn commit_key(group: uuid::Uuid, txn: TxnId) -> [u8; COMMIT_PREFIX.len() + 40] {
     key[n + 32..].copy_from_slice(&txn.attempt.to_be_bytes());
     key
 }
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "timestamp adapter requires a Timestamps group",

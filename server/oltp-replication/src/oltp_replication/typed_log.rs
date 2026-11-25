@@ -840,6 +840,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
     }
     async fn save_vote(&mut self, vote: &Vote) -> io::Result<()> {
         let vote = *vote;
+        nabedra_rt::diag(&format!("VOTE {:?} {}", self.store.identity().kind, format!("{vote}")));
         // OpenRaft requires vote and log IO in submission order: a newer
         // vote's flush marks every earlier IO flushed, so it waits for the
         // appends still syncing (PERF2d). A queued commit marker lands

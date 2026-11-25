@@ -233,6 +233,7 @@ fn invalid_profile(message: &'static str) -> ProtocolError {
 }
 
 fn report_startup_error(error: ProtocolError) -> &'static str {
+    nabedra_rt::diag(&format!("STARTUP-FAILED {:?}: {}", error.code, error.message));
     eprintln!(
         "nabedra-db: registered startup {:?}: {}",
         error.code, error.message

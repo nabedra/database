@@ -735,7 +735,9 @@ impl Endpoint for HostedControlEndpoint {
         })
     }
 }
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::Unauthorized,
         "Control operator delegation identity or request differs",

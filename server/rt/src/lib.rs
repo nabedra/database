@@ -31,3 +31,14 @@ pub const SIM: bool = cfg!(feature = "sim");
 
 #[cfg(test)]
 mod tests;
+
+pub fn diag_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| std::env::var_os("NABEDRA_DIAG").is_some()) }
+pub fn diag(msg: &str) {
+    if !diag_on() { return; }
+    #[cfg(feature = "sim")]
+    let (node, ms) = (crate::sim::current_node(), crate::sim::world().map(|w| w.elapsed().as_millis()).unwrap_or(0));
+    #[cfg(not(feature = "sim"))]
+    let (node, ms) = (None::<u64>, 0u128);
+    eprintln!("DIAG t={ms} n={node:?} {msg}");
+}
+pub fn diag_at(msg: &str, at: &std::panic::Location<'_>) { if diag_on() { diag(&format!("{msg} {}:{}", at.file(), at.line())); } }

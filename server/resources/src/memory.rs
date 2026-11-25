@@ -98,7 +98,39 @@ enum ScratchBacking {
         charge: Mutex<MemoryCharge>,
         counter: Arc<AtomicUsize>,
         owner: Arc<dyn Any + Send + Sync>,
+        diag: u64,
     },
+}
+pub mod diag {
+    use std::{backtrace::Backtrace, collections::BTreeMap, sync::Mutex};
+    pub struct Row { pub node: Option<u64>, pub bytes: usize, pub at: u128, pub trace: Backtrace }
+    pub static LIVE: Mutex<BTreeMap<u64, Row>> = Mutex::new(BTreeMap::new());
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    pub fn add(bytes: usize) -> u64 {
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let at = nabedra_rt::sim::world().map_or(0, |w| w.elapsed().as_millis());
+        let row = Row { node: nabedra_rt::sim::current_node(), bytes, at, trace: Backtrace::force_capture() };
+        LIVE.lock().unwrap().insert(id, row);
+        id
+    }
+    pub fn clear() { let rows = std::mem::take(&mut *LIVE.lock().unwrap()); drop(rows); }
+    pub fn dump(label: &str) {
+        let live = LIVE.lock().unwrap();
+        for (id, row) in live.iter() {
+            if row.node.is_none_or(|n| n > 3) { continue; }
+            let text = row.trace.to_string();
+            let mut names = Vec::new();
+            for line in text.lines() {
+                let line = line.trim();
+                if let Some((n, name)) = line.split_once(": ") && n.chars().all(|c| c.is_ascii_digit())
+                    && name.contains("nabedra") && !name.contains("diag::") && !name.contains("WorkerMemory") && !name.contains("nabedra_rt") && !name.contains("ScratchLease") {
+                    names.push(name.replace("nabedra_database_server::", "srv::").replace("nabedra_oltp_replication::oltp_replication::", "repl::"));
+                }
+                if names.len() == 10 { break; }
+            }
+            println!("SCR {label} n{} #{id} {}B t{} {} ## {}", row.node.unwrap(), row.bytes, row.at, names[..names.len().min(3)].join(" <- "), names.get(3..).map_or(String::new(), |r| r.join(" <- ")));
+        }
+    }
 }
 impl ScratchLease {
     #[inline]
@@ -119,8 +151,15 @@ impl ScratchLease {
                 charge: Mutex::new(charge),
                 counter,
                 owner,
+                diag: 0,
             },
         }
+        .tracked()
+    }
+    fn tracked(mut self) -> Self {
+        let n = self.bytes();
+        if let ScratchBacking::Working { diag, .. } = &mut self.backing { *diag = diag::add(n); }
+        self
     }
 
     fn combined(owner: Arc<dyn Any + Send + Sync>, parts: [Arc<Self>; 2]) -> Self {
@@ -146,11 +185,12 @@ impl ScratchLease {
     #[doc(hidden)]
     pub fn shrink_unused(&self, bytes: usize) -> Result<(), ProtocolError> {
         let ScratchBacking::Working {
-            charge, counter, ..
+            charge, counter, diag, ..
         } = &self.backing
         else {
             return Err(capacity());
         };
+        if let Some(row) = diag::LIVE.lock().unwrap().get_mut(diag) { row.bytes = bytes; }
         let mut charge = charge.lock().map_err(|_| capacity())?;
         let old = charge.bytes() as usize;
         charge.shrink_to(bytes as u64)?;
@@ -170,6 +210,7 @@ impl ScratchLease {
 }
 impl Drop for ScratchLease {
     fn drop(&mut self) {
+        if let ScratchBacking::Working { diag, .. } = &self.backing { let row = diag::LIVE.lock().unwrap().remove(diag); drop(row); }
         if let ScratchBacking::Working {
             charge, counter, ..
         } = &mut self.backing

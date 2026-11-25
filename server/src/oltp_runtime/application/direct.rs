@@ -1582,7 +1582,9 @@ fn unknown() -> ProtocolError {
     )
 }
 
+#[track_caller]
 fn route_unavailable() -> ProtocolError {
+    nabedra_rt::diag_at("ROUTE-UNAVAILABLE", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::StorageUnavailable,
         "direct route unavailable",

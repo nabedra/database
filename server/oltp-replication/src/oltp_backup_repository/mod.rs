@@ -493,7 +493,9 @@ fn chain_step(previous: Digest, spec: ChunkSpec) -> Digest {
     h.update(spec.sha256.as_bytes());
     Digest::from_bytes(h.finalize().into())
 }
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "invalid bounded immutable archive request",

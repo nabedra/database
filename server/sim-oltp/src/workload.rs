@@ -35,6 +35,8 @@ const SETUP_DEADLINE: Duration = Duration::from_secs(20);
 const SETTLE_LIMIT: Duration = Duration::from_secs(2);
 
 pub(crate) fn run_seed(seed: u64, generator: &mut Gen, defect: Defect, setup: &Setup) -> RunResult {
+    nabedra_resources::memory::diag::clear();
+    println!("\nSCRSEED {seed}");
     run(seed, generator, defect, None, setup)
 }
 

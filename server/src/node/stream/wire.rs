@@ -215,7 +215,9 @@ pub(super) fn unavailable() -> ProtocolError {
     )
 }
 
+#[track_caller]
 pub(super) fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     fail(ErrorCode::ValidationError, "invalid stream request")
 }
 

@@ -321,7 +321,9 @@ impl StatusDecisionProof for VerifiedStatusDecision {
     }
 }
 
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "status decision proof does not match the immutable transaction",

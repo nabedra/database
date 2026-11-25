@@ -534,7 +534,9 @@ impl HttpRuntime for RemoteRuntime {
         })
     }
 }
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "invalid enrolled API gateway configuration",

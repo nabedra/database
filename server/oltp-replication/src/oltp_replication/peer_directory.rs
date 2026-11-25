@@ -943,7 +943,9 @@ fn check_page<T>(
     }
     Ok(())
 }
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::Unauthorized,
         "peer identity or service role differs from applied Control enrollment",

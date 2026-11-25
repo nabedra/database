@@ -354,7 +354,9 @@ impl DirectSchema for CatalogSchema {
 /// (table, route schema epoch, group direct epoch and lifecycle when checked).
 type CacheKey = (Uuid, u64, Option<GroupSchema>);
 
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::StorageUnavailable,
         "catalog index metadata is incomplete",

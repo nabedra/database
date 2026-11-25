@@ -222,6 +222,10 @@ impl WorkerRuntime {
                         ErrorCode::ValidationError | ErrorCode::NotFound | ErrorCode::Conflict
                     ) =>
             {
+                if let GroupKind::Data { table_id, .. } = attempt.intent.source.kind {
+                    let holder = self.services.catalog.participant().lifecycle_exclusive(table_id).await;
+                    nabedra_rt::diag(&format!("SPLIT-PLAN-REFUSED plan {} ({}) holder {:?} open {:?}", split_id, error.message, holder.map(|h| h.map(|b| (b.txn, b.request))), (attempt.txn, attempt.request)));
+                }
                 self.services
                     .status
                     .terminal_failure(authority, attempt.request, error.clone())
@@ -268,7 +272,10 @@ impl WorkerRuntime {
             return Err(unknown());
         }
         let attempt = client.job(split_id).await?.ok_or_else(unknown)?;
-        client.freeze(&attempt).await?;
+        if let Err(error) = client.freeze(&attempt).await {
+            nabedra_rt::diag(&format!("SPLIT-FREEZE-REFUSED plan {} ({}) txn {:?}", split_id, error.message, (attempt.txn, attempt.request)));
+            return Err(error);
+        }
         for child in &children {
             // Rechecking exact placement also resumes a lost hosting/fence or
             // Control registration reply after the binding became durable.
@@ -570,7 +577,9 @@ fn split_plan_error(error: PlanError) -> ProtocolError {
         PlanError::Blocked(_) | PlanError::LifecyclePending(_) => unavailable(),
     }
 }
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "invalid manual shard split request",

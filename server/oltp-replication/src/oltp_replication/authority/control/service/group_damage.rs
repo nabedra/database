@@ -218,7 +218,9 @@ fn damage_reply(reply: ControlReply) -> Result<GroupDamageRecord, ProtocolError>
     }
 }
 
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "invalid group damage command",

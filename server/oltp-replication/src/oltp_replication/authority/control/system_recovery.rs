@@ -230,7 +230,9 @@ impl SystemRecoveryCommand {
     }
 }
 
+#[track_caller]
 fn invalid() -> ProtocolError {
+    nabedra_rt::diag_at("invalid", std::panic::Location::caller());
     ProtocolError::new(
         ErrorCode::ValidationError,
         "system replacement requires a fresh worker, certificate, and Docker mount",
