@@ -333,7 +333,7 @@ Raft positions are per range and the index is per worker. Each worker builds its
 Ready → Splitting → Draining → Retired          Ready → Merging → Retired
 ```
 
-A move appends to the target before it removes from the source, and removal waits until every scan and checkpoint that began before the append finished. A removal names one entry instance, never a row, so a row that moves back is safe. (DB-7) A split or merge copies every entry that a pin, a checkpoint or a retained cut can still need, and every entry beyond the applied position, because cores append ahead of it. (DB-17, DB-21) A copy that lands in a partition that drains meanwhile is sent on, so drains end. (DB-23) A resync or a drop of a range fails every scan that pinned it. (DB-24) A retired partition keeps its entries for the scans and checkpoints that listed it. Copies between cores name the generation of the index, and a resync makes older ones void. An entry's version is the full apply position, never shortened. Scans dedup by slot. A moved row is therefore never missed and never returned twice. Reassignment is capped per second, and re-encoding is charged to maintenance.
+A move appends to the target before it removes from the source, and removal waits until every scan and checkpoint that began before the append finished. A removal names one entry instance, never a row, so a row that moves back is safe. (DB-7) A split or merge copies every entry that a pin, a checkpoint or a retained cut can still need, and every entry beyond the applied position, because cores append ahead of it. (DB-17, DB-21) A copy that lands in a partition that drains meanwhile is sent on, and a partition that another one drains into does not start to drain, so drains end. (DB-23, DB-25) A resync or a drop of a range fails every scan that pinned it. (DB-24) A retired partition keeps its entries for the scans and checkpoints that listed it. Copies between cores name the generation of the index, and a resync makes older ones void. An entry's version is the full apply position, never shortened. Scans dedup by slot. A moved row is therefore never missed and never returned twice. Reassignment is capped per second, and re-encoding is charged to maintenance.
 
 **Filters.** Estimate matches from the summaries. At most 20,000 matches: score all of them. Otherwise read nearest partitions that contain a match, counting only matching rows in the stop rule. Never post-filter. If at least `limit` rows match, `limit` rows return.
 
@@ -493,7 +493,7 @@ Left out, for the reviewer and the user to accept:
 - Any committed prefix stands for what any voter applied, so for any number of voters. Deposed leaders only refuse or answer from what they captured, so one suffices.
 - One search worker in `SearchLatest` and `SearchRoute`: a query reads one worker per range, workers share nothing, and a crash stands in for changing the worker. Two or three workers in `SearchAssign` and `IndexLifecycle`.
 - One range in `LocalIndex`, whose structure a resync resets as a whole. Ranges share partitions and maintenance, and each entry belongs to one.
-- Reduced T1 combinations, each covered by another baseline: the two-query `SearchLatest` run has no purge, the batch run has no repeated page or purge, and the two-range `SearchSnapshot` run has one attempt per direct commit.
+- Reduced T1 combinations, each covered by another baseline: the two-query `SearchLatest` run has no purge, the batch run has no repeated page or purge, and the two-range `SearchSnapshot` run has one attempt per direct commit. In `LocalIndex`, the resync run has no drain or checkpoint, the crash run has no move (the crashmove run does), and no scan runs beside a checkpoint.
 - One row or key in `EmbedApply`, `RowBlobs` and `SearchSnapshot`: rows share only the safe point, the floor and leases, which are not trusted.
 
 **Fairness.** Client retry, in-order proposal service, Raft replication and apply, the transaction coordinator and resolver, the close timer, the tail and install loops, the barrier sender with its RPC deadline, the scan loop, the embedder's poll loop, the provider client's deadline, the lease timer, the backfill job, worker heartbeats and Control's reconcile loop. Each fairness assumption in a spec names one of these.
@@ -526,10 +526,11 @@ RESULTS_TABLE
 | DB-18 | A repeated or requeued failure report was counted twice | Spec review | `embed/prefix_count_every_report`, `embed/prefix_requeue_resets_attempts` |
 | DB-19 | A split dropped the bound of servable cuts | Spec review | `route/prefix_retag_drops_retained` |
 | DB-20 | A late fence could serve a dropped column again | Spec review | `lifecycle/prefix_fence_not_monotone` |
-| DB-21 | A partition split dropped entries that were appended ahead of the applied position | Spec re-review | `index/drain_ignores_unapplied` |
-| DB-22 | A split reset embedding attempts and turned failed rows back into pending ones | Spec re-review | `blobs/prefix_split_rederives`, `embed/rederive_keeps_identity` |
-| DB-23 | A copy to a partition that drains meanwhile blocked the drain for good | Spec re-review | `index/land_needs_ready` |
-| DB-24 | A scan went on in an index that a resync or a drop replaced | Spec re-review | `index/scan_survives_resync` |
+| DB-21 | A partition split dropped entries that were appended ahead of the applied position | Spec re-review | `index/prefix_drain_ignores_unapplied` |
+| DB-22 | A split reset embedding attempts and turned failed rows back into pending ones | Spec re-review | `blobs/prefix_split_rederives`, `embed/prefix_rederive_keeps_identity` |
+| DB-23 | A copy to a partition that drains meanwhile blocked the drain for good | Spec re-review | `index/prefix_land_needs_ready` |
+| DB-24 | A scan went on in an index that a resync or a drop replaced | Spec re-review | `index/prefix_scan_survives_resync` |
+| DB-25 | A partition retired while another one still drained into it, which blocked that drain | Spec re-review | `index/prefix_drain_a_target` |
 
 Also removed: throttling writes on search lag, which contradicted VEC-G06.
 
@@ -554,7 +555,7 @@ Also removed: throttling writes on search lag, which contradicted VEC-G06.
 
 ### Independent read and spec review
 
-A fresh agent read the plan without the specs and returned 17 suspected breaks, 11 scenarios to cover and 16 loose rules. DB-1 to DB-9 and DB-11 to DB-15 encode the breaks that are protocol steps. The loose rules became plan text in sections 2 to 7. A second agent reviewed the specs against the plan and rejected six of eight. Its 14 blocking findings are fixed: DB-8 and DB-16 to DB-20, the moves spec, resync and late copies in the index, real fault budgets, and the clock-drift statement above. Its re-review accepted 12 of the 14 fixes and raised six more, which are fixed as DB-21 to DB-24, two more liveness runs and the wording of VEC-G08.
+A fresh agent read the plan without the specs and returned 17 suspected breaks, 11 scenarios to cover and 16 loose rules. DB-1 to DB-9 and DB-11 to DB-15 encode the breaks that are protocol steps. The loose rules became plan text in sections 2 to 7. A second agent reviewed the specs against the plan and rejected six of eight. Its 14 blocking findings are fixed: DB-8 and DB-16 to DB-20, the moves spec, resync and late copies in the index, real fault budgets, and the clock-drift statement above. Its re-review accepted 12 of the 14 fixes and raised six more, which are fixed as DB-21 to DB-24, two more liveness runs and the wording of VEC-G08. Its third pass raised two, fixed as DB-25 and one more `EmbedApply` baseline, and approved all nine specs and abstractions on that condition.
 
 Covered by U or M instead of T: that a change record equals what apply did for rejected, replayed and resolved members, slot reuse, and the retry of a conflicted client update.
 

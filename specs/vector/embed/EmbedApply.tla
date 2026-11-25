@@ -191,7 +191,7 @@ HandleErr ==
         /\ IF /\ pend # None
               /\ pend.v = m.v \/ Mutant = "prefix_unfenced_failure"
               /\ m.c = col
-              /\ pend.id = m.id \/ Mutant \in {"prefix_unfenced_failure", "rederive_keeps_identity"}
+              /\ pend.id = m.id \/ Mutant \in {"prefix_unfenced_failure", "prefix_rederive_keeps_identity"}
               /\ pend.n = m.n \/ Mutant \in {"prefix_count_every_report", "prefix_unfenced_failure"}
            THEN /\ counted' = [counted EXCEPT ![pend.v] = @ + 1]
                 /\ IF pend.n + 1 >= pend.max
@@ -212,7 +212,7 @@ Requeue ==
     /\ UNCHANGED <<counted, row, ver, col, filled, vec, leased, work, msgs, setp, upd, errs, writes, updates, readds, leaders, crashes, lost, dups, errors>>
 
 \* A restore derives a new record for a row that lacks its vector, with an identity of its own, so that
-\* reports of the old one match nothing. Mutant rederive_keeps_identity ignores the identity.
+\* reports of the old one match nothing. Mutant prefix_rederive_keeps_identity ignores the identity.
 Rederive ==
     /\ requeues < MaxRequeues /\ requeues' = requeues + 1
     /\ row # None /\ vec = None /\ filled

@@ -55,9 +55,9 @@ LiveAt(s, n) == \E a \in 1..n : VisibleAt(s, a, n)
 
 \* Some cut that is or may still be asked for sees this version, or it is not applied yet.
 \* Mutant prefix_drain_copies_current_only keeps the newest applied versions only, and mutant
-\* drain_ignores_unapplied forgets entries beyond the applied position.
+\* prefix_drain_ignores_unapplied forgets entries beyond the applied position.
 Wanted(e) ==
-    \/ e.a > app /\ Mutant # "drain_ignores_unapplied"
+    \/ e.a > app /\ Mutant # "prefix_drain_ignores_unapplied"
     \/ IF Mutant = "prefix_drain_copies_current_only" THEN VisibleAt(e.s, e.a, app)
        ELSE \E n \in low..app : VisibleAt(e.s, e.a, n)
 
@@ -125,10 +125,12 @@ AdvanceLow ==
 -----------------------------------------------------------------------------
 (* Split, merge and reassignment.                                          *)
 
-\* A split drains into two new partitions, a merge into an existing one.
+\* A split drains into two new partitions, a merge into an existing one. A partition that another one
+\* drains into does not start to drain. Mutant prefix_drain_a_target lets it.
 StartDrain(p, T) ==
     /\ drains < MaxDrains /\ drains' = drains + 1
     /\ st[p] = "ready" /\ p \notin T
+    /\ (\A x \in Parts : p \notin tgts[x]) \/ Mutant = "prefix_drain_a_target"
     /\ \/ Cardinality(T) = 2 /\ \A t \in T : st[t] = "free"
        \/ Cardinality(T) = 1 /\ \A t \in T : st[t] = "ready"
     /\ st' = [x \in Parts |-> IF x = p THEN "draining" ELSE IF x \in T THEN "ready" ELSE st[x]]
@@ -156,12 +158,12 @@ Reassign(p, t) ==
     /\ UNCHANGED <<feed, st, tgts, sent, waits, q, ck, disk, unsynced, drains, checkpoints, crashes, resyncs>>
 
 \* The copy lands, also in a partition that drains meanwhile, which then sends it on. A copy of an
-\* older generation is dropped. Mutants: land_needs_ready leaves it in flight while its target drains,
+\* older generation is dropped. Mutants: prefix_land_needs_ready leaves it in flight while its target drains,
 \* late_copy_after_resync lands an old one.
 Land(t) ==
     /\ \E m \in flight :
         /\ m.t = t
-        /\ st[t] = "ready" \/ (st[t] = "draining" /\ Mutant # "land_needs_ready") \/ m.e.g # gen
+        /\ st[t] = "ready" \/ (st[t] = "draining" /\ Mutant # "prefix_land_needs_ready") \/ m.e.g # gen
         /\ flight' = flight \ {m}
         /\ IF m.e.g = gen \/ (Mutant = "late_copy_after_resync" /\ st[t] = "ready")
            THEN /\ ents' = [ents EXCEPT ![t] = @ \cup {m.e}]
@@ -276,7 +278,7 @@ InstallManifest ==
     /\ UNCHANGED <<feed, idx, q, bud>>
 
 \* Put a set of versions into the first partition, as a generation. Every running scan fails.
-\* Mutant scan_survives_resync lets it go on in the new index.
+\* Mutant prefix_scan_survives_resync lets it go on in the new index.
 Load(got, n, l, g) ==
     /\ gen' = g /\ app' = n /\ placed' = {} /\ low' = l
     /\ LET p0 == CHOOSE p \in First : TRUE IN
@@ -284,7 +286,7 @@ Load(got, n, l, g) ==
     /\ st' = [p \in Parts |-> IF p \in First THEN "ready" ELSE "free"]
     /\ tgts' = [p \in Parts |-> {}] /\ sent' = [p \in Parts |-> {}] /\ waits' = [p \in Parts |-> {}]
     /\ rems' = {} /\ ck' = None
-    /\ q' = IF Mutant = "scan_survives_resync" THEN q
+    /\ q' = IF Mutant = "prefix_scan_survives_resync" THEN q
             ELSE [x \in Queries |-> IF q[x].st \in {"run", "probed"} THEN [Idle EXCEPT !.st = "failed"] ELSE q[x]]
 
 SnapshotAt(n) == {[s |-> ops[a].s, a |-> a] : a \in {b \in 1..n : VisibleAt(ops[b].s, b, n)}}
