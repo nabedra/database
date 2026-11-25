@@ -68,6 +68,8 @@ pub enum Ledger {
 pub enum GuardKind {
     /// A native lease of `WorkerSharedResources`. Counted by [`Ledger::NativeLeases`].
     NativeLease,
+    /// The permit of a native executor's slot. No ledger counts it: the free slots are one.
+    NativeSlot,
     /// A pending Raft log write. Counted by [`Ledger::PendingWrites`].
     PendingWrite,
 }

@@ -70,7 +70,7 @@ pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
         "O26:split-across-pools" => "no phase 10 schedule splits a range across pools",
         "O26:failed-mount" => "no phase 10 schedule loses a mount",
         "F03:reservation" | "F03:dispatch" => {
-            "no seed of this range cut such a request in the resources overlay"
+            "only the resources overlay cuts such a request, and no seed of this range did"
         }
         "F03:receipt" | "F03:cleanup" => "no probe says that a caller was cancelled there",
         "F03:reduction" => "the resources overlay sends direct-path requests only",

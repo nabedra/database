@@ -16,7 +16,7 @@ use super::{
     clauses::{self, Answer},
     clients::{self, Ctx, Plan},
     cold, corrupt, moves, old_peer, paused,
-    resources::Overlay,
+    resources::{Overlay, not_judged},
 };
 use crate::{
     bootstrap::{CLIENTS, GATEWAYS, WORKERS},
@@ -42,6 +42,8 @@ pub(crate) struct Report {
     pub scenarios: Scenarios,
     pub assertions: Vec<(&'static str, bool)>,
     pub summary: Value,
+    /// The rules of the `resources` overlay's stage were evaluated.
+    pub stage_judged: bool,
 }
 
 /// Run `workload` against a started cluster.
@@ -387,7 +389,11 @@ pub(crate) async fn run(
                 .scenarios
                 .extend(overlay.stage(cluster, config.deadline()).await);
         } else {
-            cluster.record("resources overlay stage not run: the cluster did not converge".into());
+            not_judged(
+                &cluster.checks,
+                &cluster.world,
+                "the cluster did not converge",
+            );
         }
     }
 
@@ -461,6 +467,7 @@ pub(crate) async fn run(
     report.summary["one_paused_late"] = json!(outcome.one_paused_late);
     report.summary["move_wait_ms"] = json!(move_wait_ms);
     if let Some(overlay) = &overlay {
+        report.stage_judged = overlay.judged;
         report.summary["resources"] = overlay.summary(&cluster.checks, &cluster.world);
     }
     cluster.record(format!("workload summary {}", report.summary));

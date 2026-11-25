@@ -22,7 +22,7 @@
 //! ([`crate::invariants::resources`]).
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     future::{Future, poll_fn},
     pin::pin,
     sync::{
@@ -47,6 +47,7 @@ use tokio::{sync::watch, task::JoinHandle};
 use super::{
     Scenarios,
     clients::{self, Ctx, Request},
+    freezes::{self, Freezes},
 };
 use crate::{
     bootstrap::{CLIENTS, GATEWAYS, WORKERS},
@@ -58,6 +59,8 @@ use crate::{
     node::Cluster,
 };
 
+/// The server processes.
+const NODES: [u64; 5] = [WORKERS[0], WORKERS[1], WORKERS[2], GATEWAYS[0], GATEWAYS[1]];
 /// What a client whose request was cut sees.
 pub(crate) const CANCELLED: &str = "the client cancelled the request";
 /// The keys that every read pass covers. Every other key is written once.
@@ -70,6 +73,14 @@ const SHORT: Duration = Duration::from_millis(500);
 const PAST: Duration = Duration::from_millis(150);
 /// The share, per mille, of polls and jobs that a time with many stalls stops.
 const FREEZES: u32 = 4;
+/// What a seed whose stage was not judged reports.
+pub(crate) const NOT_JUDGED: &str = "NotJudged";
+/// Bound of the end of every freeze.
+const SETTLE: Duration = Duration::from_millis(100);
+/// Bound of a load: its slowest client sends three requests, each with its deadline.
+const JOIN_LIMIT: Duration = Duration::from_secs(60);
+/// How many small loads may be sent to make the stalls of a round happen.
+const FLUSHES: u32 = 20;
 /// Bound of the point before the stage, and of the convergence after it.
 const STAGE_POINT: Duration = Duration::from_secs(10);
 
@@ -234,17 +245,13 @@ impl Stall {
         }
     }
 
-    /// `stalled` names the processes with a stall, so each has one at a time.
-    async fn run(self, world: Arc<World>, stalled: Arc<Mutex<BTreeSet<u64>>>) {
-        let mut read = ClockRead::nth(self.nth);
+    fn read(self) -> ClockRead {
+        let read = ClockRead::nth(self.nth);
         if self.reservation {
-            read = read.in_file(RESERVATION);
+            read.in_file(RESERVATION)
+        } else {
+            read
         }
-        world.freeze_after_clock_read(self.node, read);
-        world.frozen_at_read(self.node).await;
-        time::sleep(self.hold).await;
-        world.thaw(self.node);
-        stalled.lock().unwrap().remove(&self.node);
     }
 }
 
@@ -274,9 +281,12 @@ pub(crate) struct Overlay {
     load: Arc<Mutex<Load>>,
     froze: bool,
     tasks: Vec<JoinHandle<()>>,
-    stalled: Arc<Mutex<BTreeSet<u64>>>,
+    /// Owns every clock freeze, from [`Self::arm`] on.
+    owner: Option<Freezes>,
     lanes: u64,
     stage: Value,
+    /// The stage's rules were evaluated.
+    pub(crate) judged: bool,
 }
 
 impl Overlay {
@@ -323,9 +333,10 @@ impl Overlay {
             load: Arc::default(),
             froze: freezes.is_some(),
             tasks: Vec::new(),
-            stalled: Arc::default(),
+            owner: None,
             lanes: 0,
             stage: Value::Null,
+            judged: false,
         }
     }
 
@@ -360,6 +371,7 @@ impl Overlay {
             cut: BTreeMap::new(),
             sent: 0,
         });
+        self.owner = Some(Freezes::watch(&cluster.world, &cluster.checks));
         if self.pauses {
             cluster
                 .world
@@ -385,12 +397,14 @@ impl Overlay {
             for gateway in &window.gateways {
                 self.press(*gateway, window.lanes, window.each);
             }
-            // The nemesis thaws what it froze itself.
+            // The nemesis thaws what it froze itself, and seeded freezes need no stall.
+            let seeded = self.freezes.is_some_and(|(from, ..)| from <= now);
             if let Some(stall) = window.stall
+                && !seeded
                 && cluster.frozen().is_empty()
                 && cluster.is_running(stall.node)
             {
-                self.stall(cluster, stall);
+                self.stall(stall);
             }
             if let Some(after) = window.storm_after {
                 let world = cluster.world.clone();
@@ -405,7 +419,7 @@ impl Overlay {
         {
             let ended = to <= now;
             let per_mille = if ended { 0 } else { FREEZES };
-            cluster.world.set_clock_freezes(per_mille, hold);
+            self.seed(per_mille, hold);
             if ended {
                 self.freezes = None;
             }
@@ -475,7 +489,6 @@ impl Overlay {
     pub(crate) async fn stop(&mut self, cluster: &mut Cluster) {
         set_cuts(&cluster.world, 0);
         cluster.world.set_storage_pauses(0, Duration::ZERO);
-        cluster.world.set_clock_freezes(0, Duration::ZERO);
         self.freezes = None;
         self.windows.clear();
         self.drain = None;
@@ -486,24 +499,61 @@ impl Overlay {
         if let Some((node, _)) = self.restart {
             self.restart_drained(cluster, node).await;
         }
+        self.thawed(cluster).await;
     }
 
-    /// Waits for the load of the chaos window. Every request has its own deadline.
-    async fn join(&mut self) {
-        for task in std::mem::take(&mut self.tasks) {
-            let _ = task.await;
+    /// Ends every stall and freeze of the overlay. One that stays is the harness's fault.
+    async fn thawed(&self, cluster: &Cluster) {
+        let Some(owner) = &self.owner else { return };
+        owner.end_all();
+        let mut wrong = Vec::new();
+        if !owner.settle(&NODES, SETTLE).await {
+            wrong.push(format!("freezes left on {:?}", owner.open()));
+        }
+        for node in freezes::abandoned(&cluster.world, owner, &NODES) {
+            cluster.world.thaw(node);
+            wrong.push(format!("n{node} was frozen and nothing held it"));
+        }
+        for detail in wrong {
+            cluster.checks.violate(&cluster.world, "harness", detail);
         }
     }
 
-    fn stall(&mut self, cluster: &Cluster, stall: Stall) {
-        // A second one would end at the first one's thaw, and its own freeze would last.
-        if !self.stalled.lock().unwrap().insert(stall.node) {
-            return;
+    fn seed(&self, per_mille: u32, hold: Duration) {
+        if let Some(owner) = &self.owner {
+            owner.seed(per_mille, hold);
         }
-        let world = cluster.world.clone();
-        let stalled = self.stalled.clone();
-        self.tasks
-            .push(nabedra_rt::task::spawn(stall.run(world, stalled)));
+    }
+
+    /// Waits for the load. Every request has its own deadline, so the load has one, too.
+    async fn join(&mut self, cluster: &Cluster) {
+        let limit = cluster.world.elapsed() + JOIN_LIMIT;
+        let mut late = 0;
+        for mut task in std::mem::take(&mut self.tasks) {
+            let left = limit.saturating_sub(cluster.world.elapsed());
+            if time::timeout(left, &mut task).await.is_err() {
+                task.abort();
+                late += 1;
+            }
+        }
+        if late > 0 {
+            cluster.checks.violate(
+                &cluster.world,
+                "harness",
+                format!("{late} clients of the overlay still ran after {JOIN_LIMIT:?}"),
+            );
+        }
+    }
+
+    /// The stage was not judged, so the seed must not read as one whose stage passed.
+    fn not_judged(cluster: &Cluster, why: &str) {
+        not_judged(&cluster.checks, &cluster.world, why);
+    }
+
+    fn stall(&self, stall: Stall) {
+        if let Some(owner) = &self.owner {
+            owner.arm(stall.node, stall.read(), stall.hold);
+        }
     }
 
     /// Starts `lanes` concurrent clients of one gateway, each sending `each` requests.
@@ -528,10 +578,10 @@ impl Overlay {
     pub(crate) async fn stage(&mut self, cluster: &Cluster, deadline: Duration) -> Scenarios {
         let mut clauses = Scenarios::new();
         let Some(probes) = cluster.checks.probes() else {
-            cluster.record("resources overlay stage not run: no probes".into());
+            Self::not_judged(cluster, "no probes");
             return clauses;
         };
-        self.join().await;
+        self.join(cluster).await;
         let mut g = Gen::from_seed(stream_seed(self.seed, "oltp-resources-stage"));
         // One uncut round first, so what a first request keeps (routes, sessions) is in the
         // point before the stage.
@@ -539,10 +589,10 @@ impl Overlay {
         let lanes = 24 + g.below(41);
         self.press(0, lanes, 1);
         self.press(1, lanes, 1);
-        self.join().await;
+        self.join(cluster).await;
         self.read_pass().await;
 
-        let nodes: Vec<u64> = WORKERS.into_iter().chain(GATEWAYS).collect();
+        let nodes = NODES;
         let mut stage = Stage::default();
         let limit = cluster.world.elapsed() + STAGE_POINT;
         let steady = loop {
@@ -557,6 +607,11 @@ impl Overlay {
         cluster.record(format!(
             "resources overlay point before the stage, steady {steady}"
         ));
+        if !steady {
+            // Nothing to compare with.
+            Self::not_judged(cluster, "the point before the stage was not steady");
+            return clauses;
+        }
 
         let before = probes.guard_counts();
         let (cut_before, _) = cuts(&cluster.world);
@@ -568,23 +623,34 @@ impl Overlay {
             let many = deadline <= SHORT && g.bool();
             if many {
                 // Every process stops now and then, so some request is caught half done.
-                cluster.world.set_clock_freezes(FREEZES, deadline + PAST);
+                self.seed(FREEZES, deadline + PAST);
             } else {
                 for stall in stalls {
-                    self.stall(cluster, stall);
+                    self.stall(stall);
                 }
             }
             self.press(0, lanes, 2);
             self.press(1, lanes, 2);
             if many {
                 time::sleep(Duration::from_millis(200 + g.below(800))).await;
-                cluster.world.set_clock_freezes(0, Duration::ZERO);
+                self.seed(0, Duration::ZERO);
             }
             if g.bool() {
                 time::sleep(Duration::from_millis(g.below(20))).await;
                 storm(&cluster.world);
             }
-            self.join().await;
+            self.join(cluster).await;
+            // A rule that has not fired would fire later, in the middle of something else.
+            for _ in 0..FLUSHES {
+                let armed = self.owner.as_ref().is_some_and(Freezes::armed);
+                if !armed {
+                    break;
+                }
+                self.press(0, 4, 1);
+                self.press(1, 4, 1);
+                self.join(cluster).await;
+            }
+            self.thawed(cluster).await;
         }
         set_cuts(&cluster.world, 0);
         // Leadership may have moved, and that takes messages.
@@ -596,6 +662,7 @@ impl Overlay {
                     "Liveness",
                     format!("no convergence {STAGE_POINT:?} after the overlay's stage"),
                 );
+                Self::not_judged(cluster, "no convergence after its load");
                 return clauses;
             }
             time::sleep(STEP).await;
@@ -614,6 +681,7 @@ impl Overlay {
             }
             time::sleep(STEP).await;
         }
+        self.judged = true;
         let mut back = true;
         for &node in &nodes {
             probes.ran(crate::invariants::resources::OVERLAY_BASELINE, 1);
@@ -691,6 +759,7 @@ impl Overlay {
         json!({
             "pauses": self.pauses,
             "froze": self.froze,
+            "freezes_began_and_ended": self.owner.as_ref().map(|owner| <[u64; 2]>::from(owner.counts())),
             "drained": self.drained,
             "requests": sent,
             "cut": cut,
@@ -703,6 +772,7 @@ impl Overlay {
                 "abandoned": guards.abandoned,
             })),
             "stage": self.stage,
+            "stage_judged": self.judged,
         })
     }
 }
@@ -776,6 +846,21 @@ fn cuts(world: &World) -> (u64, u64) {
     world
         .with_ext::<Cuts, _>(|cuts| (cuts.cut.values().sum(), cuts.sent))
         .unwrap_or_default()
+}
+
+/// Whether the overlay disturbs the run now: it cuts, loads, stalls and drains.
+pub(crate) fn disturbs(world: &World) -> bool {
+    world
+        .with_ext::<Cuts, _>(|cuts| cuts.per_mille > 0)
+        .unwrap_or(false)
+}
+
+pub(crate) fn not_judged(checks: &Invariants, world: &World, why: &str) {
+    checks.violate(
+        world,
+        NOT_JUDGED,
+        format!("the resources overlay's stage: {why}"),
+    );
 }
 
 pub(crate) fn drain_failed(cluster: &Cluster, node: u64, error: &str) {

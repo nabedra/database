@@ -26,11 +26,14 @@ use crate::{
     invariants::{Invariants, STEP, TraceObserver, elapsed_ms},
     node::Cluster,
     panics::{self, PANIC, Watch},
+    probes::Probes,
     sweep::{Defect, RunResult, Setup},
     workloads::{self, Scenarios, Workload},
 };
 
 const OPERATIONS: &str = "/v1/operations";
+/// The assertion that the `resources` overlay's stage was judged.
+pub(crate) const STAGE_JUDGED: &str = "resources stage judged";
 const SETUP_DEADLINE: Duration = Duration::from_secs(20);
 const SETTLE_LIMIT: Duration = Duration::from_secs(2);
 
@@ -192,10 +195,14 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     observer(0, format!("configuration {}", configuration["hash"]));
     let checks = Invariants::new();
     checks.set_trace(observer.clone());
-    checks.install_probes(&world, workload.name());
     let history = Arc::new(Mutex::new(History::default()));
     history.lock().unwrap().set_trace(observer.clone());
     let mut assertions = BTreeMap::new();
+    // Only here: a sink costs trace lines, and without the overlay a run is the one it was.
+    let probed = setup.workloads.overlay();
+    if probed {
+        Probes::install(&world, &checks, workload.name());
+    }
     // This ticker uses runtime time. Drifting node clocks never alter the
     // invariant sampling frequency.
     let ticker = {
@@ -246,6 +253,15 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
                             setup.workloads.overlay(),
                         )
                         .await;
+                        if probed {
+                            let judged = report.as_ref().is_ok_and(|report| report.stage_judged);
+                            assertions.insert(STAGE_JUDGED, judged);
+                            if !judged && !has_violation(&checks, workloads::resources::NOT_JUDGED)
+                            {
+                                let why = "the run ended before it";
+                                workloads::resources::not_judged(&checks, &world, why);
+                            }
+                        }
                         match report {
                             Ok(report) => {
                                 for (name, passed) in report.assertions {
@@ -327,6 +343,10 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     );
     assertions.insert("liveness", !has_violation(&checks, "Liveness"));
     let history = std::mem::take(&mut *history.lock().unwrap());
+    if probed {
+        checks.check_outcomes(&world, history.events());
+        assertions.insert("probe invariants", checks.probe_invariants_hold());
+    }
     if history.events().iter().any(|event| event.key.is_some()) {
         let verdict = history.check_direct();
         assertions.insert(
@@ -335,8 +355,6 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         );
         checks.check_history(&world, &verdict);
     }
-    checks.check_outcomes(&world, history.events());
-    assertions.insert("probe invariants", checks.probe_invariants_hold());
     let mut capture = trace.lock().unwrap();
     capture.flush_frames();
     let trace = &capture.trace;

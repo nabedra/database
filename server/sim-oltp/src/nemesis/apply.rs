@@ -29,7 +29,7 @@ use crate::{
     workloads::{
         clauses::{Answer, Effect, Fault},
         clients::{self, Ctx},
-        resources::drain_failed,
+        resources::{disturbs, drain_failed},
     },
 };
 
@@ -381,7 +381,9 @@ impl Chaos {
     /// Nothing else is open, a pending split included, and the cluster reports itself
     /// converged.
     async fn quiet(&self, cluster: &Cluster) -> bool {
-        self.log.iter().all(|fault| fault.to.is_some())
+        // The `resources` overlay cuts, loads and stalls for the whole window.
+        !disturbs(&cluster.world)
+            && self.log.iter().all(|fault| fault.to.is_some())
             && !self.faults.open()
             && cluster.converged().await
     }

@@ -61,8 +61,8 @@ NABEDRA_SIM_WORKLOAD=direct,resources NABEDRA_SEED=1 NABEDRA_SEEDS=1 NABEDRA_SIM
   cargo run --locked --release -p nabedra-sim-oltp --bin nabedra-sim -- run
 ```
 
-`ExactlyOnceRelease` and `ReleaseAfterWork` follow every native lease and Raft log write by name,
-in all workloads that install the probes. A request that a client cuts still runs on the servers,
+The overlay installs the probes, so their rules run too. `ExactlyOnceRelease` and
+`ReleaseAfterWork` follow every native lease and Raft log write by name. A request that a client cuts still runs on the servers,
 as the product intends. Only a deadline or a stop cancels work there, so the seeds with a short
 deadline and many stalls are the ones that abandon native work.
 

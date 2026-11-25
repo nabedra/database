@@ -13,7 +13,9 @@
 //!   every retained charge once".
 //! - ReleaseAfterWork. Design 3.7: "every `GuardReleased` follows its `WorkDone` on the
 //!   trace". OLTP contract, O05/F03: "abort the awaiting future, and assert its CPU/memory and
-//!   native execution ownership remain charged while native work is still live".
+//!   native execution ownership remain charged while native work is still live". The execution
+//!   ownership is the slot's permit: work runs under its lease and its slot, so the slots that
+//!   are free and the work that runs never exceed the slots.
 //! - ResourceBaseline/overlay. Design 3.7: "at quiescence, every `WorkerSharedResources`
 //!   ledger (charged bytes per class, native leases, pending guards, scratch leases, disk
 //!   reservations) and every `RangeClock` pending set is back at baseline". F03 as above.
@@ -63,7 +65,7 @@ pub struct Guards {
 pub struct GuardCounts {
     pub acquired: u64,
     pub released: u64,
-    /// Released without work: the caller gave up before the work was dispatched.
+    /// Native leases released without work: the caller gave up before it was dispatched.
     pub unstarted: u64,
     /// The caller was cancelled before its work returned.
     pub abandoned: u64,
@@ -149,7 +151,9 @@ impl Guards {
                         format!("{at} released {state} {guard} before its work was done"),
                     );
                 }
-                self.counts.unstarted += u64::from(!state.released && !state.started);
+                let unstarted = !state.released && !state.started;
+                self.counts.unstarted +=
+                    u64::from(unstarted && state.kind == GuardKind::NativeLease);
                 state.released = true;
                 self.open.remove(&guard);
             }
@@ -235,6 +239,7 @@ impl std::fmt::Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self.kind {
             GuardKind::NativeLease => "native lease",
+            GuardKind::NativeSlot => "native slot",
             GuardKind::PendingWrite => "pending write",
         })
     }
@@ -326,6 +331,7 @@ mod tests {
     use crate::invariants::STEP;
 
     const LEASE: GuardKind = GuardKind::NativeLease;
+    const SLOT: GuardKind = GuardKind::NativeSlot;
     const WRITE: GuardKind = GuardKind::PendingWrite;
 
     fn acquire(guard: u64, kind: GuardKind) -> Probe {
@@ -365,7 +371,7 @@ mod tests {
 
     #[test]
     fn legal_guards() {
-        for kind in [LEASE, WRITE] {
+        for kind in [LEASE, SLOT, WRITE] {
             // Work that ran, a caller that gave up first, and work that overlaps another.
             assert!(kinds(&[acquire(1, kind), start(1), done(1), release(1)]).is_empty());
             assert!(kinds(&[acquire(1, kind), release(1)]).is_empty());
@@ -457,6 +463,18 @@ mod tests {
         let before = [acquire(1, WRITE), release(1), start(1), done(1)];
         assert_eq!(kinds(&before), [RELEASE_AFTER_WORK]);
         assert_eq!(kinds(&[start(3)]), [RELEASE_AFTER_WORK]);
+        // The lease outlives the work, and its slot does not.
+        let slot = [
+            acquire(1, LEASE),
+            acquire(2, SLOT),
+            start(1),
+            start(2),
+            release(2),
+            done(2),
+            done(1),
+            release(1),
+        ];
+        assert_eq!(kinds(&slot), [RELEASE_AFTER_WORK]);
     }
 
     #[test]
@@ -471,10 +489,15 @@ mod tests {
                 abandoned: true,
             },
             release(2),
+            // A slot that nobody used and a write that another one covered are no reservations.
+            acquire(3, SLOT),
+            release(3),
+            acquire(4, WRITE),
+            release(4),
         ]);
         let counts = GuardCounts {
-            acquired: 2,
-            released: 2,
+            acquired: 4,
+            released: 4,
             unstarted: 1,
             abandoned: 1,
         };

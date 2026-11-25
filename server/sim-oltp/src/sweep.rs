@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use crate::{
     nemesis::Selection,
     panics::PANIC,
-    workload::run_seed,
+    workload::{STAGE_JUDGED, run_seed},
     workloads::{SCENARIOS, Scenarios, Workload, WorkloadChoice, clauses},
 };
 
@@ -579,6 +579,8 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             defect_reports.push(tested.report);
         }
     }
+    let judged = |row: &&ObservedSeed| row.assertions.get(STAGE_JUDGED) == Some(&true);
+    let unjudged = report.seeds.len() - observed.values().filter(judged).count();
     let metrics = observed.values().flat_map(|row| &row.measurements);
     let total_cpu_s = metrics
         .clone()
@@ -629,6 +631,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             workload,
             smoke: setup.workloads.is_smoke(),
             overlay: setup.workloads.overlay(),
+            unjudged,
             scenarios: scenario_assertions,
             assertions,
             unreplayed,
@@ -742,6 +745,8 @@ struct RecordInput {
     workload: String,
     smoke: bool,
     overlay: bool,
+    /// Seeds whose overlay stage was not judged.
+    unjudged: usize,
     /// Scenario tags that executed, and whether every seed that executed one passed.
     scenarios: BTreeMap<&'static str, bool>,
     assertions: BTreeMap<&'static str, bool>,
@@ -826,6 +831,12 @@ fn write_record(
     );
     if input.overlay {
         record.not_run("background Control lane slots", NO_LANE_RULE);
+        if input.unjudged > 0 {
+            record.not_run(
+                "ResourceBaseline/overlay",
+                &format!("not judged in {} of {} seeds", input.unjudged, report.count),
+            );
+        }
     }
     if input.smoke {
         for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {
