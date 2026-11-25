@@ -31,9 +31,12 @@ The search rule. TLC reports an exhaustive search whatever a cfg cuts away, so:
   - VIEW is refused, because it merges states that the properties may tell apart;
   - a cfg may not override a name it checks, its constraints or its INIT, NEXT or SPECIFICATION. Giving a
     declared CONSTANT its value is free. Overriding any other definition, such as Nat, needs a `limit` line;
-  - a mutant cfg is held to the same rule, with the baselines' `limit` lines only. It may change nothing but
-    CONSTANTs, and has to change one where a baseline checks the same property. Otherwise it does not count
-    as caught (mutant_problems).
+  - an override may not replace a definition that a constraint uses, unless by a constant value;
+  - a mutant cfg is held to the same rule, with the baselines' `limit` lines only. It sets the constant Mutant
+    to another value than one baseline, and is like that baseline in every other constant, in INIT, NEXT or
+    SPECIFICATION and in its constraints. It expects a property that this baseline checks and passed. The
+    property does not read Mutant, and the specification's definitions name the mutant's value. Otherwise it
+    does not count as caught (mutant_problems).
 The record lists the declared limits and how many states each constraint kept. What the rule cannot see: a
 variable under an upper bound that is no counter of growth, such as a step counter that every action
 increments, or a protocol phase kept as a number; a CONSTANT value, INIT or NEXT that leaves behavior out.
@@ -135,6 +138,8 @@ _VARIABLE_DECL = re.compile(r"\bVARIABLES?\s+(\w+(?:\s*,\s*\w+)*)")
 _PARAMETERS = r"\((?:[^()=]|\([^()=]*\))*\)|\[(?:[^\[\]=]|\[[^\[\]=]*\])*\]"
 _UNIT = (r"(?:LOCAL|RECURSIVE|VARIABLES?|CONSTANTS?|ASSUME|ASSUMPTION|AXIOM|THEOREM|LEMMA|PROPOSITION|COROLLARY|"
          r"INSTANCE)\b")
+_HEAD = re.compile(rf"(?<!\w)(\w+)\s*({_PARAMETERS})?\s*==(?!=)")
+_NEXT_UNIT = re.compile(rf"^(?:{_UNIT}|\w+[ \t]*(?:{_PARAMETERS})?\s*==(?!=)|-{{4}}|={{4}})", re.M)
 _ORDER_DEFINITION = re.compile(r"^[ \t]*\w+\s*(?:<=|=<|\\leq|<)\s*\w+\s*==(?!=)", re.M)
 _OVERRIDE = re.compile(r"(\w+)\s*<-\s*(?:\[\s*\w+\s*\]\s*)?(\w+)")
 
@@ -235,7 +240,7 @@ class _Bound(_Reader):
 
     def __init__(self, model: "Model", text: str, pos: int, seen: frozenset) -> None:
         super().__init__(model, text, pos)
-        self.seen, self.names = seen, []
+        self.seen, self.names, self.used = seen, [], set()  # used: the definitions it relies on
 
     def read(self) -> None:
         self.body()
@@ -270,6 +275,7 @@ class _Bound(_Reader):
             problem = self.model.bound_problem(token, self.seen)
             if problem:
                 self.refuse(problem)
+            self.used |= {token} | self.model.used[token]
             self.take()
         else:
             self.refuse(f"{token!r} starts no upper bound")
@@ -286,7 +292,7 @@ class _Bound(_Reader):
                 break
         if not self.model.is_constant(self.peek()) and not self.model.is_constant_set(self.peek()):
             self.refuse(f"{self.peek()!r} is not a declared set of constants")
-        self.take()
+        self.used.add(self.take())
         self.expect(":")
         self.body()
         del self.names[count:]
@@ -322,6 +328,10 @@ class Model:
         self.constants: set[str] = set()    # declared in the model module or one it extends
         self.variables: set[str] = set()
         self.problems: list[str] = []
+        self._index: dict[str, list[tuple[str, re.Match]]] | None = None
+        self._regions: dict[str, list[tuple[str, str]]] = {}
+        self.used: dict[str, set[str]] = {}  # what each definition that bound_problem accepted relies on
+        self.full: dict[str, list[str]] = {}  # the lines of each text, with the strings
         todo = [(model.removesuffix(".tla"), True)]
         self.extended: set[str] = set()
         while todo:
@@ -345,14 +355,20 @@ class Model:
             self.texts[name] = text
             header = tla_trace._HEADER.search(raw)
             self.lines[name] = raw.count("\n", 0, header.start() if header else 0) + 1
+            first = self.lines[name] - 1
+            self.full[name] = tc.strip_tla_comments(raw).split("\n")[first:first + len(text.splitlines())]
             self.problems += [f"{name}.tla uses the module {i}" for i in [*extended, *_INSTANCE.findall(text)]
                               if i in _SEARCH_MODULES]
             self.problems += [f"{name}.tla uses {u}" for u in sorted(set(_SEARCH_STATE.findall(text)))]
 
     def places(self, name: str) -> list[tuple[str, re.Match]]:
         """Every definition of the name, anywhere in a line: (module, match up to the body)."""
-        pattern = re.compile(rf"(?<!\w){re.escape(name)}\s*({_PARAMETERS})?\s*==(?!=)")
-        return [(module, m) for module, text in self.texts.items() for m in pattern.finditer(text)]
+        if self._index is None:
+            self._index = {}
+            for module, text in self.texts.items():
+                for m in _HEAD.finditer(text):
+                    self._index.setdefault(m.group(1), []).append((module, m))
+        return self._index.get(name, [])
 
     def defines(self, name: str) -> bool:
         return name in self.constants or bool(self.places(name))
@@ -367,7 +383,7 @@ class Model:
         """(module, offset) of the body of the name's only definition, which has no parameters and is in the model
         module or one it extends."""
         places = self.places(name)
-        if len(places) != 1 or places[0][0] not in self.extended or places[0][1].group(1):
+        if len(places) != 1 or places[0][0] not in self.extended or places[0][1].group(2):
             return None
         return places[0][0], places[0][1].end()
 
@@ -395,15 +411,47 @@ class Model:
         if any(_ORDER_DEFINITION.search(text) for text in self.texts.values()):
             return "the model defines its own order operator"
         module, pos = place
+        reader = _Bound(self, self.texts[module], pos, seen | {name})
         try:
-            _Bound(self, self.texts[module], pos, seen | {name}).read()
+            reader.read()
         except _Refused as refused:
             if "; a constraint may" in refused.why:  # from a definition it names
                 return refused.why
             line = self.lines[module] + self.texts[module].count("\n", 0, refused.at)
             return f"{module}.tla line {line}: {refused.why}; {_Bound.ALLOWED}"
+        self.used[name] = reader.used - self.constants
         return None
 
+    def regions(self, name: str) -> list[tuple[str, str]]:
+        """(text without strings, whole lines with them) of every definition of the name. A region ends at a line
+        that starts another definition or unit, but not inside a LET: it may be too long, but not too short."""
+        if name in self._regions:
+            return self._regions[name]
+        out = self._regions[name] = []
+        for module, m in self.places(name):
+            text, end = self.texts[module], m.end()
+            while True:
+                after = _NEXT_UNIT.search(text, end)
+                end = after.start() if after else len(text)
+                words = re.findall(r"\b(?:LET|IN)\b", text[m.start():end])
+                if after is None or words.count("LET") <= words.count("IN"):
+                    break
+                end += 1
+            lines = self.full[module][text.count("\n", 0, m.start()):text.count("\n", 0, end) + (after is None)]
+            out.append((text[m.start():end], "\n".join(lines)))
+        return out
+
+    def closure(self, names: list[str]) -> list[tuple[str, str]]:
+        """The regions of the names and of every definition they may use."""
+        out, todo, seen = [], list(names), set()
+        while todo:
+            name = todo.pop()
+            if name not in seen:
+                seen.add(name)
+                regions = self.regions(name)
+                out += regions
+                todo += {w for text, _ in regions for w in re.findall(r"[A-Za-z_]\w*", text)}
+        return out
 
 def limits_of(cfg: Path) -> dict[str, str]:
     """The names a cfg declares with `\\* limit: <Name> -- <reason>` lines."""
@@ -444,6 +492,10 @@ def search_problems(model: Model, cfg: Path, declared: dict[str, str] | None = N
     problems += [f"the cfg overrides {name} with {target}, which the model's modules do not define"
                  for name, target in _OVERRIDE.findall(text) if not model.defines(target)]
     checked = checked_names(parsed)
+    used = {n for name in parsed.sections.get("CONSTRAINT", []) for n in model.used.get(name, ())}
+    problems += [f"the cfg overrides {name}, which a constraint uses, with {target}, which is no constant value"
+                 for name, target in _OVERRIDE.findall(text) if name in used
+                 and not model.is_constant(target) and not model.is_constant_set(target)]
     for name in dict.fromkeys(parsed.overrides):
         if name in checked:
             problems.append(f"the cfg overrides {name}, which it checks or runs")
@@ -476,26 +528,53 @@ def settings(cfg: Path) -> frozenset[str]:
     return frozenset(" ".join(entry) for entry in out)
 
 
-def mutant_problems(model: Model, cfg: Path, baselines: list[Path]) -> list[str]:
-    """Why this mutant cfg cannot count as caught, whatever TLC says."""
+def _split(cfg: Path) -> tuple[frozenset[str], str | None]:
+    """(every setting but Mutant's value, Mutant's value when it is a plain one)."""
+    entries = settings(cfg)
+    value = [e for e in entries if e.split()[0] == "Mutant"]
+    plain = re.fullmatch(r'Mutant = ("[^"]*"|\w+)', value[0]) if len(value) == 1 else None
+    return entries - set(value), plain.group(1) if plain else None
+
+
+_NOT_PASSED = "did not pass, so no mutant of it can be judged"
+
+
+def mutant_problems(model: Model, cfg: Path, baselines: list[Path], passed: set[str]) -> list[str]:
+    """Why this mutant cfg cannot count as caught, whatever TLC says. `passed` names the baselines that passed."""
     declared = {k: v for baseline in baselines for k, v in limits_of(baseline).items()}
     problems = search_problems(model, cfg, declared)[0]
-    parsed, mine = tc.parse_cfg(cfg), settings(cfg)
+    parsed = tc.parse_cfg(cfg)
+    rest, value = _split(cfg)
+    if value is None or not model.is_constant("Mutant"):
+        return [*problems, "it does not set the CONSTANT Mutant to a plain value"]
+    # A mutant of the property alone shows nothing about the design.
+    if any(re.search(r"\bMutant\b", text) for text, _ in model.regions(parsed.expect or "")):
+        problems.append(f"{parsed.expect} reads Mutant, so the mutant may change the property and not the design")
+    start = [w for entry in rest if entry.split()[0] in _SPECIFICATION for w in entry.split()[1:]]
+    if not any(re.search(rf"(?<![\w\"]){re.escape(value)}(?![\w\"])", full) for _, full in model.closure(start)):
+        problems.append(f"no definition of {' or '.join(start)} names {value}, so the mutant changes no step")
 
-    def spec(entries: frozenset[str]) -> set[str]:
-        return {e for e in entries if e.split()[0] in _SPECIFICATION}
+    def unlike(baseline: Path) -> str | None:
+        base, (other, base_value) = tc.parse_cfg(baseline), _split(baseline)
+        if rest != other:
+            return "it changes " + ", ".join(sorted({e.split()[0] for e in rest ^ other}))
+        if base_value is None or base_value == value:
+            return f"Mutant is {base_value} there too"
+        if set(parsed.sections.get("CONSTRAINT", [])) != set(base.sections.get("CONSTRAINT", [])):
+            return "its constraints differ"
+        if not set(parsed.sections.get("SYMMETRY", [])) <= set(base.sections.get("SYMMETRY", [])):
+            return "its symmetry differs"
+        if parsed.expect not in (*base.invariants, *base.properties, *(["Deadlock"] if base.check_deadlock else [])):
+            return f"it does not check {parsed.expect}"
+        if baseline.name not in passed:
+            return _NOT_PASSED
+        return None
 
-    others = [settings(baseline) for baseline in baselines]
-    if spec(mine) not in [spec(other) for other in others]:
-        problems.append("its INIT, NEXT or SPECIFICATION is no baseline's")
-    for entry in sorted(mine - spec(mine) - frozenset().union(*others)):
-        if entry.split()[0] not in model.constants:
-            problems.append(f"it gives {entry.split()[0]}, which is no declared CONSTANT, another value")
-    for baseline, other in zip(baselines, others):
-        base = tc.parse_cfg(baseline)
-        if mine == other and parsed.expect in (
-                *base.invariants, *base.properties, *(["Deadlock"] if base.check_deadlock else [])):
-            problems.append(f"it changes no constant of {baseline.name}, which checks {parsed.expect} too")
+    reasons = {baseline.name: unlike(baseline) for baseline in baselines}
+    if None not in reasons.values():
+        waiting = [name for name, why in reasons.items() if why == _NOT_PASSED]
+        problems.append(f"{waiting[0]} {_NOT_PASSED}" if waiting else "it is no mutant of a baseline: "
+                        + "; ".join(f"{k}: {v}" for k, v in reasons.items()))
     return problems
 
 
@@ -582,7 +661,7 @@ def run_baseline(rep: Report, spec_dir: Path, model: str, cfg: Path, out: Path, 
 
 
 def run_mutant(rep: Report, spec_dir: Path, model: str, cfg: Path, out: Path, budget: int,
-               workers: str, modules: Model, baselines: list[Path]) -> dict:
+               workers: str, modules: Model, baselines: list[Path], passed: set[str]) -> dict:
     parsed = tc.parse_cfg(cfg)
     name = cfg.name[: -len(".cfg")]
     fact = {"name": name, "expect": parsed.expect or "", "observed": "", "ok": False, "cex_length": None,
@@ -597,10 +676,13 @@ def run_mutant(rep: Report, spec_dir: Path, model: str, cfg: Path, out: Path, bu
         fact["detail"] = f"expects {parsed.expect}, which its cfg does not check"
         rep.check(False, label, fact["detail"])
         return fact
-    problems = mutant_problems(modules, cfg, baselines)
+    problems = mutant_problems(modules, cfg, baselines, passed)
     if problems:
         fact["detail"] = "does not count: " + "; ".join(problems)
-        rep.check(False, label, fact["detail"])
+        if len(problems) == 1 and problems[0].endswith(_NOT_PASSED):
+            rep.skip(label, problems[0])  # the baseline's own result says why
+        else:
+            rep.check(False, label, fact["detail"])
         return fact
     stem = f"mutant-{name}"
     args = ["-workers", workers, "-dumpTrace", "json", f"/out/{stem}.cex.json",
@@ -693,7 +775,9 @@ def design_check(rep: Report, spec_dir: Path, name: str, model: str, out: Path, 
         rep.check(prop in expects, f"mutant rule {prop}",
                   "named by a mutant" if prop in expects else "no mutant expects it, and no `no-mutant` line exempts it")
 
-    mutants = [run_mutant(rep, spec_dir, model, m, out, budget, workers, modules, baselines) for m in mutant_cfgs]
+    passed = {run["cfg"] for run in runs if run["verdict"] == "pass"}
+    mutants = [run_mutant(rep, spec_dir, model, m, out, budget, workers, modules, baselines, passed)
+               for m in mutant_cfgs]
     covered = [n for n in coverage.values()]
     facts.update({
         "distinct_states": distinct, "depth": depth,

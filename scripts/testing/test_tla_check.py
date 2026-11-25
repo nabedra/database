@@ -302,9 +302,13 @@ GOOD = {"TwoPhase.cfg": ["pass", 0], "commit_one_prepared.cfg": ["invariant", 12
 
 
 class CheckOrchestrationTests(unittest.TestCase):
-    def run_fake(self, mapping, drop_mutants=(), extra=(), budget="60", prep=(), **env):
+    def run_fake(self, mapping, drop_mutants=(), extra=(), budget="60", prep=(), spare=None, **env):
+        """`spare` keeps a second baseline as it is, so that the mutants stay mutants of one when `prep` changes
+        the first. It is there by default when there are prep steps."""
         fake = FakeTlc(mapping, drop_mutants, **env)
         self.addCleanup(fake.close)
+        if prep if spare is None else spare:
+            shutil.copy(fake.spec / "TwoPhase.cfg", fake.spec / "TwoPhase.spare.cfg")
         for step in prep:
             step(fake.spec)
         self.fake = fake
@@ -434,7 +438,7 @@ class CheckOrchestrationTests(unittest.TestCase):
             edit(spec / "TwoPhase.cfg", ("INVARIANTS TypeOK Consistent\n", ""), *NO_LIVENESS)
             shutil.rmtree(spec / "mutants")
 
-        self.assert_fails("the baselines check no property", mapping={"TwoPhase.cfg": ["pass", 0]}, prep=[drop])
+        self.assert_fails("the baselines check no property", mapping={"TwoPhase.cfg": ["pass", 0]}, prep=[drop], spare=False)
 
     def test_only_a_type_invariant_with_a_reason_is_exempt(self):
         def only(spec):
@@ -444,16 +448,16 @@ class CheckOrchestrationTests(unittest.TestCase):
         def exempt(line):
             return lambda spec: edit(spec / "TwoPhase.cfg", ("CONSTANTS\n", f"\\* no-mutant: {line}\nCONSTANTS\n"))
 
-        self.assert_fails("no property besides exempted ones", mapping={"TwoPhase.cfg": ["pass", 0]}, prep=[only])
+        self.assert_fails("no property besides exempted ones", mapping={"TwoPhase.cfg": ["pass", 0]}, prep=[only], spare=False)
         for line, fragment in (("Consistent", "gives no reason"), ("Consistent --", "gives no reason"),
                                ("Consistent -- obvious", "only a type invariant"),
                                ("Termination -- obvious", "only a type invariant")):
             with self.subTest(line):
-                self.assert_fails(fragment, prep=[exempt(line)])
-        self.assert_fails("mutant rule TypeOK: its `no-mutant` line gives no reason", prep=[
+                self.assert_fails(fragment, prep=[exempt(line)], spare=False)
+        self.assert_fails("mutant rule TypeOK: its `no-mutant` line gives no reason", spare=False, prep=[
             lambda spec: edit(spec / "TwoPhase.cfg", (" -- the type invariant; every run checks it.", ""))])
         # A property cannot be a type invariant, whatever its name.
-        self.assert_fails("mutant rule TypeLive: only a type invariant", prep=[
+        self.assert_fails("mutant rule TypeLive: only a type invariant", spare=False, prep=[
             exempt("TypeLive -- x"),
             lambda spec: edit(spec / "TwoPhase.cfg", ("PROPERTIES Termination", "PROPERTIES Termination TypeLive"))])
 
@@ -698,18 +702,23 @@ class CheckOrchestrationTests(unittest.TestCase):
     def layout(rng, tokens):
         return "".join(rng.choice([" ", " ", "\n  ", "\n", "  "]) + t for t in tokens)
 
-    def fuzz_model(self, bodies):
-        """bound_problem of every body, in one module."""
-        with tempfile.TemporaryDirectory() as d:
+    def fuzz(self, bodies):
+        """bound_problem of every body. Each is alone in a module with a body that must be accepted, and without the
+        rules about the rest of the model, so that nothing but the grammar can refuse it."""
+        out = []
+        with tempfile.TemporaryDirectory() as d, patch.object(tla_check, "_ORDER_DEFINITION", re.compile("(?!)")):
             (Path(d) / "Ext.tla").write_text(self.EXT)
-            (Path(d) / "M.tla").write_text(self.MODULE + "".join(f"Q{i} =={b}\n" for i, b in enumerate(bodies)) + "After == n\n====\n")
-            model = tla_check.Model(Path(d), "M.tla")
-            return [model.bound_problem(f"Q{i}") for i in range(len(bodies))]
+            for body in bodies:
+                (Path(d) / "M.tla").write_text(f"{self.MODULE}Control ==\n  /\\ Sub\n  /\\ \\A s \\in Both : Len(log[s]) <= Max\nFew =={body}\nAfter == n\n====\n")
+                model = tla_check.Model(Path(d), "M.tla")
+                self.assertIsNone(model.bound_problem("Control"), body)
+                out.append(model.bound_problem("Few"))
+        return out
 
     def test_fuzz_bodies_outside_the_grammar(self):
         rng = random.Random(20261125)
         bodies = [self.layout(rng, self.valid(rng)) for _ in range(150)]
-        self.assertEqual([b for b, p in zip(bodies, self.fuzz_model(bodies)) if p], [])
+        self.assertEqual([b for b, p in zip(bodies, self.fuzz(bodies)) if p], [])
         foreign = ["\\/", "\\lor", "=", "#", "/=", "~", "=>", "<=>", "\\equiv", "+", "-", "*", "..", "'", ".", "!", "@", "|", "|->", "->", "{", "}", "[", "]",
                    "(", ")", ",", ":", ">", ">=", "\\geq", "\\E", "\\notin", "\\cup", "\\subseteq", "<<", ">>", "[]", "<>", '"x"', "TRUE", "IF", "THEN", "ELSE",
                    "CASE", "OTHER", "LET", "IN", "CHOOSE", "LAMBDA", "ENABLED", "UNCHANGED", "DOMAIN", "SUBSET", "EXCEPT", "up", "Cap", "Dyn", "Less", "Loop",
@@ -727,11 +736,9 @@ class CheckOrchestrationTests(unittest.TestCase):
             if kind == 0:
                 tokens.insert(rng.randrange(len(tokens) + 1), rng.choice(foreign))
             elif kind == 1:
-                # Another number is a limit too, and another name may be bound.
-                if tokens[at] in ("s", "t", "u") or tokens[at] in ("1", "42", "Max", "Own"):
-                    tokens[at] = rng.choice([f for f in foreign if not f.isidentifier() and f != "5"])
-                else:
-                    tokens[at] = rng.choice(foreign)
+                # Another number is a limit too, another name may be bound, and another variable is a counter.
+                names = ("s", "t", "u", "1", "42", "Max", "Own", "n", "m", "log", "ext")
+                tokens[at] = rng.choice([f for f in foreign if tokens[at] not in names or not f.isidentifier() and f != "5"])
             elif kind == 2:
                 if tokens[at] in ("/\\", "\\land", "Sub", "ExtBound"):  # a leading "and" may go, and a bound before one
                     continue
@@ -742,9 +749,7 @@ class CheckOrchestrationTests(unittest.TestCase):
                 bad.append(" " + form.format(*[body] * form.count("{}")).replace("\n", rng.choice(["\n", "\n  "])))
                 continue
             bad.append(self.layout(rng, tokens))
-        for start in range(0, len(bad), 150):
-            part = bad[start:start + 150]
-            self.assertEqual([b for b, p in zip(part, self.fuzz_model(part)) if p is None], [])
+        self.assertEqual([b for b, p in zip(bad, self.fuzz(bad)) if p is None], [])
 
     def test_an_override_cannot_bring_in_the_search_state(self):
         def model(*definitions):
@@ -775,34 +780,31 @@ class CheckOrchestrationTests(unittest.TestCase):
         code, _, text = self.run_fake(GOOD, FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]), prep=[*model(), override("Lvl <- MaxDrops")])
         self.assertEqual(code, 0, text)
 
-    def test_a_mutant_is_held_to_the_search_rule(self):
-        def mutant(*lines, cfg="no_resend.cfg", also=()):
-            return lambda spec: edit(spec / "mutants" / cfg, ("SPECIFICATION Spec\n", "SPECIFICATION Spec\n" + "\n".join(lines) + "\n"), *also)
+    @staticmethod
+    def in_cfg(name, *pairs):
+        return lambda spec: edit(spec / name, *pairs)
 
+    def mutant(self, *pairs, cfg="no_resend.cfg"):
+        return self.in_cfg(f"mutants/{cfg}", *pairs)
+
+    def test_a_mutant_is_held_to_the_search_rule(self):
         few = add_to_model("Few == crashes <= 1", "V == rmState", "Bad == tmUp", "Inner == tmUp")
         for lines, why in ((["VIEW V"], "VIEW V merges states"), (["ACTION_CONSTRAINT Few"], "ACTION_CONSTRAINT Few removes steps"),
                            (["CONSTRAINT Few"], "CONSTRAINT Few has no `\\* limit: Few"),
                            (["CONSTRAINT Bad", "\\* limit: Bad -- x"], "CONSTRAINT Bad: "), (["ALIAS TLCGet"], "the cfg uses TLCGet"),
                            (["CONSTRAINT Few", self.COUNTERS], "CONSTRAINT Few has no `\\* limit: Few"),
-                           (["SPECIFICATION Weak"], "its INIT, NEXT or SPECIFICATION is no baseline's"),
-                           (["CONSTANT Inner <- Bad", "\\* limit: Inner -- x"], "override Inner has no `\\* limit: Inner"),
-                           (["CONSTANT Inner <- Bad"], "it gives Inner, which is no declared CONSTANT, another value")):
+                           (["CONSTANT Inner <- Bad", "\\* limit: Inner -- x"], "override Inner has no `\\* limit: Inner")):
             with self.subTest(lines):
-                summary = self.assert_fails("mutant no_resend: does not count: ", why, prep=[few, mutant(*lines)])
+                summary = self.assert_fails("mutant no_resend: does not count: ", why, prep=[
+                    few, self.mutant(("SPECIFICATION Spec\n", "SPECIFICATION Spec\n" + "\n".join(lines) + "\n"))])
                 self.assertEqual([m["ok"] for m in summary["tla"]["mutants"]], [True, False])
                 self.assertEqual(summary["tla"]["mutants"][1]["observed"], "")  # TLC did not run
-        # An override of the baselines counts in a mutant, and another target for it does not.
-        declared = lambda spec: edit(spec / "TwoPhase.cfg", ("CONSTANTS\n", "\\* limit: Nat -- finite\nCONSTANTS\n    Nat <- Good\n"))
-        define = add_to_model("Good == 0..3", "Other == 0..2")
-        in_mutants = lambda target: [lambda spec, m=m: edit(spec / "mutants" / m, ("CONSTANTS\n", f"CONSTANTS\n    Nat <- {target}\n"))
-                                     for m in ("no_resend.cfg", "commit_one_prepared.cfg")]
-        code, _, text = self.run_fake(GOOD, prep=[declared, define, *in_mutants("Good")])
-        self.assertEqual(code, 0, text)
-        self.assert_fails("it gives Nat, which is no declared CONSTANT, another value", failed=2, prep=[declared, define, *in_mutants("Other")])
-        # With the baseline's constraint and its declaration it counts, where liveness is not at stake.
-        safety = [safety_only, few, add_to_cfg("CONSTRAINT Few", self.COUNTERS), mutant("CONSTRAINT Few", cfg="commit_one_prepared.cfg")]
-        code, summary, text = self.run_fake(GOOD, prep=[*safety, lambda spec: edit(
-            spec / "mutants" / "commit_one_prepared.cfg", *NO_LIVENESS)], FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]))
+        # With the baseline's constraint, its declaration and its override it counts, where liveness is not at stake.
+        safety = [safety_only, few, add_to_model("Good == 0..3"), add_to_cfg("CONSTRAINT Few", self.COUNTERS, "\\* limit: Nat -- finite"),
+                  self.in_cfg("TwoPhase.cfg", ("CONSTANTS\n", "CONSTANTS\n    Nat <- Good\n")),
+                  self.mutant(("CONSTANTS\n", "CONSTANTS\n    Nat <- Good\n"), ("SPECIFICATION Spec\n", "SPECIFICATION Spec\nCONSTRAINT Few\n"),
+                              *NO_LIVENESS, cfg="commit_one_prepared.cfg")]
+        code, summary, text = self.run_fake(GOOD, prep=safety, FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]))
         self.assertEqual(code, 0, text)
 
     def test_a_mutant_caught_by_a_limited_liveness_check_does_not_count(self):
@@ -810,58 +812,151 @@ class CheckOrchestrationTests(unittest.TestCase):
         summary = self.assert_fails("mutant no_resend: liveness property Termination violated", "it does not count: liveness under SYMMETRY",
                                     FAKE_TLC_EDIT=json.dumps([["@!@!@STARTMSG 2116", warning]]))
         self.assertEqual([m["ok"] for m in summary["tla"]["mutants"]], [True, False])
-        # A constraint that the baseline declares does not help where the mutant checks liveness.
-        self.assert_fails("mutant no_resend: liveness property Termination violated", "it does not count: liveness under the constraint Few",
-                          prep=[add_to_model("Few == crashes <= 1"),
-                                lambda spec: edit(spec / "TwoPhase.cfg", ("CONSTANTS\n", self.COUNTERS + "\nCONSTANTS\n")),
-                                lambda spec: edit(spec / "mutants" / "no_resend.cfg", ("SPECIFICATION Spec\n", "SPECIFICATION Spec\nCONSTRAINT Few\n"))])
+        # A constraint that a baseline declares does not help where the mutant checks liveness. The baseline's own
+        # run has no liveness message here.
+        with patch.object(tla_check, "liveness_problem", side_effect=lambda log, parsed, real=tla_check.liveness_problem:
+                          real(log, parsed) if parsed.expect else None):
+            self.assert_fails("mutant no_resend: liveness property Termination violated", "it does not count: liveness under the constraint Few",
+                              prep=[add_to_model("Few == crashes <= 1"), add_to_cfg("CONSTRAINT Few", self.COUNTERS),
+                                    self.mutant(("SPECIFICATION Spec\n", "SPECIFICATION Spec\nCONSTRAINT Few\n"))])
 
-    def test_a_mutant_that_changes_nothing_does_not_count(self):
-        def same(cfg, *pairs):
-            return lambda spec: edit(spec / "mutants" / cfg, *pairs)
-
+    def test_a_mutant_sets_only_the_mutant_constant(self):
+        """It sets Mutant to another value than a baseline, and is like it otherwise."""
+        fails = "it is no mutant of a baseline: TwoPhase.cfg: "
         none = ('Mutant = "no_resend"', 'Mutant = "none"')
-        for pairs in ([none], [none, ("CONSTANTS\n", "CONSTANT\n")], [none, ("    MaxDrops = 1\n", ""), ("MaxCrashes = 1", "MaxDrops=1 MaxCrashes = 1")],
-                      [none, ("PROPERTIES Termination", "PROPERTY Termination CHECK_DEADLOCK FALSE")]):
+        spec = "SPECIFICATION Spec\n"
+        for pairs, why in (
+                ([none], 'Mutant is "none" there too'),
+                ([none, ("CONSTANTS\n", "CONSTANT\n")], 'Mutant is "none" there too'),
+                ([none, ("    MaxDrops = 1\n", ""), ("MaxCrashes = 1", "MaxDrops=1 MaxCrashes = 1")], 'Mutant is "none" there too'),
+                ([none, ("MaxDrops = 1", "MaxDrops = 2")], "it changes MaxDrops"),
+                ([("MaxDrops = 1", "MaxDrops = 2")], "it changes MaxDrops"),
+                ([("MaxDrops = 1", "MaxDrops = {1, 2}")], "it changes MaxDrops"),
+                ([("    MaxDrops = 1\n", "")], "it changes MaxDrops"),
+                ([("RM <- MCRM", "RM <- MCRMLarge")], "it changes RM"),
+                ([("RM <- MCRM", 'RM = {"r1"}')], "it changes RM"),
+                ([("MaxDrops = 1", 'MaxDrops = 1\n    Other = "x"')], "it changes Other"),
+                ([(spec, "SPECIFICATION Weak\n")], "it changes SPECIFICATION"),
+                ([(spec, "INIT Init\nNEXT Next\n")], "it changes INIT, NEXT, SPECIFICATION"),
+                ([(spec, spec + "SYMMETRY Sym\n")], "its symmetry differs"),
+        ):
             with self.subTest(pairs):
-                self.assert_fails("it changes no constant of TwoPhase.cfg, which checks Termination too",
-                                  prep=[same("no_resend.cfg", *pairs)])
-        # The review's case: the correct spec, and a VIEW that makes TLC see a violation.
-        self.assert_fails("it changes no constant", "VIEW V merges states", prep=[
-            add_to_model("V == <<tmDecision, crashes>>"), same("no_resend.cfg", none, ("SPECIFICATION Spec\n", "SPECIFICATION Spec\nVIEW V\n"))])
-        # Another INIT, NEXT or SPECIFICATION is another design, not a mutant of this one.
-        for new in ("SPECIFICATION Weak", "INIT Init\nNEXT Next", "INIT Init\nNEXT Next\nSPECIFICATION Spec"):
-            self.assert_fails("its INIT, NEXT or SPECIFICATION is no baseline's", prep=[same("no_resend.cfg", ("SPECIFICATION Spec", new))])
-        # A baseline may have one too, and then a mutant may use it.
-        second = lambda spec: (spec / "TwoPhase.more.cfg").write_text(
-            (spec / "TwoPhase.cfg").read_text().replace("SPECIFICATION Spec", "INIT Init\nNEXT Next").replace("PROPERTIES Termination\n", ""))
-        code, _, text = self.run_fake(GOOD, prep=[second, same("commit_one_prepared.cfg", ("SPECIFICATION Spec", "INIT Init\nNEXT Next"))])
-        self.assertEqual(code, 0, text)
-        # Any other constant counts as a change, and so does a property that the baselines do not check.
-        for pairs in ([none, ("MaxDrops = 1", "MaxDrops = 2")], [none, ("RM <- MCRM", "RM <- MCRMLarge")],
-                      [none, ("MaxDrops = 1", "MaxDrops = {1, 2}")]):
+                # The definitions have to name the value, which is not at stake here.
+                self.assert_fails("mutant no_resend: does not count: ", fails + why, spare=False, prep=[self.mutant(*pairs), self.in_cfg("TwoPhase.tla", ("vars ==", 'Note == "none"\nvars ==')),
+                                                     self.in_cfg("TwoPhase.tla", ("Spec ==", "Weak == Spec /\\ Note = Note\nSpec =="))])
+        plain = "mutant no_resend: does not count: it does not set the CONSTANT Mutant to a plain value"
+        for pairs in ([('    Mutant = "no_resend"\n', "")], [('Mutant = "no_resend"', "Mutant <- MCMutant")], [('Mutant = "no_resend"', 'Mutant = {"no_resend"}')],
+                      [('Mutant = "no_resend"', 'Mutant = "no_resend"\n    Mutant = "none"')]):
             with self.subTest(pairs):
-                code, _, text = self.run_fake(GOOD, prep=[same("no_resend.cfg", *pairs)])
-                self.assertEqual(code, 0, text)
-        reach = ("@!@!@STARTMSG 2110:1 @!@!@\nInvariant Consistent", "@!@!@STARTMSG 2110:1 @!@!@\nInvariant NotReached")
-        code, summary, text = self.run_fake({**GOOD, "reach.cfg": ["invariant", 12], "commit_one_prepared.cfg": ["liveness", 13],
-                                             "no_resend.cfg": ["liveness", 13]}, FAKE_TLC_EDIT=json.dumps([reach]), prep=[
-            lambda spec: (spec / "mutants" / "reach.cfg").write_text(
-                (spec / "mutants" / "no_resend.cfg").read_text().replace("expect: Termination", "expect: NotReached").replace(*none)
-                .replace("INVARIANTS TypeOK", "INVARIANTS NotReached TypeOK")), same("commit_one_prepared.cfg", ("expect: Consistent", "expect: Termination"))])
-        reached = next(m for m in summary["tla"]["mutants"] if m["name"] == "reach")
-        self.assertEqual((reached["ok"], reached["observed"]), (True, "NotReached"), text)
+                self.assert_fails(plain, prep=[add_to_model('MCMutant == "no_resend"'), self.mutant(*pairs)], spare=False)
+        # Mutant has to be a CONSTANT of the model.
+        self.assert_fails("it does not set the CONSTANT Mutant to a plain value", failed=3, spare=False,
+                          prep=[self.in_cfg("TwoPhase.tla", ("    Mutant       \\*", "    Mutant2      \\*"))])
+        # A constraint of the baseline belongs to the mutant, and the other way round.
+        few = [add_to_model("Few == crashes <= 1"), safety_only]
+        self.assert_fails("mutant commit_one_prepared: does not count", "its constraints differ", failed=2, FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]),
+                          prep=[*few, add_to_cfg("CONSTRAINT Few", self.COUNTERS)], spare=False)
+        self.assert_fails("mutant commit_one_prepared: does not count", "its constraints differ", failed=1, FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]),
+                          prep=[few[0], self.in_cfg("TwoPhase.cfg", ("CONSTANTS\n", self.COUNTERS + "\nCONSTANTS\n")),
+                                self.mutant(("SPECIFICATION Spec\n", "SPECIFICATION Spec\nCONSTRAINT Few\n"), cfg="commit_one_prepared.cfg")], spare=False)
 
-    def test_a_deadlock_mutant_must_change_something_too(self):
-        for check, counts in (("CHECK_DEADLOCK TRUE", False), ("CHECK_DEADLOCK FALSE", True)):
+    def test_a_mutants_property_is_one_its_baseline_checks_and_passes(self):
+        # Another baseline's property: the mutant is like the main baseline, which does not check it.
+        small = lambda spec: (spec / "TwoPhase.small.cfg").write_text((spec / "TwoPhase.cfg").read_text().replace("MaxCrashes = 1", "MaxCrashes = 0")
+                                                                    .replace("INVARIANTS TypeOK", "INVARIANTS NoCrash TypeOK"))
+        probe = lambda name, value: lambda spec: (spec / "mutants" / f"{name}.cfg").write_text(
+            (spec / "mutants" / "no_resend.cfg").read_text().replace("expect: Termination", "expect: NoCrash").replace('"no_resend"', f'"{value}"')
+            .replace("INVARIANTS TypeOK", "INVARIANTS NoCrash TypeOK"))
+        crash = json.dumps([["Invariant Consistent is violated", "Invariant NoCrash is violated"]])
+        mapping = {**GOOD, "vacuous.cfg": ["invariant", 12], "commit_one_prepared.cfg": ["liveness", 13]}
+        other = self.mutant(("expect: Consistent", "expect: Termination"), cfg="commit_one_prepared.cfg")
+        for value, why in (("none", 'TwoPhase.cfg: Mutant is "none" there too; TwoPhase.small.cfg: it changes MaxCrashes'),
+                           ("no_resend", "TwoPhase.cfg: it does not check NoCrash; TwoPhase.small.cfg: it changes MaxCrashes")):
+            with self.subTest(value):
+                _, summary, text = self.run_fake(mapping, FAKE_TLC_EDIT=crash, spare=False, prep=[
+                    add_to_model("NoCrash == crashes = 0"), small, probe("vacuous", value), other])
+                self.assertIn(why, text)
+                self.assertFalse(next(m for m in summary["tla"]["mutants"] if m["name"] == "vacuous")["ok"])
+        # A larger bound that the unmutated design breaks.
+        self.assert_fails("it changes MaxCrashes", prep=[self.mutant(('"no_resend"', '"none"'), ("MaxCrashes = 1", "MaxCrashes = 2"))])
+        # A baseline that did not finish: its mutants wait for it. One that failed is the failure itself.
+        for fx, want, code in (("time_budget", "not-run", 0), ("invariant", "fail", 12)):
+            got, summary, text = self.run_fake({**GOOD, "TwoPhase.cfg": [fx, code]})
+            self.assertEqual((summary["verdict"], summary["failed"]), (want, 0 if want == "not-run" else 1), text)
+            self.assertIn("not-run mutant no_resend: TwoPhase.cfg did not pass, so no mutant of it can be judged", text)
+            self.assertEqual([m["ok"] for m in summary["tla"]["mutants"]], [False, False])
+        # Not when something else is wrong with the mutant too.
+        self.assert_fails("mutant no_resend: does not count: VIEW V merges states; TwoPhase.cfg did not pass", mapping={**GOOD, "TwoPhase.cfg": ["time_budget", 0]},
+                          prep=[add_to_model("V == rmState"), self.mutant(("SPECIFICATION Spec\n", "SPECIFICATION Spec\nVIEW V\n"))], spare=False)
+        # With two baselines, one that passed is enough.
+        code, summary, text = self.run_fake({**GOOD, "TwoPhase.cfg": ["time_budget", 0]}, spare=True)
+        self.assertEqual((summary["verdict"], [m["ok"] for m in summary["tla"]["mutants"]]), ("not-run", [True, True]), text)
+
+    def test_a_mutant_of_the_property_alone_does_not_count(self):
+        same = self.in_cfg("TwoPhase.cfg", ("INVARIANTS TypeOK", "INVARIANTS Safe TypeOK"))
+        mutant = lambda spec: (spec / "mutants" / "vacuous.cfg").write_text(
+            (spec / "mutants" / "no_resend.cfg").read_text().replace("expect: Termination", "expect: Safe").replace('"no_resend"', '"x"')
+            .replace("INVARIANTS TypeOK", "INVARIANTS Safe TypeOK"))
+        edits = json.dumps([["Invariant Consistent is violated", "Invariant Safe is violated"]])
+        mapping = {**GOOD, "vacuous.cfg": ["invariant", 12], "commit_one_prepared.cfg": ["liveness", 13]}
+        other = self.mutant(("expect: Consistent", "expect: Termination"), cfg="commit_one_prepared.cfg")
+        for definitions, why in (
+                (['Safe == crashes = 1 => Mutant # "x"'], "Safe reads Mutant, so the mutant may change the property"),
+                (['Helper == Mutant # "x"', "Safe == crashes = 1 => Helper"], 'no definition of Spec names "x", so the mutant changes no step'),
+                (["Safe == crashes <= 1"], 'no definition of Spec names "x", so the mutant changes no step'),
+                (["Safe == LET a == 1\n  IN crashes = a =>\n  Mutant # \"y\""], "Safe reads Mutant")):
+            with self.subTest(definitions):
+                _, summary, text = self.run_fake(mapping, FAKE_TLC_EDIT=edits, prep=[add_to_model(*definitions), same, mutant, other], spare=False)
+                self.assertIn(why, text)
+                self.assertFalse(next(m for m in summary["tla"]["mutants"] if m["name"] == "vacuous")["ok"])
+        # Named by a step, directly or through definitions of other modules, it counts.
+        step = self.in_cfg("TwoPhase.tla", ("TMCrash ==\n", 'TMCrash ==\n    /\\ Allowed\n'))
+        for helper in ('Allowed ==\n  LET m == Mutant\nIN m # "x"', 'Allowed == Deep\nDeep == IF Mutant = "x" THEN TRUE ELSE TRUE'):
+            with self.subTest(helper):
+                _, summary, text = self.run_fake(mapping, FAKE_TLC_EDIT=edits, prep=[
+                    add_to_model("Safe == crashes <= 1"), same, mutant, other, step, self.in_cfg("TwoPhase.tla", ("vars ==", helper + "\nvars =="))], spare=False)
+                self.assertTrue(next(m for m in summary["tla"]["mutants"] if m["name"] == "vacuous")["ok"], text)
+        # A longer name does not name it, nor does a comment.
+        for helper in ('Allowed == Mutant # "xy"', 'Allowed == TRUE \\* "x"', 'Allowed == TRUE (* "x" *)'):
+            _, summary, text = self.run_fake(mapping, FAKE_TLC_EDIT=edits, prep=[
+                add_to_model("Safe == crashes <= 1"), same, mutant, other, step, self.in_cfg("TwoPhase.tla", ("vars ==", helper + "\nvars =="))], spare=False)
+            self.assertIn('names "x", so the mutant changes no step', text)
+
+    def test_a_deadlock_mutant_is_one_of_a_baseline_that_checks_deadlock(self):
+        for check, counts in (("CHECK_DEADLOCK TRUE", True), ("CHECK_DEADLOCK FALSE", False)):
             with self.subTest(check):
-                _, summary, text = self.run_fake({**GOOD, "stuck.cfg": ["deadlock", 11]}, prep=[
+                _, summary, text = self.run_fake({**GOOD, "stuck.cfg": ["deadlock", 11]}, spare=False, prep=[
                     lambda spec: (spec / "mutants" / "stuck.cfg").write_text(
-                        (spec / "mutants" / "no_resend.cfg").read_text().replace("expect: Termination", "expect: Deadlock")
-                        .replace('"no_resend"', '"none"')),
-                    lambda spec: edit(spec / "TwoPhase.cfg", ("CHECK_DEADLOCK TRUE", check))])
+                        (spec / "mutants" / "no_resend.cfg").read_text().replace("expect: Termination", "expect: Deadlock")),
+                    self.in_cfg("TwoPhase.cfg", ("CHECK_DEADLOCK TRUE", check))])
                 stuck = next(m for m in summary["tla"]["mutants"] if m["name"] == "stuck")
                 self.assertEqual(stuck["ok"], counts, text)
+
+    # An override may not replace what a constraint uses.
+
+    def test_an_override_of_what_a_constraint_uses_fails(self):
+        def cfg(name, target):
+            return [add_to_cfg("CONSTRAINT Few", self.COUNTERS, f"\\* limit: {name} -- a bound"),
+                    self.in_cfg("TwoPhase.cfg", ("CONSTANTS\n", f"CONSTANTS\n    {name} {target}\n"))]
+
+        bound = ["Sub == crashes < 9", 'Mine == rmState["r1"] # "committed"', "Deep == crashes < 8", "Twice == Deep /\\ crashes < 9"]
+        sets = ["CONSTANTS a1, b1", "Dom == {a1}", 'Dyn == IF tmUp THEN {a1} ELSE {}', "Fixed == {a1} \\cup {b1}"]
+        for definitions, few, name, target in ((bound, "Few == Sub", "Sub", "<- Mine"), (bound, "Few == Twice", "Twice", "<- Sub"), (bound, "Few == Twice", "Deep", "<- Mine"),
+                                               (bound, "Few == (crashes < 3 /\\ Twice)", "Deep", "<- [MCTwoPhase] Mine"),
+                                               (sets, "Few == \\A s \\in Dom : crashes < 5", "Dom", "<- Dyn")):
+            with self.subTest(few=few, target=target):
+                self.assert_fails(f"the cfg overrides {name}, which a constraint uses, with ", FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]),
+                                  prep=[safety_only, add_to_model(*definitions, few), *cfg(name, target)])
+        # A constant value is no state.
+        for target in ("<- Fixed", "<- RM", "= {}"):
+            with self.subTest(target):
+                code, _, text = self.run_fake(GOOD, FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]), prep=[
+                    safety_only, add_to_model(*sets, "Few == \\A s \\in Dom : crashes < 5"), *cfg("Dom", target)])
+                self.assertEqual(code, 0, text)
+        # A definition that no constraint of this cfg uses may be replaced, with its limit line.
+        code, _, text = self.run_fake(GOOD, FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]), prep=[
+            safety_only, add_to_model(*bound, "Few == Sub"), *cfg("Deep", "<- Mine")])
+        self.assertEqual(code, 0, text)
 
     def test_depth_limit_and_state_cap_fail(self):
         for body in ('TLCGet("level") < 9', 'TLCGet("distinct") < 800', 'TLCGet("stats").diameter < 5',
@@ -927,7 +1022,7 @@ class CheckOrchestrationTests(unittest.TestCase):
         warning = ("@!@!@STARTMSG 2279:3 @!@!@\nDeclaring symmetry during liveness checking is dangerous.\n"
                    "@!@!@ENDMSG 2279 @!@!@\n@!@!@STARTMSG 2193:0")
         self.assert_fails("liveness under SYMMETRY", FAKE_TLC_EDIT=json.dumps([["@!@!@STARTMSG 2193:0", warning]]),
-                          prep=[add_to_cfg("SYMMETRY Sym")])
+                          prep=[add_to_cfg("SYMMETRY Sym")], spare=False)
         # A symmetry set in a safety run is fine: TLC does not warn.
         code, _, text = self.run_fake(GOOD, prep=[safety_only, add_to_cfg("SYMMETRY Sym")],
                                       FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]))
@@ -959,9 +1054,8 @@ class CheckOrchestrationTests(unittest.TestCase):
         for lines, name in ((("INIT Init", "NEXT Next"), "Init"), (("INIT Init", "NEXT Next"), "Next"),
                             (("POSTCONDITION Post",), "Post"), (("CONSTRAINT Few", "\\* limit: Few -- x"), "Few")):
             with self.subTest(name):
-                # The mutants run SPECIFICATION, so they are no mutants of a baseline with INIT and NEXT.
                 self.assert_fails(f"the cfg overrides {name}, which it checks or runs", FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]),
-                                  failed=3 if name in ("Init", "Next") else 1, prep=[add_to_model("Mine == 1", "Post == TRUE", "Few == crashes <= 1"), add_to_cfg(*lines),
+                                  prep=[add_to_model("Mine == 1", "Post == TRUE", "Few == crashes <= 1"), add_to_cfg(*lines),
                                         override(f"{name} <- Mine")])
         # A mutant must check the same property as the baseline.
         for name in ("Len", "Cardinality", "crashes"):
@@ -993,7 +1087,7 @@ class CheckOrchestrationTests(unittest.TestCase):
         mapping = {**GOOD, **{f"z{i:02d}.cfg": ["invariant", 12] for i in range(60)},
                    **{f"TwoPhase.v{i:02d}.cfg": ["pass", 0] for i in range(25)},
                    "z55.cfg": ["pass", 0], "TwoPhase.v24.cfg": ["invariant", 12]}
-        summary = self.assert_fails("mutant z55: no violation", failed=2, mapping=mapping, prep=[many])
+        summary = self.assert_fails("mutant z55: no violation", failed=2, mapping=mapping, prep=[many], spare=False)
         tla = summary["tla"]
         self.assertEqual((len(tla["mutants"]), len(tla["runs"])), (62, 26))
         self.assertEqual([m["name"] for m in tla["mutants"] if not m["ok"]], ["z55"])

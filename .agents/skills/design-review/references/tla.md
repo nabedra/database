@@ -107,9 +107,9 @@ its expected property. A mutant that fails with an error, or on a
 different property, does not count.
 
 An invariant that is already false in an initial state does not count
-either: no step of the mutant breaks it. Nor does one whose configuration
-changes nothing, or [limits the search](#limits-on-the-search) as no
-baseline may.
+either: no step of the mutant breaks it. A mutant changes nothing but the
+constant `Mutant`. [Limits on the search](#limits-on-the-search) says what
+else keeps one from counting.
 
 Every invariant and property of a baseline needs a mutant, and a spec
 whose baselines check none fails. Only a type invariant, an invariant with
@@ -134,7 +134,8 @@ and everything else is refused, with the line and what is allowed.
 | `SYMMETRY` or a constraint with a liveness property | Fails in an exhaustive run, where TLC reports whether it checks liveness. TLC does not report it in a simulation, so the runner does not see it there. A simulation never makes a T cell green. Use a separate `<Name>.live.cfg` without them. Action properties such as `[][A]_vars` are safety, so they may stay |
 | `VIEW` | Fails. It merges states, and TLC does not check that the merge is sound |
 | An override (`Op <- X` or `Op = x`) | `X` must be defined in the model's own modules, not in a standard one. A declared `CONSTANT` is free. Overriding a property, a constraint, a variable, `Len`, `Cardinality`, or the `INIT`, `NEXT` or `SPECIFICATION` it runs fails. Overriding another definition, such as `Nat`, needs a `limit` line |
-| A mutant configuration | The same rules, with the baselines' `limit` lines only. A mutant may change nothing but declared `CONSTANT`s, and must change one when a baseline checks the same property. It runs a baseline's `INIT`, `NEXT` or `SPECIFICATION`. Otherwise it does not count as caught |
+| An override of a definition that a constraint uses | Fails, unless the new value is a `CONSTANT` or a set of constants |
+| A mutant configuration | The same rules, with the baselines' `limit` lines only. It sets `Mutant` to another value than one baseline and is like that baseline in every other constant, in `INIT`, `NEXT` or `SPECIFICATION` and in its constraints. Its symmetry is the baseline's or none. It expects a property that this baseline checks and passes. The property's definition does not read `Mutant`, and a definition that `INIT`, `NEXT` or `SPECIFICATION` uses names the mutant's value. Otherwise it does not count as caught |
 
 The grammar of a constraint. `VARIABLE` and `CONSTANT` are names that the
 model module, or one it extends, declares and nothing defines.
