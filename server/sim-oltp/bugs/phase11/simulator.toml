@@ -17,8 +17,7 @@
 # Count (2026-11-25). Nine rows have nothing in their manifest that keeps a hit from counting: 2, 3, 5, 6, 9, 10, 11, 13, 16. Row 5 only
 # through QueueRetention. Five rows are held: 7, 14, 15, 19, 20. Two patches are partial: 17, 18. One is not sensitive: 22.
 # Rows 1, 8, 12, 21 (and 7, 14, 22) have no rule. Row 4 has no allowed text. Rows 4 and 15 are blocked and 19 looks
-# unreachable (read, not run). No resource-release-order row (19 to 22) can count. The bar is 15. Main's tool refuses the
-# manifests of rows 4, 5, 6, 8, 10, 11, 15, 16 and 17 until it knows `probe`, `needs_server` and `recovery-suite`.
+# unreachable (read, not run). No resource-release-order row (19 to 22) can count. The bar is 15.
 #
 # reach: reachable (workload only), needs-workload, needs-client, needs-invariant, needs-probe,
 # needs-trigger, needs-fault, needs-hook, narrower or partly (than the original defect), nightly,
