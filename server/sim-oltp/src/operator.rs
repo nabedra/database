@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::{
-    bootstrap::{BOOTSTRAP_CLIENT, Mounts, WORKERS},
+    bootstrap::{BOOTSTRAP_CLIENT, Mounts},
     client::{operation, request},
     history::Completion,
     invariants::{Invariants, TraceObserver, elapsed_ms},
@@ -35,6 +35,8 @@ pub(crate) struct Operator {
     pub data_token: String,
     pub cluster_id: Uuid,
     pub mounts: Mounts,
+    /// The current workers. Only the membership workload replaces one.
+    pub workers: [u64; 3],
 }
 
 impl Operator {
@@ -83,6 +85,7 @@ impl Operator {
             data_token: String::new(),
             cluster_id: Uuid::nil(),
             mounts: Mounts::for_test(),
+            workers: crate::bootstrap::WORKERS,
         }
     }
 
@@ -95,7 +98,7 @@ impl Operator {
         limit: Duration,
     ) -> Result<Value, String> {
         let mut errors = Vec::new();
-        for node in WORKERS {
+        for node in self.workers {
             match self.ask(node, id, name, payload.clone(), limit).await {
                 Completion::Ok(data) => return Ok(data),
                 other => errors.push(format!("n{node} {}", shown(&other))),
@@ -359,7 +362,7 @@ impl SplitState {
 /// One request on each worker in turn, until one that can run it answers.
 async fn ask(op: &Operator, id: Uuid, payload: &Value) -> Round {
     let mut last = Vec::new();
-    for node in WORKERS {
+    for node in op.workers {
         let payload = payload.clone();
         let answer = op
             .ask(node, id, "storage.shard.split", payload, SPLIT_REQUEST)

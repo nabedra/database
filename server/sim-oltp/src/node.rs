@@ -501,6 +501,7 @@ impl Cluster {
             data_token: self.config.data_token.clone(),
             cluster_id: self.config.cluster_id,
             mounts: self.config.mounts.clone(),
+            workers: self.config.nodes(),
         }
     }
 

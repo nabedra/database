@@ -1101,7 +1101,7 @@ impl Membership {
         cluster.prepare_restart(node).await.map_err(|error| {
             // `docs/oltp-recovery.md`, step 7: "Once queue join begins, a process restart requires
             // the normal retained-mount procedure with a new incarnation."
-            if SPARES.contains(&node) && every_survivor_refuses_its_role(&error) {
+            if SPARES.contains(&node) && every_survivor_refuses_its_role(node, &error) {
                 StepError::new(
                     "ReplacementRestart",
                     format!("the retained restart of the replacement n{node} is refused: {error}"),
@@ -2576,16 +2576,22 @@ fn data_writes(
     (answers, first)
 }
 
-/// Whether a failed restart preparation says that every survivor that answered refused the
-/// role of the worker's certificate (`ReplacementRestart`), and not, say, that it was busy.
-fn every_survivor_refuses_its_role(error: &str) -> bool {
-    error
-        .rsplit_once("worker.restart.prepare: ")
-        .is_some_and(|(_, answers)| {
-            answers
-                .split("; ")
-                .all(|answer| answer.ends_with(": Control role is not authorized"))
-        })
+/// Whether a failed restart preparation of `node` says that every survivor refused the role of
+/// the worker's certificate (`ReplacementRestart`), and not, say, that one was busy. The operator
+/// asks every worker, so the stopped one answers nothing.
+fn every_survivor_refuses_its_role(node: u64, error: &str) -> bool {
+    let Some((_, answers)) = error.rsplit_once("worker.restart.prepare: ") else {
+        return false;
+    };
+    let stopped = format!("n{node} unknown (connect n{node}: nothing listens");
+    let survivors: Vec<&str> = answers
+        .split("; ")
+        .filter(|answer| !answer.starts_with(&stopped))
+        .collect();
+    survivors.len() == 2
+        && survivors
+            .iter()
+            .all(|answer| answer.ends_with("Unauthorized Control role is not authorized"))
 }
 
 /// The table's first range and its published placement.
@@ -2670,16 +2676,24 @@ mod tests {
     #[test]
     fn only_a_refused_role_of_every_survivor_is_a_refused_replacement() {
         let error = |answers: &str| {
-            every_survivor_refuses_its_role(&format!(
-                "prepare retained restart of n4: worker.restart.prepare: {answers}"
-            ))
+            every_survivor_refuses_its_role(
+                4,
+                &format!("prepare retained restart of n4: worker.restart.prepare: {answers}"),
+            )
         };
-        let refused = "Unauthorized: Control role is not authorized";
-        assert!(error(&format!("n1 {refused}; n3 {refused}")));
-        assert!(!error(&format!("n1 {refused}; n3 Overloaded: busy")));
-        assert!(!error("n1 Conflict: Control operation is busy"));
+        let refused = "Unauthorized Control role is not authorized";
+        let stopped = "unknown (connect n4: nothing listens on simulated 10.0.0.5:20004)";
+        assert!(error(&format!("n1 {refused}; n4 {stopped}; n3 {refused}")));
+        assert!(!error(&format!(
+            "n1 {refused}; n4 {stopped}; n3 Conflict busy"
+        )));
+        // A survivor that does not answer says nothing about the role.
+        let silent = "unknown (connect n3: nothing listens on simulated 10.0.0.4:20003)";
+        assert!(!error(&format!("n1 {refused}; n4 {stopped}; n3 {silent}")));
+        assert!(!error(&format!("n1 {refused}")));
         assert!(!error(""));
         assert!(!every_survivor_refuses_its_role(
+            4,
             "survivors never dropped n4: not ready"
         ));
     }
