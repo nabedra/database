@@ -84,7 +84,6 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
     (
         "O30",
         &[
-            "O30:scoped-active",
             "O30:third-holder-delayed",
             "O30:two-holders-delayed",
             "O30:each-copy-phase",

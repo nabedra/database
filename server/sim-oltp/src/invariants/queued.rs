@@ -51,8 +51,8 @@ pub(crate) const ONE_EXECUTION: &str = "OneExecutionPerIdentity";
 /// body returns the first definite result of that identity, including a no-op or row conflict,
 /// while its dedup record is retained." A record is kept 24 h, longer than any run.
 ///
-/// Both answers must come from `POST /v1/operations` with the direct path on. An answer that the
-/// queue gave is outside the sentence. `plans/oltp-direct-path.md` says that the product does
+/// Both answers must be ones that the direct path may have given. An answer that the queue
+/// certainly gave is outside the sentence. `plans/oltp-direct-path.md` says that the product does
 /// not do this today (DR-1), so a red here is that finding until something else is shown.
 pub(crate) const FIRST_RESULT: &str = "DirectRetryResult";
 
@@ -236,7 +236,8 @@ pub(crate) enum Holder {
 
 /// The request records of one worker before and after some requests were accepted, from its
 /// public stats. Nothing may leave the queue between the two counts, so the difference counts
-/// the new requests alone: either the first count is zero, or no result can have expired yet.
+/// the new requests alone: either the first count is zero, or no result can have expired yet. At
+/// most two expired records that were still there are counted as zero.
 #[derive(Clone, Debug)]
 pub(crate) struct Retained {
     pub node: u64,
@@ -746,7 +747,7 @@ impl Log {
         }
     }
 
-    /// Definite results that `POST /v1/operations` gave one body while the direct path was on.
+    /// Definite results that the direct path may have given one body.
     fn first_result(&self, out: &mut Outcome) {
         let mut results: BTreeMap<&Body, Vec<(&Terminal, u64)>> = BTreeMap::new();
         for submission in &self.submissions {

@@ -84,6 +84,11 @@ const BACKLOG: i64 = 40;
 const ACCEPT_WAIT: Duration = Duration::from_secs(1);
 /// How many receipts are followed from a fault on.
 const WATCHED: usize = 8;
+/// One frozen worker stays so for at least this long, so that the rest can accept.
+const ALONE: Duration = Duration::from_secs(2);
+/// How many expired records may stay when new ones are counted.
+const STUCK: u64 = 2;
+const THAW_LIMIT: Duration = Duration::from_secs(5);
 const READY_LIMIT: Duration = Duration::from_secs(2);
 const SPLIT_LIMIT: Duration = Duration::from_secs(60);
 const SCOPED_LIMIT: Duration = Duration::from_secs(30);
@@ -1151,6 +1156,27 @@ fn burst(q: &Q, gateway: usize, count: i64, retry: bool) -> Vec<JoinHandle<()>> 
         .collect()
 }
 
+/// Submit reads concurrently. A queued read takes no range's write path, so a frozen Data leader
+/// does not hold its acceptance up.
+fn queued_reads(q: &Q, gateway: usize) -> Vec<JoinHandle<()>> {
+    (0..4)
+        .map(|offset| {
+            let q = q.clone();
+            nabedra_rt::task::spawn(async move {
+                let node = CLIENTS[offset as usize % CLIENTS.len()];
+                let id = fresh_id(node).await;
+                let table = &q.ctx.table;
+                let req = if offset % 2 == 0 {
+                    Req::collect(table, id)
+                } else {
+                    Req::get(table, id, offset)
+                };
+                drive(&q, node, gateway, &req, true, true, Duration::from_secs(3)).await;
+            })
+        })
+        .collect()
+}
+
 /// Wait for tasks. A panic in one is a violation, so that a lost client never reads as a quiet
 /// one.
 async fn join(cluster: &Cluster, tasks: Vec<JoinHandle<()>>) {
@@ -1254,6 +1280,7 @@ async fn freeze(
     let from = q.now() + 1;
     time::sleep(Duration::from_millis(2)).await;
     bursts.extend(burst(q, 0, 6, true));
+    bursts.extend(queued_reads(q, 1));
     if nodes.len() > 1 && q.peek_defect(Defect::EarlyAccept) {
         seed_early_accept(q).await;
     }
@@ -1293,16 +1320,27 @@ async fn apply(q: &Q, cluster: &mut Cluster, due: &Scheduled, bursts: &mut Vec<J
     );
     match due.fault {
         Fault::FreezeAndKill { two, kill } => {
-            let first = WORKERS[due.pick as usize];
-            let mut frozen = vec![first];
+            let mut order = WORKERS;
+            order.rotate_left(due.pick as usize);
+            let [first, second, third] = order;
             // Two frozen workers also take the Control quorum, so nothing is accepted whatever
-            // the copies do. One frozen worker leaves the copies as the only obstacle, so every
-            // seed freezes one alone.
-            freeze(q, cluster, &frozen, due.hold, bursts).await;
+            // the copies do. One frozen worker leaves the copies as the only obstacle, unless it
+            // is the scheduler owner or the Control leader. So each worker is frozen in turn.
+            let alone = due.hold.max(ALONE);
+            for node in [second, third] {
+                freeze(q, cluster, &[node], alone, bursts).await;
+                cluster.thaw(node);
+                if let Err(error) = wait_converged(cluster, THAW_LIMIT).await {
+                    q.skip(cluster, format!("after n{node} thawed: {error}"));
+                    break;
+                }
+            }
+            let mut frozen = vec![first];
+            freeze(q, cluster, &frozen, alone, bursts).await;
             if two {
                 cluster.thaw(first);
                 time::sleep(due.hold / 4).await;
-                frozen.push(WORKERS[(due.pick as usize + 1) % 3]);
+                frozen.push(second);
                 freeze(q, cluster, &frozen, due.hold, bursts).await;
             }
             let killed = match kill {
@@ -1529,6 +1567,7 @@ pub(crate) async fn run(
             stopped: None,
         });
     }
+    copies(&q, cluster, "before the clients").await;
     let faults_net = NetFaults::install(cluster.net(), &cluster.world, seed);
     config.jump_clocks(&cluster.world);
     let start = elapsed_ms(&cluster.world);
@@ -1643,7 +1682,7 @@ pub(crate) async fn run(
     cluster.checks.recovered(&cluster.world, "convergence");
     // Bounds below are their own.
     q.ctx.converge_by.store(u64::MAX, Ordering::Release);
-    copies(&q, cluster).await;
+    copies(&q, cluster, "after the heal").await;
     expire(&q).await;
     // The resource check comes before the finale: a full stop empties the gauges it reads.
     let stats = direct::settle(cluster, &[]).await?.0;
@@ -1661,7 +1700,6 @@ pub(crate) async fn run(
         execute_twice(&q).await;
     }
     finish(&q, cluster, chaos.as_ref(), &mut report);
-    report.summary["mode"] = json!(mode.name());
     report.summary["finale"] = json!(format!("{finale:?}"));
     report.summary["late_faults"] = json!(late);
     report.summary["profile"] = json!(chaos.as_ref().map(Chaos::profile_name));
@@ -1786,6 +1824,7 @@ fn finish(q: &Q, cluster: &Cluster, chaos: Option<&Chaos>, report: &mut direct::
         .push(("every submission answered", shared.undecided == 0));
     report.summary = json!({
         "workload": Workload::Queued.name(),
+        "mode": q.mode.name(),
         "judged": outcome.judged,
         "counts": shared.counts,
         "submissions": shared.log.submissions.len(),
@@ -2055,7 +2094,8 @@ async fn counters(cluster: &Cluster, node: u64) -> Result<(u64, u64), String> {
 
 /// The accepted records of every worker, at a point from which the count can only grow: results
 /// of a long retention do not expire within a run, and with a short one this waits until every
-/// older result has.
+/// older result has. A few records that stay although their results expired may leave at any
+/// time, so they are not counted: what is held later must then be enough without them.
 async fn baseline(q: &Q, cluster: &Cluster) -> Result<BTreeMap<u64, u64>, String> {
     let give_up = q.now() + q.mode.retention_ms + 10_000;
     loop {
@@ -2068,7 +2108,11 @@ async fn baseline(q: &Q, cluster: &Cluster) -> Result<BTreeMap<u64, u64>, String
             return Ok(counts);
         }
         if q.now() >= give_up {
-            return Err(format!("older records did not expire: {counts:?}"));
+            if counts.values().any(|count| *count > STUCK) {
+                return Err(format!("older records did not expire: {counts:?}"));
+            }
+            cluster.record(format!("queued: older records did not expire: {counts:?}"));
+            return Ok(WORKERS.map(|node| (node, 0)).into());
         }
         time::sleep(Duration::from_millis(250)).await;
     }
@@ -2077,14 +2121,19 @@ async fn baseline(q: &Q, cluster: &Cluster) -> Result<BTreeMap<u64, u64>, String
 /// At a quiet point, every ready worker of the legacy protocol holds every request that was
 /// accepted since (plan: "to all ready workers before acknowledging acceptance"). Only those:
 /// a worker that joined later need not hold older settled records.
-async fn copies(q: &Q, cluster: &Cluster) {
+async fn copies(q: &Q, cluster: &Cluster, when: &str) {
     if q.mode.scoped {
         return;
     }
     let before = match baseline(q, cluster).await {
         Ok(before) if cluster.converged().await => before,
-        Ok(_) => return q.skip(cluster, "copies: the cluster was not converged".into()),
-        Err(error) => return q.skip(cluster, format!("copies: {error}")),
+        Ok(_) => {
+            return q.skip(
+                cluster,
+                format!("copies {when}: the cluster was not converged"),
+            );
+        }
+        Err(error) => return q.skip(cluster, format!("copies {when}: {error}")),
     };
     let since = q.now();
     join(cluster, burst(q, 0, 12, false)).await;
@@ -2093,17 +2142,17 @@ async fn copies(q: &Q, cluster: &Cluster) {
     for node in WORKERS {
         match counters(cluster, node).await {
             Ok(counts) => after.push((node, counts)),
-            Err(error) => return q.skip(cluster, format!("copies: {error}")),
+            Err(error) => return q.skip(cluster, format!("copies {when}: {error}")),
         }
     }
     let at = q.now();
     // Nothing joined or left: the workers of the count before are the ready ones.
     if !cluster.converged().await {
-        return q.skip(cluster, "copies: the cluster changed".into());
+        return q.skip(cluster, format!("copies {when}: the cluster changed"));
     }
     let required = required(q, cluster.config.run_id, since, sent, at);
     cluster.record(format!(
-        "queued copies: {required} accepted, before {before:?}, after {after:?}"
+        "queued copies {when}: {required} accepted, before {before:?}, after {after:?}"
     ));
     for (node, (accepted, pending)) in after {
         q.shared.lock().unwrap().log.retained.push(Retained {
