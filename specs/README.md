@@ -154,8 +154,8 @@ and `\* trace: <path in the spec folder>`. Each is one assertion.
 
 Both print `nabedra-tla-summary: {json}` last. As the check's
 `result_parser = "tlc"`, it becomes the evidence record, with a `tla` object
-holding the distinct states, depth, coverage, each mutant's counterexample
-length, or the trace counts. Logs and counterexamples are artifacts.
+holding the distinct states, depth, coverage, the settings of each baseline
+and mutant, each mutant's counterexample length, or the trace counts. Logs and counterexamples are artifacts.
 
 | Outcome | Result |
 | --- | --- |

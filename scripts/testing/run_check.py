@@ -458,6 +458,8 @@ class _Fitter:
             return isinstance(item, dict) and item.get("verdict") == "pass"
         if key == "mutants":
             return isinstance(item, dict) and item.get("ok") is True
+        if key == "settings":  # a mutant's line goes before a baseline's
+            return isinstance(item, str) and item.startswith("mutant ")
         return key in ("unmutated", "limits")
 
     def drop(self, key: str, index: int) -> None:
@@ -517,7 +519,7 @@ class _Fitter:
             self.drop_artifact(len(self.artifacts) - 1)
         if self.tla is not None:
             facts = self.props["tla"]["properties"]
-            for key in ("runs", "mutants", "uncovered", "unmutated", "limits"):
+            for key in ("runs", "mutants", "uncovered", "unmutated", "limits", "settings"):
                 while len(self.list(key)) > facts[key]["maxItems"]:
                     self.drop_last(key, only_ok=False)
             while len(self.list("failing")) > facts["traces"]["properties"]["failing"]["maxItems"]:
@@ -548,7 +550,7 @@ class _Fitter:
         while len(self.artifacts) > self.keep:
             self.drop_artifact(len(self.artifacts) - 1)
             yield
-        for key in ("mutants", "runs", "unmutated"):
+        for key in ("mutants", "runs", "unmutated", "settings"):
             while self.drop_last(key, only_ok=True):
                 yield
         self.shorten(60)
@@ -559,7 +561,7 @@ class _Fitter:
         while len(self.not_run) > (2 if self.more else 1):
             self.drop_not_run()
             yield
-        for key in ("failing", "uncovered", "mutants", "runs", "limits"):
+        for key in ("failing", "uncovered", "mutants", "runs", "settings", "limits"):
             while self.drop_last(key, only_ok=False):
                 yield
 
@@ -569,7 +571,7 @@ def fit_record(record: dict) -> None:
     lengths and the record size limit.
 
     It drops, in order: the details of passing runs and caught mutants; tool artifacts that belong to no
-    failure, last first; caught mutants, passing runs and exempted names, last first. Then it cuts the
+    failure, last first; caught mutants, passing runs, exempted names and mutants' settings, last first. Then it cuts the
     remaining details and reasons, and last drops the artifacts of failures, not-run entries and the
     failures themselves, last first. The command log and tla/summary.json always stay. `tla.truncated`
     says that something was dropped or cut, `tla.dropped` counts it by list, with failures counted apart,

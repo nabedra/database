@@ -261,7 +261,7 @@ class FitRecordTests(unittest.TestCase):
                 total = sum(ok(x) == want for x in before["tla"].get(key, []))
                 kept = sum(ok(x) == want for x in self.tla.get(key, []))
                 self.assertEqual(total, kept + self.dropped.get(name, 0), name)
-        for key in ("uncovered", "unmutated", "limits"):
+        for key in ("uncovered", "unmutated", "limits", "settings"):
             self.assertEqual(len(before["tla"].get(key, [])), len(self.tla.get(key, [])) + self.dropped.get(key, 0))
         self.assertEqual(len(before["artifacts"]), len(self.names) + self.dropped.get("artifacts", 0))
         not_run = record["assertions"]["not_run"]
@@ -356,6 +356,41 @@ class FitRecordTests(unittest.TestCase):
         record = t_record(mutants=[mutant(i, ok=False, detail=0) for i in range(62)], failed=62)
         self.fit(record)
         self.assertEqual(self.dropped, {"failing_mutants": 12})
+
+    SETTINGS = [f"X.v{i:02d}.cfg: SPECIFICATION Spec, MaxCrashes = {i}" for i in range(10)]
+
+    def test_more_settings_than_the_schema_allows(self):
+        record = t_record(settings=[*self.SETTINGS, *(f"mutant m{i:03d} of X.v00.cfg: Mutant = 1" for i in range(90))], settings_sha256="a" * 64)
+        self.fit(record)
+        self.assertEqual((len(self.tla["settings"]), self.dropped), (80, {"settings": 20}))
+        self.assertEqual(self.tla["settings"][:10], self.SETTINGS)
+        self.assertEqual(self.tla["settings"][-1], "mutant m069 of X.v00.cfg: Mutant = 1")
+
+    def test_baselines_settings_outlive_the_mutants_and_the_digest_stays(self):
+        record = t_record(settings=[*self.SETTINGS, *(f"mutant m{i:03d} of X.v00.cfg: " + "M" * 255 for i in range(70))], settings_sha256="a" * 64,
+                          mutants=[mutant(i, ok=i != 7) for i in range(50)], runs=[run_fact(i) for i in range(20)])
+        self.fit(record)
+        self.assertEqual(self.tla["settings"][:10], self.SETTINGS)
+        self.assertGreater(self.dropped["settings"], 0)
+        self.assertEqual([m["name"] for m in self.tla["mutants"] if not m["ok"]], ["m07"])
+        self.assertEqual(self.tla["settings_sha256"], "a" * 64)
+        # Texts are cut before a baseline's line goes.
+        record = t_record(settings=[s + "y" * 200 for s in self.SETTINGS] * 2, settings_sha256="a" * 64, failed=50,
+                          mutants=[mutant(i, ok=False) for i in range(50)])
+        self.fit(record)
+        self.assertEqual((len(self.tla["settings"]), self.dropped), (20, {"shortened": 50}))
+        # When nothing else is left to drop, the baselines' go too, counted, and the limits after them.
+        record = t_record(settings=[s + "y" * 250 for s in self.SETTINGS] * 8, settings_sha256="a" * 64, limits=["l" * 190] * 50, failed=50,
+                          mutants=[mutant(i, ok=False, name="n" * 100 + "{:02d}") for i in range(50)], uncovered=["u" * 100 + str(i) for i in range(50)])
+        self.fit(record)
+        self.assertGreater(self.dropped["settings"], 0)
+        self.assertNotIn("limits", self.dropped if self.tla["settings"] else {})
+        self.assertEqual(self.tla["settings_sha256"], "a" * 64)
+
+    def test_long_settings_are_cut_and_counted(self):
+        record = t_record(settings=["X.cfg: " + "c" * 400], settings_sha256="a" * 64)
+        self.fit(record)
+        self.assertEqual((len(self.tla["settings"][0]), self.dropped), (300, {"shortened": 1}))
 
     def test_not_run_entries_are_kept_or_counted(self):
         for n, length in ((100, 250), (300, 20), (1500, 300)):

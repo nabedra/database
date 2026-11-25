@@ -8,6 +8,7 @@ evaluation error), a simulation, and trace validation (accepted and rejected). T
 replace specs/tools/tlc with a fake wrapper that prints a fixture per cfg, so they need no Docker.
 """
 
+import hashlib
 import io
 import json
 import os
@@ -958,6 +959,66 @@ class CheckOrchestrationTests(unittest.TestCase):
             safety_only, add_to_model(*bound, "Few == Sub"), *cfg("Deep", "<- Mine")])
         self.assertEqual(code, 0, text)
 
+    # The settings, for the reviewer.
+
+    def settings_of(self, summary):
+        stored = json.loads((self.fake.out / "summary.json").read_text())["settings"]
+        self.assertEqual(hashlib.sha256(json.dumps(stored, sort_keys=True).encode()).hexdigest(), summary["tla"]["settings_sha256"])
+        self.assertEqual(len(stored), len(summary["tla"]["settings"]))
+        self.assertIsNone(run_check_errors({"tla": {**summary["tla"], "settings": summary["tla"]["settings"][:80]}}))
+        return {s["cfg"]: s for s in stored}
+
+    def test_settings_list_what_a_reviewer_has_to_read(self):
+        code, summary, text = self.run_fake(GOOD, FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]), prep=[
+            safety_only, add_to_model("MCInit == Init", "MCNext ==\n  /\\ Next \\* a comment\n  /\\ rmState[\"r1\"]' # \"committed\"", "Sub == crashes < 9",
+                                      "Few ==\n  /\\ Sub\n  /\\ drops <= MaxDrops", "Good == 0..3"),
+            self.in_cfg("TwoPhase.cfg", ("SPECIFICATION Spec", "INIT MCInit\nNEXT MCNext\nSYMMETRY Sym\nCONSTRAINT Few"), ("CHECK_DEADLOCK TRUE", "CHECK_DEADLOCK FALSE"),
+                        ("CONSTANTS\n", self.COUNTERS + "\n\\* limit: Nat -- finite\nCONSTANTS\n    Nat <- Good\n"))])
+        self.assertEqual(code, 0, text)
+        stored = self.settings_of(summary)
+        self.assertEqual(list(stored), ["TwoPhase.cfg", "TwoPhase.spare.cfg", "commit_one_prepared.cfg", "no_resend.cfg"])
+        main = stored["TwoPhase.cfg"]
+        self.assertEqual(main["specification"], ["INIT MCInit", "NEXT MCNext"])
+        self.assertEqual(main["constants"], ["MaxCrashes = 1", "MaxDrops = 1", 'Mutant = "none"', "Nat <- Good", "RM <- MCRM"])
+        self.assertEqual(main["constraints"], [{"name": "Few", "declared": "bounds the two fault counters", "text": [
+            "Few ==\n  /\\ Sub\n  /\\ drops <= MaxDrops", "Sub == crashes < 9"]}])
+        self.assertEqual((main["symmetry"], main["overrides"], main["check_deadlock"], main["view"]), (["Sym"], ["Nat <- Good"], False, []))
+        self.assertEqual((main["invariants"], main["properties"]), (["TypeOK", "Consistent"], []))
+        self.assertEqual(main["definitions"]["MCNext"], ["MCNext ==\n  /\\ Next\n  /\\ rmState[\"r1\"]' # \"committed\""])
+        self.assertEqual(main["definitions"]["MCRM"], ['MCRM == {"r1", "r2", "r3"}'])
+        self.assertEqual((main["definitions"]["Good"], main["definitions"]["MCInit"]), (["Good == 0..3"], ["MCInit == Init"]))
+        self.assertNotIn("changed", main)
+        spare = stored["TwoPhase.spare.cfg"]
+        self.assertEqual((spare["specification"], spare["check_deadlock"], spare["properties"]), (["SPECIFICATION Spec"], True, ["Termination"]))
+        mutant = stored["no_resend.cfg"]
+        self.assertEqual(mutant["expect"], "Termination")
+        self.assertEqual(mutant["changed"]["TwoPhase.spare.cfg"], {"mutant": ['Mutant = "no_resend"'], "baseline": ['Mutant = "none"']})
+        self.assertIn("NEXT MCNext", mutant["changed"]["TwoPhase.cfg"]["baseline"])
+        # The record's short form.
+        self.assertEqual(summary["tla"]["settings"], [
+            'TwoPhase.cfg: INIT MCInit, NEXT MCNext, MaxCrashes = 1, MaxDrops = 1, Mutant = "none", Nat <- Good, RM <- MCRM, '
+            'CONSTRAINT Few (Few == /\\ Sub /\\ drops <= MaxDrops; Sub == crashes < 9), SYMMETRY Sym, CHECK_DEADLOCK FALSE',
+            'TwoPhase.spare.cfg: SPECIFICATION Spec, MaxCrashes = 1, MaxDrops = 1, Mutant = "none", RM <- MCRM',
+            'mutant commit_one_prepared of TwoPhase.spare.cfg: Mutant = "commit_one_prepared" instead of Mutant = "none"',
+            'mutant no_resend of TwoPhase.spare.cfg: Mutant = "no_resend" instead of Mutant = "none"'])
+
+    def test_the_settings_digest_follows_every_setting(self):
+        digests = set()
+        steps = [[], [self.in_cfg("TwoPhase.cfg", ("MaxCrashes = 1", "MaxCrashes = 0"))], [add_to_model("X == 1")], [add_to_cfg("SYMMETRY Sym")],
+                 [self.in_cfg("TwoPhase.cfg", ("SPECIFICATION Spec", "INIT Init\nNEXT Next"))], [self.in_cfg("TwoPhase.cfg", ("CHECK_DEADLOCK TRUE", "CHECK_DEADLOCK FALSE"))],
+                 [self.in_cfg("MCTwoPhase.tla", ('"r2", "r3"}', '"r2"}'))], [self.mutant(("MaxDrops = 1", "MaxDrops = 2"))],
+                 [self.in_cfg("TwoPhase.tla", ("Spec == Init", "Spec == TRUE /\\ Init"))]]
+        for prep in steps:
+            _, summary, _ = self.run_fake(GOOD, prep=prep, spare=True)
+            self.settings_of(summary)
+            digests.add(summary["tla"]["settings_sha256"])
+        self.assertEqual(len(digests), len(steps) - 1)  # a definition that no setting names is none of them
+
+    def test_t2_has_its_settings_too(self):
+        _, summary, _ = self.run_fake({"TwoPhase.large.cfg": ["simulation", 0]}, extra=("--tier", "T2", "--simulate"))
+        self.assertEqual(summary["tla"]["settings"], ['TwoPhase.large.cfg: SPECIFICATION Spec, MaxCrashes = 2, MaxDrops = 2, Mutant = "none", RM <- MCRMLarge'])
+        self.assertEqual(self.settings_of(summary)["TwoPhase.large.cfg"]["definitions"]["MCRMLarge"], ['MCRMLarge == {"r1", "r2", "r3", "r4"}'])
+
     def test_depth_limit_and_state_cap_fail(self):
         for body in ('TLCGet("level") < 9', 'TLCGet("distinct") < 800', 'TLCGet("stats").diameter < 5',
                      "TLCGetOrDefault(1, 0) <= 5", "JavaTime < 5", "RandomElement(1..3) <= 2"):
@@ -1095,6 +1156,7 @@ class CheckOrchestrationTests(unittest.TestCase):
         names = [a["name"] for a in summary["artifacts"]]
         self.assertEqual((names[0], len(names), len(set(names))), ("tla/summary.json", 89, 89))
         stored = json.loads((self.fake.out / "summary.json").read_text())
+        self.assertEqual(len(stored.pop("settings")), 88)
         self.assertEqual(stored, {k: summary[k] for k in ("verdict", "executed", "failed", "not_run", "tla")})
 
     def test_every_error_reaches_the_summary_in_full(self):

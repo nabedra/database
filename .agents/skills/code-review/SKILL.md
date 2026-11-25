@@ -79,6 +79,9 @@ checks the register requires. Follow the [evidence rules](references/evidence.md
 - Update the plan before changing a public interface, such as a wire
   protocol, HTTP API, ORM signature, configuration, CLI or on-disk format.
   The plan gives a success measure and the scenario IDs.
+- Before accepting a T pass, read the [settings](../design-review/references/tla.md#limits-on-the-search)
+  it ran with. The tool cannot tell whether a bound or a cut `NEXT` leaves
+  behavior out.
 - Resolve all blocking findings before merging. Require non-author approval
   for PRs outside the docs-only merge rule above.
 - Put every new or changed test through `scripts/testing/repeat_gate.py`.

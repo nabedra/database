@@ -89,7 +89,7 @@ with more than one summary is `error` too, so a later pass cannot hide an earlie
 
 A T check that ran always leaves a record. When the facts exceed the schema's lengths or the 20 KB
 limit, the least important go first: details of passing runs and caught mutants, artifacts that belong
-to no failure, caught mutants, passing runs, then longer texts, and failures last. `tla.truncated` says
+to no failure, caught mutants, passing runs, mutants' settings, then longer texts, and failures and baselines' settings last. `tla.truncated` says
 that something was dropped or cut. `tla.dropped` counts it by list, with failures apart, and the last
 `not_run` entry counts the dropped ones. The command log and `tla/summary.json` stay in `artifacts`, and
 `summary.json` keeps every fact. Facts the schema refuses are dropped, and the result is `error` unless

@@ -162,10 +162,19 @@ MCConstraint ==
     /\ \A g \in Groups : Len(hst[g]) <= MaxLog
 ```
 
-Model anything else as a budget constant of the spec. The evidence record
-lists the declared limits, and how many states TLC kept for each
-constraint. The reviewer of the plan judges whether the bound is wide
-enough. The rule does not detect:
+Model anything else as a budget constant of the spec.
+
+Whether a bound is wide enough, or an `INIT`, `NEXT` or constant leaves
+behavior out, is the reviewer's judgment, because no rule here can tell.
+Read the settings before you accept a T pass. `summary.json` lists them for
+each baseline and mutant under `settings`: `SPECIFICATION` or `INIT` and
+`NEXT`, every constant with its value, every constraint with its text and
+its declared limit, symmetry, overrides, the definitions these names stand
+for, and what a mutant changes against each baseline. The record holds a
+short form (`tla.settings`), the number of lines that were trimmed
+(`tla.dropped.settings`), and `tla.settings_sha256`, the digest of the full
+list, so that the list you read is the one that ran. `tla.limits` adds how
+many states TLC kept for each constraint. The rule does not detect:
 
 - an upper bound on a variable that is no counter of growth, such as a step
   counter that every action increments, or a protocol phase kept as a

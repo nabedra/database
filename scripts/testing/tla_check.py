@@ -40,6 +40,8 @@ The search rule. TLC reports an exhaustive search whatever a cfg cuts away, so:
 The record lists the declared limits and how many states each constraint kept. What the rule cannot see: a
 variable under an upper bound that is no counter of growth, such as a step counter that every action
 increments, or a protocol phase kept as a number; a CONSTANT value, INIT or NEXT that leaves behavior out.
+A reviewer has to read those, so summary.json lists the settings of every baseline and mutant (describe_settings),
+and the record has their short form and their digest.
 
 The model module is MC<Name>.tla if it exists, else <Name>.tla. Each run gets the per-run budget:
 --budget-s, else the module's level in docs/testing/modules.toml (L1 and L2 900 s, L3 3600 s). The
@@ -453,6 +455,12 @@ class Model:
                 todo += {w for text, _ in regions for w in re.findall(r"[A-Za-z_]\w*", text)}
         return out
 
+    def source(self, name: str) -> list[str]:
+        """The definitions of the name as written, without comments, for a reader."""
+        return ["\n".join(line.rstrip() for line in full.strip().splitlines() if line.strip())
+                for _, full in self.regions(name)]
+
+
 def limits_of(cfg: Path) -> dict[str, str]:
     """The names a cfg declares with `\\* limit: <Name> -- <reason>` lines."""
     return dict(_LIMIT.findall(cfg.read_text(encoding="utf-8")))
@@ -576,6 +584,55 @@ def mutant_problems(model: Model, cfg: Path, baselines: list[Path], passed: set[
         problems.append(f"{waiting[0]} {_NOT_PASSED}" if waiting else "it is no mutant of a baseline: "
                         + "; ".join(f"{k}: {v}" for k, v in reasons.items()))
     return problems
+
+
+# --------------------------------------------------------------------------------------------
+# The settings, for a reader.
+
+def describe_settings(model: Model, cfg: Path, baselines: list[Path], declared: dict[str, str]) -> dict:
+    """What a reviewer has to read in one cfg. `changed` is a mutant's difference to the baselines."""
+    parsed, entries = tc.parse_cfg(cfg), sorted(settings(cfg))
+    spec = [e for e in entries if e.split()[0] in _SPECIFICATION]
+    constants = [e for e in entries if e not in spec]
+    out: dict = {
+        "cfg": cfg.name, "specification": spec, "constants": constants,
+        "constraints": [{"name": name, "declared": declared.get(name, ""),
+                         "text": [s for n in (name, *sorted(model.used.get(name, ()))) for s in model.source(n)]}
+                        for name in parsed.sections.get("CONSTRAINT", [])],
+        "action_constraints": parsed.sections.get("ACTION_CONSTRAINT", []), "view": parsed.sections.get("VIEW", []),
+        "symmetry": parsed.sections.get("SYMMETRY", []), "check_deadlock": parsed.check_deadlock,
+        "overrides": [e for e in constants if e.split()[0] not in model.constants],
+        "invariants": parsed.invariants, "properties": parsed.properties,
+        # What the names in the settings stand for: MCInit, MCNext, MCNodes.
+        "definitions": {n: model.source(n) for n in dict.fromkeys(
+            w for e in entries for w in e.split()[1:] if re.fullmatch(r"[A-Za-z_]\w*", w) and model.places(w))},
+    }
+    if baselines:
+        out["expect"] = parsed.expect or ""
+        out["changed"] = {b.name: {"mutant": sorted(settings(cfg) - settings(b)), "baseline": sorted(settings(b) - settings(cfg))}
+                          for b in baselines}
+    return out
+
+
+def short_settings(full: dict) -> str:
+    """One line of the record. A mutant shows what differs from the baseline that is nearest to it."""
+    if "changed" in full:
+        name, near = min(full["changed"].items(), key=lambda kv: len(kv[1]["mutant"]) + len(kv[1]["baseline"]))
+        return (f"mutant {full['cfg'].removesuffix('.cfg')} of {name}: {', '.join(near['mutant']) or 'nothing set'}"
+                + (f" instead of {', '.join(near['baseline'])}" if near["baseline"] else ""))
+    parts = [*full["specification"], *full["constants"],
+             *(f"CONSTRAINT {c['name']} ({'; '.join(' '.join(s.split()) for s in c['text'])})" for c in full["constraints"]),
+             *(f"SYMMETRY {s}" for s in full["symmetry"]), *([] if full["check_deadlock"] else ["CHECK_DEADLOCK FALSE"])]
+    return f"{full['cfg']}: {', '.join(parts)}"
+
+
+def settings_facts(model: Model, baselines: list[Path], mutants: list[Path]) -> dict:
+    """The record's settings facts. `settings_full` goes to summary.json only."""
+    declared = {k: v for baseline in baselines for k, v in limits_of(baseline).items()}
+    full = [describe_settings(model, cfg, [], declared) for cfg in baselines]
+    full += [describe_settings(model, cfg, baselines, declared) for cfg in mutants]
+    digest = hashlib.sha256(json.dumps(full, sort_keys=True).encode("utf-8")).hexdigest()
+    return {"settings": [short_settings(f) for f in full], "settings_sha256": digest, "settings_full": full}
 
 
 def search_check(rep: Report, model: Model, cfgs: list[Path]) -> list[tuple[str, str, str, str]]:
@@ -786,6 +843,7 @@ def design_check(rep: Report, spec_dir: Path, name: str, model: str, out: Path, 
     })
     if limits:
         facts["limits"] = describe_limits(limits, out)
+    facts.update(settings_facts(modules, baselines, mutant_cfgs))
     return facts
 
 
@@ -794,7 +852,8 @@ def large_check(rep: Report, spec_dir: Path, name: str, model: str, out: Path, b
     cfg = spec_dir / f"{name}.large.cfg"
     if not cfg.exists():
         raise tc.TlaError(f"{_rel(cfg)} does not exist")
-    limits = search_check(rep, Model(spec_dir, model), [cfg])
+    modules = Model(spec_dir, model)
+    limits = search_check(rep, modules, [cfg])
     runs: list[dict] = []
     extra: list[str] = []
     if args.simulate:
@@ -806,6 +865,7 @@ def large_check(rep: Report, spec_dir: Path, name: str, model: str, out: Path, b
              "depth": res.depth, "runs": runs}
     if limits:
         facts["limits"] = describe_limits(limits, out)
+    facts.update(settings_facts(modules, [cfg], []))
     if args.simulate:
         facts.update({"seed": args.seed, "behaviors": args.num, "states_generated": res.generated})
     return facts
@@ -863,12 +923,13 @@ def main(argv: list[str] | None = None) -> int:
     verdict = rep.verdict()
     # Errors come first: run_check.py trims the record's not-run entries from the end.
     not_run = [{"id": "tlc-error", "reason": e} for e in rep.errors] + rep.not_run
+    full = tla.pop("settings_full", [])
     result = {"verdict": verdict, "executed": rep.executed, "failed": rep.failed, "not_run": not_run, "tla": tla}
     artifacts = []
     if out is not None and out.exists():
         # summary.json keeps every fact. run_check.py trims the record, and keeps this artifact.
         files = [f for f in sorted(out.glob("*")) if f.is_file()]  # before summary.json is written
-        (out / "summary.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        (out / "summary.json").write_text(json.dumps({**result, "settings": full}, indent=2) + "\n", encoding="utf-8")
         artifacts = [{"name": f"tla/{f.name}", "sha256": _sha256(f)} for f in (out / "summary.json", *files)]
     tc.print_summary({**result, "artifacts": artifacts})
     return EXIT[verdict]

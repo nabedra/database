@@ -83,7 +83,8 @@ class ValidatorTests(unittest.TestCase):
     def test_limits_and_dropped_counts_are_optional_facts(self):
         rec = good(kind="T")
         rec["tla"] = {"spec": "specs/x/X", "mode": "exhaustive", "tier": "T1", "tools": "t", "truncated": True,
-                      "limits": ["X.cfg: CONSTRAINT Few: terms"], "dropped": {"mutants": 3, "failing_mutants": 1}}
+                      "limits": ["X.cfg: CONSTRAINT Few: terms"], "settings": ["X.cfg: SPECIFICATION Spec"], "settings_sha256": "a" * 64,
+                      "dropped": {"mutants": 3, "failing_mutants": 1}}
         self.assertEqual(evidence.validate(rec), [])
         for dropped in ({"mutants": 0}, {"mutants": "3"}, [3]):
             rec["tla"]["dropped"] = dropped
