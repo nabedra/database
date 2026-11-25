@@ -87,7 +87,7 @@ struct Steady {
 
 /// The pass that an observation at `now` is: the next one, or the same one within a step.
 fn next_pass(now: Duration, at: Duration, passes: u32) -> (Duration, u32) {
-    if passes > 0 && now < at + STEP {
+    if false && passes > 0 && now < at + STEP {
         return (at, passes);
     }
     (now, passes + 1)
