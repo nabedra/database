@@ -19,19 +19,16 @@ that matter are elsewhere:
 
 ## What starts a run
 
-- **Nothing starts on push or commit.** A `[ci ...]` tag in a commit message does nothing. Runs
-  start only from a deliberate dispatch, the scheduled nightly, or the pull-request gate.
-- **A deliberate dispatch** is how agents start their runs. Each dispatch has its own concurrency
-  group, so no later push, commit or other agent's dispatch can cancel it. The scheduled nightly is
-  the only other dispatch: it is pinned to the SHA of `main` when it starts, and it gets the same
-  protection.
-- **The nightly schedule.** At 01:17 UTC, `nabedra-nightly.yml` resolves `main` to a commit and
-  dispatches its T2 checks and a one-hour fuzz run per target. It can also be started manually.
-  The dispatch uses at most eight runners at a time and each run has its own concurrency group.
-- **The pull-request gate.** Opening or updating a pull request to `main` runs the base jobs and
-  the quarantine job on the merge commit. Only a newer head of the same pull request cancels a gate
-  run. PR body lint and diff-based check selection run as non-blocking jobs. Docs-only pull requests
-  put `[skip ci]` in the head commit and skip it.
+Start Actions workflows manually. Use `nabedra-build.yml` for development checks and
+for broad verification on the resulting `main` SHA after a batch of PRs merges.
+Each dispatch is pinned to a commit and has its own concurrency group.
+
+Start `nabedra-nightly.yml` manually to dispatch the T2, fuzz, feature, and
+quarantine preset on `main`. Start `nabedra-evidence.yml` manually with the completed
+build run ID to ingest evidence.
+
+Use `python3 scripts/testing/matrix.py select --base <sha> --head <sha>` for the diff
+report. Dispatch relevant checks with `base=false` for focused feedback.
 
 ## Rules when many agents share Actions
 
@@ -39,7 +36,7 @@ that matter are elsewhere:
 - Cancel (`gh run cancel`) or rerun only runs you dispatched. Never wait on, cancel or report
   someone else's run as yours.
 - Keep at most one full run per branch in flight. Dispatch only the jobs you need while iterating
-  (`base=false` with `scenarios` or `tests`), and the full set once for final evidence.
+  (`base=false` with `scenarios` or `tests`), and the full set once when the change needs it.
 - A new workflow cannot be dispatched until it reaches `main`.
   Coordinate new jobs and inputs with the workflow file's owner (see
   [hot files](../../nabedra-change/references/subagent-driven-development.md#prepare-the-work)).
@@ -54,8 +51,8 @@ The workflow is `.github/workflows/nabedra-build.yml`. Its dispatch inputs:
 | --- | --- |
 | `sha` (required) | Full 40-character commit to test. It must be pushed. |
 | `request_id` (required) | Your request ID, shown in the run name. |
-| `base` (default true) | kv (clippy, tests), features (O02, NS26, including the absence of `test-hooks`), Cache library tests, two shards of default-feature OLAP library, integration and streaming tests, `nabedra-check`, OLTP library and integration tests, Events tests, and the quarantine job. |
-| `jobs` | Comma-separated opt-in jobs: `direct` (D01-D12, ORM suites, library suite off, acceptance, one leg per mode; implies `rep1`, `growth`, `o02`), `acceptance` (Linux OLTP acceptance, default mode; implies `growth`, `o02`), `o02` (O01 and O02 with an OLAP server and the engine matrix, plus T02), `growth` (O16, O26 on the shared build; O21, O28 on one opt-level-1 build), `rep1` (REP1-REP5 process suites), `rep4-mixed` (mixed-version enrollment), `o22` (adds O22 to `scenarios`), `blackhole` (AZ1/AZ2 packet-drop failover), `migrate` (MIG1/MIG2 upgrade), `live3`, `live3-fixture`, `campaign`, `docker`, `memory`, `bench`, `perf`, `g7`, `gc1`, `perf1`, `snap1`, `engine-tests` (Cache and OLAP suites), `check-tests` (the `nabedra-check` crate), `fuzz`, `mutants`. Unknown names fail the run, and the summary lists the resolved set. |
+| `base` (default true) | kv (clippy, tests), features (O02, NS26, including the absence of `test-hooks`), Cache library tests, two shards of default-feature OLAP library, integration and streaming tests, `nabedra-check`, OLTP library and integration tests, Events tests, and runtime-seam Clippy. |
+| `jobs` | Comma-separated opt-in jobs: `direct` (D01-D12, ORM suites, library suite off, acceptance, one leg per mode; implies `rep1`, `growth`, `o02`), `acceptance` (Linux OLTP acceptance, default mode; implies `growth`, `o02`), `o02` (O01 and O02 with an OLAP server and the engine matrix, plus T02), `growth` (O16, O26 on the shared build; O21, O28 on one opt-level-1 build), `rep1` (REP1-REP5 process suites), `rep4-mixed` (mixed-version enrollment), `o22` (adds O22 to `scenarios`), `blackhole` (AZ1/AZ2 packet-drop failover), `migrate` (MIG1/MIG2 upgrade), `live3`, `live3-fixture`, `campaign`, `docker`, `memory`, `bench`, `perf`, `g7`, `gc1`, `perf1`, `snap1`, `engine-tests` (Cache and OLAP suites), `check-tests` (shared Rust crates), `features` (engine feature checks and S3 loopback), `clippy`, `quarantine`, `fuzz`, `mutants`. Unknown names fail the run, and the summary lists the resolved set. |
 | `checks` | Comma-separated IDs from `docs/testing/checks/*.toml` on the tested SHA. The `checks` job runs one matrix leg per ID and installs only the declared requirements. |
 | `fuzz_seconds` (default 300) | Seconds per target for `jobs=fuzz`. The nightly sets 3600. |
 | `scenarios` | Comma-separated OLTP acceptance scenarios (O01-O29) run on the shared build, one job per scenario and mode. |
@@ -63,8 +60,9 @@ The workflow is `.github/workflows/nabedra-build.yml`. Its dispatch inputs:
 | `repeat` (default 1) | Runs of each `tests` entry. Use 20 or more for flake evidence. |
 | `modes` (default `on,off`) | direct_oltp modes for `direct`, `scenarios` and `tests`. |
 
-The `build` job compiles the debug OLTP server and every OLTP test executable once. Every job that
-tests that build downloads it instead of compiling.
+The `build` job shares one debug OLTP build with the jobs that use it. A dispatch that only
+repeats exact library tests builds the server and library test executables. The full OLTP
+suite and acceptance jobs also build the integration test executables.
 
 The `fuzz` job runs each target in `server/fuzz/fuzz_targets/` with a pinned Rust nightly. Crashes
 are available in `fuzz-crashes-<target>`. The `mutants` job runs cargo-mutants on Rust changes in
@@ -110,8 +108,8 @@ gh workflow run nabedra-build.yml --ref "$BRANCH" -f sha="$SHA" -f request_id="$
 The code under test is `sha`. The job definitions come from the head of `--ref` at dispatch time.
 So a commit that changes the workflow must be the branch head when you dispatch it. Later pushes
 to the branch change neither. A typical iteration is `-f base=false -f tests="<path>" -f repeat=5`
-or `-f base=false -f scenarios=O07`. Final evidence for a change is a full run on its final commit,
-for example `-f jobs=direct,acceptance`.
+or `-f base=false -f scenarios=O07`. Run the required verification on the final commit. For a change that needs the full OLTP
+acceptance suite, use `-f jobs=direct,acceptance`.
 
 ## Find your run
 
@@ -188,8 +186,8 @@ and quarantined items in their own lines. If a job went green on a rerun, record
 ## Quarantine
 
 `.github/quarantine.tsv` lists known-flaky and known-failing tests and scenarios. Blocking jobs skip
-them. The non-blocking `quarantine` job runs each test 5 times and each scenario in both modes, and
-reports the counts. Each row has `id` (a full test path or a scenario ID), `kind`, `owner`, `added`,
+them. The manually dispatched `quarantine` job is non-blocking and reports the counts
+from 5 runs per test and both modes per scenario. Each row has `id` (a full test path or a scenario ID), `kind`, `owner`, `added`,
 `expires` and `exit_criteria`. `python3 scripts/ci_quarantine.py check` validates the file.
 
 - **Who quarantines.** The orchestrator owns the file: the lead of the current wave, or the single
