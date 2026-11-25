@@ -30,6 +30,7 @@ use serde_json::{Value, json};
 
 use crate::rng::stream_seed;
 use crate::shrink::{self, DEFAULT_SHRINK_BUDGET};
+use crate::tla_trace;
 
 /// What one run of one seed produced.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -295,12 +296,12 @@ impl SweepReport {
 /// Runs `run` once on `g`, turning a panic into a violation. The choices consumed stay
 /// on `g`, which the shrinker reads back.
 fn guarded(run: &(impl Fn(u64, &mut Gen) -> SeedRun + Sync), seed: u64, g: &mut Gen) -> SeedRun {
-    let mut result =
-        panic::catch_unwind(AssertUnwindSafe(|| run(seed, g))).unwrap_or_else(|payload| SeedRun {
-            seed,
-            violations: vec![format!("harness: panic: {}", panic_text(&*payload))],
-            ..SeedRun::default()
-        });
+    let outcome = tla_trace::attributed(|| panic::catch_unwind(AssertUnwindSafe(|| run(seed, g))));
+    let mut result = outcome.unwrap_or_else(|payload| SeedRun {
+        seed,
+        violations: vec![format!("harness: panic: {}", panic_text(&*payload))],
+        ..SeedRun::default()
+    });
     result.seed = seed;
     if result.tape.is_empty() {
         result.tape = g.tape().to_vec();
@@ -429,7 +430,8 @@ fn report_failure(
     let shrunk = (config.shrink && !first.passed() && deterministic).then(|| {
         let kinds = shrink::kinds(&first.violations);
         shrink::shrink_tape(first.tape.clone(), &kinds, config.shrink_budget, |g| {
-            guarded(run, seed, g).violations
+            // A candidate tape is another run of this seed, so it must not take its trace.
+            tla_trace::suppressed(|| guarded(run, seed, g).violations)
         })
     });
     let mut write = |name: &str, bytes: &[u8]| {
@@ -583,9 +585,10 @@ impl PlantedSearch {
                 break;
             }
             let results = parallel_map(&batch, self.jobs, |&seed| {
-                panic::catch_unwind(AssertUnwindSafe(|| run(seed))).unwrap_or_else(|payload| {
-                    vec![format!("harness: panic: {}", panic_text(&*payload))]
-                })
+                tla_trace::attributed(|| panic::catch_unwind(AssertUnwindSafe(|| run(seed))))
+                    .unwrap_or_else(|payload| {
+                        vec![format!("harness: panic: {}", panic_text(&*payload))]
+                    })
             });
             for (seed, violations) in batch.into_iter().zip(results) {
                 tried += 1;

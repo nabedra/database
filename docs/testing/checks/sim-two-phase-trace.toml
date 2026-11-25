@@ -1,0 +1,29 @@
+# The shared nabedra.trace/1 writer and fault subscriber (server/sim/src/tla_trace), end to end: a
+# simulated two-phase commit with crashes, partitions, drops and duplicates writes 26 traces that TLC
+# must accept against specs/selftest/TwoPhaseTrace.tla, and 20 that it must reject at the line each
+# name gives: 18 hand-edited (an RMPrepare or a TMCrash line dropped, two steps swapped, a variable, a
+# state or a message corrupted) and 2 recorded from planted defects of the workload. Dropping a line
+# the spec cannot miss, a DropMessage or a TMResend, is accepted. It shows that the writer and the tools
+# work, and nothing about a product module.
+id = "sim-two-phase-trace"
+module = "sim"
+kinds = ["T"]
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+traces="$PWD/target/sim-two-phase-trace"
+rm -rf "$traces"
+export NABEDRA_TRACE_DIR="$traces/accepted"
+export RUSTFLAGS="--cfg tokio_unstable"
+export CARGO_TARGET_DIR="$PWD/server/target/sim"
+cargo test --locked -j 2 -p nabedra-sim --manifest-path server/Cargo.toml --test two_phase_trace
+# A run without its traces must not pass on the rejections alone.
+test "$(find "$traces/accepted" -name "TwoPhase-*.ndjson" | wc -l)" -eq 26
+test "$(find "$traces/rejected" -name "TwoPhase-*.ndjson" | wc -l)" -eq 20
+exec python3 scripts/testing/tla_trace.py check specs/selftest TwoPhase "$traces/accepted" --expect-rejected "$traces/rejected" --module sim
+''']
+cwd = "."
+timeout_s = 2400
+needs = ["tlc"]
+result_parser = "tlc"
