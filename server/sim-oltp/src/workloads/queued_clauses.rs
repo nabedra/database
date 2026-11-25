@@ -701,6 +701,9 @@ mod tests {
         ];
         assert!(names(&log, &[]).is_empty());
         log.retained[2].required = 3;
+        let third = log.retained.remove(2);
+        assert!(names(&log, &[]).is_empty(), "one worker was not compared");
+        log.retained.insert(2, third);
         log.retained[3].pending = 1;
         assert_eq!(
             names(&log, &[]),

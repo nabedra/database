@@ -90,8 +90,6 @@ const ACCEPT_WAIT: Duration = Duration::from_secs(1);
 const WATCHED: usize = 8;
 /// One frozen worker stays so for at least this long, so that the rest can accept.
 const ALONE: Duration = Duration::from_secs(2);
-/// How many expired records may stay when new ones are counted.
-const STUCK: u64 = 2;
 const THAW_LIMIT: Duration = Duration::from_secs(5);
 const READY_LIMIT: Duration = Duration::from_secs(2);
 const SPLIT_LIMIT: Duration = Duration::from_secs(60);
@@ -2090,27 +2088,39 @@ async fn counters(cluster: &Cluster, node: u64) -> Result<(u64, u64), String> {
     Ok((count("accepted_records")?, pending))
 }
 
-/// The accepted records of every worker, at a point from which the count can only grow: results
-/// of a long retention do not expire within a run, and with a short one this waits until every
-/// older result has. A few records that stay although their results expired may leave at any
-/// time, so they are not counted: what is held later must then be enough without them.
-async fn baseline(q: &Q, cluster: &Cluster) -> Result<BTreeMap<u64, u64>, String> {
+/// The workers whose count can only grow from now on, with their accepted records: results of a
+/// long retention do not expire within a run, and with a short one a worker has to be empty. A
+/// record that stays although its result expired may leave at any time, and would hide a lost
+/// one while it is there (review 132, second pass).
+fn comparable(counts: BTreeMap<u64, u64>, long: bool) -> BTreeMap<u64, u64> {
+    counts
+        .into_iter()
+        .filter(|(_, count)| long || *count == 0)
+        .collect()
+}
+
+/// The [`comparable`] workers, once every worker is one or the older results had time to expire.
+/// A worker that is not is named in the summary and not compared.
+async fn baseline(q: &Q, cluster: &Cluster, what: &str) -> Result<BTreeMap<u64, u64>, String> {
     let give_up = q.now() + q.mode.retention_ms + 10_000;
     loop {
         let mut counts = BTreeMap::new();
         for node in WORKERS {
             counts.insert(node, counters(cluster, node).await?.0);
         }
-        let empty = counts.values().all(|count| *count == 0);
-        if empty || q.mode.retention_ms >= LONG_RETENTION_MS {
-            return Ok(counts);
+        let long = q.mode.retention_ms >= LONG_RETENTION_MS;
+        let ready = comparable(counts.clone(), long);
+        if ready.len() == WORKERS.len() {
+            return Ok(ready);
         }
         if q.now() >= give_up {
-            if counts.values().any(|count| *count > STUCK) {
-                return Err(format!("older records did not expire: {counts:?}"));
+            for (node, count) in counts {
+                if !ready.contains_key(&node) {
+                    let why = format!("{what}: n{node} still has {count} older records");
+                    q.skip(cluster, why);
+                }
             }
-            cluster.record(format!("queued: older records did not expire: {counts:?}"));
-            return Ok(WORKERS.map(|node| (node, 0)).into());
+            return Ok(ready);
         }
         time::sleep(Duration::from_millis(250)).await;
     }
@@ -2123,7 +2133,8 @@ async fn copies(q: &Q, cluster: &Cluster, when: &str) {
     if q.mode.scoped {
         return;
     }
-    let before = match baseline(q, cluster).await {
+    let what = format!("copies {when}");
+    let before = match baseline(q, cluster, &what).await {
         Ok(before) if cluster.converged().await => before,
         Ok(_) => {
             return q.skip(
@@ -2153,11 +2164,14 @@ async fn copies(q: &Q, cluster: &Cluster, when: &str) {
         "queued copies {when}: {required} accepted, before {before:?}, after {after:?}"
     ));
     for (node, (accepted, pending)) in after {
+        let Some(&before) = before.get(&node) else {
+            continue;
+        };
         q.shared.lock().unwrap().log.retained.push(Retained {
             node,
             holder: Holder::Ready,
             required,
-            before: before[&node],
+            before,
             after: accepted,
             pending,
             at,
@@ -2312,7 +2326,7 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
     }
     let old = cluster.config.run_id;
     let before = if finale == Finale::LastHolder {
-        match baseline(q, cluster).await {
+        match baseline(q, cluster, "last holder").await {
             Ok(before) => Some(before),
             Err(error) => {
                 q.skip(cluster, format!("last holder: {error}"));
@@ -2489,7 +2503,7 @@ async fn last_holder(
         cluster.record(format!(
             "last holder n{last}: {before:?} before, {accepted} records, {pending} pending, {required} required"
         ));
-        let Some(before) = before.as_ref().map(|before| before[&last]) else {
+        let Some(&before) = before.as_ref().and_then(|before| before.get(&last)) else {
             continue;
         };
         q.shared.lock().unwrap().log.retained.push(Retained {
@@ -2998,6 +3012,17 @@ mod tests {
             progress("rolling restart", &work(0, 1, 0)),
             ("RollingRestartProgress", vec!["write committed"])
         );
+    }
+
+    /// Review 132, second pass: two stuck records on a worker hid two lost ones of six.
+    #[test]
+    fn a_worker_with_older_records_is_compared_only_when_none_can_leave() {
+        let counts = BTreeMap::from([(1, 2), (2, 0), (3, 0)]);
+        assert_eq!(
+            comparable(counts.clone(), false),
+            BTreeMap::from([(2, 0), (3, 0)])
+        );
+        assert_eq!(comparable(counts.clone(), true), counts);
     }
 
     #[test]

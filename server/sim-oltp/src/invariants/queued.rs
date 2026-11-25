@@ -233,8 +233,7 @@ pub(crate) enum Holder {
 
 /// The request records of one worker before and after some requests were accepted, from its
 /// public stats. Nothing may leave the queue between the two counts, so the difference counts
-/// the new requests alone: either the first count is zero, or no result can have expired yet. At
-/// most two expired records that were still there are counted as zero.
+/// the new requests alone: either the first count is zero, or no result can have expired yet.
 #[derive(Clone, Debug)]
 pub(crate) struct Retained {
     pub node: u64,
