@@ -176,6 +176,21 @@ impl Split {
         split
     }
 
+    #[cfg(test)]
+    pub(crate) fn published_at(op: Operator, at: u64, result: Value) -> Self {
+        let state = SplitState {
+            plans: vec![plan(Uuid::nil())],
+            published: Some((at, Uuid::nil(), result)),
+            ..SplitState::default()
+        };
+        Self {
+            op,
+            payload: Value::Null,
+            state: Arc::new(Mutex::new(state)),
+            task: None,
+        }
+    }
+
     fn state(&self) -> MutexGuard<'_, SplitState> {
         self.state.lock().unwrap()
     }

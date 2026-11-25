@@ -1145,8 +1145,11 @@ impl Chaos {
 
     /// After the heal: a split that did not publish under chaos must publish now (D07). The
     /// operator may replace a refused plan. The bound runs from `from`, so a wait for something
-    /// else does not extend it.
-    pub(crate) async fn finish_split(&mut self, cluster: &mut Cluster, from: Duration) {
+    /// else does not extend it. A split that published since the last tick is noted as well: the
+    /// later stages aim at the leader of the range that serves the table now.
+    /// Returns whether it was pending.
+    pub(crate) async fn settle_split(&mut self, cluster: &mut Cluster, from: Duration) -> bool {
+        let pending = self.split_pending();
         let deadline = from + SPLIT_LIMIT;
         while self.split_pending() && cluster.world.elapsed() < deadline {
             time::sleep(Duration::from_millis(250)).await;
@@ -1167,6 +1170,7 @@ impl Chaos {
                 ),
             );
         }
+        pending
     }
 
     /// A split was requested in this run.
@@ -1187,5 +1191,39 @@ impl Chaos {
 
     pub(crate) fn resets(&self) -> u64 {
         self.faults.resets()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::Config, invariants::Invariants, nemesis::Selection};
+
+    /// Re-review of #115: direct seeds 24 and 564. The split published during the heal, nothing
+    /// noted it, and D05 paused the leader of the child that serves its key.
+    #[test]
+    fn a_split_that_published_after_the_last_tick_is_noted() {
+        nabedra_sim::runtime::run(1, |world| async move {
+            Config::sample(1).setup(&world);
+            let trace: crate::invariants::TraceObserver = Arc::new(|_, _| {});
+            let mut cluster = Cluster::new(world, Invariants::new(), 1, trace, |_, _, _| {})
+                .await
+                .unwrap();
+            let faults = NetFaults::for_test(&cluster.world);
+            let profile = Selection::parse(&[]).unwrap().profile(1);
+            let mut g = Gen::from_seed(1);
+            let mut chaos = Chaos::new(&cluster.world, profile, faults, 0, &mut g);
+            let id = chaos.open(&cluster, Action::Split, &[]);
+            let child = Uuid::from_u128(7);
+            let result = json!({"state": "published", "children": [{"group_id": child}]});
+            chaos.split = Some((id, Split::published_at(cluster.operator(), 5, result)));
+            cluster.watch_range(Uuid::nil());
+            let from = cluster.world.elapsed();
+            assert!(!chaos.split_pending());
+            assert!(!chaos.settle_split(&mut cluster, from).await);
+            assert_eq!(cluster.range(), Some(child));
+            assert_eq!(chaos.log[id].to, Some(5));
+            assert_eq!(chaos.log[id].effects, [Effect::at(5)]);
+        });
     }
 }
