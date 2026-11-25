@@ -1,104 +1,137 @@
-# Searching 10,000 seeds in shards (design, not implemented)
+# Searching 10,000 seeds in shards
 
-Nothing here is in `sim_bugs.py`. Until it is, a search runs in one job from seed 1, and one that does not finish is
-`incomplete`. The merge step is counting logic, so it gets its own change and its own review.
-
-## Cost
-
-Figures of the second review of #113. The model is arithmetic, not a run: a patched seed runs once, a base seed once (twice
-if red), and each hit that is judged four times on one thread. The inputs were measured on Actions: 3.17 CPU s per `direct` run,
-2.94 per `cold`, 3.69 per `move`, at about 2.6 effective cores with 3 jobs, and a peak RSS of 2.5 to 3.3 GB for 30 seeds.
-
-| Per target, 10,000 seeds | Core-hours | Wall on one runner |
-| --- | --- | --- |
-| 0.5 to 1 CPU s per seed, quiet main | 2.8 to 5.6 | 1.1 to 2.1 h |
-| Measured cost, quiet main | 16 to 20 | 6.3 to 7.9 h |
-| Measured cost, red rates of 2026-11-24 | 28 (`cold`), 29 (`direct`), 62 (`move`) | 12.7, 13.3 and 43 h |
-| The same, judging only seeds that the base run has green | 24 to 30 | 9.4 to 11.7 h |
-
-All five targets cost about 90 core-hours on a quiet main at the measured cost, and 177 at those red rates. One check of 18,000 s holds
-about 13. The red rates come from unpatched seeds at `712c6459`: 27 of 30 `direct`, 29 of 30 `move` and 30 of 30 `cold` are
-red, `ResourceBaseline` in 82 of the 86. Until that is explained, about one `direct` seed in ten can count.
-
-acc3-cold-fence is not shown and is not searched. That leaves four targets: about 72 core-hours, scaled from the 90 for five.
+`sim_bugs.py shard`, `merge` and `count`. A target's seeds are split over attested jobs, and the counting run reads their
+records. The rule for what counts is in [README.md](README.md) and does not change. Lead decision 13.2 governs the merge.
 
 ## Checks
 
 | Check | Runs |
 | --- | --- |
-| `oltp-sim-bugs-<id>-1` to `-4` | One shard each: seeds 1 to 2,500, 2,501 to 5,000, 5,001 to 7,500, 7,501 to 10,000 of one target. 16 checks for four targets. |
-| `oltp-sim-bugs-<id>` | The counting run of one target, on main. |
-| `oltp-sim-bugs-direct` | All five targets' results, as the acceptance record. It cannot pass while ACC3 is not shown. |
+| `oltp-sim-bugs-<id>-1` to `-4` | One shard each: seeds 1 to 2,500, 2,501 to 5,000, 5,001 to 7,500, 7,501 to 10,000 of one target. 16 checks for the four phase 10 targets that can be found. |
+| `oltp-sim-bugs-<id>` | The counting run of one target. |
+| `oltp-sim-bugs-direct` | The counting run of all five targets: the acceptance record. It cannot pass while ACC3 is not shown. |
 
-16 shard jobs are one pass. The reviewer costed two waves of eight jobs under the nightly's cap of 8. The lead allows two waves
-of 16, and the account runs 20 jobs at once. Either way the first range of every target starts first, because a hit there makes the
-other ranges unnecessary. On a quiet main a shard takes 1.6 to 2 h plus its builds, and 2.4 to 2.9 h at the red rates above. The limit is 18,000 s.
+A pass of a shard says that its range ran to the end. It is no detection and claims no guarantee. Phase 11 targets get their shard checks with their
+workloads.
+
+**Dispatch a shard from the commit it tests**: `--ref` a branch at that commit, and `sha=` the same commit. The attestation names the commit of the
+workflow that ran. The tool accepts only the tested commit there, so a branch with another workflow cannot write a record.
 
 ## A shard
 
+`sim_bugs.py shard <id> --shard 2/4`:
+
 1. `check`, then build the unpatched sweep.
-2. The **base run first**: the unpatched build on every seed of the range, in chunks, with kinds, trace hash and
-   determinism per seed.
+2. The **base run first**: the unpatched build on every seed of the range, in chunks, with kinds, trace hash and determinism per seed. A
+   passing seed runs once and a red one twice.
 3. Build the patched sweep and reset the tree.
-4. The patched build on every seed of the range, in chunks.
-5. A seed that reports an expected kind and is red in the base run is masked as `base-red`, with no replay. The base
-   run is the twin's own run, so this is decision 8's red twin at the cost of nothing. A base seed that is not deterministic is red.
-6. Any other seed that reports an expected kind is judged as today: patched replay, clean twin, and the same masks. The
-   twin has to have the base run's trace hash, or the shard is an `error`.
-7. The shard goes on after a hit. It never decides whether a hit counts.
-8. Only at the end it prints its rows and then one line `sim-bugs-shard: complete`, with the range, the number of rows and the
-   SHA-256 over them. The log is attested, so it covers them.
+4. The patched build on every seed of the range, the same way. Every seed, also one whose base run is red: the patched rate is reported.
+5. A seed that reports an expected kind and is red in the base run is masked as `base-red`, with no replay. The base run is the
+   twin's own run. A base seed that is not deterministic is red.
+6. Any other seed that reports an expected kind is replayed alone on the patched build, and then on the unpatched one unless the first
+   replay masks it. The masks are the README's. The twin has to have the base run's kinds and trace hash, or the shard is an `error`.
+7. The shard goes on after a hit. It never decides whether a hit counts. `[[masked]]` of the manifest is the merge's.
+8. Only at the end it prints its rows and then one line `sim-bugs-shard: complete`, with the key below, the range, the number of
+   rows and the SHA-256 over them. The log is attested, so it covers them.
 
 **A run that dies is an `error`, not clean seeds.** A shard without its `complete` line (a signal, out of memory, a lost
-runner, a timeout, a missing or unreadable seed line) contributes nothing, not even the chunks it finished. Its range has
-to run again. A seed on which the harness panicked is a row with the kind `harness`: tried, not clean, listed in the result. The
-harness prints that row only with `sweep.rs` changed (a patch for P10-WORKLOADS). Without it, such a seed makes its
-shard an `error` on every run.
+runner, a time limit, a missing or unreadable seed line) contributes nothing, not even the chunks it finished. Its range has
+to run again. A seed on which the harness panicked is a row with the kind `harness`: tried, not clean, listed in the result.
+
+Steps 2 and 4 are ordinary sweeps. `NABEDRA_SIM_EXPECT` would stop at each hit and lose the rest of its parallel batch, and it
+reports no trace hash. Both modes report the kinds of the same run of a seed.
 
 ## What a row is for
 
-Each row carries its **key**: the target, the plan, the review digest of the patch, the range, and the build. The build is the Git tree
-of HEAD without the targets' own files, so it is the same on two commits that differ only in manifests. Rows of two keys never
-mix. The key does not name a machine, and recorded hashes agreed between machines in the 90 seeds measured so far.
+The `complete` line carries the **key** of the rows: the target, the plan, the review digest of the patch, the digest of its changed lines, the
+harness defect (none) and the build. The build is the Git tree of the commit without the targets' own files, so it is the same on two
+commits that differ only in manifests. Rows of two keys never mix. The plan, the patch or anything else in the build makes another key,
+and earlier merges stay in `searches.jsonl`.
 
-**Resume** is by whole shard. A shard that is complete for a key does not run again when `[[masked]]` or `[detection]` are
-committed, because the key does not change. If it does run again, both sets of rows have to be equal, seed by seed, in
-kinds, trace hash and masks. A difference makes the target an `error`: it is nondeterminism, and neither run wins. The plan,
-the patch or anything else in the build makes another key, and the earlier rows stay in `searches.jsonl`.
+A shard that is complete for a key does not run again when `[[masked]]` or `[detection]` are committed. If it does run again, both
+sets of rows have to be equal, seed by seed. A difference makes the target an `error`, wherever it is: it is
+nondeterminism, and neither run wins.
 
-## The merge step
+## The merge
 
-`sim_bugs.py merge <id> --records <dir>` reads downloaded evidence artifacts. A reviewer who wrote neither the patch nor the
-workload runs it, after `gh attestation verify` on every record. It refuses unless
+`sim_bugs.py merge <id> --records <dir>` reads downloaded evidence: for every shard the record, its log and its attestation as
+`sha256-<digest of the record>.jsonl` (`gh attestation download` writes it). It verifies each signature itself. A record is a shard only if
 
-- every shard's log has the SHA-256 that its record names, the record is of this repository's `checks` job, the tree was clean and the attempt is
-  named;
-- every shard has the same key and its `complete` line fits its rows;
-- the ranges up to the answer have no gap and no overlap, and every seed has one row.
+- `gh attestation verify` accepts it for this repository, the build workflow, a GitHub-hosted runner and the record's own commit, and the
+  certificate names a dispatch, and the run and the attempt that the record names;
+- its result is `pass`, its tree was clean, and its check is the one of that shard;
+- the one log it names is there, and names the same commit, run and attempt;
+- the log is whole: one `complete` line, after it nothing, and before it exactly the rows it names, one per seed and in order;
+- every row says by itself why its seed can or cannot count, and its replays fit;
+- it has this checkout's key, and its commit is in the clone and has that build.
 
-Its answer is the lowest seed that nothing masks, with `[[masked]]` of the manifest applied. **A hit in a higher range counts only when
-every lower range is complete.** `not-detected` needs all four ranges and the base rate over all 10,000 seeds. A range that
-is missing, died or unattested makes the answer `incomplete`, and one that disagrees makes it `error`, never `not-detected`.
+Everything else is no shard, and the merge prints why. The answer is the lowest seed that nothing masks, with `[[masked]]` of the manifest
+applied. **A hit counts only when every lower range is complete.** `not-detected` needs all ranges. A range that is missing,
+died, is unattested or is of another commit makes the answer `incomplete`. Ranges above the hit are not needed.
 
-It appends one entry of kind `merge` to `searches.jsonl`: the key, the answer, masks, base and patched rates, and per range the
-run URL, attempt, record and row digests. That entry goes through review like `[detection]`. `evidence` compares it with the logs.
+| Answer | Meaning |
+| --- | --- |
+| `candidate` | The lowest unmasked hit. Rates and masks are over seeds 1 to the hit. Unmasked seeds above it in its range are listed and nothing more. |
+| `not-detected` | Every range is complete and every hit is masked. |
+| `incomplete` | Says nothing. |
+| `error` | Two runs of one range differ. Says nothing. |
+
+`--record` appends an answer (`candidate` or `not-detected`) to `searches.jsonl` as an entry of kind `merge`. `[detection]` names its hash.
 
 ## The counting run
 
-On main, for one target. It derives again everything that says the hit is real: both builds, the patched replay, the clean
-twin, the base run of the hit and its neighbours up to the chunk size, the confirmation, and the regression without and with
-the patch. It does not search seeds 1 to the hit again.
+`sim_bugs.py count <id>`, at a commit that has main's build. It does not trust the merge entry. It
 
-Lead decision 13.2: it does not trust the merge entry for earlier hits or the base rate. It recomputes both from the shards'
-attested records, which it downloads and verifies itself, and refuses an entry that differs. A missing or unattested
-shard makes the target `incomplete`. So the records and logs of every shard have to be available when the counting run
-starts, and their signatures have to be verified in that job. How is not designed yet.
+1. reads the records from `<id>/` of the branch `evidence/sim-bugs` (or `--records <dir>`), verifies and merges them again;
+2. refuses a recorded merge that differs (`error`). Without one the hit is a candidate;
+3. builds both sweeps, which have to be the shards' binaries;
+4. replays the hit on both builds, which has to give its shard's row, and runs the base run of the hit and its neighbours up to the chunk
+   size again, which has to give their rows (`error` otherwise);
+5. applies everything of "What has to be there", and runs the regression without and with the patch.
 
-## Tests the change needs
+It does not search seeds 1 to the hit again. A missing or unattested shard makes the target `incomplete`.
 
-Each first as a failing test, with the fake harness: a shard without its line, with a line for other rows, with a missing,
-doubled or foreign seed; two shards of different keys, SHAs of different builds, overlapping ranges, a gap below the hit;
-a higher hit with a lower range missing, dead or disagreeing; rerun rows that differ; a base-red seed counted as a hit; a twin with
-another trace hash than the base run; an edited merge entry, and one that hides an earlier hit or a base rate; a missing or
-unattested shard in the counting run; a record whose log digest is another's; a dead shard
-counted as clean seeds; and `not-detected` from three ranges.
+The job needs no token and no workflow change. The `checks` job fetches every branch, so the records, logs and attestations are in its clone,
+and `gh attestation verify --bundle` needs neither login nor the API. Nothing on that branch is trusted: what is not signed is not there.
+
+Binaries of one commit have the same digest on every runner that was compared, so the shards of one merge and the counting run have to have the same
+ones.
+
+## What this design had left open
+
+Each took the refusing answer.
+
+| Open | Taken |
+| --- | --- |
+| How the counting run gets and verifies the records | The branch and the offline verification above. |
+| Shards of two commits with one key | `incomplete`. The shards of one merge are of one commit. The counting run may be of a later one with the same build. |
+| The commit of the workflow | It has to be the tested commit. |
+| The same seeds in two splits, or two binaries | `incomplete`. |
+| A patched replay with the sweep's kinds and another trace hash | Masked as `search-replay-disagree`. |
+| A disagreement in a range above the hit | `error` for the target. |
+| A merge entry with no answer | Not recorded. The attested logs keep `incomplete` runs. |
+| A target that cannot count | It has no shard. `shard` and `count` say `not-shown` or `no-detector`. |
+
+**Shared base runs are not implemented.** The unpatched results of two targets with the same build, workload and profile are equal. No two
+targets that can be searched have the same ones: the four of phase 10 differ in profile, and in phase 11 only `acc2` and `topo1-child-schema`
+share theirs, and the second is held.
+
+## Cost
+
+From the attested sweeps of run 45668293011 at `137c2a2e` (240 seeds per shard of `oltp-sim`, every seed twice, 4 jobs): 3.9 CPU s per run of `direct`
+and 5.6 of `move`, 3.75 effective cores, 5.1 GB peak RSS. Nearly every base seed is red (220 of 240 `direct`, 240 of 240 `move`),
+and a red seed runs twice on both builds.
+
+| Per shard of 2,500 seeds | Runs | CPU | Wall, without about 20 minutes of builds |
+| --- | --- | --- | --- |
+| `direct` | 10,000 at most | 10.9 h | 2.9 h |
+| `move` | 10,000 at most | 15.5 h | 4.1 h |
+
+Three `direct` targets and one `move` target: about 193 core-hours, or 51 runner-hours. A shard's limit is 17,400 s.
+
+## What it cannot prove
+
+- That nobody left out a run. A shard that ran twice with other rows is an `error` only if both records are on the branch. The Actions runs of the
+  checks are visible, and a reviewer lists them.
+- That a row is what the harness said. The attested job's own tool wrote it, from the commit the key names.
+- What the README lists for every search: an invented confirmer, a mask for a finding that is not there, a hunk that acts only in the simulator.

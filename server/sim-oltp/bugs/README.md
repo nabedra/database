@@ -4,7 +4,8 @@ Each directory holds one reverted fix: a patch that brings a known bug back, and
 here, later phases in `phase<N>/`. `scripts/testing/sim_bugs.py` applies a patch only in a scratch worktree. A target
 is found when the simulator detects the reverted fix by the rule below. Results are fault-model evidence.
 
-[SHARDS.md](SHARDS.md) is the design for searching 10,000 seeds in shards. It is not implemented.
+A search is one job (`run`), or several that each search a part of the seeds (`shard`, `merge` and `count`, in
+[SHARDS.md](SHARDS.md)). The rule is the same.
 
 ## Files
 
@@ -13,7 +14,7 @@ is found when the simulator detects the reverted fix by the rule below. Results 
 | `bug.toml` | The manifest. |
 | `revert.patch` | The patch. It changes product sources only, in the form `git diff` writes. Nothing before, between or after its `diff --git` sections. Plain ASCII, in lines of at most 200 characters. |
 | `probe.patch` | Only with `regression.probe = true`: the test that the regression runs, for a fix whose own test is not a steady proof. Same form, only added lines. See "What a probe may add". `verify` applies it to both builds. No sweep ever contains it. |
-| `searches.jsonl` | Every search of the target, also those that a later one replaced. Append-only. Written by `sim_bugs.py record`. |
+| `searches.jsonl` | Every search of the target, also those that a later one replaced. Append-only. Written by `sim_bugs.py record` and `merge --record`. |
 
 No other file may be in a target's directory. A committed target or record cannot leave the tree, and a target keeps its bug record, phase and set. A target that a
 spare replaces stays listed as not detected.
@@ -35,13 +36,15 @@ would still compile such a block, so a reviewer looks at where the block stands.
 ## The search rule
 
 1. The seeds are tried in order from 1 to 10,000. `workload`, `profile`, `expect` and `seeds` are the plan, written in
-   the manifest before the first result. No search resumes another: each run starts at seed 1.
+   the manifest before the first result. No search resumes another: each run starts at seed 1, and shards count
+   only together, from seed 1 without a gap.
 2. A seed that reports an expected kind is replayed alone, twice, on the patched build and on the unpatched build.
    It is masked, recorded, counted towards the 10,000, and the search goes on, when
    - the unpatched twin reports anything (`twin-red`);
    - the patched replay is not deterministic (`nondeterministic`) or reports other kinds than the search
      (`search-replay-disagree`);
    - a kind is a fault of the harness (`harness-fault`);
+   - its own base run is red (`base-red`, in shards, where the base run comes first). That run is the twin's;
    - both builds have the same trace (`same-trace`). Every history event and every violation is a trace line, so equal
      traces have equal verdicts;
    - the manifest says that this exact hit shows a known finding (`known-finding`).
@@ -154,13 +157,15 @@ of the trace that is neither the violation nor the client history, and that the 
 
 ## From a hit to a detection
 
-1. Dispatch the search. A new hit is a candidate, and the job fails.
-2. Download the artifact and `sim_bugs.py record <id> --from sim-bugs-run.json`. Commit `searches.jsonl`.
+1. Dispatch the search, or its shards (SHARDS.md says from which commit). A new hit is a candidate.
+2. Download the artifacts. Of a search in one job: `sim_bugs.py record <id> --from sim-bugs-run.json`. Of shards: their records, logs
+   and attestations (`gh attestation download`, named `sha256-<digest>.jsonl`) go into `<id>/` of the branch `evidence/sim-bugs`, and
+   `sim_bugs.py merge <id> --record` gives the answer. Commit `searches.jsonl`.
 3. Someone who wrote neither the patch nor the workload reads the history and the trace against the known findings, and
    writes `[detection]` or `[[masked]]`.
 4. A reviewer of that change does the "reread" column below and runs `evidence` (step 6). Merge with a merge commit: the
    evidence commits have to stay ancestors.
-5. Dispatch the search again on main.
+5. Dispatch the search again on main, or the counting run `oltp-sim-bugs-<id>` of shards.
 6. Compare the records with the attested logs. Download the `evidence-*` artifacts of every cited run into one
    directory, verify each record with `gh attestation verify`, and run `sim_bugs.py evidence --records <dir>`. This is a
    required step of the merge, and no tool enforces it.
@@ -170,12 +175,13 @@ A manifest whose plan changed and was never run is accounted for with
 
 ## What the tool cannot prove
 
-Four gaps stay open however the manifest looks. Each needs someone to reread something.
+Five gaps stay open however the manifest looks. Each needs someone to reread something.
 
 | Gap | What can happen | What to reread |
 | --- | --- | --- |
 | **An invented confirmer, or wrong prose** | A false detection counts. The names are free text: one model under two labels, or a name nobody has, passes. A hit whose schedule exposed DR-1 or DR-2 can carry prose about the reverted fix. The quoted lines have to exist and have to be an event the twin lacks. They need not show the reverted path. | The hit's trace and history, from the artifact of the attested run, against the patch and the known findings. Nothing in the manifest replaces it. |
-| **A hand-written search record** | No false hit, because the counting run derives the seed, trace, history, twin, base rate and regression again. It hides an earlier search. | `sim_bugs.py evidence` against the attested logs, and the traces of the searches it lists. |
+| **A hand-written search record** | No false hit, because the counting run derives the seed, trace, history, twin, base rate and regression again. A merge is refused when the attested records give another. It hides an earlier search. | `sim_bugs.py evidence` against the attested logs, and the traces of the searches it lists. |
+| **A shard's record left off the branch** | No false hit from it: a missing range is `incomplete`. It hides a run whose rows differ. | The Actions runs of the shard checks, and that each one's record is on `evidence/sim-bugs`. |
 | **An unrecorded search under the same plan** | No false hit. It hides extra attempts: another main SHA is another 10,000 schedules. Actions runs are visible, local ones are not. | The Actions runs of the check, and what each one's trace hashes were. |
 | **A hunk that acts only in the simulator** | A false detection counts if the reviewer misses it. The path, text and cfg rules refuse the known ways. A hand port can still ask for a node ID, a thread name, a time or anything else the rules do not know. | Every hunk of the patch, at the digest that `[review]` names, and in the trace whether the event comes from the reverted hunk. |
 

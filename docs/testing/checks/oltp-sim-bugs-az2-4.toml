@@ -1,14 +1,14 @@
 id = "oltp-sim-bugs-az2-4"
 module = "oltp"
 kinds = ["S", "H"]
-# Shard 4 of 4 of the search for az2 (server/sim-oltp/bugs/SHARDS.md): seeds 7501 to 10000 on the unpatched build and on the
+# Shard 4 of 8 of the search for az2 (server/sim-oltp/bugs/SHARDS.md): seeds 3751 to 5000 on the unpatched build and on the
 # patched one. A pass says that the range ran to its end and nothing else: it is no detection and claims no guarantee. The log
 # holds one row per seed. `sim_bugs.py merge` and the counting run (oltp-sim-bugs-az2) read it. Dispatch it from the commit it
 # tests, or its attestation does not count.
 guarantees = []
 scenarios = []
 tiers = ["T3"]
-command = ["python3", "scripts/testing/sim_bugs.py", "shard", "az2", "--shard", "4/4", "--jobs", "4", "--sim-jobs", "4",
+command = ["python3", "scripts/testing/sim_bugs.py", "shard", "az2", "--shard", "4/8", "--jobs", "4", "--sim-jobs", "4",
            "--time-limit", "17400", "--out", "target/testing-logs/oltp-sim-bugs-az2-4"]
 cwd = "."
 timeout_s = 18000
