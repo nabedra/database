@@ -203,7 +203,9 @@ impl Probes {
             self.ran(NOT_APPLIED_NEVER_COMMITTED, 1);
             for key in keys(event, events) {
                 if let Some((t_ns, digests)) = committed.get(&(key.clone(), request.clone())) {
-                    if another_body(event, events, bodies, digests) {
+                    if std::env::var_os("P10W5_OLD_RULE").is_none()
+                        && another_body(event, events, bodies, digests)
+                    {
                         continue;
                     }
                     self.report(world, NOT_APPLIED_NEVER_COMMITTED, format!(
