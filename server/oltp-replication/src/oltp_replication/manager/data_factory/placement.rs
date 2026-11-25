@@ -194,13 +194,17 @@ impl ReplicaPlacement {
             .map_err(|_| invalid())?;
         let old = old.clone();
         let mut next = old.clone();
-        let any = std::env::var_os("P11_PLANT").is_some_and(|p| p == "any-voter");
+        let mut request = request;
+        if std::env::var_os("P11_PLANT").is_some_and(|p| p == "any-voter")
+            && let Some(member) = next.iter().find(|member| {
+                member.worker_id == self.factory.manager.client().local_identity().worker_id
+            })
+        {
+            request.remove_node = member.node_id;
+        }
         let source = next
             .iter_mut()
-            .find(|member| {
-                member.node_id == request.remove_node
-                    || (any && member.worker_id == self.factory.manager.client().local_identity().worker_id)
-            })
+            .find(|member| member.node_id == request.remove_node)
             .ok_or_else(conflict)?;
         let local = self.factory.manager.client().local_identity();
         let remote_source = source.worker_id != local.worker_id;
