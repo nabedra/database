@@ -58,8 +58,7 @@
 //! - KeyspaceCoverage: routes that a Catalog replica resolved from their transaction, at each
 //!   root. Routes that arrive by snapshot, and a page rewritten without a new root, are not
 //!   checked: only a new root publishes an epoch.
-//! - ExactlyOnceRelease: native leases, counted per node. Two errors that cancel out within a
-//!   node stay hidden, and a lease that is never released is left to ResourceBaseline.
+//! - ExactlyOnceRelease and ReleaseAfterWork: see [`super::resources`].
 //! - ResourceBaseline: see [`super::Invariants::check_resources`].
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -70,6 +69,8 @@ use nabedra_oltp_types::{
 };
 use nabedra_protocol::protocol::Key;
 use uuid::Uuid;
+
+use super::resources::{Guards, OVERLAY_BASELINE, RELEASE_AFTER_WORK};
 
 /// Names of the invariants this module reports.
 pub const ELECTION_SAFETY: &str = "ElectionSafety";
@@ -88,7 +89,7 @@ pub const EXACTLY_ONCE_RELEASE: &str = "ExactlyOnceRelease";
 pub const RESOURCE_BASELINE: &str = "ResourceBaseline";
 
 /// Every invariant the probe stream checks, for the run's assertion map.
-pub const PROBE_INVARIANTS: [&str; 12] = [
+pub const PROBE_INVARIANTS: [&str; 14] = [
     ELECTION_SAFETY,
     MONOTONIC_VOTE,
     MONOTONIC_COMMIT,
@@ -100,7 +101,9 @@ pub const PROBE_INVARIANTS: [&str; 12] = [
     RANGE_CLOCK_RULE1,
     KEYSPACE_COVERAGE,
     EXACTLY_ONCE_RELEASE,
+    RELEASE_AFTER_WORK,
     RESOURCE_BASELINE,
+    OVERLAY_BASELINE,
 ];
 
 pub type Violation = (&'static str, String);
@@ -287,8 +290,8 @@ pub struct Protocol {
     pages: BTreeMap<(Uuid, Uuid), BTreeMap<u64, Option<Page>>>,
     /// How often each rule ran on an event of its own.
     exercised: BTreeMap<&'static str, u64>,
-    /// Per live node: native leases acquired and released by this incarnation.
-    native: BTreeMap<u64, (u64, u64)>,
+    /// Native leases and pending Raft log writes.
+    guards: Guards,
     /// Per node: its last ledger snapshot.
     ledgers: BTreeMap<u64, Ledgers>,
 }
@@ -533,30 +536,18 @@ impl Protocol {
                         .or_default() += outstanding;
                 }
             }
-            Probe::GuardAcquired { .. } => {
-                if let Some(node) = node {
-                    self.native.entry(node).or_default().0 += 1;
+            Probe::GuardAcquired { .. }
+            | Probe::GuardReleased { .. }
+            | Probe::WorkStarted { .. }
+            | Probe::WorkDone { .. } => {
+                match probe {
+                    Probe::GuardReleased { .. } => self.ran(EXACTLY_ONCE_RELEASE, 1),
+                    Probe::WorkDone { .. } => self.ran(RELEASE_AFTER_WORK, 1),
+                    _ => {}
                 }
+                out.extend(self.guards.observe(node, origin.t_ns, probe));
             }
-            Probe::GuardReleased => {
-                if let Some(node) = node {
-                    self.ran(EXACTLY_ONCE_RELEASE, 1);
-                    let (acquired, released) = self.native.entry(node).or_default();
-                    *released += 1;
-                    if *released > *acquired {
-                        out.push((
-                            EXACTLY_ONCE_RELEASE,
-                            format!(
-                                "n{node} released {released} native leases but acquired {acquired}"
-                            ),
-                        ));
-                    }
-                }
-            }
-            Probe::GatewayAttempt { .. }
-            | Probe::QueueCopy { .. }
-            | Probe::Receipt { .. }
-            | Probe::WorkDone { .. } => {}
+            Probe::GatewayAttempt { .. } | Probe::QueueCopy { .. } | Probe::Receipt { .. } => {}
         }
         out
     }
@@ -1010,7 +1001,7 @@ impl Protocol {
 
     /// The node's process stopped: its unpublished dedup records and ledgers end with it.
     pub fn crashed(&mut self, node: u64) {
-        self.native.remove(&node);
+        self.guards.crashed(node);
         self.ledgers.remove(&node);
         self.staged.retain(|(owner, ..), _| *owner != node);
         self.applying.retain(|_, ((owner, ..), _)| *owner != node);
@@ -1031,11 +1022,16 @@ impl Protocol {
         }
     }
 
-    /// Native leases outstanding on `node` in its current incarnation.
-    pub fn native_outstanding(&self, node: u64) -> u64 {
-        self.native
-            .get(&node)
-            .map_or(0, |(acquired, released)| acquired.saturating_sub(*released))
+    /// The run's guards.
+    pub fn guards(&self) -> &Guards {
+        &self.guards
+    }
+
+    /// ExactlyOnceRelease over the last snapshot of `node`.
+    pub fn count_guards(&mut self, node: u64) -> Vec<Violation> {
+        let (compared, out) = self.guards.counted(node, &self.ledgers(node));
+        self.ran(EXACTLY_ONCE_RELEASE, compared);
+        out
     }
 
     /// Starts a new ledger snapshot of `node`.
@@ -1119,6 +1115,8 @@ impl Protocol {
 
 #[cfg(test)]
 mod tests {
+    use nabedra_oltp_types::sim_probe::GuardKind;
+
     use super::*;
     use nabedra_oltp_types::{sim_probe::LogEntry, types::GroupKind};
 
@@ -1922,25 +1920,41 @@ mod tests {
     }
 
     #[test]
-    fn native_leases_are_released_once_and_reset_by_a_crash() {
+    fn guards_are_released_once_and_end_with_their_process() {
         let mut protocol = Protocol::new();
-        let acquire = Probe::GuardAcquired { class: "query" };
-        let release = Probe::GuardReleased;
-        protocol.observe(origin(1), &acquire);
-        assert_eq!(protocol.native_outstanding(1), 1);
-        assert!(protocol.observe(origin(1), &release).is_empty());
+        let kind = GuardKind::NativeLease;
+        let acquire = |guard| Probe::GuardAcquired {
+            guard,
+            kind,
+            class: "query",
+        };
+        let release = |guard| Probe::GuardReleased { guard };
+        protocol.observe(origin(1), &acquire(1));
+        assert_eq!(protocol.guards().held(1, kind), 1);
+        assert!(protocol.observe(origin(1), &release(1)).is_empty());
         assert_eq!(
-            kinds(&protocol.observe(origin(1), &release)),
+            kinds(&protocol.observe(origin(1), &release(1))),
             [EXACTLY_ONCE_RELEASE]
         );
+        protocol.observe(origin(1), &acquire(2));
         protocol.crashed(1);
-        protocol.observe(origin(1), &acquire);
+        protocol.observe(origin(1), &acquire(3));
         let dead = Origin {
             live: false,
             ..origin(1)
         };
-        assert!(protocol.observe(dead, &release).is_empty());
-        assert_eq!(protocol.native_outstanding(1), 1);
+        assert!(protocol.observe(dead, &release(2)).is_empty());
+        assert_eq!(protocol.guards().held(1, kind), 1);
+        let counted = Probe::LedgerSnapshot {
+            ledger: Ledger::NativeLeases,
+            group: None,
+            outstanding: 2,
+        };
+        protocol.observe(origin(1), &counted);
+        assert_eq!(kinds(&protocol.count_guards(1)), [EXACTLY_ONCE_RELEASE]);
+        let exercised = protocol.exercised();
+        assert_eq!(exercised.get(EXACTLY_ONCE_RELEASE), Some(&3));
+        assert_eq!(exercised.get(RELEASE_AFTER_WORK), None);
     }
 
     #[test]

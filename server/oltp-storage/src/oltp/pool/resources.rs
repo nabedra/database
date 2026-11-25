@@ -518,15 +518,17 @@ impl WorkerSharedResources {
                 return Err(capacity());
             }
             state.count += 1;
-            #[cfg(feature = "sim")]
-            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GuardAcquired {
-                class: class_name(class),
-            });
         }
+        #[cfg(feature = "sim")]
+        let guard = probe_acquired(class);
         let mut lease = NativeLease {
             permit: None,
             owner: self.clone(),
-            settlement: NativeSettlement(self.leases.clone()),
+            settlement: NativeSettlement(
+                self.leases.clone(),
+                #[cfg(feature = "sim")]
+                guard,
+            ),
         };
         #[cfg(any(test, feature = "test-hooks"))]
         self.native_jobs[class as usize].fetch_add(1, Ordering::Relaxed);
@@ -622,12 +624,19 @@ struct NativeLease {
     settlement: NativeSettlement,
 }
 /// Tracks job settlement without keeping the worker or its executor alive.
-struct NativeSettlement(Arc<NativeLeases>);
+struct NativeSettlement(
+    Arc<NativeLeases>,
+    /// The guard's name in the probe stream.
+    #[cfg(feature = "sim")]
+    u64,
+);
 impl Drop for NativeSettlement {
     fn drop(&mut self) {
         self.0.state.lock().expect("native lease state").count -= 1;
         #[cfg(feature = "sim")]
-        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GuardReleased);
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GuardReleased {
+            guard: self.1,
+        });
         self.0.settled.notify_waiters();
     }
 }
@@ -713,15 +722,20 @@ impl PreparedNative {
         };
         let (tx, rx) = oneshot::channel();
         #[cfg(feature = "sim")]
-        let class = self.class;
+        let probed = self.lease.settlement.1;
         let job = (guard, work, self.lease);
         executor.send(Box::new(move || {
             let (guard, work, lease) = job;
+            #[cfg(feature = "sim")]
+            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::WorkStarted {
+                guard: probed,
+            });
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
                 .unwrap_or_else(|_| Err(super::super::recovery_unknown()));
             #[cfg(feature = "sim")]
             nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::WorkDone {
-                class: class_name(class),
+                guard: probed,
+                abandoned: tx.is_closed(),
             });
             // Release the slot and the worker owner before the caller can see
             // the result: a caller that then drops its last owner must find the
@@ -782,6 +796,13 @@ impl WorkerSharedResources {
         }
         let leases = self.leases.state.lock().expect("native lease state").count;
         snapshot(Ledger::NativeLeases, leases as u64);
+        for (class, executor) in [
+            (ExecutionClass::Query, &self.query),
+            (ExecutionClass::Control, &self.control),
+        ] {
+            let free = executor.slots.available_permits() as u64;
+            snapshot(Ledger::FreeNativeSlots(class_name(class)), free);
+        }
         snapshot(Ledger::ScratchBytes, self.working_decode_bytes() as u64);
         for disk in self.storage_reservations() {
             let (device, reservations, bytes) = disk.ledger();
@@ -789,6 +810,19 @@ impl WorkerSharedResources {
             snapshot(Ledger::DiskReservedBytes { device }, bytes);
         }
     }
+}
+
+/// Reports a new native lease, and returns its name in the probe stream.
+#[cfg(feature = "sim")]
+fn probe_acquired(class: ExecutionClass) -> u64 {
+    use nabedra_oltp_types::sim_probe::{GuardKind, Probe, emit, next_guard};
+    let guard = next_guard();
+    emit(|| Probe::GuardAcquired {
+        guard,
+        kind: GuardKind::NativeLease,
+        class: class_name(class),
+    });
+    guard
 }
 
 #[cfg(feature = "sim")]

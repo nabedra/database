@@ -3,6 +3,7 @@
 //! checked synchronously as each probe arrives.
 
 pub mod protocol;
+pub mod resources;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -475,7 +476,7 @@ impl Invariants {
     }
 
     /// A probe snapshot of `worker`'s ledgers, without holding the checks lock.
-    fn ledgers(&self, worker: u64) -> Option<Ledgers> {
+    pub(crate) fn ledgers(&self, worker: u64) -> Option<Ledgers> {
         self.probes().map(|probes| probes.snapshot(worker))
     }
 

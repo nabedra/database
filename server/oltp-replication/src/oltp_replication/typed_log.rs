@@ -262,10 +262,41 @@ struct Pending {
 impl Pending {
     fn start(self: &Arc<Self>) -> PendingGuard {
         self.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        PendingGuard(self.clone())
+        PendingGuard(
+            self.clone(),
+            #[cfg(feature = "sim")]
+            self.probe_acquired(),
+        )
+    }
+    /// Reports a new guard, and returns its name in the probe stream.
+    #[cfg(feature = "sim")]
+    fn probe_acquired(self: &Arc<Self>) -> u64 {
+        use nabedra_oltp_types::sim_probe::{
+            GuardKind, Ledger, Probe, emit, next_guard, track_ledgers,
+        };
+        track_ledgers(self, |pending: &Pending| {
+            let count = pending.count.load(std::sync::atomic::Ordering::Acquire) as u64;
+            emit(|| Probe::LedgerSnapshot {
+                ledger: Ledger::PendingWrites,
+                group: None,
+                outstanding: count,
+            });
+        });
+        let guard = next_guard();
+        emit(|| Probe::GuardAcquired {
+            guard,
+            kind: GuardKind::PendingWrite,
+            class: "raft_log",
+        });
+        guard
     }
 }
-struct PendingGuard(Arc<Pending>);
+struct PendingGuard(
+    Arc<Pending>,
+    /// The guard's name in the probe stream.
+    #[cfg(feature = "sim")]
+    u64,
+);
 /// Spawns `task` as a pending operation. The guard is released only after the
 /// task's future, and with it everything the task holds (the group store, its
 /// charged entries, and through them the worker's resource owner), is dropped.
@@ -283,6 +314,10 @@ impl Drop for PendingGuard {
         self.0
             .count
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        #[cfg(feature = "sim")]
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GuardReleased {
+            guard: self.1,
+        });
         self.0.changed.notify_waiters();
     }
 }
@@ -915,7 +950,11 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                 let (store, retry, overlay) =
                     (self.store.clone(), self.retry.clone(), self.overlay.clone());
                 let pending = self.pending.start();
+                #[cfg(feature = "sim")]
+                let guard = pending.1;
                 spawn_pending(pending, async move {
+                    #[cfg(feature = "sim")]
+                    nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::WorkStarted { guard });
                     while let Some(id) = overlay.next_marker() {
                         match save_commit_marker(&store, &retry, Some(id), true).await {
                             Ok(()) => tracing::debug!(target: "nabedra_database_server::oltp_replication::typed_log", group=%store.identity().group_id,
@@ -924,6 +963,11 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                                 code=?error.code, index=id.index, "Raft commit marker not saved"),
                         }
                     }
+                    #[cfg(feature = "sim")]
+                    nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::WorkDone {
+                        guard,
+                        abandoned: false,
+                    });
                 });
             }
             return Ok(());
@@ -1014,7 +1058,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         // before releasing replica residency and stopping its runtime.
         let pending = self.pending.start();
         #[cfg(feature = "sim")]
-        let replica = self.node_id;
+        let (replica, guard) = (self.node_id, pending.1);
         #[cfg(test)]
         let append_hook = self.append_hook.lock().expect("append test hook").take();
         #[cfg(test)]
@@ -1077,6 +1121,8 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                 // callback.
                 return;
             }
+            #[cfg(feature = "sim")]
+            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::WorkStarted { guard });
             by_kind(
                 &kind,
                 [
@@ -1283,6 +1329,11 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             {
                 tracing::warn!(target: "nabedra_database_server::oltp_replication::typed_log", group=%store.identity().group_id,code=?error.code,"deferred Raft commit marker not saved");
             }
+            #[cfg(feature = "sim")]
+            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::WorkDone {
+                guard,
+                abandoned: false,
+            });
         });
         Ok(())
     }
