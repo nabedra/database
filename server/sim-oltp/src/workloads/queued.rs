@@ -1629,9 +1629,8 @@ pub(crate) async fn run(
         join(cluster, tasks),
         observe(&q, cluster, cluster.config.run_id)
     );
-    settle(&q, cluster).await;
+    settle(&q, cluster, "the heal").await;
     reread(&q, cluster.config.run_id).await;
-    copies(&q, cluster).await;
     let finals = final_reads(&q).await;
     report
         .assertions
@@ -1644,6 +1643,7 @@ pub(crate) async fn run(
     cluster.checks.recovered(&cluster.world, "convergence");
     // Bounds below are their own.
     q.ctx.converge_by.store(u64::MAX, Ordering::Release);
+    copies(&q, cluster).await;
     expire(&q).await;
     // The resource check comes before the finale: a full stop empties the gauges it reads.
     let stats = direct::settle(cluster, &[]).await?.0;
@@ -1794,7 +1794,29 @@ fn finish(q: &Q, cluster: &Cluster, chaos: Option<&Chaos>, report: &mut direct::
         "undecided": shared.undecided,
         "terminal_regressions": shared.log.regressions(),
         "runs": shared.log.runs.len(),
-        "frozen": shared.log.frozen.len(),
+        "frozen": shared.log.frozen.iter().map(|window| {
+            let sent = shared.log.submissions.iter().filter(|s| {
+                s.fresh && s.route == Route::Queued && s.invoked >= window.from && s.invoked < window.to
+            });
+            let judged = shared.log.submissions.iter().filter(|s| {
+                shared.log.frozen_window(s).is_some_and(|judged| judged.from == window.from)
+            });
+            json!({
+                "nodes": window.nodes,
+                "ms": window.to.saturating_sub(window.from),
+                "ready": window.ready,
+                "sent": sent.count(),
+                "judged": judged.count(),
+            })
+        }).collect::<Vec<_>>(),
+        "held": shared.log.retained.iter().map(|held| json!({
+            "node": held.node,
+            "holder": format!("{:?}", held.holder),
+            "required": held.required,
+            "before": held.before,
+            "after": held.after,
+            "pending": held.pending,
+        })).collect::<Vec<_>>(),
         "outside_contract": shared.outside,
         "work": worked,
         "failed_gateway_starts": shared.failed_starts,
@@ -1923,17 +1945,21 @@ async fn never_submitted(q: Q) {
     }
 }
 
-/// Look up every unsettled receipt of `run` until none is left or the budget ends. Returns
-/// what is left.
+/// Look up every unsettled receipt of `run` until none is left or the budget ends. Returns what
+/// is left. A receipt that is terminal without an outcome is looked up a few times and left to
+/// `AcceptedSettlesInRun`: waiting longer would hold up the checks after this one.
 async fn observe(q: &Q, cluster: &Cluster, run: Uuid) -> BTreeSet<Uuid> {
     let mut round = 0;
     loop {
-        let unsettled: BTreeSet<Uuid> = {
+        let (unsettled, open): (BTreeSet<Uuid>, BTreeSet<Uuid>) = {
             let shared = q.shared.lock().unwrap();
-            shared.log.unsettled(run).into_iter().collect()
+            let unsettled: BTreeSet<Uuid> = shared.log.unsettled(run).into_iter().collect();
+            let terminal: BTreeSet<Uuid> = shared.log.without_outcome(run);
+            let open = unsettled.difference(&terminal).copied().collect();
+            (unsettled, open)
         };
-        if unsettled.is_empty() || q.out_of_time() {
-            return unsettled;
+        if open.is_empty() && (unsettled.is_empty() || round >= 3) || q.out_of_time() {
+            return open;
         }
         let mut seen = BTreeSet::new();
         let open: Vec<Open> = q
@@ -1966,9 +1992,9 @@ async fn observe(q: &Q, cluster: &Cluster, run: Uuid) -> BTreeSet<Uuid> {
     }
 }
 
-/// After the heal, every accepted request of the current run must have a definite receipt
+/// After the heal, every accepted request of the current run must have a terminal receipt
 /// within the convergence bound (design 3.7, `Liveness`).
-async fn settle(q: &Q, cluster: &Cluster) {
+async fn settle(q: &Q, cluster: &Cluster, when: &str) {
     let run = cluster.config.run_id;
     let unsettled = observe(q, cluster, run).await;
     let shared = q.shared.lock().unwrap();
@@ -1983,7 +2009,7 @@ async fn settle(q: &Q, cluster: &Cluster) {
             &cluster.world,
             "Liveness",
             format!(
-                "accepted {name} {id} of run {run}, one of {total}, has no definite receipt {:?} after the heal; last answer {}",
+                "accepted {name} {id} of run {run}, one of {total}, has no terminal receipt {:?} after {when}; last answer {}",
                 direct::CONVERGE_LIMIT,
                 shared.last.get(&id).map_or("none", String::as_str),
             ),
@@ -2090,7 +2116,15 @@ async fn copies(q: &Q, cluster: &Cluster) {
             at,
         });
     }
-    settle(q, cluster).await;
+    bounded_settle(q, cluster, "the copies were counted").await;
+}
+
+/// [`settle`] with a bound of its own.
+async fn bounded_settle(q: &Q, cluster: &Cluster, when: &str) {
+    let by = q.now() + direct::CONVERGE_LIMIT.as_millis() as u64;
+    q.ctx.converge_by.store(by, Ordering::Release);
+    settle(q, cluster, when).await;
+    q.ctx.converge_by.store(u64::MAX, Ordering::Release);
 }
 
 /// Requests of `run` accepted between `since` and `before` whose results cannot have expired
@@ -2362,7 +2396,7 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
         Ordering::Release,
     );
     join(cluster, burst(q, 1, 3, true)).await;
-    settle(q, cluster).await;
+    settle(q, cluster, "the cold start").await;
     q.ctx.converge_by.store(u64::MAX, Ordering::Release);
     Ok(())
 }

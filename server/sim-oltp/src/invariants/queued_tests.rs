@@ -189,6 +189,8 @@ fn a_failed_receipt_without_an_outcome_is_a_missing_outcome() {
     log.lookups = vec![lookup(1, 300, unknown())];
     assert_eq!(kinds(&log), [ACCEPTED_SETTLES]);
     assert_eq!(log.unsettled(RUN), [Uuid::from_u128(1)]);
+    assert_eq!(log.without_outcome(RUN).len(), 1);
+    assert!(log.without_outcome(NEXT).is_empty());
     // The same identity is answered definitely later.
     log.submissions
         .push(succeeded(body(1, 1, 1), 400, json!(null)));

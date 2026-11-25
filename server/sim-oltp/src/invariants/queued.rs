@@ -892,6 +892,16 @@ impl Log {
             .collect()
     }
 
+    /// Accepted requests of `run` with a receipt that is terminal and names no outcome.
+    pub(crate) fn without_outcome(&self, run: Uuid) -> BTreeSet<Uuid> {
+        self.lookups
+            .iter()
+            .filter(|lookup| lookup.run == run)
+            .filter(|lookup| matches!(&lookup.seen, Seen::Terminal(t) if !t.decided()))
+            .map(|lookup| lookup.id)
+            .collect()
+    }
+
     /// An accepted request that was open across `at`: accepted before it, reported pending by a
     /// lookup sent at or after it, and terminal after that, in one run. A request that nobody
     /// looked up meanwhile may have settled long before, and does not count.
