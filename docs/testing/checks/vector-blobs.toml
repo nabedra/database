@@ -1,0 +1,13 @@
+# Design spec of vector values, collection and copies of a range.
+# Baselines (exhaustive, with coverage) and mutants with their controls. See specs/README.md.
+id = "vector-blobs"
+module = "vector"
+kinds = ["T"]
+guarantees = ["VEC-G10"]
+scenarios = ["VS16"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/vector/blobs", "RowBlobs", "--module", "vector"]
+cwd = "."
+timeout_s = 9000
+needs = ["tlc"]
+result_parser = "tlc"

@@ -1,6 +1,6 @@
 Add vector, full-text, sparse and multi-vector search to OLTP tables as new column types, served by separate search workers that tail the committed Data logs, so RAG applications get fresh, filtered top-k search without slowing point reads and writes.
 
-Status: proposed 2026-11-25 against `37a87d19`. Nothing here is implemented, modelled or measured. Every figure marked *target* or *estimate* is a hypothesis for a gate to test.
+Status: proposed 2026-11-25 against `37a87d19`. Nothing here is implemented or measured. The protocols are modelled in `specs/vector/`, see "Design review". Every figure marked *target* or *estimate* is a hypothesis for a gate to test.
 
 ## Decisions
 
@@ -230,9 +230,15 @@ Scalars and `list[str]` stay in the row JSON. Vector values become binary record
 row version gains  blobs: { column_id: commit_ts of the vector version it references }
 ```
 
-A metadata update references the existing vector version and does not rewrite it. MVCC GC, splits, snapshots, backups and restore treat `'x'` as part of its row: a vector version is collectable only when no retained row version references it.
+A metadata update references the existing vector version and does not rewrite it. MVCC GC, splits, snapshots, backups and restore treat `'x'`, the pending embedding record `'E'` and the failure record as part of their row:
 
-`upsert_many` groups rows by range at the gateway and sends each group to its leader, which packs up to 1 MiB of members into `DirectBatch` entries and fsyncs once per entry. Eligibility, dedup records, latches, epochs and outcomes follow the [direct path](oltp-direct-path.md) per row.
+- A vector version is collectable only when no retained row version references it. A metadata update commits against the row version it read.
+- A copy (split child, replica snapshot, backup) pins the collection safe point and takes only the versions that a reader at or above its pin can need. It never takes one that was already collectable. It activates after its rows, vectors and records are all staged. (DB-10)
+- In a cross-range transaction, Prepare stages `'x'` and `'E'` under the transaction, and Resolve writes them under the commit timestamp.
+- A damaged `'x'` value is neither null nor skipped. The voter refuses the feed of that range and follows the damage rules of the [storage engine plan](native-storage-engine.md).
+- A backup that holds vector records needs a build with `data.vector.v1`. A restored range has a new group identity, so no search checkpoint of the old one is accepted.
+
+`upsert_many` groups rows by range at the gateway and sends each group to its leader, which packs up to 1 MiB of members into `DirectBatch` entries and fsyncs once per entry. Eligibility, dedup records, latches, epochs and outcomes follow the [direct path](oltp-direct-path.md) per row. A row's request ID is derived from the call's ID and the key, so resending in other chunks after a split reuses it. A key that appears twice in one call is a `ValidationError`.
 
 Large values in the LSM are rewritten by leveled compaction. If V2 measures more than 4× EBS write amplification, `nabedra-kv` gains separate blob runs for `'x'` values, as its own reviewed plan.
 
@@ -240,26 +246,35 @@ Large values in the LSM are rewritten by leveled compaction. If V2 measures more
 
 ## 3. Search feed
 
-Any Data voter serves its applied changes to an authorized search worker. The voter derives them, so search workers never interpret transaction commands.
+Any Data voter serves its applied changes to an authorized search worker. Apply writes, in the same batch as the entry, a change record per log index: the keys it changed and how, after rejections, replays and resolves. The feed is a pure function of those records, never of the current rows, and they are truncated with the log. (DB-5) Search workers never interpret transaction commands.
 
 ```rust
 Method::SearchTail { group: GroupIdentity, routing_epoch: u64, assignment_epoch: u64, after: LogId, max_bytes: u32 }
 enum TailReply {
-    Changes { records: Vec<Change>, through: LogId, closed: Option<Closed> },
+    Changes { records: Vec<Change>, through: LogId },
     SnapshotRequired { purged_through: LogId },
     StaleRoute { .. }, NotHosted,
 }
 struct Change { at: LogId, commit_ts: CommitTs, key: MvccKey, row: Option<RowImage> }   // None = deleted
-struct Closed { at: LogId, ts: CommitTs }   // no commit at or below ts applies after `at`
+// a Closed entry arrives as a change like any other, in log order
 ```
 
-- A voter sends only entries at or below its **applied** index, so a search worker never sees an entry Raft can truncate.
+- A voter sends only changes at or below its **applied** index, so a search worker never sees an entry Raft can truncate.
 - Pages are contiguous after `after`. A gap, a smaller `LogId` or another group generation is rejected. Pages may repeat and are idempotent by `(key, commit_ts)`.
 - The worker reads from the voter in its own AZ and switches to another when that one lags.
 - The feed holds no log. If `after` was purged, the worker drops the range, installs a range snapshot at an applied cut, and tails from it. A slow search worker cannot grow a voter's disk.
-- An `'x'` value of an older entry that GC removed is also answered with `SnapshotRequired`.
+- A change whose row or `'x'` value GC removed is answered with `SnapshotRequired`, never omitted.
+- A worker accepts a page only when it continues or overlaps its own position. A resync builds a new generation beside the old one and replaces it at once, so keys missing from the snapshot vanish and late work of the old generation is ignored.
+- "Applied" on a worker means that every core and every index of the column holds the entry.
 
-A leader publishes `Closed` about every 200 ms, using a Timestamp allocation at least 1 s old, through the existing `RangeClock` rule 2 (raise `max_read_ts`, drain pending), after resolving every intent that could commit at or below it. Old timestamps keep it from invalidating commits in flight.
+**Closing a timestamp.** The leader proposes a Data log entry `Closed { ts }` with a timestamp that the Timestamp group already handed out, at least 1 s ago. (DB-1, DB-2, DB-3)
+
+- Apply records `ts` as the range's closed floor. It refuses any later direct commit or `SetVector` at or below the floor, and the leader retries those with a new timestamp.
+- Apply refuses `Closed` while any intent is open in the range, and on a frozen split source.
+- A commit timestamp of a cross-range transaction is taken after every participant prepared, so it is above every floor that closed before.
+- A range closes about once per second, and only while it served a `snapshot` query in the last 60 s. Otherwise it writes nothing.
+
+No message outside the log and no leader memory can close a timestamp. So a deposed leader, a commit of unknown outcome and a split source cannot invalidate a served cut.
 
 ---
 
@@ -268,22 +283,24 @@ A leader publishes `Closed` about every 200 ms, using a Timestamp allocation at 
 | Mode | Visible rows | Coordination per query |
 | --- | --- | --- |
 | `latest` (default) | Every write acknowledged before the query began. Linearizable per range. An acknowledged `insert_many` is always whole. One still committing while the query runs may show in part if it spans ranges. | One coalesced barrier per (search worker, data worker) pair |
-| `snapshot` | One transactionally consistent cut across ranges, at the newest `Closed` timestamp all ranges reached, at most 2 s old. Workers report their closed floor, the gateway picks the lowest of the ranges it needs, and a worker refuses a cut it no longer retains. | None |
+| `snapshot` | One transactionally consistent cut across ranges, at the newest `Closed` timestamp all ranges reached. Its target age is at most 2 s, measured from the wall time in the `Closed` entry. The age is a target, the cut is exact. Workers report their closed floor, the gateway picks the lowest of the ranges it needs, and a worker refuses a cut it no longer retains. | None per query. One small log entry per range and second while in use. |
 
 `latest` takes no timestamp. A barrier that raised `max_read_ts` at query rate would keep invalidating commit timestamps between allocation and registration and starve writers.
 
 ```rust
-Method::SearchBarrier { ranges: Vec<(GroupIdentity, u64 /* routing_epoch */)> } -> Vec<BarrierReply>
+Method::SearchBarrier { id: u64, ranges: Vec<(GroupIdentity, u64 /* routing_epoch */)>, table: Uuid, columns: Vec<ColumnId> } -> Vec<BarrierReply>
 enum BarrierReply { At(LogId), NotLeader { hint }, StaleRoute, Unavailable }
 ```
 
 1. The gateway reads its cached `SearchRoute`, prunes ranges by key bounds in the filter, and picks one search worker per search shard, preferring its own AZ and the shortest queue.
-2. Each worker starts the barrier and, in parallel, ranks centroids and prefetches postings. Concurrent queries share a barrier RPC. A query joins only a barrier that has **not been sent yet**, because one in flight may have been answered before the query began.
-3. The leader confirms its lease (ReadIndex fallback), resolves every committed-but-unapplied intent, and returns its applied `LogId`. On a frozen split source it first confirms through a Catalog barrier that the split is unpublished. Otherwise it answers `StaleRoute`.
-4. The worker waits until each range applied that position, then scans and returns its candidates with `(span, group, routing_epoch, LogId)` for every range it searched.
+2. Each worker starts the barrier. It may warm caches meanwhile, but nothing it read before step 4 counts. Concurrent queries share a barrier RPC. A query joins only a barrier that has **not been sent yet**, because one in flight may have been answered before the query began. A reply counts only for the RPC identity it answers, so a late reply to an earlier try is dropped.
+3. The leader confirms its lease (ReadIndex fallback) and that it applied the first entry of its term. It checks that the Data group's schema epoch still serves these column incarnations (DB-9), resolves every committed-but-unapplied intent, and then reads and returns its applied `LogId`. When Status is unavailable it answers `Unavailable`. On a frozen split source it first confirms through a Catalog barrier that the split is unpublished. Otherwise it answers `StaleRoute`.
+4. The worker waits until each range applied that position. Then, in one step, it pins its read point (applied position per range) and the list of partitions, and only then ranks, probes and scans. Every core and every ranking of the query evaluates that one pin. A version stays visible to a pin that began before it was superseded. (DB-4) It returns its candidates with `(span, group, routing_epoch, LogId)` for every range it searched.
 5. The gateway accepts the result only if those spans tile the requested key span exactly, with no gap or overlap. It dedups by key, merges each ranker's list globally, fuses, and applies `limit`.
 
 A replica that lags past 20% of the deadline, or a slow worker at the observed p95, causes one hedged request to the other search replica. A missing range after one refresh is `503 search_unavailable`. **A partial result is never returned as success**, and search never falls back to scanning data workers.
+
+The worker holds the complete row image, so selected columns come from the same pin, never from a later read. For a `snapshot` query, a worker keeps superseded versions for 10 s, and refuses a cut below the largest commit timestamp, deletes included, that it dropped or that its range snapshot contained. (DB-8)
 
 Determinism: two replicas may return different approximate candidates. Both obey the same visibility rule. Rows never appear after their delete is visible.
 
@@ -295,16 +312,18 @@ Raft positions are per range and the index is per worker. Each worker builds its
 
 | Structure | Content | Where |
 | --- | --- | --- |
-| Row map | slot → key, `commit_ts`, superseded-at, range, liveness, columns | RAM plus NVMe |
+| Row map | slot → key, range, versions with applied-at and superseded-at, columns. A slot is reused only when no entry and no checkpoint names it. | RAM plus NVMe |
 | Centroid tree | Balanced k-means over directions (each vector divided by its length), fanout about 100, one tree per `partition_by` value. Under 20,000 rows there is no tree and the scan is exact. | RAM |
 | Partition | 128 to 512 rows in bands of similar length: exact length, 1-bit codes and 4-bit extension of the direction, filter column blocks, `(slot, version)` | 1-bit in RAM. Extension in RAM while the budget lasts, otherwise NVMe. |
 | Raw vectors | f32, page-aligned | NVMe, `O_DIRECT` |
 | Filter summaries | Per value: partitions and, inside each, a row bitmap. Numeric min and max. | RAM |
 | Impact lists | Block-max inverted lists for BM25 (tf, length) and sparse weights, with and without division by vector length | RAM dictionary, NVMe postings |
 
-**Insert.** Assign through the tree, encode relative to the centroid, append to the owner core's partition, then update the row map. The row is visible once its position counts as applied, so no separate fresh tier exists. A superseded row keeps its entry until every open snapshot is past its successor.
+**Insert.** Assign through the tree, encode relative to the centroid, append a new entry to the owner core's partition, then update the row map. A metadata update also appends: filter columns in an entry never change in place. The row is visible once its position counts as applied, so no separate fresh tier exists. A superseded entry stays until every pin, checkpoint and retained cut is past its successor.
 
 **One index, every operation.** The codes estimate only the cosine between directions. With both exact lengths, `dot = len(o)·len(q)·cos` and `l2² = len(o)² + len(q)² − 2·dot`, so each operation and its error bound come from the same codes. Partitions and length bands are read in order of their best possible value under the requested operation. For unit-length vectors there is one band, and all three operations rank identically. For vectors of very different lengths, `dot` and `l2` may read more bands. V0 measures that cost. If it exceeds 2× a metric-specific index, the user decides on an optional second tree. Zero vectors live in one always-scanned list.
+
+**Exact.** `exact=True` scores every visible entry from raw vectors. It never prunes by codes, whose error bounds are probabilistic. With several rankings, each ranking's candidate list is exact. Ties break by key.
 
 **Dense scan.** 1-bit estimate with its error bound → survivors to the 4-bit extension → survivors to raw f32. The stop rule estimates recall from the partitions read so far and stops at `recall`.
 
@@ -314,13 +333,13 @@ Raft positions are per range and the index is per worker. Each worker builds its
 Ready → Splitting → Draining → Retired          Ready → Merging → Retired
 ```
 
-A move appends to the target before it removes from the source, and removal waits until every query that started before the append finished. Queries dedup by slot. A moved row is therefore never missed and never returned twice. Reassignment is capped per second, and re-encoding is charged to maintenance.
+A move appends to the target before it removes from the source, and removal waits until every scan and checkpoint that began before the append finished. A removal names one entry instance, never a row, so a row that moves back is safe. (DB-7) A retired partition keeps its entries for the scans and checkpoints that listed it. Scans dedup by slot. A moved row is therefore never missed and never returned twice. Reassignment is capped per second, and re-encoding is charged to maintenance.
 
 **Filters.** Estimate matches from the summaries. At most 20,000 matches: score all of them. Otherwise read nearest partitions that contain a match, counting only matching rows in the stop rule. Never post-filter. If at least `limit` rows match, `limit` rows return.
 
 **BM25 and sparse** share one format and MaxScore traversal. The gateway sends table-wide document counts (refreshed every 5 s) so all workers score alike. **Multi-vector** indexes a MUVERA encoding of the normalized vectors (10,240-d, 1,280 bytes at 1 bit) as a dense vector, and reranks with the requested MaxSim over 4-bit tokens and then raw ones.
 
-**Restart.** Checkpoints on NVMe are immutable files plus a manifest with each range's `LogId`, checksummed, published by rename. A valid checkpoint resumes the tail. Wiped or damaged NVMe copies the checkpoint from the other search replica, or installs range snapshots. A worker serves a range only after its replay reaches a fresh barrier.
+**Restart.** A checkpoint pins a read point and the partition list like a scan, and holds removals back like one. (DB-6) It writes immutable checksummed files, syncs them, and then publishes a manifest with the pinned `LogId` per range by rename. A valid checkpoint resumes the tail. Wiped or damaged NVMe copies the checkpoint from the other search replica, or installs range snapshots. A worker serves a range only after its replay reaches a fresh barrier.
 
 **Kernels.** Scalar, AVX2, AVX-512 with VPOPCNTDQ and NEON, chosen at run time. AVX-512 is stable since Rust 1.89, and the repository pins 1.94.1. The docs list NEON `vdotq_s32` with 1.98, so 1.94.1 uses widening multiplies.
 
@@ -330,10 +349,12 @@ A move appends to the target before it removes from the source, and removal wait
 
 The table option `embed` names a source column and an operator-defined model: endpoint, model, dimensions, credential reference, limits. v1 speaks the OpenAI-compatible `/v1/embeddings`, which [vLLM](https://docs.vllm.ai/en/stable/serving/openai_compatible_server/) and [TEI](https://huggingface.co/docs/text-embeddings-inference/en/quick_tour) also expose, so self-hosted models work.
 
-1. The row entry also writes `'E' ‖ key ‖ column → source_digest`. The write is durable and acknowledged. The row is found by key, filters and BM25.
+A model name is bound to one endpoint, model and dimension for life. Another model is another name and another column (`add_column`). Backfill of a new column writes the pending record of each existing row as a conditional commit under the new schema epoch. Every entry below also names the column incarnation.
+
+1. A write that changes the source text, or inserts the row, gets a source version: its commit timestamp. The same entry clears the old vector and any failure record and writes `'E' ‖ key ‖ column → { source_version, attempts }`. A write that keeps the text keeps the vector and the pending record. (DB-11) The write is durable and acknowledged. The row is found by key, filters and BM25, and by its vector once it has one.
 2. Embedders lease batches from the range leader. Leases live in leader RAM and only save money: a lost lease causes a second provider call, never a wrong vector.
-3. The embedder proposes `SetVector { key, column, model, source_digest, vector }`. Apply writes the vector and deletes the `'E'` record only if the row exists and its source digest and model still match. Otherwise it writes nothing.
-4. Provider errors back off with a circuit breaker per model. After 10 attempts the record becomes `failed` with a reason, shown in `search_status()`, and `nabedra-db search retry-embeddings` requeues it.
+3. `SetVector { key, column, source_version, vector }` is an ordinary conditional direct commit: latch, timestamp, expected row version, all epoch, intent, freeze, pause and floor checks, and a new row version. It applies only if the row exists, the source version and the column incarnation match, the column is an embedded one and the dimensions fit. It clears `'E'`. An update that read the row before it conflicts and retries, so it cannot drop the vector. (DB-12)
+4. `EmbedFailed { key, column, source_version }` counts an attempt in `'E'`, durably and only for a matching source version. After 10 attempts the record becomes a failure record with a reason, shown in `search_status()`, and `nabedra-db search retry-embeddings` requeues it. (DB-13) The circuit breaker per model counts no attempt while it is open.
 
 A query string is embedded before the search, with an LRU by `(model, digest)`. A provider outage fails those queries explicitly. `wait_for_embedding=True` waits after commit, and a timeout reports the write as applied with the embedding pending.
 
@@ -343,7 +364,9 @@ A query string is embedded before the search, with an LRU by `(model, digest)`. 
 
 Control stores `SearchAssignment { table_id, epoch, shards: [{ spans, workers }] }`. Adjacent ranges share a search shard, so fan-out is `ceil(table bytes / worker budget)` rather than one per range. Default two search replicas in different AZs.
 
-Create or move: assign → snapshot and tail → index → caught up to a fresh barrier → publish `epoch + 1` → old replica serves 30 s more, then drops. A new column builds the same way and becomes visible only when every range has a ready replica. Interrupted builds resume or stay invisible. Splits inherit the parent's assignment, and children re-tag the parent's slots at the published cut without reindexing.
+Create or move: assign → snapshot and tail → index → caught up to a fresh barrier → publish `epoch + 1` → the old replica keeps its data 30 s more, passing the same barrier and incarnation checks, then drops. A new column builds the same way and becomes visible only when every range has a ready replica that reported this incarnation. Then every Data group gets the schema epoch, and then the Catalog publishes. A drop fences every Data group first, and a name added again is a new incarnation that never serves old data. Interrupted builds resume or stay invisible. Splits inherit the parent's assignment. A worker re-tags the parent's slots to the children only when it holds every parent entry up to the freeze. Otherwise it installs child snapshots. (DB-14)
+
+Search workers and embedders hold no vote, no queue copy and no lead. They are never in the ready set and do not count as workers for `data.vector.v1`. Their RPCs carry their own protocol version, `nabedra-search/1`.
 
 | Need | Action |
 | --- | --- |
@@ -361,7 +384,7 @@ Create or move: assign → snapshot and tail → index → caught up to a fresh 
 
 Group count bounds table size: 1 B such rows are about 3.4 TB, or about 3,200 ranges at 1 GiB, 9,500 replicas, 35 data workers at today's 272 resident groups. At 4 GiB it is 9 workers. Today a split freezes writes while it copies the range, so vector tables start at 1 GiB, and V11 makes splits copy online before raising it. Bulk loads into an empty table use `nabedra-db table presplit`.
 
-Priority classes on a search worker: apply (reserved 20% of CPU), interactive, maintenance, batch and exact. Overload returns `429` before work starts. Lag never blocks point writes. Above 30 s of lag, `upsert_many` is throttled with `429`.
+Priority classes on a search worker: apply (reserved 20% of CPU), interactive, maintenance, batch and exact. Overload returns `429` before work starts. Search lag never blocks, slows or rejects a write. A replica that cannot keep up resyncs, and `search_status().lag_ms` lets a bulk loader pace itself.
 
 **Security.** mTLS with a `search` certificate purpose that allows tail, snapshot and barrier and cannot propose. The `embed` purpose can only lease pending rows and propose `SetVector`. Text leaves the cluster only for models an operator enabled for that database. Only the embedder has egress: allowlisted hosts, no redirects, private addresses refused unless listed, response size and dimensions checked, credentials by reference and never in a schema, log or Raft entry. Inputs reject NaN, infinity and wrong dimensions. NVMe uses dm-crypt with a key created at boot, since the data is rebuildable. Every query has CPU, I/O and memory budgets.
 
@@ -381,7 +404,8 @@ Priority classes on a search worker: apply (reserved 20% of CPU), interactive, m
 | Log purged under a slow replica | The range resyncs from a snapshot and is not served meanwhile |
 | Corrupt checkpoint or posting | Detected by checksum. That range leaves service and resyncs. |
 | Provider down | Writes succeed, embeddings wait |
-| Split, move or drop during a query | Coverage check fails, one refresh, then an explicit error |
+| Split, move or drop during a query | The barrier or the coverage check fails, one refresh, then an explicit error |
+| Source text changes | The old vector is gone at once. The row ranks again when its new vector arrives. |
 
 ---
 
@@ -455,6 +479,7 @@ Module `vector`, level L3, because `latest` joins OLTP's real-time order and `Se
 | Write: extra bytes | none | vector once per voter, plus one feed copy per search replica, same AZ when possible |
 | `latest`: Timestamp RPCs, leader RPCs, search RPCs | – | 0, ≤ 1 coalesced per data worker, 1 per search shard |
 | `snapshot`: leader RPCs | – | 0 |
+| `snapshot`: log entries per range and second, only while in use | – | 1 |
 | Embedding: extra entries per embedded row | – | 1 `SetVector` |
 
 **Order after approval.** Register rows and scenario IDs `VS01` onwards → independent read by an agent that sees only the plan and register → specs and mutants → T checks on Actions → each counterexample through the design bug loop → user approval → implementation on this branch.

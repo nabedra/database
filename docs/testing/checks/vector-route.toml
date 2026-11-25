@@ -1,0 +1,13 @@
+# Design spec of coverage and splits with stale routes.
+# Baselines (exhaustive, with coverage) and mutants with their controls. See specs/README.md.
+id = "vector-route"
+module = "vector"
+kinds = ["T"]
+guarantees = ["VEC-G01", "VEC-G02", "VEC-G04"]
+scenarios = ["VS06", "VS08"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/vector/route", "SearchRoute", "--module", "vector"]
+cwd = "."
+timeout_s = 9000
+needs = ["tlc"]
+result_parser = "tlc"

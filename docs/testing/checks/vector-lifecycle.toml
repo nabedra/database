@@ -1,0 +1,13 @@
+# Design spec of build, publish, drop and re-add of a search column.
+# Baselines (exhaustive, with coverage) and mutants with their controls. See specs/README.md.
+id = "vector-lifecycle"
+module = "vector"
+kinds = ["T"]
+guarantees = ["VEC-G08"]
+scenarios = ["VS14"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/vector/lifecycle", "IndexLifecycle", "--module", "vector"]
+cwd = "."
+timeout_s = 9000
+needs = ["tlc"]
+result_parser = "tlc"

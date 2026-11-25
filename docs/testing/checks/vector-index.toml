@@ -1,0 +1,13 @@
+# Design spec of the partitioned index of one search worker: scans, split, merge, reassignment and checkpoints.
+# Baselines (exhaustive, with coverage) and mutants with their controls. See specs/README.md.
+id = "vector-index"
+module = "vector"
+kinds = ["T"]
+guarantees = ["VEC-G03", "VEC-G05", "VEC-G10"]
+scenarios = ["VS05", "VS07", "VS10"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/vector/index", "LocalIndex", "--module", "vector"]
+cwd = "."
+timeout_s = 18000
+needs = ["tlc"]
+result_parser = "tlc"

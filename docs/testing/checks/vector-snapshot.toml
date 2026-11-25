@@ -1,0 +1,13 @@
+# Design spec of `snapshot` reads: closed timestamps in the log, leader changes, cross-range batches and worker resyncs.
+# Baselines (exhaustive, with coverage) and mutants with their controls. See specs/README.md.
+id = "vector-snapshot"
+module = "vector"
+kinds = ["T"]
+guarantees = ["VEC-G02"]
+scenarios = ["VS04", "VS09"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/vector/snapshot", "SearchSnapshot", "--module", "vector"]
+cwd = "."
+timeout_s = 12000
+needs = ["tlc"]
+result_parser = "tlc"

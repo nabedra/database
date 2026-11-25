@@ -1,0 +1,13 @@
+# Design spec of background embedding of one row.
+# Baselines (exhaustive, with coverage) and mutants with their controls. See specs/README.md.
+id = "vector-embed"
+module = "vector"
+kinds = ["T"]
+guarantees = ["VEC-G07"]
+scenarios = ["VS12", "VS13"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/vector/embed", "EmbedApply", "--module", "vector"]
+cwd = "."
+timeout_s = 12000
+needs = ["tlc"]
+result_parser = "tlc"

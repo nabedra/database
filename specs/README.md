@@ -201,5 +201,13 @@ prove the pipeline end to end.
 | Module | Spec | Guarantees | T checks | Plan |
 | --- | --- | --- | --- | --- |
 | testing | `selftest/TwoPhase.tla` | none: the tooling self-test | `specs-selftest`, `specs-selftest-trace`, `specs-selftest-large` | none |
+| vector | `vector/latest/SearchLatest.tla` | VEC-G01, VEC-G03, VEC-G06 | `vector-latest` | [vector plan](../plans/oltp-vector.md) |
+| vector | `vector/snapshot/SearchSnapshot.tla` | VEC-G02 | `vector-snapshot` | [vector plan](../plans/oltp-vector.md) |
+| vector | `vector/route/SearchRoute.tla` | VEC-G01, VEC-G02, VEC-G04 | `vector-route` | [vector plan](../plans/oltp-vector.md) |
+| vector | `vector/index/LocalIndex.tla` | VEC-G03, VEC-G05, VEC-G10 | `vector-index` | [vector plan](../plans/oltp-vector.md) |
+| vector | `vector/embed/EmbedApply.tla` | VEC-G07 | `vector-embed` | [vector plan](../plans/oltp-vector.md) |
+| vector | `vector/lifecycle/IndexLifecycle.tla` | VEC-G08 | `vector-lifecycle` | [vector plan](../plans/oltp-vector.md) |
+| vector | `vector/blobs/RowBlobs.tla` | VEC-G10 | `vector-blobs` | [vector plan](../plans/oltp-vector.md) |
+| vector | `vector/activation/Activation.tla` | VEC-G14 | `vector-activation` | [vector plan](../plans/oltp-vector.md) |
 
-No product spec exists yet. Existing protocols get one on next touch.
+Existing protocols get a spec on next touch. Each vector spec has its own folder, because the runner applies every mutant of a folder to one spec.

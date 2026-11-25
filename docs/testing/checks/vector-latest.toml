@@ -1,0 +1,13 @@
+# Design spec of `latest` reads: leader changes, the feed, shared barriers, cross-range batches and worker crashes.
+# Baselines (exhaustive, with coverage) and mutants with their controls. See specs/README.md.
+id = "vector-latest"
+module = "vector"
+kinds = ["T"]
+guarantees = ["VEC-G01", "VEC-G03", "VEC-G06"]
+scenarios = ["VS01", "VS02", "VS03", "VS11"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/vector/latest", "SearchLatest", "--module", "vector"]
+cwd = "."
+timeout_s = 18000
+needs = ["tlc"]
+result_parser = "tlc"
