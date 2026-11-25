@@ -4,6 +4,7 @@ kinds = ["S", "H"]
 # Fault model, no nemesis. Each seeded defect of the topology workload must be reported under the
 # rule it breaks within 8 seeds, and the same seeds without a defect must report none of those
 # rules. Seeds whose clean run is red for another reason still count as the twin of their defect.
+# The search of the clean seeds fails by design, so only its seed lines reach this log.
 guarantees = []
 scenarios = []
 tiers = ["T1"]
@@ -24,7 +25,7 @@ done
 echo "clean twins of every seed"
 rc=0
 NABEDRA_SIM_EXPECT="${kinds#,}" run > clean.log 2>&1 || rc=$?
-cat clean.log
+grep 'nabedra-sim-seed: {' clean.log
 test "$rc" = 101
 test "$(grep -c 'nabedra-sim-seed: {' clean.log)" = "$NABEDRA_SEEDS"
 ''']

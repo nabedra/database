@@ -1987,6 +1987,19 @@ async fn at_rest(cluster: &Cluster, t: &Topo, live: &mut Vec<(Ctx, Table)>) -> R
     const SCHEMA: &str = "/direct/fallbacks/schema";
     let mut rest = Vec::new();
     for (ctx, table) in live.drain(..) {
+        // A declaration that was never answered, or a build that has not published, leaves a
+        // schema change open.
+        let open = t.log(|log| {
+            let open = |b: &&Build| b.table == table && b.stuck.is_some();
+            log.builds.iter().filter(open).count()
+        });
+        if open > 0 {
+            cluster.record(format!(
+                "{} not judged at rest: {open} schema changes are open",
+                table.name()
+            ));
+            continue;
+        }
         let mut client = ctx.new_client();
         for (index, gateway) in GATEWAYS.into_iter().enumerate() {
             let node = CLIENTS[index % CLIENTS.len()];
@@ -2265,10 +2278,11 @@ async fn warm_fence(ctx: &Ctx) -> Result<(), String> {
     clients::failure(&answer).map_or(Ok(()), |why| Err(format!("fence insert: {why}")))
 }
 
-/// One declaration of the fence table.
+/// One declaration of the fence table, sent again under its ID while it is unanswered.
 async fn declare(t: &Topo, table: &str, name: &str) -> (Uuid, Value, Reply) {
     let index_id = fresh_id(BOOTSTRAP_CLIENT).await;
     let id = fresh_id(BOOTSTRAP_CLIENT).await;
+    let deadline = t.now() + ADMIN_LIMIT.as_millis() as u64;
     let definition = json!({
         "index_id": index_id, "table_id": table, "name": name,
         "columns": ["value"], "covering": ["id"],
@@ -2276,8 +2290,13 @@ async fn declare(t: &Topo, table: &str, name: &str) -> (Uuid, Value, Reply) {
     let selector = json!({
         "table_id": table, "index_id": index_id, "build_id": id, "attempt": 1,
     });
-    let reply = t.send(id, "storage.index.create", &definition).await;
-    (id, selector, reply)
+    loop {
+        let reply = t.send(id, "storage.index.create", &definition).await;
+        if !matches!(reply, Reply::Retry { .. }) || t.now() >= deadline {
+            return (id, selector, reply);
+        }
+        time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Whether the build is ready, or why that is not known.
@@ -2390,7 +2409,7 @@ async fn fence_races(
         });
         t.log(|log| {
             log.races.push(format!(
-                "{lead} of {took} ms before: under guard {under_guard}, direct {direct}, fell back {fell_back}"
+                "{lead} of {took} ms before: under guard {under_guard}, direct {direct}, fell back {fell_back}, {why}"
             ));
         });
         wait_ready(t, &selector).await?;
