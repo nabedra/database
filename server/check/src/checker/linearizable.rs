@@ -37,11 +37,15 @@
 //!
 //! [`Options::request_dedup`] adds the direct path's request identity (OLTP-G03): the dedup
 //! record is keyed by table, anchor key and request ID, and a retry with the same body returns
-//! the original result. Attempts that share request ID, anchor key, `f` and invoke value are
-//! one logical mutation. It can commit between the first eligible invoke and the first success
-//! that proves a commit. An answer computed from fresh state requires an empty dedup slot.
-//! All bodies under an identity share the slot, including those with unknown outcomes.
+//! the first definite result ([`super::direct::results`]). Attempts that share request ID, anchor
+//! key, `f` and invoke value are one logical mutation. It can commit between the first eligible
+//! invoke and the first success that proves a commit, or read the row once and change nothing
+//! between the first invoke and the first no-op or row conflict. If its answers disagree, the fresh
+//! ones are judged one by one. An answer computed from fresh state requires an empty dedup slot.
+//! All bodies under an identity share the slot, including those with unknown outcomes, but a no-op
+//! or a row conflict does not occupy it.
 
+use super::direct::results::{self, Definite};
 use super::{Anomaly, Verdict, canon};
 use crate::history::{Event, Op, Outcome, pair, payload};
 use serde_json::Value;
@@ -237,9 +241,12 @@ pub fn check_kv_opts(events: &[Event], opts: &Options) -> Verdict {
     }
     let mut anomalies = Vec::new();
     let mut checked = 0;
+    let without_effect = opts
+        .request_dedup
+        .then(|| results::without_effect(&ids, ops));
     for (_, pres) in partitions {
         let mut interner = Interner::default();
-        let (key_ops, width) = build(&pres, ops, &ids, opts.request_dedup, &mut interner);
+        let (key_ops, width) = build(&pres, ops, &ids, without_effect.as_ref(), &mut interner);
         let label = if pres.iter().all(|p| p.anchor == pres[0].anchor)
             && pres
                 .iter()
@@ -414,6 +421,18 @@ impl<'a> Identities<'a> {
         Identities { ops, by_id }
     }
 
+    /// The attempts of each identity and body, in invocation order.
+    pub(crate) fn requests(&self) -> BTreeMap<(String, &'a str, String), Vec<usize>> {
+        let mut out = BTreeMap::<_, Vec<usize>>::new();
+        for ((anchor, rid), members) in &self.by_id {
+            for &i in members {
+                let request = (anchor.clone(), *rid, body(&self.ops[i]));
+                out.entry(request).or_default().push(i);
+            }
+        }
+        out
+    }
+
     fn identity(&self, i: usize) -> Option<(String, &'a str, String)> {
         let op = &self.ops[i];
         let rid = op.request_id.as_deref()?;
@@ -578,13 +597,14 @@ fn project(op: &Op, src: usize, ids: &Identities, direct: bool) -> Result<Option
     Ok(Some(pre))
 }
 
-/// Assign registers and dedup slots within an independent key group. Merge the committing
-/// attempts for each body, while leaving fresh answers as separate operations.
+/// Assign registers and dedup slots within an independent key group. Merge the attempts of each
+/// request: the committing ones, or all of them when its one result is a no-op or a row conflict
+/// (`without_effect`). Other answers from fresh state stay separate operations.
 fn build(
     pres: &[Pre],
     ops: &[Op],
     ids: &Identities,
-    dedup: bool,
+    without_effect: Option<&HashMap<usize, Definite>>,
     interner: &mut Interner,
 ) -> (Vec<KeyOp>, usize) {
     let mut keys = HashMap::new();
@@ -608,7 +628,7 @@ fn build(
     for pre in pres {
         let src = &ops[pre.src];
         let ret = src.ret;
-        let record = if dedup && pre.role != Role::Plain {
+        let record = if without_effect.is_some() && pre.role != Role::Plain {
             ids.identity(pre.src).and_then(|(anchor, rid, body)| {
                 let scope = (anchor, rid);
                 if ids.by_id[&scope].len() < 2 {
@@ -623,23 +643,7 @@ fn build(
         } else {
             None
         };
-        if pre.role == Role::Effect
-            && let Some(record) = record
-        {
-            let identity = (record.slot, record.body);
-            if let Some(&g) = groups.get(&identity) {
-                let merged: &mut KeyOp = &mut out[g];
-                merged.call = merged.call.min(src.call);
-                merged.more.push(pre.src);
-                if let Some(r) = ret {
-                    merged.ret = Some(merged.ret.map_or(r, |m| m.min(r)));
-                }
-                continue;
-            }
-            groups.insert(identity, out.len());
-        }
-
-        out.push(KeyOp {
+        let mut op = KeyOp {
             rows: pre
                 .rows
                 .iter()
@@ -651,7 +655,28 @@ fn build(
             ret,
             src: pre.src,
             more: vec![],
-        });
+        };
+        // Attempts with an unknown outcome have the role of an effect, and share the result of
+        // their request if it has none.
+        let result = without_effect.and_then(|results| results.get(&pre.src));
+        let merges = pre.role == Role::Effect
+            || result.is_some() && results::definite_result(src) == result.copied();
+        if merges && let Some(record) = record {
+            let identity = (record.slot, record.body);
+            if let Some(&g) = groups.get(&identity) {
+                let merged: &mut KeyOp = &mut out[g];
+                if merged.role == Role::Effect && op.role != Role::Effect {
+                    std::mem::swap(merged, &mut op);
+                }
+                merged.call = merged.call.min(op.call);
+                merged.ret = merged.ret.into_iter().chain(op.ret).min();
+                merged.more.push(op.src);
+                merged.more.append(&mut op.more);
+                continue;
+            }
+            groups.insert(identity, out.len());
+        }
+        out.push(op);
     }
     (out, keys.len() + slots.len())
 }

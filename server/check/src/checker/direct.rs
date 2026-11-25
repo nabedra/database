@@ -11,13 +11,15 @@
 //!
 //! The request identity on the direct path is the table, the anchor key (the smallest key of
 //! the request) and the request ID. Its dedup record stores the body's digest and the result.
-//! A retry with the same body returns the stored result. Another body under the same identity
-//! is refused with `conflict`. The same request ID on another key is another identity and runs
-//! (D03). The body here is `f` plus the invoke value. [`check_identity`] reports:
+//! A retry with the same body returns the first definite result, including a no-op and a row
+//! conflict ([`results`], which also lists what the decision leaves open). Another body under the
+//! same identity is refused with `conflict`. The same request ID on another key is another identity
+//! and runs (D03). The body here is `f` plus the invoke value. [`check_identity`] reports:
 //!
 //! | Kind | Rule | Scenarios |
 //! | --- | --- | --- |
 //! | `dedup-miss` | an attempt invoked after an attempt of the same identity and body answered with a commit was answered from fresh state: an `update` or `delete` of a missing row, or a `conflict` refusal | D02, D04, O15 |
+//! | `unstable-result` | two attempts of the same identity and body were answered with different definite results, and no `dedup-miss` covers them | O08, D02 |
 //! | `request-id-reuse-undetected` | two bodies under one identity both committed, or one was answered `ok` although it was invoked after the other committed | D03 |
 //! | `request-id-reuse-misdetected` | an `upsert`, `update` or `delete` was refused with `conflict`, which on the direct path only reuse causes, but no other body under its identity could have held a dedup record by then | D03 |
 //!
@@ -25,7 +27,8 @@
 //! `update` or `delete` whose existence flag is `true` (see [`linearizable`]). Refusals other
 //! than `conflict`, such as `overloaded` or a deadline before the dedup lookup, can come after a
 //! commit and are not dedup misses. Dedup records expire after a retention of 24 hours, far
-//! longer than a simulated run, so the rules assume they never expire.
+//! longer than a simulated run. The rules about commits assume that they never expire, and
+//! [`results`] says what happens to no-ops and row conflicts in a longer history.
 //!
 //! The completion values come from the simulator's history recorder: a `fail` carries the
 //! error code (`code`, `error`, or `error.code`), and an `ok` `update` or `delete` carries the
@@ -33,25 +36,26 @@
 //! when recorded, must equal the number of input rows. These histories use primary-key
 //! conflicts. A workload with other uniqueness constraints needs to identify those refusals.
 //!
-//! [`check_with`] can add two rules about request identities, described in [`request_rules`]:
-//! `unstable-result` and `not-applied-took-effect`. Both are off by default, and their hits are
-//! findings to review.
+//! [`check_with`] can add a rule about refusals, described in [`request_rules`]:
+//! `not-applied-took-effect`. It is off by default, and its hits are findings to review.
 
 pub mod request_rules;
+pub mod results;
 
 use super::linearizable::{
     self, Identities, anchor, body, classify, committed_answer, error_code, rows_of,
 };
 use super::{Anomaly, Verdict, outcome};
 use crate::history::{Event, Op, Outcome, pair};
-pub use request_rules::{InsertConflict, Options, ROW_CONFLICT, insert_conflict};
+pub use request_rules::Options;
+pub use results::{InsertConflict, ROW_CONFLICT, insert_conflict};
 
-/// Every direct-path check over one history, without the opt-in rules.
+/// Every direct-path check over one history, without the opt-in rule.
 pub fn check(events: &[Event]) -> Verdict {
     check_with(events, &Options::default())
 }
 
-/// [`check`], plus the opt-in rules that `opts` selects.
+/// [`check`], plus the opt-in rule if `opts` selects it.
 pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
     let lin = linearizable::check_kv_opts(
         events,
@@ -69,9 +73,6 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
         outcome::check(&for_outcome(events, &paired.ops)),
         identity_verdict(&paired.ops),
     ];
-    if opts.stable_results {
-        verdicts.push(request_rules::stable_results(&paired.ops));
-    }
     if opts.request_not_applied {
         verdicts.push(request_rules::request_not_applied(
             events,
@@ -79,11 +80,10 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
             opts.max_configs,
         ));
     }
-    let mut verdict = Verdict::merge(verdicts);
-    if opts.stable_results || opts.request_not_applied {
-        verdict.unclassified_conflicts = request_rules::unclassified_conflicts(&paired.ops);
+    Verdict {
+        unclassified_conflicts: results::unclassified_conflicts(&paired.ops),
+        ..Verdict::merge(verdicts)
     }
-    verdict
 }
 
 /// The request ID rules in the table above.
@@ -122,6 +122,20 @@ fn identity_verdict(ops: &[Op]) -> Verdict {
             .collect();
         let name = |i: usize| describe(&ops[i]);
         for (b, (_, attempts)) in bodies.iter().enumerate() {
+            if let Some((first, other)) = results::disagreement(ops, attempts) {
+                anomalies.push(Anomaly::new(
+                    "unstable-result",
+                    format!(
+                        "request {rid:?} at anchor {anchor:?}: {} answered {:?} (event {}), and {} of the same body answered {:?}",
+                        name(first),
+                        results::definite_result(&ops[first]),
+                        ops[first].complete_index.unwrap_or(ops[first].invoke_index),
+                        name(other),
+                        results::definite_result(&ops[other]),
+                    ),
+                    [ops[first].indices(), ops[other].indices()].concat(),
+                ));
+            }
             let Some(c) = committed[b] else { continue };
             for &a in attempts {
                 let op = &ops[a];

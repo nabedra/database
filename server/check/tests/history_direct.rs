@@ -4,8 +4,11 @@
 //!
 //! The model follows `plans/oltp-direct-path.md`, section 4: the dedup record is keyed by
 //! anchor key and request ID and holds the body and the result; the same body replays the
-//! result, another body is refused with `conflict`; `update` and `delete` of a missing row and
-//! refusals commit nothing. Clients retry the same ID and body after an unknown outcome,
+//! result, also a no-op and the row conflict of an `insert` ("Retry results"); another body is
+//! refused with `conflict` after a commit; `update` and `delete` of a missing row and refusals
+//! commit nothing. Where that decision is silent, the model does what the checker accepts: a
+//! no-op or a row conflict does not hold the identity against another body, and `insert_many` over
+//! a present row is not recorded. Clients retry the same ID and body after an unknown outcome,
 //! sometimes through another gateway, and some requests reuse an earlier ID with another body
 //! on the same or another key (D02, D03, D04).
 
@@ -61,13 +64,16 @@ impl Req {
 #[derive(Default)]
 struct Store {
     rows: BTreeMap<String, Value>,
+    /// The body and the result of the commit of an identity.
     dedup: HashMap<(String, String), (String, Value)>,
+    /// The results without a commit, by identity and body.
+    unchanged: HashMap<(String, String, String), (EventType, Value)>,
     /// Times the planted bug changed an answer or an effect.
     bug_hits: usize,
 }
 
-fn conflict() -> Value {
-    json!({"not_applied": true, "code": "conflict"})
+fn conflict(message: &str) -> Value {
+    json!({"not_applied": true, "code": "conflict", "message": message})
 }
 
 impl Store {
@@ -88,15 +94,39 @@ impl Store {
                     return (EventType::Ok, result);
                 }
                 _ if body == req.body() => return (EventType::Ok, result),
-                _ => return (EventType::Fail, conflict()),
+                _ => {
+                    let reused = "request_id was already used with a different request body";
+                    return (EventType::Fail, conflict(reused));
+                }
             }
         }
+        let request = (req.key.clone(), req.rid.clone(), req.body());
+        if let Some(result) = self.unchanged.get(&request) {
+            match bug {
+                Bug::ForgetDedup => self.bug_hits += 1,
+                _ => return result.clone(),
+            }
+        }
+        let result = self.execute(req);
+        match &result {
+            (EventType::Ok, value) if *value != json!(false) => {
+                self.dedup.insert(id, (req.body(), value.clone()));
+            }
+            _ if req.f == "insert_many" => {}
+            _ => {
+                self.unchanged.insert(request, result.clone());
+            }
+        }
+        result
+    }
+
+    fn execute(&mut self, req: &Req) -> (EventType, Value) {
         let rows = req.rows();
         let present = |s: &Store, k: &str| s.rows.contains_key(k);
         let result = match req.f {
             "insert" | "insert_many" => {
                 if rows.iter().any(|(k, _)| present(self, k)) {
-                    return (EventType::Fail, conflict());
+                    return (EventType::Fail, conflict("primary key already exists"));
                 }
                 for (k, v) in &rows {
                     self.rows.insert(k.clone(), v.clone());
@@ -126,7 +156,6 @@ impl Store {
             }
             other => unreachable!("{other}"),
         };
-        self.dedup.insert(id, (req.body(), result.clone()));
         (EventType::Ok, result)
     }
 }
@@ -427,7 +456,7 @@ fn mutated_direct_histories_fail() {
 
     // The D03 refusal is explained by the other body under r1 on k1. Without it, the refused
     // upsert on k1 is a misdetected reuse.
-    let retries = load("direct_valid_retries");
+    let retries = load("direct_retry_replays");
     let mut e = retries.clone();
     for ev in e.iter_mut() {
         if ev.f == "upsert" {
@@ -436,29 +465,41 @@ fn mutated_direct_histories_fail() {
     }
     assert!(direct::check(&e).has("request-id-reuse-misdetected"));
     // Answering the replayed update from fresh state after the commit is a dedup miss.
+    let last_of = |rid: &str| {
+        retries
+            .iter()
+            .rposition(|x| x.request_id.as_deref() == Some(rid) && x.kind != EventType::Invoke)
+            .unwrap()
+    };
+    let replay = last_of("r6");
     let mut e = retries.clone();
-    let replay = e
-        .iter()
-        .enumerate()
-        .filter(|(_, x)| x.f == "update" && x.kind == EventType::Ok)
-        .map(|(i, _)| i)
-        .nth(2)
-        .unwrap();
     e[replay].value = json!(false);
     assert!(direct::check(&e).has("dedup-miss"));
     // A conflict refusal of the same body after the commit is also a dedup miss.
-    let mut e = retries;
-    let overloaded = e
-        .iter()
-        .position(|x| x.f == "update" && x.kind == EventType::Fail)
-        .unwrap();
-    e[overloaded].value = json!({"not_applied": true, "code": "conflict"});
+    let mut e = retries.clone();
+    e[replay].kind = EventType::Fail;
+    e[replay].value = json!({"not_applied": true, "code": "conflict"});
     assert!(direct::check(&e).has("dedup-miss"));
+    // A replayed no-op that answers from the row it would find now is an unstable result.
+    let replay = last_of("r10");
+    let mut e = retries.clone();
+    e[replay].value = json!(true);
+    assert!(direct::check(&e).has("unstable-result"));
+    // So is an insert that was refused over a row and succeeds once the row is gone.
+    let replay = last_of("r8");
+    let mut e = retries.clone();
+    e[replay].kind = EventType::Ok;
+    e[replay].value = Value::Null;
+    assert!(direct::check(&e).has("unstable-result"));
+    // A replayed row conflict without a message is not recognised, and is counted.
+    let mut e = retries;
+    e[replay].value.as_object_mut().unwrap().remove("message");
+    assert_eq!(direct::check(&e).unclassified_conflicts, 1);
 }
 
 #[test]
 fn insert_many_without_anchor_key_uses_its_smallest_row_key() {
-    let mut events = load("direct_valid_retries");
+    let mut events = load("direct_retry_replays");
     for e in events.iter_mut().filter(|e| e.f == "insert_many") {
         e.key = None;
     }
