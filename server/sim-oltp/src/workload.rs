@@ -188,6 +188,7 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     observer(0, format!("configuration {}", configuration["hash"]));
     let checks = Invariants::new();
     checks.set_trace(observer.clone());
+    checks.install_probes(&world, workload.name());
     let history = Arc::new(Mutex::new(History::default()));
     history.lock().unwrap().set_trace(observer.clone());
     let mut assertions = BTreeMap::new();
@@ -329,6 +330,8 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         );
         checks.check_history(&world, &verdict);
     }
+    checks.check_outcomes(&world, history.events());
+    assertions.insert("probe invariants", checks.probe_invariants_hold());
     let mut capture = trace.lock().unwrap();
     capture.flush_frames();
     let trace = &capture.trace;
@@ -350,6 +353,10 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         workload,
         scenarios,
         summary,
+        exercised: checks
+            .probes()
+            .map(|probes| probes.exercised())
+            .unwrap_or_default(),
     }
 }
 

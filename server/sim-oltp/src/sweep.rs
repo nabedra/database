@@ -15,6 +15,7 @@ use nabedra_sim::sweep::{self, PlantedSearch, SeedRun, SeedSummary, SweepConfig,
 use serde_json::{Value, json};
 
 use crate::{
+    invariants::protocol::PROBE_INVARIANTS,
     nemesis::Selection,
     panics::PANIC,
     workload::run_seed,
@@ -57,20 +58,6 @@ impl Defect {
     }
 }
 
-/// The invariants of design 3.7 that need the P10-PROBES event stream.
-const PROBE_INVARIANTS: [&str; 10] = [
-    "ElectionSafety",
-    "MonotonicVote",
-    "MonotonicCommit",
-    "LogMatching",
-    "AppliedPrefixesAgree",
-    "MajorityReached",
-    "DedupUnique over Applied",
-    "NotAppliedNeverCommitted over Applied",
-    "RangeClockRule1",
-    "KeyspaceCoverage over RouteEpochPublished",
-];
-
 /// A completed run's named assertion verdicts. Omit families that did not execute.
 pub(crate) struct RunResult {
     pub(crate) run: SeedRun,
@@ -80,6 +67,8 @@ pub(crate) struct RunResult {
     /// Scenarios whose assertions executed in this seed.
     pub(crate) scenarios: Scenarios,
     pub(crate) summary: Value,
+    /// How often each probe-driven rule ran on an event of its own.
+    pub(crate) exercised: BTreeMap<&'static str, u64>,
 }
 
 /// The workload and nemesis selection of a sweep (`NABEDRA_SIM_WORKLOAD`,
@@ -427,8 +416,16 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     }
     let started = time::now_std();
     let observed = Mutex::new(BTreeMap::<u64, ObservedSeed>::new());
+    let exercised = Mutex::new(BTreeMap::<&'static str, u64>::new());
     let report = sweep::sweep(&config, |seed, generator| {
         let (result, measurement) = measured(seed, generator, defect, &setup);
+        for (rule, times) in &result.exercised {
+            *exercised
+                .lock()
+                .expect("exercised rules poisoned")
+                .entry(rule)
+                .or_default() += times;
+        }
         let mut observed = observed.lock().expect("sweep observations poisoned");
         let observation = observed.entry(seed).or_insert_with(|| {
             let config_hash = result.run.config["hash"].as_str().map_or_else(
@@ -472,6 +469,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     });
     let observed = observed.into_inner().expect("sweep observations poisoned");
     let duration_s = time::elapsed(started).as_secs_f64();
+    let exercised = exercised.into_inner().expect("exercised rules poisoned");
     let mut assertions = BTreeMap::new();
     let mut config_hash = nabedra_sim::Fnv::default();
     let mut stats = Vec::with_capacity(report.seeds.len());
@@ -592,6 +590,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             "workload": workload,
             "verdicts": verdicts.iter().map(|(verdict, seeds)| (verdict.name(), seeds)).collect::<BTreeMap<_, _>>(),
             "scenarios": scenario_seeds.iter().map(|(tag, (seeds, failed))| (*tag, json!({"seeds": seeds, "failing": failed}))).collect::<BTreeMap<_, _>>(),
+            "probe_rules": exercised,
             "direct_oltp": true,
             "defect": defect.name(),
             "jobs": config.jobs,
@@ -625,6 +624,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             workload,
             smoke: setup.workloads.is_smoke(),
             scenarios: scenario_assertions,
+            exercised,
             assertions,
             unreplayed,
             defects_skipped: test_defects && !report.passed(),
@@ -738,6 +738,8 @@ struct RecordInput {
     smoke: bool,
     /// Scenario tags that executed, and whether every seed that executed one passed.
     scenarios: BTreeMap<&'static str, bool>,
+    /// Probe-driven rules, with how often they ran in the whole range.
+    exercised: BTreeMap<&'static str, u64>,
     assertions: BTreeMap<&'static str, bool>,
     unreplayed: u64,
     defects_skipped: bool,
@@ -808,16 +810,15 @@ fn write_record(
         record.not_run("seeded defects", "the unmodified smoke sweep failed");
     }
     for invariant in PROBE_INVARIANTS {
-        record.not_run(invariant, "no sweep installs the probes yet");
+        if input
+            .exercised
+            .get(invariant)
+            .is_none_or(|times| *times == 0)
+        {
+            record.not_run(invariant, "no seed in this range exercised it");
+        }
     }
-    record.not_run(
-        "ResourceBaseline ledger and RangeClock pending sets",
-        "no sweep installs the probes yet",
-    );
-    record.not_run(
-        "ConsistentCommittedData",
-        "no sweep installs the probes yet",
-    );
+    record.not_run("ConsistentCommittedData", "no probe reports it");
     if input.smoke {
         for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {
             record.not_run(scenario, &format!("runs in the {workload} workload"));

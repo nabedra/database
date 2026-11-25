@@ -171,8 +171,11 @@ impl Probes {
     }
 
     /// NotAppliedNeverCommitted: after a definite `not_applied` answer, no replica ever
-    /// applies a direct entry that commits that identity. Design 3.7 exempts nothing, so
-    /// neither a retry of the ID nor another body under it excuses a commit.
+    /// applies a direct entry that commits that identity and body (lead decision 12.1). A
+    /// retry of the ID excuses nothing. D03 requires a refusal of another body under a
+    /// committed identity, so a refusal is excused only when the refused body had not been
+    /// sent yet when the identity was first applied: the entry then carries another body.
+    /// A second entry under the identity is DedupUnique's.
     pub fn check_outcomes(&self, world: &World, events: &[Event]) {
         let committed: BTreeMap<_, _> = self
             .lock()
@@ -195,6 +198,9 @@ impl Probes {
             self.ran(NOT_APPLIED_NEVER_COMMITTED, 1);
             for key in keys(event, events) {
                 if let Some(t_ns) = committed.get(&(key.clone(), request.clone())) {
+                    if first_sent(event, events).is_some_and(|sent| sent > *t_ns) {
+                        continue;
+                    }
                     self.report(world, NOT_APPLIED_NEVER_COMMITTED, format!(
                         "{key} request {request}: answered not_applied at history event {} but a replica committed it at {t_ns} ns",
                         event.index
@@ -327,6 +333,27 @@ impl Probes {
             Invariants::from_checks(checks).violate(world, kind, detail);
         }
     }
+}
+
+/// When the body that `refused` answers was first sent under its identity, in virtual ns. A
+/// body is an operation and its input. `None` when the history does not say.
+fn first_sent(refused: &Event, events: &[Event]) -> Option<u64> {
+    let sent = |event: &&Event| {
+        event.kind == EventType::Invoke
+            && event.request_id == refused.request_id
+            && event.key == refused.key
+    };
+    let body = events
+        .iter()
+        .filter(sent)
+        .rfind(|invoke| invoke.process == refused.process && invoke.index < refused.index)?;
+    events
+        .iter()
+        .filter(sent)
+        .filter(|invoke| invoke.f == body.f && invoke.value == body.value)
+        .map(|invoke| invoke.time_ns)
+        .min()
+        .flatten()
 }
 
 /// The `table/key` names an operation's history event covers: its own key, or the rows its

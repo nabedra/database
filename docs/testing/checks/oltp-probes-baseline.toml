@@ -5,8 +5,7 @@ kinds = ["S", "H"]
 # scratch worktree, smoke seeds 1 to 50 must be clean and replay with every probe rule on. Then
 # server/sim-oltp/src/probes/recurring-charge.patch makes a worker hold a 564-byte charge for 50 of
 # every 51 ms after its first direct entry. Every seed must report ResourceBaseline and nothing else.
-# The scratch tree gets workload-hook.patch, as in oltp-probes-planted. It proves no product
-# guarantee by itself.
+# It proves no product guarantee by itself.
 guarantees = []
 scenarios = []
 tiers = ["T1"]
@@ -18,10 +17,6 @@ scratch="$(mktemp -d "$PWD/target/probes-baseline.XXXXXX")"
 trap 'git -C "$root" worktree remove --force "$scratch" >/dev/null 2>&1 || true' EXIT
 git -C "$root" worktree add --detach "$scratch" HEAD >/dev/null
 probes=server/sim-oltp/src/probes
-if ! grep -q install_probes "$scratch/server/sim-oltp/src/workload.rs"; then
-    echo "The workload does not install the probes: applying workload-hook.patch to the scratch tree"
-    git -C "$scratch" apply --verbose "$probes/workload-hook.patch"
-fi
 cd "$scratch/server"
 build() { cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib --no-run; }
 run() {
