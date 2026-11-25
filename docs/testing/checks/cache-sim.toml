@@ -5,7 +5,10 @@ guarantees = ["CACHE-G02", "CACHE-G03", "CACHE-G05", "CACHE-G06", "CACHE-G07", "
 scenarios = ["K01", "K02", "K03"]
 tiers = ["T1"]
 # Fault model. The cluster uses the simulated runtime, network and ClockBound.
-# Only the Cache library is compiled with sim.
+# Only the Cache library is compiled with sim. The sweep's partitions deliver
+# late, as TCP does. cache-sim-loss runs the same seeds with lost messages.
+# The history checker has no lag window here, so a pass says nothing about how
+# many acknowledged writes above the promoted copy's prefix a failover loses.
 command = ["bash", "-euc", '''
 cargo test --locked -j 4 --release -p nabedra-check --test history_cache_sim
 sim=(cargo test --locked -j 4 --release --no-default-features --features cache,sim --lib)
@@ -14,10 +17,10 @@ grep -Fxq 'cache::cluster::sim::tests::seed_sweep: test' <<< "$tests"
 "${sim[@]}" -- --nocapture --test-threads=1
 ''']
 cwd = "server"
-timeout_s = 1800
+timeout_s = 2700
 needs = []
 result_parser = "cargo-test"
 # The release profile exceeds two core-seconds per seed. Run 250 with 5% replay
 # on the PR check. Failure artifacts still get a full deterministic replay.
 # Shrink interactively from the recorded seed and replay command.
-env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim-cache", CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true", CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS = "true", NABEDRA_SEEDS = "250", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "0.05", NABEDRA_PLANTED_SEEDS = "500", NABEDRA_SIM_SHRINK = "0", NABEDRA_SIM_ARTIFACTS = "../target/testing-logs/cache-sim" }
+env = { NABEDRA_SIM_PARTITIONS = "late", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim-cache", CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true", CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS = "true", NABEDRA_SEEDS = "250", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "0.05", NABEDRA_PLANTED_SEEDS = "500", NABEDRA_SIM_SHRINK = "0", NABEDRA_SIM_ARTIFACTS = "../target/testing-logs/cache-sim" }
