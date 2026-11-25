@@ -1998,6 +1998,7 @@ version = "0.1.0"
 dependencies = [
  "nabedra-protocol",
  "nabedra-resources",
+ "nabedra-rt",
  "serde",
  "serde_json",
  "sha2 0.11.1",
