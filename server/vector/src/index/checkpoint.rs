@@ -17,7 +17,7 @@ use nabedra_rt::fs::{Fs, FsFile, OpenMode};
 use super::codec::Codec;
 use super::mutant::mutant;
 use super::rows::{Gen, Point, Slot};
-use super::{Config, Entry, Index, PinInner, Range, Service};
+use super::{Append, Config, Entry, Index, PinInner, Range, Service};
 use crate::types::{CommitTs, Error, Key, PartId, Pos, RangeId, Result, Row, Value};
 
 const MANIFEST: &str = "MANIFEST";
@@ -580,20 +580,14 @@ impl<C: Codec> Index<C> {
             };
             parts.insert(old, part);
             sh.rows.name(slot, at);
+            let a = Append {
+                slot,
+                at,
+                generation,
+            };
             let id = sh.new_id();
             let (sh, shard, codec) = self.owner(part);
-            shard.put(
-                sh,
-                codec,
-                part,
-                Entry {
-                    slot,
-                    at,
-                    generation,
-                    id,
-                    sent: false,
-                },
-            );
+            shard.put(sh, codec, part, Entry::new(a, id));
         }
         Ok(())
     }

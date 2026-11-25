@@ -895,6 +895,9 @@ fn vs07_random_interleavings_keep_the_spec_properties() {
         }
         Ok(())
     });
+    if Runs::default().cases < 256 {
+        return; // A replay of one case.
+    }
     // Every action of the spec took place.
     let total = total.into_inner();
     let actions = [

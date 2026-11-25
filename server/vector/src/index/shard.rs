@@ -21,7 +21,19 @@ pub struct Entry {
     pub generation: Gen,
     pub id: u64,
     /// A drain sent a copy to a target.
-    pub(super) sent: bool,
+    sent: bool,
+}
+
+impl Entry {
+    pub fn new(a: Append, id: u64) -> Entry {
+        Entry {
+            slot: a.slot,
+            at: a.at,
+            generation: a.generation,
+            id,
+            sent: false,
+        }
+    }
 }
 
 /// Entries of similar length, a structure of arrays.
@@ -200,23 +212,7 @@ impl<C: Codec> Shard<C> {
             sh.forget(a.generation, a.slot, a.at);
         } else if sh.dir.get(&part).is_some_and(|m| m.state == State::Ready) {
             let id = sh.new_id();
-            let Append {
-                slot,
-                at,
-                generation,
-            } = a;
-            self.put(
-                sh,
-                codec,
-                part,
-                Entry {
-                    slot,
-                    at,
-                    generation,
-                    id,
-                    sent: false,
-                },
-            );
+            self.put(sh, codec, part, Entry::new(a, id));
             sh.placed(a.generation, a.at);
         } else {
             sh.inbox.push_front(a);
@@ -236,17 +232,7 @@ impl<C: Codec> Shard<C> {
             _ => return Some(Msg::Copy(c)),
         }
         if lands {
-            let id = c.entry.id;
-            self.put(
-                sh,
-                codec,
-                c.to,
-                Entry {
-                    id,
-                    sent: false,
-                    ..c.entry
-                },
-            );
+            self.put(sh, codec, c.to, c.entry);
         } else {
             sh.forget(c.entry.generation, c.entry.slot, c.entry.at);
         }

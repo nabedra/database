@@ -118,7 +118,7 @@ fn prepared(fs: &FaultFs) -> Index {
 /// Every image that a crash may leave.
 fn images_of(fs: &FaultFs) -> Vec<FaultFs> {
     let mut all = vec![fs.crash(), fs.kill(), fs.kill().crash()];
-    all.extend((0..4).map(|seed| fs.power_loss(seed)));
+    all.extend((0..24).map(|seed| fs.power_loss(seed)));
     all
 }
 

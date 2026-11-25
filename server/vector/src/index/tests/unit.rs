@@ -638,3 +638,42 @@ fn vs05_a_resync_replaces_the_index_at_once() {
     assert!(ix.shared.rows.census().is_empty());
     assert_eq!(ix.shared.dir.values().map(|m| m.entries).sum::<usize>(), 0);
 }
+
+/// An entry stays in the tree of its `partition_by` value.
+#[test]
+fn vs07_nothing_moves_to_another_tree() {
+    let mut ix = serving(
+        Config::new(schema(2, &[ColumnType::Text], Some(0)), 1),
+        ExactCodec,
+        None,
+    );
+    let write = |k: u64, t: &str| (k, Some(row(&[1.0, 0.0], vec![Value::Text(t.into())], k)));
+    feed(
+        &mut ix,
+        RANGE,
+        &page(
+            0,
+            vec![
+                write(1, "a"),
+                write(2, "b"),
+                (3, Some(row(&[0.0; 2], vec![Value::Text("a".into())], 3))),
+            ],
+        ),
+    );
+    let parts: Vec<PartId> = ix.shared.dir.keys().copied().collect();
+    let entry = |ix: &Index, p| ix.shards[0].parts[&p].entries().next().unwrap().id;
+    for (&from, &to) in parts.iter().flat_map(|a| parts.iter().map(move |b| (a, b))) {
+        let id = entry(&ix, from);
+        assert!(!ix.reassign(from, id, to), "{from:?} to {to:?}");
+        assert!(!ix.merge(from, to), "{from:?} into {to:?}");
+    }
+    // The list of vectors without a direction does not drain.
+    let list = ix
+        .shared
+        .dir
+        .iter()
+        .find(|(_, m)| m.undirected)
+        .map(|(p, _)| *p)
+        .unwrap();
+    assert!(!ix.split(list));
+}

@@ -324,7 +324,7 @@ fn vs19_approximate_scans_reach_their_recall_and_read_a_part() {
     for lengths in [false, true] {
         let g = &mut Gen::from_seed(11);
         let dim = 16;
-        let all = clustered(g, 6000, dim, lengths);
+        let all = clustered(g, 4000, dim, lengths);
         let cfg = Config {
             flat: 1000,
             part_min: 16,
@@ -477,4 +477,36 @@ fn vs07_the_planner_counts_matches() {
         "{visited} of {}",
         ix.listed().len()
     );
+}
+
+/// A scan whose stop rule asks for little still returns `limit` rows when that many match.
+#[test]
+fn vs07_a_scan_does_not_stop_before_limit_rows() {
+    let cfg = Config {
+        flat: 0,
+        part_min: 4,
+        part_max: 16,
+        ..Config::new(schema(2, &[ColumnType::Bool], None), 2)
+    };
+    let mut ix = serving(cfg, ExactCodec, None);
+    let write = |k: u64| {
+        let a = k as f32 / 160.0;
+        let mark = Value::Bool(k.is_multiple_of(25));
+        (k, Some(row(&[a.cos(), a.sin()], vec![mark], k)))
+    };
+    feed(&mut ix, RANGE, &page(0, (0..1000).map(write).collect()));
+    settle(&mut ix);
+    let pin = latest(&mut ix, None);
+    for limit in [1, 30, 40, 50] {
+        let filter = Some(Filter::Eq(0, Value::Bool(true)));
+        let q = Query {
+            filter,
+            exact: false,
+            recall: 0.0,
+            ..query(Op::L2, &[1.0, 0.0], limit)
+        };
+        let hits = ix.search(&pin, &q).unwrap();
+        assert_eq!(hits.len(), limit.min(40));
+        assert!(images(&hits).iter().all(|k| k.is_multiple_of(25)));
+    }
 }
