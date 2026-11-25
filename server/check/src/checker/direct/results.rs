@@ -51,6 +51,7 @@
 //! | --- | --- |
 //! | `other-body-committed` | another body under the identity commits, not clearly before the first one answered a no-op or a row conflict. By the text above it should be refused; a question for the user |
 //! | `other-body-without-effect` | the same, but it answers a no-op or a row conflict of its own |
+//! | `other-body-unknown` | another body under the identity of an answered no-op or row conflict has an unknown attempt and no answered commit. It may have committed, and it may have been refused |
 //! | `insert-many-recomputed` | an `insert_many` refused over a row commits on retry. Decision 11 names only `insert` |
 //! | `request-spans-retention` | the attempts of a request with a no-op or a row conflict span [`RETENTION_NS`] or more, by `time_ns`. Its answers may be replayed or recomputed, because its record may have been deleted. Its commits are assumed to hold. Without `time_ns` nothing expires |
 //!
@@ -96,6 +97,7 @@ pub const RETENTION_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 /// The names in [`Verdict::not_judged`](super::super::Verdict::not_judged).
 pub const OTHER_BODY_COMMITTED: &str = "other-body-committed";
 pub const OTHER_BODY_UNCHANGED: &str = "other-body-without-effect";
+pub const OTHER_BODY_UNKNOWN: &str = "other-body-unknown";
 pub const INSERT_MANY_RECOMPUTED: &str = "insert-many-recomputed";
 pub const EXPIRED: &str = "request-spans-retention";
 
@@ -320,6 +322,10 @@ pub(super) fn not_judged(ids: &Identities, ops: &[Op]) -> BTreeMap<String, usize
                 .filter_map(|(_, other)| answered(other))
                 .any(|first| commits_after(attempts, first));
             count(OTHER_BODY_COMMITTED, usize::from(after));
+            let unknown = attempts.iter().any(|&i| ops[i].outcome == Outcome::Info);
+            let open = unknown && !attempts.iter().any(|&i| definite_result(&ops[i]).is_some());
+            let beside = others(b).any(|(_, other)| answered(other).is_some());
+            count(OTHER_BODY_UNKNOWN, usize::from(open && beside));
             if may_expire(ops, attempts) && answered(attempts).is_some() {
                 count(EXPIRED, 1);
             }

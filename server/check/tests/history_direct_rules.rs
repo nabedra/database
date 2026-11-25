@@ -13,7 +13,7 @@
 //! is neither a valid control nor a planned reproduction (`dr-repro` report).
 
 use nabedra_check::checker::direct::results::{
-    EXPIRED, INSERT_MANY_RECOMPUTED, OTHER_BODY_COMMITTED, OTHER_BODY_UNCHANGED,
+    EXPIRED, INSERT_MANY_RECOMPUTED, OTHER_BODY_COMMITTED, OTHER_BODY_UNCHANGED, OTHER_BODY_UNKNOWN,
 };
 use nabedra_check::checker::direct::{
     self, InsertConflict, Options, ROW_CONFLICT, insert_conflict,
@@ -1398,6 +1398,34 @@ fn what_is_not_judged_is_counted() {
         &[(OTHER_BODY_UNCHANGED, 1)],
     );
     counted(
+        "another body has an unknown attempt",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         2< info
+         3> delete k null r2
+         3< ok false",
+        &[(OTHER_BODY_UNKNOWN, 1)],
+    );
+    counted(
+        "another body has an unknown attempt and a commit",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         2< info
+         2> upsert k 9 r
+         2< ok",
+        &[(OTHER_BODY_COMMITTED, 1)],
+    );
+    counted(
+        "an unknown attempt of the same body",
+        "0> update k 2 r
+         0< ok false
+         2> update k 2 r
+         2< info",
+        &[],
+    );
+    counted(
         "a batch is computed again",
         r#"1> insert b 1 other
            1< ok
@@ -2208,8 +2236,9 @@ fn a_store_that_keeps_its_promises_is_never_flagged() {
             assert!(verdict.valid, "seed {seed}, {reading:?}: {verdict:#?}");
             assert_eq!(verdict.unclassified_conflicts, 0, "seed {seed}");
             if reading == Reading::Holds {
-                // A store that decides everything leaves nothing open.
-                assert!(verdict.not_judged.is_empty(), "seed {seed}: {verdict:#?}");
+                // A store that decides everything leaves nothing open, but a refusal may be lost.
+                let mut names = verdict.not_judged.keys();
+                assert!(names.all(|n| n == OTHER_BODY_UNKNOWN), "seed {seed}");
                 refusals += usize::from(refused_after_a_result(&events));
             } else {
                 not_judged += usize::from(!verdict.not_judged.is_empty());
