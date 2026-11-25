@@ -681,6 +681,94 @@ fn a_freeze_lands_in_a_job_and_after_a_reported_read() {
     });
 }
 
+/// Two reads of the clock, and how far the code around them got.
+fn reads_twice(stage: &AtomicU64) {
+    time::now();
+    stage.store(1, SeqCst);
+    time::now();
+    stage.store(2, SeqCst);
+}
+
+/// A service that reads its clock twice in its first step.
+struct Reader {
+    stage: Arc<AtomicU64>,
+    bell: Condvar,
+}
+
+impl Stepped for Reader {
+    fn step(&mut self) -> Step {
+        reads_twice(&self.stage);
+        Step::Exit
+    }
+    fn doorbell(&self) -> &Condvar {
+        &self.bell
+    }
+    fn run(self) {}
+}
+
+/// Whatever runs the job, it stays stopped while its node is frozen, at its first read and
+/// again at a later one.
+#[test]
+fn a_job_stopped_at_a_clock_read_stays_stopped_until_the_thaw() {
+    type Start = fn(Arc<AtomicU64>);
+    let starts: [(&str, Start); 3] = [
+        ("blocking job", |stage| {
+            drop(task::spawn_blocking(move || reads_twice(&stage)));
+        }),
+        ("one-shot", |stage| {
+            task::spawn_oneshot("reader", 1 << 20, move || reads_twice(&stage)).unwrap();
+        }),
+        ("stepped service", |stage| {
+            let bell = Condvar::new();
+            drop(task::spawn_stepped("reader", 1 << 20, Reader { stage, bell }).unwrap());
+        }),
+    ];
+    for (name, start) in starts {
+        run(13, move |world| async move {
+            world.add_node(1, NodeClock::default());
+            let file = "sim/suspend/tests.rs";
+            world.freeze_after_clock_read(1, ClockRead::nth(1).in_file(file));
+            world.freeze_after_clock_read(1, ClockRead::nth(1).in_file(file));
+            let stage = Arc::new(AtomicU64::new(0));
+            let at = stage.clone();
+            world.spawn_node(1, async move { start(at) }).await.unwrap();
+            for reads in 0..2 {
+                let frozen = tokio::time::timeout(ms(20), world.frozen_at_read(1)).await;
+                assert!(frozen.is_ok(), "{name}: read {reads} stopped nothing");
+                tokio::time::sleep(ms(30)).await;
+                assert_eq!(stage.load(SeqCst), reads, "{name}: went on while frozen");
+                assert!(world.is_frozen_at_read(1), "{name}");
+                world.thaw(1);
+            }
+            tokio::time::sleep(ms(5)).await;
+            assert_eq!(stage.load(SeqCst), 2, "{name}");
+            assert!(!world.is_frozen(1), "{name}");
+        });
+    }
+}
+
+/// A crash ends a one-shot that stands at a read: no later line of it runs.
+#[test]
+fn a_frozen_one_shot_ends_with_a_crash() {
+    run(14, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.freeze_after_clock_read(1, ClockRead::nth(1));
+        let stage = Arc::new(AtomicU64::new(0));
+        let at = stage.clone();
+        let start = async move {
+            task::spawn_oneshot("reader", 1 << 20, move || reads_twice(&at)).unwrap();
+        };
+        world.spawn_node(1, start).await.unwrap();
+        let frozen = tokio::time::timeout(ms(20), world.frozen_at_read(1)).await;
+        assert!(frozen.is_ok(), "it went on while frozen");
+        world.crash(1);
+        world.restart(1);
+        tokio::time::sleep(ms(5)).await;
+        assert_eq!(stage.load(SeqCst), 0);
+        assert!(!world.is_frozen(1));
+    });
+}
+
 /// A crash during the freeze is the end of the poll: no later line runs, and destructors
 /// do. The next incarnation starts clean.
 #[test]
