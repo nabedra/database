@@ -102,6 +102,17 @@ async fn freeze(s: &mut S, cut: u64) -> Split {
     }
     Split { bindings, children }
 }
+/// The command as another replica decodes it from its log, within the budget of
+/// its own bytes.
+fn logged(s: &S, command: &OwnedCommand<ParticipantCommand>) -> OwnedCommand<ParticipantCommand> {
+    let encoded = s.f.shared().encode(command, 16 << 20).unwrap();
+    let decoded = OwnedCommand::decode_json(&encoded, s.f.shared(), ByteClass::Data, 48 << 20).unwrap();
+    assert_eq!(
+        s.f.shared().encode(&decoded, 16 << 20).unwrap().as_slice(),
+        encoded.as_slice()
+    );
+    decoded
+}
 /// Copies everything, in pages of `max_bytes`.
 async fn import(s: &S, split: &mut Split, max_bytes: usize) {
     let mut root = lineage::initial_root(&split.bindings[0]).unwrap();
@@ -128,7 +139,7 @@ async fn import(s: &S, split: &mut Split, max_bytes: usize) {
                 .import_page_from_image(s.f.shared(), page_index, root, digest, page.clone())
                 .await
                 .unwrap();
-            let reply = child.apply_owned(command).await;
+            let reply = child.apply_owned(logged(s, &command)).await;
             let ParticipantReply::SplitImported { complete, .. } = reply else { panic!("{reply:?}") };
             assert_eq!(complete, *exhausted);
             next = expected;

@@ -343,8 +343,9 @@ impl ParticipantMachine {
                                 return Err(recovery_unknown());
                             }
                             let value = row::Version::decode(version.value())?;
-                            let vectors = row::image_cost(view, logical, &value)?
-                                .ok_or_else(row::damaged_value)?;
+                            let vectors =
+                                row::image_cost(view, logical, &value, search.is_some())?
+                                    .ok_or_else(row::damaged_value)?;
                             let cost = encoded_length(&key, super::super::MAX_FIXED_COMMAND_BYTES)?
                                 .checked_add(value.value.map_or(0, |v| v.get().len()))
                                 .and_then(|n| n.checked_add(vectors))

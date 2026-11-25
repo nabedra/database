@@ -397,7 +397,7 @@ impl<'a> Entry<'a> {
                     let row = match version.value {
                         None => None,
                         Some(value) => {
-                            let Some(cost) = row::image_cost(view, bytes, &version)? else {
+                            let Some(cost) = row::image_cost(view, bytes, &version, false)? else {
                                 return Ok(None);
                             };
                             let Some(cost) = value

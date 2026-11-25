@@ -95,7 +95,7 @@ impl VectorValue {
     }
     /// Memory that `from_stored` retains for `bytes` value bytes.
     pub(crate) fn retained_bytes(bytes: usize) -> usize {
-        base64_len(bytes).saturating_add(256)
+        base64_len(bytes).saturating_add(384)
     }
     fn text(&self) -> &[u8] {
         self.data
@@ -104,13 +104,26 @@ impl VectorValue {
             .get(1..self.data.as_str().len().saturating_sub(1))
             .unwrap_or_default()
     }
-    /// The value bytes' length, or `None` for anything that is not base64.
+    /// The value bytes' length, or `None` for anything that is not a JSON string
+    /// of the length and padding of base64.
     pub fn byte_len(&self) -> Option<usize> {
         let json = self.data.as_str().as_bytes();
         if json.len() < 2 || json[0] != b'"' || json[json.len() - 1] != b'"' {
             return None;
         }
         decoded_len(self.text()).filter(|len| *len <= MAX_VECTOR_BYTES)
+    }
+    /// `byte_len` of a value whose every character was checked, so that storing
+    /// it cannot fail.
+    pub(crate) fn checked_len(&self) -> Option<usize> {
+        let len = self.byte_len()?;
+        let mut left = len;
+        for group in self.text().chunks_exact(4) {
+            let n = left.min(3);
+            decode(group, &mut [0; 3][..n])?;
+            left -= n;
+        }
+        Some(len)
     }
     /// Writes the stored record into `out`, which holds `FRAME_BYTES` plus the
     /// value bytes. `None` for anything that is not base64.
@@ -172,7 +185,7 @@ impl SearchColumn {
     }
     /// Whether `value` has this column's kind and dimensions.
     pub(crate) fn accepts(&self, value: &VectorValue) -> bool {
-        let Some(len) = value.byte_len().filter(|_| value.kind == self.kind) else {
+        let Some(len) = value.checked_len().filter(|_| value.kind == self.kind) else {
             return false;
         };
         let vector = self.dim as usize * 4;
@@ -335,7 +348,7 @@ mod tests {
         for len in (0..300).chain([767, 768, 769, 4096, MAX_VECTOR_BYTES]) {
             let bytes: Vec<u8> = (0..len).map(|i| (i * 31 + len) as u8).collect();
             let value = VectorValue::new(&shared, VectorKind::Multi, &bytes).unwrap();
-            assert_eq!(value.byte_len(), Some(len));
+            assert_eq!(value.checked_len(), Some(len));
             assert_eq!(value.to_bytes().unwrap(), bytes);
             let owner = shared
                 .reserve_scratch(ByteClass::Data, VectorValue::retained_bytes(len))
@@ -352,6 +365,7 @@ mod tests {
         // Not base64, not padded, or a second text for the same bytes.
         for text in ["Q", "QUJ", "QUJD=", "QU=D", "QUJ=", "Q===", "====", "QU-D", "QUI\\u003d", "A\u{e9}A"] {
             assert_eq!(parse(text).to_bytes(), None, "{text}");
+            assert_eq!(parse(text).checked_len(), None, "{text}");
         }
     }
 

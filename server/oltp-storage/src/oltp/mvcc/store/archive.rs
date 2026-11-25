@@ -195,7 +195,7 @@ impl ParticipantMachine {
                                 (IntentChange::Delete, None, None) => {}
                                 _ => return Err(recovery_unknown()),
                             }
-                            let vectors = row::image_cost(view, &logical, &version)?
+                            let vectors = row::image_cost(view, &logical, &version, false)?
                                 .ok_or_else(row::damaged_value)?;
                             let cost = logical
                                 .len()

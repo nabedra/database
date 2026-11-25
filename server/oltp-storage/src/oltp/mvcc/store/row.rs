@@ -273,7 +273,7 @@ pub(super) fn stored(
 /// Native batch bytes of one row's vectors, metadata, embedding records and
 /// change record, on top of its version and head.
 pub(super) fn write_cost(search: Option<&RowSearch>, key: usize) -> usize {
-    const RECORD: usize = 1024;
+    const RECORD: usize = 256;
     let records = key
         .saturating_add(RECORD)
         .saturating_mul(MAX_SEARCH_COLUMNS + 2);
@@ -403,7 +403,7 @@ impl RowImage {
                 |((column, version), image)| {
                     *column == image.column
                         && *version <= commit_ts
-                        && image.value.byte_len().is_some()
+                        && image.value.checked_len().is_some()
                 },
             )
             && self.source.0.values().all(|version| *version <= commit_ts)
@@ -414,7 +414,7 @@ impl RowImage {
             })
     }
     pub(crate) fn heap_bytes(&self) -> Result<usize, ProtocolError> {
-        let base = 2048
+        let base = 1024
             + self.vectors.capacity() * std::mem::size_of::<VectorImage>()
             + self.records.capacity() * (std::mem::size_of::<RecordImage>() + 256);
         self.vectors.iter().try_fold(base, |bytes, image| {
@@ -448,11 +448,13 @@ pub(super) fn image_cost(
     view: &mut GroupRead<'_>,
     logical: &[u8],
     version: &Version<'_>,
+    records: bool,
 ) -> Result<Option<usize>, ProtocolError> {
     if !version.searched() {
         return Ok(Some(0));
     }
-    let mut bytes = 8usize << 10;
+    let source = if records { 768 } else { 64 };
+    let mut bytes = 2048 + version.source.0.len() * source;
     for (column, at) in &version.blobs.0 {
         let key = column_key(VECTOR, logical, *column, Some(*at))?;
         let Some(raw) = view.pinned(&key)? else {
@@ -780,7 +782,7 @@ fn read_row(
         .map(|at| !u64::from_be_bytes(at))
         .map_err(|_| recovery_unknown())?;
     let version = Version::decode(record.value())?;
-    let bytes = image_cost(view, &logical, &version)?
+    let bytes = image_cost(view, &logical, &version, true)?
         .ok_or_else(damaged_value)?
         .checked_add(version.value.map_or(0, |value| value.get().len() + 256))
         .ok_or_else(invalid)?;

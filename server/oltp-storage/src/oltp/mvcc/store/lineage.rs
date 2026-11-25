@@ -629,6 +629,8 @@ pub(super) fn stage_child(
         || tx
             .first_from(&[super::direct::EXPIRY], &[super::direct::EXPIRY])?
             .is_some()
+        || tx.first_from(&[row::VECTOR], &[row::VECTOR])?.is_some()
+        || tx.first_from(&[embed::EMBED], &[embed::EMBED])?.is_some()
     {
         return reject(tx, Fault::Conflict);
     }

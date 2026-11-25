@@ -20,7 +20,12 @@ async fn vs16_a_row_and_its_vectors_are_one_entry_and_every_byte_survives() {
     ];
     let write = s.write(1, None, Some(serde_json::json!({"id": 1})), vectors);
     let before = s.last();
-    assert_eq!(s.direct(10, write).await, applied(10));
+    // As a follower decodes the entry from its log.
+    let commit = ParticipantCommand::Direct(s.commit(10, vec![write]));
+    let entry = OwnedCommand::new_owned(commit, s.f.shared(), ByteClass::Data).unwrap();
+    let encoded = s.f.shared().encode(&entry, 1 << 20).unwrap();
+    let entry = OwnedCommand::decode_json(&encoded, s.f.shared(), ByteClass::Data, 1 << 20).unwrap();
+    assert_eq!(s.f.replica.apply_owned(entry).await, applied(10));
     assert_eq!(s.last(), before + 1, "one entry");
     let row = s.get(1).await;
     assert_eq!(
@@ -249,8 +254,9 @@ async fn vs17_a_write_that_names_wrong_vectors_is_refused_and_writes_nothing() {
     let mut s = S::new().await;
     let dense = s.dense(1);
     let short = s.value(VectorKind::Dense, &[1; 4]);
+    // Base64 of the right length, with one character that is not.
     let garbage: VectorValue =
-        serde_json::from_value(serde_json::json!({"kind": "dense", "data": "!!!!"})).unwrap();
+        serde_json::from_value(serde_json::json!({"kind": "dense", "data": "AQEBAQE!AQE="})).unwrap();
     let owner = s.f.shared().reserve_scratch(ByteClass::Data, 64 << 10).unwrap();
     garbage.attach_charge(Arc::new(owner)).unwrap();
     let bad: Vec<Vec<VectorChange>> = vec![
