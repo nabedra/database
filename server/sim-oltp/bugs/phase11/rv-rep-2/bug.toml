@@ -1,0 +1,73 @@
+# Reverted fix RV-REP-2 (phase 11, design section 4.2, row 18).
+schema = "nabedra.sim-bug/1"
+id = "rv-rep-2"
+bug = "RV-REP-2"
+set = "membership"
+phase = 11
+class = "membership-replacement-trust"
+guarantees = ["OLTP-G08", "OLTP-G09"]
+scenarios = ["O17"]
+fix_commits = ["8b3c44b2c55b51c4aae414567924ace705fdf048", "2def358f9c98bb14910726ac5888ba3be2a80441"]
+reverts = ["8b3c44b2c55b51c4aae414567924ace705fdf048", "2def358f9c98bb14910726ac5888ba3be2a80441"]
+port = "hand"
+port_notes = """
+Partial: two fixes are reversed and the record's consequence is not back. The patch reverses
+8b3c44b2c55b51c4aae414567924ace705fdf048 (system_trust.rs loads 1,024 revocations) and
+2def358f9c98bb14910726ac5888ba3be2a80441's capacity refusal in system_recovery.rs. Neither alone has the defect
+after a mount at the limit (review, local runs). 8b3c44b2 alone shows only on an old durable image (author, run
+45435939958, `!restarted.revoked(survivor)`): since 2def358f Control refuses the mount that would write the 1,025th
+revocation. With both, that mount commits and Control cannot load its revocations again. The title, `The 1,025th worker revocation could stop Control`, is not put back: refresh_or_retry
+(2def358f) stays, so a running core keeps going, and a restart does not fail either: with_replacement_directory returns
+Ok and retries forever with trust_available() false. The regression fails at its first assertion, the 2def358f refusal,
+and never reaches the 8b3c44b2 half.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
+workload = "membership"
+profile = ["revocation-storm"]
+# expect is the plan. The text an expected kind enforces is in [[rules]] at the end. A kind without text there detects
+# nothing.
+# No [[rules]] for Liveness: its only text is design 3.7, and lead decision 13.1 lists design rules for rows 6, 9, 20
+# and the Liveness rows (read as 10, 11, 13 and 16), not for row 18.
+expect = ["Liveness"]
+seeds = [1, 10000]
+
+# The text below shows the 2def358f half only.
+[regression]
+kind = "lib-test"
+test = "oltp_replication::authority::control::tests::system_recovery::o17_revocation_limit_and_failed_refresh_preserve_the_committed_mount"
+mode = "on"
+assertion = "state"
+failure_contains = ["left: SystemReplacementMounted"]
+
+# The patch author's own runs.
+[regression.evidence]
+digest = "1b4c64d0f1d1f7cb9d6d897512e9b292be2503829270e2e378e440c035867e58"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o17_revocation_limit_and_failed_refresh_preserve_the_committed_mount, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435923449", sha = "7dd3835281dd37ee0e41fc108664954df2f1be01", result = "failed", note = "request p11-bugs-rv-rep-2-7dd3835-172017, o17_revocation_limit_and_failed_refresh_preserve_the_committed_mount, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+assertion `left == right` failed
+  left: SystemReplacementMounted
+ right: Rejected(Busy)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.69s
+""" }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): partial.
+# Patch read: two fixes reversed, and the original consequence (Control stops) is not back. Kept apart from the author's
+# evidence above. These are workflow `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a
+# detection.
+# - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456643380 (8d9849ee) 3 of 3 failed: `left: SystemReplacementMounted`, `right: Rejected(Busy)`, the 2def358f half only.
+# - which hunk matters, LOCAL runs on 26f1ea29, 3 attempts each, not on CI: clean passed 3 of 3, both hunks failed 3 of 3 (`load: Err ... Control transition cannot be proven`), only the mount hunk passed 3 of 3, only the load hunk passed 3 of 3.
+# - not evidence: https://github.com/zPy52/nabedra-database/actions/runs/45461695209, https://github.com/zPy52/nabedra-database/actions/runs/45461707881 and https://github.com/zPy52/nabedra-database/actions/runs/45461722335 passed on the patched builds, because that first test only checked that opening Control succeeds.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports.
+[review]
+digest = "d49f7d757b2ec8ea7f88571101056196c4dd521cac7b7a9a3c8c321f6d1bda3e"
+verdict = "partial"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Two fixes are reversed and neither alone has the defect; the title's consequence is not back. The in-tree test \
+fails at its first assertion, the 2def358f capacity refusal, and never reaches the 8b3c44b2 half. A partial \
+patch cannot count for the bar.\
+"""

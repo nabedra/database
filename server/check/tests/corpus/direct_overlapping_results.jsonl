@@ -1,0 +1,8 @@
+{"type":"invoke","process":0,"f":"delete","key":"k1","value":null,"request_id":"r1","node":"n1"}
+{"type":"invoke","process":2,"f":"insert","key":"k1","value":{"id":"k1","value":5},"request_id":"r2","node":"n2"}
+{"type":"invoke","process":1,"f":"delete","key":"k1","value":null,"request_id":"r1","node":"n2"}
+{"type":"ok","process":0,"f":"delete","key":"k1","value":false,"request_id":"r1","node":"n1"}
+{"type":"ok","process":2,"f":"insert","key":"k1","value":null,"request_id":"r2","node":"n2"}
+{"type":"ok","process":1,"f":"delete","key":"k1","value":true,"request_id":"r1","node":"n2"}
+{"type":"invoke","process":2,"f":"get","key":"k1","value":null,"node":"n1"}
+{"type":"ok","process":2,"f":"get","key":"k1","value":null,"node":"n1"}

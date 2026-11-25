@@ -1,0 +1,77 @@
+# Reverted fix BUG1-stream (phase 11, design section 4.2, row 3).
+schema = "nabedra.sim-bug/1"
+id = "bug1-stream"
+bug = "BUG1-stream"
+set = "queued"
+phase = 11
+class = "uncertain-outcome"
+guarantees = ["OLTP-G03"]
+scenarios = ["D03", "Q05"]
+fix_commits = ["c9d7c5b86280e174f613ab6ddacc747c7aafda0c", "d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+reverts = ["c9d7c5b86280e174f613ab6ddacc747c7aafda0c", "d7b9d63c3d548e7f694d077aec3d3d4743cdb1c2"]
+port = "hand"
+port_notes = """
+http.rs before d7b9d63c kept the direct gateway only with a declared length
+(`.zip(declared_length(..))`). PERF1 restructured that code, so the port filters the gateway on
+`length.is_some()` at its one use. A body without Content-Length skips the anchor check again.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
+workload = "queued"
+profile = ["lost-http-reply", "streamed-retry"]
+# expect is the plan. The text an expected kind enforces is in [[rules]] at the end. A kind without text there detects
+# nothing.
+# The [[rules]] text of Liveness here is the retry rule. The harness also reports `Liveness` for missed deadlines, and
+# today only for those (sim-oltp/src/invariants.rs). A deadline hit is not this rule: it must not be confirmed in
+# [detection].
+# This branch's history holds an earlier plan (other `expect`). A [detection] here needs `sim_bugs.py record
+# --never-searched` for it first. No such record exists.
+expect = ["Liveness"]
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_runtime::worker_runtime::direct_gateway::tests::d03_q05_bug1_direct_retry_without_content_length_replays_original_result"
+mode = "on"
+assertion = "state"
+failure_contains = ["request id already committed on the direct path; retry it to read the result"]
+
+# The patch author's own runs.
+[regression.evidence]
+digest = "84fe7bcf41edff390308a449f8a90dc1c9979d87a6dd9961f2b9fe9a189efff9"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, d03_q05_bug1_direct_retry_without_content_length_replays_original_result, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435480837", sha = "173c25b59224256bfa2a9682ca7251c43031016d", result = "failed", note = "request p11-bugs-bug1-stream-173c25b-171802, d03_q05_bug1_direct_retry_without_content_length_replays_original_result, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+assertion `left == right` failed
+  left: (503, Object {"error": Object {"code": String("outcome_unknown"), "message": String("request id already committed on the direct path; retry it to read the result"), "outcome": String("unknown")}, "request_id": String("73491c84-2ed3-42d3-82ee-cd032dab4187")})
+ right: (200, Object {"data": Null, "request_id": String("73491c84-2ed3-42d3-82ee-cd032dab4187")})
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 1.59s
+""" }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: the gateway rule before d7b9d63c; what both fix commits added goes. Kept apart from the author's evidence
+# above. These are workflow `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456544262 (aaf38a4c) 3 of 3 failed: 503 instead of the original 200 result.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports.
+[review]
+digest = "8d2f9f18940862344a508986ca25213523f64fab47ce8b34c6e6640f2cf79666"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Patch read: the gateway rule before d7b9d63c; both fixes go. Patched: 503 instead of the original 200 result.\
+"""
+
+[[rules]]  # OLTP-G03
+kind = "Liveness"
+source = "docs/testing/guarantees/oltp.md"
+text = """\
+On the direct path, a retry of a mutation with the same request ID and body returns the first definite result of \
+that identity, including a no-op or row conflict, while its dedup record is retained.\
+"""
+
+[[rules]]  # D02
+kind = "Liveness"
+source = "docs/testing/oltp-contract.md"
+text = "One committed version, the original result, one dedup record."

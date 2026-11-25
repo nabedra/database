@@ -1,0 +1,70 @@
+# Reverted fix FIXC-owner-fence (phase 11, design section 4.2, row 12).
+schema = "nabedra.sim-bug/1"
+id = "fixc-owner-fence"
+bug = "FIXC-owner-fence"
+set = "queued"
+phase = 11
+class = "fence-lifecycle-order"
+guarantees = ["OLTP-G02", "OLTP-G07"]
+scenarios = ["O08", "R01"]
+fix_commits = ["c7b93782a1e9bf4802d3e0dd046ee6725d5616b1", "4287df8234a38854edf7e54e1e42cd460f1c551a"]
+reverts = ["4287df8234a38854edf7e54e1e42cd460f1c551a", "c7b93782a1e9bf4802d3e0dd046ee6725d5616b1"]
+port = "hand"
+port_notes = """
+4287df82 reversed at its two decision points, after c7b93782's follow-up: TransactionCoordinator::recover_queued
+always abandons an attempt of a fenced owner, and Status refuses RetrySnapshot unless the attempt was
+created by the current authority. The helper signatures stay. The library test proves the Status hunk. The
+retained-restart process suite proves the runtime hunk: with the patch its fenced mutation ended as a failed
+receipt, conflict `original execution authority was fenced` (run 45440132415); it passes without
+(run 45440153575). O08 passed with the patch.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
+workload = "queued"
+profile = ["owner-kill", "prepared-hold"]
+# Lead decisions are in designs/lead-decisions.md, outside this repository.
+expect = []
+expect_reason = """\
+Lead decision 9, count after review-121: "Rows 12 and 21: the quoted text ("Retain accepted work through \
+individual failures while a request copy survives", OLTP-G07) doesn't forbid a definite refusal after \
+acceptance, so they don't count." The texts are docs/testing/scheduler-contract.md, "Retain accepted work \
+through individual failures while a request copy survives.", and docs/testing/guarantees/oltp.md, OLTP-G07, \
+"Accepted queued work stays recoverable while a complete copy survives. A full worker stop abandons outstanding \
+work." The patched build gives such a refusal: a receipt that failed with the conflict `original execution \
+authority was fenced`.\
+"""
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_replication::authority::status::identity::tests::o10_o14_r01_q06_fenced_retry_abort_requires_exact_settlement"
+mode = "on"
+assertion = "state"
+failure_contains = ["expected retry abort, got Rejected(InvalidBinding)"]
+
+# The patch author's own runs.
+[regression.evidence]
+digest = "919565cb643c1ba88338c5eddacf1cd5cac017638726187fffc9fce3e989ed40"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o10_o14_r01_q06_fenced_retry_abort_requires_exact_settlement, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45436022495", sha = "08fafb0a3343878b6a8ed9e2a179268853dfb157", result = "failed", note = "request p11-bugs-fixc-owner-fence-08fafb0-172046, o10_o14_r01_q06_fenced_retry_abort_requires_exact_settlement, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+expected retry abort, got Rejected(InvalidBinding)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.38s
+""" }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: the behaviour before 4287df82, without both fixes. Kept apart from the author's evidence above. These are
+# workflow `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456592380 (5ab39d79) 3 of 3 failed: `Rejected(InvalidBinding)`.
+# - the retained-restart suite (r121_suite_restart), the same runs: clean 3 of 3 passed, patched 3 of 3 failed: receipt `failed`, conflict `original execution authority was fenced`.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports.
+[review]
+digest = "e2aa2f55ebd952e0e3ea45b4a250e44f05d16496f8129af9e714b1a58d4d38b2"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Patch read: the behaviour before 4287df82, without both fixes. Patched: `Rejected(InvalidBinding)`; the restart \
+suite ends in a `failed` receipt.\
+"""

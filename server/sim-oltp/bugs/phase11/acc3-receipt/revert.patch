@@ -1,0 +1,63 @@
+diff --git a/server/src/oltp_runtime/remote_api.rs b/server/src/oltp_runtime/remote_api.rs
+index fce7922f..a0a8a80f 100644
+--- a/server/src/oltp_runtime/remote_api.rs
++++ b/server/src/oltp_runtime/remote_api.rs
+@@ -407,11 +407,9 @@ impl HttpRuntime for RemoteRuntime {
+                 .client
+                 .has_scoped_receipt(record.run_id, record.request_id);
+             let mut copy_deadline = None;
+-            let mut observation_deadline = None;
+             loop {
+                 let observe = self.client.observe(record.run_id, record.request_id);
+-                let deadline = copy_deadline.into_iter().chain(observation_deadline).min();
+-                let observed = match deadline {
++                let observed = match copy_deadline {
+                     Some(deadline) => nabedra_rt::time::timeout_at(deadline, observe)
+                         .await
+                         .map_err(|_| unavailable())?,
+@@ -419,9 +417,6 @@ impl HttpRuntime for RemoteRuntime {
+                 };
+                 let state = match observed {
+                     Ok(observed) => {
+-                        // A healthy observation ends the transient failure
+-                        // streak. The original request may still be queued.
+-                        observation_deadline = None;
+                         let metadata = &observed.metadata.record;
+                         if metadata.digest != record.digest
+                             || metadata.state == RequestState::Reconciling && !scoped
+@@ -452,20 +447,10 @@ impl HttpRuntime for RemoteRuntime {
+                         state
+                     }
+                     Err(error) if scoped && receipt_retryable(&error) => RequestState::Reconciling,
+-                    Err(error) if receipt_retryable(&error) => {
+-                        observation_deadline.get_or_insert_with(|| {
+-                            nabedra_rt::time::now() + super::RECEIPT_OBSERVATION_TIMEOUT
+-                        });
+-                        RequestState::Reconciling
+-                    }
+                     Err(error) => return Err(error),
+                 };
+                 let now = nabedra_rt::time::now();
+-                if copy_deadline
+-                    .into_iter()
+-                    .chain(observation_deadline)
+-                    .any(|end| now >= end)
+-                {
++                if copy_deadline.is_some_and(|end| now >= end) {
+                     return Err(unavailable());
+                 }
+                 if (state == RequestState::Committing
+@@ -482,11 +467,8 @@ impl HttpRuntime for RemoteRuntime {
+                     copy_deadline = Some(now + timeout);
+                 }
+                 let next_poll = now + interval;
+-                let wake = copy_deadline
+-                    .into_iter()
+-                    .chain(observation_deadline)
+-                    .fold(next_poll, std::cmp::min);
+-                nabedra_rt::time::sleep_until(wake).await;
++                nabedra_rt::time::sleep_until(copy_deadline.map_or(next_poll, |end| end.min(next_poll)))
++                    .await;
+                 interval = (interval * 2).min(std::time::Duration::from_millis(500));
+             }
+         })

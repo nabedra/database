@@ -1,0 +1,37 @@
+diff --git a/server/oltp-storage/src/oltp/mvcc/planner/index_build.rs b/server/oltp-storage/src/oltp/mvcc/planner/index_build.rs
+index 6a2266fc..f6f5173b 100644
+--- a/server/oltp-storage/src/oltp/mvcc/planner/index_build.rs
++++ b/server/oltp-storage/src/oltp/mvcc/planner/index_build.rs
+@@ -63,6 +63,9 @@ impl NativePlanner {
+             )
+             .await?;
+         let result = async {
++            // Plan section 7: the publication replaces the table lifecycle.
++            self.fence_direct_writers(pin, maintenance.table_id, Some(txn.request_id))
++                .await?;
+             let key = MvccKey::CatalogIndex {
+                 table_id: maintenance.table_id,
+                 index_id: maintenance.index_id,
+@@ -223,7 +226,7 @@ impl NativePlanner {
+                 )
+                 .await;
+             }
+-            let plan = self.catalog_index_plan(
++            self.catalog_index_plan(
+                 vec![
+                     PreparedWrite {
+                         key: MvccKey::CatalogTable {
+@@ -251,12 +254,7 @@ impl NativePlanner {
+                 guard.clone(),
+                 owner,
+             )
+-            .await?;
+-            // Fence before publishing the new lifecycle. A rejected
+-            // validation must leave Data on the current Catalog lifecycle.
+-            self.fence_direct_writers(pin, maintenance.table_id, Some(txn.request_id))
+-                .await?;
+-            Ok(plan)
++            .await
+         }
+         .await;
+         result.map_err(|cause| PlanError::Guarded {

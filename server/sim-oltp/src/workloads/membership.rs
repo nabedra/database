@@ -440,7 +440,10 @@ impl Membership {
             self.pause(cluster, &ctx, window(g, 500, 2_500)).await;
         }
         // Lead decision 17: a seed whose clients completed no work proves nothing.
-        self.work = direct::progress(cluster, &ctx, start);
+        self.work = {
+            let observed = ctx.observed.lock().unwrap();
+            direct::progress(&cluster.checks, &cluster.world, &observed.attempts, start)
+        };
         ctx.stopping.store(true, Ordering::Release);
         faults.heal();
         cluster.world.set_storage_pauses(0, Duration::ZERO);

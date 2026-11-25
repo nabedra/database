@@ -7,7 +7,11 @@ use std::{
 };
 
 use nabedra_check::Gen;
-use nabedra_rt::{ids::uuid_v4, sim::in_node, time};
+use nabedra_rt::{
+    ids::uuid_v4,
+    sim::{World, in_node},
+    time,
+};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -22,7 +26,7 @@ use crate::{
     client::{operation, request},
     config::Config,
     history::{Completion, History, Operation},
-    invariants::{STEP, elapsed_ms},
+    invariants::{Invariants, STEP, elapsed_ms},
     nemesis::{NetFaults, Selection, apply::Chaos},
     node::Cluster,
 };
@@ -104,7 +108,10 @@ pub(crate) async fn run(
         }
         time::sleep(TICK).await;
     }
-    progress(cluster, &ctx, start);
+    {
+        let observed = ctx.observed.lock().unwrap();
+        progress(&cluster.checks, &cluster.world, &observed.attempts, start);
+    }
     // The table served requests, so its range has a leader. A harness that can't see it aims its
     // faults blindly.
     if cluster.elections().is_empty() {
@@ -254,9 +261,8 @@ pub(crate) async fn run(
         report.scenarios.insert("O15:cold-start");
     }
     let mut reread = false;
-    if let Some(chaos) = chaos.as_mut().filter(|chaos| chaos.split_pending()) {
-        chaos.finish_split(cluster, quiet_from).await;
-        reread = true;
+    if let Some(chaos) = chaos.as_mut() {
+        reread |= chaos.settle_split(cluster, quiet_from).await;
     }
     if let Some(chaos) = chaos.as_ref() {
         chaos.check_abandoned().await;
@@ -474,12 +480,17 @@ fn work(attempts: &[clauses::Attempt], from: u64, to: u64) -> (u64, u64) {
 
 /// A seed whose clients completed no work under chaos proves nothing, so it is never clean (lead
 /// decision 17, review 115 H1).
-pub(super) fn progress(cluster: &Cluster, ctx: &Ctx, start: u64) -> (u64, u64) {
-    let now = elapsed_ms(&cluster.world);
-    let (writes, reads) = work(&ctx.observed.lock().unwrap().attempts, start, now);
+pub(super) fn progress(
+    checks: &Invariants,
+    world: &World,
+    attempts: &[clauses::Attempt],
+    start: u64,
+) -> (u64, u64) {
+    let now = elapsed_ms(world);
+    let (writes, reads) = work(attempts, start, now);
     if writes == 0 || reads == 0 {
-        cluster.checks.violate(
-            &cluster.world,
+        checks.violate(
+            world,
             "Progress",
             format!(
                 "{writes} writes committed and {reads} reads were answered from {start}ms to {now}ms, before the heal"
@@ -677,6 +688,28 @@ mod tests {
             invoked: window.0,
             completed: window.1,
             answer,
+        }
+    }
+
+    /// Re-review of #115: the violation could be switched off and no unit test failed.
+    #[test]
+    fn a_run_without_work_is_a_progress_violation() {
+        let write = attempt(true, true, (1, 2), Answer::Committed);
+        let read = attempt(false, true, (1, 2), Answer::Ok);
+        for (attempts, violations) in [
+            (vec![], 1),
+            (vec![write.clone()], 1),
+            (vec![read.clone()], 1),
+            (vec![write, read], 0),
+        ] {
+            nabedra_sim::runtime::run(1, move |world| async move {
+                time::sleep(Duration::from_millis(10)).await;
+                let checks = Invariants::new();
+                progress(&checks, &world, &attempts, 0);
+                let found = checks.violations();
+                assert_eq!(found.len(), violations, "{found:?}");
+                assert!(found.iter().all(|line| line.contains(" Progress: ")));
+            });
         }
     }
 

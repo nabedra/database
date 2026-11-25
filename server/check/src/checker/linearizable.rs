@@ -37,11 +37,16 @@
 //!
 //! [`Options::request_dedup`] adds the direct path's request identity (OLTP-G03): the dedup
 //! record is keyed by table, anchor key and request ID, and a retry with the same body returns
-//! the original result. Attempts that share request ID, anchor key, `f` and invoke value are
-//! one logical mutation. It can commit between the first eligible invoke and the first success
-//! that proves a commit. An answer computed from fresh state requires an empty dedup slot.
-//! All bodies under an identity share the slot, including those with unknown outcomes.
+//! the first definite result ([`super::direct::results`]). Attempts that share request ID, anchor
+//! key, `f` and invoke value are one logical mutation. It can commit between the first eligible
+//! invoke and the first success that proves a commit, or read the row once and change nothing
+//! between the first invoke and the first no-op or row conflict. If its answers disagree, the fresh
+//! ones are judged one by one. An answer computed from fresh state requires that no other body
+//! committed. All bodies under an identity share the slot, including those with unknown outcomes. A
+//! no-op or a row conflict, answered or not, explains the refusal of another body, and whether it
+//! also keeps that body from committing is not judged.
 
+use super::direct::results;
 use super::{Anomaly, Verdict, canon};
 use crate::history::{Event, Op, Outcome, pair, payload};
 use serde_json::Value;
@@ -102,6 +107,9 @@ impl RegOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
     Effect,
+    /// An unknown attempt that met a missing row, or a present one for an insert: it leaves a result
+    /// without a commit ([`Record::unchanged`]) and changes no row.
+    Unchanged,
     Fresh,
     Conflict,
     Invalid,
@@ -110,14 +118,35 @@ enum Role {
 
 #[derive(Clone, Copy, Debug)]
 struct Record {
+    /// Holds the body that committed.
     slot: usize,
     body: u32,
+    /// Holds the bodies with a result but no commit, as a set of `bit`s.
+    unchanged: usize,
+    bit: u32,
+    /// The bits of batches, and of conflicts that cannot be placed: they may be recorded or not.
+    doubtful: u32,
+}
+
+/// In a record's slot: a result without a commit was seen to hold the identity.
+const HELD: u32 = u32::MAX;
+
+/// What [`results`] says about an operation.
+#[derive(Clone, Copy, Debug, Default)]
+struct Rules {
+    /// It leaves a result without a commit.
+    records: bool,
+    /// It may repeat such a result of its request instead of reading the rows.
+    replays: bool,
+    /// A refusal that is known to be about a row, so it needs one.
+    row: bool,
 }
 
 #[derive(Clone, Debug)]
 struct KeyOp {
     rows: Vec<(usize, RegOp)>,
     record: Option<Record>,
+    rules: Rules,
     role: Role,
     call: usize,
     /// `None` for an op that may take effect at any later point, or never.
@@ -143,17 +172,49 @@ impl KeyOp {
 
     fn step(&self, state: &[u32]) -> Option<Vec<u32>> {
         let held = self.record.map_or(0, |r| state[r.slot]);
+        let (mine, others) = self.record.map_or((false, 0), |r| {
+            let unchanged = state[r.unchanged];
+            (unchanged & r.bit != 0, unchanged & !r.bit)
+        });
+        let recorded = |mut next: Vec<u32>| {
+            if let Some(r) = self.record.filter(|_| self.rules.records) {
+                next[r.unchanged] |= r.bit;
+            }
+            next
+        };
+        // It is refused as reuse only if its own result may not be recorded.
+        let refusable = !mine || self.record.is_some_and(|r| r.bit & r.doubtful != 0);
+        let repeats = mine && self.rules.replays && matches!(held, 0 | HELD);
         match self.role {
             Role::Invalid => return None,
+            Role::Conflict if repeats => return Some(state.to_vec()),
             Role::Conflict => {
-                let allowed = if let Some(r) = self.record.filter(|_| held != 0) {
-                    held != r.body
-                } else {
-                    self.rows.iter().any(|(key, _)| state[*key] != 0)
-                };
-                return allowed.then(|| state.to_vec());
+                if let Some(r) = self.record.filter(|_| held != 0) {
+                    let other = if held == HELD {
+                        refusable && others != 0
+                    } else {
+                        held != r.body
+                    };
+                    return (other && !(held == HELD && self.rules.row)).then(|| state.to_vec());
+                }
+                if self.rows.iter().any(|(key, _)| state[*key] != 0) {
+                    return Some(recorded(state.to_vec()));
+                }
+                // The one result of another body holds the identity, as this refusal shows.
+                let r = self.record?;
+                let sure = others & !r.doubtful;
+                let holder = sure.count_ones() == 1 || sure == 0 && others != 0;
+                return (refusable && holder && !self.rules.row).then(|| {
+                    let mut next = state.to_vec();
+                    next[r.slot] = HELD;
+                    next
+                });
             }
-            Role::Effect | Role::Fresh if held != 0 => return None,
+            Role::Effect | Role::Unchanged | Role::Fresh if held != 0 => return None,
+            Role::Unchanged => {
+                let applies = self.rows.iter().all(|&(k, op)| op.step(state[k]).is_some());
+                return (!applies).then(|| recorded(state.to_vec()));
+            }
             _ => {}
         }
 
@@ -161,12 +222,15 @@ impl KeyOp {
         for &(key, op) in &self.rows {
             next[key] = op.step(state[key])?;
         }
-        if self.role == Role::Effect
-            && let Some(r) = self.record
-        {
-            next[r.slot] = r.body;
+        match self.role {
+            Role::Effect => {
+                if let Some(r) = self.record {
+                    next[r.slot] = r.body;
+                }
+                Some(next)
+            }
+            _ => Some(recorded(next)),
         }
-        Some(next)
     }
 }
 
@@ -189,7 +253,12 @@ pub fn check_kv_opts(events: &[Event], opts: &Options) -> Verdict {
         Ok(p) => p,
         Err(e) => return Verdict::malformed(e),
     };
-    let ops = &paired.ops;
+    let judged = if opts.request_dedup {
+        results::forget_spanning(&paired.ops)
+    } else {
+        paired.ops
+    };
+    let ops = &judged;
     let ids = Identities::new(ops);
     let mut keys = BTreeMap::new();
     let mut parents = Vec::new();
@@ -237,9 +306,12 @@ pub fn check_kv_opts(events: &[Event], opts: &Options) -> Verdict {
     }
     let mut anomalies = Vec::new();
     let mut checked = 0;
+    let requests = opts
+        .request_dedup
+        .then(|| results::Requests::new(&ids, ops));
     for (_, pres) in partitions {
         let mut interner = Interner::default();
-        let (key_ops, width) = build(&pres, ops, &ids, opts.request_dedup, &mut interner);
+        let (key_ops, width) = build(&pres, ops, &ids, requests.as_ref(), &mut interner);
         let label = if pres.iter().all(|p| p.anchor == pres[0].anchor)
             && pres
                 .iter()
@@ -414,6 +486,18 @@ impl<'a> Identities<'a> {
         Identities { ops, by_id }
     }
 
+    /// The attempts of each identity and body, in invocation order.
+    pub(crate) fn requests(&self) -> BTreeMap<(String, &'a str, String), Vec<usize>> {
+        let mut out = BTreeMap::<_, Vec<usize>>::new();
+        for ((anchor, rid), members) in &self.by_id {
+            for &i in members {
+                let request = (anchor.clone(), *rid, body(&self.ops[i]));
+                out.entry(request).or_default().push(i);
+            }
+        }
+        out
+    }
+
     fn identity(&self, i: usize) -> Option<(String, &'a str, String)> {
         let op = &self.ops[i];
         let rid = op.request_id.as_deref()?;
@@ -578,13 +662,14 @@ fn project(op: &Op, src: usize, ids: &Identities, direct: bool) -> Result<Option
     Ok(Some(pre))
 }
 
-/// Assign registers and dedup slots within an independent key group. Merge the committing
-/// attempts for each body, while leaving fresh answers as separate operations.
+/// Assign registers and dedup slots within an independent key group. Merge the attempts of each
+/// request: the committing ones, or all of them when its one result is a no-op or a row conflict
+/// ([`results::Requests`]). Other answers from fresh state stay separate operations.
 fn build(
     pres: &[Pre],
     ops: &[Op],
     ids: &Identities,
-    dedup: bool,
+    requests: Option<&results::Requests>,
     interner: &mut Interner,
 ) -> (Vec<KeyOp>, usize) {
     let mut keys = HashMap::new();
@@ -594,8 +679,10 @@ fn build(
     }
     let mut out: Vec<KeyOp> = Vec::with_capacity(pres.len());
     let mut groups = HashMap::new();
+    let mut unchanged = BTreeMap::new();
     let mut slots = HashMap::new();
     let mut bodies = HashMap::new();
+    let mut in_slot = HashMap::<usize, HashMap<u32, u32>>::new();
     let mut to_reg = |shape: &Shape| match shape {
         Shape::Read(v) => RegOp::Read(interner.id(v)),
         Shape::Write(v) => RegOp::Write(interner.id(v)),
@@ -608,52 +695,126 @@ fn build(
     for pre in pres {
         let src = &ops[pre.src];
         let ret = src.ret;
-        let record = if dedup && pre.role != Role::Plain {
+        let record = if requests.is_some() && pre.role != Role::Plain {
             ids.identity(pre.src).and_then(|(anchor, rid, body)| {
                 let scope = (anchor, rid);
                 if ids.by_id[&scope].len() < 2 {
                     return None;
                 }
-                let next_slot = keys.len() + slots.len();
+                let next_slot = keys.len() + 2 * slots.len();
                 let slot = *slots.entry(scope).or_insert(next_slot);
                 let next_body = bodies.len() as u32 + 1;
                 let body = *bodies.entry(body).or_insert(next_body);
-                Some(Record { slot, body })
+                let known = in_slot.entry(slot).or_default();
+                let next_bit = 1u32 << known.len().min(31);
+                let bit = *known.entry(body).or_insert(next_bit);
+                Some(Record {
+                    slot,
+                    body,
+                    unchanged: slot + 1,
+                    bit,
+                    doubtful: 0,
+                })
             })
         } else {
             None
         };
-        if pre.role == Role::Effect
-            && let Some(record) = record
-        {
-            let identity = (record.slot, record.body);
-            if let Some(&g) = groups.get(&identity) {
-                let merged: &mut KeyOp = &mut out[g];
-                merged.call = merged.call.min(src.call);
-                merged.more.push(pre.src);
-                if let Some(r) = ret {
-                    merged.ret = Some(merged.ret.map_or(r, |m| m.min(r)));
-                }
-                continue;
-            }
-            groups.insert(identity, out.len());
-        }
-
-        out.push(KeyOp {
+        let mut op = KeyOp {
             rows: pre
                 .rows
                 .iter()
                 .map(|(key, shape)| (keys[key], to_reg(shape)))
                 .collect(),
             record,
+            rules: Rules::default(),
             role: pre.role,
             call: src.call,
             ret,
             src: pre.src,
             more: vec![],
-        });
+        };
+        // Attempts with an unknown outcome have the role of an effect, and share the result of
+        // their request if it has none.
+        let result = requests.and_then(|r| r.without_effect(pre.src));
+        if requests.is_some() {
+            op.rules = Rules {
+                records: op.role == Role::Fresh || results::may_be_row_conflict(src),
+                replays: results::may_repeat(src),
+                row: results::is_row_conflict(src),
+            };
+            // The earliest unknown attempt of a request may have left a result without a commit.
+            if op.role == Role::Effect
+                && src.outcome == Outcome::Info
+                && let Some(record) = record
+            {
+                unchanged
+                    .entry((record.slot, record.body))
+                    .or_insert_with(|| KeyOp {
+                        role: Role::Unchanged,
+                        rules: Rules {
+                            records: true,
+                            ..Rules::default()
+                        },
+                        ..op.clone()
+                    });
+            }
+        }
+        let merges =
+            pre.role == Role::Effect || result.is_some() && results::definite_result(src) == result;
+        if merges && let Some(record) = record {
+            let identity = (record.slot, record.body);
+            if let Some(&g) = groups.get(&identity) {
+                let merged: &mut KeyOp = &mut out[g];
+                if merged.role == Role::Effect && op.role != Role::Effect {
+                    std::mem::swap(merged, &mut op);
+                }
+                merged.call = merged.call.min(op.call);
+                merged.ret = merged.ret.into_iter().chain(op.ret).min();
+                merged.more.push(op.src);
+                merged.more.append(&mut op.more);
+                continue;
+            }
+            groups.insert(identity, out.len());
+        }
+        out.push(op);
     }
-    (out, keys.len() + slots.len())
+    // It matters only to a refusal of another body, and to a repeated result of its own request.
+    let judged: Vec<(Record, Rules)> = out
+        .iter()
+        .filter(|op| matches!(op.role, Role::Conflict | Role::Fresh))
+        .filter_map(|op| Some((op.record?, op.rules)))
+        .collect();
+    let refused: Vec<Record> = out
+        .iter()
+        .filter(|op| op.role == Role::Conflict)
+        .filter_map(|op| op.record)
+        .collect();
+    let matters = |slot: usize, body: u32| {
+        refused.iter().any(|r| r.slot == slot && r.body != body)
+            || judged
+                .iter()
+                .any(|(r, rules)| r.slot == slot && r.body == body && rules.replays)
+    };
+    let mut doubtful = HashMap::<usize, u32>::new();
+    for op in &out {
+        let batch = ops[op.src].f == "insert_many";
+        if let Some(r) = op.record.filter(|_| batch || op.rules.replays) {
+            *doubtful.entry(r.slot).or_default() |= r.bit;
+        }
+    }
+    for op in &mut out {
+        if let Some(r) = &mut op.record {
+            r.doubtful = doubtful.get(&r.slot).copied().unwrap_or(0);
+        }
+        op.rules.records &= op.record.is_some_and(|r| matters(r.slot, r.body));
+    }
+    out.extend(
+        unchanged
+            .into_iter()
+            .filter(|&((slot, body), _)| matters(slot, body))
+            .map(|(_, op)| op),
+    );
+    (out, keys.len() + 2 * slots.len())
 }
 
 fn indices(o: &KeyOp, ops: &[Op]) -> Vec<usize> {
@@ -712,7 +873,7 @@ fn search(ops: &[KeyOp], width: usize, cutoff: Option<usize>, max_configs: usize
     // Definite operations that would hide a particular value if they followed its source.
     let mut on_key = HashMap::<usize, Vec<(usize, u32, usize)>>::new();
     for (i, op) in ops.iter().enumerate() {
-        if op.role == Role::Invalid || !in_prefix(op.call) {
+        if matches!(op.role, Role::Invalid | Role::Unchanged) || !in_prefix(op.call) {
             continue;
         }
         let ret = op.ret.filter(|&r| in_prefix(r));
@@ -836,7 +997,7 @@ fn search(ops: &[KeyOp], width: usize, cutoff: Option<usize>, max_configs: usize
         }
         if let Some(&read) = calls.iter().find(|&&call| {
             let op = &ops[node_op[call]];
-            op.is_read() && op.step(state).is_some()
+            op.is_read() && op.step(state).is_some_and(|next| next == state)
         }) {
             // A read that already agrees with the state can take its result now.
             return vec![read].into_iter();

@@ -62,7 +62,8 @@ would still compile such a block, so a reviewer looks at where the block stands.
 | `error` | A run died or left something unsaid: a signal, a missing or unreadable seed line, a report for another seed, workload or defect, an unexpected exit, no trace, no history, the same binary. Says nothing, and none of its seeds are clean. |
 | `not-run` | The harness lacks the workload. |
 
-A check passes only if every target of its set is found. While a target is `not-run`, the record is not-run.
+A check passes only if every target of its set is found. The record is not-run only when a target is `not-run` and every
+other one is `found`, `not-run` or `not-shown`. Any other result, such as `no-detector`, makes it fail.
 
 ## What has to be there for a hit to count
 
