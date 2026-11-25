@@ -32,6 +32,8 @@ use crate::{
 };
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+/// One request of an operation that may run for longer than a health check.
+const REQUEST: Duration = Duration::from_secs(10);
 const READINESS_POLL: Duration = Duration::from_millis(100);
 /// Bound for a retained restart's preparation through the surviving workers.
 const PREPARE_LIMIT: Duration = Duration::from_secs(60);
@@ -533,7 +535,7 @@ impl Cluster {
             // Control holds one preparation at a time, so a process that did not come up
             // starts again from the bootstrap file it already has, as a supervisor does. Once
             // that process has enrolled, the preparation is spent and a fresh one is needed.
-            let connection = self.admin("cluster.connection", json!({})).await?;
+            let connection = self.connection().await?;
             if !self.enrolled(index, &connection) {
                 return Ok(());
             }
@@ -547,15 +549,13 @@ impl Cluster {
         self.wait_ready_within(&survivors, true, survivors.len(), PREPARE_LIMIT)
             .await
             .map_err(|error| format!("survivors never dropped n{node}: {error}"))?;
-        let connection = self.admin("cluster.connection", json!({})).await?;
+        let connection = self.connection().await?;
         let (id, plan, next) =
             in_node(BOOTSTRAP_CLIENT, async { self.config.rolling_plan(index) }).await;
         let deadline = self.world.elapsed() + PREPARE_LIMIT;
         let prepared = loop {
-            match self
-                .admin_with_id(&survivors, id, "worker.restart.prepare", plan.clone())
-                .await
-            {
+            let name = "worker.restart.prepare";
+            match self.operator().any(id, name, &plan, REQUEST).await {
                 Ok(prepared) => break prepared,
                 Err(error) if self.world.elapsed() >= deadline => {
                     return Err(format!("prepare retained restart of n{node}: {error}"));
@@ -572,6 +572,22 @@ impl Cluster {
         );
         self.prepared.insert(node);
         Ok(())
+    }
+
+    /// The cluster's connection inventory. A restart needs it, and an operator does not give up
+    /// on one request that reached its deadline.
+    async fn connection(&self) -> Result<Value, String> {
+        let operator = self.operator();
+        let deadline = self.world.elapsed() + PREPARE_LIMIT;
+        loop {
+            let id = operator.id().await;
+            let name = "cluster.connection";
+            match operator.any(id, name, &json!({}), REQUEST).await {
+                Err(error) if self.world.elapsed() >= deadline => return Err(error),
+                Err(_) => time::sleep(Duration::from_millis(250)).await,
+                connection => return connection,
+            }
+        }
     }
 
     /// Whether Control lists the enrollment that worker `index` was prepared with.
@@ -631,7 +647,7 @@ impl Cluster {
         if self.world.is_up(node) {
             self.crash(node, DiskCut::Kill).await;
         }
-        let connection = self.admin("cluster.connection", json!({})).await?;
+        let connection = self.connection().await?;
         disk::reopen(&self.world, &self.checks, node, DiskCut::Kill);
         if let Err(error) = self.start_gateway(index, &connection).await {
             self.abort_start(node).await;

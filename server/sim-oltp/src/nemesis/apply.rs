@@ -39,6 +39,9 @@ const SPLIT_LIMIT: Duration = Duration::from_secs(60);
 /// Follow-ups that cannot run yet are tried again after this pause.
 const DEFER_MS: u64 = 500;
 const RESTART_TRIES: u32 = 4;
+/// Longest isolation of a leader that no other worker replaces. Voters keep a lease of the
+/// longest election timeout, so an election takes longer than the drawn window.
+const LEADER_MOVE_MS: u64 = 12_000;
 
 /// A graceful stop that has not ended.
 struct Drain {
@@ -355,8 +358,10 @@ impl Chaos {
         if let Some(window) = self.windows.get(&id) {
             self.faults.end(*window);
         }
+        let timed = self.windows.contains_key(&id) || self.log[id].action == Action::AuthFlap;
         let fault = &mut self.log[id];
-        fault.to = Some(elapsed_ms(&cluster.world));
+        let now = elapsed_ms(&cluster.world);
+        fault.to = Some(fault.until.filter(|_| timed).map_or(now, |at| at.min(now)));
         if !fault.happened() {
             cluster.record(format!(
                 "nemesis {} from {}ms did not happen",
@@ -440,7 +445,28 @@ impl Chaos {
 
     fn later(&mut self, cluster: &Cluster, after: Duration, follow: FollowUp) {
         let at = elapsed_ms(&cluster.world) + u64::try_from(after.as_millis()).unwrap_or(u64::MAX);
-        self.log[follow.fault()].until = Some(at);
+        let id = follow.fault();
+        self.log[id].until = Some(at);
+        // The loop may wait for a restart at that time, so these windows end by themselves.
+        match &follow {
+            FollowUp::ClearNet(id) => {
+                let (faults, window) = (self.faults.clone(), self.windows[id]);
+                nabedra_rt::task::spawn(async move {
+                    time::sleep(after).await;
+                    faults.end(window);
+                });
+            }
+            FollowUp::RestoreCertificate(gateway, _) => {
+                let (world, gateway) = (Arc::downgrade(&cluster.world), *gateway);
+                nabedra_rt::task::spawn(async move {
+                    time::sleep(after).await;
+                    if let Some(world) = world.upgrade() {
+                        world.override_certificate(gateway, None);
+                    }
+                });
+            }
+            _ => {}
+        }
         self.scheduler.after(at, Step::Follow(follow));
     }
 
@@ -883,6 +909,21 @@ impl Chaos {
                 self.close(cluster, id);
             }
             FollowUp::HealLinks(id) => {
+                self.collect(cluster, id);
+                let fault = &self.log[id];
+                let now = elapsed_ms(&cluster.world);
+                if fault.action == Action::LeaderMove
+                    && !fault.happened()
+                    && !healing
+                    && now < fault.from + LEADER_MOVE_MS
+                {
+                    // Isolated until another one leads (D07).
+                    let at = now + STEP.as_millis() as u64 * 10;
+                    self.log[id].until = Some(at);
+                    self.scheduler
+                        .after(at, Step::Follow(FollowUp::HealLinks(id)));
+                    return;
+                }
                 cluster.net().update_plan(|plan| plan.heal_links());
                 self.links = None;
                 self.close(cluster, id);
@@ -922,6 +963,13 @@ impl Chaos {
             FollowUp::RestartGateway(gateway, id) => {
                 if cluster.is_running(gateway) {
                     return self.close(cluster, id);
+                }
+                if !healing && (!cluster.frozen().is_empty() || self.links.is_some()) {
+                    // This loop cannot thaw a worker or heal a link while a start blocks it.
+                    let at = elapsed_ms(&cluster.world) + DEFER_MS;
+                    let again = FollowUp::RestartGateway(gateway, id);
+                    self.scheduler.after(at, Step::Follow(again));
+                    return;
                 }
                 if let Err(error) = cluster.restart_gateway(gateway).await {
                     let again = FollowUp::RestartGateway(gateway, id);

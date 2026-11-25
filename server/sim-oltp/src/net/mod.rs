@@ -254,7 +254,7 @@ impl Planner for Router {
             Message::Frame(frame) => {
                 stream = Some(frame.stream);
                 if frame.kind == FrameKind::Request {
-                    state.elected(&envelope);
+                    state.elected(envelope);
                 }
                 state
                     .frame_profile
