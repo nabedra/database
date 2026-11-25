@@ -186,7 +186,10 @@ pub(crate) fn without_effect(ids: &Identities, ops: &[Op]) -> HashMap<usize, Def
 
 /// Two attempts of one request that were answered with different results, in the order of their
 /// answers. A fresh answer to a retry sent after a commit was answered is left to `dedup-miss`.
-pub(super) fn disagreement(ops: &[Op], attempts: &[usize]) -> Option<(usize, usize)> {
+pub(super) fn disagreement(
+    ops: &[Op],
+    attempts: &[usize],
+) -> Option<((usize, Definite), (usize, Definite))> {
     if may_expire(ops, attempts) {
         return None;
     }
@@ -197,8 +200,8 @@ pub(super) fn disagreement(ops: &[Op], attempts: &[usize]) -> Option<(usize, usi
     answers.sort_by_key(|&(i, _)| ops[i].ret_pos());
     let &(first, result) = answers.first()?;
     let missed = |i: usize| result == Definite::Commit && ops[first].precedes(&ops[i]);
-    answers
-        .iter()
-        .find(|&&(i, other)| other != result && !missed(i))
-        .map(|&(i, _)| (first, i))
+    let other = answers
+        .into_iter()
+        .find(|&(i, other)| other != result && !missed(i))?;
+    Some(((first, result), other))
 }

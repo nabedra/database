@@ -122,16 +122,14 @@ fn identity_verdict(ops: &[Op]) -> Verdict {
             .collect();
         let name = |i: usize| describe(&ops[i]);
         for (b, (_, attempts)) in bodies.iter().enumerate() {
-            if let Some((first, other)) = results::disagreement(ops, attempts) {
+            if let Some(((first, result), (other, again))) = results::disagreement(ops, attempts) {
                 anomalies.push(Anomaly::new(
                     "unstable-result",
                     format!(
-                        "request {rid:?} at anchor {anchor:?}: {} answered {:?} (event {}), and {} of the same body answered {:?}",
+                        "request {rid:?} at anchor {anchor:?}: {} answered {result:?} (event {}), and {} with the same body answered {again:?}",
                         name(first),
-                        results::definite_result(&ops[first]),
                         ops[first].complete_index.unwrap_or(ops[first].invoke_index),
                         name(other),
-                        results::definite_result(&ops[other]),
                     ),
                     [ops[first].indices(), ops[other].indices()].concat(),
                 ));
