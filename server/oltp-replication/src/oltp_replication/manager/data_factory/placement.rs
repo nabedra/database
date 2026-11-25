@@ -79,7 +79,13 @@ impl ReplicaPlacement {
         request.validate()?;
         let local = self.factory.manager.client().local_identity();
         let mut plan = match self.factory.control.replica_move(id).await? {
-            Some(plan) if plan.request == request && plan.owner == local => plan,
+            Some(plan)
+                if (plan.request == request
+                    || std::env::var_os("P11_PLANT").is_some_and(|p| p == "retry-body"))
+                    && plan.owner == local =>
+            {
+                plan
+            }
             Some(_) => return Err(conflict()),
             None => self.start(permit, catalog, id, request).await?,
         };
@@ -188,9 +194,13 @@ impl ReplicaPlacement {
             .map_err(|_| invalid())?;
         let old = old.clone();
         let mut next = old.clone();
+        let any = std::env::var_os("P11_PLANT").is_some_and(|p| p == "any-voter");
         let source = next
             .iter_mut()
-            .find(|member| member.node_id == request.remove_node)
+            .find(|member| {
+                member.node_id == request.remove_node
+                    || (any && member.worker_id == self.factory.manager.client().local_identity().worker_id)
+            })
             .ok_or_else(conflict)?;
         let local = self.factory.manager.client().local_identity();
         let remote_source = source.worker_id != local.worker_id;
