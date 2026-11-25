@@ -260,6 +260,7 @@ fn a_holder_has_every_new_record_beyond_the_old_ones() {
     let held = |before, after| Retained {
         node: 2,
         holder: Holder::Ready,
+        compared: 3,
         required: 3,
         before,
         after,

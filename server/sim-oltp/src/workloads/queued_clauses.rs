@@ -229,12 +229,16 @@ impl Facts<'_> {
                 .iter()
                 .filter(move |held| held.holder == holder && held.required > 0)
         };
-        let ready: BTreeSet<u64> = judged(Holder::Ready).map(|held| held.node).collect();
-        if ready.len() == WORKERS.len() {
+        // Three workers of one count: two halves of two counts are no whole.
+        let mut counts: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+        for held in judged(Holder::Ready) {
+            counts.entry(held.at).or_default().insert(held.node);
+        }
+        if counts.values().any(|nodes| nodes.len() == WORKERS.len()) {
             out.insert("Q03:copies-on-every-ready-worker");
         }
         // R02 asks for queued and running requests on the holder.
-        if judged(Holder::Last).any(|held| held.pending > 0) {
+        if judged(Holder::Last).any(|held| held.pending > 0 && held.compared == WORKERS.len()) {
             out.extend(["R02:last-holder", "O14:last-copy"]);
         }
     }
@@ -686,6 +690,7 @@ mod tests {
         let held = |node, holder, required, pending| Retained {
             node,
             holder,
+            compared: 3,
             required,
             before: 0,
             after: 9,
@@ -703,6 +708,13 @@ mod tests {
         log.retained[2].required = 3;
         let third = log.retained.remove(2);
         assert!(names(&log, &[]).is_empty(), "one worker was not compared");
+        // The third worker was compared in another count only.
+        log.retained.push(Retained {
+            at: 950,
+            ..third.clone()
+        });
+        assert!(names(&log, &[]).is_empty(), "no count had three workers");
+        log.retained.pop();
         log.retained.insert(2, third);
         log.retained[3].pending = 1;
         assert_eq!(
@@ -713,6 +725,9 @@ mod tests {
                 "R02:last-holder"
             ]
         );
+        // Another worker still held old records when the baseline was taken.
+        log.retained[3].compared = 2;
+        assert_eq!(names(&log, &[]), ["Q03:copies-on-every-ready-worker"]);
     }
 
     #[test]

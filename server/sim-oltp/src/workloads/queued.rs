@@ -2163,6 +2163,7 @@ async fn copies(q: &Q, cluster: &Cluster, when: &str) {
     cluster.record(format!(
         "queued copies {when}: {required} accepted, before {before:?}, after {after:?}"
     ));
+    let compared = before.len();
     for (node, (accepted, pending)) in after {
         let Some(&before) = before.get(&node) else {
             continue;
@@ -2170,6 +2171,7 @@ async fn copies(q: &Q, cluster: &Cluster, when: &str) {
         q.shared.lock().unwrap().log.retained.push(Retained {
             node,
             holder: Holder::Ready,
+            compared,
             required,
             before,
             after: accepted,
@@ -2503,12 +2505,14 @@ async fn last_holder(
         cluster.record(format!(
             "last holder n{last}: {before:?} before, {accepted} records, {pending} pending, {required} required"
         ));
+        let compared = before.as_ref().map_or(0, BTreeMap::len);
         let Some(&before) = before.as_ref().and_then(|before| before.get(&last)) else {
             continue;
         };
         q.shared.lock().unwrap().log.retained.push(Retained {
             node: last,
             holder: Holder::Last,
+            compared,
             required,
             before,
             after: accepted,

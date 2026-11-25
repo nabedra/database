@@ -234,10 +234,16 @@ pub(crate) enum Holder {
 /// The request records of one worker before and after some requests were accepted, from its
 /// public stats. Nothing may leave the queue between the two counts, so the difference counts
 /// the new requests alone: either the first count is zero, or no result can have expired yet.
+///
+/// What it cannot see: while another worker still holds an old record, this one can be given a
+/// copy of it between the counts, and each such record hides one lost request. So the clauses
+/// need a baseline of all three workers.
 #[derive(Clone, Debug)]
 pub(crate) struct Retained {
     pub node: u64,
     pub holder: Holder,
+    /// How many workers the baseline could compare.
+    pub compared: usize,
     /// The identities accepted between the counts, which the worker must hold.
     pub required: usize,
     pub before: u64,
