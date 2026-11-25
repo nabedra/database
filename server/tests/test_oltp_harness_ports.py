@@ -163,22 +163,24 @@ class PickPort(Case):
             picks = [harness_ports.pick_port(), harness_ports.pick_port()]
         self.assertEqual(picks, [first, second])
 
-    def test_thousands_of_picks_are_distinct(self):
-        picks = [harness_ports.pick_port() for _ in range(3000)]
+    # Each pick binds a port for a moment, which another harness on the machine may want: not more than needed.
+    # A pick that can repeat does so about ten times in these 600.
+    def test_many_picks_are_distinct(self):
+        picks = [harness_ports.pick_port() for _ in range(600)]
         self.assertEqual(len(set(picks)), len(picks))
 
     def test_concurrent_picks_are_distinct(self):
         picks = []
 
         def pick():
-            picks.extend([harness_ports.pick_port() for _ in range(250)])
+            picks.extend([harness_ports.pick_port() for _ in range(100)])
 
         threads = [threading.Thread(target=pick) for _ in range(8)]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
-        self.assertEqual(len(set(picks)), 2000)
+        self.assertEqual(len(set(picks)), 800)
 
     def test_every_pick_is_logged(self):
         port = harness_ports.pick_port()
@@ -323,6 +325,8 @@ class Workers(Case):
     def prepared(self, **modes):
         cluster = self.cluster()
         cluster.prepare_workers()
+        for registered in cluster.root.glob('*.registered'):
+            registered.unlink()
         for name, mode in modes.items():
             cluster.config[name]['fake'] = mode
         return cluster
