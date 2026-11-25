@@ -13,7 +13,9 @@
 //!   window is open, and the lanes drain when it ends, by themselves or all at once;
 //! - drains one worker while such a window is open, and stalls a process in it: the process
 //!   stops right after a drawn clock read, in the middle of a job or a poll, so that deadlines
-//!   pass with a request half done.
+//!   pass with a request half done. In half of the seeds every process stops now and then for a
+//!   few seconds;
+//! - suspends syncs for a few milliseconds, in half of the seeds.
 //!
 //! The process limits it lowers are the ones the harness samples anyway. After the heal it runs
 //! one quiet stage: the same load with cuts, between two resource points that must be equal
@@ -62,7 +64,13 @@ pub(crate) const CANCELLED: &str = "the client cancelled the request";
 const READ_KEYS: i64 = 8;
 /// How long a stage may wait for the request deadline of its cut requests and the settling.
 const STAGE_SETTLE: Duration = Duration::from_secs(2);
-/// Bound of the point before the stage.
+/// A request deadline that a stall can outlast.
+const SHORT: Duration = Duration::from_millis(500);
+/// How much longer than a deadline a stall may last.
+const PAST: Duration = Duration::from_millis(150);
+/// The share, per mille, of polls and jobs that a time with many stalls stops.
+const FREEZES: u32 = 4;
+/// Bound of the point before the stage, and of the convergence after it.
 const STAGE_POINT: Duration = Duration::from_secs(10);
 
 /// The cuts of one run, in the World while the overlay is on.
@@ -201,9 +209,9 @@ struct Stall {
 impl Stall {
     fn draw(g: &mut Gen, deadline: Duration) -> Self {
         // Past a short deadline. A long one cannot pass without losing more than a request.
-        let short = deadline <= Duration::from_millis(500);
+        let short = deadline <= SHORT;
         let longest = if short {
-            deadline.as_millis() as u64 + 150
+            (deadline + PAST).as_millis() as u64
         } else {
             150
         };
@@ -257,9 +265,12 @@ pub(crate) struct Overlay {
     drain: Option<(Duration, u64, Duration)>,
     restart: Option<(u64, Duration)>,
     drained: Option<u64>,
+    /// When every process stops now and then, from and to, and for how long at most.
+    freezes: Option<(Duration, Duration, Duration)>,
     table: Option<Ctx>,
     next_key: Arc<AtomicI64>,
     load: Arc<Mutex<Load>>,
+    froze: bool,
     tasks: Vec<JoinHandle<()>>,
     stalled: Arc<Mutex<BTreeSet<u64>>>,
     lanes: u64,
@@ -290,8 +301,14 @@ impl Overlay {
             let stopped = Duration::from_millis(300 + g.below(2_700));
             (at, *g.pick(&WORKERS), stopped)
         });
+        let freezes = g.bool().then(|| {
+            let from = Duration::from_millis(1_000 + g.below(span / 2));
+            let hold = (deadline + PAST).min(Duration::from_millis(600));
+            (from, from + Duration::from_millis(2_000 + g.below(4_000)), hold)
+        });
         Self {
             seed,
+            freezes,
             pauses: g.bool(),
             windows,
             drain,
@@ -300,6 +317,7 @@ impl Overlay {
             table: None,
             next_key: Arc::new(AtomicI64::new(READ_KEYS)),
             load: Arc::default(),
+            froze: freezes.is_some(),
             tasks: Vec::new(),
             stalled: Arc::default(),
             lanes: 0,
@@ -327,6 +345,10 @@ impl Overlay {
         if let Some((at, ..)) = &mut self.drain {
             *at += now;
         }
+        if let Some((from, to, _)) = &mut self.freezes {
+            *from += now;
+            *to += now;
+        }
         cluster.world.insert_ext(Cuts {
             g: Gen::from_seed(stream_seed(self.seed, "oltp-resources-cuts")),
             per_mille: CHAOS_CUTS,
@@ -340,8 +362,8 @@ impl Overlay {
                 .set_storage_pauses(50, Duration::from_millis(3));
         }
         cluster.record(format!(
-            "resources overlay windows {:?} drain {:?} pauses {}",
-            self.windows, self.drain, self.pauses
+            "resources overlay windows {:?} drain {:?} freezes {:?} pauses {}",
+            self.windows, self.drain, self.freezes, self.pauses
         ));
     }
 
@@ -372,6 +394,16 @@ impl Overlay {
                     time::sleep(after).await;
                     storm(&world);
                 }));
+            }
+        }
+        if let Some((from, to, hold)) = self.freezes
+            && from <= now
+        {
+            let ended = to <= now;
+            let per_mille = if ended { 0 } else { FREEZES };
+            cluster.world.set_clock_freezes(per_mille, hold);
+            if ended {
+                self.freezes = None;
             }
         }
         if let Some((at, node, stopped)) = self.drain
@@ -417,6 +449,8 @@ impl Overlay {
     pub(crate) async fn stop(&mut self, cluster: &mut Cluster) {
         set_cuts(&cluster.world, 0);
         cluster.world.set_storage_pauses(0, Duration::ZERO);
+        cluster.world.set_clock_freezes(0, Duration::ZERO);
+        self.freezes = None;
         self.windows.clear();
         self.drain = None;
         if let Some((node, _)) = self.restart {
@@ -499,11 +533,21 @@ impl Overlay {
         for _ in 0..rounds {
             let stalls = [(); 2].map(|()| Stall::draw(&mut g, deadline));
             cluster.record(format!("resources overlay stage round, {stalls:?}"));
-            for stall in stalls {
-                self.stall(cluster, stall);
+            let many = deadline <= SHORT && g.bool();
+            if many {
+                // Every process stops now and then, so some request is caught half done.
+                cluster.world.set_clock_freezes(FREEZES, deadline + PAST);
+            } else {
+                for stall in stalls {
+                    self.stall(cluster, stall);
+                }
             }
             self.press(0, lanes, 2);
             self.press(1, lanes, 2);
+            if many {
+                time::sleep(Duration::from_millis(200 + g.below(800))).await;
+                cluster.world.set_clock_freezes(0, Duration::ZERO);
+            }
             if g.bool() {
                 time::sleep(Duration::from_millis(g.below(20))).await;
                 storm(&cluster.world);
@@ -511,6 +555,19 @@ impl Overlay {
             self.join().await;
         }
         set_cuts(&cluster.world, 0);
+        // Leadership may have moved, and that takes messages.
+        let limit = cluster.world.elapsed() + STAGE_POINT;
+        while !cluster.converged().await {
+            if cluster.world.elapsed() >= limit {
+                cluster.checks.violate(
+                    &cluster.world,
+                    "Liveness",
+                    format!("no convergence {STAGE_POINT:?} after the overlay's stage"),
+                );
+                return clauses;
+            }
+            time::sleep(STEP).await;
+        }
         self.read_pass().await;
 
         let since = cluster.world.elapsed();
@@ -601,6 +658,7 @@ impl Overlay {
         let (cut, sent) = cuts(world);
         json!({
             "pauses": self.pauses,
+            "froze": self.froze,
             "drained": self.drained,
             "requests": sent,
             "cut": cut,
