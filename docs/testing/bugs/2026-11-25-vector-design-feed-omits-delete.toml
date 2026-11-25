@@ -1,0 +1,14 @@
+id = "VECTOR-design-feed-omits-delete"
+title = "The search feed derives changes from current rows and omits a delete"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G01", "VEC-G03"]
+scenarios = ["VS02"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/latest/mutants/prefix_feed_omits_delete.cfg"
+seed = "unknown"
+why_not_caught = "The plan derived changes at the voter without recording what apply did."
+invariant_added = "A range result equals the committed prefix at its read point."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

@@ -1,0 +1,14 @@
+id = "VECTOR-design-split-rederives-record"
+title = "A split turns a failed embedding back into a pending one"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G07"]
+scenarios = ["VS16"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/blobs/mutants/prefix_split_rederives.cfg"
+seed = "unknown"
+why_not_caught = "The first spec derived records in every copy."
+invariant_added = "A split copies the embedding record exactly."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

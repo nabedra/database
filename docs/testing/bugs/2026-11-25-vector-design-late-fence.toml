@@ -1,0 +1,14 @@
+id = "VECTOR-design-late-fence"
+title = "A late schema fence serves a dropped column again"
+class = "fence-lifecycle-order"
+module = "vector"
+guarantees = ["VEC-G08"]
+scenarios = ["VS14"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/lifecycle/mutants/prefix_fence_not_monotone.cfg"
+seed = "unknown"
+why_not_caught = "The first spec wrote fences at once, so they could not be late."
+invariant_added = "A Data group takes only a larger schema epoch."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

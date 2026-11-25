@@ -1,0 +1,14 @@
+id = "VECTOR-design-move-removes-later-copy"
+title = "A deferred removal after a move there and back deletes the new copy"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G05"]
+scenarios = ["VS07"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/index/mutants/prefix_remove_by_slot.cfg"
+seed = "unknown"
+why_not_caught = "The plan removed by row instead of by entry instance."
+invariant_added = "Every row visible at a servable cut has an entry in a listed partition."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

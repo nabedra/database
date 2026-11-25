@@ -1,0 +1,14 @@
+id = "VECTOR-design-stale-embedding"
+title = "A row keeps the vector of its old text after the text changed"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G07"]
+scenarios = ["VS12"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/embed/mutants/prefix_stale_vector.cfg"
+seed = "unknown"
+why_not_caught = "The plan did not say what happens to the vector."
+invariant_added = "A stored vector was made from the current text of the row."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

@@ -1,0 +1,14 @@
+id = "VECTOR-design-bound-of-dropped-versions"
+title = "The bound of servable cuts ignores the version that superseded a dropped one"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G02"]
+scenarios = ["VS09"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/snapshot/mutants/prefix_bound_of_dropped.cfg"
+seed = "unknown"
+why_not_caught = "The plan named the dropped timestamps and the spec checked another rule."
+invariant_added = "A served cut never differs from the committed history at or below it."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

@@ -1,0 +1,14 @@
+id = "VECTOR-design-setvector-unversioned"
+title = "A concurrent metadata update drops a vector that was just stored"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G07"]
+scenarios = ["VS12"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/embed/mutants/prefix_setvector_unversioned.cfg"
+seed = "unknown"
+why_not_caught = "SetVector was not an ordinary versioned commit."
+invariant_added = "Every row without a vector is waiting for one or is marked failed."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

@@ -1,0 +1,14 @@
+id = "VECTOR-design-closed-deposed-leader"
+title = "A deposed leader closes a timestamp below a commit of the new leader"
+class = "stale-route-topology-schema"
+module = "vector"
+guarantees = ["VEC-G02"]
+scenarios = ["VS04"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/snapshot/mutants/prefix_deposed_leader_closes.cfg"
+seed = "unknown"
+why_not_caught = "The plan sent Closed outside the log with no leadership check."
+invariant_added = "A served cut never differs from the committed history at or below it."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

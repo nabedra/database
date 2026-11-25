@@ -1,0 +1,14 @@
+id = "VECTOR-design-copy-loses-pending"
+title = "A split or restore loses a pending embedding"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G07", "VEC-G10"]
+scenarios = ["VS16"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/blobs/mutants/prefix_copy_without_pending.cfg"
+seed = "unknown"
+why_not_caught = "The plan named vectors only."
+invariant_added = "A copy keeps or derives the embedding record of every row."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

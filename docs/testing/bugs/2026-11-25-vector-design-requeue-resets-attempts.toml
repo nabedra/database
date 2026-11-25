@@ -1,0 +1,14 @@
+id = "VECTOR-design-requeue-resets-attempts"
+title = "A late failure report counts against a requeued row"
+class = "uncertain-outcome"
+module = "vector"
+guarantees = ["VEC-G07"]
+scenarios = ["VS13"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/embed/mutants/prefix_requeue_resets_attempts.cfg"
+seed = "unknown"
+why_not_caught = "The first spec had no requeue."
+invariant_added = "An attempt is counted at most once per provider error of that source version."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

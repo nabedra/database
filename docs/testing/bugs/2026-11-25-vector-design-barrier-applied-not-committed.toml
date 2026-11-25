@@ -1,0 +1,14 @@
+id = "VECTOR-design-barrier-applied-not-committed"
+title = "A later latest query reads an older position than an earlier one"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G01"]
+scenarios = ["VS01"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/latest/mutants/prefix_applied_not_committed.cfg"
+seed = "unknown"
+why_not_caught = "The first spec had no property that relates two queries."
+invariant_added = "A query that began after another one finished reads no earlier position of a range."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

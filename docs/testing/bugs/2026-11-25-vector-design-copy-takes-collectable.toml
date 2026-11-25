@@ -1,0 +1,14 @@
+id = "VECTOR-design-copy-takes-collectable"
+title = "A copy takes a collectable row version and then loses its vector"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G10"]
+scenarios = ["VS16"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/blobs/mutants/prefix_copy_takes_collectable.cfg"
+seed = "unknown"
+why_not_caught = "The plan pinned the collection point but not the set of versions to copy."
+invariant_added = "An active copy holds exactly the rows of its cut, with their vectors."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

@@ -1,0 +1,14 @@
+id = "VECTOR-design-checkpoint-loses-moved-row"
+title = "A checkpoint that overlaps a move between partitions loses a row"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G05"]
+scenarios = ["VS10"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/index/mutants/prefix_checkpoint_without_epoch.cfg"
+seed = "unknown"
+why_not_caught = "The plan held removals back for queries only."
+invariant_added = "Every row visible at a servable cut has an entry in a listed partition after a crash."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

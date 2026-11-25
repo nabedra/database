@@ -1,0 +1,14 @@
+id = "VECTOR-design-closed-unknown-outcome"
+title = "A commit of unknown outcome lands below a closed timestamp that a search already used"
+class = "uncertain-outcome"
+module = "vector"
+guarantees = ["VEC-G02"]
+scenarios = ["VS04"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/snapshot/mutants/prefix_unknown_outcome_closes.cfg"
+seed = "unknown"
+why_not_caught = "The plan drained pending commits in leader memory, which forgets an attempt of unknown outcome."
+invariant_added = "No entry after an effective Closed entry commits at or below it."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

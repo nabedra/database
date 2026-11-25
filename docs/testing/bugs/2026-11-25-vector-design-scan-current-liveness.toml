@@ -1,0 +1,14 @@
+id = "VECTOR-design-scan-current-liveness"
+title = "A scan judges an entry by a later row map and misses a row that was updated meanwhile"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G03", "VEC-G05"]
+scenarios = ["VS05"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/index/mutants/prefix_current_liveness.cfg"
+seed = "unknown"
+why_not_caught = "The plan did not pin a read point for latest scans."
+invariant_added = "A finished exact scan saw every row visible at its read point."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

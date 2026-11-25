@@ -1,0 +1,14 @@
+id = "VECTOR-design-scan-probe-before-pin"
+title = "A scan ranks partitions before it fixes its read point and misses a row"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G01", "VEC-G05"]
+scenarios = ["VS07"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/index/mutants/prefix_probe_before_pin.cfg"
+seed = "unknown"
+why_not_caught = "The plan ranked centroids in parallel with the barrier."
+invariant_added = "A finished exact scan saw every row visible at its read point."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

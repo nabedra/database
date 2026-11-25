@@ -1,0 +1,14 @@
+id = "VECTOR-design-drain-drops-old-versions"
+title = "A partition split drops superseded versions that a retained cut needs"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G02", "VEC-G05"]
+scenarios = ["VS07"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/index/mutants/prefix_drain_copies_current_only.cfg"
+seed = "unknown"
+why_not_caught = "The first spec only started scans at the applied position."
+invariant_added = "Every row visible at any servable cut has an entry in a listed partition."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

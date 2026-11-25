@@ -1,0 +1,14 @@
+id = "VECTOR-design-retag-before-cut"
+title = "A lagging worker re-tags a split range and loses entries of the source"
+class = "stale-route-topology-schema"
+module = "vector"
+guarantees = ["VEC-G01"]
+scenarios = ["VS08"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/route/mutants/prefix_retag_before_cut.cfg"
+seed = "unknown"
+why_not_caught = "The plan re-tagged at the published cut without a position check."
+invariant_added = "A latest query sees every write acknowledged before it began, across a split."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

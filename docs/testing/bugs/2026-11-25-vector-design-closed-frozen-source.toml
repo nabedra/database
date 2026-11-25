@@ -1,0 +1,14 @@
+id = "VECTOR-design-closed-frozen-source"
+title = "A frozen split source closes a timestamp above commits of its children"
+class = "stale-route-topology-schema"
+module = "vector"
+guarantees = ["VEC-G02"]
+scenarios = ["VS08"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/route/mutants/prefix_frozen_source_closes.cfg"
+seed = "unknown"
+why_not_caught = "Only the latest mode checked for a published split."
+invariant_added = "A served cut never changes across a split."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

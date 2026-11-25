@@ -1,0 +1,14 @@
+id = "VECTOR-design-drain-blocked-by-copy"
+title = "A copy sent to a partition that drains meanwhile blocks the drain for good"
+class = "fence-lifecycle-order"
+module = "vector"
+guarantees = ["VEC-G05"]
+scenarios = ["VS07"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/index/mutants/land_needs_ready.cfg"
+seed = "unknown"
+why_not_caught = "The spec had no liveness property for drains."
+invariant_added = "A split or merge of a partition ends."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false

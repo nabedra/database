@@ -1,0 +1,14 @@
+id = "VECTOR-design-barrier-without-schema"
+title = "A dropped column is served through a stale route"
+class = "stale-route-topology-schema"
+module = "vector"
+guarantees = ["VEC-G08"]
+scenarios = ["VS14"]
+found_by = "review"
+found_date = "2026-11-25"
+lowest_regression = "specs/vector/lifecycle/mutants/prefix_barrier_without_schema.cfg"
+seed = "unknown"
+why_not_caught = "The barrier carried no column identity."
+invariant_added = "A worker serves only a column that its user could see while the query ran."
+fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+revert_patch_ok = false
