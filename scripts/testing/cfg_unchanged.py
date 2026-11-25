@@ -184,6 +184,25 @@ def compare_executables(parent, target_dir, base, head, features):
     for label, code in (("base", old), ("head", new)):
         print(f"{label} nabedra-db [{features}]: {len(code)} bytes, sha256 {hashlib.sha256(code).hexdigest()}")
     if old != new:
+        for name, data in (("base", old), ("head", new)):
+            Path(target_dir / name).write_bytes(data)
+        os.environ["LC_ALL"] = "C"
+        script = r"""
+cd $1
+for t in base head; do
+  readelf -SW $t > $t.sec; nm -S --defined-only $t | sort -k4 > $t.nm
+  awk '{print $2, $3, $4}' $t.nm > $t.sizes
+  objdump -h $t > /dev/null
+done
+echo SECTIONS; diff base.sec head.sec
+echo SIZES; diff base.sizes head.sizes | wc -l; diff base.sizes head.sizes | head -60
+for sec in .text .rodata .data.rel.ro .data .eh_frame .gcc_except_table .symtab .strtab .rela.dyn .got; do
+  for t in base head; do objcopy -O binary --only-section=$sec $t $t.x 2>/dev/null || readelf -x $sec $t > $t.x; done
+  echo "$sec $(cmp -l base.x head.x 2>/dev/null | wc -l) of $(stat -c %s base.x) / $(stat -c %s head.x)"
+done
+"""
+        subprocess.run(["bash", "-c", script, "x", str(target_dir)], check=False)
+        sys.stdout.flush()
         differing = sum(a != b for a, b in zip(old, new)) + abs(len(old) - len(new))
         print(f"FAILED: the release executables differ in {differing} bytes")
         return 1
