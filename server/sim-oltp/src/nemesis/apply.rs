@@ -61,22 +61,37 @@ fn start_failed(cluster: &Cluster, node: u64, failures: u32, last: bool, error: 
     last
 }
 
-/// Start a stopped gateway as its supervisor does (lead decision 18): a process that exits is
-/// started again, as often and after the same pause as the nemesis does. Returns the starts that
-/// failed, and whether the gateway runs.
-pub(crate) async fn start_gateway(cluster: &mut Cluster, gateway: u64) -> (Vec<String>, bool) {
+/// Start a stopped process as its supervisor does, and as `Chaos` does for its own faults: a start
+/// that fails is made again after the same pause, until the node has failed as often as there
+/// (lead decision 18 for a gateway; a worker the same way, its later starts after a kill). `failures`
+/// counts over the run. Returns the starts that failed, and whether the process runs.
+pub(crate) async fn start_again(
+    cluster: &mut Cluster,
+    node: u64,
+    how: DiskCut,
+    failures: &mut BTreeMap<u64, u32>,
+) -> (Vec<String>, bool) {
     let mut failed = Vec::new();
+    let mut how = how;
     loop {
-        let Err(error) = cluster.restart_gateway(gateway).await else {
+        let started = if GATEWAYS.contains(&node) {
+            cluster.restart_gateway(node).await
+        } else {
+            cluster.restart_worker(node, how).await
+        };
+        let Err(error) = started else {
             return (failed, true);
         };
         failed.push(format!(
-            "n{gateway} at {}ms: {error}",
+            "n{node} at {}ms: {error}",
             elapsed_ms(&cluster.world)
         ));
-        if start_failed(cluster, gateway, failed.len() as u32, false, &error) {
+        let count = failures.entry(node).or_default();
+        *count += 1;
+        if start_failed(cluster, node, *count, false, &error) {
             return (failed, false);
         }
+        how = DiskCut::Kill;
         time::sleep(Duration::from_millis(RESTART_PAUSE_MS)).await;
     }
 }

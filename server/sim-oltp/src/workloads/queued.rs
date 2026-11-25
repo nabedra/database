@@ -54,7 +54,7 @@ use crate::{
     },
     nemesis::{
         Action, NetFaults, Selection,
-        apply::{COLD_LIMIT, Chaos, start_gateway},
+        apply::{COLD_LIMIT, Chaos, start_again},
         window,
     },
     node::Cluster,
@@ -82,6 +82,7 @@ const REFUSALS: u32 = 6;
 const REPORTED: usize = 3;
 /// Retentions of at least this long do not expire within a run.
 const LONG_RETENTION_MS: u64 = 600_000;
+const CHAOS_WINDOW: &str = "chaos window";
 /// Requests that a restart of processes meets.
 const BACKLOG: i64 = 40;
 const ACCEPT_WAIT: Duration = Duration::from_secs(1);
@@ -320,8 +321,10 @@ struct Shared {
     windows: Vec<(&'static str, u64, u64)>,
     /// The finale's full stop.
     stop: Option<Stop>,
-    /// Every gateway start that failed (lead decision 18).
+    /// Every process start that failed (lead decision 18).
     failed_starts: Vec<String>,
+    /// How many of them each node had.
+    start_failures: BTreeMap<u64, u32>,
     /// Comparisons that could not be made, and why.
     skipped: Vec<String>,
     /// The last receipt answer per identity, for the failure messages.
@@ -1447,28 +1450,20 @@ async fn relook(q: &Q, at: u64) {
     }
 }
 
-/// Restart one process. A failure is the run's `Liveness` violation. A gateway is started again
-/// as its supervisor does (lead decision 18); a worker has one start.
+/// Restart one process as the shared nemesis does. A process that does not start within its tries
+/// is the run's `Liveness` violation, and every failed start is in the summary.
 async fn restart(q: &Q, cluster: &mut Cluster, target: Target) -> bool {
-    let (node, result) = match target {
-        Target::Gateway(node) => {
-            let (failed, started) = start_gateway(cluster, node).await;
-            q.shared.lock().unwrap().failed_starts.extend(failed);
-            return started;
-        }
-        Target::Worker(node, power) => {
-            let cut = if power { DiskCut::Power } else { DiskCut::Kill };
-            (node, cluster.restart_worker(node, cut).await)
-        }
+    let (node, how) = match target {
+        Target::Gateway(node) => (node, DiskCut::Kill),
+        Target::Worker(node, true) => (node, DiskCut::Power),
+        Target::Worker(node, false) => (node, DiskCut::Kill),
     };
-    if let Err(error) = &result {
-        cluster.checks.violate(
-            &cluster.world,
-            "Liveness",
-            format!("queued fault: n{node} did not restart: {error}"),
-        );
-    }
-    result.is_ok()
+    let mut failures = std::mem::take(&mut q.shared.lock().unwrap().start_failures);
+    let (failed, started) = start_again(cluster, node, how, &mut failures).await;
+    let mut shared = q.shared.lock().unwrap();
+    shared.start_failures = failures;
+    shared.failed_starts.extend(failed);
+    started
 }
 
 /// Seeded defect: a 202 that no second copy can back.
@@ -1610,7 +1605,7 @@ pub(crate) async fn run(
         .lock()
         .unwrap()
         .windows
-        .push(("chaos window", start, elapsed_ms(&cluster.world)));
+        .push((CHAOS_WINDOW, start, elapsed_ms(&cluster.world)));
     // The table served requests, so its range has a leader. A harness that can't see it aims its
     // faults blindly (as in the `direct` workload).
     if cluster.elections().is_empty() {
@@ -1661,6 +1656,12 @@ pub(crate) async fn run(
     tasks.append(&mut bursts);
     tokio::join!(join(tasks), observe(&q, cluster.config.run_id));
     settle(&q, cluster, "the heal").await;
+    // Marked where the `direct` workload marks it: the cluster is ready and every client is done.
+    // The reads after it have a bound of their own.
+    cluster.checks.recovered(&cluster.world, "convergence");
+    cluster
+        .checks
+        .expect_recovery(&cluster.world, "final reads", direct::CONVERGE_LIMIT);
     reread(&q, cluster.config.run_id).await;
     let finals = final_reads(&q).await;
     report
@@ -1671,7 +1672,7 @@ pub(crate) async fn run(
             .checks
             .violate(&cluster.world, "Liveness", error.clone());
     }
-    cluster.checks.recovered(&cluster.world, "convergence");
+    cluster.checks.recovered(&cluster.world, "final reads");
     // Bounds below are their own.
     q.ctx.converge_by.store(u64::MAX, Ordering::Release);
     copies(&q, cluster, "after the heal").await;
@@ -1777,11 +1778,11 @@ fn finish(q: &Q, cluster: &Cluster, chaos: Option<&Chaos>, report: &mut direct::
     let mut worked = BTreeMap::new();
     for &(name, from, to) in &shared.windows {
         let work = Work::of(&shared.log, from, to);
-        let missing = progress(name, &work);
+        let (kind, missing) = progress(name, &work);
         if !missing.is_empty() {
             cluster.checks.violate(
                 &cluster.world,
-                "Progress",
+                kind,
                 format!(
                     "{name}, {from}ms to {to}ms: no {} in {} attempts",
                     missing.join(", no "),
@@ -1851,27 +1852,32 @@ fn finish(q: &Q, cluster: &Cluster, chaos: Option<&Chaos>, report: &mut direct::
         })).collect::<Vec<_>>(),
         "outside_contract": shared.outside,
         "work": worked,
-        "failed_gateway_starts": shared.failed_starts,
+        "failed_starts": shared.failed_starts,
         "not_compared": shared.skipped,
         "abandoned": false,
     });
 }
 
-/// What a window with sending clients must have completed and did not (lead decision 17). The
-/// chaos window needs one request that was accepted and settled as well: without one the queue
-/// was not exercised. A rolling restart stops one worker at a time (OLTP-G10: "Writes stay
-/// available with one voter paused or lost").
-fn progress(window: &str, work: &Work) -> Vec<&'static str> {
-    let queue = window == "chaos window";
-    [
+/// What a window with sending clients must have completed and did not, and the kind that says so.
+///
+/// `Progress` is lead decision 17: the seed issued and completed work. The chaos window needs one
+/// request that was accepted and settled as well, because without one the queue was not
+/// exercised. `RollingRestartProgress` is a kind of its own: a rolling restart stops one worker
+/// at a time (OLTP-G10: "Writes stay available with one voter paused or lost").
+fn progress(window: &str, work: &Work) -> (&'static str, Vec<&'static str>) {
+    let queue = window == CHAOS_WINDOW;
+    let kind = if queue {
+        "Progress"
+    } else {
+        "RollingRestartProgress"
+    };
+    let missing = [
         ("write committed", work.writes == 0),
         ("read answered", work.reads == 0),
         ("accepted request settled", queue && work.settled == 0),
-    ]
-    .into_iter()
-    .filter(|(_, missing)| *missing)
-    .map(|(name, _)| name)
-    .collect()
+    ];
+    let missing = missing.into_iter().filter(|(_, missing)| *missing);
+    (kind, missing.map(|(name, _)| name).collect())
 }
 
 /// Note a full stop that the shared nemesis did, by its new run.
@@ -2981,16 +2987,16 @@ mod tests {
             settled,
             gap_ms: 0,
         };
-        assert!(progress("chaos window", &work(1, 1, 1)).is_empty());
-        assert_eq!(progress("chaos window", &work(0, 0, 0)).len(), 3);
+        assert!(progress(CHAOS_WINDOW, &work(1, 1, 1)).1.is_empty());
+        assert_eq!(progress(CHAOS_WINDOW, &work(0, 0, 0)).1.len(), 3);
         assert_eq!(
-            progress("chaos window", &work(1, 1, 0)),
-            ["accepted request settled"]
+            progress(CHAOS_WINDOW, &work(1, 1, 0)),
+            ("Progress", vec!["accepted request settled"])
         );
-        assert!(progress("rolling restart", &work(1, 1, 0)).is_empty());
+        assert!(progress("rolling restart", &work(1, 1, 0)).1.is_empty());
         assert_eq!(
             progress("rolling restart", &work(0, 1, 0)),
-            ["write committed"]
+            ("RollingRestartProgress", vec!["write committed"])
         );
     }
 
