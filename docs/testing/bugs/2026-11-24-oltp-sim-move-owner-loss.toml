@@ -1,0 +1,17 @@
+id = "OLTP-sim-move-owner-loss"
+title = "Losing the worker that runs a replica move stops the cluster from dropping it, and a cold start does not end it"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = []
+scenarios = ["O26", "O15"]
+found_by = "campaign"
+found_date = "2026-11-24"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 5
+why_not_caught = "The O26 runner moves replicas in a healthy cluster, and the recovery runners lose workers with no move active."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, seeds 5, 20 and 23 of 1 to 720 (move): survivors drop a lost worker and a cold start converges. The lost worker owned the move. Control answers Busy to BeginOwnerFence and BeginColdFence while the move record is active, and the move can be ended only by the owner incarnation that began it. The operator asks every worker for the move throughout. A harness that stopped asking showed this also for lost workers that were not the owner (nine seeds, such as 128). With the operator asking, 128 retires, and no survivor of 1 to 720 answers and keeps a lost worker that never owned the move."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-23"

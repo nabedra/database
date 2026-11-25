@@ -1,0 +1,20 @@
+diff --git a/server/sim-oltp/src/workload.rs b/server/sim-oltp/src/workload.rs
+--- a/server/sim-oltp/src/workload.rs
++++ b/server/sim-oltp/src/workload.rs
+@@ -188,6 +188,7 @@
+     observer(0, format!("configuration {}", configuration["hash"]));
+     let checks = Invariants::new();
+     checks.set_trace(observer.clone());
++    checks.install_probes(&world, workload.name());
+     let history = Arc::new(Mutex::new(History::default()));
+     history.lock().unwrap().set_trace(observer.clone());
+     let mut assertions = BTreeMap::new();
+@@ -329,6 +330,8 @@
+         );
+         checks.check_history(&world, &verdict);
+     }
++    checks.check_outcomes(&world, history.events());
++    assertions.insert("probe invariants", checks.probe_invariants_hold());
+     let mut capture = trace.lock().unwrap();
+     capture.flush_frames();
+     let trace = &capture.trace;

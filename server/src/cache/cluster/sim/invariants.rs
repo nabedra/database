@@ -30,9 +30,15 @@ pub(super) struct Observations {
     applied: BTreeMap<u64, u64>,
     served: BTreeMap<u16, (u64, WorkerId, u64)>,
     failover_markers: BTreeMap<(u16, u64), Vec<usize>>,
+    /// Committed staged promotions with the virtual time of first apply.
+    pub staged: Vec<(u64, u16, StagedPromotion)>,
     primary: BTreeMap<(Version, WorkerId), Digest>,
     replicas: BTreeMap<(Version, WorkerId), (WorkerId, Digest)>,
     pub check_replica_prefix: bool,
+    /// Redelivered SETs that a replica refused and applied.
+    pub redelivered: (u64, u64),
+    /// Messages that a late partition held.
+    pub held: u64,
 }
 
 impl Observations {
@@ -95,6 +101,8 @@ impl Observations {
             }
             return;
         }
+        self.staged
+            .extend(staged.iter().map(|&(slot, proof)| (now, slot, proof)));
         self.revisions.insert((state.generation, state.revision));
         if let Some(err) = invalid_placement(state) {
             self.violate("SlotOwnership", err);
@@ -227,6 +235,21 @@ impl Observations {
                     self.replica_prefix(version, worker, source, digest);
                 }
                 self.trace.record(now, format_args!("replica node={node} source={} slot={slot} epoch={epoch} seq={sequence} digest={digest:x?}", source.node));
+            }
+            Observed::Redelivered {
+                worker,
+                slot,
+                epoch,
+                sequence,
+                current,
+                applied,
+            } => {
+                if applied {
+                    self.redelivered.1 += 1;
+                } else {
+                    self.redelivered.0 += 1;
+                }
+                self.trace.record(now, format_args!("redelivered SET node={} slot={slot} epoch={epoch} seq={sequence} current={current} applied={applied}", worker.node));
             }
             Observed::Promoted {
                 slot,

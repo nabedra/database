@@ -587,6 +587,8 @@ pub(crate) async fn run(ctx: Ctx, program: Program) {
             break;
         }
         time::sleep(planned.think).await;
+        #[cfg(test)]
+        crate::panics::plant(&ctx.world, crate::panics::At::Client);
         let value = base + index as i64 * 10;
         let table = &ctx.table;
         let fresh_id = in_node(node, async { uuid_v4() }).await;
@@ -644,7 +646,7 @@ pub(crate) async fn run(ctx: Ctx, program: Program) {
         )
         .await;
         if let Some(same) = reuse
-            && !unknown(&completion)
+            && judged_reuse(&completion)
         {
             let mut observed = ctx.observed.lock().unwrap();
             if same {
@@ -675,6 +677,21 @@ pub(crate) async fn run(ctx: Ctx, program: Program) {
             }
             _ => {}
         }
+    }
+}
+
+/// Whether an answer to a reused request ID is one that D03 speaks about: the same key is a
+/// conflict of bodies, another key executes. The wrong success or the wrong conflict counts too,
+/// and the checker rejects it. Any other refusal, such as `overloaded` or a lifecycle conflict,
+/// says nothing about the reuse.
+fn judged_reuse(completion: &Completion) -> bool {
+    match completion {
+        Completion::Ok(_) => true,
+        Completion::Refused(error) => {
+            error.code == ErrorCode::Conflict
+                && error.message == "request_id was already used with a different request body"
+        }
+        Completion::Unknown(_) => false,
     }
 }
 
@@ -775,30 +792,39 @@ pub(crate) async fn exact_count(ctx: &Ctx) -> Result<Option<String>, String> {
             }
         }
     }
-    let id = in_node(CLIENTS[1], async { uuid_v4() }).await;
     let payload = json!({
         "table_id": ctx.table,
         "query": {"select": null, "filter": null, "order_by": null, "limit": null},
     });
-    let answer = crate::client::request(
-        CLIENTS[1],
-        GATEWAYS[1],
-        OPERATIONS,
-        &ctx.token,
-        Some(operation(id, "query.count", payload)),
-        COUNT_LIMIT,
-    )
-    .await
-    .and_then(|reply| reply.completion(id))?;
-    match answer {
-        Completion::Ok(count) if count == json!(rows) => Ok(None),
-        Completion::Ok(count) => Ok(Some(format!(
-            "query.count answered {count} and the keys hold {rows} rows"
-        ))),
-        other => Err(format!(
-            "query.count: {}",
-            failure(&other).unwrap_or_default()
-        )),
+    // A refused count is asked again under a new ID, as `read_after_transition` does.
+    let deadline = ctx.world.elapsed() + COUNT_LIMIT;
+    loop {
+        let id = in_node(CLIENTS[1], async { uuid_v4() }).await;
+        let answer = crate::client::request(
+            CLIENTS[1],
+            GATEWAYS[1],
+            OPERATIONS,
+            &ctx.token,
+            Some(operation(id, "query.count", payload.clone())),
+            COUNT_LIMIT,
+        )
+        .await
+        .and_then(|reply| reply.completion(id))?;
+        match answer {
+            Completion::Ok(count) if count == json!(rows) => return Ok(None),
+            Completion::Ok(count) => {
+                return Ok(Some(format!(
+                    "query.count answered {count} and the keys hold {rows} rows"
+                )));
+            }
+            other if ctx.world.elapsed() >= deadline => {
+                return Err(format!(
+                    "query.count: {}",
+                    failure(&other).unwrap_or_default()
+                ));
+            }
+            _ => time::sleep(Duration::from_millis(500)).await,
+        }
     }
 }
 
@@ -837,7 +863,27 @@ pub(crate) async fn burst(ctx: Ctx, gateway: usize, count: u64, first_key: i64) 
 
 #[cfg(test)]
 mod tests {
+    use nabedra_protocol::protocol::ProtocolError;
+
     use super::*;
+
+    /// Review 115, L4: an `overloaded` answer counted as D03's assertion.
+    #[test]
+    fn only_d03s_own_answers_count_as_a_judged_reuse() {
+        let refused = |code, message: &str| {
+            let error = ProtocolError::new(code, message, Outcome::NotApplied);
+            judged_reuse(&Completion::Refused(error))
+        };
+        let used = "request_id was already used with a different request body";
+        assert!(refused(ErrorCode::Conflict, used));
+        assert!(!refused(
+            ErrorCode::Conflict,
+            "captured schema or lifecycle changed"
+        ));
+        assert!(!refused(ErrorCode::Overloaded, "full"));
+        assert!(judged_reuse(&Completion::Ok(json!(true))));
+        assert!(!judged_reuse(&Completion::Unknown("deadline".into())));
+    }
 
     /// A refused write is reported only when its own value is in the row. A conflict on the
     /// refused identity is not enough: cold seed 6 found a forward marker there while the

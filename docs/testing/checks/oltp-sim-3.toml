@@ -10,10 +10,18 @@ tiers = ["T1"]
 command = ["bash", "-euc", '''
 build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
-exec timeout 900s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1
+# It poisons its process, so it runs alone.
+"${build[@]}" -- --ignored --exact panics::tests::an_escaped_panic_is_never_a_clean_seed_or_a_hit
+report=../target/testing-logs/oltp-sim-3/sweep-report.json
+rm -f "$report"
+timeout 900s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1
+# The unit tests above, or a filter that matches nothing, must not pass for the sweep.
+python3 -c 'import json, sys
+seeds = json.load(open(sys.argv[1]))["seeds"]
+sys.exit(0 if len(seeds) == int(sys.argv[2]) else f"the sweep ran {len(seeds)} seeds")' "$report" "$NABEDRA_SEEDS"
 ''']
 cwd = "server"
 timeout_s = 3600
 needs = []
 result_parser = "cargo-test"
-env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "mixed", NABEDRA_SEEDS = "30", NABEDRA_SIM_JOBS = "2", NABEDRA_SIM_VERIFY_REPLAY = "0.1", NABEDRA_SEED = "31", NABEDRA_SIM_CHECK_ID = "oltp-sim-3", NABEDRA_SIM_GUARANTEES = "OLTP-G02,OLTP-G03", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-3" }
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "mixed", NABEDRA_SEEDS = "240", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SEED = "241", NABEDRA_SIM_CHECK_ID = "oltp-sim-3", NABEDRA_SIM_GUARANTEES = "OLTP-G02,OLTP-G03", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-3" }

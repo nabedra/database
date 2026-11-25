@@ -5,20 +5,26 @@ kinds = ["S", "H"]
 # move sequences. A scenario is claimed only when every one of its clauses ran. Its probe rules
 # and the revocation storm are recorded as not run. `OperatorGuidance`, `RemovedNeverRejoins` and
 # `ReplacementRestart` rest on docs/oltp-recovery.md alone, so they report findings and count for
-# nothing. The `Step...` and `ReceiptBound` kinds are the harness's own bounds.
+# nothing. The `Step...`, `LostWorkerListed`, `SurvivorsNotReady` and `ReceiptBound` kinds are the
+# harness's own bounds. Every seed is replayed, and one that completed no client work is red.
 guarantees = ["OLTP-G07", "OLTP-G08"]
 scenarios = []
 tiers = ["T1"]
 # Build once. Cluster tests share process-wide budgets, so they run one at a time. The measured
-# sweep takes at most 20 minutes.
+# sweep takes at most 20 minutes. The sweep report must hold every seed of the range.
 command = ["bash", "-euc", '''
 build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
 "${build[@]}" -- --test-threads=1 disk:: invariants::membership node:: workloads::membership
-exec timeout 1200s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1
+report=../target/testing-logs/oltp-sim-membership/sweep-report.json
+rm -f "$report"
+timeout 1200s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1
+python3 -c 'import json, sys
+seeds = json.load(open(sys.argv[1]))["seeds"]
+sys.exit(0 if len(seeds) == int(sys.argv[2]) else f"the sweep ran {len(seeds)} seeds")' "$report" "$NABEDRA_SEEDS"
 ''']
 cwd = "server"
 timeout_s = 4200
 needs = []
 result_parser = "cargo-test"
-env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "membership", NABEDRA_SEEDS = "32", NABEDRA_SIM_JOBS = "2", NABEDRA_SIM_VERIFY_REPLAY = "0.25", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-membership", NABEDRA_SIM_GUARANTEES = "OLTP-G07,OLTP-G08", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-membership" }
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "membership", NABEDRA_SEEDS = "32", NABEDRA_SIM_JOBS = "2", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-membership", NABEDRA_SIM_GUARANTEES = "OLTP-G07,OLTP-G08", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-membership" }

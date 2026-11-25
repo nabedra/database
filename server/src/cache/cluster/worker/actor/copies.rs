@@ -22,6 +22,8 @@ pub(super) struct Copies {
     max_items: usize,
     outgoing: BTreeMap<Destination, Outgoing>,
     incoming: BTreeMap<u16, Incoming>,
+    #[cfg(feature = "sim")]
+    redelivery: super::hooks::Redelivery,
 }
 
 struct Outgoing {
@@ -56,6 +58,8 @@ impl Copies {
             max_items,
             outgoing: BTreeMap::new(),
             incoming: BTreeMap::new(),
+            #[cfg(feature = "sim")]
+            redelivery: Default::default(),
         }
     }
 
@@ -67,6 +71,8 @@ impl Copies {
     pub fn forget(&mut self, slot: u16) {
         self.outgoing.retain(|(id, _), _| *id != slot);
         self.incoming.remove(&slot);
+        #[cfg(feature = "sim")]
+        self.redelivery.forget(slot);
     }
 
     pub fn expire(&mut self) {
@@ -220,6 +226,8 @@ impl Copies {
         let slot = packet.slot;
         let old_size = state.store.charged_bytes();
         let available = storage.ceiling(config, false, old_size);
+        #[cfg(feature = "sim")]
+        let mut redelivered = Vec::new();
         match packet.data {
             Data::Empty(cut)
                 if cut >= state.sequence && (!state.baseline || cut > state.sequence) =>
@@ -244,13 +252,15 @@ impl Copies {
                 #[cfg(feature = "sim")]
                 let effects = {
                     let mut effects = effects;
-                    if super::hooks::knobs().replica_keeps_deleted_keys {
+                    if super::hooks::knobs().replica_drops_deletes {
                         effects.retain(|effect| {
                             !matches!(effect, crate::cache::store::Effect::Delete(_))
                         });
                     }
                     effects
                 };
+                #[cfg(feature = "sim")]
+                let noted = effects.clone();
                 if let Err(error) = merge(
                     &mut state.store,
                     effects,
@@ -267,6 +277,26 @@ impl Copies {
                 self.incoming.remove(&slot);
                 state.sequence = sequence;
                 state.digest = Some(digest);
+                #[cfg(feature = "sim")]
+                {
+                    redelivered =
+                        self.redelivery
+                            .applied(slot, packet.epoch, sequence, &noted, digest);
+                }
+            }
+            #[cfg(feature = "sim")]
+            Data::Delta {
+                sequence, effects, ..
+            } if state.baseline
+                && sequence < state.sequence
+                && super::hooks::knobs().replica_accepts_stale_delta =>
+            {
+                merge(
+                    &mut state.store,
+                    effects,
+                    available,
+                    config.turns.growth_bytes,
+                )?;
             }
             Data::Snapshot(chunk) if !state.baseline || chunk.cut >= state.sequence => {
                 if let Some((store, cut)) = self.receive(config, slot, chunk, available)? {
@@ -280,6 +310,27 @@ impl Copies {
             _ => return Err(StoreError::InvalidEffects),
         }
         storage.replica = storage.replica - old_size + state.store.charged_bytes();
+        #[cfg(feature = "sim")]
+        for stale in redelivered {
+            let packet = Packet {
+                slot,
+                epoch: stale.epoch,
+                data: Data::Delta {
+                    sequence: stale.sequence,
+                    effects: stale.effects,
+                    digest: stale.digest,
+                },
+            };
+            let applied = self.apply(config, state, packet, storage).is_ok();
+            super::hooks::observe(super::Observed::Redelivered {
+                worker: config.id,
+                slot,
+                epoch: stale.epoch,
+                sequence: stale.sequence,
+                current: state.sequence,
+                applied,
+            });
+        }
         Ok(())
     }
 

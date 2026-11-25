@@ -134,6 +134,64 @@ impl Cluster {
         })
     }
 
+    /// Stop `node` gracefully and wait until its process ended.
+    pub async fn drain(&mut self, node: u64) -> Result<(), String> {
+        self.start_drain(node).await?;
+        let deadline = self.world.elapsed() + RECOVERY_LIMIT;
+        loop {
+            if let Some(drained) = self.drained(node).await {
+                return drained;
+            }
+            if self.world.elapsed() >= deadline {
+                return Err(format!("n{node} drain deadline"));
+            }
+            time::sleep(READINESS_POLL).await;
+        }
+    }
+
+    /// A request ID of the operator.
+    pub async fn split_id(&self) -> Uuid {
+        in_node(BOOTSTRAP_CLIENT, async { uuid_v4() }).await
+    }
+
+    /// One administration request to `node`, with the answer as the operator sees it.
+    pub async fn admin_answer(
+        &self,
+        node: u64,
+        id: Uuid,
+        name: &str,
+        payload: Value,
+        limit: Duration,
+    ) -> Result<Completion, String> {
+        request(
+            BOOTSTRAP_CLIENT,
+            node,
+            "/v1/cluster/operations",
+            &self.config.admin_token,
+            Some(operation(id, name, payload)),
+            limit,
+        )
+        .await
+        .and_then(|reply| reply.completion(id))
+    }
+
+    /// How many ready workers `node` reports for the current run, if it answers.
+    pub async fn ready_workers(&self, node: u64) -> Option<u64> {
+        let reply = request(
+            BOOTSTRAP_CLIENT,
+            node,
+            "/health/ready",
+            &self.config.data_token,
+            None,
+            HTTP_TIMEOUT,
+        )
+        .await
+        .ok()?;
+        (reply.status == 200 && reply.body["run_id"] == json!(self.config.run_id))
+            .then(|| reply.body["ready_workers"].as_u64())
+            .flatten()
+    }
+
     /// Start a stopped worker with the bootstrap file it holds, on `disk`. Nothing is prepared
     /// through the survivors here: call [`Cluster::prepare_restart`] first to start the same
     /// worker under its next incarnation.

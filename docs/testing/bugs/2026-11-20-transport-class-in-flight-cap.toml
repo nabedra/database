@@ -1,0 +1,14 @@
+id = "TRANSPORT-CLASS-IN-FLIGHT-CAP"
+title = "Outgoing calls of one traffic class grew without bound with the number of peers"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G09"]
+scenarios = ["C07", "M02"]
+found_by = "review"
+found_date = "2026-11-20"
+lowest_regression = "server/transport/src/transport/tests/sessions.rs c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes"
+seed = "unknown"
+why_not_caught = "LIVE1's per-peer lane tests checked isolation between peers but never the total in flight per class."
+invariant_added = "Each class's outgoing calls across every peer lane are capped at four lanes' worth of handler slots, on the loopback mTLS backend and on the simulated network."
+fix_commits = ["d61ebb855a29479f58b45e28ff0f5ecd24ad6385"]
+revert_patch_ok = false

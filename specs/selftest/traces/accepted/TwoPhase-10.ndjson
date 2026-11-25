@@ -1,0 +1,6 @@
+{"trace":"nabedra.trace/1","spec":"TwoPhase","seed":10,"sha":"0000000000000000000000000000000000000000","workload":"selftest-handwritten","params":{"RM":["r1","r2"],"MaxCrashes":1,"MaxDrops":1}}
+{"seq":0,"t":1000,"node":"tm","action":"TMCrash","vars":{"tmUp":false}}
+{"seq":1,"t":2000,"node":"tm","action":"TMRestart","vars":{"tmUp":true}}
+{"seq":2,"t":3000,"node":"tm","action":"TMTimeout","vars":{"tmDecision":"aborted"},"msg":{"type":"Abort"}}
+{"seq":3,"t":4000,"node":"r1","action":"RMRcvAbort","vars":{"rmState":"aborted"},"msg":{"type":"Abort"}}
+{"seq":4,"t":5000,"node":"r2","action":"RMChooseToAbort","vars":{"rmState":"aborted"}}

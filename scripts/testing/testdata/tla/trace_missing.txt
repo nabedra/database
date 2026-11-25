@@ -1,0 +1,78 @@
+Picked up JAVA_TOOL_OPTIONS: -Xmx2g -Dtlc2.TLC.stopAfter=900
+@!@!@STARTMSG 2262:0 @!@!@
+TLC2 Version 2026.11.19.180144 (rev: bc1b506)
+@!@!@ENDMSG 2262 @!@!@
+@!@!@STARTMSG 2187:0 @!@!@
+Running breadth-first search Model-Checking with fp 44 and seed 7437210694080095862 with 1 worker on 16 cores with 1820MB heap and 64MB offheap memory [pid: 7] (Linux 6.18.58.1-microsoft-standard-WSL2 amd64, Eclipse Adoptium 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue).
+@!@!@ENDMSG 2187 @!@!@
+@!@!@STARTMSG 2220:0 @!@!@
+Starting SANY...
+@!@!@ENDMSG 2220 @!@!@
+Parsing file /specs/selftest/TwoPhaseTrace.tla
+Parsing file /specs/selftest/TwoPhase.tla
+Parsing file /specs/lib/NabedraTrace.tla
+Parsing file /tmp/tlc-12860780503487630357/Naturals.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-12860780503487630357/FiniteSets.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-12860780503487630357/Sequences.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-12860780503487630357/Json.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/Json.tla)
+Parsing file /tmp/tlc-12860780503487630357/IOUtils.tla (jar:file:/opt/tla/CommunityModules-deps.jar!/IOUtils.tla)
+Parsing file /tmp/tlc-12860780503487630357/TLC.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-12860780503487630357/Integers.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-12860780503487630357/SequencesExt.tla (jar:file:/opt/tla/CommunityModules-deps.jar!/SequencesExt.tla)
+Parsing file /tmp/tlc-12860780503487630357/FiniteSetsExt.tla (jar:file:/opt/tla/CommunityModules-deps.jar!/FiniteSetsExt.tla)
+Parsing file /tmp/tlc-12860780503487630357/Folds.tla (jar:file:/opt/tla/CommunityModules-deps.jar!/Folds.tla)
+Parsing file /tmp/tlc-12860780503487630357/Functions.tla (jar:file:/opt/tla/CommunityModules-deps.jar!/Functions.tla)
+Parsing file /tmp/tlc-12860780503487630357/Bags.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/Bags.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TwoPhase
+Semantic processing of module TLC
+Semantic processing of module Json
+Semantic processing of module Integers
+Semantic processing of module Folds
+Semantic processing of module Functions
+Semantic processing of module FiniteSetsExt
+Semantic processing of module Bags
+Semantic processing of module SequencesExt
+Semantic processing of module IOUtils
+Semantic processing of module NabedraTrace
+Semantic processing of module TwoPhaseTrace
+Linting of module TwoPhase
+Linting of module Json
+Linting of module Folds
+Linting of module Functions
+Linting of module FiniteSetsExt
+Linting of module SequencesExt
+Linting of module IOUtils
+Linting of module NabedraTrace
+Linting of module TwoPhaseTrace
+@!@!@STARTMSG 2219:0 @!@!@
+SANY finished.
+@!@!@ENDMSG 2219 @!@!@
+@!@!@STARTMSG 2185:0 @!@!@
+Starting... (2026-11-24 16:28:06)
+@!@!@ENDMSG 2185 @!@!@
+@!@!@STARTMSG 2189:0 @!@!@
+Computing initial states...
+@!@!@ENDMSG 2189 @!@!@
+@!@!@STARTMSG 2190:0 @!@!@
+Finished computing initial states: 1 distinct state generated at 2026-11-24 16:28:06.
+@!@!@ENDMSG 2190 @!@!@
+<<"nabedra-trace-rejected", 7, 12>>
+<<"nabedra-trace-line", 7, "missing", "tmDecision">>
+@!@!@STARTMSG 2404:1 @!@!@
+Postcondition TraceAccepted at line 168, col 5 to line 177, col 17 of module NabedraTrace is false.
+@!@!@ENDMSG 2404 @!@!@
+@!@!@STARTMSG 2200:0 @!@!@
+Progress(8) at 2026-11-24 16:28:06: 8 states generated (370 s/min), 8 distinct states found (370 ds/min), 0 states left on queue.
+@!@!@ENDMSG 2200 @!@!@
+@!@!@STARTMSG 2199:0 @!@!@
+8 states generated, 8 distinct states found, 0 states left on queue.
+@!@!@ENDMSG 2199 @!@!@
+@!@!@STARTMSG 2194:0 @!@!@
+The depth of the complete state graph search is 8.
+@!@!@ENDMSG 2194 @!@!@
+@!@!@STARTMSG 2186:0 @!@!@
+Finished in 1296ms at (2026-11-24 16:28:06)
+@!@!@ENDMSG 2186 @!@!@

@@ -671,6 +671,68 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
     .expect("rf1 gateway watchdog");
 }
 
+/// The opt-in history rules tell a row conflict from the others by its message, so a reworded one
+/// would switch them off. Both paths answer with the texts that the checker knows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d03_o08_insert_conflict_texts_are_the_ones_the_history_checker_knows() {
+    use nabedra_check::checker::direct::{InsertConflict, ROW_CONFLICT, insert_conflict};
+
+    nabedra_rt::time::timeout(Duration::from_secs(120), async {
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "nabedra-conflict-texts-{}",
+            nabedra_rt::ids::uuid_v4()
+        )));
+        let runtime = open(&directory.0, true).await;
+        activated(&runtime).await;
+        let app = runtime.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
+        let row = |id: i64, value: i64| json!({"id": id, "value": value, "tag": "t"});
+        let insert = |id, key, value| {
+            let payload = json!({"table_id": table, "row": row(key, value)});
+            body(id, "table.insert", payload)
+        };
+        let batch = |keys: [i64; 2]| {
+            let rows = keys.map(|key| row(key, 1));
+            let payload = json!({"table_id": table, "rows": rows});
+            body(nabedra_rt::ids::uuid_v4(), "table.insert_many", payload)
+        };
+        let fresh = nabedra_rt::ids::uuid_v4;
+        let gateway = runtime.direct_gateway_handle().unwrap().clone();
+        // A body without a declared length takes the queued path.
+        for direct in [true, false] {
+            let first = if direct { 1 } else { 11 };
+            let used = fresh();
+            let (status, reply) = call(&app, insert(used, first, 1), direct).await;
+            assert_eq!(status, 200, "{reply}");
+            let before = gateway.stats();
+            for (request, expected) in [
+                (insert(fresh(), first, 2), InsertConflict::Row),
+                (batch([first, first + 1]), InsertConflict::Row),
+                (batch([first + 2, first + 2]), InsertConflict::Other),
+                (insert(used, first, 3), InsertConflict::Other),
+            ] {
+                let (status, reply) = call(&app, request, direct).await;
+                assert_eq!(status, 409, "direct {direct}: {reply}");
+                assert_eq!(reply["error"]["outcome"], "not_applied", "{reply}");
+                assert_eq!(
+                    insert_conflict(&reply),
+                    Some(expected),
+                    "direct {direct}: nabedra-check does not know this text: {reply}"
+                );
+                if expected == InsertConflict::Row {
+                    assert_eq!(reply["error"]["message"], ROW_CONFLICT);
+                }
+            }
+            let after = gateway.stats();
+            // Only the queued path settles the request at its anchor first.
+            assert_eq!(after.forwards > before.forwards, !direct, "{after:?}");
+        }
+        runtime.drain().await.unwrap();
+    })
+    .await
+    .expect("conflict text watchdog");
+}
+
 /// T7b items 2 and 4 on one worker over mTLS: the executor's Catalog reader
 /// (`DirectLeader`, remote over the worker's own session) reads the table's
 /// exclusive lifecycle guard with the new `ParticipantExclusive` method;

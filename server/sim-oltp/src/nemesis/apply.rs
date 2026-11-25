@@ -3,12 +3,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use nabedra_check::Gen;
+use nabedra_protocol::protocol::ErrorCode;
 use nabedra_rt::{
     fs::{Fault as FsFault, FaultError, FsOp},
+    sim::{SimEvent, World},
     time,
 };
 use nabedra_sim::{Nemesis, Profile, net::draw_partition};
@@ -16,14 +19,15 @@ use serde_json::json;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::{Action, FollowUp, NetFaults, Step, window};
+use super::{Action, FaultId, FollowUp, NetFaults, Rule, Step, WindowId, window};
 use crate::{
-    bootstrap::{GATEWAYS, ROOT, WORKERS},
+    bootstrap::{GATEWAYS, ROOT, WORKERS, initial_range},
     disk::DiskCut,
-    invariants::elapsed_ms,
+    invariants::{RECOVERY_LIMIT, STEP, elapsed_ms},
     node::Cluster,
+    operator::Split,
     workloads::{
-        clauses::Fault,
+        clauses::{Answer, Effect, Fault},
         clients::{self, Ctx},
     },
 };
@@ -35,52 +39,97 @@ const SPLIT_LIMIT: Duration = Duration::from_secs(60);
 /// Follow-ups that cannot run yet are tried again after this pause.
 const DEFER_MS: u64 = 500;
 const RESTART_TRIES: u32 = 4;
+/// Longest isolation of a leader that no other worker replaces. Voters keep a lease of the
+/// longest election timeout, so an election takes longer than the drawn window.
+const LEADER_MOVE_MS: u64 = 12_000;
 
-/// A requested split that has not published.
-struct PendingSplit {
-    id: Uuid,
-    boundary: i64,
-    next_ms: u64,
-    last: String,
-    /// The last answer was a definite refusal, so the split had not published.
-    refused: bool,
+/// A graceful stop that has not ended.
+struct Drain {
+    id: FaultId,
+    deadline: u64,
+    restart_after: Duration,
 }
 
-/// A split request that a full stop interrupted. Queued work is abandoned when every worker
-/// stops, so the next run must not execute it.
-struct AbandonedSplit {
-    id: Uuid,
-    boundary: i64,
-    /// Whether its last answer before the stop was a definite refusal.
-    refused: bool,
+/// When a sync of a worker's volume failed, as the filesystem reported it.
+#[derive(Clone, Default)]
+struct SyncFailures(Arc<Mutex<Vec<(u64, u64)>>>);
+
+impl SyncFailures {
+    /// Watch every volume of the world. A call is logged on any thread, where the virtual clock
+    /// can't be read, so a task reads the time within one step.
+    fn watch(world: &Arc<World>) -> (Self, JoinHandle<()>) {
+        let failed = Arc::new(Mutex::new(Vec::new()));
+        let seen = failed.clone();
+        world.observe(Arc::new(move |event| {
+            if let SimEvent::Fs { node, mount, call } = event
+                && !call.ok
+                && mount == &Path::new(ROOT)
+                && matches!(call.op, FsOp::SyncData | FsOp::SyncAll)
+            {
+                seen.lock().unwrap().push(*node);
+            }
+        }));
+        let failures = Self::default();
+        let log = failures.clone();
+        let world = Arc::downgrade(world);
+        let task = nabedra_rt::task::spawn(async move {
+            loop {
+                time::sleep(STEP).await;
+                let Some(world) = world.upgrade() else { return };
+                let at = elapsed_ms(&world);
+                let nodes = std::mem::take(&mut *failed.lock().unwrap());
+                let mut log = log.0.lock().unwrap();
+                log.extend(nodes.into_iter().map(|node| (node, at)));
+            }
+        });
+        (failures, task)
+    }
+
+    fn first(&self, node: u64, from: u64) -> Option<u64> {
+        let failures = self.0.lock().unwrap();
+        let mut failures = failures.iter();
+        failures
+            .find(|(failed, at)| *failed == node && *at >= from)
+            .map(|(_, at)| *at)
+    }
 }
 
 /// The nemesis of one run and what it did.
 pub(crate) struct Chaos {
     scheduler: Nemesis<Step>,
     faults: NetFaults,
-    /// Actions applied, by name, with how often.
-    pub executed: BTreeMap<Action, u32>,
     pub skipped: BTreeMap<Action, u32>,
-    /// Every applied fault window, for the scenario clauses.
+    /// Every planned fault, with what happened.
     pub log: Vec<Fault>,
-    split: Option<PendingSplit>,
-    abandoned: Vec<AbandonedSplit>,
-    split_requested: bool,
+    split: Option<(FaultId, Split)>,
     cold_done: bool,
     /// The heal needed a full cold start.
     pub heal_cold: bool,
-    links_blocked: bool,
+    /// The partition or leader isolation that is in force.
+    links: Option<FaultId>,
+    /// The freeze that holds each frozen worker.
+    freezes: BTreeMap<u64, FaultId>,
+    windows: BTreeMap<FaultId, WindowId>,
     restart_failures: BTreeMap<u64, u32>,
     certificates: BTreeSet<u64>,
-    disks: BTreeSet<u64>,
-    disk_armed: BTreeMap<u64, (FsOp, u64)>,
+    /// Workers with an armed disk error.
+    disks: BTreeMap<u64, FaultId>,
+    drains: BTreeMap<u64, Drain>,
+    syncs: SyncFailures,
+    watcher: JoinHandle<()>,
     beyond_tcp: bool,
-    bursts: Vec<JoinHandle<()>>,
+    bursts: Vec<(FaultId, JoinHandle<()>)>,
+}
+
+impl Drop for Chaos {
+    fn drop(&mut self) {
+        self.watcher.abort();
+    }
 }
 
 impl Chaos {
     pub(crate) fn new(
+        world: &Arc<World>,
         profile: Profile<Action>,
         faults: NetFaults,
         start_ms: u64,
@@ -90,22 +139,24 @@ impl Chaos {
         for (action, weight) in profile.actions() {
             steps = steps.with(Step::Act(*action), weight);
         }
+        let (syncs, watcher) = SyncFailures::watch(world);
         Self {
             scheduler: Nemesis::new(steps, start_ms, g),
             faults,
-            executed: BTreeMap::new(),
             skipped: BTreeMap::new(),
             log: Vec::new(),
             split: None,
-            abandoned: Vec::new(),
-            split_requested: false,
             cold_done: false,
             heal_cold: false,
-            links_blocked: false,
+            links: None,
+            freezes: BTreeMap::new(),
+            windows: BTreeMap::new(),
             restart_failures: BTreeMap::new(),
             certificates: BTreeSet::new(),
-            disks: BTreeSet::new(),
-            disk_armed: BTreeMap::new(),
+            disks: BTreeMap::new(),
+            drains: BTreeMap::new(),
+            syncs,
+            watcher,
             beyond_tcp: false,
             bursts: Vec::new(),
         }
@@ -115,48 +166,219 @@ impl Chaos {
         self.scheduler.profile().name
     }
 
+    /// How often each action was applied, or happened.
+    pub(crate) fn counts(&self, happened: bool) -> BTreeMap<&'static str, u32> {
+        let mut counts = BTreeMap::new();
+        for fault in self.log.iter().filter(|f| !happened || f.happened()) {
+            *counts.entry(fault.action.name()).or_default() += 1;
+        }
+        counts
+    }
+
+    /// Windows that a blocked loop held for longer than planned: how many, and the longest
+    /// excess in ms. Process faults end when the process is ready again, so they have none.
+    pub(crate) fn overran(&self) -> [u64; 2] {
+        let windows = self.log.iter().filter(|fault| {
+            !matches!(
+                fault.action,
+                Action::CrashLeader
+                    | Action::PowerLeader
+                    | Action::DrainLeader
+                    | Action::DiskError
+                    | Action::KillGateway
+            )
+        });
+        let late = windows.filter_map(|fault| fault.to?.checked_sub(fault.until?));
+        let late: Vec<u64> = late.filter(|late| *late > DEFER_MS).collect();
+        [late.len() as u64, late.into_iter().max().unwrap_or(0)]
+    }
+
+    /// The faults aimed at the Data leader: how many happened, and how many hit it.
+    pub(crate) fn aimed(&self) -> BTreeMap<&'static str, [u32; 2]> {
+        let mut aimed: BTreeMap<_, [u32; 2]> = BTreeMap::new();
+        for fault in self.log.iter().filter(|fault| fault.happened()) {
+            if let Some(hit) = fault.leader {
+                let row = aimed.entry(fault.action.name()).or_default();
+                row[0] += 1;
+                row[1] += u32::from(hit);
+            }
+        }
+        aimed
+    }
+
     /// Apply the steps that are due.
     pub(crate) async fn tick(&mut self, cluster: &mut Cluster, ctx: &Ctx, g: &mut Gen) {
         let now = elapsed_ms(&cluster.world);
         for step in self.scheduler.poll(now, g) {
             match step {
                 Step::Act(action) => self.act(cluster, ctx, g, action).await,
-                Step::Follow(follow) => self.follow(cluster, follow, false).await,
+                Step::Follow(follow) => self.follow(cluster, ctx, follow, false).await,
             }
         }
-        self.reap_bursts(cluster);
-        self.try_split(cluster, ctx).await;
+        self.drained(cluster, ctx).await;
+        self.observe(cluster, ctx);
     }
 
-    /// Start a fault window in the log.
-    fn open(&mut self, cluster: &Cluster, action: Action, nodes: &[u64]) -> &mut Fault {
+    /// End the graceful stops that are over. The loop does not wait for one, because no other
+    /// fault could end meanwhile: move seed 128's 4 s partition lasted the 30 s of a drain.
+    async fn drained(&mut self, cluster: &mut Cluster, ctx: &Ctx) {
+        for node in self.drains.keys().copied().collect::<Vec<_>>() {
+            let drained = match cluster.drained(node).await {
+                Some(result) => result,
+                None if elapsed_ms(&cluster.world) >= self.drains[&node].deadline => {
+                    Err(format!("n{node} drain deadline"))
+                }
+                None => continue,
+            };
+            let Drain {
+                id, restart_after, ..
+            } = self.drains.remove(&node).expect("pending drain");
+            self.cut(cluster, node, DiskCut::Kill).await;
+            if let Err(error) = &drained {
+                cluster.checks.violate(
+                    &cluster.world,
+                    "ProcessExit",
+                    format!("drain of n{node}: {error}"),
+                );
+            }
+            self.note(
+                cluster,
+                ctx,
+                "drained",
+                json!({"worker": node, "drained": drained.err()}),
+            );
+            let follow = FollowUp::RestartWorker(node, false, id);
+            self.later(cluster, restart_after, follow);
+        }
+    }
+
+    /// Note what open faults did, and end the ones that ended by themselves.
+    fn observe(&mut self, cluster: &mut Cluster, ctx: &Ctx) {
+        for id in 0..self.log.len() {
+            if self.log[id].to.is_none() && self.log[id].action == Action::SessionDrop {
+                self.collect(cluster, id);
+                // It drops one session.
+                self.log[id].to = self.log[id].effects.first().map(|effect| effect.at);
+            }
+        }
+        let (done, open): (Vec<_>, Vec<_>) = std::mem::take(&mut self.bursts)
+            .into_iter()
+            .partition(|(_, burst)| burst.is_finished());
+        self.bursts = open;
+        for (id, _) in done {
+            self.burst_done(cluster, ctx, id);
+        }
+        self.split_published(cluster);
+    }
+
+    /// A burst that nothing answered with overload did not exhaust a lane.
+    fn burst_done(&mut self, cluster: &Cluster, ctx: &Ctx, id: FaultId) {
+        let from = self.log[id].from;
+        let refused = {
+            let observed = ctx.observed.lock().unwrap();
+            let mut attempts = observed.attempts.iter();
+            attempts
+                .find(|a| a.invoked >= from && a.answer == Answer::Refused(ErrorCode::Overloaded))
+                .map(|attempt| attempt.completed)
+        };
+        self.log[id].effects.extend(refused.map(Effect::at));
+        self.close(cluster, id);
+    }
+
+    /// Start a fault in the log.
+    fn open(&mut self, cluster: &Cluster, action: Action, nodes: &[u64]) -> FaultId {
         self.log.push(Fault {
             action,
             nodes: nodes.to_vec(),
             from: elapsed_ms(&cluster.world),
             to: None,
+            until: None,
             quiet: false,
-            variant: "",
-            observed: false,
+            effects: Vec::new(),
+            leader: None,
+            isolated: None,
         });
-        self.log.last_mut().expect("pushed fault")
+        self.log.len() - 1
     }
 
-    /// End the open window of one of `actions` on `node`, or on any node.
-    fn close(
-        &mut self,
-        cluster: &Cluster,
-        actions: &[Action],
-        node: Option<u64>,
-    ) -> Option<&mut Fault> {
+    /// The fault took effect now.
+    fn effect(&mut self, cluster: &Cluster, id: FaultId) {
+        self.log[id]
+            .effects
+            .push(Effect::at(elapsed_ms(&cluster.world)));
+    }
+
+    /// Start a fault that takes effect at once.
+    fn hit(&mut self, cluster: &Cluster, action: Action, nodes: &[u64]) -> FaultId {
+        let id = self.open(cluster, action, nodes);
+        self.effect(cluster, id);
+        id
+    }
+
+    /// Start a fault whose effect is on the frames of a window.
+    fn frames(&mut self, cluster: &Cluster, action: Action, nodes: &[u64], rule: Rule) -> FaultId {
+        let id = self.open(cluster, action, nodes);
+        self.windows.insert(id, self.faults.start(rule));
+        id
+    }
+
+    /// Read what the fault's window did.
+    fn collect(&mut self, cluster: &Cluster, id: FaultId) {
+        if let Some(window) = self.windows.get(&id) {
+            let seen = self.faults.effect(*window);
+            let resets = seen.resets.into_iter().map(|reset| Effect {
+                at: reset.at,
+                ends: [reset.from, reset.to],
+                unanswered: reset.unanswered,
+            });
+            self.log[id].effects = resets.chain(seen.first.map(Effect::at)).collect();
+        }
+        let fault = &mut self.log[id];
+        match fault.action {
+            Action::LeaderMove => {
+                let mut elections = cluster.elections().into_iter();
+                let moved =
+                    elections.find(|(at, node)| *at >= fault.from && fault.nodes != [*node]);
+                fault.effects = moved.map(|(at, _)| Effect::at(at)).into_iter().collect();
+            }
+            Action::DiskError => {
+                let failed = self.syncs.first(fault.nodes[0], fault.from);
+                fault.effects = failed.map(Effect::at).into_iter().collect();
+            }
+            _ => {}
+        }
+    }
+
+    /// End a fault, once, with what it did.
+    fn close(&mut self, cluster: &Cluster, id: FaultId) {
+        if self.log[id].to.is_some() {
+            return;
+        }
+        self.collect(cluster, id);
+        if let Some(window) = self.windows.get(&id) {
+            self.faults.end(*window);
+        }
+        let timed = self.windows.contains_key(&id) || self.log[id].action == Action::AuthFlap;
+        let fault = &mut self.log[id];
         let now = elapsed_ms(&cluster.world);
-        let fault = self.log.iter_mut().rev().find(|fault| {
-            fault.to.is_none()
-                && actions.contains(&fault.action)
-                && node.is_none_or(|node| fault.nodes.contains(&node))
-        })?;
-        fault.to = Some(now);
-        Some(fault)
+        fault.to = Some(fault.until.filter(|_| timed).map_or(now, |at| at.min(now)));
+        if !fault.happened() {
+            cluster.record(format!(
+                "nemesis {} from {}ms did not happen",
+                fault.action, fault.from
+            ));
+        }
+    }
+
+    /// Stop a worker that is not frozen any more afterwards.
+    async fn cut(&mut self, cluster: &mut Cluster, node: u64, how: DiskCut) {
+        cluster.crash(node, how).await;
+        if let Some(id) = self.freezes.remove(&node)
+            && !self.freezes.values().any(|held| *held == id)
+        {
+            // The kill ended the freeze.
+            self.close(cluster, id);
+        }
     }
 
     /// Nothing else is open, a pending split included, and the cluster reports itself
@@ -167,87 +389,44 @@ impl Chaos {
             && cluster.converged().await
     }
 
-    fn reap_bursts(&mut self, cluster: &Cluster) {
-        if self.bursts.iter().all(JoinHandle::is_finished) && !self.bursts.is_empty() {
-            self.bursts.clear();
-            while self.close(cluster, &[Action::LaneExhaust], None).is_some() {}
-        }
-    }
-
-    /// One attempt at the pending split. The attempts interleave with the other faults.
-    async fn try_split(&mut self, cluster: &Cluster, ctx: &Ctx) -> bool {
-        let Some(split) = self.split.as_mut() else {
-            return true;
+    /// The split's fault ends when it publishes.
+    fn split_published(&mut self, cluster: &mut Cluster) {
+        let Some((id, split)) = &self.split else {
+            return;
         };
-        let now = elapsed_ms(&cluster.world);
-        if now < split.next_ms {
-            return false;
-        }
-        split.next_ms = now + 250;
-        let table = Uuid::parse_str(&ctx.table).expect("table UUID");
-        match cluster.split(split.id, table, split.boundary).await {
-            Ok(published) => {
-                self.split = None;
-                if let Some(fault) = self.close(cluster, &[Action::Split], None) {
-                    fault.observed = true;
-                }
-                cluster.record(format!("nemesis split published {published}"));
-                true
-            }
-            Err(error) => {
-                if split.last != error {
-                    cluster.record(format!("nemesis split pending: {error}"));
-                }
-                split.refused = error.contains("Conflict");
-                split.last = error;
-                false
+        let id = *id;
+        if self.log[id].to.is_none()
+            && let Some((at, _, result)) = split.published()
+        {
+            self.log[id].effects = vec![Effect::at(at)];
+            self.log[id].to = Some(at);
+            let group = result.pointer("/children/0/group_id");
+            let group = group.and_then(|id| Uuid::parse_str(id.as_str()?).ok());
+            if let Some(group) = group {
+                cluster.watch_range(group);
             }
         }
     }
 
     /// Ask for the pending split once more, immediately before every worker stops.
-    pub(crate) async fn before_full_stop(&mut self, cluster: &Cluster, ctx: &Ctx) {
-        if let Some(split) = self.split.as_mut() {
-            split.next_ms = 0;
-            self.try_split(cluster, ctx).await;
+    pub(crate) async fn before_full_stop(&mut self, cluster: &mut Cluster) {
+        if let Some((_, split)) = &mut self.split {
+            split.pause().await;
         }
+        self.split_published(cluster);
     }
 
     /// The stop abandoned the pending split. Request it again under a new ID.
-    pub(crate) async fn after_full_stop(&mut self, cluster: &Cluster) {
-        let Some(split) = self.split.as_mut() else {
-            return;
-        };
-        let id = cluster.split_id().await;
-        cluster.record(format!(
-            "nemesis split {} abandoned by a full stop (refused before it: {}), requested again as {id}",
-            split.id, split.refused
-        ));
-        self.abandoned.push(AbandonedSplit {
-            id: std::mem::replace(&mut split.id, id),
-            boundary: split.boundary,
-            refused: split.refused,
-        });
-        split.refused = false;
-        split.next_ms = 0;
+    pub(crate) async fn after_full_stop(&mut self) {
+        if let Some((_, split)) = &mut self.split {
+            split.resume().await;
+        }
     }
 
     /// A split that a full stop abandoned must not have published in the next run.
-    pub(crate) async fn check_abandoned(&self, cluster: &Cluster, ctx: &Ctx) {
-        let table = Uuid::parse_str(&ctx.table).expect("table UUID");
-        for split in &self.abandoned {
-            let answer = cluster.split(split.id, table, split.boundary).await;
-            cluster.record(format!("abandoned split {} answers {answer:?}", split.id));
-            if split.refused && answer.is_ok() {
-                cluster.checks.violate(
-                    &cluster.world,
-                    "AbandonedSplitReplayed",
-                    format!(
-                        "split {} was refused before a full stop and published after it: {answer:?}",
-                        split.id
-                    ),
-                );
-            }
+    pub(crate) async fn check_abandoned(&self) {
+        if let Some((_, split)) = &self.split {
+            split.check_abandoned().await;
         }
     }
 
@@ -266,12 +445,34 @@ impl Chaos {
 
     fn later(&mut self, cluster: &Cluster, after: Duration, follow: FollowUp) {
         let at = elapsed_ms(&cluster.world) + u64::try_from(after.as_millis()).unwrap_or(u64::MAX);
+        let id = follow.fault();
+        self.log[id].until = Some(at);
+        // The loop may wait for a restart at that time, so these windows end by themselves.
+        match &follow {
+            FollowUp::ClearNet(id) => {
+                let (faults, window) = (self.faults.clone(), self.windows[id]);
+                nabedra_rt::task::spawn(async move {
+                    time::sleep(after).await;
+                    faults.end(window);
+                });
+            }
+            FollowUp::RestoreCertificate(gateway, _) => {
+                let (world, gateway) = (Arc::downgrade(&cluster.world), *gateway);
+                nabedra_rt::task::spawn(async move {
+                    time::sleep(after).await;
+                    if let Some(world) = world.upgrade() {
+                        world.override_certificate(gateway, None);
+                    }
+                });
+            }
+            _ => {}
+        }
         self.scheduler.after(at, Step::Follow(follow));
     }
 
     /// The Data leader, or a worker drawn from the tape when no leader is known.
-    async fn leader_or_any(&self, cluster: &mut Cluster, g: &mut Gen) -> Option<u64> {
-        if let Some(leader) = cluster.leader().await {
+    fn leader_or_any(&self, cluster: &Cluster, g: &mut Gen) -> Option<u64> {
+        if let Some(leader) = cluster.leader() {
             return Some(leader);
         }
         let candidates: Vec<u64> = WORKERS
@@ -292,12 +493,12 @@ impl Chaos {
         );
         // The same-run restart needs two live voters, and an armed disk stops its worker.
         let down = WORKERS.into_iter().any(|node| !cluster.is_running(node));
-        if process && (down || !self.disks.is_empty()) {
+        if process && (down || !self.disks.is_empty() || !self.drains.is_empty()) {
             return self.skip(cluster, action, "a worker is already down");
         }
         // A cold start blocks this loop, so no open window could end while it runs.
         if action == Action::Cold
-            && (self.links_blocked || !cluster.frozen().is_empty() || self.faults.open())
+            && (self.links.is_some() || !cluster.frozen().is_empty() || self.faults.open())
         {
             return self.skip(cluster, action, "a fault window is open");
         }
@@ -314,7 +515,8 @@ impl Chaos {
                 } else {
                     cluster.world.jump_wall_forward(node, by);
                 }
-                self.open(cluster, action, &[node]).to = Some(elapsed_ms(&cluster.world));
+                let id = self.hit(cluster, action, &[node]);
+                self.close(cluster, id);
                 self.note(
                     cluster,
                     ctx,
@@ -326,7 +528,7 @@ impl Chaos {
                 if !cluster.frozen().is_empty() {
                     return self.skip(cluster, action, "a worker is already frozen");
                 }
-                let Some(leader) = self.leader_or_any(cluster, g).await else {
+                let Some(leader) = self.leader_or_any(cluster, g) else {
                     return self.skip(cluster, action, "no running worker");
                 };
                 let mut followers: Vec<u64> = WORKERS
@@ -340,18 +542,22 @@ impl Chaos {
                 // One, then two (D05): the first follower is frozen alone for a while.
                 let first = followers.remove(g.below(followers.len() as u64) as usize);
                 cluster.freeze(first);
-                let fault = self.open(cluster, Action::FreezeFollower, &[first]);
-                fault.quiet = quiet;
+                let mut id = self.hit(cluster, Action::FreezeFollower, &[first]);
+                self.log[id].quiet = quiet;
+                self.log[id].leader = Some(cluster.elected() == Some(first));
                 let mut frozen = vec![first];
                 if action == Action::FreezeTwo
                     && let Some(second) = followers.pop()
                 {
                     time::sleep(window(g, 200, 2_000)).await;
-                    self.close(cluster, &[Action::FreezeFollower], Some(first));
+                    self.close(cluster, id);
                     cluster.freeze(second);
                     frozen.push(second);
-                    self.open(cluster, action, &frozen);
+                    id = self.hit(cluster, action, &frozen);
+                    let leader = cluster.elected();
+                    self.log[id].leader = Some(leader.is_some_and(|node| frozen.contains(&node)));
                 }
+                self.freezes.extend(frozen.iter().map(|node| (*node, id)));
                 let duration = window(g, 500, 4_000);
                 self.note(
                     cluster,
@@ -359,17 +565,17 @@ impl Chaos {
                     action.name(),
                     json!({"nodes": frozen, "leader": leader, "ms": duration.as_millis() as u64}),
                 );
-                self.later(cluster, duration, FollowUp::Thaw(frozen));
+                self.later(cluster, duration, FollowUp::Thaw(id));
             }
             Action::Partition => {
-                if self.links_blocked {
+                if self.links.is_some() {
                     return self.skip(cluster, action, "links already blocked");
                 }
                 let sides = draw_partition(g, &WORKERS);
                 cluster.net().update_plan(|plan| plan.partition(&sides));
-                self.links_blocked = true;
                 let nodes: Vec<u64> = sides.iter().flatten().copied().collect();
-                self.open(cluster, action, &nodes);
+                let id = self.hit(cluster, action, &nodes);
+                self.links = Some(id);
                 let duration = window(g, 500, 5_000);
                 self.note(
                     cluster,
@@ -377,13 +583,13 @@ impl Chaos {
                     "partition",
                     json!({"sides": sides, "ms": duration.as_millis() as u64}),
                 );
-                self.later(cluster, duration, FollowUp::HealLinks);
+                self.later(cluster, duration, FollowUp::HealLinks(id));
             }
             Action::LeaderMove => {
-                if self.links_blocked {
+                if self.links.is_some() {
                     return self.skip(cluster, action, "links already blocked");
                 }
-                let Some(leader) = cluster.leader().await else {
+                let Some(leader) = cluster.leader() else {
                     return self.skip(cluster, action, "no known leader");
                 };
                 cluster.net().update_plan(|plan| {
@@ -392,8 +598,8 @@ impl Chaos {
                         plan.block(other, leader);
                     }
                 });
-                self.links_blocked = true;
-                self.open(cluster, action, &[leader]);
+                let id = self.open(cluster, action, &[leader]);
+                self.links = Some(id);
                 let duration = window(g, 1_500, 4_000);
                 self.note(
                     cluster,
@@ -401,12 +607,11 @@ impl Chaos {
                     "leader-move",
                     json!({"leader": leader, "ms": duration.as_millis() as u64}),
                 );
-                self.later(cluster, duration, FollowUp::HealLinks);
+                self.later(cluster, duration, FollowUp::HealLinks(id));
             }
             Action::SessionDrop => {
                 let frames = 1 + g.below(200);
-                self.faults.drop_session_after(frames);
-                self.open(cluster, action, &[]).to = Some(elapsed_ms(&cluster.world));
+                self.frames(cluster, action, &[], Rule::SessionDrop { left: frames });
                 self.note(
                     cluster,
                     ctx,
@@ -415,37 +620,38 @@ impl Chaos {
                 );
             }
             Action::LostReply => {
-                let Some(leader) = self.leader_or_any(cluster, g).await else {
+                let Some(leader) = self.leader_or_any(cluster, g) else {
                     return self.skip(cluster, action, "no running worker");
                 };
                 let per_mille = *g.pick(&[100, 300, 1_000]);
-                self.faults.lose_replies(leader, per_mille);
-                self.open(cluster, action, &[leader]);
+                let worker = leader;
+                let rule = Rule::ReplyReset { worker, per_mille };
+                let id = self.frames(cluster, action, &[leader], rule);
                 let duration = window(g, 200, 2_000);
                 self.note(cluster, ctx, "lost-reply", json!({"worker": leader, "per_mille": per_mille, "ms": duration.as_millis() as u64}));
-                self.later(cluster, duration, FollowUp::ClearNet(action));
+                self.later(cluster, duration, FollowUp::ClearNet(id));
             }
             Action::LostHttpReply => {
                 let gateway = *g.pick(&GATEWAYS);
                 let per_mille = *g.pick(&[100, 300, 1_000]);
-                self.faults.lose_http_replies(gateway, per_mille);
-                self.open(cluster, action, &[gateway]);
+                let rule = Rule::HttpReset { gateway, per_mille };
+                let id = self.frames(cluster, action, &[gateway], rule);
                 let duration = window(g, 200, 2_000);
                 self.note(cluster, ctx, "lost-http-reply", json!({"gateway": gateway, "per_mille": per_mille, "ms": duration.as_millis() as u64}));
-                self.later(cluster, duration, FollowUp::ClearNet(action));
+                self.later(cluster, duration, FollowUp::ClearNet(id));
             }
             Action::DeadlineEdge => {
-                let Some(leader) = self.leader_or_any(cluster, g).await else {
+                let Some(leader) = self.leader_or_any(cluster, g) else {
                     return self.skip(cluster, action, "no running worker");
                 };
                 let deadline = ctx.timeout.saturating_sub(Duration::from_secs(1));
                 let percent = 40 + g.below(56);
                 let delay = deadline * u32::try_from(percent).unwrap() / 200;
-                self.faults.delay(leader, delay);
-                self.open(cluster, action, &[leader]);
+                let (worker, by) = (leader, delay);
+                let id = self.frames(cluster, action, &[leader], Rule::Delay { worker, by });
                 let duration = window(g, 500, 3_000);
                 self.note(cluster, ctx, "deadline-edge", json!({"worker": leader, "delay_ms": delay.as_millis() as u64, "ms": duration.as_millis() as u64}));
-                self.later(cluster, duration, FollowUp::ClearNet(action));
+                self.later(cluster, duration, FollowUp::ClearNet(id));
             }
             Action::AuthFlap => {
                 let gateway = *g.pick(&GATEWAYS);
@@ -459,6 +665,7 @@ impl Chaos {
                 cluster.world.override_certificate(gateway, Some(stale));
                 // Existing sessions keep their handshake; reset them so the next dial
                 // presents the stale certificate.
+                let id = self.open(cluster, action, &[gateway]);
                 for connection in cluster.world.connections() {
                     if connection.client == Some(gateway)
                         && connection
@@ -466,10 +673,10 @@ impl Chaos {
                             .is_some_and(|node| WORKERS.contains(&node))
                     {
                         cluster.world.reset_connection(connection.id);
+                        self.effect(cluster, id);
                     }
                 }
                 self.certificates.insert(gateway);
-                self.open(cluster, action, &[gateway]);
                 let duration = window(g, 500, 4_000);
                 self.note(
                     cluster,
@@ -477,14 +684,15 @@ impl Chaos {
                     "auth-flap",
                     json!({"gateway": gateway, "ms": duration.as_millis() as u64}),
                 );
-                self.later(cluster, duration, FollowUp::RestoreCertificate(gateway));
+                let follow = FollowUp::RestoreCertificate(gateway, id);
+                self.later(cluster, duration, follow);
             }
             Action::KillGateway => {
                 let gateway = *g.pick(&GATEWAYS);
                 if !cluster.is_running(gateway) {
                     return self.skip(cluster, action, "the gateway is already down");
                 }
-                self.open(cluster, action, &[gateway]);
+                let id = self.hit(cluster, action, &[gateway]);
                 cluster.kill_gateway(gateway).await;
                 let duration = window(g, 300, 3_000);
                 self.note(
@@ -493,10 +701,10 @@ impl Chaos {
                     "kill-gateway",
                     json!({"gateway": gateway, "restart_after_ms": duration.as_millis() as u64}),
                 );
-                self.later(cluster, duration, FollowUp::RestartGateway(gateway));
+                self.later(cluster, duration, FollowUp::RestartGateway(gateway, id));
             }
             Action::CrashLeader | Action::PowerLeader => {
-                let Some(leader) = self.leader_or_any(cluster, g).await else {
+                let Some(leader) = self.leader_or_any(cluster, g) else {
                     return self.skip(cluster, action, "no running worker");
                 };
                 let power = action == Action::PowerLeader;
@@ -508,66 +716,78 @@ impl Chaos {
                 // Before quorum: writes sent while both followers are frozen cannot have
                 // committed when the leader dies. Lost replies: the leader's answers are
                 // cut first, so writes it committed are still unknown to their clients.
+                let mut isolated = None;
+                let mut lost = None;
                 match variant {
                     "before-quorum" => {
                         for &node in &followers {
                             cluster.freeze(node);
                         }
+                        isolated = Some(elapsed_ms(&cluster.world));
                         time::sleep(window(g, 100, 500)).await;
                     }
                     "lost-replies" => {
-                        self.faults.lose_replies(leader, 1_000);
+                        let (worker, per_mille) = (leader, 1_000);
+                        lost = Some(self.faults.start(Rule::ReplyReset { worker, per_mille }));
                         time::sleep(window(g, 50, 300)).await;
                     }
                     _ => {}
                 }
-                self.open(cluster, action, &[leader]).variant = variant;
-                cluster
-                    .crash(leader, if power { DiskCut::Power } else { DiskCut::Kill })
-                    .await;
-                match variant {
-                    "before-quorum" => {
-                        for &node in &followers {
-                            cluster.thaw(node);
-                        }
+                let id = self.hit(cluster, action, &[leader]);
+                self.log[id].leader = Some(cluster.elected() == Some(leader));
+                self.log[id].isolated = isolated;
+                let how = if power { DiskCut::Power } else { DiskCut::Kill };
+                self.cut(cluster, leader, how).await;
+                if isolated.is_some() {
+                    for &node in &followers {
+                        cluster.thaw(node);
                     }
-                    "lost-replies" => self.faults.clear_kind(Action::LostReply),
-                    _ => {}
+                }
+                if let Some(window) = lost {
+                    self.faults.end(window);
                 }
                 let duration = window(g, 500, 5_000);
-                self.note(cluster, ctx, action.name(), json!({"worker": leader, "variant": variant, "restart_after_ms": duration.as_millis() as u64}));
-                self.later(cluster, duration, FollowUp::RestartWorker(leader, power));
+                self.note(cluster, ctx, action.name(), json!({"worker": leader, "elected": cluster.elected(), "variant": variant, "restart_after_ms": duration.as_millis() as u64}));
+                let follow = FollowUp::RestartWorker(leader, power, id);
+                self.later(cluster, duration, follow);
             }
             Action::DrainLeader => {
-                let Some(leader) = self.leader_or_any(cluster, g).await else {
+                let Some(leader) = self.leader_or_any(cluster, g) else {
                     return self.skip(cluster, action, "no running worker");
                 };
-                self.open(cluster, action, &[leader]);
-                let drained = cluster.drain(leader).await;
-                cluster.crash(leader, DiskCut::Kill).await;
-                if let Err(error) = &drained {
+                let id = self.hit(cluster, action, &[leader]);
+                self.log[id].leader = Some(cluster.elected() == Some(leader));
+                let restart_after = window(g, 300, 3_000);
+                if let Err(error) = cluster.start_drain(leader).await {
                     cluster.checks.violate(
                         &cluster.world,
                         "ProcessExit",
                         format!("drain of n{leader}: {error}"),
                     );
                 }
-                let duration = window(g, 300, 3_000);
-                self.note(cluster, ctx, "drain-leader", json!({"worker": leader, "drained": drained.as_ref().map_err(String::as_str).err(), "restart_after_ms": duration.as_millis() as u64}));
-                self.later(cluster, duration, FollowUp::RestartWorker(leader, false));
+                let deadline = elapsed_ms(&cluster.world) + RECOVERY_LIMIT.as_millis() as u64;
+                let drain = Drain {
+                    id,
+                    deadline,
+                    restart_after,
+                };
+                self.drains.insert(leader, drain);
+                self.note(
+                    cluster,
+                    ctx,
+                    "drain-leader",
+                    json!({"worker": leader, "elected": cluster.elected(), "restart_after_ms": restart_after.as_millis() as u64}),
+                );
             }
             Action::LaneExhaust => {
                 let gateway = g.below(2) as usize;
                 let count = 64 + g.below(193);
                 let quiet = self.quiet(cluster).await;
-                self.open(cluster, action, &[GATEWAYS[gateway]]).quiet = quiet;
+                let id = self.open(cluster, action, &[GATEWAYS[gateway]]);
+                self.log[id].quiet = quiet;
                 let first = 1 + g.below(ctx.keys as u64) as i64;
-                self.bursts.push(nabedra_rt::task::spawn(clients::burst(
-                    ctx.clone(),
-                    gateway,
-                    count,
-                    first,
-                )));
+                let burst = clients::burst(ctx.clone(), gateway, count, first);
+                self.bursts.push((id, nabedra_rt::task::spawn(burst)));
                 self.note(
                     cluster,
                     ctx,
@@ -576,26 +796,22 @@ impl Chaos {
                 );
             }
             Action::Split => {
-                if self.split_requested {
-                    return self.skip(cluster, action, "the range already split");
+                if self.split.is_some() {
+                    return self.skip(cluster, action, "a split was already requested");
                 }
-                self.split_requested = true;
                 let boundary = 2 + g.below(ctx.keys.max(2) as u64 - 1) as i64;
-                let id = cluster.split_id().await;
-                self.open(cluster, action, &[]);
+                let table = Uuid::parse_str(&ctx.table).expect("table UUID");
+                let source = initial_range(cluster.config.cluster_id, table);
+                let id = self.open(cluster, action, &[]);
+                let split = Split::start(cluster.operator(), source, boundary).await;
+                let plan = split.plans()[0].id;
                 self.note(
                     cluster,
                     ctx,
                     "split",
-                    json!({"boundary": boundary, "id": id}),
+                    json!({"boundary": boundary, "id": plan}),
                 );
-                self.split = Some(PendingSplit {
-                    id,
-                    boundary,
-                    next_ms: 0,
-                    last: String::new(),
-                    refused: false,
-                });
+                self.split = Some((id, split));
             }
             Action::DiskError => {
                 let node = *g.pick(&WORKERS);
@@ -604,14 +820,13 @@ impl Chaos {
                 let Some(image) = cluster.world.volume(node, Path::new(ROOT)) else {
                     return self.skip(cluster, action, "no mounted volume");
                 };
-                image.clear_calls();
                 image.inject(FsFault::on(op).nth(nth).error(FaultError::Eio));
-                self.disks.insert(node);
-                self.disk_armed.insert(node, (op, nth));
-                self.open(cluster, action, &[node]);
+                // It only happens if a sync fails (review 115, M7).
+                let id = self.open(cluster, action, &[node]);
+                self.disks.insert(node, id);
                 let duration = window(g, 500, 3_000);
                 self.note(cluster, ctx, "disk-error", json!({"worker": node, "op": format!("{op:?}"), "nth": nth, "recover_after_ms": duration.as_millis() as u64}));
-                self.later(cluster, duration, FollowUp::ClearDisk(node));
+                self.later(cluster, duration, FollowUp::ClearDisk(node, id));
             }
             Action::Cold => {
                 if self.cold_done {
@@ -622,8 +837,8 @@ impl Chaos {
                 let delays = [(); 3].map(|()| window(g, 0, 3_000));
                 self.note(cluster, ctx, "cold", json!({"power": power, "delays_ms": delays.map(|delay| delay.as_millis() as u64)}));
                 let cut = if power { DiskCut::Power } else { DiskCut::Kill };
-                self.before_full_stop(cluster, ctx).await;
-                self.open(cluster, action, &WORKERS);
+                self.before_full_stop(cluster).await;
+                let id = self.hit(cluster, action, &WORKERS);
                 if let Err(error) = cluster
                     .cold_start_staggered("cold action", cut, delays, COLD_LIMIT)
                     .await
@@ -634,12 +849,12 @@ impl Chaos {
                         format!("cold start: {error}"),
                     );
                 }
-                self.close(cluster, &[action], None);
-                self.after_full_stop(cluster).await;
+                self.close(cluster, id);
+                self.after_full_stop().await;
             }
             Action::FrameDrop => {
                 let per_mille = *g.pick(&[5, 20, 50]);
-                self.faults.frame_drop(per_mille);
+                let id = self.frames(cluster, action, &[], Rule::FrameDrop { per_mille });
                 self.beyond_tcp = true;
                 let duration = window(g, 200, 2_000);
                 self.note(
@@ -648,11 +863,13 @@ impl Chaos {
                     "frame-drop",
                     json!({"per_mille": per_mille, "ms": duration.as_millis() as u64}),
                 );
-                self.later(cluster, duration, FollowUp::ClearNet(action));
+                self.later(cluster, duration, FollowUp::ClearNet(id));
             }
             Action::BlackHole => {
                 let worker = *g.pick(&WORKERS);
-                self.faults.black_hole(worker);
+                let stream = None;
+                let rule = Rule::BlackHole { worker, stream };
+                let id = self.frames(cluster, action, &[worker], rule);
                 self.beyond_tcp = true;
                 let duration = window(g, 200, 2_000);
                 self.note(
@@ -661,11 +878,11 @@ impl Chaos {
                     "black-hole",
                     json!({"worker": worker, "ms": duration.as_millis() as u64}),
                 );
-                self.later(cluster, duration, FollowUp::ClearNet(action));
+                self.later(cluster, duration, FollowUp::ClearNet(id));
             }
             Action::Reorder => {
                 let max_ms = *g.pick(&[5, 30, 120]);
-                self.faults.reorder(max_ms);
+                let id = self.frames(cluster, action, &[], Rule::Reorder { max_ms });
                 self.beyond_tcp = true;
                 let duration = window(g, 200, 2_000);
                 self.note(
@@ -674,101 +891,113 @@ impl Chaos {
                     "reorder",
                     json!({"max_ms": max_ms, "ms": duration.as_millis() as u64}),
                 );
-                self.later(cluster, duration, FollowUp::ClearNet(action));
+                self.later(cluster, duration, FollowUp::ClearNet(id));
             }
         }
-        *self.executed.entry(action).or_default() += 1;
     }
 
-    async fn follow(&mut self, cluster: &mut Cluster, follow: FollowUp, healing: bool) {
+    async fn follow(&mut self, cluster: &mut Cluster, ctx: &Ctx, follow: FollowUp, healing: bool) {
         match follow {
-            FollowUp::Thaw(nodes) => {
-                for &node in &nodes {
+            FollowUp::Thaw(id) => {
+                // A worker that was killed meanwhile, and frozen again, stays frozen.
+                let held = self.freezes.iter().filter(|(_, held)| **held == id);
+                let nodes: Vec<u64> = held.map(|(node, _)| *node).collect();
+                for node in nodes {
+                    self.freezes.remove(&node);
                     cluster.thaw(node);
                 }
-                self.close(
-                    cluster,
-                    &[Action::FreezeFollower, Action::FreezeTwo],
-                    nodes.first().copied(),
-                );
+                self.close(cluster, id);
             }
-            FollowUp::HealLinks => {
+            FollowUp::HealLinks(id) => {
+                self.collect(cluster, id);
+                let fault = &self.log[id];
+                let now = elapsed_ms(&cluster.world);
+                if fault.action == Action::LeaderMove
+                    && !fault.happened()
+                    && !healing
+                    && now < fault.from + LEADER_MOVE_MS
+                {
+                    // Isolated until another one leads (D07).
+                    let at = now + STEP.as_millis() as u64 * 10;
+                    self.log[id].until = Some(at);
+                    self.scheduler
+                        .after(at, Step::Follow(FollowUp::HealLinks(id)));
+                    return;
+                }
                 cluster.net().update_plan(|plan| plan.heal_links());
-                self.links_blocked = false;
-                self.leader_moved(cluster).await;
-                self.close(cluster, &[Action::Partition, Action::LeaderMove], None);
+                self.links = None;
+                self.close(cluster, id);
                 cluster.record("nemesis heal links".into());
             }
-            FollowUp::RestoreCertificate(gateway) => {
+            FollowUp::RestoreCertificate(gateway, id) => {
                 cluster.world.override_certificate(gateway, None);
                 self.certificates.remove(&gateway);
-                self.close(cluster, &[Action::AuthFlap], Some(gateway));
+                self.close(cluster, id);
                 cluster.record(format!("nemesis restore certificate n{gateway}"));
             }
-            FollowUp::ClearNet(action) => {
-                self.faults.clear_kind(action);
-                self.close(cluster, &[action], None);
-            }
-            FollowUp::ClearDisk(node) => {
-                // O29: a pool that saw an ambiguous sync error reopens through storage
-                // recovery before it serves again, so the operator restarts the worker.
+            FollowUp::ClearNet(id) => self.close(cluster, id),
+            FollowUp::ClearDisk(node, id) => {
                 if let Some(image) = cluster.world.volume(node, Path::new(ROOT)) {
-                    self.count_fired(cluster, node, &image);
                     image.clear_faults();
                 }
                 self.disks.remove(&node);
+                self.collect(cluster, id);
+                let fired = self.log[id].effects.first().map(|effect| effect.at);
+                cluster.record(format!("nemesis disk-error n{node} fired {fired:?}"));
+                let Some(at) = fired else {
+                    // No sync failed, so the worker has nothing to recover from.
+                    return self.close(cluster, id);
+                };
+                let mut before = cluster.elections();
+                before.retain(|(elected, _)| *elected <= at);
+                self.log[id].leader =
+                    Some(before.last().is_some_and(|(_, leader)| *leader == node));
+                // O29: a pool that saw an ambiguous sync error reopens through storage
+                // recovery before it serves again, so the operator restarts the worker.
                 if cluster.world.is_up(node) {
-                    cluster.crash(node, DiskCut::Kill).await;
+                    self.cut(cluster, node, DiskCut::Kill).await;
                 }
-                Box::pin(self.follow(cluster, FollowUp::RestartWorker(node, false), healing)).await;
+                let restart = FollowUp::RestartWorker(node, false, id);
+                Box::pin(self.follow(cluster, ctx, restart, healing)).await;
             }
-            FollowUp::RestartGateway(gateway) => {
+            FollowUp::RestartGateway(gateway, id) => {
                 if cluster.is_running(gateway) {
+                    return self.close(cluster, id);
+                }
+                if !healing && (!cluster.frozen().is_empty() || self.links.is_some()) {
+                    // This loop cannot thaw a worker or heal a link while a start blocks it.
+                    let at = elapsed_ms(&cluster.world) + DEFER_MS;
+                    let again = FollowUp::RestartGateway(gateway, id);
+                    self.scheduler.after(at, Step::Follow(again));
                     return;
                 }
                 if let Err(error) = cluster.restart_gateway(gateway).await {
-                    self.retry(
-                        cluster,
-                        FollowUp::RestartGateway(gateway),
-                        gateway,
-                        healing,
-                        error,
-                    );
+                    let again = FollowUp::RestartGateway(gateway, id);
+                    self.retry(cluster, again, gateway, healing, error);
                 } else {
-                    self.close(cluster, &[Action::KillGateway], Some(gateway));
+                    self.close(cluster, id);
                 }
             }
-            FollowUp::RestartWorker(node, power) => {
+            FollowUp::RestartWorker(node, power, id) => {
                 if cluster.is_running(node) {
-                    return;
+                    return self.close(cluster, id);
                 }
                 if !healing
-                    && (!cluster.frozen().is_empty() || self.links_blocked || self.faults.open())
+                    && (!cluster.frozen().is_empty() || self.links.is_some() || self.faults.open())
                 {
                     // Retained restarts need the survivors' quorum, and this loop cannot
                     // end a fault window while a restart blocks it.
                     let at = elapsed_ms(&cluster.world) + DEFER_MS;
-                    self.scheduler
-                        .after(at, Step::Follow(FollowUp::RestartWorker(node, power)));
+                    let again = FollowUp::RestartWorker(node, power, id);
+                    self.scheduler.after(at, Step::Follow(again));
                     return;
                 }
                 let cut = if power { DiskCut::Power } else { DiskCut::Kill };
                 if let Err(error) = cluster.restart_worker(node, cut).await {
-                    self.retry(
-                        cluster,
-                        FollowUp::RestartWorker(node, false),
-                        node,
-                        healing,
-                        error,
-                    );
+                    let again = FollowUp::RestartWorker(node, false, id);
+                    self.retry(cluster, again, node, healing, error);
                 } else {
-                    let losses = [
-                        Action::CrashLeader,
-                        Action::PowerLeader,
-                        Action::DrainLeader,
-                    ];
-                    self.close(cluster, &losses, Some(node));
-                    self.close(cluster, &[Action::DiskError], Some(node));
+                    self.close(cluster, id);
                 }
             }
         }
@@ -802,6 +1031,10 @@ impl Chaos {
     /// Stop the nemesis, apply every pending follow-up, undo every open fault and restart
     /// whatever is down. The cluster is healthy afterwards unless a violation says why not.
     pub(crate) async fn heal(&mut self, cluster: &mut Cluster, ctx: &Ctx) -> Result<(), String> {
+        while !self.drains.is_empty() {
+            self.drained(cluster, ctx).await;
+            time::sleep(STEP).await;
+        }
         let pending = self.scheduler.stop();
         cluster.record(format!("nemesis heal with {} follow-ups", pending.len()));
         ctx.history.lock().unwrap().marker(
@@ -809,32 +1042,32 @@ impl Chaos {
             "heal",
             json!({"follow_ups": pending.len()}),
         );
-        self.leader_moved(cluster).await;
         let (restarts, others): (Vec<_>, Vec<_>) = pending.into_iter().partition(|step| {
             matches!(
                 step,
-                Step::Follow(FollowUp::RestartWorker(..) | FollowUp::RestartGateway(_))
+                Step::Follow(FollowUp::RestartWorker(..) | FollowUp::RestartGateway(..))
             )
         });
         for step in others {
             if let Step::Follow(follow) = step {
-                self.follow(cluster, follow, true).await;
+                self.follow(cluster, ctx, follow, true).await;
             }
         }
         for node in cluster.frozen().clone() {
             cluster.thaw(node);
         }
+        self.freezes.clear();
         cluster.net().update_plan(|plan| plan.heal_all());
-        self.links_blocked = false;
+        self.links = None;
+        // The windows of the faults, and a replica move's, end here. The split's fault does not.
+        for id in 0..self.log.len() {
+            if self.windows.contains_key(&id) {
+                self.close(cluster, id);
+            }
+        }
         self.faults.clear();
         for gateway in std::mem::take(&mut self.certificates) {
             cluster.world.override_certificate(gateway, None);
-        }
-        for node in std::mem::take(&mut self.disks) {
-            if let Some(image) = cluster.world.volume(node, Path::new(ROOT)) {
-                self.count_fired(cluster, node, &image);
-                image.clear_faults();
-            }
         }
         if self.beyond_tcp {
             // A stalled direction stays stalled until its session resets.
@@ -851,7 +1084,7 @@ impl Chaos {
         }
         for step in restarts {
             if let Step::Follow(follow) = step {
-                self.follow(cluster, follow, true).await;
+                self.follow(cluster, ctx, follow, true).await;
             }
         }
         let mut stuck = Vec::new();
@@ -878,7 +1111,7 @@ impl Chaos {
                 json!({"stuck": stuck}),
             );
             self.heal_cold = true;
-            self.before_full_stop(cluster, ctx).await;
+            self.before_full_stop(cluster).await;
             cluster
                 .cold_start_staggered(
                     "heal cold start",
@@ -888,7 +1121,7 @@ impl Chaos {
                 )
                 .await
                 .map_err(|error| format!("heal cold start after {stuck:?}: {error}"))?;
-            self.after_full_stop(cluster).await;
+            self.after_full_stop().await;
         }
         for gateway in GATEWAYS {
             if !cluster.is_running(gateway) {
@@ -898,78 +1131,61 @@ impl Chaos {
                     .map_err(|error| format!("heal restart n{gateway}: {error}"))?;
             }
         }
-        for burst in std::mem::take(&mut self.bursts) {
+        for (id, burst) in std::mem::take(&mut self.bursts) {
             let _ = burst.await;
+            self.burst_done(cluster, ctx, id);
         }
-        let now = elapsed_ms(&cluster.world);
-        for fault in self
-            .log
-            .iter_mut()
-            .filter(|fault| fault.action != Action::Split)
-        {
-            fault.to.get_or_insert(now);
+        for id in 0..self.log.len() {
+            if self.log[id].action != Action::Split {
+                self.close(cluster, id);
+            }
         }
         Ok(())
     }
 
-    /// A logged failure of the armed operation means the fault returned EIO.
-    fn count_fired(&mut self, cluster: &Cluster, node: u64, image: &nabedra_rt::fs::FaultFs) {
-        if let Some((op, _)) = self.disk_armed.remove(&node) {
-            let failed = image.calls().iter().any(|call| call.op == op && !call.ok);
-            cluster.record(format!("nemesis disk-error n{node} fired {failed}"));
-            let armed = self
-                .log
-                .iter_mut()
-                .rev()
-                .find(|fault| fault.action == Action::DiskError && fault.nodes == [node]);
-            if let Some(fault) = armed {
-                fault.observed |= failed;
-            }
-        }
-    }
-
-    /// Whether another worker served writes while a `leader-move` was open.
-    async fn leader_moved(&mut self, cluster: &mut Cluster) {
-        let open = self
-            .log
-            .iter()
-            .rposition(|fault| fault.action == Action::LeaderMove && fault.to.is_none());
-        if let Some(index) = open {
-            let now = cluster.leader().await;
-            let fault = &mut self.log[index];
-            fault.observed = now.is_some_and(|leader| fault.nodes != [leader]);
-        }
-    }
-
-    /// After the heal: a split that did not publish under chaos must publish now (D07).
-    pub(crate) async fn finish_split(&mut self, cluster: &Cluster, ctx: &Ctx) {
-        let deadline = cluster.world.elapsed() + SPLIT_LIMIT;
-        while !self.try_split(cluster, ctx).await {
-            if cluster.world.elapsed() >= deadline {
-                let last = self.split.as_ref().map(|split| split.last.clone());
-                cluster.checks.violate(
-                    &cluster.world,
-                    "Liveness",
-                    format!(
-                        "the split did not publish within {SPLIT_LIMIT:?} after the heal: {last:?}"
-                    ),
-                );
-                return;
-            }
+    /// After the heal: a split that did not publish under chaos must publish now (D07). The
+    /// operator may replace a refused plan. The bound runs from `from`, so a wait for something
+    /// else does not extend it.
+    pub(crate) async fn finish_split(&mut self, cluster: &mut Cluster, from: Duration) {
+        let deadline = from + SPLIT_LIMIT;
+        while self.split_pending() && cluster.world.elapsed() < deadline {
             time::sleep(Duration::from_millis(250)).await;
         }
+        if let Some((_, split)) = &mut self.split {
+            split.stop().await;
+        }
+        self.split_published(cluster);
+        if let Some((_, split)) = &self.split
+            && split.published().is_none()
+        {
+            cluster.checks.violate(
+                &cluster.world,
+                "Liveness",
+                format!(
+                    "the split did not publish within {SPLIT_LIMIT:?} after the heal: {}",
+                    split.summary()
+                ),
+            );
+        }
+    }
+
+    /// A split was requested in this run.
+    pub(crate) fn split_requested(&self) -> bool {
+        self.split.is_some()
     }
 
     /// A split was requested and has not published.
     pub(crate) fn split_pending(&self) -> bool {
-        self.split.is_some()
+        let split = self.split.as_ref();
+        split.is_some_and(|(_, split)| split.published().is_none())
+    }
+
+    pub(crate) fn split_summary(&self) -> serde_json::Value {
+        let split = self.split.as_ref();
+        split.map_or(serde_json::Value::Null, |(_, split)| split.summary())
     }
 
     pub(crate) fn resets(&self) -> u64 {
         self.faults.resets()
-    }
-
-    pub(crate) fn session_drops(&self) -> Vec<u64> {
-        self.faults.session_drops()
     }
 }

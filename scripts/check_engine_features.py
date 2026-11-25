@@ -15,6 +15,10 @@ EVENTS_MANIFEST = ROOT / 'server' / 'events' / 'Cargo.toml'
 FORBIDDEN_NATIVE = frozenset({'rocksdb', 'librocksdb-sys', 'bindgen', 'clang-sys',
                               'libz-sys', 'bzip2-sys', 'aws-lc-rs', 'aws-lc-sys',
                               'aws-lc-fips-sys', 'cmake'})
+# The phase 8 crate split. OLAP links the two shared crates; Cache links none of them.
+SHARED_SPLIT_CRATES = frozenset({'nabedra-protocol', 'nabedra-resources'})
+OLTP_SPLIT_CRATES = SHARED_SPLIT_CRATES | {'nabedra-oltp-types', 'nabedra-transport',
+                                           'nabedra-oltp-storage', 'nabedra-oltp-replication'}
 CASES = (
     ('default', 'olap', True, []),
     ('olap', 'olap', False, ['--no-default-features', '--features', 'olap']),
@@ -64,15 +68,29 @@ def assert_no_sim(name, tree):
         assert not package.startswith('nabedra-sim'), (name, package, 'simulation crate in a product graph')
         if package == 'nabedra-rt':
             runtime = True
+        # nabedra-rt, nabedra-kv and every crate of the phase 8 split forward `sim`.
+        if package.startswith('nabedra-'):
             assert 'sim' not in features, (name, package, 'sim enabled')
-        if package == 'nabedra-kv':
-            assert 'sim' not in features, (name, package, 'sim enabled')
+            assert 'sim-openraft' not in features, (name, package, 'sim-openraft enabled')
         if package == 'nabedra-resources':
             test_features = features & {'test-defaults', 'test-hooks'}
             assert not test_features, (name, package, 'test features enabled', sorted(test_features))
         if package == 'tokio':
             assert 'test-util' not in features, (name, package, 'test-util enabled')
     assert runtime, (name, 'nabedra-rt is not in the graph')
+
+
+def assert_split_crates(name, engine, s3, tree):
+    """Phase 8 crate split: each engine links exactly the split crates it needs."""
+    features = {}
+    for package, enabled in package_features(tree):
+        features.setdefault(package, set()).update(enabled)
+    linked = OLTP_SPLIT_CRATES & set(features)
+    expected = {'oltp': OLTP_SPLIT_CRATES, 'olap': SHARED_SPLIT_CRATES, 'cache': frozenset()}[engine]
+    assert linked == expected, (name, 'split crates', sorted(linked), 'expected', sorted(expected))
+    if engine == 'oltp':
+        backup_s3 = 's3' in features['nabedra-oltp-replication']
+        assert backup_s3 == s3, (name, 'nabedra-oltp-replication s3 feature', backup_s3)
 
 
 def assert_no_forbidden_native(name, packages):
@@ -149,6 +167,7 @@ def main():
     assert_no_test_hooks('olap-s3-image', image_tree)
     assert_no_sim('olap-s3-image', image_tree)
     assert_dependency_packages('olap-s3-image', 'olap', True, image_tree)
+    assert_split_crates('olap-s3-image', 'olap', True, image_tree)
     print('O02 olap-s3-image: dependency graph passed', flush=True)
     graphs = {'events': sorted(events)}
     versions = {}
@@ -157,6 +176,7 @@ def main():
         assert_no_test_hooks(name, result.stdout)
         assert_no_sim(name, result.stdout)
         graphs[name] = assert_dependency_packages(name, engine, s3, result.stdout)
+        assert_split_crates(name, engine, s3, result.stdout)
         print(f'O02 {name}: dependency graph passed', flush=True)
         if args.acceptance_evidence:
             versions[name] = installed_version(selection)
@@ -171,6 +191,13 @@ def main():
                 assert engine in result.stdout.split(), (name, result.stdout)
             print(result.stdout, end='')
             print(f'O02 {name}: {command} passed', flush=True)
+        if engine == 'oltp':
+            # The OLTP unit tests moved into the split crates' own test targets.
+            packages = [arg for crate in sorted(OLTP_SPLIT_CRATES) for arg in ('-p', crate)]
+            extra = ('--features', 'nabedra-oltp-replication/s3') if s3 else ()
+            result = cargo('test', packages, '--lib', *extra)
+            print(result.stdout, end='')
+            print(f'O02 {name}: split crate tests passed', flush=True)
     guards = check_compile_guards() if not args.dependencies_only else []
     if args.acceptance_evidence:
         commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()

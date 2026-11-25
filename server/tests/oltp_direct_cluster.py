@@ -54,8 +54,12 @@ free_port = harness_ports.pick_port
 
 
 class PortLost(AssertionError):
-    """A worker lost a port before binding it. Outside the first start this fails the
-    scenario as before."""
+    """A worker lost a port to a process outside the cluster before binding it. Outside
+    the first start this fails the scenario."""
+
+    def __init__(self, message, worker=None):
+        super().__init__(message)
+        self.worker = worker
 
 
 def log_since(path, offset, size=8192):
@@ -249,6 +253,10 @@ class Rf3Cluster:
             try:
                 return self._start()
             except PortLost as lost:
+                # Another worker that died for its own reason fails the start.
+                failure = self.exit_error([name for name in self.workers if name != lost.worker])
+                if failure is not None and not isinstance(failure, PortLost):
+                    raise failure from lost
                 if attempt == harness_ports.ATTEMPTS:
                     raise
                 print(f'direct cluster: {lost}; starting again with fresh ports', file=sys.stderr, flush=True)
@@ -361,18 +369,91 @@ class Rf3Cluster:
         else:
             command = [self.binary, 'worker', '--bootstrap', str(path)]
         self.workers[name] = Process(name, [*prefix, *command], env, self.root / f'{name}.log')
+        print(f'direct cluster: launched {name} (pid {self.workers[name].pid}), HTTP {config["bind"]}, '
+              f'node {config["node"]["bind"]}', file=sys.stderr, flush=True)
+
+    def label(self, name):
+        return f'{name} (pid {self.workers[name].pid})'
+
+    def output(self, name):
+        return log_since(self.root / f'{name}.log', self.log_offsets.get(name, 0))
+
+    def processes(self, name):
+        """The live processes of the cluster, without `name`'s."""
+        return [process.pid for other, process in [*self.workers.items(), *self.apis.items()]
+                if other != name and process.alive()]
+
+    def holder_names(self, pids):
+        trees = {other: harness_ports._process_tree(process.pid)
+                 for other, process in [*self.workers.items(), *self.apis.items()]}
+        return ', '.join(next((f'{other} (pid {pid})' for other, tree in trees.items() if pid in tree), f'pid {pid}')
+                         for pid in pids)
+
+    def cluster_holder(self, name):
+        """Which other worker has one of the worker's addresses, by its configuration or by its sockets."""
+        config = self.config[name]
+        for address in (config['bind'], config['node']['bind']):
+            for other, process in self.workers.items():
+                if other != name and address in (self.config[other]['bind'], self.config[other]['node']['bind']):
+                    return f'{self.label(other)} has the same address {address}'
+            state, pids = harness_ports.holder(*harness_ports.split_address(address), self.processes(name))
+            if state == 'cluster':
+                return f'{self.holder_names(pids)} has its address {address}'
+        return None
+
+    def start_error(self, name):
+        """The error of a worker that exited during startup: PortLost if a process outside the cluster has
+        one of its ports, so that the first start runs again with fresh ones. A registered worker cannot
+        simply be relaunched on another port once it has opened its store, and every peer names its node
+        port. Any other exit fails, also when another worker of the cluster has the port: picks are
+        distinct, so that is a wrong configuration or a product fault."""
+        output = self.output(name)
+        config = self.config[name]
+        exited = f'{self.label(name)} exited with status {self.workers[name].popen.returncode} during startup'
+        shared = self.cluster_holder(name)
+        if shared:
+            return AssertionError(f'{exited}; {shared}:\n{output}')
+        lost = harness_ports.lost_bind(output, [config['bind'], config['node']['bind']], self.processes(name))
+        if lost:
+            return PortLost(f'{exited} and lost one of its ports, {lost}:\n{output}', name)
+        return AssertionError(f'{exited}:\n{output}')
 
     def check_lost_port(self, name):
-        """A worker that exited during startup because another process took one of its
-        ports raises PortLost: the first start then runs again with fresh ports. A
-        registered worker cannot simply be relaunched on another port once it has
-        opened its store, and every peer names its node port."""
-        output = log_since(self.root / f'{name}.log', self.log_offsets.get(name, 0))
-        config = self.config[name]
-        ports = [int(config['bind'].rsplit(':', 1)[1]), int(config['node']['bind'].rsplit(':', 1)[1])]
-        if harness_ports.lost_bind(output, ports):
-            raise PortLost(f'{name} lost one of its ports {ports}:\n{output}')
-        raise AssertionError(f'{name} exited during startup:\n{output}')
+        raise self.start_error(name)
+
+    def exit_error(self, names, ready=()):
+        """The error of the workers that exited, if any. One that did not lose a port wins over one that did.
+        A worker that was ready had its ports, so its exit is never a lost port."""
+        errors = [AssertionError(f'{self.label(name)} exited with status {self.workers[name].popen.returncode} '
+                                 f'after it was ready:\n{self.output(name)}') if name in ready else self.start_error(name)
+                  for name in sorted(names) if not self.workers[name].alive()]
+        return next((error for error in errors if not isinstance(error, PortLost)), errors[0] if errors else None)
+
+    def check_exits(self, names, ready):
+        error = self.exit_error(names, ready)
+        if error is not None:
+            raise error
+
+    def answered_by(self, name):
+        address = urlsplit(self.urls[name])
+        return harness_ports.listener(self.workers[name].pid, address.hostname, address.port, self.processes(name))
+
+    def check_answer(self, name, ready, found):
+        """Why a response at a worker's URL does not count, or None: it counts only from that worker. One from
+        another worker of the cluster fails. One from outside the cluster does not end the wait: the worker's
+        exit tells whether it lost its port, and another worker may be about to fail for its own reason."""
+        if found is None or found[0] == 'own':
+            return None
+        state, pids = found
+        address, output = urlsplit(self.urls[name]).netloc, self.output(name)
+        if state == 'none':
+            assert not ready, f'{self.label(name)} stopped listening on {address} after it was ready:\n{output}'
+            return 'nobody listens'
+        who = self.holder_names(pids) or {'outside': "another user's process"}.get(state, 'an unknown process')
+        message = f'{self.label(name)} does not listen on {address}; {who} does and answered for it'
+        if state == 'outside':
+            return message
+        raise AssertionError(f'{message}:\n{output}')
 
     def barrier_dir(self, name):
         return self.root / 'barriers' / name
@@ -381,21 +462,29 @@ class Rf3Cluster:
         pending = set(names)
         deadline = time.monotonic() + deadline_seconds
         last = {}
-        while pending:
+        while True:
+            self.check_exits(names, set(names) - pending)
+            if not pending:
+                return last
+            assert time.monotonic() < deadline, f'workers not ready: {last}'
             for name in sorted(pending):
-                if not self.workers[name].alive():
-                    self.check_lost_port(name)
                 try:
                     status, ready = call(self.urls[name], '/health/ready', token=self.auth['data_token'], timeout=3)
-                    last[name] = ready
-                    if status == 200 and ready.get('replication_factor') == 3 and ready.get('ready_workers') == 3:
-                        pending.discard(name)
                 except (OSError, http.client.HTTPException, ValueError) as error:
                     last[name] = repr(error)
+                    continue
+                last[name] = ready
+                complete = status == 200 and ready.get('replication_factor') == 3 and ready.get('ready_workers') == 3
+                found = self.answered_by(name)
+                # A dead worker, this one or another, says more than who answered.
+                self.check_exits(names, set(names) - pending)
+                refused = self.check_answer(name, complete, found)
+                if refused:
+                    last[name] = refused
+                elif complete:
+                    pending.discard(name)
             if pending:
-                assert time.monotonic() < deadline, f'workers not ready: {last}'
                 time.sleep(0.25)
-        return last
 
     def admin(self, name, payload, worker=None):
         targets = [worker] if worker else [w for w in WORKERS if self.workers[w].alive() and not self.workers[w].paused]
@@ -452,8 +541,9 @@ class Rf3Cluster:
                 # The enrollment endpoint must be known before launch: when another
                 # process took its port, enroll a fresh endpoint and launch again.
                 output = log_since(self.root / f'{name}.log', offset)
-                endpoint = int(config['topology']['enrollment']['enrollment']['endpoint'].rsplit(':', 1)[1])
-                if attempt == harness_ports.ATTEMPTS or not harness_ports.lost_bind(output, [endpoint]):
+                endpoint = config['topology']['enrollment']['enrollment']['endpoint']
+                if attempt == harness_ports.ATTEMPTS or not harness_ports.lost_bind(output, [endpoint],
+                                                                                        self.processes(name)):
                     raise
                 print(f'direct cluster: {name} lost enrollment port {endpoint}; enrolling a fresh one',
                       file=sys.stderr, flush=True)
@@ -462,6 +552,9 @@ class Rf3Cluster:
         assert message.get('event') == 'nabedra.serve.launched', message
         port = urlsplit(message['bound_url']).port
         self.api_urls[name] = f'https://localhost:{port}'
+        endpoint = config['topology']['enrollment']['enrollment']['endpoint']
+        print(f'direct cluster: launched {name} (pid {process.pid}), HTTPS port {port}, enrolled {endpoint}',
+              file=sys.stderr, flush=True)
         deadline = time.monotonic() + 90
         while True:
             assert process.alive(), f'{name} exited:\n{self.tail(name)}'
@@ -611,7 +704,7 @@ class Rf1Serve:
                 if self.process.alive():
                     raise
                 output = log_since(self.root / 'serve.log', offset)
-                if attempt == harness_ports.ATTEMPTS or not harness_ports.lost_bind(output, [port]):
+                if attempt == harness_ports.ATTEMPTS or not harness_ports.lost_bind(output, [f'127.0.0.1:{port}']):
                     raise
                 print(f'direct cluster: serve lost port {port}; relaunching on a fresh one', file=sys.stderr, flush=True)
                 self.process.stop()
@@ -629,6 +722,7 @@ class Rf1Serve:
         if cold_start:
             command.append('--cold-start')
         self.process = Process('serve', command, env, self.root / 'serve.log')
+        print(f'direct cluster: launched serve (pid {self.process.pid}), HTTP port {port}', file=sys.stderr, flush=True)
         self.url = f'http://127.0.0.1:{port}'
         deadline = time.monotonic() + 90
         while True:

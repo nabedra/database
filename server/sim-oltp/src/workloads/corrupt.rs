@@ -84,14 +84,31 @@ async fn stage(
     let foreign = cluster.start_prepared(index, DiskCut::Kill).await;
     cluster.config.claim_pool(index, &own);
     cluster.record(format!("O06 foreign pool on n{victim}: {foreign:?}"));
-    clauses.push("O06:foreign-replica");
-    if foreign.is_ok() {
-        cluster.checks.violate(
-            &cluster.world,
-            "ForeignReplicaServed",
-            format!("n{victim} became ready on a volume of another pool"),
-        );
-        cluster.crash(victim, DiskCut::Kill).await;
+    match &foreign {
+        Ok(()) => {
+            clauses.push("O06:foreign-replica");
+            cluster.checks.violate(
+                &cluster.world,
+                "ForeignReplicaServed",
+                format!("n{victim} became ready on a volume of another pool"),
+            );
+            cluster.crash(victim, DiskCut::Kill).await;
+        }
+        // The same volume under its own pool is the control: it must start, or the refusal may
+        // have had any other reason.
+        Err(error) => {
+            let refused = refused(error);
+            cluster
+                .restart_worker(victim, DiskCut::Kill)
+                .await
+                .map_err(|error| format!("n{victim} did not start on its own pool: {error}"))?;
+            if refused {
+                clauses.push("O06:foreign-replica");
+            } else {
+                return Err(format!("the foreign start did not answer: {error}"));
+            }
+            cluster.crash(victim, DiskCut::Kill).await;
+        }
     }
 
     let image = cluster
@@ -119,8 +136,8 @@ async fn stage(
         "O06 flipped {}@{offset} on n{victim}: {corrupt:?}",
         path.display()
     ));
-    clauses.push("O06:corrupt-log");
     if corrupt.is_ok() {
+        clauses.push("O06:corrupt-log");
         // The process may run only with the damage reported.
         let stats = cluster.stats(victim).await?;
         cluster.record(format!(
@@ -154,7 +171,19 @@ async fn stage(
         .restart_worker(victim, DiskCut::Kill)
         .await
         .map_err(|error| format!("n{victim} did not start on its restored volume: {error}"))?;
+    // Restored, the same volume starts, so the flipped bit was the reason.
+    match corrupt {
+        Err(error) if refused(&error) => clauses.push("O06:corrupt-log"),
+        Err(error) => return Err(format!("the damaged start did not answer: {error}")),
+        Ok(()) => {}
+    }
     Ok(())
+}
+
+/// The process ended by itself with a startup error. A start that only ran out of time, or could
+/// not be prepared, refused nothing (review 115, M5).
+fn refused(error: &str) -> bool {
+    error.contains("exited during startup: Ok(Err(")
 }
 
 /// The live journal segments under `root`, oldest first.
@@ -173,4 +202,23 @@ fn journal_segments(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
     segments.sort();
     Ok(segments)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refused;
+
+    #[test]
+    fn only_a_process_that_ended_with_its_error_refused_the_volume() {
+        let exited = r#"n1 exited during startup: Ok(Err("registered worker startup failed"))"#;
+        assert!(refused(exited));
+        for other in [
+            "readiness deadline for [1]: [(1, \"503\")]",
+            "n1 exited during startup: Ok(Ok(()))",
+            "n1 exited during startup: Err(JoinError::Panic(..))",
+            "survivors never dropped n1: readiness deadline",
+        ] {
+            assert!(!refused(other), "{other}");
+        }
+    }
 }

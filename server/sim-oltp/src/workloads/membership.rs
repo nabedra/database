@@ -21,6 +21,9 @@
 //! - `cold`: every worker stops with queued requests outstanding (R04).
 //! - `stale`: like `wipe` with an older image of the volume. Opt-in only (`STEPS_ENV`): nothing
 //!   in the documented procedure allows it, and the rule that decides it needs the probes.
+//! - `thaw-kill`: a worker is killed right after another one thawed from a long freeze. Opt-in
+//!   only: it measures how long the survivors go on listing the killed worker, which every step
+//!   records for its own losses (`lost_workers` in the summary).
 //!
 //! The rules are in [`crate::invariants::membership`]. Public observations feed them on every
 //! seed; they read no internal state of the product.
@@ -51,7 +54,7 @@ use super::{
     moves,
 };
 use crate::{
-    bootstrap::{BOOTSTRAP_CLIENT, CLIENTS, GATEWAYS, ROOT, SPARES, WORKERS},
+    bootstrap::{BOOTSTRAP_CLIENT, CLIENTS, GATEWAYS, ROOT, SPARES, WORKERS, initial_range},
     client::{operation, request},
     config::Config,
     disk::{self, DiskCut},
@@ -64,7 +67,7 @@ use crate::{
             WipedNeverVotes, removed_stays_out, required_voters, window as judge_window,
         },
     },
-    nemesis::{NetFaults, Selection, apply::COLD_LIMIT, window},
+    nemesis::{NetFaults, Rule, Selection, apply::COLD_LIMIT, window},
     node::{Cluster, Disk, Marker, Started},
 };
 
@@ -118,6 +121,9 @@ const EVIDENCE_ATTEMPT: Duration = Duration::from_secs(3);
 const IN_FLIGHT: Duration = Duration::from_millis(500);
 /// The store that a worker creates before it saves its first vote.
 const STORE: &str = "pool/kv/CURRENT";
+const SETTLE_LIMIT: Duration = Duration::from_secs(2);
+/// How long `thaw-kill` watches the survivors list the killed worker.
+const THAW_LIMIT: Duration = Duration::from_secs(120);
 const RECEIPT_LIMIT: Duration = Duration::from_secs(30);
 /// Queued requests insert keys of their own, outside the clients' key space.
 const QUEUED_BASE: i64 = 1_000_000;
@@ -130,16 +136,18 @@ pub(crate) enum Step {
     Wipe,
     Cold,
     Stale,
+    ThawKill,
 }
 
 impl Step {
-    const ALL: [Step; 6] = [
+    const ALL: [Step; 7] = [
         Step::Rolling,
         Step::Moves,
         Step::Replace,
         Step::Wipe,
         Step::Cold,
         Step::Stale,
+        Step::ThawKill,
     ];
 
     fn name(self) -> &'static str {
@@ -150,6 +158,7 @@ impl Step {
             Step::Wipe => "wipe",
             Step::Cold => "cold",
             Step::Stale => "stale",
+            Step::ThawKill => "thaw-kill",
         }
     }
 
@@ -162,6 +171,7 @@ impl Step {
             Step::Wipe => "StepWipe",
             Step::Cold => "StepCold",
             Step::Stale => "StepStale",
+            Step::ThawKill => "StepThawKill",
         }
     }
 
@@ -306,6 +316,12 @@ pub(crate) struct Membership {
     next_sample_ms: u64,
     next_key: i64,
     notes: BTreeMap<&'static str, u64>,
+    /// Fresh writes that committed and reads that were answered before the heal.
+    work: (u64, u64),
+    /// How long the survivors listed each lost worker.
+    losses: Vec<Value>,
+    lost_ms: BTreeMap<u64, u64>,
+    thawed_ms: Option<u64>,
     defect: Option<Defect>,
 }
 
@@ -332,6 +348,10 @@ impl Membership {
             next_sample_ms: 0,
             next_key: QUEUED_BASE,
             notes: BTreeMap::new(),
+            work: (0, 0),
+            losses: Vec::new(),
+            lost_ms: BTreeMap::new(),
+            thawed_ms: None,
             defect: Defect::from_env(),
         }
     }
@@ -352,6 +372,7 @@ impl Membership {
         started
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run(
         mut self,
         cluster: &mut Cluster,
@@ -370,6 +391,7 @@ impl Membership {
         }
         self.queue = QueueHandoff::new(cluster.config.run_id);
         self.system_votes(cluster);
+        let start = elapsed_ms(&cluster.world);
         let plan = Plan::draw(g, selection.focus.contention, selection.focus.idle);
         let ctx = Ctx::new(
             cluster.world.clone(),
@@ -417,8 +439,10 @@ impl Membership {
             cluster.record(format!("step {} done", step.name()));
             self.pause(cluster, &ctx, window(g, 500, 2_500)).await;
         }
+        // Lead decision 17: a seed whose clients completed no work proves nothing.
+        self.work = direct::progress(cluster, &ctx, start);
         ctx.stopping.store(true, Ordering::Release);
-        faults.clear();
+        faults.heal();
         cluster.world.set_storage_pauses(0, Duration::ZERO);
         for node in cluster.frozen().clone() {
             cluster.thaw(node);
@@ -435,6 +459,7 @@ impl Membership {
             }
             report.scenarios = std::mem::take(&mut self.clauses);
             report.summary = self.summary(&ctx, &names);
+            report.summary["abandoned"] = json!(true);
             cluster.record("workload abandoned after a step that did not finish".into());
             return Ok(report);
         }
@@ -496,6 +521,10 @@ impl Membership {
             "keys": ctx.keys,
             "completed": observed.completed,
             "attempts": observed.attempts.len(),
+            "chaos_writes": self.work.0,
+            "chaos_reads": self.work.1,
+            "abandoned": false,
+            "lost_workers": self.losses,
             "queued_succeeded": self.succeeded.len(),
             "notes": self.notes,
         })
@@ -517,9 +546,9 @@ impl Membership {
             Step::Replace => {
                 let index = g.below(3) as usize;
                 self.enable(cluster).await?;
-                cluster
-                    .crash(cluster.config.node(index), DiskCut::Kill)
-                    .await;
+                let node = cluster.config.node(index);
+                cluster.crash(node, DiskCut::Kill).await;
+                self.lost(cluster, node);
                 self.replace(cluster, ctx, g, faults, quiet, index).await
             }
             Step::Wipe => {
@@ -537,6 +566,10 @@ impl Membership {
             Step::Stale => {
                 let index = g.below(3) as usize;
                 self.stale(cluster, ctx, g, index).await
+            }
+            Step::ThawKill => {
+                let index = g.below(3) as usize;
+                self.thaw_kill(cluster, ctx, g, index).await
             }
         }
     }
@@ -592,7 +625,7 @@ impl Membership {
 
     /// The published voters of the table's range. An unavailable answer says nothing.
     async fn observe_placement(&mut self, cluster: &Cluster, ctx: &Ctx) -> Option<Value> {
-        let (group, placement) = moves::placement(cluster, ctx).await.ok()?;
+        let (group, placement) = range_placement(cluster, ctx).await.ok()?;
         let mut members = placement["members"].as_array().cloned().unwrap_or_default();
         if self.defect == Some(Defect::DropVoter) {
             members.pop();
@@ -666,8 +699,19 @@ impl Membership {
         }
     }
 
+    /// The resources of `node` once three observations in a row were equal, or after 2 s.
     async fn baseline(&mut self, cluster: &Cluster, node: u64) -> Result<(), String> {
-        let stats = cluster.stats(node).await?;
+        let deadline = cluster.world.elapsed() + SETTLE_LIMIT;
+        let stats = loop {
+            let stats = cluster.stats(node).await?;
+            let steady = cluster
+                .checks
+                .resources_steady(&cluster.world, node, &stats);
+            if steady || cluster.world.elapsed() >= deadline {
+                break stats;
+            }
+            time::sleep(STEP).await;
+        };
         cluster
             .checks
             .capture_resources(&cluster.world, node, &stats);
@@ -675,27 +719,41 @@ impl Membership {
     }
 
     /// `ResourceBaseline` for every worker that is still part of the cluster. A replacement's
-    /// baseline was taken when it became ready, so a leak before that is not seen.
+    /// baseline was taken when it became ready, so a leak before that is not seen. The pools
+    /// that the moves mounted have no row in the baseline, so they must reserve nothing.
     async fn check_resources(&mut self, cluster: &Cluster) -> Result<(), String> {
-        let deadline = cluster.world.elapsed() + Duration::from_secs(2);
+        let deadline = cluster.world.elapsed() + SETTLE_LIMIT;
         loop {
-            let (mut clean, mut snapshots) = (true, Vec::new());
+            let (mut clean, mut snapshots, mut leftover) = (true, Vec::new(), None);
             for node in cluster.config.nodes() {
                 let mut stats = cluster.stats(node).await?;
                 let pools = &self.second_pools;
                 if let Some(rows) = stats["storage_reservations"].as_array_mut() {
                     rows.retain(|row| {
-                        row["device"]
+                        let extra = row["device"]
                             .as_u64()
-                            .is_none_or(|device| !pools.contains(&(node, device)))
+                            .is_some_and(|device| pools.contains(&(node, device)));
+                        if extra && (row["reserved_bytes"] != 0 || row["reservations"] != 0) {
+                            leftover = Some((node, row.to_string()));
+                        }
+                        !extra
                     });
                 }
                 clean &= cluster.checks.resources_at_baseline(node, &stats);
                 snapshots.push((node, stats));
             }
-            if clean || cluster.world.elapsed() >= deadline {
+            if clean && leftover.is_none() || cluster.world.elapsed() >= deadline {
                 for (node, stats) in &snapshots {
                     cluster.checks.check_resources(&cluster.world, *node, stats);
+                }
+                if let Some((node, row)) = leftover {
+                    cluster.checks.violate(
+                        &cluster.world,
+                        "ResourceBaseline",
+                        format!(
+                            "n{node} keeps reservations in an added pool after quiescence: {row}"
+                        ),
+                    );
                 }
                 cluster.checks.check_direct_path(&cluster.world, &snapshots);
                 return Ok(());
@@ -942,7 +1000,9 @@ impl Membership {
             } else {
                 self.cut(cluster, g, node).await
             };
+            self.lost(cluster, node);
             self.down(cluster, ctx, window(g, 0, 2_000)).await;
+            self.await_drop(cluster, ctx, node, CHECK_LIMIT).await?;
             self.prepare(cluster, node).await?;
             cluster.start_prepared(index, how).await?;
             self.joiner_copy(cluster, ctx, node, &outstanding, "R03:rolling-restart")
@@ -957,6 +1017,83 @@ impl Membership {
             self.settle_receipts(cluster, ctx, RECEIPT_LIMIT).await;
         }
         Ok(())
+    }
+
+    /// Thaw `node` and remember when.
+    fn thaw(&mut self, cluster: &mut Cluster, node: u64) {
+        cluster.thaw(node);
+        self.thawed_ms = Some(elapsed_ms(&cluster.world));
+    }
+
+    /// Worker `node` just stopped for good or for a restart.
+    fn lost(&mut self, cluster: &Cluster, node: u64) {
+        self.lost_ms.insert(node, elapsed_ms(&cluster.world));
+    }
+
+    /// Wait until every survivor lists only the survivors, and record how long that took from
+    /// the loss of `node`. No text bounds it, so this is a measurement, and a survivor that
+    /// still lists the lost worker at `limit` has a kind of its own.
+    async fn await_drop(
+        &mut self,
+        cluster: &mut Cluster,
+        ctx: &Ctx,
+        node: u64,
+        limit: Duration,
+    ) -> StepResult {
+        let survivors: Vec<u64> = cluster
+            .config
+            .nodes()
+            .into_iter()
+            .filter(|other| *other != node)
+            .collect();
+        let now = elapsed_ms(&cluster.world);
+        let lost = *self.lost_ms.entry(node).or_insert(now);
+        let deadline = cluster.world.elapsed() + limit;
+        let mut first = true;
+        let (dropped, listed) = loop {
+            let mut listed = BTreeMap::new();
+            for &survivor in &survivors {
+                listed.insert(survivor, cluster.ready_workers(survivor).await);
+            }
+            let dropped = listed
+                .values()
+                .all(|ready| *ready == Some(survivors.len() as u64));
+            if dropped || cluster.world.elapsed() >= deadline {
+                break (dropped, listed);
+            }
+            first = false;
+            self.pause(cluster, ctx, POLL).await;
+        };
+        let after = elapsed_ms(&cluster.world) - lost;
+        let loss = json!({
+            "node": node,
+            "dropped": dropped,
+            "after_ms": after,
+            // The survivors were first asked then, so it may have been earlier.
+            "at_most": dropped && first,
+            "since_thaw_ms": self.thawed_ms.and_then(|thawed| lost.checked_sub(thawed)),
+            "listed": listed.iter().map(|(node, ready)| (node.to_string(), json!(ready))).collect::<serde_json::Map<_, _>>(),
+        });
+        cluster.record(format!("lost worker {loss}"));
+        println!("fault model lost worker {loss}");
+        self.losses.push(loss);
+        if dropped {
+            return Ok(());
+        }
+        // A survivor that does not answer is another matter than one that lists the lost worker.
+        let still = listed
+            .values()
+            .all(|ready| ready.is_some_and(|ready| ready >= survivors.len() as u64));
+        Err(StepError::new(
+            if still {
+                "LostWorkerListed"
+            } else {
+                "SurvivorsNotReady"
+            },
+            format!(
+                "{after} ms after n{node} was lost the survivors list {listed:?} ready workers"
+            ),
+        ))
     }
 
     /// Prepare the retained restart of `node`.
@@ -1120,10 +1257,7 @@ impl Membership {
             .into_iter()
             .filter(|node| *node != lost)
             .collect();
-        cluster
-            .wait_ready_within(&survivors, true, survivors.len(), CHECK_LIMIT)
-            .await
-            .map_err(|error| format!("survivors never dropped n{lost}: {error}"))?;
+        self.await_drop(cluster, ctx, lost, CHECK_LIMIT).await?;
         // A preparation that never enrolled does not change who was lost.
         let lost_id = cluster.config.worker_enrollment(index)["worker_id"].clone();
         let previous = self.connection(cluster).await?["control_peers"]
@@ -1359,20 +1493,26 @@ impl Membership {
             CatchUpFault::FreezeSurvivor => {
                 cluster.freeze(survivor);
                 self.pause(cluster, ctx, length).await;
-                cluster.thaw(survivor);
+                self.thaw(cluster, survivor);
             }
             CatchUpFault::SlowSurvivors => {
-                faults.slow(Some((survivors.to_vec(), Duration::from_millis(100))));
+                let slow = faults.start(Rule::Slow {
+                    workers: survivors.to_vec(),
+                    by: Duration::from_millis(100),
+                });
                 self.pause(cluster, ctx, length).await;
-                faults.slow(None);
+                faults.end(slow);
+                placed &= faults.effect(slow).frames > 0;
             }
             CatchUpFault::DropSessions => {
-                let dropped = faults.session_drops().len();
+                let mut resets = 0;
                 for _ in 0..3 {
-                    faults.drop_session_after(g.below(40));
+                    let drop = faults.start(Rule::SessionDrop { left: g.below(40) });
                     self.pause(cluster, ctx, length / 3).await;
+                    faults.end(drop);
+                    resets += faults.effect(drop).resets.len();
                 }
-                placed &= faults.session_drops().len() > dropped;
+                placed &= resets > 0;
             }
             CatchUpFault::KillCandidate | CatchUpFault::PowerCandidate => {
                 let how = if fault == CatchUpFault::KillCandidate {
@@ -1633,9 +1773,11 @@ impl Membership {
                 StepError::new("Liveness", format!("after the control window: {error}"))
             })?;
         let how = self.cut(cluster, g, node).await;
+        self.lost(cluster, node);
         self.down(cluster, ctx, window(g, 0, 3_000)).await;
         if prepared {
             // The operator prepares the ordinary retained restart for it.
+            self.await_drop(cluster, ctx, node, CHECK_LIMIT).await?;
             self.prepare(cluster, node).await?;
         }
         self.expected_exit.insert(node);
@@ -1690,6 +1832,7 @@ impl Membership {
         }
         if cluster.world.is_up(node) {
             cluster.crash(node, DiskCut::Kill).await;
+            self.lost(cluster, node);
         }
         self.expected_exit.remove(&node);
         Ok(())
@@ -1713,7 +1856,7 @@ impl Membership {
             self.note("no placement before the window");
             return writes;
         };
-        let (group, _) = match moves::placement(cluster, ctx).await {
+        let (group, _) = match range_placement(cluster, ctx).await {
             Ok(found) => found,
             Err(_) => {
                 self.note("no placement before the window");
@@ -1806,7 +1949,7 @@ impl Membership {
         }
         let members = placement["members"].as_array().cloned().unwrap_or_default();
         let voters = self.taking_part(cluster, &members, frozen);
-        cluster.thaw(frozen);
+        self.thaw(cluster, frozen);
         let count = writes
             .data
             .iter()
@@ -1847,6 +1990,8 @@ impl Membership {
         let image: FaultFs = disk::snapshot(&cluster.world, node);
         self.pause(cluster, ctx, window(g, 2_000, 6_000)).await;
         cluster.crash(node, DiskCut::Kill).await;
+        self.lost(cluster, node);
+        self.await_drop(cluster, ctx, node, CHECK_LIMIT).await?;
         self.prepare(cluster, node).await?;
         self.expected_exit.insert(node);
         let started = cluster
@@ -1866,7 +2011,7 @@ impl Membership {
                 let frozen = others[g.below(others.len() as u64) as usize];
                 cluster.freeze(frozen);
                 time::sleep(EVIDENCE).await;
-                cluster.thaw(frozen);
+                self.thaw(cluster, frozen);
                 self.expected_exit.remove(&node);
                 self.wait_members(cluster, ctx, CHECK_LIMIT).await
             }
@@ -1882,6 +2027,37 @@ impl Membership {
                 .into())
             }
         }
+    }
+
+    /// Opt-in: a worker is killed as soon as every worker reports three ready ones after another
+    /// was frozen. Readiness then shows the view from before the freeze. `wipe` waits for
+    /// convergence at this point, so this step measures what that wait avoids: how long the
+    /// survivors go on listing the killed worker.
+    async fn thaw_kill(
+        &mut self,
+        cluster: &mut Cluster,
+        ctx: &Ctx,
+        g: &mut Gen,
+        index: usize,
+    ) -> StepResult {
+        let node = cluster.config.node(index);
+        let others: Vec<u64> = cluster
+            .config
+            .nodes()
+            .into_iter()
+            .filter(|other| *other != node)
+            .collect();
+        let frozen = others[g.below(others.len() as u64) as usize];
+        cluster.freeze(frozen);
+        time::sleep(EVIDENCE).await;
+        self.thaw(cluster, frozen);
+        self.wait_members(cluster, ctx, CHECK_LIMIT).await?;
+        cluster.crash(node, DiskCut::Kill).await;
+        self.lost(cluster, node);
+        self.await_drop(cluster, ctx, node, THAW_LIMIT).await?;
+        self.prepare(cluster, node).await?;
+        cluster.start_prepared(index, DiskCut::Kill).await?;
+        self.wait_members(cluster, ctx, CHECK_LIMIT).await
     }
 
     /// R04: "New run has no pending old work; old receipts report abandonment unless a durable
@@ -1953,7 +2129,7 @@ impl Membership {
     ) -> StepResult {
         let deadline = cluster.world.elapsed() + CHECK_LIMIT;
         let owner = loop {
-            match moves::owner(cluster, ctx).await {
+            match moves::owner(&cluster.operator(), &ctx.table).await {
                 Ok(owner) => break owner,
                 Err(error) if cluster.world.elapsed() >= deadline => {
                     return Err(format!("scheduler owner: {error}").into());
@@ -1964,7 +2140,7 @@ impl Membership {
         let mut pool = moves::Move::draw(g);
         let deadline = cluster.world.elapsed() + CHECK_LIMIT;
         let (id, payload) = loop {
-            match pool.prepare(cluster, ctx, owner).await {
+            match pool.prepare(cluster, ctx, faults, owner).await {
                 Ok(prepared) => break prepared,
                 Err(error) if cluster.world.elapsed() >= deadline => {
                     return Err(format!("second pool: {error}").into());
@@ -1972,15 +2148,18 @@ impl Membership {
                 Err(_) => self.pause(cluster, ctx, POLL).await,
             }
         };
-        if !quiet && g.bool() {
-            let others = cluster
+        let slow = (!quiet && g.bool()).then(|| {
+            let workers = cluster
                 .config
                 .nodes()
                 .into_iter()
                 .filter(|node| *node != owner)
                 .collect();
-            faults.slow(Some((others, window(g, 5, 150))));
-        }
+            faults.start(Rule::Slow {
+                workers,
+                by: window(g, 5, 150),
+            })
+        });
         // Before the pool holds anything: a request that names a voter that is no member must
         // not move another one there.
         let mut stranger = payload.clone();
@@ -1998,8 +2177,11 @@ impl Membership {
         self.judge_move(cluster, ctx, stranger_id, &stranger, &answer)
             .await;
         cluster.record(format!("stranger before the move: {}", shown(&answer)));
+        self.second_pools.extend(pool.extra_pools(&cluster.world));
         let moved = self.drive(cluster, ctx, g, owner, id, &payload).await;
-        faults.slow(None);
+        if let Some(slow) = slow {
+            faults.end(slow);
+        }
         moved?;
         let mut judged = self
             .hostile_retries(cluster, ctx, g, owner, id, &payload)
@@ -2007,14 +2189,10 @@ impl Membership {
 
         // On to a third pool, under another ID. The primary pool keeps the first move's retired
         // replica, so it is refused as a target.
-        self.second_pools
-            .extend(pool.second_pool_of(&cluster.world, owner));
-        let index = cluster.config.index_of(owner).expect("known worker");
-        let listed = cluster.config.secondary_pools(index);
         pool.another_pool();
         let deadline = cluster.world.elapsed() + CHECK_LIMIT;
         let (back_id, back) = loop {
-            match pool.prepare(cluster, ctx, owner).await {
+            match pool.prepare(cluster, ctx, faults, owner).await {
                 Ok(prepared) => break prepared,
                 Err(error) if cluster.world.elapsed() >= deadline => {
                     return Err(format!("third pool: {error}").into());
@@ -2022,9 +2200,7 @@ impl Membership {
                 Err(_) => self.pause(cluster, ctx, POLL).await,
             }
         };
-        cluster.config.list_more_pools(index, listed);
-        self.second_pools
-            .extend(pool.second_pool_of(&cluster.world, owner));
+        self.second_pools.extend(pool.extra_pools(&cluster.world));
         self.drive(cluster, ctx, g, owner, back_id, &back).await?;
         // A late retry of the first move, after the second one undid it.
         judged &= self
@@ -2073,7 +2249,7 @@ impl Membership {
                 format!("the answer to {id} is the record of {}", record["id"]),
             );
         }
-        let published = match moves::placement(cluster, ctx).await {
+        let published = match range_placement(cluster, ctx).await {
             Ok((_, placement)) => Some(nodes(
                 placement["members"]
                     .as_array()
@@ -2137,7 +2313,7 @@ impl Membership {
         id: Uuid,
         payload: &Value,
     ) -> bool {
-        let Ok((_, before)) = moves::placement(cluster, ctx).await else {
+        let Ok((_, before)) = range_placement(cluster, ctx).await else {
             return false;
         };
         let mut judged = false;
@@ -2179,7 +2355,7 @@ impl Membership {
                 shown(&answer)
             ));
         }
-        let Ok((_, after)) = moves::placement(cluster, ctx).await else {
+        let Ok((_, after)) = range_placement(cluster, ctx).await else {
             return false;
         };
         if after["members"] != before["members"]
@@ -2287,7 +2463,7 @@ fn shown(answer: &Result<Completion, String>) -> String {
 fn growth_policy(cluster: &Cluster, salt: u64) -> Value {
     let zones: serde_json::Map<String, Value> = (0..WORKERS.len())
         .map(|index| {
-            let worker = cluster.config.worker_identity(index);
+            let worker = cluster.config.mounts.identity(index);
             let id = worker["worker_id"].as_str().unwrap_or_default().to_owned();
             (id, json!(format!("fixture-{index}")))
         })
@@ -2410,6 +2586,16 @@ fn every_survivor_refuses_its_role(error: &str) -> bool {
                 .split("; ")
                 .all(|answer| answer.ends_with(": Control role is not authorized"))
         })
+}
+
+/// The table's first range and its published placement.
+async fn range_placement(cluster: &Cluster, ctx: &Ctx) -> Result<(Value, Value), String> {
+    let table = Uuid::parse_str(&ctx.table).map_err(|error| error.to_string())?;
+    let group = initial_range(cluster.config.cluster_id, table);
+    let placement = cluster
+        .admin("storage.replica.placement", json!({"group": group}))
+        .await?;
+    Ok((group, placement))
 }
 
 /// What every running worker reports about the gated capabilities.

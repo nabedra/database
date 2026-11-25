@@ -116,6 +116,15 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// The production range is not raised to the number of peers (lead decision 12.4): the
+    /// product fixes 256 slots and lets automatic growth reach 4,096 workers, so a worker can
+    /// have fewer slots than peers. Seed 66 samples four slots for five peers and stays red.
+    #[test]
+    fn session_slots_keep_the_sampled_value() {
+        let config = Config::sample(66);
+        assert_eq!(config.knobs["transport.session_slots"], json!(4));
+    }
+
     /// Seed 22 sampled a 124,761-byte arena and no worker ever bound HTTP.
     #[test]
     fn sampled_reply_arena_fits_the_largest_apply_budget() {

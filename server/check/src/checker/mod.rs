@@ -6,6 +6,7 @@
 //! | [`txn::check`] | transactions are (strictly) serializable | `G0` `G1a` `G1b` `G1c` `G-single` `G2`, the `-realtime` variants, `incompatible-order`, `garbage-read`, `duplicate-elements` |
 //! | [`outcome::check`] | a failed or `not_applied` write never takes effect | `failed-write-observed` |
 //! | [`direct::check`] | direct-path registers and single-range batches are linearizable, each request identity commits at most once, and failed attempts have no effects | `non-linearizable` `failed-write-observed` `dedup-miss` `request-id-reuse-undetected` `request-id-reuse-misdetected` |
+//! | [`direct::check_with`] | opt-in rules about request identities, off by default ([`direct::request_rules`]) | `unstable-result` `not-applied-took-effect` |
 //! | [`queue::check`] | log offsets, ordering, durability and redelivery | `duplicate-offset` `duplicate-event` `offset-gap` `out-of-order` `lost-publish` `redelivery-missing` |
 //! | [`relaxed_kv::check`] | asynchronous Cache replica promise (CACHE-G05) | `invented-value` `resurrection` `stale-read` `lost-write` |
 //!
@@ -35,6 +36,14 @@ pub struct Verdict {
     pub valid: bool,
     pub anomalies: Vec<Anomaly>,
     pub checked_ops: usize,
+    /// Refusals that an opt-in rule could not classify and therefore left out. Not an anomaly, but
+    /// a rule that leaves many out checks little. See [`direct::request_rules`].
+    #[serde(skip_serializing_if = "none")]
+    pub unclassified_conflicts: usize,
+}
+
+fn none(count: &usize) -> bool {
+    *count == 0
 }
 
 impl Verdict {
@@ -43,6 +52,7 @@ impl Verdict {
             valid: anomalies.is_empty(),
             anomalies,
             checked_ops,
+            unclassified_conflicts: 0,
         }
     }
 
@@ -73,11 +83,16 @@ impl Verdict {
     pub fn merge(verdicts: impl IntoIterator<Item = Verdict>) -> Verdict {
         let mut anomalies = Vec::new();
         let mut checked = 0;
+        let mut unclassified = 0;
         for v in verdicts {
             checked = checked.max(v.checked_ops);
+            unclassified = unclassified.max(v.unclassified_conflicts);
             anomalies.extend(v.anomalies);
         }
-        Verdict::new(checked, anomalies)
+        Verdict {
+            unclassified_conflicts: unclassified,
+            ..Verdict::new(checked, anomalies)
+        }
     }
 }
 

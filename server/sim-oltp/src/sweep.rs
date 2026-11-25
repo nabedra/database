@@ -11,11 +11,12 @@ use nabedra_check::Gen;
 use nabedra_check::evidence::{Artifact, Record};
 use nabedra_rt::time;
 use nabedra_sim::shrink;
-use nabedra_sim::sweep::{self, PlantedSearch, SeedRun, SweepConfig, SweepReport};
+use nabedra_sim::sweep::{self, PlantedSearch, SeedRun, SeedSummary, SweepConfig, SweepReport};
 use serde_json::{Value, json};
 
 use crate::{
     nemesis::Selection,
+    panics::PANIC,
     workload::run_seed,
     workloads::{SCENARIOS, Scenarios, Workload, WorkloadChoice, clauses},
 };
@@ -25,6 +26,9 @@ const REPLAY: &str = "RUST_MIN_STACK=16777216 RUSTFLAGS=\"--cfg tokio_unstable\"
     --exact --nocapture --test-threads=1";
 const SMOKE: &str = "smoke";
 const EXPECTED_DEFECT: &str = "non-linearizable";
+/// The kind of a seed whose run panicked, and of one whose replay differed.
+const HARNESS: &str = "harness";
+const DETERMINISM: &str = "determinism";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Defect {
@@ -85,6 +89,9 @@ pub(crate) struct Setup {
     pub(crate) selection: Selection,
     /// `NABEDRA_SIM_PROFILE=none`: run the workload without a nemesis.
     pub(crate) quiet: bool,
+    /// A panic that a test plants in the run.
+    #[cfg(test)]
+    pub(crate) panic_at: Option<crate::panics::At>,
 }
 
 impl Setup {
@@ -93,6 +100,8 @@ impl Setup {
             workloads: WorkloadChoice::parse(SMOKE).expect("smoke workload"),
             selection: Selection::parse(&[]).expect("default selection"),
             quiet: true,
+            #[cfg(test)]
+            panic_at: None,
         }
     }
 
@@ -109,6 +118,8 @@ impl Setup {
             workloads,
             quiet: Selection::quiet(&profile),
             selection: Selection::parse(&profile)?,
+            #[cfg(test)]
+            panic_at: None,
         })
     }
 
@@ -233,6 +244,7 @@ fn seed_line(
     workload: Workload,
     profile: Option<&str>,
     scenarios: &Scenarios,
+    verdict: Option<Verdict>,
 ) {
     println!(
         "nabedra-sim-seed: {}",
@@ -243,8 +255,37 @@ fn seed_line(
             "workload": workload.name(),
             "profile": profile,
             "scenarios": scenarios,
+            "verdict": verdict.map(Verdict::name),
         })
     );
+}
+
+/// What a sweep may say about a seed. A seed that did no work has a `Progress` violation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Verdict {
+    /// No violation, and a second run had the same trace and history.
+    Clean,
+    /// No violation, and run once. It is not clean: the run may not be reproducible.
+    Unreplayed,
+    Red,
+}
+
+impl Verdict {
+    fn of(summary: &SeedSummary) -> Self {
+        match (summary.passed && summary.deterministic, summary.replayed) {
+            (false, _) => Self::Red,
+            (true, false) => Self::Unreplayed,
+            (true, true) => Self::Clean,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Unreplayed => "unreplayed",
+            Self::Red => "red",
+        }
+    }
 }
 
 fn run_search(
@@ -255,6 +296,13 @@ fn run_search(
 ) -> Result<bool, Box<dyn Error>> {
     if config.tape.is_some() || config.shrink {
         return Err("NABEDRA_SIM_EXPECT searches fresh seeds; use run or shrink for a tape".into());
+    }
+    // A panic is a broken run, not a detection.
+    if let Some(kind) = expect
+        .iter()
+        .find(|kind| [HARNESS, DETERMINISM, PANIC].contains(&kind.as_str()))
+    {
+        return Err(format!("NABEDRA_SIM_EXPECT cannot search for {kind:?}").into());
     }
     let search = PlantedSearch {
         label: config.label.clone(),
@@ -288,12 +336,27 @@ fn run_search(
             .first
             .checked_add(offset)
             .ok_or("seed range overflows u64")?;
-        let (kinds, workload, scenarios) = observed
-            .get(&seed)
-            .ok_or_else(|| format!("seed {seed} did not finish"))?;
-        seed_line(seed, kinds, *workload, setup.profile(seed), scenarios);
+        let (kinds, workload, scenarios) = searched(&observed, seed, setup);
+        // A search runs each seed once, so it calls none clean.
+        let profile = setup.profile(seed);
+        seed_line(seed, &kinds, workload, profile, &scenarios, None);
     }
     result.map(|_| true).map_err(Into::into)
+}
+
+type SearchRow = (BTreeSet<String>, Workload, Scenarios);
+
+/// What the search reports for a seed of the prefix it considered. Every seed of the prefix
+/// ran. One without an observation panicked in the harness, as in a sweep: it is reported as a
+/// violation, and the seeds after it are still searched.
+fn searched(observed: &BTreeMap<u64, SearchRow>, seed: u64, setup: &Setup) -> SearchRow {
+    observed.get(&seed).cloned().unwrap_or_else(|| {
+        (
+            BTreeSet::from([HARNESS.to_owned()]),
+            setup.workloads.of(seed),
+            Scenarios::default(),
+        )
+    })
 }
 
 fn replay_command(defect: Defect) -> String {
@@ -416,6 +479,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     let mut config_hash = nabedra_sim::Fnv::default();
     let mut stats = Vec::with_capacity(report.seeds.len());
     let mut paths = report.artifacts.clone();
+    let mut verdicts = BTreeMap::new();
     // Scenario tag -> (seeds that executed it, seeds among them that failed).
     let mut scenario_seeds: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
     std::fs::create_dir_all(&config.artifacts)?;
@@ -424,16 +488,19 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         let observation = observed.get(&seed);
         let mut kinds = observation.map(|row| row.kinds.clone()).unwrap_or_default();
         if !summary.passed && observation.is_none() {
-            kinds.insert("harness".to_owned());
+            kinds.insert(HARNESS.to_owned());
         }
         if !summary.deterministic {
-            kinds.insert("determinism".to_owned());
+            kinds.insert(DETERMINISM.to_owned());
         }
         let seed_workload = observation.map_or(setup.workloads.of(seed), |row| row.workload);
         let tags = observation
             .map(|row| row.scenarios.clone())
             .unwrap_or_default();
-        seed_line(seed, &kinds, seed_workload, setup.profile(seed), &tags);
+        let verdict = Verdict::of(summary);
+        *verdicts.entry(verdict).or_insert(0_u64) += 1;
+        let profile = setup.profile(seed);
+        seed_line(seed, &kinds, seed_workload, profile, &tags, Some(verdict));
         for tag in &tags {
             let entry = scenario_seeds.entry(tag).or_default();
             entry.0 += 1;
@@ -458,6 +525,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         }
         stats.push(json!({
             "seed": seed,
+            "verdict": verdict.name(),
             "workload": seed_workload.name(),
             "profile": setup.profile(seed),
             "scenarios": tags,
@@ -475,6 +543,15 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         }));
     }
     assertions.insert("seed sweep", report.passed());
+    // A filter that matches nothing, or a sweep that stops early, is not a pass.
+    assertions.insert(
+        "every seed of the range ran",
+        config.count > 0 && report.seeds.len() as u64 == config.count,
+    );
+    let unreplayed = verdicts.get(&Verdict::Unreplayed).copied().unwrap_or(0);
+    if config.verify_replay >= 1.0 {
+        assertions.insert("every passing seed was replayed", unreplayed == 0);
+    }
     let mut scenario_assertions = BTreeMap::new();
     for (tag, (seeds, failed)) in &scenario_seeds {
         scenario_assertions.insert(*tag, failed == &0);
@@ -516,6 +593,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         serde_json::to_vec_pretty(&json!({
             "evidence": "fault-model",
             "workload": workload,
+            "verdicts": verdicts.iter().map(|(verdict, seeds)| (verdict.name(), seeds)).collect::<BTreeMap<_, _>>(),
             "scenarios": scenario_seeds.iter().map(|(tag, (seeds, failed))| (*tag, json!({"seeds": seeds, "failing": failed}))).collect::<BTreeMap<_, _>>(),
             "direct_oltp": true,
             "defect": defect.name(),
@@ -532,9 +610,11 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     )?;
     paths.insert(0, report_path);
     eprintln!(
-        "Fault model: {} clean seeds, {} replayed, {:.3} s wall, {:?} simulation CPU s, \
+        "Fault model: {} clean seeds (worked and replayed), {unreplayed} passing seeds not \
+         replayed, {} red, {} replayed, {:.3} s wall, {:?} simulation CPU s, \
          {:?} KiB process peak RSS, configuration {config_hash}",
-        report.count - report.evidence_seeds().failing.len() as u64,
+        verdicts.get(&Verdict::Clean).copied().unwrap_or(0),
+        verdicts.get(&Verdict::Red).copied().unwrap_or(0),
         report.replayed(),
         duration_s,
         total_cpu_s,
@@ -549,6 +629,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             smoke: setup.workloads.is_smoke(),
             scenarios: scenario_assertions,
             assertions,
+            unreplayed,
             defects_skipped: test_defects && !report.passed(),
             duration_s,
             total_cpu_s,
@@ -661,6 +742,7 @@ struct RecordInput {
     /// Scenario tags that executed, and whether every seed that executed one passed.
     scenarios: BTreeMap<&'static str, bool>,
     assertions: BTreeMap<&'static str, bool>,
+    unreplayed: u64,
     defects_skipped: bool,
     duration_s: f64,
     total_cpu_s: Option<f64>,
@@ -729,13 +811,16 @@ fn write_record(
         record.not_run("seeded defects", "the unmodified smoke sweep failed");
     }
     for invariant in PROBE_INVARIANTS {
-        record.not_run(invariant, "P10-PROBES integration pending");
+        record.not_run(invariant, "no sweep installs the probes yet");
     }
     record.not_run(
         "ResourceBaseline ledger and RangeClock pending sets",
-        "P10-PROBES integration pending",
+        "no sweep installs the probes yet",
     );
-    record.not_run("ConsistentCommittedData", "P10-PROBES integration pending");
+    record.not_run(
+        "ConsistentCommittedData",
+        "no sweep installs the probes yet",
+    );
     if input.workload.split(',').any(|name| name == "membership") {
         use crate::invariants::membership::{GUIDANCE_ONLY, NOT_RUN_FORMS};
         for (form, why) in NOT_RUN_FORMS {
@@ -764,6 +849,15 @@ fn write_record(
                 record.not_run(scenario, &format!("clauses that did not run: {missing:?}"));
             }
         }
+    }
+    if input.unreplayed > 0 {
+        record.not_run(
+            "clean verdict of passing seeds",
+            &format!(
+                "{} passing seeds were run once and not replayed",
+                input.unreplayed
+            ),
+        );
     }
     if report.replayed() == 0 {
         record.not_run(
@@ -810,6 +904,111 @@ fn sha256_file(path: &Path) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    /// Seed 2 panics below the hit at seed 3. Its line is a violation of kind `harness`, the
+    /// search goes on to the hit, and no panicked seed of the prefix is reported as a pass.
+    #[test]
+    fn a_panicking_seed_is_a_violation_and_the_search_goes_on() {
+        let setup = Setup::smoke();
+        for jobs in [1, 2] {
+            let observed = Mutex::new(BTreeMap::<u64, SearchRow>::new());
+            let mut search = PlantedSearch::new("panic", 1, 5, &["Expected"]);
+            search.jobs = jobs;
+            let found = search.run(|seed| {
+                assert!(seed != 2, "planted panic");
+                let violations = if seed == 3 {
+                    vec!["t=1ms Expected: hit".to_owned()]
+                } else {
+                    Vec::new()
+                };
+                let row = (
+                    shrink::kinds(&violations),
+                    Workload::Smoke,
+                    Scenarios::new(),
+                );
+                observed.lock().unwrap().insert(seed, row);
+                violations
+            });
+            let found = found.expect("the hit above the panic");
+            assert_eq!((found.seed, found.tried), (3, 3));
+            let observed = observed.into_inner().unwrap();
+            let kinds = |seed| searched(&observed, seed, &setup).0;
+            assert!(kinds(1).is_empty());
+            assert_eq!(kinds(2), BTreeSet::from([HARNESS.to_owned()]));
+            assert!(kinds(3).contains("Expected"));
+        }
+    }
+
+    /// The sweep itself: a body that panics in the first run, or only in the replay.
+    #[test]
+    fn a_panicking_seed_never_passes_a_sweep() {
+        let dir = std::env::temp_dir().join(format!("p10-panic-{}", std::process::id()));
+        for panicking in [0, 1] {
+            let mut config = SweepConfig::new("panic", 1, 1);
+            config.verify_replay = 1.0;
+            config.artifacts = dir.clone();
+            let runs = AtomicU64::new(0);
+            let report = sweep::sweep(&config, |seed, _| {
+                let run = runs.fetch_add(1, Ordering::SeqCst);
+                assert!(run != panicking, "planted panic");
+                SeedRun {
+                    seed,
+                    trace_hash: 7,
+                    trace_events: 1,
+                    ..SeedRun::default()
+                }
+            });
+            assert_eq!(runs.load(Ordering::SeqCst), 2);
+            assert!(!report.passed(), "panic in run {panicking}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Review 115, M10: 46 of 47 seeds that were reported as clean had been run once.
+    #[test]
+    fn a_seed_that_was_not_replayed_is_not_clean() {
+        let dir = std::env::temp_dir().join(format!("p10-verdict-{}", std::process::id()));
+        for (replay, red, want) in [
+            (0.0, false, Verdict::Unreplayed),
+            (1.0, false, Verdict::Clean),
+            (1.0, true, Verdict::Red),
+            (0.0, true, Verdict::Red),
+        ] {
+            let mut config = SweepConfig::new("verdict", 1, 1);
+            config.verify_replay = replay;
+            config.artifacts = dir.clone();
+            let report = sweep::sweep(&config, |seed, _| SeedRun {
+                seed,
+                trace_events: 1,
+                violations: red
+                    .then(|| "t=1ms Progress: none".into())
+                    .into_iter()
+                    .collect(),
+                ..SeedRun::default()
+            });
+            assert_eq!(
+                Verdict::of(&report.seeds[0]),
+                want,
+                "replay {replay}, red {red}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A panic, or a replay that differed, cannot be what a search looks for.
+    #[test]
+    fn a_search_cannot_expect_a_panic() {
+        let setup = Setup::smoke();
+        let config = SweepConfig::new("panic", 1, 1);
+        for kind in [HARNESS, DETERMINISM, PANIC] {
+            let expect = vec!["Liveness".to_owned(), kind.to_owned()];
+            assert!(run_search(&config, Defect::None, expect, &setup).is_err());
+        }
+    }
+
     #[test]
     fn sweep() {
         assert!(super::run(super::Command::Sweep).expect("OLTP smoke sweep report"));
