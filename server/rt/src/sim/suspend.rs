@@ -34,6 +34,8 @@
 //! a read of the node's clock through [`crate::time`] (or [`clock_read`], for clocks this
 //! crate does not own) the reading code is suspended and the node frozen, as by a SIGSTOP
 //! that lands there. When the node thaws, the code goes on with the value it read.
+//! Two things run a suspended job on also while its node is frozen: code of the node that
+//! waits for a service inline, as above, and dropping the owner of the job.
 //!
 //! - [`World::freeze_after_clock_read`] picks one read; the harness thaws the node.
 //! - [`World::set_clock_freezes`] picks seeded reads and thaws after a seeded time.
