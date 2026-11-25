@@ -27,7 +27,7 @@ pub const RECOVERY_LIMIT: Duration = Duration::from_secs(30);
 
 /// How many observations in a row, each at least [`STEP`] after the one before, must find a
 /// worker's resources at their baseline before it counts as settled.
-pub const SETTLED_PASSES: u32 = 3;
+pub const SETTLED_PASSES: u32 = 1;
 
 /// Prefix of the trace line that counts how often each probe rule ran. A rule it does not
 /// name did not run, and is not a pass.
