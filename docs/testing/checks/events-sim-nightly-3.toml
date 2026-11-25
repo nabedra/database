@@ -4,7 +4,7 @@ kinds = ["S", "H"]
 guarantees = ["EVT-G01", "EVT-G02", "EVT-G03", "EVT-G04", "EVT-G06"]
 scenarios = ["EV01", "EV02", "EV07"]
 tiers = ["T2", "T3"]
-command = ["cargo", "test", "--locked", "-j", "2", "--release", "--features", "sim", "--lib", "sim::tests::seed_sweep", "--", "--nocapture", "--test-threads=1"]
+command = ["cargo", "test", "--locked", "--release", "--features", "sim", "--lib", "sim::tests::seed_sweep", "--", "--nocapture", "--test-threads=1"]
 cwd = "server/events"
 # Shard 3 of 4. Allow five hours including the release build.
 timeout_s = 18000

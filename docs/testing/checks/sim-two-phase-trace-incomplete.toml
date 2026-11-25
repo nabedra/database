@@ -18,7 +18,7 @@ rm -rf "$traces"
 export NABEDRA_TRACE_DIR="$traces/accepted"
 export RUSTFLAGS="--cfg tokio_unstable"
 export CARGO_TARGET_DIR="$PWD/server/target/sim"
-cargo test --locked -j 2 -p nabedra-sim --manifest-path server/Cargo.toml --test two_phase_trace
+cargo test --locked -p nabedra-sim --manifest-path server/Cargo.toml --test two_phase_trace
 test "$(find "$traces/incomplete" -name "TwoPhase-*.ndjson" | wc -l)" -eq 8
 test "$(find "$traces/clean" -name "TwoPhase-*.ndjson" | wc -l)" -eq 2
 exec python3 scripts/testing/tla_trace.py check specs/selftest TwoPhase "$traces/clean" --expect-rejected "$traces/incomplete" --module sim

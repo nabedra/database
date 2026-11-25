@@ -17,7 +17,7 @@ rm -rf "$traces"
 export NABEDRA_TRACE_DIR="$traces/accepted"
 export RUSTFLAGS="--cfg tokio_unstable"
 export CARGO_TARGET_DIR="$PWD/server/target/sim"
-cargo test --locked -j 2 -p nabedra-sim --manifest-path server/Cargo.toml --test two_phase_trace
+cargo test --locked -p nabedra-sim --manifest-path server/Cargo.toml --test two_phase_trace
 # A run without its traces must not pass on the rejections alone.
 test "$(find "$traces/accepted" -name "TwoPhase-*.ndjson" | wc -l)" -eq 26
 test "$(find "$traces/rejected" -name "TwoPhase-*.ndjson" | wc -l)" -eq 20

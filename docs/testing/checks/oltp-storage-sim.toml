@@ -6,7 +6,7 @@ scenarios = ["C04", "C06", "F01", "F02", "F03", "NS04", "O11", "O16", "O17"]
 tiers = ["T1"]
 command = ["bash", "-eo", "pipefail", "-c", '''
 echo "Fault model: native pool and executor on simulated worker volumes"
-executable=$(cargo test --locked -j 2 -p nabedra-oltp-storage --features sim --lib --no-run \
+executable=$(cargo test --locked -p nabedra-oltp-storage --features sim --lib --no-run \
     --message-format=json-render-diagnostics |
     jq -er 'select(.reason == "compiler-artifact" and .target.name == "nabedra_oltp_storage"
                    and .profile.test and .executable != null) | .executable')

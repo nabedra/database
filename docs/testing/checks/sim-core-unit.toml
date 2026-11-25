@@ -12,7 +12,7 @@ scenarios = []
 tiers = ["T0", "T1"]
 # Unseeded first, then with tokio's rng seeded (`--cfg tokio_unstable`, as every simulation
 # sweep runs) in its own target directory, so the RUSTFLAGS never invalidate other builds.
-command = ["sh", "-ec", "cargo test --locked -j 2 -p nabedra-sim --lib && RUSTFLAGS='--cfg tokio_unstable' CARGO_TARGET_DIR=target/sim cargo test --locked -j 2 -p nabedra-sim --lib"]
+command = ["sh", "-ec", "cargo test --locked -p nabedra-sim --lib && RUSTFLAGS='--cfg tokio_unstable' CARGO_TARGET_DIR=target/sim cargo test --locked -p nabedra-sim --lib"]
 cwd = "server"
 timeout_s = 900
 needs = []

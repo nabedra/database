@@ -8,7 +8,7 @@ tiers = ["T1"]
 command = ["bash", "-euc", '''
 set -o pipefail
 repeat_sim_tests() {
-    cargo test --locked -j 2 -p nabedra-sim --manifest-path server/Cargo.toml --lib -- --list --format terse |
+    cargo test --locked -p nabedra-sim --manifest-path server/Cargo.toml --lib -- --list --format terse |
         python3 -c '
 import json
 import sys
