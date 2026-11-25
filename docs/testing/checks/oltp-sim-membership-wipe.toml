@@ -8,7 +8,7 @@ tiers = ["T2"]
 # Build once. Cluster tests share process-wide budgets, so they run one at a time. The measured
 # sweep takes at most 20 minutes. The sweep report must hold every seed of the range.
 command = ["bash", "-euc", '''
-build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+build=(cargo test --locked --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
 report=../target/testing-logs/oltp-sim-membership-wipe/sweep-report.json
 rm -f "$report"

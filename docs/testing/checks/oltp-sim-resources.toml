@@ -12,7 +12,7 @@ guarantees = ["OLTP-G09"]
 scenarios = []
 tiers = ["T2"]
 command = ["bash", "-euc", '''
-build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+build=(cargo test --locked --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
 "${build[@]}" -- --test-threads=2 invariants:: workloads:: nemesis::
 artifacts=$NABEDRA_SIM_ARTIFACTS

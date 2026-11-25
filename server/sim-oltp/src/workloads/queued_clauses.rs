@@ -150,7 +150,7 @@ impl Facts<'_> {
                         })
                 });
                 if kept {
-                    out.extend(["R03:rolling-restart", "O14:rolling-restart"]);
+                    out.extend(["R03:queued-rolling-restart", "O14:rolling-restart"]);
                 }
             }
             Mark::Partition if open => {
@@ -630,7 +630,7 @@ mod tests {
         log.lookups.push(lookup(1, 9_000, ok()));
         assert_eq!(
             names(&log, &marks),
-            ["O14:rolling-restart", "R03:rolling-restart"]
+            ["O14:rolling-restart", "R03:queued-rolling-restart"]
         );
     }
 

@@ -9,7 +9,7 @@ guarantees = ["OLTP-G02", "OLTP-G03", "OLTP-G06"]
 scenarios = []
 tiers = ["T1"]
 command = ["bash", "-euc", '''
-build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+build=(cargo test --locked --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
 "${build[@]}" -- --test-threads=2 workloads:: invariants::topology::
 report=../target/testing-logs/oltp-sim-topology/sweep-report.json

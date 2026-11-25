@@ -163,12 +163,16 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
             "O17:revocation-storm",
         ],
     ),
+    // Lead decision 21.1: two definitions, each set only by its own workload's assertion. In
+    // `queued` a receipt outlives the rolling restart; in `membership` the joiner is seen to hold
+    // the outstanding copies. R03 is complete only when every clause ran.
     (
         "R03",
         &[
-            "R03:rolling-restart",
-            "R03:replacement-joiner",
-            "R03:last-holder",
+            "R03:queued-rolling-restart",
+            "R03:membership-rolling-restart",
+            "R03:membership-replacement-joiner",
+            "R03:membership-last-holder",
         ],
     ),
 ];
@@ -221,7 +225,9 @@ pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
         }
         "O17:data-worker" => "the data worker process binds a real TCP listener",
         "O17:low-disk" => "a simulated volume has no capacity limit",
-        "R03:last-holder" => "the script settles every receipt before the next worker stops",
+        "R03:membership-last-holder" => {
+            "the script settles every receipt before the next worker stops"
+        }
         "O17:revocation-storm" => {
             "1,025 replacements, each with its own worker and certificate, need a separate large range"
         }

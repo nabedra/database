@@ -12,7 +12,7 @@ guarantees = []
 scenarios = []
 tiers = ["T1"]
 command = ["bash", "-euc", '''
-build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+build=(cargo test --locked --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
 planted() { python3 ../scripts/testing/sim_planted.py --out "../target/testing-logs/oltp-sim-topology-planted/$@" \
   -- "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1; }

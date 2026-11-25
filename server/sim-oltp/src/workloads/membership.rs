@@ -1008,8 +1008,14 @@ impl Membership {
             self.await_drop(cluster, ctx, node, CHECK_LIMIT).await?;
             self.prepare(cluster, node).await?;
             cluster.start_prepared(index, how).await?;
-            self.joiner_copy(cluster, ctx, node, &outstanding, "R03:rolling-restart")
-                .await;
+            self.joiner_copy(
+                cluster,
+                ctx,
+                node,
+                &outstanding,
+                "R03:membership-rolling-restart",
+            )
+            .await;
             self.wait_members(cluster, ctx, CHECK_LIMIT).await?;
             let connection = self.connection(cluster).await?;
             let run = connection["run_id"]
@@ -1328,8 +1334,14 @@ impl Membership {
         if placed {
             self.clauses.insert("O17:replacement-fault");
         }
-        self.joiner_copy(cluster, ctx, spare, &outstanding, "R03:replacement-joiner")
-            .await;
+        self.joiner_copy(
+            cluster,
+            ctx,
+            spare,
+            &outstanding,
+            "R03:membership-replacement-joiner",
+        )
+        .await;
         self.check_replaced(cluster, &plans, &previous, intent_id, &groups);
         // The plan that a member's restart is accepted with.
         let (restart, restart_plan) = cluster.rolling_plan(index).await;
