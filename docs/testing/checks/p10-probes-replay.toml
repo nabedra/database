@@ -1,0 +1,13 @@
+id = "p10-probes-replay"
+module = "oltp"
+kinds = ["S"]
+# Scratch, not evidence for a guarantee: see server/replay.py.
+guarantees = []
+scenarios = []
+tiers = ["weekly"]
+command = ["python3", "replay.py", "82:bc8cc6e9ea3eff82:red", "599:c10c5f394ad8c5f1:clean", "679:3fc473822b63cdb6:clean"]
+cwd = "server"
+timeout_s = 6000
+needs = []
+result_parser = "exit-code"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim" }
