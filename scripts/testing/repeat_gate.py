@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -24,7 +25,7 @@ def rust_command(file, name, root, features):
     if manifest is None:
         raise ValueError(f"no Cargo.toml found for {file}")
     source = file.relative_to(manifest.parent)
-    command = ["cargo", "test", "--locked", "--jobs", "2", "--manifest-path", str(manifest)]
+    command = ["cargo", "test", "--locked", "--manifest-path", str(manifest)]
     if manifest == Path("server/Cargo.toml"):
         if features is None:
             with (root / manifest).open("rb") as stream:
@@ -178,6 +179,7 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="print commands without running them")
     parser.add_argument("--features", help="override engine features for tests in server/Cargo.toml")
     args = parser.parse_args(argv)
+    os.environ.setdefault("CARGO_BUILD_JOBS", "2")  # as run_check.py does
     try:
         if args.catalog == "-":
             catalog = json.load(sys.stdin)

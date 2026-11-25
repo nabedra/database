@@ -15,7 +15,7 @@ tiers = ["T0", "T1"]
 command = ["bash", "-eo", "pipefail", "-c", '''
 echo "Fault model: the simulator's opt-in faults and their planted defects"
 export CARGO_TARGET_DIR="$PWD/$CARGO_TARGET_DIR"
-test=(cargo test --locked -j 2 -p nabedra-rt --features sim --lib)
+test=(cargo test --locked -p nabedra-rt --features sim --lib)
 for attempt in $(seq 20); do
     "${test[@]}" sim::suspend:: -- --nocapture --test-threads=2
     "${test[@]}" timer_floor

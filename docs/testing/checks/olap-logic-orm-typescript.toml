@@ -11,7 +11,7 @@ tiers = ["T1"]
 command = ["bash", "-ec", '''
 transcripts="$PWD/../../target/testing-logs/logic-transcripts-typescript"
 rm -rf "$transcripts"
-(cd ../../server && NABEDRA_LOGIC_RECORD="$transcripts" cargo test --locked -j 2 --test olap_logic)
+(cd ../../server && NABEDRA_LOGIC_RECORD="$transcripts" cargo test --locked --test olap_logic)
 if [ ! -f node_modules/typescript/bin/tsc ]; then
   npm ci --no-audit --no-fund
 fi

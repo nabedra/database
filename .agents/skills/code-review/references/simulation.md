@@ -35,6 +35,21 @@ check's command directly. For a library check, use
 `NABEDRA_CASES=20 cargo test -j 2 --lib "$TEST_FILTER" -- --test-threads=1`
 with the check's feature flags.
 
+## Bring up a workload
+
+When one reason makes most seeds red, a sweep says little about anything else, and neither does the next
+one. In order:
+
+1. Run about 20 seeds without faults. Settle every reason that is red there first: it is a
+   mistake in the harness, a rule that forbids a legal state, or a finding that needs no fault.
+2. Add one fault profile at a time.
+3. Rank red seeds by the reason they are red for alone, and diagnose the largest group first. A fix
+   to a rule cites the text that makes the state legal and keeps its planted bug caught. Report
+   seeds red only for open records apart from the rest. They stay red.
+4. While fewer than half the seeds are clean, sweep 24 seeds per head. Run the full range on the
+   head to merge, or after the largest group is settled.
+5. Start the next workload when the largest group of this one has a cause.
+
 ## Replay
 
 On the first failure a property panics with the property name, the seed, the case number, the
@@ -52,10 +67,8 @@ the test or the simulator.
 ## Shrink
 
 The generator records choices on a tape. After a failure, `prop` tries
-shorter tapes and smaller choices for up to `max_shrink_steps`. Seed replay
-regenerates the original input and runs shrinking again. Keep the smallest
-case found as a fixture when it can be expressed directly. You can also
-write a named regression that replays the failing seed with
+shorter tapes and smaller choices for up to `max_shrink_steps`. Keep the
+smallest case as a fixture, or write a named regression that replays the seed with
 `Config { seed: Some(<seed>), cases: 1, ..Default::default() }` through
 `prop::check_with`.
 

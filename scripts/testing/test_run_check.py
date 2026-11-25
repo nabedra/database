@@ -6,6 +6,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -629,6 +630,8 @@ class ExecuteTests(unittest.TestCase):
                 sys.exit(1)
             elif mode == "env":
                 print("rid=" + os.environ["NABEDRA_REQUEST_ID"] + " knob=" + os.environ["KNOB"])
+            elif mode.startswith("jobs-"):
+                print("jobs=" + os.environ["CARGO_BUILD_JOBS"])
             elif mode == "sleep":
                 time.sleep(30)
             elif mode == "tla-big":
@@ -755,6 +758,15 @@ class ExecuteTests(unittest.TestCase):
         record, _ = self.run_mode("env", parser="exit-code", env={"KNOB": "7"})
         self.assertEqual(record["result"], "pass")
         self.assertIn("rid=req-env knob=7", (self.logs / "req-env--demo.log").read_text())
+
+    def test_cargo_builds_with_two_jobs_unless_the_caller_or_the_check_chose(self):
+        unset = {k: v for k, v in os.environ.items() if k != "CARGO_BUILD_JOBS"}
+        for caller, own, jobs in (({}, {}, "2"), ({"CARGO_BUILD_JOBS": "4"}, {}, "4"),
+                                  ({"CARGO_BUILD_JOBS": "4"}, {"CARGO_BUILD_JOBS": "1"}, "1")):
+            with self.subTest(caller=caller, own=own), unittest.mock.patch.dict(
+                    os.environ, {**unset, **caller}, clear=True):
+                self.run_mode(f"jobs-{jobs}", parser="exit-code", env=own)
+                self.assertIn(f"jobs={jobs}", (self.logs / f"req-jobs-{jobs}--demo.log").read_text())
 
     def test_timeout_kills_the_command(self):
         record, _ = self.run_mode("sleep", parser="exit-code", timeout_s=1)

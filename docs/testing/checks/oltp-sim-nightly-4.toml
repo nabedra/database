@@ -13,7 +13,7 @@ if [[ ${NABEDRA_REQUEST_ID:-} =~ ^nightly-[[:xdigit:]]{7}-([0-9]{4})([0-9]{2})([
 fi
 epoch_day=$(date -u -d "$day" +%s)
 export NABEDRA_SEED=$((1000000 + 20000 * (epoch_day / 86400) + 5000 * NABEDRA_SIM_SHARD))
-exec cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib sweep::tests::sweep \
+exec cargo test --locked --release -p nabedra-sim-oltp --lib sweep::tests::sweep \
     -- --exact --nocapture --test-threads=1
 ''']
 cwd = "server"
