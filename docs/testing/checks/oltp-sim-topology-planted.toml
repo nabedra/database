@@ -1,0 +1,28 @@
+id = "oltp-sim-topology-planted"
+module = "oltp"
+kinds = ["S", "H"]
+# Fault model, no nemesis. Each seeded defect of the topology workload must be reported under the
+# rule it breaks within 8 seeds, by a replayed run whose clean twin judged that rule, and the clean
+# runs of all 8 seeds must report none of those rules. A run that panicked, differed from its replay,
+# left the fault model, gave up or left no report fails the check. Seeds whose clean run is red for
+# another reason still count as the twin of their defect. Six of the eight defects change one
+# observation, so they test the rule and its wiring only.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+"${build[@]}" --no-run
+python3 ../scripts/testing/sim_planted.py --out ../target/testing-logs/oltp-sim-topology-planted \
+  --first "$NABEDRA_SEED" --seeds "$NABEDRA_SEEDS" \
+  lose-row=CoveringIndexComplete duplicate-row=IndexExactlyOnce \
+  choose-building=IncompleteIndexChosen fake-drop=DroppedTableSilent \
+  refresh-twice=StaleRouteRefreshesOnce lie-about-refusal=RefusedDdlApplied \
+  stuck-fence=FenceAfterValidation lose-range=RouteCoverage \
+  -- "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1
+''']
+cwd = "server"
+timeout_s = 5400
+needs = []
+result_parser = "exit-code"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "topology", NABEDRA_SIM_PROFILE = "none", NABEDRA_SIM_TOPOLOGY = "no-move,split-before-load", NABEDRA_SEEDS = "8", NABEDRA_SIM_JOBS = "2", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-topology-planted" }

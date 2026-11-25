@@ -13,6 +13,7 @@ use std::{
 };
 
 pub(crate) mod queued;
+pub(crate) mod topology;
 
 use nabedra_check::{checker::Verdict, history::Event};
 use nabedra_rt::{

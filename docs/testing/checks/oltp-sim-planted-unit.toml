@@ -1,0 +1,12 @@
+id = "oltp-sim-planted-unit"
+module = "testing"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+# What may not count as the detection of a seeded topology defect, and what is not its clean twin.
+command = ["python3", "-m", "unittest", "test_sim_planted"]
+cwd = "scripts/testing"
+timeout_s = 300
+needs = []
+result_parser = "unittest"

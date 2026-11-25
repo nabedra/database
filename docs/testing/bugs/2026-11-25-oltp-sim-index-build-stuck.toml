@@ -1,0 +1,17 @@
+id = "OLTP-sim-index-build-stuck"
+title = "An index build of a live table stays in building for 180 s after the heal while operator resumes are accepted"
+class = "other"
+module = "oltp"
+guarantees = []
+scenarios = ["O12"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 14
+why_not_caught = "The O12 runner interrupts one build at a time; it has no mixed client load or concurrent schema changes around it."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=topology: an index build is ready within 180 s of the heal. Red at 715e062f in default-profile seed 14, where an instrumented run with an unchanged trace hash printed 78 failing steps after the declaration committed, 62 of them its own lifecycle acquisition left pending (LifecyclePending). Red at 9a6bc79e in default-profile seeds 3, 10 and 14, and with NABEDRA_SIM_PROFILE=none NABEDRA_SIM_TOPOLOGY=no-move,split-under-load in seed 5, which has no fault (3, 10 and 5 are not red for it at 715e062f). The bound is the workload's, no text gives one. Seed 5, instrumented with an unchanged trace hash (review-136): the build actor stopped 72 times in a run with `index dependency is still active`, and the failed steps printed are its own lifecycle acquisition left pending (LifecyclePending). What it waits for is not known. Seeds 3 and 10 were not instrumented. Review-136: undecided whether the product or the bound is wrong."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-23"

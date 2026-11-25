@@ -16,7 +16,7 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
     ("D03", &["D03:same-key", "D03:other-key"]),
     ("D04", &["D04:before-quorum", "D04:after-quorum"]),
     ("D05", &["D05:one-paused", "D05:rejoin", "D05:two-paused"]),
-    ("D07", &["D07:split", "D07:leader-move"]),
+    ("D07", &["D07:split", "D07:leader-move", "D07:stale-routes"]),
     (
         "D10",
         &["D10:session-drop", "D10:lane", "D10:one-shot-peer"],
@@ -101,6 +101,52 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
     ),
     ("O31", &["O31:payload-quorum", "O31:marker-quorum"]),
     ("O32", &["O32:full-stop", "O32:isolated-holder"]),
+    ("D11", &["D11:drop", "D11:index"]),
+    (
+        "O12",
+        &[
+            "O12:build-under-load",
+            "O12:build-paused",
+            "O12:worker-lost",
+            "O12:incomplete-not-chosen",
+            "O12:present-once",
+            "O12:retired",
+            "O12:refused-declaration",
+            "O12:refused-under-guard",
+            "O12:unique-validation",
+            "O12:each-phase",
+            "O12:restarted-build",
+            "O12:bounded-space",
+        ],
+    ),
+    (
+        "O16",
+        &[
+            "O16:split-during-scans",
+            "O16:split-during-commits",
+            "O16:move-during-commits",
+            "O16:restart-during-scans",
+            "O16:coverage",
+            "O16:queue-takeover",
+            "O16:snapshot-interrupted",
+        ],
+    ),
+    (
+        "O21",
+        &[
+            "O21:split-keeps-table",
+            "O21:rows-past-100000",
+            "O21:automatic-split",
+        ],
+    ),
+    (
+        "O28",
+        &[
+            "O28:routes-after-split",
+            "O28:paged-metadata",
+            "O28:interrupted-pagination",
+        ],
+    ),
 ];
 
 /// Why a clause cannot run yet, for the sweep record.
@@ -125,6 +171,30 @@ pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
             "needs a probe at each copy phase to place the fault"
         }
         "O32:isolated-holder" => "needs a probe that names the holders of a request",
+        "D11:index" => {
+            "its assertion is SchemaEpochAtCommit, which needs the schema epoch of each commit and of each Catalog publication (probes)"
+        }
+        "O12:worker-lost" => "no public observation names the worker that runs a build",
+        "O12:unique-validation" => {
+            "the product has no unique index: IndexDefinition has no such field"
+        }
+        "O12:refused-under-guard" => {
+            "a rival that reads the Catalog before the winner commits loses the guard, and a later one is refused before it"
+        }
+        "O12:each-phase" => {
+            "placing a fault in backfill, replay, validation or publication needs a probe at each"
+        }
+        "O12:restarted-build" => "no operator request starts a newer attempt of a build",
+        "O12:bounded-space" => "no rule reads the LedgerSnapshot probe of a build",
+        "O16:queue-takeover" => "no public observation names the queue owner",
+        "O16:snapshot-interrupted" => "needs a probe at the start of a snapshot installation",
+        "O21:rows-past-100000" => {
+            "100,001 rows on three replicas and their disk images do not fit this run's memory"
+        }
+        "O21:automatic-split" => "the shard target is 64 MiB; the runs stay far below it",
+        "O28:paged-metadata" | "O28:interrupted-pagination" => {
+            "needs more ranges than one routing page holds"
+        }
         _ => return None,
     })
 }

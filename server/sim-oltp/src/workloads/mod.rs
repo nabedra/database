@@ -17,6 +17,7 @@ pub(crate) mod paused;
 pub(crate) mod queued;
 mod queued_clauses;
 pub(crate) mod resources;
+pub(crate) mod topology;
 
 use std::{collections::BTreeSet, fmt};
 
@@ -28,6 +29,7 @@ pub(crate) enum Workload {
     Cold,
     Move,
     Queued,
+    Topology,
 }
 
 /// The workloads `mixed` rotates through, in seed order.
@@ -41,6 +43,7 @@ impl Workload {
             Workload::Cold => "cold",
             Workload::Move => "move",
             Workload::Queued => "queued",
+            Workload::Topology => "topology",
         }
     }
 
@@ -51,6 +54,7 @@ impl Workload {
             Workload::Cold,
             Workload::Move,
             Workload::Queued,
+            Workload::Topology,
         ]
         .into_iter()
         .find(|workload| workload.name() == name)

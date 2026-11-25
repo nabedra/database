@@ -482,7 +482,11 @@ pub(crate) async fn run(
 
 /// Poll until every worker and gateway reports the run ready with the direct path active, and
 /// a read of one key succeeds through each gateway.
-async fn converge(cluster: &Cluster, ctx: &Ctx, deadline: Duration) -> Result<(), String> {
+pub(crate) async fn converge(
+    cluster: &Cluster,
+    ctx: &Ctx,
+    deadline: Duration,
+) -> Result<(), String> {
     loop {
         let state = if cluster.converged().await {
             clients::read_each(ctx).await
@@ -499,7 +503,7 @@ async fn converge(cluster: &Cluster, ctx: &Ctx, deadline: Duration) -> Result<()
 
 /// What the clients got done in the chaos window: fresh writes that committed, and reads that
 /// were answered, before the heal.
-fn work(attempts: &[clauses::Attempt], from: u64, to: u64) -> (u64, u64) {
+pub(crate) fn work(attempts: &[clauses::Attempt], from: u64, to: u64) -> (u64, u64) {
     let in_window = attempts
         .iter()
         .filter(|a| a.fresh && a.invoked >= from && a.completed <= to);

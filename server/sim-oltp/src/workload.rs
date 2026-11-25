@@ -257,6 +257,17 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
                                 setup.quiet,
                             )
                             .await
+                        } else if workload == Workload::Topology {
+                            workloads::topology::run(
+                                &mut cluster,
+                                &config,
+                                history.clone(),
+                                generator,
+                                seed,
+                                &setup.selection,
+                                setup.quiet,
+                            )
+                            .await
                         } else {
                             workloads::direct::run(
                                 &mut cluster,
