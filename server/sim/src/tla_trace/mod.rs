@@ -26,9 +26,11 @@
 //!   the simulation's runtime (there is no virtual time there), or time that goes backward.
 //!   A step that a task of an earlier incarnation logs after the node is up again is not
 //!   found: the World does not say which incarnation a task is of;
-//! - a panic anywhere in the run, caught or not ([`runs`]);
+//! - a panic anywhere in the run, caught or not ([`runs`], which names two kinds that are
+//!   not seen);
 //! - any write error;
-//! - no commit SHA from git, or sources that are not that commit's ([`commit`]).
+//! - no commit SHA from git, or sources that are not that commit's ([`commit`], which says
+//!   what it does not find).
 //!
 //! # A trace cut short never looks complete
 //!
@@ -43,8 +45,10 @@
 //! that, such as in a check of the run's result, leaves the trace, which is complete.
 //!
 //! A run that starts over a trace of its seed moves that aside first (`.previous`), and its
-//! bytes must come out equal. Of two processes that write one seed into one directory, the
-//! second to finish must have the same bytes, or it fails and the first one's file stays.
+//! bytes must come out equal. Of two processes that write one seed into one directory at the
+//! same time, the second to finish must have the same bytes, or it fails and the first one's
+//! file stays. A process that starts after the other has finished moves its file aside, and
+//! if it then fails, neither file has the name.
 //!
 //! # Determinism
 //!
