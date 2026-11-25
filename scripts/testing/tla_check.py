@@ -33,7 +33,8 @@ The search rule. TLC reports an exhaustive search whatever a cfg cuts away, so:
   - a cfg may not override a name it checks, its constraints or its INIT, NEXT or SPECIFICATION. Giving a
     declared CONSTANT its value is free. Overriding any other definition, such as Nat, needs a `limit` line;
   - an override may not replace a definition that a constraint uses, unless by a constant value;
-  - a cfg sets each CONSTANT or other name, and INIT, NEXT and SPECIFICATION, once;
+  - a cfg reads from end to end (_CfgReader), and sets each CONSTANT or other name, and INIT, NEXT and
+    SPECIFICATION, once;
   - a mutant cfg is held to the same rule, with the baselines' `limit` lines only (mutant_problems). It sets the
     constant Mutant to another value than the baselines that check its property, of which there must be one, and
     runs the INIT, NEXT or SPECIFICATION of a baseline. The control shows that the property holds at the
@@ -469,6 +470,125 @@ class Model:
                 for _, full in self.regions(name)]
 
 
+class _CfgReader:
+    r"""A cfg, from end to end, in the forms of TLC's cfg reader (tlc2.tool.impl.ModelConfig) that this runner reads too:
+
+      cfg     ::= { section }
+      section ::= (CONSTANT | CONSTANTS) { entry } | one NAME | list { NAME } | CHECK_DEADLOCK (TRUE | FALSE)
+      entry   ::= NAME "=" value | NAME "<-" [ "[" NAME "]" ] NAME
+      value   ::= NAME | NUMBER | STRING | "{" [ value { "," value } ] "}"
+      one     ::= INIT | NEXT | SPECIFICATION | VIEW | SYMMETRY | ALIAS
+      list    ::= the other keywords
+
+    TLC also has `Op(value) = value`, `A!B <- C`, `X = [Module] value`, other words and operators as model values and
+    as names, and three more keywords. A name that TLC's lexer splits or reads as a number is none here."""
+
+    _TOKEN = re.compile(r'(?P<space>[ \t\n]+|\\\*[^\n]*)|(?P<comment>\(\*)|(?P<string>"[^"\\\n]*")|(?P<number>[0-9]+(?!\w))'
+                        r'|(?P<name>(?!(?:WF|SF)_)_*[A-Za-z]\w*)|(?P<symbol><-|[={},\[\]])', re.ASCII)
+    _ONE = ("INIT", "NEXT", "SPECIFICATION", "VIEW", "SYMMETRY", "ALIAS")
+    _OTHER = ("_PERIODIC", "_RL_REWARD", "_POSSIBLE")
+
+    def __init__(self, text: str) -> None:
+        self.text, self.pos = text, 0
+        self.kind = self.token = ""
+        self.at = 0
+        self.next()
+
+    def refuse(self, why: str) -> None:
+        raise _Refused(self.at, why)
+
+    def next(self) -> None:
+        while True:
+            self.at = self.pos
+            m = self._TOKEN.match(self.text, self.pos)
+            if not m:
+                self.kind, self.token = "end", ""
+                if self.pos < len(self.text):
+                    self.refuse(f"{self.text[self.pos]!r} starts no name, number, string or symbol")
+                return
+            self.pos, self.kind, self.token = m.end(), m.lastgroup, m.group()
+            if self.kind == "comment":
+                self.skip_comment()
+            elif self.kind != "space":
+                return
+
+    def skip_comment(self) -> None:
+        depth = 1
+        while depth:
+            m = re.compile(r"\(\*|\*\)").search(self.text, self.pos)
+            if not m:
+                self.refuse("the comment does not end")
+            self.pos = m.end()
+            depth += 1 if m.group() == "(*" else -1
+
+    def take(self, *tokens: str) -> bool:
+        """Goes past the token if it is one of these."""
+        if self.kind != "string" and self.token in tokens:
+            self.next()
+            return True
+        return False
+
+    def expect(self, *tokens: str) -> None:
+        if not self.take(*tokens):
+            self.refuse(f"{self.token!r} instead of {' or '.join(tokens)}")
+
+    def is_name(self) -> bool:
+        return self.kind == "name" and self.token not in tc._CFG_KEYWORDS and self.token not in self._OTHER
+
+    def name(self) -> None:
+        if not self.is_name():
+            self.refuse(f"{self.token!r} instead of a name")
+        self.next()
+
+    def value(self) -> None:
+        if self.take("{"):
+            if not self.take("}"):
+                self.value()
+                while self.take(","):
+                    self.value()
+                self.expect("}")
+        elif self.kind in ("number", "string"):
+            self.next()
+        else:
+            self.name()
+
+    def read(self) -> None:
+        while self.kind != "end":
+            keyword = self.token
+            if self.kind != "name" or keyword not in tc._CFG_KEYWORDS:
+                self.refuse(f"{keyword!r} instead of a keyword")
+            self.next()
+            if keyword in ("CONSTANT", "CONSTANTS"):
+                while self.is_name():
+                    self.next()
+                    if self.take("<-"):
+                        if self.take("["):
+                            self.name()
+                            self.expect("]")
+                        self.name()
+                    else:
+                        self.expect("=", "<-")
+                        self.value()
+            elif keyword == "CHECK_DEADLOCK":
+                self.expect("TRUE", "FALSE")
+            elif keyword in self._ONE:
+                self.name()
+            else:
+                while self.is_name():
+                    self.next()
+
+
+def cfg_problem(cfg: Path) -> str | None:
+    """Where the cfg is none that _CfgReader reads, or None."""
+    text = cfg.read_text(encoding="utf-8")
+    try:
+        _CfgReader(text).read()
+    except _Refused as exc:
+        line = text.count("\n", 0, exc.at)
+        return f"the cfg does not read at line {line + 1} ({(text + chr(10)).split(chr(10))[line].strip()!r}): {exc.why}"
+    return None
+
+
 def limits_of(cfg: Path) -> dict[str, str]:
     """The names a cfg declares with `\\* limit: <Name> -- <reason>` lines."""
     return dict(_LIMIT.findall(cfg.read_text(encoding="utf-8")))
@@ -486,7 +606,8 @@ def search_problems(model: Model, cfg: Path, declared: dict[str, str] | None = N
     the place of the cfg's own `limit` lines."""
     parsed = tc.parse_cfg(cfg)
     declared = limits_of(cfg) if declared is None else declared
-    problems: list[str] = []
+    unread = cfg_problem(cfg)
+    problems: list[str] = [unread] if unread else []
     limits: list[tuple[str, str, str]] = []
 
     def declare(kind: str, name: str) -> None:

@@ -1223,6 +1223,84 @@ class CheckOrchestrationTests(unittest.TestCase):
         self.assertIn("FAIL mutant vac: does not count: the cfg sets MaxCrashes more than once", text)
         self.assertNotIn("vac.cfg", self.fake.ran)
 
+    # A cfg reads from end to end. What TLC does with each form is from runs of the pinned TLC and the source of its
+    # reader, ModelConfig.java and tla+.jj at bc1b506. It reads every accepted one to the same value.
+
+    CFG = 'CONSTANTS\n  A = 1\n  {}\nINIT Init\nNEXT Next\nINVARIANTS TypeOK Safe\n'
+
+    def cfg_problem(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "x.cfg").write_bytes(text.encode("utf-8"))
+            return tla_check.cfg_problem(Path(d) / "x.cfg")
+
+    def test_cfg_entries_that_read(self):
+        for entry in ("V = foo", "V=12", 'V = "s (* CONSTANT V = 1 *)"', 'V = ""', "V = TRUE", "V = {}", 'V = {1,{2,"a"},{}}', "V = { a , b }", "V <- Foo", "V<-Foo",
+                      "V <- [Mod] Foo", "V<-[Mod]Foo", "V\n=\n1", "V(*a*)=(*b*)1(*c*)", "V\\*a\n=\\*b\n1\\*c", "V = 007", "V = 1 \\* W(1) = 2", "V = 1 (* W(1) = 2 *)",
+                      "V = 1 (* (* W(1) = 2 *) *)", "V = 1 (* \\* *)", "V = 1 (**)", "V = 1 (*)*)", "V = 1 (*. W *)", "V = 1 (* (*) *) *)", 'V = 1 (* " *) (* " *)',
+                      "V = 1 \\* (*\n\\* *)", "V = _a", "V = a_1", "V = S_x", "V = W", "V = WFx", "V = WF", "V = IF", "V = 1 W = 2", "V = 1\tW <- X\r\n", "", "V = 1\nCONSTANT W = 2\nCONSTANTS"):
+            with self.subTest(entry):
+                self.assertIsNone(self.cfg_problem(self.CFG.format(entry)))
+        for text in ("", "\n", "\\* x", "(* x *)", self.CFG.format("V = 1").rstrip("\n") + " \\* x", self.CFG.format("V = 1").replace("\n", "\r"),
+                     "SPECIFICATION Spec\nPROPERTY P Q\nPROPERTIES R\nCONSTRAINT C\nCONSTRAINTS C D\nACTION_CONSTRAINT E\nACTION_CONSTRAINTS E\nINVARIANT I\nSYMMETRY S\nVIEW V\n"
+                     "ALIAS Al\nPOSTCONDITION P\nPOSTCONDITIONS P Q\nCHECK_DEADLOCK FALSE\nINVARIANTS\n"):
+            with self.subTest(text):
+                self.assertIsNone(self.cfg_problem(text))
+
+    def test_cfg_entries_that_do_not_read(self):
+        # TLC reads some of these, and then a name has a value that the rest of the runner does not see.
+        for entry in ("V(1) = 1", "V(1, 2) = 1", "V(a) <- Foo", "V = [Mod] 1", "Mod!V = 1", "Mod!V <- Foo", "V <- 1", 'V <- "x"', "V <- [1] Foo", "V <- INIT", "V <- [INIT] Foo", "V = INIT",
+                      "V = {NEXT}", "V = _PERIODIC", "_PERIODIC = 1", "V <- _RL_REWARD", "V = @", "V = +", "V = \u2115", "V = 1a", "1a = 1",
+                      # And TLC refuses the rest.
+                      "V = -1", "V = <<1, 2>>", "V = <<>>", "V = 1.5", "V = \\b101", 'V = "a\\"b"', 'V = "a\\nb"', "V() = 1", "V = _1", "_1 = 1", "V = 1_", "V = WF_x", "V = SF_x", "V \u2190 Foo",
+                      "V = {1,}", "V = {1 2}", "V = {,}", "V = {1", "V = {1, {2}", "V = 1}", "V = 1;", "V = 1,", "V == 1", "V := 1", "V = [a |-> 1]", "V = 1..2", "V = (1)", 'V = "a', 'V = "a\nb"',
+                      "V = 'a'", "V = 1 (* x", "V = 1 (* (* x *)", "V = 1 *)", "V = 1 ----", "V = 1 ====", "V\x0c= 1", "V\x0b= 1", "V\u00a0= 1", "V\u2028= 1", "V =", "V", "= 1", "V <-",
+                      "V <- [Mod]", "V <- [] Foo", "V <- [Mod Foo", "V <- Mod] Foo", "V = a!b", "V = a.b", 'V = "x" "y"', '"V" = 1', "V = 1 2", "1 = 1", "V = 1W = 2", "V\u00e9 = 1", "V = \u00e9", "V = a\u00e9", "V = W = 1", "V <- W <- X"):
+            with self.subTest(entry):
+                self.assertIn("the cfg does not read at line ", self.cfg_problem(self.CFG.format(entry)) or "reads")
+        cfg = self.CFG.format("V = 1")
+        for old, new in (("TypeOK Safe", "TypeOK, Safe"), ("TypeOK", "Inst!TypeOK"), ("TypeOK", "1"), ("TypeOK", '"TypeOK"'), ("TypeOK", "WF_x"), ("TypeOK", "TypeOK = 1"), ("TypeOK", "TypeOK <- X"),
+                         ("TypeOK", "_POSSIBLE P"), ("NEXT Next", "NEXT Next\n_PERIODIC P"), ("NEXT Next", "_RL_REWARD R\nNEXT Next"), ("INIT Init", "INIT Init Init"), ("INIT Init", "INIT"),
+                         ("INIT Init", "INIT 1"), ("INIT Init", 'INIT "Init"'), ("INIT Init", "VIEW V W"), ("INIT Init", "SYMMETRY S1 S2"), ("INIT Init", "ALIAS A B"), ("INIT Init", "SPECIFICATION S T"), ("NEXT Next", "NEXT Next N"),
+                         ("NEXT Next", "NEXT Next\nCHECK_DEADLOCK no"), ("NEXT Next", "NEXT Next\nCHECK_DEADLOCK"), ("NEXT Next", "NEXT Next\nCHECK_DEADLOCK TRUE FALSE"), ("NEXT Next", 'NEXT Next\nCHECK_DEADLOCK "TRUE"'),
+                         ("CONSTANTS", "x CONSTANTS"), ("CONSTANTS", "\ufeffCONSTANTS"), ("CONSTANTS", "constants"), ("CONSTANTS", '"CONSTANTS"'), ("INVARIANTS", '"INVARIANTS"'), ("CONSTANTS", "CONSTANTS CHECK_DEADLOCK"), ("CONSTANTS", "{")):
+            with self.subTest(new):
+                self.assertIn("the cfg does not read at line ", self.cfg_problem(cfg.replace(old, new, 1)) or "reads")
+
+    def test_a_cfg_that_does_not_read_names_the_line(self):
+        for entry, want in (("V(1) = 1", "line 3 ('V(1) = 1'): '(' starts no name, number, string or symbol"), ("V = 1 2 \\* x", "line 3 ('V = 1 2 \\\\* x'): '2' instead of a keyword"),
+                            ("V = {1 2}", "line 3 ('V = {1 2}'): '2' instead of }"), ("V 1", "line 3 ('V 1'): '1' instead of = or <-"), ("V = 1\n(* x\ny", "line 4 ('(* x'): the comment does not end"),
+                            ("V = [Mod] 1", "line 3 ('V = [Mod] 1'): '[' instead of a name"), ("V =", "line 4 ('INIT Init'): 'INIT' instead of a name")):
+            with self.subTest(entry):
+                self.assertEqual(self.cfg_problem(self.CFG.format(entry)), "the cfg does not read at " + want)
+        self.assertEqual(self.cfg_problem("INIT"), "the cfg does not read at line 1 ('INIT'): '' instead of a name")
+        self.assertEqual(self.cfg_problem("INIT\n"), "the cfg does not read at line 2 (''): '' instead of a name")
+
+    def test_every_cfg_has_to_read(self):
+        for cfg, kw in (("TwoPhase.cfg", {}), ("TwoPhase.more.cfg", {}), ("TwoPhase.large.cfg", dict(extra=("--tier", "T2"))), ("mutants/no_resend.cfg", dict(spare=False))):
+            with self.subTest(cfg):
+                more = lambda spec: shutil.copy(spec / "TwoPhase.cfg", spec / "TwoPhase.more.cfg")
+                _, summary, text = self.run_fake({**GOOD, "TwoPhase.large.cfg": ["pass", 0]}, prep=[more, self.in_cfg(cfg, ("CONSTANTS\n", "CONSTANTS\n    Cap(1) = 1\n"))], **kw)
+                self.assertEqual((summary["verdict"], summary["failed"]), ("fail", 1), text)
+                self.assertIn("the cfg does not read at line ", text)
+                self.assertIn("('Cap(1) = 1'): '(' starts no name", text)
+
+    def test_a_reordered_operator_constant_is_no_control(self):
+        """The reviewer's D1b: Cap(1) is 1 and 2 in another order, next to other constants, and TLC takes the first."""
+        vac = lambda spec: (spec / "mutants" / "vac.cfg").write_text(
+            '\\* expect: OneCrash\nCONSTANTS\n    RM <- MCRM\n    MaxCrashes = 1\n    Cap(1) = 2\n    MaxDrops = 1\n    Cap(1) = 1\n    Mutant = "no_resend"\nSPECIFICATION Spec\nINVARIANTS OneCrash\n')
+        _, summary, text = self.run_fake({**GOOD, "vac.cfg": ["invariant", 12]}, spare=False, edits={"vac.cfg": [["Invariant Consistent is violated", "Invariant OneCrash is violated"]]}, prep=[
+            add_to_model("OneCrash == crashes <= 1"), vac, self.in_cfg("TwoPhase.tla", ("CONSTANTS", "CONSTANTS Cap(_),")),
+            self.in_cfg("TwoPhase.cfg", ("    MaxCrashes = 1\n    MaxDrops = 1\n", "    MaxDrops = 1\n    Cap(1) = 1\n    MaxCrashes = 1\n    Cap(1) = 2\n"), ("TypeOK Consistent", "TypeOK Consistent OneCrash"))])
+        self.assertEqual(summary["verdict"], "fail", text)
+        self.assertIn("FAIL search of TwoPhase.cfg: the cfg does not read at line ", text)
+        self.assertIn("FAIL mutant vac: does not count: the cfg does not read at line 5 ('Cap(1) = 2')", text)
+        self.assertNotIn("vac.cfg", self.fake.ran)
+
+    def test_the_selftests_cfgs_read(self):
+        for cfg in SELFTEST.rglob("*.cfg"):
+            with self.subTest(cfg.name):
+                self.assertIsNone(tla_check.cfg_problem(cfg))
+
     # The settings, for the reviewer.
 
     def settings_of(self, summary):
