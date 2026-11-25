@@ -351,7 +351,7 @@ class Model:
 
     def places(self, name: str) -> list[tuple[str, re.Match]]:
         """Every definition of the name, anywhere in a line: (module, match up to the body)."""
-        pattern = re.compile(rf"(?<![\w!]){re.escape(name)}\s*({_PARAMETERS})?\s*==(?!=)")
+        pattern = re.compile(rf"(?<!\w){re.escape(name)}\s*({_PARAMETERS})?\s*==(?!=)")
         return [(module, m) for module, text in self.texts.items() for m in pattern.finditer(text)]
 
     def defines(self, name: str) -> bool:
@@ -462,17 +462,15 @@ def settings(cfg: Path) -> frozenset[str]:
     text = tc.strip_tla_comments(cfg.read_text(encoding="utf-8"))
     tokens = re.findall(r'"[^"]*"|\w+|<-|[^\s\w]', text)
     out: list[list[str]] = []
-    section, depth = None, 0
+    section = None
     for i, token in enumerate(tokens):
         if token in tc._CFG_KEYWORDS:
             section = token.removesuffix("S")
             if section in _SPECIFICATION:
                 out.append([section])
-            depth = 0
             continue
-        if section == "CONSTANT" and depth == 0 and re.fullmatch(r"\w+", token) and tokens[i + 1:i + 2] in (["="], ["<-"]):
+        if section == "CONSTANT" and re.fullmatch(r"\w+", token) and tokens[i + 1:i + 2] in (["="], ["<-"]):
             out.append([])
-        depth += (token in "([{") - (token in ")]}")
         if section in ("CONSTANT", *_SPECIFICATION) and out:
             out[-1].append(token)
     return frozenset(" ".join(entry) for entry in out)

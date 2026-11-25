@@ -372,6 +372,11 @@ class FitRecordTests(unittest.TestCase):
         self.assertEqual(self.dropped, {"not_run": 16})
         self.assertEqual(len(record["assertions"]["not_run"]), 200)
 
+    def test_the_count_of_dropped_entries_is_never_cut(self):
+        record = t_record(failed=30, mutants=[mutant(i, ok=False) for i in range(30)], not_run=[{"id": "t", "reason": "r"}] * 215)
+        self.fit(record)  # checks the last entry
+        self.assertEqual(self.dropped, {"not_run": 16, "shortened": 30})
+
     def test_unlisted_failing_traces_are_counted(self):
         failing = [{"file": f"t{i}.ndjson", "index": 3, "reason": "r" * 100} for i in range(20)]
         record = t_record(mode="trace", executed=40, failed=33,

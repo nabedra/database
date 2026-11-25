@@ -106,6 +106,7 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(evidence.tla_contradictions(facts), [])
         for change in ({"mode": "guess"}, {"mode": None}, {"uncovered": ["A"]}, {"mutants": [{"name": "m", "ok": False}]},
                        {"mutants": [{"name": "m"}]}, {"runs": [{"cfg": "X.cfg", "verdict": "incomplete"}]},
+                       {"runs": [{"cfg": "X.cfg", "verdict": "incomplete", "states_left": 0}]},
                        {"runs": [{"cfg": "X.cfg", "verdict": "pass", "states_left": 4}]},
                        {"runs": [{"cfg": "X.cfg", "verdict": "pass", "states_left": None}]},
                        {"traces": {"failing": [{"file": "a"}]}}, {"dropped": {"failing_mutants": 1}},

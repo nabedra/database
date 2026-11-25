@@ -598,7 +598,7 @@ class CheckOrchestrationTests(unittest.TestCase):
         "a definition with parameters": " Less", "an undefined name": " Nope", "another module's": " Ext!ExtBound",
         "an empty body": "", "an empty quantifier": " \\A s \\in S :", "an empty last conjunct": " n <= 1 /\\", "two ands": " n <= 1 /\\ /\\ m <= 1",
         "an empty group": " ()", "no left operand": " <= 1", "no right operand": " n <=", "an open bracket": " (n <= 1", "a closed one": " n <= 1)",
-        "crossed brackets": " n <= 1) /\\ (m <= 1", "an open index": " n[Max <= 1", "a second comparison": " n <= 1 <= Max", "a word after it": " n <= 1 up",
+        "crossed brackets": " n <= 1) /\\ (m <= 1", "an open index": " n[Max <= 1", "a second comparison": " n <= 1 <= Max", "a word after it": " n <= 1 up", "a definition on the same line": " n <= 1 Z == up",
         "a line after it": " n <= 1\n  up", "a continued line": " n <= 1\n  + 1", "an or on the next line": " n <= 1\n\\/ up", "a number after it": " n <= 1 2",
         "Unicode not-equal": " n ≠ 1", "Unicode or": " n <= 1 ∨ up", "Unicode implies": " up ⇒ n <= 1", "Unicode and": " n <= 1 ∧ m <= 1",
         "Unicode order": " n ≤ 1", "Unicode for all": " ∀ s \\in S : n[s] <= 1", "a Unicode digit": " n <= ١", "a Unicode space": " n <= 1 \\/ up",
@@ -619,7 +619,9 @@ class CheckOrchestrationTests(unittest.TestCase):
         # Text before the module counts as lines of the file, and a named bound is refused where it is wrong.
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "M.tla").write_text("A note.\nTwo lines.\n---- MODULE M ----\n(* a\ncomment *)\nVARIABLE n\nB == n # 1\nFew == B\n====\n")
-            self.assertIn("M.tla line 7: '#' instead of <", tla_check.Model(Path(d), "M.tla").bound_problem("Few"))
+            problem = tla_check.Model(Path(d), "M.tla").bound_problem("Few")
+            self.assertIn("M.tla line 7: '#' instead of <", problem)
+            self.assertEqual((problem.count("line"), problem.count("a constraint may")), (1, 1))
 
     def test_a_body_ends_at_the_next_unit(self):
         for unit in ("VARIABLE x", "CONSTANT X", "ASSUME up", "THEOREM up", "LOCAL Z == up", "RECURSIVE F2(_)", "INSTANCE M2", "Z == up", "  Z == up",
@@ -642,8 +644,18 @@ class CheckOrchestrationTests(unittest.TestCase):
             inner = f"---- MODULE Inner ----\n{declared}\n====\n"
             self.assertIsNotNone(self.bound(body, extra=inner + "q == IF up THEN 0 ELSE 9\n"))
             self.assertIsNone(self.bound(body, extra=declared + "\n"))
-        both = "---- MODULE Inner ----\nVARIABLE Max\nCONSTANT n\n====\n"
-        self.assertIsNotNone(self.bound(" n <= Max", extra=both))
+        for declared, body in (("CONSTANT n", " n <= 1"), ("VARIABLE Max", " m <= Max"), ("VARIABLE S", " \\A s \\in S : n[s] <= 1")):
+            self.assertIsNotNone(self.bound(body, extra=f"---- MODULE Inner ----\n{declared}\n====\n"))
+        # Nor is a definition with parameters, or one of an instantiated module, a named bound.
+        self.assertIsNotNone(self.bound(" Par", extra="Par(x) == n <= 1\n"))
+        self.assertIsNotNone(self.bound(" Par", extra="Par[x \\in S] == n <= 1\n"))
+        self.assertIsNotNone(self.bound(" InOther", extra="INSTANCE Other WITH n <- Cap\n",
+                                        Other="---- MODULE Other ----\nVARIABLE n\nInOther == n <= 1\n====\n"))
+        # A set of constants is read to its end too.
+        for body in ("S \\cup S \\ up", "S \\cap up", "up", "up \\cup S", "S \\cup {up}", "{}", "{Max", "S \\cup", "{Max, }", "IF up THEN S ELSE S", "S\n  \\ up",
+                     "Dyn", "S \\cup Dyn", "SUBSET S", "[S -> S]", "S \\cup {s \\in S : up}"):
+            self.assertIsNotNone(self.bound(" \\A s \\in Bad : n[s] <= 1", extra=f"Bad == {body}\n"), body)
+        self.assertIsNone(self.bound(" \\A s \\in Fine : n[s] <= 1", extra="Fine == {Max, Own} \\cup S \\union\n  {Max}\n"))
         # What an instantiated module declares or defines is not the model's: it may be substituted there.
         other = "---- MODULE Other ----\nCONSTANT C\nVARIABLE v\nB == v <= C\n====\n"
         for body in (" v <= 1", " n <= C", " B"):

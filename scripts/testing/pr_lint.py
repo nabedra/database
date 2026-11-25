@@ -27,9 +27,8 @@ import tomllib
 REQUIRED = ("Guarantees", "Evidence", "Not run", "Reviewers")
 FIELD = re.compile(r"^(Guarantees|Evidence|Not run|Reviewers|Design):[ \t]*(.*)$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-# The loose reading: an opening fence may follow list markers, and a closing one may be indented more.
-LOOSE_OPEN = re.compile(r"^[ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)*(`{3,}|~{3,})(.*)$")
-LOOSE_CLOSE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
+# The loose reading: a fence may have any indent, and follow list markers.
+LOOSE_FENCE = re.compile(r"^[ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)*(`{3,}|~{3,})(.*)$")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULES_PATH = REPO_ROOT / "docs" / "testing" / "modules.toml"
 RUN_URL = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/actions/runs/\d+")
@@ -140,7 +139,7 @@ def design_section(text, fences="strict"):
     the top level, "loose" with fences at any indent and after list markers, or "none" with every line as text."""
     out, level, fence = [], 0, ""
     for line in text.splitlines():
-        pattern = FENCE if fences == "strict" else LOOSE_CLOSE if fence else LOOSE_OPEN
+        pattern = FENCE if fences == "strict" else LOOSE_FENCE
         marker = None if fences == "none" else pattern.match(line)
         if marker:
             run, tail = marker.groups()
