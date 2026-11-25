@@ -1769,7 +1769,8 @@ pub(crate) async fn run(
     }
     changes_settled(cluster, &t, &mut report);
     if let Some(chaos) = chaos.as_mut().filter(|chaos| chaos.split_pending()) {
-        chaos.finish_split(cluster, &ctx, healed).await;
+        let from = cluster.world.elapsed();
+        chaos.finish_split(cluster, &ctx, from).await;
     }
     if let Some(chaos) = chaos.as_ref() {
         chaos.check_abandoned(cluster, &ctx).await;
