@@ -28,9 +28,13 @@ use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
 pub use nabedra_oltp_types::sim_probe::{Ledger, LogEntry, Probe, ProbeSink, RouteRecord, Span};
-use nabedra_oltp_types::{sim_probe, types::GroupKind};
+use nabedra_oltp_types::{
+    sim_probe,
+    types::{Digest, GroupKind},
+};
 
 use crate::{
+    history::Bodies,
     invariants::{
         Invariants,
         protocol::{Ledgers, NOT_APPLIED_NEVER_COMMITTED, Origin, Protocol},
@@ -173,17 +177,18 @@ impl Probes {
     /// NotAppliedNeverCommitted: after a definite `not_applied` answer, no replica ever
     /// applies a direct entry that commits that identity and body (lead decision 12.1). A
     /// retry of the ID excuses nothing. D03 requires a refusal of another body under a
-    /// committed identity, so a refusal is excused only when the refused body had not been
-    /// sent yet when the identity was first applied: the entry then carries another body.
-    /// A second entry under the identity is DedupUnique's.
-    pub fn check_outcomes(&self, world: &World, events: &[Event]) {
+    /// committed identity. The entry carries the product's digest of its body, and `bodies`
+    /// has the same digest of every body that was sent, so a refusal is excused only when each
+    /// committed digest is the one of another body sent under the identity. A second entry
+    /// under the identity is DedupUnique's.
+    pub fn check_outcomes(&self, world: &World, events: &[Event], bodies: &Bodies) {
         let committed: BTreeMap<_, _> = self
             .lock()
             .protocol
             .committed()
-            .map(|(identity, t_ns)| {
+            .map(|(identity, committed)| {
                 let key = format!("{}/{}", identity.table, identity.key.history());
-                ((key, identity.request_id.to_string()), t_ns)
+                ((key, identity.request_id.to_string()), committed.clone())
             })
             .collect();
         for event in events {
@@ -197,8 +202,8 @@ impl Probes {
             };
             self.ran(NOT_APPLIED_NEVER_COMMITTED, 1);
             for key in keys(event, events) {
-                if let Some(t_ns) = committed.get(&(key.clone(), request.clone())) {
-                    if first_sent(event, events).is_some_and(|sent| sent > *t_ns) {
+                if let Some((t_ns, digests)) = committed.get(&(key.clone(), request.clone())) {
+                    if another_body(event, events, bodies, digests) {
                         continue;
                     }
                     self.report(world, NOT_APPLIED_NEVER_COMMITTED, format!(
@@ -335,25 +340,48 @@ impl Probes {
     }
 }
 
-/// When the body that `refused` answers was first sent under its identity, in virtual ns. A
-/// body is an operation and its input. `None` when the history does not say.
-fn first_sent(refused: &Event, events: &[Event]) -> Option<u64> {
-    let sent = |event: &&Event| {
-        event.kind == EventType::Invoke
-            && event.request_id == refused.request_id
-            && event.key == refused.key
+/// The invocation that `refused` answers. `None` unless its process has exactly that one call
+/// open, under the same identity: otherwise the history does not say which body was refused.
+fn open_call(refused: &Event, events: &[Event]) -> Option<usize> {
+    let mut open = Vec::new();
+    for event in events
+        .iter()
+        .filter(|event| event.process == refused.process && event.index < refused.index)
+    {
+        if event.kind == EventType::Invoke {
+            open.push(event);
+        } else if open.len() == 1 {
+            open.clear();
+        } else {
+            return None;
+        }
+    }
+    let [call] = open[..] else { return None };
+    (call.request_id == refused.request_id && call.f == refused.f).then_some(call.index)
+}
+
+/// Whether every committed digest is of a body that was sent under the identity and is not the
+/// one that `refused` answers. A body or a digest that the history does not know proves nothing.
+fn another_body(
+    refused: &Event,
+    events: &[Event],
+    bodies: &Bodies,
+    committed: &BTreeSet<Digest>,
+) -> bool {
+    let sent =
+        |event: &&Event| event.kind == EventType::Invoke && event.request_id == refused.request_id;
+    let Some(body) = open_call(refused, events).and_then(|index| bodies.get(&index)) else {
+        return false;
     };
-    let body = events
+    let known: BTreeSet<_> = events
         .iter()
         .filter(sent)
-        .rfind(|invoke| invoke.process == refused.process && invoke.index < refused.index)?;
-    events
-        .iter()
-        .filter(sent)
-        .filter(|invoke| invoke.f == body.f && invoke.value == body.value)
-        .map(|invoke| invoke.time_ns)
-        .min()
-        .flatten()
+        .filter_map(|invoke| bodies.get(&invoke.index))
+        .collect();
+    !committed.is_empty()
+        && committed
+            .iter()
+            .all(|digest| digest != body && known.contains(digest))
 }
 
 /// The `table/key` names an operation's history event covers: its own key, or the rows its

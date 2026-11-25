@@ -330,7 +330,7 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         );
         checks.check_history(&world, &verdict);
     }
-    checks.check_outcomes(&world, history.events());
+    checks.check_outcomes(&world, history.events(), history.bodies());
     assertions.insert("probe invariants", checks.probe_invariants_hold());
     let mut capture = trace.lock().unwrap();
     capture.flush_frames();
@@ -446,6 +446,7 @@ impl Scenario<'_> {
                 .cloned()
                 .unwrap_or_else(|| payload.clone()),
         };
+        let body = operation(id, name, payload);
         let attempt = self.history.invoke(
             client,
             &self.cluster.world,
@@ -458,6 +459,7 @@ impl Scenario<'_> {
                 value: input,
             },
         );
+        self.history.sends(&attempt, &body);
         let deadline = if table.is_none() {
             SETUP_DEADLINE
         } else {
@@ -468,7 +470,7 @@ impl Scenario<'_> {
             gateway,
             OPERATIONS,
             &self.cluster.config.data_token,
-            Some(operation(id, name, payload)),
+            Some(body),
             deadline,
         )
         .await

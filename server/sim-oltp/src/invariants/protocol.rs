@@ -288,8 +288,9 @@ pub struct Protocol {
     last_applied: BTreeMap<(u64, u64, Replica), u64>,
     /// Where each replica runs.
     replica_node: BTreeMap<Replica, u64>,
-    /// Identities whose committed entry some replica applied, and when the first did.
-    committed: BTreeMap<DedupIdentity, u64>,
+    /// Identities whose committed entry some replica applied, when the first did, and the
+    /// digests of the bodies that the entries carry.
+    committed: BTreeMap<DedupIdentity, (u64, BTreeSet<Digest>)>,
     /// Transactions started to apply a direct entry.
     attempts: u64,
     /// Per thread: the direct entry its last transaction started to apply, and the attempt.
@@ -474,7 +475,9 @@ impl Protocol {
                 };
                 self.committed
                     .entry(identity.clone())
-                    .or_insert(origin.t_ns);
+                    .or_insert_with(|| (origin.t_ns, BTreeSet::new()))
+                    .1
+                    .insert(*digest);
                 let applying = self.applying.get(&origin.thread);
                 if let Some((entry, attempt)) = applying
                     && node == Some(entry.0)
@@ -1227,10 +1230,8 @@ impl Protocol {
     }
 
     /// Identities of applied direct commits, with the virtual time of the first apply.
-    pub fn committed(&self) -> impl Iterator<Item = (&DedupIdentity, u64)> {
-        self.committed
-            .iter()
-            .map(|(identity, t_ns)| (identity, *t_ns))
+    pub fn committed(&self) -> impl Iterator<Item = (&DedupIdentity, &(u64, BTreeSet<Digest>))> {
+        self.committed.iter()
     }
 }
 

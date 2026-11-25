@@ -339,9 +339,10 @@ pub(crate) async fn attempt(
     fresh: bool,
 ) -> Completion {
     let key = request.anchor.to_string();
+    let body = operation(request.id, request.name, request.payload.clone());
     let invoked = {
         let mut history = ctx.history.lock().unwrap();
-        history.invoke(
+        let invoked = history.invoke(
             client,
             &ctx.world,
             gateway,
@@ -352,7 +353,9 @@ pub(crate) async fn attempt(
                 request_id: request.id,
                 value: request.input.clone(),
             },
-        )
+        );
+        history.sends(&invoked, &body);
+        invoked
     };
     let started = ctx.now_ms();
     let call = Call {
@@ -367,7 +370,7 @@ pub(crate) async fn attempt(
         gateway,
         OPERATIONS,
         &ctx.token,
-        Some(operation(request.id, request.name, request.payload.clone())),
+        Some(body),
         ctx.timeout,
     )
     .await

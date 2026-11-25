@@ -15,7 +15,7 @@ use nabedra_sim::sweep::{self, PlantedSearch, SeedRun, SeedSummary, SweepConfig,
 use serde_json::{Value, json};
 
 use crate::{
-    invariants::protocol::PROBE_INVARIANTS,
+    invariants::protocol::{PROBE_INVARIANTS, RANGE_CLOCK_NOT_RUN, REBUILD, TRUNCATION},
     nemesis::Selection,
     panics::PANIC,
     workload::run_seed,
@@ -126,6 +126,7 @@ pub enum Command {
 
 struct ObservedSeed {
     workload: Workload,
+    exercised: BTreeMap<&'static str, u64>,
     scenarios: Scenarios,
     summary: Value,
     config: Value,
@@ -416,16 +417,8 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     }
     let started = time::now_std();
     let observed = Mutex::new(BTreeMap::<u64, ObservedSeed>::new());
-    let exercised = Mutex::new(BTreeMap::<&'static str, u64>::new());
     let report = sweep::sweep(&config, |seed, generator| {
         let (result, measurement) = measured(seed, generator, defect, &setup);
-        for (rule, times) in &result.exercised {
-            *exercised
-                .lock()
-                .expect("exercised rules poisoned")
-                .entry(rule)
-                .or_default() += times;
-        }
         let mut observed = observed.lock().expect("sweep observations poisoned");
         let observation = observed.entry(seed).or_insert_with(|| {
             let config_hash = result.run.config["hash"].as_str().map_or_else(
@@ -440,6 +433,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
                 workload: result.workload,
                 scenarios: result.scenarios.clone(),
                 summary: result.summary.clone(),
+                exercised: result.exercised.clone(),
                 config: result.run.config.clone(),
                 config_hash,
                 assertions: result.assertions,
@@ -469,7 +463,11 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     });
     let observed = observed.into_inner().expect("sweep observations poisoned");
     let duration_s = time::elapsed(started).as_secs_f64();
-    let exercised = exercised.into_inner().expect("exercised rules poisoned");
+    // Each seed once: a replay is the same run.
+    let mut exercised = BTreeMap::new();
+    for row in observed.values() {
+        count_rules(&mut exercised, &row.exercised);
+    }
     let mut assertions = BTreeMap::new();
     let mut config_hash = nabedra_sim::Fnv::default();
     let mut stats = Vec::with_capacity(report.seeds.len());
@@ -809,14 +807,8 @@ fn write_record(
     if input.defects_skipped {
         record.not_run("seeded defects", "the unmodified smoke sweep failed");
     }
-    for invariant in PROBE_INVARIANTS {
-        if input
-            .exercised
-            .get(invariant)
-            .is_none_or(|times| *times == 0)
-        {
-            record.not_run(invariant, "no seed in this range exercised it");
-        }
+    for (rule, why) in rules_not_run(&input.exercised) {
+        record.not_run(&rule, &why);
     }
     record.not_run("ConsistentCommittedData", "no probe reports it");
     if input.smoke {
@@ -870,6 +862,29 @@ fn write_record(
     // richer native record in that log so the attestation also binds these fields.
     print!("{}", std::fs::read_to_string(path)?);
     Ok(outcome == nabedra_check::evidence::Outcome::Pass)
+}
+
+fn count_rules(total: &mut BTreeMap<&'static str, u64>, run: &BTreeMap<&'static str, u64>) {
+    for (rule, times) in run {
+        *total.entry(*rule).or_default() += times;
+    }
+}
+
+/// What the probe-driven rules did not judge in a range: the rules that never ran, and the
+/// commits that RangeClockRule1 had to leave out.
+fn rules_not_run(exercised: &BTreeMap<&'static str, u64>) -> Vec<(String, String)> {
+    let times = |rule: &str| exercised.get(rule).copied().unwrap_or(0);
+    let never = PROBE_INVARIANTS.into_iter().chain([REBUILD, TRUNCATION]);
+    let mut rows: Vec<_> = never
+        .filter(|rule| times(rule) == 0)
+        .map(|rule| (rule.to_owned(), "no seed in this range exercised it".into()))
+        .collect();
+    let skipped = times(RANGE_CLOCK_NOT_RUN);
+    if skipped > 0 {
+        let why = format!("{skipped} committed direct entries could not be judged");
+        rows.push((RANGE_CLOCK_NOT_RUN.to_owned(), why));
+    }
+    rows
 }
 
 fn sha256_file(path: &Path) -> io::Result<String> {
@@ -954,6 +969,25 @@ mod tests {
             assert!(!report.passed(), "panic in run {panicking}");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A sub-rule that never ran, and the commits that a rule could not judge, are not hidden
+    /// behind the rules that did run.
+    #[test]
+    fn the_record_says_which_probe_rules_did_not_judge() {
+        let mut all = BTreeMap::new();
+        for rule in PROBE_INVARIANTS.into_iter().chain([REBUILD, TRUNCATION]) {
+            count_rules(&mut all, &BTreeMap::from([(rule, 1)]));
+            count_rules(&mut all, &BTreeMap::from([(rule, 2)]));
+        }
+        assert!(all.values().all(|times| *times == 3));
+        assert!(rules_not_run(&all).is_empty());
+        let mut part = all.clone();
+        part.remove(REBUILD);
+        part.insert(TRUNCATION, 0);
+        part.insert(RANGE_CLOCK_NOT_RUN, 4);
+        let rows: Vec<_> = rules_not_run(&part).into_iter().map(|row| row.0).collect();
+        assert_eq!(rows, [REBUILD, TRUNCATION, RANGE_CLOCK_NOT_RUN]);
     }
 
     /// Review 115, M10: 46 of 47 seeds that were reported as clean had been run once.
