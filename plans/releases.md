@@ -2,22 +2,17 @@
 
 Build a manually dispatched workflow that publishes one verified version of Nabedra to GitHub Releases, crates.io, PyPI, npm and GHCR. The process for users of it is in [Releasing Nabedra](../.agents/skills/nabedra-change/references/releasing.md).
 
-Status: measured on `621af635`. Nothing here is implemented. Decisions 4 and 5 are open.
+Status: on hold. Measured on `621af635`. Nothing here is implemented, and no task starts until the simulator is finished and the user says to start. Until then, do not run the test and review pipeline for a release either.
 
 ## User decisions (2026-11-25)
 
 1. One version for the server, its crates, Events and both ORMs. The first is `0.3.0-rc.1`, above the ORMs' `0.2.2`.
 2. Candidates may ship with red cells, all listed in the notes. Stable releases need the gate to pass, with deferred cells listed but not blocking. This changes today's rule, where deferred cells block.
 3. Keep crates.io. Also publish `nabedra-sim` and `nabedra-check`, described as internal with no stability promise.
-
-- Design review (TLA+) checks new and revised features. Code review then tests the code with the simulator. No task here waits for the simulator or wires it into the project.
-
-## Open
-
-| # | Question | Proposed answer |
-| --- | --- | --- |
-| 4 | Should the OLTP binary and image let users store their database's archives in S3? | Yes, build with `oltp-backup-s3`. Alternative: `oltp`, as the Dockerfile does today. Archives to a local directory work either way, and `cargo install --features oltp-backup-s3` stays possible. |
-| 5 | How do we ship Nabedra Events, which is a separate server program? | As an image only, with `publish = false` on `nabedra-events`. Alternative: also binaries and a crate. |
+4. Build the OLTP binary and image with `oltp-backup-s3`, so that users can store their database's archives in S3.
+5. Nabedra Events ships as an image only. Set `publish = false` on `nabedra-events`.
+6. Design review (TLA+) checks new and revised features. Code review then tests the code with the simulator. No task here wires the simulator into the project.
+7. Write the procedure only. Build nothing and run no release pipeline before the simulator is finished.
 
 ---
 
@@ -110,7 +105,7 @@ flowchart LR
 | Job | Runner | What it does |
 | --- | --- | --- |
 | `preflight` | `ubuntu-24.04` | Refuses unless `github.ref` is `main`, `sha` is on `main`, `version.py check` matches `version` at `sha`, `docs/releases/v<version>.md` exists, and the tag does not. Runs the gate from `main` with `--sha`. A stable release needs it to pass. On a first attempt, no registry may have the version. |
-| `binaries` | Linux: `ubuntu-24.04`, `ubuntu-24.04-arm` in `rust:1.94.1-bookworm`. macOS: `macos-15`, `macos-15-intel` | 3 engines on 4 targets. Features: `olap,s3`, `oltp-backup-s3` (open question 4), `cache`. Archive `nabedra-db-<version>-<engine>-<target>.tar.gz` with the binary, `LICENSE` and `BUILD.txt` (SHA, engine, rustc). Checks the version banner. |
+| `binaries` | Linux: `ubuntu-24.04`, `ubuntu-24.04-arm` in `rust:1.94.1-bookworm`. macOS: `macos-15`, `macos-15-intel` | 3 engines on 4 targets. Features: `olap,s3`, `oltp-backup-s3`, `cache`. Archive `nabedra-db-<version>-<engine>-<target>.tar.gz` with the binary, `LICENSE` and `BUILD.txt` (SHA, engine, rustc). Checks the version banner. |
 | `images` | `ubuntu-24.04`, `ubuntu-24.04-arm` | Root `Dockerfile` per engine and `server/events/deploy/Dockerfile`, natively per architecture. Saved as OCI archives, pushed by digest after approval. |
 | `python` | `ubuntu-24.04` | Wheel, sdist, `twine check --strict`, unit tests against the installed wheel |
 | `npm` | `ubuntu-24.04` | `npm ci`, `npm test`, `npm pack`, import test of the tarball |

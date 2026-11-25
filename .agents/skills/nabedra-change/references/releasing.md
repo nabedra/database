@@ -3,10 +3,11 @@
 Use this page when the user asks to release, publish, tag or ship a version, or asks whether a
 release is due.
 
-> **Status: proposed, not usable yet.** `nabedra-release.yml` and `scripts/release/` do not exist.
-> Until [the release plan](../../../../plans/releases.md) is done, do not publish anything. If the
-> user asks for a release, tell them which plan tasks are still open. Remove this note in the PR
-> that completes REL7.
+> **Status: on hold.** `nabedra-release.yml` and `scripts/release/` do not exist. The user decided
+> on 2026-11-25 to build nothing, and to run no test or review pipeline for a release, until the
+> simulator is finished. Do not follow the steps below or start a task of
+> [the release plan](../../../../plans/releases.md) until the user says to. If the user asks for a
+> release, tell them it is on hold and why. Remove this note in the PR that completes REL7.
 
 ## Rules
 
@@ -93,9 +94,8 @@ design review (TLA+) -> implementation -> code review with the simulator -> rele
    [simulation](../../code-review/references/simulation.md) where the module has it.
 3. The release gate reads the evidence from both on the release SHA.
 
-The simulator is unfinished, so a candidate does not wait for it. Its missing cells are red and
-the notes list them. A stable release needs those cells green. Do not add simulation to a module
-just to make a release pass.
+This pipeline runs for a release only once the simulator is finished. From then on, a candidate
+may still ship with red simulation cells, which its notes list. A stable release needs them green.
 
 ## Steps
 
