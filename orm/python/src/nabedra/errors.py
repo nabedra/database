@@ -5,6 +5,8 @@ before deciding whether to submit another write.
 """
 from __future__ import annotations
 
+from typing import TypeAlias
+
 
 class NabedraError(Exception):
     """Base failure; local errors can lack request and HTTP status information."""
@@ -26,6 +28,10 @@ class NabedraError(Exception):
         self.request_id = request_id
         self.status_code = status_code
         self.outcome = self._default_outcome if outcome is None else outcome
+
+
+# Fields: key, outcome and error, which is None for an applied row.
+RowOutcome: TypeAlias = dict[str, str | int | NabedraError | None]
 
 
 class ValidationError(NabedraError):
@@ -63,6 +69,13 @@ class StorageError(NabedraError):
     _default_outcome = "not_applied"
 
 
+class SearchUnavailableError(NabedraError):
+    """Search cannot answer now. The same query can be sent again later."""
+
+    code = "search_unavailable"
+    _default_outcome = "not_applied"
+
+
 class TransportError(NabedraError):
     code = "transport_error"
 
@@ -74,6 +87,29 @@ class ProtocolError(NabedraError):
 class UnknownOutcomeError(NabedraError):
     code = "outcome_unknown"
     _default_outcome = "unknown"
+
+
+class BatchError(NabedraError):
+    """A multi-row write stopped early.
+
+    applied counts the rows known to be applied. outcomes lists every row of the
+    chunk that failed, in order, as key, outcome and error. Later rows were not sent.
+    """
+
+    code = "batch_error"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        applied: int,
+        outcomes: list[RowOutcome] | None = None,
+        request_id: str | None = None,
+        outcome: str | None = None,
+    ) -> None:
+        super().__init__(message, request_id=request_id, outcome=outcome)
+        self.applied = applied
+        self.outcomes = [] if outcomes is None else outcomes
 
 
 class StreamUnsupportedError(NabedraError):

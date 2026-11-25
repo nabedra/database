@@ -45,6 +45,103 @@ for await (const batch of batches) {
 }
 ```
 
+## Vector search
+
+On an OLTP server with search, tables can hold vectors, sparse weights, several
+vectors per row and lists of strings. The column type says what the data is, and
+the query says how to rank it. Other servers reject these types and operations with
+code `unsupported_operation` or `validation_error`.
+
+```typescript
+import { col, list, vector } from "nabedra"
+
+const chunks = await db.createTable("chunks", {
+  id: String, tenant: String, acl: list(String), body: String,
+  embedding: vector(1024), sparse: vector({ sparse: true }), tokens: list(vector(128)),
+}, {
+  key: "id", partitionBy: "tenant", fullText: { body: "english" },
+  embed: { embedding: { source: "body", model: "docs-v1" } },
+})
+await chunks.upsertMany(rows)
+const hits = await chunks.where(col("tenant").eq("acme").and(col("acl").containsAny(["staff"])))
+  .rank(col("embedding").cosine("reset my password"), { recall: 0.95 })
+  .select("id", "body").limit(10).collect()
+// [{ id: "doc7#0", body: "...", _score: 0.88 }]
+```
+
+| Column type | Values | Operations |
+| --- | --- | --- |
+| `vector(n)` | `n` float32 values, as `Float32Array` or `number[]`. Read as `Float32Array`. | `cosine`, `dot`, `l2` |
+| `vector({ sparse: true })` | `{ [index]: weight }` with unsigned 32-bit indices | `cosine`, `dot` |
+| `list(vector(n))` | An array of up to 1,024 vectors. Read as `Float32Array[]`. | `cosine`, `dot`: for every query vector, its best row vector, summed |
+| `list(String)` | An array of strings | `contains`, `containsAny` filters |
+| `String` in `fullText` | Text | `match` (BM25) |
+
+Vector values are stored as float32 and must be finite. Vector columns accept
+`null`, and those rows never rank on that column. Scalar comparisons and `orderBy`
+do not accept these types.
+
+| Table option | Meaning |
+| --- | --- |
+| `partitionBy` | A `String` or `BigInt` column. Each of its values gets its own index. |
+| `fullText` | `{ column: language }` for `String` columns |
+| `embed` | `{ column: { source, model } }`. The database fills this `vector(n)` column from a `String` column. Rows omit it, and writing it is a `ValidationError`. |
+
+A table has at most 8 search columns, counting vector and full-text columns. With
+any, `_score` is a reserved column name and a row holds at most 1 MiB, counting
+vectors as raw float32 bytes.
+
+| Method | Result and behavior |
+| --- | --- |
+| `col(name).cosine(query)`, `.dot(query)`, `.l2(query)` | A ranking. A string is embedded with the column's model. `cosine` rejects a zero query vector. |
+| `col(name).match(text)` | A ranking by BM25 |
+| `col(name).contains(value)`, `.containsAny(values)` | Filters on `list(String)` columns. `containsAny` of nothing matches nothing. |
+| `col(name).startsWith(prefix)` | Filter on `String` columns |
+| `query.rank(...rankings, { fusion = "rrf", candidates = 100, recall = 0.95, exact = false, consistency = "latest" })` | New query ordered by one ranking, or by several fused. `fusion` is `"rrf"` or one nonnegative weight per ranking. |
+| `query.rerank(ranking, { candidates = 200 })` | New query that scores the best candidates of `rank` again |
+| `query.rankMany(rankings, { limit, ... })` | One result list per ranking, up to 256, with the options of `rank` |
+| `table.addColumn(name, type, { embed })`, `table.dropColumn(name)` | Add or drop a vector column online. The handle then uses the new schema. |
+| `table.addFullText(column, language)`, `table.dropFullText(column)` | Start or stop indexing a `String` column for `match` |
+| `table.searchStatus()` | Per search column: `state` (`"building"`, `"ready"` or `"failed"`), `lagMs`, `pendingEmbeddings`, `failedEmbeddings` and `recall`. `lagMs` and `recall` can be `null`. |
+
+A ranked query needs a `limit` of at most 1,000 and supports only `collect`. Its rows
+gain `_score` and omit vector columns unless selected. `l2` sorts ascending, the
+others descending, then by key. `orderBy` cannot be combined with `rank`. `recall`
+is a target, not a guarantee; `exact: true` is exact. `"latest"` shows every write
+acknowledged before the query, and `"snapshot"` reads one cut across ranges.
+
+An operation that a column does not support is a `ValidationError` before any
+request. `SearchUnavailableError` (503) means that search cannot answer now. The
+query can be sent again later. Streams support only scalar columns.
+
+## Batches
+
+`upsertMany` and `deleteMany` accept any iterable or async iterable and send it in
+requests of at most 10,000 rows and 8 MiB. Each row is atomic and durable. The call is
+not atomic across rows. A key that appears twice in one request is a
+`ValidationError`; in different requests the later row wins. A missing key counts as
+applied for `deleteMany`. An empty iterable sends nothing and returns `0`.
+
+The call stops at the first request that fails and throws `BatchError`:
+
+| Property | Value |
+| --- | --- |
+| `applied` | Rows known to be applied, in the whole call |
+| `outcomes` | One `{ key, outcome, error }` per row of the failed request, in order. `outcome` is `"applied"`, `"not_applied"` or `"outcome_unknown"`. `error` is `null` for an applied row. |
+| `requestId` | ID of the failed request |
+| `outcome` | `"not_applied"`, `"partial"`, `"unknown"`, or `"applied"` when only the wait for embeddings failed |
+
+A lost response makes every row of its request `"outcome_unknown"`. The client never
+sends a request again. Writing the same rows again is safe while no other writer
+changes them. Rows after the failed request were not sent. An invalid row throws
+`ValidationError` if nothing was sent yet. After that, it or an error from the
+iterable throws `BatchError` with the applied count and no `outcomes`.
+
+`{ waitForEmbedding: true }` polls `searchStatus()` after the last request until no
+embedding of the table is pending, for at most the client's `timeout`. Other writers'
+rows count too. If the wait fails, `BatchError` reports every row as applied. Failed
+embeddings end the wait; see `failedEmbeddings`.
+
 ## Cache
 
 `Cache.connect` opens a connection pool to a Nabedra Cache server. Close it

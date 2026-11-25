@@ -12,6 +12,7 @@ import {
   NotFoundError,
   OverloadedError,
   ProtocolError,
+  SearchUnavailableError,
   StorageError,
   TransportError,
   UnknownOutcomeError,
@@ -77,12 +78,18 @@ const idleSocketMs = 25_000
 const maxTimerMs = 2_147_483_647
 const mutations = new Set([
   "table.create", "table.drop", "table.insert", "table.insert_many", "table.update",
-  "table.upsert", "table.delete",
+  "table.upsert", "table.delete", "table.upsert_many", "table.delete_many",
+  "table.add_column", "table.drop_column", "table.add_full_text", "table.drop_full_text",
 ])
 const reads = new Set([
   "table.describe", "table.list", "table.get", "query.collect", "query.count", "query.explain",
+  "table.search_status", "query.rank", "query.rank_many",
 ])
-const strictIntegers = new Set(["table.get", "query.collect", "query.count", "table.insert_many"])
+const strictIntegers = new Set([
+  "table.get", "query.collect", "query.count", "table.insert_many", "table.create", "table.describe", "table.list",
+  "table.add_column", "table.drop_column", "table.add_full_text", "table.drop_full_text",
+  "table.search_status", "query.rank", "query.rank_many",
+])
 
 export const errorMappings: ReadonlyMap<string, { status: number; type: typeof NabedraError }> = new Map([
   ["validation_error", { status: 400, type: ValidationError }],
@@ -93,6 +100,7 @@ export const errorMappings: ReadonlyMap<string, { status: number; type: typeof N
   ["limit_exceeded", { status: 413, type: LimitExceededError }],
   ["overloaded", { status: 429, type: OverloadedError }],
   ["storage_unavailable", { status: 503, type: StorageError }],
+  ["search_unavailable", { status: 503, type: SearchUnavailableError }],
   ["outcome_unknown", { status: 503, type: UnknownOutcomeError }],
 ])
 const receiptStates: ReadonlySet<string> = new Set<ReceiptState>([
@@ -337,7 +345,7 @@ function canonicalUuid(value: unknown, type: typeof NabedraError = ValidationErr
   return value
 }
 
-function isReceiptError(error: unknown): error is ReceiptError & JsonObject {
+export function isReceiptError(error: unknown): error is ReceiptError & JsonObject {
   return hasFields(error, "code", "message", "outcome")
     && typeof error.code === "string" && typeof error.message === "string"
     && (error.outcome === "not_applied" || error.outcome === "unknown")
@@ -629,13 +637,13 @@ export class Transport {
     operation: string,
     payload: JsonObject,
     decode?: (data: unknown) => T,
+    requestId: string = randomUUID(),
   ): Promise<T> {
     const mutation = mutations.has(operation)
     if (!mutation && !reads.has(operation)) throw new ValidationError("Unsupported v0 operation")
     if (decode !== undefined && typeof decode !== "function") {
       throw new ValidationError("Result decoder must be callable")
     }
-    const requestId = randomUUID()
     const body = operationBody(operation, payload, requestId)
     const { status, value } = await this.#envelope("POST", "/v1/operations", {
       body, requestId, mutation, integers: strictIntegers.has(operation) ? "bigint" : undefined,

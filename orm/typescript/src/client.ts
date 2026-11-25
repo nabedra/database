@@ -1,5 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises"
 import { ProtocolError, TransportError, ValidationError } from "./errors.js"
+import { buildLayout, sameLayout, tableLayout, wireOptions, type EmbedOptions } from "./layout.js"
 import { tableFromDescriptor, type Table } from "./table.js"
 import {
   floatToken,
@@ -15,6 +16,7 @@ import {
   validateFormat,
   validateIdentifier,
   validateSchema,
+  type Column,
   type KeyColumn,
   type Schema,
 } from "./validation.js"
@@ -33,6 +35,14 @@ export interface DatabaseOptions {
 
 export interface SubmitOptions {
   requestId?: string | null
+}
+
+export interface CreateTableOptions<S extends Schema, K extends KeyColumn<S>, E extends Column<S> = never> {
+  key: K
+  format?: "parquet"
+  partitionBy?: KeyColumn<S>
+  fullText?: { [C in Column<S>]?: string }
+  embed?: Record<E, EmbedOptions>
 }
 
 export interface RequestReceiptWaitOptions {
@@ -58,6 +68,16 @@ function predicateTokens(predicate: unknown, depth = 0): unknown {
   return predicate
 }
 
+function rankTokens(rank: unknown): unknown {
+  if (!isJsonObject(rank)) return rank
+  const { fusion, recall } = rank
+  return {
+    ...rank,
+    ...(Array.isArray(fusion) ? { fusion: fusion.map(scalarToken) } : {}),
+    ...(Object.hasOwn(rank, "recall") ? { recall: scalarToken(recall) } : {}),
+  }
+}
+
 function submitPayload(operation: string, payload: JsonObject): JsonObject {
   if (!isJsonObject(payload)) return payload
   switch (operation) {
@@ -65,12 +85,16 @@ function submitPayload(operation: string, payload: JsonObject): JsonObject {
     case "table.upsert":
       return Object.hasOwn(payload, "row") ? { ...payload, row: rowTokens(payload.row) } : payload
     case "table.insert_many":
+    case "table.upsert_many":
       return Array.isArray(payload.rows) ? { ...payload, rows: payload.rows.map(rowTokens) } : payload
     case "table.update":
       return Object.hasOwn(payload, "values") ? { ...payload, values: rowTokens(payload.values) } : payload
     case "query.collect":
     case "query.count":
     case "query.explain":
+    case "query.rank":
+    case "query.rank_many":
+      if (Object.hasOwn(payload, "rank")) payload = { ...payload, rank: rankTokens(payload.rank) }
       return isJsonObject(payload.query) && Object.hasOwn(payload.query, "filter")
         ? { ...payload, query: { ...payload.query, filter: predicateTokens(payload.query.filter) } }
         : payload
@@ -164,24 +188,36 @@ export class Database {
     return new RequestReceipt(requestId, runId, state, result, error, this.#transport)
   }
 
-  async createTable<S extends Schema, K extends KeyColumn<S>>(
+  createTable<S extends Schema, K extends KeyColumn<S>>(
     name: string,
     schema: S,
     key: K,
-    { format = "parquet" }: { format?: "parquet" } = {},
-  ): Promise<Table<S, K>> {
+    options?: { format?: "parquet" },
+  ): Promise<Table<S, K>>
+  createTable<S extends Schema, K extends KeyColumn<S>, E extends Column<S> = never>(
+    name: string,
+    schema: S,
+    options: CreateTableOptions<S, K, E>,
+  ): Promise<Table<S, K, E>>
+  async createTable<S extends Schema, K extends KeyColumn<S>, E extends Column<S>>(
+    name: string,
+    schema: S,
+    keyOrOptions: K | CreateTableOptions<S, K, E>,
+    { format: positionalFormat }: { format?: "parquet" } = {},
+  ): Promise<Table<S, K, E>> {
+    const options = typeof keyOrOptions === "object" && keyOrOptions !== null
+      ? keyOrOptions : { key: keyOrOptions, format: positionalFormat }
+    const { partitionBy, fullText, embed } = options as CreateTableOptions<S, K, E>
     name = validateIdentifier(name)
-    validateIdentifier(key)
+    const key = validateIdentifier(options.key) as K
     const checked = validateSchema(schema, key)
-    format = validateFormat(format)
-    const wireSchema = schemaToWire(checked)
-    const payload = { name, schema: wireSchema, key, format }
+    const format = validateFormat(options.format ?? "parquet")
+    const layout = buildLayout(checked, partitionBy, fullText, embed)
+    const payload = { name, schema: schemaToWire(checked), key, format, ...wireOptions(layout) }
     return this.#transport.request("table.create", payload, (data) => {
-      const table = tableFromDescriptor<S, K>(this.#transport, data)
-      const received = schemaToWire(table.schema)
+      const table = tableFromDescriptor<S, K, E>(this.#transport, data)
       if (table.name !== name || table.key !== key || table.format !== format
-          || Object.keys(received).length !== Object.keys(wireSchema).length
-          || Object.entries(wireSchema).some(([column, type]) => received[column] !== type)) {
+          || !sameLayout(tableLayout(table)!, layout)) {
         throw new ProtocolError("Created descriptor does not match submitted metadata")
       }
       return table

@@ -19,7 +19,7 @@ import { encodeJson, isJsonObject, type JsonObject } from "./transport.js"
 import { validateIdentifier } from "./validation.js"
 
 const configName = "nabedra-database.json"
-const cliVersion = "0.2.2"
+const cliVersion = "0.2.3"
 const binaryFailure = "Cannot launch compatible nabedra-db. Set NABEDRA_SERVER_BINARY to an executable file path or put nabedra-db on PATH."
 const tokenKeys = ["admin_token", "data_token", "enrollment_token"] as const
 const signaled = ["SIGINT", "SIGTERM"] as const
