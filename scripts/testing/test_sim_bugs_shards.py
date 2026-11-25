@@ -346,6 +346,26 @@ class ShardTest(ShardCase):
         self.assertIn("builds the same sweep binary", output)
         self.assertNotIn("sim-bugs-shard: complete", output)
 
+    def test_every_job_builds_in_one_place(self):
+        # A sweep holds its tree's path, so another place would be another binary.
+        places = []
+        with patch.object(sim_bugs, "build_patched", side_effect=lambda args, scratch, harness, bug: (
+                places.append(str(scratch.path)), (_ for _ in ()).throw(sim_bugs.Failure("enough")))[0]):
+            self.shard(1)
+            self.shard(2)
+            self.tool("run", "fix-one", "--seeds", "2")
+        self.assertEqual(places[0], places[1])
+        self.assertNotEqual(places[0], places[2])
+        # The place of another run, or of one that died, is not taken over.
+        for name in (places[0], places[0] + "-tmp"):
+            os.mkdir(name)
+            self.addCleanup(shutil.rmtree, name, True)
+            status, output, calls = self.shard(1)
+            self.assertEqual((status, calls, os.listdir(name)), (2, [], []), output)
+            self.assertIn("another run's", output)
+            os.rmdir(name)
+        self.assertEqual(self.shard(1)[0], 0)
+
     def test_a_target_that_cannot_count_has_no_shards(self):
         f = self.f
         text = (f.repo / BUG / "bug.toml").read_text()
