@@ -53,7 +53,7 @@ use crate::{
     config::{Config, MIN_APPLY_REPLY_BYTES},
     disk::DiskCut,
     history::Completion,
-    invariants::{Invariants, STEP, resources::Stage},
+    invariants::{Invariants, RECOVERY_LIMIT, STEP, resources::Stage},
     nemesis::apply::Chaos,
     node::Cluster,
 };
@@ -263,6 +263,8 @@ pub(crate) struct Overlay {
     windows: Vec<Window>,
     /// When a worker drains, which one, and for how long it stays stopped.
     drain: Option<(Duration, u64, Duration)>,
+    /// A drain without a nemesis: which worker, its deadline, and for how long it stays stopped.
+    draining: Option<(u64, Duration, Duration)>,
     restart: Option<(u64, Duration)>,
     drained: Option<u64>,
     /// When every process stops now and then, from and to, and for how long at most.
@@ -313,6 +315,7 @@ impl Overlay {
             pauses: g.bool(),
             windows,
             drain,
+            draining: None,
             restart: None,
             drained: None,
             table: None,
@@ -411,28 +414,50 @@ impl Overlay {
             && at <= now
         {
             self.drain = None;
-            if cluster.healthy() && cluster.is_running(node) {
+            let free = chaos.as_ref().is_none_or(|chaos| chaos.may_stop());
+            if free && cluster.healthy() {
                 cluster.record(format!("resources overlay drains n{node} during work"));
                 self.drained = Some(node);
                 match chaos.as_mut() {
-                    Some(chaos) => chaos.drain_worker(cluster, ctx, node, stopped).await,
+                    Some(chaos) => {
+                        chaos.drain_worker(cluster, ctx, node, stopped).await;
+                    }
                     None => {
-                        if let Err(error) = cluster.drain(node).await {
+                        if let Err(error) = cluster.start_drain(node).await {
                             drain_failed(cluster, node, &error);
                         }
-                        cluster.crash(node, DiskCut::Kill).await;
-                        self.restart = Some((node, now + stopped));
+                        self.draining = Some((node, now + RECOVERY_LIMIT, stopped));
                     }
                 }
             } else {
                 cluster.record(format!("resources overlay drain of n{node} skipped"));
             }
         }
+        self.finish_drain(cluster).await;
         if let Some((node, at)) = self.restart
             && at <= now
         {
             self.restart_drained(cluster, node).await;
         }
+    }
+
+    /// Ends the overlay's own drain if it is over.
+    async fn finish_drain(&mut self, cluster: &mut Cluster) {
+        let Some((node, deadline, stopped)) = self.draining else {
+            return;
+        };
+        let now = cluster.world.elapsed();
+        let drained = match cluster.drained(node).await {
+            Some(result) => result,
+            None if now >= deadline => Err("drain deadline".to_owned()),
+            None => return,
+        };
+        self.draining = None;
+        if let Err(error) = &drained {
+            drain_failed(cluster, node, error);
+        }
+        cluster.crash(node, DiskCut::Kill).await;
+        self.restart = Some((node, now + stopped));
     }
 
     async fn restart_drained(&mut self, cluster: &mut Cluster, node: u64) {
@@ -454,6 +479,10 @@ impl Overlay {
         self.freezes = None;
         self.windows.clear();
         self.drain = None;
+        while self.draining.is_some() {
+            self.finish_drain(cluster).await;
+            time::sleep(STEP).await;
+        }
         if let Some((node, _)) = self.restart {
             self.restart_drained(cluster, node).await;
         }

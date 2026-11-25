@@ -651,7 +651,7 @@ pub(crate) async fn run(ctx: Ctx, program: Program) {
         )
         .await;
         if let Some(same) = reuse
-            && !unknown(&completion)
+            && judged_reuse(&completion)
         {
             let mut observed = ctx.observed.lock().unwrap();
             if same {
@@ -682,6 +682,21 @@ pub(crate) async fn run(ctx: Ctx, program: Program) {
             }
             _ => {}
         }
+    }
+}
+
+/// Whether an answer to a reused request ID is one that D03 speaks about: the same key is a
+/// conflict of bodies, another key executes. The wrong success or the wrong conflict counts too,
+/// and the checker rejects it. Any other refusal, such as `overloaded` or a lifecycle conflict,
+/// says nothing about the reuse.
+fn judged_reuse(completion: &Completion) -> bool {
+    match completion {
+        Completion::Ok(_) => true,
+        Completion::Refused(error) => {
+            error.code == ErrorCode::Conflict
+                && error.message == "request_id was already used with a different request body"
+        }
+        Completion::Unknown(_) => false,
     }
 }
 
@@ -853,7 +868,27 @@ pub(crate) async fn burst(ctx: Ctx, gateway: usize, count: u64, first_key: i64) 
 
 #[cfg(test)]
 mod tests {
+    use nabedra_protocol::protocol::ProtocolError;
+
     use super::*;
+
+    /// Review 115, L4: an `overloaded` answer counted as D03's assertion.
+    #[test]
+    fn only_d03s_own_answers_count_as_a_judged_reuse() {
+        let refused = |code, message: &str| {
+            let error = ProtocolError::new(code, message, Outcome::NotApplied);
+            judged_reuse(&Completion::Refused(error))
+        };
+        let used = "request_id was already used with a different request body";
+        assert!(refused(ErrorCode::Conflict, used));
+        assert!(!refused(
+            ErrorCode::Conflict,
+            "captured schema or lifecycle changed"
+        ));
+        assert!(!refused(ErrorCode::Overloaded, "full"));
+        assert!(judged_reuse(&Completion::Ok(json!(true))));
+        assert!(!judged_reuse(&Completion::Unknown("deadline".into())));
+    }
 
     /// A refused write is reported only when its own value is in the row. A conflict on the
     /// refused identity is not enough: cold seed 6 found a forward marker there while the
