@@ -462,3 +462,92 @@ fn adv07_a_tenant_with_one_row_costs_little_beyond_the_row() {
     println!("{n} tenants of {dim} dimensions: {used} MB for {raw} MB of vectors");
     assert!(used <= raw * 4, "{used} MB for {raw} MB of vectors: more than 4 times");
 }
+
+// ----- More bounds.
+
+/// Tenants that were deleted leave nothing behind once retention passed: no partition, tree, summary
+/// entry or row, so that memory follows the live data and not the history.
+#[test]
+fn adv07_deleted_tenants_leave_no_partitions_behind() {
+    let cfg = Config::new(schema(2, &[ColumnType::Int], Some(0)), 2);
+    let mut ix = serving(cfg, ExactCodec, None);
+    let n = 2000u64;
+    let writes = (0..n).map(|k| (k, Some(row(&[1.0, k as f32], vec![Value::Int(k as i64)], k)))).collect();
+    feed(&mut ix, RANGE, &page(0, writes));
+    let deletes = (0..n).map(|k| (k, None)).collect();
+    feed(&mut ix, RANGE, &page(n, deletes));
+    ix.advance_low(RANGE, 2 * n).unwrap();
+    for _ in 0..50 {
+        ix.run();
+        ix.maintain(256);
+    }
+    let census = ix.shared.rows.census().len();
+    println!("after the delete: {} partitions, {} trees, {census} slots", ix.shared.dir.len(), ix.shared.roots.len());
+    assert_eq!(census, 0, "rows of deleted keys stay");
+    assert!(ix.shared.dir.len() < 100, "{} empty partitions stay for tenants that are gone", ix.shared.dir.len());
+    assert!(ix.shared.roots.len() < 100, "{} empty trees stay", ix.shared.roots.len());
+}
+
+/// The same after the range is dropped.
+#[test]
+fn adv07_a_dropped_range_leaves_no_partitions_behind() {
+    let cfg = Config::new(schema(2, &[ColumnType::Int], Some(0)), 2);
+    let mut ix = serving(cfg, ExactCodec, None);
+    let writes = (0..500).map(|k| (k, Some(row(&[1.0, k as f32], vec![Value::Int(k as i64)], k)))).collect();
+    feed(&mut ix, RANGE, &page(0, writes));
+    ix.drop_range(RANGE).unwrap();
+    for _ in 0..20 {
+        ix.run();
+        ix.maintain(256);
+    }
+    assert_eq!(ix.shared.rows.census().len(), 0);
+    assert!(ix.shared.dir.len() < 20, "{} empty partitions stay after a drop", ix.shared.dir.len());
+}
+
+/// A configuration that can never finish a split is refused when the index is made.
+#[test]
+fn adv07_a_configuration_without_copies_is_refused() {
+    let cfg = Config { copies: 0, ..Config::new(schema(2, &[], None), 1) };
+    assert!(Index::<ExactCodec>::new(cfg, ExactCodec, None).is_err(), "copies: 0 never ends a drain");
+}
+
+/// A queue of one message and one core still makes progress with splits, merges and moves.
+#[test]
+fn adv07_queues_of_one_make_progress() {
+    for (shards, queue) in [(1, 1), (2, 1), (3, 2)] {
+        let g = &mut Gen::from_seed(5);
+        let cfg = Config {
+            queue,
+            max_flight: 2,
+            part_min: 2,
+            part_max: 6,
+            ..Config::new(schema(2, &[], None), shards)
+        };
+        let mut ix = serving(cfg, ExactCodec, None);
+        let mut at = 0;
+        for _ in 0..30 {
+            let changes: Vec<_> = (0..20)
+                .map(|_| {
+                    let k = g.below(150);
+                    let a = g.below(6283) as f32 / 1000.0;
+                    (k, if g.below(4) == 0 { None } else { Some(row(&[a.cos(), a.sin()], Vec::new(), k)) })
+                })
+                .collect();
+            feed(&mut ix, RANGE, &page(at, changes));
+            at += 20;
+            for _ in 0..g.below(5) {
+                ix.maintain(4);
+                ix.step(g.below(shards as u64) as usize);
+            }
+            if g.bool() {
+                let _ = ix.advance_low(RANGE, at - g.below(at.min(10)));
+            }
+        }
+        assert!(settles(&mut ix, 5000), "shards {shards} queue {queue}: maintenance does not end");
+        let pin = latest(&mut ix, None);
+        let hits = ix.search(&pin, &query(Op::Dot, &[1.0, 0.0], 1000)).unwrap();
+        let sh = &ix.shared;
+        assert!(sh.queues.iter().all(|q| q.is_empty()) && sh.inbox.is_empty());
+        println!("shards {shards} queue {queue}: {} rows, {} partitions", hits.len(), sh.dir.len());
+    }
+}
