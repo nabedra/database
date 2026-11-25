@@ -2,11 +2,24 @@
 //! `harness`. One in a spawned task, in a product task or in a blocking job ends only that
 //! task, and the runtime drops it. The hook here keeps every panic of a world, so a seed in
 //! which anything panicked is never clean.
+//!
+//! A run that unwinds without its teardown leaves product state in the process: the next
+//! run's workers failed to start with `worker storage capacity unavailable`. So the body runs
+//! under [`caught`], and the teardown follows a panic. A panic that escapes even so poisons
+//! the process, and every run it overlaps or precedes reports only `harness`: it is not
+//! clean, and no search can take its other violations for a hit.
 
 use std::{
+    any::Any,
     collections::BTreeMap,
-    panic::{self, PanicHookInfo},
-    sync::{Arc, Mutex, MutexGuard, Once, PoisonError},
+    future::{Future, poll_fn},
+    panic::{self, AssertUnwindSafe, PanicHookInfo},
+    pin::pin,
+    sync::{
+        Arc, Mutex, MutexGuard, Once, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::Poll,
 };
 
 use nabedra_rt::sim::{self, World};
@@ -32,14 +45,38 @@ fn install() {
     });
 }
 
-fn record(info: &PanicHookInfo<'_>) {
-    let payload = info.payload();
-    let text = payload
+/// A panic escaped a run of this process.
+static POISONED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a panic escaped a run of this process, so that no run's result can be trusted.
+pub(crate) fn poisoned() -> bool {
+    POISONED.load(Ordering::SeqCst)
+}
+
+/// Runs `body`, or returns the text of the panic that ended it.
+pub(crate) async fn caught<T>(body: impl Future<Output = T>) -> Result<T, String> {
+    let mut body = pin!(body);
+    poll_fn(
+        |cx| match panic::catch_unwind(AssertUnwindSafe(|| body.as_mut().poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+            Err(payload) => Poll::Ready(Err(text(&*payload))),
+        },
+    )
+    .await
+}
+
+fn text(payload: &(dyn Any + Send)) -> String {
+    payload
         .downcast_ref::<&str>()
         .copied()
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("non-string panic payload")
-        .replace('\n', " | ");
+        .replace('\n', " | ")
+}
+
+fn record(info: &PanicHookInfo<'_>) {
+    let text = text(info.payload());
     let at = info
         .location()
         .map_or_else(String::new, |at| format!(" at {}:{}", at.file(), at.line()));
@@ -78,6 +115,9 @@ impl Watch {
 
 impl Drop for Watch {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            POISONED.store(true, Ordering::SeqCst);
+        }
         log().remove(&self.0);
     }
 }
@@ -88,6 +128,8 @@ impl Drop for Watch {
 pub(crate) enum At {
     /// The run's own body.
     Body,
+    /// The run's own body, past [`caught`]: only `panics::tests` use it.
+    Escapes,
     /// A client task, under load.
     Client,
     /// The task that runs every step check.
@@ -134,8 +176,6 @@ pub(crate) fn plant(world: &World, at: At) {
 
 #[cfg(test)]
 mod tests {
-    use std::panic::AssertUnwindSafe;
-
     use nabedra_sim::{shrink, sweep::workload_gen};
 
     use super::*;
@@ -189,6 +229,9 @@ mod tests {
         for at in [At::Body, At::Ticker, At::Task] {
             check("smoke", "none", at, 1);
         }
+        // Nothing of the panicked runs is left for the next one.
+        let after = kinds("smoke", "none", None, 1);
+        assert!(after.is_empty(), "after the panics: {after:?}");
     }
 
     /// Every workload, profile and place. Run it by name.
@@ -210,6 +253,17 @@ mod tests {
         for at in [At::Body, At::Ticker, At::Task, At::Node, At::Blocking] {
             check("smoke", "none", at, 1);
         }
+    }
+
+    /// A panic that escapes a run makes every later run of the process report only
+    /// `harness`. It poisons the process, so it runs alone and by name.
+    #[test]
+    #[ignore = "poisons the process"]
+    fn an_escaped_panic_is_never_a_clean_seed_or_a_hit() {
+        assert!(kinds("smoke", "none", None, 1).is_empty());
+        assert_eq!(kinds("smoke", "none", Some(At::Escapes), 1), ["harness"]);
+        assert_eq!(kinds("smoke", "none", None, 1), ["harness"]);
+        assert_eq!(kinds("direct", "mixed", None, 9), ["harness"]);
     }
 
     /// Without a planted panic nothing is recorded, so the hook adds no red seed by itself.
