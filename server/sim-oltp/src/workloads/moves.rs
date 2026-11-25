@@ -85,6 +85,8 @@ struct Claim {
     pool_id: Uuid,
     claim: Uuid,
     move_id: Uuid,
+    /// The worker's bootstrap file lists the pool.
+    listed: bool,
 }
 
 #[derive(Default)]
@@ -565,6 +567,7 @@ impl Driver {
                     pool_id,
                     claim,
                     move_id,
+                    listed: false,
                 };
                 inner.claim = Some(claim.clone());
                 claim
@@ -613,38 +616,51 @@ impl Driver {
                 "zone": format!("fixture-{node}"), "bytes": 1_u64 << 30,
             },
         });
-        for (name, payload) in [
-            ("storage.growth.claim", json!({"intent": intent})),
-            ("storage.growth.attempt", json!({"claim_id": claim.claim})),
-            (
-                "storage.growth.provisioned",
-                json!({"claim_id": claim.claim, "resource_id": mount["provider_volume_id"]}),
-            ),
-        ] {
-            admin(op, name, payload).await?;
+        // The claim's record says how far it got. Asking for every step again would use up its
+        // attempts, and then it can never complete.
+        let record = admin(op, "storage.growth.claim", json!({"intent": intent})).await?;
+        let mut phase = record["phase"].as_str().unwrap_or_default().to_owned();
+        if let Some(payload) = attempt(&phase, claim.claim) {
+            admin(op, "storage.growth.attempt", payload).await?;
+            phase = "provisioning".into();
         }
-        if !self.inner().clauses.contains(&"O26:mount-identity") {
-            let altered = op.mounts.identity((worker + 1) % WORKERS.len());
-            let checked = refused_mounts(op, node, claim.claim, &mount, altered, same).await?;
-            self.inner().clauses.extend(checked);
+        if phase == "provisioning" {
+            let resource = &mount["provider_volume_id"];
+            let payload = json!({"claim_id": claim.claim, "resource_id": resource});
+            admin(op, "storage.growth.provisioned", payload).await?;
         }
-        let payload = json!({"claim_id": claim.claim, "mount": mount});
-        let answer = op
-            .ask(
-                node,
-                op.id().await,
-                "storage.growth.mounted",
-                payload,
-                REQUEST,
-            )
-            .await;
-        let Completion::Ok(mounted) = &answer else {
-            return Err(format!("mount the secondary pool: {}", shown(&answer)));
+        if phase != "complete" {
+            if !self.inner().clauses.contains(&"O26:mount-identity") {
+                let altered = op.mounts.identity((worker + 1) % WORKERS.len());
+                let checked = refused_mounts(op, node, claim.claim, &mount, altered, same).await?;
+                self.inner().clauses.extend(checked);
+            }
+            let payload = json!({"claim_id": claim.claim, "mount": mount});
+            let answer = op
+                .ask(
+                    node,
+                    op.id().await,
+                    "storage.growth.mounted",
+                    payload,
+                    REQUEST,
+                )
+                .await;
+            let Completion::Ok(mounted) = &answer else {
+                return Err(format!("mount the secondary pool: {}", shown(&answer)));
+            };
+            if mounted["phase"] != "complete" {
+                return Err(format!("secondary pool not mounted: {mounted}"));
+            }
+        }
+        let listed = {
+            let mut inner = self.inner();
+            let claim = inner.claim.as_mut().expect("growth claim");
+            std::mem::replace(&mut claim.listed, true)
         };
-        if mounted["phase"] != "complete" {
-            return Err(format!("secondary pool not mounted: {mounted}"));
+        if !listed {
+            same()?;
+            op.mounts.list(worker, &mount, claim.claim);
         }
-        op.mounts.list(worker, &mount, claim.claim);
         if !self.inner().clauses.contains(&"O26:growth") {
             let after = inventory(op, node).await?;
             let stats = op.stats(node).await?;
@@ -705,6 +721,11 @@ fn next_node(members: &[Value]) -> u64 {
         .iter()
         .filter_map(|member| member["node_id"].as_u64());
     nodes.max().unwrap_or(0) + 1
+}
+
+/// The payload of a claim's next attempt. Only a claim that none was recorded for takes one.
+fn attempt(phase: &str, claim: Uuid) -> Option<Value> {
+    (phase == "claimed").then(|| json!({"claim_id": claim}))
 }
 
 async fn admin(op: &Operator, name: &str, payload: Value) -> Result<Value, String> {
@@ -1002,6 +1023,16 @@ mod tests {
         assert!(!passed_owner_check(&Completion::Unknown(connect)));
     }
 
+    /// Move seed 2: every retry asked for the whole claim again. The third one used up its
+    /// attempts, and Control answered `NotReady` for the rest of the run.
+    #[test]
+    fn a_claim_takes_one_attempt() {
+        assert!(attempt("claimed", Uuid::nil()).is_some());
+        for phase in ["provisioning", "awaiting_mount", "complete"] {
+            assert!(attempt(phase, Uuid::nil()).is_none(), "{phase}");
+        }
+    }
+
     fn driver(inner: &Arc<Mutex<Inner>>, world: &Arc<World>) -> Driver {
         Driver {
             op: Operator::for_test(world),
@@ -1033,6 +1064,7 @@ mod tests {
                         pool_id: Uuid::nil(),
                         claim: Uuid::nil(),
                         move_id: Uuid::nil(),
+                        listed: false,
                     }),
                     ..Inner::default()
                 }));

@@ -31,6 +31,7 @@ SITES = {
 INFERRED = {"raft-log-batch"}
 SAMPLES = ["e0", "e1", "e2", "e3", "e4", "e5", "e6"]
 FREEZE = "source refused the exact split freeze"
+HELD = "captured schema or lifecycle changed"
 ACTIVE_MOVE = "Control refuses fences while a replica move is active"
 
 
@@ -101,10 +102,18 @@ def usage(violation):
 class Diagnosis:
     """What the diagnostic run of one seed recorded."""
 
-    def __init__(self):
+    def __init__(self, active_move_at=None):
         self.kinds = None
+        # Where the diagnosed source refuses a command because a replica move is active, as file:line. A
+        # `Busy` from anywhere else has another reason.
+        self.active_move_at = active_move_at
         self.leases = Leases()
         self.busy_active_move = 0
+        # Split plans refused at the freeze, with DirectCommitAboveCut, and for each plan refused before
+        # it, the plan that held the table's lifecycle.
+        self.above_cut = 0
+        self.frozen = set()
+        self.holders = []
 
     def add(self, line):
         if self.leases.add(line):
@@ -112,7 +121,14 @@ class Diagnosis:
         found = re.search(r"nabedra-sim-seed: (\{.*\})", line)
         if found:
             self.kinds = set(json.loads(found[1])["kinds"])
-        elif "CONTROL-FAULT Busy" in line and "machine.rs" in line:
+        elif "FREEZE DirectCommitAboveCut" in line:
+            self.above_cut += 1
+        elif "SPLIT-FREEZE-REFUSED" in line:
+            self.frozen.update(re.findall(r"plan ([0-9a-f-]{36})", line))
+        elif "SPLIT-PLAN-REFUSED" in line:
+            held = re.search(r"holder Ok\(Some\(\(TxnId \{ request_id: ([0-9a-f-]{36})", line)
+            self.holders.append(held and held[1])
+        elif self.active_move_at and re.search(rf"CONTROL-FAULT Busy \S*{re.escape(self.active_move_at)}\b", line):
             self.busy_active_move += 1
 
 
@@ -128,9 +144,14 @@ def cause(violation, diagnosis):
     if name == "Liveness" and "the split did not publish" in violation:
         start = violation.find('"last":')
         last = json.JSONDecoder().raw_decode(violation[start + 7:])[0] if start >= 0 else []
-        if last and all(FREEZE in answer for answer in last):
-            return f"the source refused the freeze of every plan ({len(last)})", None
-        return None, "not every plan ended with a refused freeze"
+        if not last or FREEZE not in last[0] or not all(FREEZE in one or HELD in one for one in last):
+            return None, "the plans did not all end with a refused freeze or a held lifecycle"
+        if not diagnosis.above_cut or not diagnosis.frozen:
+            return None, "no refused freeze was recorded"
+        if any(HELD in one for one in last) and not (
+                diagnosis.holders and all(holder in diagnosis.frozen for holder in diagnosis.holders)):
+            return None, "another holder than the refused plan, or none, was recorded"
+        return f"a direct commit above the cut refused the first plan, which then held the range against {len(last) - 1}", None
     if name == "Liveness" and "survivors never dropped" in violation:
         if diagnosis.busy_active_move > 100:
             return f"{ACTIVE_MOVE} ({diagnosis.busy_active_move} refusals)", None
@@ -166,9 +187,9 @@ def verdict(row):
     return "clean" if row["replayed"] and row.get("chaos_writes") and row.get("chaos_reads") else "unreplayed"
 
 
-def load(root):
+def load(roots):
     rows = {}
-    for report in glob.glob(f"{root}/**/sweep-report.json", recursive=True):
+    for report in (path for root in roots for path in glob.glob(f"{root}/**/sweep-report.json", recursive=True)):
         base = pathlib.Path(report).parent
         for row in json.loads(pathlib.Path(report).read_text())["seeds"]:
             seed = row["seed"]
@@ -180,7 +201,7 @@ def load(root):
     return rows
 
 
-def diagnoses(paths):
+def diagnoses(paths, active_move_at=None):
     out, seed = {}, None
     for path in paths:
         opener = gzip.open if path.endswith(".gz") else open
@@ -190,7 +211,7 @@ def diagnoses(paths):
                 if found:
                     seed = int(found[1])
                     # The last run of a seed counts.
-                    out[seed] = Diagnosis()
+                    out[seed] = Diagnosis(active_move_at)
                 elif seed is not None:
                     out[seed].add(line)
     return out
@@ -198,11 +219,12 @@ def diagnoses(paths):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("reports", help="directory of downloaded sweep artifacts")
+    parser.add_argument("reports", nargs="+", help="directories of downloaded sweep artifacts, one per shard")
     parser.add_argument("--diagnostics", nargs="*", default=[], help="logs of diagnostic runs")
+    parser.add_argument("--active-move-at", help="file:line of the refusal while a replica move is active")
     parser.add_argument("--csv")
     args = parser.parse_args(argv)
-    known = diagnoses(args.diagnostics)
+    known = diagnoses(args.diagnostics, args.active_move_at)
     table, total, per = [], collections.Counter(), collections.defaultdict(collections.Counter)
     why = collections.Counter()
     for seed, (row, violations) in sorted(load(args.reports).items()):

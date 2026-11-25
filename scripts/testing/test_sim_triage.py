@@ -13,8 +13,8 @@ def usage(node, now, before, threads=0):
             f"baseline {shown(before, 0)}")
 
 
-def diagnosis(kinds, *lines):
-    out = triage.Diagnosis()
+def diagnosis(kinds, *lines, active_move_at="control/machine.rs:320"):
+    out = triage.Diagnosis(active_move_at)
     out.kinds = set(kinds)
     for line in lines:
         out.add(line)
@@ -88,20 +88,32 @@ class Triage(unittest.TestCase):
         self.assertEqual(self.classify([usage(1, 792, 100)], None), "undiagnosed")
         self.assertEqual(self.classify([], known, ("ResourceBaseline", "Liveness")), "undiagnosed")
 
-    def test_a_split_is_named_only_when_every_plan_was_refused_at_the_freeze(self):
+    def test_a_split_is_named_only_by_the_recorded_refusals(self):
         text = "t=9ms Liveness: the split did not publish within 60s after the heal: {\"last\":%s,\"plans\":2}"
-        known = diagnosis(["Liveness"])
-        refused = f'"Conflict {triage.FREEZE}"'
-        for last, want in ((f"[{refused},{refused}]", "named"), (f'[{refused},"n1 unknown"]', "undiagnosed"),
-                           (f'[{refused},"n1 [odd] text"]', "undiagnosed"), ("[]", "undiagnosed")):
-            self.assertEqual(self.classify([text % last], known, ("Liveness",)), want)
+        plan, other = "0" * 8 + "-1" * 4 + "0" * 20, "f" * 36
+        freeze = ["DIAG t=5 n=1 FREEZE DirectCommitAboveCut high 9", f"DIAG t=5 n=1 SPLIT-FREEZE-REFUSED plan {plan} (x)"]
+        held = f"DIAG t=6 n=1 SPLIT-PLAN-REFUSED plan {other} (y) holder Ok(Some((TxnId {{ request_id: %s, attempt: 1 }}"
+        refused, after = f'"Conflict {triage.FREEZE}"', f'"Conflict {triage.HELD}"'
+        for last, lines, want in (
+                (f"[{refused}]", freeze, "named"),
+                (f"[{refused},{after}]", [*freeze, held % plan], "named"),
+                (f"[{refused},{after}]", [*freeze, held % other], "undiagnosed"),
+                (f"[{refused},{after}]", [*freeze, held.split(" holder")[0] + " holder Ok(None)"], "undiagnosed"),
+                (f"[{refused},{after}]", freeze, "undiagnosed"),
+                (f"[{refused}]", freeze[:1], "undiagnosed"), (f"[{refused}]", [], "undiagnosed"),
+                (f'[{refused},"n1 [odd] text"]', freeze, "undiagnosed"),
+                (f"[{after}]", [*freeze, held % plan], "undiagnosed"), ("[]", freeze, "undiagnosed")):
+            known = diagnosis(["Liveness"], *lines)
+            self.assertEqual(self.classify([text % last], known, ("Liveness",)), want, (last, lines))
 
     def test_a_lost_worker_needs_the_refused_fences(self):
         text = "t=9ms Liveness: survivors never dropped n1: readiness deadline"
         busy = "DIAG t=5 n=2 CONTROL-FAULT Busy oltp-replication/src/authority/control/machine.rs:320"
         known = diagnosis(["Liveness"], *[busy] * 101)
         self.assertEqual(self.classify([text], known, ("Liveness",)), "named")
-        self.assertEqual(self.classify([text], diagnosis(["Liveness"], busy), ("Liveness",)), "undiagnosed")
+        for known in (diagnosis(["Liveness"], busy), diagnosis(["Liveness"], *[busy] * 101, active_move_at=None),
+                      diagnosis(["Liveness"], *[busy.replace("320", "3201")] * 101)):
+            self.assertEqual(self.classify([text], known, ("Liveness",)), "undiagnosed")
 
     def test_a_seed_that_was_not_replayed_or_did_no_work_is_not_clean(self):
         row = {"violations": [], "replayed": False, "deterministic": None}
