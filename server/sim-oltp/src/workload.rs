@@ -64,6 +64,9 @@ fn run(
         let d05 = workloads::paused::samples(seed, workload) || setup.selection.focus.d05;
         workloads::resources::limits(seed, &mut config, !d05);
     }
+    if workload == Workload::Queued {
+        config.force("direct_oltp", json!(workloads::queued::direct(seed)));
+    }
     let program = (workload == Workload::Smoke).then(|| Program::generate(generator));
     let (mut result, world, panics) = nabedra_sim::runtime::run(seed, |world| async move {
         let panics = Watch::new(&world);
@@ -227,7 +230,14 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     {
         Ok(mut cluster) => {
             let body = panics::caught(async {
-                let startup = cluster.start().await;
+                let configured = match workload {
+                    Workload::Queued => workloads::queued::configure(&mut cluster.config, seed),
+                    _ => Ok(()),
+                };
+                let startup = match configured {
+                    Ok(()) => cluster.start().await,
+                    Err(error) => Err(error),
+                };
                 assertions.insert("cluster readiness", startup.is_ok());
                 // Only then: a sweep is a test build too, and extra tasks change its schedule.
                 #[cfg(test)]
@@ -236,18 +246,31 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
                 }
                 match startup {
                     Ok(()) if workload != Workload::Smoke => {
-                        let report = workloads::direct::run(
-                            &mut cluster,
-                            &config,
-                            history.clone(),
-                            generator,
-                            seed,
-                            workload,
-                            &setup.selection,
-                            setup.quiet,
-                            setup.workloads.overlay(),
-                        )
-                        .await;
+                        let report = if workload == Workload::Queued {
+                            workloads::queued::run(
+                                &mut cluster,
+                                &config,
+                                history.clone(),
+                                generator,
+                                seed,
+                                &setup.selection,
+                                setup.quiet,
+                            )
+                            .await
+                        } else {
+                            workloads::direct::run(
+                                &mut cluster,
+                                &config,
+                                history.clone(),
+                                generator,
+                                seed,
+                                workload,
+                                &setup.selection,
+                                setup.quiet,
+                                setup.workloads.overlay(),
+                            )
+                            .await
+                        };
                         if setup.workloads.overlay() {
                             let judged = report.as_ref().is_ok_and(|report| report.stage_judged);
                             assertions.insert(STAGE_JUDGED, judged);
@@ -341,13 +364,17 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     let mut unclassified_conflicts = 0;
     let mut not_judged = BTreeMap::new();
     if history.events().iter().any(|event| event.key.is_some()) {
-        let verdict = history.check_direct();
+        let (assertion, verdict) = if workload == Workload::Queued {
+            (
+                "transactions, per-key linearizability and outcomes",
+                workloads::queued::check(history.events()),
+            )
+        } else {
+            ("linearizability and keyed dedup", history.check_direct())
+        };
         unclassified_conflicts = verdict.unclassified_conflicts;
         not_judged = verdict.not_judged.clone();
-        assertions.insert(
-            "linearizability and keyed dedup",
-            verdict.anomalies.is_empty(),
-        );
+        assertions.insert(assertion, verdict.anomalies.is_empty());
         checks.check_history(&world, &verdict);
     }
     checks.check_outcomes(&world, history.events(), history.bodies());

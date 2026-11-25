@@ -1,0 +1,17 @@
+id = "OLTP-sim-failed-receipt-unknown-outcome"
+title = "Accepted mutations end with a failed receipt whose error is storage_unavailable with an unknown outcome, and later lookups repeat it"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G07"]
+scenarios = ["Q01", "Q06"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 2
+why_not_caught = "The queued workload read any failed receipt as settled until AcceptedSettlesInRun judged it. Other runners not checked."
+invariant_added = "Fault model, unattested, NABEDRA_SIM_WORKLOAD=queued, profile mixed,process,network,pause. Seed 6 (625d1236edd4d068 at 6b20e211, repeated by an independent reviewer): four accepted requests (81cc1997, 14233eaf, 17ec56e2, 43697d02) read failed, 'no registered group leader completed the strong service call', outcome unknown, through both gateways. Mutations also in seeds 2, 7, 11, 12 and 16 there, where no rule reported it. AcceptedSettlesInRun reports it at bff842ef in seeds 2 (02ab95159065980b, two identities), 3, 4, 5, 10, 11 and 12 of 1 to 16, and not in seed 6, whose schedule differs there. Suspected product fault. The product path that makes the record terminal was not traced."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

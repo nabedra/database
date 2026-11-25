@@ -601,7 +601,7 @@ async fn abandon(
 }
 
 /// Create the workload's table through the first gateway, retrying the same ID.
-async fn create_table(
+pub(crate) async fn create_table(
     cluster: &Cluster,
     history: &Arc<Mutex<History>>,
     name: &str,
@@ -666,7 +666,7 @@ async fn create_table(
 /// Wait for every worker's resources to stay at their baseline (three clean observations in a
 /// row, as `Invariants::resources_at_baseline` counts them), or 2 s. The pools a move mounted
 /// have no row in the baseline, so they are split off: they must reserve nothing.
-async fn settle(
+pub(crate) async fn settle(
     cluster: &Cluster,
     extra: &[ExtraPool],
 ) -> Result<(Vec<(u64, Value)>, Option<(u64, String)>), String> {

@@ -14,6 +14,8 @@ pub(crate) mod freezes;
 pub(crate) mod moves;
 pub(crate) mod old_peer;
 pub(crate) mod paused;
+pub(crate) mod queued;
+mod queued_clauses;
 pub(crate) mod resources;
 
 use std::{collections::BTreeSet, fmt};
@@ -25,6 +27,7 @@ pub(crate) enum Workload {
     Direct,
     Cold,
     Move,
+    Queued,
 }
 
 /// The workloads `mixed` rotates through, in seed order.
@@ -37,6 +40,7 @@ impl Workload {
             Workload::Direct => "direct",
             Workload::Cold => "cold",
             Workload::Move => "move",
+            Workload::Queued => "queued",
         }
     }
 
@@ -46,6 +50,7 @@ impl Workload {
             Workload::Direct,
             Workload::Cold,
             Workload::Move,
+            Workload::Queued,
         ]
         .into_iter()
         .find(|workload| workload.name() == name)
@@ -97,6 +102,9 @@ impl WorkloadChoice {
         }
         if chosen.contains(&Workload::Smoke) && (chosen.len() > 1 || overlay) {
             return Err("the smoke workload runs alone".into());
+        }
+        if overlay && chosen.iter().any(|chosen| !ROTATION.contains(chosen)) {
+            return Err("the resources overlay runs on direct, cold and move only".into());
         }
         Ok(Self {
             workloads: chosen,
@@ -159,5 +167,6 @@ mod tests {
         assert!(cold.overlay() && cold.of(5) == Workload::Cold);
         assert_eq!(WorkloadChoice::parse(&cold.label()).unwrap(), cold);
         assert!(WorkloadChoice::parse("smoke,resources").is_err());
+        assert!(WorkloadChoice::parse("queued,resources").is_err());
     }
 }

@@ -43,6 +43,59 @@ const RESTART_TRIES: u32 = 4;
 /// Longest isolation of a leader that no other worker replaces. Voters keep a lease of the
 /// longest election timeout, so an election takes longer than the drawn window.
 const LEADER_MOVE_MS: u64 = 12_000;
+/// Between two starts of one process.
+const RESTART_PAUSE_MS: u64 = DEFER_MS * 4;
+
+/// Note a start of `node` that failed. The last one is a violation, and ends the tries.
+fn start_failed(cluster: &Cluster, node: u64, failures: u32, last: bool, error: &str) -> bool {
+    cluster.record(format!(
+        "nemesis restart n{node} failed ({failures}): {error}"
+    ));
+    let last = last || failures >= RESTART_TRIES;
+    if last {
+        cluster.checks.violate(
+            &cluster.world,
+            "Liveness",
+            format!("n{node} did not restart: {error}"),
+        );
+    }
+    last
+}
+
+/// Start a stopped process as its supervisor does, and as `Chaos` does for its own faults: a start
+/// that fails is made again after the same pause, until the node has failed as often as there
+/// (lead decision 18 for a gateway; a worker the same way, its later starts after a kill). `failures`
+/// counts over the run. Returns the starts that failed, and whether the process runs.
+pub(crate) async fn start_again(
+    cluster: &mut Cluster,
+    node: u64,
+    how: DiskCut,
+    failures: &mut BTreeMap<u64, u32>,
+) -> (Vec<String>, bool) {
+    let mut failed = Vec::new();
+    let mut how = how;
+    loop {
+        let started = if GATEWAYS.contains(&node) {
+            cluster.restart_gateway(node).await
+        } else {
+            cluster.restart_worker(node, how).await
+        };
+        let Err(error) = started else {
+            return (failed, true);
+        };
+        failed.push(format!(
+            "n{node} at {}ms: {error}",
+            elapsed_ms(&cluster.world)
+        ));
+        let count = failures.entry(node).or_default();
+        *count += 1;
+        if start_failed(cluster, node, *count, false, &error) {
+            return (failed, false);
+        }
+        how = DiskCut::Kill;
+        time::sleep(Duration::from_millis(RESTART_PAUSE_MS)).await;
+    }
+}
 
 /// A graceful stop that has not ended.
 struct Drain {
@@ -1026,18 +1079,10 @@ impl Chaos {
     ) {
         let failures = self.restart_failures.entry(node).or_default();
         *failures += 1;
-        cluster.record(format!(
-            "nemesis restart n{node} failed ({failures}): {error}"
-        ));
-        if healing || *failures >= RESTART_TRIES {
-            cluster.checks.violate(
-                &cluster.world,
-                "Liveness",
-                format!("n{node} did not restart: {error}"),
-            );
+        if start_failed(cluster, node, *failures, healing, &error) {
             return;
         }
-        let at = elapsed_ms(&cluster.world) + DEFER_MS * 4;
+        let at = elapsed_ms(&cluster.world) + RESTART_PAUSE_MS;
         self.scheduler.after(at, Step::Follow(follow));
     }
 

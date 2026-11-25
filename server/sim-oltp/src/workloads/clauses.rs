@@ -59,6 +59,48 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
             "F03:cleanup",
         ],
     ),
+    (
+        "Q03",
+        &[
+            "Q03:one-frozen",
+            "Q03:two-frozen",
+            "Q03:coordinator-killed",
+            "Q03:copies-on-every-ready-worker",
+        ],
+    ),
+    ("Q04", &["Q04:closed-socket", "Q04:api-restart"]),
+    (
+        "Q05",
+        &[
+            "Q05:same-id-two-apis",
+            "Q05:other-body",
+            "Q05:path-boundary",
+        ],
+    ),
+    ("Q06", &["Q06:expired-receipt", "Q06:lost-terminal"]),
+    (
+        "O14",
+        &[
+            "O14:rolling-restart",
+            "O14:last-copy",
+            "O14:restored-from-last-copy",
+        ],
+    ),
+    ("R01", &["R01:worker-killed"]),
+    ("R02", &["R02:last-holder"]),
+    ("R03", &["R03:rolling-restart"]),
+    ("R04", &["R04:full-stop", "R04:abandoned"]),
+    ("R05", &["R05:partition", "R05:paused-owner"]),
+    (
+        "O30",
+        &[
+            "O30:third-holder-delayed",
+            "O30:two-holders-delayed",
+            "O30:each-copy-phase",
+        ],
+    ),
+    ("O31", &["O31:payload-quorum", "O31:marker-quorum"]),
+    ("O32", &["O32:full-stop", "O32:isolated-holder"]),
 ];
 
 /// Why a clause cannot run yet, for the sweep record.
@@ -75,6 +117,14 @@ pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
         "F03:receipt" | "F03:cleanup" => "no probe says that a caller was cancelled there",
         "F03:reduction" => "the resources overlay sends direct-path requests only",
         "O26:worker-4" => "the data worker process binds a real TCP listener",
+        "O14:restored-from-last-copy" => {
+            "two lost voters leave Control without a quorum, so only a cold start follows"
+        }
+        "R05:paused-owner" => "no public observation names the queue owner",
+        "O30:each-copy-phase" | "O31:payload-quorum" | "O31:marker-quorum" => {
+            "needs a probe at each copy phase to place the fault"
+        }
+        "O32:isolated-holder" => "needs a probe that names the holders of a request",
         _ => return None,
     })
 }

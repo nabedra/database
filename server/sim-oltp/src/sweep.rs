@@ -364,6 +364,8 @@ fn replay_command(defect: Defect) -> String {
         "NABEDRA_SIM_WORKLOAD",
         "NABEDRA_SIM_PROFILE",
         "NABEDRA_SIM_BEYOND_TCP",
+        crate::workloads::queued::MODE_ENV,
+        crate::workloads::queued::DEFECT_ENV,
     ] {
         if let Some(value) = env(name) {
             prefix.push_str(&format!("{name}={value} "));
@@ -617,7 +619,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             "verdicts": verdicts.iter().map(|(verdict, seeds)| (verdict.name(), seeds)).collect::<BTreeMap<_, _>>(),
             "scenarios": scenario_seeds.iter().map(|(tag, (seeds, failed))| (*tag, json!({"seeds": seeds, "failing": failed}))).collect::<BTreeMap<_, _>>(),
             "probe_rules": exercised,
-            "direct_oltp": true,
+            "direct_oltp": direct_oltp(&workload),
             "defect": defect.name(),
             "jobs": config.jobs,
             "config_hash": config_hash,
@@ -666,6 +668,15 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             paths,
         },
     )
+}
+
+/// The queued workload draws its mode per seed; every other workload is direct.
+fn direct_oltp(workload: &str) -> Value {
+    if workload.split(',').any(|name| name == "queued") {
+        json!("per seed, in each seed's configuration")
+    } else {
+        json!(true)
+    }
 }
 
 fn write_sample(config: &SweepConfig, seed: u64, run: &SeedRun) -> io::Result<Vec<PathBuf>> {
@@ -822,7 +833,7 @@ fn write_record(
     record.mode = Some(BTreeMap::from([
         ("evidence".to_owned(), json!("fault-model")),
         ("workload".to_owned(), json!(input.workload)),
-        ("direct_oltp".to_owned(), json!(true)),
+        ("direct_oltp".to_owned(), direct_oltp(&input.workload)),
         ("config_hash".to_owned(), json!(input.config_hash)),
         ("seeded_defect".to_owned(), json!(input.defect.name())),
         ("replayed".to_owned(), json!(report.replayed())),
@@ -855,6 +866,9 @@ fn write_record(
                 &format!("not judged in {} of {} seeds", input.unjudged, report.count),
             );
         }
+    }
+    for (rule, why) in crate::invariants::queued::NOT_RUN {
+        record.not_run(rule, why);
     }
     if input.smoke {
         for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {

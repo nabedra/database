@@ -1,0 +1,17 @@
+id = "OLTP-sim-rolling-restart-no-progress"
+title = "In a rolling restart of the workers, one down at a time, no read or no write of a client that sends all the while completes for 57 to 80 s"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G10"]
+scenarios = ["R01", "R03"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 2
+why_not_caught = "No rule required that a window with sending clients made progress. Other runners not checked."
+invariant_added = "Fault model, unattested, NABEDRA_SIM_WORKLOAD=queued, profile mixed,process,network,pause, at bff842ef: RollingRestartProgress in seeds 1 to 16, all of them (seed 2 is 02ab95159065980b). Requests sent in the window and completed in it, over 239 to 3,006 attempts: no read in 15 seeds (one in seed 13), and no write in 13 (3 in seed 2, 1 in 3, 1 in 15). Each next worker is stopped as soon as the last one is ready. Undiagnosed, product or harness. In a local run of seed 2 at 9305cedb the answers were 'worker transport unavailable', 'Control authority or inventory is not ready' and 'retained worker is joining the current queue'."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

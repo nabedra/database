@@ -12,6 +12,8 @@ use std::{
     time::Duration,
 };
 
+pub(crate) mod queued;
+
 use nabedra_check::{checker::Verdict, history::Event};
 use nabedra_rt::{
     fs::FaultFs,
