@@ -2,7 +2,8 @@
 """Sort the seeds of an OLTP simulation sweep into clean, red with a named cause, and red undiagnosed.
 
 It reads sweep reports and the violations of their red seeds. A cause is named only from what a
-diagnostic run of the same seed recorded, and only when that run had the same violation kinds. Every
+diagnostic run of the same seed recorded, and only when that run had the same violation kinds and, byte for
+byte, the same client history: instrumentation can change a schedule, and then it is another run. Every
 violation of a seed needs its own evidence. Anything else is undiagnosed: an allocation site that this
 file does not list, bytes that the evidence does not add up to, and a holder that is only inferred.
 
@@ -14,6 +15,7 @@ import collections
 import csv
 import glob
 import gzip
+import hashlib
 import json
 import pathlib
 import re
@@ -37,6 +39,29 @@ HELD = "captured schema or lifecycle changed"
 NEVER_DROPPED = re.compile(r't=\d+ms Liveness: (?:n\d did not restart: |same-run restart failed after the heal: \["n\d: )'
                            r'survivors never dropped n\d: readiness deadline for [^(]*\[\(\d, \\?"200 ')
 ACTIVE_MOVE = "Control refuses fences while a replica move is active"
+
+
+# The charges of a group's Raft arenas and handle, of a pool, and of a cached route.
+GROUP, POOL, ROUTE = (8 << 20) + (64 << 10), 64 << 20, 692
+TOPOLOGY = "matches topology growth"
+
+
+def topology(violation):
+    """Whether every ledger that moved grew by whole groups, pools and cached routes. That is what a split
+    or a move adds, and whether it should have been released is not shown, so it names no cause."""
+    moved = re.findall(r"\w+(?: of group [0-9a-f-]{36})? (\d+) \(baseline (\d+)\)", violation)
+    grown = [int(now) - int(before) for now, before in moved]
+    large = [size for size in grown if size >= GROUP]
+
+    def fits(size):
+        return any((size - groups * GROUP - pools * POOL) in range(0, 17 * ROUTE, ROUTE)
+                   for groups in range(9) for pools in range(3) if groups or pools)
+
+    return bool(large) and all(fits(size) if size >= GROUP else size in range(0, 17 * ROUTE, ROUTE) for size in grown)
+
+
+def digest(lines):
+    return hashlib.sha256("\n".join(line.strip() for line in lines).encode()).hexdigest()
 
 
 def kind(violation):
@@ -110,6 +135,8 @@ class Diagnosis:
 
     def __init__(self, active_move_at=None):
         self.kinds = None
+        # A digest of its client history.
+        self.history = None
         # Where the diagnosed source refuses a command because a replica move is active, as file:line. A
         # `Busy` from anywhere else has another reason.
         self.active_move_at = active_move_at
@@ -144,7 +171,7 @@ def cause(violation, diagnosis):
     if name == "ResourceBaseline":
         grown = usage(violation)
         if grown is None:
-            return None, "another gauge than the decode bytes"
+            return None, TOPOLOGY if topology(violation) else "another gauge than the decode bytes"
         holders, why = diagnosis.leases.explain(*grown)
         return (f"holder: {holders}", None) if holders else (None, why)
     if name == "Liveness" and "the split did not publish" in violation:
@@ -165,7 +192,7 @@ def cause(violation, diagnosis):
     return None, "no rule names a cause"
 
 
-def classify(row, violations, diagnosis):
+def classify(row, violations, diagnosis, history=None):
     """(verdict, causes) of one seed of a sweep report."""
     if row["verdict"] != "red":
         return row["verdict"], []
@@ -175,6 +202,8 @@ def classify(row, violations, diagnosis):
         return "undiagnosed", ["no diagnostic run"]
     if diagnosis.kinds != set(row["violations"]):
         return "undiagnosed", ["the diagnostic run had other violations"]
+    if history is None or diagnosis.history != history:
+        return "undiagnosed", ["the diagnostic run had another client history"]
     causes, named = [], True
     for violation in violations:
         found, why = cause(violation, diagnosis)
@@ -203,7 +232,9 @@ def load(roots):
             violations = json.loads(pathlib.Path(found[0]).read_text())["violations"] if found else []
             if seed in rows:
                 raise SystemExit(f"seed {seed} is in two reports")
-            rows[seed] = (dict(row, verdict=verdict(row)), violations)
+            path = pathlib.Path(found[0]).with_name("history.jsonl") if found else None
+            history = digest(path.read_text().splitlines()) if path and path.exists() else None
+            rows[seed] = (dict(row, verdict=verdict(row)), violations, history)
     return rows
 
 
@@ -223,18 +254,30 @@ def diagnoses(paths, active_move_at=None):
     return out
 
 
+def add_histories(known, paths):
+    """The client history of each diagnostic run, from its trace `s<seed>.trace[.gz]`."""
+    for path in paths:
+        seed = int(re.search(r"s(\d+)\.trace", path)[1])
+        if seed in known:
+            with (gzip.open if path.endswith(".gz") else open)(path, "rt", errors="replace") as lines:
+                events = (re.match(r"\d+ history (\{.*\})$", line) for line in lines)
+                known[seed].history = digest(event[1] for event in events if event)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("reports", nargs="+", help="directories of downloaded sweep artifacts, one per shard")
     parser.add_argument("--diagnostics", nargs="*", default=[], help="logs of diagnostic runs")
+    parser.add_argument("--traces", nargs="*", default=[], help="traces of the diagnostic runs, s<seed>.trace.gz")
     parser.add_argument("--active-move-at", help="file:line of the refusal while a replica move is active")
     parser.add_argument("--csv")
     args = parser.parse_args(argv)
     known = diagnoses(args.diagnostics, args.active_move_at)
+    add_histories(known, args.traces)
     table, total, per = [], collections.Counter(), collections.defaultdict(collections.Counter)
     why = collections.Counter()
-    for seed, (row, violations) in sorted(load(args.reports).items()):
-        result, causes = classify(row, violations, known.get(seed))
+    for seed, (row, violations, history) in sorted(load(args.reports).items()):
+        result, causes = classify(row, violations, known.get(seed), history)
         total[result] += 1
         per[row["workload"]][result] += 1
         why.update(re.sub(r"\d+", "#", text) for text in causes if result == "undiagnosed")

@@ -1,0 +1,40 @@
+diff --git a/server/oltp-replication/src/oltp_replication/service_rpc/participant_full.rs b/server/oltp-replication/src/oltp_replication/service_rpc/participant_full.rs
+index 156f84ab..f2540c6d 100644
+--- a/server/oltp-replication/src/oltp_replication/service_rpc/participant_full.rs
++++ b/server/oltp-replication/src/oltp_replication/service_rpc/participant_full.rs
+@@ -1366,12 +1366,6 @@ impl RemoteParticipant for ParticipantClient {
+             let command_body = command.payload()?;
+             let reclaim = matches!(command_body, ParticipantCommand::ReclaimIndex(_));
+             let progress = !command_body.uses_prepare_lane();
+-            let wait_for_outgoing = matches!(
+-                command_body,
+-                ParticipantCommand::PreparePage { .. }
+-                    | ParticipantCommand::Seal { .. }
+-                    | ParticipantCommand::Resolve { .. }
+-            );
+             // These commands replay the same locator, page, or settled guard.
+             let repeat = matches!(client.action, ServiceAction::ScopedQueueExecute(_))
+                 && matches!(
+@@ -1421,21 +1415,12 @@ impl RemoteParticipant for ParticipantClient {
+             };
+             let response = if repeat {
+                 client.repeat_as(client.action, method, Some(payload)).await?
+-            } else if wait_for_outgoing {
+-                client
+-                    .call_with_outgoing_deadline(
+-                        client.action,
+-                        method,
+-                        Some(payload),
+-                        Some(nabedra_rt::time::now() + SERVICE_CONVERGENCE),
+-                    )
+-                    .await?
+             } else {
+                 client.call(method, Some(payload)).await?
+             };
+             let (value, owner): (Applied<ParticipantReply>, _) =
+                 self.decode_response(response).await.map_err(|error| {
+-                    if repeat || wait_for_outgoing {
++                    if repeat {
+                         mutation_uncertain(error)
+                     } else {
+                         error
