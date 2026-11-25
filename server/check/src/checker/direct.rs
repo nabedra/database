@@ -27,8 +27,7 @@
 //! `update` or `delete` whose existence flag is `true` (see [`linearizable`]). Refusals other
 //! than `conflict`, such as `overloaded` or a deadline before the dedup lookup, can come after a
 //! commit and are not dedup misses. Dedup records expire after a retention of 24 hours, far
-//! longer than a simulated run. The rules about commits assume that they never expire, and
-//! [`results`] says what happens to no-ops and row conflicts in a longer history.
+//! longer than a simulated run. An identity whose attempts span it is not judged ([`results`]).
 //!
 //! The completion values come from the simulator's history recorder: a `fail` carries the
 //! error code (`code`, `error`, or `error.code`), and an `ok` `update` or `delete` carries the
@@ -71,7 +70,7 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
     let mut verdicts = vec![
         lin,
         outcome::check(&for_outcome(events, &paired.ops)),
-        identity_verdict(&paired.ops),
+        identity_verdict(&results::forget_spanning(&paired.ops)),
     ];
     if opts.request_not_applied {
         verdicts.push(request_rules::request_not_applied(
@@ -93,7 +92,7 @@ pub fn check_identity(events: &[Event]) -> Verdict {
         Ok(p) => p,
         Err(e) => return Verdict::malformed(e),
     };
-    identity_verdict(&paired.ops)
+    identity_verdict(&results::forget_spanning(&paired.ops))
 }
 
 fn identity_verdict(ops: &[Op]) -> Verdict {

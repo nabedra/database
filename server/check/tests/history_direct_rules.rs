@@ -13,7 +13,8 @@
 //! is neither a valid control nor a planned reproduction (`dr-repro` report).
 
 use nabedra_check::checker::direct::results::{
-    EXPIRED, INSERT_MANY_RECOMPUTED, OTHER_BODY_COMMITTED, OTHER_BODY_UNCHANGED, OTHER_BODY_UNKNOWN,
+    EXPIRED, INSERT_MANY_RECOMPUTED, OTHER_BODY, OTHER_BODY_COMMITTED, OTHER_BODY_UNCHANGED,
+    OTHER_BODY_UNKNOWN, UNCLASSIFIED_MAY_REPEAT,
 };
 use nabedra_check::checker::direct::{
     self, InsertConflict, Options, ROW_CONFLICT, insert_conflict,
@@ -1203,6 +1204,32 @@ fn a_result_without_a_commit_explains_the_refusal_of_another_body() {
            2> upsert a 9 r
            2< reused"#,
     );
+    // So the batch may be refused itself.
+    legal(
+        "a batch that is refused after a no-op of another body",
+        r#"1> insert b 1 other
+           1< ok
+           0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
+           0< exists
+           1> delete b null gone
+           1< ok true
+           3> delete a null r
+           3< ok false
+           0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
+           0< reused"#,
+    );
+    by_default(
+        "a row conflict of another body after a refusal showed the holder",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         2< reused
+         1> insert k 1 other
+         1< ok
+         3> insert k 8 r
+         3< exists",
+        &["non-linearizable"],
+    );
     // What says that it is about a row needs one.
     by_default(
         "a row conflict with another body, over a missing row",
@@ -1281,10 +1308,13 @@ fn a_result_and_a_refusal_of_reuse_exclude_each_other() {
     };
     assert!(refusal(Some("original request run was abandoned")).is_empty());
     assert!(refusal(None).is_empty());
-    assert_eq!(
-        refusal(Some("request identity has a different body")),
-        [UNSTABLE]
-    );
+    for text in [
+        "request_id was already used with a different request body",
+        "request identity has a different body",
+        "request UUID conflicts with its durable identity",
+    ] {
+        assert_eq!(refusal(Some(text)), [UNSTABLE], "{text}");
+    }
     // Only reuse refuses an update with a conflict, unless its message says otherwise.
     let update = |message: Value| {
         let mut events = history(
@@ -1407,8 +1437,67 @@ fn the_row_conflict_of_a_batch_may_be_replayed() {
     let last = unknown.last_mut().unwrap();
     last.value.as_object_mut().unwrap().remove("message");
     let verdict = direct::check(&unknown);
-    assert_eq!(verdict.kinds(), ["non-linearizable"]);
+    assert!(verdict.valid, "{verdict:#?}");
     assert_eq!(verdict.unclassified_conflicts, 1);
+    assert_eq!(verdict.not_judged[UNCLASSIFIED_MAY_REPEAT], 1);
+    // It is replayed over a holder that a refusal showed.
+    by_default(
+        "replayed after it refused another body",
+        &format!(
+            "{refused}
+             2> upsert a 9 r
+             2< reused
+             {batch}exists"
+        ),
+        &[],
+    );
+}
+
+/// A conflict that cannot be placed may be a row conflict, and may repeat one.
+#[test]
+fn a_conflict_without_a_message_may_repeat() {
+    let without = |text: &str| {
+        let mut events = history(text);
+        for event in &mut events {
+            if event.value["message"] == ROW_CONFLICT {
+                event.value.as_object_mut().unwrap().remove("message");
+            }
+        }
+        direct::check(&events)
+    };
+    let refused = "1> insert k 1 other
+         1< ok
+         0> insert k 2 r
+         0< exists
+         1> delete k null gone
+         1< ok true
+         0> insert k 2 r
+         0< exists";
+    let verdict = without(refused);
+    assert!(verdict.valid, "{verdict:#?}");
+    assert_eq!(verdict.unclassified_conflicts, 2);
+    assert_eq!(verdict.not_judged[UNCLASSIFIED_MAY_REPEAT], 1);
+    // It still needs a row once, and is no second holder.
+    let never = without(
+        "0> insert k 2 r
+         0< exists
+         0> insert k 2 r
+         0< exists",
+    );
+    assert_eq!(never.kinds(), ["non-linearizable"]);
+    let beside = without(
+        "1> insert k 1 other
+         1< ok
+         0> insert k 2 r
+         0< exists
+         1> delete k null gone
+         1< ok true
+         2> update k 5 r
+         2< ok false
+         3> upsert k 9 r
+         3< reused",
+    );
+    assert!(beside.valid, "{beside:#?}");
 }
 
 /// What no text decides is accepted and counted by name.
@@ -1417,11 +1506,14 @@ fn what_is_not_judged_is_counted() {
     let counted = |name: &str, text: &str, expected: &[(&str, usize)]| {
         let verdict = direct::check(&history(text));
         assert!(verdict.valid, "{name}: {verdict:#?}");
-        let expected = expected.iter().map(|(n, c)| (n.to_string(), *c)).collect();
-        assert_eq!(verdict.not_judged, expected, "{name}");
+        let found: Vec<_> = verdict.not_judged.iter().filter(|(_, c)| **c > 0).collect();
+        let found: Vec<(&str, usize)> = found.iter().map(|(n, c)| (n.as_str(), **c)).collect();
+        assert_eq!(found, expected, "{name}");
+        // The three names of the open question are always there.
         let json = serde_json::to_value(&verdict).unwrap();
-        let absent = json.get("not_judged").is_none();
-        assert_eq!(absent, verdict.not_judged.is_empty(), "{name}");
+        for open in OTHER_BODY {
+            assert!(json["not_judged"][open].is_number(), "{name}: {json}");
+        }
         let merged = Verdict::merge([verdict.clone(), Verdict::new(0, Vec::new())]);
         assert_eq!(merged.not_judged, verdict.not_judged, "{name}");
     };
@@ -1536,7 +1628,7 @@ fn what_is_not_judged_is_counted() {
         &Options::default(),
     );
     assert!(verdict.has("request-id-reuse-undetected"));
-    assert!(verdict.not_judged.is_empty(), "{verdict:#?}");
+    assert!(verdict.not_judged.values().all(|c| *c == 0), "{verdict:#?}");
 }
 
 #[test]
@@ -1572,17 +1664,25 @@ fn answers_that_are_not_results() {
     assert_eq!(direct::check(&lifecycle).kinds(), ["non-linearizable"]);
 }
 
-/// Records expire after 24 hours. A request that spans as much is judged as before decision 11.
+/// Records expire after 24 hours. An identity that spans as much is not judged, so nothing in it is
+/// flagged, and it is counted.
 #[test]
-fn a_record_may_expire() {
+fn an_identity_that_spans_the_retention_is_not_judged() {
     let hours = 3_600_000_000_000u64;
+    // The time of each event in hours.
     let at = |text: &str, times: &[u64]| {
         let mut events = history(text);
         assert_eq!(events.len(), times.len());
         for (event, time) in events.iter_mut().zip(times) {
             event.time_ns = Some(*time);
         }
-        direct::check(&events).kinds()
+        direct::check(&events)
+    };
+    let legal = |name: &str, text: &str, times: &[u64]| {
+        let times: Vec<u64> = times.iter().map(|t| t * hours).collect();
+        let verdict = at(text, &times);
+        assert!(verdict.valid, "{name}: {verdict:#?}");
+        assert_eq!(verdict.not_judged[EXPIRED], 1, "{name}");
     };
     let recomputed = "0> update k 2 r
          0< ok false
@@ -1590,80 +1690,120 @@ fn a_record_may_expire() {
          1< ok
          0> update k 2 r
          0< ok true";
-    let long = [0, 1, 2, 3, 24 * hours - 1, 24 * hours];
-    assert!(at(recomputed, &long).is_empty());
-    let short = [0, 1, 2, 3, 24 * hours - 2, 24 * hours - 1];
-    assert_eq!(at(recomputed, &short), [UNSTABLE]);
-    // An old request does not excuse a later one.
-    let later = [24 * hours; 6];
-    assert_eq!(at(recomputed, &later), [UNSTABLE]);
-    let replayed = recomputed.replace("ok true", "ok false");
-    assert!(at(&replayed, &long).is_empty());
-    assert!(at(&replayed, &short).is_empty());
-    // A replay still needs a first answer that the rows explain.
-    let invented = "1> insert k 1 other
+    legal("recomputed", recomputed, &[0, 0, 0, 0, 25, 25]);
+    legal(
+        "replayed, read and replayed",
+        "0> update k 2 r
+         0< ok false
+         1> insert k 5 other
          1< ok
          0> update k 2 r
          0< ok false
+         1> get k
+         1< ok 5
          0> update k 2 r
-         0< ok false";
-    assert_eq!(
-        at(invented, &[0, 1, 2, 3, 25 * hours, 25 * hours]),
-        ["non-linearizable"]
+         0< ok false",
+        &[0, 0, 0, 0, 1, 1, 1, 1, 25, 25],
     );
-    let mut events = history(recomputed);
-    for (event, time) in events.iter_mut().zip(long) {
-        event.time_ns = Some(time);
-    }
-    assert_eq!(direct::check(&events).not_judged[EXPIRED], 1);
-    // Replayed first, and computed again after the record is gone.
-    let both = "0> update k 2 r
+    legal(
+        "another body was refused, and the first is asked again",
+        "0> update k 3 r
          0< ok false
-         1> insert k 1 other
+         0> update k 1 r
+         0< reused
+         0> update k 1 r
+         0< ok false",
+        &[0, 0, 1, 1, 25, 25],
+    );
+    legal(
+        "the refused body commits",
+        "0> delete k null r
+         0< ok false
+         1> insert k 5 r
+         1< reused
+         1> upsert k 6 r
          1< ok
-         0> update k 2 r
-         0< ok false
-         0> update k 2 r
-         0< ok true";
-    let times = [0, 1, 2, 3, 4, 5, 25 * hours, 25 * hours];
-    assert!(at(both, &times).is_empty());
-    // Refused as reuse, after the record is gone and another body committed.
-    let refused = "0> update k 2 r
+         1> get k
+         1< ok 6",
+        &[0, 0, 1, 1, 25, 25, 25, 25],
+    );
+    legal(
+        "refused as reuse of a commit",
+        "0> update k 2 r
          0< ok false
          2> upsert k 9 r
          2< ok
          0> update k 2 r
-         0< reused";
-    assert!(at(refused, &[0, 1, 2, 3, 25 * hours, 25 * hours]).is_empty());
-    assert_eq!(at(refused, &short), [UNSTABLE]);
-    // A row conflict of an insert may be replayed and recomputed too.
-    for last in ["exists", "ok"] {
-        let text = format!(
-            "1> insert k 1 other
-             1< ok
-             0> insert k 2 r
-             0< exists
-             1> delete k null gone
-             1< ok true
-             0> insert k 2 r
-             0< {last}"
-        );
-        let times = [0, 1, 2, 3, 4, 5, 25 * hours, 25 * hours];
-        assert!(at(&text, &times).is_empty(), "{last}");
-    }
-    // A commit is assumed to hold, as before.
-    let reran = "1> insert k 1 other
+         0< reused",
+        &[0, 0, 24, 24, 25, 25],
+    );
+    legal(
+        "a commit runs again",
+        "1> insert k 1 other
          1< ok
          0> update k 2 r
          0< ok true
          1> delete k null gone
          1< ok true
          0> update k 2 r
-         0< ok false";
-    let times = [0, 1, 2, 3, 4, 5, 30 * hours, 30 * hours];
-    assert_eq!(at(reran, &times), ["dedup-miss", "non-linearizable"]);
-    // Without times nothing expires.
+         0< ok false",
+        &[0, 0, 0, 0, 1, 1, 30, 30],
+    );
+    legal(
+        "a commit is replayed and then runs again",
+        "0> upsert k 2 r
+         0< ok
+         1> upsert k 3 other
+         1< ok
+         0> upsert k 2 r
+         0< ok
+         1> get k
+         1< ok 3
+         0> upsert k 2 r
+         0< ok
+         1> get k
+         1< ok 2",
+        &[0, 0, 1, 1, 2, 2, 2, 2, 25, 25, 25, 25],
+    );
+    // One nanosecond less, or the same times for all, and it is judged.
+    let short = [0, 1, 2, 3, 24 * hours - 2, 24 * hours - 1];
+    assert_eq!(at(recomputed, &short).kinds(), [UNSTABLE]);
+    assert!(!at(recomputed, &short).not_judged.contains_key(EXPIRED));
+    let exact = [0, 1, 2, 3, 24 * hours - 1, 24 * hours];
+    assert!(at(recomputed, &exact).valid);
+    assert_eq!(at(recomputed, &[24 * hours; 6]).kinds(), [UNSTABLE]);
     assert_eq!(direct::check(&history(recomputed)).kinds(), [UNSTABLE]);
+    // Only the answers of that identity are left out: another one, and the reads, are judged.
+    let beside = format!(
+        "{recomputed}
+         0> delete j null r
+         0< ok false
+         1> insert j 1 x
+         1< ok
+         0> delete j null r
+         0< ok true"
+    );
+    let mut times = [25 * hours; 12];
+    times[0] = 0;
+    let verdict = at(&beside, &times);
+    assert_eq!(verdict.kinds(), [UNSTABLE]);
+    assert_eq!(verdict.anomalies.len(), 1);
+    let invented = format!(
+        "{recomputed}
+         1> get k
+         1< ok 7"
+    );
+    let verdict = at(&invented, &[0, 0, 0, 0, 25, 25, 25, 25].map(|t| t * hours));
+    assert_eq!(verdict.kinds(), ["non-linearizable"]);
+    // A refused attempt has no effect.
+    let refused = "0> upsert k 2 r
+         0< refused overloaded
+         0> upsert k 2 r
+         0< refused overloaded
+         1> get k
+         1< ok 2";
+    let verdict = at(refused, &[0, 0, 25, 25, 25, 25].map(|t| t * hours));
+    assert!(!verdict.valid, "{verdict:#?}");
 }
 
 #[test]
@@ -2333,11 +2473,12 @@ fn a_store_that_keeps_its_promises_is_never_flagged() {
             assert_eq!(verdict.unclassified_conflicts, 0, "seed {seed}");
             if reading == Reading::Holds {
                 // A store that decides everything leaves nothing open, but a refusal may be lost.
-                let mut names = verdict.not_judged.keys();
-                assert!(names.all(|n| n == OTHER_BODY_UNKNOWN), "seed {seed}");
+                let mut counts = verdict.not_judged.iter();
+                let unknown = |(n, c): (&String, &usize)| *c == 0 || n == OTHER_BODY_UNKNOWN;
+                assert!(counts.all(unknown), "seed {seed}");
                 refusals += usize::from(refused_after_a_result(&events));
             } else {
-                not_judged += usize::from(!verdict.not_judged.is_empty());
+                not_judged += usize::from(verdict.not_judged.values().any(|c| *c > 0));
                 replays += usize::from(has_replay(&events));
             }
             // The default does not accept every conflict of the queued path, so only the opt-in

@@ -45,7 +45,8 @@
 //! # What is not judged
 //!
 //! No text decides these. They are accepted, and [`not_judged`] counts them by name in
-//! [`Verdict::not_judged`](super::super::Verdict::not_judged):
+//! [`Verdict::not_judged`](super::super::Verdict::not_judged). The first three are one question and in
+//! every verdict, also as zero:
 //!
 //! | Name | Case |
 //! | --- | --- |
@@ -53,7 +54,8 @@
 //! | `other-body-without-effect` | the same, but it answers a no-op or a row conflict of its own |
 //! | `other-body-unknown` | another body under the identity of an answered no-op or row conflict has an unknown attempt and no answered commit. It may have committed, and it may have been refused |
 //! | `insert-many-recomputed` | an `insert_many` refused over a row commits on retry. Decision 11 names only `insert` |
-//! | `request-spans-retention` | the attempts of a request with a no-op or a row conflict span [`RETENTION_NS`] or more, by `time_ns`. Its answers may be replayed or recomputed, because its record may have been deleted. Its commits are assumed to hold. Without `time_ns` nothing expires |
+//! | `unclassified-conflict-may-repeat` | a request with other attempts has a `conflict` of an insert that cannot be placed. It may be a row conflict and its replay, or something else |
+//! | `identity-spans-retention` | the attempts under an identity span [`RETENTION_NS`] or more, by `time_ns`, so its record may have expired. **Nothing is judged there**: every attempt counts as unknown, and no rule compares their answers. Other identities in the same history are judged. Without `time_ns` nothing spans |
 //!
 //! Not results, and so neither stable nor held: `not_found`, a deadline, an abandoned or fenced
 //! run, a conflicted preparation, a changed schema, a moved route, a limit. A `conflict` of an
@@ -65,8 +67,8 @@
 //! # Message texts
 //!
 //! The product has no code for a row conflict, so its message tells it from other `conflict`
-//! refusals. If the text changes, or a writer records none, the answer is not a result and the rule
-//! goes quiet on it. So every `conflict` of an insert that [`insert_conflict`] cannot place is
+//! refusals. If the text changes, or a writer records none, the answer is not a result, and the rule
+//! is quiet on it: it may be a row conflict or repeat one (`unclassified-conflict-may-repeat`). So every `conflict` of an insert that [`insert_conflict`] cannot place is
 //! counted in [`Verdict::unclassified_conflicts`](super::super::Verdict::unclassified_conflicts). It
 //! is not an anomaly. A run with a count above zero has checked less than it seems, and its caller
 //! has to print the count.
@@ -89,7 +91,7 @@
 use super::super::linearizable::{Identities, classify, code_of, committed_answer, message_of};
 use crate::history::{Op, Outcome};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 /// The default of `direct_dedup_retention_ms`: 24 hours.
 pub const RETENTION_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
@@ -99,7 +101,16 @@ pub const OTHER_BODY_COMMITTED: &str = "other-body-committed";
 pub const OTHER_BODY_UNCHANGED: &str = "other-body-without-effect";
 pub const OTHER_BODY_UNKNOWN: &str = "other-body-unknown";
 pub const INSERT_MANY_RECOMPUTED: &str = "insert-many-recomputed";
-pub const EXPIRED: &str = "request-spans-retention";
+pub const UNCLASSIFIED_MAY_REPEAT: &str = "unclassified-conflict-may-repeat";
+pub const EXPIRED: &str = "identity-spans-retention";
+
+/// The names of one open question, whether another body may run after a result. They are in every
+/// verdict of [`super::check`], also when nothing was counted.
+pub const OTHER_BODY: [&str; 3] = [
+    OTHER_BODY_COMMITTED,
+    OTHER_BODY_UNCHANGED,
+    OTHER_BODY_UNKNOWN,
+];
 
 /// The message of a refusal over an existing row.
 pub const ROW_CONFLICT: &str = "primary key already exists";
@@ -180,10 +191,10 @@ pub(crate) fn definite_result(op: &Op) -> Option<Definite> {
     }
 }
 
-/// The record that the first of these attempts made may have expired before the last one.
-fn may_expire(ops: &[Op], attempts: &[usize]) -> bool {
+/// A record of this identity may have expired between two of its attempts.
+fn spans(ops: &[Op], members: &[usize]) -> bool {
     let times = || {
-        attempts
+        members
             .iter()
             .flat_map(|&i| [ops[i].call_time, ops[i].ret_time])
             .flatten()
@@ -194,25 +205,42 @@ fn may_expire(ops: &[Op], attempts: &[usize]) -> bool {
     }
 }
 
+/// The attempts of identities that span the retention, each as an unknown one without an identity:
+/// their answers say nothing, and each may have taken effect or not. A refused one has none.
+pub(crate) fn forget_spanning(ops: &[Op]) -> Vec<Op> {
+    let mut judged = ops.to_vec();
+    for members in Identities::new(ops).by_id.values() {
+        if !spans(ops, members) {
+            continue;
+        }
+        for &i in members {
+            let op = &mut judged[i];
+            op.request_id = None;
+            op.complete_value = Value::Null;
+            if op.outcome != Outcome::Fail {
+                op.outcome = Outcome::Info;
+                op.ret = None;
+            }
+        }
+    }
+    judged
+}
+
 /// What the answers of each request say about its attempts.
 pub(crate) struct Requests {
     without_effect: HashMap<usize, Definite>,
-    spanning: HashSet<usize>,
 }
 
 impl Requests {
     pub(crate) fn new(ids: &Identities, ops: &[Op]) -> Self {
         let mut requests = Requests {
             without_effect: HashMap::new(),
-            spanning: HashSet::new(),
         };
         for attempts in ids.requests().into_values() {
             let mut results = attempts.iter().filter_map(|&i| definite_result(&ops[i]));
             let first = results.next();
             let agree = results.all(|other| Some(other) == first);
-            if may_expire(ops, &attempts) {
-                requests.spanning.extend(&attempts);
-            } else if let Some(first) = first
+            if let Some(first) = first
                 && first != Definite::Commit
                 && agree
             {
@@ -228,11 +256,6 @@ impl Requests {
     pub(crate) fn without_effect(&self, attempt: usize) -> Option<Definite> {
         self.without_effect.get(&attempt).copied()
     }
-
-    /// Its request spans the retention.
-    pub(crate) fn spans(&self, attempt: usize) -> bool {
-        self.spanning.contains(&attempt)
-    }
 }
 
 /// A refused insert, also of a batch, that is known to be about a present row.
@@ -243,6 +266,13 @@ pub(crate) fn is_row_conflict(op: &Op) -> bool {
 /// [`is_row_conflict`], or a refusal that cannot be placed.
 pub(crate) fn may_be_row_conflict(op: &Op) -> bool {
     is_row_conflict(op) || refused_insert(op) == Some(InsertConflict::Unclassified)
+}
+
+/// A refused insert that may repeat an earlier result of its request: decision 11 says nothing about
+/// the conflict of a batch, and nothing says what a conflict that cannot be placed is about.
+pub(crate) fn may_repeat(op: &Op) -> bool {
+    op.f == "insert_many" && is_row_conflict(op)
+        || refused_insert(op) == Some(InsertConflict::Unclassified)
 }
 
 /// A refusal because of another body: only that refuses an `upsert`, `update` or `delete` with
@@ -270,9 +300,6 @@ pub(super) fn may_hold(op: &Op) -> bool {
 /// A request that answered a no-op or a row conflict and was also refused as reuse: if its result
 /// is recorded, the refusal is wrong, and otherwise the result is.
 pub(super) fn result_and_refusal(ops: &[Op], attempts: &[usize]) -> Option<(usize, usize)> {
-    if may_expire(ops, attempts) {
-        return None;
-    }
     let mut results = attempts
         .iter()
         .copied()
@@ -283,7 +310,7 @@ pub(super) fn result_and_refusal(ops: &[Op], attempts: &[usize]) -> Option<(usiz
 
 /// What the checker accepts because no text decides it, by name.
 pub(super) fn not_judged(ids: &Identities, ops: &[Op]) -> BTreeMap<String, usize> {
-    let mut out = BTreeMap::new();
+    let mut out: BTreeMap<String, usize> = OTHER_BODY.map(|name| (name.to_string(), 0)).into();
     let mut count = |name: &str, times: usize| {
         if times > 0 {
             *out.entry(name.to_string()).or_default() += times;
@@ -299,6 +326,10 @@ pub(super) fn not_judged(ids: &Identities, ops: &[Op]) -> BTreeMap<String, usize
     let unchanged = |i: usize| is(i, false);
     let committed = |i: usize| is(i, true);
     for bodies in identities.values() {
+        if spans(ops, &bodies.concat()) {
+            count(EXPIRED, 1);
+            continue;
+        }
         let answered = |body: &[usize]| body.iter().copied().find(|&i| unchanged(i));
         // It did not clearly commit before the other body asked.
         let commits_after = |body: &[usize], first: usize| {
@@ -316,9 +347,10 @@ pub(super) fn not_judged(ids: &Identities, ops: &[Op]) -> BTreeMap<String, usize
             let open = unknown && !attempts.iter().any(|&i| definite_result(&ops[i]).is_some());
             let beside = others(b).any(|(_, other)| answered(other).is_some());
             count(OTHER_BODY_UNKNOWN, usize::from(open && beside));
-            if may_expire(ops, attempts) && answered(attempts).is_some() {
-                count(EXPIRED, 1);
-            }
+            let unplaced =
+                |i: &usize| refused_insert(&ops[*i]) == Some(InsertConflict::Unclassified);
+            let repeat = attempts.len() > 1 && attempts.iter().any(unplaced);
+            count(UNCLASSIFIED_MAY_REPEAT, usize::from(repeat));
             let batch = |i: &usize| ops[*i].f == "insert_many" && is_row_conflict(&ops[*i]);
             let recomputed = attempts.iter().any(batch) && attempts.iter().any(|&i| committed(i));
             count(INSERT_MANY_RECOMPUTED, usize::from(recomputed));
@@ -335,9 +367,6 @@ pub(super) fn disagreement(
     ops: &[Op],
     attempts: &[usize],
 ) -> Option<((usize, Definite), (usize, Definite))> {
-    if may_expire(ops, attempts) {
-        return None;
-    }
     let mut answers: Vec<(usize, Definite)> = attempts
         .iter()
         .filter_map(|&i| Some((i, definite_result(&ops[i])?)))

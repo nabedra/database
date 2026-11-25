@@ -124,8 +124,8 @@ struct Record {
     /// Holds the bodies with a result but no commit, as a set of `bit`s.
     unchanged: usize,
     bit: u32,
-    /// The bits of batches, whose row conflict may be recorded or not.
-    batches: u32,
+    /// The bits of batches, and of conflicts that cannot be placed: they may be recorded or not.
+    doubtful: u32,
 }
 
 /// In a record's slot: a result without a commit was seen to hold the identity.
@@ -136,8 +136,6 @@ const HELD: u32 = u32::MAX;
 struct Rules {
     /// It leaves a result without a commit.
     records: bool,
-    /// Only if no other body left one: it may be a refusal of reuse instead.
-    doubtful: bool,
     /// It may repeat such a result of its request instead of reading the rows.
     replays: bool,
     /// A refusal that is known to be about a row, so it needs one.
@@ -179,9 +177,7 @@ impl KeyOp {
             (unchanged & r.bit != 0, unchanged & !r.bit)
         });
         let recorded = |mut next: Vec<u32>| {
-            if let Some(r) = self.record.filter(|_| self.rules.records)
-                && !(self.rules.doubtful && others != 0)
-            {
+            if let Some(r) = self.record.filter(|_| self.rules.records) {
                 next[r.unchanged] |= r.bit;
             }
             next
@@ -189,7 +185,7 @@ impl KeyOp {
         let repeats = mine && self.rules.replays && matches!(held, 0 | HELD);
         match self.role {
             Role::Invalid => return None,
-            Role::Conflict | Role::Fresh if repeats => return Some(state.to_vec()),
+            Role::Conflict if repeats => return Some(state.to_vec()),
             Role::Conflict => {
                 if let Some(r) = self.record.filter(|_| held != 0) {
                     let other = if held == HELD {
@@ -204,9 +200,9 @@ impl KeyOp {
                 }
                 // The one result of another body holds the identity, as this refusal shows.
                 let r = self.record?;
-                let sure = others & !r.batches;
+                let sure = others & !r.doubtful;
                 let holder = sure.count_ones() == 1 || sure == 0 && others != 0;
-                return (!mine && holder && !self.rules.row).then(|| {
+                return (holder && !self.rules.row).then(|| {
                     let mut next = state.to_vec();
                     next[r.slot] = HELD;
                     next
@@ -255,7 +251,12 @@ pub fn check_kv_opts(events: &[Event], opts: &Options) -> Verdict {
         Ok(p) => p,
         Err(e) => return Verdict::malformed(e),
     };
-    let ops = &paired.ops;
+    let judged = if opts.request_dedup {
+        results::forget_spanning(&paired.ops)
+    } else {
+        paired.ops
+    };
+    let ops = &judged;
     let ids = Identities::new(ops);
     let mut keys = BTreeMap::new();
     let mut parents = Vec::new();
@@ -710,7 +711,7 @@ fn build(
                     body,
                     unchanged: slot + 1,
                     bit,
-                    batches: 0,
+                    doubtful: 0,
                 })
             })
         } else {
@@ -733,12 +734,10 @@ fn build(
         // Attempts with an unknown outcome have the role of an effect, and share the result of
         // their request if it has none.
         let result = requests.and_then(|r| r.without_effect(pre.src));
-        if let Some(requests) = requests {
-            let repeatable = src.f == "insert_many" || requests.spans(pre.src);
+        if requests.is_some() {
             op.rules = Rules {
                 records: op.role == Role::Fresh || results::may_be_row_conflict(src),
-                doubtful: op.role == Role::Conflict && !results::is_row_conflict(src),
-                replays: repeatable && (op.role == Role::Fresh || results::is_row_conflict(src)),
+                replays: results::may_repeat(src),
                 row: results::is_row_conflict(src),
             };
             // The earliest unknown attempt of a request may have left a result without a commit.
@@ -794,15 +793,16 @@ fn build(
                 .iter()
                 .any(|(r, rules)| r.slot == slot && r.body == body && rules.replays)
     };
-    let mut batches = HashMap::<usize, u32>::new();
-    for op in out.iter().filter(|op| ops[op.src].f == "insert_many") {
-        if let Some(r) = op.record {
-            *batches.entry(r.slot).or_default() |= r.bit;
+    let mut doubtful = HashMap::<usize, u32>::new();
+    for op in &out {
+        let batch = ops[op.src].f == "insert_many";
+        if let Some(r) = op.record.filter(|_| batch || op.rules.replays) {
+            *doubtful.entry(r.slot).or_default() |= r.bit;
         }
     }
     for op in &mut out {
         if let Some(r) = &mut op.record {
-            r.batches = batches.get(&r.slot).copied().unwrap_or(0);
+            r.doubtful = doubtful.get(&r.slot).copied().unwrap_or(0);
         }
         op.rules.records &= op.record.is_some_and(|r| matters(r.slot, r.body));
     }
