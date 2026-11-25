@@ -4,21 +4,34 @@ kinds = ["U"]
 guarantees = []
 scenarios = []
 tiers = ["T1"]
+# Every test once, then the repetition gate (50 runs of each) in four processes. FoolTest holds one
+# test per way to make sim_bugs.py count something that is not a detection.
 command = ["bash", "-euo", "pipefail", "-c", '''
 python3 -m unittest test_sim_bugs
-python3 - <<'PY' | python3 repeat_gate.py
+python3 - <<'PY'
+from concurrent.futures import ThreadPoolExecutor
 import json
+import subprocess
+import sys
 import unittest
-from test_sim_bugs import SimBugsTest
+from test_sim_bugs import FoolTest, SearchTest, SimBugsTest
 
-tests = unittest.defaultTestLoader.getTestCaseNames(SimBugsTest)
-print(json.dumps([
-    {"id": f"test_sim_bugs.SimBugsTest.{name}", "file": "scripts/testing/test_sim_bugs.py", "lang": "python"}
-    for name in tests
-]))
+tests = [{"id": f"test_sim_bugs.{case.__name__}.{name}", "file": "scripts/testing/test_sim_bugs.py", "lang": "python"}
+         for case in (SimBugsTest, FoolTest, SearchTest)
+         for name in unittest.defaultTestLoader.getTestCaseNames(case)]
+
+def gate(shard):
+    return subprocess.run([sys.executable, "repeat_gate.py"], input=json.dumps(shard), text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+with ThreadPoolExecutor(4) as pool:
+    results = list(pool.map(gate, [tests[i::4] for i in range(4)]))
+for result in results:
+    print(result.stdout, end="", flush=True)
+sys.exit(max(result.returncode for result in results))
 PY
 ''']
 cwd = "scripts/testing"
-timeout_s = 600
+timeout_s = 5400
 needs = []
 result_parser = "unittest"
