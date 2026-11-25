@@ -485,6 +485,7 @@ impl OltpPool {
             .quarantined()
             .iter()
             .filter_map(|damage| group_of_scope(&damage.scope))
+            .chain(self.inner.damage.damaged_values())
             .collect()
     }
     /// True once the group's scope is quarantined, at open or at run time. One
@@ -2062,7 +2063,8 @@ impl<'a> GroupTransaction<'a> {
     /// Deletes the change records of log indexes `from..=through`. The log's
     /// purge calls it in the transaction that deletes the same log entries.
     pub fn purge_changes(&mut self, from: u64, through: u64) -> Result<(), ProtocolError> {
-        if from > through {
+        // A group without records writes nothing here.
+        if self.read.change_from(from)?.is_none_or(|(first, _)| first > through) {
             return Ok(());
         }
         let start = change_key(&self.read.prefix, from);

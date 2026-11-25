@@ -464,3 +464,83 @@ async fn vs16_random_histories_read_back_every_version_byte_for_byte() {
         }
     }
 }
+
+/// The stored and logged encodings of a table with search columns. Other builds
+/// and replicas read them, so a change here is a format change.
+#[tokio::test]
+async fn vs20_search_encodings_are_stable_and_an_older_decoder_refuses_them() {
+    let mut s = S::new().await;
+    let write = s.write(1, None, Some(row(1, "a")), vec![s.set(PLAIN, s.dense(1))]);
+    let entry = serde_json::to_value(&write).unwrap();
+    assert_eq!(
+        entry["search"],
+        serde_json::json!({"vectors": [{"column": 1, "value": {"kind": "dense", "data": "AQEBAQEBAQE="}}]})
+    );
+    // An older build knows no `search`, in a write, a row change or a command.
+    let plain = serde_json::to_value(s.f.write(1, None, None)).unwrap();
+    assert!(plain.get("search").is_none());
+    let prepared = s.put_row(1, None, row(1, "a"), vec![]);
+    assert!(serde_json::to_value(&prepared).unwrap()["change"].get("put_row").is_some());
+    let authority = s.f.authority;
+    let (table_id, primary_key) = (s.f.table, Key::Int64(1));
+    let commands = [
+        (s.fence_command(1, columns()), "search_fence"),
+        (
+            ParticipantCommand::Closed(Closed { authority, ts: ts(1), unix_ms: 1 }),
+            "closed",
+        ),
+        (ParticipantCommand::SetVector(s.set_vector(1, 1, 1, 2)), "set_vector"),
+        (
+            ParticipantCommand::EmbedFailed(EmbedFailed {
+                authority,
+                table_id,
+                primary_key: primary_key.clone(),
+                column: EMBEDDED,
+                source_version: ts(1),
+                id: ts(1),
+                attempt: 0,
+                reason: Text::try_from("no").unwrap(),
+            }),
+            "embed_failed",
+        ),
+        (
+            ParticipantCommand::RequeueEmbedding(RequeueEmbedding {
+                authority,
+                table_id,
+                primary_key,
+                column: EMBEDDED,
+                source_version: ts(1),
+                id: ts(1),
+            }),
+            "requeue_embedding",
+        ),
+    ];
+    for (command, tag) in commands {
+        assert!(command.is_direct(), "{tag} is never nested");
+        let encoded = serde_json::to_vec(&command).unwrap();
+        let decoded: ParticipantCommand = serde_json::from_slice(&encoded).unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&encoded).unwrap().get(tag).is_some());
+        let owner = s.f.shared().reserve_scratch(ByteClass::Data, 64 << 10).unwrap();
+        decoded.attach_fields(Arc::new(owner)).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
+    }
+    s.direct(10, write).await;
+    let logical = row::logical_key(&s.f.key(1)).unwrap();
+    let dump: BTreeMap<_, _> = s.f.dump().await.into_iter().collect();
+    let version = [&[VALUE][..], &logical, &(!10u64).to_be_bytes()].concat();
+    assert_eq!(
+        std::str::from_utf8(&dump[&version]).unwrap(),
+        r#"{"value":{"body":"a","id":1},"blobs":{"1":10},"source":{"2":10}}"#
+    );
+    let record = [&b"e"[..], &logical, &2u16.to_be_bytes()].concat();
+    assert_eq!(
+        std::str::from_utf8(&dump[&record]).unwrap(),
+        r#"{"source_version":10,"id":10,"attempts":0,"limit":10}"#
+    );
+    // A tombstone carries nothing, so it has the bytes of any other table's.
+    let delete = s.write(1, Some(10), None, Vec::new());
+    s.direct(11, delete).await;
+    let dump: BTreeMap<_, _> = s.f.dump().await.into_iter().collect();
+    let version = [&[VALUE][..], &logical, &(!11u64).to_be_bytes()].concat();
+    assert_eq!(dump[&version], br#"{"value":null}"#);
+}

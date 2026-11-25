@@ -230,7 +230,8 @@ async fn vs16_a_split_page_without_every_vector_is_refused() {
     let vectors = |image: &mut CommittedImage, work: &dyn Fn(&mut RowImage)| {
         work(image.search.as_mut().unwrap());
     };
-    let cases: Vec<(&str, Vec<CommittedImage>, Option<Box<SplitSearch>>)> = vec![
+    type Case = (&'static str, Vec<CommittedImage>, Option<Box<SplitSearch>>);
+    let cases: Vec<Case> = vec![
         ("no vectors", edit(&|image| vectors(image, &|search| search.vectors.clear())), schema.clone()),
         ("one vector", edit(&|image| vectors(image, &|search| { search.vectors.pop(); })), schema.clone()),
         ("another column", edit(&|image| vectors(image, &|search| search.vectors[0].column = 9)), schema.clone()),

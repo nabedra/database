@@ -126,6 +126,9 @@ impl DamageState {
     fn values(&self) -> std::sync::MutexGuard<'_, BTreeSet<Uuid>> {
         self.values.lock().unwrap_or_else(|poison| poison.into_inner())
     }
+    pub(super) fn damaged_values(&self) -> Vec<Uuid> {
+        self.values().iter().copied().collect()
+    }
     /// One atomic load while no value is damaged.
     pub(super) fn value_damaged(&self, group: Uuid) -> bool {
         self.any_value.load(Ordering::Acquire) && self.values().contains(&group)
@@ -315,11 +318,17 @@ impl OltpPool {
                     first_bad_seq: damage.first_bad_seq,
                 })
             })
-            .chain(self.inner.damage.values().iter().map(|group| GroupDamage {
-                group: *group,
-                cause: DamageCause::RunBlock,
-                first_bad_seq: None,
-            }))
+            .chain(
+                self.inner
+                    .damage
+                    .damaged_values()
+                    .into_iter()
+                    .map(|group| GroupDamage {
+                        group,
+                        cause: DamageCause::RunBlock,
+                        first_bad_seq: None,
+                    }),
+            )
             .collect()
     }
     pub fn group_damage(&self, group: Uuid) -> Option<GroupDamage> {

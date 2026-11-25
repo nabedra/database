@@ -210,8 +210,7 @@ impl ParticipantMachine {
     ) -> Result<OwnedCommand<ChangePage>, ProtocolError> {
         if max_entries == 0
             || max_entries > 1024
-            || max_bytes < 64 << 10
-            || max_bytes > super::super::MAX_FIXED_COMMAND_BYTES
+            || !(64 << 10..=super::super::MAX_FIXED_COMMAND_BYTES).contains(&max_bytes)
             || !matches!(self.store.identity().kind, GroupKind::Data { .. })
         {
             return Err(invalid());
@@ -242,6 +241,24 @@ impl ParticipantMachine {
             )
             .await;
         self.note_damage(result)
+    }
+}
+
+impl ParticipantHandle {
+    /// `ParticipantMachine::change_page` on a local replica. Any voter serves
+    /// its applied changes, so it takes no barrier.
+    pub async fn change_page_local(
+        &self,
+        after: u64,
+        max_entries: u16,
+        max_bytes: usize,
+    ) -> Result<OwnedCommand<ChangePage>, ProtocolError> {
+        if self.remote.is_some() {
+            return Err(invalid());
+        }
+        self.local_machine()
+            .change_page(after, max_entries, max_bytes)
+            .await
     }
 }
 

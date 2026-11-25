@@ -453,3 +453,17 @@ impl ParticipantMachine {
         serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())
     }
 }
+impl ParticipantHandle {
+    /// `ParticipantMachine::embed_records` behind the leader's read barrier.
+    pub async fn embed_records_local(
+        &self,
+        after: Option<(MvccKey, ColumnId)>,
+        max_items: u16,
+    ) -> Result<Vec<EmbedItem>, ProtocolError> {
+        if self.remote.is_some() {
+            return Err(invalid());
+        }
+        self.local_consensus().ensure_linearizable_lease().await?;
+        self.local_machine().embed_records(after, max_items).await
+    }
+}

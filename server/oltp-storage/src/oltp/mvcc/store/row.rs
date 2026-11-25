@@ -669,7 +669,8 @@ impl OwnedPayload for SearchRow {
 impl ParticipantMachine {
     /// The newest version of a row at or below `read_ts` with its vectors and
     /// its embedding records. The caller took the read barrier, as for
-    /// `read_at`.
+    /// `read_at`. `u64::MAX` reads the latest version like `direct_latest`: it
+    /// waits for the key's registered commits and never raises `max_read_ts`.
     pub async fn read_search_row(
         &self,
         read_ts: ReadTs,
@@ -679,7 +680,11 @@ impl ParticipantMachine {
         if max_bytes > super::super::MAX_FIXED_COMMAND_BYTES {
             return Err(invalid());
         }
-        self.observe_snapshot(read_ts).await?;
+        if read_ts.get() == u64::MAX {
+            self.clock.wait_latest(&key).await?;
+        } else {
+            self.observe_snapshot(read_ts).await?;
+        }
         let owner = Arc::new(
             self.store
                 .resources()
@@ -707,6 +712,22 @@ impl ParticipantMachine {
             )
             .await;
         self.note_damage(result)
+    }
+}
+impl ParticipantHandle {
+    /// `ParticipantMachine::read_search_row` on a local replica.
+    pub async fn search_row_local(
+        &self,
+        read_ts: ReadTs,
+        key: MvccKey,
+        max_bytes: usize,
+    ) -> Result<OwnedCommand<SearchRow>, ProtocolError> {
+        if self.remote.is_some() {
+            return Err(invalid());
+        }
+        self.local_machine()
+            .read_search_row(read_ts, key, max_bytes)
+            .await
     }
 }
 fn read_row(
