@@ -1048,6 +1048,7 @@ impl Membership {
             .collect();
         let now = elapsed_ms(&cluster.world);
         let lost = *self.lost_ms.entry(node).or_insert(now);
+        let asked_from = now - lost;
         let deadline = cluster.world.elapsed() + limit;
         let mut first = true;
         let (dropped, listed) = loop {
@@ -1069,7 +1070,10 @@ impl Membership {
             "node": node,
             "dropped": dropped,
             "after_ms": after,
-            // The survivors were first asked then, so it may have been earlier.
+            // When the survivors were first asked. A worker that a step stopped long before, as
+            // a wiped one that was refused, is asked about only after the step's windows.
+            "asked_from_ms": asked_from,
+            // They had dropped it by then, so it may have been earlier.
             "at_most": dropped && first,
             "since_thaw_ms": self.thawed_ms.and_then(|thawed| lost.checked_sub(thawed)),
             "listed": listed.iter().map(|(node, ready)| (node.to_string(), json!(ready))).collect::<serde_json::Map<_, _>>(),
