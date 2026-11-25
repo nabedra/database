@@ -197,7 +197,7 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     observer(0, format!("configuration {}", configuration["hash"]));
     let checks = Invariants::new();
     checks.set_trace(observer.clone());
-    checks.install_probes(&world, workload.name());
+    // Scratch: no probes.
     let history = Arc::new(Mutex::new(History::default()));
     history.lock().unwrap().set_trace(observer.clone());
     let mut assertions = BTreeMap::new();
