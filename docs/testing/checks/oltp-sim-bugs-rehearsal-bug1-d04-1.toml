@@ -1,0 +1,14 @@
+id = "oltp-sim-bugs-rehearsal-bug1-d04-1"
+module = "oltp"
+kinds = ["U"]
+# REHEARSAL of the shards: the manifest's profile and kinds are overridden and the seeds are capped. No evidence for any bug.
+guarantees = []
+scenarios = []
+tiers = ["T3"]
+command = ["python3", "scripts/testing/sim_bugs.py", "shard", "bug1-d04", "--shard", "1/2", "--workload", "direct", "--profile", "network", "--expect", "NotAppliedNeverCommitted,ResourceBaseline", "--seeds", "300",
+           "--jobs", "4", "--sim-jobs", "4", "--time-limit", "9000", "--out", "target/testing-logs/oltp-sim-bugs-rehearsal-bug1-d04-1"]
+cwd = "."
+timeout_s = 9600
+needs = []
+result_parser = "exit-code"
+env = { RUSTFLAGS = "--cfg tokio_unstable", RUST_MIN_STACK = "16777216" }
