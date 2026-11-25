@@ -306,13 +306,15 @@ impl Invariants {
     ///
     /// What it cannot see:
     ///
-    /// - a charge that comes and goes, and is gone for long enough to hold three observations
-    ///   and the steps between them. Measured on smoke (3 seeds, charges in the product), held
-    ///   and gone in ms: gone for at most 30 per cycle was always red, and 160/40, 400/100,
-    ///   450/50, 800/200, 900/100 and 950/50 were missed, so from 40 on even one held 95% of
-    ///   the time;
-    /// - a charge that is there only between two samples, as 1 ms of every 10, or that keeps
-    ///   in step with both the steps and the observations: 1/1 was missed in 4 of 9 runs;
+    /// - a charge that comes and goes, if the samples fall where it is gone. Only these pairs
+    ///   were measured (held/gone in ms), and no general bound follows from them. In the
+    ///   product on smoke seeds 1, 2 and 18, red every time: 2/1, 5/5, 8/2, 9/1, 10/10, 12/4,
+    ///   14/2, 15/1, 19/1, 18/2, 28/2, 45/5, 40/10, 49/1, 80/20, 90/10, 99/1, 150/10, 180/20,
+    ///   190/10, 285/15, 270/30, 475/25, 490/10, 980/20 and 999/1. Missed: 1/9, 160/40,
+    ///   400/100, 450/50, 800/200, 900/100 and 950/50, and 1/1 in 4 of 9 runs. In the settling
+    ///   loop alone, red in this many phases: 1/4 in 1 of 5, 2/3 in 2 of 5, 1/12 in 0 of 13,
+    ///   1/15 in 1 of 16, 2/18 in 4 of 20, 2/23 in 0 of 25 and 3/27 in 9 of 30. With requests
+    ///   of 5 or 10 ms there, 4/1 was missed in 2 of 50 cases, 9/1 in 1 and 8/2 in 4 of 100;
     /// - a charge first taken after the last observation: one taken 40 ms or more after
     ///   settling starts was missed. The workload stops observing once
     ///   every worker has settled at the same pass, or at its limit: if one worker never

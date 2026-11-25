@@ -58,9 +58,10 @@
 //!   commits and commits without a record are not seen.
 //! - RangeClockRule1: committed entries of the direct path, by the time they registered in
 //!   the term of their entry. A read counts once the range admits it, so one that fails later
-//!   counts as completed. A commit that did not register in that term counts as proposed when
-//!   the term's leader took over: a read that this leader served before the proposal is not
-//!   seen. If the stream does not show the takeover either, the commit is not judged, and
+//!   counts as completed. A commit that did not register in that term was proposed somewhere
+//!   between the takeover of the term's leader and the first append of its entry. A read at or
+//!   above it before the takeover is red, and one after the first append is legal. With one in
+//!   between, or a takeover that the stream does not show, the commit is not judged, and
 //!   [`RANGE_CLOCK_NOT_RUN`] counts it. One that registered before a read but was proposed
 //!   after it, in one term, counts as proposed before. A split's children inherit the reads of
 //!   their source once a Catalog replica resolved the new routes, and an earlier split is
@@ -241,6 +242,17 @@ struct AppliedEntry {
     committed_by: Option<(u64, LogPoint)>,
 }
 
+/// A committed direct commit.
+struct DirectCommit {
+    /// The stream positions between which it was proposed: both of its registration, or the
+    /// takeover of its leader and the first append of its entry.
+    after: u64,
+    by: u64,
+    /// RangeClockRule1 reported it, or cannot judge it.
+    reported: bool,
+    not_run: bool,
+}
+
 /// A registered direct commit.
 struct Proposal {
     term: u64,
@@ -296,9 +308,10 @@ pub struct Protocol {
     served: BTreeMap<Uuid, Vec<(u64, u64)>>,
     /// Per group and commit timestamp: the registrations of a direct commit.
     proposals: BTreeMap<(Uuid, u64), Vec<Proposal>>,
-    /// Committed direct commits by group and timestamp: where they were proposed, and whether
-    /// RangeClockRule1 has nothing more to say about them.
-    direct: BTreeMap<(Uuid, u64), (u64, bool)>,
+    /// Committed direct commits by group and timestamp.
+    direct: BTreeMap<(Uuid, u64), DirectCommit>,
+    /// Per group, log index and log id: where some replica first synced the entry.
+    appended: BTreeMap<(Uuid, u64, LogPoint), u64>,
     /// Per group that a split created: its source, and where in the stream the source's
     /// reads stop counting. `None` while no route names the source any more.
     sources: BTreeMap<Uuid, BTreeMap<Uuid, Option<u64>>>,
@@ -362,6 +375,8 @@ impl Protocol {
                 self.place(*group, *replica, node);
                 for entry in entries {
                     let (index, id) = (entry.at.index, point(&entry.at));
+                    let first = self.appended.entry((*group, index, id));
+                    first.or_insert(self.seq);
                     let log = self.durable.entry((*group, *replica)).or_default();
                     if let Some(old) = log.insert(index, id).filter(|old| *old != id) {
                         self.removed(*group, *replica, "overwrote", index, old, &mut out);
@@ -916,9 +931,9 @@ impl Protocol {
 
     /// RangeClockRule1: a direct commit at `commit_ts` was applied in the entry at `entry`. Its
     /// registration in the term of that entry must precede every snapshot served at or above
-    /// it. Without one, the entry was proposed after its leader took over, whatever registered
-    /// in another term. A registration that never commits breaks nothing: a deposed leader may
-    /// register below reads its successor served.
+    /// it. Without one, the entry was proposed after its leader took over and before its first
+    /// append, whatever registered in another term. A registration that never commits breaks
+    /// nothing: a deposed leader may register below reads its successor served.
     fn committed_direct(
         &mut self,
         group: Uuid,
@@ -933,38 +948,61 @@ impl Protocol {
         let proposals = self.proposals.get(&key).into_iter().flatten();
         let registered = proposals.rev().find(|of| of.term == entry.term);
         let took_over = self.leaders.get(&(group, point(entry)));
-        let proposed = registered
-            .map(|of| of.seq)
-            .or_else(|| took_over.map(|(_, seq)| *seq));
-        let Some(seq) = proposed else {
-            self.ran(RANGE_CLOCK_NOT_RUN, 1);
-            self.direct.insert(key, (0, true));
-            return;
-        };
-        if let std::collections::btree_map::Entry::Vacant(commit) = self.direct.entry(key) {
-            commit.insert((seq, false));
-            if self.served_before(group, seq).is_some() {
-                self.ran(RANGE_CLOCK_RULE1, 1);
+        let appended = self.appended.get(&(group, entry.index, point(entry)));
+        let (after, by) = match (registered, took_over) {
+            (Some(of), _) => (of.seq, of.seq),
+            (None, Some((_, seq))) => (*seq, appended.copied().unwrap_or(self.seq)),
+            (None, None) => {
+                self.ran(RANGE_CLOCK_NOT_RUN, 1);
+                let commit = DirectCommit {
+                    after: 0,
+                    by: 0,
+                    reported: false,
+                    not_run: true,
+                };
+                self.direct.insert(key, commit);
+                return;
             }
-            self.range_clock(key, out);
+        };
+        let commit = DirectCommit {
+            after,
+            by,
+            reported: false,
+            not_run: false,
+        };
+        self.direct.insert(key, commit);
+        self.range_clock(key, out);
+        let judged = !self.direct[&key].not_run;
+        if judged && self.served_before(group, by).is_some() {
+            self.ran(RANGE_CLOCK_RULE1, 1);
         }
     }
 
     fn range_clock(&mut self, key: (Uuid, u64), out: &mut Vec<Violation>) {
-        let Some(&(seq, false)) = self.direct.get(&key) else {
+        let (group, commit_ts) = key;
+        let Some(commit) = self.direct.get(&key).filter(|of| !of.reported) else {
             return;
         };
-        let (group, commit_ts) = key;
-        if let Some(served) = self.served_before(group, seq)
-            && commit_ts <= served
-        {
-            self.direct.insert(key, (seq, true));
+        let read_before = |seq| {
+            self.served_before(group, seq)
+                .filter(|read| commit_ts <= *read)
+        };
+        let (illegal, between) = (read_before(commit.after), read_before(commit.by));
+        let unknown = between.is_some() && !commit.not_run;
+        let Some(commit) = self.direct.get_mut(&key) else {
+            return;
+        };
+        if let Some(read) = illegal {
+            commit.reported = true;
             out.push((
                 RANGE_CLOCK_RULE1,
                 format!(
-                    "group {group}: direct commit at {commit_ts} was proposed after a snapshot at {served} was served on its range"
+                    "group {group}: direct commit at {commit_ts} was proposed after a snapshot at {read} was served on its range"
                 ),
             ));
+        } else if unknown {
+            commit.not_run = true;
+            self.ran(RANGE_CLOCK_NOT_RUN, 1);
         }
     }
 
@@ -2011,11 +2049,75 @@ mod tests {
         // Registered in term 2 after the read.
         let below = [takeover(), read.clone(), proposed(GROUP, 15, 2)];
         assert_eq!(run(&below, 2), (red, (1, 0)));
-        // The limits: a read that the new leader served before the proposal, and a takeover
-        // that the stream does not show.
-        let after = [term_1.clone(), takeover(), read.clone()];
-        assert_eq!(run(&after, 2), (vec![], (0, 0)));
+        // Not judged: a takeover that the stream does not show.
         assert_eq!(run(&[term_1, read], 2), (vec![], (0, 1)));
+    }
+
+    #[test]
+    fn a_read_between_the_takeover_and_the_append_is_not_judged() {
+        // The fixtures of M1 in the re-check of #116. The read is served before the entry is
+        // appended, and the stream does not say whether it was proposed by then.
+        let takeover = Probe::VoteSaved {
+            group: GROUP,
+            kind: GroupKind::Catalog,
+            replica: 1,
+            term: 2,
+            leader: 1,
+            committed: true,
+        };
+        let run = |probes: &[Probe]| {
+            let mut protocol = Protocol::new();
+            for probe in probes {
+                assert!(protocol.observe(origin(1), probe).is_empty());
+            }
+            let found = commits_in(&mut protocol, GROUP, at(1, 2), 15);
+            let rule = |name| protocol.exercised().get(name).copied().unwrap_or(0);
+            let ran = (rule(RANGE_CLOCK_RULE1), rule(RANGE_CLOCK_NOT_RUN));
+            (kinds(&found), ran)
+        };
+        let not_run = (vec![], (0, 1));
+        // Registered in term 1, never registered, and late in a long term.
+        let term_1 = [proposed(GROUP, 15, 1), takeover.clone(), served(GROUP, 20)];
+        assert_eq!(run(&term_1), not_run);
+        assert_eq!(run(&[takeover.clone(), served(GROUP, 20)]), not_run);
+        let mut long = vec![takeover.clone()];
+        long.extend((0..10).map(|n| proposed(GROUP, 30 + n, 2)));
+        long.push(served(GROUP, 25));
+        assert_eq!(run(&long), not_run);
+        // Judged: a read below the commit, one after the first append, and one before the
+        // takeover as well, which is red.
+        assert_eq!(
+            run(&[takeover.clone(), served(GROUP, 14)]),
+            (vec![], (1, 0))
+        );
+        let appended = Probe::Appended {
+            group: GROUP,
+            kind: GroupKind::Catalog,
+            replica: 1,
+            entries: vec![LogEntry {
+                at: at(1, 2),
+                voters: Some(vec![vec![1]]),
+            }],
+        };
+        let legal = [takeover.clone(), appended, served(GROUP, 20)];
+        assert_eq!(run(&legal), (vec![], (0, 0)));
+        let both = [served(GROUP, 20), takeover.clone(), served(GROUP, 21)];
+        assert_eq!(run(&both), (vec![RANGE_CLOCK_RULE1], (1, 0)));
+        // Another id at the index is another entry.
+        let other = [takeover, appended_at(at(1, 1)), served(GROUP, 20)];
+        assert_eq!(run(&other), not_run);
+    }
+
+    fn appended_at(entry: AppliedPosition) -> Probe {
+        Probe::Appended {
+            group: GROUP,
+            kind: GroupKind::Catalog,
+            replica: 1,
+            entries: vec![LogEntry {
+                at: entry,
+                voters: None,
+            }],
+        }
     }
 
     #[test]
