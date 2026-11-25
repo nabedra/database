@@ -37,7 +37,7 @@ LIST_FIELDS = ("guarantees", "scenarios", "fix_commits")
 OPEN_FIELDS = ("owner", "expires")
 NOT_AN_OWNER = ("unknown", "unassigned", "none", "tbd")
 ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
-GUARANTEE_ID = re.compile(r"(?:OLTP|OLAP|OLAP-STR|EVT|CACHE|LSM|ORM|SCHED)-G[0-9]{2}")
+GUARANTEE_ID = re.compile(r"(?:OLTP|OLAP|OLAP-STR|EVT|CACHE|LSM|ORM|SCHED|VEC)-G[0-9]{2}")
 REGISTER_ROW = re.compile(r"^\|\s*([A-Z][A-Z-]*-G[0-9]{2})\s*\|", re.MULTILINE)
 
 
