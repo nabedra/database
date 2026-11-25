@@ -1541,6 +1541,13 @@ class FoolTest(HarnessCase):
             ("one line after a test item", test + f.revert_diff(
                 "server/src/product.rs", product + "#[cfg(test)]\npub fn hook() {}\npub fn more() {}\n"),
              "adds lines to server/src/product.rs that are not only for tests"),
+            # An attribute that takes a product item, or the whole file, out of the product.
+            ("takes an item", test + f.revert_diff("server/src/product.rs", "#[cfg(test)]\n" + product),
+             "adds lines to server/src/product.rs that are not only for tests"),
+            ("takes a statement", test + f.revert_diff("server/src/product.rs", product.replace("    1\n", "    #[cfg(test)]\n    1\n")),
+             "adds lines to server/src/product.rs that are not only for tests"),
+            ("takes the file", test + f.revert_diff("server/src/product.rs", "#![cfg(test)]\n" + product),
+             "adds lines to server/src/product.rs that are not only for tests"),
             ("harness", test + f.revert_diff("server/sim-oltp/src/sweep.rs", "pub const PLANTED: u8 = 0;\n// x\n"),
              "probe.patch touches server/sim-oltp/src/sweep.rs"),
             ("manifest", test + f.revert_diff("server/Cargo.toml", "[package]\nx = 1\n"), "probe.patch touches server/Cargo.toml"),

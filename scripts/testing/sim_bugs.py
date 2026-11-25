@@ -710,13 +710,16 @@ def probe_in_tree(bug, repo):
     for name in patch_files(bug.probe):
         if TEST_FILE.search(name) or ACCEPTANCE_FILE.fullmatch(name):
             continue
-        tests = cfg_lines(git(repo, "show", f"{with_probe}:{name}").stdout,
-                          lambda predicate, macro: not macro and TEST_ONLY.fullmatch(predicate))
         section = added.split(f"diff --git a/{name} b/{name}\n", 1)[-1].split("\ndiff --git ", 1)[0]
-        for start, count in re.findall(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", section, re.MULTILINE):
-            if not set(range(int(start), int(start) + int(count or 1))) <= tests:
-                problems.append(f"probe.patch adds lines to {name} that are not only for tests")
-                break
+        new = {line for start, count in re.findall(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", section, re.MULTILINE)
+               for line in range(int(start), int(start) + int(count or 1))}
+        # A region counts if its attribute is the tree's, or if all of it is the probe's: an added attribute must not
+        # take product code out of the product.
+        tests = {line for region in cfg_regions(git(repo, "show", f"{with_probe}:{name}").stdout,
+                                                lambda predicate, macro: not macro and TEST_ONLY.fullmatch(predicate))
+                 for line in region if region[0] not in new or set(region) <= new}
+        if not new <= tests:
+            problems.append(f"probe.patch adds lines to {name} that are not only for tests")
     return problems
 
 
@@ -764,10 +767,14 @@ def sim_only_lines(text):
 
 
 def cfg_lines(text, wanted):
-    """Line numbers of the items, statements and blocks that a cfg predicate governs, when `wanted` takes the
-    predicate (with its brackets) and whether it is a `cfg!`."""
+    return {line for lines in cfg_regions(text, wanted) for line in lines}
+
+
+def cfg_regions(text, wanted):
+    """The line ranges of the items, statements and blocks that a cfg predicate governs, its attribute included,
+    when `wanted` takes the predicate (with its brackets) and whether it is a `cfg!`."""
     code = RUST_TEXT.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), text)
-    gated = set()
+    regions = []
     for match in CFG.finditer(code):
         opening = match.start(2) if match.group(2) else match.start(3)
         end = closing(code, opening)
@@ -775,7 +782,8 @@ def cfg_lines(text, wanted):
         if not wanted(predicate, bool(match.group(3))):
             continue
         if match.group(1):
-            return set(range(1, text.count("\n") + 2))
+            regions.append(range(1, text.count("\n") + 1 + (not text.endswith("\n"))))
+            continue
         if match.group(2):
             end = code.index("]", end) + 1
             while attribute := re.compile(r"\s*#\s*\[").match(code, end):
@@ -791,8 +799,8 @@ def cfg_lines(text, wanted):
             if depth < 0:
                 break
             i += 1
-        gated.update(range(code.count("\n", 0, match.start()) + 1, code.count("\n", 0, i) + 2))
-    return gated
+        regions.append(range(code.count("\n", 0, match.start()) + 1, code.count("\n", 0, i) + 2))
+    return regions
 
 
 def applied(repo, patch):
@@ -913,7 +921,7 @@ def regression_evidence(bug, repo):
 def regression_text(manifest):
     """Which test is run, how, and what its failure says."""
     return {key: manifest.get("regression", {}).get(key) for key in
-            ("kind", "test", "scenario", "suite", "mode", "probe", "failure_contains")}
+            ("kind", "test", "scenario", "suite", "mode", "probe", "needs_server", "failure_contains")}
 
 
 def reviewed_regression(manifest):

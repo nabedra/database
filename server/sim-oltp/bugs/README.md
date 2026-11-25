@@ -11,10 +11,11 @@ is found when the simulator detects the reverted fix by the rule below. Results 
 | File | Content |
 | --- | --- |
 | `bug.toml` | The manifest. |
-| `revert.patch` | The patch. It changes product sources only, in the form `git diff` writes. Nothing before, between or after its `diff --git` sections, and no Unicode control or format character. |
+| `revert.patch` | The patch. It changes product sources only, in the form `git diff` writes. Nothing before, between or after its `diff --git` sections. Plain ASCII, in lines of at most 200 characters. |
+| `probe.patch` | Only with `regression.probe = true`: the test that the regression runs, for a fix whose own test is not a steady proof. Same form, only added lines. A line in a product source has to belong to an item, statement or block that the probe adds whole, or that the tree already has, under `#[cfg(test)]` or `test-hooks`. `verify` applies it to both builds. No sweep ever contains it. |
 | `searches.jsonl` | Every search of the target, also those that a later one replaced. Append-only. Written by `sim_bugs.py record`. |
 
-A committed target or record cannot leave the tree, and a target keeps its bug record, phase and set. A target that a
+No other file may be in a target's directory. A committed target or record cannot leave the tree, and a target keeps its bug record, phase and set. A target that a
 spare replaces stays listed as not detected.
 
 ## The search rule
@@ -54,7 +55,9 @@ A check passes only if every target of its set is found. While a target is `not-
 - The regression evidence is for this patch: its changed lines, its context, and a commit that holds it. The regression
   also passes without the patch and fails with it in the run that counts.
 - `[review]` says `sensitive`, names the digest of the whole patch as it is now, and does not contradict
-  `regression.assertion`. There is no `hold`. A patch that is refreshed, even in its context, needs another review.
+  `regression.assertion`. There is no `hold`. A patch that is refreshed, even in its context, needs another review. So
+  does another probe, and any change of `[regression]` but its evidence and `timeout_s`: the same `[review]` (its
+  `notes` aside) may not stand beside two regressions in the history.
 - `[detection]` confirms the mechanism for that exact seed, trace hash and history SHA-256. Its `search` is the hash of
   the recorded search that produced the hit, with the same plan and patch.
 - Every plan that a committed manifest ever had is in `searches.jsonl`, as a search or as `never_searched` with a
@@ -77,7 +80,15 @@ expect_reason = "<why no rule may detect it>"
 hold = "<why this target may not count yet>"
 
 [regression]
-assertion = "state"                   # or counter, timeout: what the in-tree regression asserts. Required to count.
+kind = "lib-test"                     # with test, and optionally probe or needs_server
+                                      # or "acceptance" with scenario, or "recovery-suite" with suite
+test = "<full library test path>"     # in the tree, or added by probe.patch. Not both.
+probe = true                          # or absent. Required exactly when there is a probe.patch.
+needs_server = true                   # or absent: the test starts server processes. Only these tests get one.
+suite = "replacement-wipe"            # of server/tests/oltp_recovery_operations.py, for a recovery-suite
+failure_contains = ["<text>"]         # what the failure says. Required for the two process kinds.
+assertion = "state"                   # or counter, timeout: what the regression asserts. Required to count.
+                                      # A field of another kind, or one that is off, is refused.
 
 [regression.evidence]                 # of a `verify` run, or of two commits with and without the patch
 digest = "<sim_bugs.py digest>"
@@ -155,13 +166,12 @@ Also open:
 - A `[review]` written for a patch by nobody. The digest shows which patch it is about, not that anyone read it.
 - `expect` chosen broadly before any result, or a rule whose text was added to the documents for the target.
 - A quoted line that differs between the builds and shows nothing.
-- A patch character that looks like another or like nothing (a filler letter, a line separator, a look-alike letter), and
-  code far to the right of a line. Only control and format characters are refused.
-- `regression.test` or `failure_contains` changed after the review and the evidence. The counting run repeats the test that
-  the manifest names now.
+- A probe that its reviewer did not read. It may add anything to a test file, and the row rests on it.
+- A `[review]` edited together with the regression it is about. It is then another review on paper.
 - A quote from `plans/testing/`. `check` finds the text in the copy, and does not compare the copy with the design or know
   which rows lead decision 13.1 lets a design rule count for.
-- Variables of the machine that the tool does not clear, such as `RUSTC`, a wrapper or a linker.
 - Recorded regression output, as far as the named run is concerned. `evidence` compares it.
 - Branch history that was rewritten before it reached main.
-- The harness of main, the compiler, Git, Cargo's home configuration and the Actions runner.
+- The harness of main, the compiler, Git, Cargo's home configuration, `PATH` and the Actions runner. Builds, tests and
+  Git take only an allow-list of variables from the machine (`KEPT_ENV`), so a compiler, wrapper, linker, flag or library
+  path named in a variable does not reach them.
