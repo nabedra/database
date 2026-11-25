@@ -1,0 +1,35 @@
+id = "oltp-sim-topology-planted"
+module = "oltp"
+kinds = ["S", "H"]
+# Fault model, no nemesis. Each seeded defect of the topology workload must be reported under the
+# rule it breaks within 8 seeds, and the same seeds without a defect must report none of those
+# rules. Seeds whose clean run is red for another reason still count as the twin of their defect.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+"${build[@]}" --no-run
+run() { timeout 900s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1; }
+planted=(lose-row:CoveringIndexComplete duplicate-row:IndexExactlyOnce
+  choose-building:IncompleteIndexChosen fake-drop:DroppedTableSilent
+  refresh-twice:StaleRouteRefreshesOnce lie-about-refusal:RefusedDdlApplied
+  stuck-fence:FenceAfterValidation lose-range:RouteCoverage)
+kinds=""
+for pair in "${planted[@]}"; do
+  kinds="$kinds,${pair#*:}"
+  echo "seeded defect ${pair%%:*}, expected ${pair#*:}"
+  NABEDRA_SIM_TOPOLOGY_DEFECT="${pair%%:*}" NABEDRA_SIM_EXPECT="${pair#*:}" run
+done
+echo "clean twins of every seed"
+rc=0
+NABEDRA_SIM_EXPECT="${kinds#,}" run > clean.log 2>&1 || rc=$?
+cat clean.log
+test "$rc" = 101
+test "$(grep -c 'nabedra-sim-seed: {' clean.log)" = "$NABEDRA_SEEDS"
+''']
+cwd = "server"
+timeout_s = 5400
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "topology", NABEDRA_SIM_PROFILE = "none", NABEDRA_SIM_TOPOLOGY = "no-move,split-before-load", NABEDRA_SEEDS = "8", NABEDRA_SIM_JOBS = "2", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-topology-planted", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-topology-planted" }
