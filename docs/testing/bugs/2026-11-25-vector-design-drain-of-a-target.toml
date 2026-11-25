@@ -10,5 +10,5 @@ lowest_regression = "specs/vector/index/mutants/prefix_drain_a_target.cfg"
 seed = "unknown"
 why_not_caught = "The liveness run allowed one drain only."
 invariant_added = "A split or merge of a partition ends."
-fix_commits = ["e662124af2c88c345544ab4acc769bb7dc973f7c"]
+fix_commits = ["b002e873ca09aa6cef1f23e7b9e348d42fd9398a"]
 revert_patch_ok = false
