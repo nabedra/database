@@ -87,9 +87,8 @@ give numbers from before and after on the same machine, along with the CPU and
 memory limits you ran under.
 
 If your change touches request admission, queues, scheduling, workers,
-partition memory, mutation publication, recovery or autoscaling, read
-[AGENTS.md](AGENTS.md), the [scheduling plan](plans/resource-aware-scheduling.md)
-and the [scheduler test contract](docs/testing/scheduler-contract.md) first.
+partition memory, mutation publication, recovery or autoscaling, read the
+[scheduler test contract](docs/testing/scheduler-contract.md) first.
 Cite the scenario IDs you ran, and say which behavior you didn't test.
 
 ### Models we don't accept

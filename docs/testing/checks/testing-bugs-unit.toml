@@ -1,0 +1,11 @@
+id = "testing-bugs-unit"
+module = "testing"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+command = ["python3", "-m", "unittest", "-v", "scripts.testing.test_bugs"]
+cwd = "."
+timeout_s = 60
+needs = []
+result_parser = "unittest"

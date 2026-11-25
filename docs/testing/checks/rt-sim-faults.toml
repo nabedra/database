@@ -1,0 +1,29 @@
+id = "rt-sim-faults"
+# The simulator's own faults (server/rt/src/sim) map to the `sim` module in modules.toml.
+# Each opt-in fault is shown to matter by a planted defect that no seed reaches with the
+# fault off and that seeds catch with it on, next to a clean twin that they never flag:
+# storage pauses (an acknowledgement before its fsync, one wider than its fsync), clock
+# freezes (a lease check without a fencing epoch), the timer floor (a timer fence without a
+# drift margin), mkfs inode numbers (a volume recognised by device and inode) and wipes of
+# a live node. Tooling for the simulators, so it proves no product guarantee by itself.
+module = "sim"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+# Repeated, because each test also compares seeded runs that stop helper threads.
+command = ["bash", "-eo", "pipefail", "-c", '''
+echo "Fault model: the simulator's opt-in faults and their planted defects"
+export CARGO_TARGET_DIR="$PWD/$CARGO_TARGET_DIR"
+test=(cargo test --locked -j 2 -p nabedra-rt --features sim --lib)
+for attempt in $(seq 20); do
+    "${test[@]}" sim::suspend:: -- --nocapture --test-threads=2
+    "${test[@]}" timer_floor
+    "${test[@]}" sim::volumes::
+done
+''']
+cwd = "server"
+timeout_s = 1800
+needs = []
+result_parser = "cargo-test"
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim" }

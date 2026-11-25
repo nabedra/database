@@ -43,6 +43,8 @@ const OPERATIONS: &str = "/v1/operations";
 const REPLY_GRACE: Duration = Duration::from_secs(1);
 /// Pause between a definite refusal and the identity check that follows it.
 const PROBE_PAUSE: Duration = Duration::from_millis(500);
+/// A count takes the queued path, whose acceptance test allows 30 s.
+const COUNT_LIMIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -222,7 +224,7 @@ pub(crate) struct Request {
     payload: Value,
     input: Value,
     anchor: i64,
-    id: Uuid,
+    pub(crate) id: Uuid,
 }
 
 impl Request {
@@ -246,7 +248,7 @@ impl Request {
         }
     }
 
-    fn row(name: &'static str, table: &str, key: i64, value: i64, id: Uuid) -> Self {
+    pub(crate) fn row(name: &'static str, table: &str, key: i64, value: i64, id: Uuid) -> Self {
         let row = json!({"id": key, "value": value});
         Self {
             name,
@@ -407,7 +409,7 @@ pub(crate) async fn attempt(
     completion
 }
 
-fn unknown(completion: &Completion) -> bool {
+pub(crate) fn unknown(completion: &Completion) -> bool {
     match completion {
         Completion::Ok(_) => false,
         Completion::Refused(error) => error.outcome == Outcome::Unknown,
@@ -742,7 +744,74 @@ pub(crate) async fn final_checks(ctx: &Ctx) -> Result<(), String> {
     ))
 }
 
-fn failure(completion: &Completion) -> Option<String> {
+/// One read of key 1 through each gateway, not retried.
+pub(crate) async fn read_each(ctx: &Ctx) -> Result<(), String> {
+    let mut client = ctx.new_client();
+    for (index, gateway) in GATEWAYS.into_iter().enumerate() {
+        let node = CLIENTS[index % CLIENTS.len()];
+        let id = in_node(node, async { uuid_v4() }).await;
+        let request = Request::get(&ctx.table, 1, id);
+        let completion = attempt(ctx, &mut client, node, gateway, &request, false).await;
+        if let Some(why) = failure(&completion) {
+            return Err(format!("read of key 1 through n{gateway}: {why}"));
+        }
+    }
+    Ok(())
+}
+
+/// `query.count` through one gateway against a read of every key through the other, with no
+/// client running. Returns what differs.
+pub(crate) async fn exact_count(ctx: &Ctx) -> Result<Option<String>, String> {
+    let mut client = ctx.new_client();
+    let mut rows = 0;
+    for key in 1..=ctx.keys {
+        let id = in_node(CLIENTS[0], async { uuid_v4() }).await;
+        let request = Request::get(&ctx.table, key, id);
+        match attempt(ctx, &mut client, CLIENTS[0], GATEWAYS[0], &request, false).await {
+            Completion::Ok(row) => rows += i64::from(!row.is_null()),
+            other => {
+                let why = failure(&other).unwrap_or_default();
+                return Err(format!("read of key {key}: {why}"));
+            }
+        }
+    }
+    let payload = json!({
+        "table_id": ctx.table,
+        "query": {"select": null, "filter": null, "order_by": null, "limit": null},
+    });
+    // A refused count is asked again under a new ID, as `read_after_transition` does.
+    let deadline = ctx.world.elapsed() + COUNT_LIMIT;
+    loop {
+        let id = in_node(CLIENTS[1], async { uuid_v4() }).await;
+        let answer = crate::client::request(
+            CLIENTS[1],
+            GATEWAYS[1],
+            OPERATIONS,
+            &ctx.token,
+            Some(operation(id, "query.count", payload.clone())),
+            COUNT_LIMIT,
+        )
+        .await
+        .and_then(|reply| reply.completion(id))?;
+        match answer {
+            Completion::Ok(count) if count == json!(rows) => return Ok(None),
+            Completion::Ok(count) => {
+                return Ok(Some(format!(
+                    "query.count answered {count} and the keys hold {rows} rows"
+                )));
+            }
+            other if ctx.world.elapsed() >= deadline => {
+                return Err(format!(
+                    "query.count: {}",
+                    failure(&other).unwrap_or_default()
+                ));
+            }
+            _ => time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+}
+
+pub(crate) fn failure(completion: &Completion) -> Option<String> {
     match completion {
         Completion::Ok(_) => None,
         Completion::Refused(error) => Some(format!("{:?} {}", error.code, error.message)),

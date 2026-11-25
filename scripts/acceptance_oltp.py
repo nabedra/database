@@ -33,6 +33,8 @@ RESOURCES_TEST_EXE = "NABEDRA_RESOURCES_TEST_EXE"
 TRANSPORT_TEST_EXE = "NABEDRA_TRANSPORT_TEST_EXE"
 STORAGE_TEST_EXE = "NABEDRA_OLTP_STORAGE_TEST_EXE"
 REPLICATION_TEST_EXE = "NABEDRA_OLTP_REPLICATION_TEST_EXE"
+# Workspace crates under server/ that `--features oltp` links (phase 8 crate split).
+OLTP_CRATES = ("protocol", "resources", "oltp-types", "transport", "oltp-storage", "oltp-replication")
 # Clause IDs follow the Required assertions column of docs/testing/oltp-contract.md.
 # Each ID covers the complete named observation, including its required variations.
 CLAUSES = {
@@ -177,15 +179,12 @@ def environment(target):
 
 def source_identity():
     digest = hashlib.sha256()
-    paths = [ROOT / "server/Cargo.toml", ROOT / "server/Cargo.lock",
-             ROOT / "server/resources/Cargo.toml", ROOT / "server/transport/Cargo.toml",
-             ROOT / "server/oltp-storage/Cargo.toml",
-             ROOT / "server/oltp-replication/Cargo.toml", Path(__file__)]
+    paths = [ROOT / "server/Cargo.toml", ROOT / "server/Cargo.lock", Path(__file__)]
+    # Every workspace crate the OLTP build links, including the phase 8 split.
+    for crate in ("kv", "rt", *OLTP_CRATES):
+        paths.append(ROOT / "server" / crate / "Cargo.toml")
+        paths += sorted((ROOT / "server" / crate / "src").rglob("*.rs"))
     paths += sorted((ROOT / "server/src").rglob("*.rs"))
-    paths += sorted((ROOT / "server/resources/src").rglob("*.rs"))
-    paths += sorted((ROOT / "server/transport/src").rglob("*.rs"))
-    paths += sorted((ROOT / "server/oltp-storage/src").rglob("*.rs"))
-    paths += sorted((ROOT / "server/oltp-replication/src").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.py"))
     paths += sorted((ROOT / "server/tests").rglob("*.c"))

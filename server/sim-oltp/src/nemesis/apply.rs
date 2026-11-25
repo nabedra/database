@@ -42,6 +42,17 @@ struct PendingSplit {
     boundary: i64,
     next_ms: u64,
     last: String,
+    /// The last answer was a definite refusal, so the split had not published.
+    refused: bool,
+}
+
+/// A split request that a full stop interrupted. Queued work is abandoned when every worker
+/// stops, so the next run must not execute it.
+struct AbandonedSplit {
+    id: Uuid,
+    boundary: i64,
+    /// Whether its last answer before the stop was a definite refusal.
+    refused: bool,
 }
 
 /// The nemesis of one run and what it did.
@@ -54,6 +65,7 @@ pub(crate) struct Chaos {
     /// Every applied fault window, for the scenario clauses.
     pub log: Vec<Fault>,
     split: Option<PendingSplit>,
+    abandoned: Vec<AbandonedSplit>,
     split_requested: bool,
     cold_done: bool,
     /// The heal needed a full cold start.
@@ -85,6 +97,7 @@ impl Chaos {
             skipped: BTreeMap::new(),
             log: Vec::new(),
             split: None,
+            abandoned: Vec::new(),
             split_requested: false,
             cold_done: false,
             heal_cold: false,
@@ -184,9 +197,56 @@ impl Chaos {
             Err(error) => {
                 if split.last != error {
                     cluster.record(format!("nemesis split pending: {error}"));
-                    split.last = error;
                 }
+                split.refused = error.contains("Conflict");
+                split.last = error;
                 false
+            }
+        }
+    }
+
+    /// Ask for the pending split once more, immediately before every worker stops.
+    pub(crate) async fn before_full_stop(&mut self, cluster: &Cluster, ctx: &Ctx) {
+        if let Some(split) = self.split.as_mut() {
+            split.next_ms = 0;
+            self.try_split(cluster, ctx).await;
+        }
+    }
+
+    /// The stop abandoned the pending split. Request it again under a new ID.
+    pub(crate) async fn after_full_stop(&mut self, cluster: &Cluster) {
+        let Some(split) = self.split.as_mut() else {
+            return;
+        };
+        let id = cluster.split_id().await;
+        cluster.record(format!(
+            "nemesis split {} abandoned by a full stop (refused before it: {}), requested again as {id}",
+            split.id, split.refused
+        ));
+        self.abandoned.push(AbandonedSplit {
+            id: std::mem::replace(&mut split.id, id),
+            boundary: split.boundary,
+            refused: split.refused,
+        });
+        split.refused = false;
+        split.next_ms = 0;
+    }
+
+    /// A split that a full stop abandoned must not have published in the next run.
+    pub(crate) async fn check_abandoned(&self, cluster: &Cluster, ctx: &Ctx) {
+        let table = Uuid::parse_str(&ctx.table).expect("table UUID");
+        for split in &self.abandoned {
+            let answer = cluster.split(split.id, table, split.boundary).await;
+            cluster.record(format!("abandoned split {} answers {answer:?}", split.id));
+            if split.refused && answer.is_ok() {
+                cluster.checks.violate(
+                    &cluster.world,
+                    "AbandonedSplitReplayed",
+                    format!(
+                        "split {} was refused before a full stop and published after it: {answer:?}",
+                        split.id
+                    ),
+                );
             }
         }
     }
@@ -534,6 +594,7 @@ impl Chaos {
                     boundary,
                     next_ms: 0,
                     last: String::new(),
+                    refused: false,
                 });
             }
             Action::DiskError => {
@@ -561,6 +622,7 @@ impl Chaos {
                 let delays = [(); 3].map(|()| window(g, 0, 3_000));
                 self.note(cluster, ctx, "cold", json!({"power": power, "delays_ms": delays.map(|delay| delay.as_millis() as u64)}));
                 let cut = if power { DiskCut::Power } else { DiskCut::Kill };
+                self.before_full_stop(cluster, ctx).await;
                 self.open(cluster, action, &WORKERS);
                 if let Err(error) = cluster
                     .cold_start_staggered("cold action", cut, delays, COLD_LIMIT)
@@ -573,6 +635,7 @@ impl Chaos {
                     );
                 }
                 self.close(cluster, &[action], None);
+                self.after_full_stop(cluster).await;
             }
             Action::FrameDrop => {
                 let per_mille = *g.pick(&[5, 20, 50]);
@@ -815,6 +878,7 @@ impl Chaos {
                 json!({"stuck": stuck}),
             );
             self.heal_cold = true;
+            self.before_full_stop(cluster, ctx).await;
             cluster
                 .cold_start_staggered(
                     "heal cold start",
@@ -824,6 +888,7 @@ impl Chaos {
                 )
                 .await
                 .map_err(|error| format!("heal cold start after {stuck:?}: {error}"))?;
+            self.after_full_stop(cluster).await;
         }
         for gateway in GATEWAYS {
             if !cluster.is_running(gateway) {
@@ -893,6 +958,11 @@ impl Chaos {
             }
             time::sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    /// A split was requested in this run.
+    pub(crate) fn split_requested(&self) -> bool {
+        self.split_requested
     }
 
     /// A split was requested and has not published.

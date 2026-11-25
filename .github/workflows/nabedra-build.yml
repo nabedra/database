@@ -2,15 +2,8 @@
 # How agents run it: .agents/skills/code-review/references/gh-actions.md. Where builds run:
 # .agents/skills/nabedra-builds/SKILL.md. Opt-in S3 checks use OIDC on dispatches.
 #
-# Nothing starts on push or commit. A run starts in one of three ways:
-# - A deliberate dispatch, pinned to a pushed commit:
-#     gh workflow run nabedra-build.yml --ref <branch> -f sha=<40-char sha> -f request_id=<id> [-f jobs=direct ...]
-#   Job definitions come from the --ref branch head; the code under test is `sha`. Every dispatch has its own
-#   concurrency group, so no push, commit or other dispatch can cancel it.
-# - The scheduled nightly (nabedra-nightly.yml), which resolves `main` to its SHA when it starts and dispatches
-#   this workflow pinned to that SHA, with the same uncancellable concurrency group as any dispatch.
-# - The pull-request merge gate (base jobs and the non-blocking quarantine job on the merge commit). Only a newer
-#   head of the same pull request cancels a gate run. `[skip ci]` in the head commit skips it for docs-only PRs.
+# Manually dispatch a run pinned to a pushed commit.
+# Job definitions come from the selected ref. The sha input selects the code under test.
 #
 # Opt-in jobs (`-f jobs=a,b`; unknown names fail the run). Selecting a job may imply others; the
 # `revision` job resolves the list and writes it to the run summary:
@@ -27,6 +20,8 @@
 #   campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1  long, image and measurement jobs
 #   engine-tests, check-tests  Cache, OLAP and nabedra-check tests, also in the base jobs
 #   clippy      the phase 7 runtime seam bans (server/clippy.toml) for every product feature set, also a base job
+#   features    engine feature checks and the OLTP S3 loopback fixture, also a base job
+#   quarantine  non-blocking test and scenario reruns, available by manual dispatch
 #   fuzz, mutants  libFuzzer targets or mutation tests on the diff from main's merge base
 #
 # Builds. The `build` job compiles the debug OLTP server and every OLTP test executable once and shares them as
@@ -46,10 +41,6 @@ name: nabedra build
 run-name: ${{ github.event_name == 'workflow_dispatch' && format('{0} @ {1}', inputs.request_id, inputs.sha) || github.event.pull_request.title }}
 
 on:
-  pull_request:
-    branches:
-      - main
-    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       sha:
@@ -61,11 +52,11 @@ on:
         required: true
         type: string
       base:
-        description: Base jobs (kv, features, clippy, Cache, OLAP, nabedra-check, OLTP, Events, quarantine)
+        description: Base jobs (kv, features, clippy, Cache, OLAP, nabedra-check, OLTP, Events)
         type: boolean
         default: true
       jobs:
-        description: "Comma-separated opt-in jobs: direct, acceptance, o02, growth, rep1, rep4-mixed, o22, blackhole, migrate, live3, live3-fixture, campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1, engine-tests, check-tests, clippy, fuzz, mutants"
+        description: "Comma-separated opt-in jobs: direct, acceptance, o02, growth, rep1, rep4-mixed, o22, blackhole, migrate, live3, live3-fixture, campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1, engine-tests, check-tests, features, clippy, quarantine, fuzz, mutants"
         type: string
         default: ""
       checks:
@@ -127,6 +118,9 @@ jobs:
     timeout-minutes: 10
     outputs:
       build: ${{ steps.plan.outputs.build }}
+      build_lib_only: ${{ steps.plan.outputs.build_lib_only }}
+      pr_jobs: ${{ steps.plan.outputs.pr_jobs }}
+      engine_suites: ${{ steps.plan.outputs.engine_suites }}
       # The resolved opt-in jobs, comma-delimited on both sides (",direct,rep1,"), for contains().
       jobs: ${{ steps.plan.outputs.jobs }}
       modes: ${{ steps.plan.outputs.modes }}
@@ -140,13 +134,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.TESTED_SHA }}
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
       - name: Check the inputs and plan the run
         id: plan
         env:
           EVENT: ${{ github.event_name }}
           SHA_INPUT: ${{ inputs.sha }}
           REQUEST_ID: ${{ inputs.request_id }}
-          BASE: ${{ github.event_name == 'pull_request' || inputs.base }}
+          BASE: ${{ inputs.base || false }}
           JOBS: ${{ inputs.jobs }}
           SCENARIOS: ${{ inputs.scenarios }}
           TESTS: ${{ inputs.tests }}
@@ -165,7 +160,7 @@ jobs:
             [[ "$REPEAT" =~ ^[0-9]+$ ]] && [ "$REPEAT" -ge 1 ] && [ "$REPEAT" -le 200 ] || fail "repeat must be 1-200"
             [[ "$FUZZ_SECONDS" =~ ^[0-9]+$ ]] && [ "$FUZZ_SECONDS" -ge 1 ] || fail "fuzz_seconds must be a positive integer"
           fi
-          known=",direct,acceptance,o02,growth,rep1,rep4-mixed,o22,blackhole,migrate,live3,live3-fixture,campaign,docker,memory,bench,perf,g7,gc1,perf1,snap1,engine-tests,check-tests,clippy,fuzz,mutants,"
+          known=",direct,acceptance,o02,growth,rep1,rep4-mixed,o22,blackhole,migrate,live3,live3-fixture,campaign,docker,memory,bench,perf,g7,gc1,perf1,snap1,engine-tests,check-tests,features,clippy,quarantine,fuzz,mutants,"
           selected=","
           add() { [[ "$selected" == *",$1,"* ]] || selected+="$1,"; }
           has() { [[ "$selected" == *",$1,"* ]]; }
@@ -205,12 +200,35 @@ jobs:
           fi
           has_growth=false; [ "${#growth[@]}" -gt 0 ] && has_growth=true
           [ "${#growth[@]}" -gt 0 ] || growth=('{"scenario":"none","modes":"on","label":"on","opt1":false,"timeout":600}')
+          pr_jobs=","
+          if [ "$EVENT" = pull_request ]; then
+            pr_jobs=$(python3 scripts/testing/ci/plan_pr_jobs.py)
+          fi
+          pr_has() { [[ "$pr_jobs" == *",$1,"* ]]; }
           build=false
-          for job in direct acceptance o02 growth rep1 rep4-mixed blackhole live3-fixture; do has "$job" && build=true; done
-          if [ "$BASE" = true ] || [ "$has_scenarios" = true ] || [ -n "$TESTS" ]; then build=true; fi
+          for job in direct acceptance o02 growth rep1 rep4-mixed blackhole live3-fixture quarantine; do
+            has "$job" && build=true
+          done
+          if [ "$BASE" = true ] || pr_has oltp || [ "$has_scenarios" = true ]; then build=true; fi
+          build_lib_only=false
+          if [ "$build" = false ] && [ -n "$TESTS" ]; then
+            build_lib_only=true
+            build=true
+          fi
+          engine_suites=()
+          if [ "$BASE" = true ] || has engine-tests || pr_has cache; then
+            engine_suites+=('{"suite":"Cache library","engine":"cache","shard":1}')
+          fi
+          if [ "$BASE" = true ] || has engine-tests || pr_has olap; then
+            engine_suites+=('{"suite":"OLAP shard 1 of 2","engine":"olap","shard":1}')
+            engine_suites+=('{"suite":"OLAP shard 2 of 2","engine":"olap","shard":2}')
+          fi
           quoted=$(printf '"%s",' "${modes[@]}")
           {
             echo "build=$build"
+            echo "build_lib_only=$build_lib_only"
+            echo "pr_jobs=$pr_jobs"
+            echo "engine_suites=[$(IFS=,; echo "${engine_suites[*]}")]"
             echo "jobs=$selected"
             echo "modes=[${quoted%,}]"
             echo "scenarios={\"include\":[$(IFS=,; echo "${include[*]}")]}"
@@ -228,7 +246,11 @@ jobs:
             echo "| Event | $EVENT |"
             echo "| Request | ${REQUEST_ID:-pull request} |"
             echo "| Workflow | \`$WORKFLOW_REF\` at \`$WORKFLOW_SHA\` |"
-            echo "| Base jobs | $BASE |"
+            echo "| Base jobs (dispatch) | $BASE |"
+            if [ "$EVENT" = pull_request ]; then
+              pr_selected=${pr_jobs#,}; pr_selected=${pr_selected%,}
+              echo "| Automatic PR suites | ${pr_selected:-none} |"
+            fi
             echo "| Opt-in jobs | ${JOBS:-none} (resolved: ${resolved:-none}) |"
             echo "| Scenarios | ${shown:-none} (modes ${MODES}) |"
             echo "| Tests | ${TESTS:-none} (x${REPEAT:-1}) |"
@@ -550,17 +572,25 @@ jobs:
         run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
       - name: Build
         working-directory: server
+        env:
+          LIB_ONLY: ${{ needs.revision.outputs.build_lib_only }}
         run: |
           set -o pipefail
-          cargo test --locked --no-default-features --features oltp --lib --tests --no-run --timings \
+          targets=(--lib)
+          if [ "$LIB_ONLY" != true ]; then targets+=(--tests); fi
+          cargo test --locked --no-default-features --features oltp "${targets[@]}" --no-run --timings \
             --message-format=json-render-diagnostics > ../build.json
-          cargo test --locked -p nabedra-resources -p nabedra-transport -p nabedra-oltp-storage -p nabedra-oltp-replication --lib --no-run \
+          # Every OLTP crate's unit tests (phase 8 split), so none silently stops running.
+          cargo test --locked -p nabedra-protocol -p nabedra-resources -p nabedra-oltp-types -p nabedra-transport \
+            -p nabedra-oltp-storage -p nabedra-oltp-replication --lib --no-run \
             --message-format=json-render-diagnostics >> ../build.json
           cargo build --locked --no-default-features --features oltp --bin nabedra-db
           cd ..
           # kind, name, workspace-relative path of every test executable, then the server.
           jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null)
-                 | [(if .target.name == "nabedra_resources" then "resources"
+                 | [(if .target.name == "nabedra_protocol" then "protocol"
+                     elif .target.name == "nabedra_resources" then "resources"
+                     elif .target.name == "nabedra_oltp_types" then "oltp-types"
                      elif .target.name == "nabedra_transport" then "transport"
                      elif .target.name == "nabedra_oltp_storage" then "storage"
                      elif .target.name == "nabedra_oltp_replication" then "replication"
@@ -568,11 +598,9 @@ jobs:
                      else .target.kind[0] end), .target.name, .executable] | @tsv' build.json \
             | sed "s#\t$GITHUB_WORKSPACE/#\t#" > bins.tsv
           printf 'server\tnabedra-db\tserver/target/debug/nabedra-db\n' >> bins.tsv
-          test "$(awk -F'\t' '$1 == "lib"' bins.tsv | wc -l)" = 1
-          test "$(awk -F'\t' '$1 == "resources"' bins.tsv | wc -l)" = 1
-          test "$(awk -F'\t' '$1 == "transport"' bins.tsv | wc -l)" = 1
-          test "$(awk -F'\t' '$1 == "storage"' bins.tsv | wc -l)" = 1
-          test "$(awk -F'\t' '$1 == "replication"' bins.tsv | wc -l)" = 1
+          for kind in lib protocol resources oltp-types transport storage replication; do
+            test "$(awk -F'\t' -v k="$kind" '$1 == k' bins.tsv | wc -l)" = 1 || { echo "::error::expected one $kind test executable"; exit 1; }
+          done
           cat bins.tsv
       - uses: actions/upload-artifact@v4
         with:
@@ -625,7 +653,7 @@ jobs:
   kv:
     name: nabedra-kv
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',g7,')
+    if: inputs.base || contains(needs.revision.outputs.pr_jobs, ',kv,') || contains(needs.revision.outputs.jobs, ',g7,')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -712,7 +740,7 @@ jobs:
   clippy:
     name: clippy runtime seam bans (phase 7)
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',clippy,')
+    if: inputs.base || contains(needs.revision.outputs.pr_jobs, ',clippy,') || contains(needs.revision.outputs.jobs, ',clippy,')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -774,7 +802,7 @@ jobs:
   features:
     name: feature builds (O02, NS26)
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',o02,')
+    if: inputs.base || contains(needs.revision.outputs.pr_jobs, ',features,') || contains(needs.revision.outputs.jobs, ',o02,') || contains(needs.revision.outputs.jobs, ',features,')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -870,22 +898,13 @@ jobs:
   engine-tests:
     name: ${{ matrix.suite }} tests
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',engine-tests,')
+    if: needs.revision.outputs.engine_suites != '' && needs.revision.outputs.engine_suites != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - suite: Cache library
-            engine: cache
-            shard: 1
-          - suite: OLAP shard 1 of 2
-            engine: olap
-            shard: 1
-          - suite: OLAP shard 2 of 2
-            engine: olap
-            shard: 2
+        include: ${{ fromJSON(needs.revision.outputs.engine_suites) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -966,7 +985,7 @@ jobs:
   check-tests:
     name: Shared Rust crate tests
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',check-tests,')
+    if: inputs.base || contains(needs.revision.outputs.pr_jobs, ',check-tests,') || contains(needs.revision.outputs.jobs, ',check-tests,')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -1002,7 +1021,7 @@ jobs:
   oltp:
     name: OLTP library and integration tests
     needs: [revision, build]
-    if: github.event_name == 'pull_request' || inputs.base
+    if: inputs.base || contains(needs.revision.outputs.pr_jobs, ',oltp,')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -1051,6 +1070,19 @@ jobs:
         run: |
           set -o pipefail
           "$NABEDRA_TRANSPORT_TEST_EXE" --test-threads=1 2>&1 | tee ../oltp-transport.log
+      - name: Protocol, resources and OLTP types library suites
+        if: ${{ !cancelled() }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          status=0
+          for kind in protocol resources oltp-types; do
+            exe=$(awk -F'\t' -v k="$kind" '$1 == k {print $3}' ../bins.tsv)
+            [ -n "$exe" ] || { echo "::error::the $kind test executable was not built"; status=1; continue; }
+            echo "     Running $kind ($exe)" | tee -a ../oltp-shared-crates.log
+            NABEDRA_TEST_DIRECT_OLTP=on "$GITHUB_WORKSPACE/$exe" --test-threads 4 2>&1 | tee -a ../oltp-shared-crates.log || status=1
+          done
+          exit "$status"
       - name: Integration tests
         if: ${{ !cancelled() }}
         working-directory: server
@@ -1074,7 +1106,7 @@ jobs:
   events:
     name: Events tests
     needs: revision
-    if: github.event_name == 'pull_request' || inputs.base
+    if: inputs.base || contains(needs.revision.outputs.pr_jobs, ',events,')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -1506,6 +1538,21 @@ jobs:
         run: |
           set -o pipefail
           NABEDRA_TEST_DIRECT_OLTP=off "$NABEDRA_OLTP_REPLICATION_TEST_EXE" --test-threads 4 $QUARANTINE_SKIPS 2>&1 | tee ../artifacts/oltp-replication-direct-off.log
+      - name: Transport, protocol, resources and OLTP types library suites, direct_oltp off
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.mode == 'off' }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          status=0
+          for kind in transport protocol resources oltp-types; do
+            exe=$(awk -F'\t' -v k="$kind" '$1 == k {print $3}' ../bins.tsv)
+            [ -n "$exe" ] || { echo "::error::the $kind test executable was not built"; status=1; continue; }
+            threads=4; [ "$kind" = transport ] && threads=1
+            echo "     Running $kind ($exe)" | tee -a ../artifacts/oltp-shared-crates-direct-off.log
+            NABEDRA_TEST_DIRECT_OLTP=off "$GITHUB_WORKSPACE/$exe" --test-threads "$threads" 2>&1 \
+              | tee -a ../artifacts/oltp-shared-crates-direct-off.log || status=1
+          done
+          exit "$status"
       - name: OLTP integration tests, direct_oltp off
         if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.mode == 'off' }}
         working-directory: server
@@ -2056,36 +2103,13 @@ jobs:
           MODE: ${{ matrix.mode }}
         run: |
           read -r -a names <<< "$TESTS"
-          server_cases=()
-          transport_cases=()
-          storage_cases=()
-          replication_cases=()
-          for name in "${names[@]}"; do
-            case "$name" in
-              transport::*) transport_cases+=("$name") ;;
-              oltp::*) storage_cases+=("$name") ;;
-              oltp_replication::*|oltp_deployment::*|oltp_backup_repository::*) replication_cases+=("$name") ;;
-              *) server_cases+=("$name") ;;
-            esac
+          # Each name runs on the OLTP test executable (server library or crate) that lists it.
+          executables=()
+          for kind in lib transport storage replication resources protocol oltp-types; do
+            executables+=(--executable "$GITHUB_WORKSPACE/$(awk -F'\t' -v k="$kind" '$1 == k {print $3}' ../bins.tsv)")
           done
-          repeat() {
-            python3 ../scripts/ci_repeat_tests.py --mode "$MODE" --repeat "$REPEAT" \
-              --log ../tests.log "$@" >> "$GITHUB_STEP_SUMMARY"
-          }
-          status=0
-          if [ "${#server_cases[@]}" -gt 0 ]; then
-            repeat --executable "$NABEDRA_TEST_EXE" "${server_cases[@]}" || status=1
-          fi
-          if [ "${#transport_cases[@]}" -gt 0 ]; then
-            repeat --executable "$NABEDRA_TRANSPORT_TEST_EXE" "${transport_cases[@]}" || status=1
-          fi
-          if [ "${#storage_cases[@]}" -gt 0 ]; then
-            repeat --executable "$NABEDRA_OLTP_STORAGE_TEST_EXE" "${storage_cases[@]}" || status=1
-          fi
-          if [ "${#replication_cases[@]}" -gt 0 ]; then
-            repeat --executable "$NABEDRA_OLTP_REPLICATION_TEST_EXE" "${replication_cases[@]}" || status=1
-          fi
-          exit "$status"
+          python3 ../scripts/ci_repeat_tests.py --mode "$MODE" --repeat "$REPEAT" \
+            --log ../tests.log "${executables[@]}" "${names[@]}" >> "$GITHUB_STEP_SUMMARY"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -2098,7 +2122,7 @@ jobs:
   quarantine:
     name: quarantined tests and scenarios (non-blocking)
     needs: [revision, build]
-    if: github.event_name == 'pull_request' || inputs.base
+    if: contains(needs.revision.outputs.jobs, ',quarantine,')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     continue-on-error: true
@@ -2130,7 +2154,12 @@ jobs:
         run: |
           tests=$(python3 ../scripts/ci_quarantine.py tests)
           if [ -z "$tests" ]; then echo "No quarantined tests." >> "$GITHUB_STEP_SUMMARY"; exit 0; fi
-          python3 ../scripts/ci_repeat_tests.py --mode on --repeat 5 --log ../quarantine-tests.log --report-only $tests >> "$GITHUB_STEP_SUMMARY"
+          executables=()
+          for kind in lib transport storage replication resources protocol oltp-types; do
+            executables+=(--executable "$GITHUB_WORKSPACE/$(awk -F'\t' -v k="$kind" '$1 == k {print $3}' ../bins.tsv)")
+          done
+          python3 ../scripts/ci_repeat_tests.py --mode on --repeat 5 --log ../quarantine-tests.log --report-only \
+            "${executables[@]}" $tests >> "$GITHUB_STEP_SUMMARY"
       - name: Quarantined scenarios, both modes
         if: ${{ !cancelled() }}
         run: |

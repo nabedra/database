@@ -1329,7 +1329,7 @@ pub(crate) async fn run(
             stopped: None,
         });
     }
-    let faults_net = NetFaults::install(cluster.net(), cluster.world.clone(), seed);
+    let faults_net = NetFaults::install(cluster.net(), &cluster.world, seed);
     config.jump_clocks(&cluster.world);
     let start = elapsed_ms(&cluster.world);
     let profile = without_split(selection.profile(seed));
@@ -1445,7 +1445,7 @@ pub(crate) async fn run(
     q.ctx.converge_by.store(u64::MAX, Ordering::Release);
     expire(&q).await;
     // The resource check comes before the finale: a full stop empties the gauges it reads.
-    let stats = direct::settle(cluster, None).await?.0;
+    let stats = direct::settle(cluster, &[]).await?.0;
     for (node, stats) in &stats {
         cluster.checks.check_resources(&cluster.world, *node, stats);
     }

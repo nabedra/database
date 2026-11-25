@@ -35,7 +35,8 @@ fix includes a check that catches the bug.
    - the lowest regression, and its seed when there is one;
    - why no check caught it;
    - the invariant added;
-   - the fix commit.
+   - the fix commit, or, for a bug that has no fix yet, the owner and expiry of an
+     [open record](../../../../docs/testing/bugs/README.md#open-records).
 
 ## Review findings
 

@@ -46,11 +46,9 @@ runners, and integration changes as tasks where the plan calls for them.
    Follow the dispatch procedure in
    [GitHub Actions for checks](../../code-review/references/gh-actions.md).
 
-For worker execution or recovery changes, follow [AGENTS.md](../../../../AGENTS.md).
-Use the [scheduling plan](../../../../plans/resource-aware-scheduling.md) and
+For worker execution or recovery changes, use the
 [scheduler test contract](../../../../docs/testing/scheduler-contract.md) in
-the affected task briefs and acceptance checks. Record the scenario IDs and
-actual assertion results. An unexecuted scenario remains unverified.
+the affected task briefs and acceptance checks.
 
 ## Keep independent tasks running
 

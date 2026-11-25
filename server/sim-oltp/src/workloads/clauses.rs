@@ -15,7 +15,7 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
     ("D02", &["D02:gateway-killed", "D02:after-propose"]),
     ("D03", &["D03:same-key", "D03:other-key"]),
     ("D04", &["D04:before-quorum", "D04:after-quorum"]),
-    ("D05", &["D05:one-paused", "D05:two-paused"]),
+    ("D05", &["D05:one-paused", "D05:rejoin", "D05:two-paused"]),
     ("D07", &["D07:split", "D07:leader-move"]),
     (
         "D10",
@@ -28,11 +28,26 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
             "O06:sync-failure",
             "O06:re-election",
             "O06:corrupt-log",
+            "O06:foreign-replica",
         ],
     ),
     ("O10", &["O10:lost-reply"]),
     ("O15", &["O15:cold-start"]),
-    ("O26", &["O26:pool-move", "O26:worker-4"]),
+    (
+        "O26",
+        &[
+            "O26:growth",
+            "O26:budgets",
+            "O26:mount-identity",
+            "O26:pool-move",
+            "O26:exact-count",
+            "O26:drain",
+            "O26:pinned-snapshot",
+            "O26:split-across-pools",
+            "O26:failed-mount",
+            "O26:worker-4",
+        ],
+    ),
     ("O29", &["O29:ambiguous-write"]),
     (
         "Q03",
@@ -84,8 +99,9 @@ pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
     Some(match clause {
         "D04:after-quorum" => "only the P10-PROBES Applied probe can prove the quorum came first",
         "D02:after-propose" => "needs the P10-PROBES proposal trigger",
-        "D10:one-shot-peer" => "the registered processes cannot offer only the one-shot protocol",
-        "O06:corrupt-log" => "design 3.6 lists no corruption action",
+        "O26:pinned-snapshot" => "a pinned query needs the queued path's barriers (phase 11)",
+        "O26:split-across-pools" => "a split never publishes after a direct commit (open finding)",
+        "O26:failed-mount" => "no phase 10 schedule loses a mount",
         "O26:worker-4" => "the data worker process binds a real TCP listener",
         "O14:restored-from-last-copy" => {
             "two lost voters leave Control without a quorum, so only a cold start follows"
@@ -171,6 +187,8 @@ pub(crate) struct Evidence<'a> {
     pub session_drops: &'a [u64],
     /// Intervals in which at least two of three workers were frozen or down.
     pub no_quorum: &'a [(u64, u64)],
+    /// When a replica move ran.
+    pub moving: Option<(u64, u64)>,
     /// The request deadline.
     pub deadline_ms: u64,
 }
@@ -178,6 +196,9 @@ pub(crate) struct Evidence<'a> {
 pub(crate) struct Outcome {
     pub clauses: BTreeSet<&'static str>,
     pub violations: Vec<(&'static str, String)>,
+    /// Observation: fresh writes not answered within a short deadline with only one follower
+    /// paused.
+    pub one_paused_late: u64,
 }
 
 impl Evidence<'_> {
@@ -214,6 +235,7 @@ impl Evidence<'_> {
         let mut out = Outcome {
             clauses: BTreeSet::new(),
             violations: Vec::new(),
+            one_paused_late: 0,
         };
         if self.reuse_same_key > 0 {
             out.clauses.insert("D03:same-key");
@@ -229,14 +251,14 @@ impl Evidence<'_> {
         out
     }
 
-    /// D05, two paused: no fresh write may succeed without a quorum.
+    /// O06: no fresh write may succeed without a quorum. D05's own schedule runs in
+    /// [`super::paused`].
     fn no_quorum(&self, out: &mut Outcome) {
         for &(from, to) in self.no_quorum {
             for attempt in self.attempts.iter().filter(|a| a.mutation && a.fresh) {
                 if attempt.invoked < from || attempt.invoked >= to {
                     continue;
                 }
-                out.clauses.insert("D05:two-paused");
                 out.clauses.insert("O06:quorum-loss");
                 if attempt.answer == Answer::Committed && attempt.completed <= to {
                     out.violations.push((
@@ -255,33 +277,20 @@ impl Evidence<'_> {
         let fault = &self.faults[index];
         let (from, to) = Self::window(fault);
         match fault.action {
-            // D05, one paused: with nothing else wrong, writes whose whole deadline lies
-            // inside the window succeed.
+            // Not an assertion: D05 is asserted only at its own deadline (`super::paused`).
             Action::FreezeFollower if fault.quiet && fault.nodes.len() == 1 => {
                 let clean = to.min(self.next_fault(index, from));
-                for attempt in self.attempts.iter().filter(|a| a.mutation && a.fresh) {
-                    if attempt.invoked < from || attempt.invoked + self.deadline_ms > clean {
-                        continue;
-                    }
-                    out.clauses.insert("D05:one-paused");
-                    let succeeded = matches!(
-                        attempt.answer,
-                        Answer::Committed | Answer::Ok | Answer::Refused(ErrorCode::Conflict)
-                    );
-                    if !succeeded {
-                        out.violations.push((
-                            "OnePausedProgress",
-                            format!(
-                                "fresh write {} invoked at {}ms with only follower n{} paused since {from}ms was answered {:?} at {}ms",
-                                attempt.id,
-                                attempt.invoked,
-                                fault.nodes[0],
-                                attempt.answer,
-                                attempt.completed
-                            ),
-                        ));
-                    }
-                }
+                let late = self.attempts.iter().filter(|a| {
+                    a.mutation
+                        && a.fresh
+                        && a.invoked >= from
+                        && a.invoked + self.deadline_ms <= clean
+                        && !matches!(
+                            a.answer,
+                            Answer::Committed | Answer::Ok | Answer::Refused(ErrorCode::Conflict)
+                        )
+                });
+                out.one_paused_late += late.count() as u64;
             }
             Action::KillGateway => {
                 let retried = self.attempts.iter().any(|attempt| {
@@ -385,7 +394,9 @@ impl Evidence<'_> {
                 let alone = self.faults.iter().all(|fault| {
                     let (from, to) = Self::window(fault);
                     fault.action == Action::SessionDrop || !attempt.overlaps(from, to)
-                });
+                }) && self
+                    .moving
+                    .is_none_or(|(from, to)| !attempt.overlaps(from, to));
                 if !alone {
                     continue;
                 }
@@ -452,18 +463,20 @@ mod tests {
             reuse_other_key: 0,
             session_drops: &[],
             no_quorum,
+            moving: None,
             deadline_ms: 300,
         }
         .evaluate()
     }
 
+    /// Lead decision 10.3: a short deadline is an observation, not a D05 assertion.
     #[test]
-    fn one_paused_asserts_progress_only_inside_the_clean_window() {
+    fn one_paused_at_a_short_deadline_is_counted_and_not_asserted() {
         let none = BTreeMap::new();
         let freeze = fault(Action::FreezeFollower, 2, 1_000, 2_000);
         let late = attempt(1, 1_800, 2_500, Answer::Unknown);
         let out = evaluate(std::slice::from_ref(&freeze), &[late], &none, &[]);
-        assert!(out.clauses.is_empty() && out.violations.is_empty());
+        assert_eq!(out.one_paused_late, 0);
         let stuck = attempt(2, 1_100, 1_400, Answer::Unknown);
         let out = evaluate(
             std::slice::from_ref(&freeze),
@@ -471,12 +484,12 @@ mod tests {
             &none,
             &[],
         );
-        assert!(out.clauses.contains("D05:one-paused"));
-        assert_eq!(out.violations[0].0, "OnePausedProgress");
+        assert_eq!(out.one_paused_late, 1);
+        assert!(out.clauses.is_empty() && out.violations.is_empty());
         // Another fault inside the window ends the clean part.
         let other = fault(Action::Partition, 1, 1_200, 1_500);
         let out = evaluate(&[freeze, other], &[stuck], &none, &[]);
-        assert!(out.violations.is_empty());
+        assert_eq!(out.one_paused_late, 0);
     }
 
     #[test]
@@ -486,7 +499,7 @@ mod tests {
         assert!(out.clauses.is_empty());
         let commit = attempt(1, 1_100, 1_200, Answer::Committed);
         let out = evaluate(&[], &[commit], &none, &[(1_000, 2_000)]);
-        assert!(out.clauses.contains("D05:two-paused"));
+        assert!(out.clauses.contains("O06:quorum-loss"));
         assert_eq!(out.violations[0].0, "NoQuorumNoSuccess");
         // Committed only after the thaw.
         let thawed = attempt(2, 1_100, 2_100, Answer::Committed);
@@ -533,7 +546,7 @@ mod tests {
             1_500,
             Answer::Refused(ErrorCode::StorageUnavailable),
         );
-        let run = |faults: &[Fault]| {
+        let run = |faults: &[Fault], moving| {
             let evidence = Evidence {
                 faults,
                 attempts: std::slice::from_ref(&refused),
@@ -542,13 +555,18 @@ mod tests {
                 reuse_other_key: 0,
                 session_drops: &[1_400],
                 no_quorum: &[],
+                moving,
                 deadline_ms: 300,
             };
             let out = evidence.evaluate();
             (out.clauses.len(), out.violations.len())
         };
-        assert_eq!(run(&[]), (1, 1));
-        assert_eq!(run(&[fault(Action::Partition, 1, 500, 2_000)]), (0, 0));
+        assert_eq!(run(&[], None), (1, 1));
+        let partition = fault(Action::Partition, 1, 500, 2_000);
+        assert_eq!(run(&[partition], None), (0, 0));
+        // Move seed 7: the same refusals came with the drop and the delay switched off.
+        assert_eq!(run(&[], Some((500, 2_000))), (0, 0));
+        assert_eq!(run(&[], Some((2_000, 3_000))), (1, 1));
     }
 
     #[test]

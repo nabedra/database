@@ -393,6 +393,27 @@ impl Cluster {
         Err(format!("{name}: {}", errors.join("; ")))
     }
 
+    /// One administration request to `node`, with the answer as the operator sees it.
+    pub async fn admin_answer(
+        &self,
+        node: u64,
+        id: Uuid,
+        name: &str,
+        payload: Value,
+        limit: Duration,
+    ) -> Result<Completion, String> {
+        request(
+            BOOTSTRAP_CLIENT,
+            node,
+            "/v1/cluster/operations",
+            &self.config.admin_token,
+            Some(operation(id, name, payload)),
+            limit,
+        )
+        .await
+        .and_then(|reply| reply.completion(id))
+    }
+
     /// One administration request to `node` in its own task, for operations that run for
     /// longer than a health check may wait.
     pub fn admin_task(
@@ -530,6 +551,13 @@ impl Cluster {
     /// incarnation from the ready set, prepare a fresh incarnation through them, then
     /// reopen the retained volume and start the worker.
     pub async fn restart_worker(&mut self, node: u64, how: DiskCut) -> Result<(), String> {
+        self.prepare_restart(node).await?;
+        let index = WORKERS.iter().position(|worker| *worker == node);
+        self.start_prepared(index.expect("known worker"), how).await
+    }
+
+    /// Prepare a retained restart through the survivors, unless one is still unspent.
+    pub async fn prepare_restart(&mut self, node: u64) -> Result<(), String> {
         let index = WORKERS
             .iter()
             .position(|worker| *worker == node)
@@ -539,8 +567,14 @@ impl Cluster {
         }
         if self.prepared.contains(&node) {
             // Control holds one preparation at a time, so a process that did not come up
-            // starts again from the bootstrap file it already has, as a supervisor does.
-            return self.start_prepared(index, how).await;
+            // starts again from the bootstrap file it already has, as a supervisor does. Once
+            // that process has enrolled, the preparation is spent and a fresh one is needed.
+            let connection = self.admin("cluster.connection", json!({})).await?;
+            if !self.enrolled(index, &connection) {
+                return Ok(());
+            }
+            self.record(format!("n{node} enrolled before it stopped: prepare again"));
+            self.prepared.remove(&node);
         }
         let survivors: Vec<u64> = WORKERS
             .into_iter()
@@ -573,10 +607,18 @@ impl Cluster {
             &connection["control_peers"],
         );
         self.prepared.insert(node);
-        self.start_prepared(index, how).await
+        Ok(())
     }
 
-    async fn start_prepared(&mut self, index: usize, how: DiskCut) -> Result<(), String> {
+    /// Whether Control lists the enrollment that worker `index` was prepared with.
+    fn enrolled(&self, index: usize, connection: &Value) -> bool {
+        connection["control_peers"]
+            .as_array()
+            .is_some_and(|peers| peers.contains(self.config.worker_enrollment(index)))
+    }
+
+    /// Start a prepared worker on its reopened volume and wait until it is ready.
+    pub async fn start_prepared(&mut self, index: usize, how: DiskCut) -> Result<(), String> {
         let node = WORKERS[index];
         disk::reopen(&self.world, &self.checks, node, how);
         self.start_worker(index).await?;
@@ -811,6 +853,15 @@ impl Cluster {
     }
 }
 
+/// The world owns the planner, and the planner owns the fault profiles that a workload
+/// installed. A profile may hold the world, so the cluster releases the planner it
+/// installed, also when a seed panics before its teardown.
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        self.world.clear_net_planner();
+    }
+}
+
 async fn supervisor_send(channel: &mut DuplexStream, json: &Value) -> Result<(), String> {
     let body = serde_json::to_vec(json).map_err(|err| err.to_string())?;
     channel
@@ -866,10 +917,65 @@ fn overlaps(mut edges: Vec<(u64, i32)>) -> Vec<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{Arc, Mutex, Weak},
+    };
+
+    use nabedra_rt::sim::World;
 
     use super::{Cluster, overlaps};
-    use crate::{config::Config, disk::DiskCut, invariants::Invariants};
+    use crate::{
+        config::Config, disk::DiskCut, invariants::Invariants, net::Action, workload::live_after,
+    };
+
+    /// A run of a cluster whose frame profile holds the world, as the nemesis profiles do.
+    async fn run_with_a_profile_that_holds_the_world(world: Arc<World>, panics: bool) {
+        Config::sample(1).setup(&world);
+        let checks = Invariants::new();
+        let mut cluster = Cluster::new(world.clone(), checks, 1, Arc::new(|_, _| {}), |_, _, _| {})
+            .await
+            .unwrap();
+        cluster.net().set_frame_profile(move |_| {
+            let _ = world.elapsed();
+            Action::Pass
+        });
+        assert!(!panics, "seeded harness panic");
+        cluster.teardown().await;
+    }
+
+    /// `cold` seed 4: a nemesis profile held the world, so no run's disk images were freed.
+    #[test]
+    fn a_profile_that_holds_the_world_does_not_outlive_its_run() {
+        let world = nabedra_sim::runtime::run(1, |world| async move {
+            run_with_a_profile_that_holds_the_world(world.clone(), false).await;
+            world
+        });
+        assert_eq!(live_after(world), [""; 0]);
+    }
+
+    #[test]
+    fn a_profile_that_holds_the_world_does_not_outlive_a_panic() {
+        let seen = Mutex::new(Weak::new());
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            nabedra_sim::runtime::run(1, |world| {
+                *seen.lock().unwrap() = Arc::downgrade(&world);
+                run_with_a_profile_that_holds_the_world(world, true)
+            });
+        }));
+        assert!(result.is_err());
+        let world = seen.into_inner().unwrap().upgrade();
+        assert!(world.is_none_or(|world| live_after(world).is_empty()));
+    }
+
+    /// The check between seeds reports a world that something still holds.
+    #[test]
+    fn a_retained_world_is_not_empty() {
+        let world = nabedra_sim::runtime::run(1, |world| async move { world });
+        let held = world.clone();
+        assert_eq!(live_after(world), ["World"]);
+        assert_eq!(live_after(held), [""; 0]);
+    }
 
     /// Direct seed 8: a worker killed while frozen kept its links held, so its next process
     /// had no network and never became ready.

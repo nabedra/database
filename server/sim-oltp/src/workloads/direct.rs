@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use super::{
     Scenarios, Workload, clauses,
     clients::{self, Ctx, Plan},
-    cold, moves,
+    cold, corrupt, moves, old_peer, paused,
 };
 use crate::{
     bootstrap::{CLIENTS, GATEWAYS, WORKERS},
@@ -30,6 +30,7 @@ pub(crate) const CHAOS: Duration = Duration::from_secs(20);
 /// Bound for convergence after the heal: every retry and the final reads (design 3.6).
 pub(crate) const CONVERGE_LIMIT: Duration = Duration::from_secs(30);
 const SETUP_DEADLINE: Duration = Duration::from_secs(20);
+const CONVERGE_POLL: Duration = Duration::from_millis(100);
 const TICK: Duration = Duration::from_millis(50);
 
 /// What one workload run executed, for the seed's report.
@@ -69,7 +70,7 @@ pub(crate) async fn run(
         config.deadline(),
         plan.keys,
     );
-    let faults = NetFaults::install(cluster.net(), cluster.world.clone(), seed);
+    let faults = NetFaults::install(cluster.net(), &cluster.world, seed);
     config.jump_clocks(&cluster.world);
     let start = elapsed_ms(&cluster.world);
     let profile = selection.profile(seed);
@@ -108,16 +109,20 @@ pub(crate) async fn run(
     if let Some(stop) = staggered {
         // Heal, then stop every worker while the clients still send requests, and reopen
         // the workers staggered. Restarts the nemesis owes would only race the full stop.
-        if let Some(chaos) = chaos.as_mut()
-            && let Err(error) = chaos.heal(cluster, &ctx).await
-        {
-            cluster
-                .checks
-                .violate(&cluster.world, "Liveness", format!("heal: {error}"));
-            return abandon(cluster, &ctx, tasks, report).await;
+        if let Some(chaos) = chaos.as_mut() {
+            if let Err(error) = chaos.heal(cluster, &ctx).await {
+                cluster
+                    .checks
+                    .violate(&cluster.world, "Liveness", format!("heal: {error}"));
+                return abandon(cluster, &ctx, tasks, report).await;
+            }
+            chaos.before_full_stop(cluster, &ctx).await;
         }
         let started = cluster.world.elapsed();
         let cold = stop.run(cluster, &ctx).await;
+        if let Some(chaos) = chaos.as_mut() {
+            chaos.after_full_stop(cluster).await;
+        }
         report
             .assertions
             .push(("cold start within bound", cold.is_ok()));
@@ -158,9 +163,20 @@ pub(crate) async fn run(
             .violate(&cluster.world, "Liveness", format!("heal: {error}"));
         return abandon(cluster, &ctx, tasks, report).await;
     }
+    // Convergence may be polled for 30 s after the heal. Everything after it is sent once.
+    let converged = converge(cluster, &ctx, healed + CONVERGE_LIMIT).await;
+    report
+        .assertions
+        .push(("converged after the heal", converged.is_ok()));
+    if let Err(error) = &converged {
+        cluster
+            .checks
+            .violate(&cluster.world, "Liveness", format!("convergence: {error}"));
+    }
     for task in tasks {
         let _ = task.await;
     }
+    cluster.checks.recovered(&cluster.world, "convergence");
     let final_checks = clients::final_checks(&ctx).await;
     report.assertions.push((
         "final writes and reads through both gateways",
@@ -171,11 +187,13 @@ pub(crate) async fn run(
             .checks
             .violate(&cluster.world, "Liveness", error.clone());
     }
-    cluster.checks.recovered(&cluster.world, "convergence");
     let mut reread = false;
     if let Some(chaos) = chaos.as_mut().filter(|chaos| chaos.split_pending()) {
         chaos.finish_split(cluster, &ctx).await;
         reread = true;
+    }
+    if let Some(chaos) = chaos.as_ref() {
+        chaos.check_abandoned(cluster, &ctx).await;
     }
     if let Some(moving) = moving.as_mut() {
         let moved = moving.finish(cluster, &ctx, healed).await;
@@ -184,7 +202,27 @@ pub(crate) async fn run(
             .push(("replica move retired", moved.is_ok()));
         match moved {
             Ok(()) => {
-                report.scenarios.insert("O26:pool-move");
+                if let Err(error) = moving.check_retired(cluster, &ctx).await {
+                    cluster.checks.violate(
+                        &cluster.world,
+                        "Liveness",
+                        format!("after the replica move: {error}"),
+                    );
+                }
+                match clients::exact_count(&ctx).await {
+                    Ok(None) => {
+                        report.scenarios.insert("O26:exact-count");
+                    }
+                    Ok(Some(wrong)) => {
+                        cluster.checks.violate(&cluster.world, "ExactCount", wrong);
+                        report.scenarios.insert("O26:exact-count");
+                    }
+                    Err(error) => cluster.checks.violate(
+                        &cluster.world,
+                        "Liveness",
+                        format!("count after the replica move: {error}"),
+                    ),
+                }
             }
             Err(error) => {
                 cluster
@@ -213,6 +251,50 @@ pub(crate) async fn run(
             format!("request unresolved {CONVERGE_LIMIT:?} after the heal: {request}"),
         );
     }
+    // The drain moves the replica once more, so it has its own convergence and final reads.
+    if let Some(moving) = moving.as_mut() {
+        let split = chaos.as_ref().is_some_and(Chaos::split_requested);
+        if let Some(why) = moving.drain_blocked(cluster, split) {
+            cluster.record(format!("O26 drain not run: {why}"));
+        } else {
+            let drained = match moving.drain_pool(cluster, &ctx).await {
+                Ok(()) => {
+                    let limit = cluster.world.elapsed() + CONVERGE_LIMIT;
+                    converge(cluster, &ctx, limit).await
+                }
+                Err(error) => Err(error),
+            };
+            let checked = match drained {
+                Ok(()) => clients::final_checks(&ctx).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = checked {
+                cluster.checks.violate(
+                    &cluster.world,
+                    "Liveness",
+                    format!("draining the moved pool: {error}"),
+                );
+            }
+        }
+        report.scenarios.extend(std::mem::take(&mut moving.clauses));
+    }
+    if old_peer::selected(seed, workload, selection.focus.old_peer) {
+        if converged.is_ok() && final_checks.is_ok() && cluster.converged().await {
+            let observed = old_peer::run(cluster, &ctx, &faults).await;
+            report.scenarios.extend(observed);
+        } else {
+            cluster.record("D10 old peer not run: the cluster did not converge".into());
+        }
+    }
+    if paused::selected(config, workload) {
+        if converged.is_ok() && final_checks.is_ok() && cluster.converged().await {
+            let observed = paused::run(cluster, &ctx, config.deadline()).await;
+            report.scenarios.extend(observed);
+        } else {
+            cluster.record("D05 not run: the cluster did not converge".into());
+        }
+    }
+
     let no_quorum = cluster.no_quorum();
     let drops = chaos.as_ref().map(Chaos::session_drops).unwrap_or_default();
     let outcome = clauses::Evidence {
@@ -223,6 +305,7 @@ pub(crate) async fn run(
         reuse_other_key: observed.reuse_other_key,
         session_drops: &drops,
         no_quorum: &no_quorum,
+        moving: moving.as_ref().and_then(moves::Move::window),
         deadline_ms: config.deadline().as_millis() as u64,
     }
     .evaluate();
@@ -231,10 +314,10 @@ pub(crate) async fn run(
     }
     report.scenarios.extend(outcome.clauses);
 
-    let second = moving
+    let extra = moving
         .as_ref()
-        .and_then(|moving| moving.second_pool(&cluster.world));
-    let (stats, leftover) = settle(cluster, second).await?;
+        .map_or(Vec::new(), |moving| moving.extra_pools(&cluster.world));
+    let (stats, leftover) = settle(cluster, &extra).await?;
     if !selection.focus.idle {
         cluster.checks.check_direct_path(&cluster.world, &stats);
     }
@@ -245,9 +328,32 @@ pub(crate) async fn run(
         cluster.checks.violate(
             &cluster.world,
             "ResourceBaseline",
-            format!("n{node} keeps reservations in its second pool after quiescence: {row}"),
+            format!("n{node} keeps reservations in an added pool after quiescence: {row}"),
         );
     }
+    // Last: a quarantined group stays quarantined, and its leader keeps a replication batch
+    // for it, so the resource checks above must not see it.
+    if corrupt::selected(seed, workload, selection.focus.corrupt) {
+        if converged.is_ok() && final_checks.is_ok() && cluster.converged().await {
+            let observed = corrupt::run(cluster, &ctx).await;
+            report.scenarios.extend(observed);
+            let healed = cluster.world.elapsed();
+            let after = match converge(cluster, &ctx, healed + CONVERGE_LIMIT).await {
+                Ok(()) => clients::final_checks(&ctx).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = after {
+                cluster.checks.violate(
+                    &cluster.world,
+                    "Liveness",
+                    format!("after the O06 stage: {error}"),
+                );
+            }
+        } else {
+            cluster.record("O06 stage not run: the cluster did not converge".into());
+        }
+    }
+
     report.summary = json!({
         "workload": workload.name(),
         "profile": chaos.as_ref().map(Chaos::profile_name),
@@ -262,10 +368,28 @@ pub(crate) async fn run(
         "reuse_other_key": observed.reuse_other_key,
         "not_applied_checks": observed.not_applied_checks,
         "unresolved": observed.unresolved.len(),
+        "one_paused_late": outcome.one_paused_late,
         "heal_cold_start": chaos.as_ref().is_some_and(|chaos| chaos.heal_cold),
     });
     cluster.record(format!("workload summary {}", report.summary));
     Ok(report)
+}
+
+/// Poll until every worker and gateway reports the run ready with the direct path active, and
+/// a read of one key succeeds through each gateway.
+async fn converge(cluster: &Cluster, ctx: &Ctx, deadline: Duration) -> Result<(), String> {
+    loop {
+        let state = if cluster.converged().await {
+            clients::read_each(ctx).await
+        } else {
+            Err("some worker or gateway is not ready".into())
+        };
+        match state {
+            Ok(()) => return Ok(()),
+            Err(error) if cluster.world.elapsed() >= deadline => return Err(error),
+            Err(_) => time::sleep(CONVERGE_POLL).await,
+        }
+    }
 }
 
 /// The run cannot converge: stop the clients and keep the violations already recorded.
@@ -346,11 +470,11 @@ pub(crate) async fn create_table(
     }
 }
 
-/// Wait for transient resource gauges to return to their baseline, or 2 s. The second pool a
-/// move mounted has no row in the baseline, so it is split off: it must reserve nothing.
+/// Wait for transient resource gauges to return to their baseline, or 2 s. The pools a move
+/// mounted have no row in the baseline, so they are split off: they must reserve nothing.
 pub(crate) async fn settle(
     cluster: &Cluster,
-    second: Option<SecondPool>,
+    extra: &[ExtraPool],
 ) -> Result<(Vec<(u64, Value)>, Option<(u64, String)>), String> {
     let deadline = cluster.world.elapsed() + Duration::from_secs(2);
     loop {
@@ -359,12 +483,11 @@ pub(crate) async fn settle(
         let mut leftover = None;
         for node in WORKERS {
             let mut stats = cluster.stats(node).await?;
-            if let Some((moved, device)) = second
-                && moved == node
-                && let Some(rows) = stats["storage_reservations"].as_array_mut()
-            {
+            if let Some(rows) = stats["storage_reservations"].as_array_mut() {
                 rows.retain(|row| {
-                    let extra = row["device"] == device;
+                    let extra = extra
+                        .iter()
+                        .any(|&(moved, device)| moved == node && row["device"] == device);
                     if extra && (row["reserved_bytes"] != 0 || row["reservations"] != 0) {
                         leftover = Some((node, row.to_string()));
                     }
@@ -381,5 +504,5 @@ pub(crate) async fn settle(
     }
 }
 
-/// The node and device of the pool a replica move mounted.
-pub(crate) type SecondPool = (u64, u64);
+/// The node and device of a pool that a replica move mounted.
+pub(crate) type ExtraPool = (u64, u64);
