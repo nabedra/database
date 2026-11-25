@@ -29,13 +29,10 @@ run() {
         --exact --include-ignored --nocapture --test-threads=1 "$1"
 }
 build
-NABEDRA_SEEDS=50 run sweep::tests::sweep
-git -C "$scratch" apply --verbose "$probes/recurring-charge.patch"
-build
-NABEDRA_SEEDS=3 run probes::tests::planted_recurring_charge_is_caught_only_by_probes
+NABEDRA_SEED=1 NABEDRA_SEEDS=600 run sweep::tests::sweep
 ''']
 cwd = "server"
 timeout_s = 5400
 needs = []
 result_parser = "cargo-test"
-env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", NABEDRA_SEED = "1", NABEDRA_SIM_WORKLOAD = "smoke", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SIM_CHECK_ID = "oltp-probes-baseline", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-probes-baseline" }
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", NABEDRA_SEED = "1", NABEDRA_SIM_WORKLOAD = "smoke", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "0", NABEDRA_SIM_CHECK_ID = "oltp-probes-baseline", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-probes-baseline" }

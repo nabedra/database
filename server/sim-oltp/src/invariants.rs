@@ -254,6 +254,7 @@ impl Invariants {
             stats: stats.clone(),
             ledgers,
         };
+        println!("STEADY n{worker} passes {passes} at {}", now.as_millis());
         checks.steady.insert(worker, observed);
         passes >= SETTLED_PASSES
     }
@@ -382,6 +383,7 @@ impl Invariants {
             ledgers: ledgers.map_or(0, |ledgers| ledgers.len() as u64),
             off,
         };
+        println!("OBS n{worker} passes {passes} off {} at {}", observed.off.len(), now.as_millis());
         checks.settling.insert(worker, observed);
         passes >= SETTLED_PASSES
     }
