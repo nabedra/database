@@ -487,23 +487,24 @@ impl Driver {
                     REQUEST_LIMIT,
                 )
                 .await;
-            if let Completion::Ok(record) = &answer {
-                if record["phase"]["state"] == "retired" {
-                    return Ok(self.retired(id, worker));
-                }
-                return Err(format!("move {id} phase {}", record["phase"]));
-            }
             last.push(format!("n{worker} {}", shown(&answer)));
-            match status(&self.op, id).await {
-                Ok(Some(state)) if state == "retired" => return Ok(self.retired(id, worker)),
+            let (state, answered) = match &answer {
+                Completion::Ok(record) => (state(record), true),
+                _ => match status(&self.op, id).await {
+                    Ok(state) => (state.unwrap_or_else(|| UNKNOWN.to_owned()), false),
+                    Err(error) => {
+                        last.push(error);
+                        continue;
+                    }
+                },
+            };
+            match after(&state) {
+                Next::Retired => return Ok(self.retired(id, worker)),
                 // Never started, or given up by its owner: whoever owns the role now is asked
                 // for a new one.
-                Ok(None) => return Err(self.again(id, "unknown", &last)),
-                Ok(Some(state)) if state == "cancelled" => {
-                    return Err(self.again(id, &state, &last));
-                }
-                Ok(Some(state)) => last.push(format!("Control says {state}")),
-                Err(error) => last.push(error),
+                Next::Again => return Err(self.again(id, &state, &last)),
+                Next::Same if answered => return Err(format!("move {id} is {state}")),
+                Next::Same => last.push(format!("Control says {state}")),
             }
         }
         Err(last.join("; "))
@@ -732,6 +733,30 @@ async fn admin(op: &Operator, name: &str, payload: Value) -> Result<Value, Strin
     op.any(op.id().await, name, &payload, REQUEST).await
 }
 
+/// Control has no record of the move.
+const UNKNOWN: &str = "unknown";
+
+/// What the operator does about a move in a state.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    Retired,
+    Same,
+    Again,
+}
+
+fn after(state: &str) -> Next {
+    match state {
+        "retired" => Next::Retired,
+        "cancelled" | UNKNOWN => Next::Again,
+        _ => Next::Same,
+    }
+}
+
+fn state(record: &Value) -> String {
+    let state = record["phase"]["state"].as_str();
+    state.unwrap_or("without a state").to_owned()
+}
+
 /// The state that Control records for a move, or `None` when it has none.
 async fn status(op: &Operator, id: Uuid) -> Result<Option<String>, String> {
     let mut last = Vec::new();
@@ -739,10 +764,7 @@ async fn status(op: &Operator, id: Uuid) -> Result<Option<String>, String> {
         let name = "storage.replica.move.status";
         let answer = op.ask(node, id, name, json!({}), REQUEST).await;
         match &answer {
-            Completion::Ok(record) => {
-                let state = record["phase"]["state"].as_str();
-                return Ok(Some(state.unwrap_or("without a state").to_owned()));
-            }
+            Completion::Ok(record) => return Ok(Some(state(record))),
             Completion::Refused(error) if error.message == "replica move is unknown" => {
                 return Ok(None);
             }
@@ -1021,6 +1043,19 @@ mod tests {
         ));
         let connect = "connect n1: connection refused".to_owned();
         assert!(!passed_owner_check(&Completion::Unknown(connect)));
+    }
+
+    /// Move seeds 374, 488 and 683: the owner answered that it had cancelled the move, and the
+    /// operator asked for the same one until the end.
+    #[test]
+    fn a_cancelled_move_is_not_asked_for_under_its_old_id() {
+        let cancelled = json!({"phase": {"state": "cancelled"}});
+        assert_eq!(after(&state(&cancelled)), Next::Again);
+        assert_eq!(after(UNKNOWN), Next::Again);
+        assert_eq!(after("retired"), Next::Retired);
+        for open in ["claimed", "moving", "published", "without a state"] {
+            assert_eq!(after(open), Next::Same);
+        }
     }
 
     /// Move seed 2: every retry asked for the whole claim again. The third one used up its

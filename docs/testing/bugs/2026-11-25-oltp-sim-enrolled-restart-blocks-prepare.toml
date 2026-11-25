@@ -7,9 +7,9 @@ scenarios = ["D04", "O26"]
 found_by = "campaign"
 found_date = "2026-11-25"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
-seed = 152
+seed = 149
 why_not_caught = "The restart runners let the first start finish."
-invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, seeds 152, 281, 293, 476, 593 and 630 of 1 to 720: a stopped worker restarts after the heal. Control answers Busy to worker.restart.prepare while an earlier preparation of that worker is enrolled, and the process that enrolled it has exited."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, seeds 11, 41, 149, 170 and 281 of 1 to 720: a stopped worker restarts after the heal. Control answers Busy to worker.restart.prepare while an earlier preparation of that worker is enrolled, and the process that enrolled it has exited. Why that first start failed is not established."
 fix_commits = []
 revert_patch_ok = false
 status = "open"
