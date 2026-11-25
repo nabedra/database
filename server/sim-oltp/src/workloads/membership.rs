@@ -73,8 +73,6 @@ enum Defect {
     DropVoter,
     /// The published placement lists a removed voter again (`RetryCertifiesNamedRemoval`).
     OldVoter,
-    /// A retained worker is counted as wiped (`WipedNeverVotes`).
-    Miscounted,
 }
 
 impl Defect {
@@ -84,7 +82,6 @@ impl Defect {
             Some("full-stop") => Some(Self::FullStop),
             Some("drop-voter") => Some(Self::DropVoter),
             Some("old-voter") => Some(Self::OldVoter),
-            Some("miscounted") => Some(Self::Miscounted),
             Some(name) => panic!("unknown {DEFECT_ENV} {name:?}"),
         }
     }
@@ -1512,12 +1509,6 @@ impl Membership {
             Started::Ready => self.note("wiped worker ready"),
             Started::Running => self.note("wiped worker running"),
             Started::Exited(_) => self.note("wiped worker refused"),
-        }
-        if self.defect == Some(Defect::Miscounted) {
-            // Judge the two retained voters as if the survivor had been wiped too.
-            for other in cluster.config.nodes() {
-                *self.generations.entry(other).or_default() += 1;
-            }
         }
         self.evidence(cluster, ctx, g, node).await;
         if cluster.world.is_up(node) {
