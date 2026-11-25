@@ -191,7 +191,7 @@ jobs:
           growth=()
           if has growth; then
             # SCRATCH (harness-port): O28 startup repeats. Never merge.
-            for n in head-off-clean-25 head-on-clean-25 main-off-clean-25 main-on-clean-25 head-off-kernel-3 head-off-config-3 head-off-held-1 head-off-finalheld-1 head-off-killedconfig-5 main-off-killedconfig-5 head-off-killedheld-3 main-off-killedheld-3; do
+            for n in head-off-repeat-50 head-off-clean-25 head-on-clean-25 main-off-clean-25 main-on-clean-25 head-off-kernel-3 head-off-config-3 head-off-held-1 head-off-finalheld-1 head-off-killedconfig-5 main-off-killedconfig-5 head-off-killedheld-3 main-off-killedheld-3; do
               growth+=("{\"scenario\":\"O28\",\"modes\":\"off\",\"label\":\"$n\",\"opt1\":true,\"timeout\":3600}")
             done
           fi
@@ -1764,20 +1764,20 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: oltp-bins-opt1
-          run-id: "45515222986"
+          run-id: "45520329948"
           github-token: ${{ github.token }}
       - name: Startups
         run: |
           tar -I zstd -xf oltp-bins-opt1.tar.zst
-          grep -qx "source=e5f772712eef50d73ddd363f2c7aeadd3e166f5d" bins-source.txt
+          grep -qx "source=8045fc500ad2ef582e3b2158e6bf481d781eb6c1" bins-source.txt
           EXE=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "lib" {print $3}' bins.tsv)
           BIN=$GITHUB_WORKSPACE/$(awk -F'\t' '$1 == "server" {print $3}' bins.tsv)
           IFS=- read -r side mode force count <<< "$LABEL"
-          sha=e5f772712eef50d73ddd363f2c7aeadd3e166f5d; [ "$side" = head ] || sha=169324944bb5fa32a6819742af63b688c6b8ffdd
+          sha=8045fc500ad2ef582e3b2158e6bf481d781eb6c1; [ "$side" = head ] || sha=169324944bb5fa32a6819742af63b688c6b8ffdd
           git worktree add --detach ../side "$sha"
           git -C ../side log -1 --format='harness %H'
           # The server sources of both sides are the same, so both use the one build.
-          git diff --stat 169324944bb5fa32a6819742af63b688c6b8ffdd e5f772712eef50d73ddd363f2c7aeadd3e166f5d -- server ':!server/tests' | tee /tmp/diff; [ ! -s /tmp/diff ]
+          git diff --stat 169324944bb5fa32a6819742af63b688c6b8ffdd 8045fc500ad2ef582e3b2158e6bf481d781eb6c1 -- server ':!server/tests' | tee /tmp/diff; [ ! -s /tmp/diff ]
           cat > /tmp/startup.py <<'PY'
           """Repeat the O28 startup (main(), start, wait_direct_active, first table.create) with the harness of a given
           checkout. usage: startup.py <server/tests dir> <mode> <count> <binary> <test executable>
@@ -1887,6 +1887,14 @@ jobs:
           print(f'STARTUP SUMMARY {mode}: {results.count("ok")} ok of {len(results)}', flush=True)
           sys.exit(results.count('ok') != len(results))
           PY
+          if [ "$force" = repeat ]; then
+            ok=0
+            for i in $(seq "$count"); do
+              if python -m unittest discover -s ../side/server/tests -p test_oltp_harness_ports.py >> startup.log 2>&1; then ok=$((ok+1)); fi
+            done
+            grep -E "^Ran" startup.log | cut -d' ' -f1-3 | sort | uniq -c
+            echo "STARTUP SUMMARY repeat: $ok ok of $count"; [ "$ok" = "$count" ]; exit
+          fi
           NABEDRA_TEST_DIRECT_OLTP=$mode PYTHONDONTWRITEBYTECODE=1 python /tmp/startup.py \
             "$(realpath ../side)/server/tests" "$force" "$count" "$BIN" "$EXE" > startup.log 2>&1 || status=$?
           grep -E "^STARTUP|^direct cluster|^harness_ports|lost one of|does not listen|exited with status|bind failed|worker transport unavailable" startup.log | cut -c1-400
