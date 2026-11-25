@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "p10-shards-reh2-3746cb5-201739--oltp-sim-bugs-rehearsal-bug1-d04-1.log",
+      "sha256": "b772ee6ab868f064bcf865d78cfe6c5b454854c6a24b349d17e397ea5772e798"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim-bugs-rehearsal-bug1-d04-1",
+  "duration_s": 2179.462,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-25T19:17:49.718782+00:00",
+    "request_id": "p10-shards-reh2-3746cb5-201739",
+    "runner": "GitHub Actions 1000014333",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45683713308"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "3746cb5ffa1b0ebcb749a4894eaedfee8b1fa180",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
