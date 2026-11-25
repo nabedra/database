@@ -26,6 +26,10 @@ profile = ["index-publish", "split"]
 # No [[rules]] for CoveringIndexComplete: its only text is design 3.7, and lead decision 13.1 lists design rules for
 # rows 6, 9, 20 and the Liveness rows (read as 10, 11, 13 and 16), not for row 4.
 expect = ["CoveringIndexComplete"]
+hold = """\
+Row 4. CoveringIndexComplete has no text that lead decision 13.1 allows for this row. The split finding in \
+../simulator.toml is open too.\
+"""
 seeds = [1, 10000]
 
 # The stronger regression is acceptance O28: author patched 1 of 1 failed, clean 1 of 1 passed (port_notes); review below.

@@ -14,10 +14,13 @@
 # illegal fixtures, and a run on unpatched main first. `not_detectable_yet` and `hold` repeat the manifest. The lead's
 # decisions are in designs/lead-decisions.md, outside this repository.
 #
-# Count (2026-11-25). Nine rows have nothing in their manifest that keeps a hit from counting: 2, 3, 5, 6, 9, 10, 11, 13, 16. Row 5 only
-# through QueueRetention. Five rows are held: 7, 14, 15, 19, 20. Two patches are partial: 17, 18. One is not sensitive: 22.
-# Rows 1, 8, 12, 21 (and 7, 14, 22) have no rule. Row 4 has no allowed text. Rows 4 and 15 are blocked and 19 looks
-# unreachable (read, not run). No resource-release-order row (19 to 22) can count. The bar is 15.
+# Count (2026-11-25). Eight rows have nothing in their manifest that keeps a hit from counting, except the plan record
+# below: 2, 3, 5, 6, 9, 11, 13, 16. Row 5 only through QueueRetention. Row 3 only through the retry rule, not through a
+# deadline. Rows 3 and 11 also need `record --never-searched` for an earlier plan before a [detection] can count. Seven
+# rows are held: 4, 7, 10, 14, 15, 19, 20. Two patches are partial: 17, 18. One is not sensitive: 22. Rows 1, 8, 12, 21
+# (and 7, 14, 22) have no rule. Row 15 is blocked, row 4 has an open split finding and 19 looks unreachable (read, not
+# run). No resource-release-order row (19 to 22) can count. Each of the four sets holds a row with an empty `expect`, so
+# its check fails and cannot pass. The bar is 15.
 #
 # reach: reachable (workload only), needs-workload, needs-client, needs-invariant, needs-probe,
 # needs-trigger, needs-fault, needs-hook, narrower or partly (than the original defect), nightly,
@@ -68,6 +71,7 @@ gaps = [
     "OneExecutionPerIdentity as designed cannot fire: the queue owner settles the identity at its anchor first (settle_before_reserve, T7c) and refuses the streamed body with outcome_unknown, so nothing runs twice.",
     "The harness client always sends Full<Bytes> with a length (sim-oltp/src/client.rs); it needs a streamed body mode.",
     "A no-op or refused insert that is recomputed on retry is DR-1, a known gap in the OLTP register, not this patch. Decision 8 masks such a hit.",
+    "The harness also reports Liveness for missed deadlines, and today only for those. A deadline hit on this row must not be confirmed.",
     "OneExecutionPerIdentity is the name in design 4.2. Decision 9 allows this retry rule instead.",
 ]
 
@@ -75,14 +79,15 @@ gaps = [
 row = 4
 workload = "topology"
 sensitivity = "sensitive"
+hold = "Row 4. CoveringIndexComplete has no text that lead decision 13.1 allows for this row. The split finding in ../simulator.toml is open too."
 reach = "blocked"
-not_detectable_yet = "not detectable yet: blocked by the split finding in gaps."
+not_detectable_yet = "not detectable yet: no allowed text, and the split finding in gaps is open."
 faults = "None beyond client load. The worker that led the parent at its first direct epoch must lead the child at its first epoch."
 trigger = "Index publication to Ready, then a split of the same range, then inserts routed to the child."
 rules = []
 no_text = ["CoveringIndexComplete"]
 gaps = [
-    "Blocked today: P10-WORKLOADS reports that a split never publishes under direct load (4 of 4 seeds), only with idle clients. The workload must split while idle and resume writers, or that finding must be resolved.",
+    "Open split finding. The P10-WORKLOADS report that a split never publishes under direct load is withdrawn (lead decision 17). What stands: the source refused a split with DirectCommitAboveCut (376 of 376 attempts in its seed 1), and whether a fresh plan succeeds is untested.",
 ]
 
 [bug2]
@@ -160,6 +165,7 @@ gaps = [
 row = 10
 workload = "cold"
 sensitivity = "sensitive"
+hold = "Row 10. The regression cannot be seen to fail by the tool, so no run can confirm it. The probe starts a child test that prints a second `test result:` line, and its own output follows `test ... ` on the line that should end in FAILED. classify_libtest returns not-run for the log of the cited patched run 45436207074. Missing: a regression whose patched run prints one result, its clean and patched runs, and a [review] of it."
 reach = "needs-trigger"
 faults = "Freeze or isolate the Timestamp quorum for longer than one service call (over 10 s) while a worker is between its sealed ready revision and the fence receipt."
 trigger = "Control ReadySealed for the joining worker (not a probe in the design list)."

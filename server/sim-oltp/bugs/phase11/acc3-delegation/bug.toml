@@ -21,6 +21,8 @@ workload = "membership"
 profile = ["rolling-restart", "leader-move"]
 # expect is the plan. The text an expected kind enforces is in [[rules]] at the end. A kind without text there detects
 # nothing.
+# This branch's history holds an earlier plan (other `expect`). A [detection] here needs `sim_bugs.py record
+# --never-searched` for it first. No such record exists.
 expect = ["Liveness"]
 seeds = [1, 10000]
 

@@ -5,8 +5,10 @@ kinds = ["S", "H"]
 # in its manifest's range with a kind it expects; the seed replays alone twice on the patched build
 # and passes twice on the unpatched build (sim_bugs.py run). Phase 11 needs 15 of the 22 over the
 # four sets, at least one per class; this check reports its own set.
-# No phase 11 workload exists yet, so today the command prints the marker below and the record is
-# not-run, never a pass. server/sim-oltp/bugs/phase11/simulator.toml says what each entry needs.
+# acc3-receipt, fixc-owner-fence, o21cap and qlane have an empty `expect` (`no-detector`), so the
+# command exits 1 without the marker below and the record is fail, not not-run. No phase 11
+# workload exists yet, and the set cannot pass while that stays so or while such a row is in it.
+# server/sim-oltp/bugs/phase11/simulator.toml says what each entry needs.
 # The set: acc3-receipt, bug1-encode-submit, bug1-stream, bug2, fixc-owner-fence, o21cap, qlane.
 guarantees = ["OLTP-G02", "OLTP-G03", "OLTP-G04", "OLTP-G05", "OLTP-G06", "OLTP-G07", "OLTP-G09"]
 scenarios = ["D03", "O07", "O08", "O13", "O14", "O16", "O21", "Q05", "R01"]
