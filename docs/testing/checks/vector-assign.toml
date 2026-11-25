@@ -1,0 +1,13 @@
+# Design spec of moves of a search replica between workers.
+# Baselines (exhaustive, with coverage) and mutants with their controls. See specs/README.md.
+id = "vector-assign"
+module = "vector"
+kinds = ["T"]
+guarantees = ["VEC-G01", "VEC-G04", "VEC-G08"]
+scenarios = ["VS06", "VS14"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/vector/assign", "SearchAssign", "--module", "vector"]
+cwd = "."
+timeout_s = 9000
+needs = ["tlc"]
+result_parser = "tlc"

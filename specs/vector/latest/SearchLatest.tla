@@ -7,11 +7,14 @@
 (* leader's applied index, and possibly one deposed leader that has not    *)
 (* noticed. A voter that feeds a search worker may have applied any prefix *)
 (* of the committed log, so one nondeterministic prefix stands for any     *)
-(* number of voters. Raft's log safety and the lease itself are OLTP-G01   *)
-(* and OLTP-G06.                                                           *)
+(* number of voters. Raft's log safety, and that a lease check passes only  *)
+(* while no newer leader exists, are assumed: they are existing mechanisms  *)
+(* of the OLTP module, used unchanged, and clock drift enters only there.   *)
+(* The check and the answer are separate steps: a leader can be deposed     *)
+(* between them.                                                            *)
 (*                                                                         *)
-(* Properties: VEC-G01 (LatestRealTime), VEC-G03 (NoInvisibleRow),         *)
-(* VEC-G06 (CommitIndependent, QueryProgress).                             *)
+(* Properties: VEC-G01 (LatestRealTime, MonotoneLatest), VEC-G03           *)
+(* (NoInvisibleRow), VEC-G06 (CommitIndependent, QueryProgress).           *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -22,6 +25,7 @@ CONSTANTS
     Parts,          \* [Singles \cup Batches -> SUBSET Ranges]
     Deletable,      \* the singles a client may delete
     MaxElections, MaxCrashes, MaxLost, MaxDups, MaxPurges, MaxBarriers,
+    MaxLog,         \* at least the longest log of a run
     None,           \* a model value
     Mutant
 
@@ -46,14 +50,18 @@ VARIABLES
     wait, fly,  \* queries waiting for, and in, the barrier of (s, r)
     bid,        \* barrier RPC identity of (s, r)
     asked,      \* asked[s][r]: the in-flight RPC has not been answered
+    cap,        \* cap[s][r]: what the leader captured when it got the RPC, or None:
+                \* [ci, lp, old]: committed index, applied index, and that it was deposed since
     replies,    \* barrier replies in flight
     qst, qw, qneed, qpos, qres,
+    qat,        \* qat[q][r]: the position a range was served at
+    qafter,     \* qafter[q]: queries that were done when q began
     elections, crashes, lost, dups, purges
 
 wvars == <<started, log, tail, lapp, ready, termAt, old, prepared, dec, acked>>
 fvars == <<data, wpos, inst, pages, purged>>
-bvars == <<wait, fly, bid, asked, replies>>
-qvars == <<qst, qw, qneed, qpos, qres>>
+bvars == <<wait, fly, bid, asked, cap, replies>>
+qvars == <<qst, qw, qneed, qpos, qres, qat, qafter>>
 cvars == <<elections, crashes, lost, dups, purges>>
 vars == <<wvars, fvars, bvars, qvars, cvars>>
 
@@ -113,12 +121,15 @@ Init ==
     /\ fly = [s \in Workers |-> [r \in Ranges |-> {}]]
     /\ bid = [s \in Workers |-> [r \in Ranges |-> 0]]
     /\ asked = [s \in Workers |-> [r \in Ranges |-> FALSE]]
+    /\ cap = [s \in Workers |-> [r \in Ranges |-> None]]
     /\ replies = {}
     /\ qst = [q \in Queries |-> "idle"]
     /\ qw = [q \in Queries |-> None]
     /\ qneed = [q \in Queries |-> {}]
     /\ qpos = [q \in Queries |-> [r \in Ranges |-> None]]
     /\ qres = [q \in Queries |-> [r \in Ranges |-> None]]
+    /\ qat = [q \in Queries |-> [r \in Ranges |-> None]]
+    /\ qafter = [q \in Queries |-> {}]
     /\ elections = 0 /\ crashes = 0 /\ lost = 0 /\ dups = 0 /\ purges = 0
 
 -----------------------------------------------------------------------------
@@ -196,16 +207,20 @@ Elect(r) ==
     /\ tail' = [tail EXCEPT ![r] = None]
     /\ ready' = [ready EXCEPT ![r] = FALSE]
     /\ old' = [old EXCEPT ![r] = lapp[r]]
-    /\ UNCHANGED <<started, prepared, dec, acked, fvars, bvars, qvars, crashes, lost, dups, purges>>
+    /\ cap' = [s \in Workers |-> [cap[s] EXCEPT ![r] =
+                IF @ = None \/ @.old THEN None ELSE [@ EXCEPT !.old = TRUE]]]
+    /\ asked' = [s \in Workers |-> [asked[s] EXCEPT ![r] =
+                  IF cap[s][r] # None /\ cap[s][r].old THEN FALSE ELSE @]]
+    /\ UNCHANGED <<started, prepared, dec, acked, fvars, wait, fly, bid, replies, qvars, crashes, lost, dups, purges>>
 
 -----------------------------------------------------------------------------
 (* Search feed.                                                            *)
 
-\* Mutant feed_omits_delete: the voter derives changes from its current rows, which no longer hold
+\* Mutant prefix_feed_omits_delete: the voter derives changes from its current rows, which no longer hold
 \* the deleted one, so the entry arrives empty.
 Sent(ents) ==
     [i \in 1..Len(ents) |->
-        IF Mutant = "feed_omits_delete" /\ ents[i].k = "del" THEN Entry("empty", ents[i].w) ELSE ents[i]]
+        IF Mutant = "prefix_feed_omits_delete" /\ ents[i].k = "del" THEN Entry("empty", ents[i].w) ELSE ents[i]]
 
 \* A voter answers a tail request with committed entries after the worker's position. The voter may
 \* have applied any prefix. Mutant tail_unapplied: the leader also sends its uncommitted entry.
@@ -272,19 +287,22 @@ FinishInstall(s, r) ==
 \* queries lose their barriers and their scans and are asked again.
 CrashWorker(s) ==
     /\ crashes < MaxCrashes /\ crashes' = crashes + 1
-    /\ \E keep \in BOOLEAN :
-        LET kept(r) == IF keep /\ ~inst[s][r] THEN Len(data[s][r]) \div 2 ELSE 0 IN
+    /\ \E n \in [Ranges -> 0..MaxLog] :
+        LET kept(r) == IF inst[s][r] \/ n[r] > Len(data[s][r]) THEN 0 ELSE n[r] IN
+        /\ \A r \in Ranges : kept(r) = n[r]
         /\ data' = [data EXCEPT ![s] = [r \in Ranges |-> Prefix(data[s][r], kept(r))]]
         /\ wpos' = [wpos EXCEPT ![s] = [r \in Ranges |-> kept(r)]]
     /\ inst' = [inst EXCEPT ![s] = [r \in Ranges |-> FALSE]]
     /\ wait' = [wait EXCEPT ![s] = [r \in Ranges |-> {}]]
     /\ fly' = [fly EXCEPT ![s] = [r \in Ranges |-> {}]]
     /\ asked' = [asked EXCEPT ![s] = [r \in Ranges |-> FALSE]]
+    /\ cap' = [cap EXCEPT ![s] = [r \in Ranges |-> None]]
     /\ LET hit(q) == qst[q] = "run" /\ qw[q] = s
            clear == [r \in Ranges |-> None] IN
        /\ qpos' = [q \in Queries |-> IF hit(q) THEN clear ELSE qpos[q]]
        /\ qres' = [q \in Queries |-> IF hit(q) THEN clear ELSE qres[q]]
-    /\ UNCHANGED <<wvars, pages, purged, bid, replies, qst, qw, qneed, elections, lost, dups, purges>>
+       /\ qat' = [q \in Queries |-> IF hit(q) THEN clear ELSE qat[q]]
+    /\ UNCHANGED <<wvars, pages, purged, bid, replies, qst, qw, qneed, qafter, elections, lost, dups, purges>>
 
 -----------------------------------------------------------------------------
 (* Queries and barriers.                                                   *)
@@ -294,7 +312,8 @@ StartQuery(q, s) ==
     /\ qst' = [qst EXCEPT ![q] = "run"]
     /\ qw' = [qw EXCEPT ![q] = s]
     /\ qneed' = [qneed EXCEPT ![q] = acked]
-    /\ UNCHANGED <<wvars, fvars, bvars, qpos, qres, cvars>>
+    /\ qafter' = [qafter EXCEPT ![q] = {x \in Queries : qst[x] = "done"}]
+    /\ UNCHANGED <<wvars, fvars, bvars, qpos, qres, qat, cvars>>
 
 \* A query joins a barrier that has not been sent. Mutant join_inflight_barrier joins one that has.
 JoinBarrier(q, r) ==
@@ -304,7 +323,7 @@ JoinBarrier(q, r) ==
     /\ IF Mutant = "join_inflight_barrier" /\ fly[s][r] # {}
        THEN fly' = [fly EXCEPT ![s][r] = @ \cup {q}] /\ UNCHANGED wait
        ELSE wait' = [wait EXCEPT ![s][r] = @ \cup {q}] /\ UNCHANGED fly
-    /\ UNCHANGED <<wvars, fvars, bid, asked, replies, qvars, cvars>>
+    /\ UNCHANGED <<wvars, fvars, bid, asked, cap, replies, qvars, cvars>>
 
 SendBarrier(s, r) ==
     /\ fly[s][r] = {} /\ wait[s][r] # {} /\ bid[s][r] < MaxBarriers
@@ -312,6 +331,7 @@ SendBarrier(s, r) ==
     /\ wait' = [wait EXCEPT ![s][r] = {}]
     /\ bid' = [bid EXCEPT ![s][r] = @ + 1]
     /\ asked' = [asked EXCEPT ![s][r] = TRUE]
+    /\ cap' = [cap EXCEPT ![s][r] = None]
     /\ UNCHANGED <<wvars, fvars, replies, qvars, cvars>>
 
 ReplyInFlight(s, r) == \E p \in replies : p.s = s /\ p.r = r /\ p.id = bid[s][r]
@@ -324,6 +344,7 @@ RetryBarrier(s, r) ==
     /\ Mutant # "no_barrier_retry"
     /\ bid' = [bid EXCEPT ![s][r] = @ + 1]
     /\ asked' = [asked EXCEPT ![s][r] = TRUE]
+    /\ cap' = [cap EXCEPT ![s][r] = None]
     /\ UNCHANGED <<wvars, fvars, wait, fly, replies, qvars, cvars>>
 
 \* The deadline passes although a reply is on its way. It may arrive after the resend, so it counts
@@ -333,33 +354,61 @@ SpuriousRetry(s, r) ==
     /\ lost < MaxLost /\ lost' = lost + 1
     /\ bid' = [bid EXCEPT ![s][r] = @ + 1]
     /\ asked' = [asked EXCEPT ![s][r] = TRUE]
+    /\ cap' = [cap EXCEPT ![s][r] = None]
     /\ UNCHANGED <<wvars, fvars, wait, fly, replies, qvars, elections, crashes, dups, purges>>
 
 \* Committed batches whose resolve the leader has not applied. Mutant skip_intents ignores them.
 OpenIntents(seq) ==
     {b \in Batches : Has(seq, Entry("prep", b)) /\ dec[b] = "commit" /\ ~Has(seq, Entry("res", b))}
 
-\* The leader holds its lease, applied the first entry of its term, has no committed intent left to
-\* resolve, and answers its applied position.
-AnswerBarrier(s, r) ==
-    /\ asked[s][r]
+\* The leader gets the RPC: it applied the first entry of its term, checks its lease, and captures the
+\* committed index, which a follower that feeds a worker may have applied before it.
+LeaderGetsBarrier(s, r) ==
+    /\ asked[s][r] /\ cap[s][r] = None
     /\ ready[r] \/ Mutant = "new_leader_skips_term_entry"
-    /\ Mutant = "skip_intents" \/ OpenIntents(Prefix(log[r], lapp[r])) = {}
+    /\ cap' = [cap EXCEPT ![s][r] = [ci |-> Len(log[r]), lp |-> lapp[r], old |-> FALSE]]
+    /\ UNCHANGED <<wvars, fvars, wait, fly, bid, asked, replies, qvars, cvars>>
+
+Reply(s, r, pos) ==
     /\ asked' = [asked EXCEPT ![s][r] = FALSE]
-    /\ replies' = replies \cup {[s |-> s, r |-> r, id |-> bid[s][r], pos |-> lapp[r]]}
+    /\ cap' = [cap EXCEPT ![s][r] = None]
+    /\ replies' = replies \cup {[s |-> s, r |-> r, id |-> bid[s][r], pos |-> pos]}
+
+Enough(s, r, at) ==
+    /\ at >= cap[s][r].ci \/ Mutant \in {"prefix_applied_not_committed", "position_before_resolve", "new_leader_skips_term_entry"}
+    /\ Mutant = "skip_intents" \/ OpenIntents(Prefix(log[r], at)) = {}
+
+\* It waits until it applied that index and resolved every committed intent, and then reads and
+\* returns its applied position. Mutants: prefix_applied_not_committed does not wait,
+\* position_before_resolve returns the position of the capture, skip_intents.
+AnswerBarrier(s, r) ==
+    /\ asked[s][r] /\ cap[s][r] # None /\ ~cap[s][r].old
+    /\ Enough(s, r, lapp[r])
+    /\ Reply(s, r, IF Mutant = "position_before_resolve" THEN cap[s][r].lp ELSE lapp[r])
     /\ UNCHANGED <<wvars, fvars, wait, fly, bid, qvars, cvars>>
 
-\* A deposed leader gets the barrier. Its lease is over, so it refuses and the worker asks again.
-\* Mutant barrier_without_lease: it answers.
+\* A deposed leader. If its lease was good when it got the RPC, it may still answer from what it
+\* applied. If it got the RPC afterwards, it refuses, and the worker asks again.
+\* Mutant barrier_without_lease: it answers that too.
 OldLeaderAnswers(s, r) ==
     /\ asked[s][r] /\ old[r] # None
-    /\ asked' = [asked EXCEPT ![s][r] = FALSE]
-    /\ replies' = IF Mutant = "barrier_without_lease"
-                  THEN replies \cup {[s |-> s, r |-> r, id |-> bid[s][r], pos |-> old[r]]}
-                  ELSE replies
+    /\ \/ /\ cap[s][r] # None /\ cap[s][r].old /\ Enough(s, r, old[r])
+          /\ Reply(s, r, old[r])
+       \/ /\ IF cap[s][r] = None THEN TRUE ELSE cap[s][r].old
+          /\ IF Mutant = "barrier_without_lease" THEN Reply(s, r, old[r])
+             ELSE /\ asked' = [asked EXCEPT ![s][r] = FALSE]
+                  /\ cap' = [cap EXCEPT ![s][r] = None]
+                  /\ UNCHANGED replies
     /\ old' = [old EXCEPT ![r] = None]
     /\ UNCHANGED <<started, log, tail, lapp, ready, termAt, prepared, dec, acked,
                    fvars, wait, fly, bid, qvars, cvars>>
+
+\* A deposed leader that noticed drops the RPC it held.
+OldLeaderDrops(s, r) ==
+    /\ asked[s][r] /\ old[r] = None /\ cap[s][r] # None /\ cap[s][r].old
+    /\ asked' = [asked EXCEPT ![s][r] = FALSE]
+    /\ cap' = [cap EXCEPT ![s][r] = None]
+    /\ UNCHANGED <<wvars, fvars, wait, fly, bid, replies, qvars, cvars>>
 
 \* A reply counts only for the RPC it answers. Mutant uncorrelated_reply takes any.
 RecvReply ==
@@ -370,13 +419,14 @@ RecvReply ==
                                               THEN [qpos[q] EXCEPT ![p.r] = p.pos] ELSE qpos[q]]
                 /\ fly' = [fly EXCEPT ![p.s][p.r] = {}]
                 /\ asked' = [asked EXCEPT ![p.s][p.r] = FALSE]
-           ELSE UNCHANGED <<qpos, fly, asked>>
-    /\ UNCHANGED <<wvars, fvars, wait, bid, qst, qw, qneed, qres, cvars>>
+                /\ cap' = [cap EXCEPT ![p.s][p.r] = None]
+           ELSE UNCHANGED <<qpos, fly, asked, cap>>
+    /\ UNCHANGED <<wvars, fvars, wait, bid, qst, qw, qneed, qres, qat, qafter, cvars>>
 
 LoseReply ==
     /\ lost < MaxLost /\ lost' = lost + 1
     /\ \E p \in replies : replies' = replies \ {p}
-    /\ UNCHANGED <<wvars, fvars, wait, fly, bid, asked, qvars, elections, crashes, dups, purges>>
+    /\ UNCHANGED <<wvars, fvars, wait, fly, bid, asked, cap, qvars, elections, crashes, dups, purges>>
 
 \* The worker reached the barrier's position. Mutant serve_before_catchup does not wait.
 \* Mutant expose_prepared shows rows of an undecided batch.
@@ -389,12 +439,19 @@ ServeRange(q, r) ==
                  Visible(data[s][r]) \cup
                  (IF Mutant = "expose_prepared"
                   THEN {b \in Batches : Has(data[s][r], Entry("prep", b))} ELSE {})]
-    /\ UNCHANGED <<wvars, fvars, bvars, qst, qw, qneed, qpos, cvars>>
+    /\ qat' = [qat EXCEPT ![q][r] = wpos[s][r]]
+    /\ UNCHANGED <<wvars, fvars, bvars, qst, qw, qneed, qpos, qafter, cvars>>
 
 FinishQuery(q) ==
     /\ qst[q] = "run" /\ \A r \in Ranges : qres[q][r] # None
     /\ qst' = [qst EXCEPT ![q] = "done"]
-    /\ UNCHANGED <<wvars, fvars, bvars, qw, qneed, qpos, qres, cvars>>
+    /\ UNCHANGED <<wvars, fvars, bvars, qw, qneed, qpos, qres, qat, qafter, cvars>>
+
+\* The run is over, or a worker used up the barrier RPCs it may send.
+Terminated ==
+    /\ \/ \A q \in Queries : qst[q] = "done"
+       \/ \E s \in Workers, r \in Ranges : bid[s][r] = MaxBarriers
+    /\ UNCHANGED vars
 
 -----------------------------------------------------------------------------
 
@@ -406,8 +463,9 @@ Next ==
     \/ \E b \in Batches : Decide(b) \/ AckBatch(b)
     \/ \E s \in Workers, r \in Ranges :
         \/ SendPage(s, r) \/ StartInstall(s, r) \/ FinishInstall(s, r)
-        \/ SendBarrier(s, r) \/ RetryBarrier(s, r) \/ SpuriousRetry(s, r) \/ AnswerBarrier(s, r)
-        \/ OldLeaderAnswers(s, r)
+        \/ SendBarrier(s, r) \/ RetryBarrier(s, r) \/ SpuriousRetry(s, r)
+        \/ LeaderGetsBarrier(s, r) \/ AnswerBarrier(s, r)
+        \/ OldLeaderAnswers(s, r) \/ OldLeaderDrops(s, r)
     \/ RecvPage \/ DupPage \/ LosePage
     \/ \E s \in Workers : CrashWorker(s)
     \/ \E q \in Queries :
@@ -415,6 +473,7 @@ Next ==
         \/ \E r \in Ranges : JoinBarrier(q, r) \/ ServeRange(q, r)
         \/ FinishQuery(q)
     \/ RecvReply \/ LoseReply
+    \/ Terminated
 
 \* OLTP mechanisms: client retry, Raft replication and heartbeats, the apply loop, the transaction
 \* coordinator and its resolver.
@@ -430,7 +489,9 @@ OltpFairness ==
 SearchFairness ==
     /\ \A s \in Workers, r \in Ranges :
         /\ WF_vars(SendPage(s, r)) /\ WF_vars(StartInstall(s, r)) /\ WF_vars(FinishInstall(s, r))
-        /\ WF_vars(SendBarrier(s, r)) /\ WF_vars(RetryBarrier(s, r)) /\ WF_vars(AnswerBarrier(s, r))
+        /\ WF_vars(SendBarrier(s, r)) /\ WF_vars(RetryBarrier(s, r))
+        /\ WF_vars(LeaderGetsBarrier(s, r)) /\ WF_vars(AnswerBarrier(s, r))
+        /\ WF_vars(OldLeaderAnswers(s, r)) /\ WF_vars(OldLeaderDrops(s, r))
     /\ WF_vars(RecvPage) /\ WF_vars(RecvReply)
     /\ \A q \in Queries :
         /\ \A r \in Ranges : WF_vars(JoinBarrier(q, r)) /\ WF_vars(ServeRange(q, r))
@@ -453,10 +514,15 @@ LatestRealTime ==
                     => e.w \in qres[q][r]
             /\ \A e \in qneed[q] : e.k = "del" => e.w \notin qres[q][r]
 
-\* VEC-G03: what a range returned is what some committed prefix of it contains.
+\* VEC-G01: a query that began after another one finished reads no earlier position of a range.
+MonotoneLatest ==
+    \A q \in Queries, r \in Ranges : \A x \in qafter[q] :
+        qat[q][r] # None /\ qat[x][r] # None => qat[q][r] >= qat[x][r]
+
+\* VEC-G03: what a range returned is the committed prefix at its read point.
 NoInvisibleRow ==
     \A q \in Queries, r \in Ranges :
-        qres[q][r] # None => \E n \in 0..Len(log[r]) : qres[q][r] = Visible(Prefix(log[r], n))
+        qres[q][r] # None => qat[q][r] <= Len(log[r]) /\ qres[q][r] = Visible(Prefix(log[r], qat[q][r]))
 
 \* VEC-G06: with no help from search, every single-row write is acknowledged.
 CommitIndependent == \A w \in Singles : <>(Put(w) \in acked)

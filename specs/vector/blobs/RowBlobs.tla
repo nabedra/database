@@ -4,12 +4,15 @@
 (*                                                                         *)
 (* One key of one range. A row version names the vector version it uses,   *)
 (* so a metadata update does not rewrite the vector. MVCC collection runs  *)
-(* in two steps, find and remove. A copy to another group (split child,    *)
-(* replica snapshot, backup or restore) reads rows and vectors in          *)
-(* different steps while collection runs. The pending embedding record     *)
-(* travels with the row.                                                   *)
+(* in two steps, find and remove. A cross-range transaction stages its     *)
+(* vector under the transaction before it has a commit timestamp. A copy   *)
+(* at a cut (split child, backup, restore) reads rows and vectors in       *)
+(* different steps while collection runs, and while writes go on unless it *)
+(* is a split. Activation derives the pending embedding record. A replica  *)
+(* snapshot is one engine snapshot, so it is one step and not modelled.    *)
 (*                                                                         *)
-(* Property: VEC-G10 (NoDanglingBlob, CopyComplete, CopyKeepsPending).     *)
+(* Property: VEC-G10 (NoDanglingBlob, CopyExact, CopyComplete,             *)
+(* CopyKeepsPending).                                                      *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -17,84 +20,96 @@ CONSTANTS MaxWrites, MaxCopies, MaxCrashes, None, Mutant
 
 VARIABLES
     ts,         \* the last commit timestamp
-    rows,       \* row versions [ts, del, ref]; ref is a vector version or 0
+    rows,       \* row versions [ts, del, txt, ref]; txt: it has a source text, ref: vector version or 0
+    hist,       \* every row version ever written, for the properties
     blobs,      \* vector versions present
-    pend,       \* a pending embedding record exists for the newest version
-    upd,        \* a metadata update that read the newest version [ts, ref], or None
+    staged,     \* "none", "staged" or "lost": the vector of an open transaction
+    upd,        \* a metadata update that read the newest version [ts, ref, txt], or None
     safe,       \* the collection safe point
     cand,       \* vector versions that a collection scan found unreferenced
-    copy,       \* [st, pin, rows, blobs, pend]; st: "idle", "rows", "blobs", "active"
+    copy,       \* [st, split, cut, rows, blobs, pend]; st: "idle", "rows", "blobs", "active"
     copies, crashes
 
-vars == <<ts, rows, blobs, pend, upd, safe, cand, copy, copies, crashes>>
+vars == <<ts, rows, hist, blobs, staged, upd, safe, cand, copy, copies, crashes>>
 
 Newest(R) == CHOOSE r \in R : \A x \in R : x.ts <= r.ts
-Idle == [st |-> "idle", pin |-> 0, rows |-> {}, blobs |-> {}, pend |-> FALSE, want |-> FALSE]
+\* What a copy at the cut must hold: the newest version at or below it, unless that is a delete.
+At(R, c) == LET S == {r \in R : r.ts <= c} IN IF S = {} \/ Newest(S).del THEN {} ELSE {Newest(S)}
+NeedsVector(R) == \E r \in R : r.txt /\ r.ref = 0
+Idle == [st |-> "idle", split |-> FALSE, cut |-> 0, rows |-> {}, blobs |-> {}, pend |-> FALSE]
 Copying == copy.st \in {"rows", "blobs"}
 
 TypeOK ==
-    /\ ts \in 0..MaxWrites /\ safe \in 0..ts
-    /\ blobs \subseteq 1..MaxWrites
-    /\ \A r \in rows : r.ts \in 1..MaxWrites /\ r.ref \in 0..MaxWrites
+    /\ ts \in 0..MaxWrites /\ safe \in 0..ts /\ staged \in {"none", "staged", "lost"}
+    /\ blobs \subseteq 1..MaxWrites /\ rows \subseteq hist
     /\ copies \in 0..MaxCopies /\ crashes \in 0..MaxCrashes
 
 Init ==
-    /\ ts = 0 /\ rows = {} /\ blobs = {} /\ pend = FALSE /\ upd = None /\ safe = 0 /\ cand = {}
+    /\ ts = 0 /\ rows = {} /\ hist = {} /\ blobs = {} /\ staged = "none" /\ upd = None /\ safe = 0 /\ cand = {}
     /\ copy = Idle /\ copies = 0 /\ crashes = 0
 
-\* Writes stop while a split copies the range. Replica snapshots and backups copy under a pin, which
-\* is the same for collection.
-CanWrite == ts < MaxWrites /\ ~Copying
+\* Only a split freezes the range.
+CanWrite == ts < MaxWrites /\ ~(Copying /\ copy.split)
 
+Put(r) == rows' = rows \cup {r} /\ hist' = hist \cup {r} /\ ts' = r.ts
+
+\* A row with its vector, a background SetVector included.
 PutVector ==
-    /\ CanWrite /\ ts' = ts + 1
-    /\ rows' = rows \cup {[ts |-> ts + 1, del |-> FALSE, ref |-> ts + 1]}
-    /\ blobs' = blobs \cup {ts + 1} /\ pend' = FALSE
-    /\ UNCHANGED <<upd, safe, cand, copy, copies, crashes>>
+    /\ CanWrite /\ Put([ts |-> ts + 1, del |-> FALSE, txt |-> TRUE, ref |-> ts + 1])
+    /\ blobs' = blobs \cup {ts + 1}
+    /\ UNCHANGED <<staged, upd, safe, cand, copy, copies, crashes>>
 
 \* A row with text only: its vector is pending.
 PutText ==
-    /\ CanWrite /\ ts' = ts + 1
-    /\ rows' = rows \cup {[ts |-> ts + 1, del |-> FALSE, ref |-> 0]}
-    /\ pend' = TRUE
-    /\ UNCHANGED <<blobs, upd, safe, cand, copy, copies, crashes>>
+    /\ CanWrite /\ Put([ts |-> ts + 1, del |-> FALSE, txt |-> TRUE, ref |-> 0])
+    /\ UNCHANGED <<blobs, staged, upd, safe, cand, copy, copies, crashes>>
 
 Delete ==
-    /\ CanWrite /\ rows # {} /\ ~Newest(rows).del /\ ts' = ts + 1
-    /\ rows' = rows \cup {[ts |-> ts + 1, del |-> TRUE, ref |-> 0]}
-    /\ pend' = FALSE
-    /\ UNCHANGED <<blobs, upd, safe, cand, copy, copies, crashes>>
+    /\ CanWrite /\ rows # {} /\ ~Newest(rows).del
+    /\ Put([ts |-> ts + 1, del |-> TRUE, txt |-> FALSE, ref |-> 0])
+    /\ UNCHANGED <<blobs, staged, upd, safe, cand, copy, copies, crashes>>
 
 ReadForUpdate ==
     /\ upd = None /\ rows # {} /\ ~Newest(rows).del
-    /\ upd' = [ts |-> Newest(rows).ts, ref |-> Newest(rows).ref]
-    /\ UNCHANGED <<ts, rows, blobs, pend, safe, cand, copy, copies, crashes>>
+    /\ upd' = [ts |-> Newest(rows).ts, ref |-> Newest(rows).ref, txt |-> Newest(rows).txt]
+    /\ UNCHANGED <<ts, rows, hist, blobs, staged, safe, cand, copy, copies, crashes>>
 
 \* The commit carries the version it read. Mutant no_expected_version applies it anyway.
 ApplyUpdate ==
     /\ upd # None /\ upd' = None
     /\ IF CanWrite /\ rows # {} /\ (Newest(rows).ts = upd.ts \/ Mutant = "no_expected_version")
-       THEN /\ ts' = ts + 1
-            /\ rows' = rows \cup {[ts |-> ts + 1, del |-> FALSE, ref |-> upd.ref]}
-       ELSE UNCHANGED <<ts, rows>>
-    /\ UNCHANGED <<blobs, pend, safe, cand, copy, copies, crashes>>
+       THEN Put([ts |-> ts + 1, del |-> FALSE, txt |-> upd.txt, ref |-> upd.ref])
+       ELSE UNCHANGED <<ts, rows, hist>>
+    /\ UNCHANGED <<blobs, staged, safe, cand, copy, copies, crashes>>
+
+\* Prepare stages the vector under the transaction, Resolve gives it the commit timestamp.
+Prepare ==
+    /\ staged = "none" /\ CanWrite /\ staged' = "staged"
+    /\ UNCHANGED <<ts, rows, hist, blobs, upd, safe, cand, copy, copies, crashes>>
+
+Resolve ==
+    /\ staged # "none" /\ CanWrite
+    /\ Put([ts |-> ts + 1, del |-> FALSE, txt |-> TRUE, ref |-> ts + 1])
+    /\ blobs' = IF staged = "staged" THEN blobs \cup {ts + 1} ELSE blobs
+    /\ staged' = "none"
+    /\ UNCHANGED <<upd, safe, cand, copy, copies, crashes>>
 
 -----------------------------------------------------------------------------
 (* Collection.                                                             *)
 
-\* A copy pins the safe point. Mutant copy_unpinned does not.
+\* A copy pins the safe point at its cut. Mutant copy_unpinned does not.
 AdvanceSafe ==
-    /\ safe < ts /\ (~Copying \/ Mutant = "copy_unpinned")
+    /\ safe < ts /\ (~Copying \/ safe < copy.cut \/ Mutant = "copy_unpinned")
     /\ safe' = safe + 1
-    /\ UNCHANGED <<ts, rows, blobs, pend, upd, cand, copy, copies, crashes>>
+    /\ UNCHANGED <<ts, rows, hist, blobs, staged, upd, cand, copy, copies, crashes>>
 
-\* The newest version at or below the safe point stays, unless it is a delete.
+\* A version goes when a newer one is at or below the safe point.
 CollectRow ==
     /\ \E r \in rows :
         /\ r.ts <= safe
         /\ \E x \in rows : x.ts > r.ts /\ x.ts <= safe
         /\ rows' = rows \ {r}
-    /\ UNCHANGED <<ts, blobs, pend, upd, safe, cand, copy, copies, crashes>>
+    /\ UNCHANGED <<ts, hist, blobs, staged, upd, safe, cand, copy, copies, crashes>>
 
 \* Mutant gc_ignores_reference takes any vector older than the safe point and the newest row.
 Referenced(b) == \E r \in rows : r.ref = b
@@ -102,62 +117,74 @@ FindBlob(b) ==
     /\ b \in blobs /\ b \notin cand
     /\ IF Mutant = "gc_ignores_reference" THEN b < safe /\ b # Newest(rows).ts ELSE ~Referenced(b)
     /\ cand' = cand \cup {b}
-    /\ UNCHANGED <<ts, rows, blobs, pend, upd, safe, copy, copies, crashes>>
+    /\ UNCHANGED <<ts, rows, hist, blobs, staged, upd, safe, copy, copies, crashes>>
 
 \* Found earlier, removed now, with no second look: an unreferenced vector can gain no reference.
+\* Mutant gc_takes_staged also takes the vector of an open transaction.
 RemoveBlob(b) ==
     /\ b \in cand
     /\ cand' = cand \ {b} /\ blobs' = blobs \ {b}
-    /\ UNCHANGED <<ts, rows, pend, upd, safe, copy, copies, crashes>>
+    /\ staged' = IF Mutant = "gc_takes_staged" /\ staged = "staged" THEN "lost" ELSE staged
+    /\ UNCHANGED <<ts, rows, hist, upd, safe, copy, copies, crashes>>
 
 -----------------------------------------------------------------------------
-(* Copies.                                                                 *)
+(* Copies at a cut.                                                        *)
 
-StartCopy ==
-    /\ copy.st = "idle" /\ copies < MaxCopies /\ copies' = copies + 1
-    /\ copy' = [Idle EXCEPT !.st = "rows", !.want = pend, !.pin = safe]
-    /\ UNCHANGED <<ts, rows, blobs, pend, upd, safe, cand, crashes>>
+\* A split freezes the range, and its freeze refuses while a transaction is open in it.
+StartCopy(split) ==
+    /\ copy.st \in {"idle", "active"} /\ copies < MaxCopies /\ copies' = copies + 1
+    /\ split => staged = "none"
+    /\ copy' = [Idle EXCEPT !.st = "rows", !.split = split, !.cut = ts]
+    /\ UNCHANGED <<ts, rows, hist, blobs, staged, upd, safe, cand, crashes>>
 
-\* The copy takes the versions that a reader at or above its pin can need. Mutant
-\* prefix_copy_takes_collectable takes every version that is still there, also one that was already
-\* collectable when the pin was taken. Mutant prefix_copy_without_pending knows rows and vectors only.
-Needed(r) == ~\E x \in rows : x.ts > r.ts /\ x.ts <= copy.pin
+\* The newest version at or below the cut. Mutants: prefix_copy_takes_collectable takes every version
+\* that is still there, copy_drops_row takes none.
 CopyRows ==
     /\ copy.st = "rows"
     /\ copy' = [copy EXCEPT !.st = "blobs",
-                            !.rows = {r \in rows : Needed(r) \/ Mutant = "prefix_copy_takes_collectable"},
-                            !.pend = pend /\ Mutant # "prefix_copy_without_pending"]
-    /\ UNCHANGED <<ts, rows, blobs, pend, upd, safe, cand, copies, crashes>>
+                  !.rows = CASE Mutant = "prefix_copy_takes_collectable" -> {r \in rows : r.ts <= copy.cut}
+                             [] Mutant = "copy_drops_row" -> {}
+                             [] OTHER -> At(rows, copy.cut)]
+    /\ UNCHANGED <<ts, rows, hist, blobs, staged, upd, safe, cand, copies, crashes>>
 
-\* Mutant split_drops_blobs copies no vectors.
+\* The vectors, then activation, which derives the pending record from the copied row.
+\* Mutants: split_drops_blobs copies no vectors, prefix_copy_without_pending derives nothing.
 CopyBlobs ==
     /\ copy.st = "blobs"
     /\ copy' = [copy EXCEPT !.st = "active",
                   !.blobs = IF Mutant = "split_drops_blobs" THEN {}
-                            ELSE {b \in blobs : \E r \in copy.rows : r.ref = b}]
-    /\ UNCHANGED <<ts, rows, blobs, pend, upd, safe, cand, copies, crashes>>
+                            ELSE {b \in blobs : \E r \in copy.rows : r.ref = b},
+                  !.pend = NeedsVector(copy.rows) /\ Mutant # "prefix_copy_without_pending"]
+    /\ UNCHANGED <<ts, rows, hist, blobs, staged, upd, safe, cand, copies, crashes>>
 
 \* A crash drops an unfinished copy and its staged data.
 CrashCopy ==
     /\ Copying /\ crashes < MaxCrashes /\ crashes' = crashes + 1
     /\ copy' = Idle
-    /\ UNCHANGED <<ts, rows, blobs, pend, upd, safe, cand, copies>>
+    /\ UNCHANGED <<ts, rows, hist, blobs, staged, upd, safe, cand, copies>>
+
+Terminated == ts = MaxWrites /\ ~Copying /\ UNCHANGED vars
 
 Next ==
-    \/ PutVector \/ PutText \/ Delete \/ ReadForUpdate \/ ApplyUpdate \/ AdvanceSafe
-    \/ CollectRow
+    \/ PutVector \/ PutText \/ Delete \/ ReadForUpdate \/ ApplyUpdate \/ Prepare \/ Resolve
+    \/ AdvanceSafe \/ CollectRow
     \/ \E b \in 1..MaxWrites : FindBlob(b) \/ RemoveBlob(b)
-    \/ StartCopy \/ CopyRows \/ CopyBlobs \/ CrashCopy
+    \/ \E split \in BOOLEAN : StartCopy(split)
+    \/ CopyRows \/ CopyBlobs \/ CrashCopy
+    \/ Terminated
 
 Spec == Init /\ [][Next]_vars
 
 \* VEC-G10: every retained row version has its vector.
 NoDanglingBlob == \A r \in rows : r.ref # 0 => r.ref \in blobs
 
-\* VEC-G10: and so does every copy that is in use.
+\* VEC-G10: an active copy holds exactly the rows of its cut.
+CopyExact == copy.st = "active" => copy.rows = At(hist, copy.cut)
+
+\* VEC-G10: with their vectors.
 CopyComplete == copy.st = "active" => \A r \in copy.rows : r.ref # 0 => r.ref \in copy.blobs
 
-\* VEC-G10, VEC-G07: a copy keeps the pending embedding record.
-CopyKeepsPending == copy.st = "active" => copy.pend = copy.want
+\* VEC-G10, VEC-G07: and a pending record if the row lacks its vector.
+CopyKeepsPending == copy.st = "active" => (copy.pend <=> NeedsVector(copy.rows))
 
 =============================================================================

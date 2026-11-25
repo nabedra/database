@@ -204,6 +204,7 @@ prove the pipeline end to end.
 | vector | `vector/latest/SearchLatest.tla` | VEC-G01, VEC-G03, VEC-G06 | `vector-latest` | [vector plan](../plans/oltp-vector.md) |
 | vector | `vector/snapshot/SearchSnapshot.tla` | VEC-G02 | `vector-snapshot` | [vector plan](../plans/oltp-vector.md) |
 | vector | `vector/route/SearchRoute.tla` | VEC-G01, VEC-G02, VEC-G04 | `vector-route` | [vector plan](../plans/oltp-vector.md) |
+| vector | `vector/assign/SearchAssign.tla` | VEC-G01, VEC-G04, VEC-G08 | `vector-assign` | [vector plan](../plans/oltp-vector.md) |
 | vector | `vector/index/LocalIndex.tla` | VEC-G03, VEC-G05, VEC-G10 | `vector-index` | [vector plan](../plans/oltp-vector.md) |
 | vector | `vector/embed/EmbedApply.tla` | VEC-G07 | `vector-embed` | [vector plan](../plans/oltp-vector.md) |
 | vector | `vector/lifecycle/IndexLifecycle.tla` | VEC-G08 | `vector-lifecycle` | [vector plan](../plans/oltp-vector.md) |
