@@ -1622,8 +1622,9 @@ class FoolTest(HarnessCase):
         cargo = self.root / "fake_cargo.py"
         cargo.write_text(FAKE_CARGO)
         with patch.dict(os.environ, env), FAKE_KEPT:
-            return self.f.run("verify", "--cargo", f"{sys.executable} {cargo}",
-                              "--target-dir", str(self.root / "target"), *argv)
+            # Python 3.11's argparse takes positional arguments before the options only.
+            return self.f.run("verify", *argv, "--cargo", f"{sys.executable} {cargo}",
+                              "--target-dir", str(self.root / "target"))
 
     def test_verify_builds_the_probe_on_both_sides(self):
         self.probe_row()
