@@ -1,0 +1,19 @@
+id = "p11-probe-wipe"
+module = "oltp"
+kinds = ["S"]
+guarantees = ["OLTP-G08"]
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+"${build[@]}" --no-run
+status=0
+timeout 2400s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1 || status=$?
+grep -E '"(seed|trace_hash|trace_events|virtual_ms)":' $(find .. -name sweep-report.json -path "*p11-probe-wipe*" | head -1) | paste - - - - || true
+exit $status
+''']
+cwd = "server"
+timeout_s = 5400
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "membership", NABEDRA_SEEDS = "24", NABEDRA_SIM_JOBS = "2", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "p11-probe-wipe", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/p11-probe-wipe", NABEDRA_SIM_MEMBERSHIP = "wipe", NABEDRA_SIM_PROFILE = "none" }

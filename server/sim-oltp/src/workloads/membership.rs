@@ -237,6 +237,40 @@ pub(crate) struct Membership {
     next_key: i64,
     notes: BTreeMap<&'static str, u64>,
     defect: Option<Defect>,
+    probes: ProbeState,
+}
+
+/// The probe form of `WipedNeverVotes`: the rule and the generation each node runs on.
+type ProbeState = Arc<Mutex<(WipedNeverVotes, BTreeMap<u64, u64>)>>;
+
+fn install_probes(cluster: &Cluster, state: &ProbeState) {
+    use nabedra_oltp_types::sim_probe::{Probe, ProbeSink};
+    let state = Arc::downgrade(state);
+    let world = Arc::downgrade(&cluster.world);
+    let checks = cluster.checks.clone();
+    ProbeSink::new(move |probe| {
+        let (Some(state), Some(world)) = (state.upgrade(), world.upgrade()) else {
+            return;
+        };
+        let Some(node) = nabedra_rt::sim::current_node() else {
+            return;
+        };
+        let mut state = state.lock().unwrap();
+        let generation = state.1.get(&node).copied().unwrap_or(0);
+        let (group, replica, what) = match &probe {
+            Probe::VoteSaved { group, replica, term, leader, committed, .. } => {
+                (*group, *replica, format!("vote for {leader} in term {term} committed {committed}"))
+            }
+            Probe::Appended { group, replica, entries, .. } if !entries.is_empty() => {
+                (*group, *replica, "append".to_owned())
+            }
+            _ => return,
+        };
+        if let Err(detail) = state.0.voted(group, replica, generation) {
+            checks.violate(&world, "WipedNeverVotes", format!("n{node} {what}: {detail}"));
+        }
+    })
+    .install(&cluster.world);
 }
 
 impl Membership {
@@ -264,6 +298,7 @@ impl Membership {
             next_key: QUEUED_BASE,
             notes: BTreeMap::new(),
             defect: Defect::from_env(),
+            probes: ProbeState::default(),
         }
     }
 
@@ -271,6 +306,7 @@ impl Membership {
     /// before every voter ran.
     pub(crate) async fn start(&mut self, cluster: &mut Cluster) -> Result<(), String> {
         cluster.split_volumes();
+        install_probes(cluster, &self.probes);
         let delays = self.delays;
         let capability = &mut self.capability;
         let mut early = 0;
@@ -1500,6 +1536,7 @@ impl Membership {
         }
         self.expected_exit.insert(node);
         *self.generations.entry(node).or_default() += 1;
+        *self.probes.lock().unwrap().1.entry(node).or_default() += 1;
         let started = cluster
             .restart_same_identity(node, how, Disk::Empty(kind, marker), REFUSAL_WATCH)
             .await?;
