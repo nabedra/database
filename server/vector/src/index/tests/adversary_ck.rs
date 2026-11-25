@@ -488,3 +488,24 @@ fn adv10_every_error_of_every_call_of_a_drop_and_a_resync() {
         }
     }
 }
+
+/// A checkpoint that reports success survives a power loss, also when its directory and the ones
+/// above it were made by this very call.
+#[test]
+fn adv10_an_installed_checkpoint_in_new_directories_survives_a_power_loss() {
+    for (name, deep) in [("one new level", "/data/ck"), ("three new levels", "/a/b/c/ck")] {
+        let fs = FaultFs::new();
+        if name == "one new level" {
+            fs.create_dir_all_durable(Path::new("/data"));
+        }
+        let store = Store::new(Arc::new(fs.clone()), deep);
+        let mut ix = serving(cfg(), ExactCodec, Some(store.clone()));
+        advance(&mut ix, RANGE, 12);
+        ix.checkpoint().unwrap();
+        for after in [fs.crash(), fs.power_loss(1), fs.power_loss(2), fs.power_loss(3)] {
+            let (back, damage) = Index::recover(cfg(), ExactCodec, Store::new(Arc::new(after), deep)).unwrap();
+            assert_eq!(damage, [], "{name}");
+            assert_eq!(back.status(RANGE).map(|s| s.applied), Ok(12), "{name}: a checkpoint that was reported installed is gone");
+        }
+    }
+}

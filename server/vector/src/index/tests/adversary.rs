@@ -242,6 +242,8 @@ fn adv07_approximate_search_returns_limit_rows_for_every_predicate() {
                         let mut scan = ix.scan(&pin, &q, Box::new(RecallEstimate)).unwrap();
                         while ix.visit(&mut scan).unwrap() {}
                         streamed += usize::from(scan.visited > 0);
+                        // Never post-filter: no row that fails the predicate is even scored.
+                        assert!(scan.seen.len() <= matching.len(), "{name} m={m}: {} rows scored, {} match", scan.seen.len(), matching.len());
                         let hits = ix.finish(scan).unwrap();
                         let want = matching.len().min(limit);
                         assert_eq!(hits.len(), want, "{name} m={m} {op:?} recall {recall} pairs {summary_pairs}: {} match", matching.len());
@@ -549,5 +551,208 @@ fn adv07_queues_of_one_make_progress() {
         let sh = &ix.shared;
         assert!(sh.queues.iter().all(|q| q.is_empty()) && sh.inbox.is_empty());
         println!("shards {shards} queue {queue}: {} rows, {} partitions", hits.len(), sh.dir.len());
+    }
+}
+
+/// The summary of a column with more values than it counts (4,194,304 pairs) never rules out a
+/// partition that holds a match, before, at and after the limit, and keeps estimating.
+#[test]
+fn adv07_a_summary_past_its_counting_limit_still_never_rules_out_a_match() {
+    use super::super::filter::Summary;
+    const LIMIT: usize = 1 << 22;
+    let mut s = Summary::new(1, LIMIT);
+    let part = |i: usize| PartId((i % 3) as u32);
+    for i in 0..LIMIT + 8 {
+        s.add(part(i), &[Value::Int(i as i64)]);
+        if i + 1 >= LIMIT - 2 {
+            for probe in [i, i - 1, 0, LIMIT / 2] {
+                let f = Filter::Eq(0, Value::Int(probe as i64));
+                assert!(s.may_match(&f, part(probe)), "after {} pairs: {probe} is ruled out", i + 1);
+                assert!(s.estimate(&f) >= 1.0, "after {} pairs: {probe} is estimated at {}", i + 1, s.estimate(&f));
+            }
+        }
+    }
+    // Rows leave again: still no false negative, and a value that is gone may be claimed.
+    for i in 0..LIMIT / 2 {
+        s.remove(part(i), &[Value::Int(i as i64)]);
+    }
+    let f = Filter::Eq(0, Value::Int(LIMIT as i64 + 3));
+    assert!(s.may_match(&f, part(LIMIT + 3)));
+}
+
+/// Pruning by the codes' error bound loses nothing at the largest dimension, where f32 sums of
+/// same-signed terms drift most.
+#[test]
+fn adv05_the_error_bound_holds_at_4096_dimensions() {
+    struct Never;
+    impl StopRule for Never {
+        fn enough(&mut self, _: &Progress<'_>) -> bool {
+            false
+        }
+    }
+    let dim = 4096;
+    let g = &mut Gen::from_seed(3);
+    let cfg = Config { flat: 0, part_min: 4, part_max: 16, ..Config::new(schema(dim, &[], None), 2) };
+    let mut ix = serving(cfg, ExactCodec, None);
+    // Positive, nearly equal components: every partial sum is large and rounds.
+    let vec = |g: &mut Gen, spread: u64| -> Vec<f32> { (0..dim).map(|_| 1.0 + g.below(spread) as f32 / 1000.0).collect() };
+    let rows: Vec<Vec<f32>> = (0..120).map(|_| { let s = 1 + g.below(300); vec(g, s) }).collect();
+    let changes = rows.iter().enumerate().map(|(k, v)| (k as u64, Some(row(v, Vec::new(), k as u64)))).collect();
+    feed(&mut ix, RANGE, &page(0, changes));
+    settle(&mut ix);
+    let pin = latest(&mut ix, None);
+    for op in [Op::Cosine, Op::Dot, Op::L2] {
+        for _ in 0..4 {
+            let q = vec(g, 400);
+            let want = ix.search(&pin, &query(op, &q, 5)).unwrap();
+            let approx = Query { exact: false, ..query(op, &q, 5) };
+            let mut scan = ix.scan(&pin, &approx, Box::new(Never)).unwrap();
+            while ix.visit(&mut scan).unwrap() {}
+            let got = ix.finish(scan).unwrap();
+            let keys = |h: &[Hit]| h.iter().map(|h| (h.key.clone(), h.score)).collect::<Vec<_>>();
+            assert_eq!(keys(&got), keys(&want), "{op:?}: pruning lost a row at {dim} dimensions");
+        }
+    }
+}
+
+/// Directions that differ by less than what an f32 cosine resolves (about 3.5e-4 rad near 1) still
+/// prune right: a query that equals a stored vector finds it, whatever the partitions look like.
+#[test]
+fn adv07_pruning_by_radius_survives_float_error_in_tight_clusters() {
+    struct Never;
+    impl StopRule for Never {
+        fn enough(&mut self, _: &Progress<'_>) -> bool {
+            false
+        }
+    }
+    let mut lost = Vec::new();
+    for seed in 0..40u64 {
+        let g = &mut Gen::from_seed(seed);
+        let cfg = Config { flat: 0, part_min: 4, part_max: 16, ..Config::new(schema(3, &[], None), 2) };
+        let mut ix = serving(cfg, ExactCodec, None);
+        let len = *g.pick(&[1.0f32, 1e3, 1e5]);
+        let spread = *g.pick(&[2e-5f32, 1e-4, 5e-4, 2e-3]);
+        let centres = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.6, 0.0, 0.8]];
+        let rows: Vec<Vec<f32>> = (0..400)
+            .map(|_| {
+                let c = g.pick(&centres);
+                let d: Vec<f32> = (0..3).map(|i| c[i] + (g.below(2001) as f32 / 1000.0 - 1.0) * spread).collect();
+                let n = d.iter().map(|x| x * x).sum::<f32>().sqrt();
+                d.iter().map(|x| x / n * len).collect()
+            })
+            .collect();
+        let changes = rows.iter().enumerate().map(|(k, v)| (k as u64, Some(row(v, Vec::new(), k as u64)))).collect();
+        feed(&mut ix, RANGE, &page(0, changes));
+        // Clusters this tight may not split (another test); the index is read as it is.
+        settles(&mut ix, 300);
+        let pin = latest(&mut ix, None);
+        for op in [Op::L2, Op::Dot, Op::Cosine] {
+            for _ in 0..10 {
+                let q = g.pick(&rows).clone();
+                let want = ix.search(&pin, &query(op, &q, 3)).unwrap();
+                let approx = Query { exact: false, ..query(op, &q, 3) };
+                let mut scan = ix.scan(&pin, &approx, Box::new(Never)).unwrap();
+                while ix.visit(&mut scan).unwrap() {}
+                let got = ix.finish(scan).unwrap();
+                let keys = |h: &[Hit]| h.iter().map(|h| (h.key.clone(), h.score)).collect::<Vec<_>>();
+                if keys(&got) != keys(&want) {
+                    lost.push((seed, op, len, spread));
+                }
+            }
+        }
+    }
+    assert!(lost.is_empty(), "pruning lost rows in {} of 1200 queries, for example {:?}", lost.len(), &lost[..lost.len().min(5)]);
+}
+
+/// Rows that differ, but by less than an f32 cosine resolves, split like any others: maintenance
+/// ends with partitions of at most  rows.
+#[test]
+fn adv07_near_duplicates_closer_than_f32_resolves_split_too() {
+    let g = &mut Gen::from_seed(9);
+    let mut ix = serving(Config::new(schema(8, &[], None), 2), ExactCodec, None);
+    let base = [0.3f32, -0.2, 0.5, 0.1, 0.7, -0.4, 0.2, 0.6];
+    let changes: Vec<_> = (0..2000u64)
+        .map(|k| {
+            let v: Vec<f32> = base.iter().map(|x| x + (g.below(2001) as f32 / 1000.0 - 1.0) * 1e-5).collect();
+            (k, Some(row(&v, Vec::new(), k)))
+        })
+        .collect();
+    feed(&mut ix, RANGE, &page(0, changes));
+    let ended = settles(&mut ix, 3000);
+    let biggest = ix.shared.dir.values().map(|m| m.entries).max().unwrap_or(0);
+    println!("ended {ended}, {} partitions, {} ids, biggest {biggest}", ix.shared.dir.len(), ix.shared.next_part);
+    assert!(ended && biggest <= 512, "ended {ended}, biggest partition {biggest}");
+}
+
+/// With a stop rule that never stops, an approximate scan of zero, subnormal, huge and tiny vectors
+/// returns what the exact scan does, scores and ties included.
+#[test]
+fn adv07_pruning_is_right_for_zero_subnormal_and_huge_vectors() {
+    struct Never;
+    impl StopRule for Never {
+        fn enough(&mut self, _: &Progress<'_>) -> bool {
+            false
+        }
+    }
+    let dim = 4;
+    for seed in 0..400 {
+        let g = &mut Gen::from_seed(seed);
+        let cfg = Config { flat: 0, part_min: 2, part_max: 8, ..Config::new(schema(dim, &[], None), 2) };
+        let mut ix = serving(cfg, ExactCodec, None);
+        let n = 20 + g.below(80);
+        let vecs: Vec<Vec<f32>> = (0..n).map(|_| nasty(g, dim)).collect();
+        let changes = vecs.iter().enumerate().map(|(k, v)| (k as u64, Some(row(v, Vec::new(), k as u64)))).collect();
+        feed(&mut ix, RANGE, &page(0, changes));
+        for _ in 0..40 {
+            ix.maintain(4);
+            ix.run();
+        }
+        let pin = latest(&mut ix, None);
+        for op in [Op::Cosine, Op::Dot, Op::L2] {
+            let q = nasty(g, dim);
+            if op == Op::Cosine && q.iter().all(|x| *x == 0.0) {
+                continue;
+            }
+            let limit = 1 + g.below(10) as usize;
+            let want = ix.search(&pin, &query(op, &q, limit)).unwrap();
+            let approx = Query { exact: false, ..query(op, &q, limit) };
+            let mut scan = ix.scan(&pin, &approx, Box::new(Never)).unwrap();
+            while ix.visit(&mut scan).unwrap() {}
+            let got = ix.finish(scan).unwrap();
+            let scores = |h: &[Hit]| h.iter().map(|h| h.score).collect::<Vec<_>>();
+            // Rows that tie after the rounding to f32 may be pruned by their unrounded bound: see the other test.
+            assert_eq!(scores(&got), scores(&want), "seed {seed} {op:?} query {q:?}");
+        }
+    }
+}
+
+/// Merging only goes where there is room: with no new rows, no partition grows beyond `part_max`
+/// while the index shrinks and merges, step by step.
+#[test]
+fn adv07_a_merge_never_makes_a_partition_larger_than_part_max() {
+    for seed in 0..20 {
+        let g = &mut Gen::from_seed(seed);
+        let cfg = Config { part_min: 4, part_max: 12, queue: 8, ..Config::new(schema(3, &[], None), 2) };
+        let mut ix = serving(cfg, ExactCodec, None);
+        let n = 300u64;
+        let angle = |k: u64| k as f32 * 0.0211;
+        let writes = (0..n).map(|k| (k, Some(row(&[angle(k).cos(), angle(k).sin(), (k as f32 * 0.37).sin()], Vec::new(), k)))).collect();
+        feed(&mut ix, RANGE, &page(0, writes));
+        assert!(settles(&mut ix, 5000));
+        // Most rows go: partitions fall below `part_min` and want to merge.
+        let gone: Vec<_> = (0..n).filter(|k| k % 7 != 0 || g.below(3) == 0).map(|k| (k, None)).collect();
+        let at = ix.status(RANGE).unwrap().delivered;
+        feed(&mut ix, RANGE, &page(at, gone));
+        let applied = ix.status(RANGE).unwrap().applied;
+        ix.advance_low(RANGE, applied).unwrap();
+        for step in 0..3000 {
+            ix.run();
+            ix.maintain(1 + g.below(3) as usize);
+            if g.bool() {
+                ix.step(g.below(2) as usize);
+            }
+            let biggest = ix.shared.dir.values().map(|m| m.entries).max().unwrap_or(0);
+            assert!(biggest <= 12, "seed {seed} step {step}: a partition holds {biggest} entries, part_max is 12");
+        }
     }
 }

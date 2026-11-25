@@ -19,12 +19,15 @@ const DIR: &str = "/ck";
 enum Op {
     Up { key: u8, vec: [f32; 2], tenant: i64, tags: u8 },
     Del { key: u8 },
+    /// No later entry commits at or below this timestamp.
+    Closed(CommitTs),
 }
 
 impl Op {
-    fn key(&self) -> u8 {
+    fn key(&self) -> Option<u8> {
         match self {
-            Op::Up { key, .. } | Op::Del { key } => *key,
+            Op::Up { key, .. } | Op::Del { key } => Some(*key),
+            Op::Closed(_) => None,
         }
     }
 }
@@ -63,17 +66,20 @@ impl Feed {
                 cols: cols(*tenant, *tags),
                 image: Arc::new([range, pos as u8]),
             }),
-            Op::Del { .. } => None,
+            Op::Del { .. } | Op::Closed(_) => None,
         }
     }
 
     fn page(&self, range: u8, after: Pos, through: Pos) -> Page {
         let record = |at: Pos| Record {
             at,
-            change: Change::Row {
-                key: key_of(range, self.log[at as usize - 1].key()),
-                commit_ts: Feed::ts(at),
-                row: self.row(range, at),
+            change: match &self.log[at as usize - 1] {
+                Op::Closed(ts) => Change::Closed(*ts),
+                op => Change::Row {
+                    key: key_of(range, op.key().unwrap()),
+                    commit_ts: Feed::ts(at),
+                    row: self.row(range, at),
+                },
             },
         };
         Page { after, through, records: (after + 1..=through).map(record).collect() }
@@ -81,7 +87,17 @@ impl Feed {
 
     /// The positions whose rows are visible at `pos`.
     fn live(&self, pos: Pos) -> Vec<Pos> {
-        let last = |k: u8| (1..=pos).rev().find(|n| self.log[*n as usize - 1].key() == k);
+        let last = |k: u8| (1..=pos).rev().find(|n| self.log[*n as usize - 1].key() == Some(k));
+        (0..4).filter_map(last).filter(|n| matches!(self.log[*n as usize - 1], Op::Up { .. })).collect()
+    }
+
+    /// The rows of a snapshot cut, from the whole log: the newest entry of a key that commits at or below
+    /// the cut. `Closed` promises that nothing later commits there, so the cut does not depend on what was
+    /// applied so far.
+    fn live_cut(&self, cut: CommitTs) -> Vec<Pos> {
+        let last = |k: u8| {
+            (1..=self.log.len() as Pos).rev().find(|n| self.log[*n as usize - 1].key() == Some(k) && Feed::ts(*n) <= cut)
+        };
         (0..4).filter_map(last).filter(|n| matches!(self.log[*n as usize - 1], Op::Up { .. })).collect()
     }
 }
@@ -285,7 +301,10 @@ impl World {
             return Ok(());
         }
         let key = g.below(4) as u8;
-        let op = if g.below(5) == 0 {
+        let pos = self.feeds[f].log.len() as Pos + 1;
+        let op = if g.below(6) == 0 {
+            Op::Closed(pos * 10)
+        } else if g.below(5) == 0 {
             Op::Del { key }
         } else {
             Op::Up { key, vec: vector(g), tenant: g.below(3) as i64, tags: g.below(4) as u8 }
@@ -322,10 +341,16 @@ impl World {
                 continue;
             }
             let s = self.status(f);
-            let pos = if g.bool() { s.applied } else { s.low + g.below(s.applied - s.low + 1) };
-            reads.push((feed.id, ReadAt::Position(pos)));
+            let (read, live) = if s.closed >= s.bound && g.below(3) == 0 {
+                let cut = s.bound + g.below(s.closed - s.bound + 1);
+                (ReadAt::Cut(cut), feed.live_cut(cut))
+            } else {
+                let pos = if g.bool() { s.applied } else { s.low + g.below(s.applied - s.low + 1) };
+                (ReadAt::Position(pos), feed.live(pos))
+            };
+            reads.push((feed.id, read));
             ranges.insert(f as u8);
-            expect.extend(feed.live(pos).into_iter().map(|n| (f as u8, n)));
+            expect.extend(live.into_iter().map(|n| (f as u8, n)));
         }
         if reads.is_empty() {
             return Ok(());
@@ -451,13 +476,13 @@ impl World {
         }
         let from = if feed.held { self.status(f).applied } else { 0 };
         let n = from + g.below(feed.log.len() as Pos - from + 1);
-        let bound = if n > 0 { Feed::ts(n) } else { 0 };
+        let bound = (1..=n).filter(|p| feed.log[*p as usize - 1].key().is_some()).map(Feed::ts).max().unwrap_or(0);
         self.replaced(f);
         self.ix.begin_load(feed.id, n, bound).unwrap();
         let rows: Vec<_> = feed
             .live(n)
             .iter()
-            .map(|&p| (key_of(f as u8, feed.log[p as usize - 1].key()), Feed::ts(p), feed.row(f as u8, p).unwrap()))
+            .map(|&p| (key_of(f as u8, feed.log[p as usize - 1].key().unwrap()), Feed::ts(p), feed.row(f as u8, p).unwrap()))
             .collect();
         self.ix.load_rows(feed.id, &rows).unwrap();
         self.feeds[f].held = true;
@@ -601,4 +626,33 @@ fn adv07_several_ranges_sharing_partitions_keep_every_scan_right() {
     for what in ["StartScan", "FinishScan", "FinishScan filtered", "scan failed", "Resync", "DropRange", "crash"] {
         assert!(total.get(what).copied().unwrap_or(0) >= 50, "{what} is too rare: {total:?}");
     }
+}
+
+/// The harness above is as sensitive as the author's: it catches the mutants of the spec too, which
+/// tells that its oracle is not vacuous. It does not need to catch all of them (the author's test
+/// does), so it reports and asserts that it catches most.
+#[test]
+fn adv07_the_several_range_harness_catches_most_mutants_of_the_spec() {
+    use super::super::mutant::MUTANT;
+    let names = [
+        "checkpoint_ahead_of_files", "checkpoint_forgets_low", "free_without_wait", "gc_without_epoch",
+        "late_copy_after_resync", "manifest_before_sync", "no_slot_dedup", "prefix_checkpoint_without_epoch",
+        "prefix_current_liveness", "prefix_drain_a_target", "prefix_drain_copies_current_only",
+        "prefix_drain_ignores_unapplied", "prefix_land_needs_ready", "prefix_probe_before_pin",
+        "prefix_remove_by_slot", "prefix_scan_survives_resync", "prefix_short_version", "remove_before_append",
+        "remove_without_wait", "show_superseded",
+    ];
+    let mut caught = Vec::new();
+    let mut missed = Vec::new();
+    for name in names {
+        MUTANT.with(|m| m.set(name));
+        let hit = (0..4000).find(|&seed| run(&mut Gen::from_seed(seed)).is_err());
+        match hit {
+            Some(seed) => caught.push((name, seed)),
+            None => missed.push(name),
+        }
+    }
+    MUTANT.with(|m| m.set("none"));
+    println!("caught {caught:?}\nmissed {missed:?}");
+    assert!(caught.len() >= 12, "the harness catches {} of 20", caught.len());
 }
