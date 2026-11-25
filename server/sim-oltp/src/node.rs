@@ -28,6 +28,7 @@ use crate::{
     history::Completion,
     invariants::{Invariants, RECOVERY_LIMIT, TraceObserver, elapsed_ms},
     net::SimNet,
+    operator::Operator,
 };
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -43,9 +44,8 @@ pub(crate) struct Cluster {
     processes: BTreeMap<u64, Process>,
     trace: TraceObserver,
     frozen: BTreeSet<u64>,
-    /// The last `direct.mutations` counter seen per worker, for leader tracking.
-    mutations: BTreeMap<u64, u64>,
-    leader: Option<u64>,
+    /// The Data group that serves the table, whose elections the network watches.
+    range: Option<Uuid>,
     /// Workers whose retained restart is prepared and has not become ready yet.
     prepared: BTreeSet<u64>,
     /// Per worker, the intervals in which it was frozen or had no process.
@@ -96,8 +96,7 @@ impl Cluster {
             processes: BTreeMap::new(),
             trace,
             frozen: BTreeSet::new(),
-            mutations: BTreeMap::new(),
-            leader: None,
+            range: None,
             prepared: BTreeSet::new(),
             outages: BTreeMap::new(),
         })
@@ -393,59 +392,6 @@ impl Cluster {
         Err(format!("{name}: {}", errors.join("; ")))
     }
 
-    /// One administration request to `node`, with the answer as the operator sees it.
-    pub async fn admin_answer(
-        &self,
-        node: u64,
-        id: Uuid,
-        name: &str,
-        payload: Value,
-        limit: Duration,
-    ) -> Result<Completion, String> {
-        request(
-            BOOTSTRAP_CLIENT,
-            node,
-            "/v1/cluster/operations",
-            &self.config.admin_token,
-            Some(operation(id, name, payload)),
-            limit,
-        )
-        .await
-        .and_then(|reply| reply.completion(id))
-    }
-
-    /// One administration request to `node` in its own task, for operations that run for
-    /// longer than a health check may wait.
-    pub fn admin_task(
-        &self,
-        node: u64,
-        id: Uuid,
-        name: &'static str,
-        payload: Value,
-        limit: Duration,
-    ) -> JoinHandle<Result<Value, String>> {
-        let token = self.config.admin_token.clone();
-        nabedra_rt::task::spawn(async move {
-            match request(
-                BOOTSTRAP_CLIENT,
-                node,
-                "/v1/cluster/operations",
-                &token,
-                Some(operation(id, name, payload)),
-                limit,
-            )
-            .await
-            .and_then(|reply| reply.completion(id))
-            {
-                Ok(Completion::Ok(data)) => Ok(data),
-                Ok(Completion::Refused(err)) => {
-                    Err(format!("n{node} {:?}: {}", err.code, err.message))
-                }
-                Ok(Completion::Unknown(err)) | Err(err) => Err(format!("n{node} {err}")),
-            }
-        })
-    }
-
     fn validate_connection(&self, data: &Value) -> Result<(), String> {
         if data["cluster_id"] != json!(self.config.cluster_id)
             || data["control_peers"].as_array().map(Vec::len) != Some(WORKERS.len())
@@ -491,35 +437,53 @@ impl Cluster {
         }
     }
 
-    /// The worker that most recently executed direct mutations, as the acceptance
-    /// fixture's `leader_of` finds it: the one whose `direct.mutations` counter grew.
-    /// Frozen and stopped workers are never returned.
-    pub async fn leader(&mut self) -> Option<u64> {
-        let mut best = None::<(u64, u64)>;
-        for node in WORKERS {
-            if !self.is_running(node) || self.frozen.contains(&node) {
-                continue;
-            }
-            let Ok(stats) = self.stats(node).await else {
-                continue;
-            };
-            let count = stats["direct"]["mutations"].as_u64().unwrap_or(0);
-            let previous = self.mutations.insert(node, count).unwrap_or(0);
-            // A restarted process counts from zero again.
-            let delta = if count < previous {
-                count
-            } else {
-                count - previous
-            };
-            if delta > 0 && best.is_none_or(|(_, most)| delta > most) {
-                best = Some((node, delta));
-            }
-        }
-        if let Some((node, _)) = best {
-            self.leader = Some(node);
-        }
-        self.leader
+    /// Follow the elections of a Data group, and take its leader for the table's from now on.
+    pub fn watch_range(&mut self, group: Uuid) {
+        self.net.watch_group(group);
+        self.range = Some(group);
+    }
+
+    /// Follow the table's initial range.
+    pub fn watch_table(&mut self, table: Uuid) {
+        let group = initial_range(self.config.cluster_id, table)["group_id"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok());
+        self.watch_range(group.expect("derived group ID"));
+    }
+
+    /// Every election of the table's ranges: when, and which worker.
+    pub fn elections(&self) -> Vec<(u64, u64)> {
+        let elections = self.net.elections();
+        elections.iter().map(|seen| (seen.at, seen.node)).collect()
+    }
+
+    /// The worker that a quorum last elected to lead the table's range, whatever state it is in
+    /// now. Before a new range's first append nothing is known.
+    pub fn elected(&self) -> Option<u64> {
+        let elections = self.net.elections();
+        let mut range = elections.iter().rev();
+        range
+            .find(|seen| Some(seen.group) == self.range)
+            .map(|seen| seen.node)
+    }
+
+    /// The elected leader, if it runs and is not frozen.
+    pub fn leader(&self) -> Option<u64> {
+        self.elected()
             .filter(|node| self.is_running(*node) && !self.frozen.contains(node))
+    }
+
+    /// The operator of this cluster.
+    pub fn operator(&self) -> Operator {
+        Operator {
+            world: self.world.clone(),
+            checks: self.checks.clone(),
+            trace: self.trace.clone(),
+            token: self.config.admin_token.clone(),
+            data_token: self.config.data_token.clone(),
+            cluster_id: self.config.cluster_id,
+            mounts: self.config.mounts.clone(),
+        }
     }
 
     pub async fn crash(&mut self, node: u64, how: DiskCut) {
@@ -749,21 +713,6 @@ impl Cluster {
         Ok(())
     }
 
-    /// One attempt to split the table's first range at `boundary` under `id`. Returns the
-    /// publication, or why the split is still pending.
-    pub async fn split(&self, id: Uuid, table: Uuid, boundary: i64) -> Result<Value, String> {
-        let source = initial_range(self.config.cluster_id, table);
-        let payload = json!({"source": source, "boundary": boundary, "page_bytes": 1 << 20});
-        match self
-            .admin_with_id(&WORKERS, id, "storage.shard.split", payload)
-            .await
-        {
-            Ok(result) if result["state"] == "published" => Ok(result),
-            Ok(result) => Err(result.to_string()),
-            Err(error) => Err(error),
-        }
-    }
-
     /// Whether every worker and gateway reports the run ready and the direct path active.
     pub async fn converged(&self) -> bool {
         if !self.healthy() {
@@ -792,11 +741,6 @@ impl Cluster {
             }
         }
         true
-    }
-
-    /// A fresh operation ID from the bootstrap client's stream.
-    pub async fn split_id(&self) -> Uuid {
-        in_node(BOOTSTRAP_CLIENT, async { uuid_v4() }).await
     }
 
     /// Stop a process gracefully through its own stop path, with work in flight.

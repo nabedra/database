@@ -15,7 +15,7 @@ use std::{collections::BTreeSet, fmt, time::Duration};
 use nabedra_check::Gen;
 use nabedra_sim::Profile;
 
-pub(crate) use net::NetFaults;
+pub(crate) use net::{NetFaults, Rule, WindowId};
 
 /// One nemesis decision. The mildest action comes first: the shrinker moves picks toward it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -276,6 +276,9 @@ impl Selection {
                 }
             }
         }
+        if Self::quiet(list) && !(selection.profiles.is_empty() && selection.actions.is_empty()) {
+            return Err("NABEDRA_SIM_PROFILE=none runs no nemesis, so it excludes one".into());
+        }
         let beyond = selection.profiles.contains(&"beyond-tcp")
             || selection.actions.iter().any(|action| action.beyond_tcp());
         if beyond && std::env::var("NABEDRA_SIM_BEYOND_TCP").as_deref() != Ok("1") {
@@ -323,17 +326,21 @@ impl Selection {
     }
 }
 
-/// A follow-up the nemesis applies later, or at the heal at the latest.
+/// A fault's place in the run's fault log.
+pub(crate) type FaultId = usize;
+
+/// A follow-up the nemesis applies later, or at the heal at the latest. Each names the fault
+/// that it ends, so it never ends another one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FollowUp {
-    Thaw(Vec<u64>),
-    HealLinks,
+    Thaw(FaultId),
+    HealLinks(FaultId),
     /// Restart a stopped worker; `true` after a power cut.
-    RestartWorker(u64, bool),
-    RestartGateway(u64),
-    RestoreCertificate(u64),
-    ClearNet(Action),
-    ClearDisk(u64),
+    RestartWorker(u64, bool, FaultId),
+    RestartGateway(u64, FaultId),
+    RestoreCertificate(u64, FaultId),
+    ClearNet(FaultId),
+    ClearDisk(u64, FaultId),
 }
 
 /// One scheduled nemesis step.
@@ -383,6 +390,9 @@ mod tests {
                 .all(|action| !action.beyond_tcp())
         );
         assert!(Selection::parse(&["nonsense".into()]).is_err());
+        // Review 115, L8: this ran no nemesis and said nothing.
+        assert!(Selection::parse(&["none".into(), "split".into()]).is_err());
+        assert!(Selection::parse(&["none".into(), "d05".into()]).is_ok());
         assert!(Selection::parse(&["frame-drop".into()]).is_err());
     }
 
