@@ -11,14 +11,16 @@
 //!   request's future is dropped. A client sees a lost reply and retries the identity;
 //! - fills the admission limits from one or both gateways, in windows. Requests are shed while a
 //!   window is open, and the lanes drain when it ends, by themselves or all at once;
-//! - drains one worker while such a window is open.
+//! - drains one worker while such a window is open, and stalls a process in it: the process
+//!   stops right after a drawn clock read, in the middle of a job or a poll, so that deadlines
+//!   pass with a request half done.
 //!
 //! The process limits it lowers are the ones the harness samples anyway. After the heal it runs
 //! one quiet stage: the same load with cuts, between two resource points that must be equal
 //! ([`crate::invariants::resources`]).
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::{Future, poll_fn},
     pin::pin,
     sync::{
@@ -33,7 +35,7 @@ use nabedra_check::Gen;
 use nabedra_protocol::protocol::ErrorCode;
 use nabedra_rt::{
     ids::uuid_v4,
-    sim::{World, in_node},
+    sim::{ClockRead, World, in_node},
     time,
 };
 use nabedra_sim::rng::stream_seed;
@@ -94,7 +96,7 @@ impl Cuts {
             return None;
         }
         self.sent += 1;
-        let polls = 1 + self.g.below(8) as u32;
+        let polls = 1 + self.g.below(LONGEST_CALL) as u32;
         let longest = *self.g.pick(&[0, 2, 20, 300]);
         let delay = Duration::from_millis(self.g.below(longest + 1));
         Some(Cut {
@@ -145,19 +147,25 @@ fn count(polls: u32) {
     }
 }
 
+/// A request is polled this often at most: to send, for the head and for the body.
+const LONGEST_CALL: u64 = 3;
 /// The share of the client requests that are cut while the chaos window is open.
 const CHAOS_CUTS: u64 = 150;
 /// The same in the quiet stage.
 const STAGE_CUTS: u64 = 500;
 
 /// The limits this overlay sets, before any process starts.
-pub(crate) fn limits(seed: u64, config: &mut Config) {
+pub(crate) fn limits(seed: u64, config: &mut Config, short_deadline: bool) {
     let mut g = Gen::from_seed(stream_seed(seed, "oltp-resources-limits"));
     if g.bool() {
         config.force("executor.max_in_flight", json!(4 + g.below(5)));
     }
     if g.bool() {
         config.force("data.apply_reply_bytes", json!(MIN_APPLY_REPLY_BYTES));
+    }
+    if short_deadline && g.below(4) > 0 {
+        // Short enough to pass while a worker stalls with the request half done.
+        config.force("request_deadline_ms", json!(250 + g.below(200)));
     }
     if g.bool() {
         // One slot for each of the five processes.
@@ -173,6 +181,63 @@ struct Window {
     lanes: u64,
     each: u64,
     storm_after: Option<Duration>,
+    stall: Option<Stall>,
+}
+
+/// Where native work is reserved and dispatched. Most other clock reads are in pings, ticks and
+/// timers, so a stall at any read seldom stops a request there.
+const RESERVATION: &str = "oltp/pool/resources.rs";
+
+/// A process stops after its `nth` clock read from now, in any file or in [`RESERVATION`], for
+/// `hold`.
+#[derive(Clone, Copy, Debug)]
+struct Stall {
+    node: u64,
+    reservation: bool,
+    nth: u64,
+    hold: Duration,
+}
+
+impl Stall {
+    fn draw(g: &mut Gen, deadline: Duration) -> Self {
+        // Past a short deadline. A long one cannot pass without losing more than a request.
+        let short = deadline <= Duration::from_millis(500);
+        let longest = if short {
+            deadline.as_millis() as u64 + 150
+        } else {
+            150
+        };
+        // A gateway reserves no native work.
+        let reservation = g.below(3) > 0;
+        let nodes: Vec<u64> = if reservation {
+            WORKERS.into()
+        } else {
+            WORKERS.into_iter().chain(GATEWAYS).collect()
+        };
+        Self {
+            node: *g.pick(&nodes),
+            reservation,
+            nth: 1 + g.below(if reservation { 60 } else { 400 }),
+            hold: Duration::from_millis(if short {
+                longest / 2 + g.below(longest / 2)
+            } else {
+                20 + g.below(longest - 19)
+            }),
+        }
+    }
+
+    /// `stalled` names the processes with a stall, so each has one at a time.
+    async fn run(self, world: Arc<World>, stalled: Arc<Mutex<BTreeSet<u64>>>) {
+        let mut read = ClockRead::nth(self.nth);
+        if self.reservation {
+            read = read.in_file(RESERVATION);
+        }
+        world.freeze_after_clock_read(self.node, read);
+        world.frozen_at_read(self.node).await;
+        time::sleep(self.hold).await;
+        world.thaw(self.node);
+        stalled.lock().unwrap().remove(&self.node);
+    }
 }
 
 /// How requests of the load ended.
@@ -188,7 +253,6 @@ pub(crate) struct Overlay {
     seed: u64,
     pauses: bool,
     windows: Vec<Window>,
-    storms: Vec<Duration>,
     /// When a worker drains, which one, and for how long it stays stopped.
     drain: Option<(Duration, u64, Duration)>,
     restart: Option<(u64, Duration)>,
@@ -197,12 +261,13 @@ pub(crate) struct Overlay {
     next_key: Arc<AtomicI64>,
     load: Arc<Mutex<Load>>,
     tasks: Vec<JoinHandle<()>>,
+    stalled: Arc<Mutex<BTreeSet<u64>>>,
     lanes: u64,
     stage: Value,
 }
 
 impl Overlay {
-    pub(crate) fn draw(seed: u64, chaos: Duration) -> Self {
+    pub(crate) fn draw(seed: u64, chaos: Duration, deadline: Duration) -> Self {
         let mut g = Gen::from_seed(stream_seed(seed, "oltp-resources"));
         let span = chaos.as_millis() as u64;
         let mut windows: Vec<Window> = (0..2 + g.below(2))
@@ -215,7 +280,8 @@ impl Overlay {
                 },
                 lanes: 16 + g.below(49),
                 each: 1 + g.below(3),
-                storm_after: g.bool().then(|| Duration::from_millis(g.below(200))),
+                storm_after: g.bool().then(|| Duration::from_millis(g.below(50))),
+                stall: g.bool().then(|| Stall::draw(&mut g, deadline)),
             })
             .collect();
         windows.sort_by_key(|window| window.at);
@@ -228,7 +294,6 @@ impl Overlay {
             seed,
             pauses: g.bool(),
             windows,
-            storms: Vec::new(),
             drain,
             restart: None,
             drained: None,
@@ -236,6 +301,7 @@ impl Overlay {
             next_key: Arc::new(AtomicI64::new(READ_KEYS)),
             load: Arc::default(),
             tasks: Vec::new(),
+            stalled: Arc::default(),
             lanes: 0,
             stage: Value::Null,
         }
@@ -293,17 +359,21 @@ impl Overlay {
             for gateway in &window.gateways {
                 self.press(*gateway, window.lanes, window.each);
             }
+            // The nemesis thaws what it froze itself.
+            if let Some(stall) = window.stall
+                && cluster.frozen().is_empty()
+                && cluster.is_running(stall.node)
+            {
+                self.stall(cluster, stall);
+            }
             if let Some(after) = window.storm_after {
-                self.storms.push(now + after);
+                let world = cluster.world.clone();
+                self.tasks.push(nabedra_rt::task::spawn(async move {
+                    time::sleep(after).await;
+                    storm(&world);
+                }));
             }
         }
-        self.storms.retain(|at| {
-            let due = *at <= now;
-            if due {
-                storm(&cluster.world);
-            }
-            !due
-        });
         if let Some((at, node, stopped)) = self.drain
             && at <= now
         {
@@ -348,7 +418,6 @@ impl Overlay {
         set_cuts(&cluster.world, 0);
         cluster.world.set_storage_pauses(0, Duration::ZERO);
         self.windows.clear();
-        self.storms.clear();
         self.drain = None;
         if let Some((node, _)) = self.restart {
             self.restart_drained(cluster, node).await;
@@ -360,6 +429,17 @@ impl Overlay {
         for task in std::mem::take(&mut self.tasks) {
             let _ = task.await;
         }
+    }
+
+    fn stall(&mut self, cluster: &Cluster, stall: Stall) {
+        // A second one would end at the first one's thaw, and its own freeze would last.
+        if !self.stalled.lock().unwrap().insert(stall.node) {
+            return;
+        }
+        let world = cluster.world.clone();
+        let stalled = self.stalled.clone();
+        self.tasks
+            .push(nabedra_rt::task::spawn(stall.run(world, stalled)));
     }
 
     /// Starts `lanes` concurrent clients of one gateway, each sending `each` requests.
@@ -391,7 +471,7 @@ impl Overlay {
         let mut g = Gen::from_seed(stream_seed(self.seed, "oltp-resources-stage"));
         // One uncut round first, so what a first request keeps (routes, sessions) is in the
         // point before the stage.
-        let rounds = 1 + g.below(2);
+        let rounds = 2 + g.below(2);
         let lanes = 24 + g.below(41);
         self.press(0, lanes, 1);
         self.press(1, lanes, 1);
@@ -417,10 +497,15 @@ impl Overlay {
         let (ok_before, shed_before) = self.answered();
         set_cuts(&cluster.world, STAGE_CUTS);
         for _ in 0..rounds {
+            let stalls = [(); 2].map(|()| Stall::draw(&mut g, deadline));
+            cluster.record(format!("resources overlay stage round, {stalls:?}"));
+            for stall in stalls {
+                self.stall(cluster, stall);
+            }
             self.press(0, lanes, 2);
             self.press(1, lanes, 2);
             if g.bool() {
-                time::sleep(Duration::from_millis(g.below(100))).await;
+                time::sleep(Duration::from_millis(g.below(20))).await;
                 storm(&cluster.world);
             }
             self.join().await;
@@ -686,13 +771,13 @@ mod tests {
         for seed in 1..50 {
             let chaos = Duration::from_secs(20);
             let [first, second] = [(); 2].map(|()| {
-                let overlay = Overlay::draw(seed, chaos);
+                let overlay = Overlay::draw(seed, chaos, Duration::from_millis(300));
                 format!("{:?} {:?} {}", overlay.windows, overlay.drain, overlay.pauses)
             });
             assert_eq!(first, second);
             let [first, second] = [(); 2].map(|()| {
                 let mut config = Config::sample(seed);
-                limits(seed, &mut config);
+                limits(seed, &mut config, true);
                 config.report()
             });
             assert_eq!(first, second);

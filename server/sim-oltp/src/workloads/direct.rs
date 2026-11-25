@@ -59,7 +59,7 @@ pub(crate) async fn run(
     // Before the resource baseline, as the workload's own table is.
     let overlay = if overlay {
         let table = create_table(cluster, &history, "sim_resources").await?;
-        Some((Overlay::draw(seed, CHAOS), table))
+        Some((Overlay::draw(seed, CHAOS, config.deadline()), table))
     } else {
         None
     };

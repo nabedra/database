@@ -59,7 +59,8 @@ fn run(
         config.force("data.direct.batch", json!(true));
     }
     if setup.workloads.overlay() {
-        workloads::resources::limits(seed, &mut config);
+        let d05 = workloads::paused::samples(seed, workload) || setup.selection.focus.d05;
+        workloads::resources::limits(seed, &mut config, !d05);
     }
     let program = (workload == Workload::Smoke).then(|| Program::generate(generator));
     let (mut result, world, panics) = nabedra_sim::runtime::run(seed, |world| async move {
