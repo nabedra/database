@@ -1632,6 +1632,10 @@ class FoolTest(HarnessCase):
             ("character", good.replace("\"here\"", "'h'"), (before, after)),
             ("nested comment", good.replace("\"here\"", "/* /* */ { */ 1"), (before, after)),
             ("line comment", good.replace("        crate", "        // }\n        crate"), (before, after)),
+            ("a comment on its own", good.replace("        crate", "        // x\n        crate"), (before, after)),
+            ("an escape on its own", good.replace("\"here\"", "\"a\\n\""), (before, after)),
+            ("open bracket in a line", good.replace("pause(", "pause(("), (before, after)),
+            ("open bracket in the head", good.replace("if let Some(id) = b.into()", "if (b == 1"), (before, after)),
             ("other indentation", good.replace("        crate", "    crate"), (before, after)),
             ("another closing", good.replace("\n    }\n", "\n     }\n"), (before, after)),
             ("other feature", good.replace("#[cfg(test)]", "#[cfg(feature = \"oltp\")]"), (before, after)),
@@ -1647,6 +1651,7 @@ class FoolTest(HarnessCase):
             ("no tail", statement.replace(";\n", "\n"), (before, after)),
             # The place.
             ("in a string", good, ("pub fn product() -> &'static str {\n    \"a\n", "    b\"\n}\n")),
+            ("in a string between plain lines", good, (before + "    let s = \"a;\n", "    b\";\n" + after)),
             ("after a raw string", good, (before + raw, after)),
             ("after a raw byte string", good, (before + raw.replace("r#", "br#"), after)),
             ("after a block comment", good, (before + comment, after)),
@@ -1769,6 +1774,7 @@ class FoolTest(HarnessCase):
         for name, clean_sha, patched, refused in (
                 ("the probe and the patch", clean, scratch({tests: with_probe, lib: LIB}), None),
                 ("other probes on the clean side", scratch({tests: other}), scratch({tests: with_probe, lib: LIB}), None),
+                ("no probe on the clean side", main, scratch({tests: with_probe, lib: LIB}), "does not hold the probe"),
                 ("a panic in the probe's file", clean, scratch({tests: panics, lib: LIB}), "than the probe and the patch"),
                 ("a blank more", clean, scratch({tests: with_probe + " \n", lib: LIB}), "than the probe and the patch"),
                 ("a panic in the patch's file", scratch({tests: with_probe, lib: FIXED}),
@@ -1784,7 +1790,7 @@ class FoolTest(HarnessCase):
                     self.assertEqual((errors, uncounted), ([], []))
                 else:
                     self.assertTrue(errors, uncounted)
-                    if name in ("a panic in the probe's file", "a blank more", "a step before"):
+                    if name in ("no probe on the clean side", "a panic in the probe's file", "a blank more", "a step before"):
                         self.assertIn(refused, errors[0])
 
     def test_evidence_of_a_commit_without_a_probe(self):
