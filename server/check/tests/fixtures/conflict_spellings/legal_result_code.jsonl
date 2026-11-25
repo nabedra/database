@@ -1,0 +1,8 @@
+{"index":0,"type":"invoke","process":1,"f":"insert","key":"k","value":9,"request_id":"seed"}
+{"index":1,"type":"ok","process":1,"f":"insert","key":"k","value":null,"request_id":"seed"}
+{"index":2,"type":"invoke","process":0,"f":"insert","key":"k","value":1,"request_id":"r"}
+{"index":3,"type":"fail","process":0,"f":"insert","key":"k","value":{"code":"conflict","message":"original request run was abandoned","not_applied":true},"request_id":"r"}
+{"index":4,"type":"invoke","process":1,"f":"delete","key":"k","value":null,"request_id":"gone"}
+{"index":5,"type":"ok","process":1,"f":"delete","key":"k","value":true,"request_id":"gone"}
+{"index":6,"type":"invoke","process":0,"f":"insert","key":"k","value":1,"request_id":"r"}
+{"index":7,"type":"ok","process":0,"f":"insert","key":"k","value":null,"request_id":"r"}
