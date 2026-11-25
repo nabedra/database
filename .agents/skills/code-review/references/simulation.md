@@ -38,7 +38,7 @@ with the check's feature flags.
 ## Bring up a workload
 
 When one reason makes most seeds red, a sweep says little about anything else, and neither does the next
-one. Go in this order:
+one. In order:
 
 1. Run about 20 seeds without faults. Settle every reason that is red there first: it is a
    mistake in the harness, a rule that forbids a legal state, or a finding that needs no fault.
