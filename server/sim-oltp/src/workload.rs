@@ -322,8 +322,12 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     );
     assertions.insert("liveness", !has_violation(&checks, "Liveness"));
     let history = std::mem::take(&mut *history.lock().unwrap());
+    let mut unclassified_conflicts = 0;
+    let mut not_judged = BTreeMap::new();
     if history.events().iter().any(|event| event.key.is_some()) {
         let verdict = history.check_direct();
+        unclassified_conflicts = verdict.unclassified_conflicts;
+        not_judged = verdict.not_judged.clone();
         assertions.insert(
             "linearizability and keyed dedup",
             verdict.anomalies.is_empty(),
@@ -357,6 +361,8 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
             .probes()
             .map(|probes| probes.exercised())
             .unwrap_or_default(),
+        unclassified_conflicts,
+        not_judged,
     }
 }
 

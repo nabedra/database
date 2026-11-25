@@ -69,6 +69,10 @@ pub(crate) struct RunResult {
     pub(crate) summary: Value,
     /// How often each probe-driven rule ran on an event of its own.
     pub(crate) exercised: BTreeMap<&'static str, u64>,
+    /// Refused inserts that the history checker could not place. The retry rule is quiet on them.
+    pub(crate) unclassified_conflicts: usize,
+    /// What the history checker accepted because no text decides it, by name.
+    pub(crate) not_judged: BTreeMap<String, usize>,
 }
 
 /// The workload and nemesis selection of a sweep (`NABEDRA_SIM_WORKLOAD`,
@@ -129,6 +133,8 @@ struct ObservedSeed {
     exercised: BTreeMap<&'static str, u64>,
     scenarios: Scenarios,
     summary: Value,
+    unclassified_conflicts: usize,
+    not_judged: BTreeMap<String, usize>,
     config: Value,
     config_hash: String,
     assertions: BTreeMap<&'static str, bool>,
@@ -434,6 +440,8 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
                 scenarios: result.scenarios.clone(),
                 summary: result.summary.clone(),
                 exercised: result.exercised.clone(),
+                unclassified_conflicts: result.unclassified_conflicts,
+                not_judged: result.not_judged.clone(),
                 config: result.run.config.clone(),
                 config_hash,
                 assertions: result.assertions,
@@ -523,6 +531,8 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             "profile": setup.profile(seed),
             "scenarios": tags,
             "summary": observation.map(|row| &row.summary),
+            "unclassified_conflicts": observation.map(|row| row.unclassified_conflicts),
+            "not_judged": observation.map(|row| &row.not_judged),
             "config": observation.map(|row| &row.config),
             "config_hash": observation.map(|row| &row.config_hash),
             "trace_hash": format!("{:016x}", summary.trace_hash),
@@ -579,6 +589,18 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     let peak_rss_kib = metrics
         .filter_map(|measurement| measurement.process_peak_rss_kib)
         .max();
+    let unclassified_conflicts: usize = observed
+        .values()
+        .map(|row| row.unclassified_conflicts)
+        .sum();
+    let mut not_judged = BTreeMap::<&str, usize>::new();
+    for (name, times) in observed.values().flat_map(|row| &row.not_judged) {
+        *not_judged.entry(name).or_default() += times;
+    }
+    assertions.insert(
+        "every refused insert was classified",
+        unclassified_conflicts == 0,
+    );
     let config_hash = format!("{:016x}", config_hash.finish());
     let report_path = config.artifacts.join("sweep-report.json");
     std::fs::write(
@@ -593,6 +615,8 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             "defect": defect.name(),
             "jobs": config.jobs,
             "config_hash": config_hash,
+            "unclassified_conflicts": unclassified_conflicts,
+            "not_judged": not_judged,
             "duration_s": duration_s,
             "cpu_s": total_cpu_s,
             "process_peak_rss_kib": peak_rss_kib,
@@ -606,7 +630,8 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     eprintln!(
         "Fault model: {} clean seeds (worked and replayed), {unreplayed} passing seeds not \
          replayed, {} red, {} replayed, {:.3} s wall, {:?} simulation CPU s, \
-         {:?} KiB process peak RSS, configuration {config_hash}",
+         {:?} KiB process peak RSS, {unclassified_conflicts} unclassified insert conflicts, \
+         not judged {not_judged:?}, configuration {config_hash}",
         verdicts.get(&Verdict::Clean).copied().unwrap_or(0),
         verdicts.get(&Verdict::Red).copied().unwrap_or(0),
         report.replayed(),
