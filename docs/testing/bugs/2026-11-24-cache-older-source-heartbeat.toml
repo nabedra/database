@@ -1,3 +1,6 @@
+# A controller unit schedule only, local and unattested. No cluster schedule that delivers a source's
+# older heartbeat after a newer one is known, and the author's 151 instrumented sweep seeds (local) did not
+# produce one. This record is neither a pass nor a fail of the guarantee it names.
 id = "cache-older-source-heartbeat"
 title = "A late older source heartbeat lets a staged copy 900 sequences behind complete"
 class = "other"
