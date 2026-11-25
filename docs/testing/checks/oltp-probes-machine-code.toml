@@ -9,7 +9,7 @@ guarantees = []
 scenarios = []
 tiers = ["weekly"]
 command = ["python3", "scripts/testing/cfg_unchanged.py", "--binary", "oltp",
-           "--base", "169324944bb5fa32a6819742af63b688c6b8ffdd", "--head", "d6e5718b5b755616394e1ebea492691e8d63e6f3"]
+           "--base", "169324944bb5fa32a6819742af63b688c6b8ffdd", "--head", "f329e37c59fbd2a781e5c13965b01552c05419a0"]
 cwd = "."
 timeout_s = 7200
 needs = []
