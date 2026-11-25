@@ -22,6 +22,7 @@ CONSTANTS
     Ranges, Workers, Queries,
     Singles,        \* single-row writes; each may later be deleted
     Batches,        \* insert_many across ranges
+    BatchesOn,      \* whether the run has batches
     Parts,          \* [Singles \cup Batches -> SUBSET Ranges]
     Deletable,      \* the singles a client may delete
     MaxElections, MaxCrashes, MaxLost, MaxDups, MaxPurges, MaxBarriers,
@@ -102,7 +103,7 @@ TypeOK ==
     /\ lost \in 0..MaxLost /\ dups \in 0..MaxDups /\ purges \in 0..MaxPurges
 
 Init ==
-    /\ started = {e \in Entries : e.k \in {"put", "prep"}}
+    /\ started = {e \in Entries : e.k = "put" \/ (e.k = "prep" /\ BatchesOn)}
     /\ log = [r \in Ranges |-> <<>>]
     /\ tail = [r \in Ranges |-> None]
     /\ lapp = [r \in Ranges |-> 0]
@@ -404,6 +405,12 @@ OldLeaderAnswers(s, r) ==
     /\ UNCHANGED <<started, log, tail, lapp, ready, termAt, prepared, dec, acked,
                    fvars, wait, fly, bid, qvars, cvars>>
 
+\* A deposed leader hears of its successor.
+OldLeaderNotices(r) ==
+    /\ old[r] # None
+    /\ old' = [old EXCEPT ![r] = None]
+    /\ UNCHANGED <<started, log, tail, lapp, ready, termAt, prepared, dec, acked, fvars, bvars, qvars, cvars>>
+
 \* A deposed leader that noticed drops the RPC it held.
 OldLeaderDrops(s, r) ==
     /\ asked[s][r] /\ old[r] = None /\ cap[s][r] # None /\ cap[s][r].old
@@ -460,7 +467,7 @@ Next ==
     \/ \E e \in Entries : Start(e) \/ AckSingle(e)
     \/ \E r \in Ranges :
         \/ \E e \in Entries : Propose(r, e)
-        \/ Commit(r) \/ ApplyLeader(r) \/ BecomeReady(r) \/ Elect(r) \/ Purge(r)
+        \/ Commit(r) \/ ApplyLeader(r) \/ BecomeReady(r) \/ Elect(r) \/ OldLeaderNotices(r) \/ Purge(r)
     \/ \E b \in Batches : Decide(b) \/ AckBatch(b)
     \/ \E s \in Workers, r \in Ranges :
         \/ SendPage(s, r) \/ StartInstall(s, r) \/ FinishInstall(s, r)

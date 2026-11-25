@@ -18,7 +18,7 @@
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
-CONSTANTS Slots, Parts, First, Queries,
+CONSTANTS Slots, Parts, First, Queries, QueriesOn,
           MaxOps, MaxFlight, MaxDrains, MaxMoves, MaxCheckpoints, MaxCrashes, MaxResyncs, None, Mutant
 
 VARIABLES
@@ -219,7 +219,7 @@ Collect(p) ==
 \* Mutant prefix_probe_before_pin, the design before this review: the partitions are ranked while
 \* the barrier is in flight, and the point is fixed in a later step.
 StartScan(x, n) ==
-    /\ held /\ n \in low..app
+    /\ QueriesOn /\ held /\ n \in low..app
     /\ IF Mutant = "prefix_probe_before_pin"
        THEN \/ q[x].st = "idle" /\ q' = [q EXCEPT ![x] = [Idle EXCEPT !.st = "probed", !.todo = Tree]]
             \/ q[x].st = "probed" /\ q' = [q EXCEPT ![x].st = "run", ![x].pt = n]
@@ -317,7 +317,7 @@ DropRange ==
     /\ UNCHANGED <<ops, flight, drains, moves, checkpoints, crashes>>
 
 Terminated ==
-    /\ \A x \in Queries : q[x].st \in {"done", "failed"} \/ ~held
+    /\ \A x \in Queries : q[x].st \in {"done", "failed"} \/ ~held \/ ~QueriesOn
     /\ app = Len(ops) \/ ~held
     /\ ck = None
     /\ ~\E p \in Parts : st[p] = "draining"

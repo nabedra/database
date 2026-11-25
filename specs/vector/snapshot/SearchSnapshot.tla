@@ -20,7 +20,7 @@ CONSTANTS
     Directs,        \* single-row commits
     Home,           \* [Directs -> Ranges]
     Batch,          \* a cross-range transaction, or {} for none
-    Queries,
+    Queries, QueriesOn,
     MaxAttempts, MaxElections, MaxCloses, MaxForgets, MaxUnknown,
     MaxTs,          \* at least the number of timestamps a run can hand out, plus one
     None, Mutant
@@ -238,7 +238,7 @@ RestartEmpty(r) ==
 
 \* The gateway picks a timestamp that every range reported closed. Reports may be old.
 StartQuery(q, s) ==
-    /\ qs[q] = None
+    /\ QueriesOn /\ qs[q] = None
     /\ LET floors == {Floor(r) : r \in Ranges}
            top == CHOOSE f \in floors : \A g \in floors : f <= g IN
        s <= top /\ qs' = [qs EXCEPT ![q] = s]

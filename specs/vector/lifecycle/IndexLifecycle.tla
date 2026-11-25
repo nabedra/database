@@ -13,7 +13,7 @@
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS Ranges, Workers, Queries, MaxCols, MaxFailovers, MaxLosses, MaxLostReports, MaxDrops, None, Mutant
+CONSTANTS Ranges, Workers, Queries, QueriesOn, MaxCols, MaxFailovers, MaxLosses, MaxLostReports, MaxDrops, None, Mutant
 
 Cols == 1..MaxCols
 
@@ -167,7 +167,7 @@ LiveNow == IF status \in {"ready", "dropping"} /\ col \in complete THEN {col} EL
 
 \* The gateway sends the incarnation it has cached, which may be gone.
 StartQuery(x) ==
-    /\ q[x].st = "idle" /\ gw # 0
+    /\ QueriesOn /\ q[x].st = "idle" /\ gw # 0
     /\ q' = [q EXCEPT ![x] = [st |-> "run", c |-> gw, live |-> LiveNow]]
     /\ UNCHANGED <<col, status, se, fences, epoch, ws, msgs, seen, ever, complete, gw, served, failovers, losses, drops, lostReports>>
 
