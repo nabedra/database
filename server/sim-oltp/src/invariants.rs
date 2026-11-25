@@ -303,7 +303,9 @@ impl Invariants {
     /// - a charge that comes and goes, and is gone for long enough to hold three observations
     ///   and the steps between them (more than 20 ms), or that is there only between two
     ///   samples;
-    /// - a charge first taken after the last observation;
+    /// - a charge first taken after the last observation. The workload stops observing once
+    ///   every worker has settled at the same pass, or at its limit: if one worker never
+    ///   settles, another is judged by what the limit caught, a message in flight included;
     /// - a leak by exactly what the baseline held, when the baseline was not steady
     ///   ([`Self::resources_steady`]) and held it. A baseline that caught a message in
     ///   flight is a false red instead when nothing leaks;
@@ -765,6 +767,10 @@ mod tests {
                 world.add_node(1, NodeClock::default());
                 let checks = Invariants::new();
                 checks.capture_resources(&world, 1, &stats());
+                // Observations at one instant are one observation.
+                for _ in 0..=SETTLED_PASSES {
+                    assert!(!settle || !checks.resources_at_baseline(1, &stats()));
+                }
                 while settle && !checks.resources_at_baseline(1, &stats()) {
                     time::sleep(STEP).await;
                 }
