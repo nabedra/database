@@ -1017,7 +1017,8 @@ class CheckOrchestrationTests(unittest.TestCase):
         for pairs in ([('    Mutant = "no_resend"\n', "")], [('Mutant = "no_resend"', "Mutant <- MCMutant")], [('Mutant = "no_resend"', 'Mutant = {"no_resend"}')],
                       [('Mutant = "no_resend"', 'Mutant = "no_resend"\n    Mutant = "none"')]):
             with self.subTest(pairs):
-                self.assert_fails(plain, prep=[add_to_model('MCMutant == "no_resend"'), self.mutant(*pairs)], spare=False)
+                twice = "the cfg sets Mutant more than once; " if len(pairs[0][1].splitlines()) > 1 else ""
+                self.assert_fails(plain.replace("count: ", "count: " + twice), prep=[add_to_model('MCMutant == "no_resend"'), self.mutant(*pairs)], spare=False)
         # Mutant has to be a CONSTANT of the model.
         self.assert_fails("it does not set the CONSTANT Mutant to a plain value", failed=3, spare=False,
                           prep=[self.in_cfg("TwoPhase.tla", ("    Mutant       \\*", "    Mutant2      \\*"))])
@@ -1170,6 +1171,57 @@ class CheckOrchestrationTests(unittest.TestCase):
                 ("CONSTANTS\n", "\\* limit: Sub -- x\nCONSTANTS\n    Sub <- Mine\n")])),
             add_to_cfg("CONSTRAINT Few", self.COUNTERS)])
         self.assertEqual(code, 0, text)
+
+    # A name set twice.
+
+    def test_a_cfg_that_sets_a_name_twice_fails(self):
+        model = add_to_model("One == 1", "Good == 0..3", "Few == crashes <= 1")
+        spec = "SPECIFICATION Spec\n"
+        one, large = ("MaxCrashes = 1", "MaxCrashes = {}"), ("MaxCrashes = 2", "MaxCrashes = {}")
+        for name, line in (
+                ("MaxCrashes", "2\n    MaxCrashes = 1"), ("MaxCrashes", "1\n    MaxCrashes = 1"), ("MaxCrashes", "1 MaxCrashes=2"),
+                ("MaxCrashes", "1\nCONSTANT MaxCrashes = 2"), ("MaxCrashes", "1\nCONSTANTS\n  MaxCrashes\n  = 2"),
+                ("MaxCrashes", "1\nCONSTANT MaxCrashes <- One"), ("MaxCrashes", "1\n    MaxCrashes <- [MCTwoPhase] One"), ("MaxCrashes", "1 (* x *) MaxCrashes <-[MCTwoPhase]One"),
+                ("Nat", "1\n    Nat <- Good\n    Nat <- Good"), ("Nat", "1\n    Nat <- [TwoPhase] Good\n    Nat <- [MCTwoPhase] Good"),
+                ("RM", "1\n" + spec + "CONSTANT RM <- MCRM"), ("Mutant", '1\n    Mutant = "none"')):
+            for cfg, (old, new), kw in (("TwoPhase.cfg", one, {}), ("TwoPhase.large.cfg", large, dict(extra=("--tier", "T2"))), ("mutants/no_resend.cfg", one, dict(spare=False))):
+                if cfg.startswith("mutants") and name == "Mutant":
+                    continue  # test_a_mutant_sets_mutant_to_a_value_of_its_own
+                with self.subTest(line, cfg=cfg):
+                    limit = [self.in_cfg(c, ("CONSTANTS\n", "\\* limit: Nat -- x\nCONSTANTS\n")) for c in ("TwoPhase.cfg", "TwoPhase.large.cfg")]
+                    _, summary, text = self.run_fake({**GOOD, "TwoPhase.large.cfg": ["pass", 0]}, prep=[model, *limit, self.in_cfg(cfg, (old, new.format(line)))], **kw)
+                    self.assertEqual(summary["verdict"], "fail", text)
+                    self.assertIn(f"the cfg sets {name} more than once", text)
+                    if cfg.startswith("mutants"):
+                        self.assertEqual((self.mutant_fact(summary)["ok"], self.controls_ran()), (False, []))
+        for lines, name in ((spec + spec, "SPECIFICATION"), (spec + "SPECIFICATION Weak\n", "SPECIFICATION"), ("INIT Init\nINIT Init\nNEXT Next\n", "INIT"),
+                            ("INIT Init NEXT Next\nNEXT Next\n", "NEXT")):
+            for cfg in ("TwoPhase.cfg", "mutants/no_resend.cfg"):
+                with self.subTest(lines, cfg=cfg):
+                    _, summary, text = self.run_fake(GOOD, prep=[self.in_cfg(cfg, (spec, lines))], spare=False)
+                    self.assertEqual(summary["verdict"], "fail", text)
+                    self.assertIn(f"the cfg sets {name} more than once", text)
+        # Once each, also where a name is a value, in a comment, in a string or part of another name, and where a check is named twice.
+        for old, new in (("MaxCrashes = 1", "MaxCrashes = 1 \\* MaxCrashes = 2"), ("MaxCrashes = 1", "MaxCrashes = 1 (* MaxCrashes = 2 *)"),
+                         ("SPECIFICATION Spec", "SPECIFICATION Spec \\* SPECIFICATION Spec"), ("INVARIANTS TypeOK", "INVARIANT TypeOK\nINVARIANTS TypeOK"),
+                         ("PROPERTIES Termination", "PROPERTY Termination\nPROPERTIES Termination")):
+            with self.subTest(new):
+                code, _, text = self.run_fake(GOOD, prep=[self.in_cfg("TwoPhase.cfg", (old, new))], spare=False)
+                self.assertEqual(code, 0, text)
+        code, _, text = self.run_fake(GOOD, prep=[safety_only, model, add_to_cfg("CONSTRAINT Few", "CONSTRAINTS Few Few", self.COUNTERS)], FAKE_TLC_EDIT=json.dumps([SAFETY_LOG]))
+        self.assertEqual(code, 0, text)
+
+    def test_a_reordered_constant_is_no_control(self):
+        """The reviewer's D1: both cfgs set MaxCrashes to 1 and 2, in another order, and TLC takes the last."""
+        vac = lambda spec: (spec / "mutants" / "vac.cfg").write_text(
+            '\\* expect: OneCrash\nCONSTANTS\n    RM <- MCRM\n    MaxCrashes = 1\n    MaxCrashes = 2\n    MaxDrops = 1\n    Mutant = "no_resend"\nSPECIFICATION Spec\nINVARIANTS OneCrash\n')
+        _, summary, text = self.run_fake({**GOOD, "vac.cfg": ["invariant", 12]}, spare=False, edits={"vac.cfg": [["Invariant Consistent is violated", "Invariant OneCrash is violated"]]}, prep=[
+            add_to_model("OneCrash == crashes <= 1"), vac,
+            self.in_cfg("TwoPhase.cfg", ("MaxCrashes = 1", "MaxCrashes = 2\n    MaxCrashes = 1"), ("TypeOK Consistent", "TypeOK Consistent OneCrash"))])
+        self.assertEqual(summary["verdict"], "fail", text)
+        self.assertIn("FAIL search of TwoPhase.cfg: the cfg sets MaxCrashes more than once", text)
+        self.assertIn("FAIL mutant vac: does not count: the cfg sets MaxCrashes more than once", text)
+        self.assertNotIn("vac.cfg", self.fake.ran)
 
     # The settings, for the reviewer.
 

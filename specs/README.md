@@ -63,7 +63,7 @@ A `CONSTRAINT` may only be a conjunction of upper bounds on counters, and it
 and an override of a defined operator need a line
 `\* limit: <Name> -- <reason>` in the cfg. The runner refuses other limits on
 the search, such as an `ACTION_CONSTRAINT`, a depth limit or a `VIEW`, in
-baselines and mutants. A mutant sets the constant `Mutant` to another value
+baselines and mutants, and a cfg that sets a name twice. A mutant sets the constant `Mutant` to another value
 than the baseline that checks its property. Its control, the same cfg with
 the baseline's value, has to pass before the mutant counts. See
 [limits on the search](../.agents/skills/design-review/references/tla.md#limits-on-the-search).

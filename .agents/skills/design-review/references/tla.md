@@ -151,6 +151,7 @@ and everything else is refused, with the line and what is allowed.
 | `VIEW` | Fails. It merges states, and TLC does not check that the merge is sound |
 | An override (`Op <- X` or `Op = x`) | `X` must be defined in the model's own modules, not in a standard one. A declared `CONSTANT` is free. Overriding a property, a constraint, a variable, `Len`, `Cardinality`, or the `INIT`, `NEXT` or `SPECIFICATION` it runs fails. Overriding another definition, such as `Nat`, needs a `limit` line |
 | An override of a definition that a constraint uses | Fails, unless the new value is a `CONSTANT` or a set of constants |
+| A name set twice: a `CONSTANT` or override, with `=` or `<-`, or `INIT`, `NEXT` or `SPECIFICATION` | Fails. TLC takes the last value, and `<-` before `=`. Naming an `INVARIANT`, `PROPERTY` or `CONSTRAINT` twice is harmless and stays |
 | A mutant configuration | The same rules, with the baselines' `limit` lines only. It expects a property that a baseline checks, as an invariant or as a property like the mutant does. It sets `Mutant` to another value than every baseline that checks it, and runs the `INIT`, `NEXT` or `SPECIFICATION` of a baseline. The property's definition does not read `Mutant`, and a definition that `INIT`, `NEXT` or `SPECIFICATION` uses names the mutant's value. Its control passes. Otherwise it does not count as caught |
 
 The grammar of a constraint. `VARIABLE` and `CONSTANT` are names that the
@@ -199,6 +200,8 @@ many states TLC kept for each constraint. The rule does not detect:
   leaves behavior out;
 - a property or a constant that reads `Mutant` through another definition,
   while a step names the mutant's value without effect;
+- a mutant whose `Mutant` value is the main design's, when the only baseline
+  that checks its property has another `Mutant` value. The settings show it;
 - an action that coverage counts once although one of its cases never
   happens. TLC sums every case of an operator, such as `Crash(1)` and
   `Crash(2)`, or the branches of an `IF`, and does not report an action

@@ -33,6 +33,7 @@ The search rule. TLC reports an exhaustive search whatever a cfg cuts away, so:
   - a cfg may not override a name it checks, its constraints or its INIT, NEXT or SPECIFICATION. Giving a
     declared CONSTANT its value is free. Overriding any other definition, such as Nat, needs a `limit` line;
   - an override may not replace a definition that a constraint uses, unless by a constant value;
+  - a cfg sets each CONSTANT or other name, and INIT, NEXT and SPECIFICATION, once;
   - a mutant cfg is held to the same rule, with the baselines' `limit` lines only (mutant_problems). It sets the
     constant Mutant to another value than the baselines that check its property, of which there must be one, and
     runs the INIT, NEXT or SPECIFICATION of a baseline. The control shows that the property holds at the
@@ -502,6 +503,9 @@ def search_problems(model: Model, cfg: Path, declared: dict[str, str] | None = N
     problems += [f"ACTION_CONSTRAINT {name} removes steps" for name in parsed.sections.get("ACTION_CONSTRAINT", [])]
     problems += [f"VIEW {name} merges states" for name in parsed.sections.get("VIEW", [])]
     text = tc.strip_tla_comments(cfg.read_text(encoding="utf-8"), keep_strings=False)
+    # TLC takes the last value of a name, or the `<-` one, so the text would not say which one ran.
+    names = parsed.overrides + re.findall(r"\b(?:INIT|NEXT|SPECIFICATION)\b", text)
+    problems += [f"the cfg sets {name} more than once" for name in dict.fromkeys(names) if names.count(name) > 1]
     problems += [f"the cfg uses {used}" for used in sorted(set(_SEARCH_STATE.findall(text)))]
     # A standard operator given to a constant or a definition reaches the model without its module naming it.
     problems += [f"the cfg overrides {name} with {target}, which the model's modules do not define"
