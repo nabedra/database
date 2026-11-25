@@ -500,7 +500,21 @@ Left out, for the reviewer and the user to accept:
 
 ### Results
 
-RESULTS_TABLE
+Actions run [45693260761](https://github.com/zPy52/nabedra-database/actions/runs/45693260761) on `1b6a0ca0a9f77957032acf8f8fc70883b6051cd2`, 2026-11-25. All nine evidence records verify as attested by the build workflow on that commit, with a clean tree: 220 assertions, none failed. Every baseline is exhaustive, with 0 states left. 33 baselines, 91 mutants, each with a passing control. Commits after that one change text only.
+
+| Check | Verdict | Baselines: distinct states (depth) | Actions covered | Mutants caught |
+| --- | --- | --- | --- | --- |
+| `vector-latest` | pass | SearchLatest 4,071,260 (38), .batch 6,065,090 (35), .resync 1,463,895 (34), .live 329,400 (34), .commit 3,532 (20), .liveresync 1,578 (22) | 32, min 64,013 | 15 of 15 |
+| `vector-snapshot` | pass | SearchSnapshot 2,228,909 (33), .direct 9,361,722 (35), .live 4,135 (29) | 16, min 15,129 | 11 of 11 |
+| `vector-route` | pass | SearchRoute 11,633,078 (27), .cuts 16,275,672 (23) | 20, min 185,378 | 7 of 7 |
+| `vector-assign` | pass | SearchAssign 6,411,860 (33), .three 324,845 (28), .live 56,412 (27) | 18, min 308,380 | 6 of 6 |
+| `vector-index` | pass | LocalIndex 121,257 (26), .crash 1,548,783 (35), .crashmove 199,846 (25), .moves 302,821 (24), .resync 55,437 (20), .rows 100,830 (23), .live 4,697 (19), .live2 284 (15) | 22, min 4,432 | 20 of 20 |
+| `vector-embed` | pass | EmbedApply 598,892 (39), .attempts 25,931 (29), .column 620,607 (35), .errors 2,793,836 (35), .live 29,156 (32), .liveerrors 17,747 (33) | 19, min 2,178 | 11 of 11 |
+| `vector-lifecycle` | pass | IndexLifecycle 332,540 (43), .two 32,662,640 (51), .live 55,220 (38) | 18, min 46,244 | 8 of 8 |
+| `vector-blobs` | pass | RowBlobs 2,776,848 (30) | 17, min 117,222 | 9 of 9 |
+| `vector-activation` | pass | Activation 244,980 (23) | 7, min 24,500 | 4 of 4 |
+
+Bounds are in each cfg. Counterexample lengths of the mutants are in the run's artifacts. Larger bounds (`*.large.cfg`, T2, simulation) have not run.
 
 ### Counterexamples that changed the plan
 
