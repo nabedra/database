@@ -8,15 +8,15 @@ tiers = ["T1"]
 command = ["bash", "-eo", "pipefail", "-c", '''
 echo "Fault model: OLTP pool on a per-node simulated volume"
 export CARGO_TARGET_DIR="$PWD/$CARGO_TARGET_DIR"
-cargo test --locked -j 2 -p nabedra-oltp-storage --features sim --lib oltp::pool::sim_tests -- --nocapture --test-threads=1
+cargo test --locked -p nabedra-oltp-storage --features sim --lib oltp::pool::sim_tests -- --nocapture --test-threads=1
 for attempt in $(seq 50); do
-    cargo test --locked -j 2 -p nabedra-oltp-storage --features sim --lib oltp::pool::sim_tests::ns04_o11_restart_and_crash_at_each_commit_operation_replay -- --exact --test-threads=1 |
+    cargo test --locked -p nabedra-oltp-storage --features sim --lib oltp::pool::sim_tests::ns04_o11_restart_and_crash_at_each_commit_operation_replay -- --exact --test-threads=1 |
         grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;"
-    cargo test --locked -j 2 -p nabedra-oltp-storage --features sim --lib oltp::pool::sim_tests::ns04_o11_process_kill_preserves_unsynced_pool_writes -- --exact --test-threads=1 |
+    cargo test --locked -p nabedra-oltp-storage --features sim --lib oltp::pool::sim_tests::ns04_o11_process_kill_preserves_unsynced_pool_writes -- --exact --test-threads=1 |
         grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;"
-    cargo test --locked -j 2 -p nabedra-oltp-storage --features sim --lib oltp::pool::sim_tests::o17_mount_identity_and_disk_budget_follow_volume -- --exact --test-threads=1 |
+    cargo test --locked -p nabedra-oltp-storage --features sim --lib oltp::pool::sim_tests::o17_mount_identity_and_disk_budget_follow_volume -- --exact --test-threads=1 |
         grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;"
-    cargo test --locked -j 2 -p nabedra-oltp-storage --features sim --lib oltp::pool::sim_tests::o11_snapshot_install_recovers_the_generation_at_activation -- --exact --test-threads=1 |
+    cargo test --locked -p nabedra-oltp-storage --features sim --lib oltp::pool::sim_tests::o11_snapshot_install_recovers_the_generation_at_activation -- --exact --test-threads=1 |
         grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;"
 done
 ''']

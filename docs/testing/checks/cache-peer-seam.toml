@@ -6,7 +6,7 @@ scenarios = ["K03"]
 tiers = ["T0", "T1"]
 # A simulated peer fixture checks the transport seam. K03 cluster acceptance
 # still requires the workload, history and real-environment checks.
-command = ["cargo", "test", "--locked", "-j", "2", "--no-default-features", "--features", "cache,sim", "--lib", "cache::cluster::transport::tests::k03_peer_session_checks_fingerprints_and_crash_cuts_connection", "--", "--exact", "--test-threads=1"]
+command = ["cargo", "test", "--locked", "--no-default-features", "--features", "cache,sim", "--lib", "cache::cluster::transport::tests::k03_peer_session_checks_fingerprints_and_crash_cuts_connection", "--", "--exact", "--test-threads=1"]
 cwd = "server"
 timeout_s = 900
 needs = []

@@ -12,8 +12,8 @@ echo "fault model: OLTP network profiles, seeds 1 through 50 replayed twice"
 export NABEDRA_SEED=1
 export CARGO_TARGET_DIR="$PWD/$CARGO_TARGET_DIR"
 (
-cargo test --locked -p nabedra-sim-oltp --lib -j 2 net::tests:: -- --test-threads=1 --nocapture
-cargo test --locked -p nabedra-database --no-default-features --features oltp,sim --lib -j 2 oltp_runtime::api_process::sim_net_tests::sim_net_reaches_oltp_handler -- --exact --test-threads=1 --nocapture
+cargo test --locked -p nabedra-sim-oltp --lib net::tests:: -- --test-threads=1 --nocapture
+cargo test --locked -p nabedra-database --no-default-features --features oltp,sim --lib oltp_runtime::api_process::sim_net_tests::sim_net_reaches_oltp_handler -- --exact --test-threads=1 --nocapture
 ) | tee "$log"
 for case in request-cut reply-cut stream-delay fallback-only axum-handler; do
     grep -F "sim-net $case: 50/50 passing with matching replay hashes" "$log"

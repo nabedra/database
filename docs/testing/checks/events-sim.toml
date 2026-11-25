@@ -4,7 +4,7 @@ kinds = ["S", "H"]
 guarantees = ["EVT-G01", "EVT-G02", "EVT-G03", "EVT-G04", "EVT-G06"]
 scenarios = ["EV01", "EV02", "EV07"]
 tiers = ["T1", "T2"]
-command = ["cargo", "test", "--locked", "-j", "2", "--features", "sim", "--lib", "sim::", "--", "--nocapture", "--test-threads=1"]
+command = ["cargo", "test", "--locked", "--features", "sim", "--lib", "sim::", "--", "--nocapture", "--test-threads=1"]
 cwd = "server/events"
 timeout_s = 3600
 needs = []

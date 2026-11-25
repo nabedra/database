@@ -666,7 +666,8 @@ def execute(check: Check, *, evidence_dir: Path | None, log_dir: Path, request_i
     base_env = dict(os.environ if env is None else env)
     run = evidence.run_info(base_env, request_id)
     stem = evidence.record_stem(run["request_id"], check.id)
-    child_env = {**base_env, **check.env, "NABEDRA_REQUEST_ID": run["request_id"]}
+    # Agents share one machine, so a local build gets two jobs. Actions sets its own number.
+    child_env = {"CARGO_BUILD_JOBS": "2", **base_env, **check.env, "NABEDRA_REQUEST_ID": run["request_id"]}
     missing = missing_needs(check, child_env)
     cmd = resolve_command(check.command)
     if dry_run:

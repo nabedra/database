@@ -36,7 +36,7 @@ env = { NABEDRA_CASES = "1000" } # optional
 | `timeout_s` | yes | Positive. On timeout the process group is killed and the result is `error`. |
 | `needs` | no | Environment the check requires. See below. |
 | `result_parser` | yes | How assertion counts are read from the output. See below. |
-| `env` | no | String values added to the environment. `NABEDRA_REQUEST_ID` is always set. |
+| `env` | no | String values added to the environment. `NABEDRA_REQUEST_ID` is always set. `CARGO_BUILD_JOBS` is 2 unless `env` or the caller sets it (Actions: 4), so leave `-j` out of Cargo commands in `command`. |
 | `not_run_marker` | no | A nonblank literal string, up to 300 characters. If the command exits successfully and prints this string without any parsed test failures, the record is `not-run` with zero executed assertions. Use it only when the entire check was skipped. |
 
 Unknown fields are errors.

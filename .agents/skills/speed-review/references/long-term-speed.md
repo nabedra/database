@@ -80,12 +80,3 @@ is slower in the long term.
 
 Pair every harness change with the property it could hurt, and say how we would notice. A change
 with no plausible harm says `none`.
-
-## Source
-
-The method adapts Alex Hormozi's argument that speed, measured to the finished outcome, is the one
-value the others derive from
-([video](https://youtube.com/watch?v=rRI0iH-cpjg)). His drivers, in order, are a single decision
-rule, talent, truth, work ethic, focus, ownership, innovation, quality and the removal of limits,
-with fewer processes as a theme throughout. He warns that "long-term" becomes an excuse to
-deliberate, which is why both claims above need evidence.
