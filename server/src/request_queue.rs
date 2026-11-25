@@ -28,6 +28,9 @@ impl QueueLimits {
         Ok(())
     }
 }
+pub(crate) fn planted(name: &str) -> bool {
+    std::env::var("NABEDRA_P11Q_PLANT").as_deref() == Ok(name)
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestState {
@@ -416,8 +419,9 @@ impl RequestQueue {
                 .map_err(|_| QueueError::Invalid)?,
             request_id: request.request_id,
         }) {
-            return if record.digest == digest(&body)
-                && (record.body.is_empty() || record.body == body)
+            return if planted("attach-any-body")
+                || record.digest == digest(&body)
+                    && (record.body.is_empty() || record.body == body)
             {
                 Ok(record.clone())
             } else {
@@ -819,6 +823,7 @@ impl RequestQueue {
         record.response_status = Some(status);
         record.response_body = Some(body);
         record.completed_at_ms = Some(now_ms);
+        if std::env::var("NABEDRA_RV132").is_ok() { eprintln!("RV132 done {} {:?}", id.request_id, tokio::time::Instant::now()); }
         // Terminal conservation wins over result retention at a finite result
         // cap. Never strand a committed mutation in Running; lookup explicitly
         // reports unavailable and durable history can recover its decision.
@@ -847,10 +852,15 @@ impl RequestQueue {
         if !record.accepted {
             return Err(QueueError::Unavailable);
         }
+        let retention = if planted("early-expiry") {
+            300
+        } else {
+            self.limits.result_retention_ms
+        };
         if record.result_expired
             || record
                 .completed_at_ms
-                .is_some_and(|t| now_ms.saturating_sub(t) >= self.limits.result_retention_ms)
+                .is_some_and(|t| now_ms.saturating_sub(t) >= retention)
         {
             return Err(QueueError::NotFound);
         }

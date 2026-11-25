@@ -1771,7 +1771,13 @@ impl WorkerRuntime {
                                 request_id: id,
                                 run_id: run,
                                 state: record.state,
-                                result: value.get("data").filter(|value| !value.is_null()).cloned(),
+                                result: value
+                                    .get("data")
+                                    .filter(|value| {
+                                        !value.is_null()
+                                            && !crate::request_queue::planted("drop-ram-result")
+                                    })
+                                    .cloned(),
                                 error: value
                                     .get("error")
                                     .map(|value| {
@@ -1782,6 +1788,9 @@ impl WorkerRuntime {
                         })
                     })
                     .await;
+            }
+            Ok((_, None)) if crate::request_queue::planted("lose-pending") => {
+                return Err(QueueError::NotFound.protocol());
             }
             Ok((record, None)) if record.state != RequestState::Reconciling => {
                 return Ok(OwnedReceipt::from(Receipt {
@@ -1808,6 +1817,19 @@ impl WorkerRuntime {
                 };
                 let record = terminal_record(&terminal)?;
                 if record.run_id != run {
+                    return Err(QueueError::Abandoned.protocol());
+                }
+                if crate::request_queue::planted("abandon-committed")
+                    && self
+                        .services
+                        .control
+                        .current(&self.services.scope)
+                        .await?
+                        .ready
+                        .view
+                        .run_id
+                        != run
+                {
                     return Err(QueueError::Abandoned.protocol());
                 }
                 if !self.terminal_receipt_ready(run, id, None).await? {

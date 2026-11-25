@@ -295,6 +295,17 @@ impl RemoteRuntime {
     async fn receipt_owned(&self, run: Uuid, id: Uuid) -> Result<OwnedReceipt, ProtocolError> {
         let observed = self.client.observe(run, id).await?;
         let state = observed.metadata.record.state;
+        use crate::request_queue::planted;
+        // An accepted, pending request is reported as if it had never been accepted.
+        if planted("gateway-lose-pending") && !state.terminal() {
+            return Err(crate::request_queue::QueueError::NotFound.protocol());
+        }
+        // An old run's committed request is reported abandoned.
+        if planted("gateway-abandon-committed")
+            && self.control.current(&self.scope).await?.ready.view.run_id != run
+        {
+            return Err(crate::request_queue::QueueError::Abandoned.protocol());
+        }
         if !state.terminal() {
             return Ok(Receipt {
                 request_id: id,
@@ -306,6 +317,10 @@ impl RemoteRuntime {
             .into());
         }
         let bytes = self.client.result(observed).await?;
+        #[cfg(feature = "sim")]
+        let node = nabedra_rt::sim::current_node();
+        #[cfg(not(feature = "sim"))]
+        let node = None::<u64>;
         let shared = self.shared.clone();
         self.shared
             .execute(ExecutionClass::Control, 0, 0, move || {
@@ -322,7 +337,12 @@ impl RemoteRuntime {
                 let result = value
                     .get_mut("data")
                     .map(serde_json::Value::take)
-                    .filter(|v| !v.is_null());
+                    .filter(|v| !v.is_null())
+                    // One gateway drops the result of a settled request.
+                    .filter(|_| {
+                        !(crate::request_queue::planted("gateway-drop-result")
+                            && node == Some(102))
+                    });
                 let error = value
                     .get_mut("error")
                     .map(serde_json::Value::take)

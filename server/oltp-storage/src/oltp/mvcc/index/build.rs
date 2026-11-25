@@ -170,6 +170,18 @@ impl IndexService {
             }
             nabedra_rt::time::sleep(std::time::Duration::from_millis(2)).await;
         };
+        if std::env::var("P11_TOPO_MUT").as_deref() == Ok("early-fence")
+            && let Err(cause) = self
+                .backend
+                .planner()
+                .fence_direct_writers(&metadata.pin, definition.table_id, Some(metadata.txn.request_id))
+                .await
+        {
+            return self.failed(metadata, PlanError::Guarded {
+                cause: Box::new(cause),
+                guards: vec![guard],
+            }).await;
+        }
         if let Err(cause) = self.backend.planner().validate_index_declaration(&metadata.pin, &definition).await {
             return self.failed(metadata, PlanError::Guarded {
                 cause: Box::new(cause),

@@ -304,6 +304,7 @@ impl WorkerRuntime {
                 let handle = actor.spawn(move || async move {
                     let _gate = gate;
                     if let Err(error) = service.resume(&record).await {
+                        eprintln!("P11 index {} build stopped: {:?} {} {:?}", selector.index_id, error.code, error.message, error.outcome);
                         tracing::warn!(index=%selector.index_id, build=%selector.build_id, attempt=selector.attempt,
                             code=?error.code, message=%error.message, "index build stopped before completion");
                     }

@@ -1475,6 +1475,9 @@ impl DirectExecutor {
                     .into_iter()
                     .chain(entries.put.map(|(key, cover)| (key, Some(cover))))
                 {
+                    if value.is_none() && std::env::var("P11_TOPO_MUT").as_deref() == Ok("keep-old-entry") {
+                        continue;
+                    }
                     let Some((expected, _)) =
                         self.latest(handle, key.clone(), epochs, deadline).await?
                     else {

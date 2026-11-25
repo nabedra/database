@@ -58,6 +58,12 @@ impl DirectAdmission {
             .resources
             .reserve_scratch(ByteClass::Data, working_bytes(body_bytes))
             .map_err(|_| DirectResponse::overloaded("worker memory budget is full"))?;
+        if nabedra_oltp_types::sim_probe::plant("admission-bytes", 60) {
+            std::mem::forget(self.resources.reserve_scratch(ByteClass::Data, 564));
+        }
+        if nabedra_oltp_types::sim_probe::plant("admission-slot", 60) {
+            std::mem::forget(self.slots.clone().try_acquire_owned());
+        }
         Ok(Admitted {
             _slot: slot,
             _bytes: bytes,

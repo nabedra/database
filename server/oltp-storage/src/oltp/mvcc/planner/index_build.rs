@@ -254,7 +254,12 @@ impl NativePlanner {
             .await?;
             // Fence before publishing the new lifecycle. A rejected
             // validation must leave Data on the current Catalog lifecycle.
-            self.fence_direct_writers(pin, maintenance.table_id, Some(txn.request_id))
+            let named = if std::env::var("P11_TOPO_MUT").as_deref() == Ok("wrong-fence") {
+                Uuid::from_u128(txn.request_id.as_u128() ^ 1)
+            } else {
+                txn.request_id
+            };
+            self.fence_direct_writers(pin, maintenance.table_id, Some(named))
                 .await?;
             Ok(plan)
         }

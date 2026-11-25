@@ -360,6 +360,16 @@ impl TopologyCache {
                 .zip(start.as_ref())
                 .is_some_and(|(end, start)| !compare_primary(end, start).is_gt())
         };
+        if std::env::var("P11_TOPO_MUT").as_deref() == Ok("keep-stale-route")
+            && lru.entries.get(&route.table_id).is_some_and(|routes| {
+                routes.iter().any(|(existing, _)| {
+                    let old = &existing.range.shard.span;
+                    !(before(&old.end, &span.start) || before(&span.end, &old.start))
+                })
+            })
+        {
+            return;
+        }
         lru.remove(route.table_id, |existing, _| {
             let old = &existing.range.shard.span;
             existing.schema_epoch != route.schema_epoch

@@ -1,0 +1,29 @@
+id = "p11int-member-plants"
+# Scratch, never merged. It asserts nothing and always exits 1.
+module = "oltp"
+kinds = ["S", "H"]
+guarantees = []
+scenarios = []
+tiers = ["T2"]
+command = ["bash", "-euc", '''
+build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+"${build[@]}" --no-run
+run() {
+  echo "PLANT $1 defect=$2 product=$3 steps=$4"
+  NABEDRA_SIM_MEMBERSHIP_DEFECT=$2 P11_PLANT=$3 NABEDRA_SIM_MEMBERSHIP=$4 NABEDRA_SIM_ARTIFACTS=../../target/testing-logs/plant-$1 \
+    timeout 600s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1 2>&1 | grep -E "nabedra-sim-seed:|PLANT|OperatorGuidance|RetryCertifies|RequiredVoters|QueueHandoff" | cut -c1-400 || true
+}
+run dv drop-voter "" moves
+run ov old-voter "" moves
+run fs full-stop "" rolling
+run rb "" retry-body moves
+run av "" any-voter moves
+run tm "" "" moves
+run tr "" "" rolling
+exit 1
+''']
+cwd = "server"
+timeout_s = 4200
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "membership", NABEDRA_SIM_PROFILE = "none", NABEDRA_SEEDS = "2", NABEDRA_SIM_JOBS = "1", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "p11int-member-plants" }
