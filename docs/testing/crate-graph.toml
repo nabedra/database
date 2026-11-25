@@ -9,7 +9,7 @@
 # each other (transport and storage, for example). A workspace package without a layer fails.
 [[layer]]
 name = "runtime"
-packages = ["nabedra-rt", "nabedra-simd"]
+packages = ["nabedra-rt"]
 
 [[layer]]
 name = "harness"
@@ -21,7 +21,7 @@ packages = ["nabedra-sim"]
 
 [[layer]]
 name = "protocol"
-packages = ["nabedra-protocol", "nabedra-kv"]
+packages = ["nabedra-protocol", "nabedra-kv", "nabedra-simd"]
 
 [[layer]]
 name = "resources"
