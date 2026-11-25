@@ -54,8 +54,7 @@ pub(crate) async fn run(
 ) -> Result<Report, String> {
     cluster.wait_direct().await?;
     let table = create_table(cluster, &history).await?;
-    for node in WORKERS {
-        let stats = cluster.stats(node).await?;
+    for (node, stats) in crate::workload::steady(cluster).await? {
         cluster
             .checks
             .capture_resources(&cluster.world, node, &stats);
@@ -386,6 +385,13 @@ pub(crate) async fn run(
         "unresolved": observed.unresolved.len(),
         "one_paused_late": outcome.one_paused_late,
         "move_wait_ms": move_wait_ms,
+        "placed": chaos.as_ref().map(|chaos| {
+            let mut placed = std::collections::BTreeMap::<&str, u32>::new();
+            for fault in chaos.log.iter().filter(|fault| fault.request.is_some()) {
+                *placed.entry(fault.variant).or_default() += 1;
+            }
+            placed
+        }),
         "heal_cold_start": chaos.as_ref().is_some_and(|chaos| chaos.heal_cold),
     });
     cluster.record(format!("workload summary {}", report.summary));

@@ -22,6 +22,7 @@ use crate::{
     disk::DiskCut,
     invariants::elapsed_ms,
     node::Cluster,
+    probes::Probe,
     workloads::{
         clauses::Fault,
         clients::{self, Ctx},
@@ -35,6 +36,12 @@ const SPLIT_LIMIT: Duration = Duration::from_secs(60);
 /// Follow-ups that cannot run yet are tried again after this pause.
 const DEFER_MS: u64 = 500;
 const RESTART_TRIES: u32 = 4;
+/// Two of the executor's `RETRY_PAUSE`s (2 ms): too late for another attempt (design 3.5).
+const LAST_ATTEMPT_US: u64 = 4_000;
+/// How long a reply cut at a last attempt stays in place.
+const LAST_ATTEMPT_CUT: Duration = Duration::from_millis(50);
+/// How long a probe-placed fault waits for its protocol point.
+const PLACE_LIMIT: Duration = Duration::from_secs(2);
 
 /// A requested split that has not published.
 struct PendingSplit {
@@ -137,6 +144,7 @@ impl Chaos {
             to: None,
             quiet: false,
             variant: "",
+            request: None,
             observed: false,
         });
         self.log.last_mut().expect("pushed fault")
@@ -279,6 +287,55 @@ impl Chaos {
             .filter(|node| cluster.is_running(*node) && !cluster.frozen().contains(node))
             .collect();
         (!candidates.is_empty()).then(|| *g.pick(&candidates))
+    }
+
+    /// Wait until a probe shows that `node` (or any worker) applied a direct commit that a
+    /// client still waits for: the Raft entry is committed, and no answer has left the leader.
+    /// Returns the request and the gateway that carries it.
+    async fn applied(cluster: &Cluster, ctx: &Ctx, node: Option<u64>) -> Option<(Uuid, u64)> {
+        let mut applied = cluster.checks.probes()?.subscribe(move |event| {
+            event.live
+                && matches!(event.probe, Probe::DedupApplied { .. })
+                && node.is_none_or(|node| event.node == Some(node))
+        });
+        time::timeout(PLACE_LIMIT, async {
+            while let Some(event) = applied.recv().await {
+                if let Probe::DedupApplied { request_id, .. } = event.probe
+                    && let Some(gateway) = ctx.waiting(request_id)
+                {
+                    return Some((request_id, gateway));
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Wait until a gateway sends an attempt of a request a client waits for with less than
+    /// [`LAST_ATTEMPT_US`] left. Returns the request and the voter the attempt goes to.
+    async fn last_attempt(cluster: &Cluster, ctx: &Ctx) -> Option<(Uuid, u64)> {
+        let mut attempts = cluster.checks.probes()?.subscribe(move |event| {
+            event.live
+                && matches!(event.probe, Probe::GatewayAttempt { remaining_us, .. }
+                    if remaining_us < LAST_ATTEMPT_US)
+        });
+        time::timeout(PLACE_LIMIT, async {
+            while let Some(event) = attempts.recv().await {
+                if let Probe::GatewayAttempt {
+                    request_id, voter, ..
+                } = event.probe
+                    && ctx.waiting(request_id).is_some()
+                {
+                    return Some((request_id, voter));
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     async fn act(&mut self, cluster: &mut Cluster, ctx: &Ctx, g: &mut Gen, action: Action) {
@@ -446,6 +503,39 @@ impl Chaos {
                 let duration = window(g, 500, 3_000);
                 self.note(cluster, ctx, "deadline-edge", json!({"worker": leader, "delay_ms": delay.as_millis() as u64, "ms": duration.as_millis() as u64}));
                 self.later(cluster, duration, FollowUp::ClearNet(action));
+                // Cut the reply of an attempt that no retry can follow. A cut that is already
+                // open keeps its own end.
+                let cut = self
+                    .log
+                    .iter()
+                    .any(|fault| fault.action == Action::LostReply && fault.to.is_none());
+                if g.bool()
+                    && !cut
+                    && let Some((request, voter)) = Self::last_attempt(cluster, ctx).await
+                {
+                    // A moved replica has a new node ID, whose worker the probe doesn't name.
+                    let worker = if WORKERS.contains(&voter) {
+                        voter
+                    } else {
+                        leader
+                    };
+                    self.faults.lose_replies(worker, 1_000);
+                    let fault = self.open(cluster, Action::LostReply, &[worker]);
+                    fault.variant = "last-attempt";
+                    fault.request = Some(request);
+                    self.note(
+                        cluster,
+                        ctx,
+                        "lost-reply",
+                        json!({"worker": worker, "per_mille": 1_000, "request": request}),
+                    );
+                    *self.executed.entry(Action::LostReply).or_default() += 1;
+                    self.later(
+                        cluster,
+                        LAST_ATTEMPT_CUT,
+                        FollowUp::ClearNet(Action::LostReply),
+                    );
+                }
             }
             Action::AuthFlap => {
                 let gateway = *g.pick(&GATEWAYS);
@@ -480,11 +570,24 @@ impl Chaos {
                 self.later(cluster, duration, FollowUp::RestoreCertificate(gateway));
             }
             Action::KillGateway => {
-                let gateway = *g.pick(&GATEWAYS);
+                let mut gateway = *g.pick(&GATEWAYS);
+                // After the leader proposed and applied a request, before its answer (D02).
+                let placed = if g.bool() {
+                    Self::applied(cluster, ctx, None).await
+                } else {
+                    None
+                };
+                if let Some((_, waiting)) = placed {
+                    gateway = waiting;
+                }
                 if !cluster.is_running(gateway) {
                     return self.skip(cluster, action, "the gateway is already down");
                 }
-                self.open(cluster, action, &[gateway]);
+                let fault = self.open(cluster, action, &[gateway]);
+                if let Some((request, _)) = placed {
+                    fault.variant = "after-propose";
+                    fault.request = Some(request);
+                }
                 cluster.kill_gateway(gateway).await;
                 let duration = window(g, 300, 3_000);
                 self.note(
@@ -500,7 +603,7 @@ impl Chaos {
                     return self.skip(cluster, action, "no running worker");
                 };
                 let power = action == Action::PowerLeader;
-                let variant = *g.pick(&["", "before-quorum", "lost-replies"]);
+                let variant = *g.pick(&["", "before-quorum", "lost-replies", "after-quorum"]);
                 let followers: Vec<u64> = WORKERS
                     .into_iter()
                     .filter(|node| *node != leader && !cluster.frozen().contains(node))
@@ -521,7 +624,14 @@ impl Chaos {
                     }
                     _ => {}
                 }
-                self.open(cluster, action, &[leader]).variant = variant;
+                let placed = if variant == "after-quorum" {
+                    Self::applied(cluster, ctx, Some(leader)).await
+                } else {
+                    None
+                };
+                let fault = self.open(cluster, action, &[leader]);
+                fault.variant = variant;
+                fault.request = placed.map(|(request, _)| request);
                 cluster
                     .crash(leader, if power { DiskCut::Power } else { DiskCut::Kill })
                     .await;
@@ -542,7 +652,17 @@ impl Chaos {
                 let Some(leader) = self.leader_or_any(cluster, g).await else {
                     return self.skip(cluster, action, "no running worker");
                 };
-                self.open(cluster, action, &[leader]);
+                // Between `Applied` and the reply: the lost responder.
+                let placed = if g.bool() {
+                    Self::applied(cluster, ctx, Some(leader)).await
+                } else {
+                    None
+                };
+                let fault = self.open(cluster, action, &[leader]);
+                if let Some((request, _)) = placed {
+                    fault.variant = "after-apply";
+                    fault.request = Some(request);
+                }
                 let drained = cluster.drain(leader).await;
                 cluster.crash(leader, DiskCut::Kill).await;
                 if let Err(error) = &drained {

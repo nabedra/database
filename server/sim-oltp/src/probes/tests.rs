@@ -96,6 +96,73 @@ fn a_cut_node_is_marked_dead_until_it_restarts() {
     });
 }
 
+/// Lead decision 12.1. One identity commits with body 1 at 1 ms. The refusals differ in the
+/// body they answer and in when that body was first sent.
+#[test]
+fn a_refusal_of_another_body_is_excused_only_if_it_was_sent_after_the_commit() {
+    let verdict = |sent: &[(u64, u64, i64)], refused: (u64, i64)| {
+        sim::run(1, |world| {
+            let (sent, refused) = (sent.to_vec(), refused);
+            async move {
+                world.add_node(1, NodeClock::default());
+                let (checks, _) = installed(&world);
+                let (table, request) = (Uuid::from_u128(3), Uuid::from_u128(4));
+                nabedra_rt::time::sleep(std::time::Duration::from_millis(1)).await;
+                in_node(1, async {
+                    emit(|| Probe::DedupApplied {
+                        group: Uuid::nil(),
+                        table,
+                        anchor: Key::Int64(5),
+                        request_id: request,
+                        commit_ts: 9,
+                        digest: Digest::from_bytes([1; 32]),
+                    })
+                })
+                .await;
+                let mut events = Vec::new();
+                let mut push = |kind, process, time_ns, value| {
+                    let mut event = Event::new(kind, process, "upsert")
+                        .with_value(value)
+                        .with_key(&format!("{table}/5"));
+                    event.request_id = Some(request.to_string());
+                    event.index = events.len();
+                    event.time_ns = Some(time_ns);
+                    events.push(event);
+                };
+                for (process, time_ns, body) in sent {
+                    push(
+                        EventType::Invoke,
+                        process,
+                        time_ns,
+                        json!({"id": 5, "value": body}),
+                    );
+                }
+                let (process, _) = refused;
+                let answer = json!({"not_applied": true, "code": "conflict"});
+                push(EventType::Fail, process, 9_000_000, answer);
+                checks.check_outcomes(&world, &events);
+                checks.probe_invariants_hold()
+            }
+        })
+    };
+    let (before, after) = (500_000, 2_000_000);
+    // DR-1, insert refused, and DR-2: the body that committed is refused, whatever the code.
+    assert!(!verdict(&[(0, before, 1), (1, after, 1)], (1, 1)));
+    // The refused body had been sent before the commit, so the entry may carry it.
+    assert!(!verdict(&[(0, before, 1), (1, before, 2)], (1, 2)));
+    // A retry of a body first sent before the commit is still that body.
+    assert!(!verdict(
+        &[(0, before, 2), (1, before, 1), (2, after, 2)],
+        (2, 2)
+    ));
+    // D03: another body, first sent after the identity committed.
+    assert!(verdict(&[(0, before, 1), (1, after, 2)], (1, 2)));
+    // The same instant proves nothing.
+    assert!(!verdict(&[(0, before, 1), (1, 1_000_000, 2)], (1, 2)));
+    // No invocation of the refused call: nothing proves another body.
+    assert!(!verdict(&[(0, before, 1)], (7, 2)));
+}
+
 #[test]
 fn not_applied_answers_never_have_a_committed_dedup_record() {
     sim::run(1, |world| async move {
@@ -146,7 +213,14 @@ fn replayed(seed: u64) -> RunResult {
         nabedra_sim::runtime::SEEDED,
         "build with RUSTFLAGS=\"--cfg tokio_unstable\" and CARGO_TARGET_DIR=target/sim"
     );
-    let [run, replay] = [(); 2].map(|()| run_seed(seed, &mut workload_gen(seed), Defect::None));
+    let [run, replay] = [(); 2].map(|()| {
+        run_seed(
+            seed,
+            &mut workload_gen(seed),
+            Defect::None,
+            &crate::sweep::Setup::smoke(),
+        )
+    });
     let rules = run
         .run
         .trace_tail
@@ -275,7 +349,12 @@ fn control_digests_replay() {
     for seed in seeds() {
         let [first, second] = [(); 2].map(|()| {
             *CONTROL.lock().unwrap() = Some(Vec::new());
-            run_seed(seed, &mut workload_gen(seed), Defect::None);
+            run_seed(
+                seed,
+                &mut workload_gen(seed),
+                Defect::None,
+                &crate::sweep::Setup::smoke(),
+            );
             CONTROL.lock().unwrap().take().unwrap()
         });
         assert!(

@@ -15,6 +15,7 @@ use nabedra_sim::sweep::{self, PlantedSearch, SeedRun, SweepConfig, SweepReport}
 use serde_json::{Value, json};
 
 use crate::{
+    invariants::protocol::PROBE_INVARIANTS,
     nemesis::Selection,
     panics::PANIC,
     workload::run_seed,
@@ -57,20 +58,6 @@ impl Defect {
     }
 }
 
-/// The invariants of design 3.7 that need the P10-PROBES event stream.
-const PROBE_INVARIANTS: [&str; 10] = [
-    "ElectionSafety",
-    "MonotonicVote",
-    "MonotonicCommit",
-    "LogMatching",
-    "AppliedPrefixesAgree",
-    "MajorityReached",
-    "DedupUnique over Applied",
-    "NotAppliedNeverCommitted over Applied",
-    "RangeClockRule1",
-    "KeyspaceCoverage over RouteEpochPublished",
-];
-
 /// A completed run's named assertion verdicts. Omit families that did not execute.
 pub(crate) struct RunResult {
     pub(crate) run: SeedRun,
@@ -80,6 +67,8 @@ pub(crate) struct RunResult {
     /// Scenarios whose assertions executed in this seed.
     pub(crate) scenarios: Scenarios,
     pub(crate) summary: Value,
+    /// How often each probe-driven rule ran on an event of its own.
+    pub(crate) exercised: BTreeMap<&'static str, u64>,
 }
 
 /// The workload and nemesis selection of a sweep (`NABEDRA_SIM_WORKLOAD`,
@@ -395,8 +384,16 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     }
     let started = time::now_std();
     let observed = Mutex::new(BTreeMap::<u64, ObservedSeed>::new());
+    let exercised = Mutex::new(BTreeMap::<&'static str, u64>::new());
     let report = sweep::sweep(&config, |seed, generator| {
         let (result, measurement) = measured(seed, generator, defect, &setup);
+        for (rule, times) in &result.exercised {
+            *exercised
+                .lock()
+                .expect("exercised rules poisoned")
+                .entry(rule)
+                .or_default() += times;
+        }
         let mut observed = observed.lock().expect("sweep observations poisoned");
         let observation = observed.entry(seed).or_insert_with(|| {
             let config_hash = result.run.config["hash"].as_str().map_or_else(
@@ -576,6 +573,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             workload,
             smoke: setup.workloads.is_smoke(),
             scenarios: scenario_assertions,
+            exercised: exercised.into_inner().expect("exercised rules poisoned"),
             assertions,
             defects_skipped: test_defects && !report.passed(),
             duration_s,
@@ -688,6 +686,8 @@ struct RecordInput {
     smoke: bool,
     /// Scenario tags that executed, and whether every seed that executed one passed.
     scenarios: BTreeMap<&'static str, bool>,
+    /// Probe-driven rules, with how often they ran in the whole range.
+    exercised: BTreeMap<&'static str, u64>,
     assertions: BTreeMap<&'static str, bool>,
     defects_skipped: bool,
     duration_s: f64,
@@ -757,12 +757,10 @@ fn write_record(
         record.not_run("seeded defects", "the unmodified smoke sweep failed");
     }
     for invariant in PROBE_INVARIANTS {
-        record.not_run(invariant, "P10-PROBES integration pending");
+        if !input.exercised.contains_key(invariant) {
+            record.not_run(invariant, "no seed in this range exercised it");
+        }
     }
-    record.not_run(
-        "ResourceBaseline ledger and RangeClock pending sets",
-        "P10-PROBES integration pending",
-    );
     record.not_run("ConsistentCommittedData", "P10-PROBES integration pending");
     if input.smoke {
         for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {
