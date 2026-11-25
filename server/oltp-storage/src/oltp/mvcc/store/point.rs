@@ -80,6 +80,8 @@ impl ParticipantMachine {
                     {
                         return Err(invalid());
                     }
+                    #[cfg(feature = "sim")]
+                    super::snapshot_probe(&group, request.read_ts);
                     let mut records = Vec::with_capacity(request.keys.len());
                     let mut used = 4096 + records.capacity() * std::mem::size_of::<ScanRecord>();
                     for key in request.keys.iter() {
