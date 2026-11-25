@@ -265,7 +265,7 @@ fn vs17_values_reject_every_malformed_form() {
         format!(r#"{{"f32":"{}"}}"#, b64(&f32::NEG_INFINITY.to_le_bytes())),
         // multi
         format!(r#"{{"f32s":"{two}"}}"#),
-        format!(r#"{{"n":2}}"#),
+        r#"{"n":2}"#.to_string(),
         format!(r#"{{"f32s":"{two}","n":null}}"#),
         format!(r#"{{"f32s":"{two}","n":3}}"#),
         format!(r#"{{"f32s":"{two}","n":0}}"#),
@@ -306,27 +306,19 @@ fn vs17_values_are_bounded_before_they_are_decoded() {
     assert_eq!(code(value(&multi(1025, 1))), ErrorCode::LimitExceeded);
     assert_eq!(code(value(&multi(1, 4097))), ErrorCode::ValidationError);
     assert_eq!(code(value(&multi(1024, 257))), ErrorCode::LimitExceeded);
-    let list = format!("[\"{}\"]", "x".repeat(MAX_ROW_BYTES));
-    assert_eq!(code(value(&list)), ErrorCode::LimitExceeded);
     let huge = format!(r#"{{"f32":"{}"}}"#, "A".repeat(6 * MAX_ROW_BYTES));
     assert_eq!(code(value(&huge)), ErrorCode::LimitExceeded);
 }
 
 #[test]
-fn vs17_rows_are_bounded_by_their_canonical_json() {
-    // {"id":"..."} has nine more bytes.
-    let row = |n: usize| format!(r#"{{"id":"{}"}}"#, "x".repeat(n));
-    assert!(decode_upsert_row(&row(MAX_ROW_BYTES - 9)).is_ok());
-    assert_eq!(
-        code(decode_upsert_row(&row(MAX_ROW_BYTES - 8))),
-        ErrorCode::LimitExceeded
-    );
+fn upsert_rows_decode_one_object_with_unique_columns() {
     assert_eq!(
         code(decode_upsert_row(r#"{"id":1,"id":1}"#)),
         ErrorCode::ValidationError
     );
     for text in ["[]", "null", "1", r#"{"a":1} x"#, r#"{"a":1"#, ""] {
         assert_eq!(code(decode_row(text)), ErrorCode::ValidationError, "{text}");
+        assert_eq!(code(decode_upsert_row(text)), ErrorCode::ValidationError);
     }
 }
 
@@ -460,19 +452,9 @@ fn search_options_round_trip_and_are_absent_when_empty() {
         table
     );
 
-    // An empty map is the same as none and has one encoding.
-    let Operation::Create(p) = parse_op(
-        "table.create",
-        create(json!({"id":"utf8"}), json!({"full_text":{},"embed":{}})),
-    )
-    .unwrap() else {
-        panic!();
-    };
-    assert_eq!(
-        serde_json::to_string(&p).unwrap(),
-        r#"{"name":"chunks","schema":{"id":"utf8"},"key":"id","format":"parquet"}"#
-    );
     for options in [
+        json!({"full_text": {}}),
+        json!({"embed": {}}),
         json!({"partition_by": null}),
         json!({"full_text": null}),
         json!({"embed": null}),
@@ -506,7 +488,7 @@ fn schema_rules_reject_every_violation() {
     let vector = json!({"type":"vector","dim":2});
     let ok = |schema, options| parse_op("table.create", create(schema, options)).map(|_| ());
     ok(
-        json!({"id":"utf8","tenant":"bool","body":"utf8","v":vector}),
+        json!({"id":"utf8","tenant":"int64","body":"utf8","v":vector}),
         json!({"partition_by":"tenant","full_text":{"body":"english"},"embed":{"v":{"source":"body","model":"a.b-C_1"}}}),
     )
     .unwrap();
@@ -760,32 +742,50 @@ fn rows_are_validated_against_every_column_type() {
 
 #[test]
 fn vs17_a_row_of_a_search_table_is_at_most_one_mebibyte() {
-    let table = chunks();
-    let mut big = row();
-    big["body"] = json!("x".repeat(MAX_ROW_BYTES));
-    for (op, payload) in [
-        ("table.insert", json!({"table_id":ID,"row":big})),
-        ("table.insert_many", json!({"table_id":ID,"rows":[big]})),
-        (
-            "table.update",
-            json!({"table_id":ID,"key":"a","values":{"body":big["body"]}}),
-        ),
-    ] {
-        assert_eq!(
-            code(parse_op(op, payload).unwrap().validate_for_table(&table)),
-            ErrorCode::LimitExceeded
-        );
+    let table: TableDescriptor = serde_json::from_value(json!({
+        "id":ID,"name":"t","key":"id","format":"parquet",
+        "schema":{"id":"utf8","f":"float64","m":{"type":"list","item":{"type":"vector","dim":4096}}},
+    }))
+    .unwrap();
+    // 60 vectors of 16 KiB each, as raw bytes. Their base64 is 1.25 MiB.
+    let vectors = json!({"f32s":floats(&vec![1.0; 60 * 4096]),"n":60});
+    let rest = 60 * 4096 * 4 + r#"{"f":0,"id":"","m":{"f32s":"","n":60}}"#.len();
+    for (over, allowed) in [(0, true), (1, false)] {
+        let row =
+            json!({"id":"x".repeat(MAX_ROW_BYTES - rest + over),"f":1.2345678e-200,"m":vectors});
+        for (op, payload) in [
+            ("table.insert", json!({"table_id":ID,"row":row})),
+            ("table.upsert", json!({"table_id":ID,"row":row})),
+            ("table.insert_many", json!({"table_id":ID,"rows":[row]})),
+            ("table.upsert_many", json!({"table_id":ID,"rows":[row]})),
+        ] {
+            let checked = parse_op(op, payload).unwrap().validate_for_table(&table);
+            assert_eq!(checked.is_ok(), allowed, "{op} {over}");
+            if !allowed {
+                assert_eq!(code(checked), ErrorCode::LimitExceeded);
+            }
+        }
     }
-    // Other tables keep today's limit.
-    let scalar: TableDescriptor = serde_json::from_value(
-        json!({"id":ID,"name":"t","schema":{"id":"utf8"},"key":"id","format":"parquet"}),
+    let update = json!({"table_id":ID,"key":"a","values":{"f":1.0,"m":{"f32s":"","n":0}}});
+    parse_op("table.update", update)
+        .unwrap()
+        .validate_for_table(&table)
+        .unwrap();
+    // Tables without search columns keep today's limit, lists included.
+    let plain: TableDescriptor = serde_json::from_value(
+        json!({"id":ID,"name":"t","schema":{"id":"utf8","l":{"type":"list","item":"utf8"}},"key":"id","format":"parquet"}),
     )
     .unwrap();
-    let row = json!({"id":"x".repeat(MAX_ROW_BYTES)});
-    parse_op("table.insert", json!({"table_id":ID,"row":row}))
-        .unwrap()
-        .validate_for_table(&scalar)
-        .unwrap();
+    let row = json!({"id":"x".repeat(MAX_ROW_BYTES),"l":["x".repeat(MAX_ROW_BYTES)]});
+    for (op, payload) in [
+        ("table.insert", json!({"table_id":ID,"row":row})),
+        ("table.upsert_many", json!({"table_id":ID,"rows":[row]})),
+    ] {
+        parse_op(op, payload)
+            .unwrap()
+            .validate_for_table(&plain)
+            .unwrap();
+    }
 }
 
 // ---- the scalar grammar ----
@@ -954,7 +954,6 @@ fn text_filters_decode_strictly_and_match() {
         json!({"op":"contains_any","column":"acl","value":"g"}),
         json!({"op":"contains_any","column":"acl","values":"g"}),
         json!({"op":"contains_any","column":"acl","values":[1]}),
-        json!({"op":"contains_any","column":"acl","values":vec!["x"; MAX_FILTER_VALUES + 1]}),
         json!({"op":"starts_with","column":"body"}),
         json!({"op":"ends_with","column":"body","value":"x"}),
         json!({"op":"eq","column":"id","value":null}),
@@ -962,10 +961,6 @@ fn text_filters_decode_strictly_and_match() {
     ] {
         assert_eq!(code(query(&filter)), ErrorCode::ValidationError, "{filter}");
     }
-    assert!(
-        query(&json!({"op":"contains_any","column":"acl","values":vec!["x"; MAX_FILTER_VALUES]}))
-            .is_ok()
-    );
     // Types are checked against the table.
     for filter in [
         json!({"op":"contains","column":"body","value":"g"}),
@@ -1020,6 +1015,37 @@ fn vs15_row_identities_depend_on_call_and_key_only() {
             assert!(seen.insert(id(call, Key::Int64(key))));
             assert!(seen.insert(id(call, Key::Utf8(key.to_string()))));
         }
+    }
+}
+
+#[test]
+fn vs15_a_row_runs_as_one_canonical_request() {
+    let (call, table): (Uuid, Uuid) = (ID.parse().unwrap(), Uuid::from_u128(1));
+    let spaced = r#"{ "v" : {"f32":"\u0041ACAPwAAAEA="}, "n": 1.50, "id": "doc7#0" }"#;
+    let plain = r#"{"id":"doc7#0","n":1.5,"v":{"f32":"AACAPwAAAEA="}}"#;
+    for row in [spaced, plain] {
+        let request =
+            upsert_row_request(call, table, "id", decode_upsert_row(row).unwrap()).unwrap();
+        // This encoding is the digest of the row's dedup record and forward
+        // marker, so it must never change.
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"request_id":"ce86273c-5e29-8399-98eb-f18f7c9ce73b","operation":"table.upsert","payload":{"table_id":"00000000-0000-0000-0000-000000000001","row":{"id":"doc7#0","n":1.5,"v":{"f32":"AACAPwAAAEA="}}}}"#
+        );
+    }
+    let request = delete_row_request(call, table, Key::Int64(-7)).unwrap();
+    assert_eq!(
+        serde_json::to_string(&request).unwrap(),
+        r#"{"request_id":"85853730-ce48-84e0-8cd2-086778568add","operation":"table.delete","payload":{"table_id":"00000000-0000-0000-0000-000000000001","key":-7}}"#
+    );
+    for row in [
+        r#"{"v":1}"#,
+        r#"{"id":1.0}"#,
+        r#"{"id":true}"#,
+        r#"{"id":null}"#,
+    ] {
+        let row = decode_upsert_row(row).unwrap();
+        assert!(upsert_row_request(call, table, "id", row).is_err());
     }
 }
 
@@ -1266,7 +1292,7 @@ fn rank_decodes_round_trips_and_defaults() {
         rank(|p| p["rank"]["rankings"][0]["op"] = json!("l2")),
         rank(|p| {
             p["rank"]["rankings"][0] =
-                json!({"column":"tokens","op":"dot","value":{"f32s":"","n":0}})
+                json!({"column":"tokens","op":"dot","value":{"f32s":floats(&[0.0, 0.0]),"n":1}})
         }),
     ] {
         let operation = parse_op("query.rank", payload.clone()).unwrap();
@@ -1389,7 +1415,7 @@ fn vs17_rank_rejects_every_malformed_form() {
         ("candidates", rank(|p| p["rank"]["candidates"] = json!(0))),
         (
             "candidates",
-            rank(|p| p["rank"]["candidates"] = json!(10_001)),
+            rank(|p| p["rank"]["candidates"] = json!(4_294_967_296_u64)),
         ),
         (
             "candidates",
@@ -1434,8 +1460,8 @@ fn vs17_rank_rejects_every_malformed_form() {
         })
     };
     assert!(parse_op("query.rank_many", many(json!([]), 256)).is_ok());
-    assert!(parse_op("query.rank_many", many(json!([]), 0)).is_ok());
     for payload in [
+        many(json!([]), 0),
         many(json!([]), 257),
         many(json!([ranking(json!("x"))]), 1),
         rank(|_| ()),

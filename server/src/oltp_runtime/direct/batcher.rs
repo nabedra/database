@@ -23,6 +23,11 @@
 //! gone is dropped before its batch is proposed, and its pending timestamp
 //! leaves the range clock. Once a member is in a proposal, a deadline makes
 //! its outcome unknown, as for a lone commit.
+//!
+//! The rows of one `*_many` window arrive together: each holds a `Seat` while
+//! it is prepared, and the last one to arrive or leave queues them all, so
+//! they share entries however fast the storage is. Seats wait only for each
+//! other and their keys are already latched, so they cannot wait in a cycle.
 use super::stats::DirectStats;
 use crate::{
     oltp::{
@@ -148,6 +153,52 @@ impl Range {
     }
 }
 
+/// Members of one window, until all its seats are taken or left.
+struct Gather {
+    handoff: HandoffTo,
+    state: Mutex<(usize, Vec<Member>)>,
+}
+impl Gather {
+    /// One seat is taken (`Some`) or left. The last one queues the members.
+    fn arrive(&self, member: Option<Member>) {
+        let members = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.1.extend(member);
+            state.0 -= 1;
+            if state.0 != 0 {
+                return;
+            }
+            std::mem::take(&mut state.1)
+        };
+        {
+            let mut state = self.handoff.range.lock();
+            state.queue.extend(members);
+            if state.busy || state.queue.is_empty() {
+                return;
+            }
+            state.busy = true;
+        }
+        drop(Handoff(self.handoff.clone()));
+    }
+    fn withdraw(&self, id: u64) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(index) = state.1.iter().position(|member| member.id == id) else {
+            return false;
+        };
+        state.1.remove(index);
+        true
+    }
+}
+/// A window row's place in its `Gather`. Dropping it unused leaves it.
+pub(super) struct Seat(Option<Arc<Gather>>);
+impl Drop for Seat {
+    fn drop(&mut self) {
+        if let Some(gather) = self.0.take() {
+            gather.arrive(None);
+        }
+    }
+}
+
 /// The batchers of every range this worker leads, keyed by group id.
 pub(super) struct Batchers {
     ranges: Mutex<HashMap<Uuid, Arc<Range>>>,
@@ -173,8 +224,32 @@ impl Batchers {
             .clone()
     }
 
+    fn handoff(&self, stats: &Arc<DirectStats>, handle: &ParticipantHandle) -> HandoffTo {
+        HandoffTo {
+            range: self.range(handle.identity().group_id),
+            resources: self.resources.clone(),
+            stats: stats.clone(),
+            max_bytes: self.max_bytes,
+        }
+    }
+
+    /// The seats of one window of `rows`.
+    pub(super) fn seats(
+        &self,
+        stats: &Arc<DirectStats>,
+        handle: &ParticipantHandle,
+        rows: usize,
+    ) -> Vec<Seat> {
+        let gather = Arc::new(Gather {
+            handoff: self.handoff(stats, handle),
+            state: Mutex::new((rows, Vec::with_capacity(rows))),
+        });
+        (0..rows).map(|_| Seat(Some(gather.clone()))).collect()
+    }
+
     /// Proposes `commit` (already registered with the range clock) alone or
-    /// with the commits queued behind the range's proposal in flight.
+    /// with the commits queued behind the range's proposal in flight, or with
+    /// the other members of its window.
     pub(super) async fn propose(
         &self,
         stats: &Arc<DirectStats>,
@@ -182,22 +257,32 @@ impl Batchers {
         commit: DirectCommit,
         bytes: usize,
         deadline: Instant,
+        seat: Option<Seat>,
     ) -> Reply {
-        let range = self.range(handle.identity().group_id);
+        let handoff = self.handoff(stats, handle);
+        let range = handoff.range.clone();
+        let gather = seat.and_then(|mut seat| seat.0.take());
         let queued = {
             let mut state = range.lock();
-            if state.busy {
+            if state.busy || gather.is_some() {
                 let (reply, receiver) = oneshot::channel();
                 let id = state.next_id;
                 state.next_id = state.next_id.wrapping_add(1);
-                state.queue.push_back(Member {
+                let member = Member {
                     id,
                     commit,
                     bytes,
                     deadline,
                     handle: handle.clone(),
                     reply,
-                });
+                };
+                match &gather {
+                    Some(gather) => {
+                        drop(state);
+                        gather.arrive(Some(member));
+                    }
+                    None => state.queue.push_back(member),
+                }
                 Err((id, receiver))
             } else {
                 state.busy = true;
@@ -208,22 +293,21 @@ impl Batchers {
             Ok(commit) => {
                 // Hands the queue to a driver (or idles the range) however
                 // this proposal ends, cancellation included.
-                let _handoff = Handoff {
-                    range,
-                    resources: self.resources.clone(),
-                    stats: stats.clone(),
-                    max_bytes: self.max_bytes,
-                };
+                let _handoff = Handoff(handoff);
                 lone(&self.resources, handle, commit, deadline).await
             }
             Err((id, receiver)) => match nabedra_rt::time::timeout_at(deadline, receiver).await {
                 Ok(Ok(reply)) => reply,
                 Ok(Err(_)) => Err(unknown("the direct batch driver stopped")),
-                Err(_) if range.withdraw(id) => Err(ProtocolError::new(
-                    ErrorCode::StorageUnavailable,
-                    "direct request deadline expired before its batch was proposed",
-                    Outcome::NotApplied,
-                )),
+                Err(_)
+                    if gather.is_some_and(|gather| gather.withdraw(id)) || range.withdraw(id) =>
+                {
+                    Err(ProtocolError::new(
+                        ErrorCode::StorageUnavailable,
+                        "direct request deadline expired before its batch was proposed",
+                        Outcome::NotApplied,
+                    ))
+                }
                 Err(_) => Err(unknown("direct request deadline expired")),
             },
         }
@@ -247,7 +331,9 @@ async fn lone(
 
 /// Ends the range's lone proposal: the commits queued behind it go to a
 /// driver task, or the range becomes idle.
-struct Handoff {
+struct Handoff(HandoffTo);
+#[derive(Clone)]
+struct HandoffTo {
     range: Arc<Range>,
     resources: Arc<WorkerSharedResources>,
     stats: Arc<DirectStats>,
@@ -255,14 +341,15 @@ struct Handoff {
 }
 impl Drop for Handoff {
     fn drop(&mut self) {
-        let Some(batch) = self.range.take(self.max_bytes) else {
+        let to = &self.0;
+        let Some(batch) = to.range.take(to.max_bytes) else {
             return;
         };
         let driver = Driver {
-            range: self.range.clone(),
-            resources: self.resources.clone(),
-            stats: self.stats.clone(),
-            max_bytes: self.max_bytes,
+            range: to.range.clone(),
+            resources: to.resources.clone(),
+            stats: to.stats.clone(),
+            max_bytes: to.max_bytes,
             unproposed: batch,
             armed: true,
         };

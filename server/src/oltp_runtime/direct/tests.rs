@@ -67,6 +67,7 @@ mod cap1;
 mod fixa;
 mod gc1;
 mod gc2;
+mod many;
 #[cfg(target_os = "linux")]
 mod reservations;
 
@@ -221,6 +222,7 @@ fn descriptor(table: Uuid) -> TableDescriptor {
         ]),
         key: "id".into(),
         format: TableFormat::Parquet,
+        search: Default::default(),
     }
 }
 

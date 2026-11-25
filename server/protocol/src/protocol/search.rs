@@ -9,12 +9,10 @@ use std::borrow::Cow;
 pub const MAX_VECTOR_DIM: u16 = 4096;
 pub const MAX_VECTORS_PER_VALUE: u16 = 1024;
 pub const MAX_SEARCH_COLUMNS: usize = 8;
-/// The canonical JSON of one row.
+/// One row of a table with search columns, its vectors counted as raw bytes.
 pub const MAX_ROW_BYTES: usize = 1 << 20;
 pub const MAX_RANK_LIMIT: u64 = 1000;
 pub const MAX_RANKINGS: usize = 256;
-pub const MAX_RANK_CANDIDATES: u32 = 10_000;
-pub const MAX_FILTER_VALUES: usize = 1024;
 /// The result column of a ranked query.
 pub const SCORE_COLUMN: &str = "_score";
 
@@ -197,6 +195,38 @@ impl Vector {
             _ => false,
         }
     }
+    /// The bytes of the floats and indices.
+    pub fn raw_len(&self) -> usize {
+        4 * match self {
+            Self::Dense(values) | Self::Multi { values, .. } => values.len(),
+            Self::Sparse { indices, weights } => indices.len() + weights.len(),
+        }
+    }
+    /// The same wire object without data.
+    fn emptied(&self) -> impl Serialize {
+        #[derive(Serialize)]
+        struct Sparse {
+            i: &'static str,
+            f32: &'static str,
+        }
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Dense { f32: &'static str },
+            Sparse { sparse: Sparse },
+            Multi { f32s: &'static str, n: u16 },
+        }
+        match self {
+            Self::Dense(_) => Wire::Dense { f32: "" },
+            Self::Sparse { .. } => Wire::Sparse {
+                sparse: Sparse { i: "", f32: "" },
+            },
+            Self::Multi { count, .. } => Wire::Multi {
+                f32s: "",
+                n: *count,
+            },
+        }
+    }
     /// Any vector of the value has length zero, so its cosine is undefined.
     fn has_zero(&self) -> bool {
         let zero = |values: &[f32]| values.iter().all(|v| *v == 0.0);
@@ -316,12 +346,11 @@ fn decode_value(raw: &RawValue) -> Result<Scalar, ProtocolError> {
     let text = raw.get();
     match text.as_bytes().first() {
         Some(b'{') => decode_vector(text).map(|v| Scalar::Vector(Box::new(v))),
-        Some(b'[') if text.len() > MAX_ROW_BYTES => Err(limit("row exceeds 1 MiB")),
         Some(b'[') => serde_json::from_str::<Box<[String]>>(text)
             .map(Scalar::Utf8List)
             .map_err(|_| invalid("a list value must hold strings only")),
         _ if text == "null" => Ok(Scalar::Null),
-        _ => serde_json::from_str(text).map_err(|_| invalid("malformed row value")),
+        _ => Scalar::from_json(text).map_err(|_| invalid("malformed row value")),
     }
 }
 /// One row object in any column types. The last of repeated columns wins, as
@@ -361,11 +390,9 @@ fn decode_values(raw: &str, unique: bool) -> Result<Row, ProtocolError> {
 pub fn decode_row(raw: &str) -> Result<Row, ProtocolError> {
     decode_values(raw, false)
 }
-/// A row of `table.upsert_many`: no column twice, at most `MAX_ROW_BYTES`.
+/// A row of `table.upsert_many`: no column twice.
 pub fn decode_upsert_row(raw: &str) -> Result<Row, ProtocolError> {
-    let row = decode_values(raw, true)?;
-    validate_row_size(&row)?;
-    Ok(row)
+    decode_values(raw, true)
 }
 
 pub(super) fn validate_value(value: &Scalar, ty: ColumnType) -> Result<(), ProtocolError> {
@@ -379,8 +406,10 @@ pub(super) fn validate_value(value: &Scalar, ty: ColumnType) -> Result<(), Proto
         _ => Err(invalid("value must match exact column type")),
     }
 }
-/// The length of the row's canonical JSON, without allocating it.
-pub fn validate_row_size(row: &Row) -> Result<(), ProtocolError> {
+/// The row limit of a table with search columns. It counts the row's JSON
+/// with the raw bytes of vectors in place of their base64. Floats count one
+/// byte, because clients spell them differently.
+pub(super) fn validate_row_size(row: &Row) -> Result<(), ProtocolError> {
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -391,8 +420,20 @@ pub fn validate_row_size(row: &Row) -> Result<(), ProtocolError> {
             Ok(())
         }
     }
-    let mut count = Count(0);
-    serde_json::to_writer(&mut count, row).map_err(|_| invalid("malformed row"))?;
+    // The braces, a colon per column and a comma between columns.
+    let mut count = Count(2 * row.len() + 1);
+    for (name, value) in row {
+        let json = serde_json::to_writer(&mut count, name);
+        json.and_then(|()| match value {
+            Scalar::Float64(_) => serde_json::to_writer(&mut count, &0),
+            Scalar::Vector(vector) => {
+                count.0 = count.0.saturating_add(vector.raw_len());
+                serde_json::to_writer(&mut count, &vector.emptied())
+            }
+            value => serde_json::to_writer(&mut count, value),
+        })
+        .map_err(|_| invalid("malformed row"))?;
+    }
     if count.0 > MAX_ROW_BYTES {
         return Err(limit("row exceeds 1 MiB"));
     }
@@ -628,9 +669,12 @@ impl SearchOptions {
             }
         }
         if let Some(column) = &self.partition_by
-            && !schema.get(column).is_some_and(|ty| ty.is_scalar())
+            && !matches!(
+                schema.get(column),
+                Some(ColumnType::Utf8 | ColumnType::Int64)
+            )
         {
-            return Err(invalid("partition_by must name a scalar column"));
+            return Err(invalid("partition_by must name a utf8 or int64 column"));
         }
         for (column, language) in &self.full_text {
             if schema.get(column) != Some(&ColumnType::Utf8) {
@@ -647,7 +691,7 @@ impl SearchOptions {
         Ok(())
     }
 }
-fn search_columns(schema: &Schema, search: &SearchOptions) -> usize {
+pub(super) fn search_columns(schema: &Schema, search: &SearchOptions) -> usize {
     schema.values().filter(|ty| ty.is_vector()).count() + search.full_text.len()
 }
 /// Whether a table with these columns needs `data.vector.v1`.
@@ -655,7 +699,20 @@ pub fn uses_search(schema: &Schema, search: &SearchOptions) -> bool {
     !search.is_empty() || schema.values().any(|ty| !ty.is_scalar())
 }
 
-/// A map of at most 128 entries, as a schema has columns, without repeated keys.
+/// The refusal while the cluster feature is off.
+pub fn search_disabled() -> ProtocolError {
+    unsupported("vector tables need the cluster feature data.vector.v1, which is not enabled")
+}
+fn unsupported(message: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::UnsupportedOperation,
+        message,
+        Outcome::NotApplied,
+    )
+}
+
+/// A map of 1 to 128 entries, as a schema has columns, without repeated keys.
+/// An empty one is absent on the wire.
 fn unique_map<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
 ) -> Result<BTreeMap<String, T>, D::Error> {
@@ -678,6 +735,9 @@ fn unique_map<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
                 if out.insert(name, map.next_value()?).is_some() {
                     return Err(M::Error::custom("duplicate column option"));
                 }
+            }
+            if out.is_empty() {
+                return Err(M::Error::custom("empty column options"));
             }
             Ok(out)
         }
@@ -752,9 +812,6 @@ impl TextPredicate {
     }
     pub(super) fn validate(&self, schema: Option<&Schema>) -> Result<(), ProtocolError> {
         validate_identifier(self.column())?;
-        if matches!(self, Self::ContainsAny { values, .. } if values.len() > MAX_FILTER_VALUES) {
-            return Err(limit("contains_any exceeds 1024 values"));
-        }
         let wanted = match self {
             Self::StartsWith { .. } => ColumnType::Utf8,
             _ => ColumnType::Utf8List,
@@ -785,7 +842,6 @@ pub(super) fn decode_text_predicate(
         #[serde(rename = "op")]
         _op: String,
         column: String,
-        #[serde(deserialize_with = "filter_values")]
         values: Vec<String>,
     }
     if op == "contains_any" {
@@ -798,9 +854,6 @@ pub(super) fn decode_text_predicate(
     } else {
         TextPredicate::StartsWith { column, value }
     })
-}
-fn filter_values<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
-    bounded_list(d, MAX_FILTER_VALUES)
 }
 /// At most `max` elements; a longer list stops decoding at the first one over.
 fn bounded_list<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
@@ -878,6 +931,35 @@ pub fn row_request_id(call: Uuid, key: &Key) -> Result<Uuid, ProtocolError> {
     bytes[6] = bytes[6] & 0x0f | 0x80;
     bytes[8] = bytes[8] & 0x3f | 0x80;
     Ok(Uuid::from_bytes(bytes))
+}
+
+/// The primary key of `row`.
+pub fn row_key(row: &Row, key_column: &str) -> Result<Key, ProtocolError> {
+    match row.get(key_column) {
+        Some(Scalar::Utf8(key)) => Ok(Key::Utf8(key.clone())),
+        Some(Scalar::Int64(key)) => Ok(Key::Int64(*key)),
+        _ => Err(invalid("row has no primary key")),
+    }
+}
+/// The request one row of `table.upsert_many` runs as, on either path. Its
+/// encoding is canonical, so its digest does not depend on the call's chunks.
+pub fn upsert_row_request(
+    call: Uuid,
+    table_id: Uuid,
+    key_column: &str,
+    row: Row,
+) -> Result<Request, ProtocolError> {
+    Ok(Request {
+        request_id: row_request_id(call, &row_key(&row, key_column)?)?,
+        operation: Operation::Upsert(RowPayload { table_id, row }),
+    })
+}
+/// As `upsert_row_request`, for one key of `table.delete_many`.
+pub fn delete_row_request(call: Uuid, table_id: Uuid, key: Key) -> Result<Request, ProtocolError> {
+    Ok(Request {
+        request_id: row_request_id(call, &key)?,
+        operation: Operation::Delete(KeyPayload { table_id, key }),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1027,6 +1109,9 @@ impl Ranking {
             (RankValue::Vector(_), RankOp::Match) => Err(invalid("match takes text")),
             (RankValue::Vector(vector), op) => {
                 vector.validate()?;
+                if matches!(vector, Vector::Multi { count: 0, .. }) {
+                    return Err(invalid("a query needs at least one vector"));
+                }
                 if op == RankOp::Cosine && vector.has_zero() {
                     return Err(invalid("cosine is undefined for a zero query"));
                 }
@@ -1179,15 +1264,11 @@ fn rankings<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Ranking>, D::Error> {
     bounded_list(d, MAX_RANKINGS)
 }
 impl RankOptions {
-    fn validate_structure(&self) -> Result<(), ProtocolError> {
-        let candidates = |n: u32| {
-            if (1..=MAX_RANK_CANDIDATES).contains(&n) {
-                Ok(())
-            } else {
-                Err(invalid("candidates must be 1 to 10000"))
-            }
-        };
-        candidates(self.candidates)?;
+    /// `fused` rankings share the fusion weights.
+    fn validate_structure(&self, fused: usize) -> Result<(), ProtocolError> {
+        if self.candidates == 0 {
+            return Err(invalid("candidates must be positive"));
+        }
         if !(self.recall > 0.0 && self.recall <= 1.0) {
             return Err(invalid("recall must be above 0 and at most 1"));
         }
@@ -1195,15 +1276,16 @@ impl RankOptions {
             return Err(limit("query exceeds 256 rankings"));
         }
         if let Fusion::Weights(weights) = &self.fusion
-            && (weights.len() != self.rankings.len()
-                || !weights.iter().all(|w| w.is_finite() && *w >= 0.0))
+            && (weights.len() != fused || !weights.iter().all(|w| w.is_finite() && *w >= 0.0))
         {
             return Err(invalid(
                 "fusion needs one finite, nonnegative weight per ranking",
             ));
         }
         if let Some(rerank) = &self.rerank {
-            candidates(rerank.candidates)?;
+            if rerank.candidates == 0 {
+                return Err(invalid("candidates must be positive"));
+            }
             rerank.ranking.validate_structure()?;
         }
         self.rankings
@@ -1257,7 +1339,7 @@ impl RankPayload {
             return Err(invalid("rank needs at least one ranking"));
         }
         self.query.validate_structure()?;
-        self.rank.validate_structure()
+        self.rank.validate_structure(self.rank.rankings.len())
     }
     pub(super) fn validate(&self, table: &TableDescriptor) -> Result<(), ProtocolError> {
         self.query.query().validate(&table.schema)?;
@@ -1283,7 +1365,10 @@ impl RankManyPayload {
             return Err(limit("batch exceeds 256 rankings"));
         }
         self.query.validate_structure()?;
-        self.rank.validate_structure()?;
+        if self.batch.is_empty() {
+            return Err(invalid("rank_many needs at least one ranking"));
+        }
+        self.rank.validate_structure(1)?;
         self.batch.iter().try_for_each(Ranking::validate_structure)
     }
     pub(super) fn validate(&self, table: &TableDescriptor) -> Result<(), ProtocolError> {
@@ -1293,13 +1378,63 @@ impl RankManyPayload {
     }
 }
 
+impl Operation {
+    /// Refuses what this build decodes but does not serve yet, and a table
+    /// that needs `data.vector.v1` while the cluster has not enabled it.
+    pub fn check_served(&self, vector: bool) -> Result<(), ProtocolError> {
+        match self {
+            Self::AddColumn(_)
+            | Self::DropColumn(_)
+            | Self::AddFullText(_)
+            | Self::DropFullText(_)
+            | Self::SearchStatus(_)
+            | Self::Rank(_)
+            | Self::RankMany(_) => Err(unsupported("the operation is not supported yet")),
+            Self::Create(p) if !vector && uses_search(&p.schema, &p.search) => {
+                Err(search_disabled())
+            }
+            _ => Ok(()),
+        }
+    }
+    /// As `check_served`, for the queued path, which runs the rows of a
+    /// `*_many` call one by one.
+    pub fn check_queued(&self, vector: bool) -> Result<(), ProtocolError> {
+        if matches!(self, Self::UpsertMany(_) | Self::DeleteMany(_)) {
+            return Err(unsupported("the operation needs the direct path"));
+        }
+        self.check_served(vector)
+    }
+}
+
 /// One row's result in the reply of `table.upsert_many` or `table.delete_many`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "o", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "o", rename_all = "snake_case")]
 pub enum RowOutcome {
     Applied,
     NotApplied { error: ProtocolError },
     OutcomeUnknown { error: ProtocolError },
+}
+impl<'de> Deserialize<'de> for RowOutcome {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            o: String,
+            #[serde(default, deserialize_with = "present")]
+            error: Option<ProtocolError>,
+        }
+        let Wire { o, error } = deserialize_object(d)?;
+        match (o.as_str(), error) {
+            ("applied", None) => Ok(Self::Applied),
+            ("not_applied", Some(error)) if error.outcome == Outcome::NotApplied => {
+                Ok(Self::NotApplied { error })
+            }
+            ("outcome_unknown", Some(error)) if error.outcome == Outcome::Unknown => {
+                Ok(Self::OutcomeUnknown { error })
+            }
+            _ => Err(serde::de::Error::custom("malformed row outcome")),
+        }
+    }
 }
 impl From<ProtocolError> for RowOutcome {
     fn from(error: ProtocolError) -> Self {
@@ -1454,5 +1589,7 @@ fn payload_ref<'a, T: Deserialize<'a>>(raw: &'a RawValue) -> Result<T, ProtocolE
         .map_err(|_| invalid("malformed operation payload"))
 }
 
+#[cfg(test)]
+mod fixtures;
 #[cfg(test)]
 mod tests;

@@ -27,6 +27,8 @@ pub enum ErrorCode {
     LimitExceeded,
     Overloaded,
     StorageUnavailable,
+    /// A range has no search replica that can answer. Retryable.
+    SearchUnavailable,
     #[doc(hidden)]
     SplitPublicationPending,
     OutcomeUnknown,
@@ -41,7 +43,10 @@ impl ErrorCode {
             Self::Conflict => 409,
             Self::LimitExceeded => 413,
             Self::Overloaded => 429,
-            Self::StorageUnavailable | Self::SplitPublicationPending | Self::OutcomeUnknown => 503,
+            Self::StorageUnavailable
+            | Self::SearchUnavailable
+            | Self::SplitPublicationPending
+            | Self::OutcomeUnknown => 503,
             Self::InternalError => 500,
         }
     }
@@ -174,30 +179,35 @@ pub enum Scalar {
 impl<'de> Deserialize<'de> for Scalar {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = Box::<RawValue>::deserialize(d)?;
-        let text = raw.get().trim_start();
+        Self::from_json(raw.get()).map_err(serde::de::Error::custom)
+    }
+}
+impl Scalar {
+    /// One of the four scalars from a complete JSON value.
+    fn from_json(raw: &str) -> Result<Self, serde_json::Error> {
+        use serde::de::Error;
+        let text = raw.trim_start();
         if text.starts_with(['{', '[']) || text == "null" {
-            return Err(serde::de::Error::custom("expected a non-null scalar"));
+            return Err(Error::custom("expected a non-null scalar"));
         }
-        match serde_json::from_str::<Value>(text).map_err(serde::de::Error::custom)? {
+        match serde_json::from_str::<Value>(text)? {
             Value::String(v) => Ok(Self::Utf8(v)),
             Value::Bool(v) => Ok(Self::Bool(v)),
             Value::Number(v) => {
                 // arbitrary_precision retains integer syntax even outside i64 bounds.
                 let text = v.to_string();
                 if text.contains(['.', 'e', 'E']) {
-                    let n = text.parse::<f64>().map_err(serde::de::Error::custom)?;
+                    let n = text.parse::<f64>().map_err(Error::custom)?;
                     if n.is_finite() {
                         Ok(Self::Float64(n))
                     } else {
-                        Err(serde::de::Error::custom("float64 must be finite"))
+                        Err(Error::custom("float64 must be finite"))
                     }
                 } else {
-                    text.parse::<i64>()
-                        .map(Self::Int64)
-                        .map_err(serde::de::Error::custom)
+                    text.parse::<i64>().map(Self::Int64).map_err(Error::custom)
                 }
             }
-            _ => Err(serde::de::Error::custom("expected a non-null scalar")),
+            _ => Err(Error::custom("expected a non-null scalar")),
         }
     }
 }
@@ -247,6 +257,10 @@ impl TableDescriptor {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         validate_schema(&self.name, &self.schema, &self.key)?;
         self.search.validate(&self.schema)
+    }
+    /// Vector and full-text columns.
+    pub fn search_columns(&self) -> usize {
+        search::search_columns(&self.schema, &self.search)
     }
     /// Whether the table needs the cluster feature `data.vector.v1`.
     pub fn uses_search(&self) -> bool {
@@ -530,7 +544,6 @@ impl Operation {
             Self::InsertMany(p) | Self::UpsertMany(p) if p.rows.len() > MAX_BATCH_ROWS => {
                 Err(limit("batch exceeds 10000 rows"))
             }
-            Self::UpsertMany(p) => p.rows.iter().try_for_each(validate_row_size),
             Self::DeleteMany(p) => p.validate(),
             Self::AddColumn(p) => p.validate(),
             Self::DropColumn(p) => validate_identifier(&p.name),
@@ -568,10 +581,20 @@ impl Operation {
         }
         match self {
             Self::Insert(p) | Self::Upsert(p) => validate_row(&p.row, table, RowMode::Complete),
-            Self::InsertMany(p) | Self::UpsertMany(p) => p
+            Self::InsertMany(p) => p
                 .rows
                 .iter()
                 .try_for_each(|row| validate_row(row, table, RowMode::Complete)),
+            Self::UpsertMany(p) => {
+                let mut seen = std::collections::HashSet::with_capacity(p.rows.len());
+                p.rows.iter().try_for_each(|row| {
+                    validate_row(row, table, RowMode::Complete)?;
+                    if !seen.insert(row_key(row, &table.key)?) {
+                        return Err(duplicate_key());
+                    }
+                    Ok(())
+                })
+            }
             Self::DeleteMany(p) => p
                 .keys
                 .iter()
@@ -655,8 +678,8 @@ pub fn validate_row(
     } else if row.len() - embedded + embed.len() != table.schema.len() {
         return Err(invalid("complete row must contain every schema column"));
     }
-    if table.uses_search() {
-        validate_row_size(row)?;
+    if table.search_columns() != 0 {
+        search::validate_row_size(row)?;
     }
     for (column, value) in row {
         let ty = table
