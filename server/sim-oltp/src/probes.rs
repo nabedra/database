@@ -54,9 +54,11 @@ pub struct ProbeEvent {
     pub t_ns: u64,
     /// The simulated node that emitted it, if any.
     pub node: Option<u64>,
-    /// How many times that node's process ended before.
+    /// How many times that node's process had ended by now. A probe that is not live belongs
+    /// to an earlier one.
     pub incarnation: u64,
-    /// False when the node was already cut: a destructor of a dead incarnation sent it.
+    /// False when the emitter's incarnation had ended: a destructor sent it, also if the node
+    /// is up again.
     pub live: bool,
     pub probe: Probe,
 }
@@ -253,7 +255,12 @@ impl Probes {
         let (event, violations, invariants) = {
             let mut hub = self.lock();
             let node = hub.snapshot.or_else(sim::current_node);
-            let live = node.is_none_or(|node| world.is_up(node));
+            // A node can be up again before the runtime drops its aborted tasks, so it is the
+            // emitter's own incarnation that must run. A snapshot comes from no node.
+            let live = hub.snapshot.map_or_else(
+                || world.current_incarnation_runs(),
+                |node| world.is_up(node),
+            );
             let incarnation = node.map_or(0, |node| *hub.incarnations.get(&node).unwrap_or(&0));
             let event = ProbeEvent {
                 seq: hub.seq,

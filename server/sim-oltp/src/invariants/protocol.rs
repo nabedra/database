@@ -123,8 +123,8 @@ pub const PROBE_INVARIANTS: [&str; 12] = [
 
 pub type Violation = (&'static str, String);
 
-/// Where and when a probe was emitted. `live` is false for a probe a destructor emits
-/// after its node was cut: it belongs to a dead incarnation and changes no state. `thread`
+/// Where and when a probe was emitted. `live` is false for a probe a destructor emits after
+/// its incarnation was cut, even if the node is up again: it changes no state. `thread`
 /// tells apart jobs that a storage pause interleaves: each runs on one thread to its end.
 #[derive(Clone, Copy, Debug)]
 pub struct Origin {
