@@ -1,4 +1,4 @@
-{"schema":"nabedra.catalog/1","count":3370,"tests":[
+{"schema":"nabedra.catalog/1","count":3371,"tests":[
 {"file":"orm/python/tests/events/test_client.py","hash":"202d453fc9458842","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_ack_uses_exact_offset_and_rejects_foreign_delivery_before_request","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"1c426c67dd348a60","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_claim_reuses_uuid_after_missing_response","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"b8d2b5c0d984c70e","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_error_metadata_and_duplicate_fields","lang":"python"},
@@ -866,6 +866,7 @@
 {"file":"scripts/testing/test_sim_bugs_shards.py","hash":"8598f6247200aa83","id":"scripts/testing/test_sim_bugs_shards.py::MergeTest::test_shards_of_two_splits","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs_shards.py","hash":"a44c508660c0cbdb","id":"scripts/testing/test_sim_bugs_shards.py::MergeTest::test_the_lowest_hit_of_complete_ranges","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs_shards.py","hash":"97e43f543ad7f42a","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_a_failed_record_is_read_as_strictly","lang":"python"},
+{"file":"scripts/testing/test_sim_bugs_shards.py","hash":"06b84aeafb953ab5","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_a_failed_record_of_a_job_that_passed","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs_shards.py","hash":"289a8973ed79c4cf","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_a_listing_of_many_pages","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs_shards.py","hash":"c861df9b8c8e0a58","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_a_pass_that_says_it_disagrees","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs_shards.py","hash":"36d24a859ed5ab6c","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_a_rate_limit_is_waited_out","lang":"python"},
@@ -882,9 +883,9 @@
 {"file":"scripts/testing/test_sim_bugs_shards.py","hash":"17a272604f840f52","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_evidence_of_an_error","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs_shards.py","hash":"4cd493f62a2b21b7","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_jobs_that_left_no_result","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs_shards.py","hash":"f0f5243af63d3ebd","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_jobs_whose_result_is_not_known_yet","lang":"python"},
-{"file":"scripts/testing/test_sim_bugs_shards.py","hash":"b7e1b4bf6cf26e6f","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_no_answer_is_no_shard","lang":"python"},
+{"file":"scripts/testing/test_sim_bugs_shards.py","hash":"d5bb29fe7c2fe1bf","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_no_answer_is_no_shard","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs_shards.py","hash":"baa26ce1aa878d3b","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_one_listing_for_a_set","lang":"python"},
-{"file":"scripts/testing/test_sim_bugs_shards.py","hash":"e44a92fe3c773ffb","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_the_last_recorded_merge_is_the_one","lang":"python"},
+{"file":"scripts/testing/test_sim_bugs_shards.py","hash":"ff4f3f1c557e4fb8","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_the_last_recorded_merge_is_the_one","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs_shards.py","hash":"4ddc7eab42c677a4","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_the_names_are_the_workflows","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs_shards.py","hash":"884c9ec151c26d5b","id":"scripts/testing/test_sim_bugs_shards.py::RunsTest::test_the_token_is_optional","lang":"python"},
 {"file":"scripts/testing/test_sim_bugs_shards.py","hash":"782fcf90eba48c60","id":"scripts/testing/test_sim_bugs_shards.py::ShardTest::test_a_base_seed_that_is_not_deterministic_is_red","lang":"python"},

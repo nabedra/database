@@ -2558,6 +2558,7 @@ class FailedShard:
     check: str
     record_sha256: str
     log_sha256: str
+    sha: str
     run: str
     attempt: int
     found: dict | None
@@ -2836,7 +2837,7 @@ def read_failed(key, data, record, log, text):
             found = None
         elif [record["check"]] != [f"{check_name(key)}-{n}" for n in found["shard"][:1]]:
             raise Failure("its log is of another shard than its check")
-    return FailedShard(record["check"], hashlib.sha256(data).hexdigest(), log, run["url"], run["attempt"], found)
+    return FailedShard(record["check"], hashlib.sha256(data).hexdigest(), log, record["sha"], run["url"], run["attempt"], found)
 
 
 def read_shard(args, repo, key, data, record, files, actions):
@@ -2998,7 +2999,7 @@ def merged(args, repo, bug, actions, out):
     plan = shard_plan(bug, args)
     key = shard_key(repo, bug, plan, args)
     shards, failed, problems = read_shards(args, repo, bug, key, actions, out)
-    missing = [problem for sha in sorted({shard.done["sha"] for shard in shards})
+    missing = [problem for sha in sorted({shard.done["sha"] for shard in shards} | {shard.sha for shard in failed})
                for problem in unaccounted(actions, key, sha, shards, failed)]
     answer = merge_shards(bug, key, shards, failed, problems, missing)
     if answer.body["result"] != "error" and any(entry["result"] == "error" for entry in recorded_merges(bug, key)):

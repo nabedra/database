@@ -1196,13 +1196,24 @@ class RunsTest(ShardCase):
             "the same run twice": whole(total_count=2, workflow_runs=runs * 2), "no runs": whole(workflow_runs=None),
             "runs of text": whole(workflow_runs=["x"]),
             "another place": lambda path: (302, {"Location": f"{self.api.url}/x"}, {}),
+            "another commit's runs": lambda path: (200, {}, {"total_count": 1, "workflow_runs": [{**runs[0], "head_sha": "c" * 40}]}),
         }
         for what, answer in cases.items():
             with self.subTest(what=what):
                 self.api.answer = answer
                 body, output = self.answer()
                 self.assertEqual((body["result"], body["shards"]), ("incomplete", []), output)
-                self.assertIn("GitHub", output)
+                self.assertIn("its run is not a dispatch" if "commit" in what else "GitHub", output)
+        # A redirect is not followed, even to the right place, and an answer that is no error of GitHub's is not asked again.
+        moved = []
+        self.api.answer = lambda path: (moved.append(path) or len(moved) > 1 and self.api.get(path)) or (
+            302, {"Location": self.api.url + path}, {})
+        self.assertEqual(self.answer()[0]["result"], "incomplete")
+        with patch.object(sim_bugs, "API_TRIES", 3), patch.object(sim_bugs, "wait", side_effect=AssertionError("it waits")):
+            for status in (404, 401, 410, 422):
+                self.api.answer = lambda path: (status, {}, {})
+                self.assertEqual(self.answer()[0]["result"], "incomplete")
+        self.api.answer = None
         with patch.object(sim_bugs, "API", "http://127.0.0.1:9"):
             self.assertEqual(self.answer()[0]["result"], "incomplete")
             self.assert_not_found("incomplete", "GitHub")
@@ -1390,6 +1401,11 @@ class RunsTest(ShardCase):
         (self.records / "failed-1.json").unlink()
         self.assert_merge("incomplete", "is not among the records")
 
+    def test_a_failed_record_of_a_job_that_passed(self):
+        log, = self.run_shards(1, script={"hit": 3})
+        self.keep(1, log, run=101, record={"result": "fail"}, job={"conclusion": "success"})
+        self.assert_merge("incomplete", "passed and is not among the records")
+
     def test_a_failed_record_is_read_as_strictly(self):
         self.run_shards(1, script={"hit": 3})
         log = self.nondeterministic()
@@ -1485,6 +1501,10 @@ class RunsTest(ShardCase):
         self.confirm_hit(3, self.record_merge())
         status, output, row, _ = self.count(script={"hit": 3})
         self.assertEqual((status, row["result"]), (0, "found"), output)
+        # Back to the first answer, with the second run gone from GitHub as well: the last entry is what counts.
+        (self.records / "again.json").unlink()
+        self.api.runs.pop(9)
+        self.assert_not_found("error", "the recorded merge is not what", script={"hit": 3})
 
     def test_one_listing_for_a_set(self):
         self.run_shards(1, script={"hit": 3})
