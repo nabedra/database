@@ -70,6 +70,8 @@ the affected task briefs and acceptance checks.
   Sol on high for Codex or the latest Claude Opus on high for Claude Code,
   subject to harness availability and dispatch rules. The lead dispatches
   implementations and reviews. Children work directly on their assignment.
+  For research and reading tasks, default to GPT Luna for Codex or Claude Haiku
+  for Claude Code.
 - Local simulation and property runs use one thread per agent
   (`--test-threads=1`, and `-j 2` for builds). Larger seed counts go to Actions.
 
