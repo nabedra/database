@@ -707,7 +707,9 @@ impl NativePlanner {
             )?;
             // Plan section 7: stop direct writers in the Data log before the
             // Catalog publishes the drop. The exclusive guard is held.
-            self.fence_direct_writers(pin, id, None).await?;
+            if !(std::env::var("P11_TOPO_MUT").as_deref() == Ok("unfenced-drop")) {
+                self.fence_direct_writers(pin, id, None).await?;
+            }
             let writes = vec![
                 PreparedWrite {
                     key: MvccKey::CatalogName { name },

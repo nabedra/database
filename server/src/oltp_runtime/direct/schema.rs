@@ -285,6 +285,9 @@ impl CatalogSchema {
                     CatalogRead::Blocked(_) => return Ok(SchemaLookup::Blocked),
                     CatalogRead::Value { record, .. } => record.ok_or_else(invalid)?,
                 };
+                if std::env::var("P11_TOPO_MUT").as_deref() == Ok("skip-building") && !record.phase.ready() {
+                    continue;
+                }
                 if !record.phase.writable() {
                     continue;
                 }

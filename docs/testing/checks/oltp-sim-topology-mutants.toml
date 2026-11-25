@@ -1,0 +1,28 @@
+id = "oltp-sim-topology-mutants"
+module = "oltp"
+kinds = ["S", "H"]
+# Scratch only, never merged. Product mutants of the topology rules, with the unmutated twin.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+"${build[@]}" --no-run
+run() { timeout 1500s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1; }
+for pair in wrong-fence:FenceAfterValidation early-fence:FenceAfterValidation choose-building:IncompleteIndexChosen skip-building:CoveringIndexComplete unfenced-drop:DroppedTableSilent keep-old-entry:IndexExactlyOnce keep-stale-route:StaleRouteRefreshesOnce; do
+  echo "mutant ${pair%%:*}, expected ${pair#*:}"
+  P11_TOPO_MUT="${pair%%:*}" NABEDRA_SIM_EXPECT="${pair#*:}" run 2>&1 | grep -E "nabedra-sim-seed|no seed|within" || true
+done
+echo "unmutated twins"
+NABEDRA_SIM_EXPECT=FenceAfterValidation,CoveringIndexComplete,DroppedTableSilent,IndexExactlyOnce,IncompleteIndexChosen,StaleRouteRefreshesOnce run 2>&1 | grep -E "nabedra-sim-seed" || true
+echo "races, unmutated"
+NABEDRA_SEEDS=4 run 2>&1 | grep -oE 'seed [0-9]+ failed|"fence_races":\[[^]]*\]' || true
+echo "races, early-fence"
+NABEDRA_SEEDS=4 P11_TOPO_MUT=early-fence run 2>&1 | grep -oE 'seed [0-9]+ failed|"fence_races":\[[^]]*\]' || true
+echo done
+''']
+cwd = "server"
+timeout_s = 7200
+needs = []
+result_parser = "exit-code"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "topology", NABEDRA_SIM_PROFILE = "none", NABEDRA_SIM_TOPOLOGY = "no-move,split-before-load", NABEDRA_SEEDS = "8", NABEDRA_SIM_JOBS = "2", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-topology-mutants", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-topology-mutants" }

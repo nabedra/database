@@ -527,7 +527,9 @@ impl NativePlanner {
                         .await?,
                 )?;
                 let record = record.ok_or_else(not_found)?;
-                if !record.phase.ready() {
+                let choose_building = record.phase.writable()
+                    && std::env::var("P11_TOPO_MUT").as_deref() == Ok("choose-building");
+                if !record.phase.ready() && !choose_building {
                     continue;
                 }
                 if record.schema_epoch != table.schema_epoch
