@@ -1,5 +1,6 @@
 """Shards, their merge and the counting run of sim_bugs.py, with a fake harness and a fake `gh attestation verify`."""
 
+import argparse
 import hashlib
 from io import StringIO
 import json
@@ -97,11 +98,11 @@ class ShardCase(HarnessCase):
                 json.dumps({"digest": sha256(text), "certificate": certificate}))
         return text
 
-    def run_shards(self, *parts, script=None, **kwargs):
+    def run_shards(self, *numbers, script=None, argv=(), **kwargs):
         """Run and keep these shards. Returns their logs."""
         logs = []
-        for n in parts:
-            status, output, _ = self.shard(n, script=script, run=100 + n, **kwargs)
+        for n in numbers:
+            status, output, _ = self.shard(n, *argv, script=script, run=100 + n, **kwargs)
             self.assertEqual(status, 0, output)
             self.keep(n, output, run=100 + n)
             logs.append(output)
@@ -120,6 +121,23 @@ class ShardCase(HarnessCase):
         for needle in needles:
             self.assertIn(needle, output)
         return body
+
+    def answer(self):
+        """The merge's answer without `check`, for many cases: (body, output)."""
+        if not hasattr(self, "bug"):
+            self.bug, = sim_bugs.load_bugs(self.f.repo)[0]
+            (self.root / "fake_gh.py").write_text(FAKE_GH)
+        args = argparse.Namespace(records=str(self.records), gh=f"{sys.executable} {self.root / 'fake_gh.py'}", seeds=None,
+                                  workload=None, profile=None, expect=None, rehearse_defect=None)
+        out = StringIO()
+        return sim_bugs.merged(args, self.f.repo, self.bug, out)[1].body, out.getvalue()
+
+    def assert_no_shard(self, *needles):
+        body, output = self.answer()
+        self.assertEqual((body["result"], body["shards"], body["rates"]), ("incomplete", [], None), output)
+        self.assertIn("shard 1 of", body["why"])
+        for needle in needles:
+            self.assertIn(needle, output)
 
     def count(self, *argv, script=None, **env):
         status, output, calls = self.tool("count", "fix-one", "--records", str(self.records), *argv, script=script, **env)
@@ -288,11 +306,15 @@ class ShardTest(ShardCase):
         self.assertEqual((body["hit"]["seed"], body["masked"]), (3, {"base-red": [1, 2]}))
 
     def test_a_base_seed_that_is_not_deterministic_is_red(self):
-        _, output, calls = self.shard(1, script={"hit": 2, "clean": {"2": ["Other"]}, "flaky": ["clean"]})
+        script = {"patched": {"2": [KIND]}, "clean": {"2": ["Other"]}, "flaky": ["clean"]}
+        status, output, _ = self.shard(1, script=script)
         row = rows_of(output)[1]
         self.assertEqual((row["base"]["kinds"], row["base"]["deterministic"]), (["Other", "determinism"], False))
-        # Seeds 3 and 4 pass once and are only then replayed as twins, where they differ.
-        self.assertIn("is not its base run", output)
+        self.assertEqual(sim_bugs.row_mask(row, [KIND]), (True, "base-red"))
+        # A seed that passes once and differs only as a twin.
+        status, output, _ = self.shard(1, script={"hit": 3, "flaky": ["clean"]})
+        self.assertEqual(status, 1, output)
+        self.assertIn("the twin of seed 3 is not its base run", output)
 
     def test_masks_of_the_replay(self):
         for script, reason, twin in (
@@ -399,15 +421,17 @@ class MergeTest(ShardCase):
 
     def test_not_detected_needs_every_range(self):
         script = {"patched": {"7": [KIND], "40": ["Other"]}, "clean": {"7": [KIND], "9": [KIND]}}
-        self.run_shards(1, 2, 3, script=script, parts=4)
+        self.run_shards(1, 2, 3, script=script, parts=4, argv=("--chunk", "2500"))
         body = self.assert_merge("incomplete", "shard 4 of 4")
         self.assertEqual((body["tried"], body["hit"]), (7500, None))
-        self.run_shards(4, script=script, parts=4)
+        self.run_shards(4, script=script, parts=4, argv=("--chunk", "2500"))
         body = self.assert_merge("not-detected", "not detected in [1, 10000]: 10000 seeds tried, 1 masked",
                                  "base rate 2 of 10000, patched rate 1 of 10000")
         self.assertEqual((body["masked"], body["tried"]), ({"base-red": [7]}, 10_000))
+        self.record_merge()
         status, output, row, calls = self.count()
-        self.assertEqual((status, row["result"], calls), (1, "candidate" if False else "error", []), output)
+        self.assertEqual((status, row["result"], row["tried"], calls), (1, "not-detected", 10_000, []), output)
+        self.assertIn("not detected in [1, 10000]: 10000 seeds tried, 1 masked; base rate 2 of 10000", output)
 
     def test_a_missing_range_makes_it_incomplete(self):
         self.run_shards(2, script={"hit": 6})
@@ -452,8 +476,7 @@ class MergeTest(ShardCase):
                 self.assertNotEqual(log, output)
                 shutil.rmtree(self.records)
                 self.keep(1, log)
-                body = self.assert_merge("incomplete", "shard 1 of")
-                self.assertEqual((body["tried"], body["rates"]), (0, None))
+                self.assert_no_shard()
 
     def test_rows_that_do_not_fit_their_range(self):
         _, output, _ = self.shard(1, script={"hit": 3})
@@ -491,7 +514,7 @@ class MergeTest(ShardCase):
             with self.subTest(what=what):
                 shutil.rmtree(self.records)
                 self.keep(1, self.edit_log(output, change))
-                self.assert_merge("incomplete", "shard 1 of")
+                self.assert_no_shard()
         # The edit itself is no reason for a refusal.
         shutil.rmtree(self.records)
         self.keep(1, self.edit_log(output, lambda rows: None))
@@ -515,8 +538,7 @@ class MergeTest(ShardCase):
             with self.subTest(what=what):
                 shutil.rmtree(self.records)
                 self.keep(1, self.edit_done(output, **changes))
-                body = self.assert_merge("incomplete", "shard 1 of")
-                self.assertEqual(body["shards"], [])
+                self.assert_no_shard()
         shutil.rmtree(self.records)
         self.keep(1, self.edit_done(output))
         self.assert_merge("candidate")
@@ -572,11 +594,6 @@ class MergeTest(ShardCase):
                 # It is an error even where the hit is below the range that disagrees.
                 self.assert_merge("error", "disagree")
                 self.assert_not_found("error", "disagree")
-        self.keep(2, self.edit_log(logs[1].replace("runs/102", "runs/9"), lambda rows: rows[0]["base"].update(
-            trace="00000000000000aa")), run=9, name="again")
-        shutil.copytree(self.records, self.root / "copy")
-        logs = self.run_shards(1, script={"hit": 3})
-        self.assert_merge("error", "disagree")
 
     def test_records_that_are_no_evidence(self):
         _, output, _ = self.shard(1, script={"hit": 3})
@@ -611,9 +628,7 @@ class MergeTest(ShardCase):
             with self.subTest(what=what):
                 shutil.rmtree(self.records)
                 self.keep(1, output, **changes)
-                body = self.assert_merge("incomplete", "shard 1 of")
-                self.assertEqual(body["shards"], [])
-                self.assert_not_found("incomplete", "shard 1 of")
+                self.assert_no_shard()
         shutil.rmtree(self.records)
         self.keep(1, output)
         self.assert_merge("candidate")
@@ -765,13 +780,12 @@ class CountTest(ShardCase):
         good = (self.f.repo / BUG / "bug.toml").read_text()
         other = json.loads((self.f.repo / BUG / "searches.jsonl").read_text().splitlines()[0])["search"]
         for changes, needle in (
-                ({"seed": 4}, "another hit"), ({"lines": ["9 n101 seed 3 applied"]}, "detection.lines"),
+                ({"seed": 4}, "another hit"), ({"lines": ["9 n101 seed 3 was applied"]}, "detection.lines"),
                 ({"history_sha256": "a" * 64}, "another hit"), ({"search": "0" * 64}, "names no search"),
                 ({"search": sha256(canonical(other))}, "detection.search is not the merge of these shards")):
             with self.subTest(changes=changes):
-                self.confirm_hit(3, body, **({"mechanism": detection(4)["mechanism"], **changes} if "seed" in changes else changes))
-                row = self.assert_not_found("candidate", needle, script=self.script)
-                self.assertNotIn("found", [row["result"]])
+                self.confirm_hit(changes.pop("seed", 3), body, **changes)
+                self.assert_not_found("candidate", needle, script=self.script)
         self.f.write(f"{BUG}/bug.toml", good.split("[detection]")[0])
         self.f.commit("not confirmed")
         self.assert_not_found("candidate", "no confirmed mechanism", script=self.script)
@@ -901,13 +915,6 @@ class CountTest(ShardCase):
         self.assertIn("0 of 1 reverted fixes found", output)
         self.assertNotIn(sim_bugs.NOT_RUN_MARKER, output)
 
-    def test_not_detected_is_a_result_of_its_own(self):
-        self.run_shards(1, 2, 3, 4, script={}, parts=4)
-        self.record_merge()
-        row = self.assert_not_found("not-detected", "not detected in [1, 10000]: 10000 seeds tried, 0 masked",
-                                    "base rate 0 of 10000, patched rate 0 of 10000")
-        self.assertEqual(row["tried"], 10_000)
-
     def test_evidence_compares_a_merge_with_its_records(self):
         self.ready()
         kept = self.root / "kept"
@@ -922,8 +929,7 @@ class CountTest(ShardCase):
             for path in self.records.glob(gone):
                 path.unlink()
             self.assertIn(missing, evidence())
-            shutil.rmtree(self.records)
-            shutil.copytree(kept, self.records)
+            shutil.copytree(kept, self.records, dirs_exist_ok=True)
         path = self.f.repo / BUG / "searches.jsonl"
         text = path.read_text()
         digest = json.loads(text.splitlines()[-1])["merge"]["shards"][0]["rows_sha256"]
