@@ -103,9 +103,13 @@ pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
         "D04:after-quorum" => "only the P10-PROBES Applied probe can prove the quorum came first",
         "D02:after-propose" => "needs the P10-PROBES proposal trigger",
         "O26:pinned-snapshot" => "a pinned query needs the queued path's barriers (phase 11)",
-        "O26:split-across-pools" => "a split never publishes after a direct commit (open finding)",
+        "O26:split-across-pools" => "no phase 10 schedule splits a range across pools",
         "O26:failed-mount" => "no phase 10 schedule loses a mount",
         "O26:worker-4" => "the data worker process binds a real TCP listener",
+        "D11:index" => {
+            "its assertion is SchemaEpochAtCommit, which needs the schema epoch of each commit and of each Catalog publication (probes)"
+        }
+        "O12:worker-lost" => "no public observation names the worker that runs a build",
         "O12:unique-validation" => {
             "the product has no unique index: IndexDefinition has no such field"
         }

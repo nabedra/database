@@ -191,15 +191,43 @@ fn incomplete_index_chosen() {
 
 #[test]
 fn dropped_table_silent() {
-    let call = |invoked, success| TableCall {
+    let call = |first, invoked, success| TableCall {
         what: "table.insert".into(),
+        first,
         invoked,
         success,
     };
-    // Before the acknowledgment, overlapping it, and refused after it.
-    let legal = [call(1, true), call(9, true), call(11, false)];
+    // Before the acknowledgment, overlapping it, refused after it, and unanswered after it.
+    let legal = [
+        call(1, 1, Some(true)),
+        call(9, 9, Some(true)),
+        call(11, 11, Some(false)),
+        call(11, 11, None),
+    ];
     assert!(dropped_silent(10, &legal).is_empty());
-    assert_eq!(dropped_silent(10, &[call(11, true)]).len(), 1);
+    assert_eq!(dropped_silent(10, &[call(11, 11, Some(true))]).len(), 1);
+    // A later retry of an identity first sent after the acknowledgment.
+    assert_eq!(dropped_silent(10, &[call(11, 14, Some(true))]).len(), 1);
+    // A retry of an identity first sent before the drop may return its first result.
+    assert!(dropped_silent(10, &[call(9, 12, Some(true))]).is_empty());
+    let judged = |call: TableCall| call.judged(10);
+    assert!(judged(call(11, 11, Some(false))) && judged(call(11, 11, Some(true))));
+    assert!(!judged(call(11, 11, None)) && !judged(call(9, 12, Some(false))));
+}
+
+#[test]
+fn an_explain_ran_while_building_only_between_two_statuses_that_say_so() {
+    let life = [
+        status("a", (1, 2), "building"),
+        status("a", (8, 9), "building"),
+        status("a", (12, 13), "ready"),
+    ];
+    assert!(shown_building("a", &life, 3, 7));
+    // Started before the first status ended, ended after the last began, or another index.
+    assert!(!shown_building("a", &life, 1, 7));
+    assert!(!shown_building("a", &life, 3, 8));
+    assert!(!shown_building("a", &life, 10, 11));
+    assert!(!shown_building("b", &life, 3, 7));
 }
 
 #[test]
@@ -226,15 +254,19 @@ fn refused_ddl_applied() {
 
 #[test]
 fn fence_public_form() {
-    let rest = |schema_fallbacks| AtRest {
+    let rest = |schema_fallbacks, direct| AtRest {
         table: "main",
         gateway: 101,
-        writes: 1,
+        writes: 2,
         schema_fallbacks,
+        direct,
         polled_ms: 30_000,
     };
-    assert!(fence_at_rest(&[rest(0)]).is_empty());
-    assert_eq!(fence_at_rest(&[rest(0), rest(1)]).len(), 1);
+    assert!(fence_at_rest(&[rest(0, 2)]).is_empty());
+    assert_eq!(fence_at_rest(&[rest(0, 2), rest(1, 0)]).len(), 1);
+    assert!(rest(0, 2).judged() && rest(2, 0).judged());
+    // Refused or unanswered mutations show neither a fence nor its absence.
+    assert!(!rest(0, 0).judged() && !rest(0, 1).judged());
 }
 
 #[test]

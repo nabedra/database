@@ -7,8 +7,8 @@
 //! - `main` has the direct clients of the phase 10 workloads, auditors and indexes. The
 //!   nemesis splits it under load when its profile picks `split`.
 //! - `ranged` has fewer clients, auditors and indexes. It is split before any client starts or
-//!   under load, as the seed draws. A split under load never publishes today (see
-//!   `wave-p8/reports/p10-workloads.md`), so those seeds report `Liveness`.
+//!   under load, as the seed draws. A split that doesn't publish within its bound after the heal
+//!   is reported as `Liveness`.
 //! - `victim` is written by its own clients and dropped under load, with an index publication
 //!   racing the drop, and then created again under the same name.
 //! - `moved` has one client and a replica move, in the seeds that draw one.
@@ -18,10 +18,10 @@
 //! - `fence` has one row. At the end pairs of declarations race for one index name on it, so that
 //!   one of them fails its validation while it holds the table's guard.
 //!
-//! Auditors own keys that nobody else writes and scan a covering index over them, so an
-//! acknowledged insert must be in every later scan. The rules are in
-//! [`crate::invariants::topology`]; this module records what happened. The history goes through
-//! the `direct` checks.
+//! Auditors own keys that nobody else writes and scan them through a query that a covering index
+//! can serve, so an acknowledged insert must be in every later scan. The rules are in
+//! [`crate::invariants::topology`]; this module records what happened, and how often each rule
+//! was judged. The history goes through the `direct` checks.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -54,9 +54,9 @@ use crate::{
     invariants::{
         elapsed_ms,
         topology::{
-            self, AtRest, Chosen, Ended, RULES, Refresh, Scan, Status, TableCall, Write,
-            audit_scans, dropped_silent, fence_at_rest, incomplete_chosen, refreshes_once,
-            refused_ddl, route_count,
+            self, AtRest, Chosen, Ended, Refresh, Scan, Status, TableCall, Write, audit_scans,
+            dropped_silent, fence_at_rest, incomplete_chosen, refreshes_once, refused_ddl,
+            route_count,
         },
     },
     nemesis::{Action, NetFaults, Selection, apply::Chaos},
@@ -89,8 +89,8 @@ const QUERY_LIMIT: Duration = Duration::from_secs(30);
 const REST_LIMIT: Duration = Duration::from_secs(30);
 const STATUS_POLL: Duration = Duration::from_millis(300);
 const RETRY: Duration = Duration::from_millis(250);
-/// Rounds of definite, retryable refusals before an index is declared under a new build ID, as
-/// `create_d11_index` in `tests/oltp_direct_acceptance.py` does it.
+/// Rounds without a final answer before an index is declared under a new build ID. The number is
+/// the workload's.
 const FRESH_BUILD: u32 = 12;
 /// Audited values start here, above every value another writer uses.
 const FLOOR: i64 = 1_000_000_000_000;
@@ -102,7 +102,8 @@ const RACES: usize = 4;
 const VICTIM_KEYS: i64 = 6;
 
 /// Seeded defects. `LoseRow` and `FakeDrop` change what the cluster does; the others change
-/// one observation the rule reads.
+/// one observation the rule reads, so they test the rule and its wiring. `LoseRow` can be caught
+/// by a scan before any index exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Defect {
     /// Delete one acknowledged audited row behind the clients' back.
@@ -424,8 +425,40 @@ struct Build {
     abandoned: bool,
     /// Why the build did not settle before its bound.
     stuck: Option<String>,
-    /// A request of it was never answered for good, or the build has not published.
+    /// The declaration was not refused for good, and its build has not published.
     open: bool,
+    /// Declarations that were ever unanswered and are not known to be accepted. A refusal of a
+    /// later attempt under the same ID does not settle the first one.
+    unanswered: BTreeSet<Uuid>,
+    /// The ID of the final refusal, if it was never unanswered.
+    refused_id: Option<Uuid>,
+}
+
+impl Build {
+    /// Whether a schema change of its table may be open.
+    fn is_open(&self) -> bool {
+        self.open || !self.unanswered.is_empty()
+    }
+}
+
+/// A position in the run-wide order of observations, and the virtual ms.
+type Stamp = (u64, u64);
+
+/// When an index was surely building: from the end of the first status that said so to the start
+/// of the last one.
+#[derive(Clone, Copy, Debug)]
+struct Building {
+    from: Stamp,
+    to: Stamp,
+}
+
+/// The split of `ranged`, in virtual ms.
+#[derive(Clone, Copy, Debug)]
+struct RangedSplit {
+    requested: u64,
+    /// It had surely not published when this request was sent.
+    pending: u64,
+    published: Option<u64>,
 }
 
 #[derive(Default)]
@@ -434,19 +467,29 @@ struct Log {
     scans: BTreeMap<Table, Vec<Scan>>,
     /// Scans in virtual ms, for the scenario clauses.
     scan_ms: Vec<(Table, u64, u64)>,
+    /// Scans whose plan used a covering index, by their position in the order.
+    indexed: BTreeMap<Table, Vec<u64>>,
+    /// Tables whose final scan and exact count were answered and compared.
+    counted: BTreeSet<Table>,
     created: BTreeSet<String>,
     statuses: Vec<Status>,
     chosen: Vec<Chosen>,
-    /// When each explain ran, in virtual ms.
-    explain_ms: Vec<(Table, u64)>,
+    /// When each explain ran.
+    explains: Vec<(Table, u64, u64)>,
+    building: BTreeMap<String, Building>,
     builds: Vec<Build>,
     /// Refused index builds and their selectors.
     refused: BTreeMap<Uuid, String>,
     selectors: BTreeMap<Uuid, Value>,
+    /// Refused builds whose status an operator then read.
+    refused_judged: BTreeSet<Uuid>,
     dropped: Option<u64>,
+    /// When the drop was sent and acknowledged, in virtual ms.
+    drop_ms: Option<(u64, u64)>,
+    /// The rows of the table created after the drop were counted.
+    recreated: bool,
     calls: Vec<TableCall>,
-    /// Splits of `ranged`: requested, published.
-    split: Option<(u64, Option<u64>)>,
+    split: Option<RangedSplit>,
     split_error: Option<String>,
     /// How many split IDs were sent for `ranged`.
     split_ids: u64,
@@ -454,6 +497,13 @@ struct Log {
     races: Vec<String>,
     /// What the tables did at rest.
     rest: Vec<String>,
+    /// Tables and races whose fence could not be judged, and why.
+    fence_unjudged: Vec<String>,
+    /// How often [`topology::FENCE`], [`topology::ROUTES`] and [`topology::STALE_ROUTE`] were
+    /// judged.
+    fence_judged: u64,
+    routes_judged: u64,
+    stale_judged: u64,
     defect: Option<Defect>,
 }
 
@@ -479,8 +529,9 @@ struct Topo {
 /// What the workers answered to one operator request.
 enum Reply {
     Ok(Value),
-    /// A worker that executes it refused it for good.
-    Definite(ErrorCode, String),
+    /// A worker that executes it refused it for good. The flag says that another worker left it
+    /// unanswered in the same round.
+    Definite(ErrorCode, String, bool),
     /// Nothing definite, or only refusals that ask for a retry.
     Retry {
         why: String,
@@ -492,8 +543,9 @@ impl Reply {
     fn shown(&self) -> String {
         match self {
             Reply::Ok(data) => format!("ok {}", data["state"]),
-            Reply::Definite(_, why) => why.clone(),
-            Reply::Retry { why, unknown } => format!("{why} (unknown {unknown})"),
+            Reply::Definite(_, why, unknown) | Reply::Retry { why, unknown } => {
+                format!("{why} (unknown {unknown})")
+            }
         }
     }
 }
@@ -513,6 +565,10 @@ impl Topo {
 
     fn now(&self) -> u64 {
         elapsed_ms(&self.main.world)
+    }
+
+    fn stamp(&self) -> Stamp {
+        (self.next(), self.now())
     }
 
     /// The chaos window is over and the heal has not finished.
@@ -580,7 +636,7 @@ impl Topo {
                 Ok(Completion::Refused(error)) => {
                     let message = format!("n{node} {:?}: {}", error.code, error.message);
                     if error.outcome == Outcome::NotApplied && definite(error.code) {
-                        return Reply::Definite(error.code, message);
+                        return Reply::Definite(error.code, message, unknown);
                     }
                     unknown |= error.outcome == Outcome::Unknown;
                     why.push(message);
@@ -852,7 +908,7 @@ async fn explain(
         }
     }
     t.log(|log| {
-        log.explain_ms.push((table, elapsed_ms(&t.main.world)));
+        log.explains.push((table, invoked, completed));
         if let Some(index) = index {
             log.chosen.push(Chosen {
                 index,
@@ -864,7 +920,78 @@ async fn explain(
     Ok(ranges)
 }
 
-/// Write keys nobody else writes, and scan them through the index.
+/// How many collects of `table` the workers ran since they started, and how many of them used a
+/// covering index.
+async fn collects(t: &Topo, table: Table) -> Result<(u64, u64), String> {
+    let mut sums = (0, 0);
+    for node in WORKERS {
+        let id = fresh_id(BOOTSTRAP_CLIENT).await;
+        let body = operation(id, "query.statistics", json!({}));
+        let answer = request(
+            BOOTSTRAP_CLIENT,
+            node,
+            ADMIN,
+            &t.admin_token,
+            Some(body),
+            ADMIN_LIMIT,
+        )
+        .await
+        .and_then(|reply| reply.completion(id))?;
+        let Completion::Ok(data) = &answer else {
+            return Err(clients::failure(&answer).unwrap_or_default());
+        };
+        let (ran, covered) = plans_of(&data["statistics"], &t.ctx(table).table)?;
+        sums = (sums.0 + ran, sums.1 + covered);
+    }
+    Ok(sums)
+}
+
+fn plans_of(statistics: &Value, table: &str) -> Result<(u64, u64), String> {
+    let shapes = statistics["shapes"].as_array();
+    let (Some(shapes), Some(0)) = (shapes, statistics["untracked_executions"].as_u64()) else {
+        return Err(format!("query.statistics answered {statistics}"));
+    };
+    let mut sums = (0, 0);
+    for shape in shapes {
+        if shape["table_id"] == json!(table) && shape["operation"] == "collect" {
+            let count = |value: &Value| value.as_u64().ok_or(format!("a shape is {shape}"));
+            sums.0 += count(&shape["executions"])?;
+            sums.1 += count(&shape["plans"]["covering_index"])?;
+        }
+    }
+    Ok(sums)
+}
+
+/// A scan while nothing else queries the table, so that the workers' own counts say which plan it
+/// used.
+async fn scan_alone(
+    t: &Topo,
+    client: &mut Client,
+    node: u64,
+    gateway: usize,
+    table: Table,
+) -> Option<String> {
+    let before = collects(t, table).await;
+    let at = t.next();
+    if let Some(why) = scan(t, client, node, gateway, table).await {
+        return Some(why);
+    }
+    match (before, collects(t, table).await) {
+        (Ok(before), Ok(after)) => {
+            let (ran, covered) = (
+                after.0.saturating_sub(before.0),
+                after.1.saturating_sub(before.1),
+            );
+            if ran > 0 && ran == covered {
+                t.log(|log| log.indexed.entry(table).or_default().push(at));
+            }
+        }
+        (Err(why), _) | (_, Err(why)) => t.note("scan-plan-unknown", json!(why)),
+    }
+    None
+}
+
+/// Write keys nobody else writes, and scan them.
 async fn audit(t: Topo, table: Table, steps: Vec<Audit>) {
     let ctx = t.ctx(table).clone();
     let node = CLIENTS[table as usize % CLIENTS.len()];
@@ -981,15 +1108,25 @@ async fn lose_row(t: &Topo, ctx: &Ctx, key: i64) {
 
 // Index builds.
 
-fn record_status(t: &Topo, name: &str, invoked: u64, completed: u64, data: &Value) -> String {
+fn record_status(t: &Topo, name: &str, invoked: Stamp, completed: Stamp, data: &Value) -> String {
     let state = data["state"].as_str().unwrap_or("").to_owned();
     t.log(|log| {
         log.statuses.push(Status {
             index: name.to_owned(),
-            invoked,
-            completed,
+            invoked: invoked.0,
+            completed: completed.0,
             state: state.clone(),
         });
+        if state == "building" {
+            let building = Building {
+                from: completed,
+                to: invoked,
+            };
+            log.building
+                .entry(name.to_owned())
+                .and_modify(|known| known.to = invoked)
+                .or_insert(building);
+        }
     });
     state
 }
@@ -1009,6 +1146,8 @@ async fn index_life(t: Topo, plan: IndexPlan) {
         abandoned: false,
         stuck: None,
         open: true,
+        unanswered: BTreeSet::new(),
+        refused_id: None,
     };
     let slot = t.log(|log| {
         log.created.insert(plan.name.clone());
@@ -1029,7 +1168,8 @@ async fn index_life(t: Topo, plan: IndexPlan) {
         "index",
         json!({"name": plan.name, "kind": format!("{:?}", plan.kind), "declared": build.declared,
             "ready": build.ready, "retired": build.retired, "refused": build.refused,
-            "abandoned": build.abandoned, "stuck": build.stuck}),
+            "abandoned": build.abandoned, "stuck": build.stuck,
+            "unanswered": build.unanswered}),
     );
     t.log(|log| log.builds[slot] = build);
 }
@@ -1048,11 +1188,10 @@ async fn life(
     let selector =
         |id: Uuid| json!({"table_id": table, "index_id": index_id, "build_id": id, "attempt": 1});
     t.log(|log| log.selectors.insert(id, selector(id)));
-    let mut open = false;
     let mut opened: Vec<Uuid> = Vec::new();
     let mut refusals = 0;
     let mut state = 'declare: loop {
-        let invoked = t.next();
+        let invoked = t.stamp();
         let reply = match plan.kind {
             // Beside the gate, so that it can overlap the declaration it races. The heal
             // holds the gate, and then the rival waits like any other request.
@@ -1063,16 +1202,19 @@ async fn life(
         };
         match reply {
             Reply::Ok(data) => {
-                let completed = t.next();
+                let completed = t.stamp();
                 if t.take_defect(Defect::LieAboutRefusal) {
                     t.log(|log| log.refused.insert(id, "seeded".into()));
                 }
                 break record_status(t, &plan.name, invoked, completed, &data);
             }
-            Reply::Definite(code, why) => {
+            Reply::Definite(code, why, unknown) => {
+                if unknown {
+                    build.unanswered.insert(id);
+                }
                 // The index of a dropped table, and the two kinds that fail their validation,
                 // are refused for good. Nothing else is expected to be.
-                if !open {
+                if !build.unanswered.contains(&id) {
                     t.log(|log| log.refused.insert(id, format!("{code:?} {why}")));
                 }
                 if overtaken(code, &why) && !t.builds_over() {
@@ -1080,10 +1222,10 @@ async fn life(
                     // its own ID is sent again.
                     let mut unanswered = Vec::new();
                     for earlier in std::mem::take(&mut opened) {
-                        let invoked = t.next();
+                        let invoked = t.stamp();
                         match t.admin(earlier, "storage.index.create", definition).await {
                             Reply::Ok(data) => {
-                                let completed = t.next();
+                                let completed = t.stamp();
                                 id = earlier;
                                 break 'declare record_status(
                                     t, &plan.name, invoked, completed, &data,
@@ -1096,25 +1238,26 @@ async fn life(
                     opened = unanswered;
                     id = fresh_id(BOOTSTRAP_CLIENT).await;
                     t.log(|log| log.selectors.insert(id, selector(id)));
-                    (open, refusals) = (false, 0);
+                    refusals = 0;
                     time::sleep(RETRY).await;
                     continue;
                 }
                 // The name may be taken by an earlier declaration of this index that was
                 // never answered.
                 for &earlier in &opened {
-                    let invoked = t.next();
+                    let invoked = t.stamp();
                     let ask = fresh_id(BOOTSTRAP_CLIENT).await;
                     let earlier_build = selector(earlier);
                     let asked = t.admin(ask, "storage.index.status", &earlier_build).await;
                     if let Reply::Ok(data) = asked {
-                        let completed = t.next();
+                        let completed = t.stamp();
                         id = earlier;
                         break 'declare record_status(t, &plan.name, invoked, completed, &data);
                     }
                 }
                 build.refused = true;
-                build.open = !opened.is_empty();
+                build.open = false;
+                build.refused_id = (!build.unanswered.contains(&id)).then_some(id);
                 let expected = plan.kind != IndexKind::Valid
                     || plan.table == Table::Victim
                     || (code == ErrorCode::Conflict && why.contains("already exists"));
@@ -1124,26 +1267,30 @@ async fn life(
                 return;
             }
             Reply::Retry { why, unknown } => {
-                open |= unknown;
+                if unknown {
+                    build.unanswered.insert(id);
+                }
                 refusals += 1;
                 if t.builds_over() {
                     build.stuck = Some(format!("declaration unanswered: {why}"));
                     return;
                 }
                 if refusals >= FRESH_BUILD {
-                    if open {
+                    if build.unanswered.contains(&id) {
                         opened.push(id);
                     } else {
                         t.log(|log| log.refused.insert(id, why));
                     }
                     id = fresh_id(BOOTSTRAP_CLIENT).await;
                     t.log(|log| log.selectors.insert(id, selector(id)));
-                    (open, refusals) = (false, 0);
+                    refusals = 0;
                 }
                 time::sleep(RETRY).await;
             }
         }
     };
+    // Its own outcome is known: it was accepted.
+    build.unanswered.remove(&id);
     build.declared = Some(t.now());
     t.log(|log| log.builds[slot].declared = build.declared);
     let mut polls = 0_u32;
@@ -1170,14 +1317,14 @@ async fn life(
         } else {
             "storage.index.status"
         };
-        let invoked = t.next();
+        let invoked = t.stamp();
         match t.admin(ask, name, &selector(id)).await {
             Reply::Ok(data) => {
-                let completed = t.next();
+                let completed = t.stamp();
                 state = record_status(t, &plan.name, invoked, completed, &data);
                 last.clear();
             }
-            Reply::Definite(code, why) => {
+            Reply::Definite(code, why, _) => {
                 // A build that belongs to an earlier run cannot resume, and stays invisible.
                 if name == "storage.index.resume" && *t.run.lock().unwrap() != run {
                     build.abandoned = true;
@@ -1198,10 +1345,10 @@ async fn life(
     time::sleep(after).await;
     loop {
         let ask = fresh_id(BOOTSTRAP_CLIENT).await;
-        let invoked = t.next();
+        let invoked = t.stamp();
         match t.admin(ask, "storage.index.retire", &selector(id)).await {
             Reply::Ok(data) => {
-                let completed = t.next();
+                let completed = t.stamp();
                 let state = record_status(t, &plan.name, invoked, completed, &data);
                 if state == "retired" {
                     build.open = false;
@@ -1210,7 +1357,7 @@ async fn life(
                 }
                 last = format!("retire answered {state}");
             }
-            Reply::Definite(code, why) => last = format!("{code:?} {why}"),
+            Reply::Definite(code, why, _) => last = format!("{code:?} {why}"),
             Reply::Retry { why, .. } => last = why,
         }
         if t.builds_over() {
@@ -1254,8 +1401,14 @@ async fn victim_client(t: Topo, index: usize) {
             ),
         };
         let mut gateway = (turn as usize + index) % GATEWAYS.len();
+        let mut first = None;
         for tries in 1_u64.. {
             let invoked = t.next();
+            // A read has no identity.
+            let first = match what {
+                "table.get" => invoked,
+                _ => *first.get_or_insert(invoked),
+            };
             let answer = clients::attempt(
                 &ctx,
                 &mut client,
@@ -1265,12 +1418,12 @@ async fn victim_client(t: Topo, index: usize) {
                 tries == 1,
             )
             .await;
-            let success = matches!(answer, Completion::Ok(_));
             t.log(|log| {
                 log.calls.push(TableCall {
                     what: format!("{what} of key {key} through n{}", GATEWAYS[gateway]),
+                    first,
                     invoked,
-                    success,
+                    success: succeeded(&answer),
                 });
             });
             if dropped {
@@ -1285,6 +1438,11 @@ async fn victim_client(t: Topo, index: usize) {
     }
 }
 
+/// Whether an operation succeeded, or `None` if its outcome is unknown.
+fn succeeded(answer: &Completion) -> Option<bool> {
+    (!clients::unknown(answer)).then_some(matches!(answer, Completion::Ok(_)))
+}
+
 /// Drop the victim, then create a table of the same name and check that it is empty.
 async fn drop_table(t: Topo, at: Duration, gateway: usize) -> Option<String> {
     time::sleep(at).await;
@@ -1296,6 +1454,7 @@ async fn drop_table(t: Topo, at: Duration, gateway: usize) -> Option<String> {
     let mut open = false;
     let mut ambiguous = false;
     let mut refusals = 0;
+    let sent = t.now();
     if t.take_defect(Defect::FakeDrop) {
         t.note("seeded-fake-drop", payload);
     } else {
@@ -1351,8 +1510,11 @@ async fn drop_table(t: Topo, at: Duration, gateway: usize) -> Option<String> {
             time::sleep(RETRY).await;
         }
     }
-    let dropped = t.next();
-    t.log(|log| log.dropped = Some(dropped));
+    let (dropped, at) = t.stamp();
+    t.log(|log| {
+        log.dropped = Some(dropped);
+        log.drop_ms = Some((sent, at));
+    });
     t.note("dropped", json!({"table": t.victim.table}));
     for (gateway, through) in GATEWAYS.into_iter().enumerate() {
         let id = fresh_id(node).await;
@@ -1361,12 +1523,12 @@ async fn drop_table(t: Topo, at: Duration, gateway: usize) -> Option<String> {
         let answer = t
             .public(&mut client, node, gateway, id, "table.describe", payload)
             .await;
-        let success = matches!(answer, Completion::Ok(_));
         t.log(|log| {
             log.calls.push(TableCall {
                 what: format!("table.describe through n{through}"),
+                first: invoked,
                 invoked,
-                success,
+                success: succeeded(&answer),
             });
         });
     }
@@ -1411,8 +1573,12 @@ async fn recreate(t: &Topo, client: &mut Client, node: u64) -> Option<String> {
             .public(client, node, gateway, id, "query.count", query.clone())
             .await;
         match &answer {
-            Completion::Ok(count) if *count == json!(0) => return None,
+            Completion::Ok(count) if *count == json!(0) => {
+                t.log(|log| log.recreated = true);
+                return None;
+            }
             Completion::Ok(count) => {
+                t.log(|log| log.recreated = true);
                 t.main.checks.violate(
                     &t.main.world,
                     topology::DROPPED,
@@ -1449,12 +1615,19 @@ async fn split(t: Topo, table: String, cluster_id: Uuid, boundary: i64, at: Dura
     let mut run = *t.run.lock().unwrap();
     let mut id = fresh_id(BOOTSTRAP_CLIENT).await;
     let requested = t.now();
+    let mut split = RangedSplit {
+        requested,
+        pending: requested,
+        published: None,
+    };
     t.log(|log| {
-        log.split = Some((requested, None));
+        log.split = Some(split);
         log.split_ids = 1;
     });
     t.note("split-ranged", json!({"id": id, "boundary": boundary}));
     let mut last = String::new();
+    // A request that was ever unanswered may have published, whatever a later one is told.
+    let mut unanswered = false;
     loop {
         // Queued work is abandoned when every worker stops, so the operator asks again.
         let now = *t.run.lock().unwrap();
@@ -1467,15 +1640,24 @@ async fn split(t: Topo, table: String, cluster_id: Uuid, boundary: i64, at: Dura
                 json!({"id": id, "boundary": boundary, "run": run}),
             );
         }
-        let why = match t.admin(id, "storage.shard.split", &payload).await {
+        let sent = t.now();
+        let reply = t.admin(id, "storage.shard.split", &payload).await;
+        if let Reply::Definite(_, _, true) | Reply::Retry { unknown: true, .. } = reply {
+            unanswered = true;
+        }
+        let told = matches!(&reply, Reply::Ok(data) if data["state"] != "published");
+        if told || !unanswered && !matches!(reply, Reply::Ok(_)) {
+            split.pending = sent;
+        }
+        let why = match reply {
             Reply::Ok(data) if data["state"] == "published" => {
-                let published = t.now();
-                t.log(|log| log.split = Some((requested, Some(published))));
+                split.published = Some(t.now());
+                t.log(|log| log.split = Some(split));
                 t.note("split-ranged-published", data);
                 return;
             }
             Reply::Ok(data) => data.to_string(),
-            Reply::Definite(code, why) => {
+            Reply::Definite(code, why, _) => {
                 if overtaken(code, &why) {
                     id = fresh_id(BOOTSTRAP_CLIENT).await;
                     t.log(|log| log.split_ids += 1);
@@ -1669,6 +1851,7 @@ pub(crate) async fn run(
     }
 
     let mut frozen: Option<(u64, u64)> = None;
+    let load_from = elapsed_ms(&cluster.world);
     let end = cluster.world.elapsed() + CHAOS;
     while cluster.world.elapsed() < end {
         if let Some(chaos) = chaos.as_mut() {
@@ -1682,6 +1865,12 @@ pub(crate) async fn run(
         time::sleep(TICK).await;
     }
     ctx.stopping.store(true, Ordering::Release);
+    let load = (load_from, elapsed_ms(&cluster.world));
+    let mut seen = Seen {
+        load,
+        work: progress(cluster, &t, moved.as_ref(), load),
+        moved_checked: false,
+    };
     if let Some((gateway, _)) = frozen.take() {
         cluster.thaw(gateway);
     }
@@ -1704,6 +1893,16 @@ pub(crate) async fn run(
         tasks.append(&mut changes);
         t.change_by.store(0, Ordering::Release);
         judge(cluster, &t);
+        summarize(
+            cluster,
+            &t,
+            chaos.as_ref(),
+            moving.is_some(),
+            plan.split,
+            &seen,
+            true,
+            &mut report,
+        );
         return direct::abandon(cluster, &ctx, tasks, report).await;
     }
     faults.clear();
@@ -1730,6 +1929,16 @@ pub(crate) async fn run(
         tasks.append(&mut changes);
         t.change_by.store(0, Ordering::Release);
         judge(cluster, &t);
+        summarize(
+            cluster,
+            &t,
+            chaos.as_ref(),
+            moving.is_some(),
+            plan.split,
+            &seen,
+            true,
+            &mut report,
+        );
         return direct::abandon(cluster, &ctx, tasks, report).await;
     }
     let mut converged = Ok(());
@@ -1830,17 +2039,21 @@ pub(crate) async fn run(
             );
         }
     }
-    if let Some(moved) = moved.as_ref()
-        && let Err(error) = clients::final_checks(moved).await
-    {
-        cluster
-            .checks
-            .violate(&cluster.world, "Liveness", format!("moved: {error}"));
+    if let Some(moved) = moved.as_ref() {
+        match clients::final_checks(moved).await {
+            Ok(()) => seen.moved_checked = true,
+            Err(error) => {
+                cluster
+                    .checks
+                    .violate(&cluster.world, "Liveness", format!("moved: {error}"));
+            }
+        }
     }
     let rested = at_rest(cluster, &t, &mut live).await;
-    report
-        .assertions
-        .push(("direct mutations at rest", rested.is_ok()));
+    // A table with an open schema change is not judged, and says nothing here.
+    if let Some(passed) = rested.as_ref().map_or(Some(false), |judged| *judged) {
+        report.assertions.push(("direct mutations at rest", passed));
+    }
     if let Err(error) = rested {
         cluster
             .checks
@@ -1875,6 +2088,9 @@ pub(crate) async fn run(
         &t,
         chaos.as_ref(),
         moving.as_ref(),
+        moved.as_ref(),
+        &seen,
+        report.assertions.contains(&("replica move retired", true)),
         &mut report.scenarios,
     );
     evaluate(
@@ -1909,9 +2125,81 @@ pub(crate) async fn run(
         chaos.as_ref(),
         moving.is_some(),
         plan.split,
+        &seen,
+        false,
         &mut report,
     );
     Ok(report)
+}
+
+/// What the run itself saw, for the clauses and the summary.
+struct Seen {
+    /// The time in which clients, auditors and the nemesis ran, in virtual ms.
+    load: (u64, u64),
+    work: Work,
+    /// The final operations on `moved` succeeded.
+    moved_checked: bool,
+}
+
+/// Work that was completed under load.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Work {
+    writes: u64,
+    reads: u64,
+    scans: u64,
+}
+
+impl Work {
+    fn of(attempts: &[clauses::Attempt], scans: &[(u64, u64)], load: (u64, u64)) -> Self {
+        let within = |from: u64, to: u64| load.0 <= from && to <= load.1;
+        let mut work = Self::default();
+        for attempt in attempts {
+            if !attempt.fresh || !within(attempt.invoked, attempt.completed) {
+                continue;
+            }
+            match attempt.answer {
+                Answer::Committed => work.writes += 1,
+                Answer::Ok if !attempt.mutation => work.reads += 1,
+                _ => {}
+            }
+        }
+        work.scans = scans.iter().filter(|scan| within(scan.0, scan.1)).count() as u64;
+        work
+    }
+
+    fn missing(&self) -> Vec<&'static str> {
+        [
+            (self.writes, "write committed"),
+            (self.reads, "read was answered"),
+            (self.scans, "scan was answered"),
+        ]
+        .into_iter()
+        .filter(|(done, _)| *done == 0)
+        .map(|(_, what)| what)
+        .collect()
+    }
+}
+
+/// A seed whose clients or auditors completed no work under load proves nothing, so it is never
+/// clean (lead decision 17). A scan is work of its own: the index rules are judged by scans.
+fn progress(cluster: &Cluster, t: &Topo, moved: Option<&Ctx>, load: (u64, u64)) -> Work {
+    let mut attempts = Vec::new();
+    for ctx in [Some(&t.main), Some(&t.ranged), moved]
+        .into_iter()
+        .flatten()
+    {
+        attempts.extend(ctx.observed.lock().unwrap().attempts.iter().cloned());
+    }
+    let scans: Vec<_> = t.log(|log| log.scan_ms.iter().map(|(_, a, b)| (*a, *b)).collect());
+    let work = Work::of(&attempts, &scans, load);
+    for what in work.missing() {
+        cluster.checks.violate(
+            &cluster.world,
+            "Progress",
+            format!("no {what} from {}ms to {}ms, under load", load.0, load.1),
+        );
+    }
+    work
 }
 
 /// Freeze a gateway at the start of a window and resume it at its end.
@@ -1979,7 +2267,7 @@ fn changes_settled(cluster: &Cluster, t: &Topo, report: &mut direct::Report) {
         }
     }
     report.assertions.push(("index builds settled", settled));
-    let published = split.is_none_or(|(_, published)| published.is_some());
+    let published = split.is_none_or(|split| split.published.is_some());
     report
         .assertions
         .push(("ranged split published", published));
@@ -1994,43 +2282,83 @@ fn changes_settled(cluster: &Cluster, t: &Topo, report: &mut direct::Report) {
     }
 }
 
+/// What every worker did with the mutations it was sent: fallbacks because of the schema, all
+/// fallbacks, and direct proposals.
+async fn mutation_stats(cluster: &Cluster) -> Result<[u64; 3], String> {
+    let mut sums = [0; 3];
+    for node in WORKERS {
+        let stats = cluster.stats(node).await?;
+        let direct = &stats["direct"];
+        let count = |value: &Value| value.as_u64().ok_or(format!("n{node} stats: {direct}"));
+        sums[0] += count(&direct["fallbacks"]["schema"])?;
+        let all = direct["fallbacks"].as_object();
+        for fallback in all.ok_or(format!("n{node} stats: {direct}"))?.values() {
+            sums[1] += count(fallback)?;
+        }
+        sums[2] += count(&direct["entries_proposed"])?;
+    }
+    Ok(sums)
+}
+
+/// Upserts of one table sent alone, one after another: how many were sent to the queued path for
+/// the schema, and how many committed directly.
+async fn mutate_alone(
+    cluster: &Cluster,
+    ctx: &Ctx,
+    client: &mut Client,
+    (node, gateway): (u64, u64),
+    rows: &[(i64, i64)],
+) -> Result<(u64, u64), String> {
+    let (mut schema, mut direct) = (0, 0);
+    for &(key, value) in rows {
+        let before = mutation_stats(cluster).await?;
+        let id = fresh_id(node).await;
+        let request = Request::row("table.upsert", &ctx.table, key, value, id);
+        let answer = clients::attempt(ctx, client, node, gateway, &request, true).await;
+        let after = mutation_stats(cluster).await?;
+        let grew = |at: usize| after[at].saturating_sub(before[at]);
+        schema += grew(0);
+        direct += u64::from(matches!(answer, Completion::Ok(_)) && grew(1) == 0 && grew(2) > 0);
+    }
+    Ok((schema, direct))
+}
+
 /// [`topology::FENCE`] in its public form: with every schema change settled, a mutation takes
 /// the direct path. Convergence may be polled, so a Catalog intent that the first fallback
-/// resolves is not a finding.
-async fn at_rest(cluster: &Cluster, t: &Topo, live: &mut Vec<(Ctx, Table)>) -> Result<(), String> {
-    const SCHEMA: &str = "/direct/fallbacks/schema";
+/// resolves is not a finding. Returns whether the judged tables pass, or `None` if no table could
+/// be judged.
+async fn at_rest(
+    cluster: &Cluster,
+    t: &Topo,
+    live: &mut Vec<(Ctx, Table)>,
+) -> Result<Option<bool>, String> {
     let mut rest = Vec::new();
     for (ctx, table) in live.drain(..) {
-        // A declaration that was never answered, or a build that has not published, leaves a
+        // A declaration that was ever unanswered, or a build that has not published, can leave a
         // schema change open.
         let open = t.log(|log| {
-            let open = |b: &&Build| b.table == table && b.open;
+            let open = |b: &&Build| b.table == table && b.is_open();
             log.builds.iter().filter(open).count()
         });
         if open > 0 {
-            let skipped = format!(
-                "{} not judged: {open} schema changes are open",
-                table.name()
-            );
-            t.log(|log| log.rest.push(skipped));
+            let skipped = format!("{}: {open} schema changes are open", table.name());
+            t.log(|log| log.fence_unjudged.push(skipped));
             continue;
         }
         let mut client = ctx.new_client();
         for (index, gateway) in GATEWAYS.into_iter().enumerate() {
             let node = CLIENTS[index % CLIENTS.len()];
             let started = cluster.world.elapsed();
-            let keys = BTreeSet::from([1, ctx.keys]);
             loop {
-                let before = direct_stat(cluster, SCHEMA).await?;
-                for &key in &keys {
-                    let id = fresh_id(node).await;
-                    let value = 910_000_000 + elapsed_ms(&ctx.world) as i64 * 100 + key;
-                    let request = Request::row("table.upsert", &ctx.table, key, value, id);
-                    clients::attempt(&ctx, &mut client, node, gateway, &request, true).await;
-                }
-                let mut schema = direct_stat(cluster, SCHEMA).await?.saturating_sub(before);
+                let rows: Vec<_> = BTreeSet::from([1, ctx.keys])
+                    .into_iter()
+                    .map(|key| (key, 910_000_000 + elapsed_ms(&ctx.world) as i64 * 100 + key))
+                    .collect();
+                let (mut schema, direct) =
+                    mutate_alone(cluster, &ctx, &mut client, (node, gateway), &rows).await?;
                 let polled = cluster.world.elapsed() - started;
-                if schema > 0 && polled < REST_LIMIT {
+                let writes = rows.len() as u64;
+                if (schema > 0 || direct < writes) && polled < REST_LIMIT {
                     time::sleep(RETRY).await;
                     continue;
                 }
@@ -2040,31 +2368,56 @@ async fn at_rest(cluster: &Cluster, t: &Topo, live: &mut Vec<(Ctx, Table)>) -> R
                 rest.push(AtRest {
                     table: table.name(),
                     gateway,
-                    writes: keys.len() as u64,
+                    writes,
                     schema_fallbacks: schema,
+                    direct,
                     polled_ms: polled.as_millis() as u64,
                 });
                 break;
             }
         }
     }
-    t.log(|log| {
-        log.rest.extend(rest.iter().map(|rest| {
-            format!(
-                "{} n{}: {} of {} fell back after {} ms",
-                rest.table, rest.gateway, rest.schema_fallbacks, rest.writes, rest.polled_ms
-            )
-        }));
-    });
-    for found in fence_at_rest(&rest) {
+    let passed = judge_fences(cluster, t, &rest);
+    let indirect: Vec<_> = rest.iter().filter(|rest| !rest.judged()).collect();
+    if !indirect.is_empty() {
+        return Err(format!("no direct commit: {indirect:?}"));
+    }
+    Ok((!rest.is_empty()).then_some(passed))
+}
+
+/// Judge what was sent at rest. Returns whether nothing is wrong with it.
+fn judge_fences(cluster: &Cluster, t: &Topo, rest: &[AtRest]) -> bool {
+    for rest in rest {
+        let shown = format!(
+            "{} n{}: {} of {} committed directly and {} fell back for the schema after {} ms",
+            rest.table,
+            rest.gateway,
+            rest.direct,
+            rest.writes,
+            rest.schema_fallbacks,
+            rest.polled_ms
+        );
+        t.log(|log| {
+            if rest.judged() {
+                log.fence_judged += 1;
+            } else {
+                log.fence_unjudged.push(shown.clone());
+            }
+            log.rest.push(shown);
+        });
+    }
+    let found = fence_at_rest(rest);
+    let passed = found.is_empty();
+    for found in found {
         cluster
             .checks
             .violate(&cluster.world, topology::FENCE, found);
     }
-    Ok(())
+    passed
 }
 
-/// With no client running: one scan, one explain and one count per table, not retried.
+/// With no client running: scans, explains and one count per table, not retried. The workers'
+/// statistics say which plan each scan used.
 async fn final_scans(
     cluster: &Cluster,
     t: &Topo,
@@ -2089,7 +2442,7 @@ async fn final_scans(
         let (published, asked) = match table {
             Table::Main => (nemesis_split, asked),
             _ => (
-                split.is_some_and(|(_, published)| published.is_some()),
+                split.is_some_and(|split| split.published.is_some()),
                 split_ids,
             ),
         };
@@ -2097,7 +2450,7 @@ async fn final_scans(
         let open = u64::from(!published && asked > 0);
         for (gateway, _) in GATEWAYS.iter().enumerate() {
             let node = CLIENTS[gateway % CLIENTS.len()];
-            if let Some(why) = scan(t, &mut client, node, gateway, table).await {
+            if let Some(why) = scan_alone(t, &mut client, node, gateway, table).await {
                 return Err(format!(
                     "{} through n{}: {why}",
                     table.name(),
@@ -2111,6 +2464,7 @@ async fn final_scans(
             if t.take_defect(Defect::LoseRange) {
                 ranges -= 1;
             }
+            t.log(|log| log.routes_judged += 1);
             if let Some(found) = route_count(table.name(), u64::from(published), open, ranges) {
                 cluster
                     .checks
@@ -2123,6 +2477,7 @@ async fn final_scans(
         if let Some(wrong) = exact_count(t, table).await? {
             cluster.checks.violate(&cluster.world, "ExactCount", wrong);
         }
+        t.log(|log| log.counted.insert(table));
         if published {
             report.scenarios.insert("O16:coverage");
             report.scenarios.insert("O21:split-keeps-table");
@@ -2204,7 +2559,7 @@ async fn quiet_stage(
                 let why = match t.admin(id, "storage.shard.split", &payload).await {
                     Reply::Ok(data) if data["state"] == "published" => break,
                     Reply::Ok(data) => data.to_string(),
-                    Reply::Definite(_, why) | Reply::Retry { why, .. } => why,
+                    Reply::Definite(_, why, _) | Reply::Retry { why, .. } => why,
                 };
                 if t.now() >= deadline {
                     return Err(format!("the split of an idle range did not publish: {why}"));
@@ -2228,7 +2583,7 @@ async fn quiet_stage(
                 let why = match reply {
                     Reply::Ok(data) if data["state"] == "ready" => break,
                     Reply::Ok(data) => data.to_string(),
-                    Reply::Definite(_, why) | Reply::Retry { why, .. } => why,
+                    Reply::Definite(_, why, _) | Reply::Retry { why, .. } => why,
                 };
                 if t.now() >= deadline {
                     return Err(format!("the index of an idle table is not ready: {why}"));
@@ -2236,7 +2591,7 @@ async fn quiet_stage(
                 time::sleep(STATUS_POLL).await;
                 let ask = fresh_id(BOOTSTRAP_CLIENT).await;
                 reply = t.admin(ask, "storage.index.status", &selector).await;
-                if matches!(reply, Reply::Definite(ErrorCode::NotFound, _)) {
+                if matches!(reply, Reply::Definite(ErrorCode::NotFound, ..)) {
                     reply = t.admin(id, "storage.index.create", &definition).await;
                 }
             }
@@ -2281,7 +2636,9 @@ async fn quiet_stage(
         }
     }
     cluster.record(format!("quiet {:?} {refreshes:?}", plan.quiet));
-    if plan.quiet == QuietChange::Split && refreshes.iter().any(|r| r.stale_answers > 0) {
+    let met = refreshes.iter().filter(|r| r.stale_answers > 0).count();
+    t.log(|log| log.stale_judged += met as u64);
+    if plan.quiet == QuietChange::Split && met > 0 {
         clauses.insert("D07:stale-routes");
     }
     for found in refreshes_once(&refreshes) {
@@ -2300,8 +2657,9 @@ async fn warm_fence(ctx: &Ctx) -> Result<(), String> {
     clients::failure(&answer).map_or(Ok(()), |why| Err(format!("fence insert: {why}")))
 }
 
-/// One declaration of the fence table, sent again under its ID while it is unanswered.
-async fn declare(t: &Topo, table: &str, name: &str) -> (Uuid, Value, Reply) {
+/// One declaration of the fence table, sent again under its ID while it is unanswered. The last
+/// value says whether any attempt was unanswered.
+async fn declare(t: &Topo, table: &str, name: &str) -> (Uuid, Value, Reply, bool) {
     let index_id = fresh_id(BOOTSTRAP_CLIENT).await;
     let id = fresh_id(BOOTSTRAP_CLIENT).await;
     let deadline = t.now() + ADMIN_LIMIT.as_millis() as u64;
@@ -2312,10 +2670,14 @@ async fn declare(t: &Topo, table: &str, name: &str) -> (Uuid, Value, Reply) {
     let selector = json!({
         "table_id": table, "index_id": index_id, "build_id": id, "attempt": 1,
     });
+    let mut unanswered = false;
     loop {
         let reply = t.send(id, "storage.index.create", &definition).await;
+        if let Reply::Definite(_, _, true) | Reply::Retry { unknown: true, .. } = reply {
+            unanswered = true;
+        }
         if !matches!(reply, Reply::Retry { .. }) || t.now() >= deadline {
-            return (id, selector, reply);
+            return (id, selector, reply, unanswered);
         }
         time::sleep(Duration::from_millis(20)).await;
     }
@@ -2326,7 +2688,7 @@ async fn ready(t: &Topo, selector: &Value) -> Result<bool, String> {
     let ask = fresh_id(BOOTSTRAP_CLIENT).await;
     match t.admin(ask, "storage.index.status", selector).await {
         Reply::Ok(data) => Ok(data["state"] == "ready"),
-        Reply::Definite(_, why) | Reply::Retry { why, .. } => Err(why),
+        Reply::Definite(_, why, _) | Reply::Retry { why, .. } => Err(why),
     }
 }
 
@@ -2347,18 +2709,18 @@ async fn wait_ready(t: &Topo, selector: &Value) -> Result<(), String> {
 /// Two declarations of one name, the rival sent some time before the first is done. The loser is
 /// refused before it takes the table's guard, or after, by the validation under the guard. From
 /// the two answers until the winner's build publishes, no schema change of the table is open, so
-/// the direct path must serve it ([`topology::FENCE`]).
+/// the direct path must serve it ([`topology::FENCE`]). A race with an unanswered attempt is not
+/// judged.
 async fn fence_races(
     cluster: &Cluster,
     t: &Topo,
     ctx: &Ctx,
     start: u64,
 ) -> Result<Scenarios, String> {
-    const SCHEMA: &str = "/direct/fallbacks/schema";
     let mut clauses = Scenarios::new();
     let mut client = ctx.new_client();
     let alone = t.now();
-    let (_, selector, reply) = declare(t, &ctx.table, "fence_alone").await;
+    let (_, selector, reply, _) = declare(t, &ctx.table, "fence_alone").await;
     let took = t.now() - alone;
     if !matches!(reply, Reply::Ok(_)) {
         return Err("a declaration at rest was not accepted".into());
@@ -2380,12 +2742,13 @@ async fn fence_races(
             declare(t, &ctx.table, &name).await
         };
         let (first, rival) = tokio::join!(first, rival);
-        let ((_, selector, _), (loser, refused, why)) = match (first, rival) {
-            (won @ (.., Reply::Ok(_)), (id, selector, Reply::Definite(_, why)))
-            | ((id, selector, Reply::Definite(_, why)), won @ (.., Reply::Ok(_))) => {
-                (won, (id, selector, why))
+        let unanswered = first.3 || rival.3;
+        let ((_, selector, ..), (loser, refused, why, lost)) = match (first, rival) {
+            (won @ (_, _, Reply::Ok(_), _), (id, selector, Reply::Definite(_, why, _), lost))
+            | ((id, selector, Reply::Definite(_, why, _), lost), won @ (_, _, Reply::Ok(_), _)) => {
+                (won, (id, selector, why, lost))
             }
-            ((_, a, first), (_, b, rival)) => {
+            ((_, a, first, _), (_, b, rival, _)) => {
                 // Both are still open, or neither: not the race this is about.
                 let both = format!("{} and {}", first.shown(), rival.shown());
                 t.log(|log| {
@@ -2400,44 +2763,48 @@ async fn fence_races(
                 continue;
             }
         };
-        t.log(|log| {
-            log.refused.insert(loser, why.clone());
-            log.selectors.insert(loser, refused);
-        });
+        if !lost {
+            t.log(|log| {
+                log.refused.insert(loser, why.clone());
+                log.selectors.insert(loser, refused);
+            });
+        }
         let under_guard = why.contains("name or identity already exists");
         if overtaken(ErrorCode::Conflict, &why) {
             early = lead;
         } else {
             late = lead;
         }
+        if unanswered {
+            let race = format!("fence race {turn}: a declaration was unanswered");
+            t.log(|log| log.fence_unjudged.push(race));
+            wait_ready(t, &selector).await?;
+            continue;
+        }
         let began = t.now();
-        let (mut fell_back, mut direct) = (0, 0);
+        let gateway = GATEWAYS[turn % GATEWAYS.len()];
+        let (mut writes, mut fell_back, mut direct) = (0, 0, 0);
         loop {
-            let gateway = GATEWAYS[turn % GATEWAYS.len()];
-            let before = direct_stat(cluster, SCHEMA).await?;
-            let id = fresh_id(CLIENTS[0]).await;
-            let value = 20_000 + turn as i64 * 100 + fell_back;
-            let request = Request::row("table.upsert", &ctx.table, 1, value, id);
-            clients::attempt(ctx, &mut client, CLIENTS[0], gateway, &request, true).await;
-            if direct_stat(cluster, SCHEMA).await? > before {
-                fell_back += 1;
-            } else {
-                direct += 1;
-            }
-            if direct > 0 || ready(t, &selector).await? {
+            let row = [(1, 20_000 + turn as i64 * 100 + writes as i64)];
+            let (schema, done) =
+                mutate_alone(cluster, ctx, &mut client, (CLIENTS[0], gateway), &row).await?;
+            writes += 1;
+            fell_back += schema;
+            direct += done;
+            let late = t.now() >= began + REST_LIMIT.as_millis() as u64;
+            if direct > 0 || late || ready(t, &selector).await? {
                 break;
             }
         }
+        // Once one mutation committed directly, the fence admits the table. One fallback may have
+        // met the publication itself, and then the race shows nothing.
+        let stuck = direct == 0 && fell_back > 1;
         rest.push(AtRest {
             table: "fence",
-            gateway: GATEWAYS[turn % GATEWAYS.len()],
-            writes: (fell_back + direct) as u64,
-            // One fallback may have met the publication itself.
-            schema_fallbacks: if direct == 0 && fell_back > 1 {
-                fell_back as u64
-            } else {
-                0
-            },
+            gateway,
+            writes: if direct > 0 { direct } else { writes },
+            schema_fallbacks: if stuck { fell_back } else { 0 },
+            direct,
             polled_ms: t.now() - began,
         });
         t.log(|log| {
@@ -2451,11 +2818,7 @@ async fn fence_races(
             break;
         }
     }
-    for found in fence_at_rest(&rest) {
-        cluster
-            .checks
-            .violate(&cluster.world, topology::FENCE, found);
-    }
+    judge_fences(cluster, t, &rest);
     Ok(clauses)
 }
 
@@ -2468,12 +2831,19 @@ async fn refused_builds(cluster: &Cluster, t: &Topo) {
         for _ in 0..8 {
             let ask = fresh_id(BOOTSTRAP_CLIENT).await;
             match t.admin(ask, "storage.index.status", &selector).await {
-                Reply::Ok(data) if data["build_id"] == json!(build) => {
-                    found.insert(*build);
+                Reply::Ok(data) => {
+                    if data["build_id"] == json!(build) {
+                        found.insert(*build);
+                    }
+                    t.log(|log| log.refused_judged.insert(*build));
                     break;
                 }
-                Reply::Ok(_) | Reply::Definite(..) => break,
-                Reply::Retry { .. } => time::sleep(RETRY).await,
+                Reply::Definite(ErrorCode::NotFound, _, false) => {
+                    t.log(|log| log.refused_judged.insert(*build));
+                    break;
+                }
+                // Nothing else says that the record does not exist.
+                Reply::Definite(..) | Reply::Retry { .. } => time::sleep(RETRY).await,
             }
         }
     }
@@ -2513,117 +2883,243 @@ fn judge(cluster: &Cluster, t: &Topo) {
     });
 }
 
-/// The clauses of O12, O16, O21, O28, D07 and D11 that ran.
+/// Mutations of a run, for the clauses.
+struct Load<'a>(&'a [clauses::Attempt]);
+
+impl Load<'_> {
+    /// A mutation that committed and overlaps a window.
+    fn commits(&self, from: u64, to: u64) -> bool {
+        self.any(|a| a.answer == Answer::Committed && a.invoked <= to && from <= a.completed)
+    }
+
+    /// A mutation that committed wholly inside a window.
+    fn commits_inside(&self, from: u64, to: u64) -> bool {
+        self.any(|a| a.answer == Answer::Committed && from <= a.invoked && a.completed <= to)
+    }
+
+    /// A mutation that got its one outcome and overlaps a window.
+    fn settles(&self, from: u64, to: u64) -> bool {
+        self.any(|a| {
+            matches!(a.answer, Answer::Committed | Answer::Ok)
+                && a.invoked <= to
+                && from <= a.completed
+        })
+    }
+
+    /// A mutation in a window, whatever its answer.
+    fn sends(&self, from: u64, to: u64) -> bool {
+        self.any(|a| a.invoked <= to && from <= a.completed)
+    }
+
+    fn any(&self, matches: impl Fn(&clauses::Attempt) -> bool) -> bool {
+        self.0
+            .iter()
+            .any(|attempt| attempt.mutation && matches(attempt))
+    }
+}
+
+/// What ran of D07 and O16 around a split of `ranged` whose final reads and count were compared:
+/// requests that overlap the time in which it published, and requests sent after it, under load.
+/// A split that never published split nothing.
+fn split_clauses(
+    split: RangedSplit,
+    load: &Load<'_>,
+    load_to: u64,
+    scans: &[(u64, u64)],
+) -> Vec<&'static str> {
+    let (from, Some(to)) = (split.pending, split.published) else {
+        return Vec::new();
+    };
+    let mut clauses = Vec::new();
+    if to < load_to {
+        let after = to + 1;
+        if load.settles(from, to)
+            && load.any(|a| {
+                after <= a.invoked
+                    && a.completed <= load_to
+                    && matches!(a.answer, Answer::Committed | Answer::Ok)
+            })
+        {
+            clauses.push("D07:split");
+        }
+        if load.commits(from, to) && load.commits_inside(after, load_to) {
+            clauses.push("O16:split-during-commits");
+        }
+    }
+    if scans.iter().any(|(a, b)| *a <= to && from <= *b) {
+        clauses.push("O16:split-during-scans");
+    }
+    clauses
+}
+
+/// The clauses of O12, O16, O21, O28, D07 and D11 that ran. A clause runs when its fault or
+/// change happened, requests met it, and the observation its assertion reads was made.
+#[allow(clippy::too_many_arguments)]
 fn clauses_of(
     cluster: &Cluster,
     t: &Topo,
     chaos: Option<&Chaos>,
     moving: Option<&moves::Move>,
+    moved: Option<&Ctx>,
+    seen: &Seen,
+    move_retired: bool,
     scenarios: &mut Scenarios,
 ) {
     let faults = chaos.map_or(&[][..], |chaos| &chaos.log);
-    let now = elapsed_ms(&cluster.world);
-    let overlaps = |from: u64, to: u64, actions: &[Action]| {
-        faults.iter().any(|fault| {
-            actions.contains(&fault.action) && fault.from <= to && from <= fault.to.unwrap_or(now)
-        })
-    };
     let attempts = |ctx: &Ctx| ctx.observed.lock().unwrap().attempts.clone();
-    let loads = [
+    let loads = BTreeMap::from([
         (Table::Main, attempts(&t.main)),
         (Table::Ranged, attempts(&t.ranged)),
-    ];
-    let committed = |table: Table, from: u64, to: u64| {
-        loads.iter().any(|(loaded, attempts)| {
-            *loaded == table
-                && attempts.iter().any(|a| {
-                    a.answer == Answer::Committed && a.invoked <= to && from <= a.completed
-                })
-        })
-    };
+        (Table::Victim, attempts(&t.victim)),
+    ]);
     const LOSSES: [Action; 3] = [
         Action::CrashLeader,
         Action::PowerLeader,
         Action::DrainLeader,
     ];
+    let no_quorum = cluster.no_quorum();
     t.log(|log| {
         for build in &log.builds {
-            if build.refused && build.kind == IndexKind::SameName {
+            let judged = |id: &Uuid| log.refused_judged.contains(id);
+            if build.kind == IndexKind::SameName && build.refused_id.as_ref().is_some_and(judged) {
                 scenarios.insert("O12:refused-declaration");
             }
-            let (Some(from), Some(to)) = (build.declared, build.ready) else {
-                continue;
-            };
             if build.kind == IndexKind::UnknownColumn {
                 continue;
             }
-            if committed(build.table, from, to) {
-                scenarios.insert("O12:build-under-load");
-                scenarios.insert("D11:index");
-            }
-            let chosen = log.chosen.iter().any(|choice| choice.index == build.name);
-            let explained = |from: u64, to: u64| {
-                log.explain_ms
-                    .iter()
-                    .any(|(table, at)| *table == build.table && from <= *at && *at <= to)
+            let Some(window) = log.building.get(&build.name) else {
+                continue;
             };
-            if chosen {
-                scenarios.insert("O12:present-once");
-            }
-            if explained(from, to) {
+            let (from, to) = (window.from, window.to);
+            let explained = log.explains.iter().any(|(table, a, b)| {
+                *table == build.table
+                    && topology::shown_building(&build.name, &log.statuses, *a, *b)
+            });
+            if explained {
                 scenarios.insert("O12:incomplete-not-chosen");
             }
-            if overlaps(from, to, &[Action::FreezeFollower, Action::FreezeTwo]) {
-                scenarios.insert("O12:build-paused");
+            // What the build left behind is in the rows of a scan that used it, and nowhere else.
+            let scans = log.indexed.get(&build.table).map_or(&[][..], Vec::as_slice);
+            if build.ready.is_some() && !scans.is_empty() {
+                let load = Load(&loads[&build.table]);
+                if load.commits_inside(from.1, to.1) && log.counted.contains(&build.table) {
+                    scenarios.insert("O12:build-under-load");
+                }
+                let writes = log.writes.get(&build.table);
+                let present = writes.into_iter().flatten().any(|write| {
+                    write.ended == Ended::Acked
+                        && write.value.is_some()
+                        && from.0 < write.invoked
+                        && write.completed < to.0
+                });
+                if present {
+                    scenarios.insert("O12:present-once");
+                }
+                // Without a quorum no step of the build can commit.
+                if no_quorum
+                    .iter()
+                    .any(|(a, b)| from.1 <= *a && a < b && *b <= to.1)
+                {
+                    scenarios.insert("O12:build-paused");
+                }
             }
-            if overlaps(from, to, &LOSSES) {
-                scenarios.insert("O12:worker-lost");
-            }
-            if let Some(retired) = build.retired
+            let retired = log
+                .statuses
+                .iter()
+                .find(|s| s.index == build.name && s.state == "retired")
+                .map(|status| status.completed);
+            let chosen = log.chosen.iter().any(|choice| choice.index == build.name);
+            if let Some(retired) = retired
                 && chosen
-                && explained(retired, now)
+                && log
+                    .explains
+                    .iter()
+                    .any(|(table, a, _)| *table == build.table && *a > retired)
+                && log
+                    .scans
+                    .get(&build.table)
+                    .into_iter()
+                    .flatten()
+                    .any(|scan| scan.invoked > retired)
             {
                 scenarios.insert("O12:retired");
             }
         }
-        if let Some((from, published)) = log.split {
-            let to = published.unwrap_or(now);
-            if committed(Table::Ranged, from, to) {
-                // It ran whether or not the split published: one that did not is `Liveness`.
-                scenarios.insert("D07:split");
-                scenarios.insert("O16:split-during-commits");
-            }
-            let scanned = log
-                .scan_ms
-                .iter()
-                .any(|(table, a, b)| *table == Table::Ranged && *a <= to && from <= *b);
-            if scanned {
-                scenarios.insert("O16:split-during-scans");
-            }
+        let scans_of = |table: Table| -> Vec<(u64, u64)> {
+            let of = log.scan_ms.iter().filter(|scan| scan.0 == table);
+            of.map(|(_, from, to)| (*from, *to)).collect()
+        };
+        if let Some(split) = log.split
+            && log.counted.contains(&Table::Ranged)
+        {
+            scenarios.extend(split_clauses(
+                split,
+                &Load(&loads[&Table::Ranged]),
+                seen.load.1,
+                &scans_of(Table::Ranged),
+            ));
         }
-        let restarted = log
-            .scan_ms
-            .iter()
-            .any(|(_, a, b)| overlaps(*a, *b, &LOSSES));
-        if restarted {
+        // A worker that holds a replica of every range stopped or started while a scan ran.
+        let restarted = faults.iter().filter(|fault| LOSSES.contains(&fault.action));
+        let mut edges = restarted
+            .flat_map(|fault| [Some(fault.from), fault.to])
+            .flatten();
+        if edges.any(|at| log.scan_ms.iter().any(|(_, a, b)| *a <= at && at <= *b)) {
             scenarios.insert("O16:restart-during-scans");
         }
-        let after = log.dropped.map_or(0, |dropped| {
-            log.calls
-                .iter()
-                .filter(|call| call.invoked > dropped)
-                .count()
-        });
-        let before = log.calls.iter().any(|call| call.success);
-        if after > 0 && before {
-            scenarios.insert("D11:drop");
+        if let (Some(dropped), Some((from, to))) = (log.dropped, log.drop_ms)
+            && log.recreated
+        {
+            let load = Load(&loads[&Table::Victim]);
+            let judged = log.calls.iter().any(|call| call.judged(dropped));
+            if load.commits_inside(0, from) && load.sends(from, to) && judged {
+                scenarios.insert("D11:drop");
+            }
         }
     });
     if let Some((from, to)) = moving.and_then(moves::Move::window)
-        && (committed(Table::Main, from, to) || committed(Table::Ranged, from, to))
+        && let Some(moved) = moved
+        && seen.moved_checked
+        && move_retired
+        && Load(&attempts(moved)).commits(from, to)
     {
         scenarios.insert("O16:move-during-commits");
     }
+}
+
+/// How often each rule was judged in the run.
+fn judgments(log: &Log) -> BTreeMap<&'static str, u64> {
+    let mut covering = 0;
+    for (table, scans) in &log.indexed {
+        let writes = log.writes.get(table).map_or(&[][..], Vec::as_slice);
+        for at in scans {
+            let expected = |write: &&Write| {
+                write.ended == Ended::Acked && write.value.is_some() && write.completed < *at
+            };
+            covering += u64::from(writes.iter().any(|write| expected(&write)));
+        }
+    }
+    let incomplete = log.explains.iter().filter(|(table, a, b)| {
+        log.builds.iter().any(|build| {
+            build.table == *table && topology::shown_building(&build.name, &log.statuses, *a, *b)
+        })
+    });
+    let dropped = log.calls.iter().filter(|call| {
+        log.dropped
+            .is_some_and(|acknowledged| call.judged(acknowledged))
+    });
+    let scans = log.scans.values().map(Vec::len).sum::<usize>() as u64;
+    BTreeMap::from([
+        (topology::COVERING, covering),
+        (topology::EXACTLY_ONCE, covering),
+        (topology::REFUSED_WRITE, scans),
+        (topology::INCOMPLETE, incomplete.count() as u64),
+        (topology::DROPPED, dropped.count() as u64),
+        (topology::STALE_ROUTE, log.stale_judged),
+        (topology::REFUSED_DDL, log.refused_judged.len() as u64),
+        (topology::FENCE, log.fence_judged),
+        (topology::ROUTES, log.routes_judged),
+    ])
 }
 
 /// The phase 10 clauses and their assertions, over every table's attempts.
@@ -2709,12 +3205,15 @@ fn without_schema_conflicts(history: &History) -> (u64, BTreeMap<String, u64>) {
     (conflicts, kinds)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn summarize(
     cluster: &Cluster,
     t: &Topo,
     chaos: Option<&Chaos>,
     moving: bool,
     split: SplitTiming,
+    seen: &Seen,
+    abandoned: bool,
     report: &mut direct::Report,
 ) {
     let counts = |actions: &BTreeMap<Action, u32>| -> BTreeMap<&'static str, u32> {
@@ -2730,23 +3229,34 @@ fn summarize(
             "executed": chaos.map(|chaos| counts(&chaos.executed)),
             "skipped": chaos.map(|chaos| counts(&chaos.skipped)),
             "split": format!("{split:?}"),
-            "ranged_split_ms": log.split,
+            "ranged_split_ms": log.split.map(|split| json!([split.requested, split.pending, split.published])),
+            "ranged_split_ids": log.split_ids,
             "move": moving,
             "audited_writes": log.writes.values().map(Vec::len).sum::<usize>(),
             "scans": log.scans.values().map(Vec::len).sum::<usize>(),
-            "explains": log.explain_ms.len(),
+            "explains": log.explains.len(),
             "explains_on_index": log.chosen.len(),
+            "load_ms": seen.load,
+            "chaos_writes": seen.work.writes,
+            "chaos_reads": seen.work.reads,
+            "chaos_scans": seen.work.scans,
+            "scans_on_index": log.indexed.values().map(Vec::len).sum::<usize>(),
             "statuses": log.statuses.len(),
             "builds": log.builds.iter().map(|b| json!({
                 "name": b.name, "table": b.table.name(), "kind": format!("{:?}", b.kind),
                 "declared": b.declared, "ready": b.ready, "retired": b.retired,
                 "refused": b.refused, "abandoned": b.abandoned, "stuck": b.stuck, "open": b.open,
+                "unanswered": b.unanswered,
             })).collect::<Vec<_>>(),
             "victim_calls": log.calls.len(),
             "dropped": log.dropped.is_some(),
             "fence_races": log.races,
             "at_rest": log.rest,
-            "rules": RULES,
+            "fence_not_judged": log.fence_unjudged,
+            "refused_not_judged": log.refused.len() - log.refused_judged.len(),
+            // How often each rule of `RULES` was judged. A rule with 0 did not run in this seed.
+            "judged": judgments(log),
+            "abandoned": abandoned,
             "heal_cold_start": chaos.is_some_and(|chaos| chaos.heal_cold),
         })
     });
@@ -2781,6 +3291,118 @@ mod tests {
         assert_eq!(rows(&json!([{"id": 1, "value": 2}])), Some(vec![(1, 2)]));
         assert_eq!(rows(&json!([{"id": 1}])), None);
         assert_eq!(rows(&json!({"rows": []})), None);
+    }
+
+    fn attempt(mutation: bool, window: (u64, u64), answer: Answer) -> clauses::Attempt {
+        clauses::Attempt {
+            id: Uuid::nil(),
+            mutation,
+            fresh: true,
+            gateway: GATEWAYS[0],
+            invoked: window.0,
+            completed: window.1,
+            answer,
+        }
+    }
+
+    /// Review 136, M9: 14 of 24 seeds answered no scan under load.
+    #[test]
+    fn work_under_load_needs_a_write_a_read_and_a_scan() {
+        let load = (1_000, 2_000);
+        let write = |window| attempt(true, window, Answer::Committed);
+        let read = attempt(false, (1_100, 1_200), Answer::Ok);
+        let work = |attempts: &[clauses::Attempt], scans: &[(u64, u64)]| {
+            Work::of(attempts, scans, load).missing().len()
+        };
+        let all = [write((1_100, 1_200)), read.clone()];
+        assert_eq!(work(&all, &[(1_500, 1_600)]), 0);
+        assert_eq!(work(&all, &[]), 1);
+        assert_eq!(work(&all, &[(1_500, 2_100)]), 1, "answered after the load");
+        assert_eq!(work(&all, &[(900, 1_100)]), 1, "sent before it");
+        assert_eq!(work(&[write((1_900, 2_100)), read], &[(1_500, 1_600)]), 1);
+        let unknown = attempt(true, (1_100, 1_200), Answer::Unknown);
+        assert_eq!(work(&[unknown], &[]), 3);
+    }
+
+    /// Review 136, M2: 20 of 23 `O16:split-during-commits` tags were splits that never published.
+    #[test]
+    fn a_split_that_did_not_publish_or_met_no_load_is_no_clause() {
+        let split = |published| RangedSplit {
+            requested: 100,
+            pending: 150,
+            published,
+        };
+        let commit = |window| attempt(true, window, Answer::Committed);
+        let met = [commit((140, 160)), commit((220, 230))];
+        let clauses = |split, attempts: &[clauses::Attempt], scans: &[(u64, u64)]| {
+            split_clauses(split, &Load(attempts), 500, scans)
+        };
+        let both = ["D07:split", "O16:split-during-commits"];
+        assert_eq!(clauses(split(Some(200)), &met, &[]), both);
+        let scanned = [
+            "D07:split",
+            "O16:split-during-commits",
+            "O16:split-during-scans",
+        ];
+        assert_eq!(clauses(split(Some(200)), &met, &[(190, 260)]), scanned);
+        assert!(clauses(split(None), &met, &[(190, 260)]).is_empty());
+        // Commits only before it surely had not published, or none after it.
+        assert!(clauses(split(Some(200)), &[commit((110, 120)), met[1].clone()], &[]).is_empty());
+        assert!(clauses(split(Some(200)), &met[..1], &[]).is_empty());
+        // Published after the load, or a scan that does not overlap it.
+        assert!(clauses(split(Some(600)), &met, &[]).is_empty());
+        assert!(clauses(split(Some(200)), &[], &[(201, 260)]).is_empty());
+        // No commit, only refused or unanswered mutations.
+        let unknown = [
+            attempt(true, (140, 160), Answer::Unknown),
+            attempt(true, (220, 230), Answer::Unknown),
+        ];
+        assert!(clauses(split(Some(200)), &unknown, &[]).is_empty());
+    }
+
+    #[test]
+    fn plan_counts_are_of_one_table_and_of_collects() {
+        let shape = |table: &str, operation: &str, executions: u64, covering: u64| {
+            json!({"table_id": table, "operation": operation, "executions": executions,
+                "plans": {"covering_index": covering, "primary_scan": executions - covering}})
+        };
+        let shapes = [
+            shape("a", "collect", 3, 1),
+            shape("a", "collect", 2, 2),
+            shape("a", "count", 5, 5),
+            shape("b", "collect", 7, 7),
+        ];
+        let report = json!({"untracked_executions": 0, "shapes": shapes});
+        assert_eq!(plans_of(&report, "a"), Ok((5, 3)));
+        // Beyond its capacity the report misses executions.
+        let full = json!({"untracked_executions": 1, "shapes": shapes});
+        assert!(plans_of(&full, "a").is_err());
+        assert!(plans_of(&json!({}), "a").is_err());
+    }
+
+    /// Review 136, M5: declaration 95f75d2b of seed 24 took the guard and never settled, and a
+    /// later refusal under its ID closed it.
+    #[test]
+    fn an_unanswered_declaration_keeps_its_table_open() {
+        let mut build = Build {
+            table: Table::Main,
+            name: "main_value".into(),
+            kind: IndexKind::Valid,
+            declared: None,
+            ready: None,
+            retired: None,
+            refused: true,
+            abandoned: false,
+            stuck: None,
+            open: false,
+            unanswered: BTreeSet::from([Uuid::from_u128(1)]),
+            refused_id: None,
+        };
+        assert!(build.is_open());
+        build.unanswered.clear();
+        assert!(!build.is_open());
+        build.open = true;
+        assert!(build.is_open());
     }
 
     /// Both split timings, with and without a move, are drawn. The plan never drops a table

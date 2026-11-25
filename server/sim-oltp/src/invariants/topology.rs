@@ -17,7 +17,9 @@ use uuid::Uuid;
 /// Design: "`CoveringIndexComplete`: an acknowledged insert appears in every covering index
 /// scan at a later snapshot (the workload runs the scans)."
 ///
-/// A scan invoked after the acknowledgment takes its snapshot after it.
+/// A scan invoked after the acknowledgment takes its snapshot after it. A scan of the primary
+/// rows says nothing about the index, so the rule counts as judged only for a scan whose plan
+/// is known to use a covering index.
 pub(crate) const COVERING: &str = "CoveringIndexComplete";
 
 /// Contract, O12: "Committed writes during the build are present exactly once."
@@ -32,11 +34,16 @@ pub(crate) const REFUSED_WRITE: &str = "RefusedWriteInIndex";
 pub(crate) const INCOMPLETE: &str = "IncompleteIndexChosen";
 
 /// Contract, D11: "No row lands in a dropped table". Guarantees, OLTP-G06: "Routes, topology
-/// and schema epochs are never served stale." with the failure model "a table drop [...] can
-/// race writes and leave a gateway with stale routing or schema information".
+/// and schema epochs are never served stale." with the failure model "A split, leader move,
+/// table drop, or index publication can race writes and leave a gateway with stale routing or
+/// schema information."
+///
+/// OLTP-G03 lets a retry of a retained identity return its first result, so a mutation counts
+/// from its first attempt. A read has no identity and counts from each attempt.
 pub(crate) const DROPPED: &str = "DroppedTableSilent";
 
-/// Contract, D07: "Stale routes refresh once."
+/// Contract, D07: "Stale routes refresh once." The rule allows one stale answer for each
+/// gateway and range.
 pub(crate) const STALE_ROUTE: &str = "StaleRouteRefreshesOnce";
 
 /// Guarantees, OLTP-G04: "Return `not_applied` only with proof of non-application." A schema
@@ -51,7 +58,9 @@ pub(crate) const REFUSED_DDL: &str = "RefusedDdlApplied";
 /// table is open. A Data group whose fence then names an unpublished lifecycle admits no
 /// descriptor, and its leader cannot serve a mutation directly. That consequence is public:
 /// with every schema change settled and the cluster healthy, direct mutations of the table
-/// keep being sent to the queued path because of the schema.
+/// keep being sent to the queued path because of the schema. A declaration that was ever
+/// unanswered is open until its own acceptance is known. A refusal of a later attempt under its
+/// ID does not settle it, because the first attempt can have left its fence and guard behind.
 pub(crate) const FENCE: &str = "FenceAfterValidation";
 
 /// Design: "`SchemaEpochAtCommit`: a commit's schema epoch is the one in effect at its
@@ -61,7 +70,8 @@ pub(crate) const SCHEMA_EPOCH: &str = "SchemaEpochAtCommit";
 /// Design: "`RetiredLeaderSilent`: a retired range leader never answers success."
 pub(crate) const RETIRED: &str = "RetiredLeaderSilent";
 
-/// Contract, O28: "Paged metadata covers every range exactly once at the pinned epoch".
+/// Contract, O28: "Paged metadata covers every range exactly once at the pinned epoch". The rule
+/// counts the ranges of a plan. It can't see a gap or an overlap, so it enforces less than that.
 pub(crate) const ROUTES: &str = "RouteCoverage";
 
 /// Every rule the workload judges from public observations.
@@ -89,7 +99,7 @@ pub(crate) const NOT_RUN: [(&str, &str); 4] = [
     ),
     (
         "FenceAfterValidation over Data fences",
-        "needs probes: each Data group's DirectSchema change and each published Catalog lifecycle. The public form ran",
+        "needs probes: each Data group's DirectSchema change and each published Catalog lifecycle",
     ),
     (
         "CoveringIndexComplete at the scan's own snapshot",
@@ -307,23 +317,41 @@ pub(crate) fn incomplete_chosen(
     found
 }
 
+/// Whether an explain from `from` to `to` ran while `index` was building: an earlier and a later
+/// status both say so. [`INCOMPLETE`] is judged in such a window.
+pub(crate) fn shown_building(index: &str, statuses: &[Status], from: u64, to: u64) -> bool {
+    let building = |status: &&Status| status.index == index && status.state == "building";
+    let mut states = statuses.iter().filter(building);
+    states.clone().any(|status| status.completed < from) && states.any(|status| status.invoked > to)
+}
+
 /// One answer to an operation on a table that is dropped in the run.
 #[derive(Clone, Debug)]
 pub(crate) struct TableCall {
     pub what: String,
+    /// When its identity was first sent. A read has none, so this is its own invocation.
+    pub first: u64,
     pub invoked: u64,
-    pub success: bool,
+    /// Its answer, or `None` if the outcome is unknown.
+    pub success: Option<bool>,
 }
 
-/// [`DROPPED`]: after the drop was acknowledged, no operation invoked later succeeds.
+impl TableCall {
+    /// Whether [`DROPPED`] speaks about the answer.
+    pub(crate) fn judged(&self, acknowledged: u64) -> bool {
+        self.success.is_some() && self.first > acknowledged
+    }
+}
+
+/// [`DROPPED`]: after the drop was acknowledged, no operation first sent later succeeds.
 pub(crate) fn dropped_silent(acknowledged: u64, calls: &[TableCall]) -> Vec<String> {
     calls
         .iter()
-        .filter(|call| call.success && call.invoked > acknowledged)
+        .filter(|call| call.judged(acknowledged) && call.success == Some(true))
         .map(|call| {
             format!(
-                "{} invoked at {} succeeded after the drop was acknowledged at {acknowledged}",
-                call.what, call.invoked
+                "{} first sent at {} and invoked at {} succeeded after the drop was acknowledged at {acknowledged}",
+                call.what, call.first, call.invoked
             )
         })
         .collect()
@@ -379,8 +407,18 @@ pub(crate) struct AtRest {
     pub writes: u64,
     /// Mutations the leaders sent to the queued path because of the schema.
     pub schema_fallbacks: u64,
+    /// Mutations that committed, with none sent to the queued path and one proposal each.
+    pub direct: u64,
     /// How long the workload kept polling for a direct commit, in virtual ms.
     pub polled_ms: u64,
+}
+
+impl AtRest {
+    /// Every mutation committed directly, or some were sent to the queued path for the schema.
+    /// Any other answer says nothing about the fence.
+    pub(crate) fn judged(&self) -> bool {
+        self.schema_fallbacks > 0 || self.direct >= self.writes
+    }
 }
 
 /// [`FENCE`] in its public form.
