@@ -12,11 +12,25 @@ is found when the simulator detects the reverted fix by the rule below. Results 
 | --- | --- |
 | `bug.toml` | The manifest. |
 | `revert.patch` | The patch. It changes product sources only, in the form `git diff` writes. Nothing before, between or after its `diff --git` sections. Plain ASCII, in lines of at most 200 characters. |
-| `probe.patch` | Only with `regression.probe = true`: the test that the regression runs, for a fix whose own test is not a steady proof. Same form, only added lines. A line in a product source has to belong to an item, statement or block that the probe adds whole, or that the tree already has, under `#[cfg(test)]` or `test-hooks`. `verify` applies it to both builds. No sweep ever contains it. |
+| `probe.patch` | Only with `regression.probe = true`: the test that the regression runs, for a fix whose own test is not a steady proof. Same form, only added lines. See "What a probe may add". `verify` applies it to both builds. No sweep ever contains it. |
 | `searches.jsonl` | Every search of the target, also those that a later one replaced. Append-only. Written by `sim_bugs.py record`. |
 
 No other file may be in a target's directory. A committed target or record cannot leave the tree, and a target keeps its bug record, phase and set. A target that a
 spare replaces stays listed as not detected.
+
+## What a probe may add
+
+A probe may add anything to test files, except `include`, `include_str`, `include_bytes` and block comments. What it adds
+to a product source has to be one block at a time, in whole lines:
+
+- the first line is exactly `#[cfg(test)]` or `#[cfg(any(test, feature = "test-hooks"))]`, and `#[doc(hidden)]` may follow;
+- then one `let` on one line, or a plain `fn` or `if` head that opens the block, lines that are indented further and hold no
+  brace, comment, escape, character, attribute, byte string or raw string, and the line that closes it;
+- no line before it in the file holds a raw string or a block comment, and each closes the quotes it opens;
+- the line before it ends in `{`, `}` or `;`, and the line after it starts with a word other than `else`, with `#` or with `}`.
+
+The tool does not read Rust for this. Whatever it cannot tell, it refuses. A macro that drops the attributes of its input
+would still compile such a block, so a reviewer looks at where the block stands.
 
 ## The search rule
 
@@ -54,6 +68,10 @@ A check passes only if every target of its set is found. While a target is `not-
 
 - The regression evidence is for this patch: its changed lines, its context, and a commit that holds it. The regression
   also passes without the patch and fails with it in the run that counts.
+- Evidence of a `verify` run is of a commit that holds the same patch, the same probe and the same regression. Evidence of
+  scratch commits: the commit with the patch is, in the files of the probe and the patch, its parent plus those two, byte for
+  byte, and the parent is in this history. The clean commit holds the probe's lines. It may hold other probes as well, so a
+  reviewer compares it.
 - `[review]` says `sensitive`, names the digest of the whole patch as it is now, and does not contradict
   `regression.assertion`. There is no `hold`. A patch that is refreshed, even in its context, needs another review. So
   does another probe, and any change of `[regression]` but its evidence and `timeout_s`: the same `[review]` (its
@@ -172,6 +190,16 @@ Also open:
   which rows lead decision 13.1 lets a design rule count for.
 - Recorded regression output, as far as the named run is concerned. `evidence` compares it.
 - Branch history that was rewritten before it reached main.
-- The harness of main, the compiler, Git, Cargo's home configuration, `PATH` and the Actions runner. Builds, tests and
-  Git take only an allow-list of variables from the machine (`KEPT_ENV`), so a compiler, wrapper, linker, flag or library
-  path named in a variable does not reach them.
+- The text of the recorded runs against the manifest beyond what is named above: the `mode` of scratch evidence, for one.
+- A recovery suite's failure is any assertion or timeout it prints at exit 1 beside the expected text, also one of a process
+  it started. A patch may hold code behind many tabs. A probe's test may read the source at run time.
+- The harness of main, the compiler, Git, the Actions runner, and these of the machine: `PATH`, `HOME` with what Cargo and
+  rustup keep there, the interpreter that runs this script, `--cargo` (the output names it), and Git attributes of the
+  clone, whose filters the comparison of the scratch tree refuses.
+
+Builds, tests and Git get a fixed environment. From the machine it has `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`,
+`LC_CTYPE` and `TZ`, and nothing else. Scripts of a process regression also get the interpreter's own library directory if
+`LD_LIBRARY_PATH` named it. The scratch worktree and `TMPDIR` are in `/var/tmp`, and a Cargo configuration in any directory
+above the worktree is refused. Git uses no global or system configuration, no hook, and this script's own settings for
+applying patches. It still reads the rest of the clone's own configuration. After a patch is applied, the tree has to hold exactly the old lines, less the removed and plus the
+added ones.
