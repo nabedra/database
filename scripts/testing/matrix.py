@@ -15,7 +15,8 @@ docs/testing/checks/*.toml, and docs/testing/modules.toml maps paths to modules.
 A record counts toward a cell only if it is valid, its sha is HEAD or an ancestor of HEAD, and it
 is attested (`gh attestation verify` succeeds under --verify-attestations) or --allow-unattested
 is given. Cell states: pass, fail, not-run: <reason>, quarantined p/n, stale (<n> behind),
-n/a and missing. The gate verifies attestations by default. Cells whose n/a reason starts with
+n/a and missing. A kind T cell passes only on an exhaustive T0 or T1 run: simulation and trace
+records can turn it red, never green. The gate verifies attestations by default. Cells whose n/a reason starts with
 `cloud-deferred` or `hardware-deferred` are deferred: listed by name and never counted as green.
 """
 
@@ -400,6 +401,47 @@ def _combine(group: list[Counted]) -> tuple[str, str, int, int, list[str]]:
     return "not-run", "; ".join(reasons), executed, failed, checks
 
 
+def _combine_t(group: list[Counted]) -> tuple[str, str, int, int, list[str]]:
+    """`_combine` for kind T, where only an exhaustive T0 or T1 run can make a cell pass.
+
+    A simulation, a trace check or a T2 run passing beside an exhaustive run that did not finish, failed or
+    does not exist proves less than the cell claims. So:
+
+    - a failure or quarantine in any record still wins;
+    - without a passing exhaustive T0 or T1 record on the SHA, the cell is `not-run`;
+    - an exhaustive T0 or T1 record that is `not-run` wins over a pass, also over a later pass of the same
+      check: a run that fits the budget only sometimes is not an exhaustive run at the required bounds;
+    - a `not-run` record without `tla` facts (a missing need, such as `tlc-unavailable`) may be the design
+      check. It counts as open until the same check passes on the SHA."""
+    state, reason, executed, failed, checks = _combine(group)
+    if state not in ("pass", "not-run"):
+        return state, reason, executed, failed, checks
+
+    def tla(c: Counted) -> dict:
+        facts = c.record.get("tla")
+        return facts if isinstance(facts, dict) else {}
+
+    wrong = [(c, evidence.tla_contradictions(tla(c))) for c in group if c.record["result"] == "pass" and tla(c)]
+    bad = [f"{c.record['check']}: {why[0]}" for c, why in wrong if why]
+    if bad:
+        return "fail", "facts contradict the pass: " + "; ".join(sorted(bad)), executed, failed, checks
+    exhaustive = [c for c in group if tla(c).get("mode") == "exhaustive" and tla(c).get("tier") in ("T0", "T1")]
+    passed = {c.record["check"] for c in group if c.record["result"] == "pass"}
+    open_runs = [c for c in group if c.record["result"] == "not-run"
+                 and (c in exhaustive or (not tla(c) and c.record["check"] not in passed))]
+    reasons = sorted({n["reason"] for c in open_runs for n in c.record["assertions"]["not_run"]})
+    if not any(c.record["result"] == "pass" for c in exhaustive):
+        modes = sorted({f"{tla(c).get('tier', 'unknown tier')} {tla(c).get('mode', 'unknown mode')}"
+                        for c in group if c.record["result"] == "pass"})
+        what = "no passing exhaustive T0 or T1 run" + (f" (only {', '.join(modes)})" if modes else "")
+        return "not-run", "; ".join([what, *reasons]), executed, failed, checks
+    if open_runs:
+        names = sorted({c.record["check"] for c in open_runs})
+        reason = "; ".join([f"exhaustive run not finished: {', '.join(names)}", *reasons])
+        return "not-run", reason, executed, failed, checks
+    return "pass", "", executed, failed, checks
+
+
 def evaluate_cell(g: Guarantee, kind: str, counted: list[Counted], ignored_for: int) -> Cell:
     required = kind in g.checks
     na = g.na.get(kind)
@@ -417,7 +459,7 @@ def evaluate_cell(g: Guarantee, kind: str, counted: list[Counted], ignored_for: 
     nearest = min(mine, key=lambda c: (c.behind, c.record["sha"]))
     sha = nearest.record["sha"]
     group = [c for c in mine if c.record["sha"] == sha]
-    state, reason, executed, failed, checks = _combine(group)
+    state, reason, executed, failed, checks = (_combine_t if kind == "T" else _combine)(group)
     run = next((c.record["run"] for c in group if c.record["run"]["url"]), nearest.record["run"])
     cell = Cell(g.id, kind, True, state, reason=reason, deferred=deferred, behind=nearest.behind, sha=sha,
                 date=run["date"], checks=checks, run_url=run["url"], executed=executed, failed=failed)

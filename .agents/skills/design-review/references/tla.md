@@ -43,6 +43,8 @@ pins the tool versions.
   use a configuration without it.
 - A state constraint may bound counters such as terms or sequence numbers.
   Record each constraint in the plan, since it limits what the run covers.
+  See [limits on the search](#limits-on-the-search) for what the runner
+  accepts.
 - Leave deadlock checking on. A protocol that can finish adds an explicit
   terminal stuttering step.
 - Each section of the spec names, in a comment, the plan section and the
@@ -104,8 +106,107 @@ passes when the baseline passes every property and each mutant fails on
 its expected property. A mutant that fails with an error, or on a
 different property, does not count.
 
+An invariant that is already false in an initial state does not count
+either: no step of the mutant breaks it. [Limits on the search](#limits-on-the-search)
+says what else keeps one from counting.
+
+A mutant may run at smaller or other bounds than the baseline. So the runner
+first runs its control: the same configuration with the `Mutant` value of the
+baseline that checks the property (`<Name>.cfg` if it does, else the first by
+name). The control has to pass like a baseline (finished, no state left on
+the queue), and on a liveness property it has to pass the liveness check.
+Only then does the mutant's failure show what the mutation breaks. A control
+that fails, ends in an error or stops at a cap or the budget leaves the
+mutant not caught, and the report says which. A control is a run like any
+other, with the level's budget. It is not run when a baseline, or the control
+of another mutant, has the same settings and checks the property. The
+summary lists every control with its states and verdict.
+
+A control cannot show two things, so the runner refuses a mutant whose
+property reads `Mutant`, and one whose value no definition of `INIT`, `NEXT`
+or `SPECIFICATION` names. In both, the property can hold in the control and
+fail in the mutant although no step of the protocol changed.
+
+Every invariant and property of a baseline needs a mutant, and a spec
+whose baselines check none fails. Only a type invariant, an invariant with
+`Type` in its name, may be exempted, with a line that gives the reason:
+`\* no-mutant: TypeOK -- every run checks it`.
+
 When a design bug is fixed, the reverted fix becomes a mutant named
 `prefix_<slug>`. See the [design bug loop](design-bug-loop.md).
+
+## Limits on the search
+
+TLC reports "0 states left on queue" whatever a configuration cuts away, so
+the runner checks what can limit a baseline, a `.large.cfg` run or a mutant.
+It reads text. A constraint has to match a small grammar from end to end,
+and everything else is refused, with the line and what is allowed.
+
+| Limit | Rule |
+| --- | --- |
+| `CONSTRAINT` | Allowed as a conjunction of upper bounds on counters, in an exhaustive run without liveness. Declare it in the configuration: `\* limit: <Name> -- <reason>` |
+| `ACTION_CONSTRAINT` | Fails. It removes steps |
+| A depth limit or a state cap through TLC's own search state | Fails. No module of the model and no configuration may use `TLCGet`, `TLCSet`, `TLCExt`, `RandomElement`, `Randomization`, `JavaTime` or `IOUtils` |
+| `SYMMETRY` or a constraint with a liveness property | Fails in an exhaustive run, where TLC reports whether it checks liveness. TLC does not report it in a simulation, so the runner does not see it there. A simulation never makes a T cell green. Use a separate `<Name>.live.cfg` without them. Action properties such as `[][A]_vars` are safety, so they may stay |
+| `VIEW` | Fails. It merges states, and TLC does not check that the merge is sound |
+| An override (`Op <- X` or `Op = x`) | `X` must be defined in the model's own modules, not in a standard one. A declared `CONSTANT` is free. Overriding a property, a constraint, a variable, `Len`, `Cardinality`, or the `INIT`, `NEXT` or `SPECIFICATION` it runs fails. Overriding another definition, such as `Nat`, needs a `limit` line |
+| An override of a definition that a constraint uses | Fails, unless the new value is a `CONSTANT` or a set of constants |
+| A cfg entry that is not `Name = value`, `Name <- Name` or `Name <- [Module] Name`, where a value is a name, number, string or set of values, and any token that belongs to no known section | Fails, with the line |
+| A name set twice: a `CONSTANT` or override, with `=` or `<-`, or `INIT`, `NEXT` or `SPECIFICATION` | Fails. TLC takes the last value, and `<-` before `=`. Naming an `INVARIANT`, `PROPERTY` or `CONSTRAINT` twice is harmless and stays |
+| A mutant configuration | The same rules, with the baselines' `limit` lines only. It expects a property that a baseline checks, as an invariant or as a property like the mutant does. It sets `Mutant` to another value than every baseline that checks it, and runs the `INIT`, `NEXT` or `SPECIFICATION` of a baseline. The property's definition does not read `Mutant`, and a definition that `INIT`, `NEXT` or `SPECIFICATION` uses names the mutant's value. Its control passes. Otherwise it does not count as caught |
+
+The grammar of a constraint. `VARIABLE` and `CONSTANT` are names that the
+model module, or one it extends, declares and nothing defines.
+
+```text
+body    ::= [and] item { and item }          and   ::= "/\" | "\land"
+item    ::= "(" body ")"
+          | "\A" name { "," name } "\in" set ":" body
+          | counter less limit
+          | the name of another definition whose body matches
+counter ::= ref | "Len" "(" ref ")" | "Cardinality" "(" ref ")"
+ref     ::= VARIABLE { "[" index { "," index } "]" }
+index   ::= a name that an enclosing "\A" binds | CONSTANT
+less    ::= "<" | "<=" | "=<" | "\leq"       limit ::= NUMBER | CONSTANT
+set     ::= CONSTANT | the name of a definition that is a union of
+            CONSTANTs and of enumerations of them, such as {G0} \cup Children
+```
+
+For example:
+
+```tla
+MCConstraint ==
+    /\ tso <= MaxTs
+    /\ \A g \in Groups : Len(hst[g]) <= MaxLog
+```
+
+Model anything else as a budget constant of the spec.
+
+Whether a bound is wide enough, or an `INIT`, `NEXT` or constant leaves
+behavior out, is the reviewer's judgment, because no rule here can tell.
+Read the settings before you accept a T pass. `summary.json` lists them for
+each baseline and mutant under `settings`: `SPECIFICATION` or `INIT` and
+`NEXT`, every constant with its value, every constraint with its text and
+its declared limit, symmetry, overrides, the definitions these names stand
+for, and what a mutant changes against each baseline. The record holds a
+short form (`tla.settings`), the number of lines that were trimmed
+(`tla.dropped.settings`), and `tla.settings_sha256`, the digest of the full
+list, so that the list you read is the one that ran. `tla.limits` adds how
+many states TLC kept for each constraint. The rule does not detect:
+
+- an upper bound on a variable that is no counter of growth, such as a step
+  counter that every action increments, or a protocol phase kept as a
+  number;
+- a `CONSTANT` value, or an `INIT` or `NEXT` written in `MC<Name>.tla`, that
+  leaves behavior out;
+- a property or a constant that reads `Mutant` through another definition,
+  while a step names the mutant's value without effect;
+- a mutant whose `Mutant` value is the main design's, when the only baseline
+  that checks its property has another `Mutant` value. The settings show it;
+- an action that coverage counts once although one of its cases never
+  happens. TLC sums every case of an operator, such as `Crash(1)` and
+  `Crash(2)`, or the branches of an `IF`, and does not report an action
+  that a module defines but `Next` leaves out.
 
 ## Run
 
@@ -123,9 +224,10 @@ python3 scripts/testing/tla_check.py "specs/$MODULE" "$SPEC" --tier T2 \
 
 `tla_check.py` runs every baseline (`<Name>.cfg` and any other
 `<Name>.<variant>.cfg` except `.large.cfg`) exhaustively with coverage,
-checks that every action was taken and that every invariant and property
-has a mutant, then runs every mutant and checks that it fails on the
-property its `\* expect:` line names. Each run gets the level's wall-clock
+checks that every action was taken, that every invariant and property
+has a mutant and that nothing undeclared limits the search, then runs every
+mutant and checks that its control passes and that it fails on the property
+its `\* expect:` line names. Each run gets the level's wall-clock
 budget. It reports a violation, a deadlock, a liveness violation and a TLC
 error separately, and a stop at the budget or a state cap as `not-run`.
 Logs, `-dumpTrace json` counterexamples and a summary go to
