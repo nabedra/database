@@ -216,7 +216,10 @@ class Listener(Case):
 
     def test_a_listener_of_another_process(self):
         port = self.listening('127.0.0.1')
-        self.assertEqual(harness_ports.listener(self.child(), '127.0.0.1', port), ('other', [os.getpid()]))
+        self.assertEqual(harness_ports.listener(self.child(), '127.0.0.1', port),
+                         ('outside', [os.getpid()]))
+        self.assertEqual(harness_ports.listener(self.child(), '127.0.0.1', port, [os.getpid()]),
+                         ('cluster', [os.getpid()]))
 
     def test_a_child_owns_for_its_parent(self):
         source = ('import socket, time; s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(); '
@@ -237,6 +240,53 @@ class Listener(Case):
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             self.assertEqual(harness_ports.listener(os.getpid(), '127.0.0.1', sock.getsockname()[1]), ('none', []))
+
+
+@unittest.skipUnless(sys.platform.startswith('linux'), 'needs /proc')
+class LostBind(Case):
+    HTTP = 'queue active\nnabedra-db: worker HTTP bind failed\n'
+    PANIC = 'called `Result::unwrap()` on an `Err` value: "worker HTTP bind failed"\nnote: run with RUST_BACKTRACE=1\n'
+    NODE = 'nabedra-db: registered startup StorageUnavailable: local worker storage: {} (os error {})\n'
+
+    def held(self):
+        sock = socket.socket()
+        self.addCleanup(sock.close)
+        sock.bind(('127.0.0.1', 0))
+        sock.listen()
+        return [f'127.0.0.1:{sock.getsockname()[1]}']
+
+    def free(self):
+        return [f'127.0.0.1:{free_ports(1)[0]}']
+
+    def test_a_failed_bind_needs_an_outside_holder(self):
+        for output in (self.HTTP, self.PANIC, 'nabedra-db: listener failed\n'):
+            address = self.held()
+            self.assertEqual(harness_ports.lost_bind(output, address), f'{address[0]} is held by pid {os.getpid()}')
+            self.assertIsNone(harness_ports.lost_bind(output, address, [os.getpid()]))
+            self.assertIsNone(harness_ports.lost_bind(output, self.free()))
+
+    def test_eaddrinuse_in_the_exit_needs_no_holder_and_never_one_of_the_cluster(self):
+        output = self.NODE.format('Address already in use', 98)
+        self.assertIsNotNone(harness_ports.lost_bind(output, self.free()))
+        self.assertIsNotNone(harness_ports.lost_bind(output, self.held()))
+        self.assertIsNone(harness_ports.lost_bind(output, self.held(), [os.getpid()]))
+
+    def test_another_error_or_a_mention_is_not_a_lost_port(self):
+        for output in (self.NODE.format('Cannot assign requested address', 99), 'peer said: node listener failed\n',
+                       'WARN a bind failed earlier\npanicked at pool.rs\n', 'the log says Address already in use\n', ''):
+            for addresses in (self.held(), self.free()):
+                self.assertIsNone(harness_ports.lost_bind(output, addresses), output)
+
+    def test_a_holder_without_an_owner_is_not_outside(self):
+        with mock.patch.object(harness_ports, 'holder', lambda *_: ('unknown', [])):
+            self.assertIsNone(harness_ports.lost_bind(self.HTTP, self.held()))
+        self.assertEqual(harness_ports._owner({'0x': ('0A', os.getuid())}, []), ('unknown', []))
+        self.assertEqual(harness_ports._owner({'0x': ('0A', os.getuid() + 1)}, []), ('outside', []))
+
+    def test_an_address_that_is_not_local_is_not_taken(self):
+        port = int(self.held()[0].rsplit(':', 1)[1])
+        self.assertTrue(harness_ports.port_taken(port))
+        self.assertFalse(harness_ports.port_taken(port, '192.0.2.1'))
 
 
 class Ready(http.server.ThreadingHTTPServer):
@@ -395,6 +445,37 @@ class Workers(Case):
             self.assert_names(raised.exception, f'w2 (pid {cluster.workers["w2"].pid})', 'status 101',
                               'worker HTTP bind failed', 'w1', cluster.config['w1']['bind'])
 
+    def test_a_worker_whose_address_another_one_has_by_configuration_fails(self):
+        # w1 does not listen, so only the configuration shows the duplicate.
+        cluster = self.prepared(w1='silent', w2='in-use')
+        self.same_port(cluster)
+        self.launch(cluster, names=('w1', 'w2'))
+        self.wait_exit(cluster, 'w2')
+        with self.assertRaises(AssertionError) as raised:
+            cluster.check_lost_port('w2')
+        self.assertNotIsInstance(raised.exception, PortLost)
+        self.assert_names(raised.exception, f'w1 (pid {cluster.workers["w1"].pid})', cluster.config['w1']['bind'])
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'needs /proc')
+    def test_a_worker_whose_address_another_one_took_fails_and_names_it(self):
+        cluster = self.prepared(w1='steal')
+        cluster.config['w1']['steal'] = cluster.config['w2']['bind']
+        self.launch(cluster, names=('w1', 'w2'))
+        self.wait_exit(cluster, 'w2')
+        with self.assertRaises(AssertionError) as raised:
+            cluster.check_lost_port('w2')
+        self.assertNotIsInstance(raised.exception, PortLost)
+        self.assert_names(raised.exception, f'w1 (pid {cluster.workers["w1"].pid}) has its address',
+                          cluster.config['w2']['bind'])
+
+    def test_a_dead_worker_fails_before_the_deadline_when_nobody_answers(self):
+        cluster = self.prepared(w2='crash')
+        self.launch(cluster, names=('w2',))
+        self.wait_exit(cluster, 'w2')
+        with self.assertRaises(AssertionError) as raised:
+            cluster.wait_workers(names=('w2',), deadline_seconds=3)
+        self.assert_names(raised.exception, 'status 3', 'pool open failed')
+
     def test_a_worker_that_lost_its_port_to_an_outside_process_reports_its_exit_and_log(self):
         cluster = self.prepared()
         self.outside(cluster.config['w2']['bind'])
@@ -429,12 +510,23 @@ class Workers(Case):
         self.assertNotIsInstance(raised.exception, PortLost)
         self.assert_names(raised.exception, f'w1 (pid {cluster.workers["w1"].pid})')
 
-    def test_an_answer_from_an_outside_process_is_a_lost_port(self):
-        cluster = self.prepared(w2='silent')
+    def test_an_answer_from_an_outside_process_is_a_lost_port_once_the_worker_exits(self):
+        cluster = self.prepared(w2='slow')
         self.outside(cluster.config['w2']['bind'], answers=True)
         self.launch(cluster)
         with self.assertRaises(PortLost) as raised:
             cluster.wait_workers(deadline_seconds=30)
+        self.assert_names(raised.exception, f'w2 (pid {cluster.workers["w2"].pid})', 'status 101',
+                          'worker HTTP bind failed', f'pid {os.getpid()}', cluster.config['w2']['bind'])
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'needs /proc')
+    def test_an_answer_from_an_outside_process_does_not_count_and_is_named_at_the_deadline(self):
+        cluster = self.prepared(w2='silent')
+        self.outside(cluster.config['w2']['bind'], answers=True)
+        self.launch(cluster)
+        with self.assertRaises(AssertionError) as raised:
+            cluster.wait_workers(deadline_seconds=2)
+        self.assertNotIsInstance(raised.exception, PortLost)
         self.assert_names(raised.exception, f'w2 (pid {cluster.workers["w2"].pid})', f'pid {os.getpid()}',
                           cluster.config['w2']['bind'])
 
@@ -498,16 +590,38 @@ class Workers(Case):
         self.assertNotIsInstance(raised.exception, PortLost)
         self.assert_names(raised.exception, f'w1 (pid {cluster.workers["w1"].pid})', 'status 7', 'queue active leave')
 
+    def test_a_ready_worker_that_exits_while_another_never_answers_fails_before_the_deadline(self):
+        cluster = self.prepared(w1='leave', w2='silent')
+        self.launch(cluster)
+        with self.assertRaises(AssertionError) as raised:
+            cluster.wait_workers(deadline_seconds=8)
+        self.assert_names(raised.exception, f'w1 (pid {cluster.workers["w1"].pid})', 'status 7', 'after it was ready')
+
+    def test_a_worker_that_dies_while_another_ones_answer_is_checked_wins(self):
+        cluster = self.prepared(w2='silent')
+        self.same_port(cluster)
+        self.launch(cluster)
+        listener = harness_ports.listener
+
+        def killing(pid, *where):
+            if pid == cluster.workers['w2'].pid:
+                cluster.workers['w3'].kill()
+            return listener(pid, *where)
+
+        with mock.patch.object(harness_ports, 'listener', killing), self.assertRaises(AssertionError) as raised:
+            cluster.wait_workers(deadline_seconds=20)
+        self.assert_names(raised.exception, f'w3 (pid {cluster.workers["w3"].pid})', 'status -9')
+
     def test_a_worker_that_exits_right_after_its_ready_answer_reports_that_exit(self):
         cluster = self.prepared(w1='leave-now')
         self.launch(cluster)
         listener = harness_ports.listener
 
-        def after_exit(pid, host, port):
+        def after_exit(pid, *where):
             # The exit falls between the answer and the liveness check.
             if pid == cluster.workers['w1'].pid:
                 self.wait_exit(cluster, 'w1')
-            return listener(pid, host, port)
+            return listener(pid, *where)
 
         with mock.patch.object(harness_ports, 'listener', after_exit), self.assertRaises(AssertionError) as raised:
             cluster.wait_workers(deadline_seconds=30)
@@ -592,7 +706,7 @@ class Workers(Case):
 
     def test_the_first_start_does_not_retry_a_dead_worker_next_to_a_lost_port(self):
         def first(cluster):
-            cluster.config['w2']['fake'] = 'silent'
+            cluster.config['w2']['fake'] = 'slow'
             cluster.config['w3']['fake'] = 'crash'
             self.outside(cluster.config['w2']['bind'], answers=True)
 
