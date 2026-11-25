@@ -5,10 +5,11 @@
 //! [`QueryCode`] estimates the cosine between two directions, and [`bounds`] turns that one
 //! estimate and both lengths into an interval of any operation.
 //!
-//! **Stated bound.** Over rotations, the true cosine of one pair lies within [`Estimate::err`] of
-//! [`Estimate::cos`] with probability at least [`COVERAGE`], in the 1-bit and in the 5-bit stage,
-//! and above `cos + err` or below `cos - err` with half the rest each. Never prune an exact query
-//! with it.
+//! **Stated bound, empirical.** `err` is [`EPSILON`] times the deviation of RaBitQ's error over
+//! random rotations, plus the rounding of the query, in quadrature, plus a rounding floor. RaBitQ
+//! proves a tail bound for Haar rotations; this module uses sign flips and Hadamard transforms, a
+//! fixed dither and the quadrature, so [`COVERAGE`] is a measured figure, not a theorem. Never prune
+//! an exact query with it.
 //!
 //! **Zero vectors** have no direction. [`direction`] returns `None` for them, and the cosine of
 //! [`exact`] and [`score`] too. [`CodeBlock::push`] and [`bounds`] take the lengths that
@@ -31,7 +32,13 @@ pub const MAX_DIM: usize = 1 << 16;
 pub const CODE_STEP: usize = 64;
 /// Standard deviations in [`Estimate::err`].
 pub const EPSILON: f32 = 1.9;
-/// The two-sided probability of [`EPSILON`] deviations.
+/// The share of rotations under which the true cosine of one fixed pair lies inside
+/// `cos ± err`, in the 1-bit and in the 5-bit stage, by measurement: 0.94 is the two-sided normal
+/// probability of [`EPSILON`] deviations. The tests reject a share of misses above `1 - COVERAGE`
+/// plus 4 binomial deviations of their sample: `quant::tests::true_cosine_lies_inside_the_stated_bound`
+/// (pooled pairs, no slack) and, per fixed pair, `a_fixed_pair_is_inside_the_bound_over_rotations_*`,
+/// `near_axis_vectors_in_3_5_and_8_dims_stay_inside_the_stated_bound` and
+/// `low_rank_data_in_a_large_dim_stays_inside_the_stated_bound` in `tests/adversarial_codes.rs`.
 pub const COVERAGE: f64 = 0.94;
 /// 2^-24, the relative error of one f32 rounding.
 const UNIT: f64 = 1.0 / (1u32 << 24) as f64;

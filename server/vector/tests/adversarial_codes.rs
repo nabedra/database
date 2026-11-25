@@ -588,6 +588,12 @@ fn rotation_and_codes_are_a_pure_function_of_the_seed() {
     }
 }
 
+/// `1 - COVERAGE` plus 4 binomial deviations of the 1,500 rotations of `miss_rates` (about 0.085).
+fn allowed_misses() -> f64 {
+    let p = 1.0 - COVERAGE;
+    p + 4.0 * (p * (1.0 - p) / 1500.0).sqrt()
+}
+
 /// Minimal case: a few vectors near the axes of a space of 3, 5 or 8 dimensions (centroid, query
 /// and entry each near a different axis). The estimate of this one pair is outside its
 /// stated bound for far more than the stated 6% of rotations.
@@ -674,7 +680,7 @@ fn near_axis_vectors_in_3_5_and_8_dims_stay_inside_the_stated_bound() {
     for ((dim, _, query, entry), centroid) in cases.iter().zip(&centroids) {
         let (m1, m5) = miss_rates(*dim, centroid, query, entry);
         println!("dim {dim}: miss 1-bit {m1:.3}, 5-bit {m5:.3} (stated at most 0.060)");
-        if m1 > 0.09 || m5 > 0.09 {
+        if m1 > allowed_misses() || m5 > allowed_misses() {
             failures.push(format!("dim {dim}: miss 1-bit {m1:.3}, 5-bit {m5:.3}"));
         }
     }
@@ -699,7 +705,7 @@ fn low_rank_data_in_a_large_dim_stays_inside_the_stated_bound() {
     for dim in [64, 256, 1024, 4096] {
         let (m1, m5) = miss_rates(dim, &pad(&c, dim), &pad(&q, dim), &pad(&e, dim));
         println!("rank 3 in dim {dim}: miss 1-bit {m1:.3}, 5-bit {m5:.3} (stated at most 0.060)");
-        if m1 > 0.09 || m5 > 0.09 {
+        if m1 > allowed_misses() || m5 > allowed_misses() {
             failures.push(format!(
                 "rank 3 in dim {dim}: miss 1-bit {m1:.3}, 5-bit {m5:.3}"
             ));

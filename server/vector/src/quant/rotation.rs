@@ -61,11 +61,6 @@ impl Rotation {
         assert_eq!(out.len(), self.padded, "rotation output");
         let kernels = Kernels::detect();
         let blocks = self.padded / self.block;
-        let mut dealt = if blocks > 1 {
-            vec![0.0; self.padded]
-        } else {
-            Vec::new()
-        };
         out[..self.dim].copy_from_slice(v);
         out[self.dim..].fill(0.0);
         for factors in self.factors.chunks_exact(self.padded) {
@@ -76,15 +71,23 @@ impl Rotation {
                 kernels.hadamard(block);
             }
             if blocks > 1 {
-                for (r, block) in out.chunks_exact(self.block).enumerate() {
-                    for (x, hand) in block.iter().zip(dealt.chunks_exact_mut(blocks)) {
-                        hand[r] = *x;
+                DEALT.with_borrow_mut(|dealt| {
+                    dealt.resize(self.padded, 0.0);
+                    for (r, block) in out.chunks_exact(self.block).enumerate() {
+                        for (x, hand) in block.iter().zip(dealt.chunks_exact_mut(blocks)) {
+                            hand[r] = *x;
+                        }
                     }
-                }
-                out.copy_from_slice(&dealt);
+                    out.copy_from_slice(&dealt[..self.padded]);
+                });
             }
         }
     }
+}
+
+thread_local! {
+    /// Room to deal the values of a round into, kept so that `apply` does not allocate per call.
+    static DEALT: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Values per transform of a rotation with this padded length.

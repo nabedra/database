@@ -17,8 +17,9 @@ const GOLDEN: u32 = 0x9e37_79b9;
 /// With `r = dir - centroid`, the 1-bit code is `x = sign(r)`, and the 5-bit code is the vector `y`
 /// of odd multiples of 1/2 up to 31/2 that points closest to `r` among the scales in [`CLIPS`]. As
 /// in RaBitQ (arXiv 2405.12497) and its extension (2409.09913), `r . q` is estimated by
-/// `(|r|^2 / (x . r)) * (x . q)`, whose error over random rotations has mean 0 and a deviation of at
-/// most `|r| |q| sqrt(1 / a^2 - 1) / sqrt(d - 1)`, where `a` is the cosine between `x` and `r`.
+/// `(|r|^2 / (x . r)) * (x . q)`. Under Haar rotations its error has mean 0 and a deviation of at
+/// most `|r| |q| sqrt(1 / a^2 - 1) / sqrt(d - 1)`, where `a` is the cosine between `x` and `r`; for
+/// the rotation here that is measured (see [`super::COVERAGE`]).
 ///
 /// Everything stored, and every estimate, is the same on every CPU: only integer kernels and scalar
 /// arithmetic.
@@ -188,6 +189,11 @@ pub(super) fn best_scale(residual: &[f32], r2: f64) -> f32 {
 /// does not count.
 #[inline]
 fn sum(values: &[f32], f: impl Fn(f64) -> f64) -> f64 {
+    debug_assert!(
+        values.len().is_multiple_of(8),
+        "only whole lanes: {}",
+        values.len()
+    );
     let mut lanes = [0.0; 8];
     for values in values.as_chunks::<8>().0 {
         for (lane, &value) in lanes.iter_mut().zip(values) {

@@ -714,6 +714,26 @@ fn vs07_exact_bounds_contain_the_final_score_at_the_worst_rounding() {
     }
 }
 
+/// The slack must hold the worst cosine that kernel errors within `relative_error` allow: the dot
+/// product off by `e |a| |b|` and both squared lengths by `e` of themselves, each the bad way.
+#[test]
+fn slack_holds_the_worst_kernel_errors() {
+    for dim in [1, 64, 768, 1024, 4096, MAX_DIM] {
+        let e = nabedra_simd::relative_error(dim);
+        let mut worst = 0.0f64;
+        for i in 0..=200 {
+            let cos = f64::from(i) / 100.0 - 1.0;
+            for (dot, norms) in [(-e, 1.0 + e), (e, 1.0 - e), (-e, 1.0 - e), (e, 1.0 + e)] {
+                let got = ((cos + dot) / norms).clamp(-1.0, 1.0);
+                worst = worst.max((got - cos).abs());
+            }
+        }
+        // Plus the rounding of the result to f32.
+        assert!(worst + UNIT <= slack(dim), "{dim}: {worst} {}", slack(dim));
+        assert!(worst > 1.9 * e, "{dim}: the worst case needs both errors");
+    }
+}
+
 #[test]
 fn direction_has_unit_length_or_is_refused() {
     let mut out = [0.0; 3];
