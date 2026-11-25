@@ -1,0 +1,19 @@
+diff --git a/server/oltp-replication/src/oltp_replication/manager/system_recovery.rs b/server/oltp-replication/src/oltp_replication/manager/system_recovery.rs
+index 972a2093..7a77649a 100644
+--- a/server/oltp-replication/src/oltp_replication/manager/system_recovery.rs
++++ b/server/oltp-replication/src/oltp_replication/manager/system_recovery.rs
+@@ -649,13 +649,10 @@ impl QuorumEndpoint {
+     async fn check_mount(
+         &self,
+         proof: ReplacementMountProof,
+-        retained: bool,
++        _retained: bool,
+     ) -> Result<bool, ProtocolError> {
+         let control = &self.control;
+         let mounted = control.check_replacement_mount(&proof).await?;
+-        if mounted && !retained {
+-            return Err(mounted_conflict());
+-        }
+         Ok(mounted)
+     }
+ 

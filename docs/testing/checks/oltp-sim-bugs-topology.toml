@@ -1,0 +1,23 @@
+id = "oltp-sim-bugs-topology"
+module = "oltp"
+kinds = ["S", "H"]
+# Fault-model simulation evidence. Each phase 11 topology fix, reverted, must be found by a seed in
+# its manifest's range with a kind it expects; the seed replays alone twice on the patched build
+# and passes twice on the unpatched build (sim_bugs.py run). Phase 11 needs 15 of the 22 over the
+# four sets, at least one per class; this check reports its own set.
+# idxhot has an empty `expect` (`no-detector`), so the command exits 1 without the marker below
+# and the record is fail, not not-run. No phase 11 workload exists yet, and the set cannot pass
+# while that stays so or while such a row is in it. server/sim-oltp/bugs/phase11/simulator.toml
+# says what each entry needs.
+# The set: acc2, idxhot, rd1, topo1-child-schema.
+guarantees = ["OLTP-G06"]
+scenarios = ["D11", "O12", "O28"]
+tiers = ["weekly", "T3"]
+command = ["python3", "scripts/testing/sim_bugs.py", "run", "--set", "topology", "--jobs", "4",
+           "--sim-jobs", "4", "--out", "target/testing-logs/oltp-sim-bugs-topology"]
+cwd = "."
+timeout_s = 18000
+needs = []
+result_parser = "exit-code"
+not_run_marker = "not-run: sim-harness-missing"
+env = { RUSTFLAGS = "--cfg tokio_unstable", RUST_MIN_STACK = "16777216" }

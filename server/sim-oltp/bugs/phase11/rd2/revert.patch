@@ -1,0 +1,97 @@
+diff --git a/server/oltp-replication/src/oltp_replication/service_rpc/grant_cache.rs b/server/oltp-replication/src/oltp_replication/service_rpc/grant_cache.rs
+index 8275d4a0..2144934c 100644
+--- a/server/oltp-replication/src/oltp_replication/service_rpc/grant_cache.rs
++++ b/server/oltp-replication/src/oltp_replication/service_rpc/grant_cache.rs
+@@ -60,10 +60,6 @@ const WARM_TICK: Duration = Duration::from_secs(1);
+ const WARM_AHEAD: Duration = Duration::from_millis(1500);
+ /// At most this many keys are kept warm.
+ pub(crate) const MAX_WARM: usize = 64;
+-/// A background read that takes longer is abandoned. Refreshes run one at a
+-/// time, so the warm task holds at most one Control read (one outgoing lane
+-/// slot and one native Control job) for at most this long.
+-const WARM_READ_TIMEOUT: Duration = Duration::from_secs(1);
+ 
+ /// One background role check: the applied revision read before the Control
+ /// read starts, and the read itself.
+@@ -134,8 +130,6 @@ fn observed(grant: &ServiceAuthorization) -> Observed {
+ struct Warm {
+     refresh: Refresh,
+     used: Instant,
+-    /// No refresh before this: the last one failed transiently.
+-    backoff: Option<Instant>,
+ }
+ 
+ // A seed must replay the same sequence of background Control reads.
+@@ -270,7 +264,6 @@ impl GrantCache {
+             Warm {
+                 refresh: warm(),
+                 used: now,
+-                backoff: None,
+             },
+         );
+     }
+@@ -370,7 +363,6 @@ async fn warm_loop(cache: Weak<Mutex<Grants>>) {
+             }
+             let Grants { entries, warm, .. } = &*grants;
+             warm.iter()
+-                .filter(|(_, entry)| entry.backoff.is_none_or(|until| now >= until))
+                 .filter(|(key, _)| {
+                     entries
+                         .get(key)
+@@ -379,22 +371,21 @@ async fn warm_loop(cache: Weak<Mutex<Grants>>) {
+                 .map(|(key, entry)| (*key, entry.refresh.clone()))
+                 .collect()
+         };
+-        // One read at a time: a slow or unavailable Control (recovery, a
+-        // partition) costs the foreground at most one lane slot and one
+-        // native Control job, for at most WARM_READ_TIMEOUT per tick.
+-        for (key, refresh) in due {
+-            let Some((revision, read)) = refresh() else {
+-                continue;
+-            };
+-            let started = nabedra_rt::time::now();
+-            let result = {
++        let reads = due.into_iter().filter_map(|(key, refresh)| {
++            let (revision, read) = refresh()?;
++            Some(async move {
+                 let _timer = perf_stage!("grant.warm.refresh").timer();
+-                nabedra_rt::time::timeout(WARM_READ_TIMEOUT, read).await
+-            };
+-            let Some(shared) = cache.upgrade() else {
+-                return;
+-            };
+-            let mut grants = lock(&shared);
++                let started = nabedra_rt::time::now();
++                let result = nabedra_rt::time::timeout(GRANT_TTL, read).await;
++                (key, revision, started, result)
++            })
++        });
++        let results = futures_util::future::join_all(reads).await;
++        let Some(shared) = cache.upgrade() else {
++            return;
++        };
++        let mut grants = lock(&shared);
++        for (key, revision, started, result) in results {
+             match result {
+                 Ok(Ok(grant)) => insert(
+                     &mut grants,
+@@ -410,16 +401,9 @@ async fn warm_loop(cache: Weak<Mutex<Grants>>) {
+                     grants.entries.remove(&key);
+                     grants.warm.remove(&key);
+                 }
+-                // A transient failure or a timeout: the entry expires on its
+-                // own bound, this key waits one TTL, and the rest of this
+-                // tick is skipped so a struggling Control is not read again.
+-                _ => {
+-                    perf_stage!("grant.warm.failed").record(Duration::ZERO);
+-                    if let Some(entry) = grants.warm.get_mut(&key) {
+-                        entry.backoff = Some(nabedra_rt::time::now() + GRANT_TTL);
+-                    }
+-                    break;
+-                }
++                // A transient failure: the entry expires on its own bound and
++                // the next tick tries again.
++                _ => {}
+             }
+         }
+     }

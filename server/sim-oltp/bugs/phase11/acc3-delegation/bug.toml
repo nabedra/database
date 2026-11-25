@@ -1,0 +1,70 @@
+# Reverted fix ACC3-delegation (phase 11, design section 4.2, row 11).
+schema = "nabedra.sim-bug/1"
+id = "acc3-delegation"
+bug = "ACC3-delegation"
+set = "membership"
+phase = 11
+class = "fence-lifecycle-order"
+guarantees = ["OLTP-G07", "OLTP-G08"]
+scenarios = ["O14", "R03"]
+fix_commits = ["6ad8a99c2561ba48c0bcb4a2b8252d9c1e2ad30b"]
+reverts = ["6ad8a99c2561ba48c0bcb4a2b8252d9c1e2ad30b"]
+port = "clean"
+port_notes = """
+`git diff 6ad8a99c 6ad8a99c^` on authority/control/forwarding.rs (moved to nabedra-oltp-replication): a
+Barrier or Propose over a prepared-only session is refused as invalid instead of deferred. O14, where the fix
+was found, passed once with the patch.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
+workload = "membership"
+profile = ["rolling-restart", "leader-move"]
+# expect is the plan. The text an expected kind enforces is in [[rules]] at the end. A kind without text there detects
+# nothing.
+# This branch's history holds an earlier plan (other `expect`). A [detection] here needs `sim_bugs.py record
+# --never-searched` for it first. No such record exists.
+expect = ["Liveness"]
+seeds = [1, 10000]
+
+# The probe is the patch author's. What confirms this row is the review's run below, not the probe.
+[regression]
+kind = "lib-test"
+test = "oltp_replication::manager::damage_scheduler_tests::probe_acc3_delegation_waits_for_the_applied_promotion"
+mode = "on"
+assertion = "state"
+probe = true
+failure_contains = ["from a worker whose promotion is not applied here"]
+
+# The patch author's own runs.
+[regression.evidence]
+digest = "6c32d5510986d42864feb53ddccf27a81e146da3395407dae8a861b3d3eadf1d"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, probe_acc3_delegation_waits_for_the_applied_promotion, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45436093996", sha = "af47594b829dc53e11ae08eda608629c2065aae7", result = "failed", note = "request p11-bugs-acc3-delegation-af47594-172108, probe_acc3_delegation_waits_for_the_applied_promotion, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+assertion `left == right` failed: barrier from a worker whose promotion is not applied here: Control operator delegation identity or request differs
+  left: (Unauthorized, NotApplied)
+ right: (StorageUnavailable, NotApplied)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 194 filtered out; finished in 1.35s
+""" }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact inverse of 6ad8a99c. Kept apart from the author's evidence above. These are workflow `tests`,
+# `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - oltp_replication::manager::damage_scheduler_tests::review121::r121_acc3_delegation_heals_when_the_promotion_applies: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456424289 (799d9682) 3 of 3 failed: `Unauthorized` after about 0.5 ms, never retried.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports. The digest covers revert.patch and probe.patch. The review's patched runs applied
+# revert.patch alone.
+[review]
+digest = "ff6fb5156ee8be86ee62af0987ac769c29ab2c9a4b49b24d1991e00987d8ec6d"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Patch read: exact inverse of 6ad8a99c. The verdict rests on the review's own test: `Unauthorized` after 0.5 ms, \
+never retried. Not on the probe.\
+"""
+
+[[rules]]  # 3.7
+kind = "Liveness"
+source = "plans/testing/phase-10-11-oltp-sim.md"
+text = "convergence within 30 s of the heal; the cold start, move or index build finishes within its bound"

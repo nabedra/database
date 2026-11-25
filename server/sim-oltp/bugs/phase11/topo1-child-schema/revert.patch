@@ -1,0 +1,62 @@
+diff --git a/server/oltp-storage/src/oltp/mvcc/store/direct.rs b/server/oltp-storage/src/oltp/mvcc/store/direct.rs
+index 939c58e3..16edd0cc 100644
+--- a/server/oltp-storage/src/oltp/mvcc/store/direct.rs
++++ b/server/oltp-storage/src/oltp/mvcc/store/direct.rs
+@@ -176,7 +176,7 @@ pub struct ChildPublished {
+ /// is the Catalog table lifecycle id (`TableRecord::lifecycle_id`) whose
+ /// descriptor and index set direct commits must be computed from. `None`
+ /// means the table was dropped: every direct commit answers `StaleEpoch`.
+-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct DirectSchema {
+     pub epoch: u64,
+diff --git a/server/src/oltp_runtime/direct/schema.rs b/server/src/oltp_runtime/direct/schema.rs
+index 13ec3631..85f1b73b 100644
+--- a/server/src/oltp_runtime/direct/schema.rs
++++ b/server/src/oltp_runtime/direct/schema.rs
+@@ -2,10 +2,8 @@
+ //! step 4: "validate the row against the cached table descriptor").
+ //!
+ //! A cache entry is keyed by the table, the route's schema epoch and the
+-//! group's direct schema epoch and lifecycle (T7). Direct epochs are local
+-//! to a group, so a split child can reuse a parent's earlier epoch under a
+-//! different lifecycle. Every DirectCommit carries the direct epoch and
+-//! apply refuses a stale one. The DDL fence of plan section 7
++//! group's direct schema epoch (T7). Every DirectCommit carries the direct
++//! epoch and apply refuses a stale one. The DDL fence of plan section 7
+ //! commits a new direct epoch, bound to the table lifecycle id the Catalog is
+ //! about to publish, to every Data group of the table before the Catalog
+ //! publishes a new descriptor or writable index set. A load accepts only the
+@@ -308,7 +306,10 @@ impl CatalogSchema {
+             lifecycle_id: table.lifecycle_id,
+             indexes,
+         });
+-        self.remember((table_id, schema_epoch, group), table.clone());
++        self.remember(
++            (table_id, schema_epoch, group.map(|group| group.epoch)),
++            table.clone(),
++        );
+         Ok(SchemaLookup::Table(table))
+     }
+ }
+@@ -321,7 +322,7 @@ impl DirectSchema for CatalogSchema {
+         authority: Authority,
+     ) -> ConsensusFuture<'_, SchemaLookup> {
+         Box::pin(async move {
+-            if let Some(table) = self.cached((table_id, schema_epoch, group)) {
++            if let Some(table) = self.cached((table_id, schema_epoch, group.map(|g| g.epoch))) {
+                 return Ok(SchemaLookup::Table(table));
+             }
+             self.load(table_id, schema_epoch, group, authority).await
+@@ -351,8 +352,8 @@ impl DirectSchema for CatalogSchema {
+         })
+     }
+ }
+-/// (table, route schema epoch, group direct epoch and lifecycle when checked).
+-type CacheKey = (Uuid, u64, Option<GroupSchema>);
++/// (table, route schema epoch, group direct epoch when checked).
++type CacheKey = (Uuid, u64, Option<u64>);
+ 
+ fn invalid() -> ProtocolError {
+     ProtocolError::new(
