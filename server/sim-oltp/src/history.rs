@@ -1,15 +1,21 @@
 //! Public HTTP observations in the shared JSONL history format.
 
+use std::collections::BTreeMap;
+
 use nabedra_check::{
     checker::{Verdict, direct},
     history::{Event, EventType, NEMESIS, write_jsonl},
 };
+use nabedra_oltp_types::types::Digest;
 use nabedra_protocol::protocol::{Outcome, ProtocolError};
 use nabedra_rt::sim::World;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::invariants::{TraceObserver, elapsed_ms};
+use crate::{
+    client::digest,
+    invariants::{TraceObserver, elapsed_ms},
+};
 
 #[derive(Debug)]
 pub struct Client {
@@ -38,9 +44,13 @@ pub enum Completion {
     Unknown(String),
 }
 
+pub type Bodies = BTreeMap<usize, Digest>;
+
 #[derive(Default)]
 pub struct History {
     events: Vec<Event>,
+    /// The digest of the body that each invocation sent, by event index.
+    bodies: Bodies,
     next_process: u64,
     trace: Option<TraceObserver>,
 }
@@ -102,6 +112,15 @@ impl History {
         let attempt = Attempt(self.events.len());
         self.push(world, event);
         attempt
+    }
+
+    /// The body that an invocation sends.
+    pub fn sends(&mut self, attempt: &Attempt, body: &Value) {
+        self.bodies.insert(attempt.0, digest(body));
+    }
+
+    pub fn bodies(&self) -> &Bodies {
+        &self.bodies
     }
 
     pub fn complete(

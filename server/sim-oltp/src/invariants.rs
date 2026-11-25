@@ -19,7 +19,10 @@ use nabedra_rt::{
 use nabedra_sim::raft::MAX_VIOLATIONS;
 use serde_json::Value;
 
-use crate::probes::{ProbeEvent, Probes, describe};
+use crate::{
+    history::Bodies,
+    probes::{ProbeEvent, Probes, describe},
+};
 use protocol::Ledgers;
 
 pub const STEP: Duration = Duration::from_millis(10);
@@ -142,9 +145,9 @@ impl Invariants {
 
     /// NotAppliedNeverCommitted over the finished client history. Call it last: it also
     /// traces how often each rule ran.
-    pub fn check_outcomes(&self, world: &World, events: &[Event]) {
+    pub fn check_outcomes(&self, world: &World, events: &[Event], bodies: &Bodies) {
         if let Some(probes) = self.probes() {
-            probes.check_outcomes(world, events);
+            probes.check_outcomes(world, events, bodies);
             self.trace(world, format!("{RULES_RAN} {:?}", probes.exercised()));
         }
     }
