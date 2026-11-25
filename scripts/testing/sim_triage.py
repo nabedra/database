@@ -89,7 +89,9 @@ class Leases:
 
 def usage(violation):
     """The node and the growth of `working_decode_bytes`, if nothing else grew."""
-    found = re.search(r"n(\d+) has (ResourceUsage .*) after quiescence, baseline (ResourceUsage .*)$", violation)
+    found = (re.search(r"n(\d+) has (ResourceUsage .*) after quiescence, baseline (ResourceUsage .*)$", violation)
+             or re.search(r"n(\d+) did not stay at its baseline .*, last off by (ResourceUsage .*) "
+                          r"\(baseline (ResourceUsage .*)\)$", violation))
     if not found:
         return None
     node, now, before = int(found[1]), found[2], found[3]

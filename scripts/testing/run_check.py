@@ -16,6 +16,8 @@ Results: `pass` needs at least one executed assertion and no failure. Zero execu
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
 import os
 import re
@@ -288,36 +290,73 @@ def parse_exit_code(output: str, returncode: int) -> Parsed:
 
 
 _TLA_SUMMARY = "nabedra-tla-summary: "
+# The runners' exit statuses (EXIT in tla_check.py and tla_trace.py).
+_TLA_EXIT = {"pass": 0, "fail": 1, "not-run": 2, "error": 3}
+
+
+def _unique_keys(pairs: list[tuple]) -> dict:
+    out = dict(pairs)
+    if len(out) != len(pairs):
+        raise ValueError("a key appears twice")
+    return out
+
+
+def _no_constant(text: str):
+    raise ValueError(f"{text} is not a count")
 
 
 def parse_tlc(output: str, returncode: int) -> Parsed:
     """Reads the `nabedra-tla-summary: {json}` line of tla_check.py or tla_trace.py.
 
-    A check runs one runner, so it prints one summary. More than one would let a later pass hide an
-    earlier failure, so it is an error."""
-    lines = [line for line in output.splitlines() if line.startswith(_TLA_SUMMARY)]
-    if len(lines) > 1:
-        return Parsed(0, 0, [{"id": "parser", "reason": f"{len(lines)} nabedra-tla-summary lines; a kind T "
-                              "check runs one runner"}], True, "error")
-    summary = None
-    if lines:
-        try:
-            summary = json.loads(lines[0][len(_TLA_SUMMARY):])
-        except json.JSONDecodeError:
-            summary = None
-    if not isinstance(summary, dict):
+    A check runs one runner, so it prints one summary, at the start of a line. More than one would let a
+    later pass hide an earlier failure, so the marker counts wherever it appears. Everything this parser
+    does not understand is `error`: an unknown verdict, counts that are not 0 <= failed <= executed, an exit
+    status that is not the verdict's, and a `pass` without `tla` facts, with `not_run` entries or with
+    facts that contradict it."""
+    def bad(reason: str) -> Parsed:
+        return Parsed(0, 0, [{"id": "parser", "reason": reason}], True, "error")
+
+    count = output.count(_TLA_SUMMARY.rstrip())
+    if count == 0:
         return Parsed(0, 0, [], False)
+    if count > 1:
+        return bad(f"{count} nabedra-tla-summary lines; a kind T check runs one runner")
+    # Not splitlines(): text in a trace may hold U+2028 or U+0085, which do not end a line.
+    lines = [line for line in output.split("\n") if line.startswith(_TLA_SUMMARY)]
+    if not lines:
+        return bad("the nabedra-tla-summary marker does not start a line")
     try:
-        executed, failed = int(summary["executed"]), int(summary["failed"])
-        verdict = summary["verdict"]
-    except (KeyError, TypeError, ValueError):
-        return Parsed(0, 0, [], False)
-    not_run = [
-        {"id": str(n.get("id", ""))[:200], "reason": str(n.get("reason", ""))[:300]}
-        for n in summary.get("not_run", []) if isinstance(n, dict)
-    ]
-    extra = {k: summary[k] for k in ("tla", "artifacts") if isinstance(summary.get(k), (dict, list))}
-    return Parsed(executed, failed, not_run, True, verdict if verdict in evidence.RESULTS else None, extra)
+        summary = json.loads(lines[0][len(_TLA_SUMMARY):], object_pairs_hook=_unique_keys,
+                             parse_constant=_no_constant)
+    except (ValueError, RecursionError) as exc:
+        return bad(f"unreadable nabedra-tla-summary: {exc}")
+    if not isinstance(summary, dict):
+        return bad("the nabedra-tla-summary is not an object")
+    verdict, executed, failed = summary.get("verdict"), summary.get("executed"), summary.get("failed")
+    entries = summary.get("not_run", [])
+    if not isinstance(verdict, str) or verdict not in _TLA_EXIT:
+        return bad(f"unknown verdict {verdict!r}")
+    if type(executed) is not int or type(failed) is not int or not 0 <= failed <= executed:
+        return bad(f"bad counts: executed {executed!r}, failed {failed!r}")
+    if not isinstance(entries, list) or not all(isinstance(n, dict) for n in entries):
+        return bad("not_run is not a list of objects")
+    not_run = [{"id": str(n.get("id", "")), "reason": str(n.get("reason", ""))} for n in entries]
+    extra = {}
+    if isinstance(summary.get("tla"), dict):
+        extra["tla"] = summary["tla"]
+    if isinstance(summary.get("artifacts"), list):
+        extra["artifacts"] = summary["artifacts"]
+    problems = []
+    if returncode != _TLA_EXIT[verdict]:
+        problems.append(f"exit status {returncode} with verdict {verdict}")
+    if verdict == "pass":
+        if not_run:
+            problems.append(f"verdict pass with {len(not_run)} not-run entries")
+        problems += evidence.tla_contradictions(extra.get("tla"))
+    if problems:
+        not_run.append({"id": "parser", "reason": "; ".join(problems)})
+        verdict = "error"
+    return Parsed(executed, failed, not_run, True, verdict, extra)
 
 
 PARSER_FUNCS = {
@@ -363,49 +402,208 @@ def classify(parser: str, output: str, returncode: int | None, timed_out: bool =
     return "pass", parsed
 
 
-def fit_record(record: dict) -> None:
-    """Shrinks a record's tool facts (`tla`) and tool artifacts until it fits the record size limit.
+def _clip(text: str, limit: int) -> str:
+    """`text` cut to `limit` characters. A hash keeps two long names that share a prefix apart."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 9] + "~" + hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:8]
 
-    It drops, in order: the details of passing runs and caught mutants; tool artifacts other than the
-    command log and tla/summary.json; passing runs and caught mutants, last first; and it shortens the
-    remaining details. Failures are kept. `tla.truncated` says that facts were dropped. The full facts
-    stay in the summary.json artifact."""
-    tla = record.get("tla")
 
-    def fits() -> bool:
-        return len(evidence.dumps(record).encode("utf-8")) <= evidence.MAX_RECORD_BYTES
+class _Fitter:
+    """Shrinks one record for fit_record. Everything it drops or cuts is counted."""
 
-    if fits() or not isinstance(tla, dict):
-        return
-    tla["truncated"] = True
-    runs, mutants = tla.get("runs", []), tla.get("mutants", [])
+    MORE = "more not-run entries were dropped to fit the record; the summary.json artifact or the log has them"
 
-    def run_ok(r: dict) -> bool:
-        return r.get("verdict") == "pass"
+    def __init__(self, record: dict):
+        self.record = record
+        self.props = evidence.load_schema()["properties"]
+        self.tla = record["tla"] if isinstance(record.get("tla"), dict) else None
+        self.not_run = record["assertions"]["not_run"]
+        self.artifacts = record["artifacts"]
+        self.more = 0  # dropped not-run entries
+        self.keep = 0  # artifacts that are protected or belong to a failure
 
-    def mutant_ok(m: dict) -> bool:
-        return m.get("ok") is True
+    def list(self, key: str) -> list:
+        """A list of the tla facts, or an empty one. `failing` is traces.failing."""
+        source = self.tla or {}
+        if key == "failing":
+            source = source["traces"] if isinstance(source.get("traces"), dict) else {}
+        value = source.get(key)
+        return value if isinstance(value, list) else []
 
-    for items, ok in ((runs, run_ok), (mutants, mutant_ok)):
-        for item in items:
-            if ok(item):
-                item.pop("detail", None)
-    artifacts = record.get("artifacts", [])
-    for i in range(len(artifacts) - 1, 0, -1):
-        if fits():
-            return
-        if artifacts[i].get("name") != "tla/summary.json":
-            del artifacts[i]
-    for items, ok in ((mutants, mutant_ok), (runs, run_ok)):
+    def count(self, key: str, n: int = 1) -> None:
+        if self.tla is not None and n:
+            self.tla["truncated"] = True
+            dropped = self.tla.setdefault("dropped", {})
+            dropped[key] = dropped.get(key, 0) + n
+
+    def clip(self, value, schema: dict):
+        """`value` with every string cut to its schema maxLength."""
+        if isinstance(value, str) and len(value) > schema.get("maxLength", len(value)):
+            self.count("shortened")
+            return _clip(value, schema["maxLength"])
+        if isinstance(value, dict):
+            for key in list(value):
+                if key in schema.get("properties", {}):
+                    value[key] = self.clip(value[key], schema["properties"][key])
+        elif isinstance(value, list):
+            for i, item in enumerate(value):
+                value[i] = self.clip(item, schema.get("items", {}))
+        return value
+
+    @staticmethod
+    def ok(key: str, item) -> bool:
+        """The entry reports no failure, so it goes before the ones that do."""
+        if key in ("runs", "controls"):
+            return isinstance(item, dict) and item.get("verdict") == "pass"
+        if key == "mutants":
+            return isinstance(item, dict) and item.get("ok") is True
+        if key == "settings":  # a mutant's line goes before a baseline's
+            return isinstance(item, str) and item.startswith("mutant ")
+        return key in ("unmutated", "limits")
+
+    def drop(self, key: str, index: int) -> None:
+        items = self.list(key)
+        failing = {"runs": "failing_runs", "controls": "failing_controls", "mutants": "failing_mutants", "failing": "failing_traces"}
+        self.count(key if self.ok(key, items[index]) else failing.get(key, key))
+        del items[index]
+
+    def drop_last(self, key: str, only_ok: bool) -> bool:
+        """Drops the last entry without a failure, else (unless `only_ok`) the last entry."""
+        items = self.list(key)
         for i in range(len(items) - 1, -1, -1):
-            if fits():
-                return
-            if ok(items[i]):
-                del items[i]
-    for item in [*runs, *mutants, *tla.get("traces", {}).get("failing", [])]:
-        for key in ("detail", "reason"):
-            if isinstance(item.get(key), str):
-                item[key] = item[key][:60]
+            if self.ok(key, items[i]):
+                self.drop(key, i)
+                return True
+        if items and not only_ok:
+            self.drop(key, len(items) - 1)
+            return True
+        return False
+
+    def drop_not_run(self) -> None:
+        """Drops the last not-run entry and keeps the number of dropped ones in a final entry."""
+        if self.more:
+            self.not_run.pop()
+        self.not_run.pop()
+        self.more += 1
+        self.not_run.append({"id": "truncated", "reason": f"{self.more} {self.MORE}"})
+        self.count("not_run")
+
+    def drop_artifact(self, index: int) -> None:
+        del self.artifacts[index]
+        self.count("artifacts")
+
+    @staticmethod
+    def protected(artifact: dict) -> bool:
+        """The command log and the runner's summary.json stay."""
+        return not artifact["name"].startswith("tla/") or artifact["name"] == "tla/summary.json"
+
+    def failing_files(self) -> tuple[str, ...]:
+        """The artifact name prefixes of the failing runs, controls and mutants."""
+        runs = [str(r.get("cfg", "")).removesuffix(".cfg") for r in [*self.list("runs"), *self.list("controls")] if not self.ok("runs", r)]
+        mutants = [f"mutant-{m.get('name')}" for m in self.list("mutants") if not self.ok("mutants", m)]
+        return tuple(f"tla/{stem}." for stem in runs + mutants)
+
+    def schema_limits(self) -> None:
+        """The schema's own limits: string lengths and list sizes."""
+        item = self.props["artifacts"]["items"]
+        for i in range(len(self.artifacts) - 1, -1, -1):
+            if evidence.schema_errors(self.artifacts[i], item):
+                self.drop_artifact(i)
+        # The log and the summary first, then what belongs to a failure. The rest is dropped before them.
+        failing = self.failing_files()
+        rank = [0 if self.protected(a) else 1 if a["name"].startswith(failing) else 2 for a in self.artifacts]
+        self.artifacts[:] = [a for _, _, a in sorted(zip(rank, range(len(rank)), self.artifacts))]
+        self.keep = sum(r < 2 for r in rank)
+        while len(self.artifacts) > self.props["artifacts"]["maxItems"]:
+            self.drop_artifact(len(self.artifacts) - 1)
+        if self.tla is not None:
+            facts = self.props["tla"]["properties"]
+            for key in ("runs", "controls", "mutants", "uncovered", "unmutated", "limits", "settings"):
+                while len(self.list(key)) > facts[key]["maxItems"]:
+                    self.drop_last(key, only_ok=False)
+            while len(self.list("failing")) > facts["traces"]["properties"]["failing"]["maxItems"]:
+                self.drop_last("failing", only_ok=False)
+            # A trace runner that lists fewer failing traces than it counted has dropped the rest itself.
+            if self.tla.get("mode") == "trace":
+                listed = len(self.list("failing")) + self.tla.get("dropped", {}).get("failing_traces", 0)
+                self.count("failing_traces", max(self.record["assertions"]["failed"] - listed, 0))
+            self.clip(self.tla, self.props["tla"])
+        self.clip(self.not_run, self.props["assertions"]["properties"]["not_run"])
+        while len(self.not_run) > self.props["assertions"]["properties"]["not_run"]["maxItems"]:
+            self.drop_not_run()
+
+    def shorten(self, limit: int) -> None:
+        for item in [*self.list("runs"), *self.list("controls"), *self.list("mutants"), *self.list("failing"), *self.not_run]:
+            for key in ("detail", "reason"):
+                if item.get("id") != "truncated" and len(item.get(key, "")) > limit:
+                    item[key] = _clip(item[key], limit)
+                    self.count("shortened")
+
+    def steps(self):
+        """The reductions, one at a time, least important first."""
+        for key in ("runs", "controls", "mutants"):
+            for item in self.list(key):
+                if self.ok(key, item) and item.pop("detail", ""):
+                    self.count("details")
+        yield
+        while len(self.artifacts) > self.keep:
+            self.drop_artifact(len(self.artifacts) - 1)
+            yield
+        for key in ("mutants", "controls", "runs", "unmutated", "settings"):
+            while self.drop_last(key, only_ok=True):
+                yield
+        self.shorten(60)
+        yield
+        while self.artifacts and not self.protected(self.artifacts[-1]):
+            self.drop_artifact(len(self.artifacts) - 1)
+            yield
+        while len(self.not_run) > (2 if self.more else 1):
+            self.drop_not_run()
+            yield
+        for key in ("failing", "uncovered", "mutants", "controls", "runs", "settings", "limits"):
+            while self.drop_last(key, only_ok=False):
+                yield
+
+
+def fit_record(record: dict) -> None:
+    """Shrinks a record's tool facts (`tla`), not-run entries and tool artifacts until it fits the schema's
+    lengths and the record size limit.
+
+    It drops, in order: the details of passing runs and caught mutants; tool artifacts that belong to no
+    failure, last first; caught mutants, passing controls and runs, exempted names and mutants' settings, last first. Then it cuts the
+    remaining details and reasons, and last drops the artifacts of failures, not-run entries and the
+    failures themselves, last first. The command log and tla/summary.json always stay. `tla.truncated`
+    says that something was dropped or cut, `tla.dropped` counts it by list, with failures counted apart,
+    and the last not-run entry counts the dropped ones. The runner's summary.json keeps the full facts."""
+    fitter = _Fitter(record)
+    fitter.schema_limits()
+    steps = fitter.steps()
+    while len(evidence.dumps(record).encode("utf-8")) > evidence.MAX_RECORD_BYTES:
+        if next(steps, "done") == "done":
+            return
+
+
+def ensure_valid(record: dict) -> None:
+    """Fits the record. Tool facts that the schema still refuses are dropped, and a result that rested on
+    them becomes `error`, so a check that ran always leaves a record. Its not-run entries and artifacts stay,
+    as far as they fit."""
+    given = copy.deepcopy(record)
+    try:
+        fit_record(record)
+        errors = evidence.validate(record)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:  # facts of the wrong shape
+        errors = [f"{type(exc).__name__}: {exc}"]
+    if not errors or "tla" not in record:
+        return
+    record.update(given)
+    del record["tla"]
+    record["mode"] = None
+    reason = f"the tool's facts do not fit the record and were dropped (truncated): {errors[0]}"
+    record["assertions"]["not_run"].insert(0, {"id": "record", "reason": reason})
+    if record["result"] != "fail":
+        record["result"] = "error"
+    fit_record(record)
 
 
 # --------------------------------------------------------------------------------------------
@@ -491,16 +689,16 @@ def execute(check: Check, *, evidence_dir: Path | None, log_dir: Path, request_i
         result, parsed = classify(check.result_parser, output, code, timed_out, check.not_run_marker)
         s3_requests = evidence.parse_s3_requests(output)
         artifacts.append({"name": log_path.name, "sha256": evidence.sha256_file(log_path)})
-        artifacts.extend(a for a in parsed.extra.get("artifacts", [])[:40] if isinstance(a, dict))
+        artifacts.extend(a for a in parsed.extra.get("artifacts", []) if isinstance(a, dict))
     tla = parsed.extra.get("tla") if not missing else None
     record = evidence.new_record(
         check.id, check.kinds, result=result, executed=parsed.executed, failed=parsed.failed,
-        not_run=parsed.not_run[:200], guarantees=check.guarantees, scenarios=check.scenarios,
+        not_run=parsed.not_run, guarantees=check.guarantees, scenarios=check.scenarios,
         duration_s=time.monotonic() - start, run=run, artifacts=artifacts, repo=repo,
         s3_requests=s3_requests, tla=tla,
         mode={"tla": tla["mode"]} if isinstance(tla, dict) and isinstance(tla.get("mode"), str) else None,
     )
-    fit_record(record)
+    ensure_valid(record)
     path = evidence.write(record, evidence_dir)
     return record, path
 

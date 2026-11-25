@@ -58,8 +58,7 @@ pub(crate) async fn run(
     let table = create_table(cluster, &history).await?;
     let table_id = Uuid::parse_str(&table).map_err(|error| format!("table UUID: {error}"))?;
     cluster.watch_table(table_id);
-    for node in WORKERS {
-        let stats = cluster.stats(node).await?;
+    for (node, stats) in crate::workload::steady(cluster).await? {
         cluster
             .checks
             .capture_resources(&cluster.world, node, &stats);
@@ -395,11 +394,7 @@ pub(crate) async fn run(
         cluster.checks.violate(
             &cluster.world,
             "ResourceBaseline",
-            if node == 0 {
-                row
-            } else {
-                format!("n{node} keeps reservations in an added pool after quiescence: {row}")
-            },
+            format!("n{node} keeps reservations in an added pool after quiescence: {row}"),
         );
     }
     // Last: a quarantined group stays quarantined, and its leader keeps a replication batch
@@ -618,19 +613,14 @@ async fn create_table(cluster: &Cluster, history: &Arc<Mutex<History>>) -> Resul
     }
 }
 
-/// Clean passes in a row that settle the gauges, a step apart (review 115, M11: one clean sample
-/// of two seconds hid a charge that was held most of the time).
-const CLEAN_PASSES: u32 = 3;
-
-/// Wait until transient resource gauges return to their baseline and stay there, or 2 s. The
-/// pools a move mounted have no row in the baseline, so they are split off: they must reserve
-/// nothing.
+/// Wait for every worker's resources to stay at their baseline (three clean observations in a
+/// row, as `Invariants::resources_at_baseline` counts them), or 2 s. The pools a move mounted
+/// have no row in the baseline, so they are split off: they must reserve nothing.
 async fn settle(
     cluster: &Cluster,
     extra: &[ExtraPool],
 ) -> Result<(Vec<(u64, Value)>, Option<(u64, String)>), String> {
     let deadline = cluster.world.elapsed() + Duration::from_secs(2);
-    let mut passes = 0;
     loop {
         let mut clean = true;
         let mut snapshots = Vec::new();
@@ -651,22 +641,11 @@ async fn settle(
             clean &= cluster.checks.resources_at_baseline(node, &stats);
             snapshots.push((node, stats));
         }
-        passes = passes_after(passes, clean && leftover.is_none());
-        if passes == CLEAN_PASSES {
-            return Ok((snapshots, leftover));
-        }
-        if cluster.world.elapsed() >= deadline {
-            if clean && leftover.is_none() {
-                leftover = Some((0, "no three clean passes in a row in 2 s".into()));
-            }
+        if clean && leftover.is_none() || cluster.world.elapsed() >= deadline {
             return Ok((snapshots, leftover));
         }
         time::sleep(STEP).await;
     }
-}
-
-fn passes_after(passes: u32, clean: bool) -> u32 {
-    if clean { passes + 1 } else { 0 }
 }
 
 /// The node and device of a pool that a replica move mounted.
@@ -725,19 +704,5 @@ mod tests {
         );
         let read = attempt(false, true, (1_100, 1_200), Answer::Ok);
         assert_eq!(work(&[write((1_100, 1_200)), read]), (1, 1));
-    }
-
-    #[test]
-    fn a_dirty_pass_starts_the_clean_passes_again() {
-        let passes = [true, true, false, true, true, true];
-        let mut run = 0;
-        let settled: Vec<bool> = passes
-            .into_iter()
-            .map(|clean| {
-                run = passes_after(run, clean);
-                run == CLEAN_PASSES
-            })
-            .collect();
-        assert_eq!(settled, [false, false, false, false, false, true]);
     }
 }

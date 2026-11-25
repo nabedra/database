@@ -111,6 +111,8 @@ impl ParticipantMachine {
                     let config: Config =
                         serde_json::from_slice(&raw).map_err(|_| recovery_unknown())?;
                     lineage::validate_read(&config, request.read_ts)?;
+                    #[cfg(feature = "sim")]
+                    super::snapshot_probe(&group, request.read_ts);
                     if let (
                         GroupKind::Data { table_id, .. },
                         ScanDomain::Rows { table_id: target }

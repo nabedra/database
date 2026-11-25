@@ -9,8 +9,8 @@ def usage(node, now, before, threads=0):
     def shown(size, threads):
         return (f"ResourceUsage {{ working_decode_bytes: {size}, native_threads: {threads}, "
                 "direct_in_flight: 0, disk: {} }")
-    return (f"t=9ms ResourceBaseline: n{node} has {shown(now, threads)} after quiescence, "
-            f"baseline {shown(before, 0)}")
+    return (f"t=9ms ResourceBaseline: n{node} did not stay at its baseline after quiescence: clean in its last 0 "
+            f"of 3 observations, last off by {shown(now, threads)} (baseline {shown(before, 0)})")
 
 
 def diagnosis(kinds, *lines, active_move_at="control/machine.rs:320"):

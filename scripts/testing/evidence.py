@@ -156,6 +156,48 @@ def validate(record: dict, schema: dict | None = None) -> list[str]:
     return errors
 
 
+def tla_contradictions(tla: Any) -> list[str]:
+    """Why a kind T record's facts do not support a `pass`. Empty when nothing contradicts it.
+
+    The runners derive their verdict from these facts, so a disagreement means one of the two is wrong."""
+    if not isinstance(tla, dict):
+        return ["no tla facts"]
+    out = []
+    if tla.get("mode") not in ("exhaustive", "simulation", "trace"):
+        out.append(f"unknown mode {tla.get('mode')!r}")
+
+    def entries(value: Any) -> list[dict]:
+        return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+    dropped = tla.get("dropped") if isinstance(tla.get("dropped"), dict) else {}
+    if tla.get("mode") == "exhaustive" and not entries(tla.get("runs")) and not dropped.get("runs"):
+        out.append("no run")
+    for run in entries(tla.get("runs")):
+        if run.get("verdict") != "pass":
+            out.append(f"run {run.get('cfg')} is {run.get('verdict')}")
+        elif tla.get("mode") == "exhaustive" and run.get("states_left") != 0:
+            out.append(f"run {run.get('cfg')} left {run.get('states_left')} states")
+    for run in entries(tla.get("controls")):
+        if run.get("verdict") != "pass" or run.get("states_left") != 0:
+            out.append(f"control {run.get('cfg')} is {run.get('verdict')} with {run.get('states_left')} states left")
+    out.extend(f"mutant {m.get('name')} failed" for m in entries(tla.get("mutants")) if m.get("ok") is not True)
+    if tla.get("uncovered"):
+        out.append("uncovered actions")
+    traces = tla.get("traces") if isinstance(tla.get("traces"), dict) else {}
+    if traces.get("failing"):
+        out.append("failing traces")
+    if tla.get("mode") == "trace":
+        counts = [traces.get(k) for k in ("checked", "accepted", "rejected", "expected_rejections")]
+        if not all(isinstance(n, int) for n in counts):
+            out.append("no trace counts")
+        elif counts[1] < 1 or counts[2] != counts[3] or counts[0] != counts[1] + counts[2]:
+            out.append("trace counts of no pass: " + ", ".join(map(str, counts)))
+    for key in ("failing_runs", "failing_controls", "failing_mutants", "failing_traces", "uncovered"):
+        if dropped.get(key):
+            out.append(f"{dropped[key]} dropped {key.replace('_', ' ')}")
+    return out
+
+
 def dumps(record: dict) -> str:
     return json.dumps(record, indent=2, sort_keys=True) + "\n"
 

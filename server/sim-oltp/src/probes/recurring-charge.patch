@@ -1,0 +1,46 @@
+diff --git a/server/oltp-storage/src/oltp/mvcc/store.rs b/server/oltp-storage/src/oltp/mvcc/store.rs
+index 84ec8f87..7c176175 100644
+--- a/server/oltp-storage/src/oltp/mvcc/store.rs
++++ b/server/oltp-storage/src/oltp/mvcc/store.rs
+@@ -408,6 +408,9 @@ impl ParticipantMachine {
+         // The entry applied (or was rejected) durably: its pending entry, if
+         // this node proposed it, leaves the range clock.
+         self.clock.observe_applied(position);
++        if !direct.is_empty() {
++            planted_charge(self.store.resources());
++        }
+         for commit_ts in direct {
+             self.clock.settle(commit_ts);
+         }
+@@ -530,6 +533,31 @@ impl ParticipantMachine {
+     }
+ }
+ 
++/// Planted defect: from its first direct entry on, the worker holds a charge for 50 of every
++/// 51 ms.
++fn planted_charge(resources: &Arc<crate::oltp::pool::WorkerSharedResources>) {
++    use crate::oltp::pool::{ByteClass, WorkerSharedResources};
++    use std::sync::{Mutex, Weak};
++    static PLANTED: Mutex<Vec<Weak<WorkerSharedResources>>> = Mutex::new(Vec::new());
++    let worker = Arc::downgrade(resources);
++    let mut planted = PLANTED.lock().expect("planted charges");
++    if planted.iter().any(|of| of.ptr_eq(&worker)) {
++        return;
++    }
++    planted.push(worker.clone());
++    nabedra_rt::task::spawn(async move {
++        while let Some(resources) = worker.upgrade() {
++            let Ok(charge) = resources.allocate_bytes(ByteClass::Progress, 564) else {
++                return;
++            };
++            drop(resources);
++            nabedra_rt::time::sleep(std::time::Duration::from_millis(50)).await;
++            drop(charge);
++            nabedra_rt::time::sleep(std::time::Duration::from_millis(1)).await;
++        }
++    });
++}
++
+ fn apply(
+     tx: &mut GroupTransaction<'_>,
+     group: &GroupIdentity,

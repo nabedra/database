@@ -594,6 +594,8 @@ pub(super) fn apply(
         Checked::Write { dedup, .. } => {
             let mut highs = Highs::load(tx)?;
             write(tx, command, &dedup, &mut highs)?;
+            #[cfg(feature = "sim")]
+            nabedra_oltp_types::sim_probe::emit(|| dedup_probe(group, command));
             highs.flush(tx)?;
             reply(
                 tx,
@@ -648,6 +650,8 @@ pub(super) fn apply_batch(
                     unreachable!("loaded above");
                 };
                 write(tx, member, &dedup, highs)?;
+                #[cfg(feature = "sim")]
+                nabedra_oltp_types::sim_probe::emit(|| dedup_probe(group, member));
                 used = used.checked_add(estimate).ok_or_else(invalid)?;
                 DirectMemberReply::Applied {
                     commit_ts: member.commit_ts,
@@ -821,6 +825,26 @@ fn write(
     )?;
     highs.commit(command.commit_ts);
     Ok(())
+}
+
+/// The probe for the dedup record `write` just put for `command` (simulation only).
+#[cfg(feature = "sim")]
+fn dedup_probe(
+    group: &GroupIdentity,
+    command: &DirectCommit,
+) -> nabedra_oltp_types::sim_probe::Probe {
+    let anchor = match command.dedup_key() {
+        Some(MvccKey::DirectDedup { anchor, .. }) => anchor,
+        _ => Key::Utf8(String::new()),
+    };
+    nabedra_oltp_types::sim_probe::Probe::DedupApplied {
+        group: group.group_id,
+        table: command.table_id,
+        anchor,
+        request_id: command.request_id,
+        commit_ts: command.commit_ts.get(),
+        digest: command.digest,
+    }
 }
 
 /// `tag || logical key`.

@@ -1,0 +1,16 @@
+id = "oltp-probes-unchanged"
+module = "oltp"
+kinds = ["U"]
+# P10-PROBES changed no source that a build without `sim` compiles: both revisions expand to the
+# same source, blank lines aside, for the four product crates and every product feature set. Line
+# numbers are aligned by padding the base, not ignored. Both revisions are pinned, so the result
+# stays reproducible. oltp-probes-machine-code compares the code.
+guarantees = []
+scenarios = []
+tiers = ["weekly"]
+command = ["python3", "scripts/testing/cfg_unchanged.py",
+           "--base", "169324944bb5fa32a6819742af63b688c6b8ffdd", "--head", "d6e5718b5b755616394e1ebea492691e8d63e6f3"]
+cwd = "."
+timeout_s = 5400
+needs = []
+result_parser = "exit-code"

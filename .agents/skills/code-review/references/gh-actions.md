@@ -19,16 +19,21 @@ that matter are elsewhere:
 
 ## What starts a run
 
-Start Actions workflows manually. Use `nabedra-build.yml` for development checks and
-for broad verification on the resulting `main` SHA after a batch of PRs merges.
-Each dispatch is pinned to a commit and has its own concurrency group.
+All three workflows use `workflow_dispatch` exclusively. Pushes, pull requests,
+and schedules trigger no runs.
 
-Start `nabedra-nightly.yml` manually to dispatch the T2, fuzz, feature, and
-quarantine preset on `main`. Start `nabedra-evidence.yml` manually with the completed
-build run ID to ingest evidence.
+| Workflow | When to dispatch it |
+| --- | --- |
+| [`nabedra-build.yml`](../../../../.github/workflows/nabedra-build.yml) | Run focused checks during development or broad verification on the resulting `main` SHA after a batch of PRs merges. Each dispatch tests a pinned commit and has its own concurrency group. |
+| [`nabedra-nightly.yml`](../../../../.github/workflows/nabedra-nightly.yml) | Run the long preset on demand. It reads the current `main` SHA and dispatches `nabedra-build.yml` with selected T2 checks, `base=false`, `jobs=fuzz,features,quarantine`, and `fuzz_seconds=3600`. |
+| [`nabedra-evidence.yml`](../../../../.github/workflows/nabedra-evidence.yml) | Ingest evidence on `main` after a build run completes. Supply the build run ID as `run_id`. |
 
-Use `python3 scripts/testing/matrix.py select --base <sha> --head <sha>` for the diff
-report. Dispatch relevant checks with `base=false` for focused feedback.
+For a code change, use `python3 scripts/testing/matrix.py select --base <sha> --head <sha>`
+to select checks from the diff. Dispatch relevant checks with `base=false` for focused
+feedback. Run `scripts/testing/pr_lint.py` locally as described in the
+[review protocol](../SKILL.md#pull-request-body). For a docs-only change, review the diff,
+examples, and links locally and skip tests and Actions under the
+[docs-only merge rule](../../nabedra-change/SKILL.md).
 
 ## Rules when many agents share Actions
 
@@ -54,7 +59,7 @@ The workflow is `.github/workflows/nabedra-build.yml`. Its dispatch inputs:
 | `base` (default true) | kv (clippy, tests), features (O02, NS26, including the absence of `test-hooks`), Cache library tests, two shards of default-feature OLAP library, integration and streaming tests, `nabedra-check`, OLTP library and integration tests, Events tests, and runtime-seam Clippy. |
 | `jobs` | Comma-separated opt-in jobs: `direct` (D01-D12, ORM suites, library suite off, acceptance, one leg per mode; implies `rep1`, `growth`, `o02`), `acceptance` (Linux OLTP acceptance, default mode; implies `growth`, `o02`), `o02` (O01 and O02 with an OLAP server and the engine matrix, plus T02), `growth` (O16, O26 on the shared build; O21, O28 on one opt-level-1 build), `rep1` (REP1-REP5 process suites), `rep4-mixed` (mixed-version enrollment), `o22` (adds O22 to `scenarios`), `blackhole` (AZ1/AZ2 packet-drop failover), `migrate` (MIG1/MIG2 upgrade), `live3`, `live3-fixture`, `campaign`, `docker`, `memory`, `bench`, `perf`, `g7`, `gc1`, `perf1`, `snap1`, `engine-tests` (Cache and OLAP suites), `check-tests` (shared Rust crates), `features` (engine feature checks and S3 loopback), `clippy`, `quarantine`, `fuzz`, `mutants`. Unknown names fail the run, and the summary lists the resolved set. |
 | `checks` | Comma-separated IDs from `docs/testing/checks/*.toml` on the tested SHA. The `checks` job runs one matrix leg per ID and installs only the declared requirements. |
-| `fuzz_seconds` (default 300) | Seconds per target for `jobs=fuzz`. The nightly sets 3600. |
+| `fuzz_seconds` (default 300) | Seconds per target for `jobs=fuzz`. The on-demand nightly preset sets 3600. |
 | `scenarios` | Comma-separated OLTP acceptance scenarios (O01-O29) run on the shared build, one job per scenario and mode. |
 | `tests` | Space-separated full library test paths (`module::tests::name`) run on the shared build. |
 | `repeat` (default 1) | Runs of each `tests` entry. Use 20 or more for flake evidence. |
@@ -76,20 +81,20 @@ server or a client wheel, builds or installs it in its own command, for example 
 
 The job runs `run_check.py --strict`, so a check that reports `not-run`, for a missing need or zero
 executed assertions, fails its job, and the job summary prints the record's result and reasons. A
-green `Check <id>` job therefore means an executed pass. While the S3 repository variables are unset,
-the nightly leaves out checks that need `s3` instead of dispatching them to fail.
+green `Check <id>` job therefore means an executed pass.
 
-Each registered check uploads its `evidence/` directory and command logs as `evidence-<id>`. GitHub
-attests the JSON records on deliberate and nightly dispatches. The `checks` matrix takes up to
+Each registered check uploads its `evidence/` directory and command log as `evidence-<id>`. GitHub
+attests the JSON records produced by the build workflow. The `checks` matrix takes up to
 eight runners, or six with two reserved for the `fuzz` matrix.
 
-A check that declares `s3` uses GitHub OIDC only on deliberate or nightly dispatches. Configure
-`NABEDRA_TEST_S3_ROLE_ARN` and `NABEDRA_TEST_S3_BUCKET` as repository variables, with
-`NABEDRA_TEST_S3_REGION` if the bucket is outside `us-east-1`. Scope the role to the dedicated test
-bucket, and write under `runs/<request_id>/`. A missing role or bucket produces
-`not-run: s3-unconfigured`. The PR gate has no OIDC token or bucket credentials. In the role's
-trust policy, require `token.actions.githubusercontent.com:sub` to match this repository's branch
-refs (`repo:<owner>/<repo>:ref:refs/heads/*`), so a `pull_request` token cannot assume it.
+Dispatch checks that declare `s3` with `--ref main` so GitHub OIDC can assume the dedicated
+test bucket role. Use `NABEDRA_TEST_S3_ROLE_ARN` and `NABEDRA_TEST_S3_BUCKET` as repository
+variables, with `NABEDRA_TEST_S3_REGION` if the bucket is outside `us-east-1`. Each check writes
+under `runs/<request_id>/`. If either required variable is missing, an explicitly selected
+S3 check reports `not-run: s3-unconfigured` and fails its job. The on-demand nightly preset omits
+S3 checks when either variable is missing or the budget check fails. See the
+[S3 test bucket setup](../../../../scripts/testing/s3/README.md#one-time-setup) for the role and
+repository OIDC configuration.
 
 With `jobs=docker`, the Events image job also runs the kind Events suite after NS27 when
 `scripts/testing/kind/suite_events.py` exists. That step does not fail the job until it has been
@@ -97,19 +102,34 @@ verified on Actions.
 
 ## Dispatch, pinned to your commit
 
-```sh
-SHA=$(git rev-parse HEAD); BRANCH=$(git branch --show-current)
-git push origin "$BRANCH"                    # the commit must exist on GitHub
-RID="<task>-${SHA:0:7}-$(date +%H%M%S)"
+```bash
+SHA=$(git rev-parse HEAD)
+BRANCH=$(git branch --show-current)
+git push origin "$BRANCH"
+RID="focused-${SHA:0:7}-$(date +%H%M%S)"
 gh workflow run nabedra-build.yml --ref "$BRANCH" -f sha="$SHA" -f request_id="$RID" \
-  -f base=false -f scenarios=O26,O21         # or: -f jobs=direct,acceptance (base stays on)
+  -f base=false -f scenarios=O26,O21
 ```
 
 The code under test is `sha`. The job definitions come from the head of `--ref` at dispatch time.
 So a commit that changes the workflow must be the branch head when you dispatch it. Later pushes
 to the branch change neither. A typical iteration is `-f base=false -f tests="<path>" -f repeat=5`
-or `-f base=false -f scenarios=O07`. Run the required verification on the final commit. For a change that needs the full OLTP
-acceptance suite, use `-f jobs=direct,acceptance`.
+or `-f base=false -f checks=specs-selftest`. Run the required verification on the final commit.
+For a change that needs the full OLTP acceptance suite, use `-f jobs=direct,acceptance`.
+
+After a batch of PRs merges, fetch `main` and dispatch broad verification with the base jobs
+and any relevant opt-ins:
+
+```bash
+git fetch origin main
+SHA=$(git rev-parse origin/main)
+RID="verify-${SHA:0:7}-$(date +%H%M%S)"
+gh workflow run nabedra-build.yml --ref main -f sha="$SHA" -f request_id="$RID"
+```
+
+For the long preset, use `gh workflow run nabedra-nightly.yml --ref main`. The preset's
+summary shows the pinned SHA and request ID of the build it dispatched. Use that request ID
+and `BRANCH=main` to find and inspect the build run.
 
 ## Find your run
 
@@ -182,6 +202,11 @@ Quarantined (not counted): <ids and their counts from the quarantine job>
 A scenario or test counts as passing only when its assertions executed on the recorded revision
 (see [the scheduler test contract](../../../../docs/testing/scheduler-contract.md)). Keep `not-run`
 and quarantined items in their own lines. If a job went green on a rerun, record both attempts.
+
+To ingest attested records from a completed build, dispatch
+`gh workflow run nabedra-evidence.yml --ref main -f run_id="$RUN"`. The workflow verifies the
+records against the tested revision and build run. If there are new records, it opens an
+evidence PR with the regenerated coverage matrix. See [Attestation](evidence.md#attestation).
 
 ## Quarantine
 

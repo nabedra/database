@@ -9,7 +9,7 @@ publish = ["crates-io"]
 description = "Nabedra OLTP storage"
 
 [features]
-sim = ["nabedra-rt/sim", "nabedra-kv/sim", "dep:nabedra-sim"]
+sim = ["nabedra-rt/sim", "nabedra-kv/sim", "dep:nabedra-sim", "nabedra-oltp-types/sim"]
 test-hooks = ["nabedra-resources/test-defaults", "nabedra-resources/test-hooks"]
 
 [dependencies]

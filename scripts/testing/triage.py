@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Triage a check failure against 14 days of main-branch evidence."""
+"""Triage a check failure against 14 days of main-branch evidence.
+
+A check that is kind T is always blocked, and its command never reruns: model checking is deterministic, so
+a retry proves nothing. The kinds in docs/testing/checks/<check>.toml, or in the evidence records of a check
+that is not registered, count whatever --kind says.
+"""
 
 import argparse
 from dataclasses import asdict, dataclass
@@ -11,8 +16,10 @@ import re
 import signal
 import subprocess
 import sys
+import tomllib
 
 
+CHECKS_DIR = Path(__file__).resolve().parents[2] / "docs" / "testing" / "checks"
 MAX_RETRIES = 10
 TOLERANCE = Fraction(1, 100)
 KINDS = set("MUSHFDRPKT")
@@ -90,13 +97,36 @@ def baseline(directory, check, today):
     return passes, runs
 
 
-def triage(kind, returncode, log, get_baseline, rerun):
+def known_kinds(check, evidence):
+    """The kinds of the registered check, else of its evidence records, as a set of letters. None when the
+    check is not registered and has no record."""
+    path = CHECKS_DIR / f"{check}.toml"
+    if path.parent == CHECKS_DIR and path.exists():
+        declared = tomllib.loads(path.read_text(encoding="utf-8")).get("kinds")
+        if not isinstance(declared, list) or not all(isinstance(k, str) for k in declared):
+            raise ValueError(f"{path}: kinds is not a list of strings")
+        return set(declared)
+    kinds, found = set(), False
+    for record_path in sorted(evidence.rglob("*.json")):
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        if isinstance(record, dict) and record.get("check") == check:
+            found = True
+            kinds.update(str(record.get("kind", "")).split())
+    return kinds if found else None
+
+
+def triage(kind, returncode, log, get_baseline, rerun, known=()):
+    # Before the exit status: run_check.py exits 0 on a not-run, which is no pass.
+    if known is None:
+        return Decision(True, "unknown check: it is not registered and has no evidence record")
+    if "T" in kind.split() or "T" in known:
+        return Decision(True, "kind T is never retried or unblocked: read the check's evidence record")
     if crash := crash_signature(returncode, log):
         return Decision(True, f"initial crash ({crash})")
     if returncode == 0:
         return Decision(False, "initial check passed")
     kinds = set(kind.split())
-    if "R" not in kinds or kinds.intersection({"S", "M", "H", "T"}):
+    if "R" not in kinds or kinds.intersection({"S", "M", "H"}):
         return Decision(True, f"kind {kind} is ineligible for retries")
 
     main_passed, main_runs = get_baseline()
@@ -122,7 +152,7 @@ def main(argv=None):
         epilog="Records are dated by run.date, finished_at or started_at, else file mtime. "
                "Only pass/fail records and fresh retries count.",
     )
-    parser.add_argument("--kind", required=True, help="check kind or space-separated kinds (only R retries)")
+    parser.add_argument("--kind", required=True, help="check kind or space-separated kinds (only R retries, and never a registered T check)")
     parser.add_argument("--check", required=True, help="check ID in the evidence records")
     parser.add_argument("--evidence", type=Path, required=True, help="directory of main-branch JSON evidence")
     parser.add_argument("--log", type=Path, required=True, help="log of the initial run")
@@ -148,7 +178,8 @@ def main(argv=None):
         log = args.log.read_text(encoding="utf-8", errors="replace")
         today = datetime.now(timezone.utc).date()
         decision = triage(args.kind, args.exit_code, log,
-                          lambda: baseline(args.evidence, args.check, today), rerun)
+                          lambda: baseline(args.evidence, args.check, today), rerun,
+                          known_kinds(args.check, args.evidence))
     except (OSError, ValueError) as error:
         print(f"triage: {error}", file=sys.stderr)
         return 2

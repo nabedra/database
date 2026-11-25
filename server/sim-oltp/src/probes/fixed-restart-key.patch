@@ -1,0 +1,16 @@
+diff --git a/server/oltp-replication/src/oltp_replication/manager/local/registered/restart.rs b/server/oltp-replication/src/oltp_replication/manager/local/registered/restart.rs
+index de0b4bc4..13413089 100644
+--- a/server/oltp-replication/src/oltp_replication/manager/local/registered/restart.rs
++++ b/server/oltp-replication/src/oltp_replication/manager/local/registered/restart.rs
+@@ -55,7 +55,10 @@ impl RestartMount {
+             Ok(seed) => seed,
+             Err(error) if error.kind() == std::io::ErrorKind::NotFound && !require_existing => {
+                 let mut seed = vec![0u8; 32];
+-                SystemRandom::new().fill(&mut seed).map_err(|_| invalid())?;
++                // A fixed key, to show that only this key differs between runs of a seed.
++                for (byte, value) in seed.iter_mut().zip(1..) {
++                    *byte = value;
++                }
+                 let temporary = owner
+                     .path
+                     .join(format!("restart-key-{}.next", nabedra_rt::ids::uuid_v4()));
