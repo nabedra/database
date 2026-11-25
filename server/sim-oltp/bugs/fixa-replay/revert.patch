@@ -1,8 +1,8 @@
 diff --git a/server/src/oltp_runtime/direct/executor.rs b/server/src/oltp_runtime/direct/executor.rs
-index bffc6ea..2365b9e 100644
+index ff07d29b..43587798 100644
 --- a/server/src/oltp_runtime/direct/executor.rs
 +++ b/server/src/oltp_runtime/direct/executor.rs
-@@ -1107,46 +1107,15 @@ impl DirectExecutor {
+@@ -1114,46 +1114,15 @@ impl DirectExecutor {
                      DirectData::from_json(result.as_str()).map_err(failed)?,
                  )));
              }

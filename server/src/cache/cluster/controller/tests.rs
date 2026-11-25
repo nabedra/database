@@ -910,6 +910,158 @@ fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
     assert_eq!(state.topology.slots[0], next);
 }
 
+/// A slot staging a copy on a target whose older copy was discarded, the
+/// revision before that transfer, and the copy the target once reported.
+fn staging_fixture() -> (State, WorkerId, WorkerId, u64, Progress) {
+    let mut state = fixture();
+    let source = state.topology.slots[0].primary.unwrap();
+    state.topology.slots[0].replica = None;
+    let target = make_member(4, 1).id;
+    let copy = Progress {
+        slot: 0,
+        epoch: 1,
+        sequence: 100,
+        baseline: true,
+        serving_primary: true,
+        frozen: None,
+    };
+    let mut observations = Observations::default();
+    renew(&mut state, source, 4_000);
+    report(&mut observations, &state, source, 1_000, Some(copy));
+    report(&mut observations, &state, target, 1_000, None);
+    let before = state.topology.revision;
+    let changes = observations.plan(&state, bounds(1_000));
+    assert!(state.reconcile(1_000, changes));
+    let moving = state.topology.slots[0].moving.unwrap();
+    assert!(moving.replica_only && moving.target == target);
+    assert!(state.topology.revision > before);
+    let copy = Progress {
+        serving_primary: false,
+        ..copy
+    };
+    (state, source, target, before, copy)
+}
+
+fn report_at(
+    obs: &mut Observations,
+    state: &State,
+    worker: WorkerId,
+    revision: u64,
+    ms: u64,
+    progress: Progress,
+) {
+    obs.record(
+        &state.topology,
+        Heartbeat {
+            worker,
+            version: VERSION,
+            generation: state.topology.generation,
+            revision,
+            progress: vec![progress],
+        },
+        ms,
+    );
+}
+
+/// The planner itself ignores a staged copy reported outside this transfer.
+/// Apply repeats the check, so only the planned changes show it.
+#[test]
+fn k03_staged_promotion_planner_requires_a_report_from_this_transfer() {
+    use super::placement::Change;
+
+    let (state, _, target, before, copy) = staging_fixture();
+    let current = state.topology.revision;
+    for (revision, eligible) in [(before, false), (current + 1, false), (current, true)] {
+        let mut observations = Observations::default();
+        report_at(&mut observations, &state, target, revision, 4_000, copy);
+        let planned = observations
+            .plan(&state, bounds(4_000))
+            .iter()
+            .any(|change| {
+                matches!(
+                    change,
+                    Change::Slot {
+                        index: 0,
+                        staged: Some(_),
+                        ..
+                    }
+                )
+            });
+        assert_eq!(
+            planned, eligible,
+            "revision {revision}, staging from {current}"
+        );
+    }
+}
+
+/// Completing a staged replica has no revision check at apply, so the planner
+/// alone keeps a discarded copy from becoming the assigned replica.
+#[test]
+fn k03_staged_completion_requires_a_report_from_this_transfer() {
+    let (state, source, target, before, copy) = staging_fixture();
+    let current = state.topology.revision;
+    let source_copy = Progress {
+        serving_primary: true,
+        ..copy
+    };
+    for (revision, eligible) in [(before, false), (current + 1, false), (current, true)] {
+        let mut state = state.clone();
+        let staged = state.topology.slots[0];
+        let mut observations = Observations::default();
+        report(&mut observations, &state, source, 1_500, Some(source_copy));
+        report_at(&mut observations, &state, target, revision, 1_500, copy);
+        let changes = observations.plan(&state, bounds(1_500));
+        state.reconcile(1_500, changes);
+        let slot = state.topology.slots[0];
+        if eligible {
+            assert_eq!((slot.replica, slot.moving), (Some(target), None));
+            assert_eq!((slot.primary, slot.epoch), (Some(source), 1));
+        } else {
+            assert_eq!(slot, staged, "revision {revision}, staging from {current}");
+        }
+    }
+}
+
+/// Known to fail. A heartbeat carries no order, so a late older one replaces
+/// the source's newer report, and a copy far beyond the lag bound completes.
+#[test]
+#[ignore = "open bug 2026-11-24-cache-older-source-heartbeat"]
+fn k03_older_source_heartbeat_does_not_complete_a_lagging_copy() {
+    let (mut state, source, target, _, copy) = staging_fixture();
+    let staged = state.topology.slots[0];
+    let mut observations = Observations::default();
+    let source_at = |sequence| Progress {
+        sequence,
+        serving_primary: true,
+        ..copy
+    };
+    report(
+        &mut observations,
+        &state,
+        source,
+        1_500,
+        Some(source_at(1_000)),
+    );
+    report(&mut observations, &state, target, 1_500, Some(copy));
+    let changes = observations.plan(&state, bounds(1_500));
+    state.reconcile(1_500, changes);
+    assert_eq!(state.topology.slots[0], staged, "lag 900");
+
+    report(
+        &mut observations,
+        &state,
+        source,
+        1_501,
+        Some(source_at(copy.sequence)),
+    );
+    let changes = observations.plan(&state, bounds(1_501));
+    state.reconcile(1_501, changes);
+    assert_eq!(
+        state.topology.slots[0], staged,
+        "lag 900 hidden by an older source heartbeat"
+    );
+}
+
 /// The existing controller fixture and placement decisions, without the Raft transport.
 #[cfg(feature = "sim")]
 pub(in crate::cache::cluster) struct LeaseControllerFixture {

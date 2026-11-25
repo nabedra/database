@@ -5,9 +5,9 @@ kinds = ["U"]
 # test fail with the expected text, and the test passes without it. The command builds the OLTP
 # library tests once clean and once per patch in server/target/sim-bugs.
 # acc3-cold-fence is left out: its only regression, the O15 acceptance scenario, caught the patch
-# in 1 of 5 patched runs (runs 45148928008 and 45150522656), so it cannot gate. Finding that timing
-# window is the seed search's job (oltp-sim-bugs-direct). `sim_bugs.py verify acc3-cold-fence`
-# still runs it by hand.
+# in 1 of at most 5 patched runs (runs 45148928008 and 45150522656), and none since the crate
+# split, so it cannot gate. It has its own check, oltp-sim-bugs-regression-acc3. Until a test fails
+# because of that patch, a simulator hit on it does not count (lead decision 8).
 guarantees = []
 scenarios = []
 tiers = ["T3"]
