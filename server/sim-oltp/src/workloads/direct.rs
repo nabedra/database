@@ -179,16 +179,22 @@ pub(crate) async fn run(
     cluster.checks.recovered(&cluster.world, "convergence");
     // The final operations may wait for a running move, within the move's own bound (lead
     // decision 12.3). A move that does not finish is reported by its own rule, below.
-    let mut moved = None;
+    // A pending split is tried meanwhile, and its bound runs from here, not from the end of
+    // the wait.
+    let quiet_from = cluster.world.elapsed();
     let mut move_wait_ms = 0;
     if let Some(moving) = moving.as_mut().filter(|moving| moving.running()) {
-        let from = elapsed_ms(&cluster.world);
-        let finished = moving.finish(cluster, &ctx, healed).await;
-        move_wait_ms = elapsed_ms(&cluster.world) - from;
+        while moving.waiting(cluster, healed) {
+            moving.retry(cluster, &ctx, healed).await;
+            if let Some(chaos) = chaos.as_mut() {
+                chaos.try_split(cluster, &ctx).await;
+            }
+        }
+        move_wait_ms = elapsed_ms(&cluster.world) - quiet_from.as_millis() as u64;
         cluster.record(format!(
-            "final operations waited {move_wait_ms}ms for the replica move: {finished:?}"
+            "final operations waited {move_wait_ms}ms for the replica move, still running {}",
+            moving.running()
         ));
-        moved = Some(finished);
     }
     let final_checks = clients::final_checks(&ctx).await;
     report.assertions.push((
@@ -202,17 +208,14 @@ pub(crate) async fn run(
     }
     let mut reread = false;
     if let Some(chaos) = chaos.as_mut().filter(|chaos| chaos.split_pending()) {
-        chaos.finish_split(cluster, &ctx).await;
+        chaos.finish_split(cluster, &ctx, quiet_from).await;
         reread = true;
     }
     if let Some(chaos) = chaos.as_ref() {
         chaos.check_abandoned(cluster, &ctx).await;
     }
     if let Some(moving) = moving.as_mut() {
-        let moved = match moved.take() {
-            Some(moved) => moved,
-            None => moving.finish(cluster, &ctx, healed).await,
-        };
+        let moved = moving.finish(cluster, &ctx, healed).await;
         report
             .assertions
             .push(("replica move retired", moved.is_ok()));

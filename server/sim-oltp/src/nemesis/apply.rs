@@ -175,7 +175,7 @@ impl Chaos {
     }
 
     /// One attempt at the pending split. The attempts interleave with the other faults.
-    async fn try_split(&mut self, cluster: &Cluster, ctx: &Ctx) -> bool {
+    pub(crate) async fn try_split(&mut self, cluster: &Cluster, ctx: &Ctx) -> bool {
         let Some(split) = self.split.as_mut() else {
             return true;
         };
@@ -942,8 +942,9 @@ impl Chaos {
     }
 
     /// After the heal: a split that did not publish under chaos must publish now (D07).
-    pub(crate) async fn finish_split(&mut self, cluster: &Cluster, ctx: &Ctx) {
-        let deadline = cluster.world.elapsed() + SPLIT_LIMIT;
+    /// The bound runs from `from`, so a wait for something else does not extend it.
+    pub(crate) async fn finish_split(&mut self, cluster: &Cluster, ctx: &Ctx, from: Duration) {
+        let deadline = from + SPLIT_LIMIT;
         while !self.try_split(cluster, ctx).await {
             if cluster.world.elapsed() >= deadline {
                 let last = self.split.as_ref().map(|split| split.last.clone());
