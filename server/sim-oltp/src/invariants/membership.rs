@@ -15,7 +15,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 /// The parts of the rules that public observations cannot reach, and why.
-pub(crate) const PROBE_FORMS: [(&str, &str); 4] = [
+pub(crate) const PROBE_FORMS: [(&str, &str); 5] = [
     (
         "WipedNeverVotes over VoteSaved",
         "needs the VoteSaved and Appended probes of #116; the swept form judges acknowledged writes",
@@ -23,6 +23,10 @@ pub(crate) const PROBE_FORMS: [(&str, &str); 4] = [
     (
         "MonotonicVote across a stale disk",
         "needs the VoteSaved probe of #116; the stale disk is an opt-in schedule",
+    ),
+    (
+        "CapabilityBeforeUse over public answers",
+        "no worker serves its stats before every voter runs, so no answer can show an early use (counted per seed as \"early capability answers\")",
     ),
     (
         "CapabilityBeforeUse over Applied",

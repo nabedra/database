@@ -303,6 +303,7 @@ fn replay_command(defect: Defect) -> String {
         "NABEDRA_SIM_PROFILE",
         "NABEDRA_SIM_BEYOND_TCP",
         crate::workloads::membership::STEPS_ENV,
+        crate::workloads::membership::DEFECT_ENV,
     ] {
         if let Some(value) = env(name) {
             prefix.push_str(&format!("{name}={value} "));

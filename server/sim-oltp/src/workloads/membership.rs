@@ -61,6 +61,35 @@ use crate::{
 /// Restricts the script to these steps, in this order, instead of drawing one.
 pub(crate) const STEPS_ENV: &str = "NABEDRA_SIM_MEMBERSHIP";
 
+/// A seeded defect in the harness's own run or observations, to show that a rule is wired to
+/// what the workload sees. Never set in a sweep.
+pub(crate) const DEFECT_ENV: &str = "NABEDRA_SIM_MEMBERSHIP_DEFECT";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Defect {
+    /// A rolling restart that stops every holder at once (`QueueHandoff`).
+    FullStop,
+    /// The published placement lacks one voter (`RequiredVoters`).
+    DropVoter,
+    /// The published placement lists a removed voter again (`RetryCertifiesNamedRemoval`).
+    OldVoter,
+    /// A retained worker is counted as wiped (`WipedNeverVotes`).
+    Miscounted,
+}
+
+impl Defect {
+    fn from_env() -> Option<Self> {
+        match std::env::var(DEFECT_ENV).ok().as_deref() {
+            None | Some("") => None,
+            Some("full-stop") => Some(Self::FullStop),
+            Some("drop-voter") => Some(Self::DropVoter),
+            Some("old-voter") => Some(Self::OldVoter),
+            Some("miscounted") => Some(Self::Miscounted),
+            Some(name) => panic!("unknown {DEFECT_ENV} {name:?}"),
+        }
+    }
+}
+
 const POLL: Duration = Duration::from_millis(250);
 /// An admin operation that may do work before it answers.
 const ADMIN_LIMIT: Duration = Duration::from_secs(15);
@@ -209,6 +238,7 @@ pub(crate) struct Membership {
     next_sample_ms: u64,
     next_key: i64,
     notes: BTreeMap<&'static str, u64>,
+    defect: Option<Defect>,
 }
 
 impl Membership {
@@ -235,6 +265,7 @@ impl Membership {
             next_sample_ms: 0,
             next_key: QUEUED_BASE,
             notes: BTreeMap::new(),
+            defect: Defect::from_env(),
         }
     }
 
@@ -478,10 +509,19 @@ impl Membership {
     /// The published voters of the table's range. An unavailable answer says nothing.
     async fn observe_placement(&mut self, cluster: &Cluster, ctx: &Ctx) -> Option<Value> {
         let (group, placement) = moves::placement(cluster, ctx).await.ok()?;
-        let members = placement["members"].as_array().cloned().unwrap_or_default();
+        let mut members = placement["members"].as_array().cloned().unwrap_or_default();
+        if self.defect == Some(Defect::DropVoter) {
+            members.pop();
+        }
         self.judge(cluster, "RequiredVoters", required_voters(3, &members));
         let group = group_id(&group);
-        let verdict = self.removal.published(group, &nodes(&members));
+        let mut published = nodes(&members);
+        if self.defect == Some(Defect::OldVoter) {
+            published.insert(1);
+            published.insert(2);
+            published.insert(3);
+        }
+        let verdict = self.removal.published(group, &published);
         self.judge(cluster, "RetryCertifiesNamedRemoval", verdict);
         // A published voter whose worker never lost its storage voted from it.
         for member in &members {
@@ -773,6 +813,18 @@ impl Membership {
         for index in order {
             let node = cluster.config.node(index);
             self.submit(cluster, ctx, 1 + g.below(3)).await;
+            if self.defect == Some(Defect::FullStop) {
+                cluster
+                    .cold_start_staggered(
+                        "seeded full stop",
+                        DiskCut::Kill,
+                        [Duration::ZERO; 3],
+                        COLD_LIMIT,
+                    )
+                    .await?;
+                let run = self.queue.run(cluster.config.run_id);
+                self.judge(cluster, "QueueHandoff", run);
+            }
             let outstanding = self.queue.outstanding();
             let stopped = elapsed_ms(&cluster.world);
             let how = if g.below(4) == 0 {
@@ -1461,6 +1513,12 @@ impl Membership {
             Started::Running => self.note("wiped worker running"),
             Started::Exited(_) => self.note("wiped worker refused"),
         }
+        if self.defect == Some(Defect::Miscounted) {
+            // Judge the two retained voters as if the survivor had been wiped too.
+            for other in cluster.config.nodes() {
+                *self.generations.entry(other).or_default() += 1;
+            }
+        }
         self.evidence(cluster, ctx, g, node).await;
         if cluster.world.is_up(node) {
             cluster.crash(node, DiskCut::Kill).await;
@@ -1740,6 +1798,23 @@ impl Membership {
                 .collect();
             faults.slow(Some((others, window(g, 5, 150))));
         }
+        // Before the pool holds anything: a request that names a voter that is no member must
+        // not move another one there.
+        let mut stranger = payload.clone();
+        stranger["remove_node"] = json!(700_000 + g.below(1_000));
+        let stranger_id = cluster.split_id().await;
+        let answer = cluster
+            .admin_answer(
+                owner,
+                stranger_id,
+                "storage.replica.move",
+                stranger.clone(),
+                ADMIN_LIMIT,
+            )
+            .await;
+        self.judge_move(cluster, ctx, stranger_id, &stranger, &answer)
+            .await;
+        cluster.record(format!("stranger before the move: {}", shown(&answer)));
         let moved = self.drive(cluster, ctx, g, owner, id, &payload).await;
         faults.slow(None);
         moved?;
