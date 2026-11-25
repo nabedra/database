@@ -1,0 +1,14 @@
+id = "oltp-sim-bugs-rehearsal-bug1-auth-1"
+module = "oltp"
+kinds = ["U"]
+# REHEARSAL of the shards on smoke with a planted harness defect, so that there are hits. No evidence for any bug.
+guarantees = []
+scenarios = []
+tiers = ["T3"]
+command = ["python3", "scripts/testing/sim_bugs.py", "shard", "bug1-auth", "--shard", "1/2", "--workload", "smoke", "--profile", "", "--expect", "non-linearizable", "--rehearse-defect", "lost-write", "--seeds", "40",
+           "--jobs", "4", "--sim-jobs", "4", "--time-limit", "9000", "--out", "target/testing-logs/oltp-sim-bugs-rehearsal-bug1-auth-1"]
+cwd = "."
+timeout_s = 9600
+needs = []
+result_parser = "exit-code"
+env = { RUSTFLAGS = "--cfg tokio_unstable", RUST_MIN_STACK = "16777216" }
