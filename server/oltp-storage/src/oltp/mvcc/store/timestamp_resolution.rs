@@ -325,7 +325,7 @@ pub(super) fn apply_resolution(
     completed.validate_for(locator)?;
     encoded_length(&completed, METADATA_BYTES).map_err(|_| recovery_unknown())?;
     if let Some(state) = &mut state {
-        resolve_writes(tx, state, txn, state.writes, decision)?;
+        resolve_writes(tx, config, position, state, txn, state.writes, decision)?;
         state.decision = Some(decision);
         state.resolved = state.writes;
         tx.put_serialized(&key, state)?;

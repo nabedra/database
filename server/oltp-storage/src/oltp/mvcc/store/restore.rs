@@ -140,17 +140,52 @@ pub async fn install_images(
                     }
                     tx.put_serialized(RESTORE_INACTIVE, &historical.restore_id)?;
                 }
+                let mut kept = Vec::with_capacity(images.len());
                 for owned in &images {
                     let image: &CommittedImage = owned.image()?;
-                    if image.commit_ts > historical.cut {
-                        continue;
+                    if image.commit_ts <= historical.cut {
+                        kept.push(image);
                     }
-                    install_image(tx, &group, &historical.span, image)?;
                 }
-                Ok(())
+                install_rows(tx, &group, &historical.span, historical.cut, &kept)
             },
         )
         .await
+}
+
+/// Installs images in (key, timestamp) order. A backup carries no embedding
+/// records, so a row whose newest version has a source text and no vector gets a
+/// new one. Its identity is above every timestamp of the restored history, so a
+/// report that was made for a record of the source matches nothing (DB-22).
+pub(super) fn install_rows(
+    tx: &mut GroupTransaction<'_>,
+    group: &GroupIdentity,
+    span: &KeySpan,
+    cut: CommitTs,
+    images: &[&CommittedImage],
+) -> Result<(), ProtocolError> {
+    let id = cut
+        .get()
+        .checked_add(1)
+        .and_then(|id| CommitTs::new(id).ok())
+        .ok_or_else(invalid)?;
+    for (offset, image) in images.iter().enumerate() {
+        install_image(tx, group, span, image)?;
+        // Only the newest image of the row in this batch decides.
+        if !matches!(image.key, MvccKey::Row { .. })
+            || images
+                .get(offset + 1)
+                .is_some_and(|next| next.key == image.key)
+        {
+            continue;
+        }
+        let logical = row::logical_key(&image.key)?;
+        let head = load::<Head>(tx, &row::tagged(HEAD, &logical, 0)?)?.unwrap_or_default();
+        if head.version.is_none_or(|version| version <= image.commit_ts) {
+            embed::derive(tx, &logical, image.search.as_deref(), id)?;
+        }
+    }
+    Ok(())
 }
 
 /// Write one committed image into a restore target, idempotently. Dedup
@@ -161,7 +196,7 @@ pub(super) fn install_image(
     span: &KeySpan,
     image: &CommittedImage,
 ) -> Result<(), ProtocolError> {
-    if !owns_image(group, span, &image.key) {
+    if !owns_image(group, span, &image.key) || !image.complete() {
         return Err(invalid());
     }
     if matches!(image.key, MvccKey::DirectDedup { .. }) {
@@ -183,20 +218,20 @@ pub(super) fn install_image(
             .as_ref()
             .map(|value| serde_json::from_str::<&RawValue>(value.as_str()).map_err(|_| invalid()))
             .transpose()?;
-        #[derive(Serialize, Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Version<'a> {
-            #[serde(borrow)]
-            value: Option<&'a RawValue>,
+        let version = row::imaged(raw, image.search.as_deref());
+        if let Some(search) = &image.search {
+            row::install_vectors(tx, &buffer[1..end], search)?;
         }
         if let Some(previous) = tx.pinned(buffer)? {
-            let previous: Version<'_> =
-                serde_json::from_slice(&previous).map_err(|_| recovery_unknown())?;
-            if previous.value.map(RawValue::get) != raw.map(RawValue::get) {
+            let previous = row::Version::decode(&previous)?;
+            if previous.value.map(RawValue::get) != raw.map(RawValue::get)
+                || previous.blobs != version.blobs
+                || previous.source != version.source
+            {
                 return Err(recovery_unknown());
             }
         } else {
-            tx.put_serialized(buffer, &Version { value: raw })?;
+            tx.put_serialized(buffer, &version)?;
         }
         if head
             .version

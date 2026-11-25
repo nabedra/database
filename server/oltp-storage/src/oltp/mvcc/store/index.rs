@@ -479,13 +479,8 @@ fn committed_index_record<T: serde::de::DeserializeOwned>(
         let version = head.version.ok_or_else(invalid)?;
         key[0] = VALUE;
         key[end..].copy_from_slice(&(!version.get()).to_be_bytes());
-        #[derive(Deserialize)]
-        struct Version<'a> {
-            #[serde(borrow)]
-            value: Option<&'a RawValue>,
-        }
         let raw = view.pinned(key)?.ok_or_else(invalid)?;
-        let row: Version<'_> = serde_json::from_slice(&raw).map_err(|_| recovery_unknown())?;
+        let row = row::Version::decode(&raw)?;
         let value = serde_json::from_str(row.value.ok_or_else(invalid)?.get())
             .map_err(|_| recovery_unknown())?;
         Ok((value, version))

@@ -270,11 +270,6 @@ impl ParticipantMachine {
                             buffer[0] = VALUE;
                             buffer[end..].copy_from_slice(&(!request.read_ts.get()).to_be_bytes());
                             let version = view.first_from(&buffer[..end], buffer)?;
-                            #[derive(Deserialize)]
-                            struct Version<'a> {
-                                #[serde(borrow)]
-                                value: Option<&'a RawValue>,
-                            }
                             let (stamp, value) = if let Some(version) = &version {
                                 if version.key().len() != buffer.len() {
                                     return Err(recovery_unknown());
@@ -285,8 +280,7 @@ impl ParticipantMachine {
                                         .map_err(|_| recovery_unknown())?,
                                 ))
                                 .map_err(|_| recovery_unknown())?;
-                                let decoded: Version<'_> = serde_json::from_slice(version.value())
-                                    .map_err(|_| recovery_unknown())?;
+                                let decoded = row::Version::decode(version.value())?;
                                 (Some(stamp), decoded.value)
                             } else {
                                 (None, None)

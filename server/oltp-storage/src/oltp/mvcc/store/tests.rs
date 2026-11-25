@@ -294,7 +294,7 @@ async fn o01_o22_m02_incremental_prepare_page_budget_retains_exact_limits() {
         let (change, value) = match &write.change {
             Change::Keep => (IntentChange::Keep, None),
             Change::Delete => (IntentChange::Delete, None),
-            Change::Put(value) => (
+            Change::Put(value) | Change::PutRow { value, .. } => (
                 IntentChange::Put,
                 Some(serde_json::from_str::<&RawValue>(value.as_str()).unwrap()),
             ),

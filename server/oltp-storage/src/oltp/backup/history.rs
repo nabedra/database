@@ -198,6 +198,9 @@ pub enum HistoryFrame {
         root: Digest,
     },
 }
+/// Metadata of a cloned image, its vector list and column maps included. The
+/// values themselves keep the owner of their frame.
+const IMAGE_CLONE_BYTES: usize = 8 << 10;
 pub struct OwnedImage {
     image: CommittedImage,
     _source: OwnedCommand<HistoryFrame>,
@@ -217,7 +220,7 @@ impl OwnedImage {
             image
                 .key
                 .heap_bytes()
-                .checked_add(1024)
+                .checked_add(IMAGE_CLONE_BYTES)
                 .ok_or_else(invalid)?,
         )?;
         let image = image.clone();
@@ -241,13 +244,14 @@ impl OwnedImage {
             effect
                 .key
                 .heap_bytes()
-                .checked_add(1024)
+                .checked_add(IMAGE_CLONE_BYTES)
                 .ok_or_else(invalid)?,
         )?;
         let image = CommittedImage {
             key: effect.key.clone(),
             commit_ts: page.commit_ts,
             value: effect.value.clone(),
+            search: effect.search.clone(),
         };
         Ok(Self {
             image,
@@ -325,13 +329,11 @@ impl OwnedPayload for HistoryFrame {
             Self::BeginGroup(group) => {
                 group.group.database.capacity_bytes() + span_bytes(&group.span)
             }
-            Self::Image(image) | Self::SplitImage(image) => {
-                image.key.heap_bytes()
-                    + image
-                        .value
-                        .as_ref()
-                        .map_or(Ok(0), CanonicalJson::heap_bytes)?
-            }
+            Self::Image(image) | Self::SplitImage(image) => image
+                .key
+                .heap_bytes()
+                .checked_add(image.value_bytes()?)
+                .ok_or_else(invalid)?,
             Self::CatalogIndexClosure(closure) => closure.source.database.capacity_bytes(),
             Self::CatalogSplitPublication(publication) => {
                 publication.catalog.group.database.capacity_bytes()
@@ -351,24 +353,14 @@ impl OwnedPayload for HistoryFrame {
     }
     fn attach_fields(&self, owner: Arc<ScratchLease>) -> Result<(), ProtocolError> {
         match self {
-            Self::Image(CommittedImage {
-                value: Some(value), ..
-            })
-            | Self::SplitImage(CommittedImage {
-                value: Some(value), ..
-            }) => value.attach_charge(owner),
+            Self::Image(image) | Self::SplitImage(image) => image.attach_charge(owner),
             Self::ParticipantEffects(effects) => effects.attach_fields(owner),
             _ => Ok(()),
         }
     }
     fn fields_attached(&self) -> bool {
         match self {
-            Self::Image(CommittedImage {
-                value: Some(value), ..
-            })
-            | Self::SplitImage(CommittedImage {
-                value: Some(value), ..
-            }) => value.is_charged(),
+            Self::Image(image) | Self::SplitImage(image) => image.is_charged(),
             Self::ParticipantEffects(effects) => effects.fields_attached(),
             _ => true,
         }

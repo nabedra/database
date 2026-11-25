@@ -20,6 +20,9 @@ pub struct ShardUsageScan {
     bytes: u64,
     row_bytes: u64,
     largest_image: usize,
+    /// The vectors of search columns, counted after the row versions: the
+    /// largest of each column, which bounds what one image adds.
+    vectors: Option<std::collections::BTreeMap<u16, usize>>,
     pivot: Pivot,
     _owner: ScratchLease,
 }
@@ -133,11 +136,53 @@ impl ParticipantMachine {
                         bytes: 0,
                         row_bytes: 0,
                         largest_image: 0,
+                        vectors: None,
                         pivot: Pivot::default(),
                         _owner: shared.reserve_scratch(ByteClass::Data, 6 * PIVOT_KEY_BYTES)?,
                     },
                 };
                 let before = scan.bytes;
+                if let Some(largest) = &mut scan.vectors {
+                    let bytes = &mut scan.bytes;
+                    let progress = view.scan_page_until(
+                        &[row::VECTOR],
+                        scan.after.as_ref().map(ChargedBytes::as_slice),
+                        ITEMS_PER_PAGE,
+                        |key, value| {
+                            let column = key
+                                .len()
+                                .checked_sub(10)
+                                .and_then(|at| key.get(at..at + 2))
+                                .ok_or_else(recovery_unknown)?;
+                            let column = u16::from_be_bytes([column[0], column[1]]);
+                            let size = largest.entry(column).or_default();
+                            *size = value.len().max(*size);
+                            *bytes = u64::try_from(key.len() + value.len() + 26)
+                                .ok()
+                                .and_then(|n| bytes.checked_add(n))
+                                .ok_or_else(recovery_unknown)?;
+                            Ok(*bytes - before >= BYTES_PER_PAGE)
+                        },
+                    )?;
+                    if progress.exhausted {
+                        // Base64 and its JSON, as an image carries them.
+                        let vectors = largest
+                            .values()
+                            .try_fold(0usize, |sum, size| {
+                                size.checked_mul(4).map(|n| n / 3 + 512)?.checked_add(sum)
+                            })
+                            .ok_or_else(recovery_unknown)?;
+                        return Ok(ShardUsage::Observed {
+                            epoch,
+                            bytes: scan.bytes,
+                            largest_image: scan.largest_image.saturating_add(vectors),
+                            pivot: scan.pivot.boundary,
+                        });
+                    }
+                    let cursor = progress.last_key.ok_or_else(recovery_unknown)?;
+                    scan.after = Some(shared.copy_bytes(cursor.as_slice())?);
+                    return Ok(ShardUsage::Scanning(scan));
+                }
                 let progress = view.scan_page_until(
                     &[VALUE],
                     scan.after.as_ref().map(ChargedBytes::as_slice),
@@ -181,7 +226,11 @@ impl ParticipantMachine {
                         Ok(scan.bytes - before >= BYTES_PER_PAGE)
                     },
                 )?;
-                if progress.exhausted {
+                if progress.exhausted && config.search.is_some() {
+                    scan.vectors = Some(std::collections::BTreeMap::new());
+                    scan.after = None;
+                    Ok(ShardUsage::Scanning(scan))
+                } else if progress.exhausted {
                     Ok(ShardUsage::Observed {
                         epoch,
                         bytes: scan.bytes,

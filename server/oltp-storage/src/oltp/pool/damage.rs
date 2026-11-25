@@ -34,7 +34,7 @@ use std::{
     path::Path,
     sync::{
         Mutex, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use tokio::sync::watch;
@@ -106,6 +106,10 @@ pub(super) struct DamageState {
     accept: Mutex<()>,
     refused_writes: AtomicU64,
     releases: AtomicU64,
+    /// Groups whose stored vector values failed their own checksum, which kv
+    /// cannot see. Found again at the next read after a restart.
+    values: Mutex<BTreeSet<Uuid>>,
+    any_value: AtomicBool,
 }
 impl DamageState {
     pub(super) fn new() -> Self {
@@ -115,7 +119,16 @@ impl DamageState {
             accept: Mutex::new(()),
             refused_writes: AtomicU64::new(0),
             releases: AtomicU64::new(0),
+            values: Mutex::new(BTreeSet::new()),
+            any_value: AtomicBool::new(false),
         }
+    }
+    fn values(&self) -> std::sync::MutexGuard<'_, BTreeSet<Uuid>> {
+        self.values.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+    /// One atomic load while no value is damaged.
+    pub(super) fn value_damaged(&self, group: Uuid) -> bool {
+        self.any_value.load(Ordering::Acquire) && self.values().contains(&group)
     }
     pub(super) fn bind(&self, pool: Weak<PoolInner>) {
         let _ = self.pool.set(pool);
@@ -254,6 +267,16 @@ fn write_accepted(store: &Store, accepted: &BTreeSet<Uuid>) -> Result<(), Protoc
 }
 
 impl OltpPool {
+    /// A stored vector value of `group` is missing or fails its checksum: the
+    /// group is quarantined like one whose block kv found damaged (rule 1).
+    pub(crate) fn report_value_damage(&self, group: Uuid) {
+        let damage = &self.inner.damage;
+        if damage.values().insert(group) {
+            damage.any_value.store(true, Ordering::Release);
+            damage.events.send_if_modified(|groups| groups.insert(group));
+            tracing::error!(%group, "OLTP group quarantined: a stored vector value is damaged");
+        }
+    }
     /// Rewrites the accepted record to the store's current quarantined groups.
     /// Blocks on a synced write: call it off the async runtime.
     fn accept_current(&self) -> Result<(), ProtocolError> {
@@ -292,6 +315,11 @@ impl OltpPool {
                     first_bad_seq: damage.first_bad_seq,
                 })
             })
+            .chain(self.inner.damage.values().iter().map(|group| GroupDamage {
+                group: *group,
+                cause: DamageCause::RunBlock,
+                first_bad_seq: None,
+            }))
             .collect()
     }
     pub fn group_damage(&self, group: Uuid) -> Option<GroupDamage> {
@@ -368,6 +396,7 @@ impl OltpPool {
                     .release_scope(&group_scope(id))
                     .map_err(|error| pool.failed(error))?;
                 pool.inner.damage.releases.fetch_add(1, Ordering::Relaxed);
+                pool.inner.damage.values().remove(&id);
                 ReleaseOutcome::Released
             } else {
                 ReleaseOutcome::AlreadyReleased

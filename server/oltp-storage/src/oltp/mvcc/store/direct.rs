@@ -40,7 +40,10 @@
 //! cannot delete records younger than the retention window unless it also
 //! commits with that clock. Apply reads no clock.
 use super::*;
-use crate::oltp::{mvcc::CanonicalJson, pool::ScratchLease};
+use crate::oltp::{
+    mvcc::{CanonicalJson, vector::RowSearch},
+    pool::ScratchLease,
+};
 
 pub(crate) mod clock;
 #[allow(unused_imports)] // Consumed by the leader executor (T5).
@@ -233,6 +236,10 @@ pub struct DirectWrite {
     /// `None` writes a tombstone.
     pub value: Option<CanonicalJson>,
     pub index: Vec<IndexChange>,
+    /// The vectors this write names, only for a table with search columns. A
+    /// write without it keeps the row's vectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<Box<RowSearch>>,
 }
 /// One secondary index entry written with its row, under the same rules.
 /// `expected_version` is the exact head version, as for a row.
@@ -359,15 +366,30 @@ impl DirectCommit {
             })
             .collect()
     }
+    /// Every row and index entry: its key, expected version, value and vectors.
+    #[allow(clippy::type_complexity)]
     fn changes(
         &self,
-    ) -> impl Iterator<Item = (&MvccKey, Option<CommitTs>, Option<&CanonicalJson>)> {
+    ) -> impl Iterator<
+        Item = (
+            &MvccKey,
+            Option<CommitTs>,
+            Option<&CanonicalJson>,
+            Option<&RowSearch>,
+        ),
+    > {
         self.writes.iter().flat_map(|write| {
-            std::iter::once((&write.key, write.expected_version, write.value.as_ref())).chain(
+            std::iter::once((
+                &write.key,
+                write.expected_version,
+                write.value.as_ref(),
+                write.search.as_deref(),
+            ))
+            .chain(
                 write
                     .index
                     .iter()
-                    .map(|c| (&c.key, c.expected_version, c.value.as_ref())),
+                    .map(|c| (&c.key, c.expected_version, c.value.as_ref(), None)),
             )
         })
     }
@@ -451,10 +473,12 @@ fn well_formed(
     {
         return malformed;
     }
-    for (key, _, value) in command.changes() {
+    for (key, _, value, search) in command.changes() {
         key_length(key)?;
         if let Some(value) = value {
             serde_json::from_str::<&RawValue>(value.as_str()).map_err(|_| invalid())?;
+        } else if search.is_some() {
+            return malformed;
         }
     }
     if command.writes.len() > MAX_DIRECT_WRITES
@@ -471,7 +495,7 @@ fn well_formed(
 
 /// A split holds the range: the barrier, a frozen source, or a child that
 /// has not imported everything.
-fn split_in_progress(config: &Config) -> bool {
+pub(super) fn split_in_progress(config: &Config) -> bool {
     config.direct_pause.is_some()
         || config.split_source.is_some()
         || config.split_child.is_some_and(|child| !child.complete)
@@ -511,10 +535,20 @@ fn stamp(tx: &mut GroupTransaction<'_>, applied_unix_ms: u64) -> Result<u64, Pro
 }
 
 /// The native batch bytes this commit writes, before expiry deletions.
-fn batch_estimate(command: &DirectCommit, dedup: usize) -> Result<usize, ProtocolError> {
+fn batch_estimate(
+    config: &Config,
+    command: &DirectCommit,
+    dedup: usize,
+) -> Result<usize, ProtocolError> {
     let mut bytes = 16usize << 10;
-    for (key, _, value) in command.changes() {
+    for (key, _, value, search) in command.changes() {
+        let row = matches!(key, MvccKey::Row { .. });
         let key = key_length(key)?;
+        if row && config.search.is_some() {
+            bytes = bytes
+                .checked_add(row::write_cost(search, key))
+                .ok_or_else(invalid)?;
+        }
         bytes = key
             .checked_add(9)
             .and_then(|n| n.checked_mul(2))
@@ -533,9 +567,13 @@ fn batch_estimate(command: &DirectCommit, dedup: usize) -> Result<usize, Protoco
 }
 
 /// What the ordered checks decided for one commit.
-enum Checked {
+enum Checked<'a> {
     /// Every check passed: write it under this dedup key.
-    Write { dedup: Vec<u8>, estimate: usize },
+    Write {
+        dedup: Vec<u8>,
+        estimate: usize,
+        config: &'a Config,
+    },
     /// The commit ends here and writes nothing.
     Done(DirectReply),
 }
@@ -587,13 +625,16 @@ pub(super) fn apply(
     tx: &mut GroupTransaction<'_>,
     group: &GroupIdentity,
     config: Option<&Config>,
+    position: AppliedPosition,
     command: &DirectCommit,
 ) -> Result<Transition, ProtocolError> {
     match check(tx, group, config, command, 0)? {
         Checked::Done(reply) => self::reply(tx, reply),
-        Checked::Write { dedup, .. } => {
+        Checked::Write { dedup, config, .. } => {
             let mut highs = Highs::load(tx)?;
-            write(tx, command, &dedup, &mut highs)?;
+            let mut changes = feed::Changes::new(config);
+            write(tx, config, command, &dedup, &mut highs, &mut changes)?;
+            changes.flush(tx, position)?;
             #[cfg(feature = "sim")]
             nabedra_oltp_types::sim_probe::emit(|| dedup_probe(group, command));
             highs.flush(tx)?;
@@ -615,6 +656,7 @@ pub(super) fn apply_batch(
     tx: &mut GroupTransaction<'_>,
     group: &GroupIdentity,
     config: Option<&Config>,
+    position: AppliedPosition,
     batch: &DirectBatch,
 ) -> Result<Transition, ProtocolError> {
     if batch.members.is_empty() || batch.members.len() > MAX_DIRECT_BATCH_MEMBERS {
@@ -623,6 +665,7 @@ pub(super) fn apply_batch(
     let mut replies = Vec::with_capacity(batch.members.len());
     let mut seen = std::collections::BTreeSet::new();
     let mut highs = None;
+    let mut changes = None;
     let mut used = 0usize;
     for member in &batch.members {
         // Defensive: the leader's latches keep members off each other's
@@ -630,7 +673,7 @@ pub(super) fn apply_batch(
         // validated against a head that member is about to change.
         let mut shared = false;
         let mut keys = Vec::with_capacity(member.writes.len());
-        for (key, _, _) in member.changes() {
+        for (key, ..) in member.changes() {
             let key = physical(0, key)?;
             shared |= seen.contains(&key);
             keys.push(key);
@@ -642,14 +685,19 @@ pub(super) fn apply_batch(
         seen.extend(keys);
         let reply = match check(tx, group, config, member, used)? {
             Checked::Done(reply) => member_reply(reply),
-            Checked::Write { dedup, estimate } => {
+            Checked::Write {
+                dedup,
+                estimate,
+                config,
+            } => {
                 if highs.is_none() {
                     highs = Some(Highs::load(tx)?);
                 }
                 let Some(highs) = highs.as_mut() else {
                     unreachable!("loaded above");
                 };
-                write(tx, member, &dedup, highs)?;
+                let changes = changes.get_or_insert_with(|| feed::Changes::new(config));
+                write(tx, config, member, &dedup, highs, changes)?;
                 #[cfg(feature = "sim")]
                 nabedra_oltp_types::sim_probe::emit(|| dedup_probe(group, member));
                 used = used.checked_add(estimate).ok_or_else(invalid)?;
@@ -662,6 +710,9 @@ pub(super) fn apply_batch(
     }
     if let Some(highs) = highs {
         highs.flush(tx)?;
+    }
+    if let Some(changes) = changes {
+        changes.flush(tx, position)?;
     }
     reply(tx, DirectReply::Batch(replies))
 }
@@ -678,13 +729,13 @@ fn member_reply(reply: DirectReply) -> DirectMemberReply {
 
 /// Steps 0 to 8 of plan section 4 for one commit. Nothing here writes.
 /// `used` is the native batch budget earlier members of the entry took.
-fn check(
+fn check<'a>(
     tx: &mut GroupTransaction<'_>,
     group: &GroupIdentity,
-    config: Option<&Config>,
+    config: Option<&'a Config>,
     command: &DirectCommit,
     used: usize,
-) -> Result<Checked, ProtocolError> {
+) -> Result<Checked<'a>, ProtocolError> {
     let done = |fault| Ok(Checked::Done(DirectReply::Rejected(fault)));
     let Some(config) = config else {
         return done(Fault::NotInitialized);
@@ -693,6 +744,10 @@ fn check(
     let Some(schema) = config.direct_schema else {
         return done(Fault::DirectInactive);
     };
+    // A restored range has vectors whose columns it does not know yet.
+    if search::unknown(config) {
+        return done(Fault::DirectInactive);
+    }
     if let Some(fault) = well_formed(group, command)? {
         return done(fault);
     }
@@ -721,8 +776,16 @@ fn check(
     // 4. Every key belongs to the group.
     if command
         .changes()
-        .any(|(key, _, _)| !owns(group, &config.span, key))
+        .any(|(key, ..)| !owns(group, &config.span, key))
     {
+        return done(Fault::InvalidBinding);
+    }
+    // A row names only the group's search columns that no embedder fills.
+    if command.changes().any(|(.., search)| {
+        search.is_some_and(|search| {
+            !search::ready(config).is_some_and(|schema| search.valid(&schema.columns))
+        })
+    }) {
         return done(Fault::InvalidBinding);
     }
     // 5. A committed request with this id and anchor replays or conflicts,
@@ -731,14 +794,14 @@ fn check(
     if let Some(reply) = lookup(tx, &dedup, command.digest)? {
         return Ok(Checked::Done(reply));
     }
-    let estimate = batch_estimate(command, dedup.len())?;
+    let estimate = batch_estimate(config, command, dedup.len())?;
     if used.saturating_add(estimate) > APPLY.batch_bytes - (64 << 10) {
         return done(Fault::ResourceLimit);
     }
     // 6-8. No intent, the exact head version, then a timestamp above the
     //      newest version, the GC floor and a split child's import cut.
     let mut heads = Vec::with_capacity(command.writes.len());
-    for (key, expected, _) in command.changes() {
+    for (key, expected, ..) in command.changes() {
         let length = key_length(key)?;
         let head = tx.with_scratch_buffer(length + 1, |tx, buffer| {
             buffer[0] = HEAD;
@@ -763,33 +826,41 @@ fn check(
         return done(Fault::Conflict);
     }
     drop(heads);
-    // A direct commit never lands at or below the group's GC floor (or a
-    // split child's import cut): no reader below it is served here.
-    let floor = config.split_child.map_or(config.gc_floor, |child| {
-        config
-            .gc_floor
-            .max(child.read_ts.get())
-            .max(child.published_at.map_or(0, CommitTs::get))
-    });
-    if command.commit_ts.get() <= floor {
+    if command.commit_ts.get() <= commit_floor(config) {
         return done(Fault::Conflict);
     }
-    Ok(Checked::Write { dedup, estimate })
+    Ok(Checked::Write {
+        dedup,
+        estimate,
+        config,
+    })
+}
+
+/// A direct commit never lands at or below the group's GC floor (or a split
+/// child's import cut), because no reader below it is served here, nor at or
+/// below the closed floor, because a search read was (DB-1).
+pub(super) fn commit_floor(config: &Config) -> u64 {
+    let floor = config
+        .gc_floor
+        .max(config.closed_floor.map_or(0, CommitTs::get));
+    config.split_child.map_or(floor, |child| {
+        floor
+            .max(child.read_ts.get())
+            .max(child.published_at.map_or(0, CommitTs::get))
+    })
 }
 
 /// The writes of a checked commit: its versions, heads, index entries and
 /// dedup record. The high-waters are flushed by the caller.
 fn write(
     tx: &mut GroupTransaction<'_>,
+    config: &Config,
     command: &DirectCommit,
     dedup: &[u8],
     highs: &mut Highs,
+    changes: &mut feed::Changes,
 ) -> Result<(), ProtocolError> {
-    #[derive(Serialize)]
-    struct Version<'a> {
-        value: Option<&'a RawValue>,
-    }
-    for (key, _, value) in command.changes() {
+    for (key, expected, value, search) in command.changes() {
         let length = key_length(key)?;
         let value = value
             .map(|v| serde_json::from_str::<&RawValue>(v.as_str()).map_err(|_| invalid()))
@@ -798,7 +869,28 @@ fn write(
             encode_key(key, &mut buffer[1..length + 1]);
             buffer[0] = VALUE;
             buffer[length + 1..].copy_from_slice(&(!command.commit_ts.get()).to_be_bytes());
-            tx.put_serialized(buffer, &Version { value })?;
+            let version = match search::ready(config) {
+                Some(schema) if matches!(key, MvccKey::Row { .. }) => {
+                    let logical = &buffer[1..length + 1];
+                    if let Some(search) = search {
+                        row::put_vectors(tx, search, |column| {
+                            row::column_key(row::VECTOR, logical, column, Some(command.commit_ts))
+                        })?;
+                    }
+                    changes.row(logical, command.commit_ts, value.is_some())?;
+                    row::RowWrite {
+                        schema,
+                        logical,
+                        previous: expected,
+                        commit_ts: command.commit_ts,
+                        named: &row::named(search),
+                        backfill: search.map_or(&[], |search| &search.backfill),
+                    }
+                    .plan(tx, value)?
+                }
+                _ => row::Version::plain(value),
+            };
+            tx.put_serialized(buffer, &version)?;
             buffer[0] = HEAD;
             tx.put_serialized(
                 &buffer[..length + 1],
@@ -1261,6 +1353,7 @@ pub(super) fn image_from_record(
         key,
         commit_ts,
         value: Some(CanonicalJson::from_stored_json(value, owner)?),
+        search: None,
     }))
 }
 
@@ -1295,12 +1388,11 @@ pub(super) fn schema(
         {
             current
         }
-        (current, DirectSchemaChange::Fence { lifecycle }) => {
-            let base = current.map_or(config.schema_epoch, |current| current.epoch);
-            let Some(epoch) = base.checked_add(1) else {
+        (_, DirectSchemaChange::Fence { lifecycle }) => {
+            let Some(next) = fenced(&config, lifecycle) else {
                 return reject(tx, Fault::ResourceLimit);
             };
-            DirectSchema { epoch, lifecycle }
+            next
         }
     };
     if config.direct_schema != Some(next) {
@@ -1308,6 +1400,26 @@ pub(super) fn schema(
         tx.put_serialized(CONFIG, &config)?;
     }
     commit(tx, &ParticipantReply::DirectSchema(next))
+}
+
+/// The direct schema after a fence for `lifecycle`.
+pub(super) fn fenced(config: &Config, lifecycle: Option<Uuid>) -> Option<DirectSchema> {
+    let base = config
+        .direct_schema
+        .map_or(config.schema_epoch, |current| current.epoch);
+    Some(DirectSchema {
+        epoch: base.checked_add(1)?,
+        lifecycle,
+    })
+}
+/// Raises the freeze bound for a commit outside a `DirectCommit`.
+pub(super) fn raise_high(
+    tx: &mut GroupTransaction<'_>,
+    commit_ts: CommitTs,
+) -> Result<(), ProtocolError> {
+    let mut highs = Highs::load(tx)?;
+    highs.commit(commit_ts);
+    highs.flush(tx)
 }
 
 /// The highest direct commit timestamp applied on this group.
@@ -1340,28 +1452,39 @@ impl nabedra_oltp_types::owned::OwnedPayload for DirectCommit {
                 .and_then(|n| bytes.checked_add(n))
                 .ok_or_else(invalid)?;
         }
-        for (key, _, value) in self.changes() {
+        for (key, _, value, search) in self.changes() {
+            let search = search.map_or(Ok(0), |search| {
+                search
+                    .heap_bytes()?
+                    .checked_add(std::mem::size_of::<RowSearch>())
+                    .ok_or_else(invalid)
+            })?;
             bytes = bytes
                 .checked_add(key.heap_bytes())
                 .and_then(|n| n.checked_add(value.map_or(Ok(0), |v| v.heap_bytes()).ok()?))
+                .and_then(|n| n.checked_add(search))
                 .ok_or_else(invalid)?;
         }
         Ok(bytes)
     }
     fn attach_fields(&self, owner: Arc<ScratchLease>) -> Result<(), ProtocolError> {
         self.result.attach_charge(owner.clone())?;
-        for (_, _, value) in self.changes() {
+        for (_, _, value, search) in self.changes() {
             if let Some(value) = value {
                 value.attach_charge(owner.clone())?;
+            }
+            if let Some(search) = search {
+                search.attach_charge(owner.clone())?;
             }
         }
         Ok(())
     }
     fn fields_attached(&self) -> bool {
         self.result.is_charged()
-            && self
-                .changes()
-                .all(|(_, _, value)| value.is_none_or(CanonicalJson::is_charged))
+            && self.changes().all(|(_, _, value, search)| {
+                value.is_none_or(CanonicalJson::is_charged)
+                    && search.is_none_or(RowSearch::is_charged)
+            })
     }
 }
 

@@ -357,6 +357,7 @@ impl Fixture {
             expected_version: expected.map(ts),
             value: value.map(|value| self.json(value)),
             index: Vec::new(),
+            search: None,
         }
     }
     fn commit(
@@ -2709,3 +2710,5 @@ async fn d06_latest_reads_track_pending_writers_per_key() {
 mod batch;
 #[cfg(test)]
 mod t7;
+#[cfg(test)]
+mod search;

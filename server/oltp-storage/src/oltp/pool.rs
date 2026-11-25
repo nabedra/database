@@ -490,7 +490,7 @@ impl OltpPool {
     /// True once the group's scope is quarantined, at open or at run time. One
     /// atomic load while nothing is quarantined.
     fn group_quarantined(&self, id: Uuid) -> bool {
-        self.inner.store.is_quarantined(&group_scope(id))
+        self.inner.store.is_quarantined(&group_scope(id)) || self.inner.damage.value_damaged(id)
     }
     /// Section 3 rule 1 (RV-NS6 F3): a quarantined group never writes again under
     /// its old identity, so its Raft node can neither append nor vote. Only the
@@ -1763,6 +1763,24 @@ impl<'a> GroupRead<'a> {
             _snapshot: std::marker::PhantomData,
         }))
     }
+    /// The first change record at or after log index `index` (`feed`).
+    pub(crate) fn change_from(&mut self, index: u64) -> Result<Option<(u64, Bytes)>, ProtocolError> {
+        let start = change_key(&self.prefix, index);
+        let mut upper = start[..CHANGE_PREFIX_BYTES].to_vec();
+        upper[CHANGE_PREFIX_BYTES - 1] += 1;
+        let mut iterator = RawIter::bounded(self.snapshot, &start, &upper, true);
+        iterator.seek(&start);
+        iterator.status()?;
+        let Some(key) = iterator.key() else {
+            return Ok(None);
+        };
+        let index = key
+            .get(CHANGE_PREFIX_BYTES..)
+            .and_then(|index| index.try_into().ok())
+            .map(u64::from_be_bytes)
+            .ok_or_else(recovery_unknown)?;
+        Ok(Some((index, iterator.value()?)))
+    }
     /// Snapshot-only. Candidate writes are deliberately not consulted.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<ChargedBytes>, ProtocolError> {
         self.pinned(key)?
@@ -2036,6 +2054,24 @@ impl<'a> GroupTransaction<'a> {
     pub fn pinned(&mut self, key: &[u8]) -> Result<Option<Bytes>, ProtocolError> {
         self.read.pinned(key)
     }
+    /// The change record of log index `index`, in the same batch as the entry.
+    /// Like the log it belongs to this replica: no generation, no snapshot.
+    pub(crate) fn put_change(&mut self, index: u64, value: &[u8]) -> Result<(), ProtocolError> {
+        self.put_meta(change_key(&self.read.prefix, index), value)
+    }
+    /// Deletes the change records of log indexes `from..=through`. The log's
+    /// purge calls it in the transaction that deletes the same log entries.
+    pub fn purge_changes(&mut self, from: u64, through: u64) -> Result<(), ProtocolError> {
+        if from > through {
+            return Ok(());
+        }
+        let start = change_key(&self.read.prefix, from);
+        let mut end = change_key(&self.read.prefix, through);
+        end.push(0);
+        self.preflight(start.len() + end.len(), 0)?;
+        self.batch.delete_range(&start, &end);
+        Ok(())
+    }
     fn put_meta(&mut self, key: impl AsRef<[u8]>, value: &[u8]) -> Result<(), ProtocolError> {
         self.preflight(key.as_ref().len(), value.len())?;
         self.batch.put(key.as_ref(), value);
@@ -2054,6 +2090,16 @@ impl<'a> GroupTransaction<'a> {
     }
 }
 
+/// `0x40 ‖ group ‖ 'c'`, before the log index of a change record.
+const CHANGE_PREFIX_BYTES: usize = GROUP_SCOPE_BYTES + 1;
+/// `prefix` is the state or log prefix of the same group.
+fn change_key(prefix: &[u8], index: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(CHANGE_PREFIX_BYTES + 9);
+    key.extend_from_slice(&prefix[..GROUP_SCOPE_BYTES]);
+    key.push(b'c');
+    key.extend_from_slice(&index.to_be_bytes());
+    key
+}
 fn group_key(id: Uuid, tag: u8, suffix: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(18 + suffix.len());
     key.push(0x40);

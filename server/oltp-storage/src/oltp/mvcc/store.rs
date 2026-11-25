@@ -32,6 +32,10 @@ pub mod archive;
 pub mod consensus;
 #[doc(hidden)]
 pub mod direct;
+#[doc(hidden)]
+pub mod embed;
+#[doc(hidden)]
+pub mod feed;
 mod handle;
 #[doc(hidden)]
 pub mod image_archive;
@@ -48,9 +52,13 @@ pub mod point;
 #[doc(hidden)]
 pub mod restore;
 #[doc(hidden)]
+pub mod row;
+#[doc(hidden)]
 pub mod scan;
 #[doc(hidden)]
 pub mod scoped_queue;
+#[doc(hidden)]
+pub mod search;
 #[doc(hidden)]
 pub mod split_closure;
 #[doc(hidden)]
@@ -104,6 +112,13 @@ struct Config {
     /// config that carries it, which is why downgrade is unsupported then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     direct_schema: Option<direct::DirectSchema>,
+    /// Set once the table has search columns (`data.vector.v1`). Like
+    /// `direct_schema`, an older replica cannot read a config that carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    search: Option<search::SearchSchema>,
+    /// No direct commit or `SetVector` applies at or below it (`Closed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    closed_floor: Option<CommitTs>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -202,6 +217,18 @@ pub enum ParticipantCommand {
     /// DDL publishes (plan section 7). Gated like `Direct`.
     DirectSchema(direct::DirectSchemaFence),
     ReclaimIndex(index_reclaim::ReclaimIndex),
+    /// The search columns of a Data group. This and the next four are proposed
+    /// only while `data.vector.v1` is active: an older replica cannot decode
+    /// them, nor a direct write or a prepared row that names vectors.
+    SearchFence(search::SearchFence),
+    /// Closes a timestamp for `snapshot` search reads.
+    Closed(search::Closed),
+    /// Stores an embedding as a conditional direct commit.
+    SetVector(embed::SetVector),
+    /// Counts one failed provider attempt.
+    EmbedFailed(embed::EmbedFailed),
+    /// Lets a failed embedding try again.
+    RequeueEmbedding(embed::RequeueEmbedding),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -251,6 +278,7 @@ pub enum ParticipantReply {
         deleted: usize,
         complete: bool,
     },
+    Search(search::SearchReply),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -323,6 +351,15 @@ enum IntentChange {
     Keep,
     Put,
     Delete,
+}
+impl IntentChange {
+    fn of(change: &Change) -> Self {
+        match change {
+            Change::Keep => Self::Keep,
+            Change::Put(_) | Change::PutRow { .. } => Self::Put,
+            Change::Delete => Self::Delete,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -397,6 +434,7 @@ impl ParticipantMachine {
                 .iter()
                 .map(|member| member.commit_ts)
                 .collect(),
+            ParticipantCommand::SetVector(set) => vec![set.commit_ts],
             _ => Vec::new(),
         };
         let applied = self
@@ -404,7 +442,8 @@ impl ParticipantMachine {
             .transaction(meta, APPLY, move |tx| {
                 apply(tx, &identity, position, command_digest, command.payload()?)
             })
-            .await?;
+            .await;
+        let applied = self.note_damage(applied)?;
         // The entry applied (or was rejected) durably: its pending entry, if
         // this node proposed it, leaves the range clock.
         self.clock.observe_applied(position);
@@ -511,14 +550,7 @@ impl ParticipantMachine {
                         if version > read_ts {
                             return Err(recovery_unknown());
                         }
-                        #[derive(Deserialize)]
-                        #[serde(deny_unknown_fields)]
-                        struct Version<'a> {
-                            #[serde(borrow)]
-                            value: Option<&'a RawValue>,
-                        }
-                        let value: Version<'_> = serde_json::from_slice(record.value())
-                            .map_err(|_| recovery_unknown())?;
+                        let value = row::Version::decode(record.value())?;
                         view.encode(&ReadReply::Value {
                             version: Some(version),
                             value: value.value,
@@ -613,7 +645,15 @@ fn apply(
             direct_pause: config.as_ref().and_then(|c| c.direct_pause),
             // A run fence keeps direct activation and the DDL schema fence.
             direct_schema: config.as_ref().and_then(|c| c.direct_schema),
+            search: match &config {
+                Some(config) => config.search.clone(),
+                None => search::restored(tx)?,
+            },
+            closed_floor: config.as_ref().and_then(|c| c.closed_floor),
         };
+        if config.is_none() && next_config.search.is_some() {
+            feed::start(tx, position)?;
+        }
         if encoded_length(&next_config, METADATA_BYTES).is_err() {
             return reject(tx, Fault::ResourceLimit);
         }
@@ -638,10 +678,10 @@ fn apply(
     }
     match command {
         ParticipantCommand::Direct(direct) => {
-            return direct::apply(tx, group, config.as_ref(), direct);
+            return direct::apply(tx, group, config.as_ref(), position, direct);
         }
         ParticipantCommand::DirectBatch(batch) => {
-            return direct::apply_batch(tx, group, config.as_ref(), batch);
+            return direct::apply_batch(tx, group, config.as_ref(), position, batch);
         }
         ParticipantCommand::DirectExpire(expire) => {
             return direct::expire(tx, group, config.as_ref(), expire);
@@ -660,6 +700,21 @@ fn apply(
         }
         ParticipantCommand::ReclaimIndex(reclaim) => {
             return index_reclaim::apply(tx, group, config, *reclaim);
+        }
+        ParticipantCommand::SearchFence(fence) => {
+            return search::fence(tx, group, config, position, fence);
+        }
+        ParticipantCommand::Closed(closed) => {
+            return search::closed(tx, config, position, closed);
+        }
+        ParticipantCommand::SetVector(set) => {
+            return embed::set_vector(tx, group, config.as_ref(), position, set);
+        }
+        ParticipantCommand::EmbedFailed(failed) => {
+            return embed::failed(tx, group, config.as_ref(), failed);
+        }
+        ParticipantCommand::RequeueEmbedding(requeue) => {
+            return embed::requeue(tx, group, config.as_ref(), requeue);
         }
         _ => {}
     }
@@ -752,6 +807,7 @@ fn apply(
                 || config
                     .split_child
                     .is_some_and(|child| !child.complete || plan.read_ts < child.read_ts)
+                || search::unknown(&config)
             {
                 return reject(tx, Fault::Incomplete);
             }
@@ -865,6 +921,13 @@ fn apply(
                 {
                     return reject(tx, Fault::InvalidBinding);
                 }
+                if let Some(search) = write.change.search()
+                    && (!matches!(write.key, MvccKey::Row { .. })
+                        || !search::ready(&config)
+                            .is_some_and(|schema| search.valid(&schema.columns)))
+                {
+                    return reject(tx, Fault::InvalidBinding);
+                }
                 let length = key_length(&write.key)?;
                 let fault = tx.with_scratch_buffer(length + 9, |tx, buffer| {
                     encode_key(&write.key, &mut buffer[1..1 + length]);
@@ -886,18 +949,15 @@ fn apply(
                         return Ok(Some(Fault::Conflict));
                     }
                     buffer[0] = INTENT;
-                    let value = match &write.change {
-                        Change::Put(value) => Some(
+                    let value = write
+                        .change
+                        .value()
+                        .map(|value| {
                             serde_json::from_str::<&RawValue>(value.as_str())
-                                .map_err(|_| invalid())?,
-                        ),
-                        _ => None,
-                    };
-                    let change = match write.change {
-                        Change::Keep => IntentChange::Keep,
-                        Change::Put(_) => IntentChange::Put,
-                        Change::Delete => IntentChange::Delete,
-                    };
+                                .map_err(|_| invalid())
+                        })
+                        .transpose()?;
+                    let change = IntentChange::of(&write.change);
                     tx.put_serialized(
                         &buffer[..end],
                         &Intent {
@@ -908,6 +968,9 @@ fn apply(
                             value,
                         },
                     )?;
+                    if let Some(search) = write.change.search() {
+                        row::stage(tx, *txn, state.writes + offset as u64, search)?;
+                    }
                     buffer[0] = HEAD;
                     tx.put_serialized(
                         &buffer[..end],
@@ -1072,7 +1135,7 @@ fn apply(
                 .resolved
                 .saturating_add(*max_items as u64)
                 .min(state.writes);
-            resolve_writes(tx, &state, txn, until, statement.decision)?;
+            resolve_writes(tx, &config, position, &state, txn, until, statement.decision)?;
             if until == state.writes && tx.pinned(&txn_key(b'd', txn))?.is_none() {
                 tx.put_serialized(
                     &txn_key(b'd', txn),
@@ -1119,7 +1182,12 @@ fn apply(
         | ParticipantCommand::DirectPause(_)
         | ParticipantCommand::ChildPublished(_)
         | ParticipantCommand::DirectSchema(_)
-        | ParticipantCommand::ReclaimIndex(_) => unreachable!(),
+        | ParticipantCommand::ReclaimIndex(_)
+        | ParticipantCommand::SearchFence(_)
+        | ParticipantCommand::Closed(_)
+        | ParticipantCommand::SetVector(_)
+        | ParticipantCommand::EmbedFailed(_)
+        | ParticipantCommand::RequeueEmbedding(_) => unreachable!(),
     }
 }
 
@@ -1183,11 +1251,15 @@ fn seal(
 
 fn resolve_writes(
     tx: &mut GroupTransaction<'_>,
+    config: &Config,
+    position: AppliedPosition,
     state: &Txn,
     txn: TxnId,
     until: u64,
     decision: TxnDecision,
 ) -> Result<(), ProtocolError> {
+    let schema = search::ready(config);
+    let mut changes = feed::Changes::new(config);
     for ordinal in state.resolved..until {
         let logical = tx
             .pinned(&ordinal_key(b'w', txn, ordinal))?
@@ -1218,10 +1290,6 @@ fn resolve_writes(
                 if !matches!(intent.change, IntentChange::Keep) {
                     buffer[0] = VALUE;
                     buffer[end..].copy_from_slice(&(!commit_ts.get()).to_be_bytes());
-                    #[derive(Serialize)]
-                    struct Version<'a> {
-                        value: Option<&'a RawValue>,
-                    }
                     let value = match intent.change {
                         IntentChange::Put => {
                             Some(intent.value.ok_or_else(recovery_unknown)?)
@@ -1229,11 +1297,28 @@ fn resolve_writes(
                         IntentChange::Delete => None,
                         _ => unreachable!(),
                     };
-                    tx.put_serialized(buffer, &Version { value })?;
+                    let stored = match schema {
+                        Some(schema) if logical.first() == Some(&1) => {
+                            let write = row::RowWrite {
+                                schema,
+                                logical: &logical,
+                                previous: head.version,
+                                commit_ts,
+                                named: &[],
+                                backfill: &[],
+                            };
+                            row::resolve(tx, txn, ordinal, Some((write, value)))?
+                        }
+                        _ => row::Version::plain(value),
+                    };
+                    tx.put_serialized(buffer, &stored)?;
+                    changes.row(&logical, commit_ts, value.is_some())?;
                     #[cfg(feature = "sim")]
                     route_probe(&logical, value, commit_ts);
                     version = Some(commit_ts);
                 }
+            } else if schema.is_some() {
+                row::resolve(tx, txn, ordinal, None)?;
             }
             buffer[0] = INTENT;
             tx.delete(&buffer[..end])?;
@@ -1252,6 +1337,7 @@ fn resolve_writes(
             Ok(())
         })?;
     }
+    changes.flush(tx, position)?;
     #[cfg(feature = "sim")]
     if let TxnDecision::Commit { commit_ts } = decision
         && until == state.writes
@@ -1336,17 +1422,17 @@ impl<'a> PreparePageBudget<'a> {
 
     pub fn try_add(&mut self, write: &PreparedWrite) -> Result<bool, ProtocolError> {
         let length = key_length(&write.key)?;
-        let value = match &write.change {
-            Change::Put(v) => {
-                Some(serde_json::from_str::<&RawValue>(v.as_str()).map_err(|_| invalid())?)
-            }
-            _ => None,
-        };
-        let change = match write.change {
-            Change::Keep => IntentChange::Keep,
-            Change::Put(_) => IntentChange::Put,
-            Change::Delete => IntentChange::Delete,
-        };
+        let value = write
+            .change
+            .value()
+            .map(|v| serde_json::from_str::<&RawValue>(v.as_str()).map_err(|_| invalid()))
+            .transpose()?;
+        let change = IntentChange::of(&write.change);
+        // Staged vectors, and at Resolve the records of the row.
+        let search = write
+            .change
+            .search()
+            .map_or(0, |search| row::write_cost(Some(search), length));
         let intent = encoded_length(
             &Intent {
                 read_ts: ReadTs::new(u64::MAX).map_err(|_| invalid())?,
@@ -1364,6 +1450,7 @@ impl<'a> PreparePageBudget<'a> {
             .checked_add(length.checked_mul(3).ok_or_else(invalid)?)
             .and_then(|n| n.checked_add(intent))
             .and_then(|n| n.checked_add(1024))
+            .and_then(|n| n.checked_add(search))
             .ok_or_else(invalid)?;
         // One temporary logical key, the reused native key, and one temporary
         // intent encoding must also coexist. Metadata is bounded separately.
@@ -1371,6 +1458,7 @@ impl<'a> PreparePageBudget<'a> {
             .checked_mul(2)
             .and_then(|n| n.checked_add(intent))
             .and_then(|n| n.checked_add(256 << 10))
+            .and_then(|n| n.checked_add(search))
             .ok_or_else(invalid)?;
         if batch > APPLY.batch_bytes || scratch > APPLY.scratch_bytes {
             return Ok(false);
@@ -1427,6 +1515,11 @@ impl std::fmt::Display for ParticipantCommand {
             Self::ChildPublished(_) => "participant-child-published",
             Self::DirectSchema(_) => "participant-direct-schema",
             Self::ReclaimIndex(_) => "participant-reclaim-index",
+            Self::SearchFence(_) => "participant-search-fence",
+            Self::Closed(_) => "participant-closed",
+            Self::SetVector(_) => "participant-set-vector",
+            Self::EmbedFailed(_) => "participant-embed-failed",
+            Self::RequeueEmbedding(_) => "participant-requeue-embedding",
         })
     }
 }
@@ -1745,7 +1838,8 @@ fn encode_key(key: &MvccKey, out: &mut [u8]) {
 }
 
 impl ParticipantCommand {
-    /// Commands only a range leader with `data.direct.v1` proposes. They are
+    /// Commands only a range leader with `data.direct.v1` (and, for the search
+    /// family, `data.vector.v1`) proposes. They are
     /// never nested inside a scoped or timestamp-point envelope.
     pub(crate) fn is_direct(&self) -> bool {
         matches!(
@@ -1757,6 +1851,11 @@ impl ParticipantCommand {
                 | Self::DirectPause(_)
                 | Self::ChildPublished(_)
                 | Self::DirectSchema(_)
+                | Self::SearchFence(_)
+                | Self::Closed(_)
+                | Self::SetVector(_)
+                | Self::EmbedFailed(_)
+                | Self::RequeueEmbedding(_)
         )
     }
     pub fn uses_prepare_lane(&self) -> bool {
@@ -1814,6 +1913,10 @@ impl OwnedPayload for ParticipantCommand {
             Self::Direct(direct) => add(direct.heap_bytes()?)?,
             Self::DirectBatch(batch) => add(batch.heap_bytes()?)?,
             Self::DirectForward(forward) => add(forward.heap_bytes())?,
+            Self::SearchFence(fence) => add(fence.heap_bytes())?,
+            Self::SetVector(set) => add(set.heap_bytes()?)?,
+            Self::EmbedFailed(failed) => add(failed.heap_bytes())?,
+            Self::RequeueEmbedding(requeue) => add(requeue.heap_bytes())?,
             Self::PreparePage {
                 plan,
                 writes,
@@ -1852,6 +1955,9 @@ impl OwnedPayload for ParticipantCommand {
         if let Self::DirectBatch(batch) = self {
             batch.attach_fields(owner.clone())?;
         }
+        if let Self::SetVector(set) = self {
+            set.value.attach_charge(owner.clone())?;
+        }
         if let Self::PreparePage { writes, .. } = self {
             for write in writes.iter() {
                 write.attach_charge(owner.clone())?;
@@ -1867,6 +1973,7 @@ impl OwnedPayload for ParticipantCommand {
             Self::SplitImportPage { page, .. } => page.fields_attached(),
             Self::Direct(direct) => direct.fields_attached(),
             Self::DirectBatch(batch) => batch.fields_attached(),
+            Self::SetVector(set) => set.value.is_charged(),
             Self::PreparePage { writes, .. } => writes.iter().all(PreparedWrite::fields_attached),
             _ => true,
         }
