@@ -78,6 +78,16 @@ class Triage(unittest.TestCase):
         known = diagnosis(["ResourceBaseline"], *held(ROUTE))
         self.assertEqual(self.classify([usage(1, 792, 100, threads=1)], known), "undiagnosed")
 
+    def test_the_ledgers_of_a_lease_count_only_with_the_same_bytes(self):
+        known = diagnosis(["ResourceBaseline"], *held(ROUTE))
+        for scheduler, scratch, want in ((692, 692, "named"), (700, 692, "undiagnosed"), (692, 0, "undiagnosed")):
+            ledgers = (f"SchedulerBytes {5000 + scheduler} (baseline 5000), "
+                       f"ScratchBytes {100 + scratch} (baseline 100), ")
+            line = usage(1, 792, 100).replace("off by ", "off by " + ledgers)
+            self.assertEqual(self.classify([line], known), want)
+        line = usage(1, 792, 100).replace("off by ", "off by ChargedBytes(\"data\") 792 (baseline 100), ")
+        self.assertEqual(self.classify([line], known), "undiagnosed")
+
     def test_a_node_without_a_sample_is_undiagnosed(self):
         known = diagnosis(["ResourceBaseline"], *held(ROUTE))
         self.assertEqual(self.classify([usage(2, 792, 100)], known), "undiagnosed")

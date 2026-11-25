@@ -999,7 +999,7 @@ mod tests {
     /// A sub-rule that never ran, and the commits that a rule could not judge, are not hidden
     /// behind the rules that did run.
     #[test]
-    fn the_record_says_which_probe_rules_did_not_judge() {
+    fn a_record_names_the_probe_rules_that_did_not_judge() {
         let mut all = BTreeMap::new();
         for rule in PROBE_INVARIANTS.into_iter().chain([REBUILD, TRUNCATION]) {
             count_rules(&mut all, &BTreeMap::from([(rule, 1)]));
