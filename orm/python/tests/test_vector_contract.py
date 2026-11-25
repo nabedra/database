@@ -227,7 +227,7 @@ class VectorContract(unittest.TestCase):
                 self.assertEqual(row["error"] is None or row["error"].request_id == error.request_id, True)
         self.assertEqual(actual, {**expected, "message": expected_message(expected)})
 
-    def test_create_requests_and_options(self):
+    def test_vs18_create_requests_and_options(self):
         for case in self.contract["create"]:
             with self.subTest(case=case["name"]):
                 def run():
@@ -241,7 +241,7 @@ class VectorContract(unittest.TestCase):
                 except NabedraError as error:  # Vector() itself rejects a bad type.
                     self.assert_error(error, case["error"])
 
-    def test_strict_descriptors(self):
+    def test_vs18_strict_descriptors(self):
         for case in self.contract["describe"]:
             with self.subTest(case=case["name"]):
                 described = {"operation": "table.describe", "payload": '{"name":"made"}', "response": {"data": case["data"]}}
@@ -251,7 +251,7 @@ class VectorContract(unittest.TestCase):
                 self.exchange(described, lambda: self.db.table("made").schema,
                               None if "error" in case else schema_of(case["result"]))
 
-    def test_values_queries_batches_and_columns(self):
+    def test_vs18_values_queries_batches_and_columns(self):
         for case in self.contract["calls"]:
             with self.subTest(case=case["name"]):
                 self.server.table = self.contract["tables"][case["table"]]

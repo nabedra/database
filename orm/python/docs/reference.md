@@ -285,7 +285,8 @@ results are not available in v0.
 ## Vector search
 
 Search needs an OLTP server that supports it. Other servers reject these types and
-operations with code `unsupported_operation` or `validation_error`.
+operations with code `unsupported_operation` or `validation_error`. The application
+gateway does not forward them.
 
 ```python
 from nabedra import Database, Vector, col

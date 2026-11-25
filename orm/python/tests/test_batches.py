@@ -72,7 +72,7 @@ class BatchTests(unittest.TestCase):
     def sizes(self):
         return [len(items) for _, items, _ in self.server.chunks]
 
-    def test_chunks_hold_at_most_10000_rows_in_order_with_one_call_id_each(self):
+    def test_vs17_chunks_hold_at_most_10000_rows_in_order_with_one_call_id_each(self):
         table = self.table()
         self.assertEqual(table.upsert_many({'id': n, 'note': ''} for n in range(25_000)), 25_000)
         self.assertEqual(self.sizes(), [10_000, 10_000, 5_000])
@@ -85,7 +85,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(table.delete_many(iter(range(10_001))), 10_001)
         self.assertEqual(self.sizes(), [10_000, 1])
 
-    def test_chunks_fill_8_mib_exactly_and_never_exceed_it(self):
+    def test_vs17_chunks_fill_8_mib_exactly_and_never_exceed_it(self):
         table = self.table()
         self.assertEqual(table.upsert_many([{'id': 1, 'note': ''}]), 1)
         overhead = self.server.chunks.pop()[2]
@@ -109,7 +109,7 @@ class BatchTests(unittest.TestCase):
             table.upsert_many([{'id': 1, 'note': 'a' * LIMIT}])
         self.assertEqual(self.server.chunks, [])
 
-    def test_a_failed_chunk_stops_an_endless_iterable_and_is_not_sent_again(self):
+    def test_vs15_a_failed_chunk_stops_an_endless_iterable_and_is_not_sent_again(self):
         table = self.table()
         consumed = 0
 
@@ -137,7 +137,7 @@ class BatchTests(unittest.TestCase):
                          [(10_003, 'not_applied'), (10_005, 'outcome_unknown')])
         self.assertIs(error.__cause__, error.outcomes[3]['error'])
 
-    def test_a_lost_reply_is_unknown_for_every_row_of_that_chunk_only(self):
+    def test_vs15_a_lost_reply_is_unknown_for_every_row_of_that_chunk_only(self):
         table = self.table()
         self.server.answer = lambda number, items: None if number == 2 else all_applied(number, items)
         with self.assertRaises(BatchError) as caught:
@@ -149,13 +149,13 @@ class BatchTests(unittest.TestCase):
         self.assertEqual({row['outcome'] for row in error.outcomes}, {'outcome_unknown'})
         self.assertIsInstance(error.__cause__, UnknownOutcomeError)
 
-    def test_a_short_outcome_list_is_unknown(self):
+    def test_vs15_a_short_outcome_list_is_unknown(self):
         self.server.answer = lambda _, items: {'outcomes': [APPLIED] * (len(items) - 1)}
         with self.assertRaises(BatchError) as caught:
             self.table().delete_many([1, 2])
         self.assertEqual((caught.exception.applied, caught.exception.outcome), (0, 'unknown'))
 
-    def test_later_input_errors_keep_the_applied_count(self):
+    def test_vs15_later_input_errors_keep_the_applied_count(self):
         table = self.table()
 
         def rows(last):

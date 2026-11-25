@@ -33,7 +33,7 @@ export class List<Item extends StringConstructor | Vector<false> = StringConstru
 export type SparseVector = Record<number, number>
 export type VectorInput = readonly number[] | Float32Array
 export type VectorValue = VectorInput | readonly VectorInput[] | Readonly<SparseVector>
-export type QueryValue = string | Float32Array | Float32Array[] | Map<number, number>
+export type QueryValue = string | Float32Array | Float32Array[] | SparseVector
 export type Kind = "dense" | "sparse" | "multi" | "tags"
 
 export function vector(dim: number): Vector<false>
@@ -112,20 +112,20 @@ export function dense(value: unknown, column: string, dim: number | null = null)
   return result
 }
 
-export function sparse(value: unknown, column: string): Map<number, number> {
+export function sparse(value: unknown, column: string): SparseVector {
   if (!isJsonObject(value) || Object.getOwnPropertySymbols(value).length > 0) {
     throw new ValidationError(`Column '${column}' requires a mapping of index to weight`)
   }
-  const entries = Object.entries(value).map(([index, weight]) => [Number(index), weight, index] as const)
-  if (entries.some(([index, , text]) => !indexPattern.test(text) || index > maxIndex)) {
+  // JavaScript lists integer keys in ascending order. Only the largest index is not one, and it is last.
+  const entries = Object.entries(value)
+  if (entries.some(([index]) => !indexPattern.test(index) || Number(index) > maxIndex)) {
     throw new ValidationError(`Column '${column}' requires unsigned 32-bit indices`)
   }
   if (entries.some(([, weight]) => typeof weight !== "number")) {
     throw new ValidationError(`Column '${column}' requires a mapping of index to weight`)
   }
-  entries.sort(([left], [right]) => left - right)
   const weights = float32(entries.map(([, weight]) => weight as number), column)
-  return new Map(entries.map(([index], position) => [index, weights[position]]))
+  return Object.fromEntries(entries.map(([index], position) => [index, weights[position]]))
 }
 
 export function multi(value: unknown, column: string, dim: number | null = null): Float32Array[] {
@@ -149,7 +149,7 @@ export function checkValue(value: unknown, type: unknown, column: string): unkno
   if (kind === "tags") return tags(value, column)
   if (value === null) return null
   if (kind === "dense") return dense(value, column, (type as Vector).dim)
-  if (kind === "sparse") return Object.fromEntries(sparse(value, column))
+  if (kind === "sparse") return sparse(value, column)
   return multi(value, column, itemDim(type))
 }
 
@@ -170,7 +170,7 @@ export function checkQuery(value: QueryValue, type: unknown, column: string): vo
     if (!(value instanceof Float32Array)) throw invalidVector(column)
     dense(value, column, (type as Vector).dim)
   } else if (kind === "sparse") {
-    if (!(value instanceof Map)) {
+    if (!isJsonObject(value)) {
       throw new ValidationError(`Column '${column}' requires a mapping of index to weight`)
     }
   } else if (!Array.isArray(value)) {
@@ -181,9 +181,8 @@ export function checkQuery(value: QueryValue, type: unknown, column: string): vo
 }
 
 export function hasZeroVector(value: QueryValue): boolean {
-  if (value instanceof Map) return ![...value.values()].some(Boolean)
   if (Array.isArray(value)) return value.some(hasZeroVector)
-  return value instanceof Float32Array && !value.some(Boolean)
+  return !(value instanceof Float32Array ? value : Object.values(value)).some(Boolean)
 }
 
 function encode(values: Float32Array | Uint32Array): string {
@@ -197,12 +196,10 @@ export function vectorToWire(value: unknown, type: unknown): unknown {
   if (value === null || kind === "tags") return value
   if (kind === "dense") return { f32: encode(value as Float32Array) }
   if (kind === "sparse") {
-    const entries = value instanceof Map ? value as Map<number, number>
-      : new Map(Object.entries(value as SparseVector).map(([index, weight]) => [Number(index), weight]))
-    const sorted = [...entries].sort(([left], [right]) => left - right)
+    const weights = value as SparseVector
     return { sparse: {
-      i: encode(Uint32Array.from(sorted, ([index]) => index)),
-      f32: encode(Float32Array.from(sorted, ([, weight]) => weight)),
+      i: encode(Uint32Array.from(Object.keys(weights), Number)),
+      f32: encode(Float32Array.from(Object.values(weights))),
     } }
   }
   const vectors = value as Float32Array[]

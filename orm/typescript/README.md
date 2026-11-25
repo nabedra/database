@@ -50,7 +50,8 @@ for await (const batch of batches) {
 On an OLTP server with search, tables can hold vectors, sparse weights, several
 vectors per row and lists of strings. The column type says what the data is, and
 the query says how to rank it. Other servers reject these types and operations with
-code `unsupported_operation` or `validation_error`.
+code `unsupported_operation` or `validation_error`. The application gateway does not
+forward them.
 
 ```typescript
 import { col, list, vector } from "nabedra"

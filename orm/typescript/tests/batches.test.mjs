@@ -75,7 +75,7 @@ function* rows(end) {
   for (const number of numbers(end)) yield row(number)
 }
 
-test("chunks hold at most 10000 rows in order with one call ID each", async (t) => {
+test("VS17 chunks hold at most 10000 rows in order with one call ID each", async (t) => {
   const server = await setUp(t)
   const table = await server.table()
   assert.equal(await table.upsertMany(rows(25_000)), 25_000)
@@ -91,7 +91,7 @@ test("chunks hold at most 10000 rows in order with one call ID each", async (t) 
   assert.deepEqual(server.sizes(), [10_000, 1])
 })
 
-test("chunks fill 8 MiB exactly and never exceed it", async (t) => {
+test("VS17 chunks fill 8 MiB exactly and never exceed it", async (t) => {
   const server = await setUp(t)
   const table = await server.table()
   assert.equal(await table.upsertMany([row(1)]), 1)
@@ -116,7 +116,7 @@ test("chunks fill 8 MiB exactly and never exceed it", async (t) => {
   assert.deepEqual(server.chunks, [])
 })
 
-test("a failed chunk stops an endless iterable and is not sent again", async (t) => {
+test("VS15 a failed chunk stops an endless iterable and is not sent again", async (t) => {
   const server = await setUp(t)
   const table = await server.table()
   let consumed = 0
@@ -145,7 +145,7 @@ test("a failed chunk stops an endless iterable and is not sent again", async (t)
   assert.equal(error.cause, error.outcomes[3].error)
 })
 
-test("a lost reply is unknown for every row of that chunk only", async (t) => {
+test("VS15 a lost reply is unknown for every row of that chunk only", async (t) => {
   const server = await setUp(t)
   const table = await server.table()
   server.answer = (number, items) => number === 2 ? null : allApplied(number, items)
@@ -158,14 +158,14 @@ test("a lost reply is unknown for every row of that chunk only", async (t) => {
   assert.ok(error.cause instanceof UnknownOutcomeError)
 })
 
-test("a short outcome list is unknown", async (t) => {
+test("VS15 a short outcome list is unknown", async (t) => {
   const server = await setUp(t)
   server.answer = (_, items) => ({ outcomes: items.slice(1).map(() => applied) })
   const error = await batchError((await server.table()).deleteMany([1n, 2n]))
   assert.deepEqual([error.applied, error.outcome], [0, "unknown"])
 })
 
-test("later input errors keep the applied count", async (t) => {
+test("VS15 later input errors keep the applied count", async (t) => {
   const server = await setUp(t)
   const table = await server.table()
   function* input(count, last) {

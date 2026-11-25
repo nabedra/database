@@ -132,7 +132,7 @@ function assertError(error, expected) {
   assert.deepEqual(actual, { ...expected, message })
 }
 
-test("vector search shared contract", { timeout: 60_000 }, async (t) => {
+test("VS18 vector search shared contract", { timeout: 60_000 }, async (t) => {
   let described = null
   let reply
   let requests = []

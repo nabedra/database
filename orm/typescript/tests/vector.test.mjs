@@ -70,7 +70,38 @@ test("rankings and queries are immutable", () => {
   assert.equal(new SearchUnavailableError("x").outcome, "not_applied")
 })
 
-test("search requests match Python byte for byte", { timeout: 30_000 }, async (t) => {
+test("submitted search operations keep Python's float tokens", async (t) => {
+  const bodies = []
+  const app = createServer(async (request, response) => {
+    const parts = []
+    for await (const part of request) parts.push(part)
+    const raw = Buffer.concat(parts).toString()
+    bodies.push(raw.slice(raw.indexOf('"payload":') + '"payload":'.length, -1))
+    response.writeHead(202, { "content-type": "application/json" }).end(JSON.stringify({
+      request_id: JSON.parse(raw).request_id, run_id: "11111111-1111-4111-8111-111111111111", state: "queued",
+    }))
+  })
+  app.listen(0, "127.0.0.1")
+  await once(app, "listening")
+  const db = new Database({ url: `http://127.0.0.1:${app.address().port}`, token: "test" })
+  t.after(() => new Promise((resolve) => {
+    db.close()
+    app.close(resolve)
+    app.closeAllConnections()
+  }))
+  await db.submit("table.upsert_many", { rows: [{ id: "a", score: 1 }] })
+  await db.submit("query.rank", {
+    query: { filter: { op: "eq", column: "score", value: 2 } }, rank: { fusion: [1, 0.5], recall: 1, candidates: 100 },
+  })
+  await db.submit("query.rank_many", { rank: { fusion: "rrf", recall: 1 } })
+  assert.deepEqual(bodies, [
+    '{"rows":[{"id":"a","score":1.0}]}',
+    '{"query":{"filter":{"op":"eq","column":"score","value":2.0}},"rank":{"fusion":[1.0,0.5],"recall":1.0,"candidates":100}}',
+    '{"rank":{"fusion":"rrf","recall":1.0}}',
+  ])
+})
+
+test("VS18 search requests match Python byte for byte", { timeout: 30_000 }, async (t) => {
   const descriptor = {
     id: "12345678-1234-1234-1234-123456789abc", name: "chunks",
     schema: {
