@@ -304,8 +304,18 @@ class Fixture:
 
 BUG = "server/sim-oltp/bugs/fix-one"
 # The fakes are told what to do through the environment, which the tool otherwise clears.
-FAKE_KEPT = patch.object(sim_bugs, "KEPT_ENV", re.compile(f"{sim_bugs.KEPT_ENV.pattern}|FAKE_.*")) if hasattr(
-    sim_bugs, "KEPT_ENV") else patch.dict(os.environ, {})
+class FakeKept:
+    def __enter__(self):
+        original = sim_bugs.machine_env
+        self.patch = patch.object(sim_bugs, "machine_env", lambda *args, **own: {
+            **original(*args, **own), **{k: v for k, v in os.environ.items() if k.startswith("FAKE_")}})
+        self.patch.__enter__()
+
+    def __exit__(self, *exc):
+        self.patch.__exit__(*exc)
+
+
+FAKE_KEPT = FakeKept()
 PROBE_TEST = "#[test]\nfn probe_fix_one() {}\n"
 REVIEW = {"verdict": "sensitive", "assertion": "state", "reviewer": "reviewer A",
           "source": "https://github.com/o/r/pull/1#review"}
@@ -621,6 +631,14 @@ class HarnessCase(unittest.TestCase):
         self.f = copy.copy(self.__class__.fixture)
         self.f.repo = self.root / "repo"
 
+    def fresh(self):
+        """The fixture again, with a history that no earlier case is in."""
+        root = self.root / f"fresh-{len(list(self.root.iterdir()))}"
+        shutil.copytree(self.template / "repo", root / "repo")
+        self.f = copy.copy(self.__class__.fixture)
+        self.f.repo = root / "repo"
+        return self.f
+
     def confirm(self, hit):
         """Evidence, the record of a first search, and a detection that confirms its hit."""
         f = self.f
@@ -689,13 +707,13 @@ class HarnessCase(unittest.TestCase):
         self.assertEqual(status, 0, output)
         return output, summary["bugs"][0], calls
 
-    def assert_not_counted(self, *needles, result=None, **kwargs):
+    def assert_not_counted(self, *needles, result=None, status=1, **kwargs):
         """The run counts nothing, and says why."""
         kwargs.setdefault("script", {"hit": 3})
-        status, output, summary, _ = self.harness_run(**kwargs)
+        seen, output, summary, _ = self.harness_run(**kwargs)
         rows = (summary or {}).get("bugs", [])
         self.assertNotIn("found", [row["result"] for row in rows], output)
-        self.assertEqual(status, 1, output)
+        self.assertEqual(seen, status, output)
         self.assertNotIn(sim_bugs.NOT_RUN_MARKER, output)
         for needle in needles:
             self.assertIn(needle, output)
@@ -1521,6 +1539,7 @@ class FoolTest(HarnessCase):
         f = self.f
         f.write("server/src/product.rs", "pub fn product() -> u8 {\n    1\n}\n")
         f.write("server/sim-oltp/src/sweep.rs", "pub const PLANTED: u8 = 0;\n")
+        f.write("server/sim-oltp/src/sweep_tests.rs", "fn x() {}\n")
         f.write("server/Cargo.toml", "[package]\n")
         f.write("server/build.rs", "fn main() {}\n")
         f.write("scripts/x.py", "pass\n")
@@ -1530,24 +1549,26 @@ class FoolTest(HarnessCase):
         product = (f.repo / "server/src/product.rs").read_text()
         cases = (
             ("removes a line", f.revert_diff("server/src/tests.rs", PROBE_TEST), "probe.patch may only add lines"),
+            ("simulator tests", test + f.revert_diff("server/sim-oltp/src/sweep_tests.rs", "fn x() {}\nfn y() {}\n"),
+             "probe.patch touches server/sim-oltp/src/sweep_tests.rs"),
             ("product line", test + f.revert_diff("server/src/product.rs", product.replace("    1\n", "    let _ = 0;\n    1\n")),
-             "adds lines to server/src/product.rs that are not only for tests"),
+             "not one plain test block"),
             ("product item under another cfg", test + f.revert_diff(
                 "server/src/product.rs", product + '#[cfg(any(test, feature = "oltp"))]\npub fn hook() {}\n'),
-             "adds lines to server/src/product.rs that are not only for tests"),
+             "not one plain test block"),
             ("product item not under test", test + f.revert_diff(
                 "server/src/product.rs", product + '#[cfg(not(test))]\npub fn hook() {}\n'),
-             "adds lines to server/src/product.rs that are not only for tests"),
+             "not one plain test block"),
             ("one line after a test item", test + f.revert_diff(
                 "server/src/product.rs", product + "#[cfg(test)]\npub fn hook() {}\npub fn more() {}\n"),
-             "adds lines to server/src/product.rs that are not only for tests"),
+             "not one plain test block"),
             # An attribute that takes a product item, or the whole file, out of the product.
             ("takes an item", test + f.revert_diff("server/src/product.rs", "#[cfg(test)]\n" + product),
-             "adds lines to server/src/product.rs that are not only for tests"),
+             "not one plain test block"),
             ("takes a statement", test + f.revert_diff("server/src/product.rs", product.replace("    1\n", "    #[cfg(test)]\n    1\n")),
-             "adds lines to server/src/product.rs that are not only for tests"),
+             "not one plain test block"),
             ("takes the file", test + f.revert_diff("server/src/product.rs", "#![cfg(test)]\n" + product),
-             "adds lines to server/src/product.rs that are not only for tests"),
+             "not one plain test block"),
             ("harness", test + f.revert_diff("server/sim-oltp/src/sweep.rs", "pub const PLANTED: u8 = 0;\n// x\n"),
              "probe.patch touches server/sim-oltp/src/sweep.rs"),
             ("manifest", test + f.revert_diff("server/Cargo.toml", "[package]\nx = 1\n"), "probe.patch touches server/Cargo.toml"),
@@ -1565,9 +1586,94 @@ class FoolTest(HarnessCase):
                 self.assert_refused(needle)
         for name, text in (("test", "#[cfg(test)]\n"), ("hooks", '#[cfg(any(test, feature = "test-hooks"))]\n#[doc(hidden)]\n')):
             with self.subTest(name=name):
-                self.probe_row(test + f.revert_diff("server/src/product.rs", product + text + "pub fn hook() {\n    x()\n}\n"))
+                self.probe_row(test + f.revert_diff("server/src/product.rs", product + text + "pub fn hook() {\n    x();\n}\n"))
                 status, output = f.run("check")
                 self.assertEqual(status, 0, output)
+
+    def test_probe_block_in_a_product_source(self):
+        # Only whole blocks of one plain shape are accepted, in a place that needs no reading of Rust to know.
+        f = self.f
+        before = "pub fn product(a: u8) -> u8 {\n    let b = a;\n"
+        after = "    b\n}\n"
+        test = f.revert_diff("server/src/tests.rs", TESTS + PROBE_TEST)
+        good = "    #[cfg(test)]\n    if let Some(id) = b.into() {\n        crate::tests::pause(\"here\", id);\n    }\n"
+        hook = '#[cfg(any(test, feature = "test-hooks"))]\n#[doc(hidden)]\npub fn hook(mut self) -> Self {\n    self.x = true;\n    self\n}\n'
+        statement = "    #[cfg(test)]\n    let _probe = b.map(|value| value.id);\n"
+
+        def probe(base_before, block, base_after):
+            f.write("server/src/product.rs", base_before + base_after)
+            f.commit("product")
+            self.probe_row(test + f.revert_diff("server/src/product.rs", base_before + block + base_after))
+
+        for name, block, parts in (("statement block", good, (before, after)), ("statement", statement, (before, after)),
+                                   ("two blocks apart", None, None), ("item", hook, (before + after, "#[inline]\npub fn z() {}\n")),
+                                   ("item at the end", hook, (before + after, "")),
+                                   ("after a comment", good, (before + "    // a \"quoted\" note\n", after)),
+                                   ("after a byte string", good, (before + "    c(b\"x\", '\"', \"a\\\"b\");\n", after))):
+            if block is None:
+                continue
+            with self.subTest(accepted=name):
+                probe(parts[0], block, parts[1])
+                status, output = f.run("check")
+                self.assertEqual(status, 0, output)
+        raw, comment = "    let s = r#\"a\"#;\n", "    /* a */\n"
+        cases = (
+            ("behind the item", hook.replace("    self\n}\n", "    self\n} pub fn evil() -> u8 { 9 }\n"), (before + after, "")),
+            ("on the attribute's line", "#[cfg(test)] fn hook() {} pub fn evil() -> u8 { 9 }\n", (before + after, "")),
+            ("behind an item on one line", "#[cfg(test)]\nfn hook() {} pub fn evil() -> u8 { 9 }\n", (before + after, "")),
+            ("before the attribute", "pub fn evil() -> u8 { 9 } #[cfg(test)]\nfn hook() {\n    x();\n}\n", (before + after, "")),
+            ("after the block", good + "    let evil = 9;\n", (before, after)),
+            ("before the block", "    let evil = 9;\n" + good, (before, after)),
+            ("two in one run", good + good, (before, after)),
+            ("inner block", good.replace("        crate", "        if x { y(); }\n        crate"), (before, after)),
+            ("raw byte string", good.replace("\"here\"", "br\"\\\""), (before, after)),
+            ("raw string", good.replace("\"here\"", "r\"here\""), (before, after)),
+            ("byte string", good.replace("\"here\"", "b\"here\""), (before, after)),
+            ("open string", good.replace("\"here\"", "\"here"), (before, after)),
+            ("escape", good.replace("\"here\"", "\"he\\\"re\""), (before, after)),
+            ("character", good.replace("\"here\"", "'h'"), (before, after)),
+            ("nested comment", good.replace("\"here\"", "/* /* */ { */ 1"), (before, after)),
+            ("line comment", good.replace("        crate", "        // }\n        crate"), (before, after)),
+            ("other indentation", good.replace("        crate", "    crate"), (before, after)),
+            ("another closing", good.replace("\n    }\n", "\n     }\n"), (before, after)),
+            ("other feature", good.replace("#[cfg(test)]", "#[cfg(feature = \"oltp\")]"), (before, after)),
+            ("cfg macro", "    if cfg!(test) {\n        crate::tests::pause(1);\n    }\n", (before, after)),
+            ("not test", good.replace("#[cfg(test)]", "#[cfg(not(test))]"), (before, after)),
+            ("blanks in the attribute", good.replace("#[cfg(test)]", "#[cfg( test )]"), (before, after)),
+            ("another attribute", hook.replace("#[doc(hidden)]", "#[no_mangle]"), (before + after, "")),
+            ("impl", "#[cfg(test)]\nimpl Drop for X {\n    x();\n}\n", (before + after, "")),
+            ("macro", "#[cfg(test)]\nmacro_rules! x {\n    x();\n}\n", (before + after, "")),
+            ("statement over a block", statement.replace("b.map(|value| value.id)", "{ evil() }"), (before, after)),
+            ("two statements", statement.replace("id);", "id); evil();"), (before, after)),
+            ("open bracket", statement.replace("value.id)", "value.id"), (before, after)),
+            ("no tail", statement.replace(";\n", "\n"), (before, after)),
+            # The place.
+            ("in a string", good, ("pub fn product() -> &'static str {\n    \"a\n", "    b\"\n}\n")),
+            ("after a raw string", good, (before + raw, after)),
+            ("after a raw byte string", good, (before + raw.replace("r#", "br#"), after)),
+            ("after a block comment", good, (before + comment, after)),
+            ("in a comment", good, (before + "    /* a\n", "    */\n" + after)),
+            ("under an attribute", good, (before + "    #[allow(unused)]\n", after)),
+            ("in an argument list", good, (before + "    c(\n", "    1);\n" + after)),
+            ("after an operator", good, (before + "    let c = 1 +\n", "    2;\n" + after)),
+            ("before else", good, (before + "    if a == 1 {\n    }\n", "    else {\n    }\n" + after)),
+            ("before a method", good, (before + "    if a == 1 {\n    }\n", "    .x();\n" + after)),
+            ("before else behind a comment", good, (before + "    if a == 1 {\n    }\n", "    // c\n\n    else {\n    }\n" + after)),
+        )
+        for name, block, parts in cases:
+            with self.subTest(refused=name):
+                probe(parts[0], block, parts[1])
+                status, output = f.run("check")
+                self.assertEqual(status, 1, output)
+                self.assertIn("not one plain test block", output)
+
+    def test_probe_that_reads_the_source(self):
+        f = self.f
+        for text in ("include_str!(\"lib.rs\")", "include_bytes !(\"lib.rs\")", "include!(\"lib.rs\")",
+                     "use std::include_str as read"):
+            with self.subTest(text=text):
+                self.probe_row(f.revert_diff("server/src/tests.rs", TESTS + PROBE_TEST + f"// x\nfn y() {{ {text}; }}\n"))
+                self.assert_refused("probe.patch may not include a source as text")
 
     def test_probe_of_a_test_that_exists(self):
         self.f.write("server/src/tests.rs", TESTS + PROBE_TEST)
@@ -1635,6 +1741,61 @@ class FoolTest(HarnessCase):
                 errors, _ = sim_bugs.regression_evidence(bug, f.repo)
                 self.assertEqual(any("probe" in problem for problem in errors) or "does not differ" in str(errors),
                                  refused, errors)
+
+    def test_scratch_evidence_with_more_than_the_probe(self):
+        # Every commit hangs off `main` on its own branch, as the scratch branches of phase 11 do.
+        f = self.f
+        main = sh(f.repo, "rev-parse", "HEAD").strip()
+        head = sh(f.repo, "symbolic-ref", "--short", "HEAD").strip()
+
+        def scratch(*steps):
+            sh(f.repo, "checkout", "-q", "--detach", main)
+            for files in steps:
+                for name, text in files.items():
+                    f.write(name, text)
+                sha = f.commit("scratch")
+            sh(f.repo, "checkout", "-q", head)
+            return sha
+
+        tests, lib = "server/src/tests.rs", "server/src/lib.rs"
+        with_probe = TESTS + PROBE_TEST
+        panics = with_probe + 'fn x() { panic!("lost the uncertain outcome") }\n'
+        other = "fn another_probe() {}\n" + with_probe
+        clean = scratch({tests: with_probe})
+        probe = f.revert_diff(tests, with_probe)
+        regression = f.evidence()
+        e = regression["evidence"]
+        e["patched"].update(output=e["patched"]["output"].split("fix-one:")[0])
+        bug = sim_bugs.Bug(f.repo / BUG, {"id": "fix-one", "regression": {**regression, "probe": True}}, f.patch, probe)
+        for name, clean_sha, patched, refused in (
+                ("the probe and the patch", clean, scratch({tests: with_probe, lib: LIB}), None),
+                ("other probes on the clean side", scratch({tests: other}), scratch({tests: with_probe, lib: LIB}), None),
+                ("a panic in the probe's file", clean, scratch({tests: panics, lib: LIB}), "than the probe and the patch"),
+                ("a blank more", clean, scratch({tests: with_probe + " \n", lib: LIB}), "than the probe and the patch"),
+                ("a panic in the patch's file", scratch({tests: with_probe, lib: FIXED}),
+                 scratch({tests: with_probe, lib: LIB + "fn x() { panic!() }\n"}), ""),
+                ("a panic in the commit before", clean, scratch({tests: panics}, {tests: panics.replace("panic", "panics"), lib: LIB}),
+                 "does not hold the probe alone"),
+                ("a step before", clean, scratch({"server/src/other.rs": "fn x() {}\n"}, {tests: with_probe, lib: LIB}),
+                 "is not in HEAD's history")):
+            with self.subTest(name=name):
+                e["clean"]["sha"], e["patched"]["sha"] = clean_sha, patched
+                errors, uncounted = sim_bugs.regression_evidence(bug, f.repo)
+                if refused is None:
+                    self.assertEqual((errors, uncounted), ([], []))
+                else:
+                    self.assertTrue(errors, uncounted)
+                    if name in ("a panic in the probe's file", "a blank more", "a step before"):
+                        self.assertIn(refused, errors[0])
+
+    def test_evidence_of_a_commit_without_a_probe(self):
+        f = self.f
+        self.probe_row()
+        path = f.repo / BUG / "bug.toml"
+        text = path.read_text()
+        sha = re.search(r'sha = "([0-9a-f]{40})"', text).group(1)
+        path.write_text(text.replace(sha, self.tested))
+        self.assert_refused("holds another probe")
 
     def verify(self, *argv, **env):
         cargo = self.root / "fake_cargo.py"
@@ -1707,7 +1868,7 @@ assert sys.argv[5:] == ["--suite", "replacement-wipe"], sys.argv
 assert Path(os.environ["PYTHONPATH"]).parts[-3:] == ("orm", "python", "src"), os.environ["PYTHONPATH"]
 assert os.environ["NABEDRA_TEST_DIRECT_OLTP"] == "on" and "NABEDRA_SURPRISE" not in os.environ
 if "fixed" in Path("server/src/lib.rs").read_text():
-    print(json.dumps({"scenario": "O17", "status": "passed"}))
+    print(json.dumps({"scenario": "O17/NS23 refuses a wiped mounted replacement", "status": "passed"}))
     sys.exit(0)
 PATCHED
 """
@@ -1719,17 +1880,21 @@ PATCHED
                 ("another failure", 'print("AssertionError: no sudo"); sys.exit(1)', None, "failed-otherwise; NOT verified"),
                 ("killed", "os.kill(os.getpid(), 9)", None, "not-run; NOT verified"),
                 ("usage error", "sys.exit(2)", None, "not-run; NOT verified"),
-                ("passes", 'print(json.dumps({"scenario": "O17", "status": "passed"}))', None, "passed; NOT verified"),
+                ("passes", 'print(json.dumps({"scenario": "O17/NS23 refuses a wiped mounted replacement", "status": "passed"}))', None, "passed; NOT verified"),
                 ("a traceback of the import", fails, "raise ImportError('lost the uncertain outcome')", "NOT verified"),
                 ("says nothing", fails, "sys.exit(0)", "NOT verified"),
                 ("an import that says the text", "raise ImportError('lost the uncertain outcome')", None, "not-run; NOT verified"),
-                ("reports, then fails", 'print(json.dumps({"scenario": "O17", "status": "passed"})); ' + fails, None,
+                ("another scenario passes", 'print(json.dumps({"scenario": "O17/R01 abandons only unmounted intents", "status": "passed"}));'
+                 + fails, None, "verified"),
+                ("another scenario on the clean side", fails, 'print(json.dumps({"scenario": "O17", "status": "passed"})); sys.exit(0)',
+                 "NOT verified"),
+                ("reports, then fails", 'print(json.dumps({"scenario": "O17/NS23 refuses a wiped mounted replacement", "status": "passed"})); ' + fails, None,
                  "not-run; NOT verified"),
                 ("reports and fails", fails, 'print(json.dumps({"status": "passed"})); sys.exit(1)', "NOT verified")):
             with self.subTest(name=name):
                 script = self.SUITE.replace("PATCHED", patched)
                 if clean:
-                    script = script.replace('    print(json.dumps({"scenario": "O17", "status": "passed"}))\n    sys.exit(0)',
+                    script = script.replace('    print(json.dumps({"scenario": "O17/NS23 refuses a wiped mounted replacement", "status": "passed"}))\n    sys.exit(0)',
                                             f"    {clean}")
                 self.suite_row(script)
                 status, output = self.verify(NABEDRA_SURPRISE="1")
@@ -1737,30 +1902,34 @@ PATCHED
                 self.assertEqual(status, 0 if expected == "verified" else 1, output)
 
     def test_regression_that_changed_after_its_review(self):
-        f = self.f
-        f.write("server/src/tests.rs", TESTS + "#[test]\nfn other_test() {}\n")
-        f.commit("another test")
-        text = (f.repo / BUG / "bug.toml").read_text()
+        # Each on a history of its own: a variant that was committed once is refused for that alone.
+        source = REVIEW["source"]
         for old, new in (('test = "tests::d02_fix_one_keeps_the_outcome"', 'test = "tests::other_test"'),
                          ('failure_contains = ["lost the uncertain outcome"]', 'failure_contains = ["uncertain outcome"]'),
                          ('failure_contains = ["lost the uncertain outcome"]\n', ""),
+                         ('assertion = "state"\nfailure_contains', "failure_contains"),
                          ("[regression]\n", '[regression]\nmode = "off"\n'),
                          ("[regression]\n", "[regression]\nattempts = 9\n"),
                          ("[regression]\n", "[regression]\nneeds_server = true\n")):
-            with self.subTest(new=new or old):
-                self.assertIn(old, text)
-                f.write(f"{BUG}/bug.toml", text.replace(old, new, 1))
-                self.assert_refused("the regression changed after its review")
-                # Another review, of the regression as it is now.
-                f.write(f"{BUG}/bug.toml", text.replace(old, new, 1).replace(
-                    REVIEW["source"], "https://github.com/o/r/pull/1#second-review"))
-                status, output = f.run("check")
-                self.assertEqual(status, 0, output)
-                # The notes of a review are not the review.
-                f.write(f"{BUG}/bug.toml", text.replace(old, new, 1).replace(
-                    f'source = "{REVIEW["source"]}"', f'source = "{REVIEW["source"]}"\nnotes = "same review"'))
-                self.assert_refused("the regression changed after its review")
-                f.write(f"{BUG}/bug.toml", text)
+            for name, replaced, refused in (
+                    ("same review", source, True), ("another review", "https://github.com/o/r/pull/1#second-review", False),
+                    ("the notes of a review are not the review", f'{source}"\nnotes = "same review', True)):
+                with self.subTest(new=new or old, name=name):
+                    f = self.fresh()
+                    f.write("server/src/tests.rs", TESTS + "#[test]\nfn other_test() {}\n")
+                    f.commit("another test")
+                    text = (f.repo / BUG / "bug.toml").read_text()
+                    self.assertIn(old, text)
+                    f.write(f"{BUG}/bug.toml", text.replace(old, new, 1).replace(source, replaced, 1))
+                    status, output = f.run("check")
+                    self.assertEqual(status, int(refused), output)
+                    if refused:
+                        self.assertIn("the regression changed after its review", output)
+        # What may change: the time limit and the evidence.
+        f = self.fresh()
+        f.edit("[regression]\n", "[regression]\ntimeout_s = 900\n")
+        status, output = f.run("check")
+        self.assertEqual(status, 0, output)
 
     def test_evidence_of_another_test(self):
         # The manifest at the commit that `verify` tested named another test.
@@ -1812,6 +1981,110 @@ PATCHED
         status, output = self.verify(FAKE_ENVIRONMENT=str(written), RUSTFLAGS="--cfg planted", **machine)
         self.assertEqual(status, 0, output)
         self.assertEqual(sorted(set(json.loads(written.read_text())) & {*machine, "RUSTFLAGS"}), [])
+
+    def test_the_whole_environment_is_fixed(self):
+        # Whatever the machine sets, a build sees these names and no others, and its own temporary directory.
+        noise = {name: "x" for name in ("TMPDIR", "TMP", "TEMP", "RUNNER_TEMP", "CI", "SHELL", "TERM", "XDG_CONFIG_HOME",
+                                        "CARGO_TERM_COLOR", "CARGO_NET_OFFLINE", "HTTPS_PROXY", "https_proxy", "SSL_CERT_FILE",
+                                        "RUST_BACKTRACE", "SCCACHE_DIR", "ANYTHING")}
+        written = self.root / "environment.json"
+        status, output = self.verify(FAKE_ENVIRONMENT=str(written), CARGO_PROFILE_TEST_DEBUG="2", **noise)
+        self.assertEqual(status, 0, output)
+        seen = {name for name in json.loads(written.read_text()) if not name.startswith("FAKE_")}
+        self.assertEqual(seen - {"LD_LIBRARY_PATH"} - set(sim_bugs.MACHINE), {
+            "CARGO_TARGET_DIR", "CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG", "TMPDIR"})
+        self.assertLessEqual(len(sim_bugs.MACHINE), 8)
+        _, _, calls = self.assert_found(script={"hit": 3}, **noise)
+        for call in calls:
+            self.assertEqual(set(call["environment"]) & set(noise), {"TMPDIR"})
+
+    def test_scratch_directory_that_the_machine_does_not_choose(self):
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root), "TMPDIR": str(self.root)}):
+            scratch = sim_bugs.Scratch(self.f.repo)
+        self.assertEqual(scratch.path.parent, sim_bugs.SCRATCH_BASE)
+        self.assertEqual(sim_bugs.SCRATCH_BASE, Path("/var/tmp"))
+        # Cargo reads the configuration of every directory above the one it builds in.
+        for name in ("config.toml", "config"):
+            base = self.root / f"above-{name}" / "base"
+            (base.parent / ".cargo").mkdir(parents=True)
+            base.mkdir()
+            (base.parent / ".cargo" / name).write_text("[build]\n")
+            with patch.object(sim_bugs, "SCRATCH_BASE", base):
+                self.assert_not_counted("Cargo configuration", status=2)
+                status, output = self.verify()
+            self.assertEqual(status, 2, output)
+            self.assertIn("Cargo configuration", output)
+
+    def test_cargo_is_not_named_by_a_variable(self):
+        seen = []
+        with patch.dict(os.environ, {"NABEDRA_CARGO": "/x/cargo"}), patch.object(
+                sim_bugs, "cmd_verify", side_effect=lambda repo, bugs, args, out: seen.append(args.cargo) or 0):
+            self.f.run("verify")
+        self.assertEqual(seen, ["cargo"])
+        # Another command is the caller's, and the log says so.
+        status, output = self.verify()
+        self.assertIn("cargo command: ", output)
+
+    def test_git_takes_nothing_from_the_machine(self):
+        shim, log = self.root / "shim", self.root / "git.env"
+        shim.mkdir()
+        real = shutil.which("git")
+        (shim / "git").write_text(f"#!/bin/sh\nenv -0 | tr '\\0' '\\n' | cut -d= -f1 >> {log}\nexec {real} \"$@\"\n")
+        (shim / "git").chmod(0o755)
+        noise = {"LD_AUDIT": "", "XDG_CONFIG_HOME": "/x", "GIT_TRACE": "0", "GIT_CONFIG_COUNT": "0", "PAGER": "x", "EDITOR": "x"}
+        with patch.dict(os.environ, {"PATH": f"{shim}:{os.environ['PATH']}", **noise}):
+            status, output = self.f.run("check")
+        self.assertEqual(status, 0, output)
+        seen = set(log.read_text().split())
+        self.assertEqual(seen & set(noise), set())
+        self.assertLessEqual(seen - set(sim_bugs.MACHINE) - {"PWD", "SHLVL", "_", "OLDPWD"}, {
+            "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_INDEX_FILE"})
+
+    def test_git_configuration_does_not_rewrite_a_patch(self):
+        # Blanks at the end of an added line are part of what was reviewed.
+        f = self.f
+        text = LIB.replace("    } else {", "    } else {   ")
+        home = self.root / "home"
+        home.mkdir()
+        (home / ".gitconfig").write_text("[apply]\n    whitespace = fix\n[core]\n    autocrlf = true\n")
+        patch_text = f.revert_diff("server/src/lib.rs", text)
+        sh(f.repo, "config", "apply.whitespace", "fix")
+        sh(f.repo, "config", "core.hooksPath", str(self.root / "hooks"))
+        (self.root / "hooks").mkdir()
+        hook = self.root / "hooks/post-checkout"
+        hook.write_text("#!/bin/sh\necho planted > planted.txt\n")
+        hook.chmod(0o755)
+        bug = sim_bugs.Bug(f.repo / BUG, {}, patch_text)
+        with patch.dict(os.environ, {"HOME": str(home)}), sim_bugs.Scratch(f.repo) as scratch:
+            self.assertFalse((scratch.path / "planted.txt").exists())
+            scratch.apply(bug)
+            self.assertEqual((scratch.path / "server/src/lib.rs").read_text(), text)
+            self.assertEqual(sim_bugs.applied(f.repo, patch_text), [])
+
+    def test_tree_that_is_not_the_tree_plus_the_patch(self):
+        # A filter rewrites the file as Git writes it into the scratch tree.
+        f = self.f
+        sh(f.repo, "config", "filter.x.smudge", "sed s/unknown/UNKNOWN/")
+        sh(f.repo, "config", "filter.x.clean", "sed s/UNKNOWN/unknown/")
+        (f.repo / ".git/info").mkdir(exist_ok=True)
+        (f.repo / ".git/info/attributes").write_text("server/src/lib.rs filter=x\n")
+        status, output, summary, _ = self.harness_run(script={"hit": 3})
+        self.assertNotIn("found", [row["result"] for row in (summary or {}).get("bugs", [])], output)
+        self.assertNotEqual(status, 0, output)
+        # The same when only the application differs.
+        original = sim_bugs.git
+
+        def git(repo, *args, **kwargs):
+            if args[:1] == ("apply",) and "input" in kwargs and "--numstat" not in args:
+                kwargs["input"] = kwargs["input"].replace('+        "not_applied"', '+        "not_applied" ')
+            return original(repo, *args, **kwargs)
+
+        (f.repo / ".git/info/attributes").unlink()
+        with patch.object(sim_bugs, "git", git):
+            problems = sim_bugs.applied(f.repo, f.patch)
+            self.assertTrue(any("not the tree plus the patch" in problem for problem in problems), problems)
+            with sim_bugs.Scratch(f.repo) as scratch, self.assertRaisesRegex(sim_bugs.Failure, "not the tree plus the patch"):
+                scratch.apply(sim_bugs.Bug(f.repo / BUG, {}, f.patch))
 
     def test_git_variables_do_not_reach_git(self):
         empty = self.root / "empty"
