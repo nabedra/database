@@ -41,7 +41,8 @@
 //! | Case | Verdict |
 //! | --- | --- |
 //! | Another body under the identity commits after a no-op or a row conflict | accepted: these results do not hold the identity |
-//! | Another body is refused as reuse, and only a no-op or a row conflict came before | flagged: `request-id-reuse-misdetected` for an `upsert`, `update` or `delete`, `non-linearizable` for an insert of an absent row |
+//! | Another body is refused as reuse, and only answered no-ops or row conflicts came before | flagged: `request-id-reuse-misdetected` for an `upsert`, `update` or `delete`, `non-linearizable` for an insert of an absent row |
+//! | The same, but one of those requests also has an unknown attempt | accepted: that attempt may hold the identity, without an effect. Before, it had to be able to take effect on the rows as they were, which the rule now excludes |
 //! | After such a commit, the first body answers its no-op again | flagged: `request-id-reuse-undetected` |
 //! | After such a commit, the first body is refused as reuse | accepted |
 //! | `insert_many` over a present row | not a result: each attempt is judged on the rows at its time |

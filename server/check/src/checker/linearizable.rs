@@ -49,7 +49,7 @@ use super::direct::results::{self, Definite};
 use super::{Anomaly, Verdict, canon};
 use crate::history::{Event, Op, Outcome, pair, payload};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Upper bound on memoized configurations per independent key group. Large states can have
 /// a lower limit so a search reports `check-limit` before it exhausts memory.
@@ -677,6 +677,28 @@ fn build(
             groups.insert(identity, out.len());
         }
         out.push(op);
+    }
+    // An unknown attempt of a request without effect may still hold the identity against another
+    // body, so that a refusal of that body is explained. It changes no row.
+    for g in groups.into_values().collect::<BTreeSet<usize>>() {
+        let Some(record) = out[g].record.filter(|_| out[g].role != Role::Effect) else {
+            continue;
+        };
+        let attempts = || std::iter::once(out[g].src).chain(out[g].more.iter().copied());
+        let unknown = attempts()
+            .filter(|&i| ops[i].outcome == Outcome::Info)
+            .min_by_key(|&i| ops[i].call);
+        if let Some(src) = unknown {
+            out.push(KeyOp {
+                rows: vec![],
+                record: Some(record),
+                role: Role::Effect,
+                call: ops[src].call,
+                ret: None,
+                src,
+                more: vec![],
+            });
+        }
     }
     (out, keys.len() + slots.len())
 }

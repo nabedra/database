@@ -972,6 +972,53 @@ fn the_verdict_is_as_before_where_the_decision_is_silent() {
          2< reused",
         &["non-linearizable"],
     );
+    // With an unknown attempt of the first body the refusal was accepted, and still is. The attempt
+    // holds the identity from then on and has no effect.
+    let held = "0> update k 2 r
+         0< info
+         2> upsert k 9 r
+         2< reused
+         0> update k 2 r
+         0< ok false
+         1> get k
+         1< ok null";
+    by_default(
+        "another body is refused after an unknown attempt",
+        held,
+        &[],
+    );
+    by_default(
+        "and commits afterwards",
+        &format!(
+            "{held}
+             3> upsert k 9 r
+             3< ok
+             1> get k
+             1< ok 9"
+        ),
+        &["non-linearizable"],
+    );
+    by_default(
+        "and the unknown attempt applies",
+        &format!(
+            "{held}
+             1> insert k 1 other
+             1< ok
+             1> get k
+             1< ok 2"
+        ),
+        &["non-linearizable"],
+    );
+    by_default(
+        "another body is refused before the unknown attempt was sent",
+        "2> upsert k 9 r
+         2< reused
+         0> update k 2 r
+         0< info
+         0> update k 2 r
+         0< ok false",
+        &["non-linearizable", "request-id-reuse-misdetected"],
+    );
     by_default(
         "the first body is refused once another committed",
         "0> update k 2 r
