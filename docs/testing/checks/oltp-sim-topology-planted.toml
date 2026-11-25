@@ -6,20 +6,22 @@ kinds = ["S", "H"]
 # runs of all 8 seeds must report none of those rules. A run that panicked, differed from its replay,
 # left the fault model, gave up or left no report fails the check. Seeds whose clean run is red for
 # another reason still count as the twin of their defect. Six of the eight defects change one
-# observation, so they test the rule and its wiring only.
+# observation, so they test the rule and its wiring only. Seed 2 is also run with `lose-row`: the
+# auditor meets the lost row with a no-op there, and it must not read as a refused write.
 guarantees = []
 scenarios = []
 tiers = ["T1"]
 command = ["bash", "-euc", '''
 build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
-python3 ../scripts/testing/sim_planted.py --out ../target/testing-logs/oltp-sim-topology-planted \
-  --first "$NABEDRA_SEED" --seeds "$NABEDRA_SEEDS" \
+planted() { python3 ../scripts/testing/sim_planted.py --out "../target/testing-logs/oltp-sim-topology-planted/$@" \
+  -- "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1; }
+planted all --first "$NABEDRA_SEED" --seeds "$NABEDRA_SEEDS" \
   lose-row=CoveringIndexComplete duplicate-row=IndexExactlyOnce \
   choose-building=IncompleteIndexChosen fake-drop=DroppedTableSilent \
   refresh-twice=StaleRouteRefreshesOnce lie-about-refusal=RefusedDdlApplied \
-  stuck-fence=FenceAfterValidation lose-range=RouteCoverage \
-  -- "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1
+  stuck-fence=FenceAfterValidation lose-range=RouteCoverage
+planted lose-row-2 --first 2 --seeds 1 lose-row=CoveringIndexComplete
 ''']
 cwd = "server"
 timeout_s = 5400

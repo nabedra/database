@@ -1051,11 +1051,7 @@ async fn audit(t: Topo, table: Table, steps: Vec<Audit>) {
         )
         .await;
         let completed = t.next();
-        let ended = match &answer {
-            answer if clients::unknown(answer) => Ended::Unknown,
-            Completion::Ok(Value::Bool(false)) | Completion::Refused(_) => Ended::Refused,
-            _ => Ended::Acked,
-        };
+        let ended = ended(&answer);
         t.log(|log| {
             log.writes.entry(table).or_default().push(Write {
                 key,
@@ -1069,7 +1065,7 @@ async fn audit(t: Topo, table: Table, steps: Vec<Audit>) {
         match (ended, new) {
             (Ended::Acked, Some(_)) if insert => live.push(key),
             // A key whose state is open, or that is gone, is not written again.
-            (Ended::Acked, Some(_)) | (Ended::Refused, _) => {}
+            (Ended::Acked, Some(_)) | (Ended::Refused | Ended::NoOp, _) => {}
             _ => live.retain(|live| *live != key),
         }
         if insert && ended == Ended::Acked && t.take_defect(Defect::LoseRow) {
@@ -1081,6 +1077,16 @@ async fn audit(t: Topo, table: Table, steps: Vec<Audit>) {
         if let Some(gateway) = step.explain {
             let _ = explain(&t, &mut queries, node, gateway, table).await;
         }
+    }
+}
+
+/// How a write ended. `update` and `delete` answer whether the row exists.
+fn ended(answer: &Completion) -> Ended {
+    match answer {
+        answer if clients::unknown(answer) => Ended::Unknown,
+        Completion::Ok(Value::Bool(false)) => Ended::NoOp,
+        Completion::Refused(_) => Ended::Refused,
+        _ => Ended::Acked,
     }
 }
 
@@ -3309,6 +3315,8 @@ fn summarize(
 
 #[cfg(test)]
 mod tests {
+    use nabedra_protocol::protocol::ProtocolError;
+
     use super::*;
 
     #[test]
@@ -3420,6 +3428,24 @@ mod tests {
             attempt(true, (220, 230), Answer::Unknown),
         ];
         assert!(clauses(split(Some(200)), &unknown, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_success_that_changed_no_row_is_not_a_refusal() {
+        let refused = |outcome| {
+            Completion::Refused(ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                "direct route unavailable",
+                outcome,
+            ))
+        };
+        assert_eq!(ended(&Completion::Ok(json!(false))), Ended::NoOp);
+        assert_eq!(ended(&Completion::Ok(json!(true))), Ended::Acked);
+        assert_eq!(ended(&Completion::Ok(Value::Null)), Ended::Acked);
+        assert_eq!(ended(&refused(Outcome::NotApplied)), Ended::Refused);
+        assert_eq!(ended(&refused(Outcome::Unknown)), Ended::Unknown);
+        let lost = Completion::Unknown("connection error".into());
+        assert_eq!(ended(&lost), Ended::Unknown);
     }
 
     #[test]

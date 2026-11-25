@@ -114,6 +114,8 @@ pub(crate) enum Ended {
     Acked,
     /// A definite `not_applied`.
     Refused,
+    /// Success that changed no row.
+    NoOp,
     /// No definite answer before the run ended.
     Unknown,
 }
@@ -183,9 +185,10 @@ pub(crate) fn audit_scans(writes: &[Write], scans: &[Scan]) -> Vec<(&'static str
                 continue;
             };
             let later = &history[index + 1..];
-            let quiet = later
-                .iter()
-                .all(|write| write.invoked >= scan.completed || write.ended == Ended::Refused);
+            let quiet = later.iter().all(|write| {
+                write.invoked >= scan.completed
+                    || matches!(write.ended, Ended::Refused | Ended::NoOp)
+            });
             let shown = rows.get(key).map_or(&[][..], Vec::as_slice);
             // A refused write that took effect is reported as that.
             let refused = later.iter().any(|write| {
@@ -240,6 +243,15 @@ fn illegal_row(history: &[&Write], scan: &Scan, value: i64) -> Option<(&'static 
             REFUSED_WRITE,
             format!(
                 "that write was refused as not applied at {}",
+                write.completed
+            ),
+        ));
+    }
+    if write.ended == Ended::NoOp {
+        return Some((
+            EXACTLY_ONCE,
+            format!(
+                "that write was answered as changing no row at {}",
                 write.completed
             ),
         ));
