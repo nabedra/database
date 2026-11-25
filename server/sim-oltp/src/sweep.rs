@@ -737,8 +737,12 @@ fn write_record(
     );
     record.not_run("ConsistentCommittedData", "P10-PROBES integration pending");
     if input.workload.split(',').any(|name| name == "membership") {
-        for (form, why) in crate::invariants::membership::PROBE_FORMS {
+        use crate::invariants::membership::{GUIDANCE_ONLY, NOT_RUN_FORMS};
+        for (form, why) in NOT_RUN_FORMS {
             record.not_run(form, why);
+        }
+        for (kind, why) in GUIDANCE_ONLY {
+            record.not_run(&format!("{kind} as a counted rule"), why);
         }
     }
     if input.smoke {

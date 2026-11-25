@@ -4,7 +4,8 @@
 //! `not_run` until they exist (`PROBE_FORMS`).
 //!
 //! Every rule quotes the text it enforces. The design, the plans, the contracts and the
-//! registers are the sources. `docs/oltp-recovery.md` is quoted only beside one of them.
+//! registers are the sources. What rests on `docs/oltp-recovery.md` alone reports under a kind of
+//! its own ([`GUIDANCE_ONLY`]): a finding, and no text that a rule can be counted on.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,8 +15,33 @@ use std::{
 use serde_json::Value;
 use uuid::Uuid;
 
+/// The kinds that rest on operator guidance (`docs/oltp-recovery.md`) alone. No plan, contract,
+/// register or design text carries them, so they report findings and detect nothing for a count.
+pub(crate) const GUIDANCE_ONLY: [(&str, &str); 3] = [
+    (
+        OPERATOR_GUIDANCE,
+        "retries, conflicts and abandonment of operator requests rest on docs/oltp-recovery.md alone",
+    ),
+    (
+        "RemovedNeverRejoins",
+        "that a replaced worker stays out rests on docs/oltp-recovery.md alone",
+    ),
+    (
+        "ReplacementRestart",
+        "step 7 of docs/oltp-recovery.md is its only text",
+    ),
+];
+
+/// What an operator's retry, conflict or abandonment must answer. `docs/oltp-recovery.md`: "An
+/// identical retry returns the same record", "A prepared intent authorizes only its exact
+/// candidate", "Abandonment applies only before mount commits" and "A retry after interruption
+/// uses the same planned removed and replacement replicas". OLTP-G03 does not cover these IDs:
+/// its identities execute "cluster-wide on the queued path and per table and key on the direct
+/// path", and an operator's request is on neither.
+pub(crate) const OPERATOR_GUIDANCE: &str = "OperatorGuidance";
+
 /// The parts of the rules that public observations cannot reach, and why.
-pub(crate) const PROBE_FORMS: [(&str, &str); 5] = [
+pub(crate) const NOT_RUN_FORMS: [(&str, &str); 7] = [
     (
         "WipedNeverVotes over VoteSaved",
         "needs the VoteSaved and Appended probes of #116; the swept form judges acknowledged writes",
@@ -35,6 +61,14 @@ pub(crate) const PROBE_FORMS: [(&str, &str); 5] = [
     (
         "CapabilityBeforeUse with a build that lacks a feature",
         "ControlMachine::known_features_for_test is cfg(test) product code",
+    ),
+    (
+        "RemovedNeverRejoins over the removed worker's process",
+        "its old file is refused for a member too, and the file a member would be accepted with needs the preparation that the swept form judges",
+    ),
+    (
+        "R03 over a request that outlives every holder that accepted it",
+        "the script settles every receipt before the next worker stops",
     ),
 ];
 
@@ -112,6 +146,84 @@ impl WipedNeverVotes {
     }
 }
 
+/// How one attempt of a write in a window with a frozen voter was answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WindowAnswer {
+    Acknowledged,
+    /// The write was sent and no quorum answered for it: a timeout, an unknown outcome or
+    /// unavailable storage.
+    NoQuorum,
+    /// Refused for a reason that says nothing about the quorum, such as a full executor.
+    Other(String),
+}
+
+/// What a window with one voter frozen showed about a write beside a wiped voter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Window {
+    /// `WipedNeverVotes::committed` judges it.
+    Acknowledged,
+    /// The write needed the wiped voter, and it was not acknowledged.
+    Unacknowledged,
+    /// The window showed nothing.
+    NotJudged(String),
+}
+
+/// Judge one write of a window from its attempts. `control` are the attempts of the same write
+/// in the same window before the wipe, where two retained voters could take part.
+///
+/// A write that stays unanswered shows that the wiped voter gave no vote only if the same write
+/// was acknowledged with that voter's storage in place, if the wiped process ran for the whole
+/// window, and if every attempt reached the quorum.
+pub(crate) fn window(control: &[WindowAnswer], wiped: &[WindowAnswer], wiped_ran: bool) -> Window {
+    if wiped.contains(&WindowAnswer::Acknowledged) {
+        return Window::Acknowledged;
+    }
+    let reason = if !wiped_ran {
+        "the wiped process did not run for the whole window".into()
+    } else if !control.contains(&WindowAnswer::Acknowledged) {
+        format!(
+            "the control write was not acknowledged: {:?}",
+            control.last()
+        )
+    } else if wiped.is_empty() {
+        "no write was attempted".into()
+    } else if let Some(other) = wiped
+        .iter()
+        .find(|answer| matches!(answer, WindowAnswer::Other(_)))
+    {
+        format!("an attempt did not reach the quorum: {other:?}")
+    } else {
+        return Window::Unacknowledged;
+    };
+    Window::NotJudged(reason)
+}
+
+/// What the prepared restart of a removed worker shows, from the survivors' answers. `pinned`
+/// says that the survivors read the worker's certificate pin when they started: without it they
+/// refuse a member's preparation too (`ReplacementRestart`), so a refusal shows nothing.
+///
+/// Returns whether the answers judged anything. `docs/oltp-recovery.md`, replacement, step 6:
+/// "`mounted` means Control checked the signed mount proof, revoked the lost worker ID and
+/// certificate".
+pub(crate) fn removed_stays_out(pinned: bool, answers: &[Prepared]) -> Result<bool, String> {
+    if let Some(Prepared::Accepted(record)) = answers
+        .iter()
+        .find(|answer| matches!(answer, Prepared::Accepted(_)))
+    {
+        return Err(format!("its restart is prepared: {record}"));
+    }
+    Ok(pinned && answers.contains(&Prepared::Unauthorized))
+}
+
+/// One answer to a restart preparation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Prepared {
+    Accepted(String),
+    Unauthorized,
+    /// Refused for another reason, or unknown.
+    Other,
+}
+
 /// One named membership change: the request that asked for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NamedChange {
@@ -136,14 +248,29 @@ pub(crate) enum Certified {
     Refused,
 }
 
+/// A broken rule and the kind it reports under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Broken {
+    pub kind: &'static str,
+    pub detail: String,
+}
+
+fn named_removal(detail: String) -> Result<(), Broken> {
+    Err(Broken {
+        kind: "RetryCertifiesNamedRemoval",
+        detail,
+    })
+}
+
 /// `RetryCertifiesNamedRemoval` (named in design 3.7). O17: "Never remove a required voter or
-/// queue copy before replacement/copy evidence." OLTP-G03: "Each request identity executes
-/// once". `docs/oltp-recovery.md`: "A retry after interruption uses the same planned removed
-/// and replacement replicas."
+/// queue copy before replacement/copy evidence."
 ///
 /// An answer that reports a replacement as complete certifies the removal its request names:
 /// the named voter was a member, it no longer is, the named replacement is, and nothing else
 /// changed. Every answer under one request ID certifies the same change.
+///
+/// Another body under an ID that is answered as complete is [`OPERATOR_GUIDANCE`]: O17 says
+/// nothing about request identities.
 #[derive(Default)]
 pub(crate) struct RetryCertifiesNamedRemoval {
     requests: BTreeMap<Uuid, NamedChange>,
@@ -160,7 +287,7 @@ impl RetryCertifiesNamedRemoval {
         request: &NamedChange,
         answer: &Certified,
         published: Option<&BTreeSet<u64>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Broken> {
         let original = self
             .requests
             .entry(id)
@@ -170,12 +297,15 @@ impl RetryCertifiesNamedRemoval {
             return Ok(());
         };
         if *request != original {
-            return Err(format!(
-                "{id} first named {original:?}, and the body that names {request:?} was certified"
-            ));
+            return Err(Broken {
+                kind: OPERATOR_GUIDANCE,
+                detail: format!(
+                    "{id} first named {original:?}, and the body that names {request:?} was certified"
+                ),
+            });
         }
         if *named != original {
-            return Err(format!(
+            return named_removal(format!(
                 "{id} names {original:?}, and its answer certifies {named:?}"
             ));
         }
@@ -183,21 +313,21 @@ impl RetryCertifiesNamedRemoval {
         expected.remove(&original.remove);
         expected.insert(original.add);
         if !old.contains(&original.remove) || old.contains(&original.add) || *next != expected {
-            return Err(format!(
+            return named_removal(format!(
                 "{id} names {original:?}, and its answer certifies voters {old:?} to {next:?}"
             ));
         }
         if let Some(earlier) = self.certified.get(&id)
             && earlier != answer
         {
-            return Err(format!(
+            return named_removal(format!(
                 "{id} was certified as {earlier:?} and its retry as {answer:?}"
             ));
         }
         self.certified.insert(id, answer.clone());
         self.removed.insert((original.group, original.remove));
         match published {
-            Some(voters) if voters.contains(&original.remove) => Err(format!(
+            Some(voters) if voters.contains(&original.remove) => named_removal(format!(
                 "{id} was certified as complete, and voter {} is still published in {voters:?}",
                 original.remove
             )),
@@ -358,6 +488,21 @@ impl QueueHandoff {
             "a restart that kept a holder changed the run from {} to {run}",
             self.run
         ))
+    }
+
+    /// A worker that just reported ready holds `held` outstanding requests, and `outstanding`
+    /// ones that were accepted before it joined were still outstanding after that answer. R03:
+    /// "copy before readiness". Returns whether this judged anything.
+    ///
+    /// The joiner's gauge counts records, so requests accepted during the join may hide a missing
+    /// one. It never blames a joiner that holds them all.
+    pub(crate) fn joiner(&self, held: u64, outstanding: u64) -> Result<bool, String> {
+        if held < outstanding {
+            return Err(format!(
+                "a joiner reported ready with {held} outstanding requests, and {outstanding} accepted before its join were outstanding"
+            ));
+        }
+        Ok(outstanding > 0)
     }
 
     pub(crate) fn receipt(&mut self, request: Uuid, now: Receipt) -> Result<(), String> {

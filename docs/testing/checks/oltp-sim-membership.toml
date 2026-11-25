@@ -3,7 +3,9 @@ module = "oltp"
 kinds = ["S", "H"]
 # Fault model. The `membership` workload: rolling restarts, wiped volumes, replaced voters and
 # move sequences. A scenario is claimed only when every one of its clauses ran. Its probe rules
-# and the revocation storm are recorded as not run.
+# and the revocation storm are recorded as not run. `OperatorGuidance`, `RemovedNeverRejoins` and
+# `ReplacementRestart` rest on docs/oltp-recovery.md alone, so they report findings and count for
+# nothing. The `Step...` and `ReceiptBound` kinds are the harness's own bounds.
 guarantees = ["OLTP-G07", "OLTP-G08"]
 scenarios = []
 tiers = ["T1"]

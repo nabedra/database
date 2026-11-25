@@ -296,12 +296,11 @@ impl Cluster {
         self.spawn_worker(spare);
     }
 
-    /// Start the process of a worker that the cluster removed, on the disk and the keys it had.
-    pub fn restart_removed(&mut self, node: u64) {
-        assert!(self.config.index_of(node).is_none(), "n{node} is a member");
-        self.record(format!("removed n{node} starts again"));
-        disk::reopen(&self.world, &self.checks, node, DiskCut::Kill);
-        self.spawn_worker(node);
+    /// The ID and the plan of the next retained restart of the worker in slot `index`.
+    pub async fn rolling_plan(&self, index: usize) -> (Uuid, Value) {
+        let (id, plan, _) =
+            in_node(BOOTSTRAP_CLIENT, async { self.config.rolling_plan(index) }).await;
+        (id, plan)
     }
 
     /// The replacement took over: the lost worker is no longer part of the cluster.

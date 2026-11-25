@@ -144,7 +144,8 @@ mod retry_certifies_named_removal {
         let error = rule
             .answered(Uuid::from_u128(1), &change(3, 4), &answer, None)
             .unwrap_err();
-        assert!(error.contains("certifies"), "{error}");
+        assert_eq!(error.kind, "RetryCertifiesNamedRemoval");
+        assert!(error.detail.contains("certifies"), "{error:?}");
     }
 
     #[test]
@@ -182,7 +183,8 @@ mod retry_certifies_named_removal {
                 Some(&voters(&[1, 2, 3])),
             )
             .unwrap_err();
-        assert!(error.contains("still published"), "{error}");
+        assert_eq!(error.kind, "RetryCertifiesNamedRemoval");
+        assert!(error.detail.contains("still published"), "{error:?}");
         assert!(rule.published(GROUP, &voters(&[2, 3, 4])).is_err());
     }
 
@@ -206,7 +208,8 @@ mod retry_certifies_named_removal {
                 None,
             )
             .unwrap_err();
-        assert!(error.contains("its retry"), "{error}");
+        assert_eq!(error.kind, "RetryCertifiesNamedRemoval");
+        assert!(error.detail.contains("its retry"), "{error:?}");
     }
 
     #[test]
@@ -217,7 +220,86 @@ mod retry_certifies_named_removal {
             .unwrap();
         let other = change(2, 4);
         let answer = retired(other.clone(), &[1, 2, 3], &[1, 3, 4]);
-        assert!(rule.answered(id, &other, &answer, None).is_err());
+        // No accepted text carries this part, and its kind says so.
+        let error = rule.answered(id, &other, &answer, None).unwrap_err();
+        assert_eq!(error.kind, OPERATOR_GUIDANCE);
+    }
+}
+
+mod wiped_window {
+    use super::*;
+    use WindowAnswer::{Acknowledged, NoQuorum, Other};
+
+    fn other() -> WindowAnswer {
+        Other("executor admission capacity exhausted".into())
+    }
+
+    #[test]
+    fn an_acknowledged_write_is_judged_whatever_else_happened() {
+        for (control, ran) in [(vec![], false), (vec![NoQuorum], true)] {
+            assert_eq!(
+                window(&control, &[other(), Acknowledged], ran),
+                Window::Acknowledged
+            );
+        }
+    }
+
+    #[test]
+    fn an_unanswered_write_is_judged_beside_its_acknowledged_control() {
+        assert_eq!(
+            window(&[NoQuorum, Acknowledged], &[NoQuorum, NoQuorum], true),
+            Window::Unacknowledged
+        );
+    }
+
+    #[test]
+    fn nothing_is_judged_without_a_control_a_write_or_a_running_process() {
+        for (control, wiped, ran) in [
+            (vec![NoQuorum], vec![NoQuorum], true),
+            (vec![], vec![NoQuorum], true),
+            (vec![Acknowledged], vec![], true),
+            (vec![Acknowledged], vec![NoQuorum], false),
+            (vec![Acknowledged], vec![NoQuorum, other()], true),
+            (vec![Acknowledged], vec![other(), NoQuorum], true),
+        ] {
+            assert!(
+                matches!(window(&control, &wiped, ran), Window::NotJudged(_)),
+                "{control:?} {wiped:?} {ran}"
+            );
+        }
+    }
+}
+
+mod removed_never_rejoins {
+    use super::*;
+
+    #[test]
+    fn legal_a_survivor_refuses_a_pinned_worker() {
+        assert_eq!(
+            removed_stays_out(true, &[Prepared::Other, Prepared::Unauthorized]),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn nothing_is_judged_by_busy_survivors_or_without_the_pin() {
+        assert_eq!(removed_stays_out(true, &[Prepared::Other]), Ok(false));
+        assert_eq!(removed_stays_out(true, &[]), Ok(false));
+        assert_eq!(
+            removed_stays_out(false, &[Prepared::Unauthorized]),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn illegal_a_removed_worker_is_prepared() {
+        for pinned in [true, false] {
+            let answers = [
+                Prepared::Unauthorized,
+                Prepared::Accepted("record".to_owned()),
+            ];
+            assert!(removed_stays_out(pinned, &answers).is_err());
+        }
     }
 }
 
@@ -316,6 +398,22 @@ mod queue_handoff {
         let refused = Uuid::from_u128(13);
         rule.accepted(refused);
         rule.receipt(refused, Receipt::Failed).unwrap();
+    }
+
+    #[test]
+    fn legal_a_joiner_holds_what_was_outstanding() {
+        let rule = QueueHandoff::new(RUN);
+        assert_eq!(rule.joiner(2, 2), Ok(true));
+        assert_eq!(rule.joiner(3, 1), Ok(true));
+        // Nothing was outstanding, so nothing was judged.
+        assert_eq!(rule.joiner(0, 0), Ok(false));
+        assert_eq!(rule.joiner(2, 0), Ok(false));
+    }
+
+    #[test]
+    fn illegal_a_ready_joiner_lacks_an_outstanding_request() {
+        let error = QueueHandoff::new(RUN).joiner(1, 2).unwrap_err();
+        assert!(error.contains("1 outstanding"), "{error}");
     }
 
     #[test]

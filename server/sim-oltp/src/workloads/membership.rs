@@ -6,30 +6,39 @@
 //!
 //! - `rolling`: every worker stops (kill, power loss or drain) and restarts on its retained
 //!   mount, with queued requests outstanding at each stop. Each restarted worker is a joiner
-//!   that must receive the queue state (R03).
+//!   that must hold what is still outstanding when it reports ready (R03). Most requests end
+//!   before that, and then the join shows nothing.
 //! - `moves`: the scheduler owner's Data replica moves to a second pool and a third. Each move is
 //!   retried under its ID after it completed, also after a later move undid it, with another
 //!   body, and next to requests that name a voter that is no member.
 //! - `replace`: a worker is lost for good and a spare one takes its place through
 //!   `worker.system_replacement.*` (`docs/oltp-recovery.md`), with a fault while it catches up.
-//!   The lost worker's process then comes back on its intact disk and must stay out.
+//!   The survivors must then refuse to prepare a restart of the lost worker.
 //! - `wipe`: a worker's data volume is lost and its keys are not. Its process starts again with
 //!   the same identity. Another worker is then frozen: a write acknowledged in that window
-//!   needed the vote of the wiped worker. The worker is then replaced.
+//!   needed the vote of the wiped worker. The same window runs before the loss, where the write
+//!   must be acknowledged for the later one to show anything. The worker is then replaced.
 //! - `cold`: every worker stops with queued requests outstanding (R04).
 //! - `stale`: like `wipe` with an older image of the volume. Opt-in only (`STEPS_ENV`): nothing
 //!   in the documented procedure allows it, and the rule that decides it needs the probes.
 //!
 //! The rules are in [`crate::invariants::membership`]. Public observations feed them on every
 //! seed; they read no internal state of the product.
+//!
+//! A step that fails reports under the step's own kind (`Step...`), because no text gives its
+//! bound. `Liveness` is the design's rule alone: "convergence within 30 s of the heal; the cold
+//! start [...] finishes within its bound". A scenario tag is set only when its assertion judged
+//! something in that seed.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::Path,
     sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 
 use nabedra_check::Gen;
+use nabedra_protocol::protocol::{ErrorCode, Outcome};
 use nabedra_rt::{fs::FaultFs, ids::uuid_v4, sim::Wipe, sim::in_node, time};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -42,7 +51,7 @@ use super::{
     moves,
 };
 use crate::{
-    bootstrap::{CLIENTS, GATEWAYS, SPARES, WORKERS},
+    bootstrap::{BOOTSTRAP_CLIENT, CLIENTS, GATEWAYS, ROOT, SPARES, WORKERS},
     client::{operation, request},
     config::Config,
     disk::{self, DiskCut},
@@ -50,8 +59,9 @@ use crate::{
     invariants::{
         STEP, elapsed_ms,
         membership::{
-            Capability, CapabilityBeforeUse, Certified, NamedChange, QueueHandoff, Receipt,
-            RetryCertifiesNamedRemoval, WipedNeverVotes, required_voters,
+            Broken, Capability, CapabilityBeforeUse, Certified, NamedChange, OPERATOR_GUIDANCE,
+            Prepared, QueueHandoff, Receipt, RetryCertifiesNamedRemoval, Window, WindowAnswer,
+            WipedNeverVotes, removed_stays_out, required_voters, window as judge_window,
         },
     },
     nemesis::{NetFaults, Selection, apply::COLD_LIMIT, window},
@@ -98,7 +108,7 @@ const MOVE_REQUEST: Duration = Duration::from_secs(75);
 const CHECK_LIMIT: Duration = Duration::from_secs(60);
 /// A replacement must complete within this time after its last fault ended.
 const REPLACE_LIMIT: Duration = Duration::from_secs(120);
-/// How long a worker that must stay out is watched.
+/// How long the start of a wiped worker is watched.
 const REFUSAL_WATCH: Duration = Duration::from_secs(10);
 /// How long one voter is frozen beside a wiped one.
 const EVIDENCE: Duration = Duration::from_secs(20);
@@ -106,6 +116,8 @@ const EVIDENCE: Duration = Duration::from_secs(20);
 const EVIDENCE_ATTEMPT: Duration = Duration::from_secs(3);
 /// Messages already on the wire when the voter froze have settled after this time.
 const IN_FLIGHT: Duration = Duration::from_millis(500);
+/// The store that a worker creates before it saves its first vote.
+const STORE: &str = "pool/kv/CURRENT";
 const RECEIPT_LIMIT: Duration = Duration::from_secs(30);
 /// Queued requests insert keys of their own, outside the clients' key space.
 const QUEUED_BASE: i64 = 1_000_000;
@@ -138,6 +150,18 @@ impl Step {
             Step::Wipe => "wipe",
             Step::Cold => "cold",
             Step::Stale => "stale",
+        }
+    }
+
+    /// The kind of a step that did not finish. No text gives these steps a bound.
+    fn kind(self) -> &'static str {
+        match self {
+            Step::Rolling => "StepRestart",
+            Step::Moves => "StepMove",
+            Step::Replace => "StepReplacement",
+            Step::Wipe => "StepWipe",
+            Step::Cold => "StepCold",
+            Step::Stale => "StepStale",
         }
     }
 
@@ -193,12 +217,60 @@ impl Step {
     }
 }
 
+/// Why a step did not finish. Without a kind of its own it takes the step's.
+#[derive(Debug)]
+struct StepError {
+    kind: Option<&'static str>,
+    detail: String,
+}
+
+impl StepError {
+    fn new(kind: &'static str, detail: String) -> Self {
+        Self {
+            kind: Some(kind),
+            detail,
+        }
+    }
+}
+
+impl From<String> for StepError {
+    fn from(detail: String) -> Self {
+        Self { kind: None, detail }
+    }
+}
+
+impl From<&str> for StepError {
+    fn from(detail: &str) -> Self {
+        detail.to_owned().into()
+    }
+}
+
+type StepResult = Result<(), StepError>;
+
 /// A queued insert that the cluster accepted.
 #[derive(Clone, Copy)]
 struct Queued {
     key: i64,
     value: i64,
-    accepted_ms: u64,
+}
+
+/// The attempts of each write in one window with a frozen voter.
+#[derive(Default)]
+struct WindowWrites {
+    control: Vec<WindowAnswer>,
+    /// A table creation, which needs the Timestamps and the Catalog group.
+    ddl: Vec<WindowAnswer>,
+    data: Vec<WindowAnswer>,
+    /// Whether the third worker's process ran from the start to the end.
+    ran: bool,
+}
+
+/// Three workers of a window: the one the window is about, the frozen one and the other.
+#[derive(Clone, Copy)]
+struct WindowNodes {
+    about: u64,
+    frozen: u64,
+    survivor: u64,
 }
 
 /// What a fault during the catch-up of a replacement does.
@@ -229,8 +301,6 @@ pub(crate) struct Membership {
     expected_exit: BTreeSet<u64>,
     /// The pools that moves mounted: the worker and the device.
     second_pools: BTreeSet<(u64, u64)>,
-    /// Workers whose resources were captured.
-    baselines: BTreeSet<u64>,
     clauses: Scenarios,
     enabled: bool,
     next_sample_ms: u64,
@@ -257,7 +327,6 @@ impl Membership {
             spares: SPARES.into_iter().rev().collect(),
             expected_exit: BTreeSet::new(),
             second_pools: BTreeSet::new(),
-            baselines: BTreeSet::new(),
             clauses: Scenarios::new(),
             enabled: false,
             next_sample_ms: 0,
@@ -340,8 +409,8 @@ impl Membership {
             if let Err(error) = &done {
                 cluster.checks.violate(
                     &cluster.world,
-                    "Liveness",
-                    format!("step {}: {error}", step.name()),
+                    error.kind.unwrap_or(step.kind()),
+                    format!("step {}: {}", step.name(), error.detail),
                 );
                 break;
             }
@@ -366,7 +435,7 @@ impl Membership {
             }
             report.scenarios = std::mem::take(&mut self.clauses);
             report.summary = self.summary(&ctx, &names);
-            cluster.record("workload abandoned after a liveness violation".into());
+            cluster.record("workload abandoned after a step that did not finish".into());
             return Ok(report);
         }
 
@@ -440,7 +509,7 @@ impl Membership {
         g: &mut Gen,
         faults: &NetFaults,
         quiet: bool,
-    ) -> Result<(), String> {
+    ) -> StepResult {
         cluster.record(format!("step {} starts", step.name()));
         match step {
             Step::Rolling => self.rolling(cluster, ctx, g).await,
@@ -457,7 +526,12 @@ impl Membership {
                 let index = g.below(3) as usize;
                 self.enable(cluster).await?;
                 self.wipe(cluster, ctx, g, index).await?;
-                self.replace(cluster, ctx, g, faults, quiet, index).await
+                self.replace(cluster, ctx, g, faults, quiet, index)
+                    .await
+                    .map_err(|error| StepError {
+                        kind: error.kind.or(Some(Step::Replace.kind())),
+                        ..error
+                    })
             }
             Step::Cold => self.cold(cluster, ctx, g).await,
             Step::Stale => {
@@ -471,6 +545,14 @@ impl Membership {
 
     fn note(&mut self, what: &'static str) {
         *self.notes.entry(what).or_default() += 1;
+    }
+
+    fn judge_named(&self, cluster: &Cluster, verdict: Result<(), Broken>) {
+        if let Err(broken) = verdict {
+            cluster
+                .checks
+                .violate(&cluster.world, broken.kind, broken.detail);
+        }
     }
 
     fn judge(&self, cluster: &Cluster, invariant: &str, verdict: Result<(), String>) {
@@ -589,7 +671,6 @@ impl Membership {
         cluster
             .checks
             .capture_resources(&cluster.world, node, &stats);
-        self.baselines.insert(node);
         Ok(())
     }
 
@@ -655,14 +736,7 @@ impl Membership {
                         && reply.body["run_id"] == json!(cluster.config.run_id) =>
                 {
                     self.queue.accepted(id);
-                    self.queued.insert(
-                        id,
-                        Queued {
-                            key,
-                            value,
-                            accepted_ms: elapsed_ms(&cluster.world),
-                        },
-                    );
+                    self.queued.insert(id, Queued { key, value });
                     self.note("queued accepted");
                 }
                 Ok(reply) => {
@@ -732,9 +806,10 @@ impl Membership {
         let deadline = cluster.world.elapsed() + limit;
         while !self.poll_receipts(cluster, ctx).await {
             if cluster.world.elapsed() >= deadline {
+                // No text gives an accepted request a bound.
                 cluster.checks.violate(
                     &cluster.world,
-                    "Liveness",
+                    "ReceiptBound",
                     format!(
                         "accepted requests not settled within {limit:?}: {:?}",
                         self.queue.outstanding()
@@ -788,24 +863,57 @@ impl Membership {
         }
     }
 
-    /// Whether some request accepted before `at` was outstanding then and settled since.
-    fn handed_over(&self, at: u64, before: &[Uuid]) -> bool {
-        before.iter().any(|id| {
-            self.queued
-                .get(id)
-                .is_some_and(|queued| queued.accepted_ms <= at)
-                && self.succeeded.contains_key(id)
-        })
+    /// `joiner` just reported ready. It must hold the requests of `before`, accepted before it
+    /// joined, that are still outstanding (R03, "copy before readiness"). `clause` ran only if
+    /// some still were.
+    async fn joiner_copy(
+        &mut self,
+        cluster: &mut Cluster,
+        ctx: &Ctx,
+        joiner: u64,
+        before: &[Uuid],
+        clause: &'static str,
+    ) {
+        let run = cluster.config.run_id;
+        for last in [false, true] {
+            let Ok(stats) = cluster.stats(joiner).await else {
+                self.note("joiner copy not judged: no stats");
+                return;
+            };
+            let held = ["queued_records", "running_records", "reconciling_records"]
+                .iter()
+                .map(|gauge| stats["queue"][*gauge].as_u64().unwrap_or(0))
+                .sum();
+            let mut outstanding = 0;
+            for (index, id) in before.iter().enumerate() {
+                let gateway = GATEWAYS[index % GATEWAYS.len()];
+                let state = self.receipt(cluster, ctx, gateway, run, *id).await;
+                // Another worker may still show a request that just ended as committing.
+                outstanding += u64::from(matches!(state.as_deref(), Some("queued" | "running")));
+            }
+            match self.queue.joiner(held, outstanding) {
+                Ok(true) => {
+                    cluster.record(format!(
+                        "joiner n{joiner} holds {held}, {outstanding} outstanding"
+                    ));
+                    self.clauses.insert(clause);
+                    self.note("joiner copy judged");
+                }
+                Ok(false) => self.note("joiner copy not judged: nothing outstanding"),
+                // A receipt may come from a worker that has not seen the end yet: look again.
+                Err(_) if !last => {
+                    self.pause(cluster, ctx, Duration::from_secs(1)).await;
+                    continue;
+                }
+                verdict => self.judge(cluster, "QueueHandoff", verdict.map(|_| ())),
+            }
+            return;
+        }
     }
 
     // Steps.
 
-    async fn rolling(
-        &mut self,
-        cluster: &mut Cluster,
-        ctx: &Ctx,
-        g: &mut Gen,
-    ) -> Result<(), String> {
+    async fn rolling(&mut self, cluster: &mut Cluster, ctx: &Ctx, g: &mut Gen) -> StepResult {
         let mut order = [0, 1, 2];
         for last in (1..order.len()).rev() {
             order.swap(last, g.below(last as u64 + 1) as usize);
@@ -826,29 +934,19 @@ impl Membership {
                 self.judge(cluster, "QueueHandoff", run);
             }
             let outstanding = self.queue.outstanding();
-            let stopped = elapsed_ms(&cluster.world);
             let how = if g.below(4) == 0 {
                 if let Err(error) = cluster.drain(node).await {
-                    return Err(format!("drain n{node}: {error}"));
+                    return Err(format!("drain n{node}: {error}").into());
                 }
                 DiskCut::Kill
             } else {
                 self.cut(cluster, g, node).await
             };
             self.down(cluster, ctx, window(g, 0, 2_000)).await;
-            if let Err(error) = cluster.prepare_restart(node).await {
-                // `docs/oltp-recovery.md`, step 7: "Once queue join begins, a process restart
-                // requires the normal retained-mount procedure with a new incarnation."
-                if SPARES.contains(&node) {
-                    cluster.checks.violate(
-                        &cluster.world,
-                        "ReplacementRestart",
-                        format!("the survivors refuse the retained restart of the replacement n{node}: {error}"),
-                    );
-                }
-                return Err(error);
-            }
+            self.prepare(cluster, node).await?;
             cluster.start_prepared(index, how).await?;
+            self.joiner_copy(cluster, ctx, node, &outstanding, "R03:rolling-restart")
+                .await;
             self.wait_members(cluster, ctx, CHECK_LIMIT).await?;
             let connection = self.connection(cluster).await?;
             let run = connection["run_id"]
@@ -857,11 +955,24 @@ impl Membership {
                 .unwrap_or_default();
             self.judge(cluster, "QueueHandoff", self.queue.run(run));
             self.settle_receipts(cluster, ctx, RECEIPT_LIMIT).await;
-            if self.handed_over(stopped, &outstanding) {
-                self.clauses.insert("R03:rolling-restart");
-            }
         }
         Ok(())
+    }
+
+    /// Prepare the retained restart of `node`.
+    async fn prepare(&self, cluster: &mut Cluster, node: u64) -> StepResult {
+        cluster.prepare_restart(node).await.map_err(|error| {
+            // `docs/oltp-recovery.md`, step 7: "Once queue join begins, a process restart requires
+            // the normal retained-mount procedure with a new incarnation."
+            if SPARES.contains(&node) && every_survivor_refuses_its_role(&error) {
+                StepError::new(
+                    "ReplacementRestart",
+                    format!("the retained restart of the replacement n{node} is refused: {error}"),
+                )
+            } else {
+                error.into()
+            }
+        })
     }
 
     /// Stop `node` without warning: a kill or a power loss, one half of them at a sync.
@@ -909,7 +1020,7 @@ impl Membership {
         cluster: &mut Cluster,
         ctx: &Ctx,
         limit: Duration,
-    ) -> Result<(), String> {
+    ) -> StepResult {
         let deadline = cluster.world.elapsed() + limit;
         loop {
             let nodes = cluster.config.nodes();
@@ -923,7 +1034,10 @@ impl Membership {
                 return Ok(());
             }
             if cluster.world.elapsed() >= deadline {
-                return Err(format!("{waiting:?} do not report three ready workers"));
+                return Err(StepError::new(
+                    "StepMembers",
+                    format!("{waiting:?} do not report three ready workers within {limit:?}"),
+                ));
             }
             self.pause(cluster, ctx, POLL).await;
         }
@@ -993,7 +1107,7 @@ impl Membership {
         faults: &NetFaults,
         quiet: bool,
         index: usize,
-    ) -> Result<(), String> {
+    ) -> StepResult {
         let lost = cluster.config.node(index);
         assert!(!cluster.is_running(lost), "the lost worker is down");
         let Some(spare) = self.spares.pop() else {
@@ -1050,7 +1164,6 @@ impl Membership {
             .await;
         self.submit(cluster, ctx, 1 + g.below(3)).await;
         let outstanding = self.queue.outstanding();
-        let joined = elapsed_ms(&cluster.world);
         self.generations.insert(spare, 0);
         self.capability.started(spare);
         self.expected_exit.insert(spare);
@@ -1074,9 +1187,11 @@ impl Membership {
         if placed {
             self.clauses.insert("O17:replacement-fault");
         }
+        self.joiner_copy(cluster, ctx, spare, &outstanding, "R03:replacement-joiner")
+            .await;
         self.check_replaced(cluster, &plans, &previous, intent_id, &groups);
-        let former = cluster.config.worker_enrollment(index).clone();
-        let former_pool = cluster.config.pool(index);
+        // The plan that a member's restart is accepted with.
+        let (restart, restart_plan) = cluster.rolling_plan(index).await;
         cluster.adopt(candidate, &groups);
         self.system_votes(cluster);
         self.expected_exit.remove(&spare);
@@ -1085,14 +1200,11 @@ impl Membership {
         self.baseline(cluster, spare).await?;
         self.clauses.insert("O17:replacement");
         self.settle_receipts(cluster, ctx, RECEIPT_LIMIT).await;
-        if self.handed_over(joined, &outstanding) {
-            self.clauses.insert("R03:replacement-joiner");
-        }
         let connection = self.connection(cluster).await?;
         let run = uuid(&connection["run_id"]);
         self.judge(cluster, "QueueHandoff", self.queue.run(run));
-        self.stays_out(cluster, ctx, lost, former, former_pool)
-            .await
+        self.stays_out(cluster, lost, restart, &restart_plan).await;
+        self.wait_members(cluster, ctx, CHECK_LIMIT).await
     }
 
     /// Prepare an intent that never mounts, abandon it, and check that it stays abandoned.
@@ -1125,7 +1237,7 @@ impl Membership {
             if answer != json!({"id": id, "abandoned": true}) {
                 cluster.checks.violate(
                     &cluster.world,
-                    "RetryCertifiesNamedRemoval",
+                    OPERATOR_GUIDANCE,
                     format!("abandoning {id} answered {answer}"),
                 );
             }
@@ -1139,7 +1251,7 @@ impl Membership {
         if record["intent"] != *intent {
             cluster.checks.violate(
                 &cluster.world,
-                "RetryCertifiesNamedRemoval",
+                OPERATOR_GUIDANCE,
                 format!(
                     "preparing {intent} recorded another intent: {}",
                     record["intent"]
@@ -1155,7 +1267,7 @@ impl Membership {
         if plans.is_empty() || plans.len() != record["groups"].as_array().map_or(0, Vec::len) {
             cluster.checks.violate(
                 &cluster.world,
-                "RetryCertifiesNamedRemoval",
+                OPERATOR_GUIDANCE,
                 format!("a group plan does not name the lost and the new worker: {record}"),
             );
         }
@@ -1187,7 +1299,7 @@ impl Membership {
             {
                 cluster.checks.violate(
                     &cluster.world,
-                    "RetryCertifiesNamedRemoval",
+                    OPERATOR_GUIDANCE,
                     format!(
                         "preparing {id} recorded {record}, and its retry on n{node} {replayed}"
                     ),
@@ -1209,7 +1321,7 @@ impl Membership {
         if let Ok(Completion::Ok(accepted)) = answer {
             cluster.checks.violate(
                 &cluster.world,
-                "RetryCertifiesNamedRemoval",
+                OPERATOR_GUIDANCE,
                 format!("a second intent for the same lost worker was prepared: {accepted}"),
             );
         }
@@ -1237,10 +1349,11 @@ impl Membership {
             return Ok(false);
         }
         self.pause(cluster, ctx, at).await;
-        let complete = self
+        // Placed only if the replacement is known to be incomplete at that moment.
+        let mut placed = self
             .replacement_status(cluster, survivors, check)
             .await
-            .is_some_and(|status| status["complete"] == true);
+            .is_some_and(|status| status["complete"] == false);
         match fault {
             CatchUpFault::None => {}
             CatchUpFault::FreezeSurvivor => {
@@ -1254,10 +1367,12 @@ impl Membership {
                 faults.slow(None);
             }
             CatchUpFault::DropSessions => {
+                let dropped = faults.session_drops().len();
                 for _ in 0..3 {
                     faults.drop_session_after(g.below(40));
                     self.pause(cluster, ctx, length / 3).await;
                 }
+                placed &= faults.session_drops().len() > dropped;
             }
             CatchUpFault::KillCandidate | CatchUpFault::PowerCandidate => {
                 let how = if fault == CatchUpFault::KillCandidate {
@@ -1273,7 +1388,7 @@ impl Membership {
                 cluster.restart_candidate(spare, how);
             }
         }
-        Ok(!complete)
+        Ok(placed)
     }
 
     async fn replacement_status(
@@ -1343,7 +1458,7 @@ impl Membership {
                     if let Ok(Completion::Ok(accepted)) = answer {
                         cluster.checks.violate(
                             &cluster.world,
-                            "RetryCertifiesNamedRemoval",
+                            OPERATOR_GUIDANCE,
                             format!("a mounted intent was abandoned: {accepted}"),
                         );
                     }
@@ -1417,72 +1532,59 @@ impl Membership {
             // One intent changes several groups: each is a change of its own.
             let id = Uuid::from_u128(intent.as_u128() ^ plan.named.group.as_u128());
             let verdict = self.removal.answered(id, &plan.named, &answer, Some(&next));
-            self.judge(cluster, "RetryCertifiesNamedRemoval", verdict);
+            self.judge_named(cluster, verdict);
         }
     }
 
-    /// The removed worker comes back on its intact disk, with its keys and its bootstrap file,
-    /// and must never become ready. `plans/native-storage-engine.md`, Raft safety rule 3: "The
-    /// damaged identity never rejoins." O17: the replacement's evidence removed it.
-    async fn stays_out(
-        &mut self,
-        cluster: &mut Cluster,
-        ctx: &Ctx,
-        removed: u64,
-        former: Value,
-        former_pool: Value,
-    ) -> Result<(), String> {
-        self.expected_exit.insert(removed);
-        // Control must not prepare a restart for it either, under any next incarnation.
-        let id = cluster.split_id().await;
-        let mut next = former.clone();
-        next["incarnation"] = json!(cluster.split_id().await);
-        next["enrollment_revision"] =
-            json!(former["enrollment_revision"].as_u64().unwrap_or(0) + 1);
-        let intent = json!({
-            "id": id, "run_id": cluster.config.run_id, "previous": identity(&former),
-            "next": next, "pool_id": former_pool, "mount_generation": 1_000,
-        });
+    /// The removed worker's retained restart must not be prepared, with the plan that Control
+    /// accepts for a member (`rolling` sends the same one). `RemovedNeverRejoins` rests on
+    /// `docs/oltp-recovery.md` alone. Its process isn't started again: the file it holds is
+    /// refused for a member too, so that shows nothing.
+    async fn stays_out(&mut self, cluster: &Cluster, removed: u64, id: Uuid, plan: &Value) {
+        let mut answers = Vec::new();
         for node in cluster.config.nodes() {
             let answer = cluster
                 .admin_answer(
                     node,
                     id,
                     "worker.restart.prepare",
-                    intent.clone(),
+                    plan.clone(),
                     ADMIN_LIMIT,
                 )
                 .await;
-            if let Ok(Completion::Ok(prepared)) = answer {
+            cluster.record(format!(
+                "restart of the removed n{removed} at n{node}: {}",
+                match &answer {
+                    Ok(Completion::Ok(_)) => "prepared".to_owned(),
+                    other => shown(other),
+                }
+            ));
+            answers.push(match answer {
+                Ok(Completion::Ok(record)) => Prepared::Accepted(record.to_string()),
+                Ok(Completion::Refused(error))
+                    if error.code == ErrorCode::Unauthorized
+                        && error.outcome == Outcome::NotApplied =>
+                {
+                    Prepared::Unauthorized
+                }
+                _ => Prepared::Other,
+            });
+        }
+        // Every survivor read the original workers' pins when it started.
+        match removed_stays_out(!SPARES.contains(&removed), &answers) {
+            Ok(true) => {
+                self.clauses.insert("O17:removed-worker");
+            }
+            Ok(false) => self.note("removed worker not judged"),
+            Err(detail) => {
+                self.clauses.insert("O17:removed-worker");
                 cluster.checks.violate(
                     &cluster.world,
                     "RemovedNeverRejoins",
-                    format!("n{removed} was replaced, and its restart is prepared: {prepared}"),
+                    format!("n{removed} was replaced, and {detail}"),
                 );
             }
         }
-        cluster.restart_removed(removed);
-        let deadline = cluster.world.elapsed() + REFUSAL_WATCH;
-        while cluster.world.elapsed() < deadline {
-            if let Some(result) = cluster.ended(removed).await {
-                cluster.record(format!("removed n{removed} stayed out: {result}"));
-                break;
-            }
-            if cluster.is_ready(removed, 3).await {
-                cluster.checks.violate(
-                    &cluster.world,
-                    "RemovedNeverRejoins",
-                    format!("n{removed} was replaced and reports ready again"),
-                );
-                break;
-            }
-            self.pause(cluster, ctx, POLL).await;
-        }
-        if cluster.world.is_up(removed) {
-            cluster.crash(removed, DiskCut::Kill).await;
-        }
-        self.clauses.insert("O17:removed-worker");
-        self.wait_members(cluster, ctx, CHECK_LIMIT).await
     }
 
     /// Lose worker `index`'s data volume and start it again under the same identity. Whatever
@@ -1494,7 +1596,7 @@ impl Membership {
         ctx: &Ctx,
         g: &mut Gen,
         index: usize,
-    ) -> Result<(), String> {
+    ) -> StepResult {
         let node = cluster.config.node(index);
         let kind = if g.bool() {
             Wipe::Replace
@@ -1507,11 +1609,26 @@ impl Membership {
             _ => Marker::Kept,
         };
         let prepared = g.below(3) == 0;
+        let others: Vec<u64> = cluster
+            .config
+            .nodes()
+            .into_iter()
+            .filter(|other| *other != node)
+            .collect();
+        let frozen = g.below(others.len() as u64) as usize;
+        let nodes = WindowNodes {
+            about: node,
+            frozen: others[frozen],
+            survivor: others[1 - frozen],
+        };
+        // The positive control: the same writes in the same window, with every storage in place.
+        let control = self.frozen_window(cluster, ctx, nodes, true).await;
+        self.wait_members(cluster, ctx, CHECK_LIMIT).await?;
         let how = self.cut(cluster, g, node).await;
         self.down(cluster, ctx, window(g, 0, 3_000)).await;
         if prepared {
             // The operator prepares the ordinary retained restart for it.
-            cluster.prepare_restart(node).await?;
+            self.prepare(cluster, node).await?;
         }
         self.expected_exit.insert(node);
         *self.generations.entry(node).or_default() += 1;
@@ -1522,92 +1639,150 @@ impl Membership {
         match &started {
             Started::Ready => self.note("wiped worker ready"),
             Started::Running => self.note("wiped worker running"),
-            Started::Exited(_) => self.note("wiped worker refused"),
+            Started::Exited(_) => {
+                // A process that ended before it created a store saved no vote.
+                let store = cluster
+                    .world
+                    .volume(node, Path::new(ROOT))
+                    .is_some_and(|data| data.contents(&Path::new(ROOT).join(STORE)).is_ok());
+                if store {
+                    self.note("wiped worker exited after it created a store: not judged");
+                } else {
+                    self.note("wiped worker refused");
+                    self.clauses.insert("O17:wiped-voter-refused");
+                }
+            }
         }
-        self.evidence(cluster, ctx, g, node).await;
+        let wiped = self.frozen_window(cluster, ctx, nodes, false).await;
+        for (write, control, beside, clause) in [
+            (
+                "Control write",
+                &control.control,
+                &wiped.control,
+                "O17:wiped-voter-control",
+            ),
+            ("DDL", &control.ddl, &wiped.ddl, "O17:wiped-voter-ddl"),
+            (
+                "Data write",
+                &control.data,
+                &wiped.data,
+                "O17:wiped-voter-data",
+            ),
+        ] {
+            let verdict = judge_window(control, beside, wiped.ran);
+            cluster.record(format!("{write} beside the wiped n{node}: {verdict:?}"));
+            match verdict {
+                // `frozen_window` judged the acknowledgement.
+                Window::Acknowledged | Window::Unacknowledged => {
+                    self.clauses.insert(clause);
+                    self.note("wiped window judged");
+                }
+                Window::NotJudged(_) => self.note("wiped window not judged"),
+            }
+        }
         if cluster.world.is_up(node) {
             cluster.crash(node, DiskCut::Kill).await;
         }
         self.expected_exit.remove(&node);
-        self.clauses.insert("O17:wiped-voter");
         Ok(())
     }
 
-    /// Freeze one voter besides `without`, and judge every write that was proposed and
-    /// acknowledged while it was frozen.
-    async fn evidence(&mut self, cluster: &mut Cluster, ctx: &Ctx, g: &mut Gen, without: u64) {
+    /// Freeze one voter besides `nodes.about`, and judge every write that was proposed and
+    /// acknowledged while it was frozen. `control` ends the window when each write was
+    /// acknowledged once.
+    async fn frozen_window(
+        &mut self,
+        cluster: &mut Cluster,
+        ctx: &Ctx,
+        nodes: WindowNodes,
+        control: bool,
+    ) -> WindowWrites {
+        let mut writes = WindowWrites {
+            ran: cluster.is_running(nodes.about),
+            ..WindowWrites::default()
+        };
         let Some(placement) = self.observe_placement(cluster, ctx).await else {
-            self.note("no placement before the evidence window");
-            return;
+            self.note("no placement before the window");
+            return writes;
         };
         let (group, _) = match moves::placement(cluster, ctx).await {
             Ok(found) => found,
-            Err(_) => return,
+            Err(_) => {
+                self.note("no placement before the window");
+                return writes;
+            }
         };
-        let others: Vec<u64> = cluster
-            .config
-            .nodes()
-            .into_iter()
-            .filter(|node| *node != without)
-            .collect();
-        let frozen = others[g.below(others.len() as u64) as usize];
-        let survivor = others
-            .iter()
-            .copied()
-            .find(|node| *node != frozen)
-            .expect("three workers");
+        let WindowNodes {
+            about,
+            frozen,
+            survivor,
+        } = nodes;
         cluster.freeze(frozen);
         let from = cluster.world.elapsed() + IN_FLIGHT;
         let until = cluster.world.elapsed() + EVIDENCE;
         time::sleep(IN_FLIGHT).await;
         // A write that needs the Control quorum, and one that needs Timestamps and Catalog.
-        let policy = growth_policy(cluster, self.next_sample_ms);
+        let policy = growth_policy(cluster, elapsed_ms(&cluster.world));
         let policy_id = cluster.split_id().await;
         let table_id = in_node(CLIENTS[0], async { uuid_v4() }).await;
-        let (mut control, mut table) = (Err(String::new()), Err(String::new()));
         while cluster.world.elapsed() + EVIDENCE_ATTEMPT < until {
             let began = cluster.world.elapsed();
-            let configure = cluster.admin_task(
+            let configure = nabedra_rt::task::spawn(configure_policy(
                 survivor,
+                cluster.config.admin_token.clone(),
                 policy_id,
-                "storage.growth.configure",
-                json!({"policy": policy}),
-                EVIDENCE_ATTEMPT,
-            );
-            let create = nabedra_rt::task::spawn(create_probe_table(
-                ctx.token.clone(),
-                table_id,
-                EVIDENCE_ATTEMPT,
+                policy.clone(),
             ));
+            let create = nabedra_rt::task::spawn(create_probe_table(ctx.token.clone(), table_id));
             // The same IDs are sent again: only an answer in the window counts.
-            for (known, attempt) in [(&mut control, configure), (&mut table, create)] {
-                let answer = attempt.await.unwrap_or_else(|error| Err(error.to_string()));
-                if known.is_err() {
-                    *known = answer;
+            for (known, attempt) in [(&mut writes.control, configure), (&mut writes.ddl, create)] {
+                let answer = attempt
+                    .await
+                    .unwrap_or_else(|error| WindowAnswer::Other(error.to_string()));
+                if !known.contains(&WindowAnswer::Acknowledged) {
+                    known.push(answer);
                 }
+            }
+            if control
+                && [
+                    &writes.control,
+                    &writes.ddl,
+                    &data_writes(ctx, from, None).0,
+                ]
+                .iter()
+                .all(|answers| answers.contains(&WindowAnswer::Acknowledged))
+            {
+                break;
             }
             if let Some(wait) = (began + POLL).checked_sub(cluster.world.elapsed()) {
                 time::sleep(wait).await;
             }
         }
-        while cluster.world.elapsed() < until {
+        let acknowledged = |answers: &[WindowAnswer]| answers.contains(&WindowAnswer::Acknowledged);
+        while cluster.world.elapsed() < until
+            && !(control
+                && acknowledged(&writes.control)
+                && acknowledged(&writes.ddl)
+                && acknowledged(&data_writes(ctx, from, None).0))
+        {
             time::sleep(POLL).await;
         }
         let to = elapsed_ms(&cluster.world);
+        writes.ran &= cluster.is_running(about);
+        let (data, first) = data_writes(ctx, from, Some(to));
+        writes.data = data;
+        // Judge with the processes as they were in the window.
         let system = [
-            (control, &["control"][..]),
-            (table, &["timestamps", "catalog"][..]),
+            (&writes.control, &["control"][..]),
+            (&writes.ddl, &["timestamps", "catalog"][..]),
         ];
         let groups = cluster.config.system_groups();
-        for (answer, needed) in system {
+        for (answers, needed) in system {
             cluster.record(format!(
-                "evidence: {needed:?} beside n{without}: {}",
-                match &answer {
-                    Ok(_) => "acknowledged",
-                    Err(error) => error,
-                }
+                "window: {needed:?} beside n{about}: {:?}",
+                answers.last()
             ));
-            if answer.is_err() {
+            if !acknowledged(answers) {
                 continue;
             }
             for (label, group, members) in &groups {
@@ -1621,42 +1796,35 @@ impl Membership {
                 }
             }
         }
-        // Judge with the processes as they were in the window.
         let members = placement["members"].as_array().cloned().unwrap_or_default();
         let voters = self.taking_part(cluster, &members, frozen);
         cluster.thaw(frozen);
-        let from = from.as_millis() as u64;
-        let writes: Vec<(Uuid, u64, u64)> = ctx
-            .observed
-            .lock()
-            .unwrap()
-            .attempts
+        let count = writes
+            .data
             .iter()
-            .filter(|attempt| {
-                attempt.fresh
-                    && attempt.answer == Answer::Committed
-                    && attempt.invoked >= from
-                    && attempt.completed < to
-            })
-            .map(|attempt| (attempt.id, attempt.invoked, attempt.completed))
-            .collect();
+            .filter(|answer| **answer == WindowAnswer::Acknowledged)
+            .count();
         cluster.record(format!(
-            "evidence: n{frozen} frozen beside n{without}, voters {voters:?}, {} writes acknowledged",
-            writes.len()
+            "window: n{frozen} frozen beside n{about}, control {control}, voters {voters:?}, {count} of {} writes acknowledged",
+            writes.data.len()
         ));
-        self.note("evidence windows");
-        if let Some((id, invoked, completed)) = writes.first() {
+        self.note(if control {
+            "control windows"
+        } else {
+            "wiped windows"
+        });
+        if let Some((id, invoked, completed)) = first {
             let verdict = self
                 .wiped
                 .committed(group_id(&group), &voters)
                 .map_err(|detail| {
                     format!(
-                        "{detail} ({} writes, the first {id} at {invoked} to {completed} ms)",
-                        writes.len()
+                        "{detail} ({count} writes, the first {id} at {invoked} to {completed} ms)"
                     )
                 });
             self.judge(cluster, "WipedNeverVotes", verdict);
         }
+        writes
     }
 
     /// Opt-in: a worker restarts, properly prepared, on an older image of its own volume.
@@ -1666,12 +1834,12 @@ impl Membership {
         ctx: &Ctx,
         g: &mut Gen,
         index: usize,
-    ) -> Result<(), String> {
+    ) -> StepResult {
         let node = cluster.config.node(index);
         let image: FaultFs = disk::snapshot(&cluster.world, node);
         self.pause(cluster, ctx, window(g, 2_000, 6_000)).await;
         cluster.crash(node, DiskCut::Kill).await;
-        cluster.prepare_restart(node).await?;
+        self.prepare(cluster, node).await?;
         self.expected_exit.insert(node);
         let started = cluster
             .restart_same_identity(node, DiskCut::Kill, Disk::Stale(&image), CHECK_LIMIT)
@@ -1702,14 +1870,15 @@ impl Membership {
                 self.expected_exit.remove(&node);
                 Err(format!(
                     "n{node} did not open its stale volume, and the run has no other one: {started:?}"
-                ))
+                )
+                .into())
             }
         }
     }
 
     /// R04: "New run has no pending old work; old receipts report abandonment unless a durable
     /// commit decision proves success; committed rows remain."
-    async fn cold(&mut self, cluster: &mut Cluster, ctx: &Ctx, g: &mut Gen) -> Result<(), String> {
+    async fn cold(&mut self, cluster: &mut Cluster, ctx: &Ctx, g: &mut Gen) -> StepResult {
         self.settle_receipts(cluster, ctx, RECEIPT_LIMIT).await;
         self.submit(cluster, ctx, 2 + g.below(3)).await;
         let outstanding = self.queue.outstanding();
@@ -1722,7 +1891,8 @@ impl Membership {
         let delays = [(); 3].map(|()| window(g, 0, 2_000));
         cluster
             .cold_start_staggered("cold start", how, delays, COLD_LIMIT)
-            .await?;
+            .await
+            .map_err(|error| StepError::new("Liveness", format!("cold start: {error}")))?;
         self.wait_members(cluster, ctx, CHECK_LIMIT).await?;
         let deadline = cluster.world.elapsed() + RECEIPT_LIMIT;
         let mut pending = outstanding.clone();
@@ -1772,13 +1942,13 @@ impl Membership {
         g: &mut Gen,
         faults: &NetFaults,
         quiet: bool,
-    ) -> Result<(), String> {
+    ) -> StepResult {
         let deadline = cluster.world.elapsed() + CHECK_LIMIT;
         let owner = loop {
             match moves::owner(cluster, ctx).await {
                 Ok(owner) => break owner,
                 Err(error) if cluster.world.elapsed() >= deadline => {
-                    return Err(format!("scheduler owner: {error}"));
+                    return Err(format!("scheduler owner: {error}").into());
                 }
                 Err(_) => self.pause(cluster, ctx, POLL).await,
             }
@@ -1789,7 +1959,7 @@ impl Membership {
             match pool.prepare(cluster, ctx, owner).await {
                 Ok(prepared) => break prepared,
                 Err(error) if cluster.world.elapsed() >= deadline => {
-                    return Err(format!("second pool: {error}"));
+                    return Err(format!("second pool: {error}").into());
                 }
                 Err(_) => self.pause(cluster, ctx, POLL).await,
             }
@@ -1823,7 +1993,8 @@ impl Membership {
         let moved = self.drive(cluster, ctx, g, owner, id, &payload).await;
         faults.slow(None);
         moved?;
-        self.hostile_retries(cluster, ctx, g, owner, id, &payload)
+        let mut judged = self
+            .hostile_retries(cluster, ctx, g, owner, id, &payload)
             .await;
 
         // On to a third pool, under another ID. The primary pool keeps the first move's retired
@@ -1838,7 +2009,7 @@ impl Membership {
             match pool.prepare(cluster, ctx, owner).await {
                 Ok(prepared) => break prepared,
                 Err(error) if cluster.world.elapsed() >= deadline => {
-                    return Err(format!("third pool: {error}"));
+                    return Err(format!("third pool: {error}").into());
                 }
                 Err(_) => self.pause(cluster, ctx, POLL).await,
             }
@@ -1848,11 +2019,17 @@ impl Membership {
             .extend(pool.second_pool_of(&cluster.world, owner));
         self.drive(cluster, ctx, g, owner, back_id, &back).await?;
         // A late retry of the first move, after the second one undid it.
-        self.hostile_retries(cluster, ctx, g, owner, id, &payload)
+        judged &= self
+            .hostile_retries(cluster, ctx, g, owner, id, &payload)
             .await;
-        self.hostile_retries(cluster, ctx, g, owner, back_id, &back)
+        judged &= self
+            .hostile_retries(cluster, ctx, g, owner, back_id, &back)
             .await;
-        self.clauses.insert("O17:move-sequence");
+        if judged {
+            self.clauses.insert("O17:move-sequence");
+        } else {
+            self.note("move retries not judged");
+        }
         Ok(())
     }
 
@@ -1874,9 +2051,7 @@ impl Membership {
                     next: nodes(record["next"].as_array().map_or(&[][..], Vec::as_slice)),
                 }
             }
-            Ok(Completion::Refused(error))
-                if error.outcome == nabedra_protocol::protocol::Outcome::NotApplied =>
-            {
+            Ok(Completion::Refused(error)) if error.outcome == Outcome::NotApplied => {
                 Certified::Refused
             }
             _ => Certified::Pending,
@@ -1886,7 +2061,7 @@ impl Membership {
         {
             cluster.checks.violate(
                 &cluster.world,
-                "RetryCertifiesNamedRemoval",
+                OPERATOR_GUIDANCE,
                 format!("the answer to {id} is the record of {}", record["id"]),
             );
         }
@@ -1901,7 +2076,7 @@ impl Membership {
         let verdict = self
             .removal
             .answered(id, &request, &certified, published.as_ref());
-        self.judge(cluster, "RetryCertifiesNamedRemoval", verdict);
+        self.judge_named(cluster, verdict);
         certified
     }
 
@@ -1943,7 +2118,8 @@ impl Membership {
     }
 
     /// After move `id` completed: the same request again, another body under its ID, and fresh
-    /// IDs that name a voter that is no member.
+    /// IDs that name a voter that is no member. Returns whether the same request answered
+    /// definitely and the placement could be compared.
     async fn hostile_retries(
         &mut self,
         cluster: &mut Cluster,
@@ -1952,10 +2128,11 @@ impl Membership {
         owner: u64,
         id: Uuid,
         payload: &Value,
-    ) {
+    ) -> bool {
         let Ok((_, before)) = moves::placement(cluster, ctx).await else {
-            return;
+            return false;
         };
+        let mut judged = false;
         let other = before["members"]
             .as_array()
             .into_iter()
@@ -1986,16 +2163,19 @@ impl Membership {
                     ADMIN_LIMIT,
                 )
                 .await;
-            self.judge_move(cluster, ctx, id, &payload, &answer).await;
+            let certified = self.judge_move(cluster, ctx, id, &payload, &answer).await;
+            judged |= matches!(certified, Certified::Retired { .. });
             cluster.record(format!(
                 "retry {id} removing {}: {}",
                 payload["remove_node"],
                 shown(&answer)
             ));
         }
-        if let Ok((_, after)) = moves::placement(cluster, ctx).await
-            && (after["members"] != before["members"]
-                || after["record"]["generation"] != before["record"]["generation"])
+        let Ok((_, after)) = moves::placement(cluster, ctx).await else {
+            return false;
+        };
+        if after["members"] != before["members"]
+            || after["record"]["generation"] != before["record"]["generation"]
         {
             cluster.checks.violate(
                 &cluster.world,
@@ -2005,6 +2185,7 @@ impl Membership {
                 ),
             );
         }
+        judged
     }
 }
 
@@ -2114,26 +2295,113 @@ fn growth_policy(cluster: &Cluster, salt: u64) -> Value {
 }
 
 /// Create a table of its own through the first gateway.
-async fn create_probe_table(token: String, id: Uuid, limit: Duration) -> Result<Value, String> {
+async fn create_probe_table(token: String, id: Uuid) -> WindowAnswer {
     let payload = json!({
         "name": format!("probe_{}", id.simple()),
         "schema": {"id": "int64", "value": "int64"}, "key": "id", "format": "parquet",
     });
-    match request(
-        CLIENTS[0],
-        GATEWAYS[0],
-        "/v1/operations",
-        &token,
-        Some(operation(id, "table.create", payload)),
-        limit,
+    window_answer(
+        request(
+            CLIENTS[0],
+            GATEWAYS[0],
+            "/v1/operations",
+            &token,
+            Some(operation(id, "table.create", payload)),
+            EVIDENCE_ATTEMPT,
+        )
+        .await
+        .and_then(|reply| reply.completion(id)),
     )
-    .await
-    .and_then(|reply| reply.completion(id))?
-    {
-        Completion::Ok(created) => Ok(created),
-        Completion::Refused(error) => Err(format!("{:?} {}", error.code, error.message)),
-        Completion::Unknown(error) => Err(error),
+}
+
+/// Configure the growth policy at `node`.
+async fn configure_policy(node: u64, token: String, id: Uuid, policy: Value) -> WindowAnswer {
+    window_answer(
+        request(
+            BOOTSTRAP_CLIENT,
+            node,
+            "/v1/cluster/operations",
+            &token,
+            Some(operation(
+                id,
+                "storage.growth.configure",
+                json!({"policy": policy}),
+            )),
+            EVIDENCE_ATTEMPT,
+        )
+        .await
+        .and_then(|reply| reply.completion(id)),
+    )
+}
+
+fn window_answer(answer: Result<Completion, String>) -> WindowAnswer {
+    match answer {
+        Ok(Completion::Ok(_)) => WindowAnswer::Acknowledged,
+        Ok(Completion::Refused(error)) if no_quorum(error.code) => WindowAnswer::NoQuorum,
+        Ok(Completion::Refused(error)) => {
+            WindowAnswer::Other(format!("{:?}: {}", error.code, error.message))
+        }
+        Ok(Completion::Unknown(_)) => WindowAnswer::NoQuorum,
+        // The request was sent and nothing came back in time.
+        Err(error) if error.ends_with(" deadline") => WindowAnswer::NoQuorum,
+        Err(error) => WindowAnswer::Other(error),
     }
+}
+
+/// Whether an answer with `code` can mean that no quorum answered.
+fn no_quorum(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::StorageUnavailable | ErrorCode::OutcomeUnknown
+    )
+}
+
+/// How the clients' new writes were answered that were sent from `from` and answered before
+/// `to`, and the first one that was acknowledged. A no-op and a row conflict show nothing.
+fn data_writes(
+    ctx: &Ctx,
+    from: Duration,
+    to: Option<u64>,
+) -> (Vec<WindowAnswer>, Option<(Uuid, u64, u64)>) {
+    let from = from.as_millis() as u64;
+    let (mut answers, mut first) = (Vec::new(), None);
+    for attempt in ctx
+        .observed
+        .lock()
+        .unwrap()
+        .attempts
+        .iter()
+        .filter(|attempt| {
+            attempt.mutation
+                && attempt.fresh
+                && attempt.invoked >= from
+                && to.is_none_or(|to| attempt.completed < to)
+        })
+    {
+        answers.push(match attempt.answer {
+            Answer::Committed => {
+                first.get_or_insert((attempt.id, attempt.invoked, attempt.completed));
+                WindowAnswer::Acknowledged
+            }
+            Answer::Ok | Answer::Refused(ErrorCode::Conflict) => continue,
+            Answer::Unknown => WindowAnswer::NoQuorum,
+            Answer::Refused(code) if no_quorum(code) => WindowAnswer::NoQuorum,
+            Answer::Refused(code) => WindowAnswer::Other(format!("{code:?}")),
+        });
+    }
+    (answers, first)
+}
+
+/// Whether a failed restart preparation says that every survivor that answered refused the
+/// role of the worker's certificate (`ReplacementRestart`), and not, say, that it was busy.
+fn every_survivor_refuses_its_role(error: &str) -> bool {
+    error
+        .rsplit_once("worker.restart.prepare: ")
+        .is_some_and(|(_, answers)| {
+            answers
+                .split("; ")
+                .all(|answer| answer.ends_with("Unauthorized: Control role is not authorized"))
+        })
 }
 
 /// What every running worker reports about the gated capabilities.
@@ -2203,6 +2471,56 @@ mod tests {
             seen,
             BTreeSet::from(["cold", "moves", "replace", "rolling", "wipe"])
         );
+    }
+
+    #[test]
+    fn only_a_refused_role_of_every_survivor_is_a_refused_replacement() {
+        let error = |answers: &str| {
+            every_survivor_refuses_its_role(&format!(
+                "prepare retained restart of n4: worker.restart.prepare: {answers}"
+            ))
+        };
+        let refused = "Unauthorized: Control role is not authorized";
+        assert!(error(&format!("n1 {refused}; n3 {refused}")));
+        assert!(!error(&format!("n1 {refused}; n3 Overloaded: busy")));
+        assert!(!error("n1 Conflict: Control operation is busy"));
+        assert!(!error(""));
+        assert!(!every_survivor_refuses_its_role(
+            "survivors never dropped n4: not ready"
+        ));
+    }
+
+    /// A full executor is no quorum evidence, and a silent one is.
+    #[test]
+    fn window_answers_separate_a_missing_quorum_from_other_refusals() {
+        let refused = |code| {
+            window_answer(Ok(Completion::Refused(
+                nabedra_protocol::protocol::ProtocolError::new(
+                    code,
+                    "refused",
+                    Outcome::NotApplied,
+                ),
+            )))
+        };
+        assert_eq!(
+            refused(ErrorCode::StorageUnavailable),
+            WindowAnswer::NoQuorum
+        );
+        assert_eq!(
+            window_answer(Err("HTTP n1 /v1/operations deadline".into())),
+            WindowAnswer::NoQuorum
+        );
+        assert_eq!(
+            window_answer(Ok(Completion::Ok(json!({})))),
+            WindowAnswer::Acknowledged
+        );
+        for other in [
+            refused(ErrorCode::Overloaded),
+            refused(ErrorCode::Conflict),
+            window_answer(Err("connect n1: refused".into())),
+        ] {
+            assert!(matches!(other, WindowAnswer::Other(_)), "{other:?}");
+        }
     }
 
     #[test]
