@@ -3,6 +3,9 @@
 //!
 //! # Text
 //!
+//! - All of them: OLTP register, OLTP-G09: "Resources stay within budgets and each reservation
+//!   settles exactly once." Its hazard: "Work can fail, panic, cancel, or time out while it owns
+//!   a reservation."
 //! - ExactlyOnceRelease. Design 3.7 (`plans/testing/phase-10-11-oltp-sim.md`): "one release
 //!   per acquire". Scheduler contract, F03: "All owned work settles once; compute and byte
 //!   counters return to baseline; no dependency is abandoned while still active." OLTP

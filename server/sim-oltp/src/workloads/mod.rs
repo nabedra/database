@@ -13,6 +13,7 @@ pub(crate) mod direct;
 pub(crate) mod moves;
 pub(crate) mod old_peer;
 pub(crate) mod paused;
+pub(crate) mod resources;
 
 use std::{collections::BTreeSet, fmt};
 
@@ -56,13 +57,21 @@ impl fmt::Display for Workload {
     }
 }
 
-/// `NABEDRA_SIM_WORKLOAD`: one workload, a comma list, or `mixed` for [`ROTATION`].
+/// The name that puts the [`resources`] overlay on the chosen workloads.
+const OVERLAY: &str = "resources";
+
+/// `NABEDRA_SIM_WORKLOAD`: one workload, a comma list, or `mixed` for [`ROTATION`]. With
+/// `resources` in the list the overlay runs on the others, or on [`ROTATION`] if there are none.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct WorkloadChoice(Vec<Workload>);
+pub(crate) struct WorkloadChoice {
+    workloads: Vec<Workload>,
+    overlay: bool,
+}
 
 impl WorkloadChoice {
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         let mut chosen = Vec::new();
+        let mut overlay = false;
         for name in value
             .split(',')
             .map(str::trim)
@@ -70,6 +79,8 @@ impl WorkloadChoice {
         {
             if name == "mixed" {
                 chosen.extend(ROTATION);
+            } else if name == OVERLAY {
+                overlay = true;
             } else {
                 chosen.push(
                     Workload::parse(name)
@@ -77,33 +88,45 @@ impl WorkloadChoice {
                 );
             }
         }
+        if chosen.is_empty() && overlay {
+            chosen.extend(ROTATION);
+        }
         if chosen.is_empty() {
             return Err("NABEDRA_SIM_WORKLOAD names no workload".into());
         }
-        if chosen.contains(&Workload::Smoke) && chosen.len() > 1 {
+        if chosen.contains(&Workload::Smoke) && (chosen.len() > 1 || overlay) {
             return Err("the smoke workload runs alone".into());
         }
-        Ok(Self(chosen))
+        Ok(Self {
+            workloads: chosen,
+            overlay,
+        })
+    }
+
+    /// Whether the `resources` overlay runs.
+    pub(crate) fn overlay(&self) -> bool {
+        self.overlay
     }
 
     /// The workload of `seed`: seeds rotate through the list.
     pub(crate) fn of(&self, seed: u64) -> Workload {
-        self.0[(seed % self.0.len() as u64) as usize]
+        self.workloads[(seed % self.workloads.len() as u64) as usize]
     }
 
     pub(crate) fn is_smoke(&self) -> bool {
-        self.0 == [Workload::Smoke]
+        self.workloads == [Workload::Smoke]
     }
 
     pub(crate) fn label(&self) -> String {
-        if self.0 == ROTATION {
-            return "mixed".into();
+        let mut names: Vec<_> = if self.workloads == ROTATION {
+            vec!["mixed"]
+        } else {
+            self.workloads.iter().map(|chosen| chosen.name()).collect()
+        };
+        if self.overlay {
+            names.push(OVERLAY);
         }
-        self.0
-            .iter()
-            .map(|workload| workload.name())
-            .collect::<Vec<_>>()
-            .join(",")
+        names.join(",")
     }
 }
 
@@ -126,5 +149,14 @@ mod tests {
         assert!(WorkloadChoice::parse("smoke,direct").is_err());
         assert!(WorkloadChoice::parse("bogus").is_err());
         assert_eq!(WorkloadChoice::parse("cold").unwrap().of(5), Workload::Cold);
+        assert!(!mixed.overlay());
+        let overlaid = WorkloadChoice::parse("resources").unwrap();
+        assert!(overlaid.overlay());
+        assert_eq!(overlaid.label(), "mixed,resources");
+        assert_eq!(overlaid.of(4), mixed.of(4));
+        let cold = WorkloadChoice::parse("cold,resources").unwrap();
+        assert!(cold.overlay() && cold.of(5) == Workload::Cold);
+        assert_eq!(WorkloadChoice::parse(&cold.label()).unwrap(), cold);
+        assert!(WorkloadChoice::parse("smoke,resources").is_err());
     }
 }

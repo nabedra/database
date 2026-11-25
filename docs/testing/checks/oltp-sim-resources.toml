@@ -1,0 +1,22 @@
+id = "oltp-sim-resources"
+module = "oltp"
+kinds = ["S", "H"]
+# Fault model. The `resources` overlay of phase 11 on `direct`, `cold` and `move`: client
+# requests are cut, the admission limits are filled and shed, and workers drain during work.
+# ExactlyOnceRelease, ReleaseAfterWork and ResourceBaseline are judged, and a quiet stage with
+# cuts must leave every ledger where it was. Every seed runs twice. The sweep is expected to be
+# red on unpatched main: its known reds are reported, and none of them is allowed.
+guarantees = ["OLTP-G09"]
+scenarios = []
+tiers = ["T2"]
+command = ["bash", "-euc", '''
+build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
+"${build[@]}" --no-run
+"${build[@]}" -- --test-threads=2 invariants:: workloads:: nemesis::
+exec timeout 3000s "${build[@]}" sweep::tests::sweep -- --exact --nocapture --test-threads=1
+''']
+cwd = "server"
+timeout_s = 5400
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "resources", NABEDRA_SEEDS = "16", NABEDRA_SIM_JOBS = "2", NABEDRA_SIM_VERIFY_REPLAY = "1.0", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-resources", NABEDRA_SIM_GUARANTEES = "OLTP-G09", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-resources" }

@@ -40,7 +40,7 @@ use crate::{
 
 const OPERATIONS: &str = "/v1/operations";
 /// Extra client time past the server's request deadline, so deadline answers arrive.
-const REPLY_GRACE: Duration = Duration::from_secs(1);
+pub(super) const REPLY_GRACE: Duration = Duration::from_secs(1);
 /// Pause between a definite refusal and the identity check that follows it.
 const PROBE_PAUSE: Duration = Duration::from_millis(500);
 /// A count takes the queued path, whose acceptance test allows 30 s.
@@ -278,6 +278,11 @@ impl Request {
             anchor: key,
             id,
         }
+    }
+
+    /// An `insert_many` of `count` new keys from `first`, each with its key as its value.
+    pub(super) fn rows(table: &str, first: i64, count: i64, id: Uuid) -> Self {
+        Self::insert_many(table, first, first, count, first + count, id)
     }
 
     fn insert_many(table: &str, first: i64, value: i64, count: i64, keys: i64, id: Uuid) -> Self {

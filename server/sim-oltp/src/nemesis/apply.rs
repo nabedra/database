@@ -25,6 +25,7 @@ use crate::{
     workloads::{
         clauses::Fault,
         clients::{self, Ctx},
+        resources::drain_failed,
     },
 };
 
@@ -279,6 +280,42 @@ impl Chaos {
             .filter(|node| cluster.is_running(*node) && !cluster.frozen().contains(node))
             .collect();
         (!candidates.is_empty()).then(|| *g.pick(&candidates))
+    }
+
+    /// Stop a worker gracefully. A worker that does not stop cleanly is a violation.
+    async fn drain(&mut self, cluster: &mut Cluster, node: u64) -> Result<(), String> {
+        let drained = cluster.drain(node).await;
+        cluster.crash(node, DiskCut::Kill).await;
+        if let Err(error) = &drained {
+            drain_failed(cluster, node, error);
+        }
+        drained
+    }
+
+    /// Note a drained worker and restart it `after` a while.
+    fn drained(
+        &mut self,
+        cluster: &Cluster,
+        ctx: &Ctx,
+        node: u64,
+        drained: &Result<(), String>,
+        after: Duration,
+    ) {
+        self.note(cluster, ctx, "drain-leader", json!({"worker": node, "drained": drained.as_ref().map_err(String::as_str).err(), "restart_after_ms": after.as_millis() as u64}));
+        self.later(cluster, after, FollowUp::RestartWorker(node, false));
+    }
+
+    /// The `resources` overlay drains `node`, and the nemesis restarts it.
+    pub(crate) async fn drain_worker(
+        &mut self,
+        cluster: &mut Cluster,
+        ctx: &Ctx,
+        node: u64,
+        after: Duration,
+    ) {
+        self.open(cluster, Action::DrainLeader, &[node]);
+        let drained = self.drain(cluster, node).await;
+        self.drained(cluster, ctx, node, &drained, after);
     }
 
     async fn act(&mut self, cluster: &mut Cluster, ctx: &Ctx, g: &mut Gen, action: Action) {
@@ -543,18 +580,9 @@ impl Chaos {
                     return self.skip(cluster, action, "no running worker");
                 };
                 self.open(cluster, action, &[leader]);
-                let drained = cluster.drain(leader).await;
-                cluster.crash(leader, DiskCut::Kill).await;
-                if let Err(error) = &drained {
-                    cluster.checks.violate(
-                        &cluster.world,
-                        "ProcessExit",
-                        format!("drain of n{leader}: {error}"),
-                    );
-                }
+                let drained = self.drain(cluster, leader).await;
                 let duration = window(g, 300, 3_000);
-                self.note(cluster, ctx, "drain-leader", json!({"worker": leader, "drained": drained.as_ref().map_err(String::as_str).err(), "restart_after_ms": duration.as_millis() as u64}));
-                self.later(cluster, duration, FollowUp::RestartWorker(leader, false));
+                self.drained(cluster, ctx, leader, &drained, duration);
             }
             Action::LaneExhaust => {
                 let gateway = g.below(2) as usize;

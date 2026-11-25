@@ -14,6 +14,7 @@ use super::{
     Scenarios, Workload, clauses,
     clients::{self, Ctx, Plan},
     cold, corrupt, moves, old_peer, paused,
+    resources::Overlay,
 };
 use crate::{
     bootstrap::{CLIENTS, GATEWAYS, WORKERS},
@@ -51,9 +52,17 @@ pub(crate) async fn run(
     workload: Workload,
     selection: &Selection,
     quiet: bool,
+    overlay: bool,
 ) -> Result<Report, String> {
     cluster.wait_direct().await?;
-    let table = create_table(cluster, &history).await?;
+    let table = create_table(cluster, &history, "sim_direct").await?;
+    // Before the resource baseline, as the workload's own table is.
+    let overlay = if overlay {
+        let table = create_table(cluster, &history, "sim_resources").await?;
+        Some((Overlay::draw(seed, CHAOS), table))
+    } else {
+        None
+    };
     for (node, stats) in crate::workload::steady(cluster).await? {
         cluster
             .checks
@@ -87,6 +96,10 @@ pub(crate) async fn run(
         plan.programs.len(),
         plan.keys,
     ));
+    let mut overlay = overlay.map(|(mut overlay, table)| {
+        overlay.arm(cluster, &ctx, table);
+        overlay
+    });
     let tasks: Vec<_> = plan
         .programs
         .into_iter()
@@ -101,7 +114,13 @@ pub(crate) async fn run(
         if let Some(moving) = moving.as_mut() {
             moving.tick(cluster, &ctx).await;
         }
+        if let Some(overlay) = overlay.as_mut() {
+            overlay.tick(cluster, &ctx, chaos.as_mut()).await;
+        }
         time::sleep(TICK).await;
+    }
+    if let Some(overlay) = overlay.as_mut() {
+        overlay.stop(cluster).await;
     }
 
     let mut report = Report::default();
@@ -313,6 +332,14 @@ pub(crate) async fn run(
         }
     }
 
+    if let Some(overlay) = overlay.as_mut() {
+        if converged.is_ok() && final_checks.is_ok() && cluster.converged().await {
+            report.scenarios.extend(overlay.stage(cluster, config.deadline()).await);
+        } else {
+            cluster.record("resources overlay stage not run: the cluster did not converge".into());
+        }
+    }
+
     let no_quorum = cluster.no_quorum();
     let drops = chaos.as_ref().map(Chaos::session_drops).unwrap_or_default();
     let outcome = clauses::Evidence {
@@ -390,6 +417,9 @@ pub(crate) async fn run(
         "move_wait_ms": move_wait_ms,
         "heal_cold_start": chaos.as_ref().is_some_and(|chaos| chaos.heal_cold),
     });
+    if let Some(overlay) = &overlay {
+        report.summary["resources"] = overlay.summary(&cluster.checks, &cluster.world);
+    }
     cluster.record(format!("workload summary {}", report.summary));
     Ok(report)
 }
@@ -428,12 +458,16 @@ async fn abandon(
 }
 
 /// Create the workload's table through the first gateway, retrying the same ID.
-async fn create_table(cluster: &Cluster, history: &Arc<Mutex<History>>) -> Result<String, String> {
+async fn create_table(
+    cluster: &Cluster,
+    history: &Arc<Mutex<History>>,
+    name: &str,
+) -> Result<String, String> {
     let node = CLIENTS[0];
     let gateway = GATEWAYS[0];
     let id = in_node(node, async { uuid_v4() }).await;
     let payload = json!({
-        "name": "sim_direct", "schema": {"id": "int64", "value": "int64"},
+        "name": name, "schema": {"id": "int64", "value": "int64"},
         "key": "id", "format": "parquet",
     });
     let mut client = history.lock().unwrap().client();
