@@ -1616,6 +1616,26 @@ fn a_record_may_expire() {
         event.time_ns = Some(time);
     }
     assert_eq!(direct::check(&events).not_judged[EXPIRED], 1);
+    // Replayed first, and computed again after the record is gone.
+    let both = "0> update k 2 r
+         0< ok false
+         1> insert k 1 other
+         1< ok
+         0> update k 2 r
+         0< ok false
+         0> update k 2 r
+         0< ok true";
+    let times = [0, 1, 2, 3, 4, 5, 25 * hours, 25 * hours];
+    assert!(at(both, &times).is_empty());
+    // Refused as reuse, after the record is gone and another body committed.
+    let refused = "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         2< ok
+         0> update k 2 r
+         0< reused";
+    assert!(at(refused, &[0, 1, 2, 3, 25 * hours, 25 * hours]).is_empty());
+    assert_eq!(at(refused, &short), [UNSTABLE]);
     // A row conflict of an insert may be replayed and recomputed too.
     for last in ["exists", "ok"] {
         let text = format!(
