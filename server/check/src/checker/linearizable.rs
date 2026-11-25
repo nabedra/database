@@ -182,6 +182,8 @@ impl KeyOp {
             }
             next
         };
+        // It is refused as reuse only if its own result may not be recorded.
+        let refusable = !mine || self.record.is_some_and(|r| r.bit & r.doubtful != 0);
         let repeats = mine && self.rules.replays && matches!(held, 0 | HELD);
         match self.role {
             Role::Invalid => return None,
@@ -189,7 +191,7 @@ impl KeyOp {
             Role::Conflict => {
                 if let Some(r) = self.record.filter(|_| held != 0) {
                     let other = if held == HELD {
-                        others != 0
+                        refusable && others != 0
                     } else {
                         held != r.body
                     };
@@ -202,7 +204,7 @@ impl KeyOp {
                 let r = self.record?;
                 let sure = others & !r.doubtful;
                 let holder = sure.count_ones() == 1 || sure == 0 && others != 0;
-                return (holder && !self.rules.row).then(|| {
+                return (refusable && holder && !self.rules.row).then(|| {
                     let mut next = state.to_vec();
                     next[r.slot] = HELD;
                     next

@@ -1204,6 +1204,18 @@ fn a_result_without_a_commit_explains_the_refusal_of_another_body() {
            2> upsert a 9 r
            2< reused"#,
     );
+    by_default(
+        "two unanswered bodies that refuse each other",
+        "0> delete k null r
+         0< info
+         1> update k 3 r
+         1< info
+         2> delete k null r
+         2< reused
+         3> update k 3 r
+         3< reused",
+        &["non-linearizable"],
+    );
     // So the batch may be refused itself.
     legal(
         "a batch that is refused after a no-op of another body",
