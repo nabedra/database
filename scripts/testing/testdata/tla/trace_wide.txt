@@ -1,0 +1,239 @@
+Picked up JAVA_TOOL_OPTIONS: -Xmx2g -Dtlc2.TLC.stopAfter=900
+@!@!@STARTMSG 2262:0 @!@!@
+TLC2 Version 2026.11.19.180144 (rev: bc1b506)
+@!@!@ENDMSG 2262 @!@!@
+@!@!@STARTMSG 2187:0 @!@!@
+Running breadth-first search Model-Checking with fp 1 and seed -7361629583174014602 with 1 worker on 16 cores with 1820MB heap and 64MB offheap memory [pid: 7] (Linux 6.18.58.1-microsoft-standard-WSL2 amd64, Eclipse Adoptium 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue).
+@!@!@ENDMSG 2187 @!@!@
+@!@!@STARTMSG 2220:0 @!@!@
+Starting SANY...
+@!@!@ENDMSG 2220 @!@!@
+Parsing file /specs/selftest/TwoPhaseTraceMutants.tla
+Parsing file /specs/selftest/TwoPhaseTrace.tla
+Parsing file /specs/selftest/TwoPhase.tla
+Parsing file /specs/lib/NabedraTrace.tla
+Parsing file /tmp/tlc-13083952192748429084/Naturals.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-13083952192748429084/FiniteSets.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-13083952192748429084/Sequences.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-13083952192748429084/Json.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/Json.tla)
+Parsing file /tmp/tlc-13083952192748429084/IOUtils.tla (jar:file:/opt/tla/CommunityModules-deps.jar!/IOUtils.tla)
+Parsing file /tmp/tlc-13083952192748429084/TLC.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-13083952192748429084/Integers.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-13083952192748429084/SequencesExt.tla (jar:file:/opt/tla/CommunityModules-deps.jar!/SequencesExt.tla)
+Parsing file /tmp/tlc-13083952192748429084/FiniteSetsExt.tla (jar:file:/opt/tla/CommunityModules-deps.jar!/FiniteSetsExt.tla)
+Parsing file /tmp/tlc-13083952192748429084/Folds.tla (jar:file:/opt/tla/CommunityModules-deps.jar!/Folds.tla)
+Parsing file /tmp/tlc-13083952192748429084/Functions.tla (jar:file:/opt/tla/CommunityModules-deps.jar!/Functions.tla)
+Parsing file /tmp/tlc-13083952192748429084/Bags.tla (jar:file:/opt/tla/tla2tools.jar!/tla2sany/StandardModules/Bags.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TwoPhase
+Semantic processing of module TLC
+Semantic processing of module Json
+Semantic processing of module Integers
+Semantic processing of module Folds
+Semantic processing of module Functions
+Semantic processing of module FiniteSetsExt
+Semantic processing of module Bags
+Semantic processing of module SequencesExt
+Semantic processing of module IOUtils
+Semantic processing of module NabedraTrace
+Semantic processing of module TwoPhaseTrace
+Semantic processing of module TwoPhaseTraceMutants
+Linting of module TwoPhase
+Linting of module Json
+Linting of module Folds
+Linting of module Functions
+Linting of module FiniteSetsExt
+Linting of module SequencesExt
+Linting of module IOUtils
+Linting of module NabedraTrace
+Linting of module TwoPhaseTrace
+Linting of module TwoPhaseTraceMutants
+@!@!@STARTMSG 2219:0 @!@!@
+SANY finished.
+@!@!@ENDMSG 2219 @!@!@
+@!@!@STARTMSG 2185:0 @!@!@
+Starting... (2026-11-24 16:29:12)
+@!@!@ENDMSG 2185 @!@!@
+@!@!@STARTMSG 2189:0 @!@!@
+Computing initial states...
+@!@!@ENDMSG 2189 @!@!@
+@!@!@STARTMSG 2190:0 @!@!@
+Finished computing initial states: 1 distinct state generated at 2026-11-24 16:29:12.
+@!@!@ENDMSG 2190 @!@!@
+@!@!@STARTMSG 1000:1 @!@!@
+TLC threw an unexpected exception.
+This was probably caused by an error in the spec or model.
+See the User Output or TLC Console for clues to what happened.
+The exception was a java.lang.RuntimeException
+: Attempted to check equality of integer 5 with non-integer:
+"4294967301"
+@!@!@ENDMSG 1000 @!@!@
+@!@!@STARTMSG 2121:1 @!@!@
+The behavior up to this point is:
+@!@!@ENDMSG 2121 @!@!@
+@!@!@STARTMSG 2217:4 @!@!@
+1: <Initial predicate>
+/\ traceExplained = 0
+/\ drops = 0
+/\ traceIndex = 1
+/\ tmPrepared = {}
+/\ tmUp = TRUE
+/\ msgs = {}
+/\ tmDecision = "init"
+/\ crashes = 0
+/\ rmState = [r1 |-> "working", r2 |-> "working"]
+
+@!@!@ENDMSG 2217 @!@!@
+@!@!@STARTMSG 2217:4 @!@!@
+2: <RMStep line 29, col 8 to line 29, col 37 of module TwoPhaseTrace>
+/\ traceExplained = 1
+/\ drops = 0
+/\ traceIndex = 2
+/\ tmPrepared = {}
+/\ tmUp = TRUE
+/\ msgs = {[type |-> "Prepared", rm |-> "r1"]}
+/\ tmDecision = "init"
+/\ crashes = 0
+/\ rmState = [r1 |-> "prepared", r2 |-> "working"]
+
+@!@!@ENDMSG 2217 @!@!@
+@!@!@STARTMSG 2217:4 @!@!@
+3: <RMStep line 29, col 8 to line 29, col 37 of module TwoPhaseTrace>
+/\ traceExplained = 2
+/\ drops = 0
+/\ traceIndex = 3
+/\ tmPrepared = {}
+/\ tmUp = TRUE
+/\ msgs = {[type |-> "Prepared", rm |-> "r1"], [type |-> "Prepared", rm |-> "r2"]}
+/\ tmDecision = "init"
+/\ crashes = 0
+/\ rmState = [r1 |-> "prepared", r2 |-> "prepared"]
+
+@!@!@ENDMSG 2217 @!@!@
+@!@!@STARTMSG 2217:4 @!@!@
+4: <TMStep line 33, col 8 to line 34, col 55 of module TwoPhaseTrace>
+/\ traceExplained = 3
+/\ drops = 0
+/\ traceIndex = 4
+/\ tmPrepared = {"r1"}
+/\ tmUp = TRUE
+/\ msgs = {[type |-> "Prepared", rm |-> "r1"], [type |-> "Prepared", rm |-> "r2"]}
+/\ tmDecision = "init"
+/\ crashes = 0
+/\ rmState = [r1 |-> "prepared", r2 |-> "prepared"]
+
+@!@!@ENDMSG 2217 @!@!@
+@!@!@STARTMSG 2217:4 @!@!@
+5: <TMStep line 39, col 8 to line 41, col 67 of module TwoPhaseTrace>
+/\ traceExplained = 4
+/\ drops = 0
+/\ traceIndex = 5
+/\ tmPrepared = {}
+/\ tmUp = FALSE
+/\ msgs = {[type |-> "Prepared", rm |-> "r1"], [type |-> "Prepared", rm |-> "r2"]}
+/\ tmDecision = "init"
+/\ crashes = 1
+/\ rmState = [r1 |-> "prepared", r2 |-> "prepared"]
+
+@!@!@ENDMSG 2217 @!@!@
+@!@!@STARTMSG 2217:4 @!@!@
+6: <TMStep line 42, col 8 to line 42, col 67 of module TwoPhaseTrace>
+/\ traceExplained = 5
+/\ drops = 0
+/\ traceIndex = 6
+/\ tmPrepared = {}
+/\ tmUp = TRUE
+/\ msgs = {[type |-> "Prepared", rm |-> "r1"], [type |-> "Prepared", rm |-> "r2"]}
+/\ tmDecision = "init"
+/\ crashes = 1
+/\ rmState = [r1 |-> "prepared", r2 |-> "prepared"]
+
+@!@!@ENDMSG 2217 @!@!@
+@!@!@STARTMSG 2217:4 @!@!@
+7: <TMStep line 33, col 8 to line 34, col 55 of module TwoPhaseTrace>
+/\ traceExplained = 6
+/\ drops = 0
+/\ traceIndex = 7
+/\ tmPrepared = {"r1"}
+/\ tmUp = TRUE
+/\ msgs = {[type |-> "Prepared", rm |-> "r1"], [type |-> "Prepared", rm |-> "r2"]}
+/\ tmDecision = "init"
+/\ crashes = 1
+/\ rmState = [r1 |-> "prepared", r2 |-> "prepared"]
+
+@!@!@ENDMSG 2217 @!@!@
+@!@!@STARTMSG 2217:4 @!@!@
+8: <TMStep line 33, col 8 to line 34, col 55 of module TwoPhaseTrace>
+/\ traceExplained = 7
+/\ drops = 0
+/\ traceIndex = 8
+/\ tmPrepared = {"r1", "r2"}
+/\ tmUp = TRUE
+/\ msgs = {[type |-> "Prepared", rm |-> "r1"], [type |-> "Prepared", rm |-> "r2"]}
+/\ tmDecision = "init"
+/\ crashes = 1
+/\ rmState = [r1 |-> "prepared", r2 |-> "prepared"]
+
+@!@!@ENDMSG 2217 @!@!@
+@!@!@STARTMSG 2217:4 @!@!@
+9: <TMStep line 35, col 8 to line 35, col 77 of module TwoPhaseTrace>
+/\ traceExplained = 8
+/\ drops = 0
+/\ traceIndex = 9
+/\ tmPrepared = {"r1", "r2"}
+/\ tmUp = TRUE
+/\ msgs = { [type |-> "Commit"],
+  [type |-> "Prepared", rm |-> "r1"],
+  [type |-> "Prepared", rm |-> "r2"] }
+/\ tmDecision = "committed"
+/\ crashes = 1
+/\ rmState = [r1 |-> "prepared", r2 |-> "prepared"]
+
+@!@!@ENDMSG 2217 @!@!@
+@!@!@STARTMSG 2217:4 @!@!@
+10: <TMStep line 43, col 8 to line 43, col 58 of module TwoPhaseTrace>
+/\ traceExplained = 9
+/\ drops = 1
+/\ traceIndex = 10
+/\ tmPrepared = {"r1", "r2"}
+/\ tmUp = TRUE
+/\ msgs = {[type |-> "Prepared", rm |-> "r1"], [type |-> "Prepared", rm |-> "r2"]}
+/\ tmDecision = "committed"
+/\ crashes = 1
+/\ rmState = [r1 |-> "prepared", r2 |-> "prepared"]
+
+@!@!@ENDMSG 2217 @!@!@
+@!@!@STARTMSG 2147:1 @!@!@
+TLC was unable to fingerprint.
+
+Fingerprint Stack Trace:
+0. Line 44, column 8 to line 44, column 71 in TwoPhaseTraceMutants
+1. Line 140, column 5 to line 145, column 16 in NabedraTrace
+2. Line 140, column 8 to line 140, column 31 in NabedraTrace
+3. Line 141, column 8 to line 141, column 22 in NabedraTrace
+4. Line 142, column 8 to line 142, column 35 in NabedraTrace
+5. Line 143, column 8 to line 143, column 8 in NabedraTrace
+6. Line 44, column 30 to line 44, column 62 in TwoPhaseTraceMutants
+7. Line 44, column 30 to line 44, column 50 in TwoPhaseTraceMutants
+8. Line 44, column 42 to line 44, column 50 in TwoPhaseTraceMutants
+9. Line 38, column 16 to line 38, column 54 in TwoPhaseTraceMutants
+
+
+Reason:
+Attempted to check equality of integer 5 with non-integer:
+"4294967301"
+@!@!@ENDMSG 2147 @!@!@
+@!@!@STARTMSG 2200:0 @!@!@
+Progress(11) at 2026-11-24 16:29:12: 11 states generated (352 s/min), 11 distinct states found (352 ds/min), 1 states left on queue.
+@!@!@ENDMSG 2200 @!@!@
+@!@!@STARTMSG 2199:0 @!@!@
+11 states generated, 11 distinct states found, 1 states left on queue.
+@!@!@ENDMSG 2199 @!@!@
+@!@!@STARTMSG 2194:0 @!@!@
+The depth of the complete state graph search is 11.
+@!@!@ENDMSG 2194 @!@!@
+@!@!@STARTMSG 2186:0 @!@!@
+Finished in 1873ms at (2026-11-24 16:29:12)
+@!@!@ENDMSG 2186 @!@!@

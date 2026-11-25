@@ -38,7 +38,9 @@ use super::{
     queued_clauses::{Facts, Mark, Stop, Work},
 };
 use crate::{
-    bootstrap::{BOOTSTRAP_CLIENT, Bootstrap, CLIENTS, GATEWAYS, QueueSettings, WORKERS},
+    bootstrap::{
+        BOOTSTRAP_CLIENT, Bootstrap, CLIENTS, GATEWAYS, QueueSettings, WORKERS, initial_range,
+    },
     client::{operation, request},
     config::Config,
     disk::DiskCut,
@@ -56,6 +58,7 @@ use crate::{
         window,
     },
     node::Cluster,
+    operator::Split,
 };
 
 const SUBMIT: &str = "/v1/requests";
@@ -446,11 +449,6 @@ fn failed(error: &ProtocolError) -> Terminal {
     }
 }
 
-/// Whether an error of [`request`] is a connection that ended while it waited for the reply.
-fn cut(error: &str) -> bool {
-    error.starts_with("HTTP reply:") || error.starts_with("HTTP response body:")
-}
-
 fn code(error: &ProtocolError) -> String {
     serde_json::to_value(error.code)
         .ok()
@@ -534,7 +532,6 @@ async fn attempt(
     .await;
     let mut envelope = None;
     let mut replayed = false;
-    let lost = matches!(&reply, Err(error) if cut(error));
     let deadline = matches!(&reply, Err(error) if error.ends_with("deadline"));
     let (answer, completion) = match reply {
         Err(error) => (Answer::Unknown, Completion::Unknown(error)),
@@ -621,7 +618,6 @@ async fn attempt(
         },
         asynchronous,
         gateway,
-        cut: lost,
         closed: close && deadline,
         fresh,
         invoked,
@@ -651,7 +647,6 @@ async fn lookup(q: &Q, node: u64, gateway: u64, run: Uuid, req: &Req) -> Seen {
     let invoked = q.now();
     let path = format!("{SUBMIT}/{run}/{}", req.body.id);
     let reply = request(node, gateway, &path, &q.ctx.token, None, LOOKUP_LIMIT).await;
-    let lost = matches!(&reply, Err(error) if cut(error));
     let mut envelope = None;
     let mut failed = None;
     let mut why = String::new();
@@ -716,7 +711,7 @@ async fn lookup(q: &Q, node: u64, gateway: u64, run: Uuid, req: &Req) -> Seen {
     q.shared.lock().unwrap().log.lookups.push(Lookup {
         run,
         id: req.body.id,
-        cut: lost,
+        gateway,
         invoked,
         completed: q.now(),
         seen: seen.clone(),
@@ -1177,19 +1172,10 @@ fn queued_reads(q: &Q, gateway: usize) -> Vec<JoinHandle<()>> {
         .collect()
 }
 
-/// Wait for tasks. A panic in one is a violation, so that a lost client never reads as a quiet
-/// one.
-async fn join(cluster: &Cluster, tasks: Vec<JoinHandle<()>>) {
+/// Wait for tasks. The run's panic watch reports one that panicked.
+async fn join(tasks: Vec<JoinHandle<()>>) {
     for task in tasks {
-        if let Err(error) = task.await
-            && error.is_panic()
-        {
-            cluster.checks.violate(
-                &cluster.world,
-                "Panic",
-                format!("a client task of the queued workload panicked: {error}"),
-            );
-        }
+        let _ = task.await;
     }
 }
 
@@ -1499,7 +1485,6 @@ async fn seed_early_accept(q: &Q) {
         route: Route::Queued,
         asynchronous: true,
         gateway: GATEWAYS[0],
-        cut: false,
         closed: false,
         fresh: true,
         invoked: now,
@@ -1535,9 +1520,10 @@ pub(crate) async fn run(
         activate_scoped(cluster).await?;
     }
     let table = direct::create_table(cluster, &history).await?;
-    split(cluster, &table).await?;
-    for node in WORKERS {
-        let stats = cluster.stats(node).await?;
+    let table_id = Uuid::parse_str(&table).map_err(|error| format!("table UUID: {error}"))?;
+    cluster.watch_table(table_id);
+    split(cluster, table_id).await?;
+    for (node, stats) in crate::workload::steady(cluster).await? {
         cluster
             .checks
             .capture_resources(&cluster.world, node, &stats);
@@ -1573,7 +1559,7 @@ pub(crate) async fn run(
     let start = elapsed_ms(&cluster.world);
     let profile = without_split(selection.profile(seed));
     let mut chaos = (!no_nemesis && profile.total_weight() > 0)
-        .then(|| Chaos::new(profile, faults_net.clone(), start, g));
+        .then(|| Chaos::new(&cluster.world, profile, faults_net.clone(), start, g));
     let chaos_ms = direct::CHAOS.as_millis() as u64;
     let mut schedule = if no_nemesis {
         Vec::new()
@@ -1625,6 +1611,15 @@ pub(crate) async fn run(
         .unwrap()
         .windows
         .push(("chaos window", start, elapsed_ms(&cluster.world)));
+    // The table served requests, so its range has a leader. A harness that can't see it aims its
+    // faults blindly (as in the `direct` workload).
+    if cluster.elections().is_empty() {
+        cluster.checks.violate(
+            &cluster.world,
+            "LeaderUnknown",
+            "no election of the table's range was seen on the wire",
+        );
+    }
     // A fault that found no quiet moment runs now, after the heal and with the clients still
     // sending, so every seed runs each of them.
     q.shared.lock().unwrap().last_turn = q.now();
@@ -1650,7 +1645,7 @@ pub(crate) async fn run(
         apply(&q, cluster, &due, &mut bursts).await;
     }
     q.ctx.stopping.store(true, Ordering::Release);
-    faults_net.clear();
+    faults_net.heal();
     follow_run(&q, cluster);
     cluster
         .checks
@@ -1664,10 +1659,7 @@ pub(crate) async fn run(
         return abandon(cluster, &q, tasks, bursts, chaos.as_ref(), report).await;
     }
     tasks.append(&mut bursts);
-    tokio::join!(
-        join(cluster, tasks),
-        observe(&q, cluster, cluster.config.run_id)
-    );
+    tokio::join!(join(tasks), observe(&q, cluster.config.run_id));
     settle(&q, cluster, "the heal").await;
     reread(&q, cluster.config.run_id).await;
     let finals = final_reads(&q).await;
@@ -1721,7 +1713,7 @@ async fn abandon(
     for task in &tasks {
         task.abort();
     }
-    join(cluster, tasks).await;
+    join(tasks).await;
     cluster.record("workload abandoned after a liveness violation".into());
     finish(q, cluster, chaos, &mut report);
     report.summary["abandoned"] = json!(true);
@@ -1765,14 +1757,15 @@ fn finish(q: &Q, cluster: &Cluster, chaos: Option<&Chaos>, report: &mut direct::
     }
     let mut marks = shared.marks.clone();
     for fault in chaos.iter().flat_map(|chaos| &chaos.log) {
-        let mark = match fault.action {
-            Action::Partition | Action::LeaderMove => Mark::Partition,
-            Action::LostReply | Action::LostHttpReply => Mark::LostReply {
-                to: fault.to.unwrap_or(u64::MAX),
-            },
-            _ => continue,
-        };
-        marks.push((mark, fault.from));
+        // Only what took effect.
+        for effect in &fault.effects {
+            let mark = match fault.action {
+                Action::Partition | Action::LeaderMove => Mark::Partition,
+                Action::LostReply | Action::LostHttpReply => Mark::LostReply { ends: effect.ends },
+                _ => continue,
+            };
+            marks.push((mark, effect.at));
+        }
     }
     let facts = Facts {
         log: &shared.log,
@@ -1950,19 +1943,18 @@ async fn activate_scoped(cluster: &Cluster) -> Result<(), String> {
 }
 
 /// Split the empty table's range, so batches cross ranges.
-async fn split(cluster: &Cluster, table: &str) -> Result<(), String> {
-    let table = Uuid::parse_str(table).map_err(|error| error.to_string())?;
-    let id = cluster.split_id().await;
+async fn split(cluster: &Cluster, table: Uuid) -> Result<(), String> {
+    let source = initial_range(cluster.config.cluster_id, table);
     let deadline = cluster.world.elapsed() + SPLIT_LIMIT;
-    loop {
-        match cluster.split(id, table, BOUNDARY).await {
-            Ok(_) => return Ok(()),
-            Err(error) if cluster.world.elapsed() >= deadline => {
-                return Err(format!("setup split: {error}"));
-            }
-            Err(_) => time::sleep(Duration::from_millis(250)).await,
+    let mut split = Split::start(cluster.operator(), source, BOUNDARY).await;
+    while split.published().is_none() {
+        if cluster.world.elapsed() >= deadline {
+            return Err(format!("setup split: {}", split.summary()));
         }
+        time::sleep(TICK).await;
     }
+    split.stop().await;
+    Ok(())
 }
 
 /// Look up receipts of identities that no client ever submitted.
@@ -1987,7 +1979,7 @@ async fn never_submitted(q: Q) {
 /// Look up every unsettled receipt of `run` until none is left or the budget ends. Returns what
 /// is left. A receipt that is terminal without an outcome is looked up a few times and left to
 /// `AcceptedSettlesInRun`: waiting longer would hold up the checks after this one.
-async fn observe(q: &Q, cluster: &Cluster, run: Uuid) -> BTreeSet<Uuid> {
+async fn observe(q: &Q, run: Uuid) -> BTreeSet<Uuid> {
     let mut round = 0;
     loop {
         let (unsettled, open): (BTreeSet<Uuid>, BTreeSet<Uuid>) = {
@@ -2024,7 +2016,7 @@ async fn observe(q: &Q, cluster: &Cluster, run: Uuid) -> BTreeSet<Uuid> {
                     })
                 })
                 .collect();
-            join(cluster, lookups).await;
+            join(lookups).await;
         }
         round += 1;
         time::sleep(Duration::from_millis(200)).await;
@@ -2035,7 +2027,7 @@ async fn observe(q: &Q, cluster: &Cluster, run: Uuid) -> BTreeSet<Uuid> {
 /// within the convergence bound (design 3.7, `Liveness`).
 async fn settle(q: &Q, cluster: &Cluster, when: &str) {
     let run = cluster.config.run_id;
-    let unsettled = observe(q, cluster, run).await;
+    let unsettled = observe(q, run).await;
     let shared = q.shared.lock().unwrap();
     let total = unsettled.len();
     for id in unsettled.into_iter().take(3) {
@@ -2136,7 +2128,7 @@ async fn copies(q: &Q, cluster: &Cluster, when: &str) {
         Err(error) => return q.skip(cluster, format!("copies {when}: {error}")),
     };
     let since = q.now();
-    join(cluster, burst(q, 0, 12, false)).await;
+    join(burst(q, 0, 12, false)).await;
     let sent = q.now();
     let mut after = Vec::new();
     for node in WORKERS {
@@ -2359,7 +2351,7 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
     let cold = cluster
         .cold_start_staggered("queued finale", cut, delays, COLD_LIMIT)
         .await;
-    join(cluster, tasks).await;
+    join(tasks).await;
     cold.map_err(|error| format!("cold start: {error}"))?;
     let run = cluster.config.run_id;
     // The counters are the legacy queue's alone, so they say nothing about a scoped one.
@@ -2452,7 +2444,7 @@ async fn stop(q: &Q, cluster: &mut Cluster, finale: Finale, g: &mut Gen) -> Resu
         q.now() + direct::CONVERGE_LIMIT.as_millis() as u64,
         Ordering::Release,
     );
-    join(cluster, burst(q, 1, 3, true)).await;
+    join(burst(q, 1, 3, true)).await;
     settle(q, cluster, "the cold start").await;
     q.ctx.converge_by.store(u64::MAX, Ordering::Release);
     Ok(())
@@ -3000,15 +2992,6 @@ mod tests {
             progress("rolling restart", &work(0, 1, 0)),
             ["write committed"]
         );
-    }
-
-    #[test]
-    fn only_a_lost_connection_is_a_cut() {
-        assert!(cut(
-            "HTTP reply: connection closed before message completed"
-        ));
-        assert!(!cut("connect n101: refused"));
-        assert!(!cut("HTTP n101 /v1/requests deadline"));
     }
 
     #[test]

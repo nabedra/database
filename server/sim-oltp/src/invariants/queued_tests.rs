@@ -22,7 +22,6 @@ fn submit(body: Body, at: u64, answer: Answer) -> Submission {
         route: Route::Queued,
         asynchronous: true,
         gateway: 101,
-        cut: false,
         closed: false,
         fresh: true,
         invoked: at,
@@ -50,7 +49,7 @@ fn lookup(id: u128, at: u64, seen: Seen) -> Lookup {
     Lookup {
         run: RUN,
         id: Uuid::from_u128(id),
-        cut: false,
+        gateway: 101,
         invoked: at,
         completed: at + 10,
         seen,

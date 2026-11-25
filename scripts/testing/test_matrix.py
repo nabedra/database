@@ -225,6 +225,122 @@ class BuildTests(MatrixFixtureTests):
                 matrix.build_matrix(replace(self.fx.paths, registers=registers), allow_unattested=True)
 
 
+def t_record(check, result="pass", mode="exhaustive", tier="T1", kind="T", reason="stopped at the budget",
+             behind=0, sha="a" * 40, **facts):
+    tla = None if mode is None else {"spec": "specs/x/X", "mode": mode, "tier": tier, "tools": "t", **facts}
+    if mode == "exhaustive":
+        tla.setdefault("runs", [{"cfg": "X.cfg", "verdict": "pass", "states_left": 0}])
+    if mode == "trace":
+        tla.setdefault("traces", {"checked": 3, "accepted": 1, "rejected": 2, "expected_rejections": 2, "failing": []})
+    record = {"check": check, "kind": kind, "guarantees": ["OLTP-G03"], "sha": sha, "result": result,
+              "assertions": {"executed": 3, "failed": 1 if result == "fail" else 0,
+                             "not_run": [{"id": "b", "reason": reason}] if result == "not-run" else []},
+              "run": {"url": "https://example.invalid/1", "date": "2026-11-24T00:00:00Z"}}
+    if tla is not None:
+        record["tla"] = tla
+    return matrix.Counted(Path(check), record, behind)
+
+
+class KindTCellTests(unittest.TestCase):
+    def cell(self, *records, kind="T"):
+        g = matrix.Guarantee("OLTP-G03", "s", "f", [], ["T", "U"], {})
+        return matrix.evaluate_cell(g, kind, list(records), 0)
+
+    def test_only_an_exhaustive_t0_or_t1_pass_is_green(self):
+        for tier in ("T0", "T1"):
+            cell = self.cell(t_record("d", tier=tier))
+            self.assertEqual((cell.state, cell.green()), ("pass", True))
+        sim, trace = t_record("d-large", mode="simulation", tier="T2"), t_record("d-trace", mode="trace")
+        stopped = t_record("d", "not-run")
+        cases = {
+            "simulation alone": [sim],
+            "trace alone": [trace],
+            "simulation and trace": [sim, trace],
+            "T2 exhaustive alone": [t_record("d-large", tier="T2")],
+            "T1 simulation": [t_record("d", mode="simulation")],
+            "no facts": [t_record("d", mode=None)],
+            "exhaustive not-run, simulation pass": [stopped, sim],
+            "exhaustive not-run, trace pass": [trace, stopped],
+            "need missing, simulation pass": [t_record("d", "not-run", mode=None, reason="tlc-unavailable"), sim],
+        }
+        for name, records in cases.items():
+            with self.subTest(name):
+                cell = self.cell(*records)
+                self.assertEqual((cell.state, cell.green()), ("not-run", False))
+                self.assertIn("no passing exhaustive T0 or T1 run", cell.reason)
+        self.assertIn("only T1 trace, T2 simulation", self.cell(sim, trace).reason)
+        self.assertIn("stopped at the budget", self.cell(stopped, sim).reason)
+
+    def test_a_failed_exhaustive_run_is_red_beside_any_pass(self):
+        for result in ("fail", "error"):
+            for other in (t_record("d-large", mode="simulation", tier="T2"), t_record("d-trace", mode="trace"),
+                          t_record("d")):
+                self.assertEqual(self.cell(t_record("d", result), other).state, "fail")
+
+    def test_simulation_and_trace_records_can_turn_a_pass_red(self):
+        for mode in ("simulation", "trace"):
+            for result, state in (("fail", "fail"), ("error", "fail"), ("quarantined", "quarantined 3/3")):
+                with self.subTest(mode=mode, result=result):
+                    cell = self.cell(t_record("d"), t_record("x", result, mode=mode))
+                    self.assertEqual((cell.state, cell.green()), (state, False))
+            # One that did not run beside an exhaustive pass changes nothing.
+            self.assertTrue(self.cell(t_record("d"), t_record("x", "not-run", mode=mode)).green())
+
+    def test_an_unfinished_exhaustive_run_wins_over_a_pass(self):
+        for tier in ("T0", "T1"):
+            cell = self.cell(t_record("a"), t_record("b", "not-run", tier=tier))
+            self.assertEqual((cell.state, cell.green()), ("not-run", False))
+            self.assertIn("exhaustive run not finished: b; stopped at the budget", cell.reason)
+        self.assertFalse(self.cell(t_record("a"), t_record("a", "not-run")).green())
+        # A T2 exhaustive run goes beyond the required bounds.
+        self.assertTrue(self.cell(t_record("a"), t_record("a-large", "not-run", tier="T2")).green())
+
+    def test_a_missing_need_counts_until_the_same_check_passes(self):
+        need = t_record("b", "not-run", mode=None, reason="tlc-unavailable")
+        self.assertFalse(self.cell(t_record("a"), need).green())
+        self.assertTrue(self.cell(t_record("a"), need, t_record("b")).green())
+
+    def test_facts_that_contradict_the_pass_are_red(self):
+        for facts in ({"uncovered": ["A"]}, {"mutants": [{"name": "m", "ok": False}]},
+                      {"runs": [{"cfg": "X.cfg", "verdict": "incomplete"}]}, {"dropped": {"failing_mutants": 2}}):
+            with self.subTest(facts=facts):
+                cell = self.cell(t_record("a", **facts))
+                self.assertEqual(cell.state, "fail")
+                self.assertIn("contradict", cell.reason)
+                # Also beside a clean exhaustive pass, whatever the mode of the record that contradicts itself.
+                for mode in ("simulation", "trace"):
+                    cell = self.cell(t_record("a"), t_record("b", mode=mode, **facts))
+                    self.assertEqual((cell.state, cell.green()), ("fail", False))
+        self.assertTrue(self.cell(t_record("a", dropped={"mutants": 3}, truncated=True)).green())
+        # An exhaustive record has to say that nothing was left, and a trace record that it accepted something.
+        for runs in ([], [{"cfg": "X.cfg", "verdict": "pass"}], [{"cfg": "X.cfg", "verdict": "pass", "states_left": None}],
+                     [{"cfg": "X.cfg", "verdict": "pass", "states_left": 1}], "none"):
+            self.assertEqual(self.cell(t_record("a", runs=runs)).state, "fail")
+        nothing = {"checked": 3, "accepted": 0, "rejected": 3, "expected_rejections": 3, "failing": []}
+        self.assertEqual(self.cell(t_record("a"), t_record("b", mode="trace", traces=nothing)).state, "fail")
+
+    def test_the_reasons_of_a_run_that_did_not_finish_are_shown(self):
+        cell = self.cell(t_record("a"), t_record("b", "not-run", reason="r1"), t_record("c", "not-run", reason="r2", mode=None),
+                         t_record("d", "not-run", mode="trace", reason="r3"))
+        self.assertEqual(cell.reason, "exhaustive run not finished: b, c; r1; r2")
+        cell = self.cell(t_record("b", "not-run", reason="r1"), t_record("e", mode="simulation", tier="T2"))
+        self.assertEqual(cell.reason, "no passing exhaustive T0 or T1 run (only T2 simulation); r1")
+
+    def test_the_run_must_be_on_the_cells_own_sha(self):
+        old = t_record("d", behind=3, sha="b" * 40)
+        cell = self.cell(old, t_record("d-large", mode="simulation", tier="T2"))
+        self.assertEqual((cell.state, cell.sha), ("not-run", "a" * 40))
+        cell = self.cell(old)
+        self.assertEqual((cell.state, cell.last), ("stale", "pass"))
+
+    def test_other_kinds_keep_their_rule(self):
+        mixed = t_record("m", mode="simulation", kind="T U")
+        self.assertEqual(self.cell(mixed, kind="U").state, "pass")
+        self.assertEqual(self.cell(mixed).state, "not-run")
+        plain = t_record("u", "not-run", mode=None, kind="U")
+        self.assertEqual(self.cell(plain, t_record("v", mode=None, kind="U"), kind="U").state, "pass")
+
+
 class SelectTests(MatrixFixtureTests):
     @classmethod
     def setUpClass(cls):

@@ -180,6 +180,8 @@ impl ParticipantMachine {
                         ));
                     }
                     lineage::validate_read(&config, request.read_ts)?;
+                    #[cfg(feature = "sim")]
+                    super::snapshot_probe(&group, request.read_ts);
                     // Heads first, then direct-commit dedup records, which
                     // sort after every head key (`MvccKey::DirectDedup`).
                     let mut prefix = match &request.after {

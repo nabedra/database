@@ -5,6 +5,7 @@ use std::{
     io::{self, Write},
     net::SocketAddr,
     path::Path,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use nabedra_database_server::oltp::pool::POOL_FORMAT_VERSION;
@@ -152,6 +153,99 @@ pub(crate) struct Bootstrap {
     worker_configs: [Value; 3],
     api_enrollments: [Value; 2],
     queue: QueueSettings,
+    /// The workers' identities and secondary pools, shared with the operator's tasks.
+    pub mounts: Mounts,
+}
+
+/// What the workers' bootstrap files say about identities and secondary pools. The operator's
+/// tasks change it while the cluster runs.
+#[derive(Clone)]
+pub(crate) struct Mounts(Arc<Mutex<MountState>>);
+
+struct MountState {
+    cluster_id: Uuid,
+    identities: [Value; 3],
+    pools: [Vec<Value>; 3],
+}
+
+impl Mounts {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self(Arc::new(Mutex::new(MountState {
+            cluster_id: Uuid::nil(),
+            identities: Default::default(),
+            pools: Default::default(),
+        })))
+    }
+
+    fn state(&self) -> MutexGuard<'_, MountState> {
+        self.0.lock().unwrap()
+    }
+
+    /// The current mounted identity of worker `index` (its `mount.worker` field).
+    pub fn identity(&self, index: usize) -> Value {
+        self.state().identities[index].clone()
+    }
+
+    /// A Docker-profile mount record for a secondary pool on worker `index` at `path`,
+    /// as `mount_pool` in `tests/oltp_direct_cluster.py` builds it. Writes the volume
+    /// marker on the calling node's volume.
+    pub fn new_pool(&self, index: usize, path: &str, pool_id: Uuid) -> io::Result<Value> {
+        let node = WORKERS[index];
+        let volume = format!("sim-oltp-{node}{}", path.replace('/', "-"));
+        let marker = pool_id;
+        let file = format!("{path}/.nabedra-docker-volume.json");
+        let mut out = os::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&file)?;
+        out.write_all(&serde_json::to_vec(&json!({
+            "format_version": 1, "volume_name": volume, "volume_marker": marker,
+        }))?)?;
+        out.sync_all()?;
+        os::sync_dir(Path::new(path))?;
+        let state = self.state();
+        let worker = &state.identities[index];
+        Ok(json!({
+            "profile": {"docker": {"volume_marker": marker}},
+            "worker": worker,
+            "generation": 1,
+            "identity": {
+                "engine": "oltp", "pool_format_version": POOL_FORMAT_VERSION,
+                "cluster_id": state.cluster_id, "worker_id": worker["worker_id"], "pool_id": pool_id,
+            },
+            "mount_path": path,
+            "provider_volume_id": format!("docker-volume:{volume}"),
+            "filesystem_uuid": "",
+        }))
+    }
+
+    /// List a mounted secondary pool in the worker's bootstrap file. A restarted worker opens
+    /// only the pools its bootstrap lists, so a restart without this entry can never host the
+    /// replicas that live there.
+    pub fn list(&self, index: usize, mount: &Value, claim: Uuid) {
+        let pool = json!({"mount": mount, "growth_claim": claim});
+        self.state().pools[index].push(pool);
+    }
+
+    /// The worker no longer opens this secondary pool.
+    pub fn unlist(&self, index: usize, pool: &Value) {
+        self.state().pools[index].retain(|entry| entry["mount"]["identity"]["pool_id"] != *pool);
+    }
+
+    /// The worker's next process has another identity, and its mounts follow it.
+    fn advance(&self, index: usize, worker: &Value) {
+        let mut state = self.state();
+        state.identities[index] = worker.clone();
+        for pool in &mut state.pools[index] {
+            let mount = &mut pool["mount"];
+            let generation = mount["generation"].as_u64().unwrap();
+            mount["worker"] = worker.clone();
+            mount["generation"] = json!(generation + 1);
+        }
+    }
 }
 
 impl Bootstrap {
@@ -187,7 +281,7 @@ impl Bootstrap {
             "catalog": place(3, json!("catalog")),
         });
         let (peers, pins) = Self::peer_inventory(enrollments.to_vec());
-        let worker_configs = std::array::from_fn(|local| {
+        let worker_configs: [Value; 3] = std::array::from_fn(|local| {
             let node = WORKERS[local];
             let enrollment = &enrollments[local];
             let marker = uuid_v4();
@@ -232,6 +326,11 @@ impl Bootstrap {
             json!({"database": DATABASE, "enrollment": enrollment(GATEWAYS[0])?}),
             json!({"database": DATABASE, "enrollment": enrollment(GATEWAYS[1])?}),
         ];
+        let mounts = Mounts(Arc::new(Mutex::new(MountState {
+            cluster_id,
+            identities: enrollments.each_ref().map(Self::identity),
+            pools: Default::default(),
+        })));
         Ok(Self {
             cluster_id,
             run_id,
@@ -241,6 +340,7 @@ impl Bootstrap {
             worker_configs,
             api_enrollments,
             queue: QueueSettings::default(),
+            mounts,
         })
     }
 
@@ -307,7 +407,11 @@ impl Bootstrap {
     pub fn write_worker(&self, index: usize) -> io::Result<()> {
         let node = WORKERS[index];
         self.write_material(node)?;
-        let config = &self.worker_configs[index];
+        let mut config = self.worker_configs[index].clone();
+        let pools = self.mounts.state().pools[index].clone();
+        if !pools.is_empty() {
+            config["node"]["secondary_pools"] = json!(pools);
+        }
         write_json(
             MARKER,
             &json!({
@@ -316,7 +420,7 @@ impl Bootstrap {
                 "volume_marker": config["node"]["mount"]["profile"]["docker"]["volume_marker"],
             }),
         )?;
-        write_json(CONFIG, config)
+        write_json(CONFIG, &config)
     }
 
     pub fn api_enrollment(&self, index: usize) -> &Value {
@@ -349,85 +453,10 @@ impl Bootstrap {
         write_json(CONFIG, &config)
     }
 
-    /// The current mounted identity of worker `index` (its `mount.worker` field).
-    pub fn worker_identity(&self, index: usize) -> Value {
-        self.worker_configs[index]["node"]["mount"]["worker"].clone()
-    }
-
-    /// A Docker-profile mount record for a secondary pool on worker `index` at `path`,
-    /// as `mount_pool` in `tests/oltp_direct_cluster.py` builds it. Writes the volume
-    /// marker on the calling node's volume.
-    pub fn secondary_pool(&self, index: usize, path: &str, pool_id: Uuid) -> io::Result<Value> {
-        let node = WORKERS[index];
-        let volume = format!("sim-oltp-{node}{}", path.replace('/', "-"));
-        let marker = pool_id;
-        let file = format!("{path}/.nabedra-docker-volume.json");
-        let mut out = os::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&file)?;
-        out.write_all(&serde_json::to_vec(&json!({
-            "format_version": 1, "volume_name": volume, "volume_marker": marker,
-        }))?)?;
-        out.sync_all()?;
-        os::sync_dir(Path::new(path))?;
-        let worker = &self.worker_configs[index]["node"]["mount"]["worker"];
-        Ok(json!({
-            "profile": {"docker": {"volume_marker": marker}},
-            "worker": worker,
-            "generation": 1,
-            "identity": {
-                "engine": "oltp", "pool_format_version": POOL_FORMAT_VERSION,
-                "cluster_id": self.cluster_id, "worker_id": worker["worker_id"], "pool_id": pool_id,
-            },
-            "mount_path": path,
-            "provider_volume_id": format!("docker-volume:{volume}"),
-            "filesystem_uuid": "",
-        }))
-    }
-
-    /// List a mounted secondary pool in the worker's bootstrap file. A restarted worker opens
-    /// only the pools its bootstrap lists, so a restart without this entry can never host the
-    /// replicas that live there.
-    pub fn list_secondary_pool(&mut self, index: usize, mount: &Value, claim: Uuid) {
-        let pools = &mut self.worker_configs[index]["node"]["secondary_pools"];
-        if pools.is_null() {
-            *pools = json!([]);
-        }
-        let pool = json!({"mount": mount, "growth_claim": claim});
-        pools.as_array_mut().expect("pool list").push(pool);
-    }
-
-    /// Move a node's secondary pool mounts to the worker identity of its next process.
-    fn advance_secondary(node: &mut Value, worker: &Value) {
-        let pools = node
-            .get_mut("secondary_pools")
-            .and_then(Value::as_array_mut);
-        for pool in pools.into_iter().flatten() {
-            let mount = &mut pool["mount"];
-            let generation = mount["generation"].as_u64().unwrap();
-            mount["worker"] = worker.clone();
-            mount["generation"] = json!(generation + 1);
-        }
-    }
-
     /// The TLS material of one process.
     pub fn tls(&self, node: u64) -> io::Result<TlsMaterial> {
         let (cert, key) = material(node);
         TlsMaterial::from_pem(cert, key, certificate_authority())
-    }
-
-    /// The worker no longer opens this secondary pool.
-    pub fn unlist_secondary_pool(&mut self, index: usize, pool: &Value) {
-        let node = &mut self.worker_configs[index]["node"];
-        if let Some(pools) = node
-            .get_mut("secondary_pools")
-            .and_then(Value::as_array_mut)
-        {
-            pools.retain(|entry| entry["mount"]["identity"]["pool_id"] != *pool);
-        }
     }
 
     /// The primary pool in worker `index`'s bootstrap file.
@@ -486,7 +515,7 @@ impl Bootstrap {
         if let Some(fields) = node.as_object_mut() {
             fields.remove("cold");
         }
-        Self::advance_secondary(node, &identity);
+        self.mounts.advance(index, &identity);
         let mount = &mut node["mount"];
         let generation = mount["generation"].as_u64().unwrap();
         mount["worker"] = identity;
@@ -502,14 +531,14 @@ impl Bootstrap {
             "next_run": next_run,
             "transition_id": uuid_v4(),
         });
-        for config in &mut self.worker_configs {
+        for (index, config) in self.worker_configs.iter_mut().enumerate() {
             let node = &mut config["node"];
             let enrollment = &mut node["enrollment"];
             let revision = enrollment["enrollment_revision"].as_u64().unwrap();
             enrollment["enrollment_revision"] = json!(revision + 1);
             enrollment["incarnation"] = json!(uuid_v4());
             let worker = Self::identity(enrollment);
-            Self::advance_secondary(node, &worker);
+            self.mounts.advance(index, &worker);
             let mount = &mut node["mount"];
             let generation = mount["generation"].as_u64().unwrap();
             mount["worker"] = worker;

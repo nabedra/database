@@ -36,9 +36,9 @@ pub(crate) enum Mark {
     },
     /// A link fault of the shared nemesis.
     Partition,
-    /// A lost reply of the shared nemesis, open until `to`.
+    /// A connection that the shared nemesis reset before a reply, between these nodes.
     LostReply {
-        to: u64,
+        ends: [Option<u64>; 2],
     },
 }
 
@@ -156,25 +156,27 @@ impl Facts<'_> {
             Mark::Partition if open => {
                 out.insert("R05:partition");
             }
-            Mark::LostReply { to } => {
-                let cut = |cut: bool, invoked: u64, completed: u64| {
-                    cut && invoked <= to && completed >= at
+            Mark::LostReply { ends } => {
+                let lost = |gateway: u64, invoked: u64, completed: u64| {
+                    ends.contains(&Some(gateway)) && invoked <= at && completed >= at
                 };
                 // The lost answer was certainly terminal, or the mutation had to be reconciled.
-                let receipt = self.log.lookups.iter().any(|lost| {
-                    cut(lost.cut, lost.invoked, lost.completed)
+                let receipt = self.log.lookups.iter().any(|l| {
+                    l.seen == Seen::Unknown
+                        && lost(l.gateway, l.invoked, l.completed)
                         && self
-                            .lookups(lost.run, lost.id)
-                            .any(|l| l.completed <= lost.invoked && decided(&l.seen))
+                            .lookups(l.run, l.id)
+                            .any(|early| early.completed <= l.invoked && decided(&early.seen))
                         && self
-                            .lookups(lost.run, lost.id)
-                            .any(|l| l.invoked >= lost.completed && decided(&l.seen))
+                            .lookups(l.run, l.id)
+                            .any(|late| late.invoked >= l.completed && decided(&late.seen))
                 });
                 let mutation = || {
-                    self.log.submissions.iter().any(|lost| {
-                        lost.body.mutation
-                            && cut(lost.cut, lost.invoked, lost.completed)
-                            && self.resolved(&lost.body, lost.completed).is_some()
+                    self.log.submissions.iter().any(|s| {
+                        s.body.mutation
+                            && s.answer == Answer::Unknown
+                            && lost(s.gateway, s.invoked, s.completed)
+                            && self.resolved(&s.body, s.completed).is_some()
                     })
                 };
                 if receipt || mutation() {
@@ -516,7 +518,6 @@ mod tests {
             route: Route::Queued,
             asynchronous: true,
             gateway: 101,
-            cut: false,
             closed: false,
             fresh: true,
             invoked: at,
@@ -537,7 +538,7 @@ mod tests {
         Lookup {
             run: RUN,
             id: Uuid::from_u128(id),
-            cut: false,
+            gateway: 101,
             invoked: at,
             completed: at + 10,
             seen,
@@ -712,8 +713,11 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_terminal_needs_a_cut_answer_that_was_reconciled() {
-        let marks = [(Mark::LostReply { to: 2_000 }, 1_000)];
+    fn a_lost_terminal_needs_a_lost_answer_that_was_reconciled() {
+        let reset = |gateway| {
+            let ends = [Some(gateway), Some(1)];
+            [(Mark::LostReply { ends }, 1_505)]
+        };
         let mut log = log();
         log.submissions = vec![accepted(1, 100)];
         log.lookups = vec![
@@ -721,18 +725,19 @@ mod tests {
             lookup(1, 1_500, Seen::Unknown),
             lookup(1, 3_000, ok()),
         ];
-        assert!(names(&log, &marks).is_empty(), "a deadline is not a cut");
-        log.lookups[1].cut = true;
-        assert_eq!(names(&log, &marks), ["Q06:lost-terminal"]);
+        assert_eq!(names(&log, &reset(101)), ["Q06:lost-terminal"]);
+        assert!(names(&log, &reset(102)).is_empty(), "another gateway");
+        log.lookups[1].invoked = 1_506;
+        assert!(names(&log, &reset(101)).is_empty(), "sent after the reset");
+        log.lookups[1].invoked = 1_500;
         log.lookups[0].seen = Seen::Pending;
-        assert!(names(&log, &marks).is_empty(), "not known to be terminal");
-        let mut lost = submit(body(2, 1, 2), 1_500, Answer::Unknown);
-        lost.cut = true;
+        assert!(names(&log, &reset(101)).is_empty(), "not known terminal");
+        let lost = submit(body(2, 1, 2), 1_500, Answer::Unknown);
         log.submissions.push(lost);
-        assert!(names(&log, &marks).is_empty(), "never reconciled");
+        assert!(names(&log, &reset(101)).is_empty(), "never reconciled");
         log.submissions
             .push(submit(body(2, 1, 2), 1_800, success()));
-        assert_eq!(names(&log, &marks), ["Q06:lost-terminal"]);
+        assert_eq!(names(&log, &reset(101)), ["Q06:lost-terminal"]);
     }
 
     #[test]

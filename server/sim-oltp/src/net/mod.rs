@@ -4,9 +4,11 @@
 //! header. HTTP and one-shot traffic retain byte-stream ordering.
 
 mod http;
+mod leader;
 mod peers;
 
 pub use http::HttpConnection;
+pub use leader::Election;
 pub use peers::{PeerDirectory, PeerProtocol};
 
 use std::{
@@ -74,6 +76,7 @@ struct State {
     world: Weak<World>,
     trace: Trace,
     trace_observer: Option<TraceObserver>,
+    leaders: leader::Watch,
 }
 
 /// Installs profiles on the network used by the existing transport backend.
@@ -96,6 +99,7 @@ impl SimNet {
             world: Arc::downgrade(world),
             trace: Trace::new(),
             trace_observer: None,
+            leaders: leader::Watch::default(),
         }));
         world.set_net_planner(Router(state.clone()));
         Self {
@@ -176,12 +180,29 @@ impl SimNet {
         self.state.lock().unwrap().trace_observer = Some(Arc::new(observer));
     }
 
+    /// Follow the elections of a Raft group from its AppendEntries frames.
+    pub fn watch_group(&self, group: uuid::Uuid) {
+        self.state.lock().unwrap().leaders.add(group);
+    }
+
+    /// Every election seen so far in a watched group, in order.
+    pub fn elections(&self) -> Vec<Election> {
+        self.state.lock().unwrap().leaders.elections().to_vec()
+    }
+
     pub fn trace(&self) -> Trace {
         self.state.lock().unwrap().trace.clone()
     }
 }
 
 impl State {
+    fn elected(&mut self, envelope: &Envelope<'_>) {
+        if let Some(world) = self.world.upgrade() {
+            let ms = world.elapsed().as_millis().try_into().unwrap();
+            self.leaders.request(ms, envelope.from, envelope.bytes);
+        }
+    }
+
     fn record(&mut self, event: std::fmt::Arguments<'_>) {
         self.record_observed(event, event, None);
     }
@@ -232,6 +253,9 @@ impl Planner for Router {
         let selected = match message {
             Message::Frame(frame) => {
                 stream = Some(frame.stream);
+                if frame.kind == FrameKind::Request {
+                    state.elected(envelope);
+                }
                 state
                     .frame_profile
                     .as_mut()

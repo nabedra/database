@@ -1,0 +1,20 @@
+# A controller unit schedule only, local and unattested. No cluster schedule that delivers a source's
+# older heartbeat after a newer one is known, and the author's 151 instrumented sweep seeds (local) did not
+# produce one. This record is neither a pass nor a fail of the guarantee it names.
+id = "cache-older-source-heartbeat"
+title = "A late older source heartbeat lets a staged copy 900 sequences behind complete"
+class = "other"
+module = "cache"
+guarantees = ["CACHE-G05"]
+scenarios = ["K03"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "server/src/cache/cluster/controller/tests.rs::k03_older_source_heartbeat_does_not_complete_a_lagging_copy"
+seed = "unknown"
+why_not_caught = "A worker in the sweeps never has two heartbeats in flight at once, so no heartbeat arrives after a newer one, and no unit test reordered them."
+invariant_added = "Completing a staged replica compares the target with the newest source progress the controller has seen. The regression is ignored and fails today."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-22"

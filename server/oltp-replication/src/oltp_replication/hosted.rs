@@ -407,6 +407,14 @@ where
                 tracing::debug!(target: "nabedra_database_server::oltp_replication::hosted", group=%self.store().identity().group_id, node=self._resident.node_id(),
                     index=position.index, "typed Raft state applied");
             }
+            #[cfg(feature = "sim")]
+            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::Applied {
+                group: self.store().identity().group_id,
+                kind: self.store().identity().kind.clone(),
+                replica: self._resident.node_id(),
+                entry: position,
+                digest: meta.command_digest,
+            });
             if let Some(responder) = responder {
                 // PERF2b: a small reply is measured and decoded on this
                 // task; a large one still runs as native jobs.

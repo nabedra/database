@@ -1,10 +1,12 @@
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime, timedelta, timezone
+import io
 import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import triage
 
@@ -102,6 +104,78 @@ class TriageTests(unittest.TestCase):
                 stamp = datetime(day.year, day.month, day.day, 12, tzinfo=timezone.utc).timestamp()
                 os.utime(path, (stamp, stamp))
             self.assertEqual(triage.baseline(Path(directory), "probe", today), (1, 1))
+
+
+class KindTTests(unittest.TestCase):
+    """A T check is never retried or unblocked, whatever --kind says."""
+
+    def setUp(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.checks = self.root / "checks"
+        self.checks.mkdir()
+        for name, kinds in (("spec", '["T"]'), ("mixed", '["R", "T"]'), ("real", '["R"]'), ("broken", '"T"')):
+            (self.checks / f"{name}.toml").write_text(f'id = "{name}"\nkinds = {kinds}\n')
+        self.evidence = self.root / "evidence"
+        self.evidence.mkdir()
+        (self.root / "log").write_text("mutant not caught\n")
+
+    def record(self, check, kind):
+        (self.evidence / f"{check}.json").write_text(json.dumps(
+            {"check": check, "kind": kind, "result": "pass", "run": datetime.now(timezone.utc).date().isoformat()}))
+
+    def run_main(self, check, kind, exit_code=1):
+        marker = self.root / "reran"
+        argv = ["--kind", kind, "--check", check, "--evidence", str(self.evidence), "--log",
+                str(self.root / "log"), "--exit-code", str(exit_code), "--", "touch", str(marker)]
+        out = io.StringIO()
+        with patch.object(triage, "CHECKS_DIR", self.checks), redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = triage.main(argv)
+        return code, marker.exists(), out.getvalue()
+
+    def test_registered_t_check_is_blocked_whatever_kind_says(self):
+        for check in ("spec", "mixed"):
+            self.record(check, "R")  # a record that hides the kind does not help either
+            for kind in ("R", "R P", "R T", "T", "U"):
+                for exit_code in (1, 0):
+                    with self.subTest(check=check, kind=kind, exit_code=exit_code):
+                        code, reran, text = self.run_main(check, kind, exit_code)
+                        self.assertEqual((code, reran), (1, False))
+                        self.assertIn("kind T is never retried or unblocked", text)
+                        self.assertIn("Retries 0/0", text)
+
+    def test_unregistered_check_with_t_records_is_blocked(self):
+        self.record("renamed", "U T")
+        code, reran, text = self.run_main("renamed", "R")
+        self.assertEqual((code, reran), (1, False))
+        self.assertIn("kind T is never retried", text)
+
+    def test_unknown_check_is_never_passed(self):
+        self.record("real", "R")
+        for check in ("specc", "spec ", "SPEC", "x/../spec", "../checks/spec"):
+            for exit_code in (0, 1):
+                with self.subTest(check=check, exit_code=exit_code):
+                    code, reran, text = self.run_main(check, "R", exit_code)
+                    self.assertEqual((code, reran), (1, False))
+                    self.assertIn("unknown check", text)
+        # A known one that passed is, registered or not.
+        self.record("unregistered", "R")
+        for check in ("real", "unregistered"):
+            self.assertEqual(self.run_main(check, "R", 0)[0], 0)
+
+    def test_registered_r_check_still_retries(self):
+        self.record("real", "R")
+        code, reran, text = self.run_main("real", "R")
+        self.assertEqual((code, reran), (0, True))
+        self.assertIn("Retries 10/10", text)
+
+    def test_unreadable_check_file_unblocks_nothing(self):
+        code, reran, _ = self.run_main("broken", "R")
+        self.assertEqual((code, reran), (2, False))
+
+    def test_repository_t_checks_are_known(self):
+        self.assertEqual(triage.known_kinds("specs-selftest", self.evidence), {"T"})
 
 
 class KindListTest(unittest.TestCase):

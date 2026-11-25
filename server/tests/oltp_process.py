@@ -113,7 +113,7 @@ class Server:
                     output = self.process.stderr.read().decode(errors="replace")
                     self.process.stderr.close()
                 self.process = None
-                if harness_ports.lost_bind(output, [port]):
+                if harness_ports.lost_bind(output, [f'127.0.0.1:{port}']):
                     raise PortLost(port)
                 raise AssertionError(f"server exited; diagnostics: {self.diagnostics}" if self.diagnostics else f"server exited: {output}")
             try:

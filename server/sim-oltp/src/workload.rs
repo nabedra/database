@@ -25,6 +25,7 @@ use crate::{
     history::{Client, Completion, History, Operation},
     invariants::{Invariants, STEP, TraceObserver, elapsed_ms},
     node::Cluster,
+    panics::{self, PANIC, Watch},
     sweep::{Defect, RunResult, Setup},
     workloads::{self, Scenarios, Workload},
 };
@@ -45,6 +46,10 @@ fn run(
     setup: &Setup,
 ) -> RunResult {
     let workload = setup.workloads.of(seed);
+    assert!(
+        !panics::poisoned(),
+        "an earlier run of this process panicked without its teardown"
+    );
     let mut config = Config::sample(seed);
     if workloads::paused::samples(seed, workload) || setup.selection.focus.d05 {
         let deadline = workloads::paused::DEADLINE.as_millis() as u64;
@@ -57,7 +62,12 @@ fn run(
         config.force("direct_oltp", json!(workloads::queued::direct(seed)));
     }
     let program = (workload == Workload::Smoke).then(|| Program::generate(generator));
-    let (mut result, world) = nabedra_sim::runtime::run(seed, |world| async move {
+    let (mut result, world, panics) = nabedra_sim::runtime::run(seed, |world| async move {
+        let panics = Watch::new(&world);
+        #[cfg(test)]
+        if let Some(at) = setup.panic_at {
+            world.insert_ext(crate::panics::Planted { at, fired: false });
+        }
         let body = Body {
             seed,
             config,
@@ -69,7 +79,7 @@ fn run(
             generator,
         };
         let result = execute(body, world.clone()).await;
-        (result, world)
+        (result, world, panics)
     });
     // The runtime has dropped, including cancelled task futures.
     result.blocking_cpu = world.blocking_cpu_time();
@@ -81,6 +91,22 @@ fn run(
             "t={}ms RegistriesEmpty: live entries after runtime shutdown: {live:?}",
             result.run.virtual_ms
         ));
+    }
+    // Last, so that a panic while the runtime or the world was dropped counts as well.
+    let panicked = panics.finish();
+    result
+        .assertions
+        .insert("no task panicked", panicked.is_empty());
+    for panic in panicked {
+        result
+            .run
+            .violations
+            .push(format!("t={}ms {PANIC}: {panic}", result.run.virtual_ms));
+    }
+    if panics::poisoned() {
+        // Another run of this process escaped while this one ran.
+        result.run.violations =
+            vec!["harness: another run of this process panicked without its teardown".into()];
     }
     result
 }
@@ -176,6 +202,8 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         nabedra_rt::task::spawn(async move {
             loop {
                 time::sleep(STEP).await;
+                #[cfg(test)]
+                crate::panics::plant(&world, crate::panics::At::Ticker);
                 checks.step(&world);
             }
         })
@@ -194,100 +222,112 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     .await
     {
         Ok(mut cluster) => {
-            let configured = match workload {
-                Workload::Queued => workloads::queued::configure(&mut cluster.config, seed),
-                _ => Ok(()),
-            };
-            let startup = match configured {
-                Ok(()) => cluster.start().await,
-                Err(error) => Err(error),
-            };
-            assertions.insert("cluster readiness", startup.is_ok());
-            match startup {
-                Ok(()) if workload != Workload::Smoke => {
-                    let report = if workload == Workload::Queued {
-                        workloads::queued::run(
-                            &mut cluster,
-                            &config,
-                            history.clone(),
-                            generator,
-                            seed,
-                            &setup.selection,
-                            setup.quiet,
-                        )
-                        .await
-                    } else {
-                        workloads::direct::run(
-                            &mut cluster,
-                            &config,
-                            history.clone(),
-                            generator,
-                            seed,
-                            workload,
-                            &setup.selection,
-                            setup.quiet,
-                        )
-                        .await
-                    };
-                    match report {
-                        Ok(report) => {
-                            for (name, passed) in report.assertions {
-                                assertions.insert(name, passed);
-                            }
-                            scenarios = report.scenarios;
-                            summary = report.summary;
-                        }
-                        Err(error) => {
-                            assertions.insert("public HTTP workload completed", false);
-                            checks.violate(&world, "Workload", error);
-                        }
-                    }
+            let body = panics::caught(async {
+                let configured = match workload {
+                    Workload::Queued => workloads::queued::configure(&mut cluster.config, seed),
+                    _ => Ok(()),
+                };
+                let startup = match configured {
+                    Ok(()) => cluster.start().await,
+                    Err(error) => Err(error),
+                };
+                assertions.insert("cluster readiness", startup.is_ok());
+                // Only then: a sweep is a test build too, and extra tasks change its schedule.
+                #[cfg(test)]
+                if setup.panic_at.is_some() {
+                    plant_panics(&world);
                 }
-                Ok(()) => {
-                    let program = program.as_ref().expect("smoke program");
-                    let mut history = history.lock().unwrap();
-                    match smoke(&mut cluster, &config, program, defect, &mut history).await {
-                        Ok(table) => {
-                            assertions.insert("public HTTP workload completed", true);
-                            if let Some(cut) = cold_start {
-                                let started = world.elapsed();
-                                let recovered = verify_cold_start(
-                                    &mut cluster,
-                                    &mut history,
-                                    &table,
-                                    program,
-                                    cut,
-                                )
-                                .await;
-                                assertions.insert(
-                                    "cold start preserved acknowledged data",
-                                    recovered.is_ok(),
-                                );
-                                if let Err(error) = recovered {
-                                    checks.violate(&world, "ColdLifecycle", error);
+                match startup {
+                    Ok(()) if workload != Workload::Smoke => {
+                        let report = if workload == Workload::Queued {
+                            workloads::queued::run(
+                                &mut cluster,
+                                &config,
+                                history.clone(),
+                                generator,
+                                seed,
+                                &setup.selection,
+                                setup.quiet,
+                            )
+                            .await
+                        } else {
+                            workloads::direct::run(
+                                &mut cluster,
+                                &config,
+                                history.clone(),
+                                generator,
+                                seed,
+                                workload,
+                                &setup.selection,
+                                setup.quiet,
+                            )
+                            .await
+                        };
+                        match report {
+                            Ok(report) => {
+                                for (name, passed) in report.assertions {
+                                    assertions.insert(name, passed);
                                 }
-                                println!(
-                                    "fault model cold bootstrap seed {seed}: {:?} virtual",
-                                    world.elapsed() - started
-                                );
+                                scenarios = report.scenarios;
+                                summary = report.summary;
                             }
-                            for (name, violation) in [
-                                ("direct path observed", "DirectPath"),
-                                ("public resource baseline", "ResourceBaseline"),
-                                ("original keyed retry result", "DedupUnique"),
-                            ] {
-                                assertions.insert(name, !has_violation(&checks, violation));
+                            Err(error) => {
+                                assertions.insert("public HTTP workload completed", false);
+                                checks.violate(&world, "Workload", error);
                             }
-                        }
-                        Err(error) => {
-                            assertions.insert("public HTTP workload completed", false);
-                            checks.violate(&world, "SmokeWorkload", error);
                         }
                     }
+                    Ok(()) => {
+                        let program = program.as_ref().expect("smoke program");
+                        let mut history = history.lock().unwrap();
+                        match smoke(&mut cluster, &config, program, defect, &mut history).await {
+                            Ok(table) => {
+                                assertions.insert("public HTTP workload completed", true);
+                                if let Some(cut) = cold_start {
+                                    let started = world.elapsed();
+                                    let recovered = verify_cold_start(
+                                        &mut cluster,
+                                        &mut history,
+                                        &table,
+                                        program,
+                                        cut,
+                                    )
+                                    .await;
+                                    assertions.insert(
+                                        "cold start preserved acknowledged data",
+                                        recovered.is_ok(),
+                                    );
+                                    if let Err(error) = recovered {
+                                        checks.violate(&world, "ColdLifecycle", error);
+                                    }
+                                    println!(
+                                        "fault model cold bootstrap seed {seed}: {:?} virtual",
+                                        world.elapsed() - started
+                                    );
+                                }
+                                for (name, violation) in [
+                                    ("direct path observed", "DirectPath"),
+                                    ("public resource baseline", "ResourceBaseline"),
+                                    ("original keyed retry result", "DedupUnique"),
+                                ] {
+                                    assertions.insert(name, !has_violation(&checks, violation));
+                                }
+                            }
+                            Err(error) => {
+                                assertions.insert("public HTTP workload completed", false);
+                                checks.violate(&world, "SmokeWorkload", error);
+                            }
+                        }
+                    }
+                    Err(error) => checks.violate(&world, "Bootstrap", error),
                 }
-                Err(error) => checks.violate(&world, "Bootstrap", error),
+            });
+            if let Err(panic) = body.await {
+                checks.violate(&world, "harness", format!("panic: {panic}"));
             }
             cluster.teardown().await;
+            #[cfg(test)]
+            panics::plant(&world, panics::At::Escapes);
             assertions.insert(
                 "crash teardown",
                 !has_violation(&checks, "CrashOrder") && !has_violation(&checks, "ProcessExit"),
@@ -338,6 +378,24 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         scenarios,
         summary,
     }
+}
+
+/// The panics of `panics::tests` that a started cluster can have anywhere.
+#[cfg(test)]
+fn plant_panics(world: &Arc<World>) {
+    use crate::panics::{At, plant};
+
+    plant(world, At::Body);
+    let run = |at| {
+        let world = world.clone();
+        async move { plant(&world, at) }
+    };
+    nabedra_rt::task::spawn(run(At::Task));
+    nabedra_rt::task::spawn(in_node(WORKERS[0], run(At::Node)));
+    let blocking = world.clone();
+    drop(nabedra_rt::task::spawn_blocking(move || {
+        plant(&blocking, At::Blocking);
+    }));
 }
 
 #[derive(Default)]
@@ -514,8 +572,7 @@ async fn smoke(
     let table = created["id"]
         .as_str()
         .ok_or_else(|| format!("table.create lacks table id: {created}"))?;
-    for node in WORKERS {
-        let stats = cluster.stats(node).await?;
+    for (node, stats) in steady(cluster).await? {
         cluster
             .checks
             .capture_resources(&cluster.world, node, &stats);
@@ -646,6 +703,27 @@ async fn verify_cold_start(
     Ok(())
 }
 
+/// Waits until every worker's resources stay the same, so that the baseline holds no charge
+/// of a message in flight.
+pub(crate) async fn steady(cluster: &Cluster) -> Result<Vec<(u64, Value)>, String> {
+    let deadline = cluster.world.elapsed() + SETTLE_LIMIT;
+    loop {
+        let mut steady = true;
+        let mut snapshots = Vec::new();
+        for node in WORKERS {
+            let stats = cluster.stats(node).await?;
+            steady &= cluster
+                .checks
+                .resources_steady(&cluster.world, node, &stats);
+            snapshots.push((node, stats));
+        }
+        if steady || cluster.world.elapsed() >= deadline {
+            return Ok(snapshots);
+        }
+        time::sleep(STEP).await;
+    }
+}
+
 async fn settle(cluster: &Cluster) -> Result<Vec<(u64, Value)>, String> {
     let deadline = cluster.world.elapsed() + SETTLE_LIMIT;
     loop {
@@ -669,8 +747,9 @@ mod tests {
 
     use nabedra_sim::sweep::{SweepConfig, sweep};
 
-    /// Seed 66: with fewer session slots than peers the second gateway never activated the
-    /// direct path, so its retry of a committed insert was answered `outcome_unknown` for ever.
+    /// Seed 66: with fewer session slots than peers the second gateway never activates the
+    /// direct path, and its retry of a committed insert is answered `outcome_unknown` for ever.
+    /// Red and kept (lead decision 12.4).
     #[test]
     fn smoke_seed_66_reaches_the_direct_path_through_both_gateways() {
         let mut config = SweepConfig::new("oltp-sim-smoke-66", 66, 1);

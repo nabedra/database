@@ -182,8 +182,6 @@ pub(crate) struct Submission {
     /// Sent to `POST /v1/requests`.
     pub asynchronous: bool,
     pub gateway: u64,
-    /// The connection ended before the reply, by neither side's deadline.
-    pub cut: bool,
     /// The client closed its socket on purpose before a reply could come.
     pub closed: bool,
     /// The first attempt under this identity.
@@ -198,8 +196,7 @@ pub(crate) struct Submission {
 pub(crate) struct Lookup {
     pub run: Uuid,
     pub id: Uuid,
-    /// As [`Submission::cut`].
-    pub cut: bool,
+    pub gateway: u64,
     pub invoked: u64,
     pub completed: u64,
     pub seen: Seen,

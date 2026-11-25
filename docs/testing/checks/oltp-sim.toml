@@ -8,18 +8,24 @@ tiers = ["T1"]
 # Shard 1 of 4. Build once, then allow the measured sweep at most 15 minutes.
 # It also runs the harness regressions: simulated stats omit process-wide stage
 # timings (seed 2 replayed differently in a fresh process), sampled reply arenas
-# hold the largest Data apply budget (seed 22 never bound worker HTTP), and every
-# peer has a session slot (seed 66 never reached the direct path through n102).
+# hold the largest Data apply budget (seed 22 never bound worker HTTP). Seed 66 is an
+# open finding: with fewer session slots than peers n102 never reaches the direct path.
 command = ["bash", "-euc", '''
 cargo test --locked -j 2 --release -p nabedra-database --no-default-features \
     --features oltp,sim --lib oltp_runtime::stage_timing::sim_tests:: -- --test-threads=1
 build=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib)
 "${build[@]}" --no-run
-exec timeout 900s "${build[@]}" -- --exact --nocapture --test-threads=1 \
+report=../target/testing-logs/oltp-sim/sweep-report.json
+rm -f "$report"
+timeout 900s "${build[@]}" -- --exact --nocapture --test-threads=1 \
     config::tests::sampled_reply_arena_fits_the_largest_apply_budget \
-    config::tests::every_peer_has_a_session_slot \
+    config::tests::session_slots_keep_the_sampled_value \
     workload::tests::smoke_seed_66_reaches_the_direct_path_through_both_gateways \
     sweep::tests::sweep workload::tests::cold_start_reopens_mounted_workers
+# The unit tests above, or a filter that matches nothing, must not pass for the sweep.
+python3 -c 'import json, sys
+seeds = json.load(open(sys.argv[1]))["seeds"]
+sys.exit(0 if len(seeds) == int(sys.argv[2]) else f"the sweep ran {len(seeds)} seeds")' "$report" "$NABEDRA_SEEDS"
 ''']
 cwd = "server"
 timeout_s = 3600
