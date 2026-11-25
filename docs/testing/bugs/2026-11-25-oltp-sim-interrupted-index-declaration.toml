@@ -1,0 +1,17 @@
+id = "OLTP-sim-interrupted-index-declaration"
+title = "After a worker loss interrupts schema changes of a table, the table refuses every schema change and its writes leave the direct path or are refused with a conflict, long after the heal"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = []
+scenarios = ["O12", "D11"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 24
+why_not_caught = "The O12 and D11 runners publish an index under load and do not lose a worker while a declaration is unanswered."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=topology, default profile, seed 24 (FenceAfterValidation): 270 s after the heal, with every declaration answered, all direct mutations of the table fall back for the schema and new declarations are refused with `captured schema or lifecycle changed`. With NABEDRA_SIM_TOPOLOGY=no-move,split-before-load, seeds 1 and 4, its final writes are refused with the same conflict."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-23"
