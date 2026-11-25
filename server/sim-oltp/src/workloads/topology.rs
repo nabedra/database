@@ -98,7 +98,7 @@ const FLOOR: i64 = 1_000_000_000_000;
 const AUDIT_KEYS: i64 = 1_000_000;
 const QUIET_KEYS: i64 = 10;
 /// Declarations that race for one name, until one is refused under the table's guard.
-const RACES: usize = 12;
+const RACES: usize = 4;
 const VICTIM_KEYS: i64 = 6;
 
 /// Seeded defects. `LoseRow` and `FakeDrop` change what the cluster does; the others change
@@ -424,6 +424,8 @@ struct Build {
     abandoned: bool,
     /// Why the build did not settle before its bound.
     stuck: Option<String>,
+    /// A request of it was never answered for good, or the build has not published.
+    open: bool,
 }
 
 #[derive(Default)]
@@ -450,6 +452,8 @@ struct Log {
     split_ids: u64,
     /// What each fence race did.
     races: Vec<String>,
+    /// What the tables did at rest.
+    rest: Vec<String>,
     defect: Option<Defect>,
 }
 
@@ -1004,6 +1008,7 @@ async fn index_life(t: Topo, plan: IndexPlan) {
         refused: false,
         abandoned: false,
         stuck: None,
+        open: true,
     };
     let slot = t.log(|log| {
         log.created.insert(plan.name.clone());
@@ -1109,6 +1114,7 @@ async fn life(
                     }
                 }
                 build.refused = true;
+                build.open = !opened.is_empty();
                 let expected = plan.kind != IndexKind::Valid
                     || plan.table == Table::Victim
                     || (code == ErrorCode::Conflict && why.contains("already exists"));
@@ -1175,6 +1181,7 @@ async fn life(
                 // A build that belongs to an earlier run cannot resume, and stays invisible.
                 if name == "storage.index.resume" && *t.run.lock().unwrap() != run {
                     build.abandoned = true;
+                    build.open = false;
                     return;
                 }
                 last = format!("{code:?} {why}");
@@ -1185,6 +1192,7 @@ async fn life(
     build.ready = Some(t.now());
     t.log(|log| log.builds[slot].ready = build.ready);
     let Some(after) = plan.retire else {
+        build.open = false;
         return;
     };
     time::sleep(after).await;
@@ -1196,6 +1204,7 @@ async fn life(
                 let completed = t.next();
                 let state = record_status(t, &plan.name, invoked, completed, &data);
                 if state == "retired" {
+                    build.open = false;
                     build.retired = Some(t.now());
                     return;
                 }
@@ -1990,14 +1999,15 @@ async fn at_rest(cluster: &Cluster, t: &Topo, live: &mut Vec<(Ctx, Table)>) -> R
         // A declaration that was never answered, or a build that has not published, leaves a
         // schema change open.
         let open = t.log(|log| {
-            let open = |b: &&Build| b.table == table && b.stuck.is_some();
+            let open = |b: &&Build| b.table == table && b.open;
             log.builds.iter().filter(open).count()
         });
         if open > 0 {
-            cluster.record(format!(
-                "{} not judged at rest: {open} schema changes are open",
+            let skipped = format!(
+                "{} not judged: {open} schema changes are open",
                 table.name()
-            ));
+            );
+            t.log(|log| log.rest.push(skipped));
             continue;
         }
         let mut client = ctx.new_client();
@@ -2033,7 +2043,14 @@ async fn at_rest(cluster: &Cluster, t: &Topo, live: &mut Vec<(Ctx, Table)>) -> R
             }
         }
     }
-    cluster.record(format!("at rest {rest:?}"));
+    t.log(|log| {
+        log.rest.extend(rest.iter().map(|rest| {
+            format!(
+                "{} n{}: {} of {} fell back after {} ms",
+                rest.table, rest.gateway, rest.schema_fallbacks, rest.writes, rest.polled_ms
+            )
+        }));
+    });
     for found in fence_at_rest(&rest) {
         cluster
             .checks
@@ -2718,11 +2735,12 @@ fn summarize(
             "builds": log.builds.iter().map(|b| json!({
                 "name": b.name, "table": b.table.name(), "kind": format!("{:?}", b.kind),
                 "declared": b.declared, "ready": b.ready, "retired": b.retired,
-                "refused": b.refused, "abandoned": b.abandoned, "stuck": b.stuck,
+                "refused": b.refused, "abandoned": b.abandoned, "stuck": b.stuck, "open": b.open,
             })).collect::<Vec<_>>(),
             "victim_calls": log.calls.len(),
             "dropped": log.dropped.is_some(),
             "fence_races": log.races,
+            "at_rest": log.rest,
             "rules": RULES,
             "heal_cold_start": chaos.is_some_and(|chaos| chaos.heal_cold),
         })

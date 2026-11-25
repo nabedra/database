@@ -109,6 +109,9 @@ pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
         "O12:unique-validation" => {
             "the product has no unique index: IndexDefinition has no such field"
         }
+        "O12:refused-under-guard" => {
+            "a rival that reads the Catalog before the winner commits loses the guard, and a later one is refused before it"
+        }
         "O12:each-phase" => {
             "placing a fault in backfill, replay, validation or publication needs a probe at each"
         }

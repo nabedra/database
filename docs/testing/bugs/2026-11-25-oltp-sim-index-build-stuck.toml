@@ -1,0 +1,17 @@
+id = "OLTP-sim-index-build-stuck"
+title = "After faults an index build never becomes ready: every resume stops at the same error for 180 s in a healthy cluster"
+class = "other"
+module = "oltp"
+guarantees = []
+scenarios = ["O12"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 22
+why_not_caught = "The O12 runner interrupts one build at a time and lets it finish; it has no client load, leader changes or lost replies around it."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=topology, default profile, seeds 12 and 22: an index build is ready within 180 s of the heal. With the actor's error printed in a scratch build, seed 22 stopped 65 times per run with `index dependency is still active` and seed 12 stopped 69 times per run with `no registered group leader completed the strong service call`."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-23"
