@@ -34,6 +34,14 @@ Commands:
                  It writes sim-bugs-run.json beside the harness artifacts. While the harness or a
                  bug's workload is missing it prints `not-run: sim-harness-missing` and exits 0,
                  which the check records as not-run, never as a pass.
+  shard <id>     One part of the seeds (`--shard n/parts`), on both builds, for the search in shards of
+                 server/sim-oltp/bugs/SHARDS.md. It decides nothing. Only at its end it prints one row
+                 per seed and a line over them, so a job that dies leaves nothing that counts.
+  merge <id>     The answer of a target's shards, from their attested records: the lowest seed that
+                 nothing masks while every lower seed is there. `--record` appends it to searches.jsonl.
+  count [ids]    The counting run of targets searched in shards. It merges the records again, refuses a
+                 recorded merge that differs, and repeats the builds, the hit, its twin, the base run
+                 around it and the regression. A missing or unattested shard is `incomplete`.
   record <id>    Append the search in `--from <sim-bugs-run.json>` to the bug's searches.jsonl, which
                  is append-only. `--never-searched <commit> --reason <text>` accounts for a plan that
                  an earlier manifest held and nobody ran.
@@ -48,6 +56,7 @@ membership, resources). Exit status: 0 success, 1 failure, 2 usage or environmen
 
 import argparse
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -60,6 +69,8 @@ import sys
 import tempfile
 import time
 import tomllib
+from urllib.error import HTTPError
+import urllib.request
 
 REPO = Path(__file__).resolve().parents[2]
 BUGS_DIR = Path("server/sim-oltp/bugs")
@@ -143,6 +154,19 @@ TARGET_FILE = re.compile(r"server/sim-oltp/bugs/(?:README\.md|SHARDS\.md|(?:phas
 SEARCH_SCHEMA = "nabedra.sim-bug-search/1"
 SEARCH_FIELDS = {"schema", "id", "sha", "run", "attempt", "plan", "digest", "patch_sha256", "result", "seeds",
                  "tried", "hit", "masked", "rates", "why"}
+MERGE_SCHEMA = "nabedra.sim-bug-merge/1"
+MERGE_FIELDS = SEARCH_FIELDS - {"run", "attempt"} | {"mode", "review", "build", "defect", "binaries", "later", "shards"}
+SHARD_SCHEMA = "nabedra.sim-bug-shard/1"
+# Whose attested runs count, and where the counting run finds their records: in <id>/ of this branch.
+REPOSITORY = "zPy52/nabedra-database"
+BUILD_WORKFLOW = ".github/workflows/nabedra-build.yml"
+EVIDENCE_REF = "refs/remotes/origin/evidence/sim-bugs"
+# GitHub's API, which needs no token for a public repository. A rate limit is waited out for at most API_WAIT seconds.
+API = "https://api.github.com"
+API_WAIT, API_TRIES = 3900, 5
+# What the build workflow calls a dispatched run, and the step that signs the records of a job.
+RUN_TITLE = re.compile(r"([A-Za-z0-9._-]{1,80}) @ ([0-9a-f]{40})")
+ATTEST_STEP = "Attest the evidence records"
 
 MANIFEST_FIELDS = {
     "schema": str, "id": str, "bug": str, "set": str, "phase": int, "class": str,
@@ -201,7 +225,7 @@ def machine_env(**own):
     return {**{key: os.environ[key] for key in MACHINE if key in os.environ}, **own}
 
 
-def git(repo, *args, env=None, input=None, check=True):
+def git(repo, *args, env=None, input=None, check=True, text=True):
     """Run Git with its own environment and configuration. `env` adds the caller's index."""
     # `git replace` refs would show another object under a commit's name.
     env = {**machine_env(), "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_NO_REPLACE_OBJECTS": "1",
@@ -209,10 +233,10 @@ def git(repo, *args, env=None, input=None, check=True):
     options = [part for setting in GIT_CONFIG for part in ("-c", setting)]
     if args[0] == "diff":
         args = ("diff", "--no-ext-diff", "--no-textconv", *args[1:])
-    result = subprocess.run(["git", *options, *args], cwd=repo, capture_output=True, text=True,
+    result = subprocess.run(["git", *options, *args], cwd=repo, capture_output=True, text=text,
                             env=env, input=input)
     if check and result.returncode:
-        raise Failure(f"git {' '.join(args)}: {result.stderr.strip() or result.stdout.strip()}")
+        raise Failure(f"git {' '.join(args)}: {str(result.stderr or result.stdout).strip()}")
     return result
 
 
@@ -587,8 +611,8 @@ def validate_hits(bug):
     # The tool cannot judge prose. It can refuse prose that does not name this hit and this patch,
     # or that names another hit.
     text, own = d["mechanism"], {*(d[key] for key in ("trace_hash", "history_sha256", "search")), *m["fix_commits"]}
-    own.update(entry["search"]["hit"]["twin_trace_hash"] for entry in load_searches(bug)[0]
-               if "search" in entry and search_hash(entry["search"]) == d["search"] and entry["search"]["hit"])
+    own.update(search["hit"]["twin_trace_hash"] for search in recorded_searches(load_searches(bug)[0])
+               if search_hash(search) == d["search"] and search["hit"])
     for seed in re.findall(r"\bseed\s+#?(\d+)", text, re.IGNORECASE):
         if int(seed) != d["seed"]:
             problems.append(f"detection.mechanism names seed {seed}, not this hit's seed")
@@ -1079,7 +1103,7 @@ def unrecorded_plans(bug, repo):
         return ["the clone is shallow, so earlier plans and searches are not visible"]
     entries, _ = load_searches(bug)
     known, problems = [plan_of(bug.manifest)], []
-    known += [entry["search"]["plan"] if "search" in entry else entry["never_searched"]["plan"] for entry in entries]
+    known += [(entry.get("search") or entry.get("merge") or entry["never_searched"])["plan"] for entry in entries]
     for sha, manifest in manifest_history(bug, repo):
         if manifest is None:
             problems.append(f"the manifest of {sha[:8]} is unreadable, so its plan is unknown")
@@ -1094,7 +1118,8 @@ def unrecorded_plans(bug, repo):
 
 # --------------------------------------------------------------------------------------------
 # searches.jsonl: every search of a target, also those that restarted. One JSON object per line,
-# {"n", "prev", "search"} or {"n", "prev", "never_searched"}. `prev` is the SHA-256 of the line before.
+# {"n", "prev", "search"}, {"n", "prev", "merge"} or {"n", "prev", "never_searched"}. `prev` is the SHA-256
+# of the line before.
 
 def canonical(data):
     return json.dumps(data, sort_keys=True, separators=(",", ":"))
@@ -1102,6 +1127,11 @@ def canonical(data):
 
 def search_hash(search):
     return hashlib.sha256(canonical(search).encode()).hexdigest()
+
+
+def recorded_searches(entries):
+    """The searches among the entries: of one job, or merged from shards."""
+    return [entry.get("search") or entry.get("merge") for entry in entries if "search" in entry or "merge" in entry]
 
 
 def load_searches(bug):
@@ -1122,10 +1152,12 @@ def load_searches(bug):
             if kind == "never_searched":
                 if set(body) != {"plan", "reason"} or not body["reason"].strip():
                     raise ValueError("never_searched needs a plan and a reason")
-            elif kind != "search" or set(body) != SEARCH_FIELDS or body["schema"] != SEARCH_SCHEMA:
-                raise ValueError("it is not a search")
-            elif body["id"] != bug.id or body["result"] not in SEARCHED:
-                raise ValueError("it is not a search of this target")
+            else:
+                fields, schema, results = RECORDED.get(kind, (None, None, ()))
+                if set(body) != fields or body["schema"] != schema:
+                    raise ValueError("it is not a search")
+                if body["id"] != bug.id or body["result"] not in results:
+                    raise ValueError("it is not a search of this target")
             if set(body["plan"]) != {"workload", "profile", "expect", "seeds"}:
                 raise ValueError("its plan is incomplete")
         except (ValueError, KeyError, TypeError, AttributeError) as error:
@@ -1301,9 +1333,9 @@ def cmd_check(repo, bugs, out, require_evidence=True, every=None):
 class Scratch:
     """A detached worktree of HEAD and a temporary directory, removed on exit."""
 
-    def __init__(self, repo, keep=False):
+    def __init__(self, repo, keep=False, name=None):
         self.repo, self.keep = repo, keep
-        self.path = SCRATCH_BASE / f"sim-bugs-{os.getpid()}-{time.time_ns()}"
+        self.path = SCRATCH_BASE / f"sim-bugs-{name or f'{os.getpid()}-{time.time_ns()}'}"
         self.tmp = Path(f"{self.path}-tmp")
 
     def __enter__(self):
@@ -1313,6 +1345,8 @@ class Scratch:
             for name in ("config", "config.toml"):
                 if (parent / ".cargo" / name).exists():
                     raise Failure(f"the Cargo configuration {parent / '.cargo' / name} would reach every build in {self.path}")
+        if self.path.exists() or self.tmp.exists():
+            raise Failure(f"{self.path} is another run's, or one's that died: remove it first")
         git(self.repo, "worktree", "add", "--detach", "--quiet", str(self.path), "HEAD")
         self.tmp.mkdir(mode=0o700)
         return self
@@ -1616,6 +1650,10 @@ HARNESS_RUSTFLAGS = "--cfg tokio_unstable"
 # The sweep test prints this error through `expect`, so its quotes are escaped.
 UNAVAILABLE_WORKLOAD = re.compile(r'OLTP workload [\\]?"([a-z0-9-]+)[\\]?" is unavailable')
 SEARCHED = ("found", "candidate", "not-detected", "incomplete", "error")
+# What an entry of searches.jsonl holds. Only a merge with an answer is recorded.
+RECORDED = {"search": (SEARCH_FIELDS, SEARCH_SCHEMA, SEARCHED),
+            "merge": (MERGE_FIELDS, MERGE_SCHEMA, ("candidate", "not-detected", "error"))}
+ANSWERS = ("candidate", "not-detected")
 
 
 class OutOfTime(Exception):
@@ -1761,6 +1799,9 @@ class Replay:
         return {"seed": self.seed, "trace_hash": self.entry.get("trace_hash"),
                 "history_sha256": sha256_file(self.history) if self.history else None}
 
+    def facts(self):
+        return {"kinds": self.kinds, "trace_hash": self.entry.get("trace_hash"), "deterministic": self.deterministic}
+
     def lines(self):
         """The lines of its history and trace."""
         found = set()
@@ -1887,24 +1928,40 @@ class Harness:
         first = plan.first + len(known)
         while first <= last:
             end = min(first + self.args.chunk - 1, last)
-            dest = self.out_dir / "base" / f"{label}-{first}"
-            env = sim_env(self.env, plan, label, dest, first, end - first + 1, jobs=self.args.sim_jobs)
-            code, entries = self.run(self.clean_exe, env, plan)
-            seeds = list(range(first, end + 1))
-            if [entry["seed"] for entry in entries] != seeds:
-                raise Failure(f"the base run's seed lines are not exactly the seeds {first} to {end}")
-            kinds = {entry["seed"]: sorted(entry["kinds"]) for entry in entries}
-            rows = self.report("base", plan, dest, seeds, None)
-            if {row["seed"]: sorted(row["violations"]) for row in rows} != kinds:
-                raise Failure("the base run's seed lines and its sweep report disagree")
-            if code != (101 if any(kinds.values()) else 0):
-                raise Failure(f"the base run of seeds {first} to {end} exited {code}")
-            # The report keeps every seed's kinds and trace hash. A seed's files come from a replay.
-            for directory in dest.glob(f"{label}-seed-*"):
-                shutil.rmtree(directory, ignore_errors=True)
-            known.update(kinds)
+            rows = self.sweep("base", self.clean_exe, plan, label, self.out_dir / "base" / f"{label}-{first}", first, end)
+            known.update((row["seed"], sorted(row["violations"])) for row in rows)
             first = end + 1
         return {seed: known[seed] for seed in range(plan.first, last + 1)}
+
+    def sweep(self, side, exe, plan, label, dest, first, last, defect=None):
+        """The report's rows of an ordinary sweep of seeds first..last."""
+        env = sim_env(self.env, plan, label, dest, first, last - first + 1, defect=defect, jobs=self.args.sim_jobs)
+        code, entries = self.run(exe, env, plan)
+        seeds = list(range(first, last + 1))
+        if [entry["seed"] for entry in entries] != seeds:
+            raise Failure(f"the {side} run's seed lines are not exactly the seeds {first} to {last}")
+        kinds = {entry["seed"]: sorted(entry["kinds"]) for entry in entries}
+        rows = self.report(side, plan, dest, seeds, defect)
+        if {row["seed"]: sorted(row["violations"]) for row in rows} != kinds:
+            raise Failure(f"the {side} run's seed lines and its sweep report disagree")
+        if code != (101 if any(kinds.values()) else 0):
+            raise Failure(f"the {side} run of seeds {first} to {last} exited {code}")
+        # The report keeps every seed's kinds and trace hash. A seed's files come from a replay.
+        for directory in dest.glob(f"{label}-seed-*"):
+            shutil.rmtree(directory, ignore_errors=True)
+        return rows
+
+    def facts(self, side, exe, plan, label, first, last, defect=None):
+        """{seed: kinds, trace hash and determinism} of seeds first..last on one build."""
+        facts = {}
+        dest = self.out_dir / f"{side}-rows" / f"{label}-{first}"
+        for row in self.sweep(side, exe, plan, label, dest, first, last, defect):
+            fact = {"kinds": sorted(row["violations"]), "trace": row.get("trace_hash"),
+                    "deterministic": row.get("deterministic") if row.get("replayed") is True else None}
+            if problem := fact_problem(fact):
+                raise Failure(f"the {side} run of seed {row['seed']} {problem}")
+            facts[row["seed"]] = fact
+        return facts
 
 
 def tally(kinds, expect):
@@ -1914,6 +1971,46 @@ def tally(kinds, expect):
     other = sorted(seed for seed, reported in kinds.items() if reported and seed not in set(expected))
     return {"expected": expected, "other": other,
             "fault": sorted(seed for seed, reported in kinds.items() if set(reported) & set(FAULT_KINDS))}
+
+
+def fact_problem(fact):
+    """Why this is not what a sweep says of a seed, or None."""
+    kinds, trace, deterministic = fact["kinds"], fact["trace"], fact["deterministic"]
+    if not strings(kinds) or kinds != sorted(set(kinds)):
+        return "has no list of its kinds"
+    if not isinstance(trace, str) or not TRACE_HASH.fullmatch(trace) or not (int(trace, 16) or "harness" in kinds):
+        return "reports no trace"
+    if not any(deterministic is value for value in (True, False, None)):
+        return "has no deterministic verdict"
+    if kinds and deterministic is None and "harness" not in kinds:
+        return "is red and was not replayed"
+    if (deterministic is False) != ("determinism" in kinds):
+        return "has no deterministic verdict that fits its kinds"
+    return None
+
+
+def replay_mask(kinds, replay):
+    """Why a seed that reports `kinds` cannot count after its replay on the patched build, or None."""
+    if set(FAULT_KINDS) & set(kinds) or "harness" in replay["kinds"]:
+        return "harness-fault"
+    if not replay["deterministic"]:
+        return "nondeterministic"
+    if replay["kinds"] != kinds:
+        return "search-replay-disagree"
+    return None
+
+
+def twin_mask(replay, twin):
+    """Why it cannot count beside its replay on the unpatched build, or None."""
+    if twin["kinds"]:
+        return "twin-red"
+    return "same-trace" if twin["trace_hash"] == replay["trace_hash"] else None
+
+
+def known_finding(bug, identity):
+    """The [[masked]] entry that says this exact hit shows a known finding, or None."""
+    return next((m for m in bug.manifest.get("masked", [])
+                 if all(m[key] == identity[key] for key in HIT_IDENTITY)), None)
 
 
 def judge(harness, bug, plan, label, exe, hit):
@@ -1926,20 +2023,12 @@ def judge(harness, bug, plan, label, exe, hit):
     def mask(reason, **more):
         return {"kinds": kinds, "replay_kinds": patched.kinds, **patched.identity, "reason": reason, **more}
 
-    if set(FAULT_KINDS) & set(kinds) or "harness" in patched.kinds:
-        return mask("harness-fault"), patched, None
-    if not patched.deterministic:
-        return mask("nondeterministic"), patched, None
-    if patched.kinds != kinds:
-        return mask("search-replay-disagree"), patched, None
+    if reason := replay_mask(kinds, patched.facts()):
+        return mask(reason), patched, None
     clean = harness.replay("clean", harness.clean_exe, plan, label, seed, out / "clean")
-    if clean.kinds:
-        return mask("twin-red", twin_kinds=clean.kinds), patched, clean
-    if clean.entry["trace_hash"] == patched.entry["trace_hash"]:
-        return mask("same-trace"), patched, clean
-    known = next((m for m in bug.manifest.get("masked", [])
-                  if all(m[key] == value for key, value in patched.identity.items())), None)
-    if known:
+    if reason := twin_mask(patched.facts(), clean.facts()):
+        return mask(reason, **({"twin_kinds": clean.kinds} if clean.kinds else {})), patched, clean
+    if known := known_finding(bug, patched.identity):
         return mask("known-finding", finding=known["finding"]), patched, clean
     return None, patched, clean
 
@@ -1982,8 +2071,7 @@ def count_problems(bug, repo, row, patched, clean):
     if not any(events.get(line, None) not in (None, *twin.values()) for line in d["lines"]):
         problems.append("no line of detection.lines is an event of the trace that the clean twin lacks, other than the "
                         "violation and the client history")
-    entries, _ = load_searches(bug)
-    search = next((e["search"] for e in entries if "search" in e and search_hash(e["search"]) == d["search"]), None)
+    search = next((s for s in recorded_searches(load_searches(bug)[0]) if search_hash(s) == d["search"]), None)
     if search is None:
         problems.append("detection.search names no search in searches.jsonl")
     elif (search["plan"] != plan_of(m) or search["digest"] != digest(bug.patch)):
@@ -1994,30 +2082,51 @@ def count_problems(bug, repo, row, patched, clean):
     return problems
 
 
+def label_of(bug):
+    return f"sim-bug-{bug.id}"
+
+
+def new_row(bug, plan):
+    """What a result says of its target before anything ran."""
+    return {"id": bug.id, "bug": bug.manifest["bug"], "class": bug.manifest["class"],
+            "guarantees": bug.manifest["guarantees"], "scenarios": bug.manifest["scenarios"],
+            "patch_sha256": hashlib.sha256(bug.patch.encode()).hexdigest(), "digest": digest(bug.patch),
+            "workload": plan.workload, "profile": plan.profile, "expect": plan.expect,
+            "seeds": [plan.first, plan.last], "tried": 0, "masked": [], "rates": None,
+            "result": "error", "rehearse_defect": plan.defect}
+
+
+def not_searched(bug, plan, args):
+    """The result of a target that no search can detect, or None."""
+    if not plan.expect:
+        return {"result": "no-detector", "why": bug.manifest["expect_reason"]}
+    if not_shown(bug) and not rehearsal(args):
+        return {"result": "not-shown", "why": not_shown(bug)}
+    return None
+
+
+def build_patched(args, scratch, harness, bug):
+    """(the patched sweep, the digests of both binaries). The tree is clean again afterwards."""
+    scratch.apply(bug)
+    try:
+        exe = build_sweep(args, scratch.path, harness.env, harness.log, sweep_binary(harness.env, bug.id))
+    finally:
+        scratch.reset()
+    binaries = {"patched": sha256_file(exe), "clean": sha256_file(harness.clean_exe)}
+    if binaries["patched"] == binaries["clean"]:
+        raise Failure("the patched tree builds the same sweep binary as the unpatched one")
+    return exe, binaries
+
+
 def search_bug(args, repo, scratch, harness, bug, plan):
     """Apply, build, reset, then search in order until a seed is an unmasked hit. Returns the row."""
-    label = f"sim-bug-{bug.id}"
-    row = {"id": bug.id, "bug": bug.manifest["bug"], "class": bug.manifest["class"],
-           "guarantees": bug.manifest["guarantees"], "scenarios": bug.manifest["scenarios"],
-           "patch_sha256": hashlib.sha256(bug.patch.encode()).hexdigest(), "digest": digest(bug.patch),
-           "workload": plan.workload, "profile": plan.profile, "expect": plan.expect,
-           "seeds": [plan.first, plan.last], "tried": 0, "masked": [], "rates": None,
-           "result": "error", "rehearse_defect": plan.defect}
-    if not plan.expect:
-        return dict(row, result="no-detector", why=bug.manifest["expect_reason"])
-    if not_shown(bug) and not rehearsal(args):
-        return dict(row, result="not-shown", why=not_shown(bug))
+    label, row = label_of(bug), new_row(bug, plan)
+    if why := not_searched(bug, plan, args):
+        return dict(row, **why)
     kinds, hit, patched, clean, stopped = {}, None, None, None, None
     try:
-        scratch.apply(bug)
-        try:
-            row["scratch_worktree"] = str(scratch.path)
-            exe = build_sweep(args, scratch.path, harness.env, harness.log, sweep_binary(harness.env, bug.id))
-        finally:
-            scratch.reset()
-        row["binaries"] = {"patched": sha256_file(exe), "clean": sha256_file(harness.clean_exe)}
-        if row["binaries"]["patched"] == row["binaries"]["clean"]:
-            raise Failure("the patched tree builds the same sweep binary as the unpatched one")
+        row["scratch_worktree"] = str(scratch.path)
+        exe, row["binaries"] = build_patched(args, scratch, harness, bug)
         first = plan.first
         try:
             while first <= plan.last and hit is None:
@@ -2062,17 +2171,25 @@ def search_record(bug, row, sha):
     if "patched" in row:
         hit = {key: row["patched"][key] for key in ("seed", "kinds", "trace_hash", "history_sha256")}
         hit["twin_trace_hash"] = row["clean"]["trace_hash"]
-    rates = row["rates"] and {"seeds": row["rates"]["seeds"], **{
-        side: {key: len(seeds) for key, seeds in row["rates"][side].items()} for side in ("patched", "base")}}
-    url = None
-    if os.environ.get("GITHUB_RUN_ID"):
-        url = (f"{os.environ.get('GITHUB_SERVER_URL')}/{os.environ.get('GITHUB_REPOSITORY')}"
-               f"/actions/runs/{os.environ['GITHUB_RUN_ID']}")
-    return {"schema": SEARCH_SCHEMA, "id": bug.id, "sha": sha, "run": url,
+    return {"schema": SEARCH_SCHEMA, "id": bug.id, "sha": sha, "run": run_url(),
             "attempt": os.environ.get("GITHUB_RUN_ATTEMPT"), "plan": plan_of(bug.manifest),
             "digest": row["digest"], "patch_sha256": row["patch_sha256"], "result": row["result"],
             "seeds": row["seeds"], "tried": row["tried"], "hit": hit, "masked": row["masked"],
-            "rates": rates, "why": row.get("why")}
+            "rates": counted(row["rates"]), "why": row.get("why")}
+
+
+def counted(rates):
+    """The rates as numbers of seeds."""
+    return rates and {"seeds": rates["seeds"], **{
+        side: {key: len(seeds) for key, seeds in rates[side].items()} for side in ("patched", "base")}}
+
+
+def run_url():
+    """The Actions run this is, or None."""
+    if not os.environ.get("GITHUB_RUN_ID"):
+        return None
+    return (f"{os.environ.get('GITHUB_SERVER_URL')}/{os.environ.get('GITHUB_REPOSITORY')}"
+            f"/actions/runs/{os.environ['GITHUB_RUN_ID']}")
 
 
 def describe(row):
@@ -2133,37 +2250,81 @@ def differs_from_head(repo, scratch, bugs):
     return names
 
 
-def cmd_run(repo, bugs, args, out, every=None):
+@dataclass
+class Job:
+    """One command that builds sweeps of HEAD in a scratch worktree."""
+    args: argparse.Namespace
+    scratch: Scratch
+    env: dict
+    log: object
+    out_dir: Path
+    target: Path
+    sha: str
+    build: str | None
+    not_mains: str | None
+    deadline: float | None = None
+
+    def harness(self):
+        """The unpatched build first: every clean twin and the base rate run on it."""
+        clean_exe = build_sweep(self.args, self.scratch.path, self.env, self.log, sweep_binary(self.env, "clean"))
+        return Harness(self.args, self.scratch.path, self.env, self.log, self.out_dir, clean_exe, None)
+
+
+def mode_of(args):
+    return "rehearsal" if rehearsal(args) else "evidence"
+
+
+def refused_job(repo, bugs, args, out, every):
+    """The exit status of a command that has nothing to search, or None."""
     if git(repo, "cat-file", "-e", f"HEAD:{HARNESS_MANIFEST.as_posix()}", check=False).returncode:
         print(f"{NOT_RUN_MARKER}: {HARNESS_MANIFEST} does not exist yet, so no seed was searched "
               f"for {', '.join(b.id for b in bugs)}", file=out)
         return 0
     if cmd_check(repo, bugs, out, every=every):
         return 1
-    mode = "rehearsal" if rehearsal(args) else "evidence"
     print("Fault model: seeded OLTP simulation with one historical fix reverted at a time"
           + (" (rehearsal: manifest workload, profile or expectation overridden; not evidence for "
-             "these bugs)" if mode == "rehearsal" else ""), file=out, flush=True)
+             "these bugs)" if rehearsal(args) else ""), file=out, flush=True)
+    return None
+
+
+@contextmanager
+def open_job(repo, bugs, args, out, every):
+    """A Job, or None when the working tree is not what HEAD holds."""
     target = Path(args.target_dir or repo / "server/target/sim-bugs-sim").resolve()
-    out_dir = Path(args.out or repo / "target/testing-logs" / f"sim-bugs-run-{os.getpid()}").resolve()
+    out_dir = Path(args.out or repo / "target/testing-logs" / f"sim-bugs-{args.command}-{os.getpid()}").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    log_path = Path(args.log or out_dir / "sim-bugs-run.log")
-    limits = [time.monotonic() + args.time_limit] if args.time_limit else []
-    rows = []
-    with log_path.open("a", encoding="utf-8") as log, Scratch(repo, args.keep) as scratch:
+    log_path = Path(args.log or out_dir / f"sim-bugs-{args.command}.log")
+    # A sweep holds the path of the tree it was built in. Every job of a search in shards builds in the same one, so that
+    # the same source is the same binary.
+    name = None if args.command == "run" else hashlib.sha256(str(target).encode()).hexdigest()[:16]
+    with log_path.open("a", encoding="utf-8") as log, Scratch(repo, args.keep, name) as scratch:
         env = harness_env(target, scratch)
         print(f"cargo command: {args.cargo}", file=out, flush=True)
         sha = git(scratch.path, "rev-parse", "HEAD").stdout.strip()
-        differing = differs_from_head(repo, scratch, every or bugs) if mode == "evidence" else []
+        differing = differs_from_head(repo, scratch, every or bugs) if mode_of(args) == "evidence" else []
         if differing:
             print(f"the working tree differs from HEAD, which this run would name: {', '.join(differing)}", file=out)
-            return 1
+            yield None
+            return
         build, other = mains_build(repo)
-        print(f"sim-bugs run on {sha}, artifacts {out_dir}\n" + (f"NOT countable: {other}" if other else f"build {build}"),
-              file=out, flush=True)
-        # The unpatched build first: every clean twin and the base rate run on it.
-        clean_exe = build_sweep(args, scratch.path, env, log, sweep_binary(env, "clean"))
-        harness = Harness(args, scratch.path, env, log, out_dir, clean_exe, None)
+        print(f"sim-bugs {args.command} on {sha}, artifacts {out_dir}\n"
+              + (f"NOT countable: {other}" if other else f"build {build}"), file=out, flush=True)
+        yield Job(args, scratch, env, log, out_dir, target, sha, build, other)
+
+
+def cmd_run(repo, bugs, args, out, every=None):
+    status = refused_job(repo, bugs, args, out, every)
+    if status is not None:
+        return status
+    mode, rows = mode_of(args), []
+    limits = [time.monotonic() + args.time_limit] if args.time_limit else []
+    with open_job(repo, bugs, args, out, every) as job:
+        if job is None:
+            return 1
+        sha, build, other, out_dir, target, scratch = (
+            job.sha, job.build, job.not_mains, job.out_dir, job.target, job.scratch)
+        harness = job.harness()
         for bug in bugs:
             own = [time.monotonic() + args.search_timeout] if args.search_timeout else []
             harness.deadline = min(limits + own, default=None)
@@ -2175,9 +2336,8 @@ def cmd_run(repo, bugs, args, out, every=None):
             print(describe(row), file=out, flush=True)
             if mode == "evidence" and row["result"] in SEARCHED:
                 row["search"] = search_record(bug, row, sha)
-                entries, _ = load_searches(bug)
-                row["earlier_searches"] = [e["search"] for e in entries
-                                           if "search" in e and e["search"]["plan"] != row["search"]["plan"]]
+                row["earlier_searches"] = [search for search in recorded_searches(load_searches(bug)[0])
+                                           if search["plan"] != row["search"]["plan"]]
                 print(f"sim-bugs-search: {canonical(row['search'])}", file=out, flush=True)
     summary = {"schema": "nabedra.sim-bugs-run/2", "evidence": "fault-model", "mode": mode,
                "sha": sha, "build": build, "not_mains_build": other, "set": args.set_name, "bugs": rows}
@@ -2196,6 +2356,813 @@ def cmd_run(repo, bugs, args, out, every=None):
         print(f"{NOT_RUN_MARKER}: no workload yet for {', '.join(not_run)}", file=out)
         return 0
     return 1
+
+
+# --------------------------------------------------------------------------------------------
+# Shards (server/sim-oltp/bugs/SHARDS.md): one target's seeds split over attested jobs. A shard runs a range on both
+# builds and decides nothing. `merge` reads the attested rows of all shards and gives the answer. `count` gives it
+# again from the same records, in the run that counts, and repeats what says the hit is real.
+
+ROW_MARK, SHARD_MARK, MERGE_MARK = "sim-bugs-row:", "sim-bugs-shard:", "sim-bugs-merge:"
+DONE_MARK, DISAGREE_MARK = f"{SHARD_MARK} complete ", f"{SHARD_MARK} disagree "
+DONE_FIELDS = {"schema", "mode", "id", "plan", "review", "digest", "patch_sha256", "build", "defect", "sha", "run",
+               "attempt", "shard", "seeds", "rows", "rows_sha256", "binaries"}
+# What every row of a search shares, and how a difference is named.
+KEY = {"mode": "another kind (a rehearsal is no evidence)", "id": "another target", "plan": "another plan",
+       "review": "another patch", "digest": "another patch", "patch_sha256": "another patch", "build": "another build",
+       "defect": "another harness defect"}
+
+
+DISAGREE_FIELDS = {*KEY, "sha", "run", "attempt", "shard", "why"}
+
+
+class Disagreement(Failure):
+    """One seed has two results."""
+
+
+def build_tree(repo, commit):
+    """The Git tree of `commit` without the targets' own files. Two commits that differ only in those have one build."""
+    with tempfile.TemporaryDirectory(prefix="sim-bugs-index-", dir=SCRATCH_BASE) as tmp:
+        env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
+        git(repo, "read-tree", commit, env=env)
+        names = git(repo, "ls-files", "-z", "--", BUGS_DIR.as_posix(), env=env).stdout.split("\0")
+        own = "".join(f"{name}\0" for name in names if TARGET_FILE.fullmatch(name))
+        git(repo, "update-index", "-z", "--force-remove", "--stdin", env=env, input=own)
+        return git(repo, "write-tree", env=env).stdout.strip()
+
+
+def shard_range(first, last, n, parts):
+    """The seeds of shard `n` of `parts`. Together they are first..last, each once."""
+    total = last - first + 1
+    return first + total * (n - 1) // parts, first + total * n // parts - 1
+
+
+def shard_of(value):
+    """`n/parts` of the command line."""
+    match = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", value)
+    n, parts = map(int, match.groups()) if match else (0, 0)
+    if not 1 <= n <= parts <= SEED_BUDGET:
+        raise argparse.ArgumentTypeError(f"must be n/parts, such as 1/4, and not {value!r}")
+    return n, parts
+
+
+def shard_plan(bug, args):
+    """The plan whose seeds are split. Only a rehearsal may cap them."""
+    if args.seeds and not rehearsal(args):
+        raise Failure("--seeds is for a rehearsal: the shards of a search cover all its seeds")
+    return Plan.of(bug, args)
+
+
+def shard_key(repo, bug, plan, args):
+    """What the rows of one search have in common, as HEAD has it."""
+    return {"mode": mode_of(args), "id": bug.id, "review": whole_digest(bug), "digest": digest(bug.patch),
+            "plan": {"workload": plan.workload, "profile": plan.profile, "expect": plan.expect,
+                     "seeds": [plan.first, plan.last]},
+            "patch_sha256": hashlib.sha256(bug.patch.encode()).hexdigest(), "build": build_tree(repo, "HEAD"),
+            "defect": plan.defect}
+
+
+def judged(patched, clean):
+    """What a row keeps of a hit's replays. The unpatched one is missing where the patched one masks the hit."""
+    return {"replay": {**patched.facts(), "history_sha256": patched.identity["history_sha256"]},
+            "twin": clean and clean.facts()}
+
+
+def replay_reason(row, replay):
+    """Why the patched replay of a row's hit masks it, or None."""
+    reason = replay_mask(row["patched"]["kinds"], replay)
+    return reason or ("search-replay-disagree" if replay["trace_hash"] != row["patched"]["trace"] else None)
+
+
+def replay_hit(harness, bug, plan, exe, row):
+    """(patched replay, unpatched replay or None) of a hit of a row."""
+    label, out = label_of(bug), harness.out_dir / bug.id / f"seed-{row['seed']}"
+    patched = harness.replay("patched", exe, plan, label, row["seed"], out / "patched", plan.defect)
+    if replay_reason(row, patched.facts()):
+        return patched, None
+    return patched, harness.replay("clean", harness.clean_exe, plan, label, row["seed"], out / "clean")
+
+
+def to_judge(row, expect):
+    """Whether the seed reports an expected kind that its own base run does not explain. A red base seed is the
+    twin's own run, so it needs no replay."""
+    return bool(set(row["patched"]["kinds"]) & set(expect)) and not row["base"]["kinds"]
+
+
+def row_mask(row, expect):
+    """(whether the seed reports an expected kind, why it cannot count), from the row alone."""
+    if not set(row["patched"]["kinds"]) & set(expect):
+        return False, None
+    if not to_judge(row, expect):
+        return True, "base-red"
+    replay, twin = row["judged"]["replay"], row["judged"]["twin"]
+    return True, replay_reason(row, replay) or twin_mask(replay, twin)
+
+
+def shard_rows(args, job, bug, plan, first, last, out):
+    """(rows, binary digests) of seeds first..last: the base run, then the patched build, then the replays of hits."""
+    label, harness = label_of(bug), job.harness()
+    # The limit is the job's, whose builds it includes.
+    harness.deadline = job.deadline
+    chunks = [(start, min(start + args.chunk - 1, last)) for start in range(first, last + 1, args.chunk)]
+    base, rows = {}, []
+    for start, end in chunks:
+        base.update(harness.facts("base", harness.clean_exe, plan, label, start, end))
+        print(f"{bug.id}: base run of seeds {start} to {end}", file=out, flush=True)
+    exe, binaries = build_patched(args, job.scratch, harness, bug)
+    for start, end in chunks:
+        patched = harness.facts("patched", exe, plan, label, start, end, plan.defect)
+        for seed in range(start, end + 1):
+            row = {"seed": seed, "base": base[seed], "patched": patched[seed]}
+            if to_judge(row, plan.expect):
+                row["judged"] = judged(*replay_hit(harness, bug, plan, exe, row))
+                twin = row["judged"]["twin"]
+                if twin and (twin["kinds"], twin["trace_hash"]) != (base[seed]["kinds"], base[seed]["trace"]):
+                    raise Disagreement(f"the twin of seed {seed} is not its base run")
+            rows.append(row)
+        print(f"{bug.id}: patched run of seeds {start} to {end}", file=out, flush=True)
+    return rows, binaries
+
+
+def rows_digest(rows):
+    """SHA-256 over the rows as a log holds them."""
+    return hashlib.sha256("".join(f"{canonical(row)}\n" for row in rows).encode()).hexdigest()
+
+
+def cmd_shard(repo, bugs, args, out, every=None):
+    if len(bugs) != 1 or args.shard is None:
+        raise Failure("shard takes one bug id and --shard n/parts")
+    bug, = bugs
+    plan, (n, parts) = shard_plan(bug, args), args.shard
+    if parts > plan.last - plan.first + 1:
+        raise Failure("there are more shards than seeds")
+    first, last = shard_range(plan.first, plan.last, n, parts)
+    deadline = time.monotonic() + args.time_limit if args.time_limit else None
+    status = refused_job(repo, bugs, args, out, every)
+    if status is not None:
+        return status
+    if why := not_searched(bug, plan, args):
+        print(describe(dict(new_row(bug, plan), **why)), file=out)
+        return 1
+    with open_job(repo, bugs, args, out, every) as job:
+        if job is None:
+            return 1
+        job.deadline = deadline
+        key = shard_key(repo, bug, plan, args)
+        own = {**key, "sha": job.sha, "run": run_url(), "attempt": os.environ.get("GITHUB_RUN_ATTEMPT"), "shard": [n, parts]}
+        print(f"{bug.id}: shard {n} of {parts}, seeds {first} to {last}", file=out, flush=True)
+        try:
+            rows, binaries = shard_rows(args, job, bug, plan, first, last, out)
+        except Unavailable as error:
+            print(f"{NOT_RUN_MARKER}: the harness has no {error} workload", file=out)
+            return 0
+        except Disagreement as error:
+            print(DISAGREE_MARK + canonical({**own, "why": str(error)}), file=out)
+            return 1
+        except (Failure, OutOfTime) as error:
+            why = "the time limit passed" if isinstance(error, OutOfTime) else error
+            print(f"{SHARD_MARK} error, none of its seeds count: {why}", file=out)
+            return 1
+    for row in rows:
+        print(ROW_MARK, canonical(row), file=out)
+    done = {"schema": SHARD_SCHEMA, **own, "seeds": [first, last], "rows": len(rows), "rows_sha256": rows_digest(rows),
+            "binaries": binaries}
+    print(DONE_MARK + canonical(done), file=out, flush=True)
+    return 0
+
+
+# Reading shards. Whatever is missing, unattested, cut, or of another search is no row at all.
+
+@dataclass
+class Shard:
+    check: str
+    record_sha256: str
+    log_sha256: str
+    done: dict
+    rows: list
+
+    @property
+    def job(self):
+        return int(self.done["run"].rsplit("/", 1)[1]), int(self.done["attempt"]), self.check
+
+    def json(self):
+        return {"shard": self.done["shard"], "seeds": self.done["seeds"], "check": self.check, "run": self.done["run"],
+                "attempt": int(self.done["attempt"]), "record_sha256": self.record_sha256, "log_sha256": self.log_sha256,
+                "rows_sha256": self.done["rows_sha256"]}
+
+
+@dataclass
+class FailedShard:
+    """An attested record of a shard that did not pass. Its result is known: it has no rows, and perhaps found that one
+    seed has two results."""
+    check: str
+    record_sha256: str
+    log_sha256: str
+    sha: str
+    run: str
+    attempt: int
+    found: dict | None
+
+    @property
+    def job(self):
+        return int(self.run.rsplit("/", 1)[1]), self.attempt, self.check
+
+    def json(self):
+        return {"shard": self.found["shard"], "seeds": None, "check": self.check, "run": self.run, "attempt": self.attempt,
+                "record_sha256": self.record_sha256, "log_sha256": self.log_sha256, "rows_sha256": None}
+
+
+def read_row(text, seed, expect):
+    """One row of a log. It has to say by itself why its seed can or cannot count."""
+    row = strict_json(text)
+    if canonical(row) != text or not {"seed", "base", "patched"} <= set(row) <= {"seed", "base", "patched", "judged"}:
+        raise ValueError("it is not in the form a shard writes")
+    if type(row["seed"]) is not int or row["seed"] != seed:
+        raise ValueError(f"it is for seed {row['seed']!r}")
+    for side in ("base", "patched"):
+        if set(row[side]) != {"kinds", "trace", "deterministic"}:
+            raise ValueError(f"its {side} run is not whole")
+        if problem := fact_problem(row[side]):
+            raise ValueError(f"its {side} run {problem}")
+    if ("judged" in row) != to_judge(row, expect):
+        raise ValueError("it judges a seed that is no hit, or does not judge one")
+    if "judged" in row:
+        replay, twin = row["judged"]["replay"], row["judged"]["twin"]
+        runs = [(replay, {"history_sha256"}), *([(twin, set())] if twin else [])]
+        if set(row["judged"]) != {"replay", "twin"} or any(
+                set(run) != {"kinds", "trace_hash", "deterministic"} | more for run, more in runs):
+            raise ValueError("its replays are not whole")
+        for run, _ in runs:
+            if problem := fact_problem({**run, "trace": run["trace_hash"]}):
+                raise ValueError(f"a replay {problem}")
+        if "harness" not in replay["kinds"] and not DIGEST.fullmatch(str(replay["history_sha256"])):
+            raise ValueError("its hit has no history")
+        if bool(twin) == bool(replay_reason(row, replay)):
+            raise ValueError("it has a twin after a mask, or neither")
+        if twin and (twin["kinds"], twin["trace_hash"], twin["deterministic"]) != ([], row["base"]["trace"], True):
+            raise ValueError("its twin is not its base run")
+    return row
+
+
+def read_log(text, key, repo):
+    """(last line, rows) of a shard's log, of the search that `key` names."""
+    texts, done = [], None
+    for line in text.split("\n"):
+        if done is not None and (ROW_MARK in line or SHARD_MARK in line):
+            raise Failure("something follows its last line")
+        if line.startswith(f"{ROW_MARK} "):
+            texts.append(line.removeprefix(f"{ROW_MARK} "))
+        elif line.startswith(DONE_MARK):
+            try:
+                done = strict_json(line.removeprefix(DONE_MARK))
+            except ValueError:
+                raise Failure("its last line is unreadable") from None
+        elif ROW_MARK in line or SHARD_MARK in line:
+            raise Failure(f"its log has an unreadable line: {line[:80]!r}")
+    if not isinstance(done, dict):
+        raise Failure("it has no line that says it is complete")
+    if set(done) != DONE_FIELDS or done["schema"] != SHARD_SCHEMA:
+        raise Failure("its last line is not the one a shard writes")
+    for name, what in KEY.items():
+        if done[name] != key[name]:
+            raise Failure(f"it is of {what}")
+    try:
+        (n, parts), binaries, sha = done["shard"], done["binaries"], done["sha"]
+        if not (type(n) is type(parts) is int and 1 <= n <= parts <= SEED_BUDGET):
+            raise ValueError("it names no shard")
+        first, last = shard_range(*key["plan"]["seeds"], n, parts)
+        if done["seeds"] != [first, last]:
+            raise ValueError("its range is not its shard's")
+        if (set(binaries) != {"clean", "patched"} or not all(DIGEST.fullmatch(b) for b in binaries.values())
+                or binaries["clean"] == binaries["patched"]):
+            raise ValueError("it does not name two binaries")
+        if not SHA.fullmatch(sha) or git(repo, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode:
+            raise ValueError("its commit is not available")
+        if build_tree(repo, sha) != key["build"]:
+            raise ValueError("its commit has another build than it says")
+        if [done["rows"], done["rows_sha256"]] != [len(texts), hashlib.sha256(
+                "".join(f"{text}\n" for text in texts).encode()).hexdigest()]:
+            raise ValueError("its rows are not the ones its last line names")
+        if len(texts) != last - first + 1:
+            raise ValueError(f"it has {len(texts)} rows for seeds {first} to {last}")
+        rows = [read_row(text, seed, key["plan"]["expect"]) for seed, text in enumerate(texts, first)]
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        raise Failure(f"its log is not whole: {error}") from None
+    return done, rows
+
+
+def verify_attestation(args, data, record, files):
+    """That a hosted `checks` job of this repository, at the commit that the record names, wrote these bytes.
+
+    The workflow is read at the commit that was dispatched. Only a dispatch from the tested commit itself has the
+    workflow of the build."""
+    own = hashlib.sha256(data).hexdigest()
+    bundle = next((text for name, text in files.items() if Path(name).name in (f"sha256-{own}.jsonl", f"sha256:{own}.jsonl")),
+                  None)
+    if bundle is None:
+        raise Failure("it has no attestation")
+    with tempfile.TemporaryDirectory(prefix="sim-bugs-evidence-", dir=SCRATCH_BASE) as tmp:
+        subject, proof = Path(tmp) / "record.json", Path(tmp) / "bundle.jsonl"
+        subject.write_bytes(data)
+        proof.write_bytes(bundle)
+        try:
+            result = subprocess.run(
+                [*args.gh.split(), "attestation", "verify", str(subject), "--bundle", str(proof), "--repo", REPOSITORY,
+                 "--signer-workflow", f"{REPOSITORY}/{BUILD_WORKFLOW}", "--source-digest", record["sha"],
+                 "--deny-self-hosted-runners", "--format", "json"],
+                env=machine_env(), capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise Failure(f"its attestation could not be verified: {error}") from None
+    if result.returncode:
+        raise Failure(f"its attestation does not verify: {(result.stderr.strip() or 'no reason').splitlines()[-1]}")
+    home, run = f"https://github.com/{REPOSITORY}", record["run"]
+    wanted = {"sourceRepositoryURI": home, "sourceRepositoryDigest": record["sha"], "runnerEnvironment": "github-hosted",
+              "buildTrigger": "workflow_dispatch", "runInvocationURI": f"{run['url']}/attempts/{run['attempt']}"}
+    try:
+        certificates = [entry["verificationResult"]["signature"]["certificate"] for entry in strict_json(result.stdout)]
+        good = any(all(c[name] == value for name, value in wanted.items())
+                   and c["buildSignerURI"].startswith(f"{home}/{BUILD_WORKFLOW}@") for c in certificates)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise Failure("its attestation could not be verified: the output is unreadable") from None
+    if not good:
+        raise Failure("its attestation is of another repository, workflow, commit, runner, run or attempt")
+
+
+def wait(seconds):
+    time.sleep(seconds)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None
+
+
+def api_get(path):
+    """What GitHub answers, or a Failure. Nothing of the machine is sent but a token, if there is one."""
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    request = urllib.request.Request(API + path, headers={
+        "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "sim-bugs",
+        **({"Authorization": f"Bearer {token}"} if token else {})})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+    until, tries = time.monotonic() + API_WAIT, 0
+    while True:
+        try:
+            with opener.open(request, timeout=60) as response:
+                return strict_json(response.read().decode("utf-8"))
+        except HTTPError as error:
+            why, limits = f"status {error.code}", error.headers
+            error.close()
+            limited = error.code == 429 or error.code == 403 and (
+                limits.get("x-ratelimit-remaining") == "0" or limits.get("retry-after"))
+            if not limited and error.code < 500:
+                raise Failure(f"GitHub gives no answer to {path}: {why}") from None
+        except (OSError, ValueError) as error:
+            why, limits, limited = type(error).__name__, {}, False
+        pause = 30
+        if limited:
+            wanted = [limits.get("retry-after") or "", limits.get("x-ratelimit-reset") or ""]
+            wanted = [int(value) if value.isascii() and value.isdigit() else None for value in wanted]
+            pause = wanted[0] or (max(wanted[1] - int(time.time()), 0) + 5 if wanted[1] else 60)
+        tries += not limited
+        if tries >= API_TRIES or time.monotonic() + pause > until:
+            raise Failure(f"GitHub gives no answer to {path}: {why}")
+        wait(pause)
+
+
+class Actions:
+    """Which runs and jobs of the build workflow there are, by GitHub's API. Each list is asked once, and has to be whole."""
+
+    def __init__(self):
+        self.lists = {}
+
+    def list(self, path, key):
+        if path not in self.lists:
+            found, page = [], 1
+            while True:
+                data = api_get(f"/repos/{REPOSITORY}/actions/{path}&per_page=100&page={page}")
+                items, total = (data.get(key), data.get("total_count")) if isinstance(data, dict) else (None, None)
+                if not isinstance(items, list) or type(total) is not int or not all(
+                        isinstance(item, dict) and type(item.get("id")) is int for item in items):
+                    raise Failure(f"GitHub's list {path} is unreadable")
+                found += items
+                if not items or len(found) >= total:
+                    break
+                page += 1
+            if len(found) != total or len({item["id"] for item in found}) != total:
+                raise Failure(f"GitHub's list {path} is not whole")
+            self.lists[path] = found
+        return self.lists[path]
+
+    def runs(self, sha):
+        """The runs whose workflow is of this commit."""
+        return self.list(f"workflows/{Path(BUILD_WORKFLOW).name}/runs?head_sha={sha}", "workflow_runs")
+
+    def jobs(self, run):
+        """The jobs of all attempts of a run."""
+        return self.list(f"runs/{run}/jobs?filter=all", "jobs")
+
+
+def tested_by(run):
+    """(request, commit) that a run was dispatched for, by the title its workflow gave it, or None."""
+    title = RUN_TITLE.fullmatch(run.get("display_title") if isinstance(run.get("display_title"), str) else "")
+    return title and title.groups()
+
+
+def verify_run(actions, record):
+    """That the code of the record's commit wrote it. The certificate names the workflow's commit, and a run tests the
+    commit it is given. At one commit its title says which: that commit's workflow writes it."""
+    own, sha = record["run"], record["sha"]
+    number = int(own["url"].rsplit("/", 1)[1])
+    run = next((run for run in actions.runs(sha) if run["id"] == number), None)
+    if run is None:
+        raise Failure("its run is not one of its commit's workflow")
+    home = run.get("head_repository")
+    if ((run.get("path"), run.get("event"), run.get("head_sha")) != (BUILD_WORKFLOW, "workflow_dispatch", sha)
+            or not isinstance(home, dict) or home.get("full_name") != REPOSITORY
+            or type(run.get("run_attempt")) is not int or own["attempt"] > run["run_attempt"]):
+        raise Failure("its run is not a dispatch of this repository's build workflow, or had no such attempt")
+    if tested_by(run) != (own.get("request_id"), sha):
+        raise Failure("its run tested another commit, or is another request's")
+
+
+def unaccounted(actions, key, sha, shards, failed):
+    """Why the records of this commit's shards are not all there. Every job that passed has to be a shard here, and every
+    other that left a signed record has to be among the failed ones."""
+    name, problems = re.compile(rf"Check ({check_name(key)}-[1-9][0-9]*)"), []
+    passed, other = {shard.job for shard in shards}, {shard.job for shard in failed}
+    try:
+        for run in actions.runs(sha):
+            tested = tested_by(run)
+            if run["event"] != "workflow_dispatch" or tested and tested[1] != sha:
+                continue
+            if run["status"] != "completed" and str(run["id"]) != os.environ.get("GITHUB_RUN_ID"):
+                problems.append(f"run {run['id']} at this commit has not finished")
+                continue
+            for job in actions.jobs(run["id"]):
+                match = name.fullmatch(job["name"])
+                if match is None:
+                    continue
+                where, ident = f"{match.group(1)} of run {run['id']}", (run["id"], job["run_attempt"], match.group(1))
+                signed = any((step["name"], step["conclusion"]) == (ATTEST_STEP, "success") for step in job["steps"] or [])
+                if job["status"] != "completed":
+                    problems.append(f"{where} has not finished")
+                elif job["conclusion"] == "success" and ident not in passed:
+                    problems.append(f"{where} passed and is not among the records")
+                elif job["conclusion"] != "success" and signed and ident not in other:
+                    problems.append(f"{where} did not pass, and its signed record is not among the records")
+    except (KeyError, TypeError, AttributeError):
+        problems.append("GitHub's lists of the runs at this commit are unreadable")
+    except Failure as error:
+        problems.append(str(error))
+    return problems
+
+
+def read_failed(key, data, record, log, text):
+    """The FailedShard of a record that did not pass."""
+    found, run = None, record["run"]
+    for line in text.split("\n"):
+        if DISAGREE_MARK.strip() not in line:
+            continue
+        try:
+            row = strict_json(line.removeprefix(DISAGREE_MARK))
+        except ValueError:
+            row = None
+        if found is not None or not isinstance(row, dict) or set(row) != DISAGREE_FIELDS or not isinstance(row["shard"], list):
+            raise Failure("its log has an unreadable line")
+        found = row
+    if found is not None:
+        if (found["sha"], found["run"], found["attempt"]) != (record["sha"], run["url"], str(run["attempt"])):
+            raise Failure("its log is of another commit, run or attempt than its record")
+        if any(found[name] != key[name] for name in KEY):
+            found = None
+        elif [record["check"]] != [f"{check_name(key)}-{n}" for n in found["shard"][:1]]:
+            raise Failure("its log is of another shard than its check")
+    return FailedShard(record["check"], hashlib.sha256(data).hexdigest(), log, record["sha"], run["url"], run["attempt"], found)
+
+
+def read_shard(args, repo, key, data, record, files, actions):
+    """The Shard or the FailedShard that this evidence record is of. Anything wrong with it is a Failure, and then it is
+    neither."""
+    run = record.get("run") if isinstance(record.get("run"), dict) else {}
+    if not SHA.fullmatch(str(record.get("sha"))) or not RUN_URL.fullmatch(str(run.get("url"))) or type(run.get("attempt")) is not int:
+        raise Failure("its record names no commit, run or attempt")
+    verify_attestation(args, data, record, files)
+    verify_run(actions, record)
+    logs = [a.get("sha256") for a in record.get("artifacts") or [] if str(a.get("name")).endswith(".log")]
+    if len(logs) != 1:
+        raise Failure(f"its record names {len(logs)} logs")
+    log = next((text for text in files.values() if hashlib.sha256(text).hexdigest() == logs[0]), None)
+    if log is None:
+        raise Failure("its log is not there")
+    text = log.decode("utf-8", errors="replace")
+    if record.get("result") != "pass":
+        return read_failed(key, data, record, logs[0], text)
+    if record.get("tree_clean") is not True:
+        raise Failure("its tree was not clean")
+    done, rows = read_log(text, key, repo)
+    if (done["sha"], done["run"], done["attempt"]) != (record["sha"], run["url"], str(run["attempt"])):
+        raise Failure("its log is of another commit, run or attempt than its record")
+    if record["check"] != f"{check_name(key)}-{done['shard'][0]}":
+        raise Failure("its log is of another shard than its check")
+    return Shard(record["check"], hashlib.sha256(data).hexdigest(), logs[0], done, rows)
+
+
+def check_name(key):
+    """The checks of a target's shards have this name and the number of the shard."""
+    return f"oltp-sim-bugs-{'rehearsal-' if key['mode'] == 'rehearsal' else ''}{key['id']}"
+
+
+def evidence_files(repo, bug, args):
+    """{name: bytes} of the target's downloaded records, logs and attestations."""
+    if args.records:
+        root = Path(args.records)
+        if not root.is_dir():
+            raise Failure("--records must name a directory of downloaded evidence")
+        return {path.relative_to(root).as_posix(): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
+    if git(repo, "cat-file", "-e", f"{EVIDENCE_REF}^{{commit}}", check=False).returncode:
+        return {}
+    gone = git(repo, "log", "--full-history", "-m", "--no-renames", "--diff-filter=a", "--format=", "--name-only", EVIDENCE_REF,
+               "--", f"{bug.id}/").stdout.split("\n")
+    if any(gone):
+        raise Failure(f"the branch of the records changed or lost {next(filter(None, gone))!r}, and it may only gain files")
+    names = git(repo, "ls-tree", "-r", "-z", "--name-only", EVIDENCE_REF, "--", f"{bug.id}/").stdout.split("\0")
+    return {name: git(repo, "cat-file", "blob", f"{EVIDENCE_REF}:{name}", text=False).stdout for name in names if name}
+
+
+def read_shards(args, repo, bug, key, actions, out):
+    """(shards, failed shards, problems) of the target. A problem is why a record that names its check is neither."""
+    shards, failed, problems = [], [], []
+    try:
+        files = evidence_files(repo, bug, args)
+    except Failure as error:
+        if args.records:
+            raise
+        return [], [], [str(error)]
+    if not files and not args.records:
+        print(f"{bug.id}: no evidence in {bug.id}/ of {EVIDENCE_REF.removeprefix('refs/remotes/')}", file=out)
+    for name, data in sorted(files.items()):
+        try:
+            record = strict_json(data.decode("utf-8")) if name.endswith(".json") else None
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("schema") != "nabedra.evidence/1" or not re.fullmatch(
+                rf"{check_name(key)}-[1-9][0-9]*", str(record.get("check"))):
+            continue
+        try:
+            shard = read_shard(args, repo, key, data, record, files, actions)
+            (shards if isinstance(shard, Shard) else failed).append(shard)
+        except Failure as error:
+            problems.append(f"{record['check']} ({name!r}): {error}")
+    for problem in problems:
+        print(f"{bug.id}: no shard: {problem}", file=out)
+    return shards, failed, problems
+
+
+@dataclass
+class Answer:
+    """What a target's shards give: the body to record, and what a result shows of it."""
+    body: dict
+    rates: dict | None
+    masked: list
+    hit: dict | None
+    shard: Shard | None
+
+
+def merge_shards(bug, key, shards, failed, problems, missing):
+    """The answer, from complete ranges alone: the lowest seed that nothing masks while every lower seed is there.
+    `missing` says why not every result of this commit is known."""
+    shards = sorted(shards, key=lambda s: (s.done["shard"][::-1], s.done["run"], int(s.done["attempt"]), s.record_sha256))
+    expect = key["plan"]["expect"]
+    body = {"schema": MERGE_SCHEMA, **{name: key[name] for name in KEY}, "sha": None, "binaries": None,
+            "seeds": key["plan"]["seeds"], "result": "error", "tried": 0, "hit": None, "masked": {}, "rates": None,
+            "later": [], "shards": [], "why": None}
+    ranges = {}
+    for shard in shards:
+        ranges.setdefault(tuple(shard.done["shard"]), []).append(shard)
+    differ = [f"the runs of shard {n} disagree" for (n, _), runs in ranges.items() if any(run.rows != runs[0].rows for run in runs)]
+    differ += [f"{shard.check} disagrees with itself ({shard.found['why']})" for shard in failed if shard.found]
+    if differ:
+        both = [*shards, *(shard for shard in failed if shard.found)]
+        body.update(why="; ".join([*differ, "so one seed has two results"]), shards=sorted(
+            (s.json() for s in both), key=lambda s: (s["shard"], s["run"], s["attempt"], s["record_sha256"])))
+        return Answer(body, None, [], None, None)
+    if missing:
+        body.update(result="incomplete", why="; ".join(missing))
+        return Answer(body, None, [], None, None)
+    for what, values in (("of different commits", {s.done["sha"] for s in shards}),
+                         ("of different splits", {s.done["shard"][1] for s in shards}),
+                         ("with different binaries", {canonical(s.done["binaries"]) for s in shards})):
+        if len(values) > 1:
+            body.update(result="incomplete", why=f"there are shards {what}, and one search is of one")
+            return Answer(body, None, [], None, None)
+    if shards:
+        body.update(sha=shards[0].done["sha"], binaries=shards[0].done["binaries"])
+    parts, n = shards[0].done["shard"][1] if shards else 0, 1
+    tried, used, masked, hit, hit_shard = {}, [], [], None, None
+    while hit is None and (n, parts) in ranges:
+        used += ranges[n, parts]
+        for row in ranges[n, parts][0].rows:
+            expected, reason = row_mask(row, expect)
+            identity = known = None
+            if expected and reason is None:
+                replay = row["judged"]["replay"]
+                identity = {"seed": row["seed"], "trace_hash": replay["trace_hash"], "history_sha256": replay["history_sha256"]}
+                known = known_finding(bug, identity)
+                reason = "known-finding" if known else None
+            # The rows above the hit are not part of the search. They are listed, so that nobody has to look for them.
+            if hit is not None:
+                body["later"] += [row["seed"]] if expected and reason is None else []
+                continue
+            tried[row["seed"]] = row
+            if reason:
+                masked.append({"seed": row["seed"], "kinds": row["patched"]["kinds"], "reason": reason,
+                               **({"finding": known["finding"]} if known else {})})
+            elif expected:
+                hit, hit_shard = row, ranges[n, parts][0]
+                body["hit"] = {**identity, "kinds": row["patched"]["kinds"],
+                               "twin_trace_hash": row["judged"]["twin"]["trace_hash"]}
+        n += 1
+    if hit is None and not 0 < parts < n:
+        body["why"] = "; ".join([f"shard {n} of {parts or 'its split'} is missing", *problems])
+    for mask in masked:
+        body["masked"].setdefault(mask["reason"], []).append(mask["seed"])
+    rates = tried and {"seeds": len(tried), **{side: tally({seed: row[side]["kinds"] for seed, row in tried.items()}, expect)
+                                               for side in ("patched", "base")}} or None
+    body.update(result="candidate" if hit else "incomplete" if body["why"] else "not-detected", tried=len(tried),
+                rates=counted(rates), shards=[shard.json() for shard in used])
+    return Answer(body, rates, masked, hit, hit_shard)
+
+
+def merged(args, repo, bug, actions, out):
+    """(plan, the Answer of the target's shards). Every result of their commit has to be there, and an error that was recorded
+    for this search stays one."""
+    plan = shard_plan(bug, args)
+    key = shard_key(repo, bug, plan, args)
+    shards, failed, problems = read_shards(args, repo, bug, key, actions, out)
+    missing = [problem for sha in sorted({shard.done["sha"] for shard in shards} | {shard.sha for shard in failed})
+               for problem in unaccounted(actions, key, sha, shards, failed)]
+    answer = merge_shards(bug, key, shards, failed, problems, missing)
+    if answer.body["result"] != "error" and any(entry["result"] == "error" for entry in recorded_merges(bug, key)):
+        body = {**answer.body, "result": "error", "hit": None, "later": [],
+                "why": "an earlier merge of this search is an error, and neither of its results wins"}
+        answer = Answer(body, answer.rates, answer.masked, None, None)
+    return plan, answer
+
+
+def recorded_merges(bug, key):
+    """The merges of this search in searches.jsonl. A rehearsal has none."""
+    return [entry["merge"] for entry in load_searches(bug)[0]
+            if "merge" in entry and all(entry["merge"][name] == key[name] for name in KEY)]
+
+
+def answer_row(bug, plan, answer):
+    """The result of a target that rests on shards, before its hit is repeated."""
+    body = answer.body
+    row = dict(new_row(bug, plan), result=body["result"], tried=body["tried"], masked=answer.masked, rates=answer.rates,
+               merge=body)
+    if body["result"] == "not-detected":
+        row["why"] = f"no confirmed hit in {body['tried']} seeds"
+    elif body["why"]:
+        row["why"] = body["why"]
+    return row
+
+
+def masks_of(body):
+    return ", ".join(f"{len(seeds)} {reason}" for reason, seeds in sorted(body["masked"].items())) or "none"
+
+
+def cmd_merge(repo, bugs, args, out, every=None):
+    if len(bugs) != 1:
+        raise Failure("merge takes one bug id")
+    bug, = bugs
+    if args.record and rehearsal(args):
+        raise Failure("a rehearsal is not a search of the bug")
+    if cmd_check(repo, bugs, out, every=every):
+        return 1
+    print(f"gh command: {args.gh}", file=out)
+    if rehearsal(args):
+        print("(rehearsal: not evidence for this bug)", file=out)
+    plan, answer = merged(args, repo, bug, Actions(), out)
+    body, row = answer.body, answer_row(bug, plan, answer)
+    if answer.hit is not None:
+        hit = body["hit"]
+        print(f"{bug.id}: candidate seed {hit['seed']} after {body['tried']} seeds in {body['seeds']}: {hit['kinds']} trace "
+              f"{hit['trace_hash']}, history sha256 {hit['history_sha256']}, twin trace {hit['twin_trace_hash']}; "
+              f"base rate {body['rates']['base']['expected']} of {body['tried']}, patched rate "
+              f"{body['rates']['patched']['expected']} of {body['tried']}; unmasked above it: {body['later'][:20]}", file=out)
+    else:
+        print(describe(row), file=out)
+    print(f"{bug.id}: masked: {masks_of(body)}", file=out)
+    print(f"{MERGE_MARK} {canonical(body)}", file=out, flush=True)
+    if body["result"] not in RECORDED["merge"][2]:
+        return 1
+    if args.record:
+        entries, problems = load_searches(bug)
+        if problems:
+            raise Failure("; ".join(problems))
+        if any(entry.get("merge") == body for entry in entries):
+            raise Failure(f"that merge is already in {SEARCHES}")
+        append_entry(bug, entries, {"merge": body}, out)
+    return 0 if body["result"] in ANSWERS else 1
+
+
+def merge_problems(bug, answer):
+    """(whether the recorded merge contradicts this one, what keeps the hit from counting)."""
+    body = answer.body
+    same = recorded_merges(bug, body)
+    if same and same[-1] != body:
+        return True, []
+    problems = [] if same else [f"no merge of these shards is recorded in {SEARCHES}"]
+    if bug.manifest.get("detection", {}).get("search") not in (None, search_hash(body)):
+        problems.append("detection.search is not the merge of these shards")
+    return False, problems
+
+
+def repeat_hit(args, job, harness, bug, plan, answer):
+    """(patched replay, unpatched replay) of the hit. Both builds, the replays and the base run around the hit have to
+    be what its shard says."""
+    row, done, seed = answer.hit, answer.shard.done, answer.hit["seed"]
+    exe, binaries = build_patched(args, job.scratch, harness, bug)
+    if binaries != done["binaries"]:
+        raise Failure("this job builds other binaries than the shards")
+    patched, clean = replay_hit(harness, bug, plan, exe, row)
+    if judged(patched, clean) != row["judged"]:
+        raise Failure(f"the hit of seed {seed} is not the one of its shard")
+    first, last = done["seeds"]
+    start = first + (seed - first) // args.chunk * args.chunk
+    end = min(start + args.chunk - 1, last)
+    again = harness.facts("base", harness.clean_exe, plan, label_of(bug), start, end)
+    if again != {r["seed"]: r["base"] for r in answer.shard.rows if start <= r["seed"] <= end}:
+        raise Failure(f"the base run of seeds {start} to {end} is not the one of its shard")
+    return patched, clean
+
+
+def count_bug(args, repo, job, build, actions, bug, out):
+    """The row of one target, from its shards' attested records and from this job."""
+    if why := not_searched(bug, plan := shard_plan(bug, args), args):
+        return dict(new_row(bug, plan), **why)
+    plan, answer = merged(args, repo, bug, actions, out)
+    row = answer_row(bug, plan, answer)
+    print(f"{bug.id}: masked: {masks_of(answer.body)}\n{MERGE_MARK} {canonical(answer.body)}", file=out, flush=True)
+    if row["result"] not in ANSWERS:
+        return row
+    contradicted, problems = (False, []) if rehearsal(args) else merge_problems(bug, answer)
+    if contradicted:
+        return dict(row, result="error", why="the recorded merge is not what the shards' records give")
+    if answer.hit is None:
+        return row
+    try:
+        patched, clean = repeat_hit(args, job, build(), bug, plan, answer)
+    except OutOfTime:
+        return dict(row, result="error", why="the time limit passed before the hit was repeated")
+    except Unavailable as error:
+        return dict(row, result="error", why=f"the harness has no {error} workload")
+    except Failure as error:
+        return dict(row, result="error", why=str(error))
+    row.update(found_seed=answer.hit["seed"], patched=patched.json(), clean=clean.json())
+    if rehearsal(args):
+        return dict(row, result="rehearsed")
+    problems = [*count_problems(bug, repo, row, patched, clean), *problems]
+    if problems:
+        return dict(row, result="candidate", why="; ".join(problems), problems=problems)
+    if not regression_fails_now(repo, bug, args, job.target, out):
+        why = "its regression did not pass without the patch and fail with it in this run"
+        return dict(row, result="candidate", why=why, problems=[why])
+    return dict(row, result="found", **{key: bug.manifest["detection"][key] for key in (
+        "mechanism", "detector", "confirmed_by", "confirmation")})
+
+
+def cmd_count(repo, bugs, args, out, every=None):
+    """The counting run. Only a complete, recorded and confirmed search whose hit repeats here is `found`."""
+    for bug in bugs:
+        shard_plan(bug, args)
+    status = refused_job(repo, bugs, args, out, every)
+    if status is not None:
+        return status
+    deadline = time.monotonic() + args.time_limit if args.time_limit else None
+    with open_job(repo, bugs, args, out, every) as job:
+        if job is None:
+            return 1
+        print(f"gh command: {args.gh}", file=out, flush=True)
+        built = []
+
+        def build():
+            if not built:
+                built.append(job.harness())
+                built[0].deadline = deadline
+            return built[0]
+        rows, actions = [], Actions()
+        for bug in bugs:
+            rows.append(count_bug(args, repo, job, build, actions, bug, out))
+            print(describe(rows[-1]), file=out, flush=True)
+        summary = {"schema": "nabedra.sim-bugs-count/1", "evidence": "fault-model", "mode": mode_of(args), "sha": job.sha,
+                   "build": job.build, "not_mains_build": job.not_mains, "set": args.set_name, "bugs": rows}
+        (job.out_dir / "sim-bugs-count.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    found = sum(row["result"] == ("rehearsed" if rehearsal(args) else "found") for row in rows)
+    print(f"sim-bugs count{' (rehearsal)' if rehearsal(args) else ''}: {found} of {len(rows)} " + (
+        "pipeline rehearsals completed; no reverted fix was searched for" if rehearsal(args) else
+        "reverted fixes found within budget, each from its shards' attested records and repeated in this run"), file=out)
+    return 0 if found == len(rows) else 1
 
 
 # --------------------------------------------------------------------------------------------
@@ -2225,18 +3192,23 @@ def cmd_record(repo, bugs, args, out):
         if search is None:
             raise Failure(f"that run did not search {bug.id}")
         entry = {"search": search}
+    append_entry(bug, entries, entry, out)
+    return 0
+
+
+def append_entry(bug, entries, entry, out):
+    """Write the next line of searches.jsonl."""
     path = bug.path / SEARCHES
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     previous = text.splitlines()[-1] if text else None
-    entry.update(n=len(entries) + 1, prev=previous and hashlib.sha256(previous.encode()).hexdigest())
+    entry = {**entry, "n": len(entries) + 1, "prev": previous and hashlib.sha256(previous.encode()).hexdigest()}
     path.write_text(text + canonical(entry) + "\n", encoding="utf-8")
     problems = load_searches(bug)[1]
     if problems:
         path.write_text(text, encoding="utf-8")
         raise Failure("; ".join(problems))
     print(f"{bug.id}: recorded as entry {entry['n']}"
-          + (f", search {search_hash(entry['search'])}" if "search" in entry else ""), file=out)
-    return 0
+          + "".join(f", search {search_hash(search)}" for search in recorded_searches([entry])), file=out)
 
 
 def cmd_evidence(repo, bugs, args, out):
@@ -2248,7 +3220,7 @@ def cmd_evidence(repo, bugs, args, out):
     if not args.records or not root.is_dir():
         raise Failure("--records must name a directory of downloaded evidence artifacts")
     logs = {sha256_file(path): path for path in root.rglob("*.log")}
-    attested = []
+    attested, shards = [], []
     for path in sorted(root.rglob("*.json")):
         record = read_json(path)
         if not (isinstance(record, dict) and record.get("schema") == "nabedra.evidence/1"):
@@ -2257,6 +3229,7 @@ def cmd_evidence(repo, bugs, args, out):
             if artifact.get("sha256") in logs:
                 text = logs[artifact["sha256"]].read_text(encoding="utf-8", errors="replace")
                 attested.append((record, set(text.splitlines())))
+                shards.append((sha256_file(path), artifact["sha256"], text))
 
     def matching(prefix, sha, url, results):
         return [lines for record, lines in attested
@@ -2289,6 +3262,14 @@ def cmd_evidence(repo, bugs, args, out):
                     problems.append(f"entry {entry['n']} of {SEARCHES} is not in an attested log in DIR")
             elif search:
                 problems.append(f"entry {entry['n']} of {SEARCHES} names no Actions run, so no log covers it")
+            for shard in entry.get("merge", {}).get("shards", []):
+                mark, name = DISAGREE_MARK, ""
+                if shard["rows_sha256"]:
+                    mark, name = DONE_MARK, f'"rows_sha256":"{shard["rows_sha256"]}"'
+                if not any((shard["record_sha256"], shard["log_sha256"]) == (record, log) and any(
+                        line.startswith(mark) and name in line for line in text.splitlines())
+                           for record, log, text in shards):
+                    problems.append(f"entry {entry['n']} of {SEARCHES} rests on a record of {shard['check']} that is not in DIR")
         failed += bool(problems)
         print(f"{bug.id}: " + ("; ".join(problems) if problems else "the recorded lines are in the log"), file=out)
     print(f"sim-bugs evidence: {len(bugs) - failed} of {len(bugs)} match; signatures are not checked here", file=out)
@@ -2299,14 +3280,16 @@ def cmd_evidence(repo, bugs, args, out):
 
 def main(argv=None, *, repo=REPO, out=sys.stdout):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=("check", "verify", "run", "record", "evidence", "digest"))
+    parser.add_argument("command", choices=("check", "verify", "run", "shard", "merge", "count", "record",
+                                            "evidence", "digest"))
     parser.add_argument("ids", nargs="*")
     parser.add_argument("--set", dest="set_name", choices=SETS)
     parser.add_argument("--cargo", default="cargo", help="cargo command, for example cargo-slot. The output names it.")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--target-dir", help="shared target directory (default server/target/sim-bugs)")
     parser.add_argument("--log", help="build and test log (default <target-dir>/sim-bugs-<command>.log)")
-    parser.add_argument("--seeds", type=int, help="run: cap the seeds searched per bug")
+    parser.add_argument("--seeds", type=int, help="run, and shards of a rehearsal: cap the seeds searched per bug")
+    parser.add_argument("--shard", type=shard_of, metavar="N/PARTS", help="shard: which part of the seeds to run")
     parser.add_argument("--sim-jobs", type=int, default=4, help="run: seeds simulated in parallel")
     parser.add_argument("--chunk", type=int, default=100, help="run: seeds per harness process, which keeps memory bounded")
     parser.add_argument("--search-timeout", type=int, help="run: seconds allowed per bug's search and base rate")
@@ -2315,9 +3298,12 @@ def main(argv=None, *, repo=REPO, out=sys.stdout):
     parser.add_argument("--from", dest="source", help="record: the sim-bugs-run.json of a run")
     parser.add_argument("--never-searched", metavar="COMMIT", help="record: a commit whose manifest's plan nobody ran")
     parser.add_argument("--reason", help="record: why that plan was never searched")
-    parser.add_argument("--records", help="evidence: directory of downloaded evidence artifacts")
+    parser.add_argument("--records", help="evidence, merge, count: directory of downloaded evidence artifacts. merge and "
+                        f"count read <id>/ of {EVIDENCE_REF.removeprefix('refs/remotes/')} without it")
+    parser.add_argument("--record", action="store_true", help="merge: append the answer to searches.jsonl")
+    parser.add_argument("--gh", default="gh", help="merge, count: GitHub CLI with `attestation verify`. The output names it.")
     rehearse = parser.add_argument_group(
-        "rehearsal (run)", "Override a manifest to exercise the pipeline, for example on the smoke "
+        "rehearsal (run, shard, merge, count)", "Override a manifest to exercise the pipeline, for example on the smoke "
         "workload. A rehearsal is labelled as such and is never evidence for the bug.")
     rehearse.add_argument("--workload", help="workload instead of the manifest's")
     rehearse.add_argument("--profile", help="comma-separated profiles instead of the manifest's ('' for none)")
@@ -2353,7 +3339,8 @@ def main(argv=None, *, repo=REPO, out=sys.stdout):
             if cmd_check(repo, chosen, out, require_evidence=False):
                 return 1
             return cmd_verify(repo, chosen, args, out)
-        return cmd_run(repo, chosen, args, out, every=bugs)
+        command = {"run": cmd_run, "shard": cmd_shard, "merge": cmd_merge, "count": cmd_count}[args.command]
+        return command(repo, chosen, args, out, every=bugs)
     except Failure as error:
         print(f"sim-bugs: {error}", file=out)
         return 2
