@@ -1,0 +1,17 @@
+id = "OLTP-sim-removed-learner-charge"
+title = "After a replica move the Data leader keeps replicating to the removed replica and keeps decoded entries charged"
+class = "resource-release-order"
+module = "oltp"
+guarantees = []
+scenarios = ["O26"]
+found_by = "campaign"
+found_date = "2026-11-24"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 7
+why_not_caught = "The O26 runner compares budgets around the mount, not decode charges after the move."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=move NABEDRA_SIM_PROFILE=none, seed 7 (ResourceBaseline): working_decode_bytes returns to its baseline after the move retired."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-23"

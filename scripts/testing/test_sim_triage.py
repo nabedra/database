@@ -1,0 +1,177 @@
+"""Unit tests of sim_triage.py: what may not count as a named cause (review of PR #115, H3)."""
+
+import gzip
+import tempfile
+import unittest
+
+import sim_triage as triage
+
+
+HISTORY = triage.digest(['{"index":0}', '{"index":1}'])
+
+
+def usage(node, now, before, threads=0):
+    def shown(size, threads):
+        return (f"ResourceUsage {{ working_decode_bytes: {size}, native_threads: {threads}, "
+                "direct_in_flight: 0, disk: {} }")
+    return (f"t=9ms ResourceBaseline: n{node} did not stay at its baseline after quiescence: clean in its last 0 "
+            f"of 3 observations, last off by {shown(now, threads)} (baseline {shown(before, 0)})")
+
+
+def diagnosis(kinds, *lines, active_move_at="control/machine.rs:320"):
+    out = triage.Diagnosis(active_move_at)
+    out.kinds = set(kinds)
+    out.history = HISTORY
+    for line in lines:
+        out.add(line)
+    return out
+
+
+def lease(label, lease, size, stack, node=1):
+    return f"SCR {label} n{node} #{lease} {size}B t5 {stack}"
+
+
+ROUTE = "repl::authority::control::ControlClient::replica_routes <- x <- y ## z"
+BATCH = "repl::typed_log::TypedLogStore::next_stored <- x ## z"
+
+
+def held(*stacks):
+    """Every sample holds one 700 byte lease per stack, and the baseline holds another lease."""
+    out = [lease("base", 1, 100, ROUTE)]
+    for label in triage.SAMPLES:
+        out.append(lease(label, 1, 100, ROUTE))
+        out += [lease(label, 2 + i, 700, stack) for i, stack in enumerate(stacks)]
+    return out
+
+
+def red(*kinds):
+    return {"verdict": "red", "violations": list(kinds)}
+
+
+class Triage(unittest.TestCase):
+    def classify(self, violations, known, kinds=("ResourceBaseline",)):
+        return triage.classify(red(*kinds), violations, known, HISTORY)[0]
+
+    def test_a_held_route_with_the_exact_bytes_is_named(self):
+        known = diagnosis(["ResourceBaseline"], *held(ROUTE))
+        self.assertEqual(self.classify([usage(1, 792, 100)], known), "named")
+
+    def test_unmatched_bytes_are_undiagnosed(self):
+        known = diagnosis(["ResourceBaseline"], *held(ROUTE))
+        for now in (791, 800, 792 + 7312):
+            self.assertEqual(self.classify([usage(1, now, 100)], known), "undiagnosed")
+
+    def test_an_unknown_site_is_undiagnosed(self):
+        known = diagnosis(["ResourceBaseline"], *held("some::other::job <- x ## z"))
+        self.assertEqual(self.classify([usage(1, 800, 100)], known), "undiagnosed")
+
+    def test_an_inferred_holder_is_undiagnosed(self):
+        known = diagnosis(["ResourceBaseline"], *held(BATCH))
+        self.assertEqual(self.classify([usage(1, 800, 100)], known), "undiagnosed")
+
+    def test_a_route_that_is_not_held_is_undiagnosed(self):
+        lines = [line for line in held(ROUTE) if not line.startswith("SCR e6")]
+        known = diagnosis(["ResourceBaseline"], *lines)
+        self.assertEqual(self.classify([usage(1, 792, 100)], known), "undiagnosed")
+
+    def test_another_gauge_is_undiagnosed(self):
+        known = diagnosis(["ResourceBaseline"], *held(ROUTE))
+        self.assertEqual(self.classify([usage(1, 792, 100, threads=1)], known), "undiagnosed")
+
+    def test_a_node_without_a_sample_is_undiagnosed(self):
+        known = diagnosis(["ResourceBaseline"], *held(ROUTE))
+        self.assertEqual(self.classify([usage(2, 792, 100)], known), "undiagnosed")
+
+    def test_one_violation_without_evidence_makes_the_seed_undiagnosed(self):
+        known = diagnosis(["ResourceBaseline", "NotAppliedNeverCommitted"], *held(ROUTE))
+        violations = [usage(1, 792, 100), "t=9ms NotAppliedNeverCommitted: answered not_applied"]
+        kinds = ("ResourceBaseline", "NotAppliedNeverCommitted")
+        self.assertEqual(self.classify(violations, known, kinds), "undiagnosed")
+
+    def test_a_diagnostic_run_with_other_violations_names_nothing(self):
+        known = diagnosis(["ResourceBaseline", "Liveness"], *held(ROUTE))
+        self.assertEqual(self.classify([usage(1, 792, 100)], known), "undiagnosed")
+        self.assertEqual(self.classify([usage(1, 792, 100)], None), "undiagnosed")
+        self.assertEqual(self.classify([], known, ("ResourceBaseline", "Liveness")), "undiagnosed")
+
+    def test_a_diagnostic_run_with_another_history_names_nothing(self):
+        known = diagnosis(["ResourceBaseline"], *held(ROUTE))
+        for history in (triage.digest(['{"index":0}', '{"index":2}']), triage.digest([]), None):
+            result = triage.classify(red("ResourceBaseline"), [usage(1, 792, 100)], known, history)
+            self.assertEqual(result[0], "undiagnosed")
+        known.history = None
+        self.assertEqual(self.classify([usage(1, 792, 100)], known), "undiagnosed")
+        self.assertEqual(triage.classify(red("ResourceBaseline"), [usage(1, 792, 100)], known)[0], "undiagnosed")
+
+    def test_histories_are_read_from_the_diagnostic_traces(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = f"{root}/s7.trace.gz"
+            with gzip.open(path, "wt") as out:
+                out.write('5 history {"index":0}\n6 cut n1 Kill\n6 history {"index":1}\n')
+            known = {7: triage.Diagnosis()}
+            triage.add_histories(known, [path])
+            self.assertEqual(known[7].history, HISTORY)
+
+    def test_topology_growth_is_labelled_and_stays_undiagnosed(self):
+        def violation(*ledgers):
+            off = ", ".join(f"{name} {before + size} (baseline {before})" for name, before, size in ledgers)
+            return f"t=9ms ResourceBaseline: n1 did not stay at its baseline after quiescence, last off by {off}"
+        group = "SchedulerBytes of group 00000000-0000-0000-0000-000000000000"
+        known = diagnosis(["ResourceBaseline"], *held(ROUTE))
+        for ledgers, matches in (
+                ([("ScratchBytes", 9, 16_909_672)], True), ([("SchedulerBytes", 0, 64 << 20)], True),
+                ([(group, 0, (8 << 20) + (64 << 10)), ("ScratchBytes", 100, 692)], True),
+                ([("ScratchBytes", 9, 16_909_673)], False), ([("ScratchBytes", 9, 692)], False),
+                ([("ScratchBytes", 9, 64 << 20), ("ProgressBytes", 4, 5)], False)):
+            result, causes = triage.classify(red("ResourceBaseline"), [violation(*ledgers)], known, HISTORY)
+            self.assertEqual(result, "undiagnosed")
+            self.assertEqual(triage.TOPOLOGY in causes[0], matches, causes)
+
+    def test_a_split_is_named_only_by_the_recorded_refusals(self):
+        text = "t=9ms Liveness: the split did not publish within 60s after the heal: {\"last\":%s,\"plans\":2}"
+        plan, other = "0" * 8 + "-1" * 4 + "0" * 20, "f" * 36
+        freeze = ["DIAG t=5 n=1 FREEZE DirectCommitAboveCut high 9", f"DIAG t=5 n=1 SPLIT-FREEZE-REFUSED plan {plan} (x)"]
+        held = f"DIAG t=6 n=1 SPLIT-PLAN-REFUSED plan {other} (y) holder Ok(Some((TxnId {{ request_id: %s, attempt: 1 }}"
+        refused, after = f'"Conflict {triage.FREEZE}"', f'"Conflict {triage.HELD}"'
+        for last, lines, want in (
+                (f"[{refused}]", freeze, "named"),
+                (f"[{refused},{after}]", [*freeze, held % plan], "named"),
+                (f"[{refused},{after}]", [*freeze, held % other], "undiagnosed"),
+                (f"[{refused},{after}]", [*freeze, held.split(" holder")[0] + " holder Ok(None)"], "undiagnosed"),
+                (f"[{refused},{after}]", freeze, "undiagnosed"),
+                (f"[{refused}]", freeze[:1], "undiagnosed"), (f"[{refused}]", [], "undiagnosed"),
+                (f'[{refused},"n1 [odd] text"]', freeze, "undiagnosed"),
+                (f"[{after}]", [*freeze, held % plan], "undiagnosed"), ("[]", freeze, "undiagnosed")):
+            known = diagnosis(["Liveness"], *lines)
+            self.assertEqual(self.classify([text % last], known, ("Liveness",)), want, (last, lines))
+
+    def test_a_lost_worker_needs_the_refused_fences(self):
+        text = 't=9ms Liveness: n1 did not restart: survivors never dropped n1: readiness deadline for [2, 3]: [(2, "200 {'
+        busy = "DIAG t=5 n=2 CONTROL-FAULT Busy oltp-replication/src/authority/control/machine.rs:320"
+        known = diagnosis(["Liveness"], *[busy] * 101)
+        self.assertEqual(self.classify([text], known, ("Liveness",)), "named")
+        known = diagnosis(["Liveness"], *[busy] * 101)
+        for other in (text.replace('"200 {', '"HTTP n2 deadline'),
+                      text.replace("readiness deadline for [2, 3]: ", "n2 exited during startup"),
+                      text.replace("n1 did not restart: ", "heal: heal cold start after [")):
+            self.assertEqual(self.classify([other], known, ("Liveness",)), "undiagnosed")
+        text2 = text.replace("n1 did not restart: ", 'same-run restart failed after the heal: ["n1: ').replace('"200', '\\"200')
+        self.assertEqual(self.classify([text2], known, ("Liveness",)), "named")
+        for known in (diagnosis(["Liveness"], busy), diagnosis(["Liveness"], *[busy] * 101, active_move_at=None),
+                      diagnosis(["Liveness"], *[busy.replace("320", "3201")] * 101)):
+            self.assertEqual(self.classify([text], known, ("Liveness",)), "undiagnosed")
+
+    def test_a_seed_that_was_not_replayed_or_did_no_work_is_not_clean(self):
+        row = {"violations": [], "replayed": False, "deterministic": None}
+        self.assertEqual(triage.verdict(row), "unreplayed")
+        row["replayed"], row["deterministic"] = True, True
+        self.assertEqual(triage.verdict(row), "unreplayed")
+        row.update(chaos_writes=1, chaos_reads=1)
+        self.assertEqual(triage.verdict(row), "clean")
+        row["deterministic"] = False
+        self.assertEqual(triage.verdict(row), "red")
+        self.assertEqual(triage.classify({"verdict": "unreplayed"}, [], None), ("unreplayed", []))
+
+
+if __name__ == "__main__":
+    unittest.main()

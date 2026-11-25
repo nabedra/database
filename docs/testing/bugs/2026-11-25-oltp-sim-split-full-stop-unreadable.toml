@@ -1,0 +1,17 @@
+id = "OLTP-sim-split-full-stop-unreadable"
+title = "A table stays unreadable after a full stop that interrupted a split of its range"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G01"]
+scenarios = ["O15", "D07"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 133
+why_not_caught = "The cold start runners stop workers under writes, not under an interrupted split of a range with direct commits."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, cold seed 133 of 1 to 720: reads succeed within 30 s of the heal. No read succeeded again in 1400 s of virtual time, after a full stop that interrupted a split. At an earlier head (685378e1) seed 556 showed it with trace hash 87da5ba208f9c8bc (the attested run, and one local rerun of the same binary source), and cold seeds 91, 115, 127, 286, 340, 388, 400 and 619 did as well."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

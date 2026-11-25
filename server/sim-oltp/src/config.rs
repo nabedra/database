@@ -53,6 +53,12 @@ impl Config {
         Self { knobs }
     }
 
+    /// Override one sampled knob, as a seed-search focus token asks (`batch`).
+    pub fn force(&mut self, knob: &str, value: Value) {
+        assert!(self.knobs.contains_key(knob), "unknown knob {knob}");
+        self.knobs.insert(knob.into(), value);
+    }
+
     pub fn deadline(&self) -> Duration {
         Duration::from_millis(self.knobs["request_deadline_ms"].as_u64().unwrap())
     }
@@ -109,6 +115,15 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The production range is not raised to the number of peers (lead decision 12.4): the
+    /// product fixes 256 slots and lets automatic growth reach 4,096 workers, so a worker can
+    /// have fewer slots than peers. Seed 66 samples four slots for five peers and stays red.
+    #[test]
+    fn session_slots_keep_the_sampled_value() {
+        let config = Config::sample(66);
+        assert_eq!(config.knobs["transport.session_slots"], json!(4));
+    }
 
     /// Seed 22 sampled a 124,761-byte arena and no worker ever bound HTTP.
     #[test]
