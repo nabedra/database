@@ -149,12 +149,29 @@ impl Move {
             return;
         }
         self.next_ms = now + RETRY.as_millis() as u64;
+        self.advance(cluster, ctx).await;
+    }
+
+    async fn advance(&mut self, cluster: &mut Cluster, ctx: &Ctx) {
         if let Err(error) = self.step(cluster, ctx).await {
             if error != self.last_error {
                 cluster.record(format!("move step: {error}"));
             }
             self.last_error = error;
         }
+    }
+
+    /// One more try of a running move, within its bound after the heal.
+    pub(crate) async fn retry(&mut self, cluster: &mut Cluster, ctx: &Ctx, healed: Duration) {
+        if cluster.world.elapsed() < healed + FINISH_LIMIT {
+            self.advance(cluster, ctx).await;
+            time::sleep(RETRY / 5).await;
+        }
+    }
+
+    /// Whether the move may still retire in time.
+    pub(crate) fn waiting(&self, cluster: &Cluster, healed: Duration) -> bool {
+        self.running() && cluster.world.elapsed() < healed + FINISH_LIMIT
     }
 
     async fn step(&mut self, cluster: &mut Cluster, ctx: &Ctx) -> Result<(), String> {
@@ -602,12 +619,7 @@ impl Move {
     ) -> Result<(), String> {
         let deadline = healed + FINISH_LIMIT;
         while !matches!(self.state, State::Retired) {
-            if let Err(error) = self.step(cluster, ctx).await {
-                if error != self.last_error {
-                    cluster.record(format!("move step: {error}"));
-                }
-                self.last_error = error;
-            }
+            self.advance(cluster, ctx).await;
             if cluster.world.elapsed() >= deadline && !matches!(self.state, State::Retired) {
                 return Err(format!(
                     "the replica move did not retire within {FINISH_LIMIT:?} after the heal: {}",
