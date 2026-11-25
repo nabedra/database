@@ -1,32 +1,50 @@
-# Analysis below: wave-p8 report k03-docker.md, 2026-11-25, kept with its data outside this repository.
-# It is one author's local, unattested and unreviewed work on a binary built from e3d73663. It is not evidence for K03.
+# Analysis: wave-p8 reports k03-docker.md (author) and land-135.md (independent check), 2026-11-25, kept with their data
+# outside this repository. The local runs are unattested and use a binary built from e3d73663. They are not evidence for
+# K03. The behaviour was confirmed independently on that binary. No design review has judged it.
 #
-# Rate. All 80 cache-cluster-real artifacts retained on 2026-11-25, 74 of them with five-repetition runs:
-#   47 of 74 runs red (64 %, 95 % CI 52 to 74), 47 of 243 repetitions failed (19.3 %, 95 % CI 15 to 25; Wilson).
+# Rate. All 81 cache-cluster-real artifacts retained on 2026-11-25, 75 of them with five-repetition runs:
+#   48 of 75 runs red (64 %, 95 % CI 53 to 74), 48 of 244 repetitions failed (19.7 %, 95 % CI 15 to 25; Wilson).
+#   The count includes 45501116481 (69b9d6dd, red in repetition 1), uploaded at 22:32 UTC on 2026-11-24, after the first
+#   listing. Without it: 47 of 74 and 47 of 243.
 #   One call site (cluster.py:416) and one error. A run stops at its first failed repetition, and people dispatched
 #   extra runs after reds, so this is not a random sample.
-#   Failures by repetition number: 1: 15/74, 2: 17/59, 3: 5/42, 4: 6/37, 5: 4/31.
-#   At this rate a five-repetition run is green about 1 time in 3 by chance (34 % expected, 27 of 74 seen).
-#   Repetitions on WSL Docker failed less often, 2 of 120. The reason is not known.
+#   Failures by repetition number: 1: 16/75, 2: 17/59, 3: 5/42, 4: 6/37, 5: 4/31.
+#   At this rate a five-repetition run is green about 1 time in 3 by chance (33 % expected, 27 of 75 seen).
+#   Repetitions on WSL Docker failed less often, 2 of 120 by the author. The reason is not known.
 #
-# Proposed mechanism, not reviewed. After c1 and c2 are paused for about 3 s every lease has expired, and a new
-# controller leader starts with no worker reports. It treats a worker that has not reported in its term as unavailable,
-# so the first worker heard takes slots from healthy workers, 256 per 250 ms tick, often with no replica. Repair starts
-# 64 slots per wave, about 2.1 s per wave, so the wait misses 30 s from about 960 such slots. It converged later in
-# every local repetition (145 of 145). Whether this is a controller defect or a check deadline defect is not settled.
+# Behaviour seen locally. After c1 and c2 are paused for about 3 s every lease has expired, and a new controller leader
+# starts with no worker reports. The planner acts on a fenced lease and no report younger than 3 s from the primary, so a
+# late worker and a dead one look the same. A worker that has reported takes the slots it is the replica of, 256 per
+# 250 ms tick. They have no replica if the third worker is not heard or has 64 moves in flight, so it depends on which
+# worker is late and on the layout, not on the delay alone. Repair starts 64 slots per wave, about 2.1 s per wave, so the
+# wait misses 30 s from about 960 such slots. It converged later in every one of the author's repetitions (145 of 145).
+# A new term is one way to reach this, not the only one (a 3.1 s silence in one term does it in a planner test).
 #
-# Falsification test: in 145 local repetitions, is a slot ever taken, in a later term, from a primary that had already
-# renewed in that term? 0 of 34,816 transfers. Every displaced primary renewed later, median 0.28 s, max 2.07 s.
-# Pausing w3 for 1.7 s past the controllers' resume missed 30 s in 5 of 5.
+# Written rule. plans/cache.md ("Failover and restart") allows promotion after the fence, and its 3 s report window after
+# a leadership change covers the scoped cold reset only. The planner does what that says. Whether the rule should say
+# more is for the design review.
+#
+# Open disagreement. cluster.py:401 ("quorum restores leased authority") expects the owner from before the outage to
+# serve again, so the fixture expects a surviving owner to keep its slot. No guarantee row or plan says so. land-135
+# paused w2 for 1.7 s and slot 1584 moved from w2 to w3, and that assertion failed, in 1 of 5 repetitions. Whether the
+# fixture or the rule should change is undecided.
+#
+# Falsification test: in 145 local repetitions, in a later term and before the workers are killed, is a slot with no move
+# in progress ever taken from a primary that had already renewed in that term? 0 of 34,816. Slots with a move in
+# progress were left out: 138 more owner changes, all from a primary that had renewed (137 cutovers of the test's own
+# move and 1 expired-freeze failover of it). Every displaced primary of the 34,816 renewed later, median 0.28 s, max
+# 2.07 s. land-135 repeated the count with another parser and added 25 repetitions, 0 of 15,616.
+# Pausing w3 for 1.7 s past the controllers' resume missed 30 s in 5 of 5. That is not general: pausing w2 for 1.7 s
+# missed 30 s in 0 of the 4 that reached the wait, with 0 to 256 slots bare.
 #
 # Predictions that failed:
 #   1. Pausing w3 for 0.6 s should leave 512 to 768 slots without a replica. Seen: 0, 192, 960, 1408 and 1472.
 #   2. Releasing all three workers together should leave none. 3 of 15 repetitions had 256. That variant did not
 #      separate the cases (29 of 120 unmodified repetitions had some), so it supports nothing.
 #
-# Missing: no CI controller WAL has been read. The failing WAL is local, and there w2 took w1's slots, whereas in the
-# CI failures w1 holds single copies of w3's slots. CI matches only in shape (metrics, 64-slot steps). Why CI fails more
-# often is open.
+# Missing: no CI controller WAL has been read. The failing WAL the author read is local, and there w2 took w1's slots,
+# whereas in the CI failures w1 holds single copies of w3's slots. CI matches only in shape (metrics, 64-slot steps). Why
+# CI fails more often is open.
 #
 # Not evidence. Green runs on a SHA where an earlier run or attempt of the same check was red. "Retried" is read from
 # order and request names; some were dispatched together. Reds first, then the greens:
@@ -45,12 +63,17 @@
 #   36da95b3: 45451318381, 45451397557 (4 reds of 6)
 #   6e6eccec: 45451328628, 45451382734 (6 reds of 8)
 #   e3d73663: 45489740788 (5 reds of 6)
-# The other greens had no red on their own SHA. They are single draws at the rate above: 6702e5b9 45238460162,
-# dfa72b21 45310838093, 63ac6cfb 45312899506, 48f05250 45326771345, 3f2bc01e 45419455689, b65deeeb 45446887284
-# (after reds on two earlier heads of its PR, 16ced08f and e842431c), 2560c7cd 45477601623, a28875d7 45484254552.
+# The other 8 greens had no red on their own SHA. They are single draws at the rate above. Six follow reds on earlier
+# heads of the same PR:
+#   PR 89: dfa72b21 45310838093, 63ac6cfb 45312899506, 48f05250 45326771345 (reds on e32eadb5, d7261259, 98bcab53,
+#     aedc3d11, f53b38c6, faec1184, f7eb0e8d and 81b668ed, and for 48f05250 also b6af6b5e)
+#   PR 109: b65deeeb 45446887284 (reds on 16ced08f and e842431c)
+#   PR 125: 2560c7cd 45477601623, a28875d7 45484254552 (red on f600e08a; the later head 69b9d6dd is red again)
+# The remaining two are 6702e5b9 45238460162 and 3f2bc01e 45419455689.
 #
-# The scratch repro and the proposed controller change are in that report. Both are unreviewed. The change is untested
-# and needs design review. This record does not recommend merging either.
+# A scratch repro and a proposed controller change are in k03-docker.md. The change is untested and needs design review.
+# land-135.md shows that a window anchored on the term start does not protect a worker heard after it. This record does
+# not recommend merging either.
 id = "CACHE-K03-DOCKER-PLACEMENT"
 title = "The K03 Docker fleet did not reach a ready placement within 30 s before the online move"
 class = "other"
@@ -61,8 +84,8 @@ found_by = "ci-flake"
 found_date = "2026-11-23"
 lowest_regression = "check cache-cluster-real (scripts/cache-acceptance/cluster.py history, wait_placement)"
 seed = "unknown"
-why_not_caught = "The failure is intermittent, 47 of 243 CI repetitions (19.3 %, 95 % CI 15 to 25) and 47 of 74 runs, so about 1 in 3 five-repetition runs is green by chance and rerunning a red check until it passed hid it."
-invariant_added = "Intended, not met: each of the five K03 fleet repetitions reaches 16,384 ready primaries and replicas within the check's 30 s wait before the online move. No contract states that deadline, and the cause is not reviewed, so this may be a controller fault or a fixture deadline."
+why_not_caught = "The failure is intermittent, 48 of 244 CI repetitions (19.7 %, 95 % CI 15 to 25) and 48 of 75 runs, so about 1 in 3 five-repetition runs is green by chance, and a green rerun on the same or a later head was read as a pass."
+invariant_added = "Intended, not met: each of the five K03 fleet repetitions reaches 16,384 ready primaries and replicas within the check's 30 s wait before the online move. No contract states that deadline, and whether the wait or the promotion rule should change is undecided."
 fix_commits = []
 revert_patch_ok = false
 status = "open"
