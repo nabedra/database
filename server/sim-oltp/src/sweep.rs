@@ -18,7 +18,7 @@ use crate::{
     invariants::protocol::{PROBE_INVARIANTS, RANGE_CLOCK_NOT_RUN, REBUILD, TRUNCATION},
     nemesis::Selection,
     panics::PANIC,
-    workload::run_seed,
+    workload::{STAGE_JUDGED, run_seed},
     workloads::{SCENARIOS, Scenarios, Workload, WorkloadChoice, clauses},
 };
 
@@ -57,6 +57,10 @@ impl Defect {
         }
     }
 }
+
+/// Why no rule bounds the Control lane slots that background work uses.
+const NO_LANE_RULE: &str = "no plan, contract or register says that background work uses at most \
+    one Control lane slot, and no probe reports lane slots";
 
 /// A completed run's named assertion verdicts. Omit families that did not execute.
 pub(crate) struct RunResult {
@@ -581,6 +585,8 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             defect_reports.push(tested.report);
         }
     }
+    let judged = |row: &&ObservedSeed| row.assertions.get(STAGE_JUDGED) == Some(&true);
+    let unjudged = report.seeds.len() - observed.values().filter(judged).count();
     let metrics = observed.values().flat_map(|row| &row.measurements);
     let total_cpu_s = metrics
         .clone()
@@ -646,6 +652,8 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         RecordInput {
             workload,
             smoke: setup.workloads.is_smoke(),
+            overlay: setup.workloads.overlay(),
+            unjudged,
             scenarios: scenario_assertions,
             exercised,
             assertions,
@@ -759,6 +767,9 @@ fn test_defect(base: &SweepConfig, defect: Defect) -> Result<DefectTest, Box<dyn
 struct RecordInput {
     workload: String,
     smoke: bool,
+    overlay: bool,
+    /// Seeds whose overlay stage was not judged.
+    unjudged: usize,
     /// Scenario tags that executed, and whether every seed that executed one passed.
     scenarios: BTreeMap<&'static str, bool>,
     /// Probe-driven rules, with how often they ran in the whole range.
@@ -836,6 +847,15 @@ fn write_record(
         record.not_run(&rule, &why);
     }
     record.not_run("ConsistentCommittedData", "no probe reports it");
+    if input.overlay {
+        record.not_run("background Control lane slots", NO_LANE_RULE);
+        if input.unjudged > 0 {
+            record.not_run(
+                "ResourceBaseline/overlay",
+                &format!("not judged in {} of {} seeds", input.unjudged, report.count),
+            );
+        }
+    }
     if input.smoke {
         for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {
             record.not_run(scenario, &format!("runs in the {workload} workload"));

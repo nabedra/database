@@ -48,6 +48,24 @@ and excludes the injected deletion from the client history. For the seeded stale
 records a previously observed row in place of the latest HTTP response. Both controls are
 part of the development-only harness.
 
+## Resources overlay
+
+`NABEDRA_SIM_WORKLOAD=resources` runs `direct`, `cold` and `move` with the phase 11 `resources`
+overlay, and `direct,resources` runs it on `direct` alone. Without `resources` in the list the
+overlay draws nothing and changes nothing. With it, the run lowers some limits, cuts client
+requests at a drawn poll, fills the admission limits, stalls and drains processes during work, and
+ends with a quiet stage that must leave every resource ledger where it was.
+
+```sh
+NABEDRA_SIM_WORKLOAD=direct,resources NABEDRA_SEED=1 NABEDRA_SEEDS=1 NABEDRA_SIM_VERIFY_REPLAY=1 \
+  cargo run --locked --release -p nabedra-sim-oltp --bin nabedra-sim -- run
+```
+
+Every run installs the probes, so their rules run too. `ExactlyOnceRelease` and
+`ReleaseAfterWork` follow every native lease and Raft log write by name. A request that a client cuts still runs on the servers,
+as the product intends. Only a deadline or a stop cancels work there, so the seeds with a short
+deadline and many stalls are the ones that abandon native work.
+
 ## Evidence scope
 
 The sweep report stores seed and configuration hashes, trace hashes, replay counts, virtual

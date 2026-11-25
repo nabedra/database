@@ -20,6 +20,7 @@ use super::{
     clauses::{self, Answer},
     clients::{self, Ctx, Plan},
     cold, corrupt, moves, old_peer, paused,
+    resources::{Overlay, not_judged},
 };
 use crate::{
     bootstrap::{CLIENTS, GATEWAYS, WORKERS},
@@ -45,6 +46,8 @@ pub(crate) struct Report {
     pub scenarios: Scenarios,
     pub assertions: Vec<(&'static str, bool)>,
     pub summary: Value,
+    /// The rules of the `resources` overlay's stage were evaluated.
+    pub stage_judged: bool,
 }
 
 /// Run `workload` against a started cluster.
@@ -57,11 +60,19 @@ pub(crate) async fn run(
     workload: Workload,
     selection: &Selection,
     quiet: bool,
+    overlay: bool,
 ) -> Result<Report, String> {
     cluster.wait_direct().await?;
-    let table = create_table(cluster, &history).await?;
+    let table = create_table(cluster, &history, "sim_direct").await?;
     let table_id = Uuid::parse_str(&table).map_err(|error| format!("table UUID: {error}"))?;
     cluster.watch_table(table_id);
+    // Before the resource baseline, as the workload's own table is.
+    let overlay = if overlay {
+        let table = create_table(cluster, &history, "sim_resources").await?;
+        Some((Overlay::draw(seed, CHAOS, config.deadline()), table))
+    } else {
+        None
+    };
     for (node, stats) in crate::workload::steady(cluster).await? {
         cluster
             .checks
@@ -95,6 +106,10 @@ pub(crate) async fn run(
         plan.programs.len(),
         plan.keys,
     ));
+    let mut overlay = overlay.map(|(mut overlay, table)| {
+        overlay.arm(cluster, &ctx, table);
+        overlay
+    });
     let tasks: Vec<_> = plan
         .programs
         .into_iter()
@@ -105,6 +120,9 @@ pub(crate) async fn run(
     while cluster.world.elapsed() < end {
         if let Some(chaos) = chaos.as_mut() {
             chaos.tick(cluster, &ctx, g).await;
+        }
+        if let Some(overlay) = overlay.as_mut() {
+            overlay.tick(cluster, &ctx, chaos.as_mut()).await;
         }
         time::sleep(TICK).await;
     }
@@ -120,6 +138,10 @@ pub(crate) async fn run(
             "LeaderUnknown",
             "no election of the table's range was seen on the wire",
         );
+    }
+
+    if let Some(overlay) = overlay.as_mut() {
+        overlay.stop(cluster).await;
     }
 
     let mut report = Report::default();
@@ -367,6 +389,20 @@ pub(crate) async fn run(
         }
     }
 
+    if let Some(overlay) = overlay.as_mut() {
+        if converged.is_ok() && final_checks.is_ok() && cluster.converged().await {
+            report
+                .scenarios
+                .extend(overlay.stage(cluster, config.deadline()).await);
+        } else {
+            not_judged(
+                &cluster.checks,
+                &cluster.world,
+                "the cluster did not converge",
+            );
+        }
+    }
+
     let no_quorum = cluster.no_quorum();
     let elections = cluster.elections();
     let outcome = clauses::Evidence {
@@ -436,6 +472,10 @@ pub(crate) async fn run(
     );
     report.summary["one_paused_late"] = json!(outcome.one_paused_late);
     report.summary["move_wait_ms"] = json!(move_wait_ms);
+    if let Some(overlay) = &overlay {
+        report.stage_judged = overlay.judged;
+        report.summary["resources"] = overlay.summary(&cluster.checks, &cluster.world);
+    }
     cluster.record(format!("workload summary {}", report.summary));
     Ok(report)
 }
@@ -561,12 +601,16 @@ async fn abandon(
 }
 
 /// Create the workload's table through the first gateway, retrying the same ID.
-async fn create_table(cluster: &Cluster, history: &Arc<Mutex<History>>) -> Result<String, String> {
+async fn create_table(
+    cluster: &Cluster,
+    history: &Arc<Mutex<History>>,
+    name: &str,
+) -> Result<String, String> {
     let node = CLIENTS[0];
     let gateway = GATEWAYS[0];
     let id = in_node(node, async { uuid_v4() }).await;
     let payload = json!({
-        "name": "sim_direct", "schema": {"id": "int64", "value": "int64"},
+        "name": name, "schema": {"id": "int64", "value": "int64"},
         "key": "id", "format": "parquet",
     });
     let mut client = history.lock().unwrap().client();

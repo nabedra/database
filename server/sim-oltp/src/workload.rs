@@ -31,6 +31,8 @@ use crate::{
 };
 
 const OPERATIONS: &str = "/v1/operations";
+/// The assertion that the `resources` overlay's stage was judged.
+pub(crate) const STAGE_JUDGED: &str = "resources stage judged";
 const SETUP_DEADLINE: Duration = Duration::from_secs(20);
 const SETTLE_LIMIT: Duration = Duration::from_secs(2);
 
@@ -57,6 +59,10 @@ fn run(
     }
     if setup.selection.focus.batch {
         config.force("data.direct.batch", json!(true));
+    }
+    if setup.workloads.overlay() {
+        let d05 = workloads::paused::samples(seed, workload) || setup.selection.focus.d05;
+        workloads::resources::limits(seed, &mut config, !d05);
     }
     let program = (workload == Workload::Smoke).then(|| Program::generate(generator));
     let (mut result, world, panics) = nabedra_sim::runtime::run(seed, |world| async move {
@@ -239,8 +245,18 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
                             workload,
                             &setup.selection,
                             setup.quiet,
+                            setup.workloads.overlay(),
                         )
                         .await;
+                        if setup.workloads.overlay() {
+                            let judged = report.as_ref().is_ok_and(|report| report.stage_judged);
+                            assertions.insert(STAGE_JUDGED, judged);
+                            if !judged && !has_violation(&checks, workloads::resources::NOT_JUDGED)
+                            {
+                                let why = "the run ended before it";
+                                workloads::resources::not_judged(&checks, &world, why);
+                            }
+                        }
                         match report {
                             Ok(report) => {
                                 for (name, passed) in report.assertions {

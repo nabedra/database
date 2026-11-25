@@ -29,6 +29,7 @@ use crate::{
     workloads::{
         clauses::{Answer, Effect, Fault},
         clients::{self, Ctx},
+        resources::{disturbs, drain_failed},
     },
 };
 
@@ -235,11 +236,7 @@ impl Chaos {
             } = self.drains.remove(&node).expect("pending drain");
             self.cut(cluster, node, DiskCut::Kill).await;
             if let Err(error) = &drained {
-                cluster.checks.violate(
-                    &cluster.world,
-                    "ProcessExit",
-                    format!("drain of n{node}: {error}"),
-                );
+                drain_failed(cluster, node, error);
             }
             self.note(
                 cluster,
@@ -384,7 +381,9 @@ impl Chaos {
     /// Nothing else is open, a pending split included, and the cluster reports itself
     /// converged.
     async fn quiet(&self, cluster: &Cluster) -> bool {
-        self.log.iter().all(|fault| fault.to.is_some())
+        // The `resources` overlay cuts, loads and stalls for the whole window.
+        !disturbs(&cluster.world)
+            && self.log.iter().all(|fault| fault.to.is_some())
             && !self.faults.open()
             && cluster.converged().await
     }
@@ -480,6 +479,39 @@ impl Chaos {
             .filter(|node| cluster.is_running(*node) && !cluster.frozen().contains(node))
             .collect();
         (!candidates.is_empty()).then(|| *g.pick(&candidates))
+    }
+
+    /// Stop a worker gracefully, and restart it a while after it stopped.
+    pub(crate) async fn drain_worker(
+        &mut self,
+        cluster: &mut Cluster,
+        ctx: &Ctx,
+        node: u64,
+        restart_after: Duration,
+    ) -> FaultId {
+        let id = self.hit(cluster, Action::DrainLeader, &[node]);
+        if let Err(error) = cluster.start_drain(node).await {
+            drain_failed(cluster, node, &error);
+        }
+        let deadline = elapsed_ms(&cluster.world) + RECOVERY_LIMIT.as_millis() as u64;
+        let drain = Drain {
+            id,
+            deadline,
+            restart_after,
+        };
+        self.drains.insert(node, drain);
+        self.note(
+            cluster,
+            ctx,
+            "drain-leader",
+            json!({"worker": node, "elected": cluster.elected(), "restart_after_ms": restart_after.as_millis() as u64}),
+        );
+        id
+    }
+
+    /// Whether nothing the nemesis did keeps a worker from being stopped.
+    pub(crate) fn may_stop(&self) -> bool {
+        self.disks.is_empty() && self.drains.is_empty()
     }
 
     async fn act(&mut self, cluster: &mut Cluster, ctx: &Ctx, g: &mut Gen, action: Action) {
@@ -755,29 +787,10 @@ impl Chaos {
                 let Some(leader) = self.leader_or_any(cluster, g) else {
                     return self.skip(cluster, action, "no running worker");
                 };
-                let id = self.hit(cluster, action, &[leader]);
-                self.log[id].leader = Some(cluster.elected() == Some(leader));
+                let elected = cluster.elected() == Some(leader);
                 let restart_after = window(g, 300, 3_000);
-                if let Err(error) = cluster.start_drain(leader).await {
-                    cluster.checks.violate(
-                        &cluster.world,
-                        "ProcessExit",
-                        format!("drain of n{leader}: {error}"),
-                    );
-                }
-                let deadline = elapsed_ms(&cluster.world) + RECOVERY_LIMIT.as_millis() as u64;
-                let drain = Drain {
-                    id,
-                    deadline,
-                    restart_after,
-                };
-                self.drains.insert(leader, drain);
-                self.note(
-                    cluster,
-                    ctx,
-                    "drain-leader",
-                    json!({"worker": leader, "elected": cluster.elected(), "restart_after_ms": restart_after.as_millis() as u64}),
-                );
+                let id = self.drain_worker(cluster, ctx, leader, restart_after).await;
+                self.log[id].leader = Some(elected);
             }
             Action::LaneExhaust => {
                 let gateway = g.below(2) as usize;

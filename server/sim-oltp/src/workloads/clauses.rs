@@ -49,6 +49,16 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
         ],
     ),
     ("O29", &["O29:ambiguous-write"]),
+    (
+        "F03",
+        &[
+            "F03:reservation",
+            "F03:dispatch",
+            "F03:receipt",
+            "F03:reduction",
+            "F03:cleanup",
+        ],
+    ),
 ];
 
 /// Why a clause cannot run yet, for the sweep record.
@@ -59,6 +69,11 @@ pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
         "O26:pinned-snapshot" => "a pinned query needs the queued path's barriers (phase 11)",
         "O26:split-across-pools" => "no phase 10 schedule splits a range across pools",
         "O26:failed-mount" => "no phase 10 schedule loses a mount",
+        "F03:reservation" | "F03:dispatch" => {
+            "only the resources overlay cuts such a request, and no seed of this range did"
+        }
+        "F03:receipt" | "F03:cleanup" => "no probe says that a caller was cancelled there",
+        "F03:reduction" => "the resources overlay sends direct-path requests only",
         "O26:worker-4" => "the data worker process binds a real TCP listener",
         _ => return None,
     })

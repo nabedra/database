@@ -29,6 +29,7 @@ use crate::{
     invariants::{Invariants, RECOVERY_LIMIT, TraceObserver, elapsed_ms},
     net::SimNet,
     operator::Operator,
+    workloads::freezes::{self, Freezes},
 };
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -326,9 +327,17 @@ impl Cluster {
     pub fn no_quorum(&self) -> Vec<(u64, u64)> {
         let mut edges: Vec<(u64, i32)> = Vec::new();
         for node in WORKERS {
-            for (from, to) in self.outages.get(&node).into_iter().flatten() {
-                edges.push((*from, 1));
-                edges.push((to.unwrap_or(u64::MAX), -1));
+            let outages = self.outages.get(&node).into_iter().flatten();
+            let mut all: Vec<_> = outages
+                .map(|(from, to)| (*from, to.unwrap_or(u64::MAX)))
+                .collect();
+            let stalls = self
+                .world
+                .with_ext::<Freezes, _>(|stalls| stalls.spans(node));
+            all.extend(stalls.unwrap_or_default());
+            for (from, to) in merged(all) {
+                edges.push((from, 1));
+                edges.push((to, -1));
             }
         }
         overlaps(edges)
@@ -798,6 +807,7 @@ impl Cluster {
     pub fn freeze(&mut self, node: u64) {
         self.record(format!("freeze n{node}"));
         self.frozen.insert(node);
+        freezes::nemesis(&self.world, node, true);
         self.outage(node);
         self.net.update_plan(|plan| plan.pause(node));
         self.world.freeze(node);
@@ -806,6 +816,7 @@ impl Cluster {
     /// A killed process is no longer frozen: its next process must reach the network.
     fn unpause(&mut self, node: u64) {
         if self.frozen.remove(&node) {
+            freezes::nemesis(&self.world, node, false);
             self.net.update_plan(|plan| plan.resume(node));
         }
     }
@@ -814,6 +825,7 @@ impl Cluster {
         if !self.frozen.remove(&node) {
             return;
         }
+        freezes::nemesis(&self.world, node, false);
         self.record(format!("thaw n{node}"));
         self.outage_ended(node);
         self.world.thaw(node);
@@ -863,6 +875,19 @@ async fn supervisor_receive(channel: &mut DuplexStream, phase: &str) -> Result<(
     Ok(())
 }
 
+/// One node's outages, with those that overlap as one: a node is out once.
+fn merged(mut outages: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    outages.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (from, to) in outages {
+        match merged.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => merged.push((from, to)),
+        }
+    }
+    merged
+}
+
 /// Intervals in which at least two of the outages that `edges` open and close overlap.
 fn overlaps(mut edges: Vec<(u64, i32)>) -> Vec<(u64, u64)> {
     edges.sort_unstable();
@@ -892,7 +917,7 @@ mod tests {
 
     use nabedra_rt::sim::World;
 
-    use super::{Cluster, overlaps};
+    use super::{Cluster, merged, overlaps};
     use crate::{
         config::Config, disk::DiskCut, invariants::Invariants, net::Action, workload::live_after,
     };
@@ -960,6 +985,13 @@ mod tests {
             cluster.crash(2, DiskCut::Kill).await;
             assert!(!cluster.net().update_plan(|plan| plan.is_paused(2)));
         });
+    }
+
+    #[test]
+    fn a_stall_in_an_outage_is_one_node_out() {
+        assert_eq!(merged(vec![(3, 6), (1, 9)]), [(1, 9)]);
+        assert_eq!(merged(vec![(1, 4), (3, 8), (9, 10)]), [(1, 8), (9, 10)]);
+        assert_eq!(merged(vec![(5, u64::MAX), (7, 8)]), [(5, u64::MAX)]);
     }
 
     #[test]
