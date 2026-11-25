@@ -1,0 +1,464 @@
+//! Adversarial tests of task B, written by someone who did not write it. They attack the author's
+//! declared deviations, resource bounds, filters, exactness and the rules of checkpoints.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use nabedra_check::Gen;
+
+use super::super::codec::{dot, exact, goodness};
+use super::*;
+
+// ----- Resource bounds.
+
+/// Maintenance until every partition is ready, in at most `rounds` rounds.
+fn settles<C: Codec>(ix: &mut Index<C>, rounds: usize) -> bool {
+    for _ in 0..rounds {
+        ix.run();
+        if !ix.maintain(64) && ix.shared.dir.values().all(|m| m.state == State::Ready) {
+            return true;
+        }
+    }
+    false
+}
+
+/// VEC-G05 and the resource bound "one partition that cannot split": rows of one single direction
+/// cannot be told apart, and a split must still end with partitions that are no larger than
+/// `part_max`, in a bounded number of rounds and partitions.
+fn identical(n: u64, distinct: u64, lengths: bool) {
+    let mut ix = serving(Config::new(schema(4, &[], None), 2), ExactCodec, None);
+    let write = |k: u64| {
+        let len = if lengths { 1.0 + (k % 3) as f32 } else { 1.0 };
+        let v = if k < distinct {
+            [(k + 1) as f32, 1.0, -(k as f32), 0.5]
+        } else {
+            [len, 2.0 * len, 3.0 * len, 4.0 * len]
+        };
+        (k, Some(row(&v, Vec::new(), k)))
+    };
+    feed(&mut ix, RANGE, &page(0, (0..n).map(write).collect()));
+    let ended = settles(&mut ix, 3000);
+    let parts = ix.shared.dir.len();
+    let ids = ix.shared.next_part;
+    let biggest = ix.shared.dir.values().map(|m| m.entries).max().unwrap_or(0);
+    println!("{n} rows, {distinct} distinct: ended {ended}, {parts} partitions, {ids} ids, biggest {biggest}");
+    assert!(ended, "maintenance does not end after 3000 rounds ({ids} partition ids used)");
+    assert!(biggest <= 512, "a partition of {biggest} rows is left");
+    assert!(ids < 200, "{ids} partitions were made for {n} rows");
+    let pin = latest(&mut ix, None);
+    let hits = ix.search(&pin, &query(Op::Dot, &[1.0, 0.0, 0.0, 0.0], 1000)).unwrap();
+    assert_eq!(hits.len(), 1000);
+}
+
+#[test]
+fn adv07_identical_vectors_split_into_bounded_partitions() {
+    identical(3000, 0, false);
+}
+
+#[test]
+fn adv07_vectors_of_one_direction_and_other_lengths_split_into_bounded_partitions() {
+    identical(3000, 0, true);
+}
+
+#[test]
+fn adv07_a_crowd_of_duplicates_among_other_rows_ends() {
+    identical(1500, 100, false);
+}
+
+fn rss_mb() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let line = status.lines().find(|l| l.starts_with("VmRSS:")).unwrap_or("VmRSS: 0 kB");
+    line.split_whitespace().nth(1).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0) / 1024
+}
+
+fn tenants(n: u64) -> (Index, std::time::Duration) {
+    let cfg = Config::new(schema(2, &[ColumnType::Int], Some(0)), 4);
+    let mut ix = serving(cfg, ExactCodec, None);
+    let start = std::time::Instant::now();
+    let mut at = 0;
+    while at < n {
+        let to = (at + 20_000).min(n);
+        let changes = (at..to)
+            .map(|k| (k, Some(row(&[1.0, k as f32], vec![Value::Int(k as i64)], k))))
+            .collect();
+        feed(&mut ix, RANGE, &page(at, changes));
+        at = to;
+    }
+    (ix, start.elapsed())
+}
+
+/// A tenant with one row, and many tenants with one row each, take bounded time and memory, and a
+/// query of one tenant does not look at the others.
+#[test]
+fn adv07_many_tenants_with_one_row_each() {
+    let n: u64 = std::env::var("ADV_TENANTS").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+    let before = rss_mb();
+    let (mut ix, took) = tenants(n);
+    let after = rss_mb();
+    println!("{n} tenants: feed {took:?}, memory {} MB, {} partitions", after - before.min(after), ix.shared.dir.len());
+    let start = std::time::Instant::now();
+    let filter = Filter::Eq(0, Value::Int(n as i64 / 2));
+    let pin = latest(&mut ix, Some(&filter));
+    let pinned = start.elapsed();
+    let q = Query { filter: Some(filter), ..query(Op::L2, &[1.0, 0.0], 10) };
+    let hits = ix.search(&pin, &q).unwrap();
+    println!("one tenant: pin {pinned:?}, query {:?}", start.elapsed());
+    assert_eq!(hits.len(), 1);
+    let start = std::time::Instant::now();
+    let _ = latest(&mut ix, None);
+    println!("pin without a tenant: {:?}", start.elapsed());
+    let start = std::time::Instant::now();
+    for _ in 0..10 {
+        ix.maintain(64);
+    }
+    println!("10 maintenance calls: {:?}", start.elapsed());
+    assert!(after - before.min(after) < 40 * n / 1000, "memory per tenant is too large");
+}
+
+/// Each query of one tenant costs no more than a few partitions, whatever the number of tenants.
+#[test]
+fn adv07_a_pin_of_one_tenant_does_not_depend_on_their_number() {
+    let cost = |n: u64| {
+        let (mut ix, _) = tenants(n);
+        let filter = Filter::Eq(0, Value::Int(3));
+        let start = std::time::Instant::now();
+        for _ in 0..200 {
+            let pin = latest(&mut ix, Some(&filter));
+            drop(pin);
+        }
+        start.elapsed()
+    };
+    let (small, large) = (cost(2_000), cost(40_000));
+    println!("small {small:?}, large {large:?}");
+    assert!(large < small * 20, "a pin costs {large:?} against {small:?}: it grows with the tenants");
+}
+
+// ----- Approximate search under filters.
+
+/// Estimates that are as wrong as their bound allows.
+#[derive(Clone, Copy)]
+struct Rough;
+
+fn noise(x: &[f32]) -> f32 {
+    let bits = x.iter().fold(7u32, |h, v| (h ^ v.to_bits()).wrapping_mul(0x9e37_79b1));
+    (bits >> 16) as f32 / 32_768.0 - 1.0
+}
+
+impl Codec for Rough {
+    type Block = Vec<Vec<f32>>;
+    type Query = Vec<f32>;
+    fn rotate(&self, dir: &[f32]) -> Vec<f32> {
+        dir.to_vec()
+    }
+    fn block(&self) -> Self::Block {
+        Vec::new()
+    }
+    fn push(&self, block: &mut Self::Block, dir: &[f32], _: &[f32], _: f32) {
+        block.push(dir.to_vec());
+    }
+    fn swap_remove(&self, block: &mut Self::Block, i: usize) {
+        block.swap_remove(i);
+    }
+    fn query(&self, dir: &[f32], _: &[f32]) -> Self::Query {
+        dir.to_vec()
+    }
+    fn scan(&self, q: &Self::Query, block: &Self::Block, out: &mut Vec<Estimate>) {
+        out.extend(block.iter().map(|d| Estimate { cos: dot(q, d) + 0.2 * noise(d), err: 0.2001 }));
+    }
+    fn refine(&self, q: &Self::Query, block: &Self::Block, i: usize) -> Estimate {
+        Estimate { cos: dot(q, &block[i]) - 0.03 * noise(&block[i]), err: 0.0301 }
+    }
+}
+
+
+/// Rows 0..n. Row `k` matches the first `m` rows' predicates when `k < m`. The matching rows lie
+/// away from the query, so that every near row is a trap.
+fn trap_rows(n: u64, m: u64, _g: &mut Gen) -> Vec<(u64, Row)> {
+    (0..n)
+        .map(|k| {
+            let hit = k < m;
+            // Every direction is its own: identical rows are attacked by another test.
+            let a = if hit { 3.0 + k as f32 * 0.0007 } else { k as f32 * 0.0002 };
+            let len = if k % 5 == 0 { 3.0 } else { 1.0 };
+            let tags: Vec<Arc<str>> = if hit { vec![Arc::from("a")] } else if k % 7 == 0 { Vec::new() } else { vec![Arc::from("b"), Arc::from("c")] };
+            let cols = vec![
+                Value::Int(if hit { 1 } else { 0 }),
+                Value::Tags(tags.into()),
+                Value::Bool(hit),
+                Value::Text(Arc::from(if hit { "hit" } else { "miss" })),
+            ];
+            (k, row(&[a.cos() * len, a.sin() * len], cols, k))
+        })
+        .collect()
+}
+
+const COLS: [ColumnType; 4] = [ColumnType::Int, ColumnType::Tags, ColumnType::Bool, ColumnType::Text];
+
+fn filters() -> Vec<(&'static str, Filter)> {
+    let a: Arc<str> = Arc::from("a");
+    let hit = || Filter::Eq(0, Value::Int(1));
+    vec![
+        ("eq", hit()),
+        ("bool", Filter::Eq(2, Value::Bool(true))),
+        ("contains", Filter::Contains(1, a.clone())),
+        ("contains_any", Filter::ContainsAny(1, vec![a.clone(), Arc::from("zzz")])),
+        ("starts_with", Filter::StartsWith(3, Arc::from("hi"))),
+        ("range", Filter::Range(0, std::ops::Bound::Included(Value::Int(1)), std::ops::Bound::Unbounded)),
+        ("not", Filter::Not(Box::new(Filter::Eq(0, Value::Int(0))))),
+        ("and", Filter::And(vec![hit(), Filter::Contains(1, a.clone())])),
+        ("or", Filter::Or(vec![hit(), Filter::Eq(0, Value::Int(99))])),
+        ("not and", Filter::Not(Box::new(Filter::Or(vec![Filter::Eq(0, Value::Int(0)), Filter::Eq(2, Value::Bool(false))])))),
+    ]
+}
+
+/// VEC-G05: if at least `limit` rows match, `limit` rows return, and each matches. For every number
+/// of matches around the limit, every kind of predicate, every operation and every recall.
+#[test]
+fn adv07_approximate_search_returns_limit_rows_for_every_predicate() {
+    let limit = 10usize;
+    let n = 1500u64;
+    let mut streamed = 0;
+    for summary_pairs in [1 << 22, 3] {
+        for m in [0, 1, limit as u64 - 1, limit as u64, limit as u64 + 1, 100, n] {
+            let g = &mut Gen::from_seed(m + 1);
+            let cfg = Config {
+                flat: 50,
+                part_min: 4,
+                part_max: 16,
+                summary_pairs,
+                ..Config::new(schema(2, &COLS, None), 3)
+            };
+            let mut ix = serving(cfg, Rough, None);
+            let rows = trap_rows(n, m, g);
+            let changes = rows.iter().map(|(k, r)| (*k, Some(r.clone()))).collect();
+            feed(&mut ix, RANGE, &page(0, changes));
+            settle(&mut ix);
+            for (name, f) in filters() {
+                let matching: Vec<u64> = rows.iter().filter(|(_, r)| f.matches(&r.cols)).map(|(k, _)| *k).collect();
+                let pin = latest(&mut ix, Some(&f));
+                for op in [Op::Cosine, Op::Dot, Op::L2] {
+                    for recall in [0.0, 0.5, 0.95, 1.0] {
+                        let q = Query { filter: Some(f.clone()), exact: false, recall, ..query(op, &[1.0, 0.1], limit) };
+                        let mut scan = ix.scan(&pin, &q, Box::new(RecallEstimate)).unwrap();
+                        while ix.visit(&mut scan).unwrap() {}
+                        streamed += usize::from(scan.visited > 0);
+                        let hits = ix.finish(scan).unwrap();
+                        let want = matching.len().min(limit);
+                        assert_eq!(hits.len(), want, "{name} m={m} {op:?} recall {recall} pairs {summary_pairs}: {} match", matching.len());
+                        for h in &hits {
+                            let k = u64::from_be_bytes((&*h.key).try_into().unwrap());
+                            assert!(matching.contains(&k), "{name}: {k} does not match");
+                            let r = &rows[k as usize].1;
+                            assert_eq!(Some(h.score), exact(op, r.vec.as_deref().unwrap(), &q.vec), "{name}: score of {k}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("{streamed} of the searches used the stream");
+    assert!(streamed > 100, "the stream was hardly used: {streamed}");
+}
+
+// ----- Exactness.
+
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+    let s = a + b;
+    let v = s - a;
+    (s, (a - (s - v)) + (b - v))
+}
+
+/// Sum of products in about 106 bits.
+fn dd_dot(a: &[f32], b: &[f32]) -> f64 {
+    let (mut hi, mut lo) = (0.0f64, 0.0f64);
+    for (&x, &y) in a.iter().zip(b) {
+        let (x, y) = (f64::from(x), f64::from(y));
+        let p = x * y;
+        let e = x.mul_add(y, -p);
+        let (s, t) = two_sum(hi, p);
+        hi = s;
+        lo += t + e;
+    }
+    hi + lo
+}
+
+/// A reference of the three operations that does not share code with the index.
+fn reference(op: Op, a: &[f32], b: &[f32]) -> Option<f64> {
+    match op {
+        Op::Dot => Some(dd_dot(a, b)),
+        Op::L2 => {
+            let d: Vec<f32> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+            // x - y in f32 may round, so take the difference in f64 pieces.
+            let (hi, lo): (Vec<f64>, Vec<f64>) = a
+                .iter()
+                .zip(b)
+                .map(|(&x, &y)| {
+                    let (s, e) = two_sum(f64::from(x), -f64::from(y));
+                    (s, e)
+                })
+                .unzip();
+            let _ = d;
+            let mut sum = 0.0;
+            let mut comp = 0.0;
+            for (h, l) in hi.iter().zip(&lo) {
+                let sq = h * h;
+                let e = h.mul_add(*h, -sq);
+                let (s, t) = two_sum(sum, sq);
+                sum = s;
+                comp += t + e + 2.0 * h * l;
+            }
+            Some((sum + comp).max(0.0).sqrt())
+        }
+        Op::Cosine => {
+            let (na, nb) = (dd_dot(a, a).sqrt(), dd_dot(b, b).sqrt());
+            if na == 0.0 || nb == 0.0 {
+                return None;
+            }
+            Some((dd_dot(a, b) / na / nb).clamp(-1.0, 1.0))
+        }
+    }
+}
+
+fn to_f32(x: f64) -> f32 {
+    (x as f32).clamp(f32::MIN, f32::MAX) + 0.0
+}
+
+fn ulps(a: f32, b: f32) -> i64 {
+    let key = |x: f32| {
+        let i = i64::from(x.to_bits() as i32);
+        if i < 0 { i64::from(i32::MIN) - i } else { i }
+    };
+    (key(a) - key(b)).abs()
+}
+
+fn nasty(g: &mut Gen, dim: usize) -> Vec<f32> {
+    let scale = *g.pick(&[1.0f32, 1.0, 0.5, 1e-3, 3e3, 1e19, 1e-20, 1e38, 3.0e38, 1e-39, 1e-44, 0.0]);
+    let kind = g.below(8);
+    (0..dim)
+        .map(|i| match kind {
+            0 => 0.0,
+            1 => scale,
+            2 if i % 2 == 0 => scale,
+            2 => -scale,
+            3 => f32::MIN_POSITIVE * g.below(5) as f32,
+            _ => g.range_i64(-8, 8) as f32 / 8.0 * scale,
+        })
+        .collect()
+}
+
+/// VEC-G05: an exact query equals an independent brute force, also for lengths that differ widely,
+/// zero, subnormal and huge vectors, ties and duplicates. Scores may differ by one rounding.
+#[test]
+fn adv05_exact_search_equals_an_independent_brute_force() {
+    let dim = 4;
+    let mut worst = 0;
+    for seed in 0..300 {
+        let g = &mut Gen::from_seed(seed);
+        let mut ix = serving(Config { part_min: 2, part_max: 8, ..Config::new(schema(dim, &[], None), 2) }, ExactCodec, None);
+        let n = 5 + g.below(60);
+        let mut vecs: Vec<Vec<f32>> = (0..n).map(|_| nasty(g, dim)).collect();
+        // Duplicates of one vector, which tie in every operation.
+        let twin = vecs[0].clone();
+        for _ in 0..g.below(4) {
+            vecs.push(twin.clone());
+        }
+        let changes = vecs.iter().enumerate().map(|(k, v)| (k as u64, Some(row(v, Vec::new(), k as u64)))).collect();
+        feed(&mut ix, RANGE, &page(0, changes));
+        for _ in 0..g.below(30) {
+            ix.maintain(3);
+            ix.run();
+        }
+        let pin = latest(&mut ix, None);
+        for op in [Op::Cosine, Op::Dot, Op::L2] {
+            let qv = if g.bool() { nasty(g, dim) } else { twin.clone() };
+            if op == Op::Cosine && qv.iter().all(|x| *x == 0.0) {
+                continue;
+            }
+            let limit = 1 + g.below(12) as usize;
+            let hits = ix.search(&pin, &query(op, &qv, limit)).unwrap();
+            let mut want: Vec<(f32, u64)> = vecs
+                .iter()
+                .enumerate()
+                .filter_map(|(k, v)| Some((to_f32(reference(op, v, &qv)?), k as u64)))
+                .collect();
+            let good = |s: f32| goodness(op, s);
+            want.sort_by(|a, b| good(b.0).total_cmp(&good(a.0)).then(a.1.cmp(&b.1)));
+            want.truncate(limit);
+            assert_eq!(hits.len(), want.len(), "seed {seed} {op:?}");
+            for (h, w) in hits.iter().zip(&want) {
+                let k = u64::from_be_bytes((&*h.key).try_into().unwrap());
+                let u = ulps(h.score, w.0);
+                worst = worst.max(u);
+                // The same score, or a row that ties with it within a rounding.
+                let mine = to_f32(reference(op, &vecs[k as usize], &qv).unwrap());
+                assert!(ulps(mine, h.score) <= 2, "seed {seed} {op:?}: score {} of row {k} is {mine}; {:?}", h.score, vecs[k as usize]);
+                assert!(u <= 2, "seed {seed} {op:?}: position holds {} want {}", h.score, w.0);
+            }
+            for w in hits.windows(2) {
+                let (a, b) = (goodness(op, w[0].score), goodness(op, w[1].score));
+                assert!(a > b || (a == b && w[0].key < w[1].key), "seed {seed} {op:?}: order or tie rule broken");
+            }
+        }
+    }
+    println!("worst difference: {worst} ulps");
+}
+
+/// Known limit of the chosen accumulation (decision L1): a sum in f64 loses terms that cancel.
+#[test]
+#[ignore = "known precision limit of an f64 accumulation, kept as a record"]
+fn adv05_scores_survive_cancellation() {
+    let mut ix = serving(Config::new(schema(3, &[], None), 1), ExactCodec, None);
+    // Row 1 has the dot product 1 with the query, row 0 has 0. A sum in f64 order loses the 1.
+    let rows = [([1e30f32, 0.0, -1e30], 0u64), ([1e30, 1.0, -1e30], 1)];
+    let changes = rows.iter().map(|(v, k)| (*k, Some(row(v, Vec::new(), *k)))).collect();
+    feed(&mut ix, RANGE, &page(0, changes));
+    let pin = latest(&mut ix, None);
+    let hits = ix.search(&pin, &query(Op::Dot, &[1e30, 1.0, 1e30], 2)).unwrap();
+    let got: Vec<(u64, f32)> = hits.iter().map(|h| (images(std::slice::from_ref(h))[0], h.score)).collect();
+    let want = to_f32(reference(Op::Dot, &rows[1].0, &[1e30, 1.0, 1e30]).unwrap());
+    println!("got {got:?}, reference {want}");
+    assert_eq!(got[0].0, 1, "{got:?}");
+}
+
+// ----- Seeds.
+
+/// Every seed makes another run, and one seed makes the same run twice.
+#[test]
+fn adv08_seeds_differ_and_replay() {
+    let fingerprint = |seed: u64| {
+        let g = &mut Gen::from_seed(seed);
+        (0..64).map(|_| g.u64()).fold(0u64, |h, x| h.rotate_left(5) ^ x)
+    };
+    let mut all: BTreeMap<u64, u64> = BTreeMap::new();
+    for seed in 0..6000 {
+        assert_eq!(fingerprint(seed), fingerprint(seed));
+        *all.entry(fingerprint(seed)).or_default() += 1;
+    }
+    assert_eq!(all.len(), 6000, "two seeds draw the same");
+}
+
+#[test]
+#[ignore = "measurement: no budget is stated; run with --ignored to see the cost per tenant"]
+fn adv07_a_tenant_with_one_row_costs_little_beyond_the_row() {
+    let dim = 1024usize;
+    let n = 4000u64;
+    let cfg = Config::new(schema(dim, &[ColumnType::Int], Some(0)), 4);
+    let mut ix = serving(cfg, ExactCodec, None);
+    let before = rss_mb();
+    let mut at = 0;
+    while at < n {
+        let to = (at + 1000).min(n);
+        let changes = (at..to)
+            .map(|k| {
+                let v: Vec<f32> = (0..dim).map(|i| ((k as usize * 31 + i * 7) % 97) as f32 - 48.0).collect();
+                (k, Some(row(&v, vec![Value::Int(k as i64)], k)))
+            })
+            .collect();
+        feed(&mut ix, RANGE, &page(at, changes));
+        at = to;
+    }
+    let used = rss_mb() - before.min(rss_mb());
+    let raw = n * dim as u64 * 4 / (1 << 20);
+    println!("{n} tenants of {dim} dimensions: {used} MB for {raw} MB of vectors");
+    assert!(used <= raw * 4, "{used} MB for {raw} MB of vectors: more than 4 times");
+}

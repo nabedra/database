@@ -1,3 +1,6 @@
+mod adversary;
+mod adversary_ck;
+mod adversary_multi;
 mod crash;
 mod diff;
 mod model;
