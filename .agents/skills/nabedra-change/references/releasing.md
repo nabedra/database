@@ -81,6 +81,22 @@ Propose a release when one of these holds:
 Changes only to tests, docs, specs or tooling do not need a release. Anything pending on `main`
 that should not ship blocks the release. There are no release branches before 1.0.
 
+## What a change passes before it ships
+
+```text
+design review (TLA+) -> implementation -> code review with the simulator -> release gate
+```
+
+1. New features and revisions of existing ones start with a
+   [design review](../../design-review/SKILL.md) where its rules require one.
+2. [Code review](../../code-review/SKILL.md) checks the code against that design, with
+   [simulation](../../code-review/references/simulation.md) where the module has it.
+3. The release gate reads the evidence from both on the release SHA.
+
+The simulator is unfinished, so a candidate does not wait for it. Its missing cells are red and
+the notes list them. A stable release needs those cells green. Do not add simulation to a module
+just to make a release pass.
+
 ## Steps
 
 ### 1. Propose
