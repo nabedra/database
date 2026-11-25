@@ -814,13 +814,16 @@ fn write_record(
         record.not_run("seeded defects", "the unmodified smoke sweep failed");
     }
     for invariant in PROBE_INVARIANTS {
-        record.not_run(invariant, "P10-PROBES integration pending");
+        record.not_run(invariant, "no sweep installs the probes yet");
     }
     record.not_run(
         "ResourceBaseline ledger and RangeClock pending sets",
-        "P10-PROBES integration pending",
+        "no sweep installs the probes yet",
     );
-    record.not_run("ConsistentCommittedData", "P10-PROBES integration pending");
+    record.not_run(
+        "ConsistentCommittedData",
+        "no sweep installs the probes yet",
+    );
     if input.overlay {
         record.not_run("background Control lane slots", NO_LANE_RULE);
     }

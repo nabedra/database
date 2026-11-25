@@ -9,8 +9,8 @@ def usage(node, now, before, threads=0):
     def shown(size, threads):
         return (f"ResourceUsage {{ working_decode_bytes: {size}, native_threads: {threads}, "
                 "direct_in_flight: 0, disk: {} }")
-    return (f"t=9ms ResourceBaseline: n{node} has {shown(now, threads)} after quiescence, "
-            f"baseline {shown(before, 0)}")
+    return (f"t=9ms ResourceBaseline: n{node} did not stay at its baseline after quiescence: clean in its last 0 "
+            f"of 3 observations, last off by {shown(now, threads)} (baseline {shown(before, 0)})")
 
 
 def diagnosis(kinds, *lines, active_move_at="control/machine.rs:320"):
@@ -107,10 +107,17 @@ class Triage(unittest.TestCase):
             self.assertEqual(self.classify([text % last], known, ("Liveness",)), want, (last, lines))
 
     def test_a_lost_worker_needs_the_refused_fences(self):
-        text = "t=9ms Liveness: survivors never dropped n1: readiness deadline"
+        text = 't=9ms Liveness: n1 did not restart: survivors never dropped n1: readiness deadline for [2, 3]: [(2, "200 {'
         busy = "DIAG t=5 n=2 CONTROL-FAULT Busy oltp-replication/src/authority/control/machine.rs:320"
         known = diagnosis(["Liveness"], *[busy] * 101)
         self.assertEqual(self.classify([text], known, ("Liveness",)), "named")
+        known = diagnosis(["Liveness"], *[busy] * 101)
+        for other in (text.replace('"200 {', '"HTTP n2 deadline'),
+                      text.replace("readiness deadline for [2, 3]: ", "n2 exited during startup"),
+                      text.replace("n1 did not restart: ", "heal: heal cold start after [")):
+            self.assertEqual(self.classify([other], known, ("Liveness",)), "undiagnosed")
+        text2 = text.replace("n1 did not restart: ", 'same-run restart failed after the heal: ["n1: ').replace('"200', '\\"200')
+        self.assertEqual(self.classify([text2], known, ("Liveness",)), "named")
         for known in (diagnosis(["Liveness"], busy), diagnosis(["Liveness"], *[busy] * 101, active_move_at=None),
                       diagnosis(["Liveness"], *[busy.replace("320", "3201")] * 101)):
             self.assertEqual(self.classify([text], known, ("Liveness",)), "undiagnosed")

@@ -7,9 +7,9 @@ scenarios = ["O15", "O29"]
 found_by = "campaign"
 found_date = "2026-11-25"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
-seed = 541
+seed = 376
 why_not_caught = "The sync failure runners stop after the reopen. None cuts power afterwards."
-invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, cold seeds 376, 505, 541 and 577 of 1 to 720: a full stop is followed by a cold start. One worker had returned EIO for a sync, was killed and reopened. After a power loss its pool is refused, synced journal record damaged. The mechanism is not established: the recovery may trust pages that never reached the disk, or the fault model may differ from a real disk."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, cold seeds 223, 376, 505, 541 and 577 of 1 to 720: a full stop is followed by a cold start. One worker had returned EIO for a sync, was killed and reopened. After a power loss its pool is refused, synced journal record damaged. The mechanism is not established: the recovery may trust pages that never reached the disk, or the fault model may differ from a real disk."
 fix_commits = []
 revert_patch_ok = false
 status = "open"

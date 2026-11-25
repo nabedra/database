@@ -43,7 +43,7 @@ use crate::{
             BEYOND_FAULT_MODEL, MONOTONIC_COMMIT, NOT_APPLIED_NEVER_COMMITTED, RESOURCE_BASELINE,
         },
     },
-    sweep::{Defect, RunResult},
+    sweep::{Defect, RunResult, Setup},
     workload::run_seed,
 };
 
@@ -206,7 +206,10 @@ fn replayed(seed: u64) -> RunResult {
         nabedra_sim::runtime::SEEDED,
         "build with RUSTFLAGS=\"--cfg tokio_unstable\" and CARGO_TARGET_DIR=target/sim"
     );
-    let [run, replay] = [(); 2].map(|()| run_seed(seed, &mut workload_gen(seed), Defect::None, &crate::sweep::Setup::smoke()));
+    let [run, replay] = [(); 2].map(|()| {
+        let setup = Setup::smoke();
+        run_seed(seed, &mut workload_gen(seed), Defect::None, &setup)
+    });
     let rules = run
         .run
         .trace_tail
@@ -335,7 +338,7 @@ fn control_digests_replay() {
     for seed in seeds() {
         let [first, second] = [(); 2].map(|()| {
             *CONTROL.lock().unwrap() = Some(Vec::new());
-            run_seed(seed, &mut workload_gen(seed), Defect::None, &crate::sweep::Setup::smoke());
+            run_seed(seed, &mut workload_gen(seed), Defect::None, &Setup::smoke());
             CONTROL.lock().unwrap().take().unwrap()
         });
         assert!(

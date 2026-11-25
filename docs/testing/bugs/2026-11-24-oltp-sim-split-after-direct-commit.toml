@@ -1,5 +1,5 @@
 id = "OLTP-sim-split-after-direct-commit"
-title = "A manual split of a range with direct commits never publishes: the source refuses the freeze with DirectCommitAboveCut"
+title = "A split plan refused at the freeze, with a direct commit above its cut, holds the table against every later plan until the owner changes"
 class = "fence-lifecycle-order"
 module = "oltp"
 guarantees = []
@@ -8,8 +8,8 @@ found_by = "campaign"
 found_date = "2026-11-24"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
 seed = 1
-why_not_caught = "No runner splits a range that has taken direct commits while the direct path stays on."
-invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=direct NABEDRA_SIM_PROFILE=split, seeds 1 and 2: a requested split publishes within 60 s of the heal."
+why_not_caught = "No runner splits a range that has taken direct commits while the direct path stays on, or asks for a second plan after a refused freeze."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=direct NABEDRA_SIM_PROFILE=split, seeds 1 and 2: a requested split publishes within 60 s of the heal, if the operator replaces a refused plan. The source refuses the first plan with DirectCommitAboveCut, and every new ID is then refused with captured schema or lifecycle changed, because the refused plan keeps the exclusive lifecycle guard (traced). An exact retry is refused again, because it keeps its cut. Splits do publish after direct commits: in a mixed sweep of seeds 1 to 720, 48 published with no refusal. Of 90 with a refused freeze 21 published, each after the scheduler owner changed and a retry settled the refused plan, and 69 did not. An earlier form of this record said that such a split never publishes, which was wrong."
 fix_commits = []
 revert_patch_ok = false
 status = "open"

@@ -32,6 +32,10 @@ INFERRED = {"raft-log-batch"}
 SAMPLES = ["e0", "e1", "e2", "e3", "e4", "e5", "e6"]
 FREEZE = "source refused the exact split freeze"
 HELD = "captured schema or lifecycle changed"
+# The survivors answer, and still list the lost worker. A survivor that does not answer, or a cold start
+# that fails afterwards, has another reason.
+NEVER_DROPPED = re.compile(r't=\d+ms Liveness: (?:n\d did not restart: |same-run restart failed after the heal: \["n\d: )'
+                           r'survivors never dropped n\d: readiness deadline for [^(]*\[\(\d, \\?"200 ')
 ACTIVE_MOVE = "Control refuses fences while a replica move is active"
 
 
@@ -89,7 +93,9 @@ class Leases:
 
 def usage(violation):
     """The node and the growth of `working_decode_bytes`, if nothing else grew."""
-    found = re.search(r"n(\d+) has (ResourceUsage .*) after quiescence, baseline (ResourceUsage .*)$", violation)
+    found = (re.search(r"n(\d+) has (ResourceUsage .*) after quiescence, baseline (ResourceUsage .*)$", violation)
+             or re.search(r"n(\d+) did not stay at its baseline .*, last off by (ResourceUsage .*) "
+                          r"\(baseline (ResourceUsage .*)\)$", violation))
     if not found:
         return None
     node, now, before = int(found[1]), found[2], found[3]
@@ -152,7 +158,7 @@ def cause(violation, diagnosis):
                 diagnosis.holders and all(holder in diagnosis.frozen for holder in diagnosis.holders)):
             return None, "another holder than the refused plan, or none, was recorded"
         return f"a direct commit above the cut refused the first plan, which then held the range against {len(last) - 1}", None
-    if name == "Liveness" and "survivors never dropped" in violation:
+    if NEVER_DROPPED.match(violation):
         if diagnosis.busy_active_move > 100:
             return f"{ACTIVE_MOVE} ({diagnosis.busy_active_move} refusals)", None
         return None, "no refused fence was recorded"

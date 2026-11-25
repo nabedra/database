@@ -693,7 +693,9 @@ pub(crate) async fn steady(cluster: &Cluster) -> Result<Vec<(u64, Value)>, Strin
         let mut snapshots = Vec::new();
         for node in WORKERS {
             let stats = cluster.stats(node).await?;
-            steady &= cluster.checks.resources_steady(&cluster.world, node, &stats);
+            steady &= cluster
+                .checks
+                .resources_steady(&cluster.world, node, &stats);
             snapshots.push((node, stats));
         }
         if steady || cluster.world.elapsed() >= deadline {
