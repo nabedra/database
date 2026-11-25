@@ -18,24 +18,30 @@
 //! `oltp-probes-restart-key` check shows that the assertion fails without it and passes
 //! with it.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeSet,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use nabedra_check::history::{Event, EventType};
 use nabedra_oltp_types::{
     sim_probe::{Probe, emit},
-    types::{Digest, GroupKind},
+    types::{AppliedPosition, Digest, GroupKind},
 };
 use nabedra_protocol::protocol::Key;
-use nabedra_rt::sim::{self, NodeClock, World, in_node};
+use nabedra_rt::sim::{self, NodeClock, Wipe, World, in_node};
 use nabedra_sim::{shrink, sweep::workload_gen};
 use serde_json::json;
 use uuid::Uuid;
 
-use super::{ProbeEvent, Probes};
+use super::{HARNESS, LogEntry, ProbeEvent, Probes};
 use crate::{
     invariants::{
         Invariants, RULES_RAN,
-        protocol::{MONOTONIC_COMMIT, NOT_APPLIED_NEVER_COMMITTED, RESOURCE_BASELINE},
+        protocol::{
+            BEYOND_FAULT_MODEL, MONOTONIC_COMMIT, NOT_APPLIED_NEVER_COMMITTED, RESOURCE_BASELINE,
+        },
     },
     sweep::{Defect, RunResult},
     workload::run_seed,
@@ -131,6 +137,60 @@ fn not_applied_answers_never_have_a_committed_dedup_record() {
         assert!(kinds.contains(NOT_APPLIED_NEVER_COMMITTED), "{kinds:?}");
         assert!(!checks.probe_invariants_hold());
     });
+}
+
+/// Wipes `nodes` of a group of three in turn and starts none. Returns the kinds reported, and
+/// whether the probe invariants hold.
+fn wiped(nodes: &'static [u64]) -> (BTreeSet<String>, bool) {
+    sim::run(1, move |world| async move {
+        let (checks, _) = installed(&world);
+        let (group, data) = (Uuid::from_u128(8), Path::new("/sim/data"));
+        let entry = AppliedPosition {
+            term: 1,
+            node_id: 1,
+            index: 1,
+        };
+        for node in 1..=3 {
+            world.add_node(node, NodeClock::default());
+            world.mount(node, data);
+            in_node(node, async {
+                emit(|| Probe::Appended {
+                    group,
+                    kind: GroupKind::Catalog,
+                    replica: node,
+                    entries: vec![LogEntry {
+                        at: entry,
+                        voters: Some(vec![vec![1, 2, 3]]),
+                    }],
+                });
+            })
+            .await;
+        }
+        in_node(1, async {
+            emit(|| Probe::Applied {
+                group,
+                kind: GroupKind::Catalog,
+                replica: 1,
+                entry,
+                digest: Digest::from_bytes([1; 32]),
+            });
+        })
+        .await;
+        for node in nodes {
+            world.crash(*node);
+            world.wipe(*node, data, Wipe::Replace);
+        }
+        let holds = checks.probe_invariants_hold();
+        (shrink::kinds(&checks.violations()), holds)
+    })
+}
+
+#[test]
+fn a_run_beyond_the_fault_model_is_neither_clean_nor_a_detection() {
+    assert_eq!(wiped(&[2]), (BTreeSet::new(), true));
+    // `sim_bugs.py` masks any run that reports the harness kind.
+    let beyond = [BEYOND_FAULT_MODEL, HARNESS].map(str::to_owned);
+    assert_eq!(wiped(&[2, 3]), (beyond.into(), false));
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
