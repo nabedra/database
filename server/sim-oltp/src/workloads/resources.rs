@@ -13,8 +13,8 @@
 //!   window is open, and the lanes drain when it ends, by themselves or all at once;
 //! - drains one worker while such a window is open, and stalls a process in it: the process
 //!   stops right after a drawn clock read, in the middle of a job or a poll, so that deadlines
-//!   pass with a request half done. In half of the seeds every process stops now and then for a
-//!   few seconds;
+//!   pass with a request half done. With a short request deadline, every process may stop now and
+//!   then for a few seconds;
 //! - suspends syncs for a few milliseconds, in half of the seeds.
 //!
 //! The process limits it lowers are the ones the harness samples anyway. After the heal it runs
@@ -301,10 +301,11 @@ impl Overlay {
             let stopped = Duration::from_millis(300 + g.below(2_700));
             (at, *g.pick(&WORKERS), stopped)
         });
-        let freezes = g.bool().then(|| {
+        // Only a short deadline can pass in a stop.
+        let freezes = (g.bool() && deadline <= SHORT).then(|| {
             let from = Duration::from_millis(1_000 + g.below(span / 2));
-            let hold = (deadline + PAST).min(Duration::from_millis(600));
-            (from, from + Duration::from_millis(2_000 + g.below(4_000)), hold)
+            let to = from + Duration::from_millis(2_000 + g.below(4_000));
+            (from, to, deadline + PAST)
         });
         Self {
             seed,
@@ -524,7 +525,9 @@ impl Overlay {
             }
             time::sleep(STEP).await;
         };
-        cluster.record(format!("resources overlay point before the stage, steady {steady}"));
+        cluster.record(format!(
+            "resources overlay point before the stage, steady {steady}"
+        ));
 
         let before = probes.guard_counts();
         let (cut_before, _) = cuts(&cluster.world);
@@ -700,7 +703,8 @@ async fn lane(
                 Request::rows(&ctx.table, first, rows, id)
             }
         };
-        let answer = clients::attempt(&ctx, &mut client, node, GATEWAYS[gateway], &request, true).await;
+        let answer =
+            clients::attempt(&ctx, &mut client, node, GATEWAYS[gateway], &request, true).await;
         {
             let mut load = load.lock().unwrap();
             *match &answer {
@@ -830,7 +834,10 @@ mod tests {
             let chaos = Duration::from_secs(20);
             let [first, second] = [(); 2].map(|()| {
                 let overlay = Overlay::draw(seed, chaos, Duration::from_millis(300));
-                format!("{:?} {:?} {}", overlay.windows, overlay.drain, overlay.pauses)
+                format!(
+                    "{:?} {:?} {}",
+                    overlay.windows, overlay.drain, overlay.pauses
+                )
             });
             assert_eq!(first, second);
             let [first, second] = [(); 2].map(|()| {

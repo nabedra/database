@@ -314,9 +314,8 @@ fn differences(before: &Ledgers, after: &Ledgers) -> Vec<String> {
             let group = key
                 .1
                 .map_or_else(String::new, |group| format!(" of group {group}"));
-            (at(before) != at(after)).then(|| {
-                format!("{:?}{group} {} (before {})", key.0, at(after), at(before))
-            })
+            (at(before) != at(after))
+                .then(|| format!("{:?}{group} {} (before {})", key.0, at(after), at(before)))
         })
         .collect()
 }
@@ -429,7 +428,12 @@ mod tests {
 
     #[test]
     fn a_ledger_counts_the_guards_held() {
-        let (guards, _) = run(&[acquire(1, LEASE), acquire(2, LEASE), release(1), acquire(3, WRITE)]);
+        let (guards, _) = run(&[
+            acquire(1, LEASE),
+            acquire(2, LEASE),
+            release(1),
+            acquire(3, WRITE),
+        ]);
         let ledgers = |leases, writes| {
             Ledgers::from([
                 ((Ledger::NativeLeases, None), leases),

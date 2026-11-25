@@ -71,6 +71,10 @@ const PROBE_INVARIANTS: [&str; 10] = [
     "KeyspaceCoverage over RouteEpochPublished",
 ];
 
+/// Why no rule bounds the Control lane slots that background work uses.
+const NO_LANE_RULE: &str = "no plan, contract or register says that background work uses at most \
+    one Control lane slot, and no probe reports lane slots";
+
 /// A completed run's named assertion verdicts. Omit families that did not execute.
 pub(crate) struct RunResult {
     pub(crate) run: SeedRun,
@@ -575,6 +579,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
         RecordInput {
             workload,
             smoke: setup.workloads.is_smoke(),
+            overlay: setup.workloads.overlay(),
             scenarios: scenario_assertions,
             assertions,
             defects_skipped: test_defects && !report.passed(),
@@ -686,6 +691,7 @@ fn test_defect(base: &SweepConfig, defect: Defect) -> Result<DefectTest, Box<dyn
 struct RecordInput {
     workload: String,
     smoke: bool,
+    overlay: bool,
     /// Scenario tags that executed, and whether every seed that executed one passed.
     scenarios: BTreeMap<&'static str, bool>,
     assertions: BTreeMap<&'static str, bool>,
@@ -764,6 +770,9 @@ fn write_record(
         "P10-PROBES integration pending",
     );
     record.not_run("ConsistentCommittedData", "P10-PROBES integration pending");
+    if input.overlay {
+        record.not_run("background Control lane slots", NO_LANE_RULE);
+    }
     if input.smoke {
         for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {
             record.not_run(scenario, &format!("runs in the {workload} workload"));

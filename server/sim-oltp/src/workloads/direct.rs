@@ -334,7 +334,9 @@ pub(crate) async fn run(
 
     if let Some(overlay) = overlay.as_mut() {
         if converged.is_ok() && final_checks.is_ok() && cluster.converged().await {
-            report.scenarios.extend(overlay.stage(cluster, config.deadline()).await);
+            report
+                .scenarios
+                .extend(overlay.stage(cluster, config.deadline()).await);
         } else {
             cluster.record("resources overlay stage not run: the cluster did not converge".into());
         }
