@@ -603,6 +603,8 @@ impl Repo {
         fs::create_dir(repo.0.0.join("server")).unwrap();
         fs::write(repo.0.0.join("server/Cargo.toml"), "one").unwrap();
         fs::write(repo.0.0.join("README"), "one").unwrap();
+        fs::create_dir(repo.0.0.join("specs")).unwrap();
+        fs::write(repo.0.0.join("specs/Spec.tla"), "one").unwrap();
         repo.commit(1_700_000_000);
         repo
     }
@@ -691,6 +693,10 @@ fn uncommitted_sources_are_unclean() {
     assert!(repo.unclean(now).contains("?? server/new.rs"));
     repo.git(&["add", "server/new.rs"]);
     assert!(repo.unclean(now).contains("A  server/new.rs"));
+    repo.git(&["rm", "-qf", "server/new.rs"]);
+    assert_eq!(repo.unclean(now), "");
+    fs::write(repo.0.0.join("specs/Spec.tla"), "two").unwrap();
+    assert!(repo.unclean(now).contains("M specs/Spec.tla"));
 }
 
 #[test]
@@ -708,6 +714,9 @@ fn an_executable_of_an_earlier_head_is_unclean() {
         format!("the executable was built at {first}")
     );
     assert_eq!(repo.unclean(1_700_002_500), "");
+    // Before this checkout's first reflog entry HEAD may have been anywhere, as when the
+    // worktree was made again around an old executable.
+    assert!(repo.unclean(1_699_999_999).contains("git has no record"));
     let built = commit::of(&repo.0.0.join("server"), None, None).unwrap();
     assert!(built.unclean.unwrap().contains("build time"));
     fs::remove_dir_all(repo.0.0.join(".git/logs")).unwrap();
