@@ -1235,16 +1235,15 @@ class RunsTest(ShardCase):
                     return self.api.get(path) if left[0] < 0 else (
                         status, {k: v.format(now=int(sim_bugs.time.time()) + 600) for k, v in headers.items()}, {})
                 self.api.answer = limited
-                with patch.object(sim_bugs.time, "sleep") as sleep:
+                with patch.object(sim_bugs, "wait") as sleep:
                     self.assertEqual(self.answer()[0]["result"], "candidate")
                 pauses = [call.args[0] for call in sleep.call_args_list]
                 self.assertEqual(len(pauses), 2)
                 self.assertTrue(all(0 < pause <= 620 for pause in pauses), pauses)
                 # It is waited for as long as allowed, and no longer.
                 self.api.answer = lambda path: (status, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "99999999999"}, {})
-                with patch.object(sim_bugs.time, "sleep") as sleep:
+                with patch.object(sim_bugs, "wait", side_effect=AssertionError("it waits")):
                     self.assertEqual(self.answer()[0]["result"], "incomplete")
-                sleep.assert_not_called()
 
     def test_an_outage_is_tried_again(self):
         self.run_shards(1, script={"hit": 3})
@@ -1255,7 +1254,7 @@ class RunsTest(ShardCase):
                 left[0] -= 1
                 return self.api.get(path) if left[0] < 0 else (502, {}, {})
             self.api.answer = flaky
-            with patch.object(sim_bugs.time, "sleep") as sleep, patch.object(sim_bugs, "API_TRIES", tries):
+            with patch.object(sim_bugs, "wait") as sleep, patch.object(sim_bugs, "API_TRIES", tries):
                 self.assertEqual(self.answer()[0]["result"], result)
             self.assertEqual(sleep.call_count, tries - 1)
 

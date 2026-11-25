@@ -2687,6 +2687,10 @@ def verify_attestation(args, data, record, files):
         raise Failure("its attestation is of another repository, workflow, commit, runner, run or attempt")
 
 
+def wait(seconds):
+    time.sleep(seconds)
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args):
         return None
@@ -2721,7 +2725,7 @@ def api_get(path):
         tries += not limited
         if tries >= API_TRIES or time.monotonic() + pause > until:
             raise Failure(f"GitHub gives no answer to {path}: {why}")
-        time.sleep(pause)
+        wait(pause)
 
 
 class Actions:
