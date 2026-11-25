@@ -84,7 +84,9 @@ class ValidatorTests(unittest.TestCase):
         rec = good(kind="T")
         rec["tla"] = {"spec": "specs/x/X", "mode": "exhaustive", "tier": "T1", "tools": "t", "truncated": True,
                       "limits": ["X.cfg: CONSTRAINT Few: terms"], "settings": ["X.cfg: SPECIFICATION Spec"], "settings_sha256": "a" * 64,
-                      "dropped": {"mutants": 3, "failing_mutants": 1}}
+                      "dropped": {"mutants": 3, "failing_mutants": 1}, "runs": [], "controls": [{"cfg": "control-m.cfg", "verdict": "pass", "distinct_states": 5, "depth": 2,
+                      "states_left": 0, "duration_s": 0.1, "detail": ""}],
+                      "mutants": [{"name": "m", "expect": "P", "observed": "P", "ok": True, "cex_length": 2, "control": "control-m.cfg"}]}
         self.assertEqual(evidence.validate(rec), [])
         for dropped in ({"mutants": 0}, {"mutants": "3"}, [3]):
             rec["tla"]["dropped"] = dropped
@@ -105,6 +107,13 @@ class ValidatorTests(unittest.TestCase):
                  "runs": [{"cfg": "X.cfg", "verdict": "pass", "states_left": 0}],
                  "mutants": [{"name": "m", "ok": True}], "uncovered": []}
         self.assertEqual(evidence.tla_contradictions(facts), [])
+        control = {"cfg": "control-m.cfg", "verdict": "pass", "states_left": 0}
+        self.assertEqual(evidence.tla_contradictions({**facts, "controls": [control]}), [])
+        for change in ({"verdict": "incomplete"}, {"verdict": "error"}, {"verdict": None}, {"states_left": 3}, {"states_left": None}):
+            self.assertEqual(len(evidence.tla_contradictions({**facts, "controls": [control, {**control, **change}]})), 1)
+        self.assertEqual(len(evidence.tla_contradictions({**facts, "controls": [{"cfg": "control-m.cfg", "verdict": "pass"}]})), 1)
+        self.assertEqual(evidence.tla_contradictions({**facts, "dropped": {"controls": 4}}), [])
+        self.assertEqual(evidence.tla_contradictions({**facts, "dropped": {"failing_controls": 4}}), ["4 dropped failing controls"])
         for change in ({"mode": "guess"}, {"mode": None}, {"uncovered": ["A"]}, {"mutants": [{"name": "m", "ok": False}]},
                        {"mutants": [{"name": "m"}]}, {"runs": [{"cfg": "X.cfg", "verdict": "incomplete"}]},
                        {"runs": [{"cfg": "X.cfg", "verdict": "incomplete", "states_left": 0}]},

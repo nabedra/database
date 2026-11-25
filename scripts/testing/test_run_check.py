@@ -256,7 +256,7 @@ class FitRecordTests(unittest.TestCase):
         self.dropped = record["tla"].get("dropped", {})
         self.assertEqual(bool(self.dropped), self.tla.get("truncated", False))
         # Nothing disappears uncounted.
-        for key, ok in (("runs", lambda r: r["verdict"] == "pass"), ("mutants", lambda m: m["ok"])):
+        for key, ok in (("runs", lambda r: r["verdict"] == "pass"), ("controls", lambda r: r["verdict"] == "pass"), ("mutants", lambda m: m["ok"])):
             for want, name in ((True, key), (False, f"failing_{key}")):
                 total = sum(ok(x) == want for x in before["tla"].get(key, []))
                 kept = sum(ok(x) == want for x in self.tla.get(key, []))
@@ -356,6 +356,39 @@ class FitRecordTests(unittest.TestCase):
         record = t_record(mutants=[mutant(i, ok=False, detail=0) for i in range(62)], failed=62)
         self.fit(record)
         self.assertEqual(self.dropped, {"failing_mutants": 12})
+
+    @staticmethod
+    def control(i, ok=True, detail=100):
+        return {**run_fact(i, ok=ok, detail=detail), "cfg": f"control-m{i:02d}.cfg"}
+
+    def test_more_controls_than_the_schema_allows(self):
+        record = t_record(controls=[self.control(i, ok=i != 59) for i in range(60)], failed=1)
+        self.fit(record)
+        self.assertEqual(self.dropped["controls"], 10)
+        self.assertEqual([c["cfg"] for c in self.tla["controls"] if c["verdict"] != "pass"], ["control-m59.cfg"])
+
+    def test_a_failing_control_outlives_the_passing_ones(self):
+        arts = [artifact("summary.json"), *(artifact(f"control-m{i:02d}.{k}") for i in range(50) for k in ("cfg", "log"))]
+        record = t_record(mutants=[mutant(i, ok=i != 49) for i in range(50)], controls=[self.control(i, ok=i != 49, detail=300) for i in range(50)],
+                          runs=[run_fact(i) for i in range(20)], artifacts=arts, failed=1, unmutated=["U" * 110 for _ in range(40)])
+        self.fit(record)
+        self.assertIn("tla/control-m49.log", self.names)
+        self.assertIn("tla/control-m49.cfg", self.names)
+        self.assertNotIn("tla/control-m48.log", self.names)
+        self.assertEqual([c.get("detail") for c in self.tla["controls"]][-1:], ["d" * 300])
+        self.assertEqual({c.get("detail") for c in self.tla["controls"][:-1]}, {None})
+        # Details of passing controls went, then passing controls, before a failing one is cut or dropped.
+        record = t_record(mutants=[mutant(i, ok=False) for i in range(50)], controls=[self.control(i, ok=i >= 40, detail=300) for i in range(50)], failed=50,
+                          artifacts=arts)
+        self.fit(record)
+        self.assertEqual((self.dropped.get("controls"), self.dropped.get("failing_controls", 0)), (10, 0))
+        self.assertEqual([len(c["detail"]) for c in self.tla["controls"]], [60] * 40)
+        # Failing controls go before failing runs, and are counted.
+        record = t_record(mutants=[mutant(i, ok=False, detail=300, name="n" * 100 + "{:02d}") for i in range(50)], failed=50, runs=[run_fact(i, ok=False, detail=300) for i in range(20)],
+                          controls=[{**self.control(i, ok=False, detail=300), "cfg": "c" * 110 + f"{i:02d}.cfg"} for i in range(50)], limits=["l" * 190] * 50,
+                          settings=["s" * 290] * 60, uncovered=["u" * 100] * 50)
+        self.fit(record)
+        self.assertGreater(self.dropped["failing_controls"], 0)
 
     SETTINGS = [f"X.v{i:02d}.cfg: SPECIFICATION Spec, MaxCrashes = {i}" for i in range(10)]
 

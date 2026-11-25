@@ -60,7 +60,7 @@ One JSON file per run and check, at
 | `assertions` | executed, failed, and `not_run` with a reason for each |
 | `seeds` | range, count and failing seeds |
 | `sim_core_hours`, `virtual_hours` | simulation cost and simulated time |
-| `tla` | kind T facts: spec, mode (`exhaustive`, `simulation` or `trace`), tier, states, coverage, declared limits, settings and their digest, mutants or trace counts, and `truncated` with `dropped` counts when the record was trimmed |
+| `tla` | kind T facts: spec, mode (`exhaustive`, `simulation` or `trace`), tier, states, coverage, declared limits, settings and their digest, mutants and their controls, or trace counts, and `truncated` with `dropped` counts when the record was trimmed |
 | `artifacts` | artifact names with their SHA-256s |
 
 Logs and histories stay in Actions artifacts. A record stays valid after its artifacts expire.

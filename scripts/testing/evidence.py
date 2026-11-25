@@ -177,6 +177,9 @@ def tla_contradictions(tla: Any) -> list[str]:
             out.append(f"run {run.get('cfg')} is {run.get('verdict')}")
         elif tla.get("mode") == "exhaustive" and run.get("states_left") != 0:
             out.append(f"run {run.get('cfg')} left {run.get('states_left')} states")
+    for run in entries(tla.get("controls")):
+        if run.get("verdict") != "pass" or run.get("states_left") != 0:
+            out.append(f"control {run.get('cfg')} is {run.get('verdict')} with {run.get('states_left')} states left")
     out.extend(f"mutant {m.get('name')} failed" for m in entries(tla.get("mutants")) if m.get("ok") is not True)
     if tla.get("uncovered"):
         out.append("uncovered actions")
@@ -189,7 +192,7 @@ def tla_contradictions(tla: Any) -> list[str]:
             out.append("no trace counts")
         elif counts[1] < 1 or counts[2] != counts[3] or counts[0] != counts[1] + counts[2]:
             out.append("trace counts of no pass: " + ", ".join(map(str, counts)))
-    for key in ("failing_runs", "failing_mutants", "failing_traces", "uncovered"):
+    for key in ("failing_runs", "failing_controls", "failing_mutants", "failing_traces", "uncovered"):
         if dropped.get(key):
             out.append(f"{dropped[key]} dropped {key.replace('_', ' ')}")
     return out

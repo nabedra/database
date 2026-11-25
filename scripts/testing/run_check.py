@@ -454,7 +454,7 @@ class _Fitter:
     @staticmethod
     def ok(key: str, item) -> bool:
         """The entry reports no failure, so it goes before the ones that do."""
-        if key == "runs":
+        if key in ("runs", "controls"):
             return isinstance(item, dict) and item.get("verdict") == "pass"
         if key == "mutants":
             return isinstance(item, dict) and item.get("ok") is True
@@ -464,7 +464,7 @@ class _Fitter:
 
     def drop(self, key: str, index: int) -> None:
         items = self.list(key)
-        failing = {"runs": "failing_runs", "mutants": "failing_mutants", "failing": "failing_traces"}
+        failing = {"runs": "failing_runs", "controls": "failing_controls", "mutants": "failing_mutants", "failing": "failing_traces"}
         self.count(key if self.ok(key, items[index]) else failing.get(key, key))
         del items[index]
 
@@ -499,8 +499,8 @@ class _Fitter:
         return not artifact["name"].startswith("tla/") or artifact["name"] == "tla/summary.json"
 
     def failing_files(self) -> tuple[str, ...]:
-        """The artifact name prefixes of the failing runs and mutants."""
-        runs = [str(r.get("cfg", "")).removesuffix(".cfg") for r in self.list("runs") if not self.ok("runs", r)]
+        """The artifact name prefixes of the failing runs, controls and mutants."""
+        runs = [str(r.get("cfg", "")).removesuffix(".cfg") for r in [*self.list("runs"), *self.list("controls")] if not self.ok("runs", r)]
         mutants = [f"mutant-{m.get('name')}" for m in self.list("mutants") if not self.ok("mutants", m)]
         return tuple(f"tla/{stem}." for stem in runs + mutants)
 
@@ -519,7 +519,7 @@ class _Fitter:
             self.drop_artifact(len(self.artifacts) - 1)
         if self.tla is not None:
             facts = self.props["tla"]["properties"]
-            for key in ("runs", "mutants", "uncovered", "unmutated", "limits", "settings"):
+            for key in ("runs", "controls", "mutants", "uncovered", "unmutated", "limits", "settings"):
                 while len(self.list(key)) > facts[key]["maxItems"]:
                     self.drop_last(key, only_ok=False)
             while len(self.list("failing")) > facts["traces"]["properties"]["failing"]["maxItems"]:
@@ -534,7 +534,7 @@ class _Fitter:
             self.drop_not_run()
 
     def shorten(self, limit: int) -> None:
-        for item in [*self.list("runs"), *self.list("mutants"), *self.list("failing"), *self.not_run]:
+        for item in [*self.list("runs"), *self.list("controls"), *self.list("mutants"), *self.list("failing"), *self.not_run]:
             for key in ("detail", "reason"):
                 if item.get("id") != "truncated" and len(item.get(key, "")) > limit:
                     item[key] = _clip(item[key], limit)
@@ -542,7 +542,7 @@ class _Fitter:
 
     def steps(self):
         """The reductions, one at a time, least important first."""
-        for key in ("runs", "mutants"):
+        for key in ("runs", "controls", "mutants"):
             for item in self.list(key):
                 if self.ok(key, item) and item.pop("detail", ""):
                     self.count("details")
@@ -550,7 +550,7 @@ class _Fitter:
         while len(self.artifacts) > self.keep:
             self.drop_artifact(len(self.artifacts) - 1)
             yield
-        for key in ("mutants", "runs", "unmutated", "settings"):
+        for key in ("mutants", "controls", "runs", "unmutated", "settings"):
             while self.drop_last(key, only_ok=True):
                 yield
         self.shorten(60)
@@ -561,7 +561,7 @@ class _Fitter:
         while len(self.not_run) > (2 if self.more else 1):
             self.drop_not_run()
             yield
-        for key in ("failing", "uncovered", "mutants", "runs", "settings", "limits"):
+        for key in ("failing", "uncovered", "mutants", "controls", "runs", "settings", "limits"):
             while self.drop_last(key, only_ok=False):
                 yield
 
@@ -571,7 +571,7 @@ def fit_record(record: dict) -> None:
     lengths and the record size limit.
 
     It drops, in order: the details of passing runs and caught mutants; tool artifacts that belong to no
-    failure, last first; caught mutants, passing runs, exempted names and mutants' settings, last first. Then it cuts the
+    failure, last first; caught mutants, passing controls and runs, exempted names and mutants' settings, last first. Then it cuts the
     remaining details and reasons, and last drops the artifacts of failures, not-run entries and the
     failures themselves, last first. The command log and tla/summary.json always stay. `tla.truncated`
     says that something was dropped or cut, `tla.dropped` counts it by list, with failures counted apart,

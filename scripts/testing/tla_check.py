@@ -13,8 +13,9 @@ T0 and T1 check, in order:
      some mutant's `\\* expect:` line. Only a type invariant may be exempted, with a
      `\\* no-mutant: <Property> -- <reason>` line;
   4. search rule: nothing limits the search except what the cfg declares (search_problems);
-  5. every `mutants/*.cfg`, which must fail on exactly the property its first line
-     `\\* expect: <Property>` names (or `Deadlock`). The counterexample length is recorded.
+  5. every `mutants/*.cfg`. Its control, the same cfg with the baseline's value of Mutant, must pass like a
+     baseline, and then it must fail on exactly the property its first line `\\* expect: <Property>` names
+     (or `Deadlock`). The counterexample length is recorded.
 T2 applies the search rule and runs `<Name>.large.cfg`, exhaustively or, with --simulate, as a seeded
 simulation labelled as such.
 
@@ -32,11 +33,17 @@ The search rule. TLC reports an exhaustive search whatever a cfg cuts away, so:
   - a cfg may not override a name it checks, its constraints or its INIT, NEXT or SPECIFICATION. Giving a
     declared CONSTANT its value is free. Overriding any other definition, such as Nat, needs a `limit` line;
   - an override may not replace a definition that a constraint uses, unless by a constant value;
-  - a mutant cfg is held to the same rule, with the baselines' `limit` lines only. It sets the constant Mutant
-    to another value than one baseline, and is like that baseline in every other constant, in INIT, NEXT or
-    SPECIFICATION and in its constraints. It expects a property that this baseline checks and passed. The
-    property does not read Mutant, and the specification's definitions name the mutant's value. Otherwise it
-    does not count as caught (mutant_problems).
+  - a mutant cfg is held to the same rule, with the baselines' `limit` lines only (mutant_problems). It sets the
+    constant Mutant to another value than the baselines that check its property, of which there must be one, and
+    runs the INIT, NEXT or SPECIFICATION of a baseline. The control shows that the property holds at the
+    mutant's own bounds, so other constants may differ. The property may not read Mutant, and the specification's
+    definitions name the mutant's value, because a control cannot show that: a property that asks about Mutant
+    holds in the control and fails in the mutant although no step changed. Otherwise the mutant does not count
+    as caught.
+
+A mutant's control (Controls) is a run of its own, with the per-run budget. It is not run when a baseline, or the
+control of another mutant, has the same settings and checks the property.
+
 The record lists the declared limits and how many states each constraint kept. What the rule cannot see: a
 variable under an upper bound that is no counter of growth, such as a step counter that every action
 increments, or a protocol phase kept as a number; a CONSTANT value, INIT or NEXT that leaves behavior out.
@@ -515,12 +522,13 @@ def search_problems(model: Model, cfg: Path, declared: dict[str, str] | None = N
 
 
 _SPECIFICATION = ("INIT", "NEXT", "SPECIFICATION")
+_CFG_TOKEN = re.compile(r'"[^"]*"|\w+|<-|[^\s\w]')
 
 
 def settings(cfg: Path) -> frozenset[str]:
     """What makes a cfg's model: each constant's value, and INIT, NEXT or SPECIFICATION."""
     text = tc.strip_tla_comments(cfg.read_text(encoding="utf-8"))
-    tokens = re.findall(r'"[^"]*"|\w+|<-|[^\s\w]', text)
+    tokens = _CFG_TOKEN.findall(text)
     out: list[list[str]] = []
     section = None
     for i, token in enumerate(tokens):
@@ -544,46 +552,53 @@ def _split(cfg: Path) -> tuple[frozenset[str], str | None]:
     return entries - set(value), plain.group(1) if plain else None
 
 
-_NOT_PASSED = "did not pass, so no mutant of it can be judged"
+def check_of(parsed: tc.Cfg, name: str) -> str | None:
+    """How the cfg checks this property: a state predicate under PROPERTY is not the INVARIANT."""
+    if name in parsed.invariants:
+        return "INVARIANT"
+    if name in parsed.properties:
+        return "PROPERTY"
+    return "CHECK_DEADLOCK" if name == "Deadlock" and parsed.check_deadlock else None
 
 
-def mutant_problems(model: Model, cfg: Path, baselines: list[Path], passed: set[str]) -> list[str]:
-    """Why this mutant cfg cannot count as caught, whatever TLC says. `passed` names the baselines that passed."""
+def mutant_problems(model: Model, cfg: Path, baselines: list[Path]) -> tuple[list[str], str]:
+    """Why this mutant cfg cannot count as caught, whatever TLC says, and its control's value of Mutant."""
     declared = {k: v for baseline in baselines for k, v in limits_of(baseline).items()}
     problems = search_problems(model, cfg, declared)[0]
     parsed = tc.parse_cfg(cfg)
     rest, value = _split(cfg)
     if value is None or not model.is_constant("Mutant"):
-        return [*problems, "it does not set the CONSTANT Mutant to a plain value"]
+        return [*problems, "it does not set the CONSTANT Mutant to a plain value"], ""
     # A mutant of the property alone shows nothing about the design.
     if any(re.search(r"\bMutant\b", text) for text, _ in model.regions(parsed.expect or "")):
         problems.append(f"{parsed.expect} reads Mutant, so the mutant may change the property and not the design")
-    start = [w for entry in rest if entry.split()[0] in _SPECIFICATION for w in entry.split()[1:]]
+    spec = {entry for entry in rest if entry.split()[0] in _SPECIFICATION}
+    start = [w for entry in spec for w in entry.split()[1:]]
     if not any(re.search(rf"(?<![\w\"]){re.escape(value)}(?![\w\"])", full) for _, full in model.closure(start)):
         problems.append(f"no definition of {' or '.join(start)} names {value}, so the mutant changes no step")
+    if not any(spec == {e for e in settings(b) if e.split()[0] in _SPECIFICATION} for b in baselines):
+        problems.append(f"no baseline runs its {', '.join(sorted(spec)) or 'specification'}")
+    # The design that the mutant changes: the first baseline, the main one if it can, that checks the property.
+    check = check_of(parsed, parsed.expect or "")
+    checkers = [b for b in baselines if check and check_of(tc.parse_cfg(b), parsed.expect or "") == check]
+    values = [_split(baseline)[1] for baseline in checkers]
+    if not checkers:
+        problems.append(f"no baseline checks {parsed.expect} as it does")
+    elif None in values:
+        problems.append(f"{checkers[values.index(None)].name} does not set Mutant to a plain value")
+    elif value in values:
+        problems.append(f"Mutant is {value} in {checkers[values.index(value)].name} too")
+    return problems, (values or [None])[0] or ""
 
-    def unlike(baseline: Path) -> str | None:
-        base, (other, base_value) = tc.parse_cfg(baseline), _split(baseline)
-        if rest != other:
-            return "it changes " + ", ".join(sorted({e.split()[0] for e in rest ^ other}))
-        if base_value is None or base_value == value:
-            return f"Mutant is {base_value} there too"
-        if set(parsed.sections.get("CONSTRAINT", [])) != set(base.sections.get("CONSTRAINT", [])):
-            return "its constraints differ"
-        if not set(parsed.sections.get("SYMMETRY", [])) <= set(base.sections.get("SYMMETRY", [])):
-            return "its symmetry differs"
-        if parsed.expect not in (*base.invariants, *base.properties, *(["Deadlock"] if base.check_deadlock else [])):
-            return f"it does not check {parsed.expect}"
-        if baseline.name not in passed:
-            return _NOT_PASSED
-        return None
 
-    reasons = {baseline.name: unlike(baseline) for baseline in baselines}
-    if None not in reasons.values():
-        waiting = [name for name, why in reasons.items() if why == _NOT_PASSED]
-        problems.append(f"{waiting[0]} {_NOT_PASSED}" if waiting else "it is no mutant of a baseline: "
-                        + "; ".join(f"{k}: {v}" for k, v in reasons.items()))
-    return problems
+def control_text(cfg: Path, value: str) -> str:
+    """The cfg without its comments and with this value of Mutant."""
+    text = tc.strip_tla_comments(cfg.read_text(encoding="utf-8"))
+    tokens = list(_CFG_TOKEN.finditer(text))
+    for name, equals, old in zip(tokens, tokens[1:], tokens[2:]):
+        if (name.group(), equals.group()) == ("Mutant", "="):
+            return text[:old.start()] + value + text[old.end():]
+    return text
 
 
 # --------------------------------------------------------------------------------------------
@@ -676,16 +691,13 @@ def describe_limits(limits: list[tuple[str, str, str, str]], out: Path) -> list[
 # --------------------------------------------------------------------------------------------
 # Runs.
 
-def run_baseline(rep: Report, spec_dir: Path, model: str, cfg: Path, out: Path, budget: int,
-                 workers: str, facts: list[dict], cex_dump: bool = True,
-                 extra: list[str] | None = None, label: str | None = None, simulate: bool = False) -> tc.TlcResult:
+def run_cfg(spec_dir: Path, model: str, cfg: Path, config: str, out: Path, budget: int, args: list[str],
+            simulate: bool = False) -> tuple[tc.TlcResult, dict, str]:
+    """One run that has to pass: TLC's result, its facts with the verdict, and why it did not pass. `config` is the
+    cfg's path as TLC sees it."""
     stem = cfg.name[: -len(".cfg")]
-    label = label or f"baseline {cfg.name}"
-    args = ["-workers", workers, "-coverage", "1", *(extra or [])]
-    if cex_dump:
-        args += ["-dumpTrace", "json", f"/out/{stem}.cex.json"]
-    args += ["-config", cfg.relative_to(spec_dir).as_posix(), model]
-    res, elapsed = tc.run_tlc(spec_dir, args, out_dir=out, log_path=out / f"{stem}.log", budget_s=budget)
+    res, elapsed = tc.run_tlc(spec_dir, [*args, "-config", config, model], out_dir=out, log_path=out / f"{stem}.log",
+                              budget_s=budget)
     fact = {"cfg": cfg.name, "distinct_states": res.distinct, "depth": res.depth, "states_left": res.left,
             "duration_s": round(elapsed, 1)}
     log = (out / f"{stem}.log").read_text(encoding="utf-8", errors="replace")
@@ -694,31 +706,88 @@ def run_baseline(rep: Report, spec_dir: Path, model: str, cfg: Path, out: Path, 
         else (res.complete and not res.simulation_done)
     liveness = liveness_problem(log, tc.parse_cfg(cfg))
     if res.errors:
-        fact["verdict"] = "error"
-        rep.error(label, "; ".join(res.errors))
+        fact["verdict"], why = "error", "; ".join(res.errors)
     elif res.violations:
-        fact["verdict"] = res.violations[0][0]
-        rep.check(False, label, describe(res) + f" (log {stem}.log)")
-        for line in tc.counterexample_text(log):
-            print(f"    {line}")
+        fact["verdict"], why = res.violations[0][0], describe(res)
     elif liveness:
-        fact["verdict"] = "liveness-limited"
-        rep.check(False, label, liveness)
+        fact["verdict"], why = "liveness-limited", liveness
     elif done and res.exit_code == 0:
-        fact["verdict"] = "pass"
+        fact["verdict"], why = "pass", ""
+    else:
+        fact["verdict"], why = "incomplete", tc.incomplete_reason(res, budget)
+    return res, fact, why
+
+
+def run_baseline(rep: Report, spec_dir: Path, model: str, cfg: Path, out: Path, budget: int,
+                 workers: str, facts: list[dict], cex_dump: bool = True,
+                 extra: list[str] | None = None, label: str | None = None, simulate: bool = False) -> tc.TlcResult:
+    stem = cfg.name[: -len(".cfg")]
+    label = label or f"baseline {cfg.name}"
+    args = ["-workers", workers, "-coverage", "1", *(extra or [])]
+    if cex_dump:
+        args += ["-dumpTrace", "json", f"/out/{stem}.cex.json"]
+    res, fact, why = run_cfg(spec_dir, model, cfg, cfg.relative_to(spec_dir).as_posix(), out, budget, args, simulate)
+    if fact["verdict"] == "error":
+        rep.error(label, why)
+    elif fact["verdict"] == "incomplete":
+        rep.incomplete = True
+        rep.skip(label, why)
+    elif fact["verdict"] == "pass":
         rep.check(True, label, f"{res.distinct if res.distinct is not None else res.generated} "
                                f"{'distinct' if res.distinct is not None else 'generated'} states, depth {res.depth}")
     else:
-        fact["verdict"] = "incomplete"
-        rep.incomplete = True
-        rep.skip(label, tc.incomplete_reason(res, budget))
-    fact["detail"] = describe(res) if res.violations else liveness or ""
+        rep.check(False, label, why + (f" (log {stem}.log)" if res.violations else ""))
+        if res.violations:
+            for line in tc.counterexample_text((out / f"{stem}.log").read_text(encoding="utf-8", errors="replace")):
+                print(f"    {line}")
+    fact["detail"] = why if res.violations or fact["verdict"] == "liveness-limited" else ""
     facts.append(fact)
     return res
 
 
+class Controls:
+    """The runs that show that a mutant's property holds without the mutation, at the mutant's own bounds."""
+
+    def __init__(self, spec_dir: Path, model: str, out: Path, budget: int, workers: str, baselines: list[Path],
+                 runs: list[dict]) -> None:
+        self.spec_dir, self.model, self.out, self.budget, self.workers = spec_dir, model, out, budget, workers
+        self.ran = [(cfg, run, run["detail"] or run["verdict"]) for cfg, run in zip(baselines, runs)]
+        self.baselines = len(self.ran)
+        self.facts: list[dict] = []
+
+    def of(self, cfg: Path, value: str) -> tuple[dict, str, bool]:
+        """The control run's facts, why it did not pass, and whether an earlier run is the control, because it had the
+        same settings and checked the property."""
+        control = self.out / f"control-{cfg.name}"
+        control.write_text(control_text(cfg, value), encoding="utf-8")
+        parsed, mutant = tc.parse_cfg(control), tc.parse_cfg(cfg)
+        if settings(control) != _split(cfg)[0] | {f"Mutant = {value}"} or parsed.sections != mutant.sections \
+                or parsed.check_deadlock != mutant.check_deadlock:
+            raise tc.TlaError(f"cannot write the control of {cfg.name}")
+
+        def same(other: tc.Cfg) -> bool:
+            return settings(other.path) == settings(control) and check_of(other, mutant.expect) == check_of(parsed, mutant.expect) \
+                and all(set(other.sections.get(k, [])) == set(parsed.sections.get(k, [])) for k in ("CONSTRAINT", "SYMMETRY"))
+
+        found = [(i, run, why) for i, (ran, run, why) in enumerate(self.ran) if same(tc.parse_cfg(ran))]
+        # Another mutant's control that did not pass may have failed on a property that this cfg does not check.
+        found = [f for f in found if f[1]["verdict"] == "pass"] or [f for f in found if f[0] < self.baselines]
+        if found:
+            control.unlink()
+            return found[0][1], found[0][2], True
+        stem = control.name[: -len(".cfg")]
+        args = ["-workers", self.workers, "-dumpTrace", "json", f"/out/{stem}.cex.json"]
+        _, fact, why = run_cfg(self.spec_dir, self.model, control, f"/out/{control.name}", self.out, self.budget, args)
+        fact["detail"] = why
+        print(f"[tla_check] control {control.name}: {fact['verdict']}, {fact['distinct_states']} distinct states, "
+              f"{fact['duration_s']} s" + (f": {why}" if why else ""), flush=True)
+        self.ran.append((control, fact, why))
+        self.facts.append(fact)
+        return fact, why, False
+
+
 def run_mutant(rep: Report, spec_dir: Path, model: str, cfg: Path, out: Path, budget: int,
-               workers: str, modules: Model, baselines: list[Path], passed: set[str]) -> dict:
+               workers: str, modules: Model, baselines: list[Path], controls: Controls) -> dict:
     parsed = tc.parse_cfg(cfg)
     name = cfg.name[: -len(".cfg")]
     fact = {"name": name, "expect": parsed.expect or "", "observed": "", "ok": False, "cex_length": None,
@@ -733,11 +802,19 @@ def run_mutant(rep: Report, spec_dir: Path, model: str, cfg: Path, out: Path, bu
         fact["detail"] = f"expects {parsed.expect}, which its cfg does not check"
         rep.check(False, label, fact["detail"])
         return fact
-    problems = mutant_problems(modules, cfg, baselines, passed)
+    problems, value = mutant_problems(modules, cfg, baselines)
     if problems:
         fact["detail"] = "does not count: " + "; ".join(problems)
-        if len(problems) == 1 and problems[0].endswith(_NOT_PASSED):
-            rep.skip(label, problems[0])  # the baseline's own result says why
+        rep.check(False, label, fact["detail"])
+        return fact
+    control, why, earlier = controls.of(cfg, value)
+    fact["control"] = control["cfg"]
+    if control["verdict"] != "pass":
+        fact["detail"] = f"not caught: its control {control['cfg']} " + {
+            "error": "ended in a TLC error", "incomplete": "did not finish", "liveness-limited": "does not count",
+        }.get(control["verdict"], "fails without the mutation") + f": {why}"
+        if earlier:
+            rep.skip(label, fact["detail"])  # a baseline, whose own result is the failure, the error or the not-run
         else:
             rep.check(False, label, fact["detail"])
         return fact
@@ -832,8 +909,8 @@ def design_check(rep: Report, spec_dir: Path, name: str, model: str, out: Path, 
         rep.check(prop in expects, f"mutant rule {prop}",
                   "named by a mutant" if prop in expects else "no mutant expects it, and no `no-mutant` line exempts it")
 
-    passed = {run["cfg"] for run in runs if run["verdict"] == "pass"}
-    mutants = [run_mutant(rep, spec_dir, model, m, out, budget, workers, modules, baselines, passed)
+    controls = Controls(spec_dir, model, out, budget, workers, baselines, runs)
+    mutants = [run_mutant(rep, spec_dir, model, m, out, budget, workers, modules, baselines, controls)
                for m in mutant_cfgs]
     covered = [n for n in coverage.values()]
     facts.update({
@@ -841,6 +918,8 @@ def design_check(rep: Report, spec_dir: Path, name: str, model: str, out: Path, 
         "actions": len(coverage), "min_action_coverage": min(covered) if covered else None,
         "uncovered": uncovered, "unmutated": sorted(exempt), "runs": runs, "mutants": mutants,
     })
+    if controls.facts:
+        facts["controls"] = controls.facts
     if limits:
         facts["limits"] = describe_limits(limits, out)
     facts.update(settings_facts(modules, baselines, mutant_cfgs))

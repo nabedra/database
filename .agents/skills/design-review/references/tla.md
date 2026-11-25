@@ -107,9 +107,25 @@ its expected property. A mutant that fails with an error, or on a
 different property, does not count.
 
 An invariant that is already false in an initial state does not count
-either: no step of the mutant breaks it. A mutant changes nothing but the
-constant `Mutant`. [Limits on the search](#limits-on-the-search) says what
-else keeps one from counting.
+either: no step of the mutant breaks it. [Limits on the search](#limits-on-the-search)
+says what else keeps one from counting.
+
+A mutant may run at smaller or other bounds than the baseline. So the runner
+first runs its control: the same configuration with the `Mutant` value of the
+baseline that checks the property (`<Name>.cfg` if it does, else the first by
+name). The control has to pass like a baseline (finished, no state left on
+the queue), and on a liveness property it has to pass the liveness check.
+Only then does the mutant's failure show what the mutation breaks. A control
+that fails, ends in an error or stops at a cap or the budget leaves the
+mutant not caught, and the report says which. A control is a run like any
+other, with the level's budget. It is not run when a baseline, or the control
+of another mutant, has the same settings and checks the property. The
+summary lists every control with its states and verdict.
+
+A control cannot show two things, so the runner refuses a mutant whose
+property reads `Mutant`, and one whose value no definition of `INIT`, `NEXT`
+or `SPECIFICATION` names. In both, the property can hold in the control and
+fail in the mutant although no step of the protocol changed.
 
 Every invariant and property of a baseline needs a mutant, and a spec
 whose baselines check none fails. Only a type invariant, an invariant with
@@ -135,7 +151,7 @@ and everything else is refused, with the line and what is allowed.
 | `VIEW` | Fails. It merges states, and TLC does not check that the merge is sound |
 | An override (`Op <- X` or `Op = x`) | `X` must be defined in the model's own modules, not in a standard one. A declared `CONSTANT` is free. Overriding a property, a constraint, a variable, `Len`, `Cardinality`, or the `INIT`, `NEXT` or `SPECIFICATION` it runs fails. Overriding another definition, such as `Nat`, needs a `limit` line |
 | An override of a definition that a constraint uses | Fails, unless the new value is a `CONSTANT` or a set of constants |
-| A mutant configuration | The same rules, with the baselines' `limit` lines only. It sets `Mutant` to another value than one baseline and is like that baseline in every other constant, in `INIT`, `NEXT` or `SPECIFICATION` and in its constraints. Its symmetry is the baseline's or none. It expects a property that this baseline checks and passes. The property's definition does not read `Mutant`, and a definition that `INIT`, `NEXT` or `SPECIFICATION` uses names the mutant's value. Otherwise it does not count as caught |
+| A mutant configuration | The same rules, with the baselines' `limit` lines only. It expects a property that a baseline checks, as an invariant or as a property like the mutant does. It sets `Mutant` to another value than every baseline that checks it, and runs the `INIT`, `NEXT` or `SPECIFICATION` of a baseline. The property's definition does not read `Mutant`, and a definition that `INIT`, `NEXT` or `SPECIFICATION` uses names the mutant's value. Its control passes. Otherwise it does not count as caught |
 
 The grammar of a constraint. `VARIABLE` and `CONSTANT` are names that the
 model module, or one it extends, declares and nothing defines.
@@ -181,6 +197,8 @@ many states TLC kept for each constraint. The rule does not detect:
   number;
 - a `CONSTANT` value, or an `INIT` or `NEXT` written in `MC<Name>.tla`, that
   leaves behavior out;
+- a property or a constant that reads `Mutant` through another definition,
+  while a step names the mutant's value without effect;
 - an action that coverage counts once although one of its cases never
   happens. TLC sums every case of an operator, such as `Crash(1)` and
   `Crash(2)`, or the branches of an `IF`, and does not report an action
@@ -204,8 +222,8 @@ python3 scripts/testing/tla_check.py "specs/$MODULE" "$SPEC" --tier T2 \
 `<Name>.<variant>.cfg` except `.large.cfg`) exhaustively with coverage,
 checks that every action was taken, that every invariant and property
 has a mutant and that nothing undeclared limits the search, then runs every
-mutant and checks that it fails on the property its `\* expect:` line
-names. Each run gets the level's wall-clock
+mutant and checks that its control passes and that it fails on the property
+its `\* expect:` line names. Each run gets the level's wall-clock
 budget. It reports a violation, a deadlock, a liveness violation and a TLC
 error separately, and a stop at the budget or a state cap as `not-run`.
 Logs, `-dumpTrace json` counterexamples and a summary go to
