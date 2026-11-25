@@ -1,0 +1,22 @@
+id = "p10w4-panic-off"
+module = "oltp"
+kinds = ["S"]
+# Scratch, never merged. Negative control: the hook is off, so the test must fail. A pass here means the test proves nothing.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+python3 - <<'P'
+p="sim-oltp/src/panics.rs"
+s=open(p).read()
+a="            record(info);\n"
+assert s.count(a)==1
+open(p,"w").write(s.replace(a,"            let _ = record;\n"))
+P
+cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib -- --test-threads=1 --nocapture panics::tests::a_panic_is_never_a_clean_seed
+''']
+cwd = "server"
+timeout_s = 7200
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim" }

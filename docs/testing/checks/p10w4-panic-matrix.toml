@@ -1,0 +1,17 @@
+id = "p10w4-panic-matrix"
+module = "oltp"
+kinds = ["S"]
+# Scratch, never merged. Every workload, profile and place of a planted panic.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+t=(cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib -- --test-threads=1 --nocapture --include-ignored)
+"${t[@]}" panics::tests::an_escaped
+"${t[@]}" panics::tests::a_panic panics::tests::a_run panics::tests::no_panic sweep::tests::a_
+''']
+cwd = "server"
+timeout_s = 7200
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_BEYOND_TCP = "1" }
