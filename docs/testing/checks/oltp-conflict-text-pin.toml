@@ -1,7 +1,7 @@
 id = "oltp-conflict-text-pin"
 module = "oltp"
 kinds = ["U"]
-# The texts by which nabedra-check's opt-in request rules tell row conflicts from others, against
+# The texts by which nabedra-check's direct-path checker tells row conflicts from others, against
 # the answers of the direct and the queued path. It says nothing about a guarantee.
 guarantees = []
 scenarios = []

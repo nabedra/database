@@ -1,0 +1,81 @@
+diff --git a/server/src/oltp_runtime/application.rs b/server/src/oltp_runtime/application.rs
+index ce75f28b..479ec684 100644
+--- a/server/src/oltp_runtime/application.rs
++++ b/server/src/oltp_runtime/application.rs
+@@ -201,23 +201,15 @@ impl ApplicationEndpoint {
+         shared: &WorkerSharedResources,
+         record: &RequestRecord,
+     ) -> Result<(ChargedBytes, Option<ChargedBytes>), ProtocolError> {
+-        let bytes = shared
+-            .encode_in(ByteClass::Data, record, 16 << 10)
+-            .map_err(submission_reply_unavailable)?;
+-        Ok((bytes, None))
++        Ok((shared.encode_in(ByteClass::Data, record, 16 << 10)?, None))
+     }
+ 
+     fn finish_reply(
+         shared: &WorkerSharedResources,
+         session: &AuthenticatedSession,
+-        submits: bool,
++        _submits: bool,
+         result: Result<(ChargedBytes, Option<ChargedBytes>), ProtocolError>,
+     ) -> Result<ChargedReply, ProtocolError> {
+-        let possibly_accepted = submits
+-            && result
+-                .as_ref()
+-                .err()
+-                .is_none_or(|error| error.outcome == Outcome::Unknown);
+         let (body, inline, error) = match result {
+             Ok((body, inline)) => (Some(body), inline, None),
+             Err(error) => (None, None, Some(error)),
+@@ -229,23 +221,15 @@ impl ApplicationEndpoint {
+             error,
+         };
+         Ok(ChargedReply {
+-            header: shared
+-                .encode_in(
+-                    if session.purpose() == Purpose::ApiIngress {
+-                        ByteClass::Data
+-                    } else {
+-                        ByteClass::Progress
+-                    },
+-                    &reply,
+-                    MAX_HEADER_BYTES,
+-                )
+-                .map_err(|error| {
+-                    if possibly_accepted {
+-                        submission_reply_unavailable(error)
+-                    } else {
+-                        error
+-                    }
+-                })?,
++            header: shared.encode_in(
++                if session.purpose() == Purpose::ApiIngress {
++                    ByteClass::Data
++                } else {
++                    ByteClass::Progress
++                },
++                &reply,
++                MAX_HEADER_BYTES,
++            )?,
+             sections: [body, inline, None],
+         })
+     }
+@@ -854,17 +838,6 @@ pub(super) fn submission_unknown(mut error: ProtocolError) -> ProtocolError {
+     error
+ }
+ 
+-fn submission_reply_unavailable(error: ProtocolError) -> ProtocolError {
+-    ProtocolError::new(
+-        ErrorCode::OutcomeUnknown,
+-        format!(
+-            "request receipt unavailable after submission: {}",
+-            error.message
+-        ),
+-        Outcome::Unknown,
+-    )
+-}
+-
+ #[cfg(test)]
+ #[test]
+ fn q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity() {

@@ -1,0 +1,78 @@
+diff --git a/server/oltp-replication/src/oltp_replication/manager/lifecycle.rs b/server/oltp-replication/src/oltp_replication/manager/lifecycle.rs
+index 9bc99f4d..003a6f12 100644
+--- a/server/oltp-replication/src/oltp_replication/manager/lifecycle.rs
++++ b/server/oltp-replication/src/oltp_replication/manager/lifecycle.rs
+@@ -245,20 +245,6 @@ where
+         target_applied: Option<&PlacementCatchUp<'_>>,
+         retain_removed: bool,
+     ) -> Result<GroupMembershipObservation, ProtocolError> {
+-        validate_voters(old).map_err(|_| invalid())?;
+-        validate_voters(next).map_err(|_| invalid())?;
+-        if old.len() != next.len()
+-            || !next.contains(target)
+-            || !old.iter().any(|member| member.node_id == removed)
+-            || old.iter().any(|member| member.node_id == target.node_id)
+-            || old
+-                .iter()
+-                .filter(|member| member.node_id != removed)
+-                .ne(next.iter().filter(|member| *member != target))
+-        {
+-            return Err(invalid());
+-        }
+-
+         if let Ok(observed) = self.observe_membership().await {
+             if observed.replicas() == old {
+                 let learner = self.replicate_learner(observed, target.clone()).await?;
+@@ -269,6 +255,16 @@ where
+             }
+         } else {
+             let _change = self.membership_changes.lock().await;
++            validate_voters(old).map_err(|_| invalid())?;
++            validate_voters(next).map_err(|_| invalid())?;
++            if old.len() != next.len()
++                || !next.iter().any(|member| member == target)
++                || old.iter().any(|member| member.node_id == target.node_id)
++                || old.iter().filter(|member| !next.contains(member)).count() != 1
++                || next.iter().filter(|member| !old.contains(member)).count() != 1
++            {
++                return Err(invalid());
++            }
+             self.finish_replacement(old, next, target, target_applied, retain_removed)
+                 .await?;
+         }
+@@ -717,14 +713,29 @@ where
+         damaged: &ReplicaMember,
+         fresh: ReplicaMember,
+     ) -> Result<DamagedReplacement, ProtocolError> {
+-        if !old.contains(damaged) {
++        let _ = (old, next);
++        damaged.validate().map_err(|_| invalid())?;
++        fresh.validate().map_err(|_| invalid())?;
++        if fresh.node_id == damaged.node_id {
+             return Err(invalid());
+         }
+-        let membership = self
+-            // A quarantined voter never applies again; its removal is proven
+-            // by `DamagedReplicaRemoved`, so it is dropped (REP5, ns23).
+-            .reconcile_voter_replacement(old, next, &fresh, damaged.node_id, None, false)
+-            .await?;
++        let current = self.observe_membership().await?;
++        let membership = if current.replicas.iter().any(|member| member == damaged) {
++            if current
++                .replicas
++                .iter()
++                .any(|member| member.node_id == fresh.node_id)
++            {
++                return Err(invalid());
++            }
++            let learner = self.replicate_learner(current, fresh.clone()).await?;
++            self.replace_voter_applied(learner, damaged.node_id, None, false)
++                .await?
++        } else if current.replicas.iter().any(|member| member == &fresh) {
++            current
++        } else {
++            return Err(invalid());
++        };
+         let proof = GroupDamageReplacement {
+             group: membership.group.clone(),
+             removed: damaged.clone(),

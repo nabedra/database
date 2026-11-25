@@ -1,0 +1,53 @@
+diff --git a/server/src/oltp_runtime/replica/tests.rs b/server/src/oltp_runtime/replica/tests.rs
+index 74f78304..51f64841 100644
+--- a/server/src/oltp_runtime/replica/tests.rs
++++ b/server/src/oltp_runtime/replica/tests.rs
+@@ -1501,6 +1501,48 @@ fn r01_r05_takeover_keeps_original_context_and_rejects_stale_owner_or_new_run()
+     assert_eq!(replicas[0].pending(), 1);
+ }
+ 
++/// Scratch probe for BUG2 (never shipped): Control can authorize a copy under a ready view
++/// that this replica has not applied yet. The preflight must answer `Stale`, not `Invalid`.
++#[test]
++fn probe_bug2_a_copy_under_a_newer_authority_is_stale_not_invalid() {
++    let fixture = Fixture::new(3);
++    let mut owner = fixture.replica(0);
++    let id = nabedra_rt::ids::uuid_v4();
++    let body = fixture.body(id);
++    let frame = owner
++        .propose(
++            fixture.authority,
++            body.clone(),
++            fixture.context(id, &body),
++            1,
++        )
++        .unwrap();
++    let header = frame.decode_header().unwrap();
++    header.preflight(&fixture.scope, fixture.authority).unwrap();
++    // This replica still holds the view before the copy's.
++    let mut behind = fixture.authority;
++    behind.ready.view.membership_revision -= 1;
++    assert_eq!(
++        header.preflight(&fixture.scope, behind).err(),
++        Some(QueueError::Stale),
++        "a copy under a newer ready view",
++    );
++    let mut owner_changed = fixture.authority;
++    owner_changed.owner = fixture.members[1];
++    assert_eq!(
++        header.preflight(&fixture.scope, owner_changed).err(),
++        Some(QueueError::Stale),
++        "a copy from another owner",
++    );
++    // A malformed copy stays invalid.
++    let mut malformed = header.clone();
++    malformed.sequence = 0;
++    assert_eq!(
++        malformed.preflight(&fixture.scope, fixture.authority).err(),
++        Some(QueueError::Invalid),
++    );
++}
++
+ #[test]
+ fn u02_invalid_auth_or_pin_installs_no_identity_and_wire_keeps_exact_raw_bytes() {
+     let fixture = Fixture::new(2);

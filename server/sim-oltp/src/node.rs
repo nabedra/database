@@ -454,6 +454,11 @@ impl Cluster {
         self.range = Some(group);
     }
 
+    #[cfg(test)]
+    pub fn range(&self) -> Option<Uuid> {
+        self.range
+    }
+
     /// Follow the table's initial range.
     pub fn watch_table(&mut self, table: Uuid) {
         let group = initial_range(self.config.cluster_id, table)["group_id"]
