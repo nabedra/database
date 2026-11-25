@@ -2,14 +2,18 @@
 
 import argparse
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
+import threading
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sim_bugs  # noqa: E402
@@ -32,6 +36,7 @@ if bundle["digest"] != hashlib.sha256(Path(args[0]).read_bytes()).hexdigest():
 certificate = bundle["certificate"]
 assert args[args.index("--repo") + 1] == "zPy52/nabedra-database"
 assert args[args.index("--signer-workflow") + 1].endswith("/.github/workflows/nabedra-build.yml")
+assert args[args.index("--source-digest") + 1] == json.loads(Path(args[0]).read_text())["sha"]
 assert "--deny-self-hosted-runners" in args and args[args.index("--format") + 1] == "json"
 print(json.dumps([{"verificationResult": {"signature": {"certificate": certificate}}}]))
 '''
@@ -45,8 +50,81 @@ def sha256(data):
     return hashlib.sha256(data.encode() if isinstance(data, str) else data).hexdigest()
 
 
+ATTESTED = [{"name": "Run the check", "conclusion": "failure"}, {"name": "Attest the evidence records", "conclusion": "success"}]
+
+
+class FakeActions:
+    """The parts of GitHub's REST API that say which runs and jobs there are."""
+
+    def __init__(self):
+        self.runs, self.jobs, self.asked, self.answer = {}, {}, [], None
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                outer.asked.append((self.path, self.headers.get("Authorization")))
+                status, headers, body = (outer.answer or outer.get)(self.path)
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(body if isinstance(body, bytes) else json.dumps(body).encode())
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def get(self, path):
+        """The listings, in pages as GitHub cuts them."""
+        url = urlsplit(path)
+        query = {key: values[0] for key, values in parse_qs(url.query).items()}
+        root = f"/repos/{REPO}/actions"
+        if url.path == f"{root}/workflows/nabedra-build.yml/runs":
+            assert set(query) == {"head_sha", "per_page", "page"}, query
+            key, items = "workflow_runs", [run for run in self.runs.values() if run["head_sha"] == query["head_sha"]]
+        elif match := re.fullmatch(re.escape(root) + r"/runs/([0-9]+)/jobs", url.path):
+            assert query["filter"] == "all", query
+            key, items = "jobs", list(self.jobs.get(int(match.group(1)), {}).values())
+        else:
+            return 404, {}, {"message": "Not Found"}
+        size, page = int(query["per_page"]), int(query["page"])
+        return 200, {}, {"total_count": len(items), key: items[(page - 1) * size:page * size]}
+
+    def add(self, run, attempt, check, sha, conclusion="success", run_changes=None, job=None):
+        self.runs[run] = {"id": run, "path": ".github/workflows/nabedra-build.yml", "event": "workflow_dispatch",
+                          "head_sha": sha, "display_title": f"req-{run} @ {sha}", "run_attempt": attempt,
+                          "status": "completed", "head_repository": {"full_name": REPO}, **(run_changes or {})}
+        jobs = self.jobs.setdefault(run, {})
+        jobs["other"] = {"id": run * 1000, "name": "tested revision", "run_attempt": 1, "status": "completed",
+                         "conclusion": "success", "steps": []}
+        if job is not False:
+            jobs[check, attempt] = {"id": run * 1000 + len(jobs), "name": f"Check {check}", "run_attempt": attempt,
+                                    "status": "completed", "conclusion": conclusion, "steps": ATTESTED, **(job or {})}
+
+
 class ShardCase(HarnessCase):
     PARTS = 2500  # Four seeds each. The budget stays 10,000.
+
+    def setUp(self):
+        super().setUp()
+        self.api = FakeActions()
+        self.addCleanup(self.api.close)
+        patches = patch.multiple(sim_bugs, API=self.api.url, API_TRIES=1)
+        patches.start()
+        self.addCleanup(patches.stop)
+
+    def forget(self):
+        """No evidence, and no run that left any."""
+        shutil.rmtree(self.records)
+        self.api.runs.clear()
+        self.api.jobs.clear()
 
     def tool(self, *argv, script=None, run=7, attempt="1", **env):
         """One command of the tool against the fakes: (status, output, calls of the fake sweep)."""
@@ -77,14 +155,14 @@ class ShardCase(HarnessCase):
         path.mkdir(exist_ok=True)
         return path
 
-    def keep(self, n, log, run=7, attempt=1, name=None, record=None, certificate=None, bundle=True):
-        """The evidence of one shard as it is downloaded: the record, its log and its attestation."""
+    def keep(self, n, log, run=7, attempt=1, name=None, record=None, certificate=None, bundle=True, run_changes=None, job=None):
+        """The evidence of one shard as it is downloaded: the record, its log and its attestation. GitHub lists its job."""
         name = name or f"{run}-{attempt}-{n}"
         (self.records / f"{name}.log").write_text(log)
         sha = sh(self.f.repo, "rev-parse", "HEAD").strip()
         url = f"https://github.com/{REPO}/actions/runs/{run}"
         record = {"schema": "nabedra.evidence/1", "check": f"oltp-sim-bugs-fix-one-{n}", "sha": sha, "tree_clean": True,
-                  "result": "pass", "run": {"url": url, "attempt": attempt},
+                  "result": "pass", "run": {"url": url, "attempt": attempt, "request_id": f"req-{run}"},
                   "artifacts": [{"name": f"{name}.log", "sha256": sha256(log)}], **(record or {})}
         text = json.dumps(record)
         (self.records / f"{name}.json").write_text(text)
@@ -95,6 +173,8 @@ class ShardCase(HarnessCase):
                            **(certificate or {})}
             (self.records / f"sha256-{sha256(text)}.jsonl").write_text(
                 json.dumps({"digest": sha256(text), "certificate": certificate}))
+        check = record["check"] if "rehearsal" in record["check"] else f"oltp-sim-bugs-fix-one-{n}"
+        self.api.add(run, attempt, check, sha, "success" if record["result"] == "pass" else "failure", run_changes, job)
         return text
 
     def run_shards(self, *numbers, script=None, argv=(), **kwargs):
@@ -129,7 +209,7 @@ class ShardCase(HarnessCase):
         args = argparse.Namespace(records=str(self.records), gh=f"{sys.executable} {self.root / 'fake_gh.py'}", seeds=None,
                                   workload=None, profile=None, expect=None, rehearse_defect=None)
         out = StringIO()
-        return sim_bugs.merged(args, self.f.repo, self.bug, out)[1].body, out.getvalue()
+        return sim_bugs.merged(args, self.f.repo, self.bug, sim_bugs.Actions(), out)[1].body, out.getvalue()
 
     def assert_no_shard(self, *needles):
         body, output = self.answer()
@@ -250,7 +330,7 @@ class ShardTest(ShardCase):
                 with self.assertRaises(SystemExit) as raised, patch("sys.stderr"):
                     self.tool("shard", "fix-one", "--shard", value)
                 self.assertEqual(raised.exception.code, 2)
-        for argv in (["shard", "fix-one"], ["shard", "--shard", "1/4", "--set", "direct", "fix-one"]):
+        for argv in (["shard", "fix-one"], ["shard", "fix-one", "--shard", "1/4", "--set", "direct"]):
             status, output, calls = self.tool(*argv)
             self.assertEqual((status, calls), (2, []), output)
         # A shard cannot choose its seeds, whatever its run is called, and neither can its merge.
@@ -590,13 +670,14 @@ class MergeTest(ShardCase):
 
     def test_a_commit_that_is_not_there_or_has_another_build(self):
         _, output, _ = self.shard(1, script={"hit": 3})
-        self.keep(1, self.edit_done(output, sha="a" * 40), record={"sha": "a" * 40})
+        run = lambda sha: {"head_sha": sha, "display_title": f"req-7 @ {sha}"}
+        self.keep(1, self.edit_done(output, sha="a" * 40), record={"sha": "a" * 40}, run_changes=run("a" * 40))
         self.assert_no_shard("its commit is not available")
         f = self.f
         f.write("server/src/other.rs", "pub fn other() {}\n")
         other = f.commit("another build")
         sh(f.repo, "reset", "-q", "--hard", "HEAD^")
-        self.keep(1, self.edit_done(output, sha=other), record={"sha": other})
+        self.keep(1, self.edit_done(output, sha=other), record={"sha": other}, run_changes=run(other))
         self.assert_no_shard("its commit has another build than it says")
 
     def test_shards_of_two_commits(self):
@@ -650,11 +731,14 @@ class MergeTest(ShardCase):
                 # It is an error even where the hit is below the range that disagrees.
                 self.assert_merge("error", "disagree")
                 self.assert_not_found("error", "disagree")
+                self.assertEqual(self.assert_merge("error")["shards"][2]["run"][-6:], "runs/9")
 
     def test_records_that_are_no_evidence(self):
         _, output, _ = self.shard(1, script={"hit": 3})
         other = f"https://github.com/{REPO}/actions/runs/8"
         url = f"https://github.com/{REPO}/actions/runs/7"
+        own = {"url": url, "attempt": 1, "request_id": "req-7"}
+        self.api.add(8, 1, "oltp-sim-2", sh(self.f.repo, "rev-parse", "HEAD").strip())
         cases = {
             "a failed check": {"record": {"result": "fail"}},
             "an error": {"record": {"result": "error"}},
@@ -662,11 +746,11 @@ class MergeTest(ShardCase):
             "no tree": {"record": {"tree_clean": None}},
             "another check": {"record": {"check": "oltp-sim-bugs-fix-one-2"}},
             "another commit": {"record": {"sha": "a" * 40}},
-            "another run": {"record": {"run": {"url": other, "attempt": 1}}},
-            "another attempt": {"record": {"run": {"url": url, "attempt": 2}}},
-            "an attempt as text": {"record": {"run": {"url": url, "attempt": "1"}}},
-            "no attempt": {"record": {"run": {"url": url, "attempt": None}}},
-            "no run": {"record": {"run": {"url": None, "attempt": 1}}},
+            "another run": {"record": {"run": {**own, "url": other}}},
+            "another attempt": {"record": {"run": {**own, "attempt": 2}}, "run_changes": {"run_attempt": 2}},
+            "an attempt as text": {"record": {"run": {**own, "attempt": "1"}}},
+            "no attempt": {"record": {"run": {**own, "attempt": None}}},
+            "no run": {"record": {"run": {**own, "url": None}}},
             "no log": {"record": {"artifacts": []}},
             "another log": {"record": {"artifacts": [{"name": "a.log", "sha256": "a" * 64}]}},
             "two logs": {"record": {"artifacts": [{"name": "a.log", "sha256": sha256(output)},
@@ -709,7 +793,7 @@ class MergeTest(ShardCase):
         for path in self.records.glob("101-*"):
             path.unlink()
         self.keep(1, log, run=102, name="other")
-        self.assert_merge("incomplete", "shard 1 of")
+        self.assert_merge("incomplete", "no shard: oltp-sim-bugs-fix-one-1", "its log is of another shard than its check")
 
     def test_gh_that_cannot_verify(self):
         self.run_shards(1, script={"hit": 3})
@@ -760,7 +844,7 @@ class MergeTest(ShardCase):
         path = self.f.repo / BUG / "searches.jsonl"
         first, last = path.read_text().splitlines()
         entry = json.loads(last)
-        for changes in ({"schema": "x"}, {"id": "fix-two"}, {"result": "found"}, {"plan": {}}, {"more": 1}):
+        for changes in ({"schema": "x"}, {"id": "fix-two"}, {"result": "found"}, {"result": "incomplete"}, {"plan": {}}, {"more": 1}):
             with self.subTest(changes=changes):
                 path.write_text(first + "\n" + canonical({**entry, "merge": {**entry["merge"], **changes}}) + "\n")
                 status, output = self.f.run("check")
@@ -968,6 +1052,29 @@ class CountTest(ShardCase):
         status, output = count()
         self.assertEqual(status, 0, output)
         self.assertIn("fix-one: found", output)
+        # A branch that lost or changed a file says nothing, also when the file is back.
+        def branch(*steps):
+            sh(repo, "checkout", "-q", "-f", evidence)
+            for change in steps:
+                change()
+                sh(repo, "add", "-A", "-f", "fix-one")
+                sh(repo, "commit", "-q", "--allow-empty", "-m", "later")
+            sh(repo, "update-ref", "refs/remotes/origin/evidence/sim-bugs", "HEAD")
+            sh(repo, "checkout", "-q", "-f", head)
+            sh(repo, "clean", "-fdq")
+            return count()
+        kept = {path.name: path.read_bytes() for path in self.records.iterdir()}
+        name = next(name for name in kept if name.endswith(".log"))
+        put = lambda name, data: (repo / "fix-one" / name).write_bytes(data)
+        self.assertEqual(branch(lambda: put("new.json", b"{}"))[0], 0)
+        for steps in ([lambda: (repo / "fix-one" / name).unlink()], [lambda: put(name, b"x")],
+                      [lambda: (repo / "fix-one" / name).unlink(), lambda: put(name, kept[name])],
+                      [lambda: put(name, b"x"), lambda: put(name, kept[name])],
+                      [lambda: (repo / "fix-one" / name).rename(repo / "fix-one" / "other.log")]):
+            status, output = branch(*steps)
+            self.assertEqual(status, 1, output)
+            self.assertIn("fix-one: incomplete", output)
+            self.assertIn("changed or lost", output)
         # Another target's directory is not this one's.
         sh(repo, "update-ref", "-d", "refs/remotes/origin/evidence/sim-bugs")
         self.assertEqual(count()[0], 1)
@@ -1018,6 +1125,383 @@ class CountTest(ShardCase):
         plan("kill-gateway")
         self.assertEqual(len(unrecorded()), 1)
         self.assertIn("session-drop", unrecorded()[0])
+
+
+class RunsTest(ShardCase):
+    """What GitHub says of the runs: which code wrote a record, and which results there are."""
+
+    def forged(self, **changes):
+        """A shard whose record is whole, of a run that changes in one thing. It has to be no shard, also for the count."""
+        self.forget()
+        self.keep(1, self.log, **changes)
+        body, output = self.answer()
+        self.assertEqual((body["result"], body["shards"], body["rates"]), ("incomplete", [], None), output)
+        self.assertIn("its run", output)
+
+    def test_a_record_is_of_the_commit_that_its_run_tested(self):
+        # The certificate names the workflow's commit. The code that ran and wrote the record is the run's `sha` input,
+        # which its title names.
+        _, self.log, _ = self.shard(1, script={"hit": 3})
+        sha = sh(self.f.repo, "rev-parse", "HEAD").strip()
+        other = "c" * 40
+        for changes in ({"display_title": f"req-7 @ {other}"}, {"head_sha": other}, {"head_sha": other, "display_title": f"req-7 @ {other}"},
+                        {"display_title": f"req-8 @ {sha}"}, {"display_title": f"req-7 @ {other} @ {sha}"},
+                        {"display_title": f"req-7 @ {sha} "}, {"display_title": f"req-7 @ {sha[:12]}"}, {"display_title": "[testing] a title"},
+                        {"display_title": None}, {"event": "pull_request"}, {"event": "schedule"},
+                        {"path": ".github/workflows/nabedra-nightly.yml"}, {"head_repository": {"full_name": "o/r"}},
+                        {"head_repository": None}, {"run_attempt": 0}, {"id": 8}):
+            with self.subTest(changes=changes):
+                self.forged(run_changes=changes)
+        self.forged(record={"run": {"url": f"https://github.com/{REPO}/actions/runs/7", "attempt": 1}})
+        self.forget()
+        self.keep(1, self.log)
+        self.assertEqual(self.answer()[0]["result"], "candidate")
+        # A later attempt of the run is no reason to refuse an earlier one's record.
+        self.keep(1, self.log, run_changes={"run_attempt": 3})
+        self.assertEqual(self.answer()[0]["result"], "candidate")
+
+    def test_doctored_rows_of_other_code(self):
+        # The reviewer's probe: code of another commit writes a record and a log that claim this one, whose lower hit is gone.
+        logs = self.run_shards(1, 2, script={"hit": 3})
+
+        def drop(row):
+            row["patched"].update(kinds=[], deterministic=None)
+            row.pop("judged", None)
+
+        def red(row):
+            row["base"].update(kinds=["Other"], deterministic=True)
+            row.pop("judged", None)
+
+        def trace(row):
+            row["judged"]["replay"]["trace_hash"] = "00000000000000aa"
+            row["judged"]["twin"] = None
+        other = "c" * 40
+        for change in (drop, red, trace):
+            log = self.edit_log(logs[0], lambda rows: [change(row) for row in rows if "judged" in row] and None)
+            for title in (f"req-101 @ {other}", "req-101"):
+                with self.subTest(change=change.__name__, title=title):
+                    self.keep(1, log, run=101, run_changes={"display_title": title})
+                    self.assert_merge("incomplete", "its run")
+                    self.assert_not_found("incomplete", "its run")
+
+    def test_no_answer_is_no_shard(self):
+        self.run_shards(1, script={"hit": 3})
+        runs = list(self.api.runs.values())
+        whole = lambda **changes: lambda path: (200, {}, {"total_count": 1, "workflow_runs": runs, **changes})
+        cases = {
+            "not found": lambda path: (404, {}, {"message": "Not Found"}), "forbidden": lambda path: (403, {}, {}),
+            "an outage": lambda path: (502, {}, b"bad gateway"), "no JSON": lambda path: (200, {}, b"<html>"),
+            "nothing": lambda path: (200, {}, b""), "a list": lambda path: (200, {}, []), "null": lambda path: (200, {}, None),
+            "no total": whole(total_count=None), "a part": whole(total_count=2), "more than there are": whole(total_count=0),
+            "the same run twice": whole(total_count=2, workflow_runs=runs * 2), "no runs": whole(workflow_runs=None),
+            "runs of text": whole(workflow_runs=["x"]),
+            "another place": lambda path: (302, {"Location": f"{self.api.url}/x"}, {}),
+        }
+        for what, answer in cases.items():
+            with self.subTest(what=what):
+                self.api.answer = answer
+                body, output = self.answer()
+                self.assertEqual((body["result"], body["shards"]), ("incomplete", []), output)
+                self.assertIn("GitHub", output)
+        with patch.object(sim_bugs, "API", "http://127.0.0.1:9"):
+            self.assertEqual(self.answer()[0]["result"], "incomplete")
+            self.assert_not_found("incomplete", "GitHub")
+        # And the jobs of a run, with the runs as they are.
+        for what, answer in cases.items():
+            with self.subTest(what=what):
+                self.api.answer = lambda path: answer(path) if "/jobs?" in path else self.api.get(path)
+                body, output = self.answer()
+                self.assertEqual((body["result"], body["hit"]), ("incomplete", None), output)
+                self.assertIn("GitHub", body["why"])
+        self.api.answer = None
+        sha = sh(self.f.repo, "rev-parse", "HEAD").strip()
+        for job in ({"status": None}, {"steps": "x", "conclusion": "failure"}, {"steps": ["x"], "conclusion": "failure"},
+                    {"name": None}, {"run_attempt": None}, {"conclusion": None}):
+            with self.subTest(job=job):
+                self.api.add(55, 1, "oltp-sim-bugs-fix-one-9", sha, job=job)
+                self.assertEqual(self.answer()[0]["result"], "incomplete")
+        self.api.runs.pop(55)
+        self.assertEqual(self.answer()[0]["result"], "candidate")
+
+    def test_a_rate_limit_is_waited_out(self):
+        self.run_shards(1, script={"hit": 3})
+        for status, headers in ((403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "{now}"}), (429, {}),
+                                (403, {"Retry-After": "7"})):
+            with self.subTest(status=status, headers=headers):
+                left = [2]
+
+                def limited(path):
+                    left[0] -= 1
+                    return self.api.get(path) if left[0] < 0 else (
+                        status, {k: v.format(now=int(sim_bugs.time.time()) + 600) for k, v in headers.items()}, {})
+                self.api.answer = limited
+                with patch.object(sim_bugs.time, "sleep") as sleep:
+                    self.assertEqual(self.answer()[0]["result"], "candidate")
+                pauses = [call.args[0] for call in sleep.call_args_list]
+                self.assertEqual(len(pauses), 2)
+                self.assertTrue(all(0 < pause <= 620 for pause in pauses), pauses)
+                # It is waited for as long as allowed, and no longer.
+                self.api.answer = lambda path: (status, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "99999999999"}, {})
+                with patch.object(sim_bugs.time, "sleep") as sleep:
+                    self.assertEqual(self.answer()[0]["result"], "incomplete")
+                sleep.assert_not_called()
+
+    def test_an_outage_is_tried_again(self):
+        self.run_shards(1, script={"hit": 3})
+        for tries, result in ((3, "candidate"), (2, "incomplete")):
+            left = [2]
+
+            def flaky(path):
+                left[0] -= 1
+                return self.api.get(path) if left[0] < 0 else (502, {}, {})
+            self.api.answer = flaky
+            with patch.object(sim_bugs.time, "sleep") as sleep, patch.object(sim_bugs, "API_TRIES", tries):
+                self.assertEqual(self.answer()[0]["result"], result)
+            self.assertEqual(sleep.call_count, tries - 1)
+
+    def test_the_token_is_optional(self):
+        self.run_shards(1, script={"hit": 3})
+        clean = {key: value for key, value in os.environ.items() if key not in ("GH_TOKEN", "GITHUB_TOKEN")}
+        for env, sent in ({}, None), ({"GH_TOKEN": "a", "GITHUB_TOKEN": "b"}, "Bearer a"), ({"GITHUB_TOKEN": "b"}, "Bearer b"):
+            with patch.dict(os.environ, {**clean, **env}, clear=True):
+                self.api.asked.clear()
+                self.assertEqual(self.answer()[0]["result"], "candidate")
+                self.assertEqual({token for _, token in self.api.asked}, {sent})
+        # Nothing but the listings is asked, each once.
+        self.assertEqual(len(self.api.asked), 2)
+
+    def test_a_listing_of_many_pages(self):
+        sha = sh(self.f.repo, "rev-parse", "HEAD").strip()
+        for run in range(1000, 1230):
+            self.api.add(run, 1, "oltp-sim-2", sha)
+        for n in range(230):
+            self.api.add(1000, 1, f"oltp-sim-x-{n}", sha)
+        self.run_shards(1, script={"hit": 3})
+        self.assertEqual(self.answer()[0]["result"], "candidate")
+        pages = [path for path, _ in self.api.asked if "/workflows/" in path]
+        self.assertEqual(len(pages), 3)
+
+    def test_a_result_that_is_left_out(self):
+        # The reviewer's probe: two complete runs of one range that differ, and one of them is not brought.
+        self.run_shards(1, script={"hit": 3})
+        _, log, _ = self.shard(1, script={"hit": 4}, run=201)
+        self.keep(1, log, run=201, name="again")
+        kept = self.root / "kept"
+        shutil.copytree(self.records, kept)
+        for name in ("again", "101-1-1"):
+            with self.subTest(left_out=name):
+                (self.records / f"{name}.json").unlink()
+                status, output, body = self.merge("--record")
+                self.assertEqual((status, body["result"]), (1, "incomplete"), output)
+                self.assertIn("is not among the records", output)
+                self.assertNotIn("recorded as entry", output)
+                self.assert_not_found("incomplete", "is not among the records")
+                shutil.copytree(kept, self.records, dirs_exist_ok=True)
+        self.assert_merge("error", "disagree")
+
+    def test_a_result_above_the_hit_that_is_left_out(self):
+        self.run_shards(1, 2, 3, script={"hit": 3})
+        self.assert_merge("candidate")
+        for path in self.records.glob("103-*"):
+            path.unlink()
+        self.assert_merge("incomplete", "oltp-sim-bugs-fix-one-3", "is not among the records")
+
+    def test_a_result_that_agrees_and_is_left_out(self):
+        self.run_shards(1, script={"hit": 3})
+        sha = sh(self.f.repo, "rev-parse", "HEAD").strip()
+        self.api.add(201, 1, "oltp-sim-bugs-fix-one-1", sha)
+        self.assert_merge("incomplete", "is not among the records")
+        # A run of the same title is another run.
+        self.api.runs.pop(201)
+        self.assert_merge("candidate")
+        # Another attempt of the same run is another result.
+        self.api.add(101, 2, "oltp-sim-bugs-fix-one-1", sha)
+        self.assert_merge("incomplete", "is not among the records")
+
+    def test_jobs_that_left_no_result(self):
+        self.run_shards(1, script={"hit": 3})
+        sha = sh(self.f.repo, "rev-parse", "HEAD").strip()
+        skipped = [{"name": "Attest the evidence records", "conclusion": "skipped"}]
+        for job in ({"conclusion": "failure", "steps": skipped}, {"conclusion": "failure", "steps": []},
+                    {"conclusion": "failure", "steps": None}, {"conclusion": "cancelled", "steps": skipped},
+                    {"conclusion": "failure", "steps": [{"name": "Attest the evidence records", "conclusion": None}]},
+                    {"name": "Check oltp-sim-bugs-fix-two-1"}, {"name": "Check oltp-sim-bugs-fix-one"},
+                    {"name": "Check oltp-sim-bugs-rehearsal-fix-one-1"}, {"name": "Check oltp-sim-bugs-fix-one-1-2"},
+                    {"name": "oltp-sim-bugs-fix-one-1"}):
+            with self.subTest(job=job):
+                self.api.add(201, 1, "oltp-sim-bugs-fix-one-1", sha, job=job)
+                self.assert_merge("candidate")
+        # A run at this commit that tested another one has no result of this one.
+        self.api.add(201, 1, "oltp-sim-bugs-fix-one-1", sha, run_changes={"display_title": f"req-201 @ {'c' * 40}"})
+        self.assert_merge("candidate")
+        self.api.add(201, 1, "oltp-sim-bugs-fix-one-1", sha, run_changes={"event": "pull_request"})
+        self.assert_merge("candidate")
+        # One whose title says nothing may have.
+        self.api.add(201, 1, "oltp-sim-bugs-fix-one-1", sha, run_changes={"display_title": "a title"})
+        self.assert_merge("incomplete", "is not among the records")
+
+    def test_jobs_whose_result_is_not_known_yet(self):
+        self.run_shards(1, script={"hit": 3})
+        sha = sh(self.f.repo, "rev-parse", "HEAD").strip()
+        self.api.add(201, 1, "oltp-sim-bugs-fix-one-1", sha, run_changes={"status": "in_progress"}, job=False)
+        self.assert_merge("incomplete", "run 201", "has not finished")
+        # Its own run has not finished while it merges. Its shards have to.
+        self.api.add(7, 1, "oltp-sim-bugs-fix-one", sha, run_changes={"status": "in_progress"}, job={"status": "in_progress"})
+        self.api.runs.pop(201)
+        self.assert_merge("candidate")
+        for status in ("in_progress", "queued", "waiting"):
+            self.api.add(7, 1, "oltp-sim-bugs-fix-one-2", sha, run_changes={"status": "in_progress"},
+                         job={"status": status, "conclusion": None})
+            self.assert_merge("incomplete", "oltp-sim-bugs-fix-one-2", "has not finished")
+
+    def nondeterministic(self, n=1, run=301, **changes):
+        """A shard that finds that one seed has two results, and its attested record."""
+        status, log, _ = self.shard(n, script={"hit": 3, "clean_base_row": {"trace_hash": "00000000000000aa"}}, run=run)
+        self.assertEqual(status, 1, log)
+        self.assertIn("sim-bugs-shard: disagree ", log)
+        self.keep(n, log, run=run, name=f"failed-{n}", **{"record": {"result": "fail"}, **changes})
+        return log
+
+    def test_a_shard_that_found_nondeterminism_is_a_disagreement(self):
+        # The reviewer's probe: its record beside a run that passed.
+        self.run_shards(1, 2, script={"hit": 3})
+        self.assert_merge("candidate")
+        self.nondeterministic()
+        body = self.assert_merge("error", "disagree")
+        self.assertEqual([shard["run"][-3:] for shard in body["shards"]], ["101", "301", "102"])
+        self.assert_not_found("error", "disagree")
+        # Alone it is one as well, and its absence is seen.
+        for path in self.records.glob("101-*"):
+            path.unlink()
+        self.assert_merge("error", "disagree")
+        self.forget()
+        self.run_shards(1, script={"hit": 3})
+        self.nondeterministic()
+        (self.records / "failed-1.json").unlink()
+        self.assert_merge("incomplete", "is not among the records")
+
+    def test_a_shard_that_failed_otherwise_is_no_disagreement(self):
+        self.run_shards(1, script={"hit": 3})
+        for script in ({"kill": "clean_base"}, {"clean_base_exit": 101}):
+            status, log, _ = self.shard(1, script=script, run=301)
+            self.assertEqual(status, 1, log)
+            self.keep(1, log, run=301, name="failed-1", record={"result": "fail"})
+            self.assert_merge("candidate")
+        # It is attested, so it has to be there.
+        (self.records / "failed-1.json").unlink()
+        self.assert_merge("incomplete", "is not among the records")
+
+    def test_a_failed_record_is_read_as_strictly(self):
+        self.run_shards(1, script={"hit": 3})
+        log = self.nondeterministic()
+        line = next(line for line in log.splitlines() if line.startswith("sim-bugs-shard: disagree "))
+        found = json.loads(line.removeprefix("sim-bugs-shard: disagree "))
+        other = lambda **changes: log.replace(line, f"sim-bugs-shard: disagree {canonical({**found, **changes})}")
+        # Of another search: no disagreement of this one.
+        for changes in ({"build": "a" * 40}, {"review": "a" * 64}, {"mode": "rehearsal"}, {"id": "fix-two"},
+                        {"plan": {**found["plan"], "profile": []}}):
+            with self.subTest(changes=changes):
+                self.keep(1, other(**changes), run=301, name="failed-1", record={"result": "fail"})
+                self.assert_merge("candidate")
+        # Not what a shard writes, or not whose record it is: nothing is known of it, so nothing is said.
+        for what, text in {"another commit": other(sha="a" * 40), "another run": other(run=f"https://github.com/{REPO}/actions/runs/9"),
+                           "another attempt": other(attempt="2"), "another shard": other(shard=[2, 2500]), "a field": other(more=1),
+                           "cut": log.replace(line, line[:-9]), "two": log + line + "\n",
+                           "no shard": other(shard=[]), "a shard as a number": other(shard=1),
+                           "a list": log.replace(line, "sim-bugs-shard: disagree []"),
+                           "inside": log.replace(line, "x " + line)}.items():
+            with self.subTest(what=what):
+                self.keep(1, text, run=301, name="failed-1", record={"result": "fail"})
+                self.assert_merge("incomplete", "is not among the records")
+        for what, changes in {"unattested": {"bundle": False}, "its log": {"record": {"result": "fail", "artifacts": []}},
+                              "another commit's run": {"run_changes": {"display_title": f"req-301 @ {'c' * 40}"}}}.items():
+            with self.subTest(what=what):
+                for path in self.records.glob("sha256-*"):
+                    if sha256((self.records / "101-1-1.json").read_bytes()) not in path.name:
+                        path.unlink()
+                self.keep(1, log, run=301, name="failed-1", **{"record": {"result": "fail"}, **changes})
+                body = self.merge()[2]
+                self.assertEqual(body["result"], "candidate" if "run_changes" in changes else "incomplete", body)
+
+    def test_a_pass_that_says_it_disagrees(self):
+        log, = self.run_shards(1, script={"hit": 3})
+        self.keep(1, log.replace("sim-bugs-shard: complete", "sim-bugs-shard: disagree {}\nsim-bugs-shard: complete"), run=101)
+        self.assert_merge("incomplete")
+
+    def test_an_error_stays_one(self):
+        self.run_shards(1, script={"hit": 3})
+        before = (self.f.repo / BUG / "searches.jsonl").read_text()
+        _, log, _ = self.shard(1, script={"hit": 4}, run=201)
+        self.keep(1, log, run=201, name="again")
+        status, output, body = self.merge("--record")
+        self.assertEqual((status, body["result"]), (1, "error"), output)
+        self.assertIn("recorded as entry 2", output)
+        self.assertEqual([shard["run"][-3:] for shard in body["shards"]], ["101", "201"])
+        self.f.commit("record the error")
+        self.assertEqual(self.f.run("check")[0], 0)
+        self.assertEqual(self.merge("--record")[0], 2)
+        # With the other run gone from every list, this key still has an error.
+        for path in self.records.glob("again*"):
+            path.unlink()
+        self.api.runs.pop(201)
+        body = self.assert_merge("error", "an earlier merge of this search is an error")
+        self.assertEqual(body["hit"], None)
+        self.assert_not_found("error", "an earlier merge of this search is an error")
+        # Another plan is another search.
+        text = (self.f.repo / BUG / "bug.toml").read_text().split("[detection]")[0]
+        self.f.write(f"{BUG}/bug.toml", text.replace('"lost-reply"', '"auth-flap"'))
+        self.f.commit("another plan")
+        self.forget()
+        self.run_shards(1, script={"hit": 3})
+        self.assert_merge("candidate")
+        self.f.write(f"{BUG}/searches.jsonl", before)
+
+    def test_evidence_of_an_error(self):
+        self.run_shards(1, script={"hit": 3})
+        self.nondeterministic()
+        status, output, body = self.merge("--record")
+        self.assertIn("recorded as entry 2", output)
+        evidence = lambda: self.tool("evidence", "fix-one", "--records", str(self.records))[1]
+        self.assertNotIn("entry 2", evidence())
+        text = (self.records / "failed-1.log").read_text()
+        (self.records / "failed-1.log").write_text(text + "x")
+        self.assertIn("entry 2 of searches.jsonl rests on a record of oltp-sim-bugs-fix-one-1", evidence())
+
+    def test_a_recorded_error_never_counts(self):
+        self.run_shards(1, script={"hit": 3})
+        _, log, _ = self.shard(1, script={"hit": 4}, run=201)
+        self.keep(1, log, run=201, name="again")
+        status, output, body = self.merge("--record")
+        self.f.commit("record the error")
+        self.confirm_hit(3, body)
+        self.assert_not_found("error", "disagree", script={"hit": 3})
+
+    def test_the_last_recorded_merge_is_the_one(self):
+        self.run_shards(1, script={"hit": 3})
+        self.record_merge()
+        # The same search again, with a second run of the range: the first entry is not what the records give now.
+        log, = self.run_shards(1, script={"hit": 3})
+        self.keep(1, log.replace("runs/101", "runs/9"), run=9, name="again")
+        self.assert_not_found("error", "the recorded merge is not what", script={"hit": 3})
+        self.confirm_hit(3, self.record_merge())
+        status, output, row, _ = self.count(script={"hit": 3})
+        self.assertEqual((status, row["result"]), (0, "found"), output)
+
+    def test_one_listing_for_a_set(self):
+        self.run_shards(1, script={"hit": 3})
+        self.api.asked.clear()
+        self.tool("count", "--set", "direct", "--records", str(self.records), script={"hit": 3})
+        self.assertEqual(len(self.api.asked), 2)
+
+    def test_the_names_are_the_workflows(self):
+        # What the tool looks for in GitHub's answers is what the workflow of this tree writes.
+        text = (Path(__file__).resolve().parents[2] / sim_bugs.BUILD_WORKFLOW).read_text()
+        self.assertIn("format('{0} @ {1}', inputs.request_id, inputs.sha)", text)
+        self.assertIn("    name: Check ${{ matrix.id }}\n", text)
+        self.assertIn(f"      - name: {sim_bugs.ATTEST_STEP}\n", text)
+        # One step attests, in one job, and it attests the records.
+        self.assertEqual(text.count("attest-build-provenance"), 1)
+        self.assertIn("[A-Za-z0-9._-]{1,80}", text)
 
 
 if __name__ == "__main__":

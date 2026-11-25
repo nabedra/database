@@ -69,6 +69,8 @@ import sys
 import tempfile
 import time
 import tomllib
+from urllib.error import HTTPError
+import urllib.request
 
 REPO = Path(__file__).resolve().parents[2]
 BUGS_DIR = Path("server/sim-oltp/bugs")
@@ -159,6 +161,12 @@ SHARD_SCHEMA = "nabedra.sim-bug-shard/1"
 REPOSITORY = "zPy52/nabedra-database"
 BUILD_WORKFLOW = ".github/workflows/nabedra-build.yml"
 EVIDENCE_REF = "refs/remotes/origin/evidence/sim-bugs"
+# GitHub's API, which needs no token for a public repository. A rate limit is waited out for at most API_WAIT seconds.
+API = "https://api.github.com"
+API_WAIT, API_TRIES = 3900, 5
+# What the build workflow calls a dispatched run, and the step that signs the records of a job.
+RUN_TITLE = re.compile(r"([A-Za-z0-9._-]{1,80}) @ ([0-9a-f]{40})")
+ATTEST_STEP = "Attest the evidence records"
 
 MANIFEST_FIELDS = {
     "schema": str, "id": str, "bug": str, "set": str, "phase": int, "class": str,
@@ -1644,7 +1652,8 @@ UNAVAILABLE_WORKLOAD = re.compile(r'OLTP workload [\\]?"([a-z0-9-]+)[\\]?" is un
 SEARCHED = ("found", "candidate", "not-detected", "incomplete", "error")
 # What an entry of searches.jsonl holds. Only a merge with an answer is recorded.
 RECORDED = {"search": (SEARCH_FIELDS, SEARCH_SCHEMA, SEARCHED),
-            "merge": (MERGE_FIELDS, MERGE_SCHEMA, ("candidate", "not-detected"))}
+            "merge": (MERGE_FIELDS, MERGE_SCHEMA, ("candidate", "not-detected", "error"))}
+ANSWERS = ("candidate", "not-detected")
 
 
 class OutOfTime(Exception):
@@ -2355,13 +2364,20 @@ def cmd_run(repo, bugs, args, out, every=None):
 # again from the same records, in the run that counts, and repeats what says the hit is real.
 
 ROW_MARK, SHARD_MARK, MERGE_MARK = "sim-bugs-row:", "sim-bugs-shard:", "sim-bugs-merge:"
-DONE_MARK = f"{SHARD_MARK} complete "
+DONE_MARK, DISAGREE_MARK = f"{SHARD_MARK} complete ", f"{SHARD_MARK} disagree "
 DONE_FIELDS = {"schema", "mode", "id", "plan", "review", "digest", "patch_sha256", "build", "defect", "sha", "run",
                "attempt", "shard", "seeds", "rows", "rows_sha256", "binaries"}
 # What every row of a search shares, and how a difference is named.
 KEY = {"mode": "another kind (a rehearsal is no evidence)", "id": "another target", "plan": "another plan",
        "review": "another patch", "digest": "another patch", "patch_sha256": "another patch", "build": "another build",
        "defect": "another harness defect"}
+
+
+DISAGREE_FIELDS = {*KEY, "sha", "run", "attempt", "shard", "why"}
+
+
+class Disagreement(Failure):
+    """One seed has two results."""
 
 
 def build_tree(repo, commit):
@@ -2462,7 +2478,7 @@ def shard_rows(args, job, bug, plan, first, last, out):
                 row["judged"] = judged(*replay_hit(harness, bug, plan, exe, row))
                 twin = row["judged"]["twin"]
                 if twin and (twin["kinds"], twin["trace_hash"]) != (base[seed]["kinds"], base[seed]["trace"]):
-                    raise Failure(f"the twin of seed {seed} is not its base run")
+                    raise Disagreement(f"the twin of seed {seed} is not its base run")
             rows.append(row)
         print(f"{bug.id}: patched run of seeds {start} to {end}", file=out, flush=True)
     return rows, binaries
@@ -2493,20 +2509,23 @@ def cmd_shard(repo, bugs, args, out, every=None):
             return 1
         job.deadline = deadline
         key = shard_key(repo, bug, plan, args)
+        own = {**key, "sha": job.sha, "run": run_url(), "attempt": os.environ.get("GITHUB_RUN_ATTEMPT"), "shard": [n, parts]}
         print(f"{bug.id}: shard {n} of {parts}, seeds {first} to {last}", file=out, flush=True)
         try:
             rows, binaries = shard_rows(args, job, bug, plan, first, last, out)
         except Unavailable as error:
             print(f"{NOT_RUN_MARKER}: the harness has no {error} workload", file=out)
             return 0
+        except Disagreement as error:
+            print(DISAGREE_MARK + canonical({**own, "why": str(error)}), file=out)
+            return 1
         except (Failure, OutOfTime) as error:
             why = "the time limit passed" if isinstance(error, OutOfTime) else error
             print(f"{SHARD_MARK} error, none of its seeds count: {why}", file=out)
             return 1
     for row in rows:
         print(ROW_MARK, canonical(row), file=out)
-    done = {"schema": SHARD_SCHEMA, **key, "sha": job.sha, "run": run_url(), "attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
-            "shard": [n, parts], "seeds": [first, last], "rows": len(rows), "rows_sha256": rows_digest(rows),
+    done = {"schema": SHARD_SCHEMA, **own, "seeds": [first, last], "rows": len(rows), "rows_sha256": rows_digest(rows),
             "binaries": binaries}
     print(DONE_MARK + canonical(done), file=out, flush=True)
     return 0
@@ -2522,10 +2541,34 @@ class Shard:
     done: dict
     rows: list
 
+    @property
+    def job(self):
+        return int(self.done["run"].rsplit("/", 1)[1]), int(self.done["attempt"]), self.check
+
     def json(self):
         return {"shard": self.done["shard"], "seeds": self.done["seeds"], "check": self.check, "run": self.done["run"],
                 "attempt": int(self.done["attempt"]), "record_sha256": self.record_sha256, "log_sha256": self.log_sha256,
                 "rows_sha256": self.done["rows_sha256"]}
+
+
+@dataclass
+class FailedShard:
+    """An attested record of a shard that did not pass. Its result is known: it has no rows, and perhaps found that one
+    seed has two results."""
+    check: str
+    record_sha256: str
+    log_sha256: str
+    run: str
+    attempt: int
+    found: dict | None
+
+    @property
+    def job(self):
+        return int(self.run.rsplit("/", 1)[1]), self.attempt, self.check
+
+    def json(self):
+        return {"shard": self.found["shard"], "seeds": None, "check": self.check, "run": self.run, "attempt": self.attempt,
+                "record_sha256": self.record_sha256, "log_sha256": self.log_sha256, "rows_sha256": None}
 
 
 def read_row(text, seed, expect):
@@ -2644,21 +2687,174 @@ def verify_attestation(args, data, record, files):
         raise Failure("its attestation is of another repository, workflow, commit, runner, run or attempt")
 
 
-def read_shard(args, repo, key, name, data, record, files):
-    """The shard that this evidence record is of. Anything wrong with it is a Failure, and then it is no shard."""
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None
+
+
+def api_get(path):
+    """What GitHub answers, or a Failure. Nothing of the machine is sent but a token, if there is one."""
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    request = urllib.request.Request(API + path, headers={
+        "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "sim-bugs",
+        **({"Authorization": f"Bearer {token}"} if token else {})})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+    until, tries = time.monotonic() + API_WAIT, 0
+    while True:
+        try:
+            with opener.open(request, timeout=60) as response:
+                return strict_json(response.read().decode("utf-8"))
+        except HTTPError as error:
+            why, limits = f"status {error.code}", error.headers
+            error.close()
+            limited = error.code == 429 or error.code == 403 and (
+                limits.get("x-ratelimit-remaining") == "0" or limits.get("retry-after"))
+            if not limited and error.code < 500:
+                raise Failure(f"GitHub gives no answer to {path}: {why}") from None
+        except (OSError, ValueError) as error:
+            why, limits, limited = type(error).__name__, {}, False
+        pause = 30
+        if limited:
+            wanted = [limits.get("retry-after") or "", limits.get("x-ratelimit-reset") or ""]
+            wanted = [int(value) if value.isascii() and value.isdigit() else None for value in wanted]
+            pause = wanted[0] or (max(wanted[1] - int(time.time()), 0) + 5 if wanted[1] else 60)
+        tries += not limited
+        if tries >= API_TRIES or time.monotonic() + pause > until:
+            raise Failure(f"GitHub gives no answer to {path}: {why}")
+        time.sleep(pause)
+
+
+class Actions:
+    """Which runs and jobs of the build workflow there are, by GitHub's API. Each list is asked once, and has to be whole."""
+
+    def __init__(self):
+        self.lists = {}
+
+    def list(self, path, key):
+        if path not in self.lists:
+            found, page = [], 1
+            while True:
+                data = api_get(f"/repos/{REPOSITORY}/actions/{path}&per_page=100&page={page}")
+                items, total = (data.get(key), data.get("total_count")) if isinstance(data, dict) else (None, None)
+                if not isinstance(items, list) or type(total) is not int or not all(
+                        isinstance(item, dict) and type(item.get("id")) is int for item in items):
+                    raise Failure(f"GitHub's list {path} is unreadable")
+                found += items
+                if not items or len(found) >= total:
+                    break
+                page += 1
+            if len(found) != total or len({item["id"] for item in found}) != total:
+                raise Failure(f"GitHub's list {path} is not whole")
+            self.lists[path] = found
+        return self.lists[path]
+
+    def runs(self, sha):
+        """The runs whose workflow is of this commit."""
+        return self.list(f"workflows/{Path(BUILD_WORKFLOW).name}/runs?head_sha={sha}", "workflow_runs")
+
+    def jobs(self, run):
+        """The jobs of all attempts of a run."""
+        return self.list(f"runs/{run}/jobs?filter=all", "jobs")
+
+
+def tested_by(run):
+    """(request, commit) that a run was dispatched for, by the title its workflow gave it, or None."""
+    title = RUN_TITLE.fullmatch(run.get("display_title") if isinstance(run.get("display_title"), str) else "")
+    return title and title.groups()
+
+
+def verify_run(actions, record):
+    """That the code of the record's commit wrote it. The certificate names the workflow's commit, and a run tests the
+    commit it is given. At one commit its title says which: that commit's workflow writes it."""
+    own, sha = record["run"], record["sha"]
+    number = int(own["url"].rsplit("/", 1)[1])
+    run = next((run for run in actions.runs(sha) if run["id"] == number), None)
+    if run is None:
+        raise Failure("its run is not one of its commit's workflow")
+    home = run.get("head_repository")
+    if ((run.get("path"), run.get("event"), run.get("head_sha")) != (BUILD_WORKFLOW, "workflow_dispatch", sha)
+            or not isinstance(home, dict) or home.get("full_name") != REPOSITORY
+            or type(run.get("run_attempt")) is not int or own["attempt"] > run["run_attempt"]):
+        raise Failure("its run is not a dispatch of this repository's build workflow, or had no such attempt")
+    if tested_by(run) != (own.get("request_id"), sha):
+        raise Failure("its run tested another commit, or is another request's")
+
+
+def unaccounted(actions, key, sha, shards, failed):
+    """Why the records of this commit's shards are not all there. Every job that passed has to be a shard here, and every
+    other that left a signed record has to be among the failed ones."""
+    name, problems = re.compile(rf"Check ({check_name(key)}-[1-9][0-9]*)"), []
+    passed, other = {shard.job for shard in shards}, {shard.job for shard in failed}
+    try:
+        for run in actions.runs(sha):
+            tested = tested_by(run)
+            if run["event"] != "workflow_dispatch" or tested and tested[1] != sha:
+                continue
+            if run["status"] != "completed" and str(run["id"]) != os.environ.get("GITHUB_RUN_ID"):
+                problems.append(f"run {run['id']} at this commit has not finished")
+                continue
+            for job in actions.jobs(run["id"]):
+                match = name.fullmatch(job["name"])
+                if match is None:
+                    continue
+                where, ident = f"{match.group(1)} of run {run['id']}", (run["id"], job["run_attempt"], match.group(1))
+                signed = any((step["name"], step["conclusion"]) == (ATTEST_STEP, "success") for step in job["steps"] or [])
+                if job["status"] != "completed":
+                    problems.append(f"{where} has not finished")
+                elif job["conclusion"] == "success" and ident not in passed:
+                    problems.append(f"{where} passed and is not among the records")
+                elif job["conclusion"] != "success" and signed and ident not in other:
+                    problems.append(f"{where} did not pass, and its signed record is not among the records")
+    except (KeyError, TypeError, AttributeError):
+        problems.append("GitHub's lists of the runs at this commit are unreadable")
+    except Failure as error:
+        problems.append(str(error))
+    return problems
+
+
+def read_failed(key, data, record, log, text):
+    """The FailedShard of a record that did not pass."""
+    found, run = None, record["run"]
+    for line in text.split("\n"):
+        if DISAGREE_MARK.strip() not in line:
+            continue
+        try:
+            row = strict_json(line.removeprefix(DISAGREE_MARK))
+        except ValueError:
+            row = None
+        if found is not None or not isinstance(row, dict) or set(row) != DISAGREE_FIELDS or not isinstance(row["shard"], list):
+            raise Failure("its log has an unreadable line")
+        found = row
+    if found is not None:
+        if (found["sha"], found["run"], found["attempt"]) != (record["sha"], run["url"], str(run["attempt"])):
+            raise Failure("its log is of another commit, run or attempt than its record")
+        if any(found[name] != key[name] for name in KEY):
+            found = None
+        elif [record["check"]] != [f"{check_name(key)}-{n}" for n in found["shard"][:1]]:
+            raise Failure("its log is of another shard than its check")
+    return FailedShard(record["check"], hashlib.sha256(data).hexdigest(), log, run["url"], run["attempt"], found)
+
+
+def read_shard(args, repo, key, data, record, files, actions):
+    """The Shard or the FailedShard that this evidence record is of. Anything wrong with it is a Failure, and then it is
+    neither."""
     run = record.get("run") if isinstance(record.get("run"), dict) else {}
-    if record.get("result") != "pass" or record.get("tree_clean") is not True:
-        raise Failure(f"its result is {record.get('result')!r}, or its tree was not clean")
     if not SHA.fullmatch(str(record.get("sha"))) or not RUN_URL.fullmatch(str(run.get("url"))) or type(run.get("attempt")) is not int:
         raise Failure("its record names no commit, run or attempt")
     verify_attestation(args, data, record, files)
+    verify_run(actions, record)
     logs = [a.get("sha256") for a in record.get("artifacts") or [] if str(a.get("name")).endswith(".log")]
     if len(logs) != 1:
         raise Failure(f"its record names {len(logs)} logs")
     log = next((text for text in files.values() if hashlib.sha256(text).hexdigest() == logs[0]), None)
     if log is None:
         raise Failure("its log is not there")
-    done, rows = read_log(log.decode("utf-8", errors="replace"), key, repo)
+    text = log.decode("utf-8", errors="replace")
+    if record.get("result") != "pass":
+        return read_failed(key, data, record, logs[0], text)
+    if record.get("tree_clean") is not True:
+        raise Failure("its tree was not clean")
+    done, rows = read_log(text, key, repo)
     if (done["sha"], done["run"], done["attempt"]) != (record["sha"], run["url"], str(run["attempt"])):
         raise Failure("its log is of another commit, run or attempt than its record")
     if record["check"] != f"{check_name(key)}-{done['shard'][0]}":
@@ -2680,14 +2876,23 @@ def evidence_files(repo, bug, args):
         return {path.relative_to(root).as_posix(): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
     if git(repo, "cat-file", "-e", f"{EVIDENCE_REF}^{{commit}}", check=False).returncode:
         return {}
+    gone = git(repo, "log", "--full-history", "-m", "--no-renames", "--diff-filter=a", "--format=", "--name-only", EVIDENCE_REF,
+               "--", f"{bug.id}/").stdout.split("\n")
+    if any(gone):
+        raise Failure(f"the branch of the records changed or lost {next(filter(None, gone))!r}, and it may only gain files")
     names = git(repo, "ls-tree", "-r", "-z", "--name-only", EVIDENCE_REF, "--", f"{bug.id}/").stdout.split("\0")
     return {name: git(repo, "cat-file", "blob", f"{EVIDENCE_REF}:{name}", text=False).stdout for name in names if name}
 
 
-def read_shards(args, repo, bug, key, out):
-    """(shards, problems) of the target. A problem is why a record that names its check is no shard of this search."""
-    shards, problems = [], []
-    files = evidence_files(repo, bug, args)
+def read_shards(args, repo, bug, key, actions, out):
+    """(shards, failed shards, problems) of the target. A problem is why a record that names its check is neither."""
+    shards, failed, problems = [], [], []
+    try:
+        files = evidence_files(repo, bug, args)
+    except Failure as error:
+        if args.records:
+            raise
+        return [], [], [str(error)]
     if not files and not args.records:
         print(f"{bug.id}: no evidence in {bug.id}/ of {EVIDENCE_REF.removeprefix('refs/remotes/')}", file=out)
     for name, data in sorted(files.items()):
@@ -2699,12 +2904,13 @@ def read_shards(args, repo, bug, key, out):
                 rf"{check_name(key)}-[1-9][0-9]*", str(record.get("check"))):
             continue
         try:
-            shards.append(read_shard(args, repo, key, name, data, record, files))
+            shard = read_shard(args, repo, key, data, record, files, actions)
+            (shards if isinstance(shard, Shard) else failed).append(shard)
         except Failure as error:
             problems.append(f"{record['check']} ({name!r}): {error}")
     for problem in problems:
         print(f"{bug.id}: no shard: {problem}", file=out)
-    return shards, problems
+    return shards, failed, problems
 
 
 @dataclass
@@ -2717,8 +2923,9 @@ class Answer:
     shard: Shard | None
 
 
-def merge_shards(bug, key, shards, problems):
-    """The answer, from complete ranges alone: the lowest seed that nothing masks while every lower seed is there."""
+def merge_shards(bug, key, shards, failed, problems, missing):
+    """The answer, from complete ranges alone: the lowest seed that nothing masks while every lower seed is there.
+    `missing` says why not every result of this commit is known."""
     shards = sorted(shards, key=lambda s: (s.done["shard"][::-1], s.done["run"], int(s.done["attempt"]), s.record_sha256))
     expect = key["plan"]["expect"]
     body = {"schema": MERGE_SCHEMA, **{name: key[name] for name in KEY}, "sha": None, "binaries": None,
@@ -2727,10 +2934,16 @@ def merge_shards(bug, key, shards, problems):
     ranges = {}
     for shard in shards:
         ranges.setdefault(tuple(shard.done["shard"]), []).append(shard)
-    for (n, _), runs in ranges.items():
-        if any(run.rows != runs[0].rows for run in runs):
-            body["why"] = f"the runs of shard {n} disagree, so one seed has two results"
-            return Answer(body, None, [], None, None)
+    differ = [f"the runs of shard {n} disagree" for (n, _), runs in ranges.items() if any(run.rows != runs[0].rows for run in runs)]
+    differ += [f"{shard.check} disagrees with itself ({shard.found['why']})" for shard in failed if shard.found]
+    if differ:
+        both = [*shards, *(shard for shard in failed if shard.found)]
+        body.update(why="; ".join([*differ, "so one seed has two results"]), shards=sorted(
+            (s.json() for s in both), key=lambda s: (s["shard"], s["run"], s["attempt"], s["record_sha256"])))
+        return Answer(body, None, [], None, None)
+    if missing:
+        body.update(result="incomplete", why="; ".join(missing))
+        return Answer(body, None, [], None, None)
     for what, values in (("of different commits", {s.done["sha"] for s in shards}),
                          ("of different splits", {s.done["shard"][1] for s in shards}),
                          ("with different binaries", {canonical(s.done["binaries"]) for s in shards})):
@@ -2775,11 +2988,26 @@ def merge_shards(bug, key, shards, problems):
     return Answer(body, rates, masked, hit, hit_shard)
 
 
-def merged(args, repo, bug, out):
-    """(plan, the Answer of the target's shards)."""
+def merged(args, repo, bug, actions, out):
+    """(plan, the Answer of the target's shards). Every result of their commit has to be there, and an error that was recorded
+    for this search stays one."""
     plan = shard_plan(bug, args)
     key = shard_key(repo, bug, plan, args)
-    return plan, merge_shards(bug, key, *read_shards(args, repo, bug, key, out))
+    shards, failed, problems = read_shards(args, repo, bug, key, actions, out)
+    missing = [problem for sha in sorted({shard.done["sha"] for shard in shards})
+               for problem in unaccounted(actions, key, sha, shards, failed)]
+    answer = merge_shards(bug, key, shards, failed, problems, missing)
+    if answer.body["result"] != "error" and any(entry["result"] == "error" for entry in recorded_merges(bug, key)):
+        body = {**answer.body, "result": "error", "hit": None, "later": [],
+                "why": "an earlier merge of this search is an error, and neither of its results wins"}
+        answer = Answer(body, answer.rates, answer.masked, None, None)
+    return plan, answer
+
+
+def recorded_merges(bug, key):
+    """The merges of this search in searches.jsonl. A rehearsal has none."""
+    return [entry["merge"] for entry in load_searches(bug)[0]
+            if "merge" in entry and all(entry["merge"][name] == key[name] for name in KEY)]
 
 
 def answer_row(bug, plan, answer):
@@ -2809,7 +3037,7 @@ def cmd_merge(repo, bugs, args, out, every=None):
     print(f"gh command: {args.gh}", file=out)
     if rehearsal(args):
         print("(rehearsal: not evidence for this bug)", file=out)
-    plan, answer = merged(args, repo, bug, out)
+    plan, answer = merged(args, repo, bug, Actions(), out)
     body, row = answer.body, answer_row(bug, plan, answer)
     if answer.hit is not None:
         hit = body["hit"]
@@ -2830,14 +3058,13 @@ def cmd_merge(repo, bugs, args, out, every=None):
         if any(entry.get("merge") == body for entry in entries):
             raise Failure(f"that merge is already in {SEARCHES}")
         append_entry(bug, entries, {"merge": body}, out)
-    return 0
+    return 0 if body["result"] in ANSWERS else 1
 
 
 def merge_problems(bug, answer):
     """(whether the recorded merge contradicts this one, what keeps the hit from counting)."""
     body = answer.body
-    same = [entry["merge"] for entry in load_searches(bug)[0] if "merge" in entry
-            and all(entry["merge"][name] == body[name] for name in KEY)]
+    same = recorded_merges(bug, body)
     if same and same[-1] != body:
         return True, []
     problems = [] if same else [f"no merge of these shards is recorded in {SEARCHES}"]
@@ -2865,14 +3092,14 @@ def repeat_hit(args, job, harness, bug, plan, answer):
     return patched, clean
 
 
-def count_bug(args, repo, job, build, bug, out):
+def count_bug(args, repo, job, build, actions, bug, out):
     """The row of one target, from its shards' attested records and from this job."""
     if why := not_searched(bug, plan := shard_plan(bug, args), args):
         return dict(new_row(bug, plan), **why)
-    plan, answer = merged(args, repo, bug, out)
+    plan, answer = merged(args, repo, bug, actions, out)
     row = answer_row(bug, plan, answer)
     print(f"{bug.id}: masked: {masks_of(answer.body)}\n{MERGE_MARK} {canonical(answer.body)}", file=out, flush=True)
-    if row["result"] not in RECORDED["merge"][2]:
+    if row["result"] not in ANSWERS:
         return row
     contradicted, problems = (False, []) if rehearsal(args) else merge_problems(bug, answer)
     if contradicted:
@@ -2919,9 +3146,9 @@ def cmd_count(repo, bugs, args, out, every=None):
                 built.append(job.harness())
                 built[0].deadline = deadline
             return built[0]
-        rows = []
+        rows, actions = [], Actions()
         for bug in bugs:
-            rows.append(count_bug(args, repo, job, build, bug, out))
+            rows.append(count_bug(args, repo, job, build, actions, bug, out))
             print(describe(rows[-1]), file=out, flush=True)
         summary = {"schema": "nabedra.sim-bugs-count/1", "evidence": "fault-model", "mode": mode_of(args), "sha": job.sha,
                    "build": job.build, "not_mains_build": job.not_mains, "set": args.set_name, "bugs": rows}
@@ -3031,9 +3258,11 @@ def cmd_evidence(repo, bugs, args, out):
             elif search:
                 problems.append(f"entry {entry['n']} of {SEARCHES} names no Actions run, so no log covers it")
             for shard in entry.get("merge", {}).get("shards", []):
-                name = f'"rows_sha256":"{shard["rows_sha256"]}"'
+                mark, name = DISAGREE_MARK, ""
+                if shard["rows_sha256"]:
+                    mark, name = DONE_MARK, f'"rows_sha256":"{shard["rows_sha256"]}"'
                 if not any((shard["record_sha256"], shard["log_sha256"]) == (record, log) and any(
-                        line.startswith(DONE_MARK) and name in line for line in text.splitlines())
+                        line.startswith(mark) and name in line for line in text.splitlines())
                            for record, log, text in shards):
                     problems.append(f"entry {entry['n']} of {SEARCHES} rests on a record of {shard['check']} that is not in DIR")
         failed += bool(problems)

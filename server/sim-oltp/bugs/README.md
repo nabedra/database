@@ -175,13 +175,12 @@ A manifest whose plan changed and was never run is accounted for with
 
 ## What the tool cannot prove
 
-Five gaps stay open however the manifest looks. Each needs someone to reread something.
+Four gaps stay open however the manifest looks. Each needs someone to reread something.
 
 | Gap | What can happen | What to reread |
 | --- | --- | --- |
 | **An invented confirmer, or wrong prose** | A false detection counts. The names are free text: one model under two labels, or a name nobody has, passes. A hit whose schedule exposed DR-1 or DR-2 can carry prose about the reverted fix. The quoted lines have to exist and have to be an event the twin lacks. They need not show the reverted path. | The hit's trace and history, from the artifact of the attested run, against the patch and the known findings. Nothing in the manifest replaces it. |
 | **A hand-written search record** | No false hit, because the counting run derives the seed, trace, history, twin, base rate and regression again. A merge is refused when the attested records give another. It hides an earlier search. | `sim_bugs.py evidence` against the attested logs, and the traces of the searches it lists. |
-| **A shard's record left off the branch** | No false hit from it: a missing range is `incomplete`. It hides a run whose rows differ. | The Actions runs of the shard checks, and that each one's record is on `evidence/sim-bugs`. |
 | **An unrecorded search under the same plan** | No false hit. It hides extra attempts: another main SHA is another 10,000 schedules. Actions runs are visible, local ones are not. | The Actions runs of the check, and what each one's trace hashes were. |
 | **A hunk that acts only in the simulator** | A false detection counts if the reviewer misses it. The path, text and cfg rules refuse the known ways. A hand port can still ask for a node ID, a thread name, a time or anything else the rules do not know. | Every hunk of the patch, at the digest that `[review]` names, and in the trace whether the event comes from the reverted hunk. |
 
