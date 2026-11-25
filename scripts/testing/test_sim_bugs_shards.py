@@ -30,8 +30,7 @@ bundle = json.loads(Path(args[args.index("--bundle") + 1]).read_text())
 if bundle["digest"] != hashlib.sha256(Path(args[0]).read_bytes()).hexdigest():
     sys.exit("no matching attestations")
 certificate = bundle["certificate"]
-if certificate["sourceRepositoryURI"] != "https://github.com/" + args[args.index("--repo") + 1]:
-    sys.exit("another repository")
+assert args[args.index("--repo") + 1] == "zPy52/nabedra-database"
 assert args[args.index("--signer-workflow") + 1].endswith("/.github/workflows/nabedra-build.yml")
 assert "--deny-self-hosted-runners" in args and args[args.index("--format") + 1] == "json"
 print(json.dumps([{"verificationResult": {"signature": {"certificate": certificate}}}]))
@@ -254,10 +253,13 @@ class ShardTest(ShardCase):
         for argv in (["shard", "fix-one"], ["shard", "--shard", "1/4", "--set", "direct", "fix-one"]):
             status, output, calls = self.tool(*argv)
             self.assertEqual((status, calls), (2, []), output)
-        # A shard cannot choose its seeds, whatever its run is called.
-        status, output, calls = self.shard(1, "--seeds", "2")
-        self.assertEqual((status, calls), (2, []), output)
-        self.assertNotIn("sim-bugs-shard: complete", output)
+        # A shard cannot choose its seeds, whatever its run is called, and neither can its merge.
+        records = ("--records", str(self.records))
+        for argv in (["shard", "fix-one", "--shard", "1/2"], ["merge", "fix-one", *records], ["count", "fix-one", *records]):
+            status, output, calls = self.tool(*argv, "--seeds", "4")
+            self.assertEqual((status, calls), (2, []), output)
+            self.assertIn("--seeds is for a rehearsal", output)
+        self.assertEqual(self.shard(1, "--profile", "x", "--seeds", "2")[0], 2)
 
     def test_a_shard_runs_in_chunks(self):
         _, output, calls = self.shard(2, "--chunk", "3", script={"hit": 7})
@@ -383,6 +385,8 @@ class ShardTest(ShardCase):
         for status, output, calls in (self.shard(1), self.tool("merge", "fix-one", "--records", str(self.records)),
                                       self.tool("count", "fix-one", "--records", str(self.records))):
             self.assertEqual((status, calls), (1, []), output)
+            self.assertIn("fix-one: FAILED", output)
+            self.assertNotIn("incomplete", output)
 
     def test_a_working_tree_that_is_not_head(self):
         self.f.edit('port_notes = "the one hunk"', 'port_notes = "another hunk"')
@@ -490,6 +494,7 @@ class MergeTest(ShardCase):
             "a row after the line": output + row(2) + "\n",
             "text before a row": output.replace(row(2), "x " + row(2)),
             "a line of an error": output + "sim-bugs-shard: error, something\n",
+            "a line of an error before the end": output.replace(done, "sim-bugs-shard: error, something\n" + done),
         }
         for what, log in cases.items():
             with self.subTest(what=what):
@@ -506,17 +511,28 @@ class MergeTest(ShardCase):
         judged = rows_of(output)[2]["judged"]
         cases = {
             "a missing seed": lambda rows: rows[:1] + rows[2:],
+            "a missing last seed": lambda rows: rows[:3],
             "a doubled seed": lambda rows: rows[:2] + rows[1:],
             "a foreign seed": set_row(1, seed=9),
             "another order": lambda rows: [rows[1], rows[0], *rows[2:]],
             "a seed as text": set_row(1, seed="2"),
             "a field too many": set_row(1, note="x"),
             "no base": lambda rows: rows[1].pop("base") and None,
+            "a base of more": lambda rows: rows[1]["base"].update(more=1),
+            "a patched run of more": lambda rows: rows[2]["patched"].update(more=1),
+            "a replay of more": lambda rows: rows[2]["judged"]["replay"].update(more=1),
+            "a twin of more": lambda rows: rows[2]["judged"]["twin"].update(more=1),
+            "judged more": lambda rows: rows[2]["judged"].update(more=1),
+            "a masked replay with no trace": lambda rows: rows[2]["judged"].update(
+                twin=None, replay={**judged["replay"], "kinds": ["Other"], "trace_hash": "x"}),
+            "a masked replay without a verdict": lambda rows: rows[2]["judged"].update(
+                twin=None, replay={**judged["replay"], "deterministic": None}),
             "no trace": lambda rows: rows[1]["base"].update(trace=""),
             "a trace of zeros": lambda rows: rows[1]["base"].update(trace="0" * 16),
-            "kinds out of order": lambda rows: rows[1]["base"].update(kinds=["b", "a"]),
-            "a kind twice": lambda rows: rows[1]["base"].update(kinds=["a", "a"]),
-            "kinds as text": lambda rows: rows[1]["base"].update(kinds="Other"),
+            "kinds out of order": lambda rows: rows[1]["base"].update(kinds=["b", "a"], deterministic=True),
+            "a kind twice": lambda rows: rows[1]["base"].update(kinds=["a", "a"], deterministic=True),
+            "kinds as text": lambda rows: rows[1]["base"].update(kinds="Other", deterministic=True),
+            "an empty kind": lambda rows: rows[1]["base"].update(kinds=[""], deterministic=True),
             "a red seed that ran once": lambda rows: rows[1]["base"].update(kinds=["Other"], deterministic=None),
             "a verdict that does not fit": lambda rows: rows[1]["base"].update(deterministic=False),
             "a hit nobody judged": lambda rows: rows[2].pop("judged") and None,
@@ -535,6 +551,12 @@ class MergeTest(ShardCase):
                 shutil.rmtree(self.records)
                 self.keep(1, self.edit_log(output, change))
                 self.assert_no_shard()
+        # The same rows in another spelling are another log.
+        shutil.rmtree(self.records)
+        lines = [line.replace('"seed":', '"seed": ') if line.startswith("sim-bugs-row: ") else line for line in output.splitlines()]
+        rows = "".join(line.removeprefix("sim-bugs-row: ") + "\n" for line in lines if line.startswith("sim-bugs-row: "))
+        self.keep(1, self.edit_done("\n".join(lines) + "\n", rows_sha256=sha256(rows)))
+        self.assert_no_shard("not in the form a shard writes")
         # The edit itself is no reason for a refusal.
         shutil.rmtree(self.records)
         self.keep(1, self.edit_log(output, lambda rows: None))
@@ -547,7 +569,10 @@ class MergeTest(ShardCase):
             "target": {"id": "fix-two"}, "schema": {"schema": "nabedra.sim-bug-shard/2"}, "mode": {"mode": "rehearsal"},
             "workload": {"plan": {**done["plan"], "workload": "smoke"}},
             "profile": {"plan": {**done["plan"], "profile": []}}, "expect": {"plan": {**done["plan"], "expect": ["Other"]}},
-            "seeds": {"plan": {**done["plan"], "seeds": [1, 4]}}, "review": {"review": "a" * 64}, "patch": {"digest": "a" * 64},
+            "seeds": {"plan": {**done["plan"], "seeds": [1, 4]}}, "review": {"review": "a" * 64}, "patch": {"digest": "a" * 64}, "whole patch": {"patch_sha256": "a" * 64},
+            "no shard": {"shard": [0, 2500]}, "no shards": {"shard": [1, 0]}, "a shard as text": {"shard": ["1", 2500]},
+            "a shard as a flag": {"shard": [True, 2500]}, "half a shard": {"shard": [1]},
+            "a shard above the last": {"shard": [2501, 2500], "seeds": [10001, 10004]},
             "build": {"build": "a" * 40}, "sha": {"sha": "a" * 40}, "range": {"seeds": [5, 8]}, "shard": {"shard": [2, 2500]},
             "shards": {"shard": [1, 5000]}, "run": {"run": f"https://github.com/{REPO}/actions/runs/8"},
             "attempt": {"attempt": "2"}, "defect": {"defect": "lost-write"}, "field": {"more": 1},
@@ -562,6 +587,17 @@ class MergeTest(ShardCase):
         shutil.rmtree(self.records)
         self.keep(1, self.edit_done(output))
         self.assert_merge("candidate")
+
+    def test_a_commit_that_is_not_there_or_has_another_build(self):
+        _, output, _ = self.shard(1, script={"hit": 3})
+        self.keep(1, self.edit_done(output, sha="a" * 40), record={"sha": "a" * 40})
+        self.assert_no_shard("its commit is not available")
+        f = self.f
+        f.write("server/src/other.rs", "pub fn other() {}\n")
+        other = f.commit("another build")
+        sh(f.repo, "reset", "-q", "--hard", "HEAD^")
+        self.keep(1, self.edit_done(output, sha=other), record={"sha": other})
+        self.assert_no_shard("its commit has another build than it says")
 
     def test_shards_of_two_commits(self):
         # The manifest changed in between, so the key is the same. One search is of one commit.
@@ -628,6 +664,7 @@ class MergeTest(ShardCase):
             "another commit": {"record": {"sha": "a" * 40}},
             "another run": {"record": {"run": {"url": other, "attempt": 1}}},
             "another attempt": {"record": {"run": {"url": url, "attempt": 2}}},
+            "an attempt as text": {"record": {"run": {"url": url, "attempt": "1"}}},
             "no attempt": {"record": {"run": {"url": url, "attempt": None}}},
             "no run": {"record": {"run": {"url": None, "attempt": 1}}},
             "no log": {"record": {"artifacts": []}},
@@ -730,6 +767,14 @@ class MergeTest(ShardCase):
                 self.assertEqual(status, 1, output)
                 self.assertIn("searches.jsonl line 2", output)
 
+    def test_a_rehearsed_defect_is_in_the_patched_run_only(self):
+        status, output, calls = self.shard(1, "--workload", "smoke", "--profile", "", "--expect", "non-linearizable",
+                                           "--rehearse-defect", "lost-write", "--seeds", "4", parts=2)
+        self.assertEqual(status, 0, output)
+        self.assertEqual([(c["patched"], c["replay"], c["defect"]) for c in calls],
+                         [(False, False, None), (True, False, "lost-write"), (True, True, "lost-write"), (False, True, None)])
+        self.assertEqual(done_of(output)["defect"], "lost-write")
+
     def test_a_rehearsal_is_never_evidence(self):
         argv = ("--profile", "auth-flap", "--seeds", "8")
         for n in (1, 2):
@@ -744,6 +789,8 @@ class MergeTest(ShardCase):
         status, output, body = self.merge(*argv)
         self.assertEqual((status, body["result"], body["hit"]["seed"]), (0, "candidate", 6), output)
         self.assertIn("(rehearsal", output)
+        self.assertEqual({shard["check"] for shard in body["shards"]},
+                         {f"oltp-sim-bugs-rehearsal-fix-one-{n}" for n in (1, 2)})
         status, output, _ = self.merge(*argv, "--record")
         self.assertEqual(status, 2, output)
         status, output, row, _ = self.count(*argv, script={"hit": 6})
@@ -866,11 +913,12 @@ class CountTest(ShardCase):
     def test_the_hit_has_to_repeat(self):
         self.ready()
         for script, needle in (
-                ({"hit": 9}, "is not the one of its shard"),
-                ({"hit": 3, "patched": {"3": [KIND, "Other"]}}, "is not the one of its shard"),
-                ({"hit": 3, "flaky": ["patched"]}, "is not the one of its shard"),
-                ({"hit": 3, "clean": {"3": ["Other"]}}, "is not the one of its shard"),
-                ({"hit": 3, "same_trace": True}, "is not the one of its shard"),
+                ({"hit": 9}, "the hit of seed 3 is not"),
+                ({"hit": 3, "patched": {"3": [KIND, "Other"]}}, "the hit of seed 3 is not"),
+                ({"hit": 3, "flaky": ["patched"]}, "the hit of seed 3 is not"),
+                ({"hit": 3, "clean": {"3": ["Other"]}}, "the hit of seed 3 is not"),
+                ({"hit": 3, "clean_replay": {"3": ["Other"]}}, "the hit of seed 3 is not"),
+                ({"hit": 3, "same_trace": True}, "the hit of seed 3 is not"),
                 ({"hit": 3, "clean_base": {}, "clean": {"2": ["Other"]}}, "the base run of seeds 1 to 4"),
                 ({"hit": 3, "clean_base_row": {"trace_hash": "00000000000000aa"}}, "the base run of seeds 1 to 4"),
                 ({"hit": 3, "kill": "clean_base"}, "died with signal 9"),
@@ -952,18 +1000,24 @@ class CountTest(ShardCase):
             shutil.copytree(kept, self.records, dirs_exist_ok=True)
         path = self.f.repo / BUG / "searches.jsonl"
         text = path.read_text()
-        digest = json.loads(text.splitlines()[-1])["merge"]["shards"][0]["rows_sha256"]
-        path.write_text(text.replace(digest, "a" * 64))
-        self.assertIn(missing, evidence())
+        for name in ("rows_sha256", "record_sha256", "log_sha256"):
+            digest = json.loads(text.splitlines()[-1])["merge"]["shards"][0][name]
+            path.write_text(text.replace(digest, "a" * 64))
+            self.assertIn(missing, evidence())
 
     def test_an_earlier_plan_that_was_merged_is_accounted_for(self):
         f = self.f
-        self.ready()
-        text = (f.repo / BUG / "bug.toml").read_text()
-        f.write(f"{BUG}/bug.toml", text.split("[detection]")[0].replace('profile = ["lost-reply"]', 'profile = ["auth-flap"]'))
-        f.commit("another plan")
-        bug, = sim_bugs.load_bugs(f.repo)[0]
-        self.assertEqual(sim_bugs.unrecorded_plans(bug, f.repo), [])
+        text = (f.repo / BUG / "bug.toml").read_text().split("[detection]")[0]
+        plan = lambda name: (f.write(f"{BUG}/bug.toml", text.replace('"lost-reply"', f'"{name}"')), f.commit(name))
+        plan("auth-flap")
+        self.run_shards(1, script={"hit": 3})
+        self.record_merge()
+        plan("session-drop")
+        unrecorded = lambda: sim_bugs.unrecorded_plans(sim_bugs.load_bugs(f.repo)[0][0], f.repo)
+        self.assertEqual(unrecorded(), [])
+        plan("kill-gateway")
+        self.assertEqual(len(unrecorded()), 1)
+        self.assertIn("session-drop", unrecorded()[0])
 
 
 if __name__ == "__main__":
