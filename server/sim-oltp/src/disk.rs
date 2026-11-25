@@ -301,7 +301,10 @@ mod tests {
                 .await;
                 written("/sim-oltp/run/1", b"old run").await;
                 // Written, but not durable when the snapshot is taken.
-                in_node(NODE, async { os::write("/sim-oltp/tail", b"tail").unwrap() }).await;
+                in_node(NODE, async {
+                    os::write("/sim-oltp/tail", b"tail").unwrap()
+                })
+                .await;
                 let image = snapshot(&world, NODE);
                 written("/sim-oltp/log", b"one two").await;
                 written("/sim-oltp/new", b"new").await;
@@ -338,10 +341,7 @@ mod tests {
                 let live = world.volume(NODE, Path::new(ROOT)).unwrap();
                 let after = [ROOT, "/sim-oltp/lock", "/sim-oltp/log"].map(|p| inode(&live, p));
                 assert_eq!(after, before);
-                assert_eq!(
-                    world.volume_info(NODE, Path::new(ROOT)).unwrap(),
-                    identity
-                );
+                assert_eq!(world.volume_info(NODE, Path::new(ROOT)).unwrap(), identity);
                 // The restored state is durable: a power loss now keeps it.
                 cut_for_test(&world, DiskCut::Power);
                 world.restart_with(NODE, Cut::Crash);

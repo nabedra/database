@@ -362,7 +362,9 @@ impl QueueHandoff {
 
     pub(crate) fn receipt(&mut self, request: Uuid, now: Receipt) -> Result<(), String> {
         let Some(before) = self.accepted.insert(request, now.clone()) else {
-            return Err(format!("request {request} has a receipt and was never accepted"));
+            return Err(format!(
+                "request {request} has a receipt and was never accepted"
+            ));
         };
         match (&before, &now) {
             (_, Receipt::Abandoned) => Err(format!(

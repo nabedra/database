@@ -354,7 +354,11 @@ pub(crate) async fn run(
 
 /// Poll until every worker and gateway reports the run ready with the direct path active, and
 /// a read of one key succeeds through each gateway.
-pub(super) async fn converge(cluster: &Cluster, ctx: &Ctx, deadline: Duration) -> Result<(), String> {
+pub(super) async fn converge(
+    cluster: &Cluster,
+    ctx: &Ctx,
+    deadline: Duration,
+) -> Result<(), String> {
     loop {
         let state = if cluster.converged().await {
             clients::read_each(ctx).await
@@ -386,7 +390,10 @@ async fn abandon(
 }
 
 /// Create the workload's table through the first gateway, retrying the same ID.
-pub(super) async fn create_table(cluster: &Cluster, history: &Arc<Mutex<History>>) -> Result<String, String> {
+pub(super) async fn create_table(
+    cluster: &Cluster,
+    history: &Arc<Mutex<History>>,
+) -> Result<String, String> {
     let node = CLIENTS[0];
     let gateway = GATEWAYS[0];
     let id = in_node(node, async { uuid_v4() }).await;

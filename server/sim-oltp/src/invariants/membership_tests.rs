@@ -106,8 +106,10 @@ mod retry_certifies_named_removal {
         let id = Uuid::from_u128(1);
         let request = change(3, 4);
         let done = retired(request.clone(), &[1, 2, 3], &[1, 2, 4]);
-        rule.answered(id, &request, &Certified::Pending, None).unwrap();
-        rule.answered(id, &request, &Certified::Refused, None).unwrap();
+        rule.answered(id, &request, &Certified::Pending, None)
+            .unwrap();
+        rule.answered(id, &request, &Certified::Refused, None)
+            .unwrap();
         rule.answered(id, &request, &done, Some(&voters(&[1, 2, 4])))
             .unwrap();
         // A second move takes the first one's replacement away, and a late retry of the first
@@ -271,7 +273,8 @@ mod capability_before_use {
         for worker in [1, 2, 3, 4] {
             rule.started(worker);
         }
-        rule.in_use(Capability::Batch, "active", &[1, 2, 4]).unwrap();
+        rule.in_use(Capability::Batch, "active", &[1, 2, 4])
+            .unwrap();
     }
 
     #[test]
@@ -319,9 +322,7 @@ mod queue_handoff {
     fn illegal_an_accepted_request_is_abandoned() {
         let mut rule = QueueHandoff::new(RUN);
         rule.accepted(REQUEST);
-        let error = rule
-            .receipt(REQUEST, Receipt::Abandoned)
-            .unwrap_err();
+        let error = rule.receipt(REQUEST, Receipt::Abandoned).unwrap_err();
         assert!(error.contains("abandoned"), "{error}");
     }
 

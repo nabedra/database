@@ -165,10 +165,7 @@ impl Cluster {
         let task = self.world.spawn_node(node, async move {
             in_node(
                 node,
-                process_sim::with_worker_stop(
-                    stopped,
-                    registered_process::run(path),
-                ),
+                process_sim::with_worker_stop(stopped, registered_process::run(path)),
             )
             .await
         });

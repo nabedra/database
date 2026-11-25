@@ -152,7 +152,9 @@ impl Cluster {
         let index = self.config.index_of(node).expect("known worker");
         let (volume, marker) = match disk {
             Disk::Empty(wipe, marker) => {
-                self.record(format!("n{node} restarts on an empty volume, {marker:?} marker"));
+                self.record(format!(
+                    "n{node} restarts on an empty volume, {marker:?} marker"
+                ));
                 (DataVolume::Empty(wipe), marker)
             }
             Disk::Stale(image) => {
@@ -178,7 +180,13 @@ impl Cluster {
     /// Crash `node` with a journal sync stopped just before or just after it ran, so the cut
     /// separates durability from the acknowledgment that waits for it. Returns whether a sync
     /// was stopped within `limit`. The crash happens either way.
-    pub async fn crash_at_sync(&mut self, node: u64, how: DiskCut, after: bool, limit: Duration) -> bool {
+    pub async fn crash_at_sync(
+        &mut self,
+        node: u64,
+        how: DiskCut,
+        after: bool,
+        limit: Duration,
+    ) -> bool {
         let pause = if after {
             StoragePause::after(FsOp::SyncData)
         } else {
@@ -192,7 +200,9 @@ impl Cluster {
             time::sleep(Duration::from_millis(1)).await;
         }
         let stopped = !self.world.paused_storage(node).is_empty();
-        self.record(format!("n{node} stopped at a sync: {stopped}, after {after}"));
+        self.record(format!(
+            "n{node} stopped at a sync: {stopped}, after {after}"
+        ));
         self.crash(node, how).await;
         stopped
     }
@@ -336,11 +346,23 @@ mod tests {
             cluster.start().await.unwrap();
             let keys = world.volume(1, Path::new(KEYS)).unwrap();
             let data = world.volume(1, Path::new(ROOT)).unwrap();
-            for name in ["node.key", "node.pem", "ca.pem", "auth.json", "bootstrap.json"] {
+            for name in [
+                "node.key",
+                "node.pem",
+                "ca.pem",
+                "auth.json",
+                "bootstrap.json",
+            ] {
                 assert!(keys.contents(&Path::new(KEYS).join(name)).is_ok(), "{name}");
-                assert!(data.contents(&Path::new(ROOT).join(name)).is_err(), "{name}");
+                assert!(
+                    data.contents(&Path::new(ROOT).join(name)).is_err(),
+                    "{name}"
+                );
             }
-            assert!(data.contents(Path::new("/sim-oltp/pool/kv/CURRENT")).is_ok());
+            assert!(
+                data.contents(Path::new("/sim-oltp/pool/kv/CURRENT"))
+                    .is_ok()
+            );
             cluster.teardown().await;
             assert_eq!(cluster.checks.violations(), [""; 0]);
             assert_eq!(world.unmounted_path_errors(), 0);
@@ -367,7 +389,10 @@ mod tests {
                     .unwrap();
                 assert!(matches!(started, Started::Exited(_)), "{started:?}");
                 let data = world.volume(2, Path::new(ROOT)).unwrap();
-                assert!(data.contents(Path::new("/sim-oltp/pool/kv/CURRENT")).is_err());
+                assert!(
+                    data.contents(Path::new("/sim-oltp/pool/kv/CURRENT"))
+                        .is_err()
+                );
                 let keys = world.volume(2, Path::new(KEYS)).unwrap();
                 assert!(keys.contents(&Path::new(KEYS).join("node.key")).is_ok());
                 cluster.teardown().await;

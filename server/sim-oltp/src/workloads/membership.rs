@@ -328,7 +328,9 @@ impl Membership {
 
         if !quiet && g.bool() {
             let (per_mille, max) = (1 + g.below(20), window(g, 1, 20));
-            cluster.record(format!("storage pauses {per_mille} per mille up to {max:?}"));
+            cluster.record(format!(
+                "storage pauses {per_mille} per mille up to {max:?}"
+            ));
             cluster.world.set_storage_pauses(per_mille as u32, max);
         }
         let mut done = Ok(());
@@ -446,7 +448,9 @@ impl Membership {
             Step::Replace => {
                 let index = g.below(3) as usize;
                 self.enable(cluster).await?;
-                cluster.crash(cluster.config.node(index), DiskCut::Kill).await;
+                cluster
+                    .crash(cluster.config.node(index), DiskCut::Kill)
+                    .await;
                 self.replace(cluster, ctx, g, faults, quiet, index).await
             }
             Step::Wipe => {
@@ -612,9 +616,7 @@ impl Membership {
                 for (node, stats) in &snapshots {
                     cluster.checks.check_resources(&cluster.world, *node, stats);
                 }
-                cluster
-                    .checks
-                    .check_direct_path(&cluster.world, &snapshots);
+                cluster.checks.check_direct_path(&cluster.world, &snapshots);
                 return Ok(());
             }
             time::sleep(STEP).await;
@@ -875,7 +877,11 @@ impl Membership {
                 let at = cluster
                     .crash_at_sync(node, how, side == 3, Duration::from_millis(500))
                     .await;
-                self.note(if at { "cut at a sync" } else { "no sync to cut" });
+                self.note(if at {
+                    "cut at a sync"
+                } else {
+                    "no sync to cut"
+                });
             }
         }
         how
@@ -1085,7 +1091,8 @@ impl Membership {
         let connection = self.connection(cluster).await?;
         let run = uuid(&connection["run_id"]);
         self.judge(cluster, "QueueHandoff", self.queue.run(run));
-        self.stays_out(cluster, ctx, lost, former, former_pool).await
+        self.stays_out(cluster, ctx, lost, former, former_pool)
+            .await
     }
 
     /// Prepare an intent that never mounts, abandon it, and check that it stays abandoned.
@@ -1181,7 +1188,9 @@ impl Membership {
                 cluster.checks.violate(
                     &cluster.world,
                     "RetryCertifiesNamedRemoval",
-                    format!("preparing {id} recorded {record}, and its retry on n{node} {replayed}"),
+                    format!(
+                        "preparing {id} recorded {record}, and its retry on n{node} {replayed}"
+                    ),
                 );
             }
         }
@@ -1436,7 +1445,13 @@ impl Membership {
         });
         for node in cluster.config.nodes() {
             let answer = cluster
-                .admin_answer(node, id, "worker.restart.prepare", intent.clone(), ADMIN_LIMIT)
+                .admin_answer(
+                    node,
+                    id,
+                    "worker.restart.prepare",
+                    intent.clone(),
+                    ADMIN_LIMIT,
+                )
                 .await;
             if let Ok(Completion::Ok(prepared)) = answer {
                 cluster.checks.violate(
@@ -1503,9 +1518,7 @@ impl Membership {
         let started = cluster
             .restart_same_identity(node, how, Disk::Empty(kind, marker), REFUSAL_WATCH)
             .await?;
-        cluster.record(format!(
-            "wiped n{node} (prepared {prepared}): {started:?}"
-        ));
+        cluster.record(format!("wiped n{node} (prepared {prepared}): {started:?}"));
         match &started {
             Started::Ready => self.note("wiped worker ready"),
             Started::Running => self.note("wiped worker running"),
@@ -1987,7 +2000,9 @@ impl Membership {
             cluster.checks.violate(
                 &cluster.world,
                 "RetryCertifiesNamedRemoval",
-                format!("retries of a completed move changed the placement from {before} to {after}"),
+                format!(
+                    "retries of a completed move changed the placement from {before} to {after}"
+                ),
             );
         }
     }
@@ -2149,8 +2164,7 @@ async fn observe_capability(cluster: &Cluster, rule: &mut CapabilityBeforeUse) -
             (capability["batch"] == true, Capability::Batch, "active"),
         ] {
             if used
-                && let Err(detail) =
-                    rule.in_use(capability, &format!("{what} on n{node}"), &voters)
+                && let Err(detail) = rule.in_use(capability, &format!("{what} on n{node}"), &voters)
             {
                 cluster
                     .checks
