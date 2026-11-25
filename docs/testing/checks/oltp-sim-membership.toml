@@ -19,4 +19,4 @@ cwd = "server"
 timeout_s = 4200
 needs = []
 result_parser = "cargo-test"
-env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "membership", NABEDRA_SEEDS = "16", NABEDRA_SIM_JOBS = "2", NABEDRA_SIM_VERIFY_REPLAY = "0.25", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-membership", NABEDRA_SIM_GUARANTEES = "OLTP-G07,OLTP-G08", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-membership" }
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "membership", NABEDRA_SEEDS = "32", NABEDRA_SIM_JOBS = "2", NABEDRA_SIM_VERIFY_REPLAY = "0.25", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-membership", NABEDRA_SIM_GUARANTEES = "OLTP-G07,OLTP-G08", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-membership" }

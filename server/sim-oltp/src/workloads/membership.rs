@@ -172,8 +172,9 @@ impl Step {
             steps.push(Step::Rolling);
         }
         match g.below(4) {
-            0 | 1 => steps.push(Step::Replace),
-            2 => steps.push(Step::Wipe),
+            0 => steps.push(Step::Replace),
+            // A wiped worker is replaced afterwards too.
+            1 | 2 => steps.push(Step::Wipe),
             _ => {}
         }
         if g.below(3) == 0 {
