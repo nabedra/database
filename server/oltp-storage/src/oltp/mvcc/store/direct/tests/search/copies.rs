@@ -166,7 +166,8 @@ async fn vs08_vs16_a_split_copies_rows_vectors_and_records_exactly() {
     for max_bytes in [64 << 10, 1 << 20] {
         let mut s = S::new().await;
         fill(&mut s).await;
-        assert_eq!(s.close(40).await, SearchReply::Closed { floor: ts(40) });
+        // Closed above the cut, between the barrier and the freeze.
+        assert_eq!(s.close(45).await, SearchReply::Closed { floor: ts(45) });
         let mut split = freeze(&mut s, 41).await;
         // The frozen source takes no entry that would change what was copied.
         assert_eq!(s.fail(4, 24, 24, 1).await, refused(Fault::SplitInProgress));
@@ -199,12 +200,16 @@ async fn vs08_vs16_a_split_copies_rows_vectors_and_records_exactly() {
         let right = &mut split.children[1];
         assert_eq!(count_tag(&right.dump().await, VALUE), 4, "one version of each row");
         // The child inherits the columns and the floor, and goes on.
-        let mut write = s.commit(40, vec![s.write(4, Some(24), Some(row(4, "t")), Vec::new())]);
+        let mut write = s.commit(44, vec![s.write(4, Some(24), Some(row(4, "t")), Vec::new())]);
         write.routing_epoch = 2;
         write.schema_epoch = 1;
-        assert_eq!(right.submit(ParticipantCommand::Direct(write.clone())).await, rejected(Fault::Conflict));
-        write.commit_ts = ts(42);
-        assert_eq!(right.submit(ParticipantCommand::Direct(write)).await, applied(42));
+        for at in [41, 45] {
+            write.commit_ts = ts(at);
+            let reply = right.submit(ParticipantCommand::Direct(write.clone())).await;
+            assert_eq!(reply, rejected(Fault::Conflict));
+        }
+        write.commit_ts = ts(46);
+        assert_eq!(right.submit(ParticipantCommand::Direct(write)).await, applied(46));
         assert_eq!(got(&right.machine, s.f.key(4), 50).await.unwrap().vectors[&PLAIN], (24, vec![4; 8]));
         // Its feed starts after the copy.
         let origin = right.index - 4;
